@@ -1,0 +1,22 @@
+# Local repository handoff
+git地址.txt
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Build and dependency output
+**/bin/
+**/obj/
+**/build/
+.gradle/
+node_modules/
+dist/
+coverage/
+
+# Local tooling
+.idea/
+*.log
+Thumbs.db
+.DS_Store

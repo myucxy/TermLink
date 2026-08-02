@@ -1,0 +1,4 @@
+{
+  // Chinese prose, URLs, tables, and Mermaid labels are clearer without hard wraps.
+  "MD013": false
+}

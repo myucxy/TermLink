@@ -1,0 +1,1846 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>TermLink UI Layout Review</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <svg class="svg-defs" aria-hidden="true">
+      <symbol id="i-device" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="13" rx="2" />
+        <path d="M8 21h8M12 17v4" />
+      </symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24">
+        <path d="m5 7 4 4-4 4M12 16h7" />
+      </symbol>
+      <symbol id="i-activity" viewBox="0 0 24 24">
+        <path d="M4 12h3l2-7 4 14 2-7h5" />
+      </symbol>
+      <symbol id="i-settings" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="3" />
+        <path
+          d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"
+        />
+      </symbol>
+      <symbol id="i-shield" viewBox="0 0 24 24">
+        <path d="M12 3 5 6v5c0 4.6 2.8 8.1 7 10 4.2-1.9 7-5.4 7-10V6l-7-3Z" />
+        <path d="m9 12 2 2 4-4" />
+      </symbol>
+      <symbol id="i-search" viewBox="0 0 24 24">
+        <circle cx="11" cy="11" r="7" />
+        <path d="m20 20-4-4" />
+      </symbol>
+      <symbol id="i-chevron" viewBox="0 0 24 24">
+        <path d="m9 18 6-6-6-6" />
+      </symbol>
+      <symbol id="i-more" viewBox="0 0 24 24">
+        <circle cx="5" cy="12" r="1" />
+        <circle cx="12" cy="12" r="1" />
+        <circle cx="19" cy="12" r="1" />
+      </symbol>
+      <symbol id="i-lock" viewBox="0 0 24 24">
+        <rect x="5" y="10" width="14" height="10" rx="2" />
+        <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+      </symbol>
+      <symbol id="i-server" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="6" rx="2" />
+        <rect x="3" y="14" width="18" height="6" rx="2" />
+        <path d="M7 7h.01M7 17h.01" />
+      </symbol>
+      <symbol id="i-users" viewBox="0 0 24 24">
+        <circle cx="9" cy="8" r="3" />
+        <path
+          d="M3 20v-2a6 6 0 0 1 12 0v2M16 4a3 3 0 0 1 0 6M18 14a5 5 0 0 1 3 4.6V20"
+        />
+      </symbol>
+      <symbol id="i-log" viewBox="0 0 24 24">
+        <path d="M5 3h11l3 3v15H5z" />
+        <path d="M15 3v4h4M8 11h8M8 15h8M8 19h5" />
+      </symbol>
+      <symbol id="i-box" viewBox="0 0 24 24">
+        <path d="m12 3 9 5-9 5-9-5 9-5Z" />
+        <path d="m3 8 9 5 9-5M3 13l9 5 9-5M3 8v10l9 5 9-5V8" />
+      </symbol>
+      <symbol id="i-bell" viewBox="0 0 24 24">
+        <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" />
+      </symbol>
+      <symbol id="i-play" viewBox="0 0 24 24">
+        <path d="m8 5 11 7-11 7V5Z" />
+      </symbol>
+      <symbol id="i-pause" viewBox="0 0 24 24">
+        <path d="M8 5v14M16 5v14" />
+      </symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24">
+        <rect x="8" y="8" width="12" height="12" rx="2" />
+        <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
+      </symbol>
+      <symbol id="i-card" viewBox="0 0 24 24">
+        <rect x="3" y="5" width="18" height="14" rx="2" />
+        <path d="M3 10h18M7 15h3" />
+      </symbol>
+    </svg>
+
+    <header class="review-header">
+      <div class="review-brand">
+        <span class="brand-mark" aria-hidden="true">T</span>
+        <span><strong>TermLink</strong><small>UI layout review</small></span>
+      </div>
+      <nav class="product-tabs" aria-label="选择客户端">
+        <button
+          class="product-tab is-active"
+          type="button"
+          data-product-tab="android"
+        >
+          Android
+        </button>
+        <button class="product-tab" type="button" data-product-tab="windows">
+          Windows Agent
+        </button>
+        <button class="product-tab" type="button" data-product-tab="server">
+          Server Console
+        </button>
+      </nav>
+      <button class="theme-toggle" type="button" aria-label="切换明暗主题">
+        明暗主题
+      </button>
+    </header>
+
+    <main class="review-main">
+      <section class="product-workspace is-active" data-product="android">
+        <aside class="screen-nav" aria-label="Android 页面">
+          <p class="nav-eyebrow">Android 客户端</p>
+          <h1>移动端控制中心</h1>
+          <p class="nav-summary">
+            终端内容优先，状态透明，远程输入始终经过显式控制。
+          </p>
+          <div class="screen-nav-list">
+            <button
+              class="screen-link is-active"
+              type="button"
+              data-screen-target="android-devices"
+            >
+              <span>01</span>设备首页
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="android-terminal"
+            >
+              <span>02</span>实时终端
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="android-replay"
+            >
+              <span>03</span>历史回放
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="android-security"
+            >
+              <span>04</span>可信设备
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="android-membership"
+            >
+              <span>05</span>会员与配额
+            </button>
+          </div>
+          <div class="layout-spec">
+            <span>基准</span><strong>390 × 844 dp</strong> <span>导航</span
+            ><strong>3 个一级入口</strong> <span>终端</span
+            ><strong>沉浸式子页面</strong>
+          </div>
+        </aside>
+
+        <div class="preview-stage mobile-stage">
+          <div class="phone-frame">
+            <div class="phone-status">
+              <span>09:41</span><span>5G&nbsp;&nbsp;87%</span>
+            </div>
+
+            <section
+              class="mock-screen is-active"
+              data-screen="android-devices"
+              aria-label="Android 设备首页"
+            >
+              <header class="mobile-appbar">
+                <div>
+                  <p class="overline">下午好，Alex</p>
+                  <h2>你的终端</h2>
+                </div>
+                <button class="avatar-button" type="button" aria-label="账号">
+                  AX
+                </button>
+              </header>
+              <button class="mobile-search" type="button">
+                <svg><use href="#i-search" /></svg
+                ><span>搜索 PC、会话或操作</span><kbd>⌘ K</kbd>
+              </button>
+              <div class="ambient-summary">
+                <span class="live-orb"></span><strong>Free · 1/1 台 PC</strong
+                ><span>实时会话 2/3</span>
+              </div>
+              <div class="section-heading">
+                <h3>设备</h3>
+                <button type="button">排序</button>
+              </div>
+              <div class="device-list">
+                <button
+                  class="device-row"
+                  type="button"
+                  data-jump-screen="android-terminal"
+                >
+                  <span class="device-icon"
+                    ><svg><use href="#i-device" /></svg
+                    ><i class="presence online"></i
+                  ></span>
+                  <span class="device-copy"
+                    ><strong>OFFICE-PC</strong><small>Windows 11 · 28 ms</small
+                    ><em>PowerShell · build-release</em></span
+                  >
+                  <span class="row-meta"
+                    ><b>2</b><svg><use href="#i-chevron" /></svg
+                  ></span>
+                </button>
+                <button
+                  class="device-row upgrade-row"
+                  type="button"
+                  data-jump-screen="android-membership"
+                >
+                  <span class="device-icon"
+                    ><svg><use href="#i-lock" /></svg
+                  ></span>
+                  <span class="device-copy"
+                    ><strong>添加更多 PC</strong
+                    ><small>免费版已使用 1/1 台 PC</small
+                    ><em>升级月付会员后继续添加</em></span
+                  >
+                  <span class="row-meta"
+                    ><b class="pro-label">PRO</b
+                    ><svg><use href="#i-chevron" /></svg
+                  ></span>
+                </button>
+              </div>
+              <nav class="mobile-bottom-nav" aria-label="主导航">
+                <button class="is-active" type="button">
+                  <svg><use href="#i-device" /></svg><span>设备</span>
+                </button>
+                <button type="button">
+                  <svg><use href="#i-activity" /></svg><span>活动</span>
+                </button>
+                <button type="button">
+                  <svg><use href="#i-settings" /></svg><span>设置</span>
+                </button>
+              </nav>
+            </section>
+
+            <section
+              class="mock-screen terminal-screen"
+              data-screen="android-terminal"
+              aria-label="Android 实时终端"
+            >
+              <header class="terminal-appbar">
+                <button
+                  class="icon-text-button"
+                  type="button"
+                  data-jump-screen="android-devices"
+                >
+                  ‹
+                </button>
+                <div>
+                  <strong>build-release</strong
+                  ><small>OFFICE-PC · PowerShell</small>
+                </div>
+                <button
+                  class="icon-text-button"
+                  type="button"
+                  aria-label="更多"
+                >
+                  <svg><use href="#i-more" /></svg>
+                </button>
+              </header>
+              <div class="terminal-statebar">
+                <span><i class="presence online"></i>Live</span
+                ><span
+                  ><svg><use href="#i-lock" /></svg>E2EE</span
+                ><span>82×28</span><b id="android-control-state">只读</b>
+              </div>
+              <section class="terminal-canvas" aria-label="终端输出">
+                <p>
+                  <span class="term-blue">PS</span> C:\src\termlink&gt; dotnet
+                  test
+                </p>
+                <p class="term-muted">正在确定要还原的项目…</p>
+                <p>Restore complete <span class="term-muted">(1.2s)</span></p>
+                <p class="term-green">
+                  ✓ Agent.UnitTests&nbsp;&nbsp; 86 passed
+                </p>
+                <p class="term-green">
+                  ✓ Protocol.Tests&nbsp;&nbsp;&nbsp; 72 passed
+                </p>
+                <p class="term-green">
+                  ✓ Crypto.Tests&nbsp;&nbsp;&nbsp;&nbsp; 90 passed
+                </p>
+                <p>&nbsp;</p>
+                <p>
+                  Test summary: <strong class="term-green">248 passed</strong>,
+                  0 failed
+                </p>
+                <p>Duration: 00:00:14.38</p>
+                <p>&nbsp;</p>
+                <p>
+                  <span class="term-blue">PS</span> C:\src\termlink&gt;
+                  <span class="term-cursor">&nbsp;</span>
+                </p>
+                <button class="jump-latest" type="button">↓ 最新输出</button>
+              </section>
+              <div class="extra-keys" role="toolbar" aria-label="终端快捷键">
+                <button type="button">ESC</button
+                ><button type="button">TAB</button
+                ><button type="button">CTRL</button
+                ><button type="button">ALT</button
+                ><button type="button">←</button><button type="button">↑</button
+                ><button type="button">↓</button
+                ><button type="button">→</button>
+              </div>
+              <div class="terminal-actionbar">
+                <button
+                  class="primary-action"
+                  id="request-control"
+                  type="button"
+                >
+                  <svg><use href="#i-terminal" /></svg
+                  ><span>申请 30 秒控制权</span>
+                </button>
+              </div>
+            </section>
+
+            <section
+              class="mock-screen"
+              data-screen="android-replay"
+              aria-label="Android 历史回放"
+            >
+              <header class="terminal-appbar replay-header">
+                <button class="icon-text-button" type="button">‹</button>
+                <div>
+                  <strong>deploy-prod</strong><small>历史回放 · 26 分钟</small>
+                </div>
+                <button
+                  class="icon-text-button"
+                  type="button"
+                  aria-label="搜索"
+                >
+                  <svg><use href="#i-search" /></svg>
+                </button>
+              </header>
+              <div class="replay-banner">
+                <svg><use href="#i-play" /></svg
+                ><span><strong>Replay</strong> · 已退出，code 0</span><b>4×</b>
+              </div>
+              <div class="terminal-canvas replay-canvas">
+                <p><span class="term-blue">$</span> ./deploy.sh production</p>
+                <p class="term-muted">Building image termlink/server:1.0.0</p>
+                <p>[1/4] Compile server <span class="term-green">done</span></p>
+                <p>[2/4] Run migrations <span class="term-green">done</span></p>
+                <p>[3/4] Rolling update <span class="term-green">done</span></p>
+                <p>
+                  [4/4] Health checks <span class="term-green">passed</span>
+                </p>
+                <p>&nbsp;</p>
+                <p class="term-green">Deployment completed in 04:18</p>
+              </div>
+              <div class="timeline-panel">
+                <div class="timeline-labels">
+                  <span>14:02</span><strong>14:23:18</strong><span>14:28</span>
+                </div>
+                <div class="timeline-track">
+                  <i></i><b></b><em class="event-dot one"></em
+                  ><em class="event-dot two"></em>
+                </div>
+                <div class="playback-controls">
+                  <button type="button">0.5×</button
+                  ><button type="button">1×</button
+                  ><button class="is-active" type="button">4×</button
+                  ><button
+                    class="round-control"
+                    type="button"
+                    aria-label="暂停回放"
+                  >
+                    <svg><use href="#i-pause" /></svg></button
+                  ><button type="button">
+                    <svg><use href="#i-copy" /></svg>复制
+                  </button>
+                </div>
+              </div>
+            </section>
+
+            <section
+              class="mock-screen"
+              data-screen="android-security"
+              aria-label="Android 可信设备"
+            >
+              <header class="mobile-appbar compact-appbar">
+                <button class="icon-text-button" type="button">‹</button>
+                <div>
+                  <p class="overline">安全</p>
+                  <h2>可信设备</h2>
+                </div>
+                <span></span>
+              </header>
+              <div class="security-hero">
+                <span class="security-symbol"
+                  ><svg><use href="#i-shield" /></svg
+                ></span>
+                <div>
+                  <strong>4 台可信设备</strong
+                  ><small>所有设备密钥状态正常</small>
+                </div>
+              </div>
+              <div class="section-heading">
+                <h3>当前设备</h3>
+                <span>MANAGER</span>
+              </div>
+              <div class="trust-row current">
+                <span class="device-icon"
+                  ><svg><use href="#i-device" /></svg
+                ></span>
+                <div>
+                  <strong>Pixel 10 Pro</strong><small>Android · 当前设备</small
+                  ><em>指纹 8A:72:1F:…:C9</em>
+                </div>
+                <b>管理</b>
+              </div>
+              <div class="section-heading">
+                <h3>其他设备</h3>
+                <button type="button">筛选</button>
+              </div>
+              <div class="trust-list">
+                <button class="trust-row" type="button">
+                  <span class="device-icon"
+                    ><svg><use href="#i-device" /></svg></span
+                  ><span class="trust-copy"
+                    ><strong>OFFICE-PC</strong><small>Windows · 刚刚在线</small
+                    ><em>所有 PC · 管理</em></span
+                  ><svg><use href="#i-chevron" /></svg>
+                </button>
+                <button class="trust-row" type="button">
+                  <span class="device-icon"
+                    ><svg><use href="#i-device" /></svg></span
+                  ><span class="trust-copy"
+                    ><strong>Galaxy Tab</strong><small>Android · 2 天前</small
+                    ><em>OFFICE-PC · 可控制</em></span
+                  ><svg><use href="#i-chevron" /></svg>
+                </button>
+                <button class="trust-row" type="button">
+                  <span class="device-icon"
+                    ><svg><use href="#i-device" /></svg></span
+                  ><span class="trust-copy"
+                    ><strong>旧手机</strong><small>Android · 30 天前</small
+                    ><em>HOME-PC · 只读</em></span
+                  ><svg><use href="#i-chevron" /></svg>
+                </button>
+              </div>
+              <button class="secondary-wide-action" type="button">
+                批准新设备
+              </button>
+            </section>
+
+            <section
+              class="mock-screen membership-screen"
+              data-screen="android-membership"
+              aria-label="Android 会员与配额"
+            >
+              <header class="mobile-appbar compact-appbar">
+                <button
+                  class="icon-text-button"
+                  type="button"
+                  data-jump-screen="android-devices"
+                >
+                  ‹
+                </button>
+                <div>
+                  <p class="overline">账户</p>
+                  <h2>会员与配额</h2>
+                </div>
+                <button
+                  class="icon-text-button"
+                  type="button"
+                  aria-label="帮助"
+                >
+                  ?
+                </button>
+              </header>
+              <div class="plan-identity">
+                <span class="plan-orb">T</span>
+                <div>
+                  <small>当前方案</small><strong>Free</strong>
+                  <p>适合在一台 PC 上轻量使用</p>
+                </div>
+                <em>免费</em>
+              </div>
+              <div class="quota-section">
+                <div class="quota-heading">
+                  <h3>本月权益</h3>
+                  <span>实时计算</span>
+                </div>
+                <div class="quota-row">
+                  <div><strong>已连接 PC</strong><small>1 / 1 台</small></div>
+                  <span class="quota-track"><i class="quota-full"></i></span
+                  ><b>已满</b>
+                </div>
+                <div class="quota-row">
+                  <div>
+                    <strong>同时显示的实时会话</strong><small>2 / 3 个</small>
+                  </div>
+                  <span class="quota-track"
+                    ><i class="quota-two-thirds"></i></span
+                  ><b>剩余 1</b>
+                </div>
+              </div>
+              <div class="pro-plan-card">
+                <div class="pro-plan-head">
+                  <span><small>推荐</small><strong>TermLink Pro</strong></span>
+                  <div>
+                    <b data-plan-price>月付会员</b
+                    ><small>自动续费，可随时取消</small>
+                  </div>
+                </div>
+                <ul>
+                  <li><span>✓</span>连接多台 Windows PC</li>
+                  <li><span>✓</span>同时显示更多实时终端会话</li>
+                  <li><span>✓</span>会员配额由账户统一同步</li>
+                  <li><span>✓</span>保留全部安全与 E2EE 能力</li>
+                </ul>
+                <button
+                  class="primary-action"
+                  type="button"
+                  id="android-upgrade"
+                >
+                  <svg><use href="#i-card" /></svg
+                  ><span>查看月付价格并订阅</span>
+                </button>
+                <p>实际价格、税费和货币由购买渠道在确认前显示。</p>
+              </div>
+              <button class="restore-purchase" type="button">恢复购买</button>
+            </section>
+          </div>
+        </div>
+
+        <aside class="design-notes" aria-label="Android 布局说明">
+          <p class="nav-eyebrow">布局意图</p>
+          <h2 data-note-title>设备首页</h2>
+          <p data-note-copy>
+            用一层列表直接呈现 PC、延迟、权限和活动会话，不在顶部堆叠 KPI 卡片。
+          </p>
+          <ul data-note-list>
+            <li>状态同时使用圆点、文字和时间。</li>
+            <li>搜索入口也是统一命令面板入口。</li>
+            <li>一级导航始终只有设备、活动、设置。</li>
+          </ul>
+        </aside>
+      </section>
+
+      <section class="product-workspace" data-product="windows">
+        <aside class="screen-nav" aria-label="Windows Agent 页面">
+          <p class="nav-eyebrow">Windows Agent</p>
+          <h1>本地控制平面</h1>
+          <p class="nav-summary">
+            托盘负责即时状态与紧急操作，完整窗口负责会话、访问和设置。
+          </p>
+          <div class="screen-nav-list">
+            <button
+              class="screen-link is-active"
+              type="button"
+              data-screen-target="windows-tray"
+            >
+              <span>01</span>托盘弹层
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="windows-sessions"
+            >
+              <span>02</span>会话管理
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="windows-access"
+            >
+              <span>03</span>远程访问
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="windows-settings"
+            >
+              <span>04</span>Agent 设置
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="windows-membership"
+            >
+              <span>05</span>账户与会员
+            </button>
+          </div>
+          <div class="layout-spec">
+            <span>托盘</span><strong>380 × 560 px</strong><span>主窗口</span
+            ><strong>1040 × 720 px</strong><span>优先级</span
+            ><strong>本地用户最高</strong>
+          </div>
+        </aside>
+
+        <div class="preview-stage desktop-stage windows-preview">
+          <section
+            class="desktop-mock tray-mock is-active"
+            data-screen="windows-tray"
+            aria-label="Windows 托盘弹层"
+          >
+            <header class="tray-titlebar">
+              <div class="review-brand">
+                <span class="brand-mark small">T</span
+                ><span><strong>TermLink</strong><small>OFFICE-PC</small></span>
+              </div>
+              <button type="button" aria-label="打开设置">
+                <svg><use href="#i-settings" /></svg>
+              </button>
+            </header>
+            <div class="connection-line">
+              <span
+                ><i class="presence online"></i>已连接到 relay.example.com</span
+              ><b>28 ms</b>
+            </div>
+            <div class="policy-switcher">
+              <div>
+                <small>远程策略</small
+                ><strong id="tray-policy-label">允许已批准设备控制</strong>
+              </div>
+              <button type="button" id="tray-policy-toggle">更改</button>
+            </div>
+            <div class="tray-section-heading">
+              <h2>活动会话</h2>
+              <span>2</span>
+            </div>
+            <div class="tray-session-list">
+              <button class="tray-session" type="button">
+                <span class="session-glyph ps">›_</span
+                ><span
+                  ><strong>build-release</strong
+                  ><small>PowerShell 7 · 18 分钟</small
+                  ><em><i class="viewer-dot"></i> Pixel 10 正在查看</em></span
+                ><svg><use href="#i-chevron" /></svg>
+              </button>
+              <button class="tray-session" type="button">
+                <span class="session-glyph wsl">$</span
+                ><span
+                  ><strong>api-server</strong><small>WSL Ubuntu · 1 小时</small
+                  ><em>无远程查看者</em></span
+                ><svg><use href="#i-chevron" /></svg>
+              </button>
+            </div>
+            <button class="new-session-button" type="button">
+              ＋ 新建受管终端
+            </button>
+            <button
+              class="tray-plan-row"
+              type="button"
+              data-jump-screen="windows-membership"
+            >
+              <span><b>FREE</b> 1/1 台 PC · 2/3 个实时会话</span
+              ><strong>升级 ›</strong>
+            </button>
+            <button class="danger-action" type="button">
+              停止所有远程访问
+            </button>
+            <footer class="tray-footer">
+              <span>Agent 1.0.0 · 已是最新版本</span
+              ><button type="button">打开 TermLink</button>
+            </footer>
+          </section>
+
+          <section
+            class="desktop-mock app-window"
+            data-screen="windows-sessions"
+            aria-label="Windows 会话管理"
+          >
+            <div class="window-titlebar">
+              <span class="brand-mark small">T</span><strong>TermLink</strong
+              ><span class="window-controls">— □ ×</span>
+            </div>
+            <div class="window-body">
+              <nav class="desktop-sidebar" aria-label="Windows 会话导航">
+                <div class="pc-identity">
+                  <span>OP</span>
+                  <div>
+                    <strong>OFFICE-PC</strong
+                    ><small><i class="presence online"></i>在线</small>
+                  </div>
+                </div>
+                <button class="is-active" type="button">
+                  <svg><use href="#i-terminal" /></svg>会话</button
+                ><button type="button">
+                  <svg><use href="#i-users" /></svg>远程访问</button
+                ><button type="button">
+                  <svg><use href="#i-activity" /></svg>活动</button
+                ><button type="button">
+                  <svg><use href="#i-settings" /></svg>设置
+                </button>
+                <div class="sidebar-bottom">
+                  <button type="button">
+                    <svg><use href="#i-log" /></svg>诊断</button
+                  ><small>v1.0.0</small>
+                </div>
+              </nav>
+              <div class="desktop-content">
+                <header class="content-header">
+                  <div>
+                    <p class="overline">本机</p>
+                    <h2>受管会话</h2>
+                  </div>
+                  <button class="primary-desktop-action" type="button">
+                    ＋ 新建会话
+                  </button>
+                </header>
+                <div class="toolbar">
+                  <label
+                    ><svg><use href="#i-search" /></svg
+                    ><input type="search" placeholder="搜索会话"></label
+                  ><button class="is-active" type="button">运行中 2</button
+                  ><button type="button">已退出</button
+                  ><button type="button">已归档</button>
+                </div>
+                <div class="session-table">
+                  <div class="session-table-head">
+                    <span>会话</span><span>Shell</span><span>远程状态</span
+                    ><span>活动时间</span><span></span>
+                  </div>
+                  <button class="session-table-row" type="button">
+                    <span
+                      ><i class="session-glyph ps">›_</i><b>build-release</b
+                      ><small>C:\src\termlink</small></span
+                    ><span>PowerShell 7</span
+                    ><span><em class="status-pill live">正在查看</em></span
+                    ><span>刚刚</span><svg><use href="#i-more" /></svg></button
+                  ><button class="session-table-row" type="button">
+                    <span
+                      ><i class="session-glyph wsl">$</i><b>api-server</b
+                      ><small>~/src/api</small></span
+                    ><span>WSL Ubuntu</span
+                    ><span><em class="status-pill neutral">仅本地</em></span
+                    ><span>12 秒前</span><svg><use href="#i-more" /></svg>
+                  </button>
+                </div>
+                <div class="session-detail-strip">
+                  <span
+                    ><i class="presence online"></i>Agent 与 2 个 Session Host
+                    正常</span
+                  ><span>缓冲 18.2 MB / 512 MB</span
+                  ><button type="button">查看运行状态</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section
+            class="desktop-mock app-window"
+            data-screen="windows-access"
+            aria-label="Windows 远程访问"
+          >
+            <div class="window-titlebar">
+              <span class="brand-mark small">T</span><strong>TermLink</strong
+              ><span class="window-controls">— □ ×</span>
+            </div>
+            <div class="window-body">
+              <nav class="desktop-sidebar" aria-label="Windows 远程访问导航">
+                <div class="pc-identity">
+                  <span>OP</span>
+                  <div>
+                    <strong>OFFICE-PC</strong
+                    ><small><i class="presence online"></i>在线</small>
+                  </div>
+                </div>
+                <button type="button">
+                  <svg><use href="#i-terminal" /></svg>会话</button
+                ><button class="is-active" type="button">
+                  <svg><use href="#i-users" /></svg>远程访问</button
+                ><button type="button">
+                  <svg><use href="#i-activity" /></svg>活动</button
+                ><button type="button">
+                  <svg><use href="#i-settings" /></svg>设置
+                </button>
+              </nav>
+              <div class="desktop-content">
+                <header class="content-header">
+                  <div>
+                    <p class="overline">本机策略</p>
+                    <h2>远程访问</h2>
+                  </div>
+                  <span class="secure-label"
+                    ><svg><use href="#i-shield" /></svg>本地用户优先</span
+                  >
+                </header>
+                <div class="policy-hero">
+                  <div>
+                    <span class="security-symbol"
+                      ><svg><use href="#i-shield" /></svg
+                    ></span>
+                    <div>
+                      <strong>允许已批准设备查看和控制</strong>
+                      <p>
+                        首次控制需要本机确认。本地键盘输入会立即收回控制权。
+                      </p>
+                    </div>
+                  </div>
+                  <select aria-label="远程访问策略">
+                    <option>允许查看和控制</option>
+                    <option>仅允许查看</option>
+                    <option>仅本机</option>
+                  </select>
+                </div>
+                <div class="settings-section">
+                  <div class="settings-section-head">
+                    <div>
+                      <h3>当前连接</h3>
+                      <p>远端正在访问本机时始终显示。</p>
+                    </div>
+                    <span>1 个查看者</span>
+                  </div>
+                  <div class="active-viewer">
+                    <span class="avatar-button">PX</span>
+                    <div>
+                      <strong>Pixel 10 Pro</strong
+                      ><small>正在查看 build-release · 28 ms</small>
+                    </div>
+                    <em>只读</em><button type="button">断开</button>
+                  </div>
+                </div>
+                <div class="settings-section">
+                  <div class="settings-section-head">
+                    <div>
+                      <h3>控制确认</h3>
+                      <p>决定已批准设备何时可以取得输入租约。</p>
+                    </div>
+                  </div>
+                  <label class="setting-row"
+                    ><span
+                      ><strong>首次控制需要确认</strong
+                      ><small>每台远程设备第一次控制本机时询问</small></span
+                    ><input type="checkbox" checked></label
+                  ><label class="setting-row"
+                    ><span
+                      ><strong>本地输入收回控制</strong
+                      ><small>检测到本地键盘输入后立即撤销租约</small></span
+                    ><input type="checkbox" checked></label>
+                </div>
+                <button class="danger-outline" type="button">
+                  停止所有远程访问
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section
+            class="desktop-mock app-window"
+            data-screen="windows-settings"
+            aria-label="Windows Agent 设置"
+          >
+            <div class="window-titlebar">
+              <span class="brand-mark small">T</span><strong>TermLink</strong
+              ><span class="window-controls">— □ ×</span>
+            </div>
+            <div class="window-body">
+              <nav class="desktop-sidebar" aria-label="Windows Agent 设置导航">
+                <div class="pc-identity">
+                  <span>OP</span>
+                  <div>
+                    <strong>OFFICE-PC</strong
+                    ><small><i class="presence online"></i>在线</small>
+                  </div>
+                </div>
+                <button type="button">
+                  <svg><use href="#i-terminal" /></svg>会话</button
+                ><button type="button">
+                  <svg><use href="#i-users" /></svg>远程访问</button
+                ><button type="button">
+                  <svg><use href="#i-activity" /></svg>活动</button
+                ><button class="is-active" type="button">
+                  <svg><use href="#i-settings" /></svg>设置
+                </button>
+              </nav>
+              <div class="desktop-content">
+                <header class="content-header">
+                  <div>
+                    <p class="overline">Agent</p>
+                    <h2>设置</h2>
+                  </div>
+                  <button type="button">检查更新</button>
+                </header>
+                <div class="settings-tabs">
+                  <button class="is-active" type="button">常规</button
+                  ><button type="button">终端 Profile</button
+                  ><button type="button">历史</button
+                  ><button type="button">网络</button
+                  ><button type="button">高级</button>
+                </div>
+                <div class="settings-section">
+                  <h3>启动与设备</h3>
+                  <label class="field-row"
+                    ><span
+                      ><strong>设备名称</strong
+                      ><small>远程客户端看到的名称</small></span
+                    ><input type="text" value="OFFICE-PC"></label
+                  ><label class="setting-row"
+                    ><span
+                      ><strong>登录 Windows 后启动 TermLink</strong
+                      ><small
+                        >以当前用户身份启动，不提升 Shell 权限</small
+                      ></span
+                    ><input type="checkbox" checked></label>
+                </div>
+                <div class="settings-section">
+                  <h3>本地记录</h3>
+                  <label class="field-row"
+                    ><span
+                      ><strong>保留时间</strong
+                      ><small>正文使用 DPAPI 包装的数据密钥加密</small></span
+                    ><select>
+                      <option>7 天</option>
+                      <option>1 天</option>
+                      <option>30 天</option>
+                      <option>不记录</option>
+                    </select></label
+                  >
+                  <div class="storage-meter">
+                    <span><i></i></span>
+                    <div>
+                      <strong>已使用 182 MB</strong><small>上限 2 GB</small>
+                    </div>
+                    <button type="button">清理</button>
+                  </div>
+                </div>
+                <div class="settings-section">
+                  <h3>版本与诊断</h3>
+                  <div class="version-row">
+                    <span
+                      ><strong>TermLink Agent 1.0.0</strong
+                      ><small
+                        >协议 v1 · ConPTY 可用 · Profile 已注册</small
+                      ></span
+                    ><em>最新</em><button type="button">导出诊断包</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section
+            class="desktop-mock app-window"
+            data-screen="windows-membership"
+            aria-label="Windows 账户与会员"
+          >
+            <div class="window-titlebar">
+              <span class="brand-mark small">T</span><strong>TermLink</strong
+              ><span class="window-controls">— □ ×</span>
+            </div>
+            <div class="window-body">
+              <nav class="desktop-sidebar" aria-label="Windows 账户与会员导航">
+                <div class="pc-identity">
+                  <span>OP</span>
+                  <div>
+                    <strong>OFFICE-PC</strong
+                    ><small><i class="presence online"></i>在线</small>
+                  </div>
+                </div>
+                <button type="button">
+                  <svg><use href="#i-terminal" /></svg>会话</button
+                ><button type="button">
+                  <svg><use href="#i-users" /></svg>远程访问</button
+                ><button type="button">
+                  <svg><use href="#i-activity" /></svg>活动</button
+                ><button type="button">
+                  <svg><use href="#i-settings" /></svg>设置
+                </button>
+                <div class="sidebar-bottom">
+                  <button class="is-active" type="button">
+                    <svg><use href="#i-card" /></svg>账户与会员
+                  </button>
+                </div>
+              </nav>
+              <div class="desktop-content membership-desktop">
+                <header class="content-header">
+                  <div>
+                    <p class="overline">Alex Chen</p>
+                    <h2>账户与会员</h2>
+                  </div>
+                  <button type="button">管理账户</button>
+                </header>
+                <div class="desktop-plan-banner">
+                  <div>
+                    <span class="plan-orb">T</span>
+                    <div>
+                      <small>当前方案</small>
+                      <h3>TermLink Free</h3>
+                      <p>免费权益适用于整个账号，不影响本地终端运行。</p>
+                    </div>
+                  </div>
+                  <em>FREE</em>
+                </div>
+                <div class="desktop-quota-grid">
+                  <div>
+                    <header>
+                      <span>已连接 PC</span><strong>1 / 1</strong>
+                    </header>
+                    <span class="quota-track"><i class="quota-full"></i></span
+                    ><small>添加第二台 PC 需要会员</small>
+                  </div>
+                  <div>
+                    <header>
+                      <span>同时远程显示会话</span><strong>2 / 3</strong>
+                    </header>
+                    <span class="quota-track"
+                      ><i class="quota-two-thirds"></i></span
+                    ><small>还有 1 个实时显示名额</small>
+                  </div>
+                </div>
+                <div class="desktop-pro-offer">
+                  <div>
+                    <small>月付会员</small>
+                    <h3>在多台 PC 间无缝切换</h3>
+                    <p>
+                      升级后解锁更多 PC
+                      和更多同时显示的终端会话。现有会话、密钥和安全策略保持不变。
+                    </p>
+                    <ul>
+                      <li>多 PC 远程访问</li>
+                      <li>更多并发实时会话</li>
+                      <li>跨 Android/Windows 同步权益</li>
+                    </ul>
+                  </div>
+                  <div>
+                    <span class="price-placeholder">价格在购买页显示</span
+                    ><button class="primary-desktop-action" type="button">
+                      查看月付方案</button
+                    ><button type="button">已有会员？刷新权益</button>
+                  </div>
+                </div>
+                <div class="billing-note">
+                  <svg><use href="#i-shield" /></svg>
+                  <p>
+                    会员到期不会终止 Windows 本地 Shell。超过免费配额的 PC
+                    和实时订阅将暂停远程连接，用户可选择保留哪一台 PC
+                    和三个会话。
+                  </p>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <aside class="design-notes" aria-label="Windows Agent 布局说明">
+          <p class="nav-eyebrow">布局意图</p>
+          <h2 data-note-title>托盘弹层</h2>
+          <p data-note-copy>
+            托盘只承载即时状态、新建会话和紧急停止，复杂配置进入主窗口。
+          </p>
+          <ul data-note-list>
+            <li>远端查看和控制状态始终可见。</li>
+            <li>停止远程访问是独立高优先级动作。</li>
+            <li>本地会话不依赖 Relay 正常运行。</li>
+          </ul>
+        </aside>
+      </section>
+
+      <section class="product-workspace" data-product="server">
+        <aside class="screen-nav" aria-label="服务端管理台页面">
+          <p class="nav-eyebrow">Docker Server Console</p>
+          <h1>无正文运维台</h1>
+          <p class="nav-summary">
+            管理部署、连接和安全事件，只显示路由元数据与性能，不显示终端内容。
+          </p>
+          <div class="screen-nav-list">
+            <button
+              class="screen-link is-active"
+              type="button"
+              data-screen-target="server-overview"
+            >
+              <span>01</span>运行概览
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="server-connections"
+            >
+              <span>02</span>连接路由
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="server-deployment"
+            >
+              <span>03</span>Docker 部署
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="server-audit"
+            >
+              <span>04</span>安全审计
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="server-billing"
+            >
+              <span>05</span>订阅与权益
+            </button>
+          </div>
+          <div class="layout-spec">
+            <span>基准</span><strong>1440 × 900 px</strong><span>公开数据</span
+            ><strong>仅元数据</strong><span>正文</span
+            ><strong>始终不可见</strong>
+          </div>
+        </aside>
+
+        <div class="preview-stage desktop-stage server-preview">
+          <section
+            class="desktop-mock admin-window is-active"
+            data-screen="server-overview"
+            aria-label="服务端运行概览"
+          >
+            <nav class="admin-sidebar" aria-label="Server Console 概览导航">
+              <div class="review-brand">
+                <span class="brand-mark small">T</span
+                ><span
+                  ><strong>TermLink</strong><small>Server Console</small></span
+                >
+              </div>
+              <div class="environment-select">
+                <span class="presence online"></span>
+                <div><small>环境</small><strong>production</strong></div>
+                <svg><use href="#i-chevron" /></svg>
+              </div>
+              <div class="admin-nav">
+                <button class="is-active" type="button">
+                  <svg><use href="#i-activity" /></svg>概览</button
+                ><button type="button">
+                  <svg><use href="#i-server" /></svg>连接</button
+                ><button type="button">
+                  <svg><use href="#i-box" /></svg>部署</button
+                ><button type="button">
+                  <svg><use href="#i-users" /></svg>设备与授权</button
+                ><button type="button">
+                  <svg><use href="#i-shield" /></svg>安全审计</button
+                ><button type="button">
+                  <svg><use href="#i-settings" /></svg>设置
+                </button>
+              </div>
+              <div class="admin-user">
+                <span>AX</span>
+                <div><strong>Alex Chen</strong><small>管理员</small></div>
+              </div>
+            </nav>
+            <div class="admin-main">
+              <header class="admin-topbar">
+                <div>
+                  <p class="overline">production</p>
+                  <h2>运行概览</h2>
+                </div>
+                <div>
+                  <span class="healthy-badge"><i></i>所有服务正常</span
+                  ><button type="button" aria-label="查看通知">
+                    <svg><use href="#i-bell" /></svg>
+                  </button>
+                </div>
+              </header>
+              <div class="stat-line">
+                <div>
+                  <small>在线连接</small><strong>14</strong
+                  ><span>5 PC · 3 Android</span>
+                </div>
+                <div>
+                  <small>活动会话</small><strong>9</strong
+                  ><span>2 个有查看者</span>
+                </div>
+                <div>
+                  <small>路由延迟 P95</small><strong>42 ms</strong
+                  ><span>区域 ap-east</span>
+                </div>
+              </div>
+              <div class="admin-grid">
+                <section class="ops-section traffic-panel">
+                  <header>
+                    <div>
+                      <h3>实时流量</h3>
+                      <p>最近 30 分钟 · 仅密文大小</p>
+                    </div>
+                    <span>18.4 MB/s</span>
+                  </header>
+                  <svg
+                    class="traffic-chart"
+                    viewBox="0 0 620 190"
+                    role="img"
+                    aria-label="实时密文流量折线图"
+                  >
+                    <path class="grid-line" d="M0 45H620M0 95H620M0 145H620" />
+                    <path
+                      class="area-path"
+                      d="M0 154 C50 147 60 126 105 132 S170 87 220 104 S300 73 350 82 S430 39 475 61 S545 26 620 42 L620 190 L0 190Z"
+                    />
+                    <path
+                      class="line-path"
+                      d="M0 154 C50 147 60 126 105 132 S170 87 220 104 S300 73 350 82 S430 39 475 61 S545 26 620 42"
+                    />
+                    <circle cx="620" cy="42" r="5" />
+                  </svg>
+                  <div class="chart-labels">
+                    <span>30m</span><span>20m</span><span>10m</span
+                    ><span>现在</span>
+                  </div>
+                </section>
+                <section class="ops-section service-health">
+                  <header>
+                    <div>
+                      <h3>服务健康</h3>
+                      <p>Docker Compose · 5 containers</p>
+                    </div>
+                    <button type="button">查看部署</button>
+                  </header>
+                  <div class="health-row">
+                    <span
+                      ><i class="presence online"></i
+                      ><b>termlink-server</b></span
+                    ><em>healthy</em><small>1.0.0</small>
+                  </div>
+                  <div class="health-row">
+                    <span><i class="presence online"></i><b>postgres</b></span
+                    ><em>healthy</em><small>17.6</small>
+                  </div>
+                  <div class="health-row">
+                    <span><i class="presence online"></i><b>valkey</b></span
+                    ><em>healthy</em><small>8.1</small>
+                  </div>
+                  <div class="health-row">
+                    <span><i class="presence online"></i><b>minio</b></span
+                    ><em>healthy</em><small>2026.07</small>
+                  </div>
+                  <div class="health-row">
+                    <span><i class="presence online"></i><b>caddy</b></span
+                    ><em>healthy</em><small>2.10</small>
+                  </div>
+                </section>
+              </div>
+              <section class="ops-section recent-events">
+                <header>
+                  <div>
+                    <h3>最近事件</h3>
+                    <p>不包含命令、终端正文和密文</p>
+                  </div>
+                  <button type="button">全部活动</button>
+                </header>
+                <div class="event-table">
+                  <div>
+                    <span
+                      ><i class="event-icon success"
+                        ><svg><use href="#i-device" /></svg></i
+                      ><b>PC 重新连接</b
+                      ><small>pc_8f21 · OFFICE-PC</small></span
+                    ><em>刚刚</em>
+                  </div>
+                  <div>
+                    <span
+                      ><i class="event-icon"
+                        ><svg><use href="#i-users" /></svg></i
+                      ><b>输入租约已释放</b
+                      ><small>session_72c1 · idle timeout</small></span
+                    ><em>2 分钟前</em>
+                  </div>
+                  <div>
+                    <span
+                      ><i class="event-icon"
+                        ><svg><use href="#i-box" /></svg></i
+                      ><b>加密事件块已保存</b
+                      ><small>2.8 MB · seq 18,420–21,904</small></span
+                    ><em>4 分钟前</em>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </section>
+
+          <section
+            class="desktop-mock admin-window"
+            data-screen="server-connections"
+            aria-label="服务端连接路由"
+          >
+            <nav class="admin-sidebar" aria-label="Server Console 连接导航">
+              <div class="review-brand">
+                <span class="brand-mark small">T</span
+                ><span
+                  ><strong>TermLink</strong><small>Server Console</small></span
+                >
+              </div>
+              <div class="environment-select">
+                <span class="presence online"></span>
+                <div><small>环境</small><strong>production</strong></div>
+                <svg><use href="#i-chevron" /></svg>
+              </div>
+              <div class="admin-nav">
+                <button type="button">
+                  <svg><use href="#i-activity" /></svg>概览</button
+                ><button class="is-active" type="button">
+                  <svg><use href="#i-server" /></svg>连接</button
+                ><button type="button">
+                  <svg><use href="#i-box" /></svg>部署</button
+                ><button type="button">
+                  <svg><use href="#i-users" /></svg>设备与授权</button
+                ><button type="button">
+                  <svg><use href="#i-shield" /></svg>安全审计
+                </button>
+              </div>
+            </nav>
+            <div class="admin-main">
+              <header class="admin-topbar">
+                <div>
+                  <p class="overline">Realtime Relay</p>
+                  <h2>连接与路由</h2>
+                </div>
+                <div>
+                  <label class="admin-search"
+                    ><svg><use href="#i-search" /></svg
+                    ><input type="search" placeholder="搜索连接 ID"></label
+                  ><button type="button">刷新</button>
+                </div>
+              </header>
+              <div class="connection-summary">
+                <span><i></i>14 个连接</span><span>9 个 Session Route</span
+                ><span>ACK Lag P95 3 frames</span><span>0 个慢消费者</span>
+              </div>
+              <div class="data-table connection-table">
+                <div class="data-head">
+                  <span>连接</span><span>角色</span><span>路由</span
+                  ><span>区域 / 延迟</span><span>吞吐</span><span>状态</span
+                  ><span></span>
+                </div>
+                <div class="data-row">
+                  <span><b>conn_a3f8</b><small>device 81…29</small></span
+                  ><span>PC Agent</span><span>4 sessions</span
+                  ><span>ap-east · 24 ms</span><span>12.8 MB/s</span
+                  ><em class="status-pill live">Healthy</em
+                  ><button type="button" aria-label="连接 conn_a3f8 的更多操作">
+                    <svg><use href="#i-more" /></svg>
+                  </button>
+                </div>
+                <div class="data-row">
+                  <span><b>conn_09bc</b><small>device 4d…e1</small></span
+                  ><span>Android</span><span>2 subscribed</span
+                  ><span>ap-east · 42 ms</span><span>4.6 MB/s</span
+                  ><em class="status-pill live">Healthy</em
+                  ><button type="button" aria-label="连接 conn_09bc 的更多操作">
+                    <svg><use href="#i-more" /></svg>
+                  </button>
+                </div>
+                <div class="data-row">
+                  <span><b>conn_c291</b><small>device 09…b7</small></span
+                  ><span>PC Agent</span><span>1 session</span
+                  ><span>eu-west · 138 ms</span><span>0.8 MB/s</span
+                  ><em class="status-pill warning">High latency</em
+                  ><button type="button" aria-label="连接 conn_c291 的更多操作">
+                    <svg><use href="#i-more" /></svg>
+                  </button>
+                </div>
+              </div>
+              <div class="privacy-note">
+                <svg><use href="#i-lock" /></svg>
+                <div>
+                  <strong>正文保持端到端加密</strong>
+                  <p>
+                    控制台只显示连接
+                    ID、角色、路由数量、延迟和密文吞吐，无法查看终端标题、命令或输出。
+                  </p>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section
+            class="desktop-mock admin-window"
+            data-screen="server-deployment"
+            aria-label="Docker 部署"
+          >
+            <nav class="admin-sidebar" aria-label="Server Console 部署导航">
+              <div class="review-brand">
+                <span class="brand-mark small">T</span
+                ><span
+                  ><strong>TermLink</strong><small>Server Console</small></span
+                >
+              </div>
+              <div class="environment-select">
+                <span class="presence online"></span>
+                <div><small>环境</small><strong>production</strong></div>
+                <svg><use href="#i-chevron" /></svg>
+              </div>
+              <div class="admin-nav">
+                <button type="button">
+                  <svg><use href="#i-activity" /></svg>概览</button
+                ><button type="button">
+                  <svg><use href="#i-server" /></svg>连接</button
+                ><button class="is-active" type="button">
+                  <svg><use href="#i-box" /></svg>部署</button
+                ><button type="button">
+                  <svg><use href="#i-users" /></svg>设备与授权</button
+                ><button type="button">
+                  <svg><use href="#i-shield" /></svg>安全审计
+                </button>
+              </div>
+            </nav>
+            <div class="admin-main">
+              <header class="admin-topbar">
+                <div>
+                  <p class="overline">Docker Compose</p>
+                  <h2>部署</h2>
+                </div>
+                <div>
+                  <button type="button">备份</button
+                  ><button class="primary-desktop-action" type="button">
+                    检查更新
+                  </button>
+                </div>
+              </header>
+              <div class="deployment-hero">
+                <div>
+                  <span class="deploy-icon"
+                    ><svg><use href="#i-box" /></svg
+                  ></span>
+                  <div>
+                    <small>当前版本</small>
+                    <h3>TermLink Server 1.0.0</h3>
+                    <p>Digest sha256:91da…f82c · linux/amd64</p>
+                  </div>
+                </div>
+                <span class="healthy-badge"><i></i>部署健康</span>
+              </div>
+              <div class="deployment-grid">
+                <section class="ops-section">
+                  <header>
+                    <div>
+                      <h3>Compose 服务</h3>
+                      <p>core + edge + history</p>
+                    </div>
+                    <button type="button">查看 compose.yml</button>
+                  </header>
+                  <div class="container-list">
+                    <div>
+                      <span
+                        ><i class="presence online"></i><b>termlink-server</b
+                        ><small>ghcr.io/termlink/server:1.0.0</small></span
+                      ><em>312 MB</em><strong>0.42 CPU</strong>
+                    </div>
+                    <div>
+                      <span
+                        ><i class="presence online"></i><b>postgres</b
+                        ><small>postgres:17.6-alpine</small></span
+                      ><em>1.2 GB</em><strong>0.18 CPU</strong>
+                    </div>
+                    <div>
+                      <span
+                        ><i class="presence online"></i><b>valkey</b
+                        ><small>valkey/valkey:8.1-alpine</small></span
+                      ><em>86 MB</em><strong>0.05 CPU</strong>
+                    </div>
+                    <div>
+                      <span
+                        ><i class="presence online"></i><b>minio</b
+                        ><small>history profile</small></span
+                      ><em>244 MB</em><strong>0.09 CPU</strong>
+                    </div>
+                  </div>
+                </section>
+                <section class="ops-section backup-panel">
+                  <header>
+                    <div>
+                      <h3>备份与恢复</h3>
+                      <p>最近一次验证恢复 6 天前</p>
+                    </div>
+                  </header>
+                  <div class="backup-item">
+                    <span
+                      ><svg><use href="#i-server" /></svg
+                    ></span>
+                    <div>
+                      <strong>PostgreSQL PITR</strong
+                      ><small>今天 03:00 · 842 MB</small>
+                    </div>
+                    <em>成功</em>
+                  </div>
+                  <div class="backup-item">
+                    <span
+                      ><svg><use href="#i-box" /></svg
+                    ></span>
+                    <div>
+                      <strong>加密历史对象</strong
+                      ><small>生命周期策略已启用</small>
+                    </div>
+                    <em>正常</em>
+                  </div>
+                  <button class="secondary-wide-action" type="button">
+                    运行恢复演练
+                  </button>
+                </section>
+              </div>
+              <section class="ops-section config-check">
+                <header>
+                  <div>
+                    <h3>配置检查</h3>
+                    <p>Secret 与安全基线</p>
+                  </div>
+                  <span>8 / 8 通过</span>
+                </header>
+                <div class="check-grid">
+                  <span>✓ 非 root 用户</span><span>✓ 只读根文件系统</span
+                  ><span>✓ Docker Secret</span><span>✓ TLS 1.3</span
+                  ><span>✓ 镜像签名</span><span>✓ SBOM</span
+                  ><span>✓ Healthcheck</span><span>✓ 固定 Digest</span>
+                </div>
+              </section>
+            </div>
+          </section>
+
+          <section
+            class="desktop-mock admin-window"
+            data-screen="server-audit"
+            aria-label="服务端安全审计"
+          >
+            <nav class="admin-sidebar" aria-label="Server Console 安全审计导航">
+              <div class="review-brand">
+                <span class="brand-mark small">T</span
+                ><span
+                  ><strong>TermLink</strong><small>Server Console</small></span
+                >
+              </div>
+              <div class="environment-select">
+                <span class="presence online"></span>
+                <div><small>环境</small><strong>production</strong></div>
+                <svg><use href="#i-chevron" /></svg>
+              </div>
+              <div class="admin-nav">
+                <button type="button">
+                  <svg><use href="#i-activity" /></svg>概览</button
+                ><button type="button">
+                  <svg><use href="#i-server" /></svg>连接</button
+                ><button type="button">
+                  <svg><use href="#i-box" /></svg>部署</button
+                ><button type="button">
+                  <svg><use href="#i-users" /></svg>设备与授权</button
+                ><button class="is-active" type="button">
+                  <svg><use href="#i-shield" /></svg>安全审计
+                </button>
+              </div>
+            </nav>
+            <div class="admin-main">
+              <header class="admin-topbar">
+                <div>
+                  <p class="overline">Security</p>
+                  <h2>安全审计</h2>
+                </div>
+                <div>
+                  <button type="button">导出元数据</button
+                  ><button type="button">策略</button>
+                </div>
+              </header>
+              <div class="audit-filters">
+                <button class="is-active" type="button">全部事件</button
+                ><button type="button">登录与设备</button
+                ><button type="button">授权</button
+                ><button type="button">输入租约</button
+                ><button type="button">删除</button><span></span
+                ><label
+                  ><svg><use href="#i-search" /></svg
+                  ><input type="search" placeholder="Actor / Target ID"></label>
+              </div>
+              <div class="audit-timeline">
+                <div class="audit-day"><span>今天</span></div>
+                <div class="audit-event">
+                  <i class="audit-marker success"></i><time>15:42:18</time>
+                  <div>
+                    <strong>DEVICE_APPROVED</strong>
+                    <p>Manager device_3a…f1 批准 Android device_8c…29</p>
+                    <small>result=success · trace=tr_9182 · ip=hash:4da7</small>
+                  </div>
+                  <em class="status-pill live">成功</em>
+                </div>
+                <div class="audit-event">
+                  <i class="audit-marker"></i><time>15:18:02</time>
+                  <div>
+                    <strong>LEASE_GRANTED</strong>
+                    <p>Session se_72…c1 向 device_8c…29 授予输入租约</p>
+                    <small>duration=30s · policy=first-confirmed</small>
+                  </div>
+                  <em class="status-pill neutral">已过期</em>
+                </div>
+                <div class="audit-event">
+                  <i class="audit-marker warning"></i><time>14:55:44</time>
+                  <div>
+                    <strong>LOGIN_RATE_LIMITED</strong>
+                    <p>OIDC Callback 连续失败触发短时限制</p>
+                    <small>subject=hash:19ae · attempts=8 · window=60s</small>
+                  </div>
+                  <em class="status-pill warning">已限制</em>
+                </div>
+                <div class="audit-day"><span>昨天</span></div>
+                <div class="audit-event">
+                  <i class="audit-marker success"></i><time>22:08:11</time>
+                  <div>
+                    <strong>HISTORY_DELETE_COMPLETED</strong>
+                    <p>Session se_16…4d 的 18 个加密对象已删除</p>
+                    <small>bytes=42.8MB · objects=18 · proof=del_21c8</small>
+                  </div>
+                  <em class="status-pill live">成功</em>
+                </div>
+              </div>
+              <div class="privacy-note">
+                <svg><use href="#i-shield" /></svg>
+                <div>
+                  <strong>审计日志只记录安全元数据</strong>
+                  <p>
+                    不记录命令、终端正文、访问令牌、完整 IP、公钥或密文
+                    Payload。
+                  </p>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section
+            class="desktop-mock admin-window"
+            data-screen="server-billing"
+            aria-label="服务端订阅与权益"
+          >
+            <nav class="admin-sidebar" aria-label="Server Console 订阅权益导航">
+              <div class="review-brand">
+                <span class="brand-mark small">T</span
+                ><span
+                  ><strong>TermLink</strong><small>Server Console</small></span
+                >
+              </div>
+              <div class="environment-select">
+                <span class="presence online"></span>
+                <div><small>环境</small><strong>production</strong></div>
+                <svg><use href="#i-chevron" /></svg>
+              </div>
+              <div class="admin-nav">
+                <button type="button">
+                  <svg><use href="#i-activity" /></svg>概览</button
+                ><button type="button">
+                  <svg><use href="#i-server" /></svg>连接</button
+                ><button type="button">
+                  <svg><use href="#i-box" /></svg>部署</button
+                ><button type="button">
+                  <svg><use href="#i-users" /></svg>设备与授权</button
+                ><button type="button">
+                  <svg><use href="#i-shield" /></svg>安全审计</button
+                ><button class="is-active" type="button">
+                  <svg><use href="#i-card" /></svg>订阅与权益
+                </button>
+              </div>
+            </nav>
+            <div class="admin-main">
+              <header class="admin-topbar">
+                <div>
+                  <p class="overline">Entitlements</p>
+                  <h2>订阅与权益</h2>
+                </div>
+                <div>
+                  <button type="button">同步购买凭据</button
+                  ><button class="primary-desktop-action" type="button">
+                    新建套餐
+                  </button>
+                </div>
+              </header>
+              <div class="billing-health">
+                <div>
+                  <span class="event-icon success"
+                    ><svg><use href="#i-card" /></svg
+                  ></span>
+                  <div>
+                    <small>计费状态</small
+                    ><strong>购买验证与 Webhook 正常</strong>
+                    <p>Google Play · Web Billing Provider · 最近同步 18 秒前</p>
+                  </div>
+                </div>
+                <span class="healthy-badge"><i></i>Healthy</span>
+              </div>
+              <div class="entitlement-grid">
+                <section class="ops-section plan-config">
+                  <header>
+                    <div>
+                      <h3>套餐目录</h3>
+                      <p>
+                        2 个已启用 · Catalog v7 · 客户端读取已发布版本
+                      </p>
+                    </div>
+                    <button type="button">管理套餐</button>
+                  </header>
+                  <div class="plan-compare">
+                    <div>
+                      <span
+                        ><strong>Free</strong
+                        ><small>默认权益 · 已启用</small></span
+                      >
+                      <dl>
+                        <dt>PC 上限</dt>
+                        <dd>1</dd>
+                        <dt>同时实时显示会话</dt>
+                        <dd>3</dd>
+                        <dt>计费周期</dt>
+                        <dd>免费</dd>
+                      </dl>
+                    </div>
+                    <div class="is-pro">
+                      <span
+                        ><strong>Pro Monthly</strong
+                        ><small>product: pro_monthly · 已启用</small></span
+                      >
+                      <dl>
+                        <dt>PC 上限</dt>
+                        <dd>5</dd>
+                        <dt>同时实时显示会话</dt>
+                        <dd>20</dd>
+                        <dt>计费周期</dt>
+                        <dd>月付</dd>
+                      </dl>
+                    </div>
+                  </div>
+                </section>
+                <section class="ops-section provider-status">
+                  <header>
+                    <div>
+                      <h3>购买渠道</h3>
+                      <p>只保存必要的订单引用与验证状态</p>
+                    </div>
+                  </header>
+                  <div class="provider-row">
+                    <div class="provider-identity">
+                      <i class="presence online"></i>
+                      <div>
+                        <b>Google Play Billing</b><small>RTDN 已连接</small>
+                      </div>
+                    </div>
+                    <em>正常</em>
+                  </div>
+                  <div class="provider-row">
+                    <div class="provider-identity">
+                      <i class="presence online"></i>
+                      <div>
+                        <b>Web Billing Provider</b
+                        ><small>Webhook 签名已验证</small>
+                      </div>
+                    </div>
+                    <em>正常</em>
+                  </div>
+                  <div class="provider-row">
+                    <div class="provider-identity">
+                      <i class="presence online"></i>
+                      <div>
+                        <b>Entitlement Worker</b><small>队列延迟 0.8s</small>
+                      </div>
+                    </div>
+                    <em>正常</em>
+                  </div>
+                </section>
+              </div>
+              <section class="ops-section">
+                <header>
+                  <div>
+                    <h3>最近订阅</h3>
+                    <p>不显示完整支付信息</p>
+                  </div>
+                  <label class="admin-search"
+                    ><svg><use href="#i-search" /></svg
+                    ><input
+                      type="search"
+                      placeholder="Account / Order reference"
+                  ></label>
+                </header>
+                <div class="data-table subscription-table">
+                  <div class="data-head">
+                    <span>账户</span><span>方案</span><span>来源</span
+                    ><span>续费日期</span><span>状态</span><span></span>
+                  </div>
+                  <div class="data-row">
+                    <span><b>acct_7c…21</b><small>entitlement v12</small></span
+                    ><span>Pro Monthly</span><span>Google Play</span
+                    ><span>2026-08-28</span
+                    ><em class="status-pill live">Active</em
+                    ><button
+                      type="button"
+                      aria-label="订阅 acct_7c…21 的更多操作"
+                    >
+                      <svg><use href="#i-more" /></svg>
+                    </button>
+                  </div>
+                  <div class="data-row">
+                    <span
+                      ><b>acct_18…af</b><small>grace until 08-05</small></span
+                    ><span>Pro Monthly</span><span>Web</span><span>—</span
+                    ><em class="status-pill warning">Grace period</em
+                    ><button
+                      type="button"
+                      aria-label="订阅 acct_18…af 的更多操作"
+                    >
+                      <svg><use href="#i-more" /></svg>
+                    </button>
+                  </div>
+                  <div class="data-row">
+                    <span><b>acct_42…0d</b><small>free default</small></span
+                    ><span>Free</span><span>—</span><span>—</span
+                    ><em class="status-pill neutral">Free</em
+                    ><button
+                      type="button"
+                      aria-label="订阅 acct_42…0d 的更多操作"
+                    >
+                      <svg><use href="#i-more" /></svg>
+                    </button>
+                  </div>
+                </div>
+              </section>
+              <div class="privacy-note">
+                <svg><use href="#i-shield" /></svg>
+                <div>
+                  <strong>套餐与权益由服务端决定，价格由渠道展示</strong>
+                  <p>
+                    客户端不能自行创建套餐或修改额度。订阅到期不会结束 Windows
+                    本地 Shell，只暂停超过降级目标套餐额度的远程连接。
+                  </p>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <aside class="design-notes" aria-label="Server Console 布局说明">
+          <p class="nav-eyebrow">布局意图</p>
+          <h2 data-note-title>运行概览</h2>
+          <p data-note-copy>
+            运维首页只回答连接是否健康、路由是否延迟、容器是否正常，不展示虚假的业务增长指标。
+          </p>
+          <ul data-note-list>
+            <li>所有流量数值明确标注为密文。</li>
+            <li>正文不可见是持续显示的系统属性。</li>
+            <li>部署、连接、安全审计形成三个清晰工作区。</li>
+          </ul>
+        </aside>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
