@@ -1,0 +1,37 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.10.34928.147
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.AgentControl", "src\AgentControl\TermLink.AgentControl.csproj", "{0C64C462-A681-47FC-A30F-16676BFDB81A}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Agent", "src\Agent\TermLink.Agent.csproj", "{F8FA2D19-27E3-4BDE-A6A9-FD85B8E2E9B2}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.SessionHost", "src\SessionHost\TermLink.SessionHost.csproj", "{9BE38CE8-9A08-43F0-B054-9372C71590B4}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Tray", "src\Tray\TermLink.Tray.csproj", "{6280F2B1-75D9-4E92-A626-393683A32EA9}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{0C64C462-A681-47FC-A30F-16676BFDB81A}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{0C64C462-A681-47FC-A30F-16676BFDB81A}.Debug|x64.Build.0 = Debug|Any CPU
+		{0C64C462-A681-47FC-A30F-16676BFDB81A}.Release|x64.ActiveCfg = Release|Any CPU
+		{0C64C462-A681-47FC-A30F-16676BFDB81A}.Release|x64.Build.0 = Release|Any CPU
+		{F8FA2D19-27E3-4BDE-A6A9-FD85B8E2E9B2}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{F8FA2D19-27E3-4BDE-A6A9-FD85B8E2E9B2}.Debug|x64.Build.0 = Debug|Any CPU
+		{F8FA2D19-27E3-4BDE-A6A9-FD85B8E2E9B2}.Release|x64.ActiveCfg = Release|Any CPU
+		{F8FA2D19-27E3-4BDE-A6A9-FD85B8E2E9B2}.Release|x64.Build.0 = Release|Any CPU
+		{9BE38CE8-9A08-43F0-B054-9372C71590B4}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{9BE38CE8-9A08-43F0-B054-9372C71590B4}.Debug|x64.Build.0 = Debug|Any CPU
+		{9BE38CE8-9A08-43F0-B054-9372C71590B4}.Release|x64.ActiveCfg = Release|Any CPU
+		{9BE38CE8-9A08-43F0-B054-9372C71590B4}.Release|x64.Build.0 = Release|Any CPU
+		{6280F2B1-75D9-4E92-A626-393683A32EA9}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{6280F2B1-75D9-4E92-A626-393683A32EA9}.Debug|x64.Build.0 = Debug|Any CPU
+		{6280F2B1-75D9-4E92-A626-393683A32EA9}.Release|x64.ActiveCfg = Release|Any CPU
+		{6280F2B1-75D9-4E92-A626-393683A32EA9}.Release|x64.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

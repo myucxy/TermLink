@@ -4,8 +4,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark light">
-    <title>TermLink UI Layout Review</title>
-    <link rel="stylesheet" href="styles.css">
+    <title>TermLink Product UI</title>
+    <link rel="stylesheet" href="styles.css?v=7">
   </head>
   <body>
     <svg class="svg-defs" aria-hidden="true">
@@ -86,7 +86,7 @@
     <header class="review-header">
       <div class="review-brand">
         <span class="brand-mark" aria-hidden="true">T</span>
-        <span><strong>TermLink</strong><small>UI layout review</small></span>
+        <span><strong>TermLink</strong><small>Product UI system</small></span>
       </div>
       <nav class="product-tabs" aria-label="选择客户端">
         <button
@@ -103,8 +103,13 @@
           Server Console
         </button>
       </nav>
-      <button class="theme-toggle" type="button" aria-label="切换明暗主题">
-        明暗主题
+      <button
+        class="theme-toggle"
+        type="button"
+        aria-label="切换到明亮主题"
+        aria-pressed="false"
+      >
+        明亮主题
       </button>
     </header>
 
@@ -1317,7 +1322,7 @@
                   <label class="admin-search"
                     ><svg><use href="#i-search" /></svg
                     ><input type="search" placeholder="搜索连接 ID"></label
-                  ><button type="button">刷新</button>
+                  ><button type="button" data-action="refresh-connections">刷新</button>
                 </div>
               </header>
               <div class="connection-summary">
@@ -1335,7 +1340,11 @@
                   ><span>PC Agent</span><span>4 sessions</span
                   ><span>ap-east · 24 ms</span><span>12.8 MB/s</span
                   ><em class="status-pill live">Healthy</em
-                  ><button type="button" aria-label="连接 conn_a3f8 的更多操作">
+                  ><button
+                    type="button"
+                    data-action="connection-details"
+                    aria-label="连接 conn_a3f8 的更多操作"
+                  >
                     <svg><use href="#i-more" /></svg>
                   </button>
                 </div>
@@ -1344,7 +1353,11 @@
                   ><span>Android</span><span>2 subscribed</span
                   ><span>ap-east · 42 ms</span><span>4.6 MB/s</span
                   ><em class="status-pill live">Healthy</em
-                  ><button type="button" aria-label="连接 conn_09bc 的更多操作">
+                  ><button
+                    type="button"
+                    data-action="connection-details"
+                    aria-label="连接 conn_09bc 的更多操作"
+                  >
                     <svg><use href="#i-more" /></svg>
                   </button>
                 </div>
@@ -1353,7 +1366,11 @@
                   ><span>PC Agent</span><span>1 session</span
                   ><span>eu-west · 138 ms</span><span>0.8 MB/s</span
                   ><em class="status-pill warning">High latency</em
-                  ><button type="button" aria-label="连接 conn_c291 的更多操作">
+                  ><button
+                    type="button"
+                    data-action="connection-details"
+                    aria-label="连接 conn_c291 的更多操作"
+                  >
                     <svg><use href="#i-more" /></svg>
                   </button>
                 </div>
@@ -1409,8 +1426,12 @@
                   <h2>部署</h2>
                 </div>
                 <div>
-                  <button type="button">备份</button
-                  ><button class="primary-desktop-action" type="button">
+                  <button type="button" data-action="create-backup">备份</button
+                  ><button
+                    class="primary-desktop-action"
+                    type="button"
+                    data-action="server-update"
+                  >
                     检查更新
                   </button>
                 </div>
@@ -1435,7 +1456,9 @@
                       <h3>Compose 服务</h3>
                       <p>core + edge + history</p>
                     </div>
-                    <button type="button">查看 compose.yml</button>
+                    <button type="button" data-action="show-compose">
+                      查看 compose.yml
+                    </button>
                   </header>
                   <div class="container-list">
                     <div>
@@ -1491,7 +1514,11 @@
                     </div>
                     <em>正常</em>
                   </div>
-                  <button class="secondary-wide-action" type="button">
+                  <button
+                    class="secondary-wide-action"
+                    type="button"
+                    data-action="restore-drill"
+                  >
                     运行恢复演练
                   </button>
                 </section>
@@ -1552,16 +1579,16 @@
                   <h2>安全审计</h2>
                 </div>
                 <div>
-                  <button type="button">导出元数据</button
-                  ><button type="button">策略</button>
+                  <button type="button" data-action="export-audit">导出元数据</button
+                  ><button type="button" data-action="audit-policy">策略</button>
                 </div>
               </header>
               <div class="audit-filters">
-                <button class="is-active" type="button">全部事件</button
-                ><button type="button">登录与设备</button
-                ><button type="button">授权</button
-                ><button type="button">输入租约</button
-                ><button type="button">删除</button><span></span
+                <button class="is-active" type="button" data-action="audit-filter">全部事件</button
+                ><button type="button" data-action="audit-filter">登录与设备</button
+                ><button type="button" data-action="audit-filter">授权</button
+                ><button type="button" data-action="audit-filter">输入租约</button
+                ><button type="button" data-action="audit-filter">删除</button><span></span
                 ><label
                   ><svg><use href="#i-search" /></svg
                   ><input type="search" placeholder="Actor / Target ID"></label>
@@ -1660,7 +1687,11 @@
                 </div>
                 <div>
                   <button type="button">同步购买凭据</button
-                  ><button class="primary-desktop-action" type="button">
+                  ><button
+                    class="primary-desktop-action"
+                    type="button"
+                    data-action="new-plan"
+                  >
                     新建套餐
                   </button>
                 </div>
@@ -1687,7 +1718,12 @@
                         2 个已启用 · Catalog v7 · 客户端读取已发布版本
                       </p>
                     </div>
-                    <button type="button">管理套餐</button>
+                    <span>
+                      <button type="button">管理套餐</button>
+                      <button type="button" data-action="publish-catalog">
+                        发布 Catalog v8
+                      </button>
+                    </span>
                   </header>
                   <div class="plan-compare">
                     <div>
@@ -1767,6 +1803,7 @@
                     ><svg><use href="#i-search" /></svg
                     ><input
                       type="search"
+                      aria-label="搜索账户或订单引用"
                       placeholder="Account / Order reference"
                   ></label>
                 </header>
@@ -1841,6 +1878,98 @@
       </section>
     </main>
 
-    <script src="app.js"></script>
+    <div
+      class="toast-region"
+      id="toast-region"
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+    ></div>
+
+    <dialog class="command-dialog" id="command-dialog">
+      <form method="dialog" class="command-shell">
+        <div class="overlay-header">
+          <div>
+            <p class="overline">快速导航</p>
+            <h2>搜索 PC、会话或操作</h2>
+          </div>
+          <button
+            class="overlay-close"
+            type="submit"
+            value="cancel"
+            aria-label="关闭命令面板"
+          >
+            ×
+          </button>
+        </div>
+        <label class="command-search">
+          <svg aria-hidden="true"><use href="#i-search" /></svg>
+          <input
+            id="command-input"
+            type="search"
+            autocomplete="off"
+            placeholder="输入设备、会话或操作"
+            aria-label="搜索命令"
+          >
+          <kbd>Esc</kbd>
+        </label>
+        <div class="command-results" id="command-results"></div>
+        <div class="command-footer">
+          <span>↑↓ 选择</span><span>Enter 打开</span><span>所有敏感操作仍需确认</span>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="app-dialog" id="app-dialog">
+      <form method="dialog" class="app-dialog-shell">
+        <div class="overlay-header">
+          <div>
+            <p class="overline" id="dialog-eyebrow">TermLink</p>
+            <h2 id="dialog-title">确认操作</h2>
+          </div>
+          <button
+            class="overlay-close"
+            type="submit"
+            value="cancel"
+            aria-label="关闭弹窗"
+          >×</button>
+        </div>
+        <div class="app-dialog-content" id="dialog-content"></div>
+        <div class="dialog-actions">
+          <button class="secondary-dialog-action" type="submit" value="cancel">取消</button>
+          <button
+            class="primary-dialog-action"
+            id="dialog-confirm"
+            type="submit"
+            value="confirm"
+          >
+            确认
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+    <aside
+      class="detail-drawer"
+      id="detail-drawer"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="drawer-title"
+      hidden
+    >
+      <div class="overlay-header">
+        <div>
+          <p class="overline" id="drawer-eyebrow">详情</p>
+          <h2 id="drawer-title">详情</h2>
+        </div>
+        <button class="overlay-close" id="drawer-close" type="button" aria-label="关闭详情">
+          ×
+        </button>
+      </div>
+      <div class="drawer-content" id="drawer-content"></div>
+    </aside>
+
+    <script src="app.js?v=6"></script>
   </body>
 </html>

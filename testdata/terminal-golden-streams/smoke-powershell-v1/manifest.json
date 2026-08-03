@@ -1,0 +1,33 @@
+{
+  "format": "termlink.golden-stream",
+  "format_version": 1,
+  "capture_id": "9a69e46f-0071-40a8-82a3-510b9499ed14",
+  "case_name": "smoke-powershell-v1",
+  "created_at": "2026-08-02T14:00:40.0181628+00:00",
+  "clock": "monotonic-microseconds",
+  "source": {
+    "platform": "windows-conpty",
+    "shell": "powershell",
+    "command_line": "powershell.exe -NoLogo -NoProfile",
+    "working_directory": "C:\\Windows"
+  },
+  "initial_size": {
+    "columns": 80,
+    "rows": 25
+  },
+  "files": {
+    "events": "events.jsonl",
+    "output": "output.bin",
+    "expectations": "expectations.json"
+  },
+  "statistics": {
+    "event_count": 14,
+    "output_event_count": 10,
+    "output_bytes": 702
+  },
+  "sha256": {
+    "events": "05adef54de5ed39fe648cf9d050d6512b639b8c77fd94427980e3deaee7ea043",
+    "output": "e4ce70d544eab5cb91f545e19aa6bed528a3d633012b2c57090450d3fbd1db0f",
+    "expectations": "75fc151d9ce2dffc2c1434d7db1af44df1d7ea1680afff15eb9229a51a6e1aa2"
+  }
+}

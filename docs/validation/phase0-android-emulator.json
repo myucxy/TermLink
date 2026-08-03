@@ -1,0 +1,109 @@
+{
+  "format": "termlink.phase0-android-emulator-validation",
+  "format_version": 1,
+  "generated_at": "2026-08-03T05:16:25.4517579+00:00",
+  "device": {
+    "serial": "emulator-5554",
+    "sdk": 36,
+    "model": "sdk_gphone64_x86_64",
+    "abi": "x86_64"
+  },
+  "apk_sha256": "067b39491a2b1668675dd47fcf2bd4daaf7258e17f72ac9c6b71d02ba8aa6819",
+  "summary": {
+    "case_count": 10,
+    "verified_count": 10,
+    "crash_or_anr_count": 0
+  },
+  "cases": [
+    {
+      "case_name": "ansi-unicode-pwsh-v1",
+      "status": "verified",
+      "event_count": 10,
+      "output_bytes": 1489,
+      "columns": 100,
+      "rows": 30,
+      "exit_code": 17
+    },
+    {
+      "case_name": "smoke-cmd-v1",
+      "status": "verified",
+      "event_count": 6,
+      "output_bytes": 482,
+      "columns": 100,
+      "rows": 30,
+      "exit_code": 17
+    },
+    {
+      "case_name": "smoke-powershell-v1",
+      "status": "verified",
+      "event_count": 14,
+      "output_bytes": 702,
+      "columns": 100,
+      "rows": 30,
+      "exit_code": 17
+    },
+    {
+      "case_name": "smoke-pwsh-v1",
+      "status": "verified",
+      "event_count": 13,
+      "output_bytes": 756,
+      "columns": 100,
+      "rows": 30,
+      "exit_code": 17
+    },
+    {
+      "case_name": "smoke-wsl-v1",
+      "status": "verified",
+      "event_count": 9,
+      "output_bytes": 588,
+      "columns": 100,
+      "rows": 30,
+      "exit_code": 17
+    },
+    {
+      "case_name": "terminal-features-pwsh-v1",
+      "status": "verified",
+      "event_count": 14,
+      "output_bytes": 1988,
+      "columns": 100,
+      "rows": 30,
+      "exit_code": 17
+    },
+    {
+      "case_name": "tui-fzf-wsl-v1",
+      "status": "verified",
+      "event_count": 17,
+      "output_bytes": 4104,
+      "columns": 100,
+      "rows": 30,
+      "exit_code": 17
+    },
+    {
+      "case_name": "tui-htop-wsl-v1",
+      "status": "verified",
+      "event_count": 18,
+      "output_bytes": 3928,
+      "columns": 100,
+      "rows": 30,
+      "exit_code": 17
+    },
+    {
+      "case_name": "tui-less-wsl-v1",
+      "status": "verified",
+      "event_count": 45,
+      "output_bytes": 1464,
+      "columns": 100,
+      "rows": 30,
+      "exit_code": 17
+    },
+    {
+      "case_name": "tui-vim-wsl-v1",
+      "status": "verified",
+      "event_count": 16,
+      "output_bytes": 2049,
+      "columns": 100,
+      "rows": 30,
+      "exit_code": 17
+    }
+  ]
+}

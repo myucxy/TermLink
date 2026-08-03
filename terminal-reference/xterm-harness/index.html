@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self'; form-action 'none'; frame-src 'none'; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self'">
+  <title>TermLink Terminal Reference</title>
+  <link rel="stylesheet" href="vendor/xterm.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="product">TermLink</p>
+      <h1>Terminal compatibility reference</h1>
+    </div>
+    <div class="controls">
+      <label for="case-name">Golden case</label>
+      <input id="case-name" name="case-name" type="text" autocomplete="off" spellcheck="false">
+      <button id="replay" type="button">Replay</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="status-band" aria-labelledby="run-status">
+      <div>
+        <span id="run-status" class="status" data-tone="neutral" aria-live="polite">Waiting</span>
+        <p id="run-facts">No bundle loaded.</p>
+      </div>
+      <div class="actions">
+        <button id="download-grid" type="button" disabled>Export xterm grid</button>
+        <button id="download-report" type="button" disabled>Export diff</button>
+      </div>
+    </section>
+
+    <section class="terminal-band" aria-label="xterm.js rendered terminal">
+      <div id="terminal"></div>
+    </section>
+
+    <section class="comparison" aria-labelledby="comparison-title">
+      <div class="comparison-heading">
+        <div>
+          <p class="eyebrow">Termux ↔ xterm.js</p>
+          <h2 id="comparison-title">Comparable grid fields</h2>
+        </div>
+        <span id="compare-status" class="status" data-tone="neutral">Not compared</span>
+      </div>
+      <p id="compare-summary">Replay a validated bundle to compare the engines.</p>
+      <ol id="differences" class="differences"></ol>
+    </section>
+  </main>
+
+  <script type="module" src="src/app.mjs"></script>
+</body>
+</html>

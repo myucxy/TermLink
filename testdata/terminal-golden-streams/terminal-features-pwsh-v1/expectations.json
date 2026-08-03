@@ -1,0 +1,26 @@
+{
+  "exit_code": 17,
+  "final_size": {
+    "columns": 100,
+    "rows": 30
+  },
+  "output_contains_utf8": [
+    "__OUTPUT_CAPTURE_OK__",
+    "__INPUT_CAPTURED__:android-input-simulation",
+    "__SGR_ATTRIBUTES__",
+    "__ANSI_16_RED__",
+    "__ANSI_256__",
+    "__TRUECOLOR__",
+    "__OSC_COLORS__",
+    "__OSC8_LINK__",
+    "__OSC52_RECOVERED__",
+    "__SCROLL_CURSOR__",
+    "__MODES_ENABLED__",
+    "__ALT_ACTIVE__",
+    "__ALT_RECOVERED__",
+    "__LONG_OSC_RECOVERED__",
+    "__LONG_CSI_RECOVERED__"
+  ],
+  "normalized_grid": null,
+  "reference_screenshot": null
+}

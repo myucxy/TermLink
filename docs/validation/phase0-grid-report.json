@@ -1,0 +1,108 @@
+{
+  "format": "termlink.phase0-grid-comparison",
+  "format_version": 0,
+  "generated_at": "2026-08-03T13:40:56.409Z",
+  "engines": {
+    "reference": "termux-terminal@3df69d1da197dd9bd71a3bafd902dffd720576b4",
+    "candidate": "@xterm/headless@6.0.0 + @xterm/addon-unicode11@0.9.0"
+  },
+  "summary": {
+    "case_count": 10,
+    "checkpoint_count": 122,
+    "matching_checkpoint_count": 122,
+    "different_checkpoint_count": 0,
+    "compatibility_percent": 100
+  },
+  "cases": [
+    {
+      "case_name": "ansi-unicode-pwsh-v1",
+      "capture_id": "c6be8e1d-8e84-490f-9203-4fd7ae757d78",
+      "checkpoint_count": 6,
+      "matching_checkpoint_count": 6,
+      "different_checkpoint_count": 0,
+      "status": "match",
+      "differences": []
+    },
+    {
+      "case_name": "smoke-cmd-v1",
+      "capture_id": "c55436c6-a6e1-4288-bfa6-c42553d443df",
+      "checkpoint_count": 2,
+      "matching_checkpoint_count": 2,
+      "different_checkpoint_count": 0,
+      "status": "match",
+      "differences": []
+    },
+    {
+      "case_name": "smoke-powershell-v1",
+      "capture_id": "9a69e46f-0071-40a8-82a3-510b9499ed14",
+      "checkpoint_count": 10,
+      "matching_checkpoint_count": 10,
+      "different_checkpoint_count": 0,
+      "status": "match",
+      "differences": []
+    },
+    {
+      "case_name": "smoke-pwsh-v1",
+      "capture_id": "c783d480-db0b-41c1-8dc1-d99a58b5a1de",
+      "checkpoint_count": 9,
+      "matching_checkpoint_count": 9,
+      "different_checkpoint_count": 0,
+      "status": "match",
+      "differences": []
+    },
+    {
+      "case_name": "smoke-wsl-v1",
+      "capture_id": "4398f615-5ed1-4fe5-a31f-39a829b0b875",
+      "checkpoint_count": 5,
+      "matching_checkpoint_count": 5,
+      "different_checkpoint_count": 0,
+      "status": "match",
+      "differences": []
+    },
+    {
+      "case_name": "terminal-features-pwsh-v1",
+      "capture_id": "d2f52071-810f-4196-bc46-9b893186bb11",
+      "checkpoint_count": 10,
+      "matching_checkpoint_count": 10,
+      "different_checkpoint_count": 0,
+      "status": "match",
+      "differences": []
+    },
+    {
+      "case_name": "tui-fzf-wsl-v1",
+      "capture_id": "2bf438f9-ee19-402e-b4dc-aed9374e16dd",
+      "checkpoint_count": 13,
+      "matching_checkpoint_count": 13,
+      "different_checkpoint_count": 0,
+      "status": "match",
+      "differences": []
+    },
+    {
+      "case_name": "tui-htop-wsl-v1",
+      "capture_id": "b91b8485-a655-4505-8b5b-d131a57fb2ab",
+      "checkpoint_count": 14,
+      "matching_checkpoint_count": 14,
+      "different_checkpoint_count": 0,
+      "status": "match",
+      "differences": []
+    },
+    {
+      "case_name": "tui-less-wsl-v1",
+      "capture_id": "26c95c30-2f06-4512-b517-f287b3b90348",
+      "checkpoint_count": 41,
+      "matching_checkpoint_count": 41,
+      "different_checkpoint_count": 0,
+      "status": "match",
+      "differences": []
+    },
+    {
+      "case_name": "tui-vim-wsl-v1",
+      "capture_id": "9f78052a-ee87-492a-934f-ee82b9bf1339",
+      "checkpoint_count": 12,
+      "matching_checkpoint_count": 12,
+      "different_checkpoint_count": 0,
+      "status": "match",
+      "differences": []
+    }
+  ]
+}

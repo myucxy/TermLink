@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyName>TermLink.SessionHost</AssemblyName>
+    <RootNamespace>TermLink.SessionHost</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\Common\LocalIpc.cs" Link="Common\LocalIpc.cs" />
+  </ItemGroup>
+</Project>

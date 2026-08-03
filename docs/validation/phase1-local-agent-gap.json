@@ -1,0 +1,19 @@
+{
+  "schema": "termlink.phase1-local-agent-gap-validation",
+  "version": 1,
+  "generated_at_utc": "2026-08-03T13:42:58.8958455Z",
+  "classification": "local Host-Agent bounded backlog only; not production backpressure or Snapshot",
+  "session_id": "7af00bbc-0991-4632-b5fe-0b10509603aa",
+  "passed": true,
+  "production_buffer_limit_bytes": 4194304,
+  "diagnostic_buffer_limit_bytes": 65536,
+  "produced_output_bytes": 262144,
+  "first_persisted_sequence": 68,
+  "last_persisted_sequence": 72,
+  "persisted_frames": 5,
+  "persisted_gap_frames": 1,
+  "persisted_output_bytes": 4080,
+  "input_frames_persisted": 0,
+  "final_ack": 72,
+  "lifecycle_exit_code": 23
+}

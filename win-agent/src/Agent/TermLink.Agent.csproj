@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyName>TermLink.Agent</AssemblyName>
+    <RootNamespace>TermLink.Agent</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\Common\LocalIpc.cs" Link="Common\LocalIpc.cs" />
+    <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
+    <PackageReference Include="System.IO.Pipes.AccessControl" Version="5.0.0" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+</Project>

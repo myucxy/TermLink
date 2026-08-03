@@ -1,0 +1,24 @@
+{
+  "schema": "termlink.phase1-android-test-network-validation",
+  "version": 1,
+  "generated_at_utc": "2026-08-03T13:42:13.0298059Z",
+  "classification": "temporary Phase 1 test transport; not production Protobuf, Relay, Crypto, or Snapshot",
+  "passed": true,
+  "tests": 5,
+  "failures": 0,
+  "errors": 0,
+  "covered": [
+    "Phase 1 Magic keeps the bidirectional protocol isolated from LAN Replay V1",
+    "raw output is applied before cumulative ACK",
+    "disconnect resumes from the highest locally applied sequence without duplicate feed",
+    "input submission completes only after the matching input_id is accepted",
+    "control lease grant and release bind to RemoteTerminalSession state",
+    "explicit History Gap preserves the last contiguous ACK",
+    "the test endpoint never reuses the read-only LAN Replay path"
+  ],
+  "source_sha256": {
+    "core-network/src/main/kotlin/dev/termlink/network/testrelay/Phase1TestProtocol.kt": "436f0fbfa355fa6d6601820dafd54aef7b3e29ecc6e9864d2435f00d62388d23",
+    "core-network/src/main/kotlin/dev/termlink/network/testrelay/Phase1TestSessionClient.kt": "6dd890c3d57b24ed0ad8380384070f1832c4b158856d3f27f70fbb2c84eeac68",
+    "core-network/src/test/kotlin/dev/termlink/network/testrelay/Phase1TestSessionClientTest.kt": "c180912b3afdda78e2ead6aa48d151b65d27a314e22c468ad82b198503a50ed1"
+  }
+}

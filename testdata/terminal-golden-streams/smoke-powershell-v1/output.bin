@@ -1,0 +1,7 @@
+[2J[m[H]0;管理员: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe[?25hPS C:\Windows> [?25l[1;14H> [93mWrite-Output[m [36m'__OUTPUT_CAPTURE_OK__'
+[?25h[m__OUTPUT_CAPTURE_OK__
+PS C:\Windows> PS C:\Windows> [92m$termlinkValue[m [90m=[m [36m'android-input'[m [90m+[m [36m'-simulation'[m     
+PS C:\Windows[91m> [93mWrite-Output[m ([36m'__INPUT_CAPTURED__:'[m [90m+[m [92m$termlinkValue[3m[97m)[23m[mPS C:\Windows> [93mWrite-Output[m ([36m'__INPUT_CAPTURED__:'[m [90m+[m [92m$termlinkValue[m)
+__INPUT_CAPTURED__:android-input-simulation[25X
+PS C:\Windows> [92mexit[m [97m1[3m7[23m[m[46X[?25l[46C[92m[6;16Hexit[m [97m17
+[?25h[m

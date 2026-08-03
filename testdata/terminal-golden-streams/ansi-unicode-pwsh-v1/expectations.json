@@ -1,0 +1,20 @@
+{
+  "exit_code": 17,
+  "final_size": {
+    "columns": 100,
+    "rows": 30
+  },
+  "output_contains_utf8": [
+    "__OUTPUT_CAPTURE_OK__",
+    "__INPUT_CAPTURED__:android-input-simulation",
+    "__ANSI_16_RED__",
+    "__ANSI_256__",
+    "__TRUECOLOR__",
+    "__CJK__:中文终端",
+    "__EMOJI__:🙂👩‍💻",
+    "__COMBINING__:",
+    "__ALT_SCREEN__"
+  ],
+  "normalized_grid": null,
+  "reference_screenshot": null
+}

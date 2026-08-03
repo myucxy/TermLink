@@ -1,0 +1,33 @@
+{
+  "schema": "termlink.phase1-windows-app-validation",
+  "version": 1,
+  "generated_at_utc": "2026-08-03T13:41:00.2588405Z",
+  "classification": "current-user .NET 8 Agent/Tray and local recovery; not production Relay, installer, or E2EE",
+  "passed": true,
+  "dotnet_sdk": "8.0.303",
+  "target_framework": "net8.0-windows",
+  "warnings": 0,
+  "errors": 0,
+  "real_conpty_session_hosts": 20,
+  "sessions_recovered_after_forced_agent_restart": 20,
+  "sessions_recovered_after_controlled_agent_restart": 20,
+  "registration_times_preserved": true,
+  "registration_index": "DPAPI CurrentUser, atomic replace, PID plus process-start validation",
+  "registration_index_exposed_plaintext": false,
+  "tray_summary_sessions": 20,
+  "local_shells_survived_remote_stop": 20,
+  "remote_stop_cleared_registration_index": true,
+  "tray_boundary": "current-user control Pipe V2 and redacted SessionSummary only",
+  "source_sha256": {
+    "src/AgentControl/AgentControl.cs": "5b766597f8f27566d96a00f7c5afa5bedef7e1e702a0ab6f78fee0297509af92",
+    "src/Agent/CurrentUserPipe.cs": "0e93db425e2ad4ecd4667ac1ae5e700f84ad2ee5d6b73909183e5d4828e8c727",
+    "src/Agent/SessionRegistrationStore.cs": "8a5807f4fbe3b7f2df2a3c23427f65e64297af158c1fdabb66ffae5edaca4687",
+    "src/Agent/SessionRegistry.cs": "2ce428387d2805817a664a5af11ec15a058e2d2d35bc6e7d8f5b39ad000571db",
+    "src/Agent/TermLink.Agent.csproj": "a2548e8b4ab2d8a09344ecd9faae17d08bd8b37caeb43291576c0384abb8c998",
+    "src/SessionHost/TermLink.SessionHost.csproj": "ffacfd59ff698d4b9f480fd6c829695313c81319998984cf0e9a11cd25f55c12",
+    "src/Tray/Program.cs": "d93f69d57c960f9256e997c725bb3f5a1f9674514617dbe3d8f4299cad4fb642",
+    "src/Tray/TrayApplicationContext.cs": "9d08b95673193afb2cb00f486455d6c63cfad32ec313f816ced82db497718e73",
+    "src/Tray/TermLink.Tray.csproj": "fdd2ac4b53aa5a037126d79288621c5a7df9bed9341c00f6490ee6152b6d9a30",
+    "tests/SessionRecoveryValidation.cs": "beba0658ebf3097404cc11cca3a4a23a93d6d2238f0faf690f6fa6a01510d7bd"
+  }
+}

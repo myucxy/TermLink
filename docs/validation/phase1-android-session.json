@@ -1,0 +1,29 @@
+{
+  "schema": "termlink.phase1-android-session-validation",
+  "version": 1,
+  "generated_at_utc": "2026-08-03T13:41:49.1993175Z",
+  "classification": "client session state machine; production Relay and Snapshot formats remain unfrozen",
+  "passed": true,
+  "tests": 11,
+  "failures": 0,
+  "errors": 0,
+  "resize_debounce_milliseconds": "100..200",
+  "covered": [
+    "feed completes before cumulative ACK advances",
+    "duplicate output is discarded",
+    "implicit and explicit gaps do not advance ACK",
+    "reconnect resumes from the highest locally applied sequence",
+    "bounded raw replay starts at sequence 1 and clears the engine",
+    "mid-stream reset is rejected until a portable Snapshot format is frozen",
+    "input requires an unexpired control lease and a unique input_id",
+    "failed input is not retried automatically",
+    "terminal size events are distinct and debounced",
+    "exited sessions reject input and further output",
+    "an Ended lifecycle remains Exited when its final ACK transport fails"
+  ],
+  "source_sha256": {
+    "core-session/src/main/kotlin/dev/termlink/session/RemoteSessionModels.kt": "748418d573339fb9f6fb925ab09a1890c38843dd03025a946003438422a87141",
+    "core-session/src/main/kotlin/dev/termlink/session/RemoteTerminalSession.kt": "fc41ed2ce42e6af6411315573980172fa2d982536a91fbfbeb28e925f5d3cc0e",
+    "core-session/src/test/kotlin/dev/termlink/session/RemoteTerminalSessionTest.kt": "3c19ff8f8e035be44cfa5c0ed36d330f633fab84468e6f28ca2e3a30e9556544"
+  }
+}

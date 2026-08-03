@@ -18,7 +18,7 @@
 5. 登录同一账号只用于设备发现；新设备必须经过配对批准，远程输入还需要设备权限与会话输入租约。
 6. 服务端采用 Go，可用 Docker Image 和 Docker Compose 部署；PostgreSQL 保存元数据，Redis/Valkey 保存在线状态与租约，S3 兼容存储保存可选的端到端加密历史块。
 7. 服务端只路由密文。终端正文、输入和快照在 PC 与已批准 Android 设备之间端到端加密。
-8. UI 采用“Quiet Intelligence / 安静智能”设计语言：低干扰、内容优先、上下文操作、清晰状态和渐进披露；AI 感来自信息组织与交互，不以炫光、渐变或大量卡片代替可用性。
+8. UI 采用“Quiet Focus / 安静专注”设计语言：低干扰、内容优先、上下文操作、清晰状态和渐进披露，不以炫光、渐变或大量卡片代替可用性。
 9. 服务端提供可配置套餐目录；首发预置 Free（1 台远程 PC、3 个实时 Session）与 Pro Monthly，但套餐名称、周期、额度、渠道映射和上下架状态均不硬编码在客户端。
 
 ## 2. 产品定义
@@ -71,8 +71,9 @@ TermLink 是远程终端系统，不是：
 - 多人同时向一个会话输入；
 - macOS/Linux Host Agent 和 iOS；
 - 企业组织、LDAP、审批流和合规归档；
-- AI 自动执行命令；
 - 文件传输、端口转发与公网 SSH Gateway。
+
+模型推理、终端内容解释或摘要、自然语言导航和命令生成不在产品规划内。
 
 ### 2.5 成功指标
 
@@ -839,8 +840,7 @@ PC Agent 只提取 Windows Terminal Scheme 与安全的显示字段，不上传�
 - “危险命令检测”只能提示，不应声称可靠阻止；
 - 多行粘贴、粘贴包含控制字符和远端请求 Clipboard 时必须经过策略；
 - OSC 52 默认询问或禁用，且设置最大解码长度；
-- OSC 8 链接显示完整域名，外部打开前确认，不允许 `file:`、`intent:` 等危险 Scheme；
-- Android AI 功能若未来启用，默认不上传终端全文，必须清楚展示发送范围和目标模型。
+- OSC 8 链接显示完整域名，外部打开前确认，不允许 `file:`、`intent:` 等危险 Scheme。
 
 ## 10. 会话记录、历史与回放
 
@@ -875,17 +875,17 @@ PC Agent 只提取 Windows Terminal Scheme 与安全的显示字段，不上传�
 
 ## 11. UI/UX 总体设计
 
-### 11.1 设计语言：Quiet Intelligence
+### 11.1 设计语言：Quiet Focus
 
-TermLink 的“AI 时代设计语言”定义为：
+TermLink 的“安静专注”设计语言定义为：
 
 - **内容优先**：Terminal 是主角，导航和状态占用最少空间；
 - **上下文操作**：只在用户选中 PC、Session 或输出时出现相关动作；
 - **可解释状态**：在线、同步、E2EE、租约和恢复进度均有明确文字，不依赖颜色猜测；
 - **渐进披露**：默认只显示当前任务所需信息，高级网络、密钥和引擎诊断按需展开；
 - **命令式入口**：提供统一搜索/命令面板，支持快速切 PC、Session 和动作；
-- **克制的智能感**：使用柔和层级、细边界、即时反馈和有限的光谱强调，不大面积使用霓虹渐变或玻璃拟态；
-- **人始终掌控**：AI 相关能力只解释、摘要或生成待确认文本，不自动取得租约或执行命令。
+- **克制的视觉表现**：使用柔和层级、细边界、即时反馈和有限的光谱强调，不大面积使用霓虹渐变或玻璃拟态；
+- **人始终掌控**：远程输入、租约、终止和撤销等操作必须由用户明确发起或确认。
 
 ### 11.2 信息架构
 
@@ -934,7 +934,7 @@ flowchart TB
 - 圆角以 12/16 dp 为主，Terminal Surface 可使用 8～12 dp；
 - 间距遵循 4 dp 基础网格，主要页面边距 16 dp；
 - 不给每一行套 Card；分组主要依靠留白、标题和细分隔线；
-- 光谱渐变只用于 Onboarding 品牌瞬间、命令面板选中光晕或 AI 可选入口，面积不超过页面约 10%。
+- 光谱渐变只用于 Onboarding 品牌瞬间或命令面板选中光晕，面积不超过页面约 10%。
 
 ### 11.4 字体与图标
 
@@ -1059,18 +1059,7 @@ stateDiagram-v2
 
 两端共享相同术语和状态图标：`在线`、`实时`、`只读`、`控制中`、`正在重连`、`已退出`。危险动作都使用“动作 + 对象”命名，例如“终止 build-release 会话”“撤销 Pixel 设备”，减少误操作。
 
-### 11.13 AI 能力预留
-
-MVP 只采用 AI 风格交互，不接入自动执行。后续可选能力：
-
-- 对用户选中的输出解释错误；
-- 对一段历史生成本地摘要；
-- 生成待确认命令草稿；
-- 把自然语言转换为搜索条件或导航动作。
-
-任何 AI 请求必须：显示将发送的文本范围、目标服务、隐私模式和是否保留；生成命令只能进入可编辑预览，不能自动取得租约或直接发送。
-
-### 11.14 无障碍与国际化
+### 11.13 无障碍与国际化
 
 - TalkBack 能读取页面控制与连接状态；Terminal 提供可切换的屏幕阅读器模式；
 - 支持系统字体缩放到 200%，关键动作不被截断；
@@ -1283,6 +1272,13 @@ stateDiagram-v2
 - Android `RemoteTerminalSession`、设备/Session UI；
 - 测试 Relay 上完成实时显示、输入、ACK、Snapshot 和恢复。
 
+截至 2026-08-03 的实施状态（不改变上述生产设计）：Host-Agent IPC、DPAPI Buffer、
+Session Registry、正式 .NET 8 Agent/SessionHost/Tray、DPAPI 注册索引和 20 个真实 ConPTY
+Session 的 Agent 强制结束/受控重启恢复已经验证。Android 状态机及 Android → Docker 临时双向测试
+Relay → 真实 Termux View 的 ACK、断线恢复、输入 accepted、测试租约、Flow Control、
+History Gap 和 exited 也已验证。测试链路使用隔离的明文 `TLT1` 格式，不是生产
+Protobuf/Relay/E2EE；可移植 Snapshot 仍未冻结，也未用 Termux 私有状态替代。
+
 ### 阶段 2：Docker 服务端与账号（3～4 周）
 
 - Go API/Relay、PostgreSQL、Redis/Valkey 和 Compose；
@@ -1295,10 +1291,9 @@ stateDiagram-v2
 - Windows 托盘、Profile、签名安装和更新；
 - xterm.js 回退、压力测试、安全测试、备份恢复和发布流水线。
 
-### 阶段 4：稳定与 AI 可选能力
+### 阶段 4：稳定与规模化
 
 - Termux 上游同步自动化、Golden Regression 和性能优化；
-- 可选解释/摘要/命令草稿，先完成隐私评审；
 - 多 Relay 实例、外部 S3、OIDC 和更完整的自托管文档。
 
 ## 16. 推荐仓库结构
@@ -1352,7 +1347,6 @@ Termux Fork 可以使用 Git Subtree/Submodule + Patch Queue，也可以镜像�
 | Android 默认引擎 | Termux Fork |
 | 兼容回退 | xterm.js 离线 WebView |
 | 自托管 | Docker Compose 官方支持 |
-| AI 自动执行 | 禁止；仅允许待确认辅助 |
 | 首发 Free 默认配额 | 1 台远程 PC、同时 3 个不同 Session |
 | 首发付费套餐 | Pro Monthly，月付自动续费、可取消 |
 | 套餐配置 | 名称、周期、权益、渠道映射、排序和上下架均由服务端版本化发布 |
@@ -1369,7 +1363,11 @@ Termux Fork 可以使用 Git Subtree/Submodule + Patch Queue，也可以镜像�
 4. 多设备 E2EE 的历史密钥恢复和撤销语义；
 5. Docker 服务端慢消费者和大规模 WebSocket 路由。
 
-因此下一项实现应是：`Windows Terminal Profile → Session Host → ConPTY 录制 → Termux Android Harness 离线回放`，先完成 Golden Stream 与真机画面对照，再冻结协议 Snapshot 格式。
+当前环境已经完成 Golden Stream → Termux/xterm.js 对照，以及 Android → Docker 临时测试
+Relay → Termux View 的双向闭环，以及正式 .NET 8 Agent/Tray、DPAPI 注册索引和 20 Session
+重启恢复。下一项实现应补 Windows 签名安装、当前用户自启动、受控更新与失败回滚，然后
+进入生产设备授权、Crypto 与 Relay；兼容和安全评审完成后再冻结生产 Envelope 和可移植
+Snapshot。arm64 真机、厂商 IME、外接键鼠与更多屏幕形态仍需真实硬件验证。
 
 ## 19. 关联文档
 
@@ -1378,3 +1376,4 @@ Termux Fork 可以使用 Git Subtree/Submodule + Patch Queue，也可以镜像�
 - [Android 全功能 Terminal 引擎调研与技术方案](ANDROID_TERMINAL_ENGINE_RESEARCH.md)
 - [Android、Windows Agent、Server Console UI 布局设计稿](UI_LAYOUT_DESIGNS.md)
 - [ConPTY Probe 运行说明](../prototypes/conpty-probe/README.md)
+- [Phase 1 临时双向测试协议](../protocol/test-vectors/PHASE1_TEST_SESSION_V1.md)

@@ -1,0 +1,13 @@
+{"seq":1,"elapsed_us":13073,"type":"lifecycle","state":"started"}
+{"seq":2,"elapsed_us":13337,"type":"resize","columns":80,"rows":25,"reason":"initial"}
+{"seq":3,"elapsed_us":13494,"type":"resize","columns":100,"rows":30,"reason":"probe"}
+{"seq":4,"elapsed_us":123078,"type":"output","data_offset":0,"data_length":121}
+{"seq":5,"elapsed_us":453497,"type":"output","data_offset":121,"data_length":15}
+{"seq":6,"elapsed_us":525045,"type":"output","data_offset":136,"data_length":85}
+{"seq":7,"elapsed_us":577838,"type":"output","data_offset":221,"data_length":14}
+{"seq":8,"elapsed_us":587069,"type":"output","data_offset":235,"data_length":98}
+{"seq":9,"elapsed_us":603066,"type":"output","data_offset":333,"data_length":71}
+{"seq":10,"elapsed_us":629863,"type":"output","data_offset":404,"data_length":26}
+{"seq":11,"elapsed_us":650606,"type":"output","data_offset":430,"data_length":128}
+{"seq":12,"elapsed_us":666106,"type":"output","data_offset":558,"data_length":198}
+{"seq":13,"elapsed_us":717790,"type":"lifecycle","state":"ended","exit_code":17}

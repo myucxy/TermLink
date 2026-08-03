@@ -1,0 +1,39 @@
+{
+  "generated_by": "npm run sync-vendor",
+  "packages": [
+    {
+      "name": "@xterm/xterm",
+      "version": "6.0.0",
+      "integrity": "sha512-TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg==",
+      "license": "MIT"
+    },
+    {
+      "name": "@xterm/addon-unicode11",
+      "version": "0.9.0",
+      "integrity": "sha512-FxDnYcyuXhNl+XSqGZL/t0U9eiNb/q3EWT5rYkQT/zuig8Gz/VagnQANKHdDWFM2lTMk9ly0EFQxxxtZUoRetw==",
+      "license": "MIT"
+    }
+  ],
+  "files": {
+    "xterm.mjs": {
+      "bytes": 344970,
+      "sha256": "b336ec65a086c056d4804b3d4c2347da5663d3f23c3f25be866467bd8857ad59"
+    },
+    "xterm.css": {
+      "bytes": 7112,
+      "sha256": "854a7c0fb70e8b1a083c16797ab827299fb18744f5ad34f227b48337e33293c6"
+    },
+    "LICENSE.xterm.txt": {
+      "bytes": 1261,
+      "sha256": "b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd"
+    },
+    "addon-unicode11.mjs": {
+      "bytes": 31220,
+      "sha256": "37bb2d573c615661c875398be2a3497e02bd21d7202a5d1159f6ab70a8cfc2f2"
+    },
+    "LICENSE.addon-unicode11.txt": {
+      "bytes": 1103,
+      "sha256": "e256f01188af527e4d06d21d06fbf785ae9c50d4b328bf03cbe0ba7f0aa4228f"
+    }
+  }
+}

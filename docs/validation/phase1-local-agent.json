@@ -1,0 +1,22 @@
+{
+  "schema": "termlink.phase1-local-agent-validation",
+  "version": 1,
+  "generated_at_utc": "2026-08-03T13:42:52.8118460Z",
+  "classification": "local Host-Agent IPC only; not the production Relay protocol",
+  "session_id": "6cf509e3-b42b-4804-85c2-cf4bfd8835c4",
+  "passed": true,
+  "double_conpty": true,
+  "reconnects": 1,
+  "last_sequence": 7,
+  "persisted_frames": 7,
+  "output_frames": 3,
+  "output_bytes": 334,
+  "output_sha256": "0c7ee7e8aeafdd9e71ab9acc6b73cdd27847b4b0187f7805b94fd44e83c19026",
+  "input_accepted": 1,
+  "duplicate_input_rejected": 1,
+  "input_frames_persisted": 0,
+  "resize_111x37_observed": true,
+  "lifecycle_exit_code": 17,
+  "final_ack": 7,
+  "buffer_protection": "Windows DPAPI CurrentUser per event chunk"
+}

@@ -1,0 +1,13 @@
+{
+  "exit_code": 17,
+  "final_size": {
+    "columns": 100,
+    "rows": 30
+  },
+  "output_contains_utf8": [
+    "__OUTPUT_CAPTURE_OK__",
+    "__INPUT_CAPTURED__:android-input-simulation"
+  ],
+  "normalized_grid": null,
+  "reference_screenshot": null
+}

@@ -1,0 +1,6 @@
+{"seq":1,"elapsed_us":12433,"type":"lifecycle","state":"started"}
+{"seq":2,"elapsed_us":12692,"type":"resize","columns":80,"rows":25,"reason":"initial"}
+{"seq":3,"elapsed_us":12856,"type":"resize","columns":100,"rows":30,"reason":"probe"}
+{"seq":4,"elapsed_us":32659,"type":"output","data_offset":0,"data_length":90}
+{"seq":5,"elapsed_us":41550,"type":"output","data_offset":90,"data_length":392}
+{"seq":6,"elapsed_us":46735,"type":"lifecycle","state":"ended","exit_code":17}

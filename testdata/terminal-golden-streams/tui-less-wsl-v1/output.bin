@@ -1,0 +1,98 @@
+[2J[m[H]0;C:\Windows\system32\wsl.exe[?25hseq 1 12[25l[Hseq 1 120 | sed '60s/.*/__LESS_ACTIVE__ 中文终端/' > /tmp/termlink-less.txt
+less -R /tmp/termlink-less.txt[45X
+[?25h[?2004h[?2004l[?2004hbash-5.2# seq 1 120 | sed '60s/.*/__LESS_ACTIVE__ 中文终端/' > /tmp/termlink-less.txt
+bash-5.2#[76X[1C[25l[?2004l[22;0;0t[H1[K
+2[K
+3[K
+4[K
+5[K
+6[K
+7[K
+8[K
+9[K
+10[K
+11[K
+12[K
+13[K
+14[K
+15[K
+16[K
+17[K
+18[K
+19[K
+20[K
+21[K
+22[K
+23[K
+24[K
+25[K
+26[K
+27[K
+28[K
+29[K[30m[47m
+/tmp/termlink-less.txt[m[K[?25h...skipping...[K
+92
+93
+94
+95
+96
+97
+98
+99
+100
+101
+102
+103
+104
+105
+106
+107
+108
+109
+110
+111
+112
+113
+114
+115
+116
+117
+118
+119
+120
+[30m[47m(END)[m[K[25l[23;0;0t[Hseq 1 120 | sed '60s/.*/__LESS_ACTIVE__ 中文终端/' > /tmp/termlink-less.txt[K
+less -R /tmp/termlink-less.txt[K
+bash-5.2# seq 1 120 | sed '60s/.*/__LESS_ACTIVE__ 中文终端/' > /tmp/termlink-less.txt[K
+bash-5.2# less -R /tmp/termlink-less.txt[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[5;1H[?25h[?2004hbash-5.2# printf '[?2004l[?2004h[?2004lbash-5.2# printf '__OUTPUT_CAPTURE_OK__\n__INPUT_CAPTURED__:android-input-simulation\n__LESS_EXITED_
+_\n'[K
+__OUTPUT_CAPTURE_OK__[K
+__INPUT_CAPTURED__:android-input-simulation[K
+__LESS_EXITED__[K
+bash-5.2# exit 17[K
+exit[K

@@ -1,0 +1,23 @@
+{
+  "schema": "termlink.phase1-test-relay-validation",
+  "version": 1,
+  "generated_at_utc": "2026-08-03T13:40:55.2319457Z",
+  "classification": "temporary plaintext test Relay over fixed non-sensitive fixtures; not production Relay or Protobuf",
+  "passed": true,
+  "covered": [
+    "isolated binary Magic and strict frame bounds",
+    "cumulative ACK and suffix-only resume",
+    "one-time disconnect recovery",
+    "matching input_id acceptance and test control lease",
+    "slow-consumer FlowControl followed by bounded disconnect",
+    "explicit History Gap range",
+    "Bearer token and non-browser Origin boundary",
+    "LAN Replay V1 tests remain unchanged and passing"
+  ],
+  "source_sha256": {
+    "internal/phase1test/protocol.go": "2b0d4dd28e7edcb861c1e3f2fe81071e6c959616991a70bb829fb91309c4dc70",
+    "internal/phase1test/fixture.go": "323ff8042534a32c2e82e275ba47b7c7991227ed279afe3f05b73734984d763d",
+    "internal/phase1test/handler.go": "ea2d42b2c760f61a6ec81b1ba402c53496f26b30adbde396c6a351b86a45d5e9",
+    "internal/phase1test/phase1test_test.go": "7ebbb16ce2d6b07ab9e54c203a9858a1e85e5e8e8c0762c93362711934ff2975"
+  }
+}

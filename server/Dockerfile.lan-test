@@ -1,0 +1,21 @@
+FROM golang:1.26-alpine AS build
+
+WORKDIR /src/server
+COPY server/go.mod server/go.sum ./
+RUN go mod download
+COPY server/ ./
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/termlink-server \
+    ./cmd/termlink-server
+
+FROM scratch
+
+COPY --from=build /out/termlink-server /termlink-server
+COPY testdata/terminal-golden-streams /testdata/terminal-golden-streams
+
+USER 65532:65532
+EXPOSE 8080
+
+ENTRYPOINT ["/termlink-server"]

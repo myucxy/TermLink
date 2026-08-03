@@ -11,6 +11,8 @@ git地址.txt
 **/obj/
 **/build/
 .gradle/
+.kotlin/
+local.properties
 node_modules/
 dist/
 coverage/

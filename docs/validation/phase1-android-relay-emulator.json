@@ -1,0 +1,37 @@
+{
+  "schema": "termlink.phase1-android-relay-emulator-validation",
+  "version": 1,
+  "generated_at_utc": "2026-08-03T09:54:57.6994315Z",
+  "classification": "API emulator plus temporary plaintext test Relay; not production Relay, E2EE, or hardware validation",
+  "passed": true,
+  "relay_address": "ws://10.0.2.2:8080",
+  "device": {
+    "serial": "emulator-5554",
+    "sdk": 36,
+    "model": "sdk_gphone64_x86_64",
+    "abi": "x86_64"
+  },
+  "apk_sha256": "1025fa916abb464df36cec864b571259a83671dd8c8187fec28f2e39e9195d4e",
+  "scenarios": [
+    {
+      "name": "disconnect-once",
+      "final_state": "ReadOnly then Controlling",
+      "last_acked_sequence": 13,
+      "input_accepted_count": 13
+    },
+    {
+      "name": "history-gap",
+      "final_state": "HistoryGap",
+      "last_acked_sequence": 4,
+      "missing_start": 5,
+      "missing_end": 6
+    },
+    {
+      "name": "exited",
+      "final_state": "Exited",
+      "last_acked_sequence": 14,
+      "exit_code": 17
+    }
+  ],
+  "crash_or_anr_count": 0
+}

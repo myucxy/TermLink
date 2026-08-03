@@ -1,0 +1,189 @@
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  background: #101316;
+  color: #e9edef;
+  letter-spacing: 0;
+  --surface: #171b1f;
+  --surface-2: #20262b;
+  --line: #343c42;
+  --muted: #a6b0b7;
+  --accent: #8fb9ce;
+  --success: #68c590;
+  --warning: #e2b75f;
+  --danger: #ef8383;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  background: #101316;
+}
+
+button,
+input { font: inherit; letter-spacing: 0; }
+
+button {
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0 14px;
+  background: var(--surface-2);
+  color: #eef2f4;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:focus-visible,
+input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:disabled { cursor: not-allowed; opacity: .45; }
+
+.topbar,
+.status-band,
+.comparison {
+  width: min(100%, 1320px);
+  margin-inline: auto;
+  padding-inline: clamp(16px, 4vw, 48px);
+}
+
+.topbar {
+  display: flex;
+  min-height: 92px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  border-bottom: 1px solid var(--line);
+}
+
+.product,
+.eyebrow {
+  margin: 0 0 4px;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+h1 { margin: 0; font-size: 20px; font-weight: 620; }
+h2 { margin: 0; font-size: 18px; font-weight: 620; }
+
+.controls,
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.controls label { color: var(--muted); font-size: 12px; }
+.controls input {
+  width: min(260px, 42vw);
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0 10px;
+  background: #0c0f12;
+  color: #f0f4f6;
+  font-family: Consolas, monospace;
+}
+
+.status-band {
+  display: flex;
+  min-height: 82px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.status::before {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  content: "";
+}
+
+.status[data-tone="success"] { color: var(--success); }
+.status[data-tone="warning"] { color: var(--warning); }
+.status[data-tone="danger"] { color: var(--danger); }
+
+.status-band p,
+.comparison > p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.terminal-band {
+  width: 100%;
+  overflow: auto;
+  border-block: 1px solid var(--line);
+  background: #0b0e12;
+}
+
+#terminal {
+  width: max-content;
+  min-width: 100%;
+  height: 470px;
+  padding: 18px clamp(16px, 4vw, 48px);
+}
+
+#terminal .xterm { height: 100%; }
+
+.comparison { padding-block: 24px 40px; }
+.comparison-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.differences {
+  display: grid;
+  gap: 1px;
+  margin: 18px 0 0;
+  padding: 0;
+  list-style: none;
+  border-block: 1px solid var(--line);
+}
+
+.differences li {
+  display: grid;
+  grid-template-columns: minmax(180px, 30%) 1fr;
+  gap: 16px;
+  min-height: 42px;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.differences li:last-child { border-bottom: 0; }
+.differences code { color: #dfe8ec; overflow-wrap: anywhere; }
+.differences span { overflow-wrap: anywhere; }
+
+@media (max-width: 720px) {
+  .topbar,
+  .status-band { align-items: stretch; flex-direction: column; justify-content: center; padding-block: 16px; }
+  .controls { align-items: stretch; flex-wrap: wrap; }
+  .controls label { width: 100%; }
+  .controls input { width: 100%; flex: 1 1 180px; }
+  .actions { flex-wrap: wrap; }
+  #terminal { height: 390px; padding: 14px 12px; }
+  .comparison-heading { align-items: flex-start; flex-direction: column; }
+  .differences li { grid-template-columns: 1fr; gap: 4px; padding-block: 9px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; }
+}

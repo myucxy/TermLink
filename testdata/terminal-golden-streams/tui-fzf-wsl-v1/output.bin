@@ -1,0 +1,94 @@
+[2J[m[H]0;C:\Windows\system32\wsl.exe[?25hfzf_bin=$(command -v fzf || printf /tmp/termlink-phase0-tools/fzf/usr/bin/fzf)[12X
+printf 'alpha\nbeta-target\ngamma\n中文终端\n' | "$fzf_bin" --no-mouse --border --prompt='printf 'alpha\nbeta-target\ngamma\n中文终端\n' | "$fzf_bin" --no-mouse --border --prompt='TermLink> 
+'[K
+[?2004h[?2004lbash-5.2# fzf_bin=$(command -v fzf || printf /tmp/termlink-phase0-tools/fzf/usr/bin/fzf)
+[?2004hbash-5.2# [25l[?2004l[38;2;95;95;95m[H╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [m[K[38;2;95;95;95m[97C│
+│ [39m[48;2;48;48;48m [m 中文终端[K[38;2;95;95;95m[87C│
+│ [39m[48;2;48;48;48m [m gamma[K[38;2;95;95;95m[90C│
+│ [39m[48;2;48;48;48m [m beta-target[K[38;2;95;95;95m[84C│
+│ [1m[38;2;215;0;95m[48;2;48;48;48m>[22m[39m [1m[38;2;228;228;228malpha[m[K[38;2;95;95;95m[90C│
+│ [m  [38;2;175;175;135m4/4[38;2;95;95;95m ──────────────────────────────────────────────────────────────────────────────────────────[m [38;2;95;95;95m│
+│ [1m[38;2;135;175;215mTermLink>[m[K[38;2;95;95;95m[88C│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯[29;13H[?25h[m[25l[1m[38;2;135;175;215m[29;3HTermLink>[m [1m[97mbe[m[K[?25h[25l[2;3H[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[1m[38;2;215;0;95m[48;2;48;48;48m
+>[22m[39m [1m[38;2;175;215;175mbe[38;2;228;228;228mta-target[m[K[28;3H  [38;2;175;175;135m1/4[38;2;95;95;95m ──────────────────────────────────────────────────────────────────────────────────────────[m [29;15H[?25h[25l[Hfzf_bin=$(command -v fzf || printf /tmp/termlink-phase0-tools/fzf/usr/bin/fzf)[K
+printf 'alpha\nbeta-target\ngamma\n中文终端\n' | "$fzf_bin" --no-mouse --border --prompt='TermLink> 
+'[K
+bash-5.2# fzf_bin=$(command -v fzf || printf /tmp/termlink-phase0-tools/fzf/usr/bin/fzf)[K
+bash-5.2# printf 'alpha\nbeta-target\ngamma\n中文终端\n' | "$fzf_bin" --no-mouse --border --prompt='
+TermLink> '[K
+beta-target[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[8;1H[?25h[?2004hbash-5.2# printf '[?2004l[?2004h[?2004lbash-5.2# printf '__OUTPUT_CAPTURE_OK__\n__INPUT_CAPTURED__:android-input-simulation\n__FZF_EXITED__
+\n'[K
+__OUTPUT_CAPTURE_OK__[K
+__INPUT_CAPTURED__:android-input-simulation[K
+__FZF_EXITED__[K
+bash-5.2# exit 17[K
+exit[K

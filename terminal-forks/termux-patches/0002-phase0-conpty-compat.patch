@@ -1,0 +1,67 @@
+diff --git a/terminal-emulator/src/main/java/com/termux/terminal/TerminalEmulator.java b/terminal-emulator/src/main/java/com/termux/terminal/TerminalEmulator.java
+--- a/terminal-emulator/src/main/java/com/termux/terminal/TerminalEmulator.java
++++ b/terminal-emulator/src/main/java/com/termux/terminal/TerminalEmulator.java
+@@ -484,6 +484,10 @@ public final class TerminalEmulator {
+         return isDecsetInternalBitSet(DECSET_BIT_MOUSE_TRACKING_PRESS_RELEASE) || isDecsetInternalBitSet(DECSET_BIT_MOUSE_TRACKING_BUTTON_EVENT);
+     }
+ 
++    public boolean isFocusReportingActive() {
++        return isDecsetInternalBitSet(DECSET_BIT_SEND_FOCUS_EVENTS);
++    }
++
+     private void setDefaultTabStops() {
+         for (int i = 0; i < mColumns; i++)
+             mTabStop[i] = (i & 7) == 0 && i != 0;
+@@ -1847,7 +1851,13 @@ public final class TerminalEmulator {
+                 continueSequence(ESC_CSI_ARGS_SPACE);
+                 break;
+             default:
+-                parseArg(b);
++                if (b >= 0x20 && b <= 0x2F) {
++                    // Unknown CSI intermediate bytes belong to the current sequence. Consume the
++                    // eventual final byte as well, otherwise it leaks into the visible grid.
++                    continueSequence(ESC_CSI_UNSUPPORTED_INTERMEDIATE_BYTE);
++                } else {
++                    parseArg(b);
++                }
+                 break;
+         }
+     }
+diff --git a/terminal-emulator/src/test/java/com/termux/terminal/ControlSequenceIntroducerTest.java b/terminal-emulator/src/test/java/com/termux/terminal/ControlSequenceIntroducerTest.java
+--- a/terminal-emulator/src/test/java/com/termux/terminal/ControlSequenceIntroducerTest.java
++++ b/terminal-emulator/src/test/java/com/termux/terminal/ControlSequenceIntroducerTest.java
+@@ -37,6 +37,16 @@ public class ControlSequenceIntroducerTest extends TerminalTestCase {
+ 		withTerminalSized(3, 2).enterString("\033[0;38;2;255;255;255;48;2;0;0;0;1;2;3;4;5;7;8;9mabc").assertLinesAre("abc", "   ");
+ 	}
+ 
++	/** Unsupported CSI intermediate sequences are ignored as a unit and must not print their final byte. */
++	public void testUnsupportedCsiIntermediateDoesNotLeakFinalByte() {
++		withTerminalSized(8, 2)
++			.enterString("\033[0%mOK")
++			.assertLinesAre("OK      ", "        ");
++		withTerminalSized(8, 2)
++			.enterString("\033[0%/mOK")
++			.assertLinesAre("OK      ", "        ");
++	}
++
+ 	/** CSI Ps b  Repeat the preceding graphic character Ps times (REP). */
+ 	public void testRepeat() {
+ 		withTerminalSized(3, 2).enterString("a\033[b").assertLinesAre("aa ", "   ");
+diff --git a/terminal-view/src/main/java/com/termux/view/TerminalView.java b/terminal-view/src/main/java/com/termux/view/TerminalView.java
+--- a/terminal-view/src/main/java/com/termux/view/TerminalView.java
++++ b/terminal-view/src/main/java/com/termux/view/TerminalView.java
+@@ -58,6 +58,14 @@ public final class TerminalView extends View {
+ 
+     private TextSelectionCursorController mTextSelectionCursorController;
+ 
++    @Override
++    protected void onFocusChanged(boolean gainFocus, int direction, Rect previouslyFocusedRect) {
++        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect);
++        if (mTermSession != null && mEmulator != null && mEmulator.isFocusReportingActive()) {
++            mTermSession.write(gainFocus ? "\033[I" : "\033[O");
++        }
++    }
++
+     private Handler mTerminalCursorBlinkerHandler;
+     private TerminalCursorBlinkerRunnable mTerminalCursorBlinkerRunnable;
+     private int mTerminalCursorBlinkerRate;

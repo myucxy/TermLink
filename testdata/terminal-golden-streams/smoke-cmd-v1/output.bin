@@ -1,0 +1,13 @@
+[2J[m[HMicrosoft Windows [版本 10.0.19045.6466]]0;C:\Windows\system32\cmd.exe[?25h
+(c) Microsoft Corporation。保留所有权利。[10X
+[51X
+C:\Windows>echo __OUTPUT_CAPTURE_OK__[14X
+__OUTPUT_CAPTURE_OK__[30X
+[51X
+C:\Windows>set /p "termlink_value=__INPUT_PROMPT__"
+__INPUT_PROMPT__android-input-simulation[11X
+[51X
+C:\Windows>echo __INPUT_CAPTURED__:%termlink_value%
+__INPUT_CAPTURED__:android-input-simulation        
+[51X
+C:\Windows>exit /b 17[30X

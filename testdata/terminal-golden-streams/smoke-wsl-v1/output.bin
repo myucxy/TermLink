@@ -1,0 +1,11 @@
+[2J[m[H]0;C:\Windows\system32\wsl.exe[?25hprintf '[25l[Hprintf '__OUTPUT_CAPTURE_OK__\n'[18X
+termlink_value='android-input''-simulation'       
+printf '__INPUT_CAPTURED__:%s\n' "$termlink_value"
+exit 17[43X
+[?25h[?2004hbash-5.2$ [?2004l[?2004h[?2004l[?2004h[?2004l[?2004h[?2004lbash-5.2$ printf '__OUTPUT_CAPTURE_OK__\n'[18X
+__OUTPUT_CAPTURE_OK__[39X
+bash-5.2$ termlink_value='android-input''-simulation'       
+bash-5.2$ printf '__INPUT_CAPTURED__:%s\n' "$termlink_value"
+__INPUT_CAPTURED__:android-input-simulation[17X
+bash-5.2$ exit 17[43X
+exit[56X

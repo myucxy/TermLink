@@ -1,0 +1,151 @@
+[2J[m[H]0;C:\Windows\system32\wsl.exe[?25hprintf 'alpha\nbeta\n中文终端 🙂\n' > /tmp/termlink-vim.txt
+vim -Nu NONE -n -i NONE /tmp/termlink-vim.txt[14X
+[?2004h[?2004l[?2004h[?2004lbash-5.2# printf 'alpha\nbeta\n中文终端 🙂\n' > /tmp/termlink-vim.txt
+bash-5.2# vim -Nu NONE -n -i NONE /tmp/termlink-vim.txt[14X
+[25l[22;0;0t[>4;2m[?2004h[?1004h[22;2t[22;1t[H[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[H[?25h[25l[0%m[>c]10;?]11;?[?4m[94m[malpha[K
+beta[K
+中文终端 🙂[K[94m
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K[m
+"/tmp/termlink-vim.txt" 3L, 29B[K[H[?25h[25l[4;1H__VIM_EDIT_[K[94m
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K[1m[97m
+-- INSERT --[m[K[4;12H[?25h[?2004l[>4;m__VIM_EDIT_OK__[K[94m
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K[m
+"/tmp/termlink-vim.txt"[K[?25l[77C[23;2t[23;1t[30;24H 4L, 45B written[?1004l[?2004l[23;0;0t[>4;m
+[Hprintf 'alpha\nbeta\n中文终端 🙂\n' > /tmp/termlink-vim.txt[K
+vim -Nu NONE -n -i NONE /tmp/termlink-vim.txt[K
+bash-5.2# printf 'alpha\nbeta\n中文终端 🙂\n' > /tmp/termlink-vim.txt[K
+bash-5.2# vim -Nu NONE -n -i NONE /tmp/termlink-vim.txt[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[5;1H[?25h[?2004hbash-5.2# printf '[?2004l[?2004h[?2004lbash-5.2# printf '__OUTPUT_CAPTURE_OK__\n__INPUT_CAPTURED__:android-input-simulation\n__VIM_EXITED__
+\n'[K
+__OUTPUT_CAPTURE_OK__[K
+__INPUT_CAPTURED__:android-input-simulation[K
+__VIM_EXITED__[K
+bash-5.2# exit 17[K
+exit[K

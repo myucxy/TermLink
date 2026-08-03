@@ -1,0 +1,34 @@
+[2J[m[H]0;Administrator: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe\pwsh.exe[?25hPS C:\Windows> [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+PS C:\Windows> $esc = [char]27
+[25l[HPS C:\Windows> [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)[K
+PS C:\Windows> $esc = [char]27[K
+PS C:\Windows> [Console]::Write("__OUTPUT_CAPTURE_OK__`r`n")[K
+__OUTPUT_CAPTURE_OK__[K
+PS C:\Windows> [Console]::Write("${esc}[31m__ANSI_16_RED__${esc}[0m`r`n")[K[31m
+__ANSI_16_RED__[m[K
+PS C:\Windows> [Console]::Write("${esc}[38;5;201m__ANSI_256__${esc}[0m`r`n")[K[38;2;255;0;255m
+__ANSI_256__[m[K
+PS C:\Windows> [Console]::Write("${esc}[38;2;12;200;144m__TRUECOLOR__${esc}[0m`r`n")[K[38;2;12;200;144m
+__TRUECOLOR__[m[K
+PS C:\Windows> [Console]::Write("__CJK__:中文终端`r`n")[K
+__CJK__:中文终端[K
+PS C:\Windows> [Console]::Write("__EMOJI__:����‍��`r`n")[K
+__EMOJI__:🙂👩‍💻[K
+PS C:\Windows> [Console]::Write("__COMBINING__:e`u{0301}`r`n")[K
+__COMBINING__:é[K
+PS C:\Windows> [Console]::Write("${esc}[?1049h__ALT_SCREEN__${esc}[?1049l")[K
+PS C:\Windows> [Console]::Write("${esc}[?2004h${esc}[?2004l")[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[19;1H[?25h[?2004h[?2004lPS C:\Windows> [Console]::Write("__INPUT_CAPTURED__:android-input-simulation`r`n")
+__INPUT_CAPTURED__:android-input-simulation[39X
+PS C:\Windows> exit 17[60X

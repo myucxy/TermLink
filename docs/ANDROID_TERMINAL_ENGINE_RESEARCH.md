@@ -86,9 +86,9 @@ interface TerminalSessionPort {
 Termux 是最合适的原生基础，但原样代码仍不能称为完全兼容。Fork 第一阶段需要补齐：
 
 1. Windows Terminal `selectionBackground` 和可选选择前景色；Termux 当前选择效果主要是反色；
-2. OSC 8 超链接及安全点击回调；
-3. DECSET 1004 焦点进入/离开事件；
-4. DECSET 1003 任意鼠标移动，以及更完整的触控到鼠标策略；
+2. OSC 8 超链接元数据及安全点击回调；当前只验证解析恢复；
+3. DECSET 1004 焦点进入/离开已接入 Remote Session Port，仍需真机生命周期验证；
+4. Mouse 模式与 SGR 输出编码已有回归，DECSET 1003 真实移动和触控策略仍需硬件验证；
 5. Windows/ConPTY 特殊输入与 resize/reflow 差异；
 6. Unicode 表更新、emoji ZWJ 和复杂 grapheme cluster Golden Test；
 7. 搜索、结构化屏幕导出和版本化快照 DTO；
@@ -133,8 +133,8 @@ TermLink Android App
 │   ├── seq / ACK / reconnect
 │   └── output batching and backpressure
 └── TerminalEngine
-    ├── XtermWebViewEngine       # MVP 默认
-    └── NativeVTermEngine       # termlib 实验实现
+    ├── TermuxTerminalEngine     # 默认原生引擎
+    └── XtermWebViewEngine       # 离线兼容回退
 ```
 
 WebView 只负责终端网格、VT 状态和选择渲染；登录、网络、密码学、设备授权、剪贴板授权以及文件访问全部留在 Kotlin 层。
@@ -184,6 +184,23 @@ const terminal = new Terminal({
 - App 进入后台时停止绘制但继续有限缓冲，超过上限触发快照恢复；
 - Release 包关闭 WebView 调试，崩溃日志不能包含终端正文；
 - URL、OSC 52、下载和外部 Intent 必须由 Kotlin 层校验和确认。
+
+### 5.5 当前对照实现
+
+阶段 0 已在 `terminal-reference/xterm-harness` 完成开发用的完全离线 Oracle：固定
+`@xterm/xterm` 6.0.0 和 `@xterm/addon-unicode11` 0.9.0，运行资产、许可证与 SHA-256
+清单均检入仓库。Harness 无 Kotlin Bridge、输入、Clipboard、链接跳转或外网依赖。
+
+四种 Shell、ANSI/Unicode、Terminal Features、Vim、less、fzf 和 htop 共 10 个固定流的
+原始输出块分别驱动 Termux 和 xterm.js。当前 `termlink.terminal-grid-draft` v0 在相同
+`capture_id` 和每个输出事件序号下达到 122/122 checkpoint match。API 36 模拟器也完成
+10/10 独立冷启动回放。该草案只用于定位兼容差异，不是 Android WebView Engine，也不能
+作为 `TerminalSnapshotV1` 或写入 `expectations.normalized_grid`。
+
+Android 输入适配单元测试已覆盖 CJK/emoji code point、控制键、特殊键、bracketed paste、
+SGR mouse、focus 与只读门控；但模拟器程序化测试不能证明厂商 IME、真实鼠标或复杂字体
+回退。arm64 真机、输入法/外设、截图基线和持续性能门槛完成前，不能据此宣称达到默认
+引擎上线门槛。
 
 ## 6. 原生对照方案：connectbot/termlib
 
@@ -423,7 +440,8 @@ interface TerminalEngine {
 - 中文、emoji、组合字符、双宽字符；
 - alternate screen、快速 resize 和鼠标模式。
 
-将同一事件流分别输入 xterm.js 和 termlib，截取最终画面，与 Windows Terminal 参考截图做像素/网格状态对比。
+将同一事件流分别输入 Termux Fork 和 xterm.js，截取最终画面，与 Windows Terminal
+参考截图做像素/网格状态对比；termlib 只保留为额外原生对照候选。
 
 ### 阶段 B：Termux RemoteTerminalEngine
 

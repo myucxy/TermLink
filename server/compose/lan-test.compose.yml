@@ -1,0 +1,25 @@
+services:
+  lan-test-relay:
+    build:
+      context: ../..
+      dockerfile: server/Dockerfile.lan-test
+    image: termlink/lan-test-relay:dev
+    environment:
+      TERMLINK_LISTEN_ADDR: :8080
+      TERMLINK_TESTDATA_DIR: /testdata/terminal-golden-streams
+      TERMLINK_TEST_TOKEN: ${TERMLINK_TEST_TOKEN:-termlink-lan-test}
+    ports:
+      - "0.0.0.0:${TERMLINK_LAN_TEST_PORT:-8080}:8080"
+    read_only: true
+    user: "65532:65532"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/termlink-server", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    restart: unless-stopped

@@ -1,0 +1,6 @@
+[2J[m[H]0;Administrator: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe\pwsh.exe[?25hPS C:\Windows> [25l[93mW[3m[97mrite-Output ('__INPUT_CAPTURED__:' + $termlinkValue)[1;17H[?25h[23m[m[?25l[91m[1;14H> [93mWrite-Output[m [36m'__[3m[97mOUTPUT_CAPTURE_OK__'[23m[m[17X[1;32H[?25h[25l[1;14H> [93mWrite-Output[m [36m'__OUTPUT_CAPTURE_OK__'
+[?25h[m__OUTPUT_CAPTURE_OK__
+PS C:\Windows> [92m$termlinkValue[m [90m=[m [36m'android-input'[m [90m+[m [36m'-simulation'[m
+PS C:\Windows>[49X[1CPS C:\Windows> [93mWrite-Output[m ([36m'__INPUT_CAPTURED__:'[m [90m+[m [92m$termlinkValue[m)
+__INPUT_CAPTURED__:android-input-simulation[25X
+PS C:\Windows> [92mexit[m [97m17[m[46X

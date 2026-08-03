@@ -1,0 +1,33 @@
+{
+  "format": "termlink.golden-stream",
+  "format_version": 1,
+  "capture_id": "b91b8485-a655-4505-8b5b-d131a57fb2ab",
+  "case_name": "tui-htop-wsl-v1",
+  "created_at": "2026-08-03T02:28:09.8620259+00:00",
+  "clock": "monotonic-microseconds",
+  "source": {
+    "platform": "windows-conpty",
+    "shell": "wsl",
+    "command_line": "wsl.exe -d Ubuntu-24.04 -u root --exec env TERM=xterm-256color LANG=C.UTF-8 bash --noprofile --norc",
+    "working_directory": "C:\\Windows"
+  },
+  "initial_size": {
+    "columns": 80,
+    "rows": 25
+  },
+  "files": {
+    "events": "events.jsonl",
+    "output": "output.bin",
+    "expectations": "expectations.json"
+  },
+  "statistics": {
+    "event_count": 18,
+    "output_event_count": 14,
+    "output_bytes": 3928
+  },
+  "sha256": {
+    "events": "d557126d2b251271960c13fa1b487156364ee4cfdb216f8892b68be3f97060bf",
+    "output": "23b66fa4eafd9c17e4b75b5d28cb92e820d52ad66dec0108b0842f16a3e64326",
+    "expectations": "949784635754714ddfa6c7b86c65903953fd2a6b32a02f6960d75d878658b635"
+  }
+}

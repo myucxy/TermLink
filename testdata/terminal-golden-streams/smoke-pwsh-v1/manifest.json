@@ -1,0 +1,33 @@
+{
+  "format": "termlink.golden-stream",
+  "format_version": 1,
+  "capture_id": "c783d480-db0b-41c1-8dc1-d99a58b5a1de",
+  "case_name": "smoke-pwsh-v1",
+  "created_at": "2026-08-03T00:05:58.5337066+00:00",
+  "clock": "monotonic-microseconds",
+  "source": {
+    "platform": "windows-conpty",
+    "shell": "pwsh",
+    "command_line": "\"C:\\Program Files\\WindowsApps\\Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe\\pwsh.exe\" -NoLogo -NoProfile",
+    "working_directory": "C:\\Windows"
+  },
+  "initial_size": {
+    "columns": 80,
+    "rows": 25
+  },
+  "files": {
+    "events": "events.jsonl",
+    "output": "output.bin",
+    "expectations": "expectations.json"
+  },
+  "statistics": {
+    "event_count": 13,
+    "output_event_count": 9,
+    "output_bytes": 756
+  },
+  "sha256": {
+    "events": "d2a41bbc737187bd8549f90844d530da30b3ff73ba99236376546c0462de37b0",
+    "output": "6ef6da01bdd21035af310bd2e42d559cddae5a836757989ac8bb4b9ee19c4301",
+    "expectations": "75fc151d9ce2dffc2c1434d7db1af44df1d7ea1680afff15eb9229a51a6e1aa2"
+  }
+}

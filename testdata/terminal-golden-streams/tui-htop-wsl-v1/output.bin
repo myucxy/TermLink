@@ -1,0 +1,123 @@
+[2J[m[H]0;C:\Windows\system32\wsl.exe[?25hhtop_bin=$(command -v htop || printf /tmp/termlink-phase0-tools/htop/usr/bin/htop)
+LD_LIBRARY_PATH=/tmp/termlink-phase0-tools/lib/u[34X[?2004h[?2004lLD_LIBRARY_PATH=/tmp/termlink-phase0-tools/lib/usr/lib/x86_64-linux-gnu "$htop_bin" -C -d 1 -p $$
+bash-5.2# htop_bin=$(command -v htop || printf /tmp/termlink-phase0-tools/htop/usr/bin/htop)     
+[?2004hbash-5.2# [25l[?2004l[22;0;0t[4l[?7h[H[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[100C[H[K
+    0[1m[97m[[m              0.0%[1m[97m][m   4[1m[97m[[m              0.0%[1m[97m][m   8[1m[97m[[m               0.0%[1m[97m][m 12[1m[97m[[m               0.0%[1m[97m][m  
+    1[1m[97m[[m              0.0%[1m[97m][m   5[1m[97m[[m              0.0%[1m[97m][m   9[1m[97m[[m               0.0%[1m[97m][m 13[1m[97m[[m               0.0%[1m[97m][m  
+    2[1m[97m[[m              0.0%[1m[97m][m   6[1m[97m[[m              0.0%[1m[97m][m  10[1m[97m[[m               0.0%[1m[97m][m 14[1m[97m[[m               0.0%[1m[97m][m  
+    3[1m[97m[[m              0.0%[1m[97m][m   7[1m[97m[[m              0.0%[1m[97m][m  11[1m[97m[[m[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[100C[?7l[?7h[5;1H    3[1m[97m[[m              0.0%[1m[97m][m   7[1m[97m[[m              0.0%[1m[97m][m  11[1m[97m[[m               0.0%[1m[97m][m 15[1m[97m[[m               0.0%[1m[97m][m  
+  Mem[1m[97m[|||[m#@$$$                        955M/15.6G[1m[97m][m Tasks: [1m[97m38[m, [1m[97m32[m thr, 0 kthr; [1m[97m1[m running[K
+  Swp[1m[97m[[m                                  0K/4.00G[1m[97m][m Load average: [1m[97m0.14 [m0.17 0.11[K
+                                                  Uptime: [1m[97m17:27:20[m[K
+[K
+  [30m[47m[Main][m [I/O][K[30m[47m
+    PID USER       PRI  NI  VIRT   RES   SHR S  CPU%▽MEM%   TIME+  Command[K
+   2102 root        20   0  5024  4240  3612 S   0.0  0.0  0:00.01 bash --noprofile --norc[K[m
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+F1[30m[47mHelp  [mF2[30m[47mSetup [mF3[30m[47mSearch[mF4[30m[47mFilter[mF5[30m[47mTree  [mF6[30m[47mSortBy[mF7[30m[47mNice -[mF8[30m[47mNice +[mF9[30m[47mKill  [mF10[30m[47mQuit[K[21C[m[1m[97m[2;31H##[m            9.1[2;31H              0.0%[1m[97m][m   8[1m[97m[[m               0.0%[3;31H              0.0%[1m[97m][m   9[1m[97m[[m               0.0%[4;31H              0.0%[1m[97m][m  10[1m[97m[[m               0.0%[5;31H              0.0%[1m[97m][m  11[1m[97m[[m               0.0%[6;31H        955M/15.6G[1m[97m][m Tasks: [1m[97m38[m, [1m[97m32[m thr, 0 kt[7;31H          0K/4.00G[1m[97m][m Load average: [1m[97m0.13 [m0.16[1m[97m[2;31H##[m            9.1[23;0;0t[Hhtop_bin=$(command -v htop || printf /tmp/termlink-phase0-tools/htop/usr/bin/htop)[K
+LD_LIBRARY_PATH=/tmp/termlink-phase0-tools/lib/usr/lib/x86_64-linux-gnu "$htop_bin" -C -d 1 -p $$   
+bash-5.2# htop_bin=$(command -v htop || printf /tmp/termlink-phase0-tools/htop/usr/bin/htop)        
+bash-5.2# LD_LIBRARY_PATH=/tmp/termlink-phase0-tools/lib/usr/lib/x86_64-linux-gnu "$htop_bin" -C -d 
+1 -p $$[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[6;1H[?25h[?2004hbash-5.2# printf '[?2004l[?2004h[?2004lbash-5.2# printf '__OUTPUT_CAPTURE_OK__\n__INPUT_CAPTURED__:android-input-simulation\n__HTOP_EXITED_
+_\n'[K
+__OUTPUT_CAPTURE_OK__[K
+it 17[K
+__INPUT_CAPTURED__:android-input-simulation[K
+__HTOP_EXITED__[K
+bash-5.2# exit 17[K
+exit[K

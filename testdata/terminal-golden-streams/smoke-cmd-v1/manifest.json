@@ -1,0 +1,33 @@
+{
+  "format": "termlink.golden-stream",
+  "format_version": 1,
+  "capture_id": "c55436c6-a6e1-4288-bfa6-c42553d443df",
+  "case_name": "smoke-cmd-v1",
+  "created_at": "2026-08-03T00:05:46.3354676+00:00",
+  "clock": "monotonic-microseconds",
+  "source": {
+    "platform": "windows-conpty",
+    "shell": "cmd",
+    "command_line": "C:\\Windows\\system32\\cmd.exe /D /Q",
+    "working_directory": "C:\\Windows"
+  },
+  "initial_size": {
+    "columns": 80,
+    "rows": 25
+  },
+  "files": {
+    "events": "events.jsonl",
+    "output": "output.bin",
+    "expectations": "expectations.json"
+  },
+  "statistics": {
+    "event_count": 6,
+    "output_event_count": 2,
+    "output_bytes": 482
+  },
+  "sha256": {
+    "events": "7acee4185c848a5be39b9850b6fa5b9f45d2882bf494caed04c0f865f8b45129",
+    "output": "06556a6ed83c7b8ae3a81bdba9940df0494e9334eee54b1ebdccaea7780d8618",
+    "expectations": "75fc151d9ce2dffc2c1434d7db1af44df1d7ea1680afff15eb9229a51a6e1aa2"
+  }
+}

@@ -1,28 +1,58 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading.Tasks;
+using System.Threading;
 
 namespace TermLink.Validation
 {
+    public sealed class ConPtyCaptureEvent
+    {
+        public long Sequence { get; set; }
+        public long ElapsedMicroseconds { get; set; }
+        public string Type { get; set; }
+        public long OutputOffset { get; set; }
+        public int OutputLength { get; set; }
+        public short Columns { get; set; }
+        public short Rows { get; set; }
+        public string Reason { get; set; }
+        public string State { get; set; }
+        public int? ExitCode { get; set; }
+    }
+
+    public sealed class ConPtyInputStep
+    {
+        public string Text { get; set; }
+        public int DelayBeforeMilliseconds { get; set; }
+        public bool CloseInputAfter { get; set; }
+        public short Columns { get; set; }
+        public short Rows { get; set; }
+        public string ResizeReason { get; set; }
+    }
+
     public sealed class ConPtyProbeResult
     {
         public string CommandLine { get; set; }
         public string Output { get; set; }
+        public byte[] OutputBytes { get; set; }
+        public IList<ConPtyCaptureEvent> Events { get; set; }
         public int ExitCode { get; set; }
         public int ResizeHResult { get; set; }
         public bool OutputCaptured { get; set; }
         public bool InputRoundTripCaptured { get; set; }
         public bool ResizeSucceeded { get; set; }
         public bool ExitCodeCaptured { get; set; }
+        public bool TimedOut { get; set; }
+        public string TerminationReason { get; set; }
 
         public bool Passed
         {
             get
             {
-                return OutputCaptured &&
+                return !TimedOut &&
+                       OutputCaptured &&
                        InputRoundTripCaptured &&
                        ResizeSucceeded &&
                        ExitCodeCaptured;
@@ -33,10 +63,88 @@ namespace TermLink.Validation
     public static class ConPtyProbe
     {
         private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+        private const int STARTF_USESTDHANDLES = 0x00000100;
         private const uint PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016;
         private const uint WAIT_OBJECT_0 = 0x00000000;
         private const uint WAIT_TIMEOUT = 0x00000102;
         private const uint STILL_ACTIVE = 259;
+
+        private sealed class CaptureTimeline
+        {
+            private readonly object sync = new object();
+            private readonly Stopwatch stopwatch = Stopwatch.StartNew();
+            private readonly List<byte> output = new List<byte>();
+            private readonly List<ConPtyCaptureEvent> events = new List<ConPtyCaptureEvent>();
+            private long nextSequence = 1;
+
+            public void AddOutput(byte[] buffer, int length)
+            {
+                lock (sync)
+                {
+                    var offset = output.Count;
+                    for (var index = 0; index < length; index++)
+                    {
+                        output.Add(buffer[index]);
+                    }
+
+                    events.Add(NewEvent("output", new ConPtyCaptureEvent
+                    {
+                        OutputOffset = offset,
+                        OutputLength = length
+                    }));
+                }
+            }
+
+            public void AddResize(short columns, short rows, string reason)
+            {
+                lock (sync)
+                {
+                    events.Add(NewEvent("resize", new ConPtyCaptureEvent
+                    {
+                        Columns = columns,
+                        Rows = rows,
+                        Reason = reason
+                    }));
+                }
+            }
+
+            public void AddLifecycle(string state, int? exitCode)
+            {
+                lock (sync)
+                {
+                    events.Add(NewEvent("lifecycle", new ConPtyCaptureEvent
+                    {
+                        State = state,
+                        ExitCode = exitCode
+                    }));
+                }
+            }
+
+            public byte[] GetOutputBytes()
+            {
+                lock (sync)
+                {
+                    return output.ToArray();
+                }
+            }
+
+            public IList<ConPtyCaptureEvent> GetEvents()
+            {
+                lock (sync)
+                {
+                    return new List<ConPtyCaptureEvent>(events);
+                }
+            }
+
+            private ConPtyCaptureEvent NewEvent(string type, ConPtyCaptureEvent captureEvent)
+            {
+                captureEvent.Sequence = nextSequence++;
+                captureEvent.ElapsedMicroseconds =
+                    (long)(stopwatch.ElapsedTicks * (1000000.0 / Stopwatch.Frequency));
+                captureEvent.Type = type;
+                return captureEvent;
+            }
+        }
 
         public static ConPtyProbeResult Run(
             string commandLine,
@@ -46,6 +154,28 @@ namespace TermLink.Validation
             int expectedExitCode,
             int timeoutMilliseconds)
         {
+            return RunScripted(
+                commandLine,
+                new[] { new ConPtyInputStep { Text = input, DelayBeforeMilliseconds = 0 } },
+                expectedOutputMarker,
+                expectedInputMarker,
+                expectedExitCode,
+                timeoutMilliseconds);
+        }
+
+        public static ConPtyProbeResult RunScripted(
+            string commandLine,
+            IList<ConPtyInputStep> inputSteps,
+            string expectedOutputMarker,
+            string expectedInputMarker,
+            int expectedExitCode,
+            int timeoutMilliseconds)
+        {
+            if (inputSteps == null)
+            {
+                throw new ArgumentNullException("inputSteps");
+            }
+
             IntPtr pseudoConsoleInput = IntPtr.Zero;
             IntPtr terminalInput = IntPtr.Zero;
             IntPtr terminalOutput = IntPtr.Zero;
@@ -53,7 +183,9 @@ namespace TermLink.Validation
             IntPtr pseudoConsole = IntPtr.Zero;
             IntPtr attributeList = IntPtr.Zero;
             PROCESS_INFORMATION processInfo = new PROCESS_INFORMATION();
-            Task<byte[]> readTask = null;
+            var readCompleted = 0;
+            Exception readError = null;
+            var timeline = new CaptureTimeline();
 
             try
             {
@@ -68,6 +200,8 @@ namespace TermLink.Validation
                     0,
                     out pseudoConsole);
                 CheckHResult(createHr, "CreatePseudoConsole");
+                CloseIfValid(ref pseudoConsoleInput);
+                CloseIfValid(ref pseudoConsoleOutput);
 
                 IntPtr attributeListSize = IntPtr.Zero;
                 InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref attributeListSize);
@@ -93,6 +227,10 @@ namespace TermLink.Validation
 
                 var startupInfo = new STARTUPINFOEX();
                 startupInfo.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+                startupInfo.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+                startupInfo.StartupInfo.hStdInput = IntPtr.Zero;
+                startupInfo.StartupInfo.hStdOutput = IntPtr.Zero;
+                startupInfo.StartupInfo.hStdError = IntPtr.Zero;
                 startupInfo.lpAttributeList = attributeList;
                 var processSecurity = new SECURITY_ATTRIBUTES
                 {
@@ -103,48 +241,100 @@ namespace TermLink.Validation
                     nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES))
                 };
 
-                var previousStandardInput = GetStdHandle(-10);
-                var previousStandardOutput = GetStdHandle(-11);
-                var previousStandardError = GetStdHandle(-12);
-                try
-                {
-                    SetStdHandle(-10, IntPtr.Zero);
-                    SetStdHandle(-11, IntPtr.Zero);
-                    SetStdHandle(-12, IntPtr.Zero);
-                    CheckWin32(
-                        CreateProcess(
-                            null,
-                            commandLine,
-                            ref processSecurity,
-                            ref threadSecurity,
-                            false,
-                            EXTENDED_STARTUPINFO_PRESENT,
-                            IntPtr.Zero,
-                            null,
-                            ref startupInfo,
-                            out processInfo),
-                        "CreateProcessW");
-                }
-                finally
-                {
-                    SetStdHandle(-10, previousStandardInput);
-                    SetStdHandle(-11, previousStandardOutput);
-                    SetStdHandle(-12, previousStandardError);
-                }
+                CheckWin32(
+                    CreateProcess(
+                        null,
+                        commandLine,
+                        ref processSecurity,
+                        ref threadSecurity,
+                        false,
+                        EXTENDED_STARTUPINFO_PRESENT,
+                        IntPtr.Zero,
+                        null,
+                        ref startupInfo,
+                        out processInfo),
+                    "CreateProcessW");
+
+                timeline.AddLifecycle("started", null);
+                timeline.AddResize(initialSize.X, initialSize.Y, "initial");
 
                 var outputHandleForReader = terminalOutput;
-                readTask = Task.Run(() => ReadAll(outputHandleForReader));
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try
+                    {
+                        ReadAll(outputHandleForReader, timeline);
+                    }
+                    catch (Exception error)
+                    {
+                        readError = error;
+                    }
+                    finally
+                    {
+                        Interlocked.Exchange(ref readCompleted, 1);
+                    }
+                });
 
-                var resizeHr = ResizePseudoConsole(pseudoConsole, new COORD { X = 100, Y = 30 });
+                var resizedSize = new COORD { X = 100, Y = 30 };
+                var resizeHr = ResizePseudoConsole(pseudoConsole, resizedSize);
+                var allResizesSucceeded = resizeHr == 0;
+                if (resizeHr == 0)
+                {
+                    timeline.AddResize(resizedSize.X, resizedSize.Y, "probe");
+                }
 
-                WriteAll(terminalInput, Encoding.UTF8.GetBytes(input));
+                foreach (var step in inputSteps)
+                {
+                    if (step == null)
+                    {
+                        throw new ArgumentException("Input steps must not contain null entries.", "inputSteps");
+                    }
+                    if (step.DelayBeforeMilliseconds < 0)
+                    {
+                        throw new ArgumentOutOfRangeException(
+                            "inputSteps",
+                            "Input step delay must not be negative.");
+                    }
+                    if (step.DelayBeforeMilliseconds > 0)
+                    {
+                        Thread.Sleep(step.DelayBeforeMilliseconds);
+                    }
+                    if (step.Columns != 0 || step.Rows != 0)
+                    {
+                        if (step.Columns < 2 || step.Columns > 1000 || step.Rows < 2 || step.Rows > 1000)
+                        {
+                            throw new ArgumentOutOfRangeException(
+                                "inputSteps",
+                                "Resize steps must specify both columns and rows from 2 through 1000.");
+                        }
+                        var stepSize = new COORD { X = step.Columns, Y = step.Rows };
+                        resizeHr = ResizePseudoConsole(pseudoConsole, stepSize);
+                        allResizesSucceeded &= resizeHr == 0;
+                        if (resizeHr == 0)
+                        {
+                            timeline.AddResize(
+                                stepSize.X,
+                                stepSize.Y,
+                                string.IsNullOrEmpty(step.ResizeReason) ? "scripted" : step.ResizeReason);
+                        }
+                    }
+                    if (!string.IsNullOrEmpty(step.Text))
+                    {
+                        WriteAll(terminalInput, Encoding.UTF8.GetBytes(step.Text));
+                    }
+                    if (step.CloseInputAfter)
+                    {
+                        CloseIfValid(ref terminalInput);
+                    }
+                }
 
+                var timedOut = false;
                 var waitResult = WaitForSingleObject(processInfo.hProcess, (uint)timeoutMilliseconds);
                 if (waitResult == WAIT_TIMEOUT)
                 {
-                    TerminateProcess(processInfo.hProcess, 124);
-                    WaitForSingleObject(processInfo.hProcess, 5000);
-                    throw new TimeoutException("Shell did not exit within " + timeoutMilliseconds + " ms.");
+                    CheckWin32(TerminateProcess(processInfo.hProcess, 124), "TerminateProcess(timeout)");
+                    waitResult = WaitForSingleObject(processInfo.hProcess, 5000);
+                    timedOut = true;
                 }
                 if (waitResult != WAIT_OBJECT_0)
                 {
@@ -160,41 +350,55 @@ namespace TermLink.Validation
 
                 CloseHandle(terminalInput);
                 terminalInput = IntPtr.Zero;
-                CloseHandle(pseudoConsoleInput);
-                pseudoConsoleInput = IntPtr.Zero;
-                CloseHandle(pseudoConsoleOutput);
-                pseudoConsoleOutput = IntPtr.Zero;
 
                 ClosePseudoConsole(pseudoConsole);
                 pseudoConsole = IntPtr.Zero;
 
-                if (!readTask.Wait(5000))
+                var drainDeadline = Stopwatch.StartNew();
+                while (Interlocked.CompareExchange(ref readCompleted, 0, 0) == 0 &&
+                    drainDeadline.ElapsedMilliseconds < 5000)
+                {
+                    Thread.Sleep(10);
+                }
+                if (Interlocked.CompareExchange(ref readCompleted, 0, 0) == 0)
                 {
                     throw new TimeoutException("ConPTY output pipe did not close after the Shell exited.");
                 }
+                if (readError != null)
+                {
+                    throw new InvalidOperationException("ConPTY output reader failed.", readError);
+                }
 
-                var output = Encoding.UTF8.GetString(readTask.Result);
+                timeline.AddLifecycle("ended", unchecked((int)exitCode));
+                var outputBytes = timeline.GetOutputBytes();
+                var output = Encoding.UTF8.GetString(outputBytes);
                 return new ConPtyProbeResult
                 {
                     CommandLine = commandLine,
                     Output = output,
+                    OutputBytes = outputBytes,
+                    Events = timeline.GetEvents(),
                     ExitCode = unchecked((int)exitCode),
                     ResizeHResult = resizeHr,
                     OutputCaptured = output.Contains(expectedOutputMarker),
                     InputRoundTripCaptured = output.Contains(expectedInputMarker),
-                    ResizeSucceeded = resizeHr == 0,
-                    ExitCodeCaptured = unchecked((int)exitCode) == expectedExitCode
+                    ResizeSucceeded = allResizesSucceeded,
+                    ExitCodeCaptured = unchecked((int)exitCode) == expectedExitCode,
+                    TimedOut = timedOut,
+                    TerminationReason = timedOut ? "timeout" : "exited"
                 };
             }
             finally
             {
                 if (processInfo.hThread != IntPtr.Zero)
                 {
-                    CloseHandle(processInfo.hThread);
+                    CheckWin32(CloseHandle(processInfo.hThread), "CloseHandle(process thread)");
+                    processInfo.hThread = IntPtr.Zero;
                 }
                 if (processInfo.hProcess != IntPtr.Zero)
                 {
-                    CloseHandle(processInfo.hProcess);
+                    CheckWin32(CloseHandle(processInfo.hProcess), "CloseHandle(process)");
+                    processInfo.hProcess = IntPtr.Zero;
                 }
                 if (attributeList != IntPtr.Zero)
                 {
@@ -212,9 +416,8 @@ namespace TermLink.Validation
             }
         }
 
-        private static byte[] ReadAll(IntPtr handle)
+        private static void ReadAll(IntPtr handle, CaptureTimeline timeline)
         {
-            var collected = new List<byte>();
             var buffer = new byte[4096];
             while (true)
             {
@@ -224,12 +427,8 @@ namespace TermLink.Validation
                 {
                     break;
                 }
-                for (var index = 0; index < bytesRead; index++)
-                {
-                    collected.Add(buffer[index]);
-                }
+                timeline.AddOutput(buffer, checked((int)bytesRead));
             }
-            return collected.ToArray();
         }
 
         private static void WriteAll(IntPtr handle, byte[] data)
@@ -414,10 +613,5 @@ namespace TermLink.Validation
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr GetStdHandle(int nStdHandle);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool SetStdHandle(int nStdHandle, IntPtr hHandle);
     }
 }
