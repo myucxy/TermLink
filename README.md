@@ -17,6 +17,9 @@ Session Host 与 Agent 之间具备当前用户 Named Pipe、双向 PID/Token �
 真实 Termux View。API 36 模拟器已验证累计 ACK、断线续传、输入 accepted、测试租约、
 History Gap 和 exited。该链路使用隔离的明文测试协议和固定非敏感夹具，不是生产 Relay、
 Protobuf、设备授权或 E2EE，也没有冻结可移植 Snapshot，因此当前版本仍不是可发布产品。
+Windows 端现已增加签名 MSIX 构建、`windows.startupTask` 登录自启声明和 Tray 单实例保护；
+开发证书下的自包含签名 payload 验证通过，生产受信证书下的真实安装/卸载和更新回滚仍待
+后续完成。
 
 ## 商业模式
 
@@ -59,6 +62,7 @@ Protobuf、设备授权或 E2EE，也没有冻结可移植 Snapshot，因此当�
 .\win-agent\tests\Test-SessionRegistry.ps1
 .\win-agent\Build-Windows.ps1
 .\win-agent\tests\Validate-Phase1WindowsApp.ps1
+.\win-agent\tests\Validate-WindowsInstaller.ps1
 
 # 双向模拟器验收依赖运行中的本地测试容器
 docker compose -f server\compose\lan-test.compose.yml up --build -d

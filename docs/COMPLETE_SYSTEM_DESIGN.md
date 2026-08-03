@@ -1365,9 +1365,12 @@ Termux Fork 可以使用 Git Subtree/Submodule + Patch Queue，也可以镜像�
 
 当前环境已经完成 Golden Stream → Termux/xterm.js 对照，以及 Android → Docker 临时测试
 Relay → Termux View 的双向闭环，以及正式 .NET 8 Agent/Tray、DPAPI 注册索引和 20 Session
-重启恢复。下一项实现应补 Windows 签名安装、当前用户自启动、受控更新与失败回滚，然后
-进入生产设备授权、Crypto 与 Relay；兼容和安全评审完成后再冻结生产 Envelope 和可移植
-Snapshot。arm64 真机、厂商 IME、外接键鼠与更多屏幕形态仍需真实硬件验证。
+重启恢复。Windows 已具备自包含签名 MSIX 构建、登录 StartupTask 和 Tray 单实例；开发
+证书下的包结构、签名与解包 payload 已验证，但没有绕过 Windows 安全警告执行根证书信任或
+真实 Appx 注册。下一项实现应使用生产受信证书补安装/卸载与登录启动验收，并完成受控更新
+和失败回滚，然后进入生产设备授权、Crypto 与 Relay；兼容和安全评审完成后再冻结生产
+Envelope 和可移植 Snapshot。arm64 真机、厂商 IME、外接键鼠与更多屏幕形态仍需真实硬件
+验证。
 
 ## 19. 关联文档
 

@@ -16,6 +16,7 @@ local.properties
 node_modules/
 dist/
 coverage/
+artifacts/
 
 # Local tooling
 .idea/

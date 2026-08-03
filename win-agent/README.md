@@ -136,5 +136,39 @@ SessionHost，分别在强制结束和受控重启 Agent 后从加密索引恢�
 核对 20 条脱敏摘要。最终停止远程访问后，20 个本地 Shell 均继续接收本地输入并正常退出。证据位于
 `docs/validation/phase1-windows-app.json`。
 
-当前仍没有签名安装器、开机启动/更新回滚接入、生产 Relay、账号与设备授权、设备密钥或
-E2EE。阶段性本机控制 Pipe V2 和 DPAPI 注册索引都不等于生产 Protobuf 或跨设备协议。
+## 签名 MSIX 与登录自启
+
+`package/Build-Msix.ps1` 使用固定 .NET 8 SDK 发布 `win-x64` 自包含 payload，分别签名 7 个
+TermLink 自有 EXE/DLL，再由 Windows SDK MakeAppx 生成并签名完整 MSIX。非开发构建必须
+提供 HTTPS RFC 3161 时间戳；Manifest Publisher 必须与 PFX 证书 Subject 完全一致。
+
+```powershell
+$password = Read-Host 'PFX password' -AsSecureString
+.package\Build-Msix.ps1 `
+  -Version 0.1.0.0 `
+  -Publisher 'CN=Your Trusted Publisher' `
+  -PublisherDisplayName 'Your Publisher' `
+  -CertificatePath C:\secure\termlink-signing.pfx `
+  -CertificatePassword $password `
+  -TimestampUrl https://your-rfc3161-timestamp.example
+```
+
+MSIX 使用 `windows.startupTask` 在当前用户登录后启动 `TermLink.Tray.exe`；Tray 再确保同一
+用户的 Agent 已运行。Tray 增加了基于当前用户控制 Pipe 名的本地 Mutex，从登录自启和开始
+菜单重复启动时仍只保留一个托盘实例。包使用稳定生产身份 `TermLink.Terminal`，验证脚本
+使用隔离身份 `TermLink.Terminal.Validation`。
+
+```powershell
+.\tests\Validate-WindowsInstaller.ps1
+```
+
+验证使用不落库的临时开发证书，覆盖 7 个嵌入签名、完整 MSIX 签名、476 文件自包含包、
+Manifest/StartupTask、解包 payload、Tray 单实例、Agent 状态与关闭；不会修改系统证书库或
+注册测试包。当前机器关闭 Developer Mode，开发根证书安装会触发 Windows 安全确认，因此
+尚未把开发证书自动加入 Root，也没有把该结果写成真实 `Add-AppxPackage` 成功。生产证书链
+可用后必须补当前用户安装、登录后启动和卸载验收。证据位于
+`docs/validation/phase1-windows-installer.json`。
+
+当前仍没有受控更新/失败回滚、生产证书下的真实安装验收、生产 Relay、账号与设备授权、
+设备密钥或 E2EE。阶段性本机控制 Pipe V2 和 DPAPI 注册索引都不等于生产 Protobuf 或跨设备
+协议。

@@ -158,6 +158,9 @@ cd E:\WorkSpace\AICodeProject\TermLink\prototypes\conpty-probe
 - 20 个真实 ConPTY SessionHost 已通过 Agent 强制结束和受控重启恢复，两次均 20/20 恢复
   且注册时间保持；Tray 读取 20 条脱敏摘要，远程停止后 20 个本地 Shell 均继续接受本地
   输入并正常退出；
+- Windows 新增签名 MSIX 构建：`win-x64` 自包含 payload、7 个 TermLink 自有二进制嵌入
+  签名、完整包签名、稳定包身份、登录 StartupTask 和 Tray 当前用户单实例；开发证书验证
+  覆盖 476 文件包的解包运行与 Agent 状态，且不修改系统证书库；
 - Android 新增独立 `core-session` 模块，`RemoteTerminalSession` 实现 Live、Reconnecting、
   ReadOnly、Controlling、Exited、HistoryGap、feed 后 ACK、重复丢弃、恢复点、输入租约、
   唯一输入 ID、禁止自动重试和 100～200 ms resize 防抖；
@@ -182,11 +185,13 @@ cd E:\WorkSpace\AICodeProject\TermLink\prototypes\conpty-probe
 - `docs/validation/phase1-test-relay.json`；
 - `docs/validation/phase1-android-relay-emulator.json`；
 - `docs/validation/phase1-windows-app.json`。
+- `docs/validation/phase1-windows-installer.json`。
 
-这些结果尚未完成阶段 1：Agent/Tray 已有正式 .NET 8 工程和本机恢复闭环，但还没有签名
-安装器、开机启动、更新回滚或生产账号/设备接入；`RemoteTerminalSession` 只接入临时明文
-测试网络和 Harness，尚未接入生产 Crypto、设备授权或正式设备/Session 页面。临时 Relay
-不连接真实 Windows Shell；生产 Protobuf、E2EE 和规范化 Snapshot 均未冻结。
+这些结果尚未完成阶段 1：Agent/Tray 已有正式 .NET 8 工程、本机恢复闭环、签名 MSIX 构建
+和登录自启声明，但生产受信证书下的真实安装/卸载、受控更新回滚和生产账号/设备接入仍未
+完成；`RemoteTerminalSession` 只接入临时明文测试网络和 Harness，尚未接入生产 Crypto、
+设备授权或正式设备/Session 页面。临时 Relay 不连接真实 Windows Shell；生产 Protobuf、
+E2EE 和规范化 Snapshot 均未冻结。
 
 ## 6. Android Terminal 结论
 
@@ -334,7 +339,7 @@ python -m http.server 4173 --bind 127.0.0.1
 
 下一段必须按以下顺序继续：
 
-1. 补 Agent/Tray 签名安装、当前用户自启动、受控更新与失败回滚；
+1. 用生产受信证书完成 Agent/Tray 真实安装/卸载与登录启动验收，并补受控更新与失败回滚；
 2. 建立正式设备/Session 页面与设备授权，接入生产 Crypto 和网络边界；
 3. 连接 Windows Agent → 生产 Relay → Android，验证真实 Shell 的输入、ACK、背压与恢复；
 4. 在兼容性和安全验证通过后，再冻结生产 Envelope 与 `TerminalSnapshotV1`。

@@ -412,10 +412,27 @@ Registry 新增 `registrations.dpapi` 恢复索引。索引使用 DPAPI CurrentU
 分别在强制结束和受控重启 Agent 后从加密索引恢复 20/20 个会话，注册时间保持不变；Tray
 读取 20 条脱敏摘要。
 停止全部远程访问后索引被清除，20 个本地 Shell 均继续接收本地输入并正常退出。证据为
-[`phase1-windows-app.json`](validation/phase1-windows-app.json)。该验证仍不包含签名安装、
-当前用户自启动、更新回滚、生产 Relay 或 E2EE。
+[`phase1-windows-app.json`](validation/phase1-windows-app.json)。
 
-### 7.3 Android RemoteTerminalSession
+### 7.3 Windows 签名 MSIX 与登录自启
+
+`package/Build-Msix.ps1` 已使用 .NET 8.0.303 生成 `win-x64` 自包含 payload，签名 7 个
+TermLink 自有 EXE/DLL，再使用 Windows SDK 10.0.26100 MakeAppx 生成并签名完整 MSIX。
+Manifest 使用稳定身份 `TermLink.Terminal`、`runFullTrust` 和
+`windows.startupTask`，登录后启动 Tray；Tray 以当前用户控制 Pipe 派生的本地 Mutex 保证
+重复启动只留下一个实例。
+
+`Validate-WindowsInstaller.ps1` 使用隔离身份和不落库的临时开发证书，验证 476 文件自包含
+包、嵌入签名、包签名、Manifest、StartupTask、解包后的 Tray/Agent 启动、双启动单实例、
+Agent 状态与关闭。验证前后测试包、证书库和 TermLink 进程均无残留。证据为
+[`phase1-windows-installer.json`](validation/phase1-windows-installer.json)。
+
+当前系统关闭 Developer Mode，临时开发根证书加入 CurrentUser Root 会触发 Windows 安全
+确认；自动化没有点击或绕过该警告，也没有把解包运行写成真实安装成功。生产受信代码签名
+证书可用后仍须执行 `Add-AppxPackage`、实际登录启动和卸载验收。受控更新与失败回滚尚未
+实现。
+
+### 7.4 Android RemoteTerminalSession
 
 新增 `android/core-session`，只依赖 `terminal-engine-api` 和 Kotlin Coroutines，不依赖
 Termux、Compose、OkHttp 或 LAN Replay。状态机包含 `Live`、`Reconnecting`、`ReadOnly`、
@@ -436,7 +453,7 @@ Termux、Compose、OkHttp 或 LAN Replay。状态机包含 `Live`、`Reconnectin
 [`phase1-android-session.json`](validation/phase1-android-session.json)。全量 Android/Termux
 构建、单元测试与 Lint 通过；API 36 模拟器再次完成 10/10 固定流和 LAN Docker 回放。
 
-### 7.4 Android 网络、测试 Relay 与真实 Termux View
+### 7.5 Android 网络、测试 Relay 与真实 Termux View
 
 新增 `android/core-network`，通过 OkHttp WebSocket 串行处理独立的 `TLT1` 测试帧。适配器
 在事件完成 `TerminalEngine.feed` 后才发送累计 ACK；断线后从本地最高连续序号恢复且不
@@ -465,12 +482,12 @@ API 36 模拟器经 `ws://10.0.2.2:8080` 实测：`disconnect-once` 恢复到 AC
 Agent 或真实 Shell，不实现设备批准，也不使用 Termux 私有状态冒充跨设备 Snapshot。
 [LAN Replay V1](../protocol/test-vectors/LAN_REPLAY_V1.md) 仍保持只读且格式不变。
 
-### 7.5 尚未完成的生产边界
+### 7.6 尚未完成的生产边界
 
 以上完成阶段 1 的本地 IPC、Session Registry 与客户端状态机核心，不证明生产可用。仍需
 实现和验证：
 
-- Agent/Tray 的签名安装、当前用户自启动、受控更新和失败回滚；
+- Agent/Tray 使用生产受信证书的真实安装/卸载、登录启动、受控更新和失败回滚；
 - Android 正式设备/Session 页面，以及 `RemoteTerminalSession` 与生产网络、Crypto、
   设备授权的组合；
 - Windows Agent → 生产 Relay → Android 的真实端到端输入、ACK、背压和恢复闭环；

@@ -44,11 +44,19 @@ namespace TermLink.Tray
                     return response.Success ? 0 : 1;
                 }
 
-                Application.SetHighDpiMode(HighDpiMode.SystemAware);
-                Application.EnableVisualStyles();
-                Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new TrayApplicationContext(controller));
-                return 0;
+                bool ownsTrayMutex;
+                using (var trayMutex = new Mutex(
+                    true,
+                    "Local\\" + options.ControlPipeName + "-tray",
+                    out ownsTrayMutex))
+                {
+                    if (!ownsTrayMutex) return 0;
+                    Application.SetHighDpiMode(HighDpiMode.SystemAware);
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    Application.Run(new TrayApplicationContext(controller));
+                    return 0;
+                }
             }
             catch
             {

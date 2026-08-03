@@ -1,0 +1,29 @@
+{
+  "schema": "termlink.phase1-windows-installer-validation",
+  "version": 1,
+  "generated_at_utc": "2026-08-03T14:21:14.9874033Z",
+  "classification": "signed development MSIX, unpacked payload, and startup declaration; not trusted production install or updater",
+  "passed": true,
+  "package_identity": "TermLink.Terminal.Validation",
+  "package_version": "0.1.0.0",
+  "architecture": "x64",
+  "self_contained": true,
+  "signed_msix": true,
+  "signed_termlink_binaries": 7,
+  "current_user_install": "not executed: temporary root trust requires Windows security confirmation",
+  "unpacked_packaged_tray_launched": true,
+  "tray_single_instance": true,
+  "packaged_agent_status": "AGENT_STATUS",
+  "startup_task_id": "TermLinkTrayStartup",
+  "startup_task_enabled_by_default": true,
+  "startup_task_executable": "TermLink.Tray.exe",
+  "current_user_uninstall": "not applicable: package was not registered",
+  "system_certificate_store_unchanged": true,
+  "msix_sha256": "210239a7b933d7fc95b04de8764771584b733c1fca120c86ae629947d306be03",
+  "source_sha256": {
+    "package/AppxManifest.xml": "bc8acca26e6d6d6d5b5829ebc9afe6ebd013bdbf6e4b9ec13bee304cf49616af",
+    "package/Build-Msix.ps1": "586da62d7d0fc8971907ccdf1d0e888b59c0350808bf12ca9c136dc46ee1a76c",
+    "src/Tray/Program.cs": "e6e12a7de1ef24a9a8e89ad4a6292a13f7ea79ed7dae26db7bb796c289afff35",
+    "tests/Validate-WindowsInstaller.ps1": "d9c402bda270d1c8007153517782ea79343416f22d8f68e04b5b54b687d08547"
+  }
+}
