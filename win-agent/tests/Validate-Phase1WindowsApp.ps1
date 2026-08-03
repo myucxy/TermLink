@@ -118,7 +118,7 @@ try {
         tray_summary_sessions = [int]$fields.tray_status_sessions
         local_shells_survived_remote_stop = [int]$fields.local_shells_survived
         remote_stop_cleared_registration_index = [bool]::Parse($fields.index_cleared)
-        tray_boundary = 'current-user control Pipe V2 and redacted SessionSummary only'
+        tray_boundary = 'current-user control Pipe V3 and redacted SessionSummary/ProductionStatus only'
         source_sha256 = $hashes
     }
     $resolvedEvidence = [IO.Path]::GetFullPath($EvidencePath)

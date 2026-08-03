@@ -52,6 +52,7 @@ namespace TermLink.Agent
         public byte[] InputBytes { get; private set; }
         public Guid InputId { get; private set; }
         public int DuplicateInputAttempts { get; private set; }
+        public bool UseRemoteInputV2 { get; private set; }
         public short ResizeColumns { get; private set; }
         public short ResizeRows { get; private set; }
         public int WaitMilliseconds { get; private set; }
@@ -125,6 +126,7 @@ namespace TermLink.Agent
             var diagnostics = false;
             var inspect = false;
             var testDisconnectAfterFrames = 0;
+            var useRemoteInputV2 = false;
 
             for (var index = 0; index < args.Length; index++)
             {
@@ -136,6 +138,7 @@ namespace TermLink.Agent
                     case "--buffer-directory": bufferDirectory = RequiredValue(args, ref index, "--buffer-directory"); break;
                     case "--input-base64": inputText = RequiredValue(args, ref index, "--input-base64"); break;
                     case "--input-id": inputIdText = RequiredValue(args, ref index, "--input-id"); break;
+                    case "--remote-input-v2": useRemoteInputV2 = true; break;
                     case "--duplicate-input-attempts":
                         duplicateAttempts = ParseInteger(RequiredValue(args, ref index, "--duplicate-input-attempts"), 1, 100, "duplicate input attempts");
                         break;
@@ -193,6 +196,10 @@ namespace TermLink.Agent
             {
                 throw new ArgumentException("--test-disconnect-after-frames requires --diagnostics.");
             }
+            if (useRemoteInputV2 && string.IsNullOrWhiteSpace(inputText))
+            {
+                throw new ArgumentException("--remote-input-v2 requires --input-base64.");
+            }
             if ((columns == 0) != (rows == 0))
             {
                 throw new ArgumentException("resize columns and rows must be supplied together.");
@@ -222,6 +229,7 @@ namespace TermLink.Agent
                 InputBytes = inputBytes,
                 InputId = inputId,
                 DuplicateInputAttempts = duplicateAttempts,
+                UseRemoteInputV2 = useRemoteInputV2,
                 ResizeColumns = columns,
                 ResizeRows = rows,
                 WaitMilliseconds = waitMilliseconds,
@@ -275,7 +283,10 @@ namespace TermLink.Agent
         private readonly AgentOptions options;
         private readonly EncryptedEventBuffer eventBuffer;
         private readonly InputDeduplicator inputDeduplicator;
+        private readonly CommandSequenceStore commandSequenceStore;
+        private readonly Action<LocalFrame> committedFrame;
         private readonly object statusSync = new object();
+        private readonly object commandSync = new object();
         private NamedPipeServerStream waitingPipe;
         private NamedPipeServerStream connectedPipe;
         private SessionAgentLifecycle lifecycle = SessionAgentLifecycle.Starting;
@@ -289,6 +300,8 @@ namespace TermLink.Agent
         private int persistedFrames;
         private int acceptedInputs;
         private int duplicateInputs;
+        private int remoteInputAcceptedResults;
+        private int remoteInputRejectedResults;
         private int reconnects;
         private int resizeApplied;
         private bool commandsSent;
@@ -297,12 +310,15 @@ namespace TermLink.Agent
         private int exitCode;
         private bool disposed;
 
-        public SessionAgent(AgentOptions options)
+        public SessionAgent(AgentOptions options, Action<LocalFrame> committedFrame = null)
         {
             this.options = options;
+            this.committedFrame = committedFrame;
             eventBuffer = new EncryptedEventBuffer(options.BufferDirectory, options.SessionId, options.MaximumBufferBytes);
             lastHostSequence = eventBuffer.LastSequence;
             inputDeduplicator = new InputDeduplicator(options.BufferDirectory, options.SessionId);
+            commandSequenceStore = new CommandSequenceStore(options.BufferDirectory, options.SessionId);
+            nextCommandSequence = commandSequenceStore.Value;
         }
 
         public int Run()
@@ -351,6 +367,17 @@ namespace TermLink.Agent
                     };
                 }
             }
+        }
+
+        internal IList<LocalFrame> ReadBufferedEvents(
+            ulong resumeFromSequence,
+            out ulong earliestRetainedSequence,
+            out ulong latestSequence)
+        {
+            return eventBuffer.ReadFrom(
+                resumeFromSequence,
+                out earliestRetainedSequence,
+                out latestSequence);
         }
 
         public void RequestRemoteStop()
@@ -438,6 +465,8 @@ namespace TermLink.Agent
                 ";output_bytes=" + outputBytes +
                 ";inputs_accepted=" + acceptedInputs +
                 ";inputs_duplicate=" + duplicateInputs +
+                ";remote_input_results_accepted=" + remoteInputAcceptedResults +
+                ";remote_input_results_rejected=" + remoteInputRejectedResults +
                 ";resize_applied=" + resizeApplied +
                 ";reconnects=" + reconnects +
                 ";exit=" + exitCode);
@@ -454,7 +483,8 @@ namespace TermLink.Agent
                     throw new InvalidDataException("Host sent a frame for another session.");
                 }
                 if (frame.Type == LocalFrameType.HostHello || frame.Type == LocalFrameType.AgentHello ||
-                    frame.Type == LocalFrameType.Input || frame.Type == LocalFrameType.ResizeRequest)
+                    frame.Type == LocalFrameType.Input || frame.Type == LocalFrameType.ResizeRequest ||
+                    frame.Type == LocalFrameType.RemoteInputV2)
                 {
                     throw new InvalidDataException("Host sent an invalid frame type: " + frame.Type + ".");
                 }
@@ -486,6 +516,11 @@ namespace TermLink.Agent
                 {
                     eventBuffer.Append(frame);
                     persistedFrames++;
+                    if (committedFrame != null)
+                    {
+                        try { committedFrame(frame); }
+                        catch { }
+                    }
                 }
                 lock (statusSync)
                 {
@@ -518,6 +553,12 @@ namespace TermLink.Agent
                         break;
                     case LocalFrameType.Gap:
                         break;
+                    case LocalFrameType.RemoteInputResult:
+                        LocalRemoteInputResult remoteInputResult;
+                        LocalPayloadCodec.ParseRemoteInputResult(frame.Payload, out remoteInputResult);
+                        if (remoteInputResult == LocalRemoteInputResult.Accepted) remoteInputAcceptedResults++;
+                        else remoteInputRejectedResults++;
+                        break;
                     case LocalFrameType.Ack:
                         break;
                 }
@@ -546,8 +587,16 @@ namespace TermLink.Agent
                 {
                     if (inputDeduplicator.TryAccept(options.InputId))
                     {
-                        Send(pipe, LocalFrameType.Input,
-                            LocalPayloadCodec.Input(options.InputId, options.InputBytes));
+                        if (options.UseRemoteInputV2)
+                        {
+                            Send(pipe, LocalFrameType.RemoteInputV2,
+                                LocalPayloadCodec.RemoteInput(options.InputId, 0, options.InputBytes));
+                        }
+                        else
+                        {
+                            Send(pipe, LocalFrameType.Input,
+                                LocalPayloadCodec.Input(options.InputId, options.InputBytes));
+                        }
                         acceptedInputs++;
                     }
                     else
@@ -560,15 +609,47 @@ namespace TermLink.Agent
 
         private void SendAck(NamedPipeServerStream pipe, ulong sequence)
         {
-            LocalFrameCodec.Write(pipe,
-                new LocalFrame(LocalFrameType.Ack, options.SessionId, sequence, new byte[0]));
+            lock (commandSync)
+            {
+                LocalFrameCodec.Write(pipe,
+                    new LocalFrame(LocalFrameType.Ack, options.SessionId, sequence, new byte[0]));
+            }
         }
 
         private void Send(NamedPipeServerStream pipe, LocalFrameType type, byte[] payload)
         {
-            nextCommandSequence++;
-            LocalFrameCodec.Write(pipe,
-                new LocalFrame(type, options.SessionId, nextCommandSequence, payload));
+            lock (commandSync)
+            {
+                nextCommandSequence = checked(nextCommandSequence + 1);
+                commandSequenceStore.Save(nextCommandSequence);
+                LocalFrameCodec.Write(pipe,
+                    new LocalFrame(type, options.SessionId, nextCommandSequence, payload));
+            }
+        }
+
+        public bool TrySendRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
+        {
+            if (inputId == Guid.Empty || bytes == null || bytes.Length == 0) return false;
+            lock (commandSync)
+            {
+                NamedPipeServerStream pipe;
+                lock (statusSync) pipe = connectedPipe;
+                if (pipe == null || !pipe.IsConnected || !inputDeduplicator.TryAccept(inputId)) return false;
+                nextCommandSequence = checked(nextCommandSequence + 1);
+                commandSequenceStore.Save(nextCommandSequence);
+                try
+                {
+                    LocalFrameCodec.Write(pipe, new LocalFrame(
+                        LocalFrameType.RemoteInputV2,
+                        options.SessionId,
+                        nextCommandSequence,
+                        LocalPayloadCodec.RemoteInput(inputId, expectedLocalInputEpoch, bytes)));
+                    acceptedInputs++;
+                    return true;
+                }
+                catch (IOException) { return false; }
+                catch (ObjectDisposedException) { return false; }
+            }
         }
 
         private void Authenticate(NamedPipeServerStream pipe)
@@ -688,6 +769,7 @@ namespace TermLink.Agent
             RequestRemoteStop();
             eventBuffer.Dispose();
             inputDeduplicator.Dispose();
+            commandSequenceStore.Dispose();
         }
 
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -774,15 +856,49 @@ namespace TermLink.Agent
         }
     }
 
+    internal sealed class CommandSequenceStore : IDisposable
+    {
+        private readonly string path;
+        private readonly byte[] entropy;
+        public ulong Value { get; private set; }
+
+        public CommandSequenceStore(string bufferDirectory, Guid sessionId)
+        {
+            Directory.CreateDirectory(bufferDirectory);
+            path = Path.Combine(bufferDirectory, "command-sequence.dat");
+            entropy = sessionId.ToByteArray();
+            if (!File.Exists(path)) return;
+            var bytes = ProtectedData.Unprotect(File.ReadAllBytes(path), entropy, DataProtectionScope.CurrentUser);
+            if (bytes.Length != 8) throw new InvalidDataException("Invalid command sequence state.");
+            Value = LocalFrameCodec.ReadUInt64(bytes, 0);
+        }
+
+        public void Save(ulong value)
+        {
+            if (value == 0 || value <= Value) throw new InvalidOperationException("Command sequence must increase.");
+            var bytes = new byte[8];
+            LocalFrameCodec.WriteUInt64(bytes, 0, value);
+            InputDeduplicator.AtomicWrite(path, ProtectedData.Protect(bytes, entropy, DataProtectionScope.CurrentUser));
+            Value = value;
+        }
+
+        public void Dispose() { }
+    }
+
     internal sealed class EncryptedEventBuffer : IDisposable
     {
         private readonly string directory;
         private readonly byte[] entropy;
         private readonly long maximumBytes;
+        private readonly object sync = new object();
         private readonly LinkedList<FileInfo> chunks = new LinkedList<FileInfo>();
         private long storedBytes;
+        private ulong lastSequence;
 
-        public ulong LastSequence { get; private set; }
+        public ulong LastSequence
+        {
+            get { lock (sync) return lastSequence; }
+        }
 
         public EncryptedEventBuffer(string directory, Guid sessionId, long maximumBytes)
         {
@@ -799,13 +915,13 @@ namespace TermLink.Agent
             {
                 ulong sequence;
                 if (!ulong.TryParse(Path.GetFileNameWithoutExtension(file.Name), out sequence) ||
-                    sequence == 0 || sequence <= LastSequence)
+                    sequence == 0 || sequence <= lastSequence)
                 {
                     throw new InvalidDataException("Invalid encrypted event chunk name: " + file.Name);
                 }
                 chunks.AddLast(file);
                 storedBytes += file.Length;
-                LastSequence = sequence;
+                lastSequence = sequence;
             }
             Trim();
         }
@@ -813,23 +929,31 @@ namespace TermLink.Agent
         public void Append(LocalFrame frame)
         {
             if (frame.Type == LocalFrameType.Input || frame.Type == LocalFrameType.ResizeRequest ||
-                frame.Type == LocalFrameType.HostHello || frame.Type == LocalFrameType.AgentHello)
+                frame.Type == LocalFrameType.RemoteInputV2 || frame.Type == LocalFrameType.HostHello ||
+                frame.Type == LocalFrameType.AgentHello)
             {
                 throw new InvalidOperationException("Input or handshake frames must not enter the event buffer.");
             }
-            var encoded = LocalFrameCodec.Encode(frame);
-            var protectedBytes = ProtectedData.Protect(encoded, entropy, DataProtectionScope.CurrentUser);
-            var stored = new byte[8 + protectedBytes.Length];
-            stored[0] = (byte)'T'; stored[1] = (byte)'L'; stored[2] = (byte)'B'; stored[3] = (byte)'1';
-            LocalFrameCodec.WriteUInt32(stored, 4, checked((uint)protectedBytes.Length));
-            Buffer.BlockCopy(protectedBytes, 0, stored, 8, protectedBytes.Length);
-            var path = Path.Combine(directory, frame.Sequence.ToString("D20") + ".chunk");
-            InputDeduplicator.AtomicWrite(path, stored);
-            var chunk = new FileInfo(path);
-            chunks.AddLast(chunk);
-            storedBytes += chunk.Length;
-            LastSequence = frame.Sequence;
-            Trim();
+            lock (sync)
+            {
+                if (frame.Sequence == 0 || frame.Sequence <= lastSequence)
+                {
+                    throw new InvalidDataException("Event sequence must increase monotonically.");
+                }
+                var encoded = LocalFrameCodec.Encode(frame);
+                var protectedBytes = ProtectedData.Protect(encoded, entropy, DataProtectionScope.CurrentUser);
+                var stored = new byte[8 + protectedBytes.Length];
+                stored[0] = (byte)'T'; stored[1] = (byte)'L'; stored[2] = (byte)'B'; stored[3] = (byte)'1';
+                LocalFrameCodec.WriteUInt32(stored, 4, checked((uint)protectedBytes.Length));
+                Buffer.BlockCopy(protectedBytes, 0, stored, 8, protectedBytes.Length);
+                var path = Path.Combine(directory, frame.Sequence.ToString("D20") + ".chunk");
+                InputDeduplicator.AtomicWrite(path, stored);
+                var chunk = new FileInfo(path);
+                chunks.AddLast(chunk);
+                storedBytes += chunk.Length;
+                lastSequence = frame.Sequence;
+                Trim();
+            }
         }
 
         private void Trim()
@@ -841,6 +965,76 @@ namespace TermLink.Agent
                 storedBytes -= file.Length;
                 file.Delete();
             }
+        }
+
+        public IList<LocalFrame> ReadFrom(
+            ulong resumeFromSequence,
+            out ulong earliestRetainedSequence,
+            out ulong latestSequence)
+        {
+            var storedChunks = new List<byte[]>();
+            lock (sync)
+            {
+                latestSequence = lastSequence;
+                if (chunks.First != null)
+                {
+                    earliestRetainedSequence = ParseChunkSequence(chunks.First.Value);
+                }
+                else
+                {
+                    earliestRetainedSequence = lastSequence == 0 || lastSequence == ulong.MaxValue
+                        ? 0
+                        : lastSequence + 1;
+                }
+
+                foreach (var chunk in chunks)
+                {
+                    var sequence = ParseChunkSequence(chunk);
+                    if (sequence > resumeFromSequence)
+                    {
+                        // Read while holding the buffer lock so Trim cannot remove a
+                        // chunk after the path snapshot and before decryption.
+                        storedChunks.Add(File.ReadAllBytes(chunk.FullName));
+                    }
+                }
+            }
+
+            var frames = new List<LocalFrame>(storedChunks.Count);
+            foreach (var stored in storedChunks)
+            {
+                frames.Add(DecodeStored(stored));
+            }
+            return frames;
+        }
+
+        private LocalFrame DecodeStored(byte[] stored)
+        {
+            if (stored == null || stored.Length < 8 || stored[0] != 'T' || stored[1] != 'L' ||
+                stored[2] != 'B' || stored[3] != '1')
+            {
+                throw new InvalidDataException("Invalid encrypted event chunk.");
+            }
+            var length = checked((int)LocalFrameCodec.ReadUInt32(stored, 4));
+            if (length != stored.Length - 8) throw new InvalidDataException("Invalid encrypted event chunk length.");
+            var protectedBytes = new byte[length];
+            Buffer.BlockCopy(stored, 8, protectedBytes, 0, length);
+            try
+            {
+                var encoded = ProtectedData.Unprotect(protectedBytes, entropy, DataProtectionScope.CurrentUser);
+                try { return LocalFrameCodec.Decode(encoded); }
+                finally { Array.Clear(encoded, 0, encoded.Length); }
+            }
+            finally { Array.Clear(protectedBytes, 0, protectedBytes.Length); }
+        }
+
+        private static ulong ParseChunkSequence(FileInfo file)
+        {
+            ulong sequence;
+            if (!ulong.TryParse(Path.GetFileNameWithoutExtension(file.Name), out sequence) || sequence == 0)
+            {
+                throw new InvalidDataException("Invalid encrypted event chunk name: " + file.Name);
+            }
+            return sequence;
         }
 
         public static string Inspect(string directory, Guid sessionId)

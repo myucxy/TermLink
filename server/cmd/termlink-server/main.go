@@ -11,54 +11,154 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/termlink/termlink/server/internal/api"
+	"github.com/termlink/termlink/server/internal/auth"
+	"github.com/termlink/termlink/server/internal/config"
+	"github.com/termlink/termlink/server/internal/history"
+	"github.com/termlink/termlink/server/internal/kv"
 	"github.com/termlink/termlink/server/internal/lanreplay"
+	"github.com/termlink/termlink/server/internal/migrate"
 	"github.com/termlink/termlink/server/internal/phase1test"
+	"github.com/termlink/termlink/server/internal/realtime"
+	serverruntime "github.com/termlink/termlink/server/internal/runtime"
+	"github.com/termlink/termlink/server/internal/store"
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
-		os.Exit(runHealthcheck())
+	command := "lan-test"
+	if len(os.Args) > 1 {
+		command = os.Args[1]
 	}
-	if err := run(); err != nil {
+	var err error
+	switch command {
+	case "serve":
+		err = runProduction()
+	case "migrate":
+		err = runMigrate()
+	case "healthcheck":
+		os.Exit(runHealthcheck())
+	case "lan-test":
+		err = runLANTest()
+	default:
+		err = fmt.Errorf("unknown command %q (use serve, migrate, healthcheck, or lan-test)", command)
+	}
+	if err != nil {
 		slog.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func runProduction() error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load production config: %w", err)
+	}
+	repository, err := store.Open(ctx, cfg.DatabaseURL.Value())
+	if err != nil {
+		return err
+	}
+	defer repository.Close()
+	if err := repository.VerifySchema(ctx); err != nil {
+		return err
+	}
+	valkey, err := kv.Open(ctx, cfg.RedisURL.Value())
+	if err != nil {
+		return err
+	}
+	defer valkey.Close()
+	verifier, err := auth.NewOIDCVerifier(ctx, cfg.OIDCIssuer, cfg.OIDCClientID)
+	if err != nil {
+		return err
+	}
+	authentication := auth.Middleware{Tokens: verifier, Devices: repository, Nonces: valkey, SubjectKey: []byte(cfg.TokenSigningKey.Value())}
+	var historyStore *history.Store
+	if cfg.HistoryEnabled {
+		historyStore, err = history.Open(ctx, cfg.S3Endpoint, cfg.S3PublicEndpoint, cfg.S3Region, cfg.S3Bucket, cfg.S3AccessKey.Value(), cfg.S3SecretKey.Value())
+		if err != nil {
+			return fmt.Errorf("open encrypted history object store: %w", err)
+		}
+	}
+	productionAPI := &api.API{
+		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication,
+		SubjectKey: []byte(cfg.TokenSigningKey.Value()), TokenKey: []byte(cfg.TokenSigningKey.Value()), History: historyStore,
+		ClientConfig: api.ClientConfiguration{OIDCIssuer: cfg.OIDCIssuer, OIDCClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI},
+	}
+	hub := realtime.NewHub(repository, valkey, slog.Default())
+	defer func() {
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = hub.Close(shutdown)
+	}()
+
+	mux := http.NewServeMux()
+	mux.Handle("/v1/realtime", authentication.Authenticate(hub.Handler()))
+	mux.HandleFunc("GET /readyz", readinessHandler(repository, valkey))
+	mux.Handle("/", productionAPI.Handler())
+	go consumeRevocations(ctx, valkey, hub)
+	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "history_enabled", cfg.HistoryEnabled)
+	return serverruntime.New(cfg, mux).Serve(ctx)
+}
+
+func runMigrate() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load production config: %w", err)
+	}
+	return migrate.Up(ctx, cfg.DatabaseURL.Value())
+}
+
+func readinessHandler(repository *store.Postgres, valkey *kv.Valkey) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if repository.Ping(ctx) != nil || valkey.Ping(ctx) != nil || repository.VerifySchema(ctx) != nil {
+			http.Error(w, `{"status":"unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"status":"ready"}`)
+	}
+}
+
+func consumeRevocations(ctx context.Context, valkey *kv.Valkey, hub *realtime.Hub) {
+	subscription := valkey.Client.Subscribe(ctx, "device-revoked")
+	defer subscription.Close()
+	for message := range subscription.Channel() {
+		deviceID, err := uuid.Parse(message.Payload)
+		if err == nil {
+			hub.Revoke(deviceID)
+		}
+	}
+}
+
+// runLANTest retains the explicitly non-production Golden Replay and TLT1
+// fixtures. Production containers pass the serve command and never register
+// these routes.
+func runLANTest() error {
 	token := envOrDefault("TERMLINK_TEST_TOKEN", "termlink-lan-test")
 	if len(token) < 12 {
 		return fmt.Errorf("TERMLINK_TEST_TOKEN must contain at least 12 characters")
 	}
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", lanreplay.HealthHandler)
 	bundleRoot := envOrDefault("TERMLINK_TESTDATA_DIR", "/testdata/terminal-golden-streams")
-	mux.Handle("GET /v1/test/replay/", lanreplay.Handler{
-		BundleRoot: bundleRoot,
-		Token:      token,
-	})
-	mux.Handle("GET /v1/test/session/", phase1test.Handler{
-		BundleRoot: bundleRoot,
-		Token:      token,
-	})
-
-	server := &http.Server{
-		Addr:              envOrDefault("TERMLINK_LISTEN_ADDR", ":8080"),
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       30 * time.Second,
-	}
+	mux.Handle("GET /v1/test/replay/", lanreplay.Handler{BundleRoot: bundleRoot, Token: token})
+	mux.Handle("GET /v1/test/session/", phase1test.Handler{BundleRoot: bundleRoot, Token: token})
+	server := &http.Server{Addr: envOrDefault("TERMLINK_LISTEN_ADDR", ":8080"), Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 	shutdownContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go func() {
 		<-shutdownContext.Done()
-		context, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = server.Shutdown(context)
+		_ = server.Shutdown(ctx)
 	}()
-
-	slog.Info("TermLink LAN replay test server listening", "address", server.Addr)
+	slog.Info("TermLink LAN test server listening", "address", server.Addr)
 	err := server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -68,7 +168,7 @@ func run() error {
 
 func runHealthcheck() int {
 	client := http.Client{Timeout: 2 * time.Second}
-	response, err := client.Get("http://127.0.0.1:8080/healthz")
+	response, err := client.Get("http://127.0.0.1:8080/readyz")
 	if err != nil {
 		return 1
 	}
@@ -78,7 +178,6 @@ func runHealthcheck() int {
 	}
 	return 0
 }
-
 func envOrDefault(name, fallback string) string {
 	if value := os.Getenv(name); value != "" {
 		return value

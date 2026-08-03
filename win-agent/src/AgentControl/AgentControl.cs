@@ -168,7 +168,10 @@ namespace TermLink.Agent
         StopAllRemoteAccess = 4,
         EnableRemoteAccess = 5,
         Shutdown = 6,
-        RestartAgent = 7
+        RestartAgent = 7,
+        RefreshProductionStatus = 8,
+        CreatePairingChallenge = 9,
+        RevokeDevice = 10
     }
 
     public sealed class RegistryRequest
@@ -176,6 +179,57 @@ namespace TermLink.Agent
         public RegistryCommand Command { get; set; }
         public SessionRegistration Registration { get; set; }
         public Guid SessionId { get; set; }
+        public Guid DeviceId { get; set; }
+    }
+
+    public enum ProductionRelayState : byte
+    {
+        NotConfigured = 0,
+        Connecting = 1,
+        Connected = 2,
+        Reconnecting = 3,
+        Failed = 4,
+        Stopped = 5
+    }
+
+    public sealed class ProductionDeviceSummary
+    {
+        public Guid DeviceId { get; set; }
+        public string Type { get; set; }
+        public string Name { get; set; }
+        public string TrustState { get; set; }
+    }
+
+    public sealed class ProductionSessionSummary
+    {
+        public Guid SessionId { get; set; }
+        public int ViewerCount { get; set; }
+        public Guid? ControllerDeviceId { get; set; }
+        public DateTime? LeaseExpiresAtUtc { get; set; }
+    }
+
+    public sealed class PairingChallengeSummary
+    {
+        public Guid ChallengeId { get; set; }
+        public Guid TargetDeviceId { get; set; }
+        public string TargetName { get; set; }
+        public string Code { get; set; }
+        public string ChallengeNonce { get; set; }
+        public DateTime ExpiresAtUtc { get; set; }
+    }
+
+    public sealed class ProductionStatus
+    {
+        public bool Configured { get; set; }
+        public bool AccountLinked { get; set; }
+        public string ServerHost { get; set; }
+        public string PcName { get; set; }
+        public ProductionRelayState RelayState { get; set; }
+        public string LastErrorCode { get; set; }
+        public DateTime? LastConnectedAtUtc { get; set; }
+        public IList<ProductionDeviceSummary> Devices { get; set; }
+        public IList<ProductionSessionSummary> Sessions { get; set; }
+        public PairingChallengeSummary PairingChallenge { get; set; }
     }
 
     public sealed class RegistryResponse
@@ -186,11 +240,12 @@ namespace TermLink.Agent
         public IList<SessionSummary> Summaries { get; set; }
         public int AffectedSessions { get; set; }
         public int TimedOutSessions { get; set; }
+        public ProductionStatus Production { get; set; }
     }
 
     public static class RegistryControlCodec
     {
-        private const byte Version = 2;
+        private const byte Version = 3;
         private const int MaximumBytes = 64 * 1024;
 
         public static void WriteRequest(Stream stream, RegistryRequest request)
@@ -214,6 +269,10 @@ namespace TermLink.Agent
                         break;
                     case RegistryCommand.StopSession:
                         WriteGuid(writer, request.SessionId);
+                        break;
+                    case RegistryCommand.CreatePairingChallenge:
+                    case RegistryCommand.RevokeDevice:
+                        WriteGuid(writer, request.DeviceId);
                         break;
                 }
                 writer.Flush();
@@ -244,6 +303,10 @@ namespace TermLink.Agent
                         break;
                     case RegistryCommand.StopSession:
                         request.SessionId = ReadGuid(reader);
+                        break;
+                    case RegistryCommand.CreatePairingChallenge:
+                    case RegistryCommand.RevokeDevice:
+                        request.DeviceId = ReadGuid(reader);
                         break;
                 }
                 if (body.Position != body.Length) throw new InvalidDataException("Registry request has trailing bytes.");
@@ -278,6 +341,7 @@ namespace TermLink.Agent
                     writer.Write(summary.ExitCode.HasValue);
                     if (summary.ExitCode.HasValue) writer.Write(summary.ExitCode.Value);
                 }
+                WriteProductionStatus(writer, response.Production);
                 writer.Flush();
                 WriteFrame(stream, body.ToArray());
             }
@@ -323,10 +387,134 @@ namespace TermLink.Agent
                     if (reader.ReadBoolean()) summary.ExitCode = reader.ReadInt32();
                     summaries.Add(summary);
                 }
+                response.Production = ReadProductionStatus(reader);
                 if (body.Position != body.Length) throw new InvalidDataException("Registry response has trailing bytes.");
                 response.Summaries = summaries;
                 return response;
             }
+        }
+
+        private static void WriteProductionStatus(BinaryWriter writer, ProductionStatus status)
+        {
+            status = status ?? new ProductionStatus
+            {
+                RelayState = ProductionRelayState.NotConfigured,
+                Devices = new List<ProductionDeviceSummary>(),
+                Sessions = new List<ProductionSessionSummary>()
+            };
+            writer.Write(status.Configured);
+            writer.Write(status.AccountLinked);
+            WriteString(writer, status.ServerHost ?? string.Empty);
+            WriteString(writer, status.PcName ?? string.Empty);
+            writer.Write((byte)status.RelayState);
+            WriteString(writer, status.LastErrorCode ?? string.Empty);
+            WriteOptionalDateTime(writer, status.LastConnectedAtUtc);
+            var devices = status.Devices ?? new List<ProductionDeviceSummary>();
+            if (devices.Count > 1000) throw new InvalidDataException("Too many production devices.");
+            writer.Write(devices.Count);
+            foreach (var device in devices)
+            {
+                WriteGuid(writer, device.DeviceId);
+                WriteString(writer, device.Type ?? string.Empty);
+                WriteString(writer, device.Name ?? string.Empty);
+                WriteString(writer, device.TrustState ?? string.Empty);
+            }
+            var sessions = status.Sessions ?? new List<ProductionSessionSummary>();
+            if (sessions.Count > 1000) throw new InvalidDataException("Too many production sessions.");
+            writer.Write(sessions.Count);
+            foreach (var session in sessions)
+            {
+                WriteGuid(writer, session.SessionId);
+                writer.Write(session.ViewerCount);
+                writer.Write(session.ControllerDeviceId.HasValue);
+                if (session.ControllerDeviceId.HasValue) WriteGuid(writer, session.ControllerDeviceId.Value);
+                WriteOptionalDateTime(writer, session.LeaseExpiresAtUtc);
+            }
+            writer.Write(status.PairingChallenge != null);
+            if (status.PairingChallenge != null)
+            {
+                WriteGuid(writer, status.PairingChallenge.ChallengeId);
+                WriteGuid(writer, status.PairingChallenge.TargetDeviceId);
+                WriteString(writer, status.PairingChallenge.TargetName ?? string.Empty);
+                WriteString(writer, status.PairingChallenge.Code ?? string.Empty);
+                WriteString(writer, status.PairingChallenge.ChallengeNonce ?? string.Empty);
+                writer.Write(status.PairingChallenge.ExpiresAtUtc.Ticks);
+            }
+        }
+
+        private static ProductionStatus ReadProductionStatus(BinaryReader reader)
+        {
+            var status = new ProductionStatus
+            {
+                Configured = reader.ReadBoolean(),
+                AccountLinked = reader.ReadBoolean(),
+                ServerHost = ReadString(reader),
+                PcName = ReadString(reader)
+            };
+            var relay = reader.ReadByte();
+            if (!Enum.IsDefined(typeof(ProductionRelayState), relay)) throw new InvalidDataException("Invalid Relay state.");
+            status.RelayState = (ProductionRelayState)relay;
+            status.LastErrorCode = ReadString(reader);
+            status.LastConnectedAtUtc = ReadOptionalDateTime(reader);
+            var deviceCount = reader.ReadInt32();
+            if (deviceCount < 0 || deviceCount > 1000) throw new InvalidDataException("Invalid production device count.");
+            var devices = new List<ProductionDeviceSummary>();
+            for (var index = 0; index < deviceCount; index++)
+            {
+                devices.Add(new ProductionDeviceSummary
+                {
+                    DeviceId = ReadGuid(reader),
+                    Type = ReadString(reader),
+                    Name = ReadString(reader),
+                    TrustState = ReadString(reader)
+                });
+            }
+            status.Devices = devices;
+            var sessionCount = reader.ReadInt32();
+            if (sessionCount < 0 || sessionCount > 1000) throw new InvalidDataException("Invalid production session count.");
+            var sessions = new List<ProductionSessionSummary>();
+            for (var index = 0; index < sessionCount; index++)
+            {
+                var session = new ProductionSessionSummary
+                {
+                    SessionId = ReadGuid(reader),
+                    ViewerCount = reader.ReadInt32()
+                };
+                if (session.ViewerCount < 0 || session.ViewerCount > 1000) throw new InvalidDataException("Invalid viewer count.");
+                if (reader.ReadBoolean()) session.ControllerDeviceId = ReadGuid(reader);
+                session.LeaseExpiresAtUtc = ReadOptionalDateTime(reader);
+                sessions.Add(session);
+            }
+            status.Sessions = sessions;
+            if (reader.ReadBoolean())
+            {
+                var challenge = new PairingChallengeSummary
+                {
+                    ChallengeId = ReadGuid(reader),
+                    TargetDeviceId = ReadGuid(reader),
+                    TargetName = ReadString(reader),
+                    Code = ReadString(reader),
+                    ChallengeNonce = ReadString(reader),
+                    ExpiresAtUtc = new DateTime(reader.ReadInt64(), DateTimeKind.Utc)
+                };
+                status.PairingChallenge = challenge;
+            }
+            return status;
+        }
+
+        private static void WriteOptionalDateTime(BinaryWriter writer, DateTime? value)
+        {
+            writer.Write(value.HasValue);
+            if (value.HasValue)
+            {
+                if (value.Value.Kind != DateTimeKind.Utc) throw new InvalidDataException("Production time must be UTC.");
+                writer.Write(value.Value.Ticks);
+            }
+        }
+
+        private static DateTime? ReadOptionalDateTime(BinaryReader reader)
+        {
+            return reader.ReadBoolean() ? new DateTime(reader.ReadInt64(), DateTimeKind.Utc) : (DateTime?)null;
         }
 
         private static void WriteFrame(Stream stream, byte[] body)

@@ -9,17 +9,37 @@ Terminal Features、Vim、less、fzf 和 htop 共 10 个固定流，在 Termux/x
 122/122 checkpoint match，并在 API 36 模拟器 10/10 冷启动回放通过。arm64 真机、厂商
 IME、外接键鼠与 Android WebView 回退引擎仍待后续验证或实现。
 
-阶段 1 已完成可重复的测试闭环：正式 .NET 8 Agent/SessionHost/Tray/Updater 工程已经建立；
+阶段 1 的本机与生产基础已完成可重复验收：正式 .NET 8 Agent/SessionHost/Tray/Updater 工程已经建立；
 Session Host 与 Agent 之间具备当前用户 Named Pipe、双向 PID/Token 认证、序号、ACK、
 重连重发、有界 Gap、输入去重和 DPAPI Buffer。DPAPI 注册索引已在 Agent 强制结束和受控
 重启后两次恢复 20/20 个真实 ConPTY SessionHost，远程停止不影响 20 个本地 Shell。Android 的
 `RemoteTerminalSession` 已通过独立 `core-network` 接到 Docker 临时双向测试 Relay，并驱动
 真实 Termux View。API 36 模拟器已验证累计 ACK、断线续传、输入 accepted、测试租约、
-History Gap 和 exited。该链路使用隔离的明文测试协议和固定非敏感夹具，不是生产 Relay、
-Protobuf、设备授权或 E2EE，也没有冻结可移植 Snapshot，因此当前版本仍不是可发布产品。
+History Gap 和 exited。该链路使用隔离的明文测试协议和固定非敏感夹具；LAN Replay V1、
+TLT1 和 Harness 不是生产 Relay、生产 Protobuf、设备授权或 E2EE。生产账号、设备配对、
+Protobuf/E2EE Relay、历史、计费、产品页面和 Compose 接线已经实现并通过自动化验证；
+生产发布仍受第 7 项（受信证书、备份、签名、监控和发布加固）限制。
 Windows 端现已增加签名 MSIX、登录自启、Tray 单实例和受控更新器；开发证书下已验证独立
 签名更新清单、包身份/版本/SHA-256、篡改拒绝、原子缓存、可恢复事务日志及健康检查失败
-回滚。生产受信证书下的真实安装/卸载和 `Add-AppxPackage` 更新/降级仍待后续验收。
+回滚。系统注册安装/卸载和真实 `Add-AppxPackage` 更新/降级尚未执行，需等待生产受信证书；
+这属于开发项 7，不把开发证书结果写成生产发布验证。
+
+## 开发项 1-7 完成矩阵
+
+| 开发项 | 范围 | 状态 | 验证与边界 |
+| --- | --- | --- | --- |
+| 1 | 生产账号/OIDC/设备注册与配对 | **已实现并验证** | Go `auth`、设备注册/配对 API、Android OIDC/API 客户端、Windows 配对流程；Go/Android/.NET 契约与自动化验收通过，真实外部 OIDC enrollment/provider 部署不在本次验收范围。 |
+| 2 | 生产 Protobuf 实时协议、X25519 + ChaCha20-Poly1305、Relay | **已实现并验证** | `protocol/protobuf/termlink_realtime.proto`、Go `realtimewire`/Relay、Android `core-network`、Windows `src/Protocol`；向量、协议和本地 Relay 集成通过，Relay 保持密文不透明，公网 TLS 部署未验收。 |
+| 3 | Windows ConPTY 到 Android 真实输入输出、ACK/Gap/重连、租约与本地输入优先 | **已实现并验证** | Windows `ProductionAgentRuntime`、Android 生产 Session Client、服务端租约/撤销；本机 ConPTY 与跨端契约自动化覆盖有界重放、ACK/Gap、输入去重、租约和本地输入 epoch，未宣称公网生产端到端。 |
+| 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
+| 5 | 服务端 Catalog、计费验证边界、权益与配额 | **核心已实现并验证（Provider 待配置）** | Go `billing`/Catalog/entitlement API、可注入 verified-purchase 契约与 Android `feature-billing` 已测试；真实 Google/Web verifier 未配置时生产入口返回 `BILLING_UNAVAILABLE`。 |
+| 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |
+| 7 | 生产 TLS/受信发布证书真实安装更新、备份恢复演练、镜像签名、监控告警、生产 CA/发布加固 | **未开始** | 仅有开发证书/故障注入和本地 Compose 验证；真实证书链、系统级安装更新、灾备演练、镜像签名与生产运维尚未验收。 |
+
+统一边界：`LAN Replay V1`、`TLT1`（Phase 1 Test Session V1）和 Android Compose
+Harness 都是测试夹具，不是生产协议；Android 历史客户端只接受 HTTPS。Integration
+Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-6
+的自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏或生产发布已经验证。
 
 ## 商业模式
 
@@ -44,9 +64,13 @@ Windows 端现已增加签名 MSIX、登录自启、Tray 单实例和受控更�
 - [Golden Stream V1 格式](protocol/test-vectors/GOLDEN_STREAM_V1.md)
 - [LAN Replay V1 测试协议](protocol/test-vectors/LAN_REPLAY_V1.md)
 - [Phase 1 临时双向测试协议](protocol/test-vectors/PHASE1_TEST_SESSION_V1.md)
+- [生产 Protobuf 实时协议](protocol/protobuf/PRODUCTION_REALTIME_V1.md)
+- [E2EE Session V1 测试向量](protocol/test-vectors/E2EE_SESSION_V1.md)
+- [有界历史 V1 测试向量](protocol/test-vectors/BOUNDED_HISTORY_V1.md)
 - [Android 回放 Harness](android/README.md)
 - [离线 xterm.js 对照 Harness](terminal-reference/xterm-harness/README.md)
 - [LAN Docker 测试服务](server/README.md)
+- [生产运行时与 Compose](server/README-runtime.md)
 
 ## 阶段 0/1 快速验证
 
@@ -64,6 +88,8 @@ Windows 端现已增加签名 MSIX、登录自启、Tray 单实例和受控更�
 .\win-agent\tests\Validate-Phase1WindowsApp.ps1
 .\win-agent\tests\Validate-WindowsInstaller.ps1
 .\win-agent\tests\Validate-WindowsUpdater.ps1
+.\win-agent\tests\Validate-ProductionProtocol.ps1
+.\win-agent\tests\Validate-ProductionRuntime.ps1
 
 # 双向模拟器验收依赖运行中的本地测试容器
 docker compose -f server\compose\lan-test.compose.yml up --build -d
@@ -81,6 +107,20 @@ $env:ANDROID_HOME = 'D:\Dev\Env\Android\Sdk'
 # 验证临时双向测试 Relay；脚本同时运行现有 LAN Replay 回归
 cd ..\server
 .\Validate-Phase1TestRelay.ps1
+D:\Dev\Env\Go\bin\go.exe test ./...
+D:\Dev\Env\Go\bin\go.exe vet ./...
+
+# 生产 Compose 配置（需要本机 .env 和 secrets）
+docker compose --env-file .env -f compose\core.compose.yml config
+
+# 真实 PostgreSQL/Valkey/MinIO 集成（一次性基础设施）
+docker compose -f compose\integration.compose.yml up -d --wait postgres valkey minio
+$env:TERMLINK_INTEGRATION_DATABASE_URL='postgres://termlink:integration-only-password@127.0.0.1:55432/termlink?sslmode=disable'
+$env:TERMLINK_INTEGRATION_REDIS_URL='redis://127.0.0.1:56379/0'
+$env:TERMLINK_INTEGRATION_S3_ENDPOINT='http://127.0.0.1:59000'
+$env:TERMLINK_INTEGRATION_S3_PUBLIC_ENDPOINT='http://127.0.0.1:59000'
+go test ./internal/api -run TestProductionAccountRelayAndRevocation -count=1
+docker compose -f compose\integration.compose.yml down -v
 
 # 生成 Termux 草案网格后，验证离线 xterm.js Oracle
 cd ..\terminal-reference\xterm-harness

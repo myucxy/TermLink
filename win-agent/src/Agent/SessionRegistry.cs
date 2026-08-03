@@ -37,6 +37,21 @@ namespace TermLink.Agent
             Action<IRegistryManagedSession> completion);
     }
 
+    internal interface IRemoteControllableSession
+    {
+        bool TrySendRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes);
+    }
+
+    // Kept separate from IRegistryManagedSession so existing registry test
+    // doubles do not need to implement the production replay surface.
+    internal interface IBufferedRegistryManagedSession
+    {
+        IList<LocalFrame> ReadBufferedEvents(
+            ulong resumeFromSequence,
+            out ulong earliestRetainedSequence,
+            out ulong latestSequence);
+    }
+
     internal sealed class SessionRegistry : IDisposable
     {
         private readonly object sync = new object();
@@ -55,7 +70,8 @@ namespace TermLink.Agent
             string bufferRoot,
             int disconnectedTimeoutMilliseconds,
             long maximumBufferBytes,
-            int maximumSessions)
+            int maximumSessions,
+            Action<ManagedShellType, LocalFrame> committedFrame = null)
         {
             if (string.IsNullOrWhiteSpace(bufferRoot)) throw new ArgumentException("buffer root is required", "bufferRoot");
             if (disconnectedTimeoutMilliseconds < 250 || disconnectedTimeoutMilliseconds > 300000)
@@ -74,7 +90,8 @@ namespace TermLink.Agent
             sessionFactory = new ManagedSessionFactory(
                 resolvedBufferRoot,
                 disconnectedTimeoutMilliseconds,
-                maximumBufferBytes);
+                maximumBufferBytes,
+                committedFrame);
             registrationStore = new DpapiRegistryRegistrationStore(
                 Path.Combine(resolvedBufferRoot, "registrations.dpapi"));
             RecoverRegistrations();
@@ -112,6 +129,11 @@ namespace TermLink.Agent
         public int RecoveredSessionCount
         {
             get { lock (sync) return recoveredSessionCount; }
+        }
+
+        internal bool ContainsSession(Guid sessionId)
+        {
+            lock (sync) return sessions.ContainsKey(sessionId);
         }
 
         private void RecoverRegistrations()
@@ -208,6 +230,43 @@ namespace TermLink.Agent
                 return left.RegisteredAtUtc.CompareTo(right.RegisteredAtUtc);
             });
             return result;
+        }
+
+        public bool TrySendRemoteInput(Guid sessionId, Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
+        {
+            IRemoteControllableSession controllable;
+            lock (sync)
+            {
+                IRegistryManagedSession managed;
+                if (!remoteAccessEnabled || !sessions.TryGetValue(sessionId, out managed)) return false;
+                controllable = managed as IRemoteControllableSession;
+            }
+            return controllable != null && controllable.TrySendRemoteInput(inputId, expectedLocalInputEpoch, bytes);
+        }
+
+        internal bool TryReadBufferedEvents(
+            Guid sessionId,
+            ulong resumeFromSequence,
+            out IList<LocalFrame> frames,
+            out ulong earliestRetainedSequence,
+            out ulong latestSequence)
+        {
+            frames = null;
+            earliestRetainedSequence = 0;
+            latestSequence = 0;
+            IBufferedRegistryManagedSession buffered;
+            lock (sync)
+            {
+                IRegistryManagedSession managed;
+                if (!sessions.TryGetValue(sessionId, out managed)) return false;
+                buffered = managed as IBufferedRegistryManagedSession;
+            }
+            if (buffered == null) return false;
+            frames = buffered.ReadBufferedEvents(
+                resumeFromSequence,
+                out earliestRetainedSequence,
+                out latestSequence);
+            return true;
         }
 
         public SessionStopResult StopSession(Guid sessionId)
@@ -343,12 +402,14 @@ namespace TermLink.Agent
         private readonly string bufferRoot;
         private readonly int disconnectedTimeoutMilliseconds;
         private readonly long maximumBufferBytes;
+        private readonly Action<ManagedShellType, LocalFrame> committedFrame;
 
-        public ManagedSessionFactory(string bufferRoot, int disconnectedTimeoutMilliseconds, long maximumBufferBytes)
+        public ManagedSessionFactory(string bufferRoot, int disconnectedTimeoutMilliseconds, long maximumBufferBytes, Action<ManagedShellType, LocalFrame> committedFrame = null)
         {
             this.bufferRoot = bufferRoot;
             this.disconnectedTimeoutMilliseconds = disconnectedTimeoutMilliseconds;
             this.maximumBufferBytes = maximumBufferBytes;
+            this.committedFrame = committedFrame;
         }
 
         public IRegistryManagedSession Create(
@@ -360,11 +421,12 @@ namespace TermLink.Agent
                 Path.Combine(bufferRoot, registration.SessionId.ToString("N")),
                 disconnectedTimeoutMilliseconds,
                 maximumBufferBytes,
-                completion);
+                completion,
+                committedFrame);
         }
     }
 
-    internal sealed class ManagedSession : IRegistryManagedSession
+    internal sealed class ManagedSession : IRegistryManagedSession, IRemoteControllableSession, IBufferedRegistryManagedSession
     {
         private readonly SessionAgent agent;
         private readonly ManagedShellType shellType;
@@ -379,7 +441,8 @@ namespace TermLink.Agent
             string bufferDirectory,
             int disconnectedTimeoutMilliseconds,
             long maximumBufferBytes,
-            Action<IRegistryManagedSession> completion)
+            Action<IRegistryManagedSession> completion,
+            Action<ManagedShellType, LocalFrame> committedFrame = null)
         {
             SessionId = registration.SessionId;
             shellType = registration.ShellType;
@@ -393,7 +456,7 @@ namespace TermLink.Agent
                 registration.ExpectedHostProcessId,
                 disconnectedTimeoutMilliseconds,
                 maximumBufferBytes);
-            agent = new SessionAgent(options);
+            agent = new SessionAgent(options, committedFrame == null ? (Action<LocalFrame>)null : frame => committedFrame(shellType, frame));
         }
 
         public Guid SessionId { get; private set; }
@@ -457,6 +520,22 @@ namespace TermLink.Agent
                 }
             }
             if (request) agent.RequestRemoteStop();
+        }
+
+        public bool TrySendRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
+        {
+            return agent.TrySendRemoteInput(inputId, expectedLocalInputEpoch, bytes);
+        }
+
+        public IList<LocalFrame> ReadBufferedEvents(
+            ulong resumeFromSequence,
+            out ulong earliestRetainedSequence,
+            out ulong latestSequence)
+        {
+            return agent.ReadBufferedEvents(
+                resumeFromSequence,
+                out earliestRetainedSequence,
+                out latestSequence);
         }
 
         public bool WaitForStop()
@@ -570,6 +649,12 @@ namespace TermLink.Agent
     {
         private readonly RegistryServiceOptions options;
         private readonly SessionRegistry registry;
+#if TERMLINK_PRODUCTION_RUNTIME
+        private readonly ProductionAgentRuntime productionRuntime;
+#else
+        // The legacy csc validation build intentionally excludes production sources.
+        private readonly IDisposable productionRuntime;
+#endif
         private readonly object sync = new object();
         private NamedPipeServerStream activeControlPipe;
         private volatile bool shutdownRequested;
@@ -580,11 +665,33 @@ namespace TermLink.Agent
         {
             if (options == null) throw new ArgumentNullException("options");
             this.options = options;
+#if TERMLINK_PRODUCTION_RUNTIME
+            var runtime = ProductionAgentRuntime.TryCreate();
+            try
+            {
+                registry = new SessionRegistry(
+                    options.BufferRoot,
+                    options.DisconnectedTimeoutMilliseconds,
+                    options.MaximumBufferBytes,
+                    options.MaximumSessions,
+                    runtime == null ? null : runtime.OnCommitted);
+                if (runtime != null) runtime.Attach(registry);
+                productionRuntime = runtime;
+            }
+            catch
+            {
+                if (runtime != null) runtime.Dispose();
+                if (registry != null) registry.Dispose();
+                throw;
+            }
+#else
             registry = new SessionRegistry(
                 options.BufferRoot,
                 options.DisconnectedTimeoutMilliseconds,
                 options.MaximumBufferBytes,
                 options.MaximumSessions);
+            productionRuntime = null;
+#endif
         }
 
         internal SessionRegistryService(RegistryServiceOptions options, SessionRegistry registry)
@@ -593,6 +700,7 @@ namespace TermLink.Agent
             if (registry == null) throw new ArgumentNullException("registry");
             this.options = options;
             this.registry = registry;
+            productionRuntime = null;
         }
 
         public int Run()
@@ -634,6 +742,20 @@ namespace TermLink.Agent
                             {
                                 response = Response(false, "OPERATION_TIMEOUT", 0);
                             }
+#if TERMLINK_PRODUCTION_RUNTIME
+                            catch (System.Net.Http.HttpRequestException)
+                            {
+                                response = Response(false, "PRODUCTION_REQUEST_FAILED", 0);
+                            }
+                            catch (System.Text.Json.JsonException)
+                            {
+                                response = Response(false, "PRODUCTION_RESPONSE_INVALID", 0);
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                response = Response(false, "PRODUCTION_REQUEST_CANCELLED", 0);
+                            }
+#endif
                             RegistryControlCodec.WriteResponse(pipe, response);
                             requests++;
                         }
@@ -685,7 +807,8 @@ namespace TermLink.Agent
                         Code = "OK",
                         RemoteAccessEnabled = registry.RemoteAccessEnabled,
                         Summaries = registry.GetSummaries(),
-                        AffectedSessions = 0
+                        AffectedSessions = 0,
+                        Production = ProductionSnapshot(false)
                     };
                 case RegistryCommand.StopSession:
                     var stopped = registry.StopSession(request.SessionId);
@@ -714,6 +837,30 @@ namespace TermLink.Agent
                         restart,
                         "AGENT_RESTART_READY",
                         "AGENT_RESTART_WITH_TIMEOUTS");
+                case RegistryCommand.RefreshProductionStatus:
+#if TERMLINK_PRODUCTION_RUNTIME
+                    if (productionRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+                    productionRuntime.GetStatus(true);
+                    return Response(true, "PRODUCTION_STATUS_REFRESHED", 0);
+#else
+                    return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+#endif
+                case RegistryCommand.CreatePairingChallenge:
+#if TERMLINK_PRODUCTION_RUNTIME
+                    if (productionRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+                    productionRuntime.CreatePairingChallenge(request.DeviceId);
+                    return Response(true, "PAIRING_CHALLENGE_CREATED", 0);
+#else
+                    return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+#endif
+                case RegistryCommand.RevokeDevice:
+#if TERMLINK_PRODUCTION_RUNTIME
+                    if (productionRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+                    productionRuntime.RevokeDevice(request.DeviceId);
+                    return Response(true, "DEVICE_REVOKED", 0);
+#else
+                    return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+#endif
                 default:
                     return Response(false, "UNKNOWN_COMMAND", 0);
             }
@@ -728,7 +875,8 @@ namespace TermLink.Agent
                 RemoteAccessEnabled = registry.RemoteAccessEnabled,
                 Summaries = new List<SessionSummary>(),
                 AffectedSessions = affected,
-                TimedOutSessions = 0
+                TimedOutSessions = 0,
+                Production = ProductionSnapshot(false)
             };
         }
 
@@ -741,7 +889,23 @@ namespace TermLink.Agent
                 RemoteAccessEnabled = registry.RemoteAccessEnabled,
                 Summaries = new List<SessionSummary>(),
                 AffectedSessions = result.RequestedSessions,
-                TimedOutSessions = result.TimedOutSessions
+                TimedOutSessions = result.TimedOutSessions,
+                Production = ProductionSnapshot(false)
+            };
+        }
+
+        private ProductionStatus ProductionSnapshot(bool forceRefresh)
+        {
+#if TERMLINK_PRODUCTION_RUNTIME
+            if (productionRuntime != null) return productionRuntime.GetStatus(forceRefresh);
+#endif
+            return new ProductionStatus
+            {
+                Configured = false,
+                AccountLinked = false,
+                RelayState = ProductionRelayState.NotConfigured,
+                Devices = new List<ProductionDeviceSummary>(),
+                Sessions = new List<ProductionSessionSummary>()
             };
         }
 
@@ -760,6 +924,7 @@ namespace TermLink.Agent
                 try { pipe.Dispose(); }
                 catch (ObjectDisposedException) { }
             }
+            if (productionRuntime != null) productionRuntime.Dispose();
             registry.Dispose();
         }
 

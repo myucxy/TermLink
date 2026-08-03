@@ -102,6 +102,37 @@ class RemoteTerminalSessionTest {
     }
 
     @Test
+    fun orderedInputResultBetweenOutputsDoesNotCreateHistoryGap() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(engine, outbound, backgroundScope)
+        session.onConnected()
+
+        assertEquals(
+            EventAcceptance.Applied(1),
+            session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1))),
+        )
+        assertEquals(
+            EventAcceptance.Applied(2),
+            session.accept(
+                RemoteSessionEvent.InputResult(
+                    sequence = 2,
+                    inputId = UUID.fromString("00000000-0000-0000-0000-000000000021"),
+                    accepted = true,
+                ),
+            ),
+        )
+        assertEquals(
+            EventAcceptance.Applied(3),
+            session.accept(RemoteSessionEvent.Output(3, byteArrayOf(3))),
+        )
+        assertEquals(3L, session.state.value.lastAckedSequence)
+        assertTrue(session.state.value !is RemoteSessionState.HistoryGap)
+        assertEquals(listOf(1L, 2L, 3L), outbound.acknowledgements)
+        session.close()
+    }
+
+    @Test
     fun boundedRawReplayMustStartAtOneAndRebuildsTheEngine() = runTest {
         val engine = RecordingEngine()
         val outbound = RecordingOutbound()
@@ -184,6 +215,34 @@ class RemoteTerminalSessionTest {
     }
 
     @Test
+    fun controllingLeaseRenewsEveryConfiguredIntervalAndStopsOnRevoke() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(
+            engine,
+            outbound,
+            backgroundScope,
+            clockMillis = { testScheduler.currentTime },
+            leaseRenewalIntervalMillis = 1_000,
+        )
+        session.onConnected()
+        session.grantControl("lease", 10_000, leaseVersion = 7)
+
+        advanceTimeBy(999)
+        runCurrent()
+        assertTrue(outbound.renewals.isEmpty())
+        advanceTimeBy(1)
+        runCurrent()
+        assertEquals(listOf("lease" to 7L), outbound.renewals)
+
+        session.revokeControl()
+        advanceTimeBy(2_000)
+        runCurrent()
+        assertEquals(listOf("lease" to 7L), outbound.renewals)
+        session.close()
+    }
+
+    @Test
     fun failedInputIsNeverRetriedAndMovesSessionToReconnecting() = runTest {
         val inputId = UUID.fromString("00000000-0000-0000-0000-000000000003")
         val engine = RecordingEngine()
@@ -204,6 +263,38 @@ class RemoteTerminalSessionTest {
         assertEquals(1, outbound.inputAttempts)
         assertTrue(outbound.inputs.isEmpty())
         assertIs<RemoteSessionState.Reconnecting>(session.state.value)
+        session.close()
+    }
+
+    @Test
+    fun inputResultCanArriveWhileInputTransportIsAwaitingAcceptance() = runTest {
+        val inputId = UUID.fromString("00000000-0000-0000-0000-000000000031")
+        lateinit var session: RemoteTerminalSession
+        val outbound = object : RemoteSessionOutbound {
+            override suspend fun resume(lastAckedSequence: Long) = Unit
+            override suspend fun acknowledge(highestContiguousSequence: Long) = Unit
+            override suspend fun sendResize(size: TerminalSize) = Unit
+            override suspend fun sendInput(input: RemoteInput) {
+                assertEquals(inputId, input.inputId)
+                assertEquals(
+                    EventAcceptance.Applied(1),
+                    session.accept(RemoteSessionEvent.InputResult(1, inputId, accepted = true)),
+                )
+            }
+        }
+        val sessionEngine = RecordingEngine()
+        session = RemoteTerminalSession(
+            sessionEngine,
+            outbound,
+            backgroundScope,
+            clockMillis = { testScheduler.currentTime },
+            inputIdFactory = { inputId },
+        )
+        session.onConnected()
+        session.grantControl("lease", 10_000)
+
+        assertEquals(InputSubmission.Sent(inputId), session.submitInput(byteArrayOf(1)))
+        assertEquals(1L, session.state.value.lastAckedSequence)
         session.close()
     }
 
@@ -338,6 +429,7 @@ class RemoteTerminalSessionTest {
         val acknowledgements = mutableListOf<Long>()
         val inputs = mutableListOf<RemoteInput>()
         val sizes = mutableListOf<TerminalSize>()
+        val renewals = mutableListOf<Pair<String, Long>>()
         var inputAttempts = 0
         var failInput = false
         var failAck = false
@@ -360,6 +452,11 @@ class RemoteTerminalSessionTest {
 
         override suspend fun sendResize(size: TerminalSize) {
             sizes += size
+        }
+
+        override suspend fun renewLease(leaseId: String, leaseVersion: Long): RemoteControlLease? {
+            renewals += leaseId to leaseVersion
+            return null
         }
     }
 }

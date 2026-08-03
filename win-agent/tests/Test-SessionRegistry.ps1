@@ -81,7 +81,7 @@ try {
         classification = 'local Win-Agent Registry and current-user control IPC; not production Relay or protocol'
         passed = $true
         registry_process_model = 'one long-lived Registry with one isolated SessionAgent worker per Host'
-        local_control_protocol = 'provisional current-user Registry Pipe V2; not production Protobuf'
+        local_control_protocol = 'current-user Registry Pipe V3; not production Protobuf'
         simultaneous_sessions = [int]$fields.multi_sessions
         summaries_exclude_terminal_body_pipe_token_and_buffer_path = [bool]::Parse($fields.summary_redacted)
         single_remote_stop_preserved_local_shell = [bool]::Parse($fields.single_stop_local_alive)

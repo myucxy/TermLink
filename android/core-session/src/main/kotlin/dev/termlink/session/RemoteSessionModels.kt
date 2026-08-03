@@ -24,6 +24,7 @@ sealed interface RemoteSessionState {
         override val lastAckedSequence: Long,
         val leaseId: String,
         val expiresAtEpochMillis: Long,
+        val leaseVersion: Long = 0,
     ) : RemoteSessionState
 
     data class Exited(
@@ -62,6 +63,25 @@ sealed interface RemoteSessionEvent {
         val value: String,
     ) : RemoteSessionEvent
 
+    /** An ordered session event that confirms/rejects input without rendering bytes. */
+    data class InputResult(
+        override val sequence: Long,
+        val inputId: UUID,
+        val accepted: Boolean,
+        val reason: String? = null,
+    ) : RemoteSessionEvent
+
+    /** Ordered control revocation, most commonly caused by local PC input. */
+    data class ControlRevoked(
+        override val sequence: Long,
+        val reason: String,
+    ) : RemoteSessionEvent
+
+    /** Ordered notice used by transports that deliver a lease over realtime. */
+    data class ControlGranted(
+        override val sequence: Long,
+    ) : RemoteSessionEvent
+
     data class Lifecycle(
         override val sequence: Long,
         val state: RemoteLifecycle,
@@ -80,6 +100,12 @@ data class RemoteInput(
     val bytes: ByteArray,
 )
 
+data class RemoteControlLease(
+    val leaseId: String,
+    val expiresAtEpochMillis: Long,
+    val version: Long,
+)
+
 interface RemoteSessionOutbound {
     suspend fun resume(lastAckedSequence: Long)
 
@@ -88,6 +114,13 @@ interface RemoteSessionOutbound {
     suspend fun sendInput(input: RemoteInput)
 
     suspend fun sendResize(size: TerminalSize)
+
+    /**
+     * Lease operations are optional for transports that do not expose control
+     * (for example the fixed test relay). Production transports override these
+     * hooks; defaults preserve the original outbound contract.
+     */
+    suspend fun renewLease(leaseId: String, leaseVersion: Long): RemoteControlLease? = null
 }
 
 sealed interface EventAcceptance {

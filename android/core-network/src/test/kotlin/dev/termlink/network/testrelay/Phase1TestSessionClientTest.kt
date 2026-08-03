@@ -125,6 +125,9 @@ class Phase1TestSessionClientTest {
             }
         }
         assertIs<RemoteSessionState.ReadOnly>(readOnly)
+        withTimeout(5_000) {
+            while (eventLog.indexOf("ack:3") < 0) delay(1)
+        }
         assertTrue(eventLog.indexOf("feed:3") < eventLog.indexOf("ack:3"))
         assertEquals(listOf(TerminalSize(100, 30)), engine.resizes)
 

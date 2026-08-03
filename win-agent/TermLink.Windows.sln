@@ -13,6 +13,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Tray", "src\Tray\T
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Updater", "src\Updater\TermLink.Updater.csproj", "{2F7A94D2-5678-4C25-A4CB-D6523874307D}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Protocol", "src\Protocol\TermLink.Protocol.csproj", "{A3E48690-DFE2-4D4E-9AE8-3E1F244712B9}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.AgentControl.Validation", "tests\AgentControlValidation\TermLink.AgentControl.Validation.csproj", "{F356B28D-7AC5-4C6F-AE99-DF9A29C9B1DF}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -39,5 +43,13 @@ Global
 		{2F7A94D2-5678-4C25-A4CB-D6523874307D}.Debug|x64.Build.0 = Debug|Any CPU
 		{2F7A94D2-5678-4C25-A4CB-D6523874307D}.Release|x64.ActiveCfg = Release|Any CPU
 		{2F7A94D2-5678-4C25-A4CB-D6523874307D}.Release|x64.Build.0 = Release|Any CPU
+		{A3E48690-DFE2-4D4E-9AE8-3E1F244712B9}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{A3E48690-DFE2-4D4E-9AE8-3E1F244712B9}.Debug|x64.Build.0 = Debug|Any CPU
+		{A3E48690-DFE2-4D4E-9AE8-3E1F244712B9}.Release|x64.ActiveCfg = Release|Any CPU
+		{A3E48690-DFE2-4D4E-9AE8-3E1F244712B9}.Release|x64.Build.0 = Release|Any CPU
+		{F356B28D-7AC5-4C6F-AE99-DF9A29C9B1DF}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{F356B28D-7AC5-4C6F-AE99-DF9A29C9B1DF}.Debug|x64.Build.0 = Debug|Any CPU
+		{F356B28D-7AC5-4C6F-AE99-DF9A29C9B1DF}.Release|x64.ActiveCfg = Release|Any CPU
+		{F356B28D-7AC5-4C6F-AE99-DF9A29C9B1DF}.Release|x64.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

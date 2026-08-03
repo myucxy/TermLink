@@ -7,6 +7,7 @@
 目录边界：
 
 - `src/Agent`：会话目录、Relay、加密缓冲与访问控制；
+- `src/Protocol`：生产 Protobuf Envelope、设备证明、X25519/HKDF 和 ChaCha20-Poly1305；
 - `src/Tray`：当前用户托盘和设置 UI；
 - `src/SessionHost`：每会话一个 ConPTY Owner；
 - `src/Updater`：签名更新和回滚；
@@ -18,6 +19,8 @@ WinForms Tray 和单文件 Updater：
 ```powershell
 .\Build-Windows.ps1
 .\tests\Validate-Phase1WindowsApp.ps1
+.\tests\Validate-ProductionProtocol.ps1
+.\tests\Validate-ProductionRuntime.ps1
 ```
 
 当前机器若只有 .NET 8 Runtime 而没有 SDK，可以通过 `-DotNetPath` 指向临时或独立安装的
@@ -113,15 +116,19 @@ Windows Terminal 与内层 ConPTY，不收到终止 Shell 的命令。Host 异�
 
 ## .NET 8 Agent、Tray 与重启恢复
 
-`TermLink.Windows.sln` 现在构建四个正式工程：
+`TermLink.Windows.sln` 现在构建六个正式工程和一个本机控制契约验证程序：
 
-- `TermLink.AgentControl`：Agent 与 Tray 共用的本机 Pipe V2 结构化契约；
+- `TermLink.AgentControl`：Agent 与 Tray 共用的本机 Pipe V3 结构化契约；
+- `TermLink.Protocol`：生产 Protobuf 与 E2EE/历史密码封装；
 - `TermLink.Agent`：长驻当前用户 Registry 和每会话 worker；
 - `TermLink.SessionHost`：独立 ConPTY Owner；
-- `TermLink.Tray`：系统托盘、脱敏会话列表、停止单会话、停止全部远程访问及重新启用。
+- `TermLink.Tray`：系统托盘、脱敏会话/账号/设备状态与本机控制；
+- `TermLink.Updater`：签名清单校验、部署事务和失败回滚；
+- `TermLink.AgentControl.Validation`：Pipe V3 请求/响应往返验证，不进入产品包。
 
 Tray 退出不会关闭 Agent 或本地 Shell。默认控制 Pipe 名包含当前用户 SID 的 SHA-256
-截断值；Tray 只消费 `SessionSummary`，不会获得 Pipe 名、Token、Buffer 路径或终端正文。
+截断值；Tray 只消费 `SessionSummary` 和脱敏 `ProductionStatus`，不会获得 Pipe 名、Token、
+密钥、Buffer 路径或终端正文。
 `--status-json` 仅供诊断输出同一份脱敏摘要；`--restart-agent` 为受控更新保留注册索引，
 `--shutdown-agent` 按停止远程访问语义清除索引。
 
@@ -135,6 +142,30 @@ Pipe 名和握手 Token。启动时必须同时匹配 PID 与进程启动时间�
 SessionHost，分别在强制结束和受控重启 Agent 后从加密索引恢复全部 20 个连接，再由 Tray
 核对 20 条脱敏摘要。最终停止远程访问后，20 个本地 Shell 均继续接收本地输入并正常退出。证据位于
 `docs/validation/phase1-windows-app.json`。
+
+生产 Agent 由 `src/Agent/ProductionAgentRuntime.cs` 接入 HTTPS API、生产 Protobuf
+realtime Relay、设备配对/撤销、租约和每 Android 设备历史上传；`src/Protocol` 的
+E2EE 实现与 `protocol/protobuf/termlink_realtime.proto` 保持同一 Envelope。生产 runtime
+验证脚本覆盖无配置拒绝、DPAPI 有界重放、Gap、发送背压、刷新失败隔离、生命周期释放和
+配置密钥边界；它不把本机 V3 控制 Pipe 或 Phase 1 测试帧冒充公网协议。
+
+## 开发项 1-7 完成矩阵
+
+| 开发项 | 范围 | 状态 | 验证与边界 |
+| --- | --- | --- | --- |
+| 1 | 生产账号/OIDC/设备注册与配对 | **已实现并验证（预配置接入）** | Go `auth`、设备注册/配对 API、Android AppAuth/Keystore、Windows challenge/撤销；Windows runtime 当前读取本机预配置的 DPAPI 凭据，不包含浏览器 OIDC enrollment UI。 |
+| 2 | 生产 Protobuf 实时协议、X25519 + ChaCha20-Poly1305、Relay | **已实现并验证** | `protocol/protobuf/termlink_realtime.proto`、Go `realtimewire`/Relay、Android `core-network`、Windows `src/Protocol`；向量、协议和 Relay 测试通过。 |
+| 3 | Windows ConPTY 到 Android 真实输入输出、ACK/Gap/重连、租约与本地输入优先 | **已实现并验证（模块/契约级）** | Windows `ProductionAgentRuntime`、Android 生产 Session Client、服务端租约/撤销；真实 ConPTY、跨端向量和各端自动化覆盖有界重放、ACK/Gap、输入去重、租约和本地输入 epoch，尚未做公网生产部署验收。 |
+| 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
+| 5 | 服务端 Catalog、计费验证边界、权益与配额 | **核心已实现并验证（Provider 待配置）** | Go Catalog/entitlement、可注入 verified-purchase 契约和 Android Play Billing 协调已测试；生产 main 在真实 Google/Web verifier 未配置时返回 `BILLING_UNAVAILABLE`，未冒充线上购买验证。 |
+| 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |
+| 7 | 生产 TLS/受信发布证书真实安装更新、备份恢复演练、镜像签名、监控告警、生产 CA/发布加固 | **未开始** | 仅有开发证书/故障注入和本地 Compose 验证；真实证书链、系统级安装更新、灾备演练、镜像签名与生产运维尚未验收。 |
+
+统一边界：`LAN Replay V1`、`TLT1`（Phase 1 Test Session V1）和 Android Compose
+Harness 都是测试夹具，不是生产协议；Android 历史客户端只接受 HTTPS。Integration
+Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-6
+的自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏、真实计费 Provider
+或生产发布已经验证。
 
 ## 签名 MSIX 与登录自启
 
@@ -203,5 +234,8 @@ AppX 或修改证书库。真实 PowerShell MSIX 部署后端已经实现，但�
 再执行系统级更新/降级验收。证据位于
 `docs/validation/phase1-windows-updater.json`。
 
-当前仍没有生产证书下的真实安装/更新验收、生产 Relay、账号与设备授权、设备密钥或 E2EE。
-阶段性本机控制 Pipe V2 和 DPAPI 注册索引都不等于生产 Protobuf 或跨设备协议。
+生产 Relay、账号/设备授权、设备密钥、E2EE、租约和历史上传已由生产 runtime 与跨端
+自动化验收覆盖；阶段性本机控制 Pipe V3 和 DPAPI 注册索引仍不等于生产 Protobuf 或
+跨设备协议。生产受信证书下的真实安装/卸载、登录自启、`Add-AppxPackage` 更新/降级仍
+未验收，连同备份、镜像签名、监控告警和生产 CA/发布加固属于开发项 7；不得把开发证书
+故障注入结果写成生产发布验证。

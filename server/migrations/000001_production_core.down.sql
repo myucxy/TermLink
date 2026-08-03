@@ -1,0 +1,17 @@
+DROP TABLE IF EXISTS outbox;
+DROP TABLE IF EXISTS idempotency_keys;
+DROP TABLE IF EXISTS quota_selections;
+DROP TABLE IF EXISTS entitlements;
+DROP TABLE IF EXISTS subscriptions;
+DROP TABLE IF EXISTS plans;
+DROP TABLE IF EXISTS catalog_versions;
+DROP TABLE IF EXISTS audit_events;
+DROP TABLE IF EXISTS snapshots;
+DROP TABLE IF EXISTS event_chunks;
+DROP TABLE IF EXISTS control_leases;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS device_grants;
+DROP TABLE IF EXISTS pcs;
+DROP TABLE IF EXISTS pairing_challenges;
+DROP TABLE IF EXISTS devices;
+DROP TABLE IF EXISTS users;

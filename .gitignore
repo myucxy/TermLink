@@ -6,6 +6,7 @@ git地址.txt
 .env.*
 !.env.example
 win-agent/secrets/
+server/secrets/
 
 # Build and dependency output
 **/bin/

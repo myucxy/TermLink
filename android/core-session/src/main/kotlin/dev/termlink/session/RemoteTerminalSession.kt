@@ -26,6 +26,7 @@ class RemoteTerminalSession(
     private val outbound: RemoteSessionOutbound,
     parentScope: CoroutineScope,
     private val resizeDebounceMillis: Long = 150,
+    private val leaseRenewalIntervalMillis: Long = 10_000,
     private val clockMillis: () -> Long = System::currentTimeMillis,
     private val inputIdFactory: () -> UUID = UUID::randomUUID,
     private val disposeEngineOnClose: Boolean = true,
@@ -41,6 +42,7 @@ class RemoteTerminalSession(
     private val mutableTitle = MutableStateFlow("")
     private var lastAckedSequence = 0L
     private var leaseExpiryJob: Job? = null
+    private var leaseRenewalJob: Job? = null
 
     val state: StateFlow<RemoteSessionState> = mutableState.asStateFlow()
     val title: StateFlow<String> = mutableTitle.asStateFlow()
@@ -49,6 +51,7 @@ class RemoteTerminalSession(
         require(resizeDebounceMillis in 100..200) {
             "resizeDebounceMillis must be from 100 through 200"
         }
+        require(leaseRenewalIntervalMillis > 0) { "leaseRenewalIntervalMillis must be positive" }
     }
 
     @OptIn(FlowPreview::class)
@@ -94,26 +97,65 @@ class RemoteTerminalSession(
             if (mutableState.value is RemoteSessionState.Exited) return
             leaseExpiryJob?.cancel()
             leaseExpiryJob = null
+            leaseRenewalJob?.cancel()
+            leaseRenewalJob = null
             mutableState.value = RemoteSessionState.ReadOnly(lastAckedSequence, reason)
             engine.setReadOnly(true)
         }
     }
 
-    suspend fun grantControl(leaseId: String, expiresAtEpochMillis: Long) {
+    suspend fun grantControl(
+        leaseId: String,
+        expiresAtEpochMillis: Long,
+        leaseVersion: Long = 0,
+    ) {
         require(leaseId.isNotBlank()) { "leaseId is required" }
         require(expiresAtEpochMillis > clockMillis()) { "control lease is already expired" }
         mutex.withLock {
             check(mutableState.value !is RemoteSessionState.Exited) { "session has exited" }
             leaseExpiryJob?.cancel()
+            leaseRenewalJob?.cancel()
             mutableState.value = RemoteSessionState.Controlling(
                 lastAckedSequence,
                 leaseId,
                 expiresAtEpochMillis,
+                leaseVersion,
             )
             engine.setReadOnly(false)
-            leaseExpiryJob = scope.launch {
-                delay((expiresAtEpochMillis - clockMillis()).coerceAtLeast(0))
-                expireLease(leaseId)
+            scheduleLeaseExpiry(leaseId, expiresAtEpochMillis)
+            leaseRenewalJob = scope.launch {
+                while (true) {
+                    delay(leaseRenewalIntervalMillis)
+                    val lease = mutex.withLock {
+                        val current = mutableState.value
+                        if (current is RemoteSessionState.Controlling && current.leaseId == leaseId &&
+                            current.expiresAtEpochMillis > clockMillis()
+                        ) current else null
+                    } ?: break
+                    try {
+                        val renewed = outbound.renewLease(lease.leaseId, lease.leaseVersion)
+                        if (renewed != null) {
+                            require(renewed.leaseId == lease.leaseId) { "renewed lease ID changed" }
+                            require(renewed.version >= lease.leaseVersion) { "renewed lease version regressed" }
+                            require(renewed.expiresAtEpochMillis > clockMillis()) { "renewed lease is expired" }
+                            mutex.withLock {
+                                val current = mutableState.value
+                                if (current is RemoteSessionState.Controlling && current.leaseId == renewed.leaseId) {
+                                    mutableState.value = current.copy(
+                                        expiresAtEpochMillis = renewed.expiresAtEpochMillis,
+                                        leaseVersion = renewed.version,
+                                    )
+                                    scheduleLeaseExpiry(renewed.leaseId, renewed.expiresAtEpochMillis)
+                                }
+                            }
+                        }
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Exception) {
+                        markReadOnly("control lease renewal failed")
+                        break
+                    }
+                }
             }
         }
     }
@@ -147,6 +189,15 @@ class RemoteTerminalSession(
             }
             is RemoteSessionEvent.Resize -> engine.resize(event.size.columns, event.size.rows)
             is RemoteSessionEvent.Title -> mutableTitle.value = event.value
+            is RemoteSessionEvent.InputResult -> Unit
+            is RemoteSessionEvent.ControlGranted -> Unit
+            is RemoteSessionEvent.ControlRevoked -> {
+                leaseExpiryJob?.cancel()
+                leaseExpiryJob = null
+                leaseRenewalJob?.cancel()
+                leaseRenewalJob = null
+                engine.setReadOnly(true)
+            }
             is RemoteSessionEvent.Lifecycle -> Unit
             is RemoteSessionEvent.Gap -> error("handled above")
         }
@@ -172,6 +223,8 @@ class RemoteTerminalSession(
         mutex.withLock {
             leaseExpiryJob?.cancel()
             leaseExpiryJob = null
+            leaseRenewalJob?.cancel()
+            leaseRenewalJob = null
             engine.setReadOnly(true)
             engine.clear()
             lastAckedSequence = 0
@@ -185,27 +238,34 @@ class RemoteTerminalSession(
         return lastAckedSequence
     }
 
-    suspend fun submitInput(bytes: ByteArray): InputSubmission = mutex.withLock {
-        if (bytes.isEmpty()) return InputSubmission.RejectedEmpty
-        val current = mutableState.value
-        if (current is RemoteSessionState.Exited) return InputSubmission.RejectedExited
-        if (current !is RemoteSessionState.Controlling || current.expiresAtEpochMillis <= clockMillis()) {
-            if (current is RemoteSessionState.Controlling) {
-                mutableState.value = RemoteSessionState.ReadOnly(lastAckedSequence, "control lease expired")
-                engine.setReadOnly(true)
+    suspend fun submitInput(bytes: ByteArray): InputSubmission {
+        val input = mutex.withLock {
+            if (bytes.isEmpty()) return InputSubmission.RejectedEmpty
+            val current = mutableState.value
+            if (current is RemoteSessionState.Exited) return InputSubmission.RejectedExited
+            if (current !is RemoteSessionState.Controlling || current.expiresAtEpochMillis <= clockMillis()) {
+                if (current is RemoteSessionState.Controlling) {
+                    mutableState.value = RemoteSessionState.ReadOnly(lastAckedSequence, "control lease expired")
+                    engine.setReadOnly(true)
+                }
+                return InputSubmission.RejectedNoLease
             }
-            return InputSubmission.RejectedNoLease
+            RemoteInput(inputIdFactory(), bytes.copyOf())
         }
-
-        val input = RemoteInput(inputIdFactory(), bytes.copyOf())
         return try {
+            // Do not hold the session mutex while waiting for InputAccepted;
+            // the ordered result must enter accept() on the receive coroutine.
             outbound.sendInput(input)
             InputSubmission.Sent(input.inputId)
         } catch (error: CancellationException) {
             throw error
         } catch (_: Exception) {
-            mutableState.value = RemoteSessionState.Reconnecting(lastAckedSequence, "input transport failed")
-            engine.setReadOnly(true)
+            mutex.withLock {
+                if (mutableState.value !is RemoteSessionState.Exited) {
+                    mutableState.value = RemoteSessionState.Reconnecting(lastAckedSequence, "input transport failed")
+                    engine.setReadOnly(true)
+                }
+            }
             InputSubmission.TransportFailed(input.inputId)
         }
     }
@@ -228,6 +288,9 @@ class RemoteTerminalSession(
     }
 
     private fun stateAfterAppliedEvent(event: RemoteSessionEvent): RemoteSessionState {
+        if (event is RemoteSessionEvent.ControlRevoked) {
+            return RemoteSessionState.ReadOnly(lastAckedSequence, event.reason)
+        }
         if (event is RemoteSessionEvent.Lifecycle) {
             return when (event.state) {
                 RemoteLifecycle.RUNNING -> withUpdatedAck(mutableState.value)
@@ -238,12 +301,22 @@ class RemoteTerminalSession(
                 RemoteLifecycle.ENDED -> {
                     leaseExpiryJob?.cancel()
                     leaseExpiryJob = null
+                    leaseRenewalJob?.cancel()
+                    leaseRenewalJob = null
                     engine.setReadOnly(true)
                     RemoteSessionState.Exited(lastAckedSequence, event.exitCode)
                 }
             }
         }
         return withUpdatedAck(mutableState.value)
+    }
+
+    private fun scheduleLeaseExpiry(leaseId: String, expiresAtEpochMillis: Long) {
+        leaseExpiryJob?.cancel()
+        leaseExpiryJob = scope.launch {
+            delay((expiresAtEpochMillis - clockMillis()).coerceAtLeast(0))
+            expireLease(leaseId)
+        }
     }
 
     private fun withUpdatedAck(current: RemoteSessionState): RemoteSessionState = when (current) {
@@ -258,6 +331,8 @@ class RemoteTerminalSession(
     private fun enterHistoryGap(expected: Long, received: Long) {
         leaseExpiryJob?.cancel()
         leaseExpiryJob = null
+        leaseRenewalJob?.cancel()
+        leaseRenewalJob = null
         engine.setReadOnly(true)
         mutableState.value = RemoteSessionState.HistoryGap(lastAckedSequence, expected, received)
     }
@@ -267,6 +342,8 @@ class RemoteTerminalSession(
             if (mutableState.value is RemoteSessionState.Exited) return
             leaseExpiryJob?.cancel()
             leaseExpiryJob = null
+            leaseRenewalJob?.cancel()
+            leaseRenewalJob = null
             mutableState.value = RemoteSessionState.Reconnecting(lastAckedSequence, reason)
             engine.setReadOnly(true)
         }
@@ -281,6 +358,8 @@ class RemoteTerminalSession(
                 mutableState.value = RemoteSessionState.ReadOnly(lastAckedSequence, "control lease expired")
                 engine.setReadOnly(true)
                 leaseExpiryJob = null
+                leaseRenewalJob?.cancel()
+                leaseRenewalJob = null
             }
         }
     }
@@ -288,6 +367,7 @@ class RemoteTerminalSession(
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         leaseExpiryJob?.cancel()
+        leaseRenewalJob?.cancel()
         scope.cancel()
         engine.setReadOnly(true)
         if (disposeEngineOnClose) engine.dispose()

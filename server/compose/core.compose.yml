@@ -1,0 +1,189 @@
+name: ${COMPOSE_PROJECT_NAME:-termlink}
+
+services:
+  edge:
+    image: caddy:2.10.0-alpine
+    command:
+      - caddy
+      - reverse-proxy
+      - --from
+      - ${TERMLINK_PUBLIC_HOST:-localhost}:8443
+      - --to
+      - http://server:8080
+    ports:
+      - "${TERMLINK_EDGE_BIND_IP:-0.0.0.0}:443:8443"
+    networks:
+      - public
+      - private
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --no-check-certificate -O - https://127.0.0.1:8443/healthz >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    profiles: ["edge"]
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: server/Dockerfile
+    image: ${TERMLINK_IMAGE:-ghcr.io/termlink/termlink-server:0.1.0}
+    command: ["migrate"]
+    environment: &server-environment
+      TERMLINK_PUBLIC_URL: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}
+      TERMLINK_OIDC_ISSUER: ${TERMLINK_OIDC_ISSUER:?TERMLINK_OIDC_ISSUER is required}
+      TERMLINK_OIDC_CLIENT_ID: ${TERMLINK_OIDC_CLIENT_ID:?TERMLINK_OIDC_CLIENT_ID is required}
+      TERMLINK_ANDROID_OIDC_CLIENT_ID: ${TERMLINK_ANDROID_OIDC_CLIENT_ID:-termlink-android}
+      TERMLINK_ANDROID_OIDC_REDIRECT_URI: ${TERMLINK_ANDROID_OIDC_REDIRECT_URI:-dev.termlink:/oauth2redirect}
+      TERMLINK_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
+      TERMLINK_DATABASE_URL_FILE: /run/secrets/database_url
+      TERMLINK_REDIS_URL_FILE: /run/secrets/redis_url
+      TERMLINK_TOKEN_SIGNING_KEY_FILE: /run/secrets/token_signing_key
+      TERMLINK_S3_ENDPOINT: ${TERMLINK_S3_ENDPOINT:-}
+      TERMLINK_LOG_LEVEL: ${TERMLINK_LOG_LEVEL:-info}
+      TERMLINK_HISTORY_ENABLED: ${TERMLINK_HISTORY_ENABLED:-false}
+      TERMLINK_LISTEN_ADDR: :8080
+    secrets: &server-secrets
+      - source: oidc_client_secret
+        target: oidc_client_secret
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+      - source: database_url
+        target: database_url
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+      - source: redis_url
+        target: redis_url
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+      - source: token_signing_key
+        target: token_signing_key
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+    networks:
+      - private
+    read_only: true
+    user: "65532:65532"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  server:
+    build:
+      context: ../..
+      dockerfile: server/Dockerfile
+    image: ${TERMLINK_IMAGE:-ghcr.io/termlink/termlink-server:0.1.0}
+    environment: *server-environment
+    secrets: *server-secrets
+    networks:
+      - private
+      - egress
+    read_only: true
+    user: "65532:65532"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/termlink-server", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    stop_grace_period: 30s
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  postgres:
+    image: postgres:17.5-alpine3.22
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-termlink}
+      POSTGRES_USER: ${POSTGRES_USER:-termlink}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - source: postgres_password
+        target: postgres_password
+        mode: 0400
+    networks:
+      - private
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  valkey:
+    image: valkey/valkey:8.1.1-alpine
+    command: ["valkey-server", "--appendonly", "yes"]
+    networks:
+      - private
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  caddy-data:
+  caddy-config:
+  postgres-data:
+  valkey-data:
+
+secrets:
+  oidc_client_secret:
+    file: ${TERMLINK_OIDC_CLIENT_SECRET_FILE:-../secrets/oidc-client-secret}
+  database_url:
+    file: ${TERMLINK_DATABASE_URL_FILE:-../secrets/database-url}
+  redis_url:
+    file: ${TERMLINK_REDIS_URL_FILE:-../secrets/redis-url}
+  token_signing_key:
+    file: ${TERMLINK_TOKEN_SIGNING_KEY_FILE:-../secrets/token-signing-key}
+  postgres_password:
+    file: ${TERMLINK_POSTGRES_PASSWORD_FILE:-../secrets/postgres-password}
+
+networks:
+  public:
+  private:
+    internal: true
+  # The application needs outbound access for external OIDC and S3 providers,
+  # while the database and Valkey remain on the isolated private network.
+  egress:

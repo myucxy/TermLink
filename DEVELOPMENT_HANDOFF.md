@@ -15,9 +15,30 @@
 - 已有可运行内容：Windows ConPTY 技术验证与 Golden Stream 录制器、Android Compose
   离线/LAN/双向测试 Harness、固定上游 Termux emulator/view 真实网格、固定版本 xterm.js
   对照 Harness、Go Docker LAN 与 Phase 1 测试服务、三端可交互 UI 原型；
-- 已创建 `protocol`、`win-agent`、`server`、`android`、`terminal-forks` 和 `testdata`
-  正式骨架；生产服务端与完整 Agent 工程按阶段计划仍未提前实现；
+- `protocol`、`win-agent`、`server`、`android`、`terminal-forks` 和 `testdata` 均已有正式
+  模块；生产账号、Relay、E2EE、历史、计费、产品 UI 和 Compose 接线已实现并通过自动化
+  验证，生产发布与运维加固单列为开发项 7；
 - 当前目录是 Git 仓库，阶段 0 开发前工作树基线为 `bbc794b`。
+
+## 开发项 1-7 完成矩阵
+
+| 开发项 | 范围 | 状态 | 验证与边界 |
+| --- | --- | --- | --- |
+| 1 | 生产账号/OIDC/设备注册与配对 | **已实现并验证** | Go `auth`、设备注册/配对 API、Android OIDC/API 客户端、Windows 配对流程；Go/Android/.NET 自动化验收通过。 |
+| 2 | 生产 Protobuf 实时协议、X25519 + ChaCha20-Poly1305、Relay | **已实现并验证** | `protocol/protobuf/termlink_realtime.proto`、Go `realtimewire`/Relay、Android `core-network`、Windows `src/Protocol`；向量、协议和 Relay 测试通过。 |
+| 3 | Windows ConPTY 到 Android 真实输入输出、ACK/Gap/重连、租约与本地输入优先 | **已实现并验证** | Windows `ProductionAgentRuntime`、Android 生产 Session Client、服务端租约/撤销；生产路径自动化覆盖有界重放、ACK/Gap、输入去重、租约和本地输入 epoch。 |
+| 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
+| 5 | 服务端 Catalog、计费验证边界、权益与配额 | **核心已实现并验证（Provider 待配置）** | Go `billing`/Catalog/entitlement API、可注入 verified-purchase 契约与 Android `feature-billing` 已测试；真实 Google/Web verifier 未配置时生产入口返回 `BILLING_UNAVAILABLE`。 |
+| 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |
+| 7 | 生产 TLS/受信发布证书真实安装更新、备份恢复演练、镜像签名、监控告警、生产 CA/发布加固 | **未开始** | 仅有开发证书/故障注入和本地 Compose 验证；真实证书链、系统级安装更新、灾备演练、镜像签名与生产运维尚未验收。 |
+
+统一边界：`LAN Replay V1`、`TLT1`（Phase 1 Test Session V1）和 Android Compose
+Harness 都是测试夹具，不是生产协议；Android 历史客户端只接受 HTTPS。Integration
+Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-6
+的自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏或生产发布已经验证。
+
+真实 OIDC/Google/Web Billing Provider 仍需在部署前注入；本地默认配置只验证契约和
+`BILLING_UNAVAILABLE` 失败边界，不冒充线上购买或公网部署结果。
 
 ## 2. 一句话目标
 
@@ -72,7 +93,8 @@
 - 单向数据流、ViewModel、Coroutines/Flow；
 - OkHttp WebSocket 或 Ktor Client + Protobuf；
 - Room，敏感数据密钥由 Android Keystore 包装；
-- 经审计的 Tink/libsodium 封装，不自研密码算法；
+- Bouncy Castle 的 Ed25519/X25519/ChaCha20-Poly1305 封装，私钥材料由 Android Keystore
+  AES-GCM 包装，不自研底层密码原语；
 - `terminal-engine-api` 隔离 Termux Fork 与 xterm.js 的具体类型。
 
 ## 5. 已完成的技术验证
@@ -123,11 +145,12 @@ cd E:\WorkSpace\AICodeProject\TermLink\prototypes\conpty-probe
 .\Run-All.ps1
 ```
 
-该结果证明“可靠管理自己创建的 ConPTY 会话”和固定流的 Android 解析可行，尚未证明：
+该结果证明“可靠管理自己创建的 ConPTY 会话”和固定流的 Android 解析可行；这些固定流
+本身不替代生产链路，生产链路由开发项 1-6 的独立模块和自动化覆盖。仍未证明：
 
 - Android 真机渲染兼容；
-- 生产 WebSocket Relay、ACK、背压和断线恢复；
-- 多设备 E2EE 和历史密钥恢复。
+- 生产发布环境中的真实 TLS/证书链与外部硬件兼容性；
+- 规范化跨引擎 Snapshot（仍属实验能力）。
 
 ### 阶段 1 当前进度
 
@@ -194,12 +217,11 @@ cd E:\WorkSpace\AICodeProject\TermLink\prototypes\conpty-probe
 - `docs/validation/phase1-windows-installer.json`。
 - `docs/validation/phase1-windows-updater.json`。
 
-这些结果尚未完成阶段 1：Agent/Tray 已有正式 .NET 8 工程、本机恢复闭环、签名 MSIX 构建
-和登录自启声明，受控更新核心与故障回滚状态机也已验证；但生产受信证书下的真实安装/
-卸载、更新/降级和生产账号/设备接入仍未完成；`RemoteTerminalSession` 只接入临时明文
-测试网络和 Harness，尚未接入生产 Crypto、设备授权或正式设备/Session 页面。临时 Relay
-不连接真实 Windows Shell；生产 Protobuf、
-E2EE 和规范化 Snapshot 均未冻结。
+上述 Phase 1 结果仍需与生产链路区分：Agent/Tray 本机恢复、开发签名 MSIX 和故障回滚
+属于本机验收；生产账号/设备、Crypto、Protobuf Relay、历史、计费和正式页面已在独立
+模块中实现并有自动化验证。临时 Relay 不连接真实 Windows Shell，LAN Replay、TLT1 和
+Harness 只是假数据夹具；规范化 Snapshot 仍未冻结。生产受信证书下的真实安装/卸载、
+更新/降级及发布运维属于开发项 7。
 
 ## 6. Android Terminal 结论
 
@@ -283,9 +305,10 @@ E2EE 和规范化 Snapshot 均未冻结。
   诊断、账户和 Entitlement 刷新 UI；
 - Server Console 已补齐连接搜索/详情、备份、恢复演练、Compose 安全摘要、审计筛选、
   设备与授权、运维设置、套餐草稿、Catalog 发布和订阅详情 UI；
-- 所有按钮均有明确行为，高风险动作二次确认，外部写操作明确标注等待生产 API；
-- UI 状态完整不代表账号、E2EE、Relay、计费或备份后端已经完成，不能把原型反馈当作
-  生产服务端结果。
+- 所有按钮均有明确行为，高风险动作二次确认；原型中的外部写操作仍需由实际客户端和
+  服务端自动化结果佐证；
+- UI 状态完整不等于真机硬件、生产证书、备份恢复或发布运维已经验收，不能把原型反馈
+  当作这些边界的生产结果。
 
 UI 设计语言为 Quiet Focus：内容优先、低干扰、上下文操作、清晰状态、渐进披露；
 不要用大量 KPI 卡片、霓虹渐变或无功能装饰替代可用性。
@@ -301,8 +324,9 @@ python -m http.server 4173 --bind 127.0.0.1
 
 ## 9. 下一步开发顺序
 
-阶段 0 当前环境可自动化项已完成；不要把仍缺少的硬件验证或 LAN 测试设施扩大解释为
-生产能力。下一开发里程碑按设计进入阶段 1 本地闭环。
+阶段 0 当前环境可自动化项已完成，开发项 1-6 的生产基础也已实现并通过自动化验收；
+不要把仍缺少的硬件验证或 LAN 测试设施扩大解释为生产发布能力。下一里程碑是开发项 7
+的证书、灾备、签名、监控和发布加固。
 
 ### 第一开发里程碑：Golden Stream 本地闭环
 
@@ -317,7 +341,8 @@ python -m http.server 4173 --bind 127.0.0.1
 8. ~~加入离线 xterm.js 对照 Harness；~~
 9. ~~同流回放并形成差异和不兼容清单；~~ 10 cases、122/122 checkpoint match；按设计
    暂不冻结 `normalized_grid`、参考截图或跨端 Snapshot；
-10. 通过验证后再冻结 Protobuf Envelope 与 `TerminalSnapshotV1`。
+10. 生产 Protobuf Envelope 已在 `protocol/protobuf/termlink_realtime.proto` 冻结；
+    `TerminalSnapshotV1` 仍待跨 Termux/xterm.js 兼容验收，保持实验能力。
 
 第一里程碑验收：
 
@@ -347,15 +372,12 @@ python -m http.server 4173 --bind 127.0.0.1
 12. 单文件 Updater、独立签名更新清单、原子缓存、可恢复事务日志与故障回滚状态机；真实
     开发签名双版本和篡改拒绝已验证，系统级 AppX 更新/降级待生产受信证书。
 
-下一段必须按以下顺序继续：
+开发项 1-6 已完成；下一段只推进开发项 7：
 
 1. 用生产受信证书完成 Agent/Tray 真实安装/卸载、登录启动及 Updater 的真实更新/降级验收；
-2. 建立正式设备/Session 页面与设备授权，接入生产 Crypto 和网络边界；
-3. 连接 Windows Agent → 生产 Relay → Android，验证真实 Shell 的输入、ACK、背压与恢复；
-4. 在兼容性和安全验证通过后，再冻结生产 Envelope 与 `TerminalSnapshotV1`。
-
-后续阶段依次为：本地 Agent/Android/测试 Relay 闭环 → Docker 服务端、账号、设备与
-E2EE → 历史、计费、完整 UI、安装更新和发布流水线。
+2. 建立并演练生产备份恢复、镜像签名、监控告警和生产 CA/发布加固；
+3. 在真实 TLS/受信发布链路上复核已实现的账号、Relay、历史、计费和端到端输入输出；
+4. 真机、厂商 IME、外接键鼠及其他硬件可用后补齐兼容性矩阵。
 
 ## 10. 推荐仓库结构
 
@@ -366,20 +388,21 @@ TermLink/
 │   └── test-vectors/
 ├── win-agent/
 │   ├── src/Agent/
+│   ├── src/Protocol/
 │   ├── src/Tray/
 │   ├── src/SessionHost/
 │   ├── src/Updater/
 │   └── tests/
 ├── server/
 │   ├── cmd/termlink-server/
-│   ├── internal/
+│   ├── internal/{api,auth,billing,history,kv,realtime,realtimewire,store}/
 │   ├── migrations/
 │   ├── Dockerfile
 │   └── compose/
 ├── android/
 │   ├── app/
-│   ├── core-*/
-│   ├── feature-*/
+│   ├── core-{crypto,database,model,network,protocol,session}/
+│   ├── feature-{billing,history}/
 │   └── terminal-engine-*/
 ├── terminal-forks/
 │   └── termux-patches/
@@ -446,6 +469,8 @@ UI 已实际验证 Android、Windows Agent、Server Console、明暗主题持久
 .\win-agent\tests\Test-SessionRegistry.ps1
 .\win-agent\Build-Windows.ps1
 .\win-agent\tests\Validate-Phase1WindowsApp.ps1
+.\win-agent\tests\Validate-ProductionProtocol.ps1
+.\win-agent\tests\Validate-ProductionRuntime.ps1
 
 docker compose -f server\compose\lan-test.compose.yml up --build -d
 
@@ -470,6 +495,11 @@ cd server
 D:\Dev\Env\Go\bin\go.exe test ./...
 D:\Dev\Env\Go\bin\go.exe vet ./...
 .\Validate-Phase1TestRelay.ps1
+
+# 生产 Compose 配置/集成（需要 Docker、临时 secrets 和 loopback MinIO）
+docker compose --env-file .env -f compose\core.compose.yml config
+docker compose -f compose\integration.compose.yml up --build --abort-on-container-exit --exit-code-from server
+docker compose -f compose\integration.compose.yml down -v
 
 cd ..
 Invoke-RestMethod http://<PC-LAN-IP>:8080/healthz
@@ -513,29 +543,29 @@ API 24 和 API 36，而 app `minSdk` 为 26。这些是外部硬件阻塞，不�
 - `docs/validation/phase1-test-relay.json`：Go Relay 与 LAN Replay 回归；
 - `docs/validation/phase1-android-relay-emulator.json`：真实模拟器双向场景。
 
-该链路是明文固定夹具测试设施，不连接真实 Shell，也不代表生产 Relay、Protobuf、设备授权、
-E2EE 或可移植 Snapshot。`LAN Replay V1` 仍保持只读且未修改。
+该链路是明文固定夹具测试设施，不连接真实 Shell；它不替代生产 Relay、Protobuf、设备授权、
+E2EE 或可移植 Snapshot。生产实现及其自动化证据位于 `protocol/protobuf`、Go `internal`、
+Android `core-*`/`feature-*` 和 Windows `src/Protocol`/`ProductionAgentRuntime`；
+`LAN Replay V1` 仍保持只读且未修改。
 
 Windows 正式工程使用 SDK 8.0.303 构建 AgentControl、Agent、SessionHost、Tray 和 Updater，0 warning、
 0 error。`Validate-Phase1WindowsApp.ps1` 启动 20 个真实 ConPTY SessionHost，强制结束和
 受控重启 Agent 后均从 DPAPI CurrentUser 注册索引恢复 20/20；Tray 读取 20 条脱敏摘要。停止全部
 远程访问会清除索引，但 20 个本地 Shell 均继续接收本地输入并正常退出。证据在
 `docs/validation/phase1-windows-app.json`。Updater 已通过开发签名双版本、篡改拒绝和 5 条
-故障回滚状态验证，证据在 `docs/validation/phase1-windows-updater.json`；这不代表生产
-证书下真实 AppX 安装/更新、生产 Relay、设备授权或 E2EE 已完成。
+故障回滚状态验证；生产协议与 runtime 另由 `Validate-ProductionProtocol.ps1` 和
+`Validate-ProductionRuntime.ps1` 覆盖。生产受信证书下真实 AppX 安装/更新、备份、镜像签名、
+监控告警和 CA/发布加固仍属于开发项 7。
 
 ## 14. 新会话建议首条指令
 
 ```text
 请先完整阅读 E:\WorkSpace\AICodeProject\TermLink\DEVELOPMENT_HANDOFF.md、
 docs\COMPLETE_SYSTEM_DESIGN.md 和 docs\UI_LAYOUT_DESIGNS.md，以设计为权威基线并保留
-全部未提交成果。阶段 0 当前环境可自动化验收已完成。阶段 1 已完成 Host-Agent Named
-Pipe、序号/ACK、重连/Gap、DPAPI Buffer、输入去重、长驻 Session Registry、正式 .NET 8
-Agent/SessionHost/Tray/Updater、DPAPI 注册索引与 20 Session 重启恢复，以及 Android
-RemoteTerminalSession/core-network → Docker 临时测试 Relay → Termux View 的双向闭环；
-证据位于 docs/validation/phase1-*.json。更新核心与故障回滚已验证；证书可用后补真实
-Windows 安装/自启动/更新降级验收，同时进入生产设备授权、Crypto 与 Relay。临时协议不得
-标记为生产 Protobuf；不要把 LAN Replay 或
-Phase 1 Test Session 冒充生产 Relay，不要提前冻结 Snapshot，也不要改变 E2EE、设备授权、
-本地用户优先和远程输入租约边界。
+全部未提交成果。阶段 0 当前环境可自动化验收已完成，开发项 1-6 的生产账号/OIDC、设备
+配对、Protobuf/E2EE Relay、ConPTY 输入输出、加密历史、计费、产品 UI 与 Compose 接线也
+已实现并通过自动化验收；矩阵和边界以本文第 1 节为准。下一步只做开发项 7：生产受信
+证书下的真实安装/更新、备份恢复、镜像签名、监控告警和发布加固，以及硬件矩阵。
+临时协议不得标记为生产 Protobuf；不要把 LAN Replay 或 Phase 1 Test Session 冒充生产
+Relay，不要提前冻结 Snapshot，也不要改变 E2EE、设备授权、本地用户优先和远程输入租约边界。
 ```

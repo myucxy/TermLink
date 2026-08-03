@@ -1,0 +1,715 @@
+package dev.termlink.history
+
+import androidx.room.withTransaction
+import dev.termlink.database.AckCursorEntity
+import dev.termlink.database.DeviceEntity
+import dev.termlink.database.EventChunkEntity
+import dev.termlink.database.HistoryPreferenceEntity
+import dev.termlink.database.PcEntity
+import dev.termlink.database.SessionEntity
+import dev.termlink.database.SnapshotEntity
+import dev.termlink.database.TermLinkDatabase
+import dev.termlink.model.DeviceSummary
+import dev.termlink.model.DeviceTrustState
+import dev.termlink.model.DeviceType
+import dev.termlink.model.HistoryObject
+import dev.termlink.model.PcSummary
+import dev.termlink.model.SessionState
+import dev.termlink.model.SessionSummary
+import java.security.MessageDigest
+import java.time.Instant
+import java.util.UUID
+
+/** A decoded bounded event. The payload is transient and is never a Room value. */
+data class HistoryReplayEvent(
+    val sequence: ULong,
+    val payload: ByteArray,
+) {
+    init {
+        require(sequence > 0u) { "event sequence must be positive" }
+    }
+
+    fun copyPayload(): HistoryReplayEvent = copy(payload = payload.copyOf())
+
+    override fun equals(other: Any?): Boolean =
+        other is HistoryReplayEvent && sequence == other.sequence && payload.contentEquals(other.payload)
+
+    override fun hashCode(): Int = 31 * sequence.hashCode() + payload.contentHashCode()
+}
+
+/** Ciphertext plus non-sensitive index metadata returned by history queries. */
+data class EncryptedHistoryObject(
+    val metadata: HistoryObject,
+    val ciphertext: ByteArray,
+) {
+    init {
+        require(metadata.sizeBytes == ciphertext.size.toLong()) {
+            "ciphertext size does not match history metadata"
+        }
+        require(metadata.ciphertextSha256.size == HistoryRepository.SHA256_BYTES) {
+            "history ciphertext hash must be SHA-256"
+        }
+        require(MessageDigest.isEqual(metadata.ciphertextSha256, HistoryRepository.sha256(ciphertext))) {
+            "history ciphertext hash mismatch"
+        }
+    }
+
+    fun copyCiphertext(): EncryptedHistoryObject = copy(ciphertext = ciphertext.copyOf())
+}
+
+data class EncryptedPreference(
+    val scope: String,
+    val key: String,
+    val keyId: String,
+    val ciphertextSha256: ByteArray,
+    val ciphertext: ByteArray,
+) {
+    init {
+        require(ciphertextSha256.size == HistoryRepository.SHA256_BYTES) { "preference hash must be SHA-256" }
+        require(ciphertextSha256.contentEquals(HistoryRepository.sha256(ciphertext))) {
+            "preference ciphertext hash mismatch"
+        }
+    }
+
+    fun copyCiphertext(): EncryptedPreference = copy(ciphertext = ciphertext.copyOf())
+}
+
+data class HistorySearchHit(
+    val objectId: UUID,
+    val sequence: ULong?,
+    val preview: String,
+)
+
+class HistoryIntegrityException(message: String) : IllegalStateException(message)
+
+class HistoryGapException(
+    val expectedSequence: ULong,
+    val receivedSequence: ULong,
+) : IllegalStateException("history gap: expected $expectedSequence, received $receivedSequence")
+
+/**
+ * Persistence boundary for local history. The repository accepts ciphertext, never
+ * plaintext terminal bytes. Decryption is an explicit callback used only by replay
+ * and search, so no plaintext can accidentally enter a DAO or a database transaction.
+ */
+class HistoryRepository(
+    private val database: TermLinkDatabase,
+    private val clockMillis: () -> Long = System::currentTimeMillis,
+) {
+    private val devices get() = database.devices()
+    private val pcs get() = database.pcs()
+    private val sessions get() = database.sessions()
+    private val chunks get() = database.eventChunks()
+    private val snapshots get() = database.snapshots()
+    private val acks get() = database.ackCursors()
+    private val preferences get() = database.preferences()
+
+    suspend fun upsertDevice(summary: DeviceSummary) {
+        devices.upsert(
+            DeviceEntity(
+                id = summary.id.requireUuidString(),
+                type = summary.type.name,
+                name = summary.name,
+                keyId = summary.keyId,
+                exchangePublicKey = summary.exchangePublicKey.copyOf(),
+                trustState = summary.trustState.name,
+                createdAtEpochMillis = summary.createdAt.toEpochMilli(),
+            ),
+        )
+    }
+
+    suspend fun upsertPc(summary: PcSummary) {
+        pcs.upsert(
+            PcEntity(
+                id = summary.id.requireUuidString(),
+                deviceId = summary.deviceId.requireUuidString(),
+                name = summary.name,
+                agentVersion = summary.agentVersion,
+                keyEpoch = summary.keyEpoch,
+                remoteRoutingEnabled = summary.remoteRoutingEnabled,
+                online = summary.online,
+                lastSeenAtEpochMillis = summary.lastSeenAt?.toEpochMilli(),
+            ),
+        )
+    }
+
+    suspend fun upsertSession(summary: SessionSummary) {
+        require(summary.columns in 1..65535) { "columns must be between 1 and 65535" }
+        require(summary.rows in 1..65535) { "rows must be between 1 and 65535" }
+        require(summary.lastOutputSequence <= Long.MAX_VALUE.toULong()) {
+            "last output sequence is too large for Room"
+        }
+        sessions.upsert(
+            SessionEntity(
+                id = summary.id.requireUuidString(),
+                pcId = summary.pcId.requireUuidString(),
+                shellType = summary.shellType,
+                encryptedTitle = summary.encryptedTitle?.copyOf(),
+                state = summary.state.name,
+                columns = summary.columns,
+                rows = summary.rows,
+                lastOutputSequence = summary.lastOutputSequence.toLong(),
+                createdAtEpochMillis = summary.createdAt.toEpochMilli(),
+                endedAtEpochMillis = summary.endedAt?.toEpochMilli(),
+            ),
+        )
+    }
+
+    suspend fun devices(): List<DeviceSummary> = devices.list().map { entity ->
+        DeviceSummary(
+            id = entity.id.toUuid(),
+            type = entity.type.toEnumOrThrow<DeviceType>("device type"),
+            name = entity.name,
+            keyId = entity.keyId,
+            exchangePublicKey = entity.exchangePublicKey.copyOf(),
+            trustState = entity.trustState.toEnumOrThrow<DeviceTrustState>("trust state"),
+            createdAt = Instant.ofEpochMilli(entity.createdAtEpochMillis),
+        )
+    }
+
+    suspend fun pcs(): List<PcSummary> = pcs.list().map { entity ->
+        PcSummary(
+            id = entity.id.toUuid(),
+            deviceId = entity.deviceId.toUuid(),
+            name = entity.name,
+            agentVersion = entity.agentVersion,
+            keyEpoch = entity.keyEpoch,
+            remoteRoutingEnabled = entity.remoteRoutingEnabled,
+            online = entity.online,
+            lastSeenAt = entity.lastSeenAtEpochMillis?.let(Instant::ofEpochMilli),
+        )
+    }
+
+    suspend fun sessions(pcId: UUID? = null): List<SessionSummary> =
+        (pcId?.let { sessions.listForPc(it.requireUuidString()) } ?: sessions.list()).map { entity ->
+            SessionSummary(
+                id = entity.id.toUuid(),
+                pcId = entity.pcId.toUuid(),
+                shellType = entity.shellType,
+                encryptedTitle = entity.encryptedTitle?.copyOf(),
+                state = entity.state.toEnumOrThrow<SessionState>("session state"),
+                columns = entity.columns,
+                rows = entity.rows,
+                lastOutputSequence = entity.lastOutputSequence.toULongChecked("last output sequence"),
+                createdAt = Instant.ofEpochMilli(entity.createdAtEpochMillis),
+                endedAt = entity.endedAtEpochMillis?.let(Instant::ofEpochMilli),
+            )
+        }
+
+    suspend fun session(sessionId: UUID): SessionSummary? = sessions.get(sessionId.requireUuidString())?.let { entity ->
+        SessionSummary(
+            id = entity.id.toUuid(),
+            pcId = entity.pcId.toUuid(),
+            shellType = entity.shellType,
+            encryptedTitle = entity.encryptedTitle?.copyOf(),
+            state = entity.state.toEnumOrThrow<SessionState>("session state"),
+            columns = entity.columns,
+            rows = entity.rows,
+            lastOutputSequence = entity.lastOutputSequence.toULongChecked("last output sequence"),
+            createdAt = Instant.ofEpochMilli(entity.createdAtEpochMillis),
+            endedAt = entity.endedAtEpochMillis?.let(Instant::ofEpochMilli),
+        )
+    }
+
+    /** Stores an already encrypted event chunk and computes its integrity hash. */
+    suspend fun putEventChunk(
+        sessionId: UUID,
+        startSequence: ULong,
+        endSequence: ULong,
+        objectKey: String,
+        keyId: String,
+        ciphertext: ByteArray,
+        id: UUID = UUID.randomUUID(),
+        expiresAt: Instant? = null,
+        ciphertextSha256: ByteArray? = null,
+    ): UUID {
+        val entity = eventChunkEntity(
+            id = id,
+            sessionId = sessionId,
+            startSequence = startSequence,
+            endSequence = endSequence,
+            objectKey = objectKey,
+            keyId = keyId,
+            ciphertext = ciphertext,
+            expiresAt = expiresAt,
+        )
+        ciphertextSha256?.let { supplied ->
+            if (!MessageDigest.isEqual(supplied, entity.ciphertextSha256)) {
+                throw HistoryIntegrityException("event chunk ciphertext hash mismatch before persistence")
+            }
+        }
+        chunks.upsert(entity)
+        return id
+    }
+
+    /** Compatibility alias for callers which call encrypted chunks history objects. */
+    suspend fun putChunk(
+        sessionId: UUID,
+        startSequence: ULong,
+        endSequence: ULong,
+        objectKey: String,
+        keyId: String,
+        ciphertext: ByteArray,
+        id: UUID = UUID.randomUUID(),
+        expiresAt: Instant? = null,
+        ciphertextSha256: ByteArray? = null,
+    ): UUID = putEventChunk(
+        sessionId,
+        startSequence,
+        endSequence,
+        objectKey,
+        keyId,
+        ciphertext,
+        id,
+        expiresAt,
+        ciphertextSha256,
+    )
+
+    suspend fun putSnapshot(
+        sessionId: UUID,
+        snapshotSequence: ULong,
+        rows: Int,
+        columns: Int,
+        objectKey: String,
+        keyId: String,
+        formatName: String = BOUNDED_EVENT_REPLAY_FORMAT,
+        formatVersion: Int = 1,
+        ciphertext: ByteArray,
+        id: UUID = UUID.randomUUID(),
+        expiresAt: Instant? = null,
+        ciphertextSha256: ByteArray? = null,
+    ): UUID {
+        require(rows in 1..65535) { "rows must be between 1 and 65535" }
+        require(columns in 1..65535) { "columns must be between 1 and 65535" }
+        require(formatName.isNotBlank()) { "snapshot format name is required" }
+        require(formatVersion > 0) { "snapshot format version must be positive" }
+        val sequence = snapshotSequence.toRoomSequence("snapshot sequence")
+        val bytes = ciphertext.copyOf()
+        require(bytes.isNotEmpty()) { "snapshot ciphertext must not be empty" }
+        val digest = sha256(bytes)
+        ciphertextSha256?.let { supplied ->
+            if (!MessageDigest.isEqual(supplied, digest)) {
+                throw HistoryIntegrityException("snapshot ciphertext hash mismatch before persistence")
+            }
+        }
+        snapshots.upsert(
+            SnapshotEntity(
+                id = id.requireUuidString(),
+                sessionId = sessionId.requireUuidString(),
+                snapshotSequence = sequence,
+                rows = rows,
+                columns = columns,
+                objectKey = objectKey.requireNonBlank("snapshot object key"),
+                keyId = keyId.requireNonBlank("snapshot key id"),
+                ciphertextSha256 = digest,
+                sizeBytes = bytes.size.toLong(),
+                ciphertext = bytes,
+                formatName = formatName,
+                formatVersion = formatVersion,
+                createdAtEpochMillis = clockMillis(),
+                expiresAtEpochMillis = expiresAt?.toEpochMilli(),
+            ),
+        )
+        return id
+    }
+
+    suspend fun listHistory(sessionId: UUID): List<EncryptedHistoryObject> {
+        val chunkObjects = chunks.listForSession(sessionId.requireUuidString()).map(::chunkObject)
+        val snapshotObjects = snapshots.listForSession(sessionId.requireUuidString()).map(::snapshotObject)
+        return (chunkObjects + snapshotObjects).sortedWith(
+            compareBy<EncryptedHistoryObject> {
+                it.metadata.startSequence ?: it.metadata.snapshotSequence ?: 0u
+            }.thenBy { it.metadata.id.toString() },
+        ).map(EncryptedHistoryObject::copyCiphertext)
+    }
+
+    suspend fun latestSnapshot(sessionId: UUID, atOrBefore: ULong): EncryptedHistoryObject? {
+        val sequence = atOrBefore.toRoomSequence("snapshot lookup sequence")
+        return snapshots.latestAtOrBefore(sessionId.requireUuidString(), sequence)?.let {
+            snapshotObject(it).copyCiphertext()
+        }
+    }
+
+    suspend fun getHistoryObject(objectId: UUID): EncryptedHistoryObject? =
+        chunks.get(objectId.requireUuidString())?.let { chunkObject(it).copyCiphertext() }
+            ?: snapshots.get(objectId.requireUuidString())?.let { snapshotObject(it).copyCiphertext() }
+
+    /** Stores a cumulative ACK cursor; stale writes can never move it backwards. */
+    suspend fun putAckCursor(sessionId: UUID, direction: String, sequence: ULong): ULong {
+        val safeDirection = direction.requireNonBlank("ACK direction")
+        val requested = sequence.toRoomSequence("ACK sequence")
+        val current = acks.get(sessionId.requireUuidString(), safeDirection)?.highestContiguousSequence ?: 0L
+        val retained = maxOf(current, requested)
+        acks.upsert(
+            AckCursorEntity(
+                sessionId = sessionId.requireUuidString(),
+                direction = safeDirection,
+                highestContiguousSequence = retained,
+                updatedAtEpochMillis = clockMillis(),
+            ),
+        )
+        return retained.toULongChecked("ACK sequence")
+    }
+
+    suspend fun ackCursor(sessionId: UUID, direction: String): ULong? =
+        acks.get(sessionId.requireUuidString(), direction.requireNonBlank("ACK direction"))
+            ?.highestContiguousSequence?.toULongChecked("ACK sequence")
+
+    suspend fun ackCursors(sessionId: UUID): Map<String, ULong> =
+        acks.listForSession(sessionId.requireUuidString()).associate {
+            it.direction to it.highestContiguousSequence.toULongChecked("ACK sequence")
+        }
+
+    suspend fun putPreference(
+        scope: String,
+        key: String,
+        keyId: String,
+        ciphertext: ByteArray,
+        ciphertextSha256: ByteArray? = null,
+    ) {
+        val bytes = ciphertext.copyOf()
+        require(scope.isNotBlank()) { "preference scope is required" }
+        require(key.isNotBlank()) { "preference key is required" }
+        require(keyId.isNotBlank()) { "preference key id is required" }
+        require(bytes.isNotEmpty()) { "preference ciphertext must not be empty" }
+        val digest = sha256(bytes)
+        ciphertextSha256?.let { supplied ->
+            if (!MessageDigest.isEqual(supplied, digest)) {
+                throw HistoryIntegrityException("preference ciphertext hash mismatch before persistence")
+            }
+        }
+        preferences.upsert(
+            HistoryPreferenceEntity(
+                scope = scope,
+                preferenceKey = key,
+                keyId = keyId,
+                valueCiphertext = bytes,
+                valueCiphertextSha256 = digest,
+                updatedAtEpochMillis = clockMillis(),
+            ),
+        )
+    }
+
+    suspend fun preference(scope: String, key: String): EncryptedPreference? =
+        preferences.get(scope, key)?.let { entity ->
+            verifyHash(entity.valueCiphertext, entity.valueCiphertextSha256, "preference ${entity.preferenceKey}")
+            EncryptedPreference(
+                scope = entity.scope,
+                key = entity.preferenceKey,
+                keyId = entity.keyId,
+                ciphertextSha256 = entity.valueCiphertextSha256.copyOf(),
+                ciphertext = entity.valueCiphertext.copyOf(),
+            )
+        }
+
+    suspend fun preferences(scope: String): List<EncryptedPreference> =
+        preferences.list(scope).map { entity ->
+            verifyHash(entity.valueCiphertext, entity.valueCiphertextSha256, "preference ${entity.preferenceKey}")
+            EncryptedPreference(
+                scope = entity.scope,
+                key = entity.preferenceKey,
+                keyId = entity.keyId,
+                ciphertextSha256 = entity.valueCiphertextSha256.copyOf(),
+                ciphertext = entity.valueCiphertext.copyOf(),
+            )
+        }
+
+    suspend fun deletePreference(scope: String, key: String) {
+        preferences.delete(scope, key)
+    }
+
+    suspend fun clearPreferences(scope: String) {
+        preferences.deleteScope(scope)
+    }
+
+    /**
+     * Replays a bounded, contiguous event range. Snapshots are deliberately not decoded
+     * here: callers can fetch [latestSnapshot] and apply their engine-specific format,
+     * then call this method with the snapshot sequence as the lower bound.
+     */
+    suspend fun replay(
+        sessionId: UUID,
+        fromSequence: ULong = 0u,
+        throughSequence: ULong? = null,
+        decrypt: suspend (metadata: HistoryObject, ciphertext: ByteArray) -> List<HistoryReplayEvent>,
+    ): List<HistoryReplayEvent> {
+        require(fromSequence <= Long.MAX_VALUE.toULong()) { "replay start is too large for Room" }
+        if (throughSequence != null) {
+            require(throughSequence >= fromSequence) { "replay range is inverted" }
+            require(throughSequence <= Long.MAX_VALUE.toULong()) { "replay end is too large for Room" }
+        }
+        if (fromSequence == ULong.MAX_VALUE) return emptyList()
+        val after = fromSequence.toLong()
+        val through = throughSequence?.toLong()
+        val rows = chunks.listForReplay(sessionId.requireUuidString(), after, through)
+        val expectedFirst = fromSequence + 1u
+        if (rows.isEmpty()) {
+            if (throughSequence != null && expectedFirst <= throughSequence) {
+                throw HistoryGapException(expectedFirst, expectedFirst)
+            }
+            return emptyList()
+        }
+
+        var expected = expectedFirst
+        var firstChunk = true
+        val result = ArrayList<HistoryReplayEvent>()
+        for (row in rows) {
+            val metadata = chunkMetadata(row)
+            verifyHash(row.ciphertext, row.ciphertextSha256, "event chunk ${row.id}", row.sizeBytes)
+            val start = row.startSequence.toULongChecked("event chunk start")
+            val end = row.endSequence.toULongChecked("event chunk end")
+            if (start == 0uL || end < start) {
+                throw HistoryIntegrityException("invalid event chunk range ${row.startSequence}..${row.endSequence}")
+            }
+            val overlapsRequestedPrefix = firstChunk && start <= fromSequence && end >= expected
+            if (start < expected && !overlapsRequestedPrefix) {
+                throw HistoryIntegrityException("overlapping event chunk ${row.id}: starts at $start, expected $expected")
+            }
+            if (start > expected) throw HistoryGapException(expected, start)
+
+            val decoded = try {
+                decrypt(metadata, row.ciphertext.copyOf())
+            } catch (error: HistoryIntegrityException) {
+                throw error
+            } catch (error: Exception) {
+                throw HistoryIntegrityException("unable to decrypt event chunk ${row.id}: ${error.message ?: "failure"}")
+            }
+            try {
+                validateDecodedChunk(decoded, start, end, row.id)
+                decoded.forEach { event ->
+                    if (throughSequence == null || event.sequence <= throughSequence) {
+                        if (event.sequence > fromSequence) result += event.copyPayload()
+                    }
+                }
+            } finally {
+                decoded.forEach { it.payload.fill(0) }
+            }
+            expected = if (end == ULong.MAX_VALUE) ULong.MAX_VALUE else end + 1u
+            firstChunk = false
+            if (throughSequence != null && end >= throughSequence) break
+        }
+        if (throughSequence != null && expected <= throughSequence) {
+            throw HistoryGapException(expected, expected)
+        }
+        return result
+    }
+
+    /**
+     * Searches decrypted event bytes in memory. Query text, decoded bytes, and previews
+     * are local values only; this method has no DAO writes and creates no plaintext index.
+     */
+    suspend fun search(
+        sessionId: UUID,
+        query: String,
+        decrypt: suspend (metadata: HistoryObject, ciphertext: ByteArray) -> ByteArray,
+        limit: Int = DEFAULT_SEARCH_LIMIT,
+    ): List<HistorySearchHit> {
+        require(limit > 0) { "search limit must be positive" }
+        if (query.isEmpty()) return emptyList()
+        val rows = chunks.listForSession(sessionId.requireUuidString())
+        val result = ArrayList<HistorySearchHit>()
+        val foldedQuery = query.lowercase()
+        for (row in rows) {
+            val metadata = chunkMetadata(row)
+            verifyHash(row.ciphertext, row.ciphertextSha256, "event chunk ${row.id}", row.sizeBytes)
+            val plaintext = try {
+                decrypt(metadata, row.ciphertext.copyOf())
+            } catch (error: HistoryIntegrityException) {
+                throw error
+            } catch (error: Exception) {
+                throw HistoryIntegrityException("unable to decrypt event chunk ${row.id}: ${error.message ?: "failure"}")
+            }
+            try {
+                val text = plaintext.toString(Charsets.UTF_8)
+                if (text.lowercase().contains(foldedQuery)) {
+                    result += HistorySearchHit(
+                        objectId = row.id.toUuid(),
+                        sequence = row.startSequence.toULongChecked("event chunk start"),
+                        preview = text.take(PREVIEW_LIMIT),
+                    )
+                    if (result.size >= limit) break
+                }
+            } finally {
+                plaintext.fill(0)
+            }
+        }
+        return result
+    }
+
+    suspend fun deleteSession(sessionId: UUID) {
+        val id = sessionId.requireUuidString()
+        database.withTransaction {
+            chunks.deleteForSession(id)
+            snapshots.deleteForSession(id)
+            acks.deleteForSession(id)
+            sessions.delete(id)
+            preferences.deleteScope(id)
+            preferences.deleteScope(sessionPreferenceScope(sessionId))
+        }
+    }
+
+    suspend fun clearHistory(sessionId: UUID) {
+        val id = sessionId.requireUuidString()
+        database.withTransaction {
+            chunks.deleteForSession(id)
+            snapshots.deleteForSession(id)
+            acks.deleteForSession(id)
+        }
+    }
+
+    /** Clears summaries, encrypted blobs, ACKs, and encrypted preferences on sign-out. */
+    suspend fun clearAll() {
+        database.withTransaction {
+            chunks.clear()
+            snapshots.clear()
+            acks.clear()
+            preferences.clear()
+            sessions.clear()
+            pcs.clear()
+            devices.clear()
+        }
+    }
+
+    private fun eventChunkEntity(
+        id: UUID,
+        sessionId: UUID,
+        startSequence: ULong,
+        endSequence: ULong,
+        objectKey: String,
+        keyId: String,
+        ciphertext: ByteArray,
+        expiresAt: Instant?,
+    ): EventChunkEntity {
+        require(startSequence > 0u) { "event chunk start sequence must be positive" }
+        require(endSequence >= startSequence) { "event chunk sequence range is inverted" }
+        val start = startSequence.toRoomSequence("event chunk start")
+        val end = endSequence.toRoomSequence("event chunk end")
+        val bytes = ciphertext.copyOf()
+        require(bytes.isNotEmpty()) { "event chunk ciphertext must not be empty" }
+        return EventChunkEntity(
+            id = id.requireUuidString(),
+            sessionId = sessionId.requireUuidString(),
+            startSequence = start,
+            endSequence = end,
+            objectKey = objectKey.requireNonBlank("event chunk object key"),
+            keyId = keyId.requireNonBlank("event chunk key id"),
+            ciphertextSha256 = sha256(bytes),
+            sizeBytes = bytes.size.toLong(),
+            ciphertext = bytes,
+            createdAtEpochMillis = clockMillis(),
+            expiresAtEpochMillis = expiresAt?.toEpochMilli(),
+        )
+    }
+
+    private fun chunkObject(entity: EventChunkEntity): EncryptedHistoryObject =
+        EncryptedHistoryObject(chunkMetadata(entity), entity.ciphertext.copyOf())
+
+    private fun snapshotObject(entity: SnapshotEntity): EncryptedHistoryObject =
+        EncryptedHistoryObject(
+            metadata = HistoryObject(
+                id = entity.id.toUuid(),
+                kind = HistoryObject.Kind.SNAPSHOT,
+                objectKey = entity.objectKey,
+                keyId = entity.keyId,
+                ciphertextSha256 = entity.ciphertextSha256.copyOf(),
+                sizeBytes = entity.sizeBytes,
+                startSequence = null,
+                endSequence = null,
+                snapshotSequence = entity.snapshotSequence.toULongChecked("snapshot sequence"),
+                formatName = entity.formatName,
+                formatVersion = entity.formatVersion,
+            ),
+            ciphertext = entity.ciphertext.copyOf(),
+        )
+
+    private fun chunkMetadata(entity: EventChunkEntity): HistoryObject = HistoryObject(
+        id = entity.id.toUuid(),
+        kind = HistoryObject.Kind.CHUNK,
+        objectKey = entity.objectKey,
+        keyId = entity.keyId,
+        ciphertextSha256 = entity.ciphertextSha256.copyOf(),
+        sizeBytes = entity.sizeBytes,
+        startSequence = entity.startSequence.toULongChecked("event chunk start"),
+        endSequence = entity.endSequence.toULongChecked("event chunk end"),
+        snapshotSequence = null,
+        formatName = null,
+        formatVersion = null,
+    )
+
+    private fun validateDecodedChunk(
+        events: List<HistoryReplayEvent>,
+        start: ULong,
+        end: ULong,
+        objectId: String,
+    ) {
+        val expectedCount = end - start + 1u
+        require(expectedCount <= Int.MAX_VALUE.toULong()) {
+            "event chunk $objectId is too large to decode in memory"
+        }
+        if (events.size.toULong() != expectedCount) {
+            throw HistoryIntegrityException(
+                "event chunk $objectId decoded ${events.size} events for range $start..$end",
+            )
+        }
+        events.forEachIndexed { index, event ->
+            val expected = start + index.toULong()
+            if (event.sequence != expected) {
+                throw HistoryIntegrityException(
+                    "event chunk $objectId decoded sequence ${event.sequence}, expected $expected",
+                )
+            }
+        }
+    }
+
+    private fun verifyHash(ciphertext: ByteArray, expected: ByteArray, label: String, expectedSize: Long? = null) {
+        if (expectedSize != null && expectedSize != ciphertext.size.toLong()) {
+            throw HistoryIntegrityException("ciphertext size verification failed for $label")
+        }
+        if (expected.size != SHA256_BYTES || !MessageDigest.isEqual(sha256(ciphertext), expected)) {
+            throw HistoryIntegrityException("SHA-256 verification failed for $label")
+        }
+        if (ciphertext.isEmpty()) throw HistoryIntegrityException("empty ciphertext for $label")
+    }
+
+    private fun UUID.requireUuidString(): String = toString()
+
+    private fun String.toUuid(): UUID = try {
+        UUID.fromString(this)
+    } catch (error: IllegalArgumentException) {
+        throw HistoryIntegrityException("invalid UUID in local history: $this")
+    }
+
+    private fun String.requireNonBlank(label: String): String {
+        require(isNotBlank()) { "$label is required" }
+        return this
+    }
+
+    private fun ULong.toRoomSequence(label: String): Long {
+        require(this <= Long.MAX_VALUE.toULong()) { "$label is too large for Room" }
+        return toLong()
+    }
+
+    private fun Long.toULongChecked(label: String): ULong {
+        require(this >= 0) { "$label must not be negative" }
+        return toULong()
+    }
+
+    private inline fun <reified T : Enum<T>> String.toEnumOrThrow(label: String): T = try {
+        enumValueOf<T>(this)
+    } catch (error: IllegalArgumentException) {
+        throw HistoryIntegrityException("unknown $label: $this")
+    }
+
+    companion object {
+        const val BOUNDED_EVENT_REPLAY_FORMAT = "BOUNDED_EVENT_REPLAY"
+        const val SESSION_PREFERENCE_SCOPE = "session"
+        const val SHA256_BYTES = 32
+        const val DEFAULT_SEARCH_LIMIT = 100
+        const val PREVIEW_LIMIT = 256
+
+        fun sessionPreferenceScope(sessionId: UUID): String = "$SESSION_PREFERENCE_SCOPE:$sessionId"
+
+        fun sha256(input: ByteArray): ByteArray =
+            MessageDigest.getInstance("SHA-256").digest(input)
+    }
+}

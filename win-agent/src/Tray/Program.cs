@@ -199,6 +199,40 @@ namespace TermLink.Tray
                 7000);
         }
 
+        public RegistryResponse RefreshProductionStatus()
+        {
+            return RegistryControlClient.Send(
+                options.ControlPipeName,
+                new RegistryRequest { Command = RegistryCommand.RefreshProductionStatus },
+                7000);
+        }
+
+        public RegistryResponse CreatePairingChallenge(Guid deviceId)
+        {
+            if (deviceId == Guid.Empty) throw new ArgumentException("A device is required.", nameof(deviceId));
+            return RegistryControlClient.Send(
+                options.ControlPipeName,
+                new RegistryRequest
+                {
+                    Command = RegistryCommand.CreatePairingChallenge,
+                    DeviceId = deviceId
+                },
+                10000);
+        }
+
+        public RegistryResponse RevokeDevice(Guid deviceId)
+        {
+            if (deviceId == Guid.Empty) throw new ArgumentException("A device is required.", nameof(deviceId));
+            return RegistryControlClient.Send(
+                options.ControlPipeName,
+                new RegistryRequest
+                {
+                    Command = RegistryCommand.RevokeDevice,
+                    DeviceId = deviceId
+                },
+                10000);
+        }
+
         public RegistryResponse RestartAgent()
         {
             var response = Send(RegistryCommand.RestartAgent);

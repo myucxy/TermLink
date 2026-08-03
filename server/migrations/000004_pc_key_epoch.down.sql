@@ -1,0 +1,1 @@
+ALTER TABLE pcs DROP COLUMN IF EXISTS key_epoch;

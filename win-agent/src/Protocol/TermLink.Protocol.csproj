@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>TermLink.Protocol</AssemblyName>
+    <RootNamespace>TermLink.Protocol</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Protobuf Include="..\..\..\protocol\protobuf\termlink_realtime.proto" GrpcServices="None" Link="Protos\termlink_realtime.proto" />
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.5.1" />
+    <PackageReference Include="Google.Protobuf" Version="3.31.1" />
+    <PackageReference Include="Grpc.Tools" Version="2.72.0" PrivateAssets="All" />
+  </ItemGroup>
+</Project>

@@ -229,6 +229,7 @@ namespace TermLink.SessionHost
         private string inputKind = "pipe";
         private long inputUnitsRead;
         private long inputBytesWritten;
+        private ulong localInputEpoch;
         private uint inputEventsPending;
         private bool restoreOuterConsoleInputMode;
         private AgentPipeBridge agentPipe;
@@ -261,6 +262,7 @@ namespace TermLink.SessionHost
                     options.SessionId,
                     options.HandshakeToken,
                     ApplyAgentInput,
+                    ApplyAgentRemoteInput,
                     ApplyAgentResize,
                     options.AgentBufferBytes);
                 agentPipe.Start();
@@ -500,7 +502,7 @@ namespace TermLink.SessionHost
                 }
                 if (input.Length == 0) continue;
                 var bytes = Encoding.UTF8.GetBytes(input.ToString());
-                if (!WriteInput(bytes, bytes.Length)) break;
+                if (!WriteLocalInput(bytes, bytes.Length)) break;
             }
         }
 
@@ -584,7 +586,7 @@ namespace TermLink.SessionHost
                 }
                 if (read == 0) break;
                 Interlocked.Add(ref inputUnitsRead, read);
-                if (!WriteInput(buffer, checked((int)read))) break;
+                if (!WriteLocalInput(buffer, checked((int)read))) break;
             }
         }
 
@@ -601,12 +603,50 @@ namespace TermLink.SessionHost
             return true;
         }
 
+        private bool WriteLocalInput(byte[] buffer, int length)
+        {
+            IntPtr destination;
+            lock (inputSync) destination = terminalInput;
+            if (!IsValid(destination)) return false;
+            lock (terminalWriteSync)
+            {
+                localInputEpoch = checked(localInputEpoch + 1);
+                if (agentPipe != null)
+                {
+                    agentPipe.Publish(LocalFrameType.LocalInputObserved, LocalPayloadCodec.LocalInputEpoch(localInputEpoch));
+                }
+                if (!WriteAll(destination, buffer, length)) return false;
+            }
+            Interlocked.Add(ref inputBytesWritten, length);
+            return true;
+        }
+
         private void ApplyAgentInput(Guid inputId, byte[] bytes)
         {
             if (!WriteInput(bytes, bytes.Length))
             {
                 throw new IOException("ConPTY input pipe is closed for input " + inputId.ToString("D") + ".");
             }
+        }
+
+        private LocalRemoteInputResult ApplyAgentRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
+        {
+            IntPtr destination;
+            lock (inputSync) destination = terminalInput;
+            if (!IsValid(destination)) return LocalRemoteInputResult.ConPtyClosed;
+            lock (terminalWriteSync)
+            {
+                if (expectedLocalInputEpoch != localInputEpoch)
+                {
+                    return LocalRemoteInputResult.LocalInputSuperseded;
+                }
+                if (!WriteAll(destination, bytes, bytes.Length))
+                {
+                    return LocalRemoteInputResult.WriteFailed;
+                }
+            }
+            Interlocked.Add(ref inputBytesWritten, bytes.Length);
+            return LocalRemoteInputResult.Accepted;
         }
 
         private void ApplyAgentResize(short columns, short rows)
@@ -1060,6 +1100,7 @@ namespace TermLink.SessionHost
         private readonly Guid sessionId;
         private readonly byte[] handshakeToken;
         private readonly Action<Guid, byte[]> inputHandler;
+        private readonly Func<Guid, ulong, byte[], LocalRemoteInputResult> remoteInputHandler;
         private readonly Action<short, short> resizeHandler;
         private readonly int maximumBufferedBytes;
         private readonly object sync = new object();
@@ -1079,6 +1120,7 @@ namespace TermLink.SessionHost
             Guid sessionId,
             byte[] handshakeToken,
             Action<Guid, byte[]> inputHandler,
+            Func<Guid, ulong, byte[], LocalRemoteInputResult> remoteInputHandler,
             Action<short, short> resizeHandler,
             int maximumBufferedBytes)
         {
@@ -1086,6 +1128,7 @@ namespace TermLink.SessionHost
             this.sessionId = sessionId;
             this.handshakeToken = handshakeToken;
             this.inputHandler = inputHandler;
+            this.remoteInputHandler = remoteInputHandler;
             this.resizeHandler = resizeHandler;
             this.maximumBufferedBytes = maximumBufferedBytes;
         }
@@ -1222,10 +1265,13 @@ namespace TermLink.SessionHost
                     Acknowledge(frame.Sequence);
                     continue;
                 }
-                if (frame.Sequence <= lastAgentCommandSequence) continue;
-                if (frame.Sequence != lastAgentCommandSequence + 1)
+                if (frame.Sequence <= lastAgentCommandSequence)
                 {
-                    throw new InvalidDataException("Agent command sequence is not continuous.");
+                    if (frame.Type == LocalFrameType.Input || frame.Type == LocalFrameType.RemoteInputV2)
+                    {
+                        Array.Clear(frame.Payload, 0, frame.Payload.Length);
+                    }
+                    continue;
                 }
                 lastAgentCommandSequence = frame.Sequence;
                 switch (frame.Type)
@@ -1233,13 +1279,33 @@ namespace TermLink.SessionHost
                     case LocalFrameType.Input:
                         byte[] bytes;
                         var inputId = LocalPayloadCodec.ParseInput(frame.Payload, out bytes);
-                        inputHandler(inputId, bytes);
+                        try { inputHandler(inputId, bytes); }
+                        finally
+                        {
+                            Array.Clear(bytes, 0, bytes.Length);
+                            Array.Clear(frame.Payload, 0, frame.Payload.Length);
+                        }
                         break;
                     case LocalFrameType.ResizeRequest:
                         short columns;
                         short rows;
                         LocalPayloadCodec.ParseResize(frame.Payload, out columns, out rows);
                         resizeHandler(columns, rows);
+                        break;
+                    case LocalFrameType.RemoteInputV2:
+                        ulong localInputEpoch;
+                        byte[] remoteBytes;
+                        var remoteInputId = LocalPayloadCodec.ParseRemoteInput(frame.Payload, out localInputEpoch, out remoteBytes);
+                        LocalRemoteInputResult remoteResult;
+                        try { remoteResult = remoteInputHandler(remoteInputId, localInputEpoch, remoteBytes); }
+                        finally
+                        {
+                            Array.Clear(remoteBytes, 0, remoteBytes.Length);
+                            Array.Clear(frame.Payload, 0, frame.Payload.Length);
+                        }
+                        Publish(
+                            LocalFrameType.RemoteInputResult,
+                            LocalPayloadCodec.RemoteInputResult(remoteInputId, remoteResult));
                         break;
                     default:
                         throw new InvalidDataException("Agent sent an invalid command type: " + frame.Type + ".");

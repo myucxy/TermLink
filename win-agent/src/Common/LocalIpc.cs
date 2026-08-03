@@ -14,7 +14,18 @@ namespace TermLink.LocalIpc
         Input = 6,
         ResizeRequest = 7,
         Ack = 8,
-        Gap = 9
+        Gap = 9,
+        LocalInputObserved = 10,
+        RemoteInputV2 = 11,
+        RemoteInputResult = 12
+    }
+
+    internal enum LocalRemoteInputResult : byte
+    {
+        Accepted = 1,
+        LocalInputSuperseded = 2,
+        ConPtyClosed = 3,
+        WriteFailed = 4
     }
 
     internal enum LocalLifecycleState : byte
@@ -286,6 +297,77 @@ namespace TermLink.LocalIpc
             bytes = new byte[payload.Length - 16];
             Buffer.BlockCopy(payload, 16, bytes, 0, bytes.Length);
             return inputId;
+        }
+
+        public static byte[] RemoteInput(Guid inputId, ulong localInputEpoch, byte[] bytes)
+        {
+            if (inputId == Guid.Empty) throw new ArgumentException("input ID is required", "inputId");
+            if (bytes == null || bytes.Length == 0 || bytes.Length > LocalFrameCodec.MaximumFrameBytes - 72)
+            {
+                throw new ArgumentException("input bytes are invalid", "bytes");
+            }
+            var payload = new byte[24 + bytes.Length];
+            Buffer.BlockCopy(inputId.ToByteArray(), 0, payload, 0, 16);
+            LocalFrameCodec.WriteUInt64(payload, 16, localInputEpoch);
+            Buffer.BlockCopy(bytes, 0, payload, 24, bytes.Length);
+            return payload;
+        }
+
+        public static Guid ParseRemoteInput(byte[] payload, out ulong localInputEpoch, out byte[] bytes)
+        {
+            if (payload == null || payload.Length <= 24) throw new InvalidDataException("Invalid V2 remote input payload.");
+            var idBytes = new byte[16];
+            Buffer.BlockCopy(payload, 0, idBytes, 0, 16);
+            var inputId = new Guid(idBytes);
+            if (inputId == Guid.Empty) throw new InvalidDataException("Input ID is empty.");
+            localInputEpoch = LocalFrameCodec.ReadUInt64(payload, 16);
+            bytes = new byte[payload.Length - 24];
+            Buffer.BlockCopy(payload, 24, bytes, 0, bytes.Length);
+            return inputId;
+        }
+
+        public static byte[] RemoteInputResult(Guid inputId, LocalRemoteInputResult result)
+        {
+            if (inputId == Guid.Empty) throw new ArgumentException("input ID is required", "inputId");
+            if (!Enum.IsDefined(typeof(LocalRemoteInputResult), result))
+            {
+                throw new ArgumentOutOfRangeException("result");
+            }
+            var payload = new byte[17];
+            Buffer.BlockCopy(inputId.ToByteArray(), 0, payload, 0, 16);
+            payload[16] = (byte)result;
+            return payload;
+        }
+
+        public static Guid ParseRemoteInputResult(byte[] payload, out LocalRemoteInputResult result)
+        {
+            if (payload == null || payload.Length != 17 ||
+                !Enum.IsDefined(typeof(LocalRemoteInputResult), payload[16]))
+            {
+                throw new InvalidDataException("Invalid remote input result payload.");
+            }
+            var idBytes = new byte[16];
+            Buffer.BlockCopy(payload, 0, idBytes, 0, 16);
+            var inputId = new Guid(idBytes);
+            if (inputId == Guid.Empty) throw new InvalidDataException("Input result ID is empty.");
+            result = (LocalRemoteInputResult)payload[16];
+            return inputId;
+        }
+
+        public static byte[] LocalInputEpoch(ulong epoch)
+        {
+            if (epoch == 0) throw new ArgumentOutOfRangeException("epoch");
+            var payload = new byte[8];
+            LocalFrameCodec.WriteUInt64(payload, 0, epoch);
+            return payload;
+        }
+
+        public static ulong ParseLocalInputEpoch(byte[] payload)
+        {
+            if (payload == null || payload.Length != 8) throw new InvalidDataException("Invalid local input epoch payload.");
+            var epoch = LocalFrameCodec.ReadUInt64(payload, 0);
+            if (epoch == 0) throw new InvalidDataException("Local input epoch is zero.");
+            return epoch;
         }
 
         public static byte[] Gap(ulong startSequence, ulong endSequence)

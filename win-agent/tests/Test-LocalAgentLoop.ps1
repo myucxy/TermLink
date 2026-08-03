@@ -62,6 +62,7 @@ try {
         '--buffer-directory', (Quote-Argument $bufferDirectory),
         '--input-base64', (Quote-Argument $inputBase64),
         '--input-id', $inputId.ToString('D'),
+        '--remote-input-v2',
         '--duplicate-input-attempts', '2',
         '--resize-columns', '111',
         '--resize-rows', '37',
@@ -126,6 +127,10 @@ exit 17
     $agentFields = Get-ResultFields -Text $agentOutput -Prefix '__AGENT_RESULT__:'
     Assert-True ([int]$agentFields.inputs_accepted -eq 1) 'Agent did not accept exactly one unique input.'
     Assert-True ([int]$agentFields.inputs_duplicate -eq 1) 'Agent did not reject the duplicate input ID.'
+    Assert-True ([int]$agentFields.remote_input_results_accepted -eq 1) `
+        'Session Host did not confirm exactly one successful ConPTY write.'
+    Assert-True ([int]$agentFields.remote_input_results_rejected -eq 0) `
+        'Session Host unexpectedly rejected the remote ConPTY write.'
     Assert-True ([int]$agentFields.resize_applied -ge 1) 'Agent did not observe the requested 111x37 resize.'
     Assert-True ([int]$agentFields.reconnects -ge 1) 'Host-Agent reconnect and retransmit path was not exercised.'
     Assert-True ([int]$agentFields.output_frames -ge 1) 'Agent did not receive terminal output.'
@@ -186,6 +191,8 @@ exit 17
         output_sha256 = $bufferFields.output_sha256
         input_accepted = [int]$agentFields.inputs_accepted
         duplicate_input_rejected = [int]$agentFields.inputs_duplicate
+        conpty_input_result_accepted = [int]$agentFields.remote_input_results_accepted
+        conpty_input_result_rejected = [int]$agentFields.remote_input_results_rejected
         input_frames_persisted = [int]$bufferFields.input_frames
         resize_111x37_observed = ([int]$agentFields.resize_applied -ge 1)
         lifecycle_exit_code = [int]$agentFields.exit
