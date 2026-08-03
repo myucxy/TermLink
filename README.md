@@ -9,7 +9,7 @@ Terminal Features、Vim、less、fzf 和 htop 共 10 个固定流，在 Termux/x
 122/122 checkpoint match，并在 API 36 模拟器 10/10 冷启动回放通过。arm64 真机、厂商
 IME、外接键鼠与 Android WebView 回退引擎仍待后续验证或实现。
 
-阶段 1 已完成可重复的测试闭环：正式 .NET 8 Agent/SessionHost/Tray 工程已经建立；
+阶段 1 已完成可重复的测试闭环：正式 .NET 8 Agent/SessionHost/Tray/Updater 工程已经建立；
 Session Host 与 Agent 之间具备当前用户 Named Pipe、双向 PID/Token 认证、序号、ACK、
 重连重发、有界 Gap、输入去重和 DPAPI Buffer。DPAPI 注册索引已在 Agent 强制结束和受控
 重启后两次恢复 20/20 个真实 ConPTY SessionHost，远程停止不影响 20 个本地 Shell。Android 的
@@ -17,9 +17,9 @@ Session Host 与 Agent 之间具备当前用户 Named Pipe、双向 PID/Token �
 真实 Termux View。API 36 模拟器已验证累计 ACK、断线续传、输入 accepted、测试租约、
 History Gap 和 exited。该链路使用隔离的明文测试协议和固定非敏感夹具，不是生产 Relay、
 Protobuf、设备授权或 E2EE，也没有冻结可移植 Snapshot，因此当前版本仍不是可发布产品。
-Windows 端现已增加签名 MSIX 构建、`windows.startupTask` 登录自启声明和 Tray 单实例保护；
-开发证书下的自包含签名 payload 验证通过，生产受信证书下的真实安装/卸载和更新回滚仍待
-后续完成。
+Windows 端现已增加签名 MSIX、登录自启、Tray 单实例和受控更新器；开发证书下已验证独立
+签名更新清单、包身份/版本/SHA-256、篡改拒绝、原子缓存、可恢复事务日志及健康检查失败
+回滚。生产受信证书下的真实安装/卸载和 `Add-AppxPackage` 更新/降级仍待后续验收。
 
 ## 商业模式
 
@@ -63,6 +63,7 @@ Windows 端现已增加签名 MSIX 构建、`windows.startupTask` 登录自启�
 .\win-agent\Build-Windows.ps1
 .\win-agent\tests\Validate-Phase1WindowsApp.ps1
 .\win-agent\tests\Validate-WindowsInstaller.ps1
+.\win-agent\tests\Validate-WindowsUpdater.ps1
 
 # 双向模拟器验收依赖运行中的本地测试容器
 docker compose -f server\compose\lan-test.compose.yml up --build -d

@@ -416,21 +416,33 @@ Registry 新增 `registrations.dpapi` 恢复索引。索引使用 DPAPI CurrentU
 
 ### 7.3 Windows 签名 MSIX 与登录自启
 
-`package/Build-Msix.ps1` 已使用 .NET 8.0.303 生成 `win-x64` 自包含 payload，签名 7 个
+`package/Build-Msix.ps1` 已使用 .NET 8.0.303 生成 `win-x64` 自包含 payload，签名 8 个
 TermLink 自有 EXE/DLL，再使用 Windows SDK 10.0.26100 MakeAppx 生成并签名完整 MSIX。
 Manifest 使用稳定身份 `TermLink.Terminal`、`runFullTrust` 和
 `windows.startupTask`，登录后启动 Tray；Tray 以当前用户控制 Pipe 派生的本地 Mutex 保证
 重复启动只留下一个实例。
 
-`Validate-WindowsInstaller.ps1` 使用隔离身份和不落库的临时开发证书，验证 476 文件自包含
-包、嵌入签名、包签名、Manifest、StartupTask、解包后的 Tray/Agent 启动、双启动单实例、
-Agent 状态与关闭。验证前后测试包、证书库和 TermLink 进程均无残留。证据为
+`Validate-WindowsInstaller.ps1` 使用隔离身份和不落库的临时开发证书，验证自包含包、8 个
+嵌入签名、包签名、固定更新发布者证书、Manifest、StartupTask、解包后的 Tray/Agent 启动、
+双启动单实例、Agent 状态与关闭。验证前后测试包、证书库和 TermLink 进程均无残留。证据为
 [`phase1-windows-installer.json`](validation/phase1-windows-installer.json)。
 
 当前系统关闭 Developer Mode，临时开发根证书加入 CurrentUser Root 会触发 Windows 安全
 确认；自动化没有点击或绕过该警告，也没有把解包运行写成真实安装成功。生产受信代码签名
-证书可用后仍须执行 `Add-AppxPackage`、实际登录启动和卸载验收。受控更新与失败回滚尚未
-实现。
+证书可用后仍须执行 `Add-AppxPackage`、实际登录启动和卸载验收。
+
+### 7.3.1 受控更新与失败回滚
+
+新增单文件 `TermLink.Updater.exe`、独立更新清单生成器和 PowerShell MSIX 部署后端。更新
+清单使用包签名证书对原始 UTF-8 JSON 做 RSA PKCS#1 v1.5 SHA-256 签名；Updater 严格绑定
+固定证书、MSIX Authenticode、Package Identity、Publisher、目标/当前版本、有效期和包
+SHA-256。目标与回滚包先原子缓存，再由包外 runner 通过可恢复事务日志执行更新；健康检查
+失败会以 `ForceUpdateFromAnyVersion` 回装已验证的当前版本。
+
+`Validate-WindowsUpdater.ps1` 使用两个真实开发签名 MSIX，验证清单和包篡改拒绝，以及成功、
+部署失败保留旧版、健康失败回滚、回滚失败和回滚重入 5 条路径。部署状态使用故障注入后端，
+未注册 AppX、未改证书库，也未把结果写成真实系统更新成功。证据为
+[`phase1-windows-updater.json`](validation/phase1-windows-updater.json)。
 
 ### 7.4 Android RemoteTerminalSession
 
@@ -487,7 +499,8 @@ Agent 或真实 Shell，不实现设备批准，也不使用 Termux 私有状态
 以上完成阶段 1 的本地 IPC、Session Registry 与客户端状态机核心，不证明生产可用。仍需
 实现和验证：
 
-- Agent/Tray 使用生产受信证书的真实安装/卸载、登录启动、受控更新和失败回滚；
+- Agent/Tray 使用生产受信证书的真实安装/卸载、登录启动和 Updater 更新/降级；受控更新
+  核心和故障回滚状态机已经验证；
 - Android 正式设备/Session 页面，以及 `RemoteTerminalSession` 与生产网络、Crypto、
   设备授权的组合；
 - Windows Agent → 生产 Relay → Android 的真实端到端输入、ACK、背压和恢复闭环；

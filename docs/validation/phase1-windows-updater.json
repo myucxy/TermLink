@@ -1,0 +1,84 @@
+{
+  "schema": "termlink.phase1-windows-updater-validation",
+  "version": 1,
+  "generated_at_utc": "2026-08-03T16:50:05.9659628Z",
+  "classification": "development-signed MSIX/update manifests and simulated deployment failures; no package registration or production trust claim",
+  "passed": true,
+  "package_identity": "TermLink.Terminal.UpdateValidation",
+  "current_version": "0.1.0.0",
+  "target_version": "0.2.0.0",
+  "publisher_thumbprint": "EF868F9358B9ED68BCF346651D9B2F89FA5CE54A",
+  "manifest_signature": "RSA PKCS#1 v1.5 SHA-256 over exact UTF-8 manifest bytes",
+  "target_msix_sha256": "d8eb376990ae784015af8da69b89958bfe3087858275aff3f7c8eaeb0dad1960",
+  "rollback_msix_sha256": "f1810d9470741c51a03fa86f77873e0affc1a6ff6c620845f322911001cbf987",
+  "manifest_tamper_rejected": true,
+  "package_tamper_rejected": true,
+  "packaged_single_file_updater_executed": true,
+  "packaged_publisher_certificate_matched": true,
+  "deployment_state_cases": [
+    {
+      "name": "success",
+      "exit_code": 0,
+      "state": "Succeeded",
+      "installed_version": "0.2.0.0",
+      "install_calls": [
+        "0.2.0.0:target"
+      ],
+      "tray_starts": 1
+    },
+    {
+      "name": "deployment_failure",
+      "exit_code": 10,
+      "state": "DeploymentFailed",
+      "installed_version": "0.1.0.0",
+      "install_calls": [
+        "0.2.0.0:target"
+      ],
+      "tray_starts": 1
+    },
+    {
+      "name": "health_failure_rollback",
+      "exit_code": 20,
+      "state": "RolledBack",
+      "installed_version": "0.1.0.0",
+      "install_calls": [
+        "0.2.0.0:target",
+        "0.1.0.0:rollback"
+      ],
+      "tray_starts": 1
+    },
+    {
+      "name": "rollback_failure",
+      "exit_code": 30,
+      "state": "RollbackFailed",
+      "installed_version": "0.2.0.0",
+      "install_calls": [
+        "0.2.0.0:target",
+        "0.1.0.0:rollback"
+      ],
+      "tray_starts": 0
+    },
+    {
+      "name": "resume_rollback",
+      "exit_code": 20,
+      "state": "RolledBack",
+      "installed_version": "0.1.0.0",
+      "install_calls": [
+        "0.1.0.0:rollback"
+      ],
+      "tray_starts": 1
+    }
+  ],
+  "real_add_appx_package": "not executed: production-trusted certificate is unavailable",
+  "system_certificate_store_unchanged": true,
+  "source_sha256": {
+    "package/Build-Msix.ps1": "96119d21f723e9dff58930481fd91110a8e566f277a04d4580d926706672251f",
+    "package/New-UpdateManifest.ps1": "fe4ee4e63b615bc3095a3d6838cb416898986e12f9016db4dea4a6568a300cb3",
+    "src/Updater/Program.cs": "b29db35e5a66f35e753beaa3e9ab88181c12a2f56287c124ac841aefd756911f",
+    "src/Updater/UpdateManifest.cs": "4b316ac44a9de8f4e549002b4d6bde642eb634f0722d89a2ae4848bb802f5322",
+    "src/Updater/UpdateTransaction.cs": "164979c1baac4e49f3523d58b7978548a317682998008fe804000f04c650b8ab",
+    "src/Updater/PowerShellMsixDeployment.cs": "beca459809c5efebeb69cb3feb1e90c43ff5229174167b1392dbb57ad88c4beb",
+    "tests/Validate-WindowsUpdater.ps1": "c810280872160e9caac970b4337a0e56b95ec67704acafd1ccaedddee5bf37c4",
+    "tests/UpdaterValidation/Program.cs": "f375e458cd26a0c599bf23f098def3081e67ddf752b2841f41a77c6f3236ec14"
+  }
+}

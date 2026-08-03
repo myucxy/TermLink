@@ -1,6 +1,6 @@
 # TermLink 开发交接
 
-更新时间：2026-08-03
+更新时间：2026-08-04
 
 用途：重新打开会话后先阅读本文，再阅读
 [完整产品与系统设计](docs/COMPLETE_SYSTEM_DESIGN.md)。本文只做开发导航，若细节冲突，
@@ -150,7 +150,7 @@ cd E:\WorkSpace\AICodeProject\TermLink\prototypes\conpty-probe
 - 停止结果结构化报告请求/完成/超时数；单会话、全局和关闭超时使用稳定错误码，超时
   worker 进入 retiring 集合，后续关闭会完整重试且控制循环不会因停止超时退出；
 - 已建立固定 SDK 8.0.303 的 `TermLink.Windows.sln`，包含 AgentControl、Agent、
-  SessionHost 与 WinForms Tray；正式构建 0 warning/0 error；
+  SessionHost、WinForms Tray 与单文件 Updater；正式构建 0 warning/0 error；
 - Tray 只通过当前用户 SID ACL 的控制 Pipe 读取脱敏摘要，支持停止单会话、停止全部远程
   访问和重新启用；退出 Tray 不结束 Agent 或本地 Shell；
 - Registry 使用 DPAPI CurrentUser 和原子替换保存恢复所需注册索引，PID 与进程启动时间
@@ -158,9 +158,15 @@ cd E:\WorkSpace\AICodeProject\TermLink\prototypes\conpty-probe
 - 20 个真实 ConPTY SessionHost 已通过 Agent 强制结束和受控重启恢复，两次均 20/20 恢复
   且注册时间保持；Tray 读取 20 条脱敏摘要，远程停止后 20 个本地 Shell 均继续接受本地
   输入并正常退出；
-- Windows 新增签名 MSIX 构建：`win-x64` 自包含 payload、7 个 TermLink 自有二进制嵌入
-  签名、完整包签名、稳定包身份、登录 StartupTask 和 Tray 当前用户单实例；开发证书验证
-  覆盖 476 文件包的解包运行与 Agent 状态，且不修改系统证书库；
+- Windows 签名 MSIX 构建现包含 8 个已签名 TermLink 自有二进制、完整包签名、固定更新
+  发布者公钥、稳定包身份、登录 StartupTask 和 Tray 当前用户单实例；开发证书验证覆盖
+  解包运行与 Agent 状态，且不修改系统证书库；
+- 单文件 Updater 以包外 runner 执行 Windows 事务式部署；更新前严格验证独立 RSA 签名
+  清单、MSIX Authenticode、固定发布者、Package Identity、四段版本、有效期和 SHA-256，
+  只接受同一发布者的当前回滚包与更高目标版本；
+- Updater 使用原子 staging 和可恢复事务日志；真实开发签名的 0.1.0.0/0.2.0.0 包已通过
+  清单/包篡改拒绝，以及成功、部署失败保留旧版、健康失败回滚、回滚失败和回滚重入 5 条
+  状态路径；部署后端使用故障注入，未执行真实 `Add-AppxPackage`；
 - Android 新增独立 `core-session` 模块，`RemoteTerminalSession` 实现 Live、Reconnecting、
   ReadOnly、Controlling、Exited、HistoryGap、feed 后 ACK、重复丢弃、恢复点、输入租约、
   唯一输入 ID、禁止自动重试和 100～200 ms resize 防抖；
@@ -186,11 +192,13 @@ cd E:\WorkSpace\AICodeProject\TermLink\prototypes\conpty-probe
 - `docs/validation/phase1-android-relay-emulator.json`；
 - `docs/validation/phase1-windows-app.json`。
 - `docs/validation/phase1-windows-installer.json`。
+- `docs/validation/phase1-windows-updater.json`。
 
 这些结果尚未完成阶段 1：Agent/Tray 已有正式 .NET 8 工程、本机恢复闭环、签名 MSIX 构建
-和登录自启声明，但生产受信证书下的真实安装/卸载、受控更新回滚和生产账号/设备接入仍未
-完成；`RemoteTerminalSession` 只接入临时明文测试网络和 Harness，尚未接入生产 Crypto、
-设备授权或正式设备/Session 页面。临时 Relay 不连接真实 Windows Shell；生产 Protobuf、
+和登录自启声明，受控更新核心与故障回滚状态机也已验证；但生产受信证书下的真实安装/
+卸载、更新/降级和生产账号/设备接入仍未完成；`RemoteTerminalSession` 只接入临时明文
+测试网络和 Harness，尚未接入生产 Crypto、设备授权或正式设备/Session 页面。临时 Relay
+不连接真实 Windows Shell；生产 Protobuf、
 E2EE 和规范化 Snapshot 均未冻结。
 
 ## 6. Android Terminal 结论
@@ -336,10 +344,12 @@ python -m http.server 4173 --bind 127.0.0.1
 9. Compose 双向 Harness 的真实状态绑定，以及 API 36 模拟器到 Docker 的端到端验证；
 10. 正式 .NET 8 Agent/SessionHost/Tray 工程与当前用户本机控制 UI；
 11. DPAPI 注册索引、Agent 强制重启恢复和 20 个真实 ConPTY Session 并发压力。
+12. 单文件 Updater、独立签名更新清单、原子缓存、可恢复事务日志与故障回滚状态机；真实
+    开发签名双版本和篡改拒绝已验证，系统级 AppX 更新/降级待生产受信证书。
 
 下一段必须按以下顺序继续：
 
-1. 用生产受信证书完成 Agent/Tray 真实安装/卸载与登录启动验收，并补受控更新与失败回滚；
+1. 用生产受信证书完成 Agent/Tray 真实安装/卸载、登录启动及 Updater 的真实更新/降级验收；
 2. 建立正式设备/Session 页面与设备授权，接入生产 Crypto 和网络边界；
 3. 连接 Windows Agent → 生产 Relay → Android，验证真实 Shell 的输入、ACK、背压与恢复；
 4. 在兼容性和安全验证通过后，再冻结生产 Envelope 与 `TerminalSnapshotV1`。
@@ -506,12 +516,13 @@ API 24 和 API 36，而 app `minSdk` 为 26。这些是外部硬件阻塞，不�
 该链路是明文固定夹具测试设施，不连接真实 Shell，也不代表生产 Relay、Protobuf、设备授权、
 E2EE 或可移植 Snapshot。`LAN Replay V1` 仍保持只读且未修改。
 
-Windows 正式工程使用 SDK 8.0.303 构建 AgentControl、Agent、SessionHost 和 Tray，0 warning、
+Windows 正式工程使用 SDK 8.0.303 构建 AgentControl、Agent、SessionHost、Tray 和 Updater，0 warning、
 0 error。`Validate-Phase1WindowsApp.ps1` 启动 20 个真实 ConPTY SessionHost，强制结束和
 受控重启 Agent 后均从 DPAPI CurrentUser 注册索引恢复 20/20；Tray 读取 20 条脱敏摘要。停止全部
 远程访问会清除索引，但 20 个本地 Shell 均继续接收本地输入并正常退出。证据在
-`docs/validation/phase1-windows-app.json`。这不代表签名安装/更新、生产 Relay、设备授权或
-E2EE 已完成。
+`docs/validation/phase1-windows-app.json`。Updater 已通过开发签名双版本、篡改拒绝和 5 条
+故障回滚状态验证，证据在 `docs/validation/phase1-windows-updater.json`；这不代表生产
+证书下真实 AppX 安装/更新、生产 Relay、设备授权或 E2EE 已完成。
 
 ## 14. 新会话建议首条指令
 
@@ -520,10 +531,11 @@ E2EE 已完成。
 docs\COMPLETE_SYSTEM_DESIGN.md 和 docs\UI_LAYOUT_DESIGNS.md，以设计为权威基线并保留
 全部未提交成果。阶段 0 当前环境可自动化验收已完成。阶段 1 已完成 Host-Agent Named
 Pipe、序号/ACK、重连/Gap、DPAPI Buffer、输入去重、长驻 Session Registry、正式 .NET 8
-Agent/SessionHost/Tray、DPAPI 注册索引与 20 Session 重启恢复，以及 Android
+Agent/SessionHost/Tray/Updater、DPAPI 注册索引与 20 Session 重启恢复，以及 Android
 RemoteTerminalSession/core-network → Docker 临时测试 Relay → Termux View 的双向闭环；
-证据位于 docs/validation/phase1-*.json。下一步补 Windows 签名安装/自启动/受控更新，再进入
-生产设备授权、Crypto 与 Relay。临时协议不得标记为生产 Protobuf；不要把 LAN Replay 或
+证据位于 docs/validation/phase1-*.json。更新核心与故障回滚已验证；证书可用后补真实
+Windows 安装/自启动/更新降级验收，同时进入生产设备授权、Crypto 与 Relay。临时协议不得
+标记为生产 Protobuf；不要把 LAN Replay 或
 Phase 1 Test Session 冒充生产 Relay，不要提前冻结 Snapshot，也不要改变 E2EE、设备授权、
 本地用户优先和远程输入租约边界。
 ```

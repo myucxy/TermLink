@@ -1,15 +1,17 @@
 {
   "schema": "termlink.phase1-windows-installer-validation",
   "version": 1,
-  "generated_at_utc": "2026-08-03T14:21:14.9874033Z",
-  "classification": "signed development MSIX, unpacked payload, and startup declaration; not trusted production install or updater",
+  "generated_at_utc": "2026-08-03T16:45:22.4772850Z",
+  "classification": "signed development MSIX, unpacked payload, startup declaration, and updater payload; not trusted production install or real update deployment",
   "passed": true,
   "package_identity": "TermLink.Terminal.Validation",
   "package_version": "0.1.0.0",
   "architecture": "x64",
   "self_contained": true,
   "signed_msix": true,
-  "signed_termlink_binaries": 7,
+  "signed_termlink_binaries": 8,
+  "updater_single_file_payload": true,
+  "pinned_update_publisher_matches_package_signer": true,
   "current_user_install": "not executed: temporary root trust requires Windows security confirmation",
   "unpacked_packaged_tray_launched": true,
   "tray_single_instance": true,
@@ -19,11 +21,12 @@
   "startup_task_executable": "TermLink.Tray.exe",
   "current_user_uninstall": "not applicable: package was not registered",
   "system_certificate_store_unchanged": true,
-  "msix_sha256": "210239a7b933d7fc95b04de8764771584b733c1fca120c86ae629947d306be03",
+  "msix_sha256": "51cf56e78981d9f89d189c4f910a6eb689c8eb028f2a062e4c9ca81a500e1616",
   "source_sha256": {
     "package/AppxManifest.xml": "bc8acca26e6d6d6d5b5829ebc9afe6ebd013bdbf6e4b9ec13bee304cf49616af",
-    "package/Build-Msix.ps1": "586da62d7d0fc8971907ccdf1d0e888b59c0350808bf12ca9c136dc46ee1a76c",
+    "package/Build-Msix.ps1": "96119d21f723e9dff58930481fd91110a8e566f277a04d4580d926706672251f",
+    "src/Updater/Program.cs": "b29db35e5a66f35e753beaa3e9ab88181c12a2f56287c124ac841aefd756911f",
     "src/Tray/Program.cs": "e6e12a7de1ef24a9a8e89ad4a6292a13f7ea79ed7dae26db7bb796c289afff35",
-    "tests/Validate-WindowsInstaller.ps1": "d9c402bda270d1c8007153517782ea79343416f22d8f68e04b5b54b687d08547"
+    "tests/Validate-WindowsInstaller.ps1": "ec471a539fc48f6b616cbd0aef40eeab94c88b5b414d0ffc073102ac1d43e584"
   }
 }

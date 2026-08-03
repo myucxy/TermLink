@@ -140,6 +140,18 @@ try {
         'Startup task does not launch the Tray.'
     Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'coreclr.dll') -PathType Leaf) `
         'Installed package is not self-contained.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'TermLink.Updater.exe') -PathType Leaf) `
+        'Installed package does not contain the external single-file Updater.'
+    $updatePublisherPath = Join-Path $installLocation 'TermLink.UpdatePublisher.cer'
+    Assert-True (Test-Path -LiteralPath $updatePublisherPath -PathType Leaf) `
+        'Installed package does not contain the pinned update publisher certificate.'
+    $updatePublisher = [Security.Cryptography.X509Certificates.X509Certificate2]::new($updatePublisherPath)
+    try {
+        Assert-True ($updatePublisher.Thumbprint -eq $certificate.Thumbprint) `
+            'The packaged update publisher certificate does not match the package signer.'
+    } finally {
+        $updatePublisher.Dispose()
+    }
 
     $signedBinaries = @(Get-ChildItem -LiteralPath $installLocation -File |
         Where-Object { $_.Name -match '^TermLink\..+\.(exe|dll)$' })
@@ -212,6 +224,7 @@ try {
     $sourceFiles = @(
         'package\AppxManifest.xml',
         'package\Build-Msix.ps1',
+        'src\Updater\Program.cs',
         'src\Tray\Program.cs',
         'tests\Validate-WindowsInstaller.ps1'
     )
@@ -224,7 +237,7 @@ try {
         schema = 'termlink.phase1-windows-installer-validation'
         version = 1
         generated_at_utc = [DateTime]::UtcNow.ToString('o')
-        classification = 'signed development MSIX, unpacked payload, and startup declaration; not trusted production install or updater'
+        classification = 'signed development MSIX, unpacked payload, startup declaration, and updater payload; not trusted production install or real update deployment'
         passed = $true
         package_identity = $identityName
         package_version = $packageVersion
@@ -232,6 +245,8 @@ try {
         self_contained = $true
         signed_msix = $true
         signed_termlink_binaries = [int]$buildResult.SignedTermLinkBinaries
+        updater_single_file_payload = $true
+        pinned_update_publisher_matches_package_signer = $true
         current_user_install = 'not executed: temporary root trust requires Windows security confirmation'
         unpacked_packaged_tray_launched = $true
         tray_single_instance = $true

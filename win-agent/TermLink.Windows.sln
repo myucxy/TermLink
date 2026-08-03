@@ -11,6 +11,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.SessionHost", "src
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Tray", "src\Tray\TermLink.Tray.csproj", "{6280F2B1-75D9-4E92-A626-393683A32EA9}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Updater", "src\Updater\TermLink.Updater.csproj", "{2F7A94D2-5678-4C25-A4CB-D6523874307D}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -33,5 +35,9 @@ Global
 		{6280F2B1-75D9-4E92-A626-393683A32EA9}.Debug|x64.Build.0 = Debug|Any CPU
 		{6280F2B1-75D9-4E92-A626-393683A32EA9}.Release|x64.ActiveCfg = Release|Any CPU
 		{6280F2B1-75D9-4E92-A626-393683A32EA9}.Release|x64.Build.0 = Release|Any CPU
+		{2F7A94D2-5678-4C25-A4CB-D6523874307D}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{2F7A94D2-5678-4C25-A4CB-D6523874307D}.Debug|x64.Build.0 = Debug|Any CPU
+		{2F7A94D2-5678-4C25-A4CB-D6523874307D}.Release|x64.ActiveCfg = Release|Any CPU
+		{2F7A94D2-5678-4C25-A4CB-D6523874307D}.Release|x64.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

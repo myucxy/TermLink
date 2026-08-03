@@ -176,12 +176,37 @@ try {
                 "-p:Version=$Version"
             )
         }
-        foreach ($name in @('TermLink.Agent.exe', 'TermLink.SessionHost.exe', 'TermLink.Tray.exe')) {
+        $updaterPublish = Join-Path $workRoot 'updater-publish'
+        Invoke-Tool -FilePath $DotNetPath -Arguments @(
+            'publish', (Join-Path $PSScriptRoot '..\src\Updater\TermLink.Updater.csproj'),
+            '--configuration', 'Release',
+            '--runtime', 'win-x64',
+            '--self-contained', 'true',
+            '--output', $updaterPublish,
+            '--nologo',
+            '-p:DebugSymbols=false',
+            '-p:DebugType=None',
+            '-p:PublishSingleFile=true',
+            '-p:IncludeNativeLibrariesForSelfExtract=true',
+            '-p:EnableCompressionInSingleFile=true',
+            "-p:Version=$Version"
+        )
+        Copy-Item -LiteralPath (Join-Path $updaterPublish 'TermLink.Updater.exe') `
+            -Destination (Join-Path $layout 'TermLink.Updater.exe')
+        foreach ($name in @(
+            'TermLink.Agent.exe',
+            'TermLink.SessionHost.exe',
+            'TermLink.Tray.exe',
+            'TermLink.Updater.exe'
+        )) {
             Assert-True (Test-Path -LiteralPath (Join-Path $layout $name) -PathType Leaf) `
                 "Published executable is missing: $name"
         }
         Assert-True (Test-Path -LiteralPath (Join-Path $layout 'coreclr.dll') -PathType Leaf) `
             'The package layout is not self-contained.'
+        [IO.File]::WriteAllBytes(
+            (Join-Path $layout 'TermLink.UpdatePublisher.cer'),
+            $certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
 
         $manifest = [Xml.XmlDocument]::new()
         $manifest.PreserveWhitespace = $true

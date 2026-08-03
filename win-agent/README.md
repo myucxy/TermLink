@@ -12,8 +12,8 @@
 - `src/Updater`：签名更新和回滚；
 - `tests`：生命周期、IPC、句柄和 Golden Stream 测试。
 
-正式 Windows 工程固定 .NET SDK 8.0.303，包含 Agent、SessionHost、共享本机控制契约和
-WinForms Tray：
+正式 Windows 工程固定 .NET SDK 8.0.303，包含 Agent、SessionHost、共享本机控制契约、
+WinForms Tray 和单文件 Updater：
 
 ```powershell
 .\Build-Windows.ps1
@@ -138,8 +138,10 @@ SessionHost，分别在强制结束和受控重启 Agent 后从加密索引恢�
 
 ## 签名 MSIX 与登录自启
 
-`package/Build-Msix.ps1` 使用固定 .NET 8 SDK 发布 `win-x64` 自包含 payload，分别签名 7 个
-TermLink 自有 EXE/DLL，再由 Windows SDK MakeAppx 生成并签名完整 MSIX。非开发构建必须
+`package/Build-Msix.ps1` 使用固定 .NET 8 SDK 发布 `win-x64` 自包含 payload，分别签名 8 个
+TermLink 自有 EXE/DLL，再由 Windows SDK MakeAppx 生成并签名完整 MSIX。Updater 以可复制
+到包外执行的自包含单文件发布，包内同时固定同一签名者的 `TermLink.UpdatePublisher.cer`。
+非开发构建必须
 提供 HTTPS RFC 3161 时间戳；Manifest Publisher 必须与 PFX 证书 Subject 完全一致。
 
 ```powershell
@@ -162,13 +164,44 @@ MSIX 使用 `windows.startupTask` 在当前用户登录后启动 `TermLink.Tray.
 .\tests\Validate-WindowsInstaller.ps1
 ```
 
-验证使用不落库的临时开发证书，覆盖 7 个嵌入签名、完整 MSIX 签名、476 文件自包含包、
-Manifest/StartupTask、解包 payload、Tray 单实例、Agent 状态与关闭；不会修改系统证书库或
+验证使用不落库的临时开发证书，覆盖 8 个嵌入签名、完整 MSIX 签名、自包含包、固定更新
+发布者证书、Manifest/StartupTask、解包 payload、Tray 单实例、Agent 状态与关闭；不会修改系统证书库或
 注册测试包。当前机器关闭 Developer Mode，开发根证书安装会触发 Windows 安全确认，因此
 尚未把开发证书自动加入 Root，也没有把该结果写成真实 `Add-AppxPackage` 成功。生产证书链
 可用后必须补当前用户安装、登录后启动和卸载验收。证据位于
 `docs/validation/phase1-windows-installer.json`。
 
-当前仍没有受控更新/失败回滚、生产证书下的真实安装验收、生产 Relay、账号与设备授权、
-设备密钥或 E2EE。阶段性本机控制 Pipe V2 和 DPAPI 注册索引都不等于生产 Protobuf 或跨设备
-协议。
+## 受控更新与失败回滚
+
+`package/New-UpdateManifest.ps1` 为已有 MSIX 生成单独的 UTF-8 JSON 清单，并使用包签名者的
+RSA 私钥对清单原始字节签名。清单绑定 Package Identity、Publisher、四段版本、最低当前
+版本、文件名、SHA-256 和最长 31 天有效期。Updater 还会独立检查 MSIX Authenticode，且
+目标包、回滚包和固定发布者证书必须完全一致。
+
+```powershell
+$password = Read-Host 'PFX password' -AsSecureString
+.\package\New-UpdateManifest.ps1 `
+  -PackagePath .\artifacts\TermLink-0.2.0.0-x64.msix `
+  -CertificatePath C:\secure\termlink-signing.pfx `
+  -CertificatePassword $password `
+  -MinimumCurrentVersion 0.1.0.0
+```
+
+`TermLink.Updater.exe launch` 在已安装包仍运行时完成两套更新输入校验，把目标包、当前版本
+回滚包、公钥和单文件 runner 原子复制到 `%LOCALAPPDATA%\TermLink\updates`，再由包外 runner
+调用 Windows `Add-AppxPackage`。事务日志可在进程中断后重入；目标部署失败时旧版本保持
+不变，目标健康检查失败时使用 `ForceUpdateFromAnyVersion` 回装已验证的当前版本。健康检查
+只验证 Agent 能返回成功状态，不会把用户主动关闭远程访问误判为故障。
+
+```powershell
+.\tests\Validate-WindowsUpdater.ps1
+```
+
+该测试用同一临时开发证书构建 0.1.0.0 和 0.2.0.0 两个真实 MSIX，覆盖清单/包篡改拒绝、
+成功、部署失败、健康失败回滚、回滚失败和回滚重入。部署动作使用故障注入后端，不注册
+AppX 或修改证书库。真实 PowerShell MSIX 部署后端已经实现，但必须等生产受信证书可用后
+再执行系统级更新/降级验收。证据位于
+`docs/validation/phase1-windows-updater.json`。
+
+当前仍没有生产证书下的真实安装/更新验收、生产 Relay、账号与设备授权、设备密钥或 E2EE。
+阶段性本机控制 Pipe V2 和 DPAPI 注册索引都不等于生产 Protobuf 或跨设备协议。
