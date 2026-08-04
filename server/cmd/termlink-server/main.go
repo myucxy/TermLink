@@ -172,12 +172,8 @@ func runLANTest() error {
 	if len(token) < 12 {
 		return fmt.Errorf("TERMLINK_TEST_TOKEN must contain at least 12 characters")
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", lanreplay.HealthHandler)
 	bundleRoot := envOrDefault("TERMLINK_TESTDATA_DIR", "/testdata/terminal-golden-streams")
-	mux.Handle("GET /v1/test/replay/", lanreplay.Handler{BundleRoot: bundleRoot, Token: token})
-	mux.Handle("GET /v1/test/session/", phase1test.Handler{BundleRoot: bundleRoot, Token: token})
-	server := &http.Server{Addr: envOrDefault("TERMLINK_LISTEN_ADDR", ":8080"), Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	server := &http.Server{Addr: envOrDefault("TERMLINK_LISTEN_ADDR", ":8080"), Handler: newLANTestHandler(token, bundleRoot), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 	shutdownContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go func() {
@@ -192,6 +188,15 @@ func runLANTest() error {
 		return nil
 	}
 	return err
+}
+
+func newLANTestHandler(token, bundleRoot string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", lanreplay.HealthHandler)
+	mux.HandleFunc("GET /readyz", lanreplay.HealthHandler)
+	mux.Handle("GET /v1/test/replay/", lanreplay.Handler{BundleRoot: bundleRoot, Token: token})
+	mux.Handle("GET /v1/test/session/", phase1test.Handler{BundleRoot: bundleRoot, Token: token})
+	return mux
 }
 
 func runHealthcheck() int {
