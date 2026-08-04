@@ -24,6 +24,7 @@ import (
 	"github.com/termlink/termlink/server/internal/realtime"
 	serverruntime "github.com/termlink/termlink/server/internal/runtime"
 	"github.com/termlink/termlink/server/internal/store"
+	"github.com/termlink/termlink/server/internal/webportal"
 )
 
 func main() {
@@ -85,7 +86,11 @@ func runProduction() error {
 	productionAPI := &api.API{
 		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication,
 		SubjectKey: []byte(cfg.TokenSigningKey.Value()), TokenKey: []byte(cfg.TokenSigningKey.Value()), History: historyStore,
-		ClientConfig: api.ClientConfiguration{OIDCIssuer: cfg.OIDCIssuer, OIDCClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI},
+		ClientConfig: api.ClientConfiguration{
+			OIDCIssuer: cfg.OIDCIssuer, OIDCClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI,
+			WindowsClientID: cfg.WindowsOIDCClientID, WindowsRedirectURI: cfg.WindowsOIDCRedirectURI,
+			WebClientID: cfg.WebOIDCClientID, WebRedirectURI: cfg.WebOIDCRedirectURI,
+		},
 	}
 	metrics := observability.New(repository.Pool)
 	hub := realtime.NewHubWithObserver(repository, valkey, slog.Default(), metrics)
@@ -94,11 +99,23 @@ func runProduction() error {
 		defer cancel()
 		_ = hub.Close(shutdown)
 	}()
+	portal, err := webportal.New(ctx, webportal.Config{
+		PublicURL:   cfg.PublicURL,
+		Issuer:      cfg.OIDCIssuer,
+		ClientID:    cfg.WebOIDCClientID,
+		RedirectURI: cfg.WebOIDCRedirectURI,
+		CookieKey:   []byte(cfg.TokenSigningKey.Value()),
+	})
+	if err != nil {
+		return fmt.Errorf("initialize web portal: %w", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/realtime", authentication.Authenticate(hub.Handler()))
+	mux.Handle("/v1/", productionAPI.Handler())
+	mux.Handle("/v1", productionAPI.Handler())
 	mux.HandleFunc("GET /readyz", readinessHandler(repository, valkey))
-	mux.Handle("/", productionAPI.Handler())
+	mux.Handle("/", portal.Handler())
 	go consumeRevocations(ctx, valkey, hub)
 	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "history_enabled", cfg.HistoryEnabled, "metrics_enabled", cfg.MetricsListenAddr != "")
 	return serveProduction(ctx, serverruntime.New(cfg, metrics.HTTPMiddleware(mux)), metrics, cfg.MetricsListenAddr)

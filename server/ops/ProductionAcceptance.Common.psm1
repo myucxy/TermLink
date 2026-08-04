@@ -16,6 +16,7 @@ function Get-TermLinkAcceptancePaths {
         RedisUrl = Join-Path $secretRoot 'redis-url'
         TokenSigningKey = Join-Path $secretRoot 'token-signing-key'
         RootCa = Join-Path $secretRoot 'acceptance-root-ca.crt'
+        ProbeIdentity = Join-Path $secretRoot 'production-probe-pc.json'
     }
 }
 

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -139,6 +140,10 @@ func (m Middleware) authenticate(next http.Handler, requireTrusted bool) http.Ha
 			if errors.Is(err, ErrDevicePending) {
 				status = http.StatusForbidden
 			}
+			slog.Warn("request authentication rejected",
+				"method", r.Method,
+				"path", requestTarget(r),
+				"reason", err.Error())
 			writeAuthError(w, status, err)
 			return
 		}

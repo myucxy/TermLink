@@ -49,9 +49,13 @@ type API struct {
 }
 
 type ClientConfiguration struct {
-	OIDCIssuer   string
-	OIDCClientID string
-	RedirectURI  string
+	OIDCIssuer         string
+	OIDCClientID       string
+	RedirectURI        string
+	WindowsClientID    string
+	WindowsRedirectURI string
+	WebClientID        string
+	WebRedirectURI     string
 }
 
 type HistoryObjectStore interface {
@@ -114,15 +118,21 @@ func (a *API) Handler() http.Handler {
 }
 
 func (a *API) getClientConfiguration(w http.ResponseWriter, r *http.Request) {
-	if a.ClientConfig.OIDCIssuer == "" || a.ClientConfig.OIDCClientID == "" || a.ClientConfig.RedirectURI == "" {
+	if a.ClientConfig.OIDCIssuer == "" || a.ClientConfig.OIDCClientID == "" || a.ClientConfig.RedirectURI == "" ||
+		a.ClientConfig.WindowsClientID == "" || a.ClientConfig.WindowsRedirectURI == "" ||
+		a.ClientConfig.WebClientID == "" || a.ClientConfig.WebRedirectURI == "" {
 		writeError(w, r, http.StatusServiceUnavailable, "CLIENT_CONFIGURATION_UNAVAILABLE", errors.New("client configuration is unavailable"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"oidc_issuer":       a.ClientConfig.OIDCIssuer,
-		"oidc_client_id":    a.ClientConfig.OIDCClientID,
-		"redirect_uri":      a.ClientConfig.RedirectURI,
-		"protocol_versions": []int{1},
+		"oidc_issuer":            a.ClientConfig.OIDCIssuer,
+		"oidc_client_id":         a.ClientConfig.OIDCClientID,
+		"redirect_uri":           a.ClientConfig.RedirectURI,
+		"windows_oidc_client_id": a.ClientConfig.WindowsClientID,
+		"windows_redirect_uri":   a.ClientConfig.WindowsRedirectURI,
+		"web_oidc_client_id":     a.ClientConfig.WebClientID,
+		"web_redirect_uri":       a.ClientConfig.WebRedirectURI,
+		"protocol_versions":      []int{1},
 	})
 }
 

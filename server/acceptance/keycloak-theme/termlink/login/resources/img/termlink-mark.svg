@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">TermLink</title>
+  <rect x="6" y="10" width="52" height="44" rx="11" fill="none" stroke="#F4F7FB" stroke-width="4"/>
+  <path d="m11 28 5 5-5 5" fill="none" stroke="#62E6C5" stroke-linecap="round" stroke-linejoin="round" stroke-width="3.5"/>
+  <path d="M16 20h22M27 20v25" fill="none" stroke="#F4F7FB" stroke-linecap="round" stroke-width="7"/>
+  <path d="M27 45h20V31" fill="none" stroke="#62E6C5" stroke-linecap="round" stroke-linejoin="round" stroke-width="7"/>
+  <circle cx="48" cy="21" r="4.5" fill="#FFCF5A"/>
+</svg>

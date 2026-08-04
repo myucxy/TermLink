@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -14,10 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -36,6 +36,13 @@ type identity struct {
 	public   ed25519.PublicKey
 	private  ed25519.PrivateKey
 	exchange []byte
+}
+
+type storedPCIdentity struct {
+	DeviceID   string `json:"device_id"`
+	PCID       string `json:"pc_id"`
+	PrivateKey string `json:"private_key"`
+	Exchange   string `json:"exchange"`
 }
 
 type probe struct {
@@ -59,8 +66,16 @@ func run() error {
 	issuer := strings.TrimRight(os.Getenv("TERMLINK_ACCEPTANCE_OIDC_ISSUER"), "/")
 	passwordPath := os.Getenv("TERMLINK_ACCEPTANCE_USER_PASSWORD_FILE")
 	caPath := os.Getenv("TERMLINK_ACCEPTANCE_CA_FILE")
-	if root == "" || issuer == "" || passwordPath == "" || caPath == "" {
-		return errors.New("acceptance root, issuer, password file, and CA file are required")
+	identityPath := os.Getenv("TERMLINK_ACCEPTANCE_PROBE_IDENTITY_FILE")
+	username := strings.TrimSpace(os.Getenv("TERMLINK_ACCEPTANCE_USER_NAME"))
+	if username == "" {
+		username = "acceptance-probe"
+	}
+	if root == "" || issuer == "" || passwordPath == "" || caPath == "" || identityPath == "" {
+		return errors.New("acceptance root, issuer, password file, CA file, and probe identity file are required")
+	}
+	if len(username) > 128 || strings.ContainsAny(username, "\r\n\x00") {
+		return errors.New("acceptance username is invalid")
 	}
 	if !strings.HasPrefix(root, "https://") || !strings.HasPrefix(issuer, "https://") {
 		return errors.New("acceptance endpoints must use HTTPS")
@@ -70,26 +85,11 @@ func run() error {
 		return err
 	}
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}
-	dialer := &net.Dialer{Timeout: 15 * time.Second}
-	dialContext := func(ctx context.Context, network, address string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, err
-		}
-		switch host {
-		case "api.termlink.localhost", "id.termlink.localhost":
-			host = "127.0.0.1"
-		}
-		return dialer.DialContext(ctx, network, net.JoinHostPort(host, port))
-	}
-	transport := &http.Transport{TLSClientConfig: tlsConfig.Clone(), DialContext: dialContext}
+	transport := &http.Transport{TLSClientConfig: tlsConfig.Clone()}
 	client := &http.Client{Transport: transport, Timeout: 15 * time.Second}
 	p := &probe{
 		root: root, issuer: issuer, http: client,
-		dialer: websocket.Dialer{
-			TLSClientConfig: tlsConfig.Clone(), NetDialContext: dialContext,
-			Subprotocols: []string{"termlink.realtime.v1"}, HandshakeTimeout: 15 * time.Second,
-		},
+		dialer: websocket.Dialer{TLSClientConfig: tlsConfig.Clone(), Subprotocols: []string{"termlink.realtime.v1"}, HandshakeTimeout: 15 * time.Second},
 	}
 	defer transport.CloseIdleConnections()
 
@@ -98,7 +98,7 @@ func run() error {
 		return errors.New("acceptance user password file is unavailable")
 	}
 	defer clear(password)
-	token, err := p.acquireToken(string(bytes.TrimSpace(password)))
+	token, err := p.acquireToken(username, string(bytes.TrimSpace(password)))
 	if err != nil {
 		return err
 	}
@@ -108,7 +108,7 @@ func run() error {
 	if err := p.verifyPublicEndpoints(); err != nil {
 		return err
 	}
-	pc, err := newIdentity()
+	pc, pcID, err := loadOrCreatePCIdentity(identityPath)
 	if err != nil {
 		return err
 	}
@@ -122,7 +122,7 @@ func run() error {
 	if err := p.register(pc, "WINDOWS_PC", "Acceptance PC"); err != nil {
 		return err
 	}
-	pcID, sessionID := uuid.New(), uuid.New()
+	sessionID := uuid.New()
 	if _, err := p.signedJSON(pc, http.MethodPut, "/v1/pcs/"+pcID.String(), map[string]any{
 		"name": "Acceptance PC", "agent_version": "acceptance", "key_epoch": 1,
 	}, "acceptance-pc-"+pcID.String(), http.StatusOK); err != nil {
@@ -208,14 +208,17 @@ func loadRoots(path string) (*x509.CertPool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read acceptance CA: %w", err)
 	}
-	pool := x509.NewCertPool()
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
 	if !pool.AppendCertsFromPEM(pem) {
 		return nil, errors.New("acceptance CA is invalid")
 	}
 	return pool, nil
 }
 
-func (p *probe) acquireToken(password string) (string, error) {
+func (p *probe) acquireToken(username, password string) (string, error) {
 	configurationURL := p.issuer + "/.well-known/openid-configuration"
 	response, err := p.http.Get(configurationURL)
 	if err != nil {
@@ -233,7 +236,7 @@ func (p *probe) acquireToken(password string) (string, error) {
 	}
 	form := url.Values{
 		"grant_type": {"password"}, "client_id": {"termlink-acceptance-cli"},
-		"username": {"acceptance-user"}, "password": {password}, "scope": {"openid"},
+		"username": {username}, "password": {password}, "scope": {"openid"},
 	}
 	request, _ := http.NewRequest(http.MethodPost, configuration.TokenEndpoint, strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -297,6 +300,105 @@ func newIdentity() (*identity, error) {
 	return &identity{id: uuid.New(), public: public, private: private, exchange: exchange}, nil
 }
 
+func loadOrCreatePCIdentity(path string) (*identity, uuid.UUID, error) {
+	if value, pcID, err := loadPCIdentity(path); err == nil {
+		return value, pcID, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, uuid.Nil, err
+	}
+	value, err := newIdentity()
+	if err != nil {
+		return nil, uuid.Nil, err
+	}
+	pcID := uuid.New()
+	stored := storedPCIdentity{
+		DeviceID:   value.id.String(),
+		PCID:       pcID.String(),
+		PrivateKey: base64.RawURLEncoding.EncodeToString(value.private),
+		Exchange:   base64.RawURLEncoding.EncodeToString(value.exchange),
+	}
+	raw, err := json.Marshal(stored)
+	if err != nil {
+		value.destroy()
+		return nil, uuid.Nil, err
+	}
+	defer clear(raw)
+	if err := writePrivateFile(path, raw); err != nil {
+		value.destroy()
+		if errors.Is(err, os.ErrExist) {
+			return loadPCIdentity(path)
+		}
+		return nil, uuid.Nil, err
+	}
+	return value, pcID, nil
+}
+
+func loadPCIdentity(path string) (*identity, uuid.UUID, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, uuid.Nil, err
+	}
+	if !info.Mode().IsRegular() || (runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0) {
+		return nil, uuid.Nil, errors.New("acceptance probe identity permissions are unsafe")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, uuid.Nil, err
+	}
+	defer clear(raw)
+	var stored storedPCIdentity
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		return nil, uuid.Nil, errors.New("acceptance probe identity is invalid")
+	}
+	deviceID, err := uuid.Parse(stored.DeviceID)
+	if err != nil {
+		return nil, uuid.Nil, errors.New("acceptance probe device ID is invalid")
+	}
+	pcID, err := uuid.Parse(stored.PCID)
+	if err != nil {
+		return nil, uuid.Nil, errors.New("acceptance probe PC ID is invalid")
+	}
+	privateKey, privateErr := base64.RawURLEncoding.DecodeString(stored.PrivateKey)
+	exchange, exchangeErr := base64.RawURLEncoding.DecodeString(stored.Exchange)
+	if privateErr != nil || exchangeErr != nil || len(privateKey) != ed25519.PrivateKeySize || len(exchange) != 32 {
+		clear(privateKey)
+		clear(exchange)
+		return nil, uuid.Nil, errors.New("acceptance probe key material is invalid")
+	}
+	public := make([]byte, ed25519.PublicKeySize)
+	copy(public, privateKey[ed25519.SeedSize:])
+	return &identity{id: deviceID, public: public, private: privateKey, exchange: exchange}, pcID, nil
+}
+
+func writePrivateFile(path string, raw []byte) error {
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	written := false
+	defer func() {
+		_ = file.Close()
+		if !written {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := file.Write(raw); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	written = true
+	return nil
+}
+
 func (i *identity) destroy() {
 	clear(i.private)
 	clear(i.exchange)
@@ -334,7 +436,7 @@ func (p *probe) register(device *identity, deviceType, name string) error {
 	}
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
-	if response.StatusCode != http.StatusCreated {
+	if response.StatusCode != http.StatusCreated && response.StatusCode != http.StatusConflict {
 		return fmt.Errorf("register %s returned HTTP %d", deviceType, response.StatusCode)
 	}
 	return nil

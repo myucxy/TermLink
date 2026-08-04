@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>个人中心 · TermLink</title>
+  <link rel="stylesheet" href="/assets/site.css">
+</head>
+<body class="account-body">
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="TermLink 首页">
+      <span class="brand-mark" aria-hidden="true">T</span>
+      <span><strong>TermLink</strong><small>Account Center</small></span>
+    </a>
+    <a class="button button-quiet" href="/">返回首页</a>
+  </header>
+
+  <main class="account-shell">
+    <aside class="account-context">
+      <p class="eyebrow"><span class="status-dot"></span> ACCOUNT CONNECTED</p>
+      <h1>欢迎回来，<br>{{.Username}}</h1>
+      <p>账号授权已通过公开 HTTPS OIDC 流程完成。设备仍需单独注册和批准，登录本身不会自动授予任何 PC 权限。</p>
+      <dl class="account-facts">
+        <div><dt>授权协议</dt><dd>Authorization Code + PKCE</dd></div>
+        <div><dt>浏览器会话</dt><dd>Secure · HttpOnly · SameSite</dd></div>
+        <div><dt>终端正文</dt><dd>服务端始终不可见</dd></div>
+      </dl>
+    </aside>
+
+    <section class="account-workspace" aria-labelledby="account-title">
+      <div class="account-title-row">
+        <div>
+          <p class="eyebrow">TERMLINK ACCOUNT</p>
+          <h2 id="account-title">个人中心</h2>
+          <p>管理身份安全，并继续连接 Windows 或 Android 客户端。</p>
+        </div>
+        <span class="verified-pill">已验证</span>
+      </div>
+
+      <div class="profile-panel">
+        <div class="avatar" aria-hidden="true">{{printf "%.1s" .Username}}</div>
+        <div>
+          <strong>{{.Name}}</strong>
+          <span>{{.Username}}</span>
+          {{if .Email}}<span>{{.Email}}</span>{{end}}
+        </div>
+      </div>
+
+      <div class="account-actions">
+        <article>
+          <div><span class="action-icon" aria-hidden="true">⌁</span><div><h3>连接 Windows Agent</h3><p>在托盘中选择“Link TermLink account”，系统浏览器将使用同一账号授权。</p></div></div>
+          <span class="action-state">下一步</span>
+        </article>
+        <article>
+          <div><span class="action-icon" aria-hidden="true">◇</span><div><h3>连接 Android</h3><p>Android 登录后先作为待批准设备，不会自动获得终端查看或控制权限。</p></div></div>
+          <span class="action-state">待连接</span>
+        </article>
+        <article>
+          <div><span class="action-icon" aria-hidden="true">◉</span><div><h3>账号与登录安全</h3><p>修改密码、配置 MFA、查看活跃登录，并撤销不再使用的浏览器会话。</p></div></div>
+          <a class="text-link" href="{{.IdentityAccountURL}}">管理身份 <span aria-hidden="true">→</span></a>
+        </article>
+      </div>
+
+      <div class="account-footer-actions">
+        <p>退出只会结束当前浏览器会话，不会终止 Windows 上正在运行的 Shell。</p>
+        <form action="/logout" method="post">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <button class="button button-danger" type="submit">安全退出</button>
+        </form>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

@@ -1,10 +1,15 @@
 {
   "realm": "termlink",
   "enabled": true,
-  "displayName": "TermLink Acceptance",
+  "displayName": "TermLink",
+  "loginTheme": "termlink",
+  "internationalizationEnabled": true,
+  "supportedLocales": ["zh-CN", "en"],
+  "defaultLocale": "zh-CN",
   "sslRequired": "external",
   "registrationAllowed": false,
   "resetPasswordAllowed": true,
+  "rememberMe": true,
   "loginWithEmailAllowed": true,
   "duplicateEmailsAllowed": false,
   "bruteForceProtected": true,
@@ -64,6 +69,50 @@
           }
         }
       ]
+    },
+    {
+      "clientId": "termlink-windows",
+      "name": "TermLink Windows Agent",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["http://127.0.0.1:43971/oauth2/callback"],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": ["web-origins", "acr", "roles", "profile", "basic", "email"],
+      "optionalClientScopes": ["offline_access"],
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "name": "termlink-server-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "termlink-server",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "termlink-web",
+      "name": "TermLink Web Portal",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["https://termlink.kget.cc:8910/auth/callback"],
+      "webOrigins": ["https://termlink.kget.cc:8910"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "https://termlink.kget.cc:8910/*"
+      },
+      "protocol": "openid-connect"
     }
   ]
 }

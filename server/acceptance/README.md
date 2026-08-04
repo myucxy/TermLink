@@ -25,12 +25,40 @@ tag. It never falls back to an unpinned image.
 
 The local endpoints are:
 
-- API: `https://api.termlink.localhost:9443`
-- OIDC: `https://id.termlink.localhost:9443/realms/termlink`
+- API: `https://api.127.0.0.1.sslip.io:9443`
+- Public product home and account portal: `https://termlink.kget.cc:8910/`
+- Public API/OIDC through Lucky: `https://termlink.kget.cc:8910`
+
+The public root is a product introduction page. Selecting **Login** starts an
+OIDC Authorization Code + PKCE flow through the `termlink-web` public client,
+then returns to `/account`. The portal stores only an encrypted, Secure,
+HttpOnly, SameSite browser session; access and ID tokens are not persisted in
+the browser cookie. Signing out is protected by an origin check and CSRF token.
+
+Keycloak serves the responsive TermLink account theme from
+`acceptance/keycloak-theme/termlink`. The realm import selects the theme for a
+clean deployment, and `keycloak-init` applies the same setting idempotently to
+an existing realm. Acceptance remains invitation-only because this stack does
+not configure SMTP; the login page reports that policy instead of advertising
+an unusable public registration flow.
+
+The cross-process deployment probe uses the dedicated `acceptance-probe` OIDC
+user and a persistent probe PC identity. Interactive Windows and browser
+acceptance uses `acceptance-user`, so repeated probes cannot consume that
+user's first trusted Windows-device slot. Both users are disposable and exist
+only in this acceptance realm.
+
+The acceptance stack binds an HTTP-only Lucky upstream on port `8080`. It is
+intended for the configured private-LAN hop from Lucky; TLS continues to
+terminate at the public `https://termlink.kget.cc:8910` origin. Identity paths
+are routed to Keycloak and all other paths to the TermLink Server.
 
 The Caddy CA is disposable and is not a production trust anchor. Local browser
 or emulator testing must explicitly trust only the exported acceptance CA;
 production clients continue to require a publicly trusted HTTPS chain.
+The Windows Agent test path can instead set `TERMLINK_ACCEPTANCE_CA_FILE` to
+the exported certificate. That override is accepted only for
+`*.127.0.0.1.sslip.io` acceptance hosts and still enforces the TLS hostname.
 
 Stop the stack while retaining data:
 
@@ -43,3 +71,15 @@ Remove the disposable volumes:
 ```powershell
 .\server\ops\Stop-ProductionAcceptance.ps1 -RemoveVolumes
 ```
+
+For a first-version clean-room deployment test, reset only the managed
+`termlink-production-acceptance` project, regenerate its disposable secrets,
+rebuild, and run the production protocol probe:
+
+```powershell
+.\server\ops\Start-ProductionAcceptance.ps1 -Reset
+```
+
+The reset path checks the acceptance marker before deleting its ignored secret
+directory and runs Compose only with `server/compose/acceptance.compose.yml`.
+It does not remove containers or volumes owned by other Docker projects.

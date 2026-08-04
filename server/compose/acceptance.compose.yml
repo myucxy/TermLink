@@ -1,6 +1,26 @@
 name: termlink-production-acceptance
 
 services:
+  lucky-upstream:
+    image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    ports:
+      - "0.0.0.0:8080:8080"
+    networks: ["acceptance"]
+    volumes:
+      - ../acceptance/LuckyUpstream.Caddyfile:/etc/caddy/Caddyfile:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/__termlink_upstream_health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
   edge:
     image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
     command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
@@ -9,8 +29,8 @@ services:
     networks:
       acceptance:
         aliases:
-          - api.termlink.localhost
-          - id.termlink.localhost
+          - api.127.0.0.1.sslip.io
+          - id.127.0.0.1.sslip.io
     volumes:
       - ../acceptance/Caddyfile:/etc/caddy/Caddyfile:ro
       - acceptance-caddy-data:/data
@@ -58,7 +78,7 @@ services:
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: acceptance-admin
       KC_HEALTH_ENABLED: "true"
-      KC_HOSTNAME: https://id.termlink.localhost:9443
+      KC_HOSTNAME: https://termlink.kget.cc:8910
       KC_HTTP_ENABLED: "true"
       KC_PROXY_HEADERS: xforwarded
     secrets:
@@ -66,6 +86,7 @@ services:
     networks: ["acceptance"]
     volumes:
       - ../acceptance/keycloak-realm.json:/opt/keycloak/data/import/termlink-realm.json:ro
+      - ../acceptance/keycloak-theme/termlink:/opt/keycloak/themes/termlink:ro
       - acceptance-keycloak-data:/opt/keycloak/data
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
@@ -90,26 +111,60 @@ services:
           test "$$attempt" -lt 90 || exit 1
           sleep 1
         done
-        user_id=$$(/opt/keycloak/bin/kcadm.sh get users \
+        /opt/keycloak/bin/kcadm.sh update realms/termlink \
           --config /tmp/kcadm.config \
-          -r termlink -q exact=true -q username=acceptance-user \
+          -s displayName=TermLink \
+          -s loginTheme=termlink \
+          -s internationalizationEnabled=true \
+          -s 'supportedLocales=["zh-CN","en"]' \
+          -s defaultLocale=zh-CN \
+          -s rememberMe=true >/dev/null
+        windows_client_id=$$(/opt/keycloak/bin/kcadm.sh get clients \
+          --config /tmp/kcadm.config \
+          -r termlink -q clientId=termlink-windows \
           --fields id --format csv --noquotes | tail -n 1)
-        if test -z "$$user_id"; then
-          user_id=$$(/opt/keycloak/bin/kcadm.sh create users \
+        test -n "$$windows_client_id"
+        client_scope_table=$$(/opt/keycloak/bin/kcadm.sh get client-scopes \
+          --config /tmp/kcadm.config \
+          -r termlink --fields id,name --format csv --noquotes)
+        for scope_name in web-origins acr roles profile basic email; do
+          scope_id=$$(printf '%s\n' "$$client_scope_table" | while IFS=, read -r id name; do
+            if test "$$name" = "$$scope_name"; then printf '%s' "$$id"; fi
+          done)
+          test -n "$$scope_id"
+          /opt/keycloak/bin/kcadm.sh update \
+            "clients/$$windows_client_id/default-client-scopes/$$scope_id" \
+            --config /tmp/kcadm.config -r termlink >/dev/null
+        done
+        offline_scope_id=$$(printf '%s\n' "$$client_scope_table" | while IFS=, read -r id name; do
+          if test "$$name" = offline_access; then printf '%s' "$$id"; fi
+        done)
+        test -n "$$offline_scope_id"
+        /opt/keycloak/bin/kcadm.sh update \
+          "clients/$$windows_client_id/optional-client-scopes/$$offline_scope_id" \
+          --config /tmp/kcadm.config -r termlink >/dev/null
+        for username in acceptance-user acceptance-probe; do
+          user_id=$$(/opt/keycloak/bin/kcadm.sh get users \
             --config /tmp/kcadm.config \
-            -r termlink -s username=acceptance-user -s enabled=true -i)
-        fi
-        /opt/keycloak/bin/kcadm.sh update "users/$$user_id" \
-          --config /tmp/kcadm.config \
-          -r termlink \
-          -s firstName=Acceptance \
-          -s lastName=User \
-          -s email=acceptance-user@termlink.local \
-          -s emailVerified=true \
-          -s enabled=true >/dev/null
-        /opt/keycloak/bin/kcadm.sh set-password \
-          --config /tmp/kcadm.config \
-          -r termlink --userid "$$user_id" --new-password "$$user_password" >/dev/null
+            -r termlink -q exact=true -q username="$$username" \
+            --fields id --format csv --noquotes | tail -n 1)
+          if test -z "$$user_id"; then
+            user_id=$$(/opt/keycloak/bin/kcadm.sh create users \
+              --config /tmp/kcadm.config \
+              -r termlink -s username="$$username" -s enabled=true -i)
+          fi
+          /opt/keycloak/bin/kcadm.sh update "users/$$user_id" \
+            --config /tmp/kcadm.config \
+            -r termlink \
+            -s firstName=Acceptance \
+            -s lastName="$$username" \
+            -s email="$$username@termlink.local" \
+            -s emailVerified=true \
+            -s enabled=true >/dev/null
+          /opt/keycloak/bin/kcadm.sh set-password \
+            --config /tmp/kcadm.config \
+            -r termlink --userid "$$user_id" --new-password "$$user_password" >/dev/null
+        done
     secrets:
       - keycloak_admin_password
       - acceptance_user_password
@@ -193,11 +248,15 @@ services:
       dockerfile: server/Dockerfile
     command: ["migrate"]
     environment: &termlink_environment
-      TERMLINK_PUBLIC_URL: https://api.termlink.localhost:9443
-      TERMLINK_OIDC_ISSUER: https://id.termlink.localhost:9443/realms/termlink
+      TERMLINK_PUBLIC_URL: https://termlink.kget.cc:8910
+      TERMLINK_OIDC_ISSUER: https://termlink.kget.cc:8910/realms/termlink
       TERMLINK_OIDC_CLIENT_ID: termlink-server
       TERMLINK_ANDROID_OIDC_CLIENT_ID: termlink-android
       TERMLINK_ANDROID_OIDC_REDIRECT_URI: dev.termlink:/oauth2redirect
+      TERMLINK_WINDOWS_OIDC_CLIENT_ID: termlink-windows
+      TERMLINK_WINDOWS_OIDC_REDIRECT_URI: http://127.0.0.1:43971/oauth2/callback
+      TERMLINK_WEB_OIDC_CLIENT_ID: termlink-web
+      TERMLINK_WEB_OIDC_REDIRECT_URI: https://termlink.kget.cc:8910/auth/callback
       TERMLINK_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
       TERMLINK_DATABASE_URL_FILE: /run/secrets/database_url
       TERMLINK_REDIS_URL_FILE: /run/secrets/redis_url
@@ -250,6 +309,8 @@ services:
         condition: service_completed_successfully
       keycloak-init:
         condition: service_completed_successfully
+      lucky-upstream:
+        condition: service_healthy
       valkey:
         condition: service_healthy
 

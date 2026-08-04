@@ -56,6 +56,10 @@ type Config struct {
 	OIDCClientID           string
 	AndroidOIDCClientID    string
 	AndroidOIDCRedirectURI string
+	WindowsOIDCClientID    string
+	WindowsOIDCRedirectURI string
+	WebOIDCClientID        string
+	WebOIDCRedirectURI     string
 
 	OIDCClientSecret Secret
 	DatabaseURL      Secret
@@ -91,12 +95,16 @@ type Config struct {
 // secret paths as well as secret values, because paths can contain identifying
 // deployment information and are not needed in normal startup diagnostics.
 func (c Config) String() string {
-	return fmt.Sprintf("Config{PublicURL:%q OIDCIssuer:%q OIDCClientID:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q OIDCClientSecret:%s DatabaseURL:%s RedisURL:%s TokenSigningKey:%s S3Endpoint:%q S3PublicEndpoint:%q S3Bucket:%q S3Region:%q S3AccessKey:%s S3SecretKey:%s LogLevel:%q HistoryEnabled:%t ListenAddr:%q MetricsListenAddr:%q}",
+	return fmt.Sprintf("Config{PublicURL:%q OIDCIssuer:%q OIDCClientID:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q WindowsOIDCClientID:%q WindowsOIDCRedirectURI:%q WebOIDCClientID:%q WebOIDCRedirectURI:%q OIDCClientSecret:%s DatabaseURL:%s RedisURL:%s TokenSigningKey:%s S3Endpoint:%q S3PublicEndpoint:%q S3Bucket:%q S3Region:%q S3AccessKey:%s S3SecretKey:%s LogLevel:%q HistoryEnabled:%t ListenAddr:%q MetricsListenAddr:%q}",
 		c.PublicURL,
 		c.OIDCIssuer,
 		c.OIDCClientID,
 		c.AndroidOIDCClientID,
 		c.AndroidOIDCRedirectURI,
+		c.WindowsOIDCClientID,
+		c.WindowsOIDCRedirectURI,
+		c.WebOIDCClientID,
+		c.WebOIDCRedirectURI,
 		c.OIDCClientSecret,
 		c.DatabaseURL,
 		c.RedisURL,
@@ -133,6 +141,10 @@ type Input struct {
 	OIDCClientID           string
 	AndroidOIDCClientID    string
 	AndroidOIDCRedirectURI string
+	WindowsOIDCClientID    string
+	WindowsOIDCRedirectURI string
+	WebOIDCClientID        string
+	WebOIDCRedirectURI     string
 
 	OIDCClientSecret string
 	DatabaseURL      string
@@ -161,6 +173,10 @@ func New(input Input) (Config, error) {
 		OIDCClientID:           strings.TrimSpace(input.OIDCClientID),
 		AndroidOIDCClientID:    strings.TrimSpace(input.AndroidOIDCClientID),
 		AndroidOIDCRedirectURI: strings.TrimSpace(input.AndroidOIDCRedirectURI),
+		WindowsOIDCClientID:    strings.TrimSpace(input.WindowsOIDCClientID),
+		WindowsOIDCRedirectURI: strings.TrimSpace(input.WindowsOIDCRedirectURI),
+		WebOIDCClientID:        strings.TrimSpace(input.WebOIDCClientID),
+		WebOIDCRedirectURI:     strings.TrimSpace(input.WebOIDCRedirectURI),
 		OIDCClientSecret:       Secret(strings.TrimSpace(input.OIDCClientSecret)),
 		DatabaseURL:            Secret(strings.TrimSpace(input.DatabaseURL)),
 		RedisURL:               Secret(strings.TrimSpace(input.RedisURL)),
@@ -279,6 +295,10 @@ func LoadSource(source Source) (Config, error) {
 	}
 	androidOIDCClientID := lookupOptional("TERMLINK_ANDROID_OIDC_CLIENT_ID", "termlink-android")
 	androidOIDCRedirectURI := lookupOptional("TERMLINK_ANDROID_OIDC_REDIRECT_URI", "dev.termlink:/oauth2redirect")
+	windowsOIDCClientID := lookupOptional("TERMLINK_WINDOWS_OIDC_CLIENT_ID", "termlink-windows")
+	windowsOIDCRedirectURI := lookupOptional("TERMLINK_WINDOWS_OIDC_REDIRECT_URI", "http://127.0.0.1:43971/oauth2/callback")
+	webOIDCClientID := lookupOptional("TERMLINK_WEB_OIDC_CLIENT_ID", "termlink-web")
+	webOIDCRedirectURI := lookupOptional("TERMLINK_WEB_OIDC_REDIRECT_URI", strings.TrimRight(publicURL, "/")+"/auth/callback")
 	logLevel := lookupOptional("TERMLINK_LOG_LEVEL", defaultLogLevel)
 	historyEnabled, err := parseBool("TERMLINK_HISTORY_ENABLED", lookupOptional("TERMLINK_HISTORY_ENABLED", "false"))
 	if err != nil {
@@ -329,6 +349,10 @@ func LoadSource(source Source) (Config, error) {
 		OIDCClientID:           oidcClientID,
 		AndroidOIDCClientID:    androidOIDCClientID,
 		AndroidOIDCRedirectURI: androidOIDCRedirectURI,
+		WindowsOIDCClientID:    windowsOIDCClientID,
+		WindowsOIDCRedirectURI: windowsOIDCRedirectURI,
+		WebOIDCClientID:        webOIDCClientID,
+		WebOIDCRedirectURI:     webOIDCRedirectURI,
 		OIDCClientSecret:       oidcSecret,
 		DatabaseURL:            databaseURL,
 		RedisURL:               redisURL,
@@ -426,8 +450,33 @@ func validate(c Config) (Config, error) {
 	if err != nil || redirect.Scheme != "dev.termlink" || redirect.Host != "" || redirect.Path != "/oauth2redirect" {
 		return Config{}, fmt.Errorf("%w: TERMLINK_ANDROID_OIDC_REDIRECT_URI", ErrInvalid)
 	}
+	if strings.TrimSpace(c.WindowsOIDCClientID) == "" {
+		c.WindowsOIDCClientID = "termlink-windows"
+	}
+	if strings.TrimSpace(c.WindowsOIDCRedirectURI) == "" {
+		c.WindowsOIDCRedirectURI = "http://127.0.0.1:43971/oauth2/callback"
+	}
+	windowsRedirect, err := url.Parse(c.WindowsOIDCRedirectURI)
+	if err != nil || windowsRedirect.Scheme != "http" || windowsRedirect.Hostname() != "127.0.0.1" ||
+		windowsRedirect.Port() == "" || windowsRedirect.Path != "/oauth2/callback" ||
+		windowsRedirect.RawQuery != "" || windowsRedirect.Fragment != "" || windowsRedirect.User != nil {
+		return Config{}, fmt.Errorf("%w: TERMLINK_WINDOWS_OIDC_REDIRECT_URI", ErrInvalid)
+	}
 	if c.OIDCClientSecret.Empty() {
 		return Config{}, fmt.Errorf("%w: TERMLINK_OIDC_CLIENT_SECRET_FILE", ErrSecret)
+	}
+	if strings.TrimSpace(c.WebOIDCClientID) == "" {
+		c.WebOIDCClientID = "termlink-web"
+	}
+	if strings.TrimSpace(c.WebOIDCRedirectURI) == "" {
+		c.WebOIDCRedirectURI = strings.TrimRight(c.PublicURL, "/") + "/auth/callback"
+	}
+	publicURL, _ := url.Parse(c.PublicURL)
+	webRedirect, err := url.Parse(c.WebOIDCRedirectURI)
+	if err != nil || webRedirect.Scheme != "https" ||
+		!strings.EqualFold(webRedirect.Host, publicURL.Host) || webRedirect.Path != "/auth/callback" ||
+		webRedirect.RawQuery != "" || webRedirect.Fragment != "" || webRedirect.User != nil {
+		return Config{}, fmt.Errorf("%w: TERMLINK_WEB_OIDC_REDIRECT_URI", ErrInvalid)
 	}
 	if c.DatabaseURL.Empty() {
 		return Config{}, fmt.Errorf("%w: TERMLINK_DATABASE_URL_FILE", ErrSecret)

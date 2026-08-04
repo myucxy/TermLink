@@ -36,7 +36,8 @@ if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container)) 
     foreach ($file in @(
         $paths.AdminPassword, $paths.UserPassword, $paths.PostgresPassword,
         $paths.OidcClientSecret, $paths.DatabaseUrl, $paths.RedisUrl,
-        $paths.TokenSigningKey, $paths.RootCa, $paths.Marker
+        $paths.TokenSigningKey, $paths.RootCa, $paths.Marker,
+        $paths.ProbeIdentity
     )) {
         if (Test-Path -LiteralPath $file -PathType Leaf) {
             Remove-Item -LiteralPath $file -Force
@@ -90,9 +91,11 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $paths.RootCa -PathType
     throw 'Could not export the disposable acceptance CA certificate.'
 }
 
-$env:TERMLINK_ACCEPTANCE_ROOT_URL = 'https://api.termlink.localhost:9443'
-$env:TERMLINK_ACCEPTANCE_OIDC_ISSUER = 'https://id.termlink.localhost:9443/realms/termlink'
+$env:TERMLINK_ACCEPTANCE_ROOT_URL = 'https://api.127.0.0.1.sslip.io:9443'
+$env:TERMLINK_ACCEPTANCE_OIDC_ISSUER = 'https://termlink.kget.cc:8910/realms/termlink'
 $env:TERMLINK_ACCEPTANCE_CA_FILE = $paths.RootCa
+$env:TERMLINK_ACCEPTANCE_USER_NAME = 'acceptance-probe'
+$env:TERMLINK_ACCEPTANCE_PROBE_IDENTITY_FILE = $paths.ProbeIdentity
 $go = if (Test-Path -LiteralPath 'D:\Dev\Env\Go\bin\go.exe' -PathType Leaf) {
     'D:\Dev\Env\Go\bin\go.exe'
 } else {
@@ -108,6 +111,6 @@ finally {
 }
 
 Write-Output 'TermLink production acceptance stack is running.'
-Write-Output 'API: https://api.termlink.localhost:9443'
-Write-Output 'OIDC: https://id.termlink.localhost:9443/realms/termlink'
+Write-Output 'API: https://api.127.0.0.1.sslip.io:9443'
+Write-Output 'Public API/OIDC: https://termlink.kget.cc:8910'
 Write-Output "CA certificate: $($paths.RootCa)"

@@ -212,6 +212,64 @@ func TestNewExplicitInputAppliesDefaultsAndValidates(t *testing.T) {
 	if c.LogLevel != "info" || c.ListenAddr != ":8080" {
 		t.Fatalf("defaults not applied: %#v", c)
 	}
+	if c.WindowsOIDCClientID != "termlink-windows" ||
+		c.WindowsOIDCRedirectURI != "http://127.0.0.1:43971/oauth2/callback" {
+		t.Fatalf("Windows OIDC defaults not applied: %#v", c)
+	}
+	if c.WebOIDCClientID != "termlink-web" ||
+		c.WebOIDCRedirectURI != "https://termlink.example.test/auth/callback" {
+		t.Fatalf("Web OIDC defaults not applied: %#v", c)
+	}
+}
+
+func TestWebOIDCRedirectMustUsePublicHTTPSOrigin(t *testing.T) {
+	base := Input{
+		PublicURL:        "https://termlink.example.test",
+		OIDCIssuer:       "https://issuer.example.test",
+		OIDCClientID:     "client",
+		OIDCClientSecret: "oidc",
+		DatabaseURL:      "postgres",
+		RedisURL:         "redis",
+		TokenSigningKey:  "01234567890123456789012345678901",
+	}
+	for _, redirect := range []string{
+		"http://termlink.example.test/auth/callback",
+		"https://other.example.test/auth/callback",
+		"https://termlink.example.test/wrong",
+		"https://termlink.example.test/auth/callback?code=leak",
+	} {
+		input := base
+		input.WebOIDCRedirectURI = redirect
+		if _, err := New(input); err == nil || !errors.Is(err, ErrInvalid) ||
+			!strings.Contains(err.Error(), "TERMLINK_WEB_OIDC_REDIRECT_URI") {
+			t.Fatalf("New(WebOIDCRedirectURI=%q) error = %v, want redirect error", redirect, err)
+		}
+	}
+}
+
+func TestWindowsOIDCRedirectRequiresFixedLoopbackCallback(t *testing.T) {
+	base := Input{
+		PublicURL:        "https://termlink.example.test",
+		OIDCIssuer:       "https://issuer.example.test",
+		OIDCClientID:     "client",
+		OIDCClientSecret: "oidc",
+		DatabaseURL:      "postgres",
+		RedisURL:         "redis",
+		TokenSigningKey:  "01234567890123456789012345678901",
+	}
+	for _, redirect := range []string{
+		"https://127.0.0.1:43971/oauth2/callback",
+		"http://localhost:43971/oauth2/callback",
+		"http://127.0.0.1:43971/wrong",
+		"http://127.0.0.1/oauth2/callback",
+	} {
+		input := base
+		input.WindowsOIDCRedirectURI = redirect
+		if _, err := New(input); err == nil || !errors.Is(err, ErrInvalid) ||
+			!strings.Contains(err.Error(), "TERMLINK_WINDOWS_OIDC_REDIRECT_URI") {
+			t.Fatalf("New(WindowsOIDCRedirectURI=%q) error = %v, want redirect error", redirect, err)
+		}
+	}
 }
 
 func TestMetricsListenerIsExplicitAndSeparate(t *testing.T) {
