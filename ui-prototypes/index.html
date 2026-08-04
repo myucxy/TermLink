@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark light">
     <title>TermLink Product UI</title>
-    <link rel="stylesheet" href="styles.css?v=7">
+    <link rel="stylesheet" href="styles.css?v=8">
   </head>
   <body>
     <svg class="svg-defs" aria-hidden="true">
@@ -81,6 +81,10 @@
         <rect x="3" y="5" width="18" height="14" rx="2" />
         <path d="M3 10h18M7 15h3" />
       </symbol>
+      <symbol id="i-mail" viewBox="0 0 24 24">
+        <rect x="3" y="5" width="18" height="14" rx="2" />
+        <path d="m4 7 8 6 8-6" />
+      </symbol>
     </svg>
 
     <header class="review-header">
@@ -103,14 +107,24 @@
           Server Console
         </button>
       </nav>
-      <button
-        class="theme-toggle"
-        type="button"
-        aria-label="切换到明亮主题"
-        aria-pressed="false"
-      >
-        明亮主题
-      </button>
+      <div class="review-actions">
+        <button
+          class="language-toggle"
+          type="button"
+          aria-label="Switch to English"
+          aria-pressed="false"
+        >
+          EN
+        </button>
+        <button
+          class="theme-toggle"
+          type="button"
+          aria-label="切换到明亮主题"
+          aria-pressed="false"
+        >
+          明亮主题
+        </button>
+      </div>
     </header>
 
     <main class="review-main">
@@ -125,37 +139,51 @@
             <button
               class="screen-link is-active"
               type="button"
+              data-screen-target="android-account"
+            >
+              <span>01</span>账号与登录
+            </button>
+            <button
+              class="screen-link"
+              type="button"
               data-screen-target="android-devices"
             >
-              <span>01</span>设备首页
+              <span>02</span>设备首页
             </button>
             <button
               class="screen-link"
               type="button"
               data-screen-target="android-terminal"
             >
-              <span>02</span>实时终端
+              <span>03</span>实时终端
             </button>
             <button
               class="screen-link"
               type="button"
               data-screen-target="android-replay"
             >
-              <span>03</span>历史回放
+              <span>04</span>历史回放
             </button>
             <button
               class="screen-link"
               type="button"
               data-screen-target="android-security"
             >
-              <span>04</span>可信设备
+              <span>05</span>可信设备
             </button>
             <button
               class="screen-link"
               type="button"
               data-screen-target="android-membership"
             >
-              <span>05</span>会员与配额
+              <span>06</span>会员与配额
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="android-settings"
+            >
+              <span>07</span>设置与安全
             </button>
           </div>
           <div class="layout-spec">
@@ -172,7 +200,57 @@
             </div>
 
             <section
-              class="mock-screen is-active"
+              class="mock-screen auth-mobile-screen is-active"
+              data-screen="android-account"
+              aria-label="Android 账号与登录"
+            >
+              <header class="mobile-auth-hero">
+                <div class="mobile-auth-brand">
+                  <span class="brand-mark small">T</span>
+                  <span><strong>TermLink</strong><small>Remote terminal, under your control</small></span>
+                </div>
+                <div class="mobile-auth-intro">
+                  <p class="overline">安全连接你的设备</p>
+                  <h2>随时回到<br>你的终端</h2>
+                  <p>登录后继续设备批准，账号验证不会自动授予任何 PC 的访问权。</p>
+                </div>
+              </header>
+              <div class="auth-server-strip">
+                <span class="auth-server-icon"><svg><use href="#i-shield" /></svg></span>
+                <div>
+                  <small>已验证的 TermLink Server</small>
+                  <strong>termlink.kget.cc:8910</strong>
+                </div>
+                <span class="auth-server-state"><i></i>TLS 正常</span>
+                <button type="button" data-action="change-server">更改</button>
+              </div>
+              <div class="mobile-auth-workspace">
+                <div class="auth-mode-switch" role="tablist" aria-label="账号操作">
+                  <button id="android-auth-tab-login" class="is-active" type="button" role="tab" aria-selected="true" aria-controls="android-auth-panel-login" tabindex="0" data-auth-tab="login">登录</button>
+                  <button id="android-auth-tab-register" type="button" role="tab" aria-selected="false" aria-controls="android-auth-panel-register" tabindex="-1" data-auth-tab="register">创建账号</button>
+                </div>
+                <form id="android-auth-panel-login" class="mobile-auth-form" role="tabpanel" aria-labelledby="android-auth-tab-login" data-auth-panel="login">
+                  <label>邮箱或用户名<span class="auth-input"><svg><use href="#i-users" /></svg><input type="text" autocomplete="username" value="alex@example.com" required></span></label>
+                  <label>密码<span class="auth-input"><svg><use href="#i-lock" /></svg><input type="password" autocomplete="current-password" value="password-placeholder" required></span></label>
+                  <div class="auth-form-meta"><span>使用统一账号密码</span><button class="text-action" type="button" data-action="forgot-password">忘记密码？</button></div>
+                  <button class="primary-action mobile-auth-submit" type="submit" data-action="android-login"><span>登录并绑定此设备</span><svg><use href="#i-chevron" /></svg></button>
+                </form>
+                <form id="android-auth-panel-register" class="mobile-auth-form" role="tabpanel" aria-labelledby="android-auth-tab-register" data-auth-panel="register" hidden>
+                  <label>用户名<span class="auth-input"><svg><use href="#i-users" /></svg><input type="text" autocomplete="username" placeholder="2-32 个字符" minlength="2" maxlength="32" required></span></label>
+                  <label>邮箱<span class="auth-input"><svg><use href="#i-mail" /></svg><input type="email" autocomplete="email" placeholder="name@example.com" required></span></label>
+                  <label>密码<span class="auth-input"><svg><use href="#i-lock" /></svg><input type="password" autocomplete="new-password" placeholder="至少 12 个字符" minlength="12" required></span></label>
+                  <label class="auth-check"><input type="checkbox" checked required><span>我已阅读服务条款和隐私政策</span></label>
+                  <button class="primary-action mobile-auth-submit" type="submit" data-action="android-register"><span>创建账号并验证邮箱</span><svg><use href="#i-chevron" /></svg></button>
+                </form>
+              </div>
+              <div class="auth-security-note">
+                <svg><use href="#i-shield" /></svg>
+                <span><strong>安全浏览器与 PKCE</strong><small>提交后在系统安全浏览器完成授权；App 只接收授权结果，不保存密码。</small></span>
+              </div>
+            </section>
+
+            <section
+              class="mock-screen"
               data-screen="android-devices"
               aria-label="Android 设备首页"
             >
@@ -534,7 +612,46 @@
                 </button>
                 <p>实际价格、税费和货币由购买渠道在确认前显示。</p>
               </div>
+              <div class="redeem-entry">
+                <div>
+                  <span class="security-symbol"><svg><use href="#i-card" /></svg></span>
+                  <span><strong>会员兑换码</strong><small>兑换由服务器验证，可在确认前预览方案与有效期。</small></span>
+                </div>
+                <button type="button" data-action="open-redeem">输入兑换码</button>
+              </div>
               <button class="restore-purchase" type="button">恢复购买</button>
+            </section>
+
+            <section
+              class="mock-screen settings-mobile-screen"
+              data-screen="android-settings"
+              aria-label="Android 设置与安全"
+            >
+              <header class="mobile-appbar compact-appbar">
+                <button class="icon-text-button" type="button" data-jump-screen="android-devices">‹</button>
+                <div><p class="overline">TermLink</p><h2>设置与安全</h2></div>
+                <span></span>
+              </header>
+              <div class="mobile-account-row">
+                <span class="avatar-button">AX</span>
+                <span><strong>Alex Chen</strong><small>alex@example.com · Free</small></span>
+                <button type="button" data-action="open-account-portal">管理</button>
+              </div>
+              <div class="mobile-settings-list">
+                <button type="button" data-jump-screen="android-security"><span><strong>可信设备</strong><small>4 台设备 · 密钥状态正常</small></span><svg><use href="#i-chevron" /></svg></button>
+                <button type="button" data-jump-screen="android-membership"><span><strong>会员与兑换码</strong><small>Free · 1/1 PC · 2/3 Live</small></span><svg><use href="#i-chevron" /></svg></button>
+                <label><span><strong>语言</strong><small>跟随系统或手动切换</small></span><select data-locale-select><option value="system">跟随系统</option><option value="zh-CN">简体中文</option><option value="en-US">English</option></select></label>
+                <label><span><strong>主题</strong><small>跟随系统或手动切换</small></span><select><option>跟随系统</option><option>深色</option><option>明亮</option></select></label>
+                <button type="button" data-action="change-server"><span><strong>服务器</strong><small>termlink.kget.cc:8910 · TLS 正常</small></span><svg><use href="#i-chevron" /></svg></button>
+                <button type="button" data-action="account-security"><span><strong>登录与安全</strong><small>密码、MFA、活跃登录</small></span><svg><use href="#i-chevron" /></svg></button>
+              </div>
+              <button class="secondary-wide-action" type="button" data-action="android-signout">退出当前设备</button>
+              <button class="danger-wide-action" type="button" data-action="delete-account">删除账号与云端数据</button>
+              <nav class="mobile-bottom-nav" aria-label="主导航">
+                <button type="button"><svg><use href="#i-device" /></svg><span>设备</span></button>
+                <button type="button"><svg><use href="#i-activity" /></svg><span>活动</span></button>
+                <button class="is-active" type="button"><svg><use href="#i-settings" /></svg><span>设置</span></button>
+              </nav>
             </section>
           </div>
         </div>
@@ -988,6 +1105,16 @@
                   </div>
                   <button type="button">管理账户</button>
                 </header>
+                <div class="web-account-handoff">
+                  <div>
+                    <span class="security-symbol"><svg><use href="#i-lock" /></svg></span>
+                    <span><strong>网页账户中心</strong><small>https://termlink.kget.cc:8910/account · 系统浏览器授权</small></span>
+                  </div>
+                  <div>
+                    <button type="button" data-action="windows-web-auth">重新登录</button>
+                    <button type="button" data-action="windows-web-redeem">兑换会员码</button>
+                  </div>
+                </div>
                 <div class="desktop-plan-banner">
                   <div>
                     <span class="plan-orb">T</span>
@@ -1106,6 +1233,27 @@
               data-screen-target="server-billing"
             >
               <span>05</span>订阅与权益
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="server-identity"
+            >
+              <span>06</span>账号门户
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="server-accounts"
+            >
+              <span>07</span>账号与角色
+            </button>
+            <button
+              class="screen-link"
+              type="button"
+              data-screen-target="server-redemptions"
+            >
+              <span>08</span>兑换码管理
             </button>
           </div>
           <div class="layout-spec">
@@ -1861,6 +2009,150 @@
               </div>
             </div>
           </section>
+
+          <section
+            class="desktop-mock identity-window"
+            data-screen="server-identity"
+            aria-label="TermLink 账号门户"
+          >
+            <header class="identity-titlebar">
+              <div class="review-brand"><span class="brand-mark small">T</span><span><strong>TermLink</strong><small>Account Center</small></span></div>
+              <div><span class="identity-secure-origin"><svg><use href="#i-lock" /></svg>https://termlink.kget.cc:8910</span><button type="button" data-action="language">简体中文 / EN</button></div>
+            </header>
+            <div class="identity-layout">
+              <section class="identity-context">
+                <div class="identity-context-copy">
+                  <p class="overline">Self-hosted identity</p>
+                  <h2>一个账号，安全连接<br>你的每台终端</h2>
+                  <p>Android 与 Windows 都通过系统浏览器完成授权。密码始终留在账号门户，设备访问仍需单独批准。</p>
+                </div>
+                <dl class="identity-trust-list">
+                  <div><span><svg><use href="#i-shield" /></svg></span><dt>身份服务</dt><dd>Keycloak · Healthy</dd></div>
+                  <div><span><svg><use href="#i-users" /></svg></span><dt>注册策略</dt><dd>开放注册 · 邮箱验证</dd></div>
+                  <div><span><svg><use href="#i-lock" /></svg></span><dt>授权协议</dt><dd>Authorization Code + PKCE</dd></div>
+                </dl>
+                <div class="bootstrap-summary">
+                  <span class="security-symbol"><svg><use href="#i-shield" /></svg></span>
+                  <span><strong>首次启动 Docker？</strong><small>admin 临时密码仅在 identity-bootstrap 日志显示一次。</small></span>
+                  <button type="button" data-action="bootstrap-login">查看初始化流程</button>
+                </div>
+              </section>
+              <section class="identity-auth-pane">
+                <div class="identity-form-shell">
+                  <header class="identity-form-heading">
+                    <p class="overline">TermLink Account</p>
+                    <h3>欢迎回来</h3>
+                    <p>继续访问你的设备、会员权益与 Server Console。</p>
+                  </header>
+                  <div class="auth-mode-switch" role="tablist" aria-label="网页账号操作">
+                    <button id="web-auth-tab-login" class="is-active" type="button" role="tab" aria-selected="true" aria-controls="web-auth-panel-login" tabindex="0" data-web-auth-tab="login">登录</button>
+                    <button id="web-auth-tab-register" type="button" role="tab" aria-selected="false" aria-controls="web-auth-panel-register" tabindex="-1" data-web-auth-tab="register">创建账号</button>
+                  </div>
+                  <form id="web-auth-panel-login" class="web-auth-form" role="tabpanel" aria-labelledby="web-auth-tab-login" data-web-auth-panel="login">
+                    <label>邮箱或用户名<span class="auth-input"><svg><use href="#i-users" /></svg><input type="text" autocomplete="username" value="admin" required></span></label>
+                    <label>密码<span class="auth-input"><svg><use href="#i-lock" /></svg><input type="password" autocomplete="current-password" value="temporary-password" required></span></label>
+                    <div class="identity-form-options"><label class="auth-check"><input type="checkbox"><span>保持登录</span></label><button class="text-action" type="button" data-action="forgot-password">忘记密码？</button></div>
+                    <button class="primary-desktop-action identity-submit" type="submit" data-action="web-login"><span>登录</span><svg><use href="#i-chevron" /></svg></button>
+                  </form>
+                  <form id="web-auth-panel-register" class="web-auth-form" role="tabpanel" aria-labelledby="web-auth-tab-register" data-web-auth-panel="register" hidden>
+                    <label>用户名<span class="auth-input"><svg><use href="#i-users" /></svg><input type="text" autocomplete="username" placeholder="2-32 个字符" minlength="2" maxlength="32" required></span></label>
+                    <label>邮箱<span class="auth-input"><svg><use href="#i-mail" /></svg><input type="email" autocomplete="email" placeholder="name@example.com" required></span></label>
+                    <label>密码<span class="auth-input"><svg><use href="#i-lock" /></svg><input type="password" autocomplete="new-password" placeholder="至少 12 个字符" minlength="12" required></span></label>
+                    <label class="auth-check"><input type="checkbox" checked required><span>我同意服务条款与隐私政策</span></label>
+                    <button class="primary-desktop-action identity-submit" type="submit" data-action="web-register"><span>创建账号并验证邮箱</span><svg><use href="#i-chevron" /></svg></button>
+                  </form>
+                  <p class="identity-footnote"><svg><use href="#i-lock" /></svg><span>确认浏览器地址为 <strong>https://termlink.kget.cc:8910</strong>，TermLink 不会通过其他域名索取密码。</span></p>
+                </div>
+              </section>
+            </div>
+          </section>
+
+          <section
+            class="desktop-mock admin-window"
+            data-screen="server-accounts"
+            aria-label="服务端账号与角色"
+          >
+            <nav class="admin-sidebar" aria-label="Server Console 账号导航">
+              <div class="review-brand"><span class="brand-mark small">T</span><span><strong>TermLink</strong><small>Server Console</small></span></div>
+              <div class="environment-select"><span class="presence online"></span><div><small>环境</small><strong>production</strong></div><svg><use href="#i-chevron" /></svg></div>
+              <div class="admin-nav">
+                <button type="button"><svg><use href="#i-activity" /></svg>概览</button>
+                <button type="button"><svg><use href="#i-server" /></svg>连接</button>
+                <button type="button"><svg><use href="#i-box" /></svg>部署</button>
+                <button class="is-active" type="button"><svg><use href="#i-users" /></svg>账号与角色</button>
+                <button type="button"><svg><use href="#i-shield" /></svg>安全审计</button>
+                <button type="button"><svg><use href="#i-card" /></svg>订阅与权益</button>
+                <button type="button"><svg><use href="#i-card" /></svg>兑换码</button>
+              </div>
+              <div class="admin-user"><span>SA</span><div><strong>admin</strong><small>超级管理员</small></div></div>
+            </nav>
+            <div class="admin-main">
+              <header class="admin-topbar">
+                <div><p class="overline">Identity & access</p><h2>账号与角色</h2></div>
+                <div><button type="button" data-action="registration-policy">注册策略</button><button class="primary-desktop-action" type="button" data-action="create-account">新建账号</button></div>
+              </header>
+              <div class="identity-health-strip">
+                <span><i class="presence online"></i><strong>Keycloak 正常</strong><small>Issuer 与回调已验证</small></span>
+                <span><strong>开放注册</strong><small>要求邮箱验证</small></span>
+                <span><strong>6 个角色绑定</strong><small>1 个超级管理员</small></span>
+              </div>
+              <div class="account-toolbar">
+                <label class="admin-search"><svg><use href="#i-search" /></svg><input type="search" placeholder="搜索用户名或邮箱"></label>
+                <select aria-label="角色筛选"><option>全部角色</option><option>超级管理员</option><option>管理员</option><option>用户</option></select>
+                <select aria-label="状态筛选"><option>全部状态</option><option>正常</option><option>待验证</option><option>已禁用</option></select>
+              </div>
+              <div class="account-table">
+                <div class="account-table-head"><span>账号</span><span>角色</span><span>状态</span><span>最近登录</span><span></span></div>
+                <button class="account-table-row" type="button" data-action="account-details"><span><b>admin</b><small>bootstrap administrator</small></span><span>SUPER_ADMIN</span><em>正常</em><time>刚刚</time><svg><use href="#i-more" /></svg></button>
+                <button class="account-table-row" type="button" data-action="account-details"><span><b>Alex Chen</b><small>alex@example.com</small></span><span>USER</span><em>正常</em><time>18 分钟前</time><svg><use href="#i-more" /></svg></button>
+                <button class="account-table-row" type="button" data-action="account-details"><span><b>ops-review</b><small>ops@example.com</small></span><span>AUDITOR</span><em class="warning-text">待验证</em><time>—</time><svg><use href="#i-more" /></svg></button>
+              </div>
+              <div class="security-callout">超级管理员首次登录必须修改临时密码。角色变更、禁用账号和撤销登录都要求重新认证并写入安全审计。</div>
+            </div>
+          </section>
+
+          <section
+            class="desktop-mock admin-window"
+            data-screen="server-redemptions"
+            aria-label="服务端兑换码管理"
+          >
+            <nav class="admin-sidebar" aria-label="Server Console 兑换码导航">
+              <div class="review-brand"><span class="brand-mark small">T</span><span><strong>TermLink</strong><small>Server Console</small></span></div>
+              <div class="environment-select"><span class="presence online"></span><div><small>环境</small><strong>production</strong></div><svg><use href="#i-chevron" /></svg></div>
+              <div class="admin-nav">
+                <button type="button"><svg><use href="#i-activity" /></svg>概览</button>
+                <button type="button"><svg><use href="#i-server" /></svg>连接</button>
+                <button type="button"><svg><use href="#i-box" /></svg>部署</button>
+                <button type="button"><svg><use href="#i-users" /></svg>账号与角色</button>
+                <button type="button"><svg><use href="#i-shield" /></svg>安全审计</button>
+                <button type="button"><svg><use href="#i-card" /></svg>订阅与权益</button>
+                <button class="is-active" type="button"><svg><use href="#i-card" /></svg>兑换码</button>
+              </div>
+              <div class="admin-user"><span>SA</span><div><strong>admin</strong><small>超级管理员</small></div></div>
+            </nav>
+            <div class="admin-main">
+              <header class="admin-topbar">
+                <div><p class="overline">Redemption codes</p><h2>会员兑换码</h2></div>
+                <div><button type="button" data-action="export-redemptions">导出一次性 CSV</button><button class="primary-desktop-action" type="button" data-action="new-redemption-batch">新建批次</button></div>
+              </header>
+              <div class="stat-line redemption-stats">
+                <div><small>可兑换</small><strong>184</strong><span>3 个启用批次</span></div>
+                <div><small>已兑换</small><strong>316</strong><span>本月 42 个</span></div>
+                <div><small>异常尝试</small><strong>2</strong><span>速率限制已生效</span></div>
+              </div>
+              <div class="account-toolbar">
+                <label class="admin-search"><svg><use href="#i-search" /></svg><input type="search" placeholder="搜索批次、前缀或渠道"></label>
+                <select aria-label="兑换码状态"><option>全部状态</option><option>启用</option><option>已停用</option><option>已过期</option></select>
+              </div>
+              <div class="redemption-table">
+                <div class="redemption-table-head"><span>批次</span><span>权益</span><span>使用情况</span><span>有效期</span><span>状态</span><span></span></div>
+                <button class="redemption-table-row" type="button" data-action="redemption-details"><span><b>Launch 2026</b><small>TL-A7K9-… · app-launch</small></span><span>Pro · 30 天</span><span>116 / 300</span><time>2026-09-30</time><em>启用</em><svg><use href="#i-more" /></svg></button>
+                <button class="redemption-table-row" type="button" data-action="redemption-details"><span><b>Partner August</b><small>TL-P3MX-… · partner</small></span><span>Pro · 90 天</span><span>200 / 200</span><time>2026-08-31</time><em class="warning-text">已用完</em><svg><use href="#i-more" /></svg></button>
+                <button class="redemption-table-row" type="button" data-action="redemption-details"><span><b>Internal QA</b><small>TL-QA82-… · internal</small></span><span>Pro · 7 天</span><span>0 / 20</span><time>2026-08-15</time><em>启用</em><svg><use href="#i-more" /></svg></button>
+              </div>
+              <div class="security-callout">完整兑换码只在创建后导出一次。服务端仅保存 HMAC/Hash；日志、列表和审计只显示批次与截断前缀。</div>
+            </div>
+          </section>
         </div>
 
         <aside class="design-notes" aria-label="Server Console 布局说明">
@@ -1970,6 +2262,6 @@
       <div class="drawer-content" id="drawer-content"></div>
     </aside>
 
-    <script src="app.js?v=6"></script>
+    <script src="app.js?v=9"></script>
   </body>
 </html>

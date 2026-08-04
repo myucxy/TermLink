@@ -1,9 +1,9 @@
 # TermLink 多端 UI 布局设计稿
 
-文档版本：1.1
+文档版本：1.2
 状态：生产级交互原型；生产 API Adapter 待各阶段后端实现
-更新日期：2026-08-03
-覆盖：Android、Windows Agent、Docker Server Console、会员与配额
+更新日期：2026-08-04
+覆盖：Android、Windows Agent、Docker Server Console、账号身份、双语、会员与兑换码
 
 ## 1. 设计稿入口
 
@@ -20,12 +20,13 @@ cd ui-prototypes
 python -m http.server 4173
 ```
 
-打开 `http://127.0.0.1:4173/`，顶部可切换 Android、Windows Agent、Server Console 和明暗主题；左侧切换各服务页面。
+打开 `http://127.0.0.1:4173/`，顶部可切换 Android、Windows Agent、Server Console、简体中文/English 和明暗主题；左侧切换各端页面。
 
-当前原型已完成 UI 层生产化：15 个页面具有稳定 Hash 路由与恢复、明暗主题持久化、
+当前原型已完成 UI 层生产化：20 个页面具有稳定 Hash 路由与恢复、语言/明暗主题持久化、
 统一命令面板、确认弹层、详情抽屉、Toast、筛选/搜索、设置子页、回放控制、控制租约、
-可信设备、远程紧急停止、部署操作和版本化 Catalog 管理交互。所有按钮均有明确行为，
-高风险操作必须二次确认，320px 宽度没有页面级横向溢出。
+可信设备、远程紧急停止、账号注册登录、邮箱验证、首次管理员强制改密、角色管理、会员
+兑换码、部署操作和版本化 Catalog 管理交互。所有按钮均有明确行为，高风险操作必须二次
+确认，320px 宽度没有页面级横向溢出。
 
 “生产级交互原型”只表示 UI 信息架构、状态、交互、安全文案、响应式和无障碍契约已经
 可作为正式客户端实现基线。账号、E2EE、设备授权、Session Host、Relay、计费验证、
@@ -75,6 +76,15 @@ Level 4  Critical：撤销、终止、停止所有远程访问
 ```
 
 列表默认使用留白和分隔线，不给每一行增加独立 Card。只有需要表达边界的状态汇总、购买方案或确认区域使用封闭 Surface。
+
+### 3.4 语言与本地化
+
+- 支持 `跟随系统`、`简体中文` 和 `English`，首次启动默认跟随系统；
+- Android 设置页和评审页顶部均提供语言入口，Server 账号门户也可直接切换；
+- 静态页面、动态 Dialog/Drawer、Toast、筛选项、占位文字和 Accessible Name 使用同一词典；
+- 语言切换不清空当前端、页面、表单模式、主题和会话筛选状态；
+- 服务端返回错误码，客户端按本地词典显示，不依赖服务端返回可直接展示的中文或英文；
+- 日期、时间、数字、货币和复数使用目标语言区域格式，产品名、协议名和 ID 不翻译。
 
 ## 4. 会员与配额规则
 
@@ -132,7 +142,25 @@ stateDiagram-v2
 
 基准画板为 390 × 844 dp；320dp 小屏保持单栏，600dp+ 平板进入双栏。
 
-### 5.1 设备首页
+### 5.1 账号与登录
+
+```text
+Brand + welcome context
+Verified Server：公开 HTTPS Origin / TLS / 更改服务器
+Segmented mode：登录 / 创建账号
+Credential fields：用户名或邮箱 / 密码 / 邮箱验证
+Primary action：登录并绑定设备 / 创建账号并验证邮箱
+Security note：系统安全浏览器 + Authorization Code + PKCE
+```
+
+- 客户端公开地址固定展示 `https://termlink.kget.cc:8910`，不向用户暴露 Lucky 上游地址；
+- 提交账号动作后转入系统安全浏览器，App 只接收并校验授权结果，不持久化账号密码；
+- 注册必须覆盖服务条款确认、邮箱验证、验证邮件重发和过期处理；
+- 找回密码对账号存在与否返回相同提示，链接 30 分钟内有效且只能使用一次；
+- 登录成功后设备先进入 `PENDING`，同账号登录不自动获得任何 PC 访问权；
+- 登录、注册与安全说明采用单一纵向节奏，注册字段增加时允许页面自然滚动。
+
+### 5.2 设备首页
 
 ```text
 System status
@@ -152,7 +180,7 @@ Bottom Navigation：设备 / 活动 / 设置
 - 搜索按钮打开统一命令面板，可切 PC、Session 或设置；
 - 设备状态同时显示 Presence、延迟和最近在线时间。
 
-### 5.2 实时 Terminal
+### 5.3 实时 Terminal
 
 ```text
 Top App Bar：返回 / Session + PC / 更多
@@ -172,7 +200,7 @@ Control Bar：申请控制 / 释放控制
 
 键盘弹出后隐藏非必要标题元数据，将可用高度用于 Terminal，并以 100～200ms 去抖同步 Resize。
 
-### 5.3 历史回放
+### 5.4 历史回放
 
 - 顶部始终显示 `Replay` 和 Exit Code；
 - Terminal 与实时页视觉一致，但没有输入按钮；
@@ -181,7 +209,7 @@ Control Bar：申请控制 / 释放控制
 - 搜索仅处理手机端已解密数据；
 - 拖动后从最近 Snapshot 恢复。
 
-### 5.4 可信设备
+### 5.5 可信设备
 
 - 当前设备独立分组并显示 `MANAGER`；
 - 其他 PC/Android 显示类型、最近活动、授权 PC 和权限；
@@ -189,7 +217,7 @@ Control Bar：申请控制 / 释放控制
 - 批准新设备使用二维码/短码；
 - 撤销弹窗必须显示会导致哪些连接断开。
 
-### 5.5 会员与配额
+### 5.6 会员与配额
 
 页面顺序：
 
@@ -197,11 +225,20 @@ Control Bar：申请控制 / 释放控制
 2. PC 和实时 Session 实际用量；
 3. 服务端返回的可购买套餐及其权益；
 4. “查看月付价格并订阅”；
-5. 恢复购买。
+5. 输入会员兑换码；
+6. 恢复购买。
 
 升级弹层不使用虚假倒计时、默认勾选附加项或隐藏取消入口。价格、税费和续费条款由购买渠道在最终确认前展示。
 
-### 5.6 Android 付费触发点
+### 5.7 设置与账号安全
+
+- 集中提供账号中心、可信设备、会员与兑换码、语言、主题和服务器设置；
+- 登录与安全覆盖修改密码、MFA、活跃登录和撤销其他登录；
+- “退出当前设备”仅清理当前登录，不删除账号或其他设备；
+- 删除账号需要重新认证、输入确认词并进入 7 天冷静期；
+- 冷静期结束后删除账号、设备授权和云端密文，合规审计只保留不可逆元数据。
+
+### 5.8 Android 付费触发点
 
 | 场景 | UI |
 | --- | --- |
@@ -259,11 +296,45 @@ Tab：常规、Terminal Profile、历史、网络、高级。
 - 明确说明升级只扩展远程能力，不影响 E2EE；
 - 明确说明会员过期不会终止本地 Shell。
 
+账号注册、改密、MFA 和兑换码不在 Windows 本地窗口重复实现。Agent 使用系统浏览器打开公开
+账号中心，显示“等待浏览器授权、已返回、已取消、已过期、服务器不匹配”状态，并用
+Authorization Code + PKCE 将结果交回当前 Agent。重新登录不覆盖或导出既有设备私钥。
+
 ## 7. Docker Server Console 布局
 
 Server Console 是自托管运维与订阅管理 UI，不是终端内容后台。
 
-### 7.1 运行概览
+### 7.1 账号门户
+
+账号门户采用左侧身份/信任上下文和右侧独立认证工作区：
+
+- 登录、注册、邮箱验证、找回密码、MFA 和活跃登录；
+- Android/Windows 系统浏览器授权回调和 PKCE 校验；
+- 公开 Origin、Issuer、注册策略和身份服务健康状态；
+- Docker 首次启动管理员初始化与强制改密说明。
+
+`identity-bootstrap` 首次启动创建 `admin` 超级管理员和 24 位随机临时密码。密码只在首次
+启动日志显示一次，普通重启不重放；建议 24 小时过期，首次登录不能跳过改密。改密后撤销
+临时会话并引导配置 MFA/恢复码。任何日志都不得输出改密后的密码、Token 或其他 Secret。
+
+### 7.2 账号与角色
+
+- 管理开放注册/仅邀请/关闭注册、邮箱验证、默认角色和 MFA 策略；
+- 账号列表支持搜索、角色/状态筛选、邀请、禁用、恢复和撤销登录；
+- 角色至少包含 `SUPER_ADMIN`、`ADMIN`、`AUDITOR` 和 `USER`；
+- 唯一 `SUPER_ADMIN` 不允许降级、禁用或删除，必须先验证另一个超级管理员；
+- 角色变更、禁用、登录撤销和密码重置均需重新认证并写入安全审计。
+
+### 7.3 兑换码管理
+
+- 按批次配置名称、套餐、权益时长、数量、兑换截止日期和渠道标识；
+- 完整兑换码只在创建成功后显示和导出一次，服务端仅保存 HMAC/Hash；
+- 列表与日志只显示批次、截断前缀、使用数量、到期日和状态；
+- 兑换必须事务化、幂等并同时受账号、设备和网络速率限制；
+- 确认前向 Android/网页展示套餐、权益时长和预计到期日；
+- 停用只影响未兑换码，不静默撤销已生成的 Entitlement。
+
+### 7.4 运行概览
 
 回答四个问题：
 
@@ -274,22 +345,22 @@ Server Console 是自托管运维与订阅管理 UI，不是终端内容后台�
 
 流量图只显示密文字节数，不允许下钻 Payload。
 
-### 7.2 连接路由
+### 7.5 连接路由
 
 表格字段：Connection ID、角色、Session Route 数、区域/延迟、密文吞吐、状态。Device/Session ID 仅显示截断值；高延迟和慢消费者使用文字状态。
 
-### 7.3 Docker 部署
+### 7.6 Docker 部署
 
 - 当前版本、Digest、架构和总体健康；
 - Compose 容器列表、内存与 CPU；
 - PostgreSQL PITR、对象存储生命周期、恢复演练；
 - 非 root、只读 RootFS、Secret、TLS、签名、SBOM、Healthcheck、固定 Digest 检查。
 
-### 7.4 安全审计
+### 7.7 安全审计
 
 审计时间线按 Login/Device、Grant、Lease、Delete 分类。允许显示 Trace ID、不可逆 Hash、动作和结果；禁止显示命令、Terminal 正文、Token、完整 IP、公钥和 Ciphertext。
 
-### 7.5 订阅与权益
+### 7.8 订阅与权益
 
 页面分为：
 
@@ -329,7 +400,7 @@ Entitlement {
   effective_at
   expires_at
   grace_until
-  source: DEFAULT | GOOGLE_PLAY | WEB
+  source: DEFAULT | GOOGLE_PLAY | WEB | REDEMPTION_CODE
   provider_reference_hash
   version
 }
@@ -346,6 +417,14 @@ Entitlement {
 | `POST /v1/billing/webhooks/{provider}` | 接收签名 Webhook |
 | `POST /v1/billing/restore` | 重新同步购买状态 |
 | `POST /v1/account/quota-selection` | 降级时选择保留 PC/Live Session |
+| `GET /v1/account/security` | 返回邮箱验证、MFA 和活跃登录摘要，不返回 Secret |
+| `POST /v1/account/sessions/revoke` | 撤销指定或其他登录会话 |
+| `POST /v1/billing/redemptions/preview` | 校验兑换码并返回套餐、时长和预计到期，不立即兑换 |
+| `POST /v1/billing/redemptions/redeem` | 事务化、幂等兑换并签发 Entitlement |
+| `GET /v1/admin/accounts` | 搜索和筛选账号、角色与状态 |
+| `PUT /v1/admin/registration-policy` | 更新注册、邮箱验证和 MFA 策略 |
+| `POST /v1/admin/redemption-batches` | 创建兑换码批次并一次性返回明文导出流 |
+| `POST /v1/admin/redemption-batches/{id}/disable` | 停用批次中尚未兑换的码 |
 | `POST /v1/admin/billing/plans` | 新建套餐草稿 |
 | `PUT /v1/admin/billing/plans/{id}` | 配置名称、周期、额度、渠道映射和上下架状态 |
 | `POST /v1/admin/billing/catalog/publish` | 校验并发布套餐目录新版本 |
@@ -390,14 +469,20 @@ Windows 主窗口建议最小 900 × 620px；Server Console 建议最小 1024 ×
 6. 会员过期 UI 不暗示会杀掉本地 Shell 或删除历史。
 7. Server Console 任何页面都不展示 Terminal 正文或完整支付凭据。
 8. 危险动作、付费动作和普通导航具有不同视觉优先级。
+9. 简体中文与 English 下 20 个页面、动态弹层、Toast 和表单 Accessible Name 均无混合语言遗漏。
+10. Android 与 Server 登录/注册模式均可切换，注册页可滚动但无横向溢出。
+11. `admin` 首次登录必须完成改密；临时密码普通重启不再展示。
+12. 完整兑换码只在新批次创建后显示/导出一次，旧批次不能恢复明文。
 
-2026-08-03 浏览器复核结果：
+2026-08-04 浏览器复核结果：
 
-- 15/15 页面路由与刷新恢复通过，内嵌 Server 导航不会污染页面容器状态；
+- 20/20 页面路由与刷新恢复通过，内嵌 Server 导航不会污染页面容器状态；
 - 页面按钮显式绑定覆盖 100%，无空名称按钮、重复 ID、无标签表单或无标题 Dialog；
 - Android 正文不低于 12px，Windows/Server 高密度元数据不低于 11px；
-- 15 个页面可见交互目标均不低于 28px，Android/桌面按钮统一至少 32px；
+- 20 个页面可见交互目标均不低于 28px，Android/桌面按钮统一至少 32px；
 - 320px 视口文档与活动页面横向溢出均为 0；
+- Android/Server 登录与注册支持回车提交、浏览器原生必填校验和方向键切换模式；
+- Android 授权/注册/邮箱验证、Server 注册/找回密码/初始化/强制改密英文动态弹层无中文残留；
 - 命令面板支持 `Ctrl/Cmd+K`、搜索、方向键、Enter 和 Escape；
 - 明暗主题刷新后恢复，控制租约、回放速度/时间轴、设备权限、远程停止、设置、备份和
   Catalog 发布确认均通过；
