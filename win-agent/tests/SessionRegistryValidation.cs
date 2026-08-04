@@ -40,6 +40,7 @@ namespace TermLink.Agent
                 var bufferRoot = Path.GetFullPath(args[2]);
                 Directory.CreateDirectory(bufferRoot);
                 ValidateActualAgentEntry(agentExecutable, Path.Combine(bufferRoot, "external-entry"));
+                ValidateRemoteResizeDispatch();
                 ValidateStopFailurePaths(Path.Combine(bufferRoot, "failure-paths"));
                 ValidateRestartFailurePath(Path.Combine(bufferRoot, "restart-failure"));
                 var controlPipe = "termlink-registry-control-" + Guid.NewGuid().ToString("N");
@@ -361,6 +362,23 @@ namespace TermLink.Agent
                 "Registry Dispose did not retry every retiring worker during best-effort cleanup.");
         }
 
+        private static void ValidateRemoteResizeDispatch()
+        {
+            var factory = new FakeManagedSessionFactory();
+            using (var registry = new SessionRegistry(factory, 20))
+            {
+                var sessionId = Guid.NewGuid();
+                string error;
+                Require(registry.TryRegister(CreateFakeRegistration(sessionId), out error),
+                    "Remote resize fixture registration failed: " + error);
+                Require(registry.TrySendResize(sessionId, 132, 43),
+                    "Registry did not route the remote resize request.");
+                var session = factory.Get(sessionId);
+                Require(session.ResizeColumns == 132 && session.ResizeRows == 43,
+                    "Registry changed the requested remote terminal size.");
+            }
+        }
+
         private static void ValidateRestartFailurePath(string bufferRoot)
         {
             Directory.CreateDirectory(bufferRoot);
@@ -570,7 +588,7 @@ namespace TermLink.Agent
         }
     }
 
-    internal sealed class FakeManagedSession : IRegistryManagedSession
+    internal sealed class FakeManagedSession : IRegistryManagedSession, IRemoteResizableSession
     {
         private readonly Action<IRegistryManagedSession> completion;
         private int waitCalls;
@@ -589,6 +607,8 @@ namespace TermLink.Agent
         public Guid SessionId { get; private set; }
         public int WaitsBeforeSuccess { get; private set; }
         public int WaitCalls { get { return Volatile.Read(ref waitCalls); } }
+        public short ResizeColumns { get; private set; }
+        public short ResizeRows { get; private set; }
 
         public void Start()
         {
@@ -610,6 +630,14 @@ namespace TermLink.Agent
 
         public void BeginStop()
         {
+        }
+
+        public bool TrySendResize(short columns, short rows)
+        {
+            if (columns < 1 || rows < 1) return false;
+            ResizeColumns = columns;
+            ResizeRows = rows;
+            return true;
         }
 
         public bool WaitForStop()

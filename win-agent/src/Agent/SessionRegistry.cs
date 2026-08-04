@@ -42,6 +42,11 @@ namespace TermLink.Agent
         bool TrySendRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes);
     }
 
+    internal interface IRemoteResizableSession
+    {
+        bool TrySendResize(short columns, short rows);
+    }
+
     // Kept separate from IRegistryManagedSession so existing registry test
     // doubles do not need to implement the production replay surface.
     internal interface IBufferedRegistryManagedSession
@@ -244,6 +249,18 @@ namespace TermLink.Agent
             return controllable != null && controllable.TrySendRemoteInput(inputId, expectedLocalInputEpoch, bytes);
         }
 
+        public bool TrySendResize(Guid sessionId, short columns, short rows)
+        {
+            IRemoteResizableSession resizable;
+            lock (sync)
+            {
+                IRegistryManagedSession managed;
+                if (!remoteAccessEnabled || !sessions.TryGetValue(sessionId, out managed)) return false;
+                resizable = managed as IRemoteResizableSession;
+            }
+            return resizable != null && resizable.TrySendResize(columns, rows);
+        }
+
         internal bool TryReadBufferedEvents(
             Guid sessionId,
             ulong resumeFromSequence,
@@ -426,7 +443,7 @@ namespace TermLink.Agent
         }
     }
 
-    internal sealed class ManagedSession : IRegistryManagedSession, IRemoteControllableSession, IBufferedRegistryManagedSession
+    internal sealed class ManagedSession : IRegistryManagedSession, IRemoteControllableSession, IRemoteResizableSession, IBufferedRegistryManagedSession
     {
         private readonly SessionAgent agent;
         private readonly ManagedShellType shellType;
@@ -525,6 +542,11 @@ namespace TermLink.Agent
         public bool TrySendRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
         {
             return agent.TrySendRemoteInput(inputId, expectedLocalInputEpoch, bytes);
+        }
+
+        public bool TrySendResize(short columns, short rows)
+        {
+            return agent.TrySendResize(columns, rows);
         }
 
         public IList<LocalFrame> ReadBufferedEvents(

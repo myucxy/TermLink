@@ -562,7 +562,16 @@ namespace TermLink.Agent
         {
             if (!GuidFromBytes(envelope.RecipientDeviceId.Span).Equals(credentials.DeviceId)) throw new InvalidDataException("Envelope recipient mismatch.");
             var senderId = GuidFromBytes(envelope.SenderDeviceId.Span); var sessionId = GuidFromBytes(envelope.SessionId.Span);
-            var subscriber = await GetSubscriberAsync(sessionId, senderId, token).ConfigureAwait(false);
+            Subscriber subscriber;
+            if (envelope.MessageType == MessageType.Subscribe)
+            {
+                subscriber = await GetSubscriberAsync(sessionId, senderId, token).ConfigureAwait(false);
+            }
+            else if (!subscribers.TryGetValue(sessionId, out var knownSubscribers) ||
+                !knownSubscribers.TryGetValue(senderId, out subscriber))
+            {
+                return;
+            }
             var sessionKey = SessionCrypto.DeriveSessionKey(subscriber.PairwiseKey, sessionId, CryptoDirection.AndroidToPc, envelope.KeyId.ToByteArray());
             byte[] plaintext = null;
             try
@@ -578,6 +587,7 @@ namespace TermLink.Agent
                     {
                         throw new InvalidDataException("Subscribe exchange key does not match the trusted device.");
                     }
+                    subscriber = RememberSubscriber(sessionId, subscriber);
                     await ReplaySubscriberAsync(
                         active,
                         sessionId,
@@ -587,12 +597,24 @@ namespace TermLink.Agent
                         token).ConfigureAwait(false);
                     return;
                 }
+                if (envelope.MessageType == MessageType.ResizeRequest)
+                {
+                    var resize = ResizePayload.Parser.ParseFrom(plaintext);
+                    if (resize.Columns < 1 || resize.Columns > short.MaxValue ||
+                        resize.Rows < 1 || resize.Rows > short.MaxValue ||
+                        resize.LeaseId.Length != 16)
+                    {
+                        return;
+                    }
+                    var resizeLeaseId = GuidFromBytes(resize.LeaseId.Span);
+                    if (!await LeaseMatchesAsync(sessionId, senderId, resizeLeaseId, resize.LeaseVersion, token).ConfigureAwait(false)) return;
+                    registry.TrySendResize(sessionId, (short)resize.Columns, (short)resize.Rows);
+                    return;
+                }
                 if (envelope.MessageType != MessageType.InputEvent) return;
                 var input = InputEventPayload.Parser.ParseFrom(plaintext); var inputId = GuidFromBytes(input.InputId.Span); var leaseId = GuidFromBytes(input.LeaseId.Span);
                 var sequenceKey = sessionId.ToString("N") + senderId.ToString("N"); var previous = inputSequences.GetOrAdd(sequenceKey, 0); if (input.InputSeq <= previous) return;
-                using var leaseResponse = await SendAsync(HttpMethod.Get, "/v1/sessions/" + sessionId.ToString("D") + "/lease", Array.Empty<byte>(), true, null, token).ConfigureAwait(false);
-                if (!leaseResponse.IsSuccessStatusCode) return; var leaseJson = JsonDocument.Parse(await leaseResponse.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false)).RootElement;
-                if (leaseJson.GetProperty("holder_device_id").GetGuid() != senderId || leaseJson.GetProperty("lease_id").GetGuid() != leaseId || leaseJson.GetProperty("version").GetInt64() != input.LeaseVersion) return;
+                if (!await LeaseMatchesAsync(sessionId, senderId, leaseId, input.LeaseVersion, token).ConfigureAwait(false)) return;
                 var inputBytes = input.Input.ToByteArray();
                 try
                 {
@@ -605,6 +627,43 @@ namespace TermLink.Agent
                 CryptographicOperations.ZeroMemory(sessionKey);
                 if (plaintext != null) CryptographicOperations.ZeroMemory(plaintext);
             }
+        }
+
+        private Subscriber RememberSubscriber(Guid sessionId, Subscriber candidate)
+        {
+            var sessionSubscribers = subscribers.GetOrAdd(
+                sessionId,
+                _ => new ConcurrentDictionary<Guid, Subscriber>());
+            var retained = sessionSubscribers.GetOrAdd(candidate.DeviceId, candidate);
+            if (!ReferenceEquals(retained, candidate))
+            {
+                if (candidate.ExchangePublicKey != null) CryptographicOperations.ZeroMemory(candidate.ExchangePublicKey);
+                if (candidate.PairwiseKey != null) CryptographicOperations.ZeroMemory(candidate.PairwiseKey);
+            }
+            return retained;
+        }
+
+        private async Task<bool> LeaseMatchesAsync(
+            Guid sessionId,
+            Guid senderId,
+            Guid leaseId,
+            long leaseVersion,
+            CancellationToken token)
+        {
+            using var response = await SendAsync(
+                HttpMethod.Get,
+                "/v1/sessions/" + sessionId.ToString("D") + "/lease",
+                Array.Empty<byte>(),
+                true,
+                null,
+                token).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode) return false;
+            using var document = JsonDocument.Parse(
+                await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
+            var lease = document.RootElement;
+            return lease.GetProperty("holder_device_id").GetGuid() == senderId &&
+                lease.GetProperty("lease_id").GetGuid() == leaseId &&
+                lease.GetProperty("version").GetInt64() == leaseVersion;
         }
 
         private async Task<Subscriber> GetSubscriberAsync(Guid sessionId, Guid deviceId, CancellationToken token)

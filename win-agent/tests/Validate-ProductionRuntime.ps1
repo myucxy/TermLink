@@ -63,6 +63,9 @@ try {
     if ($null -ne $runtimeType.GetField('events', [Reflection.BindingFlags]'Instance,NonPublic')) {
         throw 'Production runtime still exposes the lossy DropWrite event channel.'
     }
+    if ($null -eq (Get-InternalMethod $runtimeType 'RememberSubscriber')) {
+        throw 'Production runtime does not retain authenticated Realtime subscribers.'
+    }
 
     # Exercise the DPAPI buffer reader with deterministic retention loss. This
     # proves resume reads are ordered and that an expired cursor is observable
@@ -166,6 +169,9 @@ try {
     $serviceRegistry = $serviceType.GetField('registry', [Reflection.BindingFlags]'Instance,NonPublic').GetValue($service)
     if (-not [Object]::ReferenceEquals($runtimeRegistry, $serviceRegistry)) {
         throw 'Production runtime was not attached to the SessionRegistry owned by the service.'
+    }
+    if ($null -eq (Get-InternalMethod $serviceRegistry.GetType() 'TrySendResize')) {
+        throw 'Production runtime Registry does not expose remote resize dispatch.'
     }
 
     $service.Dispose()

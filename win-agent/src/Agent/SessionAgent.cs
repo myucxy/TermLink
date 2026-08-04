@@ -652,6 +652,30 @@ namespace TermLink.Agent
             }
         }
 
+        public bool TrySendResize(short columns, short rows)
+        {
+            if (columns < 1 || rows < 1) return false;
+            lock (commandSync)
+            {
+                NamedPipeServerStream pipe;
+                lock (statusSync) pipe = connectedPipe;
+                if (pipe == null || !pipe.IsConnected) return false;
+                nextCommandSequence = checked(nextCommandSequence + 1);
+                commandSequenceStore.Save(nextCommandSequence);
+                try
+                {
+                    LocalFrameCodec.Write(pipe, new LocalFrame(
+                        LocalFrameType.ResizeRequest,
+                        options.SessionId,
+                        nextCommandSequence,
+                        LocalPayloadCodec.Resize(columns, rows)));
+                    return true;
+                }
+                catch (IOException) { return false; }
+                catch (ObjectDisposedException) { return false; }
+            }
+        }
+
         private void Authenticate(NamedPipeServerStream pipe)
         {
             var hello = LocalFrameCodec.Read(pipe);
