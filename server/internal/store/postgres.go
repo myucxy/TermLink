@@ -191,7 +191,7 @@ func (s *Postgres) ListDevices(ctx context.Context, userID uuid.UUID) ([]DeviceR
 		return nil, err
 	}
 	defer rows.Close()
-	var result []DeviceRecord
+	result := make([]DeviceRecord, 0)
 	for rows.Next() {
 		var item DeviceRecord
 		if err := rows.Scan(&item.ID, &item.Type, &item.Name, &item.KeyID, &item.SigningPublicKey, &item.ExchangePublicKey, &item.TrustState, &item.ApprovedBy, &item.ApprovedAt, &item.RevokedAt, &item.CreatedAt); err != nil {
@@ -453,7 +453,7 @@ func (s *Postgres) ListPCs(ctx context.Context, userID, deviceID uuid.UUID) ([]P
 		return nil, err
 	}
 	defer rows.Close()
-	var result []PCRecord
+	result := make([]PCRecord, 0)
 	for rows.Next() {
 		var item PCRecord
 		if err := rows.Scan(&item.ID, &item.DeviceID, &item.Name, &item.AgentVersion, &item.KeyEpoch, &item.RemoteRoutingEnabled, &item.LastSeenAt); err != nil {
@@ -494,7 +494,7 @@ func (s *Postgres) ListSessions(ctx context.Context, userID, deviceID, pcID uuid
 		return nil, err
 	}
 	defer rows.Close()
-	var result []SessionRecord
+	result := make([]SessionRecord, 0)
 	for rows.Next() {
 		var i SessionRecord
 		var seq int64
@@ -733,7 +733,7 @@ func (s *Postgres) ListHistory(ctx context.Context, userID, deviceID, sessionID 
 		return nil, err
 	}
 	defer rows.Close()
-	var result []HistoryItem
+	result := make([]HistoryItem, 0)
 	for rows.Next() {
 		var i HistoryItem
 		var start, end, snapshot *int64
@@ -1108,7 +1108,7 @@ func (s *Postgres) PublishedPlans(ctx context.Context) (int64, []Plan, error) {
 		return 0, nil, err
 	}
 	defer rows.Close()
-	var result []Plan
+	result := make([]Plan, 0)
 	for rows.Next() {
 		var i Plan
 		if err := rows.Scan(&i.Key, &i.DisplayName, &i.Description, &i.BillingPeriod, &i.MaxRemotePCs, &i.MaxLiveSessions, &i.FeatureFlags, &i.ChannelProducts, &i.SortOrder); err != nil {
@@ -1191,7 +1191,7 @@ func (s *Postgres) ListAudit(ctx context.Context, userID uuid.UUID, before int64
 		return nil, err
 	}
 	defer rows.Close()
-	var result []AuditRecord
+	result := make([]AuditRecord, 0)
 	for rows.Next() {
 		var item AuditRecord
 		if err := rows.Scan(&item.ID, &item.ActorDeviceID, &item.Action, &item.TargetType, &item.TargetID, &item.Result, &item.TraceID, &item.Metadata, &item.CreatedAt); err != nil {
