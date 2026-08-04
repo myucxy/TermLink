@@ -3,6 +3,7 @@ package dev.termlink.product
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
+import android.view.KeyEvent
 import dev.termlink.billing.BillingCoordinator
 import dev.termlink.billing.BillingServerGateway
 import dev.termlink.billing.PlayBillingAdapter
@@ -21,6 +22,7 @@ import dev.termlink.model.PcSummary
 import dev.termlink.model.SessionState
 import dev.termlink.model.SessionSummary
 import dev.termlink.network.production.AccessTokenProvider
+import dev.termlink.network.production.InputSequenceProvider
 import dev.termlink.network.production.ProductionApiClient
 import dev.termlink.network.production.ProductionRealtimeSessionClient
 import dev.termlink.network.production.ProductionRealtimeSessionConfig
@@ -29,8 +31,8 @@ import dev.termlink.protocol.realtime.v1.GapPayload
 import dev.termlink.protocol.realtime.v1.MessageType
 import dev.termlink.protocol.realtime.v1.OutputChunkPayload
 import dev.termlink.protocol.realtime.v1.ResizePayload
-import dev.termlink.session.InputSubmission
 import dev.termlink.session.RemoteSessionState
+import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.termux.TermuxTerminalEngine
 import java.time.Instant
 import java.net.URI
@@ -44,16 +46,16 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.contentOrNull
@@ -93,6 +95,9 @@ internal class ProductionProductRepository(
     private val historyDownloads = ConcurrentHashMap<UUID, HistoryDownloadRequest>()
     private val liveSessionLock = Any()
     private val tokenRefresh = TokenRefreshCoordinator { requestFreshAccessToken() }
+    private val initialServerUrl = sessionStore.serverUrl ?: PUBLIC_SERVER_URL.also {
+        sessionStore.serverUrl = it
+    }
     private val billing = BillingCoordinator(
         adapter = PlayBillingAdapter(activity, activity),
         gateway = object : BillingServerGateway {
@@ -120,8 +125,8 @@ internal class ProductionProductRepository(
     private val mutableSnapshot = MutableStateFlow(
         ProductSnapshot(
             signedIn = authState?.isAuthorized == true,
-            configured = sessionStore.serverUrl != null,
-            serverUrl = sessionStore.serverUrl,
+            configured = true,
+            serverUrl = initialServerUrl,
         ),
     )
     override val snapshot: StateFlow<ProductSnapshot> = mutableSnapshot.asStateFlow()
@@ -269,6 +274,7 @@ internal class ProductionProductRepository(
     }
 
     override suspend fun requestControl(sessionId: UUID) {
+        freshAccessToken()
         openSession(sessionId)
         liveSessions.getValue(sessionId).client.requestControl()
         appendActivity("Control granted", "Session $sessionId", Severity.SUCCESS)
@@ -276,12 +282,14 @@ internal class ProductionProductRepository(
 
     override suspend fun releaseControl(sessionId: UUID) {
         val live = liveSessions[sessionId] ?: error("Open the session before releasing control")
+        freshAccessToken()
         live.client.releaseControl()
         appendActivity("Control released", "Session $sessionId", Severity.INFO)
     }
 
     override suspend fun openSession(sessionId: UUID) {
         if (liveSessions.containsKey(sessionId)) return
+        closeLiveSessionsExcept(emptySet())
         val product = mutableSnapshot.value
         val summary = product.sessions.firstOrNull { it.id == sessionId }
             ?: error("The selected session is unavailable")
@@ -295,7 +303,9 @@ internal class ProductionProductRepository(
         freshAccessToken()
         val root = sessionStore.serverUrl ?: error("Configure a TermLink server first")
         val stored = identity()
-        val engine = TermuxTerminalEngine()
+        val engine = TermuxTerminalEngine(
+            initialSize = TerminalSize(summary.columns.coerceAtLeast(1), summary.rows.coerceAtLeast(1)),
+        )
         val client = ProductionRealtimeSessionClient(
             engine = engine,
             config = ProductionRealtimeSessionConfig(
@@ -312,6 +322,9 @@ internal class ProductionProductRepository(
             identity = stored.identity,
             parentScope = scope,
             httpClient = http,
+            inputSequenceProvider = ReservedInputSequenceProvider {
+                sessionStore.reserveInputSequenceRange(sessionId)
+            },
         )
         val live = LiveProductSession(engine, client)
         val installed = synchronized(liveSessionLock) {
@@ -332,6 +345,16 @@ internal class ProductionProductRepository(
                 )
             }
         }
+        live.tokenRefreshJob = scope.launch {
+            while (isActive) {
+                delay(LIVE_TOKEN_REFRESH_INTERVAL_MILLIS)
+                runCatching { freshAccessToken() }
+                    .onFailure { error ->
+                        if (isActive) publishFailure(error)
+                        delay(LIVE_TOKEN_REFRESH_RETRY_MILLIS)
+                    }
+            }
+        }
         client.start()
     }
 
@@ -345,13 +368,22 @@ internal class ProductionProductRepository(
     override suspend fun sendPaste(sessionId: UUID, text: String) {
         require(text.isNotEmpty()) { "Paste text is empty" }
         val live = liveSessions[sessionId] ?: error("Open the session before sending input")
-        when (val result = live.client.remoteSession.submitInput(text.encodeToByteArray())) {
-            is InputSubmission.Sent -> Unit
-            is InputSubmission.TransportFailed -> error("Input delivery failed for ${result.inputId}")
-            InputSubmission.RejectedNoLease -> error("Request control before sending input")
-            InputSubmission.RejectedExited -> error("The session has exited")
-            InputSubmission.RejectedEmpty -> error("Paste text is empty")
+        check(live.engine.submitPaste(text)) { "Request control before sending input" }
+    }
+
+    override suspend fun sendTerminalAction(sessionId: UUID, action: TerminalAction) {
+        val live = liveSessions[sessionId] ?: error("Open the session before sending input")
+        val accepted = when (action) {
+            TerminalAction.ESCAPE -> live.engine.submitKeyCode(KeyEvent.KEYCODE_ESCAPE)
+            TerminalAction.TAB -> live.engine.submitKeyCode(KeyEvent.KEYCODE_TAB)
+            TerminalAction.ENTER -> live.engine.submitKeyCode(KeyEvent.KEYCODE_ENTER)
+            TerminalAction.ARROW_LEFT -> live.engine.submitKeyCode(KeyEvent.KEYCODE_DPAD_LEFT)
+            TerminalAction.ARROW_UP -> live.engine.submitKeyCode(KeyEvent.KEYCODE_DPAD_UP)
+            TerminalAction.ARROW_DOWN -> live.engine.submitKeyCode(KeyEvent.KEYCODE_DPAD_DOWN)
+            TerminalAction.ARROW_RIGHT -> live.engine.submitKeyCode(KeyEvent.KEYCODE_DPAD_RIGHT)
+            TerminalAction.CTRL_C -> live.engine.submitCodePoint('c'.code, controlDown = true)
         }
+        check(accepted) { "Request control before sending input" }
     }
 
     override suspend fun replayHistory(entry: HistoryEntry) {
@@ -444,7 +476,7 @@ internal class ProductionProductRepository(
         appendActivity("History replayed", entry.sessionLabel, Severity.SUCCESS)
     }
 
-    private suspend fun refresh() = withApi { api -> refreshWithApi(api) }
+    override suspend fun refresh() = withApi { api -> refreshWithApi(api) }
 
     private suspend fun refreshWithApi(api: ProductionApiClient) {
         val self = ProductResponseParser.self(api.get("/v1/devices/self").jsonObject)
@@ -462,14 +494,25 @@ internal class ProductionProductRepository(
             )
             return
         }
-        val devices = api.get("/v1/devices").jsonObject.items().map { it.jsonObject.toDevice() }
-        val pcs = api.get("/v1/pcs").jsonObject.items().map { it.jsonObject.toPc() }
+        val previous = mutableSnapshot.value
+        val trustedDevices = previous.devices
+            .map { device -> if (device.id == self.id) self else device }
+            .let { devices -> if (devices.any { it.id == self.id }) devices else listOf(self) + devices }
+        mutableSnapshot.value = previous.copy(
+            signedIn = true,
+            configured = true,
+            accountLabel = "Connected account",
+            devices = trustedDevices,
+            lastSyncedAt = Instant.now(),
+        )
+        val devices = ProductResponseParser.itemObjects(api.get("/v1/devices").jsonObject).map { it.toDevice() }
+        val pcs = ProductResponseParser.itemObjects(api.get("/v1/pcs").jsonObject).map { it.toPc() }
         val sessions = pcs.flatMap { pc ->
-            api.get("/v1/pcs/${pc.id}/sessions").jsonObject.items().map { it.jsonObject.toSession() }
+            ProductResponseParser.itemObjects(api.get("/v1/pcs/${pc.id}/sessions").jsonObject).map { it.toSession() }
         }
         val entitlement = api.get("/v1/account/entitlements").jsonObject.toEntitlement()
-        val catalogPlans = api.get("/v1/billing/plans").jsonObject["plans"]?.jsonArray
-            ?.map(JsonElement::jsonObject)?.map { it.toCatalogPlan() }.orEmpty()
+        val catalogPlans = ProductResponseParser.catalogPlanObjects(api.get("/v1/billing/plans").jsonObject)
+            .map { it.toCatalogPlan() }
         val catalog = catalogPlans.firstOrNull { it.key == entitlement.planKey }
         devices.forEach { historyRepository.upsertDevice(it) }
         pcs.forEach { historyRepository.upsertPc(it) }
@@ -485,8 +528,7 @@ internal class ProductionProductRepository(
                 if (error.status == 503) return@flatMap emptyList()
                 throw error
             }
-            response.items().mapNotNull { element ->
-                val item = element.jsonObject
+            ProductResponseParser.itemObjects(response).mapNotNull { item ->
                 if (!item.requiredString("kind").equals("chunk", ignoreCase = true) || item.requiredString("key_id") != expectedKeyId) {
                     return@mapNotNull null
                 }
@@ -592,6 +634,9 @@ internal class ProductionProductRepository(
         liveSessions.keys.filterNot(retained::contains).forEach { sessionId ->
             liveSessions.remove(sessionId)?.close()
         }
+        mutableSnapshot.value = mutableSnapshot.value.copy(
+            sessionStates = mutableSnapshot.value.sessionStates.filterKeys(retained::contains),
+        )
     }
 
     private fun closeLiveSessions() {
@@ -642,15 +687,42 @@ internal class ProductionProductRepository(
         val client: ProductionRealtimeSessionClient,
     ) : AutoCloseable {
         var stateJob: Job? = null
+        var tokenRefreshJob: Job? = null
 
         override fun close() {
             stateJob?.cancel()
             stateJob = null
+            tokenRefreshJob?.cancel()
+            tokenRefreshJob = null
             client.close()
         }
     }
 
-    private fun JsonObject.items(): JsonArray = getValue("items").jsonArray
+    internal class ReservedInputSequenceProvider(
+        private val reserve: () -> LongRange,
+    ) : InputSequenceProvider {
+        private var next = 1L
+        private var endInclusive = 0L
+
+        @Synchronized
+        override fun next(): Long {
+            if (next > endInclusive) {
+                val range = reserve()
+                require(range.first > 0 && range.first <= range.last) { "reserved input sequence range is invalid" }
+                next = range.first
+                endInclusive = range.last
+            }
+            val value = next
+            if (value == endInclusive) {
+                next = 1L
+                endInclusive = 0L
+            } else {
+                next = Math.addExact(value, 1L)
+            }
+            return value
+        }
+    }
+
     private fun JsonObject.requiredString(name: String): String = getValue(name).jsonPrimitive.content
     private fun JsonObject.instant(name: String): Instant = Instant.parse(requiredString(name))
     private fun JsonObject.optionalInstant(name: String): Instant? = get(name)?.jsonPrimitive?.contentOrNull?.let(Instant::parse)
@@ -760,5 +832,11 @@ internal class ProductionProductRepository(
             }
             return bytes
         }
+    }
+
+    private companion object {
+        const val PUBLIC_SERVER_URL = "https://termlink.kget.cc:8910"
+        const val LIVE_TOKEN_REFRESH_INTERVAL_MILLIS = 15_000L
+        const val LIVE_TOKEN_REFRESH_RETRY_MILLIS = 45_000L
     }
 }

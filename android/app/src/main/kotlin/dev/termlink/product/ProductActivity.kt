@@ -32,6 +32,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.Login
+import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Android
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Block
@@ -44,10 +48,10 @@ import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.LaptopWindows
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Logout
-import androidx.compose.material.icons.filled.Login
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PauseCircle
 import androidx.compose.material.icons.filled.PhoneAndroid
@@ -68,10 +72,10 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
-import androidx.compose.material3.Divider
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -90,6 +94,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TooltipDefaults
+import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -126,6 +131,7 @@ import dev.termlink.model.SessionState
 import dev.termlink.model.SessionSummary
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.ArgbColor
+import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalThemeV1
 import dev.termlink.terminal.termux.TermuxTerminalEngine
 import java.time.Instant
@@ -205,6 +211,31 @@ fun ProductApp(repository: ProductRepository) {
         }
     }
 
+    if (!snapshot.signedIn) {
+        Scaffold(
+            snackbarHost = { SnackbarHost(snackbarHostState) },
+            containerColor = productColors.background,
+        ) { innerPadding ->
+            ProductSignInPage(
+                snapshot = snapshot,
+                onSignIn = { runOperation(repository::signIn) },
+                onConfigure = { configureServer = true },
+                modifier = Modifier.padding(innerPadding),
+            )
+        }
+        if (configureServer) {
+            ServerConfigurationDialog(
+                initialValue = snapshot.serverUrl.orEmpty(),
+                onDismiss = { configureServer = false },
+                onConfirm = { value ->
+                    configureServer = false
+                    runOperation { repository.configureServer(value) }
+                },
+            )
+        }
+        return
+    }
+
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val wide = maxWidth >= 700.dp
         Scaffold(
@@ -214,6 +245,7 @@ fun ProductApp(repository: ProductRepository) {
                     snapshot = snapshot,
                     onSettings = { destination = ProductDestination.SETTINGS },
                     onAccount = { destination = ProductDestination.SETTINGS },
+                    onRefresh = { runOperation(repository::refresh) },
                 )
             },
             bottomBar = {
@@ -231,7 +263,7 @@ fun ProductApp(repository: ProductRepository) {
             ) {
                 if (wide) {
                     ProductNavigationRail(destination, onDestinationSelected = { destination = it })
-                    Divider(
+                    VerticalDivider(
                         modifier = Modifier
                             .fillMaxHeight()
                             .width(1.dp),
@@ -263,6 +295,9 @@ fun ProductApp(repository: ProductRepository) {
                     onRequestControl = { runOperation { repository.requestControl(it) } },
                     onReleaseControl = { runOperation { repository.releaseControl(it) } },
                     onPaste = { pasteSessionId = it },
+                    onTerminalAction = { sessionId, action ->
+                        runOperation { repository.sendTerminalAction(sessionId, action) }
+                    },
                     onReplay = { runOperation { repository.replayHistory(it) } },
                 )
             }
@@ -296,6 +331,153 @@ fun ProductApp(repository: ProductRepository) {
                 runOperation { repository.completePairing(challengeId, code, nonce) }
             },
         )
+    }
+}
+
+@Composable
+private fun ProductSignInPage(
+    snapshot: ProductSnapshot,
+    onSignIn: () -> Unit,
+    onConfigure: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 24.dp),
+        verticalArrangement = Arrangement.Top,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 440.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Surface(
+                    modifier = Modifier.size(34.dp),
+                    shape = ProductShape,
+                    color = ProductPrimary,
+                    contentColor = productColors.onPrimary,
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Filled.Terminal,
+                            contentDescription = null,
+                            modifier = Modifier.size(21.dp),
+                        )
+                    }
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                    Text("TermLink", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "Remote terminal, under your control",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(36.dp))
+            Text(
+                "SECURELY CONNECT YOUR DEVICES",
+                color = ProductPositive,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Return to\nyour terminal",
+                fontSize = 38.sp,
+                lineHeight = 40.sp,
+                fontWeight = FontWeight.SemiBold,
+                letterSpacing = (-0.5).sp,
+            )
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "Sign in to register this Android device. Account access never grants PC access until an existing trusted device approves it.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Spacer(Modifier.height(24.dp))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.45f))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Surface(
+                    modifier = Modifier.size(34.dp),
+                    shape = ProductShape,
+                    color = ProductPositive.copy(alpha = 0.14f),
+                    contentColor = ProductPositive,
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(Icons.Filled.Shield, contentDescription = null, modifier = Modifier.size(20.dp))
+                    }
+                }
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("Verified TermLink Server", style = MaterialTheme.typography.labelMedium)
+                    Text(
+                        snapshot.serverUrl ?: "Server unavailable",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                    Text("TLS healthy", style = MaterialTheme.typography.labelSmall, color = ProductPositive)
+                    TextButton(onClick = onConfigure, contentPadding = ButtonDefaults.TextButtonContentPadding) {
+                        Text("Change")
+                    }
+                }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.45f))
+
+            Spacer(Modifier.height(22.dp))
+            Button(
+                onClick = onSignIn,
+                enabled = snapshot.configured,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            ) {
+                Icon(Icons.AutoMirrored.Filled.Login, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Sign in and bind this device", fontWeight = FontWeight.SemiBold)
+            }
+
+            Spacer(Modifier.height(18.dp))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
+            Row(
+                modifier = Modifier.padding(vertical = 14.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.Top,
+            ) {
+                Icon(
+                    Icons.Filled.Shield,
+                    contentDescription = null,
+                    modifier = Modifier.size(20.dp),
+                    tint = ProductPositive,
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text("Secure browser & PKCE", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "Your password is entered only on the verified server page. TermLink receives the authorization result and never stores the password.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -334,6 +516,7 @@ private fun ProductTopBar(
     snapshot: ProductSnapshot,
     onSettings: () -> Unit,
     onAccount: () -> Unit,
+    onRefresh: () -> Unit,
 ) {
     CenterAlignedTopAppBar(
         title = {
@@ -355,12 +538,15 @@ private fun ProductTopBar(
             )
         },
         actions = {
+            IconButton(onClick = onRefresh) {
+                Icon(Icons.Filled.Refresh, contentDescription = "Refresh server data")
+            }
             IconButton(onClick = onSettings) {
                 Icon(Icons.Filled.Settings, contentDescription = "Open settings")
             }
             IconButton(onClick = onAccount) {
                 Icon(
-                    if (snapshot.signedIn) Icons.Filled.CheckCircle else Icons.Filled.Login,
+                    if (snapshot.signedIn) Icons.Filled.CheckCircle else Icons.AutoMirrored.Filled.Login,
                     contentDescription = if (snapshot.signedIn) "Account settings" else "Configure account",
                 )
             }
@@ -441,6 +627,7 @@ private fun ProductContent(
     onRequestControl: (java.util.UUID) -> Unit,
     onReleaseControl: (java.util.UUID) -> Unit,
     onPaste: (java.util.UUID) -> Unit,
+    onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
     onReplay: (HistoryEntry) -> Unit,
 ) {
     Column(
@@ -471,6 +658,7 @@ private fun ProductContent(
                 onRequestControl = onRequestControl,
                 onReleaseControl = onReleaseControl,
                 onPaste = onPaste,
+                onTerminalAction = onTerminalAction,
             )
             ProductDestination.ACTIVITY -> ActivityPage(snapshot = snapshot, onConfigure = onConfigure)
             ProductDestination.HISTORY -> HistoryPage(
@@ -590,7 +778,7 @@ private fun PairingPendingCard(onCompletePairing: () -> Unit) {
                 )
             }
             OutlinedButton(onClick = onCompletePairing) {
-                Icon(Icons.Filled.Login, contentDescription = null, modifier = Modifier.size(18.dp))
+                Icon(Icons.AutoMirrored.Filled.Login, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
                 Text("Complete pairing")
             }
@@ -803,6 +991,7 @@ private fun SessionsPage(
     onRequestControl: (java.util.UUID) -> Unit,
     onReleaseControl: (java.util.UUID) -> Unit,
     onPaste: (java.util.UUID) -> Unit,
+    onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
 ) {
     PageHeader(
         title = "Sessions",
@@ -847,6 +1036,7 @@ private fun SessionsPage(
                 onRequestControl = onRequestControl,
                 onReleaseControl = onReleaseControl,
                 onPaste = onPaste,
+                onTerminalAction = onTerminalAction,
                 remoteState = selectedState,
                 engine = selectedEngine,
                 modifier = Modifier.weight(1f),
@@ -866,6 +1056,7 @@ private fun SessionsPage(
             onRequestControl = onRequestControl,
             onReleaseControl = onReleaseControl,
             onPaste = onPaste,
+            onTerminalAction = onTerminalAction,
             remoteState = selectedState,
             engine = selectedEngine,
             modifier = Modifier.fillMaxWidth(),
@@ -890,7 +1081,7 @@ private fun SessionList(
         Column {
             Text("All sessions", modifier = Modifier.padding(14.dp), style = MaterialTheme.typography.titleSmall)
             sessions.forEachIndexed { index, session ->
-                if (index > 0) Divider(color = productColors.outline.copy(alpha = 0.35f))
+                if (index > 0) HorizontalDivider(color = productColors.outline.copy(alpha = 0.35f))
                 SessionListRow(
                     session = session,
                     selected = session.id == selectedId,
@@ -947,6 +1138,7 @@ private fun SessionDetail(
     onRequestControl: (java.util.UUID) -> Unit,
     onReleaseControl: (java.util.UUID) -> Unit,
     onPaste: (java.util.UUID) -> Unit,
+    onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
     remoteState: RemoteSessionState?,
     engine: TermuxTerminalEngine?,
     modifier: Modifier,
@@ -975,6 +1167,10 @@ private fun SessionDetail(
                 SessionStatePill(session.state)
             }
             TerminalSurface(session = session, engine = engine, remoteState = remoteState)
+            TerminalActionBar(
+                enabled = remoteState is RemoteSessionState.Controlling,
+                onAction = { onTerminalAction(session.id, it) },
+            )
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1013,6 +1209,64 @@ private fun SessionDetail(
 }
 
 @Composable
+private fun TerminalActionBar(
+    enabled: Boolean,
+    onAction: (TerminalAction) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .height(44.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        TerminalTextKey("Esc", TerminalAction.ESCAPE, enabled, onAction)
+        TerminalTextKey("Tab", TerminalAction.TAB, enabled, onAction)
+        TerminalTextKey("Enter", TerminalAction.ENTER, enabled, onAction)
+        TerminalIconKey(Icons.AutoMirrored.Filled.KeyboardArrowLeft, "Left arrow", TerminalAction.ARROW_LEFT, enabled, onAction)
+        TerminalIconKey(Icons.Filled.KeyboardArrowUp, "Up arrow", TerminalAction.ARROW_UP, enabled, onAction)
+        TerminalIconKey(Icons.Filled.KeyboardArrowDown, "Down arrow", TerminalAction.ARROW_DOWN, enabled, onAction)
+        TerminalIconKey(Icons.AutoMirrored.Filled.KeyboardArrowRight, "Right arrow", TerminalAction.ARROW_RIGHT, enabled, onAction)
+        TerminalTextKey("Ctrl+C", TerminalAction.CTRL_C, enabled, onAction)
+    }
+}
+
+@Composable
+private fun TerminalTextKey(
+    label: String,
+    action: TerminalAction,
+    enabled: Boolean,
+    onAction: (TerminalAction) -> Unit,
+) {
+    OutlinedButton(
+        onClick = { onAction(action) },
+        enabled = enabled,
+        modifier = Modifier.height(40.dp),
+        contentPadding = ButtonDefaults.ContentPadding,
+    ) {
+        Text(label, maxLines = 1, style = MaterialTheme.typography.labelMedium)
+    }
+}
+
+@Composable
+private fun TerminalIconKey(
+    icon: ImageVector,
+    description: String,
+    action: TerminalAction,
+    enabled: Boolean,
+    onAction: (TerminalAction) -> Unit,
+) {
+    IconButton(
+        onClick = { onAction(action) },
+        enabled = enabled,
+        modifier = Modifier.size(40.dp),
+    ) {
+        Icon(icon, contentDescription = description)
+    }
+}
+
+@Composable
 private fun SessionStatePill(state: SessionState) {
     val color = when (state) {
         SessionState.RUNNING -> ProductPositive
@@ -1035,17 +1289,17 @@ private fun TerminalSurface(
     engine: TermuxTerminalEngine?,
     remoteState: RemoteSessionState?,
 ) {
-    val placeholder = remember(session.id) {
-        TermuxTerminalEngine().also {
+    val placeholder = remember(session.id, session.columns, session.rows) {
+        TermuxTerminalEngine(
+            initialSize = TerminalSize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1)),
+        ).also {
             it.applyTheme(productTerminalTheme)
             it.setReadOnly(true)
-            it.resize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1))
         }
     }
     val activeEngine = engine ?: placeholder
     SideEffect {
         activeEngine.applyTheme(productTerminalTheme)
-        activeEngine.resize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1))
     }
     DisposableEffect(placeholder) {
         onDispose { placeholder.dispose() }
@@ -1081,8 +1335,8 @@ private fun TerminalSurface(
 private fun terminalStateLabel(state: RemoteSessionState?): String = when (state) {
     is RemoteSessionState.Controlling -> "Controlling"
     is RemoteSessionState.Live -> "Live"
-    is RemoteSessionState.Reconnecting -> "Reconnecting"
-    is RemoteSessionState.ReadOnly -> "Read only"
+    is RemoteSessionState.Reconnecting -> state.reason?.let { "Reconnecting | $it" } ?: "Reconnecting"
+    is RemoteSessionState.ReadOnly -> "Read only | ${state.reason}"
     is RemoteSessionState.HistoryGap -> "History gap"
     is RemoteSessionState.Exited -> "Exited"
     null -> "Connecting"
@@ -1102,7 +1356,7 @@ private fun ActivityPage(snapshot: ProductSnapshot, onConfigure: () -> Unit) {
         )
     } else {
         snapshot.activity.forEachIndexed { index, event ->
-            if (index > 0) Divider(color = productColors.outline.copy(alpha = 0.35f))
+            if (index > 0) HorizontalDivider(color = productColors.outline.copy(alpha = 0.35f))
             ActivityRow(event)
         }
     }
@@ -1353,7 +1607,7 @@ private fun GooglePlayBillingPanel(
                 )
             } else {
                 billing.products.forEachIndexed { index, product ->
-                    if (index > 0) Divider(color = productColors.outline.copy(alpha = 0.35f))
+                    if (index > 0) HorizontalDivider(color = productColors.outline.copy(alpha = 0.35f))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.Top,
@@ -1472,13 +1726,13 @@ private fun SettingsPage(
                 }
                 if (snapshot.signedIn) {
                     OutlinedButton(onClick = onSignOut) {
-                        Icon(Icons.Filled.Logout, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
                         Text("Sign out")
                     }
                 } else {
                     OutlinedButton(onClick = onSignIn) {
-                        Icon(Icons.Filled.Login, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Icon(Icons.AutoMirrored.Filled.Login, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
                         Text("Sign in")
                     }

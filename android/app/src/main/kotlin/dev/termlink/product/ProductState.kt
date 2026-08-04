@@ -50,6 +50,17 @@ data class PairingChallengeState(
 
 enum class Severity { INFO, SUCCESS, WARNING, ERROR }
 
+enum class TerminalAction {
+    ESCAPE,
+    TAB,
+    ENTER,
+    ARROW_LEFT,
+    ARROW_UP,
+    ARROW_DOWN,
+    ARROW_RIGHT,
+    CTRL_C,
+}
+
 data class HistoryEntry(
     val sessionId: UUID,
     val sessionLabel: String,
@@ -90,6 +101,7 @@ data class ProductSnapshot(
 interface ProductRepository : Closeable {
     val snapshot: StateFlow<ProductSnapshot>
 
+    suspend fun refresh()
     suspend fun signIn()
     suspend fun configureServer(url: String)
     suspend fun signOut()
@@ -104,6 +116,7 @@ interface ProductRepository : Closeable {
     fun terminalEngine(sessionId: UUID): TermuxTerminalEngine?
     fun historyEngine(historyObjectId: UUID): TermuxTerminalEngine?
     suspend fun stopSession(sessionId: UUID)
+    suspend fun sendTerminalAction(sessionId: UUID, action: TerminalAction)
     suspend fun sendPaste(sessionId: UUID, text: String)
     suspend fun replayHistory(entry: HistoryEntry)
 }
@@ -116,6 +129,7 @@ class UnavailableProductRepository : ProductRepository {
     private val mutableSnapshot = MutableStateFlow(ProductSnapshot())
     override val snapshot: StateFlow<ProductSnapshot> = mutableSnapshot.asStateFlow()
 
+    override suspend fun refresh() = unavailable()
     override suspend fun signIn() = unavailable()
     override suspend fun configureServer(url: String) = unavailable()
     override suspend fun signOut() = unavailable()
@@ -130,6 +144,7 @@ class UnavailableProductRepository : ProductRepository {
     override fun terminalEngine(sessionId: UUID): TermuxTerminalEngine? = null
     override fun historyEngine(historyObjectId: UUID): TermuxTerminalEngine? = null
     override suspend fun stopSession(sessionId: UUID) = unavailable()
+    override suspend fun sendTerminalAction(sessionId: UUID, action: TerminalAction) = unavailable()
     override suspend fun sendPaste(sessionId: UUID, text: String) = unavailable()
     override suspend fun replayHistory(entry: HistoryEntry) = unavailable()
 

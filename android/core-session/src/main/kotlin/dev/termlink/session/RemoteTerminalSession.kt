@@ -41,6 +41,7 @@ class RemoteTerminalSession(
     )
     private val mutableTitle = MutableStateFlow("")
     private var lastAckedSequence = 0L
+    private var latestTerminalSize: TerminalSize? = null
     private var leaseExpiryJob: Job? = null
     private var leaseRenewalJob: Job? = null
 
@@ -67,7 +68,7 @@ class RemoteTerminalSession(
             engine.sizeEvents
                 .distinctUntilChanged()
                 .debounce(resizeDebounceMillis)
-                .collect(::submitResize)
+                .collect(::observeResize)
         }
     }
 
@@ -111,7 +112,7 @@ class RemoteTerminalSession(
     ) {
         require(leaseId.isNotBlank()) { "leaseId is required" }
         require(expiresAtEpochMillis > clockMillis()) { "control lease is already expired" }
-        mutex.withLock {
+        val terminalSize = mutex.withLock {
             check(mutableState.value !is RemoteSessionState.Exited) { "session has exited" }
             leaseExpiryJob?.cancel()
             leaseRenewalJob?.cancel()
@@ -157,6 +158,10 @@ class RemoteTerminalSession(
                     }
                 }
             }
+            latestTerminalSize
+        }
+        if (terminalSize != null) {
+            sendResize(terminalSize)
         }
     }
 
@@ -270,20 +275,21 @@ class RemoteTerminalSession(
         }
     }
 
-    private suspend fun submitResize(size: TerminalSize) = mutex.withLock {
-        when (mutableState.value) {
-            is RemoteSessionState.Live,
-            is RemoteSessionState.ReadOnly,
-            is RemoteSessionState.Controlling,
-            -> try {
-                outbound.sendResize(size)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (_: Exception) {
-                mutableState.value = RemoteSessionState.Reconnecting(lastAckedSequence, "resize failed")
-                engine.setReadOnly(true)
-            }
-            else -> Unit
+    private suspend fun observeResize(size: TerminalSize) {
+        val shouldSend = mutex.withLock {
+            latestTerminalSize = size
+            mutableState.value is RemoteSessionState.Controlling
+        }
+        if (shouldSend) sendResize(size)
+    }
+
+    private suspend fun sendResize(size: TerminalSize) {
+        try {
+            outbound.sendResize(size)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            markReconnecting("resize failed")
         }
     }
 

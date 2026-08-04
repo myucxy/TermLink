@@ -4,6 +4,12 @@ import java.net.URI
 import java.time.Instant
 import java.util.Base64
 import java.util.UUID
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
@@ -57,7 +63,7 @@ internal object PairingInputParser {
 
     fun parse(challengeId: String, code: String, challengeNonce: String): PairingChallengeInput {
         val id = try {
-            UUID.fromString(challengeId.trim())
+            UUID.fromString(normalizeChallengeId(challengeId))
         } catch (error: IllegalArgumentException) {
             throw IllegalArgumentException("The challenge ID is invalid", error)
         }
@@ -65,6 +71,13 @@ internal object PairingInputParser {
         val normalizedNonce = normalizeNonce(challengeNonce)
         return PairingChallengeInput(id, normalizedCode, normalizedNonce)
     }
+
+    private fun normalizeChallengeId(value: String): String = value.trim().map { character ->
+        when (character) {
+            '\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2212', '\uFF0D' -> '-'
+            else -> character
+        }
+    }.joinToString("")
 
     fun normalizeCode(value: String): String {
         val normalized = value.filterNot(Char::isWhitespace).replace("-", "").uppercase()
@@ -105,6 +118,19 @@ internal object ProductResponseParser {
     fun self(root: kotlinx.serialization.json.JsonObject): dev.termlink.model.DeviceSummary =
         device(root.requiredObject("device"))
 
+    fun catalogPlanObjects(root: JsonObject): List<JsonObject> =
+        nullableObjectArray(root, "plans")
+
+    fun itemObjects(root: JsonObject): List<JsonObject> =
+        nullableObjectArray(root, "items")
+
+    private fun nullableObjectArray(root: JsonObject, name: String): List<JsonObject> =
+        when (val value = root.getValue(name)) {
+            JsonNull -> emptyList()
+            is JsonArray -> value.map(JsonElement::jsonObject)
+            else -> error("$name must be an array")
+        }
+
     private fun kotlinx.serialization.json.JsonObject.requiredString(name: String): String =
         getValue(name).jsonPrimitive.content
 
@@ -113,9 +139,11 @@ internal object ProductResponseParser {
 }
 
 internal class TokenRefreshCoordinator(private val refresh: suspend () -> String) {
-    suspend fun freshAccessToken(): String {
-        val value = refresh()
-        require(value.isNotBlank()) { "OIDC access token is unavailable" }
-        return value
+    private val mutex = Mutex()
+
+    suspend fun freshAccessToken(): String = mutex.withLock {
+        refresh().also { value ->
+            require(value.isNotBlank()) { "OIDC access token is unavailable" }
+        }
     }
 }

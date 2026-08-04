@@ -84,6 +84,16 @@ sealed interface ProductionTransportState {
     data object Closed : ProductionTransportState
 }
 
+fun interface InputSequenceProvider {
+    fun next(): Long
+}
+
+private class InMemoryInputSequenceProvider : InputSequenceProvider {
+    private val sequence = AtomicLong(0)
+
+    override fun next(): Long = sequence.incrementAndGet()
+}
+
 /**
  * E2EE Android session transport. It translates production Envelopes into the
  * renderer-independent [RemoteTerminalSession] contract and owns reconnect,
@@ -98,6 +108,8 @@ class ProductionRealtimeSessionClient(
     allowCleartextForLocalTest: Boolean = false,
     private val reconnectDelaysMillis: List<Long> = listOf(250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000),
     private val inputAcceptanceTimeoutMillis: Long = 5_000,
+    private val inputSequenceProvider: InputSequenceProvider = InMemoryInputSequenceProvider(),
+    private val subscriberRefreshIntervalMillis: Long = 15_000,
     leaseRenewalIntervalMillis: Long = 10_000,
     disposeEngineOnClose: Boolean = true,
 ) : RemoteSessionOutbound, Closeable {
@@ -107,12 +119,12 @@ class ProductionRealtimeSessionClient(
     private val started = AtomicBoolean(false)
     private val sendMutex = Mutex()
     private val materialLock = Any()
-    private val inputSequence = AtomicLong(0)
     private val envelopeSequence = AtomicLong(0)
     private val observedLocalInputEpoch = AtomicLong(0)
     private val pendingInputs = ConcurrentHashMap<UUID, CompletableDeferred<Unit>>()
     private val reconnectMutex = Mutex()
     private var reconnectJob: Job? = null
+    private var subscriberRefreshJob: Job? = null
     private var reconnectAttempt = 0
     private val mutableTransportState = MutableStateFlow<ProductionTransportState>(ProductionTransportState.Connecting)
     private val pcExchangePublicKey = config.pcExchangePublicKey.copyOf()
@@ -151,6 +163,7 @@ class ProductionRealtimeSessionClient(
             "reconnect delays must be non-empty and capped at 30 seconds"
         }
         require(inputAcceptanceTimeoutMillis > 0) { "input acceptance timeout must be positive" }
+        require(subscriberRefreshIntervalMillis > 0) { "subscriber refresh interval must be positive" }
         val session = RemoteTerminalSession(
             engine = engine,
             outbound = this,
@@ -238,7 +251,8 @@ class ProductionRealtimeSessionClient(
             ?: throw ProductionTransportException("control lease is required")
         val pending = CompletableDeferred<Unit>()
         check(pendingInputs.putIfAbsent(input.inputId, pending) == null) { "input ID is already pending" }
-        val inputSeq = inputSequence.incrementAndGet()
+        val inputSeq = inputSequenceProvider.next()
+        require(inputSeq > 0) { "input sequence provider returned a non-positive value" }
         val plaintext = InputEventPayload.newBuilder()
             .setInputId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(input.inputId)))
             .setLeaseId(ByteString.copyFrom(leaseIdBytes(controlling.leaseId)))
@@ -291,6 +305,7 @@ class ProductionRealtimeSessionClient(
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         reconnectJob?.cancel()
+        subscriberRefreshJob?.cancel()
         pendingInputs.values.forEach { it.completeExceptionally(ProductionTransportException("production session closed")) }
         pendingInputs.clear()
         transport.close()
@@ -431,7 +446,6 @@ class ProductionRealtimeSessionClient(
                         (envelope.messageType == MessageType.INPUT_ACCEPTED) == result.accepted,
                     ) { "InputResult type and accepted flag disagree" }
                     val pending = pendingInputs.remove(inputId)
-                        ?: error("InputResult does not match a pending input")
                     try {
                         requireApplied(
                             session.accept(
@@ -443,15 +457,17 @@ class ProductionRealtimeSessionClient(
                                 ),
                             ),
                         )
-                        if (envelope.messageType == MessageType.INPUT_ACCEPTED && result.accepted) {
-                            pending.complete(Unit)
-                        } else {
-                            pending.completeExceptionally(
-                                ProductionTransportException(result.reasonCode.ifBlank { "input rejected" }),
-                            )
+                        if (pending != null) {
+                            if (envelope.messageType == MessageType.INPUT_ACCEPTED && result.accepted) {
+                                pending.complete(Unit)
+                            } else {
+                                pending.completeExceptionally(
+                                    ProductionTransportException(result.reasonCode.ifBlank { "input rejected" }),
+                                )
+                            }
                         }
                     } catch (error: Throwable) {
-                        pending.completeExceptionally(error)
+                        pending?.completeExceptionally(error)
                         throw error
                     }
                 }
@@ -523,17 +539,42 @@ class ProductionRealtimeSessionClient(
                 reconnectJob = null
                 reconnectAttempt = 0
                 mutableTransportState.value = ProductionTransportState.Connected
-                if (!session.onConnected()) transport.close()
+                if (!session.onConnected()) {
+                    transport.close()
+                } else {
+                    startSubscriberRefresh()
+                }
             }
             is RealtimeState.Failed -> {
+                subscriberRefreshJob?.cancel()
+                subscriberRefreshJob = null
                 failPendingInputs(state.reason)
                 session.onDisconnected(state.reason)
                 scheduleReconnect(state.reason)
             }
             is RealtimeState.Reconnecting -> Unit
             RealtimeState.Closed -> {
+                subscriberRefreshJob?.cancel()
+                subscriberRefreshJob = null
                 failPendingInputs("production transport closed")
                 mutableTransportState.value = ProductionTransportState.Closed
+            }
+        }
+    }
+
+    private fun startSubscriberRefresh() {
+        subscriberRefreshJob?.cancel()
+        subscriberRefreshJob = scope.launch {
+            while (true) {
+                delay(subscriberRefreshIntervalMillis)
+                try {
+                    resume(session.state.value.lastAckedSequence)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    failTransport(error.message ?: "subscriber refresh failed")
+                    break
+                }
             }
         }
     }
@@ -573,7 +614,7 @@ class ProductionRealtimeSessionClient(
             acceptance is EventAcceptance.Applied ||
                 acceptance is EventAcceptance.Duplicate ||
                 acceptance is EventAcceptance.IgnoredAfterExit,
-        ) { "production event caused an implicit History Gap" }
+        ) { "production event was not contiguous: $acceptance" }
     }
 
     private fun leaseIdBytes(value: String): ByteArray =

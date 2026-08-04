@@ -27,7 +27,8 @@ class ProductContractsTest {
         val id = UUID.randomUUID()
         val nonceBytes = ByteArray(32) { it.toByte() }
         val nonce = Base64.getUrlEncoder().withoutPadding().encodeToString(nonceBytes)
-        val parsed = PairingInputParser.parse(id.toString(), " abcd-efgh ", nonce)
+        val fullWidthId = id.toString().replace('-', '\uFF0D')
+        val parsed = PairingInputParser.parse(fullWidthId, " abcd-efgh ", nonce)
 
         assertEquals(id, parsed.challengeId)
         assertEquals("ABCDEFGH", parsed.code)
@@ -50,6 +51,17 @@ class ProductContractsTest {
     }
 
     @Test
+    fun emptyCatalogAcceptsLegacyNullAndProductionEmptyArray() {
+        val legacyNull = Json.parseToJsonElement("""{"plans":null}""").jsonObject
+        val emptyArray = Json.parseToJsonElement("""{"plans":[]}""").jsonObject
+        val emptyItems = Json.parseToJsonElement("""{"items":null}""").jsonObject
+
+        assertEquals(emptyList<Any>(), ProductResponseParser.catalogPlanObjects(legacyNull))
+        assertEquals(emptyList<Any>(), ProductResponseParser.catalogPlanObjects(emptyArray))
+        assertEquals(emptyList<Any>(), ProductResponseParser.itemObjects(emptyItems))
+    }
+
+    @Test
     fun authStateEnvelopeUsesCipherAndDoesNotStorePlaintext() {
         val cipher = FakeCipher()
         val plaintext = "refresh-token-secret".encodeToByteArray()
@@ -60,6 +72,16 @@ class ProductContractsTest {
         assertEquals(plaintext.toList(), AuthStateEnvelope.open(sealed, cipher).toList())
         assertEquals(1, cipher.encryptions)
         assertEquals(1, cipher.decryptions)
+    }
+
+    @Test
+    fun reservedInputSequenceProviderAdvancesAcrossRangesWithoutReuse() {
+        val ranges = ArrayDeque(listOf(101L..103L, 201L..202L))
+        val provider = ProductionProductRepository.ReservedInputSequenceProvider {
+            ranges.removeFirst()
+        }
+
+        assertEquals(listOf(101L, 102L, 103L, 201L, 202L), List(5) { provider.next() })
     }
 
     @Test

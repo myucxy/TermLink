@@ -8,9 +8,12 @@ import dev.termlink.terminal.replay.GoldenStreamReplayer
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Test
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
@@ -21,6 +24,40 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class TermuxTerminalEngineTest {
+    @Test
+    fun burstInputDoesNotDropBytesWhileCollectorIsBackpressured() = runTest {
+        val engine = TermuxTerminalEngine()
+        engine.setReadOnly(false)
+        val eventCount = 128
+        val received = async(start = CoroutineStart.UNDISPATCHED) {
+            withTimeoutOrNull(1_000) {
+                engine.inputEvents
+                    .onEach { delay(1) }
+                    .take(eventCount)
+                    .toList()
+            }
+        }
+
+        repeat(eventCount) { assertTrue(engine.submitText("x")) }
+
+        assertEquals(eventCount, received.await()?.size)
+        engine.dispose()
+    }
+
+    @Test
+    fun remoteResizeDoesNotPublishAnOutboundViewSize() = runTest {
+        val engine = TermuxTerminalEngine(TerminalSize(80, 24))
+        val outboundSize = async(start = CoroutineStart.UNDISPATCHED) {
+            withTimeoutOrNull(1) { engine.sizeEvents.take(1).toList().single() }
+        }
+
+        engine.resize(120, 30)
+
+        assertEquals(TerminalSize(120, 30), engine.currentSize())
+        assertEquals(null, outboundSize.await())
+        engine.dispose()
+    }
+
     @Test
     fun goldenPowerShellStreamBuildsRealTerminalGrid() = runTest {
         val engine = TermuxTerminalEngine()

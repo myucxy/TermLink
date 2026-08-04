@@ -5,6 +5,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import java.security.KeyStore
 import java.util.Base64
+import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -86,6 +87,22 @@ internal class OidcSessionStore(context: Context) {
         check(preferences.edit().remove(KEY_AUTH_STATE).commit())
     }
 
+    @Synchronized
+    fun reserveInputSequenceRange(
+        sessionId: UUID,
+        count: Int = INPUT_SEQUENCE_RESERVATION_SIZE,
+        clockMillis: Long = System.currentTimeMillis(),
+    ): LongRange {
+        require(count in 1..MAX_INPUT_SEQUENCE_RESERVATION_SIZE) { "input sequence reservation is invalid" }
+        val key = KEY_INPUT_SEQUENCE_PREFIX + sessionId
+        val storedHighWatermark = preferences.getLong(key, 0L)
+        val clockFloor = Math.multiplyExact(clockMillis.coerceAtLeast(1L), INPUT_SEQUENCE_CLOCK_MULTIPLIER)
+        val start = Math.addExact(maxOf(storedHighWatermark, clockFloor), 1L)
+        val end = Math.addExact(start, count.toLong() - 1L)
+        check(preferences.edit().putLong(key, end).commit())
+        return start..end
+    }
+
     private inner class AndroidKeystoreCipher : AuthStateCipher {
         override fun transform(input: ByteArray, encrypt: Boolean): ByteArray {
             val cipher = Cipher.getInstance(TRANSFORMATION)
@@ -125,10 +142,14 @@ internal class OidcSessionStore(context: Context) {
         const val PREFERENCES = "termlink-product-session"
         const val KEY_SERVER_URL = "server_url"
         const val KEY_AUTH_STATE = "auth_state"
+        const val KEY_INPUT_SEQUENCE_PREFIX = "input_sequence_high_watermark_"
         const val KEY_ALIAS = "termlink-oidc-session-wrap-v1"
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
         const val IV_BYTES = 12
+        const val INPUT_SEQUENCE_RESERVATION_SIZE = 4_096
+        const val MAX_INPUT_SEQUENCE_RESERVATION_SIZE = 1_000_000
+        const val INPUT_SEQUENCE_CLOCK_MULTIPLIER = 1L shl 20
         val AAD = "TermLink OIDC AuthState V1".encodeToByteArray()
     }
 }

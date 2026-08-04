@@ -15,8 +15,10 @@ import com.termux.view.TerminalView
 import dev.termlink.terminal.api.TerminalEngine
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalThemeV1
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.lang.ref.WeakReference
 import java.nio.ByteBuffer
@@ -38,7 +40,7 @@ class TermuxTerminalEngine(
     private val transcriptRows: Int = DEFAULT_TRANSCRIPT_ROWS,
 ) : TerminalEngine {
     private val lock = Any()
-    private val mutableInputEvents = MutableSharedFlow<ByteArray>(extraBufferCapacity = 64)
+    private val inputEventChannel = Channel<ByteArray>(Channel.UNLIMITED)
     private val mutableSizeEvents = MutableSharedFlow<TerminalSize>(extraBufferCapacity = 16)
     private var viewReference: WeakReference<TerminalView>? = null
     private var contextReference: WeakReference<Context>? = null
@@ -117,11 +119,17 @@ class TermuxTerminalEngine(
             cellWidthPixels: Int,
             cellHeightPixels: Int,
         ) {
-            resizeInternal(columns, rows, cellWidthPixels, cellHeightPixels)
+            resizeInternal(
+                columns,
+                rows,
+                cellWidthPixels,
+                cellHeightPixels,
+                publishSizeEvent = true,
+            )
         }
     }
 
-    override val inputEvents: Flow<ByteArray> = mutableInputEvents
+    override val inputEvents: Flow<ByteArray> = inputEventChannel.receiveAsFlow()
     override val sizeEvents: Flow<TerminalSize> = mutableSizeEvents
 
     override suspend fun feed(seq: Long, bytes: ByteBuffer) {
@@ -134,7 +142,14 @@ class TermuxTerminalEngine(
     }
 
     override fun resize(columns: Int, rows: Int) {
-        resizeInternal(columns, rows, cellWidthPixels, cellHeightPixels)
+        resizeInternal(
+            columns,
+            rows,
+            cellWidthPixels,
+            cellHeightPixels,
+            publishSizeEvent = false,
+        )
+        restoreAttachedViewSize()
     }
 
     override fun applyTheme(theme: TerminalThemeV1) {
@@ -320,6 +335,7 @@ class TermuxTerminalEngine(
         rows: Int,
         cellWidthPixels: Int,
         cellHeightPixels: Int,
+        publishSizeEvent: Boolean,
     ) {
         val newSize = TerminalSize(columns, rows)
         require(cellWidthPixels > 0 && cellHeightPixels > 0) {
@@ -330,8 +346,42 @@ class TermuxTerminalEngine(
             this.cellHeightPixels = cellHeightPixels
             emulator.resize(columns, rows, cellWidthPixels, cellHeightPixels)
             currentSize = newSize
-            mutableSizeEvents.tryEmit(newSize)
+            if (publishSizeEvent) mutableSizeEvents.tryEmit(newSize)
         }
+    }
+
+    /**
+     * A replayed ResizeApplied event describes the grid that produced the following VT bytes, but
+     * it must not leave an attached Android surface rendering a larger off-screen grid. Re-run the
+     * real view measurement after applying the remote event. TerminalView calls updateSize only
+     * when the measured grid differs, which restores the local viewport and publishes exactly one
+     * outbound size event.
+     */
+    private fun restoreAttachedViewSize() {
+        val view = synchronized(lock) {
+            checkActive()
+            viewReference?.get()
+        } ?: return
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            view.updateSize()
+            return
+        }
+
+        val completed = CountDownLatch(1)
+        var failure: Throwable? = null
+        check(view.post {
+            try {
+                view.updateSize()
+            } catch (error: Throwable) {
+                failure = error
+            } finally {
+                completed.countDown()
+            }
+        }) { "Terminal view rejected a resize synchronization" }
+        check(completed.await(VIEW_UPDATE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            "Timed out synchronizing terminal view size"
+        }
+        failure?.let { throw it }
     }
 
     private fun applyThemeToEmulator(theme: TerminalThemeV1) {
@@ -383,7 +433,11 @@ class TermuxTerminalEngine(
             checkActive()
             !readOnly
         }
-        if (canWrite && bytes.isNotEmpty()) mutableInputEvents.tryEmit(bytes.copyOf())
+        if (canWrite && bytes.isNotEmpty()) {
+            check(inputEventChannel.trySend(bytes.copyOf()).isSuccess) {
+                "Terminal input queue rejected an event while the engine was active"
+            }
+        }
     }
 
     private fun canWriteInput(): Boolean = synchronized(lock) {

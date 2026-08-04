@@ -215,6 +215,34 @@ class RemoteTerminalSessionTest {
     }
 
     @Test
+    fun terminalSizeIsBufferedUntilControlLeaseIsGranted() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(
+            engine,
+            outbound,
+            backgroundScope,
+            resizeDebounceMillis = 150,
+            clockMillis = { testScheduler.currentTime },
+        )
+        session.start()
+        runCurrent()
+        session.onConnected()
+
+        engine.emitSize(TerminalSize(100, 30))
+        advanceTimeBy(150)
+        runCurrent()
+
+        assertTrue(outbound.sizes.isEmpty())
+        assertIs<RemoteSessionState.Live>(session.state.value)
+
+        session.grantControl("lease", 10_000)
+
+        assertEquals(listOf(TerminalSize(100, 30)), outbound.sizes)
+        session.close()
+    }
+
+    @Test
     fun controllingLeaseRenewsEveryConfiguredIntervalAndStopsOnRevoke() = runTest {
         val engine = RecordingEngine()
         val outbound = RecordingOutbound()
@@ -307,10 +335,12 @@ class RemoteTerminalSessionTest {
             outbound,
             backgroundScope,
             resizeDebounceMillis = 150,
+            clockMillis = { testScheduler.currentTime },
         )
         session.start()
         runCurrent()
         session.onConnected()
+        session.grantControl("lease", 10_000)
 
         engine.emitSize(TerminalSize(80, 25))
         advanceTimeBy(50)

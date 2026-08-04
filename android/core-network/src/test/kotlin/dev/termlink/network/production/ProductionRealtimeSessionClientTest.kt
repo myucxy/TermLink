@@ -5,6 +5,7 @@ import dev.termlink.crypto.CryptoDirection
 import dev.termlink.crypto.DeviceIdentity
 import dev.termlink.crypto.SessionCrypto
 import dev.termlink.protocol.realtime.v1.Envelope
+import dev.termlink.protocol.realtime.v1.InputResultPayload
 import dev.termlink.protocol.realtime.v1.MessageType
 import dev.termlink.protocol.realtime.v1.OutputChunkPayload
 import dev.termlink.protocol.realtime.v1.SubscribePayload
@@ -15,18 +16,15 @@ import dev.termlink.terminal.api.TerminalThemeV1
 import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
-import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okhttp3.mockwebserver.MockResponse
@@ -57,7 +55,7 @@ class ProductionRealtimeSessionClientTest {
     }
 
     @Test
-    fun authenticatesHelloDecryptsOutputAndResumesHighestAckAfterReconnect(): Unit = runBlocking {
+    fun authenticatesHelloDecryptsOutputAndResumesAcrossHistoricalInputResult(): Unit = runBlocking {
         val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
         val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
         val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
@@ -95,6 +93,39 @@ class ProductionRealtimeSessionClientTest {
                     if (envelope.messageType == MessageType.SUBSCRIBE) {
                         val subscribe = SubscribePayload.parseFrom(plaintext)
                         resumes += subscribe.resumeFromSeq
+                        if (index == 1) {
+                            val historicalResult = InputResultPayload.newBuilder()
+                                .setInputId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(UUID.randomUUID())))
+                                .setAccepted(true)
+                                .build()
+                                .toByteArray()
+                            val resultEnvelope = ProductionRealtimeClient.encryptedEnvelope(
+                                sessionId = sessionId,
+                                senderId = pcId,
+                                messageType = MessageType.INPUT_ACCEPTED,
+                                direction = CryptoDirection.PC_TO_ANDROID,
+                                sequence = 2,
+                                acknowledgement = 0,
+                                keyId = keyId,
+                                nonce = SessionCrypto.nonce(pcNoncePrefix, 2uL),
+                                sessionKey = SessionCrypto.deriveSessionKey(
+                                    SessionCrypto.derivePairwiseKey(
+                                        pcIdentity.exchange.privateKey,
+                                        androidIdentity.exchange.publicKey,
+                                        pcId,
+                                        androidId,
+                                        7,
+                                    ),
+                                    sessionId,
+                                    CryptoDirection.PC_TO_ANDROID,
+                                    keyId,
+                                ),
+                                plaintext = historicalResult,
+                                recipientId = androidId,
+                                nowMillis = 1_800_000_000_122,
+                            )
+                            check(webSocket.send(OkioByteString.of(*resultEnvelope.toByteArray())))
+                        }
                         val output = OutputChunkPayload.newBuilder()
                             .setOutput(ByteString.copyFrom(if (index == 0) byteArrayOf(7) else byteArrayOf(8)))
                             .build()
@@ -104,10 +135,10 @@ class ProductionRealtimeSessionClientTest {
                             senderId = pcId,
                             messageType = MessageType.OUTPUT_CHUNK,
                             direction = CryptoDirection.PC_TO_ANDROID,
-                            sequence = if (index == 0) 1 else 2,
+                            sequence = if (index == 0) 1 else 3,
                             acknowledgement = 0,
                             keyId = keyId,
-                            nonce = SessionCrypto.nonce(pcNoncePrefix, (if (index == 0) 1 else 2).toULong()),
+                            nonce = SessionCrypto.nonce(pcNoncePrefix, (if (index == 0) 1 else 3).toULong()),
                             sessionKey = SessionCrypto.deriveSessionKey(
                                 SessionCrypto.derivePairwiseKey(
                                     pcIdentity.exchange.privateKey,
@@ -168,12 +199,131 @@ class ProductionRealtimeSessionClientTest {
         )
         try {
             client.start()
-            withTimeout(10_000) { client.sessionState.first { it.lastAckedSequence == 2L } }
+            withTimeout(10_000) { client.sessionState.first { it.lastAckedSequence == 3L } }
             assertEquals(listOf(0L, 1L), resumes)
             assertEquals(2, outputs.size)
             assertArrayEquals(byteArrayOf(7), outputs[0])
             assertArrayEquals(byteArrayOf(8), outputs[1])
             assertIs<RemoteSessionState.Live>(client.sessionState.value)
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun periodicallyRefreshesSubscribeWithCurrentAckAndRestoresOutputRoute(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val keyId = "epoch-00000007".encodeToByteArray()
+        val pcNoncePrefix = byteArrayOf(1, 2, 3, 4)
+        val resumes = CopyOnWriteArrayList<Long>()
+        val outputs = CopyOnWriteArrayList<ByteArray>()
+
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        check(webSocket.send("{\"type\":\"welcome\",\"protocol_version\":1}"))
+                    }
+
+                    override fun onMessage(webSocket: WebSocket, bytes: OkioByteString) {
+                        val envelope = Envelope.parseFrom(bytes.toByteArray())
+                        if (envelope.messageType != MessageType.SUBSCRIBE) return
+                        val pairwise = SessionCrypto.derivePairwiseKey(
+                            pcIdentity.exchange.privateKey,
+                            androidIdentity.exchange.publicKey,
+                            pcId,
+                            androidId,
+                            7,
+                        )
+                        val key = SessionCrypto.deriveSessionKey(
+                            pairwise,
+                            sessionId,
+                            CryptoDirection.ANDROID_TO_PC,
+                            envelope.keyId.toByteArray(),
+                        )
+                        val plaintext = ProductionRealtimeClient.decryptEnvelope(envelope, key)
+                        try {
+                            val resume = SubscribePayload.parseFrom(plaintext).resumeFromSeq
+                            resumes += resume
+                            if (resumes.size <= 2) {
+                                val sequence = resumes.size.toLong()
+                                val output = OutputChunkPayload.newBuilder()
+                                    .setOutput(ByteString.copyFrom(byteArrayOf((6 + sequence).toByte())))
+                                    .build()
+                                    .toByteArray()
+                                val outputKey = SessionCrypto.deriveSessionKey(
+                                    pairwise,
+                                    sessionId,
+                                    CryptoDirection.PC_TO_ANDROID,
+                                    keyId,
+                                )
+                                try {
+                                    val outputEnvelope = ProductionRealtimeClient.encryptedEnvelope(
+                                        sessionId = sessionId,
+                                        senderId = pcId,
+                                        messageType = MessageType.OUTPUT_CHUNK,
+                                        direction = CryptoDirection.PC_TO_ANDROID,
+                                        sequence = sequence,
+                                        acknowledgement = 0,
+                                        keyId = keyId,
+                                        nonce = SessionCrypto.nonce(pcNoncePrefix, sequence.toULong()),
+                                        sessionKey = outputKey,
+                                        plaintext = output,
+                                        recipientId = androidId,
+                                        nowMillis = 1_800_000_000_123 + sequence,
+                                    )
+                                    check(webSocket.send(OkioByteString.of(*outputEnvelope.toByteArray())))
+                                } finally {
+                                    output.fill(0)
+                                    outputKey.fill(0)
+                                }
+                            }
+                        } finally {
+                            plaintext.fill(0)
+                            key.fill(0)
+                            pairwise.fill(0)
+                        }
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, reason)
+                    }
+                },
+            ),
+        )
+        server.start()
+
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(outputs),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = server.url("/").toString(),
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+                keyId = keyId.copyOf(),
+                noncePrefix = byteArrayOf(9, 8, 7, 6),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            subscriberRefreshIntervalMillis = 25,
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            client.start()
+            withTimeout(2_000) { client.sessionState.first { it.lastAckedSequence == 2L } }
+            assertEquals(listOf(0L, 1L), resumes.take(2))
+            assertEquals(2, outputs.size)
+            assertArrayEquals(byteArrayOf(7), outputs[0])
+            assertArrayEquals(byteArrayOf(8), outputs[1])
         } finally {
             client.close()
             androidIdentity.destroy()

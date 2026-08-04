@@ -160,6 +160,7 @@ class ProductionRealtimeClient(
 
     private inner class Listener(private val listenerGeneration: Int) : WebSocketListener() {
         private var welcomed = false
+        private var acceptingBinary = true
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
             if (!isCurrent(webSocket)) return
@@ -201,18 +202,21 @@ class ProductionRealtimeClient(
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: OkioByteString) {
-            if (!isCurrent(webSocket)) return
+            if (!isCurrent(webSocket) || !acceptingBinary) return
             if (!welcomed) {
+                acceptingBinary = false
                 webSocket.close(1002, "welcome required before binary frames")
                 return
             }
             if (bytes.size > MAX_FRAME_BYTES) {
+                acceptingBinary = false
                 webSocket.close(1009, "frame too large")
                 return
             }
             val raw = bytes.toByteArray()
             val envelope = try {
                 runCatching { Envelope.parseFrom(raw) }.getOrElse {
+                    acceptingBinary = false
                     webSocket.close(1002, "invalid Envelope")
                     return
                 }
@@ -220,21 +224,30 @@ class ProductionRealtimeClient(
                 raw.fill(0)
             }
             if (!validateIncoming(envelope)) {
+                acceptingBinary = false
                 webSocket.close(1008, "Envelope metadata rejected")
                 return
             }
             if (!mutableIncoming.tryEmit(envelope)) {
+                // close() is asynchronous. Without this generation-local gate,
+                // later callbacks can enter the queue after the first rejected
+                // frame as the collector frees capacity, manufacturing a hole
+                // that looks like durable History Gap. Stop at one contiguous
+                // prefix and let the owner resume from its cumulative ACK.
+                acceptingBinary = false
                 webSocket.close(1013, "bounded receive queue exceeded")
             }
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             if (!isCurrent(webSocket) || closed.get()) return
+            acceptingBinary = false
             mutableState.tryEmit(RealtimeState.Failed(t.message ?: "realtime failed"))
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             if (!isCurrent(webSocket) || closed.get()) return
+            acceptingBinary = false
             mutableState.tryEmit(RealtimeState.Failed(reason.ifBlank { "socket closed ($code)" }))
         }
 
@@ -264,7 +277,11 @@ class ProductionRealtimeClient(
         }
         while (true) {
             val previous = cursor.get()
-            if (envelope.seq <= previous) return false
+            // PC output is replayable from the Android cumulative ACK, including
+            // on the current socket after a subscription refresh. Authentication
+            // and RemoteTerminalSession provide idempotency. Android input can
+            // execute commands and therefore remains strictly monotonic.
+            if (envelope.seq <= previous) return role == "android"
             if (cursor.compareAndSet(previous, envelope.seq)) return true
         }
     }
