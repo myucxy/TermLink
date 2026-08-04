@@ -1,8 +1,6 @@
 using System;
 using System.Diagnostics;
 using System.IO;
-using System.Security.Cryptography;
-using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -79,7 +77,7 @@ namespace TermLink.Tray
             var localData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             var bufferRoot = Path.Combine(localData, "TermLink", "Agent");
             var agentExecutable = Path.Combine(AppContext.BaseDirectory, "TermLink.Agent.exe");
-            var pipeName = DefaultControlPipeName();
+            var pipeName = TermLinkControlPipe.DefaultName();
             string statusJson = null;
             var shutdown = false;
             var restart = false;
@@ -127,17 +125,6 @@ namespace TermLink.Tray
             return args[index];
         }
 
-        private static string DefaultControlPipeName()
-        {
-            var identity = WindowsIdentity.GetCurrent();
-            if (identity.User == null) throw new InvalidOperationException("Current Windows SID is unavailable.");
-            var sid = Encoding.UTF8.GetBytes(identity.User.Value);
-            byte[] hash;
-            using (var sha = SHA256.Create()) hash = sha.ComputeHash(sid);
-            var suffix = new StringBuilder(16);
-            for (var index = 0; index < 8; index++) suffix.Append(hash[index].ToString("x2"));
-            return "termlink-agent-control-" + suffix;
-        }
     }
 
     internal sealed class AgentController

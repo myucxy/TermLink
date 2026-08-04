@@ -7,5 +7,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\Common\LocalIpc.cs" Link="Common\LocalIpc.cs" />
+    <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
   </ItemGroup>
 </Project>

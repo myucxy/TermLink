@@ -8,6 +8,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using TermLink.Agent;
 using TermLink.LocalIpc;
 
 namespace TermLink.SessionHost
@@ -43,6 +44,9 @@ namespace TermLink.SessionHost
         public Guid SessionId { get; private set; }
         public byte[] HandshakeToken { get; private set; }
         public int AgentBufferBytes { get; private set; }
+        public string RegistryControlPipeName { get; private set; }
+        public ManagedShellType ShellType { get; private set; }
+        public bool AutoRegister { get { return !string.IsNullOrEmpty(RegistryControlPipeName); } }
         public bool UseAgentPipe { get { return !string.IsNullOrEmpty(AgentPipeName); } }
 
         public static SessionHostOptions Parse(string[] args)
@@ -55,6 +59,8 @@ namespace TermLink.SessionHost
             string agentPipeName = null;
             string sessionIdText = null;
             string handshakeTokenText = null;
+            string managedShellText = null;
+            string registryControlPipeName = null;
             var agentBufferBytes = 4 * 1024 * 1024;
             var hasTestAgentBuffer = false;
 
@@ -85,6 +91,12 @@ namespace TermLink.SessionHost
                         break;
                     case "--handshake-token":
                         handshakeTokenText = RequiredValue(args, ref index, "--handshake-token");
+                        break;
+                    case "--managed-shell":
+                        managedShellText = RequiredValue(args, ref index, "--managed-shell");
+                        break;
+                    case "--registry-pipe":
+                        registryControlPipeName = RequiredValue(args, ref index, "--registry-pipe");
                         break;
                     case "--test-agent-buffer-bytes":
                         agentBufferBytes = ParseInteger(
@@ -123,8 +135,32 @@ namespace TermLink.SessionHost
                 hasTestAgentBuffer;
             Guid sessionId = Guid.Empty;
             byte[] handshakeToken = null;
-            if (hasAnyAgentOption)
+            var shellType = ManagedShellType.Custom;
+            if (!string.IsNullOrEmpty(managedShellText))
             {
+                if (hasAnyAgentOption)
+                {
+                    throw new ArgumentException("--managed-shell cannot be combined with explicit Agent pipe options.");
+                }
+                shellType = ParseManagedShell(managedShellText);
+                sessionId = Guid.NewGuid();
+                agentPipeName = "termlink-session-" + sessionId.ToString("N");
+                handshakeToken = new byte[SessionRegistration.HandshakeTokenBytes];
+                using (var random = System.Security.Cryptography.RandomNumberGenerator.Create())
+                {
+                    random.GetBytes(handshakeToken);
+                }
+                if (string.IsNullOrEmpty(registryControlPipeName))
+                {
+                    registryControlPipeName = TermLinkControlPipe.DefaultName();
+                }
+            }
+            else if (hasAnyAgentOption)
+            {
+                if (!string.IsNullOrEmpty(registryControlPipeName))
+                {
+                    throw new ArgumentException("--registry-pipe requires --managed-shell.");
+                }
                 if (string.IsNullOrWhiteSpace(agentPipeName) || agentPipeName.Length > 200 ||
                     agentPipeName.IndexOfAny(new[] { '\\', '/' }) >= 0)
                 {
@@ -139,6 +175,15 @@ namespace TermLink.SessionHost
                     throw new ArgumentException("--handshake-token is required with --agent-pipe.");
                 }
                 handshakeToken = LocalPayloadCodec.ParseToken(handshakeTokenText);
+            }
+            else if (!string.IsNullOrEmpty(registryControlPipeName))
+            {
+                throw new ArgumentException("--registry-pipe requires --managed-shell.");
+            }
+            if (!string.IsNullOrEmpty(registryControlPipeName) &&
+                (registryControlPipeName.Length > 200 || registryControlPipeName.IndexOfAny(new[] { '\\', '/' }) >= 0))
+            {
+                throw new ArgumentException("--registry-pipe is invalid.");
             }
             if (hasTestAgentBuffer && !diagnostics)
             {
@@ -155,8 +200,23 @@ namespace TermLink.SessionHost
                 AgentPipeName = agentPipeName,
                 SessionId = sessionId,
                 HandshakeToken = handshakeToken,
-                AgentBufferBytes = agentBufferBytes
+                AgentBufferBytes = agentBufferBytes,
+                RegistryControlPipeName = registryControlPipeName,
+                ShellType = shellType
             };
+        }
+
+        private static ManagedShellType ParseManagedShell(string value)
+        {
+            switch (value)
+            {
+                case "command-prompt": return ManagedShellType.CommandPrompt;
+                case "windows-powershell": return ManagedShellType.WindowsPowerShell;
+                case "powershell-7": return ManagedShellType.PowerShell7;
+                case "wsl": return ManagedShellType.Wsl;
+                case "custom": return ManagedShellType.Custom;
+                default: throw new ArgumentException("--managed-shell is invalid.");
+            }
         }
 
         private static string RequiredValue(string[] args, ref int index, string option)
@@ -233,6 +293,7 @@ namespace TermLink.SessionHost
         private uint inputEventsPending;
         private bool restoreOuterConsoleInputMode;
         private AgentPipeBridge agentPipe;
+        private AgentRegistryRegistration agentRegistration;
         private COORD innerSize;
         private volatile bool stopInput;
         private volatile bool stopResize;
@@ -266,6 +327,19 @@ namespace TermLink.SessionHost
                     ApplyAgentResize,
                     options.AgentBufferBytes);
                 agentPipe.Start();
+                if (options.AutoRegister)
+                {
+                    agentRegistration = new AgentRegistryRegistration(
+                        options.RegistryControlPipeName,
+                        new SessionRegistration(
+                            options.SessionId,
+                            options.AgentPipeName,
+                            options.HandshakeToken,
+                            Process.GetCurrentProcess().Id,
+                            options.ShellType),
+                        () => agentPipe != null && agentPipe.IsConnected);
+                    agentRegistration.Start();
+                }
             }
 
             outerInput = GetStdHandle(-10);
@@ -847,6 +921,11 @@ namespace TermLink.SessionHost
             RestoreOuterInputMode();
             if (agentPipe != null)
             {
+                if (agentRegistration != null)
+                {
+                    agentRegistration.Dispose();
+                    agentRegistration = null;
+                }
                 agentPipe.Dispose();
                 agentPipe = null;
             }
@@ -1094,6 +1173,71 @@ namespace TermLink.SessionHost
         private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
     }
 
+    internal sealed class AgentRegistryRegistration : IDisposable
+    {
+        private readonly string controlPipeName;
+        private readonly SessionRegistration registration;
+        private readonly Func<bool> isAgentConnected;
+        private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
+        private Task worker;
+        private bool disposed;
+
+        public AgentRegistryRegistration(
+            string controlPipeName,
+            SessionRegistration registration,
+            Func<bool> isAgentConnected)
+        {
+            if (controlPipeName == null) throw new ArgumentNullException("controlPipeName");
+            if (registration == null) throw new ArgumentNullException("registration");
+            if (isAgentConnected == null) throw new ArgumentNullException("isAgentConnected");
+            this.controlPipeName = controlPipeName;
+            this.registration = registration;
+            this.isAgentConnected = isAgentConnected;
+        }
+
+        public void Start()
+        {
+            if (worker != null) throw new InvalidOperationException("Agent registration already started.");
+            worker = Task.Run((Action)RegistrationLoop);
+        }
+
+        private void RegistrationLoop()
+        {
+            while (!cancellation.IsCancellationRequested)
+            {
+                if (!isAgentConnected())
+                {
+                    try
+                    {
+                        RegistryControlClient.Send(
+                            controlPipeName,
+                            new RegistryRequest
+                            {
+                                Command = RegistryCommand.Register,
+                                Registration = registration
+                            },
+                            750);
+                    }
+                    catch (ArgumentException) { }
+                    catch (InvalidDataException) { }
+                    catch (IOException) { }
+                    catch (TimeoutException) { }
+                    catch (UnauthorizedAccessException) { }
+                }
+                if (cancellation.Token.WaitHandle.WaitOne(500)) return;
+            }
+        }
+
+        public void Dispose()
+        {
+            if (disposed) return;
+            disposed = true;
+            cancellation.Cancel();
+            if (worker != null) worker.Wait(2000);
+            cancellation.Dispose();
+        }
+    }
+
     internal sealed class AgentPipeBridge : IDisposable
     {
         private readonly string pipeName;
@@ -1136,6 +1280,11 @@ namespace TermLink.SessionHost
         public ulong LastAcknowledgedSequence
         {
             get { lock (sync) return lastAcknowledgedSequence; }
+        }
+
+        public bool IsConnected
+        {
+            get { lock (sync) return pipe != null && pipe.IsConnected; }
         }
 
         public void Start()

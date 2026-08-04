@@ -1,9 +1,9 @@
 {
   "schema": "termlink.phase1-local-agent-validation",
   "version": 1,
-  "generated_at_utc": "2026-08-03T21:08:07.7557952Z",
+  "generated_at_utc": "2026-08-04T14:05:56.8289020Z",
   "classification": "local Host-Agent IPC only; not the production Relay protocol",
-  "session_id": "1bcbe986-8837-4cd3-a7d1-8b00e3d2f4a5",
+  "session_id": "8680197d-5e96-4442-a81e-0bd8f98355a6",
   "passed": true,
   "double_conpty": true,
   "reconnects": 1,

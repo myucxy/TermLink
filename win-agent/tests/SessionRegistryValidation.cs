@@ -41,6 +41,7 @@ namespace TermLink.Agent
                 Directory.CreateDirectory(bufferRoot);
                 ValidateActualAgentEntry(agentExecutable, Path.Combine(bufferRoot, "external-entry"));
                 ValidateRemoteResizeDispatch();
+                ValidateCompletedBufferRecovery(Path.Combine(bufferRoot, "completed-recovery"));
                 ValidateStopFailurePaths(Path.Combine(bufferRoot, "failure-paths"));
                 ValidateRestartFailurePath(Path.Combine(bufferRoot, "restart-failure"));
                 var controlPipe = "termlink-registry-control-" + Guid.NewGuid().ToString("N");
@@ -200,6 +201,7 @@ namespace TermLink.Agent
                     ";batch_timeout_reported=true" +
                     ";shutdown_best_effort=true" +
                     ";restart_timeout_reported=true" +
+                    ";completed_buffer_recovered=true" +
                     ";external_registry_entry=true" +
                     ";test_thread=" + mainThreadId);
                 return 0;
@@ -377,6 +379,77 @@ namespace TermLink.Agent
                 Require(session.ResizeColumns == 132 && session.ResizeRows == 43,
                     "Registry changed the requested remote terminal size.");
             }
+        }
+
+        private static void ValidateCompletedBufferRecovery(string bufferRoot)
+        {
+            Directory.CreateDirectory(bufferRoot);
+            var sessionId = Guid.NewGuid();
+            var token = new byte[SessionRegistration.HandshakeTokenBytes];
+            using (var random = RandomNumberGenerator.Create()) random.GetBytes(token);
+            var registration = new SessionRegistration(
+                sessionId,
+                "termlink-recovered-" + sessionId.ToString("N"),
+                token,
+                int.MaxValue,
+                ManagedShellType.PowerShell7,
+                DateTime.UtcNow.AddYears(-1),
+                DateTime.UtcNow);
+            var store = new DpapiRegistryRegistrationStore(Path.Combine(bufferRoot, "registrations.dpapi"));
+            store.Upsert(registration);
+            var bufferDirectory = Path.Combine(bufferRoot, sessionId.ToString("N"));
+            using (var buffer = new EncryptedEventBuffer(bufferDirectory, sessionId, 4 * 1024 * 1024))
+            {
+                buffer.Append(new LocalFrame(
+                    LocalFrameType.Lifecycle,
+                    sessionId,
+                    1,
+                    LocalPayloadCodec.Lifecycle(LocalLifecycleState.Running, 0)));
+                buffer.Append(new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    2,
+                    Encoding.UTF8.GetBytes("recovery-fixture")));
+            }
+
+            LocalFrame committed = null;
+            using (var registry = new SessionRegistry(
+                bufferRoot,
+                1200,
+                4 * 1024 * 1024,
+                20,
+                delegate(ManagedShellType shellType, LocalFrame frame)
+                {
+                    Require(shellType == ManagedShellType.PowerShell7,
+                        "Recovered buffer changed its Shell type.");
+                    committed = frame;
+                }))
+            {
+                Require(registry.RecoveredSessionCount == 1 && registry.Count == 0 &&
+                    registry.ContainsSession(sessionId),
+                    "Completed buffer was not recovered as a retained read-only session.");
+                int exitCode;
+                Require(committed != null && committed.Sequence == 3 &&
+                    committed.Type == LocalFrameType.Lifecycle &&
+                    LocalPayloadCodec.ParseLifecycle(committed.Payload, out exitCode) ==
+                        LocalLifecycleState.Interrupted,
+                    "Dead Host recovery did not append an ordered Interrupted lifecycle.");
+                IList<LocalFrame> frames;
+                ulong earliest;
+                ulong latest;
+                Require(registry.TryReadBufferedEvents(sessionId, 0, out frames, out earliest, out latest) &&
+                    earliest == 1 && latest == 3 && frames.Count == 3,
+                    "Recovered completed buffer did not preserve its committed event stream.");
+                Require(!registry.TrySendResize(sessionId, 100, 30) &&
+                    !registry.TrySendRemoteInput(sessionId, Guid.NewGuid(), 0, Encoding.UTF8.GetBytes("blocked")),
+                    "Recovered completed buffer accepted a control operation.");
+                registry.ReleaseBufferedSession(sessionId);
+                Require(!registry.ContainsSession(sessionId),
+                    "Published completed buffer remained retained in Registry memory.");
+            }
+            Require(new DpapiRegistryRegistrationStore(
+                Path.Combine(bufferRoot, "registrations.dpapi")).Load().Count == 0,
+                "Published completed buffer remained in the recovery index.");
         }
 
         private static void ValidateRestartFailurePath(string bufferRoot)

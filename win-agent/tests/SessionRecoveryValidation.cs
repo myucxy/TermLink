@@ -181,7 +181,12 @@ namespace TermLink.AgentRecoveryValidation
                 Require(process.ExitCode == 0, "Tray status command returned " + process.ExitCode + ".");
             }
             var json = File.ReadAllText(destination, Encoding.UTF8);
-            Require(CountOccurrences(json, "\"SessionId\"") == expectedSessions,
+            var summariesStart = json.IndexOf("\"Summaries\":", StringComparison.Ordinal);
+            var productionStart = json.IndexOf("\"Production\":", StringComparison.Ordinal);
+            Require(summariesStart >= 0 && productionStart > summariesStart,
+                "Tray status did not contain ordered local and production sections.");
+            var summariesJson = json.Substring(summariesStart, productionStart - summariesStart);
+            Require(CountOccurrences(summariesJson, "\"SessionId\"") == expectedSessions,
                 "Tray status did not report " + expectedSessions + " sessions.");
             Require(json.IndexOf("HandshakeToken", StringComparison.OrdinalIgnoreCase) < 0 &&
                 json.IndexOf("PipeName", StringComparison.OrdinalIgnoreCase) < 0 &&

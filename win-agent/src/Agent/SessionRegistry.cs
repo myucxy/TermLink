@@ -51,6 +51,7 @@ namespace TermLink.Agent
     // doubles do not need to implement the production replay surface.
     internal interface IBufferedRegistryManagedSession
     {
+        ManagedShellType ShellType { get; }
         IList<LocalFrame> ReadBufferedEvents(
             ulong resumeFromSequence,
             out ulong earliestRetainedSequence,
@@ -62,10 +63,17 @@ namespace TermLink.Agent
         private readonly object sync = new object();
         private readonly Dictionary<Guid, IRegistryManagedSession> sessions =
             new Dictionary<Guid, IRegistryManagedSession>();
+        private readonly Dictionary<Guid, IRegistryManagedSession> completedSessions =
+            new Dictionary<Guid, IRegistryManagedSession>();
+        private readonly HashSet<Guid> releasedCompletedSessions = new HashSet<Guid>();
         private readonly HashSet<IRegistryManagedSession> retiring = new HashSet<IRegistryManagedSession>();
         private readonly IRegistryManagedSessionFactory sessionFactory;
         private readonly IRegistryRegistrationStore registrationStore;
         private readonly int maximumSessions;
+        private readonly bool retainCompletedSessions;
+        private readonly string bufferRoot;
+        private readonly long maximumBufferBytes;
+        private readonly Action<ManagedShellType, LocalFrame> committedFrame;
         private int recoveredSessionCount;
         private bool remoteAccessEnabled = true;
         private bool preserveRegistrationsOnShutdown;
@@ -91,12 +99,16 @@ namespace TermLink.Agent
 
             var resolvedBufferRoot = Path.GetFullPath(bufferRoot);
             this.maximumSessions = maximumSessions;
+            this.bufferRoot = resolvedBufferRoot;
+            this.maximumBufferBytes = maximumBufferBytes;
+            this.committedFrame = committedFrame;
             Directory.CreateDirectory(resolvedBufferRoot);
             sessionFactory = new ManagedSessionFactory(
                 resolvedBufferRoot,
                 disconnectedTimeoutMilliseconds,
                 maximumBufferBytes,
                 committedFrame);
+            retainCompletedSessions = committedFrame != null;
             registrationStore = new DpapiRegistryRegistrationStore(
                 Path.Combine(resolvedBufferRoot, "registrations.dpapi"));
             RecoverRegistrations();
@@ -138,7 +150,7 @@ namespace TermLink.Agent
 
         internal bool ContainsSession(Guid sessionId)
         {
-            lock (sync) return sessions.ContainsKey(sessionId);
+            lock (sync) return sessions.ContainsKey(sessionId) || completedSessions.ContainsKey(sessionId);
         }
 
         private void RecoverRegistrations()
@@ -147,6 +159,11 @@ namespace TermLink.Agent
             {
                 if (!registration.MatchesRunningHost())
                 {
+                    if (RecoverCompletedSession(registration))
+                    {
+                        recoveredSessionCount++;
+                        continue;
+                    }
                     registrationStore.Remove(registration.SessionId);
                     continue;
                 }
@@ -157,6 +174,28 @@ namespace TermLink.Agent
                         "Unable to recover Registry session " + registration.SessionId.ToString("D") + ": " + error);
                 }
                 recoveredSessionCount++;
+            }
+        }
+
+        private bool RecoverCompletedSession(SessionRegistration registration)
+        {
+            if (!retainCompletedSessions || committedFrame == null) return false;
+            var recovered = new RecoveredBufferedSession(
+                registration,
+                Path.Combine(bufferRoot, registration.SessionId.ToString("N")),
+                maximumBufferBytes);
+            try
+            {
+                var terminalFrame = recovered.EnsureTerminalFrame();
+                completedSessions.Add(registration.SessionId, recovered);
+                committedFrame(registration.ShellType, terminalFrame);
+                return true;
+            }
+            catch
+            {
+                completedSessions.Remove(registration.SessionId);
+                recovered.Dispose();
+                throw;
             }
         }
 
@@ -176,7 +215,7 @@ namespace TermLink.Agent
                     error = "REMOTE_ACCESS_DISABLED";
                     return false;
                 }
-                if (sessions.ContainsKey(registration.SessionId))
+                if (sessions.ContainsKey(registration.SessionId) || completedSessions.ContainsKey(registration.SessionId))
                 {
                     error = "SESSION_ALREADY_REGISTERED";
                     return false;
@@ -189,7 +228,7 @@ namespace TermLink.Agent
                         return false;
                     }
                 }
-                if (sessions.Count + retiring.Count >= maximumSessions)
+                if (sessions.Count + completedSessions.Count + retiring.Count >= maximumSessions)
                 {
                     error = "SESSION_LIMIT_REACHED";
                     return false;
@@ -275,7 +314,8 @@ namespace TermLink.Agent
             lock (sync)
             {
                 IRegistryManagedSession managed;
-                if (!sessions.TryGetValue(sessionId, out managed)) return false;
+                if (!sessions.TryGetValue(sessionId, out managed) &&
+                    !completedSessions.TryGetValue(sessionId, out managed)) return false;
                 buffered = managed as IBufferedRegistryManagedSession;
             }
             if (buffered == null) return false;
@@ -284,6 +324,22 @@ namespace TermLink.Agent
                 out earliestRetainedSequence,
                 out latestSequence);
             return true;
+        }
+
+        internal void ReleaseBufferedSession(Guid sessionId)
+        {
+            IRegistryManagedSession completed = null;
+            lock (sync)
+            {
+                registrationStore.Remove(sessionId);
+                if (!completedSessions.TryGetValue(sessionId, out completed))
+                {
+                    if (sessions.ContainsKey(sessionId)) releasedCompletedSessions.Add(sessionId);
+                    return;
+                }
+                completedSessions.Remove(sessionId);
+            }
+            completed.Dispose();
         }
 
         public SessionStopResult StopSession(Guid sessionId)
@@ -318,7 +374,13 @@ namespace TermLink.Agent
                 registrationStore.Clear();
                 remoteAccessEnabled = false;
                 stopped = new List<IRegistryManagedSession>(sessions.Values);
+                foreach (var completed in completedSessions.Values)
+                {
+                    if (!stopped.Contains(completed)) stopped.Add(completed);
+                }
                 sessions.Clear();
+                completedSessions.Clear();
+                releasedCompletedSessions.Clear();
                 foreach (var session in stopped) retiring.Add(session);
             }
             return StopSessions(stopped);
@@ -343,7 +405,12 @@ namespace TermLink.Agent
                 if (sessions.TryGetValue(completed.SessionId, out current) &&
                     ReferenceEquals(current, completed))
                 {
-                    if (!preserveRegistrationsOnShutdown)
+                    var alreadyReleased = releasedCompletedSessions.Remove(completed.SessionId);
+                    if (retainCompletedSessions && !alreadyReleased && !preserveRegistrationsOnShutdown)
+                    {
+                        completedSessions[completed.SessionId] = completed;
+                    }
+                    else if (!preserveRegistrationsOnShutdown)
                     {
                         registrationStore.Remove(completed.SessionId);
                     }
@@ -378,7 +445,14 @@ namespace TermLink.Agent
                     if (!stopped.Contains(session)) stopped.Add(session);
                     retiring.Add(session);
                 }
+                foreach (var completed in completedSessions.Values)
+                {
+                    if (!stopped.Contains(completed)) stopped.Add(completed);
+                    retiring.Add(completed);
+                }
                 sessions.Clear();
+                completedSessions.Clear();
+                releasedCompletedSessions.Clear();
             }
             return StopSessions(stopped);
         }
@@ -443,6 +517,97 @@ namespace TermLink.Agent
         }
     }
 
+    internal sealed class RecoveredBufferedSession : IRegistryManagedSession, IBufferedRegistryManagedSession
+    {
+        private readonly EncryptedEventBuffer buffer;
+        private readonly ManagedShellType shellType;
+        private readonly DateTime registeredAtUtc;
+        private LocalLifecycleState lifecycle;
+        private int exitCode;
+
+        public RecoveredBufferedSession(
+            SessionRegistration registration,
+            string bufferDirectory,
+            long maximumBufferBytes)
+        {
+            if (registration == null) throw new ArgumentNullException("registration");
+            SessionId = registration.SessionId;
+            shellType = registration.ShellType;
+            registeredAtUtc = registration.RegisteredAtUtc;
+            buffer = new EncryptedEventBuffer(bufferDirectory, SessionId, maximumBufferBytes);
+        }
+
+        public Guid SessionId { get; private set; }
+        public ManagedShellType ShellType { get { return shellType; } }
+
+        public LocalFrame EnsureTerminalFrame()
+        {
+            ulong earliest;
+            ulong latest;
+            var frames = buffer.ReadFrom(0, out earliest, out latest);
+            if (frames.Count > 0)
+            {
+                var last = frames[frames.Count - 1];
+                if (last.Type == LocalFrameType.Lifecycle)
+                {
+                    var state = LocalPayloadCodec.ParseLifecycle(last.Payload, out exitCode);
+                    if (state == LocalLifecycleState.Ended || state == LocalLifecycleState.Interrupted)
+                    {
+                        lifecycle = state;
+                        return last;
+                    }
+                }
+            }
+            if (latest == ulong.MaxValue) throw new InvalidDataException("Recovered event sequence is exhausted.");
+            lifecycle = LocalLifecycleState.Interrupted;
+            exitCode = 0;
+            var terminal = new LocalFrame(
+                LocalFrameType.Lifecycle,
+                SessionId,
+                latest + 1,
+                LocalPayloadCodec.Lifecycle(lifecycle, exitCode));
+            buffer.Append(terminal);
+            return terminal;
+        }
+
+        public void Start() { }
+
+        public SessionSummary GetSummary()
+        {
+            return new SessionSummary
+            {
+                SessionId = SessionId,
+                ShellType = shellType,
+                Lifecycle = lifecycle == LocalLifecycleState.Ended
+                    ? SessionAgentLifecycle.Ended
+                    : SessionAgentLifecycle.HostLost,
+                LastSequence = buffer.LastSequence,
+                RegisteredAtUtc = registeredAtUtc,
+                LastActivityUtc = DateTime.UtcNow,
+                ExitCode = lifecycle == LocalLifecycleState.Ended ? (int?)exitCode : null
+            };
+        }
+
+        public void BeginStop() { }
+        public bool WaitForStop() { return true; }
+
+        public IList<LocalFrame> ReadBufferedEvents(
+            ulong resumeFromSequence,
+            out ulong earliestRetainedSequence,
+            out ulong latestSequence)
+        {
+            return buffer.ReadFrom(
+                resumeFromSequence,
+                out earliestRetainedSequence,
+                out latestSequence);
+        }
+
+        public void Dispose()
+        {
+            buffer.Dispose();
+        }
+    }
+
     internal sealed class ManagedSession : IRegistryManagedSession, IRemoteControllableSession, IRemoteResizableSession, IBufferedRegistryManagedSession
     {
         private readonly SessionAgent agent;
@@ -477,6 +642,7 @@ namespace TermLink.Agent
         }
 
         public Guid SessionId { get; private set; }
+        public ManagedShellType ShellType { get { return shellType; } }
 
         public void Start()
         {

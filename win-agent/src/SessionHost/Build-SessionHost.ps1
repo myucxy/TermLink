@@ -18,6 +18,7 @@ $executable = Join-Path $output 'TermLink.SessionHost.exe'
     /platform:x64 `
     /optimize+ `
     "/out:$executable" `
+    (Join-Path $PSScriptRoot '..\AgentControl\AgentControl.cs') `
     (Join-Path $PSScriptRoot '..\Common\LocalIpc.cs') `
     (Join-Path $PSScriptRoot 'SessionHost.cs')
 if ($LASTEXITCODE -ne 0) {

@@ -21,7 +21,7 @@ if ($profileNames.Count -lt 3 -or
     throw "Windows Terminal profile fragment is incomplete: $($profileNames -join ', ')."
 }
 foreach ($profile in $profileFragment.profiles) {
-    if ($profile.commandline -notmatch '--command-base64 ([A-Za-z0-9+/]+={0,2})$') {
+    if ($profile.commandline -notmatch '--command-base64 ([A-Za-z0-9+/]+={0,2}) --managed-shell (command-prompt|windows-powershell|powershell-7|wsl)$') {
         throw "Profile '$($profile.name)' does not use the encoded Session Host boundary."
     }
     $childCommand = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Matches[1]))

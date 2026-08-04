@@ -1,7 +1,7 @@
 {
   "schema": "termlink.phase1-session-registry-validation",
   "version": 1,
-  "generated_at_utc": "2026-08-03T21:27:27.7740771Z",
+  "generated_at_utc": "2026-08-04T14:02:07.0165712Z",
   "classification": "local Win-Agent Registry and current-user control IPC; not production Relay or protocol",
   "passed": true,
   "registry_process_model": "one long-lived Registry with one isolated SessionAgent worker per Host",
@@ -20,6 +20,7 @@
   "batch_stop_timeout_code": "REMOTE_ACCESS_STOP_TIMEOUT",
   "shutdown_timeout_code": "REGISTRY_SHUTDOWN_WITH_TIMEOUTS",
   "restart_timeout_code": "AGENT_RESTART_WITH_TIMEOUTS",
+  "completed_buffer_restart_recovery": true,
   "shutdown_best_effort_cleanup": true,
   "external_agent_registry_entry": true,
   "host_agent_authentication": "session ID + 32-byte token + claimed PID + OS peer PID + Registry expected PID",

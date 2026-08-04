@@ -72,6 +72,7 @@ try {
     Assert-True ($fields.batch_timeout_reported -eq 'true') 'Batch timeout coverage did not pass.'
     Assert-True ($fields.shutdown_best_effort -eq 'true') 'Shutdown best-effort cleanup did not pass.'
     Assert-True ($fields.restart_timeout_reported -eq 'true') 'Controlled restart timeout coverage did not pass.'
+    Assert-True ($fields.completed_buffer_recovered -eq 'true') 'Completed buffer restart recovery did not pass.'
     Assert-True ($fields.external_registry_entry -eq 'true') 'External Agent Registry entry was not tested.'
 
     $evidence = [ordered]@{
@@ -96,6 +97,7 @@ try {
         batch_stop_timeout_code = 'REMOTE_ACCESS_STOP_TIMEOUT'
         shutdown_timeout_code = 'REGISTRY_SHUTDOWN_WITH_TIMEOUTS'
         restart_timeout_code = 'AGENT_RESTART_WITH_TIMEOUTS'
+        completed_buffer_restart_recovery = [bool]::Parse($fields.completed_buffer_recovered)
         shutdown_best_effort_cleanup = [bool]::Parse($fields.shutdown_best_effort)
         external_agent_registry_entry = [bool]::Parse($fields.external_registry_entry)
         host_agent_authentication = 'session ID + 32-byte token + claimed PID + OS peer PID + Registry expected PID'

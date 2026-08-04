@@ -513,6 +513,7 @@ namespace TermLink.Agent
                 await Task.Delay(TimeSpan.FromMilliseconds(250), token).ConfigureAwait(false);
                 foreach (var pending in pendingSessions)
                 {
+                    var terminalPublished = false;
                     ulong resumeFrom;
                     publishedSequences.TryGetValue(pending.Key, out resumeFrom);
                     IList<LocalFrame> frames;
@@ -544,6 +545,7 @@ namespace TermLink.Agent
                             {
                                 RemovePublishedSequence(pending.Key);
                             }
+                            terminalPublished = true;
                             break;
                         }
                     }
@@ -552,6 +554,10 @@ namespace TermLink.Agent
                         try { await UploadHistoryAsync(pending.Key, historyEvents, token).ConfigureAwait(false); }
                         catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
                         catch { }
+                    }
+                    if (terminalPublished && registry != null)
+                    {
+                        registry.ReleaseBufferedSession(pending.Key);
                     }
                     if (frames.Count == 0 && latest > resumeFrom)
                     {
@@ -580,7 +586,8 @@ namespace TermLink.Agent
         {
             if (frame == null || frame.Type != LocalFrameType.Lifecycle) return false;
             int exitCode;
-            return LocalPayloadCodec.ParseLifecycle(frame.Payload, out exitCode) == LocalLifecycleState.Ended;
+            var state = LocalPayloadCodec.ParseLifecycle(frame.Payload, out exitCode);
+            return state == LocalLifecycleState.Ended || state == LocalLifecycleState.Interrupted;
         }
 
         private bool TryRemovePending(Guid sessionId, PendingSession expected)

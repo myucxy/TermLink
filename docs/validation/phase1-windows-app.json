@@ -1,7 +1,7 @@
 {
   "schema": "termlink.phase1-windows-app-validation",
   "version": 1,
-  "generated_at_utc": "2026-08-03T21:27:39.6582163Z",
+  "generated_at_utc": "2026-08-04T14:07:49.6788375Z",
   "classification": "current-user .NET 8 Agent/Tray and local recovery; not production Relay, installer, or E2EE",
   "passed": true,
   "dotnet_sdk": "8.0.303",
@@ -19,15 +19,15 @@
   "remote_stop_cleared_registration_index": true,
   "tray_boundary": "current-user control Pipe V3 and redacted SessionSummary/ProductionStatus only",
   "source_sha256": {
-    "src/AgentControl/AgentControl.cs": "6420e2a1272912f13274a87a06fafcd64c6f2d5addec0b227d6da871c55ee32b",
+    "src/AgentControl/AgentControl.cs": "01aa1072560ddf937938d72d1ab0f81cdc2fe730a1569842ce3b2471aaa0fec6",
     "src/Agent/CurrentUserPipe.cs": "0e93db425e2ad4ecd4667ac1ae5e700f84ad2ee5d6b73909183e5d4828e8c727",
     "src/Agent/SessionRegistrationStore.cs": "8a5807f4fbe3b7f2df2a3c23427f65e64297af158c1fdabb66ffae5edaca4687",
-    "src/Agent/SessionRegistry.cs": "803aaf8a178f5c15ec2cb4f1d45817f97993fb15d2f4f3cdb548a855e5f3ccec",
+    "src/Agent/SessionRegistry.cs": "76ae609fadedcd28fece0299479406de8ff8785fb48a600fec14da00d586eafc",
     "src/Agent/TermLink.Agent.csproj": "0fffed7d9cd6797ef420733289bf8b93cf3aedea9e3ef139839d4e2d8d6c4a89",
-    "src/SessionHost/TermLink.SessionHost.csproj": "ffacfd59ff698d4b9f480fd6c829695313c81319998984cf0e9a11cd25f55c12",
-    "src/Tray/Program.cs": "b3aec64b8e26e6ad6fc525c577b929b132785c8580d225f3e0e06d352107542b",
-    "src/Tray/TrayApplicationContext.cs": "98c9c68c17c901d979e0f80e788a43246aed717e2ef0b1b5f25148f17be9492c",
+    "src/SessionHost/TermLink.SessionHost.csproj": "771238be1af55f6f767f6867fb6a39d924d582d7d2696bd3ef038e64e8bc78d3",
+    "src/Tray/Program.cs": "3468767c1a58f08bbd98f4213dce658d1e930b0fec22b30ed7af595a9df0c02c",
+    "src/Tray/TrayApplicationContext.cs": "49b78ce3006f74a4b96c31087eaaee75aaafb182a0bb23957a51521feba93c75",
     "src/Tray/TermLink.Tray.csproj": "fdd2ac4b53aa5a037126d79288621c5a7df9bed9341c00f6490ee6152b6d9a30",
-    "tests/SessionRecoveryValidation.cs": "beba0658ebf3097404cc11cca3a4a23a93d6d2238f0faf690f6fa6a01510d7bd"
+    "tests/SessionRecoveryValidation.cs": "f6b17477d4c306861ffedff94e51b3dcc8a93281b4744bf5fd3ee4255edb592f"
   }
 }

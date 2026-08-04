@@ -3,11 +3,41 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
+using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 
 namespace TermLink.Agent
 {
+    public static class TermLinkControlPipe
+    {
+        public static string DefaultName()
+        {
+            using (var identity = WindowsIdentity.GetCurrent())
+            {
+                if (identity.User == null)
+                {
+                    throw new InvalidOperationException("Current Windows SID is unavailable.");
+                }
+                var sid = Encoding.UTF8.GetBytes(identity.User.Value);
+                byte[] hash;
+                using (var sha = SHA256.Create()) hash = sha.ComputeHash(sid);
+                try
+                {
+                    var suffix = new StringBuilder(16);
+                    for (var index = 0; index < 8; index++) suffix.Append(hash[index].ToString("x2"));
+                    return "termlink-agent-control-" + suffix;
+                }
+                finally
+                {
+                    Array.Clear(sid, 0, sid.Length);
+                    Array.Clear(hash, 0, hash.Length);
+                }
+            }
+        }
+    }
+
     public enum ManagedShellType : byte
     {
         CommandPrompt = 1,
