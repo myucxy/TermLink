@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using TermLink.Agent;
 
@@ -14,6 +15,7 @@ namespace TermLink.Tray
         private readonly ToolStripMenuItem accountItem;
         private readonly ToolStripMenuItem relayItem;
         private readonly ToolStripMenuItem accountDevicesItem;
+        private readonly ToolStripMenuItem linkAccountItem;
         private readonly ToolStripMenuItem sessionsItem;
         private readonly ToolStripMenuItem stopAllItem;
         private readonly ToolStripMenuItem enableItem;
@@ -27,6 +29,7 @@ namespace TermLink.Tray
             accountItem = new ToolStripMenuItem("Account: checking") { Enabled = false };
             relayItem = new ToolStripMenuItem("Relay: checking") { Enabled = false };
             accountDevicesItem = new ToolStripMenuItem("Account and devices", null, delegate { OpenAccountDevices(); });
+            linkAccountItem = new ToolStripMenuItem("Link account...", null, async delegate { await LinkAccountAsync(); });
             sessionsItem = new ToolStripMenuItem("Open sessions", null, delegate { OpenSessions(); });
             stopAllItem = new ToolStripMenuItem("Stop remote access", null, delegate { StopAll(); });
             enableItem = new ToolStripMenuItem("Enable remote access", null, delegate { EnableRemoteAccess(); });
@@ -37,6 +40,7 @@ namespace TermLink.Tray
             menu.Items.Add(relayItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(accountDevicesItem);
+            menu.Items.Add(linkAccountItem);
             menu.Items.Add(sessionsItem);
             menu.Items.Add(stopAllItem);
             menu.Items.Add(enableItem);
@@ -118,6 +122,28 @@ namespace TermLink.Tray
             accountDevices.RefreshStatus();
         }
 
+        private async Task LinkAccountAsync()
+        {
+            using (var dialog = new AccountLinkForm())
+            {
+                if (dialog.ShowDialog() != DialogResult.OK) return;
+                linkAccountItem.Enabled = false;
+                try
+                {
+                    await Task.Run(() => controller.LinkAccount(dialog.ServerUrl, dialog.PcName));
+                    var response = controller.RestartAgent();
+                    if (!response.Success) throw new InvalidOperationException(response.Code);
+                    notifyIcon.ShowBalloonTip(4000, "TermLink Agent", "Account linked.", ToolTipIcon.Info);
+                    RefreshState(false);
+                }
+                catch (Exception error)
+                {
+                    ShowFailure(error.Message);
+                }
+                finally { linkAccountItem.Enabled = true; }
+            }
+        }
+
         private void StopAll()
         {
             if (MessageBox.Show(
@@ -193,6 +219,65 @@ namespace TermLink.Tray
                 if (accountDevices != null && !accountDevices.IsDisposed) accountDevices.Dispose();
             }
             base.Dispose(disposing);
+        }
+    }
+
+    internal sealed class AccountLinkForm : Form
+    {
+        private readonly TextBox server;
+        private readonly TextBox pcName;
+
+        public AccountLinkForm()
+        {
+            Text = "Link TermLink account";
+            StartPosition = FormStartPosition.CenterScreen;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ClientSize = new Size(500, 190);
+
+            var explanation = new Label
+            {
+                AutoSize = false,
+                Location = new Point(16, 14),
+                Size = new Size(468, 42),
+                Text = "TermLink will open your system browser and wait for a secure Authorization Code + PKCE callback."
+            };
+            var serverLabel = new Label { AutoSize = true, Location = new Point(16, 67), Text = "Server HTTPS URL" };
+            server = new TextBox
+            {
+                Location = new Point(150, 64),
+                Size = new Size(334, 23),
+                Text = "https://termlink.kget.cc:8910"
+            };
+            var nameLabel = new Label { AutoSize = true, Location = new Point(16, 103), Text = "PC name" };
+            pcName = new TextBox
+            {
+                Location = new Point(150, 100),
+                Size = new Size(334, 23),
+                Text = Environment.MachineName
+            };
+            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(328, 145), Size = new Size(75, 28) };
+            var link = new Button { Text = "Open browser", DialogResult = DialogResult.OK, Location = new Point(409, 145), Size = new Size(75, 28) };
+            Controls.AddRange(new Control[] { explanation, serverLabel, server, nameLabel, pcName, cancel, link });
+            AcceptButton = link;
+            CancelButton = cancel;
+        }
+
+        public string ServerUrl { get { return server.Text.Trim(); } }
+        public string PcName { get { return pcName.Text.Trim(); } }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (DialogResult == DialogResult.OK &&
+                (!Uri.TryCreate(ServerUrl, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps ||
+                    string.IsNullOrWhiteSpace(PcName)))
+            {
+                MessageBox.Show("Enter a valid HTTPS server URL and PC name.", "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                e.Cancel = true;
+                return;
+            }
+            base.OnFormClosing(e);
         }
     }
 

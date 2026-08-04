@@ -19,6 +19,10 @@ namespace TermLink.Agent
         {
             try
             {
+                if (ProductionEnrollmentOptions.IsEnrollment(args))
+                {
+                    return ProductionEnrollment.Run(ProductionEnrollmentOptions.Parse(args));
+                }
                 if (RegistryServiceOptions.IsRegistryMode(args))
                 {
                     var registryOptions = RegistryServiceOptions.Parse(args);

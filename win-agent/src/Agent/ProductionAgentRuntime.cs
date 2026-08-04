@@ -19,6 +19,22 @@ using TermLink.Protocol.Realtime.V1;
 
 namespace TermLink.Agent
 {
+    internal sealed class ProductionReauthenticationRequiredException : Exception
+    {
+        public ProductionReauthenticationRequiredException() : base("TermLink account authorization must be renewed.") { }
+    }
+
+    internal sealed class ProductionServerResponseException : HttpRequestException
+    {
+        public string ErrorCode { get; }
+
+        public ProductionServerResponseException(HttpStatusCode statusCode, string errorCode)
+            : base("TermLink server rejected the request.", null, statusCode)
+        {
+            ErrorCode = errorCode ?? string.Empty;
+        }
+    }
+
     internal sealed class ProductionAgentRuntime : IDisposable
     {
         private sealed class CommittedEvent { public ManagedShellType ShellType; public LocalFrame Frame; }
@@ -27,7 +43,7 @@ namespace TermLink.Agent
         private sealed class LeaseStatus { public Guid HolderDeviceId; public DateTime ExpiresAtUtc; }
         private readonly ProductionAgentConfig config;
         private readonly ProductionCredentials credentials;
-        private readonly HttpClient http = new HttpClient();
+        private readonly HttpClient http;
         // Frames are durably committed to each SessionAgent DPAPI buffer before
         // OnCommitted is invoked. Keep only bounded session metadata here and
         // let the publisher replay from that durable source, so a slow Relay
@@ -40,6 +56,7 @@ namespace TermLink.Agent
         private readonly ConcurrentDictionary<Guid, Subscriber> historyRecipients = new ConcurrentDictionary<Guid, Subscriber>();
         private readonly SemaphoreSlim historyRecipientGate = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim statusRefreshGate = new SemaphoreSlim(1, 1);
+        private readonly SemaphoreSlim tokenRefreshGate = new SemaphoreSlim(1, 1);
         private readonly ConcurrentDictionary<Guid, LeaseStatus> leaseStatuses = new ConcurrentDictionary<Guid, LeaseStatus>();
         private readonly ConcurrentDictionary<Guid, ulong> localInputEpochs = new ConcurrentDictionary<Guid, ulong>();
         private readonly ConcurrentDictionary<string, ulong> inputSequences = new ConcurrentDictionary<string, ulong>();
@@ -59,11 +76,13 @@ namespace TermLink.Agent
         private IList<ProductionDeviceSummary> productionDevices = new List<ProductionDeviceSummary>();
         private PairingChallengeSummary pairingChallenge;
         private Task statusRefreshWorker;
+        private string tokenEndpoint;
         private int disposed;
 
         private ProductionAgentRuntime(ProductionAgentConfig config, ProductionCredentials credentials)
         {
             this.config = config; this.credentials = credentials;
+            http = ProductionTls.CreateHttpClient(config.ServerUrl);
             RandomNumberGenerator.Fill(noncePrefix);
             http.Timeout = TimeSpan.FromSeconds(15);
         }
@@ -211,13 +230,37 @@ namespace TermLink.Agent
                     delay = TimeSpan.FromSeconds(1);
                 }
                 catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return; }
-                catch
+                catch (ProductionReauthenticationRequiredException)
                 {
-                    SetRelayState(ProductionRelayState.Reconnecting, "RELAY_CONNECTION_FAILED");
+                    SetRelayState(ProductionRelayState.Failed, "ACCOUNT_REAUTH_REQUIRED");
+                    await Task.Delay(TimeSpan.FromSeconds(30), cancellation.Token).ConfigureAwait(false);
+                }
+                catch (Exception error)
+                {
+                    SetRelayState(ProductionRelayState.Reconnecting, ConnectionFailureCode(error));
                     await Task.Delay(delay, cancellation.Token).ConfigureAwait(false);
                     delay = TimeSpan.FromSeconds(Math.Min(30, delay.TotalSeconds * 2));
                 }
             }
+        }
+
+        private static string ConnectionFailureCode(Exception error)
+        {
+            if (error is ProductionServerResponseException response && !string.IsNullOrWhiteSpace(response.ErrorCode))
+            {
+                return "HTTP_" + ((int)response.StatusCode.Value).ToString() + "_" + response.ErrorCode;
+            }
+            if (error is HttpRequestException request)
+            {
+                return request.StatusCode.HasValue
+                    ? "HTTP_" + ((int)request.StatusCode.Value).ToString()
+                    : "HTTP_TRANSPORT_FAILED";
+            }
+            if (error is WebSocketException) return "WEBSOCKET_CONNECTION_FAILED";
+            if (error is InvalidDataException) return "RELAY_PROTOCOL_INVALID";
+            if (error is JsonException) return "SERVER_RESPONSE_INVALID";
+            if (error is CryptographicException) return "CRYPTOGRAPHIC_OPERATION_FAILED";
+            return "RELAY_CONNECTION_FAILED";
         }
 
         private async Task EnsureRegisteredAsync(CancellationToken token)
@@ -233,11 +276,52 @@ namespace TermLink.Agent
                 registration["signing_public_key"], registration["exchange_public_key"], registration["key_id"], now, nonce);
             registration["timestamp_ms"] = now; registration["nonce"] = nonce; registration["signature"] = Base64Url(credentials.Identity.Sign(Encoding.UTF8.GetBytes(canonical)));
             var response = await SendAsync(HttpMethod.Post, "/v1/devices/register", JsonSerializer.SerializeToUtf8Bytes(registration), false, null, token).ConfigureAwait(false);
-            if (response.StatusCode != HttpStatusCode.Created && response.StatusCode != HttpStatusCode.Conflict) response.EnsureSuccessStatusCode();
+            if (response.StatusCode != HttpStatusCode.Created && response.StatusCode != HttpStatusCode.Conflict)
+                await EnsureServerSuccessAsync(response, "DEVICE_REGISTER", token).ConfigureAwait(false);
             response.Dispose();
             var pcBody = JsonSerializer.SerializeToUtf8Bytes(new { name = config.PcName, agent_version = config.AgentVersion, key_epoch = config.KeyEpoch });
             using var pc = await SendAsync(HttpMethod.Put, "/v1/pcs/" + config.PcId.ToString("D"), pcBody, true, "pc-upsert-" + config.PcId.ToString("N"), token).ConfigureAwait(false);
-            pc.EnsureSuccessStatusCode();
+            await EnsureServerSuccessAsync(pc, "PC_UPSERT", token).ConfigureAwait(false);
+        }
+
+        private static async Task EnsureServerSuccessAsync(HttpResponseMessage response, string operation, CancellationToken token)
+        {
+            if (response.IsSuccessStatusCode) return;
+            var code = string.Empty;
+            try
+            {
+                var bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
+                if (bytes.Length <= 64 * 1024)
+                {
+                    using var document = JsonDocument.Parse(bytes);
+                    if (document.RootElement.TryGetProperty("error", out var error) &&
+                        error.TryGetProperty("code", out var value))
+                    {
+                        var candidate = value.GetString() ?? string.Empty;
+                        if (candidate.Length <= 64)
+                        {
+                            var valid = true;
+                            foreach (var character in candidate)
+                            {
+                                if ((character < 'A' || character > 'Z') &&
+                                    (character < '0' || character > '9') && character != '_')
+                                {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            if (valid) code = candidate;
+                        }
+                    }
+                }
+                CryptographicOperations.ZeroMemory(bytes);
+            }
+            catch (JsonException)
+            {
+            }
+            throw new ProductionServerResponseException(
+                response.StatusCode,
+                string.IsNullOrWhiteSpace(code) ? operation : operation + "_" + code);
         }
 
         private async Task ConnectAndPumpAsync(CancellationToken token)
@@ -253,7 +337,9 @@ namespace TermLink.Agent
             try
             {
                 active.Options.AddSubProtocol("termlink.realtime.v1");
-                AddProofHeaders(active.Options, HttpMethod.Get, "/v1/realtime", Array.Empty<byte>());
+                ProductionTls.ConfigureWebSocket(active.Options, config.ServerUrl);
+                var accessToken = await GetAccessTokenAsync(false, token).ConfigureAwait(false);
+                AddProofHeaders(active.Options, HttpMethod.Get, "/v1/realtime", Array.Empty<byte>(), accessToken);
                 var wsUri = new Uri(config.ServerUrl.Replace("https://", "wss://", StringComparison.OrdinalIgnoreCase) + "/v1/realtime");
                 await active.ConnectAsync(wsUri, token).ConfigureAwait(false);
                 var hello = Encoding.UTF8.GetBytes("{\"role\":\"pc\",\"protocol_versions\":[1],\"capabilities\":[\"cumulative_ack\",\"e2ee_x25519_chacha20poly1305\",\"lease_v1\",\"bounded_event_replay_v1\"]}");
@@ -1005,25 +1091,91 @@ namespace TermLink.Agent
 
         private async Task<HttpResponseMessage> SendAsync(HttpMethod method, string path, byte[] body, bool deviceProof, string idempotencyKey, CancellationToken token)
         {
-            using (var request = new HttpRequestMessage(method, config.ServerUrl + path))
+            for (var attempt = 0; attempt < 2; attempt++)
             {
-                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", credentials.AccessToken);
-                if (idempotencyKey != null) request.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
-                if (deviceProof) AddProofHeaders(request.Headers, method, path, body);
-                if (body.Length > 0)
+                var accessToken = await GetAccessTokenAsync(attempt > 0, token).ConfigureAwait(false);
+                using (var request = new HttpRequestMessage(method, config.ServerUrl + path))
                 {
-                    request.Content = new ByteArrayContent(body);
-                    request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+                    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+                    if (idempotencyKey != null) request.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
+                    if (deviceProof) AddProofHeaders(request.Headers, method, path, body);
+                    if (body.Length > 0)
+                    {
+                        request.Content = new ByteArrayContent(body);
+                        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+                    }
+                    var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+                    if (response.StatusCode != HttpStatusCode.Unauthorized || attempt > 0)
+                    {
+                        return response;
+                    }
+                    response.Dispose();
                 }
-                return await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
             }
+            throw new ProductionReauthenticationRequiredException();
+        }
+
+        private async Task<string> GetAccessTokenAsync(bool forceRefresh, CancellationToken token)
+        {
+            if (!forceRefresh && !credentials.ShouldRefresh(DateTime.UtcNow, TimeSpan.FromMinutes(1)))
+                return credentials.GetAccessToken();
+            if (!credentials.CanRefresh || string.IsNullOrWhiteSpace(config.OIDCIssuer) || string.IsNullOrWhiteSpace(config.OIDCClientId))
+            {
+                if (forceRefresh) throw new ProductionReauthenticationRequiredException();
+                return credentials.GetAccessToken();
+            }
+            await tokenRefreshGate.WaitAsync(token).ConfigureAwait(false);
+            try
+            {
+                if (!forceRefresh && !credentials.ShouldRefresh(DateTime.UtcNow, TimeSpan.FromMinutes(1)))
+                    return credentials.GetAccessToken();
+                if (string.IsNullOrWhiteSpace(tokenEndpoint))
+                {
+                    using var discovery = await http.GetAsync(
+                        config.OIDCIssuer.TrimEnd('/') + "/.well-known/openid-configuration",
+                        HttpCompletionOption.ResponseHeadersRead,
+                        token).ConfigureAwait(false);
+                    discovery.EnsureSuccessStatusCode();
+                    using var document = JsonDocument.Parse(
+                        await discovery.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
+                    var endpoint = document.RootElement.GetProperty("token_endpoint").GetString();
+                    if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var endpointUri) || endpointUri.Scheme != Uri.UriSchemeHttps)
+                        throw new InvalidDataException("OIDC token endpoint is invalid.");
+                    tokenEndpoint = endpoint;
+                }
+                using var request = new HttpRequestMessage(HttpMethod.Post, tokenEndpoint)
+                {
+                    Content = new FormUrlEncodedContent(new Dictionary<string, string>
+                    {
+                        ["grant_type"] = "refresh_token",
+                        ["client_id"] = config.OIDCClientId,
+                        ["refresh_token"] = credentials.GetRefreshToken()
+                    })
+                };
+                using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+                if (response.StatusCode == HttpStatusCode.BadRequest || response.StatusCode == HttpStatusCode.Unauthorized)
+                    throw new ProductionReauthenticationRequiredException();
+                response.EnsureSuccessStatusCode();
+                using var tokens = JsonDocument.Parse(
+                    await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
+                var accessToken = tokens.RootElement.GetProperty("access_token").GetString();
+                var expiresIn = tokens.RootElement.GetProperty("expires_in").GetInt32();
+                var refreshToken = tokens.RootElement.TryGetProperty("refresh_token", out var refreshed)
+                    ? refreshed.GetString()
+                    : credentials.GetRefreshToken();
+                if (string.IsNullOrWhiteSpace(accessToken) || string.IsNullOrWhiteSpace(refreshToken) || expiresIn < 30)
+                    throw new InvalidDataException("OIDC refresh response is incomplete.");
+                credentials.UpdateTokens(accessToken, refreshToken, DateTime.UtcNow.AddSeconds(expiresIn));
+                return accessToken;
+            }
+            finally { tokenRefreshGate.Release(); }
         }
 
         private void AddProofHeaders(HttpRequestHeaders headers, HttpMethod method, string target, byte[] body)
         {
-            var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(); var nonce = RandomNonce(); var hash = Convert.ToHexString(SHA256.HashData(body)).ToLowerInvariant(); var canonical = string.Join("\n", "TERMLINK-DEVICE-PROOF-V1", method.Method.ToUpperInvariant(), target, timestamp, nonce, hash); headers.TryAddWithoutValidation("Authorization", "Bearer " + credentials.AccessToken); headers.TryAddWithoutValidation("X-TermLink-Device", credentials.DeviceId.ToString("D")); headers.TryAddWithoutValidation("X-TermLink-Timestamp", timestamp); headers.TryAddWithoutValidation("X-TermLink-Nonce", nonce); headers.TryAddWithoutValidation("X-TermLink-Signature", Base64Url(credentials.Identity.Sign(Encoding.UTF8.GetBytes(canonical))));
+            var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(); var nonce = RandomNonce(); var hash = Convert.ToHexString(SHA256.HashData(body)).ToLowerInvariant(); var canonical = string.Join("\n", "TERMLINK-DEVICE-PROOF-V1", method.Method.ToUpperInvariant(), target, timestamp, nonce, hash); headers.TryAddWithoutValidation("X-TermLink-Device", credentials.DeviceId.ToString("D")); headers.TryAddWithoutValidation("X-TermLink-Timestamp", timestamp); headers.TryAddWithoutValidation("X-TermLink-Nonce", nonce); headers.TryAddWithoutValidation("X-TermLink-Signature", Base64Url(credentials.Identity.Sign(Encoding.UTF8.GetBytes(canonical))));
         }
-        private void AddProofHeaders(ClientWebSocketOptions options, HttpMethod method, string target, byte[] body) { var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(); var nonce = RandomNonce(); var hash = Convert.ToHexString(SHA256.HashData(body)).ToLowerInvariant(); var canonical = string.Join("\n", "TERMLINK-DEVICE-PROOF-V1", method.Method.ToUpperInvariant(), target, timestamp, nonce, hash); options.SetRequestHeader("Authorization", "Bearer " + credentials.AccessToken); options.SetRequestHeader("X-TermLink-Device", credentials.DeviceId.ToString("D")); options.SetRequestHeader("X-TermLink-Timestamp", timestamp); options.SetRequestHeader("X-TermLink-Nonce", nonce); options.SetRequestHeader("X-TermLink-Signature", Base64Url(credentials.Identity.Sign(Encoding.UTF8.GetBytes(canonical)))); }
+        private void AddProofHeaders(ClientWebSocketOptions options, HttpMethod method, string target, byte[] body, string accessToken) { var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(); var nonce = RandomNonce(); var hash = Convert.ToHexString(SHA256.HashData(body)).ToLowerInvariant(); var canonical = string.Join("\n", "TERMLINK-DEVICE-PROOF-V1", method.Method.ToUpperInvariant(), target, timestamp, nonce, hash); options.SetRequestHeader("Authorization", "Bearer " + accessToken); options.SetRequestHeader("X-TermLink-Device", credentials.DeviceId.ToString("D")); options.SetRequestHeader("X-TermLink-Timestamp", timestamp); options.SetRequestHeader("X-TermLink-Nonce", nonce); options.SetRequestHeader("X-TermLink-Signature", Base64Url(credentials.Identity.Sign(Encoding.UTF8.GetBytes(canonical)))); }
         private static string Base64Url(byte[] value) { return Convert.ToBase64String(value).TrimEnd('=').Replace('+', '-').Replace('/', '_'); }
         private static string RandomNonce() { var value = new byte[16]; RandomNumberGenerator.Fill(value); return Base64Url(value); }
         private static byte[] GuidBytes(Guid value) { return Convert.FromHexString(value.ToString("N")); }
@@ -1078,6 +1230,7 @@ namespace TermLink.Agent
             socketSendGate.Dispose();
             historyRecipientGate.Dispose();
             statusRefreshGate.Dispose();
+            tokenRefreshGate.Dispose();
             cancellation.Dispose();
         }
     }

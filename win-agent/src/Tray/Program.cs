@@ -241,6 +241,35 @@ namespace TermLink.Tray
             return EnsureAgent();
         }
 
+        public void LinkAccount(string serverUrl, string pcName)
+        {
+            if (!Uri.TryCreate(serverUrl, UriKind.Absolute, out var server) || server.Scheme != Uri.UriSchemeHttps)
+                throw new ArgumentException("A valid HTTPS server URL is required.", nameof(serverUrl));
+            if (string.IsNullOrWhiteSpace(pcName)) throw new ArgumentException("A PC name is required.", nameof(pcName));
+            var start = new ProcessStartInfo
+            {
+                FileName = options.AgentExecutable,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden
+            };
+            start.ArgumentList.Add("--link-account");
+            start.ArgumentList.Add("--server-url");
+            start.ArgumentList.Add(serverUrl);
+            start.ArgumentList.Add("--pc-name");
+            start.ArgumentList.Add(pcName);
+            using (var process = Process.Start(start))
+            {
+                if (process == null) throw new InvalidOperationException("TermLink account linking could not be started.");
+                if (!process.WaitForExit(6 * 60 * 1000))
+                {
+                    try { process.Kill(true); } catch { }
+                    throw new TimeoutException("TermLink account linking expired.");
+                }
+                if (process.ExitCode != 0) throw new InvalidOperationException("TermLink account linking failed or was cancelled.");
+            }
+        }
+
         private bool TryList(int timeoutMilliseconds, out RegistryResponse response)
         {
             try

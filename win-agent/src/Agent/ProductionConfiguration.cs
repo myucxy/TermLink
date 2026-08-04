@@ -14,6 +14,8 @@ namespace TermLink.Agent
         public string PcName { get; set; }
         public string AgentVersion { get; set; }
         public long KeyEpoch { get; set; }
+        public string OIDCIssuer { get; set; }
+        public string OIDCClientId { get; set; }
 
         public static string DefaultPath
         {
@@ -30,7 +32,38 @@ namespace TermLink.Agent
                 throw new InvalidDataException("Production Agent configuration is invalid.");
             }
             config.ServerUrl = config.ServerUrl.TrimEnd('/');
+            if (!string.IsNullOrWhiteSpace(config.OIDCIssuer) || !string.IsNullOrWhiteSpace(config.OIDCClientId))
+            {
+                if (!Uri.TryCreate(config.OIDCIssuer, UriKind.Absolute, out var issuer) ||
+                    issuer.Scheme != Uri.UriSchemeHttps || string.IsNullOrWhiteSpace(config.OIDCClientId))
+                {
+                    throw new InvalidDataException("Production Agent OIDC configuration is invalid.");
+                }
+                config.OIDCIssuer = config.OIDCIssuer.TrimEnd('/');
+            }
             return config;
+        }
+
+        public static void Save(ProductionAgentConfig config)
+        {
+            if (config == null) throw new ArgumentNullException(nameof(config));
+            if (!Uri.TryCreate(config.ServerUrl, UriKind.Absolute, out var server) || server.Scheme != Uri.UriSchemeHttps ||
+                !Uri.TryCreate(config.OIDCIssuer, UriKind.Absolute, out var issuer) || issuer.Scheme != Uri.UriSchemeHttps ||
+                config.PcId == Guid.Empty || string.IsNullOrWhiteSpace(config.PcName) ||
+                string.IsNullOrWhiteSpace(config.AgentVersion) || config.KeyEpoch < 1 ||
+                string.IsNullOrWhiteSpace(config.OIDCClientId))
+            {
+                throw new ArgumentException("Production Agent configuration is incomplete.", nameof(config));
+            }
+            config.ServerUrl = config.ServerUrl.TrimEnd('/');
+            config.OIDCIssuer = config.OIDCIssuer.TrimEnd('/');
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(config);
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(DefaultPath));
+                InputDeduplicator.AtomicWrite(DefaultPath, bytes);
+            }
+            finally { CryptographicOperations.ZeroMemory(bytes); }
         }
     }
 
@@ -40,12 +73,17 @@ namespace TermLink.Agent
         public Guid DeviceId { get; private set; }
         public DeviceIdentity Identity { get; private set; }
         public string AccessToken { get; private set; }
+        public string RefreshToken { get; private set; }
+        public DateTime AccessTokenExpiresAtUtc { get; private set; }
+        private readonly object tokenSync = new object();
 
         private sealed class Stored
         {
             public Guid DeviceId { get; set; }
             public string PrivateMaterial { get; set; }
             public string AccessToken { get; set; }
+            public string RefreshToken { get; set; }
+            public long AccessTokenExpiresAtUnixSeconds { get; set; }
         }
 
         public static string DefaultPath
@@ -97,7 +135,11 @@ namespace TermLink.Agent
                         {
                             DeviceId = stored.DeviceId,
                             Identity = new DeviceIdentity(signing, exchange),
-                            AccessToken = stored.AccessToken
+                            AccessToken = stored.AccessToken,
+                            RefreshToken = stored.RefreshToken,
+                            AccessTokenExpiresAtUtc = string.IsNullOrWhiteSpace(stored.RefreshToken)
+                                ? DateTime.MaxValue
+                                : DateTimeOffset.FromUnixTimeSeconds(stored.AccessTokenExpiresAtUnixSeconds).UtcDateTime
                         };
                     }
                     finally
@@ -118,11 +160,45 @@ namespace TermLink.Agent
 
         public static void Save(Guid deviceId, DeviceIdentity identity, string accessToken)
         {
-            if (deviceId == Guid.Empty || identity == null || string.IsNullOrWhiteSpace(accessToken)) throw new ArgumentException("Credentials are incomplete.");
+            SaveCore(deviceId, identity, accessToken, null, DateTime.MaxValue);
+        }
+
+        public static void SaveWithRefreshToken(
+            Guid deviceId,
+            DeviceIdentity identity,
+            string accessToken,
+            string refreshToken,
+            DateTime accessTokenExpiresAtUtc)
+        {
+            SaveCore(deviceId, identity, accessToken, refreshToken, accessTokenExpiresAtUtc);
+        }
+
+        private static void SaveCore(
+            Guid deviceId,
+            DeviceIdentity identity,
+            string accessToken,
+            string refreshToken,
+            DateTime accessTokenExpiresAtUtc)
+        {
+            if (deviceId == Guid.Empty || identity == null || string.IsNullOrWhiteSpace(accessToken) ||
+                (!string.IsNullOrWhiteSpace(refreshToken) &&
+                    (accessTokenExpiresAtUtc.Kind != DateTimeKind.Utc || accessTokenExpiresAtUtc <= DateTime.UnixEpoch)))
+            {
+                throw new ArgumentException("Credentials are incomplete.");
+            }
             var material = identity.ExportPrivateMaterial();
             try
             {
-                var stored = new Stored { DeviceId = deviceId, PrivateMaterial = Convert.ToBase64String(material), AccessToken = accessToken };
+                var stored = new Stored
+                {
+                    DeviceId = deviceId,
+                    PrivateMaterial = Convert.ToBase64String(material),
+                    AccessToken = accessToken,
+                    RefreshToken = refreshToken,
+                    AccessTokenExpiresAtUnixSeconds = string.IsNullOrWhiteSpace(refreshToken)
+                        ? 0
+                        : new DateTimeOffset(accessTokenExpiresAtUtc).ToUnixTimeSeconds()
+                };
                 var plain = JsonSerializer.SerializeToUtf8Bytes(stored);
                 try
                 {
@@ -147,10 +223,50 @@ namespace TermLink.Agent
             }
         }
 
+        public bool CanRefresh
+        {
+            get { lock (tokenSync) return !string.IsNullOrWhiteSpace(RefreshToken); }
+        }
+
+        public bool ShouldRefresh(DateTime utcNow, TimeSpan skew)
+        {
+            lock (tokenSync)
+            {
+                return !string.IsNullOrWhiteSpace(RefreshToken) && AccessTokenExpiresAtUtc <= utcNow.Add(skew);
+            }
+        }
+
+        public string GetAccessToken()
+        {
+            lock (tokenSync) return AccessToken;
+        }
+
+        public string GetRefreshToken()
+        {
+            lock (tokenSync) return RefreshToken;
+        }
+
+        public void UpdateTokens(string accessToken, string refreshToken, DateTime accessTokenExpiresAtUtc)
+        {
+            if (string.IsNullOrWhiteSpace(refreshToken)) refreshToken = GetRefreshToken();
+            SaveWithRefreshToken(DeviceId, Identity, accessToken, refreshToken, accessTokenExpiresAtUtc);
+            lock (tokenSync)
+            {
+                AccessToken = accessToken;
+                RefreshToken = refreshToken;
+                AccessTokenExpiresAtUtc = accessTokenExpiresAtUtc;
+            }
+        }
+
         public void Dispose()
         {
             if (Identity != null) { Identity.Dispose(); Identity = null; }
-            AccessToken = null;
+            lock (tokenSync)
+            {
+                AccessToken = null;
+                RefreshToken = null;
+                AccessTokenExpiresAtUtc = DateTime.MinValue;
+            }
         }
     }
 }

@@ -163,6 +163,36 @@ try {
     if ($runtime.GetType().GetField('socketSendGate', [Reflection.BindingFlags]'Instance,NonPublic').GetValue($runtime).CurrentCount -ne 1) {
         throw 'Production runtime WebSocket send gate was not initialized.'
     }
+    $httpProofMethod = $runtime.GetType().GetMethods([Reflection.BindingFlags]'Instance,NonPublic') |
+        Where-Object {
+            $_.Name -eq 'AddProofHeaders' -and
+            $_.GetParameters().Count -eq 4 -and
+            $_.GetParameters()[0].ParameterType.FullName -eq 'System.Net.Http.Headers.HttpRequestHeaders'
+        }
+    if ($null -eq $httpProofMethod) { throw 'Production runtime HTTP proof method is unavailable.' }
+    $proofRequest = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, 'https://example.invalid/v1/devices')
+    try {
+        $proofRequest.Headers.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', 'single-token')
+        $httpProofMethod.Invoke($runtime, [object[]]@(
+            $proofRequest.Headers,
+            [Net.Http.HttpMethod]::Get,
+            '/v1/devices',
+            [byte[]]::new(0))) | Out-Null
+        $authorizationValues = @($proofRequest.Headers.GetValues('Authorization'))
+        if ($authorizationValues.Count -ne 1 -or $authorizationValues[0] -ne 'Bearer single-token') {
+            throw 'Production runtime duplicated or replaced the HTTP Authorization header.'
+        }
+        foreach ($headerName in @(
+            'X-TermLink-Device', 'X-TermLink-Timestamp',
+            'X-TermLink-Nonce', 'X-TermLink-Signature')) {
+            if (-not $proofRequest.Headers.Contains($headerName)) {
+                throw "Production runtime omitted proof header $headerName."
+            }
+        }
+    }
+    finally {
+        $proofRequest.Dispose()
+    }
     $clearSubscribers = Get-InternalMethod $runtime.GetType() 'ClearSubscribers'
     $clearSubscribers.Invoke($runtime, [object[]]@()) | Out-Null
     $runtimeRegistry = $runtime.GetType().GetField('registry', [Reflection.BindingFlags]'Instance,NonPublic').GetValue($runtime)
