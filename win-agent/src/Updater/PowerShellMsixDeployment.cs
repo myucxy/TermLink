@@ -24,8 +24,11 @@ namespace TermLink.Updater
             "if($null -eq $p -or $p.Version.ToString() -ne $env:TERMLINK_UPDATE_VERSION){exit 2};" +
             "$tray=Join-Path $p.InstallLocation 'TermLink.Tray.exe';" +
             "if(-not (Test-Path -LiteralPath $tray -PathType Leaf)){exit 3};" +
-            "& $tray --status-json $env:TERMLINK_UPDATE_STATUS;" +
-            "if($LASTEXITCODE -ne 0){exit 4};" +
+            "$args='--status-json \"'+$env:TERMLINK_UPDATE_STATUS+'\"';" +
+            "Invoke-CommandInDesktopPackage -PackageFamilyName $p.PackageFamilyName -AppId 'TermLinkTray' -Command $tray -Args $args -ErrorAction Stop|Out-Null;" +
+            "$deadline=[DateTime]::UtcNow.AddSeconds(30);" +
+            "while(-not (Test-Path -LiteralPath $env:TERMLINK_UPDATE_STATUS -PathType Leaf) -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Milliseconds 200};" +
+            "if(-not (Test-Path -LiteralPath $env:TERMLINK_UPDATE_STATUS -PathType Leaf)){exit 4};" +
             "$s=Get-Content -Raw -LiteralPath $env:TERMLINK_UPDATE_STATUS|ConvertFrom-Json;" +
             "if(-not $s.Success){exit 5}";
 
@@ -33,8 +36,8 @@ namespace TermLink.Updater
             "$ErrorActionPreference='Stop';" +
             "$p=Get-AppxPackage -Name $env:TERMLINK_UPDATE_IDENTITY|Sort-Object Version -Descending|Select-Object -First 1;" +
             "if($null -eq $p){exit 2};" +
-            "$tray=Join-Path $p.InstallLocation 'TermLink.Tray.exe';" +
-            "Start-Process -FilePath $tray|Out-Null";
+            "$target='shell:AppsFolder\'+$p.PackageFamilyName+'!TermLinkTray';" +
+            "Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList $target|Out-Null";
 
         public void Install(VerifiedUpdatePackage package, bool allowDowngrade)
         {
@@ -55,7 +58,7 @@ namespace TermLink.Updater
             {
                 var variables = Variables(package);
                 variables["TERMLINK_UPDATE_STATUS"] = statusPath;
-                return Invoke(HealthScript, variables, TimeSpan.FromSeconds(30)).ExitCode == 0;
+                return Invoke(HealthScript, variables, TimeSpan.FromSeconds(45)).ExitCode == 0;
             }
             finally
             {

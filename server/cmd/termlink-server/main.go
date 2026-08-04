@@ -19,6 +19,7 @@ import (
 	"github.com/termlink/termlink/server/internal/kv"
 	"github.com/termlink/termlink/server/internal/lanreplay"
 	"github.com/termlink/termlink/server/internal/migrate"
+	"github.com/termlink/termlink/server/internal/observability"
 	"github.com/termlink/termlink/server/internal/phase1test"
 	"github.com/termlink/termlink/server/internal/realtime"
 	serverruntime "github.com/termlink/termlink/server/internal/runtime"
@@ -86,7 +87,8 @@ func runProduction() error {
 		SubjectKey: []byte(cfg.TokenSigningKey.Value()), TokenKey: []byte(cfg.TokenSigningKey.Value()), History: historyStore,
 		ClientConfig: api.ClientConfiguration{OIDCIssuer: cfg.OIDCIssuer, OIDCClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI},
 	}
-	hub := realtime.NewHub(repository, valkey, slog.Default())
+	metrics := observability.New(repository.Pool)
+	hub := realtime.NewHubWithObserver(repository, valkey, slog.Default(), metrics)
 	defer func() {
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -98,8 +100,34 @@ func runProduction() error {
 	mux.HandleFunc("GET /readyz", readinessHandler(repository, valkey))
 	mux.Handle("/", productionAPI.Handler())
 	go consumeRevocations(ctx, valkey, hub)
-	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "history_enabled", cfg.HistoryEnabled)
-	return serverruntime.New(cfg, mux).Serve(ctx)
+	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "history_enabled", cfg.HistoryEnabled, "metrics_enabled", cfg.MetricsListenAddr != "")
+	return serveProduction(ctx, serverruntime.New(cfg, metrics.HTTPMiddleware(mux)), metrics, cfg.MetricsListenAddr)
+}
+
+func serveProduction(ctx context.Context, application *serverruntime.Runtime, metrics *observability.Metrics, metricsAddr string) error {
+	runContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type serverResult struct {
+		name string
+		err  error
+	}
+	serverCount := 1
+	results := make(chan serverResult, 2)
+	go func() { results <- serverResult{name: "application", err: application.Serve(runContext)} }()
+	if metricsAddr != "" {
+		serverCount++
+		go func() { results <- serverResult{name: "metrics", err: metrics.Serve(runContext, metricsAddr)} }()
+	}
+
+	var firstError error
+	for range serverCount {
+		result := <-results
+		if result.err != nil && firstError == nil {
+			firstError = fmt.Errorf("%s server: %w", result.name, result.err)
+		}
+		cancel()
+	}
+	return firstError
 }
 
 func runMigrate() error {

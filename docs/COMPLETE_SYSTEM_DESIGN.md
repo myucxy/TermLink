@@ -1278,8 +1278,9 @@ ConPTY Session 的 Agent 强制结束/受控重启恢复已经验证。Android �
 临时双向测试 Relay → 真实 Termux View 的 ACK、断线恢复、输入 accepted、测试租约、Flow Control、
 History Gap 和 exited 也已验证。测试链路使用隔离的明文 `TLT1` 格式，不是生产
 Protobuf/Relay/E2EE；可移植 Snapshot 仍未冻结，也未用 Termux 私有状态替代。Updater 已用
-两个真实开发签名 MSIX 验证签名清单、身份/版本/哈希、篡改拒绝和故障回滚状态机，但未在
-生产受信证书下执行真实 AppX 更新或降级。
+两个真实开发签名 MSIX 验证签名清单、身份/版本/哈希、篡改拒绝和故障回滚状态机；第 7 项
+还在临时 `LocalMachine/TrustedPeople` 开发信任下完成真实 AppX 安装、包身份启动、更新、
+降级和卸载。生产发布证书链与实际登录周期仍未外部验收。
 
 ### 阶段 2：Docker 服务端与账号（3～4 周）
 
@@ -1291,7 +1292,7 @@ Protobuf/Relay/E2EE；可移植 Snapshot 仍未冻结，也未用 Termux 私有�
 
 - 完整 Android UI、历史回放、设置、通知和无障碍；
 - Windows 托盘、Profile、签名安装和更新；
-- xterm.js 回退、压力测试、安全测试、备份恢复和发布流水线。
+- xterm.js 回退、压力测试和安全测试；备份恢复与发布流水线已完成本地实现和演练，外部发布待验收。
 
 ### 阶段 4：稳定与规模化
 
@@ -1368,11 +1369,11 @@ Termux Fork 可以使用 Git Subtree/Submodule + Patch Queue，也可以镜像�
 当前环境已经完成 Golden Stream → Termux/xterm.js 对照，以及 Android → Docker 临时测试
 Relay → Termux View 的双向闭环，以及正式 .NET 8 Agent/Tray、DPAPI 注册索引和 20 Session
 重启恢复。Windows 已具备自包含签名 MSIX、登录 StartupTask、Tray 单实例和受控 Updater；
-开发证书下的包结构、签名、解包 payload、更新输入验证和故障回滚状态机已验证，但没有绕过
-Windows 安全警告执行根证书信任或真实 AppX 注册。生产受信证书可用后应补安装/卸载、登录
-启动和真实更新/降级验收；当前可继续进入生产设备授权、Crypto 与 Relay。兼容和安全评审
-完成后再冻结生产 Envelope 和可移植 Snapshot。arm64 真机、厂商 IME、外接键鼠与更多屏幕形态仍需真实硬件
-验证。
+开发证书下的包结构、签名、更新输入、故障回滚以及真实 AppX 安装/更新/降级/卸载均已验证，
+演练只临时使用本机 TrustedPeople 并已清理。服务端 TLS、无正文指标、告警、备份恢复和镜像
+供应链也已完成本地验证。生产发布证书、真实域名 ACME、GitHub OIDC release tag、外部 Provider
+和实际登录周期仍需外部验收。兼容和安全评审完成后再冻结生产 Envelope 和可移植 Snapshot；
+arm64 真机、厂商 IME、外接键鼠与更多屏幕形态仍需真实硬件验证。
 
 ## 19. 关联文档
 

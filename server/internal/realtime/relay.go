@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -37,6 +38,7 @@ type Hub struct {
 	store         *store.Postgres
 	leases        *kv.Valkey
 	logger        *slog.Logger
+	observer      Observer
 	mu            sync.RWMutex
 	peers         map[uuid.UUID]*peer
 	subscriptions map[uuid.UUID]map[uuid.UUID]*peer
@@ -44,10 +46,35 @@ type Hub struct {
 }
 
 func NewHub(repository *store.Postgres, leases *kv.Valkey, logger *slog.Logger) *Hub {
+	return NewHubWithObserver(repository, leases, logger, nil)
+}
+
+// Observer receives low-cardinality routing measurements. Implementations
+// must never attach raw device/session identifiers or encrypted payloads.
+type Observer interface {
+	ConnectionOpened(role string)
+	ConnectionClosed(role string)
+	SubscriptionsChanged(delta int)
+	EnvelopeRouted(direction, messageType, result string, size int, duration time.Duration)
+	SlowConsumerDisconnected()
+}
+
+type noopObserver struct{}
+
+func (noopObserver) ConnectionOpened(string)                                   {}
+func (noopObserver) ConnectionClosed(string)                                   {}
+func (noopObserver) SubscriptionsChanged(int)                                  {}
+func (noopObserver) EnvelopeRouted(string, string, string, int, time.Duration) {}
+func (noopObserver) SlowConsumerDisconnected()                                 {}
+
+func NewHubWithObserver(repository *store.Postgres, leases *kv.Valkey, logger *slog.Logger, observer Observer) *Hub {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Hub{store: repository, leases: leases, logger: logger, peers: map[uuid.UUID]*peer{}, subscriptions: map[uuid.UUID]map[uuid.UUID]*peer{}}
+	if observer == nil {
+		observer = noopObserver{}
+	}
+	return &Hub{store: repository, leases: leases, logger: logger, observer: observer, peers: map[uuid.UUID]*peer{}, subscriptions: map[uuid.UUID]map[uuid.UUID]*peer{}}
 }
 
 func (h *Hub) Handler() http.Handler { return http.HandlerFunc(h.serveHTTP) }
@@ -122,7 +149,11 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		closeSocket(socket, websocket.CloseTryAgainLater, "relay shutting down")
 		return
 	}
-	defer h.remove(connection)
+	h.observer.ConnectionOpened(connection.role)
+	defer func() {
+		h.remove(connection)
+		h.observer.ConnectionClosed(connection.role)
+	}()
 	welcome := serverWelcome{Type: "welcome", ProtocolVersion: 1, HeartbeatSeconds: int(pingInterval.Seconds()), ConnectionID: uuid.NewString()}
 	if err := socket.WriteJSON(welcome); err != nil {
 		return
@@ -166,18 +197,26 @@ func (h *Hub) remove(p *peer) {
 	if h.peers[p.principal.Device.ID] == p {
 		delete(h.peers, p.principal.Device.ID)
 	}
+	removedSessions := make([]uuid.UUID, 0, len(p.subscriptions))
 	for sessionID := range p.subscriptions {
 		if subscribers := h.subscriptions[sessionID]; subscribers != nil {
+			if subscribers[p.principal.Device.ID] != p {
+				continue
+			}
 			delete(subscribers, p.principal.Device.ID)
+			removedSessions = append(removedSessions, sessionID)
 			if len(subscribers) == 0 {
 				delete(h.subscriptions, sessionID)
 			}
 		}
 	}
 	h.mu.Unlock()
+	if len(removedSessions) > 0 {
+		h.observer.SubscriptionsChanged(-len(removedSessions))
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	for sessionID := range p.subscriptions {
+	for _, sessionID := range removedSessions {
 		_ = h.leases.ReleaseLiveSession(ctx, p.principal.UserID, sessionID, p.principal.Device.ID)
 	}
 }
@@ -216,7 +255,14 @@ func (p *peer) readLoop() {
 			return
 		}
 		p.lastSequences[sessionID] = envelope.Sequence
-		if err := p.route(envelope, sessionID, frame); err != nil {
+		started := time.Now()
+		routeErr := p.route(envelope, sessionID, frame)
+		result := "accepted"
+		if routeErr != nil {
+			result = "denied"
+		}
+		p.hub.observer.EnvelopeRouted(metricDirection(p.role), strconv.FormatUint(uint64(envelope.MessageType), 10), result, len(frame), time.Since(started))
+		if routeErr != nil {
 			p.hub.logger.Warn("realtime route denied", "device", shortID(p.principal.Device.ID), "session", shortID(sessionID), "type", uint32(envelope.MessageType))
 			p.close(websocket.ClosePolicyViolation, "routing authorization denied")
 			return
@@ -225,6 +271,9 @@ func (p *peer) readLoop() {
 }
 
 func (p *peer) route(envelope realtimewire.Envelope, sessionID uuid.UUID, frame []byte) error {
+	if !p.hub.isCurrent(p) {
+		return store.ErrDenied
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if len(envelope.RecipientDeviceID) != 16 {
@@ -284,25 +333,42 @@ func (p *peer) route(envelope realtimewire.Envelope, sessionID uuid.UUID, frame 
 
 func (h *Hub) subscribe(p *peer, sessionID uuid.UUID) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	subscribers := h.subscriptions[sessionID]
 	if subscribers == nil {
 		subscribers = map[uuid.UUID]*peer{}
 		h.subscriptions[sessionID] = subscribers
 	}
+	_, existed := subscribers[p.principal.Device.ID]
 	subscribers[p.principal.Device.ID] = p
 	p.subscriptions[sessionID] = true
+	h.mu.Unlock()
+	if !existed {
+		h.observer.SubscriptionsChanged(1)
+	}
 }
 func (h *Hub) unsubscribe(p *peer, sessionID uuid.UUID) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	delete(p.subscriptions, sessionID)
+	removed := false
 	if subscribers := h.subscriptions[sessionID]; subscribers != nil {
-		delete(subscribers, p.principal.Device.ID)
-		if len(subscribers) == 0 {
-			delete(h.subscriptions, sessionID)
+		if subscribers[p.principal.Device.ID] == p {
+			delete(subscribers, p.principal.Device.ID)
+			removed = true
+			if len(subscribers) == 0 {
+				delete(h.subscriptions, sessionID)
+			}
 		}
 	}
+	h.mu.Unlock()
+	if removed {
+		h.observer.SubscriptionsChanged(-1)
+	}
+}
+
+func (h *Hub) isCurrent(p *peer) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.peers[p.principal.Device.ID] == p
 }
 func (h *Hub) sendToSubscriber(sender *peer, sessionID, recipient uuid.UUID, frame []byte) bool {
 	h.mu.RLock()
@@ -328,7 +394,9 @@ func (p *peer) enqueue(frame []byte) {
 	select {
 	case p.send <- copyFrame:
 	default:
-		p.close(websocket.CloseTryAgainLater, "slow consumer; resume from cumulative ACK")
+		if p.close(websocket.CloseTryAgainLater, "slow consumer; resume from cumulative ACK") {
+			p.hub.observer.SlowConsumerDisconnected()
+		}
 	}
 }
 func (p *peer) writeLoop() {
@@ -375,8 +443,14 @@ func (p *peer) refreshSubscriptions() {
 		_, _ = p.hub.leases.ReserveLiveSession(ctx, p.principal.UserID, id, p.principal.Device.ID, entitlement.MaxLiveSessions)
 	}
 }
-func (p *peer) close(code int, reason string) {
-	p.once.Do(func() { close(p.done); closeSocket(p.socket, code, reason) })
+func (p *peer) close(code int, reason string) bool {
+	closed := false
+	p.once.Do(func() {
+		closed = true
+		close(p.done)
+		closeSocket(p.socket, code, reason)
+	})
+	return closed
 }
 func closeSocket(socket *websocket.Conn, code int, reason string) {
 	_ = socket.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), time.Now().Add(time.Second))
@@ -412,5 +486,12 @@ func (h *Hub) Close(ctx context.Context) error {
 	}
 }
 func shortID(id uuid.UUID) string { return fmt.Sprintf("%x", id[:4]) }
+
+func metricDirection(role string) string {
+	if role == "pc" {
+		return "pc_to_android"
+	}
+	return "android_to_pc"
+}
 
 var _ = errors.Is

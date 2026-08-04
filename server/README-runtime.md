@@ -52,15 +52,90 @@ startup errors identify only the configuration field, never the secret value.
 | 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
 | 5 | 服务端 Catalog、计费验证边界、权益与配额 | **核心已实现并验证（Provider 待配置）** | Go `billing`/Catalog/entitlement API、可注入 verified-purchase 契约与 Android `feature-billing` 已测试；真实 Google/Web verifier 未配置时生产入口返回 `BILLING_UNAVAILABLE`。 |
 | 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |
-| 7 | 生产 TLS/受信发布证书真实安装更新、备份恢复演练、镜像签名、监控告警、生产 CA/发布加固 | **未开始** | 仅有开发证书/故障注入和本地 Compose 验证；真实证书链、系统级安装更新、灾备演练、镜像签名与生产运维尚未验收。 |
+| 7 | 生产 TLS/受信发布证书真实安装更新、备份恢复演练、镜像签名、监控告警、生产 CA/发布加固 | **已实现并本地验证（外部发布待验收）** | Caddy/ACME、内部 Prometheus、Alertmanager/Grafana、真实 PostgreSQL+MinIO 恢复演练、摘要固定、SBOM/provenance/Cosign workflow 与部署策略已验证；生产域名签发、告警接收器和 GitHub OIDC release tag 仍需外部执行。 |
 
 统一边界：`LAN Replay V1`、`TLT1`（Phase 1 Test Session V1）和 Android Compose
 Harness 都是测试夹具，不是生产协议；Android 历史客户端只接受 HTTPS。Integration
-Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-6
-的自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏或生产发布已经验证。
+Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-7
+的本地自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏或外部生产发布已经验证。
 
 运行时配置仍要求真实 OIDC/Google/Web Billing Provider 在部署前注入；本地默认配置只验证
 契约和 `BILLING_UNAVAILABLE` 失败边界，不冒充线上购买或公网部署结果。
+
+## TLS, observability, backup, and release checks
+
+Production uses `Caddyfile` with TLS 1.2/1.3, HSTS, a production Let's Encrypt
+ACME endpoint, separate application/history hosts, and public denial of
+`/metrics` and `/debug`. Metrics listen on the internal-only server port 9090.
+The observability layer adds Prometheus, Blackbox readiness probing,
+Alertmanager, and a provisioned Grafana dashboard; Grafana and Alertmanager
+bind to loopback by default, while Prometheus has no host port.
+
+Set `TERMLINK_IMAGE` to an immutable `tag@sha256:<digest>` reference and run:
+
+```powershell
+.\ops\Test-ProductionDeployment.ps1 `
+  -EnvFile .\.env `
+  -ComposeFile @(
+    '.\compose\core.compose.yml',
+    '.\compose\history.compose.yml',
+    '.\compose\observability.compose.yml'
+  )
+
+docker compose --env-file .env `
+  -f compose\core.compose.yml `
+  -f compose\history.compose.yml `
+  -f compose\observability.compose.yml `
+  --profile edge config
+```
+
+The policy check requires the complete reviewed service set, the TermLink image
+from `ghcr.io/myucxy/termlink-server` at an immutable digest, exact reviewed
+third-party images, fixed network membership, approved environment keys,
+`/run/secrets` references, and no declared secret value anywhere in the rendered
+configuration. It also rejects unexpected ports, non-loopback management ports,
+missing or reparse-point secret paths, reserved test domains, and any ACME CA
+other than the production Let's Encrypt endpoint.
+
+Backups contain a PostgreSQL custom-format dump and an exact MinIO mirror with
+per-file sizes and SHA-256 values. Valkey is explicitly reconstructable state.
+Production backup output must be outside the repository on an encrypted-at-rest
+destination. The operator must keep a separate random 32-byte-or-longer manifest
+authentication key in protected storage. Restore authenticates the manifest with
+HMAC-SHA-256, validates every payload, copies each payload to isolated container
+staging, rechecks its SHA-256 there, and only then performs destructive work. It
+keeps application services stopped if restoration fails:
+
+```powershell
+.\ops\Backup-TermLink.ps1 `
+  -Destination 'E:\TermLinkEncryptedBackups\2026-08-04' `
+  -ManifestAuthenticationKeyFile 'E:\TermLinkProtectedKeys\backup-manifest.key' `
+  -DestinationEncryptionConfirmed
+
+.\ops\Restore-TermLink.ps1 `
+  -BackupPath 'E:\TermLinkEncryptedBackups\2026-08-04' `
+  -ManifestAuthenticationKeyFile 'E:\TermLinkProtectedKeys\backup-manifest.key' `
+  -ConfirmDestructiveRestore
+
+.\ops\Test-BackupRestore.ps1
+```
+
+The release workflow builds `linux/amd64` and `linux/arm64`, emits SPDX and
+CycloneDX SBOMs plus maximum BuildKit provenance, and signs the immutable GHCR
+digest plus SLSA provenance and both SBOM attestations with GitHub OIDC/Cosign. All third-party Actions and
+container bases are pinned. Local policy and post-release verification entry
+points are:
+
+```powershell
+.\release\Test-ReleasePolicy.ps1
+.\release\Verify-ImageRelease.ps1 `
+  -Image 'ghcr.io/myucxy/termlink-server' `
+  -Digest 'sha256:<64-lowercase-hex>' `
+  -Tag 'v1.0.0'
+```
+
+Local validation cannot substitute for real DNS/ACME issuance, an approved
+Alertmanager receiver, or execution of a signed GitHub release tag.
 
 ## Production checks
 

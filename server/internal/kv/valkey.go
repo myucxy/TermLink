@@ -120,7 +120,17 @@ func (v *Valkey) Release(ctx context.Context, lease Lease) (bool, error) {
 	return result == 1, err
 }
 
-func(v *Valkey)ForceRelease(ctx context.Context,sessionID uuid.UUID)(Lease,bool,error){lease,err:=v.GetLease(ctx,sessionID);if errors.Is(err,redis.Nil){return Lease{},false,nil};if err!=nil{return Lease{},false,err};removed,err:=v.Client.Del(ctx,"lease:"+sessionID.String()).Result();return lease,removed==1,err}
+func (v *Valkey) ForceRelease(ctx context.Context, sessionID uuid.UUID) (Lease, bool, error) {
+	lease, err := v.GetLease(ctx, sessionID)
+	if errors.Is(err, redis.Nil) {
+		return Lease{}, false, nil
+	}
+	if err != nil {
+		return Lease{}, false, err
+	}
+	removed, err := v.Client.Del(ctx, "lease:"+sessionID.String()).Result()
+	return lease, removed == 1, err
+}
 
 func (v *Valkey) GetLease(ctx context.Context, sessionID uuid.UUID) (Lease, error) {
 	value, err := v.Client.Get(ctx, "lease:"+sessionID.String()).Result()

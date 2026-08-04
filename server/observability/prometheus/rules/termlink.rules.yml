@@ -1,0 +1,68 @@
+groups:
+  - name: termlink-operational
+    interval: 30s
+    rules:
+      - alert: TermlinkServerMetricsScrapeDown
+        expr: up{job="termlink-server"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: TermLink server metrics scrape is down
+          description: Prometheus cannot reach the server metrics listener.
+
+      - alert: TermlinkServerReadinessFailed
+        expr: absent(probe_success{job="termlink-readiness"}) or probe_success{job="termlink-readiness"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: TermLink server readiness is unavailable
+          description: The production readiness endpoint has failed its PostgreSQL, schema, or Valkey check for five minutes.
+
+      - alert: TermlinkHTTP5xxRatioHigh
+        expr: |
+          sum(rate(termlink_http_requests_total{status_class=~"5xx"}[5m]))
+            /
+          sum(rate(termlink_http_requests_total[5m])) > 0.05
+          and sum(rate(termlink_http_requests_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TermLink HTTP 5xx ratio is elevated
+          description: More than five percent of observed HTTP requests returned a 5xx status.
+
+      - alert: TermlinkHTTPP95LatencyHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(termlink_http_request_duration_seconds_bucket[5m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TermLink HTTP p95 latency is high
+          description: The aggregate HTTP request p95 has exceeded one second for ten minutes.
+
+      - alert: TermlinkRealtimeSlowConsumerDisconnects
+        expr: increase(termlink_realtime_slow_consumer_disconnects_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TermLink disconnected a slow realtime consumer
+          description: At least one slow-consumer disconnect was recorded in the last ten minutes.
+
+      - alert: TermlinkPostgresPoolSaturation
+        expr: |
+          sum(termlink_postgres_pool_connections{state="in_use"})
+            /
+          sum(termlink_postgres_pool_connections{state="max"}) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TermLink PostgreSQL pool is near saturation
+          description: More than ninety percent of configured PostgreSQL connections are in use.

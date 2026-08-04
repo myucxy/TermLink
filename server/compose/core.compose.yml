@@ -2,20 +2,20 @@ name: ${COMPOSE_PROJECT_NAME:-termlink}
 
 services:
   edge:
-    image: caddy:2.10.0-alpine
-    command:
-      - caddy
-      - reverse-proxy
-      - --from
-      - ${TERMLINK_PUBLIC_HOST:-localhost}:8443
-      - --to
-      - http://server:8080
+    image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    environment:
+      TERMLINK_PUBLIC_HOST: ${TERMLINK_PUBLIC_HOST:-localhost}
+      TERMLINK_HISTORY_PUBLIC_HOST: ${TERMLINK_HISTORY_PUBLIC_HOST:-history.localhost}
+      TERMLINK_ACME_CA: ${TERMLINK_ACME_CA:-https://acme-v02.api.letsencrypt.org/directory}
+      TERMLINK_ACME_EMAIL: ${TERMLINK_ACME_EMAIL:?TERMLINK_ACME_EMAIL is required}
     ports:
       - "${TERMLINK_EDGE_BIND_IP:-0.0.0.0}:443:8443"
     networks:
       - public
       - private
     volumes:
+      - ../Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
     read_only: true
@@ -29,7 +29,7 @@ services:
       server:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --no-check-certificate -O - https://127.0.0.1:8443/healthz >/dev/null"]
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8081/readyz >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -38,10 +38,7 @@ services:
     profiles: ["edge"]
 
   migrate:
-    build:
-      context: ../..
-      dockerfile: server/Dockerfile
-    image: ${TERMLINK_IMAGE:-ghcr.io/termlink/termlink-server:0.1.0}
+    image: ${TERMLINK_IMAGE:?TERMLINK_IMAGE immutable tag@sha256 digest is required}
     command: ["migrate"]
     environment: &server-environment
       TERMLINK_PUBLIC_URL: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}
@@ -92,10 +89,7 @@ services:
     restart: "no"
 
   server:
-    build:
-      context: ../..
-      dockerfile: server/Dockerfile
-    image: ${TERMLINK_IMAGE:-ghcr.io/termlink/termlink-server:0.1.0}
+    image: ${TERMLINK_IMAGE:?TERMLINK_IMAGE immutable tag@sha256 digest is required}
     environment: *server-environment
     secrets: *server-secrets
     networks:
@@ -126,7 +120,7 @@ services:
         condition: service_completed_successfully
 
   postgres:
-    image: postgres:17.5-alpine3.22
+    image: postgres:17.5-alpine3.22@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-termlink}
       POSTGRES_USER: ${POSTGRES_USER:-termlink}
@@ -148,7 +142,7 @@ services:
     restart: unless-stopped
 
   valkey:
-    image: valkey/valkey:8.1.1-alpine
+    image: valkey/valkey:8.1.1-alpine@sha256:6a57d58c0a37cf7acc3045ac0fd6dd91be339774106ab4d9ca088013a096a99f
     command: ["valkey-server", "--appendonly", "yes"]
     networks:
       - private

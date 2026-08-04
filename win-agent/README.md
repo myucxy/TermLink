@@ -159,11 +159,11 @@ E2EE 实现与 `protocol/protobuf/termlink_realtime.proto` 保持同一 Envelope
 | 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
 | 5 | 服务端 Catalog、计费验证边界、权益与配额 | **核心已实现并验证（Provider 待配置）** | Go Catalog/entitlement、可注入 verified-purchase 契约和 Android Play Billing 协调已测试；生产 main 在真实 Google/Web verifier 未配置时返回 `BILLING_UNAVAILABLE`，未冒充线上购买验证。 |
 | 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |
-| 7 | 生产 TLS/受信发布证书真实安装更新、备份恢复演练、镜像签名、监控告警、生产 CA/发布加固 | **未开始** | 仅有开发证书/故障注入和本地 Compose 验证；真实证书链、系统级安装更新、灾备演练、镜像签名与生产运维尚未验收。 |
+| 7 | 生产 TLS/受信发布证书真实安装更新、备份恢复演练、镜像签名、监控告警、生产 CA/发布加固 | **已实现并本地验证（生产证书待验收）** | 开发信任下真实 MSIX 安装、包身份启动、Updater 升级、强制降级和卸载通过且无残留；生产发布者证书链和时间戳仍需外部验收。服务端 TLS、备份恢复、监控和镜像供应链也已完成本地验证。 |
 
 统一边界：`LAN Replay V1`、`TLT1`（Phase 1 Test Session V1）和 Android Compose
 Harness 都是测试夹具，不是生产协议；Android 历史客户端只接受 HTTPS。Integration
-Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-6
+Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-7
 的自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏、真实计费 Provider
 或生产发布已经验证。
 
@@ -195,12 +195,13 @@ MSIX 使用 `windows.startupTask` 在当前用户登录后启动 `TermLink.Tray.
 .\tests\Validate-WindowsInstaller.ps1
 ```
 
-验证使用不落库的临时开发证书，覆盖 8 个嵌入签名、完整 MSIX 签名、自包含包、固定更新
-发布者证书、Manifest/StartupTask、解包 payload、Tray 单实例、Agent 状态与关闭；不会修改系统证书库或
-注册测试包。当前机器关闭 Developer Mode，开发根证书安装会触发 Windows 安全确认，因此
-尚未把开发证书自动加入 Root，也没有把该结果写成真实 `Add-AppxPackage` 成功。生产证书链
-可用后必须补当前用户安装、登录后启动和卸载验收。证据位于
-`docs/validation/phase1-windows-installer.json`。
+`Validate-WindowsInstaller.ps1` 继续使用不落库的临时开发证书验证 8 个嵌入签名、完整 MSIX、
+自包含 payload、固定更新发布者证书、Manifest/StartupTask、Tray 单实例、Agent 状态与关闭，
+且不注册测试包。第 7 项另由 `Validate-TrustedMsixLifecycle.ps1` 在显式确认和提升会话下，临时
+把已有开发发布证书加入 `LocalMachine/TrustedPeople`，使用隔离包身份完成真实注册、包身份
+启动、升级、降级和卸载；最后按指纹与证书原始字节哈希精确移除本轮证书，包和进程也无残留。
+证据分别位于 `docs/validation/phase1-windows-installer.json` 和
+`docs/validation/item7-windows-msix-lifecycle.json`。该结果只证明开发信任机制，不证明生产证书链。
 
 ## 受控更新与失败回滚
 
@@ -229,13 +230,13 @@ $password = Read-Host 'PFX password' -AsSecureString
 ```
 
 该测试用同一临时开发证书构建 0.1.0.0 和 0.2.0.0 两个真实 MSIX，覆盖清单/包篡改拒绝、
-成功、部署失败、健康失败回滚、回滚失败和回滚重入。部署动作使用故障注入后端，不注册
-AppX 或修改证书库。真实 PowerShell MSIX 部署后端已经实现，但必须等生产受信证书可用后
-再执行系统级更新/降级验收。证据位于
-`docs/validation/phase1-windows-updater.json`。
+成功、部署失败、健康失败回滚、回滚失败和回滚重入。故障注入证据位于
+`docs/validation/phase1-windows-updater.json`。第 7 项生命周期测试还验证了真实 PowerShell
+MSIX 部署后端：目标事务进入 `Succeeded`，随后以 `ForceUpdateFromAnyVersion` 回到旧版并
+再次通过 Agent 健康检查。生产模式仍要求 Authenticode `Valid` 证书链和 HTTPS RFC 3161 时间戳。
 
 生产 Relay、账号/设备授权、设备密钥、E2EE、租约和历史上传已由生产 runtime 与跨端
 自动化验收覆盖；阶段性本机控制 Pipe V3 和 DPAPI 注册索引仍不等于生产 Protobuf 或
-跨设备协议。生产受信证书下的真实安装/卸载、登录自启、`Add-AppxPackage` 更新/降级仍
-未验收，连同备份、镜像签名、监控告警和生产 CA/发布加固属于开发项 7；不得把开发证书
-故障注入结果写成生产发布验证。
+跨设备协议。开发信任下的真实安装/卸载、包身份启动和 `Add-AppxPackage` 更新/降级已验收；
+实际注销/登录周期、生产受信发布证书和时间戳服务仍需外部验收。不得把开发证书结果写成
+生产发布验证。

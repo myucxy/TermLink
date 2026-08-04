@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -80,16 +81,17 @@ type Config struct {
 	S3AccessKeyFile  string
 	S3SecretKeyFile  string
 
-	LogLevel       string
-	HistoryEnabled bool
-	ListenAddr     string
+	LogLevel          string
+	HistoryEnabled    bool
+	ListenAddr        string
+	MetricsListenAddr string
 }
 
 // String returns a safe diagnostic representation. It intentionally omits
 // secret paths as well as secret values, because paths can contain identifying
 // deployment information and are not needed in normal startup diagnostics.
 func (c Config) String() string {
-	return fmt.Sprintf("Config{PublicURL:%q OIDCIssuer:%q OIDCClientID:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q OIDCClientSecret:%s DatabaseURL:%s RedisURL:%s TokenSigningKey:%s S3Endpoint:%q S3PublicEndpoint:%q S3Bucket:%q S3Region:%q S3AccessKey:%s S3SecretKey:%s LogLevel:%q HistoryEnabled:%t ListenAddr:%q}",
+	return fmt.Sprintf("Config{PublicURL:%q OIDCIssuer:%q OIDCClientID:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q OIDCClientSecret:%s DatabaseURL:%s RedisURL:%s TokenSigningKey:%s S3Endpoint:%q S3PublicEndpoint:%q S3Bucket:%q S3Region:%q S3AccessKey:%s S3SecretKey:%s LogLevel:%q HistoryEnabled:%t ListenAddr:%q MetricsListenAddr:%q}",
 		c.PublicURL,
 		c.OIDCIssuer,
 		c.OIDCClientID,
@@ -108,6 +110,7 @@ func (c Config) String() string {
 		c.LogLevel,
 		c.HistoryEnabled,
 		c.ListenAddr,
+		c.MetricsListenAddr,
 	)
 }
 
@@ -143,9 +146,10 @@ type Input struct {
 	S3AccessKey      string
 	S3SecretKey      string
 
-	LogLevel       string
-	HistoryEnabled bool
-	ListenAddr     string
+	LogLevel          string
+	HistoryEnabled    bool
+	ListenAddr        string
+	MetricsListenAddr string
 }
 
 // New validates explicitly supplied values. It is useful for focused tests;
@@ -170,6 +174,7 @@ func New(input Input) (Config, error) {
 		LogLevel:               input.LogLevel,
 		HistoryEnabled:         input.HistoryEnabled,
 		ListenAddr:             input.ListenAddr,
+		MetricsListenAddr:      input.MetricsListenAddr,
 	})
 }
 
@@ -280,6 +285,7 @@ func LoadSource(source Source) (Config, error) {
 		return Config{}, err
 	}
 	listenAddr := lookupOptional("TERMLINK_LISTEN_ADDR", defaultListenAddr)
+	metricsListenAddr := lookupOptional("TERMLINK_METRICS_LISTEN_ADDR", "")
 
 	oidcSecret, err := readSecret(source, "TERMLINK_OIDC_CLIENT_SECRET_FILE")
 	if err != nil {
@@ -342,6 +348,7 @@ func LoadSource(source Source) (Config, error) {
 		LogLevel:               logLevel,
 		HistoryEnabled:         historyEnabled,
 		ListenAddr:             listenAddr,
+		MetricsListenAddr:      metricsListenAddr,
 	})
 }
 
@@ -471,7 +478,32 @@ func validate(c Config) (Config, error) {
 	if strings.TrimSpace(c.ListenAddr) == "" {
 		c.ListenAddr = defaultListenAddr
 	}
+	c.MetricsListenAddr = strings.TrimSpace(c.MetricsListenAddr)
+	if c.MetricsListenAddr != "" {
+		if err := validateListenAddr("TERMLINK_METRICS_LISTEN_ADDR", c.MetricsListenAddr); err != nil {
+			return Config{}, err
+		}
+		if c.MetricsListenAddr == c.ListenAddr {
+			return Config{}, fmt.Errorf("%w: TERMLINK_METRICS_LISTEN_ADDR must differ from TERMLINK_LISTEN_ADDR", ErrInvalid)
+		}
+	}
 	return c, nil
+}
+
+func validateListenAddr(name, value string) error {
+	host, port, err := net.SplitHostPort(value)
+	if err != nil || port == "" {
+		return fmt.Errorf("%w: %s", ErrInvalid, name)
+	}
+	if parsed, err := strconv.ParseUint(port, 10, 16); err != nil || parsed == 0 {
+		return fmt.Errorf("%w: %s", ErrInvalid, name)
+	}
+	if host != "" {
+		if ip := net.ParseIP(host); ip == nil && !strings.EqualFold(host, "localhost") {
+			return fmt.Errorf("%w: %s", ErrInvalid, name)
+		}
+	}
+	return nil
 }
 
 func validBucketName(value string) bool {

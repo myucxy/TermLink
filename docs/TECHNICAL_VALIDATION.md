@@ -427,9 +427,13 @@ Manifest 使用稳定身份 `TermLink.Terminal`、`runFullTrust` 和
 双启动单实例、Agent 状态与关闭。验证前后测试包、证书库和 TermLink 进程均无残留。证据为
 [`phase1-windows-installer.json`](validation/phase1-windows-installer.json)。
 
-当前系统关闭 Developer Mode，临时开发根证书加入 CurrentUser Root 会触发 Windows 安全
-确认；自动化没有点击或绕过该警告，也没有把解包运行写成真实安装成功。生产受信代码签名
-证书可用后仍须执行 `Add-AppxPackage`、实际登录启动和卸载验收。
+第 7 项新增 `Validate-TrustedMsixLifecycle.ps1`。它拒绝覆盖任何已有同身份包，在显式确认和
+提升会话下仅把指定开发发布证书临时加入 `LocalMachine/TrustedPeople`，不写入 Root；随后用
+隔离身份执行真实 `Add-AppxPackage` 注册、AppsFolder 包身份启动、0.1.0.0 → 0.2.0.0 更新器
+升级、`ForceUpdateFromAnyVersion` 降级、三次 Agent 健康检查和卸载。演练后包、证书和 TermLink
+进程均为 0，证据为
+[`item7-windows-msix-lifecycle.json`](validation/item7-windows-msix-lifecycle.json)。这只证明
+开发信任机制；生产证书链、RFC 3161 时间戳和实际注销/登录自启仍须外部验收。
 
 ### 7.3.1 受控更新与失败回滚
 
@@ -443,6 +447,10 @@ SHA-256。目标与回滚包先原子缓存，再由包外 runner 通过可恢�
 部署失败保留旧版、健康失败回滚、回滚失败和回滚重入 5 条路径。部署状态使用故障注入后端，
 未注册 AppX、未改证书库，也未把结果写成真实系统更新成功。证据为
 [`phase1-windows-updater.json`](validation/phase1-windows-updater.json)。
+
+生命周期演练进一步验证真实 PowerShell MSIX 后端。WindowsApps 不能由包外事务进程直接执行，
+因此健康检查改为 `Invoke-CommandInDesktopPackage` 包上下文，启动改为 AppsFolder AUMID；更新
+事务最终进入 `Succeeded`，随后真实降级和再次健康检查也通过。
 
 ### 7.4 Android RemoteTerminalSession
 
@@ -496,16 +504,12 @@ Agent 或真实 Shell，不实现设备批准，也不使用 Termux 私有状态
 
 ### 7.6 尚未完成的生产边界
 
-以上完成阶段 1 的本地 IPC、Session Registry 与客户端状态机核心，不证明生产可用。仍需
-实现和验证：
+当前自动化不证明外部生产发布。仍需配置或验证：
 
-- Agent/Tray 使用生产受信证书的真实安装/卸载、登录启动和 Updater 更新/降级；受控更新
-  核心和故障回滚状态机已经验证；
-- Android 正式设备/Session 页面，以及 `RemoteTerminalSession` 与生产网络、Crypto、
-  设备授权的组合；
-- Windows Agent → 生产 Relay → Android 的真实端到端输入、ACK、背压和恢复闭环；
+- Agent/Tray 使用生产受信发布证书与时间戳的安装/更新，以及实际注销/登录 StartupTask；
+- 真实 DNS 上的 ACME 证书签发、外部 OIDC/Billing Provider、告警接收器和 GitHub OIDC release tag；
+- Windows Agent → 公网生产 Relay → Android 的真实端到端输入、ACK、背压和恢复闭环；
 - 通过兼容评审后再冻结 Protobuf Envelope 与可移植 `TerminalSnapshotV1`；
-- OIDC、设备授权、Lease Coordinator、E2EE、Key Epoch 和无正文服务端可观测性；
 - arm64 真机、厂商 IME、键鼠、平板/折叠屏、TalkBack 和后台生命周期。
 
 LAN Replay 和 Phase 1 Test Session 都只能使用固定非敏感夹具，不能用来替代上述验收。

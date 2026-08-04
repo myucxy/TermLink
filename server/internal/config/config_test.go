@@ -37,6 +37,9 @@ func TestLoadFromEnvReadsSecretsAndRedactsDiagnostics(t *testing.T) {
 	if c.ListenAddr != ":8080" {
 		t.Fatalf("ListenAddr = %q, want :8080", c.ListenAddr)
 	}
+	if c.MetricsListenAddr != "" {
+		t.Fatalf("MetricsListenAddr = %q, want disabled", c.MetricsListenAddr)
+	}
 	output := c.String()
 	for _, secret := range []string{"oidc-secret", "postgres://termlink:password@postgres/termlink", "redis://:password@valkey:6379/0", "01234567890123456789012345678901"} {
 		if strings.Contains(output, secret) {
@@ -208,6 +211,33 @@ func TestNewExplicitInputAppliesDefaultsAndValidates(t *testing.T) {
 	}
 	if c.LogLevel != "info" || c.ListenAddr != ":8080" {
 		t.Fatalf("defaults not applied: %#v", c)
+	}
+}
+
+func TestMetricsListenerIsExplicitAndSeparate(t *testing.T) {
+	input := Input{
+		PublicURL:         "https://termlink.example.test",
+		OIDCIssuer:        "https://issuer.example.test",
+		OIDCClientID:      "client",
+		OIDCClientSecret:  "oidc",
+		DatabaseURL:       "postgres",
+		RedisURL:          "redis",
+		TokenSigningKey:   "01234567890123456789012345678901",
+		MetricsListenAddr: ":9090",
+	}
+	c, err := New(input)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if c.MetricsListenAddr != ":9090" {
+		t.Fatalf("MetricsListenAddr = %q, want :9090", c.MetricsListenAddr)
+	}
+
+	for _, invalid := range []string{"9090", ":0", "metrics.internal:9090", ":8080"} {
+		input.MetricsListenAddr = invalid
+		if _, err := New(input); err == nil || !errors.Is(err, ErrInvalid) {
+			t.Fatalf("New(MetricsListenAddr=%q) error = %v, want ErrInvalid", invalid, err)
+		}
 	}
 }
 

@@ -1,0 +1,18 @@
+global:
+  resolve_timeout: 5m
+
+# This default retains alerts in Alertmanager without sending them externally.
+# Production deployments should point TERMLINK_ALERTMANAGER_CONFIG_FILE at a
+# permission-restricted local config containing their approved receiver.
+
+route:
+  receiver: default
+  group_by:
+    - alertname
+    - severity
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: default

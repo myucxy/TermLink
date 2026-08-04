@@ -18,11 +18,12 @@ Session Host 与 Agent 之间具备当前用户 Named Pipe、双向 PID/Token �
 History Gap 和 exited。该链路使用隔离的明文测试协议和固定非敏感夹具；LAN Replay V1、
 TLT1 和 Harness 不是生产 Relay、生产 Protobuf、设备授权或 E2EE。生产账号、设备配对、
 Protobuf/E2EE Relay、历史、计费、产品页面和 Compose 接线已经实现并通过自动化验证；
-生产发布仍受第 7 项（受信证书、备份、签名、监控和发布加固）限制。
+第 7 项的生产 TLS 配置、备份恢复、镜像供应链、监控告警和发布策略已经实现并完成本地验收。
 Windows 端现已增加签名 MSIX、登录自启、Tray 单实例和受控更新器；开发证书下已验证独立
 签名更新清单、包身份/版本/SHA-256、篡改拒绝、原子缓存、可恢复事务日志及健康检查失败
-回滚。系统注册安装/卸载和真实 `Add-AppxPackage` 更新/降级尚未执行，需等待生产受信证书；
-这属于开发项 7，不把开发证书结果写成生产发布验证。
+回滚，并通过临时 `LocalMachine/TrustedPeople` 开发信任完成真实 `Add-AppxPackage` 安装、
+包身份启动、更新器升级、强制降级和卸载。开发信任在演练后已精确清理；生产发布仍需真实
+发布证书链、域名 ACME 签发、外部告警接收器及 GitHub OIDC 镜像发布验收。
 
 ## 开发项 1-7 完成矩阵
 
@@ -34,12 +35,12 @@ Windows 端现已增加签名 MSIX、登录自启、Tray 单实例和受控更�
 | 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
 | 5 | 服务端 Catalog、计费验证边界、权益与配额 | **核心已实现并验证（Provider 待配置）** | Go `billing`/Catalog/entitlement API、可注入 verified-purchase 契约与 Android `feature-billing` 已测试；真实 Google/Web verifier 未配置时生产入口返回 `BILLING_UNAVAILABLE`。 |
 | 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |
-| 7 | 生产 TLS/受信发布证书真实安装更新、备份恢复演练、镜像签名、监控告警、生产 CA/发布加固 | **未开始** | 仅有开发证书/故障注入和本地 Compose 验证；真实证书链、系统级安装更新、灾备演练、镜像签名与生产运维尚未验收。 |
+| 7 | 生产 TLS/受信发布证书真实安装更新、备份恢复演练、镜像签名、监控告警、生产 CA/发布加固 | **已实现并本地验证（外部发布待验收）** | Caddy/ACME、隔离指标与告警、PostgreSQL+MinIO 备份恢复、摘要固定、SBOM/provenance/Cosign 工作流及生产 Compose 策略已验证；开发信任下真实 MSIX 安装/升级/降级/卸载通过。生产 CA、真实发布证书和 GitHub OIDC release tag 仍需外部执行。 |
 
 统一边界：`LAN Replay V1`、`TLT1`（Phase 1 Test Session V1）和 Android Compose
 Harness 都是测试夹具，不是生产协议；Android 历史客户端只接受 HTTPS。Integration
-Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-6
-的自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏或生产发布已经验证。
+Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-7
+的本地自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏或外部生产发布已经验证。
 
 ## 商业模式
 

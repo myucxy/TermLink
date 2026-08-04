@@ -1,0 +1,144 @@
+name: Release production server image
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/termlink-server
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      # docker/setup-qemu-action v3.6.0
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392
+
+      # docker/setup-buildx-action v3.11.1
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+
+      # docker/login-action v3.4.0
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # docker/metadata-action v5.8.0
+      - id: metadata
+        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+
+      - id: release-metadata
+        name: Capture immutable build metadata
+        shell: bash
+        run: echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "${GITHUB_OUTPUT}"
+
+      # docker/build-push-action v6.18.0
+      - id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
+        with:
+          context: .
+          file: server/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
+            CREATED=${{ steps.release-metadata.outputs.created }}
+            SOURCE=https://github.com/${{ github.repository }}
+
+      # sigstore/cosign-installer v3.9.2
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159
+
+      - name: Sign immutable image digest with GitHub OIDC
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Extract BuildKit SLSA provenance
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{ json .Provenance.SLSA }}' > termlink-server.provenance.json
+          test -s termlink-server.provenance.json
+
+      # anchore/sbom-action v0.17.9
+      - name: Generate SPDX SBOM from pushed digest
+        uses: anchore/sbom-action@df80a981bc6edbc4e220a492d3cbe9f5547a6e75
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: termlink-server.spdx.json
+
+      - name: Generate CycloneDX SBOM from pushed digest
+        uses: anchore/sbom-action@df80a981bc6edbc4e220a492d3cbe9f5547a6e75
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: termlink-server.cyclonedx.json
+
+      - name: Attach signed SBOM attestations
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign attest --yes --type slsaprovenance --predicate termlink-server.provenance.json "${IMAGE}@${DIGEST}"
+          cosign attest --yes --type spdxjson --predicate termlink-server.spdx.json "${IMAGE}@${DIGEST}"
+          cosign attest --yes --type cyclonedx --predicate termlink-server.cyclonedx.json "${IMAGE}@${DIGEST}"
+
+      - name: Verify keyless signature and attestations
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+          CERTIFICATE_ISSUER: https://token.actions.githubusercontent.com
+        run: |
+          set -euo pipefail
+          cosign verify --certificate-identity "${CERTIFICATE_IDENTITY}" --certificate-oidc-issuer "${CERTIFICATE_ISSUER}" "${IMAGE}@${DIGEST}"
+          cosign verify-attestation --type slsaprovenance --certificate-identity "${CERTIFICATE_IDENTITY}" --certificate-oidc-issuer "${CERTIFICATE_ISSUER}" "${IMAGE}@${DIGEST}"
+          cosign verify-attestation --type spdxjson --certificate-identity "${CERTIFICATE_IDENTITY}" --certificate-oidc-issuer "${CERTIFICATE_ISSUER}" "${IMAGE}@${DIGEST}"
+          cosign verify-attestation --type cyclonedx --certificate-identity "${CERTIFICATE_IDENTITY}" --certificate-oidc-issuer "${CERTIFICATE_ISSUER}" "${IMAGE}@${DIGEST}"
+
+      # actions/upload-artifact v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: termlink-server-sbom-${{ github.ref_name }}
+          path: |
+            termlink-server.provenance.json
+            termlink-server.spdx.json
+            termlink-server.cyclonedx.json
+          if-no-files-found: error
+          retention-days: 30
