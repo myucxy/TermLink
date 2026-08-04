@@ -51,6 +51,13 @@ func main() {
 	}
 }
 
+func optionalHistoryStore(store *history.Store) api.HistoryObjectStore {
+	if store == nil {
+		return nil
+	}
+	return store
+}
+
 func runProduction() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -85,7 +92,7 @@ func runProduction() error {
 	}
 	productionAPI := &api.API{
 		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication,
-		SubjectKey: []byte(cfg.TokenSigningKey.Value()), TokenKey: []byte(cfg.TokenSigningKey.Value()), History: historyStore,
+		SubjectKey: []byte(cfg.TokenSigningKey.Value()), TokenKey: []byte(cfg.TokenSigningKey.Value()), History: optionalHistoryStore(historyStore),
 		ClientConfig: api.ClientConfiguration{
 			OIDCIssuer: cfg.OIDCIssuer, OIDCClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI,
 			WindowsClientID: cfg.WindowsOIDCClientID, WindowsRedirectURI: cfg.WindowsOIDCRedirectURI,

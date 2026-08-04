@@ -154,6 +154,14 @@ func run() error {
 	}, uuid.NewString(), http.StatusOK); err != nil {
 		return fmt.Errorf("upsert session: %w", err)
 	}
+	historyResponse, err := p.signedJSON(pc, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/history/uploads", map[string]any{}, uuid.NewString(), http.StatusServiceUnavailable)
+	if err != nil {
+		return fmt.Errorf("verify disabled history response: %w", err)
+	}
+	errorEnvelope, _ := historyResponse["error"].(map[string]any)
+	if code, _ := errorEnvelope["code"].(string); code != "HISTORY_UNAVAILABLE" {
+		return errors.New("disabled history response did not contain the stable error code")
+	}
 
 	pcSocket, err := p.connectRealtime(pc, "pc")
 	if err != nil {

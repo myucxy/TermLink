@@ -6,6 +6,12 @@ import (
 	"testing"
 )
 
+func TestOptionalHistoryStoreDoesNotWrapTypedNil(t *testing.T) {
+	if optionalHistoryStore(nil) != nil {
+		t.Fatal("disabled history store became a non-nil interface")
+	}
+}
+
 func TestLANTestHandlerHealthEndpoints(t *testing.T) {
 	handler := newLANTestHandler("termlink-test-token", t.TempDir())
 	for _, path := range []string{"/healthz", "/readyz"} {
