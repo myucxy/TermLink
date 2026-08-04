@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="light dark">
   <title>${msg("loginTitle", (realm.displayName!"TermLink"))}</title>
   <link rel="icon" href="${url.resourcesPath}/img/termlink-favicon.svg" type="image/svg+xml">
   <#if properties.styles?has_content>
@@ -80,6 +80,7 @@
       <div class="bootstrap-summary">
         <span class="bootstrap-icon shield-icon" aria-hidden="true"></span>
         <span><strong>${msg("termlinkFirstDockerStart")}</strong><small>${msg("termlinkBootstrapDetail")}</small></span>
+        <a class="bootstrap-link" href="https://termlink.kget.cc:8910/#deploy">${msg("termlinkBootstrapGuide")}</a>
       </div>
     </section>
 

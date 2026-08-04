@@ -1,20 +1,20 @@
 :root {
-  color-scheme: dark;
-  --bg: #090b10;
-  --bg-elevated: #0d1017;
-  --surface: #11151d;
-  --surface-2: #171c26;
-  --surface-3: #202735;
-  --text: #f1f4f8;
-  --text-2: #a3adbd;
-  --text-3: #737f92;
-  --border: #273041;
-  --border-soft: #1c2431;
-  --accent: #8594ff;
-  --accent-strong: #aeb7ff;
-  --accent-2: #52d2c7;
-  --success: #4bc98a;
-  --danger: #f1737c;
+  color-scheme: light;
+  --bg: #f4f6fa;
+  --bg-elevated: #edf0f6;
+  --surface: #ffffff;
+  --surface-2: #f7f8fb;
+  --surface-3: #e9edf5;
+  --text: #151922;
+  --text-2: #586477;
+  --text-3: #7a8494;
+  --border: #d4dae5;
+  --border-soft: #e4e8ef;
+  --accent: #5566dd;
+  --accent-strong: #4455c8;
+  --accent-2: #168f87;
+  --success: #168a57;
+  --danger: #c53e4b;
   --font-ui: Inter, "Segoe UI Variable", "Microsoft YaHei UI", system-ui, sans-serif;
   --font-mono: "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
 }
@@ -74,8 +74,8 @@ dd {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 20px;
-  padding: 0 24px;
+  gap: 14px;
+  padding: 0 18px;
   border-bottom: 1px solid var(--border-soft);
   background: var(--bg-elevated);
 }
@@ -88,8 +88,8 @@ dd {
 }
 
 .identity-brand img {
-  width: 31px;
-  height: 31px;
+  width: 28px;
+  height: 28px;
   padding: 3px;
   border: 1px solid rgba(133, 148, 255, 0.38);
   border-radius: 8px;
@@ -120,7 +120,7 @@ dd {
 }
 
 .identity-title-actions {
-  gap: 13px;
+  gap: 8px;
 }
 
 .identity-secure-origin {
@@ -183,19 +183,19 @@ dd {
 }
 
 .identity-context h1 {
-  max-width: 560px;
+  max-width: 520px;
   white-space: pre-line;
-  font-size: 44px;
+  font-size: 34px;
   font-weight: 680;
   line-height: 1.18;
   letter-spacing: 0;
 }
 
 .identity-context-copy > p:last-child {
-  max-width: 560px;
+  max-width: 510px;
   color: var(--text-2);
-  font-size: 15px;
-  line-height: 1.7;
+  font-size: 11px;
+  line-height: 1.65;
 }
 
 .identity-trust-list {
@@ -204,23 +204,23 @@ dd {
 }
 
 .identity-trust-list > div {
-  min-height: 54px;
+  min-height: 48px;
   display: grid;
-  grid-template-columns: 30px 118px minmax(0, 1fr);
+  grid-template-columns: 28px 110px minmax(0, 1fr);
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   border-bottom: 1px solid var(--border-soft);
 }
 
 .identity-trust-list dt {
   color: var(--text-3);
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .identity-trust-list dd {
   overflow-wrap: anywhere;
   color: var(--text);
-  font: 500 12px/1.4 var(--font-mono);
+  font: 500 11px/1.4 var(--font-mono);
 }
 
 .trust-icon,
@@ -252,7 +252,7 @@ dd {
   color: var(--success);
 }
 
-.bootstrap-summary > span:last-child {
+.bootstrap-summary > span:nth-child(2) {
   min-width: 0;
   display: grid;
   gap: 3px;
@@ -267,6 +267,19 @@ dd {
   color: var(--text-3);
   font-size: 11px;
   line-height: 1.45;
+}
+
+.bootstrap-link {
+  flex: 0 0 auto;
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 11px;
 }
 
 .identity-auth-pane {
@@ -289,7 +302,7 @@ dd {
 
 .identity-form-heading h2 {
   margin: 0;
-  font-size: 27px;
+  font-size: 25px;
   font-weight: 680;
   line-height: 1.25;
   letter-spacing: 0;
@@ -313,7 +326,7 @@ dd {
 
 .auth-mode-switch a,
 .auth-mode-switch span {
-  min-height: 36px;
+  min-height: 34px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -335,7 +348,7 @@ dd {
 
 .tl-form {
   display: grid;
-  gap: 14px;
+  gap: 11px;
 }
 
 .tl-form-group,
@@ -358,7 +371,7 @@ dd {
 }
 
 .tl-input-group {
-  min-height: 46px;
+  min-height: 44px;
   display: flex;
   align-items: center;
   gap: 9px;
@@ -803,6 +816,27 @@ dd {
 
   .identity-form-heading h2 {
     font-size: 25px;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #090b10;
+    --bg-elevated: #0d1017;
+    --surface: #11151d;
+    --surface-2: #171c26;
+    --surface-3: #202735;
+    --text: #f1f4f8;
+    --text-2: #a3adbd;
+    --text-3: #737f92;
+    --border: #273041;
+    --border-soft: #1c2431;
+    --accent: #8594ff;
+    --accent-strong: #aeb7ff;
+    --accent-2: #52d2c7;
+    --success: #4bc98a;
+    --danger: #f1737c;
   }
 }
 
