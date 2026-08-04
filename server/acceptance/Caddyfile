@@ -1,0 +1,31 @@
+{
+	admin off
+	https_port 9443
+	auto_https disable_redirects
+}
+
+http://127.0.0.1:9080 {
+	respond /healthz 200
+}
+
+https://api.termlink.localhost:9443 {
+	tls internal
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+	reverse_proxy server:8080
+}
+
+https://id.termlink.localhost:9443 {
+	tls internal
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+	reverse_proxy keycloak:8080
+}
