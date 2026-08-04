@@ -40,11 +40,47 @@ func TestReplacedPeerCannotRemoveReplacementSubscription(t *testing.T) {
 	}
 }
 
+func TestPCPeerAcceptsRetransmittedOutputSequence(t *testing.T) {
+	peer := testPeer(NewHubWithObserver(nil, nil, nil, nil), uuid.New())
+	peer.role = "pc"
+	sessionID := uuid.New()
+
+	if !peer.acceptSequence(sessionID, 42) {
+		t.Fatal("initial PC output sequence was rejected")
+	}
+	if !peer.acceptSequence(sessionID, 41) {
+		t.Fatal("retransmitted PC output sequence was rejected")
+	}
+	if got := peer.lastSequences[sessionID]; got != 42 {
+		t.Fatalf("PC high-water sequence = %d, want 42", got)
+	}
+}
+
+func TestAndroidPeerRejectsReplayedInputSequence(t *testing.T) {
+	peer := testPeer(NewHubWithObserver(nil, nil, nil, nil), uuid.New())
+	peer.role = "android"
+	sessionID := uuid.New()
+
+	if !peer.acceptSequence(sessionID, 42) {
+		t.Fatal("initial Android input sequence was rejected")
+	}
+	if peer.acceptSequence(sessionID, 42) {
+		t.Fatal("duplicate Android input sequence was accepted")
+	}
+	if peer.acceptSequence(sessionID, 41) {
+		t.Fatal("older Android input sequence was accepted")
+	}
+	if !peer.acceptSequence(sessionID, 43) {
+		t.Fatal("newer Android input sequence was rejected")
+	}
+}
+
 func testPeer(hub *Hub, deviceID uuid.UUID) *peer {
 	return &peer{
 		hub:           hub,
 		principal:     auth.Principal{Device: auth.Device{ID: deviceID}},
 		done:          make(chan struct{}),
+		lastSequences: map[uuid.UUID]uint64{},
 		subscriptions: map[uuid.UUID]bool{},
 	}
 }

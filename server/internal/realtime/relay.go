@@ -250,11 +250,10 @@ func (p *peer) readLoop() {
 			p.close(websocket.CloseProtocolError, "invalid session")
 			return
 		}
-		if envelope.Sequence <= p.lastSequences[sessionID] {
+		if !p.acceptSequence(sessionID, envelope.Sequence) {
 			p.close(websocket.ClosePolicyViolation, "sequence rejected")
 			return
 		}
-		p.lastSequences[sessionID] = envelope.Sequence
 		started := time.Now()
 		routeErr := p.route(envelope, sessionID, frame)
 		result := "accepted"
@@ -268,6 +267,23 @@ func (p *peer) readLoop() {
 			return
 		}
 	}
+}
+
+// Android-to-PC envelopes can execute input and therefore remain strictly
+// monotonic for the lifetime of a connection. PC-to-Android envelopes carry
+// replayable terminal events: after a cumulative-ACK resume the Agent may
+// retransmit an older event over the same Relay connection. Android applies
+// those events idempotently by terminal sequence, so rejecting the replay here
+// would disconnect the PC and strand later InputAccepted results.
+func (p *peer) acceptSequence(sessionID uuid.UUID, sequence uint64) bool {
+	last := p.lastSequences[sessionID]
+	if p.role == "android" && sequence <= last {
+		return false
+	}
+	if sequence > last {
+		p.lastSequences[sessionID] = sequence
+	}
+	return true
 }
 
 func (p *peer) route(envelope realtimewire.Envelope, sessionID uuid.UUID, frame []byte) error {
