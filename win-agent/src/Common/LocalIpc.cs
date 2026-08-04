@@ -17,7 +17,9 @@ namespace TermLink.LocalIpc
         Gap = 9,
         LocalInputObserved = 10,
         RemoteInputV2 = 11,
-        RemoteInputResult = 12
+        RemoteInputResult = 12,
+        Capabilities = 13,
+        RemoteInputReject = 14
     }
 
     internal enum LocalRemoteInputResult : byte
@@ -25,7 +27,10 @@ namespace TermLink.LocalIpc
         Accepted = 1,
         LocalInputSuperseded = 2,
         ConPtyClosed = 3,
-        WriteFailed = 4
+        WriteFailed = 4,
+        InputSequenceRejected = 5,
+        ControlLeaseRejected = 6,
+        SessionInputUnavailable = 7
     }
 
     internal enum LocalLifecycleState : byte
@@ -197,6 +202,20 @@ namespace TermLink.LocalIpc
     internal static class LocalPayloadCodec
     {
         public const int HandshakeTokenBytes = 32;
+
+        public static byte[] Capabilities(bool remoteInputReject)
+        {
+            return new[] { (byte)1, remoteInputReject ? (byte)1 : (byte)0 };
+        }
+
+        public static bool ParseCapabilities(byte[] payload)
+        {
+            if (payload == null || payload.Length != 2 || payload[0] != 1 || (payload[1] & 0xfe) != 0)
+            {
+                throw new InvalidDataException("Invalid local IPC capabilities payload.");
+            }
+            return (payload[1] & 1) != 0;
+        }
 
         public static byte[] Hello(int processId, byte[] token)
         {

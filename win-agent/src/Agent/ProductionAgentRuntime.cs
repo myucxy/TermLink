@@ -663,7 +663,10 @@ namespace TermLink.Agent
             else if (!subscribers.TryGetValue(sessionId, out var knownSubscribers) ||
                 !knownSubscribers.TryGetValue(senderId, out subscriber))
             {
-                return;
+                if (envelope.MessageType != MessageType.InputEvent &&
+                    envelope.MessageType != MessageType.ResizeRequest) return;
+                subscriber = await TryRestoreSubscriberAsync(sessionId, senderId, token).ConfigureAwait(false);
+                if (subscriber == null) return;
             }
             var sessionKey = SessionCrypto.DeriveSessionKey(subscriber.PairwiseKey, sessionId, CryptoDirection.AndroidToPc, envelope.KeyId.ToByteArray());
             byte[] plaintext = null;
@@ -705,13 +708,32 @@ namespace TermLink.Agent
                     return;
                 }
                 if (envelope.MessageType != MessageType.InputEvent) return;
-                var input = InputEventPayload.Parser.ParseFrom(plaintext); var inputId = GuidFromBytes(input.InputId.Span); var leaseId = GuidFromBytes(input.LeaseId.Span);
-                var sequenceKey = sessionId.ToString("N") + senderId.ToString("N"); var previous = inputSequences.GetOrAdd(sequenceKey, 0); if (input.InputSeq <= previous) return;
-                if (!await LeaseMatchesAsync(sessionId, senderId, leaseId, input.LeaseVersion, token).ConfigureAwait(false)) return;
+                var input = InputEventPayload.Parser.ParseFrom(plaintext);
+                if (input.InputId.Length != 16 || input.LeaseId.Length != 16 || input.InputSeq == 0 || input.Input.Length == 0) return;
+                var inputId = GuidFromBytes(input.InputId.Span); var leaseId = GuidFromBytes(input.LeaseId.Span);
+                var sequenceKey = sessionId.ToString("N") + senderId.ToString("N");
+                var previous = inputSequences.GetOrAdd(sequenceKey, 0);
+                if (input.InputSeq <= previous)
+                {
+                    registry.TrySendRemoteInputRejection(sessionId, inputId, LocalRemoteInputResult.InputSequenceRejected);
+                    return;
+                }
+                if (!await LeaseMatchesAsync(sessionId, senderId, leaseId, input.LeaseVersion, token).ConfigureAwait(false))
+                {
+                    registry.TrySendRemoteInputRejection(sessionId, inputId, LocalRemoteInputResult.ControlLeaseRejected);
+                    return;
+                }
                 var inputBytes = input.Input.ToByteArray();
                 try
                 {
-                    if (registry.TrySendRemoteInput(sessionId, inputId, input.ObservedLocalInputEpoch, inputBytes)) inputSequences[sequenceKey] = input.InputSeq;
+                    if (registry.TrySendRemoteInput(sessionId, inputId, input.ObservedLocalInputEpoch, inputBytes))
+                    {
+                        inputSequences[sequenceKey] = input.InputSeq;
+                    }
+                    else
+                    {
+                        registry.TrySendRemoteInputRejection(sessionId, inputId, LocalRemoteInputResult.SessionInputUnavailable);
+                    }
                 }
                 finally { CryptographicOperations.ZeroMemory(inputBytes); }
             }
@@ -743,34 +765,70 @@ namespace TermLink.Agent
             long leaseVersion,
             CancellationToken token)
         {
-            using var response = await SendAsync(
-                HttpMethod.Get,
-                "/v1/sessions/" + sessionId.ToString("D") + "/lease",
-                Array.Empty<byte>(),
-                true,
-                null,
-                token).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode) return false;
-            using var document = JsonDocument.Parse(
-                await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
-            var lease = document.RootElement;
-            return lease.GetProperty("holder_device_id").GetGuid() == senderId &&
-                lease.GetProperty("lease_id").GetGuid() == leaseId &&
-                lease.GetProperty("version").GetInt64() == leaseVersion;
+            try
+            {
+                using var response = await SendAsync(
+                    HttpMethod.Get,
+                    "/v1/sessions/" + sessionId.ToString("D") + "/lease",
+                    Array.Empty<byte>(),
+                    true,
+                    null,
+                    token).ConfigureAwait(false);
+                if (!response.IsSuccessStatusCode) return false;
+                using var document = JsonDocument.Parse(
+                    await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
+                var lease = document.RootElement;
+                return lease.TryGetProperty("holder_device_id", out var holder) &&
+                    lease.TryGetProperty("lease_id", out var id) &&
+                    lease.TryGetProperty("version", out var version) &&
+                    holder.TryGetGuid(out var parsedHolder) && parsedHolder == senderId &&
+                    id.TryGetGuid(out var parsedLease) && parsedLease == leaseId &&
+                    version.TryGetInt64(out var parsedVersion) && parsedVersion == leaseVersion;
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+            catch (HttpRequestException) { return false; }
+            catch (JsonException) { return false; }
         }
 
         private async Task<Subscriber> GetSubscriberAsync(Guid sessionId, Guid deviceId, CancellationToken token)
         {
             if (subscribers.TryGetValue(sessionId, out var known) && known.TryGetValue(deviceId, out var existing)) return existing;
-            using var response = await SendAsync(HttpMethod.Get, "/v1/devices", Array.Empty<byte>(), true, null, token).ConfigureAwait(false); response.EnsureSuccessStatusCode();
-            var document = JsonDocument.Parse(await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
+            using var response = await SendAsync(HttpMethod.Get, "/v1/devices", Array.Empty<byte>(), true, null, token).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            using var document = JsonDocument.Parse(await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
             foreach (var item in document.RootElement.GetProperty("items").EnumerateArray())
             {
-                if (item.GetProperty("id").GetGuid() != deviceId || item.GetProperty("trust_state").GetString() != "TRUSTED") continue;
+                if (item.GetProperty("id").GetGuid() != deviceId ||
+                    item.GetProperty("type").GetString() != "ANDROID" ||
+                    item.GetProperty("trust_state").GetString() != "TRUSTED") continue;
                 var publicKey = Convert.FromBase64String(item.GetProperty("exchange_public_key").GetString());
+                if (publicKey.Length != 32)
+                {
+                    CryptographicOperations.ZeroMemory(publicKey);
+                    throw new InvalidDataException("Subscriber exchange public key is invalid.");
+                }
                 return new Subscriber { DeviceId = deviceId, ExchangePublicKey = publicKey, PairwiseKey = SessionCrypto.DerivePairwiseKey(credentials.Identity.Exchange, publicKey, credentials.DeviceId, deviceId, config.KeyEpoch) };
             }
             throw new InvalidDataException("Subscriber device is not trusted.");
+        }
+
+        private async Task<Subscriber> TryRestoreSubscriberAsync(
+            Guid sessionId,
+            Guid deviceId,
+            CancellationToken token)
+        {
+            try
+            {
+                return RememberSubscriber(
+                    sessionId,
+                    await GetSubscriberAsync(sessionId, deviceId, token).ConfigureAwait(false));
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+            catch (OperationCanceledException) { return null; }
+            catch (HttpRequestException) { return null; }
+            catch (JsonException) { return null; }
+            catch (FormatException) { return null; }
+            catch (InvalidDataException) { return null; }
         }
 
         private async Task UploadHistoryAsync(Guid sessionId, IList<HistoryEventV1> events, CancellationToken token)
@@ -1077,6 +1135,9 @@ namespace TermLink.Agent
             if (result == LocalRemoteInputResult.Accepted) return string.Empty;
             if (result == LocalRemoteInputResult.LocalInputSuperseded) return "LOCAL_INPUT_PRIORITY";
             if (result == LocalRemoteInputResult.ConPtyClosed) return "SESSION_INPUT_CLOSED";
+            if (result == LocalRemoteInputResult.InputSequenceRejected) return "INPUT_SEQUENCE_REJECTED";
+            if (result == LocalRemoteInputResult.ControlLeaseRejected) return "CONTROL_LEASE_REJECTED";
+            if (result == LocalRemoteInputResult.SessionInputUnavailable) return "SESSION_INPUT_UNAVAILABLE";
             return "CONPTY_WRITE_FAILED";
         }
 

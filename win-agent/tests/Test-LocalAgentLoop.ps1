@@ -129,8 +129,8 @@ exit 17
     Assert-True ([int]$agentFields.inputs_duplicate -eq 1) 'Agent did not reject the duplicate input ID.'
     Assert-True ([int]$agentFields.remote_input_results_accepted -eq 1) `
         'Session Host did not confirm exactly one successful ConPTY write.'
-    Assert-True ([int]$agentFields.remote_input_results_rejected -eq 0) `
-        'Session Host unexpectedly rejected the remote ConPTY write.'
+    Assert-True ([int]$agentFields.remote_input_results_rejected -eq 1) `
+        'Session Host did not publish the ordered duplicate-sequence rejection.'
     Assert-True ([int]$agentFields.resize_applied -ge 1) 'Agent did not observe the requested 111x37 resize.'
     Assert-True ([int]$agentFields.reconnects -ge 1) 'Host-Agent reconnect and retransmit path was not exercised.'
     Assert-True ([int]$agentFields.output_frames -ge 1) 'Agent did not receive terminal output.'

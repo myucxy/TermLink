@@ -312,6 +312,7 @@ namespace TermLink.Agent
         private int resizeApplied;
         private bool commandsSent;
         private bool testDisconnectTriggered;
+        private volatile bool remoteInputRejectSupported;
         private bool ended;
         private int exitCode;
         private bool disposed;
@@ -427,6 +428,7 @@ namespace TermLink.Agent
                     SetWaitingPipe(null);
                     try
                     {
+                        remoteInputRejectSupported = false;
                         Authenticate(pipe);
                         SetConnectedPipe(pipe);
                         if (lastHostSequence > 0) reconnects++;
@@ -490,9 +492,15 @@ namespace TermLink.Agent
                 }
                 if (frame.Type == LocalFrameType.HostHello || frame.Type == LocalFrameType.AgentHello ||
                     frame.Type == LocalFrameType.Input || frame.Type == LocalFrameType.ResizeRequest ||
-                    frame.Type == LocalFrameType.RemoteInputV2)
+                    frame.Type == LocalFrameType.RemoteInputV2 || frame.Type == LocalFrameType.RemoteInputReject)
                 {
                     throw new InvalidDataException("Host sent an invalid frame type: " + frame.Type + ".");
+                }
+                if (frame.Type == LocalFrameType.Capabilities)
+                {
+                    if (frame.Sequence != 0) throw new InvalidDataException("Host capabilities must use sequence zero.");
+                    remoteInputRejectSupported = LocalPayloadCodec.ParseCapabilities(frame.Payload);
+                    continue;
                 }
                 if (frame.Sequence <= lastHostSequence)
                 {
@@ -608,6 +616,12 @@ namespace TermLink.Agent
                     else
                     {
                         duplicateInputs++;
+                        if (options.UseRemoteInputV2)
+                        {
+                            TrySendRemoteInputRejection(
+                                options.InputId,
+                                LocalRemoteInputResult.InputSequenceRejected);
+                        }
                     }
                 }
             }
@@ -651,6 +665,31 @@ namespace TermLink.Agent
                         nextCommandSequence,
                         LocalPayloadCodec.RemoteInput(inputId, expectedLocalInputEpoch, bytes)));
                     acceptedInputs++;
+                    return true;
+                }
+                catch (IOException) { return false; }
+                catch (ObjectDisposedException) { return false; }
+            }
+        }
+
+        public bool TrySendRemoteInputRejection(Guid inputId, LocalRemoteInputResult result)
+        {
+            if (inputId == Guid.Empty || result == LocalRemoteInputResult.Accepted ||
+                !Enum.IsDefined(typeof(LocalRemoteInputResult), result) || !remoteInputRejectSupported) return false;
+            lock (commandSync)
+            {
+                NamedPipeServerStream pipe;
+                lock (statusSync) pipe = connectedPipe;
+                if (pipe == null || !pipe.IsConnected) return false;
+                nextCommandSequence = checked(nextCommandSequence + 1);
+                commandSequenceStore.Save(nextCommandSequence);
+                try
+                {
+                    LocalFrameCodec.Write(pipe, new LocalFrame(
+                        LocalFrameType.RemoteInputReject,
+                        options.SessionId,
+                        nextCommandSequence,
+                        LocalPayloadCodec.RemoteInputResult(inputId, result)));
                     return true;
                 }
                 catch (IOException) { return false; }
@@ -959,7 +998,8 @@ namespace TermLink.Agent
         public void Append(LocalFrame frame)
         {
             if (frame.Type == LocalFrameType.Input || frame.Type == LocalFrameType.ResizeRequest ||
-                frame.Type == LocalFrameType.RemoteInputV2 || frame.Type == LocalFrameType.HostHello ||
+                frame.Type == LocalFrameType.RemoteInputV2 || frame.Type == LocalFrameType.RemoteInputReject ||
+                frame.Type == LocalFrameType.HostHello || frame.Type == LocalFrameType.Capabilities ||
                 frame.Type == LocalFrameType.AgentHello)
             {
                 throw new InvalidOperationException("Input or handshake frames must not enter the event buffer.");

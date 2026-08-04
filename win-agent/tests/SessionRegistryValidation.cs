@@ -40,7 +40,8 @@ namespace TermLink.Agent
                 var bufferRoot = Path.GetFullPath(args[2]);
                 Directory.CreateDirectory(bufferRoot);
                 ValidateActualAgentEntry(agentExecutable, Path.Combine(bufferRoot, "external-entry"));
-                ValidateRemoteResizeDispatch();
+                ValidateLocalIpcCapabilities();
+                ValidateRemoteControlDispatch();
                 ValidateCompletedBufferRecovery(Path.Combine(bufferRoot, "completed-recovery"));
                 ValidateStopFailurePaths(Path.Combine(bufferRoot, "failure-paths"));
                 ValidateRestartFailurePath(Path.Combine(bufferRoot, "restart-failure"));
@@ -364,7 +365,19 @@ namespace TermLink.Agent
                 "Registry Dispose did not retry every retiring worker during best-effort cleanup.");
         }
 
-        private static void ValidateRemoteResizeDispatch()
+        private static void ValidateLocalIpcCapabilities()
+        {
+            Require(LocalPayloadCodec.ParseCapabilities(LocalPayloadCodec.Capabilities(true)),
+                "Local IPC capabilities lost remote-input rejection support.");
+            Require(!LocalPayloadCodec.ParseCapabilities(LocalPayloadCodec.Capabilities(false)),
+                "Local IPC capabilities enabled an unsupported feature.");
+            var invalidRejected = false;
+            try { LocalPayloadCodec.ParseCapabilities(new byte[] { 1, 2 }); }
+            catch (InvalidDataException) { invalidRejected = true; }
+            Require(invalidRejected, "Local IPC capabilities accepted unknown feature bits.");
+        }
+
+        private static void ValidateRemoteControlDispatch()
         {
             var factory = new FakeManagedSessionFactory();
             using (var registry = new SessionRegistry(factory, 20))
@@ -378,6 +391,21 @@ namespace TermLink.Agent
                 var session = factory.Get(sessionId);
                 Require(session.ResizeColumns == 132 && session.ResizeRows == 43,
                     "Registry changed the requested remote terminal size.");
+                var inputId = Guid.NewGuid();
+                var inputBytes = Encoding.UTF8.GetBytes("registry-remote-input");
+                Require(registry.TrySendRemoteInput(sessionId, inputId, 17, inputBytes),
+                    "Registry did not route the remote input request.");
+                Require(session.RemoteInputId == inputId && session.RemoteInputEpoch == 17 &&
+                    session.RemoteInputBytes.SequenceEqual(inputBytes),
+                    "Registry changed the remote input request.");
+                Require(registry.TrySendRemoteInputRejection(
+                        sessionId,
+                        inputId,
+                        LocalRemoteInputResult.ControlLeaseRejected),
+                    "Registry did not route the ordered remote input rejection.");
+                Require(session.RejectedInputId == inputId &&
+                    session.RejectedInputResult == LocalRemoteInputResult.ControlLeaseRejected,
+                    "Registry changed the ordered remote input rejection.");
             }
         }
 
@@ -441,7 +469,11 @@ namespace TermLink.Agent
                     earliest == 1 && latest == 3 && frames.Count == 3,
                     "Recovered completed buffer did not preserve its committed event stream.");
                 Require(!registry.TrySendResize(sessionId, 100, 30) &&
-                    !registry.TrySendRemoteInput(sessionId, Guid.NewGuid(), 0, Encoding.UTF8.GetBytes("blocked")),
+                    !registry.TrySendRemoteInput(sessionId, Guid.NewGuid(), 0, Encoding.UTF8.GetBytes("blocked")) &&
+                    !registry.TrySendRemoteInputRejection(
+                        sessionId,
+                        Guid.NewGuid(),
+                        LocalRemoteInputResult.SessionInputUnavailable),
                     "Recovered completed buffer accepted a control operation.");
                 registry.ReleaseBufferedSession(sessionId);
                 Require(!registry.ContainsSession(sessionId),
@@ -661,7 +693,7 @@ namespace TermLink.Agent
         }
     }
 
-    internal sealed class FakeManagedSession : IRegistryManagedSession, IRemoteResizableSession
+    internal sealed class FakeManagedSession : IRegistryManagedSession, IRemoteControllableSession, IRemoteResizableSession
     {
         private readonly Action<IRegistryManagedSession> completion;
         private int waitCalls;
@@ -682,6 +714,11 @@ namespace TermLink.Agent
         public int WaitCalls { get { return Volatile.Read(ref waitCalls); } }
         public short ResizeColumns { get; private set; }
         public short ResizeRows { get; private set; }
+        public Guid RemoteInputId { get; private set; }
+        public ulong RemoteInputEpoch { get; private set; }
+        public byte[] RemoteInputBytes { get; private set; }
+        public Guid RejectedInputId { get; private set; }
+        public LocalRemoteInputResult RejectedInputResult { get; private set; }
 
         public void Start()
         {
@@ -710,6 +747,23 @@ namespace TermLink.Agent
             if (columns < 1 || rows < 1) return false;
             ResizeColumns = columns;
             ResizeRows = rows;
+            return true;
+        }
+
+        public bool TrySendRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
+        {
+            if (inputId == Guid.Empty || bytes == null || bytes.Length == 0) return false;
+            RemoteInputId = inputId;
+            RemoteInputEpoch = expectedLocalInputEpoch;
+            RemoteInputBytes = (byte[])bytes.Clone();
+            return true;
+        }
+
+        public bool TrySendRemoteInputRejection(Guid inputId, LocalRemoteInputResult result)
+        {
+            if (inputId == Guid.Empty || result == LocalRemoteInputResult.Accepted) return false;
+            RejectedInputId = inputId;
+            RejectedInputResult = result;
             return true;
         }
 

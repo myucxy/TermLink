@@ -1396,6 +1396,11 @@ namespace TermLink.SessionHost
             {
                 throw new InvalidDataException("Agent pipe server process identity mismatch.");
             }
+            LocalFrameCodec.Write(candidate, new LocalFrame(
+                LocalFrameType.Capabilities,
+                sessionId,
+                0,
+                LocalPayloadCodec.Capabilities(true)));
         }
 
         private void ReadAgentCommands(NamedPipeClientStream candidate)
@@ -1416,7 +1421,8 @@ namespace TermLink.SessionHost
                 }
                 if (frame.Sequence <= lastAgentCommandSequence)
                 {
-                    if (frame.Type == LocalFrameType.Input || frame.Type == LocalFrameType.RemoteInputV2)
+                    if (frame.Type == LocalFrameType.Input || frame.Type == LocalFrameType.RemoteInputV2 ||
+                        frame.Type == LocalFrameType.RemoteInputReject)
                     {
                         Array.Clear(frame.Payload, 0, frame.Payload.Length);
                     }
@@ -1455,6 +1461,18 @@ namespace TermLink.SessionHost
                         Publish(
                             LocalFrameType.RemoteInputResult,
                             LocalPayloadCodec.RemoteInputResult(remoteInputId, remoteResult));
+                        break;
+                    case LocalFrameType.RemoteInputReject:
+                        LocalRemoteInputResult rejectedResult;
+                        var rejectedInputId = LocalPayloadCodec.ParseRemoteInputResult(frame.Payload, out rejectedResult);
+                        Array.Clear(frame.Payload, 0, frame.Payload.Length);
+                        if (rejectedResult == LocalRemoteInputResult.Accepted)
+                        {
+                            throw new InvalidDataException("Agent cannot synthesize an accepted remote input result.");
+                        }
+                        Publish(
+                            LocalFrameType.RemoteInputResult,
+                            LocalPayloadCodec.RemoteInputResult(rejectedInputId, rejectedResult));
                         break;
                     default:
                         throw new InvalidDataException("Agent sent an invalid command type: " + frame.Type + ".");

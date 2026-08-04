@@ -40,6 +40,7 @@ namespace TermLink.Agent
     internal interface IRemoteControllableSession
     {
         bool TrySendRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes);
+        bool TrySendRemoteInputRejection(Guid inputId, LocalRemoteInputResult result);
     }
 
     internal interface IRemoteResizableSession
@@ -286,6 +287,18 @@ namespace TermLink.Agent
                 controllable = managed as IRemoteControllableSession;
             }
             return controllable != null && controllable.TrySendRemoteInput(inputId, expectedLocalInputEpoch, bytes);
+        }
+
+        public bool TrySendRemoteInputRejection(Guid sessionId, Guid inputId, LocalRemoteInputResult result)
+        {
+            IRemoteControllableSession controllable;
+            lock (sync)
+            {
+                IRegistryManagedSession managed;
+                if (!remoteAccessEnabled || !sessions.TryGetValue(sessionId, out managed)) return false;
+                controllable = managed as IRemoteControllableSession;
+            }
+            return controllable != null && controllable.TrySendRemoteInputRejection(inputId, result);
         }
 
         public bool TrySendResize(Guid sessionId, short columns, short rows)
@@ -708,6 +721,11 @@ namespace TermLink.Agent
         public bool TrySendRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
         {
             return agent.TrySendRemoteInput(inputId, expectedLocalInputEpoch, bytes);
+        }
+
+        public bool TrySendRemoteInputRejection(Guid inputId, LocalRemoteInputResult result)
+        {
+            return agent.TrySendRemoteInputRejection(inputId, result);
         }
 
         public bool TrySendResize(short columns, short rows)
