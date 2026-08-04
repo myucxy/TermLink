@@ -413,7 +413,13 @@ namespace TermLink.Agent
                 foreach (var session in activeSessions)
                 {
                     using var lease = await SendAsync(HttpMethod.Get, "/v1/sessions/" + session.SessionId.ToString("D") + "/lease", Array.Empty<byte>(), true, null, token).ConfigureAwait(false);
-                    if (lease.StatusCode == HttpStatusCode.NotFound) continue;
+                    // A recovered local SessionHost can outlive a clean Relay
+                    // deployment. Until its next event republishes the Session,
+                    // the server deliberately hides it as either missing or
+                    // forbidden. Neither response represents an active lease and
+                    // must not prevent the PC from refreshing pending devices.
+                    if (lease.StatusCode == HttpStatusCode.NotFound ||
+                        lease.StatusCode == HttpStatusCode.Forbidden) continue;
                     lease.EnsureSuccessStatusCode();
                     using var leaseDocument = JsonDocument.Parse(await lease.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
                     leaseStatuses[session.SessionId] = new LeaseStatus
