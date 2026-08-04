@@ -1,8 +1,8 @@
 {
   "format": "termlink.phase0-session-host-validation",
   "format_version": 1,
-  "generated_at": "2026-08-04T14:05:08.9884738+00:00",
-  "executable_sha256": "9bacecaf8934310bb8e8f46d1629fd43fff7be31569cb09a309e8fb44c7e1711",
+  "generated_at": "2026-08-04T22:33:07.5181083+00:00",
+  "executable_sha256": "b5b4e052df0cd9e8d5e1f92d8c25e2495411410c039bcadaecdda529004d3a75",
   "environment": {
     "os_version": "10.0.19045.0",
     "process_architecture": "X64"
@@ -57,7 +57,7 @@
   },
   "force_termination": {
     "probe_timed_out": true,
-    "inner_pid_stopped": 31836
+    "inner_pid_stopped": 15532
   },
   "resize": {
     "columns": 100,
@@ -76,11 +76,11 @@
   "throughput": {
     "payload_bytes": 2097152,
     "captured_payload_bytes": 2097152,
-    "elapsed_ms": 1192
+    "elapsed_ms": 1189
   },
   "soak": {
     "requested_seconds": 10,
-    "elapsed_ms": 10341,
+    "elapsed_ms": 10383,
     "completed": true
   },
   "leak_loop": {

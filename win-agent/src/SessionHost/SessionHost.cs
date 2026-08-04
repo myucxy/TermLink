@@ -259,6 +259,9 @@ namespace TermLink.SessionHost
         private const uint EnableMouseInput = 0x0010;
         private const uint EnableQuickEditMode = 0x0040;
         private const uint EnableExtendedFlags = 0x0080;
+        private const uint EnableProcessedOutput = 0x0001;
+        private const uint EnableVirtualTerminalProcessing = 0x0004;
+        private const uint Utf8CodePage = 65001;
         private const uint ThreadTerminate = 0x0001;
         private const ushort KeyEvent = 0x0001;
         private const uint RightAltPressed = 0x0001;
@@ -283,15 +286,19 @@ namespace TermLink.SessionHost
         private IntPtr job = IntPtr.Zero;
         private IntPtr inputThread = IntPtr.Zero;
         private IntPtr outerConsoleInput = IntPtr.Zero;
+        private IntPtr outerConsoleOutput = IntPtr.Zero;
         private PROCESS_INFORMATION processInfo;
         private uint outerConsoleInputMode;
         private uint outerConsoleInputCodePage;
+        private uint outerConsoleOutputMode;
+        private uint outerConsoleOutputCodePage;
         private string inputKind = "pipe";
         private long inputUnitsRead;
         private long inputBytesWritten;
         private ulong localInputEpoch;
         private uint inputEventsPending;
         private bool restoreOuterConsoleInputMode;
+        private bool restoreOuterConsoleOutputMode;
         private AgentPipeBridge agentPipe;
         private AgentRegistryRegistration agentRegistration;
         private COORD innerSize;
@@ -347,6 +354,7 @@ namespace TermLink.SessionHost
             CheckHandle(outerInput, "standard input after child start");
             CheckHandle(outerOutput, "standard output after child start");
             var inputIsConsole = ConfigureOuterInput(outerInput);
+            ConfigureOuterOutput(outerOutput);
 
             var outputTask = Task.Run(() => BridgeOutput(outerOutput));
             var inputTask = Task.Run(() => BridgeInput(outerInput, inputIsConsole));
@@ -411,6 +419,7 @@ namespace TermLink.SessionHost
                 outputDisconnected = true;
                 CloseIfValid(ref terminalOutput);
             }
+            RestoreOuterOutputMode();
 
             var endedSequence = PublishAgentFrame(
                 LocalFrameType.Lifecycle,
@@ -529,6 +538,32 @@ namespace TermLink.SessionHost
             CheckWin32(SetConsoleMode(outerInput, rawMode), "SetConsoleMode(raw input records)");
             restoreOuterConsoleInputMode = true;
             return true;
+        }
+
+        private bool ConfigureOuterOutput(IntPtr outerOutput)
+        {
+            uint mode;
+            if (!GetConsoleMode(outerOutput, out mode)) return false;
+
+            outerConsoleOutput = outerOutput;
+            outerConsoleOutputMode = mode;
+            outerConsoleOutputCodePage = GetConsoleOutputCP();
+            restoreOuterConsoleOutputMode = true;
+            try
+            {
+                var virtualTerminalMode = mode | EnableProcessedOutput | EnableVirtualTerminalProcessing;
+                CheckWin32(SetConsoleMode(outerOutput, virtualTerminalMode), "SetConsoleMode(VT output)");
+                if (outerConsoleOutputCodePage != Utf8CodePage)
+                {
+                    CheckWin32(SetConsoleOutputCP(Utf8CodePage), "SetConsoleOutputCP(UTF-8)");
+                }
+                return true;
+            }
+            catch
+            {
+                RestoreOuterOutputMode();
+                throw;
+            }
         }
 
         private void BridgeInput(IntPtr outerInput, bool inputIsConsole)
@@ -753,6 +788,20 @@ namespace TermLink.SessionHost
             outerConsoleInput = IntPtr.Zero;
         }
 
+        private void RestoreOuterOutputMode()
+        {
+            if (restoreOuterConsoleOutputMode)
+            {
+                if (outerConsoleOutputCodePage != 0 && outerConsoleOutputCodePage != Utf8CodePage)
+                {
+                    SetConsoleOutputCP(outerConsoleOutputCodePage);
+                }
+                SetConsoleMode(outerConsoleOutput, outerConsoleOutputMode);
+                restoreOuterConsoleOutputMode = false;
+            }
+            outerConsoleOutput = IntPtr.Zero;
+        }
+
         private void BridgeOutput(IntPtr outerOutput)
         {
             var buffer = new byte[OutputBatchBytes];
@@ -919,6 +968,7 @@ namespace TermLink.SessionHost
                 CloseIfValid(ref inputThread);
             }
             RestoreOuterInputMode();
+            RestoreOuterOutputMode();
             if (agentPipe != null)
             {
                 if (agentRegistration != null)
@@ -1087,6 +1137,12 @@ namespace TermLink.SessionHost
 
         [DllImport("kernel32.dll")]
         private static extern uint GetConsoleCP();
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetConsoleOutputCP();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetConsoleOutputCP(uint codePage);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool GetNumberOfConsoleInputEvents(IntPtr console, out uint events);
