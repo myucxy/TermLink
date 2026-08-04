@@ -56,8 +56,12 @@ try {
 
     $pendingSessionsField = $runtimeType.GetField('pendingSessions', [Reflection.BindingFlags]'Instance,NonPublic')
     $eventSignalField = $runtimeType.GetField('eventSignal', [Reflection.BindingFlags]'Instance,NonPublic')
+    $historySignalField = $runtimeType.GetField('historySignal', [Reflection.BindingFlags]'Instance,NonPublic')
+    $historyWorkerField = $runtimeType.GetField('historyWorker', [Reflection.BindingFlags]'Instance,NonPublic')
     $socketSendGateField = $runtimeType.GetField('socketSendGate', [Reflection.BindingFlags]'Instance,NonPublic')
-    if ($null -eq $pendingSessionsField -or $null -eq $eventSignalField -or $null -eq $socketSendGateField) {
+    if ($null -eq $pendingSessionsField -or $null -eq $eventSignalField -or
+        $null -eq $historySignalField -or $null -eq $historyWorkerField -or
+        $null -eq $socketSendGateField) {
         throw 'Production runtime replay/backpressure fields are missing.'
     }
     if ($null -ne $runtimeType.GetField('events', [Reflection.BindingFlags]'Instance,NonPublic')) {
@@ -65,6 +69,21 @@ try {
     }
     if ($null -eq (Get-InternalMethod $runtimeType 'RememberSubscriber')) {
         throw 'Production runtime does not retain authenticated Realtime subscribers.'
+    }
+    if ($null -eq (Get-InternalMethod $runtimeType 'AdvancePublishedSequence')) {
+        throw 'Production runtime does not preserve a monotonic replay publication cursor.'
+    }
+    $newEnvelopeNonce = Get-InternalMethod $runtimeType 'NewEnvelopeNonce'
+    if ($null -eq $newEnvelopeNonce) {
+        throw 'Production runtime does not expose replay-safe Envelope nonce generation.'
+    }
+    $nonces = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    for ($index = 0; $index -lt 256; $index++) {
+        [byte[]]$nonce = $newEnvelopeNonce.Invoke($null, [object[]]@())
+        if ($nonce.Length -ne 12 -or -not $nonces.Add([Convert]::ToHexString($nonce))) {
+            throw 'Production runtime generated an invalid or repeated Envelope nonce.'
+        }
+        [Security.Cryptography.CryptographicOperations]::ZeroMemory($nonce)
     }
 
     # Exercise the DPAPI buffer reader with deterministic retention loss. This

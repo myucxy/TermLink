@@ -40,7 +40,14 @@ namespace TermLink.Agent
         private sealed class CommittedEvent { public ManagedShellType ShellType; public LocalFrame Frame; }
         private sealed class PendingSession { public ManagedShellType ShellType; }
         private sealed class Subscriber { public Guid DeviceId; public byte[] ExchangePublicKey; public byte[] PairwiseKey; }
-        private sealed class LeaseStatus { public Guid HolderDeviceId; public DateTime ExpiresAtUtc; }
+        private sealed class LeaseStatus
+        {
+            public Guid HolderDeviceId;
+            public Guid LeaseId;
+            public long Version;
+            public DateTime ExpiresAtUtc;
+            public DateTime ValidatedAtUtc;
+        }
         private readonly ProductionAgentConfig config;
         private readonly ProductionCredentials credentials;
         private readonly HttpClient http;
@@ -54,6 +61,9 @@ namespace TermLink.Agent
         private readonly SemaphoreSlim socketSendGate = new SemaphoreSlim(1, 1);
         private readonly ConcurrentDictionary<Guid, ConcurrentDictionary<Guid, Subscriber>> subscribers = new ConcurrentDictionary<Guid, ConcurrentDictionary<Guid, Subscriber>>();
         private readonly ConcurrentDictionary<Guid, Subscriber> historyRecipients = new ConcurrentDictionary<Guid, Subscriber>();
+        private readonly ConcurrentDictionary<Guid, byte> pendingHistorySessions = new ConcurrentDictionary<Guid, byte>();
+        private readonly ConcurrentDictionary<Guid, byte> terminalHistorySessions = new ConcurrentDictionary<Guid, byte>();
+        private readonly SemaphoreSlim historySignal = new SemaphoreSlim(0, 1);
         private readonly SemaphoreSlim historyRecipientGate = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim statusRefreshGate = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim tokenRefreshGate = new SemaphoreSlim(1, 1);
@@ -61,11 +71,11 @@ namespace TermLink.Agent
         private readonly ConcurrentDictionary<Guid, ulong> localInputEpochs = new ConcurrentDictionary<Guid, ulong>();
         private readonly ConcurrentDictionary<string, ulong> inputSequences = new ConcurrentDictionary<string, ulong>();
         private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
-        private readonly byte[] noncePrefix = new byte[4];
         private readonly object lifecycleSync = new object();
         private readonly object statusSync = new object();
         private SessionRegistry registry;
         private Task worker;
+        private Task historyWorker;
         private ClientWebSocket socket;
         private ProductionHistoryUploader historyUploader;
         private DateTime historyRecipientsExpiresUtc;
@@ -83,7 +93,6 @@ namespace TermLink.Agent
         {
             this.config = config; this.credentials = credentials;
             http = ProductionTls.CreateHttpClient(config.ServerUrl);
-            RandomNumberGenerator.Fill(noncePrefix);
             http.Timeout = TimeSpan.FromSeconds(15);
         }
 
@@ -103,6 +112,7 @@ namespace TermLink.Agent
                 if (this.registry != null) throw new InvalidOperationException("Production runtime is already attached.");
                 this.registry = registry;
                 historyUploader = new ProductionHistoryUploader(http, SendAsync, credentials.DeviceId, config.KeyEpoch);
+                historyWorker = Task.Run(HistoryUploadLoopAsync);
                 worker = Task.Run(RunAsync);
             }
         }
@@ -123,15 +133,21 @@ namespace TermLink.Agent
                 },
                 (_, existing) =>
                 {
-                    ulong published;
-                    if (frame.Sequence == 1 ||
-                        (publishedSequences.TryGetValue(frame.SessionId, out published) && frame.Sequence <= published))
+                    // Session IDs are unique. A replay snapshot can observe a
+                    // freshly appended frame before this callback runs and may
+                    // already have advanced the publication cursor to the same
+                    // sequence. That is normal concurrency, not a reset.
+                    if (frame.Sequence == 1)
                     {
                         RemovePublishedSequence(frame.SessionId);
                         return new PendingSession { ShellType = shellType };
                     }
                     return existing;
                 });
+            // Upload from the durable buffer immediately, but only mark a
+            // terminal buffer releasable after PublishLoop has sent its final
+            // lifecycle frame to current subscribers.
+            QueueHistoryUpload(frame.SessionId, false);
             try { eventSignal.Release(); }
             catch (SemaphoreFullException) { }
             catch (ObjectDisposedException) { }
@@ -425,7 +441,10 @@ namespace TermLink.Agent
                     leaseStatuses[session.SessionId] = new LeaseStatus
                     {
                         HolderDeviceId = leaseDocument.RootElement.GetProperty("holder_device_id").GetGuid(),
-                        ExpiresAtUtc = leaseDocument.RootElement.GetProperty("expires_at").GetDateTime().ToUniversalTime()
+                        LeaseId = leaseDocument.RootElement.GetProperty("lease_id").GetGuid(),
+                        Version = leaseDocument.RootElement.GetProperty("version").GetInt64(),
+                        ExpiresAtUtc = leaseDocument.RootElement.GetProperty("expires_at").GetDateTime().ToUniversalTime(),
+                        ValidatedAtUtc = DateTime.UtcNow
                     };
                     retainedLeases.Add(session.SessionId);
                 }
@@ -516,7 +535,11 @@ namespace TermLink.Agent
                     PruneCompletedSessions();
                     continue;
                 }
-                await Task.Delay(TimeSpan.FromMilliseconds(250), token).ConfigureAwait(false);
+                // Keep a small coalescing window for terminal bursts without
+                // adding a quarter-second round trip to every ordered input
+                // result. This keeps normal typing responsive while retaining
+                // durable-buffer batching and Relay backpressure behavior.
+                await Task.Delay(TimeSpan.FromMilliseconds(10), token).ConfigureAwait(false);
                 foreach (var pending in pendingSessions)
                 {
                     var terminalPublished = false;
@@ -538,13 +561,15 @@ namespace TermLink.Agent
                         }
                         continue;
                     }
-                    var historyEvents = new List<HistoryEventV1>();
                     foreach (var frame in frames)
                     {
+                        if (publishedSequences.TryGetValue(pending.Key, out var alreadyPublished) &&
+                            frame.Sequence <= alreadyPublished)
+                        {
+                            continue;
+                        }
                         await PublishAsync(active, new CommittedEvent { ShellType = pending.Value.ShellType, Frame = frame }, token).ConfigureAwait(false);
-                        var historyEvent = BuildHistoryEvent(frame);
-                        if (historyEvent != null) historyEvents.Add(historyEvent);
-                        publishedSequences[pending.Key] = frame.Sequence;
+                        AdvancePublishedSequence(pending.Key, frame.Sequence);
                         if (IsTerminalFrame(frame))
                         {
                             if (TryRemovePending(pending.Key, pending.Value))
@@ -555,21 +580,12 @@ namespace TermLink.Agent
                             break;
                         }
                     }
-                    if (historyEvents.Count > 0)
-                    {
-                        try { await UploadHistoryAsync(pending.Key, historyEvents, token).ConfigureAwait(false); }
-                        catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
-                        catch { }
-                    }
-                    if (terminalPublished && registry != null)
-                    {
-                        registry.ReleaseBufferedSession(pending.Key);
-                    }
+                    if (frames.Count > 0) QueueHistoryUpload(pending.Key, terminalPublished);
                     if (frames.Count == 0 && latest > resumeFrom)
                     {
                         // No retained frame remains. The next Subscribe carries
                         // its own resume cursor and will receive an explicit Gap.
-                        publishedSequences[pending.Key] = latest;
+                        AdvancePublishedSequence(pending.Key, latest);
                     }
                 }
             }
@@ -596,6 +612,70 @@ namespace TermLink.Agent
             return state == LocalLifecycleState.Ended || state == LocalLifecycleState.Interrupted;
         }
 
+        private void QueueHistoryUpload(Guid sessionId, bool terminal)
+        {
+            if (sessionId == Guid.Empty || Volatile.Read(ref disposed) != 0) return;
+            if (terminal) terminalHistorySessions[sessionId] = 0;
+            pendingHistorySessions[sessionId] = 0;
+            try { historySignal.Release(); }
+            catch (SemaphoreFullException) { }
+            catch (ObjectDisposedException) { }
+        }
+
+        private async Task HistoryUploadLoopAsync()
+        {
+            var token = cancellation.Token;
+            while (!token.IsCancellationRequested)
+            {
+                await historySignal.WaitAsync(token).ConfigureAwait(false);
+                var retry = false;
+                foreach (var pending in pendingHistorySessions)
+                {
+                    if (!pendingHistorySessions.TryRemove(pending.Key, out var ignored)) continue;
+                    try
+                    {
+                        IList<LocalFrame> frames;
+                        ulong earliest;
+                        ulong latest;
+                        if (registry != null && registry.TryReadBufferedEvents(
+                            pending.Key,
+                            0,
+                            out frames,
+                            out earliest,
+                            out latest))
+                        {
+                            var events = new List<HistoryEventV1>(frames.Count);
+                            foreach (var frame in frames)
+                            {
+                                var historyEvent = BuildHistoryEvent(frame);
+                                if (historyEvent != null) events.Add(historyEvent);
+                            }
+                            if (events.Count > 0)
+                            {
+                                await UploadHistoryAsync(pending.Key, events, token).ConfigureAwait(false);
+                            }
+                        }
+                        if (terminalHistorySessions.TryRemove(pending.Key, out ignored) && registry != null)
+                        {
+                            registry.ReleaseBufferedSession(pending.Key);
+                        }
+                    }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested) { return; }
+                    catch
+                    {
+                        pendingHistorySessions[pending.Key] = 0;
+                        retry = true;
+                    }
+                }
+                if (retry)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
+                    try { historySignal.Release(); }
+                    catch (SemaphoreFullException) { }
+                }
+            }
+        }
+
         private bool TryRemovePending(Guid sessionId, PendingSession expected)
         {
             return ((ICollection<KeyValuePair<Guid, PendingSession>>)pendingSessions).Remove(
@@ -608,8 +688,22 @@ namespace TermLink.Agent
             publishedSequences.TryRemove(sessionId, out ignored);
         }
 
+        private void AdvancePublishedSequence(Guid sessionId, ulong sequence)
+        {
+            if (sequence == 0) return;
+            publishedSequences.AddOrUpdate(
+                sessionId,
+                sequence,
+                (_, current) => Math.Max(current, sequence));
+        }
+
         private async Task PublishAsync(ClientWebSocket active, CommittedEvent item, CancellationToken token)
         {
+            if (publishedSequences.TryGetValue(item.Frame.SessionId, out var alreadyPublished) &&
+                item.Frame.Sequence <= alreadyPublished)
+            {
+                return;
+            }
             if (item.Frame.Type == LocalFrameType.LocalInputObserved)
             {
                 using var released = await SendAsync(HttpMethod.Delete, "/v1/sessions/" + item.Frame.SessionId.ToString("D") + "/lease", Array.Empty<byte>(), true, Guid.NewGuid().ToString("D"), token).ConfigureAwait(false);
@@ -689,11 +783,9 @@ namespace TermLink.Agent
                     {
                         throw new InvalidDataException("Subscribe exchange key does not match the trusted device.");
                     }
-                    subscriber = RememberSubscriber(sessionId, subscriber);
                     await ReplaySubscriberAsync(
                         active,
                         sessionId,
-                        senderId,
                         subscriber,
                         subscribe.ResumeFromSeq,
                         token).ConfigureAwait(false);
@@ -771,6 +863,16 @@ namespace TermLink.Agent
             long leaseVersion,
             CancellationToken token)
         {
+            var now = DateTime.UtcNow;
+            if (leaseStatuses.TryGetValue(sessionId, out var cached) &&
+                cached.HolderDeviceId == senderId &&
+                cached.LeaseId == leaseId &&
+                cached.Version == leaseVersion &&
+                cached.ExpiresAtUtc > now &&
+                cached.ValidatedAtUtc >= now.AddSeconds(-1))
+            {
+                return true;
+            }
             try
             {
                 using var response = await SendAsync(
@@ -784,12 +886,31 @@ namespace TermLink.Agent
                 using var document = JsonDocument.Parse(
                     await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
                 var lease = document.RootElement;
-                return lease.TryGetProperty("holder_device_id", out var holder) &&
-                    lease.TryGetProperty("lease_id", out var id) &&
-                    lease.TryGetProperty("version", out var version) &&
-                    holder.TryGetGuid(out var parsedHolder) && parsedHolder == senderId &&
-                    id.TryGetGuid(out var parsedLease) && parsedLease == leaseId &&
-                    version.TryGetInt64(out var parsedVersion) && parsedVersion == leaseVersion;
+                if (!lease.TryGetProperty("holder_device_id", out var holder) ||
+                    !lease.TryGetProperty("lease_id", out var id) ||
+                    !lease.TryGetProperty("version", out var version) ||
+                    !lease.TryGetProperty("expires_at", out var expires) ||
+                    !holder.TryGetGuid(out var parsedHolder) ||
+                    !id.TryGetGuid(out var parsedLease) ||
+                    !version.TryGetInt64(out var parsedVersion) ||
+                    !expires.TryGetDateTime(out var parsedExpires))
+                {
+                    return false;
+                }
+                var validatedAt = DateTime.UtcNow;
+                var status = new LeaseStatus
+                {
+                    HolderDeviceId = parsedHolder,
+                    LeaseId = parsedLease,
+                    Version = parsedVersion,
+                    ExpiresAtUtc = parsedExpires.ToUniversalTime(),
+                    ValidatedAtUtc = validatedAt
+                };
+                leaseStatuses[sessionId] = status;
+                return status.ExpiresAtUtc > validatedAt &&
+                    parsedHolder == senderId &&
+                    parsedLease == leaseId &&
+                    parsedVersion == leaseVersion;
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
             catch (HttpRequestException) { return false; }
@@ -914,14 +1035,12 @@ namespace TermLink.Agent
         private async Task ReplaySubscriberAsync(
             ClientWebSocket active,
             Guid sessionId,
-            Guid deviceId,
             Subscriber subscriber,
             ulong resumeFromSequence,
             CancellationToken token)
         {
             // Do not publish the subscriber until the replay lock is held. A
             // concurrent live publisher can then never overtake this replay.
-            var historyEvents = new List<HistoryEventV1>();
             await socketSendGate.WaitAsync(token).ConfigureAwait(false);
             try
             {
@@ -937,9 +1056,11 @@ namespace TermLink.Agent
                 {
                     throw new InvalidDataException("Subscribed session is no longer registered.");
                 }
-                subscribers.GetOrAdd(
-                    sessionId,
-                    _ => new ConcurrentDictionary<Guid, Subscriber>())[deviceId] = subscriber;
+                // PublishLoop may be replaying a recovered buffer from zero at
+                // the same time. Advance its cursor before this subscriber is
+                // visible so it cannot receive stale live sends after replay.
+                AdvancePublishedSequence(sessionId, latestSequence);
+                subscriber = RememberSubscriber(sessionId, subscriber);
 
                 var gapStart = resumeFromSequence == ulong.MaxValue
                     ? 0
@@ -981,8 +1102,6 @@ namespace TermLink.Agent
                 {
                     var messageType = MapMessageType(frame);
                     if (messageType == MessageType.Unspecified) continue;
-                    var historyEvent = BuildHistoryEvent(frame);
-                    if (historyEvent != null) historyEvents.Add(historyEvent);
                     var payload = BuildPayload(frame).ToByteArray();
                     try
                     {
@@ -1000,12 +1119,7 @@ namespace TermLink.Agent
                 }
             }
             finally { socketSendGate.Release(); }
-            if (historyEvents.Count > 0)
-            {
-                try { await UploadHistoryAsync(sessionId, historyEvents, token).ConfigureAwait(false); }
-                catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
-                catch { }
-            }
+            QueueHistoryUpload(sessionId, false);
         }
 
         private async Task SendEncryptedAsync(ClientWebSocket active, Guid sessionId, Subscriber subscriber, MessageType type, Direction direction, ulong sequence, byte[] plaintext, CancellationToken token)
@@ -1030,9 +1144,13 @@ namespace TermLink.Agent
         {
             var keyId = Encoding.UTF8.GetBytes("epoch-" + config.KeyEpoch.ToString("D8")); var cryptoDirection = direction == Direction.PcToAndroid ? CryptoDirection.PcToAndroid : CryptoDirection.AndroidToPc;
             var key = SessionCrypto.DeriveSessionKey(subscriber.PairwiseKey, sessionId, cryptoDirection, keyId);
+            var nonce = NewEnvelopeNonce();
             try
             {
-                var nonce = SessionCrypto.Nonce(noncePrefix, sequence);
+                // A logical terminal sequence may be encrypted more than once
+                // during cumulative-ACK replay. ChaCha20-Poly1305 nonces must
+                // never repeat under the same session key, so retransmission
+                // uses a fresh random nonce instead of deriving it from seq.
                 var envelope = new Envelope { ProtocolVersion = 1, MessageType = type, SessionId = ByteString.CopyFrom(GuidBytes(sessionId)), SenderDeviceId = ByteString.CopyFrom(GuidBytes(credentials.DeviceId)), RecipientDeviceId = ByteString.CopyFrom(GuidBytes(subscriber.DeviceId)), Direction = direction, Seq = sequence, SentAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), KeyId = ByteString.CopyFrom(keyId), Nonce = ByteString.CopyFrom(nonce) };
                 var ciphertext = SessionCrypto.Encrypt(key, nonce, SessionCrypto.AssociatedData(envelope), plaintext);
                 try
@@ -1047,7 +1165,19 @@ namespace TermLink.Agent
                 }
                 finally { CryptographicOperations.ZeroMemory(serialized); }
             }
-            finally { CryptographicOperations.ZeroMemory(key); }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(nonce);
+                CryptographicOperations.ZeroMemory(key);
+                CryptographicOperations.ZeroMemory(keyId);
+            }
+        }
+
+        private static byte[] NewEnvelopeNonce()
+        {
+            var nonce = new byte[12];
+            RandomNumberGenerator.Fill(nonce);
+            return nonce;
         }
 
         private async Task SendWebSocketAsync(ClientWebSocket active, byte[] payload, WebSocketMessageType messageType, bool endOfMessage, CancellationToken token)
@@ -1267,15 +1397,23 @@ namespace TermLink.Agent
             if (active != null) active.Dispose();
 
             Task activeWorker;
+            Task activeHistoryWorker;
             Task activeStatusRefresh;
             lock (lifecycleSync)
             {
                 activeWorker = worker;
+                activeHistoryWorker = historyWorker;
                 activeStatusRefresh = statusRefreshWorker;
             }
             if (activeWorker != null)
             {
                 try { activeWorker.Wait(TimeSpan.FromSeconds(5)); }
+                catch (AggregateException) { }
+                catch (ObjectDisposedException) { }
+            }
+            if (activeHistoryWorker != null)
+            {
+                try { activeHistoryWorker.Wait(TimeSpan.FromSeconds(5)); }
                 catch (AggregateException) { }
                 catch (ObjectDisposedException) { }
             }
@@ -1296,11 +1434,13 @@ namespace TermLink.Agent
                 if (recipient.PairwiseKey != null) CryptographicOperations.ZeroMemory(recipient.PairwiseKey);
             }
             historyRecipients.Clear();
+            pendingHistorySessions.Clear();
+            terminalHistorySessions.Clear();
             publishedSequences.Clear();
             localInputEpochs.Clear();
             inputSequences.Clear();
-            CryptographicOperations.ZeroMemory(noncePrefix);
             eventSignal.Dispose();
+            historySignal.Dispose();
             socketSendGate.Dispose();
             historyRecipientGate.Dispose();
             statusRefreshGate.Dispose();
