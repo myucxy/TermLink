@@ -11,6 +11,8 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 import net.openid.appauth.AuthState
+import net.openid.appauth.TokenRequest
+import net.openid.appauth.TokenResponse
 
 internal fun interface AuthStateCipher {
     fun transform(input: ByteArray, encrypt: Boolean): ByteArray
@@ -52,6 +54,48 @@ internal object AuthStateEnvelope {
     private const val IV_BYTES = 12
 }
 
+/**
+ * Rebuilds an AuthState with a credential-free token request before it is
+ * serialized.  Native password-grant requests contain username/password only
+ * in the transient OkHttp form; this invariant prevents either value (or any
+ * other request parameter) from reaching the encrypted preference plaintext.
+ */
+internal object CredentialFreeAuthState {
+    fun sanitize(state: AuthState): AuthState {
+        val configuration = state.authorizationServiceConfiguration
+            ?: return AuthState()
+        val clean = AuthState(configuration)
+        val response = state.lastTokenResponse ?: return clean
+        val request = response.request
+        val safeRequest = TokenRequest.Builder(configuration, request.clientId)
+            // This request is serialization metadata only and is never sent.
+            // AppAuth requires a refresh token when grant_type=refresh_token;
+            // adding it here would duplicate a live credential inside the
+            // request. A private-format sentinel keeps password, authorization code,
+            // code verifier, and refresh token out of the persisted request.
+            .setGrantType(SANITIZED_REQUEST_GRANT_TYPE)
+            .setScope(request.scope)
+            .build()
+        val safeResponse = TokenResponse.Builder(safeRequest)
+            .setTokenType(response.tokenType)
+            .setAccessToken(response.accessToken)
+            .setAccessTokenExpirationTime(response.accessTokenExpirationTime)
+            .setIdToken(response.idToken)
+            .setRefreshToken(response.refreshToken)
+            .setScope(response.scope)
+            // Additional parameters are not needed for refresh and may carry
+            // provider-specific credential-like values, so drop them all.
+            .setAdditionalParameters(emptyMap())
+            .build()
+        clean.update(safeResponse, null)
+        return clean
+    }
+
+    fun serializedWithoutCredentials(state: AuthState): String = sanitize(state).jsonSerializeString()
+
+    internal const val SANITIZED_REQUEST_GRANT_TYPE = "urn:termlink:auth-state:credential-free"
+}
+
 internal class OidcSessionStore(context: Context) {
     private val preferences = context.applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
     private val cipher = AndroidKeystoreCipher()
@@ -67,15 +111,30 @@ internal class OidcSessionStore(context: Context) {
     fun loadAuthState(): AuthState? {
         val encoded = preferences.getString(KEY_AUTH_STATE, null) ?: return null
         val plaintext = AuthStateEnvelope.open(encoded, cipher)
-        return try {
+        val restored = try {
             AuthState.jsonDeserialize(String(plaintext, Charsets.UTF_8))
         } finally {
             plaintext.fill(0)
         }
+        // Migrate sessions written by older builds immediately.  Do not wait
+        // for token expiry: an old AuthorizationResponse may still contain an
+        // authorization code and PKCE verifier inside the encrypted envelope.
+        val sanitized = CredentialFreeAuthState.sanitize(restored)
+        saveAuthState(sanitized)
+        return sanitized
     }
 
+    var accountScope: String?
+        get() = preferences.getString(KEY_ACCOUNT_SCOPE, null)
+        set(value) {
+            val editor = preferences.edit()
+            if (value == null) editor.remove(KEY_ACCOUNT_SCOPE) else editor.putString(KEY_ACCOUNT_SCOPE, value)
+            check(editor.commit())
+        }
+
     fun saveAuthState(state: AuthState) {
-        val plaintext = state.jsonSerializeString().encodeToByteArray()
+        val sanitized = CredentialFreeAuthState.sanitize(state)
+        val plaintext = sanitized.jsonSerializeString().encodeToByteArray()
         try {
             check(preferences.edit().putString(KEY_AUTH_STATE, AuthStateEnvelope.seal(plaintext, cipher)).commit())
         } finally {
@@ -142,6 +201,7 @@ internal class OidcSessionStore(context: Context) {
         const val PREFERENCES = "termlink-product-session"
         const val KEY_SERVER_URL = "server_url"
         const val KEY_AUTH_STATE = "auth_state"
+        const val KEY_ACCOUNT_SCOPE = "account_scope"
         const val KEY_INPUT_SEQUENCE_PREFIX = "input_sequence_high_watermark_"
         const val KEY_ALIAS = "termlink-oidc-session-wrap-v1"
         const val ANDROID_KEYSTORE = "AndroidKeyStore"

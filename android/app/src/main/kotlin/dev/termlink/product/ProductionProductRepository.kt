@@ -4,14 +4,17 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.view.KeyEvent
+import androidx.room.withTransaction
 import dev.termlink.billing.BillingCoordinator
 import dev.termlink.billing.BillingServerGateway
+import dev.termlink.billing.BillingSnapshot
 import dev.termlink.billing.PlayBillingAdapter
 import dev.termlink.crypto.DeviceKeyVault
 import dev.termlink.crypto.HistoryCrypto
 import dev.termlink.crypto.SessionCrypto
 import dev.termlink.database.TermLinkDatabase
 import dev.termlink.history.HistoryRepository
+import dev.termlink.harness.R
 import dev.termlink.model.CatalogPlan
 import dev.termlink.model.DeviceSummary
 import dev.termlink.model.DeviceTrustState
@@ -53,6 +56,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -71,8 +76,9 @@ import net.openid.appauth.AuthorizationException
 import net.openid.appauth.AuthorizationRequest
 import net.openid.appauth.AuthorizationResponse
 import net.openid.appauth.AuthorizationService
-import net.openid.appauth.AuthorizationServiceConfiguration
 import net.openid.appauth.ResponseTypeValues
+import net.openid.appauth.TokenRequest
+import net.openid.appauth.TokenResponse
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import kotlin.coroutines.resume
@@ -89,12 +95,15 @@ internal class ProductionProductRepository(
     private val historyRepository = HistoryRepository(database)
     private val authService = AuthorizationService(activity)
     private val http = OkHttpClient()
+    private val nativeAuthHttp = secureNativeHttpClient()
+    private val nativeOidc = NativeOidcClient(nativeAuthHttp, Json { ignoreUnknownKeys = true })
     private val json = Json { ignoreUnknownKeys = true }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val liveSessions = ConcurrentHashMap<UUID, LiveProductSession>()
     private val historyEngines = ConcurrentHashMap<UUID, TermuxTerminalEngine>()
     private val historyDownloads = ConcurrentHashMap<UUID, HistoryDownloadRequest>()
     private val liveSessionLock = Any()
+    private val accessStateLock = Mutex()
     private val tokenRefresh = TokenRefreshCoordinator { requestFreshAccessToken() }
     private val initialServerUrl = sessionStore.serverUrl ?: PUBLIC_SERVER_URL.also {
         sessionStore.serverUrl = it
@@ -121,12 +130,25 @@ internal class ProductionProductRepository(
     )
     private var authState: AuthState? = sessionStore.loadAuthState()
     private var storedIdentity: DeviceKeyVault.StoredIdentity? = null
+    private var accountScope: String? = sessionStore.accountScope
+    private var oidcConfiguration: NativeOidcConfiguration? = null
     private var closed = false
 
     private val mutableSnapshot = MutableStateFlow(
         ProductSnapshot(
             signedIn = authState?.isAuthorized == true,
             configured = true,
+            authenticationState = if (authState?.isAuthorized == true) {
+                ProductAuthenticationState.AUTHENTICATED
+            } else {
+                ProductAuthenticationState.SIGNED_OUT
+            },
+            connectionState = if (authState?.isAuthorized == true) {
+                ProductConnectionState.CONNECTING
+            } else {
+                ProductConnectionState.CONFIGURED
+            },
+            enrollmentState = ProductEnrollmentState.UNKNOWN,
             serverUrl = initialServerUrl,
         ),
     )
@@ -139,7 +161,7 @@ internal class ProductionProductRepository(
 
     init {
         if (authState?.isAuthorized == true && sessionStore.serverUrl != null) {
-            scope.launch { runCatching { refresh() }.onFailure(::publishFailure) }
+            scope.launch { runCatching { refresh() } }
         }
     }
 
@@ -149,31 +171,90 @@ internal class ProductionProductRepository(
         if (changed) {
             closeLiveSessions()
             closeHistoryEngines()
+            clearRoomCache()
             authState = null
             sessionStore.clearAuthState()
             storedIdentity?.identity?.destroy()
             storedIdentity = null
-            keyVault.clear()
+            accountScope = null
+            sessionStore.accountScope = null
+            oidcConfiguration = null
         }
         sessionStore.serverUrl = normalized
         billing.reset()
-        mutableSnapshot.value = ProductSnapshot(configured = true, serverUrl = normalized)
+        mutableSnapshot.value = ProductSnapshot(
+            configured = true,
+            authenticationState = ProductAuthenticationState.SIGNED_OUT,
+            connectionState = ProductConnectionState.CONFIGURED,
+            serverUrl = normalized,
+        )
     }
 
-    override suspend fun signIn() {
+    override suspend fun signIn(username: String, password: CharArray) {
         check(!closed) { "Repository is closed" }
-        val root = sessionStore.serverUrl ?: error("Configure a TermLink server first")
-        val client = fetchClientConfiguration(root)
-        val serviceConfiguration = fetchIssuerConfiguration(client.issuer)
-        check(client.redirectUri.scheme == "dev.termlink") { "Server returned an unsupported redirect URI" }
-        authState = AuthState(serviceConfiguration)
-        val request = AuthorizationRequest.Builder(
-            serviceConfiguration,
-            client.clientId,
-            ResponseTypeValues.CODE,
-            client.redirectUri,
-        ).setScope("openid profile offline_access").build()
-        launchAuthorization(authService.getAuthorizationRequestIntent(request))
+        mutableSnapshot.value = mutableSnapshot.value.copy(
+            authenticationState = ProductAuthenticationState.NATIVE_CREDENTIALS,
+            connectionState = ProductConnectionState.CONFIGURED,
+            connectionError = null,
+        )
+        try {
+            val configuration = loadOidcConfiguration()
+            val payload = withContext(Dispatchers.IO) {
+                nativeOidc.passwordGrant(configuration, username, password)
+            }
+            val subject = OidcJwtClaims.accessTokenSubject(payload.accessToken, configuration.issuer, configuration.clientId)
+            activateAccount(configuration, subject, payload)
+            bootstrapAuthenticatedSession()
+        } catch (error: NativeOidcException) {
+            publishFailure(error)
+            if (error.browserFallbackAvailable) {
+                mutableSnapshot.value = mutableSnapshot.value.copy(
+                    authenticationState = ProductAuthenticationState.BROWSER_SETUP_REQUIRED,
+                    connectionState = ProductConnectionState.ERROR,
+                    connectionError = null,
+                )
+            }
+            throw error
+        } catch (error: Throwable) {
+            publishFailure(error)
+            throw error
+        } finally {
+            password.fill('\u0000')
+        }
+    }
+
+    override suspend fun beginBrowserRegistration() = beginBrowserAuth(BrowserAuthFlow.REGISTRATION)
+
+    override suspend fun beginBrowserAccountSetup() = beginBrowserAuth(BrowserAuthFlow.ACCOUNT_SETUP)
+
+    private suspend fun beginBrowserAuth(flow: BrowserAuthFlow) {
+        check(!closed) { "Repository is closed" }
+        try {
+            val configuration = loadOidcConfiguration()
+            mutableSnapshot.value = mutableSnapshot.value.copy(authenticationState = ProductAuthenticationState.BROWSER_SETUP_REQUIRED)
+            authState = AuthState(configuration.serviceConfiguration)
+            val requestBuilder = AuthorizationRequest.Builder(
+                configuration.serviceConfiguration,
+                configuration.clientId,
+                ResponseTypeValues.CODE,
+                configuration.redirectUri,
+            ).setScope("openid profile offline_access")
+            if (flow == BrowserAuthFlow.REGISTRATION) {
+                // OIDC prompt=create is the interoperable Keycloak
+                // registration surface; credentials stay in the browser.
+                requestBuilder.setPrompt(BrowserAuthPolicy.REGISTRATION_PROMPT)
+            } else {
+                // A normal forced browser login lets Keycloak execute whichever
+                // Required Actions are actually pending (temporary password,
+                // MFA, passkey, profile, or email) instead of guessing one.
+                requestBuilder.setPrompt(BrowserAuthPolicy.ACCOUNT_SETUP_PROMPT)
+            }
+            val request = requestBuilder.build()
+            launchAuthorization(authService.getAuthorizationRequestIntent(request))
+        } catch (error: Throwable) {
+            publishFailure(error)
+            throw error
+        }
     }
 
     fun handleAuthorizationResult(data: Intent?) {
@@ -196,9 +277,38 @@ internal class ProductionProductRepository(
                 publishFailure(tokenException ?: IllegalStateException("OIDC token exchange failed"))
                 return@performTokenRequest
             }
-            sessionStore.saveAuthState(state)
-            mutableSnapshot.value = mutableSnapshot.value.copy(signedIn = true, configured = true)
-            scope.launch { runCatching { refresh() }.onFailure(::publishFailure) }
+            val configuration = oidcConfiguration
+            val accessToken = tokenResponse.accessToken
+            if (configuration == null || accessToken.isNullOrBlank()) {
+                publishFailure(IllegalStateException("OIDC access token is unavailable"))
+                return@performTokenRequest
+            }
+            val subject = try {
+                OidcJwtClaims.accessTokenSubject(accessToken, configuration.issuer, configuration.clientId)
+            } catch (error: Throwable) {
+                publishFailure(error)
+                return@performTokenRequest
+            }
+            val cleanState = CredentialFreeAuthState.sanitize(state)
+            scope.launch {
+                runCatching {
+                    // Persist the issuer+subject scope first. If the process is
+                    // killed after AuthState is saved, startup must never see
+                    // an authorized session without an account-scoped key.
+                    establishAccountScope(AccountScope.canonical(configuration.issuer, subject))
+                    authState = cleanState
+                    sessionStore.saveAuthState(cleanState)
+                    mutableSnapshot.value = mutableSnapshot.value.copy(
+                        signedIn = true,
+                        configured = true,
+                        authenticationState = ProductAuthenticationState.AUTHENTICATED,
+                        connectionState = ProductConnectionState.CONNECTING,
+                        connectionError = null,
+                        lastSyncedAt = null,
+                    )
+                    bootstrapAuthenticatedSession()
+                }.onFailure(::publishFailure)
+            }
         }
     }
 
@@ -207,11 +317,59 @@ internal class ProductionProductRepository(
         sessionStore.clearAuthState()
         closeLiveSessions()
         closeHistoryEngines()
+        clearRoomCache()
         storedIdentity?.identity?.destroy()
         storedIdentity = null
-        keyVault.clear()
+        accountScope = null
+        sessionStore.accountScope = null
+        oidcConfiguration = null
         billing.reset()
-        mutableSnapshot.value = ProductSnapshot(configured = sessionStore.serverUrl != null, serverUrl = sessionStore.serverUrl)
+        mutableSnapshot.value = ProductSnapshot(
+            configured = sessionStore.serverUrl != null,
+            authenticationState = ProductAuthenticationState.SIGNED_OUT,
+            connectionState = if (sessionStore.serverUrl != null) {
+                ProductConnectionState.CONFIGURED
+            } else {
+                ProductConnectionState.SIGNED_OUT
+            },
+            enrollmentState = ProductEnrollmentState.UNKNOWN,
+            serverUrl = sessionStore.serverUrl,
+        )
+    }
+
+    override suspend fun confirmEnrollment() {
+        check(mutableSnapshot.value.enrollmentState == ProductEnrollmentState.PENDING_CONFIRMATION) {
+            "No pending enrollment confirmation is available"
+        }
+        withApi { api ->
+            api.post("/v1/devices/self/trust", buildJsonObject { })
+            val self = ProductResponseParser.self(api.get("/v1/devices/self").jsonObject)
+            if (self.trustState == DeviceTrustState.REVOKED) {
+                mutableSnapshot.value = mutableSnapshot.value.copy(
+                    enrollmentState = ProductEnrollmentState.REVOKED,
+                    enrollmentConfirmationRequired = false,
+                    devices = listOf(self),
+                )
+                return@withApi
+            }
+            check(self.trustState == DeviceTrustState.TRUSTED) { "The server did not trust this device" }
+            mutableSnapshot.value = mutableSnapshot.value.copy(
+                enrollmentState = ProductEnrollmentState.TRUSTED,
+                enrollmentConfirmationRequired = false,
+                accountLabel = "Connected account",
+                devices = listOf(self),
+            )
+            refreshWithApiPublished(api)
+        }
+    }
+
+    override suspend fun cancelEnrollment() {
+        if (mutableSnapshot.value.enrollmentState == ProductEnrollmentState.PENDING_CONFIRMATION) {
+            // Cancellation is a real auth cancellation: erase transient token,
+            // runtime engines, and Room cache, while signOut deliberately keeps
+            // the account-scoped identity in the vault for a later login.
+            signOut()
+        }
     }
 
     override suspend fun approveDevice(deviceId: UUID) = withApi { api ->
@@ -258,7 +416,7 @@ internal class ProductionProductRepository(
         )
         mutableSnapshot.value = mutableSnapshot.value.copy(pairingChallenge = null)
         appendActivity("Device pairing completed", "This device is now trusted by the server", Severity.SUCCESS)
-        refreshWithApi(api)
+        refreshWithApiPublished(api)
     }
 
     override suspend fun purchaseProduct(productId: String) {
@@ -271,7 +429,7 @@ internal class ProductionProductRepository(
 
     override suspend fun revokeDevice(deviceId: UUID) = withApi { api ->
         api.post("/v1/devices/$deviceId/revoke", buildJsonObject { })
-        refreshWithApi(api)
+        refreshWithApiPublished(api)
     }
 
     override suspend fun requestControl(sessionId: UUID) {
@@ -286,6 +444,29 @@ internal class ProductionProductRepository(
         freshAccessToken()
         live.client.releaseControl()
         appendActivity("Control released", "Session $sessionId", Severity.INFO)
+    }
+
+    override suspend fun releaseAllControlLeases() {
+        // Keep the realtime clients and terminal engines alive for read-only
+        // viewing. Only the server-issued control leases are released.
+        val active = liveSessions.values.filter {
+            it.client.sessionState.value is RemoteSessionState.Controlling
+        }
+        if (active.isEmpty()) return
+
+        val tokenFailure = runCatching { freshAccessToken() }.exceptionOrNull()
+        if (tokenFailure != null) publishFailure(tokenFailure)
+        var firstFailure: Throwable? = null
+        if (tokenFailure != null) firstFailure = tokenFailure
+        active.forEach { live ->
+            runCatching { live.client.releaseControl() }
+                .onFailure { error -> firstFailure = firstFailure ?: error }
+        }
+        if (firstFailure != null) {
+            publishFailure(firstFailure!!)
+        } else {
+            appendActivity("Control leases released", "Device backgrounded", Severity.INFO)
+        }
     }
 
     override suspend fun openSession(sessionId: UUID) {
@@ -477,35 +658,32 @@ internal class ProductionProductRepository(
         appendActivity("History replayed", entry.sessionLabel, Severity.SUCCESS)
     }
 
-    override suspend fun refresh() = withApi { api -> refreshWithApi(api) }
+    override suspend fun refresh() {
+        check(!closed) { "Repository is closed" }
+        mutableSnapshot.value = mutableSnapshot.value.copy(
+            connectionState = if (mutableSnapshot.value.signedIn) {
+                ProductConnectionState.CONNECTING
+            } else if (mutableSnapshot.value.configured) {
+                ProductConnectionState.CONFIGURED
+            } else {
+                ProductConnectionState.SIGNED_OUT
+            },
+            connectionError = null,
+        )
+        try {
+            withApi { api -> refreshWithApi(api) }
+        } catch (error: Throwable) {
+            publishFailure(error)
+            throw error
+        }
+    }
 
     private suspend fun refreshWithApi(api: ProductionApiClient) {
         val self = ProductResponseParser.self(api.get("/v1/devices/self").jsonObject)
         if (self.trustState != DeviceTrustState.TRUSTED) {
-            closeLiveSessions()
-            mutableSnapshot.value = mutableSnapshot.value.copy(
-                signedIn = true,
-                configured = true,
-                accountLabel = "Approval pending",
-                devices = listOf(self),
-                pcs = emptyList(),
-                sessions = emptyList(),
-                history = emptyList(),
-                lastSyncedAt = Instant.now(),
-            )
+            clearAccessControlledState(self)
             return
         }
-        val previous = mutableSnapshot.value
-        val trustedDevices = previous.devices
-            .map { device -> if (device.id == self.id) self else device }
-            .let { devices -> if (devices.any { it.id == self.id }) devices else listOf(self) + devices }
-        mutableSnapshot.value = previous.copy(
-            signedIn = true,
-            configured = true,
-            accountLabel = "Connected account",
-            devices = trustedDevices,
-            lastSyncedAt = Instant.now(),
-        )
         val devices = ProductResponseParser.itemObjects(api.get("/v1/devices").jsonObject).map { it.toDevice() }
         val pcs = ProductResponseParser.itemObjects(api.get("/v1/pcs").jsonObject).map { it.toPc() }
         val sessions = pcs.flatMap { pc ->
@@ -548,6 +726,10 @@ internal class ProductionProductRepository(
         mutableSnapshot.value = mutableSnapshot.value.copy(
             signedIn = true,
             configured = true,
+            connectionState = ProductConnectionState.CONNECTED,
+            connectionError = null,
+            enrollmentState = ProductEnrollmentState.TRUSTED,
+            enrollmentConfirmationRequired = false,
             accountLabel = "Connected account",
             devices = devices,
             pcs = pcs,
@@ -565,21 +747,43 @@ internal class ProductionProductRepository(
         scope.launch { billing.syncCatalog(catalogPlans) }
     }
 
+    private suspend fun refreshWithApiPublished(api: ProductionApiClient) {
+        try {
+            refreshWithApi(api)
+        } catch (error: Throwable) {
+            publishFailure(error)
+            throw error
+        }
+    }
+
     private suspend fun <T> withApi(block: suspend (ProductionApiClient) -> T): T = withContext(Dispatchers.IO) {
         val root = sessionStore.serverUrl ?: error("Configure a TermLink server first")
         val token = freshAccessToken()
         val identity = identity()
         ProductionApiClient(root, AccessTokenProvider { token }, identity.deviceId, identity.identity, http, allowCleartextForLocalTest = false).use { api ->
-            try {
-                api.registerDevice("ANDROID", android.os.Build.MODEL.take(128), "device-key-${identity.deviceId}")
-            } catch (error: TermLinkApiException) {
-                if (error.status != 409) throw error
-            }
+            ensureRegistered(api, identity)
             block(api)
         }
     }
 
-    private fun identity(): DeviceKeyVault.StoredIdentity = storedIdentity ?: keyVault.loadOrCreate().also { storedIdentity = it }
+    private fun ensureRegistered(api: ProductionApiClient, identity: DeviceKeyVault.StoredIdentity) {
+        try {
+            api.registerDevice("ANDROID", android.os.Build.MODEL.take(128), "device-key-${identity.deviceId}")
+        } catch (error: TermLinkApiException) {
+            if (error.status != 409) throw error
+            // A registration conflict is not proof that this device is ours.
+            // Read the server-authoritative self association and reject any
+            // mismatch rather than blindly continuing after a 409.
+            val current = runCatching { ProductResponseParser.self(api.get("/v1/devices/self").jsonObject) }
+                .getOrElse { throw IllegalStateException("Device registration conflict could not be verified") }
+            check(current.id == identity.deviceId) { "Device registration conflict could not be verified" }
+        }
+    }
+
+    private fun identity(): DeviceKeyVault.StoredIdentity {
+        val scope = accountScope ?: error("OIDC account scope is unavailable")
+        return storedIdentity ?: keyVault.loadOrCreate(scope).also { storedIdentity = it }
+    }
 
     private suspend fun freshAccessToken(): String = tokenRefresh.freshAccessToken()
 
@@ -588,52 +792,246 @@ internal class ProductionProductRepository(
             continuation.resumeWithException(IllegalStateException("Sign in first"))
             return@suspendCancellableCoroutine
         }
-        state.performActionWithFreshTokens(authService) { accessToken, _, exception ->
-            if (!continuation.isActive) return@performActionWithFreshTokens
-            if (exception != null || accessToken == null) {
-                continuation.resumeWithException(exception ?: IllegalStateException("OIDC access token is unavailable"))
-            } else {
-                sessionStore.saveAuthState(state)
-                continuation.resume(accessToken)
+        // Persisted AuthState intentionally omits AuthorizationResponse and all
+        // original token-request credentials.  AppAuth's refresh helper relies
+        // on that discarded request metadata, so every flow (native login and
+        // browser PKCE fallback) refreshes through the same bounded, no-cookie
+        // token transport instead.
+        scope.launch {
+            try {
+                val configuration = ensureOidcConfiguration()
+                val current = state.accessToken
+                if (!state.needsTokenRefresh && !current.isNullOrBlank()) {
+                    if (continuation.isActive) continuation.resume(current)
+                    return@launch
+                }
+                val refreshToken = state.refreshToken ?: throw IllegalStateException("OIDC refresh token is unavailable")
+                val payload = withContext(Dispatchers.IO) { nativeOidc.refresh(configuration, refreshToken) }
+                val refreshedSubject = OidcJwtClaims.accessTokenSubject(
+                    payload.accessToken,
+                    configuration.issuer,
+                    configuration.clientId,
+                )
+                check(accountScope == AccountScope.canonical(configuration.issuer, refreshedSubject)) {
+                    "OIDC refresh changed account identity"
+                }
+                val request = TokenRequest.Builder(configuration.serviceConfiguration, configuration.clientId)
+                    // Metadata only. A real refresh request here would require
+                    // duplicating the live refresh token inside TokenRequest.
+                    .setGrantType(CredentialFreeAuthState.SANITIZED_REQUEST_GRANT_TYPE)
+                    .setScope(payload.scope ?: state.scope)
+                    .build()
+                val tokenResponse = TokenResponse.Builder(request)
+                    .setTokenType(payload.tokenType)
+                    .setAccessToken(payload.accessToken)
+                    .setAccessTokenExpiresIn(payload.expiresInSeconds)
+                    .setRefreshToken(payload.refreshToken ?: refreshToken)
+                    .setIdToken(payload.idToken ?: state.idToken)
+                    .setScope(payload.scope ?: state.scope)
+                    .setAdditionalParameters(emptyMap())
+                    .build()
+                val updated = AuthState(configuration.serviceConfiguration)
+                updated.update(tokenResponse, null)
+                authState = CredentialFreeAuthState.sanitize(updated)
+                sessionStore.saveAuthState(authState ?: updated)
+                if (continuation.isActive) continuation.resume(payload.accessToken)
+            } catch (error: Throwable) {
+                if (continuation.isActive) continuation.resumeWithException(error)
             }
         }
+    }
+
+    private suspend fun ensureOidcConfiguration(): NativeOidcConfiguration {
+        oidcConfiguration?.let { return it }
+        val root = sessionStore.serverUrl ?: error("Configure a TermLink server first")
+        val client = fetchClientConfiguration(root)
+        return withContext(Dispatchers.IO) {
+            nativeOidc.discover(client.issuer.toString(), client.clientId, client.redirectUri)
+        }.also { oidcConfiguration = it }
+    }
+
+    private suspend fun loadOidcConfiguration(): NativeOidcConfiguration = ensureOidcConfiguration()
+
+    private suspend fun activateAccount(
+        configuration: NativeOidcConfiguration,
+        subject: String,
+        payload: NativeTokenPayload,
+    ) {
+        val nextScope = AccountScope.canonical(configuration.issuer, subject)
+        establishAccountScope(nextScope)
+        val request = TokenRequest.Builder(configuration.serviceConfiguration, configuration.clientId)
+            .setGrantType(TokenRequest.GRANT_TYPE_PASSWORD)
+            .setScope(payload.scope ?: "openid profile offline_access")
+            .build()
+        val tokenResponse = TokenResponse.Builder(request)
+            .setTokenType(payload.tokenType)
+            .setAccessToken(payload.accessToken)
+            .setAccessTokenExpiresIn(payload.expiresInSeconds)
+            .setRefreshToken(payload.refreshToken)
+            .setIdToken(payload.idToken)
+            .setScope(payload.scope ?: "openid profile offline_access")
+            .setAdditionalParameters(emptyMap())
+            .build()
+        val clean = AuthState(configuration.serviceConfiguration)
+        clean.update(tokenResponse, null)
+        authState = CredentialFreeAuthState.sanitize(clean)
+        sessionStore.saveAuthState(authState ?: clean)
+    }
+
+    private suspend fun bootstrapAuthenticatedSession() {
+        val configuration = ensureOidcConfiguration()
+        val accessToken = authState?.accessToken ?: error("OIDC access token is unavailable")
+        val subject = OidcJwtClaims.accessTokenSubject(accessToken, configuration.issuer, configuration.clientId)
+        establishAccountScope(AccountScope.canonical(configuration.issuer, subject))
+        withApi { api ->
+            val self = ProductResponseParser.self(api.get("/v1/devices/self").jsonObject)
+            when (self.trustState) {
+                DeviceTrustState.TRUSTED -> {
+                    mutableSnapshot.value = mutableSnapshot.value.copy(
+                        signedIn = true,
+                        configured = true,
+                        connectionState = ProductConnectionState.CONNECTED,
+                        enrollmentState = ProductEnrollmentState.TRUSTED,
+                        enrollmentConfirmationRequired = false,
+                        accountLabel = "Connected account",
+                        devices = listOf(self),
+                    )
+                    refreshWithApi(api)
+                }
+                DeviceTrustState.PENDING -> {
+                    clearAccessControlledState(self, prompt = true)
+                }
+                DeviceTrustState.REVOKED -> {
+                    clearAccessControlledState(self, prompt = false)
+                }
+            }
+        }
+    }
+
+    private suspend fun establishAccountScope(nextScope: String) {
+        if (accountScope != null && accountScope != nextScope) {
+            closeLiveSessions()
+            closeHistoryEngines()
+            clearRoomCache()
+            billing.reset()
+        }
+        if (accountScope != nextScope) {
+            storedIdentity?.identity?.destroy()
+            storedIdentity = null
+        }
+        accountScope = nextScope
+        sessionStore.accountScope = nextScope
     }
 
     private suspend fun fetchClientConfiguration(root: String): ClientConfiguration = withContext(Dispatchers.IO) {
         val request = Request.Builder().url("$root/v1/client-config").get().build()
-        http.newCall(request).execute().use { response ->
+        nativeAuthHttp.newCall(request).execute().use { response ->
             check(response.isSuccessful) { "TermLink client configuration returned HTTP ${response.code}" }
-            val body = json.parseToJsonElement(response.body?.string().orEmpty()).jsonObject
+            val raw = readBoundedOidcResponse(response.body, 64 * 1024, NativeOidcFailure.INVALID_CONFIGURATION)
+            val body = json.parseToJsonElement(raw).jsonObject
+            val issuer = Uri.parse(body.requiredString("oidc_issuer"))
+            val redirect = Uri.parse(body.requiredString("redirect_uri"))
+            OidcEndpointPolicy.canonicalIssuer(issuer)
+            check(redirect.scheme.equals("dev.termlink", ignoreCase = true)) { "Server returned an unsupported redirect URI" }
             ClientConfiguration(
-                issuer = Uri.parse(body.requiredString("oidc_issuer")),
+                issuer = issuer,
                 clientId = body.requiredString("oidc_client_id"),
-                redirectUri = Uri.parse(body.requiredString("redirect_uri")),
+                redirectUri = redirect,
             )
         }
     }
 
-    private suspend fun fetchIssuerConfiguration(issuer: Uri): AuthorizationServiceConfiguration =
-        suspendCancellableCoroutine { continuation ->
-            AuthorizationServiceConfiguration.fetchFromIssuer(issuer) { configuration, exception ->
-                if (!continuation.isActive) return@fetchFromIssuer
-                if (configuration == null) continuation.resumeWithException(exception ?: IllegalStateException("OIDC discovery failed"))
-                else continuation.resume(configuration)
-            }
+    /**
+     * A server refresh can downgrade this device from trusted to pending or
+     * revoked.  Close all access-bearing runtime state and erase the local
+     * encrypted session/history rows before exposing the downgraded snapshot.
+     * The device identity is intentionally retained so the pairing flow can
+     * complete without manufacturing a new device.
+     */
+    private suspend fun clearAccessControlledState(
+        self: DeviceSummary,
+        prompt: Boolean = mutableSnapshot.value.enrollmentConfirmationRequired,
+    ) = accessStateLock.withLock {
+        closeLiveSessions()
+        closeHistoryEngines()
+        billing.reset()
+        clearRoomCache()
+        val current = mutableSnapshot.value
+        mutableSnapshot.value = current.copy(
+            signedIn = true,
+            configured = true,
+            connectionState = ProductConnectionState.CONNECTED,
+            connectionError = null,
+            enrollmentState = when (self.trustState) {
+                DeviceTrustState.PENDING -> ProductEnrollmentState.PENDING_CONFIRMATION
+                DeviceTrustState.REVOKED -> ProductEnrollmentState.REVOKED
+                DeviceTrustState.TRUSTED -> ProductEnrollmentState.TRUSTED
+            },
+            enrollmentConfirmationRequired = prompt && self.trustState == DeviceTrustState.PENDING,
+            accountLabel = if (self.trustState == DeviceTrustState.REVOKED) "Revoked account" else "Account setup required",
+            devices = listOf(self),
+            pcs = emptyList(),
+            sessions = emptyList(),
+            sessionStates = emptyMap(),
+            pairingChallenge = null,
+            history = emptyList(),
+            replayedHistoryObjectIds = emptySet(),
+            catalogPlans = emptyList(),
+            entitlement = null,
+            catalogPlan = null,
+            billing = BillingSnapshot(),
+            lastSyncedAt = Instant.now(),
+        )
+    }
+
+    private suspend fun clearRoomCache() = withContext(Dispatchers.IO) {
+        database.withTransaction {
+            database.eventChunks().clear()
+            database.snapshots().clear()
+            database.ackCursors().clear()
+            database.sessions().clear()
+            database.pcs().clear()
+            database.devices().clear()
+            database.preferences().clear()
         }
+    }
 
     private fun appendActivity(title: String, detail: String, severity: Severity) {
-        mutableSnapshot.value = mutableSnapshot.value.copy(
-            activity = listOf(ActivityEntry(UUID.randomUUID().toString(), Instant.now(), title, detail, severity)) + mutableSnapshot.value.activity,
+        mutableSnapshot.value = mutableSnapshot.value.withLocalActivity(
+            ActivityEntry(UUID.randomUUID().toString(), Instant.now(), title, sanitizeActivityDetail(detail), severity),
         )
     }
 
     private fun publishFailure(error: Throwable) {
-        appendActivity("Connection failed", error.message ?: error::class.java.simpleName, Severity.ERROR)
+        val message = safeFailureMessage(error)
+        mutableSnapshot.value = mutableSnapshot.value.copy(
+            connectionState = ProductConnectionState.ERROR,
+            connectionError = message,
+        )
+        appendActivity("Connection failed", message, Severity.ERROR)
     }
 
+    private fun safeFailureMessage(error: Throwable): String = when (error) {
+        is NativeOidcException -> when (error.reason) {
+            NativeOidcFailure.INVALID_CREDENTIALS -> activity.getString(R.string.failure_invalid_credentials)
+            NativeOidcFailure.ACCOUNT_SETUP_REQUIRED -> activity.getString(R.string.sign_in_account_setup_required)
+            NativeOidcFailure.DISCOVERY_FAILED,
+            NativeOidcFailure.NETWORK -> activity.getString(R.string.failure_identity_network)
+            NativeOidcFailure.INVALID_CONFIGURATION -> activity.getString(R.string.failure_identity_configuration)
+            NativeOidcFailure.TOKEN_REQUEST_FAILED -> activity.getString(R.string.failure_identity_rejected)
+        }
+        is TermLinkApiException -> activity.getString(R.string.failure_server_http, error.status)
+        else -> activity.getString(R.string.failure_server_request)
+    }
+
+    private fun sanitizeActivityDetail(value: String): String =
+        sensitiveIdentifierPattern.replace(value, "session")
+
     private fun closeLiveSessionsExcept(retained: Set<UUID>) {
-        liveSessions.keys.filterNot(retained::contains).forEach { sessionId ->
-            liveSessions.remove(sessionId)?.close()
+        synchronized(liveSessionLock) {
+            liveSessions.keys.filterNot(retained::contains).forEach { sessionId ->
+                liveSessions.remove(sessionId)?.close()
+            }
         }
         mutableSnapshot.value = mutableSnapshot.value.copy(
             sessionStates = mutableSnapshot.value.sessionStates.filterKeys(retained::contains),
@@ -641,8 +1039,10 @@ internal class ProductionProductRepository(
     }
 
     private fun closeLiveSessions() {
-        liveSessions.values.toList().forEach(LiveProductSession::close)
-        liveSessions.clear()
+        synchronized(liveSessionLock) {
+            liveSessions.values.toList().forEach(LiveProductSession::close)
+            liveSessions.clear()
+        }
         mutableSnapshot.value = mutableSnapshot.value.copy(sessionStates = emptyMap())
     }
 
@@ -682,6 +1082,8 @@ internal class ProductionProductRepository(
     }
 
     private fun normalizeServerUrl(value: String): String = ServerUrlPolicy.normalize(value)
+
+    private enum class BrowserAuthFlow { REGISTRATION, ACCOUNT_SETUP }
 
     private data class ClientConfiguration(val issuer: Uri, val clientId: String, val redirectUri: Uri)
 
@@ -847,5 +1249,6 @@ internal class ProductionProductRepository(
         const val PUBLIC_SERVER_URL = "https://termlink.kget.cc:8910"
         const val LIVE_TOKEN_REFRESH_INTERVAL_MILLIS = 15_000L
         const val LIVE_TOKEN_REFRESH_RETRY_MILLIS = 45_000L
+        val sensitiveIdentifierPattern = Regex("(?i)\\b[0-9a-f]{8}-[0-9a-f-]{27,}\\b")
     }
 }
