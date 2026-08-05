@@ -63,7 +63,7 @@ html[data-theme="dark"] {
   --danger: #f1737c;
   --shadow: rgba(0, 0, 0, 0.32);
   --grid-dot: rgba(133, 148, 255, 0.12);
-  --accent-on: #ffffff;
+  --accent-on: #0c1020;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -86,7 +86,7 @@ html[data-theme="dark"] {
     --danger: #f1737c;
     --shadow: rgba(0, 0, 0, 0.32);
     --grid-dot: rgba(133, 148, 255, 0.12);
-    --accent-on: #ffffff;
+    --accent-on: #0c1020;
   }
 }
 
@@ -96,7 +96,6 @@ html[data-theme="dark"] {
 
 html,
 body {
-  min-width: 320px;
   margin: 0;
   color: var(--text);
   font-family: var(--font-ui);
@@ -219,7 +218,8 @@ dd {
   gap: 8px;
 }
 
-.theme-toggle {
+.theme-toggle,
+.identity-account-link {
   min-height: 32px;
   display: inline-flex;
   align-items: center;
@@ -234,9 +234,20 @@ dd {
   font-size: 11px;
 }
 
-.theme-toggle:hover {
+.identity-account-link {
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.theme-toggle:hover,
+.identity-account-link:hover {
   border-color: var(--accent);
   color: var(--text);
+}
+
+.identity-account-link-icon {
+  color: var(--accent-2);
+  font: 700 14px/1 var(--font-mono);
 }
 
 .theme-toggle-icon {
@@ -326,7 +337,7 @@ dd {
 .identity-context-copy > p:last-child {
   max-width: 510px;
   color: var(--text-2);
-  font-size: 11px;
+  font-size: 14px;
   line-height: 1.65;
 }
 
@@ -442,7 +453,7 @@ dd {
 
 .identity-form-heading > p:last-child {
   color: var(--text-2);
-  font-size: 11px;
+  font-size: 14px;
   line-height: 1.5;
 }
 
@@ -738,7 +749,7 @@ dd {
 .tl-button-primary {
   border-color: var(--accent);
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-on);
 }
 
 .tl-button-primary:hover {
@@ -751,10 +762,10 @@ dd {
 }
 
 .identity-submit {
-  min-height: 34px;
-  padding-block: 4px;
+  min-height: 42px;
+  padding-block: 9px;
   margin-top: 1px;
-  font-weight: 400;
+  font-weight: 600;
 }
 
 .identity-submit span:last-child {
@@ -987,6 +998,10 @@ dd {
     padding-inline: 8px;
   }
 
+  .identity-account-link {
+    padding-inline: 8px;
+  }
+
   .theme-toggle-label {
     display: none;
   }
@@ -1029,6 +1044,10 @@ dd {
   .identity-brand img {
     width: 29px;
     height: 29px;
+  }
+
+  .identity-brand > span {
+    display: none;
   }
 
   .identity-languages a {

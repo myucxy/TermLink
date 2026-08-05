@@ -106,7 +106,7 @@ type PortalAdminDashboard struct {
 // SyncPortalIdentity creates the account record used by the browser portal.
 // A signed SUPER_ADMIN assertion can grant the role only while the database
 // has no active SUPER_ADMIN. Every later grant is an audited database action.
-func (s *Postgres) SyncPortalIdentity(ctx context.Context, subjectHash [32]byte, asserted Role) (PortalAccount, error) {
+func (s *Postgres) SyncPortalIdentity(ctx context.Context, subjectHash [32]byte, asserted Role, traceID string) (PortalAccount, error) {
 	if !asserted.Valid() {
 		asserted = RoleUser
 	}
@@ -129,6 +129,15 @@ func (s *Postgres) SyncPortalIdentity(ctx context.Context, subjectHash [32]byte,
 		return PortalAccount{}, err
 	}
 	if result.Status != "ACTIVE" {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO audit_events(user_id,action,target_type,target_id,result,trace_id,metadata)
+			VALUES($1,'identity.web.login','account',$1,'DENIED',$2,jsonb_build_object('status',$3::text))`,
+			userID, traceID, result.Status); err != nil {
+			return PortalAccount{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return PortalAccount{}, err
+		}
 		return PortalAccount{}, ErrDenied
 	}
 	if asserted == RoleSuperAdmin && result.Role != RoleSuperAdmin {
@@ -146,10 +155,26 @@ func (s *Postgres) SyncPortalIdentity(ctx context.Context, subjectHash [32]byte,
 			}
 		}
 	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO audit_events(user_id,action,target_type,target_id,result,trace_id,metadata)
+		VALUES($1,'identity.web.login','account',$1,'SUCCEEDED',$2,jsonb_build_object('role',$3::text))`,
+		userID, traceID, result.Role); err != nil {
+		return PortalAccount{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return PortalAccount{}, err
 	}
 	return result, nil
+}
+
+// RecordPortalLoginFailure captures only a stable failure reason and trace ID.
+// No authorization code, token, raw subject, IP address, or browser content is
+// accepted by this method.
+func (s *Postgres) RecordPortalLoginFailure(ctx context.Context, traceID, reason string) error {
+	_, err := s.Pool.Exec(ctx, `
+		INSERT INTO audit_events(action,target_type,result,trace_id,metadata)
+		VALUES('identity.web.login','account','FAILED',$1,jsonb_build_object('reason',$2::text))`, traceID, reason)
+	return err
 }
 
 func (s *Postgres) GetPortalAccount(ctx context.Context, subjectHash [32]byte) (PortalAccount, error) {
@@ -366,6 +391,14 @@ func (s *Postgres) UpdatePortalAccountStatus(ctx context.Context, actorID, targe
 		VALUES($1,'admin.account.status.update','account',$2,'SUCCEEDED',$3,jsonb_build_object('old_status',$4::text,'new_status',$5::text))`,
 		actorID, targetID, traceID, oldStatus, newStatus); err != nil {
 		return err
+	}
+	if oldStatus != newStatus {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO outbox(event_type,aggregate_id,payload)
+			VALUES('account.status.changed',$1,jsonb_build_object('account_id',$1::uuid,'status',$2::text))`,
+			targetID, newStatus); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }

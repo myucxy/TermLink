@@ -107,6 +107,10 @@ type peer struct {
 	once          sync.Once
 	lastSequences map[uuid.UUID]uint64
 	subscriptions map[uuid.UUID]bool
+	// subscriptionRoutes is protected by hub.mu together with subscriptions.
+	// It binds an authorized Android subscription to the owning Windows device
+	// and the exact Grant expiry used by the zero-database-query output path.
+	subscriptionRoutes map[uuid.UUID]store.SessionRouteAuthorization
 }
 
 func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -150,7 +154,7 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		closeSocket(socket, websocket.ClosePolicyViolation, "role does not match device")
 		return
 	}
-	connection := &peer{hub: h, socket: socket, principal: principal, role: hello.Role, send: make(chan []byte, peerQueueFrames), done: make(chan struct{}), subscriptions: map[uuid.UUID]bool{}, lastSequences: map[uuid.UUID]uint64{}}
+	connection := &peer{hub: h, socket: socket, principal: principal, role: hello.Role, send: make(chan []byte, peerQueueFrames), done: make(chan struct{}), subscriptions: map[uuid.UUID]bool{}, subscriptionRoutes: map[uuid.UUID]store.SessionRouteAuthorization{}, lastSequences: map[uuid.UUID]uint64{}}
 	if !h.add(connection) {
 		closeSocket(socket, websocket.CloseTryAgainLater, "relay shutting down")
 		return
@@ -164,8 +168,17 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := socket.WriteJSON(welcome); err != nil {
 		return
 	}
+	connection.refreshPresence()
 	_ = socket.SetReadDeadline(time.Now().Add(pongTimeout))
-	socket.SetPongHandler(func(string) error { return socket.SetReadDeadline(time.Now().Add(pongTimeout)) })
+	socket.SetPongHandler(func(string) error {
+		if err := socket.SetReadDeadline(time.Now().Add(pongTimeout)); err != nil {
+			return err
+		}
+		// Presence represents a live round trip from the peer, not merely the
+		// Relay's local ping timer continuing to run.
+		connection.refreshPresence()
+		return nil
+	})
 	go connection.writeLoop()
 	connection.readLoop()
 }
@@ -215,6 +228,7 @@ func (h *Hub) remove(p *peer) {
 				delete(h.subscriptions, sessionID)
 			}
 		}
+		delete(p.subscriptionRoutes, sessionID)
 	}
 	h.mu.Unlock()
 	if len(removedSessions) > 0 {
@@ -306,16 +320,24 @@ func (p *peer) route(envelope realtimewire.Envelope, sessionID uuid.UUID, frame 
 		return store.ErrDenied
 	}
 	if p.role == "pc" {
-		owner, err := p.hub.store.SessionPCDevice(ctx, p.principal.UserID, sessionID)
-		if err != nil || owner != p.principal.Device.ID {
-			return store.ErrDenied
+		// An Android client can disconnect or unsubscribe between the Agent's
+		// subscriber snapshot and this frame. Treat that as an idempotent drop,
+		// not as a policy violation that tears down the entire PC connection. The
+		// cached subscription binds this session to its authoritative PC owner,
+		// so the terminal-output hot path does not query PostgreSQL per frame.
+		return p.hub.routeToSubscriber(ctx, p, sessionID, recipient, frame)
+	}
+	if envelope.MessageType == realtimewire.Unsubscribe {
+		route, subscribed := p.hub.subscriptionRoute(p, sessionID)
+		if p.hub.unsubscribe(p, sessionID) {
+			_ = p.hub.leases.ReleaseLiveSession(ctx, p.principal.UserID, sessionID, p.principal.Device.ID)
 		}
-		if !p.hub.sendToSubscriber(p, sessionID, recipient, frame) {
-			return store.ErrDenied
+		if subscribed && recipient == route.PCDeviceID {
+			p.hub.sendToDevice(p, route.PCDeviceID, frame)
 		}
 		return nil
 	}
-	permission, err := p.hub.store.SessionPermission(ctx, p.principal.UserID, p.principal.Device.ID, sessionID)
+	route, err := p.hub.store.SessionRoute(ctx, p.principal.UserID, p.principal.Device.ID, sessionID)
 	if err != nil {
 		return err
 	}
@@ -328,13 +350,10 @@ func (p *peer) route(envelope realtimewire.Envelope, sessionID uuid.UUID, frame 
 		if _, err := p.hub.leases.ReserveLiveSession(ctx, p.principal.UserID, sessionID, p.principal.Device.ID, entitlement.MaxLiveSessions); err != nil {
 			return store.ErrEntitlement
 		}
-		p.hub.subscribe(p, sessionID)
-	case realtimewire.Unsubscribe:
-		p.hub.unsubscribe(p, sessionID)
-		_ = p.hub.leases.ReleaseLiveSession(ctx, p.principal.UserID, sessionID, p.principal.Device.ID)
+		p.hub.subscribe(p, sessionID, route)
 	}
 	if envelope.MessageType == realtimewire.InputEvent || envelope.MessageType == realtimewire.ResizeRequest {
-		if permission != "CONTROL" && permission != "MANAGE" {
+		if route.Permission != "CONTROL" && route.Permission != "MANAGE" {
 			return store.ErrDenied
 		}
 		lease, err := p.hub.leases.GetLease(ctx, sessionID)
@@ -342,19 +361,18 @@ func (p *peer) route(envelope realtimewire.Envelope, sessionID uuid.UUID, frame 
 			return store.ErrDenied
 		}
 	}
-	owner, err := p.hub.store.SessionPCDevice(ctx, p.principal.UserID, sessionID)
-	if err != nil {
-		return err
-	}
-	if recipient != owner {
+	if recipient != route.PCDeviceID {
 		return store.ErrDenied
 	}
-	p.hub.sendToDevice(p, owner, frame)
+	p.hub.sendToDevice(p, route.PCDeviceID, frame)
 	return nil
 }
 
-func (h *Hub) subscribe(p *peer, sessionID uuid.UUID) {
+func (h *Hub) subscribe(p *peer, sessionID uuid.UUID, route store.SessionRouteAuthorization) {
 	h.mu.Lock()
+	if p.subscriptionRoutes == nil {
+		p.subscriptionRoutes = map[uuid.UUID]store.SessionRouteAuthorization{}
+	}
 	subscribers := h.subscriptions[sessionID]
 	if subscribers == nil {
 		subscribers = map[uuid.UUID]*peer{}
@@ -363,17 +381,19 @@ func (h *Hub) subscribe(p *peer, sessionID uuid.UUID) {
 	_, existed := subscribers[p.principal.Device.ID]
 	subscribers[p.principal.Device.ID] = p
 	p.subscriptions[sessionID] = true
+	p.subscriptionRoutes[sessionID] = route
 	h.mu.Unlock()
 	if !existed {
 		h.observer.SubscriptionsChanged(1)
 	}
 }
-func (h *Hub) unsubscribe(p *peer, sessionID uuid.UUID) {
+func (h *Hub) unsubscribe(p *peer, sessionID uuid.UUID) bool {
 	h.mu.Lock()
-	delete(p.subscriptions, sessionID)
 	removed := false
 	if subscribers := h.subscriptions[sessionID]; subscribers != nil {
 		if subscribers[p.principal.Device.ID] == p {
+			delete(p.subscriptions, sessionID)
+			delete(p.subscriptionRoutes, sessionID)
 			delete(subscribers, p.principal.Device.ID)
 			removed = true
 			if len(subscribers) == 0 {
@@ -385,22 +405,67 @@ func (h *Hub) unsubscribe(p *peer, sessionID uuid.UUID) {
 	if removed {
 		h.observer.SubscriptionsChanged(-1)
 	}
+	return removed
 }
 
 func (h *Hub) isCurrent(p *peer) bool {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.peers[p.principal.Device.ID] == p
-}
-func (h *Hub) sendToSubscriber(sender *peer, sessionID, recipient uuid.UUID, frame []byte) bool {
-	h.mu.RLock()
-	target := h.subscriptions[sessionID][recipient]
+	current := h.peers[p.principal.Device.ID] == p
 	h.mu.RUnlock()
-	if target == nil || target.principal.UserID != sender.principal.UserID {
+	if !current {
 		return false
 	}
-	target.enqueue(frame)
+	select {
+	case <-p.done:
+		return false
+	default:
+		return true
+	}
+}
+
+func (h *Hub) subscriptionRoute(p *peer, sessionID uuid.UUID) (store.SessionRouteAuthorization, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.subscriptions[sessionID][p.principal.Device.ID] != p {
+		return store.SessionRouteAuthorization{}, false
+	}
+	route, ok := p.subscriptionRoutes[sessionID]
+	return route, ok
+}
+
+func (h *Hub) updateSubscriptionRoute(p *peer, sessionID uuid.UUID, route store.SessionRouteAuthorization) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.subscriptions[sessionID][p.principal.Device.ID] != p {
+		return false
+	}
+	p.subscriptionRoutes[sessionID] = route
 	return true
+}
+
+func (h *Hub) routeToSubscriber(ctx context.Context, sender *peer, sessionID, recipient uuid.UUID, frame []byte) error {
+	h.mu.RLock()
+	target := h.subscriptions[sessionID][recipient]
+	var route store.SessionRouteAuthorization
+	var routePresent bool
+	if target != nil {
+		route, routePresent = target.subscriptionRoutes[sessionID]
+	}
+	h.mu.RUnlock()
+	if target == nil || target.principal.UserID != sender.principal.UserID {
+		return nil
+	}
+	if !routePresent || route.PCDeviceID != sender.principal.Device.ID {
+		return store.ErrDenied
+	}
+	if route.GrantExpiresAt != nil && !time.Now().Before(*route.GrantExpiresAt) {
+		if h.unsubscribe(target, sessionID) {
+			_ = h.leases.ReleaseLiveSession(ctx, target.principal.UserID, sessionID, target.principal.Device.ID)
+		}
+		return nil
+	}
+	target.enqueue(frame)
+	return nil
 }
 func (h *Hub) sendToDevice(sender *peer, deviceID uuid.UUID, frame []byte) {
 	h.mu.RLock()
@@ -465,7 +530,36 @@ func (p *peer) refreshSubscriptions() {
 		return
 	}
 	for _, id := range sessions {
-		_, _ = p.hub.leases.ReserveLiveSession(ctx, p.principal.UserID, id, p.principal.Device.ID, entitlement.MaxLiveSessions)
+		route, err := p.hub.store.SessionRoute(ctx, p.principal.UserID, p.principal.Device.ID, id)
+		if err != nil {
+			if errors.Is(err, store.ErrDenied) || errors.Is(err, store.ErrNotFound) {
+				if p.hub.unsubscribe(p, id) {
+					_ = p.hub.leases.ReleaseLiveSession(ctx, p.principal.UserID, id, p.principal.Device.ID)
+				}
+			}
+			continue
+		}
+		if _, err := p.hub.leases.ReserveLiveSession(ctx, p.principal.UserID, id, p.principal.Device.ID, entitlement.MaxLiveSessions); errors.Is(err, kv.ErrQuotaReached) {
+			if p.hub.unsubscribe(p, id) {
+				_ = p.hub.leases.ReleaseLiveSession(ctx, p.principal.UserID, id, p.principal.Device.ID)
+			}
+		} else if err == nil {
+			p.hub.updateSubscriptionRoute(p, id, route)
+		}
+	}
+}
+
+func (p *peer) refreshPresence() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var err error
+	if p.role == "pc" {
+		err = p.hub.store.TouchPCPresence(ctx, p.principal.UserID, p.principal.Device.ID)
+	} else {
+		err = p.hub.store.TouchDevicePresence(ctx, p.principal.UserID, p.principal.Device.ID)
+	}
+	if errors.Is(err, store.ErrDenied) {
+		p.close(websocket.ClosePolicyViolation, "device no longer trusted")
 	}
 }
 func (p *peer) close(code int, reason string) bool {
@@ -473,7 +567,9 @@ func (p *peer) close(code int, reason string) bool {
 	p.once.Do(func() {
 		closed = true
 		close(p.done)
-		closeSocket(p.socket, code, reason)
+		if p.socket != nil {
+			closeSocket(p.socket, code, reason)
+		}
 	})
 	return closed
 }
@@ -490,6 +586,46 @@ func (h *Hub) Revoke(deviceID uuid.UUID) {
 	h.mu.RUnlock()
 	if p != nil {
 		p.close(websocket.ClosePolicyViolation, "device revoked")
+	}
+}
+
+// DisableAccount terminates every current device connection for an account.
+// PostgreSQL status checks remain the authority on every later handshake and
+// route; this hook makes a committed administrator lock effective immediately
+// across Relay instances through Valkey Pub/Sub.
+func (h *Hub) DisableAccount(userID uuid.UUID) {
+	h.closeAccount(userID, "account disabled")
+}
+
+// RefreshAccount retires transports after an entitlement revision so every
+// reconnect and subscription re-evaluates the new server-authoritative quota.
+func (h *Hub) RefreshAccount(userID uuid.UUID) {
+	h.closeAccount(userID, "account authorization changed")
+}
+
+func (h *Hub) closeAccount(userID uuid.UUID, reason string) {
+	h.mu.RLock()
+	peers := make([]*peer, 0)
+	for _, p := range h.peers {
+		if p.principal.UserID == userID {
+			peers = append(peers, p)
+		}
+	}
+	h.mu.RUnlock()
+	for _, p := range peers {
+		p.close(websocket.ClosePolicyViolation, reason)
+	}
+}
+
+// RefreshDevice closes the current transport after a committed grant change.
+// The device may reconnect, but every new route is then evaluated against the
+// updated PostgreSQL authority and key epoch.
+func (h *Hub) RefreshDevice(deviceID uuid.UUID) {
+	h.mu.RLock()
+	p := h.peers[deviceID]
+	h.mu.RUnlock()
+	if p != nil {
+		p.close(websocket.ClosePolicyViolation, "device authorization changed")
 	}
 }
 func (h *Hub) Close(ctx context.Context) error {

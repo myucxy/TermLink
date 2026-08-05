@@ -121,22 +121,48 @@ func (v *Valkey) Release(ctx context.Context, lease Lease) (bool, error) {
 }
 
 func (v *Valkey) ForceRelease(ctx context.Context, sessionID uuid.UUID) (Lease, bool, error) {
-	lease, err := v.GetLease(ctx, sessionID)
+	key := "lease:" + sessionID.String()
+	value, err := forceReleaseScript.Run(ctx, v.Client, []string{key}).Text()
 	if errors.Is(err, redis.Nil) {
 		return Lease{}, false, nil
 	}
 	if err != nil {
 		return Lease{}, false, err
 	}
-	removed, err := v.Client.Del(ctx, "lease:"+sessionID.String()).Result()
-	return lease, removed == 1, err
+	lease, err := parseLeaseValue(sessionID, value)
+	if err != nil {
+		return Lease{}, false, err
+	}
+	return lease, true, nil
 }
 
+// Reading and deleting must be one Redis operation. A GET followed by DEL can
+// erase a replacement lease acquired between those commands.
+var forceReleaseScript = redis.NewScript(`
+local value=redis.call('GET',KEYS[1])
+if not value then return nil end
+redis.call('DEL',KEYS[1])
+return value`)
+
 func (v *Valkey) GetLease(ctx context.Context, sessionID uuid.UUID) (Lease, error) {
-	value, err := v.Client.Get(ctx, "lease:"+sessionID.String()).Result()
+	key := "lease:" + sessionID.String()
+	value, err := v.Client.Get(ctx, key).Result()
 	if err != nil {
 		return Lease{}, err
 	}
+	lease, err := parseLeaseValue(sessionID, value)
+	if err != nil {
+		return Lease{}, err
+	}
+	ttl, err := v.Client.PTTL(ctx, key).Result()
+	if err != nil {
+		return Lease{}, err
+	}
+	lease.ExpiresAt = time.Now().UTC().Add(ttl)
+	return lease, nil
+}
+
+func parseLeaseValue(sessionID uuid.UUID, value string) (Lease, error) {
 	parts := strings.Split(value, "|")
 	if len(parts) != 3 {
 		return Lease{}, errors.New("invalid lease state")
@@ -153,11 +179,7 @@ func (v *Valkey) GetLease(ctx context.Context, sessionID uuid.UUID) (Lease, erro
 	if err != nil {
 		return Lease{}, err
 	}
-	ttl, err := v.Client.PTTL(ctx, "lease:"+sessionID.String()).Result()
-	if err != nil {
-		return Lease{}, err
-	}
-	return Lease{SessionID: sessionID, HolderDeviceID: holder, ID: id, Version: version, ExpiresAt: time.Now().UTC().Add(ttl)}, nil
+	return Lease{SessionID: sessionID, HolderDeviceID: holder, ID: id, Version: version}, nil
 }
 
 var renewScript = redis.NewScript(`if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('PEXPIRE',KEYS[1],ARGV[2]) else return 0 end`)

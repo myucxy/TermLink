@@ -49,13 +49,14 @@ type API struct {
 }
 
 type ClientConfiguration struct {
-	OIDCIssuer         string
-	OIDCClientID       string
-	RedirectURI        string
-	WindowsClientID    string
-	WindowsRedirectURI string
-	WebClientID        string
-	WebRedirectURI     string
+	OIDCIssuer                 string
+	OIDCClientID               string
+	RedirectURI                string
+	WindowsClientID            string
+	WindowsRegistrationParties []string
+	WindowsRedirectURI         string
+	WebClientID                string
+	WebRedirectURI             string
 }
 
 type HistoryObjectStore interface {
@@ -80,7 +81,9 @@ func (a *API) Handler() http.Handler {
 	trusted.HandleFunc("POST /v1/devices/{id}/revoke", a.revokeDevice)
 	trusted.HandleFunc("GET /v1/pcs", a.listPCs)
 	trusted.HandleFunc("PUT /v1/pcs/{id}", a.upsertPC)
+	trusted.HandleFunc("GET /v1/pcs/{id}/grants", a.listPCGrants)
 	trusted.HandleFunc("POST /v1/pcs/{id}/grants", a.putGrant)
+	trusted.HandleFunc("DELETE /v1/pcs/{id}/grants/{deviceId}", a.deleteGrant)
 	trusted.HandleFunc("GET /v1/pcs/{id}/sessions", a.listSessions)
 	trusted.HandleFunc("PUT /v1/sessions/{id}", a.upsertSession)
 	trusted.HandleFunc("DELETE /v1/sessions/{id}", a.deleteSession)
@@ -107,6 +110,7 @@ func (a *API) Handler() http.Handler {
 	root.Handle("/v1/billing/plans", public)
 	root.Handle("/v1/client-config", public)
 	root.Handle("/v1/devices/self", a.Auth.AuthenticateRegistered(registered))
+	root.Handle("/v1/devices/self/trust", a.Auth.AuthenticateRegistered(a.idempotency(http.HandlerFunc(a.selfTrustAndroidDevice))))
 	// Register the exact create path as well as the completion subtree. Without
 	// this, net/http redirects POST /v1/pairing/challenges to a trailing slash,
 	// changing the signed request target and causing a false authentication
@@ -178,6 +182,10 @@ func (a *API) registerDevice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_DEVICE_TYPE", errors.New("invalid device type"))
 		return
 	}
+	if !a.canRegisterDeviceType(input.Type, identity.AuthorizedParty) {
+		writeError(w, r, http.StatusForbidden, "DEVICE_TYPE_NOT_ALLOWED", store.ErrDenied)
+		return
+	}
 	input.Name = strings.TrimSpace(input.Name)
 	if len(input.Name) < 1 || len(input.Name) > 128 || len(input.KeyID) < 8 || len(input.KeyID) > 128 {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", errors.New("invalid device fields"))
@@ -217,6 +225,21 @@ func (a *API) registerDevice(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"user_id": userID, "device": device, "bootstrap": bootstrap})
 }
 
+func (a *API) canRegisterDeviceType(deviceType, authorizedParty string) bool {
+	authorizedParty = strings.TrimSpace(authorizedParty)
+	switch deviceType {
+	case "ANDROID":
+		return authorizedParty != "" && authorizedParty == a.ClientConfig.OIDCClientID
+	case "WINDOWS_PC":
+		for _, party := range a.ClientConfig.WindowsRegistrationParties {
+			if authorizedParty != "" && authorizedParty == party {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (a *API) listDevices(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
 	items, err := a.Store.ListDevices(r.Context(), p.UserID)
@@ -235,6 +258,40 @@ func (a *API) getCurrentDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"device": item})
+}
+
+func (a *API) selfTrustAndroidDevice(w http.ResponseWriter, r *http.Request) {
+	p := principal(r)
+	if p.Device.Type != "ANDROID" || p.Identity.AuthorizedParty != a.ClientConfig.OIDCClientID ||
+		strings.TrimSpace(p.Identity.TokenID) == "" || len(a.TokenKey) < 32 {
+		writeError(w, r, http.StatusForbidden, "SELF_TRUST_NOT_ALLOWED", store.ErrDenied)
+		return
+	}
+	tokenIDHash := selfTrustTokenIDHash(a.TokenKey, p.Identity)
+	device, changed, err := a.Store.SelfTrustAndroidDevice(
+		r.Context(), p.UserID, p.Device.ID, tokenIDHash, traceID(r.Context()),
+	)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "TRUSTED",
+		"changed": changed,
+		"device":  device,
+	})
+}
+
+func selfTrustTokenIDHash(key []byte, identity auth.Identity) [32]byte {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte("TERMLINK-ANDROID-SELF-TRUST-JTI-V1"))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(identity.Issuer))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(identity.TokenID))
+	var result [32]byte
+	copy(result[:], mac.Sum(nil))
+	return result
 }
 
 func (a *API) createPairingChallenge(w http.ResponseWriter, r *http.Request) {
@@ -438,11 +495,71 @@ func (a *API) putGrant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 400, "INVALID_PERMISSION", errors.New("invalid permission"))
 		return
 	}
-	if err := a.Store.PutGrant(r.Context(), p.UserID, p.Device.ID, deviceID, pcID, input.Permission, input.ExpiresAt); err != nil {
+	if input.ExpiresAt != nil && !input.ExpiresAt.After(a.now()) {
+		writeError(w, r, 400, "INVALID_GRANT_EXPIRY", errors.New("grant expiry must be in the future"))
+		return
+	}
+	if err := a.Store.PutGrant(r.Context(), p.UserID, p.Device.ID, deviceID, pcID, input.Permission, input.ExpiresAt, traceID(r.Context())); err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
+	if input.Permission == "VIEW" {
+		if sessions, listErr := a.Store.ListSessions(r.Context(), p.UserID, p.Device.ID, pcID); listErr == nil {
+			for _, session := range sessions {
+				lease, leaseErr := a.Valkey.GetLease(r.Context(), session.ID)
+				if leaseErr == nil && lease.HolderDeviceID == deviceID {
+					_, _ = a.Valkey.Release(r.Context(), lease)
+				}
+			}
+		}
+	}
+	_ = a.Valkey.Client.Publish(r.Context(), "device-authorization-changed", deviceID.String()).Err()
 	writeJSON(w, 200, map[string]any{"permission": input.Permission})
+}
+
+func (a *API) deleteGrant(w http.ResponseWriter, r *http.Request) {
+	p := principal(r)
+	pcID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_PC_ID", err)
+		return
+	}
+	deviceID, err := uuid.Parse(r.PathValue("deviceId"))
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_DEVICE_ID", err)
+		return
+	}
+	result, err := a.Store.DeleteGrant(r.Context(), p.UserID, p.Device.ID, deviceID, pcID, traceID(r.Context()))
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	// PostgreSQL and the Relay remain authoritative even if Valkey is briefly
+	// unavailable. Best-effort CAS release prevents a removed controller from
+	// blocking another device while never releasing a newly acquired lease.
+	for _, sessionID := range result.LeaseSessionIDs {
+		lease, leaseErr := a.Valkey.GetLease(r.Context(), sessionID)
+		if leaseErr == nil && lease.HolderDeviceID == deviceID {
+			_, _ = a.Valkey.Release(r.Context(), lease)
+		}
+	}
+	_ = a.Valkey.Client.Publish(r.Context(), "device-authorization-changed", deviceID.String()).Err()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *API) listPCGrants(w http.ResponseWriter, r *http.Request) {
+	p := principal(r)
+	pcID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, r, 400, "INVALID_PC_ID", err)
+		return
+	}
+	keyEpoch, items, err := a.Store.ListPCGrants(r.Context(), p.UserID, p.Device.ID, pcID)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"pc_id": pcID, "key_epoch": keyEpoch, "items": items})
 }
 
 func (a *API) listSessions(w http.ResponseWriter, r *http.Request) {
@@ -551,7 +668,7 @@ func (a *API) acquireLease(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if err := a.Store.SaveLease(r.Context(), lease.ID, lease.SessionID, lease.HolderDeviceID, lease.ExpiresAt, lease.Version); err != nil {
+	if err := a.Store.SaveLease(r.Context(), p.UserID, p.Device.ID, lease.ID, lease.SessionID, lease.HolderDeviceID, lease.ExpiresAt, lease.Version, "lease.acquire", traceID(r.Context())); err != nil {
 		_, _ = a.Valkey.Release(r.Context(), lease)
 		writeStoreError(w, r, err)
 		return
@@ -602,13 +719,22 @@ func (a *API) forceReleaseLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 403, "MANAGE_NOT_GRANTED", store.ErrDenied)
 		return
 	}
-	lease, released, err := a.Valkey.ForceRelease(r.Context(), sessionID)
+	// The operation-scoped release tombstone preserves the exact lease fence
+	// across a transient PostgreSQL failure. Retrying the same idempotent
+	// request therefore reconciles the old durable row without deleting a
+	// replacement lease acquired after the first cache deletion.
+	releasedLease, released, err := a.Valkey.ForceReleaseForOperation(
+		r.Context(), sessionID, p.UserID, r.Header.Get("Idempotency-Key"),
+	)
 	if err != nil {
 		writeError(w, r, 503, "LEASE_UNAVAILABLE", err)
 		return
 	}
 	if released {
-		_ = a.Store.DeleteLease(r.Context(), sessionID, lease.ID)
+		if err := a.Store.ForceDeleteLease(r.Context(), p.UserID, p.Device.ID, sessionID, releasedLease.ID, releasedLease.Version, "lease.force_release", traceID(r.Context())); err != nil {
+			writeStoreError(w, r, err)
+			return
+		}
 	}
 	writeJSON(w, 200, map[string]any{"released": released})
 }
@@ -618,9 +744,51 @@ func (a *API) renewLease(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	permission, permissionErr := a.Store.SessionPermission(r.Context(), p.UserID, p.Device.ID, sessionID)
+	if permissionErr != nil && !errors.Is(permissionErr, store.ErrDenied) {
+		// A transient authority-store failure must not destructively release a
+		// lease that may still be valid. Fail the renewal and let its short TTL
+		// or a later authoritative check decide the lease state.
+		writeStoreError(w, r, permissionErr)
+		return
+	}
+	if permissionErr != nil || permission != "CONTROL" && permission != "MANAGE" {
+		// A downgrade, expiry, route disable, or device revocation invalidates
+		// the lease before it can be extended. Best-effort cleanup prevents the
+		// stale holder from blocking an authorized controller for another TTL.
+		existing, leaseErr := a.Valkey.GetLease(r.Context(), sessionID)
+		if leaseErr != nil && !errors.Is(leaseErr, redis.Nil) {
+			writeError(w, r, 503, "LEASE_UNAVAILABLE", leaseErr)
+			return
+		}
+		if leaseErr == nil && existing.ID == leaseID && existing.HolderDeviceID == p.Device.ID {
+			if _, releaseErr := a.Valkey.Release(r.Context(), existing); releaseErr != nil {
+				writeError(w, r, 503, "LEASE_UNAVAILABLE", releaseErr)
+				return
+			}
+		}
+		if err := a.Store.DeleteLease(r.Context(), p.UserID, p.Device.ID, sessionID, leaseID, "lease.revoke.permission", traceID(r.Context())); err != nil {
+			writeStoreError(w, r, err)
+			return
+		}
+		writeError(w, r, 403, "CONTROL_NOT_GRANTED", store.ErrDenied)
+		return
+	}
 	lease, err := a.Valkey.GetLease(r.Context(), sessionID)
-	if err != nil || lease.ID != leaseID || lease.HolderDeviceID != p.Device.ID {
-		writeError(w, r, 409, "LEASE_NOT_HELD", err)
+	if errors.Is(err, redis.Nil) {
+		if err := a.Store.DeleteLease(r.Context(), p.UserID, p.Device.ID, sessionID, leaseID, "lease.release", traceID(r.Context())); err != nil {
+			writeStoreError(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err != nil {
+		writeError(w, r, 503, "LEASE_UNAVAILABLE", err)
+		return
+	}
+	if lease.ID != leaseID || lease.HolderDeviceID != p.Device.ID {
+		writeError(w, r, 409, "LEASE_NOT_HELD", store.ErrConflict)
 		return
 	}
 	lease, err = a.Valkey.Renew(r.Context(), lease, 30*time.Second)
@@ -628,7 +796,17 @@ func (a *API) renewLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 409, "LEASE_NOT_HELD", err)
 		return
 	}
-	if err := a.Store.SaveLease(r.Context(), lease.ID, lease.SessionID, lease.HolderDeviceID, lease.ExpiresAt, lease.Version); err != nil {
+	if err := a.Store.SaveLease(r.Context(), p.UserID, p.Device.ID, lease.ID, lease.SessionID, lease.HolderDeviceID, lease.ExpiresAt, lease.Version, "", traceID(r.Context())); err != nil {
+		// Valkey is the live arbitration point, but PostgreSQL is the durable
+		// fencing record. Do not leave a newly extended cache lease active when
+		// its durable renewal was rejected or could not be committed.
+		if released, releaseErr := a.Valkey.Release(r.Context(), lease); releaseErr != nil {
+			slog.Warn("roll back lease renewal in Valkey", "error", releaseErr)
+		} else if released {
+			if deleteErr := a.Store.DeleteLease(r.Context(), p.UserID, p.Device.ID, sessionID, leaseID, "", traceID(r.Context())); deleteErr != nil {
+				slog.Warn("roll back durable lease renewal", "error", deleteErr)
+			}
+		}
 		writeStoreError(w, r, err)
 		return
 	}
@@ -641,8 +819,23 @@ func (a *API) releaseLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lease, err := a.Valkey.GetLease(r.Context(), sessionID)
-	if err != nil || lease.ID != leaseID || lease.HolderDeviceID != p.Device.ID {
-		writeError(w, r, 409, "LEASE_NOT_HELD", err)
+	if errors.Is(err, redis.Nil) {
+		// A previous attempt may already have removed the exact cache lease and
+		// failed before PostgreSQL committed. Retrying the fenced durable delete
+		// is safe even if another holder has since acquired a replacement.
+		if err := a.Store.DeleteLease(r.Context(), p.UserID, p.Device.ID, sessionID, leaseID, "lease.release", traceID(r.Context())); err != nil {
+			writeStoreError(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err != nil {
+		writeError(w, r, 503, "LEASE_UNAVAILABLE", err)
+		return
+	}
+	if lease.ID != leaseID || lease.HolderDeviceID != p.Device.ID {
+		writeError(w, r, 409, "LEASE_NOT_HELD", store.ErrConflict)
 		return
 	}
 	released, err := a.Valkey.Release(r.Context(), lease)
@@ -650,7 +843,10 @@ func (a *API) releaseLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 409, "LEASE_NOT_HELD", err)
 		return
 	}
-	_ = a.Store.DeleteLease(r.Context(), sessionID, leaseID)
+	if err := a.Store.DeleteLease(r.Context(), p.UserID, p.Device.ID, sessionID, leaseID, "lease.release", traceID(r.Context())); err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

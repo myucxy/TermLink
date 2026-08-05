@@ -51,15 +51,17 @@ func (Secret) GoString() string { return "[REDACTED]" }
 // Config is the validated production server configuration. Values ending in
 // Secret, URL, or Key are loaded from secret files and are redacted by String.
 type Config struct {
-	PublicURL              string
-	OIDCIssuer             string
-	OIDCClientID           string
-	AndroidOIDCClientID    string
-	AndroidOIDCRedirectURI string
-	WindowsOIDCClientID    string
-	WindowsOIDCRedirectURI string
-	WebOIDCClientID        string
-	WebOIDCRedirectURI     string
+	PublicURL                      string
+	OIDCIssuer                     string
+	OIDCClientID                   string
+	OIDCAllowedParties             []string
+	AndroidOIDCClientID            string
+	AndroidOIDCRedirectURI         string
+	WindowsOIDCClientID            string
+	WindowsRegistrationOIDCParties []string
+	WindowsOIDCRedirectURI         string
+	WebOIDCClientID                string
+	WebOIDCRedirectURI             string
 
 	OIDCClientSecret Secret
 	DatabaseURL      Secret
@@ -95,13 +97,15 @@ type Config struct {
 // secret paths as well as secret values, because paths can contain identifying
 // deployment information and are not needed in normal startup diagnostics.
 func (c Config) String() string {
-	return fmt.Sprintf("Config{PublicURL:%q OIDCIssuer:%q OIDCClientID:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q WindowsOIDCClientID:%q WindowsOIDCRedirectURI:%q WebOIDCClientID:%q WebOIDCRedirectURI:%q OIDCClientSecret:%s DatabaseURL:%s RedisURL:%s TokenSigningKey:%s S3Endpoint:%q S3PublicEndpoint:%q S3Bucket:%q S3Region:%q S3AccessKey:%s S3SecretKey:%s LogLevel:%q HistoryEnabled:%t ListenAddr:%q MetricsListenAddr:%q}",
+	return fmt.Sprintf("Config{PublicURL:%q OIDCIssuer:%q OIDCClientID:%q OIDCAllowedParties:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q WindowsOIDCClientID:%q WindowsRegistrationOIDCParties:%q WindowsOIDCRedirectURI:%q WebOIDCClientID:%q WebOIDCRedirectURI:%q OIDCClientSecret:%s DatabaseURL:%s RedisURL:%s TokenSigningKey:%s S3Endpoint:%q S3PublicEndpoint:%q S3Bucket:%q S3Region:%q S3AccessKey:%s S3SecretKey:%s LogLevel:%q HistoryEnabled:%t ListenAddr:%q MetricsListenAddr:%q}",
 		c.PublicURL,
 		c.OIDCIssuer,
 		c.OIDCClientID,
+		c.OIDCAllowedParties,
 		c.AndroidOIDCClientID,
 		c.AndroidOIDCRedirectURI,
 		c.WindowsOIDCClientID,
+		c.WindowsRegistrationOIDCParties,
 		c.WindowsOIDCRedirectURI,
 		c.WebOIDCClientID,
 		c.WebOIDCRedirectURI,
@@ -136,15 +140,17 @@ func (c Config) Validate() error {
 // obtain secrets from a managed secret provider instead of files. Production
 // startup should use Load, which enforces file permissions.
 type Input struct {
-	PublicURL              string
-	OIDCIssuer             string
-	OIDCClientID           string
-	AndroidOIDCClientID    string
-	AndroidOIDCRedirectURI string
-	WindowsOIDCClientID    string
-	WindowsOIDCRedirectURI string
-	WebOIDCClientID        string
-	WebOIDCRedirectURI     string
+	PublicURL                      string
+	OIDCIssuer                     string
+	OIDCClientID                   string
+	OIDCAllowedParties             []string
+	AndroidOIDCClientID            string
+	AndroidOIDCRedirectURI         string
+	WindowsOIDCClientID            string
+	WindowsRegistrationOIDCParties []string
+	WindowsOIDCRedirectURI         string
+	WebOIDCClientID                string
+	WebOIDCRedirectURI             string
 
 	OIDCClientSecret string
 	DatabaseURL      string
@@ -168,29 +174,31 @@ type Input struct {
 // it does not read environment variables or secret files.
 func New(input Input) (Config, error) {
 	return validate(Config{
-		PublicURL:              strings.TrimSpace(input.PublicURL),
-		OIDCIssuer:             strings.TrimSpace(input.OIDCIssuer),
-		OIDCClientID:           strings.TrimSpace(input.OIDCClientID),
-		AndroidOIDCClientID:    strings.TrimSpace(input.AndroidOIDCClientID),
-		AndroidOIDCRedirectURI: strings.TrimSpace(input.AndroidOIDCRedirectURI),
-		WindowsOIDCClientID:    strings.TrimSpace(input.WindowsOIDCClientID),
-		WindowsOIDCRedirectURI: strings.TrimSpace(input.WindowsOIDCRedirectURI),
-		WebOIDCClientID:        strings.TrimSpace(input.WebOIDCClientID),
-		WebOIDCRedirectURI:     strings.TrimSpace(input.WebOIDCRedirectURI),
-		OIDCClientSecret:       Secret(strings.TrimSpace(input.OIDCClientSecret)),
-		DatabaseURL:            Secret(strings.TrimSpace(input.DatabaseURL)),
-		RedisURL:               Secret(strings.TrimSpace(input.RedisURL)),
-		TokenSigningKey:        Secret(strings.TrimSpace(input.TokenSigningKey)),
-		S3Endpoint:             strings.TrimSpace(input.S3Endpoint),
-		S3PublicEndpoint:       strings.TrimSpace(input.S3PublicEndpoint),
-		S3Bucket:               strings.TrimSpace(input.S3Bucket),
-		S3Region:               strings.TrimSpace(input.S3Region),
-		S3AccessKey:            Secret(strings.TrimSpace(input.S3AccessKey)),
-		S3SecretKey:            Secret(strings.TrimSpace(input.S3SecretKey)),
-		LogLevel:               input.LogLevel,
-		HistoryEnabled:         input.HistoryEnabled,
-		ListenAddr:             input.ListenAddr,
-		MetricsListenAddr:      input.MetricsListenAddr,
+		PublicURL:                      strings.TrimSpace(input.PublicURL),
+		OIDCIssuer:                     strings.TrimSpace(input.OIDCIssuer),
+		OIDCClientID:                   strings.TrimSpace(input.OIDCClientID),
+		OIDCAllowedParties:             append([]string(nil), input.OIDCAllowedParties...),
+		AndroidOIDCClientID:            strings.TrimSpace(input.AndroidOIDCClientID),
+		AndroidOIDCRedirectURI:         strings.TrimSpace(input.AndroidOIDCRedirectURI),
+		WindowsOIDCClientID:            strings.TrimSpace(input.WindowsOIDCClientID),
+		WindowsRegistrationOIDCParties: append([]string(nil), input.WindowsRegistrationOIDCParties...),
+		WindowsOIDCRedirectURI:         strings.TrimSpace(input.WindowsOIDCRedirectURI),
+		WebOIDCClientID:                strings.TrimSpace(input.WebOIDCClientID),
+		WebOIDCRedirectURI:             strings.TrimSpace(input.WebOIDCRedirectURI),
+		OIDCClientSecret:               Secret(strings.TrimSpace(input.OIDCClientSecret)),
+		DatabaseURL:                    Secret(strings.TrimSpace(input.DatabaseURL)),
+		RedisURL:                       Secret(strings.TrimSpace(input.RedisURL)),
+		TokenSigningKey:                Secret(strings.TrimSpace(input.TokenSigningKey)),
+		S3Endpoint:                     strings.TrimSpace(input.S3Endpoint),
+		S3PublicEndpoint:               strings.TrimSpace(input.S3PublicEndpoint),
+		S3Bucket:                       strings.TrimSpace(input.S3Bucket),
+		S3Region:                       strings.TrimSpace(input.S3Region),
+		S3AccessKey:                    Secret(strings.TrimSpace(input.S3AccessKey)),
+		S3SecretKey:                    Secret(strings.TrimSpace(input.S3SecretKey)),
+		LogLevel:                       input.LogLevel,
+		HistoryEnabled:                 input.HistoryEnabled,
+		ListenAddr:                     input.ListenAddr,
+		MetricsListenAddr:              input.MetricsListenAddr,
 	})
 }
 
@@ -296,6 +304,14 @@ func LoadSource(source Source) (Config, error) {
 	androidOIDCClientID := lookupOptional("TERMLINK_ANDROID_OIDC_CLIENT_ID", "termlink-android")
 	androidOIDCRedirectURI := lookupOptional("TERMLINK_ANDROID_OIDC_REDIRECT_URI", "dev.termlink:/oauth2redirect")
 	windowsOIDCClientID := lookupOptional("TERMLINK_WINDOWS_OIDC_CLIENT_ID", "termlink-windows")
+	windowsRegistrationOIDCParties := strings.Split(lookupOptional(
+		"TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES",
+		windowsOIDCClientID,
+	), ",")
+	oidcAllowedParties := strings.Split(lookupOptional(
+		"TERMLINK_OIDC_ALLOWED_PARTIES",
+		androidOIDCClientID+","+windowsOIDCClientID,
+	), ",")
 	windowsOIDCRedirectURI := lookupOptional("TERMLINK_WINDOWS_OIDC_REDIRECT_URI", "http://127.0.0.1:43971/oauth2/callback")
 	webOIDCClientID := lookupOptional("TERMLINK_WEB_OIDC_CLIENT_ID", "termlink-web")
 	webOIDCRedirectURI := lookupOptional("TERMLINK_WEB_OIDC_REDIRECT_URI", strings.TrimRight(publicURL, "/")+"/auth/callback")
@@ -344,35 +360,37 @@ func LoadSource(source Source) (Config, error) {
 	}
 
 	return validate(Config{
-		PublicURL:              publicURL,
-		OIDCIssuer:             oidcIssuer,
-		OIDCClientID:           oidcClientID,
-		AndroidOIDCClientID:    androidOIDCClientID,
-		AndroidOIDCRedirectURI: androidOIDCRedirectURI,
-		WindowsOIDCClientID:    windowsOIDCClientID,
-		WindowsOIDCRedirectURI: windowsOIDCRedirectURI,
-		WebOIDCClientID:        webOIDCClientID,
-		WebOIDCRedirectURI:     webOIDCRedirectURI,
-		OIDCClientSecret:       oidcSecret,
-		DatabaseURL:            databaseURL,
-		RedisURL:               redisURL,
-		TokenSigningKey:        tokenSigningKey,
-		OIDCClientSecretFile:   envPath(source, "TERMLINK_OIDC_CLIENT_SECRET_FILE"),
-		DatabaseURLFile:        envPath(source, "TERMLINK_DATABASE_URL_FILE"),
-		RedisURLFile:           envPath(source, "TERMLINK_REDIS_URL_FILE"),
-		TokenSigningKeyFile:    envPath(source, "TERMLINK_TOKEN_SIGNING_KEY_FILE"),
-		S3Endpoint:             s3Endpoint,
-		S3PublicEndpoint:       s3PublicEndpoint,
-		S3Bucket:               s3Bucket,
-		S3Region:               s3Region,
-		S3AccessKey:            s3AccessKey,
-		S3SecretKey:            s3SecretKey,
-		S3AccessKeyFile:        envPath(source, "TERMLINK_S3_ACCESS_KEY_FILE"),
-		S3SecretKeyFile:        envPath(source, "TERMLINK_S3_SECRET_KEY_FILE"),
-		LogLevel:               logLevel,
-		HistoryEnabled:         historyEnabled,
-		ListenAddr:             listenAddr,
-		MetricsListenAddr:      metricsListenAddr,
+		PublicURL:                      publicURL,
+		OIDCIssuer:                     oidcIssuer,
+		OIDCClientID:                   oidcClientID,
+		OIDCAllowedParties:             oidcAllowedParties,
+		AndroidOIDCClientID:            androidOIDCClientID,
+		AndroidOIDCRedirectURI:         androidOIDCRedirectURI,
+		WindowsOIDCClientID:            windowsOIDCClientID,
+		WindowsRegistrationOIDCParties: windowsRegistrationOIDCParties,
+		WindowsOIDCRedirectURI:         windowsOIDCRedirectURI,
+		WebOIDCClientID:                webOIDCClientID,
+		WebOIDCRedirectURI:             webOIDCRedirectURI,
+		OIDCClientSecret:               oidcSecret,
+		DatabaseURL:                    databaseURL,
+		RedisURL:                       redisURL,
+		TokenSigningKey:                tokenSigningKey,
+		OIDCClientSecretFile:           envPath(source, "TERMLINK_OIDC_CLIENT_SECRET_FILE"),
+		DatabaseURLFile:                envPath(source, "TERMLINK_DATABASE_URL_FILE"),
+		RedisURLFile:                   envPath(source, "TERMLINK_REDIS_URL_FILE"),
+		TokenSigningKeyFile:            envPath(source, "TERMLINK_TOKEN_SIGNING_KEY_FILE"),
+		S3Endpoint:                     s3Endpoint,
+		S3PublicEndpoint:               s3PublicEndpoint,
+		S3Bucket:                       s3Bucket,
+		S3Region:                       s3Region,
+		S3AccessKey:                    s3AccessKey,
+		S3SecretKey:                    s3SecretKey,
+		S3AccessKeyFile:                envPath(source, "TERMLINK_S3_ACCESS_KEY_FILE"),
+		S3SecretKeyFile:                envPath(source, "TERMLINK_S3_SECRET_KEY_FILE"),
+		LogLevel:                       logLevel,
+		HistoryEnabled:                 historyEnabled,
+		ListenAddr:                     listenAddr,
+		MetricsListenAddr:              metricsListenAddr,
 	})
 }
 
@@ -431,10 +449,10 @@ func validate(c Config) (Config, error) {
 	if strings.TrimSpace(c.S3PublicEndpoint) == "" {
 		c.S3PublicEndpoint = strings.TrimSpace(c.S3Endpoint)
 	}
-	if err := validateURL("TERMLINK_PUBLIC_URL", c.PublicURL); err != nil {
+	if err := validateHTTPSURL("TERMLINK_PUBLIC_URL", c.PublicURL); err != nil {
 		return Config{}, err
 	}
-	if err := validateURL("TERMLINK_OIDC_ISSUER", c.OIDCIssuer); err != nil {
+	if err := validateHTTPSURL("TERMLINK_OIDC_ISSUER", c.OIDCIssuer); err != nil {
 		return Config{}, err
 	}
 	if strings.TrimSpace(c.OIDCClientID) == "" {
@@ -453,6 +471,53 @@ func validate(c Config) (Config, error) {
 	if strings.TrimSpace(c.WindowsOIDCClientID) == "" {
 		c.WindowsOIDCClientID = "termlink-windows"
 	}
+	if c.WindowsOIDCClientID == c.AndroidOIDCClientID {
+		return Config{}, fmt.Errorf("%w: Android and Windows OIDC clients must be distinct", ErrInvalid)
+	}
+	if len(c.OIDCAllowedParties) == 0 {
+		c.OIDCAllowedParties = []string{c.AndroidOIDCClientID, c.WindowsOIDCClientID}
+	}
+	allowed := make([]string, 0, len(c.OIDCAllowedParties))
+	seenAllowed := make(map[string]struct{}, len(c.OIDCAllowedParties))
+	for _, party := range c.OIDCAllowedParties {
+		party = strings.TrimSpace(party)
+		if party == "" || len(party) > 128 || party == c.OIDCClientID || strings.ContainsAny(party, " \t\r\n") {
+			return Config{}, fmt.Errorf("%w: TERMLINK_OIDC_ALLOWED_PARTIES", ErrInvalid)
+		}
+		if _, duplicate := seenAllowed[party]; duplicate {
+			continue
+		}
+		seenAllowed[party] = struct{}{}
+		allowed = append(allowed, party)
+	}
+	if _, ok := seenAllowed[c.AndroidOIDCClientID]; !ok {
+		return Config{}, fmt.Errorf("%w: TERMLINK_OIDC_ALLOWED_PARTIES", ErrInvalid)
+	}
+	if _, ok := seenAllowed[c.WindowsOIDCClientID]; !ok {
+		return Config{}, fmt.Errorf("%w: TERMLINK_OIDC_ALLOWED_PARTIES", ErrInvalid)
+	}
+	c.OIDCAllowedParties = allowed
+	if len(c.WindowsRegistrationOIDCParties) == 0 {
+		c.WindowsRegistrationOIDCParties = []string{c.WindowsOIDCClientID}
+	}
+	windowsRegistrationParties := make([]string, 0, len(c.WindowsRegistrationOIDCParties))
+	seenWindowsRegistrationParty := make(map[string]struct{}, len(c.WindowsRegistrationOIDCParties))
+	for _, party := range c.WindowsRegistrationOIDCParties {
+		party = strings.TrimSpace(party)
+		_, tokenAllowed := seenAllowed[party]
+		if party == "" || party == c.AndroidOIDCClientID || !tokenAllowed {
+			return Config{}, fmt.Errorf("%w: TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES", ErrInvalid)
+		}
+		if _, duplicate := seenWindowsRegistrationParty[party]; duplicate {
+			continue
+		}
+		seenWindowsRegistrationParty[party] = struct{}{}
+		windowsRegistrationParties = append(windowsRegistrationParties, party)
+	}
+	if _, ok := seenWindowsRegistrationParty[c.WindowsOIDCClientID]; !ok {
+		return Config{}, fmt.Errorf("%w: TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES", ErrInvalid)
+	}
+	c.WindowsRegistrationOIDCParties = windowsRegistrationParties
 	if strings.TrimSpace(c.WindowsOIDCRedirectURI) == "" {
 		c.WindowsOIDCRedirectURI = "http://127.0.0.1:43971/oauth2/callback"
 	}
@@ -491,12 +556,12 @@ func validate(c Config) (Config, error) {
 		return Config{}, fmt.Errorf("%w: TERMLINK_TOKEN_SIGNING_KEY_FILE", ErrSecret)
 	}
 	if c.S3Endpoint != "" {
-		if err := validateURL("TERMLINK_S3_ENDPOINT", c.S3Endpoint); err != nil {
+		if err := validateS3Endpoint("TERMLINK_S3_ENDPOINT", c.S3Endpoint); err != nil {
 			return Config{}, err
 		}
 	}
 	if c.S3PublicEndpoint != "" {
-		if err := validateURL("TERMLINK_S3_PUBLIC_ENDPOINT", c.S3PublicEndpoint); err != nil {
+		if err := validateS3Endpoint("TERMLINK_S3_PUBLIC_ENDPOINT", c.S3PublicEndpoint); err != nil {
 			return Config{}, err
 		}
 	}
@@ -578,4 +643,27 @@ func validateURL(name, value string) error {
 	default:
 		return fmt.Errorf("%w: %s", ErrInvalid, name)
 	}
+}
+
+func validateHTTPSURL(name, value string) error {
+	if err := validateURL(name, value); err != nil {
+		return err
+	}
+	parsed, _ := url.Parse(strings.TrimSpace(value))
+	if !strings.EqualFold(parsed.Scheme, "https") {
+		return fmt.Errorf("%w: %s", ErrInvalid, name)
+	}
+	return nil
+}
+
+func validateS3Endpoint(name, value string) error {
+	if err := validateURL(name, value); err != nil {
+		return err
+	}
+	parsed, _ := url.Parse(strings.TrimSpace(value))
+	if (parsed.Path != "" && parsed.Path != "/") || parsed.RawPath != "" ||
+		parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("%w: %s", ErrInvalid, name)
+	}
+	return nil
 }

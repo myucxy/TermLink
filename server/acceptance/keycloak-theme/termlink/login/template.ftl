@@ -8,6 +8,7 @@
   <meta name="color-scheme" content="light dark">
   <title>${msg("loginTitle", (realm.displayName!"TermLink"))}</title>
   <link rel="icon" href="${url.resourcesPath}/img/termlink-favicon.svg" type="image/svg+xml">
+  <script src="${url.resourcesPath}/js/theme-init.js"></script>
   <#if properties.styles?has_content>
     <#list properties.styles?split(' ') as style>
       <link href="${url.resourcesPath}/${style}" rel="stylesheet">
@@ -32,6 +33,10 @@
     </a>
     <div class="identity-title-actions">
       <span class="identity-secure-origin"><span class="lock-icon" aria-hidden="true"></span>${msg('termlinkVerifiedOrigin')}</span>
+      <a class="identity-account-link" href="/account" aria-label="${msg('termlinkBackToPersonalCenter')}">
+        <span class="identity-account-link-icon" aria-hidden="true">&#8592;</span>
+        <span>${msg('termlinkPersonalCenter')}</span>
+      </a>
       <button class="theme-toggle" type="button" data-theme-toggle aria-label="${msg('termlinkThemeToggle')}" title="${msg('termlinkThemeToggle')}" aria-pressed="false">
         <span class="theme-toggle-icon" aria-hidden="true">◐</span>
         <span class="theme-toggle-label">${msg('termlinkTheme')}</span>

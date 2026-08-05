@@ -13,7 +13,10 @@ services:
       - "${TERMLINK_EDGE_BIND_IP:-0.0.0.0}:443:8443"
     networks:
       - public
-      - private
+      - frontend
+      # The history host proxies only S3 object traffic over this isolated
+      # network.  It never grants the edge access to the backend network.
+      - object
     volumes:
       - ../Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
@@ -44,9 +47,11 @@ services:
       TERMLINK_PUBLIC_URL: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}
       TERMLINK_OIDC_ISSUER: ${TERMLINK_OIDC_ISSUER:?TERMLINK_OIDC_ISSUER is required}
       TERMLINK_OIDC_CLIENT_ID: ${TERMLINK_OIDC_CLIENT_ID:?TERMLINK_OIDC_CLIENT_ID is required}
+      TERMLINK_OIDC_ALLOWED_PARTIES: ${TERMLINK_OIDC_ALLOWED_PARTIES:-termlink-android,termlink-windows}
       TERMLINK_ANDROID_OIDC_CLIENT_ID: ${TERMLINK_ANDROID_OIDC_CLIENT_ID:-termlink-android}
       TERMLINK_ANDROID_OIDC_REDIRECT_URI: ${TERMLINK_ANDROID_OIDC_REDIRECT_URI:-dev.termlink:/oauth2redirect}
       TERMLINK_WINDOWS_OIDC_CLIENT_ID: ${TERMLINK_WINDOWS_OIDC_CLIENT_ID:-termlink-windows}
+      TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES: ${TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES:-termlink-windows}
       TERMLINK_WINDOWS_OIDC_REDIRECT_URI: ${TERMLINK_WINDOWS_OIDC_REDIRECT_URI:-http://127.0.0.1:43971/oauth2/callback}
       TERMLINK_WEB_OIDC_CLIENT_ID: ${TERMLINK_WEB_OIDC_CLIENT_ID:-termlink-web}
       TERMLINK_WEB_OIDC_REDIRECT_URI: ${TERMLINK_WEB_OIDC_REDIRECT_URI:-}
@@ -80,7 +85,7 @@ services:
         gid: "65532"
         mode: 0400
     networks:
-      - private
+      - backend
     read_only: true
     user: "65532:65532"
     tmpfs:
@@ -97,7 +102,8 @@ services:
     environment: *server-environment
     secrets: *server-secrets
     networks:
-      - private
+      - frontend
+      - backend
       - egress
     read_only: true
     user: "65532:65532"
@@ -134,7 +140,7 @@ services:
         target: postgres_password
         mode: 0400
     networks:
-      - private
+      - backend
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -147,13 +153,35 @@ services:
 
   valkey:
     image: valkey/valkey:8.1.1-alpine@sha256:6a57d58c0a37cf7acc3045ac0fd6dd91be339774106ab4d9ca088013a096a99f
-    command: ["valkey-server", "--appendonly", "yes"]
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        password="$$(cat /run/secrets/valkey_password)"
+        test -n "$$password"
+        case "$$password" in *[!A-Za-z0-9_-]*) exit 1;; esac
+        umask 077
+        printf 'user default on >%s ~* &* +@all\n' "$$password" > /run/valkey/users.acl
+        unset password
+        exec valkey-server --appendonly yes --aclfile /run/valkey/users.acl
+    secrets:
+      - source: valkey_password
+        target: valkey_password
+        uid: "999"
+        gid: "1000"
+        mode: 0400
     networks:
-      - private
+      - backend
     volumes:
       - valkey-data:/data
+    read_only: true
+    user: "999:1000"
+    tmpfs:
+      - /run/valkey:rw,noexec,nosuid,size=1m,uid=999,gid=1000,mode=0700
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
     healthcheck:
-      test: ["CMD", "valkey-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$(cat /run/secrets/valkey_password)\" valkey-cli --user default ping | grep -qx PONG"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -177,11 +205,22 @@ secrets:
     file: ${TERMLINK_TOKEN_SIGNING_KEY_FILE:-../secrets/token-signing-key}
   postgres_password:
     file: ${TERMLINK_POSTGRES_PASSWORD_FILE:-../secrets/postgres-password}
+  valkey_password:
+    file: ${TERMLINK_VALKEY_PASSWORD_FILE:-../secrets/valkey-password}
 
 networks:
   public:
-  private:
+  # The edge and application share only this internal network.  Keeping it
+  # separate from backend prevents the public proxy from reaching stateful
+  # services even if a route is misconfigured.
+  frontend:
     internal: true
-  # The application needs outbound access for external OIDC and S3 providers,
-  # while the database and Valkey remain on the isolated private network.
+  backend:
+    internal: true
+  # Public presigned history requests terminate at Caddy and reach only the
+  # object store on this internal network. PostgreSQL and Valkey never join it.
+  object:
+    internal: true
+  # Only the application needs outbound access for external OIDC and S3
+  # providers.  It is deliberately separate from both frontend and backend.
   egress:

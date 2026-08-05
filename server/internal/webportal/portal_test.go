@@ -31,10 +31,11 @@ type testOIDCFlow struct {
 }
 
 type testPortalRepository struct {
-	account   store.PortalAccount
-	dashboard store.PortalAdminDashboard
-	roleErr   error
-	statusErr error
+	account          store.PortalAccount
+	dashboard        store.PortalAdminDashboard
+	roleErr          error
+	statusErr        error
+	loginFailureCode string
 }
 
 func newTestPortalRepository() *testPortalRepository {
@@ -44,7 +45,7 @@ func newTestPortalRepository() *testPortalRepository {
 	}}
 }
 
-func (r *testPortalRepository) SyncPortalIdentity(_ context.Context, _ [32]byte, asserted store.Role) (store.PortalAccount, error) {
+func (r *testPortalRepository) SyncPortalIdentity(_ context.Context, _ [32]byte, asserted store.Role, _ string) (store.PortalAccount, error) {
 	if r.statusErr != nil {
 		return store.PortalAccount{}, r.statusErr
 	}
@@ -52,6 +53,11 @@ func (r *testPortalRepository) SyncPortalIdentity(_ context.Context, _ [32]byte,
 		r.account.Role = store.RoleSuperAdmin
 	}
 	return r.account, nil
+}
+
+func (r *testPortalRepository) RecordPortalLoginFailure(_ context.Context, _ string, reason string) error {
+	r.loginFailureCode = reason
+	return nil
 }
 
 func (r *testPortalRepository) GetPortalAccount(context.Context, [32]byte) (store.PortalAccount, error) {
@@ -157,8 +163,16 @@ func responseCookie(t *testing.T, response *http.Response, name string) *http.Co
 }
 
 func startLogin(t *testing.T, portal *Portal, flow *testOIDCFlow) (*http.Cookie, oauthState) {
+	return startLoginAt(t, portal, flow, "/account")
+}
+
+func startLoginAt(t *testing.T, portal *Portal, flow *testOIDCFlow, returnTo string) (*http.Cookie, oauthState) {
 	t.Helper()
-	recorder := performRequest(portal.Handler(), http.MethodGet, "/login", nil)
+	target := "/login"
+	if returnTo == "/admin" {
+		target += "?return_to=/admin"
+	}
+	recorder := performRequest(portal.Handler(), http.MethodGet, target, nil)
 	if recorder.Code != http.StatusFound {
 		t.Fatalf("login status = %d, want %d", recorder.Code, http.StatusFound)
 	}
@@ -169,7 +183,7 @@ func startLogin(t *testing.T, portal *Portal, flow *testOIDCFlow) (*http.Cookie,
 	if err := portal.oauthCodec.open(cookie.Value, &state); err != nil {
 		t.Fatalf("decode OAuth state cookie: %v", err)
 	}
-	if state.State == "" || state.Nonce == "" || state.Verifier == "" || state.ReturnTo != "/account" {
+	if state.State == "" || state.Nonce == "" || state.Verifier == "" || state.ReturnTo != returnTo {
 		t.Fatalf("OAuth state cookie is incomplete: %+v", state)
 	}
 	if flow.state != state.State || flow.nonce != state.Nonce {
@@ -189,7 +203,7 @@ func completeLogin(t *testing.T, portal *Portal, flow *testOIDCFlow) (*http.Cook
 
 func completeLoginAt(t *testing.T, portal *Portal, flow *testOIDCFlow, wantLocation string) (*http.Cookie, webSession) {
 	t.Helper()
-	oauthCookie, state := startLogin(t, portal, flow)
+	oauthCookie, state := startLoginAt(t, portal, flow, wantLocation)
 	target := "/auth/callback?code=production-code&state=" + url.QueryEscape(state.State)
 	recorder := performRequest(portal.Handler(), http.MethodGet, target, nil, oauthCookie)
 	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != wantLocation {
@@ -236,6 +250,11 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 	if css.Code != http.StatusOK || !strings.HasPrefix(css.Header().Get("Content-Type"), "text/css") || css.Body.Len() < 1000 {
 		t.Fatalf("embedded stylesheet response is incomplete: status=%d bytes=%d", css.Code, css.Body.Len())
 	}
+	themeInit := performRequest(portal.Handler(), http.MethodGet, "/assets/theme-init.js", nil)
+	if themeInit.Code != http.StatusOK || !strings.HasPrefix(themeInit.Header().Get("Content-Type"), "text/javascript") ||
+		!strings.Contains(themeInit.Body.String(), "termlink-theme") {
+		t.Fatalf("embedded pre-paint theme script response is incomplete: status=%d bytes=%d", themeInit.Code, themeInit.Body.Len())
+	}
 	theme := performRequest(portal.Handler(), http.MethodGet, "/assets/theme.js", nil)
 	if theme.Code != http.StatusOK || !strings.HasPrefix(theme.Header().Get("Content-Type"), "text/javascript") ||
 		!strings.Contains(theme.Body.String(), "termlink-theme") {
@@ -246,6 +265,21 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 		if icon.Code != http.StatusOK || icon.Header().Get("Content-Type") != "image/svg+xml" ||
 			!strings.Contains(icon.Body.String(), "TermLink") {
 			t.Fatalf("embedded brand asset %q is incomplete: status=%d bytes=%d", asset, icon.Code, icon.Body.Len())
+		}
+	}
+}
+
+func TestPortalTemplatesApplyThemeBeforeStyles(t *testing.T) {
+	for _, name := range []string{"home.html", "account.html", "admin.html", "error.html"} {
+		data, err := portalAssets.ReadFile("assets/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		html := string(data)
+		initIndex := strings.Index(html, `/assets/theme-init.js?v=01b-v3`)
+		styleIndex := strings.Index(html, `/assets/site.css?v=01b-v3`)
+		if initIndex < 0 || styleIndex < 0 || initIndex > styleIndex {
+			t.Errorf("%s must restore the selected theme before loading product styles", name)
 		}
 	}
 }
@@ -264,6 +298,23 @@ func TestPortalSeparatesUserAndAdministratorDestinations(t *testing.T) {
 		Roles: []string{"offline_access", "SUPER_ADMIN"},
 	}}
 	adminPortal := newTestPortal(t, adminFlow)
+	guestAccount := performRequest(adminPortal.Handler(), http.MethodGet, "/account", nil)
+	if guestAccount.Code != http.StatusSeeOther || guestAccount.Header().Get("Location") != "/login?return_to=/account" {
+		t.Fatalf("guest account response = %d %q", guestAccount.Code, guestAccount.Header().Get("Location"))
+	}
+	accountCookie, accountSession := completeLogin(t, adminPortal, adminFlow)
+	if accountSession.Role != string(store.RoleSuperAdmin) {
+		t.Fatalf("admin account session role = %q", accountSession.Role)
+	}
+	accountPage := performRequest(adminPortal.Handler(), http.MethodGet, "/account", nil, accountCookie)
+	if accountPage.Code != http.StatusOK || !strings.Contains(accountPage.Body.String(), "进入管理台") {
+		t.Fatalf("admin account page = %d %q", accountPage.Code, accountPage.Body.String())
+	}
+	home := performRequest(adminPortal.Handler(), http.MethodGet, "/", nil, accountCookie)
+	if !strings.Contains(home.Body.String(), `href="/account">个人中心`) ||
+		!strings.Contains(home.Body.String(), `href="/admin">管理台`) {
+		t.Fatal("signed-in administrator home must expose both account center and console")
+	}
 	adminCookie, session := completeLoginAt(t, adminPortal, adminFlow, "/admin")
 	if session.Role != string(store.RoleSuperAdmin) {
 		t.Fatalf("admin session role = %q", session.Role)
@@ -272,7 +323,7 @@ func TestPortalSeparatesUserAndAdministratorDestinations(t *testing.T) {
 	if console.Code != http.StatusOK {
 		t.Fatalf("admin console status = %d, body=%q", console.Code, console.Body.String())
 	}
-	for _, text := range []string{"Server Console", "账号与角色", "SUPER_ADMIN", "终端正文始终不可见"} {
+	for _, text := range []string{"Server Console", "账号与角色", "SUPER_ADMIN", "终端正文始终不可见", "返回个人中心"} {
 		if !strings.Contains(console.Body.String(), text) {
 			t.Fatalf("admin console omitted %q", text)
 		}
@@ -334,6 +385,34 @@ func TestPortalProtectsAdministratorMutationWithCSRFAndLastSuperAdminRule(t *tes
 	portal.Handler().ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "唯一超级管理员") {
 		t.Fatalf("last super admin response = %d %q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPortalPublishesCommittedAccountDisable(t *testing.T) {
+	flow := &testOIDCFlow{identity: accountIdentity{Subject: "admin-subject", Username: "admin", Roles: []string{"SUPER_ADMIN"}}}
+	portal := newTestPortal(t, flow)
+	cookie, session := completeLoginAt(t, portal, flow, "/admin")
+	targetID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	var publishedID uuid.UUID
+	var publishedStatus string
+	portal.config.AccountStatusChanged = func(_ context.Context, accountID uuid.UUID, status string) error {
+		publishedID = accountID
+		publishedStatus = status
+		return nil
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "https://"+testPublicHost+"/admin/accounts/"+targetID.String()+"/status", strings.NewReader("csrf="+url.QueryEscape(session.CSRF)+"&status=LOCKED"))
+	request.Host = testPublicHost
+	request.Header.Set("Origin", "https://"+testPublicHost)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	recorder := httptest.NewRecorder()
+	portal.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("account disable status=%d, body=%q", recorder.Code, recorder.Body.String())
+	}
+	if publishedID != targetID || publishedStatus != "LOCKED" {
+		t.Fatalf("published account status id=%s status=%q", publishedID, publishedStatus)
 	}
 }
 
@@ -431,8 +510,8 @@ func TestPortalRejectsCrossSiteAndTamperedSessions(t *testing.T) {
 	}
 	tampered.Value = tampered.Value[:index] + string(replacement) + tampered.Value[index+1:]
 	account := performRequest(portal.Handler(), http.MethodGet, "/account", nil, &tampered)
-	if account.Code != http.StatusSeeOther || account.Header().Get("Location") != "/login" {
-		t.Fatalf("tampered session response = %d %q, want 303 /login", account.Code, account.Header().Get("Location"))
+	if account.Code != http.StatusSeeOther || account.Header().Get("Location") != "/login?return_to=/account" {
+		t.Fatalf("tampered session response = %d %q, want 303 account login", account.Code, account.Header().Get("Location"))
 	}
 
 	badStateFlow := &testOIDCFlow{exchangeErr: errors.New("must not be called")}
@@ -441,6 +520,20 @@ func TestPortalRejectsCrossSiteAndTamperedSessions(t *testing.T) {
 	callback := performRequest(badStatePortal.Handler(), http.MethodGet, "/auth/callback?code=code&state="+url.QueryEscape(state.State+"-tampered"), nil, oauthCookie)
 	if callback.Code != http.StatusBadRequest || badStateFlow.code != "" {
 		t.Fatalf("tampered OAuth state response = %d; exchange code = %q", callback.Code, badStateFlow.code)
+	}
+}
+
+func TestPortalAuditsVerifiedFlowLoginFailureWithoutSensitiveValues(t *testing.T) {
+	flow := &testOIDCFlow{exchangeErr: errors.New("verification failed fixture")}
+	portal := newTestPortal(t, flow)
+	oauthCookie, state := startLogin(t, portal, flow)
+	callback := performRequest(portal.Handler(), http.MethodGet, "/auth/callback?code=opaque-test-code&state="+url.QueryEscape(state.State), nil, oauthCookie)
+	if callback.Code != http.StatusUnauthorized {
+		t.Fatalf("failed token verification status=%d, want 401", callback.Code)
+	}
+	repository := portal.config.Repository.(*testPortalRepository)
+	if repository.loginFailureCode != "token_verification_failed" {
+		t.Fatalf("login audit reason=%q", repository.loginFailureCode)
 	}
 }
 

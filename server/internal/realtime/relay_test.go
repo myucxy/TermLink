@@ -52,9 +52,9 @@ func TestReplacedPeerCannotRemoveReplacementSubscription(t *testing.T) {
 	newPeer := testPeer(hub, deviceID)
 
 	hub.peers[deviceID] = oldPeer
-	hub.subscribe(oldPeer, sessionID)
+	hub.subscribe(oldPeer, sessionID, store.SessionRouteAuthorization{PCDeviceID: uuid.New()})
 	hub.peers[deviceID] = newPeer
-	hub.subscribe(newPeer, sessionID)
+	hub.subscribe(newPeer, sessionID, store.SessionRouteAuthorization{PCDeviceID: uuid.New()})
 
 	if hub.isCurrent(oldPeer) {
 		t.Fatal("replaced peer remained current")
@@ -107,13 +107,133 @@ func TestAndroidPeerRejectsReplayedInputSequence(t *testing.T) {
 	}
 }
 
+func TestPCOutputUsesValidatedSubscriptionWithoutAuthorityQuery(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID := uuid.New()
+	pcID := uuid.New()
+	androidID := uuid.New()
+	sessionID := uuid.New()
+	pc := testPeer(hub, pcID)
+	pc.role = "pc"
+	pc.principal.UserID = userID
+	android := testPeer(hub, androidID)
+	android.role = "android"
+	android.principal.UserID = userID
+	hub.peers[pcID] = pc
+	hub.peers[androidID] = android
+	hub.subscribe(android, sessionID, store.SessionRouteAuthorization{
+		Permission: "VIEW",
+		PCDeviceID: pcID,
+	})
+
+	frame := []byte("opaque-production-frame")
+	err := pc.route(realtimewire.Envelope{
+		RecipientDeviceID: androidID[:],
+		MessageType:       realtimewire.OutputChunk,
+	}, sessionID, frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case received := <-android.send:
+		if string(received) != string(frame) {
+			t.Fatalf("routed frame = %q, want %q", received, frame)
+		}
+	default:
+		t.Fatal("validated subscriber did not receive PC output")
+	}
+}
+
+func TestPCOutputRejectsSubscriptionOwnedByAnotherPC(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID := uuid.New()
+	pcID := uuid.New()
+	androidID := uuid.New()
+	sessionID := uuid.New()
+	pc := testPeer(hub, pcID)
+	pc.role = "pc"
+	pc.principal.UserID = userID
+	android := testPeer(hub, androidID)
+	android.principal.UserID = userID
+	hub.peers[pcID] = pc
+	hub.peers[androidID] = android
+	hub.subscribe(android, sessionID, store.SessionRouteAuthorization{
+		Permission: "VIEW",
+		PCDeviceID: uuid.New(),
+	})
+
+	err := pc.route(realtimewire.Envelope{
+		RecipientDeviceID: androidID[:],
+		MessageType:       realtimewire.OutputChunk,
+	}, sessionID, []byte("must-not-route"))
+	if !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("wrong-owner route error = %v, want ErrDenied", err)
+	}
+	select {
+	case <-android.send:
+		t.Fatal("wrong PC owner routed output to subscriber")
+	default:
+	}
+}
+
+func TestDisableAccountClosesOnlyMatchingPeers(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	lockedUser := uuid.New()
+	otherUser := uuid.New()
+	lockedPC := testPeer(hub, uuid.New())
+	lockedAndroid := testPeer(hub, uuid.New())
+	otherAndroid := testPeer(hub, uuid.New())
+	lockedPC.principal.UserID = lockedUser
+	lockedAndroid.principal.UserID = lockedUser
+	otherAndroid.principal.UserID = otherUser
+	hub.peers[lockedPC.principal.Device.ID] = lockedPC
+	hub.peers[lockedAndroid.principal.Device.ID] = lockedAndroid
+	hub.peers[otherAndroid.principal.Device.ID] = otherAndroid
+
+	hub.DisableAccount(lockedUser)
+	for name, peer := range map[string]*peer{"pc": lockedPC, "android": lockedAndroid} {
+		select {
+		case <-peer.done:
+		default:
+			t.Fatalf("locked account %s peer remained open", name)
+		}
+	}
+	select {
+	case <-otherAndroid.done:
+		t.Fatal("unrelated account peer was closed")
+	default:
+	}
+}
+
+func TestRefreshDeviceClosesOnlyCurrentDevice(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	target := testPeer(hub, uuid.New())
+	other := testPeer(hub, uuid.New())
+	hub.peers[target.principal.Device.ID] = target
+	hub.peers[other.principal.Device.ID] = other
+
+	hub.RefreshDevice(target.principal.Device.ID)
+	select {
+	case <-target.done:
+	default:
+		t.Fatal("authorization-changed device remained open")
+	}
+	select {
+	case <-other.done:
+		t.Fatal("unrelated device was closed")
+	default:
+	}
+}
+
 func testPeer(hub *Hub, deviceID uuid.UUID) *peer {
 	return &peer{
-		hub:           hub,
-		principal:     auth.Principal{Device: auth.Device{ID: deviceID}},
-		done:          make(chan struct{}),
-		lastSequences: map[uuid.UUID]uint64{},
-		subscriptions: map[uuid.UUID]bool{},
+		hub:                hub,
+		principal:          auth.Principal{Device: auth.Device{ID: deviceID}},
+		send:               make(chan []byte, 4),
+		done:               make(chan struct{}),
+		lastSequences:      map[uuid.UUID]uint64{},
+		subscriptions:      map[uuid.UUID]bool{},
+		subscriptionRoutes: map[uuid.UUID]store.SessionRouteAuthorization{},
 	}
 }
 

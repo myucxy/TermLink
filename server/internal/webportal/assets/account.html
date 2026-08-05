@@ -7,8 +7,9 @@
   <meta name="robots" content="noindex,nofollow">
   <title>个人中心 · TermLink</title>
   <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/site.css">
-  <script src="/assets/theme.js" defer></script>
+  <script src="/assets/theme-init.js?v=01b-v3"></script>
+  <link rel="stylesheet" href="/assets/site.css?v=01b-v3">
+  <script src="/assets/theme.js?v=01b-v3" defer></script>
 </head>
 <body class="account-body">
   <header class="site-header">
@@ -16,18 +17,20 @@
       <img class="brand-mark" src="/assets/termlink-app-icon.svg" alt="">
       <span><strong>TermLink</strong><small>Account Center</small></span>
     </a>
-    <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题" aria-pressed="false">
-      <span class="theme-toggle-icon" aria-hidden="true">◐</span>
-      <span class="theme-toggle-label">主题</span>
-    </button>
-    <a class="button button-quiet" href="/">返回首页</a>
+    <div class="site-header-actions">
+      <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题" aria-pressed="false">
+        <span class="theme-toggle-icon" aria-hidden="true">◐</span>
+        <span class="theme-toggle-label">主题</span>
+      </button>
+      <a class="button button-quiet" href="/">返回首页</a>
+    </div>
   </header>
 
   <main class="account-shell">
     <aside class="account-context">
       <p class="eyebrow"><span class="status-dot"></span> ACCOUNT CONNECTED</p>
       <h1>欢迎回来，<br>{{.Username}}</h1>
-      <p>账号授权已通过公开 HTTPS OIDC 流程完成。设备仍需单独注册和批准，登录本身不会自动授予任何 PC 权限。</p>
+      <p>账号授权已通过公开 HTTPS OIDC 流程完成。Android 首次登录可在 App 内确认并直接授信当前设备；Windows Agent 的 PC 权限仍需单独授权。</p>
       <dl class="account-facts">
         <div><dt>授权协议</dt><dd>Authorization Code + PKCE</dd></div>
         <div><dt>浏览器会话</dt><dd>Secure · HttpOnly · SameSite</dd></div>
@@ -57,20 +60,20 @@
       <div class="account-actions">
         {{if .CanOpenConsole}}
         <article>
-          <div><span class="action-icon" aria-hidden="true">▦</span><div><h3>TermLink Server Console</h3><p>查看真实运行元数据、安全审计和账号角色；终端正文始终不可见。</p></div></div>
+          <div><span class="action-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg></span><div><h3>TermLink Server Console</h3><p>查看真实运行元数据、安全审计和账号角色；终端正文始终不可见。</p></div></div>
           <a class="text-link" href="{{.ConsoleURL}}">进入管理台 <span aria-hidden="true">→</span></a>
         </article>
         {{end}}
         <article>
-          <div><span class="action-icon" aria-hidden="true">⌁</span><div><h3>连接 Windows Agent</h3><p>在托盘中选择“Link TermLink account”，系统浏览器将使用同一账号授权。</p></div></div>
+          <div><span class="action-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4M7 9l2 2-2 2M11 13h4"/></svg></span><div><h3>连接 Windows Agent</h3><p>在托盘中选择“Link TermLink account”，系统浏览器将使用同一账号授权。</p></div></div>
           <span class="action-state">下一步</span>
         </article>
         <article>
-          <div><span class="action-icon" aria-hidden="true">◇</span><div><h3>连接 Android</h3><p>Android 登录后先作为待批准设备，不会自动获得终端查看或控制权限。</p></div></div>
-          <span class="action-state">待连接</span>
+          <div><span class="action-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.2"/><path d="M10 5h4M11 18.5h2"/></svg></span><div><h3>连接 Android</h3><p>Android 可在 App 内直接登录；账号首次登录该设备时，确认弹窗后即授信当前设备。</p></div></div>
+          <span class="action-state">App 内确认</span>
         </article>
         <article>
-          <div><span class="action-icon" aria-hidden="true">◉</span><div><h3>账号与登录安全</h3><p>修改密码、配置 MFA、查看活跃登录，并撤销不再使用的浏览器会话。</p></div></div>
+          <div><span class="action-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.7 2.8 8 7 10 4.2-2 7-5.3 7-10V6zM9 12l2 2 4-4"/></svg></span><div><h3>账号与登录安全</h3><p>修改密码、配置 MFA、查看活跃登录，并撤销不再使用的浏览器会话。</p></div></div>
           <a class="text-link" href="{{.IdentityAccountURL}}">管理身份 <span aria-hidden="true">→</span></a>
         </article>
       </div>

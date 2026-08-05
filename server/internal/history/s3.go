@@ -16,6 +16,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/google/uuid"
 )
 
 const MaxObjectBytes int64 = 64 << 20
@@ -154,7 +155,22 @@ func validateObject(key string, size int64, digest []byte) error {
 }
 
 func validObjectKey(value string) bool {
-	return strings.HasPrefix(value, "accounts/") && len(value) <= 512 && !strings.Contains(value, "\\") && !strings.Contains(value, "..")
+	parts := strings.Split(value, "/")
+	if len(parts) != 6 || parts[0] != "accounts" || parts[2] != "sessions" ||
+		(parts[4] != "chunk" && parts[4] != "snapshot") || !strings.HasSuffix(parts[5], ".bin") {
+		return false
+	}
+	accountID, err := uuid.Parse(parts[1])
+	if err != nil || accountID.String() != parts[1] {
+		return false
+	}
+	sessionID, err := uuid.Parse(parts[3])
+	if err != nil || sessionID.String() != parts[3] {
+		return false
+	}
+	uploadText := strings.TrimSuffix(parts[5], ".bin")
+	uploadID, err := uuid.Parse(uploadText)
+	return err == nil && uploadID.String() == uploadText
 }
 
 func equalDigest(left, right []byte) bool {

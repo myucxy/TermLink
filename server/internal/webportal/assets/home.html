@@ -7,8 +7,9 @@
   <meta name="description" content="TermLink 将 Windows Terminal 中的真实 PowerShell 与 AI CLI 安全连接到 Android。">
   <title>TermLink · 随时连接你的真实终端</title>
   <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/site.css">
-  <script src="/assets/theme.js" defer></script>
+  <script src="/assets/theme-init.js?v=01b-v3"></script>
+  <link rel="stylesheet" href="/assets/site.css?v=01b-v3">
+  <script src="/assets/theme.js?v=01b-v3" defer></script>
 </head>
 <body>
   <header class="site-header">
@@ -21,15 +22,18 @@
       <a href="#security">安全</a>
       <a href="#deploy">部署</a>
     </nav>
-    <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题" aria-pressed="false">
-      <span class="theme-toggle-icon" aria-hidden="true">◐</span>
-      <span class="theme-toggle-label">主题</span>
-    </button>
-    {{if .SignedIn}}
-      {{if .ConsoleURL}}<a class="button button-quiet" href="{{.ConsoleURL}}">{{.Username}} · 管理台</a>{{else}}<a class="button button-quiet" href="{{.AccountURL}}">{{.Username}} · 个人中心</a>{{end}}
-    {{else}}
-      <a class="button button-quiet" href="{{.LoginURL}}">登录</a>
-    {{end}}
+    <div class="site-header-actions">
+      <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题" aria-pressed="false">
+        <span class="theme-toggle-icon" aria-hidden="true">◐</span>
+        <span class="theme-toggle-label">主题</span>
+      </button>
+      {{if .SignedIn}}
+        <a class="button button-quiet" href="{{.AccountURL}}">个人中心</a>
+        {{if .ConsoleURL}}<a class="button button-quiet" href="{{.ConsoleURL}}">管理台</a>{{end}}
+      {{else}}
+        <a class="button button-quiet" href="{{.LoginURL}}">登录</a>
+      {{end}}
+    </div>
   </header>
 
   <main>
@@ -41,7 +45,8 @@
         <p class="hero-lead">在 Windows Terminal 的真实 PowerShell 中运行 Codex 或其他 AI CLI。手机断线不影响本地进程，重新连接后从确认位置继续观看和控制。</p>
         <div class="hero-actions">
           {{if .SignedIn}}
-            {{if .ConsoleURL}}<a class="button button-primary" href="{{.ConsoleURL}}">进入 Server Console</a>{{else}}<a class="button button-primary" href="{{.AccountURL}}">进入个人中心</a>{{end}}
+            <a class="button button-primary" href="{{.AccountURL}}">进入个人中心</a>
+            {{if .ConsoleURL}}<a class="button button-quiet" href="{{.ConsoleURL}}">进入 Server Console</a>{{end}}
           {{else}}
             <a class="button button-primary" href="{{.LoginURL}}">使用 TermLink 账号登录</a>
           {{end}}
@@ -132,7 +137,10 @@
         <h2>先登录，再连接你的第一台 Windows PC。</h2>
       </div>
       {{if .SignedIn}}
-        {{if .ConsoleURL}}<a class="button button-primary" href="{{.ConsoleURL}}">打开管理台</a>{{else}}<a class="button button-primary" href="{{.AccountURL}}">打开个人中心</a>{{end}}
+        <div class="final-cta-actions">
+          <a class="button button-primary" href="{{.AccountURL}}">打开个人中心</a>
+          {{if .ConsoleURL}}<a class="button button-quiet" href="{{.ConsoleURL}}">打开管理台</a>{{end}}
+        </div>
       {{else}}
         <a class="button button-primary" href="{{.LoginURL}}">安全登录</a>
       {{end}}

@@ -19,11 +19,8 @@ services:
         uid: "65532"
         gid: "65532"
         mode: 0400
-    depends_on:
-      minio:
-        condition: service_healthy
-
-  edge:
+    networks:
+      - object-control
     depends_on:
       minio:
         condition: service_healthy
@@ -37,7 +34,9 @@ services:
     secrets:
       - s3_access_key
       - s3_secret_key
-    networks: ["private"]
+    # object-control is the application-only S3 management path; object is the
+    # narrowly scoped Caddy-to-MinIO data path for presigned URLs.
+    networks: ["object-control", "object"]
     volumes:
       - minio-data:/data
     healthcheck:
@@ -55,3 +54,7 @@ secrets:
     file: ${TERMLINK_S3_ACCESS_KEY_FILE:-../secrets/s3-access-key}
   s3_secret_key:
     file: ${TERMLINK_S3_SECRET_KEY_FILE:-../secrets/s3-secret-key}
+
+networks:
+  object-control:
+    internal: true

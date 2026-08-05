@@ -7,9 +7,10 @@
   <meta name="color-scheme" content="light dark">
   <title>{{.SectionTitle}} · TermLink Server Console</title>
   <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/site.css">
-  <link rel="stylesheet" href="/assets/admin.css">
-  <script src="/assets/theme.js" defer></script>
+  <script src="/assets/theme-init.js?v=01b-v3"></script>
+  <link rel="stylesheet" href="/assets/site.css?v=01b-v3">
+  <link rel="stylesheet" href="/assets/admin.css?v=01b-v3">
+  <script src="/assets/theme.js?v=01b-v3" defer></script>
 </head>
 <body class="admin-body">
   <div class="admin-shell">
@@ -25,20 +26,20 @@
       </div>
 
       <nav class="admin-nav" aria-label="服务端管理台">
-        <a href="/admin?section=overview"{{if eq .Section "overview"}} aria-current="page"{{end}}><span>01</span>运行概览</a>
-        <a href="/admin?section=connections"{{if eq .Section "connections"}} aria-current="page"{{end}}><span>02</span>连接路由</a>
-        <a href="/admin?section=deployment"{{if eq .Section "deployment"}} aria-current="page"{{end}}><span>03</span>Docker 部署</a>
-        <a href="/admin?section=audit"{{if eq .Section "audit"}} aria-current="page"{{end}}><span>04</span>安全审计</a>
-        <a href="/admin?section=billing"{{if eq .Section "billing"}} aria-current="page"{{end}}><span>05</span>订阅与权益</a>
-        <a href="/admin?section=identity"{{if eq .Section "identity"}} aria-current="page"{{end}}><span>06</span>账号门户</a>
-        <a href="/admin?section=accounts"{{if eq .Section "accounts"}} aria-current="page"{{end}}><span>07</span>账号与角色</a>
-        <a href="/admin?section=redemptions"{{if eq .Section "redemptions"}} aria-current="page"{{end}}><span>08</span>兑换码管理 <em>未启用</em></a>
+        <a href="/admin?section=overview"{{if eq .Section "overview"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg>运行概览</a>
+        <a href="/admin?section=connections"{{if eq .Section "connections"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="m8.2 10.8 7.6-3.6M8.2 13.2l7.6 3.6"/></svg>连接路由</a>
+        <a href="/admin?section=deployment"{{if eq .Section "deployment"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9zM4.5 7.8 12 12l7.5-4.2M12 12v9"/></svg>Docker 部署</a>
+        <a href="/admin?section=audit"{{if eq .Section "audit"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.7 2.8 8 7 10 4.2-2 7-5.3 7-10V6zM9 12l2 2 4-4"/></svg>安全审计</a>
+        <a href="/admin?section=billing"{{if eq .Section "billing"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 9h18M7 15h4"/></svg>订阅与权益</a>
+        <a href="/admin?section=identity"{{if eq .Section "identity"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c.8-4 3.1-6 7-6s6.2 2 7 6"/></svg>账号门户</a>
+        <a href="/admin?section=accounts"{{if eq .Section "accounts"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M3 20c.6-4 2.7-6 6-6s5.4 2 6 6M15 15c3.4 0 5.3 1.7 6 5"/></svg>账号与角色</a>
+        <a href="/admin?section=redemptions"{{if eq .Section "redemptions"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v4a2 2 0 0 0 0 4v4H4v-4a2 2 0 0 0 0-4zM12 8v2M12 14v2"/></svg>兑换码管理 <em>未启用</em></a>
       </nav>
 
-      <div class="admin-user">
+      <a class="admin-user" href="/account" aria-label="返回个人中心">
         <span class="admin-avatar" aria-hidden="true">{{printf "%.1s" .Username}}</span>
         <span><strong>{{.Username}}</strong><small>{{.RoleLabel}} · {{.Role}}</small></span>
-      </div>
+      </a>
     </aside>
 
     <main class="admin-main">
@@ -48,10 +49,10 @@
           <h1>{{.SectionTitle}}</h1>
         </div>
         <div class="admin-top-actions">
-          <button class="theme-button" type="button" data-theme-toggle aria-label="切换深浅主题" title="切换深浅主题">
+          <button class="button button-quiet theme-toggle admin-theme-toggle" type="button" data-theme-toggle aria-label="切换深浅主题" title="切换深浅主题">
             <span class="theme-toggle-icon" aria-hidden="true">◐</span><span class="theme-toggle-label">主题</span>
           </button>
-          <a class="button button-quiet" href="/account">个人中心</a>
+          <a class="button button-quiet admin-account-link" href="/account">返回个人中心</a>
         </div>
       </header>
 

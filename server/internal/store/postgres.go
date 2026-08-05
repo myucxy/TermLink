@@ -60,7 +60,7 @@ func (s *Postgres) VerifySchema(ctx context.Context) error {
 	if err := s.Pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&version); err != nil {
 		return fmt.Errorf("production schema unavailable; run migrate: %w", err)
 	}
-	if version != 6 {
+	if version != 8 {
 		return fmt.Errorf("unsupported production schema version %d", version)
 	}
 	return nil
@@ -102,11 +102,13 @@ func (s *Postgres) RegisterDevice(ctx context.Context, subjectHash [32]byte, inp
 	if err != nil {
 		return uuid.Nil, DeviceRecord{}, false, err
 	}
-	var trustedCount int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM devices WHERE user_id=$1 AND trust_state='TRUSTED'`, userID).Scan(&trustedCount); err != nil {
+	var bootstrapConsumedAt *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT windows_bootstrap_consumed_at
+		FROM users WHERE id=$1 FOR UPDATE`, userID).Scan(&bootstrapConsumedAt); err != nil {
 		return uuid.Nil, DeviceRecord{}, false, err
 	}
-	bootstrap := input.Type == "WINDOWS_PC" && trustedCount == 0
+	bootstrap := input.Type == "WINDOWS_PC" && bootstrapConsumedAt == nil
 	trustState := "PENDING"
 	var approvedAt *time.Time
 	if bootstrap {
@@ -127,6 +129,17 @@ func (s *Postgres) RegisterDevice(ctx context.Context, subjectHash [32]byte, inp
 	}
 	if err != nil {
 		return uuid.Nil, DeviceRecord{}, false, err
+	}
+	if bootstrap {
+		command, err := tx.Exec(ctx, `
+			UPDATE users SET windows_bootstrap_consumed_at=now()
+			WHERE id=$1 AND windows_bootstrap_consumed_at IS NULL`, userID)
+		if err != nil {
+			return uuid.Nil, DeviceRecord{}, false, err
+		}
+		if command.RowsAffected() != 1 {
+			return uuid.Nil, DeviceRecord{}, false, ErrConflict
+		}
 	}
 	if err := ensureFreeEntitlement(ctx, tx, userID); err != nil {
 		return uuid.Nil, DeviceRecord{}, false, err
@@ -210,6 +223,83 @@ func (s *Postgres) GetDevice(ctx context.Context, userID, deviceID uuid.UUID) (D
 		return DeviceRecord{}, ErrNotFound
 	}
 	return item, err
+}
+
+// SelfTrustAndroidDevice atomically consumes one OIDC token identifier and
+// promotes only the calling Android device. It deliberately creates no PC
+// grant: device trust and per-PC VIEW/CONTROL/MANAGE authority are separate.
+// A repeated call after a successful transition is idempotent and does not
+// create another audit event.
+func (s *Postgres) SelfTrustAndroidDevice(ctx context.Context, userID, deviceID uuid.UUID, tokenIDHash [32]byte, traceID string) (DeviceRecord, bool, error) {
+	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return DeviceRecord{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var record DeviceRecord
+	err = tx.QueryRow(ctx, `
+		SELECT id,device_type,name,key_id,signing_public_key,exchange_public_key,
+		       trust_state,approved_by,approved_at,revoked_at,created_at
+		FROM devices
+		WHERE id=$1 AND user_id=$2
+		FOR UPDATE`, deviceID, userID,
+	).Scan(&record.ID, &record.Type, &record.Name, &record.KeyID, &record.SigningPublicKey,
+		&record.ExchangePublicKey, &record.TrustState, &record.ApprovedBy,
+		&record.ApprovedAt, &record.RevokedAt, &record.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DeviceRecord{}, false, ErrDenied
+	}
+	if err != nil {
+		return DeviceRecord{}, false, err
+	}
+	if record.Type != "ANDROID" || record.TrustState == "REVOKED" {
+		return DeviceRecord{}, false, ErrDenied
+	}
+	if record.TrustState == "TRUSTED" {
+		if err := tx.Commit(ctx); err != nil {
+			return DeviceRecord{}, false, err
+		}
+		return record, false, nil
+	}
+
+	command, err := tx.Exec(ctx, `
+		INSERT INTO device_self_trust_tokens(jti_hash,user_id,device_id)
+		VALUES($1,$2,$3)
+		ON CONFLICT (jti_hash) DO NOTHING`, tokenIDHash[:], userID, deviceID)
+	if err != nil {
+		return DeviceRecord{}, false, err
+	}
+	if command.RowsAffected() != 1 {
+		return DeviceRecord{}, false, ErrDenied
+	}
+
+	err = tx.QueryRow(ctx, `
+		UPDATE devices
+		SET trust_state='TRUSTED',approved_by=id,approved_at=now()
+		WHERE id=$1 AND user_id=$2 AND device_type='ANDROID' AND trust_state='PENDING'
+		RETURNING id,device_type,name,key_id,signing_public_key,exchange_public_key,
+		          trust_state,approved_by,approved_at,revoked_at,created_at`, deviceID, userID,
+	).Scan(&record.ID, &record.Type, &record.Name, &record.KeyID, &record.SigningPublicKey,
+		&record.ExchangePublicKey, &record.TrustState, &record.ApprovedBy,
+		&record.ApprovedAt, &record.RevokedAt, &record.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DeviceRecord{}, false, ErrDenied
+	}
+	if err != nil {
+		return DeviceRecord{}, false, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata)
+		VALUES($1,$2,'device.self_trust','device',$2,'SUCCEEDED',$3,
+		       jsonb_build_object('device_type','ANDROID','grants_created',false))`,
+		userID, deviceID, traceID); err != nil {
+		return DeviceRecord{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return DeviceRecord{}, false, err
+	}
+	return record, true, nil
 }
 
 type PairingChallengeInput struct {
@@ -361,25 +451,79 @@ func (s *Postgres) CompletePairingChallenge(ctx context.Context, userID, targetI
 }
 
 func (s *Postgres) RevokeDevice(ctx context.Context, userID, actorID, targetID uuid.UUID, traceID string) error {
-	tx, err := s.Pool.Begin(ctx)
+	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	command, err := tx.Exec(ctx, `
-		WITH actor AS (SELECT 1 FROM devices WHERE id=$1 AND user_id=$2 AND trust_state='TRUSTED')
+		WITH actor AS (
+			SELECT id,device_type,approved_by
+			FROM devices
+			WHERE id=$1 AND user_id=$2 AND trust_state='TRUSTED'
+		), affected_pcs AS (
+			SELECT pc_id AS id
+			FROM device_grants
+			WHERE device_id=$3 AND (expires_at IS NULL OR expires_at>now())
+			UNION
+			SELECT id FROM pcs WHERE device_id=$3 AND owner_user_id=$2
+		), authority AS (
+			SELECT 1
+			FROM actor
+			WHERE actor.id=$3
+			   OR (actor.device_type='WINDOWS_PC' AND actor.approved_by IS NULL)
+			   OR (
+				EXISTS(SELECT 1 FROM affected_pcs)
+				AND NOT EXISTS (
+					SELECT 1
+					FROM affected_pcs affected
+					JOIN pcs p ON p.id=affected.id AND p.owner_user_id=$2
+					LEFT JOIN device_grants manager
+					  ON manager.pc_id=p.id AND manager.device_id=$1
+					 AND (manager.expires_at IS NULL OR manager.expires_at>now())
+					WHERE p.device_id<>$1 AND COALESCE(manager.permission,'')<>'MANAGE'
+				)
+			   )
+		)
 		UPDATE devices SET trust_state='REVOKED',revoked_at=now()
-		WHERE id=$3 AND user_id=$2 AND trust_state<>'REVOKED' AND EXISTS(SELECT 1 FROM actor)`, actorID, userID, targetID)
+		WHERE id=$3 AND user_id=$2 AND trust_state<>'REVOKED' AND EXISTS(SELECT 1 FROM authority)`, actorID, userID, targetID)
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return ErrDenied
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM device_grants WHERE device_id=$1`, targetID); err != nil {
+	// Advancing every affected PC epoch before removing grants ensures that a
+	// revoked device is never included in newly encrypted live/history data.
+	// A revoked PC route is disabled as part of the same transaction.
+	if _, err := tx.Exec(ctx, `
+		UPDATE pcs SET key_epoch=key_epoch+1,
+			remote_routing_enabled=CASE WHEN device_id=$1 THEN false ELSE remote_routing_enabled END
+		WHERE owner_user_id=$2 AND (
+			device_id=$1 OR id IN (SELECT pc_id FROM device_grants WHERE device_id=$1)
+		)`, targetID, userID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM control_leases WHERE holder_device_id=$1`, targetID); err != nil {
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM device_grants
+		WHERE device_id=$1 OR pc_id IN (SELECT id FROM pcs WHERE device_id=$1 AND owner_user_id=$2)`, targetID, userID); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, `
+		DELETE FROM control_leases
+		WHERE holder_device_id=$1 OR session_id IN (
+			SELECT s.id FROM sessions s JOIN pcs p ON p.id=s.pc_id
+			WHERE p.device_id=$1 AND p.owner_user_id=$2
+		)
+		RETURNING session_id,holder_device_id,lease_id,version`, targetID, userID)
+	if err != nil {
+		return err
+	}
+	revokedLeases, err := scanRevokedLeases(rows)
+	if err != nil {
+		return err
+	}
+	if err := enqueueRevokedLeases(ctx, tx, revokedLeases); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO outbox(event_type,aggregate_id,payload) VALUES('device.revoked',$1,jsonb_build_object('user_id',$2::uuid,'device_id',$1::uuid))`, targetID, userID); err != nil {
@@ -447,6 +591,44 @@ func (s *Postgres) UpsertPC(ctx context.Context, userID, deviceID uuid.UUID, ite
 	return tx.Commit(ctx)
 }
 
+// TouchPCPresence is called by the authenticated production Realtime
+// heartbeat. It refreshes both the Windows device and its PC route without
+// accepting a client-supplied PC identifier.
+func (s *Postgres) TouchPCPresence(ctx context.Context, userID, deviceID uuid.UUID) error {
+	command, err := s.Pool.Exec(ctx, `
+		WITH trusted AS (
+			UPDATE devices SET last_seen_at=now()
+			WHERE id=$1 AND user_id=$2 AND device_type='WINDOWS_PC' AND trust_state='TRUSTED'
+			  AND EXISTS(SELECT 1 FROM users WHERE id=$2 AND status='ACTIVE')
+			RETURNING id
+		)
+		UPDATE pcs SET last_seen_at=now()
+		WHERE owner_user_id=$2 AND device_id=$1 AND EXISTS(SELECT 1 FROM trusted)`, deviceID, userID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrDenied
+	}
+	return nil
+}
+
+// TouchDevicePresence keeps the account security page's last-active value
+// current for an authenticated non-PC Realtime connection.
+func (s *Postgres) TouchDevicePresence(ctx context.Context, userID, deviceID uuid.UUID) error {
+	command, err := s.Pool.Exec(ctx, `
+		UPDATE devices SET last_seen_at=now()
+		WHERE id=$1 AND user_id=$2 AND trust_state='TRUSTED'
+		  AND EXISTS(SELECT 1 FROM users WHERE id=$2 AND status='ACTIVE')`, deviceID, userID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrDenied
+	}
+	return nil
+}
+
 func (s *Postgres) ListPCs(ctx context.Context, userID, deviceID uuid.UUID) ([]PCRecord, error) {
 	rows, err := s.Pool.Query(ctx, `SELECT p.id,p.device_id,p.name,p.agent_version,p.key_epoch,p.remote_routing_enabled,p.last_seen_at FROM pcs p WHERE p.owner_user_id=$1 AND (p.device_id=$2 OR EXISTS(SELECT 1 FROM device_grants g WHERE g.pc_id=p.id AND g.device_id=$2 AND (g.expires_at IS NULL OR g.expires_at>now()))) ORDER BY p.name,p.id`, userID, deviceID)
 	if err != nil {
@@ -507,29 +689,282 @@ func (s *Postgres) ListSessions(ctx context.Context, userID, deviceID, pcID uuid
 	return result, rows.Err()
 }
 
-func (s *Postgres) PutGrant(ctx context.Context, userID, actorID, deviceID, pcID uuid.UUID, permission string, expiresAt *time.Time) error {
-	command, err := s.Pool.Exec(ctx, `INSERT INTO device_grants(device_id,pc_id,permission,approved_by,expires_at) SELECT $1,$2,$3,$4,$5 FROM pcs p JOIN devices a ON a.id=$4 WHERE p.id=$2 AND p.owner_user_id=$6 AND a.user_id=$6 AND a.trust_state='TRUSTED' ON CONFLICT(device_id,pc_id) DO UPDATE SET permission=excluded.permission,approved_by=excluded.approved_by,expires_at=excluded.expires_at,updated_at=now()`, deviceID, pcID, permission, actorID, expiresAt, userID)
+func (s *Postgres) PutGrant(ctx context.Context, userID, actorID, deviceID, pcID uuid.UUID, permission string, expiresAt *time.Time, traceID string) error {
+	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command, err := tx.Exec(ctx, `
+		INSERT INTO device_grants(device_id,pc_id,permission,approved_by,expires_at)
+		SELECT target.id,p.id,$3,actor.id,$5
+		FROM pcs p
+		JOIN devices actor ON actor.id=$4 AND actor.user_id=$6 AND actor.trust_state='TRUSTED'
+		JOIN devices target ON target.id=$1 AND target.user_id=$6 AND target.trust_state='TRUSTED'
+		LEFT JOIN device_grants manager
+		  ON manager.pc_id=p.id AND manager.device_id=actor.id
+		 AND (manager.expires_at IS NULL OR manager.expires_at>now())
+		WHERE p.id=$2 AND p.owner_user_id=$6 AND p.remote_routing_enabled
+		  AND (p.device_id=actor.id OR manager.permission='MANAGE')
+		ON CONFLICT(device_id,pc_id) DO UPDATE
+		SET permission=excluded.permission,approved_by=excluded.approved_by,
+			expires_at=excluded.expires_at,updated_at=now()`, deviceID, pcID, permission, actorID, expiresAt, userID)
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return ErrDenied
 	}
+	if permission == "VIEW" {
+		rows, err := tx.Query(ctx, `
+			DELETE FROM control_leases
+			WHERE holder_device_id=$1 AND session_id IN (SELECT id FROM sessions WHERE pc_id=$2)
+			RETURNING session_id,holder_device_id,lease_id,version`, deviceID, pcID)
+		if err != nil {
+			return err
+		}
+		revokedLeases, err := scanRevokedLeases(rows)
+		if err != nil {
+			return err
+		}
+		if err := enqueueRevokedLeases(ctx, tx, revokedLeases); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO outbox(event_type,aggregate_id,payload)
+		VALUES('grant.updated',$1,jsonb_build_object('user_id',$2::uuid,'device_id',$1::uuid,'pc_id',$3::uuid,'permission',$4::text))`,
+		deviceID, userID, pcID, permission); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata)
+		VALUES($1,$2,'grant.update','device',$3,'SUCCEEDED',$4,
+			jsonb_build_object('pc_id',$5::uuid,'permission',$6::text,'expires_at',$7::timestamptz))`,
+		userID, actorID, deviceID, traceID, pcID, permission, expiresAt); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+type DeleteGrantResult struct {
+	KeyEpoch        int64
+	LeaseSessionIDs []uuid.UUID
+}
+
+type revokedLeaseRecord struct {
+	SessionID      uuid.UUID
+	HolderDeviceID uuid.UUID
+	LeaseID        uuid.UUID
+	Version        int64
+}
+
+func scanRevokedLeases(rows pgx.Rows) ([]revokedLeaseRecord, error) {
+	defer rows.Close()
+	result := make([]revokedLeaseRecord, 0)
+	for rows.Next() {
+		var lease revokedLeaseRecord
+		if err := rows.Scan(&lease.SessionID, &lease.HolderDeviceID, &lease.LeaseID, &lease.Version); err != nil {
+			return nil, err
+		}
+		result = append(result, lease)
+	}
+	return result, rows.Err()
+}
+
+func enqueueRevokedLeases(ctx context.Context, tx pgx.Tx, leases []revokedLeaseRecord) error {
+	for _, lease := range leases {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO outbox(event_type,aggregate_id,payload)
+			VALUES('lease.revoked',$1,jsonb_build_object(
+				'session_id',$1::uuid,'holder_device_id',$2::uuid,
+				'lease_id',$3::uuid,'version',$4::bigint))`,
+			lease.SessionID, lease.HolderDeviceID, lease.LeaseID, lease.Version); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func (s *Postgres) SessionPermission(ctx context.Context, userID, deviceID, sessionID uuid.UUID) (string, error) {
-	var permission string
-	err := s.Pool.QueryRow(ctx, `SELECT CASE WHEN p.device_id=$2 THEN 'MANAGE' ELSE g.permission END FROM sessions s JOIN pcs p ON p.id=s.pc_id LEFT JOIN device_grants g ON g.pc_id=p.id AND g.device_id=$2 AND (g.expires_at IS NULL OR g.expires_at>now()) WHERE s.id=$1 AND p.owner_user_id=$3 AND s.deleted_at IS NULL AND (p.device_id=$2 OR g.device_id IS NOT NULL)`, sessionID, deviceID, userID).Scan(&permission)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", ErrDenied
+// DeleteGrant removes one device's authority on one PC. The recipient-set
+// epoch, durable leases, audit record, and outbox event change atomically so a
+// removed device cannot remain a valid recipient of newly encrypted output.
+func (s *Postgres) DeleteGrant(ctx context.Context, userID, actorID, deviceID, pcID uuid.UUID, traceID string) (DeleteGrantResult, error) {
+	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return DeleteGrantResult{}, err
 	}
-	return permission, err
+	defer func() { _ = tx.Rollback(ctx) }()
+	var keyEpoch int64
+	err = tx.QueryRow(ctx, `
+		SELECT p.key_epoch
+		FROM pcs p
+		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
+		JOIN devices actor ON actor.id=$2 AND actor.user_id=$1 AND actor.trust_state='TRUSTED'
+		LEFT JOIN device_grants manager
+		  ON manager.pc_id=p.id AND manager.device_id=actor.id
+		 AND (manager.expires_at IS NULL OR manager.expires_at>now())
+		WHERE p.id=$3 AND p.owner_user_id=$1 AND p.remote_routing_enabled
+		  AND (p.device_id=actor.id OR manager.permission='MANAGE')
+		FOR UPDATE OF p`, userID, actorID, pcID).Scan(&keyEpoch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DeleteGrantResult{}, ErrDenied
+	}
+	if err != nil {
+		return DeleteGrantResult{}, err
+	}
+	command, err := tx.Exec(ctx, `DELETE FROM device_grants WHERE device_id=$1 AND pc_id=$2`, deviceID, pcID)
+	if err != nil {
+		return DeleteGrantResult{}, err
+	}
+	if command.RowsAffected() != 1 {
+		return DeleteGrantResult{}, ErrNotFound
+	}
+	rows, err := tx.Query(ctx, `
+		DELETE FROM control_leases
+		WHERE holder_device_id=$1 AND session_id IN (SELECT id FROM sessions WHERE pc_id=$2)
+		RETURNING session_id,holder_device_id,lease_id,version`, deviceID, pcID)
+	if err != nil {
+		return DeleteGrantResult{}, err
+	}
+	revokedLeases, err := scanRevokedLeases(rows)
+	if err != nil {
+		return DeleteGrantResult{}, err
+	}
+	leaseSessionIDs := make([]uuid.UUID, 0, len(revokedLeases))
+	for _, lease := range revokedLeases {
+		leaseSessionIDs = append(leaseSessionIDs, lease.SessionID)
+	}
+	if err := enqueueRevokedLeases(ctx, tx, revokedLeases); err != nil {
+		return DeleteGrantResult{}, err
+	}
+	keyEpoch++
+	if _, err := tx.Exec(ctx, `UPDATE pcs SET key_epoch=$2 WHERE id=$1`, pcID, keyEpoch); err != nil {
+		return DeleteGrantResult{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO outbox(event_type,aggregate_id,payload)
+		VALUES('grant.revoked',$1,jsonb_build_object('user_id',$2::uuid,'device_id',$1::uuid,'pc_id',$3::uuid,'key_epoch',$4::bigint))`,
+		deviceID, userID, pcID, keyEpoch); err != nil {
+		return DeleteGrantResult{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata)
+		VALUES($1,$2,'grant.revoke','device',$3,'SUCCEEDED',$4,jsonb_build_object('pc_id',$5::uuid,'key_epoch',$6::bigint))`,
+		userID, actorID, deviceID, traceID, pcID, keyEpoch); err != nil {
+		return DeleteGrantResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return DeleteGrantResult{}, err
+	}
+	return DeleteGrantResult{KeyEpoch: keyEpoch, LeaseSessionIDs: leaseSessionIDs}, nil
+}
+
+type PCGrantRecord struct {
+	DeviceID          uuid.UUID  `json:"device_id"`
+	DeviceType        string     `json:"device_type"`
+	DeviceName        string     `json:"device_name"`
+	ExchangePublicKey []byte     `json:"exchange_public_key"`
+	KeyID             string     `json:"key_id"`
+	Permission        string     `json:"permission"`
+	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
+}
+
+// ListPCGrants returns only active grants after authorizing the actor as the
+// owning Windows device or an unexpired MANAGE device. The authoritative key
+// epoch is returned with the same repeatable-read snapshot so an Agent never
+// encrypts a refreshed recipient set under a stale epoch.
+func (s *Postgres) ListPCGrants(ctx context.Context, userID, actorID, pcID uuid.UUID) (int64, []PCGrantRecord, error) {
+	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return 0, nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var keyEpoch int64
+	err = tx.QueryRow(ctx, `
+		SELECT p.key_epoch
+		FROM pcs p
+		JOIN devices actor ON actor.id=$2 AND actor.user_id=$1 AND actor.trust_state='TRUSTED'
+		LEFT JOIN device_grants manager
+		  ON manager.pc_id=p.id AND manager.device_id=actor.id
+		 AND (manager.expires_at IS NULL OR manager.expires_at>now())
+		WHERE p.id=$3 AND p.owner_user_id=$1 AND p.remote_routing_enabled
+		  AND (p.device_id=actor.id OR manager.permission='MANAGE')`, userID, actorID, pcID).Scan(&keyEpoch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil, ErrDenied
+	}
+	if err != nil {
+		return 0, nil, err
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT d.id,d.device_type,d.name,d.exchange_public_key,d.key_id,g.permission,g.expires_at
+		FROM device_grants g
+		JOIN devices d ON d.id=g.device_id AND d.user_id=$1 AND d.trust_state='TRUSTED'
+		WHERE g.pc_id=$2 AND (g.expires_at IS NULL OR g.expires_at>now())
+		ORDER BY d.created_at,d.id`, userID, pcID)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer rows.Close()
+	items := make([]PCGrantRecord, 0)
+	for rows.Next() {
+		var item PCGrantRecord
+		if err := rows.Scan(&item.DeviceID, &item.DeviceType, &item.DeviceName, &item.ExchangePublicKey, &item.KeyID, &item.Permission, &item.ExpiresAt); err != nil {
+			return 0, nil, err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, nil, err
+	}
+	return keyEpoch, items, nil
+}
+
+type SessionRouteAuthorization struct {
+	Permission     string
+	PCDeviceID     uuid.UUID
+	GrantExpiresAt *time.Time
+}
+
+// SessionRoute resolves both the device permission and the owning Windows
+// device from one authoritative snapshot. Relay subscription and low-rate
+// input paths use this once; high-volume PC output routes use the validated
+// subscription cache and are invalidated by authority events/heartbeats.
+func (s *Postgres) SessionRoute(ctx context.Context, userID, deviceID, sessionID uuid.UUID) (SessionRouteAuthorization, error) {
+	var result SessionRouteAuthorization
+	err := s.Pool.QueryRow(ctx, `
+		SELECT CASE WHEN p.device_id=$2 THEN 'MANAGE' ELSE g.permission END,p.device_id,g.expires_at
+		FROM sessions s
+		JOIN pcs p ON p.id=s.pc_id
+		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
+		JOIN devices owner_device ON owner_device.id=p.device_id AND owner_device.trust_state='TRUSTED'
+		LEFT JOIN device_grants g ON g.pc_id=p.id AND g.device_id=$2 AND (g.expires_at IS NULL OR g.expires_at>now())
+		WHERE s.id=$1 AND p.owner_user_id=$3 AND p.remote_routing_enabled AND s.deleted_at IS NULL
+		  AND (p.device_id=$2 OR g.device_id IS NOT NULL)`, sessionID, deviceID, userID).
+		Scan(&result.Permission, &result.PCDeviceID, &result.GrantExpiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return SessionRouteAuthorization{}, ErrDenied
+	}
+	return result, err
+}
+
+func (s *Postgres) SessionPermission(ctx context.Context, userID, deviceID, sessionID uuid.UUID) (string, error) {
+	route, err := s.SessionRoute(ctx, userID, deviceID, sessionID)
+	return route.Permission, err
 }
 
 func (s *Postgres) SessionPCDevice(ctx context.Context, userID, sessionID uuid.UUID) (uuid.UUID, error) {
 	var id uuid.UUID
-	err := s.Pool.QueryRow(ctx, `SELECT p.device_id FROM sessions s JOIN pcs p ON p.id=s.pc_id WHERE s.id=$1 AND p.owner_user_id=$2 AND s.deleted_at IS NULL`, sessionID, userID).Scan(&id)
+	err := s.Pool.QueryRow(ctx, `
+		SELECT p.device_id
+		FROM sessions s
+		JOIN pcs p ON p.id=s.pc_id
+		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
+		JOIN devices owner_device ON owner_device.id=p.device_id AND owner_device.trust_state='TRUSTED'
+		WHERE s.id=$1 AND p.owner_user_id=$2 AND p.remote_routing_enabled AND s.deleted_at IS NULL`, sessionID, userID).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, ErrNotFound
 	}
@@ -1153,7 +1588,15 @@ type IdempotencyResult struct {
 }
 
 func (s *Postgres) ClaimIdempotency(ctx context.Context, userID uuid.UUID, key string, requestHash [32]byte) (IdempotencyResult, error) {
-	command, err := s.Pool.Exec(ctx, `INSERT INTO idempotency_keys(user_id,idempotency_key,request_hash,expires_at) VALUES($1,$2,$3,now()+interval '24 hours') ON CONFLICT(user_id,idempotency_key) DO UPDATE SET request_hash=excluded.request_hash,response_status=NULL,response_body=NULL,expires_at=excluded.expires_at,created_at=now() WHERE idempotency_keys.expires_at<now()`, userID, key, requestHash[:])
+	command, err := s.Pool.Exec(ctx, `
+		INSERT INTO idempotency_keys(user_id,idempotency_key,request_hash,expires_at)
+		VALUES($1,$2,$3,now()+interval '24 hours')
+		ON CONFLICT(user_id,idempotency_key) DO UPDATE
+		SET request_hash=excluded.request_hash,response_status=NULL,response_body=NULL,
+		    expires_at=excluded.expires_at,created_at=now()
+		WHERE idempotency_keys.expires_at<now()
+		   OR (idempotency_keys.response_status>=500
+		       AND idempotency_keys.request_hash=excluded.request_hash)`, userID, key, requestHash[:])
 	if err != nil {
 		return IdempotencyResult{}, err
 	}
@@ -1202,14 +1645,140 @@ func (s *Postgres) ListAudit(ctx context.Context, userID uuid.UUID, before int64
 	return result, rows.Err()
 }
 
-func (s *Postgres) SaveLease(ctx context.Context, leaseID, sessionID, holderID uuid.UUID, expiresAt time.Time, version int64) error {
-	_, err := s.Pool.Exec(ctx, `INSERT INTO control_leases(session_id,holder_device_id,lease_id,expires_at,version) VALUES($1,$2,$3,$4,$5) ON CONFLICT(session_id) DO UPDATE SET holder_device_id=excluded.holder_device_id,lease_id=excluded.lease_id,expires_at=excluded.expires_at,version=excluded.version,updated_at=now()`, sessionID, holderID, leaseID, expiresAt, version)
-	return err
+func (s *Postgres) SaveLease(ctx context.Context, userID, actorID, leaseID, sessionID, holderID uuid.UUID, expiresAt time.Time, version int64, auditAction, traceID string) error {
+	if actorID != holderID || version < 1 {
+		return ErrDenied
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command, err := tx.Exec(ctx, `
+		INSERT INTO control_leases(session_id,holder_device_id,lease_id,expires_at,version)
+		SELECT s.id,d.id,$3,$4,$5
+		FROM sessions s
+		JOIN pcs p ON p.id=s.pc_id AND p.owner_user_id=$6 AND p.remote_routing_enabled
+		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
+		JOIN devices d ON d.id=$2 AND d.user_id=$6 AND d.device_type='ANDROID' AND d.trust_state='TRUSTED'
+		JOIN device_grants grant_authority ON grant_authority.device_id=d.id AND grant_authority.pc_id=p.id
+		  AND grant_authority.permission IN ('CONTROL','MANAGE')
+		  AND (grant_authority.expires_at IS NULL OR grant_authority.expires_at>now())
+		WHERE s.id=$1 AND s.deleted_at IS NULL
+		ON CONFLICT(session_id) DO UPDATE
+		SET holder_device_id=excluded.holder_device_id,lease_id=excluded.lease_id,
+			expires_at=CASE
+				WHEN excluded.version=control_leases.version
+				THEN GREATEST(control_leases.expires_at,excluded.expires_at)
+				ELSE excluded.expires_at
+			END,
+			version=excluded.version,updated_at=now()
+		WHERE excluded.version>control_leases.version
+		   OR control_leases.expires_at<=now()
+		   OR (excluded.version=control_leases.version
+		       AND excluded.lease_id=control_leases.lease_id
+		       AND excluded.holder_device_id=control_leases.holder_device_id)`,
+		sessionID, holderID, leaseID, expiresAt, version, userID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrConflict
+	}
+	if auditAction != "" {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata)
+			VALUES($1,$2,$3,'session',$4,'SUCCEEDED',$5,jsonb_build_object('lease_id',$6::uuid,'version',$7::bigint))`,
+			userID, actorID, auditAction, sessionID, traceID, leaseID, version); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
-func (s *Postgres) DeleteLease(ctx context.Context, sessionID, leaseID uuid.UUID) error {
-	_, err := s.Pool.Exec(ctx, `DELETE FROM control_leases WHERE session_id=$1 AND lease_id=$2`, sessionID, leaseID)
-	return err
+func (s *Postgres) DeleteLease(ctx context.Context, userID, actorID, sessionID, leaseID uuid.UUID, auditAction, traceID string) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command, err := tx.Exec(ctx, `
+		DELETE FROM control_leases lease
+		USING sessions s,pcs p,devices actor,users account
+		WHERE lease.session_id=$1 AND lease.lease_id=$2
+		  AND s.id=lease.session_id AND p.id=s.pc_id AND p.owner_user_id=$3
+		  AND actor.id=$4 AND actor.user_id=$3 AND actor.trust_state='TRUSTED'
+		  AND account.id=$3 AND account.status='ACTIVE'
+		  AND (
+			actor.id=lease.holder_device_id OR p.device_id=actor.id OR EXISTS (
+				SELECT 1 FROM device_grants manager
+				WHERE manager.device_id=actor.id AND manager.pc_id=p.id
+				  AND manager.permission='MANAGE'
+				  AND (manager.expires_at IS NULL OR manager.expires_at>now())
+			)
+		  )`, sessionID, leaseID, userID, actorID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() == 0 {
+		return tx.Commit(ctx)
+	}
+	if auditAction != "" {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata)
+			VALUES($1,$2,$3,'session',$4,'SUCCEEDED',$5,jsonb_build_object('lease_id',$6::uuid))`,
+			userID, actorID, auditAction, sessionID, traceID, leaseID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// ForceDeleteLease performs the durable half of a MANAGE force release. The
+// lease identity and version returned by Valkey are a fencing token: a
+// replacement acquired after the cache deletion must never be removed by the
+// older force-release request.
+func (s *Postgres) ForceDeleteLease(ctx context.Context, userID, actorID, sessionID, leaseID uuid.UUID, version int64, auditAction, traceID string) error {
+	if version < 1 {
+		return ErrDenied
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var deletedLeaseID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		DELETE FROM control_leases lease
+		USING sessions s,pcs p,devices actor,users account
+		WHERE lease.session_id=$1 AND lease.lease_id=$4 AND lease.version=$5
+		  AND s.id=lease.session_id AND p.id=s.pc_id AND p.owner_user_id=$2
+		  AND actor.id=$3 AND actor.user_id=$2 AND actor.trust_state='TRUSTED'
+		  AND account.id=$2 AND account.status='ACTIVE'
+		  AND (
+			p.device_id=actor.id OR EXISTS (
+				SELECT 1 FROM device_grants manager
+				WHERE manager.device_id=actor.id AND manager.pc_id=p.id
+				  AND manager.permission='MANAGE'
+				  AND (manager.expires_at IS NULL OR manager.expires_at>now())
+			)
+		  )
+		RETURNING lease.lease_id`, sessionID, userID, actorID, leaseID, version).Scan(&deletedLeaseID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return tx.Commit(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	if auditAction != "" {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata)
+			VALUES($1,$2,$3,'session',$4,'SUCCEEDED',$5,jsonb_build_object('lease_id',$6::uuid))`,
+			userID, actorID, auditAction, sessionID, traceID, deletedLeaseID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Postgres) GetEntitlement(ctx context.Context, userID uuid.UUID) (Entitlement, error) {

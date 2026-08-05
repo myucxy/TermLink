@@ -6,7 +6,9 @@ services:
     command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
     ports:
       - "0.0.0.0:8080:8080"
-    networks: ["acceptance"]
+    networks:
+      - public
+      - frontend
     volumes:
       - ../acceptance/LuckyUpstream.Caddyfile:/etc/caddy/Caddyfile:ro
     read_only: true
@@ -20,6 +22,9 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
+    depends_on:
+      keycloak-init:
+        condition: service_completed_successfully
 
   edge:
     image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
@@ -27,10 +32,15 @@ services:
     ports:
       - "127.0.0.1:9443:9443"
     networks:
-      acceptance:
+      public:
+      frontend:
         aliases:
           - api.127.0.0.1.sslip.io
           - id.127.0.0.1.sslip.io
+          - history.127.0.0.1.sslip.io
+      object:
+        aliases:
+          - history.127.0.0.1.sslip.io
     volumes:
       - ../acceptance/Caddyfile:/etc/caddy/Caddyfile:ro
       - acceptance-caddy-data:/data
@@ -59,7 +69,7 @@ services:
         exit 1
     volumes:
       - acceptance-caddy-data:/data:ro
-    networks: ["acceptance"]
+    networks: ["frontend"]
     read_only: true
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
@@ -68,32 +78,91 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # Docker Desktop exposes file-backed Compose secrets with host-derived
+  # permissions and ignores uid/gid/mode metadata. Copy them once into
+  # service-private volumes so the production-mode acceptance stack verifies
+  # the permissions that each runtime actually observes.
+  runtime-secrets-init:
+    image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        copy_secret() {
+          source="$$1"
+          destination="$$2"
+          owner="$$3"
+          rm -f "$$destination"
+          cp "/run/secrets/$$source" "$$destination"
+          chmod 0400 "$$destination"
+          chown "$$owner" "$$destination"
+        }
+        copy_secret keycloak_admin_password /target/keycloak-runtime/keycloak_admin_password 1000:0
+        copy_secret keycloak_admin_password /target/keycloak-init/keycloak_admin_password 1000:0
+        copy_secret admin_initial_password /target/keycloak-init/admin_initial_password 1000:0
+        copy_secret acceptance_user_password /target/keycloak-init/acceptance_user_password 1000:0
+        copy_secret postgres_password /target/postgres/postgres_password 70:70
+        copy_secret valkey_password /target/valkey/valkey_password 999:1000
+        copy_secret s3_access_key /target/minio/s3_access_key 0:0
+        copy_secret s3_secret_key /target/minio/s3_secret_key 0:0
+    secrets:
+      - keycloak_admin_password
+      - admin_initial_password
+      - acceptance_user_password
+      - postgres_password
+      - valkey_password
+      - s3_access_key
+      - s3_secret_key
+    volumes:
+      - acceptance-keycloak-runtime-secrets:/target/keycloak-runtime
+      - acceptance-keycloak-init-secrets:/target/keycloak-init
+      - acceptance-postgres-secrets:/target/postgres
+      - acceptance-valkey-secrets:/target/valkey
+      - acceptance-minio-secrets:/target/minio
+    network_mode: "none"
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
   keycloak:
-    image: ${TERMLINK_ACCEPTANCE_KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.3.2@sha256:98fab020a3a490aba0978f237e2a06cd0ea42bf149c6cf10f11c0aaf27728ff2}
+    image: termlink-production-acceptance-keycloak:local
+    build:
+      context: ..
+      dockerfile: acceptance/Keycloak.Dockerfile
+      args:
+        KEYCLOAK_BASE_IMAGE: ${TERMLINK_ACCEPTANCE_KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.3.2@sha256:98fab020a3a490aba0978f237e2a06cd0ea42bf149c6cf10f11c0aaf27728ff2}
     entrypoint: ["/bin/bash", "-ec"]
     command:
       - >-
         export KC_BOOTSTRAP_ADMIN_PASSWORD="$$(cat /run/secrets/keycloak_admin_password)";
-        exec /opt/keycloak/bin/kc.sh start-dev --import-realm
+        rm -rf /opt/keycloak/data/tmp/kc-gzip-cache;
+        exec /opt/keycloak/bin/kc.sh start --optimized --import-realm
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: acceptance-admin
       KC_HEALTH_ENABLED: "true"
+      KC_DB: dev-file
       KC_HOSTNAME: https://termlink.kget.cc:8910
       KC_HTTP_ENABLED: "true"
       KC_PROXY_HEADERS: xforwarded
-    secrets:
-      - keycloak_admin_password
-    networks: ["acceptance"]
+      KC_CACHE: local
+    networks: ["frontend"]
     volumes:
       - ../acceptance/keycloak-realm.json:/opt/keycloak/data/import/termlink-realm.json:ro
-      - ../acceptance/keycloak-theme/termlink:/opt/keycloak/themes/termlink:ro
       - acceptance-keycloak-data:/opt/keycloak/data
+      - acceptance-keycloak-runtime-secrets:/run/secrets:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
+    depends_on:
+      runtime-secrets-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   keycloak-init:
-    image: ${TERMLINK_ACCEPTANCE_KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.3.2@sha256:98fab020a3a490aba0978f237e2a06cd0ea42bf149c6cf10f11c0aaf27728ff2}
+    image: termlink-production-acceptance-keycloak:local
     entrypoint: ["/bin/bash", "-ec"]
     command:
       - |
@@ -115,12 +184,23 @@ services:
         /opt/keycloak/bin/kcadm.sh update realms/termlink \
           --config /tmp/kcadm.config \
           -s displayName=TermLink \
-          -s loginTheme=termlink \
+          -s loginTheme=termlink-01b-v6 \
+          -s accountTheme=termlink-01b-v6 \
           -s internationalizationEnabled=true \
           -s 'supportedLocales=["zh-CN","en"]' \
           -s defaultLocale=zh-CN \
-          -s rememberMe=true >/dev/null
-        for role_name in SUPER_ADMIN ADMIN AUDITOR USER; do
+          -s rememberMe=true \
+          -s registrationAllowed=false \
+          -s verifyEmail=false \
+          -s resetPasswordAllowed=true \
+          -s bruteForceProtected=true \
+          -s accessTokenLifespan=300 \
+          -s accessTokenLifespanForImplicitFlow=300 \
+          -s ssoSessionIdleTimeout=1800 \
+          -s ssoSessionMaxLifespan=28800 \
+          -s revokeRefreshToken=true \
+          -s refreshTokenMaxReuse=0 >/dev/null
+        for role_name in SUPER_ADMIN ADMIN AUDITOR USER TERMLINK_BOOTSTRAP_MANAGED_V1; do
           if ! /opt/keycloak/bin/kcadm.sh get "roles/$$role_name" \
             --config /tmp/kcadm.config -r termlink >/dev/null 2>&1; then
             /opt/keycloak/bin/kcadm.sh create roles \
@@ -128,6 +208,81 @@ services:
               -s name="$$role_name" >/dev/null
           fi
         done
+        android_client_id=$$(/opt/keycloak/bin/kcadm.sh get clients \
+          --config /tmp/kcadm.config \
+          -r termlink -q clientId=termlink-android \
+          --fields id --format csv --noquotes | tail -n 1)
+        test -n "$$android_client_id"
+        /opt/keycloak/bin/kcadm.sh update "clients/$$android_client_id" \
+          --config /tmp/kcadm.config -r termlink \
+          -s publicClient=true \
+          -s standardFlowEnabled=true \
+          -s directAccessGrantsEnabled=true \
+          -s implicitFlowEnabled=false \
+          -s serviceAccountsEnabled=false \
+          -s fullScopeAllowed=false \
+          -s 'redirectUris=["dev.termlink:/oauth2redirect"]' \
+          -s 'attributes={"pkce.code.challenge.method":"S256"}' >/dev/null
+        cat > /tmp/termlink-android-audience.json <<'JSON'
+        {
+          "name": "termlink-server-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "termlink-server",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+        JSON
+        android_mapper_table=$$(/opt/keycloak/bin/kcadm.sh get \
+          "clients/$$android_client_id/protocol-mappers/models" \
+          --config /tmp/kcadm.config -r termlink \
+          --fields id,name --format csv --noquotes)
+        android_mapper_id=$$(printf '%s\n' "$$android_mapper_table" | while IFS=, read -r id name; do
+          if test "$$name" = termlink-server-audience; then printf '%s' "$$id"; fi
+        done)
+        if test -n "$$android_mapper_id"; then
+          /opt/keycloak/bin/kcadm.sh delete \
+            "clients/$$android_client_id/protocol-mappers/models/$$android_mapper_id" \
+            --config /tmp/kcadm.config -r termlink >/dev/null
+        fi
+        /opt/keycloak/bin/kcadm.sh create \
+          "clients/$$android_client_id/protocol-mappers/models" \
+          --config /tmp/kcadm.config -r termlink \
+          -f /tmp/termlink-android-audience.json >/dev/null
+        acceptance_client_id=$$(/opt/keycloak/bin/kcadm.sh get clients \
+          --config /tmp/kcadm.config \
+          -r termlink -q clientId=termlink-acceptance-cli \
+          --fields id --format csv --noquotes | tail -n 1)
+        test -n "$$acceptance_client_id"
+        /opt/keycloak/bin/kcadm.sh update "clients/$$acceptance_client_id" \
+          --config /tmp/kcadm.config -r termlink \
+          -s enabled=true \
+          -s publicClient=true \
+          -s bearerOnly=false \
+          -s standardFlowEnabled=false \
+          -s directAccessGrantsEnabled=true \
+          -s implicitFlowEnabled=false \
+          -s serviceAccountsEnabled=false \
+          -s fullScopeAllowed=false >/dev/null
+        acceptance_mapper_table=$$(/opt/keycloak/bin/kcadm.sh get \
+          "clients/$$acceptance_client_id/protocol-mappers/models" \
+          --config /tmp/kcadm.config -r termlink \
+          --fields id,name --format csv --noquotes)
+        acceptance_mapper_id=$$(printf '%s\n' "$$acceptance_mapper_table" | while IFS=, read -r id name; do
+          if test "$$name" = termlink-server-audience; then printf '%s' "$$id"; fi
+        done)
+        if test -n "$$acceptance_mapper_id"; then
+          /opt/keycloak/bin/kcadm.sh delete \
+            "clients/$$acceptance_client_id/protocol-mappers/models/$$acceptance_mapper_id" \
+            --config /tmp/kcadm.config -r termlink >/dev/null
+        fi
+        /opt/keycloak/bin/kcadm.sh create \
+          "clients/$$acceptance_client_id/protocol-mappers/models" \
+          --config /tmp/kcadm.config -r termlink \
+          -f /tmp/termlink-android-audience.json >/dev/null
         windows_client_id=$$(/opt/keycloak/bin/kcadm.sh get clients \
           --config /tmp/kcadm.config \
           -r termlink -q clientId=termlink-windows \
@@ -157,6 +312,13 @@ services:
           -r termlink -q clientId=termlink-web \
           --fields id --format csv --noquotes | tail -n 1)
         test -n "$$web_client_id"
+        /opt/keycloak/bin/kcadm.sh update "clients/$$web_client_id" \
+          --config /tmp/kcadm.config -r termlink \
+          -s 'name=TermLink 个人中心' \
+          -s rootUrl=https://termlink.kget.cc:8910 \
+          -s baseUrl=https://termlink.kget.cc:8910/account \
+          -s 'redirectUris=["https://termlink.kget.cc:8910/auth/callback","https://termlink.kget.cc:8910/account"]' \
+          -s 'webOrigins=["https://termlink.kget.cc:8910"]' >/dev/null
         for scope_name in web-origins acr roles profile basic email; do
           scope_id=$$(printf '%s\n' "$$client_scope_table" | while IFS=, read -r id name; do
             if test "$$name" = "$$scope_name"; then printf '%s' "$$id"; fi
@@ -211,6 +373,18 @@ services:
             --config /tmp/kcadm.config \
             -r termlink --userid "$$admin_user_id" \
             --new-password "$$initial_admin_password" --temporary >/dev/null
+          /opt/keycloak/bin/kcadm.sh add-roles \
+            --config /tmp/kcadm.config -r termlink \
+            --uid "$$admin_user_id" --rolename TERMLINK_BOOTSTRAP_MANAGED_V1 >/dev/null
+        else
+          admin_realm_roles=$$(/opt/keycloak/bin/kcadm.sh get \
+            "users/$$admin_user_id/role-mappings/realm" \
+            --config /tmp/kcadm.config -r termlink \
+            --fields name --format csv --noquotes)
+          if ! printf '%s\n' "$$admin_realm_roles" | grep -Fxq TERMLINK_BOOTSTRAP_MANAGED_V1; then
+            printf '%s\n' 'Refusing to grant SUPER_ADMIN to an unmanaged existing admin account.' >&2
+            exit 1
+          fi
         fi
         /opt/keycloak/bin/kcadm.sh add-roles \
           --config /tmp/kcadm.config -r termlink \
@@ -240,11 +414,12 @@ services:
             --config /tmp/kcadm.config -r termlink \
             --uid "$$user_id" --rolename USER >/dev/null
         done
-    secrets:
-      - keycloak_admin_password
-      - admin_initial_password
-      - acceptance_user_password
-    networks: ["acceptance"]
+        /opt/keycloak/bin/kcadm.sh update realms/termlink \
+          --config /tmp/kcadm.config \
+          -s registrationAllowed=true >/dev/null
+    networks: ["frontend"]
+    volumes:
+      - acceptance-keycloak-init-secrets:/run/secrets:ro
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
@@ -253,6 +428,8 @@ services:
     depends_on:
       keycloak:
         condition: service_started
+      runtime-secrets-init:
+        condition: service_completed_successfully
     restart: "no"
 
   postgres:
@@ -261,35 +438,79 @@ services:
       POSTGRES_DB: termlink
       POSTGRES_USER: termlink
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
-    secrets:
-      - postgres_password
-    networks: ["acceptance"]
+    networks: ["backend"]
     volumes:
       - acceptance-postgres-data:/var/lib/postgresql/data
+      - acceptance-postgres-secrets:/run/secrets:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U termlink -d termlink"]
       interval: 2s
       timeout: 2s
       retries: 30
+    depends_on:
+      runtime-secrets-init:
+        condition: service_completed_successfully
 
   valkey:
     image: valkey/valkey:8.1.1-alpine@sha256:6a57d58c0a37cf7acc3045ac0fd6dd91be339774106ab4d9ca088013a096a99f
-    command: ["valkey-server", "--appendonly", "yes"]
-    networks: ["acceptance"]
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        password="$$(cat /run/secrets/valkey_password)"
+        test -n "$$password"
+        case "$$password" in *[!A-Za-z0-9_-]*) exit 1;; esac
+        umask 077
+        printf 'user default on >%s ~* &* +@all\n' "$$password" > /run/valkey/users.acl
+        unset password
+        exec valkey-server --appendonly yes --aclfile /run/valkey/users.acl
+    networks: ["backend"]
     volumes:
       - acceptance-valkey-data:/data
+      - acceptance-valkey-secrets:/run/secrets:ro
+    read_only: true
+    user: "999:1000"
+    tmpfs:
+      - /run/valkey:rw,noexec,nosuid,size=1m,uid=999,gid=1000,mode=0700
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
     healthcheck:
-      test: ["CMD", "valkey-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$(cat /run/secrets/valkey_password)\" valkey-cli --user default ping | grep -qx PONG"]
       interval: 2s
       timeout: 2s
       retries: 30
+    depends_on:
+      runtime-secrets-init:
+        condition: service_completed_successfully
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/s3_access_key
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/s3_secret_key
+    networks:
+      - object-control
+      - object
+    volumes:
+      - acceptance-minio-data:/data
+      - acceptance-minio-secrets:/run/secrets:ro
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 2s
+      retries: 45
+    restart: unless-stopped
+    depends_on:
+      runtime-secrets-init:
+        condition: service_completed_successfully
 
   server-secrets-init:
     image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - >-
-        for name in oidc_client_secret database_url redis_url token_signing_key; do
+        for name in oidc_client_secret database_url redis_url token_signing_key s3_access_key s3_secret_key; do
           rm -f "/target/$$name";
           cp "/run/secrets/$$name" "/target/$$name";
           chmod 0400 "/target/$$name";
@@ -304,10 +525,12 @@ services:
       - database_url
       - redis_url
       - token_signing_key
+      - s3_access_key
+      - s3_secret_key
     volumes:
       - acceptance-server-secrets:/target
       - acceptance-caddy-data:/data:ro
-    networks: ["acceptance"]
+    networks: ["frontend"]
     read_only: true
     cap_drop: ["ALL"]
     cap_add: ["CHOWN"]
@@ -327,9 +550,11 @@ services:
       TERMLINK_PUBLIC_URL: https://termlink.kget.cc:8910
       TERMLINK_OIDC_ISSUER: https://termlink.kget.cc:8910/realms/termlink
       TERMLINK_OIDC_CLIENT_ID: termlink-server
+      TERMLINK_OIDC_ALLOWED_PARTIES: termlink-android,termlink-windows,termlink-acceptance-cli
       TERMLINK_ANDROID_OIDC_CLIENT_ID: termlink-android
       TERMLINK_ANDROID_OIDC_REDIRECT_URI: dev.termlink:/oauth2redirect
       TERMLINK_WINDOWS_OIDC_CLIENT_ID: termlink-windows
+      TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES: termlink-windows,termlink-acceptance-cli
       TERMLINK_WINDOWS_OIDC_REDIRECT_URI: http://127.0.0.1:43971/oauth2/callback
       TERMLINK_WEB_OIDC_CLIENT_ID: termlink-web
       TERMLINK_WEB_OIDC_REDIRECT_URI: https://termlink.kget.cc:8910/auth/callback
@@ -337,12 +562,18 @@ services:
       TERMLINK_DATABASE_URL_FILE: /run/secrets/database_url
       TERMLINK_REDIS_URL_FILE: /run/secrets/redis_url
       TERMLINK_TOKEN_SIGNING_KEY_FILE: /run/secrets/token_signing_key
-      TERMLINK_HISTORY_ENABLED: "false"
+      TERMLINK_HISTORY_ENABLED: "true"
+      TERMLINK_S3_ENDPOINT: http://minio:9000
+      TERMLINK_S3_PUBLIC_ENDPOINT: https://history.127.0.0.1.sslip.io:9443
+      TERMLINK_S3_BUCKET: termlink-history
+      TERMLINK_S3_REGION: us-east-1
+      TERMLINK_S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+      TERMLINK_S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
       TERMLINK_LISTEN_ADDR: :8080
       TERMLINK_LOG_LEVEL: info
     volumes:
       - acceptance-server-secrets:/run/secrets:ro
-    networks: ["acceptance"]
+    networks: ["backend"]
     read_only: true
     user: "65532:65532"
     tmpfs:
@@ -364,7 +595,11 @@ services:
     environment:
       <<: *termlink_environment
       SSL_CERT_FILE: /run/secrets/acceptance-root-ca.crt
-    networks: ["acceptance"]
+    networks:
+      - frontend
+      - backend
+      - object-control
+      - egress
     volumes:
       - acceptance-server-secrets:/run/secrets:ro
     read_only: true
@@ -389,6 +624,8 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
+      minio:
+        condition: service_healthy
 
 secrets:
   keycloak_admin_password:
@@ -399,6 +636,8 @@ secrets:
     file: ${TERMLINK_ACCEPTANCE_USER_PASSWORD_FILE:?required}
   postgres_password:
     file: ${TERMLINK_ACCEPTANCE_POSTGRES_PASSWORD_FILE:?required}
+  valkey_password:
+    file: ${TERMLINK_ACCEPTANCE_VALKEY_PASSWORD_FILE:?required}
   oidc_client_secret:
     file: ${TERMLINK_ACCEPTANCE_OIDC_CLIENT_SECRET_FILE:?required}
   database_url:
@@ -407,14 +646,33 @@ secrets:
     file: ${TERMLINK_ACCEPTANCE_REDIS_URL_FILE:?required}
   token_signing_key:
     file: ${TERMLINK_ACCEPTANCE_TOKEN_SIGNING_KEY_FILE:?required}
+  s3_access_key:
+    file: ${TERMLINK_ACCEPTANCE_S3_ACCESS_KEY_FILE:?required}
+  s3_secret_key:
+    file: ${TERMLINK_ACCEPTANCE_S3_SECRET_KEY_FILE:?required}
 
 volumes:
   acceptance-caddy-data:
   acceptance-caddy-config:
   acceptance-keycloak-data:
+  acceptance-keycloak-runtime-secrets:
+  acceptance-keycloak-init-secrets:
   acceptance-postgres-data:
+  acceptance-postgres-secrets:
   acceptance-server-secrets:
   acceptance-valkey-data:
+  acceptance-valkey-secrets:
+  acceptance-minio-data:
+  acceptance-minio-secrets:
 
 networks:
-  acceptance:
+  public:
+  frontend:
+    internal: true
+  backend:
+    internal: true
+  object:
+    internal: true
+  object-control:
+    internal: true
+  egress:

@@ -5,6 +5,9 @@ only the edge proxy on port 443; the TermLink server, PostgreSQL, and Valkey
 services have no host-published ports and communicate on a private network.
 The server also has an egress-only network for external OIDC and S3 endpoints;
 PostgreSQL and Valkey remain on the isolated private network.
+When history is enabled, the server reaches MinIO through the separate internal
+`object-control` network, while the edge reaches only MinIO's `object` network
+for presigned object traffic; the edge never joins the backend network.
 The server runs as UID/GID `65532`, with a read-only root filesystem, dropped
 Linux capabilities, and a bounded `/tmp` tmpfs.
 
@@ -17,7 +20,8 @@ source control. The files must be non-empty and owner-readable only:
 New-Item -ItemType Directory -Force server\secrets | Out-Null
 'local-oidc-secret' | Set-Content server\secrets\oidc-client-secret -NoNewline
 'postgres://termlink:local-password@postgres:5432/termlink?sslmode=disable' | Set-Content server\secrets\database-url -NoNewline
-'redis://valkey:6379/0' | Set-Content server\secrets\redis-url -NoNewline
+'local-valkey-password' | Set-Content server\secrets\valkey-password -NoNewline
+'redis://default:local-valkey-password@valkey:6379/0' | Set-Content server\secrets\redis-url -NoNewline
 'local-token-signing-key' | Set-Content server\secrets\token-signing-key -NoNewline
 'local-s3-access' | Set-Content server\secrets\s3-access-key -NoNewline
 'local-s3-secret' | Set-Content server\secrets\s3-secret-key -NoNewline
@@ -26,10 +30,22 @@ New-Item -ItemType Directory -Force server\secrets | Out-Null
 docker compose --env-file server\.env -f server\compose\core.compose.yml config
 ```
 
-On Unix hosts, run `chmod 600 server/secrets/*` (or `chmod 400` for
-read-only fixtures). Do not enable history until the S3 endpoint and both S3
+On Unix hosts, run `chmod 700 server/secrets` and `chmod 600
+server/secrets/*` (or `chmod 400` for read-only fixtures). On Windows, disable
+ACL inheritance on both the directory and files and grant access only to the
+deploying account, `SYSTEM`, and local Administrators. The production policy
+validator rejects group/world Unix bits, inherited Windows ACLs, and any
+unreviewed allow ACE. Do not enable history until the S3 endpoint and both S3
 secret fixtures are configured. Secret contents are never supplied as Compose
 environment values.
+
+Valkey authentication is file-backed. Compose reads
+`TERMLINK_VALKEY_PASSWORD_FILE` at startup, writes a short-lived ACL file on
+the private `/run/valkey` tmpfs, and starts Valkey with the default user
+protected by that password. Keep the password in the separate
+`valkey-password` fixture and include the matching `default:<password>@` user
+info in the `redis-url` fixture; neither value belongs in `.env` or a rendered
+Compose environment.
 
 `TERMLINK_S3_ENDPOINT` is the server-side S3/MinIO endpoint used for bucket
 creation and object verification/deletion. `TERMLINK_S3_PUBLIC_ENDPOINT` is
@@ -66,7 +82,11 @@ Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当�
 
 Production uses `Caddyfile` with TLS 1.2/1.3, HSTS, a production Let's Encrypt
 ACME endpoint, separate application/history hosts, and public denial of
-`/metrics` and `/debug`. Metrics listen on the internal-only server port 9090.
+`/metrics` and `/debug`. The history host accepts only signed `GET`/`PUT`
+requests for canonical `termlink-history/accounts/...` ciphertext object keys;
+MinIO admin, bucket enumeration, multipart and delete APIs fail closed at the
+edge, and access logging remains disabled to avoid recording SigV4 query
+credentials. Metrics listen on the internal-only server port 9090.
 The observability layer adds Prometheus, Blackbox readiness probing,
 Alertmanager, and a provisioned Grafana dashboard; Grafana and Alertmanager
 bind to loopback by default, while Prometheus has no host port.

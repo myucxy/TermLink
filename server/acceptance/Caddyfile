@@ -2,6 +2,18 @@
 	admin off
 	https_port 9443
 	auto_https disable_redirects
+	log default {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request delete
+				url delete
+				uri delete
+				query delete
+			}
+		}
+	}
 }
 
 http://127.0.0.1:9080 {
@@ -28,4 +40,49 @@ https://id.127.0.0.1.sslip.io:9443 {
 		-Server
 	}
 	reverse_proxy keycloak:8080
+}
+
+# Presigned history data is deliberately isolated to this host and path. The
+# server signs URLs against the /termlink-history bucket prefix; Caddy only
+# forwards the two object methods when the SigV4 query carries the algorithm,
+# credential, expiry, signed-header set, and signature fields. MinIO remains
+# the authority for cryptographic verification and object authorization.
+https://history.127.0.0.1.sslip.io:9443 {
+	tls internal
+	request_body {
+		max_size 67108864
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	@historyObject {
+		method GET PUT
+		path_regexp history_object_path ^/termlink-history/accounts/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/sessions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/(chunk|snapshot)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]bin$
+		query X-Amz-Algorithm=AWS4-HMAC-SHA256
+		query X-Amz-Credential=*
+		query X-Amz-Date=*
+		query X-Amz-Expires=*
+		query X-Amz-SignedHeaders=*
+		query X-Amz-Signature=*
+	}
+	@historyObjectTooLarge {
+		method PUT
+		path_regexp oversized_history_object_path ^/termlink-history/accounts/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/sessions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/(chunk|snapshot)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]bin$
+		expression `{http.request.header.Content-Length} != '' && int({http.request.header.Content-Length}) > 67108864`
+	}
+	handle @historyObjectTooLarge {
+		respond 413
+	}
+	handle @historyObject {
+		header Cache-Control "private, no-store"
+		reverse_proxy minio:9000
+	}
+
+	# Never expose MinIO's console/admin API, other buckets, unsigned requests,
+	# or mutating methods. Keep the response deliberately generic.
+	respond 404
 }

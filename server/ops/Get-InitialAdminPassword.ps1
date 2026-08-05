@@ -8,12 +8,14 @@ Import-Module (Join-Path $PSScriptRoot 'ProductionAcceptance.Common.psm1') -Forc
 function New-RandomText {
     param([ValidateRange(16, 128)][int]$ByteCount)
     $bytes = [byte[]]::new($ByteCount)
-    [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
     try {
+        $rng.GetBytes($bytes)
         return [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
     }
     finally {
-        [Security.Cryptography.CryptographicOperations]::ZeroMemory($bytes)
+        $rng.Dispose()
+        [Array]::Clear($bytes, 0, $bytes.Length)
     }
 }
 

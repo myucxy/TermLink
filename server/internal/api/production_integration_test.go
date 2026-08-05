@@ -36,10 +36,35 @@ import (
 	"github.com/termlink/termlink/server/internal/store"
 )
 
-type integrationVerifier struct{ identity auth.Identity }
+type integrationVerifier struct{ identities map[string]auth.Identity }
 
-func (v integrationVerifier) Verify(context.Context, string) (auth.Identity, error) {
-	return v.identity, nil
+func (v integrationVerifier) Verify(_ context.Context, token string) (auth.Identity, error) {
+	identity, ok := v.identities[token]
+	if !ok {
+		return auth.Identity{}, errors.New("unknown integration token")
+	}
+	return identity, nil
+}
+
+type integrationRouteObserver struct {
+	events      chan string
+	connections chan string
+}
+
+func (integrationRouteObserver) ConnectionOpened(string) {}
+func (o integrationRouteObserver) ConnectionClosed(role string) {
+	select {
+	case o.connections <- role:
+	default:
+	}
+}
+func (integrationRouteObserver) SubscriptionsChanged(int)  {}
+func (integrationRouteObserver) SlowConsumerDisconnected() {}
+func (o integrationRouteObserver) EnvelopeRouted(direction, messageType, result string, _ int, _ time.Duration) {
+	select {
+	case o.events <- direction + ":" + messageType + ":" + result:
+	default:
+	}
 }
 
 type testDevice struct {
@@ -83,36 +108,69 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := auth.Identity{Issuer: "https://integration.issuer.test", Subject: "subject-" + uuid.NewString()}
-	verifier := integrationVerifier{identity}
+	identity := auth.Identity{
+		Issuer:          "https://integration.issuer.test",
+		Subject:         "subject-" + uuid.NewString(),
+		AuthorizedParty: "termlink-android",
+		TokenID:         "integration-access-token-" + uuid.NewString(),
+	}
+	windowsIdentity := identity
+	windowsIdentity.AuthorizedParty = "termlink-windows"
+	windowsIdentity.TokenID = "integration-windows-access-token-" + uuid.NewString()
+	verifier := integrationVerifier{identities: map[string]auth.Identity{
+		"integration":         identity,
+		"integration-windows": windowsIdentity,
+	}}
 	subjectKey := []byte("01234567890123456789012345678901")
 	authentication := auth.Middleware{Tokens: verifier, Devices: repository, Nonces: valkey, SubjectKey: subjectKey}
-	service := &api.API{Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication, SubjectKey: subjectKey, TokenKey: subjectKey, History: historyStore}
-	hub := realtime.NewHub(repository, valkey, nil)
-	revocationContext, stopRevocations := context.WithCancel(ctx)
-	revocationSubscription := valkey.Client.Subscribe(revocationContext, "device-revoked")
-	if _, err := revocationSubscription.Receive(revocationContext); err != nil {
+	service := &api.API{
+		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication,
+		SubjectKey: subjectKey, TokenKey: subjectKey, History: historyStore,
+		ClientConfig: api.ClientConfiguration{
+			OIDCClientID: "termlink-android", WindowsClientID: "termlink-windows",
+			WindowsRegistrationParties: []string{"termlink-windows"},
+		},
+	}
+	routeEvents := make(chan string, 128)
+	connectionEvents := make(chan string, 16)
+	authorityEvents := make(chan string, 16)
+	hub := realtime.NewHubWithObserver(repository, valkey, nil, integrationRouteObserver{events: routeEvents, connections: connectionEvents})
+	authorityContext, stopAuthorityChanges := context.WithCancel(ctx)
+	authoritySubscription := valkey.Client.Subscribe(authorityContext, "device-revoked", "device-authorization-changed", "account-status-changed")
+	if _, err := authoritySubscription.Receive(authorityContext); err != nil {
 		t.Fatal(err)
 	}
 	go func() {
 		for {
 			select {
-			case <-revocationContext.Done():
+			case <-authorityContext.Done():
 				return
-			case message, ok := <-revocationSubscription.Channel():
+			case message, ok := <-authoritySubscription.Channel():
 				if !ok {
 					return
 				}
-				deviceID, err := uuid.Parse(message.Payload)
-				if err == nil {
-					hub.Revoke(deviceID)
+				id, err := uuid.Parse(message.Payload)
+				if err != nil {
+					continue
+				}
+				switch message.Channel {
+				case "device-revoked":
+					hub.Revoke(id)
+				case "device-authorization-changed":
+					hub.RefreshDevice(id)
+				case "account-status-changed":
+					hub.DisableAccount(id)
+				}
+				select {
+				case authorityEvents <- message.Channel:
+				default:
 				}
 			}
 		}
 	}()
 	defer func() {
-		stopRevocations()
-		_ = revocationSubscription.Close()
+		stopAuthorityChanges()
+		_ = authoritySubscription.Close()
 	}()
 	mux := http.NewServeMux()
 	mux.Handle("/v1/realtime", authentication.Authenticate(hub.Handler()))
@@ -127,8 +185,35 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	if registerResponse["bootstrap"] != false {
 		t.Fatal("Android unexpectedly bootstrapped")
 	}
-	if userID, err := uuid.Parse(fmt.Sprint(registerResponse["user_id"])); err == nil {
-		defer func() { _, _ = repository.Pool.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, userID) }()
+	accountUserID, err := uuid.Parse(fmt.Sprint(registerResponse["user_id"]))
+	if err != nil {
+		t.Fatalf("registered account id=%v", registerResponse["user_id"])
+	}
+	defer func() {
+		_, _ = repository.Pool.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, accountUserID)
+	}()
+	selfTrustedAndroid := newDevice(t)
+	selfTrustRegistration := register(t, server.URL, selfTrustedAndroid, "ANDROID", "Self-trusted Android")
+	if selfTrustRegistration["bootstrap"] != false {
+		t.Fatal("self-trust Android unexpectedly bootstrapped")
+	}
+	selfTrust := signedJSON(t, server.URL, selfTrustedAndroid, http.MethodPost, "/v1/devices/self/trust", map[string]any{}, "self-trust-android", http.StatusOK)
+	if selfTrust["status"] != "TRUSTED" || selfTrust["changed"] != true {
+		t.Fatalf("self-trust response=%v", selfTrust)
+	}
+	repeatedSelfTrust := signedJSON(t, server.URL, selfTrustedAndroid, http.MethodPost, "/v1/devices/self/trust", map[string]any{}, "self-trust-android-repeat", http.StatusOK)
+	if repeatedSelfTrust["changed"] != false {
+		t.Fatalf("repeated self-trust response=%v", repeatedSelfTrust)
+	}
+	var selfTrustGrants, selfTrustAudits int
+	if err := repository.Pool.QueryRow(ctx, `SELECT count(*) FROM device_grants WHERE device_id=$1`, selfTrustedAndroid.id).Scan(&selfTrustGrants); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE user_id=$1 AND actor_device_id=$2 AND action='device.self_trust'`, accountUserID, selfTrustedAndroid.id).Scan(&selfTrustAudits); err != nil {
+		t.Fatal(err)
+	}
+	if selfTrustGrants != 0 || selfTrustAudits != 1 {
+		t.Fatalf("self-trust grants/audits=%d/%d, want 0/1", selfTrustGrants, selfTrustAudits)
 	}
 	pcID := uuid.New()
 	sessionID := uuid.New()
@@ -141,6 +226,11 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	signedJSON(t, server.URL, android, http.MethodPost, "/v1/pairing/challenges/"+pairing["challenge_id"].(string)+"/complete", map[string]any{
 		"code": pairing["code"], "challenge_nonce": pairing["challenge_nonce"],
 	}, "complete-pairing", http.StatusOK)
+	grants := signedJSON(t, server.URL, pc, http.MethodGet, "/v1/pcs/"+pcID.String()+"/grants", nil, "", http.StatusOK)
+	if grants["key_epoch"] != float64(1) || len(grants["items"].([]any)) != 1 {
+		t.Fatalf("authorized PC Grant snapshot=%v", grants)
+	}
+	signedJSON(t, server.URL, android, http.MethodGet, "/v1/pcs/"+pcID.String()+"/grants", nil, "", http.StatusForbidden)
 	signedJSON(t, server.URL, pc, http.MethodPut, "/v1/sessions/"+sessionID.String(), map[string]any{"pc_id": pcID, "shell_type": "pwsh", "title_cipher": "", "state": "RUNNING", "columns": 100, "rows": 30, "last_output_seq": 0}, "upsert-session", http.StatusOK)
 	signedJSON(t, server.URL, pc, http.MethodPut, "/v1/sessions/"+historySessionID.String(), map[string]any{"pc_id": pcID, "shell_type": "pwsh", "title_cipher": "", "state": "RUNNING", "columns": 100, "rows": 30, "last_output_seq": 0}, "upsert-history-session", http.StatusOK)
 	testHistoryUpload(t, server.URL, pc, historySessionID, s3Endpoint, s3Region, s3AccessKey, s3SecretKey)
@@ -149,6 +239,23 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	if leaseOne["lease_id"] != leaseTwo["lease_id"] {
 		t.Fatal("idempotent lease response changed")
 	}
+	// CONTROL is not device-management authority. A controller must not be
+	// able to promote its own Grant or revoke the owning PC.
+	signedJSON(t, server.URL, android, http.MethodPost, "/v1/pcs/"+pcID.String()+"/grants", map[string]any{
+		"device_id": android.id, "permission": "MANAGE",
+	}, "controller-self-promotion", http.StatusForbidden)
+	signedJSON(t, server.URL, android, http.MethodPost, "/v1/devices/"+pc.id.String()+"/revoke", map[string]any{}, "controller-revoke-owner", http.StatusForbidden)
+
+	// Lease renewal must re-check the current Grant and release a stale lease
+	// after a downgrade, rather than letting it block another controller.
+	signedJSON(t, server.URL, pc, http.MethodPost, "/v1/pcs/"+pcID.String()+"/grants", map[string]any{
+		"device_id": android.id, "permission": "VIEW",
+	}, "downgrade-before-renew", http.StatusOK)
+	signedJSON(t, server.URL, android, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/lease/"+fmt.Sprint(leaseOne["lease_id"])+"/renew", map[string]any{}, "renew-after-downgrade", http.StatusForbidden)
+	signedJSON(t, server.URL, pc, http.MethodPost, "/v1/pcs/"+pcID.String()+"/grants", map[string]any{
+		"device_id": android.id, "permission": "CONTROL",
+	}, "restore-control", http.StatusOK)
+	signedJSON(t, server.URL, android, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/lease", map[string]any{}, "lease-after-restore", http.StatusCreated)
 	pcSocket := dialRealtime(t, server.URL, pc, "pc")
 	defer pcSocket.Close()
 	androidSocket := dialRealtime(t, server.URL, android, "android")
@@ -162,8 +269,127 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	if !bytes.Equal(received, output) {
 		t.Fatal("Relay changed opaque production frame")
 	}
-	signedJSON(t, server.URL, pc, http.MethodPost, "/v1/devices/"+android.id.String()+"/revoke", map[string]any{}, "revoke-device", http.StatusOK)
+
+	// UNSUBSCRIBE is forwarded for Agent cleanup, but a late PC output for the
+	// removed subscriber is an idempotent drop and must not close the PC socket.
+	unsubscribe := testEnvelope(android, pc, sessionID, realtimewire.Unsubscribe, realtimewire.AndroidToPC, 2)
+	writeEnvelope(t, androidSocket, unsubscribe)
+	readEnvelope(t, pcSocket)
+	drainRouteEvents(routeEvents)
+	writeEnvelope(t, pcSocket, testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 2))
+	waitRouteEvent(t, routeEvents, "pc_to_android", realtimewire.OutputChunk)
+	resubscribe := testEnvelope(android, pc, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 3)
+	writeEnvelope(t, androidSocket, resubscribe)
+	readEnvelope(t, pcSocket)
+	resumedOutput := testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 3)
+	writeEnvelope(t, pcSocket, resumedOutput)
+	if got := readEnvelope(t, androidSocket); !bytes.Equal(got, resumedOutput) {
+		t.Fatal("PC connection did not survive stale post-unsubscribe output")
+	}
+
+	// A finite Grant carries its authoritative expiry into the subscription
+	// cache. Expiry therefore invalidates the subscription before the next
+	// ciphertext without a PostgreSQL query on every terminal-output frame.
+	// Direct database edits are used only to arrange the fixture before the
+	// subscription; production Grant changes go through the API and publish an
+	// immediate invalidation event.
+	expiryUnsubscribe := testEnvelope(android, pc, sessionID, realtimewire.Unsubscribe, realtimewire.AndroidToPC, 4)
+	writeEnvelope(t, androidSocket, expiryUnsubscribe)
+	readEnvelope(t, pcSocket)
+	if _, err := repository.Pool.Exec(ctx, `UPDATE device_grants SET expires_at=now()+interval '500 milliseconds' WHERE device_id=$1 AND pc_id=$2`, android.id, pcID); err != nil {
+		t.Fatal(err)
+	}
+	expiringSubscribe := testEnvelope(android, pc, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 5)
+	writeEnvelope(t, androidSocket, expiringSubscribe)
+	readEnvelope(t, pcSocket)
+	time.Sleep(750 * time.Millisecond)
+	drainRouteEvents(routeEvents)
+	writeEnvelope(t, pcSocket, testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 4))
+	waitRouteEvent(t, routeEvents, "pc_to_android", realtimewire.OutputChunk)
+	signedJSON(t, server.URL, pc, http.MethodPost, "/v1/pcs/"+pcID.String()+"/grants", map[string]any{
+		"device_id": android.id, "permission": "CONTROL",
+	}, "restore-expired-grant", http.StatusOK)
 	assertWebSocketClosed(t, androidSocket, websocket.ClosePolicyViolation)
+	waitAuthorityEvent(t, authorityEvents, "device-authorization-changed")
+	restoredAndroidSocket := dialRealtime(t, server.URL, android, "android")
+	defer restoredAndroidSocket.Close()
+	restoredSubscribe := testEnvelope(android, pc, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 4)
+	writeEnvelope(t, restoredAndroidSocket, restoredSubscribe)
+	readEnvelope(t, pcSocket)
+	restoredOutput := testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 5)
+	writeEnvelope(t, pcSocket, restoredOutput)
+	if got := readEnvelope(t, restoredAndroidSocket); !bytes.Equal(got, restoredOutput) {
+		t.Fatal("PC connection did not survive expired subscription cleanup")
+	}
+
+	// A physical Android disconnect has no UNSUBSCRIBE frame. Wait until the
+	// Relay removes it, send one late PC output, then reconnect and prove the
+	// original PC WebSocket is still usable.
+	if err := restoredAndroidSocket.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitConnectionClosed(t, connectionEvents, "android")
+	drainRouteEvents(routeEvents)
+	writeEnvelope(t, pcSocket, testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 6))
+	waitRouteEvent(t, routeEvents, "pc_to_android", realtimewire.OutputChunk)
+	reconnectedAndroidSocket := dialRealtime(t, server.URL, android, "android")
+	defer reconnectedAndroidSocket.Close()
+	reconnectSubscribe := testEnvelope(android, pc, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 5)
+	writeEnvelope(t, reconnectedAndroidSocket, reconnectSubscribe)
+	readEnvelope(t, pcSocket)
+	reconnectedOutput := testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 7)
+	writeEnvelope(t, pcSocket, reconnectedOutput)
+	if got := readEnvelope(t, reconnectedAndroidSocket); !bytes.Equal(got, reconnectedOutput) {
+		t.Fatal("PC connection did not survive physical Android disconnect")
+	}
+
+	// Realtime heartbeat, not only the initial REST upsert, owns PC Presence.
+	// Gorilla processes control frames while a reader is active, as production
+	// Agents are; keep a reader running so the client answers the Relay ping.
+	_ = pcSocket.SetReadDeadline(time.Time{})
+	go func() {
+		for {
+			if _, _, err := pcSocket.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+	if _, err := repository.Pool.Exec(ctx, `UPDATE pcs SET last_seen_at=now()-interval '5 minutes' WHERE id=$1`, pcID); err != nil {
+		t.Fatal(err)
+	}
+	presenceDeadline := time.Now().Add(20 * time.Second)
+	for {
+		var pcLastSeen, deviceLastSeen time.Time
+		if err := repository.Pool.QueryRow(ctx, `SELECT p.last_seen_at,d.last_seen_at FROM pcs p JOIN devices d ON d.id=p.device_id WHERE p.id=$1`, pcID).Scan(&pcLastSeen, &deviceLastSeen); err != nil {
+			t.Fatal(err)
+		}
+		if pcLastSeen.After(time.Now().Add(-time.Minute)) && deviceLastSeen.After(time.Now().Add(-time.Minute)) {
+			break
+		}
+		if time.Now().After(presenceDeadline) {
+			t.Fatal("PC Presence was not refreshed by the production Realtime heartbeat")
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	signedJSON(t, server.URL, pc, http.MethodDelete, "/v1/pcs/"+pcID.String()+"/grants/"+android.id.String(), nil, "delete-single-grant", http.StatusNoContent)
+	assertWebSocketClosed(t, reconnectedAndroidSocket, websocket.ClosePolicyViolation)
+	waitAuthorityEvent(t, authorityEvents, "device-authorization-changed")
+	deletedGrantSnapshot := signedJSON(t, server.URL, pc, http.MethodGet, "/v1/pcs/"+pcID.String()+"/grants", nil, "", http.StatusOK)
+	if deletedGrantSnapshot["key_epoch"] != float64(2) || len(deletedGrantSnapshot["items"].([]any)) != 0 {
+		t.Fatalf("deleted PC Grant snapshot=%v", deletedGrantSnapshot)
+	}
+	signedJSON(t, server.URL, pc, http.MethodPost, "/v1/pcs/"+pcID.String()+"/grants", map[string]any{
+		"device_id": android.id, "permission": "CONTROL",
+	}, "restore-after-single-grant-delete", http.StatusOK)
+	waitAuthorityEvent(t, authorityEvents, "device-authorization-changed")
+	finalAndroidSocket := dialRealtime(t, server.URL, android, "android")
+	defer finalAndroidSocket.Close()
+	signedJSON(t, server.URL, pc, http.MethodPost, "/v1/devices/"+android.id.String()+"/revoke", map[string]any{}, "revoke-device", http.StatusOK)
+	assertWebSocketClosed(t, finalAndroidSocket, websocket.ClosePolicyViolation)
+	rotatedGrants := signedJSON(t, server.URL, pc, http.MethodGet, "/v1/pcs/"+pcID.String()+"/grants", nil, "", http.StatusOK)
+	if rotatedGrants["key_epoch"] != float64(3) || len(rotatedGrants["items"].([]any)) != 0 {
+		t.Fatalf("revoked PC Grant snapshot=%v", rotatedGrants)
+	}
 	request := newSignedRequest(t, server.URL, android, http.MethodGet, "/v1/devices", nil, "")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
@@ -173,11 +399,19 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	if response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("revoked device status=%d", response.StatusCode)
 	}
+	if _, err := repository.Pool.Exec(ctx, `UPDATE users SET status='LOCKED' WHERE id=$1`, accountUserID); err != nil {
+		t.Fatal(err)
+	}
+	if err := valkey.Client.Publish(ctx, "account-status-changed", accountUserID.String()).Err(); err != nil {
+		t.Fatal(err)
+	}
+	waitAuthorityEvent(t, authorityEvents, "account-status-changed")
+	waitConnectionClosed(t, connectionEvents, "pc")
 }
 
 func assertProductionMigrations(t *testing.T, repository *store.Postgres) {
 	t.Helper()
-	rows, err := repository.Pool.Query(context.Background(), `SELECT version,name FROM schema_migrations WHERE version BETWEEN 1 AND 6 ORDER BY version`)
+	rows, err := repository.Pool.Query(context.Background(), `SELECT version,name FROM schema_migrations WHERE version BETWEEN 1 AND 8 ORDER BY version`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,6 +426,8 @@ func assertProductionMigrations(t *testing.T, repository *store.Postgres) {
 		{4, "000004_pc_key_epoch.up.sql"},
 		{5, "000005_billing_entitlements.up.sql"},
 		{6, "000006_account_roles.up.sql"},
+		{7, "000007_android_self_trust.up.sql"},
+		{8, "000008_windows_bootstrap_fence.up.sql"},
 	}
 	index := 0
 	for rows.Next() {
@@ -272,17 +508,16 @@ func testHistoryUpload(t *testing.T, root string, pc testDevice, sessionID uuid.
 	signedJSON(t, root, pc, http.MethodDelete, "/v1/sessions/"+sessionID.String(), nil, "delete-history-session", http.StatusNoContent)
 	request, err := http.NewRequest(http.MethodGet, download.URL, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("deleted history presigned URL was invalid")
 	}
 	applyPresignedHeaders(request, download.Headers)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("deleted history request transport failure (%T)", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusNotFound {
-		body, _ := io.ReadAll(response.Body)
-		t.Fatalf("deleted history status=%d body=%s", response.StatusCode, body)
+		t.Fatalf("deleted history status=%d s3_code=%s", response.StatusCode, integrationS3Code(response.Body))
 	}
 }
 
@@ -297,7 +532,7 @@ func decodePresigned(t *testing.T, value any) integrationPresignedRequest {
 		t.Fatal(err)
 	}
 	if request.URL == "" || request.Method == "" {
-		t.Fatalf("invalid presigned request=%s", data)
+		t.Fatal("invalid presigned request shape")
 	}
 	return request
 }
@@ -306,18 +541,17 @@ func putPresigned(t *testing.T, presigned integrationPresignedRequest, body []by
 	t.Helper()
 	request, err := http.NewRequest(presigned.Method, presigned.URL, bytes.NewReader(body))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("upload presigned request was invalid")
 	}
 	request.ContentLength = int64(len(body))
 	applyPresignedHeaders(request, presigned.Headers)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("presigned upload transport failure (%T)", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		failure, _ := io.ReadAll(response.Body)
-		t.Fatalf("presigned upload status=%d body=%s", response.StatusCode, failure)
+		t.Fatalf("presigned upload status=%d s3_code=%s", response.StatusCode, integrationS3Code(response.Body))
 	}
 }
 
@@ -325,17 +559,16 @@ func getPresigned(t *testing.T, presigned integrationPresignedRequest) []byte {
 	t.Helper()
 	request, err := http.NewRequest(presigned.Method, presigned.URL, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("download presigned request was invalid")
 	}
 	applyPresignedHeaders(request, presigned.Headers)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("presigned download transport failure (%T)", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		failure, _ := io.ReadAll(response.Body)
-		t.Fatalf("presigned download status=%d body=%s", response.StatusCode, failure)
+		t.Fatalf("presigned download status=%d s3_code=%s", response.StatusCode, integrationS3Code(response.Body))
 	}
 	data, err := io.ReadAll(response.Body)
 	if err != nil {
@@ -353,6 +586,29 @@ func applyPresignedHeaders(request *http.Request, headers map[string][]string) {
 			request.Header.Add(name, value)
 		}
 	}
+}
+
+// integrationS3Code keeps failure output useful without ever printing a
+// presigned URL, SigV4 query credential, request ID, host ID, or response body.
+func integrationS3Code(body io.Reader) string {
+	value, err := io.ReadAll(io.LimitReader(body, 1<<16))
+	if err != nil {
+		return "unavailable"
+	}
+	start := bytes.Index(value, []byte("<Code>"))
+	if start < 0 {
+		return "unavailable"
+	}
+	start += len("<Code>")
+	end := bytes.Index(value[start:], []byte("</Code>"))
+	if end < 0 || end > 128 {
+		return "unavailable"
+	}
+	code := strings.TrimSpace(string(value[start : start+end]))
+	if code == "" || strings.ContainsAny(code, "\r\n<>?&= ") {
+		return "unavailable"
+	}
+	return code
 }
 
 func overwriteS3Object(t *testing.T, endpoint, region, accessKey, secretKey, rawURL string, body []byte) {
@@ -378,11 +634,11 @@ func objectLocation(t *testing.T, rawURL string) (string, string) {
 	t.Helper()
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("presigned object URL was invalid")
 	}
 	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
 	if len(parts) < 2 {
-		t.Fatalf("presigned path=%q", parsed.Path)
+		t.Fatal("presigned object path was invalid")
 	}
 	key, err := url.PathUnescape(strings.Join(parts[1:], "/"))
 	if err != nil {
@@ -404,6 +660,65 @@ func assertWebSocketClosed(t *testing.T, socket *websocket.Conn, wantCode int) {
 	}
 	if closeErr.Code != wantCode {
 		t.Fatalf("revoked WebSocket close code=%d, want %d", closeErr.Code, wantCode)
+	}
+}
+
+func drainRouteEvents(events <-chan string) {
+	for {
+		select {
+		case <-events:
+		default:
+			return
+		}
+	}
+}
+
+func waitAuthorityEvent(t *testing.T, events <-chan string, expected string) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case event := <-events:
+			if event == expected {
+				return
+			}
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for authority event %q", expected)
+		}
+	}
+}
+
+func waitRouteEvent(t *testing.T, events <-chan string, direction string, messageType realtimewire.MessageType) {
+	t.Helper()
+	want := direction + ":" + strconv.FormatUint(uint64(messageType), 10) + ":"
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case event := <-events:
+			if strings.HasPrefix(event, want) {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("production route event %q was not observed", want)
+		}
+	}
+}
+
+func waitConnectionClosed(t *testing.T, events <-chan string, role string) {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case got := <-events:
+			if got == role {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("%s Realtime connection did not close", role)
+		}
 	}
 }
 
@@ -438,7 +753,11 @@ func register(t *testing.T, root string, device testDevice, deviceType, name str
 	body := map[string]any{"id": device.id, "type": deviceType, "name": name, "signing_public_key": signing, "exchange_public_key": exchange, "key_id": keyID, "timestamp_ms": timestamp, "nonce": nonce, "signature": base64.RawURLEncoding.EncodeToString(ed25519.Sign(device.private, []byte(canonical)))}
 	data, _ := json.Marshal(body)
 	request, _ := http.NewRequest(http.MethodPost, root+"/v1/devices/register", bytes.NewReader(data))
-	request.Header.Set("Authorization", "Bearer integration")
+	token := "integration"
+	if deviceType == "WINDOWS_PC" {
+		token = "integration-windows"
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
 	request.Header.Set("Content-Type", "application/json")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {

@@ -35,8 +35,10 @@ var (
 )
 
 type Identity struct {
-	Issuer  string
-	Subject string
+	Issuer          string
+	Subject         string
+	AuthorizedParty string
+	TokenID         string
 }
 
 type TokenVerifier interface {
@@ -44,16 +46,32 @@ type TokenVerifier interface {
 }
 
 type OIDCVerifier struct {
-	issuer   string
-	verifier *oidc.IDTokenVerifier
+	issuer         string
+	verifier       *oidc.IDTokenVerifier
+	allowedParties map[string]struct{}
 }
 
-func NewOIDCVerifier(ctx context.Context, issuer, clientID string) (*OIDCVerifier, error) {
+func NewOIDCVerifier(ctx context.Context, issuer, clientID string, allowedParties []string) (*OIDCVerifier, error) {
 	provider, err := oidc.NewProvider(ctx, issuer)
 	if err != nil {
 		return nil, fmt.Errorf("discover OIDC issuer: %w", err)
 	}
-	return &OIDCVerifier{issuer: issuer, verifier: provider.Verifier(&oidc.Config{ClientID: clientID})}, nil
+	parties := make(map[string]struct{}, len(allowedParties))
+	for _, party := range allowedParties {
+		party = strings.TrimSpace(party)
+		if party == "" {
+			return nil, errors.New("OIDC allowed party is empty")
+		}
+		parties[party] = struct{}{}
+	}
+	if len(parties) == 0 {
+		return nil, errors.New("OIDC allowed parties are required")
+	}
+	return &OIDCVerifier{
+		issuer:         issuer,
+		verifier:       provider.Verifier(&oidc.Config{ClientID: clientID}),
+		allowedParties: parties,
+	}, nil
 }
 
 func (v *OIDCVerifier) Verify(ctx context.Context, raw string) (Identity, error) {
@@ -62,12 +80,29 @@ func (v *OIDCVerifier) Verify(ctx context.Context, raw string) (Identity, error)
 		return Identity{}, fmt.Errorf("%w: invalid OIDC token", ErrUnauthenticated)
 	}
 	var claims struct {
-		Subject string `json:"sub"`
+		Subject         string `json:"sub"`
+		AuthorizedParty string `json:"azp"`
+		TokenType       string `json:"typ"`
+		TokenID         string `json:"jti"`
 	}
 	if err := token.Claims(&claims); err != nil || strings.TrimSpace(claims.Subject) == "" {
 		return Identity{}, fmt.Errorf("%w: missing subject", ErrUnauthenticated)
 	}
-	return Identity{Issuer: v.issuer, Subject: claims.Subject}, nil
+	if claims.TokenType != "Bearer" {
+		return Identity{}, fmt.Errorf("%w: token is not an access token", ErrUnauthenticated)
+	}
+	if _, allowed := v.allowedParties[claims.AuthorizedParty]; !allowed {
+		return Identity{}, fmt.Errorf("%w: unauthorized OIDC party", ErrUnauthenticated)
+	}
+	if strings.TrimSpace(claims.TokenID) == "" {
+		return Identity{}, fmt.Errorf("%w: missing token identifier", ErrUnauthenticated)
+	}
+	return Identity{
+		Issuer:          v.issuer,
+		Subject:         claims.Subject,
+		AuthorizedParty: claims.AuthorizedParty,
+		TokenID:         claims.TokenID,
+	}, nil
 }
 
 // SubjectHash prevents raw OIDC subjects from being stored in PostgreSQL.

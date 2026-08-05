@@ -456,7 +456,7 @@ ghcr.io/termlink/termlink-server:<semver>
 | --- | --- | --- |
 | `core` | TermLink Server、PostgreSQL、Redis/Valkey | 最小自托管 |
 | `edge` | Core + Caddy | 无现有反向代理的公网部署 |
-| `history` | Core + MinIO | 本地保存 E2EE 历史 |
+| `history` | Core + MinIO + 独立 internal `object` 网络 | 本地保存 E2EE 历史；客户端预签名 GET/PUT 经 TLS Edge 进入 MinIO，Edge 不加入数据库 `backend`，且只放行规范密文对象路径 |
 | `observability` | Prometheus、Grafana、Loki/OTel Collector | 运维诊断，可选 |
 
 生产部署必须固定镜像版本和 Digest，不使用 `latest`。数据库、对象存储使用 Named Volume 或宿主机受管目录，应用容器本身保持无状态。

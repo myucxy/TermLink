@@ -4,10 +4,11 @@
 }
 
 .admin-shell {
-  width: 100%;
+  width: min(calc(100% - 40px), var(--content));
   min-height: 100vh;
   display: grid;
-  grid-template-columns: 256px minmax(0, 1fr);
+  grid-template-columns: 236px minmax(0, 1fr);
+  margin-inline: auto;
 }
 
 .admin-sidebar {
@@ -64,7 +65,7 @@
 .admin-nav a {
   min-height: 42px;
   display: grid;
-  grid-template-columns: 26px 1fr auto;
+  grid-template-columns: 22px 1fr auto;
   align-items: center;
   gap: 8px;
   padding: 8px 10px;
@@ -75,9 +76,15 @@
   font-weight: 650;
 }
 
-.admin-nav a > span {
+.admin-nav a > svg {
+  width: 16px;
+  height: 16px;
   color: var(--text-3);
-  font: 650 10px/1 "Cascadia Mono", Consolas, monospace;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
 }
 
 .admin-nav a > em {
@@ -94,11 +101,12 @@
 
 .admin-nav a[aria-current="page"] {
   color: var(--text);
-  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
-  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  border-color: transparent;
+  background: var(--surface-raised);
+  box-shadow: inset 2px 0 var(--accent);
 }
 
-.admin-nav a[aria-current="page"] > span {
+.admin-nav a[aria-current="page"] > svg {
   color: var(--accent);
 }
 
@@ -110,6 +118,12 @@
   margin-top: auto;
   padding: 14px 8px 2px;
   border-top: 1px solid var(--line-soft);
+}
+
+.admin-user:hover,
+.admin-user:focus-visible {
+  color: var(--text);
+  background: var(--button-quiet-hover);
 }
 
 .admin-user > span:last-child {
@@ -138,14 +152,14 @@
 }
 
 .admin-main {
-  width: min(100%, 1420px);
+  width: 100%;
   min-width: 0;
   margin: 0 auto;
   padding: 0 34px 28px;
 }
 
 .admin-topbar {
-  min-height: 92px;
+  min-height: 84px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -212,7 +226,7 @@
   box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 13%, transparent);
 }
 
-.theme-button {
+.admin-theme-toggle {
   min-height: 40px;
   display: inline-flex;
   align-items: center;
@@ -225,7 +239,7 @@
   cursor: pointer;
 }
 
-.theme-button:hover {
+.admin-theme-toggle:hover {
   color: var(--text);
   border-color: var(--accent);
 }
@@ -684,6 +698,7 @@
 
 @media (max-width: 760px) {
   .admin-shell {
+    width: 100%;
     display: block;
   }
 
@@ -735,9 +750,13 @@
     justify-content: flex-end;
   }
 
-  .healthy-pill,
-  .admin-top-actions .button {
+  .healthy-pill {
     display: none;
+  }
+
+  .admin-account-link {
+    min-height: 40px;
+    padding-inline: 12px;
   }
 }
 
@@ -772,7 +791,7 @@
     display: none;
   }
 
-  .theme-button {
+  .admin-theme-toggle {
     width: 40px;
     justify-content: center;
     padding-inline: 0;

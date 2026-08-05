@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/termlink/termlink/server/internal/lanreplay"
 	"github.com/termlink/termlink/server/internal/migrate"
 	"github.com/termlink/termlink/server/internal/observability"
+	"github.com/termlink/termlink/server/internal/outbox"
 	"github.com/termlink/termlink/server/internal/phase1test"
 	"github.com/termlink/termlink/server/internal/realtime"
 	serverruntime "github.com/termlink/termlink/server/internal/runtime"
@@ -80,7 +82,7 @@ func runProduction() error {
 		return err
 	}
 	defer valkey.Close()
-	verifier, err := auth.NewOIDCVerifier(ctx, cfg.OIDCIssuer, cfg.OIDCClientID)
+	verifier, err := auth.NewOIDCVerifier(ctx, cfg.OIDCIssuer, cfg.OIDCClientID, cfg.OIDCAllowedParties)
 	if err != nil {
 		return err
 	}
@@ -101,8 +103,9 @@ func runProduction() error {
 		SubjectKey: subjectKey, TokenKey: tokenKey, History: optionalHistoryStore(historyStore),
 		ClientConfig: api.ClientConfiguration{
 			OIDCIssuer: cfg.OIDCIssuer, OIDCClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI,
-			WindowsClientID: cfg.WindowsOIDCClientID, WindowsRedirectURI: cfg.WindowsOIDCRedirectURI,
-			WebClientID: cfg.WebOIDCClientID, WebRedirectURI: cfg.WebOIDCRedirectURI,
+			WindowsClientID: cfg.WindowsOIDCClientID, WindowsRegistrationParties: cfg.WindowsRegistrationOIDCParties,
+			WindowsRedirectURI: cfg.WindowsOIDCRedirectURI,
+			WebClientID:        cfg.WebOIDCClientID, WebRedirectURI: cfg.WebOIDCRedirectURI,
 		},
 	}
 	metrics := observability.New(repository.Pool)
@@ -120,6 +123,9 @@ func runProduction() error {
 		CookieKey:   cookieKey,
 		SubjectKey:  subjectKey,
 		Repository:  repository,
+		AccountStatusChanged: func(ctx context.Context, accountID uuid.UUID, status string) error {
+			return valkey.Client.Publish(ctx, "account-status-changed", accountID.String()).Err()
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("initialize web portal: %w", err)
@@ -131,7 +137,16 @@ func runProduction() error {
 	mux.Handle("/v1", productionAPI.Handler())
 	mux.HandleFunc("GET /readyz", readinessHandler(repository, valkey))
 	mux.Handle("/", portal.Handler())
-	go consumeRevocations(ctx, valkey, hub)
+	authorityReady := make(chan struct{})
+	go consumeAuthorityChanges(ctx, valkey, hub, authorityReady)
+	select {
+	case <-authorityReady:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(5 * time.Second):
+		return errors.New("realtime authority subscription did not become ready")
+	}
+	go (outbox.Dispatcher{Store: repository, Valkey: valkey, Logger: slog.Default()}).Run(ctx)
 	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "history_enabled", cfg.HistoryEnabled, "metrics_enabled", cfg.MetricsListenAddr != "")
 	return serveProduction(ctx, serverruntime.New(cfg, metrics.HTTPMiddleware(mux)), metrics, cfg.MetricsListenAddr)
 }
@@ -192,14 +207,62 @@ func readinessHandler(repository *store.Postgres, valkey *kv.Valkey) http.Handle
 	}
 }
 
-func consumeRevocations(ctx context.Context, valkey *kv.Valkey, hub *realtime.Hub) {
-	subscription := valkey.Client.Subscribe(ctx, "device-revoked")
-	defer subscription.Close()
-	for message := range subscription.Channel() {
-		deviceID, err := uuid.Parse(message.Payload)
-		if err == nil {
-			hub.Revoke(deviceID)
+func consumeAuthorityChanges(ctx context.Context, valkey *kv.Valkey, hub *realtime.Hub, ready chan<- struct{}) {
+	var readyOnce sync.Once
+	channels := []string{"device-revoked", "device-authorization-changed", "account-status-changed", "account-entitlement-changed"}
+	for ctx.Err() == nil {
+		subscription := valkey.Client.Subscribe(ctx, channels...)
+		if _, err := subscription.Receive(ctx); err != nil {
+			_ = subscription.Close()
+			if !waitForRetry(ctx, time.Second) {
+				return
+			}
+			continue
 		}
+		readyOnce.Do(func() { close(ready) })
+		messages := subscription.Channel()
+		connected := true
+		for connected {
+			select {
+			case <-ctx.Done():
+				_ = subscription.Close()
+				return
+			case message, ok := <-messages:
+				if !ok {
+					connected = false
+					continue
+				}
+				id, err := uuid.Parse(message.Payload)
+				if err != nil {
+					continue
+				}
+				switch message.Channel {
+				case "device-revoked":
+					hub.Revoke(id)
+				case "device-authorization-changed":
+					hub.RefreshDevice(id)
+				case "account-status-changed":
+					hub.DisableAccount(id)
+				case "account-entitlement-changed":
+					hub.RefreshAccount(id)
+				}
+			}
+		}
+		_ = subscription.Close()
+		if !waitForRetry(ctx, time.Second) {
+			return
+		}
+	}
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

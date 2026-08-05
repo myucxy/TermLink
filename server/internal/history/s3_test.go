@@ -12,15 +12,23 @@ import (
 
 func TestHistoryObjectMetadataIsBounded(t *testing.T) {
 	digest := sha256.Sum256([]byte("ciphertext"))
-	if err := validateObject("accounts/a/sessions/s/chunks/c.bin", 10, digest[:]); err != nil {
+	validKey := "accounts/11111111-1111-4111-8111-111111111111/sessions/22222222-2222-4222-8222-222222222222/chunk/33333333-3333-4333-8333-333333333333.bin"
+	if err := validateObject(validKey, 10, digest[:]); err != nil {
 		t.Fatalf("valid metadata rejected: %v", err)
 	}
-	for _, key := range []string{"sessions/s/c.bin", "accounts/../secret", `accounts/a\\secret`} {
+	for _, key := range []string{
+		"sessions/s/c.bin",
+		"accounts/../secret",
+		`accounts/a\\secret`,
+		"accounts/11111111-1111-4111-8111-111111111111/sessions/22222222-2222-4222-8222-222222222222/chunks/33333333-3333-4333-8333-333333333333.bin",
+		"accounts/11111111-1111-4111-8111-111111111111/sessions/22222222-2222-4222-8222-222222222222/chunk/not-a-uuid.bin",
+		"accounts/11111111-1111-4111-8111-111111111111/sessions/22222222-2222-4222-8222-222222222222/chunk/33333333-3333-4333-8333-333333333333.bin/extra",
+	} {
 		if err := validateObject(key, 10, digest[:]); err == nil {
 			t.Fatalf("unsafe object key accepted: %q", key)
 		}
 	}
-	if err := validateObject("accounts/a/c.bin", MaxObjectBytes+1, digest[:]); err == nil {
+	if err := validateObject(validKey, MaxObjectBytes+1, digest[:]); err == nil {
 		t.Fatal("oversized object accepted")
 	}
 }
@@ -41,7 +49,7 @@ func TestOpenUsesPublicEndpointOnlyForPresignedRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
-	presigned, err := store.PresignGet(context.Background(), "accounts/a/sessions/s/chunks/c.bin", time.Minute)
+	presigned, err := store.PresignGet(context.Background(), "accounts/11111111-1111-4111-8111-111111111111/sessions/22222222-2222-4222-8222-222222222222/chunk/33333333-3333-4333-8333-333333333333.bin", time.Minute)
 	if err != nil {
 		t.Fatalf("PresignGet() error = %v", err)
 	}
@@ -65,7 +73,7 @@ func TestOpenDefaultsEmptyPublicEndpointToInternal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
-	presigned, err := store.PresignGet(context.Background(), "accounts/a/sessions/s/chunks/c.bin", time.Minute)
+	presigned, err := store.PresignGet(context.Background(), "accounts/11111111-1111-4111-8111-111111111111/sessions/22222222-2222-4222-8222-222222222222/chunk/33333333-3333-4333-8333-333333333333.bin", time.Minute)
 	if err != nil {
 		t.Fatalf("PresignGet() error = %v", err)
 	}

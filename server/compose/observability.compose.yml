@@ -13,7 +13,7 @@ services:
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=${TERMLINK_PROMETHEUS_RETENTION:-15d}
     networks:
-      - private
+      - frontend
     volumes:
       - prometheus-data:/prometheus
       - ../observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -45,7 +45,7 @@ services:
     command:
       - --config.file=/etc/blackbox/blackbox.yml
     networks:
-      - private
+      - frontend
     volumes:
       - ../observability/blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
     read_only: true
@@ -70,7 +70,7 @@ services:
     ports:
       - "${TERMLINK_ALERTMANAGER_BIND_IP:-127.0.0.1}:${TERMLINK_ALERTMANAGER_PORT:-9093}:9093"
     networks:
-      - private
+      - frontend
       - egress
     volumes:
       - alertmanager-data:/alertmanager
@@ -110,7 +110,7 @@ services:
         gid: "472"
         mode: 0400
     networks:
-      - private
+      - frontend
     volumes:
       - grafana-data:/var/lib/grafana
       - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro

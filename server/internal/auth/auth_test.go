@@ -45,7 +45,7 @@ func TestDeviceProofAuthenticatesAndRejectsReplay(t *testing.T) {
 	device := Device{ID: uuid.New(), UserID: uuid.New(), SigningPublicKey: publicKey, TrustState: "TRUSTED"}
 	nonces := &memoryNonces{seen: map[string]bool{}}
 	middleware := Middleware{
-		Tokens: fixedVerifier{Identity{"https://issuer.test", "subject"}}, Devices: fixedDevices{device},
+		Tokens: fixedVerifier{Identity{Issuer: "https://issuer.test", Subject: "subject"}}, Devices: fixedDevices{device},
 		Nonces: nonces, SubjectKey: make([]byte, 32), Clock: func() time.Time { return now },
 	}
 	req := httptest.NewRequest(http.MethodPost, "https://server.test/v1/test?b=2", nil)

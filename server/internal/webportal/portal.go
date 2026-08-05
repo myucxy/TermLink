@@ -43,14 +43,15 @@ var portalAssets embed.FS
 
 // Config contains only the public OIDC metadata and the server-held cookie key.
 type Config struct {
-	PublicURL   string
-	Issuer      string
-	ClientID    string
-	RedirectURI string
-	CookieKey   []byte
-	SubjectKey  []byte
-	Repository  portalRepository
-	Clock       func() time.Time
+	PublicURL            string
+	Issuer               string
+	ClientID             string
+	RedirectURI          string
+	CookieKey            []byte
+	SubjectKey           []byte
+	Repository           portalRepository
+	AccountStatusChanged func(context.Context, uuid.UUID, string) error
+	Clock                func() time.Time
 }
 
 type accountIdentity struct {
@@ -62,7 +63,8 @@ type accountIdentity struct {
 }
 
 type portalRepository interface {
-	SyncPortalIdentity(context.Context, [32]byte, store.Role) (store.PortalAccount, error)
+	SyncPortalIdentity(context.Context, [32]byte, store.Role, string) (store.PortalAccount, error)
+	RecordPortalLoginFailure(context.Context, string, string) error
 	GetPortalAccount(context.Context, [32]byte) (store.PortalAccount, error)
 	PortalAdminDashboard(context.Context, uuid.UUID) (store.PortalAdminDashboard, error)
 	UpdatePortalAccountRole(context.Context, uuid.UUID, uuid.UUID, store.Role, string) error
@@ -110,6 +112,7 @@ type Portal struct {
 	templates    *template.Template
 	styles       []byte
 	adminStyles  []byte
+	themeInit    []byte
 	themeScript  []byte
 	appIcon      []byte
 	favicon      []byte
@@ -184,6 +187,11 @@ func New(ctx context.Context, config Config) (*Portal, error) {
 	if err := provider.Claims(&discovery); err != nil {
 		return nil, fmt.Errorf("decode web OIDC discovery: %w", err)
 	}
+	accountURL := strings.TrimRight(config.Issuer, "/") + "/account/"
+	accountQuery := url.Values{}
+	accountQuery.Set("referrer", config.ClientID)
+	accountQuery.Set("referrer_uri", strings.TrimRight(config.PublicURL, "/")+"/account")
+	accountURL += "?" + accountQuery.Encode()
 	flow := &productionOIDCFlow{
 		oauthConfig: oauth2.Config{
 			ClientID:    config.ClientID,
@@ -195,7 +203,7 @@ func New(ctx context.Context, config Config) (*Portal, error) {
 		issuer:             strings.TrimRight(config.Issuer, "/"),
 		clientID:           config.ClientID,
 		publicURL:          strings.TrimRight(config.PublicURL, "/"),
-		accountURL:         strings.TrimRight(config.Issuer, "/") + "/account/",
+		accountURL:         accountURL,
 		endSessionEndpoint: discovery.EndSessionEndpoint,
 	}
 	return newPortal(config, publicOrigin, flow)
@@ -219,6 +227,10 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 	adminStyles, err := portalAssets.ReadFile("assets/admin.css")
 	if err != nil {
 		return nil, fmt.Errorf("read web portal admin styles: %w", err)
+	}
+	themeInit, err := portalAssets.ReadFile("assets/theme-init.js")
+	if err != nil {
+		return nil, fmt.Errorf("read web portal pre-paint theme script: %w", err)
 	}
 	themeScript, err := portalAssets.ReadFile("assets/theme.js")
 	if err != nil {
@@ -252,6 +264,7 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 		templates:    parsed,
 		styles:       styles,
 		adminStyles:  adminStyles,
+		themeInit:    themeInit,
 		themeScript:  themeScript,
 		appIcon:      appIcon,
 		favicon:      favicon,
@@ -353,6 +366,7 @@ func (p *Portal) Handler() http.Handler {
 	mux.HandleFunc("GET /{$}", p.home)
 	mux.HandleFunc("GET /assets/site.css", p.siteCSS)
 	mux.HandleFunc("GET /assets/admin.css", p.adminCSS)
+	mux.HandleFunc("GET /assets/theme-init.js", p.themeInitJS)
 	mux.HandleFunc("GET /assets/theme.js", p.themeJS)
 	mux.HandleFunc("GET /assets/termlink-app-icon.svg", p.svgAsset(p.appIcon))
 	mux.HandleFunc("GET /assets/termlink-favicon.svg", p.svgAsset(p.favicon))
@@ -391,6 +405,10 @@ func (p *Portal) adminCSS(w http.ResponseWriter, _ *http.Request) {
 
 func (p *Portal) themeJS(w http.ResponseWriter, _ *http.Request) {
 	p.staticAsset(w, "text/javascript; charset=utf-8", p.themeScript)
+}
+
+func (p *Portal) themeInitJS(w http.ResponseWriter, _ *http.Request) {
+	p.staticAsset(w, "text/javascript; charset=utf-8", p.themeInit)
 }
 
 func (p *Portal) staticAsset(w http.ResponseWriter, contentType string, contents []byte) {
@@ -453,6 +471,7 @@ func (p *Portal) login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
+	loginTraceID := uuid.NewString()
 	p.clearCookie(w, oauthCookieName)
 	if !p.usesPublicHost(r) {
 		p.renderError(w, http.StatusBadRequest, "授权地址不匹配", "请从 TermLink 公开 HTTPS 首页重新登录。")
@@ -473,11 +492,13 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 	}
 	code := r.URL.Query().Get("code")
 	if code == "" || r.URL.Query().Get("error") != "" {
+		_ = p.config.Repository.RecordPortalLoginFailure(r.Context(), loginTraceID, "authorization_incomplete")
 		p.renderError(w, http.StatusBadRequest, "登录未完成", "身份服务没有返回有效授权，请返回首页重试。")
 		return
 	}
 	identity, err := p.flow.ExchangeAndVerify(r.Context(), code, pending.Verifier, pending.Nonce)
 	if err != nil {
+		_ = p.config.Repository.RecordPortalLoginFailure(r.Context(), loginTraceID, "token_verification_failed")
 		slog.Warn("web OIDC callback rejected", "error", err)
 		p.renderError(w, http.StatusUnauthorized, "登录校验失败", "身份令牌未通过校验，请返回首页重新登录。")
 		return
@@ -492,6 +513,7 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 		r.Context(),
 		auth.SubjectHash(p.config.SubjectKey, auth.Identity{Issuer: p.config.Issuer, Subject: identity.Subject}),
 		assertedRole(identity.Roles),
+		loginTraceID,
 	)
 	if err != nil {
 		slog.Warn("web OIDC account authorization rejected", "error", err)
@@ -513,10 +535,8 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.setCookie(w, sessionCookieName, sessionCookie, p.now().Add(webSessionTTL))
-	returnTo := "/account"
-	if account.Role.CanOpenConsole() {
-		returnTo = "/admin"
-	} else if pending.ReturnTo == "/admin" {
+	returnTo := pending.ReturnTo
+	if returnTo != "/admin" || !account.Role.CanOpenConsole() {
 		returnTo = "/account"
 	}
 	http.Redirect(w, r, returnTo, http.StatusSeeOther)
@@ -530,7 +550,7 @@ func (p *Portal) account(w http.ResponseWriter, r *http.Request) {
 	session, err := p.readSession(r)
 	if err != nil {
 		p.clearCookie(w, sessionCookieName)
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		http.Redirect(w, r, "/login?return_to=/account", http.StatusSeeOther)
 		return
 	}
 	portalAccount, err := p.currentAccount(r.Context(), session)
@@ -630,6 +650,14 @@ func (p *Portal) adminUpdateStatus(w http.ResponseWriter, r *http.Request) {
 	if err := p.config.Repository.UpdatePortalAccountStatus(r.Context(), account.ID, targetID, status, traceID); err != nil {
 		p.handleAdminMutationError(w, err)
 		return
+	}
+	if status != "ACTIVE" && p.config.AccountStatusChanged != nil {
+		if err := p.config.AccountStatusChanged(r.Context(), targetID, status); err != nil {
+			// The database mutation is already committed. Periodic Realtime
+			// authority checks still fail closed; retain the successful response
+			// and surface only a content-free operational warning.
+			slog.Warn("publish account status change", "error", err)
+		}
 	}
 	http.Redirect(w, r, "/admin?section=accounts&notice=status-updated", http.StatusSeeOther)
 }

@@ -8,12 +8,14 @@ Import-Module (Join-Path $PSScriptRoot 'ProductionAcceptance.Common.psm1') -Forc
 function New-RandomText {
     param([ValidateRange(16, 128)][int]$ByteCount)
     $bytes = [byte[]]::new($ByteCount)
-    [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
     try {
+        $rng.GetBytes($bytes)
         return [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
     }
     finally {
-        [Security.Cryptography.CryptographicOperations]::ZeroMemory($bytes)
+        $rng.Dispose()
+        [Array]::Clear($bytes, 0, $bytes.Length)
     }
 }
 
@@ -68,7 +70,13 @@ test -n "$admin_user_id"
   --new-password "$temporary_password" --temporary >/dev/null
 '@
 
-    & docker compose -f $paths.ComposeFile run --rm --no-deps --entrypoint /bin/bash keycloak-init -ec $resetCommand
+    # Windows PowerShell 5.1 rewrites native arguments containing the command
+    # substitution syntax used above. Pass an inert Base64 payload to Bash so
+    # the reviewed command has identical bytes under both powershell.exe and
+    # pwsh.exe, without placing either password value on the command line.
+    $encodedResetCommand = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($resetCommand))
+    $executeEncodedReset = "printf %s $encodedResetCommand | base64 -d | /bin/bash"
+    & docker compose -f $paths.ComposeFile run --rm --no-deps --entrypoint /bin/bash keycloak-init -ec $executeEncodedReset
     if ($LASTEXITCODE -ne 0) {
         throw 'Could not issue a new initial admin temporary password.'
     }

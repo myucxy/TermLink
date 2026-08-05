@@ -30,6 +30,7 @@ func TestPortalRoleAuthorityProtectsLastSuperAdmin(t *testing.T) {
 	copy(secondHash, []byte(uuid.NewString()))
 	defer func() {
 		_, _ = repository.Pool.Exec(ctx, `DELETE FROM audit_events WHERE user_id IN ($1,$2) OR target_id IN ($1,$2)`, firstID, secondID)
+		_, _ = repository.Pool.Exec(ctx, `DELETE FROM outbox WHERE aggregate_id IN ($1,$2)`, firstID, secondID)
 		_, _ = repository.Pool.Exec(ctx, `DELETE FROM users WHERE id IN ($1,$2)`, firstID, secondID)
 	}()
 	if _, err := repository.Pool.Exec(ctx, `
@@ -42,7 +43,7 @@ func TestPortalRoleAuthorityProtectsLastSuperAdmin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dashboard.SchemaVersion != 6 || dashboard.Users < 2 {
+	if dashboard.SchemaVersion != 7 || dashboard.Users < 2 {
 		t.Fatalf("dashboard schema/users = %d/%d", dashboard.SchemaVersion, dashboard.Users)
 	}
 	if err := repository.UpdatePortalAccountRole(ctx, firstID, secondID, RoleSuperAdmin, "role-test-promote"); err != nil {
@@ -53,6 +54,18 @@ func TestPortalRoleAuthorityProtectsLastSuperAdmin(t *testing.T) {
 	}
 	if err := repository.UpdatePortalAccountRole(ctx, secondID, secondID, RoleUser, "role-test-last-super"); !errors.Is(err, ErrLastSuperAdmin) {
 		t.Fatalf("last SUPER_ADMIN demotion error = %v, want ErrLastSuperAdmin", err)
+	}
+	if err := repository.UpdatePortalAccountStatus(ctx, secondID, firstID, "LOCKED", "status-test-lock"); err != nil {
+		t.Fatal(err)
+	}
+	var statusEventCount int
+	if err := repository.Pool.QueryRow(ctx, `
+		SELECT count(*) FROM outbox
+		WHERE event_type='account.status.changed' AND aggregate_id=$1 AND payload->>'status'='LOCKED'`, firstID).Scan(&statusEventCount); err != nil {
+		t.Fatal(err)
+	}
+	if statusEventCount != 1 {
+		t.Fatalf("account status outbox events=%d, want 1", statusEventCount)
 	}
 	if _, err := repository.Pool.Exec(ctx, `UPDATE users SET status='DELETED' WHERE id=$1`, firstID); err != nil {
 		t.Fatal(err)

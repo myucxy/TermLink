@@ -183,6 +183,20 @@ func TestS3EndpointValidationCoversInternalAndPublicEndpoints(t *testing.T) {
 			},
 			fieldName: "TERMLINK_S3_PUBLIC_ENDPOINT",
 		},
+		{
+			name: "internal path",
+			mutate: func(input *Input) {
+				input.S3Endpoint = "http://minio:9000/admin"
+			},
+			fieldName: "TERMLINK_S3_ENDPOINT",
+		},
+		{
+			name: "public query",
+			mutate: func(input *Input) {
+				input.S3PublicEndpoint = "https://history.example.test?credential=leak"
+			},
+			fieldName: "TERMLINK_S3_PUBLIC_ENDPOINT",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -213,12 +227,123 @@ func TestNewExplicitInputAppliesDefaultsAndValidates(t *testing.T) {
 		t.Fatalf("defaults not applied: %#v", c)
 	}
 	if c.WindowsOIDCClientID != "termlink-windows" ||
+		strings.Join(c.WindowsRegistrationOIDCParties, ",") != "termlink-windows" ||
 		c.WindowsOIDCRedirectURI != "http://127.0.0.1:43971/oauth2/callback" {
 		t.Fatalf("Windows OIDC defaults not applied: %#v", c)
 	}
 	if c.WebOIDCClientID != "termlink-web" ||
 		c.WebOIDCRedirectURI != "https://termlink.example.test/auth/callback" {
 		t.Fatalf("Web OIDC defaults not applied: %#v", c)
+	}
+}
+
+func TestPublicAndOIDCEndpointsRequireHTTPS(t *testing.T) {
+	base := Input{
+		PublicURL:        "https://termlink.example.test",
+		OIDCIssuer:       "https://issuer.example.test/realms/termlink",
+		OIDCClientID:     "client",
+		OIDCClientSecret: "oidc",
+		DatabaseURL:      "postgres",
+		RedisURL:         "redis",
+		TokenSigningKey:  "01234567890123456789012345678901",
+	}
+	tests := []struct {
+		name  string
+		field string
+		set   func(*Input)
+	}{
+		{"public URL", "TERMLINK_PUBLIC_URL", func(input *Input) { input.PublicURL = "http://termlink.example.test" }},
+		{"OIDC issuer", "TERMLINK_OIDC_ISSUER", func(input *Input) { input.OIDCIssuer = "http://issuer.example.test/realms/termlink" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := base
+			test.set(&input)
+			_, err := New(input)
+			if err == nil || !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("New() error = %v, want invalid %s", err, test.field)
+			}
+		})
+	}
+}
+
+func TestOIDCAllowedPartiesAreExplicitAndClientBound(t *testing.T) {
+	base := Input{
+		PublicURL:              "https://termlink.example.test",
+		OIDCIssuer:             "https://issuer.example.test/realms/termlink",
+		OIDCClientID:           "termlink-server",
+		AndroidOIDCClientID:    "termlink-android",
+		AndroidOIDCRedirectURI: "dev.termlink:/oauth2redirect",
+		WindowsOIDCClientID:    "termlink-windows",
+		WindowsOIDCRedirectURI: "http://127.0.0.1:43971/oauth2/callback",
+		OIDCClientSecret:       "oidc",
+		DatabaseURL:            "postgres",
+		RedisURL:               "redis",
+		TokenSigningKey:        "01234567890123456789012345678901",
+	}
+
+	configured, err := New(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(configured.OIDCAllowedParties, ","); got != "termlink-android,termlink-windows" {
+		t.Fatalf("default OIDC allowed parties = %q", got)
+	}
+	if got := strings.Join(configured.WindowsRegistrationOIDCParties, ","); got != "termlink-windows" {
+		t.Fatalf("default Windows registration parties = %q", got)
+	}
+
+	tests := []struct {
+		name    string
+		parties []string
+	}{
+		{"missing Android", []string{"termlink-windows"}},
+		{"missing Windows", []string{"termlink-android"}},
+		{"resource audience used as party", []string{"termlink-android", "termlink-windows", "termlink-server"}},
+		{"whitespace in party", []string{"termlink-android", "termlink-windows bad"}},
+		{"empty party", []string{"termlink-android", "termlink-windows", ""}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := base
+			input.OIDCAllowedParties = test.parties
+			if _, err := New(input); err == nil || !errors.Is(err, ErrInvalid) ||
+				!strings.Contains(err.Error(), "TERMLINK_OIDC_ALLOWED_PARTIES") {
+				t.Fatalf("New() error = %v, want invalid allowed parties", err)
+			}
+		})
+	}
+
+	base.OIDCAllowedParties = []string{" termlink-android ", "termlink-windows", "termlink-android", "acceptance-probe"}
+	configured, err = New(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(configured.OIDCAllowedParties, ","); got != "termlink-android,termlink-windows,acceptance-probe" {
+		t.Fatalf("normalized OIDC allowed parties = %q", got)
+	}
+
+	base.WindowsRegistrationOIDCParties = []string{" termlink-windows ", "acceptance-probe", "termlink-windows"}
+	configured, err = New(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(configured.WindowsRegistrationOIDCParties, ","); got != "termlink-windows,acceptance-probe" {
+		t.Fatalf("normalized Windows registration parties = %q", got)
+	}
+
+	for _, parties := range [][]string{
+		{"acceptance-probe"},
+		{"termlink-windows", "termlink-android"},
+		{"termlink-windows", "not-token-allowed"},
+		{"termlink-windows", ""},
+	} {
+		input := base
+		input.WindowsRegistrationOIDCParties = parties
+		if _, err := New(input); err == nil || !errors.Is(err, ErrInvalid) ||
+			!strings.Contains(err.Error(), "TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES") {
+			t.Fatalf("New(WindowsRegistrationOIDCParties=%q) error = %v, want invalid binding", parties, err)
+		}
 	}
 }
 
