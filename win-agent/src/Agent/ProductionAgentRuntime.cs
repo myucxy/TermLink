@@ -111,10 +111,29 @@ namespace TermLink.Agent
                 if (Volatile.Read(ref disposed) != 0) throw new ObjectDisposedException("ProductionAgentRuntime");
                 if (this.registry != null) throw new InvalidOperationException("Production runtime is already attached.");
                 this.registry = registry;
+                QueueRegisteredSessionsForReplay();
                 historyUploader = new ProductionHistoryUploader(http, SendAsync, credentials.DeviceId, config.KeyEpoch);
                 historyWorker = Task.Run(HistoryUploadLoopAsync);
                 worker = Task.Run(RunAsync);
             }
+        }
+
+        private void QueueRegisteredSessionsForReplay()
+        {
+            if (registry == null) return;
+            var queued = false;
+            foreach (var session in registry.GetSummaries())
+            {
+                pendingSessions.AddOrUpdate(
+                    session.SessionId,
+                    _ => new PendingSession { ShellType = session.ShellType },
+                    (_, existing) => existing);
+                queued = true;
+            }
+            if (!queued) return;
+            try { eventSignal.Release(); }
+            catch (SemaphoreFullException) { }
+            catch (ObjectDisposedException) { }
         }
 
         public void OnCommitted(ManagedShellType shellType, LocalFrame frame)
@@ -733,7 +752,8 @@ namespace TermLink.Agent
             string state = "RUNNING"; int columns = 80, rows = 24; int? exitCode = null;
             if (item.Frame.Type == LocalFrameType.Resize) { LocalPayloadCodec.ParseResize(item.Frame.Payload, out var c, out var r); columns = c; rows = r; }
             if (item.Frame.Type == LocalFrameType.Lifecycle) { var lifecycle = LocalPayloadCodec.ParseLifecycle(item.Frame.Payload, out var exit); if (lifecycle == LocalLifecycleState.Ended) { state = "EXITED"; exitCode = exit; } else if (lifecycle == LocalLifecycleState.Interrupted) state = "INTERRUPTED"; }
-            var body = JsonSerializer.SerializeToUtf8Bytes(new { pc_id = config.PcId, shell_type = item.ShellType.ToString().ToLowerInvariant(), title_cipher = "", state, columns, rows, last_output_seq = item.Frame.Sequence, ended_at = exitCode.HasValue ? DateTimeOffset.UtcNow : (DateTimeOffset?)null });
+            var endedAt = state == "RUNNING" ? (DateTimeOffset?)null : DateTimeOffset.UtcNow;
+            var body = JsonSerializer.SerializeToUtf8Bytes(new { pc_id = config.PcId, shell_type = item.ShellType.ToString().ToLowerInvariant(), title_cipher = "", state, columns, rows, last_output_seq = item.Frame.Sequence, ended_at = endedAt });
             using var response = await SendAsync(HttpMethod.Put, "/v1/sessions/" + item.Frame.SessionId.ToString("D"), body, true, "session-" + item.Frame.SessionId.ToString("N") + "-" + item.Frame.Sequence, token).ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
         }
@@ -1096,6 +1116,13 @@ namespace TermLink.Agent
                             token).ConfigureAwait(false);
                     }
                     finally { CryptographicOperations.ZeroMemory(gapBytes); }
+
+                    // Without a portable Snapshot, Android cannot safely apply
+                    // the retained suffix after a permanent VT byte gap. Stop
+                    // this replay after the explicit Gap instead of flooding a
+                    // client that must remain in HistoryGap until a future
+                    // snapshot-based recovery is available.
+                    return;
                 }
 
                 foreach (var frame in frames)
@@ -1199,7 +1226,14 @@ namespace TermLink.Agent
             if (frame.Type == LocalFrameType.Output) return MessageType.OutputChunk;
             if (frame.Type == LocalFrameType.Resize) return MessageType.ResizeApplied;
             if (frame.Type == LocalFrameType.Gap) return MessageType.Gap;
-            if (frame.Type == LocalFrameType.Lifecycle) return MessageType.SessionUpsert;
+            if (frame.Type == LocalFrameType.Lifecycle)
+            {
+                var lifecycle = LocalPayloadCodec.ParseLifecycle(frame.Payload, out var ignoredExitCode);
+                if (lifecycle == LocalLifecycleState.Running) return MessageType.SessionStarted;
+                if (lifecycle == LocalLifecycleState.Interrupted) return MessageType.SessionInterrupted;
+                if (lifecycle == LocalLifecycleState.Ended) return MessageType.SessionEnded;
+                return MessageType.SessionUpsert;
+            }
             if (frame.Type == LocalFrameType.LocalInputObserved) return MessageType.LeaseRevoked;
             if (frame.Type == LocalFrameType.RemoteInputResult)
             {

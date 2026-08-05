@@ -314,6 +314,7 @@ namespace TermLink.Agent
         private bool testDisconnectTriggered;
         private volatile bool remoteInputRejectSupported;
         private bool ended;
+        private bool interruptedCommitted;
         private int exitCode;
         private bool disposed;
 
@@ -354,7 +355,45 @@ namespace TermLink.Agent
             catch
             {
                 Transition(SessionAgentLifecycle.Faulted);
+                try { CommitInterruptedLifecycle(); }
+                catch { }
                 throw;
+            }
+            CommitInterruptedLifecycle();
+        }
+
+        private void CommitInterruptedLifecycle()
+        {
+            LocalFrame terminal;
+            lock (statusSync)
+            {
+                if (ended || stopRequested || interruptedCommitted ||
+                    (lifecycle != SessionAgentLifecycle.HostLost &&
+                     lifecycle != SessionAgentLifecycle.Faulted))
+                {
+                    return;
+                }
+                if (lastHostSequence == ulong.MaxValue)
+                {
+                    throw new InvalidDataException("Session event sequence is exhausted.");
+                }
+
+                terminal = new LocalFrame(
+                    LocalFrameType.Lifecycle,
+                    options.SessionId,
+                    lastHostSequence + 1,
+                    LocalPayloadCodec.Lifecycle(LocalLifecycleState.Interrupted, 0));
+                eventBuffer.Append(terminal);
+                lastHostSequence = terminal.Sequence;
+                lastActivityUtc = DateTime.UtcNow;
+                persistedFrames++;
+                interruptedCommitted = true;
+            }
+
+            if (committedFrame != null)
+            {
+                try { committedFrame(terminal); }
+                catch { }
             }
         }
 

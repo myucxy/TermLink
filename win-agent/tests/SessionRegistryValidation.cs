@@ -43,6 +43,7 @@ namespace TermLink.Agent
                 ValidateLocalIpcCapabilities();
                 ValidateRemoteControlDispatch();
                 ValidateCompletedBufferRecovery(Path.Combine(bufferRoot, "completed-recovery"));
+                ValidateLiveInterruptedLifecycle(Path.Combine(bufferRoot, "live-interrupted"));
                 ValidateStopFailurePaths(Path.Combine(bufferRoot, "failure-paths"));
                 ValidateRestartFailurePath(Path.Combine(bufferRoot, "restart-failure"));
                 var controlPipe = "termlink-registry-control-" + Guid.NewGuid().ToString("N");
@@ -203,6 +204,7 @@ namespace TermLink.Agent
                     ";shutdown_best_effort=true" +
                     ";restart_timeout_reported=true" +
                     ";completed_buffer_recovered=true" +
+                    ";live_interrupted_committed=true" +
                     ";external_registry_entry=true" +
                     ";test_thread=" + mainThreadId);
                 return 0;
@@ -482,6 +484,68 @@ namespace TermLink.Agent
             Require(new DpapiRegistryRegistrationStore(
                 Path.Combine(bufferRoot, "registrations.dpapi")).Load().Count == 0,
                 "Published completed buffer remained in the recovery index.");
+        }
+
+        private static void ValidateLiveInterruptedLifecycle(string bufferRoot)
+        {
+            Directory.CreateDirectory(bufferRoot);
+            var committed = new List<LocalFrame>();
+            var lost = LostHostFixture.Start();
+            try
+            {
+                using (var registry = new SessionRegistry(
+                    bufferRoot,
+                    1200,
+                    4 * 1024 * 1024,
+                    20,
+                    delegate(ManagedShellType shellType, LocalFrame frame)
+                    {
+                        Require(shellType == ManagedShellType.Custom,
+                            "Live interrupted callback changed its Shell type.");
+                        lock (committed) committed.Add(frame);
+                    }))
+                {
+                    string error;
+                    Require(registry.TryRegister(lost.CreateRegistration(), out error),
+                        "Live interrupted fixture registration failed: " + error);
+                    WaitUntil(delegate
+                    {
+                        return registry.GetSummaries().Any(item =>
+                            item.SessionId == lost.SessionId && item.LastSequence >= 2);
+                    }, 5000, "Live interrupted fixture never committed its running state.");
+                    WaitUntil(delegate
+                    {
+                        return registry.GetSummaries().All(item => item.SessionId != lost.SessionId) &&
+                            registry.ContainsSession(lost.SessionId);
+                    }, 10000, "Live Host loss did not become a retained completed session.");
+
+                    IList<LocalFrame> frames;
+                    ulong earliest;
+                    ulong latest;
+                    Require(registry.TryReadBufferedEvents(
+                            lost.SessionId, 0, out frames, out earliest, out latest) &&
+                        earliest == 1 && latest == 3 && frames.Count == 3,
+                        "Live Host loss did not retain a continuous terminal event stream.");
+                    var terminal = frames[frames.Count - 1];
+                    int exitCode;
+                    Require(terminal.Type == LocalFrameType.Lifecycle && terminal.Sequence == 3 &&
+                        LocalPayloadCodec.ParseLifecycle(terminal.Payload, out exitCode) ==
+                            LocalLifecycleState.Interrupted,
+                        "Live Host loss did not append an ordered Interrupted lifecycle.");
+                    lock (committed)
+                    {
+                        Require(committed.Count == 3 && committed[2].Sequence == terminal.Sequence,
+                            "Live Host loss did not notify the production commit callback.");
+                    }
+                    registry.ReleaseBufferedSession(lost.SessionId);
+                    Require(!registry.ContainsSession(lost.SessionId),
+                        "Published live Interrupted session remained retained.");
+                }
+            }
+            finally
+            {
+                lost.Dispose();
+            }
         }
 
         private static void ValidateRestartFailurePath(string bufferRoot)

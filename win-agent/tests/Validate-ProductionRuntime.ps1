@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$DotNetPath = 'dotnet'
+    [string]$DotNetPath = 'dotnet',
+    [switch]$PreserveExistingProductionFiles
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,11 +24,115 @@ $bufferRoot = Join-Path ([IO.Path]::GetTempPath()) ('TermLink-Production-Lifecyc
 $probeBufferRoot = Join-Path ([IO.Path]::GetTempPath()) ('TermLink-Production-Probe-' + [Guid]::NewGuid().ToString('N'))
 $replayBufferDirectory = [string](Join-Path ([IO.Path]::GetTempPath()) ('TermLink-Production-Replay-' + [Guid]::NewGuid().ToString('N')))
 
-if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-    throw "Refusing to overwrite an existing production config: $configPath"
+if ((Test-Path -LiteralPath $configPath -PathType Leaf) -or
+    (Test-Path -LiteralPath $credentialsPath -PathType Leaf)) {
+    if (-not $PreserveExistingProductionFiles) {
+        throw "Refusing to overwrite existing production files under: $termLinkDirectory"
+    }
+    $runningTermLinkProcesses = @(Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessName -like 'TermLink*' })
+    if ($runningTermLinkProcesses.Count -gt 0) {
+        throw 'Stop all TermLink processes before preserving production files for validation.'
+    }
+
+    $backupSuffix = '.validation-backup-' + [Guid]::NewGuid().ToString('N')
+    $configBackupPath = $null
+    $credentialsBackupPath = $null
+    $childOutput = @()
+    $childExitCode = -1
+    try {
+        if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+            $configBackupPath = $configPath + $backupSuffix
+            Move-Item -LiteralPath $configPath -Destination $configBackupPath
+        }
+        if (Test-Path -LiteralPath $credentialsPath -PathType Leaf) {
+            $credentialsBackupPath = $credentialsPath + $backupSuffix
+            Move-Item -LiteralPath $credentialsPath -Destination $credentialsBackupPath
+        }
+
+        $powerShellPath = (Get-Process -Id $PID).Path
+        $childOutput = & $powerShellPath -NoProfile -File $PSCommandPath -DotNetPath $DotNetPath 2>&1
+        $childExitCode = $LASTEXITCODE
+    }
+    finally {
+        if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+            Remove-Item -LiteralPath $configPath -Force
+        }
+        if (Test-Path -LiteralPath $credentialsPath -PathType Leaf) {
+            Remove-Item -LiteralPath $credentialsPath -Force
+        }
+        if ($null -ne $configBackupPath -and (Test-Path -LiteralPath $configBackupPath -PathType Leaf)) {
+            Move-Item -LiteralPath $configBackupPath -Destination $configPath
+        }
+        if ($null -ne $credentialsBackupPath -and (Test-Path -LiteralPath $credentialsBackupPath -PathType Leaf)) {
+            Move-Item -LiteralPath $credentialsBackupPath -Destination $credentialsPath
+        }
+    }
+
+    $childOutput | Write-Output
+    if ($childExitCode -ne 0) {
+        throw "Isolated production runtime validation failed with exit code $childExitCode."
+    }
+    return
 }
-if (Test-Path -LiteralPath $credentialsPath -PathType Leaf) {
-    throw "Refusing to overwrite existing production credentials: $credentialsPath"
+
+if ($null -eq ('TermLinkProductionValidationAssemblyResolver' -as [Type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Reflection;
+
+public static class TermLinkProductionValidationAssemblyResolver
+{
+    private static string searchPath;
+    private static bool attached;
+
+    public static void Attach(string path)
+    {
+        searchPath = path;
+        if (!attached)
+        {
+            AppDomain.CurrentDomain.AssemblyResolve += Resolve;
+            attached = true;
+        }
+    }
+
+    public static void Detach()
+    {
+        if (attached)
+        {
+            AppDomain.CurrentDomain.AssemblyResolve -= Resolve;
+            attached = false;
+        }
+        searchPath = null;
+    }
+
+    private static Assembly Resolve(object sender, ResolveEventArgs args)
+    {
+        try
+        {
+            var requested = new AssemblyName(args.Name);
+            if (requested.Name is null || requested.Name.EndsWith(".resources", StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            var root = searchPath;
+            if (string.IsNullOrEmpty(root))
+            {
+                return null;
+            }
+
+            var candidate = Path.Combine(root, requested.Name + ".dll");
+            return File.Exists(candidate) ? Assembly.LoadFrom(candidate) : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+}
+'@
 }
 
 function Get-InternalMethod {
@@ -39,16 +144,7 @@ $service = $null
 $identity = $null
 $agentProcess = $null
 try {
-    $resolver = [ResolveEventHandler]{
-        param($sender, $eventArgs)
-        $name = ([Reflection.AssemblyName]$eventArgs.Name).Name + '.dll'
-        $candidate = Join-Path $agentOutput $name
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            return [Reflection.Assembly]::LoadFrom($candidate)
-        }
-        return $null
-    }
-    [AppDomain]::CurrentDomain.add_AssemblyResolve($resolver)
+    [TermLinkProductionValidationAssemblyResolver]::Attach($agentOutput)
     $assembly = [Reflection.Assembly]::LoadFrom($agentAssembly)
     $protocol = [Reflection.Assembly]::LoadFrom($protocolAssembly)
     $runtimeType = $assembly.GetType('TermLink.Agent.ProductionAgentRuntime', $true)
@@ -72,6 +168,13 @@ try {
     }
     if ($null -eq (Get-InternalMethod $runtimeType 'AdvancePublishedSequence')) {
         throw 'Production runtime does not preserve a monotonic replay publication cursor.'
+    }
+    if ($null -eq (Get-InternalMethod $runtimeType 'QueueRegisteredSessionsForReplay')) {
+        throw 'Production runtime does not queue recovered Registry sessions for publication.'
+    }
+    $mapMessageType = Get-InternalMethod $runtimeType 'MapMessageType'
+    if ($null -eq $mapMessageType) {
+        throw 'Production runtime lifecycle message mapping is unavailable.'
     }
     $newEnvelopeNonce = Get-InternalMethod $runtimeType 'NewEnvelopeNonce'
     if ($null -eq $newEnvelopeNonce) {
@@ -102,6 +205,7 @@ try {
         [Reflection.BindingFlags]'Instance,Public,NonPublic', $null,
         [Type[]]@($localFrameKindType, [Guid], [ulong], [byte[]]), $null)
     $outputKind = [Enum]::Parse($localFrameKindType, 'Output')
+    $lifecycleKind = [Enum]::Parse($localFrameKindType, 'Lifecycle')
     $append = Get-InternalMethod $bufferType 'Append'
     for ($sequence = 1; $sequence -le 3; $sequence++) {
         [byte[]]$payload = [byte[]]::new(600)
@@ -123,6 +227,18 @@ try {
     }
     $buffer.Dispose()
     $buffer = $null
+
+    $localPayloadCodec = $assembly.GetType('TermLink.LocalIpc.LocalPayloadCodec', $true)
+    $localLifecycleType = $assembly.GetType('TermLink.LocalIpc.LocalLifecycleState', $true)
+    $lifecyclePayload = Get-InternalMethod $localPayloadCodec 'Lifecycle'
+    $interruptedState = [Enum]::Parse($localLifecycleType, 'Interrupted')
+    [byte[]]$interruptedPayload = $lifecyclePayload.Invoke($null, [object[]]@($interruptedState, 0))
+    $interruptedFrame = $frameConstructor.Invoke([object[]]@(
+        $lifecycleKind, [Guid]::NewGuid(), [uint64]3, $interruptedPayload))
+    $interruptedMessageType = $mapMessageType.Invoke($null, [object[]]@($interruptedFrame))
+    if ($interruptedMessageType.ToString() -ne 'SessionInterrupted') {
+        throw "Production runtime mapped Interrupted to $interruptedMessageType instead of SessionInterrupted."
+    }
 
     $withoutConfig = $tryCreate.Invoke($null, [object[]]@())
     if ($null -ne $withoutConfig) {
@@ -249,7 +365,7 @@ try {
     Write-Output 'Production runtime no-config and lifecycle validation passed.'
 }
 finally {
-    if ($null -ne $resolver) { [AppDomain]::CurrentDomain.remove_AssemblyResolve($resolver) }
+    [TermLinkProductionValidationAssemblyResolver]::Detach()
     if ($null -ne $identity) { $identity.Dispose() }
     if ($null -ne $service) { try { $service.Dispose() } catch { } }
     if ($null -ne $agentProcess) {
