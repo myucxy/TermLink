@@ -21,6 +21,13 @@ namespace TermLink.Tray
                 if (!string.IsNullOrEmpty(options.StatusJsonPath))
                 {
                     var response = controller.EnsureAgent();
+                    // Pairing challenges contain a short-lived code and nonce. They
+                    // are available only inside the interactive pairing surface and
+                    // must never be written to diagnostic JSON.
+                    if (response.Production != null)
+                    {
+                        response.Production.PairingChallenge = null;
+                    }
                     var destination = Path.GetFullPath(options.StatusJsonPath);
                     var directory = Path.GetDirectoryName(destination);
                     if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
@@ -49,7 +56,9 @@ namespace TermLink.Tray
                     out ownsTrayMutex))
                 {
                     if (!ownsTrayMutex) return 0;
-                    Application.SetHighDpiMode(HighDpiMode.SystemAware);
+                    // The shell is sized in device-independent pixels and is safe to
+                    // move between monitors with different scale factors.
+                    Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
                     Application.Run(new TrayApplicationContext(controller));
@@ -194,15 +203,19 @@ namespace TermLink.Tray
                 7000);
         }
 
-        public RegistryResponse CreatePairingChallenge(Guid deviceId)
+        public RegistryResponse CreatePairingChallenge(Guid deviceId, string permission)
         {
             if (deviceId == Guid.Empty) throw new ArgumentException("A device is required.", nameof(deviceId));
+            permission = (permission ?? string.Empty).Trim().ToUpperInvariant();
+            if (permission != "VIEW" && permission != "CONTROL" && permission != "MANAGE")
+                throw new ArgumentException("A supported pairing permission is required.", nameof(permission));
             return RegistryControlClient.Send(
                 options.ControlPipeName,
                 new RegistryRequest
                 {
                     Command = RegistryCommand.CreatePairingChallenge,
-                    DeviceId = deviceId
+                    DeviceId = deviceId,
+                    PairingPermission = permission
                 },
                 10000);
         }
@@ -230,9 +243,10 @@ namespace TermLink.Tray
 
         public void LinkAccount(string serverUrl, string pcName)
         {
-            if (!Uri.TryCreate(serverUrl, UriKind.Absolute, out var server) || server.Scheme != Uri.UriSchemeHttps)
-                throw new ArgumentException("A valid HTTPS server URL is required.", nameof(serverUrl));
-            if (string.IsNullOrWhiteSpace(pcName)) throw new ArgumentException("A PC name is required.", nameof(pcName));
+            if (!TrayInputValidation.TryNormalizeServerOrigin(serverUrl, out var serverOrigin))
+                throw new ArgumentException("A valid HTTPS server origin is required.", nameof(serverUrl));
+            if (!TrayInputValidation.TryNormalizePcName(pcName, out var normalizedPcName))
+                throw new ArgumentException("A valid PC name is required.", nameof(pcName));
             var start = new ProcessStartInfo
             {
                 FileName = options.AgentExecutable,
@@ -242,9 +256,9 @@ namespace TermLink.Tray
             };
             start.ArgumentList.Add("--link-account");
             start.ArgumentList.Add("--server-url");
-            start.ArgumentList.Add(serverUrl);
+            start.ArgumentList.Add(serverOrigin);
             start.ArgumentList.Add("--pc-name");
-            start.ArgumentList.Add(pcName);
+            start.ArgumentList.Add(normalizedPcName);
             using (var process = Process.Start(start))
             {
                 if (process == null) throw new InvalidOperationException("TermLink account linking could not be started.");

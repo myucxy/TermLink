@@ -3,11 +3,16 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationIcon>..\..\..\assets\brand\windows\TermLink.ico</ApplicationIcon>
     <AssemblyName>TermLink.Tray</AssemblyName>
     <RootNamespace>TermLink.Tray</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\..\assets\brand\windows\TermLink.ico"
+                      LogicalName="TermLink.Tray.Assets.TermLink.ico" />
   </ItemGroup>
 </Project>
