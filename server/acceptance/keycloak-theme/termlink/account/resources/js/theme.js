@@ -2,9 +2,11 @@
   "use strict";
 
   const STORAGE_KEY = "termlink-theme";
+  const TRANSFER_PARAMETER = "termlink_theme";
   const LIGHT = "light";
   const DARK = "dark";
   const root = document.documentElement;
+  let accountReturnURL = null;
   const systemPreference = window.matchMedia
     ? window.matchMedia("(prefers-color-scheme: dark)")
     : { matches: false };
@@ -29,6 +31,51 @@
     root.dataset.theme = theme;
     root.classList.toggle("pf-v5-theme-dark", theme === DARK);
     updateToggle(document.querySelector("[data-termlink-theme-toggle]"));
+    updateAccountReturnTargets();
+  }
+
+  function safeAccountReturnURL(candidate) {
+    if (!candidate) return null;
+    try {
+      const target = new URL(candidate, window.location.href);
+      const localHTTP = target.protocol === "http:" &&
+        (target.hostname === "localhost" || target.hostname === "127.0.0.1" || target.hostname === "::1");
+      const normalizedPath = target.pathname.replace(/\/+$/, "") || "/";
+      if ((target.protocol !== "https:" && !localHTTP) || target.username || target.password || normalizedPath !== "/account") {
+        return null;
+      }
+      target.hash = "";
+      target.searchParams.delete(TRANSFER_PARAMETER);
+      return target.href;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function environmentAccountReturnURL() {
+    try {
+      const environment = JSON.parse(document.getElementById("environment")?.textContent || "{}");
+      return safeAccountReturnURL(environment.referrerUrl);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function themedAccountReturnURL(nativeReferrer) {
+    if (!accountReturnURL) {
+      accountReturnURL = safeAccountReturnURL(nativeReferrer?.getAttribute("href")) ||
+        environmentAccountReturnURL() || safeAccountReturnURL("/account");
+    }
+    const target = new URL(accountReturnURL);
+    target.searchParams.set(TRANSFER_PARAMETER, root.dataset.theme === DARK ? DARK : LIGHT);
+    return target.href;
+  }
+
+  function updateAccountReturnTargets(nativeReferrer) {
+    const target = themedAccountReturnURL(nativeReferrer);
+    document.querySelectorAll("[data-termlink-account-link], [data-termlink-sidebar-return]").forEach((link) => {
+      link.href = target;
+    });
   }
 
   function translatedLabels() {
@@ -139,10 +186,10 @@
       referrer.setAttribute("data-termlink-account-link", "");
       actions.append(referrer);
     }
-    // React can retain the injected node while replacing surrounding route
-    // state. Reassert the product-owned target on every pass so no Keycloak
-    // account sub-route can strand the user inside the identity console.
-    referrer.href = "/account";
+    // Keycloak validates referrer_uri against the registered web client. Keep
+    // that absolute portal target so split-origin production deployments do
+    // not strand the user on the identity host.
+    referrer.href = themedAccountReturnURL(nativeReferrer);
     referrer.classList.add("tl-account-return");
     referrer.setAttribute("aria-label", labels.accountAction);
     const currentIcon = referrer.querySelector(".tl-account-return-icon");
@@ -239,7 +286,7 @@
     } else if (returnLink !== sidebarBody.lastElementChild) {
       sidebarBody.append(returnLink);
     }
-    returnLink.href = "/account";
+    returnLink.href = themedAccountReturnURL();
     returnLink.setAttribute("aria-label", labels.accountAction);
     const returnLabel = returnLink.querySelector(".tl-account-sidebar-return-label");
     if (returnLabel && returnLabel.textContent !== labels.accountLabel) {
@@ -268,13 +315,24 @@
       grid?.classList.toggle("tl-account-single-section", singleSection);
     });
 
+    const sidebar = document.querySelector(".pf-v5-c-page__sidebar");
+    if (sidebar) {
+      if (desktopSidebar.matches) sidebar.setAttribute("aria-hidden", "false");
+      else if (sidebar.classList.contains("pf-m-collapsed")) sidebar.setAttribute("aria-hidden", "true");
+      else sidebar.removeAttribute("aria-hidden");
+    }
+
   }
 
+  const desktopSidebar = window.matchMedia("(min-width: 1220px)");
   const handleSystemChange = () => {
     if (!readStoredTheme()) applyTheme();
   };
   if (systemPreference.addEventListener) systemPreference.addEventListener("change", handleSystemChange);
   else systemPreference.addListener?.(handleSystemChange);
+  const handleSidebarBreakpoint = () => ensureAccountWorkspace();
+  if (desktopSidebar.addEventListener) desktopSidebar.addEventListener("change", handleSidebarBreakpoint);
+  else desktopSidebar.addListener?.(handleSidebarBreakpoint);
   window.addEventListener("storage", (event) => {
     if (event.key === STORAGE_KEY || event.key === null) applyTheme();
   });

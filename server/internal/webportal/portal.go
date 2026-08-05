@@ -30,13 +30,14 @@ import (
 )
 
 const (
-	oauthCookieName    = "__Host-termlink-oauth"
-	sessionCookieName  = "__Host-termlink-session"
-	oauthStateTTL      = 10 * time.Minute
-	webSessionTTL      = 8 * time.Hour
-	sensitiveActionTTL = 10 * time.Minute
-	maximumCookieSize  = 3800
-	recentAuditLimit   = 7
+	oauthCookieName     = "__Host-termlink-oauth"
+	sessionCookieName   = "__Host-termlink-session"
+	oauthStateTTL       = 10 * time.Minute
+	webSessionTTL       = 8 * time.Hour
+	sensitiveActionTTL  = 10 * time.Minute
+	maximumCookieSize   = 3800
+	recentAuditLimit    = 7
+	themeQueryParameter = "termlink_theme"
 )
 
 //go:embed assets/*.html assets/*.css assets/*.js assets/*.svg
@@ -73,7 +74,7 @@ type portalRepository interface {
 }
 
 type oidcFlow interface {
-	AuthorizationURL(state, nonce, challenge string) string
+	AuthorizationURL(state, nonce, challenge, theme string) string
 	ExchangeAndVerify(context.Context, string, string, string) (accountIdentity, error)
 	LogoutURL() string
 	AccountURL() string
@@ -431,7 +432,18 @@ func (p *Portal) svgAsset(contents []byte) http.HandlerFunc {
 
 func (p *Portal) login(w http.ResponseWriter, r *http.Request) {
 	if !p.usesPublicHost(r) {
-		http.Redirect(w, r, strings.TrimRight(p.config.PublicURL, "/")+"/login", http.StatusSeeOther)
+		target := strings.TrimRight(p.config.PublicURL, "/") + "/login"
+		query := url.Values{}
+		if r.URL.Query().Get("return_to") == "/admin" {
+			query.Set("return_to", "/admin")
+		}
+		if theme := normalizeTheme(r.URL.Query().Get(themeQueryParameter)); theme != "" {
+			query.Set(themeQueryParameter, theme)
+		}
+		if encoded := query.Encode(); encoded != "" {
+			target += "?" + encoded
+		}
+		http.Redirect(w, r, target, http.StatusSeeOther)
 		return
 	}
 	state, err := randomText(32)
@@ -466,7 +478,8 @@ func (p *Portal) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.setCookie(w, oauthCookieName, stateCookie, p.now().Add(oauthStateTTL))
-	location := p.flow.AuthorizationURL(state, nonce, base64.RawURLEncoding.EncodeToString(challenge[:]))
+	theme := normalizeTheme(r.URL.Query().Get(themeQueryParameter))
+	location := p.flow.AuthorizationURL(state, nonce, base64.RawURLEncoding.EncodeToString(challenge[:]), theme)
 	clear(challenge[:])
 	w.Header().Set("Cache-Control", "no-store")
 	http.Redirect(w, r, location, http.StatusFound)
@@ -729,9 +742,20 @@ func (p *Portal) renderError(w http.ResponseWriter, status int, title, message s
 
 func (p *Portal) internalError(w http.ResponseWriter, err error) {
 	slog.Error("web portal request failed", "error", err)
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	var output bytes.Buffer
+	if templateErr := p.templates.ExecuteTemplate(&output, "error.html", errorPageData{
+		Title: "服务暂时不可用", Message: "TermLink 服务端暂时无法完成该请求，请稍后重试。",
+	}); templateErr != nil {
+		slog.Error("render web portal internal error page", "error", templateErr)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, "TermLink portal is temporarily unavailable.", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	http.Error(w, "TermLink portal is temporarily unavailable.", http.StatusInternalServerError)
+	w.WriteHeader(http.StatusInternalServerError)
+	_, _ = w.Write(output.Bytes())
 }
 
 func (p *Portal) securityHeaders(next http.Handler) http.Handler {
@@ -800,13 +824,16 @@ func (p *Portal) usesTrustedFormOrigin(r *http.Request) bool {
 
 func (p *Portal) now() time.Time { return p.config.Clock().UTC() }
 
-func (f *productionOIDCFlow) AuthorizationURL(state, nonce, challenge string) string {
-	return f.oauthConfig.AuthCodeURL(
-		state,
+func (f *productionOIDCFlow) AuthorizationURL(state, nonce, challenge, theme string) string {
+	options := []oauth2.AuthCodeOption{
 		oauth2.SetAuthURLParam("nonce", nonce),
 		oauth2.SetAuthURLParam("code_challenge", challenge),
 		oauth2.SetAuthURLParam("code_challenge_method", "S256"),
-	)
+	}
+	if theme == "light" || theme == "dark" {
+		options = append(options, oauth2.SetAuthURLParam(themeQueryParameter, theme))
+	}
+	return f.oauthConfig.AuthCodeURL(state, options...)
 }
 
 func (f *productionOIDCFlow) ExchangeAndVerify(ctx context.Context, code, verifier, expectedNonce string) (accountIdentity, error) {
@@ -893,6 +920,14 @@ func firstNonEmpty(values ...string) string {
 		if strings.TrimSpace(value) != "" {
 			return strings.TrimSpace(value)
 		}
+	}
+	return ""
+}
+
+func normalizeTheme(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "light" || value == "dark" {
+		return value
 	}
 	return ""
 }

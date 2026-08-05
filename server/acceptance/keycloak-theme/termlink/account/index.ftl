@@ -47,6 +47,29 @@
         font-weight: 600;
         padding-top: 32px;
       }
+
+      .tl-loading-return {
+        margin-top: 14px;
+        color: #3759c5;
+        font-size: 14px;
+        font-weight: 700;
+        text-decoration: none;
+      }
+
+      .tl-loading-return:hover {
+        text-decoration: underline;
+      }
+
+      html[data-theme="dark"] .tl-loading-return {
+        color: #aeb7ff;
+      }
+
+      .tl-loading-noscript {
+        max-width: 460px;
+        margin: 12px 24px 0;
+        color: inherit;
+        text-align: center;
+      }
     </style>
     <script type="importmap">
       {
@@ -111,12 +134,15 @@
             <circle class="pf-v5-c-spinner__path" cx="50" cy="50" r="45" fill="none"></circle>
           </svg>
           <div>
-            <p id="loading-text">Loading the Account Console</p>
+            <p id="loading-text">${msg("termlinkLoadingAccount")}</p>
           </div>
+          <#if referrer_uri?has_content>
+            <a class="tl-loading-return" href="${referrer_uri}">${msg("termlinkBackToPersonalCenter")} →</a>
+          </#if>
+          <noscript><p class="tl-loading-noscript">${msg("termlinkJavascriptRequired")}</p></noscript>
         </div>
       </main>
     </div>
-    <noscript>JavaScript is required to use the Account Console.</noscript>
     <script id="environment" type="application/json">
       {
         "serverBaseUrl": "${serverBaseUrl}",

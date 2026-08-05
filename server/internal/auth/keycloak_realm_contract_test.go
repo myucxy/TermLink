@@ -48,7 +48,7 @@ func TestAcceptanceRealmUsesGatedRegistrationAndAndroidNativeLogin(t *testing.T)
 	}
 	// Imports fail closed. The idempotent initializer opens registration only
 	// after it has created or verified the managed bootstrap administrator.
-	if realm.LoginTheme != "termlink-01b-v11" || realm.AccountTheme != "termlink-01b-v11" ||
+	if realm.LoginTheme != "termlink-01b-v12" || realm.AccountTheme != "termlink-01b-v12" ||
 		realm.RegistrationAllowed || realm.VerifyEmail || !realm.BruteForceProtected ||
 		realm.AccessTokenLifespan <= 0 || realm.AccessTokenLifespan > 300 ||
 		!realm.RevokeRefreshToken || realm.RefreshTokenMaxReuse != 0 {
@@ -182,26 +182,31 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 	acceptanceCompose := read("../../compose/acceptance.compose.yml")
 
 	for name, content := range map[string]string{
-		"login template account target":         `class="identity-account-link" href="/account"`,
+		"login template account target":         `termlinkAccountUrl = client.baseUrl`,
 		"login template accessible label":       `msg('termlinkBackToPersonalCenter')`,
+		"login template theme transfer":         `data-theme-transfer`,
 		"login pre-paint theme script":          `src="${url.resourcesPath}/js/theme-init.js"`,
-		"login pre-paint stored theme":          `localStorage.getItem("termlink-theme")`,
+		"login pre-paint stored theme":          `const storageKey = "termlink-theme"`,
+		"login pre-paint transferred theme":     `searchParams.get(transferParameter)`,
 		"login theme responsive account action": ".identity-account-link",
 		"login SVG theme control":               `class="theme-icon-moon"`,
 		"login SVG account return":              `<span class="identity-account-link-icon" aria-hidden="true"><svg`,
 		"Chinese personal-center copy":          "termlinkBackToPersonalCenter=返回个人中心",
 		"English personal-center copy":          "termlinkBackToPersonalCenter=Back to account center",
-		"account theme fallback target":         `referrer.href = "/account"`,
+		"account validated referrer target":     `safeAccountReturnURL(nativeReferrer?.getAttribute("href"))`,
 		"account theme fallback marker":         `data-termlink-account-link`,
 		"account theme stable action group":     `data-termlink-account-actions`,
 		"account persistent sidebar return":     `data-termlink-sidebar-return`,
-		"account sidebar return target":         `returnLink.href = "/account"`,
+		"account sidebar return target":         `returnLink.href = themedAccountReturnURL()`,
+		"account desktop sidebar accessibility": `sidebar.setAttribute("aria-hidden", "false")`,
 		"account theme product brand":           `tl-account-brand-copy`,
 		"account pinned parent template":        "602b4bdf21d5dd386f2f8b9ee18b9d96a3054d430efabe00cea80779291a658f",
 		"account pre-paint theme script":        `<script src="${resourceUrl}/js/theme-init.js"></script>`,
+		"account static recovery link":          `class="tl-loading-return" href="${referrer_uri}"`,
 		"account authorization feature source":  `${(realm.userManagedAccessAllowed && isAuthorizationEnabled)?c}`,
 		"account runtime theme script":          `scripts=js/theme.js`,
-		"account pre-paint stored theme":        `localStorage.getItem("termlink-theme")`,
+		"account pre-paint stored theme":        `const storageKey = "termlink-theme"`,
+		"account pre-paint transferred theme":   `searchParams.get(transferParameter)`,
 		"account localized locale placeholder":  "defaultLocale=请选择...",
 		"account admin-aligned sidebar":         "grid-template-columns: 236px minmax(0, 1fr) !important;",
 		"account content-sized workspace":       "flex: 0 0 auto;",
@@ -209,14 +214,14 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 		"account theme return styling":          ".tl-account-return",
 		"account SVG theme control":             `class="theme-icon-moon"`,
 		"account SVG return control":            `tl-account-return-icon`,
-		"production image account theme":        `COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v11/`,
-		"production runtime account theme":      `-s accountTheme=termlink-01b-v11`,
+		"production image account theme":        `COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v12/`,
+		"production runtime account theme":      `-s accountTheme=termlink-01b-v12`,
 	} {
 		var source string
 		switch name {
-		case "login template account target", "login template accessible label", "login pre-paint theme script", "login SVG theme control", "login SVG account return":
+		case "login template account target", "login template accessible label", "login template theme transfer", "login pre-paint theme script", "login SVG theme control", "login SVG account return":
 			source = loginTemplate
-		case "login pre-paint stored theme":
+		case "login pre-paint stored theme", "login pre-paint transferred theme":
 			source = loginThemeInit
 		case "login theme responsive account action":
 			source = loginCSS
@@ -224,13 +229,13 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 			source = zhMessages
 		case "English personal-center copy":
 			source = enMessages
-		case "account theme fallback target", "account theme fallback marker", "account theme stable action group", "account persistent sidebar return", "account sidebar return target", "account theme product brand", "account redundant jump removal", "account SVG theme control", "account SVG return control":
+		case "account validated referrer target", "account theme fallback marker", "account theme stable action group", "account persistent sidebar return", "account sidebar return target", "account desktop sidebar accessibility", "account theme product brand", "account redundant jump removal", "account SVG theme control", "account SVG return control":
 			source = accountScript
-		case "account pinned parent template", "account pre-paint theme script", "account authorization feature source":
+		case "account pinned parent template", "account pre-paint theme script", "account static recovery link", "account authorization feature source":
 			source = accountTemplate
 		case "account runtime theme script":
 			source = accountThemeProperties
-		case "account pre-paint stored theme":
+		case "account pre-paint stored theme", "account pre-paint transferred theme":
 			source = accountThemeInit
 		case "account localized locale placeholder":
 			source = accountZhMessages

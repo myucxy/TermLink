@@ -7,9 +7,9 @@
   <meta name="description" content="TermLink 将 Windows Terminal 中的真实 PowerShell 与 AI CLI 安全连接到 Android。">
   <title>TermLink · 随时连接你的真实终端</title>
   <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
-  <script src="/assets/theme-init.js?v=01b-v8"></script>
-  <link rel="stylesheet" href="/assets/site.css?v=01b-v8">
-  <script src="/assets/theme.js?v=01b-v8" defer></script>
+  <script src="/assets/theme-init.js?v=01b-v9"></script>
+  <link rel="stylesheet" href="/assets/site.css?v=01b-v9">
+  <script src="/assets/theme.js?v=01b-v9" defer></script>
 </head>
 <body>
   <header class="site-header">
@@ -31,7 +31,7 @@
         <a class="button button-quiet" href="{{.AccountURL}}">个人中心</a>
         {{if .ConsoleURL}}<a class="button button-quiet" href="{{.ConsoleURL}}">管理台</a>{{end}}
       {{else}}
-        <a class="button button-quiet" href="{{.LoginURL}}">登录</a>
+        <a class="button button-quiet" href="{{.LoginURL}}" data-theme-transfer>登录</a>
       {{end}}
     </div>
   </header>
@@ -48,7 +48,7 @@
             <a class="button button-primary" href="{{.AccountURL}}">进入个人中心</a>
             {{if .ConsoleURL}}<a class="button button-quiet" href="{{.ConsoleURL}}">进入 Server Console</a>{{end}}
           {{else}}
-            <a class="button button-primary" href="{{.LoginURL}}">使用 TermLink 账号登录</a>
+            <a class="button button-primary" href="{{.LoginURL}}" data-theme-transfer>使用 TermLink 账号登录</a>
           {{end}}
           <a class="text-link" href="#product">了解工作方式 <span aria-hidden="true">→</span></a>
         </div>
@@ -142,7 +142,7 @@
           {{if .ConsoleURL}}<a class="button button-quiet" href="{{.ConsoleURL}}">打开管理台</a>{{end}}
         </div>
       {{else}}
-        <a class="button button-primary" href="{{.LoginURL}}">安全登录</a>
+        <a class="button button-primary" href="{{.LoginURL}}" data-theme-transfer>安全登录</a>
       {{end}}
     </section>
   </main>

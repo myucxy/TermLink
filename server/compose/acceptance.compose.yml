@@ -184,8 +184,8 @@ services:
         /opt/keycloak/bin/kcadm.sh update realms/termlink \
           --config /tmp/kcadm.config \
           -s displayName=TermLink \
-          -s loginTheme=termlink-01b-v11 \
-          -s accountTheme=termlink-01b-v11 \
+          -s loginTheme=termlink-01b-v12 \
+          -s accountTheme=termlink-01b-v12 \
           -s internationalizationEnabled=true \
           -s 'supportedLocales=["zh-CN","en"]' \
           -s defaultLocale=zh-CN \

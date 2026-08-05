@@ -2,6 +2,7 @@
   "use strict";
 
   const STORAGE_KEY = "termlink-theme";
+  const TRANSFER_PARAMETER = "termlink_theme";
   const LIGHT = "light";
   const DARK = "dark";
   const root = document.documentElement;
@@ -53,6 +54,20 @@
       button.setAttribute("title", labels.aria);
       button.removeAttribute("aria-pressed");
       button.dataset.theme = theme;
+    });
+    document.querySelectorAll("a[data-theme-transfer]").forEach((link) => {
+      const base = link.dataset.themeTransferBase || link.getAttribute("href");
+      if (!base) return;
+      link.dataset.themeTransferBase = base;
+      try {
+        const target = new URL(base, window.location.href);
+        target.searchParams.set(TRANSFER_PARAMETER, theme);
+        link.href = target.origin === window.location.origin
+          ? `${target.pathname}${target.search}${target.hash}`
+          : target.href;
+      } catch (_) {
+        // Keep the server-rendered safe target when URL parsing fails.
+      }
     });
   }
 

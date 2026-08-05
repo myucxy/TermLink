@@ -1,4 +1,10 @@
 <#macro registrationLayout bodyClass="" displayInfo=false displayMessage=true displayRequiredFields=false>
+<#assign termlinkAccountUrl = "">
+<#assign termlinkHomeUrl = "">
+<#if client?? && client.clientId == "termlink-web" && client.baseUrl?has_content>
+  <#assign termlinkAccountUrl = client.baseUrl>
+  <#assign termlinkHomeUrl = client.baseUrl?remove_ending("/")?remove_ending("/account") + "/">
+</#if>
 <!doctype html>
 <html lang="${lang}"<#if realm.internationalizationEnabled> dir="${(locale.rtl)?then('rtl','ltr')}"</#if>>
 <head>
@@ -27,16 +33,18 @@
 </head>
 <body class="tl-page ${bodyClass}<#if pageId != 'login'> tl-page-action</#if>" data-page-id="login-${pageId}">
   <header class="identity-titlebar">
-    <a class="identity-brand" href="/" aria-label="TermLink ${msg('termlinkHome')}">
+    <#if termlinkHomeUrl?has_content><a class="identity-brand" href="${termlinkHomeUrl}" data-theme-transfer aria-label="TermLink ${msg('termlinkHome')}"><#else><span class="identity-brand" aria-label="TermLink"></#if>
       <img src="${url.resourcesPath}/img/termlink-mark.svg" alt="">
       <span><strong>TermLink</strong><small>Account Center</small></span>
-    </a>
+    <#if termlinkHomeUrl?has_content></a><#else></span></#if>
     <div class="identity-title-actions">
       <span class="identity-secure-origin"><span class="lock-icon" aria-hidden="true"></span>${msg('termlinkVerifiedOrigin')}</span>
-      <a class="identity-account-link" href="/account" aria-label="${msg('termlinkBackToPersonalCenter')}">
-        <span class="identity-account-link-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M19 12H5m6-6-6 6 6 6"/></svg></span>
-        <span>${msg('termlinkPersonalCenter')}</span>
-      </a>
+      <#if termlinkAccountUrl?has_content>
+        <a class="identity-account-link" href="${termlinkAccountUrl}" data-theme-transfer aria-label="${msg('termlinkBackToPersonalCenter')}">
+          <span class="identity-account-link-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M19 12H5m6-6-6 6 6 6"/></svg></span>
+          <span>${msg('termlinkPersonalCenter')}</span>
+        </a>
+      </#if>
       <button class="theme-toggle" type="button" data-theme-toggle aria-label="${msg('termlinkThemeToggle')}" title="${msg('termlinkThemeToggle')}">
         <span class="theme-toggle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path class="theme-icon-moon" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/><g class="theme-icon-sun"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></g></svg></span>
         <span class="theme-toggle-label">${msg('termlinkTheme')}</span>
@@ -89,7 +97,7 @@
       <div class="bootstrap-summary">
         <span class="bootstrap-icon shield-icon" aria-hidden="true"></span>
         <span><strong>${msg("termlinkFirstDockerStart")}</strong><small>${msg("termlinkBootstrapDetail")}</small></span>
-        <a class="bootstrap-link" href="/#deploy">${msg("termlinkBootstrapGuide")}</a>
+        <#if termlinkHomeUrl?has_content><a class="bootstrap-link" href="${termlinkHomeUrl}#deploy" data-theme-transfer>${msg("termlinkBootstrapGuide")}</a></#if>
       </div>
     </section>
 

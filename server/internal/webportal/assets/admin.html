@@ -7,10 +7,10 @@
   <meta name="color-scheme" content="light dark">
   <title>{{.SectionTitle}} · TermLink Server Console</title>
   <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
-  <script src="/assets/theme-init.js?v=01b-v8"></script>
-  <link rel="stylesheet" href="/assets/site.css?v=01b-v8">
-  <link rel="stylesheet" href="/assets/admin.css?v=01b-v8">
-  <script src="/assets/theme.js?v=01b-v8" defer></script>
+  <script src="/assets/theme-init.js?v=01b-v9"></script>
+  <link rel="stylesheet" href="/assets/site.css?v=01b-v9">
+  <link rel="stylesheet" href="/assets/admin.css?v=01b-v9">
+  <script src="/assets/theme.js?v=01b-v9" defer></script>
 </head>
 <body class="admin-body">
   <div class="admin-shell">
@@ -141,7 +141,7 @@
       <section class="admin-grid">
         <article class="admin-panel"><div class="panel-heading"><div><p class="eyebrow">OIDC AUTHORITY</p><h2>身份服务</h2></div></div>
           <dl class="detail-list"><div><dt>Issuer</dt><dd>{{.Issuer}}</dd></div><div><dt>流程</dt><dd>Authorization Code + PKCE + nonce</dd></div><div><dt>门户会话</dt><dd>Secure · HttpOnly · SameSite</dd></div></dl>
-          <a class="button button-primary" href="{{.IdentityAccountURL}}">管理密码、MFA 与登录</a>
+          <a class="button button-primary" href="{{.IdentityAccountURL}}" data-theme-transfer>管理密码、MFA 与登录</a>
         </article>
         <article class="admin-panel"><div class="panel-heading"><div><p class="eyebrow">INITIAL ADMIN</p><h2>首个管理员</h2></div></div>
           <ol class="numbered-list"><li>身份初始化创建固定用户名 <code>admin</code>。</li><li>随机临时密码只存在于受管 Secret，并要求首次登录改密。</li><li>数据库只在不存在 SUPER_ADMIN 时接受签名的首次引导声明。</li><li>唯一活动超级管理员不能被降级或停用。</li></ol>

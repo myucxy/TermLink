@@ -23,6 +23,7 @@ type testOIDCFlow struct {
 	state         string
 	nonce         string
 	challenge     string
+	theme         string
 	code          string
 	verifier      string
 	expectedNonce string
@@ -33,6 +34,7 @@ type testOIDCFlow struct {
 type testPortalRepository struct {
 	account          store.PortalAccount
 	dashboard        store.PortalAdminDashboard
+	dashboardErr     error
 	roleErr          error
 	statusErr        error
 	loginFailureCode string
@@ -68,7 +70,7 @@ func (r *testPortalRepository) GetPortalAccount(context.Context, [32]byte) (stor
 }
 
 func (r *testPortalRepository) PortalAdminDashboard(context.Context, uuid.UUID) (store.PortalAdminDashboard, error) {
-	return r.dashboard, nil
+	return r.dashboard, r.dashboardErr
 }
 
 func (r *testPortalRepository) UpdatePortalAccountRole(context.Context, uuid.UUID, uuid.UUID, store.Role, string) error {
@@ -79,11 +81,15 @@ func (r *testPortalRepository) UpdatePortalAccountStatus(context.Context, uuid.U
 	return r.statusErr
 }
 
-func (f *testOIDCFlow) AuthorizationURL(state, nonce, challenge string) string {
+func (f *testOIDCFlow) AuthorizationURL(state, nonce, challenge, theme string) string {
 	f.state = state
 	f.nonce = nonce
 	f.challenge = challenge
+	f.theme = theme
 	query := url.Values{"state": {state}, "nonce": {nonce}, "code_challenge": {challenge}}
+	if theme != "" {
+		query.Set(themeQueryParameter, theme)
+	}
 	return "https://identity.example/authorize?" + query.Encode()
 }
 
@@ -276,8 +282,8 @@ func TestPortalTemplatesApplyThemeBeforeStyles(t *testing.T) {
 			t.Fatal(err)
 		}
 		html := string(data)
-		initIndex := strings.Index(html, `/assets/theme-init.js?v=01b-v8`)
-		styleIndex := strings.Index(html, `/assets/site.css?v=01b-v8`)
+		initIndex := strings.Index(html, `/assets/theme-init.js?v=01b-v9`)
+		styleIndex := strings.Index(html, `/assets/site.css?v=01b-v9`)
 		if initIndex < 0 || styleIndex < 0 || initIndex > styleIndex {
 			t.Errorf("%s must restore the selected theme before loading product styles", name)
 		}
@@ -328,7 +334,7 @@ func TestPortalAccountResponsiveAndSVGControlContract(t *testing.T) {
 		t.Error("theme behavior must not rewrite controls with platform glyphs")
 	}
 	if !strings.Contains(readAsset("admin.css"), "scrollbar-width: thin;") ||
-		!strings.Contains(adminHTML, `/assets/admin.css?v=01b-v8`) {
+		!strings.Contains(adminHTML, `/assets/admin.css?v=01b-v9`) {
 		t.Error("mobile administrator navigation must use the versioned product scrollbar styling")
 	}
 	if strings.Contains(readAsset("theme.js"), `setAttribute("aria-pressed"`) {
@@ -508,6 +514,44 @@ func TestPortalLoginUsesPKCEAndSecureHostCookie(t *testing.T) {
 	}
 	if !strings.HasPrefix(cookie.Name, "__Host-") || cookie.MaxAge <= 0 {
 		t.Fatalf("OAuth cookie does not satisfy __Host- requirements: %+v", cookie)
+	}
+}
+
+func TestPortalTransfersOnlyValidatedThemeToOIDC(t *testing.T) {
+	flow := &testOIDCFlow{}
+	portal := newTestPortal(t, flow)
+
+	dark := performRequest(portal.Handler(), http.MethodGet, "/login?termlink_theme=dark", nil)
+	if dark.Code != http.StatusFound || flow.theme != "dark" {
+		t.Fatalf("dark theme login status/theme = %d/%q", dark.Code, flow.theme)
+	}
+	location, err := url.Parse(dark.Header().Get("Location"))
+	if err != nil || location.Query().Get(themeQueryParameter) != "dark" {
+		t.Fatalf("dark theme authorization location = %q", dark.Header().Get("Location"))
+	}
+
+	invalid := performRequest(portal.Handler(), http.MethodGet, "/login?termlink_theme=attacker", nil)
+	if invalid.Code != http.StatusFound || flow.theme != "" {
+		t.Fatalf("invalid theme login status/theme = %d/%q", invalid.Code, flow.theme)
+	}
+}
+
+func TestPortalInternalErrorsKeepProductRecoveryNavigation(t *testing.T) {
+	flow := &testOIDCFlow{identity: accountIdentity{
+		Subject: "admin-subject", Username: "admin", Roles: []string{"SUPER_ADMIN"},
+	}}
+	portal := newTestPortal(t, flow)
+	repository := portal.config.Repository.(*testPortalRepository)
+	repository.account.Role = store.RoleSuperAdmin
+	cookie, _ := completeLoginAt(t, portal, flow, "/admin")
+	repository.dashboardErr = errors.New("dashboard unavailable fixture")
+
+	response := performRequest(portal.Handler(), http.MethodGet, "/admin", nil, cookie)
+	if response.Code != http.StatusInternalServerError ||
+		!strings.Contains(response.Header().Get("Content-Type"), "text/html") ||
+		!strings.Contains(response.Body.String(), `href="/account">返回个人中心</a>`) ||
+		!strings.Contains(response.Body.String(), "/assets/site.css") {
+		t.Fatalf("internal error recovery page = %d %q", response.Code, response.Body.String())
 	}
 }
 
