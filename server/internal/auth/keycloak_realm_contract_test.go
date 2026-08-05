@@ -132,6 +132,31 @@ func TestAcceptanceBootstrapFailsClosedBeforeOpeningRegistration(t *testing.T) {
 	}
 }
 
+func TestAcceptanceBootstrapPreservesExistingAcceptanceSessions(t *testing.T) {
+	data, err := os.ReadFile("../../compose/acceptance.compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compose := string(data)
+	loopStart := strings.Index(compose, "for username in acceptance-user acceptance-probe; do")
+	if loopStart < 0 {
+		t.Fatal("acceptance identity users are missing")
+	}
+	loopEndOffset := strings.Index(compose[loopStart:], "\n        done")
+	if loopEndOffset < 0 {
+		t.Fatal("acceptance identity user loop is incomplete")
+	}
+	loop := compose[loopStart : loopStart+loopEndOffset]
+	creationBranchEnd := strings.Index(loop, "\n          fi")
+	passwordInitialization := strings.Index(loop, "kcadm.sh set-password")
+	profileReconciliation := strings.Index(loop, "kcadm.sh update \"users/$$user_id\"")
+	if creationBranchEnd < 0 || passwordInitialization < 0 || profileReconciliation < 0 ||
+		passwordInitialization > creationBranchEnd || profileReconciliation < creationBranchEnd ||
+		strings.Count(loop, "kcadm.sh set-password") != 1 {
+		t.Fatal("acceptance user passwords must be initialized only when the managed user is first created")
+	}
+}
+
 func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 	read := func(path string) string {
 		t.Helper()

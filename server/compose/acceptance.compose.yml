@@ -398,6 +398,13 @@ services:
             user_id=$$(/opt/keycloak/bin/kcadm.sh create users \
               --config /tmp/kcadm.config \
               -r termlink -s username="$$username" -s enabled=true -i)
+            # Setting even an unchanged password revokes active Keycloak
+            # sessions. Keep ordinary production-style rebuilds idempotent;
+            # Start-ProductionAcceptance -Reset still creates fresh users and
+            # therefore initializes their managed password here.
+            /opt/keycloak/bin/kcadm.sh set-password \
+              --config /tmp/kcadm.config \
+              -r termlink --userid "$$user_id" --new-password "$$user_password" >/dev/null
           fi
           /opt/keycloak/bin/kcadm.sh update "users/$$user_id" \
             --config /tmp/kcadm.config \
@@ -407,9 +414,6 @@ services:
             -s email="$$username@termlink.local" \
             -s emailVerified=true \
             -s enabled=true >/dev/null
-          /opt/keycloak/bin/kcadm.sh set-password \
-            --config /tmp/kcadm.config \
-            -r termlink --userid "$$user_id" --new-password "$$user_password" >/dev/null
           /opt/keycloak/bin/kcadm.sh add-roles \
             --config /tmp/kcadm.config -r termlink \
             --uid "$$user_id" --rolename USER >/dev/null
