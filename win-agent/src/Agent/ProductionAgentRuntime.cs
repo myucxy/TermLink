@@ -263,6 +263,44 @@ namespace TermLink.Agent
             finally { CryptographicOperations.ZeroMemory(body); }
         }
 
+        /// <summary>
+        /// Grants a permission to an Android device that has already completed
+        /// account-level self trust.  This is intentionally separate from the
+        /// short-lived pairing challenge flow used by pending devices.
+        /// </summary>
+        public void GrantDevice(Guid targetDeviceId, string permission)
+        {
+            if (targetDeviceId == Guid.Empty || targetDeviceId == credentials.DeviceId)
+                throw new ArgumentException("A different target device is required.", nameof(targetDeviceId));
+            permission = ProductionDeviceGrantContract.NormalizePermission(permission);
+            var body = JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                device_id = targetDeviceId,
+                permission
+            });
+            // Scope idempotency to this click/operation. A key derived only
+            // from the grant body would replay an old success for 24 hours if
+            // the same permission were revoked and then deliberately granted
+            // again. SendAsync still reuses this key for its authentication
+            // retry, which is the retry boundary idempotency is intended for.
+            var idempotencyKey = ProductionDeviceGrantContract.IdempotencyKey(
+                config.PcId, targetDeviceId, permission, Guid.NewGuid());
+            try
+            {
+                using var response = SendAsync(
+                    HttpMethod.Post,
+                    ProductionDeviceGrantContract.GrantsPath(config.PcId),
+                    body,
+                    true,
+                    idempotencyKey,
+                    cancellation.Token).GetAwaiter().GetResult();
+                response.EnsureSuccessStatusCode();
+                statusExpiresUtc = DateTime.MinValue;
+                RefreshStatusAsync(cancellation.Token).GetAwaiter().GetResult();
+            }
+            finally { CryptographicOperations.ZeroMemory(body); }
+        }
+
         public void RevokeDevice(Guid targetDeviceId)
         {
             if (targetDeviceId == Guid.Empty || targetDeviceId == credentials.DeviceId) throw new ArgumentException("The local PC device cannot revoke itself.", nameof(targetDeviceId));

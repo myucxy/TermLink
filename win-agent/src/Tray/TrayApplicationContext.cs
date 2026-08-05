@@ -2718,6 +2718,7 @@ namespace TermLink.Tray
         private readonly ListView devices;
         private readonly Button refreshButton;
         private readonly Button createChallengeButton;
+        private readonly Button grantButton;
         private readonly Button revokeButton;
         private readonly ComboBox pairingPermission;
         private readonly TextBox challengeCodeValue;
@@ -2806,6 +2807,8 @@ namespace TermLink.Tray
             refreshButton.Click += delegate { RefreshStatus(); };
             createChallengeButton = new TrayThemedButton { Text = TrayText.Pick("创建配对请求", "Create pairing request"), AutoSize = true, Enabled = false };
             createChallengeButton.Click += delegate { CreateChallenge(); };
+            grantButton = new TrayThemedButton { Text = TrayText.Pick("直接授权", "Grant on this PC"), AutoSize = true, Enabled = false };
+            grantButton.Click += delegate { GrantSelected(); };
             revokeButton = new TrayThemedButton { Text = TrayText.Pick("撤销设备", "Revoke device"), AutoSize = true, Enabled = false };
             revokeButton.Tag = "danger";
             revokeButton.Click += delegate { RevokeSelected(); };
@@ -2822,6 +2825,7 @@ namespace TermLink.Tray
             TrayComboBoxStyle.Configure(pairingPermission);
             actions.Controls.Add(refreshButton);
             actions.Controls.Add(revokeButton);
+            actions.Controls.Add(grantButton);
             actions.Controls.Add(createChallengeButton);
             actions.Controls.Add(pairingPermission);
 
@@ -3009,7 +3013,12 @@ namespace TermLink.Tray
             var pendingAndroid = selected != null &&
                 string.Equals(selected.Type, "ANDROID", StringComparison.OrdinalIgnoreCase) &&
                 string.Equals(selected.TrustState, "PENDING", StringComparison.OrdinalIgnoreCase);
+            var trustedAndroid = selected != null &&
+                string.Equals(selected.Type, "ANDROID", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(selected.TrustState, "TRUSTED", StringComparison.OrdinalIgnoreCase);
             createChallengeButton.Enabled = pendingAndroid && pairingPermission.SelectedIndex >= 0 &&
+                productionStatus != null && productionStatus.Configured && productionStatus.AccountLinked;
+            grantButton.Enabled = trustedAndroid && pairingPermission.SelectedIndex >= 0 &&
                 productionStatus != null && productionStatus.Configured && productionStatus.AccountLinked;
             revokeButton.Enabled = selected != null &&
                 !IsLocalPc(selected) &&
@@ -3020,7 +3029,8 @@ namespace TermLink.Tray
         private async void CreateChallenge()
         {
             var selected = SelectedDevice();
-            if (selected == null) return;
+            if (selected == null || !string.Equals(selected.Type, "ANDROID", StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(selected.TrustState, "PENDING", StringComparison.OrdinalIgnoreCase)) return;
             var permission = pairingPermission.SelectedItem as string ?? "VIEW";
             var permissionDetail = permission == "MANAGE"
                 ? TrayText.Pick("可查看、控制并管理此 PC 的设备授权", "view, control, and manage device access on this PC")
@@ -3044,6 +3054,37 @@ namespace TermLink.Tray
             catch (Exception)
             {
                 stateLabel.Text = TrayText.Pick("无法创建配对请求，请刷新后重试。", "Could not create the pairing request. Refresh and try again.");
+            }
+        }
+
+        private async void GrantSelected()
+        {
+            var selected = SelectedDevice();
+            if (selected == null || !string.Equals(selected.Type, "ANDROID", StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(selected.TrustState, "TRUSTED", StringComparison.OrdinalIgnoreCase)) return;
+            var permission = pairingPermission.SelectedItem as string ?? "VIEW";
+            var permissionDetail = permission == "MANAGE"
+                ? TrayText.Pick("可查看、控制并管理此 PC 的设备授权", "view, control, and manage device access on this PC")
+                : permission == "CONTROL"
+                    ? TrayText.Pick("可查看并申请此 PC 的短时控制租约", "view and request short control leases on this PC")
+                    : TrayText.Pick("只能查看此 PC 的终端", "view terminals on this PC only");
+            var targetName = TrayDisplay.StringOrDash(selected.Name);
+            if (MessageBox.Show(
+                TrayText.Pick("直接为已信任设备“" + targetName + "”授予 " + permission + "？\n\n" + permissionDetail + "。", "Grant " + permission + " directly to trusted device '" + targetName + "'?\n\nIt may " + permissionDetail + "."),
+                "TermLink",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            try
+            {
+                var response = await Task.Run(() => controller.GrantDevice(selected.DeviceId, permission));
+                if (!response.Success) throw new InvalidOperationException(response.Code);
+                Apply(response);
+                stateLabel.Text = TrayText.Pick("已为已信任设备“" + targetName + "”授予 " + permission + "。", permission + " granted directly to trusted device '" + targetName + "'.");
+            }
+            catch (Exception)
+            {
+                stateLabel.Text = TrayText.Pick("无法直接授权设备，请刷新后重试。", "Could not grant the trusted device. Refresh and try again.");
             }
         }
 

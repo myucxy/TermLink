@@ -220,6 +220,21 @@ namespace TermLink.Tray
                 10000);
         }
 
+        public RegistryResponse GrantDevice(Guid deviceId, string permission)
+        {
+            if (deviceId == Guid.Empty) throw new ArgumentException("A device is required.", nameof(deviceId));
+            permission = ProductionDeviceGrantContract.NormalizePermission(permission);
+            return RegistryControlClient.Send(
+                options.ControlPipeName,
+                new RegistryRequest
+                {
+                    Command = RegistryCommand.GrantDevice,
+                    DeviceId = deviceId,
+                    GrantPermission = permission
+                },
+                10000);
+        }
+
         public RegistryResponse RevokeDevice(Guid deviceId)
         {
             if (deviceId == Guid.Empty) throw new ArgumentException("A device is required.", nameof(deviceId));

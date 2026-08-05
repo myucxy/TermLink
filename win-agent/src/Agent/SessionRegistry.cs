@@ -1342,6 +1342,14 @@ namespace TermLink.Agent
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
 #endif
+                case RegistryCommand.GrantDevice:
+#if TERMLINK_PRODUCTION_RUNTIME
+                    if (productionRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+                    productionRuntime.GrantDevice(request.DeviceId, request.GrantPermission);
+                    return Response(true, "DEVICE_GRANT_UPDATED", 0);
+#else
+                    return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+#endif
                 case RegistryCommand.RevokeDevice:
 #if TERMLINK_PRODUCTION_RUNTIME
                     if (productionRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);

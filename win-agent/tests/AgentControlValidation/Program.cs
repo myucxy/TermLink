@@ -56,6 +56,34 @@ var pairingRequest = RoundTripRequest(new RegistryRequest
     PairingPermission = "CONTROL"
 });
 Require(pairingRequest.DeviceId == deviceId && pairingRequest.PairingPermission == "CONTROL", "Pairing request changed.");
+var directGrantRequest = RoundTripRequest(new RegistryRequest
+{
+    Command = RegistryCommand.GrantDevice,
+    DeviceId = deviceId,
+    GrantPermission = "MANAGE"
+});
+Require(directGrantRequest.DeviceId == deviceId && directGrantRequest.GrantPermission == "MANAGE",
+    "Trusted direct grant request changed.");
+Require(string.IsNullOrEmpty(directGrantRequest.PairingPermission),
+    "Trusted direct grant must not reuse pairing permission semantics.");
+var pcId = Guid.Parse("abcdef01-2345-6789-abcd-ef0123456789");
+Require(ProductionDeviceGrantContract.NormalizePermission(" control ") == "CONTROL",
+    "Direct grant permission normalization changed.");
+var grantsPath = ProductionDeviceGrantContract.GrantsPath(pcId);
+Require(grantsPath == "/v1/pcs/abcdef01-2345-6789-abcd-ef0123456789/grants",
+    "Direct grant endpoint path changed.");
+var operationId = Guid.Parse("01020304-0506-0708-090a-0b0c0d0e0f10");
+var grantKey = ProductionDeviceGrantContract.IdempotencyKey(pcId, deviceId, "MANAGE", operationId);
+Require(grantKey == ProductionDeviceGrantContract.IdempotencyKey(pcId, deviceId, " manage ", operationId) &&
+    grantKey == "pc-grant-abcdef0123456789abcdef0123456789-102132435465768798a9bacbdcedfe0f-manage-0102030405060708090a0b0c0d0e0f10",
+    "Direct grant idempotency key is not stable within one operation.");
+Require(grantKey != ProductionDeviceGrantContract.IdempotencyKey(
+        pcId, deviceId, "MANAGE", Guid.Parse("11121314-1516-1718-191a-1b1c1d1e1f20")),
+    "A later direct-grant operation must not replay an earlier grant response.");
+var invalidPermissionRejected = false;
+try { ProductionDeviceGrantContract.NormalizePermission("PAIR"); }
+catch (ArgumentException) { invalidPermissionRejected = true; }
+Require(invalidPermissionRejected, "Unsupported direct grant permission was accepted.");
 var revokeRequest = RoundTripRequest(new RegistryRequest { Command = RegistryCommand.RevokeDevice, DeviceId = deviceId });
 Require(revokeRequest.DeviceId == deviceId, "RevokeDevice ID changed.");
 

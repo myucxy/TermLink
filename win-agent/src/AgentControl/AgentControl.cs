@@ -239,7 +239,8 @@ namespace TermLink.Agent
         RestartAgent = 7,
         RefreshProductionStatus = 8,
         CreatePairingChallenge = 9,
-        RevokeDevice = 10
+        RevokeDevice = 10,
+        GrantDevice = 11
     }
 
     public sealed class RegistryRequest
@@ -249,6 +250,38 @@ namespace TermLink.Agent
         public Guid SessionId { get; set; }
         public Guid DeviceId { get; set; }
         public string PairingPermission { get; set; }
+        public string GrantPermission { get; set; }
+    }
+
+    /// <summary>
+    /// Shared, non-secret contract helpers for the owner-PC direct grant flow.
+    /// Keeping these outside the pairing request fields makes the two flows
+    /// difficult to accidentally conflate at the tray/registry boundary.
+    /// </summary>
+    public static class ProductionDeviceGrantContract
+    {
+        public static string NormalizePermission(string permission)
+        {
+            var normalized = (permission ?? string.Empty).Trim().ToUpperInvariant();
+            if (normalized != "VIEW" && normalized != "CONTROL" && normalized != "MANAGE")
+                throw new ArgumentException("A supported permission is required.", nameof(permission));
+            return normalized;
+        }
+
+        public static string GrantsPath(Guid pcId)
+        {
+            if (pcId == Guid.Empty) throw new ArgumentException("A PC is required.", nameof(pcId));
+            return "/v1/pcs/" + pcId.ToString("D") + "/grants";
+        }
+
+        public static string IdempotencyKey(Guid pcId, Guid deviceId, string permission, Guid operationId)
+        {
+            if (pcId == Guid.Empty) throw new ArgumentException("A PC is required.", nameof(pcId));
+            if (deviceId == Guid.Empty) throw new ArgumentException("A device is required.", nameof(deviceId));
+            if (operationId == Guid.Empty) throw new ArgumentException("An operation is required.", nameof(operationId));
+            return "pc-grant-" + pcId.ToString("N") + "-" + deviceId.ToString("N") + "-" +
+                NormalizePermission(permission).ToLowerInvariant() + "-" + operationId.ToString("N");
+        }
     }
 
     public enum ProductionRelayState : byte
@@ -345,6 +378,10 @@ namespace TermLink.Agent
                         WriteGuid(writer, request.DeviceId);
                         WriteString(writer, request.PairingPermission ?? string.Empty);
                         break;
+                    case RegistryCommand.GrantDevice:
+                        WriteGuid(writer, request.DeviceId);
+                        WriteString(writer, request.GrantPermission ?? string.Empty);
+                        break;
                     case RegistryCommand.RevokeDevice:
                         WriteGuid(writer, request.DeviceId);
                         break;
@@ -381,6 +418,10 @@ namespace TermLink.Agent
                     case RegistryCommand.CreatePairingChallenge:
                         request.DeviceId = ReadGuid(reader);
                         request.PairingPermission = ReadString(reader);
+                        break;
+                    case RegistryCommand.GrantDevice:
+                        request.DeviceId = ReadGuid(reader);
+                        request.GrantPermission = ReadString(reader);
                         break;
                     case RegistryCommand.RevokeDevice:
                         request.DeviceId = ReadGuid(reader);
