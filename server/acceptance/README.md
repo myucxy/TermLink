@@ -18,6 +18,25 @@ open both Realtime roles, route opaque production Protobuf Envelopes, enforce a
 control lease, release it as the PC, and verify device revocation disconnects
 the Android socket. No credential or token is printed.
 
+On a clean deployment, `keycloak-init` also creates the product account
+`admin`, assigns the realm bootstrap role `SUPER_ADMIN`, and installs a random
+24-character temporary password. Retrieve that password exactly once from a
+trusted local terminal, then complete Keycloak's mandatory password change:
+
+```powershell
+.\server\ops\Get-InitialAdminPassword.ps1
+```
+
+The retrieval command rotates the host bootstrap input before printing the
+original and records that it was claimed. Do not redirect or log its output.
+If it was already claimed and then lost, issue and retrieve a new temporary
+credential without exposing the Keycloak bootstrap credential:
+
+```powershell
+.\server\ops\Reset-InitialAdminPassword.ps1
+.\server\ops\Get-InitialAdminPassword.ps1
+```
+
 If Docker Desktop cannot pull Quay layers directly, the start script downloads
 the exact official platform manifest through the OCI registry API, verifies the
 manifest and every blob SHA-256, and loads it under an acceptance-only local
@@ -31,7 +50,7 @@ The local endpoints are:
 
 The public root is a product introduction page. Selecting **Login** starts an
 OIDC Authorization Code + PKCE flow through the `termlink-web` public client,
-then returns to `/account`. The portal stores only an encrypted, Secure,
+then returns a regular user to `/account` or a console role to `/admin`. The portal stores only an encrypted, Secure,
 HttpOnly, SameSite browser session; access and ID tokens are not persisted in
 the browser cookie. Signing out is protected by an origin check and CSRF token.
 

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -82,7 +84,11 @@ func runProduction() error {
 	if err != nil {
 		return err
 	}
-	authentication := auth.Middleware{Tokens: verifier, Devices: repository, Nonces: valkey, SubjectKey: []byte(cfg.TokenSigningKey.Value())}
+	keyMaster := cfg.TokenSigningKey.Value()
+	subjectKey := deriveServerKey(keyMaster, "oidc-subject-hash")
+	tokenKey := deriveServerKey(keyMaster, "capability-token-signing")
+	cookieKey := deriveServerKey(keyMaster, "web-cookie-master")
+	authentication := auth.Middleware{Tokens: verifier, Devices: repository, Nonces: valkey, SubjectKey: subjectKey}
 	var historyStore *history.Store
 	if cfg.HistoryEnabled {
 		historyStore, err = history.Open(ctx, cfg.S3Endpoint, cfg.S3PublicEndpoint, cfg.S3Region, cfg.S3Bucket, cfg.S3AccessKey.Value(), cfg.S3SecretKey.Value())
@@ -92,7 +98,7 @@ func runProduction() error {
 	}
 	productionAPI := &api.API{
 		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication,
-		SubjectKey: []byte(cfg.TokenSigningKey.Value()), TokenKey: []byte(cfg.TokenSigningKey.Value()), History: optionalHistoryStore(historyStore),
+		SubjectKey: subjectKey, TokenKey: tokenKey, History: optionalHistoryStore(historyStore),
 		ClientConfig: api.ClientConfiguration{
 			OIDCIssuer: cfg.OIDCIssuer, OIDCClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI,
 			WindowsClientID: cfg.WindowsOIDCClientID, WindowsRedirectURI: cfg.WindowsOIDCRedirectURI,
@@ -111,7 +117,9 @@ func runProduction() error {
 		Issuer:      cfg.OIDCIssuer,
 		ClientID:    cfg.WebOIDCClientID,
 		RedirectURI: cfg.WebOIDCRedirectURI,
-		CookieKey:   []byte(cfg.TokenSigningKey.Value()),
+		CookieKey:   cookieKey,
+		SubjectKey:  subjectKey,
+		Repository:  repository,
 	})
 	if err != nil {
 		return fmt.Errorf("initialize web portal: %w", err)
@@ -126,6 +134,13 @@ func runProduction() error {
 	go consumeRevocations(ctx, valkey, hub)
 	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "history_enabled", cfg.HistoryEnabled, "metrics_enabled", cfg.MetricsListenAddr != "")
 	return serveProduction(ctx, serverruntime.New(cfg, metrics.HTTPMiddleware(mux)), metrics, cfg.MetricsListenAddr)
+}
+
+func deriveServerKey(master, purpose string) []byte {
+	mac := hmac.New(sha256.New, []byte(master))
+	_, _ = mac.Write([]byte("TermLink server key V1\x00"))
+	_, _ = mac.Write([]byte(purpose))
+	return mac.Sum(nil)
 }
 
 func serveProduction(ctx context.Context, application *serverruntime.Runtime, metrics *observability.Metrics, metricsAddr string) error {

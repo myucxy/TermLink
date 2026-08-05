@@ -24,14 +24,18 @@
     </#list>
   </#if>
 </head>
-<body class="tl-page ${bodyClass}" data-page-id="login-${pageId}">
+<body class="tl-page ${bodyClass}<#if pageId != 'login'> tl-page-action</#if>" data-page-id="login-${pageId}">
   <header class="identity-titlebar">
-    <a class="identity-brand" href="https://termlink.kget.cc:8910/" aria-label="TermLink ${msg('termlinkHome')}">
+    <a class="identity-brand" href="/" aria-label="TermLink ${msg('termlinkHome')}">
       <img src="${url.resourcesPath}/img/termlink-mark.svg" alt="">
       <span><strong>TermLink</strong><small>Account Center</small></span>
     </a>
     <div class="identity-title-actions">
-      <span class="identity-secure-origin"><span class="lock-icon" aria-hidden="true"></span>https://termlink.kget.cc:8910</span>
+      <span class="identity-secure-origin"><span class="lock-icon" aria-hidden="true"></span>${msg('termlinkVerifiedOrigin')}</span>
+      <button class="theme-toggle" type="button" data-theme-toggle aria-label="${msg('termlinkThemeToggle')}" title="${msg('termlinkThemeToggle')}" aria-pressed="false">
+        <span class="theme-toggle-icon" aria-hidden="true">◐</span>
+        <span class="theme-toggle-label">${msg('termlinkTheme')}</span>
+      </button>
       <#if realm.internationalizationEnabled && locale.supported?size gt 1>
         <#assign englishLocaleUrl = "">
         <#assign chineseLocaleUrl = "">
@@ -80,7 +84,7 @@
       <div class="bootstrap-summary">
         <span class="bootstrap-icon shield-icon" aria-hidden="true"></span>
         <span><strong>${msg("termlinkFirstDockerStart")}</strong><small>${msg("termlinkBootstrapDetail")}</small></span>
-        <a class="bootstrap-link" href="https://termlink.kget.cc:8910/#deploy">${msg("termlinkBootstrapGuide")}</a>
+        <a class="bootstrap-link" href="/#deploy">${msg("termlinkBootstrapGuide")}</a>
       </div>
     </section>
 

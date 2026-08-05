@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -9,6 +10,22 @@ import (
 func TestOptionalHistoryStoreDoesNotWrapTypedNil(t *testing.T) {
 	if optionalHistoryStore(nil) != nil {
 		t.Fatal("disabled history store became a non-nil interface")
+	}
+}
+
+func TestDeriveServerKeySeparatesSecurityDomains(t *testing.T) {
+	master := "0123456789abcdef0123456789abcdef"
+	subject := deriveServerKey(master, "oidc-subject-hash")
+	token := deriveServerKey(master, "capability-token-signing")
+	cookie := deriveServerKey(master, "web-cookie-master")
+	if len(subject) != 32 || len(token) != 32 || len(cookie) != 32 {
+		t.Fatalf("derived key lengths = %d/%d/%d", len(subject), len(token), len(cookie))
+	}
+	if bytes.Equal(subject, token) || bytes.Equal(subject, cookie) || bytes.Equal(token, cookie) {
+		t.Fatal("distinct security domains produced the same derived key")
+	}
+	if !bytes.Equal(subject, deriveServerKey(master, "oidc-subject-hash")) {
+		t.Fatal("server key derivation is not deterministic")
 	}
 }
 

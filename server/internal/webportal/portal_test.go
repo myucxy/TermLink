@@ -12,6 +12,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/termlink/termlink/server/internal/store"
 )
 
 const testPublicHost = "termlink.example:8910"
@@ -25,6 +28,49 @@ type testOIDCFlow struct {
 	expectedNonce string
 	identity      accountIdentity
 	exchangeErr   error
+}
+
+type testPortalRepository struct {
+	account   store.PortalAccount
+	dashboard store.PortalAdminDashboard
+	roleErr   error
+	statusErr error
+}
+
+func newTestPortalRepository() *testPortalRepository {
+	return &testPortalRepository{account: store.PortalAccount{
+		ID: uuid.MustParse("11111111-1111-4111-8111-111111111111"), Role: store.RoleUser, Status: "ACTIVE",
+		CreatedAt: time.Date(2026, time.August, 4, 9, 0, 0, 0, time.UTC),
+	}}
+}
+
+func (r *testPortalRepository) SyncPortalIdentity(_ context.Context, _ [32]byte, asserted store.Role) (store.PortalAccount, error) {
+	if r.statusErr != nil {
+		return store.PortalAccount{}, r.statusErr
+	}
+	if asserted == store.RoleSuperAdmin {
+		r.account.Role = store.RoleSuperAdmin
+	}
+	return r.account, nil
+}
+
+func (r *testPortalRepository) GetPortalAccount(context.Context, [32]byte) (store.PortalAccount, error) {
+	if r.statusErr != nil {
+		return store.PortalAccount{}, r.statusErr
+	}
+	return r.account, nil
+}
+
+func (r *testPortalRepository) PortalAdminDashboard(context.Context, uuid.UUID) (store.PortalAdminDashboard, error) {
+	return r.dashboard, nil
+}
+
+func (r *testPortalRepository) UpdatePortalAccountRole(context.Context, uuid.UUID, uuid.UUID, store.Role, string) error {
+	return r.roleErr
+}
+
+func (r *testPortalRepository) UpdatePortalAccountStatus(context.Context, uuid.UUID, uuid.UUID, string, string) error {
+	return r.statusErr
 }
 
 func (f *testOIDCFlow) AuthorizationURL(state, nonce, challenge string) string {
@@ -58,6 +104,8 @@ func newTestPortal(t *testing.T, flow *testOIDCFlow) *Portal {
 		ClientID:    "termlink-web",
 		RedirectURI: "https://" + testPublicHost + "/auth/callback",
 		CookieKey:   []byte("0123456789abcdef0123456789abcdef"),
+		SubjectKey:  []byte("abcdef0123456789abcdef0123456789"),
+		Repository:  newTestPortalRepository(),
 		Clock:       func() time.Time { return clock },
 	}
 	origin, err := validateConfig(config)
@@ -69,6 +117,21 @@ func newTestPortal(t *testing.T, flow *testOIDCFlow) *Portal {
 		t.Fatalf("create test portal: %v", err)
 	}
 	return portal
+}
+
+func TestValidateConfigRejectsPublicURLWithPath(t *testing.T) {
+	config := Config{
+		PublicURL:   "https://" + testPublicHost + "/console",
+		Issuer:      "https://identity.example/realms/termlink",
+		ClientID:    "termlink-web",
+		RedirectURI: "https://" + testPublicHost + "/auth/callback",
+		CookieKey:   []byte("0123456789abcdef0123456789abcdef"),
+		SubjectKey:  []byte("abcdef0123456789abcdef0123456789"),
+		Repository:  newTestPortalRepository(),
+	}
+	if _, err := validateConfig(config); err == nil {
+		t.Fatal("validateConfig accepted a public URL with a non-root path")
+	}
 }
 
 func performRequest(handler http.Handler, method, target string, body io.Reader, cookies ...*http.Cookie) *httptest.ResponseRecorder {
@@ -121,12 +184,16 @@ func startLogin(t *testing.T, portal *Portal, flow *testOIDCFlow) (*http.Cookie,
 }
 
 func completeLogin(t *testing.T, portal *Portal, flow *testOIDCFlow) (*http.Cookie, webSession) {
+	return completeLoginAt(t, portal, flow, "/account")
+}
+
+func completeLoginAt(t *testing.T, portal *Portal, flow *testOIDCFlow, wantLocation string) (*http.Cookie, webSession) {
 	t.Helper()
 	oauthCookie, state := startLogin(t, portal, flow)
 	target := "/auth/callback?code=production-code&state=" + url.QueryEscape(state.State)
 	recorder := performRequest(portal.Handler(), http.MethodGet, target, nil, oauthCookie)
-	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/account" {
-		t.Fatalf("callback response = %d %q, want 303 /account", recorder.Code, recorder.Header().Get("Location"))
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != wantLocation {
+		t.Fatalf("callback response = %d %q, want 303 %s", recorder.Code, recorder.Header().Get("Location"), wantLocation)
 	}
 	if flow.code != "production-code" || flow.verifier != state.Verifier || flow.expectedNonce != state.Nonce {
 		t.Fatal("callback did not pass the code, verifier, and nonce to OIDC verification")
@@ -169,12 +236,104 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 	if css.Code != http.StatusOK || !strings.HasPrefix(css.Header().Get("Content-Type"), "text/css") || css.Body.Len() < 1000 {
 		t.Fatalf("embedded stylesheet response is incomplete: status=%d bytes=%d", css.Code, css.Body.Len())
 	}
+	theme := performRequest(portal.Handler(), http.MethodGet, "/assets/theme.js", nil)
+	if theme.Code != http.StatusOK || !strings.HasPrefix(theme.Header().Get("Content-Type"), "text/javascript") ||
+		!strings.Contains(theme.Body.String(), "termlink-theme") {
+		t.Fatalf("embedded theme script response is incomplete: status=%d bytes=%d", theme.Code, theme.Body.Len())
+	}
 	for _, asset := range []string{"/assets/termlink-app-icon.svg", "/assets/termlink-favicon.svg"} {
 		icon := performRequest(portal.Handler(), http.MethodGet, asset, nil)
 		if icon.Code != http.StatusOK || icon.Header().Get("Content-Type") != "image/svg+xml" ||
 			!strings.Contains(icon.Body.String(), "TermLink") {
 			t.Fatalf("embedded brand asset %q is incomplete: status=%d bytes=%d", asset, icon.Code, icon.Body.Len())
 		}
+	}
+}
+
+func TestPortalSeparatesUserAndAdministratorDestinations(t *testing.T) {
+	userFlow := &testOIDCFlow{identity: accountIdentity{Subject: "user-subject", Username: "user"}}
+	userPortal := newTestPortal(t, userFlow)
+	userCookie, _ := completeLogin(t, userPortal, userFlow)
+	denied := performRequest(userPortal.Handler(), http.MethodGet, "/admin", nil, userCookie)
+	if denied.Code != http.StatusForbidden || !strings.Contains(denied.Body.String(), "无权访问管理台") {
+		t.Fatalf("regular user admin response = %d %q", denied.Code, denied.Body.String())
+	}
+
+	adminFlow := &testOIDCFlow{identity: accountIdentity{
+		Subject: "admin-subject", Username: "admin", Name: "TermLink Administrator",
+		Roles: []string{"offline_access", "SUPER_ADMIN"},
+	}}
+	adminPortal := newTestPortal(t, adminFlow)
+	adminCookie, session := completeLoginAt(t, adminPortal, adminFlow, "/admin")
+	if session.Role != string(store.RoleSuperAdmin) {
+		t.Fatalf("admin session role = %q", session.Role)
+	}
+	console := performRequest(adminPortal.Handler(), http.MethodGet, "/admin?section=accounts", nil, adminCookie)
+	if console.Code != http.StatusOK {
+		t.Fatalf("admin console status = %d, body=%q", console.Code, console.Body.String())
+	}
+	for _, text := range []string{"Server Console", "账号与角色", "SUPER_ADMIN", "终端正文始终不可见"} {
+		if !strings.Contains(console.Body.String(), text) {
+			t.Fatalf("admin console omitted %q", text)
+		}
+	}
+}
+
+func TestPortalAdminAndAuditorRolesAreReadOnly(t *testing.T) {
+	for _, role := range []store.Role{store.RoleAdmin, store.RoleAuditor} {
+		t.Run(string(role), func(t *testing.T) {
+			flow := &testOIDCFlow{identity: accountIdentity{Subject: "console-subject", Username: "console-user", Roles: []string{string(role)}}}
+			portal := newTestPortal(t, flow)
+			portal.config.Repository.(*testPortalRepository).account.Role = role
+			cookie, session := completeLoginAt(t, portal, flow, "/admin")
+			console := performRequest(portal.Handler(), http.MethodGet, "/admin?section=accounts", nil, cookie)
+			if console.Code != http.StatusOK || !strings.Contains(console.Body.String(), "只读") {
+				t.Fatalf("%s console response = %d %q", role, console.Code, console.Body.String())
+			}
+
+			targetID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
+			request := httptest.NewRequest(http.MethodPost, "https://"+testPublicHost+"/admin/accounts/"+targetID.String()+"/role", strings.NewReader("csrf="+url.QueryEscape(session.CSRF)+"&role=USER"))
+			request.Host = testPublicHost
+			request.Header.Set("Origin", "https://"+testPublicHost)
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			request.AddCookie(cookie)
+			recorder := httptest.NewRecorder()
+			portal.Handler().ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusForbidden {
+				t.Fatalf("%s account mutation status = %d, want 403", role, recorder.Code)
+			}
+		})
+	}
+}
+
+func TestPortalProtectsAdministratorMutationWithCSRFAndLastSuperAdminRule(t *testing.T) {
+	flow := &testOIDCFlow{identity: accountIdentity{Subject: "admin-subject", Username: "admin", Roles: []string{"SUPER_ADMIN"}}}
+	portal := newTestPortal(t, flow)
+	cookie, session := completeLoginAt(t, portal, flow, "/admin")
+	targetID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
+
+	request := httptest.NewRequest(http.MethodPost, "https://"+testPublicHost+"/admin/accounts/"+targetID.String()+"/role", strings.NewReader("csrf=wrong&role=USER"))
+	request.Host = testPublicHost
+	request.Header.Set("Origin", "https://"+testPublicHost)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	recorder := httptest.NewRecorder()
+	portal.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("admin mutation without CSRF status = %d, want 403", recorder.Code)
+	}
+
+	repository := portal.config.Repository.(*testPortalRepository)
+	repository.roleErr = store.ErrLastSuperAdmin
+	request = httptest.NewRequest(http.MethodPost, "https://"+testPublicHost+"/admin/accounts/"+targetID.String()+"/role", strings.NewReader("csrf="+url.QueryEscape(session.CSRF)+"&role=USER"))
+	request.Host = testPublicHost
+	request.Header.Set("Origin", "https://"+testPublicHost)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	recorder = httptest.NewRecorder()
+	portal.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "唯一超级管理员") {
+		t.Fatalf("last super admin response = %d %q", recorder.Code, recorder.Body.String())
 	}
 }
 

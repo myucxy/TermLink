@@ -73,6 +73,41 @@ Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当�
 - [LAN Docker 测试服务](server/README.md)
 - [生产运行时与 Compose](server/README-runtime.md)
 
+## 服务端访问与首个管理员
+
+生产验收部署的公开入口是 <https://termlink.kget.cc:8910/>。根路径始终先显示
+TermLink 产品首页；点击“登录”后才进入 Keycloak，普通用户完成登录后进入
+`/account`，拥有 `SUPER_ADMIN`、`ADMIN` 或 `AUDITOR` 数据库角色的账号进入受保护的
+`/admin`。首页、登录页、个人中心和管理台共用同一个深浅主题偏好，不会在页面切换时
+黑白跳变。
+
+首个版本的全新受管部署会创建固定用户名 `admin`，授予唯一初始
+`SUPER_ADMIN`，并设置随机 24 位临时密码。密码不写入仓库、镜像、README 或普通启动
+日志。完成部署后，只在可信本机终端执行下面的领取脚本；它会先以互斥方式写入已领取
+标记并轮换宿主机引导 Secret，再只输出一次原临时密码：
+
+```powershell
+.\server\ops\Start-ProductionAcceptance.ps1 -Reset
+.\server\ops\Get-InitialAdminPassword.ps1
+```
+
+不要把领取命令的输出重定向到文件、CI 日志、聊天或剪贴板历史。使用该临时密码首次
+登录时，Keycloak 会强制修改密码；改密后请在身份中心配置 MFA。普通重启不会重新创建
+管理员，也不会再次显示原临时密码。
+
+如果临时密码已领取但遗失，使用受管的重置脚本签发一个新的临时密码，再单次领取；
+脚本通过容器内文件型 Secret 调用身份管理工具，不会在命令行或日志中放入密码值：
+
+```powershell
+.\server\ops\Reset-InitialAdminPassword.ps1
+.\server\ops\Get-InitialAdminPassword.ps1
+```
+
+`admin` 进入管理台后可查看真实账号、设备、连接、会话、Schema、订阅计数和安全审计。
+角色与账号停用操作只允许最近登录的 `SUPER_ADMIN` 执行，并受同源 CSRF、数据库二次
+授权和“最后一个活动超级管理员不可降级/停用”的事务约束。控制台永不显示终端正文、
+Token 或 Secret；尚未实现的兑换码能力明确标为未启用，不展示原型假数据。
+
 ## 阶段 0/1 快速验证
 
 ```powershell

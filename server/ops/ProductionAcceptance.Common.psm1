@@ -9,6 +9,10 @@ function Get-TermLinkAcceptancePaths {
         SecretRoot = $secretRoot
         Marker = Join-Path $secretRoot '.managed-by-termlink-production-acceptance'
         AdminPassword = Join-Path $secretRoot 'keycloak-admin-password'
+        InitialAdminPassword = Join-Path $secretRoot 'admin-initial-password'
+        InitialAdminClaimed = Join-Path $secretRoot '.admin-initial-password-claimed'
+        InitialAdminReady = Join-Path $secretRoot '.admin-initial-password-ready'
+        InitialAdminLock = Join-Path $secretRoot '.admin-initial-password.lock'
         UserPassword = Join-Path $secretRoot 'acceptance-user-password'
         PostgresPassword = Join-Path $secretRoot 'postgres-password'
         OidcClientSecret = Join-Path $secretRoot 'oidc-client-secret'
@@ -24,6 +28,7 @@ function Set-TermLinkAcceptanceComposeEnvironment {
     param([Parameter(Mandatory)]$Paths)
 
     $env:TERMLINK_ACCEPTANCE_KEYCLOAK_ADMIN_PASSWORD_FILE = $Paths.AdminPassword
+    $env:TERMLINK_ACCEPTANCE_ADMIN_INITIAL_PASSWORD_FILE = $Paths.InitialAdminPassword
     $env:TERMLINK_ACCEPTANCE_USER_PASSWORD_FILE = $Paths.UserPassword
     $env:TERMLINK_ACCEPTANCE_POSTGRES_PASSWORD_FILE = $Paths.PostgresPassword
     $env:TERMLINK_ACCEPTANCE_OIDC_CLIENT_SECRET_FILE = $Paths.OidcClientSecret

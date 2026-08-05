@@ -98,6 +98,7 @@ services:
     command:
       - |
         admin_password="$$(cat /run/secrets/keycloak_admin_password)"
+        initial_admin_password="$$(cat /run/secrets/admin_initial_password)"
         user_password="$$(cat /run/secrets/acceptance_user_password)"
         for attempt in $$(seq 1 90); do
           if /opt/keycloak/bin/kcadm.sh config credentials \
@@ -119,6 +120,14 @@ services:
           -s 'supportedLocales=["zh-CN","en"]' \
           -s defaultLocale=zh-CN \
           -s rememberMe=true >/dev/null
+        for role_name in SUPER_ADMIN ADMIN AUDITOR USER; do
+          if ! /opt/keycloak/bin/kcadm.sh get "roles/$$role_name" \
+            --config /tmp/kcadm.config -r termlink >/dev/null 2>&1; then
+            /opt/keycloak/bin/kcadm.sh create roles \
+              --config /tmp/kcadm.config -r termlink \
+              -s name="$$role_name" >/dev/null
+          fi
+        done
         windows_client_id=$$(/opt/keycloak/bin/kcadm.sh get clients \
           --config /tmp/kcadm.config \
           -r termlink -q clientId=termlink-windows \
@@ -143,6 +152,69 @@ services:
         /opt/keycloak/bin/kcadm.sh update \
           "clients/$$windows_client_id/optional-client-scopes/$$offline_scope_id" \
           --config /tmp/kcadm.config -r termlink >/dev/null
+        web_client_id=$$(/opt/keycloak/bin/kcadm.sh get clients \
+          --config /tmp/kcadm.config \
+          -r termlink -q clientId=termlink-web \
+          --fields id --format csv --noquotes | tail -n 1)
+        test -n "$$web_client_id"
+        for scope_name in web-origins acr roles profile basic email; do
+          scope_id=$$(printf '%s\n' "$$client_scope_table" | while IFS=, read -r id name; do
+            if test "$$name" = "$$scope_name"; then printf '%s' "$$id"; fi
+          done)
+          test -n "$$scope_id"
+          /opt/keycloak/bin/kcadm.sh update \
+            "clients/$$web_client_id/default-client-scopes/$$scope_id" \
+            --config /tmp/kcadm.config -r termlink >/dev/null
+        done
+        cat > /tmp/termlink-web-realm-roles.json <<'JSON'
+        {
+          "name": "termlink-web-realm-roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "multivalued": "true",
+            "claim.name": "realm_access.roles",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+        JSON
+        web_mapper_table=$$(/opt/keycloak/bin/kcadm.sh get \
+          "clients/$$web_client_id/protocol-mappers/models" \
+          --config /tmp/kcadm.config -r termlink \
+          --fields id,name --format csv --noquotes)
+        web_mapper_id=$$(printf '%s\n' "$$web_mapper_table" | while IFS=, read -r id name; do
+          if test "$$name" = termlink-web-realm-roles; then printf '%s' "$$id"; fi
+        done)
+        if test -z "$$web_mapper_id"; then
+          /opt/keycloak/bin/kcadm.sh create \
+            "clients/$$web_client_id/protocol-mappers/models" \
+            --config /tmp/kcadm.config -r termlink \
+            -f /tmp/termlink-web-realm-roles.json >/dev/null
+        fi
+        admin_user_id=$$(/opt/keycloak/bin/kcadm.sh get users \
+          --config /tmp/kcadm.config \
+          -r termlink -q exact=true -q username=admin \
+          --fields id --format csv --noquotes | tail -n 1)
+        if test -z "$$admin_user_id"; then
+          admin_user_id=$$(/opt/keycloak/bin/kcadm.sh create users \
+            --config /tmp/kcadm.config -r termlink \
+            -s username=admin -s enabled=true -i)
+          /opt/keycloak/bin/kcadm.sh update "users/$$admin_user_id" \
+            --config /tmp/kcadm.config -r termlink \
+            -s firstName=TermLink -s lastName=Administrator \
+            -s email=admin@termlink.local -s emailVerified=true -s enabled=true >/dev/null
+          /opt/keycloak/bin/kcadm.sh set-password \
+            --config /tmp/kcadm.config \
+            -r termlink --userid "$$admin_user_id" \
+            --new-password "$$initial_admin_password" --temporary >/dev/null
+        fi
+        /opt/keycloak/bin/kcadm.sh add-roles \
+          --config /tmp/kcadm.config -r termlink \
+          --uid "$$admin_user_id" --rolename SUPER_ADMIN >/dev/null
         for username in acceptance-user acceptance-probe; do
           user_id=$$(/opt/keycloak/bin/kcadm.sh get users \
             --config /tmp/kcadm.config \
@@ -164,9 +236,13 @@ services:
           /opt/keycloak/bin/kcadm.sh set-password \
             --config /tmp/kcadm.config \
             -r termlink --userid "$$user_id" --new-password "$$user_password" >/dev/null
+          /opt/keycloak/bin/kcadm.sh add-roles \
+            --config /tmp/kcadm.config -r termlink \
+            --uid "$$user_id" --rolename USER >/dev/null
         done
     secrets:
       - keycloak_admin_password
+      - admin_initial_password
       - acceptance_user_password
     networks: ["acceptance"]
     read_only: true
@@ -317,6 +393,8 @@ services:
 secrets:
   keycloak_admin_password:
     file: ${TERMLINK_ACCEPTANCE_KEYCLOAK_ADMIN_PASSWORD_FILE:?required}
+  admin_initial_password:
+    file: ${TERMLINK_ACCEPTANCE_ADMIN_INITIAL_PASSWORD_FILE:?required}
   acceptance_user_password:
     file: ${TERMLINK_ACCEPTANCE_USER_PASSWORD_FILE:?required}
   postgres_password:

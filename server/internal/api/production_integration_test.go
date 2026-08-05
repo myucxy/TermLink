@@ -177,7 +177,7 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 
 func assertProductionMigrations(t *testing.T, repository *store.Postgres) {
 	t.Helper()
-	rows, err := repository.Pool.Query(context.Background(), `SELECT version,name FROM schema_migrations WHERE version BETWEEN 1 AND 5 ORDER BY version`)
+	rows, err := repository.Pool.Query(context.Background(), `SELECT version,name FROM schema_migrations WHERE version BETWEEN 1 AND 6 ORDER BY version`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,6 +191,7 @@ func assertProductionMigrations(t *testing.T, repository *store.Postgres) {
 		{3, "000003_history_uploads.up.sql"},
 		{4, "000004_pc_key_epoch.up.sql"},
 		{5, "000005_billing_entitlements.up.sql"},
+		{6, "000006_account_roles.up.sql"},
 	}
 	index := 0
 	for rows.Next() {

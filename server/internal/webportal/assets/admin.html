@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="color-scheme" content="light dark">
+  <title>{{.SectionTitle}} · TermLink Server Console</title>
+  <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/site.css">
+  <link rel="stylesheet" href="/assets/admin.css">
+  <script src="/assets/theme.js" defer></script>
+</head>
+<body class="admin-body">
+  <div class="admin-shell">
+    <aside class="admin-sidebar">
+      <a class="brand admin-brand" href="/" aria-label="TermLink 首页">
+        <img class="brand-mark" src="/assets/termlink-app-icon.svg" alt="">
+        <span><strong>TermLink</strong><small>Server Console</small></span>
+      </a>
+
+      <div class="environment-card">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span><small>环境</small><strong>production</strong></span>
+      </div>
+
+      <nav class="admin-nav" aria-label="服务端管理台">
+        <a href="/admin?section=overview"{{if eq .Section "overview"}} aria-current="page"{{end}}><span>01</span>运行概览</a>
+        <a href="/admin?section=connections"{{if eq .Section "connections"}} aria-current="page"{{end}}><span>02</span>连接路由</a>
+        <a href="/admin?section=deployment"{{if eq .Section "deployment"}} aria-current="page"{{end}}><span>03</span>Docker 部署</a>
+        <a href="/admin?section=audit"{{if eq .Section "audit"}} aria-current="page"{{end}}><span>04</span>安全审计</a>
+        <a href="/admin?section=billing"{{if eq .Section "billing"}} aria-current="page"{{end}}><span>05</span>订阅与权益</a>
+        <a href="/admin?section=identity"{{if eq .Section "identity"}} aria-current="page"{{end}}><span>06</span>账号门户</a>
+        <a href="/admin?section=accounts"{{if eq .Section "accounts"}} aria-current="page"{{end}}><span>07</span>账号与角色</a>
+        <a href="/admin?section=redemptions"{{if eq .Section "redemptions"}} aria-current="page"{{end}}><span>08</span>兑换码管理 <em>未启用</em></a>
+      </nav>
+
+      <div class="admin-user">
+        <span class="admin-avatar" aria-hidden="true">{{printf "%.1s" .Username}}</span>
+        <span><strong>{{.Username}}</strong><small>{{.RoleLabel}} · {{.Role}}</small></span>
+      </div>
+    </aside>
+
+    <main class="admin-main">
+      <header class="admin-topbar">
+        <div>
+          <p class="eyebrow">PRODUCTION · CONTENT BLIND</p>
+          <h1>{{.SectionTitle}}</h1>
+        </div>
+        <div class="admin-top-actions">
+          <button class="theme-button" type="button" data-theme-toggle aria-label="切换深浅主题" title="切换深浅主题">
+            <span class="theme-toggle-icon" aria-hidden="true">◐</span><span class="theme-toggle-label">主题</span>
+          </button>
+          <a class="button button-quiet" href="/account">个人中心</a>
+        </div>
+      </header>
+
+      {{if .Notice}}<div class="admin-notice" role="status">{{.Notice}}</div>{{end}}
+
+      {{if eq .Section "overview"}}
+      <section aria-labelledby="overview-heading">
+        <h2 class="sr-only" id="overview-heading">生产运行指标</h2>
+        <div class="admin-stats">
+          <article><small>账号</small><strong>{{.Dashboard.Users}}</strong><span>{{.Dashboard.ConsoleAccounts}} 个控制台角色</span></article>
+          <article><small>可信设备</small><strong>{{.Dashboard.TrustedDevices}}</strong><span>共 {{.Dashboard.Devices}} 个设备</span></article>
+          <article><small>运行会话</small><strong>{{.Dashboard.RunningSessions}}</strong><span>共 {{.Dashboard.Sessions}} 个未删除会话</span></article>
+          <article><small>Windows PC</small><strong>{{.Dashboard.PCs}}</strong><span>只统计路由元数据</span></article>
+        </div>
+        <div class="admin-grid">
+          <article class="admin-panel privacy-panel">
+            <div class="panel-heading"><div><p class="eyebrow">E2EE BOUNDARY</p><h2>正文不可见</h2></div><span class="icon-badge" aria-hidden="true">⌁</span></div>
+            <p>管理台只读取账号、设备、路由、序号和审计元数据。终端标题、命令、输出和历史明文不会进入服务端页面或数据库。</p>
+            <dl class="fact-grid">
+              <div><dt>Schema</dt><dd>v{{.Dashboard.SchemaVersion}}</dd></div>
+              <div><dt>协议</dt><dd>Protobuf v1</dd></div>
+              <div><dt>Relay</dt><dd>Opaque E2EE</dd></div>
+            </dl>
+          </article>
+          <article class="admin-panel">
+            <div class="panel-heading"><div><p class="eyebrow">RECENT EVENTS</p><h2>最近安全事件</h2></div><a href="/admin?section=audit">全部审计 →</a></div>
+            <div class="compact-event-list">
+              {{range .Dashboard.AuditEvents}}
+              <div><span class="event-result event-{{.Result}}" aria-hidden="true"></span><span><strong>{{.Action}}</strong><small>{{.TargetType}} · {{.Result}}</small></span><time>{{formatTime .CreatedAt}}</time></div>
+              {{else}}<p class="empty-copy">还没有安全事件。</p>{{end}}
+            </div>
+          </article>
+        </div>
+      </section>
+      {{end}}
+
+      {{if eq .Section "connections"}}
+      <section class="admin-panel" aria-labelledby="connections-heading">
+        <div class="panel-heading"><div><p class="eyebrow">REALTIME RELAY</p><h2 id="connections-heading">设备与会话路由</h2><p>仅展示连接元数据；不展示终端正文。</p></div><span class="count-pill">{{len .Dashboard.Connections}} 个设备</span></div>
+        <div class="admin-table-wrap"><table class="admin-table">
+          <thead><tr><th>设备</th><th>类型</th><th>信任</th><th>运行 Session</th><th>最后序号</th><th>最后活动</th></tr></thead>
+          <tbody>{{range .Dashboard.Connections}}<tr>
+            <td><strong>{{.Name}}</strong><small>{{shortID .ID}}</small></td><td>{{.DeviceType}}</td>
+            <td><span class="state-pill state-{{.TrustState}}">{{.TrustState}}</span></td><td>{{.RunningSessions}}</td><td>{{.LastOutputSeq}}</td><td>{{formatOptionalTime .LastSeenAt}}</td>
+          </tr>{{else}}<tr><td colspan="6" class="empty-cell">当前没有已注册设备。连接 Windows Agent 后会在这里出现。</td></tr>{{end}}</tbody>
+        </table></div>
+      </section>
+      {{end}}
+
+      {{if eq .Section "deployment"}}
+      <section class="admin-grid deployment-grid">
+        <article class="admin-panel"><div class="panel-heading"><div><p class="eyebrow">DEPLOYMENT</p><h2>生产 Compose</h2></div></div>
+          <dl class="detail-list"><div><dt>公开 Origin</dt><dd>{{.PublicURL}}</dd></div><div><dt>数据库 Schema</dt><dd>v{{.Dashboard.SchemaVersion}}</dd></div><div><dt>运行形态</dt><dd>Docker Compose · TLS edge</dd></div><div><dt>Secret</dt><dd>文件挂载 · 页面不回显</dd></div></dl>
+        </article>
+        <article class="admin-panel"><div class="panel-heading"><div><p class="eyebrow">SAFETY BASELINE</p><h2>部署边界</h2></div></div>
+          <ul class="check-list"><li>应用容器非 root、只读 RootFS</li><li>PostgreSQL 与 Valkey 仅位于内部网络</li><li>OIDC、API 与 Realtime 共用受信 HTTPS Origin</li><li>备份内容仅含元数据与 E2EE 密文</li></ul>
+          <p class="muted-note">容器级 CPU、内存和版本应由受保护的 Grafana/Prometheus 运维面查看，本页面不伪造监控数字。</p>
+        </article>
+      </section>
+      {{end}}
+
+      {{if eq .Section "audit"}}
+      <section class="admin-panel" aria-labelledby="audit-heading">
+        <div class="panel-heading"><div><p class="eyebrow">IMMUTABLE METADATA</p><h2 id="audit-heading">安全审计</h2><p>不包含命令、终端正文、Token 或 Secret。</p></div><span class="count-pill">最近 {{len .Dashboard.AuditEvents}} 条</span></div>
+        <div class="admin-table-wrap"><table class="admin-table">
+          <thead><tr><th>时间</th><th>动作</th><th>目标</th><th>结果</th><th>Trace ID</th></tr></thead>
+          <tbody>{{range .Dashboard.AuditEvents}}<tr><td>{{formatTime .CreatedAt}}</td><td><strong>{{.Action}}</strong></td><td>{{.TargetType}} <code class="masked-id" title="目标引用已脱敏">{{if .TargetID}}{{printf "%.8s…" .TargetID}}{{else}}—{{end}}</code></td><td><span class="state-pill event-{{.Result}}">{{.Result}}</span></td><td><code>{{.TraceID}}</code></td></tr>{{else}}<tr><td colspan="5" class="empty-cell">还没有审计事件。</td></tr>{{end}}</tbody>
+        </table></div>
+      </section>
+      {{end}}
+
+      {{if eq .Section "billing"}}
+      <section class="admin-grid">
+        <article class="admin-panel"><div class="panel-heading"><div><p class="eyebrow">PUBLISHED CATALOG</p><h2>订阅目录</h2></div></div>
+          <div class="large-metric"><strong>{{.Dashboard.Plans}}</strong><span>套餐记录</span></div>
+          <p>套餐草稿、发布版本和渠道映射由受设备证明保护的管理 API 维护。客户端只读取已发布目录。</p>
+        </article>
+        <article class="admin-panel"><div class="panel-heading"><div><p class="eyebrow">ENTITLEMENTS</p><h2>有效订阅</h2></div></div>
+          <div class="large-metric"><strong>{{.Dashboard.ActiveSubscriptions}}</strong><span>ACTIVE / GRACE</span></div>
+          <p>会员到期只停止超出权益的远程能力；Windows 本地 Shell、密钥和已有加密历史不会被终止或删除。</p>
+        </article>
+      </section>
+      {{end}}
+
+      {{if eq .Section "identity"}}
+      <section class="admin-grid">
+        <article class="admin-panel"><div class="panel-heading"><div><p class="eyebrow">OIDC AUTHORITY</p><h2>身份服务</h2></div></div>
+          <dl class="detail-list"><div><dt>Issuer</dt><dd>{{.Issuer}}</dd></div><div><dt>流程</dt><dd>Authorization Code + PKCE + nonce</dd></div><div><dt>门户会话</dt><dd>Secure · HttpOnly · SameSite</dd></div></dl>
+          <a class="button button-primary" href="{{.IdentityAccountURL}}">管理密码、MFA 与登录</a>
+        </article>
+        <article class="admin-panel"><div class="panel-heading"><div><p class="eyebrow">INITIAL ADMIN</p><h2>首个管理员</h2></div></div>
+          <ol class="numbered-list"><li>身份初始化创建固定用户名 <code>admin</code>。</li><li>随机临时密码只存在于受管 Secret，并要求首次登录改密。</li><li>数据库只在不存在 SUPER_ADMIN 时接受签名的首次引导声明。</li><li>唯一活动超级管理员不能被降级或停用。</li></ol>
+          <p class="muted-note">密码获取与丢失重置命令见仓库根 README；页面和日志不会回显 Secret。</p>
+        </article>
+      </section>
+      {{end}}
+
+      {{if eq .Section "accounts"}}
+      <section class="admin-panel" aria-labelledby="accounts-heading">
+        <div class="panel-heading"><div><p class="eyebrow">DATABASE AUTHORITY</p><h2 id="accounts-heading">账号与角色</h2><p>OIDC 证明身份；数据库角色在每次管理请求时重新检查。</p></div>{{if .CanManageAccounts}}<span class="state-pill state-TRUSTED">可管理</span>{{else}}<span class="state-pill">只读</span>{{end}}</div>
+        <div class="admin-table-wrap"><table class="admin-table accounts-table">
+          <thead><tr><th>账号引用</th><th>角色</th><th>状态</th><th>设备</th><th>创建时间</th><th>操作</th></tr></thead>
+          <tbody>{{range .Dashboard.Accounts}}<tr>
+            <td><strong>{{.Reference}}</strong><small>{{shortID .ID}}</small></td><td><span class="role-pill role-{{.Role}}">{{roleLabel .Role}}</span><small>{{.Role}}</small></td><td><span class="state-pill state-{{.Status}}">{{statusLabel .Status}}</span></td><td>{{.Devices}}</td><td>{{formatTime .CreatedAt}}</td>
+            <td>{{if $.CanManageAccounts}}<div class="row-actions">
+              {{if ne .Status "DELETED"}}
+                <form action="/admin/accounts/{{.ID}}/role" method="post" data-confirm-action="role" data-account="{{.Reference}}">
+                  <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                  <label><span class="sr-only">修改 {{.Reference}} 角色</span><select name="role" aria-label="修改 {{.Reference}} 角色"><option value="USER"{{if eq .Role "USER"}} selected{{end}}>USER</option><option value="AUDITOR"{{if eq .Role "AUDITOR"}} selected{{end}}>AUDITOR</option><option value="ADMIN"{{if eq .Role "ADMIN"}} selected{{end}}>ADMIN</option><option value="SUPER_ADMIN"{{if eq .Role "SUPER_ADMIN"}} selected{{end}}>SUPER_ADMIN</option></select></label>
+                  <button type="submit" aria-label="保存 {{.Reference}} 的角色">保存角色</button>
+                </form>
+              {{end}}
+              {{if eq .Status "ACTIVE"}}
+                <form action="/admin/accounts/{{.ID}}/status" method="post" data-confirm-action="lock" data-account="{{.Reference}}">
+                  <input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="status" value="LOCKED">
+                  <button class="danger-outline" type="submit" aria-label="停用 {{.Reference}}">停用</button>
+                </form>
+              {{else if eq .Status "LOCKED"}}
+                <form action="/admin/accounts/{{.ID}}/status" method="post" data-confirm-action="unlock" data-account="{{.Reference}}">
+                  <input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="status" value="ACTIVE">
+                  <button type="submit" aria-label="启用 {{.Reference}}">启用</button>
+                </form>
+              {{else if eq .Status "DELETED"}}
+                <span class="row-action-muted">已删除</span>
+              {{end}}
+            </div>{{else}}—{{end}}</td>
+          </tr>{{else}}<tr><td colspan="6" class="empty-cell">还没有账号。</td></tr>{{end}}</tbody>
+        </table></div>
+        <div class="security-callout"><strong>高风险保护</strong><p>角色和状态变更要求 SUPER_ADMIN、同源 CSRF 校验、最近 10 分钟内登录，并写入不可省略的审计事件。唯一活动 SUPER_ADMIN 受事务保护。</p></div>
+      </section>
+      {{end}}
+
+      {{if eq .Section "redemptions"}}
+      <section class="admin-panel disabled-feature" aria-labelledby="redemption-heading">
+        <span class="icon-badge" aria-hidden="true">◇</span><p class="eyebrow">NOT ENABLED</p><h2 id="redemption-heading">兑换码不在当前发布范围</h2>
+        <p>当前生产 Schema 没有兑换码表或兑换 API，因此控制台不会展示伪造批次、虚构兑换数据或不可用按钮。启用该能力前需先完成代码哈希、一次性兑换、批次停用、速率限制和审计设计。</p>
+        <a class="button button-quiet" href="/admin?section=billing">返回订阅与权益</a>
+      </section>
+      {{end}}
+
+      <footer class="admin-footer">
+        <span>TermLink Server Console · 终端正文始终不可见</span>
+        <form action="/logout" method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">安全退出</button></form>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

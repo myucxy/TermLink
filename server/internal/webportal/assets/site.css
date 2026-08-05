@@ -1,4 +1,66 @@
 :root {
+  color-scheme: light;
+  --canvas: #f4f6fa;
+  --canvas-soft: #edf0f6;
+  --surface: #ffffff;
+  --surface-raised: #f7f8fb;
+  --line: #d4dae5;
+  --line-soft: rgba(84, 98, 122, 0.17);
+  --text: #151922;
+  --text-2: #586477;
+  --text-3: #7a8494;
+  --accent: #5566dd;
+  --accent-strong: #4455c8;
+  --accent-2: #168f87;
+  --success: #168a57;
+  --warning: #a76808;
+  --danger: #c53e4b;
+  --shadow: 0 28px 80px rgba(30, 40, 60, 0.16);
+  --accent-on: #ffffff;
+  --accent-hover: #5566dd;
+  --button-quiet-bg: rgba(21, 25, 34, 0.035);
+  --button-quiet-hover: rgba(21, 25, 34, 0.07);
+  --danger-on: #8d2935;
+  --danger-bg: rgba(197, 62, 75, 0.1);
+  --danger-border: rgba(197, 62, 75, 0.38);
+  --cta-bg: rgba(85, 102, 221, 0.07);
+  --cta-border: rgba(85, 102, 221, 0.32);
+  --content: 1180px;
+  font-family: "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  background: var(--canvas);
+  color: var(--text);
+}
+
+html[data-theme="light"] {
+  color-scheme: light;
+  --canvas: #f4f6fa;
+  --canvas-soft: #edf0f6;
+  --surface: #ffffff;
+  --surface-raised: #f7f8fb;
+  --line: #d4dae5;
+  --line-soft: rgba(84, 98, 122, 0.17);
+  --text: #151922;
+  --text-2: #586477;
+  --text-3: #7a8494;
+  --accent: #5566dd;
+  --accent-strong: #4455c8;
+  --accent-2: #168f87;
+  --success: #168a57;
+  --warning: #a76808;
+  --danger: #c53e4b;
+  --shadow: 0 28px 80px rgba(30, 40, 60, 0.16);
+  --accent-on: #ffffff;
+  --accent-hover: #5566dd;
+  --button-quiet-bg: rgba(21, 25, 34, 0.035);
+  --button-quiet-hover: rgba(21, 25, 34, 0.07);
+  --danger-on: #8d2935;
+  --danger-bg: rgba(197, 62, 75, 0.1);
+  --danger-border: rgba(197, 62, 75, 0.38);
+  --cta-bg: rgba(85, 102, 221, 0.07);
+  --cta-border: rgba(85, 102, 221, 0.32);
+}
+
+html[data-theme="dark"] {
   color-scheme: dark;
   --canvas: #090b10;
   --canvas-soft: #0d1118;
@@ -16,10 +78,46 @@
   --warning: #f2b84b;
   --danger: #f46d75;
   --shadow: 0 28px 80px rgba(0, 0, 0, 0.38);
-  --content: 1180px;
-  font-family: "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
-  background: var(--canvas);
-  color: var(--text);
+  --accent-on: #0c1020;
+  --accent-hover: #c0c6ff;
+  --button-quiet-bg: rgba(255, 255, 255, 0.035);
+  --button-quiet-hover: rgba(255, 255, 255, 0.06);
+  --danger-on: #ffdfe1;
+  --danger-bg: rgba(244, 109, 117, 0.12);
+  --danger-border: rgba(244, 109, 117, 0.42);
+  --cta-bg: rgba(124, 140, 255, 0.07);
+  --cta-border: rgba(138, 151, 255, 0.32);
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]):not([data-theme="dark"]) {
+    color-scheme: dark;
+    --canvas: #090b10;
+    --canvas-soft: #0d1118;
+    --surface: #11151c;
+    --surface-raised: #171c26;
+    --line: #29303d;
+    --line-soft: rgba(156, 167, 184, 0.17);
+    --text: #f1f4f8;
+    --text-2: #aab4c4;
+    --text-3: #758196;
+    --accent: #8a97ff;
+    --accent-strong: #a8b1ff;
+    --accent-2: #4fd1c5;
+    --success: #49c987;
+    --warning: #f2b84b;
+    --danger: #f46d75;
+    --shadow: 0 28px 80px rgba(0, 0, 0, 0.38);
+    --accent-on: #0c1020;
+    --accent-hover: #c0c6ff;
+    --button-quiet-bg: rgba(255, 255, 255, 0.035);
+    --button-quiet-hover: rgba(255, 255, 255, 0.06);
+    --danger-on: #ffdfe1;
+    --danger-bg: rgba(244, 109, 117, 0.12);
+    --danger-border: rgba(244, 109, 117, 0.42);
+    --cta-bg: rgba(124, 140, 255, 0.07);
+    --cta-border: rgba(138, 151, 255, 0.32);
+  }
 }
 
 * {
@@ -146,34 +244,52 @@ a:focus-visible {
 }
 
 .button-primary {
-  color: #0c1020;
+  color: var(--accent-on);
   background: var(--accent-strong);
   border-color: var(--accent-strong);
 }
 
 .button-primary:hover {
-  background: #c0c6ff;
+  background: var(--accent-hover);
 }
 
 .button-quiet {
   color: var(--text);
-  background: rgba(255, 255, 255, 0.035);
+  background: var(--button-quiet-bg);
   border-color: var(--line);
 }
 
 .button-quiet:hover {
-  border-color: #485368;
-  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--text-3);
+  background: var(--button-quiet-hover);
 }
 
 .button-danger {
-  color: #ffdfe1;
-  background: rgba(244, 109, 117, 0.12);
-  border-color: rgba(244, 109, 117, 0.42);
+  color: var(--danger-on);
+  background: var(--danger-bg);
+  border-color: var(--danger-border);
 }
 
 .button-danger:hover {
-  background: rgba(244, 109, 117, 0.19);
+  background: color-mix(in srgb, var(--danger-bg) 150%, transparent);
+}
+
+.theme-toggle {
+  min-width: 76px;
+  padding-inline: 11px;
+}
+
+.theme-toggle-icon {
+  width: 1.1em;
+  display: inline-grid;
+  place-items: center;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.theme-toggle-label {
+  white-space: nowrap;
+  font-size: 12px;
 }
 
 .hero {
@@ -483,9 +599,9 @@ a:focus-visible {
   gap: 40px;
   margin-bottom: 76px;
   padding: 48px;
-  border: 1px solid rgba(138, 151, 255, 0.32);
+  border: 1px solid var(--cta-border);
   border-radius: 16px;
-  background: rgba(124, 140, 255, 0.07);
+  background: var(--cta-bg);
 }
 
 .final-cta h2 {
@@ -544,7 +660,7 @@ a:focus-visible {
   padding: 44px;
   border: 1px solid var(--line);
   border-radius: 17px;
-  background: rgba(17, 21, 28, 0.92);
+  background: var(--surface);
   box-shadow: var(--shadow);
 }
 
@@ -680,8 +796,16 @@ a:focus-visible {
   box-shadow: var(--shadow);
 }
 
-.error-card .brand {
+.error-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
   margin-bottom: 58px;
+}
+
+.error-card .brand {
+  margin-bottom: 0;
 }
 
 .error-card h1 {
@@ -732,6 +856,8 @@ a:focus-visible {
 
   .brand small { display: none; }
   .site-header > .button { padding-inline: 12px; }
+  .theme-toggle { min-width: 42px; padding-inline: 10px; }
+  .theme-toggle-label { display: none; }
   .hero { min-height: auto; padding: 54px 0 70px; }
   .hero h1 { font-size: 48px; }
   .hero-kicker { font-size: 30px; }
@@ -783,6 +909,7 @@ a:focus-visible {
   .account-title-row { align-items: flex-start; flex-direction: column-reverse; }
   .account-actions article { align-items: flex-start; flex-direction: column; }
   .account-footer-actions { align-items: flex-start; flex-direction: column; }
+  .error-card { padding: 34px 24px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

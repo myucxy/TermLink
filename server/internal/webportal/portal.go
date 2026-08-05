@@ -23,18 +23,22 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/google/uuid"
+	"github.com/termlink/termlink/server/internal/auth"
+	"github.com/termlink/termlink/server/internal/store"
 	"golang.org/x/oauth2"
 )
 
 const (
-	oauthCookieName   = "__Host-termlink-oauth"
-	sessionCookieName = "__Host-termlink-session"
-	oauthStateTTL     = 10 * time.Minute
-	webSessionTTL     = 8 * time.Hour
-	maximumCookieSize = 3800
+	oauthCookieName    = "__Host-termlink-oauth"
+	sessionCookieName  = "__Host-termlink-session"
+	oauthStateTTL      = 10 * time.Minute
+	webSessionTTL      = 8 * time.Hour
+	sensitiveActionTTL = 10 * time.Minute
+	maximumCookieSize  = 3800
 )
 
-//go:embed assets/*.html assets/*.css assets/*.svg
+//go:embed assets/*.html assets/*.css assets/*.js assets/*.svg
 var portalAssets embed.FS
 
 // Config contains only the public OIDC metadata and the server-held cookie key.
@@ -44,6 +48,8 @@ type Config struct {
 	ClientID    string
 	RedirectURI string
 	CookieKey   []byte
+	SubjectKey  []byte
+	Repository  portalRepository
 	Clock       func() time.Time
 }
 
@@ -52,6 +58,15 @@ type accountIdentity struct {
 	Username string
 	Name     string
 	Email    string
+	Roles    []string
+}
+
+type portalRepository interface {
+	SyncPortalIdentity(context.Context, [32]byte, store.Role) (store.PortalAccount, error)
+	GetPortalAccount(context.Context, [32]byte) (store.PortalAccount, error)
+	PortalAdminDashboard(context.Context, uuid.UUID) (store.PortalAdminDashboard, error)
+	UpdatePortalAccountRole(context.Context, uuid.UUID, uuid.UUID, store.Role, string) error
+	UpdatePortalAccountStatus(context.Context, uuid.UUID, uuid.UUID, string, string) error
 }
 
 type oidcFlow interface {
@@ -70,12 +85,14 @@ type oauthState struct {
 }
 
 type webSession struct {
-	Subject     string `json:"subject"`
-	Username    string `json:"username"`
-	Name        string `json:"name"`
-	Email       string `json:"email"`
-	CSRF        string `json:"csrf"`
-	ExpiresAtMS int64  `json:"expires_at_ms"`
+	Subject           string `json:"subject"`
+	Username          string `json:"username"`
+	Name              string `json:"name"`
+	Email             string `json:"email"`
+	Role              string `json:"role"`
+	CSRF              string `json:"csrf"`
+	AuthenticatedAtMS int64  `json:"authenticated_at_ms"`
+	ExpiresAtMS       int64  `json:"expires_at_ms"`
 }
 
 type cookieCodec struct {
@@ -92,6 +109,8 @@ type Portal struct {
 	sessionCodec cookieCodec
 	templates    *template.Template
 	styles       []byte
+	adminStyles  []byte
+	themeScript  []byte
 	appIcon      []byte
 	favicon      []byte
 }
@@ -111,6 +130,7 @@ type homePageData struct {
 	Username   string
 	LoginURL   string
 	AccountURL string
+	ConsoleURL string
 }
 
 type accountPageData struct {
@@ -119,6 +139,25 @@ type accountPageData struct {
 	Email              string
 	IdentityAccountURL string
 	CSRF               string
+	Role               store.Role
+	RoleLabel          string
+	CanOpenConsole     bool
+	ConsoleURL         string
+}
+
+type adminPageData struct {
+	Username           string
+	Role               store.Role
+	RoleLabel          string
+	CSRF               string
+	Section            string
+	SectionTitle       string
+	CanManageAccounts  bool
+	Dashboard          store.PortalAdminDashboard
+	IdentityAccountURL string
+	PublicURL          string
+	Issuer             string
+	Notice             string
 }
 
 type errorPageData struct {
@@ -163,13 +202,27 @@ func New(ctx context.Context, config Config) (*Portal, error) {
 }
 
 func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, error) {
-	parsed, err := template.ParseFS(portalAssets, "assets/*.html")
+	parsed, err := template.New("portal").Funcs(template.FuncMap{
+		"formatTime":         formatPortalTime,
+		"formatOptionalTime": formatOptionalPortalTime,
+		"shortID":            shortID,
+		"roleLabel":          roleLabel,
+		"statusLabel":        statusLabel,
+	}).ParseFS(portalAssets, "assets/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("parse web portal templates: %w", err)
 	}
 	styles, err := portalAssets.ReadFile("assets/site.css")
 	if err != nil {
 		return nil, fmt.Errorf("read web portal styles: %w", err)
+	}
+	adminStyles, err := portalAssets.ReadFile("assets/admin.css")
+	if err != nil {
+		return nil, fmt.Errorf("read web portal admin styles: %w", err)
+	}
+	themeScript, err := portalAssets.ReadFile("assets/theme.js")
+	if err != nil {
+		return nil, fmt.Errorf("read web portal theme script: %w", err)
 	}
 	appIcon, err := portalAssets.ReadFile("assets/termlink-app-icon.svg")
 	if err != nil {
@@ -198,6 +251,8 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 		sessionCodec: sessionCodec,
 		templates:    parsed,
 		styles:       styles,
+		adminStyles:  adminStyles,
+		themeScript:  themeScript,
 		appIcon:      appIcon,
 		favicon:      favicon,
 	}, nil
@@ -206,6 +261,7 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 func validateConfig(config Config) (*url.URL, error) {
 	publicOrigin, err := url.Parse(strings.TrimSpace(config.PublicURL))
 	if err != nil || publicOrigin.Scheme != "https" || publicOrigin.Host == "" || publicOrigin.User != nil ||
+		(publicOrigin.Path != "" && publicOrigin.Path != "/") || publicOrigin.RawPath != "" ||
 		publicOrigin.RawQuery != "" || publicOrigin.Fragment != "" {
 		return nil, errors.New("web portal public URL must be an HTTPS origin")
 	}
@@ -223,6 +279,12 @@ func validateConfig(config Config) (*url.URL, error) {
 	}
 	if len(config.CookieKey) < 32 {
 		return nil, errors.New("web portal cookie key must contain at least 32 bytes")
+	}
+	if len(config.SubjectKey) < 32 {
+		return nil, errors.New("web portal subject key must contain at least 32 bytes")
+	}
+	if config.Repository == nil {
+		return nil, errors.New("web portal account repository is required")
 	}
 	return publicOrigin, nil
 }
@@ -290,11 +352,16 @@ func (p *Portal) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", p.home)
 	mux.HandleFunc("GET /assets/site.css", p.siteCSS)
+	mux.HandleFunc("GET /assets/admin.css", p.adminCSS)
+	mux.HandleFunc("GET /assets/theme.js", p.themeJS)
 	mux.HandleFunc("GET /assets/termlink-app-icon.svg", p.svgAsset(p.appIcon))
 	mux.HandleFunc("GET /assets/termlink-favicon.svg", p.svgAsset(p.favicon))
 	mux.HandleFunc("GET /login", p.login)
 	mux.HandleFunc("GET /auth/callback", p.callback)
 	mux.HandleFunc("GET /account", p.account)
+	mux.HandleFunc("GET /admin", p.admin)
+	mux.HandleFunc("POST /admin/accounts/{id}/role", p.adminUpdateRole)
+	mux.HandleFunc("POST /admin/accounts/{id}/status", p.adminUpdateStatus)
 	mux.HandleFunc("POST /logout", p.logout)
 	mux.HandleFunc("/", p.notFound)
 	return p.securityHeaders(mux)
@@ -303,17 +370,34 @@ func (p *Portal) Handler() http.Handler {
 func (p *Portal) home(w http.ResponseWriter, r *http.Request) {
 	data := homePageData{LoginURL: "/login", AccountURL: "/account"}
 	if session, err := p.readSession(r); err == nil {
-		data.SignedIn = true
-		data.Username = session.Username
+		if account, accountErr := p.currentAccount(r.Context(), session); accountErr == nil {
+			data.SignedIn = true
+			data.Username = session.Username
+			if account.Role.CanOpenConsole() {
+				data.ConsoleURL = "/admin"
+			}
+		}
 	}
 	p.render(w, http.StatusOK, "home.html", data)
 }
 
 func (p *Portal) siteCSS(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	p.staticAsset(w, "text/css; charset=utf-8", p.styles)
+}
+
+func (p *Portal) adminCSS(w http.ResponseWriter, _ *http.Request) {
+	p.staticAsset(w, "text/css; charset=utf-8", p.adminStyles)
+}
+
+func (p *Portal) themeJS(w http.ResponseWriter, _ *http.Request) {
+	p.staticAsset(w, "text/javascript; charset=utf-8", p.themeScript)
+}
+
+func (p *Portal) staticAsset(w http.ResponseWriter, contentType string, contents []byte) {
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(p.styles)
+	_, _ = w.Write(contents)
 }
 
 func (p *Portal) svgAsset(contents []byte) http.HandlerFunc {
@@ -346,11 +430,15 @@ func (p *Portal) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	challenge := sha256.Sum256([]byte(verifier))
+	returnTo := "/account"
+	if r.URL.Query().Get("return_to") == "/admin" {
+		returnTo = "/admin"
+	}
 	stateCookie, err := p.oauthCodec.seal(oauthState{
 		State:      state,
 		Nonce:      nonce,
 		Verifier:   verifier,
-		ReturnTo:   "/account",
+		ReturnTo:   returnTo,
 		IssuedAtMS: p.now().UnixMilli(),
 	})
 	if err != nil {
@@ -400,21 +488,35 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	username := firstNonEmpty(identity.Username, identity.Name, identity.Email, "TermLink 用户")
+	account, err := p.config.Repository.SyncPortalIdentity(
+		r.Context(),
+		auth.SubjectHash(p.config.SubjectKey, auth.Identity{Issuer: p.config.Issuer, Subject: identity.Subject}),
+		assertedRole(identity.Roles),
+	)
+	if err != nil {
+		slog.Warn("web OIDC account authorization rejected", "error", err)
+		p.renderError(w, http.StatusForbidden, "账号不可用", "账号未启用或授权状态无效，请联系 TermLink 管理员。")
+		return
+	}
 	sessionCookie, err := p.sessionCodec.seal(webSession{
-		Subject:     identity.Subject,
-		Username:    username,
-		Name:        identity.Name,
-		Email:       identity.Email,
-		CSRF:        csrf,
-		ExpiresAtMS: p.now().Add(webSessionTTL).UnixMilli(),
+		Subject:           identity.Subject,
+		Username:          username,
+		Name:              identity.Name,
+		Email:             identity.Email,
+		Role:              string(account.Role),
+		CSRF:              csrf,
+		AuthenticatedAtMS: p.now().UnixMilli(),
+		ExpiresAtMS:       p.now().Add(webSessionTTL).UnixMilli(),
 	})
 	if err != nil {
 		p.internalError(w, err)
 		return
 	}
 	p.setCookie(w, sessionCookieName, sessionCookie, p.now().Add(webSessionTTL))
-	returnTo := pending.ReturnTo
-	if returnTo != "/account" {
+	returnTo := "/account"
+	if account.Role.CanOpenConsole() {
+		returnTo = "/admin"
+	} else if pending.ReturnTo == "/admin" {
 		returnTo = "/account"
 	}
 	http.Redirect(w, r, returnTo, http.StatusSeeOther)
@@ -431,13 +533,105 @@ func (p *Portal) account(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
+	portalAccount, err := p.currentAccount(r.Context(), session)
+	if err != nil {
+		p.clearCookie(w, sessionCookieName)
+		p.renderError(w, http.StatusForbidden, "账号不可用", "账号已被停用或浏览器会话需要重新登录。")
+		return
+	}
 	p.render(w, http.StatusOK, "account.html", accountPageData{
 		Username:           session.Username,
 		Name:               session.Name,
 		Email:              session.Email,
 		IdentityAccountURL: p.flow.AccountURL(),
 		CSRF:               session.CSRF,
+		Role:               portalAccount.Role,
+		RoleLabel:          roleLabel(portalAccount.Role),
+		CanOpenConsole:     portalAccount.Role.CanOpenConsole(),
+		ConsoleURL:         "/admin",
 	})
+}
+
+func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
+	if !p.usesPublicHost(r) {
+		http.Redirect(w, r, strings.TrimRight(p.config.PublicURL, "/")+"/admin", http.StatusSeeOther)
+		return
+	}
+	session, account, ok := p.requireConsole(w, r)
+	if !ok {
+		return
+	}
+	dashboard, err := p.config.Repository.PortalAdminDashboard(r.Context(), account.ID)
+	if err != nil {
+		p.internalError(w, err)
+		return
+	}
+	section := normalizeAdminSection(r.URL.Query().Get("section"))
+	p.render(w, http.StatusOK, "admin.html", adminPageData{
+		Username:           session.Username,
+		Role:               account.Role,
+		RoleLabel:          roleLabel(account.Role),
+		CSRF:               session.CSRF,
+		Section:            section,
+		SectionTitle:       adminSectionTitle(section),
+		CanManageAccounts:  account.Role.CanManageAccounts(),
+		Dashboard:          dashboard,
+		IdentityAccountURL: p.flow.AccountURL(),
+		PublicURL:          strings.TrimRight(p.config.PublicURL, "/"),
+		Issuer:             strings.TrimRight(p.config.Issuer, "/"),
+		Notice:             adminNotice(r.URL.Query().Get("notice")),
+	})
+}
+
+func (p *Portal) adminUpdateRole(w http.ResponseWriter, r *http.Request) {
+	session, account, ok := p.requireSuperAdminAction(w, r)
+	if !ok {
+		return
+	}
+	targetID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil || r.ParseForm() != nil {
+		p.renderError(w, http.StatusBadRequest, "请求无效", "账号或角色参数无效。")
+		return
+	}
+	role, err := store.ParseRole(r.Form.Get("role"))
+	if err != nil {
+		p.renderError(w, http.StatusBadRequest, "请求无效", "请选择受支持的账号角色。")
+		return
+	}
+	traceID, err := randomText(12)
+	if err != nil {
+		p.internalError(w, err)
+		return
+	}
+	if err := p.config.Repository.UpdatePortalAccountRole(r.Context(), account.ID, targetID, role, traceID); err != nil {
+		p.handleAdminMutationError(w, err)
+		return
+	}
+	_ = session
+	http.Redirect(w, r, "/admin?section=accounts&notice=role-updated", http.StatusSeeOther)
+}
+
+func (p *Portal) adminUpdateStatus(w http.ResponseWriter, r *http.Request) {
+	_, account, ok := p.requireSuperAdminAction(w, r)
+	if !ok {
+		return
+	}
+	targetID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil || r.ParseForm() != nil {
+		p.renderError(w, http.StatusBadRequest, "请求无效", "账号或状态参数无效。")
+		return
+	}
+	status := strings.ToUpper(strings.TrimSpace(r.Form.Get("status")))
+	traceID, err := randomText(12)
+	if err != nil {
+		p.internalError(w, err)
+		return
+	}
+	if err := p.config.Repository.UpdatePortalAccountStatus(r.Context(), account.ID, targetID, status, traceID); err != nil {
+		p.handleAdminMutationError(w, err)
+		return
+	}
+	http.Redirect(w, r, "/admin?section=accounts&notice=status-updated", http.StatusSeeOther)
 }
 
 func (p *Portal) logout(w http.ResponseWriter, r *http.Request) {
@@ -472,10 +666,13 @@ func (p *Portal) readSession(r *http.Request) (webSession, error) {
 	if err := p.sessionCodec.open(cookie.Value, &session); err != nil {
 		return webSession{}, err
 	}
-	if strings.TrimSpace(session.Subject) == "" || strings.TrimSpace(session.CSRF) == "" ||
+	role, roleErr := store.ParseRole(session.Role)
+	if strings.TrimSpace(session.Subject) == "" || strings.TrimSpace(session.CSRF) == "" || roleErr != nil ||
+		session.AuthenticatedAtMS <= 0 || session.AuthenticatedAtMS > p.now().UnixMilli() ||
 		p.now().UnixMilli() >= session.ExpiresAtMS {
 		return webSession{}, errors.New("web session expired")
 	}
+	session.Role = string(role)
 	return session, nil
 }
 
@@ -504,7 +701,7 @@ func (p *Portal) internalError(w http.ResponseWriter, err error) {
 
 func (p *Portal) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -596,6 +793,12 @@ func (f *productionOIDCFlow) ExchangeAndVerify(ctx context.Context, code, verifi
 		PreferredUsername string `json:"preferred_username"`
 		Name              string `json:"name"`
 		Email             string `json:"email"`
+		RealmAccess       struct {
+			Roles []string `json:"roles"`
+		} `json:"realm_access"`
+		ResourceAccess map[string]struct {
+			Roles []string `json:"roles"`
+		} `json:"resource_access"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
 		return accountIdentity{}, errors.New("web OIDC claims are invalid")
@@ -603,11 +806,16 @@ func (f *productionOIDCFlow) ExchangeAndVerify(ctx context.Context, code, verifi
 	if strings.TrimSpace(claims.Subject) == "" || !constantTextEqual(claims.Nonce, expectedNonce) {
 		return accountIdentity{}, errors.New("web OIDC nonce or subject is invalid")
 	}
+	roles := append([]string(nil), claims.RealmAccess.Roles...)
+	if resource, ok := claims.ResourceAccess[f.clientID]; ok {
+		roles = append(roles, resource.Roles...)
+	}
 	return accountIdentity{
 		Subject:  claims.Subject,
 		Username: claims.PreferredUsername,
 		Name:     claims.Name,
 		Email:    claims.Email,
+		Roles:    roles,
 	}, nil
 }
 
@@ -652,6 +860,155 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func assertedRole(roles []string) store.Role {
+	result := store.RoleUser
+	for _, value := range roles {
+		switch strings.ToUpper(strings.TrimSpace(value)) {
+		case string(store.RoleSuperAdmin):
+			return store.RoleSuperAdmin
+		case string(store.RoleAdmin):
+			result = store.RoleAdmin
+		case string(store.RoleAuditor):
+			if result == store.RoleUser {
+				result = store.RoleAuditor
+			}
+		}
+	}
+	return result
+}
+
+func (p *Portal) currentAccount(ctx context.Context, session webSession) (store.PortalAccount, error) {
+	return p.config.Repository.GetPortalAccount(ctx, auth.SubjectHash(
+		p.config.SubjectKey,
+		auth.Identity{Issuer: p.config.Issuer, Subject: session.Subject},
+	))
+}
+
+func (p *Portal) requireConsole(w http.ResponseWriter, r *http.Request) (webSession, store.PortalAccount, bool) {
+	session, err := p.readSession(r)
+	if err != nil {
+		p.clearCookie(w, sessionCookieName)
+		http.Redirect(w, r, "/login?return_to=/admin", http.StatusSeeOther)
+		return webSession{}, store.PortalAccount{}, false
+	}
+	account, err := p.currentAccount(r.Context(), session)
+	if err != nil || !account.Role.CanOpenConsole() || !store.Role(session.Role).CanOpenConsole() {
+		p.renderError(w, http.StatusForbidden, "无权访问管理台", "当前账号没有 TermLink Server Console 权限。")
+		return webSession{}, store.PortalAccount{}, false
+	}
+	return session, account, true
+}
+
+func (p *Portal) requireSuperAdminAction(w http.ResponseWriter, r *http.Request) (webSession, store.PortalAccount, bool) {
+	session, account, ok := p.requireConsole(w, r)
+	if !ok {
+		return webSession{}, store.PortalAccount{}, false
+	}
+	if !p.usesTrustedFormOrigin(r) || r.ParseForm() != nil || !constantTextEqual(session.CSRF, r.Form.Get("csrf")) {
+		p.renderError(w, http.StatusForbidden, "管理请求被拒绝", "请求来源或安全校验无效，请刷新管理台后重试。")
+		return webSession{}, store.PortalAccount{}, false
+	}
+	if account.Role != store.RoleSuperAdmin || store.Role(session.Role) != store.RoleSuperAdmin {
+		p.renderError(w, http.StatusForbidden, "需要超级管理员", "该操作仅允许 SUPER_ADMIN 执行。")
+		return webSession{}, store.PortalAccount{}, false
+	}
+	age := p.now().Sub(time.UnixMilli(session.AuthenticatedAtMS))
+	if age < 0 || age > sensitiveActionTTL {
+		p.renderError(w, http.StatusForbidden, "需要重新认证", "高风险操作仅允许在最近登录后的 10 分钟内执行，请安全退出并重新登录。")
+		return webSession{}, store.PortalAccount{}, false
+	}
+	return session, account, true
+}
+
+func (p *Portal) handleAdminMutationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrLastSuperAdmin):
+		p.renderError(w, http.StatusConflict, "无法修改唯一超级管理员", "请先创建并验证另一个 SUPER_ADMIN，再修改当前唯一超级管理员。")
+	case errors.Is(err, store.ErrDenied):
+		p.renderError(w, http.StatusForbidden, "管理请求被拒绝", "当前账号或目标状态不允许该操作。")
+	case errors.Is(err, store.ErrNotFound):
+		p.renderError(w, http.StatusNotFound, "账号不存在", "目标账号可能已被删除。")
+	default:
+		p.internalError(w, err)
+	}
+}
+
+func normalizeAdminSection(value string) string {
+	switch value {
+	case "overview", "connections", "deployment", "audit", "billing", "identity", "accounts", "redemptions":
+		return value
+	default:
+		return "overview"
+	}
+}
+
+func adminSectionTitle(section string) string {
+	return map[string]string{
+		"overview": "运行概览", "connections": "连接与路由", "deployment": "Docker 部署",
+		"audit": "安全审计", "billing": "订阅与权益", "identity": "账号门户",
+		"accounts": "账号与角色", "redemptions": "兑换码管理",
+	}[normalizeAdminSection(section)]
+}
+
+func adminNotice(value string) string {
+	switch value {
+	case "role-updated":
+		return "账号角色已更新，并已写入安全审计。"
+	case "status-updated":
+		return "账号状态已更新，并已写入安全审计。"
+	default:
+		return ""
+	}
+}
+
+func roleLabel(role store.Role) string {
+	switch role {
+	case store.RoleSuperAdmin:
+		return "超级管理员"
+	case store.RoleAdmin:
+		return "管理员"
+	case store.RoleAuditor:
+		return "审计员"
+	default:
+		return "普通用户"
+	}
+}
+
+func statusLabel(status string) string {
+	switch status {
+	case "ACTIVE":
+		return "已启用"
+	case "LOCKED":
+		return "已停用"
+	case "DELETED":
+		return "已删除"
+	default:
+		return status
+	}
+}
+
+func formatPortalTime(value time.Time) string {
+	if value.IsZero() {
+		return "—"
+	}
+	return value.UTC().Format("2006-01-02 15:04 UTC")
+}
+
+func formatOptionalPortalTime(value *time.Time) string {
+	if value == nil {
+		return "尚未上报"
+	}
+	return formatPortalTime(*value)
+}
+
+func shortID(value uuid.UUID) string {
+	text := value.String()
+	if len(text) < 8 {
+		return text
+	}
+	return text[:8] + "…"
 }
 
 func clear(value []byte) {

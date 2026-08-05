@@ -60,7 +60,7 @@ func (s *Postgres) VerifySchema(ctx context.Context) error {
 	if err := s.Pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&version); err != nil {
 		return fmt.Errorf("production schema unavailable; run migrate: %w", err)
 	}
-	if version != 5 {
+	if version != 6 {
 		return fmt.Errorf("unsupported production schema version %d", version)
 	}
 	return nil

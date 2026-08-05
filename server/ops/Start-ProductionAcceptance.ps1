@@ -31,10 +31,14 @@ if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container)) 
         throw "Refusing to reset an unmanaged directory: $($paths.SecretRoot)"
     }
     Set-TermLinkAcceptanceComposeEnvironment -Paths $paths
+    if (-not (Test-Path -LiteralPath $paths.InitialAdminPassword -PathType Leaf)) {
+        $env:TERMLINK_ACCEPTANCE_ADMIN_INITIAL_PASSWORD_FILE = $paths.AdminPassword
+    }
     & docker compose -f $paths.ComposeFile down --volumes --remove-orphans
     if ($LASTEXITCODE -ne 0) { throw 'Could not reset the production acceptance stack.' }
     foreach ($file in @(
-        $paths.AdminPassword, $paths.UserPassword, $paths.PostgresPassword,
+        $paths.AdminPassword, $paths.InitialAdminPassword, $paths.InitialAdminClaimed,
+        $paths.InitialAdminReady, $paths.InitialAdminLock, $paths.UserPassword, $paths.PostgresPassword,
         $paths.OidcClientSecret, $paths.DatabaseUrl, $paths.RedisUrl,
         $paths.TokenSigningKey, $paths.RootCa, $paths.Marker,
         $paths.ProbeIdentity
@@ -57,6 +61,7 @@ else {
 }
 
 Write-SecretFile $paths.AdminPassword (New-RandomText 32)
+Write-SecretFile $paths.InitialAdminPassword (New-RandomText 18)
 Write-SecretFile $paths.UserPassword (New-RandomText 32)
 $postgresPassword = if (Test-Path -LiteralPath $paths.PostgresPassword -PathType Leaf) {
     [IO.File]::ReadAllText($paths.PostgresPassword)
@@ -110,7 +115,15 @@ finally {
     Pop-Location
 }
 
+if (-not (Test-Path -LiteralPath $paths.InitialAdminReady -PathType Leaf) -and
+    -not (Test-Path -LiteralPath $paths.InitialAdminClaimed -PathType Leaf)) {
+    [IO.File]::WriteAllText($paths.InitialAdminReady, 'TermLink admin identity bootstrap completed', [Text.UTF8Encoding]::new($false))
+}
+
 Write-Output 'TermLink production acceptance stack is running.'
 Write-Output 'API: https://api.127.0.0.1.sslip.io:9443'
 Write-Output 'Public API/OIDC: https://termlink.kget.cc:8910'
 Write-Output "CA certificate: $($paths.RootCa)"
+if (-not (Test-Path -LiteralPath $paths.InitialAdminClaimed -PathType Leaf)) {
+    Write-Output 'Initial admin is ready. Retrieve its temporary password once with server\ops\Get-InitialAdminPassword.ps1.'
+}

@@ -3,17 +3,25 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
   <meta name="robots" content="noindex,nofollow">
   <title>{{.Title}} · TermLink</title>
   <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/assets/site.css">
+  <script src="/assets/theme.js" defer></script>
 </head>
 <body class="error-body">
   <main class="error-card">
-    <a class="brand" href="/" aria-label="TermLink 首页">
-      <img class="brand-mark" src="/assets/termlink-app-icon.svg" alt="">
-      <span><strong>TermLink</strong><small>Secure account portal</small></span>
-    </a>
+    <div class="error-card-header">
+      <a class="brand" href="/" aria-label="TermLink 首页">
+        <img class="brand-mark" src="/assets/termlink-app-icon.svg" alt="">
+        <span><strong>TermLink</strong><small>Secure account portal</small></span>
+      </a>
+      <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题" aria-pressed="false">
+        <span class="theme-toggle-icon" aria-hidden="true">◐</span>
+        <span class="theme-toggle-label">主题</span>
+      </button>
+    </div>
     <p class="eyebrow">REQUEST NOT COMPLETED</p>
     <h1>{{.Title}}</h1>
     <p>{{.Message}}</p>

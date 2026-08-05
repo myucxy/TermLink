@@ -17,8 +17,77 @@
   --danger: #c53e4b;
   --shadow: rgba(30, 40, 60, 0.16);
   --grid-dot: rgba(85, 102, 221, 0.12);
+  --accent-on: #ffffff;
   --font-ui: Inter, "Segoe UI Variable", "Microsoft YaHei UI", system-ui, sans-serif;
   --font-mono: "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+}
+
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f6fa;
+  --bg-elevated: #edf0f6;
+  --surface: #ffffff;
+  --surface-2: #f7f8fb;
+  --surface-3: #e9edf5;
+  --text: #151922;
+  --text-2: #586477;
+  --text-3: #7a8494;
+  --border: #d4dae5;
+  --border-soft: #e4e8ef;
+  --accent: #5566dd;
+  --accent-strong: #4455c8;
+  --accent-2: #168f87;
+  --success: #168a57;
+  --danger: #c53e4b;
+  --shadow: rgba(30, 40, 60, 0.16);
+  --grid-dot: rgba(85, 102, 221, 0.12);
+  --accent-on: #ffffff;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #090b10;
+  --bg-elevated: #0d1017;
+  --surface: #11151d;
+  --surface-2: #171c26;
+  --surface-3: #202735;
+  --text: #f1f4f8;
+  --text-2: #a3adbd;
+  --text-3: #737f92;
+  --border: #273041;
+  --border-soft: #1c2431;
+  --accent: #8594ff;
+  --accent-strong: #aeb7ff;
+  --accent-2: #52d2c7;
+  --success: #4bc98a;
+  --danger: #f1737c;
+  --shadow: rgba(0, 0, 0, 0.32);
+  --grid-dot: rgba(133, 148, 255, 0.12);
+  --accent-on: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]):not([data-theme="dark"]) {
+    color-scheme: dark;
+    --bg: #090b10;
+    --bg-elevated: #0d1017;
+    --surface: #11151d;
+    --surface-2: #171c26;
+    --surface-3: #202735;
+    --text: #f1f4f8;
+    --text-2: #a3adbd;
+    --text-3: #737f92;
+    --border: #273041;
+    --border-soft: #1c2431;
+    --accent: #8594ff;
+    --accent-strong: #aeb7ff;
+    --accent-2: #52d2c7;
+    --success: #4bc98a;
+    --danger: #f1737c;
+    --shadow: rgba(0, 0, 0, 0.32);
+    --grid-dot: rgba(133, 148, 255, 0.12);
+    --accent-on: #ffffff;
+  }
 }
 
 * {
@@ -44,13 +113,25 @@ html {
 
 body {
   width: min(100%, 1080px);
-  min-height: 720px;
+  min-height: min(720px, calc(100vh - 44px));
   margin: max(0px, calc((100vh - 764px) / 2)) auto;
-  overflow: hidden;
+  overflow: visible;
   border: 1px solid var(--border);
   border-radius: 14px;
   background: var(--surface);
   box-shadow: 0 26px 70px var(--shadow);
+}
+
+/* Account-action pages (password reset, MFA, forced password changes, etc.)
+   can be substantially taller than the sign-in card. Keep their content
+   top-aligned and let the document scroll instead of clipping the form. */
+body.tl-page-action .identity-layout {
+  min-height: 0;
+}
+
+body.tl-page-action .identity-auth-pane {
+  align-content: start;
+  place-items: start center;
 }
 
 button,
@@ -136,6 +217,38 @@ dd {
 
 .identity-title-actions {
   gap: 8px;
+}
+
+.theme-toggle {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.theme-toggle:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.theme-toggle-icon {
+  width: 1.1em;
+  display: inline-grid;
+  place-items: center;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.theme-toggle-label {
+  white-space: nowrap;
 }
 
 .identity-secure-origin {
@@ -869,6 +982,15 @@ dd {
     display: none;
   }
 
+  .theme-toggle {
+    min-width: 32px;
+    padding-inline: 8px;
+  }
+
+  .theme-toggle-label {
+    display: none;
+  }
+
   .identity-title-actions {
     margin-left: auto;
   }
@@ -920,29 +1042,6 @@ dd {
 
   .identity-form-heading h2 {
     font-size: 25px;
-  }
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color-scheme: dark;
-    --bg: #090b10;
-    --bg-elevated: #0d1017;
-    --surface: #11151d;
-    --surface-2: #171c26;
-    --surface-3: #202735;
-    --text: #f1f4f8;
-    --text-2: #a3adbd;
-    --text-3: #737f92;
-    --border: #273041;
-    --border-soft: #1c2431;
-    --accent: #8594ff;
-    --accent-strong: #aeb7ff;
-    --accent-2: #52d2c7;
-    --success: #4bc98a;
-    --danger: #f1737c;
-    --shadow: rgba(0, 0, 0, 0.32);
-    --grid-dot: rgba(133, 148, 255, 0.12);
   }
 }
 
