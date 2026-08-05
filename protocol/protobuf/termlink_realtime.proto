@@ -67,7 +67,18 @@ message SequenceRange { uint64 start = 1; uint64 end = 2; }
 message InputEventPayload { bytes input_id = 1; bytes lease_id = 2; int64 lease_version = 3; uint64 input_seq = 4; bytes input = 5; uint64 observed_local_input_epoch = 6; }
 message InputResultPayload { bytes input_id = 1; bool accepted = 2; string reason_code = 3; }
 message ResizePayload { uint32 columns = 1; uint32 rows = 2; uint32 cell_width_px = 3; uint32 cell_height_px = 4; bytes lease_id = 5; int64 lease_version = 6; }
-message SessionUpsertPayload { string shell_type = 1; bytes title_cipher = 2; string lifecycle = 3; uint32 columns = 4; uint32 rows = 5; bytes exchange_public_key = 6; int64 key_epoch = 7; }
+message SessionUpsertPayload {
+  string shell_type = 1;
+  bytes title_cipher = 2;
+  string lifecycle = 3;
+  uint32 columns = 4;
+  uint32 rows = 5;
+  bytes exchange_public_key = 6;
+  int64 key_epoch = 7;
+  // Presence distinguishes a real successful exit (0) from an older sender
+  // that did not publish the exit result.
+  optional int32 exit_code = 8;
+}
 message SubscribePayload { uint64 resume_from_seq = 1; bytes subscriber_exchange_public_key = 2; }
 message LeasePayload { bytes lease_id = 1; int64 version = 2; int64 expires_at_ms = 3; string reason_code = 4; uint64 local_input_epoch = 5; }
 message GapPayload { uint64 start = 1; uint64 end = 2; string reason_code = 3; }

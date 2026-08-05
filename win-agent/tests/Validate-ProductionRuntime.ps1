@@ -289,6 +289,26 @@ try {
     if ($interruptedMessageType.ToString() -ne 'SessionInterrupted') {
         throw "Production runtime mapped Interrupted to $interruptedMessageType instead of SessionInterrupted."
     }
+    $buildPayload = Get-InternalMethod $runtimeType 'BuildPayload'
+    $endedState = [Enum]::Parse($localLifecycleType, 'Ended')
+    [byte[]]$endedPayload = $lifecyclePayload.Invoke($null, [object[]]@($endedState, 17))
+    $endedFrame = $frameConstructor.Invoke([object[]]@(
+        $lifecycleKind, [Guid]::NewGuid(), [uint64]4, $endedPayload))
+    $productionEnded = $buildPayload.Invoke($null, [object[]]@($endedFrame))
+    if (-not $productionEnded.HasExitCode -or $productionEnded.ExitCode -ne 17) {
+        throw 'Production E2EE lifecycle payload dropped the real Shell exit code.'
+    }
+    [byte[]]$successfulPayload = $lifecyclePayload.Invoke($null, [object[]]@($endedState, 0))
+    $successfulFrame = $frameConstructor.Invoke([object[]]@(
+        $lifecycleKind, [Guid]::NewGuid(), [uint64]5, $successfulPayload))
+    $productionSuccess = $buildPayload.Invoke($null, [object[]]@($successfulFrame))
+    if (-not $productionSuccess.HasExitCode -or $productionSuccess.ExitCode -ne 0) {
+        throw 'Production E2EE lifecycle payload confused a real zero exit with an unknown result.'
+    }
+    $productionInterrupted = $buildPayload.Invoke($null, [object[]]@($interruptedFrame))
+    if ($productionInterrupted.HasExitCode) {
+        throw 'Production E2EE lifecycle payload attached an exit code before Session end.'
+    }
 
     $withoutConfig = $tryCreate.Invoke($null, [object[]]@())
     if ($null -ne $withoutConfig) {

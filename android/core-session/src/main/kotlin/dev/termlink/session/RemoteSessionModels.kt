@@ -29,7 +29,7 @@ sealed interface RemoteSessionState {
 
     data class Exited(
         override val lastAckedSequence: Long,
-        val exitCode: Int,
+        val exitCode: Int?,
     ) : RemoteSessionState
 
     data class HistoryGap(
@@ -85,7 +85,7 @@ sealed interface RemoteSessionEvent {
     data class Lifecycle(
         override val sequence: Long,
         val state: RemoteLifecycle,
-        val exitCode: Int = 0,
+        val exitCode: Int? = null,
     ) : RemoteSessionEvent
 
     data class Gap(

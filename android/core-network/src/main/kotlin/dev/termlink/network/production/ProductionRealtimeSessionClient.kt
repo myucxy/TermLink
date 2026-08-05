@@ -415,7 +415,8 @@ class ProductionRealtimeSessionClient(
                     require(acceptance is EventAcceptance.HistoryGap) { "gap did not enter History Gap" }
                 }
                 MessageType.SESSION_UPSERT -> {
-                    val lifecycle = SessionUpsertPayload.parseFrom(plaintext).lifecycle.uppercase()
+                    val payload = SessionUpsertPayload.parseFrom(plaintext)
+                    val lifecycle = payload.lifecycle.uppercase()
                     when (lifecycle) {
                         "RUNNING", "STARTED", "CHANGED" -> requireApplied(
                             session.accept(RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.RUNNING)),
@@ -424,7 +425,13 @@ class ProductionRealtimeSessionClient(
                             session.accept(RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.INTERRUPTED)),
                         )
                         "EXITED", "ENDED" -> requireApplied(
-                            session.accept(RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.ENDED)),
+                            session.accept(
+                                RemoteSessionEvent.Lifecycle(
+                                    envelope.seq,
+                                    RemoteLifecycle.ENDED,
+                                    payload.exitCode.takeIf { payload.hasExitCode() },
+                                ),
+                            ),
                         )
                         else -> error("unknown session lifecycle")
                     }
@@ -435,9 +442,18 @@ class ProductionRealtimeSessionClient(
                 MessageType.SESSION_INTERRUPTED -> requireApplied(
                     session.accept(RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.INTERRUPTED)),
                 )
-                MessageType.SESSION_ENDED -> requireApplied(
-                    session.accept(RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.ENDED)),
-                )
+                MessageType.SESSION_ENDED -> {
+                    val payload = SessionUpsertPayload.parseFrom(plaintext)
+                    requireApplied(
+                        session.accept(
+                            RemoteSessionEvent.Lifecycle(
+                                envelope.seq,
+                                RemoteLifecycle.ENDED,
+                                payload.exitCode.takeIf { payload.hasExitCode() },
+                            ),
+                        ),
+                    )
+                }
                 MessageType.INPUT_ACCEPTED, MessageType.INPUT_REJECTED -> {
                     val result = InputResultPayload.parseFrom(plaintext)
                     val inputId = ProductionRealtimeClient.uuidFromBytes(result.inputId.toByteArray())

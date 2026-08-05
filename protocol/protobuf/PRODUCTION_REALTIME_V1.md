@@ -70,3 +70,11 @@ input revokes the remote lease and always takes priority.
 The ordered `LEASE_REVOKED` payload carries the new monotonic
 `local_input_epoch`. Subsequent Android input echoes the latest observed epoch,
 so a stale lease or in-flight input cannot cross a local-input boundary.
+
+## Lifecycle results
+
+`SESSION_ENDED` and an ended `SESSION_UPSERT` carry a
+`SessionUpsertPayload`. Its optional `exit_code` preserves the Shell's signed
+32-bit exit result inside E2EE. Presence is required even when the real value is
+zero. An absent field means that an older sender did not publish the result; a
+receiver must not reinterpret that unknown value as a successful exit.

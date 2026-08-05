@@ -8,6 +8,7 @@ import dev.termlink.protocol.realtime.v1.Envelope
 import dev.termlink.protocol.realtime.v1.InputResultPayload
 import dev.termlink.protocol.realtime.v1.MessageType
 import dev.termlink.protocol.realtime.v1.OutputChunkPayload
+import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
 import dev.termlink.protocol.realtime.v1.SubscribePayload
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.TerminalEngine
@@ -157,7 +158,41 @@ class ProductionRealtimeSessionClientTest {
                             nowMillis = 1_800_000_000_123,
                         )
                         check(webSocket.send(OkioByteString.of(*outputEnvelope.toByteArray())))
-                        if (index == 0) webSocket.close(1012, "test reconnect")
+                        if (index == 0) {
+                            webSocket.close(1012, "test reconnect")
+                        } else {
+                            val ended = SessionUpsertPayload.newBuilder()
+                                .setLifecycle("ENDED")
+                                .setExitCode(17)
+                                .build()
+                                .toByteArray()
+                            val endedEnvelope = ProductionRealtimeClient.encryptedEnvelope(
+                                sessionId = sessionId,
+                                senderId = pcId,
+                                messageType = MessageType.SESSION_ENDED,
+                                direction = CryptoDirection.PC_TO_ANDROID,
+                                sequence = 4,
+                                acknowledgement = 0,
+                                keyId = keyId,
+                                nonce = SessionCrypto.nonce(pcNoncePrefix, 4uL),
+                                sessionKey = SessionCrypto.deriveSessionKey(
+                                    SessionCrypto.derivePairwiseKey(
+                                        pcIdentity.exchange.privateKey,
+                                        androidIdentity.exchange.publicKey,
+                                        pcId,
+                                        androidId,
+                                        7,
+                                    ),
+                                    sessionId,
+                                    CryptoDirection.PC_TO_ANDROID,
+                                    keyId,
+                                ),
+                                plaintext = ended,
+                                recipientId = androidId,
+                                nowMillis = 1_800_000_000_124,
+                            )
+                            check(webSocket.send(OkioByteString.of(*endedEnvelope.toByteArray())))
+                        }
                     } else if (envelope.messageType == MessageType.OUTPUT_ACK) {
                         // The ACK is authenticated by the transport and proves
                         // that a decrypted output was applied before reconnect.
@@ -200,12 +235,13 @@ class ProductionRealtimeSessionClientTest {
         )
         try {
             client.start()
-            withTimeout(10_000) { client.sessionState.first { it.lastAckedSequence == 3L } }
+            withTimeout(10_000) { client.sessionState.first { it.lastAckedSequence == 4L } }
             assertEquals(listOf(0L, 1L), resumes)
             assertEquals(2, outputs.size)
             assertArrayEquals(byteArrayOf(7), outputs[0])
             assertArrayEquals(byteArrayOf(8), outputs[1])
-            assertIs<RemoteSessionState.Live>(client.sessionState.value)
+            val exited = assertIs<RemoteSessionState.Exited>(client.sessionState.value)
+            assertEquals(17, exited.exitCode)
         } finally {
             client.close()
             androidIdentity.destroy()

@@ -24,6 +24,18 @@ var envelope = new Envelope
 const string expected = "080110141a10111111111111111111111111111111112210222222222222222222222222222222222801302a380740fba0f1c2b1344a0865706f63682d3031520c3333333333333333333333335a204444444444444444444444444444444444444444444444444444444444444444";
 Require(Convert.ToHexString(envelope.ToByteArray()).Equals(expected, StringComparison.OrdinalIgnoreCase), "Protobuf Envelope vector changed.");
 
+var endedWithFailure = new SessionUpsertPayload { Lifecycle = "ENDED", ExitCode = 17 };
+var endedSuccessfully = new SessionUpsertPayload { Lifecycle = "ENDED", ExitCode = 0 };
+var legacyEnded = new SessionUpsertPayload { Lifecycle = "ENDED" };
+Require(SessionUpsertPayload.Parser.ParseFrom(endedWithFailure.ToByteArray()).HasExitCode &&
+    SessionUpsertPayload.Parser.ParseFrom(endedWithFailure.ToByteArray()).ExitCode == 17,
+    "Session exit code 17 lost protobuf presence.");
+Require(SessionUpsertPayload.Parser.ParseFrom(endedSuccessfully.ToByteArray()).HasExitCode &&
+    SessionUpsertPayload.Parser.ParseFrom(endedSuccessfully.ToByteArray()).ExitCode == 0,
+    "Session exit code 0 lost protobuf presence.");
+Require(!SessionUpsertPayload.Parser.ParseFrom(legacyEnded.ToByteArray()).HasExitCode,
+    "Legacy Session lifecycle unexpectedly acquired an exit code.");
+
 using var pc = DeviceExchangeKeyPair.Generate();
 using var android = DeviceExchangeKeyPair.Generate();
 Guid pcId = Guid.NewGuid(), androidId = Guid.NewGuid(), sessionId = Guid.NewGuid();

@@ -1519,10 +1519,12 @@ namespace TermLink.Agent
             }
             if (frame.Type == LocalFrameType.Lifecycle)
             {
-                var lifecycle = LocalPayloadCodec.ParseLifecycle(frame.Payload, out var ignoredExitCode);
+                var lifecycle = LocalPayloadCodec.ParseLifecycle(frame.Payload, out var exitCode);
                 var state = lifecycle == LocalLifecycleState.Ended ? "ENDED" :
                     lifecycle == LocalLifecycleState.Interrupted ? "INTERRUPTED" : "RUNNING";
-                return new SessionUpsertPayload { Lifecycle = state };
+                var payload = new SessionUpsertPayload { Lifecycle = state };
+                if (lifecycle == LocalLifecycleState.Ended) payload.ExitCode = exitCode;
+                return payload;
             }
             return new SessionUpsertPayload { Lifecycle = "changed" };
         }

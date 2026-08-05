@@ -432,6 +432,22 @@ class RemoteTerminalSessionTest {
         session.close()
     }
 
+    @Test
+    fun legacyEndedLifecycleDoesNotPretendTheShellExitedSuccessfully() = runTest {
+        val engine = RecordingEngine()
+        val session = RemoteTerminalSession(engine, RecordingOutbound(), backgroundScope)
+        session.onConnected()
+
+        assertEquals(
+            EventAcceptance.Applied(1),
+            session.accept(RemoteSessionEvent.Lifecycle(1, RemoteLifecycle.ENDED)),
+        )
+        val exited = assertIs<RemoteSessionState.Exited>(session.state.value)
+        assertEquals(null, exited.exitCode)
+        assertTrue(engine.readOnlyState)
+        session.close()
+    }
+
     private class RecordingEngine(
         private val onFeed: suspend (Long, ByteArray) -> Unit = { _, _ -> },
     ) : TerminalEngine {
