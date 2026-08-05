@@ -27,6 +27,82 @@ function Write-SecretFile {
     [IO.File]::WriteAllText($Path, $Value, [Text.UTF8Encoding]::new($false))
 }
 
+function Wait-ProductionAcceptanceStack {
+    param(
+        [Parameter(Mandatory)][string]$ComposeFile,
+        [ValidateRange(30, 900)][int]$TimeoutSeconds = 300
+    )
+
+    $healthyServices = @('edge', 'lucky-upstream', 'postgres', 'valkey', 'minio', 'server')
+    $runningServices = @('keycloak')
+    $completedServices = @(
+        'runtime-secrets-init', 'oidc-ca-ready', 'keycloak-init',
+        'server-secrets-init', 'migrate'
+    )
+    $expectedServices = @($healthyServices + $runningServices + $completedServices)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $lastState = @{}
+
+    while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        $rows = @(& docker compose -f $ComposeFile ps --all --format json)
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Could not inspect the production acceptance stack.'
+        }
+
+        $lastState = @{}
+        foreach ($row in $rows) {
+            if ([string]::IsNullOrWhiteSpace([string]$row)) { continue }
+            try {
+                $items = @($row | ConvertFrom-Json -ErrorAction Stop)
+            }
+            catch {
+                throw 'Docker Compose returned an invalid service status payload.'
+            }
+            foreach ($item in $items) {
+                $lastState[[string]$item.Service] = $item
+            }
+        }
+
+        $failed = @($expectedServices | Where-Object {
+            $item = $lastState[$_]
+            $null -ne $item -and [string]$item.State -eq 'exited' -and [int]$item.ExitCode -ne 0
+        })
+        if ($failed.Count -ne 0) {
+            throw "Production acceptance services failed: $($failed -join ', ')."
+        }
+
+        $healthyReady = @($healthyServices | Where-Object {
+            $item = $lastState[$_]
+            $null -ne $item -and [string]$item.State -eq 'running' -and [string]$item.Health -eq 'healthy'
+        }).Count -eq $healthyServices.Count
+        $runningReady = @($runningServices | Where-Object {
+            $item = $lastState[$_]
+            $null -ne $item -and [string]$item.State -eq 'running'
+        }).Count -eq $runningServices.Count
+        $completedReady = @($completedServices | Where-Object {
+            $item = $lastState[$_]
+            $null -ne $item -and [string]$item.State -eq 'exited' -and [int]$item.ExitCode -eq 0
+        }).Count -eq $completedServices.Count
+
+        if ($healthyReady -and $runningReady -and $completedReady) {
+            return
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    $summary = @($expectedServices | ForEach-Object {
+        $item = $lastState[$_]
+        if ($null -eq $item) {
+            "$_=missing"
+        }
+        else {
+            $health = if ([string]::IsNullOrWhiteSpace([string]$item.Health)) { 'none' } else { [string]$item.Health }
+            "$_=$($item.State)/$health/exit-$($item.ExitCode)"
+        }
+    }) -join ', '
+    throw "The production acceptance stack did not become ready within $TimeoutSeconds seconds: $summary."
+}
+
 $paths = Get-TermLinkAcceptancePaths
 if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container)) {
     if (-not (Test-Path -LiteralPath $paths.Marker -PathType Leaf)) {
@@ -127,13 +203,14 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not close the public acceptance upstream
 # rerun so rotations reach their service-private volumes.
 & docker compose -f $paths.ComposeFile rm --stop --force runtime-secrets-init server-secrets-init keycloak-init
 if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the Keycloak policy initializer.' }
-# Recreate/build the project first, then wait from a stable container set. Combining
-# --build/--detach with --wait can race Compose's container replacement and leave the
-# waiter holding an old container id ("No such container").
+# Recreate/build the project once. A second `compose up --wait` can restart the
+# completed initializer jobs and race Compose's own container replacement on
+# Docker Desktop, leaving the waiter bound to a removed container ID. Poll the
+# single stable container set instead and require every initializer and health
+# check to reach its production-ready terminal state.
 & docker compose -f $paths.ComposeFile up --build --detach
 if ($LASTEXITCODE -ne 0) { throw 'Could not build or recreate the production acceptance stack.' }
-& docker compose -f $paths.ComposeFile up --no-build --no-recreate --detach --wait --wait-timeout 300
-if ($LASTEXITCODE -ne 0) { throw 'The production acceptance stack did not become ready.' }
+Wait-ProductionAcceptanceStack -ComposeFile $paths.ComposeFile -TimeoutSeconds 300
 
 function Assert-RuntimeSecretMetadata {
     param(

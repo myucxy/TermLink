@@ -24,3 +24,31 @@ func TestAcceptanceStartClosesPublicIngressBeforeReinitializingIdentity(t *testi
 		t.Fatal("acceptance startup must remove the completed identity initializer before bringing the stack up")
 	}
 }
+
+func TestAcceptanceStartWaitsOnOneStableContainerSet(t *testing.T) {
+	data, err := os.ReadFile("../../ops/Start-ProductionAcceptance.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(data)
+	startStack := strings.Index(script, "docker compose -f $paths.ComposeFile up --build --detach")
+	waitStack := strings.LastIndex(script, "Wait-ProductionAcceptanceStack -ComposeFile $paths.ComposeFile")
+	if startStack < 0 || waitStack < 0 || startStack >= waitStack {
+		t.Fatal("acceptance startup must wait after creating the production container set")
+	}
+	if strings.Contains(script, "up --no-build --no-recreate --detach --wait") {
+		t.Fatal("acceptance startup must not restart completed initializer jobs through a second compose up")
+	}
+	for _, contract := range []string{
+		"ps --all --format json",
+		"'edge', 'lucky-upstream', 'postgres', 'valkey', 'minio', 'server'",
+		"'runtime-secrets-init', 'oidc-ca-ready', 'keycloak-init'",
+		"'server-secrets-init', 'migrate'",
+		"[string]$item.Health -eq 'healthy'",
+		"[string]$item.State -eq 'exited' -and [int]$item.ExitCode -eq 0",
+	} {
+		if !strings.Contains(script, contract) {
+			t.Fatalf("acceptance stable-container wait omitted %q", contract)
+		}
+	}
+}
