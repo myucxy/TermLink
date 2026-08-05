@@ -8,6 +8,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -113,6 +114,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -128,6 +130,7 @@ import dev.termlink.model.DeviceType
 import dev.termlink.model.GrantPermission
 import dev.termlink.model.PcSummary
 import dev.termlink.model.SessionState
+import dev.termlink.harness.R
 import dev.termlink.model.SessionSummary
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.ArgbColor
@@ -361,14 +364,13 @@ private fun ProductSignInPage(
                 Surface(
                     modifier = Modifier.size(34.dp),
                     shape = ProductShape,
-                    color = ProductPrimary,
-                    contentColor = productColors.onPrimary,
+                    color = Color(0xFF10151D),
                 ) {
                     Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            Icons.Filled.Terminal,
-                            contentDescription = null,
-                            modifier = Modifier.size(21.dp),
+                        Image(
+                            painter = painterResource(R.drawable.termlink_mark_color),
+                            contentDescription = "TermLink",
+                            modifier = Modifier.size(28.dp),
                         )
                     }
                 }
@@ -520,13 +522,23 @@ private fun ProductTopBar(
 ) {
     CenterAlignedTopAppBar(
         title = {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("TermLink", style = MaterialTheme.typography.titleMedium)
-                Text(
-                    destination.label,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Image(
+                    painter = painterResource(R.drawable.termlink_mark_color),
+                    contentDescription = null,
+                    modifier = Modifier.size(25.dp),
                 )
+                Column(horizontalAlignment = Alignment.Start) {
+                    Text("TermLink", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        destination.label,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         },
         navigationIcon = {
