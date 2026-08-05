@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -51,14 +53,23 @@ func TestDisconnectOnceResumesAfterHighestCumulativeACK(t *testing.T) {
 	for {
 		frame, err := readFrame(first)
 		if err != nil {
-			var closeError *websocket.CloseError
-			if !errors.As(err, &closeError) || closeError.Code != websocket.CloseServiceRestart {
+			if lastACK != 6 || !isExpectedDisconnectError(err) {
 				t.Fatalf("initial connection close = %v", err)
 			}
 			break
 		}
 		lastACK = frame.Sequence
-		writeClientFrame(t, first, Frame{Type: FrameCumulativeACK, ACK: lastACK})
+		// Hold ACKs for 2..4 until sequence 5 is read so that sequence 6 is
+		// delivered before the relay closes the connection.
+		if lastACK != 1 && lastACK != 5 && lastACK != 6 {
+			continue
+		}
+		if err := writeClientFrameErr(first, Frame{Type: FrameCumulativeACK, ACK: lastACK}); err != nil {
+			if lastACK != 6 || !isExpectedDisconnectError(err) {
+				t.Fatalf("initial ACK %d: %v", lastACK, err)
+			}
+			break
+		}
 	}
 	if lastACK != 6 {
 		t.Fatalf("initial ACK = %d, want 6", lastACK)
@@ -197,13 +208,26 @@ func dial(t *testing.T, url string) *websocket.Conn {
 
 func writeClientFrame(t *testing.T, connection *websocket.Conn, frame Frame) {
 	t.Helper()
-	encoded, err := EncodeFrame(frame)
-	if err != nil {
-		t.Fatalf("encode client frame: %v", err)
-	}
-	if err := connection.WriteMessage(websocket.BinaryMessage, encoded); err != nil {
+	if err := writeClientFrameErr(connection, frame); err != nil {
 		t.Fatalf("write client frame: %v", err)
 	}
+}
+
+func writeClientFrameErr(connection *websocket.Conn, frame Frame) error {
+	encoded, err := EncodeFrame(frame)
+	if err != nil {
+		return err
+	}
+	return connection.WriteMessage(websocket.BinaryMessage, encoded)
+}
+
+func isExpectedDisconnectError(err error) bool {
+	var closeError *websocket.CloseError
+	if errors.As(err, &closeError) {
+		return closeError.Code == websocket.CloseServiceRestart
+	}
+	var operationError *net.OpError
+	return errors.As(err, &operationError) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 func readType(t *testing.T, connection *websocket.Conn, frameType byte) Frame {
