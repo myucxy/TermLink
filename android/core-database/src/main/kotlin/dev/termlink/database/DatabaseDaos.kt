@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 
 @Dao
 interface DeviceDao {
@@ -135,8 +136,88 @@ interface SnapshotDao {
 
 @Dao
 interface AckCursorDao {
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsert(entity: AckCursorEntity)
+    @Query(
+        """UPDATE ack_cursors
+           SET highestContiguousSequence = CASE
+                 WHEN :sequence > highestContiguousSequence THEN :sequence
+                 ELSE highestContiguousSequence
+               END,
+               updatedAtEpochMillis = CASE
+                 WHEN :sequence > highestContiguousSequence THEN :updatedAtEpochMillis
+                 ELSE updatedAtEpochMillis
+               END
+           WHERE sessionId = :sessionId AND direction = :direction
+             AND rendererGeneration = :rendererGeneration""",
+    )
+    suspend fun advanceExisting(
+        sessionId: String,
+        direction: String,
+        rendererGeneration: Long,
+        sequence: Long,
+        updatedAtEpochMillis: Long,
+    ): Int
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIfAbsent(entity: AckCursorEntity): Long
+
+    /** API-26-compatible monotonic upsert; stale concurrent writes cannot regress the cursor. */
+    @Transaction
+    suspend fun advance(entity: AckCursorEntity): Boolean {
+        if (advanceExisting(
+                entity.sessionId,
+                entity.direction,
+                entity.rendererGeneration,
+                entity.highestContiguousSequence,
+                entity.updatedAtEpochMillis,
+            ) == 1
+        ) return true
+        if (insertIfAbsent(entity) != -1L) return true
+        return advanceExisting(
+                entity.sessionId,
+                entity.direction,
+                entity.rendererGeneration,
+                entity.highestContiguousSequence,
+                entity.updatedAtEpochMillis,
+            ) == 1
+    }
+
+    @Transaction
+    suspend fun getOrCreate(entity: AckCursorEntity): AckCursorEntity {
+        get(entity.sessionId, entity.direction)?.let { return it }
+        insertIfAbsent(entity)
+        return requireNotNull(get(entity.sessionId, entity.direction)) {
+            "ACK cursor initialization failed"
+        }
+    }
+
+    @Query(
+        """UPDATE ack_cursors
+           SET rendererGeneration = rendererGeneration + 1,
+               highestContiguousSequence = 0,
+               updatedAtEpochMillis = :updatedAtEpochMillis
+           WHERE sessionId = :sessionId AND direction = :direction
+             AND rendererGeneration = :expectedGeneration""",
+    )
+    suspend fun resetExisting(
+        sessionId: String,
+        direction: String,
+        expectedGeneration: Long,
+        updatedAtEpochMillis: Long,
+    ): Int
+
+    /** Atomically fences all writers from the previous renderer generation. */
+    @Transaction
+    suspend fun reset(
+        sessionId: String,
+        direction: String,
+        expectedGeneration: Long,
+        updatedAtEpochMillis: Long,
+    ): AckCursorEntity {
+        check(resetExisting(sessionId, direction, expectedGeneration, updatedAtEpochMillis) == 1) {
+            "ACK renderer generation is stale"
+        }
+        return requireNotNull(get(sessionId, direction)) { "ACK cursor disappeared during reset" }
+    }
 
     @Query("SELECT * FROM ack_cursors WHERE sessionId = :sessionId ORDER BY direction ASC")
     suspend fun listForSession(sessionId: String): List<AckCursorEntity>

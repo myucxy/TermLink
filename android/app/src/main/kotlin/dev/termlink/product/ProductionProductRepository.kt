@@ -31,9 +31,16 @@ import dev.termlink.network.production.ProductionRealtimeSessionClient
 import dev.termlink.network.production.ProductionRealtimeSessionConfig
 import dev.termlink.network.production.TermLinkApiException
 import dev.termlink.protocol.realtime.v1.GapPayload
+import dev.termlink.protocol.realtime.v1.HistoryChunkV1
+import dev.termlink.protocol.realtime.v1.HistoryEventV1
+import dev.termlink.protocol.realtime.v1.InputResultPayload
+import dev.termlink.protocol.realtime.v1.LeasePayload
 import dev.termlink.protocol.realtime.v1.MessageType
 import dev.termlink.protocol.realtime.v1.OutputChunkPayload
 import dev.termlink.protocol.realtime.v1.ResizePayload
+import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
+import dev.termlink.session.RemoteLifecycle
+import dev.termlink.session.RemoteSessionEvent
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.termux.TermuxTerminalEngine
@@ -44,7 +51,9 @@ import java.security.MessageDigest
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -104,6 +113,8 @@ internal class ProductionProductRepository(
     private val historyDownloads = ConcurrentHashMap<UUID, HistoryDownloadRequest>()
     private val liveSessionLock = Any()
     private val accessStateLock = Mutex()
+    private val refreshStateLock = Mutex()
+    private val keyMetadataRefreshLock = Mutex()
     private val tokenRefresh = TokenRefreshCoordinator { requestFreshAccessToken() }
     private val initialServerUrl = sessionStore.serverUrl ?: PUBLIC_SERVER_URL.also {
         sessionStore.serverUrl = it
@@ -488,26 +499,61 @@ internal class ProductionProductRepository(
         val engine = TermuxTerminalEngine(
             initialSize = TerminalSize(summary.columns.coerceAtLeast(1), summary.rows.coerceAtLeast(1)),
         )
-        val client = ProductionRealtimeSessionClient(
-            engine = engine,
-            config = ProductionRealtimeSessionConfig(
-                rootUrl = root,
-                tokenProvider = AccessTokenProvider {
-                    authState?.accessToken ?: error("OIDC access token is unavailable")
+        val client = try {
+            val restoredHistory = restoreLiveHistory(
+                session = summary,
+                pc = pc,
+                pcDevice = pcDevice,
+                stored = stored,
+                engine = engine,
+            )
+            val ackRendererGeneration = AtomicLong(restoredHistory.rendererGeneration)
+            ProductionRealtimeSessionClient(
+                engine = engine,
+                config = ProductionRealtimeSessionConfig(
+                    rootUrl = root,
+                    tokenProvider = AccessTokenProvider {
+                        authState?.accessToken ?: error("OIDC access token is unavailable")
+                    },
+                    androidDeviceId = stored.deviceId,
+                    pcDeviceId = pc.deviceId,
+                    sessionId = sessionId,
+                    keyEpoch = pc.keyEpoch,
+                    pcExchangePublicKey = pcDevice.exchangePublicKey.copyOf(),
+                ),
+                identity = stored.identity,
+                parentScope = scope,
+                httpClient = http,
+                inputSequenceProvider = ReservedInputSequenceProvider {
+                    sessionStore.reserveInputSequenceRange(sessionId)
                 },
-                androidDeviceId = stored.deviceId,
-                pcDeviceId = pc.deviceId,
-                sessionId = sessionId,
-                keyEpoch = pc.keyEpoch,
-                pcExchangePublicKey = pcDevice.exchangePublicKey.copyOf(),
-            ),
-            identity = stored.identity,
-            parentScope = scope,
-            httpClient = http,
-            inputSequenceProvider = ReservedInputSequenceProvider {
-                sessionStore.reserveInputSequenceRange(sessionId)
-            },
-        )
+                envelopeSequenceProvider = ReservedInputSequenceProvider {
+                    sessionStore.reserveEnvelopeSequenceRange(sessionId)
+                },
+                initialAcknowledgedSequence = restoredHistory.acknowledgement,
+                initialObservedLocalInputEpoch = restoredHistory.localInputEpoch,
+                acknowledgementObserver = { sequence ->
+                    historyRepository.putAckCursor(
+                        sessionId,
+                        LIVE_OUTPUT_ACK_DIRECTION,
+                        ackRendererGeneration.get(),
+                        sequence.toULong(),
+                    ).toLong()
+                },
+                acknowledgementResetObserver = {
+                    val reset = historyRepository.resetAckCursor(
+                        sessionId,
+                        LIVE_OUTPUT_ACK_DIRECTION,
+                        ackRendererGeneration.get(),
+                    )
+                    ackRendererGeneration.set(reset.rendererGeneration)
+                },
+                authoritativeMetadataRefreshObserver = { refreshLiveKeyMetadata() },
+            )
+        } catch (error: Throwable) {
+            engine.dispose()
+            throw error
+        }
         val live = LiveProductSession(engine, client)
         val installed = synchronized(liveSessionLock) {
             if (liveSessions.containsKey(sessionId)) false
@@ -525,6 +571,11 @@ internal class ProductionProductRepository(
                 mutableSnapshot.value = mutableSnapshot.value.copy(
                     sessionStates = mutableSnapshot.value.sessionStates + (sessionId to state),
                 )
+                if (state is RemoteSessionState.HistoryGap && live.recoveryJob?.isActive != true) {
+                    live.recoveryJob = scope.launch {
+                        recoverLiveHistoryGap(sessionId, live)
+                    }
+                }
             }
         }
         live.tokenRefreshJob = scope.launch {
@@ -578,79 +629,18 @@ internal class ProductionProductRepository(
             it.id == pc.deviceId && it.type == DeviceType.WINDOWS_PC && it.trustState == DeviceTrustState.TRUSTED
         } ?: error("The history PC is not trusted")
         val stored = identity()
-        val expectedKeyId = HistoryCrypto.keyId(stored.deviceId, pc.keyEpoch)
-        require(entry.historyObject.keyId == expectedKeyId) { "The selected history key is not available on this device" }
-        val start = requireNotNull(entry.historyObject.startSequence) { "History start sequence is missing" }
-        val end = requireNotNull(entry.historyObject.endSequence) { "History end sequence is missing" }
-
-        val chunk = withContext(Dispatchers.IO) {
-            val sealedObject = downloadHistory(download, entry.historyObject)
-            val pairwise = SessionCrypto.derivePairwiseKey(
-                stored.identity.exchange.privateKey,
-                pcDevice.exchangePublicKey,
-                pc.deviceId,
-                stored.deviceId,
-                pc.keyEpoch,
-            )
-            try {
-                historyRepository.putEventChunk(
-                    sessionId = entry.sessionId,
-                    startSequence = start,
-                    endSequence = end,
-                    objectKey = entry.historyObject.objectKey,
-                    keyId = entry.historyObject.keyId,
-                    ciphertext = sealedObject,
-                    id = entry.historyObject.id,
-                    ciphertextSha256 = entry.historyObject.ciphertextSha256,
-                )
-                HistoryCrypto.open(
-                    pairwise,
-                    sealedObject,
-                    entry.sessionId,
-                    pc.deviceId,
-                    stored.deviceId,
-                    pc.keyEpoch,
-                    entry.historyObject.keyId,
-                    start,
-                    end,
-                )
-            } finally {
-                pairwise.fill(0)
-                sealedObject.fill(0)
-            }
+        val historyEpoch = historyKeyEpoch(stored.deviceId, entry.historyObject.keyId)
+        require(historyEpoch != null && historyEpoch <= pc.keyEpoch) {
+            "The selected history key is not available on this device"
         }
+        val chunk = openHistoryChunk(entry, pc, pcDevice, stored, download)
 
         val engine = historyEngines.getOrPut(entry.historyObject.id) { TermuxTerminalEngine() }
         engine.setReadOnly(true)
         engine.clear()
         engine.resize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1))
         chunk.eventsList.forEach { event ->
-            val payload = event.payload.toByteArray()
-            try {
-                when (event.messageType) {
-                    MessageType.OUTPUT_CHUNK -> {
-                        val output = OutputChunkPayload.parseFrom(payload).output.toByteArray()
-                        try { engine.feed(event.seq, ByteBuffer.wrap(output)) } finally { output.fill(0) }
-                    }
-                    MessageType.RESIZE_APPLIED -> ResizePayload.parseFrom(payload).also { resize ->
-                        engine.resize(resize.columns.coerceAtLeast(1), resize.rows.coerceAtLeast(1))
-                    }
-                    MessageType.GAP -> GapPayload.parseFrom(payload).also { gap ->
-                        error("History gap ${gap.start}..${gap.end}")
-                    }
-                    MessageType.SESSION_UPSERT,
-                    MessageType.SESSION_STARTED,
-                    MessageType.SESSION_INTERRUPTED,
-                    MessageType.SESSION_ENDED,
-                    MessageType.INPUT_ACCEPTED,
-                    MessageType.INPUT_REJECTED,
-                    MessageType.LEASE_REVOKED,
-                    -> Unit
-                    else -> error("Unsupported history event ${event.messageType}")
-                }
-            } finally {
-                payload.fill(0)
-            }
+            applyHistoryEvent(engine, event)
         }
         mutableSnapshot.value = mutableSnapshot.value.copy(
             replayedHistoryObjectIds = mutableSnapshot.value.replayedHistoryObjectIds + entry.historyObject.id,
@@ -678,7 +668,7 @@ internal class ProductionProductRepository(
         }
     }
 
-    private suspend fun refreshWithApi(api: ProductionApiClient) {
+    private suspend fun refreshWithApi(api: ProductionApiClient): Unit = refreshStateLock.withLock {
         val self = ProductResponseParser.self(api.get("/v1/devices/self").jsonObject)
         if (self.trustState != DeviceTrustState.TRUSTED) {
             clearAccessControlledState(self)
@@ -693,14 +683,16 @@ internal class ProductionProductRepository(
         val catalogPlans = ProductResponseParser.catalogPlanObjects(api.get("/v1/billing/plans").jsonObject)
             .map { it.toCatalogPlan() }
         val catalog = catalogPlans.firstOrNull { it.key == entitlement.planKey }
-        devices.forEach { historyRepository.upsertDevice(it) }
-        pcs.forEach { historyRepository.upsertPc(it) }
+        // Reject an epoch rollback or same-epoch public-key substitution before
+        // any untrusted metadata reaches Room. Refreshes are serialized so a
+        // slower response cannot overwrite a newer validated snapshot.
+        validateAuthoritativeSessionKeys(devices, pcs, sessions)
+        historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
         sessions.forEach { historyRepository.upsertSession(it) }
         val ownDeviceId = identity().deviceId
         val refreshedDownloads = mutableMapOf<UUID, HistoryDownloadRequest>()
         val historyEntries = sessions.flatMap { session ->
             val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@flatMap emptyList()
-            val expectedKeyId = HistoryCrypto.keyId(ownDeviceId, pc.keyEpoch)
             val response = try {
                 api.get("/v1/sessions/${session.id}/history").jsonObject
             } catch (error: TermLinkApiException) {
@@ -708,7 +700,11 @@ internal class ProductionProductRepository(
                 throw error
             }
             ProductResponseParser.itemObjects(response).mapNotNull { item ->
-                if (!item.requiredString("kind").equals("chunk", ignoreCase = true) || item.requiredString("key_id") != expectedKeyId) {
+                val keyId = item.requiredString("key_id")
+                val historyEpoch = historyKeyEpoch(ownDeviceId, keyId)
+                if (!item.requiredString("kind").equals("chunk", ignoreCase = true) ||
+                    historyEpoch == null || historyEpoch > pc.keyEpoch
+                ) {
                     return@mapNotNull null
                 }
                 val parsed = item.toHistoryObject(session.id)
@@ -720,8 +716,22 @@ internal class ProductionProductRepository(
         }
         historyDownloads.clear()
         historyDownloads.putAll(refreshedDownloads)
+        rotateLiveSessionKeys(devices, pcs, sessions)
         closeHistoryEnginesExcept(historyEntries.mapTo(mutableSetOf()) { it.historyObject.id })
-        closeLiveSessionsExcept(sessions.filter { it.state != SessionState.EXITED }.mapTo(mutableSetOf()) { it.id })
+        val trustedPcIds = pcs.asSequence()
+            .filter { pc ->
+                devices.any { device ->
+                    device.id == pc.deviceId &&
+                        device.type == DeviceType.WINDOWS_PC &&
+                        device.trustState == DeviceTrustState.TRUSTED
+                }
+            }
+            .mapTo(mutableSetOf(), PcSummary::id)
+        closeLiveSessionsExcept(
+            sessions.filter {
+                it.state != SessionState.EXITED && it.pcId in trustedPcIds
+            }.mapTo(mutableSetOf(), SessionSummary::id),
+        )
         val retainedStates = mutableSnapshot.value.sessionStates.filterKeys { id -> sessions.any { it.id == id } }
         mutableSnapshot.value = mutableSnapshot.value.copy(
             signedIn = true,
@@ -1038,6 +1048,93 @@ internal class ProductionProductRepository(
         )
     }
 
+    private suspend fun rotateLiveSessionKeys(
+        devices: List<DeviceSummary>,
+        pcs: List<PcSummary>,
+        sessions: List<SessionSummary>,
+    ) {
+        liveSessions.toMap().forEach { (sessionId, live) ->
+            val session = sessions.firstOrNull { it.id == sessionId } ?: return@forEach
+            val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@forEach
+            val device = devices.firstOrNull {
+                it.id == pc.deviceId &&
+                    it.type == DeviceType.WINDOWS_PC &&
+                    it.trustState == DeviceTrustState.TRUSTED
+            } ?: return@forEach
+            live.client.rotateKeyMaterial(pc.keyEpoch, device.exchangePublicKey)
+        }
+    }
+
+    /**
+     * Unknown realtime key IDs trigger this narrow authoritative refresh. It
+     * intentionally avoids account, billing, and history endpoints so an
+     * unavailable history object store cannot block an epoch transition.
+     */
+    private suspend fun refreshLiveKeyMetadata(): Unit = keyMetadataRefreshLock.withLock {
+        withApi { api ->
+            val devices = ProductResponseParser.itemObjects(api.get("/v1/devices").jsonObject).map { it.toDevice() }
+            val pcs = ProductResponseParser.itemObjects(api.get("/v1/pcs").jsonObject).map { it.toPc() }
+            val sessions = mutableSnapshot.value.sessions
+            liveSessions.toMap().forEach { (sessionId, live) ->
+                val session = sessions.firstOrNull { it.id == sessionId } ?: return@forEach
+                val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@forEach
+                val device = devices.firstOrNull {
+                    it.id == pc.deviceId &&
+                        it.type == DeviceType.WINDOWS_PC &&
+                        it.trustState == DeviceTrustState.TRUSTED
+                } ?: return@forEach
+                live.client.validateKeyMaterialUpdate(pc.keyEpoch, device.exchangePublicKey)
+            }
+            // Persist the authoritative epoch/public-key pair before any live
+            // session can start encrypting or decrypting with the new epoch.
+            historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
+            rotateLiveSessionKeys(devices, pcs, sessions)
+            val trustedPcIds = pcs.asSequence()
+                .filter { pc ->
+                    devices.any { device ->
+                        device.id == pc.deviceId &&
+                            device.type == DeviceType.WINDOWS_PC &&
+                            device.trustState == DeviceTrustState.TRUSTED
+                    }
+                }
+                .mapTo(mutableSetOf(), PcSummary::id)
+            closeLiveSessionsExcept(
+                sessions.filter { it.state != SessionState.EXITED && it.pcId in trustedPcIds }
+                    .mapTo(mutableSetOf(), SessionSummary::id),
+            )
+        }
+    }
+
+    private suspend fun validateAuthoritativeSessionKeys(
+        devices: List<DeviceSummary>,
+        pcs: List<PcSummary>,
+        sessions: List<SessionSummary>,
+    ) {
+        val storedPcs = historyRepository.pcs().associateBy(PcSummary::id)
+        val storedDevices = historyRepository.devices().associateBy(DeviceSummary::id)
+        pcs.forEach { pc ->
+            val storedPc = storedPcs[pc.id] ?: return@forEach
+            require(pc.keyEpoch >= storedPc.keyEpoch) { "key epoch must not regress" }
+            val nextKey = devices.firstOrNull { it.id == pc.deviceId }?.exchangePublicKey
+            val storedKey = storedDevices[storedPc.deviceId]?.exchangePublicKey
+            if (nextKey != null && storedKey != null && storedKey.isNotEmpty()) {
+                require(nextKey.contentEquals(storedKey)) {
+                    "PC exchange key changed without a new device identity"
+                }
+            }
+        }
+        liveSessions.toMap().forEach { (sessionId, live) ->
+            val session = sessions.firstOrNull { it.id == sessionId } ?: return@forEach
+            val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@forEach
+            val device = devices.firstOrNull {
+                it.id == pc.deviceId &&
+                    it.type == DeviceType.WINDOWS_PC &&
+                    it.trustState == DeviceTrustState.TRUSTED
+            } ?: return@forEach
+            live.client.validateKeyMaterialUpdate(pc.keyEpoch, device.exchangePublicKey)
+        }
+    }
+
     private fun closeLiveSessions() {
         synchronized(liveSessionLock) {
             liveSessions.values.toList().forEach(LiveProductSession::close)
@@ -1099,12 +1196,15 @@ internal class ProductionProductRepository(
     ) : AutoCloseable {
         var stateJob: Job? = null
         var tokenRefreshJob: Job? = null
+        var recoveryJob: Job? = null
 
         override fun close() {
             stateJob?.cancel()
             stateJob = null
             tokenRefreshJob?.cancel()
             tokenRefreshJob = null
+            recoveryJob?.cancel()
+            recoveryJob = null
             client.close()
         }
     }
@@ -1245,10 +1345,427 @@ internal class ProductionProductRepository(
         }
     }
 
+    /**
+     * Rebuilds the renderer through the last durable cumulative ACK before a
+     * fresh socket subscribes. A cursor is never used by itself: if encrypted
+     * history cannot reconstruct a contiguous prefix from sequence 1, the
+     * client safely resumes from 0 and lets the Agent replay its bounded log.
+     */
+    private suspend fun restoreLiveHistory(
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        engine: TermuxTerminalEngine,
+    ): RestoredLiveHistory {
+        val cursor = historyRepository.ackCursorState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
+            ?: historyRepository.initializeAckCursor(session.id, LIVE_OUTPUT_ACK_DIRECTION)
+        if (cursor.sequence == 0uL) {
+            return RestoredLiveHistory(rendererGeneration = cursor.rendererGeneration)
+        }
+        val target = cursor.sequence
+        suspend fun resetRendererAndCursor(): RestoredLiveHistory {
+            engine.clear()
+            engine.resize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1))
+            val reset = historyRepository.resetAckCursor(
+                session.id,
+                LIVE_OUTPUT_ACK_DIRECTION,
+                cursor.rendererGeneration,
+            )
+            return RestoredLiveHistory(rendererGeneration = reset.rendererGeneration)
+        }
+        val candidates = mutableSnapshot.value.history
+            .asSequence()
+            .filter { entry ->
+                entry.sessionId == session.id &&
+                    entry.historyObject.kind == HistoryObject.Kind.CHUNK &&
+                    historyKeyEpoch(stored.deviceId, entry.historyObject.keyId)?.let { it <= pc.keyEpoch } == true
+            }
+            .sortedWith(
+                compareBy<HistoryEntry> { it.historyObject.startSequence ?: ULong.MAX_VALUE }
+                    .thenBy { it.historyObject.endSequence ?: ULong.MAX_VALUE },
+            )
+            .toList()
+        if (candidates.isEmpty()) return resetRendererAndCursor()
+
+        var expected = 1uL
+        var restored = 0uL
+        var localInputEpoch = 0L
+        return try {
+            engine.clear()
+            engine.resize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1))
+            while (expected <= target) {
+                val entry = candidates.firstOrNull { it.historyObject.startSequence == expected } ?: break
+                val download = historyDownloads[entry.historyObject.id] ?: break
+                val chunk = openHistoryChunk(entry, pc, pcDevice, stored, download)
+                for (event in chunk.eventsList) {
+                    val sequence = event.seq.toULong()
+                    check(sequence == expected) { "History recovery is not contiguous" }
+                    if (sequence > target) break
+                    localInputEpoch = maxOf(localInputEpoch, applyHistoryEvent(engine, event))
+                    restored = sequence
+                    expected++
+                }
+                if (restored >= target) break
+                val end = requireNotNull(entry.historyObject.endSequence) { "History end sequence is missing" }
+                if (restored < end) break
+            }
+            if (restored == target) {
+                RestoredLiveHistory(
+                    acknowledgement = restored.toLong(),
+                    localInputEpoch = localInputEpoch,
+                    rendererGeneration = cursor.rendererGeneration,
+                )
+            } else {
+                resetRendererAndCursor()
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            resetRendererAndCursor()
+        }
+    }
+
+    private suspend fun openHistoryChunk(
+        entry: HistoryEntry,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        download: HistoryDownloadRequest,
+    ): HistoryChunkV1 = withContext(Dispatchers.IO) {
+        val metadata = entry.historyObject
+        val start = requireNotNull(metadata.startSequence) { "History start sequence is missing" }
+        val end = requireNotNull(metadata.endSequence) { "History end sequence is missing" }
+        val cached = try {
+            historyRepository.getHistoryObject(metadata.id)?.takeIf { value ->
+                MessageDigest.isEqual(value.metadata.ciphertextSha256, metadata.ciphertextSha256)
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            null
+        }
+        val sealedObject = cached?.ciphertext ?: downloadHistory(download, metadata)
+        val historyEpoch = requireNotNull(historyKeyEpoch(stored.deviceId, metadata.keyId)) {
+            "History key ID is not for this device"
+        }
+        require(historyEpoch <= pc.keyEpoch) { "History key epoch is newer than the authoritative PC epoch" }
+        val pairwise = SessionCrypto.derivePairwiseKey(
+            stored.identity.exchange.privateKey,
+            pcDevice.exchangePublicKey,
+            pc.deviceId,
+            stored.deviceId,
+            historyEpoch,
+        )
+        try {
+            if (cached == null) {
+                historyRepository.putEventChunk(
+                    sessionId = entry.sessionId,
+                    startSequence = start,
+                    endSequence = end,
+                    objectKey = metadata.objectKey,
+                    keyId = metadata.keyId,
+                    ciphertext = sealedObject,
+                    id = metadata.id,
+                    ciphertextSha256 = metadata.ciphertextSha256,
+                )
+            }
+            HistoryCrypto.open(
+                pairwise,
+                sealedObject,
+                entry.sessionId,
+                pc.deviceId,
+                stored.deviceId,
+                historyEpoch,
+                metadata.keyId,
+                start,
+                end,
+            )
+        } finally {
+            pairwise.fill(0)
+            sealedObject.fill(0)
+        }
+    }
+
+    private suspend fun recoverLiveHistoryGap(
+        sessionId: UUID,
+        live: LiveProductSession,
+    ) {
+        var retry = 0
+        while (
+            scope.isActive &&
+            liveSessions[sessionId] === live &&
+            live.client.sessionState.value is RemoteSessionState.HistoryGap
+        ) {
+            try {
+                refresh()
+                if (liveSessions[sessionId] !== live) return
+                val product = mutableSnapshot.value
+                val session = product.sessions.firstOrNull { it.id == sessionId } ?: return
+                val pc = product.pcs.firstOrNull { it.id == session.pcId } ?: return
+                val pcDevice = product.devices.firstOrNull {
+                    it.id == pc.deviceId &&
+                        it.type == DeviceType.WINDOWS_PC &&
+                        it.trustState == DeviceTrustState.TRUSTED
+                } ?: return
+                val activeGap = live.client.sessionState.value as? RemoteSessionState.HistoryGap ?: return
+                val missingEnd = activeGap.receivedSequence - 1
+                val recovery = if (missingEnd > 0) {
+                    loadLiveHistoryEvents(session, pc, pcDevice, identity(), missingEnd)
+                } else {
+                    null
+                }
+                if (recovery != null) {
+                    try {
+                        val recovered = live.client.recoverFromHistory(
+                            recovery.events,
+                            recovery.localInputEpoch,
+                            activeGap,
+                        )
+                        appendActivity(
+                            "History gap recovered",
+                            "Encrypted replay restored through ACK $recovered",
+                            Severity.SUCCESS,
+                        )
+                        return
+                    } finally {
+                        recovery.events.forEach { event ->
+                            if (event is RemoteSessionEvent.Output) event.bytes.fill(0)
+                        }
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                // The encrypted history upload can lag the realtime stream.
+                // Keep the renderer read-only and retry with bounded backoff.
+            }
+            delay(HISTORY_RECOVERY_DELAYS_MILLIS[retry.coerceAtMost(HISTORY_RECOVERY_DELAYS_MILLIS.lastIndex)])
+            retry++
+        }
+    }
+
+    private suspend fun loadLiveHistoryEvents(
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        throughSequence: Long,
+    ): LoadedLiveHistory? {
+        require(throughSequence > 0) { "History recovery sequence must be positive" }
+        val through = throughSequence.toULong()
+        val candidates = mutableSnapshot.value.history
+            .asSequence()
+            .filter { entry ->
+                entry.sessionId == session.id &&
+                    entry.historyObject.kind == HistoryObject.Kind.CHUNK &&
+                    historyKeyEpoch(stored.deviceId, entry.historyObject.keyId)?.let { it <= pc.keyEpoch } == true
+            }
+            .sortedWith(
+                compareBy<HistoryEntry> { it.historyObject.startSequence ?: ULong.MAX_VALUE }
+                    .thenBy { it.historyObject.endSequence ?: ULong.MAX_VALUE },
+            )
+            .toList()
+        var expected = 1uL
+        var localInputEpoch = 0L
+        val events = mutableListOf<RemoteSessionEvent>()
+        try {
+            while (expected <= through) {
+                val entry = candidates.firstOrNull { it.historyObject.startSequence == expected }
+                if (entry == null) {
+                    wipeHistoryEvents(events)
+                    return null
+                }
+                val download = historyDownloads[entry.historyObject.id]
+                if (download == null) {
+                    wipeHistoryEvents(events)
+                    return null
+                }
+                val chunk = openHistoryChunk(entry, pc, pcDevice, stored, download)
+                for (event in chunk.eventsList) {
+                    val sequence = event.seq.toULong()
+                    check(sequence == expected) { "History recovery is not contiguous" }
+                    if (sequence > through) break
+                    val decoded = decodeHistoryEvent(event)
+                    events += decoded.event
+                    localInputEpoch = maxOf(localInputEpoch, decoded.localInputEpoch)
+                    expected++
+                }
+                if (expected <= through && expected <= requireNotNull(entry.historyObject.endSequence)) {
+                    wipeHistoryEvents(events)
+                    return null
+                }
+            }
+        } catch (error: Exception) {
+            wipeHistoryEvents(events)
+            throw error
+        }
+        return LoadedLiveHistory(events, localInputEpoch)
+    }
+
+    private fun decodeHistoryEvent(event: HistoryEventV1): DecodedHistoryEvent {
+        require(event.seq > 0) { "History event sequence must be positive" }
+        val payload = event.payload.toByteArray()
+        return try {
+            when (event.messageType) {
+                MessageType.OUTPUT_CHUNK -> {
+                    val output = OutputChunkPayload.parseFrom(payload).output.toByteArray()
+                    DecodedHistoryEvent(RemoteSessionEvent.Output(event.seq, output))
+                }
+                MessageType.RESIZE_APPLIED -> ResizePayload.parseFrom(payload).let { resize ->
+                    DecodedHistoryEvent(
+                        RemoteSessionEvent.Resize(
+                            event.seq,
+                            TerminalSize(resize.columns.coerceAtLeast(1), resize.rows.coerceAtLeast(1)),
+                        ),
+                    )
+                }
+                MessageType.SESSION_UPSERT -> SessionUpsertPayload.parseFrom(payload).let { value ->
+                    val lifecycle = when (value.lifecycle.uppercase()) {
+                        "RUNNING", "STARTED", "CHANGED" -> RemoteLifecycle.RUNNING
+                        "INTERRUPTED" -> RemoteLifecycle.INTERRUPTED
+                        "EXITED", "ENDED" -> RemoteLifecycle.ENDED
+                        else -> error("Unknown history lifecycle")
+                    }
+                    DecodedHistoryEvent(
+                        RemoteSessionEvent.Lifecycle(
+                            event.seq,
+                            lifecycle,
+                            value.exitCode.takeIf { value.hasExitCode() },
+                        ),
+                    )
+                }
+                MessageType.SESSION_STARTED -> DecodedHistoryEvent(
+                    RemoteSessionEvent.Lifecycle(event.seq, RemoteLifecycle.RUNNING),
+                )
+                MessageType.SESSION_INTERRUPTED -> DecodedHistoryEvent(
+                    RemoteSessionEvent.Lifecycle(event.seq, RemoteLifecycle.INTERRUPTED),
+                )
+                MessageType.SESSION_ENDED -> SessionUpsertPayload.parseFrom(payload).let { value ->
+                    DecodedHistoryEvent(
+                        RemoteSessionEvent.Lifecycle(
+                            event.seq,
+                            RemoteLifecycle.ENDED,
+                            value.exitCode.takeIf { value.hasExitCode() },
+                        ),
+                    )
+                }
+                MessageType.INPUT_ACCEPTED,
+                MessageType.INPUT_REJECTED,
+                -> InputResultPayload.parseFrom(payload).let { value ->
+                    val inputId = uuidFromBytes(value.inputId.toByteArray())
+                    require((event.messageType == MessageType.INPUT_ACCEPTED) == value.accepted) {
+                        "History input result type mismatch"
+                    }
+                    DecodedHistoryEvent(
+                        RemoteSessionEvent.InputResult(
+                            event.seq,
+                            inputId,
+                            value.accepted,
+                            value.reasonCode.ifBlank { null },
+                        ),
+                    )
+                }
+                MessageType.LEASE_GRANTED -> DecodedHistoryEvent(RemoteSessionEvent.ControlGranted(event.seq))
+                MessageType.LEASE_DENIED,
+                MessageType.LEASE_REVOKED,
+                -> LeasePayload.parseFrom(payload).let { value ->
+                    DecodedHistoryEvent(
+                        RemoteSessionEvent.ControlRevoked(
+                            event.seq,
+                            value.reasonCode.ifBlank { "control lease revoked" },
+                        ),
+                        value.localInputEpoch,
+                    )
+                }
+                MessageType.GAP -> error("History contains a permanent gap")
+                else -> error("Unsupported history event ${event.messageType}")
+            }
+        } finally {
+            payload.fill(0)
+        }
+    }
+
+    private fun uuidFromBytes(value: ByteArray): UUID {
+        try {
+            require(value.size == 16) { "History UUID must be 16 bytes" }
+            val buffer = ByteBuffer.wrap(value)
+            return UUID(buffer.long, buffer.long)
+        } finally {
+            value.fill(0)
+        }
+    }
+
+    private fun historyKeyEpoch(recipientDeviceId: UUID, keyId: String): Long? {
+        val prefix = "history-v1:${recipientDeviceId.toString().replace("-", "")}:"
+        if (!keyId.startsWith(prefix)) return null
+        val encodedEpoch = keyId.removePrefix(prefix)
+        if (encodedEpoch.length !in 8..19 || encodedEpoch.any { it !in '0'..'9' }) return null
+        val epoch = encodedEpoch.toLongOrNull()?.takeIf { it > 0 } ?: return null
+        return epoch.takeIf { HistoryCrypto.keyId(recipientDeviceId, it) == keyId }
+    }
+
+    private fun wipeHistoryEvents(events: List<RemoteSessionEvent>) {
+        events.forEach { event ->
+            if (event is RemoteSessionEvent.Output) event.bytes.fill(0)
+        }
+    }
+
+    private suspend fun applyHistoryEvent(engine: TermuxTerminalEngine, event: HistoryEventV1): Long {
+        val payload = event.payload.toByteArray()
+        return try {
+            when (event.messageType) {
+                MessageType.OUTPUT_CHUNK -> {
+                    val output = OutputChunkPayload.parseFrom(payload).output.toByteArray()
+                    try { engine.feed(event.seq, ByteBuffer.wrap(output)) } finally { output.fill(0) }
+                    0
+                }
+                MessageType.RESIZE_APPLIED -> ResizePayload.parseFrom(payload).also { resize ->
+                    engine.resize(resize.columns.coerceAtLeast(1), resize.rows.coerceAtLeast(1))
+                }.let { 0 }
+                MessageType.GAP -> {
+                    val gap = GapPayload.parseFrom(payload)
+                    error("History gap ${gap.start}..${gap.end}")
+                }
+                MessageType.SESSION_UPSERT,
+                MessageType.SESSION_STARTED,
+                MessageType.SESSION_INTERRUPTED,
+                MessageType.SESSION_ENDED,
+                MessageType.INPUT_ACCEPTED,
+                MessageType.INPUT_REJECTED,
+                MessageType.LEASE_GRANTED -> 0
+                MessageType.LEASE_DENIED,
+                MessageType.LEASE_REVOKED,
+                -> LeasePayload.parseFrom(payload).localInputEpoch
+                else -> error("Unsupported history event ${event.messageType}")
+            }
+        } finally {
+            payload.fill(0)
+        }
+    }
+
+    private data class RestoredLiveHistory(
+        val acknowledgement: Long = 0,
+        val localInputEpoch: Long = 0,
+        val rendererGeneration: Long,
+    )
+
+    private data class LoadedLiveHistory(
+        val events: List<RemoteSessionEvent>,
+        val localInputEpoch: Long,
+    )
+
+    private data class DecodedHistoryEvent(
+        val event: RemoteSessionEvent,
+        val localInputEpoch: Long = 0,
+    )
+
     private companion object {
         const val PUBLIC_SERVER_URL = "https://termlink.kget.cc:8910"
         const val LIVE_TOKEN_REFRESH_INTERVAL_MILLIS = 15_000L
         const val LIVE_TOKEN_REFRESH_RETRY_MILLIS = 45_000L
+        const val LIVE_OUTPUT_ACK_DIRECTION = "PC_TO_ANDROID"
+        val HISTORY_RECOVERY_DELAYS_MILLIS = longArrayOf(500, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000)
         val sensitiveIdentifierPattern = Regex("(?i)\\b[0-9a-f]{8}-[0-9a-f-]{27,}\\b")
     }
 }

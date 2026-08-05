@@ -17,7 +17,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         AckCursorEntity::class,
         HistoryPreferenceEntity::class,
     ],
-    version = 2,
+    version = 3,
     exportSchema = true,
 )
 abstract class TermLinkDatabase : RoomDatabase() {
@@ -48,7 +48,7 @@ abstract class TermLinkDatabase : RoomDatabase() {
         @JvmStatic
         fun open(context: Context, name: String = DEFAULT_NAME): TermLinkDatabase =
             Room.databaseBuilder(context.applicationContext, TermLinkDatabase::class.java, name)
-                .addMigrations(MIGRATION_1_2)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                 .build()
 
         @JvmStatic
@@ -69,6 +69,15 @@ abstract class TermLinkDatabase : RoomDatabase() {
                 )
                 database.execSQL(
                     "ALTER TABLE pcs ADD COLUMN keyEpoch INTEGER NOT NULL DEFAULT 1",
+                )
+            }
+        }
+
+        @JvmField
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL(
+                    "ALTER TABLE ack_cursors ADD COLUMN rendererGeneration INTEGER NOT NULL DEFAULT 1",
                 )
             }
         }

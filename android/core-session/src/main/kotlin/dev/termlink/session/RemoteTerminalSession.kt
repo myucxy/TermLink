@@ -4,10 +4,13 @@ import dev.termlink.terminal.api.TerminalEngine
 import dev.termlink.terminal.api.TerminalSize
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -20,11 +23,13 @@ import kotlinx.coroutines.sync.withLock
 import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 class RemoteTerminalSession(
     private val engine: TerminalEngine,
     private val outbound: RemoteSessionOutbound,
     parentScope: CoroutineScope,
+    initialAcknowledgedSequence: Long = 0,
     private val resizeDebounceMillis: Long = 150,
     private val leaseRenewalIntervalMillis: Long = 10_000,
     private val clockMillis: () -> Long = System::currentTimeMillis,
@@ -33,14 +38,22 @@ class RemoteTerminalSession(
 ) : AutoCloseable {
     private val sessionJob = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + sessionJob)
+    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val mutex = Mutex()
+    private val acknowledgementCommitMutex = Mutex()
     private val started = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
+    private val rebuildingRenderer = AtomicBoolean(false)
     private val mutableState = MutableStateFlow<RemoteSessionState>(
-        RemoteSessionState.Reconnecting(lastAckedSequence = 0),
+        RemoteSessionState.Reconnecting(lastAckedSequence = initialAcknowledgedSequence),
     )
     private val mutableTitle = MutableStateFlow("")
-    private var lastAckedSequence = 0L
+    private val acknowledgementHighWater = AtomicLong(initialAcknowledgedSequence)
+    private val acknowledgementSignal = Channel<Unit>(Channel.CONFLATED)
+    private val acknowledgementJob: Job
+    private var lastAppliedSequence = initialAcknowledgedSequence
+    private var lastAckedSequence = initialAcknowledgedSequence
+    private var gapGeneration = 0L
     private var latestTerminalSize: TerminalSize? = null
     private var leaseExpiryJob: Job? = null
     private var leaseRenewalJob: Job? = null
@@ -49,10 +62,16 @@ class RemoteTerminalSession(
     val title: StateFlow<String> = mutableTitle.asStateFlow()
 
     init {
+        require(initialAcknowledgedSequence >= 0) { "initialAcknowledgedSequence must not be negative" }
         require(resizeDebounceMillis in 100..200) {
             "resizeDebounceMillis must be from 100 through 200"
         }
         require(leaseRenewalIntervalMillis > 0) { "leaseRenewalIntervalMillis must be positive" }
+        acknowledgementJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            for (ignored in acknowledgementSignal) {
+                drainAcknowledgements()
+            }
+        }
     }
 
     @OptIn(FlowPreview::class)
@@ -73,15 +92,23 @@ class RemoteTerminalSession(
     }
 
     suspend fun onConnected(): Boolean {
+        var historyRecoveryRequired = false
+        var durableCursor = 0L
         mutex.withLock {
-            if (mutableState.value is RemoteSessionState.Exited) return false
-            if (mutableState.value !is RemoteSessionState.HistoryGap) {
-                mutableState.value = RemoteSessionState.Live(lastAckedSequence)
+            if (closed.get() || mutableState.value is RemoteSessionState.Exited) return false
+            historyRecoveryRequired = mutableState.value is RemoteSessionState.HistoryGap
+            durableCursor = lastAckedSequence
+            if (!historyRecoveryRequired) {
+                mutableState.value = RemoteSessionState.Live(durableCursor)
             }
             engine.setReadOnly(true)
         }
+        // A gap cannot safely advertise any cursor until the renderer has been
+        // rebuilt and the cumulative ACK has been persisted. REST history
+        // recovery will publish a fresh SUBSCRIBE after that commit.
+        if (historyRecoveryRequired) return true
         return try {
-            outbound.resume(lastAckedSequence)
+            outbound.resume(durableCursor)
             true
         } catch (error: CancellationException) {
             throw error
@@ -97,7 +124,7 @@ class RemoteTerminalSession(
 
     suspend fun markReadOnly(reason: String) {
         mutex.withLock {
-            if (mutableState.value is RemoteSessionState.Exited ||
+            if (closed.get() || mutableState.value is RemoteSessionState.Exited ||
                 mutableState.value is RemoteSessionState.HistoryGap
             ) return
             leaseExpiryJob?.cancel()
@@ -117,6 +144,7 @@ class RemoteTerminalSession(
         require(leaseId.isNotBlank()) { "leaseId is required" }
         require(expiresAtEpochMillis > clockMillis()) { "control lease is already expired" }
         val terminalSize = mutex.withLock {
+            check(!closed.get()) { "RemoteTerminalSession is closed" }
             check(mutableState.value !is RemoteSessionState.Exited) { "session has exited" }
             check(mutableState.value !is RemoteSessionState.HistoryGap) {
                 "session has an unrecoverable history gap"
@@ -176,18 +204,45 @@ class RemoteTerminalSession(
         markReadOnly(reason)
     }
 
-    suspend fun accept(event: RemoteSessionEvent): EventAcceptance = mutex.withLock {
-        require(event.sequence > 0) { "event sequence must be positive" }
-        if (mutableState.value is RemoteSessionState.Exited) return EventAcceptance.IgnoredAfterExit
-        if (event.sequence <= lastAckedSequence) return EventAcceptance.Duplicate(event.sequence)
+    suspend fun accept(event: RemoteSessionEvent): EventAcceptance = accept(event, sendAcknowledgement = true)
 
-        val expected = lastAckedSequence + 1
+    private suspend fun accept(
+        event: RemoteSessionEvent,
+        sendAcknowledgement: Boolean,
+    ): EventAcceptance = mutex.withLock {
+        check(!closed.get()) { "RemoteTerminalSession is closed" }
+        check(!rebuildingRenderer.get()) { "RemoteTerminalSession renderer is rebuilding" }
+        require(event.sequence > 0) { "event sequence must be positive" }
+        if (event.sequence <= lastAppliedSequence) {
+            if (sendAcknowledgement && event.sequence > lastAckedSequence) {
+                requestAcknowledgement(lastAppliedSequence)
+            }
+            return EventAcceptance.Duplicate(event.sequence)
+        }
+        if (mutableState.value is RemoteSessionState.Exited) return EventAcceptance.IgnoredAfterExit
+        (mutableState.value as? RemoteSessionState.HistoryGap)?.let { gap ->
+            return EventAcceptance.HistoryGap(gap.expectedSequence, gap.receivedSequence)
+        }
+
+        val expected = lastAppliedSequence + 1
         if (event is RemoteSessionEvent.Gap) {
             require(event.missingEndSequence >= event.missingStartSequence) { "gap range is inverted" }
-            require(event.missingStartSequence == expected) { "gap start does not match the next sequence" }
             require(event.missingEndSequence == event.sequence - 1) { "gap end does not precede its frame" }
-            enterHistoryGap(expected, event.sequence)
-            return EventAcceptance.HistoryGap(expected, event.sequence)
+            if (event.missingEndSequence >= expected) {
+                // A reconnect can legitimately overlap a prefix which reached
+                // the renderer but whose cumulative ACK had not reached the PC.
+                // Freeze only the still-missing suffix.
+                enterHistoryGap(expected, event.sequence)
+                return EventAcceptance.HistoryGap(expected, event.sequence)
+            }
+            // History recovery ends immediately before the ordered Gap marker.
+            // When the peer replays that same marker its missing range is now
+            // fully covered; consume it as a no-op sequence event and ACK it.
+            check(event.sequence == expected) { "covered gap marker is not the next sequence" }
+            lastAppliedSequence = event.sequence
+            mutableState.value = withUpdatedAck(mutableState.value)
+            if (sendAcknowledgement) requestAcknowledgement(lastAppliedSequence)
+            return EventAcceptance.Applied(event.sequence)
         }
         if (event.sequence != expected) {
             enterHistoryGap(expected, event.sequence)
@@ -214,44 +269,280 @@ class RemoteTerminalSession(
             is RemoteSessionEvent.Gap -> error("handled above")
         }
 
-        lastAckedSequence = event.sequence
+        lastAppliedSequence = event.sequence
         mutableState.value = stateAfterAppliedEvent(event)
-        try {
-            outbound.acknowledge(lastAckedSequence)
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            engine.setReadOnly(true)
-            if (mutableState.value !is RemoteSessionState.Exited) {
-                mutableState.value = RemoteSessionState.Reconnecting(lastAckedSequence, "ACK failed")
-            }
+        if (sendAcknowledgement) {
+            requestAcknowledgement(lastAppliedSequence)
         }
         EventAcceptance.Applied(event.sequence)
     }
 
-    suspend fun resetAndReplay(events: List<RemoteSessionEvent>): Long {
+    private fun requestAcknowledgement(highestAppliedSequence: Long) {
+        acknowledgementHighWater.accumulateAndGet(highestAppliedSequence, ::maxOf)
+        acknowledgementSignal.trySend(Unit)
+    }
+
+    private suspend fun drainAcknowledgements() {
+        while (!closed.get()) {
+            val target = acknowledgementHighWater.get()
+            try {
+                val committed = acknowledgementCommitMutex.withLock {
+                    val durableBefore = mutex.withLock { lastAckedSequence }
+                    if (target <= durableBefore) return@withLock false
+                    val persisted = outbound.persistAcknowledgement(target)
+                    require(persisted == target) {
+                        "durable ACK commit returned $persisted for requested sequence $target"
+                    }
+                    mutex.withLock {
+                        check(target <= lastAppliedSequence) {
+                            "durable ACK cannot advance beyond the applied renderer cursor"
+                        }
+                        if (target > lastAckedSequence) {
+                            lastAckedSequence = target
+                            mutableState.value = withUpdatedAck(mutableState.value)
+                        }
+                    }
+                    outbound.acknowledge(target)
+                    true
+                }
+                if (!committed || acknowledgementHighWater.get() <= target) return
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                markReconnecting("ACK failed")
+                return
+            }
+        }
+    }
+
+    suspend fun resetAndReplay(
+        events: List<RemoteSessionEvent>,
+        acknowledgeEach: Boolean = true,
+    ): Long {
+        check(!closed.get()) { "RemoteTerminalSession is closed" }
+        validateHistoryReplay(events, events.lastOrNull()?.sequence ?: 0)
+        check(rebuildingRenderer.compareAndSet(false, true)) { "RemoteTerminalSession renderer is already rebuilding" }
+        try {
+            return acknowledgementCommitMutex.withLock {
+                mutex.withLock {
+                    check(!closed.get()) { "RemoteTerminalSession is closed" }
+                    outbound.resetAcknowledgement()
+                    leaseExpiryJob?.cancel()
+                    leaseExpiryJob = null
+                    leaseRenewalJob?.cancel()
+                    leaseRenewalJob = null
+                    try {
+                        engine.setReadOnly(true)
+                        engine.clear()
+                        lastAppliedSequence = 0
+                        lastAckedSequence = 0
+                        acknowledgementHighWater.set(0)
+                        mutableTitle.value = ""
+                        mutableState.value = RemoteSessionState.Live(lastAckedSequence)
+                        for (event in events) {
+                            when (event) {
+                                is RemoteSessionEvent.Output ->
+                                    engine.feed(event.sequence, ByteBuffer.wrap(event.bytes).asReadOnlyBuffer())
+                                is RemoteSessionEvent.Resize -> engine.resize(event.size.columns, event.size.rows)
+                                is RemoteSessionEvent.Title -> mutableTitle.value = event.value
+                                is RemoteSessionEvent.InputResult,
+                                is RemoteSessionEvent.ControlGranted,
+                                -> Unit
+                                is RemoteSessionEvent.ControlRevoked -> engine.setReadOnly(true)
+                                is RemoteSessionEvent.Lifecycle -> Unit
+                                is RemoteSessionEvent.Gap -> error("raw replay contains a permanent gap")
+                            }
+                            lastAppliedSequence = event.sequence
+                            mutableState.value = stateAfterAppliedEvent(event)
+                            if (acknowledgeEach) requestAcknowledgement(lastAppliedSequence)
+                        }
+                        if (!acknowledgeEach) requestAcknowledgement(lastAppliedSequence)
+                        lastAppliedSequence
+                    } catch (error: Throwable) {
+                        lastAppliedSequence = 0
+                        lastAckedSequence = 0
+                        acknowledgementHighWater.set(0)
+                        mutableTitle.value = ""
+                        runCatching { engine.clear() }.exceptionOrNull()?.let(error::addSuppressed)
+                        gapGeneration++
+                        mutableState.value = RemoteSessionState.HistoryGap(
+                            lastAckedSequence = 0,
+                            expectedSequence = 1,
+                            receivedSequence = events.last().sequence + 1,
+                            generation = gapGeneration,
+                        )
+                        runCatching { engine.setReadOnly(true) }.exceptionOrNull()?.let(error::addSuppressed)
+                        throw error
+                    }
+                }
+            }
+        } finally {
+            rebuildingRenderer.set(false)
+        }
+    }
+
+    /**
+     * Rebuilds a specific HistoryGap generation from a verified raw prefix.
+     * Replay shape and the original durable cursor are validated before the
+     * renderer is cleared. Commit order is durable store, session cursor, then
+     * wire publication.
+     */
+    suspend fun recoverFromHistory(
+        events: List<RemoteSessionEvent>,
+        expectedGap: RemoteSessionState.HistoryGap,
+        persist: suspend (Long) -> Unit,
+        publish: suspend (Long) -> Unit,
+    ): Long {
+        check(!closed.get()) { "RemoteTerminalSession is closed" }
+        val target = expectedGap.receivedSequence - 1
+        validateHistoryReplay(events, target)
+        check(rebuildingRenderer.compareAndSet(false, true)) { "RemoteTerminalSession renderer is already rebuilding" }
+        try {
+            return acknowledgementCommitMutex.withLock {
+                mutex.withLock {
+                check(!closed.get()) { "RemoteTerminalSession is closed" }
+                val currentGap = mutableState.value as? RemoteSessionState.HistoryGap
+                    ?: error("history recovery requires an active History Gap")
+                require(currentGap.generation == expectedGap.generation) {
+                    "history gap generation changed before recovery"
+                }
+                require(currentGap.expectedSequence == expectedGap.expectedSequence &&
+                    currentGap.receivedSequence == expectedGap.receivedSequence
+                ) { "history gap range changed before recovery" }
+                // The final ACK for the already-rendered prefix may finish
+                // after the caller observes the HistoryGap. That monotonic
+                // advance is safe: the generation and missing range above are
+                // the recovery fence, while the current cursor remains the
+                // authoritative durable value once the ACK commit mutex is
+                // held. Reject only regression or an internally inconsistent
+                // state.
+                require(currentGap.lastAckedSequence >= expectedGap.lastAckedSequence) {
+                    "durable ACK regressed before history recovery"
+                }
+                require(lastAckedSequence == currentGap.lastAckedSequence) {
+                    "history gap durable ACK is inconsistent"
+                }
+                require(lastAppliedSequence == currentGap.expectedSequence - 1) {
+                    "applied renderer cursor does not match the active history gap"
+                }
+
+                leaseExpiryJob?.cancel()
+                leaseExpiryJob = null
+                leaseRenewalJob?.cancel()
+                leaseRenewalJob = null
+                engine.setReadOnly(true)
+                engine.clear()
+                lastAppliedSequence = 0
+                mutableTitle.value = ""
+                var recoveredState: RemoteSessionState = RemoteSessionState.Live(lastAckedSequence)
+                var durable = false
+                try {
+                    for (event in events) {
+                        when (event) {
+                            is RemoteSessionEvent.Output ->
+                                engine.feed(event.sequence, ByteBuffer.wrap(event.bytes).asReadOnlyBuffer())
+                            is RemoteSessionEvent.Resize -> engine.resize(event.size.columns, event.size.rows)
+                            is RemoteSessionEvent.Title -> mutableTitle.value = event.value
+                            is RemoteSessionEvent.InputResult,
+                            is RemoteSessionEvent.ControlGranted,
+                            -> Unit
+                            is RemoteSessionEvent.ControlRevoked -> engine.setReadOnly(true)
+                            is RemoteSessionEvent.Lifecycle -> Unit
+                            is RemoteSessionEvent.Gap -> error("raw replay contains a permanent gap")
+                        }
+                        lastAppliedSequence = event.sequence
+                        recoveredState = when (event) {
+                            is RemoteSessionEvent.ControlRevoked ->
+                                RemoteSessionState.ReadOnly(lastAckedSequence, event.reason)
+                            is RemoteSessionEvent.Lifecycle -> when (event.state) {
+                                RemoteLifecycle.RUNNING -> recoveredState
+                                RemoteLifecycle.INTERRUPTED ->
+                                    RemoteSessionState.Reconnecting(lastAckedSequence, "remote session interrupted")
+                                RemoteLifecycle.ENDED ->
+                                    RemoteSessionState.Exited(lastAckedSequence, event.exitCode)
+                            }
+                            else -> recoveredState
+                        }
+                    }
+                    persist(target)
+                    durable = true
+                    lastAckedSequence = target
+                    acknowledgementHighWater.set(target)
+                    recoveredState = withUpdatedAck(recoveredState)
+                    mutableState.value = recoveredState
+                    publish(target)
+                    target
+                } catch (error: Throwable) {
+                    if (durable) {
+                        mutableState.value = if (recoveredState is RemoteSessionState.Exited) {
+                            withUpdatedAck(recoveredState)
+                        } else {
+                            RemoteSessionState.Reconnecting(lastAckedSequence, "history recovery publication failed")
+                        }
+                    } else {
+                        var resetFailure: Throwable? = null
+                        try {
+                            outbound.resetAcknowledgement()
+                        } catch (resetError: Throwable) {
+                            resetFailure = resetError
+                        }
+                        lastAppliedSequence = 0
+                        lastAckedSequence = 0
+                        acknowledgementHighWater.set(0)
+                        mutableTitle.value = ""
+                        runCatching { engine.clear() }.exceptionOrNull()?.let(error::addSuppressed)
+                        mutableState.value = RemoteSessionState.HistoryGap(
+                            lastAckedSequence = 0,
+                            expectedSequence = 1,
+                            receivedSequence = expectedGap.receivedSequence,
+                            generation = expectedGap.generation,
+                        )
+                        resetFailure?.let(error::addSuppressed)
+                    }
+                    runCatching { engine.setReadOnly(true) }.exceptionOrNull()?.let(error::addSuppressed)
+                    throw error
+                }
+                }
+            }
+        } finally {
+            rebuildingRenderer.set(false)
+        }
+    }
+
+    suspend fun recoverFromHistory(
+        events: List<RemoteSessionEvent>,
+        persist: suspend (Long) -> Unit,
+        publish: suspend (Long) -> Unit,
+    ): Long {
+        val expected = state.value as? RemoteSessionState.HistoryGap
+            ?: error("history recovery requires an active History Gap")
+        return recoverFromHistory(events, expected, persist, publish)
+    }
+
+    private fun validateHistoryReplay(events: List<RemoteSessionEvent>, target: Long) {
+        require(target > 0) { "history recovery target must be positive" }
         require(events.isNotEmpty()) { "raw replay must not be empty" }
         require(events.first().sequence == 1L) { "raw replay must start at sequence 1 without a Snapshot" }
-        mutex.withLock {
-            leaseExpiryJob?.cancel()
-            leaseExpiryJob = null
-            leaseRenewalJob?.cancel()
-            leaseRenewalJob = null
-            engine.setReadOnly(true)
-            engine.clear()
-            lastAckedSequence = 0
-            mutableTitle.value = ""
-            mutableState.value = RemoteSessionState.Live(lastAckedSequence)
-        }
+        var expected = 1L
+        var ended = false
         for (event in events) {
-            val result = accept(event)
-            check(result is EventAcceptance.Applied) { "raw replay is not a complete contiguous stream" }
+            require(!ended) { "raw replay contains events after the session ended" }
+            require(event.sequence == expected) { "raw replay is not a complete contiguous stream" }
+            require(event !is RemoteSessionEvent.Gap) { "raw replay contains a permanent gap" }
+            if (event is RemoteSessionEvent.Output) {
+                require(event.bytes.isNotEmpty()) { "output event is empty" }
+            }
+            ended = event is RemoteSessionEvent.Lifecycle && event.state == RemoteLifecycle.ENDED
+            expected++
         }
-        return lastAckedSequence
+        require(events.last().sequence == target) {
+            "raw replay does not completely fill the active history gap"
+        }
     }
 
     suspend fun submitInput(bytes: ByteArray): InputSubmission {
         val input = mutex.withLock {
+            check(!closed.get()) { "RemoteTerminalSession is closed" }
             if (bytes.isEmpty()) return InputSubmission.RejectedEmpty
             val current = mutableState.value
             if (current is RemoteSessionState.Exited) return InputSubmission.RejectedExited
@@ -269,6 +560,8 @@ class RemoteTerminalSession(
             // the ordered result must enter accept() on the receive coroutine.
             outbound.sendInput(input)
             InputSubmission.Sent(input.inputId)
+        } catch (error: RemoteInputRejectedException) {
+            InputSubmission.RejectedByRemote(input.inputId, error.reasonCode)
         } catch (error: CancellationException) {
             throw error
         } catch (_: Exception) {
@@ -278,12 +571,13 @@ class RemoteTerminalSession(
                     engine.setReadOnly(true)
                 }
             }
-            InputSubmission.TransportFailed(input.inputId)
+            InputSubmission.DeliveryUnknown(input.inputId)
         }
     }
 
     private suspend fun observeResize(size: TerminalSize) {
         val shouldSend = mutex.withLock {
+            if (closed.get()) return
             latestTerminalSize = size
             mutableState.value is RemoteSessionState.Controlling
         }
@@ -347,12 +641,18 @@ class RemoteTerminalSession(
         leaseRenewalJob?.cancel()
         leaseRenewalJob = null
         engine.setReadOnly(true)
-        mutableState.value = RemoteSessionState.HistoryGap(lastAckedSequence, expected, received)
+        gapGeneration++
+        mutableState.value = RemoteSessionState.HistoryGap(
+            lastAckedSequence,
+            expected,
+            received,
+            gapGeneration,
+        )
     }
 
     private suspend fun markReconnecting(reason: String?) {
         mutex.withLock {
-            if (mutableState.value is RemoteSessionState.Exited ||
+            if (closed.get() || mutableState.value is RemoteSessionState.Exited ||
                 mutableState.value is RemoteSessionState.HistoryGap
             ) return
             leaseExpiryJob?.cancel()
@@ -366,6 +666,7 @@ class RemoteTerminalSession(
 
     private suspend fun expireLease(leaseId: String) {
         mutex.withLock {
+            if (closed.get()) return
             val current = mutableState.value
             if (current is RemoteSessionState.Controlling && current.leaseId == leaseId &&
                 current.expiresAtEpochMillis <= clockMillis()
@@ -383,7 +684,28 @@ class RemoteTerminalSession(
         if (!closed.compareAndSet(false, true)) return
         leaseExpiryJob?.cancel()
         leaseRenewalJob?.cancel()
+        acknowledgementSignal.close()
+        acknowledgementJob.cancel()
         scope.cancel()
+        if (mutex.tryLock()) {
+            try {
+                closeEngine()
+            } finally {
+                mutex.unlock()
+                cleanupScope.cancel()
+            }
+        } else {
+            cleanupScope.launch {
+                try {
+                    mutex.withLock { closeEngine() }
+                } finally {
+                    cleanupScope.cancel()
+                }
+            }
+        }
+    }
+
+    private fun closeEngine() {
         engine.setReadOnly(true)
         if (disposeEngineOnClose) engine.dispose()
     }

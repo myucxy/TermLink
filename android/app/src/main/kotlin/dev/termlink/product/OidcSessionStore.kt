@@ -146,14 +146,38 @@ internal class OidcSessionStore(context: Context) {
         check(preferences.edit().remove(KEY_AUTH_STATE).commit())
     }
 
-    @Synchronized
     fun reserveInputSequenceRange(
         sessionId: UUID,
         count: Int = INPUT_SEQUENCE_RESERVATION_SIZE,
         clockMillis: Long = System.currentTimeMillis(),
-    ): LongRange {
+    ): LongRange = synchronized(SEQUENCE_RESERVATION_LOCK) {
+        reserveSequenceRange(
+            KEY_INPUT_SEQUENCE_PREFIX + sessionId,
+            count,
+            clockMillis,
+        )
+    }
+
+    /**
+     * Reserves Android -> PC Envelope sequence numbers before use. Because the
+     * sequence is the 64-bit suffix of the AEAD nonce, persisting the high
+     * watermark prevents nonce reuse when a Session is reopened in the same
+     * key epoch.
+     */
+    fun reserveEnvelopeSequenceRange(
+        sessionId: UUID,
+        count: Int = ENVELOPE_SEQUENCE_RESERVATION_SIZE,
+        clockMillis: Long = System.currentTimeMillis(),
+    ): LongRange = synchronized(SEQUENCE_RESERVATION_LOCK) {
+        reserveSequenceRange(
+            KEY_ENVELOPE_SEQUENCE_PREFIX + sessionId,
+            count,
+            clockMillis,
+        )
+    }
+
+    private fun reserveSequenceRange(key: String, count: Int, clockMillis: Long): LongRange {
         require(count in 1..MAX_INPUT_SEQUENCE_RESERVATION_SIZE) { "input sequence reservation is invalid" }
-        val key = KEY_INPUT_SEQUENCE_PREFIX + sessionId
         val storedHighWatermark = preferences.getLong(key, 0L)
         val clockFloor = Math.multiplyExact(clockMillis.coerceAtLeast(1L), INPUT_SEQUENCE_CLOCK_MULTIPLIER)
         val start = Math.addExact(maxOf(storedHighWatermark, clockFloor), 1L)
@@ -203,13 +227,16 @@ internal class OidcSessionStore(context: Context) {
         const val KEY_AUTH_STATE = "auth_state"
         const val KEY_ACCOUNT_SCOPE = "account_scope"
         const val KEY_INPUT_SEQUENCE_PREFIX = "input_sequence_high_watermark_"
+        const val KEY_ENVELOPE_SEQUENCE_PREFIX = "envelope_sequence_high_watermark_android_to_pc_"
         const val KEY_ALIAS = "termlink-oidc-session-wrap-v1"
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
         const val IV_BYTES = 12
         const val INPUT_SEQUENCE_RESERVATION_SIZE = 4_096
+        const val ENVELOPE_SEQUENCE_RESERVATION_SIZE = 4_096
         const val MAX_INPUT_SEQUENCE_RESERVATION_SIZE = 1_000_000
         const val INPUT_SEQUENCE_CLOCK_MULTIPLIER = 1L shl 20
         val AAD = "TermLink OIDC AuthState V1".encodeToByteArray()
+        val SEQUENCE_RESERVATION_LOCK = Any()
     }
 }

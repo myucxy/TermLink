@@ -218,7 +218,9 @@ class Phase1TestSessionClientTest {
         client.start()
 
         val gap = withTimeout(5_000) {
-            client.sessionState.first { it is RemoteSessionState.HistoryGap }
+            client.sessionState.first {
+                it is RemoteSessionState.HistoryGap && it.lastAckedSequence == 4L
+            }
         }
         assertEquals(4L, gap.lastAckedSequence)
         assertEquals(5L, assertIs<RemoteSessionState.HistoryGap>(gap).expectedSequence)

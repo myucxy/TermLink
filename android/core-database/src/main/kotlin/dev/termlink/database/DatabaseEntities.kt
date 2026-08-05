@@ -115,6 +115,12 @@ data class AckCursorEntity(
     val sessionId: String,
     /** Direction is metadata, e.g. PC_TO_ANDROID or ANDROID_TO_PC. */
     val direction: String,
+    /**
+     * Identifies the renderer state this cursor belongs to. Reset increments
+     * the generation instead of deleting the row so delayed writers from an
+     * older renderer cannot recreate a stale high cursor.
+     */
+    val rendererGeneration: Long,
     val highestContiguousSequence: Long,
     val updatedAtEpochMillis: Long,
 )

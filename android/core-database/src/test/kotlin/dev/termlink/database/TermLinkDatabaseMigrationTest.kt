@@ -1,0 +1,202 @@
+package dev.termlink.database
+
+import androidx.room.Room
+import androidx.sqlite.db.SupportSQLiteDatabase
+import androidx.test.core.app.ApplicationProvider
+import kotlin.test.assertEquals
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [26])
+class TermLinkDatabaseMigrationTest {
+    @Test
+    fun migrateV2ToV3PreservesAckCursorAndInitializesRendererGeneration() {
+        createDatabaseAtVersion(2) {
+            execSQL(
+                """
+                INSERT INTO ack_cursors(sessionId, direction, highestContiguousSequence, updatedAtEpochMillis)
+                VALUES ('session-v2', 'PC_TO_ANDROID', 42, 1234)
+                """.trimIndent(),
+            )
+        }
+
+        val migrated = openMigratedDatabase()
+        try {
+            val database = migrated.openHelper.writableDatabase
+            database.query(
+                "SELECT rendererGeneration, highestContiguousSequence, updatedAtEpochMillis FROM ack_cursors WHERE sessionId = 'session-v2' AND direction = 'PC_TO_ANDROID'",
+            ).use { cursor ->
+                check(cursor.moveToFirst())
+                assertEquals(1L, cursor.getLong(0))
+                assertEquals(42L, cursor.getLong(1))
+                assertEquals(1234L, cursor.getLong(2))
+            }
+        } finally {
+            migrated.close()
+        }
+    }
+
+    @Test
+    fun migrateV1ToV3PreservesEmptyExchangeKeyAndInitializesPcKeyEpoch() {
+        createDatabaseAtVersion(1) {
+            execSQL(
+                """
+                INSERT INTO devices(id, type, name, keyId, trustState, createdAtEpochMillis)
+                VALUES ('device-v1', 'PHONE', 'legacy', 'key-id', 'UNTRUSTED', 1000)
+                """.trimIndent(),
+            )
+            execSQL(
+                """
+                INSERT INTO pcs(id, deviceId, name, agentVersion, remoteRoutingEnabled, online, lastSeenAtEpochMillis)
+                VALUES ('pc-v1', 'device-v1', 'legacy-pc', '1.0', 0, 0, NULL)
+                """.trimIndent(),
+            )
+        }
+
+        val migrated = openMigratedDatabase()
+        try {
+            val database = migrated.openHelper.writableDatabase
+            database.query(
+                "SELECT exchangePublicKey, trustState FROM devices WHERE id = 'device-v1'",
+            ).use { cursor ->
+                check(cursor.moveToFirst())
+                assertEquals(0, cursor.getBlob(0).size)
+                assertEquals("UNTRUSTED", cursor.getString(1))
+            }
+            database.query("SELECT keyEpoch FROM pcs WHERE id = 'pc-v1'").use { cursor ->
+                check(cursor.moveToFirst())
+                assertEquals(1L, cursor.getLong(0))
+            }
+        } finally {
+            migrated.close()
+        }
+    }
+
+    /**
+     * Room's MigrationTestHelper expects schemas packaged as test assets, while
+     * this module exports them to the repository-level schemas directory. Seed
+     * a real v3 Room database, rebuild only the columns introduced by later
+     * versions, and then let Room run the production migrations against it.
+     */
+    private fun createDatabaseAtVersion(
+        version: Int,
+        insertRows: SupportSQLiteDatabase.() -> Unit,
+    ) {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        context.deleteDatabase(DATABASE_NAME)
+        val seed = Room.databaseBuilder(context, TermLinkDatabase::class.java, DATABASE_NAME)
+            .allowMainThreadQueries()
+            .build()
+        val database = seed.openHelper.writableDatabase
+        when (version) {
+            1 -> downgradeV3ToV1(database)
+            2 -> downgradeV3ToV2(database)
+            else -> error("Unsupported test database version: $version")
+        }
+        database.insertRows()
+        seed.close()
+    }
+
+    private fun openMigratedDatabase(): TermLinkDatabase {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val migrated = Room.databaseBuilder(context, TermLinkDatabase::class.java, DATABASE_NAME)
+            .addMigrations(TermLinkDatabase.MIGRATION_1_2, TermLinkDatabase.MIGRATION_2_3)
+            .allowMainThreadQueries()
+            .build()
+        migrated.openHelper.writableDatabase
+        return migrated
+    }
+
+    private fun downgradeV3ToV2(database: SupportSQLiteDatabase) {
+        database.execSQL(
+            """
+            CREATE TABLE ack_cursors_legacy (
+                sessionId TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                highestContiguousSequence INTEGER NOT NULL,
+                updatedAtEpochMillis INTEGER NOT NULL,
+                PRIMARY KEY(sessionId, direction)
+            )
+            """.trimIndent(),
+        )
+        database.execSQL(
+            """
+            INSERT INTO ack_cursors_legacy(sessionId, direction, highestContiguousSequence, updatedAtEpochMillis)
+            SELECT sessionId, direction, highestContiguousSequence, updatedAtEpochMillis FROM ack_cursors
+            """.trimIndent(),
+        )
+        database.execSQL("DROP TABLE ack_cursors")
+        database.execSQL("ALTER TABLE ack_cursors_legacy RENAME TO ack_cursors")
+        database.execSQL(
+            "CREATE INDEX index_ack_cursors_sessionId_highestContiguousSequence ON ack_cursors(sessionId, highestContiguousSequence)",
+        )
+        setRoomVersion(database, 2, V2_IDENTITY_HASH)
+    }
+
+    private fun downgradeV3ToV1(database: SupportSQLiteDatabase) {
+        downgradeV3ToV2(database)
+        database.execSQL(
+            """
+            CREATE TABLE devices_legacy (
+                id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                keyId TEXT NOT NULL,
+                trustState TEXT NOT NULL,
+                createdAtEpochMillis INTEGER NOT NULL,
+                PRIMARY KEY(id)
+            )
+            """.trimIndent(),
+        )
+        database.execSQL(
+            """
+            INSERT INTO devices_legacy(id, type, name, keyId, trustState, createdAtEpochMillis)
+            SELECT id, type, name, keyId, trustState, createdAtEpochMillis FROM devices
+            """.trimIndent(),
+        )
+        database.execSQL("DROP TABLE devices")
+        database.execSQL("ALTER TABLE devices_legacy RENAME TO devices")
+        database.execSQL("CREATE INDEX index_devices_trustState ON devices(trustState)")
+        database.execSQL("CREATE INDEX index_devices_createdAtEpochMillis ON devices(createdAtEpochMillis)")
+
+        database.execSQL(
+            """
+            CREATE TABLE pcs_legacy (
+                id TEXT NOT NULL,
+                deviceId TEXT NOT NULL,
+                name TEXT NOT NULL,
+                agentVersion TEXT NOT NULL,
+                remoteRoutingEnabled INTEGER NOT NULL,
+                online INTEGER NOT NULL,
+                lastSeenAtEpochMillis INTEGER,
+                PRIMARY KEY(id)
+            )
+            """.trimIndent(),
+        )
+        database.execSQL(
+            """
+            INSERT INTO pcs_legacy(id, deviceId, name, agentVersion, remoteRoutingEnabled, online, lastSeenAtEpochMillis)
+            SELECT id, deviceId, name, agentVersion, remoteRoutingEnabled, online, lastSeenAtEpochMillis FROM pcs
+            """.trimIndent(),
+        )
+        database.execSQL("DROP TABLE pcs")
+        database.execSQL("ALTER TABLE pcs_legacy RENAME TO pcs")
+        database.execSQL("CREATE INDEX index_pcs_deviceId ON pcs(deviceId)")
+        database.execSQL("CREATE INDEX index_pcs_online_lastSeenAtEpochMillis ON pcs(online, lastSeenAtEpochMillis)")
+        setRoomVersion(database, 1, V1_IDENTITY_HASH)
+    }
+
+    private fun setRoomVersion(database: SupportSQLiteDatabase, version: Int, identityHash: String) {
+        database.execSQL("PRAGMA user_version = $version")
+        database.execSQL("UPDATE room_master_table SET identity_hash = '$identityHash' WHERE id = 42")
+    }
+
+    private companion object {
+        const val DATABASE_NAME = "termlink-migration-test.db"
+        const val V1_IDENTITY_HASH = "0e5a433e894b631b4fcd81e47a099256"
+        const val V2_IDENTITY_HASH = "db77fd61744b9b1bd762519fc91e1618"
+    }
+}

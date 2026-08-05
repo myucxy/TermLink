@@ -3,7 +3,9 @@ package dev.termlink.session
 import dev.termlink.terminal.api.TerminalEngine
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalThemeV1
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -12,6 +14,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.ByteBuffer
@@ -36,6 +39,7 @@ class RemoteTerminalSessionTest {
         val applied = session.accept(RemoteSessionEvent.Output(1, "ok".encodeToByteArray()))
         val duplicate = session.accept(RemoteSessionEvent.Output(1, "ignored".encodeToByteArray()))
         val gap = session.accept(RemoteSessionEvent.Output(3, "gap".encodeToByteArray()))
+        runCurrent()
 
         assertEquals(EventAcceptance.Applied(1), applied)
         assertEquals(EventAcceptance.Duplicate(1), duplicate)
@@ -55,12 +59,41 @@ class RemoteTerminalSessionTest {
 
         assertTrue(session.onConnected())
         session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1)))
+        runCurrent()
         session.onDisconnected("network switch")
         assertIs<RemoteSessionState.Reconnecting>(session.state.value)
         assertTrue(session.onConnected())
 
         assertEquals(listOf(0L, 1L), outbound.resumes)
         assertEquals(1L, session.state.value.lastAckedSequence)
+        session.close()
+    }
+
+    @Test
+    fun restoredRendererStartsAtItsDurableCursorWithoutFeedingDuplicates() = runTest {
+        val engine = RecordingEngine()
+        engine.feed(41, ByteBuffer.wrap(byteArrayOf(1)))
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(
+            engine = engine,
+            outbound = outbound,
+            parentScope = backgroundScope,
+            initialAcknowledgedSequence = 41,
+        )
+
+        assertTrue(session.onConnected())
+        assertEquals(listOf(41L), outbound.resumes)
+        assertEquals(
+            EventAcceptance.Duplicate(41),
+            session.accept(RemoteSessionEvent.Output(41, byteArrayOf(1))),
+        )
+        assertEquals(
+            EventAcceptance.Applied(42),
+            session.accept(RemoteSessionEvent.Output(42, byteArrayOf(2))),
+        )
+        runCurrent()
+        assertEquals(listOf(42L), outbound.acknowledgements)
+        assertEquals(listOf(41L, 42L), engine.feeds.map { it.first })
         session.close()
     }
 
@@ -75,6 +108,7 @@ class RemoteTerminalSessionTest {
             EventAcceptance.Applied(1),
             session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1))),
         )
+        runCurrent()
         val reconnecting = assertIs<RemoteSessionState.Reconnecting>(session.state.value)
         assertEquals(1L, reconnecting.lastAckedSequence)
 
@@ -85,12 +119,87 @@ class RemoteTerminalSessionTest {
     }
 
     @Test
+    fun persistenceFailureResumesDurableCursorAndDuplicateRetriggersCommitWithoutRefed() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound().apply { failPersist = true }
+        val session = RemoteTerminalSession(engine, outbound, backgroundScope)
+        session.onConnected()
+
+        assertEquals(
+            EventAcceptance.Applied(1),
+            session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1))),
+        )
+        runCurrent()
+        val reconnecting = assertIs<RemoteSessionState.Reconnecting>(session.state.value)
+        assertEquals(0L, reconnecting.lastAckedSequence)
+        assertTrue(outbound.acknowledgements.isEmpty())
+
+        outbound.failPersist = false
+        assertTrue(session.onConnected())
+        assertEquals(
+            EventAcceptance.Duplicate(1),
+            session.accept(RemoteSessionEvent.Output(1, byteArrayOf(9))),
+        )
+        runCurrent()
+
+        assertEquals(listOf(0L, 0L), outbound.resumes)
+        assertEquals(listOf(1L), outbound.persistedAcknowledgements)
+        assertEquals(listOf(1L), outbound.acknowledgements)
+        assertEquals(listOf(1L), engine.feeds.map { it.first })
+        assertEquals(1L, session.state.value.lastAckedSequence)
+        session.close()
+    }
+
+    @Test
+    fun tenThousandAppliedEventsCollapseBehindOneBlockedDurableCommit() = runTest {
+        val firstCommitStarted = CompletableDeferred<Unit>()
+        val releaseFirstCommit = CompletableDeferred<Unit>()
+        val persisted = mutableListOf<Long>()
+        val published = mutableListOf<Long>()
+        val outbound = object : RemoteSessionOutbound {
+            override suspend fun resume(lastAckedSequence: Long) = Unit
+
+            override suspend fun persistAcknowledgement(highestContiguousSequence: Long): Long {
+                persisted += highestContiguousSequence
+                if (persisted.size == 1) {
+                    firstCommitStarted.complete(Unit)
+                    releaseFirstCommit.await()
+                }
+                return highestContiguousSequence
+            }
+
+            override suspend fun acknowledge(highestContiguousSequence: Long) {
+                published += highestContiguousSequence
+            }
+
+            override suspend fun sendInput(input: RemoteInput) = Unit
+            override suspend fun sendResize(size: TerminalSize) = Unit
+        }
+        val session = RemoteTerminalSession(RecordingEngine(), outbound, backgroundScope)
+
+        session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1)))
+        runCurrent()
+        firstCommitStarted.await()
+        for (sequence in 2L..10_000L) {
+            session.accept(RemoteSessionEvent.Output(sequence, byteArrayOf(1)))
+        }
+        releaseFirstCommit.complete(Unit)
+        runCurrent()
+
+        assertEquals(listOf(1L, 10_000L), persisted)
+        assertEquals(listOf(1L, 10_000L), published)
+        assertEquals(10_000L, session.state.value.lastAckedSequence)
+        session.close()
+    }
+
+    @Test
     fun explicitGapDoesNotAdvanceAck() = runTest {
         val engine = RecordingEngine()
         val outbound = RecordingOutbound()
         val session = RemoteTerminalSession(engine, outbound, backgroundScope)
         session.onConnected()
         session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1)))
+        runCurrent()
 
         assertEquals(
             EventAcceptance.HistoryGap(2, 4),
@@ -98,6 +207,80 @@ class RemoteTerminalSessionTest {
         )
         assertEquals(listOf(1L), outbound.acknowledgements)
         assertEquals(1L, session.state.value.lastAckedSequence)
+        session.close()
+    }
+
+    @Test
+    fun overlappingGapFreezesOnlyTheSuffixNotAlreadyApplied() = runTest {
+        val session = RemoteTerminalSession(RecordingEngine(), RecordingOutbound(), backgroundScope)
+        session.onConnected()
+        session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1)))
+        session.accept(RemoteSessionEvent.Output(2, byteArrayOf(2)))
+
+        assertEquals(
+            EventAcceptance.HistoryGap(3, 4),
+            session.accept(RemoteSessionEvent.Gap(4, 2, 3)),
+        )
+        val gap = assertIs<RemoteSessionState.HistoryGap>(session.state.value)
+        assertEquals(3L, gap.expectedSequence)
+        assertEquals(4L, gap.receivedSequence)
+        session.close()
+    }
+
+    @Test
+    fun replayedGapMarkerIsAcknowledgedAfterHistoryFilledItsRange() = runTest {
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(RecordingEngine(), outbound, backgroundScope)
+        session.onConnected()
+        session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1)))
+        runCurrent()
+        val activeGap = assertIs<RemoteSessionState.HistoryGap>(
+            session.accept(RemoteSessionEvent.Gap(4, 2, 3)).let { session.state.value },
+        )
+        session.recoverFromHistory(
+            events = listOf(
+                RemoteSessionEvent.Output(1, byteArrayOf(1)),
+                RemoteSessionEvent.Output(2, byteArrayOf(2)),
+                RemoteSessionEvent.Output(3, byteArrayOf(3)),
+            ),
+            expectedGap = activeGap,
+            persist = {},
+            publish = {},
+        )
+
+        assertEquals(
+            EventAcceptance.Applied(4),
+            session.accept(RemoteSessionEvent.Gap(4, 2, 3)),
+        )
+        runCurrent()
+        assertEquals(4L, session.state.value.lastAckedSequence)
+        assertTrue(session.state.value !is RemoteSessionState.HistoryGap)
+        session.close()
+    }
+
+    @Test
+    fun historyGapFreezesSubsequentEventsUntilFullRecovery() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(engine, outbound, backgroundScope)
+        session.onConnected()
+        session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1)))
+        runCurrent()
+        session.accept(RemoteSessionEvent.Gap(4, 2, 3))
+
+        assertEquals(
+            EventAcceptance.HistoryGap(2, 4),
+            session.accept(RemoteSessionEvent.Output(2, byteArrayOf(2))),
+        )
+        assertEquals(
+            EventAcceptance.HistoryGap(2, 4),
+            session.accept(RemoteSessionEvent.Lifecycle(5, RemoteLifecycle.ENDED, 17)),
+        )
+
+        val gap = assertIs<RemoteSessionState.HistoryGap>(session.state.value)
+        assertEquals(1L, gap.lastAckedSequence)
+        assertEquals(listOf(1L), engine.feeds.map { it.first })
+        assertEquals(listOf(1L), outbound.acknowledgements)
         session.close()
     }
 
@@ -116,7 +299,7 @@ class RemoteTerminalSessionTest {
         assertIs<RemoteSessionState.HistoryGap>(session.state.value)
         assertTrue(session.onConnected())
         assertIs<RemoteSessionState.HistoryGap>(session.state.value)
-        assertEquals(listOf(0L, 0L), outbound.resumes)
+        assertEquals(listOf(0L), outbound.resumes)
         assertFailsWith<IllegalStateException> {
             session.grantControl("lease", Long.MAX_VALUE)
         }
@@ -153,9 +336,10 @@ class RemoteTerminalSessionTest {
             EventAcceptance.Applied(3),
             session.accept(RemoteSessionEvent.Output(3, byteArrayOf(3))),
         )
+        runCurrent()
         assertEquals(3L, session.state.value.lastAckedSequence)
         assertTrue(session.state.value !is RemoteSessionState.HistoryGap)
-        assertEquals(listOf(1L, 2L, 3L), outbound.acknowledgements)
+        assertEquals(listOf(3L), outbound.acknowledgements)
         session.close()
     }
 
@@ -175,6 +359,7 @@ class RemoteTerminalSessionTest {
                 RemoteSessionEvent.Title(3, "build"),
             ),
         )
+        runCurrent()
 
         assertEquals(3L, last)
         assertEquals(1, engine.clearCount)
@@ -182,7 +367,212 @@ class RemoteTerminalSessionTest {
         assertArrayEquals(byteArrayOf(1, 2), engine.feeds.single().second)
         assertEquals(listOf(TerminalSize(100, 30)), engine.resizes)
         assertEquals("build", session.title.value)
-        assertEquals(listOf(1L, 2L, 3L), outbound.acknowledgements)
+        assertEquals(listOf(3L), outbound.acknowledgements)
+        session.close()
+    }
+
+    @Test
+    fun boundedRawReplayCanDeferPerEventAcknowledgementsForOneCumulativeAck() = runTest {
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(RecordingEngine(), outbound, backgroundScope)
+
+        val last = session.resetAndReplay(
+            listOf(
+                RemoteSessionEvent.Output(1, byteArrayOf(1)),
+                RemoteSessionEvent.Output(2, byteArrayOf(2)),
+            ),
+            acknowledgeEach = false,
+        )
+        runCurrent()
+
+        assertEquals(2L, last)
+        assertEquals(listOf(2L), outbound.acknowledgements)
+        assertEquals(2L, session.state.value.lastAckedSequence)
+        session.close()
+    }
+
+    @Test
+    fun failedRawReplayMidFeedClearsRendererLeavesReadOnlyGapAndCanRetry() = runTest {
+        var failSecondFeed = true
+        val engine = RecordingEngine { sequence, _ ->
+            if (sequence == 2L && failSecondFeed) {
+                failSecondFeed = false
+                throw IllegalStateException("renderer feed failed")
+            }
+        }
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(engine, outbound, backgroundScope)
+        val replay = listOf(
+            RemoteSessionEvent.Output(1, byteArrayOf(1)),
+            RemoteSessionEvent.Output(2, byteArrayOf(2)),
+            RemoteSessionEvent.Output(3, byteArrayOf(3)),
+        )
+
+        assertFailsWith<IllegalStateException> {
+            session.resetAndReplay(replay)
+        }
+        runCurrent()
+
+        val failed = assertIs<RemoteSessionState.HistoryGap>(session.state.value)
+        assertEquals(0L, failed.lastAckedSequence)
+        assertEquals(1L, failed.expectedSequence)
+        assertEquals(4L, failed.receivedSequence)
+        assertTrue(engine.readOnlyState)
+        assertEquals(2, engine.clearCount)
+        assertTrue(engine.feeds.isEmpty())
+        assertTrue(outbound.acknowledgements.isEmpty())
+
+        assertEquals(3L, session.resetAndReplay(replay))
+        runCurrent()
+
+        assertEquals(listOf(1L, 2L, 3L), engine.feeds.map { it.first })
+        assertEquals(listOf(3L), outbound.acknowledgements)
+        assertEquals(3L, session.state.value.lastAckedSequence)
+        assertTrue(session.state.value !is RemoteSessionState.HistoryGap)
+        session.close()
+    }
+
+    @Test
+    fun failedHistoryRecoveryKeepsOriginalGapAndCanRetryAtomically() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(engine, outbound, backgroundScope)
+        session.onConnected()
+        session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1)))
+        runCurrent()
+        session.accept(RemoteSessionEvent.Gap(4, 2, 3))
+        val replay = listOf(
+            RemoteSessionEvent.Output(1, byteArrayOf(1)),
+            RemoteSessionEvent.Output(2, byteArrayOf(2)),
+            RemoteSessionEvent.Output(3, byteArrayOf(3)),
+        )
+
+        assertFailsWith<IllegalStateException> {
+            session.recoverFromHistory(
+                replay,
+                persist = { throw IllegalStateException("durable ACK unavailable") },
+                publish = {},
+            )
+        }
+        val failed = assertIs<RemoteSessionState.HistoryGap>(session.state.value)
+        assertEquals(0L, failed.lastAckedSequence)
+        assertEquals(1L, failed.expectedSequence)
+        assertEquals(4L, failed.receivedSequence)
+        assertTrue(engine.feeds.isEmpty())
+        assertTrue(engine.readOnlyState)
+
+        val commits = mutableListOf<Long>()
+        assertEquals(
+            3L,
+            session.recoverFromHistory(
+                replay,
+                persist = { commits += it },
+                publish = {},
+            ),
+        )
+        assertEquals(listOf(3L), commits)
+        assertEquals(3L, session.state.value.lastAckedSequence)
+        assertTrue(session.state.value !is RemoteSessionState.HistoryGap)
+        session.close()
+    }
+
+    @Test
+    fun historyRecoveryAcceptsPrefixAckCommittedAfterGapSnapshot() = runTest {
+        val persistStarted = CompletableDeferred<Unit>()
+        val releasePersist = CompletableDeferred<Unit>()
+        val outbound = RecordingOutbound(
+            onPersist = { sequence ->
+                if (sequence == 1L) {
+                    persistStarted.complete(Unit)
+                    releasePersist.await()
+                }
+            },
+        )
+        val session = RemoteTerminalSession(RecordingEngine(), outbound, backgroundScope)
+        session.onConnected()
+        session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1)))
+        persistStarted.await()
+        session.accept(RemoteSessionEvent.Gap(4, 2, 3))
+        val observedGap = assertIs<RemoteSessionState.HistoryGap>(session.state.value)
+        assertEquals(0L, observedGap.lastAckedSequence)
+
+        val durableRecovery = mutableListOf<Long>()
+        val publishedRecovery = mutableListOf<Long>()
+        val recovery = async {
+            session.recoverFromHistory(
+                events = listOf(
+                    RemoteSessionEvent.Output(1, byteArrayOf(1)),
+                    RemoteSessionEvent.Output(2, byteArrayOf(2)),
+                    RemoteSessionEvent.Output(3, byteArrayOf(3)),
+                ),
+                expectedGap = observedGap,
+                persist = { durableRecovery += it },
+                publish = { publishedRecovery += it },
+            )
+        }
+
+        releasePersist.complete(Unit)
+        assertEquals(3L, recovery.await())
+        assertEquals(listOf(1L), outbound.persistedAcknowledgements)
+        assertEquals(listOf(1L), outbound.acknowledgements)
+        assertEquals(listOf(3L), durableRecovery)
+        assertEquals(listOf(3L), publishedRecovery)
+        assertEquals(3L, session.state.value.lastAckedSequence)
+        session.close()
+    }
+
+    @Test
+    fun partialHistoryRecoveryCannotClearTheActiveGap() = runTest {
+        val engine = RecordingEngine()
+        val session = RemoteTerminalSession(engine, RecordingOutbound(), backgroundScope)
+        session.onConnected()
+        session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1)))
+        runCurrent()
+        session.accept(RemoteSessionEvent.Gap(4, 2, 3))
+
+        assertFailsWith<IllegalArgumentException> {
+            session.recoverFromHistory(
+                listOf(
+                    RemoteSessionEvent.Output(1, byteArrayOf(1)),
+                    RemoteSessionEvent.Output(2, byteArrayOf(2)),
+                ),
+                persist = { error("partial replay must not be persisted") },
+                publish = { error("partial replay must not be published") },
+            )
+        }
+
+        val gap = assertIs<RemoteSessionState.HistoryGap>(session.state.value)
+        assertEquals(1L, gap.lastAckedSequence)
+        assertEquals(2L, gap.expectedSequence)
+        assertEquals(4L, gap.receivedSequence)
+        assertEquals(listOf(1L), engine.feeds.map { it.first })
+        assertTrue(engine.readOnlyState)
+        session.close()
+    }
+
+    @Test
+    fun durableHistoryRecoveryKeepsCursorWhenPublicationFails() = runTest {
+        val engine = RecordingEngine()
+        val session = RemoteTerminalSession(engine, RecordingOutbound(), backgroundScope)
+        session.onConnected()
+        session.accept(RemoteSessionEvent.Gap(3, 1, 2))
+        val durable = mutableListOf<Long>()
+
+        assertFailsWith<IllegalStateException> {
+            session.recoverFromHistory(
+                listOf(
+                    RemoteSessionEvent.Output(1, byteArrayOf(1)),
+                    RemoteSessionEvent.Output(2, byteArrayOf(2)),
+                ),
+                persist = { durable += it },
+                publish = { throw IllegalStateException("socket closed") },
+            )
+        }
+
+        assertEquals(listOf(2L), durable)
+        val reconnecting = assertIs<RemoteSessionState.Reconnecting>(session.state.value)
+        assertEquals(2L, reconnecting.lastAckedSequence)
+        assertEquals(listOf(1L, 2L), engine.feeds.map { it.first })
         session.close()
     }
 
@@ -314,10 +704,39 @@ class RemoteTerminalSessionTest {
 
         val result = session.submitInput("do-not-retry".encodeToByteArray())
 
-        assertEquals(InputSubmission.TransportFailed(inputId), result)
+        assertEquals(InputSubmission.DeliveryUnknown(inputId), result)
         assertEquals(1, outbound.inputAttempts)
         assertTrue(outbound.inputs.isEmpty())
         assertIs<RemoteSessionState.Reconnecting>(session.state.value)
+        session.close()
+    }
+
+    @Test
+    fun authoritativeInputRejectionDoesNotBreakAHealthyControlLease() = runTest {
+        val inputId = UUID.fromString("00000000-0000-0000-0000-000000000004")
+        val outbound = object : RemoteSessionOutbound {
+            override suspend fun resume(lastAckedSequence: Long) = Unit
+            override suspend fun acknowledge(highestContiguousSequence: Long) = Unit
+            override suspend fun sendResize(size: TerminalSize) = Unit
+            override suspend fun sendInput(input: RemoteInput) {
+                throw RemoteInputRejectedException("INPUT_SEQUENCE_REJECTED")
+            }
+        }
+        val session = RemoteTerminalSession(
+            RecordingEngine(),
+            outbound,
+            backgroundScope,
+            clockMillis = { testScheduler.currentTime },
+            inputIdFactory = { inputId },
+        )
+        session.onConnected()
+        session.grantControl("lease", 10_000)
+
+        assertEquals(
+            InputSubmission.RejectedByRemote(inputId, "INPUT_SEQUENCE_REJECTED"),
+            session.submitInput(byteArrayOf(1)),
+        )
+        assertIs<RemoteSessionState.Controlling>(session.state.value)
         session.close()
     }
 
@@ -349,6 +768,7 @@ class RemoteTerminalSessionTest {
         session.grantControl("lease", 10_000)
 
         assertEquals(InputSubmission.Sent(inputId), session.submitInput(byteArrayOf(1)))
+        runCurrent()
         assertEquals(1L, session.state.value.lastAckedSequence)
         session.close()
     }
@@ -425,6 +845,7 @@ class RemoteTerminalSessionTest {
             EventAcceptance.Applied(1),
             session.accept(RemoteSessionEvent.Lifecycle(1, RemoteLifecycle.ENDED, 17)),
         )
+        runCurrent()
         val exited = assertIs<RemoteSessionState.Exited>(session.state.value)
         assertEquals(1L, exited.lastAckedSequence)
         assertEquals(17, exited.exitCode)
@@ -446,6 +867,28 @@ class RemoteTerminalSessionTest {
         assertEquals(null, exited.exitCode)
         assertTrue(engine.readOnlyState)
         session.close()
+    }
+
+    @Test
+    fun closeRejectsFurtherSessionWorkBeforeEngineCanBeReused() = runTest {
+        val engine = RecordingEngine()
+        val session = RemoteTerminalSession(engine, RecordingOutbound(), backgroundScope)
+        session.onConnected()
+
+        session.close()
+
+        assertTrue(engine.disposed)
+        assertFalse(session.onConnected())
+        assertFailsWith<IllegalStateException> {
+            session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1)))
+        }
+        assertFailsWith<IllegalStateException> {
+            session.submitInput(byteArrayOf(1))
+        }
+        assertFailsWith<IllegalStateException> {
+            session.grantControl("lease", Long.MAX_VALUE)
+        }
+        assertTrue(engine.feeds.isEmpty())
     }
 
     private class RecordingEngine(
@@ -497,18 +940,32 @@ class RemoteTerminalSessionTest {
 
     private class RecordingOutbound(
         private val log: MutableList<String>? = null,
+        private val onPersist: suspend (Long) -> Unit = {},
     ) : RemoteSessionOutbound {
         val resumes = mutableListOf<Long>()
+        val persistedAcknowledgements = mutableListOf<Long>()
         val acknowledgements = mutableListOf<Long>()
         val inputs = mutableListOf<RemoteInput>()
         val sizes = mutableListOf<TerminalSize>()
         val renewals = mutableListOf<Pair<String, Long>>()
         var inputAttempts = 0
         var failInput = false
+        var failPersist = false
         var failAck = false
 
         override suspend fun resume(lastAckedSequence: Long) {
             resumes += lastAckedSequence
+        }
+
+        override suspend fun persistAcknowledgement(highestContiguousSequence: Long): Long {
+            if (failPersist) throw IllegalStateException("ACK persistence offline")
+            onPersist(highestContiguousSequence)
+            persistedAcknowledgements += highestContiguousSequence
+            return highestContiguousSequence
+        }
+
+        override suspend fun resetAcknowledgement() {
+            persistedAcknowledgements.clear()
         }
 
         override suspend fun acknowledge(highestContiguousSequence: Long) {

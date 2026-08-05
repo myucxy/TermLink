@@ -37,6 +37,16 @@ data class HistoryReplayEvent(
     override fun hashCode(): Int = 31 * sequence.hashCode() + payload.contentHashCode()
 }
 
+/** Durable cumulative ACK plus the renderer generation it is safe to resume. */
+data class AckCursorState(
+    val sequence: ULong,
+    val rendererGeneration: Long,
+) {
+    init {
+        require(rendererGeneration > 0) { "renderer generation must be positive" }
+    }
+}
+
 /** Ciphertext plus non-sensitive index metadata returned by history queries. */
 data class EncryptedHistoryObject(
     val metadata: HistoryObject,
@@ -105,32 +115,78 @@ class HistoryRepository(
     private val preferences get() = database.preferences()
 
     suspend fun upsertDevice(summary: DeviceSummary) {
-        devices.upsert(
-            DeviceEntity(
-                id = summary.id.requireUuidString(),
-                type = summary.type.name,
-                name = summary.name,
-                keyId = summary.keyId,
-                exchangePublicKey = summary.exchangePublicKey.copyOf(),
-                trustState = summary.trustState.name,
-                createdAtEpochMillis = summary.createdAt.toEpochMilli(),
-            ),
-        )
+        requireValidDeviceKey(summary)
+        database.withTransaction {
+            val stored = devices.get(summary.id.requireUuidString())
+            if (stored?.exchangePublicKey?.isNotEmpty() == true) {
+                require(summary.exchangePublicKey.contentEquals(stored.exchangePublicKey)) {
+                    "device exchange key changed without a new device identity"
+                }
+            }
+            devices.upsert(deviceEntity(summary))
+        }
     }
 
     suspend fun upsertPc(summary: PcSummary) {
-        pcs.upsert(
-            PcEntity(
-                id = summary.id.requireUuidString(),
-                deviceId = summary.deviceId.requireUuidString(),
-                name = summary.name,
-                agentVersion = summary.agentVersion,
-                keyEpoch = summary.keyEpoch,
-                remoteRoutingEnabled = summary.remoteRoutingEnabled,
-                online = summary.online,
-                lastSeenAtEpochMillis = summary.lastSeenAt?.toEpochMilli(),
-            ),
-        )
+        require(summary.keyEpoch > 0) { "key epoch must be positive" }
+        database.withTransaction {
+            val stored = pcs.get(summary.id.requireUuidString())
+            if (stored != null) {
+                require(stored.deviceId == summary.deviceId.requireUuidString()) {
+                    "PC device identity must not change"
+                }
+                require(summary.keyEpoch >= stored.keyEpoch) { "key epoch must not regress" }
+            }
+            pcs.upsert(pcEntity(summary))
+        }
+    }
+
+    /**
+     * Validates and atomically persists the authoritative PC epoch together
+     * with the exchange public key it authenticates. A live client may rotate
+     * only after this transaction commits.
+     */
+    suspend fun persistAuthoritativeKeyMetadata(
+        deviceSummaries: List<DeviceSummary>,
+        pcSummaries: List<PcSummary>,
+    ) {
+        require(deviceSummaries.map(DeviceSummary::id).toSet().size == deviceSummaries.size) {
+            "authoritative device metadata contains duplicate IDs"
+        }
+        require(pcSummaries.map(PcSummary::id).toSet().size == pcSummaries.size) {
+            "authoritative PC metadata contains duplicate IDs"
+        }
+        val nextDevices = deviceSummaries.associateBy(DeviceSummary::id)
+        deviceSummaries.forEach(::requireValidDeviceKey)
+        pcSummaries.forEach { summary ->
+            require(summary.keyEpoch > 0) { "key epoch must be positive" }
+            val nextDevice = requireNotNull(nextDevices[summary.deviceId]) {
+                "authoritative PC metadata is missing its device key"
+            }
+            require(nextDevice.type == DeviceType.WINDOWS_PC) { "PC metadata references a non-PC device" }
+        }
+        database.withTransaction {
+            deviceSummaries.forEach { summary ->
+                val storedDevice = devices.get(summary.id.requireUuidString()) ?: return@forEach
+                // Database v1 -> v2 used an empty, unusable sentinel. Permit
+                // exactly one authenticated initialization; a real device key
+                // is immutable for the lifetime of its device ID.
+                if (storedDevice.exchangePublicKey.isNotEmpty()) {
+                    require(summary.exchangePublicKey.contentEquals(storedDevice.exchangePublicKey)) {
+                        "device exchange key changed without a new device identity"
+                    }
+                }
+            }
+            pcSummaries.forEach { summary ->
+                val storedPc = pcs.get(summary.id.requireUuidString()) ?: return@forEach
+                require(storedPc.deviceId == summary.deviceId.requireUuidString()) {
+                    "PC device identity must not change"
+                }
+                require(summary.keyEpoch >= storedPc.keyEpoch) { "key epoch must not regress" }
+            }
+            devices.upsertAll(deviceSummaries.map(::deviceEntity))
+            pcs.upsertAll(pcSummaries.map(::pcEntity))
+        }
     }
 
     suspend fun upsertSession(summary: SessionSummary) {
@@ -139,8 +195,7 @@ class HistoryRepository(
         require(summary.lastOutputSequence <= Long.MAX_VALUE.toULong()) {
             "last output sequence is too large for Room"
         }
-        sessions.upsert(
-            SessionEntity(
+        val incoming = SessionEntity(
                 id = summary.id.requireUuidString(),
                 pcId = summary.pcId.requireUuidString(),
                 shellType = summary.shellType,
@@ -151,8 +206,30 @@ class HistoryRepository(
                 lastOutputSequence = summary.lastOutputSequence.toLong(),
                 createdAtEpochMillis = summary.createdAt.toEpochMilli(),
                 endedAtEpochMillis = summary.endedAt?.toEpochMilli(),
-            ),
-        )
+            )
+        database.withTransaction {
+            val stored = sessions.get(incoming.id)
+            if (stored == null) {
+                sessions.upsert(incoming)
+            } else {
+                require(stored.pcId == incoming.pcId) { "session PC identity must not change" }
+                require(stored.shellType == incoming.shellType) { "session shell type must not change" }
+                val storedExited = stored.state == SessionState.EXITED.name
+                val incomingExited = incoming.state == SessionState.EXITED.name
+                sessions.upsert(
+                    incoming.copy(
+                        state = if (storedExited) stored.state else incoming.state,
+                        lastOutputSequence = maxOf(stored.lastOutputSequence, incoming.lastOutputSequence),
+                        createdAtEpochMillis = stored.createdAtEpochMillis,
+                        endedAtEpochMillis = when {
+                            storedExited -> stored.endedAtEpochMillis ?: incoming.endedAtEpochMillis
+                            incomingExited -> incoming.endedAtEpochMillis ?: stored.endedAtEpochMillis
+                            else -> incoming.endedAtEpochMillis
+                        },
+                    ),
+                )
+            }
+        }
     }
 
     suspend fun devices(): List<DeviceSummary> = devices.list().map { entity ->
@@ -334,31 +411,71 @@ class HistoryRepository(
         chunks.get(objectId.requireUuidString())?.let { chunkObject(it).copyCiphertext() }
             ?: snapshots.get(objectId.requireUuidString())?.let { snapshotObject(it).copyCiphertext() }
 
-    /** Stores a cumulative ACK cursor; stale writes can never move it backwards. */
-    suspend fun putAckCursor(sessionId: UUID, direction: String, sequence: ULong): ULong {
+    suspend fun initializeAckCursor(sessionId: UUID, direction: String): AckCursorState {
+        val safeSessionId = sessionId.requireUuidString()
         val safeDirection = direction.requireNonBlank("ACK direction")
-        val requested = sequence.toRoomSequence("ACK sequence")
-        val current = acks.get(sessionId.requireUuidString(), safeDirection)?.highestContiguousSequence ?: 0L
-        val retained = maxOf(current, requested)
-        acks.upsert(
+        return acks.getOrCreate(
             AckCursorEntity(
-                sessionId = sessionId.requireUuidString(),
+                sessionId = safeSessionId,
                 direction = safeDirection,
-                highestContiguousSequence = retained,
+                rendererGeneration = 1,
+                highestContiguousSequence = 0,
                 updatedAtEpochMillis = clockMillis(),
             ),
-        )
-        return retained.toULongChecked("ACK sequence")
+        ).toAckCursorState()
     }
 
-    suspend fun ackCursor(sessionId: UUID, direction: String): ULong? =
+    /** Stores a cumulative ACK only for the renderer generation that applied it. */
+    suspend fun putAckCursor(
+        sessionId: UUID,
+        direction: String,
+        rendererGeneration: Long,
+        sequence: ULong,
+    ): ULong {
+        require(rendererGeneration > 0) { "renderer generation must be positive" }
+        val safeDirection = direction.requireNonBlank("ACK direction")
+        val requested = sequence.toRoomSequence("ACK sequence")
+        val safeSessionId = sessionId.requireUuidString()
+        val updatedAt = clockMillis()
+        check(
+            acks.advance(
+                AckCursorEntity(
+                    sessionId = safeSessionId,
+                    direction = safeDirection,
+                    rendererGeneration = rendererGeneration,
+                    highestContiguousSequence = requested,
+                    updatedAtEpochMillis = updatedAt,
+                ),
+            ),
+        ) { "ACK renderer generation is stale" }
+        val persisted = requireNotNull(acks.get(safeSessionId, safeDirection)) { "ACK cursor was not persisted" }
+        check(persisted.rendererGeneration == rendererGeneration) { "ACK renderer generation changed during commit" }
+        return persisted.highestContiguousSequence.toULongChecked("ACK sequence")
+    }
+
+    suspend fun ackCursorState(sessionId: UUID, direction: String): AckCursorState? =
         acks.get(sessionId.requireUuidString(), direction.requireNonBlank("ACK direction"))
-            ?.highestContiguousSequence?.toULongChecked("ACK sequence")
+            ?.toAckCursorState()
 
     suspend fun ackCursors(sessionId: UUID): Map<String, ULong> =
         acks.listForSession(sessionId.requireUuidString()).associate {
             it.direction to it.highestContiguousSequence.toULongChecked("ACK sequence")
         }
+
+    /** Resets one cursor and permanently fences writers from its old renderer. */
+    suspend fun resetAckCursor(
+        sessionId: UUID,
+        direction: String,
+        expectedRendererGeneration: Long,
+    ): AckCursorState {
+        require(expectedRendererGeneration > 0) { "renderer generation must be positive" }
+        return acks.reset(
+            sessionId.requireUuidString(),
+            direction.requireNonBlank("ACK direction"),
+            expectedRendererGeneration,
+            clockMillis(),
+        ).toAckCursorState()
+    }
 
     suspend fun putPreference(
         scope: String,
@@ -570,6 +687,34 @@ class HistoryRepository(
         }
     }
 
+    private fun deviceEntity(summary: DeviceSummary) = DeviceEntity(
+        id = summary.id.requireUuidString(),
+        type = summary.type.name,
+        name = summary.name,
+        keyId = summary.keyId,
+        exchangePublicKey = summary.exchangePublicKey.copyOf(),
+        trustState = summary.trustState.name,
+        createdAtEpochMillis = summary.createdAt.toEpochMilli(),
+    )
+
+    private fun requireValidDeviceKey(summary: DeviceSummary) {
+        require(summary.exchangePublicKey.size == 32 && summary.exchangePublicKey.any { it.toInt() != 0 }) {
+            "device exchange public key is invalid"
+        }
+        require(summary.keyId.isNotBlank()) { "device key ID is required" }
+    }
+
+    private fun pcEntity(summary: PcSummary) = PcEntity(
+        id = summary.id.requireUuidString(),
+        deviceId = summary.deviceId.requireUuidString(),
+        name = summary.name,
+        agentVersion = summary.agentVersion,
+        keyEpoch = summary.keyEpoch,
+        remoteRoutingEnabled = summary.remoteRoutingEnabled,
+        online = summary.online,
+        lastSeenAtEpochMillis = summary.lastSeenAt?.toEpochMilli(),
+    )
+
     private fun eventChunkEntity(
         id: UUID,
         sessionId: UUID,
@@ -693,6 +838,13 @@ class HistoryRepository(
         require(this >= 0) { "$label must not be negative" }
         return toULong()
     }
+
+    private fun AckCursorEntity.toAckCursorState(): AckCursorState = AckCursorState(
+        sequence = highestContiguousSequence.toULongChecked("ACK sequence"),
+        rendererGeneration = rendererGeneration.also {
+            require(it > 0) { "renderer generation must be positive" }
+        },
+    )
 
     private inline fun <reified T : Enum<T>> String.toEnumOrThrow(label: String): T = try {
         enumValueOf<T>(this)

@@ -36,6 +36,7 @@ sealed interface RemoteSessionState {
         override val lastAckedSequence: Long,
         val expectedSequence: Long,
         val receivedSequence: Long,
+        val generation: Long = 0,
     ) : RemoteSessionState
 }
 
@@ -109,7 +110,24 @@ data class RemoteControlLease(
 interface RemoteSessionOutbound {
     suspend fun resume(lastAckedSequence: Long)
 
+    /**
+     * Commits a cumulative renderer cursor to durable storage. Implementations
+     * that have no durable store may use the default identity commit.
+     *
+     * The returned sequence must equal [highestContiguousSequence]. Returning
+     * a different value is treated as a broken persistence contract.
+     */
+    suspend fun persistAcknowledgement(highestContiguousSequence: Long): Long = highestContiguousSequence
+
+    /** Publishes an already-durable cumulative ACK to the peer. */
     suspend fun acknowledge(highestContiguousSequence: Long)
+
+    /**
+     * Clears a durable cursor after the renderer has been irreversibly reset.
+     * Production implementations must remove the persisted cursor before a
+     * blank renderer is allowed to resume from zero.
+     */
+    suspend fun resetAcknowledgement() = Unit
 
     suspend fun sendInput(input: RemoteInput)
 
@@ -123,6 +141,17 @@ interface RemoteSessionOutbound {
     suspend fun renewLease(leaseId: String, leaseVersion: Long): RemoteControlLease? = null
 }
 
+/** The PC authoritatively rejected this input before it could execute. */
+class RemoteInputRejectedException(
+    val reasonCode: String,
+) : IllegalStateException(reasonCode)
+
+/**
+ * The sender cannot prove whether the PC accepted the input. Callers must not
+ * retry it with a new input ID because doing so could execute a command twice.
+ */
+class RemoteInputDeliveryUnknownException(message: String) : IllegalStateException(message)
+
 sealed interface EventAcceptance {
     data class Applied(val sequence: Long) : EventAcceptance
     data class Duplicate(val sequence: Long) : EventAcceptance
@@ -132,7 +161,8 @@ sealed interface EventAcceptance {
 
 sealed interface InputSubmission {
     data class Sent(val inputId: UUID) : InputSubmission
-    data class TransportFailed(val inputId: UUID) : InputSubmission
+    data class RejectedByRemote(val inputId: UUID, val reasonCode: String) : InputSubmission
+    data class DeliveryUnknown(val inputId: UUID) : InputSubmission
     data object RejectedNoLease : InputSubmission
     data object RejectedExited : InputSubmission
     data object RejectedEmpty : InputSubmission
