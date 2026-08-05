@@ -142,6 +142,16 @@ try {
         'Installed package is not self-contained.'
     Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'TermLink.Updater.exe') -PathType Leaf) `
         'Installed package does not contain the external single-file Updater.'
+    $brandAssetRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\assets\brand\windows'))
+    foreach ($assetName in @('Square44x44Logo.png', 'Square150x150Logo.png', 'StoreLogo.png')) {
+        $sourceAsset = Join-Path $brandAssetRoot $assetName
+        $packagedAsset = Join-Path $installLocation "Assets\$assetName"
+        Assert-True (Test-Path -LiteralPath $packagedAsset -PathType Leaf) `
+            "Installed package is missing brand asset: $assetName"
+        Assert-True ((Get-FileHash -LiteralPath $sourceAsset -Algorithm SHA256).Hash -eq
+            (Get-FileHash -LiteralPath $packagedAsset -Algorithm SHA256).Hash) `
+            "Installed package brand asset differs from the reviewed 01B export: $assetName"
+    }
     $updatePublisherPath = Join-Path $installLocation 'TermLink.UpdatePublisher.cer'
     Assert-True (Test-Path -LiteralPath $updatePublisherPath -PathType Leaf) `
         'Installed package does not contain the pinned update publisher certificate.'
@@ -170,6 +180,15 @@ try {
     $beforeTrayIds = @(Get-Process -Name 'TermLink.Tray' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
     $beforeAgentIds = @(Get-Process -Name 'TermLink.Agent' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
     $installedTray = Join-Path $installLocation 'TermLink.Tray.exe'
+    Add-Type -AssemblyName System.Drawing
+    $installedTrayIcon = [Drawing.Icon]::ExtractAssociatedIcon($installedTray)
+    try {
+        Assert-True ($null -ne $installedTrayIcon -and $installedTrayIcon.Width -ge 16 -and $installedTrayIcon.Height -ge 16) `
+            'Packaged Tray does not contain the TermLink application icon.'
+    }
+    finally {
+        if ($null -ne $installedTrayIcon) { $installedTrayIcon.Dispose() }
+    }
     $firstTrayLaunch = Start-Process -FilePath $installedTray -PassThru
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
     $trayProcesses = @()

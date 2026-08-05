@@ -7,9 +7,26 @@ using TermLink.Agent;
 
 namespace TermLink.Tray
 {
+    internal static class BrandIcons
+    {
+        public static Icon LoadApplicationIcon()
+        {
+            try
+            {
+                var icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+                if (icon != null) return icon;
+            }
+            catch (ArgumentException)
+            {
+            }
+            return (Icon)SystemIcons.Application.Clone();
+        }
+    }
+
     internal sealed class TrayApplicationContext : ApplicationContext
     {
         private readonly AgentController controller;
+        private readonly Icon applicationIcon;
         private readonly NotifyIcon notifyIcon;
         private readonly ToolStripMenuItem statusItem;
         private readonly ToolStripMenuItem accountItem;
@@ -25,6 +42,7 @@ namespace TermLink.Tray
         public TrayApplicationContext(AgentController controller)
         {
             this.controller = controller;
+            applicationIcon = BrandIcons.LoadApplicationIcon();
             statusItem = new ToolStripMenuItem("Connecting") { Enabled = false };
             accountItem = new ToolStripMenuItem("Account: checking") { Enabled = false };
             relayItem = new ToolStripMenuItem("Relay: checking") { Enabled = false };
@@ -51,7 +69,7 @@ namespace TermLink.Tray
 
             notifyIcon = new NotifyIcon
             {
-                Icon = SystemIcons.Application,
+                Icon = applicationIcon,
                 Text = "TermLink Agent",
                 ContextMenuStrip = menu,
                 Visible = true
@@ -217,6 +235,7 @@ namespace TermLink.Tray
                 notifyIcon.Dispose();
                 if (sessionList != null && !sessionList.IsDisposed) sessionList.Dispose();
                 if (accountDevices != null && !accountDevices.IsDisposed) accountDevices.Dispose();
+                applicationIcon.Dispose();
             }
             base.Dispose(disposing);
         }
@@ -230,6 +249,7 @@ namespace TermLink.Tray
         public AccountLinkForm()
         {
             Text = "Link TermLink account";
+            Icon = BrandIcons.LoadApplicationIcon();
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
@@ -327,6 +347,7 @@ namespace TermLink.Tray
         {
             this.controller = controller;
             Text = "TermLink sessions";
+            Icon = BrandIcons.LoadApplicationIcon();
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(760, 380);
             Size = new Size(900, 480);
@@ -483,6 +504,7 @@ namespace TermLink.Tray
         {
             this.controller = controller;
             Text = "TermLink account and devices";
+            Icon = BrandIcons.LoadApplicationIcon();
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(780, 520);
             Size = new Size(920, 620);

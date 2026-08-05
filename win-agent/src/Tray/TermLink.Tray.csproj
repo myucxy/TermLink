@@ -3,6 +3,7 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationIcon>..\..\..\assets\brand\windows\TermLink.ico</ApplicationIcon>
     <AssemblyName>TermLink.Tray</AssemblyName>
     <RootNamespace>TermLink.Tray</RootNamespace>
   </PropertyGroup>

@@ -82,33 +82,6 @@ function Confirm-EmbeddedSignature {
     throw "Embedded signature verification failed for '$Path'."
 }
 
-function New-PackageLogo {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][int]$Size)
-    $bitmap = [Drawing.Bitmap]::new($Size, $Size)
-    $graphics = [Drawing.Graphics]::FromImage($bitmap)
-    try {
-        $graphics.Clear([Drawing.Color]::FromArgb(255, 17, 24, 39))
-        $unit = [Math]::Max(2, [int][Math]::Round($Size / 11.0))
-        $cyan = [Drawing.SolidBrush]::new([Drawing.Color]::FromArgb(255, 34, 211, 238))
-        $green = [Drawing.SolidBrush]::new([Drawing.Color]::FromArgb(255, 74, 222, 128))
-        try {
-            $graphics.FillRectangle($cyan, 2 * $unit, 3 * $unit, 6 * $unit, 2 * $unit)
-            $graphics.FillRectangle($cyan, 2 * $unit, 3 * $unit, 2 * $unit, 5 * $unit)
-            $graphics.FillRectangle($green, 4 * $unit, 6 * $unit, 5 * $unit, 2 * $unit)
-            $graphics.FillRectangle($green, 7 * $unit, 3 * $unit, 2 * $unit, 5 * $unit)
-        }
-        finally {
-            $cyan.Dispose()
-            $green.Dispose()
-        }
-        $bitmap.Save($Path, [Drawing.Imaging.ImageFormat]::Png)
-    }
-    finally {
-        $graphics.Dispose()
-        $bitmap.Dispose()
-    }
-}
-
 $versionParts = @($Version.Split('.') | ForEach-Object { [int]$_ })
 Assert-True ($versionParts.Count -eq 4 -and @($versionParts | Where-Object { $_ -gt 65535 }).Count -eq 0) `
     'MSIX version parts must each be between 0 and 65535.'
@@ -150,8 +123,6 @@ try {
 
     $makeAppx = Find-WindowsSdkTool -Name 'makeappx.exe'
     $signTool = Find-WindowsSdkTool -Name 'signtool.exe'
-    Add-Type -AssemblyName System.Drawing
-
     $workRoot = Join-Path ([IO.Path]::GetTempPath()) ('TermLink-Msix-' + [guid]::NewGuid().ToString('N'))
     $layout = Join-Path $workRoot 'layout'
     $temporaryPackage = Join-Path $workRoot 'TermLink.msix'
@@ -228,9 +199,12 @@ try {
 
         $assetRoot = Join-Path $layout 'Assets'
         [IO.Directory]::CreateDirectory($assetRoot) | Out-Null
-        New-PackageLogo -Path (Join-Path $assetRoot 'Square44x44Logo.png') -Size 44
-        New-PackageLogo -Path (Join-Path $assetRoot 'Square150x150Logo.png') -Size 150
-        New-PackageLogo -Path (Join-Path $assetRoot 'StoreLogo.png') -Size 50
+        $brandAssetRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\assets\brand\windows'))
+        foreach ($assetName in @('Square44x44Logo.png', 'Square150x150Logo.png', 'StoreLogo.png')) {
+            $source = Join-Path $brandAssetRoot $assetName
+            Assert-True (Test-Path -LiteralPath $source -PathType Leaf) "Brand asset is missing: $source"
+            Copy-Item -LiteralPath $source -Destination (Join-Path $assetRoot $assetName)
+        }
 
         $signArguments = @('sign', '/fd', 'SHA256', '/f', [IO.Path]::GetFullPath($CertificatePath), '/p', $plainPassword)
         if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) {

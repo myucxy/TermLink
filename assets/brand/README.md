@@ -17,6 +17,14 @@
 - `termlink-mark-color.svg`：深色界面上的透明彩色标记；
 - `termlink-mark-light.svg`：深色托盘、标题栏和高对比界面；
 - `termlink-mark-dark.svg`：浅色托盘、标题栏和打印场景。
+- `windows/TermLink.ico`：Windows 可执行文件与托盘的多尺寸图标；
+- `windows/*.png`：MSIX 清单使用的 01B 商店与磁贴图标。
+
+Windows 导出资源由仓库内脚本从同一 01B 几何参数生成：
+
+```powershell
+.\assets\brand\Export-WindowsAssets.ps1
+```
 
 ## 颜色
 
