@@ -31,7 +31,7 @@
         <a href="/admin?section=deployment"{{if eq .Section "deployment"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9zM4.5 7.8 12 12l7.5-4.2M12 12v9"/></svg>Docker 部署</a>
         <a href="/admin?section=audit"{{if eq .Section "audit"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.7 2.8 8 7 10 4.2-2 7-5.3 7-10V6zM9 12l2 2 4-4"/></svg>安全审计</a>
         <a href="/admin?section=billing"{{if eq .Section "billing"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 9h18M7 15h4"/></svg>订阅与权益</a>
-        <a href="/admin?section=identity"{{if eq .Section "identity"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c.8-4 3.1-6 7-6s6.2 2 7 6"/></svg>账号门户</a>
+        <a href="/admin?section=identity"{{if eq .Section "identity"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c.8-4 3.1-6 7-6s6.2 2 7 6"/></svg>身份与安全</a>
         <a href="/admin?section=accounts"{{if eq .Section "accounts"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M3 20c.6-4 2.7-6 6-6s5.4 2 6 6M15 15c3.4 0 5.3 1.7 6 5"/></svg>账号与角色</a>
         <a href="/admin?section=redemptions"{{if eq .Section "redemptions"}} aria-current="page"{{end}}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v4a2 2 0 0 0 0 4v4H4v-4a2 2 0 0 0 0-4zM12 8v2M12 14v2"/></svg>兑换码管理 <em>未启用</em></a>
       </nav>
@@ -80,7 +80,7 @@
           <article class="admin-panel">
             <div class="panel-heading"><div><p class="eyebrow">RECENT EVENTS</p><h2>最近安全事件</h2></div><a href="/admin?section=audit">全部审计 →</a></div>
             <div class="compact-event-list">
-              {{range .Dashboard.AuditEvents}}
+              {{range .RecentAuditEvents}}
               <div><span class="event-result event-{{.Result}}" aria-hidden="true"></span><span><strong>{{.Action}}</strong><small>{{.TargetType}} · {{.Result}}</small></span><time>{{formatTime .CreatedAt}}</time></div>
               {{else}}<p class="empty-copy">还没有安全事件。</p>{{end}}
             </div>

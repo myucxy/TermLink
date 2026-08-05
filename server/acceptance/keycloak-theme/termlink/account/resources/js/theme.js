@@ -37,6 +37,8 @@
       ? {
           accountAction: "返回个人中心",
           accountLabel: "个人中心",
+          identityDescription: "账号资料、密码、多因素认证与活跃登录",
+          identityTitle: "身份与安全",
           darkAction: "切换到深色主题",
           darkLabel: "深色主题",
           lightAction: "切换到明亮主题",
@@ -45,6 +47,8 @@
       : {
           accountAction: "Back to account center",
           accountLabel: "Account center",
+          identityDescription: "Profile, password, multifactor authentication, and active sessions",
+          identityTitle: "Identity & security",
           darkAction: "Switch to dark theme",
           darkLabel: "Dark theme",
           lightAction: "Switch to light theme",
@@ -132,10 +136,13 @@
     let referrer = actions.querySelector("[data-termlink-account-link]");
     if (!referrer) {
       referrer = document.createElement("a");
-      referrer.href = "/account";
       referrer.setAttribute("data-termlink-account-link", "");
       actions.append(referrer);
     }
+    // React can retain the injected node while replacing surrounding route
+    // state. Reassert the product-owned target on every pass so no Keycloak
+    // account sub-route can strand the user inside the identity console.
+    referrer.href = "/account";
     referrer.classList.add("tl-account-return");
     referrer.setAttribute("aria-label", labels.accountAction);
     const currentIcon = referrer.querySelector(".tl-account-return-icon");
@@ -184,6 +191,85 @@
     updateToggle(button);
   }
 
+  function ensureAccountSidebar() {
+    const sidebarBody = document.querySelector(".pf-v5-c-page__sidebar-body");
+    if (!sidebarBody) return;
+    const labels = translatedLabels();
+
+    let context = sidebarBody.querySelector("[data-termlink-account-context]");
+    if (!context) {
+      context = document.createElement("div");
+      context.className = "tl-account-nav-context";
+      context.setAttribute("data-termlink-account-context", "");
+      const eyebrow = document.createElement("span");
+      eyebrow.className = "tl-account-nav-eyebrow";
+      eyebrow.textContent = "TERMLINK ACCOUNT";
+      const title = document.createElement("strong");
+      title.className = "tl-account-nav-title";
+      const description = document.createElement("small");
+      description.className = "tl-account-nav-description";
+      context.append(eyebrow, title, description);
+      sidebarBody.prepend(context);
+    }
+    const title = context.querySelector(".tl-account-nav-title");
+    const description = context.querySelector(".tl-account-nav-description");
+    if (title && title.textContent !== labels.identityTitle) title.textContent = labels.identityTitle;
+    if (description && description.textContent !== labels.identityDescription) {
+      description.textContent = labels.identityDescription;
+    }
+
+    let returnLink = sidebarBody.querySelector("[data-termlink-sidebar-return]");
+    if (!returnLink) {
+      returnLink = document.createElement("a");
+      returnLink.className = "tl-account-sidebar-return";
+      returnLink.setAttribute("data-termlink-sidebar-return", "");
+      const icon = document.createElement("span");
+      icon.className = "tl-account-sidebar-return-icon";
+      icon.setAttribute("aria-hidden", "true");
+      icon.innerHTML = '<svg viewBox="0 0 24 24" focusable="false"><path d="M19 12H5m6-6-6 6 6 6"/></svg>';
+      const copy = document.createElement("span");
+      copy.className = "tl-account-sidebar-return-copy";
+      const label = document.createElement("strong");
+      label.className = "tl-account-sidebar-return-label";
+      const hint = document.createElement("small");
+      hint.textContent = "TermLink";
+      copy.append(label, hint);
+      returnLink.append(icon, copy);
+      sidebarBody.append(returnLink);
+    } else if (returnLink !== sidebarBody.lastElementChild) {
+      sidebarBody.append(returnLink);
+    }
+    returnLink.href = "/account";
+    returnLink.setAttribute("aria-label", labels.accountAction);
+    const returnLabel = returnLink.querySelector(".tl-account-sidebar-return-label");
+    if (returnLabel && returnLabel.textContent !== labels.accountLabel) {
+      returnLabel.textContent = labels.accountLabel;
+    }
+  }
+
+  function ensureAccountWorkspace() {
+    document.body.classList.add("tl-account-console");
+    const main = document.querySelector(".pf-v5-c-page__main");
+    if (main) {
+      const sections = Array.from(main.children).filter((element) =>
+        element.classList.contains("pf-v5-c-page__main-section"),
+      );
+      sections.forEach((section, index) => {
+        section.classList.toggle("tl-account-page-heading", index === 0);
+        section.classList.toggle("tl-account-page-workspace", index > 0);
+      });
+    }
+
+    document.querySelectorAll(".pf-v5-c-jump-links").forEach((jumpLinks) => {
+      const host = jumpLinks.closest(".pf-v5-l-grid__item");
+      const grid = host?.parentElement;
+      const singleSection = jumpLinks.querySelectorAll("li").length <= 1;
+      host?.classList.toggle("tl-account-single-jump", singleSection);
+      grid?.classList.toggle("tl-account-single-section", singleSection);
+    });
+
+  }
+
   const handleSystemChange = () => {
     if (!readStoredTheme()) applyTheme();
   };
@@ -196,6 +282,8 @@
   const ensureAccountChrome = () => {
     ensureAccountBrand();
     ensureAccountActions();
+    ensureAccountSidebar();
+    ensureAccountWorkspace();
   };
   const observer = new MutationObserver(ensureAccountChrome);
   const start = () => {

@@ -48,7 +48,7 @@ func TestAcceptanceRealmUsesGatedRegistrationAndAndroidNativeLogin(t *testing.T)
 	}
 	// Imports fail closed. The idempotent initializer opens registration only
 	// after it has created or verified the managed bootstrap administrator.
-	if realm.LoginTheme != "termlink-01b-v9" || realm.AccountTheme != "termlink-01b-v9" ||
+	if realm.LoginTheme != "termlink-01b-v11" || realm.AccountTheme != "termlink-01b-v11" ||
 		realm.RegistrationAllowed || realm.VerifyEmail || !realm.BruteForceProtected ||
 		realm.AccessTokenLifespan <= 0 || realm.AccessTokenLifespan > 300 ||
 		!realm.RevokeRefreshToken || realm.RefreshTokenMaxReuse != 0 {
@@ -173,9 +173,11 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 	zhMessages := read("../../acceptance/keycloak-theme/termlink/login/messages/messages_zh_CN.properties")
 	enMessages := read("../../acceptance/keycloak-theme/termlink/login/messages/messages_en.properties")
 	accountScript := read("../../acceptance/keycloak-theme/termlink/account/resources/js/theme.js")
+	accountTemplate := read("../../acceptance/keycloak-theme/termlink/account/index.ftl")
 	accountThemeProperties := read("../../acceptance/keycloak-theme/termlink/account/theme.properties")
 	accountThemeInit := read("../../acceptance/keycloak-theme/termlink/account/resources/js/theme-init.js")
 	accountCSS := read("../../acceptance/keycloak-theme/termlink/account/resources/css/account.css")
+	accountZhMessages := read("../../acceptance/keycloak-theme/termlink/account/messages/messages_zh_CN.properties")
 	keycloakDockerfile := read("../../acceptance/Keycloak.Dockerfile")
 	acceptanceCompose := read("../../compose/acceptance.compose.yml")
 
@@ -192,13 +194,23 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 		"account theme fallback target":         `referrer.href = "/account"`,
 		"account theme fallback marker":         `data-termlink-account-link`,
 		"account theme stable action group":     `data-termlink-account-actions`,
+		"account persistent sidebar return":     `data-termlink-sidebar-return`,
+		"account sidebar return target":         `returnLink.href = "/account"`,
 		"account theme product brand":           `tl-account-brand-copy`,
-		"account pre-paint script order":        `scripts=js/theme-init.js js/theme.js`,
+		"account pinned parent template":        "602b4bdf21d5dd386f2f8b9ee18b9d96a3054d430efabe00cea80779291a658f",
+		"account pre-paint theme script":        `<script src="${resourceUrl}/js/theme-init.js"></script>`,
+		"account authorization feature source":  `${(realm.userManagedAccessAllowed && isAuthorizationEnabled)?c}`,
+		"account runtime theme script":          `scripts=js/theme.js`,
 		"account pre-paint stored theme":        `localStorage.getItem("termlink-theme")`,
+		"account localized locale placeholder":  "defaultLocale=请选择...",
+		"account admin-aligned sidebar":         "grid-template-columns: 236px minmax(0, 1fr) !important;",
+		"account content-sized workspace":       "flex: 0 0 auto;",
+		"account redundant jump removal":        "tl-account-single-section",
 		"account theme return styling":          ".tl-account-return",
 		"account SVG theme control":             `class="theme-icon-moon"`,
 		"account SVG return control":            `tl-account-return-icon`,
-		"production image account theme":        `COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v9/`,
+		"production image account theme":        `COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v11/`,
+		"production runtime account theme":      `-s accountTheme=termlink-01b-v11`,
 	} {
 		var source string
 		switch name {
@@ -212,16 +224,22 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 			source = zhMessages
 		case "English personal-center copy":
 			source = enMessages
-		case "account theme fallback target", "account theme fallback marker", "account theme stable action group", "account theme product brand", "account SVG theme control", "account SVG return control":
+		case "account theme fallback target", "account theme fallback marker", "account theme stable action group", "account persistent sidebar return", "account sidebar return target", "account theme product brand", "account redundant jump removal", "account SVG theme control", "account SVG return control":
 			source = accountScript
-		case "account pre-paint script order":
+		case "account pinned parent template", "account pre-paint theme script", "account authorization feature source":
+			source = accountTemplate
+		case "account runtime theme script":
 			source = accountThemeProperties
 		case "account pre-paint stored theme":
 			source = accountThemeInit
-		case "account theme return styling":
+		case "account localized locale placeholder":
+			source = accountZhMessages
+		case "account theme return styling", "account admin-aligned sidebar", "account content-sized workspace":
 			source = accountCSS
 		case "production image account theme":
 			source = keycloakDockerfile
+		case "production runtime account theme":
+			source = acceptanceCompose
 		}
 		if !strings.Contains(source, content) {
 			t.Errorf("%s contract is missing", name)
@@ -245,8 +263,13 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 	if !strings.Contains(loginCSS, "--text-3: #606b7d;") || !strings.Contains(accountCSS, "--tl-text-3: #606b7d;") {
 		t.Error("identity theme tertiary text must meet light-theme contrast requirements")
 	}
-	if !strings.Contains(accountCSS, "@media (max-width: 420px)") ||
+	prePaint := strings.Index(accountTemplate, `<script src="${resourceUrl}/js/theme-init.js"></script>`)
+	entryScript := strings.Index(accountTemplate, "<#if entryScript?has_content>")
+	if prePaint < 0 || entryScript < 0 || prePaint > entryScript || strings.Contains(accountTemplate, "matchMedia") {
+		t.Error("account theme must resolve the shared product preference before React without a competing system-theme listener")
+	}
+	if !strings.Contains(accountCSS, "@media (max-width: 350px)") ||
 		!strings.Contains(accountCSS, ".tl-account-return-label {\n    display: none;\n  }") {
-		t.Error("account return action must collapse to its accessible icon before the narrow toolbar can clip its label")
+		t.Error("account return label must remain visible at 390px and collapse only on extremely narrow toolbars")
 	}
 }

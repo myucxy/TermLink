@@ -36,6 +36,7 @@ const (
 	webSessionTTL      = 8 * time.Hour
 	sensitiveActionTTL = 10 * time.Minute
 	maximumCookieSize  = 3800
+	recentAuditLimit   = 7
 )
 
 //go:embed assets/*.html assets/*.css assets/*.js assets/*.svg
@@ -157,6 +158,7 @@ type adminPageData struct {
 	SectionTitle       string
 	CanManageAccounts  bool
 	Dashboard          store.PortalAdminDashboard
+	RecentAuditEvents  []store.PortalAuditEvent
 	IdentityAccountURL string
 	PublicURL          string
 	Issuer             string
@@ -587,6 +589,10 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	section := normalizeAdminSection(r.URL.Query().Get("section"))
+	recentAuditEvents := dashboard.AuditEvents
+	if len(recentAuditEvents) > recentAuditLimit {
+		recentAuditEvents = recentAuditEvents[:recentAuditLimit]
+	}
 	p.render(w, http.StatusOK, "admin.html", adminPageData{
 		Username:           session.Username,
 		Role:               account.Role,
@@ -596,6 +602,7 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 		SectionTitle:       adminSectionTitle(section),
 		CanManageAccounts:  account.Role.CanManageAccounts(),
 		Dashboard:          dashboard,
+		RecentAuditEvents:  recentAuditEvents,
 		IdentityAccountURL: p.flow.AccountURL(),
 		PublicURL:          strings.TrimRight(p.config.PublicURL, "/"),
 		Issuer:             strings.TrimRight(p.config.Issuer, "/"),
@@ -975,7 +982,7 @@ func normalizeAdminSection(value string) string {
 func adminSectionTitle(section string) string {
 	return map[string]string{
 		"overview": "运行概览", "connections": "连接与路由", "deployment": "Docker 部署",
-		"audit": "安全审计", "billing": "订阅与权益", "identity": "账号门户",
+		"audit": "安全审计", "billing": "订阅与权益", "identity": "身份与安全",
 		"accounts": "账号与角色", "redemptions": "兑换码管理",
 	}[normalizeAdminSection(section)]
 }

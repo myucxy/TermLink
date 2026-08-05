@@ -387,6 +387,29 @@ func TestPortalSeparatesUserAndAdministratorDestinations(t *testing.T) {
 	}
 }
 
+func TestPortalOverviewKeepsFullAuditLogOutOfTheDashboard(t *testing.T) {
+	flow := &testOIDCFlow{identity: accountIdentity{
+		Subject: "admin-subject", Username: "admin", Roles: []string{"SUPER_ADMIN"},
+	}}
+	portal := newTestPortal(t, flow)
+	repository := portal.config.Repository.(*testPortalRepository)
+	for index := 0; index < 10; index++ {
+		repository.dashboard.AuditEvents = append(repository.dashboard.AuditEvents, store.PortalAuditEvent{
+			Action: "overview-event-" + string(rune('a'+index)), Result: "SUCCEEDED",
+		})
+	}
+	cookie, _ := completeLoginAt(t, portal, flow, "/admin")
+
+	overview := performRequest(portal.Handler(), http.MethodGet, "/admin", nil, cookie)
+	if overview.Code != http.StatusOK || strings.Count(overview.Body.String(), "overview-event-") != 7 {
+		t.Fatalf("overview audit preview status/count = %d/%d", overview.Code, strings.Count(overview.Body.String(), "overview-event-"))
+	}
+	fullAudit := performRequest(portal.Handler(), http.MethodGet, "/admin?section=audit", nil, cookie)
+	if fullAudit.Code != http.StatusOK || strings.Count(fullAudit.Body.String(), "overview-event-") != 10 {
+		t.Fatalf("full audit status/count = %d/%d", fullAudit.Code, strings.Count(fullAudit.Body.String(), "overview-event-"))
+	}
+}
+
 func TestPortalAdminAndAuditorRolesAreReadOnly(t *testing.T) {
 	for _, role := range []store.Role{store.RoleAdmin, store.RoleAuditor} {
 		t.Run(string(role), func(t *testing.T) {
