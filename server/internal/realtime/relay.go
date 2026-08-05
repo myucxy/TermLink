@@ -30,6 +30,12 @@ const (
 	pongTimeout     = 45 * time.Second
 	pingInterval    = 15 * time.Second
 	peerQueueFrames = 128
+	// A replay can legitimately enqueue a short burst faster than the socket
+	// writer can drain it. Give the writer a bounded opportunity to catch up
+	// before classifying the peer as a slow consumer. This also propagates
+	// backpressure to the sender's read loop without allowing an unbounded
+	// Relay queue.
+	peerEnqueueTimeout = 500 * time.Millisecond
 )
 
 var requiredCapabilities = []string{"cumulative_ack", "e2ee_x25519_chacha20poly1305", "lease_v1"}
@@ -407,9 +413,12 @@ func (h *Hub) sendToDevice(sender *peer, deviceID uuid.UUID, frame []byte) {
 
 func (p *peer) enqueue(frame []byte) {
 	copyFrame := append([]byte(nil), frame...)
+	timer := time.NewTimer(peerEnqueueTimeout)
+	defer timer.Stop()
 	select {
 	case p.send <- copyFrame:
-	default:
+	case <-p.done:
+	case <-timer.C:
 		if p.close(websocket.CloseTryAgainLater, "slow consumer; resume from cumulative ACK") {
 			p.hub.observer.SlowConsumerDisconnected()
 		}

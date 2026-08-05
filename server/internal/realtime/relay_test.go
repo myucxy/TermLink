@@ -11,6 +11,38 @@ import (
 	"github.com/termlink/termlink/server/internal/store"
 )
 
+func TestPeerEnqueueAllowsBriefReplayBackpressure(t *testing.T) {
+	p := &peer{
+		hub:  &Hub{observer: noopObserver{}},
+		send: make(chan []byte, 1),
+		done: make(chan struct{}),
+	}
+	p.send <- []byte("queued")
+
+	drained := make(chan struct{})
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		<-p.send
+		close(drained)
+	}()
+
+	p.enqueue([]byte("replay"))
+	<-drained
+	select {
+	case frame := <-p.send:
+		if string(frame) != "replay" {
+			t.Fatalf("queued frame = %q, want replay", frame)
+		}
+	default:
+		t.Fatal("replay frame was dropped during brief backpressure")
+	}
+	select {
+	case <-p.done:
+		t.Fatal("brief replay backpressure closed the peer")
+	default:
+	}
+}
+
 func TestReplacedPeerCannotRemoveReplacementSubscription(t *testing.T) {
 	observer := &subscriptionObserver{}
 	hub := NewHubWithObserver(nil, nil, nil, observer)
