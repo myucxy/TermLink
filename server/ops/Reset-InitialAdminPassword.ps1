@@ -50,6 +50,15 @@ try {
         throw 'Could not prepare the pinned Keycloak image.'
     }
 
+    # Docker Desktop stages file-backed Compose secrets into service-private
+    # volumes. Refresh that staging volume after rotating the host-side input;
+    # otherwise keycloak-init would keep reading the password copied during the
+    # previous deployment and the newly retrieved credential could never log in.
+    & docker compose -f $paths.ComposeFile run --rm --no-deps runtime-secrets-init
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not stage the new initial admin password.'
+    }
+
 $resetCommand = @'
 admin_password="$(cat /run/secrets/keycloak_admin_password)"
 temporary_password="$(cat /run/secrets/admin_initial_password)"
