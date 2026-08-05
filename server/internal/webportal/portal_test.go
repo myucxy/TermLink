@@ -329,8 +329,8 @@ func TestPortalTemplatesApplyThemeBeforeStyles(t *testing.T) {
 			t.Fatal(err)
 		}
 		html := string(data)
-		initIndex := strings.Index(html, `/assets/theme-init.js?v=01b-v10`)
-		styleIndex := strings.Index(html, `/assets/site.css?v=01b-v10`)
+		initIndex := strings.Index(html, `/assets/theme-init.js?v=01b-v11`)
+		styleIndex := strings.Index(html, `/assets/site.css?v=01b-v11`)
 		if initIndex < 0 || styleIndex < 0 || initIndex > styleIndex {
 			t.Errorf("%s must restore the selected theme before loading product styles", name)
 		}
@@ -382,7 +382,7 @@ func TestPortalAccountResponsiveAndSVGControlContract(t *testing.T) {
 	}
 	adminCSS := readAsset("admin.css")
 	if !strings.Contains(adminCSS, "scrollbar-width: thin;") ||
-		!strings.Contains(adminHTML, `/assets/admin.css?v=01b-v10`) {
+		!strings.Contains(adminHTML, `/assets/admin.css?v=01b-v11`) {
 		t.Error("mobile administrator navigation must use the versioned product scrollbar styling")
 	}
 	if !strings.Contains(siteCSS, `--shadow-color: rgba(30, 40, 60, 0.16);`) ||
