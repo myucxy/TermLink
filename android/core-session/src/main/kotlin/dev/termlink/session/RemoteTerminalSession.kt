@@ -75,7 +75,9 @@ class RemoteTerminalSession(
     suspend fun onConnected(): Boolean {
         mutex.withLock {
             if (mutableState.value is RemoteSessionState.Exited) return false
-            mutableState.value = RemoteSessionState.Live(lastAckedSequence)
+            if (mutableState.value !is RemoteSessionState.HistoryGap) {
+                mutableState.value = RemoteSessionState.Live(lastAckedSequence)
+            }
             engine.setReadOnly(true)
         }
         return try {
@@ -95,7 +97,9 @@ class RemoteTerminalSession(
 
     suspend fun markReadOnly(reason: String) {
         mutex.withLock {
-            if (mutableState.value is RemoteSessionState.Exited) return
+            if (mutableState.value is RemoteSessionState.Exited ||
+                mutableState.value is RemoteSessionState.HistoryGap
+            ) return
             leaseExpiryJob?.cancel()
             leaseExpiryJob = null
             leaseRenewalJob?.cancel()
@@ -114,6 +118,9 @@ class RemoteTerminalSession(
         require(expiresAtEpochMillis > clockMillis()) { "control lease is already expired" }
         val terminalSize = mutex.withLock {
             check(mutableState.value !is RemoteSessionState.Exited) { "session has exited" }
+            check(mutableState.value !is RemoteSessionState.HistoryGap) {
+                "session has an unrecoverable history gap"
+            }
             leaseExpiryJob?.cancel()
             leaseRenewalJob?.cancel()
             mutableState.value = RemoteSessionState.Controlling(
@@ -345,7 +352,9 @@ class RemoteTerminalSession(
 
     private suspend fun markReconnecting(reason: String?) {
         mutex.withLock {
-            if (mutableState.value is RemoteSessionState.Exited) return
+            if (mutableState.value is RemoteSessionState.Exited ||
+                mutableState.value is RemoteSessionState.HistoryGap
+            ) return
             leaseExpiryJob?.cancel()
             leaseExpiryJob = null
             leaseRenewalJob?.cancel()

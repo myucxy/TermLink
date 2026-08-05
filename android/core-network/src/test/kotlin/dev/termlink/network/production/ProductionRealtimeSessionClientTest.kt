@@ -16,6 +16,7 @@ import dev.termlink.terminal.api.TerminalThemeV1
 import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -194,7 +195,7 @@ class ProductionRealtimeSessionClientTest {
             ),
             identity = androidIdentity,
             parentScope = scope,
-            reconnectDelaysMillis = listOf(0),
+            reconnectDelaysMillis = listOf(25),
             allowCleartextForLocalTest = true,
         )
         try {
@@ -324,6 +325,60 @@ class ProductionRealtimeSessionClientTest {
             assertEquals(2, outputs.size)
             assertArrayEquals(byteArrayOf(7), outputs[0])
             assertArrayEquals(byteArrayOf(8), outputs[1])
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun keepsRetryingWhenOfflineConnectionsFailBackToBack(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+
+        server.enqueue(MockResponse().setResponseCode(503).setHeadersDelay(50, TimeUnit.MILLISECONDS))
+        server.enqueue(MockResponse().setResponseCode(503).setHeadersDelay(50, TimeUnit.MILLISECONDS))
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        check(webSocket.send("{\"type\":\"welcome\",\"protocol_version\":1}"))
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, reason)
+                    }
+                },
+            ),
+        )
+        server.start()
+
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = server.url("/").toString(),
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            reconnectDelaysMillis = listOf(0),
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            client.start()
+            withTimeout(5_000) {
+                client.transportState.first { it is ProductionTransportState.Connected }
+            }
+            assertEquals(3, server.requestCount)
         } finally {
             client.close()
             androidIdentity.destroy()

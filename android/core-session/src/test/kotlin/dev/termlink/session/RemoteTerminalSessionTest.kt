@@ -102,6 +102,33 @@ class RemoteTerminalSessionTest {
     }
 
     @Test
+    fun historyGapSurvivesDisconnectAndReconnectAndCannotGainControl() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(engine, outbound, backgroundScope)
+        session.onConnected()
+
+        assertEquals(
+            EventAcceptance.HistoryGap(1, 3),
+            session.accept(RemoteSessionEvent.Gap(3, 1, 2)),
+        )
+        session.onDisconnected("replay queue closed")
+        assertIs<RemoteSessionState.HistoryGap>(session.state.value)
+        assertTrue(session.onConnected())
+        assertIs<RemoteSessionState.HistoryGap>(session.state.value)
+        assertEquals(listOf(0L, 0L), outbound.resumes)
+        assertFailsWith<IllegalStateException> {
+            session.grantControl("lease", Long.MAX_VALUE)
+        }
+        assertEquals(
+            InputSubmission.RejectedNoLease,
+            session.submitInput("blocked".encodeToByteArray()),
+        )
+        assertTrue(engine.readOnlyState)
+        session.close()
+    }
+
+    @Test
     fun orderedInputResultBetweenOutputsDoesNotCreateHistoryGap() = runTest {
         val engine = RecordingEngine()
         val outbound = RecordingOutbound()

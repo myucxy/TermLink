@@ -77,6 +77,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.concurrent.thread
 
 internal class ProductionProductRepository(
     private val activity: Activity,
@@ -668,8 +669,16 @@ internal class ProductionProductRepository(
         storedIdentity = null
         authService.dispose()
         database.close()
-        http.dispatcher.executorService.shutdown()
-        http.connectionPool.evictAll()
+        http.dispatcher.cancelAll()
+        val executor = http.dispatcher.executorService
+        val connectionPool = http.connectionPool
+        thread(start = true, isDaemon = true, name = "TermLink-OkHttp-Close") {
+            try {
+                connectionPool.evictAll()
+            } finally {
+                executor.shutdown()
+            }
+        }
     }
 
     private fun normalizeServerUrl(value: String): String = ServerUrlPolicy.normalize(value)

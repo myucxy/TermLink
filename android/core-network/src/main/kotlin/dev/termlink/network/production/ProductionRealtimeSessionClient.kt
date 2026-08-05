@@ -588,6 +588,11 @@ class ProductionRealtimeSessionClient(
             val delayMillis = reconnectDelaysMillis[(reconnectAttempt - 1).coerceAtMost(reconnectDelaysMillis.lastIndex)]
             reconnectJob = scope.launch {
                 delay(delayMillis.toLong())
+                // Clear the scheduled attempt before starting OkHttp. A fast
+                // offline failure can call back from newWebSocket while this
+                // coroutine is still active; leaving it installed would make
+                // scheduleReconnect discard the next retry.
+                reconnectMutex.withLock { reconnectJob = null }
                 if (!closed.get()) transport.connect()
             }
         }
