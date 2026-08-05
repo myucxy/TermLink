@@ -206,6 +206,22 @@ try {
     if ($null -eq (Get-InternalMethod $runtimeType 'QueueRegisteredSessionsForReplay')) {
         throw 'Production runtime does not queue recovered Registry sessions for publication.'
     }
+    $localInputIdempotencyKey = Get-InternalMethod $runtimeType 'LocalInputLeaseIdempotencyKey'
+    if ($null -eq $localInputIdempotencyKey) {
+        throw 'Production runtime does not derive a stable local-input lease operation key.'
+    }
+    $localInputSession = [Guid]::NewGuid()
+    $localInputKey = [string]$localInputIdempotencyKey.Invoke(
+        $null, [object[]]@($localInputSession, [uint64]42))
+    $replayedLocalInputKey = [string]$localInputIdempotencyKey.Invoke(
+        $null, [object[]]@($localInputSession, [uint64]42))
+    $nextLocalInputKey = [string]$localInputIdempotencyKey.Invoke(
+        $null, [object[]]@($localInputSession, [uint64]43))
+    if ($localInputKey -ne $replayedLocalInputKey -or
+        $localInputKey -eq $nextLocalInputKey -or
+        $localInputKey.Length -lt 8 -or $localInputKey.Length -gt 128) {
+        throw 'Local-input lease operation keys are not stable, unique, and server-compatible.'
+    }
     $mapMessageType = Get-InternalMethod $runtimeType 'MapMessageType'
     if ($null -eq $mapMessageType) {
         throw 'Production runtime lifecycle message mapping is unavailable.'
@@ -363,6 +379,25 @@ try {
         $proofRequest.Dispose()
     }
     $clearSubscribers = Get-InternalMethod $runtime.GetType() 'ClearSubscribers'
+    $clearSubscribers.Invoke($runtime, [object[]]@()) | Out-Null
+    $rememberSubscriber = Get-InternalMethod $runtime.GetType() 'RememberSubscriber'
+    $subscriberSessionId = [Guid]::NewGuid()
+    $subscriberDeviceId = [Guid]::NewGuid()
+    $retainedSubscriber = [Activator]::CreateInstance($subscriberType, $true)
+    $subscriberType.GetField('DeviceId').SetValue($retainedSubscriber, $subscriberDeviceId)
+    $subscriberType.GetField('KeyEpoch').SetValue($retainedSubscriber, [int64]1)
+    $subscriberType.GetField('LastActivityUtc').SetValue($retainedSubscriber, [DateTime]::UtcNow)
+    $subscriberType.GetField('ExchangePublicKey').SetValue($retainedSubscriber, [byte[]](1..32))
+    $subscriberType.GetField('PairwiseKey').SetValue($retainedSubscriber, [byte[]](33..64))
+    $firstRemembered = $rememberSubscriber.Invoke(
+        $runtime, [object[]]@($subscriberSessionId, $retainedSubscriber))
+    $secondRemembered = $rememberSubscriber.Invoke(
+        $runtime, [object[]]@($subscriberSessionId, $retainedSubscriber))
+    if (-not [Object]::ReferenceEquals($firstRemembered, $secondRemembered) -or
+        [bool]$subscriberType.GetField('Removed').GetValue($retainedSubscriber) -or
+        $null -eq $subscriberType.GetField('PairwiseKey').GetValue($retainedSubscriber)) {
+        throw 'Repeated SUBSCRIBE retired the active Subscriber and zeroized its live key.'
+    }
     $clearSubscribers.Invoke($runtime, [object[]]@()) | Out-Null
     $runtimeRegistry = $runtime.GetType().GetField('registry', [Reflection.BindingFlags]'Instance,NonPublic').GetValue($runtime)
     $serviceRegistry = $serviceType.GetField('registry', [Reflection.BindingFlags]'Instance,NonPublic').GetValue($service)

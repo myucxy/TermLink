@@ -774,7 +774,13 @@ namespace TermLink.Agent
             }
             if (item.Frame.Type == LocalFrameType.LocalInputObserved)
             {
-                using var released = await SendAsync(HttpMethod.Delete, "/v1/sessions/" + item.Frame.SessionId.ToString("D") + "/lease", Array.Empty<byte>(), true, Guid.NewGuid().ToString("D"), token).ConfigureAwait(false);
+                using var released = await SendAsync(
+                    HttpMethod.Delete,
+                    "/v1/sessions/" + item.Frame.SessionId.ToString("D") + "/lease",
+                    Array.Empty<byte>(),
+                    true,
+                    LocalInputLeaseIdempotencyKey(item.Frame.SessionId, item.Frame.Sequence),
+                    token).ConfigureAwait(false);
                 released.EnsureSuccessStatusCode();
             }
             if (item.Frame.Type == LocalFrameType.Lifecycle || item.Frame.Type == LocalFrameType.Resize)
@@ -964,6 +970,10 @@ namespace TermLink.Agent
             {
                 if (sessionSubscribers.TryGetValue(candidate.DeviceId, out var retained))
                 {
+                    // A periodic SUBSCRIBE may resolve to the Subscriber that is
+                    // already published for this session. Never retire that same
+                    // instance: retirement zeroizes the live pairwise key.
+                    if (ReferenceEquals(retained, candidate)) return retained;
                     lock (retained.Sync)
                     {
                         if (!retained.Removed)
@@ -978,6 +988,14 @@ namespace TermLink.Agent
                 }
                 if (sessionSubscribers.TryAdd(candidate.DeviceId, candidate)) return candidate;
             }
+        }
+
+        private static string LocalInputLeaseIdempotencyKey(Guid sessionId, ulong frameSequence)
+        {
+            // A recovered durable LocalInputObserved frame must replay the same
+            // DELETE operation. Coupling the key to its immutable local frame
+            // identity prevents an old replay from fencing a later lease.
+            return "local-input-priority-" + sessionId.ToString("N") + "-" + frameSequence.ToString("X16");
         }
 
         private async Task<bool> LeaseMatchesAsync(
