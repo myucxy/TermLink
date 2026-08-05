@@ -95,9 +95,16 @@ Registry 提供当前用户 SID ACL 的独立本机控制 Pipe，支持注册、
 Registry 登记的 Host PID。摘要只包含 Session ID、白名单 Shell 类型、生命周期、Host PID、
 最后序号和时间；不包含终端正文、标题、工作目录、Token、Pipe 名或 Buffer 路径。
 
-“停止远程访问”只关闭 Agent 侧 Pipe 并禁用后续注册。Session Host 会继续桥接本地
-Windows Terminal 与内层 ConPTY，不收到终止 Shell 的命令。Host 异常退出或断管后未在
-限定时间重连时，worker 自动结束并从 Registry 删除。
+“停止远程访问”只关闭 Agent 侧 Pipe，不向本地 Shell 发送终止命令。单会话停止会把
+Session ID、Host PID 和进程启动时间写入 CurrentUser DPAPI 保护的
+`remote-access-policy.dpapi` 墓碑；同一 Host 不能在 worker 回收、历史发布或 Agent 重启后
+静默重新注册。Host 收到 `SESSION_STOPPED` 后停止注册重试，但继续桥接本地 Windows
+Terminal 与内层 ConPTY。Host 退出后墓碑可安全清理，新开的 Profile 使用新的 Session。
+
+“停止全部远程访问”把全局关闭状态持久化到同一策略文件。Agent/系统重启不会自动开放；
+只有本机控制面的显式“恢复远程访问”成功持久化后才重新接受注册。策略文件截断、篡改或
+无法用当前 Windows 用户解密时按 fail-closed 处理。全局恢复不会删除仍存活 Host 的单会话
+墓碑。
 
 停止结果包含请求数、完成数和超时数。单会话超时返回稳定码 `STOP_TIMEOUT`；全局停止
 返回 `REMOTE_ACCESS_STOP_TIMEOUT`；关闭返回 `REGISTRY_SHUTDOWN_WITH_TIMEOUTS`；受控
@@ -105,6 +112,10 @@ Windows Terminal 与内层 ConPTY，不收到终止 Shell 的命令。Host 异�
 集合，禁止相同 Session ID 重注册，并在后续关闭中再次 best-effort 等待。批量停止会对
 全部 worker 先发停止，再逐一收集结果，不因首个超时跳过其余 worker；除关闭/重启命令外，
 控制服务返回错误码后继续运行。
+
+若停止已经在当前进程生效、但策略文件无法持久写入，控制面返回
+`STOPPED_NOT_DURABLE` 或 `REMOTE_ACCESS_STOPPED_NOT_DURABLE`，不会把非持久结果误报为
+成功；恢复写入失败返回 `REMOTE_ACCESS_ENABLE_NOT_DURABLE` 并继续保持关闭。
 
 `Test-SessionRegistry.ps1` 使用真实 Session Host 验证 3 个同时会话、摘要脱敏、单会话和
 并发重复停止、异常退出 Host 回收；另用独立 PID 完成认证后主动失联并保持存活，验证

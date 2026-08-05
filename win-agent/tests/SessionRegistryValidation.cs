@@ -46,6 +46,8 @@ namespace TermLink.Agent
                 ValidateLiveInterruptedLifecycle(Path.Combine(bufferRoot, "live-interrupted"));
                 ValidateControlledInterruptedLifecycle(Path.Combine(bufferRoot, "controlled-interrupted"));
                 ValidateRestartPreservesWithoutInterruption(Path.Combine(bufferRoot, "restart-preserves"));
+                ValidateRemoteAccessPolicyPersistence(Path.Combine(bufferRoot, "remote-policy"));
+                ValidatePolicyPersistenceFailure();
                 ValidateStopFailurePaths(Path.Combine(bufferRoot, "failure-paths"));
                 ValidateRestartFailurePath(Path.Combine(bufferRoot, "restart-failure"));
                 var controlPipe = "termlink-registry-control-" + Guid.NewGuid().ToString("N");
@@ -92,6 +94,13 @@ namespace TermLink.Agent
                 });
                 Require(stopFirst.Success && stopFirst.AffectedSessions == 1, "Single-session stop failed.");
                 Require(!first.Process.HasExited, "Stopping remote access terminated the local Shell Host.");
+                var stoppedRetry = Send(controlPipe, new RegistryRequest
+                {
+                    Command = RegistryCommand.Register,
+                    Registration = first.CreateRegistration(ManagedShellType.PowerShell7)
+                });
+                Require(!stoppedRetry.Success && stoppedRetry.Code == "SESSION_STOPPED",
+                    "A still-running explicitly stopped Host re-registered after its worker retired.");
                 first.CompleteLocally();
 
                 abnormal.Process.Kill();
@@ -149,6 +158,40 @@ namespace TermLink.Agent
                 Require(!concurrent.Process.HasExited, "Concurrent remote stop terminated the local Shell Host.");
                 concurrent.CompleteLocally();
 
+                var autoRegistered = HostFixture.Start(
+                    hostExecutable,
+                    "auto-register-stop",
+                    38,
+                    controlPipe);
+                hosts.Add(autoRegistered);
+                var autoSessionId = Guid.Empty;
+                WaitUntil(delegate
+                {
+                    var summary = Send(
+                        controlPipe,
+                        new RegistryRequest { Command = RegistryCommand.List }).Summaries.FirstOrDefault(
+                            item => item.HostProcessId == autoRegistered.Process.Id &&
+                                item.Lifecycle == SessionAgentLifecycle.Connected &&
+                                item.LastSequence >= 2);
+                    if (summary == null) return false;
+                    autoSessionId = summary.SessionId;
+                    return true;
+                }, 10000, "Managed SessionHost did not auto-register with the Registry.");
+                autoRegistered.AdoptRegisteredSession(autoSessionId);
+                var autoStop = Send(controlPipe, new RegistryRequest
+                {
+                    Command = RegistryCommand.StopSession,
+                    SessionId = autoRegistered.SessionId
+                });
+                Require(autoStop.Success && !autoRegistered.Process.HasExited,
+                    "Stopping an auto-registered Session terminated its local Shell.");
+                Thread.Sleep(1600);
+                Require(!ContainsSession(
+                        Send(controlPipe, new RegistryRequest { Command = RegistryCommand.List }).Summaries,
+                        autoRegistered.SessionId),
+                    "Auto-register loop restored a Session after explicit single-session stop.");
+                autoRegistered.CompleteLocally();
+
                 var stopAllOne = HostFixture.Start(hostExecutable, "stop-all-one", 34);
                 var stopAllTwo = HostFixture.Start(hostExecutable, "stop-all-two", 35);
                 hosts.Add(stopAllOne);
@@ -194,13 +237,17 @@ namespace TermLink.Agent
                     "__REGISTRY_TEST_RESULT__:multi_sessions=3" +
                     ";summary_redacted=true" +
                     ";single_stop_local_alive=true" +
+                    ";single_stop_tombstoned=true" +
+                    ";remote_policy_persisted=true" +
+                    ";policy_corruption_fail_closed=true" +
                     ";concurrent_stop_winners=1" +
                     ";abnormal_reclaimed=true" +
                     ";lost_host_reclaimed=true" +
                     ";stop_all_sessions=2" +
                     ";registration_blocked=true" +
                     ";registry_close_sessions=2" +
-                    ";local_shells_survived=6" +
+                    ";local_shells_survived=7" +
+                    ";auto_registration_stop_stable=true" +
                     ";stop_timeout_stable=true" +
                     ";batch_timeout_reported=true" +
                     ";shutdown_best_effort=true" +
@@ -328,8 +375,8 @@ namespace TermLink.Agent
                     Command = RegistryCommand.Register,
                     Registration = CreateFakeRegistration(single)
                 });
-                Require(!duplicateStopping.Success && duplicateStopping.Code == "SESSION_STOPPING",
-                    "Registry accepted a duplicate ID while the old worker was still retiring.");
+                Require(!duplicateStopping.Success && duplicateStopping.Code == "SESSION_STOPPED",
+                    "A timed-out stopped Session bypassed its durable Host tombstone.");
 
                 var batchSlow = Guid.NewGuid();
                 var batchFast = Guid.NewGuid();
@@ -679,6 +726,132 @@ namespace TermLink.Agent
             }
         }
 
+        private static void ValidateRemoteAccessPolicyPersistence(string bufferRoot)
+        {
+            Directory.CreateDirectory(bufferRoot);
+            var policyPath = Path.Combine(bufferRoot, "remote-access-policy.dpapi");
+            var stoppedSessionId = Guid.NewGuid();
+            var stoppedRegistration = CreateFakeRegistration(stoppedSessionId);
+
+            using (var registry = new SessionRegistry(
+                new FakeManagedSessionFactory(),
+                20,
+                new NullRegistryRegistrationStore(),
+                new DpapiRemoteAccessPolicyStore(policyPath)))
+            {
+                string error;
+                Require(registry.TryRegister(stoppedRegistration, out error),
+                    "Persistent stop fixture did not register: " + error);
+                var stopped = registry.StopSession(stoppedSessionId);
+                Require(stopped.Success && !stopped.PolicyPersistenceFailed,
+                    "Single-session stop tombstone was not persisted.");
+            }
+
+            using (var recovered = new SessionRegistry(
+                new FakeManagedSessionFactory(),
+                20,
+                new NullRegistryRegistrationStore(),
+                new DpapiRemoteAccessPolicyStore(policyPath)))
+            {
+                string error;
+                Require(!recovered.TryRegister(stoppedRegistration, out error) && error == "SESSION_STOPPED",
+                    "Agent restart allowed a still-running explicitly stopped Host to re-register.");
+                var active = CreateFakeRegistration(Guid.NewGuid());
+                Require(recovered.TryRegister(active, out error),
+                    "Remote policy fixture could not register an unrelated Session: " + error);
+                var stopAll = recovered.StopAllRemoteAccess();
+                Require(stopAll.Success && !recovered.RemoteAccessEnabled,
+                    "Global remote-access stop was not persisted.");
+            }
+
+            using (var disabled = new SessionRegistry(
+                new FakeManagedSessionFactory(),
+                20,
+                new NullRegistryRegistrationStore(),
+                new DpapiRemoteAccessPolicyStore(policyPath)))
+            {
+                string error;
+                Require(!disabled.RemoteAccessEnabled &&
+                    !disabled.TryRegister(CreateFakeRegistration(Guid.NewGuid()), out error) &&
+                    error == "REMOTE_ACCESS_DISABLED",
+                    "Agent restart silently re-enabled globally stopped remote access.");
+                Require(disabled.EnableRemoteAccess() && disabled.RemoteAccessEnabled,
+                    "Explicit Enable did not durably restore remote access.");
+            }
+
+            using (var enabled = new SessionRegistry(
+                new FakeManagedSessionFactory(),
+                20,
+                new NullRegistryRegistrationStore(),
+                new DpapiRemoteAccessPolicyStore(policyPath)))
+            {
+                string error;
+                Require(enabled.RemoteAccessEnabled,
+                    "Explicitly enabled remote access did not survive Agent restart.");
+                Require(!enabled.TryRegister(stoppedRegistration, out error) && error == "SESSION_STOPPED",
+                    "Global Enable erased a single-session stop tombstone.");
+                Require(enabled.TryRegister(CreateFakeRegistration(Guid.NewGuid()), out error),
+                    "Enabled policy rejected an unrelated Session: " + error);
+            }
+
+            File.WriteAllBytes(policyPath, Encoding.ASCII.GetBytes("truncated-policy"));
+            using (var damaged = new SessionRegistry(
+                new FakeManagedSessionFactory(),
+                20,
+                new NullRegistryRegistrationStore(),
+                new DpapiRemoteAccessPolicyStore(policyPath)))
+            {
+                string error;
+                Require(!damaged.RemoteAccessEnabled &&
+                    !damaged.TryRegister(CreateFakeRegistration(Guid.NewGuid()), out error) &&
+                    error == "REMOTE_ACCESS_DISABLED",
+                    "Damaged remote-access policy failed open.");
+                Require(damaged.EnableRemoteAccess(),
+                    "Explicit Enable could not repair a damaged remote-access policy.");
+            }
+        }
+
+        private static void ValidatePolicyPersistenceFailure()
+        {
+            var factory = new FakeManagedSessionFactory();
+            using (var registry = new SessionRegistry(
+                factory,
+                20,
+                new NullRegistryRegistrationStore(),
+                new FailingRemoteAccessPolicyStore()))
+            {
+                string error;
+                var sessionId = Guid.NewGuid();
+                var registration = CreateFakeRegistration(sessionId);
+                Require(registry.TryRegister(registration, out error),
+                    "Policy failure fixture did not register: " + error);
+                var stopped = registry.StopSession(sessionId);
+                Require(!stopped.Success && stopped.PolicyPersistenceFailed &&
+                    stopped.CompletedSessions == 1,
+                    "Single-session stop did not report a non-durable policy write.");
+                Require(!registry.TryRegister(registration, out error) && error == "SESSION_STOPPED",
+                    "A non-durable single stop failed to block re-registration in the current Agent.");
+            }
+
+            factory = new FakeManagedSessionFactory();
+            using (var registry = new SessionRegistry(
+                factory,
+                20,
+                new NullRegistryRegistrationStore(),
+                new FailingRemoteAccessPolicyStore()))
+            {
+                string error;
+                Require(registry.TryRegister(CreateFakeRegistration(Guid.NewGuid()), out error),
+                    "Global policy failure fixture did not register: " + error);
+                var stopped = registry.StopAllRemoteAccess();
+                Require(!stopped.Success && stopped.PolicyPersistenceFailed &&
+                    stopped.CompletedSessions == 1 && !registry.RemoteAccessEnabled,
+                    "Global stop did not remain effective after its durable policy write failed.");
+                Require(!registry.EnableRemoteAccess() && !registry.RemoteAccessEnabled,
+                    "Failed durable Enable reopened remote access in memory.");
+            }
+        }
+
         private static void ValidateRestartFailurePath(string bufferRoot)
         {
             Directory.CreateDirectory(bufferRoot);
@@ -888,7 +1061,21 @@ namespace TermLink.Agent
         }
     }
 
-    internal sealed class FakeManagedSession : IRegistryManagedSession, IRemoteControllableSession, IRemoteResizableSession
+    internal sealed class FailingRemoteAccessPolicyStore : IRemoteAccessPolicyStore
+    {
+        public RemoteAccessPolicySnapshot Load()
+        {
+            return new RemoteAccessPolicySnapshot(true, new List<StoppedHostIdentity>());
+        }
+
+        public void Save(RemoteAccessPolicySnapshot snapshot)
+        {
+            throw new IOException("injected remote-access policy write failure");
+        }
+    }
+
+    internal sealed class FakeManagedSession : IRegistryManagedSession, IRemoteControllableSession,
+        IRemoteResizableSession, IRecoveryRegistrationSession
     {
         private readonly Action<IRegistryManagedSession> completion;
         private int waitCalls;
@@ -900,11 +1087,13 @@ namespace TermLink.Agent
             Action<IRegistryManagedSession> completion)
         {
             SessionId = registration.SessionId;
+            Registration = registration;
             WaitsBeforeSuccess = waitsBeforeSuccess;
             this.completion = completion;
         }
 
         public Guid SessionId { get; private set; }
+        public SessionRegistration Registration { get; private set; }
         public int WaitsBeforeSuccess { get; private set; }
         public int WaitCalls { get { return Volatile.Read(ref waitCalls); } }
         public short ResizeColumns { get; private set; }
@@ -1051,7 +1240,11 @@ namespace TermLink.Agent
         public string SecretMarker { get; private set; }
         public int ExitCode { get; private set; }
 
-        public static HostFixture Start(string hostExecutable, string label, int exitCode)
+        public static HostFixture Start(
+            string hostExecutable,
+            string label,
+            int exitCode,
+            string registryControlPipe = null)
         {
             var sessionId = Guid.NewGuid();
             var pipe = "termlink-registry-session-" + sessionId.ToString("N");
@@ -1068,15 +1261,22 @@ namespace TermLink.Agent
             var encodedScript = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
             var command = "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand " + encodedScript;
             var encodedCommand = Convert.ToBase64String(Encoding.UTF8.GetBytes(command));
+            var arguments = "--command-base64 " + encodedCommand + " --timeout-ms 30000";
+            if (!string.IsNullOrEmpty(registryControlPipe))
+            {
+                arguments += " --managed-shell custom --registry-pipe " + registryControlPipe;
+            }
+            else
+            {
+                arguments +=
+                    " --agent-pipe " + pipe +
+                    " --session-id " + sessionId.ToString("D") +
+                    " --handshake-token " + Convert.ToBase64String(token);
+            }
             var start = new ProcessStartInfo
             {
                 FileName = hostExecutable,
-                Arguments =
-                    "--command-base64 " + encodedCommand +
-                    " --timeout-ms 30000" +
-                    " --agent-pipe " + pipe +
-                    " --session-id " + sessionId.ToString("D") +
-                    " --handshake-token " + Convert.ToBase64String(token),
+                Arguments = arguments,
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardInput = true,
@@ -1087,6 +1287,12 @@ namespace TermLink.Agent
             };
             var process = Process.Start(start);
             return new HostFixture(process, sessionId, pipe, token, marker, exitCode);
+        }
+
+        public void AdoptRegisteredSession(Guid sessionId)
+        {
+            if (sessionId == Guid.Empty) throw new ArgumentException("Registered Session ID is required.");
+            SessionId = sessionId;
         }
 
         public SessionRegistration CreateRegistration(ManagedShellType shellType)

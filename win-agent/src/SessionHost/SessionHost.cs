@@ -1265,7 +1265,7 @@ namespace TermLink.SessionHost
                 {
                     try
                     {
-                        RegistryControlClient.Send(
+                        var response = RegistryControlClient.Send(
                             controlPipeName,
                             new RegistryRequest
                             {
@@ -1273,6 +1273,13 @@ namespace TermLink.SessionHost
                                 Registration = registration
                             },
                             750);
+                        // A single-session stop is bound to this Host process
+                        // identity and survives Agent restarts. Do not spin for
+                        // the rest of the local Shell lifetime after the Agent
+                        // has acknowledged that permanent decision. Global
+                        // REMOTE_ACCESS_DISABLED remains retryable because an
+                        // explicit Enable is expected to restore all Sessions.
+                        if (!response.Success && response.Code == "SESSION_STOPPED") return;
                     }
                     catch (ArgumentException) { }
                     catch (InvalidDataException) { }

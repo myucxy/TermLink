@@ -61,13 +61,17 @@ try {
     $fields = Get-ResultFields -Text $text -Prefix '__REGISTRY_TEST_RESULT__:'
     Assert-True ([int]$fields.multi_sessions -eq 3) 'Multi-session Registry coverage did not run.'
     Assert-True ($fields.summary_redacted -eq 'true') 'Summary redaction did not pass.'
+    Assert-True ($fields.single_stop_tombstoned -eq 'true') 'Single-session stop tombstone did not block re-registration.'
+    Assert-True ($fields.remote_policy_persisted -eq 'true') 'Remote-access policy did not survive Agent restart.'
+    Assert-True ($fields.policy_corruption_fail_closed -eq 'true') 'Damaged remote-access policy did not fail closed.'
+    Assert-True ($fields.auto_registration_stop_stable -eq 'true') 'Auto-register loop restored an explicitly stopped Session.'
     Assert-True ([int]$fields.concurrent_stop_winners -eq 1) 'Concurrent stop was not idempotent.'
     Assert-True ($fields.abnormal_reclaimed -eq 'true') 'Abnormal Host was not reclaimed.'
     Assert-True ($fields.lost_host_reclaimed -eq 'true') 'Disconnected live Host was not reclaimed.'
     Assert-True ([int]$fields.stop_all_sessions -eq 2) 'Global remote stop did not cover both sessions.'
     Assert-True ($fields.registration_blocked -eq 'true') 'Global remote stop did not block new registration.'
     Assert-True ([int]$fields.registry_close_sessions -eq 2) 'Registry close coverage did not run.'
-    Assert-True ([int]$fields.local_shells_survived -eq 6) 'Local Shell survival checks did not all pass.'
+    Assert-True ([int]$fields.local_shells_survived -eq 7) 'Local Shell survival checks did not all pass.'
     Assert-True ($fields.stop_timeout_stable -eq 'true') 'Single-session stop timeout result was not stable.'
     Assert-True ($fields.batch_timeout_reported -eq 'true') 'Batch timeout coverage did not pass.'
     Assert-True ($fields.shutdown_best_effort -eq 'true') 'Shutdown best-effort cleanup did not pass.'
@@ -87,6 +91,10 @@ try {
         simultaneous_sessions = [int]$fields.multi_sessions
         summaries_exclude_terminal_body_pipe_token_and_buffer_path = [bool]::Parse($fields.summary_redacted)
         single_remote_stop_preserved_local_shell = [bool]::Parse($fields.single_stop_local_alive)
+        single_remote_stop_blocked_host_reregistration = [bool]::Parse($fields.single_stop_tombstoned)
+        remote_access_policy_survived_agent_restart = [bool]::Parse($fields.remote_policy_persisted)
+        damaged_remote_access_policy_failed_closed = [bool]::Parse($fields.policy_corruption_fail_closed)
+        stopped_auto_registration_remained_stopped = [bool]::Parse($fields.auto_registration_stop_stable)
         concurrent_stop_successes = [int]$fields.concurrent_stop_winners
         abnormal_host_reclaimed = [bool]::Parse($fields.abnormal_reclaimed)
         disconnected_live_host_reclaimed = [bool]::Parse($fields.lost_host_reclaimed)

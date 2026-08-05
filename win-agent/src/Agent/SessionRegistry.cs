@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
 using System.Security.AccessControl;
+using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
@@ -17,7 +18,8 @@ namespace TermLink.Agent
         public int RequestedSessions { get; set; }
         public int CompletedSessions { get; set; }
         public int TimedOutSessions { get; set; }
-        public bool Success { get { return TimedOutSessions == 0; } }
+        public bool PolicyPersistenceFailed { get; set; }
+        public bool Success { get { return TimedOutSessions == 0 && !PolicyPersistenceFailed; } }
     }
 
     internal interface IRegistryManagedSession
@@ -82,6 +84,10 @@ namespace TermLink.Agent
         private readonly HashSet<Guid> retainOnCompletion = new HashSet<Guid>();
         private readonly IRegistryManagedSessionFactory sessionFactory;
         private readonly IRegistryRegistrationStore registrationStore;
+        private readonly IRemoteAccessPolicyStore remoteAccessPolicyStore;
+        private readonly Dictionary<Guid, StoppedHostIdentity> stoppedHosts =
+            new Dictionary<Guid, StoppedHostIdentity>();
+        private readonly HashSet<Guid> stoppedSessionIds = new HashSet<Guid>();
         private readonly int maximumSessions;
         private readonly bool retainCompletedSessions;
         private readonly string bufferRoot;
@@ -124,11 +130,18 @@ namespace TermLink.Agent
             retainCompletedSessions = committedFrame != null;
             registrationStore = new DpapiRegistryRegistrationStore(
                 Path.Combine(resolvedBufferRoot, "registrations.dpapi"));
+            remoteAccessPolicyStore = new DpapiRemoteAccessPolicyStore(
+                Path.Combine(resolvedBufferRoot, "remote-access-policy.dpapi"));
+            LoadRemoteAccessPolicy();
             RecoverRegistrations();
         }
 
         internal SessionRegistry(IRegistryManagedSessionFactory sessionFactory, int maximumSessions)
-            : this(sessionFactory, maximumSessions, new NullRegistryRegistrationStore())
+            : this(
+                sessionFactory,
+                maximumSessions,
+                new NullRegistryRegistrationStore(),
+                new NullRemoteAccessPolicyStore())
         {
         }
 
@@ -136,13 +149,29 @@ namespace TermLink.Agent
             IRegistryManagedSessionFactory sessionFactory,
             int maximumSessions,
             IRegistryRegistrationStore registrationStore)
+            : this(
+                sessionFactory,
+                maximumSessions,
+                registrationStore,
+                new NullRemoteAccessPolicyStore())
+        {
+        }
+
+        internal SessionRegistry(
+            IRegistryManagedSessionFactory sessionFactory,
+            int maximumSessions,
+            IRegistryRegistrationStore registrationStore,
+            IRemoteAccessPolicyStore remoteAccessPolicyStore)
         {
             if (sessionFactory == null) throw new ArgumentNullException("sessionFactory");
             if (registrationStore == null) throw new ArgumentNullException("registrationStore");
+            if (remoteAccessPolicyStore == null) throw new ArgumentNullException("remoteAccessPolicyStore");
             if (maximumSessions < 1 || maximumSessions > 1000) throw new ArgumentOutOfRangeException("maximumSessions");
             this.sessionFactory = sessionFactory;
             this.registrationStore = registrationStore;
+            this.remoteAccessPolicyStore = remoteAccessPolicyStore;
             this.maximumSessions = maximumSessions;
+            LoadRemoteAccessPolicy();
             RecoverRegistrations();
         }
 
@@ -166,10 +195,128 @@ namespace TermLink.Agent
             lock (sync) return sessions.ContainsKey(sessionId) || completedSessions.ContainsKey(sessionId);
         }
 
+        private void LoadRemoteAccessPolicy()
+        {
+            var snapshot = remoteAccessPolicyStore.Load();
+            if (snapshot == null) throw new InvalidDataException("Remote-access policy store returned no state.");
+            remoteAccessEnabled = snapshot.RemoteAccessEnabled && snapshot.Valid;
+            stoppedHosts.Clear();
+            stoppedSessionIds.Clear();
+            foreach (var stopped in snapshot.StoppedHosts)
+            {
+                if (stopped == null || stoppedHosts.ContainsKey(stopped.SessionId))
+                    throw new InvalidDataException("Remote-access policy contains duplicate stopped Hosts.");
+                stoppedHosts.Add(stopped.SessionId, stopped);
+                stoppedSessionIds.Add(stopped.SessionId);
+            }
+        }
+
+        private RemoteAccessPolicySnapshot PolicySnapshot(
+            bool enabled,
+            IDictionary<Guid, StoppedHostIdentity> stopped)
+        {
+            return new RemoteAccessPolicySnapshot(
+                enabled,
+                new List<StoppedHostIdentity>(stopped.Values));
+        }
+
+        private bool IsSessionStoppedByPolicyLocked(Guid sessionId)
+        {
+            if (!stoppedSessionIds.Contains(sessionId)) return false;
+            StoppedHostIdentity stopped;
+            if (!stoppedHosts.TryGetValue(sessionId, out stopped)) return true;
+            if (stopped.MatchesRunningHost()) return true;
+
+            var retained = new Dictionary<Guid, StoppedHostIdentity>(stoppedHosts);
+            retained.Remove(sessionId);
+            try
+            {
+                remoteAccessPolicyStore.Save(PolicySnapshot(remoteAccessEnabled, retained));
+            }
+            catch (Exception error)
+            {
+                if (!IsPolicyStorageError(error)) throw;
+                // Keeping a stale tombstone over-blocks one Session but is the
+                // fail-closed result when its durable removal cannot be saved.
+                return true;
+            }
+            stoppedHosts.Remove(sessionId);
+            stoppedSessionIds.Remove(sessionId);
+            return false;
+        }
+
+        private bool AddStoppedHostPolicyLocked(IRegistryManagedSession managed)
+        {
+            stoppedSessionIds.Add(managed.SessionId);
+            var recoverable = managed as IRecoveryRegistrationSession;
+            if (recoverable == null) return true;
+            var next = new Dictionary<Guid, StoppedHostIdentity>();
+            foreach (var item in stoppedHosts)
+            {
+                if (item.Value.MatchesRunningHost()) next[item.Key] = item.Value;
+            }
+            var stopped = StoppedHostIdentity.FromRegistration(recoverable.Registration);
+            next[managed.SessionId] = stopped;
+            try
+            {
+                remoteAccessPolicyStore.Save(PolicySnapshot(remoteAccessEnabled, next));
+            }
+            catch (Exception error)
+            {
+                if (!IsPolicyStorageError(error)) throw;
+                stoppedHosts[managed.SessionId] = stopped;
+                return false;
+            }
+            stoppedHosts.Clear();
+            stoppedSessionIds.Clear();
+            foreach (var item in next)
+            {
+                stoppedHosts[item.Key] = item.Value;
+                stoppedSessionIds.Add(item.Key);
+            }
+            return true;
+        }
+
+        private bool SaveRemoteAccessEnabledLocked(bool enabled)
+        {
+            try
+            {
+                remoteAccessPolicyStore.Save(PolicySnapshot(enabled, stoppedHosts));
+                return true;
+            }
+            catch (Exception error)
+            {
+                if (!IsPolicyStorageError(error)) throw;
+                return false;
+            }
+        }
+
+        private static bool IsPolicyStorageError(Exception error)
+        {
+            return error is IOException ||
+                error is UnauthorizedAccessException ||
+                error is InvalidDataException ||
+                error is CryptographicException;
+        }
+
         private void RecoverRegistrations()
         {
             foreach (var registration in registrationStore.Load())
             {
+                var blockedByStoppedHost = false;
+                lock (sync)
+                {
+                    if (remoteAccessEnabled)
+                        blockedByStoppedHost = IsSessionStoppedByPolicyLocked(registration.SessionId);
+                }
+                if (!remoteAccessEnabled || blockedByStoppedHost)
+                {
+                    var recoveryOnly = registration.AsRecoveryOnly();
+                    registrationStore.Upsert(recoveryOnly);
+                    if (RecoverCompletedSession(recoveryOnly)) recoveredSessionCount++;
+                    else registrationStore.Remove(registration.SessionId);
+                    continue;
+                }
                 if (registration.RecoveryOnly || !registration.MatchesRunningHost())
                 {
                     if (RecoverCompletedSession(registration))
@@ -226,6 +373,11 @@ namespace TermLink.Agent
                 if (!remoteAccessEnabled)
                 {
                     error = "REMOTE_ACCESS_DISABLED";
+                    return false;
+                }
+                if (IsSessionStoppedByPolicyLocked(registration.SessionId))
+                {
+                    error = "SESSION_STOPPED";
                     return false;
                 }
                 if (sessions.ContainsKey(registration.SessionId) || completedSessions.ContainsKey(registration.SessionId))
@@ -394,12 +546,13 @@ namespace TermLink.Agent
         public SessionStopResult StopSession(Guid sessionId)
         {
             IRegistryManagedSession managed;
+            var policyDurable = true;
             lock (sync)
             {
                 if (!sessions.TryGetValue(sessionId, out managed)) return new SessionStopResult();
+                policyDurable = AddStoppedHostPolicyLocked(managed);
                 if (retainCompletedSessions)
                 {
-                    MarkRecoveryOnly(managed);
                     retainOnCompletion.Add(sessionId);
                 }
                 else registrationStore.Remove(sessionId);
@@ -416,22 +569,24 @@ namespace TermLink.Agent
             {
                 RequestedSessions = 1,
                 CompletedSessions = completed ? 1 : 0,
-                TimedOutSessions = completed ? 0 : 1
+                TimedOutSessions = completed ? 0 : 1,
+                PolicyPersistenceFailed = !policyDurable
             };
         }
 
         public SessionStopResult StopAllRemoteAccess()
         {
             List<IRegistryManagedSession> stopped;
+            var policyDurable = true;
             lock (sync)
             {
                 remoteAccessEnabled = false;
+                policyDurable = SaveRemoteAccessEnabledLocked(false);
                 stopped = new List<IRegistryManagedSession>(sessions.Values);
                 if (retainCompletedSessions)
                 {
                     foreach (var session in stopped)
                     {
-                        MarkRecoveryOnly(session);
                         retainOnCompletion.Add(session.SessionId);
                     }
                 }
@@ -448,7 +603,9 @@ namespace TermLink.Agent
                 sessions.Clear();
                 foreach (var session in stopped) retiring.Add(session);
             }
-            return StopSessions(stopped, true);
+            var result = StopSessions(stopped, true);
+            result.PolicyPersistenceFailed = !policyDurable;
+            return result;
         }
 
         public bool EnableRemoteAccess()
@@ -456,9 +613,10 @@ namespace TermLink.Agent
             lock (sync)
             {
                 if (disposed) return false;
-                var changed = !remoteAccessEnabled;
+                if (remoteAccessEnabled) return true;
+                if (!SaveRemoteAccessEnabledLocked(true)) return false;
                 remoteAccessEnabled = true;
-                return changed;
+                return true;
             }
         }
 
@@ -1129,16 +1287,27 @@ namespace TermLink.Agent
                 case RegistryCommand.StopSession:
                     var stopped = registry.StopSession(request.SessionId);
                     if (stopped.RequestedSessions == 0) return Response(false, "SESSION_NOT_FOUND", 0);
-                    return StopResponse(stopped, "STOPPED", "STOP_TIMEOUT");
+                    var stopFailure = stopped.PolicyPersistenceFailed
+                        ? (stopped.TimedOutSessions > 0 ? "STOP_TIMEOUT_NOT_DURABLE" : "STOPPED_NOT_DURABLE")
+                        : "STOP_TIMEOUT";
+                    return StopResponse(stopped, "STOPPED", stopFailure);
                 case RegistryCommand.StopAllRemoteAccess:
                     var stoppedAll = registry.StopAllRemoteAccess();
+                    var stopAllFailure = stoppedAll.PolicyPersistenceFailed
+                        ? (stoppedAll.TimedOutSessions > 0
+                            ? "REMOTE_ACCESS_STOP_TIMEOUT_NOT_DURABLE"
+                            : "REMOTE_ACCESS_STOPPED_NOT_DURABLE")
+                        : "REMOTE_ACCESS_STOP_TIMEOUT";
                     return StopResponse(
                         stoppedAll,
                         "REMOTE_ACCESS_STOPPED",
-                        "REMOTE_ACCESS_STOP_TIMEOUT");
+                        stopAllFailure);
                 case RegistryCommand.EnableRemoteAccess:
-                    registry.EnableRemoteAccess();
-                    return Response(true, "REMOTE_ACCESS_ENABLED", 0);
+                    var enabled = registry.EnableRemoteAccess();
+                    return Response(
+                        enabled,
+                        enabled ? "REMOTE_ACCESS_ENABLED" : "REMOTE_ACCESS_ENABLE_NOT_DURABLE",
+                        0);
                 case RegistryCommand.Shutdown:
                     shutdownRequested = true;
                     var shutdown = registry.Shutdown();
