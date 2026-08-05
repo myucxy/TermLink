@@ -105,7 +105,10 @@ func (f *testOIDCFlow) ExchangeAndVerify(_ context.Context, code, verifier, expe
 
 func (*testOIDCFlow) LogoutURL() string { return "https://identity.example/logout" }
 
-func (*testOIDCFlow) AccountURL() string { return "https://identity.example/account/" }
+func (*testOIDCFlow) AccountURL() string {
+	return "https://identity.example/realms/termlink/account/?referrer=termlink-web&referrer_uri=" +
+		url.QueryEscape("https://"+testPublicHost+"/account")
+}
 
 func newTestPortal(t *testing.T, flow *testOIDCFlow) *Portal {
 	t.Helper()
@@ -157,6 +160,17 @@ func performRequest(handler http.Handler, method, target string, body io.Reader,
 	return recorder
 }
 
+func performRequestOnHost(handler http.Handler, method, host, target string, body io.Reader, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, "https://"+host+target, body)
+	request.Host = host
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	return recorder
+}
+
 func responseCookie(t *testing.T, response *http.Response, name string) *http.Cookie {
 	t.Helper()
 	for _, cookie := range response.Cookies() {
@@ -175,8 +189,8 @@ func startLogin(t *testing.T, portal *Portal, flow *testOIDCFlow) (*http.Cookie,
 func startLoginAt(t *testing.T, portal *Portal, flow *testOIDCFlow, returnTo string) (*http.Cookie, oauthState) {
 	t.Helper()
 	target := "/login"
-	if returnTo == "/admin" {
-		target += "?return_to=/admin"
+	if returnTo != "/account" {
+		target += "?return_to=" + url.QueryEscape(returnTo)
 	}
 	recorder := performRequest(portal.Handler(), http.MethodGet, target, nil)
 	if recorder.Code != http.StatusFound {
@@ -199,6 +213,39 @@ func startLoginAt(t *testing.T, portal *Portal, flow *testOIDCFlow, returnTo str
 	wantChallenge := base64.RawURLEncoding.EncodeToString(challenge[:])
 	if flow.challenge != wantChallenge {
 		t.Fatalf("PKCE challenge = %q, want %q", flow.challenge, wantChallenge)
+	}
+	return cookie, state
+}
+
+func startLoginWithParams(t *testing.T, portal *Portal, flow *testOIDCFlow, returnTo, theme string) (*http.Cookie, oauthState) {
+	t.Helper()
+	query := url.Values{}
+	if returnTo != "" {
+		query.Set("return_to", returnTo)
+	}
+	if theme != "" {
+		query.Set(themeQueryParameter, theme)
+	}
+	target := "/login"
+	if encoded := query.Encode(); encoded != "" {
+		target += "?" + encoded
+	}
+	recorder := performRequest(portal.Handler(), http.MethodGet, target, nil)
+	if recorder.Code != http.StatusFound {
+		t.Fatalf("login status = %d, want %d", recorder.Code, http.StatusFound)
+	}
+	response := recorder.Result()
+	defer response.Body.Close()
+	cookie := responseCookie(t, response, oauthCookieName)
+	var state oauthState
+	if err := portal.oauthCodec.open(cookie.Value, &state); err != nil {
+		t.Fatalf("decode OAuth state cookie: %v", err)
+	}
+	if state.State == "" || state.Nonce == "" || state.Verifier == "" {
+		t.Fatalf("OAuth state cookie is incomplete: %+v", state)
+	}
+	if flow.state != state.State || flow.nonce != state.Nonce {
+		t.Fatal("authorization URL did not receive the sealed state and nonce")
 	}
 	return cookie, state
 }
@@ -282,8 +329,8 @@ func TestPortalTemplatesApplyThemeBeforeStyles(t *testing.T) {
 			t.Fatal(err)
 		}
 		html := string(data)
-		initIndex := strings.Index(html, `/assets/theme-init.js?v=01b-v9`)
-		styleIndex := strings.Index(html, `/assets/site.css?v=01b-v9`)
+		initIndex := strings.Index(html, `/assets/theme-init.js?v=01b-v10`)
+		styleIndex := strings.Index(html, `/assets/site.css?v=01b-v10`)
 		if initIndex < 0 || styleIndex < 0 || initIndex > styleIndex {
 			t.Errorf("%s must restore the selected theme before loading product styles", name)
 		}
@@ -333,9 +380,15 @@ func TestPortalAccountResponsiveAndSVGControlContract(t *testing.T) {
 	if strings.ContainsAny(readAsset("theme.js"), "☼☾") {
 		t.Error("theme behavior must not rewrite controls with platform glyphs")
 	}
-	if !strings.Contains(readAsset("admin.css"), "scrollbar-width: thin;") ||
-		!strings.Contains(adminHTML, `/assets/admin.css?v=01b-v9`) {
+	adminCSS := readAsset("admin.css")
+	if !strings.Contains(adminCSS, "scrollbar-width: thin;") ||
+		!strings.Contains(adminHTML, `/assets/admin.css?v=01b-v10`) {
 		t.Error("mobile administrator navigation must use the versioned product scrollbar styling")
+	}
+	if !strings.Contains(siteCSS, `--shadow-color: rgba(30, 40, 60, 0.16);`) ||
+		!strings.Contains(adminCSS, `color-mix(in srgb, var(--shadow-color)`) ||
+		strings.Contains(adminCSS, `color-mix(in srgb, var(--shadow)`) {
+		t.Error("administrator elevation must mix a color token instead of the complete shadow declaration")
 	}
 	if strings.Contains(readAsset("theme.js"), `setAttribute("aria-pressed"`) {
 		t.Error("theme action buttons must not expose toggle-button pressed state")
@@ -373,7 +426,9 @@ func TestPortalSeparatesUserAndAdministratorDestinations(t *testing.T) {
 		t.Fatalf("admin account session role = %q", accountSession.Role)
 	}
 	accountPage := performRequest(adminPortal.Handler(), http.MethodGet, "/account", nil, accountCookie)
-	if accountPage.Code != http.StatusOK || !strings.Contains(accountPage.Body.String(), "进入管理台") {
+	if accountPage.Code != http.StatusOK || !strings.Contains(accountPage.Body.String(), "进入管理台") ||
+		!strings.Contains(accountPage.Body.String(), `href="/account/identity" data-theme-transfer`) ||
+		!strings.Contains(accountPage.Body.String(), `href="/admin">管理台</a>`) {
 		t.Fatalf("admin account page = %d %q", accountPage.Code, accountPage.Body.String())
 	}
 	home := performRequest(adminPortal.Handler(), http.MethodGet, "/", nil, accountCookie)
@@ -393,6 +448,11 @@ func TestPortalSeparatesUserAndAdministratorDestinations(t *testing.T) {
 		if !strings.Contains(console.Body.String(), text) {
 			t.Fatalf("admin console omitted %q", text)
 		}
+	}
+	identitySection := performRequest(adminPortal.Handler(), http.MethodGet, "/admin?section=identity", nil, adminCookie)
+	if identitySection.Code != http.StatusOK ||
+		!strings.Contains(identitySection.Body.String(), `href="/account/identity" data-theme-transfer`) {
+		t.Fatalf("admin identity section = %d %q", identitySection.Code, identitySection.Body.String())
 	}
 }
 
@@ -533,6 +593,29 @@ func TestPortalTransfersOnlyValidatedThemeToOIDC(t *testing.T) {
 	invalid := performRequest(portal.Handler(), http.MethodGet, "/login?termlink_theme=attacker", nil)
 	if invalid.Code != http.StatusFound || flow.theme != "" {
 		t.Fatalf("invalid theme login status/theme = %d/%q", invalid.Code, flow.theme)
+	}
+}
+
+func TestValidateIdentityAccountURLFailsClosed(t *testing.T) {
+	config := Config{
+		PublicURL: "https://" + testPublicHost,
+		Issuer:    "https://identity.example/realms/termlink",
+		ClientID:  "termlink-web",
+	}
+	valid := (&testOIDCFlow{}).AccountURL()
+	if got, err := validateIdentityAccountURL(config, valid); err != nil || got == "" {
+		t.Fatalf("valid identity account URL = %q, %v", got, err)
+	}
+	for name, candidate := range map[string]string{
+		"wrong origin": "https://attacker.example/realms/termlink/account/",
+		"wrong path":   "https://identity.example/realms/termlink/admin/",
+		"bad referrer": "https://identity.example/realms/termlink/account/?referrer=attacker",
+		"bad return":   "https://identity.example/realms/termlink/account/?referrer_uri=https%3A%2F%2Fattacker.example%2Faccount",
+		"extra query":  "https://identity.example/realms/termlink/account/?redirect=https%3A%2F%2Fattacker.example",
+	} {
+		if _, err := validateIdentityAccountURL(config, candidate); err == nil {
+			t.Errorf("%s identity account URL was accepted", name)
+		}
 	}
 }
 
@@ -706,5 +789,179 @@ func TestPortalFormOriginAllowsOnlySameOriginProxyFallback(t *testing.T) {
 	request.Host = "attacker.example"
 	if portal.usesTrustedFormOrigin(request) {
 		t.Fatal("request for an unexpected host was accepted")
+	}
+}
+
+func assertIdentityLoginRedirect(t *testing.T, response *httptest.ResponseRecorder, wantHost, wantTheme string) {
+	t.Helper()
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("identity redirect status = %d, want 303; location=%q", response.Code, response.Header().Get("Location"))
+	}
+	location, err := url.Parse(response.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse identity redirect location %q: %v", response.Header().Get("Location"), err)
+	}
+	if location.Path != "/login" || (wantHost == "" && location.Host != "") || (wantHost != "" && !strings.EqualFold(location.Host, wantHost)) {
+		t.Fatalf("identity redirect location = %q, want /login host %q", response.Header().Get("Location"), wantHost)
+	}
+	query := location.Query()
+	if query.Get("return_to") != "/account/identity" {
+		t.Fatalf("identity login return_to = %q, want /account/identity", query.Get("return_to"))
+	}
+	if wantTheme == "" {
+		if _, ok := query[themeQueryParameter]; ok {
+			t.Fatalf("identity login unexpectedly propagated theme %q", query.Get(themeQueryParameter))
+		}
+	} else if query.Get(themeQueryParameter) != wantTheme {
+		t.Fatalf("identity login theme = %q, want %q", query.Get(themeQueryParameter), wantTheme)
+	}
+}
+
+func TestPortalIdentityAlwaysStartsFreshOIDCLogin(t *testing.T) {
+	tests := []struct {
+		name       string
+		themeQuery string
+		theme      string
+		session    string
+	}{
+		{name: "guest"},
+		{name: "recent session", themeQuery: "DARK", theme: "dark", session: "recent"},
+		{name: "expired session", themeQuery: "attacker", session: "expired"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			flow := &testOIDCFlow{identity: accountIdentity{Subject: "identity-subject", Username: "identity-user"}}
+			portal := newTestPortal(t, flow)
+			var sessionCookie *http.Cookie
+			switch tt.session {
+			case "recent":
+				sessionCookie, _ = completeLogin(t, portal, flow)
+			case "expired":
+				_, session := completeLogin(t, portal, flow)
+				session.AuthenticatedAtMS = portal.now().Add(-(sensitiveActionTTL + time.Second)).UnixMilli()
+				sealed, err := portal.sessionCodec.seal(session)
+				if err != nil {
+					t.Fatalf("seal expired session fixture: %v", err)
+				}
+				sessionCookie = &http.Cookie{Name: sessionCookieName, Value: sealed}
+			}
+
+			target := "/account/identity"
+			if tt.themeQuery != "" {
+				target += "?" + themeQueryParameter + "=" + url.QueryEscape(tt.themeQuery)
+			}
+			var response *httptest.ResponseRecorder
+			if sessionCookie == nil {
+				response = performRequest(portal.Handler(), http.MethodGet, target, nil)
+			} else {
+				response = performRequest(portal.Handler(), http.MethodGet, target, nil, sessionCookie)
+			}
+			assertIdentityLoginRedirect(t, response, "", tt.theme)
+		})
+	}
+}
+
+func TestPortalLoginAllowlistSealsIdentityReturnAndNormalizedTheme(t *testing.T) {
+	tests := []struct {
+		name      string
+		returnTo  string
+		wantTo    string
+		input     string
+		wantTheme string
+	}{
+		{name: "account", returnTo: "/account", wantTo: "/account", input: "DARK", wantTheme: "dark"},
+		{name: "admin", returnTo: "/admin", wantTo: "/admin", input: "light", wantTheme: "light"},
+		{name: "identity", returnTo: "/account/identity", wantTo: "/account/identity", input: "dark", wantTheme: "dark"},
+		{name: "unknown target", returnTo: "https://attacker.example/callback", wantTo: "/account", input: "dark", wantTheme: "dark"},
+		{name: "nested target", returnTo: "/account/identity?next=/admin", wantTo: "/account", input: "attacker", wantTheme: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			flow := &testOIDCFlow{}
+			portal := newTestPortal(t, flow)
+			_, state := startLoginWithParams(t, portal, flow, tt.returnTo, tt.input)
+			if state.ReturnTo != tt.wantTo {
+				t.Fatalf("sealed return_to = %q, want %q", state.ReturnTo, tt.wantTo)
+			}
+			if state.Theme != tt.wantTheme {
+				t.Fatalf("sealed theme = %q, want %q", state.Theme, tt.wantTheme)
+			}
+			if flow.theme != tt.wantTheme {
+				t.Fatalf("authorization theme = %q, want %q", flow.theme, tt.wantTheme)
+			}
+		})
+	}
+}
+
+func TestPortalCallbackPreservesIdentityThemeAndRejectsUnknownReturnTarget(t *testing.T) {
+	flow := &testOIDCFlow{identity: accountIdentity{Subject: "identity-subject", Username: "identity-user"}}
+	portal := newTestPortal(t, flow)
+	oauthCookie, state := startLoginWithParams(t, portal, flow, "/account/identity", "DARK")
+	callback := performRequest(portal.Handler(), http.MethodGet, "/auth/callback?code=production-code&state="+url.QueryEscape(state.State), nil, oauthCookie)
+	if callback.Code != http.StatusSeeOther {
+		t.Fatalf("identity callback status = %d, location=%q", callback.Code, callback.Header().Get("Location"))
+	}
+	wantURL, err := url.Parse(flow.AccountURL())
+	if err != nil {
+		t.Fatalf("parse account URL fixture: %v", err)
+	}
+	wantQuery := wantURL.Query()
+	wantQuery.Set(themeQueryParameter, "dark")
+	wantURL.RawQuery = wantQuery.Encode()
+	if got := callback.Header().Get("Location"); got != wantURL.String() {
+		t.Fatalf("identity callback location = %q, want %q", got, wantURL.String())
+	}
+
+	unknownFlow := &testOIDCFlow{identity: accountIdentity{Subject: "unknown-target-subject", Username: "unknown-target-user"}}
+	unknownPortal := newTestPortal(t, unknownFlow)
+	unknownCookie, unknownState := startLoginWithParams(t, unknownPortal, unknownFlow, "/admin?next=/attacker", "dark")
+	if unknownState.ReturnTo != "/account" {
+		t.Fatalf("unknown return_to was sealed as %q, want /account", unknownState.ReturnTo)
+	}
+	unknownCallback := performRequest(unknownPortal.Handler(), http.MethodGet, "/auth/callback?code=production-code&state="+url.QueryEscape(unknownState.State), nil, unknownCookie)
+	if unknownCallback.Code != http.StatusSeeOther || unknownCallback.Header().Get("Location") != "/account" {
+		t.Fatalf("unknown return_to callback = %d %q, want 303 /account", unknownCallback.Code, unknownCallback.Header().Get("Location"))
+	}
+}
+
+func TestPortalCallbackFallsBackForUnknownSealedReturnTarget(t *testing.T) {
+	flow := &testOIDCFlow{identity: accountIdentity{Subject: "sealed-target-subject", Username: "sealed-target-user"}}
+	portal := newTestPortal(t, flow)
+	pending := oauthState{
+		State:      "sealed-state",
+		Nonce:      "sealed-nonce",
+		Verifier:   "sealed-verifier",
+		ReturnTo:   "https://attacker.example/callback",
+		Theme:      "dark",
+		IssuedAtMS: portal.now().UnixMilli(),
+	}
+	encoded, err := portal.oauthCodec.seal(pending)
+	if err != nil {
+		t.Fatalf("seal unknown return target fixture: %v", err)
+	}
+	cookie := &http.Cookie{Name: oauthCookieName, Value: encoded}
+	callback := performRequest(portal.Handler(), http.MethodGet, "/auth/callback?code=production-code&state="+url.QueryEscape(pending.State), nil, cookie)
+	if callback.Code != http.StatusSeeOther || callback.Header().Get("Location") != "/account" {
+		t.Fatalf("unknown sealed return_to callback = %d %q, want 303 /account", callback.Code, callback.Header().Get("Location"))
+	}
+}
+
+func TestPortalIdentityCanonicalRedirectPreservesAllowlistedTargetAndTheme(t *testing.T) {
+	for _, target := range []string{
+		"/login?return_to=%2Faccount%2Fidentity&termlink_theme=DARK",
+		"/account/identity?termlink_theme=DARK",
+	} {
+		t.Run(target, func(t *testing.T) {
+			portal := newTestPortal(t, &testOIDCFlow{})
+			response := performRequestOnHost(portal.Handler(), http.MethodGet, "lucky-upstream:8080", target, nil)
+			assertIdentityLoginRedirect(t, response, testPublicHost, "dark")
+			location, err := url.Parse(response.Header().Get("Location"))
+			if err != nil {
+				t.Fatalf("parse canonical identity redirect: %v", err)
+			}
+			if location.Scheme != "https" {
+				t.Fatalf("canonical identity redirect scheme = %q, want https", location.Scheme)
+			}
+		})
 	}
 }

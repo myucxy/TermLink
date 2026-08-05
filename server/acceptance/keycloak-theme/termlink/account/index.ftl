@@ -1,4 +1,8 @@
 <#-- Keycloak 26.3.2 account-v3 parent SHA-256: 602b4bdf21d5dd386f2f8b9ee18b9d96a3054d430efabe00cea80779291a658f. Rebase this override with any Keycloak upgrade. -->
+<#assign termlinkAccountReturnUrl = referrer_uri!>
+<#if !termlinkAccountReturnUrl?has_content>
+  <#assign termlinkAccountReturnUrl = properties.logoUrl!"/account">
+</#if>
 <!doctype html>
 <html lang="${locale}">
   <head>
@@ -50,7 +54,7 @@
 
       .tl-loading-return {
         margin-top: 14px;
-        color: #3759c5;
+        color: #4455c8;
         font-size: 14px;
         font-weight: 700;
         text-decoration: none;
@@ -136,9 +140,7 @@
           <div>
             <p id="loading-text">${msg("termlinkLoadingAccount")}</p>
           </div>
-          <#if referrer_uri?has_content>
-            <a class="tl-loading-return" href="${referrer_uri}">${msg("termlinkBackToPersonalCenter")} →</a>
-          </#if>
+          <a class="tl-loading-return" href="${termlinkAccountReturnUrl}">${msg("termlinkBackToPersonalCenter")} →</a>
           <noscript><p class="tl-loading-noscript">${msg("termlinkJavascriptRequired")}</p></noscript>
         </div>
       </main>
@@ -157,6 +159,7 @@
         "locale": "${locale}",
         "referrerName": "${referrerName!""}",
         "referrerUrl": "${referrer_uri!""}",
+        "accountReturnUrl": "${termlinkAccountReturnUrl?js_string}",
         "features": {
           "isRegistrationEmailAsUsername": ${realm.registrationEmailAsUsername?c},
           "isEditUserNameAllowed": ${realm.editUsernameAllowed?c},

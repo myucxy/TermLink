@@ -270,7 +270,7 @@
   border: 1px solid var(--line-soft);
   border-radius: 12px;
   background: var(--surface);
-  box-shadow: 0 12px 34px color-mix(in srgb, var(--shadow) 22%, transparent);
+  box-shadow: 0 12px 34px color-mix(in srgb, var(--shadow-color) 22%, transparent);
 }
 
 .admin-stats small,
@@ -303,7 +303,7 @@
   border: 1px solid var(--line-soft);
   border-radius: 13px;
   background: var(--surface);
-  box-shadow: 0 14px 44px color-mix(in srgb, var(--shadow) 18%, transparent);
+  box-shadow: 0 14px 44px color-mix(in srgb, var(--shadow-color) 18%, transparent);
 }
 
 .panel-heading {

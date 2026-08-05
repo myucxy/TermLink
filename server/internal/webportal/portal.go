@@ -85,6 +85,7 @@ type oauthState struct {
 	Nonce      string `json:"nonce"`
 	Verifier   string `json:"verifier"`
 	ReturnTo   string `json:"return_to"`
+	Theme      string `json:"theme,omitempty"`
 	IssuedAtMS int64  `json:"issued_at_ms"`
 }
 
@@ -108,6 +109,7 @@ type cookieCodec struct {
 type Portal struct {
 	config       Config
 	publicOrigin *url.URL
+	identityURL  string
 	flow         oidcFlow
 	oauthCodec   cookieCodec
 	sessionCodec cookieCodec
@@ -213,6 +215,10 @@ func New(ctx context.Context, config Config) (*Portal, error) {
 }
 
 func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, error) {
+	identityURL, err := validateIdentityAccountURL(config, flow.AccountURL())
+	if err != nil {
+		return nil, err
+	}
 	parsed, err := template.New("portal").Funcs(template.FuncMap{
 		"formatTime":         formatPortalTime,
 		"formatOptionalTime": formatOptionalPortalTime,
@@ -261,6 +267,7 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 	return &Portal{
 		config:       config,
 		publicOrigin: publicOrigin,
+		identityURL:  identityURL,
 		flow:         flow,
 		oauthCodec:   oauthCodec,
 		sessionCodec: sessionCodec,
@@ -376,6 +383,7 @@ func (p *Portal) Handler() http.Handler {
 	mux.HandleFunc("GET /login", p.login)
 	mux.HandleFunc("GET /auth/callback", p.callback)
 	mux.HandleFunc("GET /account", p.account)
+	mux.HandleFunc("GET /account/identity", p.identity)
 	mux.HandleFunc("GET /admin", p.admin)
 	mux.HandleFunc("POST /admin/accounts/{id}/role", p.adminUpdateRole)
 	mux.HandleFunc("POST /admin/accounts/{id}/status", p.adminUpdateStatus)
@@ -434,8 +442,8 @@ func (p *Portal) login(w http.ResponseWriter, r *http.Request) {
 	if !p.usesPublicHost(r) {
 		target := strings.TrimRight(p.config.PublicURL, "/") + "/login"
 		query := url.Values{}
-		if r.URL.Query().Get("return_to") == "/admin" {
-			query.Set("return_to", "/admin")
+		if returnTo := normalizePortalReturnTo(r.URL.Query().Get("return_to")); returnTo != "/account" {
+			query.Set("return_to", returnTo)
 		}
 		if theme := normalizeTheme(r.URL.Query().Get(themeQueryParameter)); theme != "" {
 			query.Set(themeQueryParameter, theme)
@@ -462,15 +470,14 @@ func (p *Portal) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	challenge := sha256.Sum256([]byte(verifier))
-	returnTo := "/account"
-	if r.URL.Query().Get("return_to") == "/admin" {
-		returnTo = "/admin"
-	}
+	returnTo := normalizePortalReturnTo(r.URL.Query().Get("return_to"))
+	theme := normalizeTheme(r.URL.Query().Get(themeQueryParameter))
 	stateCookie, err := p.oauthCodec.seal(oauthState{
 		State:      state,
 		Nonce:      nonce,
 		Verifier:   verifier,
 		ReturnTo:   returnTo,
+		Theme:      theme,
 		IssuedAtMS: p.now().UnixMilli(),
 	})
 	if err != nil {
@@ -478,7 +485,6 @@ func (p *Portal) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.setCookie(w, oauthCookieName, stateCookie, p.now().Add(oauthStateTTL))
-	theme := normalizeTheme(r.URL.Query().Get(themeQueryParameter))
 	location := p.flow.AuthorizationURL(state, nonce, base64.RawURLEncoding.EncodeToString(challenge[:]), theme)
 	clear(challenge[:])
 	w.Header().Set("Cache-Control", "no-store")
@@ -550,11 +556,28 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.setCookie(w, sessionCookieName, sessionCookie, p.now().Add(webSessionTTL))
-	returnTo := pending.ReturnTo
-	if returnTo != "/admin" || !account.Role.CanOpenConsole() {
-		returnTo = "/account"
+	returnTo := "/account"
+	switch normalizePortalReturnTo(pending.ReturnTo) {
+	case "/admin":
+		if account.Role.CanOpenConsole() {
+			returnTo = "/admin"
+		}
+	case "/account/identity":
+		returnTo = addThemeToURL(p.identityURL, pending.Theme)
 	}
 	http.Redirect(w, r, returnTo, http.StatusSeeOther)
+}
+
+func (p *Portal) identity(w http.ResponseWriter, r *http.Request) {
+	target := "/login?return_to=%2Faccount%2Fidentity"
+	if theme := normalizeTheme(r.URL.Query().Get(themeQueryParameter)); theme != "" {
+		target += "&" + themeQueryParameter + "=" + url.QueryEscape(theme)
+	}
+	if !p.usesPublicHost(r) {
+		target = strings.TrimRight(p.config.PublicURL, "/") + target
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, target, http.StatusSeeOther)
 }
 
 func (p *Portal) account(w http.ResponseWriter, r *http.Request) {
@@ -578,7 +601,7 @@ func (p *Portal) account(w http.ResponseWriter, r *http.Request) {
 		Username:           session.Username,
 		Name:               session.Name,
 		Email:              session.Email,
-		IdentityAccountURL: p.flow.AccountURL(),
+		IdentityAccountURL: "/account/identity",
 		CSRF:               session.CSRF,
 		Role:               portalAccount.Role,
 		RoleLabel:          roleLabel(portalAccount.Role),
@@ -616,7 +639,7 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 		CanManageAccounts:  account.Role.CanManageAccounts(),
 		Dashboard:          dashboard,
 		RecentAuditEvents:  recentAuditEvents,
-		IdentityAccountURL: p.flow.AccountURL(),
+		IdentityAccountURL: "/account/identity",
 		PublicURL:          strings.TrimRight(p.config.PublicURL, "/"),
 		Issuer:             strings.TrimRight(p.config.Issuer, "/"),
 		Notice:             adminNotice(r.URL.Query().Get("notice")),
@@ -930,6 +953,63 @@ func normalizeTheme(value string) string {
 		return value
 	}
 	return ""
+}
+
+func normalizePortalReturnTo(value string) string {
+	switch strings.TrimSpace(value) {
+	case "/admin":
+		return "/admin"
+	case "/account/identity":
+		return "/account/identity"
+	default:
+		return "/account"
+	}
+}
+
+func validateIdentityAccountURL(config Config, value string) (string, error) {
+	issuer, err := url.Parse(strings.TrimSpace(config.Issuer))
+	if err != nil {
+		return "", errors.New("web portal identity issuer is invalid")
+	}
+	target, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || target.Scheme != "https" || target.Host == "" || target.User != nil ||
+		target.RawPath != "" || target.Fragment != "" || !strings.EqualFold(target.Scheme, issuer.Scheme) ||
+		!strings.EqualFold(target.Host, issuer.Host) {
+		return "", errors.New("web portal identity account URL must use the configured issuer origin")
+	}
+	expectedPath := strings.TrimRight(issuer.Path, "/") + "/account"
+	if strings.TrimRight(target.Path, "/") != expectedPath {
+		return "", errors.New("web portal identity account URL must use the configured realm account path")
+	}
+	query := target.Query()
+	for key := range query {
+		if key != "referrer" && key != "referrer_uri" && key != themeQueryParameter {
+			return "", errors.New("web portal identity account URL contains an unsupported query parameter")
+		}
+	}
+	if referrer := query.Get("referrer"); referrer != config.ClientID {
+		return "", errors.New("web portal identity account URL contains an invalid referrer")
+	}
+	if referrerURI := query.Get("referrer_uri"); referrerURI != strings.TrimRight(config.PublicURL, "/")+"/account" {
+		return "", errors.New("web portal identity account URL contains an invalid return target")
+	}
+	query.Del(themeQueryParameter)
+	target.RawQuery = query.Encode()
+	return target.String(), nil
+}
+
+func addThemeToURL(value, theme string) string {
+	target, err := url.Parse(value)
+	if err != nil {
+		return "/account"
+	}
+	query := target.Query()
+	query.Del(themeQueryParameter)
+	if theme = normalizeTheme(theme); theme != "" {
+		query.Set(themeQueryParameter, theme)
+	}
+	target.RawQuery = query.Encode()
+	return target.String()
 }
 
 func assertedRole(roles []string) store.Role {

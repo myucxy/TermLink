@@ -55,7 +55,9 @@
   function environmentAccountReturnURL() {
     try {
       const environment = JSON.parse(document.getElementById("environment")?.textContent || "{}");
-      return safeAccountReturnURL(environment.referrerUrl);
+      return safeAccountReturnURL(environment.referrerUrl) ||
+        safeAccountReturnURL(environment.accountReturnUrl) ||
+        safeAccountReturnURL(environment.logoUrl);
     } catch (_) {
       return null;
     }
@@ -73,7 +75,7 @@
 
   function updateAccountReturnTargets(nativeReferrer) {
     const target = themedAccountReturnURL(nativeReferrer);
-    document.querySelectorAll("[data-termlink-account-link], [data-termlink-sidebar-return]").forEach((link) => {
+    document.querySelectorAll("[data-termlink-account-link], [data-termlink-sidebar-return], [data-termlink-account-brand]").forEach((link) => {
       link.href = target;
     });
   }
@@ -84,7 +86,9 @@
       ? {
           accountAction: "返回个人中心",
           accountLabel: "个人中心",
+          accountHint: "TermLink 账号总览",
           identityDescription: "账号资料、密码、多因素认证与活跃登录",
+          identityNavLabel: "身份管理",
           identityTitle: "身份与安全",
           darkAction: "切换到深色主题",
           darkLabel: "深色主题",
@@ -94,7 +98,9 @@
       : {
           accountAction: "Back to account center",
           accountLabel: "Account center",
+          accountHint: "TermLink account overview",
           identityDescription: "Profile, password, multifactor authentication, and active sessions",
+          identityNavLabel: "Identity management",
           identityTitle: "Identity & security",
           darkAction: "Switch to dark theme",
           darkLabel: "Dark theme",
@@ -138,7 +144,9 @@
     const brand = document.querySelector('[data-testid="page-header"] .pf-v5-c-masthead__brand');
     if (!brand) return;
     brand.classList.add("tl-account-brand");
+    brand.setAttribute("data-termlink-account-brand", "");
     brand.setAttribute("aria-label", "TermLink Account Center");
+    brand.href = themedAccountReturnURL();
     if (brand.querySelector(".tl-account-brand-copy")) return;
 
     const copy = document.createElement("span");
@@ -179,6 +187,11 @@
       nativeReferrer.setAttribute("aria-hidden", "true");
       nativeReferrer.tabIndex = -1;
     }
+
+    host.querySelectorAll(".pf-v5-c-avatar").forEach((avatar) => {
+      const item = avatar.closest(".pf-v5-c-toolbar__item");
+      if (item) item.setAttribute("data-termlink-native-avatar", "");
+    });
 
     let referrer = actions.querySelector("[data-termlink-account-link]");
     if (!referrer) {
@@ -279,11 +292,9 @@
       const label = document.createElement("strong");
       label.className = "tl-account-sidebar-return-label";
       const hint = document.createElement("small");
-      hint.textContent = "TermLink";
+      hint.className = "tl-account-sidebar-return-hint";
       copy.append(label, hint);
       returnLink.append(icon, copy);
-      sidebarBody.append(returnLink);
-    } else if (returnLink !== sidebarBody.lastElementChild) {
       sidebarBody.append(returnLink);
     }
     returnLink.href = themedAccountReturnURL();
@@ -291,6 +302,27 @@
     const returnLabel = returnLink.querySelector(".tl-account-sidebar-return-label");
     if (returnLabel && returnLabel.textContent !== labels.accountLabel) {
       returnLabel.textContent = labels.accountLabel;
+    }
+    const returnHint = returnLink.querySelector(".tl-account-sidebar-return-hint");
+    if (returnHint && returnHint.textContent !== labels.accountHint) {
+      returnHint.textContent = labels.accountHint;
+    }
+
+    let sectionLabel = sidebarBody.querySelector("[data-termlink-identity-nav-label]");
+    if (!sectionLabel) {
+      sectionLabel = document.createElement("p");
+      sectionLabel.className = "tl-account-nav-section";
+      sectionLabel.setAttribute("data-termlink-identity-nav-label", "");
+    }
+    if (sectionLabel.textContent !== labels.identityNavLabel) sectionLabel.textContent = labels.identityNavLabel;
+
+    const navigation = sidebarBody.querySelector(".pf-v5-c-nav");
+    if (
+      navigation &&
+      (returnLink.nextElementSibling !== sectionLabel || sectionLabel.nextElementSibling !== navigation)
+    ) {
+      sidebarBody.insertBefore(returnLink, navigation);
+      sidebarBody.insertBefore(sectionLabel, navigation);
     }
   }
 

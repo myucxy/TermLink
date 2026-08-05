@@ -81,7 +81,10 @@ HttpOnly, SameSite browser session; access and ID tokens are not persisted in
 the browser cookie. Signing out is protected by an origin check and CSRF token.
 The Keycloak account console uses the TermLink account theme, preserves the
 same `termlink-theme` preference, and exposes a validated return link to
-`/account`.
+`/account`. The portal's allowlisted `/account/identity` bridge first renews the
+`termlink-web` OIDC session and then redirects to the configured realm Account
+Console. This keeps the product navigation and theme available even when the
+shorter Keycloak SSO session expired while the portal session remained valid.
 
 Self-service registration is enabled after `keycloak-init` has created or
 verified the managed bootstrap administrator. The public Lucky upstream remains

@@ -48,7 +48,7 @@ func TestAcceptanceRealmUsesGatedRegistrationAndAndroidNativeLogin(t *testing.T)
 	}
 	// Imports fail closed. The idempotent initializer opens registration only
 	// after it has created or verified the managed bootstrap administrator.
-	if realm.LoginTheme != "termlink-01b-v12" || realm.AccountTheme != "termlink-01b-v12" ||
+	if realm.LoginTheme != "termlink-01b-v17" || realm.AccountTheme != "termlink-01b-v17" ||
 		realm.RegistrationAllowed || realm.VerifyEmail || !realm.BruteForceProtected ||
 		realm.AccessTokenLifespan <= 0 || realm.AccessTokenLifespan > 300 ||
 		!realm.RevokeRefreshToken || realm.RefreshTokenMaxReuse != 0 {
@@ -198,24 +198,33 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 		"account theme stable action group":     `data-termlink-account-actions`,
 		"account persistent sidebar return":     `data-termlink-sidebar-return`,
 		"account sidebar return target":         `returnLink.href = themedAccountReturnURL()`,
+		"account sidebar return priority":       `sidebarBody.insertBefore(returnLink, navigation)`,
+		"account sidebar injection idempotence": `returnLink.nextElementSibling !== sectionLabel`,
+		"account identity navigation label":     `data-termlink-identity-nav-label`,
+		"account native user menu styling":      `[data-testid="page-header"] .pf-v5-c-menu-toggle`,
+		"account redundant avatar removal":      `data-termlink-native-avatar`,
 		"account desktop sidebar accessibility": `sidebar.setAttribute("aria-hidden", "false")`,
 		"account theme product brand":           `tl-account-brand-copy`,
+		"account validated brand target":        `brand.href = themedAccountReturnURL()`,
 		"account pinned parent template":        "602b4bdf21d5dd386f2f8b9ee18b9d96a3054d430efabe00cea80779291a658f",
 		"account pre-paint theme script":        `<script src="${resourceUrl}/js/theme-init.js"></script>`,
-		"account static recovery link":          `class="tl-loading-return" href="${referrer_uri}"`,
+		"account static recovery link":          `class="tl-loading-return" href="${termlinkAccountReturnUrl}"`,
+		"account static recovery fallback":      `properties.logoUrl!"/account"`,
 		"account authorization feature source":  `${(realm.userManagedAccessAllowed && isAuthorizationEnabled)?c}`,
 		"account runtime theme script":          `scripts=js/theme.js`,
+		"account absolute recovery target":      `logoUrl=https://termlink.kget.cc:8910/account`,
 		"account pre-paint stored theme":        `const storageKey = "termlink-theme"`,
 		"account pre-paint transferred theme":   `searchParams.get(transferParameter)`,
 		"account localized locale placeholder":  "defaultLocale=请选择...",
 		"account admin-aligned sidebar":         "grid-template-columns: 236px minmax(0, 1fr) !important;",
 		"account content-sized workspace":       "flex: 0 0 auto;",
+		"account opaque workspace surface":      ":not(.tl-account-page-workspace)",
 		"account redundant jump removal":        "tl-account-single-section",
 		"account theme return styling":          ".tl-account-return",
 		"account SVG theme control":             `class="theme-icon-moon"`,
 		"account SVG return control":            `tl-account-return-icon`,
-		"production image account theme":        `COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v12/`,
-		"production runtime account theme":      `-s accountTheme=termlink-01b-v12`,
+		"production image account theme":        `COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v17/`,
+		"production runtime account theme":      `-s accountTheme=termlink-01b-v17`,
 	} {
 		var source string
 		switch name {
@@ -229,17 +238,17 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 			source = zhMessages
 		case "English personal-center copy":
 			source = enMessages
-		case "account validated referrer target", "account theme fallback marker", "account theme stable action group", "account persistent sidebar return", "account sidebar return target", "account desktop sidebar accessibility", "account theme product brand", "account redundant jump removal", "account SVG theme control", "account SVG return control":
+		case "account validated referrer target", "account theme fallback marker", "account theme stable action group", "account persistent sidebar return", "account sidebar return target", "account sidebar return priority", "account sidebar injection idempotence", "account identity navigation label", "account redundant avatar removal", "account desktop sidebar accessibility", "account theme product brand", "account validated brand target", "account redundant jump removal", "account SVG theme control", "account SVG return control":
 			source = accountScript
-		case "account pinned parent template", "account pre-paint theme script", "account static recovery link", "account authorization feature source":
+		case "account pinned parent template", "account pre-paint theme script", "account static recovery link", "account static recovery fallback", "account authorization feature source":
 			source = accountTemplate
-		case "account runtime theme script":
+		case "account runtime theme script", "account absolute recovery target":
 			source = accountThemeProperties
 		case "account pre-paint stored theme", "account pre-paint transferred theme":
 			source = accountThemeInit
 		case "account localized locale placeholder":
 			source = accountZhMessages
-		case "account theme return styling", "account admin-aligned sidebar", "account content-sized workspace":
+		case "account theme return styling", "account native user menu styling", "account admin-aligned sidebar", "account content-sized workspace", "account opaque workspace surface":
 			source = accountCSS
 		case "production image account theme":
 			source = keycloakDockerfile
@@ -255,6 +264,9 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 	}
 	if strings.ContainsAny(loginTemplate+accountScript, "◐☼☾←") {
 		t.Error("identity themes must not depend on platform control glyphs")
+	}
+	if strings.Contains(accountScript+accountCSS, "data-termlink-native-account-control") {
+		t.Error("account theme must retain Keycloak's current-account and sign-out menu")
 	}
 	if strings.Contains(loginTemplate, "aria-pressed") ||
 		strings.Contains(accountScript, `setAttribute("aria-pressed"`) ||
@@ -273,8 +285,8 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 	if prePaint < 0 || entryScript < 0 || prePaint > entryScript || strings.Contains(accountTemplate, "matchMedia") {
 		t.Error("account theme must resolve the shared product preference before React without a competing system-theme listener")
 	}
-	if !strings.Contains(accountCSS, "@media (max-width: 350px)") ||
+	if !strings.Contains(accountCSS, "@media (max-width: 380px)") ||
 		!strings.Contains(accountCSS, ".tl-account-return-label {\n    display: none;\n  }") {
-		t.Error("account return label must remain visible at 390px and collapse only on extremely narrow toolbars")
+		t.Error("account return label must collapse before the English label can overflow a narrow toolbar")
 	}
 }
