@@ -660,7 +660,24 @@ type SessionRecord struct {
 }
 
 func (s *Postgres) UpsertSession(ctx context.Context, userID, deviceID uuid.UUID, item SessionRecord) error {
-	command, err := s.Pool.Exec(ctx, `INSERT INTO sessions(id,pc_id,shell_type,title_cipher,state,columns,rows,last_output_seq,ended_at) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9 FROM pcs WHERE id=$2 AND owner_user_id=$10 AND device_id=$11 ON CONFLICT(id) DO UPDATE SET title_cipher=excluded.title_cipher,state=excluded.state,columns=excluded.columns,rows=excluded.rows,last_output_seq=GREATEST(sessions.last_output_seq,excluded.last_output_seq),ended_at=excluded.ended_at WHERE sessions.pc_id=$2`, item.ID, item.PCID, item.ShellType, item.TitleCipher, item.State, item.Columns, item.Rows, int64(item.LastOutputSequence), item.EndedAt, userID, deviceID)
+	command, err := s.Pool.Exec(ctx, `
+		INSERT INTO sessions(id,pc_id,shell_type,title_cipher,state,columns,rows,last_output_seq,ended_at)
+		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9
+		FROM pcs
+		WHERE id=$2 AND owner_user_id=$10 AND device_id=$11
+		ON CONFLICT(id) DO UPDATE SET
+			title_cipher=CASE WHEN sessions.state='DELETED' THEN sessions.title_cipher ELSE excluded.title_cipher END,
+			state=CASE WHEN sessions.state IN ('EXITED','DELETED') THEN sessions.state ELSE excluded.state END,
+			columns=CASE WHEN sessions.state='DELETED' THEN sessions.columns ELSE excluded.columns END,
+			rows=CASE WHEN sessions.state='DELETED' THEN sessions.rows ELSE excluded.rows END,
+			last_output_seq=CASE WHEN sessions.state='DELETED' THEN sessions.last_output_seq ELSE GREATEST(sessions.last_output_seq,excluded.last_output_seq) END,
+			ended_at=CASE
+				WHEN sessions.state='DELETED' THEN sessions.ended_at
+				WHEN sessions.state='EXITED' THEN CASE WHEN excluded.state='EXITED' THEN COALESCE(sessions.ended_at,excluded.ended_at) ELSE sessions.ended_at END
+				WHEN excluded.state='EXITED' THEN COALESCE(excluded.ended_at,sessions.ended_at)
+				ELSE excluded.ended_at
+			END
+		WHERE sessions.pc_id=$2`, item.ID, item.PCID, item.ShellType, item.TitleCipher, item.State, item.Columns, item.Rows, int64(item.LastOutputSequence), item.EndedAt, userID, deviceID)
 	if err != nil {
 		return err
 	}

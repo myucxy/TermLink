@@ -43,7 +43,7 @@ func TestPortalRoleAuthorityProtectsLastSuperAdmin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dashboard.SchemaVersion != 7 || dashboard.Users < 2 {
+	if dashboard.SchemaVersion != 8 || dashboard.Users < 2 {
 		t.Fatalf("dashboard schema/users = %d/%d", dashboard.SchemaVersion, dashboard.Users)
 	}
 	if err := repository.UpdatePortalAccountRole(ctx, firstID, secondID, RoleSuperAdmin, "role-test-promote"); err != nil {
