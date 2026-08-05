@@ -48,7 +48,7 @@ func TestAcceptanceRealmUsesGatedRegistrationAndAndroidNativeLogin(t *testing.T)
 	}
 	// Imports fail closed. The idempotent initializer opens registration only
 	// after it has created or verified the managed bootstrap administrator.
-	if realm.LoginTheme != "termlink-01b-v8" || realm.AccountTheme != "termlink-01b-v8" ||
+	if realm.LoginTheme != "termlink-01b-v9" || realm.AccountTheme != "termlink-01b-v9" ||
 		realm.RegistrationAllowed || realm.VerifyEmail || !realm.BruteForceProtected ||
 		realm.AccessTokenLifespan <= 0 || realm.AccessTokenLifespan > 300 ||
 		!realm.RevokeRefreshToken || realm.RefreshTokenMaxReuse != 0 {
@@ -173,7 +173,7 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 		"account theme return styling":          ".tl-account-return",
 		"account SVG theme control":             `class="theme-icon-moon"`,
 		"account SVG return control":            `tl-account-return-icon`,
-		"production image account theme":        `COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v8/`,
+		"production image account theme":        `COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v9/`,
 	} {
 		var source string
 		switch name {
@@ -219,5 +219,9 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 	}
 	if !strings.Contains(loginCSS, "--text-3: #606b7d;") || !strings.Contains(accountCSS, "--tl-text-3: #606b7d;") {
 		t.Error("identity theme tertiary text must meet light-theme contrast requirements")
+	}
+	if !strings.Contains(accountCSS, "@media (max-width: 420px)") ||
+		!strings.Contains(accountCSS, ".tl-account-return-label {\n    display: none;\n  }") {
+		t.Error("account return action must collapse to its accessible icon before the narrow toolbar can clip its label")
 	}
 }

@@ -517,15 +517,10 @@ textarea:focus-visible {
   }
 
   .tl-account-return {
-    flex: 0 0 auto;
-    white-space: nowrap;
-  }
-}
-
-@media (max-width: 340px) {
-  .tl-account-return {
     width: 38px;
+    flex: 0 0 auto;
     padding-inline: 0;
+    white-space: nowrap;
   }
 
   .tl-account-return-label {
