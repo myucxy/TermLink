@@ -349,6 +349,9 @@ func TestPortalSeparatesUserAndAdministratorDestinations(t *testing.T) {
 	if denied.Code != http.StatusForbidden || !strings.Contains(denied.Body.String(), "无权访问管理台") {
 		t.Fatalf("regular user admin response = %d %q", denied.Code, denied.Body.String())
 	}
+	if !strings.Contains(denied.Body.String(), `href="/account">返回个人中心</a>`) {
+		t.Fatal("administrator error response must provide a direct return to the account center")
+	}
 
 	adminFlow := &testOIDCFlow{identity: accountIdentity{
 		Subject: "admin-subject", Username: "admin", Name: "TermLink Administrator",
