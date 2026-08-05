@@ -148,7 +148,7 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 		t.Fatalf("home status = %d, want 200", recorder.Code)
 	}
 	body := recorder.Body.String()
-	for _, text := range []string{"离开电脑", "真实终端", "端到端加密", "安全登录"} {
+	for _, text := range []string{"离开电脑", "真实终端", "端到端加密", "安全登录", "/assets/termlink-app-icon.svg"} {
 		if !strings.Contains(body, text) {
 			t.Fatalf("home page omitted %q", text)
 		}
@@ -168,6 +168,13 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 	css := performRequest(portal.Handler(), http.MethodGet, "/assets/site.css", nil)
 	if css.Code != http.StatusOK || !strings.HasPrefix(css.Header().Get("Content-Type"), "text/css") || css.Body.Len() < 1000 {
 		t.Fatalf("embedded stylesheet response is incomplete: status=%d bytes=%d", css.Code, css.Body.Len())
+	}
+	for _, asset := range []string{"/assets/termlink-app-icon.svg", "/assets/termlink-favicon.svg"} {
+		icon := performRequest(portal.Handler(), http.MethodGet, asset, nil)
+		if icon.Code != http.StatusOK || icon.Header().Get("Content-Type") != "image/svg+xml" ||
+			!strings.Contains(icon.Body.String(), "TermLink") {
+			t.Fatalf("embedded brand asset %q is incomplete: status=%d bytes=%d", asset, icon.Code, icon.Body.Len())
+		}
 	}
 }
 
@@ -255,15 +262,15 @@ func TestPortalRejectsCrossSiteAndTamperedSessions(t *testing.T) {
 	}
 
 	tampered := *sessionCookie
-	last := len(tampered.Value) - 1
-	if last < 0 {
+	index := len(tampered.Value) / 2
+	if index < 0 || index >= len(tampered.Value) {
 		t.Fatal("session cookie was empty")
 	}
 	replacement := byte('A')
-	if tampered.Value[last] == replacement {
+	if tampered.Value[index] == replacement {
 		replacement = 'B'
 	}
-	tampered.Value = tampered.Value[:last] + string(replacement)
+	tampered.Value = tampered.Value[:index] + string(replacement) + tampered.Value[index+1:]
 	account := performRequest(portal.Handler(), http.MethodGet, "/account", nil, &tampered)
 	if account.Code != http.StatusSeeOther || account.Header().Get("Location") != "/login" {
 		t.Fatalf("tampered session response = %d %q, want 303 /login", account.Code, account.Header().Get("Location"))

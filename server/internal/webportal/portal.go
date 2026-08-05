@@ -34,7 +34,7 @@ const (
 	maximumCookieSize = 3800
 )
 
-//go:embed assets/*.html assets/*.css
+//go:embed assets/*.html assets/*.css assets/*.svg
 var portalAssets embed.FS
 
 // Config contains only the public OIDC metadata and the server-held cookie key.
@@ -92,6 +92,8 @@ type Portal struct {
 	sessionCodec cookieCodec
 	templates    *template.Template
 	styles       []byte
+	appIcon      []byte
+	favicon      []byte
 }
 
 type productionOIDCFlow struct {
@@ -169,6 +171,14 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 	if err != nil {
 		return nil, fmt.Errorf("read web portal styles: %w", err)
 	}
+	appIcon, err := portalAssets.ReadFile("assets/termlink-app-icon.svg")
+	if err != nil {
+		return nil, fmt.Errorf("read web portal app icon: %w", err)
+	}
+	favicon, err := portalAssets.ReadFile("assets/termlink-favicon.svg")
+	if err != nil {
+		return nil, fmt.Errorf("read web portal favicon: %w", err)
+	}
 	oauthCodec, err := newCookieCodec(config.CookieKey, oauthCookieName)
 	if err != nil {
 		return nil, err
@@ -188,6 +198,8 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 		sessionCodec: sessionCodec,
 		templates:    parsed,
 		styles:       styles,
+		appIcon:      appIcon,
+		favicon:      favicon,
 	}, nil
 }
 
@@ -278,6 +290,8 @@ func (p *Portal) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", p.home)
 	mux.HandleFunc("GET /assets/site.css", p.siteCSS)
+	mux.HandleFunc("GET /assets/termlink-app-icon.svg", p.svgAsset(p.appIcon))
+	mux.HandleFunc("GET /assets/termlink-favicon.svg", p.svgAsset(p.favicon))
 	mux.HandleFunc("GET /login", p.login)
 	mux.HandleFunc("GET /auth/callback", p.callback)
 	mux.HandleFunc("GET /account", p.account)
@@ -300,6 +314,15 @@ func (p *Portal) siteCSS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(p.styles)
+}
+
+func (p *Portal) svgAsset(contents []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/svg+xml")
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(contents)
+	}
 }
 
 func (p *Portal) login(w http.ResponseWriter, r *http.Request) {
