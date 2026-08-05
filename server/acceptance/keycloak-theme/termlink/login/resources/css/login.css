@@ -7,7 +7,7 @@
   --surface-3: #e9edf5;
   --text: #151922;
   --text-2: #586477;
-  --text-3: #7a8494;
+  --text-3: #606b7d;
   --border: #d4dae5;
   --border-soft: #e4e8ef;
   --accent: #5566dd;
@@ -31,7 +31,7 @@ html[data-theme="light"] {
   --surface-3: #e9edf5;
   --text: #151922;
   --text-2: #586477;
-  --text-3: #7a8494;
+  --text-3: #606b7d;
   --border: #d4dae5;
   --border-soft: #e4e8ef;
   --accent: #5566dd;
@@ -53,7 +53,7 @@ html[data-theme="dark"] {
   --surface-3: #202735;
   --text: #f1f4f8;
   --text-2: #a3adbd;
-  --text-3: #737f92;
+  --text-3: #8792a3;
   --border: #273041;
   --border-soft: #1c2431;
   --accent: #8594ff;
@@ -76,7 +76,7 @@ html[data-theme="dark"] {
     --surface-3: #202735;
     --text: #f1f4f8;
     --text-2: #a3adbd;
-    --text-3: #737f92;
+    --text-3: #8792a3;
     --border: #273041;
     --border-soft: #1c2431;
     --accent: #8594ff;
@@ -246,17 +246,34 @@ dd {
 }
 
 .identity-account-link-icon {
+  width: 15px;
+  height: 15px;
+  display: inline-grid;
+  place-items: center;
   color: var(--accent-2);
-  font: 700 14px/1 var(--font-mono);
 }
 
 .theme-toggle-icon {
-  width: 1.1em;
+  width: 15px;
+  height: 15px;
   display: inline-grid;
   place-items: center;
-  font-size: 14px;
-  line-height: 1;
 }
+
+.identity-account-link-icon svg,
+.theme-toggle-icon svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.theme-icon-sun { display: none; }
+html[data-theme="dark"] .theme-icon-moon { display: none; }
+html[data-theme="dark"] .theme-icon-sun { display: inline; }
 
 .theme-toggle-label {
   white-space: nowrap;

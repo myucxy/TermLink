@@ -34,11 +34,11 @@
     <div class="identity-title-actions">
       <span class="identity-secure-origin"><span class="lock-icon" aria-hidden="true"></span>${msg('termlinkVerifiedOrigin')}</span>
       <a class="identity-account-link" href="/account" aria-label="${msg('termlinkBackToPersonalCenter')}">
-        <span class="identity-account-link-icon" aria-hidden="true">&#8592;</span>
+        <span class="identity-account-link-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M19 12H5m6-6-6 6 6 6"/></svg></span>
         <span>${msg('termlinkPersonalCenter')}</span>
       </a>
-      <button class="theme-toggle" type="button" data-theme-toggle aria-label="${msg('termlinkThemeToggle')}" title="${msg('termlinkThemeToggle')}" aria-pressed="false">
-        <span class="theme-toggle-icon" aria-hidden="true">◐</span>
+      <button class="theme-toggle" type="button" data-theme-toggle aria-label="${msg('termlinkThemeToggle')}" title="${msg('termlinkThemeToggle')}">
+        <span class="theme-toggle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path class="theme-icon-moon" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/><g class="theme-icon-sun"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></g></svg></span>
         <span class="theme-toggle-label">${msg('termlinkTheme')}</span>
       </button>
       <#if realm.internationalizationEnabled && locale.supported?size gt 1>

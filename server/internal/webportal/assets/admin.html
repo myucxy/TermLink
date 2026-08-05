@@ -7,10 +7,10 @@
   <meta name="color-scheme" content="light dark">
   <title>{{.SectionTitle}} · TermLink Server Console</title>
   <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
-  <script src="/assets/theme-init.js?v=01b-v3"></script>
-  <link rel="stylesheet" href="/assets/site.css?v=01b-v3">
-  <link rel="stylesheet" href="/assets/admin.css?v=01b-v3">
-  <script src="/assets/theme.js?v=01b-v3" defer></script>
+  <script src="/assets/theme-init.js?v=01b-v8"></script>
+  <link rel="stylesheet" href="/assets/site.css?v=01b-v8">
+  <link rel="stylesheet" href="/assets/admin.css?v=01b-v8">
+  <script src="/assets/theme.js?v=01b-v8" defer></script>
 </head>
 <body class="admin-body">
   <div class="admin-shell">
@@ -50,7 +50,7 @@
         </div>
         <div class="admin-top-actions">
           <button class="button button-quiet theme-toggle admin-theme-toggle" type="button" data-theme-toggle aria-label="切换深浅主题" title="切换深浅主题">
-            <span class="theme-toggle-icon" aria-hidden="true">◐</span><span class="theme-toggle-label">主题</span>
+            <span class="theme-toggle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path class="theme-icon-moon" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/><g class="theme-icon-sun"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></g></svg></span><span class="theme-toggle-label">主题</span>
           </button>
           <a class="button button-quiet admin-account-link" href="/account">返回个人中心</a>
         </div>
@@ -69,7 +69,7 @@
         </div>
         <div class="admin-grid">
           <article class="admin-panel privacy-panel">
-            <div class="panel-heading"><div><p class="eyebrow">E2EE BOUNDARY</p><h2>正文不可见</h2></div><span class="icon-badge" aria-hidden="true">⌁</span></div>
+            <div class="panel-heading"><div><p class="eyebrow">E2EE BOUNDARY</p><h2>正文不可见</h2></div><span class="icon-badge" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.7 2.8 8 7 10 4.2-2 7-5.3 7-10V6zM9 12l2 2 4-4"/></svg></span></div>
             <p>管理台只读取账号、设备、路由、序号和审计元数据。终端标题、命令、输出和历史明文不会进入服务端页面或数据库。</p>
             <dl class="fact-grid">
               <div><dt>Schema</dt><dd>v{{.Dashboard.SchemaVersion}}</dd></div>
@@ -187,7 +187,7 @@
 
       {{if eq .Section "redemptions"}}
       <section class="admin-panel disabled-feature" aria-labelledby="redemption-heading">
-        <span class="icon-badge" aria-hidden="true">◇</span><p class="eyebrow">NOT ENABLED</p><h2 id="redemption-heading">兑换码不在当前发布范围</h2>
+        <span class="icon-badge" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8.5 8.5 7 7m0-7-7 7"/></svg></span><p class="eyebrow">NOT ENABLED</p><h2 id="redemption-heading">兑换码不在当前发布范围</h2>
         <p>当前生产 Schema 没有兑换码表或兑换 API，因此控制台不会展示伪造批次、虚构兑换数据或不可用按钮。启用该能力前需先完成代码哈希、一次性兑换、批次停用、速率限制和审计设计。</p>
         <a class="button button-quiet" href="/admin?section=billing">返回订阅与权益</a>
       </section>

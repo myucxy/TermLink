@@ -48,7 +48,7 @@ func TestAcceptanceRealmUsesGatedRegistrationAndAndroidNativeLogin(t *testing.T)
 	}
 	// Imports fail closed. The idempotent initializer opens registration only
 	// after it has created or verified the managed bootstrap administrator.
-	if realm.LoginTheme != "termlink-01b-v6" || realm.AccountTheme != "termlink-01b-v6" ||
+	if realm.LoginTheme != "termlink-01b-v8" || realm.AccountTheme != "termlink-01b-v8" ||
 		realm.RegistrationAllowed || realm.VerifyEmail || !realm.BruteForceProtected ||
 		realm.AccessTokenLifespan <= 0 || realm.AccessTokenLifespan > 300 ||
 		!realm.RevokeRefreshToken || realm.RefreshTokenMaxReuse != 0 {
@@ -160,6 +160,8 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 		"login pre-paint theme script":          `src="${url.resourcesPath}/js/theme-init.js"`,
 		"login pre-paint stored theme":          `localStorage.getItem("termlink-theme")`,
 		"login theme responsive account action": ".identity-account-link",
+		"login SVG theme control":               `class="theme-icon-moon"`,
+		"login SVG account return":              `<span class="identity-account-link-icon" aria-hidden="true"><svg`,
 		"Chinese personal-center copy":          "termlinkBackToPersonalCenter=返回个人中心",
 		"English personal-center copy":          "termlinkBackToPersonalCenter=Back to account center",
 		"account theme fallback target":         `referrer.href = "/account"`,
@@ -169,11 +171,13 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 		"account pre-paint script order":        `scripts=js/theme-init.js js/theme.js`,
 		"account pre-paint stored theme":        `localStorage.getItem("termlink-theme")`,
 		"account theme return styling":          ".tl-account-return",
-		"production image account theme":        `COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v6/`,
+		"account SVG theme control":             `class="theme-icon-moon"`,
+		"account SVG return control":            `tl-account-return-icon`,
+		"production image account theme":        `COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v8/`,
 	} {
 		var source string
 		switch name {
-		case "login template account target", "login template accessible label", "login pre-paint theme script":
+		case "login template account target", "login template accessible label", "login pre-paint theme script", "login SVG theme control", "login SVG account return":
 			source = loginTemplate
 		case "login pre-paint stored theme":
 			source = loginThemeInit
@@ -183,7 +187,7 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 			source = zhMessages
 		case "English personal-center copy":
 			source = enMessages
-		case "account theme fallback target", "account theme fallback marker", "account theme stable action group", "account theme product brand":
+		case "account theme fallback target", "account theme fallback marker", "account theme stable action group", "account theme product brand", "account SVG theme control", "account SVG return control":
 			source = accountScript
 		case "account pre-paint script order":
 			source = accountThemeProperties
@@ -200,5 +204,20 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 	}
 	if strings.Contains(acceptanceCompose, "../acceptance/keycloak-theme/termlink:/opt/keycloak/themes/") {
 		t.Error("production acceptance must exercise the identity theme baked into the Keycloak image")
+	}
+	if strings.ContainsAny(loginTemplate+accountScript, "◐☼☾←") {
+		t.Error("identity themes must not depend on platform control glyphs")
+	}
+	if strings.Contains(loginTemplate, "aria-pressed") ||
+		strings.Contains(accountScript, `setAttribute("aria-pressed"`) ||
+		strings.Contains(read("../../acceptance/keycloak-theme/termlink/login/resources/js/theme.js"), `setAttribute("aria-pressed"`) {
+		t.Error("identity theme action buttons must not expose toggle-button pressed state")
+	}
+	if !strings.Contains(accountScript, `nativeReferrer.removeAttribute("aria-hidden")`) ||
+		strings.Index(accountScript, "const host = findAccountActionHost();") > strings.Index(accountScript, `nativeReferrer.setAttribute("aria-hidden", "true")`) {
+		t.Error("account return action must preserve the native referrer until its custom host is available")
+	}
+	if !strings.Contains(loginCSS, "--text-3: #606b7d;") || !strings.Contains(accountCSS, "--tl-text-3: #606b7d;") {
+		t.Error("identity theme tertiary text must meet light-theme contrast requirements")
 	}
 }

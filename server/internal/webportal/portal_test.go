@@ -276,10 +276,67 @@ func TestPortalTemplatesApplyThemeBeforeStyles(t *testing.T) {
 			t.Fatal(err)
 		}
 		html := string(data)
-		initIndex := strings.Index(html, `/assets/theme-init.js?v=01b-v3`)
-		styleIndex := strings.Index(html, `/assets/site.css?v=01b-v3`)
+		initIndex := strings.Index(html, `/assets/theme-init.js?v=01b-v8`)
+		styleIndex := strings.Index(html, `/assets/site.css?v=01b-v8`)
 		if initIndex < 0 || styleIndex < 0 || initIndex > styleIndex {
 			t.Errorf("%s must restore the selected theme before loading product styles", name)
+		}
+	}
+}
+
+func TestPortalAccountResponsiveAndSVGControlContract(t *testing.T) {
+	readAsset := func(name string) string {
+		t.Helper()
+		data, err := portalAssets.ReadFile("assets/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+
+	siteCSS := readAsset("site.css")
+	for name, contract := range map[string]string{
+		"small-desktop hero breakpoint":   `@media (max-width: 1280px)`,
+		"account tablet breakpoint":       `@media (max-width: 940px)`,
+		"tablet hero stacking":            `.hero-copy { width: 100%; max-width: 680px; }`,
+		"flow-positioned tablet terminal": `margin: 42px 0 0 auto;`,
+		"account shrinkable workspace":    `min-width: 0;`,
+		"long identity wrapping":          `overflow-wrap: anywhere;`,
+		"long display-name wrapping":      `.profile-panel strong`,
+		"accessible tertiary text":        `--text-3: #606b7d;`,
+	} {
+		if !strings.Contains(siteCSS, contract) {
+			t.Errorf("%s is missing", name)
+		}
+	}
+
+	for _, name := range []string{"home.html", "account.html", "admin.html", "error.html"} {
+		html := readAsset(name)
+		if !strings.Contains(html, `class="theme-icon-moon"`) || !strings.Contains(html, `class="theme-icon-sun"`) {
+			t.Errorf("%s must use the shared SVG theme icon", name)
+		}
+		if strings.ContainsAny(html, "◐☼☾") {
+			t.Errorf("%s must not depend on platform theme glyphs", name)
+		}
+	}
+
+	adminHTML := readAsset("admin.html")
+	if !strings.Contains(adminHTML, `<span class="icon-badge" aria-hidden="true"><svg`) || strings.ContainsAny(adminHTML, "⌁◇") {
+		t.Error("administrator decorative badges must use product SVG icons")
+	}
+	if strings.ContainsAny(readAsset("theme.js"), "☼☾") {
+		t.Error("theme behavior must not rewrite controls with platform glyphs")
+	}
+	if !strings.Contains(readAsset("admin.css"), "scrollbar-width: thin;") ||
+		!strings.Contains(adminHTML, `/assets/admin.css?v=01b-v8`) {
+		t.Error("mobile administrator navigation must use the versioned product scrollbar styling")
+	}
+	if strings.Contains(readAsset("theme.js"), `setAttribute("aria-pressed"`) {
+		t.Error("theme action buttons must not expose toggle-button pressed state")
+	}
+	for _, name := range []string{"home.html", "account.html", "admin.html", "error.html"} {
+		if strings.Contains(readAsset(name), "aria-pressed") {
+			t.Errorf("%s theme action must not expose toggle-button pressed state", name)
 		}
 	}
 }

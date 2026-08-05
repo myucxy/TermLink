@@ -7,7 +7,7 @@ html[data-theme="light"] {
   --tl-surface-2: #f7f8fb;
   --tl-text: #151922;
   --tl-text-2: #586477;
-  --tl-text-3: #7a8494;
+  --tl-text-3: #606b7d;
   --tl-border: #d4dae5;
   --tl-border-soft: #e4e8ef;
   --tl-accent: #5566dd;
@@ -40,7 +40,7 @@ html.pf-v5-theme-dark[data-theme="dark"] {
   --tl-surface-2: #171c26;
   --tl-text: #f1f4f8;
   --tl-text-2: #a3adbd;
-  --tl-text-3: #737f92;
+  --tl-text-3: #8792a3;
   --tl-border: #273041;
   --tl-border-soft: #1c2431;
   --tl-accent: #8594ff;
@@ -183,8 +183,11 @@ body {
 }
 
 .tl-account-return-icon {
+  width: 16px;
+  height: 16px;
+  display: inline-grid;
+  place-items: center;
   color: var(--tl-accent-2);
-  font: 700 15px/1 "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
 }
 
 .tl-account-actions {
@@ -201,11 +204,26 @@ body {
 }
 
 .tl-account-theme-toggle-icon {
-  width: 1.1em;
+  width: 16px;
+  height: 16px;
   display: inline-grid;
   place-items: center;
-  font-size: 15px;
 }
+
+.tl-account-return-icon svg,
+.tl-account-theme-toggle-icon svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.theme-icon-sun { display: none; }
+html[data-theme="dark"] .theme-icon-moon { display: none; }
+html[data-theme="dark"] .theme-icon-sun { display: inline; }
 
 .pf-v5-c-page__sidebar {
   width: 236px;

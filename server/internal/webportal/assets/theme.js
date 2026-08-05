@@ -48,12 +48,10 @@
     const labels = labelsFor(theme);
     document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
       const label = button.querySelector(".theme-toggle-label");
-      const icon = button.querySelector(".theme-toggle-icon");
       if (label) label.textContent = labels.label;
-      if (icon) icon.textContent = theme === DARK ? "☼" : "☾";
       button.setAttribute("aria-label", labels.aria);
       button.setAttribute("title", labels.aria);
-      button.setAttribute("aria-pressed", String(theme === LIGHT));
+      button.removeAttribute("aria-pressed");
       button.dataset.theme = theme;
     });
   }

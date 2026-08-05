@@ -8,7 +8,7 @@
   --line-soft: rgba(84, 98, 122, 0.17);
   --text: #151922;
   --text-2: #586477;
-  --text-3: #7a8494;
+  --text-3: #606b7d;
   --accent: #5566dd;
   --accent-strong: #4455c8;
   --accent-2: #168f87;
@@ -41,7 +41,7 @@ html[data-theme="light"] {
   --line-soft: rgba(84, 98, 122, 0.17);
   --text: #151922;
   --text-2: #586477;
-  --text-3: #7a8494;
+  --text-3: #606b7d;
   --accent: #5566dd;
   --accent-strong: #4455c8;
   --accent-2: #168f87;
@@ -70,7 +70,7 @@ html[data-theme="dark"] {
   --line-soft: #1c2431;
   --text: #f1f4f8;
   --text-2: #a3adbd;
-  --text-3: #737f92;
+  --text-3: #8792a3;
   --accent: #8594ff;
   --accent-strong: #aeb7ff;
   --accent-2: #52d2c7;
@@ -100,7 +100,7 @@ html[data-theme="dark"] {
     --line-soft: #1c2431;
     --text: #f1f4f8;
     --text-2: #a3adbd;
-    --text-3: #737f92;
+    --text-3: #8792a3;
     --accent: #8594ff;
     --accent-strong: #aeb7ff;
     --accent-2: #52d2c7;
@@ -286,12 +286,25 @@ a:focus-visible {
 }
 
 .theme-toggle-icon {
-  width: 1.1em;
+  width: 16px;
+  height: 16px;
   display: inline-grid;
   place-items: center;
-  font-size: 15px;
-  line-height: 1;
 }
+
+.theme-toggle-icon svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.theme-icon-sun { display: none; }
+html[data-theme="dark"] .theme-icon-moon { display: none; }
+html[data-theme="dark"] .theme-icon-sun { display: inline; }
 
 .theme-toggle-label {
   white-space: nowrap;
@@ -649,6 +662,7 @@ a:focus-visible {
 
 .account-context h1 {
   font-size: clamp(40px, 4vw, 48px);
+  overflow-wrap: anywhere;
 }
 
 .account-context > p:not(.eyebrow) {
@@ -663,6 +677,7 @@ a:focus-visible {
 }
 
 .account-workspace {
+  min-width: 0;
   padding: 44px;
   border: 1px solid var(--line);
   border-radius: 17px;
@@ -675,6 +690,13 @@ a:focus-visible {
   align-items: start;
   justify-content: space-between;
   gap: 22px;
+}
+
+.account-title-row > div,
+.profile-panel > div:last-child,
+.account-actions article > div,
+.account-actions article > div > div {
+  min-width: 0;
 }
 
 .account-title-row h2 {
@@ -725,9 +747,14 @@ a:focus-visible {
   display: grid;
 }
 
+.profile-panel strong {
+  overflow-wrap: anywhere;
+}
+
 .profile-panel span {
   color: var(--text-3);
   font-size: 13px;
+  overflow-wrap: anywhere;
 }
 
 .account-actions {
@@ -780,6 +807,7 @@ a:focus-visible {
   margin: 0;
   color: var(--text-2);
   font-size: 13px;
+  overflow-wrap: anywhere;
 }
 
 .account-footer-actions {
@@ -833,29 +861,33 @@ a:focus-visible {
   color: var(--text-2);
 }
 
-@media (max-width: 900px) {
-  .site-nav { display: none; }
-
+@media (max-width: 1280px) {
   .hero {
     display: block;
-    min-height: 880px;
-    padding-top: 58px;
+    min-height: auto;
+    padding: 58px 0 90px;
   }
 
   .hero-copy { width: 100%; max-width: 680px; }
   .hero h1 { font-size: 64px; }
   .hero-kicker { font-size: 34px; }
   .terminal-card {
+    position: relative;
     top: auto;
-    right: 0;
-    bottom: 76px;
+    right: auto;
+    bottom: auto;
     width: 88%;
-    opacity: 0.62;
+    margin: 42px 0 0 auto;
+    opacity: 1;
     transform: none;
   }
-  .split-section { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 940px) {
   .account-shell { grid-template-columns: 1fr; }
   .account-context { max-width: 680px; }
+  .site-nav { display: none; }
+  .split-section { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 680px) {

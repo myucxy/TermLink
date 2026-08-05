@@ -58,12 +58,9 @@
     const labels = translatedLabels();
     button.setAttribute("aria-label", dark ? labels.lightAction : labels.darkAction);
     button.setAttribute("title", dark ? labels.lightAction : labels.darkAction);
-    button.setAttribute("aria-pressed", String(!dark));
-    const icon = button.querySelector(".tl-account-theme-toggle-icon");
+    button.removeAttribute("aria-pressed");
     const label = button.querySelector(".tl-account-theme-toggle-label");
-    const nextIcon = dark ? "☼" : "☾";
     const nextLabel = dark ? labels.lightLabel : labels.darkLabel;
-    if (icon && icon.textContent !== nextIcon) icon.textContent = nextIcon;
     if (label && label.textContent !== nextLabel) label.textContent = nextLabel;
   }
 
@@ -106,23 +103,30 @@
   function ensureAccountActions() {
     const labels = translatedLabels();
     const nativeReferrer = document.querySelector('[data-testid="referrer-link"]');
-    if (nativeReferrer) {
-      nativeReferrer.setAttribute("data-termlink-native-referrer", "");
-      nativeReferrer.setAttribute("aria-hidden", "true");
-      nativeReferrer.tabIndex = -1;
+    const host = findAccountActionHost();
+    if (!host) {
+      if (nativeReferrer) {
+        nativeReferrer.removeAttribute("data-termlink-native-referrer");
+        nativeReferrer.removeAttribute("aria-hidden");
+        nativeReferrer.removeAttribute("tabindex");
+      }
+      return;
     }
+
     let actions = document.querySelector("[data-termlink-account-actions]");
     if (!actions) {
-      const host = findAccountActionHost();
-      if (!host) return;
       actions = document.createElement("div");
       actions.className = "tl-account-actions";
       actions.setAttribute("data-termlink-account-actions", "");
       host.append(actions);
     } else {
-      const host = findAccountActionHost();
-      if (!host) return;
       if (actions.parentElement !== host || actions !== host.lastElementChild) host.append(actions);
+    }
+
+    if (nativeReferrer) {
+      nativeReferrer.setAttribute("data-termlink-native-referrer", "");
+      nativeReferrer.setAttribute("aria-hidden", "true");
+      nativeReferrer.tabIndex = -1;
     }
 
     let referrer = actions.querySelector("[data-termlink-account-link]");
@@ -139,6 +143,7 @@
     if (
       referrer.dataset.termlinkLabel !== labels.accountLabel ||
       !currentIcon ||
+      !currentIcon.querySelector("svg") ||
       !currentLabel ||
       currentLabel.textContent !== labels.accountLabel
     ) {
@@ -146,7 +151,7 @@
       const returnIcon = document.createElement("span");
       returnIcon.className = "tl-account-return-icon";
       returnIcon.setAttribute("aria-hidden", "true");
-      returnIcon.textContent = "←";
+      returnIcon.innerHTML = '<svg viewBox="0 0 24 24" focusable="false"><path d="M19 12H5m6-6-6 6 6 6"/></svg>';
       const returnLabel = document.createElement("span");
       returnLabel.className = "tl-account-return-label";
       returnLabel.textContent = labels.accountLabel;
@@ -167,6 +172,7 @@
     const icon = document.createElement("span");
     icon.className = "tl-account-theme-toggle-icon";
     icon.setAttribute("aria-hidden", "true");
+    icon.innerHTML = '<svg viewBox="0 0 24 24" focusable="false"><path class="theme-icon-moon" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/><g class="theme-icon-sun"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></g></svg>';
     const label = document.createElement("span");
     label.className = "tl-account-theme-toggle-label";
     button.append(icon, label);
