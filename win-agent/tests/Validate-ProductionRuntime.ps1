@@ -348,6 +348,21 @@ try {
     if ($runtime.GetType().GetField('socketSendGate', [Reflection.BindingFlags]'Instance,NonPublic').GetValue($runtime).CurrentCount -ne 1) {
         throw 'Production runtime WebSocket send gate was not initialized.'
     }
+    $pairingChallengeField = $runtime.GetType().GetField(
+        'pairingChallenge', [Reflection.BindingFlags]'Instance,NonPublic')
+    $snapshotStatus = Get-InternalMethod $runtime.GetType() 'SnapshotStatus'
+    $pairingChallengeType = $pairingChallengeField.FieldType
+    $pairingChallenge = [Activator]::CreateInstance($pairingChallengeType)
+    $pairingChallengeType.GetProperty('TargetFingerprint').SetValue($pairingChallenge, 'validation-fingerprint')
+    $pairingChallengeType.GetProperty('Permission').SetValue($pairingChallenge, 'CONTROL')
+    $pairingChallengeField.SetValue($runtime, $pairingChallenge)
+    $pairingSnapshot = $snapshotStatus.Invoke($runtime, [object[]]@()).PairingChallenge
+    if ($null -eq $pairingSnapshot -or
+        $pairingSnapshot.TargetFingerprint -ne 'validation-fingerprint' -or
+        $pairingSnapshot.Permission -ne 'CONTROL') {
+        throw 'Production status snapshot dropped pairing authorization metadata.'
+    }
+    $pairingChallengeField.SetValue($runtime, $null)
     $httpProofMethod = $runtime.GetType().GetMethods([Reflection.BindingFlags]'Instance,NonPublic') |
         Where-Object {
             $_.Name -eq 'AddProofHeaders' -and

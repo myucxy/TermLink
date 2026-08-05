@@ -562,6 +562,8 @@ namespace TermLink.Agent
                         ChallengeId = pairingChallenge.ChallengeId,
                         TargetDeviceId = pairingChallenge.TargetDeviceId,
                         TargetName = pairingChallenge.TargetName,
+                        TargetFingerprint = pairingChallenge.TargetFingerprint,
+                        Permission = pairingChallenge.Permission,
                         Code = pairingChallenge.Code,
                         ChallengeNonce = pairingChallenge.ChallengeNonce,
                         ExpiresAtUtc = pairingChallenge.ExpiresAtUtc
