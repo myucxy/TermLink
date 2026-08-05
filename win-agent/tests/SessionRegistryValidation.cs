@@ -44,6 +44,8 @@ namespace TermLink.Agent
                 ValidateRemoteControlDispatch();
                 ValidateCompletedBufferRecovery(Path.Combine(bufferRoot, "completed-recovery"));
                 ValidateLiveInterruptedLifecycle(Path.Combine(bufferRoot, "live-interrupted"));
+                ValidateControlledInterruptedLifecycle(Path.Combine(bufferRoot, "controlled-interrupted"));
+                ValidateRestartPreservesWithoutInterruption(Path.Combine(bufferRoot, "restart-preserves"));
                 ValidateStopFailurePaths(Path.Combine(bufferRoot, "failure-paths"));
                 ValidateRestartFailurePath(Path.Combine(bufferRoot, "restart-failure"));
                 var controlPipe = "termlink-registry-control-" + Guid.NewGuid().ToString("N");
@@ -545,6 +547,135 @@ namespace TermLink.Agent
             finally
             {
                 lost.Dispose();
+            }
+        }
+
+        private static void ValidateControlledInterruptedLifecycle(string bufferRoot)
+        {
+            Directory.CreateDirectory(bufferRoot);
+            var committed = new List<LocalFrame>();
+            var fixture = LostHostFixture.Start();
+            try
+            {
+                using (var registry = new SessionRegistry(
+                    bufferRoot,
+                    1200,
+                    4 * 1024 * 1024,
+                    20,
+                    delegate(ManagedShellType shellType, LocalFrame frame)
+                    {
+                        Require(shellType == ManagedShellType.Custom,
+                            "Controlled stop callback changed its Shell type.");
+                        lock (committed) committed.Add(frame);
+                    }))
+                {
+                    string error;
+                    Require(registry.TryRegister(fixture.CreateRegistration(), out error),
+                        "Controlled stop fixture registration failed: " + error);
+                    WaitUntil(delegate
+                    {
+                        return registry.GetSummaries().Any(item =>
+                            item.SessionId == fixture.SessionId && item.LastSequence >= 2);
+                    }, 5000, "Controlled stop fixture never committed its running state.");
+
+                    var stop = registry.StopSession(fixture.SessionId);
+                    Require(stop.Success && stop.RequestedSessions == 1,
+                        "Controlled stop did not finish its managed Session.");
+                    Require(registry.ContainsSession(fixture.SessionId),
+                        "Controlled stop did not retain its terminal DPAPI buffer.");
+
+                    IList<LocalFrame> frames;
+                    ulong earliest;
+                    ulong latest;
+                    Require(registry.TryReadBufferedEvents(
+                            fixture.SessionId, 0, out frames, out earliest, out latest) &&
+                        earliest == 1 && latest == 3 && frames.Count == 3,
+                        "Controlled stop did not retain a continuous terminal event stream.");
+                    var terminal = frames[frames.Count - 1];
+                    int exitCode;
+                    Require(terminal.Type == LocalFrameType.Lifecycle && terminal.Sequence == 3 &&
+                        LocalPayloadCodec.ParseLifecycle(terminal.Payload, out exitCode) ==
+                            LocalLifecycleState.Interrupted,
+                        "Controlled stop did not append exactly one ordered Interrupted lifecycle.");
+                    lock (committed)
+                    {
+                        Require(committed.Count == 3 && committed[2].Sequence == terminal.Sequence,
+                            "Controlled stop did not notify the production commit callback.");
+                    }
+                }
+
+                using (var recovered = new SessionRegistry(
+                    bufferRoot,
+                    1200,
+                    4 * 1024 * 1024,
+                    20,
+                    delegate(ManagedShellType ignoredShell, LocalFrame ignoredFrame) { }))
+                {
+                    Require(recovered.GetSummaries().All(item => item.SessionId != fixture.SessionId) &&
+                        recovered.ContainsSession(fixture.SessionId),
+                        "Recovery-only terminal Session reattached to the still-running local Host.");
+                    recovered.ReleaseBufferedSession(fixture.SessionId);
+                    Require(!recovered.ContainsSession(fixture.SessionId),
+                        "Released controlled-stop Session remained retained.");
+                }
+            }
+            finally
+            {
+                fixture.Dispose();
+            }
+        }
+
+        private static void ValidateRestartPreservesWithoutInterruption(string bufferRoot)
+        {
+            Directory.CreateDirectory(bufferRoot);
+            var committed = new List<LocalFrame>();
+            var fixture = LostHostFixture.Start();
+            try
+            {
+                using (var registry = new SessionRegistry(
+                    bufferRoot,
+                    1200,
+                    4 * 1024 * 1024,
+                    20,
+                    delegate(ManagedShellType shellType, LocalFrame frame)
+                    {
+                        lock (committed) committed.Add(frame);
+                    }))
+                {
+                    string error;
+                    Require(registry.TryRegister(fixture.CreateRegistration(), out error),
+                        "Restart preservation fixture registration failed: " + error);
+                    WaitUntil(delegate
+                    {
+                        return registry.GetSummaries().Any(item =>
+                            item.SessionId == fixture.SessionId && item.LastSequence >= 2);
+                    }, 5000, "Restart preservation fixture never committed its running state.");
+                    var restart = registry.ShutdownForRestart();
+                    Require(restart.Success && restart.RequestedSessions == 1,
+                        "Restart preservation did not stop its managed Session.");
+                }
+
+                lock (committed)
+                {
+                    var interrupted = false;
+                    foreach (var frame in committed)
+                    {
+                        if (frame.Type != LocalFrameType.Lifecycle) continue;
+                        int ignoredExit;
+                        if (LocalPayloadCodec.ParseLifecycle(frame.Payload, out ignoredExit) ==
+                            LocalLifecycleState.Interrupted) interrupted = true;
+                    }
+                    Require(committed.Count == 2 && !interrupted,
+                        "Agent restart emitted an Interrupted lifecycle instead of preserving recovery state.");
+                }
+                var registrations = new DpapiRegistryRegistrationStore(
+                    Path.Combine(bufferRoot, "registrations.dpapi")).Load();
+                Require(registrations.Any(item => item.SessionId == fixture.SessionId),
+                    "Agent restart removed the preserved recovery registration.");
+            }
+            finally
+            {
+                fixture.Dispose();
             }
         }
 

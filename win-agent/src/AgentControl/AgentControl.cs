@@ -75,7 +75,8 @@ namespace TermLink.Agent
                 expectedHostProcessId,
                 shellType,
                 GetProcessStartTimeUtc(expectedHostProcessId),
-                DateTime.UtcNow)
+                DateTime.UtcNow,
+                false)
         {
         }
 
@@ -87,6 +88,27 @@ namespace TermLink.Agent
             ManagedShellType shellType,
             DateTime expectedHostStartTimeUtc,
             DateTime registeredAtUtc)
+            : this(
+                sessionId,
+                pipeName,
+                handshakeToken,
+                expectedHostProcessId,
+                shellType,
+                expectedHostStartTimeUtc,
+                registeredAtUtc,
+                false)
+        {
+        }
+
+        public SessionRegistration(
+            Guid sessionId,
+            string pipeName,
+            byte[] handshakeToken,
+            int expectedHostProcessId,
+            ManagedShellType shellType,
+            DateTime expectedHostStartTimeUtc,
+            DateTime registeredAtUtc,
+            bool recoveryOnly)
         {
             if (sessionId == Guid.Empty) throw new ArgumentException("session ID is required", "sessionId");
             if (string.IsNullOrWhiteSpace(pipeName) || pipeName.Length > 200 ||
@@ -119,6 +141,7 @@ namespace TermLink.Agent
             ShellType = shellType;
             ExpectedHostStartTimeUtc = expectedHostStartTimeUtc;
             RegisteredAtUtc = registeredAtUtc;
+            RecoveryOnly = recoveryOnly;
         }
 
         private readonly byte[] handshakeTokenBytes;
@@ -130,6 +153,21 @@ namespace TermLink.Agent
         public ManagedShellType ShellType { get; private set; }
         public DateTime ExpectedHostStartTimeUtc { get; private set; }
         public DateTime RegisteredAtUtc { get; private set; }
+        public bool RecoveryOnly { get; private set; }
+
+        public SessionRegistration AsRecoveryOnly()
+        {
+            if (RecoveryOnly) return this;
+            return new SessionRegistration(
+                SessionId,
+                PipeName,
+                handshakeTokenBytes,
+                ExpectedHostProcessId,
+                ShellType,
+                ExpectedHostStartTimeUtc,
+                RegisteredAtUtc,
+                true);
+        }
 
         public bool MatchesRunningHost()
         {
@@ -210,6 +248,7 @@ namespace TermLink.Agent
         public SessionRegistration Registration { get; set; }
         public Guid SessionId { get; set; }
         public Guid DeviceId { get; set; }
+        public string PairingPermission { get; set; }
     }
 
     public enum ProductionRelayState : byte
@@ -243,6 +282,8 @@ namespace TermLink.Agent
         public Guid ChallengeId { get; set; }
         public Guid TargetDeviceId { get; set; }
         public string TargetName { get; set; }
+        public string TargetFingerprint { get; set; }
+        public string Permission { get; set; }
         public string Code { get; set; }
         public string ChallengeNonce { get; set; }
         public DateTime ExpiresAtUtc { get; set; }
@@ -275,7 +316,7 @@ namespace TermLink.Agent
 
     public static class RegistryControlCodec
     {
-        private const byte Version = 3;
+        private const byte Version = 4;
         private const int MaximumBytes = 64 * 1024;
 
         public static void WriteRequest(Stream stream, RegistryRequest request)
@@ -301,6 +342,9 @@ namespace TermLink.Agent
                         WriteGuid(writer, request.SessionId);
                         break;
                     case RegistryCommand.CreatePairingChallenge:
+                        WriteGuid(writer, request.DeviceId);
+                        WriteString(writer, request.PairingPermission ?? string.Empty);
+                        break;
                     case RegistryCommand.RevokeDevice:
                         WriteGuid(writer, request.DeviceId);
                         break;
@@ -335,6 +379,9 @@ namespace TermLink.Agent
                         request.SessionId = ReadGuid(reader);
                         break;
                     case RegistryCommand.CreatePairingChallenge:
+                        request.DeviceId = ReadGuid(reader);
+                        request.PairingPermission = ReadString(reader);
+                        break;
                     case RegistryCommand.RevokeDevice:
                         request.DeviceId = ReadGuid(reader);
                         break;
@@ -466,6 +513,8 @@ namespace TermLink.Agent
                 WriteGuid(writer, status.PairingChallenge.ChallengeId);
                 WriteGuid(writer, status.PairingChallenge.TargetDeviceId);
                 WriteString(writer, status.PairingChallenge.TargetName ?? string.Empty);
+                WriteString(writer, status.PairingChallenge.TargetFingerprint ?? string.Empty);
+                WriteString(writer, status.PairingChallenge.Permission ?? string.Empty);
                 WriteString(writer, status.PairingChallenge.Code ?? string.Empty);
                 WriteString(writer, status.PairingChallenge.ChallengeNonce ?? string.Empty);
                 writer.Write(status.PairingChallenge.ExpiresAtUtc.Ticks);
@@ -523,6 +572,8 @@ namespace TermLink.Agent
                     ChallengeId = ReadGuid(reader),
                     TargetDeviceId = ReadGuid(reader),
                     TargetName = ReadString(reader),
+                    TargetFingerprint = ReadString(reader),
+                    Permission = ReadString(reader),
                     Code = ReadString(reader),
                     ChallengeNonce = ReadString(reader),
                     ExpiresAtUtc = new DateTime(reader.ReadInt64(), DateTimeKind.Utc)

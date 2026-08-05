@@ -118,13 +118,13 @@ Windows Terminal 与内层 ConPTY，不收到终止 Shell 的命令。Host 异�
 
 `TermLink.Windows.sln` 现在构建六个正式工程和一个本机控制契约验证程序：
 
-- `TermLink.AgentControl`：Agent 与 Tray 共用的本机 Pipe V3 结构化契约；
+- `TermLink.AgentControl`：Agent 与 Tray 共用的本机 Pipe V4 结构化契约；
 - `TermLink.Protocol`：生产 Protobuf 与 E2EE/历史密码封装；
 - `TermLink.Agent`：长驻当前用户 Registry 和每会话 worker；
 - `TermLink.SessionHost`：独立 ConPTY Owner；
 - `TermLink.Tray`：系统托盘、脱敏会话/账号/设备状态与本机控制；
 - `TermLink.Updater`：签名清单校验、部署事务和失败回滚；
-- `TermLink.AgentControl.Validation`：Pipe V3 请求/响应往返验证，不进入产品包。
+- `TermLink.AgentControl.Validation`：Pipe V4 请求/响应往返验证，不进入产品包。
 
 Tray 退出不会关闭 Agent 或本地 Shell。默认控制 Pipe 名包含当前用户 SID 的 SHA-256
 截断值；Tray 只消费 `SessionSummary` 和脱敏 `ProductionStatus`，不会获得 Pipe 名、Token、
@@ -135,8 +135,11 @@ Tray 退出不会关闭 Agent 或本地 Shell。默认控制 Pipe 名包含当�
 Registry 在 Buffer Root 保存 `registrations.dpapi`。文件载荷使用 DPAPI CurrentUser，写入时
 原子替换；只包含恢复路由所需的 Session ID、Shell 类型、Host PID 与启动时间、注册时间、
 Pipe 名和握手 Token。启动时必须同时匹配 PID 与进程启动时间才会恢复，以防 PID 重用；
-正常 Session 结束、停止单会话、停止全部远程访问或受控关闭都会删除对应索引。该索引不
-包含事件、输入、标题或工作目录，也不是终端历史或跨设备 Snapshot。
+受控重启保留活动会话路由；正常 Session 结束、停止单会话、停止全部远程访问或受控关闭
+会把条目标记为仅恢复终端 Buffer。Agent 重启时此类条目只恢复已结束的 DPAPI 事件流，绝不
+重新连接仍在运行的本地 Host。只有该 Session 面向全部当前有效 Grant 的 E2EE 历史均已持久
+提交后，Agent 才删除恢复索引和事件 chunk；History 权益或服务不可用时继续保留本地有界
+Buffer。该索引不包含终端正文、输入、标题或工作目录，也不是跨设备 Snapshot。
 
 `Validate-Phase1WindowsApp.ps1` 使用正式 .NET 8 构建产物启动 20 个真实 ConPTY
 SessionHost，分别在强制结束和受控重启 Agent 后从加密索引恢复全部 20 个连接，再由 Tray
@@ -236,7 +239,7 @@ MSIX 部署后端：目标事务进入 `Succeeded`，随后以 `ForceUpdateFromA
 再次通过 Agent 健康检查。生产模式仍要求 Authenticode `Valid` 证书链和 HTTPS RFC 3161 时间戳。
 
 生产 Relay、账号/设备授权、设备密钥、E2EE、租约和历史上传已由生产 runtime 与跨端
-自动化验收覆盖；阶段性本机控制 Pipe V3 和 DPAPI 注册索引仍不等于生产 Protobuf 或
+自动化验收覆盖；阶段性本机控制 Pipe V4 和 DPAPI 注册索引仍不等于生产 Protobuf 或
 跨设备协议。开发信任下的真实安装/卸载、包身份启动和 `Add-AppxPackage` 更新/降级已验收；
 实际注销/登录周期、生产受信发布证书和时间戳服务仍需外部验收。不得把开发证书结果写成
 生产发布验证。

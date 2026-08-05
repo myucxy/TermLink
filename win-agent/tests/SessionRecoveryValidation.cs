@@ -96,7 +96,9 @@ namespace TermLink.AgentRecoveryValidation
                     "Stopping remote access did not cover all recovered sessions.");
                 Require(hosts.All(host => !host.Process.HasExited),
                     "Stopping remote access terminated a local Session Host.");
-                Require(!File.Exists(indexPath), "Stopping remote access did not clear the registration index.");
+                Require(File.Exists(indexPath),
+                    "Stopping remote access did not retain the encrypted terminal-recovery index.");
+                AssertIndexCiphertext(indexPath, hosts);
 
                 foreach (var host in hosts) host.BeginLocalCompletion();
                 foreach (var host in hosts) host.VerifyLocalCompletion();
@@ -115,7 +117,7 @@ namespace TermLink.AgentRecoveryValidation
                     ";dpapi_index_plaintext=false" +
                     ";tray_status_sessions=20" +
                     ";local_shells_survived=20" +
-                    ";index_cleared=true");
+                    ";terminal_index_retained=true");
                 return 0;
             }
             catch (Exception error)
@@ -244,7 +246,8 @@ namespace TermLink.AgentRecoveryValidation
         {
             var bytes = File.ReadAllBytes(indexPath);
             Require(bytes.Length > 5 && bytes[0] == (byte)'T' && bytes[1] == (byte)'L' &&
-                bytes[2] == (byte)'R' && bytes[3] == (byte)'I' && bytes[4] == 1,
+                bytes[2] == (byte)'R' && bytes[3] == (byte)'I' &&
+                (bytes[4] == 1 || bytes[4] == 2),
                 "Registration index header is invalid.");
             foreach (var host in hosts)
             {

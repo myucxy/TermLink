@@ -299,6 +299,7 @@ namespace TermLink.Agent
         private DateTime lastActivityUtc = DateTime.UtcNow;
         private int actualHostProcessId;
         private volatile bool stopRequested;
+        private bool commitInterruptedOnStop;
         private ulong lastHostSequence;
         private ulong nextCommandSequence;
         private long outputBytes;
@@ -367,9 +368,11 @@ namespace TermLink.Agent
             LocalFrame terminal;
             lock (statusSync)
             {
-                if (ended || stopRequested || interruptedCommitted ||
+                var stoppedWithInterruption = lifecycle == SessionAgentLifecycle.RemoteStopped && commitInterruptedOnStop;
+                if (ended || interruptedCommitted ||
                     (lifecycle != SessionAgentLifecycle.HostLost &&
-                     lifecycle != SessionAgentLifecycle.Faulted))
+                     lifecycle != SessionAgentLifecycle.Faulted &&
+                     !stoppedWithInterruption))
                 {
                     return;
                 }
@@ -426,13 +429,28 @@ namespace TermLink.Agent
                 out latestSequence);
         }
 
+        internal void DeleteBufferedEvents()
+        {
+            eventBuffer.DeleteAll();
+        }
+
         public void RequestRemoteStop()
+        {
+            RequestRemoteStop(false);
+        }
+
+        public void RequestRemoteStop(bool commitInterruptedLifecycle)
         {
             NamedPipeServerStream wait;
             NamedPipeServerStream connected;
             lock (statusSync)
             {
-                if (stopRequested) return;
+                if (stopRequested)
+                {
+                    if (commitInterruptedLifecycle) commitInterruptedOnStop = true;
+                    return;
+                }
+                commitInterruptedOnStop = commitInterruptedLifecycle;
                 stopRequested = true;
                 lifecycle = SessionAgentLifecycle.RemoteStopped;
                 lastActivityUtc = DateTime.UtcNow;
@@ -1073,6 +1091,21 @@ namespace TermLink.Agent
                 chunks.RemoveFirst();
                 storedBytes -= file.Length;
                 file.Delete();
+            }
+        }
+
+        public void DeleteAll()
+        {
+            lock (sync)
+            {
+                while (chunks.First != null)
+                {
+                    var file = chunks.First.Value;
+                    chunks.RemoveFirst();
+                    try { file.Delete(); }
+                    catch (FileNotFoundException) { }
+                }
+                storedBytes = 0;
             }
         }
 

@@ -38,7 +38,7 @@ namespace TermLink.Agent
     {
         private static readonly byte[] Magic = Encoding.ASCII.GetBytes("TLRI");
         private static readonly byte[] Entropy = Encoding.UTF8.GetBytes("TermLink.Registry.Index.V1");
-        private const byte Version = 1;
+        private const byte Version = 2;
         private const int MaximumFileBytes = 1024 * 1024;
         private const int MaximumEntries = 1000;
         private readonly string indexPath;
@@ -121,7 +121,8 @@ namespace TermLink.Agent
             {
                 if (encoded[index] != Magic[index]) throw new InvalidDataException("Registry registration index has invalid magic.");
             }
-            if (encoded[Magic.Length] != Version)
+            var storedVersion = encoded[Magic.Length];
+            if (storedVersion < 1 || storedVersion > Version)
             {
                 throw new InvalidDataException("Registry registration index version is unsupported.");
             }
@@ -160,6 +161,7 @@ namespace TermLink.Agent
                         var registeredAt = new DateTime(reader.ReadInt64(), DateTimeKind.Utc);
                         var token = ReadExact(reader, SessionRegistration.HandshakeTokenBytes);
                         var pipeName = ReadString(reader);
+                        var recoveryOnly = storedVersion >= 2 && reader.ReadBoolean();
                         var registration = new SessionRegistration(
                             sessionId,
                             pipeName,
@@ -167,7 +169,8 @@ namespace TermLink.Agent
                             processId,
                             (ManagedShellType)shellValue,
                             processStart,
-                            registeredAt);
+                            registeredAt,
+                            recoveryOnly);
                         if (registrations.ContainsKey(sessionId))
                         {
                             throw new InvalidDataException("Registry registration index contains a duplicate session ID.");
@@ -208,6 +211,7 @@ namespace TermLink.Agent
                     writer.Write(registration.RegisteredAtUtc.Ticks);
                     writer.Write(registration.HandshakeToken);
                     WriteString(writer, registration.PipeName);
+                    writer.Write(registration.RecoveryOnly);
                 }
                 writer.Flush();
                 plain = stream.ToArray();

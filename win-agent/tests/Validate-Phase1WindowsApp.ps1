@@ -78,7 +78,7 @@ try {
     Assert-True ($fields.dpapi_index_plaintext -eq 'false') 'Registration index exposed plaintext routing secrets.'
     Assert-True ([int]$fields.tray_status_sessions -eq 20) 'Tray did not read all 20 summaries.'
     Assert-True ([int]$fields.local_shells_survived -eq 20) 'A local shell did not survive remote stop.'
-    Assert-True ($fields.index_cleared -eq 'true') 'Remote stop did not clear the registration index.'
+    Assert-True ($fields.terminal_index_retained -eq 'true') 'Remote stop did not retain the encrypted terminal-recovery index.'
 
     $sourceFiles = @(
         'src\AgentControl\AgentControl.cs',
@@ -117,7 +117,7 @@ try {
         registration_index_exposed_plaintext = [bool]::Parse($fields.dpapi_index_plaintext)
         tray_summary_sessions = [int]$fields.tray_status_sessions
         local_shells_survived_remote_stop = [int]$fields.local_shells_survived
-        remote_stop_cleared_registration_index = [bool]::Parse($fields.index_cleared)
+        remote_stop_retained_terminal_recovery_index = [bool]::Parse($fields.terminal_index_retained)
         tray_boundary = 'current-user control Pipe V3 and redacted SessionSummary/ProductionStatus only'
         source_sha256 = $hashes
     }

@@ -166,6 +166,40 @@ try {
     if ($null -eq (Get-InternalMethod $runtimeType 'RememberSubscriber')) {
         throw 'Production runtime does not retain authenticated Realtime subscribers.'
     }
+    foreach ($subscriberMethod in @(
+        'RemoveSubscriber', 'PruneSubscribers', 'TryAdvanceSubscriberAck',
+        'RetireSubscriber', 'RefreshAuthorizedRecipientsAsync')) {
+        if ($null -eq (Get-InternalMethod $runtimeType $subscriberMethod)) {
+            throw "Production runtime subscriber lifecycle method is missing: $subscriberMethod"
+        }
+    }
+    $subscriberType = $runtimeType.GetNestedType('Subscriber', [Reflection.BindingFlags]'NonPublic')
+    if ($null -eq $subscriberType) { throw 'Production runtime Subscriber state is unavailable.' }
+    $subscriber = [Activator]::CreateInstance($subscriberType, $true)
+    $subscriberType.GetField('KeyEpoch').SetValue($subscriber, [int64]3)
+    $subscriberType.GetField('HighestAck').SetValue($subscriber, [uint64]2)
+    $subscriberType.GetField('LastSentSequence').SetValue($subscriber, [uint64]5)
+    $subscriberType.GetField('LastActivityUtc').SetValue($subscriber, [DateTime]::UtcNow)
+    [byte[]]$subscriberExchange = [byte[]](1..32)
+    [byte[]]$subscriberPairwise = [byte[]](33..64)
+    $subscriberType.GetField('ExchangePublicKey').SetValue($subscriber, $subscriberExchange)
+    $subscriberType.GetField('PairwiseKey').SetValue($subscriber, $subscriberPairwise)
+    $advanceAck = Get-InternalMethod $runtimeType 'TryAdvanceSubscriberAck'
+    if ($advanceAck.Invoke($null, [object[]]@($subscriber, [uint64]1)) -or
+        $advanceAck.Invoke($null, [object[]]@($subscriber, [uint64]6)) -or
+        -not $advanceAck.Invoke($null, [object[]]@($subscriber, [uint64]5)) -or
+        $advanceAck.Invoke($null, [object[]]@($subscriber, [uint64]4))) {
+        throw 'Production runtime accepted a regressive or out-of-range cumulative ACK.'
+    }
+    $retireSubscriber = Get-InternalMethod $runtimeType 'RetireSubscriber'
+    $retireSubscriber.Invoke($null, [object[]]@($subscriber)) | Out-Null
+    if (-not [bool]$subscriberType.GetField('Removed').GetValue($subscriber) -or
+        $null -ne $subscriberType.GetField('ExchangePublicKey').GetValue($subscriber) -or
+        $null -ne $subscriberType.GetField('PairwiseKey').GetValue($subscriber) -or
+        @($subscriberExchange | Where-Object { $_ -ne 0 }).Count -ne 0 -or
+        @($subscriberPairwise | Where-Object { $_ -ne 0 }).Count -ne 0) {
+        throw 'Production runtime did not atomically retire and zeroize Subscriber keys.'
+    }
     if ($null -eq (Get-InternalMethod $runtimeType 'AdvancePublishedSequence')) {
         throw 'Production runtime does not preserve a monotonic replay publication cursor.'
     }

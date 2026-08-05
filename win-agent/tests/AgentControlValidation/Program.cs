@@ -49,11 +49,15 @@ foreach (var command in new[]
 
 var stop = RoundTripRequest(new RegistryRequest { Command = RegistryCommand.StopSession, SessionId = sessionId });
 Require(stop.SessionId == sessionId, "StopSession ID changed.");
-foreach (var command in new[] { RegistryCommand.CreatePairingChallenge, RegistryCommand.RevokeDevice })
+var pairingRequest = RoundTripRequest(new RegistryRequest
 {
-    var result = RoundTripRequest(new RegistryRequest { Command = command, DeviceId = deviceId });
-    Require(result.Command == command && result.DeviceId == deviceId, command + " device ID changed.");
-}
+    Command = RegistryCommand.CreatePairingChallenge,
+    DeviceId = deviceId,
+    PairingPermission = "CONTROL"
+});
+Require(pairingRequest.DeviceId == deviceId && pairingRequest.PairingPermission == "CONTROL", "Pairing request changed.");
+var revokeRequest = RoundTripRequest(new RegistryRequest { Command = RegistryCommand.RevokeDevice, DeviceId = deviceId });
+Require(revokeRequest.DeviceId == deviceId, "RevokeDevice ID changed.");
 
 var now = new DateTime(638925120000000000, DateTimeKind.Utc);
 var response = new RegistryResponse
@@ -105,6 +109,8 @@ var response = new RegistryResponse
             ChallengeId = Guid.Parse("fedcba98-7654-3210-ffff-eeeeeeeeeeee"),
             TargetDeviceId = deviceId,
             TargetName = "Phone",
+            TargetFingerprint = "0123456789abcdef",
+            Permission = "CONTROL",
             Code = "123456",
             ChallengeNonce = "codec-nonce",
             ExpiresAtUtc = now.AddMinutes(5)
@@ -119,7 +125,10 @@ Require(decoded.Summaries.Count == 1 && decoded.Summaries[0].ExitCode == 17, "Se
 Require(decoded.Production.Configured && decoded.Production.RelayState == ProductionRelayState.Connected, "Production state changed.");
 Require(decoded.Production.Devices.Count == 1 && decoded.Production.Devices[0].DeviceId == deviceId, "Device summary changed.");
 Require(decoded.Production.Sessions.Count == 1 && decoded.Production.Sessions[0].ControllerDeviceId == deviceId, "Production session changed.");
-Require(decoded.Production.PairingChallenge != null && decoded.Production.PairingChallenge.Code == "123456", "Pairing challenge changed.");
+Require(decoded.Production.PairingChallenge != null &&
+    decoded.Production.PairingChallenge.Code == "123456" &&
+    decoded.Production.PairingChallenge.Permission == "CONTROL" &&
+    decoded.Production.PairingChallenge.TargetFingerprint == "0123456789abcdef", "Pairing challenge changed.");
 
 var defaultProduction = RoundTripResponse(new RegistryResponse
 {
@@ -130,7 +139,7 @@ var defaultProduction = RoundTripResponse(new RegistryResponse
 Require(defaultProduction.Production.RelayState == ProductionRelayState.NotConfigured, "Default production state changed.");
 Require(defaultProduction.Production.Devices.Count == 0 && defaultProduction.Production.Sessions.Count == 0, "Default production collections changed.");
 
-Console.WriteLine("TermLink Agent control Pipe V3 round-trip validation passed.");
+Console.WriteLine("TermLink Agent control Pipe V4 round-trip validation passed.");
 
 static RegistryRequest RoundTripRequest(RegistryRequest request)
 {

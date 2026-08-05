@@ -19,6 +19,13 @@ namespace TermLink.Agent
     {
         public Guid DeviceId;
         public byte[] PairwiseKey;
+        public long KeyEpoch;
+    }
+
+    internal enum ProductionHistoryUploadOutcome
+    {
+        Durable,
+        Unavailable
     }
 
     internal sealed class ProductionHistoryUploader : IDisposable
@@ -26,7 +33,6 @@ namespace TermLink.Agent
         private readonly HttpClient http;
         private readonly Func<HttpMethod, string, byte[], bool, string, CancellationToken, Task<HttpResponseMessage>> send;
         private readonly Guid pcDeviceId;
-        private readonly long keyEpoch;
         private readonly ConcurrentDictionary<string, ulong> cursors = new ConcurrentDictionary<string, ulong>();
         private readonly ConcurrentDictionary<string, byte> initialized = new ConcurrentDictionary<string, byte>();
         private readonly ConcurrentDictionary<string, SemaphoreSlim> uploadGates = new ConcurrentDictionary<string, SemaphoreSlim>();
@@ -35,28 +41,28 @@ namespace TermLink.Agent
         public ProductionHistoryUploader(
             HttpClient http,
             Func<HttpMethod, string, byte[], bool, string, CancellationToken, Task<HttpResponseMessage>> send,
-            Guid pcDeviceId,
-            long keyEpoch)
+            Guid pcDeviceId)
         {
             this.http = http ?? throw new ArgumentNullException(nameof(http));
             this.send = send ?? throw new ArgumentNullException(nameof(send));
             this.pcDeviceId = pcDeviceId;
-            this.keyEpoch = keyEpoch;
         }
 
-        public async Task UploadAsync(Guid sessionId, ProductionHistoryRecipient recipient, IList<HistoryEventV1> events, CancellationToken token)
+        public async Task<ProductionHistoryUploadOutcome> UploadAsync(Guid sessionId, ProductionHistoryRecipient recipient, IList<HistoryEventV1> events, CancellationToken token)
         {
-            if (Volatile.Read(ref disposed) != 0 || recipient == null || recipient.PairwiseKey == null || events == null || events.Count == 0) return;
-            var keyId = HistoryCrypto.KeyId(recipient.DeviceId, keyEpoch);
+            if (Volatile.Read(ref disposed) != 0 || recipient == null || recipient.PairwiseKey == null || recipient.KeyEpoch < 1 || events == null || events.Count == 0)
+                return ProductionHistoryUploadOutcome.Unavailable;
+            var keyId = HistoryCrypto.KeyId(recipient.DeviceId, recipient.KeyEpoch);
             var cursorKey = sessionId.ToString("N") + ":" + keyId;
             var uploadGate = uploadGates.GetOrAdd(cursorKey, _ => new SemaphoreSlim(1, 1));
             await uploadGate.WaitAsync(token).ConfigureAwait(false);
             try
             {
-                await InitializeCursorAsync(sessionId, keyId, cursorKey, token).ConfigureAwait(false);
+                if (!await InitializeCursorAsync(sessionId, keyId, cursorKey, token).ConfigureAwait(false))
+                    return ProductionHistoryUploadOutcome.Unavailable;
                 cursors.TryGetValue(cursorKey, out var cursor);
                 var remaining = events.Where(value => value.Seq > cursor).OrderBy(value => value.Seq).ToList();
-                if (remaining.Count == 0) return;
+                if (remaining.Count == 0) return ProductionHistoryUploadOutcome.Durable;
 
                 foreach (var batch in ContiguousBatches(remaining))
                 {
@@ -65,7 +71,7 @@ namespace TermLink.Agent
                     byte[] createBody = null;
                     try
                     {
-                        sealedObject = HistoryCrypto.Seal(recipient.PairwiseKey, sessionId, pcDeviceId, recipient.DeviceId, keyEpoch, batch);
+                        sealedObject = HistoryCrypto.Seal(recipient.PairwiseKey, sessionId, pcDeviceId, recipient.DeviceId, recipient.KeyEpoch, batch);
                         digest = SHA256.HashData(sealedObject);
                         createBody = JsonSerializer.SerializeToUtf8Bytes(new
                         {
@@ -84,7 +90,8 @@ namespace TermLink.Agent
                             "history-create-" + sessionId.ToString("N") + "-" + recipient.DeviceId.ToString("N") + "-" +
                                 batch[0].Seq + "-" + batch[^1].Seq + "-" + Convert.ToHexString(digest, 0, 6).ToLowerInvariant(),
                             token).ConfigureAwait(false);
-                        if (create.StatusCode == HttpStatusCode.ServiceUnavailable || create.StatusCode == HttpStatusCode.Forbidden) return;
+                        if (create.StatusCode == HttpStatusCode.ServiceUnavailable || create.StatusCode == HttpStatusCode.Forbidden)
+                            return ProductionHistoryUploadOutcome.Unavailable;
                         create.EnsureSuccessStatusCode();
                         using var document = JsonDocument.Parse(await create.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
                         var uploadId = document.RootElement.GetProperty("upload_id").GetGuid();
@@ -107,18 +114,18 @@ namespace TermLink.Agent
                         if (sealedObject != null) CryptographicOperations.ZeroMemory(sealedObject);
                     }
                 }
+                return ProductionHistoryUploadOutcome.Durable;
             }
             finally { uploadGate.Release(); }
         }
 
-        private async Task InitializeCursorAsync(Guid sessionId, string keyId, string cursorKey, CancellationToken token)
+        private async Task<bool> InitializeCursorAsync(Guid sessionId, string keyId, string cursorKey, CancellationToken token)
         {
-            if (initialized.ContainsKey(cursorKey)) return;
+            if (initialized.ContainsKey(cursorKey)) return true;
             using var response = await send(HttpMethod.Get, "/v1/sessions/" + sessionId.ToString("D") + "/history", Array.Empty<byte>(), true, null, token).ConfigureAwait(false);
             if (response.StatusCode == HttpStatusCode.ServiceUnavailable || response.StatusCode == HttpStatusCode.Forbidden)
             {
-                initialized.TryAdd(cursorKey, 0);
-                return;
+                return false;
             }
             response.EnsureSuccessStatusCode();
             using var document = JsonDocument.Parse(await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
@@ -132,6 +139,7 @@ namespace TermLink.Agent
             }
             cursors[cursorKey] = highest;
             initialized.TryAdd(cursorKey, 0);
+            return true;
         }
 
         private async Task PutCiphertextAsync(JsonElement upload, byte[] sealedObject, CancellationToken token)

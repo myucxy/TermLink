@@ -37,9 +37,22 @@ namespace TermLink.Agent
 
     internal sealed class ProductionAgentRuntime : IDisposable
     {
+        private static readonly TimeSpan SubscriberIdleTimeout = TimeSpan.FromSeconds(45);
+        private static readonly TimeSpan AuthorityCacheDuration = TimeSpan.FromSeconds(30);
         private sealed class CommittedEvent { public ManagedShellType ShellType; public LocalFrame Frame; }
         private sealed class PendingSession { public ManagedShellType ShellType; }
-        private sealed class Subscriber { public Guid DeviceId; public byte[] ExchangePublicKey; public byte[] PairwiseKey; }
+        private sealed class Subscriber
+        {
+            public readonly object Sync = new object();
+            public Guid DeviceId;
+            public byte[] ExchangePublicKey;
+            public byte[] PairwiseKey;
+            public long KeyEpoch;
+            public DateTime LastActivityUtc;
+            public ulong HighestAck;
+            public ulong LastSentSequence;
+            public bool Removed;
+        }
         private sealed class LeaseStatus
         {
             public Guid HolderDeviceId;
@@ -78,7 +91,7 @@ namespace TermLink.Agent
         private Task historyWorker;
         private ClientWebSocket socket;
         private ProductionHistoryUploader historyUploader;
-        private DateTime historyRecipientsExpiresUtc;
+        private DateTime authorityExpiresUtc;
         private DateTime statusExpiresUtc;
         private ProductionRelayState relayState = ProductionRelayState.Connecting;
         private string relayErrorCode = string.Empty;
@@ -112,7 +125,7 @@ namespace TermLink.Agent
                 if (this.registry != null) throw new InvalidOperationException("Production runtime is already attached.");
                 this.registry = registry;
                 QueueRegisteredSessionsForReplay();
-                historyUploader = new ProductionHistoryUploader(http, SendAsync, credentials.DeviceId, config.KeyEpoch);
+                historyUploader = new ProductionHistoryUploader(http, SendAsync, credentials.DeviceId);
                 historyWorker = Task.Run(HistoryUploadLoopAsync);
                 worker = Task.Run(RunAsync);
             }
@@ -172,6 +185,22 @@ namespace TermLink.Agent
             catch (ObjectDisposedException) { }
         }
 
+        public bool DrainTerminalPublications(TimeSpan timeout)
+        {
+            if (timeout < TimeSpan.Zero || timeout > TimeSpan.FromMinutes(1))
+                throw new ArgumentOutOfRangeException(nameof(timeout));
+            if (Volatile.Read(ref disposed) != 0) return pendingSessions.IsEmpty;
+            try { eventSignal.Release(); }
+            catch (SemaphoreFullException) { }
+            catch (ObjectDisposedException) { return pendingSessions.IsEmpty; }
+            var deadline = DateTime.UtcNow.Add(timeout);
+            while (!pendingSessions.IsEmpty && DateTime.UtcNow < deadline)
+            {
+                Thread.Sleep(25);
+            }
+            return pendingSessions.IsEmpty;
+        }
+
         public ProductionStatus GetStatus(bool forceRefresh)
         {
             if (forceRefresh)
@@ -198,14 +227,17 @@ namespace TermLink.Agent
             return SnapshotStatus();
         }
 
-        public PairingChallengeSummary CreatePairingChallenge(Guid targetDeviceId)
+        public PairingChallengeSummary CreatePairingChallenge(Guid targetDeviceId, string permission)
         {
             if (targetDeviceId == Guid.Empty || targetDeviceId == credentials.DeviceId) throw new ArgumentException("A different target device is required.", nameof(targetDeviceId));
+            permission = (permission ?? string.Empty).Trim().ToUpperInvariant();
+            if (permission != "VIEW" && permission != "CONTROL" && permission != "MANAGE")
+                throw new ArgumentException("A supported permission is required.", nameof(permission));
             var body = JsonSerializer.SerializeToUtf8Bytes(new
             {
                 target_device_id = targetDeviceId,
                 pc_id = config.PcId,
-                permission = "CONTROL"
+                permission
             });
             try
             {
@@ -218,6 +250,8 @@ namespace TermLink.Agent
                     ChallengeId = root.GetProperty("challenge_id").GetGuid(),
                     TargetDeviceId = targetDeviceId,
                     TargetName = root.GetProperty("target").GetProperty("name").GetString(),
+                    TargetFingerprint = root.GetProperty("target").GetProperty("public_key_fingerprint").GetString(),
+                    Permission = root.GetProperty("grant").GetProperty("permission").GetString(),
                     Code = root.GetProperty("code").GetString(),
                     ChallengeNonce = root.GetProperty("challenge_nonce").GetString(),
                     ExpiresAtUtc = root.GetProperty("expires_at").GetDateTime().ToUniversalTime()
@@ -483,6 +517,7 @@ namespace TermLink.Agent
 
         private ProductionStatus SnapshotStatus()
         {
+            PruneSubscribers();
             var sessions = new List<ProductionSessionSummary>();
             var registrySessions = registry == null ? new List<SessionSummary>() : new List<SessionSummary>(registry.GetSummaries());
             foreach (var session in registrySessions)
@@ -551,9 +586,11 @@ namespace TermLink.Agent
             {
                 if (!await eventSignal.WaitAsync(TimeSpan.FromSeconds(5), token).ConfigureAwait(false))
                 {
+                    PruneSubscribers();
                     PruneCompletedSessions();
                     continue;
                 }
+                PruneSubscribers();
                 // Keep a small coalescing window for terminal bursts without
                 // adding a quarter-second round trip to every ordered input
                 // result. This keeps normal typing responsive while retaining
@@ -656,6 +693,7 @@ namespace TermLink.Agent
                         IList<LocalFrame> frames;
                         ulong earliest;
                         ulong latest;
+                        var durable = false;
                         if (registry != null && registry.TryReadBufferedEvents(
                             pending.Key,
                             0,
@@ -663,6 +701,7 @@ namespace TermLink.Agent
                             out earliest,
                             out latest))
                         {
+                            durable = true;
                             var events = new List<HistoryEventV1>(frames.Count);
                             foreach (var frame in frames)
                             {
@@ -671,8 +710,14 @@ namespace TermLink.Agent
                             }
                             if (events.Count > 0)
                             {
-                                await UploadHistoryAsync(pending.Key, events, token).ConfigureAwait(false);
+                                durable = await UploadHistoryAsync(pending.Key, events, token).ConfigureAwait(false);
                             }
+                        }
+                        if (terminalHistorySessions.ContainsKey(pending.Key) && !durable)
+                        {
+                            pendingHistorySessions[pending.Key] = 0;
+                            retry = true;
+                            continue;
                         }
                         if (terminalHistorySessions.TryRemove(pending.Key, out ignored) && registry != null)
                         {
@@ -688,7 +733,11 @@ namespace TermLink.Agent
                 }
                 if (retry)
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
+                    // History may be disabled by entitlement for an extended
+                    // period. Retain the DPAPI buffer and retry without a hot
+                    // loop; transport failures still reach this same bounded
+                    // retry path.
+                    await Task.Delay(TimeSpan.FromSeconds(30), token).ConfigureAwait(false);
                     try { historySignal.Release(); }
                     catch (SemaphoreFullException) { }
                 }
@@ -732,6 +781,7 @@ namespace TermLink.Agent
             {
                 await UpsertSessionAsync(item, token).ConfigureAwait(false);
             }
+            PruneSubscribers();
             if (!subscribers.TryGetValue(item.Frame.SessionId, out var sessionSubscribers)) return;
             foreach (var subscriber in sessionSubscribers.Values)
             {
@@ -773,35 +823,61 @@ namespace TermLink.Agent
 
         private async Task HandleIncomingAsync(ClientWebSocket active, Envelope envelope, CancellationToken token)
         {
+            if (envelope.ProtocolVersion != 1 || envelope.Direction != Direction.AndroidToPc ||
+                envelope.Seq == 0 || envelope.Nonce.Length != 12 || envelope.Ciphertext.Length < 16)
+            {
+                throw new InvalidDataException("Envelope metadata is invalid.");
+            }
             if (!GuidFromBytes(envelope.RecipientDeviceId.Span).Equals(credentials.DeviceId)) throw new InvalidDataException("Envelope recipient mismatch.");
             var senderId = GuidFromBytes(envelope.SenderDeviceId.Span); var sessionId = GuidFromBytes(envelope.SessionId.Span);
             Subscriber subscriber;
             if (envelope.MessageType == MessageType.Subscribe)
             {
-                subscriber = await GetSubscriberAsync(sessionId, senderId, token).ConfigureAwait(false);
+                subscriber = await GetSubscriberAsync(sessionId, senderId, token, true).ConfigureAwait(false);
             }
             else if (!subscribers.TryGetValue(sessionId, out var knownSubscribers) ||
                 !knownSubscribers.TryGetValue(senderId, out subscriber))
             {
+                if (envelope.MessageType == MessageType.Unsubscribe)
+                {
+                    try { subscriber = await GetSubscriberAsync(sessionId, senderId, token).ConfigureAwait(false); }
+                    catch (InvalidDataException) { return; }
+                    catch (HttpRequestException) { return; }
+                }
+                else
+                {
                 if (envelope.MessageType != MessageType.InputEvent &&
                     envelope.MessageType != MessageType.ResizeRequest) return;
                 subscriber = await TryRestoreSubscriberAsync(sessionId, senderId, token).ConfigureAwait(false);
                 if (subscriber == null) return;
+                }
             }
-            var sessionKey = SessionCrypto.DeriveSessionKey(subscriber.PairwiseKey, sessionId, CryptoDirection.AndroidToPc, envelope.KeyId.ToByteArray());
+            long subscriberEpoch;
+            var pairwiseKey = SnapshotPairwiseKey(subscriber, out subscriberEpoch);
+            if (pairwiseKey == null) return;
+            var expectedKeyId = EpochKeyId(subscriberEpoch);
+            if (!CryptographicOperations.FixedTimeEquals(expectedKeyId, envelope.KeyId.Span))
+            {
+                CryptographicOperations.ZeroMemory(pairwiseKey);
+                CryptographicOperations.ZeroMemory(expectedKeyId);
+                throw new InvalidDataException("Envelope key epoch is stale or invalid.");
+            }
+            var sessionKey = SessionCrypto.DeriveSessionKey(pairwiseKey, sessionId, CryptoDirection.AndroidToPc, expectedKeyId);
+            CryptographicOperations.ZeroMemory(pairwiseKey);
+            CryptographicOperations.ZeroMemory(expectedKeyId);
             byte[] plaintext = null;
             try
             {
                 plaintext = SessionCrypto.Decrypt(sessionKey, envelope.Nonce.ToByteArray(), SessionCrypto.AssociatedData(envelope), envelope.Ciphertext.ToByteArray());
+                TouchSubscriber(subscriber);
                 if (envelope.MessageType == MessageType.Subscribe)
                 {
                     var subscribe = SubscribePayload.Parser.ParseFrom(plaintext);
-                    if (subscribe.SubscriberExchangePublicKey.Length > 0 &&
-                        !CryptographicOperations.FixedTimeEquals(
-                            subscribe.SubscriberExchangePublicKey.Span,
-                            subscriber.ExchangePublicKey))
+                    if (subscribe.ResumeFromSeq != envelope.Ack ||
+                        (subscribe.SubscriberExchangePublicKey.Length > 0 &&
+                         !MatchesExchangePublicKey(subscriber, subscribe.SubscriberExchangePublicKey.Span)))
                     {
-                        throw new InvalidDataException("Subscribe exchange key does not match the trusted device.");
+                        throw new InvalidDataException("Subscribe cursor or exchange key is invalid.");
                     }
                     await ReplaySubscriberAsync(
                         active,
@@ -809,6 +885,23 @@ namespace TermLink.Agent
                         subscriber,
                         subscribe.ResumeFromSeq,
                         token).ConfigureAwait(false);
+                    return;
+                }
+                if (envelope.MessageType == MessageType.Unsubscribe)
+                {
+                    if (plaintext.Length != 0) throw new InvalidDataException("Unsubscribe payload must be empty.");
+                    if (!RemoveSubscriber(sessionId, senderId, subscriber)) RetireSubscriber(subscriber);
+                    return;
+                }
+                if (envelope.MessageType == MessageType.OutputAck)
+                {
+                    var acknowledgement = OutputAckPayload.Parser.ParseFrom(plaintext);
+                    if (acknowledgement.HighestContiguousSeq != envelope.Ack ||
+                        acknowledgement.Missing.Count != 0 ||
+                        !TryAdvanceSubscriberAck(subscriber, acknowledgement.HighestContiguousSeq))
+                    {
+                        throw new InvalidDataException("Output acknowledgement is invalid.");
+                    }
                     return;
                 }
                 if (envelope.MessageType == MessageType.ResizeRequest)
@@ -867,13 +960,24 @@ namespace TermLink.Agent
             var sessionSubscribers = subscribers.GetOrAdd(
                 sessionId,
                 _ => new ConcurrentDictionary<Guid, Subscriber>());
-            var retained = sessionSubscribers.GetOrAdd(candidate.DeviceId, candidate);
-            if (!ReferenceEquals(retained, candidate))
+            while (true)
             {
-                if (candidate.ExchangePublicKey != null) CryptographicOperations.ZeroMemory(candidate.ExchangePublicKey);
-                if (candidate.PairwiseKey != null) CryptographicOperations.ZeroMemory(candidate.PairwiseKey);
+                if (sessionSubscribers.TryGetValue(candidate.DeviceId, out var retained))
+                {
+                    lock (retained.Sync)
+                    {
+                        if (!retained.Removed)
+                        {
+                            RetireSubscriber(candidate);
+                            return retained;
+                        }
+                    }
+                    ((ICollection<KeyValuePair<Guid, Subscriber>>)sessionSubscribers).Remove(
+                        new KeyValuePair<Guid, Subscriber>(candidate.DeviceId, retained));
+                    continue;
+                }
+                if (sessionSubscribers.TryAdd(candidate.DeviceId, candidate)) return candidate;
             }
-            return retained;
         }
 
         private async Task<bool> LeaseMatchesAsync(
@@ -937,26 +1041,52 @@ namespace TermLink.Agent
             catch (JsonException) { return false; }
         }
 
-        private async Task<Subscriber> GetSubscriberAsync(Guid sessionId, Guid deviceId, CancellationToken token)
+        private async Task<Subscriber> GetSubscriberAsync(
+            Guid sessionId,
+            Guid deviceId,
+            CancellationToken token,
+            bool forceAuthorityRefresh = false)
         {
-            if (subscribers.TryGetValue(sessionId, out var known) && known.TryGetValue(deviceId, out var existing)) return existing;
-            using var response = await SendAsync(HttpMethod.Get, "/v1/devices", Array.Empty<byte>(), true, null, token).ConfigureAwait(false);
-            response.EnsureSuccessStatusCode();
-            using var document = JsonDocument.Parse(await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
-            foreach (var item in document.RootElement.GetProperty("items").EnumerateArray())
+            if (forceAuthorityRefresh)
+                await RefreshAuthorizedRecipientsAsync(true, token).ConfigureAwait(false);
+            if (subscribers.TryGetValue(sessionId, out var known) && known.TryGetValue(deviceId, out var existing))
             {
-                if (item.GetProperty("id").GetGuid() != deviceId ||
-                    item.GetProperty("type").GetString() != "ANDROID" ||
-                    item.GetProperty("trust_state").GetString() != "TRUSTED") continue;
-                var publicKey = Convert.FromBase64String(item.GetProperty("exchange_public_key").GetString());
-                if (publicKey.Length != 32)
+                lock (existing.Sync)
                 {
-                    CryptographicOperations.ZeroMemory(publicKey);
-                    throw new InvalidDataException("Subscriber exchange public key is invalid.");
+                    if (!existing.Removed && existing.KeyEpoch == config.KeyEpoch) return existing;
                 }
-                return new Subscriber { DeviceId = deviceId, ExchangePublicKey = publicKey, PairwiseKey = SessionCrypto.DerivePairwiseKey(credentials.Identity.Exchange, publicKey, credentials.DeviceId, deviceId, config.KeyEpoch) };
+                RemoveSubscriber(sessionId, deviceId, existing);
             }
-            throw new InvalidDataException("Subscriber device is not trusted.");
+
+            await RefreshAuthorizedRecipientsAsync(false, token).ConfigureAwait(false);
+            if (!historyRecipients.TryGetValue(deviceId, out var authorized))
+            {
+                await RefreshAuthorizedRecipientsAsync(true, token).ConfigureAwait(false);
+                if (!historyRecipients.TryGetValue(deviceId, out authorized))
+                    throw new InvalidDataException("Subscriber does not have an active PC grant.");
+            }
+            byte[] publicKey;
+            long keyEpoch;
+            lock (authorized.Sync)
+            {
+                if (authorized.Removed || authorized.ExchangePublicKey == null || authorized.KeyEpoch < 1)
+                    throw new InvalidDataException("Subscriber authority is unavailable.");
+                publicKey = (byte[])authorized.ExchangePublicKey.Clone();
+                keyEpoch = authorized.KeyEpoch;
+            }
+            return new Subscriber
+            {
+                DeviceId = deviceId,
+                ExchangePublicKey = publicKey,
+                PairwiseKey = SessionCrypto.DerivePairwiseKey(
+                    credentials.Identity.Exchange,
+                    publicKey,
+                    credentials.DeviceId,
+                    deviceId,
+                    keyEpoch),
+                KeyEpoch = keyEpoch,
+                LastActivityUtc = DateTime.UtcNow
+            };
         }
 
         private async Task<Subscriber> TryRestoreSubscriberAsync(
@@ -978,9 +1108,9 @@ namespace TermLink.Agent
             catch (InvalidDataException) { return null; }
         }
 
-        private async Task UploadHistoryAsync(Guid sessionId, IList<HistoryEventV1> events, CancellationToken token)
+        private async Task<bool> UploadHistoryAsync(Guid sessionId, IList<HistoryEventV1> events, CancellationToken token)
         {
-            if (historyUploader == null) return;
+            if (historyUploader == null) return false;
             IList<LocalFrame> retainedFrames;
             ulong ignoredEarliest;
             ulong ignoredLatest;
@@ -994,60 +1124,132 @@ namespace TermLink.Agent
                 }
                 if (retainedEvents.Count > 0) events = retainedEvents;
             }
-            await RefreshHistoryRecipientsAsync(token).ConfigureAwait(false);
+            // History objects must never be produced for a stale or revoked
+            // recipient. Fetch a fresh PC-scoped Grant snapshot for every
+            // archival attempt; the response also carries the authoritative
+            // key epoch in the same database snapshot.
+            await RefreshAuthorizedRecipientsAsync(true, token).ConfigureAwait(false);
+            var hasRecipient = false;
+            var durable = true;
             foreach (var recipient in historyRecipients.Values)
             {
-                await historyUploader.UploadAsync(
-                    sessionId,
-                    new ProductionHistoryRecipient { DeviceId = recipient.DeviceId, PairwiseKey = recipient.PairwiseKey },
-                    events,
-                    token).ConfigureAwait(false);
+                long keyEpoch;
+                var pairwiseKey = SnapshotPairwiseKey(recipient, out keyEpoch);
+                if (pairwiseKey == null) continue;
+                hasRecipient = true;
+                try
+                {
+                    var outcome = await historyUploader.UploadAsync(
+                        sessionId,
+                        new ProductionHistoryRecipient
+                        {
+                            DeviceId = recipient.DeviceId,
+                            PairwiseKey = pairwiseKey,
+                            KeyEpoch = keyEpoch
+                        },
+                        events,
+                        token).ConfigureAwait(false);
+                    if (outcome != ProductionHistoryUploadOutcome.Durable) durable = false;
+                }
+                finally { CryptographicOperations.ZeroMemory(pairwiseKey); }
             }
+            return hasRecipient && durable;
         }
 
-        private async Task RefreshHistoryRecipientsAsync(CancellationToken token)
+        private async Task RefreshAuthorizedRecipientsAsync(bool force, CancellationToken token)
         {
-            if (DateTime.UtcNow < historyRecipientsExpiresUtc) return;
+            if (!force && DateTime.UtcNow < authorityExpiresUtc) return;
             await historyRecipientGate.WaitAsync(token).ConfigureAwait(false);
             try
             {
-                if (DateTime.UtcNow < historyRecipientsExpiresUtc) return;
-                using var response = await SendAsync(HttpMethod.Get, "/v1/devices", Array.Empty<byte>(), true, null, token).ConfigureAwait(false);
+                if (!force && DateTime.UtcNow < authorityExpiresUtc) return;
+                using var response = await SendAsync(
+                    HttpMethod.Get,
+                    "/v1/pcs/" + config.PcId.ToString("D") + "/grants",
+                    Array.Empty<byte>(),
+                    true,
+                    null,
+                    token).ConfigureAwait(false);
                 response.EnsureSuccessStatusCode();
                 using var document = JsonDocument.Parse(await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
-                var retained = new HashSet<Guid>();
-                foreach (var item in document.RootElement.GetProperty("items").EnumerateArray())
+                if (!document.RootElement.TryGetProperty("key_epoch", out var epochElement) ||
+                    !epochElement.TryGetInt64(out var keyEpoch) || keyEpoch < 1 || keyEpoch < config.KeyEpoch)
                 {
-                    if (!string.Equals(item.GetProperty("type").GetString(), "ANDROID", StringComparison.Ordinal) ||
-                        !string.Equals(item.GetProperty("trust_state").GetString(), "TRUSTED", StringComparison.Ordinal)) continue;
-                    var deviceId = item.GetProperty("id").GetGuid();
-                    var publicKey = Convert.FromBase64String(item.GetProperty("exchange_public_key").GetString());
-                    if (publicKey.Length != 32) { CryptographicOperations.ZeroMemory(publicKey); continue; }
-                    retained.Add(deviceId);
-                    historyRecipients.AddOrUpdate(
-                        deviceId,
-                        _ => new Subscriber
-                        {
-                            DeviceId = deviceId,
-                            ExchangePublicKey = publicKey,
-                            PairwiseKey = SessionCrypto.DerivePairwiseKey(credentials.Identity.Exchange, publicKey, credentials.DeviceId, deviceId, config.KeyEpoch)
-                        },
-                        (_, existing) =>
+                    throw new InvalidDataException("PC Grant key epoch is invalid.");
+                }
+                var authorizedKeys = new Dictionary<Guid, byte[]>();
+                var retained = new HashSet<Guid>();
+                try
+                {
+                    foreach (var item in document.RootElement.GetProperty("items").EnumerateArray())
+                    {
+                        if (!string.Equals(item.GetProperty("device_type").GetString(), "ANDROID", StringComparison.Ordinal)) continue;
+                        var deviceId = item.GetProperty("device_id").GetGuid();
+                        var publicKey = Convert.FromBase64String(item.GetProperty("exchange_public_key").GetString());
+                        if (publicKey.Length != 32 || deviceId == Guid.Empty)
                         {
                             CryptographicOperations.ZeroMemory(publicKey);
-                            return existing;
-                        });
-                }
-                foreach (var item in historyRecipients)
-                {
-                    if (retained.Contains(item.Key)) continue;
-                    if (historyRecipients.TryRemove(item.Key, out var removed))
-                    {
-                        if (removed.ExchangePublicKey != null) CryptographicOperations.ZeroMemory(removed.ExchangePublicKey);
-                        if (removed.PairwiseKey != null) CryptographicOperations.ZeroMemory(removed.PairwiseKey);
+                            throw new InvalidDataException("PC Grant exchange key is invalid.");
+                        }
+                        if (!authorizedKeys.TryAdd(deviceId, publicKey))
+                        {
+                            CryptographicOperations.ZeroMemory(publicKey);
+                            throw new InvalidDataException("PC Grant snapshot contains a duplicate device.");
+                        }
                     }
+
+                    if (keyEpoch > config.KeyEpoch)
+                    {
+                        var previousEpoch = config.KeyEpoch;
+                        config.KeyEpoch = keyEpoch;
+                        try { ProductionAgentConfig.Save(config); }
+                        catch
+                        {
+                            config.KeyEpoch = previousEpoch;
+                            throw;
+                        }
+                        ClearSubscribers();
+                        foreach (var previous in historyRecipients.Values) RetireSubscriber(previous);
+                        historyRecipients.Clear();
+                    }
+
+                    foreach (var item in authorizedKeys)
+                    {
+                        retained.Add(item.Key);
+                        var publicKey = (byte[])item.Value.Clone();
+                        var candidate = new Subscriber
+                        {
+                            DeviceId = item.Key,
+                            ExchangePublicKey = publicKey,
+                            PairwiseKey = SessionCrypto.DerivePairwiseKey(
+                                credentials.Identity.Exchange,
+                                publicKey,
+                                credentials.DeviceId,
+                                item.Key,
+                                keyEpoch),
+                            KeyEpoch = keyEpoch,
+                            LastActivityUtc = DateTime.UtcNow
+                        };
+                        if (historyRecipients.TryGetValue(item.Key, out var existing) &&
+                            SubscriberAuthorityMatches(existing, candidate))
+                        {
+                            RetireSubscriber(candidate);
+                            continue;
+                        }
+                        historyRecipients[item.Key] = candidate;
+                        if (existing != null) RetireSubscriber(existing);
+                    }
+                    foreach (var item in historyRecipients)
+                    {
+                        if (retained.Contains(item.Key)) continue;
+                        if (historyRecipients.TryRemove(item.Key, out var removed)) RetireSubscriber(removed);
+                    }
+                    authorityExpiresUtc = DateTime.UtcNow.Add(AuthorityCacheDuration);
                 }
-                historyRecipientsExpiresUtc = DateTime.UtcNow.AddSeconds(30);
+                finally
+                {
+                    foreach (var publicKey in authorizedKeys.Values) CryptographicOperations.ZeroMemory(publicKey);
+                }
             }
             finally { historyRecipientGate.Release(); }
         }
@@ -1076,11 +1278,14 @@ namespace TermLink.Agent
                 {
                     throw new InvalidDataException("Subscribed session is no longer registered.");
                 }
+                if (resumeFromSequence > latestSequence)
+                    throw new InvalidDataException("Subscribe cursor exceeds the session sequence.");
                 // PublishLoop may be replaying a recovered buffer from zero at
                 // the same time. Advance its cursor before this subscriber is
                 // visible so it cannot receive stale live sends after replay.
                 AdvancePublishedSequence(sessionId, latestSequence);
                 subscriber = RememberSubscriber(sessionId, subscriber);
+                ResetSubscriberCursor(subscriber, resumeFromSequence);
 
                 var gapStart = resumeFromSequence == ulong.MaxValue
                     ? 0
@@ -1105,17 +1310,20 @@ namespace TermLink.Agent
                     var gapBytes = gapPayload.ToByteArray();
                     try
                     {
+                        if (gapEnd == ulong.MaxValue) throw new InvalidDataException("Gap sequence is exhausted.");
                         await SendEncryptedCoreAsync(
                             active,
                             sessionId,
                             subscriber,
                             MessageType.Gap,
                             Direction.PcToAndroid,
-                            gapEnd,
+                            gapEnd + 1,
                             gapBytes,
                             token).ConfigureAwait(false);
                     }
                     finally { CryptographicOperations.ZeroMemory(gapBytes); }
+
+                    RemoveSubscriber(sessionId, subscriber.DeviceId, subscriber);
 
                     // Without a portable Snapshot, Android cannot safely apply
                     // the retained suffix after a permanent VT byte gap. Stop
@@ -1169,8 +1377,12 @@ namespace TermLink.Agent
 
         private async Task SendEncryptedCoreAsync(ClientWebSocket active, Guid sessionId, Subscriber subscriber, MessageType type, Direction direction, ulong sequence, byte[] plaintext, CancellationToken token)
         {
-            var keyId = Encoding.UTF8.GetBytes("epoch-" + config.KeyEpoch.ToString("D8")); var cryptoDirection = direction == Direction.PcToAndroid ? CryptoDirection.PcToAndroid : CryptoDirection.AndroidToPc;
-            var key = SessionCrypto.DeriveSessionKey(subscriber.PairwiseKey, sessionId, cryptoDirection, keyId);
+            long keyEpoch;
+            var pairwiseKey = SnapshotPairwiseKey(subscriber, out keyEpoch);
+            if (pairwiseKey == null) return;
+            var keyId = EpochKeyId(keyEpoch); var cryptoDirection = direction == Direction.PcToAndroid ? CryptoDirection.PcToAndroid : CryptoDirection.AndroidToPc;
+            var key = SessionCrypto.DeriveSessionKey(pairwiseKey, sessionId, cryptoDirection, keyId);
+            CryptographicOperations.ZeroMemory(pairwiseKey);
             var nonce = NewEnvelopeNonce();
             try
             {
@@ -1189,6 +1401,7 @@ namespace TermLink.Agent
                 try
                 {
                     await active.SendAsync(serialized, WebSocketMessageType.Binary, true, token).ConfigureAwait(false);
+                    RecordSubscriberSend(subscriber, sequence);
                 }
                 finally { CryptographicOperations.ZeroMemory(serialized); }
             }
@@ -1205,6 +1418,12 @@ namespace TermLink.Agent
             var nonce = new byte[12];
             RandomNumberGenerator.Fill(nonce);
             return nonce;
+        }
+
+        private static byte[] EpochKeyId(long keyEpoch)
+        {
+            if (keyEpoch < 1) throw new InvalidDataException("Key epoch is invalid.");
+            return Encoding.UTF8.GetBytes("epoch-" + keyEpoch.ToString("D8"));
         }
 
         private async Task SendWebSocketAsync(ClientWebSocket active, byte[] payload, WebSocketMessageType messageType, bool endOfMessage, CancellationToken token)
@@ -1311,16 +1530,136 @@ namespace TermLink.Agent
             return "CONPTY_WRITE_FAILED";
         }
 
+        private static byte[] SnapshotPairwiseKey(Subscriber subscriber, out long keyEpoch)
+        {
+            keyEpoch = 0;
+            if (subscriber == null) return null;
+            lock (subscriber.Sync)
+            {
+                if (subscriber.Removed || subscriber.PairwiseKey == null || subscriber.KeyEpoch < 1) return null;
+                keyEpoch = subscriber.KeyEpoch;
+                return (byte[])subscriber.PairwiseKey.Clone();
+            }
+        }
+
+        private static bool MatchesExchangePublicKey(Subscriber subscriber, ReadOnlySpan<byte> publicKey)
+        {
+            lock (subscriber.Sync)
+            {
+                return !subscriber.Removed && subscriber.ExchangePublicKey != null &&
+                    CryptographicOperations.FixedTimeEquals(subscriber.ExchangePublicKey, publicKey);
+            }
+        }
+
+        private static bool SubscriberAuthorityMatches(Subscriber left, Subscriber right)
+        {
+            lock (left.Sync)
+            lock (right.Sync)
+            {
+                return !left.Removed && !right.Removed && left.KeyEpoch == right.KeyEpoch &&
+                    left.ExchangePublicKey != null && right.ExchangePublicKey != null &&
+                    CryptographicOperations.FixedTimeEquals(left.ExchangePublicKey, right.ExchangePublicKey);
+            }
+        }
+
+        private static void TouchSubscriber(Subscriber subscriber)
+        {
+            lock (subscriber.Sync)
+            {
+                if (!subscriber.Removed) subscriber.LastActivityUtc = DateTime.UtcNow;
+            }
+        }
+
+        private static void ResetSubscriberCursor(Subscriber subscriber, ulong resumeFromSequence)
+        {
+            lock (subscriber.Sync)
+            {
+                if (subscriber.Removed) return;
+                subscriber.HighestAck = resumeFromSequence;
+                if (subscriber.LastSentSequence < resumeFromSequence)
+                    subscriber.LastSentSequence = resumeFromSequence;
+                subscriber.LastActivityUtc = DateTime.UtcNow;
+            }
+        }
+
+        private static void RecordSubscriberSend(Subscriber subscriber, ulong sequence)
+        {
+            lock (subscriber.Sync)
+            {
+                if (subscriber.Removed) return;
+                if (sequence > subscriber.LastSentSequence) subscriber.LastSentSequence = sequence;
+            }
+        }
+
+        private static bool TryAdvanceSubscriberAck(Subscriber subscriber, ulong highestContiguousSequence)
+        {
+            lock (subscriber.Sync)
+            {
+                if (subscriber.Removed || highestContiguousSequence < subscriber.HighestAck ||
+                    highestContiguousSequence > subscriber.LastSentSequence) return false;
+                subscriber.HighestAck = highestContiguousSequence;
+                subscriber.LastActivityUtc = DateTime.UtcNow;
+                return true;
+            }
+        }
+
+        private bool RemoveSubscriber(Guid sessionId, Guid deviceId, Subscriber expected)
+        {
+            if (!subscribers.TryGetValue(sessionId, out var sessionSubscribers)) return false;
+            var removed = ((ICollection<KeyValuePair<Guid, Subscriber>>)sessionSubscribers).Remove(
+                new KeyValuePair<Guid, Subscriber>(deviceId, expected));
+            if (!removed) return false;
+            RetireSubscriber(expected);
+            if (sessionSubscribers.IsEmpty)
+            {
+                ((ICollection<KeyValuePair<Guid, ConcurrentDictionary<Guid, Subscriber>>>)subscribers).Remove(
+                    new KeyValuePair<Guid, ConcurrentDictionary<Guid, Subscriber>>(sessionId, sessionSubscribers));
+            }
+            return true;
+        }
+
+        private static void RetireSubscriber(Subscriber subscriber)
+        {
+            if (subscriber == null) return;
+            byte[] exchangePublicKey;
+            byte[] pairwiseKey;
+            lock (subscriber.Sync)
+            {
+                if (subscriber.Removed) return;
+                subscriber.Removed = true;
+                exchangePublicKey = subscriber.ExchangePublicKey;
+                pairwiseKey = subscriber.PairwiseKey;
+                subscriber.ExchangePublicKey = null;
+                subscriber.PairwiseKey = null;
+            }
+            if (exchangePublicKey != null) CryptographicOperations.ZeroMemory(exchangePublicKey);
+            if (pairwiseKey != null) CryptographicOperations.ZeroMemory(pairwiseKey);
+        }
+
+        private void PruneSubscribers()
+        {
+            var cutoff = DateTime.UtcNow.Subtract(SubscriberIdleTimeout);
+            foreach (var session in subscribers)
+            {
+                foreach (var item in session.Value)
+                {
+                    var expired = false;
+                    lock (item.Value.Sync)
+                    {
+                        expired = item.Value.Removed || item.Value.LastActivityUtc <= cutoff;
+                    }
+                    if (expired) RemoveSubscriber(session.Key, item.Key, item.Value);
+                }
+            }
+        }
+
         private void ClearSubscribers()
         {
             foreach (var session in subscribers.Values)
             {
                 foreach (var subscriber in session.Values)
                 {
-                    if (subscriber.PairwiseKey != null)
-                    {
-                        CryptographicOperations.ZeroMemory(subscriber.PairwiseKey);
-                    }
+                    RetireSubscriber(subscriber);
                 }
                 session.Clear();
             }
@@ -1464,8 +1803,7 @@ namespace TermLink.Agent
             ClearSubscribers();
             foreach (var recipient in historyRecipients.Values)
             {
-                if (recipient.ExchangePublicKey != null) CryptographicOperations.ZeroMemory(recipient.ExchangePublicKey);
-                if (recipient.PairwiseKey != null) CryptographicOperations.ZeroMemory(recipient.PairwiseKey);
+                RetireSubscriber(recipient);
             }
             historyRecipients.Clear();
             pendingHistorySessions.Clear();

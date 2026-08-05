@@ -30,6 +30,16 @@ namespace TermLink.Agent
         void Dispose();
     }
 
+    internal interface IInterruptibleRegistryManagedSession
+    {
+        void BeginStop(bool commitInterruptedLifecycle);
+    }
+
+    internal interface IRecoveryRegistrationSession
+    {
+        SessionRegistration Registration { get; }
+    }
+
     internal interface IRegistryManagedSessionFactory
     {
         IRegistryManagedSession Create(
@@ -57,6 +67,7 @@ namespace TermLink.Agent
             ulong resumeFromSequence,
             out ulong earliestRetainedSequence,
             out ulong latestSequence);
+        void DeleteBufferedEvents();
     }
 
     internal sealed class SessionRegistry : IDisposable
@@ -68,6 +79,7 @@ namespace TermLink.Agent
             new Dictionary<Guid, IRegistryManagedSession>();
         private readonly HashSet<Guid> releasedCompletedSessions = new HashSet<Guid>();
         private readonly HashSet<IRegistryManagedSession> retiring = new HashSet<IRegistryManagedSession>();
+        private readonly HashSet<Guid> retainOnCompletion = new HashSet<Guid>();
         private readonly IRegistryManagedSessionFactory sessionFactory;
         private readonly IRegistryRegistrationStore registrationStore;
         private readonly int maximumSessions;
@@ -158,7 +170,7 @@ namespace TermLink.Agent
         {
             foreach (var registration in registrationStore.Load())
             {
-                if (!registration.MatchesRunningHost())
+                if (registration.RecoveryOnly || !registration.MatchesRunningHost())
                 {
                     if (RecoverCompletedSession(registration))
                     {
@@ -328,7 +340,19 @@ namespace TermLink.Agent
             {
                 IRegistryManagedSession managed;
                 if (!sessions.TryGetValue(sessionId, out managed) &&
-                    !completedSessions.TryGetValue(sessionId, out managed)) return false;
+                    !completedSessions.TryGetValue(sessionId, out managed))
+                {
+                    managed = null;
+                    foreach (var candidate in retiring)
+                    {
+                        if (candidate.SessionId == sessionId)
+                        {
+                            managed = candidate;
+                            break;
+                        }
+                    }
+                    if (managed == null) return false;
+                }
                 buffered = managed as IBufferedRegistryManagedSession;
             }
             if (buffered == null) return false;
@@ -348,10 +372,22 @@ namespace TermLink.Agent
                 if (!completedSessions.TryGetValue(sessionId, out completed))
                 {
                     if (sessions.ContainsKey(sessionId)) releasedCompletedSessions.Add(sessionId);
+                    else
+                    {
+                        foreach (var candidate in retiring)
+                        {
+                            if (candidate.SessionId == sessionId)
+                            {
+                                releasedCompletedSessions.Add(sessionId);
+                                break;
+                            }
+                        }
+                    }
                     return;
                 }
                 completedSessions.Remove(sessionId);
             }
+            DeleteBufferedEvents(completed);
             completed.Dispose();
         }
 
@@ -361,11 +397,16 @@ namespace TermLink.Agent
             lock (sync)
             {
                 if (!sessions.TryGetValue(sessionId, out managed)) return new SessionStopResult();
-                registrationStore.Remove(sessionId);
+                if (retainCompletedSessions)
+                {
+                    MarkRecoveryOnly(managed);
+                    retainOnCompletion.Add(sessionId);
+                }
+                else registrationStore.Remove(sessionId);
                 sessions.Remove(sessionId);
                 retiring.Add(managed);
             }
-            managed.BeginStop();
+            BeginStop(managed, true);
             var completed = managed.WaitForStop();
             if (completed)
             {
@@ -384,19 +425,30 @@ namespace TermLink.Agent
             List<IRegistryManagedSession> stopped;
             lock (sync)
             {
-                registrationStore.Clear();
                 remoteAccessEnabled = false;
                 stopped = new List<IRegistryManagedSession>(sessions.Values);
-                foreach (var completed in completedSessions.Values)
+                if (retainCompletedSessions)
                 {
-                    if (!stopped.Contains(completed)) stopped.Add(completed);
+                    foreach (var session in stopped)
+                    {
+                        MarkRecoveryOnly(session);
+                        retainOnCompletion.Add(session.SessionId);
+                    }
+                }
+                else
+                {
+                    registrationStore.Clear();
+                    foreach (var completed in completedSessions.Values)
+                    {
+                        if (!stopped.Contains(completed)) stopped.Add(completed);
+                    }
+                    completedSessions.Clear();
+                    releasedCompletedSessions.Clear();
                 }
                 sessions.Clear();
-                completedSessions.Clear();
-                releasedCompletedSessions.Clear();
                 foreach (var session in stopped) retiring.Add(session);
             }
-            return StopSessions(stopped);
+            return StopSessions(stopped, true);
         }
 
         public bool EnableRemoteAccess()
@@ -412,25 +464,37 @@ namespace TermLink.Agent
 
         private void OnSessionCompleted(IRegistryManagedSession completed)
         {
+            var deleteReleasedBuffer = false;
             lock (sync)
             {
                 IRegistryManagedSession current;
-                if (sessions.TryGetValue(completed.SessionId, out current) &&
-                    ReferenceEquals(current, completed))
+                var wasActive = sessions.TryGetValue(completed.SessionId, out current) &&
+                    ReferenceEquals(current, completed);
+                var wasRetainedStop = retainOnCompletion.Remove(completed.SessionId);
+                if (wasActive || wasRetainedStop)
                 {
                     var alreadyReleased = releasedCompletedSessions.Remove(completed.SessionId);
+                    deleteReleasedBuffer = alreadyReleased;
                     if (retainCompletedSessions && !alreadyReleased && !preserveRegistrationsOnShutdown)
                     {
+                        MarkRecoveryOnly(completed);
                         completedSessions[completed.SessionId] = completed;
                     }
                     else if (!preserveRegistrationsOnShutdown)
                     {
                         registrationStore.Remove(completed.SessionId);
                     }
-                    sessions.Remove(completed.SessionId);
+                    if (wasActive) sessions.Remove(completed.SessionId);
                 }
                 retiring.Remove(completed);
             }
+            if (deleteReleasedBuffer) DeleteBufferedEvents(completed);
+        }
+
+        private static void DeleteBufferedEvents(IRegistryManagedSession session)
+        {
+            var buffered = session as IBufferedRegistryManagedSession;
+            if (buffered != null) buffered.DeleteBufferedEvents();
         }
 
         public SessionStopResult Shutdown()
@@ -449,7 +513,6 @@ namespace TermLink.Agent
             lock (sync)
             {
                 if (preserveRegistrations) preserveRegistrationsOnShutdown = true;
-                if (!preserveRegistrationsOnShutdown) registrationStore.Clear();
                 disposed = true;
                 remoteAccessEnabled = false;
                 stopped = new List<IRegistryManagedSession>(retiring);
@@ -458,21 +521,50 @@ namespace TermLink.Agent
                     if (!stopped.Contains(session)) stopped.Add(session);
                     retiring.Add(session);
                 }
-                foreach (var completed in completedSessions.Values)
+                if (preserveRegistrationsOnShutdown || !retainCompletedSessions)
                 {
-                    if (!stopped.Contains(completed)) stopped.Add(completed);
-                    retiring.Add(completed);
+                    foreach (var completed in completedSessions.Values)
+                    {
+                        if (!stopped.Contains(completed)) stopped.Add(completed);
+                        retiring.Add(completed);
+                    }
+                    completedSessions.Clear();
+                    releasedCompletedSessions.Clear();
+                }
+                if (!preserveRegistrationsOnShutdown && retainCompletedSessions)
+                {
+                    foreach (var session in stopped)
+                    {
+                        MarkRecoveryOnly(session);
+                        retainOnCompletion.Add(session.SessionId);
+                    }
+                }
+                else
+                {
+                    retainOnCompletion.Clear();
+                    if (!preserveRegistrationsOnShutdown) registrationStore.Clear();
                 }
                 sessions.Clear();
-                completedSessions.Clear();
-                releasedCompletedSessions.Clear();
             }
-            return StopSessions(stopped);
+            return StopSessions(stopped, !preserveRegistrationsOnShutdown);
         }
 
-        private SessionStopResult StopSessions(IList<IRegistryManagedSession> stopped)
+        private static void BeginStop(IRegistryManagedSession session, bool commitInterruptedLifecycle)
         {
-            foreach (var session in stopped) session.BeginStop();
+            var interruptible = session as IInterruptibleRegistryManagedSession;
+            if (interruptible != null) interruptible.BeginStop(commitInterruptedLifecycle);
+            else session.BeginStop();
+        }
+
+        private void MarkRecoveryOnly(IRegistryManagedSession session)
+        {
+            var recoverable = session as IRecoveryRegistrationSession;
+            if (recoverable != null) registrationStore.Upsert(recoverable.Registration.AsRecoveryOnly());
+        }
+
+        private SessionStopResult StopSessions(IList<IRegistryManagedSession> stopped, bool commitInterruptedLifecycle)
+        {
+            foreach (var session in stopped) BeginStop(session, commitInterruptedLifecycle);
             var completed = 0;
             var timedOut = 0;
             foreach (var session in stopped)
@@ -615,15 +707,21 @@ namespace TermLink.Agent
                 out latestSequence);
         }
 
+        public void DeleteBufferedEvents()
+        {
+            buffer.DeleteAll();
+        }
+
         public void Dispose()
         {
             buffer.Dispose();
         }
     }
 
-    internal sealed class ManagedSession : IRegistryManagedSession, IRemoteControllableSession, IRemoteResizableSession, IBufferedRegistryManagedSession
+    internal sealed class ManagedSession : IRegistryManagedSession, IInterruptibleRegistryManagedSession, IRecoveryRegistrationSession, IRemoteControllableSession, IRemoteResizableSession, IBufferedRegistryManagedSession
     {
         private readonly SessionAgent agent;
+        private readonly SessionRegistration registration;
         private readonly ManagedShellType shellType;
         private readonly DateTime registeredAtUtc;
         private readonly Action<IRegistryManagedSession> completion;
@@ -639,6 +737,7 @@ namespace TermLink.Agent
             Action<IRegistryManagedSession> completion,
             Action<ManagedShellType, LocalFrame> committedFrame = null)
         {
+            this.registration = registration;
             SessionId = registration.SessionId;
             shellType = registration.ShellType;
             registeredAtUtc = registration.RegisteredAtUtc;
@@ -656,6 +755,7 @@ namespace TermLink.Agent
 
         public Guid SessionId { get; private set; }
         public ManagedShellType ShellType { get { return shellType; } }
+        public SessionRegistration Registration { get { return registration; } }
 
         public void Start()
         {
@@ -706,6 +806,11 @@ namespace TermLink.Agent
 
         public void BeginStop()
         {
+            BeginStop(true);
+        }
+
+        public void BeginStop(bool commitInterruptedLifecycle)
+        {
             var request = false;
             lock (sync)
             {
@@ -715,7 +820,7 @@ namespace TermLink.Agent
                     request = true;
                 }
             }
-            if (request) agent.RequestRemoteStop();
+            if (request) agent.RequestRemoteStop(commitInterruptedLifecycle);
         }
 
         public bool TrySendRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
@@ -742,6 +847,11 @@ namespace TermLink.Agent
                 resumeFromSequence,
                 out earliestRetainedSequence,
                 out latestSequence);
+        }
+
+        public void DeleteBufferedEvents()
+        {
+            agent.DeleteBufferedEvents();
         }
 
         public bool WaitForStop()
@@ -1032,6 +1142,10 @@ namespace TermLink.Agent
                 case RegistryCommand.Shutdown:
                     shutdownRequested = true;
                     var shutdown = registry.Shutdown();
+#if TERMLINK_PRODUCTION_RUNTIME
+                    if (productionRuntime != null)
+                        productionRuntime.DrainTerminalPublications(TimeSpan.FromSeconds(10));
+#endif
                     return StopResponse(
                         shutdown,
                         "REGISTRY_SHUTDOWN",
@@ -1054,7 +1168,7 @@ namespace TermLink.Agent
                 case RegistryCommand.CreatePairingChallenge:
 #if TERMLINK_PRODUCTION_RUNTIME
                     if (productionRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
-                    productionRuntime.CreatePairingChallenge(request.DeviceId);
+                    productionRuntime.CreatePairingChallenge(request.DeviceId, request.PairingPermission);
                     return Response(true, "PAIRING_CHALLENGE_CREATED", 0);
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
@@ -1130,7 +1244,16 @@ namespace TermLink.Agent
                 try { pipe.Dispose(); }
                 catch (ObjectDisposedException) { }
             }
+            registry.Shutdown();
+#if TERMLINK_PRODUCTION_RUNTIME
+            if (productionRuntime != null)
+            {
+                productionRuntime.DrainTerminalPublications(TimeSpan.FromSeconds(10));
+                productionRuntime.Dispose();
+            }
+#else
             if (productionRuntime != null) productionRuntime.Dispose();
+#endif
             registry.Dispose();
         }
 
