@@ -354,7 +354,7 @@ git diff --check
 ## 12. 2026-08-07 Windows 安装器自动复用上次目录
 
 - 安装器现在把最后一次成功安装根目录作为 HKCU `Software\\TermLink` 的非敏感提示保存；
-  安装 marker 仍是唯一可信依据。启动图形安装向导时按“已登记目录 → 默认目录 → 常见安装目录”
+  安装 marker 仍是唯一可信依据。启动图形安装向导时按“已登记目录 → 既有 Terminal Fragment → 默认目录 → 常见安装目录”
   顺序发现，并要求 marker 的产品、规范化 `InstallRoot` 与受控 `TermLink.Agent.exe` /
   `TermLink.Tray.exe` 同时匹配，损坏或越权 marker 会安全忽略。
 - 显式 `--install-dir` 继续拥有最高优先级；无目录的卸载命令也会自动找到上次安装目录。
