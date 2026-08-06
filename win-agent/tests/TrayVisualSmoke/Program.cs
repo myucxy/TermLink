@@ -14,7 +14,6 @@ var preferencesType = assembly.GetType("TermLink.Tray.TrayPreferences", true)!;
 var languageType = assembly.GetType("TermLink.Tray.TrayLanguage", true)!;
 var themeType = assembly.GetType("TermLink.Tray.TrayTheme", true)!;
 var formType = assembly.GetType("TermLink.Tray.MainWindowForm", true)!;
-var popupType = assembly.GetType("TermLink.Tray.TrayPopupForm", true)!;
 var accountLinkType = assembly.GetType("TermLink.Tray.AccountLinkForm", true)!;
 var parse = optionsType.GetMethod("Parse", BindingFlags.Public | BindingFlags.Static)!;
 var update = preferencesType.GetMethod("Update", BindingFlags.Public | BindingFlags.Static)!;
@@ -45,7 +44,7 @@ try
         form.Show();
         Application.DoEvents();
 
-        foreach (var page in new[] { "sessions", "remote", "devices", "activity", "settings", "membership" })
+        foreach (var page in new[] { "sessions", "connection", "settings" })
         {
             navigate.Invoke(form, new object[] { page });
             Application.DoEvents();
@@ -68,23 +67,6 @@ try
         }
         accountLink.Hide();
 
-        Action<string> popupNavigate = _ => { };
-        Action noAction = () => { };
-        using var popup = (Form)Activator.CreateInstance(
-            popupType,
-            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
-            null,
-            new object[] { popupNavigate, noAction, noAction },
-            null)!;
-        popup.StartPosition = FormStartPosition.Manual;
-        popup.Location = new Point(20, 20);
-        popup.Show();
-        var applyUnavailable = popupType.GetMethod("ApplyUnavailable", BindingFlags.Instance | BindingFlags.Public)!;
-        applyUnavailable.Invoke(popup, new object[] { new InvalidOperationException("visual smoke") });
-        Application.DoEvents();
-        using var popupBitmap = new Bitmap(popup.Width, popup.Height);
-        popup.DrawToBitmap(popupBitmap, new Rectangle(Point.Empty, popup.Size));
-        popupBitmap.Save(Path.Combine(outputRoot, $"{language.ToLowerInvariant()}-{theme.ToLowerInvariant()}-tray.png"), ImageFormat.Png);
     }
 }
 finally

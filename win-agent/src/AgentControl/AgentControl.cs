@@ -326,6 +326,8 @@ namespace TermLink.Agent
     {
         public bool Configured { get; set; }
         public bool AccountLinked { get; set; }
+        public string AccountUsername { get; set; }
+        public string AccountEmail { get; set; }
         public string ServerHost { get; set; }
         public string PcName { get; set; }
         public ProductionRelayState RelayState { get; set; }
@@ -349,7 +351,7 @@ namespace TermLink.Agent
 
     public static class RegistryControlCodec
     {
-        private const byte Version = 4;
+        private const byte Version = 5;
         private const int MaximumBytes = 64 * 1024;
 
         public static void WriteRequest(Stream stream, RegistryRequest request)
@@ -522,6 +524,8 @@ namespace TermLink.Agent
             };
             writer.Write(status.Configured);
             writer.Write(status.AccountLinked);
+            WriteString(writer, status.AccountUsername ?? string.Empty);
+            WriteString(writer, status.AccountEmail ?? string.Empty);
             WriteString(writer, status.ServerHost ?? string.Empty);
             WriteString(writer, status.PcName ?? string.Empty);
             writer.Write((byte)status.RelayState);
@@ -568,6 +572,8 @@ namespace TermLink.Agent
             {
                 Configured = reader.ReadBoolean(),
                 AccountLinked = reader.ReadBoolean(),
+                AccountUsername = ReadString(reader),
+                AccountEmail = ReadString(reader),
                 ServerHost = ReadString(reader),
                 PcName = ReadString(reader)
             };

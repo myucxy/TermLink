@@ -468,12 +468,7 @@ namespace TermLink.Tray
         private readonly ToolStripMenuItem statusItem;
         private readonly ToolStripMenuItem accountItem;
         private readonly ToolStripMenuItem relayItem;
-        private readonly ToolStripMenuItem accountDevicesItem;
-        private readonly ToolStripMenuItem linkAccountItem;
-        private readonly ToolStripMenuItem registerAccountItem;
         private readonly ToolStripMenuItem sessionsItem;
-        private readonly ToolStripMenuItem stopAllItem;
-        private readonly ToolStripMenuItem enableItem;
         private readonly ToolStripMenuItem restartItem;
         private readonly ToolStripMenuItem openItem;
         private readonly ToolStripMenuItem settingsItem;
@@ -481,7 +476,6 @@ namespace TermLink.Tray
         private readonly System.Windows.Forms.Timer refreshTimer;
         private int refreshInFlight;
         private MainWindowForm mainWindow;
-        private TrayPopupForm trayPopup;
         private RegistryResponse latestResponse;
         private Exception latestError;
 
@@ -496,14 +490,9 @@ namespace TermLink.Tray
             statusItem = new ToolStripMenuItem(TrayText.Pick("正在连接", "Connecting")) { Enabled = false };
             accountItem = new ToolStripMenuItem(TrayText.Pick("账户：检查中", "Account: checking")) { Enabled = false };
             relayItem = new ToolStripMenuItem(TrayText.Pick("Relay：检查中", "Relay: checking")) { Enabled = false };
-            accountDevicesItem = new ToolStripMenuItem(TrayText.Pick("账户与设备", "Account and devices"), null, delegate { OpenAccountDevices(); });
-            linkAccountItem = new ToolStripMenuItem(TrayText.Pick("登录账户…", "Sign in..."), null, async delegate { await LoginAccountAsync(); });
-            registerAccountItem = new ToolStripMenuItem(TrayText.Pick("创建账户…", "Create account..."), null, async delegate { await RegisterAccountAsync(); });
             sessionsItem = new ToolStripMenuItem(TrayText.Pick("打开会话", "Open sessions"), null, delegate { OpenSessions(); });
-            stopAllItem = new ToolStripMenuItem(TrayText.Pick("停止远程访问", "Stop remote access"), null, delegate { StopAll(); });
-            enableItem = new ToolStripMenuItem(TrayText.Pick("恢复远程访问", "Enable remote access"), null, delegate { EnableRemoteAccess(); });
             restartItem = new ToolStripMenuItem(TrayText.Pick("重启 Agent", "Restart agent"), null, delegate { RestartAgent(); });
-            openItem = new ToolStripMenuItem(TrayText.Pick("打开 TermLink", "Open TermLink"), null, delegate { OpenMainWindow("sessions"); });
+            openItem = new ToolStripMenuItem(TrayText.Pick("打开 TermLink", "Open TermLink"), null, delegate { OpenMainWindow("connection"); });
             settingsItem = new ToolStripMenuItem(TrayText.Pick("设置", "Settings"), null, delegate { OpenMainWindow("settings"); });
             exitItem = new ToolStripMenuItem(TrayText.Pick("退出托盘", "Exit tray"), null, delegate { ExitTray(); });
             var menu = new ContextMenuStrip();
@@ -512,12 +501,7 @@ namespace TermLink.Tray
             menu.Items.Add(accountItem);
             menu.Items.Add(relayItem);
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(accountDevicesItem);
-            menu.Items.Add(linkAccountItem);
-            menu.Items.Add(registerAccountItem);
             menu.Items.Add(sessionsItem);
-            menu.Items.Add(stopAllItem);
-            menu.Items.Add(enableItem);
             menu.Items.Add(restartItem);
             menu.Items.Add(openItem);
             menu.Items.Add(settingsItem);
@@ -525,7 +509,6 @@ namespace TermLink.Tray
             menu.Items.Add(exitItem);
             menu.Opening += delegate
             {
-                if (trayPopup != null && trayPopup.Visible) trayPopup.Hide();
                 _ = RefreshStateAsync(false);
             };
 
@@ -538,9 +521,9 @@ namespace TermLink.Tray
             };
             notifyIcon.MouseUp += delegate(object sender, MouseEventArgs e)
             {
-                if (e.Button == MouseButtons.Left) ToggleTrayPopup();
+                if (e.Button == MouseButtons.Left) OpenMainWindow("connection");
             };
-            notifyIcon.DoubleClick += delegate { OpenMainWindow("sessions"); };
+            notifyIcon.DoubleClick += delegate { OpenMainWindow("connection"); };
             refreshTimer = new System.Windows.Forms.Timer { Interval = 3000 };
             refreshTimer.Tick += async delegate { await RefreshStateAsync(false); };
             refreshTimer.Start();
@@ -568,22 +551,11 @@ namespace TermLink.Tray
 
         private void PreferencesChanged()
         {
-            accountDevicesItem.Text = TrayText.Pick("账户与设备", "Account and devices");
-            linkAccountItem.Text = TrayText.Pick("登录账户…", "Sign in...");
-            registerAccountItem.Text = TrayText.Pick("创建账户…", "Create account...");
             sessionsItem.Text = TrayText.Pick("打开会话", "Open sessions");
-            stopAllItem.Text = TrayText.Pick("停止远程访问", "Stop remote access");
-            enableItem.Text = TrayText.Pick("恢复远程访问", "Enable remote access");
             restartItem.Text = TrayText.Pick("重启 Agent", "Restart agent");
             openItem.Text = TrayText.Pick("打开 TermLink", "Open TermLink");
             settingsItem.Text = TrayText.Pick("设置", "Settings");
             exitItem.Text = TrayText.Pick("退出托盘", "Exit tray");
-            if (trayPopup != null)
-            {
-                trayPopup.Close();
-                trayPopup.Dispose();
-                trayPopup = null;
-            }
         }
 
         private void ApplyState(RegistryResponse response)
@@ -593,19 +565,11 @@ namespace TermLink.Tray
             latestError = null;
             var count = response.Summaries == null ? 0 : response.Summaries.Count;
             var production = response.Production ?? new ProductionStatus();
-            statusItem.Text = response.RemoteAccessEnabled
-                ? TrayText.Pick("远程访问已开启 · " + count + " 个会话", "Remote access on · " + count + " sessions")
-                : TrayText.Pick("远程访问已停止", "Remote access off");
+            statusItem.Text = TrayText.Pick("Agent · " + count + " 个会话", "Agent · " + count + " sessions");
             accountItem.Text = TrayText.Pick("账户：", "Account: ") + TrayDisplay.LocalizedAccountStatus(production);
             relayItem.Text = TrayText.Pick("Relay：", "Relay: ") + TrayDisplay.LocalizedRelayStatus(production.RelayState);
-            accountDevicesItem.Enabled = true;
             sessionsItem.Enabled = true;
-            stopAllItem.Enabled = response.RemoteAccessEnabled;
-            enableItem.Enabled = !response.RemoteAccessEnabled;
-            notifyIcon.Text = response.RemoteAccessEnabled
-                ? "TermLink · " + TrayText.Pick("远程开启", "remote on")
-                : "TermLink · " + TrayText.Pick("远程停止", "remote off");
-            if (trayPopup != null && !trayPopup.IsDisposed) trayPopup.Apply(response);
+            notifyIcon.Text = "TermLink · " + TrayDisplay.LocalizedRelayStatus(production.RelayState);
             if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.Apply(response);
         }
 
@@ -616,11 +580,7 @@ namespace TermLink.Tray
             statusItem.Text = TrayText.Pick("Agent 不可用", "Agent unavailable");
             accountItem.Text = TrayText.Pick("账户：不可用", "Account: unavailable");
             relayItem.Text = TrayText.Pick("Relay：不可用", "Relay: unavailable");
-            accountDevicesItem.Enabled = false;
             sessionsItem.Enabled = false;
-            stopAllItem.Enabled = false;
-            enableItem.Enabled = false;
-            if (trayPopup != null && !trayPopup.IsDisposed) trayPopup.ApplyUnavailable(error);
             if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.ApplyUnavailable(error);
             if (showFailure) ShowFailure(error.Message);
         }
@@ -633,7 +593,6 @@ namespace TermLink.Tray
 
         private void OpenMainWindow(string page)
         {
-            if (trayPopup != null && trayPopup.Visible) trayPopup.Hide();
             if (mainWindow == null || mainWindow.IsDisposed)
             {
                 mainWindow = new MainWindowForm(controller);
@@ -642,28 +601,26 @@ namespace TermLink.Tray
             mainWindow.Show();
             mainWindow.Activate();
             mainWindow.Navigate(page);
-            _ = mainWindow.RefreshAsync();
+            _ = OpenMainWindowAsync();
         }
 
-        private void ToggleTrayPopup()
+        private async Task OpenMainWindowAsync()
         {
-            if (trayPopup != null && !trayPopup.IsDisposed && trayPopup.Visible)
+            try
             {
-                trayPopup.Hide();
-                return;
+                await mainWindow.RefreshAsync();
+                var response = await Task.Run(() => controller.EnsureAgent());
+                ApplyState(response);
+                var production = response == null ? null : response.Production;
+                if (production == null || !production.AccountLinked)
+                {
+                    await LoginAccountAsync();
+                }
             }
-            if (trayPopup == null || trayPopup.IsDisposed)
+            catch (Exception error)
             {
-                trayPopup = new TrayPopupForm(
-                    OpenMainWindow,
-                    StopAll,
-                    EnableRemoteAccess,
-                    LoginAccountAsync);
-                if (latestResponse != null) trayPopup.Apply(latestResponse);
-                else if (latestError != null) trayPopup.ApplyUnavailable(latestError);
+                ShowFailure(error.Message);
             }
-            trayPopup.ShowNear(Cursor.Position);
-            _ = RefreshStateAsync(false);
         }
 
         private void OpenSessions()
@@ -671,17 +628,11 @@ namespace TermLink.Tray
             OpenMainWindow("sessions");
         }
 
-        private void OpenAccountDevices()
-        {
-            OpenMainWindow("devices");
-        }
-
         private async Task LoginAccountAsync()
         {
             using (var dialog = new AccountLinkForm())
             {
                 if (dialog.ShowDialog() != DialogResult.OK) return;
-                linkAccountItem.Enabled = false;
                 try
                 {
                     await Task.Run(() => controller.LoginAccount(dialog.Username, dialog.Password, dialog.PcName));
@@ -694,7 +645,6 @@ namespace TermLink.Tray
                 {
                     ShowFailure(error.Message);
                 }
-                finally { linkAccountItem.Enabled = true; }
             }
         }
 
@@ -703,7 +653,6 @@ namespace TermLink.Tray
             using (var dialog = new AccountRegisterForm())
             {
                 if (dialog.ShowDialog() != DialogResult.OK) return;
-                registerAccountItem.Enabled = false;
                 try
                 {
                     await Task.Run(() => controller.RegisterAccount(dialog.Username, dialog.Email, dialog.Password, dialog.Confirm, dialog.PcName));
@@ -716,7 +665,6 @@ namespace TermLink.Tray
                 {
                     ShowFailure(error.Message);
                 }
-                finally { registerAccountItem.Enabled = true; }
             }
         }
 
@@ -779,7 +727,6 @@ namespace TermLink.Tray
         private void ExitTray()
         {
             refreshTimer.Stop();
-            if (trayPopup != null && !trayPopup.IsDisposed) trayPopup.Close();
             notifyIcon.Visible = false;
             notifyIcon.Dispose();
             if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.Close();
@@ -793,7 +740,6 @@ namespace TermLink.Tray
                 TrayPreferences.Changed -= PreferencesChanged;
                 refreshTimer.Dispose();
                 notifyIcon.Dispose();
-                if (trayPopup != null && !trayPopup.IsDisposed) trayPopup.Dispose();
                 if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.Dispose();
                 applicationIcon.Dispose();
             }
@@ -1669,16 +1615,19 @@ namespace TermLink.Tray
         private readonly Dictionary<string, Button> navigationButtons = new Dictionary<string, Button>(StringComparer.OrdinalIgnoreCase);
         private readonly Label identityName;
         private readonly Label identityState;
-        private readonly Label footerLabel;
+        private readonly TableLayoutPanel accountFooter;
+        private readonly Label accountIdentityLabel;
+        private readonly Button accountLoginButton;
+        private readonly Button accountRegisterButton;
         private readonly Label shellStatusLabel;
         private readonly Button refreshButton;
         private readonly Icon applicationIcon;
         private readonly Bitmap brandBitmap;
         private readonly List<string> navigationOrder = new List<string>
         {
-            "sessions", "remote", "devices", "activity", "settings"
+            "sessions", "connection", "settings"
         };
-        private string currentPage = "sessions";
+        private string currentPage = "connection";
         private Control activePage;
         private SessionListForm sessionChild;
         private AccountDevicesForm devicesChild;
@@ -1725,21 +1674,62 @@ namespace TermLink.Tray
                 Padding = new Padding(0),
                 Margin = new Padding(0)
             };
-            root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 220));
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 260));
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 78));
 
             navigationPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(14, 16, 12, 10) };
             contentHost = new Panel { Dock = DockStyle.Fill, Padding = new Padding(1) };
-            footerLabel = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(12, 0, 12, 0) };
+            accountFooter = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 1,
+                Padding = new Padding(12, 4, 8, 4),
+                Margin = new Padding(0),
+                Tag = "sidebar"
+            };
+            accountFooter.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 140));
+            accountFooter.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            accountFooter.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            accountIdentityLabel = new Label
+            {
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                Font = new Font(Font.FontFamily, 8F, FontStyle.Regular),
+                Text = TrayText.Pick("未登录\r\n登录后连接 TermLink", "Not signed in\r\nSign in to connect TermLink")
+            };
+            var accountActions = new FlowLayoutPanel
+            {
+                AutoSize = true,
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                Margin = new Padding(4, 0, 0, 0),
+                Tag = "sidebar"
+            };
+            accountLoginButton = CreateButton(TrayText.Pick("登录", "Sign in"));
+            accountLoginButton.AutoSize = false;
+            accountLoginButton.Size = new Size(78, 30);
+            accountLoginButton.Margin = new Padding(1);
+            accountLoginButton.Click += async delegate { await LoginAccountFromWindowAsync(); };
+            accountRegisterButton = CreateButton(TrayText.Pick("注册", "Register"));
+            accountRegisterButton.AutoSize = false;
+            accountRegisterButton.Size = new Size(50, 30);
+            accountRegisterButton.Margin = new Padding(1);
+            accountRegisterButton.Click += async delegate { await RegisterAccountFromWindowAsync(); };
+            accountActions.Controls.Add(accountLoginButton);
+            accountActions.Controls.Add(accountRegisterButton);
+            accountFooter.Controls.Add(accountIdentityLabel, 0, 0);
+            accountFooter.Controls.Add(accountActions, 1, 0);
             shellStatusLabel = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight, Padding = new Padding(12, 0, 12, 0), AutoEllipsis = true };
             root.Controls.Add(navigationPanel, 0, 0);
             root.Controls.Add(contentHost, 1, 0);
-            root.Controls.Add(footerLabel, 0, 1);
+            root.Controls.Add(accountFooter, 0, 1);
             root.Controls.Add(shellStatusLabel, 1, 1);
             Controls.Add(root);
-            footerLabel.Text = "TermLink Agent";
 
             var brand = new TableLayoutPanel
             {
@@ -1864,9 +1854,7 @@ namespace TermLink.Tray
             DisposeActivePage();
             switch (currentPage)
             {
-                case "remote": CreateRemotePage(); break;
-                case "devices": CreateDevicesPage(); break;
-                case "activity": CreateActivityPage(); break;
+                case "connection": CreateActivityPage(); break;
                 case "settings": CreateSettingsPage(); break;
                 default: CreateSessionsPage(); break;
             }
@@ -1896,6 +1884,18 @@ namespace TermLink.Tray
                 ? TrayText.Pick("Agent 状态已同步", "Agent status synced")
                 : TrayText.Pick("Agent 返回错误", "Agent returned an error");
             if (sessionChild != null && !sessionChild.IsDisposed) sessionChild.Apply(response);
+            if (production.AccountLinked)
+            {
+                accountIdentityLabel.Text = TrayDisplay.StringOrDash(production.AccountUsername) + "\r\n" + TrayDisplay.StringOrDash(production.AccountEmail);
+                accountLoginButton.Text = TrayText.Pick("重新登录", "Sign in again");
+                accountRegisterButton.Visible = false;
+            }
+            else
+            {
+                accountIdentityLabel.Text = TrayText.Pick("未登录\r\n请先登录 TermLink", "Not signed in\r\nSign in to TermLink first");
+                accountLoginButton.Text = TrayText.Pick("登录", "Sign in");
+                accountRegisterButton.Visible = true;
+            }
             if (devicesChild != null && !devicesChild.IsDisposed) devicesChild.Apply(response);
             UpdateRemotePage(production);
             UpdateActivityPage(production);
@@ -1911,6 +1911,7 @@ namespace TermLink.Tray
             }
             latestResponse = null;
             identityState.Text = TrayText.Pick("○ Agent 不可用", "○ Agent unavailable");
+            accountIdentityLabel.Text = TrayText.Pick("账户状态不可用", "Account status unavailable");
             shellStatusLabel.Text = error == null
                 ? TrayText.Pick("未连接", "Not connected")
                 : TrayText.Pick("Agent 不可用 · 请确认服务正在运行", "Agent unavailable · confirm the service is running");
@@ -1963,9 +1964,7 @@ namespace TermLink.Tray
         {
             switch (key)
             {
-                case "remote": return "↗ " + NavigationDisplayLabel(key);
-                case "devices": return "◇ " + NavigationDisplayLabel(key);
-                case "activity": return "⌁ " + NavigationDisplayLabel(key);
+                case "connection": return "↔ " + NavigationDisplayLabel(key);
                 case "settings": return "⚙ " + NavigationDisplayLabel(key);
                 default: return "▣ " + NavigationDisplayLabel(key);
             }
@@ -1975,9 +1974,7 @@ namespace TermLink.Tray
         {
             switch (key)
             {
-                case "remote": return TrayText.Pick("远程访问", "Remote access");
-                case "devices": return TrayText.Pick("设备", "Devices");
-                case "activity": return TrayText.Pick("活动", "Activity");
+                case "connection": return TrayText.Pick("连接服务器", "Server connection");
                 case "settings": return TrayText.Pick("设置", "Settings");
                 default: return TrayText.Pick("会话", "Sessions");
             }
@@ -1987,9 +1984,7 @@ namespace TermLink.Tray
         {
             switch (key)
             {
-                case "remote": return TrayText.Pick("远程访问", "Remote access");
-                case "devices": return TrayText.Pick("设备列表", "Device list");
-                case "activity": return TrayText.Pick("活动与诊断", "Activity & diagnostics");
+                case "connection": return TrayText.Pick("连接服务器", "Server connection");
                 case "settings": return TrayText.Pick("Agent 设置", "Agent settings");
                 default: return TrayText.Pick("会话", "Sessions");
             }
@@ -2048,7 +2043,7 @@ namespace TermLink.Tray
             var shell = CreatePageShell(
                 TrayText.Pick("本机", "This PC"),
                 TrayText.Pick("受管会话", "Managed sessions"),
-                TrayText.Pick("本地 Shell 始终优先，远程连接可随时停止。", "Local shells stay available; remote access can be stopped at any time."),
+                TrayText.Pick("通过 Windows Terminal 的 TermLink Profile 启动并管理本机会话。", "Start and manage local sessions from a TermLink Windows Terminal profile."),
                 out body);
             sessionChild = sessionChild == null || sessionChild.IsDisposed ? new SessionListForm(controller) : sessionChild;
             sessionChild.TopLevel = false;
@@ -2144,20 +2139,20 @@ namespace TermLink.Tray
         {
             Panel body;
             var shell = CreatePageShell(
-                TrayText.Pick("可观测性", "Observability"),
-                TrayText.Pick("活动与诊断", "Activity & diagnostics"),
-                TrayText.Pick("只显示状态和元数据，不显示终端正文。", "Status and metadata only; terminal content is never shown here."),
+                TrayText.Pick("TermLink 服务", "TermLink service"),
+                TrayText.Pick("连接服务器", "Server connection"),
+                TrayText.Pick("查看 Win-Agent 与 TermLink 服务器之间的实时连接状态。", "View the live connection between Win-Agent and the TermLink server."),
                 out body);
             var stack = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false };
-            var health = CreateCard(TrayText.Pick("运行健康", "Runtime health"), out var healthBody);
-            activitySummaryLabel = CreateValueLabel(TrayText.Pick("等待 Agent 状态…", "Waiting for Agent status…"), 12, true);
+            var health = CreateCard(TrayText.Pick("当前连接", "Current connection"), out var healthBody);
+            activitySummaryLabel = CreateValueLabel(TrayText.Pick("正在检查服务器连接…", "Checking the server connection…"), 12, true);
             diagnosticsSummaryLabel = CreateValueLabel("", 10, false);
             healthBody.Controls.Add(activitySummaryLabel);
             healthBody.Controls.Add(diagnosticsSummaryLabel);
             stack.Controls.Add(health);
-            var note = CreateCard(TrayText.Pick("诊断原则", "Diagnostic boundary"), out var noteBody);
+            var note = CreateCard(TrayText.Pick("连接说明", "Connection details"), out var noteBody);
             noteBody.Controls.Add(CreateValueLabel(
-                TrayText.Pick("诊断包只包含版本、协议、Relay 和缓冲区摘要；不会导出命令、Token 或终端输出。", "Diagnostics contain version, protocol, Relay and buffer summaries; commands, tokens and terminal output are never exported."),
+                TrayText.Pick("服务器地址由 TermLink 固定配置；断线后 Agent 会自动重连，本地 Shell 不受影响。", "The TermLink server is preconfigured. Agent reconnects automatically and local shells keep running."),
                 10,
                 false));
             stack.Controls.Add(note);
@@ -2202,7 +2197,7 @@ namespace TermLink.Tray
             stack.Controls.Add(appearance);
             var safety = CreateCard(TrayText.Pick("本地优先", "Local-first safety"), out var safetyBody);
             safetyBody.Controls.Add(CreateValueLabel(
-                TrayText.Pick("本地 Shell 不依赖 Relay。停止远程访问由本机立即执行；设备撤销需要服务器连接并同步撤销状态。", "Local shells do not depend on Relay. This PC stops remote access immediately; device revocation requires the server and synchronizes revoked state."),
+                TrayText.Pick("本地 Shell 始终独立运行；服务器短暂断线不会终止当前终端。", "Local shells keep running independently; a temporary server disconnect never terminates the current terminal."),
                 10,
                 false));
             stack.Controls.Add(safety);
@@ -2311,11 +2306,13 @@ namespace TermLink.Tray
         {
             if (activitySummaryLabel == null || latestResponse == null) return;
             var relay = production == null ? ProductionRelayState.NotConfigured : production.RelayState;
-            activitySummaryLabel.Text = TrayText.Pick("Agent：正常 · Relay：", "Agent: healthy · Relay: ") +
-                TrayDisplay.LocalizedRelayStatus(relay);
-            diagnosticsSummaryLabel.Text = TrayText.Pick(
-                "会话 " + (latestResponse.Summaries == null ? 0 : latestResponse.Summaries.Count) + " · 远程访问 " + (latestResponse.RemoteAccessEnabled ? "开启" : "停止"),
-                (latestResponse.Summaries == null ? 0 : latestResponse.Summaries.Count) + " sessions · remote access " + (latestResponse.RemoteAccessEnabled ? "on" : "off"));
+            activitySummaryLabel.Text = relay == ProductionRelayState.Connected
+                ? TrayText.Pick("● 已连接到服务器", "● Connected to server")
+                : TrayText.Pick("○ ", "○ ") + TrayDisplay.LocalizedRelayStatus(relay);
+            diagnosticsSummaryLabel.Text = TrayText.Pick("服务器：", "Server: ") +
+                TrayDisplay.StringOrDash(production == null ? null : production.ServerHost) + "\r\n" +
+                TrayText.Pick("最近连接：", "Last connected: ") +
+                TrayDisplay.DateTimeOrDash(production == null ? null : production.LastConnectedAtUtc);
         }
 
         private void UpdateMembershipPage(ProductionStatus production)
@@ -2453,10 +2450,33 @@ namespace TermLink.Tray
                     var response = await Task.Run(() => controller.RestartAgent());
                     if (!response.Success) throw new InvalidOperationException(response.Code);
                     Apply(response);
+                    MessageBox.Show(TrayText.Pick("账户登录成功，服务器连接正在建立。", "Signed in successfully. Connecting to the server."), "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
-                catch (Exception)
+                catch (Exception error)
                 {
-                    MessageBox.Show(TrayText.Pick("账户登录未完成，请重试或查看诊断。", "Account sign-in did not complete. Retry or open diagnostics."), "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show(TrayText.Pick("账户登录失败：", "Account sign-in failed: ") + error.Message, "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                finally { SetBusy(false); }
+            }
+        }
+
+        private async Task RegisterAccountFromWindowAsync()
+        {
+            using (var dialog = new AccountRegisterForm())
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                SetBusy(true);
+                try
+                {
+                    await Task.Run(() => controller.RegisterAccount(dialog.Username, dialog.Email, dialog.Password, dialog.Confirm, dialog.PcName));
+                    var response = await Task.Run(() => controller.RestartAgent());
+                    if (!response.Success) throw new InvalidOperationException(response.Code);
+                    Apply(response);
+                    MessageBox.Show(TrayText.Pick("账户创建成功，服务器连接正在建立。", "Account created successfully. Connecting to the server."), "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (Exception error)
+                {
+                    MessageBox.Show(TrayText.Pick("账户创建失败：", "Account creation failed: ") + error.Message, "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
                 finally { SetBusy(false); }
             }
@@ -2489,7 +2509,7 @@ namespace TermLink.Tray
             root.BackColor = palette.Canvas;
             navigationPanel.BackColor = palette.Sidebar;
             contentHost.BackColor = palette.Canvas;
-            footerLabel.BackColor = palette.Sidebar;
+            accountFooter.BackColor = palette.Sidebar;
             shellStatusLabel.BackColor = palette.Canvas;
             foreach (var button in navigationButtons.Values)
             {

@@ -113,6 +113,8 @@ var response = new RegistryResponse
     {
         Configured = true,
         AccountLinked = true,
+        AccountUsername = "codec-user",
+        AccountEmail = "codec@example.test",
         ServerHost = "relay.example.test",
         PcName = "Codec PC",
         RelayState = ProductionRelayState.Connected,
@@ -151,6 +153,7 @@ Require(decoded.Success && decoded.Code == "OK" && decoded.RemoteAccessEnabled, 
 Require(decoded.AffectedSessions == 2 && decoded.TimedOutSessions == 1, "Response counts changed.");
 Require(decoded.Summaries.Count == 1 && decoded.Summaries[0].ExitCode == 17, "Session summary changed.");
 Require(decoded.Production.Configured && decoded.Production.RelayState == ProductionRelayState.Connected, "Production state changed.");
+Require(decoded.Production.AccountUsername == "codec-user" && decoded.Production.AccountEmail == "codec@example.test", "Account identity changed.");
 Require(decoded.Production.Devices.Count == 1 && decoded.Production.Devices[0].DeviceId == deviceId, "Device summary changed.");
 Require(decoded.Production.Sessions.Count == 1 && decoded.Production.Sessions[0].ControllerDeviceId == deviceId, "Production session changed.");
 Require(decoded.Production.PairingChallenge != null &&
@@ -167,7 +170,7 @@ var defaultProduction = RoundTripResponse(new RegistryResponse
 Require(defaultProduction.Production.RelayState == ProductionRelayState.NotConfigured, "Default production state changed.");
 Require(defaultProduction.Production.Devices.Count == 0 && defaultProduction.Production.Sessions.Count == 0, "Default production collections changed.");
 
-Console.WriteLine("TermLink Agent control Pipe V4 round-trip validation passed.");
+Console.WriteLine("TermLink Agent control Pipe V5 round-trip validation passed.");
 
 static RegistryRequest RoundTripRequest(RegistryRequest request)
 {

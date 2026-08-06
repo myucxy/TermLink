@@ -130,13 +130,13 @@ Terminal 与内层 ConPTY。Host 退出后墓碑可安全清理，新开的 Prof
 
 `TermLink.Windows.sln` 现在构建六个正式工程和一个本机控制契约验证程序：
 
-- `TermLink.AgentControl`：Agent 与 Tray 共用的本机 Pipe V4 结构化契约；
+- `TermLink.AgentControl`：Agent 与 Tray 共用的本机 Pipe V5 结构化契约（含脱敏账号用户名/邮箱摘要）；
 - `TermLink.Protocol`：生产 Protobuf 与 E2EE/历史密码封装；
 - `TermLink.Agent`：长驻当前用户 Registry 和每会话 worker；
 - `TermLink.SessionHost`：独立 ConPTY Owner；
 - `TermLink.Tray`：系统托盘、脱敏会话/账号/设备状态与本机控制；
 - `TermLink.Updater`：签名清单校验、部署事务和失败回滚；
-- `TermLink.AgentControl.Validation`：Pipe V4 请求/响应往返验证，不进入产品包。
+- `TermLink.AgentControl.Validation`：Pipe V5 请求/响应往返验证，不进入产品包。
 
 `TermLink.Setup` 是独立的安装器工程，不加入产品运行时解决方案；由 `package/Build-Setup.ps1`
 先生成并签名 payload，再以资源形式嵌入后发布为单文件 EXE。

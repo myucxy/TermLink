@@ -335,3 +335,18 @@ git diff --check
   `{"status":"ready"}`。使用本机生产凭据执行真实 Win-Agent 公网 Runtime 验证：
   `AccountLinked=True`、`RelayState=Connected`、设备数 4，未输出凭据内容；唯一测试 Agent
   进程和临时目录已清理，现有 Windows Terminal PID `28752` 仍在运行。
+
+## 11. 2026-08-07 Win-Agent 托盘控制面收敛
+
+- Win-Agent 主窗口导航现在只保留“会话 / 连接服务器 / 设置”；原“活动”改为“连接服务器”，
+  页面只显示固定服务器、Relay 状态和最近连接时间。设备页、远程访问页、权益入口不再进入
+  产品导航；底层 Agent/协议命令保留用于兼容，不再展示权限设置。
+- 同账号默认权限不在 Windows UI 中配置或切换。左键点击托盘不再显示独立 TrayPopup，直接打开
+  主窗口的“连接服务器”页；未登录时自动优先打开登录对话框。登录/注册成功和失败均给出明确
+  的气泡或对话框提醒。
+- 主窗口左下角新增账号区，显示登录后的用户名和邮箱，并提供登录/注册入口；用户名/邮箱仅
+  作为脱敏显示摘要从 OIDC access token claims 读取，写入生产配置，不参与任何授权判断。
+  既有旧配置未保存摘要时，Agent 会从当前令牌即时补齐显示。
+- 本机控制协议从 Pipe V4 升为 V5，新增两个账号显示字段；`AgentControlValidation` 往返验证
+  通过。Win-Agent Release Solution 构建 0 warning / 0 error；Tray Visual Smoke 在中英文、
+  明暗四种主题下生成 16 张页面截图，导航和账号区目视通过，未启动或关闭用户现有 Terminal。

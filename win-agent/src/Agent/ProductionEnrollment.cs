@@ -72,7 +72,7 @@ namespace TermLink.Agent
 
     public static class ProductionEnrollment
     {
-        private const string AuthorizationScopes = "openid offline_access";
+        private const string AuthorizationScopes = "openid profile email offline_access";
         public const string PublicServerUrl = "https://termlink.kget.cc:8910";
 
         private sealed class ClientConfiguration
@@ -183,6 +183,7 @@ namespace TermLink.Agent
             if (existingConfig != null && !string.Equals(existingConfig.ServerUrl, serverUrl, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("The existing TermLink device is linked to a different server.");
             using var existingCredentials = ProductionCredentials.TryLoad();
+            var account = ProductionCredentials.ReadAccountClaims(tokens.AccessToken);
             DeviceIdentity identity = null;
             try
             {
@@ -193,6 +194,8 @@ namespace TermLink.Agent
                 {
                     ServerUrl = serverUrl, PcId = existingConfig == null ? Guid.NewGuid() : existingConfig.PcId,
                     PcName = existingConfig == null ? (pcName ?? Environment.MachineName) : existingConfig.PcName,
+                    AccountUsername = string.IsNullOrWhiteSpace(account.Username) ? existingConfig?.AccountUsername : account.Username,
+                    AccountEmail = string.IsNullOrWhiteSpace(account.Email) ? existingConfig?.AccountEmail : account.Email,
                     AgentVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown",
                     KeyEpoch = existingConfig == null ? 1 : existingConfig.KeyEpoch, OIDCIssuer = client.OIDCIssuer, OIDCClientId = client.ClientId
                 });
@@ -292,6 +295,7 @@ namespace TermLink.Agent
             }
 
             var existingCredentials = ProductionCredentials.TryLoad();
+            var account = ProductionCredentials.ReadAccountClaims(tokens.AccessToken);
             DeviceIdentity identity = null;
             try
             {
@@ -309,6 +313,8 @@ namespace TermLink.Agent
                     ServerUrl = options.ServerUrl,
                     PcId = existingConfig == null ? Guid.NewGuid() : existingConfig.PcId,
                     PcName = existingConfig == null ? options.PcName : existingConfig.PcName,
+                    AccountUsername = string.IsNullOrWhiteSpace(account.Username) ? existingConfig?.AccountUsername : account.Username,
+                    AccountEmail = string.IsNullOrWhiteSpace(account.Email) ? existingConfig?.AccountEmail : account.Email,
                     AgentVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown",
                     KeyEpoch = existingConfig == null ? 1 : existingConfig.KeyEpoch,
                     OIDCIssuer = client.OIDCIssuer,

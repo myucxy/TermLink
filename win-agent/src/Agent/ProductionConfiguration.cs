@@ -12,6 +12,8 @@ namespace TermLink.Agent
         public string ServerUrl { get; set; }
         public Guid PcId { get; set; }
         public string PcName { get; set; }
+        public string AccountUsername { get; set; }
+        public string AccountEmail { get; set; }
         public string AgentVersion { get; set; }
         public long KeyEpoch { get; set; }
         public string OIDCIssuer { get; set; }
@@ -156,6 +158,37 @@ namespace TermLink.Agent
                 if (entropy != null) CryptographicOperations.ZeroMemory(entropy);
                 if (protectedBytes != null) CryptographicOperations.ZeroMemory(protectedBytes);
             }
+        }
+
+        // These claims are display-only account labels. They never participate
+        // in device authorization or Relay authentication decisions.
+        internal static (string Username, string Email) ReadAccountClaims(string accessToken)
+        {
+            if (string.IsNullOrWhiteSpace(accessToken)) return (null, null);
+            try
+            {
+                var parts = accessToken.Split('.');
+                if (parts.Length != 3) return (null, null);
+                var encoded = parts[1].Replace('-', '+').Replace('_', '/');
+                encoded += new string('=', (4 - encoded.Length % 4) % 4);
+                var payload = Convert.FromBase64String(encoded);
+                using var document = JsonDocument.Parse(payload);
+                var root = document.RootElement;
+                var username = root.TryGetProperty("preferred_username", out var preferred) ? preferred.GetString() : null;
+                if (string.IsNullOrWhiteSpace(username) && root.TryGetProperty("username", out var rawUsername)) username = rawUsername.GetString();
+                var email = root.TryGetProperty("email", out var emailValue) ? emailValue.GetString() : null;
+                return (NormalizeClaim(username), NormalizeClaim(email));
+            }
+            catch (Exception error) when (error is FormatException || error is JsonException || error is ArgumentException || error is InvalidOperationException)
+            {
+                return (null, null);
+            }
+        }
+
+        private static string NormalizeClaim(string value)
+        {
+            value = (value ?? string.Empty).Trim();
+            return value.Length > 256 ? value.Substring(0, 256) : value;
         }
 
         public static void Save(Guid deviceId, DeviceIdentity identity, string accessToken)

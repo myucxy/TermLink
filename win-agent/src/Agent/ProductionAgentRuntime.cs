@@ -585,6 +585,14 @@ namespace TermLink.Agent
             }
             lock (statusSync)
             {
+                var accountUsername = config.AccountUsername;
+                var accountEmail = config.AccountEmail;
+                if (string.IsNullOrWhiteSpace(accountUsername) || string.IsNullOrWhiteSpace(accountEmail))
+                {
+                    var account = ProductionCredentials.ReadAccountClaims(credentials.GetAccessToken());
+                    if (string.IsNullOrWhiteSpace(accountUsername)) accountUsername = account.Username;
+                    if (string.IsNullOrWhiteSpace(accountEmail)) accountEmail = account.Email;
+                }
                 var devices = new List<ProductionDeviceSummary>();
                 foreach (var device in productionDevices)
                 {
@@ -600,6 +608,8 @@ namespace TermLink.Agent
                 {
                     Configured = true,
                     AccountLinked = true,
+                    AccountUsername = accountUsername,
+                    AccountEmail = accountEmail,
                     ServerHost = new Uri(config.ServerUrl).Host,
                     PcName = config.PcName,
                     RelayState = relayState,
