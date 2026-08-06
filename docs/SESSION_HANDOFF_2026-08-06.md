@@ -424,3 +424,16 @@ artifact ID、SHA-256 和公开接口结果，但不要记录任何 Secret。
   活动远程会话后，将远端安装已发布的 `TermLink-Setup-0.1.7.0.exe`，让安装器原地升级并刷新
   Agent/Tray；升级后再用连接服务器页面或状态探针确认 `RelayState=Connected`。未记录凭据、
   Token 或其他 Secret。
+
+## 17. 2026-08-07 Windows 安装器卸载入口发布 0.1.8
+
+- 已使用通过 `Validate-WindowsSetup.ps1` 的生产安装器
+  `win-agent/artifacts/TermLink-Setup-0.1.8.0.exe` 发布到 `termlink-win64/stable`。
+- 版本/构建号：`0.1.8` / `8`；AppShip 状态：`published`。
+- release ID：`a6224d11-2828-4818-9c50-ad1a355271c9`；artifact ID：
+  `809c92d8-11bb-4f05-b897-3f240c83f624`。
+- 制品 SHA-256：`f01fc2e49dbea8cf691cb7d85d7f9a07fed2157199331bd90b8b9a538dc5e258`。
+- 公开更新接口验证：旧 build `7` 返回 `status=optional`、latest `0.1.8` / build `8`；
+  build `8` 返回 `status=no_update`。
+- 该版本包含安装目录内的 `TermLink.Uninstall.exe`，支持双击卸载并清理 Agent、Tray、
+  Terminal Profile、快捷方式、启动项及安装目录。未记录凭据、Token、证书私钥或密码。
