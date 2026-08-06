@@ -399,3 +399,18 @@ GET /api/v1/apps/termlink-win64/updates?platform=windows&arch=x64&channel=stable
 
 应返回 `status=optional` 和新版本；使用新 build 查询应返回 `status=no_update`。记录 release ID、
 artifact ID、SHA-256 和公开接口结果，但不要记录任何 Secret。
+
+## 15. 2026-08-07 Relay“重新连接中”诊断
+
+- 公网 `https://termlink.kget.cc:8910/readyz` 返回 HTTP 200；本机使用当前 DPAPI 凭据运行
+  `Test-ProductionPublicRuntime.ps1`，结果为 `AccountLinked=True`、`RelayState=Connected`、
+  设备数 4；`Test-ProductionManagedSession.ps1` 进一步完成真实 PowerShell 会话注册、
+  本地输入优先级和终端生命周期发布。
+- 远端 `192.168.9.22` 只读检查显示 `C:\Program Files\TermLink\TermLink.Agent.exe` 和
+  `TermLink.Tray.exe` 仍在运行，配置使用固定公网地址；Agent 到公网 `:8910` 的 TCP 连接连续
+  保持 `ESTABLISHED`。因此当前不是 Server/Relay 服务整体中断，而是远端旧实例的 UI 状态未刷新
+  或仍未应用 0.1.7 安装包。
+- 为遵守“不关闭正在运行的窗口”，本次没有远程重启 Agent/Tray 或安装新包。下一步在确认没有
+  活动远程会话后，将远端安装已发布的 `TermLink-Setup-0.1.7.0.exe`，让安装器原地升级并刷新
+  Agent/Tray；升级后再用连接服务器页面或状态探针确认 `RelayState=Connected`。未记录凭据、
+  Token 或其他 Secret。
