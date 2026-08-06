@@ -25,6 +25,11 @@ namespace TermLink.Setup
         {
             try
             {
+                var invokedAsUninstaller = IsUninstallerExecutable();
+                if (invokedAsUninstaller && args.Length == 0)
+                {
+                    return Installer.LaunchInstalledUninstaller();
+                }
                 var options = SetupArguments.Parse(args);
                 if (options.Help)
                 {
@@ -34,8 +39,13 @@ namespace TermLink.Setup
 
                 if (options.Uninstall)
                 {
+                    if (invokedAsUninstaller && string.IsNullOrWhiteSpace(options.CleanupSelfPath))
+                    {
+                        return Installer.LaunchInstalledUninstaller(options.InstallDirectory);
+                    }
                     var root = options.InstallDirectory ?? Installer.DiscoverPreviousInstallDirectory();
                     Installer.Uninstall(root);
+                    Installer.ScheduleSelfDelete(options.CleanupSelfPath);
                     return 0;
                 }
 
@@ -87,6 +97,13 @@ namespace TermLink.Setup
                 return 1;
             }
         }
+
+        private static bool IsUninstallerExecutable()
+        {
+            var processPath = Environment.ProcessPath;
+            return !string.IsNullOrWhiteSpace(processPath) &&
+                string.Equals(Path.GetFileName(processPath), "TermLink.Uninstall.exe", StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     internal sealed class SetupArguments
@@ -103,6 +120,7 @@ namespace TermLink.Setup
         public bool Uninstall { get; private set; }
         public bool CreateStartup { get; private set; } = true;
         public bool Help { get; private set; }
+        public string CleanupSelfPath { get; private set; }
 
         public static SetupArguments Parse(string[] args)
         {
@@ -125,6 +143,9 @@ namespace TermLink.Setup
                         result.CreateStartup = false;
                         break;
                     case "--quiet":
+                        break;
+                    case "--cleanup-self":
+                        result.CleanupSelfPath = Required(args, ref index, "--cleanup-self");
                         break;
                     case "--help":
                     case "-h":
@@ -166,12 +187,15 @@ namespace TermLink.Setup
         public string DesktopShortcutSha256 { get; set; }
         public string StartMenuShortcutPath { get; set; }
         public string StartMenuShortcutSha256 { get; set; }
+        public string UninstallerPath { get; set; }
+        public string UninstallerSha256 { get; set; }
     }
 
     internal static class Installer
     {
         private const string MarkerName = ".termlink-install.json";
         private const string FragmentFileName = "termlink.json";
+        private const string UninstallerFileName = "TermLink.Uninstall.exe";
         private const string InstallStateSubKey = @"Software\TermLink";
         private const string InstallRootValueName = "InstallRoot";
         private static readonly string[] RequiredPayloadFiles =
@@ -436,6 +460,7 @@ namespace TermLink.Setup
                     TryRemoveStartupIfOwned(previous);
                 }
                 ConfigureShortcuts(root, marker, previous);
+                ConfigureUninstaller(root, marker);
                 WriteMarker(root, marker);
                 RememberInstallDirectory(root);
 
@@ -454,6 +479,7 @@ namespace TermLink.Setup
                     TryRemoveTerminalFragmentIfOwned(marker);
                     TryRemoveStartupIfOwned(marker);
                     TryRemoveShortcuts(marker);
+                    TryRemoveUninstallerIfOwned(marker);
                 }
                 TryDeleteDirectory(root);
                 TryRestoreDirectory(backup, root);
@@ -482,6 +508,60 @@ namespace TermLink.Setup
             Directory.Delete(root, true);
             ForgetInstallDirectory(root);
             Console.WriteLine("TermLink 已卸载: " + root);
+        }
+
+        internal static int LaunchInstalledUninstaller(string installDirectory = null)
+        {
+            var source = Environment.ProcessPath;
+            if (string.IsNullOrWhiteSpace(source) || !File.Exists(source))
+            {
+                throw new InvalidOperationException("卸载程序路径不可用。");
+            }
+
+            var root = NormalizeInstallRoot(installDirectory ?? Path.GetDirectoryName(source));
+            var temporaryCopy = Path.Combine(
+                Path.GetTempPath(), "TermLink-Uninstall-" + Guid.NewGuid().ToString("N") + ".exe");
+            File.Copy(source, temporaryCopy, overwrite: false);
+            var start = new ProcessStartInfo
+            {
+                FileName = temporaryCopy,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden
+            };
+            start.ArgumentList.Add("--uninstall");
+            start.ArgumentList.Add(root);
+            start.ArgumentList.Add("--cleanup-self");
+            start.ArgumentList.Add(temporaryCopy);
+            start.ArgumentList.Add("--quiet");
+            using (var process = Process.Start(start))
+            {
+                if (process == null) throw new InvalidOperationException("卸载程序无法启动清理进程。");
+            }
+            return 0;
+        }
+
+        internal static void ScheduleSelfDelete(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return;
+            try
+            {
+                var command = "/d /c timeout /t 2 /nobreak >nul & del /f /q \"" +
+                    path.Replace("\"", "\"\"") + "\"";
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
+                    Arguments = command,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                })?.Dispose();
+            }
+            catch
+            {
+                // The temporary copy is harmless if the best-effort cleanup
+                // process cannot be started.
+            }
         }
 
         private static string NormalizeInstallRoot(string installDirectory)
@@ -803,6 +883,28 @@ namespace TermLink.Setup
             marker.StartMenuShortcutSha256 = Sha256(marker.StartMenuShortcutPath);
         }
 
+        private static void ConfigureUninstaller(string root, InstallMarker marker)
+        {
+            var source = Environment.ProcessPath;
+            if (string.IsNullOrWhiteSpace(source) || !File.Exists(source)) return;
+            var sourceName = Path.GetFileName(source);
+            if (!sourceName.StartsWith("TermLink-Setup-", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(sourceName, "TermLink.Setup.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                // A developer invoking the installer through `dotnet` has no
+                // distributable setup EXE to copy. Official single-file builds
+                // always take one of the two names above.
+                return;
+            }
+
+            var destination = Path.Combine(root, UninstallerFileName);
+            if (string.Equals(Path.GetFullPath(source), Path.GetFullPath(destination), StringComparison.OrdinalIgnoreCase))
+                return;
+            File.Copy(source, destination, overwrite: true);
+            marker.UninstallerPath = destination;
+            marker.UninstallerSha256 = Sha256(destination);
+        }
+
         private static string ResolveShortcutPath(string defaultPath, string previousPath, string previousSha256)
         {
             if (!string.IsNullOrWhiteSpace(previousPath) &&
@@ -926,6 +1028,25 @@ namespace TermLink.Setup
             catch
             {
                 // Preserve the original install error; owned shortcuts can be retried on uninstall.
+            }
+        }
+
+        private static void TryRemoveUninstallerIfOwned(InstallMarker marker)
+        {
+            try
+            {
+                if (marker == null || string.IsNullOrWhiteSpace(marker.UninstallerPath) ||
+                    string.IsNullOrWhiteSpace(marker.UninstallerSha256) ||
+                    !File.Exists(marker.UninstallerPath)) return;
+                if (string.Equals(Sha256(marker.UninstallerPath), marker.UninstallerSha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    File.Delete(marker.UninstallerPath);
+                }
+            }
+            catch
+            {
+                // Preserve the original install error; the incomplete root is
+                // already scheduled for cleanup by the surrounding rollback.
             }
         }
 

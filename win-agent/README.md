@@ -252,9 +252,15 @@ Terminal Fragment。Fragment 中的 `commandline` 使用实际安装目录并正
 & .\artifacts\TermLink-Setup-0.1.0.0.exe --uninstall 'D:\Apps\TermLink'
 ```
 
+安装完成后，安装目录内还会释放 `TermLink.Uninstall.exe`。双击该文件即可卸载；它会先复制到
+临时目录再执行清理，因此可以安全删除包含自身的安装目录。若安装目录位于 `C:\Program Files`，
+请使用管理员权限运行。卸载前请先结束 TermLink 终端会话，卸载会停止 Agent、Tray 和
+SessionHost，但不会处理不属于 TermLink 的普通 Windows Terminal 窗口。
+
 该 EXE 是单文件安装器，安装目录内仍保留多个 TermLink 进程文件，这是 ConPTY 会话隔离和 Tray/Agent
 生命周期设计所要求的边界。当前 `TermLink.Updater.exe` 的受控更新事务仍以 MSIX 为目标；传统 EXE
-安装器的安装、升级（原地覆盖）和卸载由 `TermLink.Setup.exe` 负责。
+安装器的安装、升级（原地覆盖）和卸载由 `TermLink.Setup.exe` 负责，目录内的
+`TermLink.Uninstall.exe` 是面向用户的卸载入口。
 
 ```powershell
 .\tests\Validate-WindowsSetup.ps1

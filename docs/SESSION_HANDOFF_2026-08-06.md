@@ -362,6 +362,16 @@ git diff --check
 - `Validate-WindowsSetup.ps1` 新增自定义目录记忆、无目录自动卸载和状态恢复检查；安装器构建与
   Release Solution 构建均需通过后再发布新 artifact。未记录任何密码、Token 或证书私钥。
 
+## 16. 2026-08-07 安装目录卸载入口
+
+- 安装器现在会把当前单文件安装器复制为 `TermLink.Uninstall.exe` 释放到实际安装目录。
+  双击该文件会先复制到临时目录，再执行带 marker 校验的卸载，避免卸载程序自身锁定导致目录
+  无法删除；临时副本在退出后自动清理。
+- `Validate-WindowsSetup.ps1` 已覆盖卸载 EXE 释放、双击卸载、自删除、Terminal Fragment、
+  快捷方式、启动项和安装目录清理。验证版本 `0.1.8.0`，安装包 SHA-256 为
+  `f01fc2e49dbea8cf691cb7d85d7f9a07fed2157199331bd90b8b9a538dc5e258`；该版本当前只生成了
+  本地验证包，尚未发布 AppShip。未记录密码、Token 或证书私钥。
+
 ## 13. 2026-08-07 Windows 安装器发布 0.1.7
 
 - 使用已验证的单文件 EXE `win-agent/artifacts/TermLink-Setup-0.1.7.0.exe` 发布到

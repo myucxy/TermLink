@@ -123,6 +123,7 @@ try {
         'TermLink.Tray.exe',
         'TermLink.Updater.exe',
         'TermLink.UpdatePublisher.cer',
+        'TermLink.Uninstall.exe',
         'coreclr.dll',
         '.termlink-install.json'
     )) {
@@ -179,12 +180,20 @@ try {
 
     Invoke-Setup -SetupPath $setupPath -Arguments @(
         '--install-dir', $installRoot, '--no-startup', '--quiet')
-    # Exercise the legacy-upgrade path as well: remove the new registry hint
-    # and let the existing Windows Terminal fragment locate the custom root.
+    # Exercise the legacy-upgrade path and the installed uninstaller: remove
+    # the new registry hint, then let the in-place uninstaller delegate through
+    # a temporary copy so it can delete its own installation directory safely.
     Remove-ItemProperty -LiteralPath $installStateKeyPath -Name 'InstallRoot' -Force -ErrorAction SilentlyContinue
-    Invoke-Setup -SetupPath $setupPath -Arguments @('--uninstall', '--quiet')
+    $uninstallerPath = Join-Path $installRoot 'TermLink.Uninstall.exe'
+    $uninstallProcess = Start-Process -FilePath $uninstallerPath -PassThru -WindowStyle Hidden
+    Assert-True $uninstallProcess.WaitForExit(30000) 'The installed uninstaller did not return.'
+    $uninstallProcess.Dispose()
+    $uninstallDeadline = [DateTime]::UtcNow.AddSeconds(60)
+    while ((Test-Path -LiteralPath $installRoot) -and [DateTime]::UtcNow -lt $uninstallDeadline) {
+        Start-Sleep -Milliseconds 250
+    }
     $installed = $false
-    Assert-True (-not (Test-Path -LiteralPath $installRoot)) 'The setup uninstall left the install directory behind.'
+    Assert-True (-not (Test-Path -LiteralPath $installRoot)) 'The installed uninstaller left the install directory behind.'
     Assert-True (-not (Test-Path -LiteralPath $fragmentPath)) 'The setup uninstall left its generated Terminal fragment behind.'
     foreach ($shortcut in @($desktopShortcuts[0], $startMenuShortcuts[0])) {
         Assert-True (-not (Test-Path -LiteralPath $shortcut.FullName)) `
@@ -207,6 +216,7 @@ try {
         startup_unchanged_under_no_startup = $true
         upgrade_in_place = $true
         previous_install_directory_auto_discovered = $true
+        installed_uninstaller = $true
         uninstall = $true
         setup_sha256 = (Get-FileHash -LiteralPath $setupPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
