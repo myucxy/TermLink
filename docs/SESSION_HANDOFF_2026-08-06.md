@@ -133,6 +133,20 @@ git diff --check
   Windows 本次使用用户授权的一次性自生成 Code Signing 证书，签名根不属于系统受信生产 CA；
   不能把该签名视为正式商业发布证书。
 
+### 3.3 AppShip 应用图标上传（2026-08-06）
+
+- 原因确认：此前发布流程只上传 APK/EXE 制品，AppShip 应用的独立 `iconUrl` 元数据仍为空，
+  因此管理台和公开应用页没有显示图标；这不影响已发布安装包内的图标资源。
+- 使用仓库正式 01B Prompt Ligature 资源
+  `assets/brand/windows/Square150x150Logo.png`，通过 AppShip 管理接口上传到
+  `termlink-android` 与 `termlink-win64` 两个应用；未创建额外 release，也未修改已有发布历史。
+- 两个应用的 `iconUrl` 现在分别指向其公开 `/api/v1/apps/{slug}/icon` 地址；公开 GET 均返回
+  HTTP 200、`image/png`、3143 bytes，PNG 内容可读取。
+- Android `AndroidManifest.xml` 已引用 `@mipmap/ic_launcher` / `@mipmap/ic_launcher_round`，
+  APK 资源表包含 adaptive icon、foreground 和 monochrome 资源；Windows Tray/Setup 工程均
+  嵌入同一 `TermLink.ico`。因此 AppShip 图标、Android 启动器和 Windows 安装器/托盘使用同一
+  01B 品牌方向。
+
 ## 4. 本机状态注意事项
 
 - 本机 Android SDK 已确认位于 `D:\Dev\Env\Android\Sdk`（不是常见的 `D:\Android\Sdk`）；使用该路径设置本次构建进程的
