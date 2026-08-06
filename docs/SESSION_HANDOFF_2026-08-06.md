@@ -129,8 +129,8 @@ git diff --check
 - Lucky 上游：`http://192.168.9.28:8080`，仅作本机映射，不写入客户端；
 - OIDC、TLS、API、Realtime Probe 的生产验收栈已在不清空数据的情况下重建并通过；
 - 注册功能已开放；
-- Android 支持 App 内直接登录，账号首次登录该 Android 时弹窗确认后可将本设备标为
-  `TRUSTED`，无需跳转网页；
+- Android 与 Windows 都支持应用内直接登录和注册，固定使用公开 HTTPS 服务，不跳转网页；
+  首版同账号设备自动登记、信任并发现自己的 PC/Session，远程输入仍需短时控制租约；
 - `admin` 是首次超级管理员。临时密码未写入仓库；README 已说明单次领取/重置途径；
 - `admin` 当前处于首次登录强制改密状态，新的临时密码尚未领取；不得在日志、文档或提交中
   输出该密码。
@@ -144,8 +144,8 @@ git diff --check
 - 受控重启已安装 Agent 后，控制管道 `List` 与 `RefreshProductionStatus` 均保持
   `RelayState=Connected`；生产状态返回 2 台设备、1 个本地会话。
 - 既有 `TermLink.SessionHost`、PowerShell 和 Windows Terminal 进程均保持运行，未关闭用户窗口。
-- 已通过 Windows Agent 对当前账号下唯一的可信 Android 设备授予 `CONTROL`，返回
-  `DEVICE_GRANT_UPDATED`。
+- 旧的 Windows Agent Grant 流程仍可用于协议兼容测试，但首版客户端不展示授信、配对、
+  会员或配额入口；同账号 PC/Session 发现由服务端自动设备策略覆盖。
 - 本机模拟器 `dev.termlink.harness` 虽显示“已登录；已有最近服务器同步”，但其设备名为
   `sdk_gphone64_x86_64`；当前 Windows 账号的设备名为 `25098PN5AC`。两者属于不同账号，
   模拟器页面的 `0/1 台 PC、0/3 个实时会话` 不能作为当前账号的实时连接证据。
@@ -158,7 +158,7 @@ git diff --check
    不关闭验收机或本机已有窗口；
 2. 验证已安装包、Alias、四个可见 Profile、Tray/Agent 和真实 SessionHost；连接信息和登录
    凭据只在会话内使用，不写入仓库或交接文档；
-3. 在托盘中真实给当前已 `TRUSTED` Android 授予 `CONTROL`，Android 刷新并确认 PC/Session；
+3. 在 Android/Windows 应用内使用同一账号完成原生登录或注册，确认设备自动登记并发现 PC/Session；
 4. 在不关闭现有窗口的前提下，安全处理开发 Fragment，使用真实 Windows Terminal
    TermLink PowerShell Profile 启动受管 PowerShell；
 5. 在该 Shell 中运行真实 Codex/其他 AI CLI；

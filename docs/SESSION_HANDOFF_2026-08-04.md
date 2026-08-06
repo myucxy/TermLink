@@ -30,7 +30,8 @@ Windows Terminal / TermLink Profile
 - 传输终端原始字节与生命周期事件，不传屏幕截图；
 - Codex/AI CLI 只要继续运行在同一个 ConPTY 中，输出和输入都属于目标范围；
 - Windows Terminal 标签栏、菜单、浏览器登录窗口和独立 GUI 不属于远程终端内容；
-- 设备登录不等于获得 PC 访问权，新设备必须批准；远程输入还需要权限和控制租约；
+- 首版客户端使用同账号自动设备注册与发现，不展示首次授信/配对 UI；远程输入仍需要短时控制租约，
+  本地 Windows 输入始终优先。底层 pairing/grant/trust API 保留为协议兼容，不作为首版产品入口；
 - Relay 不持有终端正文解密密钥，生产载荷必须 E2EE；
 - 本地 Shell 不依赖 Relay，Android 断线或会员到期不能终止本地 Shell；
 - 简体中文和 English 是 Android、Windows、Server Console 的统一需求。
@@ -98,6 +99,22 @@ python -m http.server 4173
 - `README.md`
 
 尚未生成或接入 Windows ICO/MSIX PNG、Android Adaptive Icon 和各网页 favicon 引用。
+
+### 3.5 首版原生账号入口（2026-08-06）
+
+- Android `ProductActivity` 已移除服务器地址编辑、授信确认、配对/可信设备管理、会员、配额和
+  购买入口；登录和注册使用应用内原生表单。
+- Windows Tray 与主窗口已提供原生用户名/密码登录、创建账户表单；固定使用
+  `https://termlink.kget.cc:8910`，不再从客户端打开浏览器或允许切换服务器。
+- Windows 主窗口隐藏会员/权益导航；设备页只读展示账号设备，授信/配对/撤销控件不再加入产品 UI，
+  旧协议代码仍保留兼容。
+- 服务端已有 `POST /v1/auth/register`，生产模式自动信任同账号设备并允许同账号 PC/Session 发现；
+  真实公网账号注册、Android/Windows 跨进程 Realtime/E2EE 闭环仍需部署后实测。
+- 本机验证：Rider 自带 .NET SDK 10.0.201 在 `DOTNET_ROLL_FORWARD=LatestMajor` 下成功构建
+  `win-agent/TermLink.Windows.sln`（0 警告、0 错误）；本机没有项目锁定的 .NET 8.0.303 SDK，
+  因此该结果是兼容性编译，不替代使用官方 .NET 8 SDK 的发布构建。
+- Android `:app:compileDebugKotlin :app:testDebugUnitTest` 和服务端 `go test ./internal/auth
+  ./internal/api ./internal/store ./internal/realtime` 已通过。
 
 ## 4. 当前真实能力边界
 
