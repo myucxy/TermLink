@@ -6,6 +6,7 @@ using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Security;
 using System.Text;
 using System.Text.Json;
 using System.Runtime.InteropServices;
@@ -33,7 +34,7 @@ namespace TermLink.Setup
 
                 if (options.Uninstall)
                 {
-                    var root = options.InstallDirectory ?? Installer.DefaultInstallDirectory;
+                    var root = options.InstallDirectory ?? Installer.DiscoverPreviousInstallDirectory();
                     Installer.Uninstall(root);
                     return 0;
                 }
@@ -171,6 +172,13 @@ namespace TermLink.Setup
     {
         private const string MarkerName = ".termlink-install.json";
         private const string FragmentFileName = "termlink.json";
+        private const string InstallStateSubKey = @"Software\TermLink";
+        private const string InstallRootValueName = "InstallRoot";
+        private static readonly string[] RequiredPayloadFiles =
+        {
+            "TermLink.Agent.exe",
+            "TermLink.Tray.exe"
+        };
         private static readonly string[] OwnedProcessNames =
         {
             "TermLink.Agent",
@@ -187,6 +195,193 @@ namespace TermLink.Setup
                     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                     "Programs",
                     "TermLink");
+            }
+        }
+
+        /// <summary>
+        /// Finds the last valid TermLink installation for the interactive setup
+        /// wizard (and for an uninstall without an explicit directory). The
+        /// registry value is only a hint; the marker and payload are validated
+        /// before a path is returned, so a stale or tampered value is ignored.
+        /// </summary>
+        internal static string DiscoverPreviousInstallDirectory()
+        {
+            var candidates = new List<string>();
+            AddCandidate(candidates, ReadRegisteredInstallDirectory());
+            // Older installers did not persist the registry hint, but they did
+            // write the Windows Terminal fragment. Its command line contains
+            // the absolute SessionHost path and therefore lets upgrades recover
+            // a custom directory without scanning an entire drive.
+            AddCandidate(candidates, ReadFragmentInstallDirectory());
+            AddCandidate(candidates, DefaultInstallDirectory);
+
+            foreach (var parent in CommonInstallParents())
+            {
+                try
+                {
+                    if (!Directory.Exists(parent)) continue;
+                    foreach (var directory in Directory.EnumerateDirectories(parent, "TermLink", SearchOption.TopDirectoryOnly))
+                    {
+                        AddCandidate(candidates, directory);
+                    }
+                }
+                catch (Exception error) when (
+                    error is UnauthorizedAccessException ||
+                    error is DirectoryNotFoundException ||
+                    error is IOException)
+                {
+                    // Discovery is best effort. A protected or disappearing
+                    // parent must never prevent a first-time installation.
+                }
+            }
+
+            foreach (var candidate in candidates)
+            {
+                if (ReadMarkerIfPresent(candidate) != null) return candidate;
+            }
+            return DefaultInstallDirectory;
+        }
+
+        private static string ReadFragmentInstallDirectory()
+        {
+            var path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Microsoft", "Windows Terminal", "Fragments", "TermLink", FragmentFileName);
+            if (!File.Exists(path)) return null;
+            try
+            {
+                using (var document = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8)))
+                {
+                    if (!document.RootElement.TryGetProperty("profiles", out var profiles) ||
+                        profiles.ValueKind != JsonValueKind.Array) return null;
+                    foreach (var profile in profiles.EnumerateArray())
+                    {
+                        if (!profile.TryGetProperty("commandline", out var commandline) ||
+                            commandline.ValueKind != JsonValueKind.String) continue;
+                        var value = commandline.GetString();
+                        const string executableName = "TermLink.SessionHost.exe";
+                        var executableIndex = value.IndexOf(executableName, StringComparison.OrdinalIgnoreCase);
+                        if (executableIndex < 0) continue;
+                        var quoteIndex = value.LastIndexOf('"', executableIndex);
+                        var start = quoteIndex >= 0 ? quoteIndex + 1 :
+                            value.LastIndexOf(' ', executableIndex) + 1;
+                        if (start < 0 || start >= executableIndex) continue;
+                        var executablePath = value.Substring(start, executableIndex - start + executableName.Length);
+                        return Directory.GetParent(Path.GetFullPath(executablePath))?.FullName;
+                    }
+                }
+            }
+            catch (Exception error) when (
+                error is JsonException ||
+                error is IOException ||
+                error is UnauthorizedAccessException ||
+                error is ArgumentException ||
+                error is NotSupportedException)
+            {
+                return null;
+            }
+            return null;
+        }
+
+        internal static bool IsValidInstallDirectory(string root)
+        {
+            return ReadMarkerIfPresent(root) != null;
+        }
+
+        private static IEnumerable<string> CommonInstallParents()
+        {
+            var roots = new[]
+            {
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs"),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+            };
+            return roots
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Distinct(StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static void AddCandidate(ICollection<string> candidates, string candidate)
+        {
+            if (string.IsNullOrWhiteSpace(candidate)) return;
+            try
+            {
+                var normalized = NormalizeInstallRoot(candidate);
+                if (!candidates.Any(value => string.Equals(value, normalized, StringComparison.OrdinalIgnoreCase)))
+                {
+                    candidates.Add(normalized);
+                }
+            }
+            catch (Exception error) when (
+                error is ArgumentException ||
+                error is NotSupportedException ||
+                error is IOException)
+            {
+                // Ignore malformed or dangerous paths from external state.
+            }
+        }
+
+        private static string ReadRegisteredInstallDirectory()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(InstallStateSubKey, writable: false))
+                {
+                    return key?.GetValue(InstallRootValueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames) as string;
+                }
+            }
+            catch (Exception error) when (
+                error is SecurityException ||
+                error is UnauthorizedAccessException ||
+                error is IOException)
+            {
+                return null;
+            }
+        }
+
+        private static void RememberInstallDirectory(string root)
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.CreateSubKey(InstallStateSubKey, writable: true))
+                {
+                    key?.SetValue(InstallRootValueName, root, RegistryValueKind.String);
+                }
+            }
+            catch (Exception error) when (
+                error is SecurityException ||
+                error is UnauthorizedAccessException ||
+                error is IOException)
+            {
+                // Registry persistence is an optimization. The marker remains
+                // authoritative and the install must still succeed if HKCU is
+                // restricted by enterprise policy.
+            }
+        }
+
+        private static void ForgetInstallDirectory(string root)
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(InstallStateSubKey, writable: true))
+                {
+                    var remembered = key?.GetValue(InstallRootValueName, null,
+                        RegistryValueOptions.DoNotExpandEnvironmentNames) as string;
+                    if (string.Equals(remembered, root, StringComparison.OrdinalIgnoreCase))
+                    {
+                        key.DeleteValue(InstallRootValueName, throwOnMissingValue: false);
+                    }
+                }
+            }
+            catch (Exception error) when (
+                error is SecurityException ||
+                error is UnauthorizedAccessException ||
+                error is IOException)
+            {
+                // A stale hint is harmless; a future discovery will validate the
+                // marker before using it.
             }
         }
 
@@ -242,6 +437,7 @@ namespace TermLink.Setup
                 }
                 ConfigureShortcuts(root, marker, previous);
                 WriteMarker(root, marker);
+                RememberInstallDirectory(root);
 
                 if (Directory.Exists(backup)) Directory.Delete(backup, true);
                 installSucceeded = true;
@@ -284,6 +480,7 @@ namespace TermLink.Setup
             RemoveStartupIfOwned(marker);
             RemoveShortcuts(marker);
             Directory.Delete(root, true);
+            ForgetInstallDirectory(root);
             Console.WriteLine("TermLink 已卸载: " + root);
         }
 
@@ -315,15 +512,28 @@ namespace TermLink.Setup
 
         private static InstallMarker ReadMarkerIfPresent(string root)
         {
-            var path = Path.Combine(root, MarkerName);
-            if (!File.Exists(path)) return null;
             try
             {
+                var normalizedRoot = NormalizeInstallRoot(root);
+                var path = Path.Combine(normalizedRoot, MarkerName);
+                if (!File.Exists(path) || !Directory.Exists(normalizedRoot)) return null;
                 var marker = JsonSerializer.Deserialize<InstallMarker>(File.ReadAllText(path, Encoding.UTF8));
-                if (marker == null || !string.Equals(marker.Product, Program.ProductId, StringComparison.Ordinal)) return null;
+                if (marker == null || !string.Equals(marker.Product, Program.ProductId, StringComparison.Ordinal) ||
+                    string.IsNullOrWhiteSpace(marker.InstallRoot)) return null;
+                var declaredRoot = NormalizeInstallRoot(marker.InstallRoot);
+                if (!string.Equals(declaredRoot, normalizedRoot, StringComparison.OrdinalIgnoreCase)) return null;
+                foreach (var fileName in RequiredPayloadFiles)
+                {
+                    if (!File.Exists(Path.Combine(normalizedRoot, fileName))) return null;
+                }
                 return marker;
             }
-            catch (JsonException)
+            catch (Exception error) when (
+                error is ArgumentException ||
+                error is IOException ||
+                error is UnauthorizedAccessException ||
+                error is JsonException ||
+                error is NotSupportedException)
             {
                 return null;
             }

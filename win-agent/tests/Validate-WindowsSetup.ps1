@@ -50,6 +50,7 @@ $setupPath = if ([string]::IsNullOrWhiteSpace($OutputSetupPath)) {
 $pfxPath = Join-Path $workRoot 'development-signing.pfx'
 $fragmentPath = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\Fragments\TermLink\termlink.json'
 $runKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$installStateKeyPath = 'HKCU:\Software\TermLink'
 $desktopDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
 $startMenuDirectory = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::StartMenu)) 'Programs\TermLink'
 $desktopShortcutsBefore = @(Get-ChildItem -LiteralPath $desktopDirectory -Filter 'TermLink*.lnk' -File -ErrorAction SilentlyContinue |
@@ -63,6 +64,10 @@ $fragmentBytes = if ($fragmentExisted) { [IO.File]::ReadAllBytes($fragmentPath) 
 $runKey = Get-ItemProperty -LiteralPath $runKeyPath -ErrorAction SilentlyContinue
 $runExisted = $null -ne $runKey -and $null -ne $runKey.PSObject.Properties['TermLink']
 $runValue = if ($runExisted) { [string]$runKey.TermLink } else { $null }
+$installState = Get-ItemProperty -LiteralPath $installStateKeyPath -ErrorAction SilentlyContinue
+$installRootValueExisted = $null -ne $installState -and
+    $null -ne $installState.PSObject.Properties['InstallRoot']
+$installRootValueBefore = if ($installRootValueExisted) { [string]$installState.InstallRoot } else { $null }
 $installed = $false
 $rsa = $null
 $certificate = $null
@@ -164,10 +169,17 @@ try {
     } else { $null }
     Assert-True ([string]::Equals($afterRunValue, $runValue, [StringComparison]::Ordinal)) `
         '--no-startup changed the current-user startup registration.'
+    $afterInstallState = Get-ItemProperty -LiteralPath $installStateKeyPath -ErrorAction SilentlyContinue
+    $afterInstallRoot = if ($null -ne $afterInstallState -and
+        $null -ne $afterInstallState.PSObject.Properties['InstallRoot']) {
+        [string]$afterInstallState.InstallRoot
+    } else { $null }
+    Assert-True ([string]::Equals($afterInstallRoot, $installRoot, [StringComparison]::OrdinalIgnoreCase)) `
+        'The setup did not remember the selected installation directory.'
 
     Invoke-Setup -SetupPath $setupPath -Arguments @(
         '--install-dir', $installRoot, '--no-startup', '--quiet')
-    Invoke-Setup -SetupPath $setupPath -Arguments @('--uninstall', $installRoot, '--quiet')
+    Invoke-Setup -SetupPath $setupPath -Arguments @('--uninstall', '--quiet')
     $installed = $false
     Assert-True (-not (Test-Path -LiteralPath $installRoot)) 'The setup uninstall left the install directory behind.'
     Assert-True (-not (Test-Path -LiteralPath $fragmentPath)) 'The setup uninstall left its generated Terminal fragment behind.'
@@ -191,6 +203,7 @@ try {
         terminal_fragment_owned_cleanup = $true
         startup_unchanged_under_no_startup = $true
         upgrade_in_place = $true
+        previous_install_directory_auto_discovered = $true
         uninstall = $true
         setup_sha256 = (Get-FileHash -LiteralPath $setupPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
@@ -239,6 +252,21 @@ finally {
     }
     elseif (-not $runExisted -and $null -ne $currentRunValue) {
         Remove-ItemProperty -LiteralPath $runKeyPath -Name 'TermLink' -Force
+    }
+    $currentInstallState = Get-ItemProperty -LiteralPath $installStateKeyPath -ErrorAction SilentlyContinue
+    $currentInstallRoot = if ($null -ne $currentInstallState -and
+        $null -ne $currentInstallState.PSObject.Properties['InstallRoot']) {
+        [string]$currentInstallState.InstallRoot
+    } else { $null }
+    if ($installRootValueExisted) {
+        if (-not [string]::Equals($currentInstallRoot, $installRootValueBefore,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            New-Item -Path $installStateKeyPath -Force | Out-Null
+            New-ItemProperty -LiteralPath $installStateKeyPath -Name 'InstallRoot' -Value $installRootValueBefore -PropertyType String -Force | Out-Null
+        }
+    }
+    elseif ($null -ne $currentInstallRoot) {
+        Remove-ItemProperty -LiteralPath $installStateKeyPath -Name 'InstallRoot' -Force -ErrorAction SilentlyContinue
     }
     if ($null -ne $certificate) { $certificate.Dispose() }
     if ($null -ne $rsa) { $rsa.Dispose() }

@@ -15,6 +15,9 @@ namespace TermLink.Setup
 
         internal SetupForm()
         {
+            var previousInstallDirectory = Installer.DiscoverPreviousInstallDirectory();
+            var hasPreviousInstall = Installer.IsValidInstallDirectory(previousInstallDirectory);
+
             Text = "TermLink 安装程序";
             Icon = LoadIcon();
             FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -45,7 +48,7 @@ namespace TermLink.Setup
                 Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
                 Location = new Point(88, 56),
                 Size = new Size(365, 23),
-                Text = Installer.DefaultInstallDirectory
+                Text = previousInstallDirectory
             };
             Controls.Add(installDirectory);
 
@@ -73,7 +76,9 @@ namespace TermLink.Setup
                 AutoSize = false,
                 Location = new Point(18, 127),
                 Size = new Size(524, 34),
-                Text = "安装器会自动配置 Windows Terminal Profile。"
+                Text = hasPreviousInstall
+                    ? "检测到已有安装，将在上次目录原地升级；也可点击“浏览...”更换目录。"
+                    : "安装器会自动配置 Windows Terminal Profile。"
             };
             Controls.Add(status);
 
