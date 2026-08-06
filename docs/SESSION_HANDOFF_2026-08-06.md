@@ -265,3 +265,19 @@ git diff --check
 - 生产发布证书、外部 Billing Provider、真机 IME/键鼠、TalkBack、后台和长时间吞吐仍未验收。
 
 任何后续“完成”声明都必须以真实生产 Protobuf/Realtime/E2EE 跨进程证据为准。
+
+## 8. 2026-08-06 Server 生产验收镜像重建与滚动部署
+
+- 已将 Server/Realtime 生产协议变更提交为 `ce4bb6d`（`feat(server): enforce production realtime flow control`）。
+  提交范围仅包含 `protocol/` 权威协议说明、`termlink_realtime.proto`、Server Relay 及其测试，未混入
+  Android、Termux 或 Windows UI 修改。
+- `server` 目录执行 `go test ./...` 与 `go vet ./...` 均通过。
+- 使用 `server/Dockerfile` 构建镜像 `termlink-production-acceptance-server:local`，OCI 元数据为
+  version `0.1.6`、revision `ce4bb6d`、created `2026-08-06T14:39:14Z`；镜像 digest
+  `sha256:723b98810d7b453424441bfb4082deea04c57c03c3d7dcb606e185d7b465a26b`。
+- 在既有 `termlink-production-acceptance` Compose 项目中先执行 `migrate`，再仅
+  `--force-recreate server` 滚动替换；未执行 `down -v`，未删除或重建 PostgreSQL、Valkey、MinIO、
+  Keycloak、Caddy 及其数据卷，现有 Windows Terminal/Agent/Shell 未关闭。
+- 部署后 Server 容器状态为 `Up (healthy)`，日志仅报告正常启动；公网
+  `https://termlink.kget.cc:8910/readyz` 返回 `{"status":"ready"}`。该结果证明 Server 健康，
+  不等同于三端真实 E2EE 终端闭环已完成。
