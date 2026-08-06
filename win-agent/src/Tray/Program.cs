@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
@@ -187,6 +188,53 @@ namespace TermLink.Tray
                 5000);
         }
 
+        /// <summary>
+        /// Stops the registry Agent and every managed SessionHost left from this
+        /// installation. The tray exit action must not leave a background relay
+        /// connection alive after its UI has disappeared, so a graceful registry
+        /// shutdown is followed by a path-scoped process sweep and a last-resort
+        /// tree kill for processes that did not terminate in time.
+        /// </summary>
+        public void ShutdownAndWait()
+        {
+            try
+            {
+                RegistryControlClient.Send(
+                    options.ControlPipeName,
+                    new RegistryRequest { Command = RegistryCommand.Shutdown },
+                    15000);
+            }
+            catch (Exception)
+            {
+                // The Agent may already be stopping or its pipe may have closed.
+                // The scoped process sweep below still guarantees no TermLink
+                // process from this installation is left behind.
+            }
+
+            WaitForOwnedProcesses(DateTime.UtcNow.AddSeconds(10));
+            foreach (var process in GetOwnedProcesses())
+            {
+                using (process)
+                {
+                    try
+                    {
+                        if (!process.HasExited) process.Kill(true);
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        // The process exited between enumeration and Kill.
+                    }
+                    catch (System.ComponentModel.Win32Exception)
+                    {
+                        // Do not broaden the kill scope when a process cannot be inspected.
+                    }
+                    try { process.WaitForExit(5000); }
+                    catch (InvalidOperationException) { }
+                }
+            }
+            WaitForOwnedProcesses(DateTime.UtcNow.AddSeconds(5));
+        }
+
         public RegistryResponse StopSession(Guid sessionId)
         {
             return RegistryControlClient.Send(
@@ -314,6 +362,51 @@ namespace TermLink.Tray
             }
             response = null;
             return false;
+        }
+
+        private void WaitForOwnedProcesses(DateTime deadlineUtc)
+        {
+            while (DateTime.UtcNow < deadlineUtc)
+            {
+                var processes = GetOwnedProcesses();
+                var hasProcesses = processes.Count != 0;
+                foreach (var process in processes) process.Dispose();
+                if (!hasProcesses) return;
+                Thread.Sleep(50);
+            }
+        }
+
+        private List<Process> GetOwnedProcesses()
+        {
+            var result = new List<Process>();
+            var installRoot = Path.GetDirectoryName(options.AgentExecutable);
+            if (string.IsNullOrWhiteSpace(installRoot)) return result;
+            installRoot = Path.GetFullPath(installRoot).TrimEnd(Path.DirectorySeparatorChar) +
+                Path.DirectorySeparatorChar;
+            foreach (var name in new[] { "TermLink.Agent", "TermLink.SessionHost" })
+            {
+                foreach (var process in Process.GetProcessesByName(name))
+                {
+                    try
+                    {
+                        var path = process.MainModule == null ? null : process.MainModule.FileName;
+                        if (!string.IsNullOrWhiteSpace(path) &&
+                            Path.GetFullPath(path).StartsWith(installRoot, StringComparison.OrdinalIgnoreCase))
+                        {
+                            result.Add(process);
+                            continue;
+                        }
+                    }
+                    catch (InvalidOperationException)
+                    {
+                    }
+                    catch (System.ComponentModel.Win32Exception)
+                    {
+                    }
+                    process.Dispose();
+                }
+            }
+            return result;
         }
     }
 }

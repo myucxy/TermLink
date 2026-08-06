@@ -1,9 +1,9 @@
 {
   "schema": "termlink.phase1-windows-setup-validation",
   "version": 1,
-  "generated_at_utc": "2026-08-06T17:41:06.4897535Z",
+  "generated_at_utc": "2026-08-06T18:14:09.6047706Z",
   "passed": true,
-  "setup_version": "0.1.8.0",
+  "setup_version": "0.1.9.0",
   "architecture": "win-x64",
   "single_file_setup": true,
   "self_contained_payload": true,
@@ -16,5 +16,5 @@
   "previous_install_directory_auto_discovered": true,
   "installed_uninstaller": true,
   "uninstall": true,
-  "setup_sha256": "f01fc2e49dbea8cf691cb7d85d7f9a07fed2157199331bd90b8b9a538dc5e258"
+  "setup_sha256": "1fec4d648b91b9690170d6da80a88af9c4f306c768f1aa45730e1024bf05196e"
 }

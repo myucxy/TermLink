@@ -437,3 +437,20 @@ artifact ID、SHA-256 和公开接口结果，但不要记录任何 Secret。
   build `8` 返回 `status=no_update`。
 - 该版本包含安装目录内的 `TermLink.Uninstall.exe`，支持双击卸载并清理 Agent、Tray、
   Terminal Profile、快捷方式、启动项及安装目录。未记录凭据、Token、证书私钥或密码。
+
+## 18. 2026-08-07 托盘退出关闭全部受控进程并发布 0.1.9
+
+- 托盘右键“退出托盘”现在先向 Agent Registry 发送优雅关闭请求，等待 Agent 和
+  SessionHost 退出；超时后仅按当前安装目录进行进程路径校验和树终止，不会终止普通
+  Windows Terminal 或用户 Shell。
+- 新增 `win-agent/tests/Test-TrayExit.ps1`，真实启动 Release Agent 后调用退出关闭路径，
+  验证同安装目录 Agent 已退出；`TermLink.Windows.sln` Release 构建为 0 警告、0 错误。
+- `Validate-WindowsSetup.ps1 -Version 0.1.9.0` 已通过安装、升级、卸载 EXE 释放和清理验证。
+- 安装包 `win-agent/artifacts/TermLink-Setup-0.1.9.0.exe` SHA-256：
+  `8d4f5bc6e5711ac1c315112dd9fe590ca74ca53c2cbf699632ea4004232f9d03`；签名状态为
+  `Valid`，签名审核使用当前开发证书指纹 `91AE60BC06D866628B8EB2C62F32BDE9DAB56466`。
+- AppShip `termlink-win64/stable` 已发布版本 `0.1.9` / build `9`，release ID：
+  `6aa0cc8b-ddcd-4a2e-8cb4-d1155c49aa0b`，artifact ID：
+  `1660af5b-b5e3-4060-8f57-9cdcf2be7cd5`，状态 `published`。
+- 公开更新接口验证：build `8` 返回 `status=optional` / latest `0.1.9` build `9`；
+  build `9` 返回 `status=no_update`。未记录凭据、Token、证书私钥或密码。

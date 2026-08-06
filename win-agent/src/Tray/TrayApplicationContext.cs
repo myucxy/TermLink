@@ -475,6 +475,7 @@ namespace TermLink.Tray
         private readonly ToolStripMenuItem exitItem;
         private readonly System.Windows.Forms.Timer refreshTimer;
         private int refreshInFlight;
+        private int exitInFlight;
         private MainWindowForm mainWindow;
         private RegistryResponse latestResponse;
         private Exception latestError;
@@ -724,13 +725,27 @@ namespace TermLink.Tray
             notifyIcon.ShowBalloonTip(4000, "TermLink", message, ToolTipIcon.Error);
         }
 
-        private void ExitTray()
+        private async void ExitTray()
         {
+            if (Interlocked.Exchange(ref exitInFlight, 1) != 0) return;
+            exitItem.Enabled = false;
             refreshTimer.Stop();
             notifyIcon.Visible = false;
-            notifyIcon.Dispose();
-            if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.Close();
-            ExitThread();
+            try
+            {
+                await Task.Run(() => controller.ShutdownAndWait());
+            }
+            catch
+            {
+                // Tray exit is best effort from the UI perspective; the controller
+                // already performed the bounded, path-scoped process sweep.
+            }
+            finally
+            {
+                notifyIcon.Dispose();
+                if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.Close();
+                ExitThread();
+            }
         }
 
         protected override void Dispose(bool disposing)
