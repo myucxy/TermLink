@@ -111,12 +111,12 @@
       <div>
         <p class="eyebrow">SECURITY BY DESIGN</p>
         <h2 id="security-title">Relay 只看见密文和路由。</h2>
-        <p class="section-copy">设备通过 OIDC 身份、独立设备密钥和显式授权建立信任。服务器负责路由、租约和审计，但不持有终端正文解密密钥。</p>
+        <p class="section-copy">设备通过 OIDC 身份和独立设备密钥证明归属；首版同账号设备自动登记和发现。服务器负责路由、短时控制租约和审计，但不持有终端正文解密密钥。</p>
       </div>
       <dl class="security-list">
         <div><dt>E2EE</dt><dd>X25519 + ChaCha20-Poly1305，正文对 Relay 不可见。</dd></div>
         <div><dt>Device proof</dt><dd>每个敏感请求同时证明账号身份与设备私钥持有权。</dd></div>
-        <div><dt>Local first</dt><dd>远程订阅、网络故障或会员状态都不能终止本地 Shell。</dd></div>
+        <div><dt>Local first</dt><dd>远程订阅、账号状态或网络故障都不能终止本地 Shell。</dd></div>
       </dl>
     </section>
 

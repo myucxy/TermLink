@@ -170,15 +170,18 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("self-trust Android device: %w", err)
 	}
-	if selfTrust["status"] != "TRUSTED" || selfTrust["changed"] != true {
+	if selfTrust["status"] != "TRUSTED" {
 		return errors.New("Android self-trust response is invalid")
+	}
+	if _, ok := selfTrust["changed"].(bool); !ok {
+		return errors.New("Android self-trust changed flag is invalid")
 	}
 	pcsBeforeGrant, err := p.signedJSON(android, http.MethodGet, "/v1/pcs", nil, "", http.StatusOK)
 	if err != nil {
 		return fmt.Errorf("list Android PC access before grant: %w", err)
 	}
-	if items, ok := pcsBeforeGrant["items"].([]any); !ok || len(items) != 0 {
-		return errors.New("Android self-trust unexpectedly granted PC access")
+	if items, ok := pcsBeforeGrant["items"].([]any); !ok || len(items) != 1 {
+		return errors.New("same-account Android did not discover its PC")
 	}
 	if _, err := p.signedJSON(pc, http.MethodPost, "/v1/pcs/"+pcID.String()+"/grants", map[string]any{
 		"device_id": android.id, "permission": "CONTROL",
@@ -1115,7 +1118,7 @@ func (p *probe) connectRealtime(device *identity, role string) (*websocket.Conn,
 	_ = connection.SetWriteDeadline(time.Now().Add(15 * time.Second))
 	hello, _ := json.Marshal(map[string]any{
 		"role": role, "protocol_versions": []int{1},
-		"capabilities": []string{"cumulative_ack", "e2ee_x25519_chacha20poly1305", "lease_v1", "bounded_event_replay_v1"},
+		"capabilities": []string{"cumulative_ack", "e2ee_x25519_chacha20poly1305", "flow_control_v1", "lease_v1", "bounded_event_replay_v1"},
 	})
 	if err := connection.WriteMessage(websocket.TextMessage, hello); err != nil {
 		connection.Close()

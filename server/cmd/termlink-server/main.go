@@ -74,6 +74,10 @@ func runProduction() error {
 		return err
 	}
 	defer repository.Close()
+	// First-version product policy: signing in is sufficient to use the
+	// account's own devices. Legacy trust/grant tables remain for compatibility
+	// and future policy work, but are not a user-facing enrollment step.
+	repository.AutoTrustDevices = true
 	if err := repository.VerifySchema(ctx); err != nil {
 		return err
 	}
@@ -91,6 +95,12 @@ func runProduction() error {
 	tokenKey := deriveServerKey(keyMaster, "capability-token-signing")
 	cookieKey := deriveServerKey(keyMaster, "web-cookie-master")
 	authentication := auth.Middleware{Tokens: verifier, Devices: repository, Nonces: valkey, SubjectKey: subjectKey}
+	registration, err := auth.NewDirectRegistrationService(auth.DirectRegistrationConfig{
+		Issuer: cfg.OIDCIssuer, ClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI,
+	})
+	if err != nil {
+		return fmt.Errorf("initialize direct registration: %w", err)
+	}
 	var historyStore *history.Store
 	if cfg.HistoryEnabled {
 		historyStore, err = history.Open(ctx, cfg.S3Endpoint, cfg.S3PublicEndpoint, cfg.S3Region, cfg.S3Bucket, cfg.S3AccessKey.Value(), cfg.S3SecretKey.Value())
@@ -99,7 +109,7 @@ func runProduction() error {
 		}
 	}
 	productionAPI := &api.API{
-		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication,
+		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication, Registration: registration,
 		SubjectKey: subjectKey, TokenKey: tokenKey, History: optionalHistoryStore(historyStore),
 		ClientConfig: api.ClientConfiguration{
 			OIDCIssuer: cfg.OIDCIssuer, OIDCClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI,

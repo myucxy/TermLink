@@ -838,7 +838,7 @@ func dialRealtime(t *testing.T, root string, device testDevice, role string) *we
 		}
 		t.Fatal(err)
 	}
-	hello := fmt.Sprintf(`{"role":%q,"protocol_versions":[1],"capabilities":["cumulative_ack","e2ee_x25519_chacha20poly1305","lease_v1"]}`, role)
+	hello := fmt.Sprintf(`{"role":%q,"protocol_versions":[1],"capabilities":["cumulative_ack","e2ee_x25519_chacha20poly1305","flow_control_v1","lease_v1"]}`, role)
 	if err := socket.WriteMessage(websocket.TextMessage, []byte(hello)); err != nil {
 		t.Fatal(err)
 	}

@@ -27,7 +27,13 @@ var (
 	ErrEntitlement = errors.New("entitlement limit reached")
 )
 
-type Postgres struct{ Pool *pgxpool.Pool }
+type Postgres struct {
+	Pool *pgxpool.Pool
+	// AutoTrustDevices is enabled by the first-version production server. The
+	// legacy pending/grant implementation remains available for migrations and
+	// focused compatibility tests without exposing it as a product step.
+	AutoTrustDevices bool
+}
 
 func Open(ctx context.Context, databaseURL string) (*Postgres, error) {
 	config, err := pgxpool.ParseConfig(databaseURL)
@@ -111,7 +117,7 @@ func (s *Postgres) RegisterDevice(ctx context.Context, subjectHash [32]byte, inp
 	bootstrap := input.Type == "WINDOWS_PC" && bootstrapConsumedAt == nil
 	trustState := "PENDING"
 	var approvedAt *time.Time
-	if bootstrap {
+	if bootstrap || s.AutoTrustDevices {
 		trustState = "TRUSTED"
 		now := time.Now().UTC()
 		approvedAt = &now
@@ -630,7 +636,7 @@ func (s *Postgres) TouchDevicePresence(ctx context.Context, userID, deviceID uui
 }
 
 func (s *Postgres) ListPCs(ctx context.Context, userID, deviceID uuid.UUID) ([]PCRecord, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT p.id,p.device_id,p.name,p.agent_version,p.key_epoch,p.remote_routing_enabled,p.last_seen_at FROM pcs p WHERE p.owner_user_id=$1 AND (p.device_id=$2 OR EXISTS(SELECT 1 FROM device_grants g WHERE g.pc_id=p.id AND g.device_id=$2 AND (g.expires_at IS NULL OR g.expires_at>now()))) ORDER BY p.name,p.id`, userID, deviceID)
+	rows, err := s.Pool.Query(ctx, `SELECT p.id,p.device_id,p.name,p.agent_version,p.key_epoch,p.remote_routing_enabled,p.last_seen_at FROM pcs p WHERE p.owner_user_id=$1 AND ($3 OR p.device_id=$2 OR EXISTS(SELECT 1 FROM device_grants g WHERE g.pc_id=p.id AND g.device_id=$2 AND (g.expires_at IS NULL OR g.expires_at>now()))) ORDER BY p.name,p.id`, userID, deviceID, s.AutoTrustDevices)
 	if err != nil {
 		return nil, err
 	}
@@ -688,7 +694,7 @@ func (s *Postgres) UpsertSession(ctx context.Context, userID, deviceID uuid.UUID
 }
 
 func (s *Postgres) ListSessions(ctx context.Context, userID, deviceID, pcID uuid.UUID) ([]SessionRecord, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT s.id,s.pc_id,s.shell_type,s.title_cipher,s.state,s.columns,s.rows,s.last_output_seq,s.created_at,s.ended_at FROM sessions s JOIN pcs p ON p.id=s.pc_id WHERE p.id=$1 AND p.owner_user_id=$2 AND s.deleted_at IS NULL AND (p.device_id=$3 OR EXISTS(SELECT 1 FROM device_grants g WHERE g.pc_id=p.id AND g.device_id=$3 AND (g.expires_at IS NULL OR g.expires_at>now()))) ORDER BY s.created_at DESC,s.id`, pcID, userID, deviceID)
+	rows, err := s.Pool.Query(ctx, `SELECT s.id,s.pc_id,s.shell_type,s.title_cipher,s.state,s.columns,s.rows,s.last_output_seq,s.created_at,s.ended_at FROM sessions s JOIN pcs p ON p.id=s.pc_id WHERE p.id=$1 AND p.owner_user_id=$2 AND s.deleted_at IS NULL AND ($4 OR p.device_id=$3 OR EXISTS(SELECT 1 FROM device_grants g WHERE g.pc_id=p.id AND g.device_id=$3 AND (g.expires_at IS NULL OR g.expires_at>now()))) ORDER BY s.created_at DESC,s.id`, pcID, userID, deviceID, s.AutoTrustDevices)
 	if err != nil {
 		return nil, err
 	}
@@ -953,14 +959,18 @@ type SessionRouteAuthorization struct {
 func (s *Postgres) SessionRoute(ctx context.Context, userID, deviceID, sessionID uuid.UUID) (SessionRouteAuthorization, error) {
 	var result SessionRouteAuthorization
 	err := s.Pool.QueryRow(ctx, `
-		SELECT CASE WHEN p.device_id=$2 THEN 'MANAGE' ELSE g.permission END,p.device_id,g.expires_at
+		-- The first production release uses account-scoped automatic trust.
+		-- Treat same-account devices as full MANAGE participants so clients do
+		-- not need a separate grant/pairing step. Explicit legacy grants still
+		-- retain their VIEW/CONTROL/MANAGE semantics when AutoTrustDevices is off.
+		SELECT CASE WHEN p.device_id=$2 THEN 'MANAGE' WHEN $4 THEN 'MANAGE' ELSE g.permission END,p.device_id,g.expires_at
 		FROM sessions s
 		JOIN pcs p ON p.id=s.pc_id
 		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
 		JOIN devices owner_device ON owner_device.id=p.device_id AND owner_device.trust_state='TRUSTED'
 		LEFT JOIN device_grants g ON g.pc_id=p.id AND g.device_id=$2 AND (g.expires_at IS NULL OR g.expires_at>now())
 		WHERE s.id=$1 AND p.owner_user_id=$3 AND p.remote_routing_enabled AND s.deleted_at IS NULL
-		  AND (p.device_id=$2 OR g.device_id IS NOT NULL)`, sessionID, deviceID, userID).
+		  AND ($4 OR p.device_id=$2 OR g.device_id IS NOT NULL)`, sessionID, deviceID, userID, s.AutoTrustDevices).
 		Scan(&result.Permission, &result.PCDeviceID, &result.GrantExpiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return SessionRouteAuthorization{}, ErrDenied
@@ -1678,10 +1688,10 @@ func (s *Postgres) SaveLease(ctx context.Context, userID, actorID, leaseID, sess
 		JOIN pcs p ON p.id=s.pc_id AND p.owner_user_id=$6 AND p.remote_routing_enabled
 		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
 		JOIN devices d ON d.id=$2 AND d.user_id=$6 AND d.device_type='ANDROID' AND d.trust_state='TRUSTED'
-		JOIN device_grants grant_authority ON grant_authority.device_id=d.id AND grant_authority.pc_id=p.id
+		LEFT JOIN device_grants grant_authority ON grant_authority.device_id=d.id AND grant_authority.pc_id=p.id
 		  AND grant_authority.permission IN ('CONTROL','MANAGE')
 		  AND (grant_authority.expires_at IS NULL OR grant_authority.expires_at>now())
-		WHERE s.id=$1 AND s.deleted_at IS NULL
+		WHERE s.id=$1 AND s.deleted_at IS NULL AND ($7 OR grant_authority.device_id IS NOT NULL)
 		ON CONFLICT(session_id) DO UPDATE
 		SET holder_device_id=excluded.holder_device_id,lease_id=excluded.lease_id,
 			expires_at=CASE
@@ -1695,7 +1705,7 @@ func (s *Postgres) SaveLease(ctx context.Context, userID, actorID, leaseID, sess
 		   OR (excluded.version=control_leases.version
 		       AND excluded.lease_id=control_leases.lease_id
 		       AND excluded.holder_device_id=control_leases.holder_device_id)`,
-		sessionID, holderID, leaseID, expiresAt, version, userID)
+		sessionID, holderID, leaseID, expiresAt, version, userID, s.AutoTrustDevices)
 	if err != nil {
 		return err
 	}

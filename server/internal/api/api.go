@@ -44,6 +44,7 @@ type API struct {
 	TokenKey     []byte
 	History      HistoryObjectStore
 	Billing      *billing.Registry
+	Registration *auth.DirectRegistrationService
 	ClientConfig ClientConfiguration
 	Clock        func() time.Time
 }
@@ -71,6 +72,7 @@ func (a *API) Handler() http.Handler {
 	public.HandleFunc("POST /v1/devices/register", a.registerDevice)
 	public.HandleFunc("GET /v1/billing/plans", a.listPlans)
 	public.HandleFunc("GET /v1/client-config", a.getClientConfiguration)
+	public.HandleFunc("POST /v1/auth/register", a.registerAccount)
 	registered := http.NewServeMux()
 	registered.HandleFunc("POST /v1/pairing/challenges/{id}/complete", a.completePairingChallenge)
 	registered.HandleFunc("GET /v1/devices/self", a.getCurrentDevice)
@@ -109,6 +111,7 @@ func (a *API) Handler() http.Handler {
 	root.Handle("/v1/devices/register", public)
 	root.Handle("/v1/billing/plans", public)
 	root.Handle("/v1/client-config", public)
+	root.Handle("/v1/auth/register", public)
 	root.Handle("/v1/devices/self", a.Auth.AuthenticateRegistered(registered))
 	root.Handle("/v1/devices/self/trust", a.Auth.AuthenticateRegistered(a.idempotency(http.HandlerFunc(a.selfTrustAndroidDevice))))
 	// Register the exact create path as well as the completion subtree. Without
@@ -119,6 +122,58 @@ func (a *API) Handler() http.Handler {
 	root.Handle("/v1/pairing/challenges/", a.Auth.AuthenticateRegistered(a.idempotency(registered)))
 	root.Handle("/v1/", a.Auth.Authenticate(a.idempotency(trusted)))
 	return traceMiddleware(root)
+}
+
+type registerAccountRequest struct {
+	Username  string `json:"username"`
+	Email     string `json:"email"`
+	Password  string `json:"password"`
+	Confirm   string `json:"password_confirm"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+}
+
+func (a *API) registerAccount(w http.ResponseWriter, r *http.Request) {
+	if a.Registration == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "REGISTRATION_UNAVAILABLE", errors.New("direct registration is unavailable"))
+		return
+	}
+	var input registerAccountRequest
+	if err := decodeJSON(r, &input); err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err)
+		return
+	}
+	registration := auth.DirectRegistrationInput{
+		Username: strings.TrimSpace(input.Username), Email: strings.TrimSpace(input.Email), Password: input.Password,
+		Confirm: input.Confirm, FirstName: strings.TrimSpace(input.FirstName), LastName: strings.TrimSpace(input.LastName),
+	}
+	if err := auth.ValidateDirectRegistrationInput(registration); err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REGISTRATION", err)
+		return
+	}
+	// Keep registration attempts bounded across replicas. The address is
+	// hashed before it becomes a Valkey key and is never logged or returned.
+	if a.Valkey != nil {
+		address := strings.TrimSpace(strings.Split(r.RemoteAddr, ":")[0])
+		digest := sha256.Sum256([]byte(address))
+		allowed, err := a.Valkey.Consume(r.Context(), "account-register:"+hex.EncodeToString(digest[:]), "attempt", time.Minute)
+		if err != nil {
+			writeError(w, r, http.StatusServiceUnavailable, "REGISTRATION_UNAVAILABLE", err)
+			return
+		}
+		if !allowed {
+			writeError(w, r, http.StatusTooManyRequests, "REGISTRATION_RATE_LIMITED", errors.New("registration rate limit reached"))
+			return
+		}
+	}
+	err := a.Registration.Register(r.Context(), registration)
+	// Never expose provider error text: it can contain identity-service
+	// internals or user-supplied field values. Clients classify by message_key.
+	if err != nil {
+		writeError(w, r, http.StatusUnprocessableEntity, "REGISTRATION_REJECTED", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"registered": true})
 }
 
 func (a *API) getClientConfiguration(w http.ResponseWriter, r *http.Request) {
