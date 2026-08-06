@@ -313,3 +313,25 @@ git diff --check
   `4e7a3c00-2e31-4bbc-a065-a9220069fd16`，artifact
   `eb6fd7ef-50fe-42c8-a412-1bf53eab431b`，版本 `0.1.6` / build `6`，状态 `published`。
   公开更新接口验证：build 5 返回 `optional` / latest 0.1.6 build 6，build 6 返回 `no_update`。
+
+## 10. 2026-08-06 Relay 未连接修复与 Server 0.1.8 部署
+
+- 根因确认：`RegisterDevice` 在 `AutoTrustDevices=true` 时把第二台 Windows PC 也写成
+  `approved_by=NULL,trust_state=TRUSTED`，触发 `devices_one_bootstrap_pc_per_user` 唯一索引；
+  设备注册事务回滚后 Agent 访问设备接口得到 `unknown device`，Relay 因而无法连接。
+- 提交 `74693e5 fix(server): preserve Windows bootstrap approval`：首台 Windows 仍是唯一
+  bootstrap；后续自动信任的 Windows PC 关联 bootstrap 的 `approved_by`，并将该行为写入
+  `TestWindowsAutoTrustMultipleDevices` 集成测试。测试会在未配置数据库时跳过，不使用 Mock 作为
+  生产证据。
+- `server` 执行 `gofmt`、无集成环境 `go test ./...`、接入本机 PostgreSQL 集成库的
+  `go test ./...`、`go vet ./...` 均通过；集成数据库测试使用唯一临时账号并在清理阶段删除其
+  设备、审计和 outbox 数据。
+- 使用 `server/Dockerfile` 构建 Server `0.1.8`，OCI revision `74693e5`，本地镜像 ID
+  `sha256:bff03d477d99221f2064eaef35d4183f20bf5b2e3a359c8207a5c9f469dfe008`。
+  先运行一次 `migrate`，再滚动替换 `server`；PostgreSQL、Valkey、MinIO、Keycloak、Caddy
+  数据容器及数据卷未删除或重建。Compose 因依赖关系重新运行了完成态的 `keycloak-init` 与
+  `migrate`，两者均以退出码 0 完成。
+- 部署后 Server `Up (healthy)`，公网 `https://termlink.kget.cc:8910/readyz` 返回
+  `{"status":"ready"}`。使用本机生产凭据执行真实 Win-Agent 公网 Runtime 验证：
+  `AccountLinked=True`、`RelayState=Connected`、设备数 4，未输出凭据内容；唯一测试 Agent
+  进程和临时目录已清理，现有 Windows Terminal PID `28752` 仍在运行。
