@@ -137,6 +137,22 @@ git diff --check
 
 ## 6. 下一条生产主链
 
+### 2026-08-06 现场 Relay 恢复证据与 Android 账号边界
+
+- 已将旧 Windows 生产身份文件移动到本机带时间戳的备份目录并完成当前 OIDC 账号重新绑定；
+  未删除或输出任何凭据内容。
+- 受控重启已安装 Agent 后，控制管道 `List` 与 `RefreshProductionStatus` 均保持
+  `RelayState=Connected`；生产状态返回 2 台设备、1 个本地会话。
+- 既有 `TermLink.SessionHost`、PowerShell 和 Windows Terminal 进程均保持运行，未关闭用户窗口。
+- 已通过 Windows Agent 对当前账号下唯一的可信 Android 设备授予 `CONTROL`，返回
+  `DEVICE_GRANT_UPDATED`。
+- 本机模拟器 `dev.termlink.harness` 虽显示“已登录；已有最近服务器同步”，但其设备名为
+  `sdk_gphone64_x86_64`；当前 Windows 账号的设备名为 `25098PN5AC`。两者属于不同账号，
+  模拟器页面的 `0/1 台 PC、0/3 个实时会话` 不能作为当前账号的实时连接证据。
+
+因此，Windows → 公网 Relay 的生产连接已得到真实进程证据；Android 同账号实时观看/控制仍待
+在模拟器或真机登录当前账号后重新验证，不能提前宣称三端闭环完成。
+
 1. 使用包含 `ea09519`、`203ea59` 和 `585d0db` 的 0.2 Windows 构建，在独立 Windows
    验收机上通过普通 `Add-AppxPackage` 持久安装；禁止使用 `ForceApplicationShutdown`，
    不关闭验收机或本机已有窗口；
