@@ -261,6 +261,33 @@ Terminal Fragment。Fragment 中的 `commandline` 使用实际安装目录并正
 验证脚本使用临时开发证书构建并签名单文件安装器，在带空格的临时目录执行安装、原地升级和卸载，
 核对自包含 payload、固定更新发布者证书、实际安装路径 Terminal Fragment 以及所有权受控清理。
 
+### 下载后的 EXE 被 Windows 拦截
+
+AppShip 首版的 `TermLink-Setup-*.exe` 使用用户明确允许的一次性自签名证书；它不是系统受信的
+商业代码签名证书。因此另一台 Windows 可能先显示“Windows 已保护你的电脑”或“无法验证发布者”。
+确认文件来自 AppShip 后，在 PowerShell 中执行以下诊断（不会关闭现有 Terminal、Agent 或 Shell）：
+
+```powershell
+$exe = (Resolve-Path '.\TermLink-Setup-0.1.3.0.exe').Path
+Unblock-File -LiteralPath $exe       # 仅移除浏览器下载标记，不修改签名
+Get-FileHash -Algorithm SHA256 -LiteralPath $exe
+Get-AuthenticodeSignature -LiteralPath $exe |
+  Select-Object Status, StatusMessage, @{Name='Signer';Expression={$_.SignerCertificate.Subject}}
+```
+
+若 SmartScreen 只显示未知发布者，选择“更多信息 → 仍要运行”即可继续测试；不要关闭 SmartScreen。
+也不要把私钥导入目标机。若安装器仍失败，使用命令行可得到确定错误而不是泛化弹窗：
+
+```powershell
+& $exe --install-dir "$env:LOCALAPPDATA\Programs\TermLink" --no-startup --quiet
+$LASTEXITCODE
+Get-Content "$env:TEMP\TermLink-Setup-error.log" -Tail 80 -ErrorAction SilentlyContinue
+```
+
+如果错误提示 `TermLink Terminal Fragment 已存在但不属于本安装器`，请换一个空安装目录，或先备份并
+处理该用户自己的 `termlink.json`；安装器不会覆盖未知的 Windows Terminal Fragment。正式生产发布
+仍必须换用受信代码签名证书和 RFC 3161 时间戳。
+
 ### 验收 MSIX 的证书信任
 
 `TermLink-0.2.0.0-acceptance-x64.msix` 使用自签名的验收证书（Publisher 为
