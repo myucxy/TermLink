@@ -300,7 +300,7 @@ git diff --check
   与 refresh token 均存在，未输出任何凭据内容。
 - Android Dock 已将“活动”替换为“会话”主入口，点击后直接进入会话/终端页；会话终端移除圆角
   外层包装和页间留白，改为铺满可用区域，宽屏使用直角分栏，移动端横向分页无间隙。Android
-  版本升至 `0.1.6` / build `6`，提交 `96a7eb3`；App 单测与 Release 构建通过，APK V2 签名验证
+  版本升至 `0.1.6` / build `6`，源码提交为 `96a7eb3`、`1fc83ef`；App 单测与 Release 构建通过，APK V2 签名验证
   通过，SHA-256 为 `C0A78800D9611135321FE4013AC0ACA87C6CF19488A2D71DBB7819BE5893BF6D`。
 - AppShip `termlink-android/stable` 已发布：release
   `1169d9db-e8e7-4c05-8096-eab6fbcee9d0`，artifact
