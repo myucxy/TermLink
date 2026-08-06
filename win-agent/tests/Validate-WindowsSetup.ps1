@@ -179,6 +179,9 @@ try {
 
     Invoke-Setup -SetupPath $setupPath -Arguments @(
         '--install-dir', $installRoot, '--no-startup', '--quiet')
+    # Exercise the legacy-upgrade path as well: remove the new registry hint
+    # and let the existing Windows Terminal fragment locate the custom root.
+    Remove-ItemProperty -LiteralPath $installStateKeyPath -Name 'InstallRoot' -Force -ErrorAction SilentlyContinue
     Invoke-Setup -SetupPath $setupPath -Arguments @('--uninstall', '--quiet')
     $installed = $false
     Assert-True (-not (Test-Path -LiteralPath $installRoot)) 'The setup uninstall left the install directory behind.'
