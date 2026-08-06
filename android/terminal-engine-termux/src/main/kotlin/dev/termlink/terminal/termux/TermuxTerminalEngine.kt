@@ -183,7 +183,11 @@ class TermuxTerminalEngine(
     }
 
     /** Creates the real Android terminal surface used by the Compose harness. */
-    fun createView(context: Context, textSizeSp: Float = DEFAULT_TEXT_SIZE_SP): View {
+    fun createView(
+        context: Context,
+        textSizeSp: Float = DEFAULT_TEXT_SIZE_SP,
+        lineSpacingMultiplier: Float = 1f,
+    ): View {
         val textSizePx = TypedValue.applyDimension(
             TypedValue.COMPLEX_UNIT_SP,
             textSizeSp,
@@ -191,9 +195,11 @@ class TermuxTerminalEngine(
         )
             .roundToInt()
             .coerceAtLeast(1)
+        val boundedLineSpacing = lineSpacingMultiplier.coerceIn(0.8f, 1.8f)
         return TerminalView(context, null).also { view ->
             view.setTextSize(textSizePx)
-            view.setTerminalViewClient(TermuxTerminalViewClient(view, textSizePx))
+            view.setLineSpacing(boundedLineSpacing)
+            view.setTerminalViewClient(TermuxTerminalViewClient(view, textSizePx, boundedLineSpacing))
             view.isFocusable = true
             view.isFocusableInTouchMode = true
             synchronized(lock) {

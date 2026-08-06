@@ -520,12 +520,24 @@ public final class TerminalView extends View {
      * @param textSize the new font size, in density-independent pixels.
      */
     public void setTextSize(int textSize) {
-        mRenderer = new TerminalRenderer(textSize, mRenderer == null ? Typeface.MONOSPACE : mRenderer.mTypeface);
+        mRenderer = new TerminalRenderer(
+            textSize,
+            mRenderer == null ? Typeface.MONOSPACE : mRenderer.mTypeface,
+            mRenderer == null ? 1.f : mRenderer.mLineSpacingMultiplier
+        );
         updateSize();
     }
 
+    /** Sets the distance between terminal rows as a multiplier of font metrics. */
+    public void setLineSpacing(float multiplier) {
+        if (mRenderer == null) return;
+        mRenderer = new TerminalRenderer(mRenderer.mTextSize, mRenderer.mTypeface, multiplier);
+        updateSize();
+        invalidate();
+    }
+
     public void setTypeface(Typeface newTypeface) {
-        mRenderer = new TerminalRenderer(mRenderer.mTextSize, newTypeface);
+        mRenderer = new TerminalRenderer(mRenderer.mTextSize, newTypeface, mRenderer.mLineSpacingMultiplier);
         updateSize();
         invalidate();
     }

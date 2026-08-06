@@ -79,7 +79,7 @@
     <string name="server_url_hint">https://termlink.example.com</string>
     <string name="action_save">Save</string>
     <string name="action_cancel">Cancel</string>
-    <string name="page_devices_subtitle">Your Android terminal and connected PCs.</string>
+    <string name="page_devices_subtitle">Windows PCs and terminal sessions in this account.</string>
     <string name="page_sessions_subtitle">Per-PC sessions and the live terminal stream.</string>
     <string name="page_activity_subtitle">Recent device-local actions; this is not a server audit.</string>
     <string name="page_history_subtitle">Encrypted history objects returned by the server.</string>
@@ -171,12 +171,25 @@
     <string name="terminal_waiting_lease">Terminals stay read only until a server control lease is granted.</string>
     <string name="terminal_key_escape">Esc</string><string name="terminal_key_tab">Tab</string><string name="terminal_key_enter">Enter</string><string name="terminal_key_ctrl_c">Ctrl+C</string>
     <string name="arrow_left">Left arrow</string><string name="arrow_up">Up arrow</string><string name="arrow_down">Down arrow</string><string name="arrow_right">Right arrow</string>
+    <string name="terminal_dock_hide">Hide shortcut dock</string><string name="terminal_dock_show">Show shortcut dock</string>
     <string name="settings_appearance_title">Appearance</string>
     <string name="settings_appearance_copy">Choose the app chrome theme. Terminal ANSI colors stay unchanged.</string>
     <string name="settings_access_title">Account and access</string>
     <string name="settings_access_copy">Nested settings keep the phone primary navigation focused.</string>
     <string name="settings_account_title">Account</string>
     <string name="settings_account_copy">View the signed-in identity and the fixed public service endpoint.</string>
+    <string name="settings_terminal_title">Terminal display</string>
+    <string name="settings_terminal_copy">Adjust command-line font, line spacing, and RGB colors.</string>
+    <string name="settings_terminal_font_size">Font size %1$.0fsp</string>
+    <string name="settings_terminal_line_spacing">Line spacing %1$.1fx</string>
+    <string name="settings_terminal_foreground">Foreground color</string>
+    <string name="settings_terminal_background">Background color</string>
+    <string name="settings_shortcuts_title">Shortcuts</string>
+    <string name="settings_shortcuts_copy">Choose dock keys, reorder them, and edit their labels.</string>
+    <string name="settings_shortcuts_direction_copy">Arrow keys keep their direction icons; labels change the dock only, not server actions.</string>
+    <string name="shortcut_label_name">Dock label</string>
+    <string name="shortcut_move_up">Move shortcut up</string>
+    <string name="shortcut_move_down">Move shortcut down</string>
     <string name="theme_system">System</string>
     <string name="theme_light">Light</string>
     <string name="theme_dark">Dark</string>

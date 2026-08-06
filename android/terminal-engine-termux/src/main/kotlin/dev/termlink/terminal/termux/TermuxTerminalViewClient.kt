@@ -13,10 +13,12 @@ import kotlin.math.roundToInt
 internal class TermuxTerminalViewClient(
     private val view: TerminalView,
     private val baseTextSizePx: Int,
+    private val lineSpacingMultiplier: Float,
 ) : TerminalViewClient {
     override fun onScale(scale: Float): Float {
         val bounded = scale.coerceIn(MIN_SCALE, MAX_SCALE)
         view.setTextSize((baseTextSizePx * bounded).roundToInt().coerceAtLeast(1))
+        view.setLineSpacing(lineSpacingMultiplier)
         return bounded
     }
 

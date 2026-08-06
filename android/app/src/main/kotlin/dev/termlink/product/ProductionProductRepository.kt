@@ -571,7 +571,9 @@ internal class ProductionProductRepository(
 
     override suspend fun openSession(sessionId: UUID) {
         if (liveSessions.containsKey(sessionId)) return
-        closeLiveSessionsExcept(emptySet())
+        // Keep every opened session alive. The Android pager is a viewer over
+        // multiple concurrent terminals; switching pages must not terminate
+        // another session's realtime stream.
         val product = mutableSnapshot.value
         val summary = product.sessions.firstOrNull { it.id == sessionId }
             ?: error("The selected session is unavailable")
