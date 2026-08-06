@@ -454,3 +454,17 @@ artifact ID、SHA-256 和公开接口结果，但不要记录任何 Secret。
   `1660af5b-b5e3-4060-8f57-9cdcf2be7cd5`，状态 `published`。
 - 公开更新接口验证：build `8` 返回 `status=optional` / latest `0.1.9` build `9`；
   build `9` 返回 `status=no_update`。未记录凭据、Token、证书私钥或密码。
+
+## 19. 2026-08-07 Android 客户端发布 0.1.7
+
+- Android 版本递增到 `0.1.7` / build `7`，使用 `D:\Dev\Env\Android\keystores\nuanya-release.jks`
+  生产签名；APK V2 验证通过，签名证书 SHA-256 指纹为
+  `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b`。
+- `testDebugUnitTest` 全模块通过；`:app:assembleRelease` 成功，APK SHA-256 为
+  `85d87a645a2c9e866ad188271964a03e20f991d69c430f425f882f6f398f0cde`。
+- AppShip `termlink-android/stable` 已发布，release ID：`4f337830-0d0b-424f-ab3a-47cbf229bebe`，
+  artifact ID：`dea8e665-9835-44f5-ac95-f5eda1138c19`，状态 `published`。
+- 公开更新接口验证：build `6` 返回 `status=optional` / latest `0.1.7` build `7`；
+  build `7` 返回 `status=no_update`。
+- 本版本包含原生账号登录/注册、仅显示 Windows PC 的设备页、整页左右滑动会话、多会话持续
+  连接和生产更新检查。未记录凭据、Token、证书私钥或签名密码。

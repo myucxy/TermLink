@@ -51,7 +51,6 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.LaptopWindows
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Search
@@ -117,11 +116,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import dev.termlink.model.DeviceSummary
 import dev.termlink.model.DeviceType
 import dev.termlink.model.PcSummary
 import dev.termlink.model.SessionState
 import dev.termlink.harness.R
+import dev.termlink.harness.BuildConfig
 import dev.termlink.model.SessionSummary
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.ArgbColor
@@ -263,6 +262,18 @@ class ProductActivity : ComponentActivity() {
             }
         }
         super.onStop()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (::repository.isInitialized) {
+            lifecycleScope.launch {
+                // Match NuanYa's startup/foreground check: the repository
+                // throttles this to one request per minute and reuses an
+                // ETag-bound response when the cache is still fresh.
+                runCatching { repository.checkForUpdate(force = false) }
+            }
+        }
     }
 
     override fun onDestroy() {
@@ -415,7 +426,7 @@ fun ProductApp(
                     onThemePreferenceChanged = onThemePreferenceChanged,
                     onSignIn = { runOperation(repository::signIn) },
                     onSignOut = { signOutConfirmation = true },
-                    onCheckForUpdate = { runOperation { repository.checkForUpdate() } },
+                    onCheckForUpdate = { runOperation { repository.checkForUpdate(force = true) } },
                     onTerminalAction = { sessionId, action ->
                         runOperation { repository.sendTerminalAction(sessionId, action) }
                     },
@@ -929,12 +940,6 @@ private fun ProductDestination.localizedLabel(): String = when (this) {
 }
 
 @Composable
-private fun DeviceType.localizedLabel(): String = when (this) {
-    DeviceType.WINDOWS_PC -> stringResource(R.string.device_type_windows_pc)
-    DeviceType.ANDROID -> stringResource(R.string.device_type_android)
-}
-
-@Composable
 private fun SessionState.localizedLabel(): String = when (this) {
     SessionState.RUNNING -> stringResource(R.string.session_running)
     SessionState.INTERRUPTED -> stringResource(R.string.session_interrupted)
@@ -1002,7 +1007,6 @@ private fun ProductContent(
         when (destination) {
             ProductDestination.DEVICES -> DevicesPage(
                 snapshot = snapshot,
-                onOpenSessions = onOpenSessions,
                 onOpenSession = { sessionId ->
                     onSessionSelected(sessionId)
                     onOpenSession(sessionId)
@@ -1034,7 +1038,6 @@ private fun ProductContent(
                 onSignIn = onSignIn,
                 onSignOut = onSignOut,
                 onCheckForUpdate = onCheckForUpdate,
-                onOpenAccount = onOpenAccount,
                 themePreference = themePreference,
                 onThemePreferenceChanged = onThemePreferenceChanged,
                 terminalPreferences = terminalPreferences,
@@ -1073,7 +1076,6 @@ private fun PrimaryHomeHeader(onOpenAccount: () -> Unit) {
 @Composable
 private fun DevicesPage(
     snapshot: ProductSnapshot,
-    onOpenSessions: () -> Unit,
     onOpenSession: (java.util.UUID) -> Unit,
     onOpenAccount: () -> Unit,
     onOpenCommandSearch: () -> Unit,
@@ -1091,8 +1093,6 @@ private fun DevicesPage(
         Text(stringResource(R.string.home_command_search), modifier = Modifier.weight(1f), textAlign = androidx.compose.ui.text.style.TextAlign.Start)
         Text(stringResource(R.string.home_command_shortcut), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
-    ConnectionBanner(snapshot = snapshot)
-    Text(stringResource(R.string.nav_devices), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
     // The Android client is an observer/controller, not a device-management
     // list for itself. Only Windows PCs are part of this product surface.
     val devices = snapshot.devices.filter { it.type == DeviceType.WINDOWS_PC }
@@ -1108,65 +1108,27 @@ private fun DevicesPage(
             actionLabel = null,
             onAction = {},
         )
-    } else {
-        devices.forEach { device ->
-            DeviceRow(
-                device = device,
-            )
-        }
     }
     val windowsDeviceIds = devices.mapTo(hashSetOf()) { it.id }
     val pcs = snapshot.pcs.filter { it.deviceId in windowsDeviceIds }
     if (pcs.isNotEmpty()) {
-        PageHeader(title = stringResource(R.string.pc_routing_title), subtitle = stringResource(R.string.pc_routing_subtitle), icon = Icons.Filled.LaptopWindows)
+        var expandedPcIds by remember { mutableStateOf(emptySet<String>()) }
         pcs.forEach { pc ->
+            val sessions = snapshot.sessions.filter { it.pcId == pc.id }
+            val pcKey = pc.id.toString()
             PcRow(
                 pc = pc,
-                sessions = snapshot.sessions.filter { it.pcId == pc.id },
+                sessions = sessions,
+                expanded = pcKey in expandedPcIds,
+                onToggleExpanded = {
+                    expandedPcIds = if (pcKey in expandedPcIds) {
+                        expandedPcIds - pcKey
+                    } else {
+                        expandedPcIds + pcKey
+                    }
+                },
                 onOpenSession = onOpenSession,
             )
-        }
-        OutlinedButton(onClick = onOpenSessions, modifier = Modifier.heightIn(min = 48.dp)) {
-            Icon(Icons.Filled.Terminal, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(6.dp))
-            Text(stringResource(R.string.action_view_sessions))
-        }
-    }
-}
-
-@Composable
-private fun DeviceRow(
-    device: DeviceSummary,
-) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = ProductShape,
-        color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
-    ) {
-        Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                val displayName = if (device.name.isBlank()) stringResource(R.string.unknown_device) else device.name
-                Icon(
-                    imageVector = if (device.type == DeviceType.WINDOWS_PC) Icons.Filled.LaptopWindows else Icons.Filled.PhoneAndroid,
-                    contentDescription = device.type.name,
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(26.dp),
-                )
-                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(displayName, style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        device.type.localizedLabel(),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
         }
     }
 }
@@ -1175,71 +1137,92 @@ private fun DeviceRow(
 private fun PcRow(
     pc: PcSummary,
     sessions: List<SessionSummary> = emptyList(),
+    expanded: Boolean = false,
+    onToggleExpanded: (() -> Unit)? = null,
     onOpenSession: ((java.util.UUID) -> Unit)? = null,
 ) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .border(BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)), ProductShape)
-            .padding(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = ProductShape,
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
     ) {
-        Icon(Icons.Filled.LaptopWindows, contentDescription = stringResource(R.string.windows_pc_accessibility), tint = MaterialTheme.colorScheme.primary)
-        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(pc.name, style = MaterialTheme.typography.titleSmall)
-            Text(
-                stringResource(
-                    R.string.pc_routing_status,
-                    pc.agentVersion,
-                    stringResource(if (pc.remoteRoutingEnabled) R.string.remote_enabled else R.string.remote_disabled),
-                ),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        StatusDot(
-            color = if (pc.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
-            contentDescription = if (pc.online) stringResource(R.string.pc_online_accessibility) else stringResource(R.string.pc_offline_accessibility),
-        )
-    }
-    if (sessions.isNotEmpty()) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(start = 42.dp, end = 12.dp, bottom = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(2.dp),
-        ) {
-            sessions.forEach { session ->
-                val active = session.state == SessionState.RUNNING && pc.online
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(ProductShape)
-                        .clickable(enabled = onOpenSession != null) { onOpenSession?.invoke(session.id) }
-                        .padding(horizontal = 8.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    StatusDot(
-                        color = if (active) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
-                        contentDescription = session.state.localizedLabel(),
-                    )
+        Column {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = sessions.isNotEmpty() && onToggleExpanded != null) {
+                        onToggleExpanded?.invoke()
+                    }
+                    .padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Icon(Icons.Filled.LaptopWindows, contentDescription = stringResource(R.string.windows_pc_accessibility), tint = MaterialTheme.colorScheme.primary)
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(pc.name, style = MaterialTheme.typography.titleMedium)
                     Text(
-                        session.shellType,
-                        modifier = Modifier.weight(1f),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = if (active) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
+                        stringResource(
+                            R.string.pc_routing_status,
+                            pc.agentVersion,
+                            stringResource(if (pc.remoteRoutingEnabled) R.string.remote_enabled else R.string.remote_disabled),
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    Text(
-                        session.state.localizedLabel(),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                }
+                StatusDot(
+                    color = if (pc.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    contentDescription = if (pc.online) stringResource(R.string.pc_online_accessibility) else stringResource(R.string.pc_offline_accessibility),
+                )
+                if (sessions.isNotEmpty()) {
+                    Icon(
+                        imageVector = if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+            }
+            if (expanded && sessions.isNotEmpty()) {
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 42.dp, end = 12.dp, top = 8.dp, bottom = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    sessions.forEach { session ->
+                        val active = session.state == SessionState.RUNNING && pc.online
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(ProductShape)
+                                .clickable(enabled = onOpenSession != null) { onOpenSession?.invoke(session.id) }
+                                .padding(horizontal = 8.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            StatusDot(
+                                color = if (active) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                contentDescription = session.state.localizedLabel(),
+                            )
+                            Text(
+                                session.shellType,
+                                modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (active) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                session.state.localizedLabel(),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -1885,7 +1868,6 @@ private fun SettingsPage(
     onSignIn: () -> Unit,
     onSignOut: () -> Unit,
     onCheckForUpdate: () -> Unit,
-    onOpenAccount: () -> Unit,
     themePreference: ProductThemePreference,
     onThemePreferenceChanged: (ProductThemePreference) -> Unit,
     terminalPreferences: TerminalDisplayPreferences,
@@ -1894,7 +1876,7 @@ private fun SettingsPage(
     onShortcutPreferencesChanged: (TerminalShortcutPreferences) -> Unit,
 ) {
     PageHeader(stringResource(R.string.nav_settings), stringResource(R.string.page_settings_subtitle), Icons.Filled.Settings)
-    ConnectionBanner(snapshot = snapshot)
+
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = ProductShape,
@@ -1902,6 +1884,25 @@ private fun SettingsPage(
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
     ) {
         Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.Filled.AccountCircle,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(28.dp),
+                )
+                Text(
+                    snapshot.accountLabel ?: stringResource(R.string.account_login_fallback),
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
             SettingRow(
                 icon = if (snapshot.isConnected()) Icons.Filled.Wifi else Icons.Filled.WifiOff,
                 title = stringResource(R.string.settings_server_connection),
@@ -1923,18 +1924,25 @@ private fun SettingsPage(
                 title = stringResource(R.string.settings_input_safety),
                 detail = stringResource(R.string.terminal_waiting_lease),
             )
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
             Row(
-                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 if (snapshot.signedIn) {
-                    OutlinedButton(onClick = onSignOut, modifier = Modifier.heightIn(min = 48.dp)) {
+                    OutlinedButton(
+                        onClick = onSignOut,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                    ) {
                         Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
                         Text(stringResource(R.string.action_sign_out))
                     }
                 } else {
-                    OutlinedButton(onClick = onSignIn, modifier = Modifier.heightIn(min = 48.dp)) {
+                    OutlinedButton(
+                        onClick = onSignIn,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                    ) {
                         Icon(Icons.AutoMirrored.Filled.Login, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
                         Text(stringResource(R.string.action_sign_in))
@@ -1943,61 +1951,37 @@ private fun SettingsPage(
             }
         }
     }
-    PageHeader(stringResource(R.string.settings_appearance_title), stringResource(R.string.settings_appearance_copy), Icons.Filled.Settings)
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        ProductThemePreference.entries.forEach { option ->
-            FilterChip(
-                selected = themePreference == option,
-                onClick = { onThemePreferenceChanged(option) },
-                label = { Text(option.displayLabel()) },
-                modifier = Modifier.heightIn(min = 48.dp),
-            )
-        }
-    }
-    PageHeader(stringResource(R.string.settings_account_title), stringResource(R.string.settings_account_copy), Icons.Filled.AccountCircle)
-    OutlinedButton(onClick = onOpenAccount, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-        Icon(Icons.Filled.AccountCircle, contentDescription = null, modifier = Modifier.size(18.dp))
-        Spacer(Modifier.width(8.dp))
-        Text(stringResource(R.string.nav_account))
-    }
-    PageHeader(stringResource(R.string.settings_updates_title), stringResource(R.string.settings_updates_copy), Icons.Filled.Refresh)
-    val update = snapshot.updateStatus
+
+    SettingsSectionHeader(
+        title = stringResource(R.string.settings_appearance_title),
+        subtitle = stringResource(R.string.settings_appearance_copy),
+        icon = Icons.Filled.Settings,
+    )
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = ProductShape,
         color = MaterialTheme.colorScheme.surface,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
     ) {
-        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(
-                when (update.decision) {
-                    ProductUpdateDecision.NOT_CONFIGURED -> stringResource(R.string.update_not_configured)
-                    ProductUpdateDecision.NO_UPDATE -> stringResource(R.string.update_no_update)
-                    ProductUpdateDecision.OPTIONAL -> stringResource(R.string.update_optional, update.versionName ?: "-")
-                    ProductUpdateDecision.REQUIRED -> stringResource(R.string.update_required, update.versionName ?: "-")
-                    ProductUpdateDecision.ERROR -> stringResource(R.string.update_error)
-                },
-                style = MaterialTheme.typography.titleSmall,
-            )
-            update.message?.let {
-                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            update.downloadUrl?.let {
-                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            }
-            OutlinedButton(onClick = onCheckForUpdate, modifier = Modifier.heightIn(min = 48.dp)) {
-                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(6.dp))
-                Text(stringResource(R.string.action_check_updates))
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(14.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            ProductThemePreference.entries.forEach { option ->
+                FilterChip(
+                    selected = themePreference == option,
+                    onClick = { onThemePreferenceChanged(option) },
+                    label = { Text(option.displayLabel()) },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                )
             }
         }
     }
-    PageHeader(
+
+    SettingsSectionHeader(
         stringResource(R.string.settings_terminal_title),
         stringResource(R.string.settings_terminal_copy),
         Icons.Filled.Terminal,
@@ -2006,7 +1990,8 @@ private fun SettingsPage(
         preferences = terminalPreferences,
         onPreferencesChanged = onTerminalPreferencesChanged,
     )
-    PageHeader(
+
+    SettingsSectionHeader(
         stringResource(R.string.settings_shortcuts_title),
         stringResource(R.string.settings_shortcuts_copy),
         Icons.Filled.Terminal,
@@ -2015,9 +2000,130 @@ private fun SettingsPage(
         preferences = shortcutPreferences,
         onPreferencesChanged = onShortcutPreferencesChanged,
     )
-    PageHeader(stringResource(R.string.settings_about), stringResource(R.string.settings_about_copy), Icons.Filled.Info)
-    Text(stringResource(R.string.settings_product_shell), style = MaterialTheme.typography.bodyMedium)
-    Text(stringResource(R.string.settings_transport_copy), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+    SettingsSectionHeader(
+        title = stringResource(R.string.settings_about),
+        subtitle = stringResource(R.string.settings_about_copy),
+        icon = Icons.Filled.Info,
+    )
+    SettingsAboutCard(
+        update = snapshot.updateStatus,
+        onCheckForUpdate = onCheckForUpdate,
+    )
+}
+
+@Composable
+private fun SettingsSectionHeader(title: String, subtitle: String, icon: ImageVector) {
+    Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Icon(
+            icon,
+            contentDescription = title,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(22.dp),
+        )
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsAboutCard(
+    update: ProductUpdateStatus,
+    onCheckForUpdate: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = ProductShape,
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
+    ) {
+        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        stringResource(R.string.settings_product_shell),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        stringResource(
+                            R.string.settings_version,
+                            BuildConfig.VERSION_NAME,
+                            BuildConfig.VERSION_CODE,
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                OutlinedButton(onClick = onCheckForUpdate, modifier = Modifier.heightIn(min = 48.dp)) {
+                    Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(stringResource(R.string.action_check_updates))
+                }
+            }
+            Text(
+                when (update.decision) {
+                    ProductUpdateDecision.NOT_CONFIGURED -> stringResource(R.string.update_not_configured)
+                    ProductUpdateDecision.NO_UPDATE -> stringResource(R.string.update_no_update)
+                    ProductUpdateDecision.OPTIONAL -> stringResource(R.string.update_optional, update.versionName ?: "-")
+                    ProductUpdateDecision.REQUIRED -> stringResource(R.string.update_required, update.versionName ?: "-")
+                    ProductUpdateDecision.ERROR -> stringResource(R.string.update_error)
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (update.decision == ProductUpdateDecision.ERROR) {
+                update.message?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+            update.releaseNotes?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Text(
+                stringResource(R.string.settings_updates_copy),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    stringResource(R.string.settings_author),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    stringResource(R.string.settings_author_name),
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        }
+    }
 }
 
 @Composable

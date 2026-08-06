@@ -58,6 +58,10 @@ data class ProductUpdateStatus(
     val downloadUrl: String? = null,
     val message: String? = null,
     val checkedAt: Instant? = null,
+    val artifactSizeBytes: Long? = null,
+    val artifactSha256: String? = null,
+    val minSupportedBuild: Long? = null,
+    val fromCache: Boolean = false,
 )
 
 /**
@@ -314,7 +318,7 @@ interface ProductRepository : Closeable {
     suspend fun register(username: String, email: String, password: CharArray, confirm: CharArray): Unit =
         error("Direct account registration is unavailable")
     /** Checks the public AppShip update decision without an account token. */
-    suspend fun checkForUpdate(): ProductUpdateStatus = ProductUpdateStatus()
+    suspend fun checkForUpdate(force: Boolean = true): ProductUpdateStatus = ProductUpdateStatus()
     /**
      * Direct registration is intentionally not part of this contract yet:
      * the current service exposes registration only through its browser/PKCE
@@ -355,7 +359,7 @@ class UnavailableProductRepository : ProductRepository {
     override suspend fun refresh() = unavailable()
     override suspend fun signIn(username: String, password: CharArray) = unavailable()
     override suspend fun register(username: String, email: String, password: CharArray, confirm: CharArray) = unavailable()
-    override suspend fun checkForUpdate(): ProductUpdateStatus = ProductUpdateStatus(
+    override suspend fun checkForUpdate(force: Boolean): ProductUpdateStatus = ProductUpdateStatus(
         decision = ProductUpdateDecision.NOT_CONFIGURED,
         message = "Update service is not configured",
     )
@@ -387,7 +391,11 @@ class UnavailableProductRepository : ProductRepository {
 
 object ProductFormatter {
     fun quotaLabel(used: Int, limit: Int): String =
-        if (limit > 0) "$used / $limit" else "$used / unavailable"
+        when {
+            limit < 0 -> "$used / unlimited"
+            limit > 0 -> "$used / $limit"
+            else -> "$used / unavailable"
+        }
 
     fun trustLabel(value: dev.termlink.model.DeviceTrustState): String =
         value.name.lowercase().replace('_', ' ').replaceFirstChar { it.uppercase() }

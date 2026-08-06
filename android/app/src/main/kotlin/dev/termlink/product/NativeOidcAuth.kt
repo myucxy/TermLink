@@ -99,6 +99,31 @@ internal object OidcJwtClaims {
         return subject
     }
 
+    /**
+     * Reads a non-sensitive display identifier from a JWT payload. This is
+     * only a UI fallback for browser-authenticated sessions; authorization
+     * remains based on the validated subject above and never on this value.
+     */
+    fun displayIdentifier(token: String): String? {
+        val pieces = token.split('.', limit = 4)
+        if (pieces.size != 3) return null
+        val claims = try {
+            val decoded = Base64.getUrlDecoder().decode(pieces[1])
+            try {
+                Json.parseToJsonElement(String(decoded, StandardCharsets.UTF_8)).jsonObject
+            } finally {
+                decoded.fill(0)
+            }
+        } catch (_: Exception) {
+            return null
+        }
+        return sequenceOf("preferred_username", "email", "username")
+            .mapNotNull { key -> claims[key]?.jsonPrimitive?.contentOrNull?.trim() }
+            .firstOrNull { value ->
+                value.isNotEmpty() && value.length <= 320 && value.none { ch -> ch.code < 0x20 || ch.code == 0x7F }
+            }
+    }
+
     private fun audienceContains(value: kotlinx.serialization.json.JsonElement?, expected: String): Boolean = when (value) {
         is JsonPrimitive -> value.contentOrNull == expected
         is JsonArray -> value.any { (it as? JsonPrimitive)?.contentOrNull == expected }

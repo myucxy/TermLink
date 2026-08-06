@@ -23,6 +23,7 @@ class ProductStateTest {
     fun formatterDoesNotInventAnEntitlementForUnknownLimit() {
         assertEquals("2 / unavailable", ProductFormatter.quotaLabel(2, 0))
         assertEquals("2 / 5", ProductFormatter.quotaLabel(2, 5))
+        assertEquals("2 / unlimited", ProductFormatter.quotaLabel(2, -1))
         assertEquals("Pending", ProductFormatter.trustLabel(DeviceTrustState.PENDING))
     }
 

@@ -132,6 +132,23 @@ internal class OidcSessionStore(context: Context) {
             check(editor.commit())
         }
 
+    /**
+     * Non-sensitive login identifier shown in the settings account card.
+     * This is the username/email entered by the user, never a password or
+     * token claim.  It is deliberately kept separate from the encrypted
+     * AuthState so the UI can render it without deserializing credentials.
+     */
+    var accountLogin: String?
+        get() = preferences.getString(KEY_ACCOUNT_LOGIN, null)
+        set(value) {
+            val normalized = value
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() && it.length <= MAX_ACCOUNT_LOGIN_LENGTH && it.none { ch -> ch.code < 0x20 || ch.code == 0x7F } }
+            val editor = preferences.edit()
+            if (normalized == null) editor.remove(KEY_ACCOUNT_LOGIN) else editor.putString(KEY_ACCOUNT_LOGIN, normalized)
+            check(editor.commit())
+        }
+
     fun saveAuthState(state: AuthState) {
         val sanitized = CredentialFreeAuthState.sanitize(state)
         val plaintext = sanitized.jsonSerializeString().encodeToByteArray()
@@ -226,6 +243,7 @@ internal class OidcSessionStore(context: Context) {
         const val KEY_SERVER_URL = "server_url"
         const val KEY_AUTH_STATE = "auth_state"
         const val KEY_ACCOUNT_SCOPE = "account_scope"
+        const val KEY_ACCOUNT_LOGIN = "account_login"
         const val KEY_INPUT_SEQUENCE_PREFIX = "input_sequence_high_watermark_"
         const val KEY_ENVELOPE_SEQUENCE_PREFIX = "envelope_sequence_high_watermark_android_to_pc_"
         const val KEY_ALIAS = "termlink-oidc-session-wrap-v1"
@@ -236,6 +254,7 @@ internal class OidcSessionStore(context: Context) {
         const val ENVELOPE_SEQUENCE_RESERVATION_SIZE = 4_096
         const val MAX_INPUT_SEQUENCE_RESERVATION_SIZE = 1_000_000
         const val INPUT_SEQUENCE_CLOCK_MULTIPLIER = 1L shl 20
+        const val MAX_ACCOUNT_LOGIN_LENGTH = 320
         val AAD = "TermLink OIDC AuthState V1".encodeToByteArray()
         val SEQUENCE_RESERVATION_LOCK = Any()
     }

@@ -81,6 +81,7 @@ data class CatalogPlan(
     val displayName: String,
     val description: String,
     val billingPeriod: String,
+    /** Server returns -1 for unlimited PC/session quantities. */
     val maxRemotePcs: Int,
     val maxLiveSessions: Int,
     val featureFlags: Map<String, Boolean>,
@@ -90,6 +91,7 @@ data class CatalogPlan(
 data class Entitlement(
     val planKey: String,
     val catalogVersion: Long,
+    /** Server returns -1 for unlimited PC/session quantities. */
     val maxRemotePcs: Int,
     val maxLiveSessions: Int,
     val featureFlags: Map<String, Boolean>,

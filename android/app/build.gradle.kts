@@ -2,6 +2,7 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("org.jetbrains.kotlin.plugin.serialization")
 }
 
 android {
@@ -32,8 +33,8 @@ android {
         applicationId = "dev.termlink.harness"
         minSdk = 26
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.1.6"
+        versionCode = 7
+        versionName = "0.1.7"
         manifestPlaceholders["appAuthRedirectScheme"] = "dev.termlink"
     }
 

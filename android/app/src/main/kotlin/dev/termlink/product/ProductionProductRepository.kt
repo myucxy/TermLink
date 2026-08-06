@@ -3,6 +3,7 @@ package dev.termlink.product
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.view.KeyEvent
 import androidx.room.withTransaction
 import dev.termlink.billing.BillingCoordinator
@@ -107,6 +108,7 @@ internal class ProductionProductRepository(
     private val historyRepository = HistoryRepository(database)
     private val authService = AuthorizationService(activity)
     private val http = OkHttpClient()
+    private val updatePreferences = activity.getSharedPreferences(UPDATE_PREFERENCES, android.content.Context.MODE_PRIVATE)
     private val nativeAuthHttp = secureNativeHttpClient()
     private val nativeOidc = NativeOidcClient(nativeAuthHttp, Json { ignoreUnknownKeys = true })
     private val json = Json { ignoreUnknownKeys = true }
@@ -117,6 +119,7 @@ internal class ProductionProductRepository(
     private val liveSessionLock = Any()
     private val accessStateLock = Mutex()
     private val refreshStateLock = Mutex()
+    private val updateCheckLock = Mutex()
     private val keyMetadataRefreshLock = Mutex()
     private val tokenRefresh = TokenRefreshCoordinator { requestFreshAccessToken() }
     // The first production client is intentionally pinned to the public service.
@@ -149,11 +152,15 @@ internal class ProductionProductRepository(
     private var accountScope: String? = sessionStore.accountScope
     private var oidcConfiguration: NativeOidcConfiguration? = null
     private var closed = false
-    private var appShipEtag: String? = null
+    private val updateArchitecture = Build.SUPPORTED_ABIS.firstOrNull()?.takeIf { it.isNotBlank() } ?: "universal"
+    private val updateRequestKey = "$PRODUCT_APPSHIP_SLUG|android|$updateArchitecture|stable|${BuildConfig.VERSION_CODE}"
+
+    private fun accountDisplayLabel(): String? = sessionStore.accountLogin
 
     private val mutableSnapshot = MutableStateFlow(
         ProductSnapshot(
             signedIn = authState?.isAuthorized == true,
+            accountLabel = sessionStore.accountLogin,
             configured = true,
             authenticationState = if (authState?.isAuthorized == true) {
                 ProductAuthenticationState.AUTHENTICATED
@@ -191,6 +198,7 @@ internal class ProductionProductRepository(
             clearRoomCache()
             authState = null
             sessionStore.clearAuthState()
+            sessionStore.accountLogin = null
             storedIdentity?.identity?.destroy()
             storedIdentity = null
             accountScope = null
@@ -221,6 +229,7 @@ internal class ProductionProductRepository(
             }
             val subject = OidcJwtClaims.accessTokenSubject(payload.accessToken, configuration.issuer, configuration.clientId)
             activateAccount(configuration, subject, payload)
+            sessionStore.accountLogin = username
             bootstrapAuthenticatedSession()
         } catch (error: NativeOidcException) {
             publishFailure(error)
@@ -269,59 +278,109 @@ internal class ProductionProductRepository(
         }
     }
 
-    override suspend fun checkForUpdate(): ProductUpdateStatus {
-        val baseUrl = BuildConfig.TERMLINK_APPSHIP_BASE_URL.trim().trimEnd('/')
-        if (baseUrl.isBlank()) {
-            return publishUpdateStatus(
-                ProductUpdateStatus(
-                    decision = ProductUpdateDecision.NOT_CONFIGURED,
-                    message = "Update service is not configured",
-                    checkedAt = Instant.now(),
-                ),
-            )
-        }
-        val baseUri = runCatching { URI(baseUrl) }.getOrNull()
-        if (baseUri == null || !baseUri.isAbsolute || !baseUri.scheme.equals("https", ignoreCase = true)) {
-            return publishUpdateStatus(
-                ProductUpdateStatus(
-                    decision = ProductUpdateDecision.ERROR,
-                    message = "Update service must use HTTPS",
-                    checkedAt = Instant.now(),
-                ),
-            )
-        }
-        val status = try {
-            withContext(Dispatchers.IO) {
-                val url = "$baseUrl/api/v1/apps/$PRODUCT_APPSHIP_SLUG/updates" +
-                    "?platform=android&arch=universal&channel=stable&build=${BuildConfig.VERSION_CODE}"
+    override suspend fun checkForUpdate(force: Boolean): ProductUpdateStatus = updateCheckLock.withLock {
+        withContext(Dispatchers.IO) {
+            val baseUrl = BuildConfig.TERMLINK_APPSHIP_BASE_URL.trim().trimEnd('/')
+            if (baseUrl.isBlank()) {
+                return@withContext publishUpdateStatus(
+                    ProductUpdateStatus(
+                        decision = ProductUpdateDecision.NOT_CONFIGURED,
+                        message = "Update service is not configured",
+                        checkedAt = Instant.now(),
+                    ),
+                )
+            }
+
+            val cached = cachedUpdateStatus(baseUrl)
+            val lastCheckedAt = updatePreferences.getLong(UPDATE_CHECKED_AT_KEY, 0L)
+            if (
+                !force &&
+                cached != null &&
+                isUpdateCacheFresh(
+                    lastCheckedAt,
+                    System.currentTimeMillis(),
+                    intervalMs = UPDATE_CACHE_INTERVAL_MILLIS,
+                )
+            ) {
+                return@withContext publishUpdateStatus(cached.copy(fromCache = true, checkedAt = Instant.now()))
+            }
+
+            val status = try {
+                val checkUrl = AppShipUpdateProtocol.buildCheckUrl(
+                    baseUrl = baseUrl,
+                    slug = PRODUCT_APPSHIP_SLUG,
+                    architecture = updateArchitecture,
+                    channel = UPDATE_CHANNEL,
+                    buildNumber = BuildConfig.VERSION_CODE.toLong(),
+                )
                 val request = Request.Builder()
-                    .url(url)
+                    .url(checkUrl)
                     .get()
+                    .header("Accept", "application/json")
                     .header("Cache-Control", "no-cache")
-                    .apply { appShipEtag?.let { header("If-None-Match", it) } }
+                    .apply {
+                        // Do not send an ETag from another build/ABI/channel.
+                        // NuanYa only revalidates when the request-key-bound
+                        // cached response is available; otherwise a 304
+                        // cannot be safely interpreted by this client.
+                        if (cached != null) {
+                            updatePreferences.getString(UPDATE_ETAG_KEY, null)?.let { header("If-None-Match", it) }
+                        }
+                    }
                     .build()
                 http.newCall(request).execute().use { response ->
-                    if (response.code == 304) {
-                        ProductUpdateStatus(
-                            decision = ProductUpdateDecision.NO_UPDATE,
-                            message = "No update available",
-                            checkedAt = Instant.now(),
-                        )
-                    } else {
-                        if (!response.isSuccessful) error("Update service returned HTTP ${response.code}")
-                        response.header("ETag")?.let { appShipEtag = it }
-                        parseAppShipUpdate(response.body?.string().orEmpty())
+                    when (response.code) {
+                        200 -> {
+                            val body = readLimitedText(response.body?.byteStream())
+                            val decision = AppShipUpdateProtocol.parseAndValidate(
+                                body = body,
+                                baseUrl = baseUrl,
+                                expectedSlug = PRODUCT_APPSHIP_SLUG,
+                                expectedChannel = UPDATE_CHANNEL,
+                                expectedArchitecture = updateArchitecture,
+                                currentBuild = BuildConfig.VERSION_CODE.toLong(),
+                            )
+                            saveUpdateCache(body, response.header("ETag"))
+                            decision.copy(fromCache = false, checkedAt = Instant.now())
+                        }
+                        304 -> {
+                            val cachedDecision = cached
+                                ?: throw AppShipUpdateException("更新缓存已失效，请重新检测")
+                            updatePreferences.edit()
+                                .putLong(UPDATE_CHECKED_AT_KEY, System.currentTimeMillis())
+                                .commit()
+                            cachedDecision.copy(fromCache = true, checkedAt = Instant.now())
+                        }
+                        404 -> throw AppShipUpdateException("更新服务尚未发布 TermLink 版本")
+                        422 -> throw AppShipUpdateException("当前应用的更新参数配置无效")
+                        429 -> throw AppShipUpdateException("更新检测过于频繁，请稍后重试")
+                        in 500..599 -> throw AppShipUpdateException("更新服务暂时不可用，请稍后重试")
+                        else -> throw AppShipUpdateException("更新检测失败（HTTP ${response.code}）")
                     }
                 }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: AppShipUpdateException) {
+                ProductUpdateStatus(
+                    decision = ProductUpdateDecision.ERROR,
+                    message = error.message?.take(160) ?: "Update check failed",
+                    checkedAt = Instant.now(),
+                )
+            } catch (error: java.io.IOException) {
+                ProductUpdateStatus(
+                    decision = ProductUpdateDecision.ERROR,
+                    message = "Unable to connect to update service",
+                    checkedAt = Instant.now(),
+                )
+            } catch (error: Throwable) {
+                ProductUpdateStatus(
+                    decision = ProductUpdateDecision.ERROR,
+                    message = error.message?.take(160) ?: "Update check failed",
+                    checkedAt = Instant.now(),
+                )
             }
-        } catch (error: Throwable) {
-            ProductUpdateStatus(
-                decision = ProductUpdateDecision.ERROR,
-                message = error.message?.take(160) ?: "Update check failed",
-                checkedAt = Instant.now(),
-            )
+            publishUpdateStatus(status)
         }
-        return publishUpdateStatus(status)
     }
 
     override suspend fun beginBrowserRegistration() = beginBrowserAuth(BrowserAuthFlow.REGISTRATION)
@@ -393,6 +452,9 @@ internal class ProductionProductRepository(
             val cleanState = CredentialFreeAuthState.sanitize(state)
             scope.launch {
                 runCatching {
+                    if (sessionStore.accountLogin == null) {
+                        sessionStore.accountLogin = OidcJwtClaims.displayIdentifier(tokenResponse.idToken ?: accessToken)
+                    }
                     // Persist the issuer+subject scope first. If the process is
                     // killed after AuthState is saved, startup must never see
                     // an authorized session without an account-scoped key.
@@ -416,6 +478,7 @@ internal class ProductionProductRepository(
     override suspend fun signOut() {
         authState = null
         sessionStore.clearAuthState()
+        sessionStore.accountLogin = null
         closeLiveSessions()
         closeHistoryEngines()
         clearRoomCache()
@@ -453,7 +516,7 @@ internal class ProductionProductRepository(
             mutableSnapshot.value = mutableSnapshot.value.copy(
                 enrollmentState = ProductEnrollmentState.TRUSTED,
                 enrollmentConfirmationRequired = false,
-                accountLabel = "Connected account",
+                accountLabel = accountDisplayLabel(),
                 devices = listOf(self),
             )
             refreshWithApiPublished(api)
@@ -831,7 +894,7 @@ internal class ProductionProductRepository(
             connectionError = null,
             enrollmentState = ProductEnrollmentState.TRUSTED,
             enrollmentConfirmationRequired = false,
-            accountLabel = "Connected account",
+            accountLabel = accountDisplayLabel(),
             devices = devices,
             pcs = pcs,
             sessions = sessions,
@@ -983,6 +1046,9 @@ internal class ProductionProductRepository(
         val configuration = ensureOidcConfiguration()
         val accessToken = authState?.accessToken ?: error("OIDC access token is unavailable")
         val subject = OidcJwtClaims.accessTokenSubject(accessToken, configuration.issuer, configuration.clientId)
+        if (sessionStore.accountLogin == null) {
+            sessionStore.accountLogin = OidcJwtClaims.displayIdentifier(accessToken)
+        }
         establishAccountScope(AccountScope.canonical(configuration.issuer, subject))
         withApi { api ->
             val self = ProductResponseParser.self(api.get("/v1/devices/self").jsonObject)
@@ -994,7 +1060,7 @@ internal class ProductionProductRepository(
                         connectionState = ProductConnectionState.CONNECTED,
                         enrollmentState = ProductEnrollmentState.TRUSTED,
                         enrollmentConfirmationRequired = false,
-                        accountLabel = "Connected account",
+                        accountLabel = accountDisplayLabel(),
                         devices = listOf(self),
                     )
                     refreshWithApi(api)
@@ -1069,7 +1135,7 @@ internal class ProductionProductRepository(
                 DeviceTrustState.TRUSTED -> ProductEnrollmentState.TRUSTED
             },
             enrollmentConfirmationRequired = prompt && self.trustState == DeviceTrustState.PENDING,
-            accountLabel = if (self.trustState == DeviceTrustState.REVOKED) "Revoked account" else "Account setup required",
+            accountLabel = accountDisplayLabel(),
             devices = listOf(self),
             pcs = emptyList(),
             sessions = emptyList(),
@@ -1102,43 +1168,47 @@ internal class ProductionProductRepository(
         return status
     }
 
-    private fun parseAppShipUpdate(body: String): ProductUpdateStatus {
-        val root = runCatching { json.parseToJsonElement(body).jsonObject }
-            .getOrElse { return ProductUpdateStatus(ProductUpdateDecision.ERROR, message = "Invalid update response", checkedAt = Instant.now()) }
-        fun objectAt(parent: JsonObject, key: String): JsonObject? = parent[key] as? JsonObject
-        fun stringAt(parent: JsonObject, vararg keys: String): String? = keys.firstNotNullOfOrNull { key ->
-            parent[key]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
-        }
-        val release = objectAt(root, "release") ?: objectAt(root, "update") ?: objectAt(root, "latest") ?: root
-        val artifact = objectAt(release, "artifact") ?: objectAt(root, "artifact")
-        val rawDecision = stringAt(root, "decision", "status", "result")?.uppercase()
-        val versionName = stringAt(release, "versionName", "version_name", "version")
-        val buildNumber = stringAt(release, "buildNumber", "build_number", "build")?.toLongOrNull()
-        val downloadUrl = stringAt(artifact ?: release, "downloadUrl", "download_url", "url")
-            ?.takeIf { value ->
-                runCatching { URI(value) }.getOrNull()?.let { uri ->
-                    uri.isAbsolute && uri.scheme.equals("https", ignoreCase = true)
-                } == true
+    private fun cachedUpdateStatus(baseUrl: String): ProductUpdateStatus? {
+        if (updatePreferences.getString(UPDATE_REQUEST_KEY, null) != updateRequestKey) return null
+        val body = updatePreferences.getString(UPDATE_BODY_KEY, null) ?: return null
+        return runCatching {
+            AppShipUpdateProtocol.parseAndValidate(
+                body = body,
+                baseUrl = baseUrl,
+                expectedSlug = PRODUCT_APPSHIP_SLUG,
+                expectedChannel = UPDATE_CHANNEL,
+                expectedArchitecture = updateArchitecture,
+                currentBuild = BuildConfig.VERSION_CODE.toLong(),
+            )
+        }.getOrNull()
+    }
+
+    private fun saveUpdateCache(body: String, etag: String?) {
+        updatePreferences.edit()
+            .putString(UPDATE_REQUEST_KEY, updateRequestKey)
+            .putString(UPDATE_BODY_KEY, body)
+            .putString(UPDATE_ETAG_KEY, etag)
+            .putLong(UPDATE_CHECKED_AT_KEY, System.currentTimeMillis())
+            .commit()
+    }
+
+    private fun readLimitedText(input: java.io.InputStream?): String {
+        if (input == null) throw AppShipUpdateException("更新服务返回了空响应")
+        val output = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(8 * 1024)
+        var total = 0
+        input.use { stream ->
+            while (true) {
+                val count = stream.read(buffer)
+                if (count < 0) break
+                total += count
+                if (total > UPDATE_MAX_RESPONSE_BYTES) {
+                    throw AppShipUpdateException("更新服务响应过大")
+                }
+                output.write(buffer, 0, count)
             }
-        val decision = when (rawDecision) {
-            "REQUIRED", "MANDATORY", "FORCE" -> ProductUpdateDecision.REQUIRED
-            "OPTIONAL", "AVAILABLE", "UPDATE_AVAILABLE" -> ProductUpdateDecision.OPTIONAL
-            "NO_UPDATE", "NONE", "CURRENT", "UP_TO_DATE", "NOT_AVAILABLE" -> ProductUpdateDecision.NO_UPDATE
-            else -> if (versionName != null || buildNumber != null || downloadUrl != null) {
-                ProductUpdateDecision.OPTIONAL
-            } else {
-                ProductUpdateDecision.NO_UPDATE
-            }
         }
-        return ProductUpdateStatus(
-            decision = decision,
-            versionName = versionName,
-            buildNumber = buildNumber,
-            releaseNotes = stringAt(release, "releaseNotes", "release_notes", "notes"),
-            downloadUrl = downloadUrl,
-            message = stringAt(root, "message", "detail") ?: if (decision == ProductUpdateDecision.NO_UPDATE) "No update available" else null,
-            checkedAt = Instant.now(),
-        )
+        return output.toString(Charsets.UTF_8.name())
     }
 
     private fun appendActivity(title: String, detail: String, severity: Severity) {
@@ -1897,6 +1967,14 @@ internal class ProductionProductRepository(
 
     private companion object {
         const val PUBLIC_SERVER_URL = "https://termlink.kget.cc:8910"
+        const val UPDATE_PREFERENCES = "update_service"
+        const val UPDATE_CHANNEL = "stable"
+        const val UPDATE_REQUEST_KEY = "cache_request"
+        const val UPDATE_BODY_KEY = "cache_body"
+        const val UPDATE_ETAG_KEY = "cache_etag"
+        const val UPDATE_CHECKED_AT_KEY = "cache_checked_at"
+        const val UPDATE_CACHE_INTERVAL_MILLIS = 60_000L
+        const val UPDATE_MAX_RESPONSE_BYTES = 1_048_576
         const val LIVE_TOKEN_REFRESH_INTERVAL_MILLIS = 15_000L
         const val LIVE_TOKEN_REFRESH_RETRY_MILLIS = 45_000L
         const val LIVE_OUTPUT_ACK_DIRECTION = "PC_TO_ANDROID"

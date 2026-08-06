@@ -84,7 +84,7 @@
     <string name="page_activity_subtitle">Recent device-local actions; this is not a server audit.</string>
     <string name="page_history_subtitle">Encrypted history objects returned by the server.</string>
     <string name="page_membership_subtitle">Entitlement and quotas returned by the server catalog.</string>
-    <string name="page_settings_subtitle">Connection, account, and local safety defaults.</string>
+    <string name="page_settings_subtitle">Connection and local safety defaults.</string>
     <string name="page_trusted_devices_subtitle">Review access state without exposing key identifiers.</string>
     <string name="page_account_subtitle">Identity and server state for this Android device.</string>
     <string name="pc_routing_title">PC routing</string>
@@ -174,10 +174,6 @@
     <string name="terminal_dock_hide">Hide shortcut dock</string><string name="terminal_dock_show">Show shortcut dock</string>
     <string name="settings_appearance_title">Appearance</string>
     <string name="settings_appearance_copy">Choose the app chrome theme. Terminal ANSI colors stay unchanged.</string>
-    <string name="settings_access_title">Account and access</string>
-    <string name="settings_access_copy">Nested settings keep the phone primary navigation focused.</string>
-    <string name="settings_account_title">Account</string>
-    <string name="settings_account_copy">View the signed-in identity and the fixed public service endpoint.</string>
     <string name="settings_terminal_title">Terminal display</string>
     <string name="settings_terminal_copy">Adjust command-line font, line spacing, and RGB colors.</string>
     <string name="settings_terminal_font_size">Font size %1$.0fsp</string>
@@ -194,10 +190,13 @@
     <string name="theme_light">Light</string>
     <string name="theme_dark">Dark</string>
     <string name="settings_server_connection">Server connection</string>
-    <string name="settings_device_proof">Default account access</string>
+    <string name="settings_device_proof">Default access</string>
     <string name="settings_input_safety">Input safety</string>
     <string name="settings_about">About</string>
-    <string name="settings_about_copy">Build and protocol details for support diagnostics.</string>
+    <string name="settings_about_copy">Version, author, and update information.</string>
+    <string name="settings_version">Version %1$s (%2$d)</string>
+    <string name="settings_author">Author</string>
+    <string name="settings_author_name">丶清风惹尘</string>
     <string name="settings_updates_title">Updates</string>
     <string name="settings_updates_copy">Check the public AppShip channel without sending account credentials.</string>
     <string name="action_check_updates">Check for updates</string>
@@ -206,7 +205,7 @@
     <string name="update_optional">Optional update available: %1$s</string>
     <string name="update_required">Required update: %1$s</string>
     <string name="update_error">Update check failed</string>
-    <string name="settings_product_shell">TermLink Android product shell</string>
+    <string name="settings_product_shell">TermLink</string>
     <string name="settings_transport_copy">Production transport uses the fixed public service after you sign in.</string>
     <string name="confirm_reject_title">Reject pending device?</string>
     <string name="confirm_revoke_title">Revoke device trust?</string>
@@ -240,6 +239,7 @@
     <string name="account_endpoint">Server endpoint</string>
     <string name="account_last_sync">Last server sync</string>
     <string name="account_no_identity">No account identity returned</string>
+    <string name="account_login_fallback">Signed in</string>
     <string name="account_not_configured">Not configured</string>
     <string name="account_not_synced">Not synced</string>
     <string name="account_access_copy">This device uses the signed-in account for its authenticated terminal connection.</string>
