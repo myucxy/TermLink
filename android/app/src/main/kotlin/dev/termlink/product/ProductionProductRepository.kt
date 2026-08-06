@@ -90,6 +90,8 @@ import net.openid.appauth.TokenRequest
 import net.openid.appauth.TokenResponse
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.concurrent.thread
@@ -116,8 +118,10 @@ internal class ProductionProductRepository(
     private val refreshStateLock = Mutex()
     private val keyMetadataRefreshLock = Mutex()
     private val tokenRefresh = TokenRefreshCoordinator { requestFreshAccessToken() }
-    private val initialServerUrl = sessionStore.serverUrl ?: PUBLIC_SERVER_URL.also {
-        sessionStore.serverUrl = it
+    // The first production client is intentionally pinned to the public service.
+    // Migrate older installs that may still have a locally edited endpoint.
+    private val initialServerUrl = PUBLIC_SERVER_URL.also {
+        if (sessionStore.serverUrl != it) sessionStore.serverUrl = it
     }
     private val billing = BillingCoordinator(
         adapter = PlayBillingAdapter(activity, activity),
@@ -171,13 +175,13 @@ internal class ProductionProductRepository(
     }
 
     init {
-        if (authState?.isAuthorized == true && sessionStore.serverUrl != null) {
+        if (authState?.isAuthorized == true) {
             scope.launch { runCatching { refresh() } }
         }
     }
 
     override suspend fun configureServer(url: String) {
-        val normalized = normalizeServerUrl(url)
+        val normalized = PUBLIC_SERVER_URL
         val changed = normalized != sessionStore.serverUrl
         if (changed) {
             closeLiveSessions()
@@ -231,6 +235,35 @@ internal class ProductionProductRepository(
             throw error
         } finally {
             password.fill('\u0000')
+        }
+    }
+
+    override suspend fun register(username: String, email: String, password: CharArray, confirm: CharArray) {
+        check(!closed) { "Repository is closed" }
+        require(username.trim().length in 3..128) { "Username is invalid" }
+        require(email.trim().length in 3..320) { "Email is invalid" }
+        require(password.size in 8..1024 && password.contentEquals(confirm)) { "Password is invalid" }
+        try {
+            val root = PUBLIC_SERVER_URL
+            val body = buildJsonObject {
+                put("username", username.trim())
+                put("email", email.trim())
+                put("password", String(password))
+                put("password_confirm", String(confirm))
+            }
+            val request = Request.Builder()
+                .url("$root/v1/auth/register")
+                .post(body.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .header("Cache-Control", "no-store")
+                .build()
+            withContext(Dispatchers.IO) {
+                nativeAuthHttp.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) throw IllegalStateException("Account registration was rejected")
+                }
+            }
+        } finally {
+            password.fill('\u0000')
+            confirm.fill('\u0000')
         }
     }
 
@@ -336,15 +369,11 @@ internal class ProductionProductRepository(
         oidcConfiguration = null
         billing.reset()
         mutableSnapshot.value = ProductSnapshot(
-            configured = sessionStore.serverUrl != null,
+            configured = true,
             authenticationState = ProductAuthenticationState.SIGNED_OUT,
-            connectionState = if (sessionStore.serverUrl != null) {
-                ProductConnectionState.CONFIGURED
-            } else {
-                ProductConnectionState.SIGNED_OUT
-            },
+            connectionState = ProductConnectionState.CONFIGURED,
             enrollmentState = ProductEnrollmentState.UNKNOWN,
-            serverUrl = sessionStore.serverUrl,
+            serverUrl = PUBLIC_SERVER_URL,
         )
     }
 
@@ -390,7 +419,10 @@ internal class ProductionProductRepository(
             buildJsonObject {
                 put("target_device_id", deviceId.toString())
                 put("pc_id", pc.id.toString())
-                put("permission", "CONTROL")
+                // Legacy pairing callers are retained for compatibility, but
+                // the first release gives same-account Android devices the
+                // maximum account-scoped permission by default.
+                put("permission", PRODUCT_DEFAULT_ANDROID_PERMISSION)
             },
         ).jsonObject
         val challenge = PairingChallengeDisplay(
@@ -494,7 +526,7 @@ internal class ProductionProductRepository(
         } ?: error("The session PC is not a trusted device")
         require(pcDevice.exchangePublicKey.size == 32) { "The PC exchange public key is unavailable" }
         freshAccessToken()
-        val root = sessionStore.serverUrl ?: error("Configure a TermLink server first")
+        val root = PUBLIC_SERVER_URL
         val stored = identity()
         val engine = TermuxTerminalEngine(
             initialSize = TerminalSize(summary.columns.coerceAtLeast(1), summary.rows.coerceAtLeast(1)),
@@ -767,7 +799,7 @@ internal class ProductionProductRepository(
     }
 
     private suspend fun <T> withApi(block: suspend (ProductionApiClient) -> T): T = withContext(Dispatchers.IO) {
-        val root = sessionStore.serverUrl ?: error("Configure a TermLink server first")
+        val root = PUBLIC_SERVER_URL
         val token = freshAccessToken()
         val identity = identity()
         ProductionApiClient(root, AccessTokenProvider { token }, identity.deviceId, identity.identity, http, allowCleartextForLocalTest = false).use { api ->
@@ -853,7 +885,7 @@ internal class ProductionProductRepository(
 
     private suspend fun ensureOidcConfiguration(): NativeOidcConfiguration {
         oidcConfiguration?.let { return it }
-        val root = sessionStore.serverUrl ?: error("Configure a TermLink server first")
+        val root = PUBLIC_SERVER_URL
         val client = fetchClientConfiguration(root)
         return withContext(Dispatchers.IO) {
             nativeOidc.discover(client.issuer.toString(), client.clientId, client.redirectUri)

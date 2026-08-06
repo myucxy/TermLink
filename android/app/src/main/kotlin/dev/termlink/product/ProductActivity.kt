@@ -39,9 +39,6 @@ import androidx.compose.material.icons.automirrored.filled.Login
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AccountCircle
-import androidx.compose.material.icons.filled.Block
-import androidx.compose.material.icons.filled.CardMembership
-import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Devices
@@ -55,7 +52,6 @@ import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.ShoppingCart
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Terminal
@@ -117,7 +113,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import dev.termlink.model.DeviceSummary
-import dev.termlink.model.DeviceTrustState
 import dev.termlink.model.DeviceType
 import dev.termlink.model.PcSummary
 import dev.termlink.model.SessionState
@@ -137,8 +132,6 @@ import kotlinx.coroutines.launch
 import androidx.core.view.WindowCompat
 
 private sealed class DestructiveProductAction {
-    data class RevokeDevice(val deviceId: java.util.UUID, val reject: Boolean) : DestructiveProductAction()
-    data class ChangeServer(val value: String) : DestructiveProductAction()
     data object SignOut : DestructiveProductAction()
 }
 
@@ -265,21 +258,23 @@ fun ProductApp(
 ) {
     val snapshot by repository.snapshot.collectAsStateCompat()
     var destinationName by rememberSaveable { mutableStateOf(ProductDestination.DEVICES.name) }
-    val destination = ProductDestination.valueOf(destinationName)
-    var deviceFilter by rememberSaveable { mutableStateOf(DeviceFilter.ALL) }
+    val storedDestination = runCatching { ProductDestination.valueOf(destinationName) }
+        .getOrDefault(ProductDestination.DEVICES)
+    // A destination saved by an older build must not resurrect hidden product
+    // surfaces after an upgrade.
+    val destination = storedDestination.takeIf { it.isVisibleInProductShell } ?: ProductDestination.DEVICES
     var selectedSessionId by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedHistoryId by rememberSaveable { mutableStateOf<String?>(null) }
     var pasteSessionId by remember { mutableStateOf<java.util.UUID?>(null) }
-    var configureServer by remember { mutableStateOf(false) }
-    var completePairing by remember { mutableStateOf(false) }
     var commandSearchOpen by remember { mutableStateOf(false) }
-    var pendingDestructiveAction by remember { mutableStateOf<DestructiveProductAction?>(null) }
+    var signOutConfirmation by remember { mutableStateOf(false) }
+    var registrationOpen by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     val unavailableOperationMessage = stringResource(R.string.unknown_server_operation)
 
     fun navigateTo(next: ProductDestination) {
-        destinationName = next.name
+        if (next.isVisibleInProductShell) destinationName = next.name
     }
 
     fun navigateToPrimary(next: ProductPrimaryDestination) {
@@ -316,24 +311,18 @@ fun ProductApp(
                     password.fill('\u0000')
                     runOperation({ repository.signIn(username, submittedPassword) }, onComplete)
                 },
-                onRegister = { runOperation(repository::beginBrowserRegistration) },
-                onAccountSetup = { runOperation(repository::beginBrowserAccountSetup) },
-                onConfigure = { configureServer = true },
+                onRegister = { registrationOpen = true },
                 modifier = Modifier.padding(innerPadding),
             )
         }
-        if (configureServer) {
-            ServerConfigurationDialog(
-                initialValue = snapshot.serverUrl.orEmpty(),
-                onDismiss = { configureServer = false },
-                onConfirm = { value ->
-                    configureServer = false
-                    val normalized = runCatching { ServerUrlPolicy.normalize(value) }.getOrNull()
-                    if (snapshot.signedIn && normalized != null && normalized != snapshot.serverUrl) {
-                        pendingDestructiveAction = DestructiveProductAction.ChangeServer(value)
-                    } else {
-                        runOperation { repository.configureServer(value) }
-                    }
+        if (registrationOpen) {
+            RegistrationDialog(
+                onDismiss = { registrationOpen = false },
+                onSubmit = { username, email, password, confirm ->
+                    runOperation(
+                        { repository.register(username, email, password, confirm) },
+                        onComplete = { registrationOpen = false },
+                    )
                 },
             )
         }
@@ -379,8 +368,6 @@ fun ProductApp(
                     destination = destination,
                     snapshot = snapshot,
                     wide = wide,
-                    deviceFilter = deviceFilter,
-                    onDeviceFilterChanged = { deviceFilter = it },
                     selectedSessionId = selectedSessionId,
                     onSessionSelected = { selectedSessionId = it.toString() },
                     onOpenSession = { runOperation { repository.openSession(it) } },
@@ -390,26 +377,12 @@ fun ProductApp(
                     onHistorySelected = { selectedHistoryId = it.historyObject.id.toString() },
                     onOpenSessions = { navigateTo(ProductDestination.SESSIONS) },
                     onOpenHistory = { navigateTo(ProductDestination.HISTORY) },
-                    onOpenMembership = { navigateTo(ProductDestination.MEMBERSHIP) },
-                    onOpenTrustedDevices = { navigateTo(ProductDestination.TRUSTED_DEVICES) },
                     onOpenAccount = { navigateTo(ProductDestination.ACCOUNT) },
                     onOpenCommandSearch = { commandSearchOpen = true },
                     themePreference = themePreference,
                     onThemePreferenceChanged = onThemePreferenceChanged,
-                    onConfigure = { configureServer = true },
-                    onCompletePairing = { completePairing = true },
-                    onPurchase = { runOperation { repository.purchaseProduct(it) } },
-                    onRestorePurchases = { runOperation { repository.restorePurchases() } },
                     onSignIn = { runOperation(repository::signIn) },
-                    onSignOut = { pendingDestructiveAction = DestructiveProductAction.SignOut },
-                    onApprove = { runOperation { repository.approveDevice(it) } },
-                    onRevoke = { deviceId ->
-                        val device = snapshot.devices.firstOrNull { it.id == deviceId }
-                        pendingDestructiveAction = DestructiveProductAction.RevokeDevice(
-                            deviceId = deviceId,
-                            reject = device?.trustState == DeviceTrustState.PENDING,
-                        )
-                    },
+                    onSignOut = { signOutConfirmation = true },
                     onRequestControl = { runOperation { repository.requestControl(it) } },
                     onReleaseControl = { runOperation { repository.releaseControl(it) } },
                     onPaste = { pasteSessionId = it },
@@ -431,30 +404,6 @@ fun ProductApp(
             },
         )
     }
-    if (configureServer) {
-        ServerConfigurationDialog(
-            initialValue = snapshot.serverUrl.orEmpty(),
-            onDismiss = { configureServer = false },
-            onConfirm = { value ->
-                configureServer = false
-                val normalized = runCatching { ServerUrlPolicy.normalize(value) }.getOrNull()
-                if (snapshot.signedIn && normalized != null && normalized != snapshot.serverUrl) {
-                    pendingDestructiveAction = DestructiveProductAction.ChangeServer(value)
-                } else {
-                    runOperation { repository.configureServer(value) }
-                }
-            },
-        )
-    }
-    if (completePairing) {
-        PairingCompletionDialog(
-            onDismiss = { completePairing = false },
-            onConfirm = { challengeId, code, nonce ->
-                completePairing = false
-                runOperation { repository.completePairing(challengeId, code, nonce) }
-            },
-        )
-    }
     if (commandSearchOpen) {
         CommandSearchDialog(
             onDismiss = { commandSearchOpen = false },
@@ -464,50 +413,16 @@ fun ProductApp(
             },
         )
     }
-    if (snapshot.enrollmentConfirmationRequired && snapshot.enrollmentState == ProductEnrollmentState.PENDING_CONFIRMATION) {
-        EnrollmentConfirmationDialog(
-            onConfirm = { runOperation(repository::confirmEnrollment) },
-            onCancel = { runOperation(repository::cancelEnrollment) },
-        )
-    }
-    pendingDestructiveAction?.let { action ->
-        val title: String
-        val message: String
-        val confirmLabel: String
-        when (action) {
-            is DestructiveProductAction.RevokeDevice -> {
-                title = stringResource(if (action.reject) R.string.confirm_reject_title else R.string.confirm_revoke_title)
-                message = if (action.reject) {
-                    stringResource(R.string.confirm_reject_copy)
-                } else {
-                    stringResource(R.string.confirm_revoke_copy)
-                }
-                confirmLabel = stringResource(if (action.reject) R.string.confirm_reject else R.string.confirm_revoke)
-            }
-            is DestructiveProductAction.ChangeServer -> {
-                title = stringResource(R.string.confirm_change_server_title)
-                message = stringResource(R.string.confirm_change_server_copy)
-                confirmLabel = stringResource(R.string.confirm_change_server)
-            }
-            DestructiveProductAction.SignOut -> {
-                title = stringResource(R.string.confirm_sign_out_title)
-                message = stringResource(R.string.confirm_sign_out_copy)
-                confirmLabel = stringResource(R.string.confirm_sign_out)
-            }
-        }
+    if (signOutConfirmation) {
         ConfirmActionDialog(
-            title = title,
-            message = message,
-            confirmLabel = confirmLabel,
+            title = stringResource(R.string.confirm_sign_out_title),
+            message = stringResource(R.string.confirm_sign_out_copy),
+            confirmLabel = stringResource(R.string.confirm_sign_out),
             icon = Icons.Filled.Warning,
-            onDismiss = { pendingDestructiveAction = null },
+            onDismiss = { signOutConfirmation = false },
             onConfirm = {
-                pendingDestructiveAction = null
-                when (action) {
-                    is DestructiveProductAction.RevokeDevice -> runOperation { repository.revokeDevice(action.deviceId) }
-                    is DestructiveProductAction.ChangeServer -> runOperation { repository.configureServer(action.value) }
-                    DestructiveProductAction.SignOut -> runOperation(repository::signOut)
-                }
+                signOutConfirmation = false
+                runOperation(repository::signOut)
             },
         )
     }
@@ -518,8 +433,6 @@ private fun ProductSignInPage(
     snapshot: ProductSnapshot,
     onSignIn: (String, CharArray, () -> Unit) -> Unit,
     onRegister: () -> Unit,
-    onAccountSetup: () -> Unit,
-    onConfigure: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var username by remember { mutableStateOf("") }
@@ -610,7 +523,7 @@ private fun ProductSignInPage(
                 Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(stringResource(R.string.sign_in_server_label), style = MaterialTheme.typography.labelMedium)
                     Text(
-                        snapshot.serverUrl ?: stringResource(R.string.sign_in_server_unavailable),
+                        PRODUCT_PUBLIC_SERVER_URL,
                         style = MaterialTheme.typography.bodySmall,
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.SemiBold,
@@ -618,22 +531,17 @@ private fun ProductSignInPage(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-                Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                    Text(stringResource(R.string.status_https_endpoint), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.tertiary)
-                    TextButton(onClick = onConfigure, contentPadding = ButtonDefaults.TextButtonContentPadding, modifier = Modifier.heightIn(min = 48.dp)) {
-                        Text(stringResource(R.string.action_change_server))
-                    }
-                }
+                Text(
+                    stringResource(R.string.status_https_endpoint),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.tertiary,
+                )
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.45f))
 
             if (snapshot.connectionState == ProductConnectionState.ERROR) {
                 Text(
-                    if (snapshot.authenticationState == ProductAuthenticationState.BROWSER_SETUP_REQUIRED) {
-                        stringResource(R.string.sign_in_account_setup_required)
-                    } else {
-                        snapshot.connectionError ?: stringResource(R.string.connection_error_copy)
-                    },
+                    snapshot.connectionError ?: stringResource(R.string.connection_error_copy),
                     modifier = Modifier.padding(top = 12.dp),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
@@ -671,7 +579,7 @@ private fun ProductSignInPage(
                     password = ""
                     onSignIn(submittedUsername, submittedPassword) { submitting = false }
                 },
-                enabled = snapshot.configured && !submitting && username.isNotBlank() && password.isNotEmpty(),
+                enabled = !submitting && username.isNotBlank() && password.isNotEmpty(),
                 modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
             ) {
                 Icon(Icons.AutoMirrored.Filled.Login, contentDescription = null)
@@ -682,21 +590,11 @@ private fun ProductSignInPage(
                 )
             }
             Spacer(Modifier.height(10.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                OutlinedButton(
-                    onClick = { password = ""; onRegister() },
-                    enabled = snapshot.configured && !submitting,
-                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                ) { Text(stringResource(R.string.sign_in_register)) }
-                OutlinedButton(
-                    onClick = { password = ""; onAccountSetup() },
-                    enabled = snapshot.configured && !submitting,
-                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                ) { Text(stringResource(R.string.sign_in_account_setup)) }
-            }
+            OutlinedButton(
+                onClick = onRegister,
+                enabled = !submitting,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            ) { Text(stringResource(R.string.sign_in_register)) }
 
             Spacer(Modifier.height(18.dp))
             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
@@ -712,9 +610,9 @@ private fun ProductSignInPage(
                     tint = MaterialTheme.colorScheme.secondary,
                 )
                 Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                    Text(stringResource(R.string.sign_in_secure_browser), style = MaterialTheme.typography.titleSmall)
+                    Text(stringResource(R.string.sign_in_secure_native), style = MaterialTheme.typography.titleSmall)
                     Text(
-                        stringResource(R.string.sign_in_secure_browser_copy),
+                        stringResource(R.string.sign_in_secure_native_copy),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -725,50 +623,101 @@ private fun ProductSignInPage(
 }
 
 @Composable
-private fun ServerConfigurationDialog(
-    initialValue: String,
+private fun RegistrationDialog(
     onDismiss: () -> Unit,
-    onConfirm: (String) -> Unit,
+    onSubmit: (String, String, CharArray, CharArray) -> Unit,
 ) {
-    var value by rememberSaveable(initialValue) { mutableStateOf(initialValue) }
+    var username by rememberSaveable { mutableStateOf("") }
+    var email by rememberSaveable { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+    var submitting by remember { mutableStateOf(false) }
+    val valid = username.trim().length >= 3 && email.trim().contains("@") &&
+        password.length >= 8 && password == confirm
     AlertDialog(
-        onDismissRequest = onDismiss,
-        icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
-        title = { Text(stringResource(R.string.server_dialog_title)) },
+        onDismissRequest = { if (!submitting) onDismiss() },
+        icon = { Icon(Icons.Filled.AccountCircle, contentDescription = null) },
+        title = { Text(stringResource(R.string.registration_title)) },
         text = {
-            OutlinedTextField(
-                value = value,
-                onValueChange = { value = it },
-                label = { Text(stringResource(R.string.server_url_label)) },
-                placeholder = { Text(stringResource(R.string.server_url_hint)) },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-            )
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 520.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    stringResource(R.string.registration_copy),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it },
+                    enabled = !submitting,
+                    singleLine = true,
+                    label = { Text(stringResource(R.string.registration_username_label)) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = email,
+                    onValueChange = { email = it },
+                    enabled = !submitting,
+                    singleLine = true,
+                    label = { Text(stringResource(R.string.registration_email_label)) },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    enabled = !submitting,
+                    singleLine = true,
+                    label = { Text(stringResource(R.string.registration_password_label)) },
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = confirm,
+                    onValueChange = { confirm = it },
+                    enabled = !submitting,
+                    singleLine = true,
+                    label = { Text(stringResource(R.string.registration_confirm_label)) },
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (confirm.isNotEmpty() && password != confirm) {
+                    Text(
+                        stringResource(R.string.registration_password_mismatch),
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
         },
         confirmButton = {
-            Button(onClick = { onConfirm(value) }, enabled = value.isNotBlank(), modifier = Modifier.heightIn(min = 48.dp)) { Text(stringResource(R.string.action_save)) }
-        },
-        dismissButton = { TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text(stringResource(R.string.action_cancel)) } },
-    )
-}
-
-@Composable
-private fun EnrollmentConfirmationDialog(
-    onConfirm: () -> Unit,
-    onCancel: () -> Unit,
-) {
-    AlertDialog(
-        onDismissRequest = onCancel,
-        icon = { Icon(Icons.Filled.PhoneAndroid, contentDescription = null) },
-        title = { Text(stringResource(R.string.enrollment_confirm_title)) },
-        text = {
-            Text(stringResource(R.string.enrollment_confirm_copy))
-        },
-        confirmButton = {
-            Button(onClick = onConfirm) { Text(stringResource(R.string.enrollment_confirm_action)) }
+            Button(
+                onClick = {
+                    if (!valid || submitting) return@Button
+                    submitting = true
+                    val nextPassword = password.toCharArray()
+                    val nextConfirm = confirm.toCharArray()
+                    password = ""
+                    confirm = ""
+                    onSubmit(username.trim(), email.trim(), nextPassword, nextConfirm)
+                },
+                enabled = valid && !submitting,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) {
+                Text(if (submitting) stringResource(R.string.registration_working) else stringResource(R.string.registration_action))
+            }
         },
         dismissButton = {
-            TextButton(onClick = onCancel) { Text(stringResource(R.string.action_cancel)) }
+            TextButton(onClick = onDismiss, enabled = !submitting, modifier = Modifier.heightIn(min = 48.dp)) {
+                Text(stringResource(R.string.action_cancel))
+            }
         },
     )
 }
@@ -892,30 +841,17 @@ private fun ProductDestination.localizedLabel(): String = when (this) {
     ProductDestination.SESSIONS -> stringResource(R.string.nav_sessions)
     ProductDestination.ACTIVITY -> stringResource(R.string.nav_activity)
     ProductDestination.HISTORY -> stringResource(R.string.nav_history)
-    ProductDestination.MEMBERSHIP -> stringResource(R.string.nav_membership)
-    ProductDestination.TRUSTED_DEVICES -> stringResource(R.string.nav_trusted_devices)
+    // Retained enum values are never exposed by the shell.
+    ProductDestination.MEMBERSHIP,
+    ProductDestination.TRUSTED_DEVICES -> label
     ProductDestination.ACCOUNT -> stringResource(R.string.nav_account)
     ProductDestination.SETTINGS -> stringResource(R.string.nav_settings)
-}
-
-@Composable
-private fun DeviceTrustState.localizedLabel(): String = when (this) {
-    DeviceTrustState.TRUSTED -> stringResource(R.string.trust_trusted)
-    DeviceTrustState.PENDING -> stringResource(R.string.trust_pending)
-    DeviceTrustState.REVOKED -> stringResource(R.string.trust_revoked)
 }
 
 @Composable
 private fun DeviceType.localizedLabel(): String = when (this) {
     DeviceType.WINDOWS_PC -> stringResource(R.string.device_type_windows_pc)
     DeviceType.ANDROID -> stringResource(R.string.device_type_android)
-}
-
-@Composable
-private fun DeviceFilter.localizedLabel(): String = when (this) {
-    DeviceFilter.ALL -> stringResource(R.string.filter_all)
-    DeviceFilter.TRUSTED -> stringResource(R.string.filter_trusted)
-    DeviceFilter.PENDING -> stringResource(R.string.filter_pending)
 }
 
 @Composable
@@ -932,27 +868,11 @@ private fun dev.termlink.model.HistoryObject.Kind.localizedLabel(): String = whe
 }
 
 @Composable
-private fun dev.termlink.billing.BillingPhase.localizedLabel(): String = when (this) {
-    dev.termlink.billing.BillingPhase.IDLE -> stringResource(R.string.billing_idle)
-    dev.termlink.billing.BillingPhase.CONNECTING -> stringResource(R.string.billing_connecting)
-    dev.termlink.billing.BillingPhase.READY -> stringResource(R.string.billing_ready)
-    dev.termlink.billing.BillingPhase.PURCHASING -> stringResource(R.string.billing_purchasing)
-    dev.termlink.billing.BillingPhase.VERIFYING -> stringResource(R.string.billing_verifying)
-    dev.termlink.billing.BillingPhase.RESTORING -> stringResource(R.string.billing_restoring)
-    dev.termlink.billing.BillingPhase.PENDING -> stringResource(R.string.billing_pending)
-    dev.termlink.billing.BillingPhase.CANCELED -> stringResource(R.string.billing_canceled)
-    dev.termlink.billing.BillingPhase.DISCONNECTED -> stringResource(R.string.billing_disconnected)
-    dev.termlink.billing.BillingPhase.ERROR -> stringResource(R.string.billing_error)
-}
-
-@Composable
 private fun ProductContent(
     modifier: Modifier,
     destination: ProductDestination,
     snapshot: ProductSnapshot,
     wide: Boolean,
-    deviceFilter: DeviceFilter,
-    onDeviceFilterChanged: (DeviceFilter) -> Unit,
     selectedSessionId: String?,
     onSessionSelected: (java.util.UUID) -> Unit,
     onOpenSession: (java.util.UUID) -> Unit,
@@ -962,20 +882,12 @@ private fun ProductContent(
     onHistorySelected: (HistoryEntry) -> Unit,
     onOpenSessions: () -> Unit,
     onOpenHistory: () -> Unit,
-    onOpenMembership: () -> Unit,
-    onOpenTrustedDevices: () -> Unit,
     onOpenAccount: () -> Unit,
     onOpenCommandSearch: () -> Unit,
     themePreference: ProductThemePreference,
     onThemePreferenceChanged: (ProductThemePreference) -> Unit,
-    onConfigure: () -> Unit,
-    onCompletePairing: () -> Unit,
-    onPurchase: (String) -> Unit,
-    onRestorePurchases: () -> Unit,
     onSignIn: () -> Unit,
     onSignOut: () -> Unit,
-    onApprove: (java.util.UUID) -> Unit,
-    onRevoke: (java.util.UUID) -> Unit,
     onRequestControl: (java.util.UUID) -> Unit,
     onReleaseControl: (java.util.UUID) -> Unit,
     onPaste: (java.util.UUID) -> Unit,
@@ -992,12 +904,6 @@ private fun ProductContent(
         when (destination) {
             ProductDestination.DEVICES -> DevicesPage(
                 snapshot = snapshot,
-                filter = deviceFilter,
-                onFilterChanged = onDeviceFilterChanged,
-                onConfigure = onConfigure,
-                onCompletePairing = onCompletePairing,
-                onApprove = onApprove,
-                onRevoke = onRevoke,
                 onOpenSessions = onOpenSessions,
                 onOpenAccount = onOpenAccount,
                 onOpenCommandSearch = onOpenCommandSearch,
@@ -1009,7 +915,6 @@ private fun ProductContent(
                 onSessionSelected = onSessionSelected,
                 onOpenSession = onOpenSession,
                 terminalEngine = terminalEngine,
-                onConfigure = onConfigure,
                 onRequestControl = onRequestControl,
                 onReleaseControl = onReleaseControl,
                 onPaste = onPaste,
@@ -1017,44 +922,37 @@ private fun ProductContent(
             )
             ProductDestination.ACTIVITY -> ActivityPage(
                 snapshot = snapshot,
-                onConfigure = onConfigure,
                 onOpenHistory = onOpenHistory,
             )
             ProductDestination.HISTORY -> HistoryPage(
                 snapshot = snapshot,
                 selectedHistoryId = selectedHistoryId,
                 onHistorySelected = onHistorySelected,
-                onConfigure = onConfigure,
                 onReplay = onReplay,
                 historyEngine = historyEngine,
             )
-            ProductDestination.MEMBERSHIP -> MembershipPage(
-                snapshot = snapshot,
-                onConfigure = onConfigure,
-                onPurchase = onPurchase,
-                onRestorePurchases = onRestorePurchases,
-            )
-            ProductDestination.TRUSTED_DEVICES -> TrustedDevicesPage(
-                snapshot = snapshot,
-                onApprove = onApprove,
-                onRevoke = onRevoke,
-                onCompletePairing = onCompletePairing,
-                onConfigure = onConfigure,
-            )
-            ProductDestination.ACCOUNT -> AccountPage(snapshot = snapshot, onSignOut = onSignOut, onConfigure = onConfigure)
+            // These routes remain in the enum for persistence/API compatibility,
+            // but navigation is blocked by [isVisibleInProductShell].
+            ProductDestination.MEMBERSHIP,
+            ProductDestination.TRUSTED_DEVICES -> HiddenProductDestinationPage()
+            ProductDestination.ACCOUNT -> AccountPage(snapshot = snapshot, onSignOut = onSignOut)
             ProductDestination.SETTINGS -> SettingsPage(
                 snapshot = snapshot,
-                onConfigure = onConfigure,
                 onSignIn = onSignIn,
                 onSignOut = onSignOut,
-                onOpenMembership = onOpenMembership,
-                onOpenTrustedDevices = onOpenTrustedDevices,
                 onOpenAccount = onOpenAccount,
                 themePreference = themePreference,
                 onThemePreferenceChanged = onThemePreferenceChanged,
             )
         }
     }
+}
+
+/** Defensive fallback for stale deep links into removed product surfaces. */
+@Composable
+private fun HiddenProductDestinationPage() {
+    // Do not render membership, quota, billing, trust, or pairing content.
+    Spacer(Modifier.height(1.dp))
 }
 
 @Composable
@@ -1075,34 +973,8 @@ private fun PrimaryHomeHeader(onOpenAccount: () -> Unit) {
 }
 
 @Composable
-private fun HomeQuotaSummary(snapshot: ProductSnapshot) {
-    val entitlement = snapshot.entitlement ?: return
-    val plan = snapshot.catalogPlan?.displayName ?: entitlement.planKey
-    Text(
-        stringResource(
-            R.string.home_quota_summary,
-            plan,
-            quotaValue(snapshot.pcs.size, entitlement.maxRemotePcs),
-            quotaValue(snapshot.sessions.count { it.state == SessionState.RUNNING }, entitlement.maxLiveSessions),
-        ),
-        style = MaterialTheme.typography.labelLarge,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
-}
-
-@Composable
-private fun quotaValue(used: Int, limit: Int): String =
-    if (limit > 0) "$used/$limit" else stringResource(R.string.quota_unavailable)
-
-@Composable
 private fun DevicesPage(
     snapshot: ProductSnapshot,
-    filter: DeviceFilter,
-    onFilterChanged: (DeviceFilter) -> Unit,
-    onConfigure: () -> Unit,
-    onCompletePairing: () -> Unit,
-    onApprove: (java.util.UUID) -> Unit,
-    onRevoke: (java.util.UUID) -> Unit,
     onOpenSessions: () -> Unit,
     onOpenAccount: () -> Unit,
     onOpenCommandSearch: () -> Unit,
@@ -1120,62 +992,25 @@ private fun DevicesPage(
         Text(stringResource(R.string.home_command_search), modifier = Modifier.weight(1f), textAlign = androidx.compose.ui.text.style.TextAlign.Start)
         Text(stringResource(R.string.home_command_shortcut), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
-    HomeQuotaSummary(snapshot)
-    ConnectionBanner(snapshot = snapshot, onConfigure = onConfigure)
-    if (snapshot.enrollmentState == ProductEnrollmentState.PENDING_CONFIRMATION) {
-        PairingPendingCard(onCompletePairing = onCompletePairing, selfEnrollment = true)
-    }
-    snapshot.pairingChallenge?.let { challenge ->
-        PairingChallengeCard(challenge)
-    }
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        DeviceFilter.entries.forEach { item ->
-            FilterChip(
-                selected = filter == item,
-                onClick = { onFilterChanged(item) },
-                label = { Text(item.localizedLabel()) },
-                leadingIcon = if (filter == item) {
-                    { Icon(Icons.Filled.Check, contentDescription = null, modifier = Modifier.size(18.dp)) }
-                } else null,
-                modifier = Modifier.heightIn(min = 48.dp),
-            )
-        }
-    }
+    ConnectionBanner(snapshot = snapshot)
     Text(stringResource(R.string.nav_devices), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-    val devices = snapshot.devices.filter { device ->
-        when (filter) {
-            DeviceFilter.ALL -> true
-            DeviceFilter.TRUSTED -> device.trustState == DeviceTrustState.TRUSTED
-            DeviceFilter.PENDING -> device.trustState == DeviceTrustState.PENDING
-        }
-    }
-    // A pending self-device has no authority to approve itself. Until a trusted
-    // manager/PC is present, show a truthful waiting state instead of a doomed action.
-    val canApprovePending = snapshot.canApprovePendingDevice()
+    val devices = snapshot.devices
     if (devices.isEmpty()) {
         EmptyState(
-            icon = Icons.Filled.Shield,
+            icon = Icons.Filled.Devices,
             title = if (snapshot.signedIn) stringResource(R.string.empty_no_devices) else stringResource(R.string.empty_sign_in_devices),
             detail = if (snapshot.signedIn) {
                 stringResource(R.string.server_devices_empty_copy)
             } else {
-                stringResource(R.string.server_device_trust_copy)
+                stringResource(R.string.empty_sign_in_devices)
             },
-            actionLabel = if (!snapshot.configured) stringResource(R.string.action_configure_server) else null,
-            onAction = onConfigure,
+            actionLabel = null,
+            onAction = {},
         )
     } else {
         devices.forEach { device ->
             DeviceRow(
                 device = device,
-                canApprove = canApprovePending,
-                onApprove = onApprove,
-                onRevoke = onRevoke,
             )
         }
     }
@@ -1191,132 +1026,8 @@ private fun DevicesPage(
 }
 
 @Composable
-private fun PairingPendingCard(onCompletePairing: () -> Unit, selfEnrollment: Boolean = false) {
-    val warning = MaterialTheme.colorScheme.tertiary
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = ProductShape,
-        color = warning.copy(alpha = 0.10f),
-        border = BorderStroke(1.dp, warning.copy(alpha = 0.55f)),
-    ) {
-        Row(
-            modifier = Modifier.padding(14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Icon(Icons.Filled.Lock, contentDescription = stringResource(R.string.pairing_pending_accessibility), tint = warning)
-            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text(stringResource(R.string.status_device_approval_pending), style = MaterialTheme.typography.titleSmall)
-                Text(
-                    stringResource(if (selfEnrollment) R.string.status_self_enrollment_pending_copy else R.string.status_pending_copy),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            OutlinedButton(onClick = onCompletePairing, modifier = Modifier.heightIn(min = 48.dp)) {
-                Icon(Icons.AutoMirrored.Filled.Login, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(6.dp))
-                Text(stringResource(R.string.action_complete_pairing))
-            }
-        }
-    }
-}
-
-@Composable
-private fun PairingChallengeCard(challenge: PairingChallengeState) {
-    val positive = MaterialTheme.colorScheme.secondary
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = ProductShape,
-        color = positive.copy(alpha = 0.08f),
-        border = BorderStroke(1.dp, positive.copy(alpha = 0.55f)),
-    ) {
-        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Icon(Icons.Filled.Shield, contentDescription = stringResource(R.string.pairing_challenge_accessibility), tint = positive)
-                Text(stringResource(R.string.status_pairing_challenge), style = MaterialTheme.typography.titleSmall)
-            }
-            Text(
-                stringResource(R.string.status_pairing_ready, challenge.targetName ?: stringResource(R.string.unknown_target)),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(stringResource(R.string.status_pairing_code, challenge.code.chunked(4).joinToString("-")), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.titleMedium)
-            Text(
-                stringResource(R.string.status_pairing_expiry, challenge.expiresAt ?: stringResource(R.string.time_soon)),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.tertiary,
-            )
-        }
-    }
-}
-
-@Composable
-private fun PairingCompletionDialog(
-    onDismiss: () -> Unit,
-    onConfirm: (challengeId: String, code: String, nonce: String) -> Unit,
-) {
-    var challengeId by rememberSaveable { mutableStateOf("") }
-    var code by rememberSaveable { mutableStateOf("") }
-    var nonce by rememberSaveable { mutableStateOf("") }
-    var showAdvanced by rememberSaveable { mutableStateOf(false) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        icon = { Icon(Icons.Filled.Shield, contentDescription = null) },
-        title = { Text(stringResource(R.string.pairing_dialog_title)) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(
-                    stringResource(R.string.pairing_dialog_copy),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                OutlinedTextField(
-                    value = code,
-                    onValueChange = { code = it },
-                    label = { Text(stringResource(R.string.pairing_code_label)) },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-                )
-                TextButton(onClick = { showAdvanced = !showAdvanced }, modifier = Modifier.heightIn(min = 48.dp)) {
-                    Text(stringResource(if (showAdvanced) R.string.pairing_advanced_hide else R.string.pairing_advanced_show))
-                }
-                if (showAdvanced) {
-                    OutlinedTextField(
-                        value = challengeId,
-                        onValueChange = { challengeId = it },
-                        label = { Text(stringResource(R.string.pairing_id_label)) },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                    )
-                    OutlinedTextField(
-                        value = nonce,
-                        onValueChange = { nonce = it },
-                        label = { Text(stringResource(R.string.pairing_proof_label)) },
-                        minLines = 2,
-                        maxLines = 3,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = { onConfirm(challengeId, code, nonce) },
-                enabled = challengeId.isNotBlank() && code.isNotBlank() && nonce.isNotBlank() && showAdvanced,
-                modifier = Modifier.heightIn(min = 48.dp),
-            ) { Text(stringResource(R.string.action_complete)) }
-        },
-        dismissButton = { TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text(stringResource(R.string.action_cancel)) } },
-    )
-}
-
-@Composable
 private fun DeviceRow(
     device: DeviceSummary,
-    canApprove: Boolean,
-    onApprove: (java.util.UUID) -> Unit,
-    onRevoke: (java.util.UUID) -> Unit,
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -1346,66 +1057,9 @@ private fun DeviceRow(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-                TrustPill(device.trustState)
-            }
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                when (device.trustState) {
-                    DeviceTrustState.PENDING -> {
-                        if (canApprove) {
-                            Button(onClick = { onApprove(device.id) }, contentPadding = ButtonDefaults.ContentPadding, modifier = Modifier.heightIn(min = 48.dp)) {
-                                Icon(Icons.Filled.Check, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(6.dp))
-                                Text(stringResource(R.string.action_approve))
-                            }
-                        } else {
-                            Text(
-                                stringResource(R.string.status_waiting_manager),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.tertiary,
-                            )
-                        }
-                        OutlinedButton(onClick = { onRevoke(device.id) }, modifier = Modifier.heightIn(min = 48.dp)) {
-                            Icon(Icons.Filled.Block, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text(stringResource(R.string.action_reject))
-                        }
-                    }
-                    DeviceTrustState.TRUSTED -> OutlinedButton(onClick = { onRevoke(device.id) }, modifier = Modifier.heightIn(min = 48.dp)) {
-                        Icon(Icons.Filled.Block, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text(stringResource(R.string.action_revoke_trust))
-                    }
-                    DeviceTrustState.REVOKED -> Text(
-                        stringResource(R.string.status_revoked_server),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
             }
         }
     }
-}
-
-@Composable
-private fun TrustPill(state: DeviceTrustState) {
-    val color = when (state) {
-        DeviceTrustState.TRUSTED -> MaterialTheme.colorScheme.secondary
-        DeviceTrustState.PENDING -> MaterialTheme.colorScheme.tertiary
-        DeviceTrustState.REVOKED -> MaterialTheme.colorScheme.error
-    }
-    Text(
-        state.localizedLabel(),
-        modifier = Modifier
-            .border(BorderStroke(1.dp, color.copy(alpha = 0.7f)), RoundedCornerShape(50))
-            .padding(horizontal = 9.dp, vertical = 5.dp),
-        style = MaterialTheme.typography.labelSmall,
-        color = color,
-    )
 }
 
 @Composable
@@ -1449,7 +1103,6 @@ private fun SessionsPage(
     onSessionSelected: (java.util.UUID) -> Unit,
     onOpenSession: (java.util.UUID) -> Unit,
     terminalEngine: (java.util.UUID) -> TermuxTerminalEngine?,
-    onConfigure: () -> Unit,
     onRequestControl: (java.util.UUID) -> Unit,
     onReleaseControl: (java.util.UUID) -> Unit,
     onPaste: (java.util.UUID) -> Unit,
@@ -1460,14 +1113,14 @@ private fun SessionsPage(
         subtitle = stringResource(R.string.page_sessions_subtitle),
         icon = Icons.Filled.Terminal,
     )
-    ConnectionBanner(snapshot = snapshot, onConfigure = onConfigure)
+    ConnectionBanner(snapshot = snapshot)
     if (snapshot.sessions.isEmpty()) {
         EmptyState(
             icon = Icons.Filled.Terminal,
             title = if (snapshot.signedIn) stringResource(R.string.empty_no_sessions) else stringResource(R.string.empty_sign_in_sessions),
             detail = stringResource(R.string.server_sessions_empty_copy),
-            actionLabel = if (!snapshot.configured) stringResource(R.string.action_configure_server) else null,
-            onAction = onConfigure,
+            actionLabel = null,
+            onAction = {},
         )
         return
     }
@@ -1819,7 +1472,6 @@ private fun terminalStateLabel(state: RemoteSessionState?): String = when (state
 @Composable
 private fun ActivityPage(
     snapshot: ProductSnapshot,
-    onConfigure: () -> Unit,
     onOpenHistory: () -> Unit,
 ) {
     PageHeader(stringResource(R.string.nav_activity), stringResource(R.string.page_activity_subtitle), Icons.Filled.Timeline)
@@ -1833,14 +1485,14 @@ private fun ActivityPage(
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
-    ConnectionBanner(snapshot = snapshot, onConfigure = onConfigure)
+    ConnectionBanner(snapshot = snapshot)
     if (snapshot.activity.isEmpty()) {
         EmptyState(
             icon = Icons.Filled.Timeline,
             title = if (snapshot.signedIn) stringResource(R.string.empty_no_activity) else stringResource(R.string.empty_sign_in_activity),
             detail = stringResource(R.string.activity_device_local_copy),
-            actionLabel = if (!snapshot.configured) stringResource(R.string.action_configure_server) else null,
-            onAction = onConfigure,
+            actionLabel = null,
+            onAction = {},
         )
     } else {
         snapshot.activity.forEachIndexed { index, event ->
@@ -1882,19 +1534,18 @@ private fun HistoryPage(
     snapshot: ProductSnapshot,
     selectedHistoryId: String?,
     onHistorySelected: (HistoryEntry) -> Unit,
-    onConfigure: () -> Unit,
     onReplay: (HistoryEntry) -> Unit,
     historyEngine: (java.util.UUID) -> TermuxTerminalEngine?,
 ) {
     PageHeader(stringResource(R.string.nav_history), stringResource(R.string.page_history_subtitle), Icons.Filled.History)
-    ConnectionBanner(snapshot = snapshot, onConfigure = onConfigure)
+    ConnectionBanner(snapshot = snapshot)
     if (snapshot.history.isEmpty()) {
         EmptyState(
             icon = Icons.Filled.History,
             title = if (snapshot.signedIn) stringResource(R.string.empty_no_history) else stringResource(R.string.empty_sign_in_history),
             detail = stringResource(R.string.server_history_empty_copy),
-            actionLabel = if (!snapshot.configured) stringResource(R.string.action_configure_server) else null,
-            onAction = onConfigure,
+            actionLabel = null,
+            onAction = {},
         )
         return
     }
@@ -1998,232 +1649,16 @@ private fun HistoryTerminalSurface(entry: HistoryEntry, engine: TermuxTerminalEn
 }
 
 @Composable
-private fun MembershipPage(
-    snapshot: ProductSnapshot,
-    onConfigure: () -> Unit,
-    onPurchase: (String) -> Unit,
-    onRestorePurchases: () -> Unit,
-) {
-    PageHeader(stringResource(R.string.nav_membership), stringResource(R.string.page_membership_subtitle), Icons.Filled.CardMembership)
-    ConnectionBanner(snapshot = snapshot, onConfigure = onConfigure)
-    GooglePlayBillingPanel(
-        snapshot = snapshot,
-        onPurchase = onPurchase,
-        onRestorePurchases = onRestorePurchases,
-    )
-    val entitlement = snapshot.entitlement
-    val plan = snapshot.catalogPlan
-    if (entitlement == null) {
-        EmptyState(
-            icon = Icons.Filled.CardMembership,
-            title = stringResource(R.string.empty_entitlement),
-            detail = stringResource(R.string.membership_unknown_limits),
-            actionLabel = if (!snapshot.configured) stringResource(R.string.action_configure_server) else null,
-            onAction = onConfigure,
-        )
-        return
-    }
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = ProductShape,
-        color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
-    ) {
-        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Icon(Icons.Filled.Shield, contentDescription = stringResource(R.string.status_server_entitlement), tint = MaterialTheme.colorScheme.secondary)
-                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(plan?.displayName ?: entitlement.planKey, style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        plan?.description ?: stringResource(R.string.catalog_plan_metadata_unavailable),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-            Text(
-                stringResource(
-                    R.string.entitlement_version_summary,
-                    entitlement.version,
-                    entitlement.catalogVersion,
-                ),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            QuotaRow(
-                label = stringResource(R.string.quota_remote_pcs),
-                used = snapshot.pcs.size,
-                limit = entitlement.maxRemotePcs,
-            )
-            QuotaRow(
-                label = stringResource(R.string.quota_live_sessions),
-                used = snapshot.sessions.count { it.state == SessionState.RUNNING },
-                limit = entitlement.maxLiveSessions,
-            )
-            Text(
-                entitlement.expiresAt?.let {
-                    stringResource(
-                        R.string.entitlement_effective_until,
-                        formatInstant(entitlement.effectiveAt),
-                        formatInstant(it),
-                    )
-                } ?: stringResource(
-                    R.string.entitlement_effective_from,
-                    formatInstant(entitlement.effectiveAt),
-                ),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
-    val flags = entitlement.featureFlags.entries.sortedBy { it.key }
-    if (flags.isNotEmpty()) {
-        PageHeader(stringResource(R.string.membership_features), stringResource(R.string.membership_features_copy), Icons.Filled.CheckCircle)
-        flags.forEach { (key, enabled) ->
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 7.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Icon(
-                    if (enabled) Icons.Filled.CheckCircle else Icons.Filled.Block,
-                    contentDescription = if (enabled) stringResource(R.string.feature_enabled) else stringResource(R.string.feature_disabled),
-                    tint = if (enabled) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(key, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                Text(if (enabled) stringResource(R.string.feature_enabled) else stringResource(R.string.feature_disabled), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-    }
-}
-
-@Composable
-private fun GooglePlayBillingPanel(
-    snapshot: ProductSnapshot,
-    onPurchase: (String) -> Unit,
-    onRestorePurchases: () -> Unit,
-) {
-    val billing = snapshot.billing
-    val busy = billing.phase in setOf(
-        dev.termlink.billing.BillingPhase.CONNECTING,
-        dev.termlink.billing.BillingPhase.PURCHASING,
-        dev.termlink.billing.BillingPhase.VERIFYING,
-        dev.termlink.billing.BillingPhase.RESTORING,
-    )
-    PageHeader(stringResource(R.string.membership_google_play), stringResource(R.string.membership_google_play_copy), Icons.Filled.ShoppingCart)
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = ProductShape,
-        color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
-    ) {
-        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            if (billing.products.isEmpty()) {
-                Text(
-                    billing.message ?: stringResource(R.string.billing_no_products),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (billing.phase == dev.termlink.billing.BillingPhase.ERROR) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            } else {
-                billing.products.forEachIndexed { index, product ->
-                    if (index > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.Top,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                            Text(product.title, style = MaterialTheme.typography.titleSmall)
-                            Text(product.description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            val priceLabel = listOfNotNull(product.formattedPrice, product.billingPeriod).joinToString("  |  ")
-                            Text(
-                                if (priceLabel.isBlank()) stringResource(R.string.membership_price_unavailable) else priceLabel,
-                                style = MaterialTheme.typography.labelLarge,
-                                color = MaterialTheme.colorScheme.primary,
-                            )
-                        }
-                        Button(
-                            onClick = { onPurchase(product.productId) },
-                            enabled = snapshot.signedIn && snapshot.configured && !busy,
-                            modifier = Modifier.heightIn(min = 48.dp),
-                        ) {
-                            Icon(Icons.Filled.ShoppingCart, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text(stringResource(R.string.action_buy))
-                        }
-                    }
-                }
-            }
-            billing.message?.let { message ->
-                Text(message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.tertiary)
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                OutlinedButton(
-                    onClick = onRestorePurchases,
-                    enabled = snapshot.signedIn && snapshot.configured && !busy,
-                    modifier = Modifier.heightIn(min = 48.dp),
-                ) {
-                    Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(stringResource(R.string.action_restore_purchases))
-                }
-                Text(
-                    billing.phase.localizedLabel(),
-                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 11.dp),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun QuotaRow(label: String, used: Int, limit: Int) {
-    val ratio = if (limit > 0) (used.toFloat() / limit).coerceIn(0f, 1f) else 0f
-    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(label, style = MaterialTheme.typography.bodyMedium)
-            Text(
-                if (limit > 0) "$used / $limit" else "$used / ${stringResource(R.string.quota_unavailable)}",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.primary,
-            )
-        }
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(8.dp)
-                .clip(RoundedCornerShape(4.dp))
-                .background(MaterialTheme.colorScheme.surfaceVariant),
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth(ratio)
-                    .fillMaxHeight()
-                    .background(if (used > limit && limit > 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary),
-            )
-        }
-    }
-}
-
-@Composable
 private fun SettingsPage(
     snapshot: ProductSnapshot,
-    onConfigure: () -> Unit,
     onSignIn: () -> Unit,
     onSignOut: () -> Unit,
-    onOpenMembership: () -> Unit,
-    onOpenTrustedDevices: () -> Unit,
     onOpenAccount: () -> Unit,
     themePreference: ProductThemePreference,
     onThemePreferenceChanged: (ProductThemePreference) -> Unit,
 ) {
     PageHeader(stringResource(R.string.nav_settings), stringResource(R.string.page_settings_subtitle), Icons.Filled.Settings)
-    ConnectionBanner(snapshot = snapshot, onConfigure = onConfigure)
+    ConnectionBanner(snapshot = snapshot)
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = ProductShape,
@@ -2243,7 +1678,7 @@ private fun SettingsPage(
                 },
             )
             SettingRow(
-                icon = Icons.Filled.Shield,
+                icon = Icons.Filled.CheckCircle,
                 title = stringResource(R.string.settings_device_proof),
                 detail = stringResource(R.string.settings_device_proof_copy),
             )
@@ -2256,11 +1691,6 @@ private fun SettingsPage(
                 modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Button(onClick = onConfigure, modifier = Modifier.heightIn(min = 48.dp)) {
-                    Icon(Icons.Filled.Settings, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(stringResource(R.string.action_configure_server))
-                }
                 if (snapshot.signedIn) {
                     OutlinedButton(onClick = onSignOut, modifier = Modifier.heightIn(min = 48.dp)) {
                         Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -2293,23 +1723,11 @@ private fun SettingsPage(
             )
         }
     }
-    PageHeader(stringResource(R.string.settings_access_title), stringResource(R.string.settings_access_copy), Icons.Filled.Shield)
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        OutlinedButton(onClick = onOpenTrustedDevices, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-            Icon(Icons.Filled.PhoneAndroid, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(8.dp))
-            Text(stringResource(R.string.nav_trusted_devices))
-        }
-        OutlinedButton(onClick = onOpenMembership, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-            Icon(Icons.Filled.CardMembership, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(8.dp))
-            Text(stringResource(R.string.nav_membership))
-        }
-        OutlinedButton(onClick = onOpenAccount, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-            Icon(Icons.Filled.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(8.dp))
-            Text(stringResource(R.string.nav_account))
-        }
+    PageHeader(stringResource(R.string.settings_account_title), stringResource(R.string.settings_account_copy), Icons.Filled.AccountCircle)
+    OutlinedButton(onClick = onOpenAccount, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+        Icon(Icons.Filled.AccountCircle, contentDescription = null, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(8.dp))
+        Text(stringResource(R.string.nav_account))
     }
     PageHeader(stringResource(R.string.settings_about), stringResource(R.string.settings_about_copy), Icons.Filled.Info)
     Text(stringResource(R.string.settings_product_shell), style = MaterialTheme.typography.bodyMedium)
@@ -2324,44 +1742,12 @@ private fun ProductThemePreference.displayLabel(): String = when (this) {
 }
 
 @Composable
-private fun TrustedDevicesPage(
-    snapshot: ProductSnapshot,
-    onApprove: (java.util.UUID) -> Unit,
-    onRevoke: (java.util.UUID) -> Unit,
-    onCompletePairing: () -> Unit,
-    onConfigure: () -> Unit,
-) {
-    PageHeader(stringResource(R.string.nav_trusted_devices), stringResource(R.string.page_trusted_devices_subtitle), Icons.Filled.Shield)
-    ConnectionBanner(snapshot = snapshot, onConfigure = onConfigure)
-    snapshot.pairingChallenge?.let { PairingChallengeCard(it) }
-    val canApprove = snapshot.canApprovePendingDevice()
-    if (snapshot.devices.isEmpty()) {
-        val canCompletePairing = snapshot.enrollmentState == ProductEnrollmentState.PENDING_CONFIRMATION
-        EmptyState(
-            icon = Icons.Filled.Shield,
-            title = stringResource(R.string.empty_no_trusted_devices),
-            detail = stringResource(R.string.empty_no_trusted_devices_copy),
-            actionLabel = if (canCompletePairing) stringResource(R.string.action_complete_pairing) else null,
-            onAction = onCompletePairing,
-        )
-    } else {
-        snapshot.devices.forEach { device ->
-            DeviceRow(device = device, canApprove = canApprove, onApprove = onApprove, onRevoke = onRevoke)
-        }
-    }
-    if (snapshot.enrollmentState == ProductEnrollmentState.PENDING_CONFIRMATION) {
-        PairingPendingCard(onCompletePairing = onCompletePairing, selfEnrollment = true)
-    }
-}
-
-@Composable
 private fun AccountPage(
     snapshot: ProductSnapshot,
     onSignOut: () -> Unit,
-    onConfigure: () -> Unit,
 ) {
     PageHeader(stringResource(R.string.nav_account), stringResource(R.string.page_account_subtitle), Icons.Filled.CheckCircle)
-    ConnectionBanner(snapshot = snapshot, onConfigure = onConfigure)
+    ConnectionBanner(snapshot = snapshot)
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = ProductShape,
@@ -2370,7 +1756,7 @@ private fun AccountPage(
     ) {
         Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SettingRow(Icons.Filled.CheckCircle, stringResource(R.string.account_identity), snapshot.accountLabel ?: stringResource(R.string.account_no_identity))
-            SettingRow(Icons.Filled.Wifi, stringResource(R.string.account_endpoint), snapshot.serverUrl ?: stringResource(R.string.account_not_configured))
+            SettingRow(Icons.Filled.Wifi, stringResource(R.string.account_endpoint), PRODUCT_PUBLIC_SERVER_URL)
             SettingRow(Icons.Filled.Info, stringResource(R.string.account_last_sync), snapshot.lastSyncedAt?.let(::formatInstant) ?: stringResource(R.string.account_not_synced))
             Text(
                 stringResource(R.string.account_access_copy),
@@ -2400,7 +1786,7 @@ private fun SettingRow(icon: ImageVector, title: String, detail: String) {
 }
 
 @Composable
-private fun ConnectionBanner(snapshot: ProductSnapshot, onConfigure: () -> Unit) {
+private fun ConnectionBanner(snapshot: ProductSnapshot) {
     val configured = snapshot.configured
     val connected = snapshot.isConnected()
     val color = when {
@@ -2449,7 +1835,6 @@ private fun ConnectionBanner(snapshot: ProductSnapshot, onConfigure: () -> Unit)
                     color = MaterialTheme.colorScheme.onSurface,
                 )
             }
-            TextButton(onClick = onConfigure, modifier = Modifier.heightIn(min = 48.dp)) { Text(stringResource(R.string.nav_settings)) }
         }
     }
 }

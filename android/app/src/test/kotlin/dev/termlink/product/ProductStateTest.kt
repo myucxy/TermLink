@@ -35,6 +35,15 @@ class ProductStateTest {
     }
 
     @Test
+    fun removedProductSurfacesAreNotVisibleButRemainRepresentable() {
+        assertTrue(ProductDestination.DEVICES.isVisibleInProductShell)
+        assertTrue(ProductDestination.ACCOUNT.isVisibleInProductShell)
+        assertFalse(ProductDestination.MEMBERSHIP.isVisibleInProductShell)
+        assertFalse(ProductDestination.TRUSTED_DEVICES.isVisibleInProductShell)
+        assertEquals("https://termlink.kget.cc:8910", PRODUCT_PUBLIC_SERVER_URL)
+    }
+
+    @Test
     fun themePreferenceDefaultsToSystemForUnknownStoredValue() {
         assertEquals(ProductThemePreference.SYSTEM, ProductThemePreference.fromWireValue(null))
         assertEquals(ProductThemePreference.SYSTEM, ProductThemePreference.fromWireValue("unexpected"))

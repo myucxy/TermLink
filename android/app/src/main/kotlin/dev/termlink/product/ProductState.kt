@@ -28,6 +28,25 @@ enum class ProductDestination(val label: String) {
     SETTINGS("Settings"),
 }
 
+/**
+ * The production app is pinned to the public service.  Keep this UI-facing
+ * value alongside the state contract so screens cannot accidentally expose a
+ * mutable endpoint field.  [ProductionProductRepository] uses the same
+ * default URL for its persisted session store.
+ */
+const val PRODUCT_PUBLIC_SERVER_URL = "https://termlink.kget.cc:8910"
+
+/** First-release account policy: same-account Android devices get full access. */
+const val PRODUCT_DEFAULT_ANDROID_PERMISSION = "MANAGE"
+
+/**
+ * Routes retained in the product shell.  Membership and trust/pairing state
+ * remain in [ProductSnapshot] for transport compatibility, but are not part
+ * of the current Android user interface.
+ */
+val ProductDestination.isVisibleInProductShell: Boolean
+    get() = this != ProductDestination.MEMBERSHIP && this != ProductDestination.TRUSTED_DEVICES
+
 /** The only destinations shown in the phone's primary navigation bar. */
 enum class ProductPrimaryDestination(val label: String) {
     DEVICES("Devices"),
@@ -203,6 +222,14 @@ interface ProductRepository : Closeable {
     suspend fun signIn(username: String, password: CharArray): Unit = signIn()
     /** Legacy no-argument entry point retained for settings/fakes; it never opens a browser. */
     suspend fun signIn(): Unit = error("Enter a username and password to sign in")
+    /** Creates an account through the server's direct registration boundary. */
+    suspend fun register(username: String, email: String, password: CharArray, confirm: CharArray): Unit =
+        error("Direct account registration is unavailable")
+    /**
+     * Direct registration is intentionally not part of this contract yet:
+     * the current service exposes registration only through its browser/PKCE
+     * flow.  The product shell displays a TODO instead of launching that flow.
+     */
     suspend fun beginBrowserRegistration()
     suspend fun beginBrowserAccountSetup()
     suspend fun confirmEnrollment()
@@ -237,6 +264,7 @@ class UnavailableProductRepository : ProductRepository {
 
     override suspend fun refresh() = unavailable()
     override suspend fun signIn(username: String, password: CharArray) = unavailable()
+    override suspend fun register(username: String, email: String, password: CharArray, confirm: CharArray) = unavailable()
     override suspend fun beginBrowserRegistration() = unavailable()
     override suspend fun beginBrowserAccountSetup() = unavailable()
     override suspend fun confirmEnrollment() = unavailable()

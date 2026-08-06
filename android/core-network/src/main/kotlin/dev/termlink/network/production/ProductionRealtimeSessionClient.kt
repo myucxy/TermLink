@@ -5,6 +5,7 @@ import dev.termlink.crypto.CryptoDirection
 import dev.termlink.crypto.DeviceIdentity
 import dev.termlink.crypto.SessionCrypto
 import dev.termlink.protocol.realtime.v1.Envelope
+import dev.termlink.protocol.realtime.v1.FlowControlPayload
 import dev.termlink.protocol.realtime.v1.GapPayload
 import dev.termlink.protocol.realtime.v1.InputEventPayload
 import dev.termlink.protocol.realtime.v1.InputResultPayload
@@ -180,7 +181,14 @@ class ProductionRealtimeSessionClient(
     )
     private val incomingJob: Job
     private val transportStateJob: Job
+    private val receivePressureJob: Job
     private lateinit var session: RemoteTerminalSession
+    private val subscriberReady = AtomicBoolean(false)
+    private val semanticFlowHold = AtomicBoolean(false)
+    private val flowControlEpoch = AtomicLong(0)
+    private val flowControlMutex = Mutex()
+    private var lastFlowControlGeneration = Int.MIN_VALUE
+    private var lastFlowControlPaused: Boolean? = null
 
     init {
         require(reconnectDelaysMillis.isNotEmpty() && reconnectDelaysMillis.all { it in 0..30_000 }) {
@@ -201,9 +209,9 @@ class ProductionRealtimeSessionClient(
         )
         this.session = session
         incomingJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
-            transport.incoming.collect { envelope ->
+            transport.receivedEnvelopes.collect { received ->
                 try {
-                    incomingProcessingMutex.withLock { handleIncoming(envelope) }
+                    incomingProcessingMutex.withLock { handleIncoming(received.envelope) }
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Exception) {
@@ -227,11 +235,26 @@ class ProductionRealtimeSessionClient(
                         }
                     }
                     failTransport(error.message ?: "invalid production Envelope")
+                } finally {
+                    received.close()
                 }
             }
         }
         transportStateJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
             transport.state.collect(::handleTransportState)
+        }
+        receivePressureJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            transport.receivePressure.collect {
+                if (subscriberReady.get() && mutableTransportState.value is ProductionTransportState.Connected) {
+                    try {
+                        sendFlowControl(force = false)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        failTransport(error.message ?: "flow control update failed")
+                    }
+                }
+            }
         }
     }
 
@@ -328,6 +351,9 @@ class ProductionRealtimeSessionClient(
                     publish = { recovered ->
                         sendAcknowledgement(recovered)
                         resume(recovered)
+                        subscriberReady.set(true)
+                        semanticFlowHold.set(false)
+                        sendFlowControl(force = true)
                     },
                 )
             }
@@ -431,6 +457,7 @@ class ProductionRealtimeSessionClient(
                 }
                 if (mutableTransportState.value is ProductionTransportState.Connected) {
                     resume(session.state.value.lastAckedSequence)
+                    sendFlowControl(force = true)
                 }
             }
             return true
@@ -552,6 +579,7 @@ class ProductionRealtimeSessionClient(
         api.close()
         incomingJob.cancel()
         transportStateJob.cancel()
+        receivePressureJob.cancel()
         scope.cancel()
         synchronized(materialLock) {
             currentMaterial.destroy()
@@ -579,10 +607,60 @@ class ProductionRealtimeSessionClient(
         mutableTransportState.value = ProductionTransportState.Closed
     }
 
+    private suspend fun sendFlowControl(force: Boolean) {
+        flowControlMutex.withLock {
+            if (!subscriberReady.get() ||
+                mutableTransportState.value !is ProductionTransportState.Connected
+            ) return
+            val pressure = transport.receivePressure.value
+            val paused = semanticFlowHold.get() || pressure.paused
+            if (!force &&
+                lastFlowControlGeneration == pressure.generation &&
+                lastFlowControlPaused == paused
+            ) return
+            val acknowledgement = session.state.value.lastAckedSequence
+            val epoch = flowControlEpoch.incrementAndGet()
+            require(epoch > 0) { "flow control epoch exhausted" }
+            val payload = FlowControlPayload.newBuilder()
+                .setHighestContiguousSeq(acknowledgement)
+                .setMaxUnackedEvents(if (paused) 0 else ProductionRealtimeClient.OPEN_WINDOW_EVENTS)
+                .setMaxUnackedWireBytes(if (paused) 0L else ProductionRealtimeClient.OPEN_WINDOW_WIRE_BYTES)
+                .setPaused(paused)
+                .setReasonCode(
+                    when {
+                        semanticFlowHold.get() -> "ANDROID_HISTORY_RECOVERY"
+                        paused -> "ANDROID_RENDER_QUEUE_HIGH_WATER"
+                        else -> "ANDROID_RENDER_QUEUE_AVAILABLE"
+                    },
+                )
+                .setControlEpoch(epoch)
+                .build()
+                .toByteArray()
+            sendEncrypted(MessageType.FLOW_CONTROL, payload, acknowledgement)
+            lastFlowControlGeneration = pressure.generation
+            lastFlowControlPaused = paused
+        }
+    }
+
+    private fun setSemanticFlowHold(held: Boolean) {
+        if (semanticFlowHold.getAndSet(held) == held) return
+        if (subscriberReady.get() && mutableTransportState.value is ProductionTransportState.Connected) {
+            scope.launch {
+                try {
+                    sendFlowControl(force = true)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    failTransport(error.message ?: "semantic flow control update failed")
+                }
+            }
+        }
+    }
+
     private suspend fun sendEncrypted(
         messageType: MessageType,
         plaintext: ByteArray,
-        acknowledgement: Long = session.state.value.lastAckedSequence,
+        acknowledgement: Long = 0,
     ) {
         try {
             sendMutex.withLock {
@@ -815,6 +893,10 @@ class ProductionRealtimeSessionClient(
 
     private fun validateEnvelope(envelope: Envelope) {
         require(envelope.protocolVersion == 1) { "unsupported Envelope protocol version" }
+        require(envelope.direction == dev.termlink.protocol.realtime.v1.Direction.PC_TO_ANDROID) {
+            "Envelope direction mismatch"
+        }
+        require(envelope.ack == 0L) { "PC-to-Android application messages must use ack=0" }
         require(envelope.sessionId.toByteArray().contentEquals(ProductionRealtimeClient.uuidBytes(config.sessionId))) {
             "Envelope session mismatch"
         }
@@ -842,7 +924,10 @@ class ProductionRealtimeSessionClient(
     private suspend fun handleTransportState(state: RealtimeState) {
         if (closed.get()) return
         when (state) {
-            RealtimeState.Connecting -> mutableTransportState.value = ProductionTransportState.Connecting
+            RealtimeState.Connecting -> {
+                subscriberReady.set(false)
+                mutableTransportState.value = ProductionTransportState.Connecting
+            }
             RealtimeState.Connected -> {
                 reconnectJob?.cancel()
                 reconnectJob = null
@@ -851,12 +936,15 @@ class ProductionRealtimeSessionClient(
                 if (!session.onConnected()) {
                     failTransport("initial session subscribe failed")
                 } else if (session.state.value !is RemoteSessionState.HistoryGap) {
+                    subscriberReady.set(true)
+                    sendFlowControl(force = true)
                     startSubscriberRefresh()
                 }
             }
             is RealtimeState.Failed -> {
                 subscriberRefreshJob?.cancel()
                 subscriberRefreshJob = null
+                subscriberReady.set(false)
                 failPendingInputs(state.reason)
                 session.onDisconnected(state.reason)
                 scheduleReconnect(state.reason)
@@ -865,6 +953,7 @@ class ProductionRealtimeSessionClient(
             RealtimeState.Closed -> {
                 subscriberRefreshJob?.cancel()
                 subscriberRefreshJob = null
+                subscriberReady.set(false)
                 failPendingInputs("production transport closed")
                 mutableTransportState.value = ProductionTransportState.Closed
             }
@@ -884,6 +973,7 @@ class ProductionRealtimeSessionClient(
                 ) break
                 try {
                     resume(session.state.value.lastAckedSequence)
+                    sendFlowControl(force = true)
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Exception) {
@@ -940,6 +1030,7 @@ class ProductionRealtimeSessionClient(
         if (acceptance is EventAcceptance.HistoryGap) {
             subscriberRefreshJob?.cancel()
             subscriberRefreshJob = null
+            setSemanticFlowHold(true)
         }
         return acceptance is EventAcceptance.Applied || acceptance is EventAcceptance.Duplicate
     }

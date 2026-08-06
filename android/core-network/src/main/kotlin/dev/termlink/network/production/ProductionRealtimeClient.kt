@@ -14,11 +14,19 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -41,6 +49,26 @@ sealed interface RealtimeState {
     data object Closed : RealtimeState
 }
 
+data class ProductionReceivePressure(
+    val generation: Int,
+    val paused: Boolean,
+    val bufferedEvents: Int,
+    val bufferedWireBytes: Long,
+)
+
+class ProductionReceivedEnvelope internal constructor(
+    val envelope: Envelope,
+    val wireBytes: Int,
+    val generation: Int,
+    private val releaseReservation: (Int) -> Unit,
+) : AutoCloseable {
+    private val released = AtomicBoolean(false)
+
+    override fun close() {
+        if (released.compareAndSet(false, true)) releaseReservation(wireBytes)
+    }
+}
+
 /**
  * The production WebSocket transport. It only handles authenticated socket
  * framing and opaque protobuf Envelopes; session keys and payload semantics
@@ -59,9 +87,15 @@ class ProductionRealtimeClient(
     private val closed = AtomicBoolean(false)
     private val generation = AtomicInteger(0)
     private val lastIncomingSequences = ConcurrentHashMap<IncomingCursor, java.util.concurrent.atomic.AtomicLong>()
-    private val mutableIncoming = MutableSharedFlow<Envelope>(
-        extraBufferCapacity = 128,
-        onBufferOverflow = BufferOverflow.SUSPEND,
+    private val bufferedIncomingEvents = AtomicInteger(0)
+    private val bufferedIncomingWireBytes = AtomicLong(0)
+    private val receivePressurePaused = AtomicBoolean(false)
+    private val incomingChannel = Channel<ProductionReceivedEnvelope>(
+        capacity = MAX_BUFFERED_EVENTS,
+        onUndeliveredElement = { it.close() },
+    )
+    private val mutableReceivePressure = MutableStateFlow(
+        ProductionReceivePressure(0, false, 0, 0),
     )
     private val mutableState = MutableSharedFlow<RealtimeState>(
         replay = 1,
@@ -72,7 +106,15 @@ class ProductionRealtimeClient(
     @Volatile private var socket: WebSocket? = null
     @Volatile private var connectedGeneration: Int = 0
 
-    val incoming: SharedFlow<Envelope> = mutableIncoming.asSharedFlow()
+    private val incomingReceived: Flow<ProductionReceivedEnvelope> = incomingChannel.receiveAsFlow()
+    // Compatibility view for transport-level callers that only need the
+    // immutable Envelope. The session bridge uses receivedEnvelopes so the
+    // byte reservation remains held until decrypt/parse/render completes.
+    val incoming: Flow<Envelope> = incomingReceived.map { received ->
+        try { received.envelope } finally { received.close() }
+    }
+    internal val receivedEnvelopes: Flow<ProductionReceivedEnvelope> = incomingReceived
+    val receivePressure: StateFlow<ProductionReceivePressure> = mutableReceivePressure.asStateFlow()
     val state: SharedFlow<RealtimeState> = mutableState.asSharedFlow()
 
     init {
@@ -156,6 +198,7 @@ class ProductionRealtimeClient(
         }
         mutableState.tryEmit(RealtimeState.Closed)
         lastIncomingSequences.clear()
+        incomingChannel.cancel()
     }
 
     private inner class Listener(private val listenerGeneration: Int) : WebSocketListener() {
@@ -171,6 +214,7 @@ class ProductionRealtimeClient(
                     listOf(
                         "cumulative_ack",
                         "e2ee_x25519_chacha20poly1305",
+                        "flow_control_v1",
                         "lease_v1",
                         "bounded_event_replay_v1",
                     ).forEach { add(kotlinx.serialization.json.JsonPrimitive(it)) }
@@ -228,7 +272,19 @@ class ProductionRealtimeClient(
                 webSocket.close(1008, "Envelope metadata rejected")
                 return
             }
-            if (!mutableIncoming.tryEmit(envelope)) {
+            if (!reserveIncoming(raw.size, listenerGeneration)) {
+                acceptingBinary = false
+                webSocket.close(1013, "bounded receive byte budget exceeded")
+                return
+            }
+            val received = ProductionReceivedEnvelope(
+                envelope = envelope,
+                wireBytes = raw.size,
+                generation = listenerGeneration,
+                releaseReservation = ::releaseIncoming,
+            )
+            if (incomingChannel.trySend(received).isFailure) {
+                received.close()
                 // close() is asynchronous. Without this generation-local gate,
                 // later callbacks can enter the queue after the first rejected
                 // frame as the collector frees capacity, manufacturing a hole
@@ -257,6 +313,42 @@ class ProductionRealtimeClient(
 
         private fun isCurrent(webSocket: WebSocket): Boolean =
             !closed.get() && generation.get() == listenerGeneration && socket === webSocket
+    }
+
+    private fun reserveIncoming(wireBytes: Int, pressureGeneration: Int): Boolean {
+        if (wireBytes <= 0 || wireBytes > MAX_FRAME_BYTES) return false
+        val events = bufferedIncomingEvents.incrementAndGet()
+        val bytes = bufferedIncomingWireBytes.addAndGet(wireBytes.toLong())
+        if (events > MAX_BUFFERED_EVENTS || bytes > HARD_BUFFERED_WIRE_BYTES) {
+            bufferedIncomingEvents.decrementAndGet()
+            bufferedIncomingWireBytes.addAndGet(-wireBytes.toLong())
+            return false
+        }
+        if (bytes >= HIGH_BUFFERED_WIRE_BYTES && receivePressurePaused.compareAndSet(false, true)) {
+            publishReceivePressure(pressureGeneration)
+        }
+        return true
+    }
+
+    private fun releaseIncoming(wireBytes: Int) {
+        val events = bufferedIncomingEvents.updateAndGet { (it - 1).coerceAtLeast(0) }
+        val bytes = bufferedIncomingWireBytes.updateAndGet { (it - wireBytes).coerceAtLeast(0) }
+        if (bytes <= LOW_BUFFERED_WIRE_BYTES && receivePressurePaused.compareAndSet(true, false)) {
+            publishReceivePressure(generation.get(), events, bytes)
+        }
+    }
+
+    private fun publishReceivePressure(
+        pressureGeneration: Int,
+        events: Int = bufferedIncomingEvents.get(),
+        bytes: Long = bufferedIncomingWireBytes.get(),
+    ) {
+        mutableReceivePressure.value = ProductionReceivePressure(
+            generation = pressureGeneration,
+            paused = receivePressurePaused.get(),
+            bufferedEvents = events,
+            bufferedWireBytes = bytes,
+        )
     }
 
     private fun validateIncoming(envelope: Envelope): Boolean {
@@ -290,6 +382,12 @@ class ProductionRealtimeClient(
 
     companion object {
         const val MAX_FRAME_BYTES: Int = 1 shl 20
+        const val MAX_BUFFERED_EVENTS: Int = 128
+        const val OPEN_WINDOW_EVENTS: Int = 128
+        const val OPEN_WINDOW_WIRE_BYTES: Long = 3L shl 20
+        const val LOW_BUFFERED_WIRE_BYTES: Long = 1L shl 20
+        const val HIGH_BUFFERED_WIRE_BYTES: Long = 4L shl 20
+        const val HARD_BUFFERED_WIRE_BYTES: Long = 8L shl 20
         private const val MAX_HELLO_BYTES: Int = 16 shl 10
 
         internal val defaultHttpClient: OkHttpClient = OkHttpClient.Builder()
