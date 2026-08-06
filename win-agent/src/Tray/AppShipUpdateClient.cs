@@ -28,6 +28,7 @@ namespace TermLink.Tray
     internal static class AppShipUpdateClient
     {
         internal const string ApplicationSlug = "termlink-win64";
+        private const string PublicBaseUrl = "https://appship.kget.cc:8910";
         private static readonly HttpClient Client = new HttpClient
         {
             Timeout = TimeSpan.FromSeconds(15)
@@ -39,6 +40,10 @@ namespace TermLink.Tray
             if (string.IsNullOrWhiteSpace(configured))
             {
                 configured = Environment.GetEnvironmentVariable("APPSHIP_BASE_URL");
+            }
+            if (string.IsNullOrWhiteSpace(configured))
+            {
+                configured = PublicBaseUrl;
             }
             return (configured ?? string.Empty)
                 .Trim()

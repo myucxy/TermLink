@@ -11,7 +11,7 @@ android {
     val appShipBaseUrl = providers.gradleProperty("termlinkAppShipBaseUrl")
         .orElse(providers.environmentVariable("TERMLINK_APPSHIP_BASE_URL"))
         .orElse(providers.environmentVariable("APPSHIP_BASE_URL"))
-        .orElse("")
+        .orElse("https://appship.kget.cc:8910")
         .get()
         .replace("\\", "\\\\")
         .replace("\"", "\\\"")
@@ -32,8 +32,8 @@ android {
         applicationId = "dev.termlink.harness"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.1.2"
+        versionCode = 3
+        versionName = "0.1.3"
         manifestPlaceholders["appAuthRedirectScheme"] = "dev.termlink"
     }
 
