@@ -43,6 +43,93 @@ func TestPeerEnqueueAllowsBriefReplayBackpressure(t *testing.T) {
 	}
 }
 
+func TestPeerQueueByteBudgetIsHardBound(t *testing.T) {
+	p := &peer{}
+	if !p.reserveQueueBytes(peerQueueBytes - 1) {
+		t.Fatal("initial queue reservation was rejected")
+	}
+	if p.reserveQueueBytes(2) {
+		t.Fatal("queue accepted bytes beyond the hard budget")
+	}
+	p.releaseQueueBytes(peerQueueBytes - 1)
+	if got := p.queuedBytes.Load(); got != 0 {
+		t.Fatalf("queued bytes = %d, want 0", got)
+	}
+	if p.reserveQueueBytes(peerQueueBytes + 1) {
+		t.Fatal("single reservation larger than the hard budget was accepted")
+	}
+}
+
+func TestRealtimeMessageDirectionACLIsExhaustive(t *testing.T) {
+	all := []realtimewire.MessageType{
+		realtimewire.Heartbeat, realtimewire.Goodbye,
+		realtimewire.SessionUpsert, realtimewire.SessionRemoved,
+		realtimewire.Subscribe, realtimewire.Unsubscribe,
+		realtimewire.OutputChunk, realtimewire.OutputACK,
+		realtimewire.FlowControl, realtimewire.Gap,
+		realtimewire.InputEvent, realtimewire.InputAccepted,
+		realtimewire.InputRejected, realtimewire.ResizeRequest,
+		realtimewire.ResizeApplied, realtimewire.SnapshotOffer,
+		realtimewire.SnapshotChunk, realtimewire.ResumeRequest,
+		realtimewire.LeaseRequest, realtimewire.LeaseGranted,
+		realtimewire.LeaseDenied, realtimewire.LeaseRevoked,
+		realtimewire.ThemeChanged, realtimewire.SessionStarted,
+		realtimewire.SessionInterrupted, realtimewire.SessionEnded,
+	}
+	android := map[realtimewire.MessageType]bool{
+		realtimewire.Heartbeat: true, realtimewire.Goodbye: true,
+		realtimewire.Subscribe: true, realtimewire.Unsubscribe: true,
+		realtimewire.OutputACK: true, realtimewire.FlowControl: true,
+		realtimewire.InputEvent: true, realtimewire.ResizeRequest: true,
+		realtimewire.ResumeRequest: true, realtimewire.LeaseRequest: true,
+	}
+	pc := map[realtimewire.MessageType]bool{
+		realtimewire.Heartbeat: true, realtimewire.Goodbye: true,
+		realtimewire.SessionUpsert: true, realtimewire.SessionRemoved: true,
+		realtimewire.OutputChunk: true, realtimewire.Gap: true,
+		realtimewire.InputAccepted: true, realtimewire.InputRejected: true,
+		realtimewire.ResizeApplied: true, realtimewire.SnapshotOffer: true,
+		realtimewire.SnapshotChunk: true, realtimewire.LeaseGranted: true,
+		realtimewire.LeaseDenied: true, realtimewire.LeaseRevoked: true,
+		realtimewire.ThemeChanged: true, realtimewire.SessionStarted: true,
+		realtimewire.SessionInterrupted: true, realtimewire.SessionEnded: true,
+	}
+	for _, messageType := range all {
+		if got := allowedMessage("android", messageType); got != android[messageType] {
+			t.Errorf("android message %d allowed = %v, want %v", messageType, got, android[messageType])
+		}
+		if got := allowedMessage("pc", messageType); got != pc[messageType] {
+			t.Errorf("pc message %d allowed = %v, want %v", messageType, got, pc[messageType])
+		}
+	}
+	if allowedMessage("android", realtimewire.MessageUnspecified) ||
+		allowedMessage("pc", realtimewire.MessageUnspecified) ||
+		allowedMessage("unknown", realtimewire.OutputChunk) {
+		t.Fatal("unspecified role/message was accepted")
+	}
+}
+
+func TestEnvelopeACKMetadataContract(t *testing.T) {
+	for _, messageType := range []realtimewire.MessageType{
+		realtimewire.Subscribe, realtimewire.OutputACK, realtimewire.FlowControl,
+	} {
+		if !validEnvelopeACK(realtimewire.Envelope{MessageType: messageType, ACK: 42}) {
+			t.Fatalf("message %d rejected its cumulative ACK", messageType)
+		}
+	}
+	for _, messageType := range []realtimewire.MessageType{
+		realtimewire.OutputChunk, realtimewire.InputEvent, realtimewire.ResizeRequest,
+		realtimewire.LeaseRequest, realtimewire.SessionEnded,
+	} {
+		if validEnvelopeACK(realtimewire.Envelope{MessageType: messageType, ACK: 42}) {
+			t.Fatalf("message %d accepted a forbidden ACK", messageType)
+		}
+		if !validEnvelopeACK(realtimewire.Envelope{MessageType: messageType}) {
+			t.Fatalf("message %d rejected ack=0", messageType)
+		}
+	}
+}
+
 func TestReplacedPeerCannotRemoveReplacementSubscription(t *testing.T) {
 	observer := &subscriptionObserver{}
 	hub := NewHubWithObserver(nil, nil, nil, observer)
@@ -85,6 +172,26 @@ func TestPCPeerAcceptsRetransmittedOutputSequence(t *testing.T) {
 	}
 	if got := peer.lastSequences[sessionID]; got != 42 {
 		t.Fatalf("PC high-water sequence = %d, want 42", got)
+	}
+}
+
+func TestPCPeerRejectsSameSequenceCiphertextReplacement(t *testing.T) {
+	peer := testPeer(NewHubWithObserver(nil, nil, nil, nil), uuid.New())
+	peer.role = "pc"
+	sessionID := uuid.New()
+	recipientID := uuid.New()
+	first := []byte("opaque-frame-a")
+	if !peer.acceptPCSequence(sessionID, recipientID, 42, first) {
+		t.Fatal("initial PC frame was rejected")
+	}
+	if !peer.acceptPCSequence(sessionID, recipientID, 42, first) {
+		t.Fatal("identical PC replay was rejected")
+	}
+	if peer.acceptPCSequence(sessionID, recipientID, 42, []byte("opaque-frame-b")) {
+		t.Fatal("same-sequence ciphertext replacement was accepted")
+	}
+	if !peer.acceptPCSequence(sessionID, uuid.New(), 42, []byte("opaque-frame-b")) {
+		t.Fatal("same logical sequence for an independent recipient was rejected")
 	}
 }
 

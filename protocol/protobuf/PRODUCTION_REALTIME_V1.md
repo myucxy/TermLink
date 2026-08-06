@@ -45,8 +45,12 @@ deterministic protobuf encoding of every Envelope field except field 11
 The two directions use distinct HKDF output keys. `(key_id, direction, seq)`
 must never repeat.
 
-The Relay validates routing fields, authorization, direction, monotonically
-increasing sequence numbers, and size. It never decrypts field 11.
+The Relay validates routing fields, authorization, direction, sequence rules,
+and size. It never decrypts field 11. `Envelope.ack` is a routing-visible
+copy of the cumulative output cursor and is non-zero only for `SUBSCRIBE`,
+`OUTPUT_ACK`, and `FLOW_CONTROL`. For those messages the decrypted payload
+cursor MUST equal `Envelope.ack`; every other application message MUST carry
+`ack = 0`.
 
 Pairwise device-channel messages set `recipient_device_id` and are delivered
 only to that approved device. Empty-recipient messages are limited to message
@@ -55,10 +59,30 @@ output in V1 is recipient-specific; Relay never maps Key IDs to private keys.
 
 ## Capabilities
 
-Version 1 requires `e2ee_x25519_chacha20poly1305`, `cumulative_ack`, and
-`lease_v1`. `bounded_event_replay_v1` is supported for recovery. The proposed
+Version 1 requires `e2ee_x25519_chacha20poly1305`, `cumulative_ack`,
+`flow_control_v1`, and `lease_v1`. `bounded_event_replay_v1` is supported for recovery. The proposed
 `terminal_snapshot_v1` capability remains experimental until Termux/xterm
 cross-engine compatibility validation is accepted; it is not a stable format.
+
+## Direction and message ACL
+
+The authenticated WebSocket role fixes the Envelope direction. The Relay
+applies this allowlist before looking up a route:
+
+| Direction | Message types |
+| --- | --- |
+| Android → PC | `SUBSCRIBE`, `UNSUBSCRIBE`, `OUTPUT_ACK`, `FLOW_CONTROL`, `INPUT_EVENT`, `RESIZE_REQUEST`, `RESUME_REQUEST`, `LEASE_REQUEST`, `GOODBYE`, `HEARTBEAT` |
+| PC → Android | `SESSION_UPSERT`, `SESSION_REMOVED`, `OUTPUT_CHUNK`, `GAP`, `INPUT_ACCEPTED`, `INPUT_REJECTED`, `RESIZE_APPLIED`, `SNAPSHOT_OFFER`, `SNAPSHOT_CHUNK`, `LEASE_GRANTED`, `LEASE_DENIED`, `LEASE_REVOKED`, `THEME_CHANGED`, `SESSION_STARTED`, `SESSION_INTERRUPTED`, `SESSION_ENDED`, `GOODBYE`, `HEARTBEAT` |
+
+`FLOW_CONTROL` is Android → PC only in V1. It is encrypted and contains the
+same `highest_contiguous_seq` as `Envelope.ack`, absolute finite limits for
+unacknowledged events and serialized Envelope/WebSocket binary payload bytes,
+a monotonic control epoch, and an optional reason. A zero limit or
+`paused=true` pauses the complete ordered PC-to-Android session stream. V1
+uses one sequence for output, resize, lifecycle, lease and input-result events,
+so no later control frame may overtake a paused terminal frame. The PC must
+still service the local ConPTY and Shell. It resumes from the subscriber's
+cumulative ACK when a newer positive window arrives.
 
 ## Input authority
 

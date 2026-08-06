@@ -5,6 +5,7 @@ package realtime
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,6 +32,9 @@ const (
 	pongTimeout     = 45 * time.Second
 	pingInterval    = 15 * time.Second
 	peerQueueFrames = 128
+	// Frames remain bounded separately so a peer cannot consume roughly
+	// peerQueueFrames * MaxFrameBytes while its socket is stalled.
+	peerQueueBytes = 8 << 20
 	// A replay can legitimately enqueue a short burst faster than the socket
 	// writer can drain it. Give the writer a bounded opportunity to catch up
 	// before classifying the peer as a slow consumer. This also propagates
@@ -38,7 +43,7 @@ const (
 	peerEnqueueTimeout = 500 * time.Millisecond
 )
 
-var requiredCapabilities = []string{"cumulative_ack", "e2ee_x25519_chacha20poly1305", "lease_v1"}
+var requiredCapabilities = []string{"cumulative_ack", "e2ee_x25519_chacha20poly1305", "flow_control_v1", "lease_v1"}
 
 type Hub struct {
 	store         *store.Postgres
@@ -98,19 +103,34 @@ type serverWelcome struct {
 }
 
 type peer struct {
-	hub           *Hub
-	socket        *websocket.Conn
-	principal     auth.Principal
-	role          string
-	send          chan []byte
-	done          chan struct{}
-	once          sync.Once
-	lastSequences map[uuid.UUID]uint64
-	subscriptions map[uuid.UUID]bool
+	hub             *Hub
+	socket          *websocket.Conn
+	principal       auth.Principal
+	role            string
+	send            chan []byte
+	done            chan struct{}
+	once            sync.Once
+	lastSequences   map[uuid.UUID]uint64
+	pcLastSequences map[pcRouteKey]uint64
+	pcReplayFrames  map[pcReplayKey][32]byte
+	pcReplayOrder   []pcReplayKey
+	subscriptions   map[uuid.UUID]bool
+	queuedBytes     atomic.Int64
 	// subscriptionRoutes is protected by hub.mu together with subscriptions.
 	// It binds an authorized Android subscription to the owning Windows device
 	// and the exact Grant expiry used by the zero-database-query output path.
 	subscriptionRoutes map[uuid.UUID]store.SessionRouteAuthorization
+}
+
+type pcReplayKey struct {
+	sessionID   uuid.UUID
+	recipientID uuid.UUID
+	sequence    uint64
+}
+
+type pcRouteKey struct {
+	sessionID   uuid.UUID
+	recipientID uuid.UUID
 }
 
 func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -154,7 +174,7 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		closeSocket(socket, websocket.ClosePolicyViolation, "role does not match device")
 		return
 	}
-	connection := &peer{hub: h, socket: socket, principal: principal, role: hello.Role, send: make(chan []byte, peerQueueFrames), done: make(chan struct{}), subscriptions: map[uuid.UUID]bool{}, subscriptionRoutes: map[uuid.UUID]store.SessionRouteAuthorization{}, lastSequences: map[uuid.UUID]uint64{}}
+	connection := &peer{hub: h, socket: socket, principal: principal, role: hello.Role, send: make(chan []byte, peerQueueFrames), done: make(chan struct{}), subscriptions: map[uuid.UUID]bool{}, subscriptionRoutes: map[uuid.UUID]store.SessionRouteAuthorization{}, lastSequences: map[uuid.UUID]uint64{}, pcLastSequences: map[pcRouteKey]uint64{}, pcReplayFrames: map[pcReplayKey][32]byte{}}
 	if !h.add(connection) {
 		closeSocket(socket, websocket.CloseTryAgainLater, "relay shutting down")
 		return
@@ -265,12 +285,22 @@ func (p *peer) readLoop() {
 			p.close(websocket.ClosePolicyViolation, "direction rejected")
 			return
 		}
+		if !allowedMessage(p.role, envelope.MessageType) || !validEnvelopeACK(envelope) {
+			p.close(websocket.ClosePolicyViolation, "message type or acknowledgement rejected")
+			return
+		}
 		sessionID, err := uuid.FromBytes(envelope.SessionID)
 		if err != nil {
 			p.close(websocket.CloseProtocolError, "invalid session")
 			return
 		}
-		if !p.acceptSequence(sessionID, envelope.Sequence) {
+		if p.role == "pc" {
+			recipient, recipientErr := uuid.FromBytes(envelope.RecipientDeviceID)
+			if recipientErr != nil || !p.acceptPCSequence(sessionID, recipient, envelope.Sequence, frame) {
+				p.close(websocket.ClosePolicyViolation, "sequence rejected")
+				return
+			}
+		} else if !p.acceptSequence(sessionID, envelope.Sequence) {
 			p.close(websocket.ClosePolicyViolation, "sequence rejected")
 			return
 		}
@@ -289,6 +319,47 @@ func (p *peer) readLoop() {
 	}
 }
 
+func allowedMessage(role string, messageType realtimewire.MessageType) bool {
+	if role == "android" {
+		switch messageType {
+		case realtimewire.Heartbeat, realtimewire.Goodbye,
+			realtimewire.Subscribe, realtimewire.Unsubscribe,
+			realtimewire.OutputACK, realtimewire.FlowControl,
+			realtimewire.InputEvent, realtimewire.ResizeRequest,
+			realtimewire.ResumeRequest, realtimewire.LeaseRequest:
+			return true
+		default:
+			return false
+		}
+	}
+	if role == "pc" {
+		switch messageType {
+		case realtimewire.Heartbeat, realtimewire.Goodbye,
+			realtimewire.SessionUpsert, realtimewire.SessionRemoved,
+			realtimewire.OutputChunk, realtimewire.Gap,
+			realtimewire.InputAccepted, realtimewire.InputRejected,
+			realtimewire.ResizeApplied, realtimewire.SnapshotOffer,
+			realtimewire.SnapshotChunk, realtimewire.LeaseGranted,
+			realtimewire.LeaseDenied, realtimewire.LeaseRevoked,
+			realtimewire.ThemeChanged, realtimewire.SessionStarted,
+			realtimewire.SessionInterrupted, realtimewire.SessionEnded:
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func validEnvelopeACK(envelope realtimewire.Envelope) bool {
+	switch envelope.MessageType {
+	case realtimewire.Subscribe, realtimewire.OutputACK, realtimewire.FlowControl:
+		return true
+	default:
+		return envelope.ACK == 0
+	}
+}
+
 // Android-to-PC envelopes can execute input and therefore remain strictly
 // monotonic for the lifetime of a connection. PC-to-Android envelopes carry
 // replayable terminal events: after a cumulative-ACK resume the Agent may
@@ -302,6 +373,38 @@ func (p *peer) acceptSequence(sessionID uuid.UUID, sequence uint64) bool {
 	}
 	if sequence > last {
 		p.lastSequences[sessionID] = sequence
+	}
+	return true
+}
+
+const maxPCReplayFrames = 4096
+
+// PC output may be replayed only as the exact serialized frame previously
+// accepted for the same session/recipient/sequence. This prevents a sender
+// from replacing an authenticated logical event with different ciphertext
+// while retaining cumulative-sequence semantics.
+func (p *peer) acceptPCSequence(sessionID, recipientID uuid.UUID, sequence uint64, frame []byte) bool {
+	if p.pcLastSequences == nil {
+		p.pcLastSequences = map[pcRouteKey]uint64{}
+	}
+	if p.pcReplayFrames == nil {
+		p.pcReplayFrames = map[pcReplayKey][32]byte{}
+	}
+	key := pcReplayKey{sessionID: sessionID, recipientID: recipientID, sequence: sequence}
+	routeKey := pcRouteKey{sessionID: sessionID, recipientID: recipientID}
+	last := p.pcLastSequences[routeKey]
+	digest := sha256.Sum256(frame)
+	if sequence <= last {
+		previous, ok := p.pcReplayFrames[key]
+		return ok && bytes.Equal(previous[:], digest[:])
+	}
+	p.pcLastSequences[routeKey] = sequence
+	p.pcReplayFrames[key] = digest
+	p.pcReplayOrder = append(p.pcReplayOrder, key)
+	for len(p.pcReplayOrder) > maxPCReplayFrames {
+		oldest := p.pcReplayOrder[0]
+		p.pcReplayOrder = p.pcReplayOrder[1:]
+		delete(p.pcReplayFrames, oldest)
 	}
 	return true
 }
@@ -352,10 +455,19 @@ func (p *peer) route(envelope realtimewire.Envelope, sessionID uuid.UUID, frame 
 		}
 		p.hub.subscribe(p, sessionID, route)
 	}
-	if envelope.MessageType == realtimewire.InputEvent || envelope.MessageType == realtimewire.ResizeRequest {
+	if envelope.MessageType == realtimewire.InputEvent || envelope.MessageType == realtimewire.ResizeRequest ||
+		envelope.MessageType == realtimewire.LeaseRequest {
 		if route.Permission != "CONTROL" && route.Permission != "MANAGE" {
 			return store.ErrDenied
 		}
+	}
+	if envelope.MessageType == realtimewire.OutputACK || envelope.MessageType == realtimewire.FlowControl ||
+		envelope.MessageType == realtimewire.ResumeRequest {
+		if _, subscribed := p.hub.subscriptionRoute(p, sessionID); !subscribed {
+			return store.ErrDenied
+		}
+	}
+	if envelope.MessageType == realtimewire.InputEvent || envelope.MessageType == realtimewire.ResizeRequest {
 		lease, err := p.hub.leases.GetLease(ctx, sessionID)
 		if err != nil || lease.HolderDeviceID != p.principal.Device.ID {
 			return store.ErrDenied
@@ -478,23 +590,61 @@ func (h *Hub) sendToDevice(sender *peer, deviceID uuid.UUID, frame []byte) {
 
 func (p *peer) enqueue(frame []byte) {
 	copyFrame := append([]byte(nil), frame...)
+	if !p.reserveQueueBytes(int64(len(copyFrame))) {
+		if p.close(websocket.CloseTryAgainLater, "slow consumer; byte budget exceeded; resume from cumulative ACK") {
+			p.hub.observer.SlowConsumerDisconnected()
+		}
+		return
+	}
 	timer := time.NewTimer(peerEnqueueTimeout)
 	defer timer.Stop()
 	select {
 	case p.send <- copyFrame:
 	case <-p.done:
+		p.releaseQueueBytes(int64(len(copyFrame)))
 	case <-timer.C:
+		p.releaseQueueBytes(int64(len(copyFrame)))
 		if p.close(websocket.CloseTryAgainLater, "slow consumer; resume from cumulative ACK") {
 			p.hub.observer.SlowConsumerDisconnected()
 		}
 	}
 }
+
+func (p *peer) reserveQueueBytes(size int64) bool {
+	if size <= 0 || size > peerQueueBytes {
+		return false
+	}
+	for {
+		current := p.queuedBytes.Load()
+		if current > peerQueueBytes-size {
+			return false
+		}
+		if p.queuedBytes.CompareAndSwap(current, current+size) {
+			return true
+		}
+	}
+}
+
+func (p *peer) releaseQueueBytes(size int64) {
+	for {
+		current := p.queuedBytes.Load()
+		next := current - size
+		if next < 0 {
+			next = 0
+		}
+		if p.queuedBytes.CompareAndSwap(current, next) {
+			return
+		}
+	}
+}
+
 func (p *peer) writeLoop() {
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case frame := <-p.send:
+			p.releaseQueueBytes(int64(len(frame)))
 			_ = p.socket.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := p.socket.WriteMessage(websocket.BinaryMessage, frame); err != nil {
 				p.close(websocket.CloseAbnormalClosure, "write failed")
