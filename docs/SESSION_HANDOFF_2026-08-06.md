@@ -306,3 +306,10 @@ git diff --check
   `1169d9db-e8e7-4c05-8096-eab6fbcee9d0`，artifact
   `0cc8997f-f688-4d72-ae21-8ec55441bb18`，状态 `published`。公开更新接口验证：build 5 返回
   `optional` / latest 0.1.6 build 6，build 6 返回 `no_update`。
+- Windows 安装器 `TermLink-Setup-0.1.6.0.exe` 已完成自包含构建、9 个内部二进制签名和
+  `Get-AuthenticodeSignature=Valid` 验证，SHA-256 为
+  `5FF44F61889B0CB6D95B37D4EF6CE8927AD34A591C42CDD0BA2DE14569CF19D7`。
+- AppShip `termlink-win64/stable` 已发布：release
+  `4e7a3c00-2e31-4bbc-a065-a9220069fd16`，artifact
+  `eb6fd7ef-50fe-42c8-a412-1bf53eab431b`，版本 `0.1.6` / build `6`，状态 `published`。
+  公开更新接口验证：build 5 返回 `optional` / latest 0.1.6 build 6，build 6 返回 `no_update`。
