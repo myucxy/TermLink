@@ -14,6 +14,7 @@ import dev.termlink.crypto.HistoryCrypto
 import dev.termlink.crypto.SessionCrypto
 import dev.termlink.database.TermLinkDatabase
 import dev.termlink.history.HistoryRepository
+import dev.termlink.harness.BuildConfig
 import dev.termlink.harness.R
 import dev.termlink.model.CatalogPlan
 import dev.termlink.model.DeviceSummary
@@ -148,6 +149,7 @@ internal class ProductionProductRepository(
     private var accountScope: String? = sessionStore.accountScope
     private var oidcConfiguration: NativeOidcConfiguration? = null
     private var closed = false
+    private var appShipEtag: String? = null
 
     private val mutableSnapshot = MutableStateFlow(
         ProductSnapshot(
@@ -265,6 +267,61 @@ internal class ProductionProductRepository(
             password.fill('\u0000')
             confirm.fill('\u0000')
         }
+    }
+
+    override suspend fun checkForUpdate(): ProductUpdateStatus {
+        val baseUrl = BuildConfig.TERMLINK_APPSHIP_BASE_URL.trim().trimEnd('/')
+        if (baseUrl.isBlank()) {
+            return publishUpdateStatus(
+                ProductUpdateStatus(
+                    decision = ProductUpdateDecision.NOT_CONFIGURED,
+                    message = "Update service is not configured",
+                    checkedAt = Instant.now(),
+                ),
+            )
+        }
+        val baseUri = runCatching { URI(baseUrl) }.getOrNull()
+        if (baseUri == null || !baseUri.isAbsolute || !baseUri.scheme.equals("https", ignoreCase = true)) {
+            return publishUpdateStatus(
+                ProductUpdateStatus(
+                    decision = ProductUpdateDecision.ERROR,
+                    message = "Update service must use HTTPS",
+                    checkedAt = Instant.now(),
+                ),
+            )
+        }
+        val status = try {
+            withContext(Dispatchers.IO) {
+                val url = "$baseUrl/api/v1/apps/$PRODUCT_APPSHIP_SLUG/updates" +
+                    "?platform=android&arch=universal&channel=stable&build=${BuildConfig.VERSION_CODE}"
+                val request = Request.Builder()
+                    .url(url)
+                    .get()
+                    .header("Cache-Control", "no-cache")
+                    .apply { appShipEtag?.let { header("If-None-Match", it) } }
+                    .build()
+                http.newCall(request).execute().use { response ->
+                    if (response.code == 304) {
+                        ProductUpdateStatus(
+                            decision = ProductUpdateDecision.NO_UPDATE,
+                            message = "No update available",
+                            checkedAt = Instant.now(),
+                        )
+                    } else {
+                        if (!response.isSuccessful) error("Update service returned HTTP ${response.code}")
+                        response.header("ETag")?.let { appShipEtag = it }
+                        parseAppShipUpdate(response.body?.string().orEmpty())
+                    }
+                }
+            }
+        } catch (error: Throwable) {
+            ProductUpdateStatus(
+                decision = ProductUpdateDecision.ERROR,
+                message = error.message?.take(160) ?: "Update check failed",
+                checkedAt = Instant.now(),
+            )
+        }
+        return publishUpdateStatus(status)
     }
 
     override suspend fun beginBrowserRegistration() = beginBrowserAuth(BrowserAuthFlow.REGISTRATION)
@@ -1036,6 +1093,50 @@ internal class ProductionProductRepository(
             database.devices().clear()
             database.preferences().clear()
         }
+    }
+
+    private fun publishUpdateStatus(status: ProductUpdateStatus): ProductUpdateStatus {
+        mutableSnapshot.value = mutableSnapshot.value.copy(updateStatus = status)
+        return status
+    }
+
+    private fun parseAppShipUpdate(body: String): ProductUpdateStatus {
+        val root = runCatching { json.parseToJsonElement(body).jsonObject }
+            .getOrElse { return ProductUpdateStatus(ProductUpdateDecision.ERROR, message = "Invalid update response", checkedAt = Instant.now()) }
+        fun objectAt(parent: JsonObject, key: String): JsonObject? = parent[key] as? JsonObject
+        fun stringAt(parent: JsonObject, vararg keys: String): String? = keys.firstNotNullOfOrNull { key ->
+            parent[key]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+        }
+        val release = objectAt(root, "release") ?: objectAt(root, "update") ?: root
+        val artifact = objectAt(release, "artifact") ?: objectAt(root, "artifact")
+        val rawDecision = stringAt(root, "decision", "status", "result")?.uppercase()
+        val versionName = stringAt(release, "versionName", "version_name", "version")
+        val buildNumber = stringAt(release, "buildNumber", "build_number", "build")?.toLongOrNull()
+        val downloadUrl = stringAt(artifact ?: release, "downloadUrl", "download_url", "url")
+            ?.takeIf { value ->
+                runCatching { URI(value) }.getOrNull()?.let { uri ->
+                    uri.isAbsolute && uri.scheme.equals("https", ignoreCase = true)
+                } == true
+            }
+        val decision = when (rawDecision) {
+            "REQUIRED", "MANDATORY", "FORCE" -> ProductUpdateDecision.REQUIRED
+            "OPTIONAL", "AVAILABLE", "UPDATE_AVAILABLE" -> ProductUpdateDecision.OPTIONAL
+            "NO_UPDATE", "NONE", "CURRENT", "UP_TO_DATE", "NOT_AVAILABLE" -> ProductUpdateDecision.NO_UPDATE
+            else -> if (versionName != null || buildNumber != null || downloadUrl != null) {
+                ProductUpdateDecision.OPTIONAL
+            } else {
+                ProductUpdateDecision.NO_UPDATE
+            }
+        }
+        return ProductUpdateStatus(
+            decision = decision,
+            versionName = versionName,
+            buildNumber = buildNumber,
+            releaseNotes = stringAt(release, "releaseNotes", "release_notes", "notes"),
+            downloadUrl = downloadUrl,
+            message = stringAt(root, "message", "detail") ?: if (decision == ProductUpdateDecision.NO_UPDATE) "No update available" else null,
+            checkedAt = Instant.now(),
+        )
     }
 
     private fun appendActivity(title: String, detail: String, severity: Severity) {

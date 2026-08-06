@@ -383,6 +383,7 @@ fun ProductApp(
                     onThemePreferenceChanged = onThemePreferenceChanged,
                     onSignIn = { runOperation(repository::signIn) },
                     onSignOut = { signOutConfirmation = true },
+                    onCheckForUpdate = { runOperation { repository.checkForUpdate() } },
                     onRequestControl = { runOperation { repository.requestControl(it) } },
                     onReleaseControl = { runOperation { repository.releaseControl(it) } },
                     onPaste = { pasteSessionId = it },
@@ -888,6 +889,7 @@ private fun ProductContent(
     onThemePreferenceChanged: (ProductThemePreference) -> Unit,
     onSignIn: () -> Unit,
     onSignOut: () -> Unit,
+    onCheckForUpdate: () -> Unit,
     onRequestControl: (java.util.UUID) -> Unit,
     onReleaseControl: (java.util.UUID) -> Unit,
     onPaste: (java.util.UUID) -> Unit,
@@ -940,6 +942,7 @@ private fun ProductContent(
                 snapshot = snapshot,
                 onSignIn = onSignIn,
                 onSignOut = onSignOut,
+                onCheckForUpdate = onCheckForUpdate,
                 onOpenAccount = onOpenAccount,
                 themePreference = themePreference,
                 onThemePreferenceChanged = onThemePreferenceChanged,
@@ -1653,6 +1656,7 @@ private fun SettingsPage(
     snapshot: ProductSnapshot,
     onSignIn: () -> Unit,
     onSignOut: () -> Unit,
+    onCheckForUpdate: () -> Unit,
     onOpenAccount: () -> Unit,
     themePreference: ProductThemePreference,
     onThemePreferenceChanged: (ProductThemePreference) -> Unit,
@@ -1728,6 +1732,38 @@ private fun SettingsPage(
         Icon(Icons.Filled.AccountCircle, contentDescription = null, modifier = Modifier.size(18.dp))
         Spacer(Modifier.width(8.dp))
         Text(stringResource(R.string.nav_account))
+    }
+    PageHeader(stringResource(R.string.settings_updates_title), stringResource(R.string.settings_updates_copy), Icons.Filled.Refresh)
+    val update = snapshot.updateStatus
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = ProductShape,
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
+    ) {
+        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                when (update.decision) {
+                    ProductUpdateDecision.NOT_CONFIGURED -> stringResource(R.string.update_not_configured)
+                    ProductUpdateDecision.NO_UPDATE -> stringResource(R.string.update_no_update)
+                    ProductUpdateDecision.OPTIONAL -> stringResource(R.string.update_optional, update.versionName ?: "-")
+                    ProductUpdateDecision.REQUIRED -> stringResource(R.string.update_required, update.versionName ?: "-")
+                    ProductUpdateDecision.ERROR -> stringResource(R.string.update_error)
+                },
+                style = MaterialTheme.typography.titleSmall,
+            )
+            update.message?.let {
+                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            update.downloadUrl?.let {
+                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
+            OutlinedButton(onClick = onCheckForUpdate, modifier = Modifier.heightIn(min = 48.dp)) {
+                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(stringResource(R.string.action_check_updates))
+            }
+        }
     }
     PageHeader(stringResource(R.string.settings_about), stringResource(R.string.settings_about_copy), Icons.Filled.Info)
     Text(stringResource(R.string.settings_product_shell), style = MaterialTheme.typography.bodyMedium)

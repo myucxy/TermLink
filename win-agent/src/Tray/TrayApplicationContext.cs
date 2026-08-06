@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
@@ -1690,6 +1691,10 @@ namespace TermLink.Tray
         private Button remoteStopButton;
         private Label activitySummaryLabel;
         private Label diagnosticsSummaryLabel;
+        private Label updateStatusLabel;
+        private Button updateCheckButton;
+        private Button updateOpenButton;
+        private string updateDownloadUrl;
         private Label membershipAccountStatusLabel;
         private Label membershipAccountDetailLabel;
         private Label membershipDeviceQuotaLabel;
@@ -2201,6 +2206,30 @@ namespace TermLink.Tray
                 10,
                 false));
             stack.Controls.Add(safety);
+
+            var updates = CreateCard(TrayText.Pick("软件更新", "Software updates"), out var updatesBody);
+            updateStatusLabel = CreateValueLabel(
+                TrayText.Pick("检查公开 AppShip 更新，不会自动关闭当前窗口。", "Check the public AppShip channel without closing the current window."),
+                10,
+                false);
+            updatesBody.Controls.Add(updateStatusLabel);
+            var updateActions = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = true,
+                Padding = new Padding(0, 10, 0, 0)
+            };
+            updateCheckButton = CreateButton(TrayText.Pick("检查更新", "Check for updates"));
+            updateCheckButton.Click += async delegate { await CheckForUpdateAsync(); };
+            updateOpenButton = CreateButton(TrayText.Pick("打开下载", "Open download"));
+            updateOpenButton.Enabled = false;
+            updateOpenButton.Click += delegate { OpenUpdateDownload(); };
+            updateActions.Controls.Add(updateCheckButton);
+            updateActions.Controls.Add(updateOpenButton);
+            updatesBody.Controls.Add(updateActions);
+            stack.Controls.Add(updates);
             body.Controls.Add(stack);
             FitPageStack(body, stack);
             activePage = shell;
@@ -2316,6 +2345,55 @@ namespace TermLink.Tray
                     "已发布 Session 元数据：" + (production.Sessions == null ? 0 : production.Sessions.Count) + "（非订阅占用）",
                     "Published Session metadata: " + (production.Sessions == null ? 0 : production.Sessions.Count) + " (not subscription occupancy)");
             }
+        }
+
+        private async Task CheckForUpdateAsync()
+        {
+            if (updateCheckButton == null || updateStatusLabel == null) return;
+            updateCheckButton.Enabled = false;
+            updateOpenButton.Enabled = false;
+            updateDownloadUrl = null;
+            updateStatusLabel.Text = TrayText.Pick("正在检查更新…", "Checking for updates…");
+            try
+            {
+                var current = typeof(Program).Assembly.GetName().Version ?? new Version(0, 0, 0, 0);
+                var result = await AppShipUpdateClient.CheckAsync(AppShipUpdateClient.ConfiguredBaseUrl(), current);
+                updateDownloadUrl = result.DownloadUrl;
+                var version = string.IsNullOrWhiteSpace(result.VersionName) ? "-" : result.VersionName;
+                var prefix = result.Decision == WindowsUpdateDecision.Optional
+                    ? TrayText.Pick("有可选更新：", "Optional update: ")
+                    : result.Decision == WindowsUpdateDecision.Required
+                        ? TrayText.Pick("需要更新：", "Required update: ")
+                        : result.Decision == WindowsUpdateDecision.NoUpdate
+                            ? TrayText.Pick("当前已是最新版本", "You are up to date")
+                            : result.Decision == WindowsUpdateDecision.NotConfigured
+                                ? TrayText.Pick("更新服务未配置", "Update service is not configured")
+                                : TrayText.Pick("检查更新失败", "Update check failed");
+                updateStatusLabel.Text = prefix +
+                    ((result.Decision == WindowsUpdateDecision.Optional || result.Decision == WindowsUpdateDecision.Required) ? version : string.Empty) +
+                    (string.IsNullOrWhiteSpace(result.Message) ? string.Empty : " · " + result.Message);
+                updateOpenButton.Enabled = !string.IsNullOrWhiteSpace(updateDownloadUrl);
+            }
+            catch (Exception error)
+            {
+                updateStatusLabel.Text = TrayText.Pick("检查更新失败 · " + error.Message, "Update check failed · " + error.Message);
+            }
+            finally
+            {
+                updateCheckButton.Enabled = true;
+            }
+        }
+
+        private void OpenUpdateDownload()
+        {
+            if (string.IsNullOrWhiteSpace(updateDownloadUrl) ||
+                !Uri.TryCreate(updateDownloadUrl, UriKind.Absolute, out var uri) ||
+                !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)) return;
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = uri.AbsoluteUri,
+                UseShellExecute = true
+            });
         }
 
         private async Task ToggleRemoteAsync()

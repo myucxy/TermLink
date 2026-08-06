@@ -75,15 +75,21 @@ try {
         $pfxPath,
         $certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Pfx, $passwordText))
 
-    $result = & (Join-Path $PSScriptRoot '..\package\Build-Setup.ps1') `
+    $buildOutput = @(& (Join-Path $PSScriptRoot '..\package\Build-Setup.ps1') `
         -Version '0.1.0.0' `
         -CertificatePath $pfxPath `
         -CertificatePassword $password `
         -Development `
         -DotNetPath $DotNetPath `
-        -OutputPath $setupPath
+        -OutputPath $setupPath)
+    # Build-Setup emits tool progress for interactive callers. Select the final
+    # summary object instead of relying on pipeline cardinality.
+    $result = @($buildOutput | Where-Object {
+        $_ -is [psobject] -and $_.PSObject.Properties['SetupPath'] -and
+        $_.PSObject.Properties['SelfContained'] -and $_.PSObject.Properties['EmbeddedPayload']
+    } | Select-Object -Last 1)
     Assert-True (Test-Path -LiteralPath $setupPath -PathType Leaf) 'The single-file setup executable was not created.'
-    Assert-True ([bool]$result.SelfContained -and [bool]$result.EmbeddedPayload) `
+    Assert-True ($result.Count -eq 1 -and [bool]$result[0].SelfContained -and [bool]$result[0].EmbeddedPayload) `
         'The setup build did not report a self-contained embedded payload.'
 
     Invoke-Setup -SetupPath $setupPath -Arguments @(
@@ -118,7 +124,7 @@ try {
             "A mandatory Terminal profile is missing: $guid"
     }
     foreach ($profile in $profiles) {
-        Assert-True ([string]$profile.commandline.StartsWith(
+        Assert-True ($profile.commandline.StartsWith(
                 $expectedHostPrefix, [StringComparison]::OrdinalIgnoreCase)) `
             "Terminal profile does not use the selected installation directory: $($profile.guid)"
     }

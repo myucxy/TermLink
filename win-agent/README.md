@@ -185,7 +185,7 @@ Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当�
 的自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏、真实计费 Provider
 或生产发布已经验证。
 
-## 签名 MSIX 与登录自启
+## MSIX 兼容验证（非首发格式）
 
 `package/Build-Msix.ps1` 使用固定 .NET 8 SDK 发布 `win-x64` 自包含 payload，分别签名 8 个
 TermLink 自有 EXE/DLL，再由 Windows SDK MakeAppx 生成并签名完整 MSIX。Updater 以可复制
@@ -221,9 +221,9 @@ MSIX 使用 `windows.startupTask` 在当前用户登录后启动 `TermLink.Tray.
 证据分别位于 `docs/validation/phase1-windows-installer.json` 和
 `docs/validation/item7-windows-msix-lifecycle.json`。该结果只证明开发信任机制，不证明生产证书链。
 
-## 单文件 EXE 安装器
+## 单文件 EXE 安装器（Windows 首发格式）
 
-需要传统安装器（而不是 MSIX）时，`package/Build-Setup.ps1` 会把 Agent、SessionHost、Tray、
+Windows 首发使用 `package/Build-Setup.ps1` 生成单文件 EXE；该脚本会把 Agent、SessionHost、Tray、
 Updater 以及 .NET 8 `win-x64` 自包含运行库压缩并嵌入一个 `TermLink.Setup.exe`。安装器默认使用
 `%LOCALAPPDATA%\Programs\TermLink`，也可以在安装向导中选择目录或通过命令行指定目录：
 

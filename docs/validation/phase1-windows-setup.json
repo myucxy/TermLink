@@ -1,0 +1,18 @@
+{
+  "schema": "termlink.phase1-windows-setup-validation",
+  "version": 1,
+  "generated_at_utc": "2026-08-06T08:06:20.5650547Z",
+  "passed": true,
+  "setup_version": "0.1.0.0",
+  "architecture": "win-x64",
+  "single_file_setup": true,
+  "self_contained_payload": true,
+  "embedded_payload": true,
+  "selected_install_directory_applied": true,
+  "terminal_profile_count": 4,
+  "terminal_fragment_owned_cleanup": true,
+  "startup_unchanged_under_no_startup": true,
+  "upgrade_in_place": true,
+  "uninstall": true,
+  "setup_sha256": "7a1aa2cb36c485e9196c41bf6f299aed409af2229b080fcd7b034a365383b7b7"
+}

@@ -104,6 +104,18 @@ git diff --check
 - `docs/validation/phase1-windows-installer.json`；
 - `docs/validation/item7-windows-msix-lifecycle.json`。
 
+### 3.1 更新检查与 Windows EXE 首发路径
+
+- Android 与 Windows Tray 已接入 AppShip 公共更新检查，固定 slug 分别为
+  `termlink-android` 和 `termlink-win64`；只查询 stable 通道，不携带账号凭据，不自动下载或
+  安装，也不会关闭当前 Windows Terminal、Agent 或 Shell 窗口。
+- Windows 首发产物固定为 `TermLink-Setup-<version>.exe` 单文件安装器；`Build-Setup.ps1`
+  已完成自包含 Agent/SessionHost/Tray/Updater 打包和开发证书签名构建。正式 AppShip 发布仍
+  需要外部提供 HTTPS AppShip 地址、`release_manager` 凭据和受信代码签名证书/时间戳。
+- Android release signing 现在只从 Gradle 属性或进程环境读取 keystore 路径、别名和密码，
+  仓库不保存签名材料；当前工作区没有 TermLink 专用 release keystore，不能用其他产品证书
+  代替生产签名。
+
 ## 4. 本机状态注意事项
 
 - 本机 Android SDK 已确认位于 `D:\Dev\Env\Android\Sdk`（不是常见的 `D:\Android\Sdk`）；使用该路径设置本次构建进程的

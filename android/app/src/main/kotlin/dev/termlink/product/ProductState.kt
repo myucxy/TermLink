@@ -39,6 +39,27 @@ const val PRODUCT_PUBLIC_SERVER_URL = "https://termlink.kget.cc:8910"
 /** First-release account policy: same-account Android devices get full access. */
 const val PRODUCT_DEFAULT_ANDROID_PERMISSION = "MANAGE"
 
+/** Public AppShip identity for Android update checks. */
+const val PRODUCT_APPSHIP_SLUG = "termlink-android"
+
+enum class ProductUpdateDecision {
+    NOT_CONFIGURED,
+    NO_UPDATE,
+    OPTIONAL,
+    REQUIRED,
+    ERROR,
+}
+
+data class ProductUpdateStatus(
+    val decision: ProductUpdateDecision = ProductUpdateDecision.NOT_CONFIGURED,
+    val versionName: String? = null,
+    val buildNumber: Long? = null,
+    val releaseNotes: String? = null,
+    val downloadUrl: String? = null,
+    val message: String? = null,
+    val checkedAt: Instant? = null,
+)
+
 /**
  * Routes retained in the product shell.  Membership and trust/pairing state
  * remain in [ProductSnapshot] for transport compatibility, but are not part
@@ -189,6 +210,7 @@ data class ProductSnapshot(
     val entitlement: Entitlement? = null,
     val catalogPlan: CatalogPlan? = null,
     val billing: BillingSnapshot = BillingSnapshot(),
+    val updateStatus: ProductUpdateStatus = ProductUpdateStatus(),
     val lastSyncedAt: Instant? = null,
 )
 
@@ -225,6 +247,8 @@ interface ProductRepository : Closeable {
     /** Creates an account through the server's direct registration boundary. */
     suspend fun register(username: String, email: String, password: CharArray, confirm: CharArray): Unit =
         error("Direct account registration is unavailable")
+    /** Checks the public AppShip update decision without an account token. */
+    suspend fun checkForUpdate(): ProductUpdateStatus = ProductUpdateStatus()
     /**
      * Direct registration is intentionally not part of this contract yet:
      * the current service exposes registration only through its browser/PKCE
@@ -265,6 +289,10 @@ class UnavailableProductRepository : ProductRepository {
     override suspend fun refresh() = unavailable()
     override suspend fun signIn(username: String, password: CharArray) = unavailable()
     override suspend fun register(username: String, email: String, password: CharArray, confirm: CharArray) = unavailable()
+    override suspend fun checkForUpdate(): ProductUpdateStatus = ProductUpdateStatus(
+        decision = ProductUpdateDecision.NOT_CONFIGURED,
+        message = "Update service is not configured",
+    )
     override suspend fun beginBrowserRegistration() = unavailable()
     override suspend fun beginBrowserAccountSetup() = unavailable()
     override suspend fun confirmEnrollment() = unavailable()

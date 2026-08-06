@@ -185,6 +185,14 @@
     <string name="settings_input_safety">Input safety</string>
     <string name="settings_about">About</string>
     <string name="settings_about_copy">Build and protocol details for support diagnostics.</string>
+    <string name="settings_updates_title">Updates</string>
+    <string name="settings_updates_copy">Check the public AppShip channel without sending account credentials.</string>
+    <string name="action_check_updates">Check for updates</string>
+    <string name="update_not_configured">Update service is not configured</string>
+    <string name="update_no_update">You are up to date</string>
+    <string name="update_optional">Optional update available: %1$s</string>
+    <string name="update_required">Required update: %1$s</string>
+    <string name="update_error">Update check failed</string>
     <string name="settings_product_shell">TermLink Android product shell</string>
     <string name="settings_transport_copy">Production transport uses the fixed public service after you sign in.</string>
     <string name="confirm_reject_title">Reject pending device?</string>

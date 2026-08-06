@@ -8,6 +8,26 @@ android {
     namespace = "dev.termlink.harness"
     compileSdk = 36
 
+    val appShipBaseUrl = providers.gradleProperty("termlinkAppShipBaseUrl")
+        .orElse(providers.environmentVariable("TERMLINK_APPSHIP_BASE_URL"))
+        .orElse(providers.environmentVariable("APPSHIP_BASE_URL"))
+        .orElse("")
+        .get()
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+    val releaseStoreFile = providers.gradleProperty("termlinkReleaseStoreFile")
+        .orElse(providers.environmentVariable("TERMLINK_RELEASE_STORE_FILE"))
+        .orNull
+    val releaseStorePassword = providers.gradleProperty("termlinkReleaseStorePassword")
+        .orElse(providers.environmentVariable("TERMLINK_RELEASE_STORE_PASSWORD"))
+        .orNull
+    val releaseKeyAlias = providers.gradleProperty("termlinkReleaseKeyAlias")
+        .orElse(providers.environmentVariable("TERMLINK_RELEASE_KEY_ALIAS"))
+        .orNull
+    val releaseKeyPassword = providers.gradleProperty("termlinkReleaseKeyPassword")
+        .orElse(providers.environmentVariable("TERMLINK_RELEASE_KEY_PASSWORD"))
+        .orNull
+
     defaultConfig {
         applicationId = "dev.termlink.harness"
         minSdk = 26
@@ -20,6 +40,27 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+
+    defaultConfig {
+        buildConfigField("String", "TERMLINK_APPSHIP_BASE_URL", "\"$appShipBaseUrl\"")
+    }
+
+    // Release signing is opt-in and supplied by the build environment. Never commit
+    // a keystore path or password; an unset configuration intentionally produces an
+    // unsigned release artifact that cannot be published as production.
+    if (!releaseStoreFile.isNullOrBlank() &&
+        !releaseStorePassword.isNullOrBlank() &&
+        !releaseKeyAlias.isNullOrBlank()) {
+        signingConfigs {
+            create("termlinkRelease") {
+                storeFile = file(releaseStoreFile)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword ?: releaseStorePassword
+            }
+        }
+        buildTypes.getByName("release").signingConfig = signingConfigs.getByName("termlinkRelease")
     }
 
     packaging {

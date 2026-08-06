@@ -51,6 +51,12 @@ $env:GRADLE_USER_HOME = 'D:\Dev\Env\gradle\user-home'
   :feature-billing:testDebugUnitTest :app:testDebugUnitTest
 ```
 
+生产 release 构建不会把签名材料写入仓库。构建机通过 `termlinkReleaseStoreFile`、
+`termlinkReleaseStorePassword`、`termlinkReleaseKeyAlias` 和可选的
+`termlinkReleaseKeyPassword` Gradle 属性（或对应的 `TERMLINK_RELEASE_*` 环境变量）注入
+TermLink 专用 keystore；未配置时 release 保持未签名，不能上传 AppShip。更新检查地址在构建
+时通过 `termlinkAppShipBaseUrl`、`TERMLINK_APPSHIP_BASE_URL` 或标准 `APPSHIP_BASE_URL` 注入。
+
 Wrapper 固定 Gradle 8.13 及其 SHA-256，不依赖 `D:\Dev` 中带全局初始化脚本的 Gradle
 发行目录。
 
