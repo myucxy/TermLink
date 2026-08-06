@@ -19,6 +19,7 @@ node_modules/
 dist/
 coverage/
 artifacts/
+.appship/
 
 # Local tooling
 .idea/

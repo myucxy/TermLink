@@ -52,10 +52,11 @@ namespace TermLink.Setup
             }
             catch (Exception error)
             {
+                var errorLogPath = Path.Combine(Path.GetTempPath(), "TermLink-Setup-error.log");
                 try
                 {
                     File.AppendAllText(
-                        Path.Combine(Path.GetTempPath(), "TermLink-Setup-error.log"),
+                        errorLogPath,
                         DateTime.UtcNow.ToString("O") + Environment.NewLine + error + Environment.NewLine);
                 }
                 catch
@@ -71,7 +72,8 @@ namespace TermLink.Setup
                 try
                 {
                     System.Windows.Forms.MessageBox.Show(
-                        error.Message,
+                        error.Message + Environment.NewLine + Environment.NewLine +
+                        "详细日志: " + errorLogPath,
                         "TermLink 安装程序",
                         System.Windows.Forms.MessageBoxButtons.OK,
                         System.Windows.Forms.MessageBoxIcon.Error);
@@ -195,6 +197,7 @@ namespace TermLink.Setup
             var staging = Path.Combine(parent, ".termlink-install-" + Guid.NewGuid().ToString("N"));
             var backup = Path.Combine(parent, ".termlink-backup-" + Guid.NewGuid().ToString("N"));
             InstallMarker marker = null;
+            var installSucceeded = false;
             try
             {
                 Directory.CreateDirectory(staging);
@@ -211,11 +214,31 @@ namespace TermLink.Setup
                     InstalledUtc = DateTime.UtcNow.ToString("O")
                 };
                 ConfigureTerminal(root, marker, previous);
-                if (createStartup) ConfigureStartup(root, marker);
-                else RemoveStartupIfOwned(previous);
+                if (createStartup)
+                {
+                    try
+                    {
+                        ConfigureStartup(root, marker);
+                    }
+                    catch (Exception startupError) when (
+                        startupError is UnauthorizedAccessException ||
+                        startupError is System.Security.SecurityException)
+                    {
+                        // HKCU\...\Run can be locked down by enterprise policy. The
+                        // application is still usable without auto-start; do not make
+                        // the whole install fail for an optional convenience feature.
+                        marker.StartupCommand = null;
+                        Console.Error.WriteLine("登录启动项未配置（当前用户注册表权限不足）。");
+                    }
+                }
+                else
+                {
+                    TryRemoveStartupIfOwned(previous);
+                }
                 WriteMarker(root, marker);
 
                 if (Directory.Exists(backup)) Directory.Delete(backup, true);
+                installSucceeded = true;
                 Console.WriteLine("TermLink 已安装到: " + root);
                 Console.WriteLine("Windows Terminal 配置: " + marker.TerminalFragmentPath);
             }
@@ -223,17 +246,20 @@ namespace TermLink.Setup
             {
                 if (marker != null)
                 {
-                    RemoveTerminalFragmentIfOwned(marker);
-                    RemoveStartupIfOwned(marker);
+                    // Cleanup must never replace the original installer error. In
+                    // particular, the marker is intentionally incomplete while a
+                    // fragment or startup value is being written.
+                    TryRemoveTerminalFragmentIfOwned(marker);
+                    TryRemoveStartupIfOwned(marker);
                 }
-                if (Directory.Exists(root)) Directory.Delete(root, true);
-                if (Directory.Exists(backup)) Directory.Move(backup, root);
+                TryDeleteDirectory(root);
+                TryRestoreDirectory(backup, root);
                 throw;
             }
             finally
             {
-                if (Directory.Exists(staging)) Directory.Delete(staging, true);
-                if (Directory.Exists(backup)) Directory.Delete(backup, true);
+                TryDeleteDirectory(staging);
+                if (installSucceeded) TryDeleteDirectory(backup);
             }
         }
 
@@ -435,7 +461,17 @@ namespace TermLink.Setup
 
             var json = JsonSerializer.Serialize(new Dictionary<string, object> { ["profiles"] = profiles },
                 new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine;
-            File.WriteAllText(path, json, new UTF8Encoding(false));
+            try
+            {
+                File.WriteAllText(path, json, new UTF8Encoding(false));
+            }
+            catch (UnauthorizedAccessException error)
+            {
+                throw new InvalidOperationException(
+                    "无法写入 Windows Terminal Fragment：" + path +
+                    "。请确认当前用户对该目录有写入权限，并关闭占用该文件的编辑器后重试。",
+                    error);
+            }
             marker.TerminalFragmentPath = path;
             marker.TerminalFragmentSha256 = Sha256(path);
         }
@@ -527,9 +563,67 @@ namespace TermLink.Setup
             }
         }
 
+        private static void TryRemoveTerminalFragmentIfOwned(InstallMarker marker)
+        {
+            try
+            {
+                RemoveTerminalFragmentIfOwned(marker);
+            }
+            catch
+            {
+                // Preserve the original install error. The diagnostic log contains
+                // the original stack and is the source of truth for cleanup issues.
+            }
+        }
+
+        private static void TryRemoveStartupIfOwned(InstallMarker marker)
+        {
+            try
+            {
+                RemoveStartupIfOwned(marker);
+            }
+            catch
+            {
+                // Preserve the original install error; startup cleanup is best effort.
+            }
+        }
+
+        private static void TryDeleteDirectory(string path)
+        {
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(path) && Directory.Exists(path))
+                {
+                    Directory.Delete(path, true);
+                }
+            }
+            catch
+            {
+                // Preserve the original install error; an interrupted cleanup can
+                // be retried safely by the next installation attempt.
+            }
+        }
+
+        private static void TryRestoreDirectory(string backup, string root)
+        {
+            try
+            {
+                if (Directory.Exists(backup) && !Directory.Exists(root))
+                {
+                    Directory.Move(backup, root);
+                }
+            }
+            catch
+            {
+                // Preserve the original install error. The backup remains visible
+                // for manual recovery instead of being deleted implicitly.
+            }
+        }
+
         private static void RemoveTerminalFragmentIfOwned(InstallMarker marker)
         {
-            if (marker == null || string.IsNullOrWhiteSpace(marker.TerminalFragmentPath)) return;
+            if (marker == null || string.IsNullOrWhiteSpace(marker.TerminalFragmentPath) ||
+                string.IsNullOrWhiteSpace(marker.TerminalFragmentSha256)) return;
             var expectedPath = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "Microsoft", "Windows Terminal", "Fragments", "TermLink", FragmentFileName);

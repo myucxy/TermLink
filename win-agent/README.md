@@ -284,6 +284,12 @@ $LASTEXITCODE
 Get-Content "$env:TEMP\TermLink-Setup-error.log" -Tail 80 -ErrorAction SilentlyContinue
 ```
 
+图形安装向导失败时也会把完整异常写入同一个日志，并在错误弹窗中显示日志路径。若日志中的
+错误为 `Attempted to perform an unauthorized operation`，请优先查看其后记录的具体堆栈和路径；
+0.1.4.0 起回滚清理不会再覆盖原始异常，Windows Terminal Fragment 写入失败会直接提示具体
+文件权限问题。登录启动项属于可选功能，若当前用户注册表策略拒绝写入，安装器会保留核心程序
+并跳过该项。
+
 如果错误提示 `TermLink Terminal Fragment 已存在但不属于本安装器`，请换一个空安装目录，或先备份并
 处理该用户自己的 `termlink.json`；安装器不会覆盖未知的 Windows Terminal Fragment。正式生产发布
 仍必须换用受信代码签名证书和 RFC 3161 时间戳。

@@ -211,6 +211,22 @@ git diff --check
 - `:app:testDebugUnitTest` 与 `:app:assembleDebug` 通过；本轮未关闭 Windows Terminal、
   Win-Agent 或现有 Shell。
 
+### 2026-08-06 Windows EXE 安装异常修复
+
+- 修复 `TermLink.Setup` 回滚路径：安装标记尚未写完整时，清理不会再对空路径调用
+  `Path.GetFullPath`；清理、回滚和临时目录删除均为 best-effort，不会覆盖原始安装异常。
+- WinForms 安装失败现在同样写入 `%TEMP%\TermLink-Setup-error.log`，并在弹窗中显示日志路径；
+  CLI 和 GUI 的错误诊断保持一致。
+- Windows Terminal Fragment 写入失败会显示具体文件路径和权限处理建议；登录启动项遇到当前
+  用户注册表策略拒绝时，安装仍可完成并明确跳过该可选项，不影响 Agent/SessionHost 使用。
+- `Validate-WindowsSetup.ps1` 真实执行自包含 payload、签名、安装、原地升级和卸载通过；未关闭
+  现有 Windows Terminal、Win-Agent 或 Shell。
+- 生成修复版 `win-agent/artifacts/TermLink-Setup-0.1.4.0.exe`，签名状态为 `Valid`，
+  SHA-256 为 `074d684d127640517c9749f6ad9af3a897167cc352bf0846d77a8afd55a5d2e8`；已发布到
+  AppShip `termlink-win64/stable`，版本 `0.1.4` / build `4`，release
+  `f0ccb36c-a7fc-4970-a22e-7ac51fed79c4`，artifact `5aa0e737-3f01-407e-9a40-872da1bf0c29`，
+  状态 `published`。
+
 1. 使用包含 `ea09519`、`203ea59` 和 `585d0db` 的 0.2 Windows 构建，在独立 Windows
    验收机上通过普通 `Add-AppxPackage` 持久安装；禁止使用 `ForceApplicationShutdown`，
    不关闭验收机或本机已有窗口；

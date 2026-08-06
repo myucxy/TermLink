@@ -138,7 +138,23 @@ namespace TermLink.Setup
             {
                 install.Enabled = true;
                 status.Text = "安装失败。";
-                MessageBox.Show(this, error.Message, "TermLink 安装失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                var errorLogPath = Path.Combine(Path.GetTempPath(), "TermLink-Setup-error.log");
+                try
+                {
+                    File.AppendAllText(
+                        errorLogPath,
+                        DateTime.UtcNow.ToString("O") + Environment.NewLine + error + Environment.NewLine);
+                }
+                catch
+                {
+                    // Error reporting must not mask the original installer failure.
+                }
+                MessageBox.Show(
+                    this,
+                    error.Message + Environment.NewLine + Environment.NewLine + "详细日志: " + errorLogPath,
+                    "TermLink 安装失败",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
             }
         }
 
