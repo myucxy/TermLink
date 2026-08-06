@@ -219,15 +219,20 @@ git diff --check
   CLI 和 GUI 的错误诊断保持一致。
 - Windows Terminal Fragment 写入失败会显示具体文件路径和权限处理建议；登录启动项遇到当前
   用户注册表策略拒绝时，安装仍可完成并明确跳过该可选项，不影响 Agent/SessionHost 使用。
-- `Validate-WindowsSetup.ps1` 真实执行自包含 payload、签名、安装、原地升级和卸载通过；未关闭
-  现有 Windows Terminal、Win-Agent 或 Shell。
-- 生成修复版 `win-agent/artifacts/TermLink-Setup-0.1.4.0.exe`，签名状态为 `Valid`，
-  SHA-256 为 `074d684d127640517c9749f6ad9af3a897167cc352bf0846d77a8afd55a5d2e8`；已发布到
-  AppShip `termlink-win64/stable`，版本 `0.1.4` / build `4`，release
-  `f0ccb36c-a7fc-4970-a22e-7ac51fed79c4`，artifact `5aa0e737-3f01-407e-9a40-872da1bf0c29`，
+- `Validate-WindowsSetup.ps1` 真实执行自包含 payload、签名、安装、原地升级、桌面/开始菜单快捷
+  方式创建与卸载通过；未关闭现有 Windows Terminal、Win-Agent 或 Shell。
+- Windows 修复版 `TermLink-Setup-0.1.5.0.exe` 签名状态为 `Valid`，SHA-256 为
+  `d691b4b63322f1c6acefe0eb4eae453a4cde040b74258787a240d593c1550f3a`；已发布到 AppShip
+  `termlink-win64/stable`，版本 `0.1.5` / build `5`，release
+  `aa286794-53ea-4a54-9ca9-161359840513`，artifact `0cea8d2f-1e0a-447e-a895-c6effd13d40e`，
   状态 `published`。
-- 公开更新接口验证通过：Windows build `3` 返回最新 `0.1.4` / `4`，build `4` 返回 `no_update`；
-  客户端不会自动下载或安装，也不会关闭现有 Terminal、Agent 或 Shell。
+- Android release APK 已使用 NuanYa 生产证书签名（V2 验证通过），SHA-256 为
+  `2ab2c3f6f24db0114a333c84991e4fbf87096cc33659ae89f89ff0c3ae71ab5b`；已发布到 AppShip
+  `termlink-android/stable`，版本 `0.1.5` / build `5`，release
+  `28847936-c656-4827-981b-ebbd40f877e0`，artifact `bafc7637-6764-47b7-8ff9-5bc13d7a668a`，
+  状态 `published`。
+- 两端公开更新接口均验证返回最新 build `5`；传入 build `5` 返回 `no_update`。客户端不会
+  自动下载或安装，也不会关闭现有 Terminal、Agent 或 Shell。
 
 1. 使用包含 `ea09519`、`203ea59` 和 `585d0db` 的 0.2 Windows 构建，在独立 Windows
    验收机上通过普通 `Add-AppxPackage` 持久安装；禁止使用 `ForceApplicationShutdown`，
