@@ -18,12 +18,14 @@ param(
     [Alias('Development')]
     [switch]$DevelopmentTrust,
     [switch]$ConfirmDevelopmentTrust,
+    [switch]$ConfirmLifecycleMutation,
     [switch]$Preflight,
     [string]$EvidencePath = (Join-Path $PSScriptRoot '..\..\docs\validation\item7-windows-msix-lifecycle.json')
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if ($ConfirmLifecycleMutation) { $ConfirmPreference = 'None' }
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -147,16 +149,15 @@ function Assert-NoPackageCollision {
 }
 
 function Get-PlatformState {
+    if ($PSVersionTable.PSEdition -ne 'Desktop') {
+        throw "Run this AppX lifecycle test with Windows PowerShell 5.1: $env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+    }
     $appxCommands = @(
         'Get-AppxPackage',
         'Add-AppxPackage',
         'Remove-AppxPackage',
         'Invoke-CommandInDesktopPackage'
     )
-    if ($PSVersionTable.PSEdition -eq 'Core' -and
-        $null -eq (Get-Command -Name 'Get-AppxPackage' -ErrorAction SilentlyContinue)) {
-        Import-Module Appx -UseWindowsPowerShell -ErrorAction Stop -WarningAction SilentlyContinue
-    }
     foreach ($command in $appxCommands) {
         Assert-True ($null -ne (Get-Command -Name $command -ErrorAction SilentlyContinue)) `
             "Required AppX command is unavailable: $command"
@@ -313,6 +314,78 @@ function Assert-StartupDeclaration {
     return $true
 }
 
+function Assert-TerminalIntegration {
+    param(
+        [Parameter(Mandatory)]$Package,
+        [switch]$RequireRegisteredAlias
+    )
+    $manifestPath = Join-Path $Package.InstallLocation 'AppxManifest.xml'
+    Assert-True (Test-Path -LiteralPath $manifestPath -PathType Leaf) 'Installed AppX manifest is missing.'
+    $manifest = [Xml.XmlDocument]::new()
+    $manifest.XmlResolver = $null
+    $manifest.Load($manifestPath)
+    $namespaces = [Xml.XmlNamespaceManager]::new($manifest.NameTable)
+    $namespaces.AddNamespace('f', 'http://schemas.microsoft.com/appx/manifest/foundation/windows10')
+    $namespaces.AddNamespace('uap3', 'http://schemas.microsoft.com/appx/manifest/uap/windows10/3')
+    $namespaces.AddNamespace('desktop', 'http://schemas.microsoft.com/appx/manifest/desktop/windows10')
+
+    $aliasExtension = $manifest.SelectSingleNode(
+        "/f:Package/f:Applications/f:Application/f:Extensions/uap3:Extension[@Category='windows.appExecutionAlias']",
+        $namespaces)
+    Assert-True ($null -ne $aliasExtension -and
+        $aliasExtension.GetAttribute('Executable') -eq 'TermLink.SessionHost.exe') `
+        'Installed package does not map its execution alias to SessionHost.'
+    $executionAlias = $aliasExtension.SelectSingleNode(
+        'uap3:AppExecutionAlias/desktop:ExecutionAlias', $namespaces)
+    Assert-True ($null -ne $executionAlias -and
+        $executionAlias.GetAttribute('Alias') -eq 'termlink-session.exe') `
+        'Installed package does not register the stable SessionHost alias.'
+
+    $terminalExtension = $manifest.SelectSingleNode(
+        "/f:Package/f:Applications/f:Application/f:Extensions/uap3:Extension[@Category='windows.appExtension']/uap3:AppExtension[@Name='com.microsoft.windows.terminal.settings']",
+        $namespaces)
+    Assert-True ($null -ne $terminalExtension -and
+        $terminalExtension.GetAttribute('Id') -eq 'TermLink' -and
+        $terminalExtension.GetAttribute('PublicFolder') -eq 'Terminal') `
+        'Installed package does not expose the TermLink Windows Terminal settings extension.'
+
+    $fragmentPath = Join-Path $Package.InstallLocation 'Terminal\Fragments\termlink.json'
+    Assert-True (Test-Path -LiteralPath $fragmentPath -PathType Leaf) `
+        'Installed package is missing its Windows Terminal profile fragment.'
+    $fragment = Get-Content -Raw -LiteralPath $fragmentPath | ConvertFrom-Json
+    $profiles = @($fragment.profiles)
+    $expectedGuids = @(
+        '{cb3ce4a8-86da-5aa1-a77d-abe62f8b55b2}',
+        '{b2025574-4cc8-5264-b577-7c6532eff95a}',
+        '{7cf2d180-c8be-5b08-99a0-268bd2dc1d6f}',
+        '{f5652f1d-a6da-5199-b595-3a1255ce04b4}'
+    )
+    Assert-True ($profiles.Count -eq $expectedGuids.Count) `
+        'Installed package has an unexpected Windows Terminal profile count.'
+    foreach ($profile in $profiles) {
+        Assert-True ($expectedGuids -ccontains [string]$profile.guid) `
+            "Installed package contains an unexpected Windows Terminal profile: $($profile.guid)"
+        Assert-True ([string]$profile.commandline -cmatch '^termlink-session\.exe ') `
+            "Installed Windows Terminal profile bypasses the SessionHost alias: $($profile.guid)"
+        Assert-True (-not ([string]$profile.commandline).Contains(':\')) `
+            "Installed Windows Terminal profile contains a machine-specific path: $($profile.guid)"
+    }
+
+    $aliasPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) `
+        'Microsoft\WindowsApps\termlink-session.exe'
+    if ($RequireRegisteredAlias) {
+        Assert-True (Test-Path -LiteralPath $aliasPath -PathType Leaf) `
+            'Windows did not register the packaged SessionHost execution alias.'
+    }
+    return [pscustomobject]@{
+        Alias = 'termlink-session.exe'
+        AliasRegistered = (Test-Path -LiteralPath $aliasPath -PathType Leaf)
+        ProfileCount = $profiles.Count
+        ProfileGuids = $expectedGuids
+        FragmentPath = $fragmentPath
+    }
+}
+
 function Find-PackagedProcesses {
     param([Parameter(Mandatory)][string]$InstallLocation)
     $root = [IO.Path]::GetFullPath($InstallLocation).TrimEnd('\') + '\'
@@ -414,6 +487,168 @@ function Invoke-TrayHealth {
         }
         else { $null }
         AgentPathPresent = (Test-Path -LiteralPath $agentPath -PathType Leaf)
+    }
+}
+
+function Invoke-TerminalAliasHealth {
+    param(
+        [Parameter(Mandatory)]$Package,
+        [Parameter(Mandatory)][string]$StatusRoot
+    )
+    $aliasPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) `
+        'Microsoft\WindowsApps\termlink-session.exe'
+    Assert-True (Test-Path -LiteralPath $aliasPath -PathType Leaf) `
+        'The installed SessionHost execution alias is unavailable for a runtime probe.'
+
+    $expectedHostPath = Join-Path $Package.InstallLocation 'TermLink.SessionHost.exe'
+    Assert-True (Test-Path -LiteralPath $expectedHostPath -PathType Leaf) `
+        'The installed SessionHost executable is missing.'
+    $trayPath = Join-Path $Package.InstallLocation 'TermLink.Tray.exe'
+    Assert-True (Test-Path -LiteralPath $trayPath -PathType Leaf) `
+        'The installed Tray executable is missing.'
+
+    $probeId = [guid]::NewGuid().ToString('N')
+    $controlPipeName = "termlink-msix-alias-$probeId"
+    $bufferRoot = Join-Path $StatusRoot "alias-buffer-$probeId"
+    [IO.Directory]::CreateDirectory($bufferRoot) | Out-Null
+    $bootstrapStatusPath = Join-Path $StatusRoot "alias-bootstrap-$probeId.json"
+    [void](Invoke-InPackageContext -Package $Package -Command $trayPath -Arguments @(
+        '--control-pipe', $controlPipeName,
+        '--buffer-root', $bufferRoot,
+        '--status-json', $bootstrapStatusPath))
+    $bootstrapDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    while (-not (Test-Path -LiteralPath $bootstrapStatusPath -PathType Leaf) -and
+        [DateTime]::UtcNow -lt $bootstrapDeadline) {
+        Start-Sleep -Milliseconds 200
+    }
+    Assert-True (Test-Path -LiteralPath $bootstrapStatusPath -PathType Leaf) `
+        'The isolated packaged Agent did not write its bootstrap status.'
+    $bootstrapStatus = Get-Content -Raw -LiteralPath $bootstrapStatusPath | ConvertFrom-Json
+    Assert-True ([bool]$bootstrapStatus.Success -and [bool]$bootstrapStatus.RemoteAccessEnabled) `
+        'The isolated packaged Agent was not healthy before the SessionHost alias probe.'
+
+    # Use a bounded child command and redirected standard handles so this probe
+    # exercises the same packaged SessionHost alias without opening or closing
+    # any of the user's Windows Terminal windows.
+    $marker = '__TERMLINK_MSIX_ALIAS_RUNTIME__'
+    $childCommand = "cmd.exe /d /q /c `"echo $marker& set /p TERMLINK_ALIAS_PROBE=& exit /b 23`""
+    $encodedChildCommand = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($childCommand))
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $aliasPath
+    $start.Arguments = "--command-base64 $encodedChildCommand --managed-shell command-prompt --registry-pipe $controlPipeName --timeout-ms 30000 --diagnostics"
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    $session = @()
+    $actualHostPath = $null
+    $standardOutput = ''
+    $standardError = ''
+    try {
+        Assert-True $process.Start() 'The installed SessionHost execution alias did not start.'
+        $actualHostPath = [Diagnostics.Process]::GetProcessById($process.Id).MainModule.FileName
+        Assert-True ([string]::Equals(
+            [IO.Path]::GetFullPath($actualHostPath),
+            [IO.Path]::GetFullPath($expectedHostPath),
+            [StringComparison]::OrdinalIgnoreCase)) `
+            'The execution alias did not resolve to the installed SessionHost executable.'
+
+        $registrationDeadline = [DateTime]::UtcNow.AddSeconds(10)
+        $attempt = 0
+        do {
+            $attempt++
+            $statusPath = Join-Path $StatusRoot ("alias-status-{0}.json" -f $attempt)
+            Remove-Item -LiteralPath $statusPath -Force -ErrorAction SilentlyContinue
+            [void](Invoke-InPackageContext -Package $Package -Command $trayPath `
+                -Arguments @(
+                    '--control-pipe', $controlPipeName,
+                    '--buffer-root', $bufferRoot,
+                    '--status-json', $statusPath))
+            $statusWriteDeadline = [DateTime]::UtcNow.AddSeconds(5)
+            while (-not (Test-Path -LiteralPath $statusPath -PathType Leaf) -and
+                -not $process.HasExited -and [DateTime]::UtcNow -lt $statusWriteDeadline) {
+                Start-Sleep -Milliseconds 100
+            }
+            if (Test-Path -LiteralPath $statusPath -PathType Leaf) {
+                $status = Get-Content -Raw -LiteralPath $statusPath | ConvertFrom-Json
+                Assert-True ([bool]$status.Success) `
+                    'The packaged Agent became unhealthy during the SessionHost alias probe.'
+                $session = @($status.Summaries | Where-Object {
+                    [int]$_.HostProcessId -eq $process.Id
+                } | Select-Object -First 1)
+            }
+            if ($session.Count -eq 0) { Start-Sleep -Milliseconds 150 }
+        } while ($session.Count -eq 0 -and -not $process.HasExited -and
+            [DateTime]::UtcNow -lt $registrationDeadline)
+        if ($session.Count -ne 1) {
+            if (-not $process.HasExited) {
+                try {
+                    $process.StandardInput.WriteLine('abort')
+                    $process.StandardInput.Flush()
+                    $process.StandardInput.Close()
+                    [void]$process.WaitForExit(5000)
+                }
+                catch { }
+            }
+            if ($process.HasExited) {
+                $standardError = $process.StandardError.ReadToEnd()
+            }
+            $registryDiagnostics = @($standardError -split "`r?`n" | Where-Object {
+                $_.StartsWith('__AGENT_REGISTRY_RESULT__:', [StringComparison]::Ordinal)
+            } | Select-Object -Unique)
+            $detail = " SessionHost exit=" + (
+                $(if ($process.HasExited) { $process.ExitCode } else { 'running' })) +
+                "; registry=" + $(if ($registryDiagnostics.Count -gt 0) {
+                    $registryDiagnostics -join ','
+                }
+                else { 'no diagnostic' }) + '.'
+            throw "The packaged SessionHost alias did not register its managed Shell with the Agent.$detail"
+        }
+
+        $process.StandardInput.WriteLine('continue')
+        $process.StandardInput.Flush()
+        $process.StandardInput.Close()
+        Assert-True $process.WaitForExit(20000) `
+            'The bounded SessionHost alias runtime probe did not exit naturally.'
+        $standardOutput = $process.StandardOutput.ReadToEnd()
+        $standardError = $process.StandardError.ReadToEnd()
+        Assert-True ($process.ExitCode -eq 23) `
+            "The installed SessionHost alias returned unexpected exit code $($process.ExitCode)."
+        Assert-True ($standardOutput.Contains($marker)) `
+            'The installed SessionHost alias did not bridge the child Shell output.'
+
+        return [pscustomobject]@{
+            AliasStarted = $true
+            HostPathMatchesPackage = $true
+            SessionRegistered = $true
+            SessionId = [string]$session[0].SessionId
+            ShellType = [string]$session[0].ShellType
+            OutputMarkerObserved = $true
+            ExitCode = $process.ExitCode
+            OpenedWindowsTerminalWindow = $false
+        }
+    }
+    finally {
+        if ($null -ne $process) {
+            try {
+                if (-not $process.HasExited) { $process.Kill() }
+            }
+            catch { }
+            $process.Dispose()
+        }
+        try {
+            [void](Invoke-InPackageContext -Package $Package -Command $trayPath -Arguments @(
+                '--control-pipe', $controlPipeName,
+                '--buffer-root', $bufferRoot,
+                '--shutdown-agent'))
+        }
+        catch { }
+        $standardOutput = $null
+        $standardError = $null
     }
 }
 
@@ -520,7 +755,10 @@ function Write-Evidence {
     [IO.Directory]::CreateDirectory($directory) | Out-Null
     $temporary = "$resolved.tmp-$([guid]::NewGuid().ToString('N'))"
     try {
-        $Evidence | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporary -Encoding utf8
+        [IO.File]::WriteAllText(
+            $temporary,
+            ($Evidence | ConvertTo-Json -Depth 8) + [Environment]::NewLine,
+            [Text.UTF8Encoding]::new($false))
         Move-Item -LiteralPath $temporary -Destination $resolved -Force
     }
     finally {
@@ -554,6 +792,14 @@ $healthChecks = [ordered]@{
 }
 $currentSignatureStatus = $null
 $targetSignatureStatus = $null
+$terminalAliasPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) `
+    'Microsoft\WindowsApps\termlink-session.exe'
+$initialTerminal = $null
+$upgradedTerminal = $null
+$downgradedTerminal = $null
+$initialAliasRuntime = $null
+$upgradedAliasRuntime = $null
+$downgradedAliasRuntime = $null
 
 try {
     Assert-True (-not [string]::IsNullOrWhiteSpace($Publisher)) 'Publisher is required.'
@@ -608,6 +854,8 @@ try {
     # This check is deliberately before certificate import, package build, or
     # Add-AppxPackage so an existing user's registration is never touched.
     Assert-NoPackageCollision -IdentityName $PackageIdentityName -ExpectedPublisher $Publisher
+    Assert-True (-not (Test-Path -LiteralPath $terminalAliasPath -PathType Leaf)) `
+        "Refusing to replace an existing Windows app execution alias: $terminalAliasPath"
 
     if ($preflightOnly) {
         [pscustomobject]@{
@@ -623,6 +871,7 @@ try {
             DeveloperModeEnabled = $platform.DeveloperModeEnabled
             IsElevated = $platform.IsElevated
             PackageCollision = $false
+            ExecutionAliasCollision = $false
             AppxStateMutated = $false
             CertificateStoreMutated = $false
             DevelopmentTrustStore = if ($development) { 'LocalMachine/TrustedPeople' } else { $null }
@@ -721,9 +970,11 @@ try {
     $installedByRun = $true
     $installed = Assert-InstalledVersion -IdentityName $PackageIdentityName -ExpectedPublisher $Publisher -ExpectedVersion $currentVersion
     $initialStartup = Assert-StartupDeclaration -Package $installed
+    $initialTerminal = Assert-TerminalIntegration -Package $installed -RequireRegisteredAlias
     $initialStatus = Invoke-TrayHealth -Package $installed -TrackedProcesses $trackedProcesses `
         -StatusPath (Join-Path $workRoot 'initial-status.json')
     $healthChecks.initial = $initialStatus.StatusSucceeded
+    $initialAliasRuntime = Invoke-TerminalAliasHealth -Package $installed -StatusRoot $workRoot
 
     $cacheRoot = Join-Path $workRoot 'updater-cache'
     [IO.Directory]::CreateDirectory($cacheRoot) | Out-Null
@@ -736,9 +987,11 @@ try {
     $upgraded = Assert-InstalledVersion -IdentityName $PackageIdentityName -ExpectedPublisher $Publisher -ExpectedVersion $targetVersion
     $upgradedByRun = $true
     $upgradedStartup = Assert-StartupDeclaration -Package $upgraded
+    $upgradedTerminal = Assert-TerminalIntegration -Package $upgraded -RequireRegisteredAlias
     $upgradedStatus = Invoke-TrayHealth -Package $upgraded -TrackedProcesses $trackedProcesses `
         -StatusPath (Join-Path $workRoot 'upgraded-status.json')
     $healthChecks.upgraded = $upgradedStatus.StatusSucceeded
+    $upgradedAliasRuntime = Invoke-TerminalAliasHealth -Package $upgraded -StatusRoot $workRoot
 
     Stop-PackagedAgent -Package $upgraded
     if (-not $PSCmdlet.ShouldProcess("AppX package $PackageIdentityName", 'Downgrade to version 0.1.0.0 with ForceUpdateFromAnyVersion')) { return }
@@ -746,9 +999,11 @@ try {
     $downgraded = Assert-InstalledVersion -IdentityName $PackageIdentityName -ExpectedPublisher $Publisher -ExpectedVersion $currentVersion
     $downgradedByRun = $true
     $downgradedStartup = Assert-StartupDeclaration -Package $downgraded
+    $downgradedTerminal = Assert-TerminalIntegration -Package $downgraded -RequireRegisteredAlias
     $downgradedStatus = Invoke-TrayHealth -Package $downgraded -TrackedProcesses $trackedProcesses `
         -StatusPath (Join-Path $workRoot 'downgraded-status.json')
     $healthChecks.downgraded = $downgradedStatus.StatusSucceeded
+    $downgradedAliasRuntime = Invoke-TerminalAliasHealth -Package $downgraded -StatusRoot $workRoot
 
     Stop-PackagedAgent -Package $downgraded
     Stop-TrackedProcesses -TrackedProcesses $trackedProcesses
@@ -760,16 +1015,22 @@ try {
     $uninstalledByRun = $true
     Assert-True (@(Get-AppxPackage -Name $PackageIdentityName -ErrorAction SilentlyContinue).Count -eq 0) `
         'The validation package is still registered after Remove-AppxPackage.'
+    Assert-True (-not (Test-Path -LiteralPath $terminalAliasPath -PathType Leaf)) `
+        'The SessionHost execution alias remains after package removal.'
 
     $sourceFiles = @(
         'package\AppxManifest.xml',
         'package\Build-Msix.ps1',
+        'package\Terminal\Fragments\termlink.json',
         'package\New-UpdateManifest.ps1',
+        'src\AgentControl\AgentControl.cs',
+        'src\SessionHost\SessionHost.cs',
         'src\Updater\Program.cs',
         'src\Updater\UpdateManifest.cs',
         'src\Updater\UpdateTransaction.cs',
         'src\Updater\PowerShellMsixDeployment.cs',
         'src\Tray\Program.cs',
+        'tests\Invoke-DevelopmentMsixLifecycle.ps1',
         'tests\Validate-TrustedMsixLifecycle.ps1'
     )
     $sourceHashes = [ordered]@{}
@@ -815,6 +1076,22 @@ try {
             upgraded_declared = [bool]$upgradedStartup
             downgraded_declared = [bool]$downgradedStartup
             startup_task_enabled = $true
+        }
+        terminal_checks = [ordered]@{
+            execution_alias = 'termlink-session.exe'
+            initial_alias_registered = $initialTerminal.AliasRegistered
+            upgraded_alias_registered = $upgradedTerminal.AliasRegistered
+            downgraded_alias_registered = $downgradedTerminal.AliasRegistered
+            alias_removed_on_uninstall = $true
+            profile_count = $initialTerminal.ProfileCount
+            profile_guids = $initialTerminal.ProfileGuids
+            fragment_preserved_across_update = (
+                $initialTerminal.ProfileCount -eq $upgradedTerminal.ProfileCount -and
+                $upgradedTerminal.ProfileCount -eq $downgradedTerminal.ProfileCount)
+            alias_runtime_initial = $initialAliasRuntime
+            alias_runtime_upgraded = $upgradedAliasRuntime
+            alias_runtime_downgraded = $downgradedAliasRuntime
+            user_terminal_windows_opened_or_closed = $false
         }
         health_checks = $healthChecks
         target_msix_sha256 = $targetBuild[0].Sha256

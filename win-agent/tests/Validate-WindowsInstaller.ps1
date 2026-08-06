@@ -126,6 +126,7 @@ try {
     $installedManifest.Load($installedManifestPath)
     $namespaces = [Xml.XmlNamespaceManager]::new($installedManifest.NameTable)
     $namespaces.AddNamespace('f', 'http://schemas.microsoft.com/appx/manifest/foundation/windows10')
+    $namespaces.AddNamespace('uap3', 'http://schemas.microsoft.com/appx/manifest/uap/windows10/3')
     $namespaces.AddNamespace('desktop', 'http://schemas.microsoft.com/appx/manifest/desktop/windows10')
     $identity = $installedManifest.SelectSingleNode('/f:Package/f:Identity', $namespaces)
     Assert-True ($identity.GetAttribute('Name') -eq $identityName) 'Packaged identity changed.'
@@ -138,6 +139,46 @@ try {
     Assert-True ($startup.GetAttribute('Enabled') -eq 'true') 'Startup task is not enabled by default.'
     Assert-True ($startup.ParentNode.GetAttribute('Executable') -eq 'TermLink.Tray.exe') `
         'Startup task does not launch the Tray.'
+    $aliasExtension = $installedManifest.SelectSingleNode(
+        "/f:Package/f:Applications/f:Application/f:Extensions/uap3:Extension[@Category='windows.appExecutionAlias']",
+        $namespaces)
+    Assert-True ($null -ne $aliasExtension) 'Installed package does not declare a SessionHost execution alias.'
+    Assert-True ($aliasExtension.GetAttribute('Executable') -eq 'TermLink.SessionHost.exe') `
+        'The execution alias does not launch the packaged SessionHost.'
+    $executionAlias = $aliasExtension.SelectSingleNode(
+        'uap3:AppExecutionAlias/desktop:ExecutionAlias', $namespaces)
+    Assert-True ($null -ne $executionAlias -and
+        $executionAlias.GetAttribute('Alias') -eq 'termlink-session.exe') `
+        'The stable SessionHost execution alias changed.'
+    $terminalExtension = $installedManifest.SelectSingleNode(
+        "/f:Package/f:Applications/f:Application/f:Extensions/uap3:Extension[@Category='windows.appExtension']/uap3:AppExtension[@Name='com.microsoft.windows.terminal.settings']",
+        $namespaces)
+    Assert-True ($null -ne $terminalExtension) `
+        'Installed package does not declare the Windows Terminal settings extension.'
+    Assert-True ($terminalExtension.GetAttribute('Id') -eq 'TermLink' -and
+        $terminalExtension.GetAttribute('PublicFolder') -eq 'Terminal') `
+        'The Windows Terminal settings extension identity or public folder changed.'
+    $terminalFragmentPath = Join-Path $installLocation 'Terminal\Fragments\termlink.json'
+    Assert-True (Test-Path -LiteralPath $terminalFragmentPath -PathType Leaf) `
+        'Installed package does not contain the Windows Terminal fragment.'
+    $terminalFragment = Get-Content -Raw -LiteralPath $terminalFragmentPath | ConvertFrom-Json
+    $terminalProfiles = @($terminalFragment.profiles)
+    $expectedProfileGuids = @(
+        '{cb3ce4a8-86da-5aa1-a77d-abe62f8b55b2}',
+        '{b2025574-4cc8-5264-b577-7c6532eff95a}',
+        '{7cf2d180-c8be-5b08-99a0-268bd2dc1d6f}',
+        '{f5652f1d-a6da-5199-b595-3a1255ce04b4}'
+    )
+    Assert-True ($terminalProfiles.Count -eq $expectedProfileGuids.Count) `
+        'Installed package has an unexpected Windows Terminal profile count.'
+    foreach ($profile in $terminalProfiles) {
+        Assert-True ($expectedProfileGuids -ccontains [string]$profile.guid) `
+            "Installed package contains an unexpected Windows Terminal profile: $($profile.guid)"
+        Assert-True ([string]$profile.commandline -cmatch '^termlink-session\.exe ') `
+            "Windows Terminal profile bypasses the packaged SessionHost alias: $($profile.guid)"
+        Assert-True (-not ([string]$profile.commandline).Contains(':\')) `
+            "Windows Terminal profile contains a machine-specific absolute path: $($profile.guid)"
+    }
     Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'coreclr.dll') -PathType Leaf) `
         'Installed package is not self-contained.'
     Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'TermLink.Updater.exe') -PathType Leaf) `
@@ -206,12 +247,15 @@ try {
     Write-Output 'STEP=tray_started'
 
     $secondTrayLaunch = Start-Process -FilePath $installedTray -PassThru
-    Start-Sleep -Seconds 2
-    $trayProcesses = @(Find-PackagedProcesses -Name 'TermLink.Tray' -InstallLocation $installLocation `
-        -ExcludedIds $beforeTrayIds)
+    $singleInstanceDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        Start-Sleep -Milliseconds 100
+        $secondTrayLaunch.Refresh()
+        $trayProcesses = @(Find-PackagedProcesses -Name 'TermLink.Tray' -InstallLocation $installLocation `
+            -ExcludedIds $beforeTrayIds)
+    } while (-not $secondTrayLaunch.HasExited -and [DateTime]::UtcNow -lt $singleInstanceDeadline)
     $validationProcessIds += @($trayProcesses | Select-Object -ExpandProperty Id)
     Assert-True ($trayProcesses.Count -eq 1) 'Tray current-user single-instance protection failed.'
-    $secondTrayLaunch.Refresh()
     Assert-True $secondTrayLaunch.HasExited 'The second Tray process did not exit after single-instance detection.'
     Write-Output 'STEP=tray_single_instance'
 
@@ -243,6 +287,9 @@ try {
     $sourceFiles = @(
         'package\AppxManifest.xml',
         'package\Build-Msix.ps1',
+        'package\Terminal\Fragments\termlink.json',
+        'src\AgentControl\AgentControl.cs',
+        'src\SessionHost\SessionHost.cs',
         'src\Updater\Program.cs',
         'src\Tray\Program.cs',
         'tests\Validate-WindowsInstaller.ps1'
@@ -256,7 +303,7 @@ try {
         schema = 'termlink.phase1-windows-installer-validation'
         version = 1
         generated_at_utc = [DateTime]::UtcNow.ToString('o')
-        classification = 'signed development MSIX, unpacked payload, startup declaration, and updater payload; not trusted production install or real update deployment'
+        classification = 'signed development MSIX, unpacked payload, startup and Windows Terminal declarations, and updater payload; not trusted production install or real update deployment'
         passed = $true
         package_identity = $identityName
         package_version = $packageVersion
@@ -273,6 +320,9 @@ try {
         startup_task_id = 'TermLinkTrayStartup'
         startup_task_enabled_by_default = $true
         startup_task_executable = 'TermLink.Tray.exe'
+        terminal_execution_alias = 'termlink-session.exe'
+        terminal_profile_count = $terminalProfiles.Count
+        terminal_profile_guids = $expectedProfileGuids
         current_user_uninstall = 'not applicable: package was not registered'
         system_certificate_store_unchanged = $true
         msix_sha256 = (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash.ToLowerInvariant()

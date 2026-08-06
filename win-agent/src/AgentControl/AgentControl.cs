@@ -264,21 +264,21 @@ namespace TermLink.Agent
         {
             var normalized = (permission ?? string.Empty).Trim().ToUpperInvariant();
             if (normalized != "VIEW" && normalized != "CONTROL" && normalized != "MANAGE")
-                throw new ArgumentException("A supported permission is required.", nameof(permission));
+                throw new ArgumentException("A supported permission is required.", "permission");
             return normalized;
         }
 
         public static string GrantsPath(Guid pcId)
         {
-            if (pcId == Guid.Empty) throw new ArgumentException("A PC is required.", nameof(pcId));
+            if (pcId == Guid.Empty) throw new ArgumentException("A PC is required.", "pcId");
             return "/v1/pcs/" + pcId.ToString("D") + "/grants";
         }
 
         public static string IdempotencyKey(Guid pcId, Guid deviceId, string permission, Guid operationId)
         {
-            if (pcId == Guid.Empty) throw new ArgumentException("A PC is required.", nameof(pcId));
-            if (deviceId == Guid.Empty) throw new ArgumentException("A device is required.", nameof(deviceId));
-            if (operationId == Guid.Empty) throw new ArgumentException("An operation is required.", nameof(operationId));
+            if (pcId == Guid.Empty) throw new ArgumentException("A PC is required.", "pcId");
+            if (deviceId == Guid.Empty) throw new ArgumentException("A device is required.", "deviceId");
+            if (operationId == Guid.Empty) throw new ArgumentException("An operation is required.", "operationId");
             return "pc-grant-" + pcId.ToString("N") + "-" + deviceId.ToString("N") + "-" +
                 NormalizePermission(permission).ToLowerInvariant() + "-" + operationId.ToString("N");
         }

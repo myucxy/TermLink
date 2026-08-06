@@ -1,8 +1,8 @@
 {
   "schema": "termlink.phase1-windows-installer-validation",
   "version": 1,
-  "generated_at_utc": "2026-08-03T21:14:48.6712421Z",
-  "classification": "signed development MSIX, unpacked payload, startup declaration, and updater payload; not trusted production install or real update deployment",
+  "generated_at_utc": "2026-08-06T01:41:38.5729419Z",
+  "classification": "signed development MSIX, unpacked payload, startup and Windows Terminal declarations, and updater payload; not trusted production install or real update deployment",
   "passed": true,
   "package_identity": "TermLink.Terminal.Validation",
   "package_version": "0.1.0.0",
@@ -19,14 +19,25 @@
   "startup_task_id": "TermLinkTrayStartup",
   "startup_task_enabled_by_default": true,
   "startup_task_executable": "TermLink.Tray.exe",
+  "terminal_execution_alias": "termlink-session.exe",
+  "terminal_profile_count": 4,
+  "terminal_profile_guids": [
+    "{cb3ce4a8-86da-5aa1-a77d-abe62f8b55b2}",
+    "{b2025574-4cc8-5264-b577-7c6532eff95a}",
+    "{7cf2d180-c8be-5b08-99a0-268bd2dc1d6f}",
+    "{f5652f1d-a6da-5199-b595-3a1255ce04b4}"
+  ],
   "current_user_uninstall": "not applicable: package was not registered",
   "system_certificate_store_unchanged": true,
-  "msix_sha256": "19d52759b79c00f27b593378631293ea70d79d0fb1e6383d5b783908a3f62ddf",
+  "msix_sha256": "37a714e8d5cbb269cb8d183b9ade5fa78f0c15b263c1f92058987bbc4a01265e",
   "source_sha256": {
-    "package/AppxManifest.xml": "bc8acca26e6d6d6d5b5829ebc9afe6ebd013bdbf6e4b9ec13bee304cf49616af",
-    "package/Build-Msix.ps1": "96119d21f723e9dff58930481fd91110a8e566f277a04d4580d926706672251f",
+    "package/AppxManifest.xml": "dacd3a6e15c5246e3ba93d9fd38478c28b956082c5882791b4754d8b59a1bb67",
+    "package/Build-Msix.ps1": "59ffdbf0e1eff4be244b0ff9bd73c53c2c17f2946fd783767d18ab7e9434bdf6",
+    "package/Terminal/Fragments/termlink.json": "7854d6e42807f775dba27d9935b6ae15601430b8fe36431c6d6721cd47337c73",
+    "src/AgentControl/AgentControl.cs": "ffac8a68645b68645c8b347cdc0204a3480b3c4e5671aa639b20ffee8bc913c4",
+    "src/SessionHost/SessionHost.cs": "e7ac44b3e1db500b27ac394070835d721756714a5406296f8dff67d5e1bd1e43",
     "src/Updater/Program.cs": "b29db35e5a66f35e753beaa3e9ab88181c12a2f56287c124ac841aefd756911f",
-    "src/Tray/Program.cs": "b3aec64b8e26e6ad6fc525c577b929b132785c8580d225f3e0e06d352107542b",
-    "tests/Validate-WindowsInstaller.ps1": "ec471a539fc48f6b616cbd0aef40eeab94c88b5b414d0ffc073102ac1d43e584"
+    "src/Tray/Program.cs": "2f1957af83028635619a0ee57336e5d0754c9e5109de3be5c5398afb00849578",
+    "tests/Validate-WindowsInstaller.ps1": "d5905de540f82dbef6d4296b99db504ecb70a0bfeacf3b201e4b90da4791f81c"
   }
 }

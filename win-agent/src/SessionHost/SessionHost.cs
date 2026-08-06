@@ -344,7 +344,11 @@ namespace TermLink.SessionHost
                             options.HandshakeToken,
                             Process.GetCurrentProcess().Id,
                             options.ShellType),
-                        () => agentPipe != null && agentPipe.IsConnected);
+                        () => agentPipe != null && agentPipe.IsConnected,
+                        options.Diagnostics
+                            ? (Action<string>)(message => Console.Error.WriteLine(
+                                "__AGENT_REGISTRY_RESULT__:" + message))
+                            : null);
                     agentRegistration.Start();
                 }
             }
@@ -1234,6 +1238,7 @@ namespace TermLink.SessionHost
         private readonly string controlPipeName;
         private readonly SessionRegistration registration;
         private readonly Func<bool> isAgentConnected;
+        private readonly Action<string> diagnostic;
         private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
         private Task worker;
         private bool disposed;
@@ -1241,7 +1246,8 @@ namespace TermLink.SessionHost
         public AgentRegistryRegistration(
             string controlPipeName,
             SessionRegistration registration,
-            Func<bool> isAgentConnected)
+            Func<bool> isAgentConnected,
+            Action<string> diagnostic)
         {
             if (controlPipeName == null) throw new ArgumentNullException("controlPipeName");
             if (registration == null) throw new ArgumentNullException("registration");
@@ -1249,6 +1255,7 @@ namespace TermLink.SessionHost
             this.controlPipeName = controlPipeName;
             this.registration = registration;
             this.isAgentConnected = isAgentConnected;
+            this.diagnostic = diagnostic;
         }
 
         public void Start()
@@ -1279,16 +1286,27 @@ namespace TermLink.SessionHost
                         // has acknowledged that permanent decision. Global
                         // REMOTE_ACCESS_DISABLED remains retryable because an
                         // explicit Enable is expected to restore all Sessions.
+                        if (diagnostic != null)
+                        {
+                            diagnostic(response.Success
+                                ? "registered"
+                                : "response=" + (response.Code ?? "none"));
+                        }
                         if (!response.Success && response.Code == "SESSION_STOPPED") return;
                     }
-                    catch (ArgumentException) { }
-                    catch (InvalidDataException) { }
-                    catch (IOException) { }
-                    catch (TimeoutException) { }
-                    catch (UnauthorizedAccessException) { }
+                    catch (ArgumentException) { ReportException("ArgumentException"); }
+                    catch (InvalidDataException) { ReportException("InvalidDataException"); }
+                    catch (IOException) { ReportException("IOException"); }
+                    catch (TimeoutException) { ReportException("TimeoutException"); }
+                    catch (UnauthorizedAccessException) { ReportException("UnauthorizedAccessException"); }
                 }
                 if (cancellation.Token.WaitHandle.WaitOne(500)) return;
             }
+        }
+
+        private void ReportException(string exceptionType)
+        {
+            if (diagnostic != null) diagnostic("exception=" + exceptionType);
         }
 
         public void Dispose()

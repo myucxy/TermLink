@@ -63,8 +63,18 @@ function Confirm-EmbeddedSignature {
         [Parameter(Mandatory)][string]$Path,
         [switch]$AllowDevelopmentRoot
     )
-    $output = @(& $SignToolPath verify /pa /all $Path 2>&1)
-    $exitCode = $LASTEXITCODE
+    # Windows PowerShell 5.1 promotes native stderr to an ErrorRecord and,
+    # under the script-wide Stop preference, would abort before we can inspect
+    # the expected untrusted-root result for an ephemeral development signer.
+    $previousErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $SignToolPath verify /pa /all $Path 2>&1)
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorPreference
+    }
     if ($exitCode -eq 0) {
         $output | ForEach-Object { Write-Host $_ }
         return
@@ -206,6 +216,50 @@ try {
             Copy-Item -LiteralPath $source -Destination (Join-Path $assetRoot $assetName)
         }
 
+        # Windows Terminal discovers packaged profiles through the
+        # com.microsoft.windows.terminal.settings app extension. The fragment
+        # uses a stable AppExecutionAlias so it never embeds a workspace path
+        # or the versioned WindowsApps installation directory.
+        $terminalSourceRoot = Join-Path $PSScriptRoot 'Terminal'
+        Assert-True (Test-Path -LiteralPath $terminalSourceRoot -PathType Container) `
+            "Windows Terminal package assets are missing: $terminalSourceRoot"
+        Copy-Item -LiteralPath $terminalSourceRoot -Destination $layout -Recurse
+        $terminalFragmentPath = Join-Path $layout 'Terminal\Fragments\termlink.json'
+        Assert-True (Test-Path -LiteralPath $terminalFragmentPath -PathType Leaf) `
+            'The packaged Windows Terminal fragment is missing.'
+        $terminalFragment = Get-Content -Raw -LiteralPath $terminalFragmentPath | ConvertFrom-Json
+        $terminalProfiles = @($terminalFragment.profiles)
+        $expectedTerminalProfiles = @{
+            '{cb3ce4a8-86da-5aa1-a77d-abe62f8b55b2}' = @('TermLink CMD', 'command-prompt', 'cmd.exe')
+            '{b2025574-4cc8-5264-b577-7c6532eff95a}' = @('TermLink Windows PowerShell', 'windows-powershell', 'powershell.exe -NoLogo -NoProfile')
+            '{7cf2d180-c8be-5b08-99a0-268bd2dc1d6f}' = @('TermLink PowerShell 7', 'powershell-7', 'pwsh.exe -NoLogo -NoProfile')
+            '{f5652f1d-a6da-5199-b595-3a1255ce04b4}' = @('TermLink WSL', 'wsl', 'wsl.exe')
+        }
+        Assert-True ($terminalProfiles.Count -eq $expectedTerminalProfiles.Count) `
+            'The packaged Windows Terminal profile count changed.'
+        Assert-True (@($terminalProfiles.guid | Select-Object -Unique).Count -eq $terminalProfiles.Count) `
+            'The packaged Windows Terminal profile GUIDs are not unique.'
+        foreach ($profile in $terminalProfiles) {
+            $guid = [string]$profile.guid
+            Assert-True $expectedTerminalProfiles.ContainsKey($guid) `
+                "The packaged Windows Terminal profile GUID is not approved: $guid"
+            $expected = $expectedTerminalProfiles[$guid]
+            Assert-True ([string]$profile.name -ceq $expected[0]) `
+                "The packaged Windows Terminal profile name changed for $guid."
+            $commandLine = [string]$profile.commandline
+            $commandMatch = [regex]::Match(
+                $commandLine,
+                '^termlink-session\.exe --command-base64 ([A-Za-z0-9+/]+={0,2}) --managed-shell ([a-z0-9-]+)$')
+            Assert-True $commandMatch.Success `
+                "The packaged Windows Terminal profile does not use the stable SessionHost alias: $guid"
+            Assert-True ($commandMatch.Groups[2].Value -ceq $expected[1]) `
+                "The packaged managed-shell identity changed for $guid."
+            $childCommand = [Text.Encoding]::UTF8.GetString(
+                [Convert]::FromBase64String($commandMatch.Groups[1].Value))
+            Assert-True ($childCommand -ceq $expected[2]) `
+                "The packaged child command changed for $guid."
+        }
+
         $signArguments = @('sign', '/fd', 'SHA256', '/f', [IO.Path]::GetFullPath($CertificatePath), '/p', $plainPassword)
         if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) {
             $signArguments += @('/tr', $TimestampUrl, '/td', 'SHA256')
@@ -236,6 +290,8 @@ try {
             Publisher = $Publisher
             CertificateThumbprint = $certificate.Thumbprint
             SignedTermLinkBinaries = $ownedBinaries.Count
+            TerminalExecutionAlias = 'termlink-session.exe'
+            TerminalProfiles = $terminalProfiles.Count
             Sha256 = (Get-FileHash -LiteralPath $resolvedOutput -Algorithm SHA256).Hash.ToLowerInvariant()
         }
     }
