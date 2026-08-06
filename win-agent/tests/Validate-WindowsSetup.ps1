@@ -50,6 +50,14 @@ $setupPath = if ([string]::IsNullOrWhiteSpace($OutputSetupPath)) {
 $pfxPath = Join-Path $workRoot 'development-signing.pfx'
 $fragmentPath = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\Fragments\TermLink\termlink.json'
 $runKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$desktopDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+$startMenuDirectory = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::StartMenu)) 'Programs\TermLink'
+$desktopShortcutsBefore = @(Get-ChildItem -LiteralPath $desktopDirectory -Filter 'TermLink*.lnk' -File -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty FullName)
+$startMenuShortcutsBefore = @(if (Test-Path -LiteralPath $startMenuDirectory) {
+    Get-ChildItem -LiteralPath $startMenuDirectory -Filter 'TermLink*.lnk' -File -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty FullName
+})
 $fragmentExisted = Test-Path -LiteralPath $fragmentPath -PathType Leaf
 $fragmentBytes = if ($fragmentExisted) { [IO.File]::ReadAllBytes($fragmentPath) } else { $null }
 $runKey = Get-ItemProperty -LiteralPath $runKeyPath -ErrorAction SilentlyContinue
@@ -137,6 +145,19 @@ try {
                 $expectedHostPrefix, [StringComparison]::OrdinalIgnoreCase)) `
             "Terminal profile does not use the selected installation directory: $($profile.guid)"
     }
+    $desktopShortcuts = @(Get-ChildItem -LiteralPath $desktopDirectory -Filter 'TermLink*.lnk' -File |
+        Where-Object { $_.FullName -notin $desktopShortcutsBefore })
+    $startMenuShortcuts = @(Get-ChildItem -LiteralPath $startMenuDirectory -Filter 'TermLink*.lnk' -File |
+        Where-Object { $_.FullName -notin $startMenuShortcutsBefore })
+    Assert-True ($desktopShortcuts.Count -eq 1) 'The setup did not create exactly one desktop shortcut.'
+    Assert-True ($startMenuShortcuts.Count -eq 1) 'The setup did not create exactly one Start menu shortcut.'
+    $shortcutShell = New-Object -ComObject WScript.Shell
+    foreach ($shortcut in @($desktopShortcuts[0], $startMenuShortcuts[0])) {
+        $shortcutTarget = $shortcutShell.CreateShortcut($shortcut.FullName).TargetPath
+        Assert-True ([string]::Equals($shortcutTarget, (Join-Path $installRoot 'TermLink.Tray.exe'),
+                [StringComparison]::OrdinalIgnoreCase)) `
+            "Shortcut target is incorrect: $($shortcut.FullName)"
+    }
     $afterRun = Get-ItemProperty -LiteralPath $runKeyPath -ErrorAction SilentlyContinue
     $afterRunValue = if ($null -ne $afterRun -and $null -ne $afterRun.PSObject.Properties['TermLink']) {
         [string]$afterRun.TermLink
@@ -150,6 +171,10 @@ try {
     $installed = $false
     Assert-True (-not (Test-Path -LiteralPath $installRoot)) 'The setup uninstall left the install directory behind.'
     Assert-True (-not (Test-Path -LiteralPath $fragmentPath)) 'The setup uninstall left its generated Terminal fragment behind.'
+    foreach ($shortcut in @($desktopShortcuts[0], $startMenuShortcuts[0])) {
+        Assert-True (-not (Test-Path -LiteralPath $shortcut.FullName)) `
+            "The setup uninstall left its generated shortcut behind: $($shortcut.FullName)"
+    }
 
     $evidence = [ordered]@{
         schema = 'termlink.phase1-windows-setup-validation'
@@ -188,6 +213,22 @@ finally {
     }
     elseif (Test-Path -LiteralPath $fragmentPath -PathType Leaf) {
         Remove-Item -LiteralPath $fragmentPath -Force
+    }
+    $shortcutShell = New-Object -ComObject WScript.Shell
+    foreach ($directory in @($desktopDirectory, $startMenuDirectory)) {
+        if (-not (Test-Path -LiteralPath $directory)) { continue }
+        foreach ($shortcut in @(Get-ChildItem -LiteralPath $directory -Filter 'TermLink*.lnk' -File -ErrorAction SilentlyContinue)) {
+            try {
+                $target = $shortcutShell.CreateShortcut($shortcut.FullName).TargetPath
+                if ([string]$target -like ((Join-Path $installRoot '*'))) {
+                    Remove-Item -LiteralPath $shortcut.FullName -Force -ErrorAction SilentlyContinue
+                }
+            } catch { }
+        }
+    }
+    if ((Test-Path -LiteralPath $startMenuDirectory -PathType Container) -and
+        -not (Get-ChildItem -LiteralPath $startMenuDirectory -Force -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $startMenuDirectory -Force -ErrorAction SilentlyContinue
     }
     $currentRun = Get-ItemProperty -LiteralPath $runKeyPath -ErrorAction SilentlyContinue
     $currentRunValue = if ($null -ne $currentRun -and $null -ne $currentRun.PSObject.Properties['TermLink']) {

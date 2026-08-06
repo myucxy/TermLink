@@ -242,7 +242,9 @@ $password = Read-Host 'PFX password' -AsSecureString
 安装器会为当前用户创建登录自启，并在
 `%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\TermLink\termlink.json` 生成独立
 Terminal Fragment。Fragment 中的 `commandline` 使用实际安装目录并正确处理空格，不会修改用户的
-`settings.json`；升级会重新生成，卸载只删除仍与安装器记录的哈希一致的文件。
+`settings.json`；安装器同时在当前用户桌面和开始菜单 `Programs\TermLink` 创建指向
+`TermLink.Tray.exe` 的快捷方式，升级会复用并重新生成，卸载只删除仍与安装器记录的哈希一致的
+快捷方式和 Fragment。
 
 静默卸载使用：
 

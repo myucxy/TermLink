@@ -8,6 +8,7 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Runtime.InteropServices;
 using Microsoft.Win32;
 
 namespace TermLink.Setup
@@ -160,6 +161,10 @@ namespace TermLink.Setup
         public string TerminalFragmentPath { get; set; }
         public string TerminalFragmentSha256 { get; set; }
         public string StartupCommand { get; set; }
+        public string DesktopShortcutPath { get; set; }
+        public string DesktopShortcutSha256 { get; set; }
+        public string StartMenuShortcutPath { get; set; }
+        public string StartMenuShortcutSha256 { get; set; }
     }
 
     internal static class Installer
@@ -235,6 +240,7 @@ namespace TermLink.Setup
                 {
                     TryRemoveStartupIfOwned(previous);
                 }
+                ConfigureShortcuts(root, marker, previous);
                 WriteMarker(root, marker);
 
                 if (Directory.Exists(backup)) Directory.Delete(backup, true);
@@ -251,6 +257,7 @@ namespace TermLink.Setup
                     // fragment or startup value is being written.
                     TryRemoveTerminalFragmentIfOwned(marker);
                     TryRemoveStartupIfOwned(marker);
+                    TryRemoveShortcuts(marker);
                 }
                 TryDeleteDirectory(root);
                 TryRestoreDirectory(backup, root);
@@ -275,6 +282,7 @@ namespace TermLink.Setup
             StopOwnedProcesses(root);
             RemoveTerminalFragmentIfOwned(marker);
             RemoveStartupIfOwned(marker);
+            RemoveShortcuts(marker);
             Directory.Delete(root, true);
             Console.WriteLine("TermLink 已卸载: " + root);
         }
@@ -563,6 +571,117 @@ namespace TermLink.Setup
             }
         }
 
+        private static void ConfigureShortcuts(string root, InstallMarker marker, InstallMarker previous)
+        {
+            var tray = Path.Combine(root, "TermLink.Tray.exe");
+            var desktopDefault = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+                "TermLink.lnk");
+            var startMenuDirectory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.StartMenu),
+                "Programs", "TermLink");
+            var startMenuDefault = Path.Combine(startMenuDirectory, "TermLink.lnk");
+
+            marker.DesktopShortcutPath = ResolveShortcutPath(
+                desktopDefault, previous?.DesktopShortcutPath, previous?.DesktopShortcutSha256);
+            marker.StartMenuShortcutPath = ResolveShortcutPath(
+                startMenuDefault, previous?.StartMenuShortcutPath, previous?.StartMenuShortcutSha256);
+
+            CreateShortcut(marker.DesktopShortcutPath, tray, root);
+            marker.DesktopShortcutSha256 = Sha256(marker.DesktopShortcutPath);
+            CreateShortcut(marker.StartMenuShortcutPath, tray, root);
+            marker.StartMenuShortcutSha256 = Sha256(marker.StartMenuShortcutPath);
+        }
+
+        private static string ResolveShortcutPath(string defaultPath, string previousPath, string previousSha256)
+        {
+            if (!string.IsNullOrWhiteSpace(previousPath) &&
+                !string.IsNullOrWhiteSpace(previousSha256) &&
+                File.Exists(previousPath) &&
+                string.Equals(Sha256(previousPath), previousSha256, StringComparison.OrdinalIgnoreCase))
+            {
+                return previousPath;
+            }
+
+            if (!File.Exists(defaultPath)) return defaultPath;
+            var directory = Path.GetDirectoryName(defaultPath);
+            var stem = Path.GetFileNameWithoutExtension(defaultPath);
+            var extension = Path.GetExtension(defaultPath);
+            for (var suffix = 2; suffix <= 100; suffix++)
+            {
+                var candidate = Path.Combine(directory, stem + " (" + suffix + ")" + extension);
+                if (!File.Exists(candidate)) return candidate;
+            }
+            throw new IOException("无法为 TermLink 创建快捷方式：同名文件过多。请清理旧的 TermLink 快捷方式后重试。");
+        }
+
+        private static void CreateShortcut(string path, string target, string workingDirectory)
+        {
+            var directory = Path.GetDirectoryName(path);
+            if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
+
+            object shell = null;
+            object shortcut = null;
+            try
+            {
+                var shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType == null)
+                {
+                    throw new PlatformNotSupportedException("当前 Windows 环境缺少快捷方式创建组件 WScript.Shell。");
+                }
+                shell = Activator.CreateInstance(shellType);
+                shortcut = shellType.InvokeMember(
+                    "CreateShortcut",
+                    System.Reflection.BindingFlags.InvokeMethod,
+                    null,
+                    shell,
+                    new object[] { path });
+                var shortcutType = shortcut.GetType();
+                shortcutType.InvokeMember("TargetPath", System.Reflection.BindingFlags.SetProperty,
+                    null, shortcut, new object[] { target });
+                shortcutType.InvokeMember("WorkingDirectory", System.Reflection.BindingFlags.SetProperty,
+                    null, shortcut, new object[] { workingDirectory });
+                shortcutType.InvokeMember("Description", System.Reflection.BindingFlags.SetProperty,
+                    null, shortcut, new object[] { "TermLink Windows Agent" });
+                shortcutType.InvokeMember("IconLocation", System.Reflection.BindingFlags.SetProperty,
+                    null, shortcut, new object[] { target + ",0" });
+                shortcutType.InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod,
+                    null, shortcut, null);
+            }
+            catch (UnauthorizedAccessException error)
+            {
+                throw new InvalidOperationException(
+                    "无法创建 TermLink 快捷方式：" + path + "。请确认当前用户对该目录有写入权限。",
+                    error);
+            }
+            finally
+            {
+                if (shortcut != null && Marshal.IsComObject(shortcut)) Marshal.FinalReleaseComObject(shortcut);
+                if (shell != null && Marshal.IsComObject(shell)) Marshal.FinalReleaseComObject(shell);
+            }
+        }
+
+        private static void RemoveShortcuts(InstallMarker marker)
+        {
+            RemoveShortcutIfOwned(marker?.DesktopShortcutPath, marker?.DesktopShortcutSha256);
+            RemoveShortcutIfOwned(marker?.StartMenuShortcutPath, marker?.StartMenuShortcutSha256);
+            var startMenuDirectory = marker?.StartMenuShortcutPath == null
+                ? null
+                : Path.GetDirectoryName(marker.StartMenuShortcutPath);
+            if (!string.IsNullOrWhiteSpace(startMenuDirectory) &&
+                Directory.Exists(startMenuDirectory) &&
+                !Directory.EnumerateFileSystemEntries(startMenuDirectory).Any())
+            {
+                Directory.Delete(startMenuDirectory);
+            }
+        }
+
+        private static void RemoveShortcutIfOwned(string path, string sha256)
+        {
+            if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(sha256) || !File.Exists(path)) return;
+            if (string.Equals(Sha256(path), sha256, StringComparison.OrdinalIgnoreCase)) File.Delete(path);
+        }
+
         private static void TryRemoveTerminalFragmentIfOwned(InstallMarker marker)
         {
             try
@@ -585,6 +704,18 @@ namespace TermLink.Setup
             catch
             {
                 // Preserve the original install error; startup cleanup is best effort.
+            }
+        }
+
+        private static void TryRemoveShortcuts(InstallMarker marker)
+        {
+            try
+            {
+                RemoveShortcuts(marker);
+            }
+            catch
+            {
+                // Preserve the original install error; owned shortcuts can be retried on uninstall.
             }
         }
 
