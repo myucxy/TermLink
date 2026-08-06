@@ -284,3 +284,25 @@ git diff --check
 - 部署后 Server 容器状态为 `Up (healthy)`，日志仅报告正常启动；公网
   `https://termlink.kget.cc:8910/readyz` 返回 `{"status":"ready"}`。该结果证明 Server 健康，
   不等同于三端真实 E2EE 终端闭环已完成。
+
+## 9. 2026-08-06 Windows 原生登录修复与 Android 0.1.6 发布
+
+- 根因确认：Win-Agent 的应用内登录使用 OIDC Resource Owner Password Grant，而验收 Realm 的
+  `termlink-windows` 客户端原先为 `directAccessGrantsEnabled=false`；Keycloak 日志返回
+  `error=not_allowed` / `Client not allowed for direct access grants`。
+- 提交 `5315efb` 同步修复 Realm 模板、已有数据卷的 `keycloak-init` 幂等 reconciliation，并增加
+  Windows 客户端流策略契约测试。当前运行 Realm 已用初始化脚本更新，管理查询确认
+  `termlink-windows.directAccessGrantsEnabled=true`。
+- Server 镜像按 `0.1.7` / revision `5315efb` 重建，digest 为
+  `sha256:2b459f0af75d1c652d09234017e9766c58d9c2e46c2999ef29ccfa663e82eb01`；先执行迁移后仅
+  recreate `server`，容器健康，公网 `/readyz` 继续返回 `{"status":"ready"}`。
+- 使用验收账号对公开 Keycloak token endpoint 做真实 Direct Grant 验证：HTTP 200，access token
+  与 refresh token 均存在，未输出任何凭据内容。
+- Android Dock 已将“活动”替换为“会话”主入口，点击后直接进入会话/终端页；会话终端移除圆角
+  外层包装和页间留白，改为铺满可用区域，宽屏使用直角分栏，移动端横向分页无间隙。Android
+  版本升至 `0.1.6` / build `6`，提交 `96a7eb3`；App 单测与 Release 构建通过，APK V2 签名验证
+  通过，SHA-256 为 `C0A78800D9611135321FE4013AC0ACA87C6CF19488A2D71DBB7819BE5893BF6D`。
+- AppShip `termlink-android/stable` 已发布：release
+  `1169d9db-e8e7-4c05-8096-eab6fbcee9d0`，artifact
+  `0cc8997f-f688-4d72-ae21-8ec55441bb18`，状态 `published`。公开更新接口验证：build 5 返回
+  `optional` / latest 0.1.6 build 6，build 6 返回 `no_update`。
