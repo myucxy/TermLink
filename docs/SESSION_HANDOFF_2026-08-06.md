@@ -120,13 +120,17 @@ git diff --check
 
 - AppShip 地址：`https://appship.kget.cc:8910/`；两个公开应用均已由管理员创建并发布到
   `stable` 通道。
-- Android：slug `termlink-android`，release `8d090760-cfb4-46e7-870e-19a780894984`，
-  artifact `8f527304-c89c-4ebc-8afc-92dc27637a27`，版本 `0.1.0` / build `1`，状态
-  `published`；APK SHA-256 为 `aec47e73f7df51bc480754b1b09e3b393c1b26464c03cf033e17b86cb04b8a4b`。
-- Windows：slug `termlink-win64`，release `cc05481b-29f6-4bbb-8094-08c4e4a2f5e6`，
-  artifact `0d7e8b4b-7654-43b2-8cc1-47ed7034f6bb`，版本 `0.1.0` / build `1`，状态
-  `published`；EXE SHA-256 为 `ffd69e87a3971ba410055fe3cf3332e18f4defab524c9007d85b8c43d79a1aca`。
-- 两个公开 updates 接口均返回 HTTP 200、stable、latest `0.1.0`/build `1` 和 `no_update`。
+- Android build 1 首发 release `8d090760-cfb4-46e7-870e-19a780894984` 已保留；当前修复版
+  slug `termlink-android` 的 release `99b0508f-29c5-4e39-858d-80e61b0e8fc0`、artifact
+  `80aae773-3363-4a95-835a-74dafb91f4e0`，版本 `0.1.2` / build `2`，状态 `published`；
+  APK SHA-256 为 `d9b3a730390f827c62945e37ef88b28e67fdde9034ac8eeed21e11f0a16c0489`。
+- Windows build 1 首发 release `cc05481b-29f6-4bbb-8094-08c4e4a2f5e6` 已保留；当前修复版
+  slug `termlink-win64` 的 release `f2141e9a-39ec-4e4e-9fad-2484c0864d3c`、artifact
+  `e84434d2-b2ad-4ce0-9eb6-db09bc9566b4`，版本 `0.1.2` / build `2`，状态 `published`；
+  EXE SHA-256 为 `6137d27da263bef5bd5567ed7c4ceb53c303f56e5146a52e0b1fbf73c064bdef`。
+- 两个公开 updates 接口均返回 HTTP 200；传入 build 1 返回 `optional` 和 latest `0.1.2`/2，
+  传入 build 2 返回 `no_update`。客户端已兼容 AppShip 实际的 `latest` 与根级 `artifact`
+  响应结构。
   Windows 本次使用用户授权的一次性自生成 Code Signing 证书，签名根不属于系统受信生产 CA；
   不能把该签名视为正式商业发布证书。
 

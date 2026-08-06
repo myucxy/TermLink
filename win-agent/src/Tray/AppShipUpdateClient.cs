@@ -69,7 +69,13 @@ namespace TermLink.Tray
                 };
             }
 
-            var build = Math.Max(0, currentVersion == null ? 0 : currentVersion.Build);
+            var build = currentVersion == null
+                ? 0
+                : currentVersion.Build > 0
+                    ? currentVersion.Build
+                    : currentVersion.Revision > 0
+                        ? currentVersion.Revision
+                        : 1;
             var endpoint = baseUrl + "/api/v1/apps/" + ApplicationSlug +
                 "/updates?platform=windows&arch=x64&channel=stable&build=" + build;
             try
@@ -117,7 +123,7 @@ namespace TermLink.Tray
                 using (var document = JsonDocument.Parse(body ?? string.Empty))
                 {
                     var root = document.RootElement;
-                    var release = ObjectAt(root, "release") ?? ObjectAt(root, "update") ?? root;
+                    var release = ObjectAt(root, "release") ?? ObjectAt(root, "update") ?? ObjectAt(root, "latest") ?? root;
                     var artifact = ObjectAt(release, "artifact") ?? ObjectAt(root, "artifact");
                     var rawDecision = StringAt(root, "decision", "status", "result");
                     var version = StringAt(release, "versionName", "version_name", "version");

@@ -1107,7 +1107,7 @@ internal class ProductionProductRepository(
         fun stringAt(parent: JsonObject, vararg keys: String): String? = keys.firstNotNullOfOrNull { key ->
             parent[key]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
         }
-        val release = objectAt(root, "release") ?: objectAt(root, "update") ?: root
+        val release = objectAt(root, "release") ?: objectAt(root, "update") ?: objectAt(root, "latest") ?: root
         val artifact = objectAt(release, "artifact") ?: objectAt(root, "artifact")
         val rawDecision = stringAt(root, "decision", "status", "result")?.uppercase()
         val versionName = stringAt(release, "versionName", "version_name", "version")

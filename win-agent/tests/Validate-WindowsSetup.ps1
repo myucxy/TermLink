@@ -2,6 +2,8 @@
 param(
     [string]$DotNetPath = (Join-Path $env:TEMP 'termlink-dotnet-sdk-8.0.303\dotnet.exe'),
     [string]$EvidencePath = (Join-Path $PSScriptRoot '..\..\docs\validation\phase1-windows-setup.json'),
+    [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
+    [string]$Version = '0.1.2.0',
     [string]$OutputSetupPath
 )
 
@@ -83,7 +85,7 @@ try {
         $certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Pfx, $passwordText))
 
     $buildOutput = @(& (Join-Path $PSScriptRoot '..\package\Build-Setup.ps1') `
-        -Version '0.1.0.0' `
+        -Version $Version `
         -CertificatePath $pfxPath `
         -CertificatePassword $password `
         -Development `
@@ -154,7 +156,7 @@ try {
         version = 1
         generated_at_utc = [DateTime]::UtcNow.ToString('o')
         passed = $true
-        setup_version = '0.1.0.0'
+        setup_version = $Version
         architecture = 'win-x64'
         single_file_setup = $true
         self_contained_payload = $true
