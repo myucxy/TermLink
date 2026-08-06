@@ -117,18 +117,39 @@ func (s *Postgres) RegisterDevice(ctx context.Context, subjectHash [32]byte, inp
 	bootstrap := input.Type == "WINDOWS_PC" && bootstrapConsumedAt == nil
 	trustState := "PENDING"
 	var approvedAt *time.Time
+	var approvedBy *uuid.UUID
 	if bootstrap || s.AutoTrustDevices {
 		trustState = "TRUSTED"
 		now := time.Now().UTC()
 		approvedAt = &now
 	}
+	// The partial unique index reserves a single trusted Windows PC with a
+	// nil approver as the account bootstrap device.  Auto-trusting a later PC
+	// must retain the bootstrap relationship instead of attempting to create a
+	// second nil-approved row (which would make the Agent an unknown device).
+	// The user row is locked above, so this lookup is serialized with all other
+	// registrations for the account.
+	if input.Type == "WINDOWS_PC" && !bootstrap && s.AutoTrustDevices {
+		var bootstrapID uuid.UUID
+		err := tx.QueryRow(ctx, `
+			SELECT id
+			FROM devices
+			WHERE user_id=$1 AND device_type='WINDOWS_PC' AND approved_by IS NULL
+			ORDER BY created_at,id
+			LIMIT 1`, userID).Scan(&bootstrapID)
+		if err == nil {
+			approvedBy = &bootstrapID
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, DeviceRecord{}, false, err
+		}
+	}
 	var record DeviceRecord
 	err = tx.QueryRow(ctx, `
-		INSERT INTO devices(id,user_id,device_type,name,signing_public_key,exchange_public_key,key_id,trust_state,approved_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		INSERT INTO devices(id,user_id,device_type,name,signing_public_key,exchange_public_key,key_id,trust_state,approved_by,approved_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		ON CONFLICT (id) DO NOTHING
 		RETURNING id,device_type,name,key_id,signing_public_key,exchange_public_key,trust_state,approved_by,approved_at,revoked_at,created_at`,
-		input.ID, userID, input.Type, input.Name, input.SigningPublicKey, input.ExchangePublicKey, input.KeyID, trustState, approvedAt,
+		input.ID, userID, input.Type, input.Name, input.SigningPublicKey, input.ExchangePublicKey, input.KeyID, trustState, approvedBy, approvedAt,
 	).Scan(&record.ID, &record.Type, &record.Name, &record.KeyID, &record.SigningPublicKey, &record.ExchangePublicKey, &record.TrustState, &record.ApprovedBy, &record.ApprovedAt, &record.RevokedAt, &record.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, DeviceRecord{}, false, ErrConflict
