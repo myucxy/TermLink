@@ -1,7 +1,7 @@
 {
   "schema": "termlink.phase1-windows-setup-validation",
   "version": 1,
-  "generated_at_utc": "2026-08-06T08:06:20.5650547Z",
+  "generated_at_utc": "2026-08-06T09:06:25.5268168Z",
   "passed": true,
   "setup_version": "0.1.0.0",
   "architecture": "win-x64",
@@ -14,5 +14,5 @@
   "startup_unchanged_under_no_startup": true,
   "upgrade_in_place": true,
   "uninstall": true,
-  "setup_sha256": "7a1aa2cb36c485e9196c41bf6f299aed409af2229b080fcd7b034a365383b7b7"
+  "setup_sha256": "ffd69e87a3971ba410055fe3cf3332e18f4defab524c9007d85b8c43d79a1aca"
 }

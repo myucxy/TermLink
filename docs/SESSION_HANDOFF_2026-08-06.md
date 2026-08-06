@@ -116,6 +116,20 @@ git diff --check
   仓库不保存签名材料；当前工作区没有 TermLink 专用 release keystore，不能用其他产品证书
   代替生产签名。
 
+### 3.2 AppShip 首版发布结果
+
+- AppShip 地址：`https://appship.kget.cc:8910/`；两个公开应用均已由管理员创建并发布到
+  `stable` 通道。
+- Android：slug `termlink-android`，release `8d090760-cfb4-46e7-870e-19a780894984`，
+  artifact `8f527304-c89c-4ebc-8afc-92dc27637a27`，版本 `0.1.0` / build `1`，状态
+  `published`；APK SHA-256 为 `aec47e73f7df51bc480754b1b09e3b393c1b26464c03cf033e17b86cb04b8a4b`。
+- Windows：slug `termlink-win64`，release `cc05481b-29f6-4bbb-8094-08c4e4a2f5e6`，
+  artifact `0d7e8b4b-7654-43b2-8cc1-47ed7034f6bb`，版本 `0.1.0` / build `1`，状态
+  `published`；EXE SHA-256 为 `ffd69e87a3971ba410055fe3cf3332e18f4defab524c9007d85b8c43d79a1aca`。
+- 两个公开 updates 接口均返回 HTTP 200、stable、latest `0.1.0`/build `1` 和 `no_update`。
+  Windows 本次使用用户授权的一次性自生成 Code Signing 证书，签名根不属于系统受信生产 CA；
+  不能把该签名视为正式商业发布证书。
+
 ## 4. 本机状态注意事项
 
 - 本机 Android SDK 已确认位于 `D:\Dev\Env\Android\Sdk`（不是常见的 `D:\Android\Sdk`）；使用该路径设置本次构建进程的

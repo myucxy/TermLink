@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$DotNetPath = (Join-Path $env:TEMP 'termlink-dotnet-sdk-8.0.303\dotnet.exe'),
-    [string]$EvidencePath = (Join-Path $PSScriptRoot '..\..\docs\validation\phase1-windows-setup.json')
+    [string]$EvidencePath = (Join-Path $PSScriptRoot '..\..\docs\validation\phase1-windows-setup.json'),
+    [string]$OutputSetupPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,7 +38,13 @@ function Invoke-Setup {
 Assert-True (Test-Path -LiteralPath $DotNetPath -PathType Leaf) ".NET SDK not found: $DotNetPath"
 $workRoot = Join-Path ([IO.Path]::GetTempPath()) ('TermLink-SetupValidation-' + [guid]::NewGuid().ToString('N'))
 $installRoot = Join-Path $workRoot 'Installed TermLink'
-$setupPath = Join-Path $workRoot 'TermLink-Setup.exe'
+$setupPath = if ([string]::IsNullOrWhiteSpace($OutputSetupPath)) {
+    Join-Path $workRoot 'TermLink-Setup.exe'
+} else {
+    $resolvedOutput = [IO.Path]::GetFullPath($OutputSetupPath)
+    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($resolvedOutput)) | Out-Null
+    $resolvedOutput
+}
 $pfxPath = Join-Path $workRoot 'development-signing.pfx'
 $fragmentPath = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\Fragments\TermLink\termlink.json'
 $runKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
