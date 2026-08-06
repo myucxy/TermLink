@@ -217,6 +217,29 @@ MSIX 使用 `windows.startupTask` 在当前用户登录后启动 `TermLink.Tray.
 证据分别位于 `docs/validation/phase1-windows-installer.json` 和
 `docs/validation/item7-windows-msix-lifecycle.json`。该结果只证明开发信任机制，不证明生产证书链。
 
+### 验收 MSIX 的证书信任
+
+`TermLink-0.2.0.0-acceptance-x64.msix` 使用自签名的验收证书（Publisher 为
+`CN=TermLink Remote Acceptance`）。首次在另一台 Windows 机器安装前，必须只把该包的
+**公钥证书**导入 `TrustedPeople`（受信任的人）存储。不要导入 PFX/私钥，不要把证书放进
+`Trusted Root Certification Authorities`，也不要关闭 SmartScreen 或系统签名校验。
+
+最简单的方式是：右键 MSIX → 属性 → 数字签名 → 选择签名 → 详细信息 → 查看证书 → 安装证书，
+选择“本地计算机”（需要管理员权限）或“当前用户”，并指定“受信任的人”。然后重新运行：
+
+```powershell
+$package = (Resolve-Path '.\TermLink-0.2.0.0-acceptance-x64.msix').Path
+$signature = Get-AuthenticodeSignature -LiteralPath $package
+if ($null -eq $signature.SignerCertificate) { throw 'MSIX signer certificate was not found.' }
+$cer = Join-Path $env:TEMP 'TermLink-Remote-Acceptance.cer'
+Export-Certificate -Cert $signature.SignerCertificate -FilePath $cer -Type CERT | Out-Null
+Import-Certificate -FilePath $cer -CertStoreLocation 'Cert:\LocalMachine\TrustedPeople'
+Add-AppxPackage -Path $package
+```
+
+没有管理员权限时，将 `LocalMachine` 改为 `CurrentUser`。如果仍失败，先确认包的签名者和清单
+Publisher 完全相同，再提供 `Add-AppxPackage` 返回的错误代码；不要混用旧版包或其他证书。
+
 ## 受控更新与失败回滚
 
 `package/New-UpdateManifest.ps1` 为已有 MSIX 生成单独的 UTF-8 JSON 清单，并使用包签名者的

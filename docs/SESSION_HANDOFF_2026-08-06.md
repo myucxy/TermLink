@@ -106,6 +106,13 @@ git diff --check
 
 ## 4. 本机状态注意事项
 
+- 本机 Android SDK 已确认位于 `D:\Dev\Env\Android\Sdk`（不是常见的 `D:\Android\Sdk`）；使用该路径设置本次构建进程的
+  `ANDROID_SDK_ROOT`/`ANDROID_HOME` 后，`:core-network:compileDebugKotlin`、
+  `:core-network:testDebugUnitTest`、`:core-session:testDebugUnitTest` 与 `:app:assembleDebug`
+  均已通过。未修改系统级环境变量。
+- 当前尚未提交的生产 FlowControl/ACK/Relay 字节预算改动已通过 Server 相关 Go 测试与
+  `go vet`，Windows Release Solution 构建为 0 warning / 0 error；这些结果证明当前源码可构建，
+  不证明公网部署或真实 Windows → Android 生产闭环已经通过。
 - 用户原有 Windows Terminal 窗口未关闭；后续不得用结束 `WindowsTerminal.exe` 进程清理测试；
 - 当前用户和 All Users 均没有注册 `TermLink.Terminal`；磁盘上仍有旧的 0.1 开发 MSIX
   构建产物，但它不是已安装包；
