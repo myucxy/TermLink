@@ -63,7 +63,24 @@ $packagePath = Join-Path $workRoot 'TermLink-validation.msix'
 $pfxPath = Join-Path $workRoot 'development-signing.pfx'
 $payloadRoot = Join-Path $workRoot 'payload'
 $statusPath = Join-Path $workRoot 'agent-status.json'
+$controlPipeName = 'termlink-installer-validation-' + [guid]::NewGuid().ToString('N')
+$agentBufferRoot = Join-Path $workRoot 'agent-buffer'
 [IO.Directory]::CreateDirectory($workRoot) | Out-Null
+
+# Every Tray invocation in this validator must use an ephemeral control pipe and
+# a buffer below the validator's temporary root.  Passing these explicitly keeps
+# the test isolated from the real SID-default Agent pipe and
+# %LOCALAPPDATA%\TermLink\Agent data, even when a development Tray/Agent is
+# already running for the interactive user.
+$trayIsolationArguments = @(
+    '--control-pipe', $controlPipeName,
+    '--buffer-root', $agentBufferRoot
+)
+Assert-True (-not [string]::IsNullOrWhiteSpace($controlPipeName)) 'Validation control pipe was not generated.'
+Assert-True ([IO.Path]::GetFullPath($agentBufferRoot).StartsWith(
+        [IO.Path]::GetFullPath($workRoot).TrimEnd('\') + '\',
+        [StringComparison]::OrdinalIgnoreCase)) `
+    'Validation Agent buffer root escaped the isolated temporary workspace.'
 
 $password = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(24))
 $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
@@ -230,7 +247,8 @@ try {
     finally {
         if ($null -ne $installedTrayIcon) { $installedTrayIcon.Dispose() }
     }
-    $firstTrayLaunch = Start-Process -FilePath $installedTray -PassThru
+    $firstTrayLaunch = Start-Process -FilePath $installedTray `
+        -ArgumentList $trayIsolationArguments -PassThru
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
     $trayProcesses = @()
     do {
@@ -246,7 +264,8 @@ try {
     }
     Write-Output 'STEP=tray_started'
 
-    $secondTrayLaunch = Start-Process -FilePath $installedTray -PassThru
+    $secondTrayLaunch = Start-Process -FilePath $installedTray `
+        -ArgumentList $trayIsolationArguments -PassThru
     $singleInstanceDeadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
         Start-Sleep -Milliseconds 100
@@ -271,14 +290,14 @@ try {
     Write-Output 'STEP=agent_started'
 
     $statusProcess = Start-Process -FilePath $installedTray `
-        -ArgumentList @('--status-json', $statusPath) -Wait -PassThru
+        -ArgumentList @($trayIsolationArguments + @('--status-json', $statusPath)) -Wait -PassThru
     Assert-True ($statusProcess.ExitCode -eq 0) 'Packaged Tray could not query Agent status.'
     $agentStatus = Get-Content -Raw -LiteralPath $statusPath | ConvertFrom-Json
     Assert-True $agentStatus.Success 'Packaged Agent status was not successful.'
     Assert-True $agentStatus.RemoteAccessEnabled 'Packaged Agent did not enable remote access.'
     Write-Output 'STEP=agent_status'
     $shutdownProcess = Start-Process -FilePath $installedTray `
-        -ArgumentList '--shutdown-agent' -Wait -PassThru
+        -ArgumentList @($trayIsolationArguments + @('--shutdown-agent')) -Wait -PassThru
     Assert-True ($shutdownProcess.ExitCode -eq 0) 'Packaged Tray could not stop the validation Agent.'
     Start-Sleep -Milliseconds 300
     Stop-ValidationProcesses -ProcessIds $validationProcessIds

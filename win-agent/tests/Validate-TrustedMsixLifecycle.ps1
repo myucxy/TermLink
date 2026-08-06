@@ -271,6 +271,114 @@ function Assert-PackageSignature {
     return $status
 }
 
+function Convert-ToLegacyTerminalPackage {
+    param(
+        [Parameter(Mandatory)][string]$SourcePackagePath,
+        [Parameter(Mandatory)][string]$DestinationPackagePath,
+        [Parameter(Mandatory)][string]$WorkRoot,
+        [Parameter(Mandatory)][string]$CertificatePath,
+        [Parameter(Mandatory)][Security.SecureString]$CertificatePassword,
+        [AllowEmptyString()][string]$TimestampUrl
+    )
+
+    $resolvedWorkRoot = [IO.Path]::GetFullPath($WorkRoot).TrimEnd('\') + '\'
+    $legacyLayout = [IO.Path]::GetFullPath((Join-Path $WorkRoot 'legacy-layout'))
+    Assert-True ($legacyLayout.StartsWith($resolvedWorkRoot, [StringComparison]::OrdinalIgnoreCase)) `
+        'Legacy package layout escaped the lifecycle work directory.'
+
+    $makeAppx = Find-WindowsSdkTool -Name 'makeappx.exe'
+    $signTool = Find-WindowsSdkTool -Name 'signtool.exe'
+    Invoke-ExternalTool -FilePath $makeAppx -Arguments @(
+        'unpack', '/p', [IO.Path]::GetFullPath($SourcePackagePath), '/d', $legacyLayout, '/o'
+    ) -Quiet | Out-Null
+
+    $manifestPath = Join-Path $legacyLayout 'AppxManifest.xml'
+    Assert-True (Test-Path -LiteralPath $manifestPath -PathType Leaf) `
+        'The unpacked migration fixture is missing AppxManifest.xml.'
+    $manifest = [Xml.XmlDocument]::new()
+    $manifest.PreserveWhitespace = $true
+    $manifest.XmlResolver = $null
+    $manifest.Load($manifestPath)
+    $namespaces = [Xml.XmlNamespaceManager]::new($manifest.NameTable)
+    $namespaces.AddNamespace('f', 'http://schemas.microsoft.com/appx/manifest/foundation/windows10')
+    $namespaces.AddNamespace('uap3', 'http://schemas.microsoft.com/appx/manifest/uap/windows10/3')
+    $extensions = @($manifest.SelectNodes(
+        "/f:Package/f:Applications/f:Application/f:Extensions/uap3:Extension[@Category='windows.appExecutionAlias' or @Category='windows.appExtension']",
+        $namespaces))
+    Assert-True ($extensions.Count -eq 2) `
+        'The current package did not contain both terminal integration declarations before migration fixture conversion.'
+    foreach ($extension in $extensions) {
+        [void]$extension.ParentNode.RemoveChild($extension)
+    }
+    $ignorable = @($manifest.DocumentElement.GetAttribute('IgnorableNamespaces').Split(' ') |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -ne 'uap3' })
+    $manifest.DocumentElement.SetAttribute('IgnorableNamespaces', ($ignorable -join ' '))
+    $manifest.DocumentElement.RemoveAttribute('uap3', 'http://www.w3.org/2000/xmlns/')
+    $xmlSettings = [Xml.XmlWriterSettings]::new()
+    $xmlSettings.Encoding = [Text.UTF8Encoding]::new($false)
+    $xmlSettings.Indent = $true
+    $writer = [Xml.XmlWriter]::Create($manifestPath, $xmlSettings)
+    try { $manifest.Save($writer) }
+    finally { $writer.Dispose() }
+
+    $legacyTerminalRoot = [IO.Path]::GetFullPath((Join-Path $legacyLayout 'Terminal'))
+    Assert-True ($legacyTerminalRoot.StartsWith(($legacyLayout.TrimEnd('\') + '\'),
+            [StringComparison]::OrdinalIgnoreCase)) 'Legacy Terminal fixture path escaped its package layout.'
+    if (Test-Path -LiteralPath $legacyTerminalRoot) {
+        Remove-Item -LiteralPath $legacyTerminalRoot -Recurse -Force -ErrorAction Stop
+    }
+
+    Invoke-ExternalTool -FilePath $makeAppx -Arguments @(
+        'pack', '/d', $legacyLayout, '/p', [IO.Path]::GetFullPath($DestinationPackagePath), '/o', '/h', 'SHA256'
+    ) -Quiet | Out-Null
+    $plainPassword = [Net.NetworkCredential]::new('', $CertificatePassword).Password
+    try {
+        $signArguments = @(
+            'sign', '/fd', 'SHA256', '/f', [IO.Path]::GetFullPath($CertificatePath), '/p', $plainPassword
+        )
+        if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) {
+            $signArguments += @('/tr', $TimestampUrl, '/td', 'SHA256')
+        }
+        Invoke-ExternalTool -FilePath $signTool -Arguments ($signArguments + @(
+            [IO.Path]::GetFullPath($DestinationPackagePath)
+        )) -Quiet | Out-Null
+    }
+    finally { $plainPassword = $null }
+    Assert-True (Test-Path -LiteralPath $DestinationPackagePath -PathType Leaf) `
+        'The signed legacy migration fixture was not created.'
+    return [pscustomobject]@{
+        PackagePath = [IO.Path]::GetFullPath($DestinationPackagePath)
+        Sha256 = (Get-FileHash -LiteralPath $DestinationPackagePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        TerminalIntegrationPresent = $false
+    }
+}
+
+function Get-TerminalUserFragmentFingerprint {
+    $root = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) `
+        'Microsoft\Windows Terminal\Fragments\TermLink'
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+        return [pscustomobject]@{ Exists = $false; FileCount = 0; Fingerprint = $null }
+    }
+    $resolvedRoot = [IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
+    $records = @(Get-ChildItem -LiteralPath $root -File -Recurse -Force | Sort-Object FullName | ForEach-Object {
+        $resolvedFile = [IO.Path]::GetFullPath($_.FullName)
+        Assert-True ($resolvedFile.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)) `
+            'A user fragment file escaped the expected TermLink fragment directory.'
+        [ordered]@{
+            relative_path = $resolvedFile.Substring($resolvedRoot.Length).Replace('\', '/')
+            length = $_.Length
+            sha256 = (Get-FileHash -LiteralPath $resolvedFile -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    })
+    $serialized = $records | ConvertTo-Json -Depth 4 -Compress
+    $bytes = [Text.Encoding]::UTF8.GetBytes([string]$serialized)
+    return [pscustomobject]@{
+        Exists = $true
+        FileCount = $records.Count
+        Fingerprint = (Get-RawBytesHash -Bytes $bytes).ToLowerInvariant()
+    }
+}
+
 function Get-InstalledPackage {
     param([Parameter(Mandatory)][string]$IdentityName, [Parameter(Mandatory)][string]$ExpectedPublisher)
     $packages = @(Get-AppxPackage -Name $IdentityName -ErrorAction SilentlyContinue |
@@ -383,6 +491,35 @@ function Assert-TerminalIntegration {
         ProfileCount = $profiles.Count
         ProfileGuids = $expectedGuids
         FragmentPath = $fragmentPath
+    }
+}
+
+function Assert-LegacyTerminalIntegrationAbsent {
+    param([Parameter(Mandatory)]$Package)
+
+    $manifestPath = Join-Path $Package.InstallLocation 'AppxManifest.xml'
+    Assert-True (Test-Path -LiteralPath $manifestPath -PathType Leaf) 'Installed legacy AppX manifest is missing.'
+    $manifest = [Xml.XmlDocument]::new()
+    $manifest.XmlResolver = $null
+    $manifest.Load($manifestPath)
+    $namespaces = [Xml.XmlNamespaceManager]::new($manifest.NameTable)
+    $namespaces.AddNamespace('f', 'http://schemas.microsoft.com/appx/manifest/foundation/windows10')
+    $namespaces.AddNamespace('uap3', 'http://schemas.microsoft.com/appx/manifest/uap/windows10/3')
+    $terminalDeclarations = @($manifest.SelectNodes(
+        "/f:Package/f:Applications/f:Application/f:Extensions/uap3:Extension[@Category='windows.appExecutionAlias' or @Category='windows.appExtension']",
+        $namespaces))
+    Assert-True ($terminalDeclarations.Count -eq 0) `
+        'The legacy migration fixture unexpectedly contains terminal integration declarations.'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $Package.InstallLocation 'Terminal') -PathType Container)) `
+        'The legacy migration fixture unexpectedly contains packaged terminal profiles.'
+    $aliasPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) `
+        'Microsoft\WindowsApps\termlink-session.exe'
+    Assert-True (-not (Test-Path -LiteralPath $aliasPath -PathType Leaf)) `
+        'The legacy migration fixture unexpectedly registered the SessionHost alias.'
+    return [pscustomobject]@{
+        AliasRegistered = $false
+        ProfileCount = 0
+        TerminalAppExtensionDeclared = $false
     }
 }
 
@@ -777,10 +914,17 @@ $importedCertificateThumbprint = $null
 $importedCertificateRawHash = $null
 $trackedProcesses = @{}
 $installedByRun = $false
+$packageMutationStarted = $false
 $upgradedByRun = $false
 $downgradedByRun = $false
 $uninstalledByRun = $false
 $cleanupErrors = @()
+$primaryFailure = $null
+$pendingEvidence = $null
+$cleanupPackageAbsent = $false
+$cleanupCertificateAbsent = (-not [bool]$DevelopmentTrust)
+$cleanupTrackedProcessesAbsent = $false
+$cleanupTemporaryWorkspaceAbsent = $false
 $preflightOnly = $Preflight -or [bool]$WhatIfPreference
 $development = [bool]$DevelopmentTrust
 $currentVersion = '0.1.0.0'
@@ -800,6 +944,8 @@ $downgradedTerminal = $null
 $initialAliasRuntime = $null
 $upgradedAliasRuntime = $null
 $downgradedAliasRuntime = $null
+$userFragmentBefore = Get-TerminalUserFragmentFingerprint
+$userFragmentAfter = $null
 
 try {
     Assert-True (-not [string]::IsNullOrWhiteSpace($Publisher)) 'Publisher is required.'
@@ -879,9 +1025,23 @@ try {
         return
     }
 
+    # Invalidate any older success evidence before the first build, trust-store
+    # import, or AppX mutation.  If this run is interrupted or cleanup fails,
+    # callers cannot mistake a previous successful JSON file for this run.
+    Write-Evidence -Evidence ([ordered]@{
+        schema = 'termlink.windows-msix-lifecycle-validation'
+        version = 2
+        generated_at_utc = [DateTime]::UtcNow.ToString('o')
+        classification = 'validation in progress or failed before cleanup proof'
+        passed = $false
+        package_identity = $PackageIdentityName
+        publisher = $Publisher
+    }) -Path $EvidencePath
+
     $workRoot = Join-Path ([IO.Path]::GetTempPath()) ('TermLink-MsixLifecycle-' + [guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($workRoot) | Out-Null
-    $currentPackage = Join-Path $workRoot "TermLink-$currentVersion-x64.msix"
+    $currentModernPackage = Join-Path $workRoot "TermLink-$currentVersion-current-x64.msix"
+    $currentPackage = Join-Path $workRoot "TermLink-$currentVersion-legacy-x64.msix"
     $targetPackage = Join-Path $workRoot "TermLink-$targetVersion-x64.msix"
     $derivedCertificatePath = Join-Path $workRoot 'publisher.cer'
     [IO.File]::WriteAllBytes(
@@ -904,10 +1064,17 @@ try {
     }
     $buildArguments.Version = $currentVersion
     $buildArguments.PackageIdentityName = $PackageIdentityName
-    $buildArguments.OutputPath = $currentPackage
+    $buildArguments.OutputPath = $currentModernPackage
     $currentBuildOutput = @(& $buildScript @buildArguments)
     $currentBuild = @($currentBuildOutput | Where-Object { $null -ne $_.PSObject.Properties['Sha256'] } | Select-Object -Last 1)
     Assert-True ($currentBuild.Count -eq 1) 'The 0.1.0.0 MSIX build did not return metadata.'
+    $legacyBuild = Convert-ToLegacyTerminalPackage `
+        -SourcePackagePath $currentModernPackage `
+        -DestinationPackagePath $currentPackage `
+        -WorkRoot $workRoot `
+        -CertificatePath $PfxPath `
+        -CertificatePassword $securePassword `
+        -TimestampUrl $TimestampUrl
     $buildArguments.Version = $targetVersion
     $buildArguments.OutputPath = $targetPackage
     $targetBuildOutput = @(& $buildScript @buildArguments)
@@ -938,9 +1105,9 @@ try {
                 if ($PSCmdlet.ShouldProcess('LocalMachine TrustedPeople', 'Import the exact development publisher certificate')) {
                     $importedCertificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
                         $certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-                    $store.Add($importedCertificate)
                     $importedCertificateThumbprint = Normalize-Thumbprint $importedCertificate.Thumbprint
                     $importedCertificateRawHash = Get-RawBytesHash -Bytes $importedCertificate.RawData
+                    $store.Add($importedCertificate)
                 }
                 else { throw 'Development certificate import was not confirmed.' }
             }
@@ -966,15 +1133,15 @@ try {
     Assert-True (Test-Path -LiteralPath $targetManifest.ManifestPath -PathType Leaf) 'Target update manifest was not created.'
 
     if (-not $PSCmdlet.ShouldProcess("AppX package $PackageIdentityName", 'Register version 0.1.0.0')) { return }
+    $packageMutationStarted = $true
     Invoke-AppxInstall -PackagePath $currentPackage
     $installedByRun = $true
     $installed = Assert-InstalledVersion -IdentityName $PackageIdentityName -ExpectedPublisher $Publisher -ExpectedVersion $currentVersion
     $initialStartup = Assert-StartupDeclaration -Package $installed
-    $initialTerminal = Assert-TerminalIntegration -Package $installed -RequireRegisteredAlias
+    $initialTerminal = Assert-LegacyTerminalIntegrationAbsent -Package $installed
     $initialStatus = Invoke-TrayHealth -Package $installed -TrackedProcesses $trackedProcesses `
         -StatusPath (Join-Path $workRoot 'initial-status.json')
     $healthChecks.initial = $initialStatus.StatusSucceeded
-    $initialAliasRuntime = Invoke-TerminalAliasHealth -Package $installed -StatusRoot $workRoot
 
     $cacheRoot = Join-Path $workRoot 'updater-cache'
     [IO.Directory]::CreateDirectory($cacheRoot) | Out-Null
@@ -988,6 +1155,10 @@ try {
     $upgradedByRun = $true
     $upgradedStartup = Assert-StartupDeclaration -Package $upgraded
     $upgradedTerminal = Assert-TerminalIntegration -Package $upgraded -RequireRegisteredAlias
+    Assert-True (-not $initialTerminal.AliasRegistered -and $upgradedTerminal.AliasRegistered) `
+        'The legacy-to-unified upgrade did not add the SessionHost execution alias.'
+    Assert-True ($initialTerminal.ProfileCount -eq 0 -and $upgradedTerminal.ProfileCount -eq 4) `
+        'The legacy-to-unified upgrade did not add all packaged Windows Terminal profiles.'
     $upgradedStatus = Invoke-TrayHealth -Package $upgraded -TrackedProcesses $trackedProcesses `
         -StatusPath (Join-Path $workRoot 'upgraded-status.json')
     $healthChecks.upgraded = $upgradedStatus.StatusSucceeded
@@ -999,11 +1170,10 @@ try {
     $downgraded = Assert-InstalledVersion -IdentityName $PackageIdentityName -ExpectedPublisher $Publisher -ExpectedVersion $currentVersion
     $downgradedByRun = $true
     $downgradedStartup = Assert-StartupDeclaration -Package $downgraded
-    $downgradedTerminal = Assert-TerminalIntegration -Package $downgraded -RequireRegisteredAlias
+    $downgradedTerminal = Assert-LegacyTerminalIntegrationAbsent -Package $downgraded
     $downgradedStatus = Invoke-TrayHealth -Package $downgraded -TrackedProcesses $trackedProcesses `
         -StatusPath (Join-Path $workRoot 'downgraded-status.json')
     $healthChecks.downgraded = $downgradedStatus.StatusSucceeded
-    $downgradedAliasRuntime = Invoke-TerminalAliasHealth -Package $downgraded -StatusRoot $workRoot
 
     Stop-PackagedAgent -Package $downgraded
     Stop-TrackedProcesses -TrackedProcesses $trackedProcesses
@@ -1017,6 +1187,11 @@ try {
         'The validation package is still registered after Remove-AppxPackage.'
     Assert-True (-not (Test-Path -LiteralPath $terminalAliasPath -PathType Leaf)) `
         'The SessionHost execution alias remains after package removal.'
+    $userFragmentAfter = Get-TerminalUserFragmentFingerprint
+    Assert-True ($userFragmentBefore.Exists -eq $userFragmentAfter.Exists -and
+        $userFragmentBefore.FileCount -eq $userFragmentAfter.FileCount -and
+        [string]$userFragmentBefore.Fingerprint -eq [string]$userFragmentAfter.Fingerprint) `
+        'The lifecycle validation changed the user-owned Windows Terminal Fragment directory.'
 
     $sourceFiles = @(
         'package\AppxManifest.xml',
@@ -1048,12 +1223,12 @@ try {
         'development-only; exact publisher certificate may be imported into LocalMachine TrustedPeople after explicit confirmation'
     }
     else { 'production; Authenticode Valid trusted chain required and no certificate trust import performed' }
-    $evidence = [ordered]@{
+    $pendingEvidence = [ordered]@{
         schema = 'termlink.windows-msix-lifecycle-validation'
-        version = 1
+        version = 2
         generated_at_utc = [DateTime]::UtcNow.ToString('o')
         classification = $classification
-        passed = $true
+        passed = $false
         package_identity = $PackageIdentityName
         publisher = $Publisher
         current_version = $currentVersion
@@ -1083,11 +1258,20 @@ try {
             upgraded_alias_registered = $upgradedTerminal.AliasRegistered
             downgraded_alias_registered = $downgradedTerminal.AliasRegistered
             alias_removed_on_uninstall = $true
-            profile_count = $initialTerminal.ProfileCount
-            profile_guids = $initialTerminal.ProfileGuids
-            fragment_preserved_across_update = (
-                $initialTerminal.ProfileCount -eq $upgradedTerminal.ProfileCount -and
-                $upgradedTerminal.ProfileCount -eq $downgradedTerminal.ProfileCount)
+            profile_count = $upgradedTerminal.ProfileCount
+            profile_guids = $upgradedTerminal.ProfileGuids
+            legacy_to_unified_upgrade_verified = (
+                -not $initialTerminal.AliasRegistered -and
+                $initialTerminal.ProfileCount -eq 0 -and
+                $upgradedTerminal.AliasRegistered -and
+                $upgradedTerminal.ProfileCount -eq 4)
+            unified_to_legacy_downgrade_cleanup_verified = (
+                -not $downgradedTerminal.AliasRegistered -and
+                $downgradedTerminal.ProfileCount -eq 0)
+            user_fragment_present = $userFragmentBefore.Exists
+            user_fragment_file_count = $userFragmentBefore.FileCount
+            user_fragment_untouched = $true
+            visible_profile_coexistence_verified = $false
             alias_runtime_initial = $initialAliasRuntime
             alias_runtime_upgraded = $upgradedAliasRuntime
             alias_runtime_downgraded = $downgradedAliasRuntime
@@ -1095,27 +1279,38 @@ try {
         }
         health_checks = $healthChecks
         target_msix_sha256 = $targetBuild[0].Sha256
-        current_msix_sha256 = $currentBuild[0].Sha256
+        current_msix_sha256 = $legacyBuild.Sha256
+        cleanup_checks = [ordered]@{
+            package_absent = $false
+            validation_owned_development_certificate_absent = $false
+            tracked_processes_absent = $false
+            temporary_workspace_absent = $false
+        }
         source_sha256 = $sourceHashes
     }
-    Write-Evidence -Evidence $evidence -Path $EvidencePath
-    Write-Output "Trusted MSIX lifecycle validation passed. Evidence: $([IO.Path]::GetFullPath($EvidencePath))"
 }
 catch {
-    throw
+    $primaryFailure = $_
 }
 finally {
     Stop-TrackedProcesses -TrackedProcesses $trackedProcesses
-    if ($installedByRun -and -not $uninstalledByRun) {
+    if ($packageMutationStarted) {
         try {
             $remaining = @(Get-AppxPackage -Name $PackageIdentityName -ErrorAction SilentlyContinue |
                 Where-Object { [string]$_.Publisher -eq $Publisher })
             foreach ($package in $remaining) {
                 Remove-AppxPackage -Package $package.PackageFullName -ErrorAction Stop
             }
+            $remainingAfterCleanup = @(Get-AppxPackage -Name $PackageIdentityName -ErrorAction Stop |
+                Where-Object { [string]$_.Publisher -eq $Publisher })
+            if ($remainingAfterCleanup.Count -ne 0) {
+                throw 'The validation-owned package remains registered after cleanup.'
+            }
+            $cleanupPackageAbsent = $true
         }
-        catch { $cleanupErrors += 'Owned package cleanup failed.' }
+        catch { $cleanupErrors += 'Owned package cleanup failed or could not be verified.' }
     }
+    else { $cleanupPackageAbsent = $true }
     if ($null -ne $importedCertificateThumbprint) {
         try {
             $store = [Security.Cryptography.X509Certificates.X509Store]::new('TrustedPeople', 'LocalMachine')
@@ -1125,13 +1320,44 @@ finally {
                     (Normalize-Thumbprint $_.Thumbprint) -eq $importedCertificateThumbprint -and
                     ((Get-RawBytesHash -Bytes $_.RawData) -eq $importedCertificateRawHash)
                 })
-                $matchToRemove = $matches | Select-Object -First 1
-                if ($null -ne $matchToRemove) { $store.Remove($matchToRemove) }
+                foreach ($matchToRemove in $matches) { $store.Remove($matchToRemove) }
             }
             finally { $store.Dispose() }
+            $verifyStore = [Security.Cryptography.X509Certificates.X509Store]::new('TrustedPeople', 'LocalMachine')
+            try {
+                $verifyStore.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+                $remainingCertificates = @($verifyStore.Certificates | Where-Object {
+                    (Normalize-Thumbprint $_.Thumbprint) -eq $importedCertificateThumbprint -and
+                    ((Get-RawBytesHash -Bytes $_.RawData) -eq $importedCertificateRawHash)
+                })
+                if ($remainingCertificates.Count -ne 0) {
+                    throw 'The exact development publisher certificate remains trusted after cleanup.'
+                }
+                $cleanupCertificateAbsent = $true
+            }
+            finally { $verifyStore.Dispose() }
         }
-        catch { $cleanupErrors += 'Exact development certificate cleanup failed.' }
+        catch { $cleanupErrors += 'Exact development certificate cleanup failed or could not be verified.' }
     }
+    else { $cleanupCertificateAbsent = $true }
+
+    $ownedProcessesRemaining = @()
+    foreach ($key in @($trackedProcesses.Keys)) {
+        $processId = [int]$key
+        $expectedPath = [string]$trackedProcesses[$key]
+        $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+        if ($null -eq $process) { continue }
+        try {
+            if ([string]::Equals([IO.Path]::GetFullPath($process.Path), [IO.Path]::GetFullPath($expectedPath),
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                $ownedProcessesRemaining += $processId
+            }
+        }
+        catch { }
+    }
+    if ($ownedProcessesRemaining.Count -eq 0) { $cleanupTrackedProcessesAbsent = $true }
+    else { $cleanupErrors += 'Validation-owned process cleanup failed or could not be verified.' }
+
     if ($null -ne $importedCertificate) { $importedCertificate.Dispose() }
     if ($null -ne $publicCertificate) { $publicCertificate.Dispose() }
     if ($null -ne $certificate) { $certificate.Dispose() }
@@ -1142,10 +1368,32 @@ finally {
         $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
         if ($resolvedWork.StartsWith($temporaryRoot, [StringComparison]::OrdinalIgnoreCase) -and
             [IO.Path]::GetFileName($resolvedWork).StartsWith('TermLink-MsixLifecycle-', [StringComparison]::Ordinal)) {
-            Remove-Item -LiteralPath $resolvedWork -Recurse -Force -ErrorAction SilentlyContinue
+            try {
+                Remove-Item -LiteralPath $resolvedWork -Recurse -Force -ErrorAction Stop
+                if (Test-Path -LiteralPath $resolvedWork) {
+                    throw 'The lifecycle temporary workspace still exists after cleanup.'
+                }
+                $cleanupTemporaryWorkspaceAbsent = $true
+            }
+            catch { $cleanupErrors += 'Lifecycle temporary workspace cleanup failed or could not be verified.' }
         }
+        else { $cleanupErrors += 'Lifecycle temporary workspace failed its cleanup boundary check.' }
     }
-    if ($cleanupErrors.Count -gt 0) {
-        Write-Warning ($cleanupErrors -join ' ')
-    }
+    else { $cleanupTemporaryWorkspaceAbsent = $true }
 }
+
+if ($cleanupErrors.Count -gt 0) {
+    throw ('MSIX lifecycle validation cleanup failed: ' + ($cleanupErrors -join ' '))
+}
+if ($null -ne $primaryFailure) { throw $primaryFailure }
+Assert-True ($null -ne $pendingEvidence) 'The lifecycle validation completed without pending evidence.'
+$pendingEvidence.cleanup_checks.package_absent = $cleanupPackageAbsent
+$pendingEvidence.cleanup_checks.validation_owned_development_certificate_absent = $cleanupCertificateAbsent
+$pendingEvidence.cleanup_checks.tracked_processes_absent = $cleanupTrackedProcessesAbsent
+$pendingEvidence.cleanup_checks.temporary_workspace_absent = $cleanupTemporaryWorkspaceAbsent
+Assert-True ($cleanupPackageAbsent -and $cleanupCertificateAbsent -and
+    $cleanupTrackedProcessesAbsent -and $cleanupTemporaryWorkspaceAbsent) `
+    'The lifecycle validation cleanup proof is incomplete.'
+$pendingEvidence.passed = $true
+Write-Evidence -Evidence $pendingEvidence -Path $EvidencePath
+Write-Output "Trusted MSIX lifecycle validation passed. Evidence: $([IO.Path]::GetFullPath($EvidencePath))"

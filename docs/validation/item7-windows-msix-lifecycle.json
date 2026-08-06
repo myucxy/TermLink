@@ -12,7 +12,7 @@
                           "src/Updater/PowerShellMsixDeployment.cs":  "56dd28d216ebab79a944f877c370452f616c0a2e881f7d11065d82af7d004833",
                           "src/Tray/Program.cs":  "2f1957af83028635619a0ee57336e5d0754c9e5109de3be5c5398afb00849578",
                           "tests/Invoke-DevelopmentMsixLifecycle.ps1":  "315776f6ff922309f8b2e5c77c0172e9a28acbfa4683c1774bf5495a27a11894",
-                          "tests/Validate-TrustedMsixLifecycle.ps1":  "342e7af73a96d2d30e2cad8947dae547eb9fcedc2ef33cd64e3678e10ad46e00"
+                          "tests/Validate-TrustedMsixLifecycle.ps1":  "775d3e49e54b15233b1aa9660be002333da0482573ad2ed35bdd648d00e9bde4"
                       },
     "package_identity":  "TermLink.Terminal.InstallAudit",
     "health_checks":  {
@@ -22,13 +22,13 @@
                       },
     "upgraded":  true,
     "schema":  "termlink.windows-msix-lifecycle-validation",
-    "target_msix_sha256":  "0c4e28fc659917248f3fdaa9ef468e3f01f7f200e7f4a57dbc4a0afff387961f",
-    "current_msix_sha256":  "9de39bfbe8cc54ba1169fa08e0ddd2257c4844b1112fe0fa693597ac05cbf33e",
+    "target_msix_sha256":  "a80f70f02de40f7054fb804beb10b95c186a8bef9089f87b0e1ec7bd4378c9b1",
+    "current_msix_sha256":  "63493df7ad1468a8d9bb45c6c7693985338bf9cc369828ca278f7daa2ed4575f",
     "terminal_checks":  {
                             "execution_alias":  "termlink-session.exe",
-                            "initial_alias_registered":  true,
+                            "initial_alias_registered":  false,
                             "upgraded_alias_registered":  true,
-                            "downgraded_alias_registered":  true,
+                            "downgraded_alias_registered":  false,
                             "alias_removed_on_uninstall":  true,
                             "profile_count":  4,
                             "profile_guids":  [
@@ -37,42 +37,29 @@
                                                   "{7cf2d180-c8be-5b08-99a0-268bd2dc1d6f}",
                                                   "{f5652f1d-a6da-5199-b595-3a1255ce04b4}"
                                               ],
-                            "fragment_preserved_across_update":  true,
-                            "alias_runtime_initial":  {
-                                                          "AliasStarted":  true,
-                                                          "HostPathMatchesPackage":  true,
-                                                          "SessionRegistered":  true,
-                                                          "SessionId":  "140f1850-ba89-4a2e-b490-70c3c7ebba5e",
-                                                          "ShellType":  "1",
-                                                          "OutputMarkerObserved":  true,
-                                                          "ExitCode":  23,
-                                                          "OpenedWindowsTerminalWindow":  false
-                                                      },
+                            "legacy_to_unified_upgrade_verified":  true,
+                            "unified_to_legacy_downgrade_cleanup_verified":  true,
+                            "user_fragment_present":  true,
+                            "user_fragment_file_count":  1,
+                            "user_fragment_untouched":  true,
+                            "visible_profile_coexistence_verified":  false,
+                            "alias_runtime_initial":  null,
                             "alias_runtime_upgraded":  {
                                                            "AliasStarted":  true,
                                                            "HostPathMatchesPackage":  true,
                                                            "SessionRegistered":  true,
-                                                           "SessionId":  "51539ad7-06b4-4620-b8d4-e83617a0b0cc",
+                                                           "SessionId":  "be78b0c9-a2dd-4e61-bf2d-4d4e66ee984c",
                                                            "ShellType":  "1",
                                                            "OutputMarkerObserved":  true,
                                                            "ExitCode":  23,
                                                            "OpenedWindowsTerminalWindow":  false
                                                        },
-                            "alias_runtime_downgraded":  {
-                                                             "AliasStarted":  true,
-                                                             "HostPathMatchesPackage":  true,
-                                                             "SessionRegistered":  true,
-                                                             "SessionId":  "252d86f3-bf1a-4925-9674-0d417cd0b2bf",
-                                                             "ShellType":  "1",
-                                                             "OutputMarkerObserved":  true,
-                                                             "ExitCode":  23,
-                                                             "OpenedWindowsTerminalWindow":  false
-                                                         },
+                            "alias_runtime_downgraded":  null,
                             "user_terminal_windows_opened_or_closed":  false
                         },
     "installed":  true,
     "downgraded":  true,
-    "version":  1,
+    "version":  2,
     "target_version":  "0.2.0.0",
     "rollback_bundle_verified":  true,
     "uninstalled":  true,
@@ -88,11 +75,17 @@
     "trust_chain_status":  "development Authenticode status: UnknownError/UnknownError",
     "direct_downgrade_verified":  true,
     "updater_state":  "Succeeded",
-    "certificate_thumbprint":  "82D60B2DA02921F5B01BD36012503F895449CB5A",
+    "cleanup_checks":  {
+                           "package_absent":  true,
+                           "validation_owned_development_certificate_absent":  true,
+                           "tracked_processes_absent":  true,
+                           "temporary_workspace_absent":  true
+                       },
+    "certificate_thumbprint":  "991AD0EBF9FA4A6C4DE44E1612BD10C3E4908A45",
     "classification":  "development-only; exact publisher certificate may be imported into LocalMachine TrustedPeople after explicit confirmation",
     "publisher":  "CN=TermLink Development Install Audit",
     "development_trust_imported":  true,
-    "generated_at_utc":  "2026-08-06T01:45:18.5093135Z",
+    "generated_at_utc":  "2026-08-06T02:19:39.0733051Z",
     "passed":  true,
     "current_version":  "0.1.0.0"
 }
