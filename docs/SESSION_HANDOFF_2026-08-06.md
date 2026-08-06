@@ -226,6 +226,8 @@ git diff --check
   AppShip `termlink-win64/stable`，版本 `0.1.4` / build `4`，release
   `f0ccb36c-a7fc-4970-a22e-7ac51fed79c4`，artifact `5aa0e737-3f01-407e-9a40-872da1bf0c29`，
   状态 `published`。
+- 公开更新接口验证通过：Windows build `3` 返回最新 `0.1.4` / `4`，build `4` 返回 `no_update`；
+  客户端不会自动下载或安装，也不会关闭现有 Terminal、Agent 或 Shell。
 
 1. 使用包含 `ea09519`、`203ea59` 和 `585d0db` 的 0.2 Windows 构建，在独立 Windows
    验收机上通过普通 `Add-AppxPackage` 持久安装；禁止使用 `ForceApplicationShutdown`，
