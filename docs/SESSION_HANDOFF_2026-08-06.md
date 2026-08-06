@@ -361,3 +361,13 @@ git diff --check
   升级保持原地替换、备份和回滚逻辑，仍允许浏览按钮手动更改目录；HKCU 受限时不影响安装成功。
 - `Validate-WindowsSetup.ps1` 新增自定义目录记忆、无目录自动卸载和状态恢复检查；安装器构建与
   Release Solution 构建均需通过后再发布新 artifact。未记录任何密码、Token 或证书私钥。
+
+## 13. 2026-08-07 Windows 安装器发布 0.1.7
+
+- 使用已验证的单文件 EXE `win-agent/artifacts/TermLink-Setup-0.1.7.0.exe` 发布到
+  `termlink-win64/stable`，版本 `0.1.7` / build `7`，AppShip 状态为 `published`。
+- release `77b3eaf2-c34d-4fcc-aec1-6f29d58a6523`，artifact `a89c6168-041d-4c11-96ad-6fc679c84a53`；
+  制品 SHA-256 为 `6b42d1b38ce473b23fcdd0daab10b1ab1c79639098b2889ba71264211a68a3a5`。
+- 发布使用当前版本自包含安装器的签名审核记录；签名根仍是首版一次性自签名根，不等同于系统
+  受信商业证书。公开更新接口验证：build 6 返回 `optional` / latest 0.1.7 build 7，
+  build 7 返回 `no_update`。
