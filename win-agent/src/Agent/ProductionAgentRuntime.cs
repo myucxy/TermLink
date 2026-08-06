@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -39,6 +40,10 @@ namespace TermLink.Agent
     {
         private static readonly TimeSpan SubscriberIdleTimeout = TimeSpan.FromSeconds(45);
         private static readonly TimeSpan AuthorityCacheDuration = TimeSpan.FromSeconds(30);
+        private const int DefaultFlowWindowEvents = 128;
+        private const ulong DefaultFlowWindowWireBytes = 3UL << 20;
+        private const int MaxFlowWindowEvents = 4096;
+        private const ulong MaxFlowWindowWireBytes = 8UL << 20;
         private sealed class CommittedEvent { public ManagedShellType ShellType; public LocalFrame Frame; }
         private sealed class PendingSession { public ManagedShellType ShellType; }
         private sealed class Subscriber
@@ -51,6 +56,13 @@ namespace TermLink.Agent
             public DateTime LastActivityUtc;
             public ulong HighestAck;
             public ulong LastSentSequence;
+            public bool FlowPaused;
+            public int FlowWindowEvents = DefaultFlowWindowEvents;
+            public ulong FlowWindowWireBytes = DefaultFlowWindowWireBytes;
+            public ulong FlowControlEpoch;
+            public ulong InFlightWireBytes;
+            public readonly SortedDictionary<ulong, byte[]> SentFrames = new SortedDictionary<ulong, byte[]>();
+            public bool DrainRequested;
             public bool Removed;
         }
         private sealed class LeaseStatus
@@ -449,7 +461,7 @@ namespace TermLink.Agent
                 AddProofHeaders(active.Options, HttpMethod.Get, "/v1/realtime", Array.Empty<byte>(), accessToken);
                 var wsUri = new Uri(config.ServerUrl.Replace("https://", "wss://", StringComparison.OrdinalIgnoreCase) + "/v1/realtime");
                 await active.ConnectAsync(wsUri, token).ConfigureAwait(false);
-                var hello = Encoding.UTF8.GetBytes("{\"role\":\"pc\",\"protocol_versions\":[1],\"capabilities\":[\"cumulative_ack\",\"e2ee_x25519_chacha20poly1305\",\"lease_v1\",\"bounded_event_replay_v1\"]}");
+                var hello = Encoding.UTF8.GetBytes("{\"role\":\"pc\",\"protocol_versions\":[1],\"capabilities\":[\"cumulative_ack\",\"e2ee_x25519_chacha20poly1305\",\"flow_control_v1\",\"lease_v1\",\"bounded_event_replay_v1\"]}");
                 try { await SendWebSocketAsync(active, hello, WebSocketMessageType.Text, true, token).ConfigureAwait(false); }
                 finally { CryptographicOperations.ZeroMemory(hello); }
                 var welcome = new byte[16 * 1024];
@@ -664,11 +676,11 @@ namespace TermLink.Agent
                         {
                             continue;
                         }
-                        await PublishAsync(active, new CommittedEvent { ShellType = pending.Value.ShellType, Frame = frame }, token).ConfigureAwait(false);
+                        var delivered = await PublishAsync(active, new CommittedEvent { ShellType = pending.Value.ShellType, Frame = frame }, token).ConfigureAwait(false);
                         AdvancePublishedSequence(pending.Key, frame.Sequence);
                         if (IsTerminalFrame(frame))
                         {
-                            if (TryRemovePending(pending.Key, pending.Value))
+                            if (delivered && TryRemovePending(pending.Key, pending.Value))
                             {
                                 RemovePublishedSequence(pending.Key);
                             }
@@ -805,12 +817,12 @@ namespace TermLink.Agent
                 (_, current) => Math.Max(current, sequence));
         }
 
-        private async Task PublishAsync(ClientWebSocket active, CommittedEvent item, CancellationToken token)
+        private async Task<bool> PublishAsync(ClientWebSocket active, CommittedEvent item, CancellationToken token)
         {
             if (publishedSequences.TryGetValue(item.Frame.SessionId, out var alreadyPublished) &&
                 item.Frame.Sequence <= alreadyPublished)
             {
-                return;
+                return true;
             }
             if (item.Frame.Type == LocalFrameType.LocalInputObserved)
             {
@@ -828,7 +840,8 @@ namespace TermLink.Agent
                 await UpsertSessionAsync(item, token).ConfigureAwait(false);
             }
             PruneSubscribers();
-            if (!subscribers.TryGetValue(item.Frame.SessionId, out var sessionSubscribers)) return;
+            if (!subscribers.TryGetValue(item.Frame.SessionId, out var sessionSubscribers)) return true;
+            var delivered = true;
             foreach (var subscriber in sessionSubscribers.Values)
             {
                 var messageType = MapMessageType(item.Frame);
@@ -837,10 +850,12 @@ namespace TermLink.Agent
                 var payloadBytes = payload.ToByteArray();
                 try
                 {
-                    await SendEncryptedAsync(active, item.Frame.SessionId, subscriber, messageType, Direction.PcToAndroid, item.Frame.Sequence, payloadBytes, token).ConfigureAwait(false);
+                    if (!await SendEncryptedAsync(active, item.Frame.SessionId, subscriber, messageType, Direction.PcToAndroid, item.Frame.Sequence, payloadBytes, token).ConfigureAwait(false))
+                        delivered = false;
                 }
                 finally { CryptographicOperations.ZeroMemory(payloadBytes); }
             }
+            return delivered;
         }
 
         private async Task UpsertSessionAsync(CommittedEvent item, CancellationToken token)
@@ -916,6 +931,13 @@ namespace TermLink.Agent
             {
                 plaintext = SessionCrypto.Decrypt(sessionKey, envelope.Nonce.ToByteArray(), SessionCrypto.AssociatedData(envelope), envelope.Ciphertext.ToByteArray());
                 TouchSubscriber(subscriber);
+                if (envelope.MessageType != MessageType.Subscribe &&
+                    envelope.MessageType != MessageType.OutputAck &&
+                    envelope.MessageType != MessageType.FlowControl &&
+                    envelope.Ack != 0)
+                {
+                    throw new InvalidDataException("This message type must use ack=0.");
+                }
                 if (envelope.MessageType == MessageType.Subscribe)
                 {
                     var subscribe = SubscribePayload.Parser.ParseFrom(plaintext);
@@ -947,6 +969,27 @@ namespace TermLink.Agent
                         !TryAdvanceSubscriberAck(subscriber, acknowledgement.HighestContiguousSeq))
                     {
                         throw new InvalidDataException("Output acknowledgement is invalid.");
+                    }
+                    if (TakeSubscriberDrainRequest(subscriber))
+                    {
+                        await ReplaySubscriberAsync(active, sessionId, subscriber, acknowledgement.HighestContiguousSeq, token).ConfigureAwait(false);
+                    }
+                    return;
+                }
+                if (envelope.MessageType == MessageType.FlowControl)
+                {
+                    var flow = FlowControlPayload.Parser.ParseFrom(plaintext);
+                    if (flow.HighestContiguousSeq != envelope.Ack ||
+                        flow.ControlEpoch == 0 ||
+                        flow.MaxUnackedEvents > (uint)MaxFlowWindowEvents ||
+                        flow.MaxUnackedWireBytes > MaxFlowWindowWireBytes ||
+                        !TryApplyFlowControl(subscriber, flow))
+                    {
+                        throw new InvalidDataException("Flow control payload is invalid.");
+                    }
+                    if (TakeSubscriberDrainRequest(subscriber))
+                    {
+                        await ReplaySubscriberAsync(active, sessionId, subscriber, flow.HighestContiguousSeq, token).ConfigureAwait(false);
                     }
                     return;
                 }
@@ -1338,12 +1381,13 @@ namespace TermLink.Agent
                 }
                 if (resumeFromSequence > latestSequence)
                     throw new InvalidDataException("Subscribe cursor exceeds the session sequence.");
-                // PublishLoop may be replaying a recovered buffer from zero at
-                // the same time. Advance its cursor before this subscriber is
-                // visible so it cannot receive stale live sends after replay.
-                AdvancePublishedSequence(sessionId, latestSequence);
+                // The publication cursor is global only as a batching hint;
+                // never advance it from a single subscriber replay. Doing so
+                // can make another subscriber skip durable frames that have
+                // not yet reached its socket.
                 subscriber = RememberSubscriber(sessionId, subscriber);
-                ResetSubscriberCursor(subscriber, resumeFromSequence);
+                if (!ResetSubscriberCursor(subscriber, resumeFromSequence))
+                    throw new InvalidDataException("Subscribe cursor regressed below the durable acknowledgement.");
 
                 var gapStart = resumeFromSequence == ulong.MaxValue
                     ? 0
@@ -1398,7 +1442,7 @@ namespace TermLink.Agent
                     var payload = BuildPayload(frame).ToByteArray();
                     try
                     {
-                        await SendEncryptedCoreAsync(
+                        var sent = await SendEncryptedCoreAsync(
                             active,
                             sessionId,
                             subscriber,
@@ -1407,6 +1451,7 @@ namespace TermLink.Agent
                             frame.Sequence,
                             payload,
                             token).ConfigureAwait(false);
+                        if (!sent) break;
                     }
                     finally { CryptographicOperations.ZeroMemory(payload); }
                 }
@@ -1415,12 +1460,89 @@ namespace TermLink.Agent
             QueueHistoryUpload(sessionId, false);
         }
 
-        private async Task SendEncryptedAsync(ClientWebSocket active, Guid sessionId, Subscriber subscriber, MessageType type, Direction direction, ulong sequence, byte[] plaintext, CancellationToken token)
+        private static byte[] GetCachedSubscriberFrameOrState(
+            Subscriber subscriber,
+            ulong sequence,
+            out bool alreadyDelivered,
+            out bool canEncrypt)
+        {
+            alreadyDelivered = false;
+            canEncrypt = false;
+            if (subscriber == null) return null;
+            lock (subscriber.Sync)
+            {
+                if (subscriber.Removed) return null;
+                PruneSubscriberFramesLocked(subscriber);
+                if (sequence <= subscriber.HighestAck)
+                {
+                    alreadyDelivered = true;
+                    return null;
+                }
+                if (subscriber.FlowPaused ||
+                    subscriber.SentFrames.Count >= subscriber.FlowWindowEvents ||
+                    subscriber.InFlightWireBytes >= subscriber.FlowWindowWireBytes)
+                {
+                    // A frame that would exceed the absolute window remains
+                    // in the durable Registry buffer for a later drain.
+                    subscriber.DrainRequested = true;
+                    alreadyDelivered = false;
+                    return null;
+                }
+                if (subscriber.SentFrames.TryGetValue(sequence, out var existing))
+                    return (byte[])existing.Clone();
+                canEncrypt = true;
+                return null;
+            }
+        }
+
+        private static byte[] PrepareNewSubscriberFrame(Subscriber subscriber, ulong sequence, byte[] serialized)
+        {
+            if (subscriber == null || serialized == null || serialized.Length == 0) return null;
+            lock (subscriber.Sync)
+            {
+                if (subscriber.Removed) return null;
+                PruneSubscriberFramesLocked(subscriber);
+                if (sequence <= subscriber.HighestAck) return null;
+                if (subscriber.FlowPaused ||
+                    subscriber.SentFrames.Count >= subscriber.FlowWindowEvents ||
+                    subscriber.InFlightWireBytes + (ulong)serialized.Length > subscriber.FlowWindowWireBytes)
+                {
+                    subscriber.DrainRequested = true;
+                    return null;
+                }
+                if (subscriber.SentFrames.TryGetValue(sequence, out var existing))
+                {
+                    if (!CryptographicOperations.FixedTimeEquals(existing, serialized))
+                        throw new InvalidDataException("same sequence produced different ciphertext");
+                    return (byte[])existing.Clone();
+                }
+                var retained = (byte[])serialized.Clone();
+                subscriber.SentFrames.Add(sequence, retained);
+                subscriber.InFlightWireBytes += (ulong)retained.Length;
+                return (byte[])serialized.Clone();
+            }
+        }
+
+        private static void PruneSubscriberFramesLocked(Subscriber subscriber)
+        {
+            while (subscriber.SentFrames.Count > 0)
+            {
+                var first = subscriber.SentFrames.First();
+                if (first.Key > subscriber.HighestAck) break;
+                subscriber.SentFrames.Remove(first.Key);
+                subscriber.InFlightWireBytes = subscriber.InFlightWireBytes >= (ulong)first.Value.Length
+                    ? subscriber.InFlightWireBytes - (ulong)first.Value.Length
+                    : 0;
+                CryptographicOperations.ZeroMemory(first.Value);
+            }
+        }
+
+        private async Task<bool> SendEncryptedAsync(ClientWebSocket active, Guid sessionId, Subscriber subscriber, MessageType type, Direction direction, ulong sequence, byte[] plaintext, CancellationToken token)
         {
             await socketSendGate.WaitAsync(token).ConfigureAwait(false);
             try
             {
-                await SendEncryptedCoreAsync(
+                return await SendEncryptedCoreAsync(
                     active,
                     sessionId,
                     subscriber,
@@ -1433,21 +1555,35 @@ namespace TermLink.Agent
             finally { socketSendGate.Release(); }
         }
 
-        private async Task SendEncryptedCoreAsync(ClientWebSocket active, Guid sessionId, Subscriber subscriber, MessageType type, Direction direction, ulong sequence, byte[] plaintext, CancellationToken token)
+        private async Task<bool> SendEncryptedCoreAsync(ClientWebSocket active, Guid sessionId, Subscriber subscriber, MessageType type, Direction direction, ulong sequence, byte[] plaintext, CancellationToken token)
         {
+            var cached = GetCachedSubscriberFrameOrState(subscriber, sequence, out var alreadyDelivered, out var canEncrypt);
+            if (alreadyDelivered) return true;
+            if (!canEncrypt && cached == null) return false;
+            if (cached != null)
+            {
+                try
+                {
+                    await active.SendAsync(cached, WebSocketMessageType.Binary, true, token).ConfigureAwait(false);
+                    RecordSubscriberSend(subscriber, sequence);
+                    return true;
+                }
+                finally { CryptographicOperations.ZeroMemory(cached); }
+            }
+
             long keyEpoch;
             var pairwiseKey = SnapshotPairwiseKey(subscriber, out keyEpoch);
-            if (pairwiseKey == null) return;
+            if (pairwiseKey == null) return false;
             var keyId = EpochKeyId(keyEpoch); var cryptoDirection = direction == Direction.PcToAndroid ? CryptoDirection.PcToAndroid : CryptoDirection.AndroidToPc;
             var key = SessionCrypto.DeriveSessionKey(pairwiseKey, sessionId, cryptoDirection, keyId);
             CryptographicOperations.ZeroMemory(pairwiseKey);
             var nonce = NewEnvelopeNonce();
             try
             {
-                // A logical terminal sequence may be encrypted more than once
-                // during cumulative-ACK replay. ChaCha20-Poly1305 nonces must
-                // never repeat under the same session key, so retransmission
-                // uses a fresh random nonce instead of deriving it from seq.
+                // The first serialized Envelope for a logical sequence is
+                // retained per subscriber until ACK. Replays therefore use
+                // byte-identical ciphertext, allowing the Relay to reject a
+                // same-sequence/different-ciphertext substitution.
                 var envelope = new Envelope { ProtocolVersion = 1, MessageType = type, SessionId = ByteString.CopyFrom(GuidBytes(sessionId)), SenderDeviceId = ByteString.CopyFrom(GuidBytes(credentials.DeviceId)), RecipientDeviceId = ByteString.CopyFrom(GuidBytes(subscriber.DeviceId)), Direction = direction, Seq = sequence, SentAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), KeyId = ByteString.CopyFrom(keyId), Nonce = ByteString.CopyFrom(nonce) };
                 var ciphertext = SessionCrypto.Encrypt(key, nonce, SessionCrypto.AssociatedData(envelope), plaintext);
                 try
@@ -1458,8 +1594,15 @@ namespace TermLink.Agent
                 var serialized = envelope.ToByteArray();
                 try
                 {
-                    await active.SendAsync(serialized, WebSocketMessageType.Binary, true, token).ConfigureAwait(false);
+                    var sendBytes = PrepareNewSubscriberFrame(subscriber, sequence, serialized);
+                    if (sendBytes == null) return false;
+                    try
+                    {
+                        await active.SendAsync(sendBytes, WebSocketMessageType.Binary, true, token).ConfigureAwait(false);
+                    }
+                    finally { CryptographicOperations.ZeroMemory(sendBytes); }
                     RecordSubscriberSend(subscriber, sequence);
+                    return true;
                 }
                 finally { CryptographicOperations.ZeroMemory(serialized); }
             }
@@ -1630,15 +1773,17 @@ namespace TermLink.Agent
             }
         }
 
-        private static void ResetSubscriberCursor(Subscriber subscriber, ulong resumeFromSequence)
+        private static bool ResetSubscriberCursor(Subscriber subscriber, ulong resumeFromSequence)
         {
             lock (subscriber.Sync)
             {
-                if (subscriber.Removed) return;
+                if (subscriber.Removed || resumeFromSequence < subscriber.HighestAck) return false;
                 subscriber.HighestAck = resumeFromSequence;
+                PruneSubscriberFramesLocked(subscriber);
                 if (subscriber.LastSentSequence < resumeFromSequence)
                     subscriber.LastSentSequence = resumeFromSequence;
                 subscriber.LastActivityUtc = DateTime.UtcNow;
+                return true;
             }
         }
 
@@ -1658,7 +1803,48 @@ namespace TermLink.Agent
                 if (subscriber.Removed || highestContiguousSequence < subscriber.HighestAck ||
                     highestContiguousSequence > subscriber.LastSentSequence) return false;
                 subscriber.HighestAck = highestContiguousSequence;
+                PruneSubscriberFramesLocked(subscriber);
                 subscriber.LastActivityUtc = DateTime.UtcNow;
+                return true;
+            }
+        }
+
+        private static bool TryApplyFlowControl(Subscriber subscriber, FlowControlPayload flow)
+        {
+            lock (subscriber.Sync)
+            {
+                if (subscriber.Removed || flow.HighestContiguousSeq < subscriber.HighestAck ||
+                    flow.HighestContiguousSeq > subscriber.LastSentSequence ||
+                    flow.ControlEpoch < subscriber.FlowControlEpoch)
+                    return false;
+                var paused = flow.Paused || flow.MaxUnackedEvents == 0 || flow.MaxUnackedWireBytes == 0;
+                if (flow.ControlEpoch == subscriber.FlowControlEpoch)
+                {
+                    return subscriber.HighestAck == flow.HighestContiguousSeq &&
+                        subscriber.FlowPaused == paused &&
+                        subscriber.FlowWindowEvents == (int)flow.MaxUnackedEvents &&
+                        subscriber.FlowWindowWireBytes == flow.MaxUnackedWireBytes;
+                }
+                subscriber.HighestAck = flow.HighestContiguousSeq;
+                subscriber.FlowControlEpoch = flow.ControlEpoch;
+                subscriber.FlowPaused = paused;
+                subscriber.FlowWindowEvents = (int)flow.MaxUnackedEvents;
+                subscriber.FlowWindowWireBytes = flow.MaxUnackedWireBytes;
+                PruneSubscriberFramesLocked(subscriber);
+                subscriber.LastActivityUtc = DateTime.UtcNow;
+                return true;
+            }
+        }
+
+        private static bool TakeSubscriberDrainRequest(Subscriber subscriber)
+        {
+            lock (subscriber.Sync)
+            {
+                if (subscriber.Removed || subscriber.FlowPaused || !subscriber.DrainRequested ||
+                    subscriber.SentFrames.Count >= subscriber.FlowWindowEvents ||
+                    subscriber.InFlightWireBytes >= subscriber.FlowWindowWireBytes)
+                    return false;
+                subscriber.DrainRequested = false;
                 return true;
             }
         }
@@ -1683,6 +1869,7 @@ namespace TermLink.Agent
             if (subscriber == null) return;
             byte[] exchangePublicKey;
             byte[] pairwiseKey;
+            List<byte[]> sentFrames;
             lock (subscriber.Sync)
             {
                 if (subscriber.Removed) return;
@@ -1691,9 +1878,13 @@ namespace TermLink.Agent
                 pairwiseKey = subscriber.PairwiseKey;
                 subscriber.ExchangePublicKey = null;
                 subscriber.PairwiseKey = null;
+                sentFrames = subscriber.SentFrames.Values.ToList();
+                subscriber.SentFrames.Clear();
+                subscriber.InFlightWireBytes = 0;
             }
             if (exchangePublicKey != null) CryptographicOperations.ZeroMemory(exchangePublicKey);
             if (pairwiseKey != null) CryptographicOperations.ZeroMemory(pairwiseKey);
+            foreach (var frame in sentFrames) CryptographicOperations.ZeroMemory(frame);
         }
 
         private void PruneSubscribers()

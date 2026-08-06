@@ -70,9 +70,10 @@ namespace TermLink.Agent
         }
     }
 
-    internal static class ProductionEnrollment
+    public static class ProductionEnrollment
     {
         private const string AuthorizationScopes = "openid offline_access";
+        public const string PublicServerUrl = "https://termlink.kget.cc:8910";
 
         private sealed class ClientConfiguration
         {
@@ -107,12 +108,99 @@ namespace TermLink.Agent
             public int ExpiresIn { get; set; }
         }
 
-        public static int Run(ProductionEnrollmentOptions options)
+        internal static int Run(ProductionEnrollmentOptions options)
         {
             if (options == null) throw new ArgumentNullException(nameof(options));
             RunAsync(options).GetAwaiter().GetResult();
             Console.WriteLine("TermLink account linked.");
             return 0;
+        }
+
+        public static void LoginDirect(string serverUrl, string pcName, string username, string password)
+        {
+            RunDirectAsync(serverUrl, pcName, username, null, password, false).GetAwaiter().GetResult();
+        }
+
+        public static void RegisterDirect(string serverUrl, string pcName, string username, string email, string password, string confirm)
+        {
+            RunDirectAsync(serverUrl, pcName, username, email, password, true, confirm).GetAwaiter().GetResult();
+        }
+
+        private static async Task RunDirectAsync(string serverUrl, string pcName, string username, string email, string password, bool register, string confirm = null)
+        {
+            if (!Uri.TryCreate(serverUrl, UriKind.Absolute, out var server) || server.Scheme != Uri.UriSchemeHttps ||
+                !string.IsNullOrEmpty(server.Query) || !string.IsNullOrEmpty(server.Fragment))
+                throw new ArgumentException("The TermLink server origin is invalid.");
+            if (string.IsNullOrWhiteSpace(username) || username.Length > 128 || string.IsNullOrWhiteSpace(password))
+                throw new ArgumentException("Account credentials are invalid.");
+            using var http = ProductionTls.CreateHttpClient(serverUrl.TrimEnd('/'));
+            http.Timeout = TimeSpan.FromSeconds(20);
+            var client = await GetJsonAsync<ClientConfiguration>(http, serverUrl.TrimEnd('/') + "/v1/client-config", CancellationToken.None).ConfigureAwait(false);
+            ValidateClientConfigurationForDirect(client);
+            if (register)
+            {
+                if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(confirm) || password != confirm)
+                    throw new ArgumentException("Registration fields are invalid.");
+                using var registration = new HttpRequestMessage(HttpMethod.Post, serverUrl.TrimEnd('/') + "/v1/auth/register")
+                {
+                    Content = new StringContent(JsonSerializer.Serialize(new
+                    {
+                        username = username.Trim(), email = email.Trim(), password, password_confirm = confirm
+                    }), Encoding.UTF8, "application/json")
+                };
+                using var registrationResponse = await http.SendAsync(registration, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
+                if (!registrationResponse.IsSuccessStatusCode)
+                    throw new InvalidOperationException("TermLink account registration was rejected.");
+            }
+            var discovery = await GetJsonAsync<OIDCConfiguration>(http, client.OIDCIssuer.TrimEnd('/') + "/.well-known/openid-configuration", CancellationToken.None).ConfigureAwait(false);
+            if (!IsHttps(discovery.TokenEndpoint)) throw new InvalidDataException("OIDC token endpoint is invalid.");
+            using var tokenRequest = new HttpRequestMessage(HttpMethod.Post, discovery.TokenEndpoint)
+            {
+                Content = new FormUrlEncodedContent(new Dictionary<string, string>
+                {
+                    ["grant_type"] = "password", ["client_id"] = client.ClientId,
+                    ["scope"] = AuthorizationScopes, ["username"] = username.Trim(), ["password"] = password
+                })
+            };
+            using var tokenResponse = await http.SendAsync(tokenRequest, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
+            if (!tokenResponse.IsSuccessStatusCode)
+                throw new InvalidOperationException("TermLink account login was rejected.");
+            var tokens = await ReadJsonAsync<TokenResponse>(tokenResponse, CancellationToken.None).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(tokens.AccessToken) || string.IsNullOrWhiteSpace(tokens.RefreshToken) || tokens.ExpiresIn < 30)
+                throw new InvalidDataException("OIDC token response is incomplete.");
+            PersistTokens(serverUrl.TrimEnd('/'), pcName, client, tokens);
+        }
+
+        private static void ValidateClientConfigurationForDirect(ClientConfiguration client)
+        {
+            if (client == null || !IsHttps(client.OIDCIssuer) || string.IsNullOrWhiteSpace(client.ClientId) || string.IsNullOrWhiteSpace(client.RedirectUri))
+                throw new InvalidDataException("TermLink client configuration is invalid.");
+        }
+
+        private static void PersistTokens(string serverUrl, string pcName, ClientConfiguration client, TokenResponse tokens)
+        {
+            var existingConfig = ProductionAgentConfig.TryLoad();
+            if (existingConfig != null && !string.Equals(existingConfig.ServerUrl, serverUrl, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The existing TermLink device is linked to a different server.");
+            using var existingCredentials = ProductionCredentials.TryLoad();
+            DeviceIdentity identity = null;
+            try
+            {
+                identity = existingCredentials == null ? DeviceIdentity.Generate() : existingCredentials.Identity;
+                var deviceId = existingCredentials == null ? Guid.NewGuid() : existingCredentials.DeviceId;
+                ProductionCredentials.SaveWithRefreshToken(deviceId, identity, tokens.AccessToken, tokens.RefreshToken, DateTime.UtcNow.AddSeconds(tokens.ExpiresIn));
+                ProductionAgentConfig.Save(new ProductionAgentConfig
+                {
+                    ServerUrl = serverUrl, PcId = existingConfig == null ? Guid.NewGuid() : existingConfig.PcId,
+                    PcName = existingConfig == null ? (pcName ?? Environment.MachineName) : existingConfig.PcName,
+                    AgentVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown",
+                    KeyEpoch = existingConfig == null ? 1 : existingConfig.KeyEpoch, OIDCIssuer = client.OIDCIssuer, OIDCClientId = client.ClientId
+                });
+            }
+            finally
+            {
+                if (existingCredentials == null) identity?.Dispose();
+            }
         }
 
         private static async Task RunAsync(ProductionEnrollmentOptions options)

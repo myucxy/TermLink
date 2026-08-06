@@ -10,6 +10,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
+    <ProjectReference Include="..\Agent\TermLink.Agent.csproj" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="..\..\..\assets\brand\windows\TermLink.ico"

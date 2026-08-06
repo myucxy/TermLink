@@ -11,6 +11,7 @@
 - `src/Tray`：当前用户托盘和设置 UI；
 - `src/SessionHost`：每会话一个 ConPTY Owner；
 - `src/Updater`：签名更新和回滚；
+- `src/Setup`：单文件传统安装器，引导 payload 解压、登录自启和 Terminal Fragment；
 - `tests`：生命周期、IPC、句柄和 Golden Stream 测试。
 
 正式 Windows 工程固定 .NET SDK 8.0.303，包含 Agent、SessionHost、共享本机控制契约、
@@ -137,6 +138,9 @@ Terminal 与内层 ConPTY。Host 退出后墓碑可安全清理，新开的 Prof
 - `TermLink.Updater`：签名清单校验、部署事务和失败回滚；
 - `TermLink.AgentControl.Validation`：Pipe V4 请求/响应往返验证，不进入产品包。
 
+`TermLink.Setup` 是独立的安装器工程，不加入产品运行时解决方案；由 `package/Build-Setup.ps1`
+先生成并签名 payload，再以资源形式嵌入后发布为单文件 EXE。
+
 Tray 退出不会关闭 Agent 或本地 Shell。默认控制 Pipe 名包含当前用户 SID 的 SHA-256
 截断值；Tray 只消费 `SessionSummary` 和脱敏 `ProductionStatus`，不会获得 Pipe 名、Token、
 密钥、Buffer 路径或终端正文。
@@ -216,6 +220,46 @@ MSIX 使用 `windows.startupTask` 在当前用户登录后启动 `TermLink.Tray.
 启动、升级、降级和卸载；最后按指纹与证书原始字节哈希精确移除本轮证书，包和进程也无残留。
 证据分别位于 `docs/validation/phase1-windows-installer.json` 和
 `docs/validation/item7-windows-msix-lifecycle.json`。该结果只证明开发信任机制，不证明生产证书链。
+
+## 单文件 EXE 安装器
+
+需要传统安装器（而不是 MSIX）时，`package/Build-Setup.ps1` 会把 Agent、SessionHost、Tray、
+Updater 以及 .NET 8 `win-x64` 自包含运行库压缩并嵌入一个 `TermLink.Setup.exe`。安装器默认使用
+`%LOCALAPPDATA%\Programs\TermLink`，也可以在安装向导中选择目录或通过命令行指定目录：
+
+```powershell
+$password = Read-Host 'PFX password' -AsSecureString
+.\package\Build-Setup.ps1 `
+  -Version 0.1.0.0 `
+  -CertificatePath C:\secure\termlink-signing.pfx `
+  -CertificatePassword $password `
+  -TimestampUrl https://your-rfc3161-timestamp.example
+
+& .\artifacts\TermLink-Setup-0.1.0.0.exe --install-dir 'D:\Apps\TermLink'
+```
+
+开发证书构建可以加 `-Development`，但正式发布仍要求代码签名证书和 HTTPS RFC 3161 时间戳。
+安装器会为当前用户创建登录自启，并在
+`%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\TermLink\termlink.json` 生成独立
+Terminal Fragment。Fragment 中的 `commandline` 使用实际安装目录并正确处理空格，不会修改用户的
+`settings.json`；升级会重新生成，卸载只删除仍与安装器记录的哈希一致的文件。
+
+静默卸载使用：
+
+```powershell
+& .\artifacts\TermLink-Setup-0.1.0.0.exe --uninstall 'D:\Apps\TermLink'
+```
+
+该 EXE 是单文件安装器，安装目录内仍保留多个 TermLink 进程文件，这是 ConPTY 会话隔离和 Tray/Agent
+生命周期设计所要求的边界。当前 `TermLink.Updater.exe` 的受控更新事务仍以 MSIX 为目标；传统 EXE
+安装器的安装、升级（原地覆盖）和卸载由 `TermLink.Setup.exe` 负责。
+
+```powershell
+.\tests\Validate-WindowsSetup.ps1
+```
+
+验证脚本使用临时开发证书构建并签名单文件安装器，在带空格的临时目录执行安装、原地升级和卸载，
+核对自包含 payload、固定更新发布者证书、实际安装路径 Terminal Fragment 以及所有权受控清理。
 
 ### 验收 MSIX 的证书信任
 

@@ -469,6 +469,7 @@ namespace TermLink.Tray
         private readonly ToolStripMenuItem relayItem;
         private readonly ToolStripMenuItem accountDevicesItem;
         private readonly ToolStripMenuItem linkAccountItem;
+        private readonly ToolStripMenuItem registerAccountItem;
         private readonly ToolStripMenuItem sessionsItem;
         private readonly ToolStripMenuItem stopAllItem;
         private readonly ToolStripMenuItem enableItem;
@@ -495,7 +496,8 @@ namespace TermLink.Tray
             accountItem = new ToolStripMenuItem(TrayText.Pick("账户：检查中", "Account: checking")) { Enabled = false };
             relayItem = new ToolStripMenuItem(TrayText.Pick("Relay：检查中", "Relay: checking")) { Enabled = false };
             accountDevicesItem = new ToolStripMenuItem(TrayText.Pick("账户与设备", "Account and devices"), null, delegate { OpenAccountDevices(); });
-            linkAccountItem = new ToolStripMenuItem(TrayText.Pick("关联账户…", "Link account..."), null, async delegate { await LinkAccountAsync(); });
+            linkAccountItem = new ToolStripMenuItem(TrayText.Pick("登录账户…", "Sign in..."), null, async delegate { await LoginAccountAsync(); });
+            registerAccountItem = new ToolStripMenuItem(TrayText.Pick("创建账户…", "Create account..."), null, async delegate { await RegisterAccountAsync(); });
             sessionsItem = new ToolStripMenuItem(TrayText.Pick("打开会话", "Open sessions"), null, delegate { OpenSessions(); });
             stopAllItem = new ToolStripMenuItem(TrayText.Pick("停止远程访问", "Stop remote access"), null, delegate { StopAll(); });
             enableItem = new ToolStripMenuItem(TrayText.Pick("恢复远程访问", "Enable remote access"), null, delegate { EnableRemoteAccess(); });
@@ -511,6 +513,7 @@ namespace TermLink.Tray
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(accountDevicesItem);
             menu.Items.Add(linkAccountItem);
+            menu.Items.Add(registerAccountItem);
             menu.Items.Add(sessionsItem);
             menu.Items.Add(stopAllItem);
             menu.Items.Add(enableItem);
@@ -565,7 +568,8 @@ namespace TermLink.Tray
         private void PreferencesChanged()
         {
             accountDevicesItem.Text = TrayText.Pick("账户与设备", "Account and devices");
-            linkAccountItem.Text = TrayText.Pick("关联账户…", "Link account...");
+            linkAccountItem.Text = TrayText.Pick("登录账户…", "Sign in...");
+            registerAccountItem.Text = TrayText.Pick("创建账户…", "Create account...");
             sessionsItem.Text = TrayText.Pick("打开会话", "Open sessions");
             stopAllItem.Text = TrayText.Pick("停止远程访问", "Stop remote access");
             enableItem.Text = TrayText.Pick("恢复远程访问", "Enable remote access");
@@ -652,7 +656,8 @@ namespace TermLink.Tray
                 trayPopup = new TrayPopupForm(
                     OpenMainWindow,
                     StopAll,
-                    EnableRemoteAccess);
+                    EnableRemoteAccess,
+                    LoginAccountAsync);
                 if (latestResponse != null) trayPopup.Apply(latestResponse);
                 else if (latestError != null) trayPopup.ApplyUnavailable(latestError);
             }
@@ -670,7 +675,7 @@ namespace TermLink.Tray
             OpenMainWindow("devices");
         }
 
-        private async Task LinkAccountAsync()
+        private async Task LoginAccountAsync()
         {
             using (var dialog = new AccountLinkForm())
             {
@@ -678,10 +683,10 @@ namespace TermLink.Tray
                 linkAccountItem.Enabled = false;
                 try
                 {
-                    await Task.Run(() => controller.LinkAccount(dialog.ServerUrl, dialog.PcName));
+                    await Task.Run(() => controller.LoginAccount(dialog.Username, dialog.Password, dialog.PcName));
                     var response = await Task.Run(() => controller.RestartAgent());
                     if (!response.Success) throw new InvalidOperationException(response.Code);
-                    notifyIcon.ShowBalloonTip(4000, "TermLink", TrayText.Pick("账户已关联。", "Account linked."), ToolTipIcon.Info);
+                    notifyIcon.ShowBalloonTip(4000, "TermLink", TrayText.Pick("账户已登录。", "Account signed in."), ToolTipIcon.Info);
                     await RefreshStateAsync(false);
                 }
                 catch (Exception error)
@@ -689,6 +694,28 @@ namespace TermLink.Tray
                     ShowFailure(error.Message);
                 }
                 finally { linkAccountItem.Enabled = true; }
+            }
+        }
+
+        private async Task RegisterAccountAsync()
+        {
+            using (var dialog = new AccountRegisterForm())
+            {
+                if (dialog.ShowDialog() != DialogResult.OK) return;
+                registerAccountItem.Enabled = false;
+                try
+                {
+                    await Task.Run(() => controller.RegisterAccount(dialog.Username, dialog.Email, dialog.Password, dialog.Confirm, dialog.PcName));
+                    var response = await Task.Run(() => controller.RestartAgent());
+                    if (!response.Success) throw new InvalidOperationException(response.Code);
+                    notifyIcon.ShowBalloonTip(4000, "TermLink", TrayText.Pick("账户已创建并登录。", "Account created and signed in."), ToolTipIcon.Info);
+                    await RefreshStateAsync(false);
+                }
+                catch (Exception error)
+                {
+                    ShowFailure(error.Message);
+                }
+                finally { registerAccountItem.Enabled = true; }
             }
         }
 
@@ -784,6 +811,7 @@ namespace TermLink.Tray
         private readonly Action<string> navigate;
         private readonly Action stopAllRemoteAccess;
         private readonly Action enableRemoteAccess;
+        private readonly Func<Task> signInAccount;
         private readonly Icon applicationIcon;
         private readonly Bitmap brandBitmap;
         private readonly TableLayoutPanel root;
@@ -809,11 +837,13 @@ namespace TermLink.Tray
         public TrayPopupForm(
             Action<string> navigate,
             Action stopAllRemoteAccess,
-            Action enableRemoteAccess)
+            Action enableRemoteAccess,
+            Func<Task> signInAccount)
         {
             this.navigate = navigate ?? throw new ArgumentNullException(nameof(navigate));
             this.stopAllRemoteAccess = stopAllRemoteAccess ?? throw new ArgumentNullException(nameof(stopAllRemoteAccess));
             this.enableRemoteAccess = enableRemoteAccess ?? throw new ArgumentNullException(nameof(enableRemoteAccess));
+            this.signInAccount = signInAccount ?? throw new ArgumentNullException(nameof(signInAccount));
             applicationIcon = BrandIcons.LoadApplicationIcon();
             brandBitmap = applicationIcon.ToBitmap();
 
@@ -972,13 +1002,13 @@ namespace TermLink.Tray
                 TrayText.Pick("打开受管会话", "Open managed sessions"),
                 TrayText.Pick("在主窗口打开受管会话", "Open managed sessions in the main window"));
             accountButton = CreatePopupButton(
-                TrayText.Pick("账户与会员 ›", "Account & membership ›"),
-                TrayText.Pick("打开账户与会员", "Open account and membership"));
+                TrayText.Pick("登录账户 ›", "Sign in ›"),
+                TrayText.Pick("直接登录 TermLink 账户", "Sign in to the TermLink account directly"));
             remoteActionButton = CreatePopupButton(
                 TrayText.Pick("检查远程访问状态", "Check remote access status"),
                 TrayText.Pick("停止或恢复远程访问", "Stop or enable remote access"));
             openSessionsButton.Click += delegate { OpenPage("sessions"); };
-            accountButton.Click += delegate { OpenPage("membership"); };
+            accountButton.Click += async delegate { await signInAccount(); };
             remoteActionButton.Click += delegate
             {
                 if (latestResponse == null)
@@ -1063,11 +1093,11 @@ namespace TermLink.Tray
                 ? TrayText.Pick("未配置服务器", "No server")
                 : production.ServerHost;
             policyLabel.Text = response.RemoteAccessEnabled
-                ? TrayText.Pick("已批准设备可按授权连接", "Approved devices may connect")
+                ? TrayText.Pick("同账号设备默认可连接并操作", "Same-account devices can connect and operate by default")
                 : TrayText.Pick("远程访问已停止", "Remote access is stopped");
             accountButton.Text = production.AccountLinked
-                ? TrayText.Pick("账户已关联 · 查看会员 ›", "Account linked · view membership ›")
-                : TrayText.Pick("关联账户 · 查看账户页面 ›", "Link account · open account page ›");
+                ? TrayText.Pick("账户已登录 · 重新登录 ›", "Account signed in · sign in again ›")
+                : TrayText.Pick("登录账户 ›", "Sign in ›");
             remoteActionButton.Text = response.RemoteAccessEnabled
                 ? TrayText.Pick("停止所有远程访问", "Stop all remote access")
                 : TrayText.Pick("恢复远程访问", "Enable remote access");
@@ -1090,7 +1120,7 @@ namespace TermLink.Tray
             connectionDetailLabel.Text = TrayText.Pick("需要检查", "Needs attention");
             policyLabel.Text = TrayText.Pick("无法读取远程策略", "Remote policy unavailable");
             sessionCountLabel.Text = "0";
-            accountButton.Text = TrayText.Pick("账户与会员 ›", "Account & membership ›");
+            accountButton.Text = TrayText.Pick("登录账户 ›", "Sign in ›");
             remoteActionButton.Text = TrayText.Pick("远程访问状态不可用", "Remote access unavailable");
             remoteActionButton.Enabled = true;
             ShowEmptySessions(TrayText.Pick("无法读取 Agent 状态\r\n请打开 TermLink 查看诊断", "Agent status is unavailable\r\nOpen TermLink for diagnostics"));
@@ -1130,7 +1160,7 @@ namespace TermLink.Tray
             connectionLabel.Text = TrayText.Pick("○ 正在连接", "○ Connecting");
             connectionDetailLabel.Text = string.Empty;
             policyLabel.Text = TrayText.Pick("正在读取状态", "Reading status");
-            accountButton.Text = TrayText.Pick("账户与会员 ›", "Account & membership ›");
+            accountButton.Text = TrayText.Pick("登录账户 ›", "Sign in ›");
             remoteActionButton.Text = TrayText.Pick("检查远程访问状态", "Check remote access status");
             remoteActionButton.Enabled = true;
             sessionCountLabel.Text = "0";
@@ -1400,20 +1430,21 @@ namespace TermLink.Tray
 
     internal sealed class AccountLinkForm : Form
     {
-        private readonly TextBox server;
+        private readonly TextBox username;
+        private readonly TextBox password;
         private readonly TextBox pcName;
 
         public AccountLinkForm()
         {
-            Text = TrayText.Pick("关联 TermLink 账户", "Link TermLink account");
+            Text = TrayText.Pick("登录 TermLink 账户", "Sign in to TermLink");
             Icon = BrandIcons.LoadApplicationIcon();
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
-            ClientSize = new Size(500, 224);
+            ClientSize = new Size(500, 300);
             AutoScaleMode = AutoScaleMode.Dpi;
-            AccessibleName = TrayText.Pick("TermLink 浏览器账户授权", "TermLink browser account authorization");
+            AccessibleName = TrayText.Pick("TermLink 账户登录", "TermLink account sign in");
 
             var explanation = new Label
             {
@@ -1421,27 +1452,33 @@ namespace TermLink.Tray
                 Location = new Point(16, 14),
                 Size = new Size(468, 52),
                 Text = TrayText.Pick(
-                    "在系统浏览器中安全关联此 PC。\r\nTermLink 使用 Authorization Code + PKCE。",
-                    "Open your browser to link this PC securely.\r\nTermLink uses Authorization Code + PKCE."),
+                    "直接在此窗口登录，密码只通过 HTTPS 发送到 TermLink。\r\n登录后此 PC 会自动连接到你的账号。",
+                    "Sign in directly in this window. The password is sent only over HTTPS.\r\nThis PC connects to your account after sign-in."),
                 UseMnemonic = false
             };
-            var serverLabel = new Label { AutoSize = true, Location = new Point(16, 79), Text = TrayText.Pick("服务器 HTTPS 地址", "Server HTTPS URL"), UseMnemonic = false };
-            server = new TextBox
+            var serverLabel = new Label { AutoSize = true, Location = new Point(16, 79), Text = TrayText.Pick("TermLink 服务", "TermLink service"), UseMnemonic = false };
+            var server = new TextBox
             {
                 Location = new Point(180, 75),
                 Size = new Size(304, 25),
-                Text = "https://termlink.kget.cc:8910"
+                Text = ProductionEnrollment.PublicServerUrl,
+                ReadOnly = true,
+                TabStop = false
             };
-            var nameLabel = new Label { AutoSize = true, Location = new Point(16, 117), Text = TrayText.Pick("PC 名称", "PC name"), UseMnemonic = false };
+            var usernameLabel = new Label { AutoSize = true, Location = new Point(16, 117), Text = TrayText.Pick("用户名或邮箱", "Username or email"), UseMnemonic = false };
+            username = new TextBox { Location = new Point(180, 113), Size = new Size(304, 25) };
+            var passwordLabel = new Label { AutoSize = true, Location = new Point(16, 155), Text = TrayText.Pick("密码", "Password"), UseMnemonic = false };
+            password = new TextBox { Location = new Point(180, 151), Size = new Size(304, 25), UseSystemPasswordChar = true };
+            var nameLabel = new Label { AutoSize = true, Location = new Point(16, 193), Text = TrayText.Pick("PC 名称", "PC name"), UseMnemonic = false };
             pcName = new TextBox
             {
-                Location = new Point(180, 113),
+                Location = new Point(180, 189),
                 Size = new Size(304, 25),
                 Text = Environment.MachineName
             };
-            var cancel = new Button { Text = TrayText.Pick("取消", "Cancel"), DialogResult = DialogResult.Cancel, Location = new Point(218, 171), Size = new Size(88, 34), Anchor = AnchorStyles.Bottom | AnchorStyles.Right, UseMnemonic = false, AccessibleName = TrayText.Pick("取消账户关联", "Cancel account linking") };
-            var link = new Button { Text = TrayText.Pick("打开浏览器", "Open browser"), DialogResult = DialogResult.OK, Location = new Point(314, 171), Size = new Size(170, 34), Anchor = AnchorStyles.Bottom | AnchorStyles.Right, UseMnemonic = false, AccessibleName = TrayText.Pick("打开系统浏览器进行账户关联", "Open system browser for account linking") };
-            Controls.AddRange(new Control[] { explanation, serverLabel, server, nameLabel, pcName, cancel, link });
+            var cancel = new Button { Text = TrayText.Pick("取消", "Cancel"), DialogResult = DialogResult.Cancel, Location = new Point(218, 245), Size = new Size(88, 34), Anchor = AnchorStyles.Bottom | AnchorStyles.Right, UseMnemonic = false, AccessibleName = TrayText.Pick("取消账户登录", "Cancel account sign in") };
+            var link = new Button { Text = TrayText.Pick("登录", "Sign in"), DialogResult = DialogResult.OK, Location = new Point(314, 245), Size = new Size(170, 34), Anchor = AnchorStyles.Bottom | AnchorStyles.Right, UseMnemonic = false, AccessibleName = TrayText.Pick("直接登录 TermLink 账户", "Sign in to TermLink account") };
+            Controls.AddRange(new Control[] { explanation, serverLabel, server, usernameLabel, username, passwordLabel, password, nameLabel, pcName, cancel, link });
             AcceptButton = link;
             CancelButton = cancel;
             ApplyThemeToDialog(this, TrayPalette.For(TrayPreferences.Theme));
@@ -1453,30 +1490,30 @@ namespace TermLink.Tray
             TrayWindowChrome.Apply(this, TrayPalette.For(TrayPreferences.Theme));
         }
 
-        public string ServerUrl { get { return server.Text.Trim(); } }
+        public string ServerUrl { get { return ProductionEnrollment.PublicServerUrl; } }
+        public string Username { get { return username.Text.Trim(); } }
+        public string Password { get { return password.Text; } }
         public string PcName { get { return pcName.Text.Trim(); } }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            string origin = null;
             string normalizedName = null;
             if (DialogResult == DialogResult.OK &&
-                (!TrayInputValidation.TryNormalizeServerOrigin(ServerUrl, out origin) ||
+                (string.IsNullOrWhiteSpace(Username) || string.IsNullOrWhiteSpace(Password) ||
                     !TrayInputValidation.TryNormalizePcName(PcName, out normalizedName)))
             {
-                MessageBox.Show(TrayText.Pick("请输入不含路径、查询或登录信息的 HTTPS 服务器 Origin，以及 1–80 个字符的 PC 名称。", "Enter an HTTPS server origin without a path, query, or credentials, and a 1–80 character PC name."), "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(TrayText.Pick("请输入用户名、密码和有效的 PC 名称。", "Enter a username, password, and valid PC name."), "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 e.Cancel = true;
                 return;
             }
             if (DialogResult == DialogResult.OK)
             {
-                server.Text = origin;
                 pcName.Text = normalizedName;
             }
             base.OnFormClosing(e);
         }
 
-        private static void ApplyThemeToDialog(Control control, TrayPalette palette)
+        internal static void ApplyThemeToDialog(Control control, TrayPalette palette)
         {
             control.BackColor = palette.Canvas;
             control.ForeColor = palette.Text;
@@ -1495,6 +1532,71 @@ namespace TermLink.Tray
                 button.ForeColor = palette.Text;
             }
             foreach (Control child in control.Controls) ApplyThemeToDialog(child, palette);
+        }
+    }
+
+    internal sealed class AccountRegisterForm : Form
+    {
+        private readonly TextBox username;
+        private readonly TextBox email;
+        private readonly TextBox password;
+        private readonly TextBox confirm;
+        private readonly TextBox pcName;
+
+        public AccountRegisterForm()
+        {
+            Text = TrayText.Pick("创建 TermLink 账户", "Create TermLink account");
+            Icon = BrandIcons.LoadApplicationIcon();
+            StartPosition = FormStartPosition.CenterScreen;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ClientSize = new Size(500, 370);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            AccessibleName = TrayText.Pick("TermLink 账户注册", "TermLink account registration");
+            var explanation = new Label { AutoSize = false, Location = new Point(16, 14), Size = new Size(468, 42), Text = TrayText.Pick("直接在此窗口创建账号，密码只通过 HTTPS 发送到固定服务。", "Create the account directly in this window. The password is sent only over HTTPS."), UseMnemonic = false };
+            var serviceLabel = new Label { AutoSize = true, Location = new Point(16, 70), Text = TrayText.Pick("TermLink 服务", "TermLink service"), UseMnemonic = false };
+            var service = new TextBox { Location = new Point(180, 66), Size = new Size(304, 25), Text = ProductionEnrollment.PublicServerUrl, ReadOnly = true, TabStop = false };
+            var usernameLabel = new Label { AutoSize = true, Location = new Point(16, 108), Text = TrayText.Pick("用户名", "Username"), UseMnemonic = false };
+            username = new TextBox { Location = new Point(180, 104), Size = new Size(304, 25) };
+            var emailLabel = new Label { AutoSize = true, Location = new Point(16, 146), Text = TrayText.Pick("邮箱", "Email"), UseMnemonic = false };
+            email = new TextBox { Location = new Point(180, 142), Size = new Size(304, 25) };
+            var passwordLabel = new Label { AutoSize = true, Location = new Point(16, 184), Text = TrayText.Pick("密码", "Password"), UseMnemonic = false };
+            password = new TextBox { Location = new Point(180, 180), Size = new Size(304, 25), UseSystemPasswordChar = true };
+            var confirmLabel = new Label { AutoSize = true, Location = new Point(16, 222), Text = TrayText.Pick("确认密码", "Confirm password"), UseMnemonic = false };
+            confirm = new TextBox { Location = new Point(180, 218), Size = new Size(304, 25), UseSystemPasswordChar = true };
+            var nameLabel = new Label { AutoSize = true, Location = new Point(16, 260), Text = TrayText.Pick("PC 名称", "PC name"), UseMnemonic = false };
+            pcName = new TextBox { Location = new Point(180, 256), Size = new Size(304, 25), Text = Environment.MachineName };
+            var cancel = new Button { Text = TrayText.Pick("取消", "Cancel"), DialogResult = DialogResult.Cancel, Location = new Point(218, 318), Size = new Size(88, 34), Anchor = AnchorStyles.Bottom | AnchorStyles.Right, UseMnemonic = false };
+            var submit = new Button { Text = TrayText.Pick("创建并登录", "Create and sign in"), DialogResult = DialogResult.OK, Location = new Point(314, 318), Size = new Size(170, 34), Anchor = AnchorStyles.Bottom | AnchorStyles.Right, UseMnemonic = false };
+            Controls.AddRange(new Control[] { explanation, serviceLabel, service, usernameLabel, username, emailLabel, email, passwordLabel, password, confirmLabel, confirm, nameLabel, pcName, cancel, submit });
+            AcceptButton = submit;
+            CancelButton = cancel;
+            AccountLinkForm.ApplyThemeToDialog(this, TrayPalette.For(TrayPreferences.Theme));
+        }
+
+        public string Username { get { return username.Text.Trim(); } }
+        public string Email { get { return email.Text.Trim(); } }
+        public string Password { get { return password.Text; } }
+        public string Confirm { get { return confirm.Text; } }
+        public string PcName { get { return pcName.Text.Trim(); } }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            TrayWindowChrome.Apply(this, TrayPalette.For(TrayPreferences.Theme));
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (DialogResult == DialogResult.OK && (Username.Length < 3 || Email.Length < 3 || Password.Length < 8 || Password != Confirm || !TrayInputValidation.TryNormalizePcName(PcName, out var normalized)))
+            {
+                MessageBox.Show(TrayText.Pick("请填写有效的用户名、邮箱、密码和 PC 名称。", "Enter a valid username, email, password, and PC name."), "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                e.Cancel = true;
+                return;
+            }
+            if (DialogResult == DialogResult.OK && TrayInputValidation.TryNormalizePcName(PcName, out var pc)) pcName.Text = pc;
+            base.OnFormClosing(e);
         }
     }
 
@@ -1573,7 +1675,7 @@ namespace TermLink.Tray
         private readonly Bitmap brandBitmap;
         private readonly List<string> navigationOrder = new List<string>
         {
-            "sessions", "remote", "devices", "activity", "settings", "membership"
+            "sessions", "remote", "devices", "activity", "settings"
         };
         private string currentPage = "sessions";
         private Control activePage;
@@ -1761,7 +1863,6 @@ namespace TermLink.Tray
                 case "devices": CreateDevicesPage(); break;
                 case "activity": CreateActivityPage(); break;
                 case "settings": CreateSettingsPage(); break;
-                case "membership": CreateMembershipPage(); break;
                 default: CreateSessionsPage(); break;
             }
             ApplyTheme();
@@ -1793,7 +1894,6 @@ namespace TermLink.Tray
             if (devicesChild != null && !devicesChild.IsDisposed) devicesChild.Apply(response);
             UpdateRemotePage(production);
             UpdateActivityPage(production);
-            UpdateMembershipPage(production);
         }
 
         public void ApplyUnavailable(Exception error)
@@ -1862,7 +1962,6 @@ namespace TermLink.Tray
                 case "devices": return "◇ " + NavigationDisplayLabel(key);
                 case "activity": return "⌁ " + NavigationDisplayLabel(key);
                 case "settings": return "⚙ " + NavigationDisplayLabel(key);
-                case "membership": return "◎ " + NavigationDisplayLabel(key);
                 default: return "▣ " + NavigationDisplayLabel(key);
             }
         }
@@ -1872,10 +1971,9 @@ namespace TermLink.Tray
             switch (key)
             {
                 case "remote": return TrayText.Pick("远程访问", "Remote access");
-                case "devices": return TrayText.Pick("可信设备", "Devices");
+                case "devices": return TrayText.Pick("设备", "Devices");
                 case "activity": return TrayText.Pick("活动", "Activity");
                 case "settings": return TrayText.Pick("设置", "Settings");
-                case "membership": return TrayText.Pick("账户与会员", "Account");
                 default: return TrayText.Pick("会话", "Sessions");
             }
         }
@@ -1885,10 +1983,9 @@ namespace TermLink.Tray
             switch (key)
             {
                 case "remote": return TrayText.Pick("远程访问", "Remote access");
-                case "devices": return TrayText.Pick("可信设备", "Trusted devices");
+                case "devices": return TrayText.Pick("设备列表", "Device list");
                 case "activity": return TrayText.Pick("活动与诊断", "Activity & diagnostics");
                 case "settings": return TrayText.Pick("Agent 设置", "Agent settings");
-                case "membership": return TrayText.Pick("账户与会员", "Account & membership");
                 default: return TrayText.Pick("会话", "Sessions");
             }
         }
@@ -1965,9 +2062,9 @@ namespace TermLink.Tray
         {
             Panel body;
             var shell = CreatePageShell(
-                TrayText.Pick("身份与信任", "Identity & trust"),
+                TrayText.Pick("账户设备", "Account devices"),
                 TrayText.Pick("设备", "Devices"),
-                TrayText.Pick("批准、配对或撤销可信设备。", "Approve, pair or revoke trusted devices."),
+                TrayText.Pick("查看当前账号下已注册的设备。", "View devices registered to the current account."),
                 out body);
             devicesChild = devicesChild == null || devicesChild.IsDisposed ? new AccountDevicesForm(controller) : devicesChild;
             devicesChild.TopLevel = false;
@@ -2003,7 +2100,7 @@ namespace TermLink.Tray
             remoteStatusLabel = CreateValueLabel(TrayText.Pick("正在读取…", "Loading…"), 18, true);
             remoteConnectionLabel = CreateValueLabel("", 10, false);
             remoteSessionsLabel = CreateValueLabel("", 10, false);
-            remotePolicyLabel = CreateValueLabel(TrayText.Pick("CONTROL 权限可申请控制 · 本地输入立即收回控制", "CONTROL permission may request control · local input immediately reclaims control"), 10, false);
+            remotePolicyLabel = CreateValueLabel(TrayText.Pick("同账号设备默认具备完整访问 · 本地输入立即收回控制", "Same-account devices have full access by default · local input immediately reclaims control"), 10, false);
             statusBody.Controls.Add(remoteStatusLabel);
             statusBody.Controls.Add(remoteConnectionLabel);
             statusBody.Controls.Add(remoteSessionsLabel);
@@ -2128,7 +2225,7 @@ namespace TermLink.Tray
             accountBody.Controls.Add(membershipAccountDetailLabel);
             var accountActions = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(0, 10, 0, 0) };
             var linkButton = CreateButton(TrayText.Pick("在浏览器中关联账户", "Link account in browser"));
-            linkButton.Click += async delegate { await LinkAccountFromWindowAsync(); };
+            linkButton.Click += async delegate { await LoginAccountFromWindowAsync(); };
             linkButton.AccessibleName = TrayText.Pick("在系统浏览器中关联 TermLink 账户", "Link TermLink account in the system browser");
             accountActions.Controls.Add(linkButton);
             accountBody.Controls.Add(accountActions);
@@ -2160,7 +2257,7 @@ namespace TermLink.Tray
                         ? TrayText.Pick("○ 策略已开启 · 等待账户关联", "○ Policy enabled · awaiting account link")
                         : !connected
                             ? TrayText.Pick("○ 策略已开启 · Relay 未连接", "○ Policy enabled · Relay not connected")
-                            : TrayText.Pick("● 可信设备可按授权查看或申请控制", "● Trusted devices may view or request control according to grants");
+                            : TrayText.Pick("● 同账号设备可查看并申请控制", "● Same-account devices can view and request control");
             remoteConnectionLabel.Text = TrayText.Pick("Relay：", "Relay: ") +
                 (connected ? TrayText.Pick("已连接", "connected") : TrayDisplay.LocalizedRelayStatus(production == null ? ProductionRelayState.NotConfigured : production.RelayState));
             var viewerCount = 0;
@@ -2174,7 +2271,7 @@ namespace TermLink.Tray
             remoteSessionsLabel.Text = TrayText.Pick("活动会话：", "Active sessions: ") +
                 (latestResponse.Summaries == null ? 0 : latestResponse.Summaries.Count) +
                 TrayText.Pick(" · 查看者 " + viewerCount, " · viewers " + viewerCount);
-            remotePolicyLabel.Text = TrayText.Pick("可信设备需具备 CONTROL 权限 · 本地输入立即抢回控制权", "A trusted device needs CONTROL permission · local input immediately reclaims control");
+            remotePolicyLabel.Text = TrayText.Pick("同账号设备默认具备完整访问 · 本地输入立即抢回控制权", "Same-account devices have full access by default · local input immediately reclaims control");
             remoteToggleButton.Text = latestResponse.RemoteAccessEnabled
                 ? TrayText.Pick("停止远程访问", "Stop remote access")
                 : TrayText.Pick("恢复远程访问", "Enable remote access");
@@ -2266,7 +2363,7 @@ namespace TermLink.Tray
             finally { SetBusy(false); }
         }
 
-        private async Task LinkAccountFromWindowAsync()
+        private async Task LoginAccountFromWindowAsync()
         {
             using (var dialog = new AccountLinkForm())
             {
@@ -2274,14 +2371,14 @@ namespace TermLink.Tray
                 SetBusy(true);
                 try
                 {
-                    await Task.Run(() => controller.LinkAccount(dialog.ServerUrl, dialog.PcName));
+                    await Task.Run(() => controller.LoginAccount(dialog.Username, dialog.Password, dialog.PcName));
                     var response = await Task.Run(() => controller.RestartAgent());
                     if (!response.Success) throw new InvalidOperationException(response.Code);
                     Apply(response);
                 }
                 catch (Exception)
                 {
-                    MessageBox.Show(TrayText.Pick("账户关联未完成，请重试或查看诊断。", "Account linking did not complete. Retry or open diagnostics."), "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show(TrayText.Pick("账户登录未完成，请重试或查看诊断。", "Account sign-in did not complete. Retry or open diagnostics."), "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
                 finally { SetBusy(false); }
             }
@@ -2741,7 +2838,7 @@ namespace TermLink.Tray
             MinimumSize = new Size(780, 520);
             Size = new Size(920, 620);
             AutoScaleMode = AutoScaleMode.Dpi;
-            AccessibleName = TrayText.Pick("TermLink 账户与可信设备", "TermLink account and trusted devices");
+            AccessibleName = TrayText.Pick("TermLink 账户设备", "TermLink account devices");
 
             stateLabel = new Label
             {
@@ -2787,12 +2884,12 @@ namespace TermLink.Tray
                 MultiSelect = false,
                 View = View.Details,
                 ShowItemToolTips = true,
-                AccessibleName = TrayText.Pick("可信设备列表", "Trusted devices list")
+                AccessibleName = TrayText.Pick("账户设备列表", "Account devices list")
             };
             TrayListViewStyle.Configure(devices);
             devices.Columns.Add(TrayText.Pick("名称", "Name"), 300);
             devices.Columns.Add(TrayText.Pick("类型", "Type"), 150);
-            devices.Columns.Add(TrayText.Pick("信任状态", "Trust"), 150);
+            devices.Columns.Add(TrayText.Pick("状态", "Status"), 150);
             devices.ClientSizeChanged += delegate { FitDeviceColumns(); };
             devices.SelectedIndexChanged += delegate { UpdateActions(); };
 
@@ -2823,11 +2920,10 @@ namespace TermLink.Tray
             pairingPermission.SelectedIndex = 0;
             pairingPermission.SelectedIndexChanged += delegate { UpdateActions(); };
             TrayComboBoxStyle.Configure(pairingPermission);
+            // Account/device authorization is automatic in the first release.
+            // Keep the legacy pairing controls in code for protocol compatibility,
+            // but do not expose them in the product UI.
             actions.Controls.Add(refreshButton);
-            actions.Controls.Add(revokeButton);
-            actions.Controls.Add(grantButton);
-            actions.Controls.Add(createChallengeButton);
-            actions.Controls.Add(pairingPermission);
 
             challengeCodeValue = CreateReadOnlyTextBox();
             challengePermissionValue = CreateValueLabel();
@@ -2870,7 +2966,6 @@ namespace TermLink.Tray
             challenge.Controls.Add(challengeGrid);
 
             Controls.Add(devices);
-            Controls.Add(challenge);
             Controls.Add(actions);
             Controls.Add(details);
             Controls.Add(stateLabel);
@@ -2937,7 +3032,7 @@ namespace TermLink.Tray
                     if (device == null) continue;
                     var item = new ListViewItem(TrayDisplay.StringOrDash(device.Name)) { Tag = device };
                     item.SubItems.Add(TrayDisplay.StringOrDash(device.Type));
-                    item.SubItems.Add(TrayDisplay.StringOrDash(device.TrustState));
+                    item.SubItems.Add(DeviceAvailabilityLabel(device));
                     item.ToolTipText = device.DeviceId == Guid.Empty ? string.Empty : "Device " + device.DeviceId.ToString("D");
                     devices.Items.Add(item);
                 }
@@ -2959,6 +3054,13 @@ namespace TermLink.Tray
                 AutoEllipsis = true,
                 Padding = new Padding(2, 0, 8, 0)
             };
+        }
+
+        private static string DeviceAvailabilityLabel(ProductionDeviceSummary device)
+        {
+            if (device != null && string.Equals(device.TrustState, "REVOKED", StringComparison.OrdinalIgnoreCase))
+                return TrayText.Pick("已停用", "Disabled");
+            return TrayText.Pick("已登记", "Registered");
         }
 
         private void FitDeviceColumns()

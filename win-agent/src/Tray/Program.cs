@@ -286,6 +286,16 @@ namespace TermLink.Tray
             }
         }
 
+        public void LoginAccount(string username, string password, string pcName)
+        {
+            ProductionEnrollment.LoginDirect(ProductionEnrollment.PublicServerUrl, pcName, username, password);
+        }
+
+        public void RegisterAccount(string username, string email, string password, string confirm, string pcName)
+        {
+            ProductionEnrollment.RegisterDirect(ProductionEnrollment.PublicServerUrl, pcName, username, email, password, confirm);
+        }
+
         private bool TryList(int timeoutMilliseconds, out RegistryResponse response)
         {
             try

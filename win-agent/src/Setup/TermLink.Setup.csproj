@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>TermLink.Setup</AssemblyName>
+    <RootNamespace>TermLink.Setup</RootNamespace>
+    <ApplicationIcon>..\..\..\assets\brand\windows\TermLink.ico</ApplicationIcon>
+    <PayloadPath Condition="'$(PayloadPath)' == ''">$(MSBuildProjectDirectory)\payload.zip</PayloadPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\..\assets\brand\windows\TermLink.ico"
+                      LogicalName="TermLink.Setup.Assets.TermLink.ico" />
+    <EmbeddedResource Include="$(PayloadPath)"
+                      LogicalName="TermLink.Setup.Payload.zip"
+                      Condition="Exists('$(PayloadPath)')" />
+  </ItemGroup>
+  <Target Name="ValidatePayload" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(PayloadPath)')"
+           Text="The setup payload was not supplied. Build with -p:PayloadPath=&lt;payload.zip&gt;." />
+  </Target>
+</Project>
