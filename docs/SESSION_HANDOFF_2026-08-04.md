@@ -164,6 +164,21 @@ Windows Terminal TermLink Profile
 
 ## 7. Git 状态与提交
 
+### 2026-08-06 生产 Windows 设备重新绑定与 Relay 验证
+
+本次现场验证解决了已安装 Win-Agent 托盘显示“Relay 未连接”的设备身份问题：
+
+- 旧 `production-config.json` 与 `production-credentials.dpapi` 已移动（未删除）到本机
+  `%LOCALAPPDATA%\TermLink\identity-backup-20260806-123119` 备份目录；文档和日志不包含其中的凭据内容。
+- 使用当前已登录的 OIDC 会话完成 Windows 账户绑定，生成新的本机设备身份和 PC 配置。
+- 受控重启已安装 Agent 后，控制管道 `List` 返回 `RelayState=Connected`、空错误码；
+  `RefreshProductionStatus` 返回 `PRODUCTION_STATUS_REFRESHED`，同样保持 `Connected`。
+- 生产状态返回 2 台设备、1 个会话；既有 `TermLink.SessionHost` PID 38000 和
+  `WindowsTerminal` PID 28752 均保持运行，未关闭用户窗口。
+
+这证明了当前账号下 Windows 设备注册、PC 上报和生产 Realtime 连接已恢复；尚不能替代
+Android 真机/模拟器观看、控制租约、输入去重和断线恢复的完整跨端验收。
+
 本交接前的关键提交：
 
 - `6190172 feat: complete production development items 1-6`
