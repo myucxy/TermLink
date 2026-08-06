@@ -13,6 +13,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -29,6 +32,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -336,7 +341,11 @@ fun ProductApp(
                 if (destination.primaryDestination().destination() != destination) {
                     ProductTopBar(
                         destination = destination,
-                        onBack = { navigateTo(destination.primaryDestination().destination()) },
+                        onBack = if (destination == ProductDestination.SESSIONS) {
+                            null
+                        } else {
+                            { navigateTo(destination.primaryDestination().destination()) }
+                        },
                         onRefresh = { runOperation(repository::refresh) },
                     )
                 }
@@ -767,14 +776,16 @@ private fun CommandSearchDialog(
 @Composable
 private fun ProductTopBar(
     destination: ProductDestination,
-    onBack: () -> Unit,
+    onBack: (() -> Unit)?,
     onRefresh: () -> Unit,
 ) {
     CenterAlignedTopAppBar(
         title = { Text(destination.localizedLabel(), style = MaterialTheme.typography.titleLarge) },
         navigationIcon = {
-            IconButton(onClick = onBack) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.action_back))
+            if (onBack != null) {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.action_back))
+                }
             }
         },
         actions = {
@@ -896,6 +907,24 @@ private fun ProductContent(
     onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
     onReplay: (HistoryEntry) -> Unit,
 ) {
+    if (destination == ProductDestination.SESSIONS) {
+        SessionsPage(
+            snapshot = snapshot,
+            wide = wide,
+            selectedSessionId = selectedSessionId,
+            onSessionSelected = onSessionSelected,
+            onOpenSession = onOpenSession,
+            terminalEngine = terminalEngine,
+            onRequestControl = onRequestControl,
+            onReleaseControl = onReleaseControl,
+            onPaste = onPaste,
+            onTerminalAction = onTerminalAction,
+            modifier = modifier
+                .fillMaxSize()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+        )
+        return
+    }
     Column(
         modifier = modifier
             .fillMaxHeight()
@@ -910,18 +939,7 @@ private fun ProductContent(
                 onOpenAccount = onOpenAccount,
                 onOpenCommandSearch = onOpenCommandSearch,
             )
-            ProductDestination.SESSIONS -> SessionsPage(
-                snapshot = snapshot,
-                wide = wide,
-                selectedSessionId = selectedSessionId,
-                onSessionSelected = onSessionSelected,
-                onOpenSession = onOpenSession,
-                terminalEngine = terminalEngine,
-                onRequestControl = onRequestControl,
-                onReleaseControl = onReleaseControl,
-                onPaste = onPaste,
-                onTerminalAction = onTerminalAction,
-            )
+            ProductDestination.SESSIONS -> Unit
             ProductDestination.ACTIVITY -> ActivityPage(
                 snapshot = snapshot,
                 onOpenHistory = onOpenHistory,
@@ -1110,75 +1128,207 @@ private fun SessionsPage(
     onReleaseControl: (java.util.UUID) -> Unit,
     onPaste: (java.util.UUID) -> Unit,
     onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
+    modifier: Modifier,
 ) {
-    PageHeader(
-        title = stringResource(R.string.nav_sessions),
-        subtitle = stringResource(R.string.page_sessions_subtitle),
-        icon = Icons.Filled.Terminal,
-    )
-    ConnectionBanner(snapshot = snapshot)
-    if (snapshot.sessions.isEmpty()) {
-        EmptyState(
-            icon = Icons.Filled.Terminal,
-            title = if (snapshot.signedIn) stringResource(R.string.empty_no_sessions) else stringResource(R.string.empty_sign_in_sessions),
-            detail = stringResource(R.string.server_sessions_empty_copy),
-            actionLabel = null,
-            onAction = {},
-        )
-        return
-    }
-    val selected = snapshot.sessions.firstOrNull { it.id.toString() == selectedSessionId }
-        ?: snapshot.sessions.first()
-    LaunchedEffect(selected.id) { onOpenSession(selected.id) }
-    val selectedState = snapshot.sessionStates[selected.id]
-    val selectedEngine = terminalEngine(selected.id)
-    val unknownPcLabel = stringResource(R.string.unknown_pc)
-    fun pcLabel(session: SessionSummary): String =
-        snapshot.pcs.firstOrNull { it.id == session.pcId }?.name
-            ?: unknownPcLabel
-    if (wide) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            verticalAlignment = Alignment.Top,
-        ) {
-            SessionList(
-                sessions = snapshot.sessions,
-                selectedId = selected.id,
-                onSessionSelected = onSessionSelected,
-                pcLabel = ::pcLabel,
-                modifier = Modifier.widthIn(min = 260.dp, max = 360.dp),
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        if (snapshot.sessions.isEmpty()) {
+            ConnectionBanner(snapshot = snapshot)
+            EmptyState(
+                icon = Icons.Filled.Terminal,
+                title = if (snapshot.signedIn) stringResource(R.string.empty_no_sessions) else stringResource(R.string.empty_sign_in_sessions),
+                detail = stringResource(R.string.server_sessions_empty_copy),
+                actionLabel = null,
+                onAction = {},
             )
-            SessionDetail(
-                session = selected,
-                pcLabel = pcLabel(selected),
-                onRequestControl = onRequestControl,
-                onReleaseControl = onReleaseControl,
-                onPaste = onPaste,
-                onTerminalAction = onTerminalAction,
-                remoteState = selectedState,
-                engine = selectedEngine,
+        } else {
+            val selected = snapshot.sessions.firstOrNull { it.id.toString() == selectedSessionId }
+                ?: snapshot.sessions.first()
+            LaunchedEffect(selected.id, selected.state) {
+                if (selected.state != SessionState.EXITED) onOpenSession(selected.id)
+            }
+            val unknownPcLabel = stringResource(R.string.unknown_pc)
+            fun pcLabel(session: SessionSummary): String =
+                snapshot.pcs.firstOrNull { it.id == session.pcId }?.name
+                    ?: unknownPcLabel
+
+            if (wide) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .verticalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.Top,
+                ) {
+                    SessionList(
+                        sessions = snapshot.sessions,
+                        selectedId = selected.id,
+                        onSessionSelected = onSessionSelected,
+                        pcLabel = ::pcLabel,
+                        modifier = Modifier.widthIn(min = 260.dp, max = 360.dp),
+                    )
+                    SessionDetail(
+                        session = selected,
+                        pcLabel = pcLabel(selected),
+                        onRequestControl = onRequestControl,
+                        onReleaseControl = onReleaseControl,
+                        onPaste = onPaste,
+                        onTerminalAction = onTerminalAction,
+                        remoteState = selected.resolveDisplayedRemoteState(snapshot.sessionStates[selected.id]),
+                        engine = terminalEngine(selected.id),
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            } else {
+                MobileSessionPager(
+                    sessions = snapshot.sessions,
+                    selectedId = selected.id,
+                    onSessionSelected = onSessionSelected,
+                    pcLabel = ::pcLabel,
+                    terminalEngine = terminalEngine,
+                    sessionStates = snapshot.sessionStates,
+                    onRequestControl = onRequestControl,
+                    onReleaseControl = onReleaseControl,
+                    onPaste = onPaste,
+                    onTerminalAction = onTerminalAction,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MobileSessionPager(
+    sessions: List<SessionSummary>,
+    selectedId: java.util.UUID,
+    onSessionSelected: (java.util.UUID) -> Unit,
+    pcLabel: (SessionSummary) -> String,
+    terminalEngine: (java.util.UUID) -> TermuxTerminalEngine?,
+    sessionStates: Map<java.util.UUID, RemoteSessionState>,
+    onRequestControl: (java.util.UUID) -> Unit,
+    onReleaseControl: (java.util.UUID) -> Unit,
+    onPaste: (java.util.UUID) -> Unit,
+    onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
+    modifier: Modifier,
+) {
+    val sessionIds = remember(sessions) { sessions.map(SessionSummary::id) }
+    val selectedIndex = sessionIds.indexOf(selectedId).coerceAtLeast(0)
+    val pagerState = rememberPagerState(initialPage = selectedIndex) { sessions.size }
+    val switcherState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(selectedId, sessionIds) {
+        val target = sessionIds.indexOf(selectedId).coerceAtLeast(0)
+        if (target != pagerState.settledPage) pagerState.scrollToPage(target)
+        switcherState.animateScrollToItem(target)
+    }
+    LaunchedEffect(pagerState.settledPage, sessionIds) {
+        val pageSession = sessions.getOrNull(pagerState.settledPage) ?: return@LaunchedEffect
+        if (pageSession.id != selectedId) onSessionSelected(pageSession.id)
+        switcherState.animateScrollToItem(pagerState.settledPage)
+    }
+
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        LazyRow(
+            modifier = Modifier.fillMaxWidth(),
+            state = switcherState,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            itemsIndexed(sessions, key = { _, session -> session.id.toString() }) { index, session ->
+                SessionSwitcherItem(
+                    session = session,
+                    pcLabel = pcLabel(session),
+                    selected = index == pagerState.settledPage,
+                    onClick = {
+                        scope.launch {
+                            pagerState.animateScrollToPage(index)
+                        }
+                    },
+                )
+            }
+        }
+        HorizontalPager(
+            state = pagerState,
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            key = { page -> sessions[page].id.toString() },
+            pageSpacing = 12.dp,
+            beyondViewportPageCount = 1,
+        ) { page ->
+            val session = sessions[page]
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(bottom = 4.dp),
+            ) {
+                SessionDetail(
+                    session = session,
+                    pcLabel = pcLabel(session),
+                    onRequestControl = onRequestControl,
+                    onReleaseControl = onReleaseControl,
+                    onPaste = onPaste,
+                    onTerminalAction = onTerminalAction,
+                    remoteState = session.resolveDisplayedRemoteState(sessionStates[session.id]),
+                    engine = terminalEngine(session.id),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SessionSwitcherItem(
+    session: SessionSummary,
+    pcLabel: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val accent = when (session.state) {
+        SessionState.RUNNING -> MaterialTheme.colorScheme.secondary
+        SessionState.INTERRUPTED -> MaterialTheme.colorScheme.tertiary
+        SessionState.EXITED -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Column(
+        modifier = Modifier
+            .width(168.dp)
+            .clip(ProductShape)
+            .background(if (selected) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface)
+            .border(
+                BorderStroke(1.dp, if (selected) accent else MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)),
+                ProductShape,
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Icon(
+                Icons.Filled.Terminal,
+                contentDescription = null,
+                tint = accent,
+                modifier = Modifier.size(17.dp),
+            )
+            Text(
+                session.shellType,
                 modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.labelLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
         }
-    } else {
-        SessionList(
-            sessions = snapshot.sessions,
-            selectedId = selected.id,
-            onSessionSelected = onSessionSelected,
-            pcLabel = ::pcLabel,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        SessionDetail(
-            session = selected,
-            pcLabel = pcLabel(selected),
-            onRequestControl = onRequestControl,
-            onReleaseControl = onReleaseControl,
-            onPaste = onPaste,
-            onTerminalAction = onTerminalAction,
-            remoteState = selectedState,
-            engine = selectedEngine,
-            modifier = Modifier.fillMaxWidth(),
+        Text(
+            pcLabel,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
@@ -1411,6 +1561,13 @@ private fun SessionStatePill(state: SessionState) {
         color = color,
     )
 }
+
+private fun SessionSummary.resolveDisplayedRemoteState(actual: RemoteSessionState?): RemoteSessionState? =
+    actual ?: if (state == SessionState.EXITED) {
+        RemoteSessionState.Exited(lastAckedSequence = 0, exitCode = null)
+    } else {
+        null
+    }
 
 @Composable
 private fun TerminalSurface(

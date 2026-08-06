@@ -196,6 +196,21 @@ git diff --check
 因此，Windows → 公网 Relay 的生产连接已得到真实进程证据；Android 同账号实时观看/控制仍待
 在模拟器或真机登录当前账号后重新验证，不能提前宣称三端闭环完成。
 
+### 2026-08-06 Android 会话页横向切换验收
+
+- `android/app/src/main/kotlin/dev/termlink/product/ProductActivity.kt` 的窄屏会话页改为顶部
+  `LazyRow` 会话切换条与 `HorizontalPager` 终端详情页；会话卡片固定紧凑宽度并露出后续会话，
+  点击卡片与正文左右滑动保持双向同步。
+- 会话页应用栏不再显示“返回设备”箭头；刷新操作仍保留，系统返回手势继续可用。窄屏不再
+  重复渲染大标题和同步 Banner，会话切换条直接位于应用栏下方；宽屏仍保留左侧会话列表。
+- 已退出会话不会再次调用 `openSession()`，正文状态显示“已退出”，滑动到该会话不弹出错误
+  Snackbar。
+- 使用本机 `emulator-5554` 安装当前 Debug APK 完成目视验收：顶部仅显示“会话”和刷新按钮；
+  顶部会话条可横向滚动；在终端正文区域左滑可切换会话并同步顶部选中项；切换到已退出会话
+  显示“已退出”且无错误提示。
+- `:app:testDebugUnitTest` 与 `:app:assembleDebug` 通过；本轮未关闭 Windows Terminal、
+  Win-Agent 或现有 Shell。
+
 1. 使用包含 `ea09519`、`203ea59` 和 `585d0db` 的 0.2 Windows 构建，在独立 Windows
    验收机上通过普通 `Add-AppxPackage` 持久安装；禁止使用 `ForceApplicationShutdown`，
    不关闭验收机或本机已有窗口；
