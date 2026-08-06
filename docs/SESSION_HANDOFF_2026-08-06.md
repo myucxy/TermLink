@@ -371,3 +371,31 @@ git diff --check
 - 发布使用当前版本自包含安装器的签名审核记录；签名根仍是首版一次性自签名根，不等同于系统
   受信商业证书。公开更新接口验证：build 6 返回 `optional` / latest 0.1.7 build 7，
   build 7 返回 `no_update`。
+
+## 14. AppShip Windows 发布参数（后续会话复用）
+
+以下是可提交到 AppShip 的非敏感固定参数；密码、Token、证书私钥和签名密码不写入仓库：
+
+| 参数 | Windows 值 |
+| --- | --- |
+| AppShip Base URL | `https://appship.kget.cc:8910/` |
+| Application slug | `termlink-win64` |
+| Channel | `stable` |
+| Platform / file kind / architecture | `windows` / `exe` / `x64` |
+| 产物命名 | `win-agent/artifacts/TermLink-Setup-<version>.0.exe` |
+| 发布脚本 | `F:\\AISession\\.codex\\skills\\appship-publish\\scripts\\publish.ps1` |
+| 状态文件 | `.appship/termlink-win64-stable-<version>.json`（必须保留用于 `-Resume`） |
+| 凭据传递 | 使用 `-PasswordVariableName APPSHIP_PASSWORD`，不要把密码写入参数或文件 |
+
+发布前必须先运行 Windows Release 构建和 `Validate-WindowsSetup.ps1`，确认 EXE SHA-256 与待发
+产物一致。版本号和 build number 都必须递增；同一版本中断时使用同一个状态文件和完全相同的
+参数加 `-Resume`，不要生成新的幂等键或覆盖旧 draft。Windows 首版使用一次性自签名根，发布时
+需要由授权人员确认签名完整性后提交 `-SignatureDecision approved`、证书指纹和审核说明；这不
+等同于系统受信商业证书。发布完成后验证：
+
+```text
+GET /api/v1/apps/termlink-win64/updates?platform=windows&arch=x64&channel=stable&build=<旧 build>
+```
+
+应返回 `status=optional` 和新版本；使用新 build 查询应返回 `status=no_update`。记录 release ID、
+artifact ID、SHA-256 和公开接口结果，但不要记录任何 Secret。
