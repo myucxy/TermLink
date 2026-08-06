@@ -1,5 +1,6 @@
 package dev.termlink.product
 
+import android.graphics.Color as AndroidColor
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -13,9 +14,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -68,6 +66,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -81,6 +80,7 @@ import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
@@ -149,7 +149,6 @@ private val ProductPositive = Color(0xFF65D6A1)
 private val ProductWarning = Color(0xFFF1C96B)
 private val ProductDanger = Color(0xFFFF8C91)
 private val ProductMuted = Color(0xFFAAB5C5)
-private val ProductTerminalBackground = Color(0xFF080B10)
 
 private val productColors = androidx.compose.material3.darkColorScheme(
     primary = ProductPrimary,
@@ -185,6 +184,12 @@ private val productLightColors = lightColorScheme(
 
 private const val PRODUCT_PREFERENCES = "termlink_product_preferences"
 private const val PRODUCT_THEME_KEY = "theme_preference"
+private const val TERMINAL_FONT_SIZE_KEY = "terminal_font_size_sp"
+private const val TERMINAL_LINE_SPACING_KEY = "terminal_line_spacing"
+private const val TERMINAL_FOREGROUND_KEY = "terminal_foreground_argb"
+private const val TERMINAL_BACKGROUND_KEY = "terminal_background_argb"
+private const val TERMINAL_SHORTCUT_PREFIX = "terminal_shortcut_"
+private const val TERMINAL_SHORTCUT_ORDER_KEY = "terminal_shortcut_order"
 
 private fun loadThemePreference(context: android.content.Context): ProductThemePreference =
     ProductThemePreference.fromWireValue(
@@ -212,6 +217,8 @@ class ProductActivity : ComponentActivity() {
         setContent {
             val context = LocalContext.current
             var themePreference by rememberSaveable { mutableStateOf(loadThemePreference(context)) }
+            var terminalPreferences by remember { mutableStateOf(loadTerminalDisplayPreferences(context)) }
+            var shortcutPreferences by remember { mutableStateOf(loadTerminalShortcutPreferences(context)) }
             val systemDark = isSystemInDarkTheme()
             val dark = when (themePreference) {
                 ProductThemePreference.SYSTEM -> systemDark
@@ -231,6 +238,16 @@ class ProductActivity : ComponentActivity() {
                     onThemePreferenceChanged = {
                         themePreference = it
                         saveThemePreference(context, it)
+                    },
+                    terminalPreferences = terminalPreferences,
+                    onTerminalPreferencesChanged = {
+                        terminalPreferences = it.normalized
+                        saveTerminalDisplayPreferences(context, terminalPreferences)
+                    },
+                    shortcutPreferences = shortcutPreferences,
+                    onShortcutPreferencesChanged = {
+                        shortcutPreferences = it.normalized
+                        saveTerminalShortcutPreferences(context, shortcutPreferences)
                     },
                 )
             }
@@ -260,6 +277,10 @@ fun ProductApp(
     repository: ProductRepository,
     themePreference: ProductThemePreference = ProductThemePreference.SYSTEM,
     onThemePreferenceChanged: (ProductThemePreference) -> Unit = {},
+    terminalPreferences: TerminalDisplayPreferences = TerminalDisplayPreferences(),
+    onTerminalPreferencesChanged: (TerminalDisplayPreferences) -> Unit = {},
+    shortcutPreferences: TerminalShortcutPreferences = TerminalShortcutPreferences(),
+    onShortcutPreferencesChanged: (TerminalShortcutPreferences) -> Unit = {},
 ) {
     val snapshot by repository.snapshot.collectAsStateCompat()
     var destinationName by rememberSaveable { mutableStateOf(ProductDestination.DEVICES.name) }
@@ -270,7 +291,6 @@ fun ProductApp(
     val destination = storedDestination.takeIf { it.isVisibleInProductShell } ?: ProductDestination.DEVICES
     var selectedSessionId by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedHistoryId by rememberSaveable { mutableStateOf<String?>(null) }
-    var pasteSessionId by remember { mutableStateOf<java.util.UUID?>(null) }
     var commandSearchOpen by remember { mutableStateOf(false) }
     var signOutConfirmation by remember { mutableStateOf(false) }
     var registrationOpen by remember { mutableStateOf(false) }
@@ -338,7 +358,7 @@ fun ProductApp(
         val wide = maxWidth >= 700.dp
         Scaffold(
             topBar = {
-                if (destination.primaryDestination().destination() != destination) {
+                if (destination.primaryDestination().destination() != destination && destination != ProductDestination.SESSIONS) {
                     ProductTopBar(
                         destination = destination,
                         onBack = if (destination == ProductDestination.SESSIONS) {
@@ -379,7 +399,10 @@ fun ProductApp(
                     wide = wide,
                     selectedSessionId = selectedSessionId,
                     onSessionSelected = { selectedSessionId = it.toString() },
-                    onOpenSession = { runOperation { repository.openSession(it) } },
+                    // Opening a session is the command-line entry point. The
+                    // server lease is requested here, so the terminal has no
+                    // separate "申请控制" button.
+                    onOpenSession = { runOperation { repository.requestControl(it) } },
                     terminalEngine = repository::terminalEngine,
                     historyEngine = repository::historyEngine,
                     selectedHistoryId = selectedHistoryId,
@@ -393,27 +416,19 @@ fun ProductApp(
                     onSignIn = { runOperation(repository::signIn) },
                     onSignOut = { signOutConfirmation = true },
                     onCheckForUpdate = { runOperation { repository.checkForUpdate() } },
-                    onRequestControl = { runOperation { repository.requestControl(it) } },
-                    onReleaseControl = { runOperation { repository.releaseControl(it) } },
-                    onPaste = { pasteSessionId = it },
                     onTerminalAction = { sessionId, action ->
                         runOperation { repository.sendTerminalAction(sessionId, action) }
                     },
+                    terminalPreferences = terminalPreferences,
+                    onTerminalPreferencesChanged = onTerminalPreferencesChanged,
+                    shortcutPreferences = shortcutPreferences,
+                    onShortcutPreferencesChanged = onShortcutPreferencesChanged,
                     onReplay = { runOperation { repository.replayHistory(it) } },
                 )
             }
         }
     }
 
-    pasteSessionId?.let { sessionId ->
-        PasteConfirmationDialog(
-            onDismiss = { pasteSessionId = null },
-            onConfirm = { text ->
-                pasteSessionId = null
-                runOperation { repository.sendPaste(sessionId, text) }
-            },
-        )
-    }
     if (commandSearchOpen) {
         CommandSearchDialog(
             onDismiss = { commandSearchOpen = false },
@@ -632,6 +647,59 @@ private fun ProductSignInPage(
     }
 }
 
+private fun loadTerminalDisplayPreferences(context: android.content.Context): TerminalDisplayPreferences {
+    val preferences = context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
+    return TerminalDisplayPreferences(
+        fontSizeSp = preferences.getFloat(TERMINAL_FONT_SIZE_KEY, 14f),
+        lineSpacingMultiplier = preferences.getFloat(TERMINAL_LINE_SPACING_KEY, 1f),
+        foregroundArgb = preferences.getInt(TERMINAL_FOREGROUND_KEY, 0xFFE9EEF5.toInt()),
+        backgroundArgb = preferences.getInt(TERMINAL_BACKGROUND_KEY, 0xFF080B10.toInt()),
+    ).normalized
+}
+
+private fun saveTerminalDisplayPreferences(
+    context: android.content.Context,
+    value: TerminalDisplayPreferences,
+) {
+    val normalized = value.normalized
+    context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
+        .edit()
+        .putFloat(TERMINAL_FONT_SIZE_KEY, normalized.fontSizeSp)
+        .putFloat(TERMINAL_LINE_SPACING_KEY, normalized.lineSpacingMultiplier)
+        .putInt(TERMINAL_FOREGROUND_KEY, normalized.foregroundArgb)
+        .putInt(TERMINAL_BACKGROUND_KEY, normalized.backgroundArgb)
+        .apply()
+}
+
+private fun loadTerminalShortcutPreferences(context: android.content.Context): TerminalShortcutPreferences {
+    val preferences = context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
+    val defaults = TerminalShortcutPreferences().normalized
+    val storedOrder = preferences.getString(TERMINAL_SHORTCUT_ORDER_KEY, null)
+        ?.split(',')
+        ?.mapNotNull { value -> runCatching { TerminalAction.valueOf(value) }.getOrNull() }
+        ?: defaults.visibleActions
+    return TerminalShortcutPreferences(
+        labels = TerminalAction.entries.associateWith { action ->
+            preferences.getString(TERMINAL_SHORTCUT_PREFIX + action.name, defaults.label(action)) ?: defaults.label(action)
+        },
+        visibleActions = storedOrder,
+    ).normalized
+}
+
+private fun saveTerminalShortcutPreferences(
+    context: android.content.Context,
+    value: TerminalShortcutPreferences,
+) {
+    val normalized = value.normalized
+    context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
+        .edit()
+        .apply {
+            normalized.labels.forEach { (action, label) -> putString(TERMINAL_SHORTCUT_PREFIX + action.name, label) }
+        }
+        .putString(TERMINAL_SHORTCUT_ORDER_KEY, normalized.visibleActions.joinToString(",") { it.name })
+        .apply()
+}
+
 @Composable
 private fun RegistrationDialog(
     onDismiss: () -> Unit,
@@ -836,14 +904,14 @@ private fun ProductBottomNavigation(
 
 private fun ProductPrimaryDestination.icon(): ImageVector = when (this) {
     ProductPrimaryDestination.DEVICES -> Icons.Filled.Devices
-    ProductPrimaryDestination.ACTIVITY -> Icons.Filled.Timeline
+    ProductPrimaryDestination.SESSIONS -> Icons.Filled.Terminal
     ProductPrimaryDestination.SETTINGS -> Icons.Filled.Settings
 }
 
 @Composable
 private fun ProductPrimaryDestination.localizedLabel(): String = when (this) {
     ProductPrimaryDestination.DEVICES -> stringResource(R.string.nav_devices)
-    ProductPrimaryDestination.ACTIVITY -> stringResource(R.string.nav_activity)
+    ProductPrimaryDestination.SESSIONS -> stringResource(R.string.nav_sessions)
     ProductPrimaryDestination.SETTINGS -> stringResource(R.string.nav_settings)
 }
 
@@ -898,12 +966,13 @@ private fun ProductContent(
     onOpenCommandSearch: () -> Unit,
     themePreference: ProductThemePreference,
     onThemePreferenceChanged: (ProductThemePreference) -> Unit,
+    terminalPreferences: TerminalDisplayPreferences,
+    onTerminalPreferencesChanged: (TerminalDisplayPreferences) -> Unit,
+    shortcutPreferences: TerminalShortcutPreferences,
+    onShortcutPreferencesChanged: (TerminalShortcutPreferences) -> Unit,
     onSignIn: () -> Unit,
     onSignOut: () -> Unit,
     onCheckForUpdate: () -> Unit,
-    onRequestControl: (java.util.UUID) -> Unit,
-    onReleaseControl: (java.util.UUID) -> Unit,
-    onPaste: (java.util.UUID) -> Unit,
     onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
     onReplay: (HistoryEntry) -> Unit,
 ) {
@@ -915,13 +984,11 @@ private fun ProductContent(
             onSessionSelected = onSessionSelected,
             onOpenSession = onOpenSession,
             terminalEngine = terminalEngine,
-            onRequestControl = onRequestControl,
-            onReleaseControl = onReleaseControl,
-            onPaste = onPaste,
             onTerminalAction = onTerminalAction,
+            terminalPreferences = terminalPreferences,
+            shortcutPreferences = shortcutPreferences,
             modifier = modifier
-                .fillMaxSize()
-                .padding(horizontal = 16.dp, vertical = 14.dp),
+                .fillMaxSize(),
         )
         return
     }
@@ -936,6 +1003,11 @@ private fun ProductContent(
             ProductDestination.DEVICES -> DevicesPage(
                 snapshot = snapshot,
                 onOpenSessions = onOpenSessions,
+                onOpenSession = { sessionId ->
+                    onSessionSelected(sessionId)
+                    onOpenSession(sessionId)
+                    onOpenSessions()
+                },
                 onOpenAccount = onOpenAccount,
                 onOpenCommandSearch = onOpenCommandSearch,
             )
@@ -950,6 +1022,7 @@ private fun ProductContent(
                 onHistorySelected = onHistorySelected,
                 onReplay = onReplay,
                 historyEngine = historyEngine,
+                terminalPreferences = terminalPreferences,
             )
             // These routes remain in the enum for persistence/API compatibility,
             // but navigation is blocked by [isVisibleInProductShell].
@@ -964,6 +1037,10 @@ private fun ProductContent(
                 onOpenAccount = onOpenAccount,
                 themePreference = themePreference,
                 onThemePreferenceChanged = onThemePreferenceChanged,
+                terminalPreferences = terminalPreferences,
+                onTerminalPreferencesChanged = onTerminalPreferencesChanged,
+                shortcutPreferences = shortcutPreferences,
+                onShortcutPreferencesChanged = onShortcutPreferencesChanged,
             )
         }
     }
@@ -997,6 +1074,7 @@ private fun PrimaryHomeHeader(onOpenAccount: () -> Unit) {
 private fun DevicesPage(
     snapshot: ProductSnapshot,
     onOpenSessions: () -> Unit,
+    onOpenSession: (java.util.UUID) -> Unit,
     onOpenAccount: () -> Unit,
     onOpenCommandSearch: () -> Unit,
 ) {
@@ -1015,7 +1093,9 @@ private fun DevicesPage(
     }
     ConnectionBanner(snapshot = snapshot)
     Text(stringResource(R.string.nav_devices), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-    val devices = snapshot.devices
+    // The Android client is an observer/controller, not a device-management
+    // list for itself. Only Windows PCs are part of this product surface.
+    val devices = snapshot.devices.filter { it.type == DeviceType.WINDOWS_PC }
     if (devices.isEmpty()) {
         EmptyState(
             icon = Icons.Filled.Devices,
@@ -1035,9 +1115,17 @@ private fun DevicesPage(
             )
         }
     }
-    if (snapshot.pcs.isNotEmpty()) {
+    val windowsDeviceIds = devices.mapTo(hashSetOf()) { it.id }
+    val pcs = snapshot.pcs.filter { it.deviceId in windowsDeviceIds }
+    if (pcs.isNotEmpty()) {
         PageHeader(title = stringResource(R.string.pc_routing_title), subtitle = stringResource(R.string.pc_routing_subtitle), icon = Icons.Filled.LaptopWindows)
-        snapshot.pcs.forEach { pc -> PcRow(pc) }
+        pcs.forEach { pc ->
+            PcRow(
+                pc = pc,
+                sessions = snapshot.sessions.filter { it.pcId == pc.id },
+                onOpenSession = onOpenSession,
+            )
+        }
         OutlinedButton(onClick = onOpenSessions, modifier = Modifier.heightIn(min = 48.dp)) {
             Icon(Icons.Filled.Terminal, contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(6.dp))
@@ -1084,7 +1172,11 @@ private fun DeviceRow(
 }
 
 @Composable
-private fun PcRow(pc: PcSummary) {
+private fun PcRow(
+    pc: PcSummary,
+    sessions: List<SessionSummary> = emptyList(),
+    onOpenSession: ((java.util.UUID) -> Unit)? = null,
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1108,11 +1200,49 @@ private fun PcRow(pc: PcSummary) {
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        Icon(
-            if (pc.online) Icons.Filled.Wifi else Icons.Filled.WifiOff,
+        StatusDot(
+            color = if (pc.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
             contentDescription = if (pc.online) stringResource(R.string.pc_online_accessibility) else stringResource(R.string.pc_offline_accessibility),
-            tint = if (pc.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
         )
+    }
+    if (sessions.isNotEmpty()) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 42.dp, end = 12.dp, bottom = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            sessions.forEach { session ->
+                val active = session.state == SessionState.RUNNING && pc.online
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(ProductShape)
+                        .clickable(enabled = onOpenSession != null) { onOpenSession?.invoke(session.id) }
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    StatusDot(
+                        color = if (active) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        contentDescription = session.state.localizedLabel(),
+                    )
+                    Text(
+                        session.shellType,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (active) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        session.state.localizedLabel(),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -1124,43 +1254,51 @@ private fun SessionsPage(
     onSessionSelected: (java.util.UUID) -> Unit,
     onOpenSession: (java.util.UUID) -> Unit,
     terminalEngine: (java.util.UUID) -> TermuxTerminalEngine?,
-    onRequestControl: (java.util.UUID) -> Unit,
-    onReleaseControl: (java.util.UUID) -> Unit,
-    onPaste: (java.util.UUID) -> Unit,
     onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
+    terminalPreferences: TerminalDisplayPreferences,
+    shortcutPreferences: TerminalShortcutPreferences,
     modifier: Modifier,
 ) {
     Column(
         modifier = modifier,
-        verticalArrangement = Arrangement.spacedBy(14.dp),
+        verticalArrangement = Arrangement.Top,
     ) {
         if (snapshot.sessions.isEmpty()) {
-            ConnectionBanner(snapshot = snapshot)
-            EmptyState(
-                icon = Icons.Filled.Terminal,
-                title = if (snapshot.signedIn) stringResource(R.string.empty_no_sessions) else stringResource(R.string.empty_sign_in_sessions),
-                detail = stringResource(R.string.server_sessions_empty_copy),
-                actionLabel = null,
-                onAction = {},
-            )
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                ConnectionBanner(snapshot = snapshot)
+                EmptyState(
+                    icon = Icons.Filled.Terminal,
+                    title = if (snapshot.signedIn) stringResource(R.string.empty_no_sessions) else stringResource(R.string.empty_sign_in_sessions),
+                    detail = stringResource(R.string.server_sessions_empty_copy),
+                    actionLabel = null,
+                    onAction = {},
+                )
+            }
         } else {
             val selected = snapshot.sessions.firstOrNull { it.id.toString() == selectedSessionId }
                 ?: snapshot.sessions.first()
             LaunchedEffect(selected.id, selected.state) {
-                if (selected.state != SessionState.EXITED) onOpenSession(selected.id)
+                if (selected.state == SessionState.RUNNING) onOpenSession(selected.id)
             }
             val unknownPcLabel = stringResource(R.string.unknown_pc)
             fun pcLabel(session: SessionSummary): String =
                 snapshot.pcs.firstOrNull { it.id == session.pcId }?.name
                     ?: unknownPcLabel
+            fun pcOnline(session: SessionSummary): Boolean =
+                snapshot.pcs.firstOrNull { it.id == session.pcId }?.online == true
 
             if (wide) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .weight(1f)
-                        .verticalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        .fillMaxHeight()
+                        .weight(1f),
+                    horizontalArrangement = Arrangement.Start,
                     verticalAlignment = Alignment.Top,
                 ) {
                     SessionList(
@@ -1168,18 +1306,27 @@ private fun SessionsPage(
                         selectedId = selected.id,
                         onSessionSelected = onSessionSelected,
                         pcLabel = ::pcLabel,
-                        modifier = Modifier.widthIn(min = 260.dp, max = 360.dp),
+                        modifier = Modifier
+                            .widthIn(min = 260.dp, max = 360.dp)
+                            .fillMaxHeight()
+                            .verticalScroll(rememberScrollState()),
+                    )
+                    VerticalDivider(
+                        modifier = Modifier.fillMaxHeight(),
+                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f),
                     )
                     SessionDetail(
                         session = selected,
                         pcLabel = pcLabel(selected),
-                        onRequestControl = onRequestControl,
-                        onReleaseControl = onReleaseControl,
-                        onPaste = onPaste,
+                        pcOnline = pcOnline(selected),
                         onTerminalAction = onTerminalAction,
+                        terminalPreferences = terminalPreferences,
+                        shortcutPreferences = shortcutPreferences,
                         remoteState = selected.resolveDisplayedRemoteState(snapshot.sessionStates[selected.id]),
                         engine = terminalEngine(selected.id),
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .weight(1f),
                     )
                 }
             } else {
@@ -1188,12 +1335,12 @@ private fun SessionsPage(
                     selectedId = selected.id,
                     onSessionSelected = onSessionSelected,
                     pcLabel = ::pcLabel,
+                    pcOnline = ::pcOnline,
                     terminalEngine = terminalEngine,
                     sessionStates = snapshot.sessionStates,
-                    onRequestControl = onRequestControl,
-                    onReleaseControl = onReleaseControl,
-                    onPaste = onPaste,
                     onTerminalAction = onTerminalAction,
+                    terminalPreferences = terminalPreferences,
+                    shortcutPreferences = shortcutPreferences,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -1207,128 +1354,47 @@ private fun MobileSessionPager(
     selectedId: java.util.UUID,
     onSessionSelected: (java.util.UUID) -> Unit,
     pcLabel: (SessionSummary) -> String,
+    pcOnline: (SessionSummary) -> Boolean,
     terminalEngine: (java.util.UUID) -> TermuxTerminalEngine?,
     sessionStates: Map<java.util.UUID, RemoteSessionState>,
-    onRequestControl: (java.util.UUID) -> Unit,
-    onReleaseControl: (java.util.UUID) -> Unit,
-    onPaste: (java.util.UUID) -> Unit,
     onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
+    terminalPreferences: TerminalDisplayPreferences,
+    shortcutPreferences: TerminalShortcutPreferences,
     modifier: Modifier,
 ) {
     val sessionIds = remember(sessions) { sessions.map(SessionSummary::id) }
     val selectedIndex = sessionIds.indexOf(selectedId).coerceAtLeast(0)
     val pagerState = rememberPagerState(initialPage = selectedIndex) { sessions.size }
-    val switcherState = rememberLazyListState()
-    val scope = rememberCoroutineScope()
 
     LaunchedEffect(selectedId, sessionIds) {
         val target = sessionIds.indexOf(selectedId).coerceAtLeast(0)
         if (target != pagerState.settledPage) pagerState.scrollToPage(target)
-        switcherState.animateScrollToItem(target)
     }
     LaunchedEffect(pagerState.settledPage, sessionIds) {
         val pageSession = sessions.getOrNull(pagerState.settledPage) ?: return@LaunchedEffect
         if (pageSession.id != selectedId) onSessionSelected(pageSession.id)
-        switcherState.animateScrollToItem(pagerState.settledPage)
     }
 
-    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        LazyRow(
-            modifier = Modifier.fillMaxWidth(),
-            state = switcherState,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            itemsIndexed(sessions, key = { _, session -> session.id.toString() }) { index, session ->
-                SessionSwitcherItem(
-                    session = session,
-                    pcLabel = pcLabel(session),
-                    selected = index == pagerState.settledPage,
-                    onClick = {
-                        scope.launch {
-                            pagerState.animateScrollToPage(index)
-                        }
-                    },
-                )
-            }
-        }
-        HorizontalPager(
-            state = pagerState,
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
-            key = { page -> sessions[page].id.toString() },
-            pageSpacing = 12.dp,
-            beyondViewportPageCount = 1,
-        ) { page ->
-            val session = sessions[page]
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(bottom = 4.dp),
-            ) {
-                SessionDetail(
-                    session = session,
-                    pcLabel = pcLabel(session),
-                    onRequestControl = onRequestControl,
-                    onReleaseControl = onReleaseControl,
-                    onPaste = onPaste,
-                    onTerminalAction = onTerminalAction,
-                    remoteState = session.resolveDisplayedRemoteState(sessionStates[session.id]),
-                    engine = terminalEngine(session.id),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun SessionSwitcherItem(
-    session: SessionSummary,
-    pcLabel: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-) {
-    val accent = when (session.state) {
-        SessionState.RUNNING -> MaterialTheme.colorScheme.secondary
-        SessionState.INTERRUPTED -> MaterialTheme.colorScheme.tertiary
-        SessionState.EXITED -> MaterialTheme.colorScheme.onSurfaceVariant
-    }
-    Column(
-        modifier = Modifier
-            .width(168.dp)
-            .clip(ProductShape)
-            .background(if (selected) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface)
-            .border(
-                BorderStroke(1.dp, if (selected) accent else MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)),
-                ProductShape,
-            )
-            .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        verticalArrangement = Arrangement.spacedBy(3.dp),
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Icon(
-                Icons.Filled.Terminal,
-                contentDescription = null,
-                tint = accent,
-                modifier = Modifier.size(17.dp),
-            )
-            Text(
-                session.shellType,
-                modifier = Modifier.weight(1f),
-                style = MaterialTheme.typography.labelLarge,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        Text(
-            pcLabel,
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
+    // The pager itself is the session switcher.  There is intentionally no
+    // tab row or scrollbar: a horizontal swipe reveals the next terminal.
+    HorizontalPager(
+        state = pagerState,
+        modifier = modifier.fillMaxSize(),
+        key = { page -> sessions[page].id.toString() },
+        pageSpacing = 0.dp,
+        beyondViewportPageCount = 1,
+    ) { page ->
+        val session = sessions[page]
+        SessionDetail(
+            session = session,
+            pcLabel = pcLabel(session),
+            pcOnline = pcOnline(session),
+            onTerminalAction = onTerminalAction,
+            remoteState = session.resolveDisplayedRemoteState(sessionStates[session.id]),
+            engine = terminalEngine(session.id),
+            terminalPreferences = terminalPreferences,
+            shortcutPreferences = shortcutPreferences,
+            modifier = Modifier.fillMaxSize(),
         )
     }
 }
@@ -1343,12 +1409,14 @@ private fun SessionList(
 ) {
     Surface(
         modifier = modifier,
-        shape = ProductShape,
         color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
     ) {
         Column {
-            Text(stringResource(R.string.sessions_all), modifier = Modifier.padding(14.dp), style = MaterialTheme.typography.titleSmall)
+            Text(
+                stringResource(R.string.sessions_all),
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                style = MaterialTheme.typography.titleSmall,
+            )
             sessions.forEachIndexed { index, session ->
                 if (index > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
                 SessionListRow(
@@ -1405,84 +1473,52 @@ private fun SessionListRow(
 private fun SessionDetail(
     session: SessionSummary,
     pcLabel: String,
-    onRequestControl: (java.util.UUID) -> Unit,
-    onReleaseControl: (java.util.UUID) -> Unit,
-    onPaste: (java.util.UUID) -> Unit,
+    pcOnline: Boolean,
     onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
     remoteState: RemoteSessionState?,
     engine: TermuxTerminalEngine?,
+    terminalPreferences: TerminalDisplayPreferences,
+    shortcutPreferences: TerminalShortcutPreferences,
     modifier: Modifier,
 ) {
     Surface(
         modifier = modifier,
-        shape = ProductShape,
         color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
     ) {
         Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                StatusDot(
+                    color = sessionStatusColor(session.state, pcOnline, remoteState),
+                    contentDescription = session.state.localizedLabel(),
+                )
                 Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(session.shellType, style = MaterialTheme.typography.titleMedium)
                     Text(
-                        stringResource(
-                            R.string.session_detail_summary,
-                            pcLabel,
-                            session.state.localizedLabel(),
-                            session.columns,
-                            session.rows,
-                        ),
-                        style = MaterialTheme.typography.bodySmall,
+                        "$pcLabel · ${session.shellType}",
+                        style = MaterialTheme.typography.labelLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 2,
+                        maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-                SessionStatePill(session.state)
             }
-            TerminalSurface(session = session, engine = engine, remoteState = remoteState)
-            TerminalActionBar(
-                enabled = remoteState is RemoteSessionState.Controlling,
-                onAction = { onTerminalAction(session.id, it) },
-            )
-            Row(
+            TerminalSurface(
+                session = session,
+                engine = engine,
+                remoteState = remoteState,
+                terminalPreferences = terminalPreferences,
+                shortcutPreferences = shortcutPreferences,
+                onTerminalAction = { onTerminalAction(session.id, it) },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState())
-                    .heightIn(min = 52.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Button(
-                    onClick = { onRequestControl(session.id) },
-                    enabled = session.state == SessionState.RUNNING && remoteState !is RemoteSessionState.Controlling,
-                    modifier = Modifier.heightIn(min = 48.dp),
-                ) {
-                    Icon(Icons.Filled.Lock, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(stringResource(R.string.action_request_control))
-                }
-                OutlinedButton(
-                    onClick = { onReleaseControl(session.id) },
-                    enabled = remoteState is RemoteSessionState.Controlling,
-                    modifier = Modifier.heightIn(min = 48.dp),
-                ) {
-                    Icon(Icons.Filled.Lock, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(stringResource(R.string.action_release))
-                }
-                OutlinedButton(
-                    onClick = { onPaste(session.id) },
-                    enabled = remoteState is RemoteSessionState.Controlling,
-                    modifier = Modifier.heightIn(min = 48.dp),
-                ) {
-                    Icon(Icons.Filled.ContentPaste, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(stringResource(R.string.action_paste))
-                }
-            }
+                    .weight(1f),
+            )
         }
     }
 }
@@ -1491,23 +1527,39 @@ private fun SessionDetail(
 private fun TerminalActionBar(
     enabled: Boolean,
     onAction: (TerminalAction) -> Unit,
+    shortcutPreferences: TerminalShortcutPreferences,
+    expanded: Boolean,
+    onExpandedChanged: (Boolean) -> Unit,
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .horizontalScroll(rememberScrollState())
-            .heightIn(min = 52.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+            .background(Color.Black.copy(alpha = 0.62f), RoundedCornerShape(6.dp))
+            .padding(horizontal = 4.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        TerminalTextKey(stringResource(R.string.terminal_key_escape), TerminalAction.ESCAPE, enabled, onAction)
-        TerminalTextKey(stringResource(R.string.terminal_key_tab), TerminalAction.TAB, enabled, onAction)
-        TerminalTextKey(stringResource(R.string.terminal_key_enter), TerminalAction.ENTER, enabled, onAction)
-        TerminalIconKey(Icons.AutoMirrored.Filled.KeyboardArrowLeft, stringResource(R.string.arrow_left), TerminalAction.ARROW_LEFT, enabled, onAction)
-        TerminalIconKey(Icons.Filled.KeyboardArrowUp, stringResource(R.string.arrow_up), TerminalAction.ARROW_UP, enabled, onAction)
-        TerminalIconKey(Icons.Filled.KeyboardArrowDown, stringResource(R.string.arrow_down), TerminalAction.ARROW_DOWN, enabled, onAction)
-        TerminalIconKey(Icons.AutoMirrored.Filled.KeyboardArrowRight, stringResource(R.string.arrow_right), TerminalAction.ARROW_RIGHT, enabled, onAction)
-        TerminalTextKey(stringResource(R.string.terminal_key_ctrl_c), TerminalAction.CTRL_C, enabled, onAction)
+        IconButton(
+            onClick = { onExpandedChanged(!expanded) },
+            modifier = Modifier.size(30.dp),
+        ) {
+            Icon(
+                if (expanded) Icons.Filled.KeyboardArrowDown else Icons.Filled.KeyboardArrowUp,
+                contentDescription = if (expanded) stringResource(R.string.terminal_dock_hide) else stringResource(R.string.terminal_dock_show),
+                tint = Color.White.copy(alpha = 0.82f),
+            )
+        }
+        if (expanded) {
+            shortcutPreferences.visibleActions.forEach { action ->
+                when (action) {
+                    TerminalAction.ARROW_LEFT -> TerminalIconKey(Icons.AutoMirrored.Filled.KeyboardArrowLeft, stringResource(R.string.arrow_left), action, enabled, onAction)
+                    TerminalAction.ARROW_UP -> TerminalIconKey(Icons.Filled.KeyboardArrowUp, stringResource(R.string.arrow_up), action, enabled, onAction)
+                    TerminalAction.ARROW_DOWN -> TerminalIconKey(Icons.Filled.KeyboardArrowDown, stringResource(R.string.arrow_down), action, enabled, onAction)
+                    TerminalAction.ARROW_RIGHT -> TerminalIconKey(Icons.AutoMirrored.Filled.KeyboardArrowRight, stringResource(R.string.arrow_right), action, enabled, onAction)
+                    else -> TerminalTextKey(shortcutPreferences.label(action), action, enabled, onAction)
+                }
+            }
+        }
     }
 }
 
@@ -1521,10 +1573,10 @@ private fun TerminalTextKey(
     OutlinedButton(
         onClick = { onAction(action) },
         enabled = enabled,
-        modifier = Modifier.heightIn(min = 48.dp),
-        contentPadding = ButtonDefaults.ContentPadding,
+        modifier = Modifier.heightIn(min = 30.dp),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 7.dp, vertical = 0.dp),
     ) {
-        Text(label, maxLines = 1, style = MaterialTheme.typography.labelMedium)
+        Text(label, maxLines = 1, style = MaterialTheme.typography.labelSmall)
     }
 }
 
@@ -1539,27 +1591,34 @@ private fun TerminalIconKey(
     IconButton(
         onClick = { onAction(action) },
         enabled = enabled,
-        modifier = Modifier.size(48.dp),
+        modifier = Modifier.size(30.dp),
     ) {
         Icon(icon, contentDescription = description)
     }
 }
 
+private fun sessionStatusColor(
+    state: SessionState,
+    pcOnline: Boolean,
+    remoteState: RemoteSessionState?,
+): Color = when {
+    state == SessionState.EXITED -> ProductMuted
+    !pcOnline -> ProductMuted
+    state == SessionState.INTERRUPTED -> ProductDanger
+    remoteState is RemoteSessionState.Reconnecting || remoteState is RemoteSessionState.HistoryGap -> ProductDanger
+    else -> ProductPositive
+}
+
 @Composable
-private fun SessionStatePill(state: SessionState) {
-    val color = when (state) {
-        SessionState.RUNNING -> MaterialTheme.colorScheme.secondary
-        SessionState.INTERRUPTED -> MaterialTheme.colorScheme.tertiary
-        SessionState.EXITED -> MaterialTheme.colorScheme.onSurfaceVariant
-    }
-    Text(
-        state.localizedLabel(),
+private fun StatusDot(color: Color, contentDescription: String) {
+    Box(
         modifier = Modifier
-            .border(BorderStroke(1.dp, color.copy(alpha = 0.7f)), RoundedCornerShape(50))
-            .padding(horizontal = 9.dp, vertical = 5.dp),
-        style = MaterialTheme.typography.labelSmall,
-        color = color,
-    )
+            .size(9.dp)
+            .clip(RoundedCornerShape(50))
+            .background(color)
+            .border(1.dp, color.copy(alpha = 0.55f), RoundedCornerShape(50)),
+        contentAlignment = Alignment.Center,
+    ) {}
 }
 
 private fun SessionSummary.resolveDisplayedRemoteState(actual: RemoteSessionState?): RemoteSessionState? =
@@ -1574,59 +1633,58 @@ private fun TerminalSurface(
     session: SessionSummary,
     engine: TermuxTerminalEngine?,
     remoteState: RemoteSessionState?,
+    terminalPreferences: TerminalDisplayPreferences,
+    shortcutPreferences: TerminalShortcutPreferences,
+    onTerminalAction: (TerminalAction) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val placeholder = remember(session.id, session.columns, session.rows) {
         TermuxTerminalEngine(
             initialSize = TerminalSize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1)),
         ).also {
-            it.applyTheme(productTerminalTheme)
+            it.applyTheme(productTerminalTheme(terminalPreferences))
             it.setReadOnly(true)
         }
     }
     val activeEngine = engine ?: placeholder
     SideEffect {
-        activeEngine.applyTheme(productTerminalTheme)
+        activeEngine.applyTheme(productTerminalTheme(terminalPreferences))
+        activeEngine.setReadOnly(remoteState !is RemoteSessionState.Controlling)
     }
     DisposableEffect(placeholder) {
         onDispose { placeholder.dispose() }
     }
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(38.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            Text(stringResource(R.string.terminal_live), style = MaterialTheme.typography.labelLarge)
-            Text(
-                terminalStateLabel(remoteState),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.tertiary,
+    var dockExpanded by rememberSaveable(session.id) { mutableStateOf(true) }
+    Box(
+        modifier = modifier
+            .background(Color(terminalPreferences.backgroundArgb)),
+    ) {
+        key(activeEngine, terminalPreferences.fontSizeSp, terminalPreferences.lineSpacingMultiplier) {
+            AndroidView(
+                factory = { context ->
+                    activeEngine.createView(
+                        context = context,
+                        textSizeSp = terminalPreferences.fontSizeSp,
+                        lineSpacingMultiplier = terminalPreferences.lineSpacingMultiplier,
+                    )
+                },
+                modifier = Modifier.fillMaxSize(),
             )
         }
-        key(activeEngine) {
-            AndroidView(
-                factory = { context -> activeEngine.createView(context) },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(260.dp)
-                    .clip(ProductShape)
-                    .background(ProductTerminalBackground),
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(6.dp),
+        ) {
+            TerminalActionBar(
+                enabled = remoteState is RemoteSessionState.Controlling,
+                onAction = onTerminalAction,
+                shortcutPreferences = shortcutPreferences,
+                expanded = dockExpanded,
+                onExpandedChanged = { dockExpanded = it },
             )
         }
     }
-}
-
-@Composable
-private fun terminalStateLabel(state: RemoteSessionState?): String = when (state) {
-    is RemoteSessionState.Controlling -> stringResource(R.string.terminal_controlling)
-    is RemoteSessionState.Live -> stringResource(R.string.terminal_live_state)
-    is RemoteSessionState.Reconnecting -> stringResource(R.string.terminal_reconnecting)
-    is RemoteSessionState.ReadOnly -> stringResource(R.string.terminal_read_only)
-    is RemoteSessionState.HistoryGap -> stringResource(R.string.terminal_history_gap)
-    is RemoteSessionState.Exited -> stringResource(R.string.terminal_exited)
-    null -> stringResource(R.string.terminal_connecting)
 }
 
 @Composable
@@ -1696,6 +1754,7 @@ private fun HistoryPage(
     onHistorySelected: (HistoryEntry) -> Unit,
     onReplay: (HistoryEntry) -> Unit,
     historyEngine: (java.util.UUID) -> TermuxTerminalEngine?,
+    terminalPreferences: TerminalDisplayPreferences,
 ) {
     PageHeader(stringResource(R.string.nav_history), stringResource(R.string.page_history_subtitle), Icons.Filled.History)
     ConnectionBanner(snapshot = snapshot)
@@ -1730,6 +1789,7 @@ private fun HistoryPage(
     HistoryReplaySurface(
         entry = selected,
         engine = historyEngine(selected.historyObject.id),
+        terminalPreferences = terminalPreferences,
         onReplay = onReplay,
     )
 }
@@ -1738,6 +1798,7 @@ private fun HistoryPage(
 private fun HistoryReplaySurface(
     entry: HistoryEntry,
     engine: TermuxTerminalEngine?,
+    terminalPreferences: TerminalDisplayPreferences,
     onReplay: (HistoryEntry) -> Unit,
 ) {
     Surface(
@@ -1777,33 +1838,43 @@ private fun HistoryReplaySurface(
                     color = MaterialTheme.colorScheme.tertiary,
                 )
             }
-            HistoryTerminalSurface(entry = entry, engine = engine)
+            HistoryTerminalSurface(entry = entry, engine = engine, terminalPreferences = terminalPreferences)
         }
     }
 }
 
 @Composable
-private fun HistoryTerminalSurface(entry: HistoryEntry, engine: TermuxTerminalEngine?) {
+private fun HistoryTerminalSurface(
+    entry: HistoryEntry,
+    engine: TermuxTerminalEngine?,
+    terminalPreferences: TerminalDisplayPreferences,
+) {
     val placeholder = remember(entry.historyObject.id) {
         TermuxTerminalEngine().also {
-            it.applyTheme(productTerminalTheme)
+            it.applyTheme(productTerminalTheme(terminalPreferences))
             it.setReadOnly(true)
         }
     }
     val activeEngine = engine ?: placeholder
     SideEffect {
-        activeEngine.applyTheme(productTerminalTheme)
+        activeEngine.applyTheme(productTerminalTheme(terminalPreferences))
         activeEngine.setReadOnly(true)
     }
     DisposableEffect(placeholder) { onDispose { placeholder.dispose() } }
-    key(activeEngine) {
+    key(activeEngine, terminalPreferences.fontSizeSp, terminalPreferences.lineSpacingMultiplier) {
         AndroidView(
-            factory = { context -> activeEngine.createView(context) },
+            factory = { context ->
+                activeEngine.createView(
+                    context = context,
+                    textSizeSp = terminalPreferences.fontSizeSp,
+                    lineSpacingMultiplier = terminalPreferences.lineSpacingMultiplier,
+                )
+            },
             modifier = Modifier
                 .fillMaxWidth()
                 .height(240.dp)
                 .clip(ProductShape)
-                .background(ProductTerminalBackground),
+                .background(Color(terminalPreferences.backgroundArgb)),
         )
     }
 }
@@ -1817,6 +1888,10 @@ private fun SettingsPage(
     onOpenAccount: () -> Unit,
     themePreference: ProductThemePreference,
     onThemePreferenceChanged: (ProductThemePreference) -> Unit,
+    terminalPreferences: TerminalDisplayPreferences,
+    onTerminalPreferencesChanged: (TerminalDisplayPreferences) -> Unit,
+    shortcutPreferences: TerminalShortcutPreferences,
+    onShortcutPreferencesChanged: (TerminalShortcutPreferences) -> Unit,
 ) {
     PageHeader(stringResource(R.string.nav_settings), stringResource(R.string.page_settings_subtitle), Icons.Filled.Settings)
     ConnectionBanner(snapshot = snapshot)
@@ -1922,9 +1997,212 @@ private fun SettingsPage(
             }
         }
     }
+    PageHeader(
+        stringResource(R.string.settings_terminal_title),
+        stringResource(R.string.settings_terminal_copy),
+        Icons.Filled.Terminal,
+    )
+    TerminalDisplaySettings(
+        preferences = terminalPreferences,
+        onPreferencesChanged = onTerminalPreferencesChanged,
+    )
+    PageHeader(
+        stringResource(R.string.settings_shortcuts_title),
+        stringResource(R.string.settings_shortcuts_copy),
+        Icons.Filled.Terminal,
+    )
+    TerminalShortcutSettings(
+        preferences = shortcutPreferences,
+        onPreferencesChanged = onShortcutPreferencesChanged,
+    )
     PageHeader(stringResource(R.string.settings_about), stringResource(R.string.settings_about_copy), Icons.Filled.Info)
     Text(stringResource(R.string.settings_product_shell), style = MaterialTheme.typography.bodyMedium)
     Text(stringResource(R.string.settings_transport_copy), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
+@Composable
+private fun TerminalDisplaySettings(
+    preferences: TerminalDisplayPreferences,
+    onPreferencesChanged: (TerminalDisplayPreferences) -> Unit,
+) {
+    val value = preferences.normalized
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = ProductShape,
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
+    ) {
+        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text(
+                stringResource(R.string.settings_terminal_font_size, value.fontSizeSp),
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Slider(
+                value = value.fontSizeSp,
+                onValueChange = { onPreferencesChanged(value.copy(fontSizeSp = it)) },
+                valueRange = 10f..24f,
+                steps = 13,
+            )
+            Text(
+                stringResource(R.string.settings_terminal_line_spacing, value.lineSpacingMultiplier),
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Slider(
+                value = value.lineSpacingMultiplier,
+                onValueChange = { onPreferencesChanged(value.copy(lineSpacingMultiplier = it)) },
+                valueRange = 0.8f..1.8f,
+                steps = 9,
+            )
+            RgbEditor(
+                title = stringResource(R.string.settings_terminal_foreground),
+                argb = value.foregroundArgb,
+                onArgbChanged = { onPreferencesChanged(value.copy(foregroundArgb = it)) },
+            )
+            RgbEditor(
+                title = stringResource(R.string.settings_terminal_background),
+                argb = value.backgroundArgb,
+                onArgbChanged = { onPreferencesChanged(value.copy(backgroundArgb = it)) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun RgbEditor(
+    title: String,
+    argb: Int,
+    onArgbChanged: (Int) -> Unit,
+) {
+    val red = AndroidColor.red(argb)
+    val green = AndroidColor.green(argb)
+    val blue = AndroidColor.blue(argb)
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Box(
+                modifier = Modifier
+                    .size(24.dp)
+                    .clip(RoundedCornerShape(5.dp))
+                    .background(Color(argb))
+                    .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(5.dp)),
+            )
+            Text(title, style = MaterialTheme.typography.titleSmall)
+            Text("RGB($red, $green, $blue)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            RgbChannelField("R", red) { onArgbChanged(packOpaqueArgb(it, green, blue)) }
+            RgbChannelField("G", green) { onArgbChanged(packOpaqueArgb(red, it, blue)) }
+            RgbChannelField("B", blue) { onArgbChanged(packOpaqueArgb(red, green, it)) }
+        }
+    }
+}
+
+@Composable
+private fun RgbChannelField(label: String, value: Int, onValueChanged: (Int) -> Unit) {
+    var text by remember(value) { mutableStateOf(value.toString()) }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { next ->
+            val digits = next.filter(Char::isDigit).take(3)
+            text = digits
+            digits.toIntOrNull()?.let { onValueChanged(it.coerceIn(0, 255)) }
+        },
+        label = { Text(label) },
+        singleLine = true,
+        modifier = Modifier.width(82.dp),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+    )
+}
+
+private fun packOpaqueArgb(red: Int, green: Int, blue: Int): Int =
+    AndroidColor.rgb(red.coerceIn(0, 255), green.coerceIn(0, 255), blue.coerceIn(0, 255))
+
+@Composable
+private fun TerminalShortcutSettings(
+    preferences: TerminalShortcutPreferences,
+    onPreferencesChanged: (TerminalShortcutPreferences) -> Unit,
+) {
+    val value = preferences.normalized
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = ProductShape,
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
+    ) {
+        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            TerminalAction.entries.forEach { action ->
+                val index = value.visibleActions.indexOf(action)
+                val selected = index >= 0
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = selected,
+                        enabled = action != TerminalAction.ENTER,
+                        onCheckedChange = { checked ->
+                            val next = if (checked) {
+                                value.visibleActions + action
+                            } else {
+                                value.visibleActions - action
+                            }
+                            onPreferencesChanged(value.copy(visibleActions = next))
+                        },
+                    )
+                    Text(
+                        action.name.replace('_', ' '),
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                    IconButton(
+                        onClick = {
+                            if (index > 0) {
+                                val next = value.visibleActions.toMutableList()
+                                next[index] = next[index - 1].also { next[index - 1] = next[index] }
+                                onPreferencesChanged(value.copy(visibleActions = next))
+                            }
+                        },
+                        enabled = selected && index > 0,
+                        modifier = Modifier.size(34.dp),
+                    ) {
+                        Icon(Icons.Filled.KeyboardArrowUp, contentDescription = stringResource(R.string.shortcut_move_up))
+                    }
+                    IconButton(
+                        onClick = {
+                            if (index >= 0 && index < value.visibleActions.lastIndex) {
+                                val next = value.visibleActions.toMutableList()
+                                next[index] = next[index + 1].also { next[index + 1] = next[index] }
+                                onPreferencesChanged(value.copy(visibleActions = next))
+                            }
+                        },
+                        enabled = selected && index < value.visibleActions.lastIndex,
+                        modifier = Modifier.size(34.dp),
+                    ) {
+                        Icon(Icons.Filled.KeyboardArrowDown, contentDescription = stringResource(R.string.shortcut_move_down))
+                    }
+                }
+                if (selected && action !in setOf(
+                        TerminalAction.ARROW_LEFT,
+                        TerminalAction.ARROW_UP,
+                        TerminalAction.ARROW_DOWN,
+                        TerminalAction.ARROW_RIGHT,
+                    )) {
+                    OutlinedTextField(
+                        value = value.label(action),
+                        onValueChange = { next ->
+                            onPreferencesChanged(value.copy(labels = value.labels + (action to next)))
+                        },
+                        label = { Text(stringResource(R.string.shortcut_label_name)) },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 48.dp),
+                    )
+                }
+            }
+            Text(
+                stringResource(R.string.settings_shortcuts_direction_copy),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
 }
 
 @Composable
@@ -2150,22 +2428,25 @@ private fun safeOperationMessage(error: Throwable, fallback: String): String =
         fallback
     }
 
-private val productTerminalTheme = TerminalThemeV1(
-    name = "TermLink Product",
-    foreground = ArgbColor(0xFFE9EEF5.toInt()),
-    background = ArgbColor(0xFF080B10.toInt()),
-    cursor = ArgbColor(0xFFF5F7FA.toInt()),
-    selectionBackground = ArgbColor(0xFF3E4B70.toInt()),
-    selectionForeground = null,
-    ansiColors = listOf(
-        0xFF161B24, 0xFFFF8C91, 0xFF65D6A1, 0xFFF1C96B,
-        0xFF9CB2FF, 0xFFC99DEB, 0xFF6EDDE0, 0xFFE9EEF5,
-        0xFF6F7A8B, 0xFFFFA4A8, 0xFF82E3B4, 0xFFFFD984,
-        0xFFB9C7FF, 0xFFDDB8F2, 0xFF8DE7E9, 0xFFFFFFFF,
-    ).map { ArgbColor(it.toInt()) },
-    boldAsBright = true,
-    fontFamilyHint = "Cascadia Mono",
-)
+private fun productTerminalTheme(preferences: TerminalDisplayPreferences): TerminalThemeV1 {
+    val normalized = preferences.normalized
+    return TerminalThemeV1(
+        name = "TermLink Product",
+        foreground = ArgbColor(normalized.foregroundArgb),
+        background = ArgbColor(normalized.backgroundArgb),
+        cursor = ArgbColor(normalized.foregroundArgb),
+        selectionBackground = ArgbColor(0xFF3E4B70.toInt()),
+        selectionForeground = null,
+        ansiColors = listOf(
+            normalized.backgroundArgb, 0xFFFF8C91, 0xFF65D6A1, 0xFFF1C96B,
+            0xFF9CB2FF, 0xFFC99DEB, 0xFF6EDDE0, normalized.foregroundArgb,
+            0xFF6F7A8B, 0xFFFFA4A8, 0xFF82E3B4, 0xFFFFD984,
+            0xFFB9C7FF, 0xFFDDB8F2, 0xFF8DE7E9, 0xFFFFFFFF,
+        ).map { ArgbColor(it.toInt()) },
+        boldAsBright = true,
+        fontFamilyHint = "Cascadia Mono",
+    )
+}
 
 /** A small compatibility wrapper keeps the app free of a lifecycle-compose dependency. */
 @Composable

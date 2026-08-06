@@ -71,7 +71,7 @@ val ProductDestination.isVisibleInProductShell: Boolean
 /** The only destinations shown in the phone's primary navigation bar. */
 enum class ProductPrimaryDestination(val label: String) {
     DEVICES("Devices"),
-    ACTIVITY("Activity"),
+    SESSIONS("Sessions"),
     SETTINGS("Settings"),
 }
 
@@ -87,9 +87,35 @@ enum class ProductThemePreference(val wireValue: String) {
     }
 }
 
+/**
+ * Local presentation preferences for the remote terminal.  These values are
+ * deliberately independent from the application light/dark theme: a terminal
+ * is a user's working surface and should not unexpectedly change when the
+ * surrounding product shell follows the system theme.
+ */
+data class TerminalDisplayPreferences(
+    val fontSizeSp: Float = 14f,
+    val lineSpacingMultiplier: Float = 1f,
+    /** Packed opaque ARGB values; the settings UI edits the RGB channels. */
+    val foregroundArgb: Int = 0xFFE9EEF5.toInt(),
+    val backgroundArgb: Int = 0xFF080B10.toInt(),
+) {
+    val normalized: TerminalDisplayPreferences
+        get() = copy(
+            fontSizeSp = fontSizeSp.coerceIn(10f, 24f),
+            lineSpacingMultiplier = lineSpacingMultiplier.coerceIn(0.8f, 1.8f),
+            foregroundArgb = foregroundArgb or 0xFF000000.toInt(),
+            backgroundArgb = backgroundArgb or 0xFF000000.toInt(),
+        )
+}
+
 fun ProductDestination.primaryDestination(): ProductPrimaryDestination = when (this) {
-    ProductDestination.DEVICES, ProductDestination.SESSIONS -> ProductPrimaryDestination.DEVICES
-    ProductDestination.ACTIVITY, ProductDestination.HISTORY -> ProductPrimaryDestination.ACTIVITY
+    ProductDestination.DEVICES -> ProductPrimaryDestination.DEVICES
+    ProductDestination.SESSIONS -> ProductPrimaryDestination.SESSIONS
+    // Activity and history remain reachable from secondary actions. Keep the
+    // devices destination selected while those pages are open because the
+    // former Activity dock item is now the direct Sessions entry point.
+    ProductDestination.ACTIVITY, ProductDestination.HISTORY -> ProductPrimaryDestination.DEVICES
     ProductDestination.SETTINGS,
     ProductDestination.MEMBERSHIP,
     ProductDestination.TRUSTED_DEVICES,
@@ -98,7 +124,7 @@ fun ProductDestination.primaryDestination(): ProductPrimaryDestination = when (t
 
 fun ProductPrimaryDestination.destination(): ProductDestination = when (this) {
     ProductPrimaryDestination.DEVICES -> ProductDestination.DEVICES
-    ProductPrimaryDestination.ACTIVITY -> ProductDestination.ACTIVITY
+    ProductPrimaryDestination.SESSIONS -> ProductDestination.SESSIONS
     ProductPrimaryDestination.SETTINGS -> ProductDestination.SETTINGS
 }
 
@@ -171,6 +197,46 @@ enum class TerminalAction {
     ARROW_RIGHT,
     CTRL_C,
 }
+
+/** Local labels for the compact shortcut dock; the action semantics remain fixed. */
+data class TerminalShortcutPreferences(
+    val labels: Map<TerminalAction, String> = defaultTerminalShortcutLabels(),
+    val visibleActions: List<TerminalAction> = defaultTerminalShortcutActions(),
+) {
+    fun label(action: TerminalAction): String = labels[action].orEmpty().ifBlank { defaultTerminalShortcutLabels()[action].orEmpty() }
+
+    val normalized: TerminalShortcutPreferences
+        get() = copy(
+            labels = TerminalAction.entries.associateWith { action ->
+                label(action).trim().take(12).ifBlank { defaultTerminalShortcutLabels()[action].orEmpty() }
+            },
+            visibleActions = (visibleActions + TerminalAction.ENTER)
+                .distinct()
+                .filter(TerminalAction.entries::contains),
+        )
+}
+
+private fun defaultTerminalShortcutLabels(): Map<TerminalAction, String> = mapOf(
+    TerminalAction.ESCAPE to "Esc",
+    TerminalAction.TAB to "Tab",
+    TerminalAction.ENTER to "Enter",
+    TerminalAction.ARROW_LEFT to "←",
+    TerminalAction.ARROW_UP to "↑",
+    TerminalAction.ARROW_DOWN to "↓",
+    TerminalAction.ARROW_RIGHT to "→",
+    TerminalAction.CTRL_C to "Ctrl+C",
+)
+
+private fun defaultTerminalShortcutActions(): List<TerminalAction> = listOf(
+    TerminalAction.ESCAPE,
+    TerminalAction.TAB,
+    TerminalAction.ENTER,
+    TerminalAction.ARROW_LEFT,
+    TerminalAction.ARROW_UP,
+    TerminalAction.ARROW_DOWN,
+    TerminalAction.ARROW_RIGHT,
+    TerminalAction.CTRL_C,
+)
 
 data class HistoryEntry(
     val sessionId: UUID,

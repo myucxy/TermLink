@@ -28,9 +28,10 @@ class ProductStateTest {
 
     @Test
     fun phonePrimaryNavigationKeepsNestedRoutesUnderTheirParent() {
-        assertEquals(ProductPrimaryDestination.DEVICES, ProductDestination.SESSIONS.primaryDestination())
-        assertEquals(ProductPrimaryDestination.ACTIVITY, ProductDestination.HISTORY.primaryDestination())
+        assertEquals(ProductPrimaryDestination.SESSIONS, ProductDestination.SESSIONS.primaryDestination())
+        assertEquals(ProductPrimaryDestination.DEVICES, ProductDestination.HISTORY.primaryDestination())
         assertEquals(ProductPrimaryDestination.SETTINGS, ProductDestination.MEMBERSHIP.primaryDestination())
+        assertEquals(ProductDestination.SESSIONS, ProductPrimaryDestination.SESSIONS.destination())
         assertEquals(ProductDestination.SETTINGS, ProductPrimaryDestination.SETTINGS.destination())
     }
 
@@ -92,5 +93,33 @@ class ProductStateTest {
         assertEquals(MAX_DEVICE_LOCAL_ACTIVITY_ENTRIES, snapshot.activity.size)
         assertEquals("event-${MAX_DEVICE_LOCAL_ACTIVITY_ENTRIES + 6}", snapshot.activity.first().title)
         assertTrue(snapshot.activity.all { it.source == ActivitySource.DEVICE_LOCAL })
+    }
+
+    @Test
+    fun terminalDisplayPreferencesStayWithinRendererSafeBounds() {
+        val normalized = TerminalDisplayPreferences(
+            fontSizeSp = 2f,
+            lineSpacingMultiplier = 4f,
+            foregroundArgb = 0x00112233,
+            backgroundArgb = 0x00445566,
+        ).normalized
+
+        assertEquals(10f, normalized.fontSizeSp)
+        assertEquals(1.8f, normalized.lineSpacingMultiplier)
+        assertEquals(0xFF112233.toInt(), normalized.foregroundArgb)
+        assertEquals(0xFF445566.toInt(), normalized.backgroundArgb)
+    }
+
+    @Test
+    fun terminalShortcutLabelsTrimAndFallbackToDefaults() {
+        val normalized = TerminalShortcutPreferences(
+            labels = mapOf(TerminalAction.ESCAPE to "   ", TerminalAction.TAB to "  Next  "),
+            visibleActions = listOf(TerminalAction.TAB, TerminalAction.TAB),
+        ).normalized
+
+        assertEquals("Esc", normalized.label(TerminalAction.ESCAPE))
+        assertEquals("Next", normalized.label(TerminalAction.TAB))
+        assertEquals("Ctrl+C", normalized.label(TerminalAction.CTRL_C))
+        assertEquals(listOf(TerminalAction.TAB, TerminalAction.ENTER), normalized.visibleActions)
     }
 }

@@ -32,8 +32,8 @@ android {
         applicationId = "dev.termlink.harness"
         minSdk = 26
         targetSdk = 36
-        versionCode = 5
-        versionName = "0.1.5"
+        versionCode = 6
+        versionName = "0.1.6"
         manifestPlaceholders["appAuthRedirectScheme"] = "dev.termlink"
     }
 
