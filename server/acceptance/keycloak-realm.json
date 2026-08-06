@@ -95,7 +95,7 @@
       "enabled": true,
       "publicClient": true,
       "standardFlowEnabled": true,
-      "directAccessGrantsEnabled": false,
+      "directAccessGrantsEnabled": true,
       "redirectUris": ["http://127.0.0.1:43971/oauth2/callback"],
       "webOrigins": [],
       "attributes": {

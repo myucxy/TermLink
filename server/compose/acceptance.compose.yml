@@ -288,6 +288,17 @@ services:
           -r termlink -q clientId=termlink-windows \
           --fields id --format csv --noquotes | tail -n 1)
         test -n "$$windows_client_id"
+        /opt/keycloak/bin/kcadm.sh update "clients/$$windows_client_id" \
+          --config /tmp/kcadm.config -r termlink \
+          -s enabled=true \
+          -s publicClient=true \
+          -s standardFlowEnabled=true \
+          -s directAccessGrantsEnabled=true \
+          -s implicitFlowEnabled=false \
+          -s serviceAccountsEnabled=false \
+          -s fullScopeAllowed=false \
+          -s 'redirectUris=["http://127.0.0.1:43971/oauth2/callback"]' \
+          -s 'attributes={"pkce.code.challenge.method":"S256"}' >/dev/null
         client_scope_table=$$(/opt/keycloak/bin/kcadm.sh get client-scopes \
           --config /tmp/kcadm.config \
           -r termlink --fields id,name --format csv --noquotes)

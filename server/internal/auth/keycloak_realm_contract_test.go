@@ -27,7 +27,7 @@ type acceptanceRealmClient struct {
 	} `json:"protocolMappers"`
 }
 
-func TestAcceptanceRealmUsesGatedRegistrationAndAndroidNativeLogin(t *testing.T) {
+func TestAcceptanceRealmUsesGatedRegistrationAndNativeClientLogin(t *testing.T) {
 	data, err := os.ReadFile("../../acceptance/keycloak-realm.json")
 	if err != nil {
 		t.Fatal(err)
@@ -80,6 +80,24 @@ func TestAcceptanceRealmUsesGatedRegistrationAndAndroidNativeLogin(t *testing.T)
 	}
 	if !foundAudience {
 		t.Fatal("Android access-only server audience mapper is missing")
+	}
+	var windows *acceptanceRealmClient
+	for i := range realm.Clients {
+		if realm.Clients[i].ClientID == "termlink-windows" {
+			windows = &realm.Clients[i]
+			break
+		}
+	}
+	if windows == nil {
+		t.Fatal("termlink-windows client is missing")
+	}
+	if !windows.PublicClient || !windows.StandardFlowEnabled || !windows.DirectAccessGrantsEnabled || windows.ImplicitFlowEnabled ||
+		windows.ServiceAccountsEnabled || windows.FullScopeAllowed || windows.Secret != "" {
+		t.Fatal("termlink-windows client flow policy is unsafe")
+	}
+	if windows.Attributes["pkce.code.challenge.method"] != "S256" ||
+		!containsString(windows.RedirectURIs, "http://127.0.0.1:43971/oauth2/callback") {
+		t.Fatal("termlink-windows browser fallback policy is incomplete")
 	}
 	var web *acceptanceRealmClient
 	for i := range realm.Clients {
@@ -154,6 +172,37 @@ func TestAcceptanceBootstrapPreservesExistingAcceptanceSessions(t *testing.T) {
 		passwordInitialization > creationBranchEnd || profileReconciliation < creationBranchEnd ||
 		strings.Count(loop, "kcadm.sh set-password") != 1 {
 		t.Fatal("acceptance user passwords must be initialized only when the managed user is first created")
+	}
+}
+
+func TestAcceptanceBootstrapReconcilesWindowsNativeLogin(t *testing.T) {
+	data, err := os.ReadFile("../../compose/acceptance.compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compose := string(data)
+	windowsStart := strings.Index(compose, "windows_client_id=$$(/opt/keycloak/bin/kcadm.sh get clients")
+	if windowsStart < 0 {
+		t.Fatal("Windows client reconciliation is missing")
+	}
+	windowsEndOffset := strings.Index(compose[windowsStart:], "client_scope_table=$$(/opt/keycloak/bin/kcadm.sh get client-scopes")
+	if windowsEndOffset < 0 {
+		t.Fatal("Windows client reconciliation is incomplete")
+	}
+	windowsBlock := compose[windowsStart : windowsStart+windowsEndOffset]
+	for _, expected := range []string{
+		`-s publicClient=true`,
+		`-s standardFlowEnabled=true`,
+		`-s directAccessGrantsEnabled=true`,
+		`-s implicitFlowEnabled=false`,
+		`-s serviceAccountsEnabled=false`,
+		`-s fullScopeAllowed=false`,
+		`-s 'redirectUris=["http://127.0.0.1:43971/oauth2/callback"]'`,
+		`-s 'attributes={"pkce.code.challenge.method":"S256"}'`,
+	} {
+		if !strings.Contains(windowsBlock, expected) {
+			t.Fatalf("Windows native-login reconciliation is missing %q", expected)
+		}
 	}
 }
 
