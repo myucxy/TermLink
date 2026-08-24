@@ -245,7 +245,8 @@ class ProductStateTest {
         assertEquals("Esc", normalized.label(TerminalAction.ESCAPE))
         assertEquals("Next", normalized.label(TerminalAction.TAB))
         assertEquals("Ctrl+C", normalized.label(TerminalAction.CTRL_C))
-        assertEquals(listOf(TerminalAction.TAB, TerminalAction.ENTER), normalized.visibleActions)
+        assertEquals(TerminalAction.TAB, normalized.visibleActions.first())
+        assertEquals(TerminalAction.entries.toSet(), normalized.visibleActions.toSet())
     }
 
     @Test
@@ -350,22 +351,43 @@ class ProductStateTest {
     }
 
     @Test
-    fun shortcutSettingsShowVisibleActionsInDockOrderThenHiddenActions() {
+    fun unifiedShortcutOrderInterleavesBuiltInAndCustomItemsAndRepairsMissingKeys() {
+        val custom = TerminalCustomShortcut(
+            id = "resume-codex",
+            label = "Codex",
+            value = "codex resume",
+            type = TerminalCustomShortcutType.QUICK_INPUT,
+        )
         val preferences = TerminalShortcutPreferences(
             visibleActions = listOf(
                 TerminalAction.DELETE,
                 TerminalAction.TAB,
                 TerminalAction.ENTER,
             ),
+            customShortcuts = listOf(custom),
+            shortcutOrder = listOf(
+                terminalBuiltInShortcutOrderKey(TerminalAction.DELETE),
+                terminalCustomShortcutOrderKey(custom.id),
+                "unknown:item",
+                terminalBuiltInShortcutOrderKey(TerminalAction.TAB),
+            ),
         )
 
-        val order = terminalShortcutSettingsOrder(preferences)
+        val normalized = preferences.normalized
+        val items = orderedTerminalShortcutItems(preferences)
 
         assertEquals(
-            listOf(TerminalAction.DELETE, TerminalAction.TAB, TerminalAction.ENTER),
-            order.take(3),
+            listOf(
+                terminalBuiltInShortcutOrderKey(TerminalAction.DELETE),
+                terminalCustomShortcutOrderKey(custom.id),
+                terminalBuiltInShortcutOrderKey(TerminalAction.TAB),
+            ),
+            normalized.shortcutOrder.take(3),
         )
-        assertEquals(TerminalAction.entries.toSet(), order.toSet())
-        assertEquals(TerminalAction.entries.size, order.size)
+        assertEquals(TerminalShortcutItem.BuiltIn(TerminalAction.DELETE), items[0])
+        assertEquals(TerminalShortcutItem.Custom(custom), items[1])
+        assertEquals(TerminalShortcutItem.BuiltIn(TerminalAction.TAB), items[2])
+        assertEquals(TerminalAction.entries.size + 1, items.size)
+        assertEquals(false, normalized.shortcutOrder.contains("unknown:item"))
     }
 }

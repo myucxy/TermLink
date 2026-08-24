@@ -75,6 +75,13 @@ class TerminalShortcutInputTest {
                     TerminalCustomShortcutType.QUICK_INPUT,
                 ),
             ),
+            shortcutOrder = listOf(
+                terminalBuiltInShortcutOrderKey(TerminalAction.DELETE),
+                terminalCustomShortcutOrderKey("resume-codex"),
+                terminalBuiltInShortcutOrderKey(TerminalAction.ENTER),
+                terminalCustomShortcutOrderKey("literal-plus"),
+                terminalCustomShortcutOrderKey("control-plus"),
+            ),
         ).normalized
 
         saveTerminalShortcutPreferences(context, value)
@@ -88,6 +95,14 @@ class TerminalShortcutInputTest {
         assertEquals(TerminalCustomShortcutType.QUICK_INPUT, restored.customShortcuts[2].type)
         assertEquals(quickCommand, restored.customShortcuts[2].quickInput)
         assertEquals("Codex", restored.customShortcuts[2].displayLabel)
+        assertEquals(
+            listOf(
+                terminalBuiltInShortcutOrderKey(TerminalAction.DELETE),
+                terminalCustomShortcutOrderKey("resume-codex"),
+                terminalBuiltInShortcutOrderKey(TerminalAction.ENTER),
+            ),
+            restored.shortcutOrder.take(3),
+        )
     }
 
     @Test

@@ -18,12 +18,15 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.lifecycleScope
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -65,6 +68,7 @@ import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Info
@@ -127,7 +131,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionOnScreen
@@ -136,6 +143,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -143,6 +151,8 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -252,6 +262,7 @@ private const val TERMINAL_BACKGROUND_KEY = "terminal_background_argb"
 private const val TERMINAL_SHORTCUT_PREFIX = "terminal_shortcut_"
 private const val TERMINAL_SHORTCUT_ORDER_KEY = "terminal_shortcut_order"
 private const val TERMINAL_CUSTOM_SHORTCUTS_KEY = "terminal_custom_shortcuts_v1"
+private const val TERMINAL_UNIFIED_SHORTCUT_ORDER_KEY = "terminal_shortcut_order_v2"
 private const val REMOTE_DOWNLOAD_PC_ID_KEY = "remote_download_pc_id"
 private const val REMOTE_DOWNLOAD_PC_NAME_KEY = "remote_download_pc_name"
 private const val REMOTE_DOWNLOAD_PATH_KEY = "remote_download_path"
@@ -2178,12 +2189,19 @@ internal fun loadTerminalShortcutPreferences(context: android.content.Context): 
             }
         }
     }.getOrDefault(emptyList())
+    val unifiedOrder = preferences.getString(TERMINAL_UNIFIED_SHORTCUT_ORDER_KEY, null)
+        ?.split(',')
+        ?.map(String::trim)
+        ?.filter(String::isNotEmpty)
+        ?: storedOrder.map(::terminalBuiltInShortcutOrderKey) +
+            customShortcuts.map { terminalCustomShortcutOrderKey(it.id) }
     return TerminalShortcutPreferences(
         labels = TerminalAction.entries.associateWith { action ->
             preferences.getString(TERMINAL_SHORTCUT_PREFIX + action.name, defaults.label(action)) ?: defaults.label(action)
         },
         visibleActions = storedOrder,
         customShortcuts = customShortcuts,
+        shortcutOrder = unifiedOrder,
     ).normalized
 }
 
@@ -2215,6 +2233,7 @@ internal fun saveTerminalShortcutPreferences(
         }
         .putString(TERMINAL_SHORTCUT_ORDER_KEY, normalized.visibleActions.joinToString(",") { it.name })
         .putString(TERMINAL_CUSTOM_SHORTCUTS_KEY, customShortcuts.toString())
+        .putString(TERMINAL_UNIFIED_SHORTCUT_ORDER_KEY, normalized.shortcutOrder.joinToString(","))
         .apply()
 }
 
@@ -3474,21 +3493,21 @@ private fun TerminalActionBar(
                 )
             }
             if (expanded) {
-                shortcutPreferences.visibleActions.forEach { action ->
-                    when (action) {
-                        TerminalAction.ARROW_LEFT -> TerminalIconKey(Icons.AutoMirrored.Filled.KeyboardArrowLeft, stringResource(R.string.arrow_left), action, enabled, onAction)
-                        TerminalAction.ARROW_UP -> TerminalIconKey(Icons.Filled.KeyboardArrowUp, stringResource(R.string.arrow_up), action, enabled, onAction)
-                        TerminalAction.ARROW_DOWN -> TerminalIconKey(Icons.Filled.KeyboardArrowDown, stringResource(R.string.arrow_down), action, enabled, onAction)
-                        TerminalAction.ARROW_RIGHT -> TerminalIconKey(Icons.AutoMirrored.Filled.KeyboardArrowRight, stringResource(R.string.arrow_right), action, enabled, onAction)
-                        else -> TerminalTextKey(shortcutPreferences.label(action), action, enabled, onAction)
+                orderedTerminalShortcutItems(shortcutPreferences).forEach { item ->
+                    when (item) {
+                        is TerminalShortcutItem.BuiltIn -> when (item.action) {
+                            TerminalAction.ARROW_LEFT -> TerminalIconKey(Icons.AutoMirrored.Filled.KeyboardArrowLeft, stringResource(R.string.arrow_left), item.action, enabled, onAction)
+                            TerminalAction.ARROW_UP -> TerminalIconKey(Icons.Filled.KeyboardArrowUp, stringResource(R.string.arrow_up), item.action, enabled, onAction)
+                            TerminalAction.ARROW_DOWN -> TerminalIconKey(Icons.Filled.KeyboardArrowDown, stringResource(R.string.arrow_down), item.action, enabled, onAction)
+                            TerminalAction.ARROW_RIGHT -> TerminalIconKey(Icons.AutoMirrored.Filled.KeyboardArrowRight, stringResource(R.string.arrow_right), item.action, enabled, onAction)
+                            else -> TerminalTextKey(shortcutPreferences.label(item.action), item.action, enabled, onAction)
+                        }
+                        is TerminalShortcutItem.Custom -> TerminalCustomTextKey(
+                            shortcut = item.shortcut,
+                            enabled = enabled,
+                            onActivate = onCustomShortcut,
+                        )
                     }
-                }
-                shortcutPreferences.customShortcuts.forEach { shortcut ->
-                    TerminalCustomTextKey(
-                        shortcut = shortcut,
-                        enabled = enabled,
-                        onActivate = onCustomShortcut,
-                    )
                 }
             }
         }
@@ -4518,12 +4537,12 @@ private fun TerminalDisplaySettings(
                 valueRange = 0.8f..1.8f,
                 steps = 9,
             )
-            RgbEditor(
+            TerminalColorPickerSetting(
                 title = stringResource(R.string.settings_terminal_foreground),
                 argb = value.foregroundArgb,
                 onArgbChanged = { onPreferencesChanged(value.copy(foregroundArgb = it)) },
             )
-            RgbEditor(
+            TerminalColorPickerSetting(
                 title = stringResource(R.string.settings_terminal_background),
                 argb = value.backgroundArgb,
                 onArgbChanged = { onPreferencesChanged(value.copy(backgroundArgb = it)) },
@@ -4533,53 +4552,247 @@ private fun TerminalDisplaySettings(
 }
 
 @Composable
-private fun RgbEditor(
+private fun TerminalColorPickerSetting(
     title: String,
     argb: Int,
     onArgbChanged: (Int) -> Unit,
 ) {
-    val red = AndroidColor.red(argb)
-    val green = AndroidColor.green(argb)
-    val blue = AndroidColor.blue(argb)
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    var pickerOpen by rememberSaveable(title) { mutableStateOf(false) }
+    OutlinedButton(
+        onClick = { pickerOpen = true },
+        modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
             Box(
                 modifier = Modifier
-                    .size(24.dp)
-                    .clip(RoundedCornerShape(5.dp))
+                    .size(32.dp)
+                    .clip(RoundedCornerShape(7.dp))
                     .background(Color(argb))
-                    .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(5.dp)),
+                    .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(7.dp)),
             )
-            Text(title, style = MaterialTheme.typography.titleSmall)
-            Text("RGB($red, $green, $blue)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(title, style = MaterialTheme.typography.titleSmall)
+                Text(
+                    terminalColorHex(argb),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Text(stringResource(R.string.settings_color_picker_action))
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            RgbChannelField("R", red) { onArgbChanged(packOpaqueArgb(it, green, blue)) }
-            RgbChannelField("G", green) { onArgbChanged(packOpaqueArgb(red, it, blue)) }
-            RgbChannelField("B", blue) { onArgbChanged(packOpaqueArgb(red, green, it)) }
-        }
+    }
+    if (pickerOpen) {
+        TerminalColorPickerDialog(
+            title = title,
+            initialArgb = argb,
+            onDismiss = { pickerOpen = false },
+            onConfirm = {
+                onArgbChanged(it)
+                pickerOpen = false
+            },
+        )
     }
 }
 
 @Composable
-private fun RgbChannelField(label: String, value: Int, onValueChanged: (Int) -> Unit) {
-    var text by remember(value) { mutableStateOf(value.toString()) }
-    OutlinedTextField(
-        value = text,
-        onValueChange = { next ->
-            val digits = next.filter(Char::isDigit).take(3)
-            text = digits
-            digits.toIntOrNull()?.let { onValueChanged(it.coerceIn(0, 255)) }
+private fun TerminalColorPickerDialog(
+    title: String,
+    initialArgb: Int,
+    onDismiss: () -> Unit,
+    onConfirm: (Int) -> Unit,
+) {
+    val initialHsv = remember(initialArgb) { terminalColorHsv(initialArgb) }
+    var hue by remember(initialArgb) { mutableStateOf(initialHsv[0]) }
+    var saturation by remember(initialArgb) { mutableStateOf(initialHsv[1]) }
+    var brightness by remember(initialArgb) { mutableStateOf(initialHsv[2]) }
+    val selectedArgb = opaqueArgbFromHsv(hue, saturation, brightness)
+    val hueColors = remember {
+        (0..6).map { step -> Color(opaqueArgbFromHsv(step * 60f, 1f, 1f)) }
+    }
+
+    fun selectArgb(argb: Int) {
+        val hsv = terminalColorHsv(argb)
+        hue = hsv[0]
+        saturation = hsv[1]
+        brightness = hsv[2]
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(selectedArgb))
+                            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(8.dp)),
+                    )
+                    Column {
+                        Text(terminalColorHex(selectedArgb), style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            stringResource(R.string.settings_color_picker_hint),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Canvas(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(180.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .pointerInput(hue) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown()
+                                fun update(position: Offset) {
+                                    saturation = (position.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f)
+                                    brightness = (1f - position.y / size.height.coerceAtLeast(1)).coerceIn(0f, 1f)
+                                }
+                                update(down.position)
+                                var pressed = true
+                                while (pressed) {
+                                    val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id }
+                                    if (change == null) {
+                                        pressed = false
+                                    } else {
+                                        if (change.pressed) update(change.position)
+                                        change.consume()
+                                        pressed = change.pressed
+                                    }
+                                }
+                            }
+                        },
+                ) {
+                    drawRect(
+                        brush = Brush.horizontalGradient(
+                            listOf(Color.White, Color(opaqueArgbFromHsv(hue, 1f, 1f))),
+                        ),
+                    )
+                    drawRect(brush = Brush.verticalGradient(listOf(Color.Transparent, Color.Black)))
+                    val marker = Offset(saturation * size.width, (1f - brightness) * size.height)
+                    drawCircle(Color.Black.copy(alpha = 0.85f), radius = 10.dp.toPx(), center = marker)
+                    drawCircle(Color.White, radius = 8.dp.toPx(), center = marker, style = Stroke(2.dp.toPx()))
+                }
+                Canvas(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(32.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .pointerInput(Unit) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown()
+                                fun update(position: Offset) {
+                                    hue = (position.x / size.width.coerceAtLeast(1) * 360f).coerceIn(0f, 359.999f)
+                                }
+                                update(down.position)
+                                var pressed = true
+                                while (pressed) {
+                                    val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id }
+                                    if (change == null) {
+                                        pressed = false
+                                    } else {
+                                        if (change.pressed) update(change.position)
+                                        change.consume()
+                                        pressed = change.pressed
+                                    }
+                                }
+                            }
+                        },
+                ) {
+                    drawRect(brush = Brush.horizontalGradient(hueColors))
+                    val markerX = hue / 360f * size.width
+                    drawCircle(
+                        color = Color.Black.copy(alpha = 0.85f),
+                        radius = 9.dp.toPx(),
+                        center = Offset(markerX, size.height / 2f),
+                    )
+                    drawCircle(
+                        color = Color.White,
+                        radius = 7.dp.toPx(),
+                        center = Offset(markerX, size.height / 2f),
+                        style = Stroke(2.dp.toPx()),
+                    )
+                }
+                Text(
+                    stringResource(R.string.settings_color_picker_presets),
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    terminalColorPresets.forEach { preset ->
+                        val presetDescription = terminalColorHex(preset)
+                        IconButton(
+                            onClick = { selectArgb(preset) },
+                            modifier = Modifier.semantics { contentDescription = presetDescription },
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(Color(preset))
+                                    .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(6.dp)),
+                            )
+                        }
+                    }
+                }
+            }
         },
-        label = { Text(label) },
-        singleLine = true,
-        modifier = Modifier.width(82.dp),
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        confirmButton = {
+            TextButton(onClick = { onConfirm(selectedArgb) }, modifier = Modifier.heightIn(min = 48.dp)) {
+                Text(stringResource(R.string.action_save))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) {
+                Text(stringResource(R.string.action_cancel))
+            }
+        },
     )
 }
 
-private fun packOpaqueArgb(red: Int, green: Int, blue: Int): Int =
-    AndroidColor.rgb(red.coerceIn(0, 255), green.coerceIn(0, 255), blue.coerceIn(0, 255))
+private val terminalColorPresets = listOf(
+    0xFF080B10.toInt(),
+    0xFF121820.toInt(),
+    0xFF263238.toInt(),
+    0xFF465363.toInt(),
+    0xFFE9EEF5.toInt(),
+    0xFFFFFFFF.toInt(),
+    0xFF9CB2FF.toInt(),
+    0xFF65D6A1.toInt(),
+    0xFFF1C96B.toInt(),
+    0xFFFF8C91.toInt(),
+    0xFFC99DEB.toInt(),
+    0xFF6EDDE0.toInt(),
+)
+
+internal fun terminalColorHsv(argb: Int): FloatArray = FloatArray(3).also { hsv ->
+    AndroidColor.colorToHSV(argb or 0xFF000000.toInt(), hsv)
+}
+
+internal fun opaqueArgbFromHsv(hue: Float, saturation: Float, brightness: Float): Int =
+    AndroidColor.HSVToColor(
+        floatArrayOf(
+            hue.coerceIn(0f, 359.999f),
+            saturation.coerceIn(0f, 1f),
+            brightness.coerceIn(0f, 1f),
+        ),
+    )
+
+internal fun terminalColorHex(argb: Int): String = "#%06X".format(Locale.ROOT, argb and 0x00FFFFFF)
 
 @Composable
 private fun TerminalShortcutSettings(
@@ -4587,7 +4800,29 @@ private fun TerminalShortcutSettings(
     onPreferencesChanged: (TerminalShortcutPreferences) -> Unit,
 ) {
     val value = preferences.normalized
-    var shortcutEditorOpen by remember { mutableStateOf(false) }
+    val orderedItems = orderedTerminalShortcutItems(value)
+    var shortcutEditorOpen by rememberSaveable { mutableStateOf(false) }
+    var editingShortcutId by rememberSaveable { mutableStateOf<String?>(null) }
+
+    fun closeEditor() {
+        shortcutEditorOpen = false
+        editingShortcutId = null
+    }
+
+    fun moveItem(index: Int, delta: Int) {
+        val destination = index + delta
+        if (index !in orderedItems.indices || destination !in orderedItems.indices) return
+        val nextOrder = value.shortcutOrder.toMutableList()
+        val movingKey = orderedItems[index].orderKey
+        val destinationKey = orderedItems[destination].orderKey
+        val sourceOrderIndex = nextOrder.indexOf(movingKey)
+        val destinationOrderIndex = nextOrder.indexOf(destinationKey)
+        if (sourceOrderIndex < 0 || destinationOrderIndex < 0) return
+        nextOrder[sourceOrderIndex] = destinationKey
+        nextOrder[destinationOrderIndex] = movingKey
+        onPreferencesChanged(value.copy(shortcutOrder = nextOrder))
+    }
+
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = ProductShape,
@@ -4595,117 +4830,85 @@ private fun TerminalShortcutSettings(
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
     ) {
         Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            terminalShortcutSettingsOrder(value).forEach { action ->
-                val index = value.visibleActions.indexOf(action)
-                val selected = index >= 0
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(
-                        checked = selected,
-                        enabled = action != TerminalAction.ENTER,
-                        onCheckedChange = { checked ->
-                            val next = if (checked) {
-                                value.visibleActions + action
-                            } else {
-                                value.visibleActions - action
-                            }
-                            onPreferencesChanged(value.copy(visibleActions = next))
-                        },
-                    )
-                    Text(
-                        stringResource(terminalActionLabelResource(action)),
-                        modifier = Modifier.weight(1f),
-                        style = MaterialTheme.typography.labelMedium,
-                    )
+            orderedItems.forEachIndexed { index, item ->
+                if (index > 0) {
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.24f))
+                }
+                val title: String
+                val typeLabel: String
+                val detail: String
+                when (item) {
+                    is TerminalShortcutItem.BuiltIn -> {
+                        title = stringResource(terminalActionLabelResource(item.action))
+                        typeLabel = stringResource(R.string.shortcut_type_built_in_key)
+                        detail = value.label(item.action)
+                    }
+                    is TerminalShortcutItem.Custom -> {
+                        title = item.shortcut.displayLabel
+                        typeLabel = stringResource(terminalCustomShortcutTypeLabelResource(item.shortcut.type))
+                        detail = item.shortcut.value
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            title,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.labelLarge,
+                        )
+                        Text(
+                            typeLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        Text(
+                            detail,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (item is TerminalShortcutItem.Custom) {
+                        IconButton(
+                            onClick = {
+                                editingShortcutId = item.shortcut.id
+                                shortcutEditorOpen = true
+                            },
+                            modifier = Modifier.size(40.dp),
+                        ) {
+                            Icon(
+                                Icons.Filled.Edit,
+                                contentDescription = stringResource(R.string.shortcut_edit_custom),
+                            )
+                        }
+                    }
                     IconButton(
-                        onClick = {
-                            if (index > 0) {
-                                val next = value.visibleActions.toMutableList()
-                                next[index] = next[index - 1].also { next[index - 1] = next[index] }
-                                onPreferencesChanged(value.copy(visibleActions = next))
-                            }
-                        },
-                        enabled = selected && index > 0,
-                        modifier = Modifier.size(34.dp),
+                        onClick = { moveItem(index, -1) },
+                        enabled = index > 0,
+                        modifier = Modifier.size(40.dp),
                     ) {
                         Icon(Icons.Filled.KeyboardArrowUp, contentDescription = stringResource(R.string.shortcut_move_up))
                     }
                     IconButton(
-                        onClick = {
-                            if (index >= 0 && index < value.visibleActions.lastIndex) {
-                                val next = value.visibleActions.toMutableList()
-                                next[index] = next[index + 1].also { next[index + 1] = next[index] }
-                                onPreferencesChanged(value.copy(visibleActions = next))
-                            }
-                        },
-                        enabled = selected && index < value.visibleActions.lastIndex,
-                        modifier = Modifier.size(34.dp),
+                        onClick = { moveItem(index, 1) },
+                        enabled = index < orderedItems.lastIndex,
+                        modifier = Modifier.size(40.dp),
                     ) {
                         Icon(Icons.Filled.KeyboardArrowDown, contentDescription = stringResource(R.string.shortcut_move_down))
                     }
                 }
-                if (selected && action !in setOf(
-                        TerminalAction.ARROW_LEFT,
-                        TerminalAction.ARROW_UP,
-                        TerminalAction.ARROW_DOWN,
-                        TerminalAction.ARROW_RIGHT,
-                    )) {
-                    OutlinedTextField(
-                        value = value.label(action),
-                        onValueChange = { next ->
-                            onPreferencesChanged(value.copy(labels = value.labels + (action to next)))
-                        },
-                        label = { Text(stringResource(R.string.shortcut_label_name)) },
-                        singleLine = true,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(start = 48.dp),
-                    )
-                }
-            }
-            if (value.customShortcuts.isNotEmpty()) {
-                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
-                Text(
-                    stringResource(R.string.shortcut_custom_title),
-                    style = MaterialTheme.typography.titleSmall,
-                )
-                value.customShortcuts.forEach { shortcut ->
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(shortcut.displayLabel, style = MaterialTheme.typography.labelLarge)
-                            Text(
-                                stringResource(terminalCustomShortcutTypeLabelResource(shortcut.type)),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.primary,
-                            )
-                            Text(
-                                shortcut.value,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                        IconButton(
-                            onClick = {
-                                onPreferencesChanged(
-                                    value.copy(customShortcuts = value.customShortcuts - shortcut),
-                                )
-                            },
-                        ) {
-                            Icon(
-                                Icons.Filled.DeleteForever,
-                                contentDescription = stringResource(R.string.shortcut_delete_custom),
-                            )
-                        }
-                    }
-                }
             }
             OutlinedButton(
-                onClick = { shortcutEditorOpen = true },
+                onClick = {
+                    editingShortcutId = null
+                    shortcutEditorOpen = true
+                },
                 enabled = value.customShortcuts.size < MAX_CUSTOM_TERMINAL_SHORTCUTS,
                 modifier = Modifier.fillMaxWidth(),
             ) {
@@ -4719,21 +4922,40 @@ private fun TerminalShortcutSettings(
         }
     }
     if (shortcutEditorOpen) {
+        val editingShortcut = editingShortcutId?.let { id ->
+            value.customShortcuts.firstOrNull { it.id == id }
+        }
         TerminalShortcutEditorDialog(
-            onDismiss = { shortcutEditorOpen = false },
+            initialShortcut = editingShortcut,
+            onDismiss = ::closeEditor,
             onConfirm = { label, type, shortcutValue ->
                 val shortcut = TerminalCustomShortcut(
-                    id = java.util.UUID.randomUUID().toString(),
+                    id = editingShortcut?.id ?: java.util.UUID.randomUUID().toString(),
                     label = label,
                     value = shortcutValue,
                     type = type,
                 ).normalizedOrNull
                 if (shortcut != null) {
+                    val nextShortcuts = if (editingShortcut == null) {
+                        value.customShortcuts + shortcut
+                    } else {
+                        value.customShortcuts.map { current ->
+                            if (current.id == editingShortcut.id) shortcut else current
+                        }
+                    }
                     onPreferencesChanged(
-                        value.copy(customShortcuts = value.customShortcuts + shortcut),
+                        value.copy(customShortcuts = nextShortcuts),
                     )
                 }
-                shortcutEditorOpen = false
+                closeEditor()
+            },
+            onDelete = editingShortcut?.let { shortcut ->
+                {
+                    onPreferencesChanged(
+                        value.copy(customShortcuts = value.customShortcuts.filterNot { it.id == shortcut.id }),
+                    )
+                    closeEditor()
+                }
             },
         )
     }
@@ -4741,15 +4963,21 @@ private fun TerminalShortcutSettings(
 
 @Composable
 private fun TerminalShortcutEditorDialog(
+    initialShortcut: TerminalCustomShortcut? = null,
     onDismiss: () -> Unit,
     onConfirm: (String, TerminalCustomShortcutType, String) -> Unit,
+    onDelete: (() -> Unit)? = null,
 ) {
-    var label by rememberSaveable { mutableStateOf("") }
-    var shortcutTypeName by rememberSaveable {
-        mutableStateOf(TerminalCustomShortcutType.KEY_COMBINATION.name)
+    var label by rememberSaveable(initialShortcut?.id) { mutableStateOf(initialShortcut?.label.orEmpty()) }
+    var shortcutTypeName by rememberSaveable(initialShortcut?.id) {
+        mutableStateOf(initialShortcut?.type?.name ?: TerminalCustomShortcutType.KEY_COMBINATION.name)
     }
-    var keyCombination by rememberSaveable { mutableStateOf("") }
-    var quickInput by rememberSaveable { mutableStateOf("") }
+    var keyCombination by rememberSaveable(initialShortcut?.id) {
+        mutableStateOf(initialShortcut?.keyCombination.orEmpty())
+    }
+    var quickInput by rememberSaveable(initialShortcut?.id) {
+        mutableStateOf(initialShortcut?.quickInput.orEmpty())
+    }
     val shortcutType = TerminalCustomShortcutType.valueOf(shortcutTypeName)
     val parsed = TerminalKeyCombination.parse(keyCombination)
     val valid = when (shortcutType) {
@@ -4764,7 +4992,14 @@ private fun TerminalShortcutEditorDialog(
     }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.shortcut_add_custom_title)) },
+        title = {
+            Text(
+                stringResource(
+                    if (initialShortcut == null) R.string.shortcut_add_custom_title
+                    else R.string.shortcut_edit_custom_title,
+                ),
+            )
+        },
         text = {
             Column(
                 modifier = Modifier
@@ -4837,6 +5072,18 @@ private fun TerminalShortcutEditorDialog(
                             .focusRequester(focusRequester),
                     )
                 }
+                if (onDelete != null) {
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
+                    OutlinedButton(
+                        onClick = onDelete,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                    ) {
+                        Icon(Icons.Filled.DeleteForever, contentDescription = null)
+                        Spacer(Modifier.width(6.dp))
+                        Text(stringResource(R.string.shortcut_delete_custom_action))
+                    }
+                }
             }
         },
         confirmButton = {
@@ -4853,7 +5100,12 @@ private fun TerminalShortcutEditorDialog(
                 },
                 enabled = valid,
             ) {
-                Text(stringResource(R.string.shortcut_save_custom))
+                Text(
+                    stringResource(
+                        if (initialShortcut == null) R.string.shortcut_save_custom
+                        else R.string.shortcut_save_changes,
+                    ),
+                )
             }
         },
         dismissButton = {
@@ -4897,11 +5149,6 @@ internal fun terminalCombinationFromAndroidKeyEvent(event: AndroidKeyEvent): Ter
         alt = event.isAltPressed,
         shift = event.isShiftPressed,
     )
-}
-
-internal fun terminalShortcutSettingsOrder(preferences: TerminalShortcutPreferences): List<TerminalAction> {
-    val visible = preferences.normalized.visibleActions
-    return visible + TerminalAction.entries.filterNot(visible::contains)
 }
 
 internal fun terminalActionLabelResource(action: TerminalAction): Int = when (action) {

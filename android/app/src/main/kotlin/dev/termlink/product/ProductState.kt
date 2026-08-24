@@ -445,22 +445,64 @@ data class TerminalShortcutPreferences(
     val labels: Map<TerminalAction, String> = defaultTerminalShortcutLabels(),
     val visibleActions: List<TerminalAction> = defaultTerminalShortcutActions(),
     val customShortcuts: List<TerminalCustomShortcut> = emptyList(),
+    val shortcutOrder: List<String> = emptyList(),
 ) {
     fun label(action: TerminalAction): String = labels[action].orEmpty().ifBlank { defaultTerminalShortcutLabels()[action].orEmpty() }
 
     val normalized: TerminalShortcutPreferences
-        get() = copy(
-            labels = TerminalAction.entries.associateWith { action ->
-                label(action).trim().take(12).ifBlank { defaultTerminalShortcutLabels()[action].orEmpty() }
-            },
-            visibleActions = (visibleActions + TerminalAction.ENTER)
+        get() {
+            val normalizedActions = (visibleActions + TerminalAction.entries)
                 .distinct()
-                .filter(TerminalAction.entries::contains),
-            customShortcuts = customShortcuts
+                .filter(TerminalAction.entries::contains)
+            val normalizedCustomShortcuts = customShortcuts
                 .mapNotNull(TerminalCustomShortcut::normalizedOrNull)
                 .distinctBy(TerminalCustomShortcut::id)
-                .take(MAX_CUSTOM_TERMINAL_SHORTCUTS),
-        )
+                .take(MAX_CUSTOM_TERMINAL_SHORTCUTS)
+            val defaultOrder = normalizedActions.map(::terminalBuiltInShortcutOrderKey) +
+                normalizedCustomShortcuts.map { terminalCustomShortcutOrderKey(it.id) }
+            val validOrderKeys = defaultOrder.toSet()
+            return copy(
+                labels = TerminalAction.entries.associateWith { action ->
+                label(action).trim().take(12).ifBlank { defaultTerminalShortcutLabels()[action].orEmpty() }
+                },
+                visibleActions = normalizedActions,
+                customShortcuts = normalizedCustomShortcuts,
+                shortcutOrder = (shortcutOrder + defaultOrder)
+                    .distinct()
+                    .filter(validOrderKeys::contains),
+            )
+        }
+}
+
+sealed interface TerminalShortcutItem {
+    val orderKey: String
+
+    data class BuiltIn(val action: TerminalAction) : TerminalShortcutItem {
+        override val orderKey: String = terminalBuiltInShortcutOrderKey(action)
+    }
+
+    data class Custom(val shortcut: TerminalCustomShortcut) : TerminalShortcutItem {
+        override val orderKey: String = terminalCustomShortcutOrderKey(shortcut.id)
+    }
+}
+
+internal fun terminalBuiltInShortcutOrderKey(action: TerminalAction): String = "builtin:${action.name}"
+
+internal fun terminalCustomShortcutOrderKey(id: String): String = "custom:$id"
+
+internal fun orderedTerminalShortcutItems(preferences: TerminalShortcutPreferences): List<TerminalShortcutItem> {
+    val normalized = preferences.normalized
+    val itemsByOrderKey = buildMap {
+        normalized.visibleActions.forEach { action ->
+            val item = TerminalShortcutItem.BuiltIn(action)
+            put(item.orderKey, item)
+        }
+        normalized.customShortcuts.forEach { shortcut ->
+            val item = TerminalShortcutItem.Custom(shortcut)
+            put(item.orderKey, item)
+        }
+    }
+    return normalized.shortcutOrder.mapNotNull(itemsByOrderKey::get)
 }
 
 const val MAX_CUSTOM_TERMINAL_SHORTCUTS = 24
