@@ -120,6 +120,7 @@
     <string name="action_paste">Paste</string>
     <string name="action_delete_session">Delete offline session</string>
     <string name="action_close_session">Close online session</string>
+    <string name="action_close_session_tab">Close local tab</string>
     <string name="session_close_request_sent">The Windows session was closed and removed.</string>
     <string name="action_replay_output">Replay output</string>
     <string name="snapshot_replay_unavailable">Snapshot recovery metadata is available; replay controls are not supported for this object.</string>
@@ -155,7 +156,7 @@
     <string name="empty_no_trusted_devices_copy">The server has not returned any device trust records.</string>
     <string name="server_sync_empty_copy">The server has not returned any devices for this filter.</string>
     <string name="server_data_empty_copy">Device trust and pending requests are server data.</string>
-    <string name="server_sessions_empty_copy">Live sessions appear here after a trusted PC starts one.</string>
+    <string name="server_sessions_empty_copy">Open a Windows session from Devices to show it here.</string>
     <string name="server_activity_empty_copy">Activity on this screen is recorded locally on this device; it is not a server audit feed.</string>
     <string name="server_history_empty_copy">History is available only when the server returns encrypted chunks or snapshots.</string>
     <string name="server_devices_empty_copy">No online Windows PCs are currently available for this account.</string>
@@ -353,4 +354,5 @@
     <string name="remote_file_error_server">Windows file request failed (HTTP %1$d).</string>
     <string name="remote_file_error_connection">Could not reach the Windows PC. Try again.</string>
     <string name="remote_file_error_generic">The Windows file operation failed. Try again.</string>
+    <string name="failure_authentication_expired">Your sign-in has expired. Please sign in again.</string>
 </resources>

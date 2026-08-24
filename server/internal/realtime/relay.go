@@ -536,8 +536,11 @@ func (p *peer) route(envelope realtimewire.Envelope, sessionID uuid.UUID, frame 
 		}
 	}
 	if envelope.MessageType == realtimewire.InputEvent || envelope.MessageType == realtimewire.ResizeRequest {
-		lease, err := p.hub.leases.GetLease(ctx, sessionID)
-		if err != nil || lease.HolderDeviceID != p.principal.Device.ID {
+		// SessionRoute above already binds the sender to the session's owning
+		// account and re-checks CONTROL/MANAGE authority. The live lease is
+		// account-shared, so its protocol-compatible first-holder field is not an
+		// authorization boundary for later Android participants.
+		if _, err := p.hub.leases.GetLease(ctx, sessionID); err != nil {
 			return store.ErrDenied
 		}
 	}

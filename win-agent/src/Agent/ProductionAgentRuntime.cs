@@ -451,6 +451,7 @@ namespace TermLink.Agent
                         statusRefreshWorker = Task.Run(async () =>
                         {
                             try { await RefreshStatusAsync(cancellation.Token).ConfigureAwait(false); }
+                            catch (ProductionReauthenticationRequiredException) { }
                             catch (OperationCanceledException) { }
                             catch (HttpRequestException) { }
                             catch (JsonException) { }
@@ -674,10 +675,14 @@ namespace TermLink.Agent
             var canonical = string.Join("\n", "TERMLINK-DEVICE-REGISTER-V1", credentials.DeviceId.ToString("D"), "WINDOWS_PC", config.PcName,
                 registration["signing_public_key"], registration["exchange_public_key"], registration["key_id"], now, nonce);
             registration["timestamp_ms"] = now; registration["nonce"] = nonce; registration["signature"] = Base64Url(credentials.Identity.Sign(Encoding.UTF8.GetBytes(canonical)));
-            var response = await SendAsync(HttpMethod.Post, "/v1/devices/register", JsonSerializer.SerializeToUtf8Bytes(registration), false, null, token).ConfigureAwait(false);
+            using var response = await SendAsync(HttpMethod.Post, "/v1/devices/register", JsonSerializer.SerializeToUtf8Bytes(registration), false, null, token).ConfigureAwait(false);
+            if (response.StatusCode == HttpStatusCode.Unauthorized ||
+                response.StatusCode == HttpStatusCode.Forbidden)
+            {
+                throw new ProductionReauthenticationRequiredException();
+            }
             if (response.StatusCode != HttpStatusCode.Created && response.StatusCode != HttpStatusCode.Conflict)
                 await EnsureServerSuccessAsync(response, "DEVICE_REGISTER", token).ConfigureAwait(false);
-            response.Dispose();
             lock (statusSync) lastPCUpsertAttemptUtc = DateTime.UtcNow;
             await UpsertPCAsync(token).ConfigureAwait(false);
         }
@@ -789,7 +794,10 @@ namespace TermLink.Agent
                 if (Volatile.Read(ref disposed) != 0) throw new OperationCanceledException(token);
                 socket = active;
             }
-            ClearSubscribers();
+            // A realtime connection is an authorization boundary. Never let a
+            // lease observation from the prior connection satisfy the first
+            // input on a reconnected Android route; fetch the current fence.
+            ClearRealtimeConnectionState();
 
             try
             {
@@ -877,7 +885,7 @@ namespace TermLink.Agent
                     if (ReferenceEquals(socket, active)) socket = null;
                 }
                 active.Dispose();
-                ClearSubscribers();
+                ClearRealtimeConnectionState();
                 if (!token.IsCancellationRequested) SetRelayState(ProductionRelayState.Reconnecting, "RELAY_DISCONNECTED");
             }
         }
@@ -888,6 +896,11 @@ namespace TermLink.Agent
             try
             {
                 using var response = await SendAsync(HttpMethod.Get, "/v1/devices", Array.Empty<byte>(), true, null, token).ConfigureAwait(false);
+                if (response.StatusCode == HttpStatusCode.Unauthorized ||
+                    response.StatusCode == HttpStatusCode.Forbidden)
+                {
+                    throw new ProductionReauthenticationRequiredException();
+                }
                 response.EnsureSuccessStatusCode();
                 using var document = JsonDocument.Parse(await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
                 var devices = new List<ProductionDeviceSummary>();
@@ -2179,9 +2192,17 @@ namespace TermLink.Agent
             long leaseVersion,
             CancellationToken token)
         {
+            if (sessionId == Guid.Empty || senderId == Guid.Empty ||
+                leaseId == Guid.Empty || leaseVersion < 1)
+            {
+                return false;
+            }
+            if (!await IsAuthorizedInputSenderAsync(senderId, token).ConfigureAwait(false))
+                return false;
+
             var now = DateTime.UtcNow;
             if (leaseStatuses.TryGetValue(sessionId, out var cached) &&
-                cached.HolderDeviceId == senderId &&
+                cached.HolderDeviceId != Guid.Empty &&
                 cached.LeaseId == leaseId &&
                 cached.Version == leaseVersion &&
                 cached.ExpiresAtUtc > now &&
@@ -2224,13 +2245,58 @@ namespace TermLink.Agent
                 };
                 leaseStatuses[sessionId] = status;
                 return status.ExpiresAtUtc > validatedAt &&
-                    parsedHolder == senderId &&
+                    parsedHolder != Guid.Empty &&
                     parsedLease == leaseId &&
                     parsedVersion == leaseVersion;
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
             catch (HttpRequestException) { return false; }
             catch (JsonException) { return false; }
+        }
+
+        private async Task<bool> IsAuthorizedInputSenderAsync(
+            Guid senderId,
+            CancellationToken token)
+        {
+            try
+            {
+                // This is the Server's PC-scoped same-account recipient
+                // snapshot. The holder field on a control lease identifies
+                // who acquired/renews its fence; it is not the account-wide
+                // input authorization decision.
+                await RefreshAuthorizedRecipientsAsync(false, token).ConfigureAwait(false);
+                if (IsAuthorizedInputSender(senderId)) return true;
+
+                // A newly paired/reconnected Android may not be present in a
+                // still-live negative cache. Refresh once before rejecting it.
+                await RefreshAuthorizedRecipientsAsync(true, token).ConfigureAwait(false);
+                return IsAuthorizedInputSender(senderId);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+            catch (OperationCanceledException) { return false; }
+            catch (HttpRequestException) { return false; }
+            catch (JsonException) { return false; }
+            catch (FormatException) { return false; }
+            catch (InvalidDataException) { return false; }
+        }
+
+        private bool IsAuthorizedInputSender(Guid senderId)
+        {
+            if (senderId == Guid.Empty ||
+                !authorizedRecipients.TryGetValue(senderId, out var authorized))
+            {
+                return false;
+            }
+            lock (authorized.Sync)
+            {
+                return !authorized.Removed &&
+                    authorized.DeviceId == senderId &&
+                    authorized.KeyEpoch == config.KeyEpoch &&
+                    authorized.ExchangePublicKey != null &&
+                    authorized.ExchangePublicKey.Length == 32 &&
+                    authorized.PairwiseKey != null &&
+                    authorized.PairwiseKey.Length == 32;
+            }
         }
 
         private async Task<Subscriber> GetSubscriberAsync(
@@ -3435,6 +3501,12 @@ namespace TermLink.Agent
             foreach (var subscriber in retained) RetireSubscriber(subscriber);
         }
 
+        private void ClearRealtimeConnectionState()
+        {
+            ClearSubscribers();
+            leaseStatuses.Clear();
+        }
+
         private async Task<HttpResponseMessage> SendAsync(HttpMethod method, string path, byte[] body, bool deviceProof, string idempotencyKey, CancellationToken token)
         {
             for (var attempt = 0; attempt < 2; attempt++)
@@ -3451,11 +3523,9 @@ namespace TermLink.Agent
                         request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
                     }
                     var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
-                    if (response.StatusCode != HttpStatusCode.Unauthorized || attempt > 0)
-                    {
-                        return response;
-                    }
+                    if (response.StatusCode != HttpStatusCode.Unauthorized) return response;
                     response.Dispose();
+                    if (attempt > 0) throw new ProductionReauthenticationRequiredException();
                 }
             }
             throw new ProductionReauthenticationRequiredException();
@@ -3574,6 +3644,7 @@ namespace TermLink.Agent
             {
                 try { activeStatusRefresh.GetAwaiter().GetResult(); }
                 catch (AggregateException) { }
+                catch (ProductionReauthenticationRequiredException) { }
                 catch (OperationCanceledException) { }
                 catch (ObjectDisposedException) { }
             }

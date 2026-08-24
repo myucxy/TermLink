@@ -590,7 +590,7 @@ func (s *Postgres) RevokeDevice(ctx context.Context, userID, actorID, targetID u
 	}
 	rows, err := tx.Query(ctx, `
 		DELETE FROM control_leases
-		WHERE holder_device_id=$1 OR session_id IN (
+		WHERE session_id IN (
 			SELECT s.id FROM sessions s JOIN pcs p ON p.id=s.pc_id
 			WHERE p.device_id=$1 AND p.owner_user_id=$2
 		)
@@ -948,22 +948,6 @@ func (s *Postgres) PutGrant(ctx context.Context, userID, actorID, deviceID, pcID
 	if command.RowsAffected() != 1 {
 		return ErrDenied
 	}
-	if permission == "VIEW" {
-		rows, err := tx.Query(ctx, `
-			DELETE FROM control_leases
-			WHERE holder_device_id=$1 AND session_id IN (SELECT id FROM sessions WHERE pc_id=$2)
-			RETURNING session_id,holder_device_id,lease_id,version`, deviceID, pcID)
-		if err != nil {
-			return err
-		}
-		revokedLeases, err := scanRevokedLeases(rows)
-		if err != nil {
-			return err
-		}
-		if err := enqueueRevokedLeases(ctx, tx, revokedLeases); err != nil {
-			return err
-		}
-	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO outbox(event_type,aggregate_id,payload)
 		VALUES('grant.updated',$1,jsonb_build_object('user_id',$2::uuid,'device_id',$1::uuid,'pc_id',$3::uuid,'permission',$4::text))`,
@@ -1019,9 +1003,10 @@ func enqueueRevokedLeases(ctx context.Context, tx pgx.Tx, leases []revokedLeaseR
 	return nil
 }
 
-// DeleteGrant removes one device's authority on one PC. The recipient-set
-// epoch, durable leases, audit record, and outbox event change atomically so a
-// removed device cannot remain a valid recipient of newly encrypted output.
+// DeleteGrant removes one device's authority on one PC. Shared durable leases
+// are retained because holder_device_id is only the protocol-compatible first
+// participant, not exclusive ownership. LeaseSessionIDs lets the API remove
+// the revoked Android from Valkey without disturbing other participants.
 func (s *Postgres) DeleteGrant(ctx context.Context, userID, actorID, deviceID, pcID uuid.UUID, traceID string) (DeleteGrantResult, error) {
 	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
@@ -1053,24 +1038,24 @@ func (s *Postgres) DeleteGrant(ctx context.Context, userID, actorID, deviceID, p
 	if command.RowsAffected() != 1 {
 		return DeleteGrantResult{}, ErrNotFound
 	}
-	rows, err := tx.Query(ctx, `
-		DELETE FROM control_leases
-		WHERE holder_device_id=$1 AND session_id IN (SELECT id FROM sessions WHERE pc_id=$2)
-		RETURNING session_id,holder_device_id,lease_id,version`, deviceID, pcID)
+	rows, err := tx.Query(ctx, `SELECT id FROM sessions WHERE pc_id=$1 AND deleted_at IS NULL`, pcID)
 	if err != nil {
 		return DeleteGrantResult{}, err
 	}
-	revokedLeases, err := scanRevokedLeases(rows)
-	if err != nil {
+	leaseSessionIDs := make([]uuid.UUID, 0)
+	for rows.Next() {
+		var sessionID uuid.UUID
+		if err := rows.Scan(&sessionID); err != nil {
+			rows.Close()
+			return DeleteGrantResult{}, err
+		}
+		leaseSessionIDs = append(leaseSessionIDs, sessionID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
 		return DeleteGrantResult{}, err
 	}
-	leaseSessionIDs := make([]uuid.UUID, 0, len(revokedLeases))
-	for _, lease := range revokedLeases {
-		leaseSessionIDs = append(leaseSessionIDs, lease.SessionID)
-	}
-	if err := enqueueRevokedLeases(ctx, tx, revokedLeases); err != nil {
-		return DeleteGrantResult{}, err
-	}
+	rows.Close()
 	keyEpoch++
 	if _, err := tx.Exec(ctx, `UPDATE pcs SET key_epoch=$2 WHERE id=$1`, pcID, keyEpoch); err != nil {
 		return DeleteGrantResult{}, err
@@ -3084,7 +3069,7 @@ func (s *Postgres) ListAudit(ctx context.Context, userID uuid.UUID, before int64
 }
 
 func (s *Postgres) SaveLease(ctx context.Context, userID, actorID, leaseID, sessionID, holderID uuid.UUID, expiresAt time.Time, version int64, auditAction, traceID string) error {
-	if actorID != holderID || version < 1 {
+	if version < 1 {
 		return ErrDenied
 	}
 	tx, err := s.Pool.Begin(ctx)
@@ -3094,15 +3079,16 @@ func (s *Postgres) SaveLease(ctx context.Context, userID, actorID, leaseID, sess
 	defer func() { _ = tx.Rollback(ctx) }()
 	command, err := tx.Exec(ctx, `
 		INSERT INTO control_leases(session_id,holder_device_id,lease_id,expires_at,version)
-		SELECT s.id,d.id,$3,$4,$5
+		SELECT s.id,holder.id,$3,$4,$5
 		FROM sessions s
 		JOIN pcs p ON p.id=s.pc_id AND p.owner_user_id=$6 AND p.remote_routing_enabled
 		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
-		JOIN devices d ON d.id=$2 AND d.user_id=$6 AND d.device_type='ANDROID' AND d.trust_state='TRUSTED'
-		LEFT JOIN device_grants grant_authority ON grant_authority.device_id=d.id AND grant_authority.pc_id=p.id
+		JOIN devices actor ON actor.id=$2 AND actor.user_id=$6 AND actor.device_type='ANDROID' AND actor.trust_state='TRUSTED'
+		JOIN devices holder ON holder.id=$7 AND holder.user_id=$6 AND holder.device_type='ANDROID'
+		LEFT JOIN device_grants grant_authority ON grant_authority.device_id=actor.id AND grant_authority.pc_id=p.id
 		  AND grant_authority.permission IN ('CONTROL','MANAGE')
 		  AND (grant_authority.expires_at IS NULL OR grant_authority.expires_at>now())
-		WHERE s.id=$1 AND s.deleted_at IS NULL AND ($7 OR grant_authority.device_id IS NOT NULL)
+		WHERE s.id=$1 AND s.deleted_at IS NULL AND ($8 OR grant_authority.device_id IS NOT NULL)
 		ON CONFLICT(session_id) DO UPDATE
 		SET holder_device_id=excluded.holder_device_id,lease_id=excluded.lease_id,
 			expires_at=CASE
@@ -3116,7 +3102,7 @@ func (s *Postgres) SaveLease(ctx context.Context, userID, actorID, leaseID, sess
 		   OR (excluded.version=control_leases.version
 		       AND excluded.lease_id=control_leases.lease_id
 		       AND excluded.holder_device_id=control_leases.holder_device_id)`,
-		sessionID, holderID, leaseID, expiresAt, version, userID, s.AutoTrustDevices)
+		sessionID, actorID, leaseID, expiresAt, version, userID, holderID, s.AutoTrustDevices)
 	if err != nil {
 		return err
 	}
@@ -3148,13 +3134,13 @@ func (s *Postgres) DeleteLease(ctx context.Context, userID, actorID, sessionID, 
 		  AND actor.id=$4 AND actor.user_id=$3 AND actor.trust_state='TRUSTED'
 		  AND account.id=$3 AND account.status='ACTIVE'
 		  AND (
-			actor.id=lease.holder_device_id OR p.device_id=actor.id OR EXISTS (
-				SELECT 1 FROM device_grants manager
-				WHERE manager.device_id=actor.id AND manager.pc_id=p.id
-				  AND manager.permission='MANAGE'
-				  AND (manager.expires_at IS NULL OR manager.expires_at>now())
+			p.device_id=actor.id OR ($5 AND actor.device_type='ANDROID') OR EXISTS (
+				SELECT 1 FROM device_grants controller
+				WHERE controller.device_id=actor.id AND controller.pc_id=p.id
+				  AND controller.permission IN ('CONTROL','MANAGE')
+				  AND (controller.expires_at IS NULL OR controller.expires_at>now())
 			)
-		  )`, sessionID, leaseID, userID, actorID)
+		  )`, sessionID, leaseID, userID, actorID, s.AutoTrustDevices)
 	if err != nil {
 		return err
 	}

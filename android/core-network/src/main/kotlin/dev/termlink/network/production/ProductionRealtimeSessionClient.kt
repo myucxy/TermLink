@@ -1055,6 +1055,22 @@ class ProductionRealtimeSessionClient(
                 }
                 scheduleReconnect(reconnectReason)
             }
+            is RealtimeState.AuthenticationRejected -> {
+                subscriberRefreshJob?.cancel()
+                subscriberRefreshJob = null
+                subscriberReady.value = false
+                failPendingInputs(state.reason)
+                session.onDisconnected(state.reason)
+                mutableTransportState.value = ProductionTransportState.Reconnecting(0, state.reason)
+            }
+            is RealtimeState.AuthenticationFailed -> {
+                subscriberRefreshJob?.cancel()
+                subscriberRefreshJob = null
+                subscriberReady.value = false
+                failPendingInputs(state.reason)
+                session.onDisconnected(state.reason)
+                mutableTransportState.value = ProductionTransportState.Failed(state.reason)
+            }
             is RealtimeState.Reconnecting -> Unit
             RealtimeState.Closed -> {
                 subscriberRefreshJob?.cancel()

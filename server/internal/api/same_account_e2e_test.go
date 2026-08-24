@@ -74,6 +74,10 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 			Issuer: issuer, Subject: sameSubject, AuthorizedParty: "termlink-android",
 			TokenID: "same-account-android-" + uuid.NewString(),
 		},
+		"same-account-android-two": {
+			Issuer: issuer, Subject: sameSubject, AuthorizedParty: "termlink-android",
+			TokenID: "same-account-android-two-" + uuid.NewString(),
+		},
 		"cross-account-android": {
 			Issuer: issuer, Subject: crossSubject, AuthorizedParty: "termlink-android",
 			TokenID: "cross-account-android-" + uuid.NewString(),
@@ -101,16 +105,19 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 
 	windows := newDevice(t)
 	android := newDevice(t)
+	androidTwo := newDevice(t)
 	crossAndroid := newDevice(t)
 	windowsRegistration := sameAccountRegister(t, testServer.URL, windows, "WINDOWS_PC", "Same-account PC", "same-account-windows")
 	androidRegistration := sameAccountRegister(t, testServer.URL, android, "ANDROID", "Same-account Android", "same-account-android")
+	androidTwoRegistration := sameAccountRegister(t, testServer.URL, androidTwo, "ANDROID", "Same-account Android two", "same-account-android-two")
 	crossRegistration := sameAccountRegister(t, testServer.URL, crossAndroid, "ANDROID", "Cross-account Android", "cross-account-android")
 
 	sameUserID := mustResponseUUID(t, windowsRegistration, "user_id")
 	androidUserID := mustResponseUUID(t, androidRegistration, "user_id")
+	androidTwoUserID := mustResponseUUID(t, androidTwoRegistration, "user_id")
 	crossUserID := mustResponseUUID(t, crossRegistration, "user_id")
-	if androidUserID != sameUserID {
-		t.Fatalf("same OIDC subject produced different accounts: windows=%s android=%s", sameUserID, androidUserID)
+	if androidUserID != sameUserID || androidTwoUserID != sameUserID {
+		t.Fatalf("same OIDC subject produced different accounts: windows=%s androids=%s/%s", sameUserID, androidUserID, androidTwoUserID)
 	}
 	if crossUserID == sameUserID {
 		t.Fatal("different OIDC subjects unexpectedly shared an account")
@@ -118,11 +125,12 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	defer func() {
 		_, _ = repository.Pool.Exec(context.Background(), `DELETE FROM users WHERE id=ANY($1)`, []uuid.UUID{sameUserID, crossUserID})
 	}()
-	if windowsRegistration["bootstrap"] != true || androidRegistration["bootstrap"] != false {
-		t.Fatalf("unexpected bootstrap flags: windows=%v android=%v", windowsRegistration["bootstrap"], androidRegistration["bootstrap"])
+	if windowsRegistration["bootstrap"] != true || androidRegistration["bootstrap"] != false || androidTwoRegistration["bootstrap"] != false {
+		t.Fatalf("unexpected bootstrap flags: windows=%v androids=%v/%v", windowsRegistration["bootstrap"], androidRegistration["bootstrap"], androidTwoRegistration["bootstrap"])
 	}
 	assertDeviceTrusted(t, repository, windows.id)
 	assertDeviceTrusted(t, repository, android.id)
+	assertDeviceTrusted(t, repository, androidTwo.id)
 	assertDeviceTrusted(t, repository, crossAndroid.id)
 	assertNoLegacyAuthorizationRows(t, repository, sameUserID)
 
@@ -153,11 +161,17 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("invalid lease response: %v", lease)
 	}
+	sharedLease := sameAccountSignedJSON(t, testServer.URL, androidTwo, "same-account-android-two", http.MethodPost, "/v1/sessions/"+sessionID.String()+"/lease", map[string]any{}, "same-account-shared-lease", http.StatusCreated)
+	if sharedLease["lease_id"] != lease["lease_id"] || sharedLease["version"] != lease["version"] || sharedLease["holder_device_id"] != lease["holder_device_id"] {
+		t.Fatalf("second Android received a different shared lease: first=%v second=%v", lease, sharedLease)
+	}
 
 	pcSocket := sameAccountDialRealtime(t, testServer.URL, windows, "same-account-windows", "pc")
 	defer pcSocket.Close()
 	androidSocket := sameAccountDialRealtime(t, testServer.URL, android, "same-account-android", "android")
 	defer androidSocket.Close()
+	androidTwoSocket := sameAccountDialRealtime(t, testServer.URL, androidTwo, "same-account-android-two", "android")
+	defer androidTwoSocket.Close()
 
 	subscribeFrame := testEnvelope(android, windows, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 1)
 	writeEnvelope(t, androidSocket, subscribeFrame)
@@ -174,6 +188,29 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	if got := readEnvelope(t, pcSocket); !bytes.Equal(got, inputFrame) {
 		t.Fatal("Relay changed or misdirected the leased Android input frame")
 	}
+	secondInputFrame := testEnvelope(androidTwo, windows, sessionID, realtimewire.InputEvent, realtimewire.AndroidToPC, 1)
+	writeEnvelope(t, androidTwoSocket, secondInputFrame)
+	if got := readEnvelope(t, pcSocket); !bytes.Equal(got, secondInputFrame) {
+		t.Fatal("Relay rejected or changed the second Android's shared-lease input frame")
+	}
+
+	sameAccountSignedJSON(t, testServer.URL, android, "same-account-android", http.MethodDelete, "/v1/sessions/"+sessionID.String()+"/lease/"+leaseID.String(), nil, "same-account-release-first-participant", http.StatusNoContent)
+	_ = androidSocket.Close()
+	remainingInputFrame := testEnvelope(androidTwo, windows, sessionID, realtimewire.InputEvent, realtimewire.AndroidToPC, 2)
+	writeEnvelope(t, androidTwoSocket, remainingInputFrame)
+	if got := readEnvelope(t, pcSocket); !bytes.Equal(got, remainingInputFrame) {
+		t.Fatal("first Android release/disconnect revoked the remaining Android's shared control")
+	}
+	rejoinedLease := sameAccountSignedJSON(t, testServer.URL, android, "same-account-android", http.MethodPost, "/v1/sessions/"+sessionID.String()+"/lease", map[string]any{}, "same-account-rejoin-shared-lease", http.StatusCreated)
+	if rejoinedLease["lease_id"] != lease["lease_id"] || rejoinedLease["version"] != lease["version"] {
+		t.Fatalf("first Android did not rejoin the existing shared lease: original=%v rejoined=%v", lease, rejoinedLease)
+	}
+	sameAccountSignedJSON(t, testServer.URL, windows, "same-account-windows", http.MethodPost, "/v1/devices/"+android.id.String()+"/revoke", map[string]any{}, "same-account-revoke-first-android", http.StatusOK)
+	postRevokeInputFrame := testEnvelope(androidTwo, windows, sessionID, realtimewire.InputEvent, realtimewire.AndroidToPC, 3)
+	writeEnvelope(t, androidTwoSocket, postRevokeInputFrame)
+	if got := readEnvelope(t, pcSocket); !bytes.Equal(got, postRevokeInputFrame) {
+		t.Fatal("first Android authority revocation revoked the remaining Android's shared control")
+	}
 
 	crossPCs := sameAccountSignedJSON(t, testServer.URL, crossAndroid, "cross-account-android", http.MethodGet, "/v1/pcs", nil, "", http.StatusOK)
 	if items, ok := crossPCs["items"].([]any); !ok || len(items) != 0 {
@@ -187,9 +224,17 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	writeEnvelope(t, crossSocket, crossSubscribe)
 	assertSameAccountSocketClosed(t, crossSocket, websocket.ClosePolicyViolation)
 
-	sameAccountSignedJSON(t, testServer.URL, android, "same-account-android", http.MethodDelete, "/v1/sessions/"+sessionID.String()+"/lease/"+leaseID.String(), nil, "same-account-release-lease", http.StatusNoContent)
+	sameAccountSignedJSON(t, testServer.URL, androidTwo, "same-account-android-two", http.MethodDelete, "/v1/sessions/"+sessionID.String()+"/lease/"+leaseID.String(), nil, "same-account-release-last-participant", http.StatusNoContent)
+	sameAccountSignedJSON(t, testServer.URL, windows, "same-account-windows", http.MethodGet, "/v1/sessions/"+sessionID.String()+"/lease", nil, "", http.StatusNotFound)
+	var durableLeaseCount int
+	if err := repository.Pool.QueryRow(context.Background(), `SELECT count(*) FROM control_leases WHERE session_id=$1`, sessionID).Scan(&durableLeaseCount); err != nil {
+		t.Fatal(err)
+	}
+	if durableLeaseCount != 0 {
+		t.Fatalf("last shared-lease participant left %d durable fences, want 0", durableLeaseCount)
+	}
 	assertNoLegacyAuthorizationRows(t, repository, sameUserID)
-	t.Log("covered: same-subject Windows+Android direct registration; PC/session discovery; REST and Relay subscription; directed output; leased input routing; cross-subject isolation")
+	t.Log("covered: same-subject Windows+two Android registration; shared lease acquisition; simultaneous Relay input; participant release/disconnect and active authority-revocation isolation; last-participant live/durable cleanup; cross-subject isolation")
 	t.Log("boundary: service integration only; real OIDC, packaged clients, TLS, and client cryptography remain outside this gate")
 }
 

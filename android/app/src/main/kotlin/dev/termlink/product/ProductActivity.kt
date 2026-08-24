@@ -255,6 +255,8 @@ private const val PRODUCT_PREFERENCES = "termlink_product_preferences"
 private const val PRODUCT_THEME_KEY = "theme_preference"
 private const val PRODUCT_PRIMARY_DESTINATION_KEY = "primary_destination"
 private const val PRODUCT_SELECTED_SESSION_ID_KEY = "selected_session_id"
+private const val PRODUCT_OPENED_SESSION_IDS_KEY = "opened_session_ids_v1"
+private const val PRODUCT_EXPANDED_PC_IDS_KEY = "expanded_pc_ids_v1"
 private const val TERMINAL_FONT_SIZE_KEY = "terminal_font_size_sp"
 private const val TERMINAL_LINE_SPACING_KEY = "terminal_line_spacing"
 private const val TERMINAL_FOREGROUND_KEY = "terminal_foreground_argb"
@@ -732,19 +734,11 @@ class ProductActivity : ComponentActivity() {
 
     override fun onStop() {
         productForeground = false
-        // Backgrounding must give up every remote control lease, but it must
-        // not terminate the Windows shell or the read-only viewing stream.
-        if (::repository.isInitialized) {
-            lifecycleScope.launch {
-                try {
-                    repository.releaseAllControlLeases()
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (_: Throwable) {
-                    // The repository publishes actionable release failures.
-                }
-            }
-        }
+        // Keep this device's short-lived control lease while the Activity is
+        // merely backgrounded. Releasing it here raced a fast process/activity
+        // restart and could delete the freshly resumed lease. The realtime
+        // client stops renewing when it is actually closed, so abandoned leases
+        // still expire naturally on the server.
         super.onStop()
     }
 
@@ -752,8 +746,8 @@ class ProductActivity : ComponentActivity() {
         super.onStart()
         // A Boolean can be conflated by Compose when stop/start happen before
         // the next frame. The monotonic generation preserves every foreground
-        // entry and therefore gives the selected session one fresh lease
-        // opportunity after its background release.
+        // entry and therefore gives the selected session one fresh foreground
+        // reconciliation opportunity.
         productForegroundGeneration = nextForegroundGeneration(productForegroundGeneration)
         productForeground = true
         if (::repository.isInitialized) {
@@ -860,6 +854,8 @@ fun ProductApp(
     // surfaces after an upgrade.
     val destination = storedDestination.takeIf { it.isVisibleInProductShell } ?: ProductDestination.DEVICES
     var selectedSessionId by rememberSaveable { mutableStateOf(restoredNavigation.selectedSessionId) }
+    var openedSessionIds by remember { mutableStateOf(restoredNavigation.openedSessionIds) }
+    var expandedPcIds by remember { mutableStateOf(restoredNavigation.expandedPcIds) }
     var selectedHistoryId by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedRemotePcId by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedRemotePcName by rememberSaveable { mutableStateOf("") }
@@ -901,6 +897,23 @@ fun ProductApp(
         }
     }
 
+    LaunchedEffect(
+        snapshot.connectionState,
+        snapshot.sessions.map { Triple(it.id, it.state, it.online) },
+        openedSessionIds,
+    ) {
+        if (snapshot.connectionState != ProductConnectionState.CONNECTED) return@LaunchedEffect
+        val available = snapshot.sessions.asSequence()
+            .filter(::isSessionTabOpenable)
+            .mapTo(hashSetOf()) { it.id.toString() }
+        val retained = openedSessionIds.filter(available::contains)
+        if (retained != openedSessionIds) {
+            openedSessionIds = retained
+            selectedSessionId = selectedSessionId?.takeIf(retained::contains) ?: retained.lastOrNull()
+            saveProductSessionTabs(context, retained, selectedSessionId)
+        }
+    }
+
     fun navigateTo(next: ProductDestination) {
         if (next.isVisibleInProductShell) {
             destinationName = next.name
@@ -912,6 +925,47 @@ fun ProductApp(
 
     fun navigateToPrimary(next: ProductPrimaryDestination) {
         navigateTo(next.destination())
+    }
+
+    fun selectSessionTab(sessionId: java.util.UUID, addIfMissing: Boolean): Boolean {
+        if (!isSessionTabOpenable(snapshot.sessions.firstOrNull { it.id == sessionId })) return false
+        val value = sessionId.toString()
+        val next = if (addIfMissing && value !in openedSessionIds) openedSessionIds + value else openedSessionIds
+        if (value !in next) return false
+        openedSessionIds = next
+        selectedSessionId = value
+        saveProductSessionTabs(context, next, value)
+        return true
+    }
+
+    fun removeSessionTabState(sessionId: java.util.UUID) {
+        val value = sessionId.toString()
+        if (value !in openedSessionIds) return
+        val removedIndex = openedSessionIds.indexOf(value)
+        val next = openedSessionIds - value
+        val nextSelected = when {
+            selectedSessionId != value -> selectedSessionId?.takeIf(next::contains)
+            next.isEmpty() -> null
+            else -> next[removedIndex.coerceAtMost(next.lastIndex)]
+        }
+        openedSessionIds = next
+        selectedSessionId = nextSelected
+        saveProductSessionTabs(context, next, nextSelected)
+    }
+
+    fun closeLocalSessionTab(sessionId: java.util.UUID) {
+        removeSessionTabState(sessionId)
+        scope.launch {
+            try {
+                repository.closeSessionView(sessionId)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                snackbarHostState.showSnackbar(
+                    safeOperationMessage(error, unavailableOperationMessage, activeSessionDeleteMessage),
+                )
+            }
+        }
     }
 
     BackHandler(enabled = destination.primaryDestination().destination() != destination) {
@@ -961,8 +1015,7 @@ fun ProductApp(
                 arguments = arguments,
                 onSelectSession = { sessionId ->
                     withContext(Dispatchers.Main.immediate) {
-                        selectedSessionId = sessionId.toString()
-                        saveSelectedProductSession(context, sessionId)
+                        selectSessionTab(sessionId, addIfMissing = true)
                         navigateTo(ProductDestination.SESSIONS)
                     }
                 },
@@ -1142,10 +1195,15 @@ fun ProductApp(
                     foregroundGeneration = foregroundGeneration,
                     wide = if (destination == ProductDestination.SESSIONS) sessionWide else wide,
                     selectedSessionId = selectedSessionId,
+                    openedSessionIds = openedSessionIds,
                     onSessionSelected = {
-                        selectedSessionId = it.toString()
-                        saveSelectedProductSession(context, it)
+                        // Device-page rows and existing session tabs share this
+                        // callback. Adding is idempotent for an existing tab and
+                        // is required when Devices opens a session for the first
+                        // time.
+                        selectSessionTab(it, addIfMissing = true)
                     },
+                    onCloseSessionTab = ::closeLocalSessionTab,
                     // Opening a session is the command-line entry point. The
                     // server lease is requested here, so the terminal has no
                     // separate "申请控制" button.
@@ -1163,6 +1221,12 @@ fun ProductApp(
                     onOpenAccount = { navigateTo(ProductDestination.ACCOUNT) },
                     selectedRemotePcId = selectedRemotePcId,
                     selectedRemotePcName = selectedRemotePcName,
+                    expandedPcIds = expandedPcIds,
+                    onTogglePcExpanded = { pcId ->
+                        val value = pcId.toString()
+                        expandedPcIds = if (value in expandedPcIds) expandedPcIds - value else expandedPcIds + value
+                        saveExpandedProductPcs(context, expandedPcIds)
+                    },
                     onBrowsePc = { pc ->
                         selectedRemotePcId = pc.id.toString()
                         selectedRemotePcName = pc.name
@@ -1186,9 +1250,9 @@ fun ProductApp(
                         scope.launch {
                             try {
                                 val sessionId = repository.openRemoteShell(pcId, path, shellType)
-                                selectedSessionId = sessionId.toString()
-                                saveSelectedProductSession(context, sessionId)
-                                navigateTo(ProductDestination.SESSIONS)
+                                if (selectSessionTab(sessionId, addIfMissing = true)) {
+                                    navigateTo(ProductDestination.SESSIONS)
+                                }
                             } catch (error: CancellationException) {
                                 throw error
                             } catch (error: Throwable) {
@@ -1287,7 +1351,18 @@ fun ProductApp(
             onConfirm = {
                 val sessionId = deletableSessionId
                 pendingDeleteSessionId = null
-                runOperation { repository.deleteSession(sessionId) }
+                scope.launch {
+                    try {
+                        repository.deleteSession(sessionId)
+                        removeSessionTabState(sessionId)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Throwable) {
+                        snackbarHostState.showSnackbar(
+                            safeOperationMessage(error, unavailableOperationMessage, activeSessionDeleteMessage),
+                        )
+                    }
+                }
             },
         )
     }
@@ -1304,6 +1379,7 @@ fun ProductApp(
                 scope.launch {
                     try {
                         repository.stopSession(sessionId)
+                        removeSessionTabState(sessionId)
                         snackbarHostState.showSnackbar(sessionCloseRequestSentMessage)
                     } catch (error: CancellationException) {
                         throw error
@@ -2131,6 +2207,8 @@ private fun saveTerminalDisplayPreferences(
 internal data class ProductNavigationState(
     val primaryDestination: ProductPrimaryDestination = ProductPrimaryDestination.DEVICES,
     val selectedSessionId: String? = null,
+    val openedSessionIds: List<String> = emptyList(),
+    val expandedPcIds: Set<String> = emptySet(),
 )
 
 internal fun loadProductNavigationState(context: android.content.Context): ProductNavigationState {
@@ -2138,10 +2216,27 @@ internal fun loadProductNavigationState(context: android.content.Context): Produ
     val primaryDestination = preferences.getString(PRODUCT_PRIMARY_DESTINATION_KEY, null)
         ?.let { stored -> ProductPrimaryDestination.entries.firstOrNull { it.name == stored } }
         ?: ProductPrimaryDestination.DEVICES
+    val openedSessionIds = parseStoredUuidArray(
+        preferences.getString(PRODUCT_OPENED_SESSION_IDS_KEY, null),
+    )
     val selectedSessionId = preferences.getString(PRODUCT_SELECTED_SESSION_ID_KEY, null)
         ?.takeIf { stored -> runCatching { java.util.UUID.fromString(stored) }.isSuccess }
-    return ProductNavigationState(primaryDestination, selectedSessionId)
+        ?.takeIf(openedSessionIds::contains)
+    val expandedPcIds = preferences.getStringSet(PRODUCT_EXPANDED_PC_IDS_KEY, emptySet())
+        .orEmpty()
+        .filterTo(linkedSetOf()) { stored -> runCatching { java.util.UUID.fromString(stored) }.isSuccess }
+    return ProductNavigationState(primaryDestination, selectedSessionId, openedSessionIds, expandedPcIds)
 }
+
+private fun parseStoredUuidArray(value: String?): List<String> = runCatching {
+    val array = JSONArray(value ?: "[]")
+    buildList {
+        for (index in 0 until array.length()) {
+            val stored = array.optString(index)
+            if (runCatching { java.util.UUID.fromString(stored) }.isSuccess && stored !in this) add(stored)
+        }
+    }
+}.getOrDefault(emptyList())
 
 internal fun saveProductPrimaryDestination(
     context: android.content.Context,
@@ -2157,6 +2252,52 @@ internal fun saveSelectedProductSession(context: android.content.Context, sessio
     context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
         .edit()
         .putString(PRODUCT_SELECTED_SESSION_ID_KEY, sessionId.toString())
+        .apply()
+}
+
+internal fun clearSelectedProductSession(context: android.content.Context) {
+    context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
+        .edit()
+        .remove(PRODUCT_SELECTED_SESSION_ID_KEY)
+        .apply()
+}
+
+internal fun saveOpenedProductSessions(context: android.content.Context, sessionIds: List<String>) {
+    val normalized = sessionIds.distinct().filter { stored ->
+        runCatching { java.util.UUID.fromString(stored) }.isSuccess
+    }
+    context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
+        .edit()
+        .putString(PRODUCT_OPENED_SESSION_IDS_KEY, JSONArray(normalized).toString())
+        .apply()
+}
+
+internal fun saveProductSessionTabs(
+    context: android.content.Context,
+    sessionIds: List<String>,
+    selectedSessionId: String?,
+) {
+    val normalized = sessionIds.distinct().filter { stored ->
+        runCatching { java.util.UUID.fromString(stored) }.isSuccess
+    }
+    val selected = selectedSessionId?.takeIf(normalized::contains)
+    context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
+        .edit()
+        .putString(PRODUCT_OPENED_SESSION_IDS_KEY, JSONArray(normalized).toString())
+        .also { editor ->
+            if (selected == null) editor.remove(PRODUCT_SELECTED_SESSION_ID_KEY)
+            else editor.putString(PRODUCT_SELECTED_SESSION_ID_KEY, selected)
+        }
+        .apply()
+}
+
+internal fun saveExpandedProductPcs(context: android.content.Context, pcIds: Set<String>) {
+    val normalized = pcIds.filterTo(linkedSetOf()) { stored ->
+        runCatching { java.util.UUID.fromString(stored) }.isSuccess
+    }
+    context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
+        .edit()
+        .putStringSet(PRODUCT_EXPANDED_PC_IDS_KEY, normalized)
         .apply()
 }
 
@@ -2529,7 +2670,9 @@ private fun ProductContent(
     foregroundGeneration: Long,
     wide: Boolean,
     selectedSessionId: String?,
-    onSessionSelected: (java.util.UUID) -> Unit,
+    openedSessionIds: List<String>,
+    onSessionSelected: (java.util.UUID) -> Boolean,
+    onCloseSessionTab: (java.util.UUID) -> Unit,
     onOpenSession: suspend (java.util.UUID) -> Unit,
     onLoadTranscript: (java.util.UUID) -> Unit,
     onClearTranscript: (java.util.UUID) -> Unit,
@@ -2542,6 +2685,8 @@ private fun ProductContent(
     onOpenAccount: () -> Unit,
     selectedRemotePcId: String?,
     selectedRemotePcName: String,
+    expandedPcIds: Set<String>,
+    onTogglePcExpanded: (java.util.UUID) -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
     onOpenPcDownloads: (PcSummary) -> Unit,
     onBrowseRemoteDirectory: (java.util.UUID, String, String, Long?) -> Unit,
@@ -2615,8 +2760,12 @@ private fun ProductContent(
             foregroundGeneration = foregroundGeneration,
             wide = wide,
             selectedSessionId = selectedSessionId,
-            onSessionSelected = onSessionSelected,
-            onStopSessionRequested = onStopSessionRequested,
+            openedSessionIds = openedSessionIds,
+            onSessionSelected = { sessionId ->
+                onSessionSelected(sessionId)
+                Unit
+            },
+            onCloseSessionTab = onCloseSessionTab,
             onOpenSession = onOpenSession,
             onLoadTranscript = onLoadTranscript,
             onClearTranscript = onClearTranscript,
@@ -2642,9 +2791,10 @@ private fun ProductContent(
         when (destination) {
             ProductDestination.DEVICES -> DevicesPage(
                 snapshot = snapshot,
+                expandedPcIds = expandedPcIds,
+                onTogglePcExpanded = onTogglePcExpanded,
                 onOpenSession = { sessionId ->
-                    onSessionSelected(sessionId)
-                    onOpenSessions()
+                    if (onSessionSelected(sessionId)) onOpenSessions()
                 },
                 onOpenAccount = onOpenAccount,
                 onBrowsePc = onBrowsePc,
@@ -2722,6 +2872,8 @@ private fun PrimaryHomeHeader(onOpenAccount: () -> Unit) {
 @Composable
 private fun DevicesPage(
     snapshot: ProductSnapshot,
+    expandedPcIds: Set<String>,
+    onTogglePcExpanded: (java.util.UUID) -> Unit,
     onOpenSession: (java.util.UUID) -> Unit,
     onOpenAccount: () -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
@@ -2757,7 +2909,6 @@ private fun DevicesPage(
             onAction = {},
         )
     } else {
-        var expandedPcIds by remember { mutableStateOf(emptySet<String>()) }
         pcs.forEach { pc ->
             val sessions = snapshot.sessions.filter { it.pcId == pc.id }
             val pcKey = pc.id.toString()
@@ -2766,13 +2917,7 @@ private fun DevicesPage(
                 sessions = sessions,
                 sessionTitles = snapshot.sessionTitles,
                 expanded = pcKey in expandedPcIds,
-                onToggleExpanded = {
-                    expandedPcIds = if (pcKey in expandedPcIds) {
-                        expandedPcIds - pcKey
-                    } else {
-                        expandedPcIds + pcKey
-                    }
-                },
+                onToggleExpanded = { onTogglePcExpanded(pc.id) },
                 onOpenSession = onOpenSession,
                 onBrowseFiles = { onBrowsePc(pc) },
                 onOpenDownloads = { onOpenPcDownloads(pc) },
@@ -2890,7 +3035,11 @@ private fun PcRow(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(ProductShape)
-                                .clickable(enabled = onOpenSession != null) { onOpenSession?.invoke(session.id) }
+                                .clickable(
+                                    enabled = onOpenSession != null && isSessionTabOpenable(session),
+                                ) {
+                                    onOpenSession?.invoke(session.id)
+                                }
                                 .padding(horizontal = 8.dp, vertical = 8.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -2948,6 +3097,9 @@ private fun PcRow(
 
 internal fun isDeviceSessionActive(sessionOnline: Boolean): Boolean = sessionOnline
 
+internal fun isSessionTabOpenable(session: SessionSummary?): Boolean =
+    session != null && session.online && session.state != SessionState.EXITED
+
 internal enum class DeviceSessionDestructiveAction {
     CLOSE_ONLINE,
     DELETE_OFFLINE_RECORD,
@@ -2968,8 +3120,9 @@ private fun SessionsPage(
     foregroundGeneration: Long,
     wide: Boolean,
     selectedSessionId: String?,
+    openedSessionIds: List<String>,
     onSessionSelected: (java.util.UUID) -> Unit,
-    onStopSessionRequested: (java.util.UUID) -> Unit,
+    onCloseSessionTab: (java.util.UUID) -> Unit,
     onOpenSession: suspend (java.util.UUID) -> Unit,
     onLoadTranscript: (java.util.UUID) -> Unit,
     onClearTranscript: (java.util.UUID) -> Unit,
@@ -2986,10 +3139,12 @@ private fun SessionsPage(
     val requestedSelectedId = selectedSessionId?.let { value ->
         runCatching { java.util.UUID.fromString(value) }.getOrNull()
     }
-    val requestedSelected = snapshot.sessions.firstOrNull { it.id == requestedSelectedId }
+    val opened = openedSessionIds.toHashSet()
+    val openedSessions = snapshot.sessions.filter { it.id.toString() in opened }
+    val requestedSelected = openedSessions.firstOrNull { it.id == requestedSelectedId }
     val requestedSelectedEngine = requestedSelected?.let { terminalEngine(it.id) }
     val activeSessions = liveSessionPageSessions(
-        sessions = snapshot.sessions,
+        sessions = openedSessions,
         selectedId = requestedSelectedId,
         sessionStates = snapshot.sessionStates,
         selectedHasEngine = requestedSelectedEngine != null,
@@ -3057,6 +3212,7 @@ private fun SessionsPage(
                         sessionTitles = snapshot.sessionTitles,
                         selectedId = selected.id,
                         onSessionSelected = onSessionSelected,
+                        onCloseSessionTab = onCloseSessionTab,
                         pcLabel = ::pcLabel,
                         modifier = Modifier
                             .widthIn(min = 260.dp, max = 360.dp)
@@ -3099,7 +3255,7 @@ private fun SessionsPage(
                     sessionTitles = snapshot.sessionTitles,
                     selectedId = selected.id,
                     onSessionSelected = onSessionSelected,
-                    onStopSessionRequested = onStopSessionRequested,
+                    onCloseSessionTab = onCloseSessionTab,
                     pcLabel = ::pcLabel,
                     selectedEngine = selectedEngine,
                     sessionStates = snapshot.sessionStates,
@@ -3131,7 +3287,7 @@ private fun MobileSessionContent(
     sessionTitles: Map<java.util.UUID, String>,
     selectedId: java.util.UUID,
     onSessionSelected: (java.util.UUID) -> Unit,
-    onStopSessionRequested: (java.util.UUID) -> Unit,
+    onCloseSessionTab: (java.util.UUID) -> Unit,
     pcLabel: (SessionSummary) -> String,
     selectedEngine: TermuxTerminalEngine?,
     sessionStates: Map<java.util.UUID, RemoteSessionState>,
@@ -3179,24 +3335,20 @@ private fun MobileSessionContent(
                                 overflow = TextOverflow.Ellipsis,
                             )
                         },
-                        trailingIcon = if (candidate.online) {
-                            {
-                                IconButton(
-                                    onClick = { onStopSessionRequested(candidate.id) },
-                                    modifier = Modifier
-                                        .size(32.dp)
-                                        .testTag(mobileSessionCloseTestTag(candidate.id)),
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.Close,
-                                        contentDescription = stringResource(R.string.action_close_session),
-                                        modifier = Modifier.size(17.dp),
-                                        tint = MaterialTheme.colorScheme.error,
-                                    )
-                                }
+                        trailingIcon = {
+                            IconButton(
+                                onClick = { onCloseSessionTab(candidate.id) },
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .testTag(mobileSessionCloseTestTag(candidate.id)),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Close,
+                                    contentDescription = stringResource(R.string.action_close_session_tab),
+                                    modifier = Modifier.size(17.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
                             }
-                        } else {
-                            null
                         },
                     )
                 }
@@ -3287,6 +3439,7 @@ private fun SessionList(
     sessionTitles: Map<java.util.UUID, String>,
     selectedId: java.util.UUID,
     onSessionSelected: (java.util.UUID) -> Unit,
+    onCloseSessionTab: (java.util.UUID) -> Unit,
     pcLabel: (SessionSummary) -> String,
     modifier: Modifier,
 ) {
@@ -3308,6 +3461,7 @@ private fun SessionList(
                     selected = session.id == selectedId,
                     pcLabel = pcLabel(session),
                     onClick = { onSessionSelected(session.id) },
+                    onClose = { onCloseSessionTab(session.id) },
                 )
             }
         }
@@ -3321,6 +3475,7 @@ private fun SessionListRow(
     selected: Boolean,
     pcLabel: String,
     onClick: () -> Unit,
+    onClose: () -> Unit,
 ) {
     val stateColor = when (session.state) {
         SessionState.RUNNING -> MaterialTheme.colorScheme.secondary
@@ -3349,6 +3504,17 @@ private fun SessionListRow(
                 ),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        IconButton(
+            onClick = onClose,
+            modifier = Modifier.size(36.dp),
+        ) {
+            Icon(
+                Icons.Filled.Close,
+                contentDescription = stringResource(R.string.action_close_session_tab),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(18.dp),
             )
         }
     }

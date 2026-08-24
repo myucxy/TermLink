@@ -87,27 +87,46 @@ func (v *Valkey) ReleaseLiveSession(ctx context.Context, userID, sessionID, devi
 
 var acquireScript = redis.NewScript(`
 local current=redis.call('GET',KEYS[1])
+local clock=redis.call('TIME')
+local now=tonumber(clock[1])*1000+math.floor(tonumber(clock[2])/1000)
+local expires=now+tonumber(ARGV[3])
 if current then
-  local separator=string.find(current,'|',1,true)
-  if separator and string.sub(current,1,separator-1)==ARGV[1] then
-    redis.call('PEXPIRE',KEYS[1],ARGV[3])
-    return current
+  redis.call('ZREMRANGEBYSCORE',KEYS[3],'-inf',now)
+  if redis.call('ZCARD',KEYS[3])==0 then
+    local separator=string.find(current,'|',1,true)
+    local legacy_holder=separator and string.sub(current,1,separator-1) or ''
+    local legacy_ttl=redis.call('PTTL',KEYS[1])
+    if legacy_holder~='' and legacy_ttl>0 then
+      redis.call('ZADD',KEYS[3],now+legacy_ttl,legacy_holder)
+    end
   end
-  return false
+  redis.call('ZADD',KEYS[3],expires,ARGV[1])
+  local latest=redis.call('ZRANGE',KEYS[3],-1,-1,'WITHSCORES')
+  if latest[2] and tonumber(latest[2])>expires then
+    expires=tonumber(latest[2])
+  end
+  redis.call('PEXPIREAT',KEYS[1],expires)
+  redis.call('PEXPIREAT',KEYS[3],expires)
+  return current
 end
 local version=redis.call('INCR',KEYS[2])
 local value=ARGV[1]..'|'..ARGV[2]..'|'..version
 redis.call('PSETEX',KEYS[1],ARGV[3],value)
+redis.call('DEL',KEYS[3])
+redis.call('ZADD',KEYS[3],expires,ARGV[1])
+redis.call('PEXPIREAT',KEYS[3],expires)
 return value`)
 
-// Acquire atomically creates a lease or resumes the current holder's lease.
-// A resume preserves the lease ID and fencing version while restoring its full
-// duration. Competing holders cannot consume versions or replace the lease.
+// Acquire atomically creates or joins the session's shared control lease. A
+// join preserves the first holder's compatibility field, lease ID, and fencing
+// version while registering the joining Android as an independently releasable
+// participant. Authorization and the account boundary are enforced by the API
+// and durable store before this account-scoped primitive is used.
 func (v *Valkey) Acquire(ctx context.Context, sessionID, holderID uuid.UUID, duration time.Duration) (Lease, error) {
 	key := "lease:" + sessionID.String()
 	leaseID := uuid.New()
 	now := time.Now().UTC()
-	value, err := acquireScript.Run(ctx, v.Client, []string{key, key + ":version"}, holderID.String(), leaseID.String(), duration.Milliseconds()).Text()
+	value, err := acquireScript.Run(ctx, v.Client, []string{key, key + ":version", key + ":participants"}, holderID.String(), leaseID.String(), duration.Milliseconds()).Text()
 	if errors.Is(err, redis.Nil) {
 		return Lease{}, ErrLeaseHeld
 	}
@@ -122,17 +141,58 @@ func (v *Valkey) Acquire(ctx context.Context, sessionID, holderID uuid.UUID, dur
 	return lease, nil
 }
 
-var releaseScript = redis.NewScript(`if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('DEL',KEYS[1]) else return 0 end`)
+var releaseScript = redis.NewScript(`
+if redis.call('GET',KEYS[1])~=ARGV[1] then return 0 end
+redis.call('DEL',KEYS[1],KEYS[2])
+return 1`)
 
+// Release performs a fenced hard release. It is reserved for rollback and
+// administrative cleanup; an Android's ordinary release uses ReleaseForDevice
+// so it cannot revoke other participants in the shared lease.
 func (v *Valkey) Release(ctx context.Context, lease Lease) (bool, error) {
 	value := lease.HolderDeviceID.String() + "|" + lease.ID.String() + "|" + fmt.Sprint(lease.Version)
-	result, err := releaseScript.Run(ctx, v.Client, []string{"lease:" + lease.SessionID.String()}, value).Int()
+	key := "lease:" + lease.SessionID.String()
+	result, err := releaseScript.Run(ctx, v.Client, []string{key, key + ":participants"}, value).Int()
 	return result == 1, err
+}
+
+var releaseForDeviceScript = redis.NewScript(`
+local current=redis.call('GET',KEYS[1])
+if not current or current~=ARGV[1] then return 0 end
+local clock=redis.call('TIME')
+local now=tonumber(clock[1])*1000+math.floor(tonumber(clock[2])/1000)
+redis.call('ZREMRANGEBYSCORE',KEYS[2],'-inf',now)
+local removed=redis.call('ZREM',KEYS[2],ARGV[2])
+local remaining=redis.call('ZCARD',KEYS[2])
+if remaining==0 then
+  local separator=string.find(current,'|',1,true)
+  local legacy_holder=separator and string.sub(current,1,separator-1) or ''
+  if removed==0 and legacy_holder~=ARGV[2] then return 0 end
+  redis.call('DEL',KEYS[1],KEYS[2])
+  return 2
+end
+if removed==0 then return 0 end
+local latest=redis.call('ZRANGE',KEYS[2],-1,-1,'WITHSCORES')
+redis.call('PEXPIREAT',KEYS[1],latest[2])
+redis.call('PEXPIREAT',KEYS[2],latest[2])
+return 1`)
+
+// ReleaseForDevice removes one Android from a shared lease. accepted reports
+// whether the exact lease included that device; released is true only when it
+// was the last live participant and the shared lease was deleted.
+func (v *Valkey) ReleaseForDevice(ctx context.Context, lease Lease, deviceID uuid.UUID) (accepted, released bool, err error) {
+	value := lease.HolderDeviceID.String() + "|" + lease.ID.String() + "|" + fmt.Sprint(lease.Version)
+	key := "lease:" + lease.SessionID.String()
+	result, err := releaseForDeviceScript.Run(ctx, v.Client, []string{key, key + ":participants"}, value, deviceID.String()).Int()
+	if err != nil {
+		return false, false, err
+	}
+	return result == 1 || result == 2, result == 2, nil
 }
 
 func (v *Valkey) ForceRelease(ctx context.Context, sessionID uuid.UUID) (Lease, bool, error) {
 	key := "lease:" + sessionID.String()
-	value, err := forceReleaseScript.Run(ctx, v.Client, []string{key}).Text()
+	value, err := forceReleaseScript.Run(ctx, v.Client, []string{key, key + ":participants"}).Text()
 	if errors.Is(err, redis.Nil) {
 		return Lease{}, false, nil
 	}
@@ -151,7 +211,7 @@ func (v *Valkey) ForceRelease(ctx context.Context, sessionID uuid.UUID) (Lease, 
 var forceReleaseScript = redis.NewScript(`
 local value=redis.call('GET',KEYS[1])
 if not value then return nil end
-redis.call('DEL',KEYS[1])
+redis.call('DEL',KEYS[1],KEYS[2])
 return value`)
 
 func (v *Valkey) GetLease(ctx context.Context, sessionID uuid.UUID) (Lease, error) {
@@ -192,17 +252,38 @@ func parseLeaseValue(sessionID uuid.UUID, value string) (Lease, error) {
 	return Lease{SessionID: sessionID, HolderDeviceID: holder, ID: id, Version: version}, nil
 }
 
-var renewScript = redis.NewScript(`if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('PEXPIRE',KEYS[1],ARGV[2]) else return 0 end`)
+var renewScript = redis.NewScript(`
+if redis.call('GET',KEYS[1])~=ARGV[1] then return 0 end
+local clock=redis.call('TIME')
+local now=tonumber(clock[1])*1000+math.floor(tonumber(clock[2])/1000)
+local expires=now+tonumber(ARGV[3])
+redis.call('ZREMRANGEBYSCORE',KEYS[2],'-inf',now)
+redis.call('ZADD',KEYS[2],expires,ARGV[2])
+local latest=redis.call('ZRANGE',KEYS[2],-1,-1,'WITHSCORES')
+if latest[2] and tonumber(latest[2])>expires then
+  expires=tonumber(latest[2])
+end
+redis.call('PEXPIREAT',KEYS[1],expires)
+redis.call('PEXPIREAT',KEYS[2],expires)
+return 1`)
 
 func (v *Valkey) Renew(ctx context.Context, lease Lease, duration time.Duration) (Lease, error) {
+	return v.RenewForDevice(ctx, lease, lease.HolderDeviceID, duration)
+}
+
+// RenewForDevice refreshes the shared lease and the calling Android's
+// participant lifetime without changing the protocol-visible first holder.
+func (v *Valkey) RenewForDevice(ctx context.Context, lease Lease, deviceID uuid.UUID, duration time.Duration) (Lease, error) {
 	value := lease.HolderDeviceID.String() + "|" + lease.ID.String() + "|" + fmt.Sprint(lease.Version)
-	result, err := renewScript.Run(ctx, v.Client, []string{"lease:" + lease.SessionID.String()}, value, duration.Milliseconds()).Int()
+	key := "lease:" + lease.SessionID.String()
+	now := time.Now().UTC()
+	result, err := renewScript.Run(ctx, v.Client, []string{key, key + ":participants"}, value, deviceID.String(), duration.Milliseconds()).Int()
 	if err != nil {
 		return Lease{}, err
 	}
 	if result != 1 {
 		return Lease{}, ErrLeaseHeld
 	}
-	lease.ExpiresAt = time.Now().UTC().Add(duration)
+	lease.ExpiresAt = now.Add(duration)
 	return lease, nil
 }

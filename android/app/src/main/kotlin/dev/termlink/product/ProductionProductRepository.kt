@@ -73,6 +73,8 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CancellationException
@@ -167,6 +169,45 @@ internal fun accountRegistrationRequestBody(
         put("password_confirm", String(confirm))
     }.toString()
 }
+
+/** Thread-visible token handoff shared by every long-lived realtime client. */
+internal class RealtimeAccessTokenSource {
+    private val current = AtomicReference<String?>(null)
+
+    fun publish(token: String): String {
+        require(token.isNotBlank()) { "OIDC access token is unavailable" }
+        current.set(token)
+        return token
+    }
+
+    fun requireCurrent(): String = current.get() ?: error("OIDC access token is unavailable")
+
+    fun clear() {
+        current.set(null)
+    }
+}
+
+/** Invalidates any asynchronous token result captured by an older auth lifecycle. */
+internal class AuthenticationLifecycleFence {
+    private val generation = AtomicLong(0)
+
+    fun capture(): Long = generation.get()
+
+    fun invalidate(): Long = generation.incrementAndGet()
+
+    fun isCurrent(captured: Long): Boolean = generation.get() == captured
+}
+
+internal fun authenticationExpiredSnapshot(
+    snapshot: ProductSnapshot,
+    message: String,
+): ProductSnapshot = snapshot.copy(
+    signedIn = false,
+    accountLabel = null,
+    authenticationState = ProductAuthenticationState.SIGNED_OUT,
+    connectionState = ProductConnectionState.ERROR,
+    connectionError = message,
+)
 
 /** Reads only the reachability decision published by the PC catalog. */
 internal fun authoritativePcOnline(root: JsonObject): Boolean =
@@ -446,7 +487,10 @@ internal class ProductionProductRepository(
     private val updateCheckLock = Mutex()
     private val updateDownloadLock = Mutex()
     private val keyMetadataRefreshLock = Mutex()
-    private val tokenRefresh = TokenRefreshCoordinator { requestFreshAccessToken() }
+    private val realtimeAccessToken = RealtimeAccessTokenSource()
+    private val authenticationLifecycle = AuthenticationLifecycleFence()
+    private var pendingBrowserAuthenticationGeneration: Long? = null
+    private val tokenRefresh = TokenRefreshCoordinator(::requestFreshAccessToken)
     // The first production client is intentionally pinned to the public service.
     // Migrate older installs that may still have a locally edited endpoint.
     private val initialServerUrl = PRODUCT_PUBLIC_SERVER_URL.also {
@@ -572,7 +616,9 @@ internal class ProductionProductRepository(
             closeLiveSessions()
             closeHistoryEngines()
             clearRoomCache()
+            authenticationLifecycle.invalidate()
             authState = null
+            realtimeAccessToken.clear()
             sessionStore.clearAuthState()
             sessionStore.accountLogin = null
             storedIdentity?.identity?.destroy()
@@ -593,6 +639,7 @@ internal class ProductionProductRepository(
 
     override suspend fun signIn(username: String, password: CharArray) {
         check(!closed) { "Repository is closed" }
+        val authenticationGeneration = authenticationLifecycle.invalidate()
         mutableSnapshot.value = mutableSnapshot.value.copy(
             authenticationState = ProductAuthenticationState.NATIVE_CREDENTIALS,
             connectionState = ProductConnectionState.CONFIGURED,
@@ -603,13 +650,14 @@ internal class ProductionProductRepository(
             val payload = withContext(Dispatchers.IO) {
                 nativeOidc.passwordGrant(configuration, username, password)
             }
+            requireCurrentAuthentication(authenticationGeneration)
             val subject = OidcJwtClaims.accessTokenSubject(payload.accessToken, configuration.issuer, configuration.clientId)
-            activateAccount(configuration, subject, payload)
+            activateAccount(configuration, subject, payload, authenticationGeneration)
             sessionStore.accountLogin = username
             bootstrapAuthenticatedSession()
         } catch (error: NativeOidcException) {
-            publishFailure(error)
-            if (error.browserFallbackAvailable) {
+            if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration)) publishFailure(error)
+            if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration) && error.browserFallbackAvailable) {
                 mutableSnapshot.value = mutableSnapshot.value.copy(
                     authenticationState = ProductAuthenticationState.BROWSER_SETUP_REQUIRED,
                     connectionState = ProductConnectionState.ERROR,
@@ -618,7 +666,7 @@ internal class ProductionProductRepository(
             }
             throw error
         } catch (error: Throwable) {
-            publishFailure(error)
+            if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration)) publishFailure(error)
             throw error
         } finally {
             password.fill('\u0000')
@@ -817,10 +865,13 @@ internal class ProductionProductRepository(
 
     private suspend fun beginBrowserAuth(flow: BrowserAuthFlow) {
         check(!closed) { "Repository is closed" }
+        val authenticationGeneration = authenticationLifecycle.invalidate()
         try {
             val configuration = loadOidcConfiguration()
+            requireCurrentAuthentication(authenticationGeneration)
             mutableSnapshot.value = mutableSnapshot.value.copy(authenticationState = ProductAuthenticationState.BROWSER_SETUP_REQUIRED)
             authState = AuthState(configuration.serviceConfiguration)
+            pendingBrowserAuthenticationGeneration = authenticationGeneration
             val requestBuilder = AuthorizationRequest.Builder(
                 configuration.serviceConfiguration,
                 configuration.clientId,
@@ -840,19 +891,27 @@ internal class ProductionProductRepository(
             val request = requestBuilder.build()
             launchAuthorization(authService.getAuthorizationRequestIntent(request))
         } catch (error: Throwable) {
-            publishFailure(error)
+            if (pendingBrowserAuthenticationGeneration == authenticationGeneration) {
+                pendingBrowserAuthenticationGeneration = null
+            }
+            if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration)) publishFailure(error)
             throw error
         }
     }
 
     fun handleAuthorizationResult(data: Intent?) {
+        val authenticationGeneration = pendingBrowserAuthenticationGeneration ?: return
+        pendingBrowserAuthenticationGeneration = null
         if (data == null) {
-            publishFailure(IllegalStateException("OIDC sign-in was canceled"))
+            if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration) && authState != null) {
+                publishFailure(IllegalStateException("OIDC sign-in was canceled"))
+            }
             return
         }
         val response = AuthorizationResponse.fromIntent(data)
         val exception = AuthorizationException.fromIntent(data)
-        val state = authState ?: AuthState()
+        if (closed || !authenticationLifecycle.isCurrent(authenticationGeneration)) return
+        val state = authState ?: return
         state.update(response, exception)
         authState = state
         if (response == null) {
@@ -861,6 +920,7 @@ internal class ProductionProductRepository(
         }
         authService.performTokenRequest(response.createTokenExchangeRequest()) { tokenResponse, tokenException ->
             state.update(tokenResponse, tokenException)
+            if (!isCurrentAuthentication(authenticationGeneration, state)) return@performTokenRequest
             if (tokenResponse == null) {
                 publishFailure(tokenException ?: IllegalStateException("OIDC token exchange failed"))
                 return@performTokenRequest
@@ -880,13 +940,17 @@ internal class ProductionProductRepository(
             val cleanState = CredentialFreeAuthState.sanitize(state)
             scope.launch {
                 runCatching {
+                    requireCurrentAuthentication(authenticationGeneration, state)
                     if (sessionStore.accountLogin == null) {
                         sessionStore.accountLogin = OidcJwtClaims.displayIdentifier(tokenResponse.idToken ?: accessToken)
                     }
                     // Persist the issuer+subject scope first. If the process is
                     // killed after AuthState is saved, startup must never see
                     // an authorized session without an account-scoped key.
-                    establishAccountScope(AccountScope.canonical(configuration.issuer, subject))
+                    establishAccountScope(AccountScope.canonical(configuration.issuer, subject)) {
+                        requireCurrentAuthentication(authenticationGeneration, state)
+                    }
+                    requireCurrentAuthentication(authenticationGeneration, state)
                     authState = cleanState
                     sessionStore.saveAuthState(cleanState)
                     mutableSnapshot.value = mutableSnapshot.value.copy(
@@ -898,14 +962,18 @@ internal class ProductionProductRepository(
                         lastSyncedAt = null,
                     )
                     bootstrapAuthenticatedSession()
-                }.onFailure(::publishFailure)
+                }.onFailure { error ->
+                    if (isCurrentAuthentication(authenticationGeneration, state)) publishFailure(error)
+                }
             }
         }
     }
 
     override suspend fun signOut() {
         cancelRemoteDownloadsAndJoin(clearMetadata = true)
+        authenticationLifecycle.invalidate()
         authState = null
+        realtimeAccessToken.clear()
         sessionStore.clearAuthState()
         sessionStore.accountLogin = null
         closeLiveSessions()
@@ -1128,12 +1196,30 @@ internal class ProductionProductRepository(
             initialSize = TerminalSize(summary.columns.coerceAtLeast(1), summary.rows.coerceAtLeast(1)),
         )
         val restoredHistory = try {
-            restoreLiveHistory(
-                session = summary,
-                pc = pc,
-                pcDevice = pcDevice,
-                stored = stored,
-                engine = engine,
+            restoreHistoryOrUseTail(
+                restoreHistory = {
+                    restoreLiveHistory(
+                        session = summary,
+                        pc = pc,
+                        pcDevice = pcDevice,
+                        stored = stored,
+                        engine = engine,
+                    )
+                },
+                tailOnly = { error ->
+                    if (BuildConfig.DEBUG) {
+                        Log.e(
+                            "TermLinkTailFirst",
+                            "History bootstrap failed; opening realtime at directory tail " +
+                                "session=$sessionId tail=${summary.lastOutputSequence}",
+                            error,
+                        )
+                    }
+                    val authoritativeTail = latestTailOrDirectoryTail(summary.lastOutputSequence) {
+                        latestAuthoritativeSessionTail(summary)
+                    }
+                    prepareTailOnlyBootstrap(summary, authoritativeTail, engine)
+                },
             )
         } catch (error: CancellationException) {
             engine.dispose()
@@ -1158,9 +1244,7 @@ internal class ProductionProductRepository(
                 engine = engine,
                 config = ProductionRealtimeSessionConfig(
                     rootUrl = root,
-                    tokenProvider = AccessTokenProvider {
-                        authState?.accessToken ?: error("OIDC access token is unavailable")
-                    },
+                    tokenProvider = AccessTokenProvider(realtimeAccessToken::requireCurrent),
                     androidDeviceId = stored.deviceId,
                     pcDeviceId = pc.deviceId,
                     sessionId = sessionId,
@@ -1276,12 +1360,14 @@ internal class ProductionProductRepository(
             }
         }
         live.tokenRefreshJob = scope.launch {
-            while (isActive) {
+            while (isActive && mutableSnapshot.value.signedIn) {
                 delay(LIVE_TOKEN_REFRESH_INTERVAL_MILLIS)
                 runCatching { freshAccessToken() }
                     .onFailure { error ->
-                        if (isActive) publishFailure(error)
-                        delay(LIVE_TOKEN_REFRESH_RETRY_MILLIS)
+                        if (isActive && mutableSnapshot.value.signedIn) {
+                            publishFailure(error)
+                            delay(LIVE_TOKEN_REFRESH_RETRY_MILLIS)
+                        }
                     }
             }
         }
@@ -1300,6 +1386,23 @@ internal class ProductionProductRepository(
             live.close()
             observeBootstrapFailure(sessionId)
             throw error
+        }
+    }
+
+    override suspend fun closeSessionView(sessionId: UUID): Unit = sessionLifecycleLock.withLock {
+        check(!closed) { "Repository is closed" }
+        val live = synchronized(liveSessionLock) { liveSessions.remove(sessionId) }
+        live?.closeAndJoin()
+        // Closing an Android tab is intentionally local. Keep the authoritative
+        // catalog row and encrypted history so the Windows shell remains visible
+        // on Devices and can be opened again without creating a new session.
+        mutableSnapshot.update { snapshot ->
+            snapshot.copy(
+                sessionStates = snapshot.sessionStates - sessionId,
+                transcriptViewports = snapshot.transcriptViewports - sessionId,
+                liveAcknowledgements = snapshot.liveAcknowledgements - sessionId,
+                bootstrapSources = snapshot.bootstrapSources - sessionId,
+            )
         }
     }
 
@@ -2327,11 +2430,17 @@ internal class ProductionProductRepository(
         return storedIdentity ?: keyVault.loadOrCreate(scope).also { storedIdentity = it }
     }
 
-    private suspend fun freshAccessToken(): String = tokenRefresh.freshAccessToken()
+    private suspend fun freshAccessToken(force: Boolean = false): String =
+        tokenRefresh.freshAccessToken(force)
 
-    private suspend fun requestFreshAccessToken(): String = suspendCancellableCoroutine { continuation ->
+    private suspend fun requestFreshAccessToken(force: Boolean): String = suspendCancellableCoroutine { continuation ->
+        val generation = authenticationLifecycle.capture()
         val state = authState ?: run {
             continuation.resumeWithException(IllegalStateException("Sign in first"))
+            return@suspendCancellableCoroutine
+        }
+        if (closed || !authenticationLifecycle.isCurrent(generation)) {
+            continuation.resumeWithException(IllegalStateException("Authentication lifecycle changed"))
             return@suspendCancellableCoroutine
         }
         // Persisted AuthState intentionally omits AuthorizationResponse and all
@@ -2343,7 +2452,9 @@ internal class ProductionProductRepository(
             try {
                 val configuration = ensureOidcConfiguration()
                 val current = state.accessToken
-                if (!state.needsTokenRefresh && !current.isNullOrBlank()) {
+                if (!force && !state.needsTokenRefresh && !current.isNullOrBlank()) {
+                    requireCurrentAuthentication(generation, state)
+                    realtimeAccessToken.publish(current)
                     if (continuation.isActive) continuation.resume(current)
                     return@launch
                 }
@@ -2374,14 +2485,32 @@ internal class ProductionProductRepository(
                     .build()
                 val updated = AuthState(configuration.serviceConfiguration)
                 updated.update(tokenResponse, null)
-                authState = CredentialFreeAuthState.sanitize(updated)
-                sessionStore.saveAuthState(authState ?: updated)
+                requireCurrentAuthentication(generation, state)
+                val clean = CredentialFreeAuthState.sanitize(updated)
+                authState = clean
+                sessionStore.saveAuthState(clean)
+                realtimeAccessToken.publish(payload.accessToken)
                 if (continuation.isActive) continuation.resume(payload.accessToken)
             } catch (error: Throwable) {
                 if (continuation.isActive) continuation.resumeWithException(error)
             }
         }
     }
+
+    private fun requireCurrentAuthentication(generation: Long, state: AuthState) {
+        check(isCurrentAuthentication(generation, state)) {
+            "Authentication lifecycle changed"
+        }
+    }
+
+    private fun requireCurrentAuthentication(generation: Long) {
+        check(!closed && authenticationLifecycle.isCurrent(generation)) {
+            "Authentication lifecycle changed"
+        }
+    }
+
+    private fun isCurrentAuthentication(generation: Long, state: AuthState): Boolean =
+        !closed && authenticationLifecycle.isCurrent(generation) && authState === state
 
     private suspend fun ensureOidcConfiguration(): NativeOidcConfiguration {
         oidcConfiguration?.let { return it }
@@ -2398,9 +2527,14 @@ internal class ProductionProductRepository(
         configuration: NativeOidcConfiguration,
         subject: String,
         payload: NativeTokenPayload,
+        authenticationGeneration: Long,
     ) {
+        requireCurrentAuthentication(authenticationGeneration)
         val nextScope = AccountScope.canonical(configuration.issuer, subject)
-        establishAccountScope(nextScope)
+        establishAccountScope(nextScope) {
+            requireCurrentAuthentication(authenticationGeneration)
+        }
+        requireCurrentAuthentication(authenticationGeneration)
         val request = TokenRequest.Builder(configuration.serviceConfiguration, configuration.clientId)
             .setGrantType(TokenRequest.GRANT_TYPE_PASSWORD)
             .setScope(payload.scope ?: "openid profile offline_access")
@@ -2452,13 +2586,19 @@ internal class ProductionProductRepository(
             }
         }
 
-    private suspend fun establishAccountScope(nextScope: String) {
+    private suspend fun establishAccountScope(
+        nextScope: String,
+        beforeCommit: () -> Unit = {},
+    ) {
+        beforeCommit()
         if (accountScope != null && accountScope != nextScope) {
             closeLiveSessions()
             closeHistoryEngines()
             clearRoomCache()
+            beforeCommit()
             billing.reset()
         }
+        beforeCommit()
         if (accountScope != nextScope) {
             storedIdentity?.identity?.destroy()
             storedIdentity = null
@@ -3032,16 +3172,26 @@ internal class ProductionProductRepository(
     }
 
     private fun closeLiveSessions() {
-        synchronized(liveSessionLock) {
-            liveSessions.values.toList().forEach(LiveProductSession::close)
-            liveSessions.clear()
+        closeRetiredRealtimeRuntime(detachRealtimeRuntime())
+    }
+
+    private fun detachRealtimeRuntime(): RetiredRealtimeRuntime {
+        val retired = synchronized(liveSessionLock) {
+            RetiredRealtimeRuntime(
+                sessions = liveSessions.values.toList().also { liveSessions.clear() },
+                multiplexer = realtimeMultiplexer.also { realtimeMultiplexer = null },
+            )
         }
-        realtimeMultiplexer?.close()
-        realtimeMultiplexer = null
         mutableSnapshot.value = mutableSnapshot.value.copy(
             sessionStates = emptyMap(),
             sessionTitles = emptyMap(),
         )
+        return retired
+    }
+
+    private fun closeRetiredRealtimeRuntime(retired: RetiredRealtimeRuntime) {
+        retired.sessions.forEach(LiveProductSession::close)
+        retired.multiplexer?.close()
     }
 
     private fun deviceRealtimeMultiplexer(
@@ -3049,15 +3199,38 @@ internal class ProductionProductRepository(
     ): ProductionRealtimeMultiplexer = synchronized(liveSessionLock) {
         realtimeMultiplexer ?: ProductionRealtimeMultiplexer(
             rootUrl = PRODUCT_PUBLIC_SERVER_URL,
-            tokenProvider = AccessTokenProvider {
-                authState?.accessToken ?: error("OIDC access token is unavailable")
-            },
+            tokenProvider = AccessTokenProvider(realtimeAccessToken::requireCurrent),
             deviceId = stored.deviceId,
             identity = stored.identity,
             parentScope = scope,
             httpClient = http,
             allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
+            authenticationRefresher = dev.termlink.network.production.RealtimeAuthenticationRefresher {
+                freshAccessToken(force = true)
+            },
+            authenticationFailureObserver = ::invalidateAuthentication,
         ).also { realtimeMultiplexer = it }
+    }
+
+    private fun invalidateAuthentication(error: Throwable) {
+        if (closed || !mutableSnapshot.value.signedIn) return
+        authenticationLifecycle.invalidate()
+        authState = null
+        realtimeAccessToken.clear()
+        runCatching { sessionStore.clearAuthState() }
+        runCatching { sessionStore.accountLogin = null }
+        val message = activity.getString(R.string.failure_authentication_expired)
+        mutableSnapshot.value = authenticationExpiredSnapshot(mutableSnapshot.value, message)
+        appendActivity("Authentication expired", message, Severity.ERROR)
+        val retired = detachRealtimeRuntime()
+        // This observer can run inside the multiplexer state collector. Yield
+        // to the Repository parent scope before closing the captured old
+        // multiplexer. The live map and owner slot are already detached, so a
+        // later re-login cannot be closed by this cleanup job.
+        scope.launch {
+            kotlinx.coroutines.yield()
+            closeRetiredRealtimeRuntime(retired)
+        }
     }
 
     private fun closeHistoryEnginesExcept(retained: Set<UUID>) {
@@ -3074,6 +3247,8 @@ internal class ProductionProductRepository(
     override fun close() {
         if (closed) return
         closed = true
+        authenticationLifecycle.invalidate()
+        realtimeAccessToken.clear()
         if (realtimeNetworkCallbackRegistered) {
             runCatching { connectivityManager.unregisterNetworkCallback(realtimeNetworkCallback) }
             realtimeNetworkCallbackRegistered = false
@@ -3191,6 +3366,11 @@ internal class ProductionProductRepository(
             client.close()
         }
     }
+
+    private data class RetiredRealtimeRuntime(
+        val sessions: List<LiveProductSession>,
+        val multiplexer: ProductionRealtimeMultiplexer?,
+    )
 
     internal class ReservedInputSequenceProvider(
         private val reserve: () -> LongRange,
@@ -3483,6 +3663,42 @@ internal class ProductionProductRepository(
             expectedRendererGeneration,
         )
         RestoredLiveHistory(RendererBootstrapState.Empty(reset.rendererGeneration))
+    }
+
+    private suspend fun prepareTailOnlyBootstrap(
+        session: SessionSummary,
+        authoritativeTail: ULong,
+        engine: TermuxTerminalEngine,
+    ): RestoredLiveHistory {
+        val cursor = historyRepository.ackCursorState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
+            ?: historyRepository.initializeAckCursor(session.id, LIVE_OUTPUT_ACK_DIRECTION)
+        val rendererState = prepareTailOnlyRendererState(
+            authoritativeTail = tailOnlyCursor(authoritativeTail, cursor.sequence),
+            clearRenderer = {
+                engine.clear()
+                engine.resize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1))
+            },
+            resetCursor = {
+                historyRepository.resetAckCursor(
+                    session.id,
+                    LIVE_OUTPUT_ACK_DIRECTION,
+                    cursor.rendererGeneration,
+                ).let { DurableAckCommit(it.sequence.toLong(), it.rendererGeneration) }
+            },
+            persistTail = { generation, tail ->
+                historyRepository.putAckCursor(
+                    session.id,
+                    LIVE_OUTPUT_ACK_DIRECTION,
+                    generation,
+                    tail,
+                )
+            },
+        )
+        return RestoredLiveHistory(
+            rendererState = rendererState,
+            durableAcknowledgement = rendererState.sequence.toULong(),
+            bootstrapSource = ProductBootstrapSource.TAIL_ONLY,
+        )
     }
 
     private suspend fun prepareTerminalSnapshot(
@@ -4677,6 +4893,61 @@ internal fun canSafelySubscribeFromZeroWithoutSnapshot(
 
 internal const val SESSION_BOOTSTRAP_IN_PROGRESS_REASON = "snapshot bootstrap in progress"
 internal const val SESSION_BOOTSTRAP_FAILED_REASON = "snapshot bootstrap failed"
+
+/** History recovery is optional for opening an otherwise valid realtime session. */
+internal suspend fun <Restored> restoreHistoryOrUseTail(
+    restoreHistory: suspend () -> Restored,
+    tailOnly: suspend (Exception) -> Restored,
+): Restored = try {
+    restoreHistory()
+} catch (error: CancellationException) {
+    throw error
+} catch (error: Exception) {
+    tailOnly(error)
+}
+
+/** A failed best-effort refresh must never turn a valid directory row into an open failure. */
+internal suspend fun latestTailOrDirectoryTail(
+    directoryTail: ULong,
+    latestAuthoritativeTail: suspend () -> ULong?,
+): ULong = try {
+    maxOf(directoryTail, latestAuthoritativeTail() ?: directoryTail)
+} catch (error: CancellationException) {
+    throw error
+} catch (_: Exception) {
+    directoryTail
+}
+
+/** Never lets an eventually-consistent directory move behind this device's durable cursor. */
+internal fun tailOnlyCursor(
+    authoritativeTail: ULong,
+    durableAcknowledgement: ULong,
+): ULong = maxOf(authoritativeTail, durableAcknowledgement)
+
+/**
+ * Permanently fences the previous renderer before anchoring a blank renderer
+ * at the monotonic live tail. The returned state is safe to hand to realtime only
+ * after the tail cursor itself is durable.
+ */
+internal suspend fun prepareTailOnlyRendererState(
+    authoritativeTail: ULong,
+    clearRenderer: () -> Unit,
+    resetCursor: suspend () -> DurableAckCommit,
+    persistTail: suspend (rendererGeneration: Long, tail: ULong) -> ULong,
+): RendererBootstrapState.TailOnly {
+    require(authoritativeTail <= Long.MAX_VALUE.toULong()) { "authoritative tail is out of range" }
+    return withContext(NonCancellable) {
+        clearRenderer()
+        val reset = resetCursor()
+        check(reset.sequence == 0L) { "renderer reset did not clear its ACK cursor" }
+        val persisted = persistTail(reset.rendererGeneration, authoritativeTail)
+        check(persisted == authoritativeTail) { "tail-only cursor was not persisted" }
+        RendererBootstrapState.TailOnly(
+            sequence = persisted.toLong(),
+            rendererGeneration = reset.rendererGeneration,
+        )
+    }
+}
 
 internal fun shouldReplaceLiveSessionForOpen(
     liveSessionExists: Boolean,

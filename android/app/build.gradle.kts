@@ -107,13 +107,13 @@ val debugTerminalSnapshotRuntime = providers.gradleProperty("termlinkEnableTermi
     .toBooleanStrictOrNull()
     ?: throw GradleException("termlinkEnableTerminalSnapshotRuntime must be true or false")
 val termLinkVersionCode = providers.gradleProperty("termlinkVersionCode")
-    .orElse("31")
+    .orElse("32")
     .get()
     .toIntOrNull()
     ?.takeIf { it > 0 }
     ?: throw GradleException("termlinkVersionCode must be a positive integer")
 val termLinkVersionName = providers.gradleProperty("termlinkVersionName")
-    .orElse("0.1.25")
+    .orElse("0.1.26")
     .get()
     .trim()
     .takeIf { it.isNotEmpty() }

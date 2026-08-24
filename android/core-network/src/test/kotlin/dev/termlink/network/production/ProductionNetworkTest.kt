@@ -8,6 +8,7 @@ import dev.termlink.protocol.realtime.v1.Envelope
 import dev.termlink.protocol.realtime.v1.MessageType
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.AbstractExecutorService
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
@@ -23,6 +24,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
+import okhttp3.Dispatcher
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okhttp3.mockwebserver.MockResponse
@@ -35,6 +37,40 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProductionNetworkTest {
+    @Test
+    fun synchronousHandshakeFailureBeforeNewWebSocketReturnsIsNotDropped(): Unit = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setResponseCode(401))
+        server.start()
+        val identity = DeviceIdentity.generate()
+        val executor = InlineExecutorService()
+        val client = ProductionRealtimeClient(
+            rootUrl = server.url("/").toString(),
+            tokenProvider = AccessTokenProvider { "expired" },
+            deviceId = UUID.randomUUID(),
+            identity = identity,
+            role = "android",
+            httpClient = OkHttpClient.Builder().dispatcher(Dispatcher(executor)).build(),
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            val rejected = async(start = CoroutineStart.UNDISPATCHED) {
+                client.state.first { it is RealtimeState.AuthenticationRejected }
+            }
+
+            client.connect()
+
+            val state = withTimeout(5_000) { rejected.await() }
+            assertTrue(state is RealtimeState.AuthenticationRejected)
+            assertEquals(401, (state as RealtimeState.AuthenticationRejected).status)
+        } finally {
+            client.close()
+            executor.shutdownNow()
+            identity.destroy()
+            server.shutdown()
+        }
+    }
+
     @Test
     fun realtimeNormalizesSharedRestClientForLongLivedWebSockets() {
         val restClient = OkHttpClient.Builder()
@@ -229,6 +265,20 @@ class ProductionNetworkTest {
             .setNonce(ByteString.copyFrom(ByteArray(12) { sequence.toByte() }))
             .setCiphertext(ByteString.copyFrom(ByteArray(16) { sequence.toByte() }))
             .build()
+
+    private class InlineExecutorService : AbstractExecutorService() {
+        @Volatile private var stopped = false
+
+        override fun execute(command: Runnable) = command.run()
+        override fun shutdown() { stopped = true }
+        override fun shutdownNow(): MutableList<Runnable> {
+            stopped = true
+            return mutableListOf()
+        }
+        override fun isShutdown(): Boolean = stopped
+        override fun isTerminated(): Boolean = stopped
+        override fun awaitTermination(timeout: Long, unit: TimeUnit): Boolean = stopped
+    }
 
     private fun hex(value: String): ByteArray = value.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }

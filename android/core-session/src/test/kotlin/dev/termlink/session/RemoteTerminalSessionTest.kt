@@ -111,6 +111,31 @@ class RemoteTerminalSessionTest {
     }
 
     @Test
+    fun tailOnlyRendererStartsBlankAtDirectoryCursorAndReconnectsFromLiveProgress() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(
+            engine = engine,
+            outbound = outbound,
+            parentScope = backgroundScope,
+            initialRendererState = RendererBootstrapState.TailOnly(41, rendererGeneration = 3),
+        )
+
+        assertTrue(session.onConnected())
+        assertEquals(emptyList<Pair<Long, ByteArray>>(), engine.feeds)
+        assertEquals(EventAcceptance.Duplicate(41), session.accept(RemoteSessionEvent.Output(41, byteArrayOf(1))))
+        assertEquals(EventAcceptance.Applied(42), session.accept(RemoteSessionEvent.Output(42, byteArrayOf(2))))
+        runCurrent()
+        session.onDisconnected("network switch")
+        assertTrue(session.onConnected())
+
+        assertEquals(listOf(41L, 42L), outbound.resumes)
+        assertEquals(listOf(42L), engine.feeds.map { it.first })
+        assertEquals(42L, session.state.value.lastAckedSequence)
+        session.close()
+    }
+
+    @Test
     fun ackFailureKeepsAppliedSequenceForTheNextResume() = runTest {
         val engine = RecordingEngine()
         val outbound = RecordingOutbound().apply { failAck = true }

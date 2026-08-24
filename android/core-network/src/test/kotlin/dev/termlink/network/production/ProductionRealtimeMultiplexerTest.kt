@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.take
@@ -42,10 +43,164 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okio.ByteString as OkioByteString
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ProductionRealtimeMultiplexerTest {
+    @Test
+    fun oidcRejectionRefreshesOnceAtDeviceBoundaryAndReconnectsWithLatestToken(): Unit = runBlocking {
+        val androidId = UUID.fromString("10000000-0000-0000-0000-000000000000")
+        val identity = DeviceIdentity.generate()
+        val token = AtomicReference("token-1")
+        val refreshCount = AtomicInteger(0)
+        val serverSocket = AtomicReference<WebSocket>()
+        val serverSocketClosed = CountDownLatch(1)
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setResponseCode(401))
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
+                        serverSocket.set(webSocket)
+                    }
+
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        check(webSocket.send("{\"type\":\"welcome\",\"protocol_version\":1}"))
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, reason)
+                    }
+
+                    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                        serverSocketClosed.countDown()
+                    }
+                },
+            ),
+        )
+        server.start()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val multiplexer = ProductionRealtimeMultiplexer(
+            rootUrl = server.url("/").toString(),
+            tokenProvider = AccessTokenProvider(token::get),
+            deviceId = androidId,
+            identity = identity,
+            parentScope = scope,
+            allowCleartextForLocalTest = true,
+            authenticationRefresher = RealtimeAuthenticationRefresher {
+                refreshCount.incrementAndGet()
+                token.set("token-2")
+            },
+        )
+        val endpoint = multiplexer.register(UUID.randomUUID())
+        try {
+            val connected = async { endpoint.state.first { it == RealtimeState.Connected } }
+            endpoint.connect()
+            withTimeout(5_000) { connected.await() }
+
+            assertEquals(1, refreshCount.get())
+            assertEquals("Bearer token-1", server.takeRequest().getHeader("Authorization"))
+            assertEquals("Bearer token-2", server.takeRequest().getHeader("Authorization"))
+        } finally {
+            multiplexer.close()
+            if (serverSocket.getAndSet(null)?.close(1000, "test complete") == true) {
+                serverSocketClosed.await(2, TimeUnit.SECONDS)
+            }
+            scope.cancel()
+            identity.destroy()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun failedForcedRefreshPublishesTerminalAuthenticationFailureWithoutRetryLoop(): Unit = runTest {
+        val socket = FakeSocket()
+        val refreshCount = AtomicInteger(0)
+        val failureCount = AtomicInteger(0)
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(
+            socket = socket,
+            parentScope = backgroundScope,
+            authenticationRefresher = RealtimeAuthenticationRefresher {
+                refreshCount.incrementAndGet()
+                throw IllegalStateException("refresh rejected")
+            },
+            authenticationFailureObserver = { failureCount.incrementAndGet() },
+        )
+        val endpoint = multiplexer.register(UUID.randomUUID())
+        val failed = async { endpoint.state.first { it is RealtimeState.AuthenticationFailed } }
+
+        endpoint.connect()
+        socket.emitState(RealtimeState.AuthenticationRejected(401, "expired"))
+        runCurrent()
+
+        assertTrue(failed.await() is RealtimeState.AuthenticationFailed)
+        assertEquals(1, refreshCount.get())
+        assertEquals(1, failureCount.get())
+        assertEquals(1, socket.connectCount)
+
+        endpoint.connect()
+        multiplexer.onNetworkAvailable()
+        runCurrent()
+        assertEquals(1, socket.connectCount)
+        multiplexer.close()
+    }
+
+    @Test
+    fun secondOidcRejectionAfterForcedRefreshIsTerminal(): Unit = runTest {
+        val socket = FakeSocket()
+        val refreshCount = AtomicInteger(0)
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(
+            socket = socket,
+            parentScope = backgroundScope,
+            authenticationRefresher = RealtimeAuthenticationRefresher { refreshCount.incrementAndGet() },
+        )
+        val endpoint = multiplexer.register(UUID.randomUUID())
+        val failed = async { endpoint.state.first { it is RealtimeState.AuthenticationFailed } }
+
+        endpoint.connect()
+        socket.emitState(RealtimeState.AuthenticationRejected(401, "expired"))
+        runCurrent()
+        assertEquals(2, socket.connectCount)
+
+        socket.emitState(RealtimeState.AuthenticationRejected(403, "still rejected"))
+        runCurrent()
+        assertTrue(failed.await() is RealtimeState.AuthenticationFailed)
+        assertEquals(1, refreshCount.get())
+        assertEquals(2, socket.connectCount)
+        multiplexer.close()
+    }
+
+    @Test
+    fun terminalAuthenticationMultiplexerCanBeRetiredAndReplacementConnects(): Unit = runTest {
+        val failedSocket = FakeSocket()
+        val failedMultiplexer = ProductionRealtimeMultiplexer.forTest(
+            socket = failedSocket,
+            parentScope = backgroundScope,
+            authenticationRefresher = RealtimeAuthenticationRefresher {
+                throw IllegalStateException("refresh rejected")
+            },
+        )
+        val failedEndpoint = failedMultiplexer.register(UUID.randomUUID())
+        val authenticationFailed = async {
+            failedEndpoint.state.first { it is RealtimeState.AuthenticationFailed }
+        }
+        failedEndpoint.connect()
+        failedSocket.emitState(RealtimeState.AuthenticationRejected(401, "expired"))
+        runCurrent()
+        assertTrue(authenticationFailed.await() is RealtimeState.AuthenticationFailed)
+        failedMultiplexer.close()
+
+        val replacementSocket = FakeSocket()
+        val replacement = ProductionRealtimeMultiplexer.forTest(replacementSocket, backgroundScope)
+        val replacementEndpoint = replacement.register(UUID.randomUUID())
+        replacementEndpoint.connect()
+
+        assertEquals(1, failedSocket.closeCount)
+        assertEquals(1, replacementSocket.connectCount)
+        replacement.close()
+    }
+
     @Test
     fun onePhysicalWebSocketCarriesInterleavedAAndBSessions(): Unit = runBlocking {
         val androidId = UUID.fromString("10000000-0000-0000-0000-000000000000")

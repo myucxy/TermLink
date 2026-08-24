@@ -2,6 +2,7 @@ package dev.termlink.product
 
 import dev.termlink.model.DeviceTrustState
 import dev.termlink.model.SessionState
+import dev.termlink.network.production.AccessTokenProvider
 import dev.termlink.network.production.TermLinkApiException
 import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
 import dev.termlink.session.InputSubmission
@@ -11,6 +12,7 @@ import dev.termlink.session.RemoteSessionState
 import java.net.URI
 import java.util.Base64
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -534,18 +536,70 @@ class ProductContractsTest {
     fun tokenRefreshCoordinatorCallsRefreshAndRejectsBlankTokens() {
         runBlocking {
             var calls = 0
-            val coordinator = TokenRefreshCoordinator {
+            val forced = mutableListOf<Boolean>()
+            val coordinator = TokenRefreshCoordinator { force ->
                 calls += 1
+                forced += force
                 "fresh-$calls"
             }
 
             assertEquals("fresh-1", coordinator.freshAccessToken())
-            assertEquals("fresh-2", coordinator.freshAccessToken())
+            assertEquals("fresh-2", coordinator.freshAccessToken(force = true))
             assertEquals(2, calls)
+            assertEquals(listOf(false, true), forced)
             assertThrows(IllegalArgumentException::class.java) {
-                runBlocking { TokenRefreshCoordinator { " " }.freshAccessToken() }
+                runBlocking { TokenRefreshCoordinator { _ -> " " }.freshAccessToken() }
             }
         }
+    }
+
+    @Test
+    fun authenticationLifecycleFenceRejectsRefreshCapturedBeforeSignOutOrClose() {
+        val fence = AuthenticationLifecycleFence()
+        val beforeSignOut = fence.capture()
+
+        fence.invalidate()
+
+        assertFalse(fence.isCurrent(beforeSignOut))
+        val afterSignOut = fence.capture()
+        assertTrue(fence.isCurrent(afterSignOut))
+
+        fence.invalidate()
+        assertFalse(fence.isCurrent(afterSignOut))
+    }
+
+    @Test
+    fun authenticationExpiryClearsTheVisibleAccountIdentity() {
+        val expired = authenticationExpiredSnapshot(
+            snapshot = ProductSnapshot(
+                signedIn = true,
+                accountLabel = "alice@example.test",
+                authenticationState = ProductAuthenticationState.AUTHENTICATED,
+                connectionState = ProductConnectionState.CONNECTED,
+            ),
+            message = "Authentication expired",
+        )
+
+        assertFalse(expired.signedIn)
+        assertEquals(null, expired.accountLabel)
+        assertEquals(ProductAuthenticationState.SIGNED_OUT, expired.authenticationState)
+        assertEquals(ProductConnectionState.ERROR, expired.connectionState)
+        assertEquals("Authentication expired", expired.connectionError)
+    }
+
+    @Test
+    fun realtimeTokenSourcePublishesTheLatestRefreshedTokenAndClearsOnSignOut() {
+        val source = RealtimeAccessTokenSource()
+        val provider = AccessTokenProvider(source::requireCurrent)
+
+        assertThrows(IllegalStateException::class.java, source::requireCurrent)
+        assertEquals("fresh-1", source.publish("fresh-1"))
+        assertEquals("fresh-1", provider.accessToken())
+        assertEquals("fresh-2", source.publish("fresh-2"))
+        assertEquals("fresh-2", CompletableFuture.supplyAsync(provider::accessToken).get())
+
+        source.clear()
+        assertThrows(IllegalStateException::class.java, provider::accessToken)
     }
 
     private fun parseDevice(id: UUID, trustState: String) = ProductResponseParser.device(

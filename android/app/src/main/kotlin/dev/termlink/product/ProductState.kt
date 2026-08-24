@@ -632,6 +632,7 @@ internal fun retainOldestTranscriptPages(
 
 enum class ProductBootstrapSource {
     EMPTY,
+    TAIL_ONLY,
     LEGACY_REPLAY,
     BOUND_SNAPSHOT,
     REMOTE_SNAPSHOT,
@@ -804,6 +805,8 @@ interface ProductRepository : Closeable {
     suspend fun openRemoteShell(pcId: UUID, path: String, shellType: RemoteShellType): UUID =
         error("Remote terminal launch is unavailable")
     suspend fun openSession(sessionId: UUID)
+    /** Closes only this Android viewer/transport; the Windows shell remains running. */
+    suspend fun closeSessionView(sessionId: UUID) = Unit
     fun terminalEngine(sessionId: UUID): TermuxTerminalEngine?
     fun historyEngine(historyObjectId: UUID): TermuxTerminalEngine?
     suspend fun stopSession(sessionId: UUID)
@@ -864,6 +867,7 @@ class UnavailableProductRepository : ProductRepository {
     override fun deleteRemoteDownloadRecord(recordId: UUID) = Unit
     override suspend fun openRemoteShell(pcId: UUID, path: String, shellType: RemoteShellType): UUID = unavailable()
     override suspend fun openSession(sessionId: UUID) = unavailable()
+    override suspend fun closeSessionView(sessionId: UUID) = Unit
     override fun terminalEngine(sessionId: UUID): TermuxTerminalEngine? = null
     override fun historyEngine(historyObjectId: UUID): TermuxTerminalEngine? = null
     override suspend fun stopSession(sessionId: UUID) = unavailable()

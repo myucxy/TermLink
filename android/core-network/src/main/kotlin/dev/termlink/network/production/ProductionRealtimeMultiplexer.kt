@@ -11,12 +11,19 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
+
+fun interface RealtimeAuthenticationRefresher {
+    suspend fun refreshAccessToken()
+}
 
 data class ProductionRealtimeMultiplexerDiagnostics(
     val phase: String,
@@ -50,6 +57,8 @@ interface ProductionRealtimeSessionTransport : Closeable {
 class ProductionRealtimeMultiplexer private constructor(
     private val socket: ProductionRealtimeSocket,
     parentScope: CoroutineScope,
+    private val authenticationRefresher: RealtimeAuthenticationRefresher,
+    private val authenticationFailureObserver: (Throwable) -> Unit,
 ) : Closeable {
     constructor(
         rootUrl: String,
@@ -59,6 +68,8 @@ class ProductionRealtimeMultiplexer private constructor(
         parentScope: CoroutineScope,
         httpClient: OkHttpClient = ProductionRealtimeClient.defaultHttpClient,
         allowCleartextForLocalTest: Boolean = false,
+        authenticationRefresher: RealtimeAuthenticationRefresher = RealtimeAuthenticationRefresher { },
+        authenticationFailureObserver: (Throwable) -> Unit = { },
     ) : this(
         socket = ProductionRealtimeClient(
             rootUrl = rootUrl,
@@ -70,6 +81,8 @@ class ProductionRealtimeMultiplexer private constructor(
             allowCleartextForLocalTest = allowCleartextForLocalTest,
         ),
         parentScope = parentScope,
+        authenticationRefresher = authenticationRefresher,
+        authenticationFailureObserver = authenticationFailureObserver,
     )
 
     private val scopeJob = SupervisorJob(parentScope.coroutineContext[Job])
@@ -79,6 +92,14 @@ class ProductionRealtimeMultiplexer private constructor(
     private val endpointLock = Any()
     private val endpoints = mutableMapOf<UUID, Endpoint>()
     private var socketPhase = SocketPhase.IDLE
+    private var authenticationRecoveryUsed = false
+    private var authenticationRecoveryJob: Job? = null
+    private val mutableState = MutableSharedFlow<RealtimeState>(
+        replay = 1,
+        extraBufferCapacity = 4,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    private val state: SharedFlow<RealtimeState> = mutableState.asSharedFlow()
     private val routeJob: Job
     private val stateJob: Job
 
@@ -88,16 +109,25 @@ class ProductionRealtimeMultiplexer private constructor(
         }
         stateJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
             socket.state.collect { state ->
-                synchronized(connectionLock) {
-                    if (!closed.get()) {
+                if (closed.get()) return@collect
+                if (state is RealtimeState.AuthenticationRejected) {
+                    handleAuthenticationRejected(state)
+                } else {
+                    synchronized(connectionLock) {
                         socketPhase = when (state) {
                             RealtimeState.Connecting -> SocketPhase.CONNECTING
-                            RealtimeState.Connected -> SocketPhase.CONNECTED
+                            RealtimeState.Connected -> {
+                                authenticationRecoveryUsed = false
+                                SocketPhase.CONNECTED
+                            }
                             is RealtimeState.Reconnecting -> SocketPhase.CONNECTING
+                            is RealtimeState.AuthenticationFailed -> SocketPhase.AUTHENTICATION_FAILED
                             is RealtimeState.Failed -> SocketPhase.FAILED
                             RealtimeState.Closed -> SocketPhase.CLOSED
+                            is RealtimeState.AuthenticationRejected -> error("handled above")
                         }
                     }
+                    mutableState.tryEmit(state)
                 }
             }
         }
@@ -117,6 +147,9 @@ class ProductionRealtimeMultiplexer private constructor(
         }
         removed.forEach(Endpoint::closeFromOwner)
         synchronized(connectionLock) { socketPhase = SocketPhase.CLOSED }
+        authenticationRecoveryJob?.cancel()
+        authenticationRecoveryJob = null
+        mutableState.tryEmit(RealtimeState.Closed)
         routeJob.cancel()
         stateJob.cancel()
         socket.close()
@@ -130,7 +163,9 @@ class ProductionRealtimeMultiplexer private constructor(
      */
     fun onNetworkAvailable() {
         val reconnect = synchronized(connectionLock) {
-            if (closed.get() || socketPhase == SocketPhase.CLOSED) {
+            if (closed.get() || socketPhase == SocketPhase.CLOSED ||
+                socketPhase == SocketPhase.AUTHENTICATING || socketPhase == SocketPhase.AUTHENTICATION_FAILED
+            ) {
                 false
             } else {
                 socketPhase = SocketPhase.FAILED
@@ -178,6 +213,55 @@ class ProductionRealtimeMultiplexer private constructor(
         if (shouldDisconnect) socket.disconnect(reason)
     }
 
+    private fun handleAuthenticationRejected(rejected: RealtimeState.AuthenticationRejected) {
+        val recover = synchronized(connectionLock) {
+            if (closed.get() || socketPhase == SocketPhase.CLOSED) {
+                null
+            } else if (authenticationRecoveryUsed) {
+                socketPhase = SocketPhase.AUTHENTICATION_FAILED
+                false
+            } else {
+                authenticationRecoveryUsed = true
+                socketPhase = SocketPhase.AUTHENTICATING
+                true
+            }
+        } ?: return
+        if (!recover) {
+            publishAuthenticationFailure(
+                IllegalStateException("realtime authentication was rejected after token refresh (HTTP ${rejected.status})"),
+            )
+            return
+        }
+        mutableState.tryEmit(RealtimeState.Reconnecting(1, "refreshing realtime authentication"))
+        authenticationRecoveryJob = scope.launch {
+            try {
+                authenticationRefresher.refreshAccessToken()
+            } catch (error: Throwable) {
+                if (!closed.get()) publishAuthenticationFailure(error)
+                return@launch
+            }
+            val reconnect = synchronized(connectionLock) {
+                if (closed.get() || socketPhase != SocketPhase.AUTHENTICATING) {
+                    false
+                } else {
+                    socketPhase = SocketPhase.FAILED
+                    true
+                }
+            }
+            if (reconnect) ensureConnected()
+        }
+    }
+
+    private fun publishAuthenticationFailure(error: Throwable) {
+        synchronized(connectionLock) {
+            if (!closed.get()) socketPhase = SocketPhase.AUTHENTICATION_FAILED
+        }
+        runCatching { authenticationFailureObserver(error) }
+        mutableState.tryEmit(
+            RealtimeState.AuthenticationFailed(error.message ?: "realtime authentication failed"),
+        )
+    }
+
     private fun route(received: ProductionReceivedEnvelope) {
         val sessionId = ProductionRealtimeClient.uuidFromBytes(received.envelope.sessionId.toByteArray())
         val endpoint = synchronized(endpointLock) { sessionId?.let(endpoints::get) }
@@ -203,7 +287,7 @@ class ProductionRealtimeMultiplexer private constructor(
         override val receivePressure: StateFlow<ProductionReceivePressure>
             get() = socket.receivePressure
         override val state: SharedFlow<RealtimeState>
-            get() = socket.state
+            get() = this@ProductionRealtimeMultiplexer.state
 
         override fun connect() {
             check(!endpointClosed.get()) { "production session transport is closed" }
@@ -243,6 +327,8 @@ class ProductionRealtimeMultiplexer private constructor(
         IDLE,
         CONNECTING,
         CONNECTED,
+        AUTHENTICATING,
+        AUTHENTICATION_FAILED,
         FAILED,
         CLOSED,
     }
@@ -258,6 +344,13 @@ class ProductionRealtimeMultiplexer private constructor(
         fun forTest(
             socket: ProductionRealtimeSocket,
             parentScope: CoroutineScope,
-        ): ProductionRealtimeMultiplexer = ProductionRealtimeMultiplexer(socket, parentScope)
+            authenticationRefresher: RealtimeAuthenticationRefresher = RealtimeAuthenticationRefresher { },
+            authenticationFailureObserver: (Throwable) -> Unit = { },
+        ): ProductionRealtimeMultiplexer = ProductionRealtimeMultiplexer(
+            socket,
+            parentScope,
+            authenticationRefresher,
+            authenticationFailureObserver,
+        )
     }
 }

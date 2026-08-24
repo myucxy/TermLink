@@ -34,16 +34,40 @@ class ProductNavigationPreferencesTest {
     }
 
     @Test
-    fun persistsSessionsDestinationAndSelectedSessionAcrossActivityRecreation() {
+    fun persistsOpenedTabsSelectedSessionAndExpandedPcsAcrossActivityRecreation() {
         val sessionId = UUID.randomUUID()
+        val secondSessionId = UUID.randomUUID()
+        val pcId = UUID.randomUUID()
 
         saveProductPrimaryDestination(context, ProductPrimaryDestination.SESSIONS)
-        saveSelectedProductSession(context, sessionId)
+        saveProductSessionTabs(
+            context,
+            listOf(sessionId.toString(), secondSessionId.toString()),
+            sessionId.toString(),
+        )
+        saveExpandedProductPcs(context, setOf(pcId.toString()))
 
         assertEquals(
-            ProductNavigationState(ProductPrimaryDestination.SESSIONS, sessionId.toString()),
+            ProductNavigationState(
+                primaryDestination = ProductPrimaryDestination.SESSIONS,
+                selectedSessionId = sessionId.toString(),
+                openedSessionIds = listOf(sessionId.toString(), secondSessionId.toString()),
+                expandedPcIds = setOf(pcId.toString()),
+            ),
             loadProductNavigationState(context),
         )
+    }
+
+    @Test
+    fun dropsASelectedSessionThatIsNotAnOpenedTab() {
+        val sessionId = UUID.randomUUID()
+
+        saveSelectedProductSession(context, sessionId)
+
+        val restored = loadProductNavigationState(context)
+
+        assertNull(restored.selectedSessionId)
+        assertEquals(emptyList<String>(), restored.openedSessionIds)
     }
 
     @Test
@@ -52,12 +76,16 @@ class ProductNavigationPreferencesTest {
             .edit()
             .putString("primary_destination", "REMOVED_DESTINATION")
             .putString("selected_session_id", "not-a-uuid")
+            .putString("opened_session_ids_v1", "[\"not-a-uuid\"]")
+            .putStringSet("expanded_pc_ids_v1", setOf("also-not-a-uuid"))
             .commit()
 
         val restored = loadProductNavigationState(context)
 
         assertEquals(ProductPrimaryDestination.DEVICES, restored.primaryDestination)
         assertNull(restored.selectedSessionId)
+        assertEquals(emptyList<String>(), restored.openedSessionIds)
+        assertEquals(emptySet<String>(), restored.expandedPcIds)
     }
 
     private companion object {

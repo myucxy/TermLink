@@ -15,7 +15,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-func TestAcquireResumesSameHolderAtomically(t *testing.T) {
+func TestAcquireSharesLeaseAcrossDevicesAtomically(t *testing.T) {
 	redisURL := strings.TrimSpace(os.Getenv("TERMLINK_INTEGRATION_REDIS_URL"))
 	if redisURL == "" {
 		t.Skip("TERMLINK_INTEGRATION_REDIS_URL is required for the real Valkey lease test")
@@ -32,7 +32,7 @@ func TestAcquireResumesSameHolderAtomically(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cleanupCancel()
-		_ = valkey.Client.Del(cleanupContext, leaseKey, leaseKey+":version").Err()
+		_ = valkey.Client.Del(cleanupContext, leaseKey, leaseKey+":version", leaseKey+":participants").Err()
 		_ = valkey.Close()
 	})
 
@@ -63,9 +63,13 @@ func TestAcquireResumesSameHolderAtomically(t *testing.T) {
 		t.Fatalf("resumed TTL = %s, want full 1.2s duration", ttl)
 	}
 
-	_, err = valkey.Acquire(ctx, sessionID, uuid.New(), time.Second)
-	if !errors.Is(err, ErrLeaseHeld) {
-		t.Fatalf("competing acquire error = %v, want ErrLeaseHeld", err)
+	secondHolderID := uuid.New()
+	shared, err := valkey.Acquire(ctx, sessionID, secondHolderID, time.Second)
+	if err != nil {
+		t.Fatalf("second device join: %v", err)
+	}
+	if shared.ID != initial.ID || shared.Version != initial.Version || shared.HolderDeviceID != holderID {
+		t.Fatalf("shared lease = %+v, want first holder and fence %+v", shared, initial)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
@@ -108,7 +112,7 @@ func TestAcquireConcurrentContendersCreateOneLease(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cleanupCancel()
-		_ = valkey.Client.Del(cleanupContext, leaseKey, leaseKey+":version").Err()
+		_ = valkey.Client.Del(cleanupContext, leaseKey, leaseKey+":version", leaseKey+":participants").Err()
 		_ = valkey.Close()
 	})
 
@@ -135,32 +139,157 @@ func TestAcquireConcurrentContendersCreateOneLease(t *testing.T) {
 	waitGroup.Wait()
 	close(results)
 
-	var winner Lease
+	var shared Lease
 	successes := 0
-	conflicts := 0
 	for result := range results {
-		switch {
-		case result.err == nil:
-			winner = result.lease
-			successes++
-		case errors.Is(result.err, ErrLeaseHeld):
-			conflicts++
-		default:
+		if result.err != nil {
 			t.Fatalf("unexpected acquire error: %v", result.err)
 		}
+		if successes == 0 {
+			shared = result.lease
+		} else if result.lease.ID != shared.ID || result.lease.Version != shared.Version || result.lease.HolderDeviceID != shared.HolderDeviceID {
+			t.Fatalf("concurrent acquire returned a different shared fence: first=%+v got=%+v", shared, result.lease)
+		}
+		successes++
 	}
-	if successes != 1 || conflicts != contenderCount-1 {
-		t.Fatalf("concurrent results: successes=%d conflicts=%d, want 1 and %d", successes, conflicts, contenderCount-1)
+	if successes != contenderCount {
+		t.Fatalf("concurrent successes=%d, want %d", successes, contenderCount)
 	}
-	if winner.Version != 1 {
-		t.Fatalf("winner version = %d, want 1", winner.Version)
+	if shared.Version != 1 {
+		t.Fatalf("shared version = %d, want 1", shared.Version)
 	}
 	version, err := valkey.Client.Get(ctx, leaseKey+":version").Int64()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != winner.Version {
-		t.Fatalf("stored version counter = %d, want %d; conflicts must not consume versions", version, winner.Version)
+	if version != shared.Version {
+		t.Fatalf("stored version counter = %d, want %d; joins must not consume versions", version, shared.Version)
+	}
+}
+
+func TestReleaseForDeviceRetainsSharedLeaseUntilLastParticipant(t *testing.T) {
+	redisURL := strings.TrimSpace(os.Getenv("TERMLINK_INTEGRATION_REDIS_URL"))
+	if redisURL == "" {
+		t.Skip("TERMLINK_INTEGRATION_REDIS_URL is required for the real Valkey shared release test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	valkey, err := Open(ctx, redisURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := uuid.New()
+	firstDevice, secondDevice := uuid.New(), uuid.New()
+	leaseKey := "lease:" + sessionID.String()
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cleanupCancel()
+		_ = valkey.Client.Del(cleanupContext, leaseKey, leaseKey+":version", leaseKey+":participants").Err()
+		_ = valkey.Close()
+	})
+
+	lease, err := valkey.Acquire(ctx, sessionID, firstDevice, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined, err := valkey.Acquire(ctx, sessionID, secondDevice, 5*time.Second)
+	if err != nil || joined.ID != lease.ID || joined.Version != lease.Version {
+		t.Fatalf("join lease=%+v error=%v, want fence %+v", joined, err, lease)
+	}
+	accepted, released, err := valkey.ReleaseForDevice(ctx, lease, firstDevice)
+	if err != nil || !accepted || released {
+		t.Fatalf("first release accepted/released/error=%v/%v/%v, want true/false/nil", accepted, released, err)
+	}
+	remaining, err := valkey.GetLease(ctx, sessionID)
+	if err != nil || remaining.ID != lease.ID || remaining.Version != lease.Version {
+		t.Fatalf("shared lease after first release=%+v error=%v", remaining, err)
+	}
+	if _, err := valkey.RenewForDevice(ctx, remaining, secondDevice, 5*time.Second); err != nil {
+		t.Fatalf("remaining device renew: %v", err)
+	}
+	accepted, released, err = valkey.ReleaseForDevice(ctx, remaining, secondDevice)
+	if err != nil || !accepted || !released {
+		t.Fatalf("last release accepted/released/error=%v/%v/%v, want true/true/nil", accepted, released, err)
+	}
+	if _, err := valkey.GetLease(ctx, sessionID); !errors.Is(err, redis.Nil) {
+		t.Fatalf("lease after final release error=%v, want redis.Nil", err)
+	}
+}
+
+func TestReleaseForDevicePrunesExpiredParticipants(t *testing.T) {
+	redisURL := strings.TrimSpace(os.Getenv("TERMLINK_INTEGRATION_REDIS_URL"))
+	if redisURL == "" {
+		t.Skip("TERMLINK_INTEGRATION_REDIS_URL is required for the real Valkey participant TTL test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	valkey, err := Open(ctx, redisURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := uuid.New()
+	firstDevice, secondDevice := uuid.New(), uuid.New()
+	leaseKey := "lease:" + sessionID.String()
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cleanupCancel()
+		_ = valkey.Client.Del(cleanupContext, leaseKey, leaseKey+":version", leaseKey+":participants").Err()
+		_ = valkey.Close()
+	})
+
+	lease, err := valkey.Acquire(ctx, sessionID, firstDevice, 400*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := valkey.Acquire(ctx, sessionID, secondDevice, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(600 * time.Millisecond)
+	accepted, released, err := valkey.ReleaseForDevice(ctx, lease, secondDevice)
+	if err != nil || !accepted || !released {
+		t.Fatalf("release after peer participant TTL accepted/released/error=%v/%v/%v", accepted, released, err)
+	}
+}
+
+func TestAcquireMigratesLegacyLeaseParticipantsWithoutChangingFence(t *testing.T) {
+	redisURL := strings.TrimSpace(os.Getenv("TERMLINK_INTEGRATION_REDIS_URL"))
+	if redisURL == "" {
+		t.Skip("TERMLINK_INTEGRATION_REDIS_URL is required for the real Valkey lease migration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	valkey, err := Open(ctx, redisURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := uuid.New()
+	legacyHolder, joiningDevice, leaseID := uuid.New(), uuid.New(), uuid.New()
+	leaseKey := "lease:" + sessionID.String()
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cleanupCancel()
+		_ = valkey.Client.Del(cleanupContext, leaseKey, leaseKey+":version", leaseKey+":participants").Err()
+		_ = valkey.Close()
+	})
+	legacyValue := legacyHolder.String() + "|" + leaseID.String() + "|7"
+	if err := valkey.Client.Set(ctx, leaseKey, legacyValue, 5*time.Second).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	shared, err := valkey.Acquire(ctx, sessionID, joiningDevice, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shared.HolderDeviceID != legacyHolder || shared.ID != leaseID || shared.Version != 7 {
+		t.Fatalf("legacy join changed fence: got %+v", shared)
+	}
+	accepted, released, err := valkey.ReleaseForDevice(ctx, shared, joiningDevice)
+	if err != nil || !accepted || released {
+		t.Fatalf("joining device release accepted/released/error=%v/%v/%v, want legacy holder retained", accepted, released, err)
+	}
+	accepted, released, err = valkey.ReleaseForDevice(ctx, shared, legacyHolder)
+	if err != nil || !accepted || !released {
+		t.Fatalf("legacy holder release accepted/released/error=%v/%v/%v", accepted, released, err)
 	}
 }
 

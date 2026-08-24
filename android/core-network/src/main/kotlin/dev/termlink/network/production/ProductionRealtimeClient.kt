@@ -45,6 +45,8 @@ sealed interface RealtimeState {
     data object Connecting : RealtimeState
     data object Connected : RealtimeState
     data class Reconnecting(val attempt: Int, val reason: String? = null) : RealtimeState
+    data class AuthenticationRejected(val status: Int, val reason: String) : RealtimeState
+    data class AuthenticationFailed(val reason: String) : RealtimeState
     data class Failed(val reason: String) : RealtimeState
     data object Closed : RealtimeState
 }
@@ -190,7 +192,11 @@ class ProductionRealtimeClient(
             return
         }
         synchronized(sendLock) {
-            if (!closed.get() && generation.get() == nextGeneration) socket = opened else opened.cancel()
+            if (!closed.get() && generation.get() == nextGeneration && (socket == null || socket === opened)) {
+                socket = opened
+            } else {
+                opened.cancel()
+            }
         }
     }
 
@@ -347,9 +353,21 @@ class ProductionRealtimeClient(
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            if (!isCurrent(webSocket) || closed.get()) return
+            if (!isCurrent(webSocket) || closed.get()) {
+                response?.close()
+                return
+            }
             acceptingBinary = false
-            mutableState.tryEmit(RealtimeState.Failed(t.message ?: "realtime failed"))
+            val status = response?.code
+            val reason = t.message ?: "realtime failed"
+            response?.close()
+            mutableState.tryEmit(
+                if (status == 401 || status == 403) {
+                    RealtimeState.AuthenticationRejected(status, reason)
+                } else {
+                    RealtimeState.Failed(reason)
+                },
+            )
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
@@ -362,8 +380,21 @@ class ProductionRealtimeClient(
             if (isCurrent(webSocket)) webSocket.close(code, reason)
         }
 
-        private fun isCurrent(webSocket: WebSocket): Boolean =
-            !closed.get() && generation.get() == listenerGeneration && socket === webSocket
+        /**
+         * OkHttp is allowed to invoke a listener on its dispatcher before
+         * newWebSocket returns to [connect]. Let that first callback claim the
+         * current generation instead of dropping the only failure signal.
+         */
+        private fun isCurrent(webSocket: WebSocket): Boolean = synchronized(sendLock) {
+            if (closed.get() || generation.get() != listenerGeneration) return@synchronized false
+            when (val active = socket) {
+                null -> {
+                    socket = webSocket
+                    true
+                }
+                else -> active === webSocket
+            }
+        }
     }
 
     private fun reserveIncoming(wireBytes: Int, pressureGeneration: Int): Boolean {
@@ -435,6 +466,8 @@ class ProductionRealtimeClient(
         RealtimeState.Connecting -> "CONNECTING"
         RealtimeState.Connected -> "CONNECTED"
         is RealtimeState.Reconnecting -> "RECONNECTING"
+        is RealtimeState.AuthenticationRejected -> "AUTHENTICATION_REJECTED"
+        is RealtimeState.AuthenticationFailed -> "AUTHENTICATION_FAILED"
         is RealtimeState.Failed -> "FAILED"
         RealtimeState.Closed -> "CLOSED"
         null -> "IDLE"

@@ -138,11 +138,11 @@ internal object ProductResponseParser {
         getValue(name).jsonObject
 }
 
-internal class TokenRefreshCoordinator(private val refresh: suspend () -> String) {
+internal class TokenRefreshCoordinator(private val refresh: suspend (force: Boolean) -> String) {
     private val mutex = Mutex()
 
-    suspend fun freshAccessToken(): String = mutex.withLock {
-        refresh().also { value ->
+    suspend fun freshAccessToken(force: Boolean = false): String = mutex.withLock {
+        refresh(force).also { value ->
             require(value.isNotBlank()) { "OIDC access token is unavailable" }
         }
     }

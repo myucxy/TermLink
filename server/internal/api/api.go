@@ -522,12 +522,74 @@ func (a *API) revokeDevice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 400, "INVALID_DEVICE_ID", err)
 		return
 	}
-	if err := a.Store.RevokeDevice(r.Context(), p.UserID, p.Device.ID, target, traceID(r.Context())); err != nil {
+	pcs, err := a.Store.ListPCs(r.Context(), p.UserID, p.Device.ID)
+	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
+	leaseSessionIDs := make(map[uuid.UUID]struct{})
+	for _, pc := range pcs {
+		sessions, listErr := a.Store.ListSessionsIncludingEnded(r.Context(), p.UserID, p.Device.ID, pc.ID)
+		if listErr != nil {
+			writeStoreError(w, r, listErr)
+			return
+		}
+		for _, session := range sessions {
+			leaseSessionIDs[session.ID] = struct{}{}
+		}
+	}
+	trace := traceID(r.Context())
+	// A self-revoking actor cannot authorize the exact durable-fence delete
+	// after its trust row changes. Remove its shared-lease participation first;
+	// another participant's lease remains untouched.
+	if target == p.Device.ID {
+		for sessionID := range leaseSessionIDs {
+			if err := a.releaseLeaseParticipant(r.Context(), p.UserID, p.Device.ID, target, sessionID, trace); err != nil {
+				writeError(w, r, http.StatusServiceUnavailable, "LEASE_UNAVAILABLE", err)
+				return
+			}
+		}
+	}
+	if err := a.Store.RevokeDevice(r.Context(), p.UserID, p.Device.ID, target, trace); err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	if target != p.Device.ID {
+		for sessionID := range leaseSessionIDs {
+			if err := a.releaseLeaseParticipant(r.Context(), p.UserID, p.Device.ID, target, sessionID, trace); err != nil {
+				// Revocation is already durable and Relay authorization fails closed.
+				// Keep the successful security response stable; the short Valkey TTL
+				// is the fallback if this best-effort reconciliation is unavailable.
+				slog.Warn("remove revoked device from shared lease", "trace_id", trace, "target_device_id", target, "session_id", sessionID, "error", err)
+			}
+		}
+	}
 	_ = a.Valkey.Client.Publish(r.Context(), "device-revoked", target.String()).Err()
 	writeJSON(w, 200, map[string]any{"status": "REVOKED"})
+}
+
+func (a *API) releaseLeaseParticipant(
+	ctx context.Context,
+	userID, actorID, deviceID, sessionID uuid.UUID,
+	trace string,
+) error {
+	lease, err := a.Valkey.GetLease(ctx, sessionID)
+	if errors.Is(err, redis.Nil) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, released, err := a.Valkey.ReleaseForDevice(ctx, lease, deviceID)
+	if err != nil || !released {
+		return err
+	}
+	// Delete only the exact durable fence observed before the CAS release. A
+	// replacement lease acquired after that release must survive reconciliation.
+	return a.Store.DeleteLease(
+		ctx, userID, actorID, sessionID, lease.ID,
+		"lease.revoke.permission", trace,
+	)
 }
 
 func (a *API) listPCs(w http.ResponseWriter, r *http.Request) {
@@ -608,11 +670,12 @@ func (a *API) putGrant(w http.ResponseWriter, r *http.Request) {
 		// a Valkey lease behind until its TTL expires.
 		if sessions, listErr := a.Store.ListSessionsIncludingEnded(r.Context(), p.UserID, p.Device.ID, pcID); listErr == nil {
 			for _, session := range sessions {
-				lease, leaseErr := a.Valkey.GetLease(r.Context(), session.ID)
-				if leaseErr == nil && lease.HolderDeviceID == deviceID {
-					_, _ = a.Valkey.Release(r.Context(), lease)
+				if releaseErr := a.releaseLeaseParticipant(r.Context(), p.UserID, p.Device.ID, deviceID, session.ID, traceID(r.Context())); releaseErr != nil {
+					slog.Warn("remove downgraded device from shared lease", "trace_id", traceID(r.Context()), "target_device_id", deviceID, "session_id", session.ID, "error", releaseErr)
 				}
 			}
+		} else {
+			slog.Warn("list sessions for grant downgrade lease cleanup", "trace_id", traceID(r.Context()), "target_device_id", deviceID, "pc_id", pcID, "error", listErr)
 		}
 	}
 	_ = a.Valkey.Client.Publish(r.Context(), "device-authorization-changed", deviceID.String()).Err()
@@ -640,9 +703,8 @@ func (a *API) deleteGrant(w http.ResponseWriter, r *http.Request) {
 	// unavailable. Best-effort CAS release prevents a removed controller from
 	// blocking another device while never releasing a newly acquired lease.
 	for _, sessionID := range result.LeaseSessionIDs {
-		lease, leaseErr := a.Valkey.GetLease(r.Context(), sessionID)
-		if leaseErr == nil && lease.HolderDeviceID == deviceID {
-			_, _ = a.Valkey.Release(r.Context(), lease)
+		if releaseErr := a.releaseLeaseParticipant(r.Context(), p.UserID, p.Device.ID, deviceID, sessionID, traceID(r.Context())); releaseErr != nil {
+			slog.Warn("remove grant-revoked device from shared lease", "trace_id", traceID(r.Context()), "target_device_id", deviceID, "session_id", sessionID, "error", releaseErr)
 		}
 	}
 	_ = a.Valkey.Client.Publish(r.Context(), "device-authorization-changed", deviceID.String()).Err()
@@ -808,7 +870,7 @@ func (a *API) acquireLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.Store.SaveLease(r.Context(), p.UserID, p.Device.ID, lease.ID, lease.SessionID, lease.HolderDeviceID, lease.ExpiresAt, lease.Version, "lease.acquire", traceID(r.Context())); err != nil {
-		_, _ = a.Valkey.Release(r.Context(), lease)
+		_, _, _ = a.Valkey.ReleaseForDevice(r.Context(), lease, p.Device.ID)
 		writeStoreError(w, r, err)
 		return
 	}
@@ -900,9 +962,14 @@ func (a *API) renewLease(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, 503, "LEASE_UNAVAILABLE", leaseErr)
 			return
 		}
-		if leaseErr == nil && existing.ID == leaseID && existing.HolderDeviceID == p.Device.ID {
-			if _, releaseErr := a.Valkey.Release(r.Context(), existing); releaseErr != nil {
+		if leaseErr == nil && existing.ID == leaseID {
+			accepted, released, releaseErr := a.Valkey.ReleaseForDevice(r.Context(), existing, p.Device.ID)
+			if releaseErr != nil {
 				writeError(w, r, 503, "LEASE_UNAVAILABLE", releaseErr)
+				return
+			}
+			if accepted && !released {
+				writeError(w, r, 403, "CONTROL_NOT_GRANTED", store.ErrDenied)
 				return
 			}
 		}
@@ -926,11 +993,11 @@ func (a *API) renewLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 503, "LEASE_UNAVAILABLE", err)
 		return
 	}
-	if lease.ID != leaseID || lease.HolderDeviceID != p.Device.ID {
+	if lease.ID != leaseID {
 		writeError(w, r, 409, "LEASE_NOT_HELD", store.ErrConflict)
 		return
 	}
-	lease, err = a.Valkey.Renew(r.Context(), lease, 30*time.Second)
+	lease, err = a.Valkey.RenewForDevice(r.Context(), lease, p.Device.ID, 30*time.Second)
 	if err != nil {
 		writeError(w, r, 409, "LEASE_NOT_HELD", err)
 		return
@@ -939,9 +1006,9 @@ func (a *API) renewLease(w http.ResponseWriter, r *http.Request) {
 		// Valkey is the live arbitration point, but PostgreSQL is the durable
 		// fencing record. Do not leave a newly extended cache lease active when
 		// its durable renewal was rejected or could not be committed.
-		if released, releaseErr := a.Valkey.Release(r.Context(), lease); releaseErr != nil {
+		if accepted, released, releaseErr := a.Valkey.ReleaseForDevice(r.Context(), lease, p.Device.ID); releaseErr != nil {
 			slog.Warn("roll back lease renewal in Valkey", "error", releaseErr)
-		} else if released {
+		} else if accepted && released {
 			if deleteErr := a.Store.DeleteLease(r.Context(), p.UserID, p.Device.ID, sessionID, leaseID, "", traceID(r.Context())); deleteErr != nil {
 				slog.Warn("roll back durable lease renewal", "error", deleteErr)
 			}
@@ -955,6 +1022,15 @@ func (a *API) releaseLease(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
 	sessionID, leaseID, ok := parseLeasePath(w, r)
 	if !ok {
+		return
+	}
+	permission, err := a.Store.SessionPermission(r.Context(), p.UserID, p.Device.ID, sessionID)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	if permission != "CONTROL" && permission != "MANAGE" {
+		writeError(w, r, 403, "CONTROL_NOT_GRANTED", store.ErrDenied)
 		return
 	}
 	lease, err := a.Valkey.GetLease(r.Context(), sessionID)
@@ -973,18 +1049,20 @@ func (a *API) releaseLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 503, "LEASE_UNAVAILABLE", err)
 		return
 	}
-	if lease.ID != leaseID || lease.HolderDeviceID != p.Device.ID {
+	if lease.ID != leaseID {
 		writeError(w, r, 409, "LEASE_NOT_HELD", store.ErrConflict)
 		return
 	}
-	released, err := a.Valkey.Release(r.Context(), lease)
-	if err != nil || !released {
+	accepted, released, err := a.Valkey.ReleaseForDevice(r.Context(), lease, p.Device.ID)
+	if err != nil || !accepted {
 		writeError(w, r, 409, "LEASE_NOT_HELD", err)
 		return
 	}
-	if err := a.Store.DeleteLease(r.Context(), p.UserID, p.Device.ID, sessionID, leaseID, "lease.release", traceID(r.Context())); err != nil {
-		writeStoreError(w, r, err)
-		return
+	if released {
+		if err := a.Store.DeleteLease(r.Context(), p.UserID, p.Device.ID, sessionID, leaseID, "lease.release", traceID(r.Context())); err != nil {
+			writeStoreError(w, r, err)
+			return
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

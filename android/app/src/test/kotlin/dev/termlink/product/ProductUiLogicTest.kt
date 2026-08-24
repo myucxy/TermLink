@@ -82,6 +82,17 @@ class ProductUiLogicTest {
     }
 
     @Test
+    fun sessionTabsOpenOnlyForOnlineNonExitedCatalogEntries() {
+        val id = UUID.fromString("00000000-0000-0000-0000-000000000031")
+        val online = session(id, SessionState.RUNNING, Instant.EPOCH, online = true)
+
+        assertTrue(isSessionTabOpenable(online))
+        assertFalse(isSessionTabOpenable(online.copy(online = false)))
+        assertFalse(isSessionTabOpenable(online.copy(state = SessionState.EXITED, online = true)))
+        assertFalse(isSessionTabOpenable(null))
+    }
+
+    @Test
     fun onlineCloseAndOfflineRecordDeletionAreDistinctActions() {
         assertEquals(
             DeviceSessionDestructiveAction.CLOSE_ONLINE,

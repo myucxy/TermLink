@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text;
 using System.Threading;
 
 namespace TermLink.Agent
@@ -192,6 +193,7 @@ namespace TermLink.Agent
                     service = candidate;
                     startupStage = "ready";
                 }
+                WriteRuntimeDiagnostic("ready", null);
                 SignalStartupCompleted();
                 candidate.Run();
             }
@@ -202,6 +204,7 @@ namespace TermLink.Agent
                     lastFailure = error;
                     startupStage = "failed: " + error.GetType().Name;
                 }
+                WriteRuntimeDiagnostic("failed", error);
                 SignalStartupCompleted();
             }
             finally
@@ -231,6 +234,7 @@ namespace TermLink.Agent
                             if (lastFailure == null) lastFailure = error;
                             startupStage = "stopped with cleanup error: " + error.GetType().Name;
                         }
+                        WriteRuntimeDiagnostic("cleanup failed", error);
                     }
                 }
                 if (ownsInstance)
@@ -245,6 +249,29 @@ namespace TermLink.Agent
         private void SetStartupStage(string value)
         {
             lock (sync) startupStage = value;
+            WriteRuntimeDiagnostic(value, null);
+        }
+
+        private static void WriteRuntimeDiagnostic(string stage, Exception error)
+        {
+            try
+            {
+                var root = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "TermLink", "logs");
+                Directory.CreateDirectory(root);
+                var entry = DateTime.UtcNow.ToString("O") +
+                    " background-runtime stage=" + stage + Environment.NewLine;
+                if (error != null) entry += error + Environment.NewLine;
+                File.AppendAllText(
+                    Path.Combine(root, "TermLink-background-runtime.log"),
+                    entry,
+                    new UTF8Encoding(false));
+            }
+            catch
+            {
+                // Runtime diagnostics must never become a startup dependency.
+            }
         }
 
         private void SignalStartupCompleted()

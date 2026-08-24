@@ -3,7 +3,11 @@ package dev.termlink.session
 import dev.termlink.terminal.api.TerminalSize
 import java.util.UUID
 
-/** Proof that the renderer already contains every ordered event through [sequence]. */
+/**
+ * Declares the cursor and generation installed before realtime starts.
+ * All states except [TailOnly] prove the renderer contains the corresponding
+ * prefix; [TailOnly] explicitly records that the historical prefix was skipped.
+ */
 sealed interface RendererBootstrapState {
     val sequence: Long
     val rendererGeneration: Long
@@ -25,6 +29,21 @@ sealed interface RendererBootstrapState {
     ) : RendererBootstrapState {
         init {
             require(sequence > 0) { "full renderer prefix must be non-empty" }
+            require(rendererGeneration > 0) { "renderer generation must be positive" }
+        }
+    }
+
+    /**
+     * A deliberately blank renderer anchored at the authoritative directory
+     * tail. Historical output is absent, but new ordered events can continue
+     * from [sequence] without replaying an unavailable prefix.
+     */
+    data class TailOnly(
+        override val sequence: Long,
+        override val rendererGeneration: Long,
+    ) : RendererBootstrapState {
+        init {
+            require(sequence >= 0) { "tail-only cursor must not be negative" }
             require(rendererGeneration > 0) { "renderer generation must be positive" }
         }
     }

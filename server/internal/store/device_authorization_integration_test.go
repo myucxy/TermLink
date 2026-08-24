@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -205,12 +206,13 @@ func TestDeviceAuthorizationMatrix(t *testing.T) {
 	if err := repository.PutGrant(ctx, userID, manageActor, manageTarget, pcOwner, "VIEW", nil, "matrix-manager-downgrade-grant"); err != nil {
 		t.Fatalf("valid MANAGE PutGrant downgrade: %v", err)
 	}
-	assertMatrixLeaseRemoved(t, repository, ctx, grantLeaseSession)
-	assertMatrixLeaseRevocationOutbox(t, repository, ctx, grantLeaseSession, manageTarget, replacementLeaseID, 2)
+	assertMatrixLeaseRetained(t, repository, ctx, grantLeaseSession, replacementLeaseID, 2)
+	assertMatrixLeaseRevocationOutbox(t, repository, ctx, grantLeaseSession, manageTarget, replacementLeaseID, 2, 0)
 	assertMatrixOutboxEvent(t, repository, ctx, "grant.updated", manageTarget, 2)
 
-	// Recreate a CONTROL grant and durable lease so DeleteGrant independently
-	// proves that it commits the exact lease revocation alongside the grant.
+	// Recreate a CONTROL grant and advance the durable fence. DeleteGrant must
+	// return affected sessions for participant cleanup without deleting the
+	// account-shared durable lease.
 	if err := repository.PutGrant(ctx, userID, manageActor, manageTarget, pcOwner, "CONTROL", nil, "matrix-manager-restore-grant"); err != nil {
 		t.Fatalf("valid MANAGE PutGrant restore: %v", err)
 	}
@@ -226,7 +228,7 @@ func TestDeviceAuthorizationMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("valid MANAGE DeleteGrant: %v", err)
 	}
-	if deletedGrant.KeyEpoch != epochBeforeGrantDelete+1 || len(deletedGrant.LeaseSessionIDs) != 1 || deletedGrant.LeaseSessionIDs[0] != grantLeaseSession {
+	if deletedGrant.KeyEpoch != epochBeforeGrantDelete+1 || !slices.Contains(deletedGrant.LeaseSessionIDs, grantLeaseSession) {
 		t.Fatalf("DeleteGrant result=%+v", deletedGrant)
 	}
 	var remainingGrant, remainingLease int
@@ -236,10 +238,11 @@ func TestDeviceAuthorizationMatrix(t *testing.T) {
 	if err := repository.Pool.QueryRow(ctx, `SELECT count(*) FROM control_leases WHERE session_id=$1`, grantLeaseSession).Scan(&remainingLease); err != nil {
 		t.Fatal(err)
 	}
-	if remainingGrant != 0 || remainingLease != 0 {
+	if remainingGrant != 0 || remainingLease != 1 {
 		t.Fatalf("DeleteGrant retained grant=%d lease=%d", remainingGrant, remainingLease)
 	}
-	assertMatrixLeaseRevocationOutbox(t, repository, ctx, grantLeaseSession, manageTarget, deleteLeaseID, 3)
+	assertMatrixLeaseRetained(t, repository, ctx, grantLeaseSession, deleteLeaseID, 3)
+	assertMatrixLeaseRevocationOutbox(t, repository, ctx, grantLeaseSession, manageTarget, deleteLeaseID, 3, 0)
 	assertMatrixOutboxEvent(t, repository, ctx, "grant.revoked", manageTarget, 1)
 	if _, err := repository.DeleteGrant(ctx, userID, manageActor, manageTarget, pcOwner, "matrix-repeat-delete-grant"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("repeat DeleteGrant error=%v, want ErrNotFound", err)
@@ -276,8 +279,9 @@ func TestDeviceAuthorizationMatrix(t *testing.T) {
 	}
 
 	// Self-revocation is always allowed for a trusted actor. Give the device a
-	// route grant and live durable lease so the revoke exercises grant cleanup,
-	// exact lease outbox delivery, and epoch work in one transaction.
+	// route grant and live durable lease so the revoke exercises grant cleanup
+	// and epoch work without treating the compatibility holder as exclusive
+	// ownership of an account-shared lease.
 	insertMatrixGrant(t, repository, ctx, selfTarget, pcOwner, "CONTROL", nil, bootstrapPC)
 	selfLeaseID := uuid.New()
 	if err := repository.SaveLease(ctx, userID, selfTarget, selfLeaseID, grantLeaseSession, selfTarget, time.Now().UTC().Add(30*time.Second), 4, "", "matrix-self-revoke-lease"); err != nil {
@@ -286,8 +290,8 @@ func TestDeviceAuthorizationMatrix(t *testing.T) {
 	if err := repository.RevokeDevice(ctx, userID, selfActor, selfTarget, "matrix-self-revoke"); err != nil {
 		t.Fatalf("self revoke: %v", err)
 	}
-	assertMatrixLeaseRemoved(t, repository, ctx, grantLeaseSession)
-	assertMatrixLeaseRevocationOutbox(t, repository, ctx, grantLeaseSession, selfTarget, selfLeaseID, 4)
+	assertMatrixLeaseRetained(t, repository, ctx, grantLeaseSession, selfLeaseID, 4)
+	assertMatrixLeaseRevocationOutbox(t, repository, ctx, grantLeaseSession, selfTarget, selfLeaseID, 4, 0)
 	assertMatrixOutboxEvent(t, repository, ctx, "device.revoked", selfTarget, 1)
 
 	// The bootstrap PC may revoke a later PC. The PC route is disabled and its
@@ -391,7 +395,19 @@ func assertMatrixLeaseRemoved(t *testing.T, repository *Postgres, ctx context.Co
 	}
 }
 
-func assertMatrixLeaseRevocationOutbox(t *testing.T, repository *Postgres, ctx context.Context, sessionID, holderID, leaseID uuid.UUID, version int64) {
+func assertMatrixLeaseRetained(t *testing.T, repository *Postgres, ctx context.Context, sessionID, leaseID uuid.UUID, version int64) {
+	t.Helper()
+	var storedLeaseID uuid.UUID
+	var storedVersion int64
+	if err := repository.Pool.QueryRow(ctx, `SELECT lease_id,version FROM control_leases WHERE session_id=$1`, sessionID).Scan(&storedLeaseID, &storedVersion); err != nil {
+		t.Fatal(err)
+	}
+	if storedLeaseID != leaseID || storedVersion != version {
+		t.Fatalf("session %s lease/version=%s/%d, want %s/%d", sessionID, storedLeaseID, storedVersion, leaseID, version)
+	}
+}
+
+func assertMatrixLeaseRevocationOutbox(t *testing.T, repository *Postgres, ctx context.Context, sessionID, holderID, leaseID uuid.UUID, version int64, want int) {
 	t.Helper()
 	var count int
 	if err := repository.Pool.QueryRow(ctx, `
@@ -404,8 +420,8 @@ func assertMatrixLeaseRevocationOutbox(t *testing.T, repository *Postgres, ctx c
 		sessionID.String(), holderID.String(), leaseID.String(), version).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("lease revocation outbox count=%d for session=%s lease=%s version=%d, want 1", count, sessionID, leaseID, version)
+	if count != want {
+		t.Fatalf("lease revocation outbox count=%d for session=%s lease=%s version=%d, want %d", count, sessionID, leaseID, version, want)
 	}
 }
 

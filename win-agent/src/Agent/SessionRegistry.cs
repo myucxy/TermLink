@@ -1485,6 +1485,10 @@ namespace TermLink.Agent
                             response = Response(false, "OPERATION_TIMEOUT", 0);
                         }
 #if TERMLINK_PRODUCTION_RUNTIME
+                        catch (ProductionReauthenticationRequiredException)
+                        {
+                            response = Response(false, "ACCOUNT_REAUTH_REQUIRED", 0);
+                        }
                         catch (System.Net.Http.HttpRequestException)
                         {
                             response = Response(false, "PRODUCTION_REQUEST_FAILED", 0);
@@ -1606,7 +1610,14 @@ namespace TermLink.Agent
                 case RegistryCommand.RefreshProductionStatus:
 #if TERMLINK_PRODUCTION_RUNTIME
                     if (productionRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
-                    productionRuntime.GetStatus(true);
+                    try
+                    {
+                        productionRuntime.GetStatus(true);
+                    }
+                    catch (ProductionReauthenticationRequiredException)
+                    {
+                        return Response(false, "ACCOUNT_REAUTH_REQUIRED", 0);
+                    }
                     return Response(true, "PRODUCTION_STATUS_REFRESHED", 0);
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);

@@ -176,6 +176,9 @@ func TestSameAccountDirectAccess(t *testing.T) {
 	if err := repository.SaveLease(ctx, userID, crossAndroid.ID, uuid.New(), sessionID, crossAndroid.ID, leaseExpiry, 2, "lease.acquire", "same-account-cross-acquire"); err == nil {
 		t.Fatal("cross-account durable lease acquisition unexpectedly succeeded")
 	}
+	if err := repository.SaveLease(ctx, userID, crossAndroid.ID, leaseID, sessionID, android.ID, leaseExpiry.Add(time.Second), 1, "", "same-account-cross-refresh"); err == nil {
+		t.Fatal("cross-account actor unexpectedly refreshed the existing shared lease")
+	}
 	if err := repository.Pool.QueryRow(ctx, `SELECT holder_device_id,lease_id FROM control_leases WHERE session_id=$1`, sessionID).Scan(&storedHolder, &storedLease); err != nil {
 		t.Fatal(err)
 	}
@@ -187,8 +190,8 @@ func TestSameAccountDirectAccess(t *testing.T) {
 	}
 
 	// A second same-account Android has implicit MANAGE authority without a
-	// grant. Its revoke must immediately rotate every affected account PC and
-	// remove the target's durable lease.
+	// grant. Revoking one Android rotates affected account PCs but must not
+	// mistake the shared lease's compatibility holder for exclusive ownership.
 	managerID := uuid.New()
 	_, managerAndroid, _, err := repository.RegisterDevice(ctx, subject, sameAccountRegisterInput(managerID, "ANDROID", "Direct Manager Android"), "same-account-register-manager")
 	if err != nil {
@@ -203,6 +206,17 @@ func TestSameAccountDirectAccess(t *testing.T) {
 	}
 	if explicitGrants != 0 {
 		t.Fatalf("automatic access created %d explicit grants, want 0", explicitGrants)
+	}
+	sharedExpiry := leaseExpiry.Add(10 * time.Second)
+	if err := repository.SaveLease(ctx, userID, managerAndroid.ID, leaseID, sessionID, android.ID, sharedExpiry, 1, "", "same-account-shared-refresh"); err != nil {
+		t.Fatalf("second same-account Android refresh shared lease: %v", err)
+	}
+	var storedExpiry time.Time
+	if err := repository.Pool.QueryRow(ctx, `SELECT holder_device_id,lease_id,expires_at FROM control_leases WHERE session_id=$1`, sessionID).Scan(&storedHolder, &storedLease, &storedExpiry); err != nil {
+		t.Fatal(err)
+	}
+	if storedHolder != android.ID || storedLease != leaseID || storedExpiry.Before(sharedExpiry.Add(-time.Millisecond)) {
+		t.Fatalf("shared refresh changed fence or failed to extend expiry: holder/id/expiry=%s/%s/%s", storedHolder, storedLease, storedExpiry)
 	}
 
 	deleteSessionID := uuid.New()
@@ -276,8 +290,8 @@ func TestSameAccountDirectAccess(t *testing.T) {
 	if err := repository.Pool.QueryRow(ctx, `SELECT count(*) FROM control_leases WHERE session_id=$1`, sessionID).Scan(&remainingLease); err != nil {
 		t.Fatal(err)
 	}
-	if revokedState != "REVOKED" || epochAfterRevoke != epochBeforeRevoke+1 || remainingLease != 0 {
-		t.Fatalf("revocation state/epoch/lease=%s/%d/%d, want REVOKED/%d/0", revokedState, epochAfterRevoke, remainingLease, epochBeforeRevoke+1)
+	if revokedState != "REVOKED" || epochAfterRevoke != epochBeforeRevoke+1 || remainingLease != 1 {
+		t.Fatalf("revocation state/epoch/lease=%s/%d/%d, want REVOKED/%d/1", revokedState, epochAfterRevoke, remainingLease, epochBeforeRevoke+1)
 	}
 
 	gotEpoch, recipients, err = repository.ListPCGrants(ctx, userID, windows.ID, pcID)
@@ -301,6 +315,9 @@ func TestSameAccountDirectAccess(t *testing.T) {
 	}
 	if err := repository.SaveLease(ctx, userID, android.ID, uuid.New(), sessionID, android.ID, leaseExpiry, 2, "lease.acquire", "same-account-revoked-acquire"); err == nil {
 		t.Fatal("revoked device durable lease acquisition unexpectedly succeeded")
+	}
+	if err := repository.ForceDeleteLease(ctx, userID, managerAndroid.ID, sessionID, leaseID, 1, "lease.force_release", "same-account-shared-force-release"); err != nil {
+		t.Fatalf("manager force release shared lease: %v", err)
 	}
 	replacementLeaseID := uuid.New()
 	if err := repository.SaveLease(ctx, userID, managerAndroid.ID, replacementLeaseID, sessionID, managerAndroid.ID, leaseExpiry, 1, "", "same-account-revoked-force-fixture"); err != nil {
