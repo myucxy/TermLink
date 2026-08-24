@@ -69,6 +69,7 @@ Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当�
 - [生产级多端交互 UI 原型](ui-prototypes/index.html)
 - [产品需求与技术方案](docs/PRODUCT_REQUIREMENTS_AND_SOLUTION.md)
 - [阶段 0 技术验证与 Windows Terminal Android 移植评估](docs/TECHNICAL_VALIDATION.md)
+- [内存 Relay 与生产 Protobuf E2E 技术验证模块](technical-validation/e2e/README.md)
 - [Android 全功能 Terminal 引擎调研与技术方案](docs/ANDROID_TERMINAL_ENGINE_RESEARCH.md)
 - [ConPTY 可运行原型](prototypes/conpty-probe/README.md)
 - [.NET 8 Windows Agent、SessionHost 与 Tray](win-agent/README.md)

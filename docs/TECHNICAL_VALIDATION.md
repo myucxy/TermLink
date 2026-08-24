@@ -24,6 +24,10 @@
 
 GitHub 候选引擎、Windows Terminal 配色映射和 Android 端最终架构见 [Android 全功能 Terminal 引擎调研与技术方案](ANDROID_TERMINAL_ENGINE_RESEARCH.md)。
 
+旧 `TermLink-E2E` 工作副本中仍有效的内存 Relay 与生产 Protobuf 替身客户端已经精简迁入
+[E2E 技术验证模块](../technical-validation/e2e/README.md)。该模块不复制 Android、Windows
+或 Termux 产品源码，并明确不把协议替身测试当作真实产品端到端证据。
+
 ## 2. Windows ConPTY 实机验证
 
 ### 2.1 验证环境

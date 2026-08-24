@@ -1,0 +1,21 @@
+name: termlink-technical-validation-e2e
+
+services:
+  relay:
+    image: termlink-e2e-technical-validation:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      TERMLINK_E2E_ADDR: "0.0.0.0:8080"
+      TERMLINK_E2E_TOKEN: "${TERMLINK_E2E_TOKEN:-termlink-e2e-local-token-v1}"
+    ports:
+      - "127.0.0.1:${TERMLINK_E2E_PORT:-18080}:8080"
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: "no"
+    stop_grace_period: 15s

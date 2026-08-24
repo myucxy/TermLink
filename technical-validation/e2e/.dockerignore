@@ -1,0 +1,6 @@
+.git/
+.work/
+protocol-client/
+*.md
+*.ps1
+compose.yml
