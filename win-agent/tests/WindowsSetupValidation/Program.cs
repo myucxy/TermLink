@@ -31,6 +31,7 @@ namespace TermLink.Setup.Validation
                 ValidateInstalledLaunchVersionIdentity(temporaryRoot);
                 ValidateLaunchHealthIsProcessBound();
                 ValidateUpgradeTerminationConsent();
+                ValidateUpgradeTerminationPrompt();
                 ValidateServiceImagePathParsing();
                 ValidateRunningProcessDiscoveryAndTermination(temporaryRoot);
                 ValidateTransientDirectoryLockRetry(temporaryRoot);
@@ -125,6 +126,31 @@ namespace TermLink.Setup.Validation
             Assert(summary.Contains("TermLink.Agent", StringComparison.Ordinal) &&
                 summary.Contains("PID 5678", StringComparison.Ordinal),
                 "The interactive upgrade prompt summary is incomplete.");
+        }
+
+        private static void ValidateUpgradeTerminationPrompt()
+        {
+            var running = new[]
+            {
+                new RunningTermLinkProcess(
+                    2468,
+                    "TermLink.SessionHost",
+                    "C:\\TermLink\\TermLink.SessionHost.exe")
+            };
+            var prompt = Installer.FormatUpgradeTerminationPrompt(
+                running,
+                Array.Empty<RunningTermLinkService>());
+            Assert(prompt.Contains("所有由 TermLink SessionHost 承载的命令行会话", StringComparison.Ordinal) &&
+                prompt.Contains("PID 2468", StringComparison.Ordinal) &&
+                prompt.Contains("关闭后的会话无法恢复", StringComparison.Ordinal) &&
+                prompt.Contains("all TermLink-hosted terminal sessions", StringComparison.Ordinal),
+                "The upgrade prompt does not explicitly disclose terminal-session termination in both languages.");
+
+            var quietPrompt = Installer.FormatUpgradeTerminationPrompt(
+                Array.Empty<RunningTermLinkProcess>(),
+                Array.Empty<RunningTermLinkService>());
+            Assert(quietPrompt.Contains("提交安装前仍会再次检查", StringComparison.Ordinal),
+                "An idle upgrade no longer warns that a final process sweep will run before commit.");
         }
 
         private static void ValidateCrossDirectoryUpgradeIsRejected(string temporaryRoot)

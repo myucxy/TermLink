@@ -11,8 +11,15 @@ Directory.CreateDirectory(outputRoot);
 var isolatedRootParent = Path.Combine(Path.GetTempPath(), "TermLink.TrayVisualSmoke");
 var isolatedRoot = Path.Combine(isolatedRootParent, "run-" + Guid.NewGuid().ToString("N"));
 var isolatedPreferencesPath = Path.Combine(isolatedRoot, "Tray", "ui.preferences");
+var isolatedReconnectPreferencesPath = Path.Combine(
+    isolatedRoot,
+    "Agent",
+    "connection.preferences.json");
 Directory.CreateDirectory(isolatedRoot);
 AppContext.SetData("TermLink.TrayPreferences.StoragePath", isolatedPreferencesPath);
+AppContext.SetData(
+    "TermLink.ProductionReconnectPreferences.StoragePath",
+    isolatedReconnectPreferencesPath);
 // The unified desktop executable keeps the TermLink.Tray namespace, but its
 // assembly name is TermLink so the installed UI and background runtime ship as
 // one program. Load the product assembly name instead of the pre-unification
@@ -212,6 +219,9 @@ finally
 {
     update.Invoke(null, new[] { originalLanguage, originalTheme });
     AppContext.SetData("TermLink.TrayPreferences.StoragePath", null);
+    AppContext.SetData(
+        "TermLink.ProductionReconnectPreferences.StoragePath",
+        null);
     DeleteIsolatedRoot(isolatedRootParent, isolatedRoot);
 }
 

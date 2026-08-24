@@ -39,6 +39,20 @@ Require(!ConPtySessionHost.ShouldAbortUnregisteredSession(true, false, 749, 750)
     ConPtySessionHost.ShouldAbortUnregisteredSession(true, false, 750, 750) &&
     !ConPtySessionHost.ShouldAbortUnregisteredSession(true, true, 750, 750),
     "SessionHost registration timeout did not exclusively stop an unregistered process tree");
+const uint processedInput = 0x0001;
+const uint lineInput = 0x0002;
+const uint echoInput = 0x0004;
+const uint windowInput = 0x0008;
+const uint mouseInput = 0x0010;
+const uint quickEdit = 0x0040;
+const uint extendedFlags = 0x0080;
+const uint virtualTerminalInput = 0x0200;
+var outerInputMode = ConPtySessionHost.BuildOuterInputMode(
+    processedInput | lineInput | echoInput | mouseInput | quickEdit | virtualTerminalInput);
+Require((outerInputMode & (processedInput | lineInput | echoInput | mouseInput)) == 0 &&
+    (outerInputMode & (windowInput | extendedFlags | quickEdit | virtualTerminalInput)) ==
+        (windowInput | extendedFlags | quickEdit | virtualTerminalInput),
+    "SessionHost outer input mode still captures mouse actions or drops existing Terminal flags");
 RequireThrows(() => SessionHostOptions.Parse(new[]
 {
     "--command-base64", encodedCommand,

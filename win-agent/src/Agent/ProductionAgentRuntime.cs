@@ -129,6 +129,7 @@ namespace TermLink.Agent
         }
         private readonly ProductionAgentConfig config;
         private readonly ProductionCredentials credentials;
+        private readonly ProductionReconnectPreferences reconnectPreferences;
         private readonly HttpClient http;
         private readonly HttpClient fileUploadHttp;
         // Frames are durably committed to each SessionAgent DPAPI buffer before
@@ -185,10 +186,23 @@ namespace TermLink.Agent
         private Task statusRefreshWorker;
         private string tokenEndpoint;
         private int disposed;
+        private long successfulConnectionGeneration;
 
         private ProductionAgentRuntime(ProductionAgentConfig config, ProductionCredentials credentials)
+            : this(config, credentials, new ProductionReconnectPreferences())
         {
-            this.config = config; this.credentials = credentials;
+        }
+
+        private ProductionAgentRuntime(
+            ProductionAgentConfig config,
+            ProductionCredentials credentials,
+            ProductionReconnectPreferences reconnectPreferences)
+        {
+            this.config = config;
+            this.credentials = credentials;
+            this.reconnectPreferences = reconnectPreferences ??
+                throw new ArgumentNullException(nameof(reconnectPreferences));
+            this.reconnectPreferences.Validate();
             http = ProductionTls.CreateHttpClient(config.ServerUrl);
             http.Timeout = TimeSpan.FromSeconds(15);
             fileUploadHttp = ProductionTls.CreateHttpClient(config.ServerUrl);
@@ -284,7 +298,10 @@ namespace TermLink.Agent
                 config.AgentVersion = runtimeVersion;
             }
             var credentials = ProductionCredentials.TryLoad(); if (credentials == null) return null;
-            return new ProductionAgentRuntime(config, credentials);
+            return new ProductionAgentRuntime(
+                config,
+                credentials,
+                ProductionReconnectPreferences.Load());
         }
 
         public void Attach(SessionRegistry registry)
@@ -571,15 +588,17 @@ namespace TermLink.Agent
 
         private async Task RunAsync()
         {
-            var delay = TimeSpan.FromSeconds(1);
+            var consecutiveFailures = 0;
             while (!cancellation.IsCancellationRequested)
             {
+                var connectionGenerationBeforeAttempt =
+                    Interlocked.Read(ref successfulConnectionGeneration);
                 try
                 {
                     SetRelayState(ProductionRelayState.Connecting, string.Empty);
                     await EnsureRegisteredAsync(cancellation.Token).ConfigureAwait(false);
                     await ConnectAndPumpAsync(cancellation.Token).ConfigureAwait(false);
-                    delay = TimeSpan.FromSeconds(1);
+                    consecutiveFailures = 0;
                 }
                 catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return; }
                 catch (ProductionReauthenticationRequiredException)
@@ -590,16 +609,25 @@ namespace TermLink.Agent
                     // state stable until the user explicitly retries or the login
                     // workflow replaces the runtime with fresh credentials.
                     await reconnectSignal.WaitAsync(cancellation.Token).ConfigureAwait(false);
+                    consecutiveFailures = 0;
                 }
                 catch (Exception error)
                 {
+                    if (Interlocked.Read(ref successfulConnectionGeneration) !=
+                        connectionGenerationBeforeAttempt)
+                    {
+                        // A healthy socket generation resets the backoff even if
+                        // it later disconnects by throwing from the pump.
+                        consecutiveFailures = 0;
+                    }
+                    consecutiveFailures = checked(consecutiveFailures + 1);
                     SetRelayState(ProductionRelayState.Reconnecting, ConnectionFailureCode(error));
                     var jitterMilliseconds = RandomNumberGenerator.GetInt32(0, 500);
                     var manuallyRetried = await WaitForRetryOrReconnectAsync(
-                        delay + TimeSpan.FromMilliseconds(jitterMilliseconds),
+                        reconnectPreferences.DelayAfterFailure(consecutiveFailures) +
+                            TimeSpan.FromMilliseconds(jitterMilliseconds),
                         cancellation.Token).ConfigureAwait(false);
-                    if (manuallyRetried) delay = TimeSpan.FromSeconds(1);
-                    else delay = TimeSpan.FromSeconds(Math.Min(15, delay.TotalSeconds * 2));
+                    if (manuallyRetried) consecutiveFailures = 0;
                 }
             }
         }
@@ -1032,6 +1060,7 @@ namespace TermLink.Agent
                 if (state == ProductionRelayState.Connected) lastConnectedAtUtc = DateTime.UtcNow;
             }
             if (!connected) return;
+            Interlocked.Increment(ref successfulConnectionGeneration);
             // Re-publish every encrypted directory title after a successful
             // Relay generation. The Server row is durable, but this heals
             // cleanup/failover races and ensures a quiet session does not need

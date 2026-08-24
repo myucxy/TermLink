@@ -156,18 +156,29 @@ namespace TermLink.SessionHost
                     workingDirectory = new UTF8Encoding(false, true)
                         .GetString(Convert.FromBase64String(encodedWorkingDirectory));
                 }
-                catch (Exception error) when (error is FormatException || error is DecoderFallbackException)
+                catch (FormatException error)
+                {
+                    throw new ArgumentException("--working-directory-base64 is not valid Base64-encoded UTF-8.", error);
+                }
+                catch (DecoderFallbackException error)
                 {
                     throw new ArgumentException("--working-directory-base64 is not valid Base64-encoded UTF-8.", error);
                 }
                 if (string.IsNullOrWhiteSpace(workingDirectory) || workingDirectory.IndexOf('\0') >= 0 ||
-                    workingDirectory.Length > 4096 || !Path.IsPathFullyQualified(workingDirectory))
+                    workingDirectory.Length > 4096 || !IsFullyQualifiedWindowsPath(workingDirectory))
                 {
                     throw new ArgumentException("Decoded working directory must be an absolute Windows path.");
                 }
                 try { workingDirectory = Path.GetFullPath(workingDirectory); }
-                catch (Exception error) when (
-                    error is ArgumentException || error is NotSupportedException || error is PathTooLongException)
+                catch (ArgumentException error)
+                {
+                    throw new ArgumentException("Decoded working directory is invalid.", error);
+                }
+                catch (NotSupportedException error)
+                {
+                    throw new ArgumentException("Decoded working directory is invalid.", error);
+                }
+                catch (PathTooLongException error)
                 {
                     throw new ArgumentException("Decoded working directory is invalid.", error);
                 }
@@ -284,6 +295,17 @@ namespace TermLink.SessionHost
             }
         }
 
+        private static bool IsFullyQualifiedWindowsPath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            var hasDriveRoot = path.Length >= 3 && char.IsLetter(path[0]) && path[1] == ':' &&
+                (path[2] == Path.DirectorySeparatorChar || path[2] == Path.AltDirectorySeparatorChar);
+            var hasUncRoot = path.Length >= 3 &&
+                (path[0] == Path.DirectorySeparatorChar || path[0] == Path.AltDirectorySeparatorChar) &&
+                (path[1] == Path.DirectorySeparatorChar || path[1] == Path.AltDirectorySeparatorChar);
+            return hasDriveRoot || hasUncRoot;
+        }
+
         private static string RequiredValue(string[] args, ref int index, string option)
         {
             if (++index >= args.Length || string.IsNullOrEmpty(args[index]))
@@ -322,7 +344,6 @@ namespace TermLink.SessionHost
         private const uint EnableEchoInput = 0x0004;
         private const uint EnableWindowInput = 0x0008;
         private const uint EnableMouseInput = 0x0010;
-        private const uint EnableQuickEditMode = 0x0040;
         private const uint EnableExtendedFlags = 0x0080;
         private const uint EnableProcessedOutput = 0x0001;
         private const uint EnableVirtualTerminalProcessing = 0x0004;
@@ -544,10 +565,12 @@ namespace TermLink.SessionHost
             bool autoRegister,
             bool agentConnected,
             long elapsedMilliseconds,
-            int registrationTimeoutMilliseconds) =>
-            autoRegister && !agentConnected &&
-            registrationTimeoutMilliseconds != Timeout.Infinite &&
-            elapsedMilliseconds >= registrationTimeoutMilliseconds;
+            int registrationTimeoutMilliseconds)
+        {
+            return autoRegister && !agentConnected &&
+                registrationTimeoutMilliseconds != Timeout.Infinite &&
+                elapsedMilliseconds >= registrationTimeoutMilliseconds;
+        }
 
         private void CreateInnerPseudoConsole(COORD size)
         {
@@ -632,11 +655,23 @@ namespace TermLink.SessionHost
             outerConsoleInputMode = mode;
             outerConsoleInputCodePage = GetConsoleCP();
             inputKind = "console";
-            var rawMode = (mode & ~(EnableProcessedInput | EnableLineInput | EnableEchoInput | EnableQuickEditMode)) |
-                EnableExtendedFlags | EnableWindowInput | EnableMouseInput;
+            var rawMode = BuildOuterInputMode(mode);
             CheckWin32(SetConsoleMode(outerInput, rawMode), "SetConsoleMode(raw input records)");
             restoreOuterConsoleInputMode = true;
             return true;
+        }
+
+        internal static uint BuildOuterInputMode(uint mode)
+        {
+            // SessionHost consumes key records so local and remote writes can be
+            // serialized, but it does not consume mouse records. Advertising
+            // ENABLE_MOUSE_INPUT made Windows Terminal send selection, right
+            // click, and wheel actions into a path that discarded them. Keep the
+            // front-end's Quick Edit/VT flags intact and explicitly disable mouse
+            // reporting so Terminal retains copy, paste, selection, and scroll.
+            return (mode & ~(EnableProcessedInput | EnableLineInput |
+                    EnableEchoInput | EnableMouseInput)) |
+                EnableExtendedFlags | EnableWindowInput;
         }
 
         private bool ConfigureOuterOutput(IntPtr outerOutput)

@@ -227,20 +227,15 @@ namespace TermLink.Setup
                 // directory cannot disturb a working installation in the old
                 // directory.
                 Installer.EnsureInstallDirectoryCompatible(target);
+                var isUpgrade = Installer.IsValidInstallDirectory(target);
                 var runningProcesses = Installer.GetRunningOwnedProcesses(target);
                 var runningServices = Installer.GetRunningOwnedServices(target);
                 var terminateRunningProcesses = false;
-                if (runningProcesses.Count > 0 || runningServices.Count > 0)
+                if (isUpgrade)
                 {
                     var decision = MessageBox.Show(
                         this,
-                        "检测到正在使用当前 TermLink 安装目录的程序：" + Environment.NewLine +
-                        Installer.FormatRunningProcessList(runningProcesses) + Environment.NewLine + Environment.NewLine +
-                        "Windows 服务：" + Environment.NewLine +
-                        Installer.FormatRunningServiceList(runningServices) + Environment.NewLine + Environment.NewLine +
-                        "升级需要先终止这些程序及其子进程；活动终端和未保存的工作可能丢失。" +
-                        "是否终止并继续升级？" + Environment.NewLine +
-                        "Active terminals and unsaved work may be lost. Stop these processes and continue?",
+                        Installer.FormatUpgradeTerminationPrompt(runningProcesses, runningServices),
                         "TermLink 升级 / Upgrade",
                         MessageBoxButtons.YesNo,
                         MessageBoxIcon.Warning,

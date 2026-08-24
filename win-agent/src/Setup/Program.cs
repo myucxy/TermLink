@@ -1224,6 +1224,31 @@ namespace TermLink.Setup
                 processes.Select(value => "• " + value.Name + " (PID " + value.ProcessId + ")"));
         }
 
+        internal static string FormatUpgradeTerminationPrompt(
+            IReadOnlyList<RunningTermLinkProcess> processes,
+            IReadOnlyList<RunningTermLinkService> services)
+        {
+            processes = processes ?? Array.Empty<RunningTermLinkProcess>();
+            services = services ?? Array.Empty<RunningTermLinkService>();
+            var processSummary = processes.Count == 0
+                ? "• 当前未检测到；提交安装前仍会再次检查并终止随后启动的 TermLink 程序。"
+                : FormatRunningProcessList(processes);
+            var serviceSummary = services.Count == 0
+                ? "• 无"
+                : FormatRunningServiceList(services);
+            return
+                "检测到已有 TermLink 安装。升级将关闭 TermLink 主程序、后台 Agent，以及所有由 TermLink SessionHost 承载的命令行会话。" +
+                Environment.NewLine +
+                "请先保存终端中未完成的工作；关闭后的会话无法恢复。" +
+                Environment.NewLine + Environment.NewLine +
+                "当前 TermLink 程序：" + Environment.NewLine + processSummary +
+                Environment.NewLine + Environment.NewLine +
+                "Windows 服务：" + Environment.NewLine + serviceSummary +
+                Environment.NewLine + Environment.NewLine +
+                "是否终止这些程序和会话并继续升级？" + Environment.NewLine +
+                "The upgrade will stop TermLink, its Agent, and all TermLink-hosted terminal sessions. Continue?";
+        }
+
         internal static IReadOnlyList<RunningTermLinkService> GetRunningOwnedServices(
             string installDirectory)
         {

@@ -2022,6 +2022,11 @@ namespace TermLink.Tray
         private Label membershipSessionQuotaLabel;
         private ComboBox languageCombo;
         private ComboBox themeCombo;
+        private NumericUpDown reconnectInitialDelayInput;
+        private NumericUpDown reconnectMaximumDelayInput;
+        private NumericUpDown reconnectMaximumAttemptsInput;
+        private Label reconnectSettingsStatusLabel;
+        private Button reconnectSettingsSaveButton;
         private bool applyingPreferences;
         private bool layoutInitialized;
 
@@ -2652,6 +2657,59 @@ namespace TermLink.Tray
             appearanceBody.Controls.Add(CreateSettingRow(TrayText.Pick("颜色主题", "Color theme"), TrayText.Pick("跟随系统、浅色或深色。", "Follow Windows, light or dark."), themeCombo));
             stack.Controls.Add(appearance);
 
+            var reconnectPreferences = ProductionReconnectPreferences.Load();
+            var reconnect = CreateCard(
+                TrayText.Pick("服务器重连", "Server reconnect"),
+                out var reconnectBody);
+            reconnectInitialDelayInput = CreateNumericPreference(
+                ProductionReconnectPreferences.MinimumInitialDelaySeconds,
+                ProductionReconnectPreferences.MaximumInitialDelaySeconds,
+                reconnectPreferences.InitialDelaySeconds);
+            reconnectMaximumDelayInput = CreateNumericPreference(
+                ProductionReconnectPreferences.MinimumMaximumDelaySeconds,
+                ProductionReconnectPreferences.MaximumMaximumDelaySeconds,
+                reconnectPreferences.MaximumDelaySeconds);
+            reconnectMaximumAttemptsInput = CreateNumericPreference(
+                0,
+                ProductionReconnectPreferences.MaximumFastAttemptsLimit,
+                reconnectPreferences.MaximumFastAttempts);
+            reconnectBody.Controls.Add(CreateSettingRow(
+                TrayText.Pick("初始重连间隔（秒）", "Initial reconnect delay (seconds)"),
+                TrayText.Pick("首次连接失败后等待的时间，范围 1–60 秒。", "Delay after the first failed connection, from 1 to 60 seconds."),
+                reconnectInitialDelayInput));
+            reconnectBody.Controls.Add(CreateSettingRow(
+                TrayText.Pick("最大重连间隔（秒）", "Maximum reconnect delay (seconds)"),
+                TrayText.Pick("指数退避的上限，范围 1–300 秒，不能小于初始间隔。", "Exponential backoff ceiling, from 1 to 300 seconds and not below the initial delay."),
+                reconnectMaximumDelayInput));
+            reconnectBody.Controls.Add(CreateSettingRow(
+                TrayText.Pick("快速重连次数", "Fast reconnect attempts"),
+                TrayText.Pick("0 表示无限重试；达到正数上限后改为每 60 秒探测，绝不会结束本地 Shell。", "0 retries indefinitely; after a positive limit, probe every 60 seconds and never stop local shells."),
+                reconnectMaximumAttemptsInput));
+            reconnectSettingsStatusLabel = CreateValueLabel(
+                TrayText.Pick(
+                    "保存后会重启后台 Agent；现有命令行进程保持运行并自动重新接入。",
+                    "Saving restarts the background Agent; existing command processes keep running and reconnect automatically."),
+                10,
+                false);
+            reconnectBody.Controls.Add(reconnectSettingsStatusLabel);
+            var reconnectActions = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = true,
+                Padding = new Padding(0, 10, 0, 0)
+            };
+            reconnectSettingsSaveButton = CreateButton(
+                TrayText.Pick("保存并重启 Agent", "Save and restart Agent"));
+            reconnectSettingsSaveButton.AccessibleName = TrayText.Pick(
+                "保存服务器重连设置并重启后台 Agent",
+                "Save server reconnect settings and restart the background Agent");
+            reconnectSettingsSaveButton.Click += async delegate { await SaveReconnectSettingsAsync(); };
+            reconnectActions.Controls.Add(reconnectSettingsSaveButton);
+            reconnectBody.Controls.Add(reconnectActions);
+            stack.Controls.Add(reconnect);
+
             var terminalIntegration = CreateCard(
                 TrayText.Pick("Windows Terminal 配置", "Windows Terminal integration"),
                 out var terminalIntegrationBody);
@@ -2769,6 +2827,63 @@ namespace TermLink.Tray
                 if (!IsDisposed && terminalIntegrationButton != null)
                     terminalIntegrationButton.Enabled =
                         !WindowsTerminalIntegration.IsCurrentProcessPackaged();
+            }
+        }
+
+        private async Task SaveReconnectSettingsAsync()
+        {
+            if (reconnectSettingsSaveButton == null ||
+                reconnectSettingsStatusLabel == null ||
+                reconnectInitialDelayInput == null ||
+                reconnectMaximumDelayInput == null ||
+                reconnectMaximumAttemptsInput == null)
+            {
+                return;
+            }
+
+            var preferences = new ProductionReconnectPreferences
+            {
+                InitialDelaySeconds = Decimal.ToInt32(reconnectInitialDelayInput.Value),
+                MaximumDelaySeconds = Decimal.ToInt32(reconnectMaximumDelayInput.Value),
+                MaximumFastAttempts = Decimal.ToInt32(reconnectMaximumAttemptsInput.Value)
+            };
+            if (preferences.MaximumDelaySeconds < preferences.InitialDelaySeconds)
+            {
+                MessageBox.Show(
+                    this,
+                    TrayText.Pick(
+                        "最大重连间隔不能小于初始重连间隔。",
+                        "The maximum reconnect delay cannot be below the initial delay."),
+                    "TermLink",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            SetBusy(true);
+            reconnectSettingsStatusLabel.Text = TrayText.Pick(
+                "正在保存并重启后台 Agent…",
+                "Saving and restarting the background Agent…");
+            try
+            {
+                await Task.Run(() => ProductionReconnectPreferences.Save(preferences));
+                var response = await Task.Run(() => controller.RestartAgent());
+                if (response == null || !response.Success)
+                    throw new InvalidOperationException(response == null ? "NO_RESPONSE" : response.Code);
+                Apply(response);
+                reconnectSettingsStatusLabel.Text = TrayText.Pick(
+                    "设置已保存，后台 Agent 已重启；现有会话正在自动重新接入。",
+                    "Settings saved and the background Agent restarted; existing sessions are reconnecting automatically.");
+            }
+            catch (Exception error)
+            {
+                reconnectSettingsStatusLabel.Text = TrayText.Pick(
+                    "保存或重启失败：",
+                    "Save or restart failed: ") + error.Message;
+            }
+            finally
+            {
+                SetBusy(false);
             }
         }
 
@@ -3109,6 +3224,7 @@ namespace TermLink.Tray
             if (remoteStopButton != null) remoteStopButton.Enabled = !busy && latestResponse != null && latestResponse.RemoteAccessEnabled;
             if (connectionRetryButton != null && busy) connectionRetryButton.Enabled = false;
             if (terminalIntegrationButton != null) terminalIntegrationButton.Enabled = !busy;
+            if (reconnectSettingsSaveButton != null) reconnectSettingsSaveButton.Enabled = !busy;
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
         }
 
@@ -3320,6 +3436,21 @@ namespace TermLink.Tray
             };
             TrayComboBoxStyle.Configure(combo);
             return combo;
+        }
+
+        private NumericUpDown CreateNumericPreference(int minimum, int maximum, int value)
+        {
+            return new NumericUpDown
+            {
+                Minimum = minimum,
+                Maximum = maximum,
+                Value = Math.Min(maximum, Math.Max(minimum, value)),
+                Width = Dpi(190),
+                Height = Dpi(30),
+                TextAlign = HorizontalAlignment.Left,
+                ThousandsSeparator = false,
+                AccessibleRole = AccessibleRole.SpinButton
+            };
         }
 
         private Control CreateSettingRow(string title, string description, Control editor)

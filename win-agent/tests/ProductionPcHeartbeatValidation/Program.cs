@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -10,6 +11,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using TermLink.Protocol;
+using TermLink.Agent;
 
 namespace TermLink.ProductionPcHeartbeat.Validation;
 
@@ -104,6 +106,7 @@ internal static class Program
         object runtime = null;
         try
         {
+            ValidateReconnectPreferences();
             var agentAssembly = Assembly.Load("TermLink.Agent");
             var runtimeType = agentAssembly.GetType("TermLink.Agent.ProductionAgentRuntime", true);
             var configType = agentAssembly.GetType("TermLink.Agent.ProductionAgentConfig", true);
@@ -386,6 +389,60 @@ internal static class Program
         finally
         {
             if (runtime is IDisposable disposable) disposable.Dispose();
+        }
+    }
+
+    private static void ValidateReconnectPreferences()
+    {
+        var path = Path.Combine(
+            Path.GetTempPath(),
+            "TermLink-reconnect-preferences-" + Guid.NewGuid().ToString("N") + ".json");
+        AppContext.SetData(
+            "TermLink.ProductionReconnectPreferences.StoragePath",
+            path);
+        try
+        {
+            var saved = new ProductionReconnectPreferences
+            {
+                InitialDelaySeconds = 2,
+                MaximumDelaySeconds = 10,
+                MaximumFastAttempts = 3
+            };
+            ProductionReconnectPreferences.Save(saved);
+            var loaded = ProductionReconnectPreferences.Load();
+            Require(loaded.InitialDelaySeconds == 2 &&
+                loaded.MaximumDelaySeconds == 10 &&
+                loaded.MaximumFastAttempts == 3,
+                "Reconnect preferences did not survive an atomic save/load round trip.");
+
+            var delayMethod = typeof(ProductionReconnectPreferences).GetMethod(
+                "DelayAfterFailure",
+                BindingFlags.Instance | BindingFlags.NonPublic) ??
+                throw new InvalidOperationException("Reconnect delay policy is unavailable.");
+            var delays = Enumerable.Range(1, 5)
+                .Select(failure => (TimeSpan)delayMethod.Invoke(loaded, new object[] { failure }))
+                .Select(delay => delay.TotalSeconds)
+                .ToArray();
+            Require(delays.SequenceEqual(new[] { 2d, 4d, 8d, 60d, 60d }),
+                "Reconnect delay policy did not honor fast attempts, exponential bounds, and slow probing.");
+
+            loaded.MaximumDelaySeconds = 300;
+            Require(((TimeSpan)delayMethod.Invoke(loaded, new object[] { 4 })).TotalSeconds == 60d,
+                "Slow probing did not remain at the documented 60-second cadence when the exponential ceiling was higher.");
+
+            File.WriteAllText(path, "{ damaged preferences", Encoding.UTF8);
+            var fallback = ProductionReconnectPreferences.Load();
+            Require(fallback.InitialDelaySeconds == 1 &&
+                fallback.MaximumDelaySeconds == 15 &&
+                fallback.MaximumFastAttempts == 0,
+                "Damaged reconnect preferences did not fail safely to production defaults.");
+        }
+        finally
+        {
+            AppContext.SetData(
+                "TermLink.ProductionReconnectPreferences.StoragePath",
+                null);
+            if (File.Exists(path)) File.Delete(path);
         }
     }
 

@@ -303,7 +303,13 @@ try {
     $upgradedProfiles = @($upgradedFragment.profiles)
     Assert-True ($upgradedProfiles.Count -eq $profiles.Count) `
         'The upgrade retained an extra stale Terminal profile or removed a generated profile.'
-    $allowedProfileProperties = @('guid', 'name', 'commandline', 'startingDirectory', 'hidden')
+    $allowedProfileProperties = @(
+        'guid',
+        'name',
+        'commandline',
+        'startingDirectory',
+        'closeOnExit',
+        'hidden')
     foreach ($profile in $upgradedProfiles) {
         $unexpectedProperties = @($profile.PSObject.Properties.Name |
             Where-Object { $_ -cnotin $allowedProfileProperties })
@@ -312,6 +318,8 @@ try {
         Assert-True ($profile.commandline.StartsWith(
                 $expectedHostPrefix, [StringComparison]::OrdinalIgnoreCase)) `
             "Upgraded Terminal profile does not use the current SessionHost: $($profile.guid)"
+        Assert-True ([string]$profile.closeOnExit -ceq 'always') `
+            "Upgraded Terminal profile no longer closes its tab after a remote session stop: $($profile.guid)"
     }
     $upgradedMarker = Get-Content -Raw -LiteralPath (Join-Path $installRoot '.termlink-install.json') |
         ConvertFrom-Json
