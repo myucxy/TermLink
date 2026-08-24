@@ -19,7 +19,7 @@ Set-StrictMode -Version Latest
 
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $agent = Join-Path $projectRoot 'src\Agent\bin\Release\net8.0-windows\TermLink.Agent.exe'
-$tray = Join-Path $projectRoot 'src\Tray\bin\Release\net8.0-windows\TermLink.Tray.exe'
+$tray = Join-Path $projectRoot 'src\Tray\bin\Release\net8.0-windows\TermLink.exe'
 $sessionHost = Join-Path $projectRoot 'src\SessionHost\bin\Release\net8.0-windows\TermLink.SessionHost.exe'
 $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
 $productionRoot = Join-Path ([Environment]::GetFolderPath(
@@ -43,7 +43,7 @@ function Get-FixtureSnapshot {
     $statusPath = Join-Path $State.TestRoot 'status.json'
     Remove-Item -LiteralPath $statusPath -Force -ErrorAction SilentlyContinue
     & $tray --control-pipe $State.ControlPipe --buffer-root $State.BufferRoot `
-        --agent-exe $agent --status-json $statusPath | Out-Null
+        --status-json $statusPath | Out-Null
     if (-not (Test-Path -LiteralPath $statusPath -PathType Leaf)) {
         throw 'Production Gap fixture status was unavailable.'
     }
@@ -345,7 +345,7 @@ if ($Action -eq 'Interrupt') {
 try {
     if (Test-FixtureProcess ([int]$state.AgentPid) 'TermLink.Agent') {
         & $tray --control-pipe $state.ControlPipe --buffer-root $state.BufferRoot `
-            --agent-exe $agent --shutdown-agent | Out-Null
+            --shutdown-agent | Out-Null
         $deadline = [DateTime]::UtcNow.AddSeconds(12)
         while ((Test-FixtureProcess ([int]$state.AgentPid) 'TermLink.Agent') -and
             [DateTime]::UtcNow -lt $deadline) {

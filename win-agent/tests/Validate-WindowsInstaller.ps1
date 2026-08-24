@@ -154,7 +154,7 @@ try {
     Assert-True ($null -ne $startup) 'Installed package does not declare a desktop startup task.'
     Assert-True ($startup.GetAttribute('TaskId') -eq 'TermLinkTrayStartup') 'Startup task ID changed.'
     Assert-True ($startup.GetAttribute('Enabled') -eq 'true') 'Startup task is not enabled by default.'
-    Assert-True ($startup.ParentNode.GetAttribute('Executable') -eq 'TermLink.Tray.exe') `
+    Assert-True ($startup.ParentNode.GetAttribute('Executable') -eq 'TermLink.exe') `
         'Startup task does not launch the Tray.'
     $aliasExtension = $installedManifest.SelectSingleNode(
         "/f:Package/f:Applications/f:Application/f:Extensions/uap3:Extension[@Category='windows.appExecutionAlias']",
@@ -195,11 +195,29 @@ try {
             "Windows Terminal profile bypasses the packaged SessionHost alias: $($profile.guid)"
         Assert-True (-not ([string]$profile.commandline).Contains(':\')) `
             "Windows Terminal profile contains a machine-specific absolute path: $($profile.guid)"
+        Assert-True ([string]$profile.closeOnExit -ceq 'always') `
+            "Windows Terminal profile does not close its tab with SessionHost: $($profile.guid)"
     }
     Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'coreclr.dll') -PathType Leaf) `
         'Installed package is not self-contained.'
     Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'TermLink.Updater.exe') -PathType Leaf) `
         'Installed package does not contain the external single-file Updater.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'TermLink.Agent.dll') -PathType Leaf) `
+        'Installed package does not contain the in-process Agent runtime assembly.'
+    foreach ($name in @(
+        'TermLink.Agent.exe',
+        'TermLink.Agent.deps.json',
+        'TermLink.Agent.runtimeconfig.json'
+    )) {
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $installLocation $name))) `
+            "Installed package contains obsolete standalone Agent file: $name"
+    }
+    $expectedProductExecutables = @('TermLink.exe', 'TermLink.SessionHost.exe', 'TermLink.Updater.exe')
+    $installedProductExecutables = @(Get-ChildItem -LiteralPath $installLocation -File -Filter 'TermLink*.exe' |
+        Select-Object -ExpandProperty Name)
+    Assert-True ($installedProductExecutables.Count -eq $expectedProductExecutables.Count -and
+        @($installedProductExecutables | Where-Object { $expectedProductExecutables -cnotcontains $_ }).Count -eq 0) `
+        "Installed package contains an unexpected product executable: $($installedProductExecutables -join ', ')"
     $brandAssetRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\assets\brand\windows'))
     foreach ($assetName in @('Square44x44Logo.png', 'Square150x150Logo.png', 'StoreLogo.png')) {
         $sourceAsset = Join-Path $brandAssetRoot $assetName
@@ -222,7 +240,7 @@ try {
     }
 
     $signedBinaries = @(Get-ChildItem -LiteralPath $installLocation -File |
-        Where-Object { $_.Name -match '^TermLink\..+\.(exe|dll)$' })
+        Where-Object { $_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' })
     Assert-True ($signedBinaries.Count -eq $buildResult.SignedTermLinkBinaries) `
         'Installed TermLink binary count differs from the signed build.'
     foreach ($binary in $signedBinaries) {
@@ -235,9 +253,9 @@ try {
     }
     Write-Output 'STEP=payload_verified'
 
-    $beforeTrayIds = @(Get-Process -Name 'TermLink.Tray' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+    $beforeTrayIds = @(Get-Process -Name 'TermLink' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
     $beforeAgentIds = @(Get-Process -Name 'TermLink.Agent' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
-    $installedTray = Join-Path $installLocation 'TermLink.Tray.exe'
+    $installedTray = Join-Path $installLocation 'TermLink.exe'
     Add-Type -AssemblyName System.Drawing
     $installedTrayIcon = [Drawing.Icon]::ExtractAssociatedIcon($installedTray)
     try {
@@ -253,7 +271,7 @@ try {
     $trayProcesses = @()
     do {
         Start-Sleep -Milliseconds 100
-        $trayProcesses = @(Find-PackagedProcesses -Name 'TermLink.Tray' -InstallLocation $installLocation `
+        $trayProcesses = @(Find-PackagedProcesses -Name 'TermLink' -InstallLocation $installLocation `
             -ExcludedIds $beforeTrayIds)
     } while ($trayProcesses.Count -eq 0 -and [DateTime]::UtcNow -lt $deadline)
     $validationProcessIds += @($trayProcesses | Select-Object -ExpandProperty Id)
@@ -270,7 +288,7 @@ try {
     do {
         Start-Sleep -Milliseconds 100
         $secondTrayLaunch.Refresh()
-        $trayProcesses = @(Find-PackagedProcesses -Name 'TermLink.Tray' -InstallLocation $installLocation `
+        $trayProcesses = @(Find-PackagedProcesses -Name 'TermLink' -InstallLocation $installLocation `
             -ExcludedIds $beforeTrayIds)
     } while (-not $secondTrayLaunch.HasExited -and [DateTime]::UtcNow -lt $singleInstanceDeadline)
     $validationProcessIds += @($trayProcesses | Select-Object -ExpandProperty Id)
@@ -278,16 +296,11 @@ try {
     Assert-True $secondTrayLaunch.HasExited 'The second Tray process did not exit after single-instance detection.'
     Write-Output 'STEP=tray_single_instance'
 
-    $deadline = [DateTime]::UtcNow.AddSeconds(10)
-    $agentProcesses = @()
-    do {
-        Start-Sleep -Milliseconds 100
-        $agentProcesses = @(Find-PackagedProcesses -Name 'TermLink.Agent' -InstallLocation $installLocation `
-            -ExcludedIds $beforeAgentIds)
-    } while ($agentProcesses.Count -eq 0 -and [DateTime]::UtcNow -lt $deadline)
-    $validationProcessIds += @($agentProcesses | Select-Object -ExpandProperty Id)
-    Assert-True ($agentProcesses.Count -eq 1) 'Packaged Tray did not start exactly one Agent.'
-    Write-Output 'STEP=agent_started'
+    $agentProcesses = @(Find-PackagedProcesses -Name 'TermLink.Agent' -InstallLocation $installLocation `
+        -ExcludedIds $beforeAgentIds)
+    Assert-True ($agentProcesses.Count -eq 0) `
+        'Packaged Tray started an obsolete standalone Agent process instead of its in-process runtime.'
+    Write-Output 'STEP=embedded_agent_started'
 
     $statusProcess = Start-Process -FilePath $installedTray `
         -ArgumentList @($trayIsolationArguments + @('--status-json', $statusPath)) -Wait -PassThru
@@ -338,7 +351,7 @@ try {
         packaged_agent_status = 'AGENT_STATUS'
         startup_task_id = 'TermLinkTrayStartup'
         startup_task_enabled_by_default = $true
-        startup_task_executable = 'TermLink.Tray.exe'
+        startup_task_executable = 'TermLink.exe'
         terminal_execution_alias = 'termlink-session.exe'
         terminal_profile_count = $terminalProfiles.Count
         terminal_profile_guids = $expectedProfileGuids
@@ -358,7 +371,7 @@ finally {
     if (-not [string]::IsNullOrWhiteSpace($installLocation) -and
         [IO.Directory]::Exists($installLocation)) {
         $remainingValidationProcesses = @(
-            Find-PackagedProcesses -Name 'TermLink.Tray' -InstallLocation $installLocation
+            Find-PackagedProcesses -Name 'TermLink' -InstallLocation $installLocation
             Find-PackagedProcesses -Name 'TermLink.Agent' -InstallLocation $installLocation
         )
         Stop-ValidationProcesses -ProcessIds @($remainingValidationProcesses | Select-Object -ExpandProperty Id)

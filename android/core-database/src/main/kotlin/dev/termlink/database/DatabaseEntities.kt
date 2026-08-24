@@ -2,6 +2,7 @@ package dev.termlink.database
 
 import androidx.room.ColumnInfo
 import androidx.room.Entity
+import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
 
@@ -106,6 +107,40 @@ data class SnapshotEntity(
     val expiresAtEpochMillis: Long?,
 )
 
+/**
+ * One encrypted, read-only transcript page selected for a fixed snapshot anchor.
+ * [requestBeforeLineId] records the exclusive cursor which produced this page so
+ * cached paging cannot silently skip a gap or drift to a newer live ACK.
+ */
+@Entity(
+    tableName = "transcript_pages",
+    indices = [
+        Index(
+            value = ["sessionId", "snapshotSequence", "requestBeforeLineId"],
+            unique = true,
+        ),
+        Index(value = ["sessionId", "snapshotSequence", "firstLineId", "lastLineId"]),
+        Index(value = ["objectKey"], unique = true),
+    ],
+)
+data class TranscriptPageEntity(
+    @PrimaryKey val id: String,
+    val sessionId: String,
+    val snapshotSequence: Long,
+    val requestBeforeLineId: Long,
+    val firstLineId: Long,
+    val lastLineId: Long,
+    val objectKey: String,
+    val keyId: String,
+    @ColumnInfo(typeAffinity = ColumnInfo.BLOB) val ciphertextSha256: ByteArray,
+    val sizeBytes: Long,
+    @ColumnInfo(typeAffinity = ColumnInfo.BLOB) val ciphertext: ByteArray,
+    val formatName: String,
+    val formatVersion: Int,
+    val createdAtEpochMillis: Long,
+    val expiresAtEpochMillis: Long?,
+)
+
 @Entity(
     tableName = "ack_cursors",
     primaryKeys = ["sessionId", "direction"],
@@ -122,6 +157,38 @@ data class AckCursorEntity(
      */
     val rendererGeneration: Long,
     val highestContiguousSequence: Long,
+    val updatedAtEpochMillis: Long,
+)
+
+/**
+ * Binds a durable ACK generation to the exact encrypted snapshot from which
+ * that renderer must be reconstructed before the cursor may be advertised.
+ */
+@Entity(
+    tableName = "renderer_checkpoints",
+    primaryKeys = ["sessionId", "direction"],
+    indices = [Index(value = ["snapshotId"])],
+    foreignKeys = [
+        ForeignKey(
+            entity = SnapshotEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["snapshotId"],
+        ),
+        ForeignKey(
+            entity = AckCursorEntity::class,
+            parentColumns = ["sessionId", "direction"],
+            childColumns = ["sessionId", "direction"],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
+)
+data class RendererCheckpointEntity(
+    val sessionId: String,
+    val direction: String,
+    val rendererGeneration: Long,
+    val snapshotId: String,
+    val snapshotSequence: Long,
+    @ColumnInfo(typeAffinity = ColumnInfo.BLOB) val ciphertextSha256: ByteArray,
     val updatedAtEpochMillis: Long,
 )
 

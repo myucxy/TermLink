@@ -22,7 +22,7 @@ namespace TermLink.Updater
             "$ErrorActionPreference='Stop';" +
             "$p=Get-AppxPackage -Name $env:TERMLINK_UPDATE_IDENTITY|Sort-Object Version -Descending|Select-Object -First 1;" +
             "if($null -eq $p -or $p.Version.ToString() -ne $env:TERMLINK_UPDATE_VERSION){exit 2};" +
-            "$tray=Join-Path $p.InstallLocation 'TermLink.Tray.exe';" +
+            "$tray=Join-Path $p.InstallLocation 'TermLink.exe';" +
             "if(-not (Test-Path -LiteralPath $tray -PathType Leaf)){exit 3};" +
             "$args='--status-json \"'+$env:TERMLINK_UPDATE_STATUS+'\"';" +
             "Invoke-CommandInDesktopPackage -PackageFamilyName $p.PackageFamilyName -AppId 'TermLinkTray' -Command $tray -Args $args -ErrorAction Stop|Out-Null;" +

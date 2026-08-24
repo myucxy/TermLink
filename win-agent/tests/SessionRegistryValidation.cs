@@ -41,7 +41,12 @@ namespace TermLink.Agent
                 Directory.CreateDirectory(bufferRoot);
                 ValidateActualAgentEntry(agentExecutable, Path.Combine(bufferRoot, "external-entry"));
                 ValidateLocalIpcCapabilities();
+                ValidateBoundedLargeBuffer(Path.Combine(bufferRoot, "bounded-large-buffer"));
                 ValidateRemoteControlDispatch();
+                ValidateActiveCapacityAccounting();
+                ValidateCompletedHistoryCapacity(
+                    hostExecutable,
+                    Path.Combine(bufferRoot, "completed-history-capacity"));
                 ValidateCompletedBufferRecovery(Path.Combine(bufferRoot, "completed-recovery"));
                 ValidateLiveInterruptedLifecycle(Path.Combine(bufferRoot, "live-interrupted"));
                 ValidateControlledInterruptedLifecycle(Path.Combine(bufferRoot, "controlled-interrupted"));
@@ -50,6 +55,9 @@ namespace TermLink.Agent
                 ValidatePolicyPersistenceFailure();
                 ValidateStopFailurePaths(Path.Combine(bufferRoot, "failure-paths"));
                 ValidateRestartFailurePath(Path.Combine(bufferRoot, "restart-failure"));
+                ValidateExplicitSessionTermination(
+                    hostExecutable,
+                    Path.Combine(bufferRoot, "explicit-termination"));
                 var controlPipe = "termlink-registry-control-" + Guid.NewGuid().ToString("N");
                 var options = RegistryServiceOptions.Parse(new[]
                 {
@@ -252,9 +260,15 @@ namespace TermLink.Agent
                     ";batch_timeout_reported=true" +
                     ";shutdown_best_effort=true" +
                     ";restart_timeout_reported=true" +
+                    ";active_capacity_bounded=true" +
+                    ";retiring_capacity_bounded=true" +
+                    ";completed_history_capacity_free=true" +
+                    ";completed_history_recovery_ordered=true" +
                     ";completed_buffer_recovered=true" +
                     ";live_interrupted_committed=true" +
                     ";external_registry_entry=true" +
+                    ";explicit_termination_exact=true" +
+                    ";termination_identity_checked=true" +
                     ";test_thread=" + mainThreadId);
                 return 0;
             }
@@ -428,6 +442,49 @@ namespace TermLink.Agent
             Require(invalidRejected, "Local IPC capabilities accepted unknown feature bits.");
         }
 
+        private static void ValidateBoundedLargeBuffer(string bufferRoot)
+        {
+            var sessionId = Guid.NewGuid();
+            var directory = Path.Combine(bufferRoot, sessionId.ToString("N"));
+            Directory.CreateDirectory(directory);
+            const int frameCount = 2048;
+            var payload = Enumerable.Repeat((byte)'x', 8193).ToArray();
+            using (var buffer = new EncryptedEventBuffer(directory, sessionId, 64L * 1024 * 1024))
+            {
+                for (var sequence = 1; sequence <= frameCount; sequence++)
+                {
+                    buffer.Append(new LocalFrame(
+                        LocalFrameType.Output,
+                        sessionId,
+                        (ulong)sequence,
+                        payload));
+                }
+
+                ulong earliest;
+                ulong latest;
+                bool hasMore;
+                var first = buffer.ReadFrom(
+                    0,
+                    16,
+                    256 * 1024,
+                    out earliest,
+                    out latest,
+                    out hasMore);
+                Require(first.Count == 16 && first[0].Sequence == 1 && first[15].Sequence == 16 &&
+                    earliest == 1 && latest == frameCount && hasMore,
+                    "A >16 MiB/thousands-frame buffer was decrypted beyond its bounded replay page.");
+                var tail = buffer.ReadFrom(
+                    2040,
+                    16,
+                    256 * 1024,
+                    out earliest,
+                    out latest,
+                    out hasMore);
+                Require(tail.Count == 8 && tail[0].Sequence == 2041 && tail[7].Sequence == 2048 && !hasMore,
+                    "Bounded replay did not finish the large buffer in linear S+1 order.");
+            }
+        }
+
         private static void ValidateRemoteControlDispatch()
         {
             var factory = new FakeManagedSessionFactory();
@@ -436,12 +493,10 @@ namespace TermLink.Agent
                 var sessionId = Guid.NewGuid();
                 string error;
                 Require(registry.TryRegister(CreateFakeRegistration(sessionId), out error),
-                    "Remote resize fixture registration failed: " + error);
-                Require(registry.TrySendResize(sessionId, 132, 43),
-                    "Registry did not route the remote resize request.");
+                    "Remote control fixture registration failed: " + error);
+                Require(typeof(SessionRegistry).GetMethod("TrySendResize") == null,
+                    "Registry still exposes an Android-to-ConPTY resize dispatch surface.");
                 var session = factory.Get(sessionId);
-                Require(session.ResizeColumns == 132 && session.ResizeRows == 43,
-                    "Registry changed the requested remote terminal size.");
                 var inputId = Guid.NewGuid();
                 var inputBytes = Encoding.UTF8.GetBytes("registry-remote-input");
                 Require(registry.TrySendRemoteInput(sessionId, inputId, 17, inputBytes),
@@ -458,6 +513,148 @@ namespace TermLink.Agent
                     session.RejectedInputResult == LocalRemoteInputResult.ControlLeaseRejected,
                     "Registry changed the ordered remote input rejection.");
             }
+        }
+
+        private static void ValidateActiveCapacityAccounting()
+        {
+            var factory = new FakeManagedSessionFactory();
+            using (var registry = new SessionRegistry(factory, 1))
+            {
+                var firstId = Guid.NewGuid();
+                var nextRegistration = CreateFakeRegistration(Guid.NewGuid());
+                factory.SetWaitsBeforeSuccess(firstId, 2);
+                string error;
+                Require(registry.TryRegister(CreateFakeRegistration(firstId), out error),
+                    "Active-capacity fixture registration failed: " + error);
+                Require(!registry.TryRegister(nextRegistration, out error) &&
+                    error == "SESSION_LIMIT_REACHED",
+                    "Registry did not enforce its active Session limit.");
+
+                var stopped = registry.StopSession(firstId);
+                Require(!stopped.Success && stopped.TimedOutSessions == 1 && registry.Count == 0,
+                    "Retiring-capacity fixture did not enter its timed-out retiring state.");
+                Require(!registry.TryRegister(nextRegistration, out error) &&
+                    error == "SESSION_LIMIT_REACHED",
+                    "A retiring worker stopped consuming an active Session slot too early.");
+
+                Require(factory.Get(firstId).WaitForStop(),
+                    "Retiring-capacity fixture could not finish its deferred stop.");
+                Require(registry.TryRegister(nextRegistration, out error),
+                    "A completed retiring worker did not release its active Session slot: " + error);
+            }
+        }
+
+        private static void ValidateCompletedHistoryCapacity(string hostExecutable, string bufferRoot)
+        {
+            Directory.CreateDirectory(bufferRoot);
+            var store = new DpapiRegistryRegistrationStore(
+                Path.Combine(bufferRoot, "registrations.dpapi"));
+            var completedIds = new List<Guid>();
+            for (var index = 0; index < 3; index++)
+            {
+                completedIds.Add(SeedRecoverableCompletedHistory(bufferRoot, store, index));
+            }
+
+            HostFixture recoveredHost = null;
+            HostFixture replacementHost = null;
+            try
+            {
+                recoveredHost = HostFixture.Start(hostExecutable, "capacity-recovered-active", 41);
+                store.Upsert(recoveredHost.CreateRegistration(ManagedShellType.PowerShell7));
+
+                using (var registry = new SessionRegistry(
+                    bufferRoot,
+                    1200,
+                    4 * 1024 * 1024,
+                    1,
+                    delegate(ManagedShellType ignoredShell, LocalFrame ignoredFrame) { }))
+                {
+                    WaitUntil(delegate
+                    {
+                        return registry.GetSummaries().Any(item =>
+                            item.SessionId == recoveredHost.SessionId &&
+                            item.Lifecycle == SessionAgentLifecycle.Connected &&
+                            item.LastSequence >= 2);
+                    }, 10000, "Completed history prevented a live Session from recovering at startup.");
+                    Require(registry.RecoveredSessionCount == completedIds.Count + 1 &&
+                        registry.Count == 1 && completedIds.All(registry.ContainsSession),
+                        "Registry did not recover completed history and the live Session independently.");
+
+                    IList<LocalFrame> frames;
+                    ulong earliest;
+                    ulong latest;
+                    Require(registry.TryReadBufferedEvents(
+                            completedIds[0], 0, out frames, out earliest, out latest) &&
+                        frames.Count == 4 && earliest == 1 && latest == 4,
+                        "Capacity accounting made retained completed history unreadable.");
+
+                    string error;
+                    Require(!registry.TryRegister(CreateFakeRegistration(Guid.NewGuid()), out error) &&
+                        error == "SESSION_LIMIT_REACHED",
+                        "Recovered live Session did not consume the configured active slot.");
+
+                    recoveredHost.CompleteLocally();
+                    WaitUntil(delegate
+                    {
+                        return registry.Count == 0 && registry.ContainsSession(recoveredHost.SessionId);
+                    }, 10000, "Completed live Session did not move into retained history.");
+
+                    replacementHost = HostFixture.Start(hostExecutable, "capacity-replacement-active", 42);
+                    Require(registry.TryRegister(
+                            replacementHost.CreateRegistration(ManagedShellType.CommandPrompt), out error),
+                        "Completed history consumed the newly available active slot: " + error);
+                    WaitUntil(delegate
+                    {
+                        return registry.GetSummaries().Any(item =>
+                            item.SessionId == replacementHost.SessionId &&
+                            item.Lifecycle == SessionAgentLifecycle.Connected &&
+                            item.LastSequence >= 2);
+                    }, 10000, "Replacement Session did not connect after completed backlog recovery.");
+                    replacementHost.CompleteLocally();
+                    WaitUntil(delegate { return registry.Count == 0; }, 10000,
+                        "Replacement Session did not complete cleanly.");
+                }
+            }
+            finally
+            {
+                if (replacementHost != null) replacementHost.Dispose();
+                if (recoveredHost != null) recoveredHost.Dispose();
+            }
+        }
+
+        private static Guid SeedRecoverableCompletedHistory(
+            string bufferRoot,
+            IRegistryRegistrationStore store,
+            int ordinal)
+        {
+            var sessionId = Guid.NewGuid();
+            var token = new byte[SessionRegistration.HandshakeTokenBytes];
+            using (var random = RandomNumberGenerator.Create()) random.GetBytes(token);
+            store.Upsert(new SessionRegistration(
+                sessionId,
+                "termlink-capacity-history-" + sessionId.ToString("N"),
+                token,
+                int.MaxValue - ordinal,
+                ManagedShellType.PowerShell7,
+                DateTime.UtcNow.AddYears(-1).AddMinutes(ordinal),
+                DateTime.UtcNow.AddMinutes(-ordinal)));
+            using (var buffer = new EncryptedEventBuffer(
+                Path.Combine(bufferRoot, sessionId.ToString("N")),
+                sessionId,
+                4 * 1024 * 1024))
+            {
+                buffer.Append(new LocalFrame(
+                    LocalFrameType.Lifecycle,
+                    sessionId,
+                    1,
+                    LocalPayloadCodec.Lifecycle(LocalLifecycleState.Running, 0)));
+                buffer.Append(new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    2,
+                    Encoding.UTF8.GetBytes("completed-capacity-" + ordinal)));
+            }
+            return sessionId;
         }
 
         private static void ValidateCompletedBufferRecovery(string bufferRoot)
@@ -508,19 +705,33 @@ namespace TermLink.Agent
                     registry.ContainsSession(sessionId),
                     "Completed buffer was not recovered as a retained read-only session.");
                 int exitCode;
-                Require(committed != null && committed.Sequence == 3 &&
-                    committed.Type == LocalFrameType.Lifecycle &&
-                    LocalPayloadCodec.ParseLifecycle(committed.Payload, out exitCode) ==
-                        LocalLifecycleState.Interrupted,
-                    "Dead Host recovery did not append an ordered Interrupted lifecycle.");
+                Require(committed != null && committed.Sequence == 4 &&
+                    committed.Type == LocalFrameType.SessionRemoved,
+                    "Dead Host recovery did not append an ordered removal after Interrupted.");
                 IList<LocalFrame> frames;
                 ulong earliest;
                 ulong latest;
                 Require(registry.TryReadBufferedEvents(sessionId, 0, out frames, out earliest, out latest) &&
-                    earliest == 1 && latest == 3 && frames.Count == 3,
+                    earliest == 1 && latest == 4 && frames.Count == 4 &&
+                    frames[2].Type == LocalFrameType.Lifecycle &&
+                    LocalPayloadCodec.ParseLifecycle(frames[2].Payload, out exitCode) ==
+                        LocalLifecycleState.Interrupted &&
+                    frames[3].Type == LocalFrameType.SessionRemoved,
                     "Recovered completed buffer did not preserve its committed event stream.");
-                Require(!registry.TrySendResize(sessionId, 100, 30) &&
-                    !registry.TrySendRemoteInput(sessionId, Guid.NewGuid(), 0, Encoding.UTF8.GetBytes("blocked")) &&
+                bool hasMore;
+                Require(registry.TryReadBufferedEvents(
+                        sessionId, 0, 2, long.MaxValue,
+                        out frames, out earliest, out latest, out hasMore) &&
+                    frames.Select(value => value.Sequence).SequenceEqual(new ulong[] { 1, 2 }) &&
+                    earliest == 1 && latest == 4 && hasMore,
+                    "Bounded Registry replay did not stop after its first two-frame page.");
+                Require(registry.TryReadBufferedEvents(
+                        sessionId, 2, 2, long.MaxValue,
+                        out frames, out earliest, out latest, out hasMore) &&
+                    frames.Select(value => value.Sequence).SequenceEqual(new ulong[] { 3, 4 }) &&
+                    !hasMore,
+                    "Bounded Registry replay did not resume linearly at S+1.");
+                Require(!registry.TrySendRemoteInput(sessionId, Guid.NewGuid(), 0, Encoding.UTF8.GetBytes("blocked")) &&
                     !registry.TrySendRemoteInputRejection(
                         sessionId,
                         Guid.NewGuid(),
@@ -530,9 +741,18 @@ namespace TermLink.Agent
                 Require(!registry.ContainsSession(sessionId),
                     "Published completed buffer remained retained in Registry memory.");
             }
-            Require(new DpapiRegistryRegistrationStore(
-                Path.Combine(bufferRoot, "registrations.dpapi")).Load().Count == 0,
-                "Published completed buffer remained in the recovery index.");
+            var retiredStore = new DpapiRegistryRegistrationStore(
+                Path.Combine(bufferRoot, "registrations.dpapi"));
+            var retired = retiredStore.Load().Single(item => item.SessionId == sessionId);
+            Require(retired.Retired,
+                "Published completed Session ID was not durably retired.");
+            using (var restarted = new SessionRegistry(new FakeManagedSessionFactory(), 20, retiredStore))
+            {
+                string reuseError;
+                Require(!restarted.TryRegister(CreateFakeRegistration(sessionId), out reuseError) &&
+                    reuseError == "SESSION_RETIRED",
+                    "A retired Session ID was reusable after Registry restart.");
+            }
         }
 
         private static void ValidateLiveInterruptedLifecycle(string bufferRoot)
@@ -573,17 +793,18 @@ namespace TermLink.Agent
                     ulong latest;
                     Require(registry.TryReadBufferedEvents(
                             lost.SessionId, 0, out frames, out earliest, out latest) &&
-                        earliest == 1 && latest == 3 && frames.Count == 3,
+                        earliest == 1 && latest == 4 && frames.Count == 4,
                         "Live Host loss did not retain a continuous terminal event stream.");
                     var terminal = frames[frames.Count - 1];
                     int exitCode;
-                    Require(terminal.Type == LocalFrameType.Lifecycle && terminal.Sequence == 3 &&
-                        LocalPayloadCodec.ParseLifecycle(terminal.Payload, out exitCode) ==
+                    Require(terminal.Type == LocalFrameType.SessionRemoved && terminal.Sequence == 4 &&
+                        frames[2].Type == LocalFrameType.Lifecycle &&
+                        LocalPayloadCodec.ParseLifecycle(frames[2].Payload, out exitCode) ==
                             LocalLifecycleState.Interrupted,
-                        "Live Host loss did not append an ordered Interrupted lifecycle.");
+                        "Live Host loss did not append ordered Interrupted and removal events.");
                     lock (committed)
                     {
-                        Require(committed.Count == 3 && committed[2].Sequence == terminal.Sequence,
+                        Require(committed.Count == 4 && committed[3].Sequence == terminal.Sequence,
                             "Live Host loss did not notify the production commit callback.");
                     }
                     registry.ReleaseBufferedSession(lost.SessionId);
@@ -636,17 +857,18 @@ namespace TermLink.Agent
                     ulong latest;
                     Require(registry.TryReadBufferedEvents(
                             fixture.SessionId, 0, out frames, out earliest, out latest) &&
-                        earliest == 1 && latest == 3 && frames.Count == 3,
+                        earliest == 1 && latest == 4 && frames.Count == 4,
                         "Controlled stop did not retain a continuous terminal event stream.");
                     var terminal = frames[frames.Count - 1];
                     int exitCode;
-                    Require(terminal.Type == LocalFrameType.Lifecycle && terminal.Sequence == 3 &&
-                        LocalPayloadCodec.ParseLifecycle(terminal.Payload, out exitCode) ==
+                    Require(terminal.Type == LocalFrameType.SessionRemoved && terminal.Sequence == 4 &&
+                        frames[2].Type == LocalFrameType.Lifecycle &&
+                        LocalPayloadCodec.ParseLifecycle(frames[2].Payload, out exitCode) ==
                             LocalLifecycleState.Interrupted,
-                        "Controlled stop did not append exactly one ordered Interrupted lifecycle.");
+                        "Controlled stop did not append Interrupted followed by removal.");
                     lock (committed)
                     {
-                        Require(committed.Count == 3 && committed[2].Sequence == terminal.Sequence,
+                        Require(committed.Count == 4 && committed[3].Sequence == terminal.Sequence,
                             "Controlled stop did not notify the production commit callback.");
                     }
                 }
@@ -669,6 +891,77 @@ namespace TermLink.Agent
             finally
             {
                 fixture.Dispose();
+            }
+        }
+
+        private static void ValidateExplicitSessionTermination(string hostExecutable, string bufferRoot)
+        {
+            Directory.CreateDirectory(bufferRoot);
+            var target = HostFixture.Start(hostExecutable, "terminate-target", 46);
+            var survivor = HostFixture.Start(hostExecutable, "terminate-survivor", 47);
+            try
+            {
+                using (var registry = new SessionRegistry(
+                    bufferRoot,
+                    1200,
+                    4 * 1024 * 1024,
+                    20))
+                {
+                    string error;
+                    Require(registry.TryRegister(target.CreateRegistration(ManagedShellType.PowerShell7), out error),
+                        "Terminate target did not register: " + error);
+                    Require(registry.TryRegister(survivor.CreateRegistration(ManagedShellType.CommandPrompt), out error),
+                        "Terminate survivor did not register: " + error);
+                    WaitUntil(delegate
+                    {
+                        var summaries = registry.GetSummaries();
+                        return summaries.Any(item => item.SessionId == target.SessionId && item.LastSequence >= 2) &&
+                            summaries.Any(item => item.SessionId == survivor.SessionId && item.LastSequence >= 2);
+                    }, 5000, "Terminate fixtures did not reach Connected state.");
+                    var targetChildProcessId = target.WaitForChildProcessId();
+
+                    Require(registry.TerminateSession(target.SessionId),
+                        "Explicit Session termination did not accept its registered Host identity.");
+                    Require(registry.TerminateSession(target.SessionId),
+                        "Explicit Session termination was not idempotent.");
+                    Require(target.Process.WaitForExit(10000),
+                        "Explicit Session termination did not end the target SessionHost.");
+                    WaitUntil(delegate { return !IsProcessRunning(targetChildProcessId); }, 10000,
+                        "Explicit Session termination left the target child Shell running.");
+                    Require(!survivor.Process.HasExited,
+                        "Explicit Session termination killed an unrelated SessionHost.");
+
+                    var stopped = registry.StopSession(survivor.SessionId);
+                    Require(stopped.Success && !survivor.Process.HasExited,
+                        "StopSession no longer preserves the local Shell after adding explicit termination.");
+                    survivor.CompleteLocally();
+                }
+
+                var mismatchFactory = new FakeManagedSessionFactory();
+                using (var mismatchRegistry = new SessionRegistry(mismatchFactory, 5))
+                {
+                    var process = Process.GetCurrentProcess();
+                    var token = new byte[SessionRegistration.HandshakeTokenBytes];
+                    using (var random = RandomNumberGenerator.Create()) random.GetBytes(token);
+                    var mismatched = new SessionRegistration(
+                        Guid.NewGuid(),
+                        "termlink-terminate-mismatch-" + Guid.NewGuid().ToString("N"),
+                        token,
+                        process.Id,
+                        ManagedShellType.Custom,
+                        process.StartTime.ToUniversalTime().AddTicks(-1),
+                        DateTime.UtcNow);
+                    string error;
+                    Require(mismatchRegistry.TryRegister(mismatched, out error),
+                        "Termination identity-mismatch fixture did not register: " + error);
+                    Require(!mismatchRegistry.TerminateSession(mismatched.SessionId),
+                        "Termination accepted a reused PID with a different process start time.");
+                }
+            }
+            finally
+            {
+                survivor.Dispose();
+                target.Dispose();
             }
         }
 
@@ -998,6 +1291,17 @@ namespace TermLink.Agent
             return summaries.Any(item => item.SessionId == sessionId);
         }
 
+        private static bool IsProcessRunning(int processId)
+        {
+            try
+            {
+                using (var process = Process.GetProcessById(processId)) return !process.HasExited;
+            }
+            catch (ArgumentException) { return false; }
+            catch (InvalidOperationException) { return false; }
+            catch (System.ComponentModel.Win32Exception) { return false; }
+        }
+
         private static void WaitUntil(Func<bool> condition, int timeoutMilliseconds, string failure)
         {
             var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
@@ -1075,7 +1379,7 @@ namespace TermLink.Agent
     }
 
     internal sealed class FakeManagedSession : IRegistryManagedSession, IRemoteControllableSession,
-        IRemoteResizableSession, IRecoveryRegistrationSession
+        IRecoveryRegistrationSession
     {
         private readonly Action<IRegistryManagedSession> completion;
         private int waitCalls;
@@ -1096,8 +1400,6 @@ namespace TermLink.Agent
         public SessionRegistration Registration { get; private set; }
         public int WaitsBeforeSuccess { get; private set; }
         public int WaitCalls { get { return Volatile.Read(ref waitCalls); } }
-        public short ResizeColumns { get; private set; }
-        public short ResizeRows { get; private set; }
         public Guid RemoteInputId { get; private set; }
         public ulong RemoteInputEpoch { get; private set; }
         public byte[] RemoteInputBytes { get; private set; }
@@ -1124,14 +1426,6 @@ namespace TermLink.Agent
 
         public void BeginStop()
         {
-        }
-
-        public bool TrySendResize(short columns, short rows)
-        {
-            if (columns < 1 || rows < 1) return false;
-            ResizeColumns = columns;
-            ResizeRows = rows;
-            return true;
         }
 
         public bool TrySendRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
@@ -1223,7 +1517,14 @@ namespace TermLink.Agent
     {
         private bool completed;
 
-        private HostFixture(Process process, Guid sessionId, string pipeName, byte[] token, string marker, int exitCode)
+        private HostFixture(
+            Process process,
+            Guid sessionId,
+            string pipeName,
+            byte[] token,
+            string marker,
+            int exitCode,
+            string childProcessIdPath)
         {
             Process = process;
             SessionId = sessionId;
@@ -1231,6 +1532,7 @@ namespace TermLink.Agent
             Token = token;
             SecretMarker = marker;
             ExitCode = exitCode;
+            ChildProcessIdPath = childProcessIdPath;
         }
 
         public Process Process { get; private set; }
@@ -1239,6 +1541,7 @@ namespace TermLink.Agent
         public byte[] Token { get; private set; }
         public string SecretMarker { get; private set; }
         public int ExitCode { get; private set; }
+        public string ChildProcessIdPath { get; private set; }
 
         public static HostFixture Start(
             string hostExecutable,
@@ -1251,9 +1554,13 @@ namespace TermLink.Agent
             var token = new byte[32];
             using (var random = RandomNumberGenerator.Create()) random.GetBytes(token);
             var marker = "SECRET_" + Guid.NewGuid().ToString("N").Substring(0, 12);
+            var childProcessIdPath = Path.Combine(
+                Path.GetTempPath(),
+                "TermLink-Child-" + Guid.NewGuid().ToString("N") + ".pid");
             var script =
                 "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);" +
                 "[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);" +
+                "[IO.File]::WriteAllText('" + childProcessIdPath.Replace("'", "''") + "',[string]$PID);" +
                 "[Console]::WriteLine('" + marker + "_READY');" +
                 "$v=[Console]::ReadLine();" +
                 "[Console]::WriteLine('" + marker + "_LOCAL:'+$v);" +
@@ -1286,7 +1593,35 @@ namespace TermLink.Agent
                 StandardErrorEncoding = new UTF8Encoding(false)
             };
             var process = Process.Start(start);
-            return new HostFixture(process, sessionId, pipe, token, marker, exitCode);
+            return new HostFixture(
+                process,
+                sessionId,
+                pipe,
+                token,
+                marker,
+                exitCode,
+                childProcessIdPath);
+        }
+
+        public int WaitForChildProcessId()
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (DateTime.UtcNow < deadline)
+            {
+                try
+                {
+                    int processId;
+                    if (File.Exists(ChildProcessIdPath) &&
+                        int.TryParse(File.ReadAllText(ChildProcessIdPath), out processId) && processId > 0)
+                    {
+                        return processId;
+                    }
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+                Thread.Sleep(50);
+            }
+            throw new TimeoutException("Child Shell did not publish its process ID.");
         }
 
         public void AdoptRegisteredSession(Guid sessionId)
@@ -1346,6 +1681,29 @@ namespace TermLink.Agent
             }
             Process.Dispose();
             Process = null;
+            try
+            {
+                int childProcessId;
+                if (File.Exists(ChildProcessIdPath) &&
+                    int.TryParse(File.ReadAllText(ChildProcessIdPath), out childProcessId))
+                {
+                    using (var child = System.Diagnostics.Process.GetProcessById(childProcessId))
+                    {
+                        if (!child.HasExited)
+                        {
+                            child.Kill();
+                            child.WaitForExit();
+                        }
+                    }
+                }
+            }
+            catch (ArgumentException) { }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+            catch (IOException) { }
+            try { if (File.Exists(ChildProcessIdPath)) File.Delete(ChildProcessIdPath); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
         }
     }
 }

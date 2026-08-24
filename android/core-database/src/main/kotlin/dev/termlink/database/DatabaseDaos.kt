@@ -74,11 +74,11 @@ interface SessionDao {
 
 @Dao
 interface EventChunkDao {
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsert(entity: EventChunkEntity)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIfAbsent(entity: EventChunkEntity): Long
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertAll(entities: List<EventChunkEntity>)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertAllIfAbsent(entities: List<EventChunkEntity>): List<Long>
 
     /** Returns all chunks which could contribute a sequence after [afterSequence]. */
     @Query(
@@ -99,6 +99,22 @@ interface EventChunkDao {
     @Query("SELECT * FROM event_chunks WHERE id = :id LIMIT 1")
     suspend fun get(id: String): EventChunkEntity?
 
+    @Query("SELECT * FROM event_chunks WHERE objectKey = :objectKey LIMIT 1")
+    suspend fun getByObjectKey(objectKey: String): EventChunkEntity?
+
+    @Query(
+        "SELECT * FROM event_chunks WHERE sessionId = :sessionId " +
+            "AND startSequence = :startSequence AND endSequence = :endSequence LIMIT 1",
+    )
+    suspend fun getForRange(
+        sessionId: String,
+        startSequence: Long,
+        endSequence: Long,
+    ): EventChunkEntity?
+
+    @Query("SELECT COUNT(*) FROM event_chunks WHERE sessionId = :sessionId")
+    suspend fun countForSession(sessionId: String): Int
+
     @Query("DELETE FROM event_chunks WHERE sessionId = :sessionId")
     suspend fun deleteForSession(sessionId: String)
 
@@ -108,11 +124,8 @@ interface EventChunkDao {
 
 @Dao
 interface SnapshotDao {
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsert(entity: SnapshotEntity)
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertAll(entities: List<SnapshotEntity>)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIfAbsent(entity: SnapshotEntity): Long
 
     @Query(
         "SELECT * FROM snapshots WHERE sessionId = :sessionId " +
@@ -127,10 +140,50 @@ interface SnapshotDao {
     @Query("SELECT * FROM snapshots WHERE id = :id LIMIT 1")
     suspend fun get(id: String): SnapshotEntity?
 
+    @Query("SELECT COUNT(*) FROM snapshots WHERE sessionId = :sessionId")
+    suspend fun countForSession(sessionId: String): Int
+
     @Query("DELETE FROM snapshots WHERE sessionId = :sessionId")
     suspend fun deleteForSession(sessionId: String)
 
     @Query("DELETE FROM snapshots")
+    suspend fun clear()
+}
+
+@Dao
+interface TranscriptPageDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIfAbsent(entity: TranscriptPageEntity): Long
+
+    @Query(
+        "SELECT * FROM transcript_pages WHERE sessionId = :sessionId " +
+            "AND snapshotSequence = :snapshotSequence AND requestBeforeLineId = :requestBeforeLineId LIMIT 1",
+    )
+    suspend fun getForCursor(
+        sessionId: String,
+        snapshotSequence: Long,
+        requestBeforeLineId: Long,
+    ): TranscriptPageEntity?
+
+    @Query("SELECT * FROM transcript_pages WHERE id = :id LIMIT 1")
+    suspend fun get(id: String): TranscriptPageEntity?
+
+    @Query("SELECT * FROM transcript_pages WHERE objectKey = :objectKey LIMIT 1")
+    suspend fun getByObjectKey(objectKey: String): TranscriptPageEntity?
+
+    @Query(
+        "SELECT * FROM transcript_pages WHERE sessionId = :sessionId AND snapshotSequence = :snapshotSequence " +
+            "ORDER BY firstLineId ASC, lastLineId ASC, id ASC",
+    )
+    suspend fun listForAnchor(sessionId: String, snapshotSequence: Long): List<TranscriptPageEntity>
+
+    @Query("SELECT COUNT(*) FROM transcript_pages WHERE sessionId = :sessionId")
+    suspend fun countForSession(sessionId: String): Int
+
+    @Query("DELETE FROM transcript_pages WHERE sessionId = :sessionId")
+    suspend fun deleteForSession(sessionId: String)
+
+    @Query("DELETE FROM transcript_pages")
     suspend fun clear()
 }
 
@@ -205,6 +258,23 @@ interface AckCursorDao {
         updatedAtEpochMillis: Long,
     ): Int
 
+    @Query(
+        """UPDATE ack_cursors
+           SET rendererGeneration = rendererGeneration + 1,
+               highestContiguousSequence = :sequence,
+               updatedAtEpochMillis = :updatedAtEpochMillis
+           WHERE sessionId = :sessionId AND direction = :direction
+             AND rendererGeneration = :expectedGeneration
+             AND highestContiguousSequence <= :sequence""",
+    )
+    suspend fun installRendererCheckpoint(
+        sessionId: String,
+        direction: String,
+        expectedGeneration: Long,
+        sequence: Long,
+        updatedAtEpochMillis: Long,
+    ): Int
+
     /** Atomically fences all writers from the previous renderer generation. */
     @Transaction
     suspend fun reset(
@@ -229,6 +299,24 @@ interface AckCursorDao {
     suspend fun deleteForSession(sessionId: String)
 
     @Query("DELETE FROM ack_cursors")
+    suspend fun clear()
+}
+
+@Dao
+interface RendererCheckpointDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(entity: RendererCheckpointEntity)
+
+    @Query("SELECT * FROM renderer_checkpoints WHERE sessionId = :sessionId AND direction = :direction LIMIT 1")
+    suspend fun get(sessionId: String, direction: String): RendererCheckpointEntity?
+
+    @Query("DELETE FROM renderer_checkpoints WHERE sessionId = :sessionId AND direction = :direction")
+    suspend fun delete(sessionId: String, direction: String)
+
+    @Query("DELETE FROM renderer_checkpoints WHERE sessionId = :sessionId")
+    suspend fun deleteForSession(sessionId: String)
+
+    @Query("DELETE FROM renderer_checkpoints")
     suspend fun clear()
 }
 

@@ -36,6 +36,7 @@ namespace TermLink.SessionHost
     internal sealed class SessionHostOptions
     {
         public string CommandLine { get; private set; }
+        public string WorkingDirectory { get; private set; }
         public int TimeoutMilliseconds { get; private set; }
         public short FallbackColumns { get; private set; }
         public short FallbackRows { get; private set; }
@@ -45,6 +46,7 @@ namespace TermLink.SessionHost
         public byte[] HandshakeToken { get; private set; }
         public int AgentBufferBytes { get; private set; }
         public string RegistryControlPipeName { get; private set; }
+        public int RegistrationTimeoutMilliseconds { get; private set; }
         public ManagedShellType ShellType { get; private set; }
         public bool AutoRegister { get { return !string.IsNullOrEmpty(RegistryControlPipeName); } }
         public bool UseAgentPipe { get { return !string.IsNullOrEmpty(AgentPipeName); } }
@@ -52,6 +54,7 @@ namespace TermLink.SessionHost
         public static SessionHostOptions Parse(string[] args)
         {
             string encodedCommand = null;
+            string encodedWorkingDirectory = null;
             var timeout = Timeout.Infinite;
             short columns = 80;
             short rows = 25;
@@ -60,7 +63,9 @@ namespace TermLink.SessionHost
             string sessionIdText = null;
             string handshakeTokenText = null;
             string managedShellText = null;
+            string managedSessionIdText = null;
             string registryControlPipeName = null;
+            var registrationTimeout = Timeout.Infinite;
             var agentBufferBytes = 4 * 1024 * 1024;
             var hasTestAgentBuffer = false;
 
@@ -70,6 +75,9 @@ namespace TermLink.SessionHost
                 {
                     case "--command-base64":
                         encodedCommand = RequiredValue(args, ref index, "--command-base64");
+                        break;
+                    case "--working-directory-base64":
+                        encodedWorkingDirectory = RequiredValue(args, ref index, "--working-directory-base64");
                         break;
                     case "--timeout-ms":
                         timeout = ParseInteger(RequiredValue(args, ref index, "--timeout-ms"), 1, 86400000, "timeout");
@@ -95,8 +103,18 @@ namespace TermLink.SessionHost
                     case "--managed-shell":
                         managedShellText = RequiredValue(args, ref index, "--managed-shell");
                         break;
+                    case "--managed-session-id":
+                        managedSessionIdText = RequiredValue(args, ref index, "--managed-session-id");
+                        break;
                     case "--registry-pipe":
                         registryControlPipeName = RequiredValue(args, ref index, "--registry-pipe");
+                        break;
+                    case "--registration-timeout-ms":
+                        registrationTimeout = ParseInteger(
+                            RequiredValue(args, ref index, "--registration-timeout-ms"),
+                            250,
+                            300000,
+                            "registration timeout");
                         break;
                     case "--test-agent-buffer-bytes":
                         agentBufferBytes = ParseInteger(
@@ -130,6 +148,33 @@ namespace TermLink.SessionHost
                 throw new ArgumentException("Decoded command line is empty or exceeds the Windows limit.");
             }
 
+            string workingDirectory = null;
+            if (!string.IsNullOrEmpty(encodedWorkingDirectory))
+            {
+                try
+                {
+                    workingDirectory = new UTF8Encoding(false, true)
+                        .GetString(Convert.FromBase64String(encodedWorkingDirectory));
+                }
+                catch (Exception error) when (error is FormatException || error is DecoderFallbackException)
+                {
+                    throw new ArgumentException("--working-directory-base64 is not valid Base64-encoded UTF-8.", error);
+                }
+                if (string.IsNullOrWhiteSpace(workingDirectory) || workingDirectory.IndexOf('\0') >= 0 ||
+                    workingDirectory.Length > 4096 || !Path.IsPathFullyQualified(workingDirectory))
+                {
+                    throw new ArgumentException("Decoded working directory must be an absolute Windows path.");
+                }
+                try { workingDirectory = Path.GetFullPath(workingDirectory); }
+                catch (Exception error) when (
+                    error is ArgumentException || error is NotSupportedException || error is PathTooLongException)
+                {
+                    throw new ArgumentException("Decoded working directory is invalid.", error);
+                }
+                if (!Directory.Exists(workingDirectory))
+                    throw new ArgumentException("Decoded working directory does not exist.");
+            }
+
             var hasAnyAgentOption = !string.IsNullOrEmpty(agentPipeName) ||
                 !string.IsNullOrEmpty(sessionIdText) || !string.IsNullOrEmpty(handshakeTokenText) ||
                 hasTestAgentBuffer;
@@ -143,7 +188,15 @@ namespace TermLink.SessionHost
                     throw new ArgumentException("--managed-shell cannot be combined with explicit Agent pipe options.");
                 }
                 shellType = ParseManagedShell(managedShellText);
-                sessionId = Guid.NewGuid();
+                if (!string.IsNullOrEmpty(managedSessionIdText))
+                {
+                    if (!Guid.TryParse(managedSessionIdText, out sessionId) || sessionId == Guid.Empty)
+                        throw new ArgumentException("--managed-session-id must be a non-empty GUID.");
+                }
+                else
+                {
+                    sessionId = Guid.NewGuid();
+                }
                 agentPipeName = "termlink-session-" + sessionId.ToString("N");
                 handshakeToken = new byte[SessionRegistration.HandshakeTokenBytes];
                 using (var random = System.Security.Cryptography.RandomNumberGenerator.Create())
@@ -157,6 +210,8 @@ namespace TermLink.SessionHost
             }
             else if (hasAnyAgentOption)
             {
+                if (!string.IsNullOrEmpty(managedSessionIdText))
+                    throw new ArgumentException("--managed-session-id requires --managed-shell.");
                 if (!string.IsNullOrEmpty(registryControlPipeName))
                 {
                     throw new ArgumentException("--registry-pipe requires --managed-shell.");
@@ -180,6 +235,14 @@ namespace TermLink.SessionHost
             {
                 throw new ArgumentException("--registry-pipe requires --managed-shell.");
             }
+            else if (!string.IsNullOrEmpty(managedSessionIdText))
+            {
+                throw new ArgumentException("--managed-session-id requires --managed-shell.");
+            }
+            if (registrationTimeout != Timeout.Infinite && string.IsNullOrEmpty(managedShellText))
+            {
+                throw new ArgumentException("--registration-timeout-ms requires --managed-shell.");
+            }
             if (!string.IsNullOrEmpty(registryControlPipeName) &&
                 (registryControlPipeName.Length > 200 || registryControlPipeName.IndexOfAny(new[] { '\\', '/' }) >= 0))
             {
@@ -193,6 +256,7 @@ namespace TermLink.SessionHost
             return new SessionHostOptions
             {
                 CommandLine = commandLine,
+                WorkingDirectory = workingDirectory,
                 TimeoutMilliseconds = timeout,
                 FallbackColumns = columns,
                 FallbackRows = rows,
@@ -202,6 +266,7 @@ namespace TermLink.SessionHost
                 HandshakeToken = handshakeToken,
                 AgentBufferBytes = agentBufferBytes,
                 RegistryControlPipeName = registryControlPipeName,
+                RegistrationTimeoutMilliseconds = registrationTimeout,
                 ShellType = shellType
             };
         }
@@ -276,7 +341,9 @@ namespace TermLink.SessionHost
         private readonly object inputSync = new object();
         private readonly object terminalWriteSync = new object();
         private readonly object resizeSync = new object();
+        private readonly object titleSync = new object();
         private readonly ManualResetEventSlim inputThreadReady = new ManualResetEventSlim(false);
+        private readonly TerminalTitleTracker titleTracker = new TerminalTitleTracker();
         private IntPtr pseudoConsoleInput = IntPtr.Zero;
         private IntPtr terminalInput = IntPtr.Zero;
         private IntPtr terminalOutput = IntPtr.Zero;
@@ -299,6 +366,7 @@ namespace TermLink.SessionHost
         private uint inputEventsPending;
         private bool restoreOuterConsoleInputMode;
         private bool restoreOuterConsoleOutputMode;
+        private string lastPublishedTitle;
         private AgentPipeBridge agentPipe;
         private AgentRegistryRegistration agentRegistration;
         private COORD innerSize;
@@ -331,7 +399,6 @@ namespace TermLink.SessionHost
                     options.HandshakeToken,
                     ApplyAgentInput,
                     ApplyAgentRemoteInput,
-                    ApplyAgentResize,
                     options.AgentBufferBytes);
                 agentPipe.Start();
                 if (options.AutoRegister)
@@ -367,10 +434,14 @@ namespace TermLink.SessionHost
             {
                 throw new InvalidOperationException("Input bridge did not start.");
             }
+            // Publish the PC-observed dimensions before the Running lifecycle
+            // so the first server upsert never invents an Android viewport or
+            // a default 80x24 size.
+            PublishAgentFrame(LocalFrameType.Resize, LocalPayloadCodec.Resize(size.X, size.Y));
+            PublishCurrentConsoleTitle();
             PublishAgentFrame(
                 LocalFrameType.Lifecycle,
                 LocalPayloadCodec.Lifecycle(LocalLifecycleState.Running, 0));
-            PublishAgentFrame(LocalFrameType.Resize, LocalPayloadCodec.Resize(size.X, size.Y));
             var handlesAtStart = Process.GetCurrentProcess().HandleCount;
             var stopwatch = Stopwatch.StartNew();
             var reason = "exited";
@@ -396,6 +467,17 @@ namespace TermLink.SessionHost
                     reason = "timeout";
                     CloseInput();
                     TerminateProcessTree(124);
+                    break;
+                }
+                if (ShouldAbortUnregisteredSession(
+                    options.AutoRegister,
+                    agentPipe != null && agentPipe.IsConnected,
+                    stopwatch.ElapsedMilliseconds,
+                    options.RegistrationTimeoutMilliseconds))
+                {
+                    reason = "registration-timeout";
+                    CloseInput();
+                    TerminateProcessTree(125);
                     break;
                 }
             }
@@ -428,7 +510,11 @@ namespace TermLink.SessionHost
             var endedSequence = PublishAgentFrame(
                 LocalFrameType.Lifecycle,
                 LocalPayloadCodec.Lifecycle(LocalLifecycleState.Ended, unchecked((int)rawExitCode)));
-            if (agentPipe != null && endedSequence > 0) agentPipe.WaitForAck(endedSequence, 2000);
+            var removedSequence = PublishAgentFrame(
+                LocalFrameType.SessionRemoved,
+                LocalPayloadCodec.SessionRemoved());
+            var terminalSequence = removedSequence > 0 ? removedSequence : endedSequence;
+            if (agentPipe != null && terminalSequence > 0) agentPipe.WaitForAck(terminalSequence, 2000);
 
             CloseChildHandles();
             CloseIfValid(ref job);
@@ -453,6 +539,15 @@ namespace TermLink.SessionHost
             }
             return reason == "timeout" ? 124 : unchecked((int)rawExitCode);
         }
+
+        internal static bool ShouldAbortUnregisteredSession(
+            bool autoRegister,
+            bool agentConnected,
+            long elapsedMilliseconds,
+            int registrationTimeoutMilliseconds) =>
+            autoRegister && !agentConnected &&
+            registrationTimeoutMilliseconds != Timeout.Infinite &&
+            elapsedMilliseconds >= registrationTimeoutMilliseconds;
 
         private void CreateInnerPseudoConsole(COORD size)
         {
@@ -516,7 +611,7 @@ namespace TermLink.SessionHost
                     false,
                     ExtendedStartupInfoPresent | CreateSuspended,
                     IntPtr.Zero,
-                    null,
+                    options.WorkingDirectory,
                     ref startup,
                     out processInfo),
                 "CreateProcessW");
@@ -762,12 +857,6 @@ namespace TermLink.SessionHost
             return LocalRemoteInputResult.Accepted;
         }
 
-        private void ApplyAgentResize(short columns, short rows)
-        {
-            var requested = new COORD { X = columns, Y = rows };
-            if (!ResizeInner(requested)) throw new COMException("Agent resize failed.");
-        }
-
         private void StopInputBridge(Task inputTask)
         {
             stopInput = true;
@@ -842,6 +931,7 @@ namespace TermLink.SessionHost
                 var agentBytes = new byte[total];
                 Buffer.BlockCopy(buffer, 0, agentBytes, 0, total);
                 PublishAgentFrame(LocalFrameType.Output, agentBytes);
+                titleTracker.Process(agentBytes, PublishTitleIfChanged);
                 if (!WriteAll(outerOutput, buffer, total))
                 {
                     outputDisconnected = true;
@@ -859,8 +949,31 @@ namespace TermLink.SessionHost
                 {
                     if (ResizeInner(current)) previous = current;
                 }
+                PublishCurrentConsoleTitle();
                 Thread.Sleep(40);
             }
+        }
+
+        private void PublishCurrentConsoleTitle()
+        {
+            var buffer = new StringBuilder(4096);
+            var length = GetConsoleTitle(buffer, buffer.Capacity);
+            if (length > 0 || Marshal.GetLastWin32Error() == 0)
+                PublishTitleIfChanged(buffer.ToString());
+        }
+
+        private void PublishTitleIfChanged(string title)
+        {
+            byte[] payload;
+            try { payload = LocalPayloadCodec.Title(title); }
+            catch (ArgumentException) { return; }
+            var normalized = LocalPayloadCodec.ParseTitle(payload);
+            lock (titleSync)
+            {
+                if (string.Equals(lastPublishedTitle, normalized, StringComparison.Ordinal)) return;
+                lastPublishedTitle = normalized;
+            }
+            PublishAgentFrame(LocalFrameType.Title, payload);
         }
 
         private bool ResizeInner(COORD size)
@@ -1166,6 +1279,9 @@ namespace TermLink.SessionHost
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool GetConsoleScreenBufferInfo(IntPtr output, out CONSOLE_SCREEN_BUFFER_INFO info);
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetConsoleTitle(StringBuilder title, int size);
+
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CreatePipe(out IntPtr readPipe, out IntPtr writePipe, IntPtr attributes, uint size);
 
@@ -1242,6 +1358,7 @@ namespace TermLink.SessionHost
         private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
         private Task worker;
         private bool disposed;
+        private DateTime nextLaunchAttemptUtc;
 
         public AgentRegistryRegistration(
             string controlPipeName,
@@ -1296,8 +1413,8 @@ namespace TermLink.SessionHost
                     }
                     catch (ArgumentException) { ReportException("ArgumentException"); }
                     catch (InvalidDataException) { ReportException("InvalidDataException"); }
-                    catch (IOException) { ReportException("IOException"); }
-                    catch (TimeoutException) { ReportException("TimeoutException"); }
+                    catch (IOException) { ReportException("IOException"); TryLaunchTermLink(); }
+                    catch (TimeoutException) { ReportException("TimeoutException"); TryLaunchTermLink(); }
                     catch (UnauthorizedAccessException) { ReportException("UnauthorizedAccessException"); }
                 }
                 if (cancellation.Token.WaitHandle.WaitOne(500)) return;
@@ -1307,6 +1424,33 @@ namespace TermLink.SessionHost
         private void ReportException(string exceptionType)
         {
             if (diagnostic != null) diagnostic("exception=" + exceptionType);
+        }
+
+        private void TryLaunchTermLink()
+        {
+            var now = DateTime.UtcNow;
+            if (now < nextLaunchAttemptUtc) return;
+            nextLaunchAttemptUtc = now.AddSeconds(30);
+            try
+            {
+                var executable = Path.Combine(AppContext.BaseDirectory, "TermLink.exe");
+                if (!File.Exists(executable)) return;
+                using (var process = Process.Start(new ProcessStartInfo
+                {
+                    FileName = executable,
+                    WorkingDirectory = AppContext.BaseDirectory,
+                    UseShellExecute = true
+                }))
+                {
+                    if (diagnostic != null) diagnostic(process == null
+                        ? "main-launch-failed"
+                        : "main-launch-requested");
+                }
+            }
+            catch (IOException error) { ReportException("MainLaunch" + error.GetType().Name); }
+            catch (UnauthorizedAccessException error) { ReportException("MainLaunch" + error.GetType().Name); }
+            catch (InvalidOperationException error) { ReportException("MainLaunch" + error.GetType().Name); }
+            catch (Win32Exception error) { ReportException("MainLaunch" + error.GetType().Name); }
         }
 
         public void Dispose()
@@ -1326,7 +1470,6 @@ namespace TermLink.SessionHost
         private readonly byte[] handshakeToken;
         private readonly Action<Guid, byte[]> inputHandler;
         private readonly Func<Guid, ulong, byte[], LocalRemoteInputResult> remoteInputHandler;
-        private readonly Action<short, short> resizeHandler;
         private readonly int maximumBufferedBytes;
         private readonly object sync = new object();
         private readonly LinkedList<LocalFrame> pending = new LinkedList<LocalFrame>();
@@ -1346,7 +1489,6 @@ namespace TermLink.SessionHost
             byte[] handshakeToken,
             Action<Guid, byte[]> inputHandler,
             Func<Guid, ulong, byte[], LocalRemoteInputResult> remoteInputHandler,
-            Action<short, short> resizeHandler,
             int maximumBufferedBytes)
         {
             this.pipeName = pipeName;
@@ -1354,7 +1496,6 @@ namespace TermLink.SessionHost
             this.handshakeToken = handshakeToken;
             this.inputHandler = inputHandler;
             this.remoteInputHandler = remoteInputHandler;
-            this.resizeHandler = resizeHandler;
             this.maximumBufferedBytes = maximumBufferedBytes;
         }
 
@@ -1521,12 +1662,6 @@ namespace TermLink.SessionHost
                             Array.Clear(bytes, 0, bytes.Length);
                             Array.Clear(frame.Payload, 0, frame.Payload.Length);
                         }
-                        break;
-                    case LocalFrameType.ResizeRequest:
-                        short columns;
-                        short rows;
-                        LocalPayloadCodec.ParseResize(frame.Payload, out columns, out rows);
-                        resizeHandler(columns, rows);
                         break;
                     case LocalFrameType.RemoteInputV2:
                         ulong localInputEpoch;

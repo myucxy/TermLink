@@ -3,12 +3,15 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <AssemblyName>TermLink.Setup</AssemblyName>
     <RootNamespace>TermLink.Setup</RootNamespace>
     <ApplicationIcon>..\..\..\assets\brand\windows\TermLink.ico</ApplicationIcon>
     <PayloadPath Condition="'$(PayloadPath)' == ''">$(MSBuildProjectDirectory)\payload.zip</PayloadPath>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="..\Common\WindowsTerminalIntegration.cs" Link="Common\WindowsTerminalIntegration.cs" />
+    <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
     <EmbeddedResource Include="..\..\..\assets\brand\windows\TermLink.ico"
                       LogicalName="TermLink.Setup.Assets.TermLink.ico" />
     <EmbeddedResource Include="$(PayloadPath)"

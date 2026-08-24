@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <StartupObject>TermLink.Setup.Validation.ValidationProgram</StartupObject>
+    <AssemblyName>TermLink.WindowsSetup.Validation</AssemblyName>
+    <RootNamespace>TermLink.Setup.Validation</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\AgentControl\TermLink.AgentControl.csproj" />
+    <Compile Include="..\..\src\Common\WindowsTerminalIntegration.cs" Link="Common\WindowsTerminalIntegration.cs" />
+    <Compile Include="..\..\src\Setup\Program.cs" Link="Setup\Program.cs" />
+    <Compile Include="..\..\src\Setup\SetupForm.cs" Link="Setup\SetupForm.cs" />
+  </ItemGroup>
+</Project>

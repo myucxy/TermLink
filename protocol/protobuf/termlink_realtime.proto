@@ -57,6 +57,9 @@ enum MessageType {
   SESSION_STARTED = 80;
   SESSION_INTERRUPTED = 81;
   SESSION_ENDED = 82;
+  // Android asks the authoritative Windows PC to terminate the registered
+  // SessionHost and its child Shell process tree.
+  SESSION_TERMINATE_REQUEST = 83;
 }
 
 // These payloads are serialized and encrypted into Envelope.ciphertext. The
@@ -90,6 +93,13 @@ message SessionUpsertPayload {
   // Presence distinguishes a real successful exit (0) from an older sender
   // that did not publish the exit result.
   optional int32 exit_code = 8;
+  // This payload is already sealed inside the recipient-specific Envelope.
+  // Absence retains the current title; a present empty value clears it.
+  optional string title = 9;
+}
+message SessionTerminateRequestPayload {
+  bytes request_id = 1;
+  string reason_code = 2;
 }
 message SubscribePayload { uint64 resume_from_seq = 1; bytes subscriber_exchange_public_key = 2; }
 message LeasePayload { bytes lease_id = 1; int64 version = 2; int64 expires_at_ms = 3; string reason_code = 4; uint64 local_input_epoch = 5; }
@@ -117,4 +127,266 @@ message HistoryEventV1 {
   uint64 seq = 1;
   MessageType message_type = 2;
   bytes payload = 3;
+}
+
+// TerminalSnapshotV1 is an experimental, runtime-disabled normalized terminal
+// checkpoint. It is sealed into TerminalSnapshotCiphertextV1 and transferred
+// as a history object over REST. snapshot_seq anchors existing ordered events
+// through S; the object does not consume an Envelope.seq and MUST NOT be sent
+// with SNAPSHOT_OFFER or SNAPSHOT_CHUNK.
+enum SnapshotCompressionV1 {
+  SNAPSHOT_COMPRESSION_V1_UNSPECIFIED = 0;
+  SNAPSHOT_COMPRESSION_V1_NONE = 1;
+  SNAPSHOT_COMPRESSION_V1_ZSTD = 2;
+}
+
+enum TerminalScreenKindV1 {
+  TERMINAL_SCREEN_KIND_V1_UNSPECIFIED = 0;
+  TERMINAL_SCREEN_KIND_V1_PRIMARY = 1;
+  TERMINAL_SCREEN_KIND_V1_ALTERNATE = 2;
+}
+
+enum SnapshotParserStateV1 {
+  SNAPSHOT_PARSER_STATE_V1_UNSPECIFIED = 0;
+  SNAPSHOT_PARSER_STATE_V1_GROUND = 1;
+}
+
+enum TerminalCursorStyleV1 {
+  TERMINAL_CURSOR_STYLE_V1_UNSPECIFIED = 0;
+  TERMINAL_CURSOR_STYLE_V1_BLOCK = 1;
+  TERMINAL_CURSOR_STYLE_V1_UNDERLINE = 2;
+  TERMINAL_CURSOR_STYLE_V1_BAR = 3;
+}
+
+enum TerminalUnderlineStyleV1 {
+  TERMINAL_UNDERLINE_STYLE_V1_UNSPECIFIED = 0;
+  TERMINAL_UNDERLINE_STYLE_V1_NONE = 1;
+  TERMINAL_UNDERLINE_STYLE_V1_SINGLE = 2;
+  TERMINAL_UNDERLINE_STYLE_V1_DOUBLE = 3;
+  TERMINAL_UNDERLINE_STYLE_V1_CURLY = 4;
+  TERMINAL_UNDERLINE_STYLE_V1_DOTTED = 5;
+  TERMINAL_UNDERLINE_STYLE_V1_DASHED = 6;
+}
+
+enum TerminalCharsetV1 {
+  TERMINAL_CHARSET_V1_UNSPECIFIED = 0;
+  TERMINAL_CHARSET_V1_ASCII = 1;
+  TERMINAL_CHARSET_V1_DEC_SPECIAL_GRAPHICS = 2;
+  TERMINAL_CHARSET_V1_UK = 3;
+  TERMINAL_CHARSET_V1_LATIN_1 = 4;
+}
+
+enum TerminalMouseTrackingV1 {
+  TERMINAL_MOUSE_TRACKING_V1_UNSPECIFIED = 0;
+  TERMINAL_MOUSE_TRACKING_V1_NONE = 1;
+  TERMINAL_MOUSE_TRACKING_V1_X10 = 2;
+  TERMINAL_MOUSE_TRACKING_V1_NORMAL = 3;
+  TERMINAL_MOUSE_TRACKING_V1_BUTTON_EVENT = 4;
+  TERMINAL_MOUSE_TRACKING_V1_ANY_EVENT = 5;
+}
+
+enum TerminalMouseEncodingV1 {
+  TERMINAL_MOUSE_ENCODING_V1_UNSPECIFIED = 0;
+  TERMINAL_MOUSE_ENCODING_V1_DEFAULT = 1;
+  TERMINAL_MOUSE_ENCODING_V1_UTF8 = 2;
+  TERMINAL_MOUSE_ENCODING_V1_SGR = 3;
+  TERMINAL_MOUSE_ENCODING_V1_URXVT = 4;
+  TERMINAL_MOUSE_ENCODING_V1_SGR_PIXELS = 5;
+}
+
+enum TerminalLifecycleV1 {
+  TERMINAL_LIFECYCLE_V1_UNSPECIFIED = 0;
+  TERMINAL_LIFECYCLE_V1_RUNNING = 1;
+  TERMINAL_LIFECYCLE_V1_INTERRUPTED = 2;
+  TERMINAL_LIFECYCLE_V1_ENDED = 3;
+}
+
+// A color is either the terminal default, a palette index, or 0xRRGGBB.
+message TerminalColorRefV1 {
+  oneof value {
+    bool default_color = 1;
+    uint32 palette_index = 2;
+    fixed32 rgb = 3;
+  }
+}
+
+message TerminalPaletteV1 {
+  // Exactly 256 entries, each encoded as 0xRRGGBB.
+  repeated fixed32 colors_rgb = 1;
+  fixed32 default_foreground_rgb = 2;
+  fixed32 default_background_rgb = 3;
+  fixed32 default_cursor_rgb = 4;
+}
+
+message TerminalHyperlinkV1 {
+  string id = 1;
+  string uri = 2;
+  string params = 3;
+}
+
+message TerminalStyleV1 {
+  TerminalColorRefV1 foreground = 1;
+  TerminalColorRefV1 background = 2;
+  TerminalColorRefV1 underline_color = 3;
+  // Bit 0 bold, 1 dim, 2 italic, 3 underline, 4 blink, 5 inverse,
+  // 6 invisible, 7 strikethrough, and 8 protected.
+  uint32 attributes = 4;
+  TerminalUnderlineStyleV1 underline_style = 5;
+  // Zero means no hyperlink; otherwise this is hyperlink-table index + 1.
+  uint32 hyperlink_index_plus_one = 6;
+}
+
+message TerminalCharsetStateV1 {
+  TerminalCharsetV1 g0 = 1;
+  TerminalCharsetV1 g1 = 2;
+  TerminalCharsetV1 g2 = 3;
+  TerminalCharsetV1 g3 = 4;
+  uint32 gl = 5;
+  uint32 gr = 6;
+}
+
+message TerminalCursorStateV1 {
+  uint32 column = 1;
+  uint32 row = 2;
+  bool visible = 3;
+  TerminalCursorStyleV1 style = 4;
+  bool blink = 5;
+  uint32 rendition_style_index = 6;
+  TerminalCharsetStateV1 charset = 7;
+  bool origin_mode = 8;
+  bool pending_wrap = 9;
+}
+
+message TerminalModesV1 {
+  bool auto_wrap = 1;
+  bool origin = 2;
+  bool insert = 3;
+  bool newline = 4;
+  bool reverse_video = 5;
+  bool application_cursor = 6;
+  bool application_keypad = 7;
+  bool bracketed_paste = 8;
+  bool focus_reporting = 9;
+  bool left_right_margin = 10;
+  TerminalMouseTrackingV1 mouse_tracking = 11;
+  TerminalMouseEncodingV1 mouse_encoding = 12;
+}
+
+message TerminalCellRunV1 {
+  uint32 repeat = 1;
+  string grapheme = 2;
+  uint32 display_width = 3;
+  uint32 style_index = 4;
+  bool wide_continuation = 5;
+}
+
+message TerminalRowV1 {
+  // Primary/transcript IDs share one positive increasing namespace. New V1
+  // producers write zero for alternate rows. Importers may accept legacy
+  // non-zero alternate IDs but must ignore them semantically.
+  uint64 line_id = 1;
+  // Zero is permitted for a visible row not yet sealed by ordered output.
+  uint64 sealed_at_seq = 2;
+  bool soft_wrapped = 3;
+  repeated TerminalCellRunV1 runs = 4;
+}
+
+message TerminalScreenV1 {
+  repeated TerminalRowV1 visible_rows = 1;
+  TerminalCursorStateV1 cursor = 2;
+  TerminalCursorStateV1 saved_cursor = 3;
+  uint32 scroll_top = 4;
+  uint32 scroll_bottom = 5;
+  uint32 margin_left = 6;
+  uint32 margin_right = 7;
+  uint32 current_style_index = 8;
+  bool pending_wrap = 9;
+  string last_printed_grapheme = 10;
+  TerminalCharsetStateV1 charset = 11;
+}
+
+message TerminalSessionProjectionV1 {
+  TerminalLifecycleV1 lifecycle = 1;
+  optional sint32 exit_code = 2;
+  uint64 observed_local_input_epoch = 3;
+}
+
+message TerminalSnapshotV1 {
+  uint32 format_version = 1;
+  uint64 snapshot_seq = 2;
+  uint32 columns = 3;
+  uint32 rows = 4;
+  TerminalScreenKindV1 active_screen = 5;
+  TerminalScreenV1 primary_screen = 6;
+  TerminalScreenV1 alternate_screen = 7;
+  TerminalModesV1 modes = 8;
+  TerminalPaletteV1 palette = 9;
+  repeated uint32 tab_stops = 10;
+  repeated TerminalStyleV1 style_table = 11;
+  repeated TerminalHyperlinkV1 hyperlink_table = 12;
+  // Phase 1 producers MUST leave this empty. Older rows are fetched as
+  // independent TerminalTranscriptPageV1 objects.
+  repeated TerminalRowV1 scrollback_rows = 13;
+  // Zero while scrollback_rows is empty in V1.
+  uint64 scrollback_first_line_id = 14;
+  // Exactly max(primary_screen.visible_rows.line_id) + 1.
+  uint64 next_transcript_line_id = 15;
+  bool scrollback_truncated = 16;
+  string title = 17;
+  TerminalSessionProjectionV1 projection = 18;
+  SnapshotParserStateV1 parser_state = 19;
+}
+
+message TerminalSnapshotCiphertextV1 {
+  uint32 container_version = 1;
+  bytes session_id = 2;
+  bytes pc_device_id = 3;
+  bytes recipient_device_id = 4;
+  int64 key_epoch = 5;
+  string key_id = 6;
+  uint64 snapshot_seq = 7;
+  uint32 columns = 8;
+  uint32 rows = 9;
+  string format_name = 10;
+  uint32 format_version = 11;
+  SnapshotCompressionV1 compression = 12;
+  uint64 uncompressed_bytes = 13;
+  bytes nonce = 14;
+  bytes ciphertext = 15;
+}
+
+// Transcript pages are an independent, read-only row projection. They never
+// advance the live ACK and their rows must never be prepended to a live VT
+// parser. Each page is sealed into TerminalTranscriptCiphertextV1 for REST.
+message TerminalTranscriptPageV1 {
+  // All pages in one traversal retain this fixed snapshot anchor.
+  uint32 format_version = 1;
+  uint64 as_of_snapshot_seq = 2;
+  uint64 first_line_id = 3;
+  uint64 last_line_id = 4;
+  bool has_more_before = 5;
+  // Equals first_line_id when has_more_before, otherwise the zero sentinel.
+  uint64 next_before_line_id = 6;
+  repeated TerminalStyleV1 style_table = 7;
+  repeated TerminalHyperlinkV1 hyperlink_table = 8;
+  TerminalPaletteV1 palette = 9;
+  repeated TerminalRowV1 rows = 10;
+}
+
+message TerminalTranscriptCiphertextV1 {
+  uint32 container_version = 1;
+  bytes session_id = 2;
+  bytes pc_device_id = 3;
+  bytes recipient_device_id = 4;
+  int64 key_epoch = 5;
+  string key_id = 6;
+  uint64 as_of_snapshot_seq = 7;
+  uint64 first_line_id = 8;
+  uint64 last_line_id = 9;
+  string format_name = 10;
+  uint32 format_version = 11;
+  SnapshotCompressionV1 compression = 12;
+  uint64 uncompressed_bytes = 13;
+  bytes nonce = 14;
+  bytes ciphertext = 15;
 }

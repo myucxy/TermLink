@@ -1,11 +1,100 @@
 [CmdletBinding()]
 param(
-    [switch]$Reset
+    [switch]$Reset,
+    [string]$LanAddress,
+    [string]$LuckyBindAddress = '0.0.0.0',
+    [ValidateRange(1, 65535)][int]$LuckyPort = 8080
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Import-Module (Join-Path $PSScriptRoot 'ProductionAcceptance.Common.psm1') -Force
+
+function Set-AcceptanceEndpointEnvironment {
+    param(
+        [string]$Address,
+        [string]$PublicUpstreamBindAddress,
+        [ValidateRange(1, 65535)][int]$PublicUpstreamPort
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Address)) {
+        $parsedBindAddress = $null
+        if (-not [Net.IPAddress]::TryParse($PublicUpstreamBindAddress.Trim(), [ref]$parsedBindAddress) -or
+            $parsedBindAddress.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) {
+            throw 'LuckyBindAddress must be an IPv4 address assigned to this host, or 0.0.0.0.'
+        }
+        $normalizedBindAddress = $parsedBindAddress.ToString()
+        if ($normalizedBindAddress -ne '0.0.0.0') {
+            $assigned = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
+                $_.IPAddress -eq $normalizedBindAddress
+            })
+            if ($assigned.Count -eq 0) {
+                throw "LuckyBindAddress '$normalizedBindAddress' is not assigned to this host."
+            }
+        }
+        $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN = 'https://termlink.kget.cc:8910'
+        $env:TERMLINK_ACCEPTANCE_PUBLIC_HOST = 'termlink.kget.cc'
+        $env:TERMLINK_ACCEPTANCE_PUBLIC_PORT = '8910'
+        $env:TERMLINK_ACCEPTANCE_PUBLIC_SCHEME = 'https'
+        $env:TERMLINK_ACCEPTANCE_HISTORY_ORIGIN = $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN
+        $env:TERMLINK_ACCEPTANCE_HISTORY_HOST = 'history.127.0.0.1.sslip.io'
+        $env:TERMLINK_ACCEPTANCE_EDGE_BIND_IP = '127.0.0.1'
+        $env:TERMLINK_ACCEPTANCE_LUCKY_BIND_IP = $normalizedBindAddress
+        $env:TERMLINK_ACCEPTANCE_LUCKY_PORT = $PublicUpstreamPort.ToString([Globalization.CultureInfo]::InvariantCulture)
+        return [pscustomobject]@{
+            Root = $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN
+            PublicOrigin = $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN
+            HistoryOrigin = $env:TERMLINK_ACCEPTANCE_HISTORY_ORIGIN
+        }
+    }
+
+    $parsedAddress = $null
+    if (-not [Net.IPAddress]::TryParse($Address.Trim(), [ref]$parsedAddress) -or
+        $parsedAddress.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) {
+        throw 'LanAddress must be an IPv4 address assigned to this host.'
+    }
+    $normalizedAddress = $parsedAddress.ToString()
+    $assigned = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
+        $_.IPAddress -eq $normalizedAddress
+    })
+    if ($assigned.Count -eq 0) {
+        throw "LanAddress '$normalizedAddress' is not assigned to this host."
+    }
+
+    $publicHost = "termlink.$normalizedAddress.sslip.io"
+    $historyHost = "history.$normalizedAddress.sslip.io"
+    $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN = "https://${publicHost}:9443"
+    $env:TERMLINK_ACCEPTANCE_PUBLIC_HOST = $publicHost
+    $env:TERMLINK_ACCEPTANCE_PUBLIC_PORT = '9443'
+    $env:TERMLINK_ACCEPTANCE_PUBLIC_SCHEME = 'https'
+    $env:TERMLINK_ACCEPTANCE_HISTORY_ORIGIN = "https://${historyHost}:9443"
+    $env:TERMLINK_ACCEPTANCE_HISTORY_HOST = $historyHost
+    $env:TERMLINK_ACCEPTANCE_EDGE_BIND_IP = '0.0.0.0'
+    $parsedBindAddress = $null
+    if (-not [Net.IPAddress]::TryParse($PublicUpstreamBindAddress.Trim(), [ref]$parsedBindAddress) -or
+        $parsedBindAddress.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) {
+        throw 'LuckyBindAddress must be an IPv4 address assigned to this host, or 0.0.0.0.'
+    }
+    $normalizedBindAddress = $parsedBindAddress.ToString()
+    if ($normalizedBindAddress -ne '0.0.0.0') {
+        $assignedBindAddress = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
+            $_.IPAddress -eq $normalizedBindAddress
+        })
+        if ($assignedBindAddress.Count -eq 0) {
+            throw "LuckyBindAddress '$normalizedBindAddress' is not assigned to this host."
+        }
+    }
+    # Keep the compatibility Lucky listener configurable on the LAN path too.
+    # Public reverse proxies may already target this listener instead of the
+    # local TLS edge, so silently forcing loopback would break a healthy stack.
+    $env:TERMLINK_ACCEPTANCE_LUCKY_BIND_IP = $normalizedBindAddress
+    $env:TERMLINK_ACCEPTANCE_LUCKY_PORT = $PublicUpstreamPort.ToString([Globalization.CultureInfo]::InvariantCulture)
+    return [pscustomobject]@{
+        Root = $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN
+        PublicOrigin = $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN
+        HistoryOrigin = $env:TERMLINK_ACCEPTANCE_HISTORY_ORIGIN
+    }
+}
 
 function New-RandomText {
     param([ValidateRange(16, 128)][int]$ByteCount)
@@ -33,11 +122,10 @@ function Wait-ProductionAcceptanceStack {
         [ValidateRange(30, 900)][int]$TimeoutSeconds = 300
     )
 
-    $healthyServices = @('edge', 'lucky-upstream', 'postgres', 'valkey', 'minio', 'server')
-    $runningServices = @('keycloak')
+    $healthyServices = @('edge', 'lucky-upstream', 'postgres', 'valkey', 'minio', 'server', 'keycloak')
+    $runningServices = @()
     $completedServices = @(
-        'runtime-secrets-init', 'oidc-ca-ready', 'keycloak-init',
-        'server-secrets-init', 'migrate'
+        'runtime-secrets-init', 'keycloak-init', 'server-secrets-init', 'migrate'
     )
     $expectedServices = @($healthyServices + $runningServices + $completedServices)
     $timer = [Diagnostics.Stopwatch]::StartNew()
@@ -103,6 +191,10 @@ function Wait-ProductionAcceptanceStack {
     throw "The production acceptance stack did not become ready within $TimeoutSeconds seconds: $summary."
 }
 
+$endpoints = Set-AcceptanceEndpointEnvironment `
+    -Address $LanAddress `
+    -PublicUpstreamBindAddress $LuckyBindAddress `
+    -PublicUpstreamPort $LuckyPort
 $paths = Get-TermLinkAcceptancePaths
 if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container)) {
     if (-not (Test-Path -LiteralPath $paths.Marker -PathType Leaf)) {
@@ -208,7 +300,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the Keycloak policy initiali
 # Docker Desktop, leaving the waiter bound to a removed container ID. Poll the
 # single stable container set instead and require every initializer and health
 # check to reach its production-ready terminal state.
-& docker compose -f $paths.ComposeFile up --build --detach
+& docker compose -f $paths.ComposeFile up --build --detach --remove-orphans
 if ($LASTEXITCODE -ne 0) { throw 'Could not build or recreate the production acceptance stack.' }
 Wait-ProductionAcceptanceStack -ComposeFile $paths.ComposeFile -TimeoutSeconds 300
 
@@ -238,8 +330,9 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $paths.RootCa -PathType
     throw 'Could not export the disposable acceptance CA certificate.'
 }
 
-$env:TERMLINK_ACCEPTANCE_ROOT_URL = 'https://api.127.0.0.1.sslip.io:9443'
-$env:TERMLINK_ACCEPTANCE_OIDC_ISSUER = 'https://termlink.kget.cc:8910/realms/termlink'
+$env:TERMLINK_ACCEPTANCE_ROOT_URL = $endpoints.Root
+$env:TERMLINK_ACCEPTANCE_OIDC_ISSUER = "$($endpoints.PublicOrigin)/realms/termlink"
+$env:TERMLINK_ACCEPTANCE_HISTORY_ORIGIN = $endpoints.HistoryOrigin
 $env:TERMLINK_ACCEPTANCE_CA_FILE = $paths.RootCa
 $env:TERMLINK_ACCEPTANCE_USER_NAME = 'acceptance-probe'
 $env:TERMLINK_ACCEPTANCE_PROBE_IDENTITY_FILE = $paths.ProbeIdentity
@@ -263,9 +356,18 @@ if (-not (Test-Path -LiteralPath $paths.InitialAdminReady -PathType Leaf) -and
 }
 Protect-TermLinkAcceptanceSecretTree -SecretRoot $paths.SecretRoot
 
+# Keep completed jobs available for diagnostics until every probe succeeds,
+# then remove only their stopped containers. Named data, secret volumes, and
+# images remain untouched.
+$oneShotServices = @(
+    'runtime-secrets-init', 'keycloak-init', 'server-secrets-init', 'migrate'
+)
+& docker compose -f $paths.ComposeFile rm --force @oneShotServices
+if ($LASTEXITCODE -ne 0) { throw 'Could not remove completed production acceptance jobs.' }
+
 Write-Output 'TermLink production acceptance stack is running.'
-Write-Output 'API: https://api.127.0.0.1.sslip.io:9443'
-Write-Output 'Public API/OIDC: https://termlink.kget.cc:8910'
+Write-Output "API: $($endpoints.Root)"
+Write-Output "Public API/OIDC: $($endpoints.PublicOrigin)"
 Write-Output "CA certificate: $($paths.RootCa)"
 if (-not (Test-Path -LiteralPath $paths.InitialAdminClaimed -PathType Leaf)) {
     Write-Output 'Initial admin is ready. Retrieve its temporary password once with server\ops\Get-InitialAdminPassword.ps1.'

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
+using System.IO.Pipes;
 using System.Linq;
 using System.Reflection;
 using System.Security.Cryptography;
@@ -10,7 +11,10 @@ using System.Security;
 using System.Text;
 using System.Text.Json;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Microsoft.Win32;
+using TermLink.Agent;
+using TermLink.WindowsIntegration;
 
 namespace TermLink.Setup
 {
@@ -23,11 +27,14 @@ namespace TermLink.Setup
         [STAThread]
         public static int Main(string[] args)
         {
+            System.Windows.Forms.Application.SetHighDpiMode(
+                System.Windows.Forms.HighDpiMode.PerMonitorV2);
             try
             {
                 var invokedAsUninstaller = IsUninstallerExecutable();
                 if (invokedAsUninstaller && args.Length == 0)
                 {
+                    DetachFromInheritedWorkingDirectory();
                     return Installer.LaunchInstalledUninstaller();
                 }
                 var options = SetupArguments.Parse(args);
@@ -41,22 +48,46 @@ namespace TermLink.Setup
                 {
                     if (invokedAsUninstaller && string.IsNullOrWhiteSpace(options.CleanupSelfPath))
                     {
-                        return Installer.LaunchInstalledUninstaller(options.InstallDirectory);
+                        var delegatedRoot = string.IsNullOrWhiteSpace(options.InstallDirectory)
+                            ? null
+                            : Path.GetFullPath(options.InstallDirectory);
+                        DetachFromInheritedWorkingDirectory();
+                        return Installer.LaunchInstalledUninstaller(
+                            delegatedRoot,
+                            options.PurgeKnownRuntimeData);
                     }
-                    var root = options.InstallDirectory ?? Installer.DiscoverPreviousInstallDirectory();
-                    Installer.Uninstall(root);
-                    Installer.ScheduleSelfDelete(options.CleanupSelfPath);
+                    // Resolve caller-supplied relative paths before detaching
+                    // from an inherited install-root working directory.
+                    var root = string.IsNullOrWhiteSpace(options.InstallDirectory)
+                        ? Installer.DiscoverPreviousInstallDirectory()
+                        : Path.GetFullPath(options.InstallDirectory);
+                    var cleanupSelfPath = string.IsNullOrWhiteSpace(options.CleanupSelfPath)
+                        ? null
+                        : Path.GetFullPath(options.CleanupSelfPath);
+                    DetachFromInheritedWorkingDirectory();
+                    Installer.Uninstall(root, options.PurgeKnownRuntimeData);
+                    Installer.ScheduleSelfDelete(cleanupSelfPath);
                     return 0;
                 }
 
                 if (!string.IsNullOrWhiteSpace(options.InstallDirectory))
                 {
-                    Installer.Install(options.InstallDirectory, options.CreateStartup);
+                    var installDirectory = Path.GetFullPath(options.InstallDirectory);
+                    DetachFromInheritedWorkingDirectory();
+                    Installer.Install(
+                        installDirectory,
+                        options.CreateStartup,
+                        options.TerminateRunningProcesses);
+                    if (!options.NoLaunch && !Installer.TryLaunchTray(installDirectory))
+                    {
+                        Console.Error.WriteLine(
+                            "安装已完成，但 TermLink 主程序未通过本地控制管道健康检查；请从开始菜单重试启动 TermLink。");
+                        return 2;
+                    }
                     return 0;
                 }
 
-                System.Windows.Forms.Application.SetHighDpiMode(
-                    System.Windows.Forms.HighDpiMode.PerMonitorV2);
+                DetachFromInheritedWorkingDirectory();
                 System.Windows.Forms.Application.EnableVisualStyles();
                 System.Windows.Forms.Application.SetCompatibleTextRenderingDefault(false);
                 System.Windows.Forms.Application.Run(new SetupForm());
@@ -104,6 +135,15 @@ namespace TermLink.Setup
             return !string.IsNullOrWhiteSpace(processPath) &&
                 string.Equals(Path.GetFileName(processPath), "TermLink.Uninstall.exe", StringComparison.OrdinalIgnoreCase);
         }
+
+        private static void DetachFromInheritedWorkingDirectory()
+        {
+            // An in-app update is commonly launched by TermLink.exe while that
+            // process has the install root as its current directory. Inheriting
+            // it can give Setup its own handle to the directory it must rename.
+            // The installed uninstaller has the same self-lock risk.
+            Directory.SetCurrentDirectory(Path.GetFullPath(Path.GetTempPath()));
+        }
     }
 
     internal sealed class SetupArguments
@@ -113,12 +153,18 @@ namespace TermLink.Setup
             "  TermLink-Setup.exe                         打开安装向导\n" +
             "  TermLink-Setup.exe --install-dir <目录>     静默安装\n" +
             "  TermLink-Setup.exe --install-dir <目录> --no-startup\n" +
+            "  TermLink-Setup.exe --install-dir <目录> --no-launch\n" +
+            "  TermLink-Setup.exe --install-dir <目录> --terminate-running\n" +
             "  TermLink-Setup.exe --uninstall [<目录>]     卸载\n" +
+            "  TermLink-Setup.exe --uninstall [<目录>] --purge-known-runtime-data\n" +
             "  TermLink-Setup.exe --help                   显示帮助";
 
         public string InstallDirectory { get; private set; }
         public bool Uninstall { get; private set; }
         public bool CreateStartup { get; private set; } = true;
+        public bool PurgeKnownRuntimeData { get; private set; }
+        public bool TerminateRunningProcesses { get; private set; }
+        public bool NoLaunch { get; private set; }
         public bool Help { get; private set; }
         public string CleanupSelfPath { get; private set; }
 
@@ -142,6 +188,15 @@ namespace TermLink.Setup
                     case "--no-startup":
                         result.CreateStartup = false;
                         break;
+                    case "--purge-known-runtime-data":
+                        result.PurgeKnownRuntimeData = true;
+                        break;
+                    case "--terminate-running":
+                        result.TerminateRunningProcesses = true;
+                        break;
+                    case "--no-launch":
+                        result.NoLaunch = true;
+                        break;
                     case "--quiet":
                         break;
                     case "--cleanup-self":
@@ -160,6 +215,20 @@ namespace TermLink.Setup
             if (result.Uninstall && args.Any(value => string.Equals(value, "--install-dir", StringComparison.OrdinalIgnoreCase)))
             {
                 throw new ArgumentException("--uninstall 不能和 --install-dir 同时使用。");
+            }
+            if (result.PurgeKnownRuntimeData && !result.Uninstall)
+            {
+                throw new ArgumentException("--purge-known-runtime-data 只能和 --uninstall 一起使用。");
+            }
+            if (result.TerminateRunningProcesses &&
+                (result.Uninstall || string.IsNullOrWhiteSpace(result.InstallDirectory)))
+            {
+                throw new ArgumentException("--terminate-running 只能和 --install-dir 一起使用。");
+            }
+            if (result.NoLaunch &&
+                (result.Uninstall || string.IsNullOrWhiteSpace(result.InstallDirectory)))
+            {
+                throw new ArgumentException("--no-launch 只能和 --install-dir 一起使用。");
             }
             return result;
         }
@@ -182,6 +251,8 @@ namespace TermLink.Setup
         public string InstalledUtc { get; set; }
         public string TerminalFragmentPath { get; set; }
         public string TerminalFragmentSha256 { get; set; }
+        public string TerminalIntegrationStatus { get; set; }
+        public string TerminalIntegrationDiagnostic { get; set; }
         public string StartupCommand { get; set; }
         public string DesktopShortcutPath { get; set; }
         public string DesktopShortcutSha256 { get; set; }
@@ -191,6 +262,198 @@ namespace TermLink.Setup
         public string UninstallerSha256 { get; set; }
     }
 
+    internal sealed class SetupPrerequisiteResult
+    {
+        internal SetupPrerequisiteResult(
+            IReadOnlyList<string> errors,
+            IReadOnlyList<string> warnings,
+            bool windowsTerminalInstalled,
+            string architectureDescription)
+        {
+            Errors = errors;
+            Warnings = warnings;
+            WindowsTerminalInstalled = windowsTerminalInstalled;
+            ArchitectureDescription = architectureDescription;
+        }
+
+        public IReadOnlyList<string> Errors { get; }
+        public IReadOnlyList<string> Warnings { get; }
+        public bool WindowsTerminalInstalled { get; }
+        public string ArchitectureDescription { get; }
+        public bool Supported => Errors.Count == 0;
+    }
+
+    internal static class SetupPrerequisites
+    {
+        internal const int MinimumWindowsBuild = 17763;
+
+        internal static SetupPrerequisiteResult Evaluate(
+            bool isWindows,
+            int windowsBuild,
+            bool is64BitOperatingSystem,
+            Architecture processArchitecture,
+            bool createPseudoConsoleAvailable,
+            bool windowsTerminalInstalled)
+        {
+            var errors = new List<string>();
+            var warnings = new List<string>();
+            if (!isWindows)
+            {
+                errors.Add("TermLink Windows Agent 只能安装在 Windows 上。");
+            }
+            else if (windowsBuild < MinimumWindowsBuild)
+            {
+                errors.Add(
+                    "Windows 版本过旧（当前 build " + windowsBuild +
+                    "）。TermLink 需要 Windows 10 1809 / Server 2019 (build 17763) 或更高版本。");
+            }
+
+            if (!is64BitOperatingSystem || processArchitecture != Architecture.X64)
+            {
+                errors.Add(
+                    "当前环境无法运行 TermLink x64 组件。" +
+                    "需要 64 位 Windows 且安装程序必须以 x64 进程运行；当前进程架构为 " +
+                    processArchitecture + "。");
+            }
+
+            if (!createPseudoConsoleAvailable)
+            {
+                errors.Add(
+                    "系统 kernel32.dll 未提供 CreatePseudoConsole (ConPTY)。" +
+                    "请安装受支持的 Windows 更新后重试。");
+            }
+
+            if (!windowsTerminalInstalled)
+            {
+                warnings.Add(
+                    "未检测到 Windows Terminal。TermLink Agent 仍可安装；" +
+                    "安装程序不会自动安装、替换或修改 Windows Terminal。");
+            }
+
+            return new SetupPrerequisiteResult(
+                errors,
+                warnings,
+                windowsTerminalInstalled,
+                "OS=" + RuntimeInformation.OSArchitecture + ", Process=" + processArchitecture);
+        }
+
+        internal static SetupPrerequisiteResult EvaluateCurrent()
+        {
+            return Evaluate(
+                RuntimeInformation.IsOSPlatform(OSPlatform.Windows),
+                Environment.OSVersion.Version.Build,
+                Environment.Is64BitOperatingSystem,
+                RuntimeInformation.ProcessArchitecture,
+                HasCreatePseudoConsoleExport(),
+                IsWindowsTerminalInstalled());
+        }
+
+        internal static SetupPrerequisiteResult EnsureSupported()
+        {
+            var result = EvaluateCurrent();
+            if (!result.Supported)
+            {
+                throw new PlatformNotSupportedException(
+                    "TermLink 安装前置检查未通过：" + Environment.NewLine +
+                    string.Join(Environment.NewLine, result.Errors) + Environment.NewLine +
+                    "架构详情: " + result.ArchitectureDescription);
+            }
+            return result;
+        }
+
+        private static bool HasCreatePseudoConsoleExport()
+        {
+            IntPtr module = IntPtr.Zero;
+            try
+            {
+                if (!NativeLibrary.TryLoad("kernel32.dll", out module)) return false;
+                return NativeLibrary.TryGetExport(module, "CreatePseudoConsole", out _);
+            }
+            catch (Exception error) when (
+                error is DllNotFoundException ||
+                error is EntryPointNotFoundException ||
+                error is BadImageFormatException ||
+                error is NotSupportedException)
+            {
+                return false;
+            }
+            finally
+            {
+                if (module != IntPtr.Zero) NativeLibrary.Free(module);
+            }
+        }
+
+        private static bool IsWindowsTerminalInstalled()
+        {
+            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            var candidates = new[]
+            {
+                Path.Combine(localAppData, "Microsoft", "WindowsApps", "wt.exe"),
+                Path.Combine(localAppData, "Packages", "Microsoft.WindowsTerminal_8wekyb3d8bbwe"),
+                Path.Combine(localAppData, "Packages", "Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe")
+            };
+            return candidates.Any(path => File.Exists(path) || Directory.Exists(path)) ||
+                Installer.FindExecutableOnPath("wt.exe") != null;
+        }
+    }
+
+    internal sealed class InstallOutcome
+    {
+        internal InstallOutcome(string terminalStatus, string terminalMessage, string terminalDiagnosticLogPath)
+        {
+            TerminalStatus = terminalStatus;
+            TerminalMessage = terminalMessage;
+            TerminalDiagnosticLogPath = terminalDiagnosticLogPath;
+        }
+
+        public string TerminalStatus { get; }
+        public string TerminalMessage { get; }
+        public string TerminalDiagnosticLogPath { get; }
+        public bool TerminalConfigured =>
+            string.Equals(TerminalStatus, "configured", StringComparison.Ordinal) ||
+            string.Equals(TerminalStatus, "configured-terminal-not-installed", StringComparison.Ordinal);
+    }
+
+    internal sealed class RunningTermLinkProcess
+    {
+        internal RunningTermLinkProcess(int processId, string name, string executablePath)
+        {
+            ProcessId = processId;
+            Name = name ?? string.Empty;
+            ExecutablePath = executablePath ?? string.Empty;
+        }
+
+        public int ProcessId { get; }
+        public string Name { get; }
+        public string ExecutablePath { get; }
+    }
+
+    internal sealed class RunningTermLinkService
+    {
+        internal RunningTermLinkService(string name, string displayName, string executablePath)
+        {
+            Name = name ?? string.Empty;
+            DisplayName = displayName ?? string.Empty;
+            ExecutablePath = executablePath ?? string.Empty;
+        }
+
+        public string Name { get; }
+        public string DisplayName { get; }
+        public string ExecutablePath { get; }
+    }
+
+    internal sealed class RunningTermLinkProcessesException : InvalidOperationException
+    {
+        internal RunningTermLinkProcessesException(IReadOnlyList<RunningTermLinkProcess> processes)
+            : base(
+                "检测到正在运行的 TermLink 程序，未获得终止授权，升级已取消：" +
+                Environment.NewLine + Installer.FormatRunningProcessList(processes) +
+                Environment.NewLine +
+                "请使用安装向导确认终止，或在无人值守安装时显式传入 --terminate-running。")
+        {
+        }
+    }
+
     internal static class Installer
     {
         private const string MarkerName = ".termlink-install.json";
@@ -198,19 +461,52 @@ namespace TermLink.Setup
         private const string UninstallerFileName = "TermLink.Uninstall.exe";
         private const string InstallStateSubKey = @"Software\TermLink";
         private const string InstallRootValueName = "InstallRoot";
+        private const uint DeleteAccess = 0x00010000;
+        private const uint ShareReadWriteDelete = 0x00000001 | 0x00000002 | 0x00000004;
+        private const uint OpenExisting = 3;
+        private const uint FileAttributeNormal = 0x00000080;
+        private const uint FileFlagBackupSemantics = 0x02000000;
+        private const uint ProcessQueryLimitedInformation = 0x00001000;
+        private static readonly IntPtr InvalidHandleValue = new IntPtr(-1);
         private static readonly string[] RequiredPayloadFiles =
         {
-            "TermLink.Agent.exe",
-            "TermLink.Tray.exe"
-        };
-        private static readonly string[] OwnedProcessNames =
-        {
-            "TermLink.Agent",
-            "TermLink.SessionHost",
-            "TermLink.Tray",
-            "TermLink.Updater"
+            "TermLink.exe",
+            "TermLink.SessionHost.exe"
         };
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateFile(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(
+            uint desiredAccess,
+            [MarshalAs(UnmanagedType.Bool)] bool inheritHandle,
+            int processId);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool QueryFullProcessImageName(
+            IntPtr process,
+            uint flags,
+            StringBuilder executableName,
+            ref uint size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetNamedPipeServerProcessId(
+            IntPtr pipe,
+            out uint serverProcessId);
         internal static string DefaultInstallDirectory
         {
             get
@@ -365,6 +661,51 @@ namespace TermLink.Setup
             }
         }
 
+        /// <summary>
+        /// Returns the installation explicitly owned by current-user setup
+        /// state. Unlike the broader wizard discovery, this intentionally does
+        /// not scan common directories: a valid but abandoned test/backup copy
+        /// must not prevent a new installation. Current installers persist the
+        /// registry value, while the Terminal Fragment covers legacy installs.
+        /// </summary>
+        private static string DiscoverAuthoritativeInstallDirectory()
+        {
+            var candidates = new List<string>();
+            AddCandidate(candidates, ReadRegisteredInstallDirectory());
+            AddCandidate(candidates, ReadFragmentInstallDirectory());
+            foreach (var candidate in candidates)
+            {
+                if (ReadMarkerIfPresent(candidate) != null) return candidate;
+            }
+            return null;
+        }
+
+        internal static void EnsureInstallDirectoryCompatible(string requestedInstallDirectory)
+        {
+            ValidateInstallDirectorySelection(
+                requestedInstallDirectory,
+                DiscoverAuthoritativeInstallDirectory());
+        }
+
+        internal static void ValidateInstallDirectorySelection(
+            string requestedInstallDirectory,
+            string activeInstallDirectory)
+        {
+            var requestedRoot = NormalizeInstallRoot(requestedInstallDirectory);
+            if (string.IsNullOrWhiteSpace(activeInstallDirectory)) return;
+
+            var activeRoot = NormalizeInstallRoot(activeInstallDirectory);
+            if (string.Equals(requestedRoot, activeRoot, StringComparison.OrdinalIgnoreCase)) return;
+
+            throw new InvalidOperationException(
+                "检测到 TermLink 已安装在：" + activeRoot + Environment.NewLine +
+                "安装器不支持直接把现有安装迁移到其他目录，以免旧版本继续运行或新版本被误报为已启动。" +
+                Environment.NewLine +
+                "如需改用以下目录，请先从原目录运行 TermLink.Uninstall.exe 完成卸载，再重新安装：" +
+                Environment.NewLine + requestedRoot + Environment.NewLine +
+                "Existing TermLink installation must be uninstalled before choosing a different install directory.");
+        }
+
         private static void RememberInstallDirectory(string root)
         {
             try
@@ -409,26 +750,73 @@ namespace TermLink.Setup
             }
         }
 
-        internal static void Install(string installDirectory, bool createStartup)
+        internal static InstallOutcome Install(
+            string installDirectory,
+            bool createStartup,
+            bool terminateRunningProcesses = false,
+            CancellationToken cancellationToken = default,
+            Func<bool> tryBeginCommit = null)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            // Run the platform checks before creating or moving any directory.
+            // This keeps a rejected old/unsupported machine completely unchanged.
+            var prerequisites = SetupPrerequisites.EnsureSupported();
             var root = NormalizeInstallRoot(installDirectory);
+            // A cross-directory upgrade would leave the authoritative old root
+            // installed and its global Tray/Agent identity could make the new
+            // executable exit immediately. Reject it before creating even the
+            // requested parent directory or stopping any process.
+            EnsureInstallDirectoryCompatible(root);
             var parent = Directory.GetParent(root).FullName;
             Directory.CreateDirectory(parent);
             var previous = ReadMarkerIfPresent(root);
             ValidateExistingDirectory(root, previous);
-            StopOwnedProcesses(root);
 
             var staging = Path.Combine(parent, ".termlink-install-" + Guid.NewGuid().ToString("N"));
             var backup = Path.Combine(parent, ".termlink-backup-" + Guid.NewGuid().ToString("N"));
             InstallMarker marker = null;
+            var previousTerminalFragment = ReadExistingTerminalFragment();
+            var previousStartupCommand = ReadOwnedStartupCommand(previous);
+            var previousDesktopShortcut = ReadOwnedFile(
+                previous?.DesktopShortcutPath,
+                previous?.DesktopShortcutSha256);
+            var previousStartMenuShortcut = ReadOwnedFile(
+                previous?.StartMenuShortcutPath,
+                previous?.StartMenuShortcutSha256);
             var installSucceeded = false;
+            var oldRootMoved = false;
+            var newRootActivated = false;
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 Directory.CreateDirectory(staging);
-                ExtractPayload(staging);
+                ExtractPayload(staging, cancellationToken);
 
-                if (Directory.Exists(root)) Directory.Move(root, backup);
-                Directory.Move(staging, root);
+                // Re-check immediately before the first mutation. A process may
+                // have started while the payload was being staged.
+                cancellationToken.ThrowIfCancellationRequested();
+                EnsureOwnedProcessesStopped(
+                    root,
+                    terminateRunningProcesses,
+                    cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (Directory.Exists(root))
+                {
+                    MoveDirectoryWithRetry(
+                        root,
+                        backup,
+                        "无法将旧版本移入安全备份目录",
+                        cancellationToken: cancellationToken);
+                    oldRootMoved = true;
+                }
+                cancellationToken.ThrowIfCancellationRequested();
+                MoveDirectoryWithRetry(
+                    staging,
+                    root,
+                    "无法激活新版本安装目录",
+                    cancellationToken: cancellationToken);
+                newRootActivated = true;
+                cancellationToken.ThrowIfCancellationRequested();
 
                 marker = new InstallMarker
                 {
@@ -437,7 +825,12 @@ namespace TermLink.Setup
                     InstallRoot = root,
                     InstalledUtc = DateTime.UtcNow.ToString("O")
                 };
-                ConfigureTerminal(root, marker, previous);
+                var terminalOutcome = ConfigureTerminalSafely(
+                    root,
+                    marker,
+                    previous,
+                    prerequisites.WindowsTerminalInstalled);
+                cancellationToken.ThrowIfCancellationRequested();
                 if (createStartup)
                 {
                     try
@@ -461,28 +854,96 @@ namespace TermLink.Setup
                 }
                 ConfigureShortcuts(root, marker, previous);
                 ConfigureUninstaller(root, marker);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (tryBeginCommit != null && !tryBeginCommit())
+                {
+                    throw new OperationCanceledException(cancellationToken);
+                }
                 WriteMarker(root, marker);
                 RememberInstallDirectory(root);
 
-                if (Directory.Exists(backup)) Directory.Delete(backup, true);
+                // The new root is now complete and authoritative. Backup cleanup
+                // is post-commit best effort: a locked file in the old backup
+                // must never trigger rollback that deletes the working new root.
                 installSucceeded = true;
+                TryDeleteDirectory(backup);
+                if (Directory.Exists(backup))
+                {
+                    Console.Error.WriteLine(
+                        "旧版本备份暂时无法清理，已保留以避免数据损坏: " + backup);
+                }
                 Console.WriteLine("TermLink 已安装到: " + root);
-                Console.WriteLine("Windows Terminal 配置: " + marker.TerminalFragmentPath);
+                if (terminalOutcome.TerminalConfigured)
+                {
+                    Console.WriteLine("Windows Terminal 配置: " + marker.TerminalFragmentPath);
+                }
+                else
+                {
+                    Console.Error.WriteLine(terminalOutcome.TerminalMessage);
+                    if (!string.IsNullOrWhiteSpace(terminalOutcome.TerminalDiagnosticLogPath))
+                    {
+                        Console.Error.WriteLine("Windows Terminal 集成诊断: " + terminalOutcome.TerminalDiagnosticLogPath);
+                    }
+                }
+                return terminalOutcome;
             }
-            catch
+            catch (Exception installError)
             {
+                if (installSucceeded)
+                {
+                    // The transaction already committed. Never roll back to a
+                    // backup that may have been partially cleaned.
+                    throw;
+                }
                 if (marker != null)
                 {
                     // Cleanup must never replace the original installer error. In
                     // particular, the marker is intentionally incomplete while a
                     // fragment or startup value is being written.
-                    TryRemoveTerminalFragmentIfOwned(marker);
+                    TryRestoreTerminalFragmentAfterRollback(
+                        marker,
+                        previousTerminalFragment);
                     TryRemoveStartupIfOwned(marker);
                     TryRemoveShortcuts(marker);
                     TryRemoveUninstallerIfOwned(marker);
                 }
-                TryDeleteDirectory(root);
-                TryRestoreDirectory(backup, root);
+                TryRestoreStartupAfterRollback(previousStartupCommand);
+                TryRestoreOwnedFileAfterRollback(
+                    previous?.DesktopShortcutPath,
+                    previousDesktopShortcut);
+                TryRestoreOwnedFileAfterRollback(
+                    previous?.StartMenuShortcutPath,
+                    previousStartMenuShortcut);
+                // Never delete `root` unless this invocation successfully moved
+                // the new staged payload there. In particular, a lock that makes
+                // the old-root move fail must leave the previous install intact.
+                if (oldRootMoved)
+                {
+                    try
+                    {
+                        RestorePreviousInstallRootAfterFailure(backup, root, parent);
+                    }
+                    catch (Exception rollbackError)
+                    {
+                        throw new InvalidOperationException(
+                            "升级失败，且无法自动把旧版本恢复到原目录。" +
+                            "旧版本备份仍保留在: " + backup + Environment.NewLine +
+                            "请不要删除该目录，并根据详细日志手动恢复。",
+                            new AggregateException(installError, rollbackError));
+                    }
+                }
+                else if (newRootActivated)
+                {
+                    TryDeleteDirectory(root);
+                    if (Directory.Exists(root))
+                    {
+                        throw new InvalidOperationException(
+                            "安装已取消，但无法清理尚未提交的新版本目录: " + root +
+                            Environment.NewLine +
+                            "该目录可能仍被防病毒软件、索引器或文件预览器占用，请关闭占用后手动删除。",
+                            installError);
+                    }
+                }
                 throw;
             }
             finally
@@ -492,7 +953,7 @@ namespace TermLink.Setup
             }
         }
 
-        internal static void Uninstall(string installDirectory)
+        internal static void Uninstall(string installDirectory, bool purgeKnownRuntimeData = false)
         {
             var root = NormalizeInstallRoot(installDirectory);
             var marker = ReadMarkerIfPresent(root);
@@ -501,16 +962,28 @@ namespace TermLink.Setup
                 throw new InvalidOperationException("指定目录不是 TermLink 安装目录，已拒绝删除: " + root);
             }
 
-            StopOwnedProcesses(root);
+            EnsureOwnedProcessesStopped(root, terminateRunningProcesses: true);
             RemoveTerminalFragmentIfOwned(marker);
             RemoveStartupIfOwned(marker);
             RemoveShortcuts(marker);
             Directory.Delete(root, true);
             ForgetInstallDirectory(root);
+            if (purgeKnownRuntimeData)
+            {
+                var deleted = PurgeKnownRuntimeDataFiles(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+                Console.WriteLine("已清理明确列入清单的 TermLink 运行数据文件: " + deleted.Count);
+            }
+            else
+            {
+                Console.WriteLine("TermLink 运行数据已保留；如需删除明确列入清单的数据，请使用 --purge-known-runtime-data。");
+            }
             Console.WriteLine("TermLink 已卸载: " + root);
         }
 
-        internal static int LaunchInstalledUninstaller(string installDirectory = null)
+        internal static int LaunchInstalledUninstaller(
+            string installDirectory = null,
+            bool purgeKnownRuntimeData = false)
         {
             var source = Environment.ProcessPath;
             if (string.IsNullOrWhiteSpace(source) || !File.Exists(source))
@@ -525,12 +998,14 @@ namespace TermLink.Setup
             var start = new ProcessStartInfo
             {
                 FileName = temporaryCopy,
+                WorkingDirectory = Path.GetDirectoryName(temporaryCopy),
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden
             };
             start.ArgumentList.Add("--uninstall");
             start.ArgumentList.Add(root);
+            if (purgeKnownRuntimeData) start.ArgumentList.Add("--purge-known-runtime-data");
             start.ArgumentList.Add("--cleanup-self");
             start.ArgumentList.Add(temporaryCopy);
             start.ArgumentList.Add("--quiet");
@@ -552,6 +1027,7 @@ namespace TermLink.Setup
                 {
                     FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
                     Arguments = command,
+                    WorkingDirectory = Path.GetTempPath(),
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     WindowStyle = ProcessWindowStyle.Hidden
@@ -627,7 +1103,9 @@ namespace TermLink.Setup
                 new UTF8Encoding(false));
         }
 
-        private static void ExtractPayload(string destination)
+        private static void ExtractPayload(
+            string destination,
+            CancellationToken cancellationToken)
         {
             var assembly = Assembly.GetExecutingAssembly();
             using (var stream = assembly.GetManifestResourceStream(Program.PayloadResourceName))
@@ -637,6 +1115,7 @@ namespace TermLink.Setup
                 {
                     foreach (var entry in archive.Entries)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         var relative = entry.FullName.Replace('/', Path.DirectorySeparatorChar);
                         var target = Path.GetFullPath(Path.Combine(destination, relative));
                         var prefix = destination.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
@@ -653,16 +1132,261 @@ namespace TermLink.Setup
                         using (var input = entry.Open())
                         using (var output = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.None))
                         {
-                            input.CopyTo(output);
+                            var buffer = new byte[128 * 1024];
+                            int bytesRead;
+                            while ((bytesRead = input.Read(buffer, 0, buffer.Length)) > 0)
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
+                                output.Write(buffer, 0, bytesRead);
+                            }
                         }
                     }
                 }
             }
         }
 
-        private static void StopOwnedProcesses(string root)
+        internal static IReadOnlyList<RunningTermLinkProcess> GetRunningOwnedProcesses(
+            string installDirectory)
         {
-            var tray = Path.Combine(root, "TermLink.Tray.exe");
+            var root = NormalizeInstallRoot(installDirectory);
+            var prefix = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            var result = new List<RunningTermLinkProcess>();
+            foreach (var process in Process.GetProcesses())
+            {
+                try
+                {
+                    if (process.Id == Environment.ProcessId) continue;
+                    var path = TryGetProcessImagePath(process.Id);
+                    if (!string.IsNullOrWhiteSpace(path) &&
+                        path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        result.Add(new RunningTermLinkProcess(
+                            process.Id,
+                            process.ProcessName,
+                            path));
+                    }
+                }
+                catch
+                {
+                    // A process that cannot be inspected is not claimed as
+                    // TermLink-owned and is never terminated by this installer.
+                }
+                finally
+                {
+                    process.Dispose();
+                }
+            }
+            return result.OrderBy(value => value.Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(value => value.ProcessId)
+                .ToArray();
+        }
+
+        internal static bool IsOwnedTrayRunning(string installDirectory)
+        {
+            var root = NormalizeInstallRoot(installDirectory);
+            var trayPath = Path.Combine(root, "TermLink.exe");
+            return GetRunningOwnedProcesses(root).Any(process =>
+                string.Equals(
+                    Path.GetFullPath(process.ExecutablePath),
+                    trayPath,
+                    StringComparison.OrdinalIgnoreCase));
+        }
+
+        internal static string TryGetProcessImagePath(int processId)
+        {
+            if (processId <= 0) return null;
+            var handle = OpenProcess(ProcessQueryLimitedInformation, false, processId);
+            if (handle == IntPtr.Zero || handle == InvalidHandleValue) return null;
+            try
+            {
+                var capacity = 32768u;
+                var path = new StringBuilder((int)capacity);
+                if (!QueryFullProcessImageName(handle, 0, path, ref capacity)) return null;
+                if (capacity == 0 || path.Length == 0) return null;
+                try { return Path.GetFullPath(path.ToString()); }
+                catch (Exception error) when (
+                    error is ArgumentException ||
+                    error is IOException ||
+                    error is NotSupportedException) { return null; }
+            }
+            finally
+            {
+                CloseHandle(handle);
+            }
+        }
+
+        internal static string FormatRunningProcessList(
+            IReadOnlyList<RunningTermLinkProcess> processes)
+        {
+            if (processes == null || processes.Count == 0) return "（无 / none）";
+            return string.Join(
+                Environment.NewLine,
+                processes.Select(value => "• " + value.Name + " (PID " + value.ProcessId + ")"));
+        }
+
+        internal static IReadOnlyList<RunningTermLinkService> GetRunningOwnedServices(
+            string installDirectory)
+        {
+            var root = NormalizeInstallRoot(installDirectory);
+            var prefix = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            var result = new List<RunningTermLinkService>();
+            try
+            {
+                using var services = Registry.LocalMachine.OpenSubKey(
+                    @"SYSTEM\CurrentControlSet\Services",
+                    writable: false);
+                if (services == null) return result;
+                foreach (var name in services.GetSubKeyNames())
+                {
+                    using var service = services.OpenSubKey(name, writable: false);
+                    var imagePath = service?.GetValue(
+                        "ImagePath",
+                        null,
+                        RegistryValueOptions.DoNotExpandEnvironmentNames) as string;
+                    var executable = ParseServiceExecutablePath(imagePath);
+                    if (string.IsNullOrWhiteSpace(executable) ||
+                        !executable.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ||
+                        !IsWindowsServiceRunning(name)) continue;
+                    var displayName = service.GetValue("DisplayName") as string;
+                    result.Add(new RunningTermLinkService(name, displayName, executable));
+                }
+            }
+            catch (Exception error) when (
+                error is SecurityException ||
+                error is UnauthorizedAccessException ||
+                error is IOException)
+            {
+                // Service discovery is best effort and never broadens ownership.
+            }
+            return result.OrderBy(value => value.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+        }
+
+        internal static string FormatRunningServiceList(
+            IReadOnlyList<RunningTermLinkService> services)
+        {
+            if (services == null || services.Count == 0) return "（无 / none）";
+            return string.Join(
+                Environment.NewLine,
+                services.Select(value => "• " +
+                    (string.IsNullOrWhiteSpace(value.DisplayName) ? value.Name : value.DisplayName) +
+                    " (" + value.Name + ")"));
+        }
+
+        internal static string ParseServiceExecutablePath(string imagePath)
+        {
+            if (string.IsNullOrWhiteSpace(imagePath)) return null;
+            var value = Environment.ExpandEnvironmentVariables(imagePath.Trim());
+            string executable;
+            if (value[0] == '"')
+            {
+                var end = value.IndexOf('"', 1);
+                if (end <= 1) return null;
+                executable = value.Substring(1, end - 1);
+            }
+            else
+            {
+                var end = value.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+                if (end < 0) return null;
+                executable = value.Substring(0, end + 4);
+            }
+            if (executable.StartsWith(@"\??\", StringComparison.Ordinal))
+                executable = executable.Substring(4);
+            if (!Path.IsPathFullyQualified(executable)) return null;
+            try { return Path.GetFullPath(executable); }
+            catch (Exception error) when (
+                error is ArgumentException ||
+                error is NotSupportedException ||
+                error is IOException) { return null; }
+        }
+
+        private static bool IsWindowsServiceRunning(string name)
+        {
+            var result = RunServiceControl("query", name, 5000);
+            return result.ExitCode == 0 &&
+                System.Text.RegularExpressions.Regex.IsMatch(
+                    result.Output,
+                    @"STATE\s*:\s*4\b",
+                    System.Text.RegularExpressions.RegexOptions.CultureInvariant |
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        }
+
+        private static (int ExitCode, string Output) RunServiceControl(
+            string command,
+            string name,
+            int timeoutMilliseconds)
+        {
+            var executable = Path.Combine(Environment.SystemDirectory, "sc.exe");
+            using var process = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = executable,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                }
+            };
+            process.StartInfo.ArgumentList.Add(command);
+            process.StartInfo.ArgumentList.Add(name);
+            if (!process.Start()) return (-1, string.Empty);
+            var output = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
+            if (!process.WaitForExit(timeoutMilliseconds))
+            {
+                try { process.Kill(true); }
+                catch { }
+                return (-1, output);
+            }
+            return (process.ExitCode, output);
+        }
+
+        internal static void ValidateTerminationConsent(
+            IReadOnlyList<RunningTermLinkProcess> processes,
+            bool terminateRunningProcesses)
+        {
+            if (processes != null && processes.Count > 0 && !terminateRunningProcesses)
+            {
+                throw new RunningTermLinkProcessesException(processes);
+            }
+        }
+
+        internal static void EnsureOwnedProcessesStopped(
+            string root,
+            bool terminateRunningProcesses,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var running = GetRunningOwnedProcesses(root);
+            var runningServices = GetRunningOwnedServices(root);
+            ValidateTerminationConsent(running, terminateRunningProcesses);
+            if (runningServices.Count > 0 && !terminateRunningProcesses)
+            {
+                throw new InvalidOperationException(
+                    "检测到正在运行的 TermLink Windows 服务，未获得终止授权，升级已取消：" +
+                    Environment.NewLine + FormatRunningServiceList(runningServices));
+            }
+            if (running.Count == 0 && runningServices.Count == 0) return;
+
+            foreach (var service in runningServices)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                RunServiceControl("stop", service.Name, 10000);
+            }
+            var serviceDeadline = DateTime.UtcNow.AddSeconds(20);
+            while (DateTime.UtcNow < serviceDeadline && GetRunningOwnedServices(root).Count > 0)
+            {
+                if (cancellationToken.WaitHandle.WaitOne(200))
+                    cancellationToken.ThrowIfCancellationRequested();
+            }
+            var remainingServices = GetRunningOwnedServices(root);
+            if (remainingServices.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    "无法停止以下 TermLink Windows 服务，升级未修改现有安装：" +
+                    Environment.NewLine + FormatRunningServiceList(remainingServices));
+            }
+
+            var tray = Path.Combine(root, "TermLink.exe");
             if (File.Exists(tray))
             {
                 try
@@ -675,7 +1399,12 @@ namespace TermLink.Setup
                         CreateNoWindow = true
                     }))
                     {
-                        shutdown?.WaitForExit(10000);
+                        if (shutdown != null)
+                        {
+                            var shutdownDeadline = DateTime.UtcNow.AddSeconds(10);
+                            while (!shutdown.WaitForExit(100) && DateTime.UtcNow < shutdownDeadline)
+                                cancellationToken.ThrowIfCancellationRequested();
+                        }
                     }
                 }
                 catch
@@ -685,142 +1414,521 @@ namespace TermLink.Setup
             }
 
             var prefix = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            foreach (var name in OwnedProcessNames)
+            var terminationDiagnostics = new List<string>();
+            var processDeadline = DateTime.UtcNow.AddSeconds(10);
+            while (DateTime.UtcNow < processDeadline)
             {
-                foreach (var process in Process.GetProcessesByName(name))
+                cancellationToken.ThrowIfCancellationRequested();
+                var candidates = GetRunningOwnedProcesses(root);
+                if (candidates.Count == 0) break;
+                foreach (var candidate in candidates)
                 {
                     try
                     {
+                        using var process = Process.GetProcessById(candidate.ProcessId);
                         if (process.Id == Environment.ProcessId) continue;
                         var path = process.MainModule?.FileName;
                         if (!string.IsNullOrWhiteSpace(path) &&
                             path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                         {
-                            process.Kill(true);
-                            process.WaitForExit(5000);
+                            // Setup can itself be a child of TermLink.exe when an
+                            // in-app update launches the downloaded installer. A
+                            // tree kill of that parent would therefore terminate
+                            // this installer before it can replace the old files.
+                            // Every executable under the validated install root is
+                            // enumerated and stopped separately by this loop, so a
+                            // single-process kill is both sufficient and scoped.
+                            process.Kill(entireProcessTree: false);
+                            var exitDeadline = DateTime.UtcNow.AddSeconds(5);
+                            while (!process.WaitForExit(100) && DateTime.UtcNow < exitDeadline)
+                                cancellationToken.ThrowIfCancellationRequested();
                         }
                     }
-                    catch
+                    catch (Exception error)
                     {
-                        // A process that cannot be inspected is never killed by this installer.
-                    }
-                    finally
-                    {
-                        process.Dispose();
+                        terminationDiagnostics.Add(
+                            candidate.Name + " (PID " + candidate.ProcessId + "): " + error.Message);
                     }
                 }
+                if (cancellationToken.WaitHandle.WaitOne(100))
+                    cancellationToken.ThrowIfCancellationRequested();
             }
-        }
 
-        private static void ConfigureTerminal(string root, InstallMarker marker, InstallMarker previous)
-        {
-            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            var directory = Path.Combine(localAppData, "Microsoft", "Windows Terminal", "Fragments", "TermLink");
-            Directory.CreateDirectory(directory);
-            var path = Path.Combine(directory, FragmentFileName);
-            if (File.Exists(path))
+            var remaining = GetRunningOwnedProcesses(root);
+            if (remaining.Count > 0)
             {
-                var ownsExisting = previous != null &&
-                    !string.IsNullOrWhiteSpace(previous.TerminalFragmentPath) &&
-                    string.Equals(Path.GetFullPath(previous.TerminalFragmentPath),
-                        Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase) &&
-                    string.Equals(Sha256(path), previous.TerminalFragmentSha256, StringComparison.OrdinalIgnoreCase);
-                ownsExisting = ownsExisting || IsRecognizedTermLinkFragment(path);
-                if (!ownsExisting)
+                foreach (var candidate in remaining)
                 {
-                    throw new InvalidOperationException(
-                        "TermLink Terminal Fragment 已存在但不属于本安装器，为避免覆盖用户配置，请先处理: " + path);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    terminationDiagnostics.Add(
+                        TryTaskKillOwnedProcess(root, candidate, cancellationToken));
                 }
+                var taskKillDeadline = DateTime.UtcNow.AddSeconds(5);
+                do
+                {
+                    if (cancellationToken.WaitHandle.WaitOne(100))
+                        cancellationToken.ThrowIfCancellationRequested();
+                    remaining = GetRunningOwnedProcesses(root);
+                } while (remaining.Count > 0 && DateTime.UtcNow < taskKillDeadline);
             }
-            var sessionHost = Path.Combine(root, "TermLink.SessionHost.exe");
-            var profiles = new List<Dictionary<string, object>>
+            if (remaining.Count > 0)
             {
-                CreateProfile("{cb3ce4a8-86da-5aa1-a77d-abe62f8b55b2}", "TermLink CMD", "cmd.exe", "command-prompt"),
-                CreateProfile("{b2025574-4cc8-5264-b577-7c6532eff95a}", "TermLink Windows PowerShell", "powershell.exe -NoLogo -NoProfile", "windows-powershell")
-            };
-            if (FindOnPath("pwsh.exe") != null)
-            {
-                profiles.Add(CreateProfile("{7cf2d180-c8be-5b08-99a0-268bd2dc1d6f}", "TermLink PowerShell 7", "pwsh.exe -NoLogo -NoProfile", "powershell-7"));
-            }
-            if (FindOnPath("wsl.exe") != null)
-            {
-                profiles.Add(CreateProfile("{f5652f1d-a6da-5199-b595-3a1255ce04b4}", "TermLink WSL", "wsl.exe", "wsl"));
-            }
-
-            foreach (var profile in profiles)
-            {
-                // CreateProfile temporarily stores the child command in the private marker below.
-                var childCommand = (string)profile["__child"];
-                var encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(childCommand));
-                profile["commandline"] = Quote(sessionHost) + " --command-base64 " + encoded + " --managed-shell " + profile["__shell"];
-                profile.Remove("__child");
-                profile.Remove("__shell");
-            }
-
-            var json = JsonSerializer.Serialize(new Dictionary<string, object> { ["profiles"] = profiles },
-                new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine;
-            try
-            {
-                File.WriteAllText(path, json, new UTF8Encoding(false));
-            }
-            catch (UnauthorizedAccessException error)
-            {
+                var distinctDiagnostics = terminationDiagnostics
+                    .Distinct(StringComparer.Ordinal)
+                    .Take(20)
+                    .ToArray();
+                var diagnostics = distinctDiagnostics.Length == 0
+                    ? string.Empty
+                    : Environment.NewLine + "终止诊断：" + Environment.NewLine +
+                        string.Join(
+                            Environment.NewLine,
+                            distinctDiagnostics.Select(value => "• " + value));
                 throw new InvalidOperationException(
-                    "无法写入 Windows Terminal Fragment：" + path +
-                    "。请确认当前用户对该目录有写入权限，并关闭占用该文件的编辑器后重试。",
-                    error);
+                    "无法终止以下 TermLink 程序，升级未修改现有安装：" + Environment.NewLine +
+                    FormatRunningProcessList(remaining) + Environment.NewLine +
+                    "请在任务管理器中结束这些 PID 后重试；若诊断为拒绝访问，请以管理员身份运行安装器。" +
+                    diagnostics);
             }
-            marker.TerminalFragmentPath = path;
-            marker.TerminalFragmentSha256 = Sha256(path);
         }
 
-        private static Dictionary<string, object> CreateProfile(string guid, string name, string childCommand, string shell)
-        {
-            return new Dictionary<string, object>
-            {
-                ["guid"] = guid,
-                ["name"] = name,
-                ["commandline"] = string.Empty,
-                ["startingDirectory"] = "%USERPROFILE%",
-                ["hidden"] = false,
-                ["__child"] = childCommand,
-                ["__shell"] = shell
-            };
-        }
-
-        private static bool IsRecognizedTermLinkFragment(string path)
+        private static string TryTaskKillOwnedProcess(
+            string root,
+            RunningTermLinkProcess candidate,
+            CancellationToken cancellationToken)
         {
             try
             {
-                using (var document = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8)))
+                using var owned = Process.GetProcessById(candidate.ProcessId);
+                // Keep the Process object alive until taskkill exits so this
+                // verification and termination cannot silently target a PID
+                // that was already recycled before the fallback began.
+                _ = owned.SafeHandle;
+                var path = TryGetProcessImagePath(candidate.ProcessId);
+                var prefix = Path.GetFullPath(root)
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
+                    Path.DirectorySeparatorChar;
+                if (string.IsNullOrWhiteSpace(path) ||
+                    !Path.GetFullPath(path).StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                 {
-                    if (!document.RootElement.TryGetProperty("profiles", out var profiles) ||
-                        profiles.ValueKind != JsonValueKind.Array || profiles.GetArrayLength() == 0)
+                    return candidate.Name + " (PID " + candidate.ProcessId +
+                        "): PID 已变化或不再属于当前安装目录，未调用 taskkill。";
+                }
+
+                using var taskKill = new Process
+                {
+                    StartInfo = new ProcessStartInfo
                     {
-                        return false;
+                        FileName = Path.Combine(Environment.SystemDirectory, "taskkill.exe"),
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true
                     }
-                    var knownGuids = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                    {
-                        "{cb3ce4a8-86da-5aa1-a77d-abe62f8b55b2}",
-                        "{b2025574-4cc8-5264-b577-7c6532eff95a}",
-                        "{7cf2d180-c8be-5b08-99a0-268bd2dc1d6f}",
-                        "{f5652f1d-a6da-5199-b595-3a1255ce04b4}"
-                    };
-                    foreach (var profile in profiles.EnumerateArray())
-                    {
-                        if (!profile.TryGetProperty("guid", out var guid) ||
-                            !knownGuids.Contains(guid.GetString() ?? string.Empty)) return false;
-                    }
-                    return true;
+                };
+                taskKill.StartInfo.ArgumentList.Add("/PID");
+                taskKill.StartInfo.ArgumentList.Add(candidate.ProcessId.ToString());
+                // Do not use /T here. During an in-app update the downloaded
+                // Setup process is a descendant of TermLink.exe; taskkill /T
+                // would kill the installer together with the old application.
+                // Remaining TermLink-owned descendants are discovered by path
+                // and handled individually by the caller's bounded retry loop.
+                taskKill.StartInfo.ArgumentList.Add("/F");
+                taskKill.Start();
+                var deadline = DateTime.UtcNow.AddSeconds(5);
+                while (!taskKill.WaitForExit(100) && DateTime.UtcNow < deadline)
+                {
+                    if (!cancellationToken.IsCancellationRequested) continue;
+                    try { taskKill.Kill(true); }
+                    catch { }
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+                if (!taskKill.HasExited)
+                {
+                    try { taskKill.Kill(true); }
+                    catch { }
+                    return candidate.Name + " (PID " + candidate.ProcessId +
+                        "): taskkill 等待超时。";
+                }
+                var output = (taskKill.StandardOutput.ReadToEnd() + " " +
+                    taskKill.StandardError.ReadToEnd()).Trim();
+                return candidate.Name + " (PID " + candidate.ProcessId +
+                    "): taskkill exit " + taskKill.ExitCode +
+                    (string.IsNullOrWhiteSpace(output) ? string.Empty : "，" + output);
+            }
+            catch (Exception error) when (error is not OperationCanceledException)
+            {
+                return candidate.Name + " (PID " + candidate.ProcessId +
+                    "): taskkill 兜底失败，" + error.Message;
+            }
+        }
+
+        internal static void MoveDirectoryWithRetry(
+            string source,
+            string destination,
+            string operation,
+            TimeSpan? timeout = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(source))
+                throw new ArgumentException("Source directory is required.", nameof(source));
+            if (string.IsNullOrWhiteSpace(destination))
+                throw new ArgumentException("Destination directory is required.", nameof(destination));
+
+            var resolvedSource = Path.GetFullPath(source);
+            var resolvedDestination = Path.GetFullPath(destination);
+            var wait = timeout ?? TimeSpan.FromSeconds(30);
+            if (wait < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(timeout));
+            var deadline = DateTime.UtcNow + wait;
+            IOException lastError = null;
+            var delayMilliseconds = 50;
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    Directory.Move(resolvedSource, resolvedDestination);
+                    return;
+                }
+                catch (DirectoryNotFoundException)
+                {
+                    throw;
+                }
+                catch (IOException error)
+                {
+                    lastError = error;
+                    if (DateTime.UtcNow >= deadline) break;
+                    if (cancellationToken.WaitHandle.WaitOne(delayMilliseconds))
+                        cancellationToken.ThrowIfCancellationRequested();
+                    delayMilliseconds = Math.Min(delayMilliseconds + 50, 500);
                 }
             }
-            catch (JsonException)
+
+            var blockers = new List<RunningTermLinkProcess>();
+            if (Directory.Exists(resolvedSource))
+                blockers.AddRange(GetRunningOwnedProcesses(resolvedSource));
+            if (Directory.Exists(resolvedDestination))
+                blockers.AddRange(GetRunningOwnedProcesses(resolvedDestination));
+            var distinctBlockers = blockers
+                .GroupBy(value => value.ProcessId)
+                .Select(group => group.First())
+                .ToArray();
+            var details = distinctBlockers.Length == 0
+                ? "未发现仍从相关目录运行的进程；可能是防病毒软件、索引器或文件预览器的临时句柄。"
+                : "仍在占用的进程：" + Environment.NewLine + FormatRunningProcessList(distinctBlockers);
+            var blockedPaths = Directory.Exists(resolvedSource)
+                ? FindDeleteBlockedPaths(resolvedSource, 12)
+                : Array.Empty<string>();
+            if (blockedPaths.Count > 0)
+            {
+                details += Environment.NewLine + "无法取得删除/改名访问权的路径：" +
+                    Environment.NewLine + string.Join(
+                        Environment.NewLine,
+                        blockedPaths.Select(path => "• " + path));
+            }
+            var win32Error = lastError == null ? 0 : lastError.HResult & 0xFFFF;
+            throw new IOException(
+                (string.IsNullOrWhiteSpace(operation) ? "无法移动安装目录" : operation) + "。" +
+                Environment.NewLine + details + Environment.NewLine +
+                "安装器已等待 " + Math.Ceiling(wait.TotalSeconds) +
+                " 秒且没有覆盖现有目录。请关闭相关程序后重试；若安全软件正在扫描，请等待扫描完成。" +
+                Environment.NewLine + "底层错误: Win32 " + win32Error +
+                " (0x" + win32Error.ToString("X") + ")，" + lastError?.Message,
+                lastError);
+        }
+
+        internal static IReadOnlyList<string> FindDeleteBlockedPaths(
+            string root,
+            int maximumResults = 12)
+        {
+            if (string.IsNullOrWhiteSpace(root))
+                throw new ArgumentException("Root directory is required.", nameof(root));
+            if (maximumResults <= 0)
+                throw new ArgumentOutOfRangeException(nameof(maximumResults));
+            var resolvedRoot = Path.GetFullPath(root);
+            if (!Directory.Exists(resolvedRoot)) return Array.Empty<string>();
+
+            var blocked = new List<string>();
+            IEnumerable<string> entries;
+            try
+            {
+                entries = Directory.EnumerateFiles(
+                        resolvedRoot,
+                        "*",
+                        SearchOption.AllDirectories)
+                    .Concat(Directory.EnumerateDirectories(
+                        resolvedRoot,
+                        "*",
+                        SearchOption.AllDirectories))
+                    .Concat(new[] { resolvedRoot })
+                    .ToArray();
+            }
+            catch (Exception error) when (
+                error is IOException ||
+                error is UnauthorizedAccessException)
+            {
+                return new[] { "<无法枚举安装目录: " + error.Message + ">" };
+            }
+
+            foreach (var path in entries)
+            {
+                var isDirectory = Directory.Exists(path);
+                var handle = CreateFile(
+                    path,
+                    DeleteAccess,
+                    ShareReadWriteDelete,
+                    IntPtr.Zero,
+                    OpenExisting,
+                    isDirectory ? FileFlagBackupSemantics : FileAttributeNormal,
+                    IntPtr.Zero);
+                if (handle != InvalidHandleValue)
+                {
+                    CloseHandle(handle);
+                    continue;
+                }
+
+                var error = Marshal.GetLastWin32Error();
+                if (error != 5 && error != 32 && error != 33) continue;
+                var relative = Path.GetRelativePath(resolvedRoot, path);
+                blocked.Add(
+                    (string.Equals(relative, ".", StringComparison.Ordinal)
+                        ? "<安装目录本身>"
+                        : relative) + " (Win32 " + error + ")");
+                if (blocked.Count >= maximumResults) break;
+            }
+            return blocked;
+        }
+
+        internal static InstallOutcome ConfigureTerminalSafely(
+            string root,
+            InstallMarker marker,
+            InstallMarker previous,
+            bool windowsTerminalInstalled,
+            string terminalFragmentPath = null)
+        {
+            try
+            {
+                ConfigureTerminal(root, marker, terminalFragmentPath);
+                marker.TerminalIntegrationStatus = windowsTerminalInstalled
+                    ? "configured"
+                    : "configured-terminal-not-installed";
+                marker.TerminalIntegrationDiagnostic = windowsTerminalInstalled
+                    ? null
+                    : "未检测到 Windows Terminal；TermLink 自有 Profile Fragment 已预先生成。" +
+                      "以后安装 Windows Terminal 即可读取该配置，TermLink 没有安装、替换或修改 Terminal 本体。";
+                var message = windowsTerminalInstalled
+                    ? "Windows Terminal Profile 已配置。"
+                    : marker.TerminalIntegrationDiagnostic;
+                return new InstallOutcome(marker.TerminalIntegrationStatus, message, null);
+            }
+            catch (Exception error) when (
+                error is InvalidOperationException ||
+                error is UnauthorizedAccessException ||
+                error is SecurityException ||
+                error is IOException ||
+                error is JsonException ||
+                error is ArgumentException ||
+                error is NotSupportedException)
+            {
+                var diagnosticPath = WriteTerminalDiagnostic(error);
+                var message =
+                    "TermLink Agent 已安装，但可选的 Windows Terminal Profile 配置失败。" +
+                    "安装程序没有修改 Windows Terminal 的 settings.json，也不会替换现有 Terminal；原因: " +
+                    error.Message;
+                marker.TerminalIntegrationStatus = "failed";
+                marker.TerminalIntegrationDiagnostic = message;
+                CarryForwardTerminalOwnership(marker, previous);
+                return new InstallOutcome("failed", message, diagnosticPath);
+            }
+        }
+
+        private static void CarryForwardTerminalOwnership(
+            InstallMarker marker,
+            InstallMarker previous)
+        {
+            if (marker == null || previous == null) return;
+            var expectedPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Microsoft", "Windows Terminal", "Fragments", "TermLink", FragmentFileName);
+            if (!IsTerminalFragmentOwnedByMarker(expectedPath, previous)) return;
+            marker.TerminalFragmentPath = expectedPath;
+            marker.TerminalFragmentSha256 = previous.TerminalFragmentSha256;
+        }
+
+        private static string WriteTerminalDiagnostic(Exception error)
+        {
+            var path = Path.Combine(Path.GetTempPath(), "TermLink-Setup-terminal.log");
+            try
+            {
+                File.AppendAllText(
+                    path,
+                    DateTime.UtcNow.ToString("O") + Environment.NewLine + error + Environment.NewLine,
+                    new UTF8Encoding(false));
+                return path;
+            }
+            catch
+            {
+                // Console/UI still receive the original diagnostic when the
+                // temporary directory is itself unavailable.
+                return null;
+            }
+        }
+
+        private static void ConfigureTerminal(
+            string root,
+            InstallMarker marker,
+            string terminalFragmentPath = null)
+        {
+            var result = string.IsNullOrWhiteSpace(terminalFragmentPath)
+                ? WindowsTerminalIntegration.Reconfigure(root)
+                : WindowsTerminalIntegration.Reconfigure(root, terminalFragmentPath);
+            marker.TerminalFragmentPath = result.FragmentPath;
+            marker.TerminalFragmentSha256 = result.Sha256;
+        }
+
+        internal static bool IsTerminalFragmentOwnedByMarker(string path, InstallMarker marker)
+        {
+            if (marker == null || string.IsNullOrWhiteSpace(path) ||
+                string.IsNullOrWhiteSpace(marker.TerminalFragmentPath) ||
+                string.IsNullOrWhiteSpace(marker.TerminalFragmentSha256) ||
+                !File.Exists(path)) return false;
+            try
+            {
+                return string.Equals(
+                        Path.GetFullPath(marker.TerminalFragmentPath),
+                        Path.GetFullPath(path),
+                        StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(
+                        Sha256(path),
+                        marker.TerminalFragmentSha256,
+                        StringComparison.OrdinalIgnoreCase);
+            }
+            catch (Exception error) when (
+                error is IOException ||
+                error is UnauthorizedAccessException ||
+                error is SecurityException ||
+                error is ArgumentException ||
+                error is NotSupportedException)
             {
                 return false;
             }
         }
 
-        private static string FindOnPath(string name)
+        internal static bool TryLaunchTray(string installDirectory)
+        {
+            try
+            {
+                var root = NormalizeInstallRoot(installDirectory);
+                if (!IsInstalledLaunchIdentityValid(root)) return false;
+                var tray = Path.Combine(root, "TermLink.exe");
+                using (var process = Process.Start(new ProcessStartInfo
+                {
+                    FileName = tray,
+                    WorkingDirectory = root,
+                    UseShellExecute = false
+                }))
+                {
+                    if (process == null) return false;
+                    var deadline = DateTime.UtcNow.AddSeconds(15);
+                    while (DateTime.UtcNow < deadline)
+                    {
+                        if (process.HasExited) return false;
+                        var launchedPath = TryGetProcessImagePath(process.Id);
+                        if (!string.IsNullOrWhiteSpace(launchedPath) &&
+                            !string.Equals(
+                                Path.GetFullPath(launchedPath),
+                                Path.GetFullPath(tray),
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            return false;
+                        }
+                        try
+                        {
+                            var response = SendHealthRequestToLaunchedTray(
+                                TermLinkControlPipe.DefaultName(),
+                                process.Id,
+                                500);
+                            if (response != null && response.Success) return true;
+                        }
+                        catch (Exception error) when (
+                            error is IOException ||
+                            error is TimeoutException ||
+                            error is UnauthorizedAccessException)
+                        {
+                        }
+                        Thread.Sleep(100);
+                    }
+                    // A process that merely remains alive is not sufficient. The
+                    // default pipe may still belong to another installation, and
+                    // reporting success in that state makes a failed relocation
+                    // indistinguishable from a working upgrade.
+                    return false;
+                }
+            }
+            catch (Exception error) when (
+                error is IOException ||
+                error is UnauthorizedAccessException ||
+                error is InvalidOperationException ||
+                error is BadImageFormatException ||
+                error is SecurityException ||
+                error is System.ComponentModel.Win32Exception)
+            {
+                return false;
+            }
+        }
+
+        internal static bool IsInstalledLaunchIdentityValid(string installDirectory)
+        {
+            try
+            {
+                var root = NormalizeInstallRoot(installDirectory);
+                var tray = Path.Combine(root, "TermLink.exe");
+                var trayAssembly = Path.Combine(root, "TermLink.dll");
+                var marker = ReadMarkerIfPresent(root);
+                if (!File.Exists(tray) || !File.Exists(trayAssembly) || marker == null) return false;
+                var installedVersion = AssemblyName.GetAssemblyName(trayAssembly).Version?.ToString();
+                return !string.IsNullOrWhiteSpace(installedVersion) &&
+                    string.Equals(installedVersion, marker.Version, StringComparison.Ordinal);
+            }
+            catch (Exception error) when (
+                error is IOException ||
+                error is UnauthorizedAccessException ||
+                error is InvalidOperationException ||
+                error is BadImageFormatException ||
+                error is SecurityException ||
+                error is ArgumentException ||
+                error is NotSupportedException)
+            {
+                return false;
+            }
+        }
+
+        internal static RegistryResponse SendHealthRequestToLaunchedTray(
+            string pipeName,
+            int launchedProcessId,
+            int timeoutMilliseconds)
+        {
+            using (var pipe = new NamedPipeClientStream(
+                ".",
+                pipeName,
+                PipeDirection.InOut,
+                PipeOptions.None))
+            {
+                pipe.Connect(timeoutMilliseconds);
+                if (!GetNamedPipeServerProcessId(
+                        pipe.SafePipeHandle.DangerousGetHandle(),
+                        out var serverProcessId) ||
+                    serverProcessId != (uint)launchedProcessId)
+                {
+                    return null;
+                }
+                RegistryControlCodec.WriteRequest(
+                    pipe,
+                    new RegistryRequest { Command = RegistryCommand.List });
+                return RegistryControlCodec.ReadResponse(pipe);
+            }
+        }
+
+        internal static string FindExecutableOnPath(string name)
         {
             var path = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
             foreach (var directory in path.Split(Path.PathSeparator))
@@ -839,7 +1947,7 @@ namespace TermLink.Setup
 
         private static void ConfigureStartup(string root, InstallMarker marker)
         {
-            var tray = Path.Combine(root, "TermLink.Tray.exe");
+            var tray = Path.Combine(root, "TermLink.exe");
             var command = Quote(tray);
             using (var key = Registry.CurrentUser.CreateSubKey("Software\\Microsoft\\Windows\\CurrentVersion\\Run"))
             {
@@ -861,9 +1969,59 @@ namespace TermLink.Setup
             }
         }
 
+        private static string ReadOwnedStartupCommand(InstallMarker marker)
+        {
+            if (marker == null || string.IsNullOrWhiteSpace(marker.StartupCommand)) return null;
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(
+                    "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                    writable: false))
+                {
+                    var current = key?.GetValue(Program.RunValueName) as string;
+                    return string.Equals(
+                        current,
+                        marker.StartupCommand,
+                        StringComparison.OrdinalIgnoreCase)
+                        ? current
+                        : null;
+                }
+            }
+            catch (Exception error) when (
+                error is SecurityException ||
+                error is UnauthorizedAccessException ||
+                error is IOException)
+            {
+                return null;
+            }
+        }
+
+        private static void TryRestoreStartupAfterRollback(string previousCommand)
+        {
+            if (string.IsNullOrWhiteSpace(previousCommand)) return;
+            try
+            {
+                using (var key = Registry.CurrentUser.CreateSubKey(
+                    "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                    writable: true))
+                {
+                    var current = key?.GetValue(Program.RunValueName) as string;
+                    if (string.IsNullOrWhiteSpace(current))
+                    {
+                        key?.SetValue(Program.RunValueName, previousCommand, RegistryValueKind.String);
+                    }
+                }
+            }
+            catch
+            {
+                // Preserve the original installation failure. A concurrent user
+                // value is never overwritten during rollback.
+            }
+        }
+
         private static void ConfigureShortcuts(string root, InstallMarker marker, InstallMarker previous)
         {
-            var tray = Path.Combine(root, "TermLink.Tray.exe");
+            var tray = Path.Combine(root, "TermLink.exe");
             var desktopDefault = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
                 "TermLink.lnk");
@@ -889,6 +2047,7 @@ namespace TermLink.Setup
             if (string.IsNullOrWhiteSpace(source) || !File.Exists(source)) return;
             var sourceName = Path.GetFileName(source);
             if (!sourceName.StartsWith("TermLink-Setup-", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(sourceName, "TermLink-Setup.exe", StringComparison.OrdinalIgnoreCase) &&
                 !string.Equals(sourceName, "TermLink.Setup.exe", StringComparison.OrdinalIgnoreCase))
             {
                 // A developer invoking the installer through `dotnet` has no
@@ -994,16 +2153,111 @@ namespace TermLink.Setup
             if (string.Equals(Sha256(path), sha256, StringComparison.OrdinalIgnoreCase)) File.Delete(path);
         }
 
-        private static void TryRemoveTerminalFragmentIfOwned(InstallMarker marker)
+        private static byte[] ReadOwnedFile(string path, string sha256)
         {
+            if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(sha256) ||
+                !File.Exists(path)) return null;
             try
             {
-                RemoveTerminalFragmentIfOwned(marker);
+                return string.Equals(Sha256(path), sha256, StringComparison.OrdinalIgnoreCase)
+                    ? File.ReadAllBytes(path)
+                    : null;
+            }
+            catch (Exception error) when (
+                error is IOException ||
+                error is UnauthorizedAccessException ||
+                error is SecurityException)
+            {
+                return null;
+            }
+        }
+
+        private static void TryRestoreOwnedFileAfterRollback(string path, byte[] content)
+        {
+            if (string.IsNullOrWhiteSpace(path) || content == null) return;
+            try
+            {
+                // Do not overwrite a file created or modified concurrently after
+                // the failed upgrade. Restoration only fills the path removed by
+                // this installer's owned-file cleanup.
+                if (File.Exists(path)) return;
+                var directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
+                var temporaryPath = path + ".termlink-rollback-" + Guid.NewGuid().ToString("N") + ".tmp";
+                try
+                {
+                    File.WriteAllBytes(temporaryPath, content);
+                    File.Move(temporaryPath, path, overwrite: false);
+                }
+                finally
+                {
+                    if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+                }
             }
             catch
             {
-                // Preserve the original install error. The diagnostic log contains
-                // the original stack and is the source of truth for cleanup issues.
+                // Preserve the original installation failure and any concurrent
+                // file. The previous install root still contains its marker.
+            }
+        }
+
+        private static byte[] ReadExistingTerminalFragment()
+        {
+            var expectedPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Microsoft", "Windows Terminal", "Fragments", "TermLink", FragmentFileName);
+            try
+            {
+                return File.Exists(expectedPath) ? File.ReadAllBytes(expectedPath) : null;
+            }
+            catch (Exception error) when (
+                error is IOException ||
+                error is UnauthorizedAccessException ||
+                error is SecurityException)
+            {
+                return null;
+            }
+        }
+
+        private static void TryRestoreTerminalFragmentAfterRollback(
+            InstallMarker installedMarker,
+            byte[] previousContent)
+        {
+            try
+            {
+                if (installedMarker == null ||
+                    string.IsNullOrWhiteSpace(installedMarker.TerminalFragmentPath)) return;
+                var path = installedMarker.TerminalFragmentPath;
+                // If another process/user edited the new fragment after it was
+                // written, rollback no longer owns its current bytes and leaves
+                // them untouched.
+                if (!IsTerminalFragmentOwnedByMarker(path, installedMarker)) return;
+                if (previousContent == null)
+                {
+                    RemoveTerminalFragmentIfOwned(installedMarker);
+                    return;
+                }
+
+                var directory = Path.GetDirectoryName(path);
+                Directory.CreateDirectory(directory);
+                var temporaryPath = Path.Combine(
+                    directory,
+                    ".termlink-rollback-" + Guid.NewGuid().ToString("N") + ".tmp");
+                try
+                {
+                    File.WriteAllBytes(temporaryPath, previousContent);
+                    File.Move(temporaryPath, path, overwrite: true);
+                }
+                finally
+                {
+                    if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+                }
+            }
+            catch
+            {
+                // Preserve the original installation error. If safe restoration
+                // is impossible, the previous/new fragment is left visible for
+                // diagnosis instead of broad cleanup.
             }
         }
 
@@ -1066,19 +2320,65 @@ namespace TermLink.Setup
             }
         }
 
-        private static void TryRestoreDirectory(string backup, string root)
+        internal static void RestorePreviousInstallRootAfterFailure(
+            string backup,
+            string root,
+            string parent)
         {
+            if (!Directory.Exists(backup))
+            {
+                throw new DirectoryNotFoundException("旧版本备份不存在: " + backup);
+            }
+
+            string failedRoot = null;
+            if (Directory.Exists(root))
+            {
+                failedRoot = Path.Combine(parent, ".termlink-failed-" + Guid.NewGuid().ToString("N"));
+                MoveDirectoryWithRetry(
+                    root,
+                    failedRoot,
+                    "无法隔离失败的新版本目录",
+                    TimeSpan.FromSeconds(10));
+            }
+
             try
             {
-                if (Directory.Exists(backup) && !Directory.Exists(root))
-                {
-                    Directory.Move(backup, root);
-                }
+                MoveDirectoryWithRetry(
+                    backup,
+                    root,
+                    "无法恢复旧版本安装目录",
+                    TimeSpan.FromSeconds(10));
             }
             catch
             {
-                // Preserve the original install error. The backup remains visible
-                // for manual recovery instead of being deleted implicitly.
+                // If restoring the backup itself fails, make the activated new
+                // root usable again when possible. The backup remains intact for
+                // manual recovery and the caller surfaces both failures.
+                if (!string.IsNullOrWhiteSpace(failedRoot) &&
+                    Directory.Exists(failedRoot) &&
+                    !Directory.Exists(root))
+                {
+                    try
+                    {
+                        MoveDirectoryWithRetry(
+                            failedRoot,
+                            root,
+                            "无法重新激活失败的新版本目录",
+                            TimeSpan.FromSeconds(5));
+                    }
+                    catch { }
+                }
+                throw;
+            }
+
+            if (!string.IsNullOrWhiteSpace(failedRoot))
+            {
+                TryDeleteDirectory(failedRoot);
+                if (Directory.Exists(failedRoot))
+                {
+                    Console.Error.WriteLine(
+                        "失败的新版本目录暂时无法清理，旧版本已恢复；保留目录: " + failedRoot);
+                }
             }
         }
 
@@ -1093,7 +2393,7 @@ namespace TermLink.Setup
                     Path.GetFullPath(marker.TerminalFragmentPath ?? string.Empty),
                     Path.GetFullPath(expectedPath),
                     StringComparison.OrdinalIgnoreCase) || !File.Exists(expectedPath)) return;
-            if (string.Equals(Sha256(expectedPath), marker.TerminalFragmentSha256, StringComparison.OrdinalIgnoreCase))
+            if (IsTerminalFragmentOwnedByMarker(expectedPath, marker))
             {
                 File.Delete(expectedPath);
                 var directory = Path.GetDirectoryName(expectedPath);
@@ -1102,6 +2402,60 @@ namespace TermLink.Setup
                     Directory.Delete(directory);
                 }
             }
+        }
+
+        internal static IReadOnlyList<string> GetKnownRuntimeDataFilePaths(string localApplicationData)
+        {
+            if (string.IsNullOrWhiteSpace(localApplicationData))
+            {
+                throw new ArgumentException("Local application data directory is required.", nameof(localApplicationData));
+            }
+            var root = Path.Combine(Path.GetFullPath(localApplicationData), "TermLink");
+            return new[]
+            {
+                Path.Combine(root, "production-config.json"),
+                Path.Combine(root, "production-credentials.dpapi"),
+                Path.Combine(root, "Agent", "registrations.dpapi"),
+                Path.Combine(root, "Agent", "remote-access-policy.dpapi"),
+                Path.Combine(root, "Tray", "ui.preferences")
+            };
+        }
+
+        internal static IReadOnlyList<string> PurgeKnownRuntimeDataFiles(string localApplicationData)
+        {
+            var knownPaths = GetKnownRuntimeDataFilePaths(localApplicationData);
+            var root = Path.GetFullPath(Path.Combine(localApplicationData, "TermLink"));
+            var prefix = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
+                Path.DirectorySeparatorChar;
+            var deleted = new List<string>();
+            foreach (var candidate in knownPaths)
+            {
+                var path = Path.GetFullPath(candidate);
+                if (!path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException("运行数据清理路径超出 TermLink 专用目录，已拒绝: " + path);
+                }
+                if (!File.Exists(path)) continue;
+                File.Delete(path);
+                deleted.Add(path);
+            }
+
+            // Remove only these exact directories, and only when already empty.
+            // Session directories, update transactions and unknown files are
+            // deliberately retained; no recursive enumeration or deletion occurs.
+            foreach (var directory in new[]
+            {
+                Path.Combine(root, "Agent"),
+                Path.Combine(root, "Tray"),
+                root
+            })
+            {
+                if (Directory.Exists(directory) && !Directory.EnumerateFileSystemEntries(directory).Any())
+                {
+                    Directory.Delete(directory, recursive: false);
+                }
+            }
+            return deleted;
         }
 
         private static string Sha256(string path)

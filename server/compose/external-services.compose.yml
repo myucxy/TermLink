@@ -1,0 +1,34 @@
+# Overlay for production deployments that use provider-managed OIDC and S3.
+# PostgreSQL and Valkey remain local because they are required durable/runtime
+# state, while no Keycloak or MinIO container is introduced by this overlay.
+services:
+  edge:
+    volumes:
+      - ./external-services.Caddyfile:/etc/caddy/Caddyfile:ro
+
+  server:
+    environment:
+      TERMLINK_HISTORY_ENABLED: "true"
+      TERMLINK_S3_ENDPOINT: ${TERMLINK_S3_ENDPOINT:?TERMLINK_S3_ENDPOINT is required for external S3}
+      TERMLINK_S3_PUBLIC_ENDPOINT: ${TERMLINK_S3_PUBLIC_ENDPOINT:?TERMLINK_S3_PUBLIC_ENDPOINT is required for external S3}
+      TERMLINK_S3_BUCKET: ${TERMLINK_S3_BUCKET:-termlink-history}
+      TERMLINK_S3_REGION: ${TERMLINK_S3_REGION:-us-east-1}
+      TERMLINK_S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+      TERMLINK_S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+    secrets:
+      - source: s3_access_key
+        target: s3_access_key
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+      - source: s3_secret_key
+        target: s3_secret_key
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+
+secrets:
+  s3_access_key:
+    file: ${TERMLINK_S3_ACCESS_KEY_FILE:?TERMLINK_S3_ACCESS_KEY_FILE is required for external S3}
+  s3_secret_key:
+    file: ${TERMLINK_S3_SECRET_KEY_FILE:?TERMLINK_S3_SECRET_KEY_FILE is required for external S3}

@@ -1,4 +1,4 @@
-
+﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.10.34928.147
@@ -9,6 +9,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Agent", "src\Agent
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.SessionHost", "src\SessionHost\TermLink.SessionHost.csproj", "{9BE38CE8-9A08-43F0-B054-9372C71590B4}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.SessionHost.Validation", "tests\SessionHostValidation\TermLink.SessionHost.Validation.csproj", "{B87B4B97-6F2D-4D26-8E19-1F4BC1D15A40}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.WindowsSetup.Validation", "tests\WindowsSetupValidation\TermLink.WindowsSetup.Validation.csproj", "{997D856C-3B71-4528-9AFA-DC6330AA91CB}"
+EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Tray", "src\Tray\TermLink.Tray.csproj", "{6280F2B1-75D9-4E92-A626-393683A32EA9}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Updater", "src\Updater\TermLink.Updater.csproj", "{2F7A94D2-5678-4C25-A4CB-D6523874307D}"
@@ -16,6 +20,12 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Protocol", "src\Protocol\TermLink.Protocol.csproj", "{A3E48690-DFE2-4D4E-9AE8-3E1F244712B9}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.AgentControl.Validation", "tests\AgentControlValidation\TermLink.AgentControl.Validation.csproj", "{F356B28D-7AC5-4C6F-AE99-DF9A29C9B1DF}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Tray.UpdateValidation", "tests\TrayUpdateValidation\TermLink.Tray.UpdateValidation.csproj", "{733F90E8-117B-4DB4-A32E-7BEDE75C85D8}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{5F5F9B01-0E93-4DF9-AB2C-8EF697D8E2C5}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.FileOperations.Validation", "tests\FileOperationsValidation\TermLink.FileOperations.Validation.csproj", "{6C50ED51-D383-41F3-A33C-1E6F86783414}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -35,6 +45,14 @@ Global
 		{9BE38CE8-9A08-43F0-B054-9372C71590B4}.Debug|x64.Build.0 = Debug|Any CPU
 		{9BE38CE8-9A08-43F0-B054-9372C71590B4}.Release|x64.ActiveCfg = Release|Any CPU
 		{9BE38CE8-9A08-43F0-B054-9372C71590B4}.Release|x64.Build.0 = Release|Any CPU
+		{B87B4B97-6F2D-4D26-8E19-1F4BC1D15A40}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{B87B4B97-6F2D-4D26-8E19-1F4BC1D15A40}.Debug|x64.Build.0 = Debug|Any CPU
+		{B87B4B97-6F2D-4D26-8E19-1F4BC1D15A40}.Release|x64.ActiveCfg = Release|Any CPU
+		{B87B4B97-6F2D-4D26-8E19-1F4BC1D15A40}.Release|x64.Build.0 = Release|Any CPU
+		{997D856C-3B71-4528-9AFA-DC6330AA91CB}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{997D856C-3B71-4528-9AFA-DC6330AA91CB}.Debug|x64.Build.0 = Debug|Any CPU
+		{997D856C-3B71-4528-9AFA-DC6330AA91CB}.Release|x64.ActiveCfg = Release|Any CPU
+		{997D856C-3B71-4528-9AFA-DC6330AA91CB}.Release|x64.Build.0 = Release|Any CPU
 		{6280F2B1-75D9-4E92-A626-393683A32EA9}.Debug|x64.ActiveCfg = Debug|Any CPU
 		{6280F2B1-75D9-4E92-A626-393683A32EA9}.Debug|x64.Build.0 = Debug|Any CPU
 		{6280F2B1-75D9-4E92-A626-393683A32EA9}.Release|x64.ActiveCfg = Release|Any CPU
@@ -51,5 +69,16 @@ Global
 		{F356B28D-7AC5-4C6F-AE99-DF9A29C9B1DF}.Debug|x64.Build.0 = Debug|Any CPU
 		{F356B28D-7AC5-4C6F-AE99-DF9A29C9B1DF}.Release|x64.ActiveCfg = Release|Any CPU
 		{F356B28D-7AC5-4C6F-AE99-DF9A29C9B1DF}.Release|x64.Build.0 = Release|Any CPU
+		{733F90E8-117B-4DB4-A32E-7BEDE75C85D8}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{733F90E8-117B-4DB4-A32E-7BEDE75C85D8}.Debug|x64.Build.0 = Debug|Any CPU
+		{733F90E8-117B-4DB4-A32E-7BEDE75C85D8}.Release|x64.ActiveCfg = Release|Any CPU
+		{733F90E8-117B-4DB4-A32E-7BEDE75C85D8}.Release|x64.Build.0 = Release|Any CPU
+		{6C50ED51-D383-41F3-A33C-1E6F86783414}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{6C50ED51-D383-41F3-A33C-1E6F86783414}.Debug|x64.Build.0 = Debug|Any CPU
+		{6C50ED51-D383-41F3-A33C-1E6F86783414}.Release|x64.ActiveCfg = Release|Any CPU
+		{6C50ED51-D383-41F3-A33C-1E6F86783414}.Release|x64.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{6C50ED51-D383-41F3-A33C-1E6F86783414} = {5F5F9B01-0E93-4DF9-AB2C-8EF697D8E2C5}
 	EndGlobalSection
 EndGlobal

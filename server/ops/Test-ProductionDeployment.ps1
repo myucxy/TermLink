@@ -510,18 +510,47 @@ if ($null -ne $s3PublicUri) {
 
 $caddyfilePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Caddyfile'))
 $caddyfileText = [IO.File]::ReadAllText($caddyfilePath)
+$historyObjectMatcher = 'path_regexp history_object_path ^/termlink-history/accounts/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/sessions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/(chunk|snapshot|transcript)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]bin$'
+$fileTransferMatcher = 'path_regexp file_transfer_path ^/termlink-history/accounts/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/file-transfers/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]bin$'
 Assert-Production ($caddyfileText -match '(?m)^\s*method GET PUT\s*$') `
     'The history edge must allow only GET and PUT object methods.'
 Assert-Production ($caddyfileText -match '(?m)^\s*max_size 67108864\s*$') `
     'The history edge body limit must exactly match the 64 MiB object contract.'
-Assert-Production ($caddyfileText -match '(?m)^\s*path_regexp history_object_path \^/termlink-history/accounts/.+sessions/.+\(chunk\|snapshot\)/.+\[\.\]bin\$$') `
+Assert-Production ($caddyfileText.Contains($historyObjectMatcher, [StringComparison]::Ordinal)) `
     'The history edge must restrict requests to TermLink account object keys.'
+Assert-Production ($caddyfileText.Contains($fileTransferMatcher, [StringComparison]::Ordinal)) `
+    'The history edge must restrict file transfers to the reviewed account/PC/operation object shape.'
+Assert-Production ($caddyfileText -match '(?m)^\s*expression `\{http\.request\.header\.Content-Length\} != '''' && int\(\{http\.request\.header\.Content-Length\}\) > 67108864`$') `
+    'The history edge must reject session-history PUT bodies above 64 MiB.'
+Assert-Production ($caddyfileText -match '(?m)^\s*expression `\{http\.request\.header\.Content-Length\} != '''' && int\(\{http\.request\.header\.Content-Length\}\) > 5368709120`$') `
+    'The history edge must reject file-transfer PUT bodies above exactly 5 GiB.'
+Assert-Production ($caddyfileText -match '(?ms)handle @history_object\s*\{.*?max_size 67108864.*?reverse_proxy minio:9000\s*\}') `
+    'The session-history route must retain its independent 64 MiB streaming limit.'
+Assert-Production ($caddyfileText -match '(?ms)handle @file_transfer\s*\{.*?max_size 5368709120.*?reverse_proxy minio:9000\s*\}') `
+    'The file-transfer route must use the independent exact 5 GiB streaming limit.'
 Assert-Production ($caddyfileText -match '(?m)^\s*reverse_proxy minio:9000\s*$') `
     'The reviewed history object proxy target is missing.'
 Assert-Production ($caddyfileText -match '(?m)^\s*respond 404\s*$') `
     'The history edge must fail closed for every unmatched method and path.'
 Assert-Production ($caddyfileText -notmatch '(?m)^\s*log\s*(?:\{|$)') `
     'Caddy access logging must remain disabled so presigned query credentials are not emitted.'
+
+# Acceptance has both a private TLS object edge and a public Lucky HTTP hop.
+# Keep their file-transfer shape and 5 GiB limit aligned with the production
+# edge without weakening the independent 64 MiB session-history handlers.
+$acceptanceFileTransferMatcher = $fileTransferMatcher.Replace('file_transfer_path', 'file_transfer_object_path')
+foreach ($acceptanceProxy in @(
+    (Join-Path $PSScriptRoot '..\acceptance\Caddyfile'),
+    (Join-Path $PSScriptRoot '..\acceptance\LuckyUpstream.Caddyfile')
+)) {
+    $acceptanceProxyText = [IO.File]::ReadAllText([IO.Path]::GetFullPath($acceptanceProxy))
+    Assert-Production ($acceptanceProxyText.Contains($acceptanceFileTransferMatcher, [StringComparison]::Ordinal)) `
+        "Acceptance proxy '$acceptanceProxy' must use the reviewed account/PC/operation file-transfer shape."
+    Assert-Production ($acceptanceProxyText -match '(?ms)handle @historyObject\s*\{.*?max_size 67108864.*?reverse_proxy minio:9000') `
+        "Acceptance proxy '$acceptanceProxy' must retain the independent 64 MiB history limit."
+    Assert-Production ($acceptanceProxyText -match '(?ms)handle @fileTransferObject\s*\{.*?max_size 5368709120.*?reverse_proxy minio:9000') `
+        "Acceptance proxy '$acceptanceProxy' must use the independent exact 5 GiB file-transfer limit."
+}
 
 # This is the key boundary of the production topology: the public edge may
 # reach PostgreSQL and Valkey only through the application. MinIO shares the

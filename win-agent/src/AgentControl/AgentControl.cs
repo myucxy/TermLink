@@ -27,7 +27,12 @@ namespace TermLink.Agent
                 {
                     var suffix = new StringBuilder(16);
                     for (var index = 0; index < 8; index++) suffix.Append(hash[index].ToString("x2"));
-                    return "termlink-agent-control-" + suffix;
+                    // V2 moves the integrated Tray/Agent away from the legacy
+                    // control-pipe and single-instance mutex namespace. An old
+                    // standalone Agent could keep the V1 mutex while no longer
+                    // serving its pipe, permanently preventing the integrated
+                    // runtime from starting after an upgrade.
+                    return "termlink-agent-control-v2-" + suffix;
                 }
                 finally
                 {
@@ -76,6 +81,7 @@ namespace TermLink.Agent
                 shellType,
                 GetProcessStartTimeUtc(expectedHostProcessId),
                 DateTime.UtcNow,
+                false,
                 false)
         {
         }
@@ -96,6 +102,7 @@ namespace TermLink.Agent
                 shellType,
                 expectedHostStartTimeUtc,
                 registeredAtUtc,
+                false,
                 false)
         {
         }
@@ -109,6 +116,29 @@ namespace TermLink.Agent
             DateTime expectedHostStartTimeUtc,
             DateTime registeredAtUtc,
             bool recoveryOnly)
+            : this(
+                sessionId,
+                pipeName,
+                handshakeToken,
+                expectedHostProcessId,
+                shellType,
+                expectedHostStartTimeUtc,
+                registeredAtUtc,
+                recoveryOnly,
+                false)
+        {
+        }
+
+        public SessionRegistration(
+            Guid sessionId,
+            string pipeName,
+            byte[] handshakeToken,
+            int expectedHostProcessId,
+            ManagedShellType shellType,
+            DateTime expectedHostStartTimeUtc,
+            DateTime registeredAtUtc,
+            bool recoveryOnly,
+            bool retired)
         {
             if (sessionId == Guid.Empty) throw new ArgumentException("session ID is required", "sessionId");
             if (string.IsNullOrWhiteSpace(pipeName) || pipeName.Length > 200 ||
@@ -133,6 +163,10 @@ namespace TermLink.Agent
             {
                 throw new ArgumentException("registration time must be UTC", "registeredAtUtc");
             }
+            if (retired && !recoveryOnly)
+            {
+                throw new ArgumentException("retired registrations must be recovery-only", "retired");
+            }
 
             SessionId = sessionId;
             PipeName = pipeName;
@@ -142,6 +176,7 @@ namespace TermLink.Agent
             ExpectedHostStartTimeUtc = expectedHostStartTimeUtc;
             RegisteredAtUtc = registeredAtUtc;
             RecoveryOnly = recoveryOnly;
+            Retired = retired;
         }
 
         private readonly byte[] handshakeTokenBytes;
@@ -154,6 +189,7 @@ namespace TermLink.Agent
         public DateTime ExpectedHostStartTimeUtc { get; private set; }
         public DateTime RegisteredAtUtc { get; private set; }
         public bool RecoveryOnly { get; private set; }
+        public bool Retired { get; private set; }
 
         public SessionRegistration AsRecoveryOnly()
         {
@@ -166,7 +202,58 @@ namespace TermLink.Agent
                 ShellType,
                 ExpectedHostStartTimeUtc,
                 RegisteredAtUtc,
+                true,
+                Retired);
+        }
+
+        public SessionRegistration AsActive()
+        {
+            if (Retired) throw new InvalidOperationException("A retired Session ID cannot become active.");
+            if (!RecoveryOnly) return this;
+            return new SessionRegistration(
+                SessionId,
+                PipeName,
+                handshakeTokenBytes,
+                ExpectedHostProcessId,
+                ShellType,
+                ExpectedHostStartTimeUtc,
+                RegisteredAtUtc,
+                false,
+                false);
+        }
+
+        public SessionRegistration AsRetired()
+        {
+            if (Retired) return this;
+            return new SessionRegistration(
+                SessionId,
+                PipeName,
+                handshakeTokenBytes,
+                ExpectedHostProcessId,
+                ShellType,
+                ExpectedHostStartTimeUtc,
+                RegisteredAtUtc,
+                true,
                 true);
+        }
+
+        public bool HasSameHostIdentity(SessionRegistration other)
+        {
+            return other != null &&
+                SessionId == other.SessionId &&
+                ExpectedHostProcessId == other.ExpectedHostProcessId &&
+                ExpectedHostStartTimeUtc.Ticks == other.ExpectedHostStartTimeUtc.Ticks &&
+                ShellType == other.ShellType &&
+                string.Equals(PipeName, other.PipeName, StringComparison.Ordinal) &&
+                FixedTimeEquals(handshakeTokenBytes, other.handshakeTokenBytes);
+        }
+
+        private static bool FixedTimeEquals(byte[] left, byte[] right)
+        {
+            if (left == null || right == null || left.Length != right.Length) return false;
+            var difference = 0;
+            for (var index = 0; index < left.Length; index++) difference |= left[index] ^ right[index];
+            return difference == 0;
         }
 
         public bool MatchesRunningHost()
@@ -240,7 +327,8 @@ namespace TermLink.Agent
         RefreshProductionStatus = 8,
         CreatePairingChallenge = 9,
         RevokeDevice = 10,
-        GrantDevice = 11
+        GrantDevice = 11,
+        RetryProductionConnection = 12
     }
 
     public sealed class RegistryRequest
@@ -329,6 +417,8 @@ namespace TermLink.Agent
         public string AccountUsername { get; set; }
         public string AccountEmail { get; set; }
         public string ServerHost { get; set; }
+        public string ServerOrigin { get; set; }
+        public bool TerminalSnapshotEnabled { get; set; }
         public string PcName { get; set; }
         public ProductionRelayState RelayState { get; set; }
         public string LastErrorCode { get; set; }
@@ -351,7 +441,8 @@ namespace TermLink.Agent
 
     public static class RegistryControlCodec
     {
-        private const byte Version = 5;
+        public const byte CurrentVersion = 6;
+        private const byte MinimumSupportedVersion = 5;
         private const int MaximumBytes = 64 * 1024;
 
         public static void WriteRequest(Stream stream, RegistryRequest request)
@@ -361,7 +452,7 @@ namespace TermLink.Agent
             using (var body = new MemoryStream())
             using (var writer = new BinaryWriter(body, Encoding.UTF8))
             {
-                writer.Write(Version);
+                writer.Write(CurrentVersion);
                 writer.Write((byte)request.Command);
                 switch (request.Command)
                 {
@@ -395,10 +486,17 @@ namespace TermLink.Agent
 
         public static RegistryRequest ReadRequest(Stream stream)
         {
+            byte ignoredVersion;
+            return ReadRequest(stream, out ignoredVersion);
+        }
+
+        public static RegistryRequest ReadRequest(Stream stream, out byte version)
+        {
             using (var body = new MemoryStream(ReadFrame(stream), false))
             using (var reader = new BinaryReader(body, Encoding.UTF8))
             {
-                if (reader.ReadByte() != Version) throw new InvalidDataException("Unsupported Registry control version.");
+                version = reader.ReadByte();
+                ValidateVersion(version, "control");
                 var commandValue = reader.ReadByte();
                 if (!Enum.IsDefined(typeof(RegistryCommand), commandValue)) throw new InvalidDataException("Unknown Registry command.");
                 var request = new RegistryRequest { Command = (RegistryCommand)commandValue };
@@ -436,12 +534,18 @@ namespace TermLink.Agent
 
         public static void WriteResponse(Stream stream, RegistryResponse response)
         {
+            WriteResponse(stream, response, CurrentVersion);
+        }
+
+        public static void WriteResponse(Stream stream, RegistryResponse response, byte version)
+        {
             if (stream == null) throw new ArgumentNullException("stream");
             if (response == null) throw new ArgumentNullException("response");
+            ValidateVersion(version, "response");
             using (var body = new MemoryStream())
             using (var writer = new BinaryWriter(body, Encoding.UTF8))
             {
-                writer.Write(Version);
+                writer.Write(version);
                 writer.Write(response.Success);
                 WriteString(writer, response.Code ?? string.Empty);
                 writer.Write(response.RemoteAccessEnabled);
@@ -461,7 +565,7 @@ namespace TermLink.Agent
                     writer.Write(summary.ExitCode.HasValue);
                     if (summary.ExitCode.HasValue) writer.Write(summary.ExitCode.Value);
                 }
-                WriteProductionStatus(writer, response.Production);
+                WriteProductionStatus(writer, response.Production, version);
                 writer.Flush();
                 WriteFrame(stream, body.ToArray());
             }
@@ -472,7 +576,8 @@ namespace TermLink.Agent
             using (var body = new MemoryStream(ReadFrame(stream), false))
             using (var reader = new BinaryReader(body, Encoding.UTF8))
             {
-                if (reader.ReadByte() != Version) throw new InvalidDataException("Unsupported Registry response version.");
+                var version = reader.ReadByte();
+                ValidateVersion(version, "response");
                 var response = new RegistryResponse
                 {
                     Success = reader.ReadBoolean(),
@@ -507,14 +612,14 @@ namespace TermLink.Agent
                     if (reader.ReadBoolean()) summary.ExitCode = reader.ReadInt32();
                     summaries.Add(summary);
                 }
-                response.Production = ReadProductionStatus(reader);
+                response.Production = ReadProductionStatus(reader, version);
                 if (body.Position != body.Length) throw new InvalidDataException("Registry response has trailing bytes.");
                 response.Summaries = summaries;
                 return response;
             }
         }
 
-        private static void WriteProductionStatus(BinaryWriter writer, ProductionStatus status)
+        private static void WriteProductionStatus(BinaryWriter writer, ProductionStatus status, byte version)
         {
             status = status ?? new ProductionStatus
             {
@@ -564,9 +669,14 @@ namespace TermLink.Agent
                 WriteString(writer, status.PairingChallenge.ChallengeNonce ?? string.Empty);
                 writer.Write(status.PairingChallenge.ExpiresAtUtc.Ticks);
             }
+            if (version >= 6)
+            {
+                WriteString(writer, status.ServerOrigin ?? string.Empty);
+                writer.Write(status.TerminalSnapshotEnabled);
+            }
         }
 
-        private static ProductionStatus ReadProductionStatus(BinaryReader reader)
+        private static ProductionStatus ReadProductionStatus(BinaryReader reader, byte version)
         {
             var status = new ProductionStatus
             {
@@ -575,6 +685,8 @@ namespace TermLink.Agent
                 AccountUsername = ReadString(reader),
                 AccountEmail = ReadString(reader),
                 ServerHost = ReadString(reader),
+                ServerOrigin = string.Empty,
+                TerminalSnapshotEnabled = false,
                 PcName = ReadString(reader)
             };
             var relay = reader.ReadByte();
@@ -627,7 +739,18 @@ namespace TermLink.Agent
                 };
                 status.PairingChallenge = challenge;
             }
+            if (version >= 6)
+            {
+                status.ServerOrigin = ReadString(reader);
+                status.TerminalSnapshotEnabled = reader.ReadBoolean();
+            }
             return status;
+        }
+
+        private static void ValidateVersion(byte version, string frameKind)
+        {
+            if (version < MinimumSupportedVersion || version > CurrentVersion)
+                throw new InvalidDataException("Unsupported Registry " + frameKind + " version.");
         }
 
         private static void WriteOptionalDateTime(BinaryWriter writer, DateTime? value)

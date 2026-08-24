@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using TermLink.Agent;
+using TermLink.WindowsIntegration;
 
 namespace TermLink.Tray
 {
@@ -33,12 +34,9 @@ namespace TermLink.Tray
     /// </summary>
     internal static class TrayPreferences
     {
+        internal const string StoragePathAppContextKey = "TermLink.TrayPreferences.StoragePath";
         private static readonly object Gate = new object();
-        private static readonly string FilePath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "TermLink",
-            "Tray",
-            "ui.preferences");
+        private static readonly string FilePath = ResolveFilePath();
         private static TrayLanguage language;
         private static TrayTheme theme;
 
@@ -49,6 +47,24 @@ namespace TermLink.Tray
             language = TrayLanguage.FollowSystem;
             theme = TrayTheme.FollowSystem;
             Load();
+        }
+
+        private static string ResolveFilePath()
+        {
+            // In-process test hosts may redirect this non-sensitive preference
+            // file before the type is initialized. Production never sets the
+            // AppContext value and therefore continues to use LocalAppData.
+            var overridePath = AppContext.GetData(StoragePathAppContextKey) as string;
+            if (!string.IsNullOrWhiteSpace(overridePath))
+            {
+                return Path.GetFullPath(overridePath);
+            }
+
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "TermLink",
+                "Tray",
+                "ui.preferences");
         }
 
         public static TrayLanguage Language
@@ -169,6 +185,25 @@ namespace TermLink.Tray
                 default: return Pick("跟随系统", "Follow system");
             }
         }
+    }
+
+    internal static class TrayProductVersion
+    {
+        public static string Full
+        {
+            get
+            {
+                var version = typeof(TrayProductVersion).Assembly.GetName().Version;
+                if (version == null) return "0.0.0.0";
+                return string.Join(".",
+                    Math.Max(0, version.Major),
+                    Math.Max(0, version.Minor),
+                    Math.Max(0, version.Build),
+                    Math.Max(0, version.Revision));
+            }
+        }
+
+        public static string Display { get { return "v" + Full; } }
     }
 
     internal sealed class TrayPalette
@@ -400,13 +435,20 @@ namespace TermLink.Tray
     {
         public static Icon LoadApplicationIcon()
         {
+            return LoadApplicationIcon(DpiLayout.DesignDpi);
+        }
+
+        public static Icon LoadApplicationIcon(int dpi)
+        {
+            var iconPixels = DpiLayout.Scale96(32, dpi);
+            var requestedSize = new Size(iconPixels, iconPixels);
             try
             {
                 using (var stream = typeof(BrandIcons).Assembly.GetManifestResourceStream("TermLink.Tray.Assets.TermLink.ico"))
                 {
                     if (stream != null)
                     {
-                        using (var embedded = new Icon(stream))
+                        using (var embedded = new Icon(stream, requestedSize))
                         {
                             return (Icon)embedded.Clone();
                         }
@@ -421,14 +463,59 @@ namespace TermLink.Tray
             }
             try
             {
-                var icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
-                if (icon != null) return icon;
+                using (var icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath))
+                {
+                    if (icon != null) return new Icon(icon, requestedSize);
+                }
             }
             catch (ArgumentException)
             {
             }
             return (Icon)SystemIcons.Application.Clone();
         }
+
+        public static Bitmap LoadBrandBitmap()
+        {
+            try
+            {
+                using (var stream = typeof(BrandIcons).Assembly.GetManifestResourceStream(
+                    "TermLink.Tray.Assets.TermLink-preview-256.png"))
+                using (var embedded = stream == null ? null : Image.FromStream(stream))
+                {
+                    if (embedded != null) return new Bitmap(embedded);
+                }
+            }
+            catch (ArgumentException)
+            {
+            }
+            catch (IOException)
+            {
+            }
+            using (var icon = LoadApplicationIcon())
+            {
+                return icon.ToBitmap();
+            }
+        }
+    }
+
+    internal static class DpiLayout
+    {
+        internal const int DesignDpi = 96;
+
+        internal static int Scale96(int logicalPixels, int dpi)
+        {
+            if (logicalPixels == 0) return 0;
+            var effectiveDpi = dpi <= 0 ? DesignDpi : dpi;
+            return (int)Math.Round(
+                logicalPixels * (double)effectiveDpi / DesignDpi,
+                MidpointRounding.AwayFromZero);
+        }
+
+        internal static Padding Scale96(Padding value, int dpi) => new Padding(
+            Scale96(value.Left, dpi),
+            Scale96(value.Top, dpi),
+            Scale96(value.Right, dpi),
+            Scale96(value.Bottom, dpi));
     }
 
     internal static class TrayInputValidation
@@ -470,19 +557,24 @@ namespace TermLink.Tray
         private readonly ToolStripMenuItem relayItem;
         private readonly ToolStripMenuItem sessionsItem;
         private readonly ToolStripMenuItem restartItem;
+        private readonly ToolStripMenuItem signOutItem;
         private readonly ToolStripMenuItem openItem;
         private readonly ToolStripMenuItem settingsItem;
         private readonly ToolStripMenuItem exitItem;
         private readonly System.Windows.Forms.Timer refreshTimer;
+        private readonly System.Windows.Forms.Timer updateCheckTimer;
+        private readonly WindowsUpdateWorkflow updateWorkflow;
         private int refreshInFlight;
         private int exitInFlight;
         private MainWindowForm mainWindow;
         private RegistryResponse latestResponse;
         private Exception latestError;
+        private bool reauthenticationNoticeShown;
 
         public TrayApplicationContext(AgentController controller)
         {
             this.controller = controller;
+            updateWorkflow = new WindowsUpdateWorkflow();
             if (SynchronizationContext.Current == null)
             {
                 SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
@@ -493,17 +585,19 @@ namespace TermLink.Tray
             relayItem = new ToolStripMenuItem(TrayText.Pick("Relay：检查中", "Relay: checking")) { Enabled = false };
             sessionsItem = new ToolStripMenuItem(TrayText.Pick("打开会话", "Open sessions"), null, delegate { OpenSessions(); });
             restartItem = new ToolStripMenuItem(TrayText.Pick("重启 Agent", "Restart agent"), null, delegate { RestartAgent(); });
+            signOutItem = new ToolStripMenuItem(TrayText.Pick("退出登录并忘记本机账号", "Sign out and forget local account"), null, delegate { SignOutAccount(); }) { Enabled = false };
             openItem = new ToolStripMenuItem(TrayText.Pick("打开 TermLink", "Open TermLink"), null, delegate { OpenMainWindow("connection"); });
             settingsItem = new ToolStripMenuItem(TrayText.Pick("设置", "Settings"), null, delegate { OpenMainWindow("settings"); });
-            exitItem = new ToolStripMenuItem(TrayText.Pick("退出托盘", "Exit tray"), null, delegate { ExitTray(); });
+            exitItem = new ToolStripMenuItem(TrayText.Pick("退出 TermLink", "Exit TermLink"), null, delegate { ExitTray(); });
             var menu = new ContextMenuStrip();
-            menu.Items.Add(new ToolStripMenuItem("TermLink Agent") { Enabled = false });
+            menu.Items.Add(new ToolStripMenuItem("TermLink") { Enabled = false });
             menu.Items.Add(statusItem);
             menu.Items.Add(accountItem);
             menu.Items.Add(relayItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(sessionsItem);
             menu.Items.Add(restartItem);
+            menu.Items.Add(signOutItem);
             menu.Items.Add(openItem);
             menu.Items.Add(settingsItem);
             menu.Items.Add(new ToolStripSeparator());
@@ -516,7 +610,7 @@ namespace TermLink.Tray
             notifyIcon = new NotifyIcon
             {
                 Icon = applicationIcon,
-                Text = "TermLink Agent",
+                Text = "TermLink",
                 ContextMenuStrip = menu,
                 Visible = true
             };
@@ -525,9 +619,25 @@ namespace TermLink.Tray
                 if (e.Button == MouseButtons.Left) OpenMainWindow("connection");
             };
             notifyIcon.DoubleClick += delegate { OpenMainWindow("connection"); };
+            notifyIcon.BalloonTipClicked += delegate { OpenMainWindow("connection"); };
             refreshTimer = new System.Windows.Forms.Timer { Interval = 3000 };
             refreshTimer.Tick += async delegate { await RefreshStateAsync(false); };
             refreshTimer.Start();
+            updateCheckTimer = new System.Windows.Forms.Timer { Interval = 15000 };
+            updateCheckTimer.Tick += async delegate
+            {
+                updateCheckTimer.Stop();
+                try
+                {
+                    await updateWorkflow.CheckAndOfferAsync(null, manual: false);
+                }
+                catch
+                {
+                    // Startup checks are best effort. Manual checks surface the
+                    // same workflow's complete diagnostic in the settings page.
+                }
+            };
+            updateCheckTimer.Start();
             TrayPreferences.Changed += PreferencesChanged;
             _ = RefreshStateAsync(true);
         }
@@ -554,9 +664,10 @@ namespace TermLink.Tray
         {
             sessionsItem.Text = TrayText.Pick("打开会话", "Open sessions");
             restartItem.Text = TrayText.Pick("重启 Agent", "Restart agent");
+            signOutItem.Text = TrayText.Pick("退出登录并忘记本机账号", "Sign out and forget local account");
             openItem.Text = TrayText.Pick("打开 TermLink", "Open TermLink");
             settingsItem.Text = TrayText.Pick("设置", "Settings");
-            exitItem.Text = TrayText.Pick("退出托盘", "Exit tray");
+            exitItem.Text = TrayText.Pick("退出 TermLink", "Exit TermLink");
         }
 
         private void ApplyState(RegistryResponse response)
@@ -566,11 +677,32 @@ namespace TermLink.Tray
             latestError = null;
             var count = response.Summaries == null ? 0 : response.Summaries.Count;
             var production = response.Production ?? new ProductionStatus();
+            var requiresReauthentication = TrayDisplay.RequiresReauthentication(production);
             statusItem.Text = TrayText.Pick("Agent · " + count + " 个会话", "Agent · " + count + " sessions");
             accountItem.Text = TrayText.Pick("账户：", "Account: ") + TrayDisplay.LocalizedAccountStatus(production);
-            relayItem.Text = TrayText.Pick("Relay：", "Relay: ") + TrayDisplay.LocalizedRelayStatus(production.RelayState);
+            relayItem.Text = requiresReauthentication
+                ? TrayText.Pick("需要重新登录", "Sign in again required")
+                : TrayText.Pick("Relay：", "Relay: ") + TrayDisplay.LocalizedRelayStatus(production.RelayState);
             sessionsItem.Enabled = true;
-            notifyIcon.Text = "TermLink · " + TrayDisplay.LocalizedRelayStatus(production.RelayState);
+            signOutItem.Enabled = production.Configured && production.AccountLinked;
+            notifyIcon.Text = requiresReauthentication
+                ? TrayText.Pick("TermLink · 登录已失效", "TermLink · sign-in expired")
+                : "TermLink · " + TrayDisplay.LocalizedRelayStatus(production.RelayState);
+            if (requiresReauthentication && !reauthenticationNoticeShown)
+            {
+                reauthenticationNoticeShown = true;
+                notifyIcon.ShowBalloonTip(
+                    8000,
+                    "TermLink",
+                    TrayText.Pick(
+                        "登录已失效，请重新登录。点击此提示即可打开登录入口。",
+                        "Your sign-in expired. Sign in again to reconnect. Click this notification to open TermLink."),
+                    ToolTipIcon.Warning);
+            }
+            else if (!requiresReauthentication)
+            {
+                reauthenticationNoticeShown = false;
+            }
             if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.Apply(response);
         }
 
@@ -582,6 +714,7 @@ namespace TermLink.Tray
             accountItem.Text = TrayText.Pick("账户：不可用", "Account: unavailable");
             relayItem.Text = TrayText.Pick("Relay：不可用", "Relay: unavailable");
             sessionsItem.Enabled = false;
+            signOutItem.Enabled = false;
             if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.ApplyUnavailable(error);
             if (showFailure) ShowFailure(error.Message);
         }
@@ -596,7 +729,7 @@ namespace TermLink.Tray
         {
             if (mainWindow == null || mainWindow.IsDisposed)
             {
-                mainWindow = new MainWindowForm(controller);
+                mainWindow = new MainWindowForm(controller, updateWorkflow);
                 mainWindow.FormClosed += delegate { mainWindow = null; };
             }
             mainWindow.Show();
@@ -613,7 +746,8 @@ namespace TermLink.Tray
                 var response = await Task.Run(() => controller.EnsureAgent());
                 ApplyState(response);
                 var production = response == null ? null : response.Production;
-                if (production == null || !production.AccountLinked)
+                if (production == null || !production.AccountLinked ||
+                    TrayDisplay.RequiresReauthentication(production))
                 {
                     await LoginAccountAsync();
                 }
@@ -631,7 +765,7 @@ namespace TermLink.Tray
 
         private async Task LoginAccountAsync()
         {
-            using (var dialog = new AccountLinkForm())
+            using (var dialog = new AccountLinkForm(controller.ServerUrl))
             {
                 if (dialog.ShowDialog() != DialogResult.OK) return;
                 try
@@ -651,7 +785,7 @@ namespace TermLink.Tray
 
         private async Task RegisterAccountAsync()
         {
-            using (var dialog = new AccountRegisterForm())
+            using (var dialog = new AccountRegisterForm(controller.ServerUrl))
             {
                 if (dialog.ShowDialog() != DialogResult.OK) return;
                 try
@@ -720,6 +854,38 @@ namespace TermLink.Tray
             }
         }
 
+        private async void SignOutAccount()
+        {
+            if (MessageBox.Show(
+                TrayText.Pick(
+                    "退出此 PC 上的 TermLink 账号？\n\n这会停止当前远程连接，并仅从本机清除登录凭据和账号配置；不会删除服务器账号。",
+                    "Sign out of TermLink on this PC?\n\nThis stops current remote connections and removes only the local credentials and account configuration. It does not delete the server account."),
+                "TermLink",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) != DialogResult.OK)
+            {
+                return;
+            }
+            signOutItem.Enabled = false;
+            try
+            {
+                var response = await Task.Run(() => controller.ForgetLocalAccountAndRestart());
+                if (response == null || !response.Success) throw new InvalidOperationException(response == null ? "NO_RESPONSE" : response.Code);
+                ApplyState(response);
+                notifyIcon.ShowBalloonTip(
+                    4000,
+                    "TermLink",
+                    TrayText.Pick("已退出登录，并已忘记此 PC 上的账号。", "Signed out and forgot the account on this PC."),
+                    ToolTipIcon.Info);
+            }
+            catch (Exception error)
+            {
+                ShowFailure(error.Message);
+                await RefreshStateAsync(false);
+            }
+        }
+
         private void ShowFailure(string message)
         {
             notifyIcon.ShowBalloonTip(4000, "TermLink", message, ToolTipIcon.Error);
@@ -727,6 +893,17 @@ namespace TermLink.Tray
 
         private async void ExitTray()
         {
+            if (MessageBox.Show(
+                TrayText.Pick(
+                    "完全退出 TermLink 并停止后台连接？\n\n你仍会保持登录；下次启动 TermLink 时会继续使用此账号。",
+                    "Exit TermLink and stop its background connection?\n\nYou will remain signed in. TermLink will use this account again the next time it starts."),
+                "TermLink",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Information,
+                MessageBoxDefaultButton.Button2) != DialogResult.OK)
+            {
+                return;
+            }
             if (Interlocked.Exchange(ref exitInFlight, 1) != 0) return;
             exitItem.Enabled = false;
             refreshTimer.Stop();
@@ -754,6 +931,7 @@ namespace TermLink.Tray
             {
                 TrayPreferences.Changed -= PreferencesChanged;
                 refreshTimer.Dispose();
+                updateCheckTimer.Dispose();
                 notifyIcon.Dispose();
                 if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.Dispose();
                 applicationIcon.Dispose();
@@ -774,7 +952,7 @@ namespace TermLink.Tray
         private readonly Action stopAllRemoteAccess;
         private readonly Action enableRemoteAccess;
         private readonly Func<Task> signInAccount;
-        private readonly Icon applicationIcon;
+        private Icon applicationIcon;
         private readonly Bitmap brandBitmap;
         private readonly TableLayoutPanel root;
         private readonly TableLayoutPanel header;
@@ -795,6 +973,7 @@ namespace TermLink.Tray
         private readonly Button remoteActionButton;
         private readonly Button openMainButton;
         private RegistryResponse latestResponse;
+        private Point? lastAnchor;
 
         public TrayPopupForm(
             Action<string> navigate,
@@ -802,12 +981,15 @@ namespace TermLink.Tray
             Action enableRemoteAccess,
             Func<Task> signInAccount)
         {
+            SuspendLayout();
+            AutoScaleDimensions = new SizeF(DpiLayout.DesignDpi, DpiLayout.DesignDpi);
+            AutoScaleMode = AutoScaleMode.Dpi;
             this.navigate = navigate ?? throw new ArgumentNullException(nameof(navigate));
             this.stopAllRemoteAccess = stopAllRemoteAccess ?? throw new ArgumentNullException(nameof(stopAllRemoteAccess));
             this.enableRemoteAccess = enableRemoteAccess ?? throw new ArgumentNullException(nameof(enableRemoteAccess));
             this.signInAccount = signInAccount ?? throw new ArgumentNullException(nameof(signInAccount));
-            applicationIcon = BrandIcons.LoadApplicationIcon();
-            brandBitmap = applicationIcon.ToBitmap();
+            applicationIcon = BrandIcons.LoadApplicationIcon(DeviceDpi);
+            brandBitmap = BrandIcons.LoadBrandBitmap();
 
             Text = "TermLink";
             Icon = applicationIcon;
@@ -816,7 +998,6 @@ namespace TermLink.Tray
             StartPosition = FormStartPosition.Manual;
             TopMost = true;
             KeyPreview = true;
-            AutoScaleMode = AutoScaleMode.Dpi;
             ClientSize = new Size(380, 560);
             MinimumSize = new Size(380, 560);
             MaximumSize = new Size(380, 560);
@@ -996,10 +1177,7 @@ namespace TermLink.Tray
             };
             footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             footer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
-            var version = typeof(TrayPopupForm).Assembly.GetName().Version;
-            var versionText = version == null
-                ? "Agent"
-                : "Agent " + version.Major + "." + version.Minor + "." + version.Build;
+            var versionText = "TermLink " + TrayProductVersion.Display;
             var versionLabel = CreateLabel(versionText, ContentAlignment.MiddleLeft, false);
             versionLabel.Font = new Font(Font.FontFamily, 8F, FontStyle.Regular);
             openMainButton = CreatePopupButton(TrayText.Pick("打开 TermLink", "Open TermLink"), TrayText.Pick("打开 TermLink 主窗口", "Open the TermLink main window"));
@@ -1018,23 +1196,55 @@ namespace TermLink.Tray
             Controls.Add(root);
 
             Deactivate += delegate { if (Visible) Hide(); };
+            ResumeLayout(false);
+            PerformLayout();
+            // The form itself must complete its 96-DPI WinForms auto-scale pass
+            // before session rows are added with explicit device-pixel sizes.
+            // Adding the empty row before ResumeLayout scales it a second time.
             SetConnecting();
             ApplyTheme();
+            PerformLayout();
         }
 
         public void ShowNear(Point anchor)
         {
-            var workArea = Screen.FromPoint(anchor).WorkingArea;
-            var x = Math.Max(workArea.Left, Math.Min(anchor.X - Width + 24, workArea.Right - Width));
-            var y = anchor.Y >= workArea.Top + (workArea.Height / 2)
-                ? anchor.Y - Height - 8
-                : anchor.Y + 8;
-            y = Math.Max(workArea.Top, Math.Min(y, workArea.Bottom - Height));
-            Location = new Point(x, y);
+            lastAnchor = anchor;
+            PositionNear(anchor);
             ApplyTheme();
             if (!Visible) Show();
+            PositionNear(anchor);
             BringToFront();
             Activate();
+        }
+
+        private void PositionNear(Point anchor)
+        {
+            var workArea = Screen.FromPoint(anchor).WorkingArea;
+            var x = Math.Max(
+                workArea.Left,
+                Math.Min(anchor.X - Width + DpiLayout.Scale96(24, DeviceDpi), workArea.Right - Width));
+            var y = anchor.Y >= workArea.Top + (workArea.Height / 2)
+                ? anchor.Y - Height - DpiLayout.Scale96(8, DeviceDpi)
+                : anchor.Y + DpiLayout.Scale96(8, DeviceDpi);
+            y = Math.Max(workArea.Top, Math.Min(y, workArea.Bottom - Height));
+            Location = new Point(x, y);
+        }
+
+        protected override void OnDpiChanged(DpiChangedEventArgs e)
+        {
+            base.OnDpiChanged(e);
+            ReloadApplicationIcon(e.DeviceDpiNew);
+            FitSessionRows();
+            if (lastAnchor.HasValue) PositionNear(lastAnchor.Value);
+        }
+
+        private void ReloadApplicationIcon(int dpi)
+        {
+            var replacement = BrandIcons.LoadApplicationIcon(dpi);
+            var previous = applicationIcon;
+            applicationIcon = replacement;
+            Icon = replacement;
+            previous.Dispose();
         }
 
         public void Apply(RegistryResponse response)
@@ -1047,17 +1257,24 @@ namespace TermLink.Tray
             }
             latestResponse = response;
             var production = response.Production ?? new ProductionStatus();
+            var requiresReauthentication = TrayDisplay.RequiresReauthentication(production);
             pcNameLabel.Text = string.IsNullOrWhiteSpace(production.PcName) ? Environment.MachineName : production.PcName;
-            connectionLabel.Text = production.RelayState == ProductionRelayState.Connected
+            connectionLabel.Text = requiresReauthentication
+                ? TrayText.Pick("! 登录已失效，请重新登录", "! Sign-in expired; sign in again")
+                : production.RelayState == ProductionRelayState.Connected
                 ? TrayText.Pick("● Relay 已连接", "● Relay connected")
                 : TrayText.Pick("○ Relay ", "○ Relay ") + TrayDisplay.LocalizedRelayStatus(production.RelayState);
-            connectionDetailLabel.Text = string.IsNullOrWhiteSpace(production.ServerHost)
+            connectionDetailLabel.Text = requiresReauthentication
+                ? TrayText.Pick("重新登录后将自动恢复服务器连接", "The server connection resumes automatically after sign-in")
+                : string.IsNullOrWhiteSpace(production.ServerHost)
                 ? TrayText.Pick("未配置服务器", "No server")
                 : production.ServerHost;
             policyLabel.Text = response.RemoteAccessEnabled
                 ? TrayText.Pick("同账号设备默认可连接并操作", "Same-account devices can connect and operate by default")
                 : TrayText.Pick("远程访问已停止", "Remote access is stopped");
-            accountButton.Text = production.AccountLinked
+            accountButton.Text = requiresReauthentication
+                ? TrayText.Pick("立即重新登录 ›", "Sign in again now ›")
+                : production.AccountLinked
                 ? TrayText.Pick("账户已登录 · 重新登录 ›", "Account signed in · sign in again ›")
                 : TrayText.Pick("登录账户 ›", "Sign in ›");
             remoteActionButton.Text = response.RemoteAccessEnabled
@@ -1146,10 +1363,10 @@ namespace TermLink.Tray
                 var button = CreatePopupButton(SessionText(summary, production), SessionAccessibleName(summary, production));
                 button.Tag = "session";
                 button.Dock = DockStyle.None;
-                button.Height = 68;
+                button.Height = DpiLayout.Scale96(68, DeviceDpi);
                 button.TextAlign = ContentAlignment.MiddleLeft;
-                button.Padding = new Padding(9, 3, 7, 3);
-                button.Margin = new Padding(0, 0, 0, 4);
+                button.Padding = DpiLayout.Scale96(new Padding(9, 3, 7, 3), DeviceDpi);
+                button.Margin = DpiLayout.Scale96(new Padding(0, 0, 0, 4), DeviceDpi);
                 button.Font = new Font(Font.FontFamily, 8.5F, FontStyle.Regular);
                 button.Click += delegate { OpenPage("sessions"); };
                 sessionList.Controls.Add(button);
@@ -1163,8 +1380,8 @@ namespace TermLink.Tray
             var empty = CreateLabel(text, ContentAlignment.MiddleCenter, false);
             empty.Tag = "session-empty";
             empty.Dock = DockStyle.None;
-            empty.Height = 92;
-            empty.Margin = new Padding(0, 10, 0, 0);
+            empty.Height = DpiLayout.Scale96(92, DeviceDpi);
+            empty.Margin = DpiLayout.Scale96(new Padding(0, 10, 0, 0), DeviceDpi);
             empty.Font = new Font(Font.FontFamily, 8.5F, FontStyle.Regular);
             sessionList.Controls.Add(empty);
             FitSessionRows();
@@ -1183,8 +1400,9 @@ namespace TermLink.Tray
         private void FitSessionRows()
         {
             if (sessionList.IsDisposed) return;
-            var width = Math.Max(120,
-                sessionList.ClientSize.Width - sessionList.Padding.Horizontal - SystemInformation.VerticalScrollBarWidth - 2);
+            var width = Math.Max(DpiLayout.Scale96(120, DeviceDpi),
+                sessionList.ClientSize.Width - sessionList.Padding.Horizontal -
+                    SystemInformation.VerticalScrollBarWidth - DpiLayout.Scale96(2, DeviceDpi));
             foreach (Control child in sessionList.Controls) child.Width = width;
         }
 
@@ -1392,12 +1610,25 @@ namespace TermLink.Tray
 
     internal sealed class AccountLinkForm : Form
     {
+        private static readonly Size LogicalClientSize = new Size(500, 300);
         private readonly TextBox username;
         private readonly TextBox password;
         private readonly TextBox pcName;
+        private readonly string serverUrl;
+        private readonly Dictionary<Control, Rectangle> logicalBounds = new Dictionary<Control, Rectangle>();
 
-        public AccountLinkForm()
+        public AccountLinkForm() : this(ProductionEnrollment.PublicServerUrl)
         {
+        }
+
+        public AccountLinkForm(string serverUrl)
+        {
+            SuspendLayout();
+            AutoScaleDimensions = new SizeF(DpiLayout.DesignDpi, DpiLayout.DesignDpi);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            if (!TrayInputValidation.TryNormalizeServerOrigin(serverUrl, out var serverOrigin))
+                throw new ArgumentException("A valid HTTPS server origin is required.", nameof(serverUrl));
+            this.serverUrl = serverOrigin;
             Text = TrayText.Pick("登录 TermLink 账户", "Sign in to TermLink");
             Icon = BrandIcons.LoadApplicationIcon();
             StartPosition = FormStartPosition.CenterScreen;
@@ -1405,7 +1636,6 @@ namespace TermLink.Tray
             MaximizeBox = false;
             MinimizeBox = false;
             ClientSize = new Size(500, 300);
-            AutoScaleMode = AutoScaleMode.Dpi;
             AccessibleName = TrayText.Pick("TermLink 账户登录", "TermLink account sign in");
 
             var explanation = new Label
@@ -1423,7 +1653,7 @@ namespace TermLink.Tray
             {
                 Location = new Point(180, 75),
                 Size = new Size(304, 25),
-                Text = ProductionEnrollment.PublicServerUrl,
+                Text = serverOrigin,
                 ReadOnly = true,
                 TabStop = false
             };
@@ -1444,6 +1674,9 @@ namespace TermLink.Tray
             AcceptButton = link;
             CancelButton = cancel;
             ApplyThemeToDialog(this, TrayPalette.For(TrayPreferences.Theme));
+            CaptureLogicalBounds();
+            ResumeLayout(false);
+            PerformLayout();
         }
 
         protected override void OnHandleCreated(EventArgs e)
@@ -1452,7 +1685,36 @@ namespace TermLink.Tray
             TrayWindowChrome.Apply(this, TrayPalette.For(TrayPreferences.Theme));
         }
 
-        public string ServerUrl { get { return ProductionEnrollment.PublicServerUrl; } }
+        protected override void OnDpiChanged(DpiChangedEventArgs e)
+        {
+            base.OnDpiChanged(e);
+            ApplyLogicalBounds();
+        }
+
+        private void CaptureLogicalBounds()
+        {
+            foreach (Control child in Controls) logicalBounds[child] = child.Bounds;
+        }
+
+        private void ApplyLogicalBounds()
+        {
+            SuspendLayout();
+            ClientSize = new Size(
+                DpiLayout.Scale96(LogicalClientSize.Width, DeviceDpi),
+                DpiLayout.Scale96(LogicalClientSize.Height, DeviceDpi));
+            foreach (var pair in logicalBounds)
+            {
+                pair.Key.Bounds = new Rectangle(
+                    DpiLayout.Scale96(pair.Value.X, DeviceDpi),
+                    DpiLayout.Scale96(pair.Value.Y, DeviceDpi),
+                    DpiLayout.Scale96(pair.Value.Width, DeviceDpi),
+                    DpiLayout.Scale96(pair.Value.Height, DeviceDpi));
+            }
+            ResumeLayout(false);
+            PerformLayout();
+        }
+
+        public string ServerUrl { get { return serverUrl; } }
         public string Username { get { return username.Text.Trim(); } }
         public string Password { get { return password.Text; } }
         public string PcName { get { return pcName.Text.Trim(); } }
@@ -1499,14 +1761,27 @@ namespace TermLink.Tray
 
     internal sealed class AccountRegisterForm : Form
     {
+        private static readonly Size LogicalClientSize = new Size(500, 370);
         private readonly TextBox username;
         private readonly TextBox email;
         private readonly TextBox password;
         private readonly TextBox confirm;
         private readonly TextBox pcName;
+        private readonly string serverUrl;
+        private readonly Dictionary<Control, Rectangle> logicalBounds = new Dictionary<Control, Rectangle>();
 
-        public AccountRegisterForm()
+        public AccountRegisterForm() : this(ProductionEnrollment.PublicServerUrl)
         {
+        }
+
+        public AccountRegisterForm(string serverUrl)
+        {
+            SuspendLayout();
+            AutoScaleDimensions = new SizeF(DpiLayout.DesignDpi, DpiLayout.DesignDpi);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            if (!TrayInputValidation.TryNormalizeServerOrigin(serverUrl, out var serverOrigin))
+                throw new ArgumentException("A valid HTTPS server origin is required.", nameof(serverUrl));
+            this.serverUrl = serverOrigin;
             Text = TrayText.Pick("创建 TermLink 账户", "Create TermLink account");
             Icon = BrandIcons.LoadApplicationIcon();
             StartPosition = FormStartPosition.CenterScreen;
@@ -1514,11 +1789,10 @@ namespace TermLink.Tray
             MaximizeBox = false;
             MinimizeBox = false;
             ClientSize = new Size(500, 370);
-            AutoScaleMode = AutoScaleMode.Dpi;
             AccessibleName = TrayText.Pick("TermLink 账户注册", "TermLink account registration");
             var explanation = new Label { AutoSize = false, Location = new Point(16, 14), Size = new Size(468, 42), Text = TrayText.Pick("直接在此窗口创建账号，密码只通过 HTTPS 发送到固定服务。", "Create the account directly in this window. The password is sent only over HTTPS."), UseMnemonic = false };
             var serviceLabel = new Label { AutoSize = true, Location = new Point(16, 70), Text = TrayText.Pick("TermLink 服务", "TermLink service"), UseMnemonic = false };
-            var service = new TextBox { Location = new Point(180, 66), Size = new Size(304, 25), Text = ProductionEnrollment.PublicServerUrl, ReadOnly = true, TabStop = false };
+            var service = new TextBox { Location = new Point(180, 66), Size = new Size(304, 25), Text = serverOrigin, ReadOnly = true, TabStop = false };
             var usernameLabel = new Label { AutoSize = true, Location = new Point(16, 108), Text = TrayText.Pick("用户名", "Username"), UseMnemonic = false };
             username = new TextBox { Location = new Point(180, 104), Size = new Size(304, 25) };
             var emailLabel = new Label { AutoSize = true, Location = new Point(16, 146), Text = TrayText.Pick("邮箱", "Email"), UseMnemonic = false };
@@ -1535,6 +1809,9 @@ namespace TermLink.Tray
             AcceptButton = submit;
             CancelButton = cancel;
             AccountLinkForm.ApplyThemeToDialog(this, TrayPalette.For(TrayPreferences.Theme));
+            CaptureLogicalBounds();
+            ResumeLayout(false);
+            PerformLayout();
         }
 
         public string Username { get { return username.Text.Trim(); } }
@@ -1542,11 +1819,41 @@ namespace TermLink.Tray
         public string Password { get { return password.Text; } }
         public string Confirm { get { return confirm.Text; } }
         public string PcName { get { return pcName.Text.Trim(); } }
+        public string ServerUrl { get { return serverUrl; } }
 
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
             TrayWindowChrome.Apply(this, TrayPalette.For(TrayPreferences.Theme));
+        }
+
+        protected override void OnDpiChanged(DpiChangedEventArgs e)
+        {
+            base.OnDpiChanged(e);
+            ApplyLogicalBounds();
+        }
+
+        private void CaptureLogicalBounds()
+        {
+            foreach (Control child in Controls) logicalBounds[child] = child.Bounds;
+        }
+
+        private void ApplyLogicalBounds()
+        {
+            SuspendLayout();
+            ClientSize = new Size(
+                DpiLayout.Scale96(LogicalClientSize.Width, DeviceDpi),
+                DpiLayout.Scale96(LogicalClientSize.Height, DeviceDpi));
+            foreach (var pair in logicalBounds)
+            {
+                pair.Key.Bounds = new Rectangle(
+                    DpiLayout.Scale96(pair.Value.X, DeviceDpi),
+                    DpiLayout.Scale96(pair.Value.Y, DeviceDpi),
+                    DpiLayout.Scale96(pair.Value.Width, DeviceDpi),
+                    DpiLayout.Scale96(pair.Value.Height, DeviceDpi));
+            }
+            ResumeLayout(false);
+            PerformLayout();
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -1567,7 +1874,16 @@ namespace TermLink.Tray
         public static string AccountStatus(ProductionStatus status)
         {
             if (status == null || !status.Configured) return "not configured";
+            if (RequiresReauthentication(status)) return "reauthentication required";
             return status.AccountLinked ? "linked" : "not linked";
+        }
+
+        public static bool RequiresReauthentication(ProductionStatus status)
+        {
+            if (status == null || !status.Configured || !status.AccountLinked) return false;
+            var code = (status.LastErrorCode ?? string.Empty).Trim().ToUpperInvariant();
+            return code == "ACCOUNT_REAUTH_REQUIRED" ||
+                code.StartsWith("HTTP_401", StringComparison.Ordinal);
         }
 
         public static string RelayStatus(ProductionRelayState state)
@@ -1586,6 +1902,7 @@ namespace TermLink.Tray
         public static string LocalizedAccountStatus(ProductionStatus status)
         {
             if (status == null || !status.Configured) return TrayText.Pick("未配置", "not configured");
+            if (RequiresReauthentication(status)) return TrayText.Pick("登录已失效", "sign-in expired");
             return status.AccountLinked ? TrayText.Pick("已关联", "linked") : TrayText.Pick("未关联", "not linked");
         }
 
@@ -1600,6 +1917,42 @@ namespace TermLink.Tray
                 case ProductionRelayState.Stopped: return TrayText.Pick("已停止", "stopped");
                 default: return TrayText.Pick("未配置", "not configured");
             }
+        }
+
+        public static string LocalizedConnectionFailure(string code)
+        {
+            code = (code ?? string.Empty).Trim().ToUpperInvariant();
+            if (code.Length == 0) return TrayText.Pick("暂无错误，正在建立连接", "No error reported; connection is being established");
+            string detail;
+            if (code == "ACCOUNT_REAUTH_REQUIRED" || code.StartsWith("HTTP_401", StringComparison.Ordinal))
+                detail = TrayText.Pick("登录已过期，请重新登录", "Your sign-in expired; sign in again");
+            else if (code.StartsWith("HTTP_403", StringComparison.Ordinal))
+                detail = TrayText.Pick("服务器拒绝了当前设备或账号", "The server rejected this device or account");
+            else if (code == "HTTP_TRANSPORT_FAILED")
+                detail = TrayText.Pick("HTTP 传输失败，可能是 DNS、代理、TLS 或防火墙", "HTTP transport failed; check DNS, proxy, TLS, or firewall");
+            else if (code == "DNS_RESOLUTION_FAILED")
+                detail = TrayText.Pick("无法解析服务器域名，请检查 DNS", "The server name could not be resolved; check DNS");
+            else if (code == "CONNECTION_REFUSED")
+                detail = TrayText.Pick("服务器端口拒绝连接，请检查映射、防火墙或服务状态", "The server port refused the connection; check routing, firewall, or service state");
+            else if (code == "CONNECTION_TIMEOUT")
+                detail = TrayText.Pick("连接超时，请检查代理、防火墙和公网端口", "Connection timed out; check proxy, firewall, and the public port");
+            else if (code == "TLS_CERTIFICATE_FAILED")
+                detail = TrayText.Pick("TLS 证书验证失败，请检查证书链和系统时间", "TLS certificate validation failed; check the certificate chain and system clock");
+            else if (code == "NETWORK_CONNECTION_FAILED")
+                detail = TrayText.Pick("网络连接失败，请检查代理和网络策略", "Network connection failed; check proxy and network policy");
+            else if (code == "WEBSOCKET_CONNECTION_FAILED")
+                detail = TrayText.Pick("WebSocket 长连接失败；网页可访问不代表代理已允许 WSS Upgrade", "WebSocket failed; a working web page does not prove the proxy allows WSS Upgrade");
+            else if (code == "RELAY_PROTOCOL_INVALID" || code == "SERVER_RESPONSE_INVALID")
+                detail = TrayText.Pick("服务端响应或实时协议不兼容", "The server response or realtime protocol is incompatible");
+            else if (code == "CRYPTOGRAPHIC_OPERATION_FAILED")
+                detail = TrayText.Pick("设备加密状态异常，请重新登录", "Device cryptographic state failed; sign in again");
+            else if (code == "RELAY_DISCONNECTED")
+                detail = TrayText.Pick("长连接被服务端或网络中断，TermLink 会自动重连", "The server or network closed the long connection; TermLink will reconnect");
+            else if (code.StartsWith("HTTP_", StringComparison.Ordinal))
+                detail = TrayText.Pick("服务器返回错误", "The server returned an error");
+            else
+                detail = TrayText.Pick("实时连接失败", "Realtime connection failed");
+            return detail + " [" + code + "]";
         }
 
         public static string DateTimeOrDash(DateTime? value)
@@ -1623,6 +1976,8 @@ namespace TermLink.Tray
     internal sealed class MainWindowForm : Form
     {
         private readonly AgentController controller;
+        private readonly WindowsUpdateWorkflow updateWorkflow;
+        private readonly bool enableBackgroundRefresh;
         private readonly TableLayoutPanel root;
         private readonly Panel navigationPanel;
         private readonly Panel contentHost;
@@ -1634,9 +1989,10 @@ namespace TermLink.Tray
         private readonly Label accountIdentityLabel;
         private readonly Button accountLoginButton;
         private readonly Button accountRegisterButton;
+        private readonly Button accountSignOutButton;
         private readonly Label shellStatusLabel;
         private readonly Button refreshButton;
-        private readonly Icon applicationIcon;
+        private Icon applicationIcon;
         private readonly Bitmap brandBitmap;
         private readonly List<string> navigationOrder = new List<string>
         {
@@ -1655,10 +2011,11 @@ namespace TermLink.Tray
         private Button remoteStopButton;
         private Label activitySummaryLabel;
         private Label diagnosticsSummaryLabel;
+        private Button connectionRetryButton;
         private Label updateStatusLabel;
         private Button updateCheckButton;
-        private Button updateOpenButton;
-        private string updateDownloadUrl;
+        private Label terminalIntegrationStatusLabel;
+        private Button terminalIntegrationButton;
         private Label membershipAccountStatusLabel;
         private Label membershipAccountDetailLabel;
         private Label membershipDeviceQuotaLabel;
@@ -1666,18 +2023,40 @@ namespace TermLink.Tray
         private ComboBox languageCombo;
         private ComboBox themeCombo;
         private bool applyingPreferences;
+        private bool layoutInitialized;
 
-        public MainWindowForm(AgentController controller)
+        public MainWindowForm(AgentController controller) : this(controller, new WindowsUpdateWorkflow())
         {
+        }
+
+        internal MainWindowForm(AgentController controller, bool enableBackgroundRefresh)
+            : this(controller, new WindowsUpdateWorkflow(), enableBackgroundRefresh)
+        {
+        }
+
+        internal MainWindowForm(AgentController controller, WindowsUpdateWorkflow updateWorkflow)
+            : this(controller, updateWorkflow, true)
+        {
+        }
+
+        internal MainWindowForm(
+            AgentController controller,
+            WindowsUpdateWorkflow updateWorkflow,
+            bool enableBackgroundRefresh)
+        {
+            SuspendLayout();
+            AutoScaleDimensions = new SizeF(DpiLayout.DesignDpi, DpiLayout.DesignDpi);
+            AutoScaleMode = AutoScaleMode.Dpi;
             this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
-            applicationIcon = BrandIcons.LoadApplicationIcon();
-            brandBitmap = applicationIcon.ToBitmap();
-            Text = "TermLink";
+            this.updateWorkflow = updateWorkflow ?? throw new ArgumentNullException(nameof(updateWorkflow));
+            this.enableBackgroundRefresh = enableBackgroundRefresh;
+            applicationIcon = BrandIcons.LoadApplicationIcon(DeviceDpi);
+            brandBitmap = BrandIcons.LoadBrandBitmap();
+            Text = "TermLink " + TrayProductVersion.Display;
             Icon = applicationIcon;
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(900, 620);
             Size = new Size(1040, 720);
-            AutoScaleMode = AutoScaleMode.Dpi;
             Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 9F, FontStyle.Regular);
             AccessibleName = "TermLink Agent control plane";
 
@@ -1692,7 +2071,9 @@ namespace TermLink.Tray
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 260));
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 78));
+            // Two account buttons plus their margins and footer padding need
+            // more than the old 78 logical pixels after DPI round-trips.
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));
 
             navigationPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(14, 16, 12, 10) };
             contentHost = new Panel { Dock = DockStyle.Fill, Padding = new Padding(1) };
@@ -1705,7 +2086,9 @@ namespace TermLink.Tray
                 Margin = new Padding(0),
                 Tag = "sidebar"
             };
-            accountFooter.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 140));
+            // Preserve enough width for the shared 110px action-button minimum
+            // after footer padding and the action panel's left margin.
+            accountFooter.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
             accountFooter.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             accountFooter.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             accountIdentityLabel = new Label
@@ -1726,17 +2109,18 @@ namespace TermLink.Tray
                 Tag = "sidebar"
             };
             accountLoginButton = CreateButton(TrayText.Pick("登录", "Sign in"));
-            accountLoginButton.AutoSize = false;
-            accountLoginButton.Size = new Size(78, 30);
             accountLoginButton.Margin = new Padding(1);
             accountLoginButton.Click += async delegate { await LoginAccountFromWindowAsync(); };
             accountRegisterButton = CreateButton(TrayText.Pick("注册", "Register"));
-            accountRegisterButton.AutoSize = false;
-            accountRegisterButton.Size = new Size(50, 30);
             accountRegisterButton.Margin = new Padding(1);
             accountRegisterButton.Click += async delegate { await RegisterAccountFromWindowAsync(); };
+            accountSignOutButton = CreateButton(TrayText.Pick("退出登录", "Sign out"));
+            accountSignOutButton.Margin = new Padding(1);
+            accountSignOutButton.Visible = false;
+            accountSignOutButton.Click += async delegate { await SignOutAccountFromWindowAsync(); };
             accountActions.Controls.Add(accountLoginButton);
             accountActions.Controls.Add(accountRegisterButton);
+            accountActions.Controls.Add(accountSignOutButton);
             accountFooter.Controls.Add(accountIdentityLabel, 0, 0);
             accountFooter.Controls.Add(accountActions, 1, 0);
             shellStatusLabel = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight, Padding = new Padding(12, 0, 12, 0), AutoEllipsis = true };
@@ -1822,14 +2206,21 @@ namespace TermLink.Tray
             navigationLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             navigationLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 78));
             navigationLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            navigationLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+            // 34px button + 8px margin + 4px top padding, with rounding room.
+            navigationLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
             navigationLayout.Controls.Add(brand, 0, 0);
             navigationLayout.Controls.Add(navigationList, 0, 1);
             navigationLayout.Controls.Add(refreshPanel, 0, 2);
             navigationPanel.Controls.Add(navigationLayout);
 
-            Navigate(currentPage);
+            Navigate(currentPage, enableBackgroundRefresh);
             ApplyTheme();
+            ResumeLayout(false);
+            PerformLayout();
+            // Controls constructed above use 96-DPI logical values and are
+            // scaled exactly once by WinForms. Controls created by later page
+            // navigation use the window's current monitor DPI.
+            layoutInitialized = true;
         }
 
         public async Task RefreshAsync()
@@ -1851,7 +2242,9 @@ namespace TermLink.Tray
             }
         }
 
-        public void Navigate(string page)
+        public void Navigate(string page) => Navigate(page, enableBackgroundRefresh);
+
+        private void Navigate(string page, bool enableBackgroundRefresh)
         {
             if (string.IsNullOrWhiteSpace(page)) page = "sessions";
             if (!navigationButtons.ContainsKey(page)) page = "sessions";
@@ -1871,7 +2264,7 @@ namespace TermLink.Tray
             {
                 case "connection": CreateActivityPage(); break;
                 case "settings": CreateSettingsPage(); break;
-                default: CreateSessionsPage(); break;
+                default: CreateSessionsPage(enableBackgroundRefresh); break;
             }
             ApplyTheme();
             if (latestResponse != null) Apply(latestResponse);
@@ -1887,29 +2280,39 @@ namespace TermLink.Tray
             }
             latestResponse = response;
             var production = response.Production ?? new ProductionStatus();
+            var requiresReauthentication = TrayDisplay.RequiresReauthentication(production);
             identityName.Text = string.IsNullOrWhiteSpace(production.PcName) ? Environment.MachineName : production.PcName;
             identityState.Text = !production.Configured
                 ? TrayText.Pick("● 本地 Agent · 账户未配置", "● Local Agent · account not configured")
                 : !production.AccountLinked
                     ? TrayText.Pick("● 本地 Agent · 等待账户关联", "● Local Agent · awaiting account link")
+                    : requiresReauthentication
+                        ? TrayText.Pick("! 登录已失效 · 请重新登录", "! Sign-in expired · sign in again")
                     : production.RelayState == ProductionRelayState.Connected
                         ? TrayText.Pick("● Relay 已连接", "● Relay connected")
                         : TrayText.Pick("○ Relay ", "○ Relay ") + TrayDisplay.LocalizedRelayStatus(production.RelayState);
             shellStatusLabel.Text = response.Success
                 ? TrayText.Pick("Agent 状态已同步", "Agent status synced")
                 : TrayText.Pick("Agent 返回错误", "Agent returned an error");
+            accountSignOutButton.Text = TrayText.Pick("退出登录", "Sign out");
             if (sessionChild != null && !sessionChild.IsDisposed) sessionChild.Apply(response);
             if (production.AccountLinked)
             {
-                accountIdentityLabel.Text = TrayDisplay.StringOrDash(production.AccountUsername) + "\r\n" + TrayDisplay.StringOrDash(production.AccountEmail);
-                accountLoginButton.Text = TrayText.Pick("重新登录", "Sign in again");
+                accountIdentityLabel.Text = requiresReauthentication
+                    ? TrayText.Pick("登录已失效\r\n请重新登录", "Sign-in expired\r\nSign in again")
+                    : TrayDisplay.StringOrDash(production.AccountUsername) + "\r\n" + TrayDisplay.StringOrDash(production.AccountEmail);
+                accountLoginButton.Text = requiresReauthentication
+                    ? TrayText.Pick("立即登录", "Sign in now")
+                    : TrayText.Pick("重新登录", "Sign in again");
                 accountRegisterButton.Visible = false;
+                accountSignOutButton.Visible = true;
             }
             else
             {
                 accountIdentityLabel.Text = TrayText.Pick("未登录\r\n请先登录 TermLink", "Not signed in\r\nSign in to TermLink first");
                 accountLoginButton.Text = TrayText.Pick("登录", "Sign in");
                 accountRegisterButton.Visible = true;
+                accountSignOutButton.Visible = false;
             }
             if (devicesChild != null && !devicesChild.IsDisposed) devicesChild.Apply(response);
             UpdateRemotePage(production);
@@ -1929,8 +2332,11 @@ namespace TermLink.Tray
             accountIdentityLabel.Text = TrayText.Pick("账户状态不可用", "Account status unavailable");
             shellStatusLabel.Text = error == null
                 ? TrayText.Pick("未连接", "Not connected")
-                : TrayText.Pick("Agent 不可用 · 请确认服务正在运行", "Agent unavailable · confirm the service is running");
+                : TrayText.Pick("TermLink 后台不可用 · " + error.Message, "TermLink background unavailable · " + error.Message);
             if (remoteStatusLabel != null) remoteStatusLabel.Text = TrayText.Pick("Agent 不可用", "Agent unavailable");
+            if (activitySummaryLabel != null) activitySummaryLabel.Text = TrayText.Pick("○ 本地运行时不可用", "○ Local runtime unavailable");
+            if (diagnosticsSummaryLabel != null) diagnosticsSummaryLabel.Text = error == null ? string.Empty : error.Message;
+            if (connectionRetryButton != null) connectionRetryButton.Enabled = true;
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
@@ -1947,6 +2353,26 @@ namespace TermLink.Tray
             TrayWindowChrome.Apply(this, TrayPalette.For(TrayPreferences.Theme));
         }
 
+        protected override void OnDpiChanged(DpiChangedEventArgs e)
+        {
+            base.OnDpiChanged(e);
+            ReloadApplicationIcon(e.DeviceDpiNew);
+            PerformLayout();
+            FitNavigationButtons();
+            activePage?.PerformLayout();
+            sessionChild?.PerformLayout();
+            devicesChild?.PerformLayout();
+        }
+
+        private void ReloadApplicationIcon(int dpi)
+        {
+            var replacement = BrandIcons.LoadApplicationIcon(dpi);
+            var previous = applicationIcon;
+            applicationIcon = replacement;
+            Icon = replacement;
+            previous.Dispose();
+        }
+
         private void BuildNavigation()
         {
             navigationList.Controls.Clear();
@@ -1954,10 +2380,10 @@ namespace TermLink.Tray
             foreach (var key in navigationOrder)
             {
                 var button = CreateButton(NavigationText(key));
-                button.Height = 42;
-                button.Margin = new Padding(0, 2, 0, 2);
+                button.Height = Dpi(42);
+                button.Margin = Dpi(new Padding(0, 2, 0, 2));
                 button.TextAlign = ContentAlignment.MiddleLeft;
-                button.Padding = new Padding(8, 0, 2, 0);
+                button.Padding = Dpi(new Padding(8, 0, 2, 0));
                 button.Tag = key;
                 button.AccessibleRole = AccessibleRole.PushButton;
                 button.AccessibleName = NavigationLabel(key);
@@ -1971,7 +2397,7 @@ namespace TermLink.Tray
         private void FitNavigationButtons()
         {
             if (navigationList == null || navigationList.IsDisposed) return;
-            var width = Math.Max(120, navigationList.ClientSize.Width - navigationList.Padding.Horizontal);
+            var width = Math.Max(Dpi(120), navigationList.ClientSize.Width - navigationList.Padding.Horizontal);
             foreach (Control child in navigationList.Controls) child.Width = width;
         }
 
@@ -2017,28 +2443,29 @@ namespace TermLink.Tray
 
         private Panel CreatePageShell(string eyebrow, string title, string description, out Panel body)
         {
-            var shell = new Panel { Dock = DockStyle.Fill, Padding = new Padding(28, 22, 28, 20), Tag = "page" };
+            var shell = new Panel { Dock = DockStyle.Fill, Padding = Dpi(new Padding(28, 22, 28, 20)), Tag = "page" };
             var header = new TableLayoutPanel
             {
                 Dock = DockStyle.Top,
-                Height = 104,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 ColumnCount = 2,
                 RowCount = 2,
-                Padding = new Padding(0, 0, 0, 16),
+                Padding = Dpi(new Padding(0, 0, 0, 16)),
                 Tag = "page"
             };
             header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            header.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
-            header.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
-            var eyebrowLabel = new Label { Text = eyebrow, Dock = DockStyle.Fill, AutoSize = false, Font = new Font(Font.FontFamily, 9, FontStyle.Bold), TextAlign = ContentAlignment.TopLeft };
-            var titleLabel = new Label { Text = title, Dock = DockStyle.Fill, AutoSize = false, Font = new Font(Font.FontFamily, 20, FontStyle.Bold), TextAlign = ContentAlignment.MiddleLeft };
+            header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            var eyebrowLabel = new Label { Text = eyebrow, Dock = DockStyle.Fill, AutoSize = true, Font = new Font(Font.FontFamily, 9, FontStyle.Bold), TextAlign = ContentAlignment.TopLeft };
+            var titleLabel = new Label { Text = title, Dock = DockStyle.Fill, AutoSize = true, Font = new Font(Font.FontFamily, 20, FontStyle.Bold), TextAlign = ContentAlignment.MiddleLeft, Padding = Dpi(new Padding(0, 4, 0, 0)) };
             var descriptionLabel = new Label
             {
                 Text = description,
                 Anchor = AnchorStyles.Top | AnchorStyles.Right,
                 AutoSize = true,
-                MaximumSize = new Size(320, 48),
+                MaximumSize = new Size(Dpi(320), 0),
                 TextAlign = ContentAlignment.TopRight,
                 UseMnemonic = false
             };
@@ -2046,13 +2473,13 @@ namespace TermLink.Tray
             header.Controls.Add(titleLabel, 0, 1);
             header.SetColumnSpan(titleLabel, 2);
             header.Controls.Add(descriptionLabel, 1, 0);
-            body = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(0, 2, 0, 0), Tag = "page" };
+            body = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = Dpi(new Padding(0, 2, 0, 0)), Tag = "page" };
             shell.Controls.Add(body);
             shell.Controls.Add(header);
             return shell;
         }
 
-        private void CreateSessionsPage()
+        private void CreateSessionsPage(bool enableBackgroundRefresh = true)
         {
             Panel body;
             var shell = CreatePageShell(
@@ -2070,7 +2497,7 @@ namespace TermLink.Tray
             activePage = shell;
             contentHost.Controls.Add(shell);
             contentHost.Controls.SetChildIndex(shell, 0);
-            _ = sessionChild.RefreshSessionsAsync();
+            if (enableBackgroundRefresh) _ = sessionChild.RefreshSessionsAsync();
         }
 
         private void CreateDevicesPage()
@@ -2164,6 +2591,20 @@ namespace TermLink.Tray
             diagnosticsSummaryLabel = CreateValueLabel("", 10, false);
             healthBody.Controls.Add(activitySummaryLabel);
             healthBody.Controls.Add(diagnosticsSummaryLabel);
+            var connectionActions = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = true,
+                Padding = new Padding(0, 10, 0, 0),
+                Tag = "card"
+            };
+            connectionRetryButton = CreateButton(TrayText.Pick("立即重试连接", "Retry connection now"));
+            connectionRetryButton.AccessibleName = TrayText.Pick("立即重试服务器连接", "Retry the server connection now");
+            connectionRetryButton.Click += async delegate { await RetryConnectionAsync(); };
+            connectionActions.Controls.Add(connectionRetryButton);
+            healthBody.Controls.Add(connectionActions);
             stack.Controls.Add(health);
             var note = CreateCard(TrayText.Pick("连接说明", "Connection details"), out var noteBody);
             noteBody.Controls.Add(CreateValueLabel(
@@ -2210,6 +2651,41 @@ namespace TermLink.Tray
             appearanceBody.Controls.Add(CreateSettingRow(TrayText.Pick("界面语言", "Interface language"), TrayText.Pick("跟随系统或固定使用一种语言。", "Follow Windows or choose a fixed language."), languageCombo));
             appearanceBody.Controls.Add(CreateSettingRow(TrayText.Pick("颜色主题", "Color theme"), TrayText.Pick("跟随系统、浅色或深色。", "Follow Windows, light or dark."), themeCombo));
             stack.Controls.Add(appearance);
+
+            var terminalIntegration = CreateCard(
+                TrayText.Pick("Windows Terminal 配置", "Windows Terminal integration"),
+                out var terminalIntegrationBody);
+            var packageManagedTerminal = WindowsTerminalIntegration.IsCurrentProcessPackaged();
+            terminalIntegrationStatusLabel = CreateValueLabel(
+                packageManagedTerminal
+                    ? TrayText.Pick(
+                        "当前 MSIX 版本由安装包提供 Terminal Profile，无需生成额外的本地 Fragment。",
+                        "This MSIX build provides its Terminal profiles through the package; no additional loose Fragment is created.")
+                    : TrayText.Pick(
+                        "如果 TermLink 安装目录发生变化，可在这里删除并重建 TermLink 自己的 Profile Fragment。不会修改 Terminal 的 settings.json 或其他 Profile。",
+                        "If the TermLink install directory moved, rebuild TermLink's own profile Fragment here. Terminal settings.json and other profiles are never changed."),
+                10,
+                false);
+            terminalIntegrationBody.Controls.Add(terminalIntegrationStatusLabel);
+            var terminalActions = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = true,
+                Padding = new Padding(0, 10, 0, 0)
+            };
+            terminalIntegrationButton = CreateButton(
+                TrayText.Pick("重新配置 Terminal", "Reconfigure Terminal"));
+            terminalIntegrationButton.AccessibleName = TrayText.Pick(
+                "重新生成 TermLink Windows Terminal Profile",
+                "Regenerate TermLink Windows Terminal profiles");
+            terminalIntegrationButton.Enabled = !packageManagedTerminal;
+            terminalIntegrationButton.Click += async delegate { await ReconfigureTerminalAsync(); };
+            terminalActions.Controls.Add(terminalIntegrationButton);
+            terminalIntegrationBody.Controls.Add(terminalActions);
+            stack.Controls.Add(terminalIntegration);
+
             var safety = CreateCard(TrayText.Pick("本地优先", "Local-first safety"), out var safetyBody);
             safetyBody.Controls.Add(CreateValueLabel(
                 TrayText.Pick("本地 Shell 始终独立运行；服务器短暂断线不会终止当前终端。", "Local shells keep running independently; a temporary server disconnect never terminates the current terminal."),
@@ -2219,7 +2695,7 @@ namespace TermLink.Tray
 
             var updates = CreateCard(TrayText.Pick("软件更新", "Software updates"), out var updatesBody);
             updateStatusLabel = CreateValueLabel(
-                TrayText.Pick("检查公开 AppShip 更新，不会自动关闭当前窗口。", "Check the public AppShip channel without closing the current window."),
+                TrayText.Pick("通过 AppShip 安全检查、下载并打开交互式安装向导。", "Securely check AppShip, download, and open the interactive Setup wizard."),
                 10,
                 false);
             updatesBody.Controls.Add(updateStatusLabel);
@@ -2233,11 +2709,7 @@ namespace TermLink.Tray
             };
             updateCheckButton = CreateButton(TrayText.Pick("检查更新", "Check for updates"));
             updateCheckButton.Click += async delegate { await CheckForUpdateAsync(); };
-            updateOpenButton = CreateButton(TrayText.Pick("打开下载", "Open download"));
-            updateOpenButton.Enabled = false;
-            updateOpenButton.Click += delegate { OpenUpdateDownload(); };
             updateActions.Controls.Add(updateCheckButton);
-            updateActions.Controls.Add(updateOpenButton);
             updatesBody.Controls.Add(updateActions);
             stack.Controls.Add(updates);
             body.Controls.Add(stack);
@@ -2246,6 +2718,58 @@ namespace TermLink.Tray
             contentHost.Controls.Add(shell);
             contentHost.Controls.SetChildIndex(shell, 0);
             applyingPreferences = false;
+        }
+
+        private async Task ReconfigureTerminalAsync()
+        {
+            if (terminalIntegrationButton == null || terminalIntegrationStatusLabel == null) return;
+            terminalIntegrationButton.Enabled = false;
+            terminalIntegrationStatusLabel.Text = TrayText.Pick(
+                "正在重建 TermLink Terminal Profile…",
+                "Rebuilding TermLink Terminal profiles…");
+            try
+            {
+                var installRoot = Path.GetFullPath(AppContext.BaseDirectory);
+                var result = await Task.Run(() => WindowsTerminalIntegration.Reconfigure(installRoot));
+                if (result.PackageManaged)
+                {
+                    terminalIntegrationStatusLabel.Text = TrayText.Pick(
+                        "MSIX 包内的 " + result.ProfileCount + " 个 Terminal Profile 已通过校验，未生成本地 Fragment。",
+                        "Validated " + result.ProfileCount + " packaged Terminal profiles; no loose Fragment was created.");
+                    return;
+                }
+                var markerUpdated = await Task.Run(() =>
+                    WindowsTerminalIntegration.TryRefreshInstallMarker(installRoot, result));
+                terminalIntegrationStatusLabel.Text = TrayText.Pick(
+                    "已重建 " + result.ProfileCount + " 个 Profile。请关闭并重新打开 Windows Terminal。\r\n" + result.FragmentPath,
+                    "Rebuilt " + result.ProfileCount + " profiles. Close and reopen Windows Terminal.\r\n" + result.FragmentPath);
+                MessageBox.Show(
+                    TrayText.Pick(
+                        "TermLink Terminal 配置已重新生成。\n\n请关闭并重新打开 Windows Terminal，让新的安装目录生效。" +
+                        (markerUpdated ? string.Empty : "\n\n未找到有效安装标记，但 Profile 已成功重建。"),
+                        "TermLink Terminal integration was regenerated.\n\nClose and reopen Windows Terminal so the current install directory takes effect." +
+                        (markerUpdated ? string.Empty : "\n\nNo valid install marker was found, but the profiles were rebuilt successfully.")),
+                    "TermLink",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception error)
+            {
+                terminalIntegrationStatusLabel.Text = TrayText.Pick(
+                    "重新配置失败：" + error.Message,
+                    "Reconfiguration failed: " + error.Message);
+                MessageBox.Show(
+                    terminalIntegrationStatusLabel.Text,
+                    "TermLink",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+            finally
+            {
+                if (!IsDisposed && terminalIntegrationButton != null)
+                    terminalIntegrationButton.Enabled =
+                        !WindowsTerminalIntegration.IsCurrentProcessPackaged();
+            }
         }
 
         private void CreateMembershipPage()
@@ -2288,17 +2812,22 @@ namespace TermLink.Tray
         {
             if (remoteStatusLabel == null || latestResponse == null) return;
             var connected = production != null && production.RelayState == ProductionRelayState.Connected;
+            var requiresReauthentication = TrayDisplay.RequiresReauthentication(production);
             remoteStatusLabel.Text = !latestResponse.RemoteAccessEnabled
                 ? TrayText.Pick("○ 远程访问已停止", "○ Remote access is stopped")
                 : production == null || !production.Configured
                     ? TrayText.Pick("○ 策略已开启 · 账户未配置", "○ Policy enabled · account not configured")
                     : !production.AccountLinked
                         ? TrayText.Pick("○ 策略已开启 · 等待账户关联", "○ Policy enabled · awaiting account link")
+                        : requiresReauthentication
+                            ? TrayText.Pick("! 登录已失效 · 请重新登录", "! Sign-in expired · sign in again")
                         : !connected
                             ? TrayText.Pick("○ 策略已开启 · Relay 未连接", "○ Policy enabled · Relay not connected")
                             : TrayText.Pick("● 同账号设备可查看并申请控制", "● Same-account devices can view and request control");
-            remoteConnectionLabel.Text = TrayText.Pick("Relay：", "Relay: ") +
-                (connected ? TrayText.Pick("已连接", "connected") : TrayDisplay.LocalizedRelayStatus(production == null ? ProductionRelayState.NotConfigured : production.RelayState));
+            remoteConnectionLabel.Text = requiresReauthentication
+                ? TrayText.Pick("账户：登录已失效，请重新登录", "Account: sign-in expired; sign in again")
+                : TrayText.Pick("Relay：", "Relay: ") +
+                    (connected ? TrayText.Pick("已连接", "connected") : TrayDisplay.LocalizedRelayStatus(production == null ? ProductionRelayState.NotConfigured : production.RelayState));
             var viewerCount = 0;
             if (production != null && production.Sessions != null)
             {
@@ -2321,13 +2850,56 @@ namespace TermLink.Tray
         {
             if (activitySummaryLabel == null || latestResponse == null) return;
             var relay = production == null ? ProductionRelayState.NotConfigured : production.RelayState;
-            activitySummaryLabel.Text = relay == ProductionRelayState.Connected
+            var requiresReauthentication = TrayDisplay.RequiresReauthentication(production);
+            activitySummaryLabel.Text = requiresReauthentication
+                ? TrayText.Pick("! 登录已失效，请重新登录", "! Sign-in expired; sign in again")
+                : relay == ProductionRelayState.Connected
                 ? TrayText.Pick("● 已连接到服务器", "● Connected to server")
                 : TrayText.Pick("○ ", "○ ") + TrayDisplay.LocalizedRelayStatus(relay);
             diagnosticsSummaryLabel.Text = TrayText.Pick("服务器：", "Server: ") +
                 TrayDisplay.StringOrDash(production == null ? null : production.ServerHost) + "\r\n" +
                 TrayText.Pick("最近连接：", "Last connected: ") +
-                TrayDisplay.DateTimeOrDash(production == null ? null : production.LastConnectedAtUtc);
+                TrayDisplay.DateTimeOrDash(production == null ? null : production.LastConnectedAtUtc) + "\r\n" +
+                TrayText.Pick("原因：", "Reason: ") +
+                TrayDisplay.LocalizedConnectionFailure(production == null ? null : production.LastErrorCode);
+            if (connectionRetryButton != null)
+            {
+                connectionRetryButton.Text = requiresReauthentication
+                    ? TrayText.Pick("重新登录", "Sign in again")
+                    : TrayText.Pick("立即重试连接", "Retry connection now");
+                connectionRetryButton.AccessibleName = requiresReauthentication
+                    ? TrayText.Pick("重新登录 TermLink 账户", "Sign in to the TermLink account again")
+                    : TrayText.Pick("立即重试服务器连接", "Retry the server connection now");
+                connectionRetryButton.Enabled = requiresReauthentication ||
+                    (production != null && production.Configured && production.AccountLinked &&
+                        relay != ProductionRelayState.Connected);
+            }
+        }
+
+        private async Task RetryConnectionAsync()
+        {
+            if (connectionRetryButton == null) return;
+            if (TrayDisplay.RequiresReauthentication(latestResponse == null ? null : latestResponse.Production))
+            {
+                await LoginAccountFromWindowAsync();
+                return;
+            }
+            connectionRetryButton.Enabled = false;
+            SetBusy(true);
+            try
+            {
+                var response = await Task.Run(() => controller.RetryProductionConnection());
+                if (!response.Success) throw new InvalidOperationException(response.Code);
+                Apply(response);
+                activitySummaryLabel.Text = TrayText.Pick("○ 已请求立即重连…", "○ Immediate reconnect requested…");
+                await Task.Delay(350);
+                Apply(await Task.Run(() => controller.EnsureAgent()));
+            }
+            catch (Exception error)
+            {
+                ApplyUnavailable(error);
+            }
+            finally { SetBusy(false); }
         }
 
         private void UpdateMembershipPage(ProductionStatus production)
@@ -2335,9 +2907,12 @@ namespace TermLink.Tray
             if (production == null) return;
             if (membershipAccountStatusLabel != null)
             {
+                var requiresReauthentication = TrayDisplay.RequiresReauthentication(production);
                 membershipAccountStatusLabel.Text = TrayText.Pick(
-                    production.Configured && production.AccountLinked ? "已关联账户" : "尚未关联账户",
-                    production.Configured && production.AccountLinked ? "Account linked" : "Account not linked");
+                    requiresReauthentication ? "登录已失效，请重新登录" :
+                        production.Configured && production.AccountLinked ? "已关联账户" : "尚未关联账户",
+                    requiresReauthentication ? "Sign-in expired; sign in again" :
+                        production.Configured && production.AccountLinked ? "Account linked" : "Account not linked");
             }
             if (membershipAccountDetailLabel != null)
             {
@@ -2363,28 +2938,15 @@ namespace TermLink.Tray
         {
             if (updateCheckButton == null || updateStatusLabel == null) return;
             updateCheckButton.Enabled = false;
-            updateOpenButton.Enabled = false;
-            updateDownloadUrl = null;
-            updateStatusLabel.Text = TrayText.Pick("正在检查更新…", "Checking for updates…");
             try
             {
-                var current = typeof(Program).Assembly.GetName().Version ?? new Version(0, 0, 0, 0);
-                var result = await AppShipUpdateClient.CheckAsync(AppShipUpdateClient.ConfiguredBaseUrl(), current);
-                updateDownloadUrl = result.DownloadUrl;
-                var version = string.IsNullOrWhiteSpace(result.VersionName) ? "-" : result.VersionName;
-                var prefix = result.Decision == WindowsUpdateDecision.Optional
-                    ? TrayText.Pick("有可选更新：", "Optional update: ")
-                    : result.Decision == WindowsUpdateDecision.Required
-                        ? TrayText.Pick("需要更新：", "Required update: ")
-                        : result.Decision == WindowsUpdateDecision.NoUpdate
-                            ? TrayText.Pick("当前已是最新版本", "You are up to date")
-                            : result.Decision == WindowsUpdateDecision.NotConfigured
-                                ? TrayText.Pick("更新服务未配置", "Update service is not configured")
-                                : TrayText.Pick("检查更新失败", "Update check failed");
-                updateStatusLabel.Text = prefix +
-                    ((result.Decision == WindowsUpdateDecision.Optional || result.Decision == WindowsUpdateDecision.Required) ? version : string.Empty) +
-                    (string.IsNullOrWhiteSpace(result.Message) ? string.Empty : " · " + result.Message);
-                updateOpenButton.Enabled = !string.IsNullOrWhiteSpace(updateDownloadUrl);
+                await updateWorkflow.CheckAndOfferAsync(
+                    this,
+                    manual: true,
+                    status =>
+                    {
+                        if (!IsDisposed && updateStatusLabel != null) updateStatusLabel.Text = status;
+                    });
             }
             catch (Exception error)
             {
@@ -2394,18 +2956,6 @@ namespace TermLink.Tray
             {
                 updateCheckButton.Enabled = true;
             }
-        }
-
-        private void OpenUpdateDownload()
-        {
-            if (string.IsNullOrWhiteSpace(updateDownloadUrl) ||
-                !Uri.TryCreate(updateDownloadUrl, UriKind.Absolute, out var uri) ||
-                !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)) return;
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = uri.AbsoluteUri,
-                UseShellExecute = true
-            });
         }
 
         private async Task ToggleRemoteAsync()
@@ -2455,7 +3005,7 @@ namespace TermLink.Tray
 
         private async Task LoginAccountFromWindowAsync()
         {
-            using (var dialog = new AccountLinkForm())
+            using (var dialog = new AccountLinkForm(controller.ServerUrl))
             {
                 if (dialog.ShowDialog(this) != DialogResult.OK) return;
                 SetBusy(true);
@@ -2477,7 +3027,7 @@ namespace TermLink.Tray
 
         private async Task RegisterAccountFromWindowAsync()
         {
-            using (var dialog = new AccountRegisterForm())
+            using (var dialog = new AccountRegisterForm(controller.ServerUrl))
             {
                 if (dialog.ShowDialog(this) != DialogResult.OK) return;
                 SetBusy(true);
@@ -2497,6 +3047,48 @@ namespace TermLink.Tray
             }
         }
 
+        private async Task SignOutAccountFromWindowAsync()
+        {
+            if (MessageBox.Show(
+                TrayText.Pick(
+                    "退出此 PC 上的 TermLink 账号？\n\n这会停止当前远程连接，并仅从本机清除登录凭据和账号配置；不会删除服务器账号。",
+                    "Sign out of TermLink on this PC?\n\nThis stops current remote connections and removes only the local credentials and account configuration. It does not delete the server account."),
+                "TermLink",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) != DialogResult.OK)
+            {
+                return;
+            }
+            SetBusy(true);
+            accountSignOutButton.Enabled = false;
+            try
+            {
+                var response = await Task.Run(() => controller.ForgetLocalAccountAndRestart());
+                if (response == null || !response.Success) throw new InvalidOperationException(response == null ? "NO_RESPONSE" : response.Code);
+                Apply(response);
+                MessageBox.Show(
+                    TrayText.Pick("已退出登录，并已忘记此 PC 上的账号。", "Signed out and forgot the account on this PC."),
+                    "TermLink",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception error)
+            {
+                MessageBox.Show(
+                    TrayText.Pick("退出登录失败：", "Sign-out failed: ") + error.Message,
+                    "TermLink",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                await RefreshAsync();
+            }
+            finally
+            {
+                accountSignOutButton.Enabled = true;
+                SetBusy(false);
+            }
+        }
+
         private void PreferenceChanged(object sender, EventArgs e)
         {
             if (applyingPreferences || languageCombo == null || themeCombo == null || languageCombo.SelectedIndex < 0 || themeCombo.SelectedIndex < 0) return;
@@ -2510,8 +3102,13 @@ namespace TermLink.Tray
         {
             if (IsDisposed) return;
             refreshButton.Enabled = !busy;
+            accountLoginButton.Enabled = !busy;
+            accountRegisterButton.Enabled = !busy;
+            accountSignOutButton.Enabled = !busy;
             if (remoteToggleButton != null) remoteToggleButton.Enabled = !busy;
             if (remoteStopButton != null) remoteStopButton.Enabled = !busy && latestResponse != null && latestResponse.RemoteAccessEnabled;
+            if (connectionRetryButton != null && busy) connectionRetryButton.Enabled = false;
+            if (terminalIntegrationButton != null) terminalIntegrationButton.Enabled = !busy;
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
         }
 
@@ -2599,49 +3196,49 @@ namespace TermLink.Tray
             foreach (Control child in control.Controls) ApplyThemeTo(child, palette);
         }
 
-        private static Label CreateValueLabel(string text, float size, bool strong)
+        private Label CreateValueLabel(string text, float size, bool strong)
         {
             return new Label
             {
                 Text = text,
                 AutoSize = true,
-                MaximumSize = new Size(760, 0),
-                Padding = new Padding(0, 3, 0, 3),
+                MaximumSize = new Size(Dpi(760), 0),
+                Padding = Dpi(new Padding(0, 3, 0, 3)),
                 Font = new Font(SystemFonts.MessageBoxFont.FontFamily, size, strong ? FontStyle.Bold : FontStyle.Regular),
                 AccessibleName = text
             };
         }
 
-        private static Button CreateButton(string text)
+        private Button CreateButton(string text)
         {
             return new Button
             {
                 Text = text,
                 AutoSize = true,
-                MinimumSize = new Size(110, 34),
+                MinimumSize = new Size(Dpi(110), Dpi(34)),
                 FlatStyle = FlatStyle.Flat,
                 UseMnemonic = false,
                 AccessibleRole = AccessibleRole.PushButton,
                 AccessibleName = text,
-                Margin = new Padding(4)
+                Margin = Dpi(new Padding(4))
             };
         }
 
-        private static Panel CreateCard(string title, out FlowLayoutPanel body)
+        private Panel CreateCard(string title, out FlowLayoutPanel body)
         {
             var card = new Panel
             {
                 AutoSize = false,
-                Width = 600,
-                Height = 80,
-                MinimumSize = new Size(460, 0),
-                Padding = new Padding(16),
-                Margin = new Padding(0, 0, 0, 14),
+                Width = Dpi(600),
+                Height = Dpi(80),
+                MinimumSize = new Size(Dpi(320), 0),
+                Padding = Dpi(new Padding(16)),
+                Margin = Dpi(new Padding(0, 0, 0, 14)),
                 BorderStyle = BorderStyle.FixedSingle,
                 Tag = "card"
             };
-            var heading = new Label { Text = title, AutoSize = false, Dock = DockStyle.Top, Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 11, FontStyle.Bold), Padding = new Padding(0, 0, 0, 8), UseMnemonic = false };
-            body = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = false, Width = 566, FlowDirection = FlowDirection.TopDown, WrapContents = false, Margin = new Padding(0), Padding = new Padding(0), Tag = "card" };
+            var heading = new Label { Text = title, AutoSize = false, Dock = DockStyle.Top, Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 11, FontStyle.Bold), Padding = Dpi(new Padding(0, 0, 0, 8)), UseMnemonic = false };
+            body = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = false, Width = Dpi(566), FlowDirection = FlowDirection.TopDown, WrapContents = false, Margin = new Padding(0), Padding = new Padding(0), Tag = "card" };
             card.Controls.Add(body);
             card.Controls.Add(heading);
             var capturedBody = body;
@@ -2656,16 +3253,23 @@ namespace TermLink.Tray
             card.SizeChanged += delegate { fit(); };
             body.ControlAdded += delegate { fit(); };
             body.ControlRemoved += delegate { fit(); };
+            body.ControlAdded += delegate(object sender, ControlEventArgs args)
+            {
+                args.Control.TextChanged += delegate { fit(); };
+                args.Control.SizeChanged += delegate { fit(); };
+            };
             fit();
             return card;
         }
 
-        private static void FitPageStack(Panel body, FlowLayoutPanel stack)
+        private void FitPageStack(Panel body, FlowLayoutPanel stack)
         {
             Action resize = delegate
             {
                 if (body.IsDisposed || stack.IsDisposed) return;
-                var width = Math.Max(460, body.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 2);
+                var width = Math.Max(
+                    Dpi(320),
+                    body.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - Dpi(2));
                 stack.Width = width;
                 foreach (Control child in stack.Controls) child.Width = width;
             };
@@ -2674,10 +3278,10 @@ namespace TermLink.Tray
             resize();
         }
 
-        private static void FitCardContent(Panel card, FlowLayoutPanel body, Label heading)
+        private void FitCardContent(Panel card, FlowLayoutPanel body, Label heading)
         {
             if (card.IsDisposed || body.IsDisposed || heading.IsDisposed) return;
-            var width = Math.Max(320, card.ClientSize.Width - card.Padding.Horizontal);
+            var width = Math.Max(Dpi(320), card.ClientSize.Width - card.Padding.Horizontal);
             body.Width = width;
             foreach (Control child in body.Controls)
             {
@@ -2700,38 +3304,44 @@ namespace TermLink.Tray
             body.Size = new Size(width, preferredHeight);
             heading.MaximumSize = new Size(width, 0);
             heading.Height = heading.GetPreferredSize(new Size(width, 0)).Height;
-            card.Height = card.Padding.Vertical + heading.Height + body.Height + 2;
+            card.Height = card.Padding.Vertical + heading.Height + body.Height + Dpi(2);
             card.PerformLayout();
         }
 
-        private static ComboBox CreatePreferenceCombo()
+        private ComboBox CreatePreferenceCombo()
         {
             var combo = new ComboBox
             {
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 FlatStyle = FlatStyle.Flat,
-                Width = 190,
-                Height = 30,
+                Width = Dpi(190),
+                Height = Dpi(30),
                 AccessibleRole = AccessibleRole.ComboBox
             };
             TrayComboBoxStyle.Configure(combo);
             return combo;
         }
 
-        private static Control CreateSettingRow(string title, string description, Control editor)
+        private Control CreateSettingRow(string title, string description, Control editor)
         {
-            var row = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Width = 566, ColumnCount = 2, RowCount = 2, Padding = new Padding(0, 5, 0, 5), Tag = "card" };
+            var row = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Width = Dpi(566), ColumnCount = 1, RowCount = 3, Padding = Dpi(new Padding(0, 5, 0, 5)), Tag = "card" };
             row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190));
             row.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             row.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            row.Controls.Add(new Label { Text = title, AutoSize = true, MaximumSize = new Size(350, 0), Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 10, FontStyle.Bold) }, 0, 0);
-            row.Controls.Add(new Label { Text = description, AutoSize = true, MaximumSize = new Size(350, 0), ForeColor = SystemColors.GrayText }, 0, 1);
-            editor.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            row.Controls.Add(editor, 1, 0);
-            row.SetRowSpan(editor, 2);
+            row.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            row.Controls.Add(new Label { Text = title, AutoSize = true, Dock = DockStyle.Top, Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 10, FontStyle.Bold) }, 0, 0);
+            row.Controls.Add(new Label { Text = description, AutoSize = true, Dock = DockStyle.Top, ForeColor = SystemColors.GrayText }, 0, 1);
+            editor.Anchor = AnchorStyles.Top | AnchorStyles.Left;
+            editor.Margin = Dpi(new Padding(0, 6, 0, 0));
+            row.Controls.Add(editor, 0, 2);
             return row;
         }
+
+        private int LayoutDpi => layoutInitialized ? DeviceDpi : DpiLayout.DesignDpi;
+
+        private int Dpi(int logicalPixels) => DpiLayout.Scale96(logicalPixels, LayoutDpi);
+
+        private Padding Dpi(Padding value) => DpiLayout.Scale96(value, LayoutDpi);
     }
 
     internal sealed class SessionListForm : Form
@@ -2743,13 +3353,15 @@ namespace TermLink.Tray
 
         public SessionListForm(AgentController controller)
         {
+            SuspendLayout();
+            AutoScaleDimensions = new SizeF(DpiLayout.DesignDpi, DpiLayout.DesignDpi);
+            AutoScaleMode = AutoScaleMode.Dpi;
             this.controller = controller;
             Text = TrayText.Pick("TermLink 会话", "TermLink sessions");
             Icon = BrandIcons.LoadApplicationIcon();
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(760, 380);
             Size = new Size(900, 480);
-            AutoScaleMode = AutoScaleMode.Dpi;
             AccessibleName = TrayText.Pick("TermLink 受管会话", "TermLink managed sessions");
 
             stateLabel = new Label
@@ -2793,11 +3405,20 @@ namespace TermLink.Tray
             Controls.Add(actions);
             Controls.Add(stateLabel);
             FitSessionColumns();
+            ResumeLayout(false);
+            PerformLayout();
         }
 
         public void RefreshSessions()
         {
             _ = RefreshSessionsAsync();
+        }
+
+        protected override void OnDpiChanged(DpiChangedEventArgs e)
+        {
+            base.OnDpiChanged(e);
+            PerformLayout();
+            FitSessionColumns();
         }
 
         public async Task RefreshSessionsAsync()
@@ -2944,13 +3565,15 @@ namespace TermLink.Tray
 
         public AccountDevicesForm(AgentController controller)
         {
+            SuspendLayout();
+            AutoScaleDimensions = new SizeF(DpiLayout.DesignDpi, DpiLayout.DesignDpi);
+            AutoScaleMode = AutoScaleMode.Dpi;
             this.controller = controller;
             Text = TrayText.Pick("TermLink 账户与设备", "TermLink account and devices");
             Icon = BrandIcons.LoadApplicationIcon();
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(780, 520);
             Size = new Size(920, 620);
-            AutoScaleMode = AutoScaleMode.Dpi;
             AccessibleName = TrayText.Pick("TermLink 账户设备", "TermLink account devices");
 
             stateLabel = new Label
@@ -3084,11 +3707,20 @@ namespace TermLink.Tray
             Controls.Add(stateLabel);
             ClearChallenge();
             FitDeviceColumns();
+            ResumeLayout(false);
+            PerformLayout();
         }
 
         public void RefreshStatus()
         {
             _ = RefreshStatusAsync();
+        }
+
+        protected override void OnDpiChanged(DpiChangedEventArgs e)
+        {
+            base.OnDpiChanged(e);
+            PerformLayout();
+            FitDeviceColumns();
         }
 
         public async Task RefreshStatusAsync()

@@ -25,6 +25,19 @@ import kotlin.test.assertIs
 @OptIn(ExperimentalCoroutinesApi::class)
 class RemoteTerminalSessionTest {
     @Test
+    fun titlePresenceDistinguishesUnpublishedFromExplicitClear() = runTest {
+        val session = RemoteTerminalSession(RecordingEngine(), RecordingOutbound(), backgroundScope)
+
+        assertEquals(null, session.title.value)
+        session.onConnected()
+        assertEquals(EventAcceptance.Applied(1), session.accept(RemoteSessionEvent.Title(1, "build")))
+        assertEquals("build", session.title.value)
+        assertEquals(EventAcceptance.Applied(2), session.accept(RemoteSessionEvent.Title(2, "")))
+        assertEquals("", session.title.value)
+        session.close()
+    }
+
+    @Test
     fun feedsBeforeCumulativeAckAndDetectsDuplicateAndGap() = runTest {
         val log = mutableListOf<String>()
         val engine = RecordingEngine { sequence, _ ->
@@ -78,7 +91,7 @@ class RemoteTerminalSessionTest {
             engine = engine,
             outbound = outbound,
             parentScope = backgroundScope,
-            initialAcknowledgedSequence = 41,
+            initialRendererState = RendererBootstrapState.FullPrefix(41, rendererGeneration = 1),
         )
 
         assertTrue(session.onConnected())
@@ -159,18 +172,24 @@ class RemoteTerminalSessionTest {
         val outbound = object : RemoteSessionOutbound {
             override suspend fun resume(lastAckedSequence: Long) = Unit
 
-            override suspend fun persistAcknowledgement(highestContiguousSequence: Long): Long {
+            override suspend fun persistAcknowledgement(
+                expectedRendererGeneration: Long,
+                highestContiguousSequence: Long,
+            ): DurableAckCommit {
                 persisted += highestContiguousSequence
                 if (persisted.size == 1) {
                     firstCommitStarted.complete(Unit)
                     releaseFirstCommit.await()
                 }
-                return highestContiguousSequence
+                return DurableAckCommit(highestContiguousSequence, expectedRendererGeneration)
             }
 
             override suspend fun acknowledge(highestContiguousSequence: Long) {
                 published += highestContiguousSequence
             }
+
+            override suspend fun resetAcknowledgement(expectedRendererGeneration: Long) =
+                DurableAckCommit(0, expectedRendererGeneration + 1)
 
             override suspend fun sendInput(input: RemoteInput) = Unit
             override suspend fun sendResize(size: TerminalSize) = Unit
@@ -244,7 +263,7 @@ class RemoteTerminalSessionTest {
                 RemoteSessionEvent.Output(3, byteArrayOf(3)),
             ),
             expectedGap = activeGap,
-            persist = {},
+            persist = { generation, sequence -> DurableAckCommit(sequence, generation) },
             publish = {},
         )
 
@@ -450,7 +469,7 @@ class RemoteTerminalSessionTest {
         assertFailsWith<IllegalStateException> {
             session.recoverFromHistory(
                 replay,
-                persist = { throw IllegalStateException("durable ACK unavailable") },
+                persist = { _, _ -> throw IllegalStateException("durable ACK unavailable") },
                 publish = {},
             )
         }
@@ -466,7 +485,10 @@ class RemoteTerminalSessionTest {
             3L,
             session.recoverFromHistory(
                 replay,
-                persist = { commits += it },
+                persist = { generation, sequence ->
+                    commits += sequence
+                    DurableAckCommit(sequence, generation)
+                },
                 publish = {},
             ),
         )
@@ -506,7 +528,10 @@ class RemoteTerminalSessionTest {
                     RemoteSessionEvent.Output(3, byteArrayOf(3)),
                 ),
                 expectedGap = observedGap,
-                persist = { durableRecovery += it },
+                persist = { generation, sequence ->
+                    durableRecovery += sequence
+                    DurableAckCommit(sequence, generation)
+                },
                 publish = { publishedRecovery += it },
             )
         }
@@ -536,7 +561,7 @@ class RemoteTerminalSessionTest {
                     RemoteSessionEvent.Output(1, byteArrayOf(1)),
                     RemoteSessionEvent.Output(2, byteArrayOf(2)),
                 ),
-                persist = { error("partial replay must not be persisted") },
+                persist = { _, _ -> error("partial replay must not be persisted") },
                 publish = { error("partial replay must not be published") },
             )
         }
@@ -564,7 +589,10 @@ class RemoteTerminalSessionTest {
                     RemoteSessionEvent.Output(1, byteArrayOf(1)),
                     RemoteSessionEvent.Output(2, byteArrayOf(2)),
                 ),
-                persist = { durable += it },
+                persist = { generation, sequence ->
+                    durable += sequence
+                    DurableAckCommit(sequence, generation)
+                },
                 publish = { throw IllegalStateException("socket closed") },
             )
         }
@@ -632,7 +660,7 @@ class RemoteTerminalSessionTest {
     }
 
     @Test
-    fun terminalSizeIsBufferedUntilControlLeaseIsGranted() = runTest {
+    fun terminalSizeIsNeverSentWhenControlLeaseIsGranted() = runTest {
         val engine = RecordingEngine()
         val outbound = RecordingOutbound()
         val session = RemoteTerminalSession(
@@ -655,7 +683,7 @@ class RemoteTerminalSessionTest {
 
         session.grantControl("lease", 10_000)
 
-        assertEquals(listOf(TerminalSize(100, 30)), outbound.sizes)
+        assertTrue(outbound.sizes.isEmpty())
         session.close()
     }
 
@@ -716,6 +744,10 @@ class RemoteTerminalSessionTest {
         val inputId = UUID.fromString("00000000-0000-0000-0000-000000000004")
         val outbound = object : RemoteSessionOutbound {
             override suspend fun resume(lastAckedSequence: Long) = Unit
+            override suspend fun persistAcknowledgement(expectedRendererGeneration: Long, highestContiguousSequence: Long) =
+                DurableAckCommit(highestContiguousSequence, expectedRendererGeneration)
+            override suspend fun resetAcknowledgement(expectedRendererGeneration: Long) =
+                DurableAckCommit(0, expectedRendererGeneration + 1)
             override suspend fun acknowledge(highestContiguousSequence: Long) = Unit
             override suspend fun sendResize(size: TerminalSize) = Unit
             override suspend fun sendInput(input: RemoteInput) {
@@ -746,6 +778,10 @@ class RemoteTerminalSessionTest {
         lateinit var session: RemoteTerminalSession
         val outbound = object : RemoteSessionOutbound {
             override suspend fun resume(lastAckedSequence: Long) = Unit
+            override suspend fun persistAcknowledgement(expectedRendererGeneration: Long, highestContiguousSequence: Long) =
+                DurableAckCommit(highestContiguousSequence, expectedRendererGeneration)
+            override suspend fun resetAcknowledgement(expectedRendererGeneration: Long) =
+                DurableAckCommit(0, expectedRendererGeneration + 1)
             override suspend fun acknowledge(highestContiguousSequence: Long) = Unit
             override suspend fun sendResize(size: TerminalSize) = Unit
             override suspend fun sendInput(input: RemoteInput) {
@@ -774,7 +810,7 @@ class RemoteTerminalSessionTest {
     }
 
     @Test
-    fun terminalSizeEventsAreDistinctAndDebounced() = runTest {
+    fun terminalSizeEventsArePresentationOnlyAndNeverReachOutbound() = runTest {
         val engine = RecordingEngine()
         val outbound = RecordingOutbound()
         val session = RemoteTerminalSession(
@@ -792,16 +828,14 @@ class RemoteTerminalSessionTest {
         engine.emitSize(TerminalSize(80, 25))
         advanceTimeBy(50)
         engine.emitSize(TerminalSize(100, 30))
-        advanceTimeBy(149)
-        assertTrue(outbound.sizes.isEmpty())
-        advanceTimeBy(1)
+        advanceTimeBy(150)
         runCurrent()
-        assertEquals(listOf(TerminalSize(100, 30)), outbound.sizes)
+        assertTrue(outbound.sizes.isEmpty())
 
         engine.emitSize(TerminalSize(100, 30))
         advanceTimeBy(200)
         runCurrent()
-        assertEquals(1, outbound.sizes.size)
+        assertTrue(outbound.sizes.isEmpty())
         session.close()
     }
 
@@ -957,15 +991,19 @@ class RemoteTerminalSessionTest {
             resumes += lastAckedSequence
         }
 
-        override suspend fun persistAcknowledgement(highestContiguousSequence: Long): Long {
+        override suspend fun persistAcknowledgement(
+            expectedRendererGeneration: Long,
+            highestContiguousSequence: Long,
+        ): DurableAckCommit {
             if (failPersist) throw IllegalStateException("ACK persistence offline")
             onPersist(highestContiguousSequence)
             persistedAcknowledgements += highestContiguousSequence
-            return highestContiguousSequence
+            return DurableAckCommit(highestContiguousSequence, expectedRendererGeneration)
         }
 
-        override suspend fun resetAcknowledgement() {
+        override suspend fun resetAcknowledgement(expectedRendererGeneration: Long): DurableAckCommit {
             persistedAcknowledgements.clear()
+            return DurableAckCommit(0, expectedRendererGeneration + 1)
         }
 
         override suspend fun acknowledge(highestContiguousSequence: Long) {

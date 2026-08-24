@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>TermLink.PortableTerminalModel.Validation</AssemblyName>
+    <RootNamespace>TermLink.PortableTerminalModel.Validation</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\src\Agent\PortableTerminalModelV1.cs" Link="PortableTerminalModelV1.cs" />
+    <Compile Include="Program.cs" />
+  </ItemGroup>
+</Project>

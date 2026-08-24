@@ -1,14 +1,15 @@
 {
   "schema": "termlink.phase1-windows-setup-validation",
   "version": 1,
-  "generated_at_utc": "2026-08-06T18:14:09.6047706Z",
+  "generated_at_utc": "2026-08-23T05:24:21.9151293Z",
   "passed": true,
-  "setup_version": "0.1.9.0",
+  "setup_version": "0.1.16.22",
   "architecture": "win-x64",
   "single_file_setup": true,
   "self_contained_payload": true,
   "embedded_payload": true,
   "selected_install_directory_applied": true,
+  "tray_assembly_version": "0.1.16.22",
   "terminal_profile_count": 4,
   "terminal_fragment_owned_cleanup": true,
   "startup_unchanged_under_no_startup": true,
@@ -16,5 +17,5 @@
   "previous_install_directory_auto_discovered": true,
   "installed_uninstaller": true,
   "uninstall": true,
-  "setup_sha256": "1fec4d648b91b9690170d6da80a88af9c4f306c768f1aa45730e1024bf05196e"
+  "setup_sha256": "f76a985e178994e976275c6822897f44177f0dd980aebcb7ce497efc98d7b554"
 }

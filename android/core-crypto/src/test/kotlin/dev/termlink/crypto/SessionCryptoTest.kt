@@ -5,7 +5,9 @@ import dev.termlink.protocol.realtime.v1.ResizePayload
 import java.security.SecureRandom
 import java.util.UUID
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.fail
 import org.junit.Test
 
 class SessionCryptoTest {
@@ -83,6 +85,129 @@ class SessionCryptoTest {
         assertArrayEquals("history\r\n".encodeToByteArray(), OutputChunkPayload.parseFrom(chunk.eventsList[0].payload).output.toByteArray())
         val resize = ResizePayload.parseFrom(chunk.eventsList[1].payload)
         assertArrayEquals(intArrayOf(120, 40), intArrayOf(resize.columns, resize.rows))
+    }
+
+    @Test
+    fun opensCrossPlatformMultiRecipientSessionTitleVector() {
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val firstRecipientId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val secondRecipientId = UUID.fromString("21324354-6576-8798-a9ba-cbdcedfe0f10")
+        val firstPairwise = hex("b1632a5a77cafec55f885fc4c3588f303ed3ca9856d5c464636e0b5feaefa773")
+        val secondPairwise = ByteArray(32) { (it + 64).toByte() }
+        val sealedTitle = sessionTitleVector()
+        val expectedTitle = "构建完成 — PowerShell 🚀"
+
+        assertEquals(
+            expectedTitle,
+            SessionTitleCrypto.open(firstPairwise, sealedTitle, sessionId, pcId, firstRecipientId, 7),
+        )
+        assertEquals(
+            expectedTitle,
+            SessionTitleCrypto.open(secondPairwise, sealedTitle, sessionId, pcId, secondRecipientId, 9),
+        )
+        assertEquals(
+            "title-v1:102132435465768798a9bacbdcedfe0f:00000007",
+            SessionTitleCrypto.keyId(firstRecipientId, 7),
+        )
+        assertFalse(sealedTitle.containsSequence(expectedTitle.encodeToByteArray()))
+    }
+
+    @Test
+    fun opensExplicitEmptySessionTitleVector() {
+        val sealedTitle = hex(
+            "544c5449544c453100000001fedcba9876543210ffffeeeeeeeeeeee00112233445566778899aabbccddeeff" +
+                "00000001102132435465768798a9bacbdcedfe0f0000000000000007000102030405060708090a0b00000010" +
+                "5fa75868560ae6e0c3fbbbbbbe33309c",
+        )
+        assertEquals(
+            "",
+            SessionTitleCrypto.open(
+                hex("b1632a5a77cafec55f885fc4c3588f303ed3ca9856d5c464636e0b5feaefa773"),
+                sealedTitle,
+                UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee"),
+                UUID.fromString("00112233-4455-6677-8899-aabbccddeeff"),
+                UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f"),
+                7,
+            ),
+        )
+    }
+
+    @Test
+    fun rejectsWrongRecipientTamperingAndMalformedTitleEnvelopes() {
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val recipientId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pairwise = hex("b1632a5a77cafec55f885fc4c3588f303ed3ca9856d5c464636e0b5feaefa773")
+        val vector = sessionTitleVector()
+
+        assertRejected {
+            SessionTitleCrypto.open(pairwise, vector, sessionId, pcId, UUID.randomUUID(), 7)
+        }
+        assertRejected {
+            SessionTitleCrypto.open(pairwise, vector, sessionId, pcId, recipientId, 8)
+        }
+        assertRejected {
+            SessionTitleCrypto.open(pairwise, vector, UUID.randomUUID(), pcId, recipientId, 7)
+        }
+        assertRejected {
+            SessionTitleCrypto.open(ByteArray(32), vector, sessionId, pcId, recipientId, 7)
+        }
+
+        val tampered = vector.clone().also { it[48 + 40 + 5] = (it[48 + 40 + 5].toInt() xor 0x40).toByte() }
+        assertRejected { SessionTitleCrypto.open(pairwise, tampered, sessionId, pcId, recipientId, 7) }
+
+        val duplicate = vector.clone().also { System.arraycopy(it, 48, it, 136, 16) }
+        assertRejected { SessionTitleCrypto.open(pairwise, duplicate, sessionId, pcId, recipientId, 7) }
+
+        assertRejected {
+            SessionTitleCrypto.open(pairwise, vector.copyOf(vector.size - 1), sessionId, pcId, recipientId, 7)
+        }
+        assertRejected {
+            SessionTitleCrypto.open(pairwise, vector + byteArrayOf(0), sessionId, pcId, recipientId, 7)
+        }
+        assertRejected {
+            SessionTitleCrypto.open(
+                pairwise,
+                ByteArray(SessionTitleCrypto.MAX_ENVELOPE_BYTES + 1),
+                sessionId,
+                pcId,
+                recipientId,
+                7,
+            )
+        }
+
+        val oversizedEntry = vector.clone().also {
+            it[84] = 0
+            it[85] = 0
+            it[86] = 0x10
+            it[87] = 0x11
+        }
+        assertRejected { SessionTitleCrypto.open(pairwise, oversizedEntry, sessionId, pcId, recipientId, 7) }
+    }
+
+    private fun sessionTitleVector(): ByteArray = hex(
+        "544c5449544c453100000001fedcba9876543210ffffeeeeeeeeeeee00112233445566778899aabbccddeeff" +
+            "00000002102132435465768798a9bacbdcedfe0f0000000000000007000102030405060708090a0b00000030" +
+            "182952144768033daa7e5ce9107cae203ea87a1e4e4c55c8e7e36f1f820a977448911969516fb3e821106d1d0f02daa" +
+            "12132435465768798a9bacbdcedfe0f100000000000000009101112131415161718191a1b00000030" +
+            "04d63f4639923e08cf5db7267b626151494e3388d725f9217a4c0d514d973a233271f288e5f697eed253fde73adccd46",
+    )
+
+    private fun assertRejected(block: () -> Unit) {
+        try {
+            block()
+            fail("Malformed or unauthorized session title envelope was accepted")
+        } catch (_: IllegalArgumentException) {
+            // Expected fail-closed parsing/authentication result.
+        }
+    }
+
+    private fun ByteArray.containsSequence(candidate: ByteArray): Boolean {
+        if (candidate.isEmpty() || candidate.size > size) return false
+        return (0..size - candidate.size).any { offset ->
+            candidate.indices.all { index -> this[offset + index] == candidate[index] }
+        }
     }
 
     private fun hex(value: String): ByteArray = value.chunked(2).map { it.toInt(16).toByte() }.toByteArray()

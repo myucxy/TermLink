@@ -8,7 +8,7 @@ Set-StrictMode -Version Latest
 
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $agent = Join-Path $projectRoot 'src\Agent\bin\Release\net8.0-windows\TermLink.Agent.exe'
-$tray = Join-Path $projectRoot 'src\Tray\bin\Release\net8.0-windows\TermLink.Tray.exe'
+$tray = Join-Path $projectRoot 'src\Tray\bin\Release\net8.0-windows\TermLink.exe'
 $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
 $productionRoot = Join-Path $localAppData 'TermLink'
 $configPath = Join-Path $productionRoot 'production-config.json'
@@ -42,8 +42,7 @@ try {
 
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
-        & $tray --control-pipe $controlPipe --buffer-root $bufferRoot `
-            --agent-exe $agent --status-json $statusPath
+        & $tray --control-pipe $controlPipe --buffer-root $bufferRoot --status-json $statusPath
         if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $statusPath -PathType Leaf)) {
             $snapshot = Get-Content -Raw -LiteralPath $statusPath | ConvertFrom-Json
             if ($snapshot.Production.RelayState -eq 2 -and
@@ -82,8 +81,7 @@ try {
 }
 finally {
     try {
-        & $tray --control-pipe $controlPipe --buffer-root $bufferRoot `
-            --agent-exe $agent --shutdown-agent | Out-Null
+        & $tray --control-pipe $controlPipe --buffer-root $bufferRoot --shutdown-agent | Out-Null
     }
     catch {
     }

@@ -28,10 +28,20 @@ namespace TermLink.Agent
                 if (RegistryServiceOptions.IsRegistryMode(args))
                 {
                     var registryOptions = RegistryServiceOptions.Parse(args);
+#if TERMLINK_PRODUCTION_RUNTIME
+                    using (var host = new EmbeddedAgentHost(registryOptions))
+                    {
+                        host.Start();
+                        while (host.IsRunning) Thread.Sleep(100);
+                        if (host.LastFailure != null) throw host.LastFailure;
+                        return 0;
+                    }
+#else
                     using (var service = new SessionRegistryService(registryOptions))
                     {
                         return service.Run();
                     }
+#endif
                 }
                 var options = AgentOptions.Parse(args);
                 if (options.InspectBuffer)
@@ -315,6 +325,7 @@ namespace TermLink.Agent
         private bool testDisconnectTriggered;
         private volatile bool remoteInputRejectSupported;
         private bool ended;
+        private bool removed;
         private bool interruptedCommitted;
         private int exitCode;
         private bool disposed;
@@ -333,6 +344,7 @@ namespace TermLink.Agent
         public int Run()
         {
             RunCore();
+            CommitInterruptedLifecycle();
 
             if (!ended)
             {
@@ -365,38 +377,53 @@ namespace TermLink.Agent
 
         private void CommitInterruptedLifecycle()
         {
-            LocalFrame terminal;
+            var terminalFrames = new List<LocalFrame>(2);
             lock (statusSync)
             {
                 var stoppedWithInterruption = lifecycle == SessionAgentLifecycle.RemoteStopped && commitInterruptedOnStop;
-                if (ended || interruptedCommitted ||
-                    (lifecycle != SessionAgentLifecycle.HostLost &&
-                     lifecycle != SessionAgentLifecycle.Faulted &&
-                     !stoppedWithInterruption))
+                if (removed || interruptedCommitted ||
+                    (!ended && lifecycle != SessionAgentLifecycle.HostLost &&
+                     lifecycle != SessionAgentLifecycle.Faulted && !stoppedWithInterruption))
                 {
                     return;
                 }
-                if (lastHostSequence == ulong.MaxValue)
+                if (!ended)
                 {
-                    throw new InvalidDataException("Session event sequence is exhausted.");
+                    if (lastHostSequence == ulong.MaxValue)
+                        throw new InvalidDataException("Session event sequence is exhausted.");
+                    var interrupted = new LocalFrame(
+                        LocalFrameType.Lifecycle,
+                        options.SessionId,
+                        lastHostSequence + 1,
+                        LocalPayloadCodec.Lifecycle(LocalLifecycleState.Interrupted, 0));
+                    eventBuffer.Append(interrupted);
+                    terminalFrames.Add(interrupted);
+                    lastHostSequence = interrupted.Sequence;
+                    persistedFrames++;
                 }
-
-                terminal = new LocalFrame(
-                    LocalFrameType.Lifecycle,
+                if (lastHostSequence == ulong.MaxValue)
+                    throw new InvalidDataException("Session event sequence is exhausted.");
+                var removal = new LocalFrame(
+                    LocalFrameType.SessionRemoved,
                     options.SessionId,
                     lastHostSequence + 1,
-                    LocalPayloadCodec.Lifecycle(LocalLifecycleState.Interrupted, 0));
-                eventBuffer.Append(terminal);
-                lastHostSequence = terminal.Sequence;
+                    LocalPayloadCodec.SessionRemoved());
+                eventBuffer.Append(removal);
+                terminalFrames.Add(removal);
+                lastHostSequence = removal.Sequence;
                 lastActivityUtc = DateTime.UtcNow;
-                persistedFrames++;
+                persistedFrames += 1;
+                removed = true;
                 interruptedCommitted = true;
             }
 
             if (committedFrame != null)
             {
-                try { committedFrame(terminal); }
-                catch { }
+                foreach (var terminal in terminalFrames)
+                {
+                    try { committedFrame(terminal); }
+                    catch { }
+                }
             }
         }
 
@@ -427,6 +454,23 @@ namespace TermLink.Agent
                 resumeFromSequence,
                 out earliestRetainedSequence,
                 out latestSequence);
+        }
+
+        internal IList<LocalFrame> ReadBufferedEvents(
+            ulong resumeFromSequence,
+            int maximumEvents,
+            long maximumStoredBytes,
+            out ulong earliestRetainedSequence,
+            out ulong latestSequence,
+            out bool hasMore)
+        {
+            return eventBuffer.ReadFrom(
+                resumeFromSequence,
+                maximumEvents,
+                maximumStoredBytes,
+                out earliestRetainedSequence,
+                out latestSequence,
+                out hasMore);
         }
 
         internal void DeleteBufferedEvents()
@@ -464,7 +508,7 @@ namespace TermLink.Agent
         private void RunCore()
         {
             var disconnectedDeadline = DateTime.UtcNow.AddMilliseconds(options.WaitMilliseconds);
-            while (!ended && !stopRequested)
+            while (!removed && !stopRequested)
             {
                 if (actualHostProcessId > 0 && !IsProcessRunning(actualHostProcessId))
                 {
@@ -507,7 +551,7 @@ namespace TermLink.Agent
                     }
                 }
 
-                if (!ended && !stopRequested)
+                if (!removed && !stopRequested)
                 {
                     if (actualHostProcessId > 0 && !IsProcessRunning(actualHostProcessId))
                     {
@@ -539,7 +583,7 @@ namespace TermLink.Agent
 
         private void ProcessConnection(NamedPipeServerStream pipe)
         {
-            while (!ended && pipe.IsConnected)
+            while (!removed && pipe.IsConnected)
             {
                 var frame = LocalFrameCodec.Read(pipe);
                 if (frame == null) break;
@@ -609,7 +653,7 @@ namespace TermLink.Agent
                         short columns;
                         short rows;
                         LocalPayloadCodec.ParseResize(frame.Payload, out columns, out rows);
-                        if (options.ResizeColumns == columns && options.ResizeRows == rows) resizeApplied++;
+                        resizeApplied++;
                         break;
                     case LocalFrameType.Lifecycle:
                         int lifecycleExit;
@@ -621,6 +665,12 @@ namespace TermLink.Agent
                             exitCode = lifecycleExit;
                             Transition(SessionAgentLifecycle.Ended);
                         }
+                        break;
+                    case LocalFrameType.SessionRemoved:
+                        LocalPayloadCodec.ParseSessionRemoved(frame.Payload);
+                        if (!ended)
+                            throw new InvalidDataException("Host removed a session before publishing its ended lifecycle.");
+                        removed = true;
                         break;
                     case LocalFrameType.Gap:
                         break;
@@ -647,11 +697,6 @@ namespace TermLink.Agent
         {
             if (commandsSent) return;
             commandsSent = true;
-            if (options.ResizeColumns > 0)
-            {
-                Send(pipe, LocalFrameType.ResizeRequest,
-                    LocalPayloadCodec.Resize(options.ResizeColumns, options.ResizeRows));
-            }
             if (options.InputBytes != null)
             {
                 for (var attempt = 0; attempt < options.DuplicateInputAttempts; attempt++)
@@ -747,30 +792,6 @@ namespace TermLink.Agent
                         options.SessionId,
                         nextCommandSequence,
                         LocalPayloadCodec.RemoteInputResult(inputId, result)));
-                    return true;
-                }
-                catch (IOException) { return false; }
-                catch (ObjectDisposedException) { return false; }
-            }
-        }
-
-        public bool TrySendResize(short columns, short rows)
-        {
-            if (columns < 1 || rows < 1) return false;
-            lock (commandSync)
-            {
-                NamedPipeServerStream pipe;
-                lock (statusSync) pipe = connectedPipe;
-                if (pipe == null || !pipe.IsConnected) return false;
-                nextCommandSequence = checked(nextCommandSequence + 1);
-                commandSequenceStore.Save(nextCommandSequence);
-                try
-                {
-                    LocalFrameCodec.Write(pipe, new LocalFrame(
-                        LocalFrameType.ResizeRequest,
-                        options.SessionId,
-                        nextCommandSequence,
-                        LocalPayloadCodec.Resize(columns, rows)));
                     return true;
                 }
                 catch (IOException) { return false; }
@@ -1114,7 +1135,29 @@ namespace TermLink.Agent
             out ulong earliestRetainedSequence,
             out ulong latestSequence)
         {
+            bool hasMore;
+            return ReadFrom(
+                resumeFromSequence,
+                int.MaxValue,
+                long.MaxValue,
+                out earliestRetainedSequence,
+                out latestSequence,
+                out hasMore);
+        }
+
+        public IList<LocalFrame> ReadFrom(
+            ulong resumeFromSequence,
+            int maximumEvents,
+            long maximumStoredBytes,
+            out ulong earliestRetainedSequence,
+            out ulong latestSequence,
+            out bool hasMore)
+        {
+            if (maximumEvents < 1) throw new ArgumentOutOfRangeException("maximumEvents");
+            if (maximumStoredBytes < 1) throw new ArgumentOutOfRangeException("maximumStoredBytes");
             var storedChunks = new List<byte[]>();
+            long selectedStoredBytes = 0;
+            hasMore = false;
             lock (sync)
             {
                 latestSequence = lastSequence;
@@ -1134,9 +1177,18 @@ namespace TermLink.Agent
                     var sequence = ParseChunkSequence(chunk);
                     if (sequence > resumeFromSequence)
                     {
+                        if (storedChunks.Count >= maximumEvents ||
+                            (storedChunks.Count > 0 &&
+                             chunk.Length > maximumStoredBytes - selectedStoredBytes))
+                        {
+                            hasMore = true;
+                            break;
+                        }
                         // Read while holding the buffer lock so Trim cannot remove a
                         // chunk after the path snapshot and before decryption.
-                        storedChunks.Add(File.ReadAllBytes(chunk.FullName));
+                        var stored = File.ReadAllBytes(chunk.FullName);
+                        storedChunks.Add(stored);
+                        selectedStoredBytes = checked(selectedStoredBytes + stored.LongLength);
                     }
                 }
             }
@@ -1144,7 +1196,8 @@ namespace TermLink.Agent
             var frames = new List<LocalFrame>(storedChunks.Count);
             foreach (var stored in storedChunks)
             {
-                frames.Add(DecodeStored(stored));
+                try { frames.Add(DecodeStored(stored)); }
+                finally { Array.Clear(stored, 0, stored.Length); }
             }
             return frames;
         }
@@ -1192,6 +1245,7 @@ namespace TermLink.Agent
             long outputBytes = 0;
             var inputFrames = 0;
             var gapFrames = 0;
+            var removedFrames = 0;
             ulong firstSequence = 0;
             ulong lastSequence = 0;
             using (var hash = SHA256.Create())
@@ -1241,6 +1295,11 @@ namespace TermLink.Agent
                     }
                     if (frame.Type == LocalFrameType.Input) inputFrames++;
                     if (frame.Type == LocalFrameType.Gap) gapFrames++;
+                    if (frame.Type == LocalFrameType.SessionRemoved)
+                    {
+                        LocalPayloadCodec.ParseSessionRemoved(frame.Payload);
+                        removedFrames++;
+                    }
                 }
                 var digest = hash.ComputeHash(output.ToArray());
                 return "__BUFFER_RESULT__:session=" + sessionId.ToString("D") +
@@ -1251,6 +1310,7 @@ namespace TermLink.Agent
                     ";output_bytes=" + outputBytes +
                     ";input_frames=" + inputFrames +
                     ";gap_frames=" + gapFrames +
+                    ";removed_frames=" + removedFrames +
                     ";output_sha256=" + ToHex(digest);
             }
         }

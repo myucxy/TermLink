@@ -1,22 +1,45 @@
 [CmdletBinding()]
 param(
     [string]$DotNetPath = 'dotnet',
+    [string]$ArtifactsPath,
     [switch]$PreserveExistingProductionFiles
 )
 
 $ErrorActionPreference = 'Stop'
 $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
 $env:DOTNET_NOLOGO = '1'
+$terminalSnapshotEnvironmentName = 'TERMLINK_ENABLE_TERMINAL_SNAPSHOT_V1'
+$terminalSnapshotEnvironmentBefore = [Environment]::GetEnvironmentVariable(
+    $terminalSnapshotEnvironmentName,
+    [EnvironmentVariableTarget]::Process)
 
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $agentProject = Join-Path $projectRoot 'src\Agent\TermLink.Agent.csproj'
-$agentAssembly = Join-Path $projectRoot 'src\Agent\bin\Release\net8.0-windows\TermLink.Agent.dll'
-$protocolAssembly = Join-Path $projectRoot 'src\Protocol\bin\Release\net8.0\TermLink.Protocol.dll'
+$buildArguments = @('build', $agentProject, '--configuration', 'Release')
+if ([string]::IsNullOrWhiteSpace($ArtifactsPath)) {
+    $agentAssembly = Join-Path $projectRoot 'src\Agent\bin\Release\net8.0-windows\TermLink.Agent.dll'
+    $protocolAssembly = Join-Path $projectRoot 'src\Protocol\bin\Release\net8.0\TermLink.Protocol.dll'
+    $buildArguments += '--no-restore'
+}
+else {
+    $ArtifactsPath = [IO.Path]::GetFullPath($ArtifactsPath)
+    $agentAssembly = Join-Path $ArtifactsPath 'bin\TermLink.Agent\release\TermLink.Agent.dll'
+    $protocolAssembly = Join-Path $ArtifactsPath 'bin\TermLink.Protocol\release\TermLink.Protocol.dll'
+    $buildArguments += @('--artifacts-path', $ArtifactsPath)
+}
 $agentOutput = Split-Path -Parent $agentAssembly
-$build = & $DotNetPath build $agentProject --configuration Release --no-restore 2>&1
+$build = & $DotNetPath @buildArguments 2>&1
 if ($LASTEXITCODE -ne 0) { throw "Agent build failed: $($build -join "`n")" }
 
-$localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+$acceptanceLocalAppDataRoot = [Environment]::GetEnvironmentVariable(
+    'TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT',
+    [EnvironmentVariableTarget]::Process)
+$localAppData = if ([string]::IsNullOrWhiteSpace($acceptanceLocalAppDataRoot)) {
+    [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+}
+else {
+    [IO.Path]::GetFullPath($acceptanceLocalAppDataRoot)
+}
 $termLinkDirectory = Join-Path $localAppData 'TermLink'
 $configPath = Join-Path $termLinkDirectory 'production-config.json'
 $credentialsPath = Join-Path $termLinkDirectory 'production-credentials.dpapi'
@@ -136,8 +159,15 @@ public static class TermLinkProductionValidationAssemblyResolver
 }
 
 function Get-InternalMethod {
-    param([Type]$Type, [string]$Name)
-    $Type.GetMethod($Name, [Reflection.BindingFlags]'Static,Instance,Public,NonPublic')
+    param([Type]$Type, [string]$Name, [int]$ParameterCount = -1)
+    $methods = @($Type.GetMethods([Reflection.BindingFlags]'Static,Instance,Public,NonPublic') |
+        Where-Object {
+            $_.Name -eq $Name -and
+            ($ParameterCount -lt 0 -or $_.GetParameters().Count -eq $ParameterCount)
+        })
+    if ($methods.Count -eq 1) { return $methods[0] }
+    if ($methods.Count -eq 0) { return $null }
+    throw "Ambiguous internal method: $($Type.FullName).$Name"
 }
 
 $service = $null
@@ -149,6 +179,16 @@ try {
     $protocol = [Reflection.Assembly]::LoadFrom($protocolAssembly)
     $runtimeType = $assembly.GetType('TermLink.Agent.ProductionAgentRuntime', $true)
     $tryCreate = Get-InternalMethod $runtimeType 'TryCreate'
+    $normalizeServerOrigin = Get-InternalMethod $runtimeType 'NormalizeServerOrigin'
+    if ($null -eq $normalizeServerOrigin) {
+        throw 'Production runtime Server origin normalization is unavailable.'
+    }
+    $normalizedServerOrigin = [string]$normalizeServerOrigin.Invoke(
+        $null,
+        [object[]]@('HTTPS://discarded@Relay.Example.Test:9443/ignored/path?ignored=1#ignored'))
+    if ($normalizedServerOrigin -ne 'https://relay.example.test:9443') {
+        throw "Production runtime returned a non-canonical Server origin: $normalizedServerOrigin"
+    }
 
     $pendingSessionsField = $runtimeType.GetField('pendingSessions', [Reflection.BindingFlags]'Instance,NonPublic')
     $eventSignalField = $runtimeType.GetField('eventSignal', [Reflection.BindingFlags]'Instance,NonPublic')
@@ -222,6 +262,21 @@ try {
         $localInputKey.Length -lt 8 -or $localInputKey.Length -gt 128) {
         throw 'Local-input lease operation keys are not stable, unique, and server-compatible.'
     }
+    $pcUpsertIdempotencyKey = Get-InternalMethod $runtimeType 'PCUpsertIdempotencyKey'
+    if ($null -eq $pcUpsertIdempotencyKey) {
+        throw 'Production runtime does not derive a content-scoped PC upsert key.'
+    }
+    $pcUpsertId = [Guid]::Parse('abcdef01-2345-6789-abcd-ef0123456789')
+    $pcBodyA = [Text.Encoding]::UTF8.GetBytes('{"name":"PC A","agent_version":"1","key_epoch":1}')
+    $pcBodyB = [Text.Encoding]::UTF8.GetBytes('{"name":"PC A","agent_version":"2","key_epoch":1}')
+    $pcKeyA = [string]$pcUpsertIdempotencyKey.Invoke($null, [object[]]@($pcUpsertId, $pcBodyA))
+    $pcKeyARetry = [string]$pcUpsertIdempotencyKey.Invoke($null, [object[]]@($pcUpsertId, $pcBodyA))
+    $pcKeyB = [string]$pcUpsertIdempotencyKey.Invoke($null, [object[]]@($pcUpsertId, $pcBodyB))
+    if ($pcKeyA -ne $pcKeyARetry -or $pcKeyA -eq $pcKeyB -or
+        $pcKeyA -notmatch ('^pc-upsert-v2-' + $pcUpsertId.ToString('N') + '-[0-9a-f]{32}$') -or
+        $pcKeyA.Length -lt 8 -or $pcKeyA.Length -gt 128) {
+        throw 'PC upsert operation keys are not content-stable, mutation-aware, and server-compatible.'
+    }
     $mapMessageType = Get-InternalMethod $runtimeType 'MapMessageType'
     if ($null -eq $mapMessageType) {
         throw 'Production runtime lifecycle message mapping is unavailable.'
@@ -264,7 +319,7 @@ try {
             $outputKind, $replaySessionId, [uint64]$sequence, $payload))
         $append.Invoke($buffer, [object[]]@($frame)) | Out-Null
     }
-    $read = Get-InternalMethod $bufferType 'ReadFrom'
+    $read = Get-InternalMethod $bufferType 'ReadFrom' 3
     $readArguments = New-Object object[] 3
     $readArguments[0] = [uint64]0
     $readArguments[1] = [uint64]0
@@ -306,8 +361,155 @@ try {
         throw 'Production E2EE lifecycle payload confused a real zero exit with an unknown result.'
     }
     $productionInterrupted = $buildPayload.Invoke($null, [object[]]@($interruptedFrame))
-    if ($productionInterrupted.HasExitCode) {
-        throw 'Production E2EE lifecycle payload attached an exit code before Session end.'
+    if ($productionInterrupted.HasExitCode -or $productionInterrupted.HasTitle) {
+        throw 'Production E2EE lifecycle payload attached metadata owned by another ordered event.'
+    }
+
+    $titleKind = [Enum]::Parse($localFrameKindType, 'Title')
+    $removedKind = [Enum]::Parse($localFrameKindType, 'SessionRemoved')
+    $resizeKind = [Enum]::Parse($localFrameKindType, 'Resize')
+    $titlePayloadMethod = Get-InternalMethod $localPayloadCodec 'Title'
+    $resizePayloadMethod = Get-InternalMethod $localPayloadCodec 'Resize'
+    $removedPayloadMethod = Get-InternalMethod $localPayloadCodec 'SessionRemoved'
+    $titleSession = [Guid]::NewGuid()
+    $synchronizedTitle = 'sensitive-title — 构建完成 🚀'
+    [byte[]]$titlePayload = $titlePayloadMethod.Invoke($null, [object[]]@($synchronizedTitle))
+    $titleFrame = $frameConstructor.Invoke([object[]]@(
+        $titleKind, $titleSession, [uint64]2, $titlePayload))
+    if ($mapMessageType.Invoke($null, [object[]]@($titleFrame)).ToString() -ne 'SessionUpsert') {
+        throw 'Production runtime did not map ordered Title metadata to SessionUpsert.'
+    }
+    $publicTitlePayload = $buildPayload.Invoke($null, [object[]]@($titleFrame))
+    if ($publicTitlePayload.Lifecycle -ne 'CHANGED' -or
+        -not $publicTitlePayload.HasTitle -or $publicTitlePayload.Title -ne $synchronizedTitle -or
+        $publicTitlePayload.TitleCipher.Length -ne 0) {
+        throw 'Production runtime did not publish the exact Unicode title only through the outer E2EE payload.'
+    }
+    [byte[]]$emptyTitlePayload = $titlePayloadMethod.Invoke($null, [object[]]@(''))
+    $emptyTitleFrame = $frameConstructor.Invoke([object[]]@(
+        $titleKind, $titleSession, [uint64]3, $emptyTitlePayload))
+    $publicEmptyTitlePayload = $buildPayload.Invoke($null, [object[]]@($emptyTitleFrame))
+    if (-not $publicEmptyTitlePayload.HasTitle -or $publicEmptyTitlePayload.Title -ne '' -or
+        $publicEmptyTitlePayload.TitleCipher.Length -ne 0) {
+        throw 'Production runtime lost explicit empty-title presence or populated title_cipher.'
+    }
+    [byte[]]$removedPayload = $removedPayloadMethod.Invoke($null, [object[]]@())
+    $removedFrame = $frameConstructor.Invoke([object[]]@(
+        $removedKind, $titleSession, [uint64]6, $removedPayload))
+    if ($mapMessageType.Invoke($null, [object[]]@($removedFrame)).ToString() -ne 'SessionRemoved') {
+        throw 'Production runtime did not map explicit SessionRemoved lifecycle.'
+    }
+    $isTerminalFrame = Get-InternalMethod $runtimeType 'IsTerminalFrame'
+    if ([bool]$isTerminalFrame.Invoke($null, [object[]]@($endedFrame)) -or
+        -not [bool]$isTerminalFrame.Invoke($null, [object[]]@($removedFrame))) {
+        throw 'Production publication terminated before explicit SessionRemoved.'
+    }
+    $buildHistoryEvent = Get-InternalMethod $runtimeType 'BuildHistoryEvent'
+    if ($null -ne $buildHistoryEvent.Invoke($null, [object[]]@($removedFrame))) {
+        throw 'SessionRemoved incorrectly replaced the retained Ended history event.'
+    }
+
+    # Exercise the pure per-session projection. A lifecycle/title event must
+    # retain the PC-observed size, and Session A/B metadata must never mix.
+    $publicationStateType = $runtimeType.GetNestedType('SessionPublicationState', [Reflection.BindingFlags]'NonPublic')
+    $committedEventType = $runtimeType.GetNestedType('CommittedEvent', [Reflection.BindingFlags]'NonPublic')
+    $shellType = $committedEventType.GetField('ShellType').FieldType
+    $powerShell7 = [Enum]::Parse($shellType, 'PowerShell7')
+    $applyPublicationFrame = Get-InternalMethod $runtimeType 'ApplyPublicationFrame'
+    $buildRealtimePayload = Get-InternalMethod $runtimeType 'BuildRealtimePayload'
+    $stateA = [Activator]::CreateInstance($publicationStateType, $true)
+    $stateB = [Activator]::CreateInstance($publicationStateType, $true)
+    $sessionA = [Guid]::NewGuid()
+    $sessionB = [Guid]::NewGuid()
+
+    function Apply-MetadataFrame([object]$state, [object]$frame) {
+        $item = [Activator]::CreateInstance($committedEventType, $true)
+        $committedEventType.GetField('ShellType').SetValue($item, $powerShell7)
+        $committedEventType.GetField('Frame').SetValue($item, $frame)
+        $applyPublicationFrame.Invoke($null, [object[]]@($state, $item, [DateTimeOffset]::UtcNow))
+    }
+
+    [byte[]]$resizeABytes = $resizePayloadMethod.Invoke($null, [object[]]@([int16]132, [int16]43))
+    $resizeA = $frameConstructor.Invoke([object[]]@($resizeKind, $sessionA, [uint64]1, $resizeABytes))
+    $titleA = $frameConstructor.Invoke([object[]]@($titleKind, $sessionA, [uint64]2, $titlePayload))
+    $projectionA = Apply-MetadataFrame $stateA $resizeA
+    $projectionA = Apply-MetadataFrame $stateA $titleA
+    $runningA = $frameConstructor.Invoke([object[]]@(
+        $lifecycleKind, $sessionA, [uint64]3,
+        $lifecyclePayload.Invoke($null, [object[]]@([Enum]::Parse($localLifecycleType, 'Running'), 0))))
+    $projectionA = Apply-MetadataFrame $stateA $runningA
+    $outputA = $frameConstructor.Invoke([object[]]@(
+        $outputKind, $sessionA, [uint64]4, [Text.Encoding]::UTF8.GetBytes('A-only')))
+    $projectionA = Apply-MetadataFrame $stateA $outputA
+    if ($projectionA.Columns -ne 132 -or $projectionA.Rows -ne 43 -or
+        $projectionA.LastOutputSequence -ne 4 -or $projectionA.Title -ne $synchronizedTitle) {
+        throw 'Lifecycle/output metadata reset the authoritative PC size/title projection.'
+    }
+    $realtimeTitle = $buildRealtimePayload.Invoke($null, [object[]]@($titleA, $powerShell7, $projectionA))
+    if ($realtimeTitle.Columns -ne 132 -or $realtimeTitle.Rows -ne 43 -or
+        $realtimeTitle.ShellType -ne 'powershell7' -or
+        -not $realtimeTitle.HasTitle -or $realtimeTitle.Title -ne $synchronizedTitle -or
+        $realtimeTitle.TitleCipher.Length -ne 0) {
+        throw 'Realtime SessionUpsert did not carry complete safe session metadata.'
+    }
+    $buildSessionUpsertBody = Get-InternalMethod $runtimeType 'BuildSessionUpsertBody'
+    [byte[]]$restBody = $buildSessionUpsertBody.Invoke(
+        $null,
+        [object[]]@([Guid]::Parse('12345678-90ab-cdef-1234-567890abcdef'), $projectionA))
+    $restBodyText = [Text.Encoding]::UTF8.GetString($restBody)
+    $restBodyObject = $restBodyText | ConvertFrom-Json
+    $restPropertyNames = @($restBodyObject.PSObject.Properties.Name)
+    if ($restBodyText.Contains('sensitive-title', [StringComparison]::Ordinal) -or
+        $restPropertyNames -contains 'title' -or $restBodyObject.title_cipher -ne '') {
+        throw 'REST Session upsert exposed title plaintext or claimed plaintext was title ciphertext.'
+    }
+    $titleCipherField = $projectionA.GetType().GetField(
+        'TitleCipher',
+        [Reflection.BindingFlags]'Instance,Public,NonPublic')
+    if ($null -eq $titleCipherField) {
+        throw 'Session publication snapshot does not carry a sealed directory title.'
+    }
+    $titleCipherField.SetValue($projectionA, [byte[]]@(1, 2, 3))
+    try {
+        [byte[]]$sealedRestBody = $buildSessionUpsertBody.Invoke(
+            $null,
+            [object[]]@([Guid]::Parse('12345678-90ab-cdef-1234-567890abcdef'), $projectionA))
+        $sealedRestText = [Text.Encoding]::UTF8.GetString($sealedRestBody)
+        $sealedRestObject = $sealedRestText | ConvertFrom-Json
+        if ($sealedRestText.Contains('sensitive-title', [StringComparison]::Ordinal) -or
+            @($sealedRestObject.PSObject.Properties.Name) -contains 'title' -or
+            $sealedRestObject.title_cipher -ne 'AQID') {
+            throw 'REST Session upsert did not carry only the URL-safe multi-recipient title envelope.'
+        }
+    }
+    finally {
+        $titleCipherField.SetValue($projectionA, $null)
+    }
+
+    [byte[]]$resizeBBytes = $resizePayloadMethod.Invoke($null, [object[]]@([int16]91, [int16]27))
+    $resizeB = $frameConstructor.Invoke([object[]]@($resizeKind, $sessionB, [uint64]1, $resizeBBytes))
+    $projectionB = Apply-MetadataFrame $stateB $resizeB
+    $outputB = $frameConstructor.Invoke([object[]]@(
+        $outputKind, $sessionB, [uint64]2, [Text.Encoding]::UTF8.GetBytes('B-only')))
+    $projectionB = Apply-MetadataFrame $stateB $outputB
+    if ($projectionA.SessionId -ne $sessionA -or $projectionB.SessionId -ne $sessionB -or
+        $projectionA.Columns -ne 132 -or $projectionB.Columns -ne 91 -or
+        $projectionA.LastOutputSequence -ne 4 -or $projectionB.LastOutputSequence -ne 2) {
+        throw 'Session A/B metadata or output sequence projections crossed streams.'
+    }
+    $requiresImmediateUpsert = Get-InternalMethod $runtimeType 'RequiresImmediateMetadataUpsert'
+    if (-not [bool]$requiresImmediateUpsert.Invoke($null, [object[]]@($resizeA)) -or
+        -not [bool]$requiresImmediateUpsert.Invoke($null, [object[]]@($titleA)) -or
+        -not [bool]$requiresImmediateUpsert.Invoke($null, [object[]]@($runningA)) -or
+        -not [bool]$requiresImmediateUpsert.Invoke($null, [object[]]@($endedFrame)) -or
+        [bool]$requiresImmediateUpsert.Invoke($null, [object[]]@($outputA)) -or
+        [bool]$requiresImmediateUpsert.Invoke($null, [object[]]@($removedFrame))) {
+        throw 'Session start/title/size no longer upsert immediately or OUTPUT/removal bypassed coalescing semantics.'
+    }
+    $metadataCadence = [TimeSpan]$runtimeType.GetField(
+        'MetadataUpsertCadence', [Reflection.BindingFlags]'Static,NonPublic').GetValue($null)
+    if ($metadataCadence -le [TimeSpan]::Zero -or $metadataCadence -gt [TimeSpan]::FromSeconds(1)) {
+        throw 'OUTPUT metadata upsert cadence is missing or too stale.'
     }
 
     $withoutConfig = $tryCreate.Invoke($null, [object[]]@())
@@ -361,6 +563,10 @@ try {
     $serviceConstructor = $serviceType.GetConstructor(
         [Reflection.BindingFlags]'Instance,Public,NonPublic', $null,
         [Type[]]@($optionsType), $null)
+    [Environment]::SetEnvironmentVariable(
+        $terminalSnapshotEnvironmentName,
+        '1',
+        [EnvironmentVariableTarget]::Process)
     $service = $serviceConstructor.Invoke([object[]]@($options))
 
     $runtime = $serviceType.GetField('productionRuntime', [Reflection.BindingFlags]'Instance,NonPublic').GetValue($service)
@@ -376,11 +582,16 @@ try {
     $pairingChallengeType.GetProperty('TargetFingerprint').SetValue($pairingChallenge, 'validation-fingerprint')
     $pairingChallengeType.GetProperty('Permission').SetValue($pairingChallenge, 'CONTROL')
     $pairingChallengeField.SetValue($runtime, $pairingChallenge)
-    $pairingSnapshot = $snapshotStatus.Invoke($runtime, [object[]]@()).PairingChallenge
+    $productionSnapshot = $snapshotStatus.Invoke($runtime, [object[]]@())
+    $pairingSnapshot = $productionSnapshot.PairingChallenge
     if ($null -eq $pairingSnapshot -or
         $pairingSnapshot.TargetFingerprint -ne 'validation-fingerprint' -or
         $pairingSnapshot.Permission -ne 'CONTROL') {
         throw 'Production status snapshot dropped pairing authorization metadata.'
+    }
+    if ($productionSnapshot.ServerOrigin -ne 'https://127.0.0.1:1' -or
+        -not $productionSnapshot.TerminalSnapshotEnabled) {
+        throw 'Production status snapshot did not map the configured Server origin and Terminal Snapshot capability.'
     }
     $pairingChallengeField.SetValue($runtime, $null)
     $httpProofMethod = $runtime.GetType().GetMethods([Reflection.BindingFlags]'Instance,NonPublic') |
@@ -439,8 +650,8 @@ try {
     if (-not [Object]::ReferenceEquals($runtimeRegistry, $serviceRegistry)) {
         throw 'Production runtime was not attached to the SessionRegistry owned by the service.'
     }
-    if ($null -eq (Get-InternalMethod $serviceRegistry.GetType() 'TrySendResize')) {
-        throw 'Production runtime Registry does not expose remote resize dispatch.'
+    if ($null -ne (Get-InternalMethod $serviceRegistry.GetType() 'TrySendResize')) {
+        throw 'Production runtime Registry still exposes Android-to-ConPTY resize dispatch.'
     }
 
     $service.Dispose()
@@ -469,6 +680,10 @@ try {
     Write-Output 'Production runtime no-config and lifecycle validation passed.'
 }
 finally {
+    [Environment]::SetEnvironmentVariable(
+        $terminalSnapshotEnvironmentName,
+        $terminalSnapshotEnvironmentBefore,
+        [EnvironmentVariableTarget]::Process)
     [TermLinkProductionValidationAssemblyResolver]::Detach()
     if ($null -ne $identity) { $identity.Dispose() }
     if ($null -ne $service) { try { $service.Dispose() } catch { } }

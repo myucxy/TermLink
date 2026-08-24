@@ -59,11 +59,11 @@ public final class TerminalRenderer {
         }
     }
 
-    /** Render the terminal to a canvas with at a specified row scroll, and an optional rectangular selection. */
-    public final void render(TerminalEmulator mEmulator, Canvas canvas, int topRow,
+    /** Render the terminal viewport with a specified row scroll and optional selection. */
+    public final void render(TerminalEmulator mEmulator, Canvas canvas, int topRow, int visibleRows,
                              int selectionY1, int selectionY2, int selectionX1, int selectionX2) {
         final boolean reverseVideo = mEmulator.isReverseVideo();
-        final int endRow = topRow + mEmulator.mRows;
+        final int endRow = Math.min(mEmulator.mRows, topRow + Math.max(1, visibleRows));
         final int columns = mEmulator.mColumns;
         final int cursorCol = mEmulator.getCursorCol();
         final int cursorRow = mEmulator.getCursorRow();

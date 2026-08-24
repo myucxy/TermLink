@@ -31,22 +31,57 @@ import (
 	"github.com/termlink/termlink/server/internal/store"
 )
 
-const maxJSONBody = 1 << 20
+// A 1 MiB opaque session-title envelope expands to roughly 1.34 MiB when the
+// Windows Agent transports it as base64url JSON. Keep the HTTP bound above the
+// cryptographic envelope bound while still rejecting unbounded request bodies.
+const maxJSONBody = 2 << 20
+
+const maxSessionTitleCipherBytes = 1 << 20
+
+const maxHistoryPageTokenBytes = 2048
+
+const maxTranscriptPublicationPageCount = 100_000
+
+const (
+	boundedEventReplayFormat                   = store.HistoryFormatBoundedEventReplay
+	terminalSnapshotFormat                     = store.HistoryFormatTerminalSnapshot
+	terminalTranscriptFormat                   = store.HistoryFormatTerminalTranscript
+	maxTerminalSnapshotCiphertextBytes   int64 = store.MaxSnapshotCiphertextBytes
+	maxTerminalTranscriptCiphertextBytes int64 = store.MaxTranscriptCiphertextBytes
+)
 
 const pairingCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 type API struct {
-	Store        *store.Postgres
-	Valkey       *kv.Valkey
-	Tokens       auth.TokenVerifier
-	Auth         auth.Middleware
-	SubjectKey   []byte
-	TokenKey     []byte
-	History      HistoryObjectStore
-	Billing      *billing.Registry
-	Registration *auth.DirectRegistrationService
-	ClientConfig ClientConfiguration
-	Clock        func() time.Time
+	Store           *store.Postgres
+	Valkey          *kv.Valkey
+	Tokens          auth.TokenVerifier
+	Auth            auth.Middleware
+	SubjectKey      []byte
+	TokenKey        []byte
+	History         HistoryObjectStore
+	Billing         *billing.Registry
+	Registration    *auth.DirectRegistrationService
+	ClientConfig    ClientConfiguration
+	Clock           func() time.Time
+	historyPages    historyPageLister
+	historyUploads  historyUploadStore
+	transcriptPages transcriptPageLister
+	fileOperations  fileOperationStore
+}
+
+type historyPageLister interface {
+	ListHistoryPage(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, store.HistoryPageRequest) (store.HistoryPage, error)
+}
+
+type historyUploadStore interface {
+	CreateHistoryUpload(context.Context, uuid.UUID, uuid.UUID, store.HistoryUploadRecord) error
+	PendingHistoryUpload(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID) (store.HistoryUploadRecord, error)
+	CommitHistoryUpload(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID) (store.HistoryItem, error)
+}
+
+type transcriptPageLister interface {
+	ListTranscriptPage(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, store.TranscriptPageRequest) (store.TranscriptPage, error)
 }
 
 type ClientConfiguration struct {
@@ -83,6 +118,13 @@ func (a *API) Handler() http.Handler {
 	trusted.HandleFunc("POST /v1/devices/{id}/revoke", a.revokeDevice)
 	trusted.HandleFunc("GET /v1/pcs", a.listPCs)
 	trusted.HandleFunc("PUT /v1/pcs/{id}", a.upsertPC)
+	trusted.HandleFunc("POST /v1/pcs/{pcId}/file-operations", a.createFileOperation)
+	trusted.HandleFunc("POST /v1/pcs/{pcId}/file-operations/claim", a.claimFileOperation)
+	trusted.HandleFunc("GET /v1/pcs/{pcId}/file-operations/{operationId}", a.getFileOperation)
+	trusted.HandleFunc("DELETE /v1/pcs/{pcId}/file-operations/{operationId}", a.cancelFileOperation)
+	trusted.HandleFunc("POST /v1/pcs/{pcId}/file-operations/{operationId}/upload", a.uploadFileOperation)
+	trusted.HandleFunc("POST /v1/pcs/{pcId}/file-operations/{operationId}/renew", a.renewFileOperation)
+	trusted.HandleFunc("POST /v1/pcs/{pcId}/file-operations/{operationId}/complete", a.completeFileOperation)
 	trusted.HandleFunc("GET /v1/pcs/{id}/grants", a.listPCGrants)
 	trusted.HandleFunc("POST /v1/pcs/{id}/grants", a.putGrant)
 	trusted.HandleFunc("DELETE /v1/pcs/{id}/grants/{deviceId}", a.deleteGrant)
@@ -154,9 +196,7 @@ func (a *API) registerAccount(w http.ResponseWriter, r *http.Request) {
 	// Keep registration attempts bounded across replicas. The address is
 	// hashed before it becomes a Valkey key and is never logged or returned.
 	if a.Valkey != nil {
-		address := strings.TrimSpace(strings.Split(r.RemoteAddr, ":")[0])
-		digest := sha256.Sum256([]byte(address))
-		allowed, err := a.Valkey.Consume(r.Context(), "account-register:"+hex.EncodeToString(digest[:]), "attempt", time.Minute)
+		allowed, err := a.Valkey.Consume(r.Context(), accountRegistrationRateLimitScope(r), "attempt", time.Minute)
 		if err != nil {
 			writeError(w, r, http.StatusServiceUnavailable, "REGISTRATION_UNAVAILABLE", err)
 			return
@@ -507,9 +547,10 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Name         string `json:"name"`
-		AgentVersion string `json:"agent_version"`
-		KeyEpoch     int64  `json:"key_epoch"`
+		Name                    string `json:"name"`
+		AgentVersion            string `json:"agent_version"`
+		KeyEpoch                int64  `json:"key_epoch"`
+		SessionHeartbeatCapable bool   `json:"session_heartbeat_capable"`
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		writeError(w, r, 400, "INVALID_REQUEST", err)
@@ -519,7 +560,10 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 400, "INVALID_REQUEST", errors.New("invalid PC metadata"))
 		return
 	}
-	if err := a.Store.UpsertPC(r.Context(), p.UserID, p.Device.ID, store.PCRecord{ID: id, Name: input.Name, AgentVersion: input.AgentVersion, KeyEpoch: input.KeyEpoch}); err != nil {
+	if err := a.Store.UpsertPC(r.Context(), p.UserID, p.Device.ID, store.PCRecord{
+		ID: id, Name: input.Name, AgentVersion: input.AgentVersion, KeyEpoch: input.KeyEpoch,
+		SessionHeartbeatCapable: input.SessionHeartbeatCapable,
+	}); err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
@@ -559,7 +603,10 @@ func (a *API) putGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if input.Permission == "VIEW" {
-		if sessions, listErr := a.Store.ListSessions(r.Context(), p.UserID, p.Device.ID, pcID); listErr == nil {
+		// This is control-plane cleanup, not the live session directory. Include
+		// ended and stale-PC rows so a recently downgraded device does not leave
+		// a Valkey lease behind until its TTL expires.
+		if sessions, listErr := a.Store.ListSessionsIncludingEnded(r.Context(), p.UserID, p.Device.ID, pcID); listErr == nil {
 			for _, session := range sessions {
 				lease, leaseErr := a.Valkey.GetLease(r.Context(), session.ID)
 				if leaseErr == nil && lease.HolderDeviceID == deviceID {
@@ -624,7 +671,20 @@ func (a *API) listSessions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 400, "INVALID_PC_ID", err)
 		return
 	}
-	items, err := a.Store.ListSessions(r.Context(), p.UserID, p.Device.ID, pcID)
+	includeEnded := false
+	if raw := r.URL.Query().Get("include_ended"); raw != "" {
+		includeEnded, err = strconv.ParseBool(raw)
+		if err != nil {
+			writeError(w, r, http.StatusBadRequest, "INVALID_INCLUDE_ENDED", err)
+			return
+		}
+	}
+	var items []store.SessionRecord
+	if includeEnded {
+		items, err = a.Store.ListSessionsIncludingEnded(r.Context(), p.UserID, p.Device.ID, pcID)
+	} else {
+		items, err = a.Store.ListSessions(r.Context(), p.UserID, p.Device.ID, pcID)
+	}
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
@@ -639,14 +699,15 @@ func (a *API) upsertSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		PCID               string     `json:"pc_id"`
-		ShellType          string     `json:"shell_type"`
-		TitleCipher        string     `json:"title_cipher"`
-		State              string     `json:"state"`
-		Columns            int        `json:"columns"`
-		Rows               int        `json:"rows"`
-		LastOutputSequence uint64     `json:"last_output_seq"`
-		EndedAt            *time.Time `json:"ended_at"`
+		PCID                    string     `json:"pc_id"`
+		ShellType               string     `json:"shell_type"`
+		TitleCipher             *string    `json:"title_cipher"`
+		State                   string     `json:"state"`
+		Columns                 int        `json:"columns"`
+		Rows                    int        `json:"rows"`
+		LastOutputSequence      uint64     `json:"last_output_seq"`
+		EndedAt                 *time.Time `json:"ended_at"`
+		SessionHeartbeatCapable bool       `json:"session_heartbeat_capable"`
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		writeError(w, r, 400, "INVALID_REQUEST", err)
@@ -657,7 +718,7 @@ func (a *API) upsertSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 400, "INVALID_PC_ID", err)
 		return
 	}
-	title, err := base64.RawURLEncoding.DecodeString(input.TitleCipher)
+	title, err := decodeSessionTitleCipher(input.TitleCipher)
 	if err != nil {
 		writeError(w, r, 400, "INVALID_CIPHERTEXT", err)
 		return
@@ -670,12 +731,35 @@ func (a *API) upsertSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 400, "INVALID_SIZE", errors.New("invalid terminal size"))
 		return
 	}
-	item := store.SessionRecord{ID: sessionID, PCID: pcID, ShellType: input.ShellType, TitleCipher: title, State: input.State, Columns: input.Columns, Rows: input.Rows, LastOutputSequence: input.LastOutputSequence, EndedAt: input.EndedAt}
+	item := store.SessionRecord{
+		ID: sessionID, PCID: pcID, ShellType: input.ShellType, TitleCipher: title,
+		State: input.State, Columns: input.Columns, Rows: input.Rows,
+		LastOutputSequence: input.LastOutputSequence, EndedAt: input.EndedAt,
+		SessionHeartbeatCapable: input.SessionHeartbeatCapable,
+	}
 	if err := a.Store.UpsertSession(r.Context(), p.UserID, p.Device.ID, item); err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": sessionID})
+}
+
+func decodeSessionTitleCipher(encoded *string) ([]byte, error) {
+	// Both an absent field and an explicit empty string mean "no title update".
+	// The Windows Agent deliberately sends an empty string when it cannot seal
+	// a fresh recipient-bound title; returning nil preserves the stored value in
+	// Postgres. A non-empty envelope is the only value that may replace it.
+	if encoded == nil || *encoded == "" {
+		return nil, nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(*encoded)
+	if err != nil {
+		return nil, err
+	}
+	if len(decoded) > maxSessionTitleCipherBytes {
+		return nil, errors.New("session title ciphertext exceeds limit")
+	}
+	return decoded, nil
 }
 
 func (a *API) subscribeSession(w http.ResponseWriter, r *http.Request) {
@@ -917,17 +1001,22 @@ func (a *API) createHistoryUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Kind             string  `json:"kind"`
-		KeyID            string  `json:"key_id"`
-		CiphertextSHA256 string  `json:"ciphertext_sha256"`
-		SizeBytes        int64   `json:"size_bytes"`
-		StartSequence    *uint64 `json:"start_seq"`
-		EndSequence      *uint64 `json:"end_seq"`
-		SnapshotSequence *uint64 `json:"snapshot_seq"`
-		Rows             *int    `json:"rows"`
-		Columns          *int    `json:"columns"`
-		FormatName       *string `json:"format_name"`
-		FormatVersion    *int    `json:"format_version"`
+		Kind                          string  `json:"kind"`
+		KeyID                         string  `json:"key_id"`
+		CiphertextSHA256              string  `json:"ciphertext_sha256"`
+		SizeBytes                     int64   `json:"size_bytes"`
+		StartSequence                 *uint64 `json:"start_seq"`
+		EndSequence                   *uint64 `json:"end_seq"`
+		SnapshotSequence              *uint64 `json:"snapshot_seq"`
+		AsOfSnapshotSequence          *uint64 `json:"as_of_snapshot_seq"`
+		FirstLineID                   *uint64 `json:"first_line_id"`
+		LastLineID                    *uint64 `json:"last_line_id"`
+		Rows                          *int    `json:"rows"`
+		Columns                       *int    `json:"columns"`
+		FormatName                    *string `json:"format_name"`
+		FormatVersion                 *int    `json:"format_version"`
+		TranscriptInitialBeforeLineID *uint64 `json:"transcript_initial_before_line_id"`
+		TranscriptPageCount           *int    `json:"transcript_page_count"`
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err)
@@ -942,28 +1031,75 @@ func (a *API) createHistoryUpload(w http.ResponseWriter, r *http.Request) {
 		CiphertextSHA256: digest, SizeBytes: input.SizeBytes, ExpiresAt: a.now().Add(10 * time.Minute)}
 	if input.Kind == "CHUNK" {
 		if input.StartSequence == nil || input.EndSequence == nil || *input.StartSequence < 1 || *input.EndSequence < *input.StartSequence ||
-			*input.StartSequence > math.MaxInt64 || *input.EndSequence > math.MaxInt64 || input.SnapshotSequence != nil || input.Rows != nil || input.Columns != nil || input.FormatName != nil || input.FormatVersion != nil {
+			*input.StartSequence > math.MaxInt64 || *input.EndSequence > math.MaxInt64 || input.SnapshotSequence != nil ||
+			input.AsOfSnapshotSequence != nil || input.FirstLineID != nil || input.LastLineID != nil ||
+			input.Rows != nil || input.Columns != nil || input.FormatName != nil || input.FormatVersion != nil ||
+			input.TranscriptInitialBeforeLineID != nil || input.TranscriptPageCount != nil {
 			writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_RANGE", errors.New("invalid chunk range"))
 			return
 		}
 		start, end := int64(*input.StartSequence), int64(*input.EndSequence)
 		item.StartSequence, item.EndSequence = &start, &end
 	} else if input.Kind == "SNAPSHOT" {
-		if input.SnapshotSequence == nil || *input.SnapshotSequence > math.MaxInt64 || input.Rows == nil || input.Columns == nil ||
-			*input.Rows < 1 || *input.Rows > 65535 || *input.Columns < 1 || *input.Columns > 65535 || input.FormatName == nil ||
-			*input.FormatName != "BOUNDED_EVENT_REPLAY" || input.FormatVersion == nil || *input.FormatVersion != 1 ||
-			input.StartSequence != nil || input.EndSequence != nil {
+		var transcriptInitialBeforeLineID *int64
+		if input.TranscriptInitialBeforeLineID != nil {
+			if *input.TranscriptInitialBeforeLineID > math.MaxInt64 {
+				writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_SNAPSHOT", errors.New("invalid transcript publication metadata"))
+				return
+			}
+			value := int64(*input.TranscriptInitialBeforeLineID)
+			transcriptInitialBeforeLineID = &value
+		}
+		if input.SnapshotSequence == nil || input.Rows == nil || input.Columns == nil || input.FormatName == nil ||
+			input.FormatVersion == nil || input.StartSequence != nil || input.EndSequence != nil ||
+			input.AsOfSnapshotSequence != nil || input.FirstLineID != nil || input.LastLineID != nil ||
+			validateHistorySnapshotMetadata(*input.SnapshotSequence, input.SizeBytes, *input.Rows, *input.Columns,
+				*input.FormatName, *input.FormatVersion) != nil ||
+			validateSnapshotTranscriptPublicationMetadata(*input.FormatName, transcriptInitialBeforeLineID, input.TranscriptPageCount) != nil {
 			writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_SNAPSHOT", errors.New("unsupported snapshot metadata"))
 			return
 		}
 		sequence := int64(*input.SnapshotSequence)
 		item.SnapshotSequence, item.Rows, item.Columns, item.FormatName, item.FormatVersion = &sequence, input.Rows, input.Columns, input.FormatName, input.FormatVersion
+		item.TranscriptInitialBeforeLineID, item.TranscriptPageCount = transcriptInitialBeforeLineID, input.TranscriptPageCount
+	} else if input.Kind == "TRANSCRIPT" {
+		if input.AsOfSnapshotSequence == nil || input.FirstLineID == nil || input.LastLineID == nil ||
+			input.FormatName == nil || input.FormatVersion == nil || input.StartSequence != nil ||
+			input.EndSequence != nil || input.SnapshotSequence != nil || input.Rows != nil || input.Columns != nil ||
+			input.TranscriptInitialBeforeLineID != nil || input.TranscriptPageCount != nil ||
+			validateHistoryTranscriptMetadata(*input.AsOfSnapshotSequence, *input.FirstLineID, *input.LastLineID,
+				input.SizeBytes, *input.FormatName, *input.FormatVersion) != nil {
+			writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_TRANSCRIPT", errors.New("unsupported transcript metadata"))
+			return
+		}
+		asOf, first, last := int64(*input.AsOfSnapshotSequence), int64(*input.FirstLineID), int64(*input.LastLineID)
+		item.AsOfSnapshotSequence, item.FirstLineID, item.LastLineID = &asOf, &first, &last
+		item.FormatName, item.FormatVersion = input.FormatName, input.FormatVersion
 	} else {
 		writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_KIND", errors.New("invalid history kind"))
 		return
 	}
+	formatName := ""
+	if item.FormatName != nil {
+		formatName = *item.FormatName
+	}
+	recipientID, recipientEpoch, recipientErr := store.ParseHistoryRecipientKeyID(item.Kind, formatName, item.KeyID)
+	if recipientErr != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_KEY_ID", recipientErr)
+		return
+	}
+	item.RecipientDeviceID = recipientID
+	item.RecipientKeyEpoch = recipientEpoch
 	item.ObjectKey = fmt.Sprintf("accounts/%s/sessions/%s/%s/%s.bin", p.UserID, sessionID, strings.ToLower(input.Kind), item.ID)
-	if err := a.Store.CreateHistoryUpload(r.Context(), p.UserID, p.Device.ID, item); err != nil {
+	uploadStore := a.historyUploads
+	if uploadStore == nil && a.Store != nil {
+		uploadStore = a.Store
+	}
+	if uploadStore == nil {
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", errors.New("history upload store is unavailable"))
+		return
+	}
+	if err := uploadStore.CreateHistoryUpload(r.Context(), p.UserID, p.Device.ID, item); err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
@@ -974,6 +1110,32 @@ func (a *API) createHistoryUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"upload_id": item.ID, "upload": upload, "expires_at": item.ExpiresAt})
+}
+
+func validateHistorySnapshotMetadata(sequence uint64, sizeBytes int64, rows, columns int, formatName string, formatVersion int) error {
+	if sequence > math.MaxInt64 {
+		return store.ErrInvalidHistorySnapshot
+	}
+	return store.ValidateHistorySnapshotMetadata(int64(sequence), sizeBytes, rows, columns, formatName, formatVersion)
+}
+
+func validateHistoryTranscriptMetadata(asOfSnapshotSequence, firstLineID, lastLineID uint64, sizeBytes int64, formatName string, formatVersion int) error {
+	if asOfSnapshotSequence > math.MaxInt64 || firstLineID > math.MaxInt64 || lastLineID > math.MaxInt64 {
+		return store.ErrInvalidHistoryTranscript
+	}
+	return store.ValidateHistoryTranscriptMetadata(int64(asOfSnapshotSequence), int64(firstLineID), int64(lastLineID),
+		sizeBytes, formatName, formatVersion)
+}
+
+func validateSnapshotTranscriptPublicationMetadata(formatName string, initialBeforeLineID *int64, pageCount *int) error {
+	if initialBeforeLineID == nil && pageCount == nil {
+		return nil
+	}
+	if initialBeforeLineID == nil || pageCount == nil || formatName != terminalSnapshotFormat ||
+		*initialBeforeLineID < 1 || *pageCount < 0 || *pageCount > maxTranscriptPublicationPageCount {
+		return store.ErrInvalidHistorySnapshot
+	}
+	return nil
 }
 
 func (a *API) commitHistoryUpload(w http.ResponseWriter, r *http.Request) {
@@ -992,16 +1154,47 @@ func (a *API) commitHistoryUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_UPLOAD_ID", err)
 		return
 	}
-	upload, err := a.Store.PendingHistoryUpload(r.Context(), p.UserID, p.Device.ID, sessionID, uploadID)
+	uploadStore := a.historyUploads
+	if uploadStore == nil && a.Store != nil {
+		uploadStore = a.Store
+	}
+	if uploadStore == nil {
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", errors.New("history upload store is unavailable"))
+		return
+	}
+	upload, err := uploadStore.PendingHistoryUpload(r.Context(), p.UserID, p.Device.ID, sessionID, uploadID)
 	if err != nil {
 		writeStoreError(w, r, err)
+		return
+	}
+	if upload.Kind == "SNAPSHOT" && (upload.SnapshotSequence == nil || upload.Rows == nil || upload.Columns == nil ||
+		upload.FormatName == nil || upload.FormatVersion == nil || upload.StartSequence != nil || upload.EndSequence != nil ||
+		upload.AsOfSnapshotSequence != nil || upload.FirstLineID != nil || upload.LastLineID != nil ||
+		validateHistorySnapshotMetadata(uint64(*upload.SnapshotSequence), upload.SizeBytes, *upload.Rows, *upload.Columns,
+			*upload.FormatName, *upload.FormatVersion) != nil ||
+		validateSnapshotTranscriptPublicationMetadata(*upload.FormatName, upload.TranscriptInitialBeforeLineID, upload.TranscriptPageCount) != nil) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_SNAPSHOT", store.ErrInvalidHistorySnapshot)
+		return
+	}
+	if upload.Kind == "TRANSCRIPT" && (upload.AsOfSnapshotSequence == nil || upload.FirstLineID == nil ||
+		upload.LastLineID == nil || upload.FormatName == nil || upload.FormatVersion == nil ||
+		upload.StartSequence != nil || upload.EndSequence != nil || upload.SnapshotSequence != nil ||
+		upload.Rows != nil || upload.Columns != nil || upload.TranscriptInitialBeforeLineID != nil ||
+		upload.TranscriptPageCount != nil ||
+		validateHistoryTranscriptMetadata(uint64(*upload.AsOfSnapshotSequence), uint64(*upload.FirstLineID),
+			uint64(*upload.LastLineID), upload.SizeBytes, *upload.FormatName, *upload.FormatVersion) != nil) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_TRANSCRIPT", store.ErrInvalidHistoryTranscript)
+		return
+	}
+	if upload.Kind == "CHUNK" && (upload.TranscriptInitialBeforeLineID != nil || upload.TranscriptPageCount != nil) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_RANGE", errors.New("invalid chunk range"))
 		return
 	}
 	if err := a.History.VerifyCiphertext(r.Context(), upload.ObjectKey, upload.SizeBytes, upload.CiphertextSHA256); err != nil {
 		writeError(w, r, http.StatusUnprocessableEntity, "HISTORY_INTEGRITY_FAILED", err)
 		return
 	}
-	item, err := a.Store.CommitHistoryUpload(r.Context(), p.UserID, p.Device.ID, sessionID, uploadID)
+	item, err := uploadStore.CommitHistoryUpload(r.Context(), p.UserID, p.Device.ID, sessionID, uploadID)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
@@ -1016,25 +1209,19 @@ func (a *API) deleteSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_SESSION_ID", err)
 		return
 	}
-	keys, err := a.Store.SessionHistoryObjectKeys(r.Context(), p.UserID, p.Device.ID, sessionID)
-	if err != nil {
-		writeStoreError(w, r, err)
-		return
-	}
-	if len(keys) > 0 && a.History == nil {
-		writeError(w, r, http.StatusServiceUnavailable, "HISTORY_UNAVAILABLE", errors.New("history deletion is unavailable"))
-		return
-	}
-	for _, key := range keys {
-		if err := a.History.Delete(r.Context(), key); err != nil {
-			slog.Error("delete history ciphertext failed", "trace_id", traceID(r.Context()), "error", err)
-			writeError(w, r, http.StatusServiceUnavailable, "HISTORY_DELETE_PENDING", err)
-			return
-		}
-	}
 	if err := a.Store.MarkSessionDeleted(r.Context(), p.UserID, p.Device.ID, sessionID, traceID(r.Context())); err != nil {
 		writeStoreError(w, r, err)
 		return
+	}
+	// PostgreSQL is the authority fence. Once its tombstone commits, no new
+	// lease can be authorized for this session, so it is safe to remove any
+	// stale live-arbitration entry without risking deletion of a replacement.
+	// A retry remains idempotent if Valkey is temporarily unavailable here.
+	if a.Valkey != nil {
+		if _, _, err := a.Valkey.ForceRelease(r.Context(), sessionID); err != nil {
+			writeError(w, r, http.StatusServiceUnavailable, "LEASE_UNAVAILABLE", err)
+			return
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1046,30 +1233,537 @@ func (a *API) listHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 400, "INVALID_SESSION_ID", err)
 		return
 	}
-	items, err := a.Store.ListHistory(r.Context(), p.UserID, p.Device.ID, sessionID)
-	if err != nil {
-		writeStoreError(w, r, err)
+	if a.transcriptHistoryRequested(r, p.UserID, p.Device.ID, sessionID) {
+		a.listTranscriptHistory(w, r, p.UserID, p.Device.ID, sessionID)
 		return
 	}
+	pageRequest, cursorRequest, queryErr := a.parseHistoryPageRequest(r, p.UserID, p.Device.ID, sessionID)
+	if queryErr != nil {
+		writeError(w, r, http.StatusBadRequest, queryErr.Code, queryErr)
+		return
+	}
+	pageStore := a.historyPages
+	if pageStore == nil && a.Store != nil {
+		pageStore = a.Store
+	}
+	if pageStore == nil {
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", errors.New("history page store is unavailable"))
+		return
+	}
+	page, listErr := pageStore.ListHistoryPage(r.Context(), p.UserID, p.Device.ID, sessionID, pageRequest)
+	if listErr != nil {
+		switch {
+		case errors.Is(listErr, store.ErrHistoryAnchorAhead):
+			code := "INVALID_HISTORY_AS_OF"
+			if cursorRequest {
+				code = "INVALID_HISTORY_CURSOR"
+			}
+			writeError(w, r, http.StatusBadRequest, code, listErr)
+		case errors.Is(listErr, store.ErrInvalidHistoryPage):
+			writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_PAGE", listErr)
+		default:
+			writeStoreError(w, r, listErr)
+		}
+		return
+	}
+	// The PostgreSQL implementation already returns at most request.Limit
+	// items. Keep a handler-side bound as defense in depth so a replacement
+	// implementation cannot accidentally trigger unbounded URL signing.
+	if len(page.Items) > pageRequest.Limit {
+		page.Items = page.Items[:pageRequest.Limit]
+		page.HasMore = true
+	}
+	asOf, tokenErr := a.encodeHistoryAsOf(p.UserID, p.Device.ID, sessionID, page.AsOfRevision)
+	if tokenErr != nil {
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", tokenErr)
+		return
+	}
+	var nextCursor any
+	if page.HasMore && len(page.Items) > 0 {
+		last := page.Items[len(page.Items)-1]
+		next, encodeErr := a.encodeHistoryCursor(
+			p.UserID, p.Device.ID, sessionID, pageRequest.Kind, pageRequest.FormatName, page.AsOfRevision, last,
+		)
+		if encodeErr != nil {
+			writeError(w, r, http.StatusInternalServerError, "INTERNAL", encodeErr)
+			return
+		}
+		nextCursor = next
+	}
+	// Requests without page selectors historically received the same top-level
+	// items/plaintext_index response. Preserve their item metadata shape while
+	// sourcing the data from the bounded first page.
+	responseItems, responseErr := a.historyResponseItems(r.Context(), page.Items, historyPaginationRequested(r))
+	if responseErr != nil {
+		writeError(w, r, http.StatusServiceUnavailable, "HISTORY_UNAVAILABLE", responseErr)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": responseItems, "as_of": asOf, "next_cursor": nextCursor,
+		"has_more": page.HasMore, "order": "sequence_desc", "plaintext_index": false,
+	})
+}
+
+func (a *API) transcriptHistoryRequested(r *http.Request, userID, deviceID, sessionID uuid.UUID) bool {
+	query := r.URL.Query()
+	if _, present := query["as_of_snapshot_seq"]; present {
+		return true
+	}
+	if _, present := query["before_line_id"]; present {
+		return true
+	}
+	if kinds, present := query["kind"]; present {
+		for _, kind := range kinds {
+			if strings.EqualFold(kind, string(store.HistoryKindTranscript)) {
+				return true
+			}
+		}
+	}
+	if cursors := query["cursor"]; len(cursors) == 1 {
+		_, err := a.decodeTranscriptCursor(cursors[0], userID, deviceID, sessionID)
+		return err == nil
+	}
+	return false
+}
+
+func (a *API) listTranscriptHistory(w http.ResponseWriter, r *http.Request, userID, deviceID, sessionID uuid.UUID) {
+	request, cursorRequest, queryErr := a.parseTranscriptPageRequest(r, userID, deviceID, sessionID)
+	if queryErr != nil {
+		writeError(w, r, http.StatusBadRequest, queryErr.Code, queryErr)
+		return
+	}
+	pageStore := a.transcriptPages
+	if pageStore == nil && a.Store != nil {
+		pageStore = a.Store
+	}
+	if pageStore == nil {
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", errors.New("transcript page store is unavailable"))
+		return
+	}
+	page, err := pageStore.ListTranscriptPage(r.Context(), userID, deviceID, sessionID, request)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrHistoryAnchorAhead):
+			code := "INVALID_HISTORY_PAGE"
+			if cursorRequest {
+				code = "INVALID_HISTORY_CURSOR"
+			}
+			writeError(w, r, http.StatusBadRequest, code, err)
+		case errors.Is(err, store.ErrInvalidHistoryPage):
+			writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_PAGE", err)
+		default:
+			writeStoreError(w, r, err)
+		}
+		return
+	}
+	responseItems, err := a.historyResponseItems(r.Context(), page.Items, true)
+	if err != nil {
+		writeError(w, r, http.StatusServiceUnavailable, "HISTORY_UNAVAILABLE", err)
+		return
+	}
+	var nextCursor any
+	if page.Ready && page.HasMore && len(page.Items) == 1 {
+		next, err := a.encodeTranscriptCursor(userID, deviceID, sessionID, page.AsOfRevision,
+			request.AsOfSnapshotSequence, int64(page.Items[0].FirstLineID))
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "INTERNAL", err)
+			return
+		}
+		nextCursor = next
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": responseItems, "as_of_snapshot_seq": uint64(request.AsOfSnapshotSequence),
+		"next_cursor": nextCursor, "has_more": page.HasMore,
+		"ready": page.Ready, "order": "line_id_desc_pages", "plaintext_index": false,
+	})
+}
+
+type historyPageQueryError struct {
+	Code string
+}
+
+func (e *historyPageQueryError) Error() string { return e.Code }
+
+type historyAsOfToken struct {
+	Version   int    `json:"v"`
+	Purpose   string `json:"p"`
+	UserID    string `json:"u"`
+	DeviceID  string `json:"d"`
+	SessionID string `json:"s"`
+	Revision  int64  `json:"r"`
+}
+
+type historyCursorToken struct {
+	Version       int               `json:"v"`
+	Purpose       string            `json:"p"`
+	UserID        string            `json:"u"`
+	DeviceID      string            `json:"d"`
+	SessionID     string            `json:"s"`
+	Kind          store.HistoryKind `json:"k"`
+	FormatName    string            `json:"f,omitempty"`
+	Revision      int64             `json:"a"`
+	Sequence      int64             `json:"q"`
+	BeforeKind    store.HistoryKind `json:"b"`
+	HistoryItemID string            `json:"i"`
+}
+
+type transcriptCursorToken struct {
+	Version              int    `json:"v"`
+	Purpose              string `json:"p"`
+	UserID               string `json:"u"`
+	DeviceID             string `json:"d"`
+	SessionID            string `json:"s"`
+	Revision             int64  `json:"r"`
+	AsOfSnapshotSequence int64  `json:"a"`
+	BeforeLineID         int64  `json:"b"`
+}
+
+func historyPaginationRequested(r *http.Request) bool {
+	query := r.URL.Query()
+	for _, name := range []string{"limit", "kind", "format_name", "as_of", "cursor", "as_of_snapshot_seq", "before_line_id"} {
+		if _, ok := query[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *API) parseHistoryPageRequest(r *http.Request, userID, deviceID, sessionID uuid.UUID) (store.HistoryPageRequest, bool, *historyPageQueryError) {
+	query := r.URL.Query()
+	for name := range query {
+		if name != "limit" && name != "kind" && name != "format_name" && name != "as_of" && name != "cursor" && name != "legacy" {
+			return store.HistoryPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_PAGE"}
+		}
+	}
+	// Older clients may send legacy=true. It no longer selects an unbounded
+	// implementation; accept one compatibility value and use the normal first
+	// page below.
+	if _, legacyPresent, legacyErr := singleHistoryQueryValue(query, "legacy"); legacyErr != nil {
+		return store.HistoryPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_PAGE"}
+	} else if legacyPresent && historyPaginationRequested(r) {
+		return store.HistoryPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_PAGE"}
+	}
+	limit := 50
+	if raw, present, valueErr := singleHistoryQueryValue(query, "limit"); valueErr != nil {
+		valueErr.Code = "INVALID_HISTORY_LIMIT"
+		return store.HistoryPageRequest{}, false, valueErr
+	} else if present {
+		parsed, parseErr := strconv.ParseUint(raw, 10, 8)
+		if parseErr != nil || parsed < 1 || parsed > 100 {
+			return store.HistoryPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_LIMIT"}
+		}
+		limit = int(parsed)
+	}
+	cursor, hasCursor, cursorValueErr := singleHistoryQueryValue(query, "cursor")
+	if cursorValueErr != nil {
+		cursorValueErr.Code = "INVALID_HISTORY_CURSOR"
+		return store.HistoryPageRequest{}, true, cursorValueErr
+	}
+	if hasCursor {
+		if _, hasKind := query["kind"]; hasKind {
+			return store.HistoryPageRequest{}, true, &historyPageQueryError{Code: "INVALID_HISTORY_CURSOR"}
+		}
+		if _, hasAsOf := query["as_of"]; hasAsOf {
+			return store.HistoryPageRequest{}, true, &historyPageQueryError{Code: "INVALID_HISTORY_CURSOR"}
+		}
+		if _, hasFormat := query["format_name"]; hasFormat {
+			return store.HistoryPageRequest{}, true, &historyPageQueryError{Code: "INVALID_HISTORY_CURSOR"}
+		}
+		payload, decodeErr := a.decodeHistoryCursor(cursor, userID, deviceID, sessionID)
+		if decodeErr != nil {
+			return store.HistoryPageRequest{}, true, &historyPageQueryError{Code: "INVALID_HISTORY_CURSOR"}
+		}
+		itemID, parseErr := uuid.Parse(payload.HistoryItemID)
+		if parseErr != nil {
+			return store.HistoryPageRequest{}, true, &historyPageQueryError{Code: "INVALID_HISTORY_CURSOR"}
+		}
+		return store.HistoryPageRequest{
+			Kind: payload.Kind, FormatName: payload.FormatName, Limit: limit, AsOfRevision: &payload.Revision,
+			Before: &store.HistoryPosition{Sequence: payload.Sequence, Kind: payload.BeforeKind, ID: itemID},
+		}, true, nil
+	}
+
+	kind := store.HistoryKindAll
+	if raw, present, kindErr := singleHistoryQueryValue(query, "kind"); kindErr != nil {
+		kindErr.Code = "INVALID_HISTORY_KIND"
+		return store.HistoryPageRequest{}, false, kindErr
+	} else if present {
+		kind = store.HistoryKind(strings.ToLower(raw))
+		if kind != store.HistoryKindAll && kind != store.HistoryKindChunk && kind != store.HistoryKindSnapshot {
+			return store.HistoryPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_KIND"}
+		}
+	}
+	formatName := ""
+	if raw, present, formatErr := singleHistoryQueryValue(query, "format_name"); formatErr != nil {
+		formatErr.Code = "INVALID_HISTORY_FORMAT"
+		return store.HistoryPageRequest{}, false, formatErr
+	} else if present {
+		if kind != store.HistoryKindSnapshot ||
+			raw != store.HistoryFormatBoundedEventReplay && raw != store.HistoryFormatTerminalSnapshot {
+			return store.HistoryPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_FORMAT"}
+		}
+		formatName = raw
+	}
+	var revision *int64
+	if raw, present, asOfErr := singleHistoryQueryValue(query, "as_of"); asOfErr != nil {
+		asOfErr.Code = "INVALID_HISTORY_AS_OF"
+		return store.HistoryPageRequest{}, false, asOfErr
+	} else if present {
+		payload, decodeErr := a.decodeHistoryAsOf(raw, userID, deviceID, sessionID)
+		if decodeErr != nil {
+			return store.HistoryPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_AS_OF"}
+		}
+		revision = &payload.Revision
+	}
+	return store.HistoryPageRequest{Kind: kind, FormatName: formatName, Limit: limit, AsOfRevision: revision}, false, nil
+}
+
+func (a *API) parseTranscriptPageRequest(r *http.Request, userID, deviceID, sessionID uuid.UUID) (store.TranscriptPageRequest, bool, *historyPageQueryError) {
+	query := r.URL.Query()
+	for name := range query {
+		if name != "limit" && name != "kind" && name != "as_of_snapshot_seq" && name != "before_line_id" && name != "cursor" {
+			return store.TranscriptPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_PAGE"}
+		}
+	}
+	if raw, present, valueErr := singleHistoryQueryValue(query, "limit"); valueErr != nil {
+		valueErr.Code = "INVALID_HISTORY_LIMIT"
+		return store.TranscriptPageRequest{}, false, valueErr
+	} else if present && raw != "1" {
+		return store.TranscriptPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_LIMIT"}
+	}
+
+	cursor, hasCursor, cursorErr := singleHistoryQueryValue(query, "cursor")
+	if cursorErr != nil {
+		cursorErr.Code = "INVALID_HISTORY_CURSOR"
+		return store.TranscriptPageRequest{}, true, cursorErr
+	}
+	if hasCursor {
+		if _, present := query["kind"]; present {
+			return store.TranscriptPageRequest{}, true, &historyPageQueryError{Code: "INVALID_HISTORY_CURSOR"}
+		}
+		if _, present := query["as_of_snapshot_seq"]; present {
+			return store.TranscriptPageRequest{}, true, &historyPageQueryError{Code: "INVALID_HISTORY_CURSOR"}
+		}
+		if _, present := query["before_line_id"]; present {
+			return store.TranscriptPageRequest{}, true, &historyPageQueryError{Code: "INVALID_HISTORY_CURSOR"}
+		}
+		payload, err := a.decodeTranscriptCursor(cursor, userID, deviceID, sessionID)
+		if err != nil {
+			return store.TranscriptPageRequest{}, true, &historyPageQueryError{Code: "INVALID_HISTORY_CURSOR"}
+		}
+		return store.TranscriptPageRequest{
+			AsOfSnapshotSequence: payload.AsOfSnapshotSequence,
+			BeforeLineID:         &payload.BeforeLineID,
+			AsOfRevision:         &payload.Revision,
+			Limit:                1,
+		}, true, nil
+	}
+
+	kind, hasKind, kindErr := singleHistoryQueryValue(query, "kind")
+	if kindErr != nil || !hasKind || !strings.EqualFold(kind, string(store.HistoryKindTranscript)) {
+		return store.TranscriptPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_KIND"}
+	}
+	asOfText, hasAsOf, asOfErr := singleHistoryQueryValue(query, "as_of_snapshot_seq")
+	if asOfErr != nil || !hasAsOf {
+		return store.TranscriptPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_PAGE"}
+	}
+	asOf, err := strconv.ParseUint(asOfText, 10, 64)
+	if err != nil || asOf < 1 || asOf > math.MaxInt64 {
+		return store.TranscriptPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_PAGE"}
+	}
+	var before *int64
+	if beforeText, present, beforeErr := singleHistoryQueryValue(query, "before_line_id"); beforeErr != nil {
+		return store.TranscriptPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_PAGE"}
+	} else if present {
+		value, err := strconv.ParseUint(beforeText, 10, 64)
+		if err != nil || value < 1 || value > math.MaxInt64 {
+			return store.TranscriptPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_PAGE"}
+		}
+		converted := int64(value)
+		before = &converted
+	}
+	return store.TranscriptPageRequest{
+		AsOfSnapshotSequence: int64(asOf), BeforeLineID: before, Limit: 1,
+	}, false, nil
+}
+
+func singleHistoryQueryValue(query map[string][]string, name string) (string, bool, *historyPageQueryError) {
+	values, present := query[name]
+	if !present {
+		return "", false, nil
+	}
+	if len(values) != 1 || values[0] == "" {
+		return "", true, &historyPageQueryError{Code: "INVALID_HISTORY_PAGE"}
+	}
+	return values[0], true, nil
+}
+
+func (a *API) encodeHistoryAsOf(userID, deviceID, sessionID uuid.UUID, revision int64) (string, error) {
+	payload := historyAsOfToken{Version: 1, Purpose: "history-as-of", UserID: userID.String(), DeviceID: deviceID.String(), SessionID: sessionID.String(), Revision: revision}
+	return a.encodeHistoryPageToken("TERMLINK-HISTORY-ASOF-V1", payload)
+}
+
+func (a *API) decodeHistoryAsOf(token string, userID, deviceID, sessionID uuid.UUID) (historyAsOfToken, error) {
+	var payload historyAsOfToken
+	if err := a.decodeHistoryPageToken("TERMLINK-HISTORY-ASOF-V1", token, &payload); err != nil {
+		return historyAsOfToken{}, err
+	}
+	if payload.Version != 1 || payload.Purpose != "history-as-of" || payload.UserID != userID.String() || payload.DeviceID != deviceID.String() ||
+		payload.SessionID != sessionID.String() || payload.Revision < 0 {
+		return historyAsOfToken{}, errors.New("invalid history as-of token")
+	}
+	return payload, nil
+}
+
+func (a *API) encodeHistoryCursor(userID, deviceID, sessionID uuid.UUID, kind store.HistoryKind, formatName string, revision int64, item store.HistoryItem) (string, error) {
+	beforeKind := store.HistoryKind(item.Kind)
+	sequence := int64(item.EndSequence)
+	if beforeKind == store.HistoryKindSnapshot {
+		sequence = int64(item.SnapshotSequence)
+	}
+	payload := historyCursorToken{
+		Version: 1, Purpose: "history-cursor", UserID: userID.String(), DeviceID: deviceID.String(), SessionID: sessionID.String(),
+		Kind: kind, FormatName: formatName, Revision: revision, Sequence: sequence, BeforeKind: beforeKind, HistoryItemID: item.ID.String(),
+	}
+	return a.encodeHistoryPageToken("TERMLINK-HISTORY-CURSOR-V1", payload)
+}
+
+func (a *API) decodeHistoryCursor(token string, userID, deviceID, sessionID uuid.UUID) (historyCursorToken, error) {
+	var payload historyCursorToken
+	if err := a.decodeHistoryPageToken("TERMLINK-HISTORY-CURSOR-V1", token, &payload); err != nil {
+		return historyCursorToken{}, err
+	}
+	validKind := payload.Kind == store.HistoryKindAll || payload.Kind == store.HistoryKindChunk || payload.Kind == store.HistoryKindSnapshot
+	validBeforeKind := payload.BeforeKind == store.HistoryKindChunk || payload.BeforeKind == store.HistoryKindSnapshot
+	validFormat := payload.FormatName == "" || payload.Kind == store.HistoryKindSnapshot &&
+		(payload.FormatName == store.HistoryFormatBoundedEventReplay || payload.FormatName == store.HistoryFormatTerminalSnapshot)
+	if payload.Version != 1 || payload.Purpose != "history-cursor" || payload.UserID != userID.String() || payload.DeviceID != deviceID.String() ||
+		payload.SessionID != sessionID.String() || payload.Revision < 0 || payload.Sequence < 0 || !validKind ||
+		!validBeforeKind || !validFormat || (payload.Kind != store.HistoryKindAll && payload.Kind != payload.BeforeKind) {
+		return historyCursorToken{}, errors.New("invalid history cursor")
+	}
+	itemID, err := uuid.Parse(payload.HistoryItemID)
+	if err != nil || itemID.String() != payload.HistoryItemID {
+		return historyCursorToken{}, errors.New("invalid history cursor item")
+	}
+	return payload, nil
+}
+
+func (a *API) encodeTranscriptCursor(userID, deviceID, sessionID uuid.UUID, revision, asOfSnapshotSequence, beforeLineID int64) (string, error) {
+	if revision < 0 || asOfSnapshotSequence < 1 || beforeLineID < 1 {
+		return "", errors.New("invalid transcript cursor")
+	}
+	payload := transcriptCursorToken{
+		Version: 1, Purpose: "transcript-cursor", UserID: userID.String(), DeviceID: deviceID.String(),
+		SessionID: sessionID.String(), Revision: revision, AsOfSnapshotSequence: asOfSnapshotSequence,
+		BeforeLineID: beforeLineID,
+	}
+	return a.encodeHistoryPageToken("TERMLINK-TRANSCRIPT-CURSOR-V1", payload)
+}
+
+func (a *API) decodeTranscriptCursor(token string, userID, deviceID, sessionID uuid.UUID) (transcriptCursorToken, error) {
+	var payload transcriptCursorToken
+	if err := a.decodeHistoryPageToken("TERMLINK-TRANSCRIPT-CURSOR-V1", token, &payload); err != nil {
+		return transcriptCursorToken{}, err
+	}
+	if payload.Version != 1 || payload.Purpose != "transcript-cursor" ||
+		payload.UserID != userID.String() || payload.DeviceID != deviceID.String() ||
+		payload.SessionID != sessionID.String() || payload.Revision < 0 ||
+		payload.AsOfSnapshotSequence < 1 || payload.BeforeLineID < 1 {
+		return transcriptCursorToken{}, errors.New("invalid transcript cursor")
+	}
+	return payload, nil
+}
+
+func (a *API) encodeHistoryPageToken(domain string, value any) (string, error) {
+	if len(a.TokenKey) < 32 {
+		return "", errors.New("history pagination signing key is unavailable")
+	}
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	mac := hmac.New(sha256.New, a.TokenKey)
+	_, _ = mac.Write([]byte(domain + "\n" + encoded))
+	return encoded + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+}
+
+func (a *API) decodeHistoryPageToken(domain, token string, destination any) error {
+	if len(a.TokenKey) < 32 || len(token) == 0 || len(token) > maxHistoryPageTokenBytes || strings.Count(token, ".") != 1 {
+		return errors.New("invalid history page token")
+	}
+	encoded, signatureText, _ := strings.Cut(token, ".")
+	signature, err := base64.RawURLEncoding.DecodeString(signatureText)
+	if err != nil || len(signature) != sha256.Size {
+		return errors.New("invalid history page signature")
+	}
+	mac := hmac.New(sha256.New, a.TokenKey)
+	_, _ = mac.Write([]byte(domain + "\n" + encoded))
+	if !hmac.Equal(signature, mac.Sum(nil)) {
+		return errors.New("invalid history page signature")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || len(payload) == 0 || len(payload) > maxHistoryPageTokenBytes {
+		return errors.New("invalid history page payload")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("single history page payload required")
+	}
+	return nil
+}
+
+func (a *API) historyResponseItems(ctx context.Context, items []store.HistoryItem, paged bool) ([]map[string]any, error) {
 	responseItems := make([]map[string]any, 0, len(items))
 	for _, item := range items {
 		if a.History == nil {
-			writeError(w, r, http.StatusServiceUnavailable, "HISTORY_UNAVAILABLE", errors.New("history object store is disabled"))
-			return
+			return nil, errors.New("history object store is disabled")
 		}
-		download, err := a.History.PresignGet(r.Context(), item.ObjectKey, 5*time.Minute)
+		download, err := a.History.PresignGet(ctx, item.ObjectKey, 5*time.Minute)
 		if err != nil {
-			writeError(w, r, http.StatusServiceUnavailable, "HISTORY_UNAVAILABLE", err)
-			return
+			return nil, err
 		}
-		responseItems = append(responseItems, map[string]any{
-			"kind": item.Kind, "id": item.ID, "start_seq": item.StartSequence, "end_seq": item.EndSequence,
-			"snapshot_seq": item.SnapshotSequence, "key_id": item.KeyID,
-			"ciphertext_sha256": base64.RawURLEncoding.EncodeToString(item.CiphertextSHA256), "size_bytes": item.SizeBytes,
-			"format_name": item.FormatName, "format_version": item.FormatVersion, "created_at": item.CreatedAt, "download": download,
-		})
+		response := map[string]any{
+			"kind": item.Kind, "id": item.ID, "key_id": item.KeyID,
+			"ciphertext_sha256": base64.RawURLEncoding.EncodeToString(item.CiphertextSHA256),
+			"size_bytes":        item.SizeBytes, "created_at": item.CreatedAt, "download": download,
+		}
+		if paged {
+			if item.Kind == string(store.HistoryKindSnapshot) {
+				response["snapshot_seq"] = item.SnapshotSequence
+				response["rows"] = item.Rows
+				response["columns"] = item.Columns
+				response["format_name"] = item.FormatName
+				response["format_version"] = item.FormatVersion
+			} else if item.Kind == string(store.HistoryKindTranscript) {
+				response["as_of_snapshot_seq"] = item.AsOfSnapshotSequence
+				response["first_line_id"] = item.FirstLineID
+				response["last_line_id"] = item.LastLineID
+				response["format_name"] = item.FormatName
+				response["format_version"] = item.FormatVersion
+			} else {
+				response["start_seq"] = item.StartSequence
+				response["end_seq"] = item.EndSequence
+			}
+		} else {
+			response["start_seq"] = item.StartSequence
+			response["end_seq"] = item.EndSequence
+			response["snapshot_seq"] = item.SnapshotSequence
+			response["format_name"] = item.FormatName
+			response["format_version"] = item.FormatVersion
+			if item.Kind == string(store.HistoryKindSnapshot) {
+				response["rows"] = item.Rows
+				response["columns"] = item.Columns
+			}
+		}
+		responseItems = append(responseItems, response)
 	}
-	writeJSON(w, 200, map[string]any{"items": responseItems, "plaintext_index": false})
+	return responseItems, nil
 }
 func (a *API) listPlans(w http.ResponseWriter, r *http.Request) {
 	version, plans, err := a.Store.PublishedPlans(r.Context())
@@ -1349,7 +2043,14 @@ func decodeJSON(r *http.Request, destination any) error {
 	if r.Body == nil {
 		return errors.New("JSON body required")
 	}
-	decoder := json.NewDecoder(io.LimitReader(r.Body, maxJSONBody+1))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBody+1))
+	if err != nil {
+		return err
+	}
+	if len(body) > maxJSONBody {
+		return errors.New("JSON body exceeds limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
 		return err
@@ -1369,6 +2070,14 @@ func writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, r, 404, "NOT_FOUND", err)
+	case errors.Is(err, store.ErrSessionActive):
+		writeError(w, r, http.StatusConflict, "SESSION_ACTIVE", err)
+	case errors.Is(err, store.ErrInvalidHistorySnapshot):
+		writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_SNAPSHOT", err)
+	case errors.Is(err, store.ErrInvalidHistoryTranscript):
+		writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_TRANSCRIPT", err)
+	case errors.Is(err, store.ErrInvalidHistoryRecipient):
+		writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_KEY_ID", err)
 	case errors.Is(err, store.ErrConflict):
 		writeError(w, r, 409, "CONFLICT", err)
 	case errors.Is(err, store.ErrDenied):

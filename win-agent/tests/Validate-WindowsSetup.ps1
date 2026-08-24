@@ -18,19 +18,24 @@ function Assert-True {
 function Invoke-Setup {
     param(
         [Parameter(Mandatory)][string]$SetupPath,
-        [Parameter(Mandatory)][string[]]$Arguments
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [int]$ExpectedExitCode = 0,
+        [string]$WorkingDirectory
     )
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $SetupPath
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
+    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+        $start.WorkingDirectory = $WorkingDirectory
+    }
     foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }
     $process = [Diagnostics.Process]::Start($start)
     Assert-True ($null -ne $process) 'The setup process did not start.'
     try {
         Assert-True $process.WaitForExit(120000) 'The setup process timed out.'
-        Assert-True ($process.ExitCode -eq 0) `
-            "The setup process failed with exit code $($process.ExitCode)."
+        Assert-True ($process.ExitCode -eq $ExpectedExitCode) `
+            "The setup process returned exit code $($process.ExitCode), expected $ExpectedExitCode."
     }
     finally {
         $process.Dispose()
@@ -69,11 +74,26 @@ $installRootValueExisted = $null -ne $installState -and
     $null -ne $installState.PSObject.Properties['InstallRoot']
 $installRootValueBefore = if ($installRootValueExisted) { [string]$installState.InstallRoot } else { $null }
 $installed = $false
+$relocationProbe = $null
 $rsa = $null
 $certificate = $null
 [IO.Directory]::CreateDirectory($workRoot) | Out-Null
 
 try {
+    # Isolate the validation from an existing user-owned TermLink fragment.
+    # The exact original bytes are restored in finally even when validation
+    # fails, while the test installation gets a clean ownership boundary.
+    if ($fragmentExisted) {
+        Remove-Item -LiteralPath $fragmentPath -Force
+    }
+    # The real setup validation intentionally installs into a temporary root.
+    # Hide only the saved current-user root while the test runs so the
+    # uninstall-first relocation guard does not mistake this isolated lifecycle
+    # for a user-requested move. The exact value is restored in finally.
+    if ($installRootValueExisted) {
+        Remove-ItemProperty -LiteralPath $installStateKeyPath -Name 'InstallRoot' -Force
+    }
+
     $passwordText = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(24))
     $password = ConvertTo-SecureString $passwordText -AsPlainText -Force
     $rsa = [Security.Cryptography.RSA]::Create(3072)
@@ -115,13 +135,13 @@ try {
         'The setup build did not report a self-contained embedded payload.'
 
     Invoke-Setup -SetupPath $setupPath -Arguments @(
-        '--install-dir', $installRoot, '--no-startup', '--quiet')
+        '--install-dir', $installRoot, '--no-startup', '--no-launch', '--quiet')
     $installed = $true
     foreach ($name in @(
-        'TermLink.Agent.exe',
         'TermLink.SessionHost.exe',
-        'TermLink.Tray.exe',
+        'TermLink.exe',
         'TermLink.Updater.exe',
+        'TermLink.Agent.dll',
         'TermLink.UpdatePublisher.cer',
         'TermLink.Uninstall.exe',
         'coreclr.dll',
@@ -130,6 +150,27 @@ try {
         Assert-True (Test-Path -LiteralPath (Join-Path $installRoot $name) -PathType Leaf) `
             "Installed setup payload is missing: $name"
     }
+    foreach ($name in @(
+        'TermLink.Agent.exe',
+        'TermLink.Agent.deps.json',
+        'TermLink.Agent.runtimeconfig.json'
+    )) {
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $installRoot $name))) `
+            "Installed setup payload contains obsolete standalone Agent file: $name"
+    }
+    $expectedProductExecutables = @('TermLink.exe', 'TermLink.SessionHost.exe', 'TermLink.Updater.exe')
+    $installedProductExecutables = @(Get-ChildItem -LiteralPath $installRoot -File -Filter 'TermLink*.exe' |
+        Where-Object { $_.Name -cne 'TermLink.Uninstall.exe' } |
+        Select-Object -ExpandProperty Name)
+    Assert-True ($installedProductExecutables.Count -eq $expectedProductExecutables.Count -and
+        @($installedProductExecutables | Where-Object { $expectedProductExecutables -cnotcontains $_ }).Count -eq 0) `
+        "Installed setup contains an unexpected product executable: $($installedProductExecutables -join ', ')"
+    $trayAssemblyPath = Join-Path $installRoot 'TermLink.dll'
+    Assert-True (Test-Path -LiteralPath $trayAssemblyPath -PathType Leaf) `
+        'Installed setup payload is missing: TermLink.dll'
+    $trayAssemblyVersion = [Reflection.AssemblyName]::GetAssemblyName($trayAssemblyPath).Version.ToString()
+    Assert-True ([string]::Equals($trayAssemblyVersion, $Version, [StringComparison]::Ordinal)) `
+        "Installed Tray assembly version is '$trayAssemblyVersion', expected '$Version'."
 
     Assert-True (Test-Path -LiteralPath $fragmentPath -PathType Leaf) `
         'The setup did not create the Windows Terminal fragment.'
@@ -160,7 +201,7 @@ try {
     $shortcutShell = New-Object -ComObject WScript.Shell
     foreach ($shortcut in @($desktopShortcuts[0], $startMenuShortcuts[0])) {
         $shortcutTarget = $shortcutShell.CreateShortcut($shortcut.FullName).TargetPath
-        Assert-True ([string]::Equals($shortcutTarget, (Join-Path $installRoot 'TermLink.Tray.exe'),
+        Assert-True ([string]::Equals($shortcutTarget, (Join-Path $installRoot 'TermLink.exe'),
                 [StringComparison]::OrdinalIgnoreCase)) `
             "Shortcut target is incorrect: $($shortcut.FullName)"
     }
@@ -178,14 +219,119 @@ try {
     Assert-True ([string]::Equals($afterInstallRoot, $installRoot, [StringComparison]::OrdinalIgnoreCase)) `
         'The setup did not remember the selected installation directory.'
 
+    # Exercise the real executable's relocation guard while a process from A is
+    # running. B must not be created, the old process must not be stopped, and
+    # the old installed bytes must remain unchanged. --no-launch keeps this
+    # lifecycle independent from any user-owned Tray already running.
+    $relocationRoot = Join-Path $workRoot 'Relocated TermLink'
+    $oldMarkerPath = Join-Path $installRoot '.termlink-install.json'
+    $oldTrayAssemblyPath = Join-Path $installRoot 'TermLink.dll'
+    $oldMarkerHash = (Get-FileHash -LiteralPath $oldMarkerPath -Algorithm SHA256).Hash
+    $oldTrayAssemblyHash = (Get-FileHash -LiteralPath $oldTrayAssemblyPath -Algorithm SHA256).Hash
+    $relocationProbePath = Join-Path $installRoot 'TermLink.RelocationProbe.exe'
+    Copy-Item -LiteralPath (Join-Path ([Environment]::SystemDirectory) 'ping.exe') `
+        -Destination $relocationProbePath
+    $relocationProbe = Start-Process -FilePath $relocationProbePath `
+        -ArgumentList @('127.0.0.1', '-t') -PassThru -WindowStyle Hidden
+    Start-Sleep -Milliseconds 250
+    Assert-True (-not $relocationProbe.HasExited) `
+        'The relocation running-process probe did not remain active.'
     Invoke-Setup -SetupPath $setupPath -Arguments @(
-        '--install-dir', $installRoot, '--no-startup', '--quiet')
+        '--install-dir', $relocationRoot, '--no-startup', '--no-launch', '--quiet') `
+        -ExpectedExitCode 1 -WorkingDirectory $installRoot
+    Assert-True (-not $relocationProbe.HasExited) `
+        'The rejected relocation stopped a process from the existing installation.'
+    Assert-True (-not (Test-Path -LiteralPath $relocationRoot)) `
+        'The rejected relocation created the new installation directory.'
+    Assert-True (
+        (Get-FileHash -LiteralPath $oldMarkerPath -Algorithm SHA256).Hash -ceq $oldMarkerHash -and
+        (Get-FileHash -LiteralPath $oldTrayAssemblyPath -Algorithm SHA256).Hash -ceq $oldTrayAssemblyHash) `
+        'The rejected relocation changed the existing installation.'
+    $relocationProbe.Kill($true)
+    Assert-True $relocationProbe.WaitForExit(5000) `
+        'The validation relocation probe did not stop during test cleanup.'
+    $relocationProbe.Dispose()
+    $relocationProbe = $null
+    Remove-Item -LiteralPath $relocationProbePath -Force
+
+    # Force the real upgrade path to encounter an obsolete TermLink-owned
+    # Fragment. This must be replaced as a whole even though the existing
+    # install marker no longer owns the stale bytes.
+    $staleHostPath = 'C:\Obsolete TermLink\TermLink.SessionHost.exe'
+    $staleExtraProfileGuid = '{8f3dff3b-9401-52e8-999a-49066cfefea0}'
+    $staleFragment = [ordered]@{
+        stale_top_level = 'must be removed by the upgrade'
+        profiles = @(
+            [ordered]@{
+                guid = $mandatoryGuids[0]
+                name = 'Stale TermLink CMD'
+                commandline = '"' + $staleHostPath + '" --stale'
+                startingDirectory = 'C:\Obsolete TermLink'
+                hidden = $true
+                stale_profile_field = 'must be removed by the upgrade'
+            },
+            [ordered]@{
+                guid = $staleExtraProfileGuid
+                name = 'Stale Extra Profile'
+                commandline = 'cmd.exe /k echo stale'
+                startingDirectory = '%USERPROFILE%'
+                hidden = $false
+            }
+        )
+    }
+    [IO.File]::WriteAllText(
+        $fragmentPath,
+        ($staleFragment | ConvertTo-Json -Depth 6) + [Environment]::NewLine,
+        [Text.UTF8Encoding]::new($false))
+
+    Invoke-Setup -SetupPath $setupPath -Arguments @(
+        '--install-dir', $installRoot, '--no-startup', '--no-launch', '--terminate-running', '--quiet') `
+        -WorkingDirectory $installRoot
+
+    $upgradedFragmentText = [IO.File]::ReadAllText($fragmentPath, [Text.Encoding]::UTF8)
+    Assert-True (-not $upgradedFragmentText.Contains($staleHostPath, [StringComparison]::OrdinalIgnoreCase)) `
+        'The upgrade retained the obsolete SessionHost path.'
+    Assert-True (-not $upgradedFragmentText.Contains('stale_top_level', [StringComparison]::Ordinal) -and
+        -not $upgradedFragmentText.Contains('stale_profile_field', [StringComparison]::Ordinal) -and
+        -not $upgradedFragmentText.Contains($staleExtraProfileGuid, [StringComparison]::OrdinalIgnoreCase)) `
+        'The upgrade merged with the stale Fragment instead of replacing it completely.'
+    $upgradedFragment = $upgradedFragmentText | ConvertFrom-Json
+    $upgradedTopLevelProperties = @($upgradedFragment.PSObject.Properties.Name)
+    Assert-True ($upgradedTopLevelProperties.Count -eq 1 -and
+        $upgradedTopLevelProperties[0] -ceq 'profiles') `
+        "The upgraded Fragment contains unexpected top-level fields: $($upgradedTopLevelProperties -join ', ')"
+    $upgradedProfiles = @($upgradedFragment.profiles)
+    Assert-True ($upgradedProfiles.Count -eq $profiles.Count) `
+        'The upgrade retained an extra stale Terminal profile or removed a generated profile.'
+    $allowedProfileProperties = @('guid', 'name', 'commandline', 'startingDirectory', 'hidden')
+    foreach ($profile in $upgradedProfiles) {
+        $unexpectedProperties = @($profile.PSObject.Properties.Name |
+            Where-Object { $_ -cnotin $allowedProfileProperties })
+        Assert-True ($unexpectedProperties.Count -eq 0) `
+            "The upgraded profile contains stale fields: $($unexpectedProperties -join ', ')"
+        Assert-True ($profile.commandline.StartsWith(
+                $expectedHostPrefix, [StringComparison]::OrdinalIgnoreCase)) `
+            "Upgraded Terminal profile does not use the current SessionHost: $($profile.guid)"
+    }
+    $upgradedMarker = Get-Content -Raw -LiteralPath (Join-Path $installRoot '.termlink-install.json') |
+        ConvertFrom-Json
+    $upgradedFragmentHash = (Get-FileHash -LiteralPath $fragmentPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    Assert-True ([string]::Equals(
+            [string]$upgradedMarker.TerminalFragmentPath,
+            [IO.Path]::GetFullPath($fragmentPath),
+            [StringComparison]::OrdinalIgnoreCase) -and
+        [string]::Equals(
+            [string]$upgradedMarker.TerminalFragmentSha256,
+            $upgradedFragmentHash,
+            [StringComparison]::OrdinalIgnoreCase)) `
+        'The upgrade marker does not own the completely replaced Terminal Fragment.'
     # Exercise the legacy-upgrade path and the installed uninstaller: remove
     # the new registry hint, then let the in-place uninstaller delegate through
     # a temporary copy so it can delete its own installation directory safely.
     Remove-ItemProperty -LiteralPath $installStateKeyPath -Name 'InstallRoot' -Force -ErrorAction SilentlyContinue
     $uninstallerPath = Join-Path $installRoot 'TermLink.Uninstall.exe'
-    $uninstallProcess = Start-Process -FilePath $uninstallerPath -PassThru -WindowStyle Hidden
+    $uninstallProcess = Start-Process -FilePath $uninstallerPath -PassThru -WindowStyle Hidden `
+        -WorkingDirectory $installRoot
     Assert-True $uninstallProcess.WaitForExit(30000) 'The installed uninstaller did not return.'
     $uninstallProcess.Dispose()
     $uninstallDeadline = [DateTime]::UtcNow.AddSeconds(60)
@@ -211,10 +357,15 @@ try {
         self_contained_payload = $true
         embedded_payload = $true
         selected_install_directory_applied = $true
+        tray_assembly_version = $trayAssemblyVersion
         terminal_profile_count = $profiles.Count
+        terminal_fragment_stale_upgrade_overwrite = $true
         terminal_fragment_owned_cleanup = $true
         startup_unchanged_under_no_startup = $true
         upgrade_in_place = $true
+        inherited_install_working_directory_detached = $true
+        cross_directory_upgrade_rejected = $true
+        relocation_rejection_preserved_running_install = $true
         previous_install_directory_auto_discovered = $true
         installed_uninstaller = $true
         uninstall = $true
@@ -229,6 +380,16 @@ try {
     Write-Output "Single-file Windows setup validation passed. Evidence: $resolvedEvidence"
 }
 finally {
+    if ($null -ne $relocationProbe) {
+        try {
+            if (-not $relocationProbe.HasExited) {
+                $relocationProbe.Kill($true)
+                [void]$relocationProbe.WaitForExit(5000)
+            }
+        }
+        catch { }
+        finally { $relocationProbe.Dispose() }
+    }
     if ($installed -and (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
         try { Invoke-Setup -SetupPath $setupPath -Arguments @('--uninstall', $installRoot, '--quiet') }
         catch { Write-Warning "Validation cleanup could not run setup uninstall: $($_.Exception.Message)" }
@@ -236,9 +397,18 @@ finally {
     if ($fragmentExisted) {
         [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($fragmentPath)) | Out-Null
         [IO.File]::WriteAllBytes($fragmentPath, $fragmentBytes)
+        $restoredFragmentBytes = [IO.File]::ReadAllBytes($fragmentPath)
+        Assert-True (
+            $restoredFragmentBytes.Length -eq $fragmentBytes.Length -and
+            [Convert]::ToBase64String($restoredFragmentBytes) -ceq [Convert]::ToBase64String($fragmentBytes)) `
+            'Validation cleanup did not restore the original user Terminal Fragment byte-for-byte.'
     }
-    elseif (Test-Path -LiteralPath $fragmentPath -PathType Leaf) {
-        Remove-Item -LiteralPath $fragmentPath -Force
+    else {
+        if (Test-Path -LiteralPath $fragmentPath -PathType Leaf) {
+            Remove-Item -LiteralPath $fragmentPath -Force
+        }
+        Assert-True (-not (Test-Path -LiteralPath $fragmentPath -PathType Leaf)) `
+            'Validation cleanup left its generated Terminal Fragment behind.'
     }
     $shortcutShell = New-Object -ComObject WScript.Shell
     foreach ($directory in @($desktopDirectory, $startMenuDirectory)) {

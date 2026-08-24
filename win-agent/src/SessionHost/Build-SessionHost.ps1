@@ -20,6 +20,7 @@ $executable = Join-Path $output 'TermLink.SessionHost.exe'
     "/out:$executable" `
     (Join-Path $PSScriptRoot '..\AgentControl\AgentControl.cs') `
     (Join-Path $PSScriptRoot '..\Common\LocalIpc.cs') `
+    (Join-Path $PSScriptRoot 'TerminalTitleTracker.cs') `
     (Join-Path $PSScriptRoot 'SessionHost.cs')
 if ($LASTEXITCODE -ne 0) {
     throw "Session Host compilation failed with exit code $LASTEXITCODE."

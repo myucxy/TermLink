@@ -10,22 +10,54 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/billing"
 )
 
 var (
-	ErrNotFound    = errors.New("record not found")
-	ErrConflict    = errors.New("record conflict")
-	ErrDenied      = errors.New("operation denied")
+	ErrNotFound                 = errors.New("record not found")
+	ErrConflict                 = errors.New("record conflict")
+	ErrDenied                   = errors.New("operation denied")
+	ErrSessionActive            = errors.New("session is active")
+	ErrInvalidHistoryPage       = errors.New("invalid history page")
+	ErrHistoryAnchorAhead       = errors.New("history anchor is ahead of the session")
+	ErrInvalidHistorySnapshot   = errors.New("invalid history snapshot")
+	ErrInvalidHistoryTranscript = errors.New("invalid history transcript")
+	ErrInvalidHistoryRecipient  = errors.New("invalid history recipient")
+	// ErrEntitlement is retained for wire compatibility with older clients;
+	// current PC/session paths no longer produce it because account quantities
+	// are unlimited.
 	ErrEntitlement = errors.New("entitlement limit reached")
 )
+
+// UnlimitedQuota is the wire-level value used for legacy entitlement fields
+// whose enforcement has been removed. The columns remain for catalog and
+// billing compatibility, while API consumers can render -1 as “unlimited”.
+const UnlimitedQuota = -1
+
+const (
+	HistoryFormatBoundedEventReplay       = "BOUNDED_EVENT_REPLAY"
+	HistoryFormatTerminalSnapshot         = "TERMLINK_TERMINAL_SNAPSHOT"
+	HistoryFormatTerminalTranscript       = "TERMLINK_TERMINAL_TRANSCRIPT"
+	MaxSnapshotCiphertextBytes      int64 = 2 << 20
+	MaxTranscriptCiphertextBytes    int64 = 512 << 10
+	MaxTranscriptPublicationPages         = 100_000
+)
+
+// sessionOnlineWindow is the server-authoritative reachability window. A
+// heartbeat-capable Agent must refresh the exact session; legacy Agents fall
+// back to PC presence until they advertise that capability.
+const sessionOnlineWindow = 45 * time.Second
+
+const latestSchemaVersion int64 = 18
 
 type Postgres struct {
 	Pool *pgxpool.Pool
@@ -66,7 +98,7 @@ func (s *Postgres) VerifySchema(ctx context.Context) error {
 	if err := s.Pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&version); err != nil {
 		return fmt.Errorf("production schema unavailable; run migrate: %w", err)
 	}
-	if version != 8 {
+	if version != latestSchemaVersion {
 		return fmt.Errorf("unsupported production schema version %d", version)
 	}
 	return nil
@@ -95,9 +127,10 @@ type DeviceRecord struct {
 	CreatedAt         time.Time  `json:"created_at"`
 }
 
-// RegisterDevice creates the user on first OIDC login. The first Windows PC
-// is the only bootstrap exception to PENDING, because a trusted local device
-// is required to approve every later device.
+// RegisterDevice creates the user on first OIDC login. Production enables
+// AutoTrustDevices, making non-revoked devices immediately usable inside the
+// same account. The bootstrap/PENDING relationships remain for compatibility
+// tests and deployments that explicitly leave automatic account access off.
 func (s *Postgres) RegisterDevice(ctx context.Context, subjectHash [32]byte, input RegisterDeviceInput, traceID string) (uuid.UUID, DeviceRecord, bool, error) {
 	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
@@ -477,6 +510,10 @@ func (s *Postgres) CompletePairingChallenge(ctx context.Context, userID, targetI
 	return tx.Commit(ctx)
 }
 
+// RevokeDevice applies account-scoped MANAGE semantics in auto-trust mode. A
+// revoked Android is removed from every PC recipient snapshot on the account,
+// so each affected key epoch advances even when no device_grants row exists.
+// Legacy mode retains its bootstrap/explicit-MANAGE authorization rules.
 func (s *Postgres) RevokeDevice(ctx context.Context, userID, actorID, targetID uuid.UUID, traceID string) error {
 	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
@@ -488,16 +525,26 @@ func (s *Postgres) RevokeDevice(ctx context.Context, userID, actorID, targetID u
 			SELECT id,device_type,approved_by
 			FROM devices
 			WHERE id=$1 AND user_id=$2 AND trust_state='TRUSTED'
+		), target AS (
+			SELECT id,device_type
+			FROM devices
+			WHERE id=$3 AND user_id=$2 AND trust_state<>'REVOKED'
 		), affected_pcs AS (
 			SELECT pc_id AS id
 			FROM device_grants
 			WHERE device_id=$3 AND (expires_at IS NULL OR expires_at>now())
 			UNION
 			SELECT id FROM pcs WHERE device_id=$3 AND owner_user_id=$2
+			UNION
+			SELECT p.id
+			FROM pcs p
+			WHERE $4 AND p.owner_user_id=$2
+			  AND EXISTS(SELECT 1 FROM target WHERE target.device_type='ANDROID')
 		), authority AS (
 			SELECT 1
 			FROM actor
 			WHERE actor.id=$3
+			   OR $4
 			   OR (actor.device_type='WINDOWS_PC' AND actor.approved_by IS NULL)
 			   OR (
 				EXISTS(SELECT 1 FROM affected_pcs)
@@ -513,7 +560,8 @@ func (s *Postgres) RevokeDevice(ctx context.Context, userID, actorID, targetID u
 			   )
 		)
 		UPDATE devices SET trust_state='REVOKED',revoked_at=now()
-		WHERE id=$3 AND user_id=$2 AND trust_state<>'REVOKED' AND EXISTS(SELECT 1 FROM authority)`, actorID, userID, targetID)
+		WHERE id=$3 AND user_id=$2 AND trust_state<>'REVOKED'
+		  AND EXISTS(SELECT 1 FROM target) AND EXISTS(SELECT 1 FROM authority)`, actorID, userID, targetID, s.AutoTrustDevices)
 	if err != nil {
 		return err
 	}
@@ -528,7 +576,11 @@ func (s *Postgres) RevokeDevice(ctx context.Context, userID, actorID, targetID u
 			remote_routing_enabled=CASE WHEN device_id=$1 THEN false ELSE remote_routing_enabled END
 		WHERE owner_user_id=$2 AND (
 			device_id=$1 OR id IN (SELECT pc_id FROM device_grants WHERE device_id=$1)
-		)`, targetID, userID); err != nil {
+			OR ($3 AND EXISTS (
+				SELECT 1 FROM devices target
+				WHERE target.id=$1 AND target.user_id=$2 AND target.device_type='ANDROID'
+			))
+		)`, targetID, userID, s.AutoTrustDevices); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `
@@ -563,13 +615,16 @@ func (s *Postgres) RevokeDevice(ctx context.Context, userID, actorID, targetID u
 }
 
 type PCRecord struct {
-	ID                   uuid.UUID  `json:"id"`
-	DeviceID             uuid.UUID  `json:"device_id"`
-	Name                 string     `json:"name"`
-	AgentVersion         string     `json:"agent_version"`
-	KeyEpoch             int64      `json:"key_epoch"`
-	RemoteRoutingEnabled bool       `json:"remote_routing_enabled"`
-	LastSeenAt           *time.Time `json:"last_seen_at,omitempty"`
+	ID                        uuid.UUID  `json:"id"`
+	DeviceID                  uuid.UUID  `json:"device_id"`
+	Name                      string     `json:"name"`
+	AgentVersion              string     `json:"agent_version"`
+	KeyEpoch                  int64      `json:"key_epoch"`
+	RemoteRoutingEnabled      bool       `json:"remote_routing_enabled"`
+	SessionHeartbeatCapable   bool       `json:"session_heartbeat_capable"`
+	SessionHeartbeatEnabledAt *time.Time `json:"session_heartbeat_enabled_at,omitempty"`
+	Online                    bool       `json:"online"`
+	LastSeenAt                *time.Time `json:"last_seen_at,omitempty"`
 }
 
 func (s *Postgres) UpsertPC(ctx context.Context, userID, deviceID uuid.UUID, item PCRecord) error {
@@ -578,12 +633,15 @@ func (s *Postgres) UpsertPC(ctx context.Context, userID, deviceID uuid.UUID, ite
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var maxRemotePCs int
+	// PC routes are account-owned resources.  Entitlement rows still exist for
+	// billing/catalog compatibility, but they no longer gate registration: one
+	// account may register any number of trusted Windows PCs.
+	var trustedDevice int
 	if err := tx.QueryRow(ctx, `
-		SELECT e.max_remote_pcs
-		FROM devices d JOIN entitlements e ON e.account_id=d.user_id
+		SELECT 1
+		FROM devices d
 		WHERE d.id=$1 AND d.user_id=$2 AND d.device_type='WINDOWS_PC' AND d.trust_state='TRUSTED'
-		FOR UPDATE OF d`, deviceID, userID).Scan(&maxRemotePCs); errors.Is(err, pgx.ErrNoRows) {
+		FOR UPDATE`, deviceID, userID).Scan(&trustedDevice); errors.Is(err, pgx.ErrNoRows) {
 		return ErrDenied
 	} else if err != nil {
 		return err
@@ -597,21 +655,16 @@ func (s *Postgres) UpsertPC(ctx context.Context, userID, deviceID uuid.UUID, ite
 	if hasExisting && (existingOwner != userID || existingDevice != deviceID) {
 		return ErrDenied
 	}
-	if !hasExisting {
-		var count int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM pcs WHERE owner_user_id=$1 AND remote_routing_enabled`, userID).Scan(&count); err != nil {
-			return err
-		}
-		if count >= maxRemotePCs {
-			return ErrEntitlement
-		}
-	}
 	_, err = tx.Exec(ctx, `
-		INSERT INTO pcs(id,owner_user_id,device_id,name,agent_version,key_epoch,last_seen_at)
-		VALUES($1,$2,$3,$4,$5,$6,now())
+		INSERT INTO pcs(
+			id,owner_user_id,device_id,name,agent_version,key_epoch,last_seen_at,
+			session_heartbeat_capable,session_heartbeat_enabled_at)
+		VALUES($1,$2,$3,$4,$5,$6,now(),$7,CASE WHEN $7 THEN now() END)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name,agent_version=excluded.agent_version,
-		key_epoch=GREATEST(pcs.key_epoch,excluded.key_epoch),last_seen_at=now()
-		WHERE pcs.owner_user_id=$2 AND pcs.device_id=$3`, item.ID, userID, deviceID, item.Name, item.AgentVersion, item.KeyEpoch)
+		key_epoch=GREATEST(pcs.key_epoch,excluded.key_epoch),last_seen_at=now(),
+		session_heartbeat_capable=pcs.session_heartbeat_capable OR excluded.session_heartbeat_capable,
+		session_heartbeat_enabled_at=COALESCE(pcs.session_heartbeat_enabled_at,excluded.session_heartbeat_enabled_at)
+		WHERE pcs.owner_user_id=$2 AND pcs.device_id=$3`, item.ID, userID, deviceID, item.Name, item.AgentVersion, item.KeyEpoch, item.SessionHeartbeatCapable)
 	if err != nil {
 		return err
 	}
@@ -657,7 +710,21 @@ func (s *Postgres) TouchDevicePresence(ctx context.Context, userID, deviceID uui
 }
 
 func (s *Postgres) ListPCs(ctx context.Context, userID, deviceID uuid.UUID) ([]PCRecord, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT p.id,p.device_id,p.name,p.agent_version,p.key_epoch,p.remote_routing_enabled,p.last_seen_at FROM pcs p WHERE p.owner_user_id=$1 AND ($3 OR p.device_id=$2 OR EXISTS(SELECT 1 FROM device_grants g WHERE g.pc_id=p.id AND g.device_id=$2 AND (g.expires_at IS NULL OR g.expires_at>now()))) ORDER BY p.name,p.id`, userID, deviceID, s.AutoTrustDevices)
+	rows, err := s.Pool.Query(ctx, `
+		SELECT p.id,p.device_id,p.name,p.agent_version,p.key_epoch,p.remote_routing_enabled,
+		       p.session_heartbeat_capable,p.session_heartbeat_enabled_at,
+		       COALESCE(p.last_seen_at > now()-($4 * interval '1 second'),false),p.last_seen_at
+		FROM pcs p
+		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
+		JOIN devices actor ON actor.id=$2 AND actor.user_id=$1 AND actor.trust_state='TRUSTED'
+		WHERE p.owner_user_id=$1 AND (
+			$3 OR p.device_id=actor.id OR EXISTS(
+				SELECT 1 FROM device_grants g
+				WHERE g.pc_id=p.id AND g.device_id=actor.id
+				  AND (g.expires_at IS NULL OR g.expires_at>now())
+			)
+		)
+		ORDER BY p.name,p.id`, userID, deviceID, s.AutoTrustDevices, int(sessionOnlineWindow/time.Second))
 	if err != nil {
 		return nil, err
 	}
@@ -665,7 +732,9 @@ func (s *Postgres) ListPCs(ctx context.Context, userID, deviceID uuid.UUID) ([]P
 	result := make([]PCRecord, 0)
 	for rows.Next() {
 		var item PCRecord
-		if err := rows.Scan(&item.ID, &item.DeviceID, &item.Name, &item.AgentVersion, &item.KeyEpoch, &item.RemoteRoutingEnabled, &item.LastSeenAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.DeviceID, &item.Name, &item.AgentVersion, &item.KeyEpoch,
+			&item.RemoteRoutingEnabled, &item.SessionHeartbeatCapable, &item.SessionHeartbeatEnabledAt,
+			&item.Online, &item.LastSeenAt); err != nil {
 			return nil, err
 		}
 		result = append(result, item)
@@ -674,48 +743,167 @@ func (s *Postgres) ListPCs(ctx context.Context, userID, deviceID uuid.UUID) ([]P
 }
 
 type SessionRecord struct {
-	ID                 uuid.UUID  `json:"id"`
-	PCID               uuid.UUID  `json:"pc_id"`
-	ShellType          string     `json:"shell_type"`
-	TitleCipher        []byte     `json:"title_cipher,omitempty"`
-	State              string     `json:"state"`
-	Columns            int        `json:"columns"`
-	Rows               int        `json:"rows"`
-	LastOutputSequence uint64     `json:"last_output_seq"`
-	CreatedAt          time.Time  `json:"created_at"`
-	EndedAt            *time.Time `json:"ended_at,omitempty"`
+	ID                      uuid.UUID  `json:"id"`
+	PCID                    uuid.UUID  `json:"pc_id"`
+	ShellType               string     `json:"shell_type"`
+	TitleCipher             []byte     `json:"title_cipher,omitempty"`
+	State                   string     `json:"state"`
+	Columns                 int        `json:"columns"`
+	Rows                    int        `json:"rows"`
+	LastOutputSequence      uint64     `json:"last_output_seq"`
+	SessionHeartbeatCapable bool       `json:"session_heartbeat_capable,omitempty"`
+	Online                  bool       `json:"online"`
+	CreatedAt               time.Time  `json:"created_at"`
+	LastSeenAt              *time.Time `json:"last_seen_at,omitempty"`
+	EndedAt                 *time.Time `json:"ended_at,omitempty"`
 }
 
 func (s *Postgres) UpsertSession(ctx context.Context, userID, deviceID uuid.UUID, item SessionRecord) error {
-	command, err := s.Pool.Exec(ctx, `
-		INSERT INTO sessions(id,pc_id,shell_type,title_cipher,state,columns,rows,last_output_seq,ended_at)
-		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		err = s.upsertSessionOnce(ctx, userID, deviceID, item)
+		if !isPostgresRetryableTransactionError(err) {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	return err
+}
+
+func (s *Postgres) upsertSessionOnce(ctx context.Context, userID, deviceID uuid.UUID, item SessionRecord) error {
+	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Use the same PC-then-session lock order as automatic cleanup. A committed
+	// PC capability change or fresh session heartbeat therefore wins the stale
+	// recheck, while an AUTO_STALE tombstone can be safely resurrected only by
+	// this authenticated owning Windows device path.
+	var pcHeartbeatCapable bool
+	err = tx.QueryRow(ctx, `
+		SELECT session_heartbeat_capable
 		FROM pcs
-		WHERE id=$2 AND owner_user_id=$10 AND device_id=$11
+		WHERE id=$1 AND owner_user_id=$2 AND device_id=$3
+		FOR UPDATE`, item.PCID, userID, deviceID).Scan(&pcHeartbeatCapable)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrDenied
+	}
+	if err != nil {
+		return err
+	}
+	var existingPCID uuid.UUID
+	err = tx.QueryRow(ctx, `SELECT pc_id FROM sessions WHERE id=$1 FOR UPDATE`, item.ID).Scan(&existingPCID)
+	if err == nil && existingPCID != item.PCID {
+		return ErrDenied
+	}
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+
+	heartbeat := item.SessionHeartbeatCapable && pcHeartbeatCapable
+	command, err := tx.Exec(ctx, `
+		INSERT INTO sessions(
+			id,pc_id,shell_type,title_cipher,state,columns,rows,last_output_seq,ended_at,last_seen_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CASE WHEN $10 THEN now() END)
 		ON CONFLICT(id) DO UPDATE SET
-			title_cipher=CASE WHEN sessions.state='DELETED' THEN sessions.title_cipher ELSE excluded.title_cipher END,
-			state=CASE WHEN sessions.state IN ('EXITED','DELETED') THEN sessions.state ELSE excluded.state END,
-			columns=CASE WHEN sessions.state='DELETED' THEN sessions.columns ELSE excluded.columns END,
-			rows=CASE WHEN sessions.state='DELETED' THEN sessions.rows ELSE excluded.rows END,
-			last_output_seq=CASE WHEN sessions.state='DELETED' THEN sessions.last_output_seq ELSE GREATEST(sessions.last_output_seq,excluded.last_output_seq) END,
+			title_cipher=CASE
+				WHEN sessions.state='DELETED' AND sessions.deletion_reason IS DISTINCT FROM 'AUTO_STALE' THEN sessions.title_cipher
+				WHEN NOT $11 THEN sessions.title_cipher
+				ELSE excluded.title_cipher
+			END,
+			state=CASE
+				WHEN sessions.state='DELETED' AND sessions.deletion_reason='AUTO_STALE' THEN excluded.state
+				WHEN sessions.state IN ('EXITED','DELETED') THEN sessions.state
+				ELSE excluded.state
+			END,
+			columns=CASE
+				WHEN sessions.state='DELETED' AND sessions.deletion_reason IS DISTINCT FROM 'AUTO_STALE' THEN sessions.columns
+				ELSE excluded.columns
+			END,
+			rows=CASE
+				WHEN sessions.state='DELETED' AND sessions.deletion_reason IS DISTINCT FROM 'AUTO_STALE' THEN sessions.rows
+				ELSE excluded.rows
+			END,
+			last_output_seq=CASE
+				WHEN sessions.state='DELETED' AND sessions.deletion_reason IS DISTINCT FROM 'AUTO_STALE' THEN sessions.last_output_seq
+				WHEN sessions.state='DELETED' AND sessions.deletion_reason='AUTO_STALE' THEN excluded.last_output_seq
+				ELSE GREATEST(sessions.last_output_seq,excluded.last_output_seq)
+			END,
 			ended_at=CASE
+				WHEN sessions.state='DELETED' AND sessions.deletion_reason='AUTO_STALE' THEN excluded.ended_at
 				WHEN sessions.state='DELETED' THEN sessions.ended_at
 				WHEN sessions.state='EXITED' THEN CASE WHEN excluded.state='EXITED' THEN COALESCE(sessions.ended_at,excluded.ended_at) ELSE sessions.ended_at END
 				WHEN excluded.state='EXITED' THEN COALESCE(excluded.ended_at,sessions.ended_at)
 				ELSE excluded.ended_at
+			END,
+			last_seen_at=CASE
+				WHEN sessions.state='DELETED' AND sessions.deletion_reason IS DISTINCT FROM 'AUTO_STALE' THEN sessions.last_seen_at
+				WHEN $10 OR (sessions.state='DELETED' AND sessions.deletion_reason='AUTO_STALE') THEN now()
+				ELSE sessions.last_seen_at
+			END,
+			deleted_at=CASE
+				WHEN sessions.state='DELETED' AND sessions.deletion_reason='AUTO_STALE' THEN NULL
+				ELSE sessions.deleted_at
+			END,
+			deletion_reason=CASE
+				WHEN sessions.state='DELETED' AND sessions.deletion_reason='AUTO_STALE' THEN NULL
+				ELSE sessions.deletion_reason
 			END
-		WHERE sessions.pc_id=$2`, item.ID, item.PCID, item.ShellType, item.TitleCipher, item.State, item.Columns, item.Rows, int64(item.LastOutputSequence), item.EndedAt, userID, deviceID)
+		WHERE sessions.pc_id=$2`, item.ID, item.PCID, item.ShellType, item.TitleCipher, item.State,
+		item.Columns, item.Rows, int64(item.LastOutputSequence), item.EndedAt, heartbeat, item.TitleCipher != nil)
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return ErrDenied
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (s *Postgres) ListSessions(ctx context.Context, userID, deviceID, pcID uuid.UUID) ([]SessionRecord, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT s.id,s.pc_id,s.shell_type,s.title_cipher,s.state,s.columns,s.rows,s.last_output_seq,s.created_at,s.ended_at FROM sessions s JOIN pcs p ON p.id=s.pc_id WHERE p.id=$1 AND p.owner_user_id=$2 AND s.deleted_at IS NULL AND ($4 OR p.device_id=$3 OR EXISTS(SELECT 1 FROM device_grants g WHERE g.pc_id=p.id AND g.device_id=$3 AND (g.expires_at IS NULL OR g.expires_at>now()))) ORDER BY s.created_at DESC,s.id`, pcID, userID, deviceID, s.AutoTrustDevices)
+	return s.listSessions(ctx, userID, deviceID, pcID, false)
+}
+
+// ListSessionsIncludingEnded is the explicit compatibility/history view. The
+// default ListSessions contract is the live session directory used by product
+// clients, so an exited/interrupted session or a session whose PC stopped
+// heartbeating cannot remain visible as an actionable terminal forever.
+func (s *Postgres) ListSessionsIncludingEnded(ctx context.Context, userID, deviceID, pcID uuid.UUID) ([]SessionRecord, error) {
+	return s.listSessions(ctx, userID, deviceID, pcID, true)
+}
+
+func (s *Postgres) listSessions(ctx context.Context, userID, deviceID, pcID uuid.UUID, includeEnded bool) ([]SessionRecord, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT s.id,s.pc_id,s.shell_type,s.title_cipher,s.state,s.columns,s.rows,s.last_output_seq,
+		       s.created_at,s.last_seen_at,s.ended_at,presence.online
+		FROM sessions s
+		JOIN pcs p ON p.id=s.pc_id
+		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
+		JOIN devices actor ON actor.id=$3 AND actor.user_id=$2 AND actor.trust_state='TRUSTED'
+		CROSS JOIN LATERAL (
+			SELECT COALESCE(
+				s.state='RUNNING' AND CASE
+					WHEN p.session_heartbeat_capable
+						THEN s.last_seen_at > now()-($6 * interval '1 second')
+					ELSE p.last_seen_at > now()-($6 * interval '1 second')
+				END,
+				false
+			) AS online
+		) presence
+		WHERE p.id=$1 AND p.owner_user_id=$2 AND s.deleted_at IS NULL
+		  AND ($5 OR presence.online) AND (
+			$4 OR p.device_id=actor.id OR EXISTS(
+				SELECT 1 FROM device_grants g
+				WHERE g.pc_id=p.id AND g.device_id=actor.id
+				  AND (g.expires_at IS NULL OR g.expires_at>now())
+			)
+		)
+		ORDER BY s.created_at DESC,s.id`,
+		pcID, userID, deviceID, s.AutoTrustDevices, includeEnded, int(sessionOnlineWindow/time.Second))
 	if err != nil {
 		return nil, err
 	}
@@ -724,7 +912,8 @@ func (s *Postgres) ListSessions(ctx context.Context, userID, deviceID, pcID uuid
 	for rows.Next() {
 		var i SessionRecord
 		var seq int64
-		if err := rows.Scan(&i.ID, &i.PCID, &i.ShellType, &i.TitleCipher, &i.State, &i.Columns, &i.Rows, &seq, &i.CreatedAt, &i.EndedAt); err != nil {
+		if err := rows.Scan(&i.ID, &i.PCID, &i.ShellType, &i.TitleCipher, &i.State, &i.Columns,
+			&i.Rows, &seq, &i.CreatedAt, &i.LastSeenAt, &i.EndedAt, &i.Online); err != nil {
 			return nil, err
 		}
 		i.LastOutputSequence = uint64(seq)
@@ -914,10 +1103,12 @@ type PCGrantRecord struct {
 	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
 }
 
-// ListPCGrants returns only active grants after authorizing the actor as the
-// owning Windows device or an unexpired MANAGE device. The authoritative key
-// epoch is returned with the same repeatable-read snapshot so an Agent never
-// encrypts a refreshed recipient set under a stale epoch.
+// ListPCGrants returns the PC's active encryption recipients. In production
+// auto-trust mode every trusted Android device on the account is an implicit
+// MANAGE recipient; legacy deployments continue to use explicit active grants.
+// The authoritative key epoch is returned with the same repeatable-read
+// snapshot so an Agent never encrypts a refreshed recipient set under a stale
+// epoch.
 func (s *Postgres) ListPCGrants(ctx context.Context, userID, actorID, pcID uuid.UUID) (int64, []PCGrantRecord, error) {
 	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
@@ -928,12 +1119,13 @@ func (s *Postgres) ListPCGrants(ctx context.Context, userID, actorID, pcID uuid.
 	err = tx.QueryRow(ctx, `
 		SELECT p.key_epoch
 		FROM pcs p
+		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
 		JOIN devices actor ON actor.id=$2 AND actor.user_id=$1 AND actor.trust_state='TRUSTED'
 		LEFT JOIN device_grants manager
 		  ON manager.pc_id=p.id AND manager.device_id=actor.id
 		 AND (manager.expires_at IS NULL OR manager.expires_at>now())
 		WHERE p.id=$3 AND p.owner_user_id=$1 AND p.remote_routing_enabled
-		  AND (p.device_id=actor.id OR manager.permission='MANAGE')`, userID, actorID, pcID).Scan(&keyEpoch)
+		  AND ($4 OR p.device_id=actor.id OR manager.permission='MANAGE')`, userID, actorID, pcID, s.AutoTrustDevices).Scan(&keyEpoch)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil, ErrDenied
 	}
@@ -941,11 +1133,16 @@ func (s *Postgres) ListPCGrants(ctx context.Context, userID, actorID, pcID uuid.
 		return 0, nil, err
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT d.id,d.device_type,d.name,d.exchange_public_key,d.key_id,g.permission,g.expires_at
-		FROM device_grants g
-		JOIN devices d ON d.id=g.device_id AND d.user_id=$1 AND d.trust_state='TRUSTED'
-		WHERE g.pc_id=$2 AND (g.expires_at IS NULL OR g.expires_at>now())
-		ORDER BY d.created_at,d.id`, userID, pcID)
+		SELECT d.id,d.device_type,d.name,d.exchange_public_key,d.key_id,
+		       CASE WHEN $3 AND d.device_type='ANDROID' THEN 'MANAGE' ELSE g.permission END,
+		       CASE WHEN $3 AND d.device_type='ANDROID' THEN NULL ELSE g.expires_at END
+		FROM devices d
+		LEFT JOIN device_grants g
+		  ON g.device_id=d.id AND g.pc_id=$2
+		 AND (g.expires_at IS NULL OR g.expires_at>now())
+		WHERE d.user_id=$1 AND d.trust_state='TRUSTED'
+		  AND (($3 AND d.device_type='ANDROID') OR g.device_id IS NOT NULL)
+		ORDER BY d.created_at,d.id`, userID, pcID, s.AutoTrustDevices)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -984,14 +1181,17 @@ func (s *Postgres) SessionRoute(ctx context.Context, userID, deviceID, sessionID
 		-- Treat same-account devices as full MANAGE participants so clients do
 		-- not need a separate grant/pairing step. Explicit legacy grants still
 		-- retain their VIEW/CONTROL/MANAGE semantics when AutoTrustDevices is off.
-		SELECT CASE WHEN p.device_id=$2 THEN 'MANAGE' WHEN $4 THEN 'MANAGE' ELSE g.permission END,p.device_id,g.expires_at
+		SELECT CASE WHEN p.device_id=actor.id THEN 'MANAGE' WHEN $4 THEN 'MANAGE' ELSE g.permission END,
+		       p.device_id,
+		       CASE WHEN $4 THEN NULL ELSE g.expires_at END
 		FROM sessions s
 		JOIN pcs p ON p.id=s.pc_id
 		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
 		JOIN devices owner_device ON owner_device.id=p.device_id AND owner_device.trust_state='TRUSTED'
-		LEFT JOIN device_grants g ON g.pc_id=p.id AND g.device_id=$2 AND (g.expires_at IS NULL OR g.expires_at>now())
+		JOIN devices actor ON actor.id=$2 AND actor.user_id=$3 AND actor.trust_state='TRUSTED'
+		LEFT JOIN device_grants g ON g.pc_id=p.id AND g.device_id=actor.id AND (g.expires_at IS NULL OR g.expires_at>now())
 		WHERE s.id=$1 AND p.owner_user_id=$3 AND p.remote_routing_enabled AND s.deleted_at IS NULL
-		  AND ($4 OR p.device_id=$2 OR g.device_id IS NOT NULL)`, sessionID, deviceID, userID, s.AutoTrustDevices).
+		  AND ($4 OR p.device_id=actor.id OR g.device_id IS NOT NULL)`, sessionID, deviceID, userID, s.AutoTrustDevices).
 		Scan(&result.Permission, &result.PCDeviceID, &result.GrantExpiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return SessionRouteAuthorization{}, ErrDenied
@@ -1020,72 +1220,402 @@ func (s *Postgres) SessionPCDevice(ctx context.Context, userID, sessionID uuid.U
 }
 
 type HistoryItem struct {
-	Kind             string    `json:"kind"`
-	ID               uuid.UUID `json:"id"`
-	StartSequence    uint64    `json:"start_seq,omitempty"`
-	EndSequence      uint64    `json:"end_seq,omitempty"`
-	SnapshotSequence uint64    `json:"snapshot_seq,omitempty"`
-	ObjectKey        string    `json:"object_key"`
-	KeyID            string    `json:"key_id"`
-	CiphertextSHA256 []byte    `json:"ciphertext_sha256"`
-	SizeBytes        int64     `json:"size_bytes"`
-	FormatName       string    `json:"format_name,omitempty"`
-	FormatVersion    int       `json:"format_version,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
+	Kind                 string    `json:"kind"`
+	ID                   uuid.UUID `json:"id"`
+	StartSequence        uint64    `json:"start_seq,omitempty"`
+	EndSequence          uint64    `json:"end_seq,omitempty"`
+	SnapshotSequence     uint64    `json:"snapshot_seq,omitempty"`
+	AsOfSnapshotSequence uint64    `json:"as_of_snapshot_seq,omitempty"`
+	FirstLineID          uint64    `json:"first_line_id,omitempty"`
+	LastLineID           uint64    `json:"last_line_id,omitempty"`
+	Rows                 int       `json:"rows,omitempty"`
+	Columns              int       `json:"columns,omitempty"`
+	ObjectKey            string    `json:"object_key"`
+	KeyID                string    `json:"key_id"`
+	CiphertextSHA256     []byte    `json:"ciphertext_sha256"`
+	SizeBytes            int64     `json:"size_bytes"`
+	FormatName           string    `json:"format_name,omitempty"`
+	FormatVersion        int       `json:"format_version,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	HistoryRevision      int64     `json:"-"`
+}
+
+type HistoryKind string
+
+const (
+	HistoryKindAll        HistoryKind = "all"
+	HistoryKindChunk      HistoryKind = "chunk"
+	HistoryKindSnapshot   HistoryKind = "snapshot"
+	HistoryKindTranscript HistoryKind = "transcript"
+)
+
+type HistoryPosition struct {
+	Sequence int64
+	Kind     HistoryKind
+	ID       uuid.UUID
+}
+
+type HistoryPageRequest struct {
+	Kind         HistoryKind
+	FormatName   string
+	Limit        int
+	AsOfRevision *int64
+	Before       *HistoryPosition
+}
+
+type HistoryPage struct {
+	Items        []HistoryItem
+	AsOfRevision int64
+	HasMore      bool
+}
+
+type TranscriptPageRequest struct {
+	AsOfSnapshotSequence int64
+	BeforeLineID         *int64
+	AsOfRevision         *int64
+	Limit                int
+}
+
+type TranscriptPage struct {
+	Items        []HistoryItem
+	AsOfRevision int64
+	HasMore      bool
+	Ready        bool
 }
 
 type HistoryUploadRecord struct {
-	ID               uuid.UUID
-	SessionID        uuid.UUID
-	Kind             string
-	ObjectKey        string
-	KeyID            string
-	CiphertextSHA256 []byte
-	SizeBytes        int64
-	StartSequence    *int64
-	EndSequence      *int64
-	SnapshotSequence *int64
-	Rows             *int
-	Columns          *int
-	FormatName       *string
-	FormatVersion    *int
-	ExpiresAt        time.Time
+	ID                   uuid.UUID
+	SessionID            uuid.UUID
+	Kind                 string
+	ObjectKey            string
+	KeyID                string
+	CiphertextSHA256     []byte
+	SizeBytes            int64
+	StartSequence        *int64
+	EndSequence          *int64
+	SnapshotSequence     *int64
+	AsOfSnapshotSequence *int64
+	FirstLineID          *int64
+	LastLineID           *int64
+	// Transcript publication metadata is present only on terminal Snapshot
+	// uploads. Legacy snapshots leave both fields nil and retain legacy paging.
+	TranscriptInitialBeforeLineID *int64
+	TranscriptPageCount           *int
+	Rows                          *int
+	Columns                       *int
+	FormatName                    *string
+	FormatVersion                 *int
+	RecipientDeviceID             uuid.UUID
+	RecipientKeyEpoch             int64
+	ExpiresAt                     time.Time
+}
+
+func ParseHistoryRecipientKeyID(kind, formatName, keyID string) (uuid.UUID, int64, error) {
+	prefix := ""
+	switch {
+	case kind == "CHUNK" && formatName == "":
+		prefix = "history-v1"
+	case kind == "SNAPSHOT" && formatName == HistoryFormatBoundedEventReplay:
+		prefix = "history-v1"
+	case kind == "SNAPSHOT" && formatName == HistoryFormatTerminalSnapshot:
+		prefix = "snapshot-v1"
+	case kind == "TRANSCRIPT" && formatName == HistoryFormatTerminalTranscript:
+		prefix = "transcript-v1"
+	default:
+		return uuid.Nil, 0, ErrInvalidHistoryRecipient
+	}
+	parts := strings.Split(keyID, ":")
+	if len(parts) != 3 || parts[0] != prefix || len(parts[1]) != 32 || parts[1] != strings.ToLower(parts[1]) ||
+		len(parts[2]) < 8 || len(parts[2]) > 19 {
+		return uuid.Nil, 0, ErrInvalidHistoryRecipient
+	}
+	for _, value := range parts[1] {
+		if value < '0' || value > '9' && value < 'a' || value > 'f' {
+			return uuid.Nil, 0, ErrInvalidHistoryRecipient
+		}
+	}
+	for _, value := range parts[2] {
+		if value < '0' || value > '9' {
+			return uuid.Nil, 0, ErrInvalidHistoryRecipient
+		}
+	}
+	recipient, err := uuid.Parse(parts[1])
+	if err != nil || strings.ReplaceAll(recipient.String(), "-", "") != parts[1] {
+		return uuid.Nil, 0, ErrInvalidHistoryRecipient
+	}
+	epoch, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || epoch < 1 || fmt.Sprintf("%08d", epoch) != parts[2] ||
+		((prefix == "snapshot-v1" || prefix == "transcript-v1") && len(parts[2]) != 8) {
+		return uuid.Nil, 0, ErrInvalidHistoryRecipient
+	}
+	return recipient, epoch, nil
+}
+
+func validateHistoryUploadRecipient(item HistoryUploadRecord) error {
+	formatName := ""
+	if item.FormatName != nil {
+		formatName = *item.FormatName
+	}
+	recipient, epoch, err := ParseHistoryRecipientKeyID(item.Kind, formatName, item.KeyID)
+	if err != nil || recipient != item.RecipientDeviceID || epoch != item.RecipientKeyEpoch {
+		return ErrInvalidHistoryRecipient
+	}
+	return nil
+}
+
+func ValidateHistorySnapshotMetadata(sequence, sizeBytes int64, rows, columns int, formatName string, formatVersion int) error {
+	if sequence < 0 || sizeBytes < 1 || sizeBytes > MaxSnapshotCiphertextBytes || rows < 1 || rows > 256 ||
+		columns < 1 || columns > 512 || formatVersion != 1 {
+		return ErrInvalidHistorySnapshot
+	}
+	switch formatName {
+	case HistoryFormatBoundedEventReplay:
+		// Legacy bounded replay may describe the initial state at sequence zero.
+		return nil
+	case HistoryFormatTerminalSnapshot:
+		if sequence == 0 {
+			return ErrInvalidHistorySnapshot
+		}
+		return nil
+	default:
+		return ErrInvalidHistorySnapshot
+	}
+}
+
+func validateHistorySnapshotUpload(item HistoryUploadRecord) error {
+	if item.SnapshotSequence == nil || item.Rows == nil || item.Columns == nil || item.FormatName == nil || item.FormatVersion == nil ||
+		item.StartSequence != nil || item.EndSequence != nil || item.AsOfSnapshotSequence != nil ||
+		item.FirstLineID != nil || item.LastLineID != nil {
+		return ErrInvalidHistorySnapshot
+	}
+	publicationMetadataPresent := item.TranscriptInitialBeforeLineID != nil || item.TranscriptPageCount != nil
+	if publicationMetadataPresent && (item.TranscriptInitialBeforeLineID == nil || item.TranscriptPageCount == nil ||
+		*item.TranscriptInitialBeforeLineID < 1 || *item.TranscriptPageCount < 0 ||
+		*item.TranscriptPageCount > MaxTranscriptPublicationPages ||
+		*item.FormatName != HistoryFormatTerminalSnapshot) {
+		return ErrInvalidHistorySnapshot
+	}
+	return ValidateHistorySnapshotMetadata(*item.SnapshotSequence, item.SizeBytes, *item.Rows, *item.Columns, *item.FormatName, *item.FormatVersion)
+}
+
+func ValidateHistoryTranscriptMetadata(asOfSnapshotSequence, firstLineID, lastLineID, sizeBytes int64, formatName string, formatVersion int) error {
+	if asOfSnapshotSequence < 1 || firstLineID < 1 || lastLineID < firstLineID ||
+		sizeBytes < 1 || sizeBytes > MaxTranscriptCiphertextBytes ||
+		formatName != HistoryFormatTerminalTranscript || formatVersion != 1 {
+		return ErrInvalidHistoryTranscript
+	}
+	return nil
+}
+
+func validateHistoryTranscriptUpload(item HistoryUploadRecord) error {
+	if item.AsOfSnapshotSequence == nil || item.FirstLineID == nil || item.LastLineID == nil ||
+		item.FormatName == nil || item.FormatVersion == nil || item.StartSequence != nil ||
+		item.EndSequence != nil || item.SnapshotSequence != nil || item.Rows != nil || item.Columns != nil ||
+		item.TranscriptInitialBeforeLineID != nil || item.TranscriptPageCount != nil {
+		return ErrInvalidHistoryTranscript
+	}
+	return ValidateHistoryTranscriptMetadata(*item.AsOfSnapshotSequence, *item.FirstLineID, *item.LastLineID,
+		item.SizeBytes, *item.FormatName, *item.FormatVersion)
+}
+
+func validateHistoryUploadShape(item HistoryUploadRecord) error {
+	switch item.Kind {
+	case "CHUNK":
+		if item.StartSequence == nil || item.EndSequence == nil || *item.StartSequence < 1 ||
+			*item.EndSequence < *item.StartSequence || item.SnapshotSequence != nil || item.Rows != nil ||
+			item.Columns != nil || item.FormatName != nil || item.FormatVersion != nil ||
+			item.AsOfSnapshotSequence != nil || item.FirstLineID != nil || item.LastLineID != nil ||
+			item.TranscriptInitialBeforeLineID != nil || item.TranscriptPageCount != nil {
+			return ErrInvalidHistoryPage
+		}
+		return nil
+	case "SNAPSHOT":
+		return validateHistorySnapshotUpload(item)
+	case "TRANSCRIPT":
+		return validateHistoryTranscriptUpload(item)
+	default:
+		return ErrInvalidHistoryPage
+	}
 }
 
 func (s *Postgres) CreateHistoryUpload(ctx context.Context, userID, actorID uuid.UUID, item HistoryUploadRecord) error {
-	command, err := s.Pool.Exec(ctx, `
-		INSERT INTO history_uploads(id,user_id,actor_device_id,session_id,kind,object_key,key_id,ciphertext_sha256,size_bytes,start_seq,end_seq,snapshot_seq,rows,columns,format_name,format_version,expires_at)
-		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17
+	if err := validateHistoryUploadShape(item); err != nil {
+		return err
+	}
+	if err := validateHistoryUploadRecipient(item); err != nil {
+		return err
+	}
+	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var allowed bool
+	err = tx.QueryRow(ctx, `
+		SELECT true
+		FROM sessions session
+		JOIN pcs pc
+		  ON pc.id=session.pc_id AND pc.owner_user_id=$1 AND pc.device_id=$2
+		 AND pc.remote_routing_enabled AND pc.key_epoch=$5
+		JOIN devices actor
+		  ON actor.id=$2 AND actor.user_id=$1 AND actor.device_type='WINDOWS_PC' AND actor.trust_state='TRUSTED'
+		JOIN devices recipient
+		  ON recipient.id=$4 AND recipient.user_id=$1 AND recipient.device_type='ANDROID' AND recipient.trust_state='TRUSTED'
+		LEFT JOIN device_grants recipient_grant
+		  ON recipient_grant.pc_id=pc.id AND recipient_grant.device_id=recipient.id
+		 AND (recipient_grant.expires_at IS NULL OR recipient_grant.expires_at>now())
+		WHERE session.id=$3 AND session.deleted_at IS NULL
+		  AND ($6 OR recipient_grant.device_id IS NOT NULL)
+		FOR UPDATE OF session,pc,actor,recipient`, userID, actorID, item.SessionID,
+		item.RecipientDeviceID, item.RecipientKeyEpoch, s.AutoTrustDevices).Scan(&allowed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrDenied
+	}
+	if err != nil {
+		return err
+	}
+	// Create a new session tuple version while holding the deletion fence. A
+	// serializable delete that began while this upload was uncommitted must
+	// restart before it can collect history object keys.
+	if _, err := tx.Exec(ctx, `UPDATE sessions SET history_revision=history_revision WHERE id=$1`, item.SessionID); err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `
+		INSERT INTO history_uploads(id,user_id,actor_device_id,session_id,kind,object_key,key_id,ciphertext_sha256,size_bytes,start_seq,end_seq,snapshot_seq,as_of_snapshot_seq,first_line_id,last_line_id,transcript_initial_before_line_id,transcript_page_count,rows,columns,format_name,format_version,recipient_device_id,recipient_key_epoch,expires_at)
+		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24
 		FROM sessions s
-		JOIN pcs p ON p.id=s.pc_id AND p.owner_user_id=$2 AND p.device_id=$3 AND p.remote_routing_enabled
-		JOIN devices d ON d.id=$3 AND d.user_id=$2 AND d.device_type='WINDOWS_PC' AND d.trust_state='TRUSTED'
-		WHERE s.id=$4 AND s.deleted_at IS NULL`,
+		JOIN pcs p ON p.id=s.pc_id AND p.owner_user_id=$2 AND p.device_id=$3 AND p.remote_routing_enabled AND p.key_epoch=$23
+		JOIN devices actor ON actor.id=$3 AND actor.user_id=$2 AND actor.device_type='WINDOWS_PC' AND actor.trust_state='TRUSTED'
+		JOIN devices recipient ON recipient.id=$22 AND recipient.user_id=$2 AND recipient.device_type='ANDROID' AND recipient.trust_state='TRUSTED'
+		LEFT JOIN device_grants recipient_grant
+		  ON recipient_grant.pc_id=p.id AND recipient_grant.device_id=recipient.id
+		 AND (recipient_grant.expires_at IS NULL OR recipient_grant.expires_at>now())
+		WHERE s.id=$4 AND s.deleted_at IS NULL AND ($25 OR recipient_grant.device_id IS NOT NULL)`,
 		item.ID, userID, actorID, item.SessionID, item.Kind, item.ObjectKey, item.KeyID, item.CiphertextSHA256,
-		item.SizeBytes, item.StartSequence, item.EndSequence, item.SnapshotSequence, item.Rows, item.Columns,
-		item.FormatName, item.FormatVersion, item.ExpiresAt)
+		item.SizeBytes, item.StartSequence, item.EndSequence, item.SnapshotSequence, item.AsOfSnapshotSequence,
+		item.FirstLineID, item.LastLineID, item.TranscriptInitialBeforeLineID, item.TranscriptPageCount,
+		item.Rows, item.Columns, item.FormatName, item.FormatVersion,
+		item.RecipientDeviceID, item.RecipientKeyEpoch, item.ExpiresAt,
+		s.AutoTrustDevices)
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return ErrDenied
 	}
-	return nil
+	return tx.Commit(ctx)
+}
+
+func requireHistoryTranscriptAnchor(
+	ctx context.Context,
+	query historyRecipientAuthorityQuery,
+	sessionID, recipientID uuid.UUID,
+	asOfSnapshotSequence int64,
+	maxRevision *int64,
+) error {
+	var found bool
+	err := query.QueryRow(ctx, `
+		SELECT true
+		FROM snapshots
+		WHERE session_id=$1 AND recipient_device_id=$2 AND snapshot_seq=$3
+		  AND format_name='TERMLINK_TERMINAL_SNAPSHOT' AND format_version=1
+		  AND deleted_at IS NULL AND ($4::bigint IS NULL OR history_revision<=$4)`,
+		sessionID, recipientID, asOfSnapshotSequence, maxRevision).Scan(&found)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	return err
+}
+
+type transcriptPublicationRecord struct {
+	InitialBeforeLineID int64
+	ExpectedPageCount   int
+	CompletedRevision   *int64
+}
+
+func findTranscriptPublication(
+	ctx context.Context,
+	query historyRecipientAuthorityQuery,
+	sessionID, recipientID uuid.UUID,
+	asOfSnapshotSequence int64,
+) (transcriptPublicationRecord, bool, error) {
+	var publication transcriptPublicationRecord
+	err := query.QueryRow(ctx, `
+		SELECT initial_before_line_id,expected_page_count,completed_revision
+		FROM transcript_publications
+		WHERE session_id=$1 AND recipient_device_id=$2 AND as_of_snapshot_seq=$3`,
+		sessionID, recipientID, asOfSnapshotSequence,
+	).Scan(&publication.InitialBeforeLineID, &publication.ExpectedPageCount, &publication.CompletedRevision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return transcriptPublicationRecord{}, false, nil
+	}
+	if err != nil {
+		return transcriptPublicationRecord{}, false, err
+	}
+	return publication, true, nil
+}
+
+type historyRecipientAuthorityQuery interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func (s *Postgres) requireHistoryRecipientAuthority(
+	ctx context.Context,
+	query historyRecipientAuthorityQuery,
+	userID, actorID, sessionID, recipientID uuid.UUID,
+	keyEpoch int64,
+) error {
+	var allowed bool
+	err := query.QueryRow(ctx, `
+		SELECT true
+		FROM sessions s
+		JOIN pcs p
+		  ON p.id=s.pc_id AND p.owner_user_id=$1 AND p.device_id=$2
+		 AND p.remote_routing_enabled AND p.key_epoch=$5
+		JOIN devices actor
+		  ON actor.id=$2 AND actor.user_id=$1 AND actor.device_type='WINDOWS_PC' AND actor.trust_state='TRUSTED'
+		JOIN devices recipient
+		  ON recipient.id=$4 AND recipient.user_id=$1 AND recipient.device_type='ANDROID' AND recipient.trust_state='TRUSTED'
+		LEFT JOIN device_grants recipient_grant
+		  ON recipient_grant.pc_id=p.id AND recipient_grant.device_id=recipient.id
+		 AND (recipient_grant.expires_at IS NULL OR recipient_grant.expires_at>now())
+		WHERE s.id=$3 AND s.deleted_at IS NULL AND ($6 OR recipient_grant.device_id IS NOT NULL)
+		FOR SHARE OF s,p,actor,recipient`, userID, actorID, sessionID, recipientID, keyEpoch, s.AutoTrustDevices,
+	).Scan(&allowed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrDenied
+	}
+	return err
 }
 
 func (s *Postgres) PendingHistoryUpload(ctx context.Context, userID, actorID, sessionID, uploadID uuid.UUID) (HistoryUploadRecord, error) {
 	var item HistoryUploadRecord
 	err := s.Pool.QueryRow(ctx, `
-		SELECT id,session_id,kind,object_key,key_id,ciphertext_sha256,size_bytes,start_seq,end_seq,snapshot_seq,rows,columns,format_name,format_version,expires_at
+		SELECT id,session_id,kind,object_key,key_id,ciphertext_sha256,size_bytes,start_seq,end_seq,snapshot_seq,as_of_snapshot_seq,first_line_id,last_line_id,transcript_initial_before_line_id,transcript_page_count,rows,columns,format_name,format_version,recipient_device_id,recipient_key_epoch,expires_at
 		FROM history_uploads
 		WHERE id=$1 AND user_id=$2 AND actor_device_id=$3 AND session_id=$4 AND committed_at IS NULL AND expires_at>now()`,
 		uploadID, userID, actorID, sessionID,
 	).Scan(&item.ID, &item.SessionID, &item.Kind, &item.ObjectKey, &item.KeyID, &item.CiphertextSHA256,
-		&item.SizeBytes, &item.StartSequence, &item.EndSequence, &item.SnapshotSequence, &item.Rows, &item.Columns,
-		&item.FormatName, &item.FormatVersion, &item.ExpiresAt)
+		&item.SizeBytes, &item.StartSequence, &item.EndSequence, &item.SnapshotSequence, &item.AsOfSnapshotSequence,
+		&item.FirstLineID, &item.LastLineID, &item.TranscriptInitialBeforeLineID, &item.TranscriptPageCount,
+		&item.Rows, &item.Columns,
+		&item.FormatName, &item.FormatVersion, &item.RecipientDeviceID, &item.RecipientKeyEpoch, &item.ExpiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return HistoryUploadRecord{}, ErrNotFound
 	}
-	return item, err
+	if err != nil {
+		return HistoryUploadRecord{}, err
+	}
+	if err := validateHistoryUploadShape(item); err != nil {
+		return HistoryUploadRecord{}, err
+	}
+	if err := validateHistoryUploadRecipient(item); err != nil {
+		return HistoryUploadRecord{}, err
+	}
+	if err := s.requireHistoryRecipientAuthority(ctx, s.Pool, userID, actorID, sessionID, item.RecipientDeviceID, item.RecipientKeyEpoch); err != nil {
+		return HistoryUploadRecord{}, err
+	}
+	return item, nil
 }
 
 func (s *Postgres) CommitHistoryUpload(ctx context.Context, userID, actorID, sessionID, uploadID uuid.UUID) (HistoryItem, error) {
@@ -1094,36 +1624,105 @@ func (s *Postgres) CommitHistoryUpload(ctx context.Context, userID, actorID, ses
 		return HistoryItem{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var upload HistoryUploadRecord
+	var lastOutputSequence int64
 	err = tx.QueryRow(ctx, `
-		SELECT id,session_id,kind,object_key,key_id,ciphertext_sha256,size_bytes,start_seq,end_seq,snapshot_seq,rows,columns,format_name,format_version,expires_at
-		FROM history_uploads
-		WHERE id=$1 AND user_id=$2 AND actor_device_id=$3 AND session_id=$4 AND committed_at IS NULL AND expires_at>now()
-		FOR UPDATE`, uploadID, userID, actorID, sessionID,
-	).Scan(&upload.ID, &upload.SessionID, &upload.Kind, &upload.ObjectKey, &upload.KeyID, &upload.CiphertextSHA256,
-		&upload.SizeBytes, &upload.StartSequence, &upload.EndSequence, &upload.SnapshotSequence, &upload.Rows,
-		&upload.Columns, &upload.FormatName, &upload.FormatVersion, &upload.ExpiresAt)
+		SELECT session.last_output_seq
+		FROM sessions session
+		WHERE session.id=$1 AND session.deleted_at IS NULL
+		  AND EXISTS (
+		    SELECT 1 FROM history_uploads upload
+		    WHERE upload.id=$2 AND upload.user_id=$3 AND upload.actor_device_id=$4
+		      AND upload.session_id=session.id AND upload.committed_at IS NULL AND upload.expires_at>now()
+		  )
+		FOR UPDATE OF session`, sessionID, uploadID, userID, actorID).Scan(&lastOutputSequence)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return HistoryItem{}, ErrConflict
 	}
 	if err != nil {
 		return HistoryItem{}, err
 	}
-	itemID := uuid.New()
-	if upload.Kind == "CHUNK" {
-		_, err = tx.Exec(ctx, `
-			INSERT INTO event_chunks(id,session_id,start_seq,end_seq,object_key,key_id,ciphertext_sha256,size_bytes)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, itemID, sessionID, upload.StartSequence, upload.EndSequence,
-			upload.ObjectKey, upload.KeyID, upload.CiphertextSHA256, upload.SizeBytes)
-	} else {
-		_, err = tx.Exec(ctx, `
-			INSERT INTO snapshots(id,session_id,snapshot_seq,rows,columns,object_key,key_id,ciphertext_sha256,size_bytes,format_name,format_version)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, itemID, sessionID, upload.SnapshotSequence,
-			upload.Rows, upload.Columns, upload.ObjectKey, upload.KeyID, upload.CiphertextSHA256, upload.SizeBytes,
-			upload.FormatName, upload.FormatVersion)
+	var upload HistoryUploadRecord
+	err = tx.QueryRow(ctx, `
+		SELECT id,session_id,kind,object_key,key_id,ciphertext_sha256,size_bytes,start_seq,end_seq,snapshot_seq,as_of_snapshot_seq,first_line_id,last_line_id,transcript_initial_before_line_id,transcript_page_count,rows,columns,format_name,format_version,recipient_device_id,recipient_key_epoch,expires_at
+		FROM history_uploads
+		WHERE id=$1 AND user_id=$2 AND actor_device_id=$3 AND session_id=$4 AND committed_at IS NULL AND expires_at>now()
+		FOR UPDATE`, uploadID, userID, actorID, sessionID,
+	).Scan(&upload.ID, &upload.SessionID, &upload.Kind, &upload.ObjectKey, &upload.KeyID, &upload.CiphertextSHA256,
+		&upload.SizeBytes, &upload.StartSequence, &upload.EndSequence, &upload.SnapshotSequence,
+		&upload.AsOfSnapshotSequence, &upload.FirstLineID, &upload.LastLineID,
+		&upload.TranscriptInitialBeforeLineID, &upload.TranscriptPageCount, &upload.Rows,
+		&upload.Columns, &upload.FormatName, &upload.FormatVersion, &upload.RecipientDeviceID,
+		&upload.RecipientKeyEpoch, &upload.ExpiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return HistoryItem{}, ErrConflict
 	}
 	if err != nil {
 		return HistoryItem{}, err
+	}
+	if err := validateHistoryUploadShape(upload); err != nil {
+		return HistoryItem{}, err
+	}
+	if err := validateHistoryUploadRecipient(upload); err != nil {
+		return HistoryItem{}, err
+	}
+	if err := s.requireHistoryRecipientAuthority(ctx, tx, userID, actorID, sessionID, upload.RecipientDeviceID, upload.RecipientKeyEpoch); err != nil {
+		return HistoryItem{}, err
+	}
+	if upload.Kind == "SNAPSHOT" && upload.FormatName != nil && *upload.FormatName == HistoryFormatTerminalSnapshot &&
+		upload.SnapshotSequence != nil && *upload.SnapshotSequence > lastOutputSequence {
+		return HistoryItem{}, ErrInvalidHistorySnapshot
+	}
+	itemID := uuid.New()
+	var createdAt time.Time
+	var historyRevision int64
+	if upload.Kind == "CHUNK" {
+		// The object key identifies this upload attempt, while the encrypted
+		// content identity is key, digest, and size. Retain the first attempt's
+		// canonical row when an identical sequence range is uploaded again.
+		err = tx.QueryRow(ctx, `
+			INSERT INTO event_chunks(id,session_id,start_seq,end_seq,object_key,key_id,ciphertext_sha256,size_bytes,recipient_device_id)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+			ON CONFLICT ON CONSTRAINT event_chunks_session_recipient_range_key DO UPDATE
+			SET id=event_chunks.id
+			WHERE event_chunks.key_id=EXCLUDED.key_id
+			  AND event_chunks.ciphertext_sha256=EXCLUDED.ciphertext_sha256
+			  AND event_chunks.size_bytes=EXCLUDED.size_bytes
+			RETURNING id,object_key,key_id,ciphertext_sha256,size_bytes,created_at,history_revision`, itemID, sessionID,
+			upload.StartSequence, upload.EndSequence, upload.ObjectKey, upload.KeyID, upload.CiphertextSHA256,
+			upload.SizeBytes, upload.RecipientDeviceID).Scan(&itemID, &upload.ObjectKey, &upload.KeyID, &upload.CiphertextSHA256,
+			&upload.SizeBytes, &createdAt, &historyRevision)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return HistoryItem{}, ErrConflict
+		}
+	} else if upload.Kind == "SNAPSHOT" {
+		err = tx.QueryRow(ctx, `
+			INSERT INTO snapshots(id,session_id,snapshot_seq,rows,columns,object_key,key_id,ciphertext_sha256,size_bytes,format_name,format_version,recipient_device_id)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+			ON CONFLICT ON CONSTRAINT snapshots_session_recipient_sequence_format_key DO UPDATE
+			SET id=snapshots.id
+			WHERE snapshots.key_id=EXCLUDED.key_id
+			  AND snapshots.ciphertext_sha256=EXCLUDED.ciphertext_sha256
+			  AND snapshots.size_bytes=EXCLUDED.size_bytes
+			  AND snapshots.rows=EXCLUDED.rows
+			  AND snapshots.columns=EXCLUDED.columns
+			RETURNING id,object_key,key_id,ciphertext_sha256,size_bytes,rows,columns,created_at,history_revision`, itemID, sessionID, upload.SnapshotSequence,
+			upload.Rows, upload.Columns, upload.ObjectKey, upload.KeyID, upload.CiphertextSHA256, upload.SizeBytes,
+			upload.FormatName, upload.FormatVersion, upload.RecipientDeviceID).Scan(&itemID, &upload.ObjectKey,
+			&upload.KeyID, &upload.CiphertextSHA256, &upload.SizeBytes, upload.Rows, upload.Columns, &createdAt,
+			&historyRevision)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return HistoryItem{}, ErrConflict
+		}
+	} else {
+		err = commitTranscriptPage(ctx, tx, sessionID, &upload, &itemID, &createdAt, &historyRevision)
+	}
+	if err != nil {
+		return HistoryItem{}, err
+	}
+	if upload.Kind == "SNAPSHOT" && upload.FormatName != nil && *upload.FormatName == HistoryFormatTerminalSnapshot {
+		if err := ensureTranscriptPublication(ctx, tx, sessionID, upload); err != nil {
+			return HistoryItem{}, err
+		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE history_uploads SET committed_at=now() WHERE id=$1`, uploadID); err != nil {
 		return HistoryItem{}, err
@@ -1132,7 +1731,8 @@ func (s *Postgres) CommitHistoryUpload(ctx context.Context, userID, actorID, ses
 		return HistoryItem{}, err
 	}
 	item := HistoryItem{Kind: strings.ToLower(upload.Kind), ID: itemID, ObjectKey: upload.ObjectKey, KeyID: upload.KeyID,
-		CiphertextSHA256: upload.CiphertextSHA256, SizeBytes: upload.SizeBytes, CreatedAt: time.Now().UTC()}
+		CiphertextSHA256: upload.CiphertextSHA256, SizeBytes: upload.SizeBytes, CreatedAt: createdAt,
+		HistoryRevision: historyRevision}
 	if upload.StartSequence != nil {
 		item.StartSequence = uint64(*upload.StartSequence)
 	}
@@ -1141,6 +1741,21 @@ func (s *Postgres) CommitHistoryUpload(ctx context.Context, userID, actorID, ses
 	}
 	if upload.SnapshotSequence != nil {
 		item.SnapshotSequence = uint64(*upload.SnapshotSequence)
+	}
+	if upload.AsOfSnapshotSequence != nil {
+		item.AsOfSnapshotSequence = uint64(*upload.AsOfSnapshotSequence)
+	}
+	if upload.FirstLineID != nil {
+		item.FirstLineID = uint64(*upload.FirstLineID)
+	}
+	if upload.LastLineID != nil {
+		item.LastLineID = uint64(*upload.LastLineID)
+	}
+	if upload.Rows != nil {
+		item.Rows = *upload.Rows
+	}
+	if upload.Columns != nil {
+		item.Columns = *upload.Columns
 	}
 	if upload.FormatName != nil {
 		item.FormatName = *upload.FormatName
@@ -1151,15 +1766,242 @@ func (s *Postgres) CommitHistoryUpload(ctx context.Context, userID, actorID, ses
 	return item, nil
 }
 
+func ensureTranscriptPublication(
+	ctx context.Context,
+	tx pgx.Tx,
+	sessionID uuid.UUID,
+	upload HistoryUploadRecord,
+) error {
+	if upload.TranscriptInitialBeforeLineID == nil || upload.TranscriptPageCount == nil || upload.SnapshotSequence == nil {
+		return nil
+	}
+	var ignored int64
+	err := tx.QueryRow(ctx, `
+		INSERT INTO transcript_publications(
+		  session_id,recipient_device_id,as_of_snapshot_seq,initial_before_line_id,expected_page_count)
+		VALUES($1,$2,$3,$4,$5)
+		ON CONFLICT (session_id,recipient_device_id,as_of_snapshot_seq) DO UPDATE
+		SET initial_before_line_id=transcript_publications.initial_before_line_id
+		WHERE transcript_publications.initial_before_line_id=EXCLUDED.initial_before_line_id
+		  AND transcript_publications.expected_page_count=EXCLUDED.expected_page_count
+		RETURNING initial_before_line_id`,
+		sessionID, upload.RecipientDeviceID, upload.SnapshotSequence,
+		upload.TranscriptInitialBeforeLineID, upload.TranscriptPageCount,
+	).Scan(&ignored)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	return finalizeTranscriptPublication(ctx, tx, sessionID, upload.RecipientDeviceID, *upload.SnapshotSequence)
+}
+
+func lockTranscriptPublication(
+	ctx context.Context,
+	tx pgx.Tx,
+	sessionID, recipientID uuid.UUID,
+	asOfSnapshotSequence int64,
+) (transcriptPublicationRecord, bool, error) {
+	var publication transcriptPublicationRecord
+	err := tx.QueryRow(ctx, `
+		SELECT initial_before_line_id,expected_page_count,completed_revision
+		FROM transcript_publications
+		WHERE session_id=$1 AND recipient_device_id=$2 AND as_of_snapshot_seq=$3
+		FOR UPDATE`, sessionID, recipientID, asOfSnapshotSequence,
+	).Scan(&publication.InitialBeforeLineID, &publication.ExpectedPageCount, &publication.CompletedRevision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return transcriptPublicationRecord{}, false, nil
+	}
+	if err != nil {
+		return transcriptPublicationRecord{}, false, err
+	}
+	return publication, true, nil
+}
+
+func finalizeTranscriptPublication(
+	ctx context.Context,
+	tx pgx.Tx,
+	sessionID, recipientID uuid.UUID,
+	asOfSnapshotSequence int64,
+) error {
+	publication, found, err := lockTranscriptPublication(ctx, tx, sessionID, recipientID, asOfSnapshotSequence)
+	if err != nil || !found || publication.CompletedRevision != nil {
+		return err
+	}
+
+	var snapshotRevision int64
+	err = tx.QueryRow(ctx, `
+		SELECT history_revision
+		FROM snapshots
+		WHERE session_id=$1 AND recipient_device_id=$2 AND snapshot_seq=$3
+		  AND format_name='TERMLINK_TERMINAL_SNAPSHOT' AND format_version=1 AND deleted_at IS NULL`,
+		sessionID, recipientID, asOfSnapshotSequence,
+	).Scan(&snapshotRevision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+
+	var pageCount int
+	var maxPageRevision *int64
+	var pagesBelowInitial bool
+	err = tx.QueryRow(ctx, `
+		SELECT count(*),max(history_revision),coalesce(bool_and(last_line_id<$4),true)
+		FROM transcript_pages
+		WHERE session_id=$1 AND recipient_device_id=$2 AND as_of_snapshot_seq=$3 AND deleted_at IS NULL`,
+		sessionID, recipientID, asOfSnapshotSequence, publication.InitialBeforeLineID,
+	).Scan(&pageCount, &maxPageRevision, &pagesBelowInitial)
+	if err != nil {
+		return err
+	}
+	if !pagesBelowInitial || pageCount > publication.ExpectedPageCount {
+		return ErrConflict
+	}
+	if pageCount < publication.ExpectedPageCount {
+		return nil
+	}
+	completedRevision := snapshotRevision
+	if maxPageRevision != nil && *maxPageRevision > completedRevision {
+		completedRevision = *maxPageRevision
+	}
+	command, err := tx.Exec(ctx, `
+		UPDATE transcript_publications
+		SET completed_revision=$4,completed_at=now()
+		WHERE session_id=$1 AND recipient_device_id=$2 AND as_of_snapshot_seq=$3
+		  AND completed_revision IS NULL`, sessionID, recipientID, asOfSnapshotSequence, completedRevision)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
+func commitTranscriptPage(
+	ctx context.Context,
+	tx pgx.Tx,
+	sessionID uuid.UUID,
+	upload *HistoryUploadRecord,
+	itemID *uuid.UUID,
+	createdAt *time.Time,
+	historyRevision *int64,
+) error {
+	err := tx.QueryRow(ctx, `
+		SELECT id,object_key,key_id,ciphertext_sha256,size_bytes,created_at,history_revision
+		FROM transcript_pages
+		WHERE session_id=$1 AND recipient_device_id=$2 AND as_of_snapshot_seq=$3
+		  AND first_line_id=$4 AND last_line_id=$5
+		  AND format_name=$6 AND format_version=$7 AND deleted_at IS NULL
+		  AND key_id=$8 AND ciphertext_sha256=$9 AND size_bytes=$10`,
+		sessionID, upload.RecipientDeviceID, upload.AsOfSnapshotSequence, upload.FirstLineID,
+		upload.LastLineID, upload.FormatName, upload.FormatVersion, upload.KeyID,
+		upload.CiphertextSHA256, upload.SizeBytes,
+	).Scan(itemID, &upload.ObjectKey, &upload.KeyID, &upload.CiphertextSHA256, &upload.SizeBytes, createdAt, historyRevision)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	publication, publicationFound, err := lockTranscriptPublication(
+		ctx, tx, sessionID, upload.RecipientDeviceID, *upload.AsOfSnapshotSequence,
+	)
+	if err != nil {
+		return err
+	}
+	if publicationFound && (publication.CompletedRevision != nil || *upload.LastLineID >= publication.InitialBeforeLineID) {
+		return ErrConflict
+	}
+
+	var overlaps bool
+	err = tx.QueryRow(ctx, `
+		SELECT EXISTS (
+		  SELECT 1 FROM transcript_pages
+		  WHERE session_id=$1 AND recipient_device_id=$2 AND as_of_snapshot_seq=$3
+		    AND deleted_at IS NULL AND first_line_id<=$5 AND last_line_id>=$4
+		)`, sessionID, upload.RecipientDeviceID, upload.AsOfSnapshotSequence,
+		upload.FirstLineID, upload.LastLineID).Scan(&overlaps)
+	if err != nil {
+		return err
+	}
+	if overlaps {
+		return ErrConflict
+	}
+
+	err = tx.QueryRow(ctx, `
+		INSERT INTO transcript_pages(
+		  id,session_id,recipient_device_id,as_of_snapshot_seq,first_line_id,last_line_id,
+		  object_key,key_id,ciphertext_sha256,size_bytes,format_name,format_version)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		RETURNING id,object_key,key_id,ciphertext_sha256,size_bytes,created_at,history_revision`,
+		*itemID, sessionID, upload.RecipientDeviceID, upload.AsOfSnapshotSequence,
+		upload.FirstLineID, upload.LastLineID, upload.ObjectKey, upload.KeyID,
+		upload.CiphertextSHA256, upload.SizeBytes, upload.FormatName, upload.FormatVersion,
+	).Scan(itemID, &upload.ObjectKey, &upload.KeyID, &upload.CiphertextSHA256, &upload.SizeBytes, createdAt, historyRevision)
+	var postgresError *pgconn.PgError
+	if errors.As(err, &postgresError) && postgresError.Code == "23505" {
+		return ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	if publicationFound {
+		return finalizeTranscriptPublication(ctx, tx, sessionID, upload.RecipientDeviceID, *upload.AsOfSnapshotSequence)
+	}
+	return nil
+}
+
+// SessionHistoryObjectKeys checks delete-specific MANAGE authority and
+// activity before returning the currently indexed ciphertext keys.
 func (s *Postgres) SessionHistoryObjectKeys(ctx context.Context, userID, actorID, sessionID uuid.UUID) ([]string, error) {
-	permission, err := s.SessionPermission(ctx, userID, actorID, sessionID)
-	if err != nil || permission != "MANAGE" {
+	var permission string
+	var deleted, active bool
+	err := s.Pool.QueryRow(ctx, `
+		SELECT CASE
+		         WHEN p.device_id=actor.id OR $4 THEN 'MANAGE'
+		         ELSE COALESCE(manager.permission,'')
+		       END,
+		       s.deleted_at IS NOT NULL,
+		       s.state='RUNNING'
+		         AND CASE
+		           WHEN p.session_heartbeat_capable
+		             THEN s.last_seen_at > now()-($5 * interval '1 second')
+		           ELSE p.last_seen_at > now()-($5 * interval '1 second')
+		         END
+		FROM sessions s
+		JOIN pcs p ON p.id=s.pc_id
+		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
+		JOIN devices actor
+		  ON actor.id=$2 AND actor.user_id=$3 AND actor.trust_state='TRUSTED'
+		LEFT JOIN device_grants manager
+		  ON manager.pc_id=p.id AND manager.device_id=actor.id
+		 AND (manager.expires_at IS NULL OR manager.expires_at>now())
+		WHERE s.id=$1 AND p.owner_user_id=$3`, sessionID, actorID, userID, s.AutoTrustDevices,
+		float64(sessionOnlineWindow/time.Second)).Scan(&permission, &deleted, &active)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDenied
+	}
+	if err != nil {
+		return nil, err
+	}
+	if permission != "MANAGE" {
+		return nil, ErrDenied
+	}
+	if deleted {
+		return nil, nil
+	}
+	if active {
+		return nil, ErrSessionActive
 	}
 	rows, err := s.Pool.Query(ctx, `
 		SELECT object_key FROM event_chunks WHERE session_id=$1 AND deleted_at IS NULL
 		UNION SELECT object_key FROM snapshots WHERE session_id=$1 AND deleted_at IS NULL
-		UNION SELECT object_key FROM history_uploads WHERE session_id=$1 AND committed_at IS NULL`, sessionID)
+		UNION SELECT object_key FROM transcript_pages WHERE session_id=$1 AND deleted_at IS NULL
+		UNION SELECT object_key FROM history_uploads WHERE session_id=$1`, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -1176,29 +2018,76 @@ func (s *Postgres) SessionHistoryObjectKeys(ctx context.Context, userID, actorID
 }
 
 func (s *Postgres) MarkSessionDeleted(ctx context.Context, userID, actorID, sessionID uuid.UUID, traceID string) error {
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		err = s.markSessionDeletedOnce(ctx, userID, actorID, sessionID, traceID)
+		if !isPostgresRetryableTransactionError(err) {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	return err
+}
+
+func isPostgresRetryableTransactionError(err error) bool {
+	var postgresError *pgconn.PgError
+	return errors.As(err, &postgresError) && (postgresError.Code == "40001" || postgresError.Code == "40P01")
+}
+
+func (s *Postgres) markSessionDeletedOnce(ctx context.Context, userID, actorID, sessionID uuid.UUID, traceID string) error {
 	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var permission string
-	err = tx.QueryRow(ctx, `SELECT CASE WHEN p.device_id=$2 THEN 'MANAGE' ELSE g.permission END FROM sessions s JOIN pcs p ON p.id=s.pc_id LEFT JOIN device_grants g ON g.pc_id=p.id AND g.device_id=$2 AND (g.expires_at IS NULL OR g.expires_at>now()) WHERE s.id=$1 AND p.owner_user_id=$3 AND s.deleted_at IS NULL AND (p.device_id=$2 OR g.device_id IS NOT NULL) FOR UPDATE OF s,p`, sessionID, actorID, userID).Scan(&permission)
-	if errors.Is(err, pgx.ErrNoRows) || permission != "MANAGE" {
+	var deleted, active bool
+	err = tx.QueryRow(ctx, `
+		SELECT CASE
+		         WHEN p.device_id=actor.id OR $4 THEN 'MANAGE'
+		         ELSE COALESCE(manager.permission,'')
+		       END,
+		       s.deleted_at IS NOT NULL,
+		       s.state='RUNNING'
+		         AND CASE
+		           WHEN p.session_heartbeat_capable
+		             THEN s.last_seen_at > now()-($5 * interval '1 second')
+		           ELSE p.last_seen_at > now()-($5 * interval '1 second')
+		         END
+		FROM sessions s
+		JOIN pcs p ON p.id=s.pc_id
+		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
+		JOIN devices actor ON actor.id=$2 AND actor.user_id=$3 AND actor.trust_state='TRUSTED'
+		LEFT JOIN device_grants manager
+		  ON manager.pc_id=p.id AND manager.device_id=actor.id
+		 AND (manager.expires_at IS NULL OR manager.expires_at>now())
+		WHERE s.id=$1 AND p.owner_user_id=$3
+		FOR UPDATE OF s,p`, sessionID, actorID, userID, s.AutoTrustDevices,
+		float64(sessionOnlineWindow/time.Second)).Scan(&permission, &deleted, &active)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrDenied
 	}
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE event_chunks SET deleted_at=now() WHERE session_id=$1 AND deleted_at IS NULL`, sessionID); err != nil {
+	if permission != "MANAGE" {
+		return ErrDenied
+	}
+	if deleted {
+		return tx.Commit(ctx)
+	}
+	if active {
+		return ErrSessionActive
+	}
+	if err := tombstoneSessionHistory(ctx, tx, sessionID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE snapshots SET deleted_at=now() WHERE session_id=$1 AND deleted_at IS NULL`, sessionID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `DELETE FROM history_uploads WHERE session_id=$1`, sessionID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `UPDATE sessions SET state='DELETED',deleted_at=now() WHERE id=$1`, sessionID); err != nil {
+	if _, err := tx.Exec(ctx, `
+		UPDATE sessions
+		SET state='DELETED',deleted_at=now(),deletion_reason='USER_REQUESTED'
+		WHERE id=$1`, sessionID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id) VALUES($1,$2,'session.delete','session',$3,'SUCCEEDED',$4)`, userID, actorID, sessionID, traceID); err != nil {
@@ -1207,41 +2096,534 @@ func (s *Postgres) MarkSessionDeleted(ctx context.Context, userID, actorID, sess
 	return tx.Commit(ctx)
 }
 
+func tombstoneSessionHistory(ctx context.Context, tx pgx.Tx, sessionID uuid.UUID) error {
+	if _, err := tx.Exec(ctx, `
+		WITH object_keys AS (
+			SELECT object_key FROM event_chunks WHERE session_id=$1 AND deleted_at IS NULL
+			UNION SELECT object_key FROM snapshots WHERE session_id=$1 AND deleted_at IS NULL
+			UNION SELECT object_key FROM transcript_pages WHERE session_id=$1 AND deleted_at IS NULL
+			UNION SELECT object_key FROM history_uploads WHERE session_id=$1
+		)
+		INSERT INTO outbox(event_type,aggregate_id,payload)
+		SELECT 'history.object.delete',$1,jsonb_build_object('object_key',object_key)
+		FROM object_keys
+		ON CONFLICT DO NOTHING`, sessionID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM control_leases WHERE session_id=$1`, sessionID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE event_chunks SET deleted_at=now() WHERE session_id=$1 AND deleted_at IS NULL`, sessionID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE snapshots SET deleted_at=now() WHERE session_id=$1 AND deleted_at IS NULL`, sessionID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE transcript_pages SET deleted_at=now() WHERE session_id=$1 AND deleted_at IS NULL`, sessionID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM history_uploads WHERE session_id=$1`, sessionID); err != nil {
+		return err
+	}
+	return nil
+}
+
+const maxAutomaticSessionCleanupBatch = 100
+
+// CleanupSessions tombstones a bounded batch of server-side session metadata.
+// It does not publish a realtime command or ask a Windows Agent to terminate a
+// process. EXITED rows are safe after endedBefore. RUNNING and INTERRUPTED rows
+// are eligible only after their PC opted in to explicit session heartbeats and
+// that session metadata is older than staleBefore.
+func (s *Postgres) CleanupSessions(ctx context.Context, endedBefore, staleBefore time.Time, batchSize int) (int, error) {
+	if batchSize <= 0 {
+		return 0, nil
+	}
+	if batchSize > maxAutomaticSessionCleanupBatch {
+		batchSize = maxAutomaticSessionCleanupBatch
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT session.id
+		FROM sessions session
+		JOIN pcs pc ON pc.id=session.pc_id
+		WHERE session.deleted_at IS NULL AND (
+			(session.state='EXITED'
+			 AND COALESCE(session.ended_at,session.last_seen_at)<=$1)
+			OR
+			(session.state IN ('RUNNING','INTERRUPTED')
+			 AND pc.session_heartbeat_capable
+			 AND GREATEST(session.last_seen_at,pc.session_heartbeat_enabled_at)<=$2)
+		)
+		ORDER BY CASE WHEN session.state='EXITED' THEN 0 ELSE 1 END,
+		         COALESCE(session.ended_at,session.last_seen_at,pc.session_heartbeat_enabled_at),
+		         session.id
+		LIMIT $3`, endedBefore, staleBefore, batchSize)
+	if err != nil {
+		return 0, err
+	}
+	var candidates []uuid.UUID
+	for rows.Next() {
+		var sessionID uuid.UUID
+		if err := rows.Scan(&sessionID); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		candidates = append(candidates, sessionID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+
+	cleaned := 0
+	for _, sessionID := range candidates {
+		changed, err := s.cleanupSession(ctx, sessionID, endedBefore, staleBefore)
+		if err != nil {
+			return cleaned, err
+		}
+		if changed {
+			cleaned++
+		}
+	}
+	return cleaned, nil
+}
+
+func (s *Postgres) cleanupSession(ctx context.Context, sessionID uuid.UUID, endedBefore, staleBefore time.Time) (bool, error) {
+	var changed bool
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		changed, err = s.cleanupSessionOnce(ctx, sessionID, endedBefore, staleBefore)
+		if !isPostgresRetryableTransactionError(err) {
+			return changed, err
+		}
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+	}
+	return changed, err
+}
+
+func (s *Postgres) cleanupSessionOnce(ctx context.Context, sessionID uuid.UUID, endedBefore, staleBefore time.Time) (bool, error) {
+	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Lock the owning PC before the session, matching UpsertSession. The second
+	// query is the authoritative eligibility check; the unlocked candidate scan
+	// is only a bounded work queue.
+	var userID uuid.UUID
+	var heartbeatCapable bool
+	var heartbeatEnabledAt *time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT pc.owner_user_id,pc.session_heartbeat_capable,pc.session_heartbeat_enabled_at
+		FROM pcs pc
+		JOIN sessions session ON session.pc_id=pc.id
+		WHERE session.id=$1
+		FOR UPDATE OF pc`, sessionID).Scan(&userID, &heartbeatCapable, &heartbeatEnabledAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, tx.Commit(ctx)
+	}
+	if err != nil {
+		return false, err
+	}
+
+	var state string
+	var deletedAt, endedAt, lastSeenAt *time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT state,deleted_at,ended_at,last_seen_at
+		FROM sessions
+		WHERE id=$1
+		FOR UPDATE`, sessionID).Scan(&state, &deletedAt, &endedAt, &lastSeenAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, tx.Commit(ctx)
+	}
+	if err != nil {
+		return false, err
+	}
+	if deletedAt != nil {
+		return false, tx.Commit(ctx)
+	}
+
+	reason := ""
+	switch state {
+	case "EXITED":
+		reference := endedAt
+		if reference == nil {
+			reference = lastSeenAt
+		}
+		if reference != nil && !reference.After(endedBefore) {
+			reason = "AUTO_ENDED"
+		}
+	case "RUNNING", "INTERRUPTED":
+		if !heartbeatCapable {
+			break
+		}
+		reference := lastSeenAt
+		if reference == nil || (heartbeatEnabledAt != nil && heartbeatEnabledAt.After(*reference)) {
+			reference = heartbeatEnabledAt
+		}
+		if reference != nil && !reference.After(staleBefore) {
+			reason = "AUTO_STALE"
+		}
+	}
+	if reason == "" {
+		return false, tx.Commit(ctx)
+	}
+
+	if err := tombstoneSessionHistory(ctx, tx, sessionID); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE sessions
+		SET state='DELETED',deleted_at=now(),deletion_reason=$2
+		WHERE id=$1`, sessionID, reason); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO audit_events(
+			user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata)
+		VALUES($1,NULL,'session.auto_delete','session',$2,'SUCCEEDED',$3,
+			jsonb_build_object('deletion_reason',$4::text,'previous_state',$5::text))`,
+		userID, sessionID, "session-cleanup:"+sessionID.String(), reason, state); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Postgres) ListHistory(ctx context.Context, userID, deviceID, sessionID uuid.UUID) ([]HistoryItem, error) {
 	if _, err := s.SessionPermission(ctx, userID, deviceID, sessionID); err != nil {
 		return nil, err
 	}
-	rows, err := s.Pool.Query(ctx, `SELECT 'chunk',id,start_seq,end_seq,NULL::bigint,object_key,key_id,ciphertext_sha256,size_bytes,''::text,0,created_at FROM event_chunks WHERE session_id=$1 AND deleted_at IS NULL UNION ALL SELECT 'snapshot',id,NULL::bigint,NULL::bigint,snapshot_seq,object_key,key_id,ciphertext_sha256,size_bytes,format_name,format_version,created_at FROM snapshots WHERE session_id=$1 AND deleted_at IS NULL ORDER BY 12,2`, sessionID)
+	var ownerPC bool
+	if err := s.Pool.QueryRow(ctx, `
+		SELECT p.device_id=$2
+		FROM sessions s JOIN pcs p ON p.id=s.pc_id
+		WHERE s.id=$1 AND p.owner_user_id=$3 AND s.deleted_at IS NULL`, sessionID, deviceID, userID,
+	).Scan(&ownerPC); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrDenied
+		}
+		return nil, err
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT 'chunk',id,start_seq,end_seq,NULL::bigint,NULL::integer,NULL::integer,
+		       object_key,key_id,ciphertext_sha256,size_bytes,''::text,0,created_at,history_revision
+		FROM event_chunks
+		WHERE session_id=$1 AND deleted_at IS NULL AND ($2 OR recipient_device_id=$3)
+		UNION ALL
+		SELECT 'snapshot',id,NULL::bigint,NULL::bigint,snapshot_seq,rows,columns,
+		       object_key,key_id,ciphertext_sha256,size_bytes,format_name,format_version,created_at,history_revision
+		FROM snapshots
+		WHERE session_id=$1 AND deleted_at IS NULL AND ($2 OR recipient_device_id=$3)
+		ORDER BY 14,2`, sessionID, ownerPC, deviceID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	result := make([]HistoryItem, 0)
 	for rows.Next() {
-		var i HistoryItem
-		var start, end, snapshot *int64
-		if err := rows.Scan(&i.Kind, &i.ID, &start, &end, &snapshot, &i.ObjectKey, &i.KeyID, &i.CiphertextSHA256, &i.SizeBytes, &i.FormatName, &i.FormatVersion, &i.CreatedAt); err != nil {
+		item, err := scanHistoryItem(rows)
+		if err != nil {
 			return nil, err
 		}
-		if start != nil {
-			i.StartSequence = uint64(*start)
-		}
-		if end != nil {
-			i.EndSequence = uint64(*end)
-		}
-		if snapshot != nil {
-			i.SnapshotSequence = uint64(*snapshot)
-		}
-		result = append(result, i)
+		result = append(result, item)
 	}
 	return result, rows.Err()
 }
 
+// ListHistoryPage returns an immutable view of the history catalog. The
+// session row share lock is the read-side of the revision trigger's write
+// fence: an in-flight upload is either fully before or fully after the anchor.
+func (s *Postgres) ListHistoryPage(ctx context.Context, userID, deviceID, sessionID uuid.UUID, request HistoryPageRequest) (HistoryPage, error) {
+	if request.Limit < 1 || request.Limit > 100 ||
+		(request.Kind != HistoryKindAll && request.Kind != HistoryKindChunk && request.Kind != HistoryKindSnapshot) ||
+		(request.FormatName != "" && (request.Kind != HistoryKindSnapshot ||
+			(request.FormatName != HistoryFormatBoundedEventReplay && request.FormatName != HistoryFormatTerminalSnapshot))) ||
+		(request.AsOfRevision != nil && *request.AsOfRevision < 0) {
+		return HistoryPage{}, ErrInvalidHistoryPage
+	}
+	if request.Before != nil {
+		if request.Before.Sequence < 0 || request.Before.ID == uuid.Nil ||
+			(request.Before.Kind != HistoryKindChunk && request.Before.Kind != HistoryKindSnapshot) ||
+			(request.Kind != HistoryKindAll && request.Before.Kind != request.Kind) {
+			return HistoryPage{}, ErrInvalidHistoryPage
+		}
+	}
+
+	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return HistoryPage{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var currentRevision, lastOutputSequence int64
+	var ownerPC bool
+	err = tx.QueryRow(ctx, `
+		SELECT s.history_revision,s.last_output_seq,p.device_id=$2
+		FROM sessions s
+		JOIN pcs p ON p.id=s.pc_id
+		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
+		JOIN devices owner_device ON owner_device.id=p.device_id AND owner_device.trust_state='TRUSTED'
+		JOIN devices actor ON actor.id=$2 AND actor.user_id=$3 AND actor.trust_state='TRUSTED'
+		LEFT JOIN device_grants g
+		  ON g.pc_id=p.id AND g.device_id=actor.id
+		 AND (g.expires_at IS NULL OR g.expires_at>now())
+		WHERE s.id=$1 AND p.owner_user_id=$3 AND p.remote_routing_enabled AND s.deleted_at IS NULL
+		  AND ($4 OR p.device_id=actor.id OR g.device_id IS NOT NULL)
+		FOR SHARE OF s`, sessionID, deviceID, userID, s.AutoTrustDevices).Scan(&currentRevision, &lastOutputSequence, &ownerPC)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return HistoryPage{}, ErrDenied
+	}
+	if err != nil {
+		return HistoryPage{}, err
+	}
+	anchor := currentRevision
+	if request.AsOfRevision != nil {
+		anchor = *request.AsOfRevision
+		if anchor > currentRevision {
+			return HistoryPage{}, ErrHistoryAnchorAhead
+		}
+	}
+
+	var beforeSequence any
+	beforeRank := 0
+	beforeID := uuid.Nil
+	if request.Before != nil {
+		beforeSequence = request.Before.Sequence
+		beforeRank = historyKindRank(request.Before.Kind)
+		beforeID = request.Before.ID
+	}
+	rows, err := tx.Query(ctx, `
+		WITH candidates AS (
+			SELECT 'chunk'::text AS kind,id,start_seq,end_seq,NULL::bigint AS snapshot_seq,
+			       NULL::integer AS rows,NULL::integer AS columns,object_key,key_id,ciphertext_sha256,
+			       size_bytes,''::text AS format_name,0 AS format_version,created_at,history_revision,
+			       end_seq AS logical_sequence,1 AS kind_rank
+			FROM event_chunks
+			WHERE session_id=$1 AND deleted_at IS NULL AND history_revision<=$2
+			  AND ($6='all' OR $6='chunk')
+			  AND ($7 OR recipient_device_id=$8)
+			  AND ($3::bigint IS NULL OR end_seq<$3 OR
+			       (end_seq=$3 AND (1<$4 OR (1=$4 AND id<$5))))
+			UNION ALL
+			SELECT 'snapshot'::text AS kind,id,NULL::bigint,NULL::bigint,snapshot_seq,
+			       rows,columns,object_key,key_id,ciphertext_sha256,size_bytes,format_name,format_version,
+			       created_at,history_revision,snapshot_seq AS logical_sequence,2 AS kind_rank
+			FROM snapshots
+			WHERE session_id=$1 AND deleted_at IS NULL AND history_revision<=$2
+			  AND ($6='all' OR $6='snapshot')
+			  AND ($7 OR recipient_device_id=$8)
+			  AND ($9='' OR format_name=$9)
+			  AND (format_name<>'TERMLINK_TERMINAL_SNAPSHOT' OR snapshot_seq<=$11)
+			  AND ($3::bigint IS NULL OR snapshot_seq<$3 OR
+			       (snapshot_seq=$3 AND (2<$4 OR (2=$4 AND id<$5))))
+		)
+		SELECT kind,id,start_seq,end_seq,snapshot_seq,rows,columns,object_key,key_id,ciphertext_sha256,
+		       size_bytes,format_name,format_version,created_at,history_revision
+		FROM candidates
+		ORDER BY logical_sequence DESC,kind_rank DESC,id DESC
+		LIMIT $10`, sessionID, anchor, beforeSequence, beforeRank, beforeID, string(request.Kind), ownerPC,
+		deviceID, request.FormatName, request.Limit+1, lastOutputSequence)
+	if err != nil {
+		return HistoryPage{}, err
+	}
+	items := make([]HistoryItem, 0, request.Limit+1)
+	for rows.Next() {
+		item, scanErr := scanHistoryItem(rows)
+		if scanErr != nil {
+			rows.Close()
+			return HistoryPage{}, scanErr
+		}
+		items = append(items, item)
+	}
+	rowsErr := rows.Err()
+	rows.Close()
+	if rowsErr != nil {
+		return HistoryPage{}, rowsErr
+	}
+	hasMore := len(items) > request.Limit
+	if hasMore {
+		items = items[:request.Limit]
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return HistoryPage{}, err
+	}
+	return HistoryPage{Items: items, AsOfRevision: anchor, HasMore: hasMore}, nil
+}
+
+func historyKindRank(kind HistoryKind) int {
+	if kind == HistoryKindSnapshot {
+		return 2
+	}
+	return 1
+}
+
+type historyItemScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanHistoryItem(row historyItemScanner) (HistoryItem, error) {
+	var item HistoryItem
+	var start, end, snapshot *int64
+	var rows, columns *int
+	if err := row.Scan(&item.Kind, &item.ID, &start, &end, &snapshot, &rows, &columns,
+		&item.ObjectKey, &item.KeyID, &item.CiphertextSHA256, &item.SizeBytes, &item.FormatName,
+		&item.FormatVersion, &item.CreatedAt, &item.HistoryRevision); err != nil {
+		return HistoryItem{}, err
+	}
+	if start != nil {
+		item.StartSequence = uint64(*start)
+	}
+	if end != nil {
+		item.EndSequence = uint64(*end)
+	}
+	if snapshot != nil {
+		item.SnapshotSequence = uint64(*snapshot)
+	}
+	if rows != nil {
+		item.Rows = *rows
+	}
+	if columns != nil {
+		item.Columns = *columns
+	}
+	return item, nil
+}
+
+// ListTranscriptPage reads one encrypted transcript page for the requesting
+// Android recipient. Transcript rows are deliberately separate from the
+// legacy event/snapshot history catalog and its "all" selector.
+func (s *Postgres) ListTranscriptPage(
+	ctx context.Context,
+	userID, deviceID, sessionID uuid.UUID,
+	request TranscriptPageRequest,
+) (TranscriptPage, error) {
+	if request.Limit != 1 || request.AsOfSnapshotSequence < 1 ||
+		(request.BeforeLineID != nil && *request.BeforeLineID < 1) ||
+		(request.AsOfRevision != nil && *request.AsOfRevision < 0) {
+		return TranscriptPage{}, ErrInvalidHistoryPage
+	}
+
+	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return TranscriptPage{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var currentRevision int64
+	err = tx.QueryRow(ctx, `
+		SELECT session.history_revision
+		FROM sessions session
+		JOIN pcs pc ON pc.id=session.pc_id AND pc.owner_user_id=$2 AND pc.remote_routing_enabled
+		JOIN users account ON account.id=$2 AND account.status='ACTIVE'
+		JOIN devices actor
+		  ON actor.id=$3 AND actor.user_id=$2 AND actor.device_type='ANDROID' AND actor.trust_state='TRUSTED'
+		LEFT JOIN device_grants actor_grant
+		  ON actor_grant.pc_id=pc.id AND actor_grant.device_id=actor.id
+		 AND (actor_grant.expires_at IS NULL OR actor_grant.expires_at>now())
+		WHERE session.id=$1 AND session.deleted_at IS NULL
+		  AND ($4 OR actor_grant.device_id IS NOT NULL)
+		FOR SHARE OF session`, sessionID, userID, deviceID, s.AutoTrustDevices).Scan(&currentRevision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TranscriptPage{}, ErrDenied
+	}
+	if err != nil {
+		return TranscriptPage{}, err
+	}
+
+	publication, publicationFound, err := findTranscriptPublication(
+		ctx, tx, sessionID, deviceID, request.AsOfSnapshotSequence,
+	)
+	if err != nil {
+		return TranscriptPage{}, err
+	}
+	anchorRevision := currentRevision
+	ready := true
+	if publicationFound {
+		if publication.CompletedRevision == nil {
+			if request.AsOfRevision != nil {
+				return TranscriptPage{}, ErrHistoryAnchorAhead
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return TranscriptPage{}, err
+			}
+			return TranscriptPage{Items: []HistoryItem{}, AsOfRevision: currentRevision, Ready: false}, nil
+		}
+		anchorRevision = *publication.CompletedRevision
+		if request.AsOfRevision != nil && *request.AsOfRevision != anchorRevision {
+			return TranscriptPage{}, ErrHistoryAnchorAhead
+		}
+	} else if request.AsOfRevision != nil {
+		anchorRevision = *request.AsOfRevision
+		if anchorRevision > currentRevision {
+			return TranscriptPage{}, ErrHistoryAnchorAhead
+		}
+	}
+	if err := requireHistoryTranscriptAnchor(ctx, tx, sessionID, deviceID, request.AsOfSnapshotSequence, &anchorRevision); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			if err := tx.Commit(ctx); err != nil {
+				return TranscriptPage{}, err
+			}
+			return TranscriptPage{Items: []HistoryItem{}, AsOfRevision: anchorRevision, Ready: false}, nil
+		}
+		return TranscriptPage{}, err
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT id,as_of_snapshot_seq,first_line_id,last_line_id,object_key,key_id,
+		       ciphertext_sha256,size_bytes,format_name,format_version,created_at,history_revision
+		FROM transcript_pages
+		WHERE session_id=$1 AND recipient_device_id=$2 AND as_of_snapshot_seq=$3
+		  AND deleted_at IS NULL AND history_revision<=$4
+		  AND ($5::bigint IS NULL OR last_line_id<$5)
+		ORDER BY last_line_id DESC,first_line_id DESC,id DESC
+		LIMIT 2`, sessionID, deviceID, request.AsOfSnapshotSequence, anchorRevision, request.BeforeLineID)
+	if err != nil {
+		return TranscriptPage{}, err
+	}
+	items := make([]HistoryItem, 0, 2)
+	for rows.Next() {
+		var item HistoryItem
+		var asOfSnapshotSequence, firstLineID, lastLineID int64
+		if err := rows.Scan(&item.ID, &asOfSnapshotSequence, &firstLineID, &lastLineID,
+			&item.ObjectKey, &item.KeyID, &item.CiphertextSHA256, &item.SizeBytes,
+			&item.FormatName, &item.FormatVersion, &item.CreatedAt, &item.HistoryRevision); err != nil {
+			rows.Close()
+			return TranscriptPage{}, err
+		}
+		item.Kind = string(HistoryKindTranscript)
+		item.AsOfSnapshotSequence = uint64(asOfSnapshotSequence)
+		item.FirstLineID = uint64(firstLineID)
+		item.LastLineID = uint64(lastLineID)
+		items = append(items, item)
+	}
+	rowsErr := rows.Err()
+	rows.Close()
+	if rowsErr != nil {
+		return TranscriptPage{}, rowsErr
+	}
+	hasMore := len(items) > request.Limit
+	if hasMore {
+		items = items[:request.Limit]
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return TranscriptPage{}, err
+	}
+	return TranscriptPage{Items: items, AsOfRevision: anchorRevision, HasMore: hasMore, Ready: ready}, nil
+}
+
 type Plan struct {
-	Key             string          `json:"key"`
-	DisplayName     string          `json:"display_name"`
-	Description     string          `json:"description"`
-	BillingPeriod   string          `json:"billing_period"`
+	Key           string `json:"key"`
+	DisplayName   string `json:"display_name"`
+	Description   string `json:"description"`
+	BillingPeriod string `json:"billing_period"`
+	// Quantity fields are exposed as -1 (UnlimitedQuota) by PublishedPlans;
+	// database/catalog values remain for backward-compatible billing storage.
 	MaxRemotePCs    int             `json:"max_remote_pcs"`
 	MaxLiveSessions int             `json:"max_live_sessions"`
 	FeatureFlags    json.RawMessage `json:"feature_flags"`
@@ -1315,7 +2697,7 @@ func validatePlanDraftInput(input PlanDraftInput) error {
 	if input.BillingPeriod != "FREE" && input.BillingPeriod != "MONTHLY" && input.BillingPeriod != "YEARLY" {
 		return ErrDenied
 	}
-	if input.MaxRemotePCs < 0 || input.MaxRemotePCs > 10000 || input.MaxLiveSessions < 0 || input.MaxLiveSessions > 100000 || input.SortOrder < -100000 || input.SortOrder > 100000 {
+	if input.MaxRemotePCs != UnlimitedQuota || input.MaxLiveSessions != UnlimitedQuota || input.SortOrder < -100000 || input.SortOrder > 100000 {
 		return ErrDenied
 	}
 	if input.AvailableFrom != nil && input.AvailableUntil != nil && !input.AvailableUntil.After(*input.AvailableFrom) {
@@ -1335,6 +2717,10 @@ func validatePlanDraftInput(input PlanDraftInput) error {
 }
 
 func normalizePlanDraftInput(input PlanDraftInput) PlanDraftInput {
+	// Quantity limits are retained only as compatibility fields. Every new
+	// catalog definition is persisted with the unlimited sentinel.
+	input.MaxRemotePCs = UnlimitedQuota
+	input.MaxLiveSessions = UnlimitedQuota
 	if len(input.FeatureFlags) == 0 {
 		input.FeatureFlags = json.RawMessage(`{}`)
 	}
@@ -1597,14 +2983,18 @@ func (s *Postgres) PublishedPlans(ctx context.Context) (int64, []Plan, error) {
 		if err := rows.Scan(&i.Key, &i.DisplayName, &i.Description, &i.BillingPeriod, &i.MaxRemotePCs, &i.MaxLiveSessions, &i.FeatureFlags, &i.ChannelProducts, &i.SortOrder); err != nil {
 			return 0, nil, err
 		}
+		i.MaxRemotePCs = UnlimitedQuota
+		i.MaxLiveSessions = UnlimitedQuota
 		result = append(result, i)
 	}
 	return version, result, rows.Err()
 }
 
 type Entitlement struct {
-	PlanKey         string          `json:"plan_key"`
-	CatalogVersion  int64           `json:"catalog_version"`
+	PlanKey        string `json:"plan_key"`
+	CatalogVersion int64  `json:"catalog_version"`
+	// Quantity fields are always -1 on API responses; they are not enforcement
+	// inputs anymore.
 	MaxRemotePCs    int             `json:"max_remote_pcs"`
 	MaxLiveSessions int             `json:"max_live_sessions"`
 	FeatureFlags    json.RawMessage `json:"feature_flags"`
@@ -1804,14 +3194,14 @@ func (s *Postgres) ForceDeleteLease(ctx context.Context, userID, actorID, sessio
 		  AND actor.id=$3 AND actor.user_id=$2 AND actor.trust_state='TRUSTED'
 		  AND account.id=$2 AND account.status='ACTIVE'
 		  AND (
-			p.device_id=actor.id OR EXISTS (
+			$6 OR p.device_id=actor.id OR EXISTS (
 				SELECT 1 FROM device_grants manager
 				WHERE manager.device_id=actor.id AND manager.pc_id=p.id
 				  AND manager.permission='MANAGE'
 				  AND (manager.expires_at IS NULL OR manager.expires_at>now())
 			)
 		  )
-		RETURNING lease.lease_id`, sessionID, userID, actorID, leaseID, version).Scan(&deletedLeaseID)
+		RETURNING lease.lease_id`, sessionID, userID, actorID, leaseID, version, s.AutoTrustDevices).Scan(&deletedLeaseID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return tx.Commit(ctx)
 	}
@@ -1835,7 +3225,12 @@ func (s *Postgres) GetEntitlement(ctx context.Context, userID uuid.UUID) (Entitl
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Entitlement{}, ErrNotFound
 	}
-	return e, err
+	if err != nil {
+		return Entitlement{}, err
+	}
+	e.MaxRemotePCs = UnlimitedQuota
+	e.MaxLiveSessions = UnlimitedQuota
+	return e, nil
 }
 
 // ApplyVerifiedPurchase persists a provider-authoritative result. The raw
@@ -1931,6 +3326,8 @@ func (s *Postgres) ApplyVerifiedPurchase(ctx context.Context, userID, actorDevic
 		if err := tx.Commit(ctx); err != nil {
 			return Entitlement{}, err
 		}
+		current.MaxRemotePCs = UnlimitedQuota
+		current.MaxLiveSessions = UnlimitedQuota
 		return current, nil
 	}
 	version := int64(1)
@@ -1951,6 +3348,8 @@ func (s *Postgres) ApplyVerifiedPurchase(ctx context.Context, userID, actorDevic
 		return Entitlement{}, fmt.Errorf("entitlement audit: %w", err)
 	}
 	current = Entitlement{PlanKey: planKey, CatalogVersion: catalogVersion, MaxRemotePCs: maxRemotePCs, MaxLiveSessions: maxLiveSessions, FeatureFlags: featureFlags, Version: version, EffectiveAt: now, GraceUntil: graceUntil, Source: source, ProviderRefHash: providerHash}
+	current.MaxRemotePCs = UnlimitedQuota
+	current.MaxLiveSessions = UnlimitedQuota
 	if err := tx.Commit(ctx); err != nil {
 		return Entitlement{}, err
 	}

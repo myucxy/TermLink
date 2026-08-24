@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 const (
 	deviceProofDomain = "TERMLINK-DEVICE-PROOF-V1"
 	registerDomain    = "TERMLINK-DEVICE-REGISTER-V1"
+	initialKeyEpoch   = int64(1)
 	maxHistoryBytes   = 64 << 20
 	maxHTMLBytes      = 2 << 20
 )
@@ -46,6 +48,7 @@ type identity struct {
 }
 
 type storedPCIdentity struct {
+	Scope      string `json:"scope"`
 	DeviceID   string `json:"device_id"`
 	PCID       string `json:"pc_id"`
 	PrivateKey string `json:"private_key"`
@@ -53,11 +56,12 @@ type storedPCIdentity struct {
 }
 
 type probe struct {
-	root   string
-	issuer string
-	tokens map[uuid.UUID]string
-	http   *http.Client
-	dialer websocket.Dialer
+	root          string
+	issuer        string
+	historyOrigin *url.URL
+	tokens        map[uuid.UUID]string
+	http          *http.Client
+	dialer        websocket.Dialer
 }
 
 type presignedRequest struct {
@@ -80,6 +84,10 @@ func run() error {
 	issuer := strings.TrimRight(os.Getenv("TERMLINK_ACCEPTANCE_OIDC_ISSUER"), "/")
 	passwordPath := os.Getenv("TERMLINK_ACCEPTANCE_USER_PASSWORD_FILE")
 	caPath := os.Getenv("TERMLINK_ACCEPTANCE_CA_FILE")
+	historyOriginRaw := strings.TrimRight(os.Getenv("TERMLINK_ACCEPTANCE_HISTORY_ORIGIN"), "/")
+	if historyOriginRaw == "" {
+		historyOriginRaw = "https://history.127.0.0.1.sslip.io:9443"
+	}
 	identityPath := os.Getenv("TERMLINK_ACCEPTANCE_PROBE_IDENTITY_FILE")
 	username := strings.TrimSpace(os.Getenv("TERMLINK_ACCEPTANCE_USER_NAME"))
 	if username == "" {
@@ -94,12 +102,20 @@ func run() error {
 	if !strings.HasPrefix(root, "https://") || !strings.HasPrefix(issuer, "https://") {
 		return errors.New("acceptance endpoints must use HTTPS")
 	}
+	historyOrigin, err := url.Parse(historyOriginRaw)
+	if err != nil || !strings.EqualFold(historyOrigin.Scheme, "https") || historyOrigin.Host == "" ||
+		historyOrigin.User != nil || historyOrigin.Path != "" || historyOrigin.RawQuery != "" || historyOrigin.Fragment != "" {
+		return errors.New("acceptance history origin must be an HTTPS origin")
+	}
 	roots, err := loadRoots(caPath)
 	if err != nil {
 		return err
 	}
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}
-	transport := &http.Transport{TLSClientConfig: tlsConfig.Clone()}
+	transport := &http.Transport{
+		TLSClientConfig:       tlsConfig.Clone(),
+		ExpectContinueTimeout: 15 * time.Second,
+	}
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   60 * time.Second,
@@ -108,7 +124,7 @@ func run() error {
 		},
 	}
 	p := &probe{
-		root: root, issuer: issuer, tokens: make(map[uuid.UUID]string), http: client,
+		root: root, issuer: issuer, historyOrigin: historyOrigin, tokens: make(map[uuid.UUID]string), http: client,
 		dialer: websocket.Dialer{TLSClientConfig: tlsConfig.Clone(), Subprotocols: []string{"termlink.realtime.v1"}, HandshakeTimeout: 15 * time.Second},
 	}
 	defer transport.CloseIdleConnections()
@@ -141,7 +157,7 @@ func run() error {
 		}
 	}()
 
-	pc, pcID, err := loadOrCreatePCIdentity(identityPath)
+	pc, pcID, err := loadOrCreatePCIdentity(identityPath, issuer)
 	if err != nil {
 		return err
 	}
@@ -159,40 +175,62 @@ func run() error {
 	}
 	sessionID := uuid.New()
 	if _, err := p.signedJSON(pc, http.MethodPut, "/v1/pcs/"+pcID.String(), map[string]any{
-		"name": "Acceptance PC", "agent_version": "acceptance", "key_epoch": 1,
-	}, "acceptance-pc-"+pcID.String(), http.StatusOK); err != nil {
+		"name": "Acceptance PC", "agent_version": "acceptance", "key_epoch": initialKeyEpoch,
+	}, newProbeRunIdempotencyKey("pc-presence"), http.StatusOK); err != nil {
 		return fmt.Errorf("upsert PC: %w", err)
 	}
 	if err := p.register(android, "ANDROID", "Acceptance Android"); err != nil {
 		return err
 	}
-	selfTrust, err := p.signedJSON(android, http.MethodPost, "/v1/devices/self/trust", map[string]any{}, uuid.NewString(), http.StatusOK)
+	pcsDirect, err := p.signedJSON(android, http.MethodGet, "/v1/pcs", nil, "", http.StatusOK)
 	if err != nil {
-		return fmt.Errorf("self-trust Android device: %w", err)
+		return fmt.Errorf("list same-account Android PC access: %w", err)
 	}
-	if selfTrust["status"] != "TRUSTED" {
-		return errors.New("Android self-trust response is invalid")
+	if err := validateDiscoveredListItem(pcsDirect, pcID, "device_id", pc.id); err != nil {
+		return fmt.Errorf("same-account Android did not discover its PC: %w", err)
 	}
-	if _, ok := selfTrust["changed"].(bool); !ok {
-		return errors.New("Android self-trust changed flag is invalid")
-	}
-	pcsBeforeGrant, err := p.signedJSON(android, http.MethodGet, "/v1/pcs", nil, "", http.StatusOK)
+	recipients, err := p.signedJSON(pc, http.MethodGet, "/v1/pcs/"+pcID.String()+"/grants", nil, "", http.StatusOK)
 	if err != nil {
-		return fmt.Errorf("list Android PC access before grant: %w", err)
+		return fmt.Errorf("list same-account PC recipients: %w", err)
 	}
-	if items, ok := pcsBeforeGrant["items"].([]any); !ok || len(items) != 1 {
-		return errors.New("same-account Android did not discover its PC")
+	keyEpoch, ok := positiveInt64Field(recipients, "key_epoch")
+	if !ok {
+		return errors.New("same-account PC recipients response has an invalid key epoch")
 	}
-	if _, err := p.signedJSON(pc, http.MethodPost, "/v1/pcs/"+pcID.String()+"/grants", map[string]any{
-		"device_id": android.id, "permission": "CONTROL",
-	}, uuid.NewString(), http.StatusOK); err != nil {
-		return fmt.Errorf("grant Android PC control: %w", err)
+	currentRecipient := false
+	if items, ok := recipients["items"].([]any); ok {
+		for _, raw := range items {
+			item, ok := raw.(map[string]any)
+			if !ok || fmt.Sprint(item["device_id"]) != android.id.String() {
+				continue
+			}
+			currentRecipient = item["permission"] == "MANAGE" &&
+				strings.TrimSpace(fmt.Sprint(item["exchange_public_key"])) != ""
+			break
+		}
+	}
+	if !currentRecipient {
+		return errors.New("same-account Android was not exposed as an implicit MANAGE encryption recipient")
 	}
 	if _, err := p.signedJSON(pc, http.MethodPut, "/v1/sessions/"+sessionID.String(), map[string]any{
 		"pc_id": pcID, "shell_type": "powershell", "title_cipher": "", "state": "RUNNING",
 		"columns": 80, "rows": 24, "last_output_seq": 1,
 	}, uuid.NewString(), http.StatusOK); err != nil {
 		return fmt.Errorf("upsert session: %w", err)
+	}
+	sessionsDirect, err := p.signedJSON(android, http.MethodGet, "/v1/pcs/"+pcID.String()+"/sessions", nil, "", http.StatusOK)
+	if err != nil {
+		return fmt.Errorf("list same-account Android sessions: %w", err)
+	}
+	if err := validateDiscoveredListItem(sessionsDirect, sessionID, "pc_id", pcID); err != nil {
+		return fmt.Errorf("same-account Android did not discover its managed session: %w", err)
+	}
+	directSubscription, err := p.signedJSON(android, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/subscribe", map[string]any{}, uuid.NewString(), http.StatusCreated)
+	if err != nil {
+		return fmt.Errorf("create same-account Android subscription: %w", err)
+	}
+	if directSubscription["permission"] != "MANAGE" || strings.TrimSpace(fmt.Sprint(directSubscription["token"])) == "" {
+		return errors.New("same-account Android subscription did not receive direct MANAGE authority")
 	}
 	pcSocket, err := p.connectRealtime(pc, "pc")
 	if err != nil {
@@ -232,6 +270,16 @@ func run() error {
 	if _, err := p.signedJSON(pc, http.MethodDelete, "/v1/sessions/"+sessionID.String()+"/lease", nil, uuid.NewString(), http.StatusOK); err != nil {
 		return fmt.Errorf("force release lease: %w", err)
 	}
+	historyDownload, err := p.verifyHistory(pc, android.id, keyEpoch, sessionID)
+	if err != nil {
+		return fmt.Errorf("verify production history object data plane: %w", err)
+	}
+	if _, err := p.signedJSON(pc, http.MethodPut, "/v1/sessions/"+sessionID.String(), map[string]any{
+		"pc_id": pcID, "shell_type": "powershell", "title_cipher": "", "state": "EXITED",
+		"columns": 80, "rows": 24, "last_output_seq": 3, "ended_at": time.Now().UTC(),
+	}, uuid.NewString(), http.StatusOK); err != nil {
+		return fmt.Errorf("exit history session: %w", err)
+	}
 	if _, err := p.signedJSON(pc, http.MethodPost, "/v1/devices/"+android.id.String()+"/revoke", map[string]any{}, uuid.NewString(), http.StatusOK); err != nil {
 		return fmt.Errorf("revoke Android device: %w", err)
 	}
@@ -239,10 +287,43 @@ func run() error {
 	if _, _, err := androidSocket.ReadMessage(); err == nil {
 		return errors.New("revoked Android realtime connection remained open")
 	}
-	if err := p.verifyHistory(pc, sessionID); err != nil {
-		return fmt.Errorf("verify production history object data plane: %w", err)
+	if _, err := p.signedJSON(pc, http.MethodDelete, "/v1/sessions/"+sessionID.String(), nil, uuid.NewString(), http.StatusNoContent); err != nil {
+		return fmt.Errorf("delete history session: %w", err)
+	}
+	// Session deletion commits the catalog tombstone and a durable object-delete
+	// outbox event atomically. The object store side is intentionally asynchronous
+	// and at-least-once, so allow the dispatcher a bounded interval to converge.
+	if err := p.waitForPresignedStatus(historyDownload, http.StatusNotFound, 15*time.Second); err != nil {
+		return fmt.Errorf("wait for deleted history object: %w", err)
 	}
 	return nil
+}
+
+// A persisted probe identity deliberately reuses its PC UUID across runs, but
+// its presence update must execute on every run. Reusing one idempotency key
+// would replay the first cached 200 response forever and leave last_seen_at
+// stale, causing the active-session directory to hide the fresh test session.
+func newProbeRunIdempotencyKey(operation string) string {
+	return "acceptance-" + operation + "-" + uuid.NewString()
+}
+
+func (p *probe) waitForPresignedStatus(request presignedRequest, expected int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastStatus int
+	for {
+		status, err := p.presignedStatus(request, nil)
+		if err != nil {
+			return err
+		}
+		lastStatus = status
+		if status == expected {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("object returned HTTP %d, expected %d before timeout", lastStatus, expected)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 func loadRoots(path string) (*x509.CertPool, error) {
@@ -260,82 +341,72 @@ func loadRoots(path string) (*x509.CertPool, error) {
 	return pool, nil
 }
 
-func (p *probe) verifyHistory(pc *identity, sessionID uuid.UUID) error {
+func (p *probe) verifyHistory(pc *identity, recipientDeviceID uuid.UUID, keyEpoch int64, sessionID uuid.UUID) (presignedRequest, error) {
 	ciphertext := []byte("production-history-ciphertext-v1")
 	digest := sha256.Sum256(ciphertext)
 	created, err := p.signedJSON(pc, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/history/uploads", map[string]any{
 		"kind":              "CHUNK",
-		"key_id":            "epoch-0001",
+		"key_id":            historyRecipientKeyID(recipientDeviceID, keyEpoch),
 		"ciphertext_sha256": base64.RawURLEncoding.EncodeToString(digest[:]),
 		"size_bytes":        len(ciphertext),
 		"start_seq":         1,
 		"end_seq":           3,
 	}, uuid.NewString(), http.StatusCreated)
 	if err != nil {
-		return fmt.Errorf("create upload: %w", err)
+		return presignedRequest{}, fmt.Errorf("create upload: %w", err)
 	}
 	uploadID, ok := stringField(created, "upload_id")
 	if !ok {
-		return errors.New("create upload response has no upload id")
+		return presignedRequest{}, errors.New("create upload response has no upload id")
 	}
 	upload, err := decodePresigned(created["upload"])
 	if err != nil {
-		return fmt.Errorf("decode upload URL: %w", err)
+		return presignedRequest{}, fmt.Errorf("decode upload URL: %w", err)
 	}
-	if err := validateHistoryURL(upload, http.MethodPut); err != nil {
-		return err
+	if err := p.validateHistoryURL(upload, http.MethodPut); err != nil {
+		return presignedRequest{}, err
 	}
 	if err := p.putPresigned(upload, ciphertext); err != nil {
-		return fmt.Errorf("presigned upload: %w", err)
+		return presignedRequest{}, fmt.Errorf("presigned upload: %w", err)
 	}
 	commitPath := "/v1/sessions/" + sessionID.String() + "/history/uploads/" + uploadID + "/commit"
 	if _, err := p.signedJSON(pc, http.MethodPost, commitPath, nil, uuid.NewString(), http.StatusCreated); err != nil {
-		return fmt.Errorf("commit upload: %w", err)
+		return presignedRequest{}, fmt.Errorf("commit upload: %w", err)
 	}
 	listed, err := p.signedJSON(pc, http.MethodGet, "/v1/sessions/"+sessionID.String()+"/history", nil, "", http.StatusOK)
 	if err != nil {
-		return fmt.Errorf("list history: %w", err)
+		return presignedRequest{}, fmt.Errorf("list history: %w", err)
 	}
 	items, ok := listed["items"].([]any)
 	if !ok || len(items) != 1 {
-		return fmt.Errorf("list history returned %d items", len(items))
+		return presignedRequest{}, fmt.Errorf("list history returned %d items", len(items))
 	}
 	item, ok := items[0].(map[string]any)
 	if !ok {
-		return errors.New("history item has invalid shape")
+		return presignedRequest{}, errors.New("history item has invalid shape")
 	}
 	download, err := decodePresigned(item["download"])
 	if err != nil {
-		return fmt.Errorf("decode download URL: %w", err)
+		return presignedRequest{}, fmt.Errorf("decode download URL: %w", err)
 	}
-	if err := validateHistoryURL(download, http.MethodGet); err != nil {
-		return err
+	if err := p.validateHistoryURL(download, http.MethodGet); err != nil {
+		return presignedRequest{}, err
 	}
 	downloaded, err := p.getPresigned(download)
 	if err != nil {
-		return fmt.Errorf("presigned download: %w", err)
+		return presignedRequest{}, fmt.Errorf("presigned download: %w", err)
 	}
 	if !bytes.Equal(downloaded, ciphertext) {
-		return errors.New("downloaded ciphertext differs from uploaded bytes")
+		return presignedRequest{}, errors.New("downloaded ciphertext differs from uploaded bytes")
 	}
 
 	if err := p.verifyHistoryRejects(upload, ciphertext); err != nil {
-		return err
+		return presignedRequest{}, err
 	}
-	if err := p.verifyHistorySizeBoundary(pc, sessionID); err != nil {
-		return err
+	if err := p.verifyHistorySizeBoundary(pc, recipientDeviceID, keyEpoch, sessionID); err != nil {
+		return presignedRequest{}, err
 	}
-	if _, err := p.signedJSON(pc, http.MethodDelete, "/v1/sessions/"+sessionID.String(), nil, uuid.NewString(), http.StatusNoContent); err != nil {
-		return fmt.Errorf("delete history session: %w", err)
-	}
-	status, err := p.presignedStatus(download, nil)
-	if err != nil {
-		return fmt.Errorf("request deleted object: %w", err)
-	}
-	if status != http.StatusNotFound {
-		return fmt.Errorf("deleted history object returned HTTP %d", status)
-	}
-	return nil
+	return download, nil
 }
 
 func (p *probe) verifyHistoryRejects(upload presignedRequest, body []byte) error {
@@ -397,14 +468,14 @@ func (p *probe) verifyHistoryRejects(upload presignedRequest, body []byte) error
 	return nil
 }
 
-func (p *probe) verifyHistorySizeBoundary(pc *identity, sessionID uuid.UUID) error {
+func (p *probe) verifyHistorySizeBoundary(pc *identity, recipientDeviceID uuid.UUID, keyEpoch int64, sessionID uuid.UUID) error {
 	digest := sha256.New()
 	if _, err := io.CopyN(digest, &zeroReader{}, maxHistoryBytes); err != nil {
 		return fmt.Errorf("hash maximum-size history fixture: %w", err)
 	}
 	created, err := p.signedJSON(pc, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/history/uploads", map[string]any{
 		"kind":              "CHUNK",
-		"key_id":            "epoch-boundary",
+		"key_id":            historyRecipientKeyID(recipientDeviceID, keyEpoch),
 		"ciphertext_sha256": base64.RawURLEncoding.EncodeToString(digest.Sum(nil)),
 		"size_bytes":        maxHistoryBytes,
 		"start_seq":         4,
@@ -417,7 +488,7 @@ func (p *probe) verifyHistorySizeBoundary(pc *identity, sessionID uuid.UUID) err
 	if err != nil {
 		return fmt.Errorf("decode maximum-size upload URL: %w", err)
 	}
-	if err := validateHistoryURL(upload, http.MethodPut); err != nil {
+	if err := p.validateHistoryURL(upload, http.MethodPut); err != nil {
 		return err
 	}
 	response, err := p.presignedRequest(upload.Method, upload.URL, upload.Headers, io.LimitReader(&zeroReader{}, maxHistoryBytes), maxHistoryBytes)
@@ -430,7 +501,16 @@ func (p *probe) verifyHistorySizeBoundary(pc *identity, sessionID uuid.UUID) err
 		return fmt.Errorf("maximum-size history upload returned HTTP %d", response.StatusCode)
 	}
 
-	status, err := p.presignedStatusURL(upload.Method, upload.URL, upload.Headers,
+	// Send only the oversized request headers until the public gateway returns
+	// its bounded 413. Without Expect: 100-continue, an outer reverse proxy can
+	// buffer the full 64 MiB+ fixture and translate the intended rejection into
+	// a timeout/502 before the TermLink upload gate sees the Content-Length.
+	oversizedHeaders := make(map[string][]string, len(upload.Headers)+1)
+	for name, values := range upload.Headers {
+		oversizedHeaders[name] = append([]string(nil), values...)
+	}
+	oversizedHeaders["Expect"] = []string{"100-continue"}
+	status, err := p.presignedStatusURL(upload.Method, upload.URL, oversizedHeaders,
 		io.LimitReader(&zeroReader{}, maxHistoryBytes+1), maxHistoryBytes+1)
 	if err != nil {
 		return fmt.Errorf("over-limit history request: %w", err)
@@ -439,6 +519,10 @@ func (p *probe) verifyHistorySizeBoundary(pc *identity, sessionID uuid.UUID) err
 		return fmt.Errorf("over-limit history request returned HTTP %d, want 413", status)
 	}
 	return nil
+}
+
+func historyRecipientKeyID(recipientDeviceID uuid.UUID, keyEpoch int64) string {
+	return fmt.Sprintf("history-v1:%s:%08d", strings.ReplaceAll(recipientDeviceID.String(), "-", ""), keyEpoch)
 }
 
 func (p *probe) putPresigned(request presignedRequest, body []byte) error {
@@ -569,12 +653,12 @@ func (p *probe) presignedRequest(method, rawURL string, headers map[string][]str
 	return p.http.Do(request)
 }
 
-func validateHistoryURL(request presignedRequest, expectedMethod string) error {
+func (p *probe) validateHistoryURL(request presignedRequest, expectedMethod string) error {
 	if request.Method != expectedMethod {
 		return fmt.Errorf("history presigned method=%q, want %q", request.Method, expectedMethod)
 	}
 	parsed, err := url.Parse(request.URL)
-	if err != nil || !strings.EqualFold(parsed.Scheme, "https") || !strings.EqualFold(parsed.Hostname(), "history.127.0.0.1.sslip.io") || parsed.Port() != "9443" ||
+	if err != nil || !strings.EqualFold(parsed.Scheme, p.historyOrigin.Scheme) || !strings.EqualFold(parsed.Host, p.historyOrigin.Host) ||
 		!strings.HasPrefix(parsed.EscapedPath(), "/termlink-history/accounts/") {
 		return errors.New("history presigned URL did not target the TLS object host and bucket path")
 	}
@@ -605,6 +689,18 @@ func decodePresigned(value any) (presignedRequest, error) {
 func stringField(value map[string]any, name string) (string, bool) {
 	field, ok := value[name].(string)
 	return field, ok && strings.TrimSpace(field) != ""
+}
+
+func positiveInt64Field(value map[string]any, name string) (int64, bool) {
+	field, ok := value[name].(json.Number)
+	if !ok {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(field.String(), 10, 64)
+	if err != nil || parsed < 1 {
+		return 0, false
+	}
+	return parsed, true
 }
 
 type zeroReader struct{}
@@ -873,6 +969,24 @@ func sameHTTPSOrigin(candidate, expected *url.URL) bool {
 		strings.EqualFold(candidate.Scheme, expected.Scheme) && strings.EqualFold(candidate.Host, expected.Host)
 }
 
+func validateDiscoveredListItem(response map[string]any, itemID uuid.UUID, ownerField string, ownerID uuid.UUID) error {
+	items, ok := response["items"].([]any)
+	if !ok {
+		return errors.New("items field is invalid")
+	}
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok || fmt.Sprint(item["id"]) != itemID.String() {
+			continue
+		}
+		if fmt.Sprint(item[ownerField]) != ownerID.String() {
+			return fmt.Errorf("item %s has invalid %s", itemID, ownerField)
+		}
+		return nil
+	}
+	return fmt.Errorf("item %s is missing", itemID)
+}
+
 func spaceSeparatedContains(value, expected string) bool {
 	for _, field := range strings.Fields(value) {
 		if field == expected {
@@ -901,9 +1015,20 @@ func newIdentity() (*identity, error) {
 	return &identity{id: uuid.New(), public: public, private: private, exchange: exchange}, nil
 }
 
-func loadOrCreatePCIdentity(path string) (*identity, uuid.UUID, error) {
-	if value, pcID, err := loadPCIdentity(path); err == nil {
-		return value, pcID, nil
+func loadOrCreatePCIdentity(path, scope string) (*identity, uuid.UUID, error) {
+	if strings.TrimSpace(scope) == "" {
+		return nil, uuid.Nil, errors.New("acceptance probe identity scope is required")
+	}
+	if value, pcID, storedScope, err := loadPCIdentity(path); err == nil {
+		if storedScope == scope {
+			return value, pcID, nil
+		}
+		value.destroy()
+		// A device ID cannot move between OIDC issuer scopes. This file is a
+		// managed acceptance fixture, so rotate it before registering locally.
+		if err := os.Remove(path); err != nil {
+			return nil, uuid.Nil, fmt.Errorf("rotate acceptance probe identity: %w", err)
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, uuid.Nil, err
 	}
@@ -913,6 +1038,7 @@ func loadOrCreatePCIdentity(path string) (*identity, uuid.UUID, error) {
 	}
 	pcID := uuid.New()
 	stored := storedPCIdentity{
+		Scope:      scope,
 		DeviceID:   value.id.String(),
 		PCID:       pcID.String(),
 		PrivateKey: base64.RawURLEncoding.EncodeToString(value.private),
@@ -927,48 +1053,56 @@ func loadOrCreatePCIdentity(path string) (*identity, uuid.UUID, error) {
 	if err := writePrivateFile(path, raw); err != nil {
 		value.destroy()
 		if errors.Is(err, os.ErrExist) {
-			return loadPCIdentity(path)
+			loaded, loadedPCID, loadedScope, loadErr := loadPCIdentity(path)
+			if loadErr != nil {
+				return nil, uuid.Nil, loadErr
+			}
+			if loadedScope != scope {
+				loaded.destroy()
+				return nil, uuid.Nil, errors.New("acceptance probe identity scope changed concurrently")
+			}
+			return loaded, loadedPCID, nil
 		}
 		return nil, uuid.Nil, err
 	}
 	return value, pcID, nil
 }
 
-func loadPCIdentity(path string) (*identity, uuid.UUID, error) {
+func loadPCIdentity(path string) (*identity, uuid.UUID, string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return nil, uuid.Nil, err
+		return nil, uuid.Nil, "", err
 	}
 	if !info.Mode().IsRegular() || (runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0) {
-		return nil, uuid.Nil, errors.New("acceptance probe identity permissions are unsafe")
+		return nil, uuid.Nil, "", errors.New("acceptance probe identity permissions are unsafe")
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, uuid.Nil, err
+		return nil, uuid.Nil, "", err
 	}
 	defer clear(raw)
 	var stored storedPCIdentity
 	if err := json.Unmarshal(raw, &stored); err != nil {
-		return nil, uuid.Nil, errors.New("acceptance probe identity is invalid")
+		return nil, uuid.Nil, "", errors.New("acceptance probe identity is invalid")
 	}
 	deviceID, err := uuid.Parse(stored.DeviceID)
 	if err != nil {
-		return nil, uuid.Nil, errors.New("acceptance probe device ID is invalid")
+		return nil, uuid.Nil, "", errors.New("acceptance probe device ID is invalid")
 	}
 	pcID, err := uuid.Parse(stored.PCID)
 	if err != nil {
-		return nil, uuid.Nil, errors.New("acceptance probe PC ID is invalid")
+		return nil, uuid.Nil, "", errors.New("acceptance probe PC ID is invalid")
 	}
 	privateKey, privateErr := base64.RawURLEncoding.DecodeString(stored.PrivateKey)
 	exchange, exchangeErr := base64.RawURLEncoding.DecodeString(stored.Exchange)
 	if privateErr != nil || exchangeErr != nil || len(privateKey) != ed25519.PrivateKeySize || len(exchange) != 32 {
 		clear(privateKey)
 		clear(exchange)
-		return nil, uuid.Nil, errors.New("acceptance probe key material is invalid")
+		return nil, uuid.Nil, "", errors.New("acceptance probe key material is invalid")
 	}
 	public := make([]byte, ed25519.PublicKeySize)
 	copy(public, privateKey[ed25519.SeedSize:])
-	return &identity{id: deviceID, public: public, private: privateKey, exchange: exchange}, pcID, nil
+	return &identity{id: deviceID, public: public, private: privateKey, exchange: exchange}, pcID, stored.Scope, nil
 }
 
 func writePrivateFile(path string, raw []byte) error {
@@ -1090,7 +1224,9 @@ func (p *probe) signedJSON(device *identity, method, path string, value any, ide
 		return map[string]any{}, nil
 	}
 	var decoded map[string]any
-	if err := json.Unmarshal(raw, &decoded); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&decoded); err != nil {
 		return nil, err
 	}
 	return decoded, nil

@@ -1,14 +1,14 @@
 # TermLink 产品需求与技术方案
 
 文档版本：0.1
-状态：立项草案
-更新日期：2026-08-02
+状态：立项草案（终端信息获取与服务端转发以[专项需求基线](TERMINAL_INFORMATION_FORWARDING_REQUIREMENTS.md)为准）
+更新日期：2026-08-21
 
 ## 1. 项目定义
 
 TermLink 是一个多设备远程终端系统，由 Windows PC Agent、云端中继服务和 Android 客户端组成。
 
-用户在 Windows 上启动 TermLink 受管终端后，系统持续采集该会话的 ANSI/UTF-8 输入输出流、终端尺寸和生命周期事件。登录同一账号且已获授权的 Android 客户端可以：
+用户在 Windows 上启动 TermLink 受管终端后，系统持续采集该会话的 ANSI/UTF-8 输入输出流、终端尺寸和生命周期事件。Windows Agent 与 Android 登录同一 OIDC 账号后，Android 无需配对、自授信或逐 PC Grant 即可：
 
 - 查看账号下不同 PC 的在线状态；
 - 查看每台 PC 上的终端会话列表和运行状态；
@@ -22,6 +22,8 @@ TermLink 不是远程桌面，也不抓取 Windows Terminal 的图像。它传�
 ## 2. 需求优化与范围边界
 
 ### 2.1 对原始想法的收敛
+
+> 2026-08-15 架构重整：本节中“Session Host 通过 ConPTY 创建并桥接”的描述是迁移前方案，不再作为新的生产实现要求。目标生产来源是 `termForward/terminal-main` 内的 `ITerminalConnection` 异步通道；当前生产 runtime 尚未完成注册、IPC 和数据源切换，详见[终端信息获取与服务端转发需求基线](TERMINAL_INFORMATION_FORWARDING_REQUIREMENTS.md)。
 
 原始想法中的“记录每个 Terminal 会话窗口”调整为“记录每个 TermLink 受管会话”。原因是 Windows Terminal 没有向第三方提供稳定、完整的接口，用来旁路读取并控制任意已打开标签页的输入输出。依赖窗口抓取、键盘钩子或进程注入会带来兼容性、安全性和内容准确性问题。
 
@@ -40,7 +42,7 @@ TermLink 不是远程桌面，也不抓取 Windows Terminal 的图像。它传�
 - Windows Terminal 中由 TermLink Profile 启动的 PowerShell、CMD 和 WSL 会话；
 - 一个账号下多台 PC、多会话发现和切换；
 - 实时输出、远程输入、断线重连和最近历史回放；
-- PC 与 Android 设备配对、分级授权和权限撤销；
+- 同账号设备自动注册与直接发现、严格账号隔离和设备撤销；
 - 会话内容端到端加密；
 - 本地优先的输入控制权和基础安全审计。
 
@@ -59,9 +61,9 @@ TermLink 不是远程桌面，也不抓取 Windows Terminal 的图像。它传�
 
 - 账号所有者：登录、绑定设备、配置留存策略和撤销设备；
 - PC 本地用户：创建会话、批准远程控制、随时夺回控制权；
-- Android 远程用户：浏览 PC 和会话，在授权范围内查看或控制。
+- Android 远程用户：浏览同账号 PC 和受管会话，并在取得短时输入租约后控制。
 
-首版默认三个设备权限等级：
+底层仍保留 `VIEW`、`CONTROL`、`MANAGE` 权限和 Grant 数据，以兼容旧部署与旧客户端；首版当前产品主流程不要求用户选择或批准这些权限，同账号、未撤销的 Android 按账号级直接访问策略处理。兼容层语义如下：
 
 | 权限 | 能力 |
 | --- | --- |
@@ -111,19 +113,28 @@ TermLink 不是远程桌面，也不抓取 Windows Terminal 的图像。它传�
 
 #### 账号和设备
 
-- 使用 OAuth 2.1/OIDC Authorization Code + PKCE 登录；
+- 使用 OIDC 登录；Android 当前优先通过固定 HTTPS 身份端点进行原生登录，身份提供方要求交互时再使用 Authorization Code + PKCE 浏览器回退；
 - 展示 PC 列表：名称、在线/离线、系统版本、Agent 版本、最近在线时间；
-- 新 Android 设备即使登录同一账号，也必须经已有可信设备或 PC 端进行一次配对批准；
-- 支持查看本机权限、主动退出及撤销本设备。
+- 新 Android 设备登录同一 OIDC 账号后自动注册，并可直接发现和使用该账号下的 PC/Session；不得显示配对、自授信或逐 PC Grant 前置步骤；
+- 同账号多台 Android 可以同时查看同一会话，但 Snapshot、Transcript、Event Chunk、签名下载 URL、密钥和本地缓存都必须按接收设备隔离；一台手机不得读取或覆盖另一台手机的对象；
+- 不同 OIDC subject 的设备、PC 和 Session 必须严格隔离；
+- Android 加密保存经过清理的 OIDC 会话以支持进程重启后恢复，绝不持久化登录密码；冷启动恢复和 Refresh Token 轮换必须纳入验收；
+- 支持主动退出；退出只清理当前登录和本地运行态，不等同于设备撤销/解绑。显式撤销本设备入口及跨端效果仍需产品验收确认。
 
 #### 会话浏览和显示
 
 - 按 PC 分组展示运行中、已退出和已归档会话；
 - 会话页支持 ANSI 颜色、256 色、True Color、光标、清屏、滚动区域和常见 TUI；
 - 支持横竖屏、字号调整、软键盘辅助栏和保持屏幕常亮；
-- 支持从终端状态快照进入，再应用增量事件；
-- 支持查看最近历史、跳转最新输出以及在已解密内容中进行本地搜索；
+- 新能力启用时按 `select -> download -> prepare -> cache -> bind -> install -> subscribe(S)`
+  从终端状态快照进入，随后只应用 S+1 及之后的增量事件；任一步失败都不得用不完整状态推进 ACK；
+- 首次打开只显示 Snapshot S 的最后可见屏幕，不预取更早 Transcript；到达顶部后才按固定 S
+  每次向前加载一页（最多 200 行）到独立历史 viewport；
+- 支持查看最近历史、跳转最新输出以及在已解密内容中进行本地搜索；浏览历史时实时输出和 ACK
+  继续前进，关闭历史层后回到最新输出；
 - 明确展示“实时”“正在重连”“只读”“控制中”“已退出”等状态。
+- 上述状态、History gap、历史为空、分页失败、恢复和重试操作必须提供简体中文与 English 文案，
+  并在软键盘打开、横竖屏和系统大字体下保持 Terminal、底栏和 IME 不重叠。
 
 #### 远程输入
 
@@ -136,13 +147,13 @@ TermLink 不是远程桌面，也不抓取 Windows Terminal 的图像。它传�
 
 ### 4.3 云端 Relay 与账号服务
 
-- 管理账号、设备、设备公钥、授权关系、PC 在线状态和会话索引；
+- 管理账号归属、设备、设备公钥、撤销状态、PC 在线状态和会话索引；
 - 使用 TLS WebSocket 转发加密后的实时事件；
 - 支持心跳、断线检测、ACK、按序重发、背压和限流；
 - 服务端只保存完成路由所需的元数据，无法解密终端正文；
 - 历史内容若启用云端保存，以端到端加密的数据块写入对象存储；
 - 支持令牌刷新、设备撤销、密钥轮换和所有会话强制下线；
-- 记录安全审计元数据：登录、配对、授权变化、控制租约、会话开始/结束和删除操作；
+- 记录安全审计元数据：登录、设备注册/撤销、控制租约、会话开始/结束和删除操作；兼容 pairing/grant API 被调用时仍记录对应审计；
 - 审计日志默认不记录命令正文、终端正文、访问令牌或明文密钥。
 
 ### 4.4 会话记录与回放
@@ -159,6 +170,20 @@ TermLink 不是远程桌面，也不抓取 Windows Terminal 的图像。它传�
 
 每个事件至少包含 `session_id`、单调递增的 `seq`、时间戳、事件类型和加密载荷。终端正文按大小或时间切块，快照用于快速打开长会话，事件用于准确重放快照后的变化。
 
+#### Tail-first 历史对象行为
+
+启用新能力后，Windows 以 durable `LocalFrame`/producer WAL 为唯一历史物化前缀：从同一
+1..S 前缀物化 Snapshot 与 Transcript，并在 durable ordered outbox 中按接收 Android 设备
+分别密封；上传提交顺序固定为 Transcript Page 在先、Snapshot S 最后。服务端只有
+在 transcript-first 提交屏障完成后，才可把 Snapshot S 返回给该接收设备。Transcript-first 是
+生产顺序，不等于 Android 首开下载顺序；首开仍只下载一个 Snapshot。
+
+旧能力 `bounded_event_replay_v1` 继续作为默认生产恢复与失败回退。新的
+`terminal_snapshot_v1` capability 必须经双方能力协商和运行开关共同开启；
+`TerminalTranscriptPageV1` 是受同一门禁约束的 REST 对象类型，不是独立 wire capability。
+缺对象、认证失败、设备不匹配、Key Epoch 不匹配、安装失败或 S+1 缺失时 fail closed，不得把
+中段 VT 字节喂给空 parser，也不得把固定 S 的 Transcript 行拼进 live parser。
+
 默认建议：
 
 - PC 本地加密记录保留 7 天，可改为关闭、1 天、30 天或自定义；
@@ -168,21 +193,21 @@ TermLink 不是远程桌面，也不抓取 Windows Terminal 的图像。它传�
 
 ### 4.5 会员与付费功能
 
-服务端使用可配置套餐目录；首发预置 Free 和 Pro Monthly：
+服务端仍使用可配置套餐目录以兼容购买、恢复购买和功能标记，但 PC 与实时会话数量不再受套餐额度限制：
 
 | 权益 | Free | Pro Monthly |
 | --- | --- | --- |
-| 可远程连接 PC | 默认 1 台 | 默认 5 台 |
-| 同时远程显示的实时会话 | 默认 3 个不同 Session | 默认 20 个 |
+| 可远程连接 PC | 不限数量 | 不限数量 |
+| 同时远程显示的实时会话 | 不限数量 | 不限数量 |
 | Windows 本地 Shell | 不限制 | 不限制 |
-| E2EE、设备批准、撤销和本地优先 | 完整 | 完整 |
+| E2EE、账号隔离、设备撤销和本地优先 | 完整 | 完整 |
 | 周期 | 免费 | 月付、自动续费、可取消 |
 
-Free/Pro Monthly 只是首发配置，不是代码枚举。管理员可以配置套餐名称、计费周期、PC/实时 Session 额度、渠道 Product ID、排序、上下架时间和降级目标；修改后通过版本化发布生效。客户端读取已发布套餐目录，不自行拼装套餐。
+Free/Pro Monthly 只是兼容性的首发配置，不是代码枚举。管理员可以配置套餐名称、计费周期、功能标记、渠道 Product ID、排序和上下架时间；修改后通过版本化发布生效。历史 `max_remote_pcs` 与 `max_live_sessions` 字段仅为兼容保留，接口以 `-1` 表示不限，服务端不再根据这两个字段拒绝注册或订阅。
 
 实际价格、货币和税费由购买渠道在最终确认前展示，不硬编码在客户端。Android 使用 Google Play Billing；服务端验证 Purchase Token/Webhook 并签发账号级 Entitlement，客户端不能自行声明会员状态。
 
-会员到期不会终止 Windows 本地 Shell，也不会删除 PC、设备和历史。超过 Free 配额时暂停新增远程订阅，并让用户选择保留一台远程 PC 和最多三个实时会话。完整计费、降级和 UI 规则见 [完整产品与系统设计](COMPLETE_SYSTEM_DESIGN.md) 与 [多端 UI 布局设计稿](UI_LAYOUT_DESIGNS.md)。
+会员到期不会终止 Windows 本地 Shell，也不会删除 PC、设备、历史或已建立的实时订阅；由于数量不限，不再执行超额暂停、配额选择或降级清理。
 
 ## 5. 非功能需求
 
@@ -191,7 +216,7 @@ Free/Pro Monthly 只是首发配置，不是代码枚举。管理员可以配置
 - 稳定网络下，PC 输出到 Android 显示的区域内 P95 延迟不高于 250 ms；
 - Android 输入到 PC Agent 写入 ConPTY 的区域内 P95 延迟不高于 250 ms；
 - 单会话持续输出 2 MB/s 时 UI 不阻塞，通过背压和批量帧保持可用；
-- 首版支持每个账号 5 台 PC、每台 PC 20 个并发受管会话；
+- 首版支持同账号不限数量 PC 与并发受管会话；服务端仅保留连接背压和资源安全上限。
 - 重连后仅补发最后 ACK 序号之后的数据，不重复执行输入事件；
 - 10 万行级历史会话通过快照和分块加载，在普通手机上可渐进打开。
 
@@ -208,14 +233,14 @@ Free/Pro Monthly 只是首发配置，不是代码枚举。管理员可以配置
 ### 5.3 安全要求
 
 - 所有外部通信使用 TLS 1.3；
-- 终端载荷在 PC 与已批准 Android 设备之间端到端加密，推荐 X25519 密钥协商与 ChaCha20-Poly1305/AES-GCM；
-- 每台设备拥有独立密钥，不以“登录同一账号”替代设备信任；
+- 终端载荷在 PC 与同账号、未撤销的 Android 设备之间端到端加密，推荐 X25519 密钥协商与 ChaCha20-Poly1305/AES-GCM；
+- OIDC subject 决定账号访问边界，每台设备仍拥有独立密钥并必须证明私钥持有；同账号直连不允许共享设备私钥；
 - Access Token 短时有效，Refresh Token 可轮换且与设备绑定；
 - PC 私钥由 DPAPI 保护，Android 私钥存入 Android Keystore；
 - 每帧包含会话、方向、序号和随机数关联信息，防止重放和跨会话替换；
 - 设备撤销后拒绝新连接并轮换受影响会话密钥；
 - 不在日志、崩溃报告和监控指标中写入终端正文或令牌；
-- 服务端对登录、配对、输入和历史读取实施频率限制和异常告警；
+- 服务端对登录、设备注册/撤销、输入和历史读取实施频率限制和异常告警；兼容 pairing/grant 端点继续受限流保护；
 - PC 端安装、升级和二进制文件必须签名。
 
 ## 6. 总体技术方案
@@ -244,7 +269,7 @@ Android App + Terminal Renderer
 | --- | --- |
 | Session Host | 创建 ConPTY、桥接本地终端、采集 I/O、处理 resize 和 Shell 生命周期 |
 | PC Agent | 登录和设备密钥、会话目录、加密、缓冲、重连、权限策略和本地通知 |
-| API 服务 | 账号、设备、授权、会话元数据、历史索引和审计接口 |
+| API 服务 | 账号归属、设备、撤销状态、会话元数据、历史索引和审计接口；兼容旧授权 API |
 | Realtime Relay | PC/Android 在线连接、路由、ACK、背压和输入租约协调 |
 | Android App | 设备与会话浏览、解密、ANSI 渲染、历史回放和远程输入 |
 
@@ -271,8 +296,11 @@ Android App + Terminal Renderer
 2. Android 获取有权访问的 PC 与会话列表。
 3. Android 请求订阅 `session_id`，Relay 校验账号、设备状态和只读权限。
 4. PC Agent 与 Android 使用已验证设备公钥派生会话密钥。
-5. PC Agent 先发送最近终端快照，再从快照序号发送增量事件。
-6. Android 解密、校验序号、渲染并周期性 ACK。
+5. 新能力协商开启时，Android 经 REST 选择只属于本设备的 Snapshot S，下载并完成认证、
+   detached prepare、持久缓存、checkpoint/ACK S 原子绑定和安装；Snapshot 不通过 Realtime 发送。
+6. Android 以 S 发起 Realtime 订阅，只接受 S+1 及之后的连续事件；旧能力或任何安全回退场景
+   使用 `bounded_event_replay_v1`。
+7. Android 解密、校验序号、渲染，并只在事件应用与必要持久化完成后推进累计 ACK。
 
 #### 发送远程输入
 
@@ -286,8 +314,10 @@ Android App + Terminal Renderer
 
 1. Android 保存每个会话最后连续 ACK 的输出序号。
 2. 重连后提交 `last_acked_seq`。
-3. PC Agent 若仍有增量缓冲，直接续传；否则发送最近快照和其后事件。
-4. 若所需数据已过期，Android 清空当前解析状态并从最新快照恢复，同时提示历史缺口。
+3. PC Agent 若仍有安全连续增量缓冲，直接续传；双方已开启新能力时，也可以选择、认证并原子
+   安装该接收设备的最新合格 Snapshot S，再从 S+1 续传。
+4. 若所需数据已过期且没有合格 Snapshot，Android 保留安全 ACK 并明确提示 History gap；不得
+   静默清空后从中段事件继续。
 
 ### 6.4 推荐的核心实体
 
@@ -297,7 +327,7 @@ Android App + Terminal Renderer
 | Device | `device_id`, `user_id`, `type`, `name`, `public_key`, `trust_state`, `revoked_at` |
 | PcPresence | `pc_id`, `agent_version`, `online`, `last_seen_at` |
 | Session | `session_id`, `pc_id`, `shell_type`, `title`, `state`, `created_at`, `ended_at` |
-| DeviceGrant | `device_id`, `pc_id`, `permission`, `approved_by`, `expires_at` |
+| DeviceGrant（兼容层） | `device_id`, `pc_id`, `permission`, `approved_by`, `expires_at`；账号级直连主流程不依赖该记录 |
 | ControlLease | `session_id`, `holder_device_id`, `lease_id`, `expires_at` |
 | EventChunk | `session_id`, `start_seq`, `end_seq`, `cipher_ref`, `created_at`, `expires_at` |
 | AuditEvent | `actor_device_id`, `action`, `target_id`, `result`, `created_at`, `ip_hash` |
@@ -332,9 +362,11 @@ Envelope {
 
 ## 8. 关键产品决策
 
-### 8.1 同账号不等于自动获得控制权
+### 8.1 同账号直接访问，但输入仍需短时租约
 
-同账号用于设备发现；设备配对和 PC 授权用于建立信任。新手机首次登录后默认无终端访问权，需要 PC 或现有可信设备批准。这样可以降低账号密码或登录会话泄露后直接获得 Shell 的风险。
+OIDC subject 是首版访问边界：Windows Agent 与 Android 登录同一账号后，未撤销设备自动注册并直接发现、订阅该账号的 PC 与受管 Session，不需要用户执行配对、自授信或逐 PC Grant。不同账号必须在列表、REST、Realtime 路由、历史和密钥接收方选择上全部隔离。
+
+直接访问不等于永久占有输入权。每个远程输入仍需短时会话租约，PC 本地策略可以要求确认，本地键盘可以抢占，设备撤销会断开连接并停止获得新密钥。逐设备密钥与签名证明继续存在；旧 `trust_state`、pairing 和 `device_grants` 表/API 仅作为兼容层，不得重新出现在当前产品主流程。
 
 ### 8.2 本地用户优先
 
@@ -353,7 +385,7 @@ PC 本地用户始终可以查看远端连接状态、撤销输入租约或停�
 满足以下条件才视为首版闭环：
 
 1. 一台 Windows 11 PC 安装 Agent 后能通过 TermLink Profile 打开 PowerShell、CMD 和至少一个 WSL 会话。
-2. Android 使用同一账号登录并完成设备批准后，可看到 PC 及其会话列表。
+2. Android 使用与 Windows Agent 相同的 OIDC 账号登录后，无配对、自授信或 Grant 即可看到该账号的 PC 及其受管会话列表；其他账号不可见且不可路由。
 3. Android 能正确显示常见 ANSI 输出、中文、颜色、光标移动和一个典型 TUI 程序。
 4. Android 获得输入租约后，可以发送文本、Enter、方向键和 Ctrl+C；只读设备的输入被可靠拒绝。
 5. Wi-Fi/蜂窝网络切换并断开 30 秒后，会话可自动重连，已确认输出不重复，缺失输出可补齐或明确提示缺口。
@@ -362,6 +394,21 @@ PC 本地用户始终可以查看远端连接状态、撤销输入租约或停�
 8. PC 断网或 Relay 停机时，本地 Terminal 仍可正常输入和运行命令。
 9. PC 用户可以一键切换只读/禁用远程访问，并能明确看到当前远程查看和控制状态。
 10. 删除历史会话后，列表不可见且对应加密内容进入可验证的删除流程。
+
+### 9.1 Tail-first 七项原始需求验收表
+
+此表是产品上线条件，不是当前 E2E 通过声明。执行结果和证据必须由主代理在最终代码上更新；
+当前统一为“待验证”。
+
+| ID | 原始需求 | 产品验收条件 | 当前结果 |
+| --- | --- | --- | --- |
+| TF-01 | Windows durable 生产链 | 真实受管会话的全部 marker 先持久化到 producer WAL；逐接收设备 Transcript 先提交，Snapshot S 最后提交，崩溃后幂等续作。 | 待主代理最终验证 |
+| TF-02 | Android S/S+1 进入实时 | 真实产品完成选择、下载、准备、缓存、绑定、安装和订阅；订阅从 S 开始且第一个新事件为 S+1。 | 待主代理最终验证 |
+| TF-03 | 首次只有最后一屏 | 初开只有一个 Snapshot，无 Transcript/Event Chunk 预取；最后 marker 可见、最早 marker 不可见。 | 待主代理最终验证 |
+| TF-04 | 固定 S 上滑分页 | 每次上滑只取一页且不超过 200 行；独立 viewport、固定 S，分页不改变 live ACK。 | 待主代理最终验证 |
+| TF-05 | 历史与实时并行 | 历史层打开时新输出仍推进 ACK；关闭后回到实时尾部并看见新输出。 | 待主代理最终验证 |
+| TF-06 | 同账号多 Android 隔离 | 两台以上 Android 可订阅同一会话，但对象、URL、密钥与缓存严格按 recipient 隔离，交叉访问失败。 | 待主代理最终验证 |
+| TF-07 | 失败、回退、双语与 IME | 所有失败 fail closed 或回到连续事件回放；中英文状态完整，Terminal/底栏/IME 无越界或重叠。 | 待主代理最终验证 |
 
 ## 10. 里程碑建议
 
@@ -380,8 +427,8 @@ PC 本地用户始终可以查看远端连接状态、撤销输入租约或停�
 
 ### 阶段 2：账号与安全（3～4 周）
 
-- OIDC 登录、设备注册与配对；
-- 设备授权、输入租约、撤销和审计；
+- OIDC 登录、同账号设备自动注册和账号隔离；
+- 输入租约、设备撤销和审计；兼容 pairing/grant API 只做回归保护；
 - 端到端加密、密钥保存与轮换；
 - 完成最小化威胁建模和安全测试。
 
@@ -400,7 +447,7 @@ PC 本地用户始终可以查看远端连接状态、撤销输入租约或停�
 | 高频输出导致手机卡顿 | 延迟和内存上升 | 批量帧、背压、渲染节流、滚动缓冲上限和快照 |
 | 网络重试造成命令重复 | 可能执行危险操作两次 | 输入 `input_id` 去重；租约校验；不自动重发未确认的整段粘贴 |
 | 终端内容含密钥或隐私 | 高严重度数据泄露 | E2EE、短保留、输入默认不落盘、日志脱敏、设备撤销 |
-| 服务端 E2EE 与多设备密钥管理复杂 | 延误或产生安全漏洞 | 首版限制设备数量；使用成熟密码库；对协议做第三方审查 |
+| 服务端 E2EE 与多设备密钥管理复杂 | 延误或产生安全漏洞 | 每个设备独立密钥和接收方密文；严格按账号/撤销状态筛选；使用成熟密码库并对协议做第三方审查 |
 | Agent 高权限运行扩大攻击面 | PC 被远程利用 | 会话进程尽量以当前用户权限运行；服务与会话宿主隔离；签名升级 |
 
 ## 12. 后续演进方向
@@ -420,5 +467,5 @@ PC 本地用户始终可以查看远端连接状态、撤销输入租约或停�
 1. 产品首先服务个人用户还是小型团队；本文默认个人账号、多设备自用。
 2. 是否必须支持公网自建部署；本文建议先设计可容器化 Relay，但首版只维护一种官方部署方式。
 3. 云端历史记录是否作为默认能力；本文建议默认关闭、用户显式开启。
-4. 远程首次控制是每次需要 PC 确认，还是已授权设备可自动获取；本文建议提供策略，默认首次确认。
-5. 免费版的 PC 数、历史配额和保留时长；不应让商业限制影响协议正确性和本地可用性。
+4. 同账号访问已经确定无需配对或 Grant；仍待确认的是每次申请短时输入租约是否需要 PC 本地确认。本文建议提供 PC 策略，默认首次控制确认。
+5. 历史配额和保留时长；PC 与实时 Session 数量已经确定为不限，不应让商业状态影响协议正确性和本地可用性。

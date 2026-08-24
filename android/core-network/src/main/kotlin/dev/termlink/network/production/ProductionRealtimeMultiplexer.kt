@@ -1,0 +1,263 @@
+package dev.termlink.network.production
+
+import dev.termlink.crypto.DeviceIdentity
+import dev.termlink.protocol.realtime.v1.Envelope
+import java.io.Closeable
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+
+data class ProductionRealtimeMultiplexerDiagnostics(
+    val phase: String,
+    val endpointCount: Int,
+    val socket: ProductionRealtimeSocketDiagnostics,
+)
+
+/**
+ * One session-scoped view over the device WebSocket. Closing this endpoint only
+ * unregisters its UUID; ownership of the socket remains at device scope.
+ */
+interface ProductionRealtimeSessionTransport : Closeable {
+    val receivedEnvelopes: Flow<ProductionReceivedEnvelope>
+    val receivePressure: StateFlow<ProductionReceivePressure>
+    val state: SharedFlow<RealtimeState>
+
+    fun connect()
+    fun send(envelope: Envelope): Boolean
+    fun disconnect(reason: String)
+    fun diagnostics(): ProductionRealtimeMultiplexerDiagnostics = ProductionRealtimeMultiplexerDiagnostics(
+        phase = "UNKNOWN",
+        endpointCount = 0,
+        socket = ProductionRealtimeSocketDiagnostics(0, 0, false, "UNKNOWN", 0, 0),
+    )
+}
+
+/**
+ * Owns the single production WebSocket for one Android device and routes opaque
+ * envelopes to the live client registered for the exact session UUID.
+ */
+class ProductionRealtimeMultiplexer private constructor(
+    private val socket: ProductionRealtimeSocket,
+    parentScope: CoroutineScope,
+) : Closeable {
+    constructor(
+        rootUrl: String,
+        tokenProvider: AccessTokenProvider,
+        deviceId: UUID,
+        identity: DeviceIdentity,
+        parentScope: CoroutineScope,
+        httpClient: OkHttpClient = ProductionRealtimeClient.defaultHttpClient,
+        allowCleartextForLocalTest: Boolean = false,
+    ) : this(
+        socket = ProductionRealtimeClient(
+            rootUrl = rootUrl,
+            tokenProvider = tokenProvider,
+            deviceId = deviceId,
+            identity = identity,
+            role = "android",
+            httpClient = httpClient,
+            allowCleartextForLocalTest = allowCleartextForLocalTest,
+        ),
+        parentScope = parentScope,
+    )
+
+    private val scopeJob = SupervisorJob(parentScope.coroutineContext[Job])
+    private val scope = CoroutineScope(parentScope.coroutineContext + scopeJob)
+    private val closed = AtomicBoolean(false)
+    private val connectionLock = Any()
+    private val endpointLock = Any()
+    private val endpoints = mutableMapOf<UUID, Endpoint>()
+    private var socketPhase = SocketPhase.IDLE
+    private val routeJob: Job
+    private val stateJob: Job
+
+    init {
+        routeJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            socket.receivedEnvelopes.collect { received -> route(received) }
+        }
+        stateJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            socket.state.collect { state ->
+                synchronized(connectionLock) {
+                    if (!closed.get()) {
+                        socketPhase = when (state) {
+                            RealtimeState.Connecting -> SocketPhase.CONNECTING
+                            RealtimeState.Connected -> SocketPhase.CONNECTED
+                            is RealtimeState.Reconnecting -> SocketPhase.CONNECTING
+                            is RealtimeState.Failed -> SocketPhase.FAILED
+                            RealtimeState.Closed -> SocketPhase.CLOSED
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** Registers exactly one consumer for [sessionId]. */
+    fun register(sessionId: UUID): ProductionRealtimeSessionTransport = synchronized(endpointLock) {
+        check(!closed.get()) { "production realtime multiplexer is closed" }
+        check(sessionId !in endpoints) { "production session is already registered" }
+        Endpoint(sessionId).also { endpoints[sessionId] = it }
+    }
+
+    override fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        val removed = synchronized(endpointLock) {
+            endpoints.values.toList().also { endpoints.clear() }
+        }
+        removed.forEach(Endpoint::closeFromOwner)
+        synchronized(connectionLock) { socketPhase = SocketPhase.CLOSED }
+        routeJob.cancel()
+        stateJob.cancel()
+        socket.close()
+        scope.cancel()
+    }
+
+    /**
+     * Android can restore HTTP before OkHttp recognizes that the old socket
+     * belonged to a lost network. A confirmed default-network transition is
+     * therefore an explicit socket-generation boundary, not merely a hint.
+     */
+    fun onNetworkAvailable() {
+        val reconnect = synchronized(connectionLock) {
+            if (closed.get() || socketPhase == SocketPhase.CLOSED) {
+                false
+            } else {
+                socketPhase = SocketPhase.FAILED
+                true
+            }
+        }
+        if (!reconnect) return
+        // Cancel even a socket already marked FAILED. OkHttp can retain that
+        // generation until its asynchronous callback unwinds.
+        socket.disconnect("default network became available")
+        ensureConnected()
+    }
+
+    private fun ensureConnected() {
+        val shouldConnect = synchronized(connectionLock) {
+            check(!closed.get()) { "production realtime multiplexer is closed" }
+            if (socketPhase == SocketPhase.IDLE || socketPhase == SocketPhase.FAILED) {
+                socketPhase = SocketPhase.CONNECTING
+                true
+            } else {
+                false
+            }
+        }
+        if (shouldConnect) {
+            try {
+                socket.connect()
+            } catch (error: Exception) {
+                synchronized(connectionLock) {
+                    if (!closed.get()) socketPhase = SocketPhase.FAILED
+                }
+                throw error
+            }
+        }
+    }
+
+    private fun disconnectSocket(reason: String) {
+        val shouldDisconnect = synchronized(connectionLock) {
+            if (closed.get() || socketPhase == SocketPhase.CLOSED || socketPhase == SocketPhase.FAILED) {
+                false
+            } else {
+                socketPhase = SocketPhase.FAILED
+                true
+            }
+        }
+        if (shouldDisconnect) socket.disconnect(reason)
+    }
+
+    private fun route(received: ProductionReceivedEnvelope) {
+        val sessionId = ProductionRealtimeClient.uuidFromBytes(received.envelope.sessionId.toByteArray())
+        val endpoint = synchronized(endpointLock) { sessionId?.let(endpoints::get) }
+        if (endpoint == null || !endpoint.deliver(received)) received.close()
+    }
+
+    private fun unregister(endpoint: Endpoint) {
+        synchronized(endpointLock) {
+            if (endpoints[endpoint.sessionId] === endpoint) endpoints.remove(endpoint.sessionId)
+        }
+    }
+
+    private inner class Endpoint(
+        val sessionId: UUID,
+    ) : ProductionRealtimeSessionTransport {
+        private val endpointClosed = AtomicBoolean(false)
+        private val incoming = Channel<ProductionReceivedEnvelope>(
+            capacity = ProductionRealtimeClient.MAX_BUFFERED_EVENTS,
+            onUndeliveredElement = ProductionReceivedEnvelope::close,
+        )
+
+        override val receivedEnvelopes: Flow<ProductionReceivedEnvelope> = incoming.receiveAsFlow()
+        override val receivePressure: StateFlow<ProductionReceivePressure>
+            get() = socket.receivePressure
+        override val state: SharedFlow<RealtimeState>
+            get() = socket.state
+
+        override fun connect() {
+            check(!endpointClosed.get()) { "production session transport is closed" }
+            ensureConnected()
+        }
+
+        override fun send(envelope: Envelope): Boolean {
+            check(!endpointClosed.get()) { "production session transport is closed" }
+            require(
+                ProductionRealtimeClient.uuidFromBytes(envelope.sessionId.toByteArray()) == sessionId,
+            ) { "Envelope session does not match the registered endpoint" }
+            return socket.send(envelope)
+        }
+
+        override fun disconnect(reason: String) {
+            if (!endpointClosed.get()) disconnectSocket(reason)
+        }
+
+        override fun diagnostics(): ProductionRealtimeMultiplexerDiagnostics =
+            this@ProductionRealtimeMultiplexer.diagnostics()
+
+        override fun close() {
+            if (!endpointClosed.compareAndSet(false, true)) return
+            unregister(this)
+            incoming.close()
+        }
+
+        fun closeFromOwner() {
+            if (endpointClosed.compareAndSet(false, true)) incoming.close()
+        }
+
+        fun deliver(received: ProductionReceivedEnvelope): Boolean =
+            !endpointClosed.get() && incoming.trySend(received).isSuccess
+    }
+
+    private enum class SocketPhase {
+        IDLE,
+        CONNECTING,
+        CONNECTED,
+        FAILED,
+        CLOSED,
+    }
+
+    private fun diagnostics(): ProductionRealtimeMultiplexerDiagnostics =
+        ProductionRealtimeMultiplexerDiagnostics(
+            phase = synchronized(connectionLock) { socketPhase.name },
+            endpointCount = synchronized(endpointLock) { endpoints.size },
+            socket = socket.diagnostics(),
+        )
+
+    internal companion object {
+        fun forTest(
+            socket: ProductionRealtimeSocket,
+            parentScope: CoroutineScope,
+        ): ProductionRealtimeMultiplexer = ProductionRealtimeMultiplexer(socket, parentScope)
+    }
+}

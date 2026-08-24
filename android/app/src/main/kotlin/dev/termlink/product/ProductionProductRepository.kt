@@ -2,8 +2,11 @@ package dev.termlink.product
 
 import android.app.Activity
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.Uri
 import android.os.Build
+import android.util.Log
 import android.view.KeyEvent
 import androidx.room.withTransaction
 import dev.termlink.billing.BillingCoordinator
@@ -13,8 +16,14 @@ import dev.termlink.billing.PlayBillingAdapter
 import dev.termlink.crypto.DeviceKeyVault
 import dev.termlink.crypto.HistoryCrypto
 import dev.termlink.crypto.SessionCrypto
+import dev.termlink.crypto.SessionTitleCrypto
+import dev.termlink.crypto.TerminalSnapshotCrypto
 import dev.termlink.database.TermLinkDatabase
 import dev.termlink.history.HistoryRepository
+import dev.termlink.history.HistoryObjectCounts
+import dev.termlink.history.EncryptedTranscriptPage
+import dev.termlink.history.RendererCheckpointState
+import dev.termlink.history.TranscriptPageMetadata
 import dev.termlink.harness.BuildConfig
 import dev.termlink.harness.R
 import dev.termlink.model.CatalogPlan
@@ -29,6 +38,7 @@ import dev.termlink.model.SessionSummary
 import dev.termlink.network.production.AccessTokenProvider
 import dev.termlink.network.production.InputSequenceProvider
 import dev.termlink.network.production.ProductionApiClient
+import dev.termlink.network.production.ProductionRealtimeMultiplexer
 import dev.termlink.network.production.ProductionRealtimeSessionClient
 import dev.termlink.network.production.ProductionRealtimeSessionConfig
 import dev.termlink.network.production.TermLinkApiException
@@ -42,38 +52,58 @@ import dev.termlink.protocol.realtime.v1.OutputChunkPayload
 import dev.termlink.protocol.realtime.v1.ResizePayload
 import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
 import dev.termlink.session.RemoteLifecycle
+import dev.termlink.session.DurableAckCommit
+import dev.termlink.session.RendererBootstrapState
+import dev.termlink.session.InputSubmission
 import dev.termlink.session.RemoteSessionEvent
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.TerminalSize
+import dev.termlink.terminal.api.PreparedTerminalCheckpoint
+import dev.termlink.terminal.api.TerminalTranscriptPageV1
 import dev.termlink.terminal.termux.TermuxTerminalEngine
 import java.time.Instant
 import java.net.URI
+import java.net.URLEncoder
 import java.nio.ByteBuffer
 import java.security.MessageDigest
+import java.nio.charset.StandardCharsets
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.ConcurrentMap
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
@@ -98,6 +128,244 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.concurrent.thread
 
+internal suspend fun <T> withClearedRegistrationSecrets(
+    password: CharArray,
+    confirm: CharArray,
+    operation: suspend () -> T,
+): T = try {
+    operation()
+} finally {
+    password.fill('\u0000')
+    confirm.fill('\u0000')
+}
+
+internal fun accountRegistrationRequestBody(
+    username: String,
+    email: String,
+    firstName: String,
+    lastName: String,
+    password: CharArray,
+    confirm: CharArray,
+): String {
+    val normalizedUsername = username.trim()
+    val normalizedEmail = email.trim()
+    val normalizedFirstName = firstName.trim()
+    val normalizedLastName = lastName.trim()
+    require(normalizedUsername.length in 3..128 && username.none { it == '\r' || it == '\n' }) { "Username is invalid" }
+    require(normalizedEmail.length in 3..320 && normalizedEmail.contains("@") && email.none { it == '\r' || it == '\n' }) {
+        "Email is invalid"
+    }
+    require(normalizedFirstName.length in 1..128 && firstName.none { it == '\r' || it == '\n' }) { "First name is invalid" }
+    require(normalizedLastName.length in 1..128 && lastName.none { it == '\r' || it == '\n' }) { "Last name is invalid" }
+    require(password.size in 8..1024 && password.contentEquals(confirm)) { "Password is invalid" }
+    return buildJsonObject {
+        put("username", normalizedUsername)
+        put("email", normalizedEmail)
+        put("first_name", normalizedFirstName)
+        put("last_name", normalizedLastName)
+        put("password", String(password))
+        put("password_confirm", String(confirm))
+    }.toString()
+}
+
+/** Reads only the reachability decision published by the PC catalog. */
+internal fun authoritativePcOnline(root: JsonObject): Boolean =
+    root["online"]?.jsonPrimitive?.booleanOrNull == true
+
+/** Applies only runtime facts emitted by the engine bound to this session. */
+internal fun projectLiveSessionSummary(
+    session: SessionSummary,
+    remoteState: RemoteSessionState,
+    authoritativeSize: TerminalSize,
+): SessionSummary = session.copy(
+    state = when (remoteState) {
+        is RemoteSessionState.Exited -> SessionState.EXITED
+        is RemoteSessionState.Reconnecting -> if (remoteState.reason == "remote session interrupted") {
+            SessionState.INTERRUPTED
+        } else {
+            session.state
+        }
+        is RemoteSessionState.Live,
+        is RemoteSessionState.ReadOnly,
+        is RemoteSessionState.Controlling -> SessionState.RUNNING
+        is RemoteSessionState.HistoryGap -> session.state
+    },
+    online = when (remoteState) {
+        is RemoteSessionState.Exited -> false
+        // An opened renderer remains a valid read-only viewer while transport
+        // or remote lifecycle recovery is in progress. Publishing catalog
+        // reachability here made the selected detail disappear on one stale
+        // online=false poll even though the renderer was still recoverable.
+        is RemoteSessionState.Reconnecting -> true
+        is RemoteSessionState.Live,
+        is RemoteSessionState.ReadOnly,
+        is RemoteSessionState.Controlling -> true
+        is RemoteSessionState.HistoryGap -> true
+    },
+    columns = authoritativeSize.columns,
+    rows = authoritativeSize.rows,
+)
+
+private data class RuntimeSessionProjection(
+    val state: RemoteSessionState,
+    val size: TerminalSize,
+    val titleOverride: String?,
+)
+
+/**
+ * Null means neither realtime metadata nor the compatibility renderer has a
+ * title, so the authenticated directory title remains authoritative. Blank is
+ * intentionally preserved because it is an explicit realtime clear event.
+ */
+internal fun liveSessionTitleOverride(
+    publishedTitle: String?,
+    rendererTitle: String,
+): String? = publishedTitle ?: rendererTitle.takeIf(String::isNotBlank)
+
+internal fun changedPcDeviceIdentitySessionIds(
+    storedPcs: List<PcSummary>,
+    incomingPcs: List<PcSummary>,
+    sessions: List<SessionSummary>,
+): Set<UUID> {
+    val storedDeviceIds = storedPcs.associate { it.id to it.deviceId }
+    val changedPcIds = incomingPcs.asSequence()
+        .filter { incoming -> storedDeviceIds[incoming.id]?.let { it != incoming.deviceId } == true }
+        .mapTo(hashSetOf(), PcSummary::id)
+    return sessions.asSequence()
+        .filter { it.pcId in changedPcIds }
+        .mapTo(hashSetOf(), SessionSummary::id)
+}
+
+internal fun productSessionUpsertEvent(
+    sequence: Long,
+    payload: SessionUpsertPayload,
+): RemoteSessionEvent {
+    require(sequence > 0) { "session event sequence must be positive" }
+    if (payload.hasTitle()) return RemoteSessionEvent.Title(sequence, payload.title)
+    val lifecycle = when (payload.lifecycle.uppercase()) {
+        "RUNNING", "STARTED", "CHANGED" -> RemoteLifecycle.RUNNING
+        "INTERRUPTED" -> RemoteLifecycle.INTERRUPTED
+        "EXITED", "ENDED" -> RemoteLifecycle.ENDED
+        else -> error("Unknown history lifecycle")
+    }
+    return RemoteSessionEvent.Lifecycle(
+        sequence,
+        lifecycle,
+        payload.exitCode.takeIf { payload.hasExitCode() },
+    )
+}
+
+/** Reconciles an authoritative catalog without touching global connection UI state. */
+internal fun reconcileSessionCatalog(
+    current: ProductSnapshot,
+    pcs: List<PcSummary>,
+    sessions: List<SessionSummary>,
+    deletedSessionIds: Set<UUID>,
+): ProductSnapshot {
+    val filtered = sessions.filterNot { it.id in deletedSessionIds }
+    val retained = filtered.mapTo(hashSetOf(), SessionSummary::id)
+    val pruned = current.sessions.asSequence()
+        .map(SessionSummary::id)
+        .filterNot(retained::contains)
+        .fold(current) { snapshot, sessionId -> snapshot.withoutSession(sessionId) }
+    return pruned.copy(pcs = pcs, sessions = filtered)
+}
+
+/** Applies authenticated directory titles without retaining a stale value after a replacement envelope fails closed. */
+internal fun reconcileSessionDirectoryTitles(
+    current: Map<UUID, String>,
+    sessions: List<SessionSummary>,
+    decrypted: Map<UUID, String>,
+    realtime: Map<UUID, String> = emptyMap(),
+): MutableMap<UUID, String> {
+    val retainedIds = sessions.mapTo(hashSetOf(), SessionSummary::id)
+    val result = current.filterKeys(retainedIds::contains).toMutableMap()
+    sessions.forEach { session ->
+        if (session.encryptedTitle == null) return@forEach
+        val title = decrypted[session.id]
+        if (title.isNullOrBlank()) result.remove(session.id) else result[session.id] = title
+    }
+    // Directory envelopes and realtime title events share the public snapshot
+    // map, but not the same lifecycle. A malformed/re-keyed directory envelope
+    // must fail closed without deleting a newer title already authenticated by
+    // the open realtime session. Presence in this map is significant: an
+    // explicit blank realtime title clears both the old realtime value and any
+    // directory fallback for that live session.
+    realtime.forEach { (sessionId, title) ->
+        if (sessionId !in retainedIds) return@forEach
+        if (title.isBlank()) result.remove(sessionId) else result[sessionId] = title
+    }
+    return result
+}
+
+/**
+ * An epoch and exchange key are scoped to one Windows device identity. A PC
+ * record that moves to a new device identity starts a fresh epoch namespace;
+ * only transitions within the same identity are monotonic and key-stable.
+ */
+internal fun validateAuthoritativePcKeyTransition(
+    storedPc: PcSummary,
+    storedDevice: DeviceSummary?,
+    incomingPc: PcSummary,
+    incomingDevice: DeviceSummary?,
+) {
+    require(incomingPc.id == storedPc.id) { "PC key transition changed the PC identity" }
+    if (incomingPc.deviceId != storedPc.deviceId) return
+    require(incomingPc.keyEpoch >= storedPc.keyEpoch) { "key epoch must not regress" }
+    val storedKey = storedDevice?.takeIf { it.id == storedPc.deviceId }?.exchangePublicKey
+    val incomingKey = incomingDevice?.takeIf { it.id == incomingPc.deviceId }?.exchangePublicKey
+    if (incomingKey != null && storedKey != null && storedKey.isNotEmpty()) {
+        require(incomingKey.contentEquals(storedKey)) {
+            "PC exchange key changed without a new device identity"
+        }
+    }
+}
+
+/** Keeps opened renderers through transient reachability changes; EXITED is terminal. */
+internal fun retainedLiveSessionIds(
+    sessions: List<SessionSummary>,
+    trustedPcIds: Set<UUID>,
+): Set<UUID> = sessions.asSequence()
+    .filter { it.state != SessionState.EXITED && it.pcId in trustedPcIds }
+    .mapTo(hashSetOf(), SessionSummary::id)
+
+internal data class ProductRealtimeDiagnostics(
+    val socketPhase: String,
+    val socketGeneration: Int,
+    val connectedGeneration: Int,
+    val socketState: String,
+    val endpointCount: Int,
+    val transportState: String,
+    val remoteState: String,
+    val transportCollectorActive: Boolean,
+    val reconnectActive: Boolean,
+    val subscriberReady: Boolean,
+    val reconnectAttempt: Int,
+    val subscribeSendCount: Long,
+    val lastSubscribeCursor: Long,
+    val flowControlSendCount: Long,
+    val lastReceivedSequence: Long,
+    val lastHandledSequence: Long,
+    val networkAvailableCount: Int,
+    val networkLostCount: Int,
+    val networkReconnectCount: Int,
+)
+
+private const val REMOTE_FILE_OPERATION_LIST = "LIST"
+private const val REMOTE_FILE_OPERATION_DOWNLOAD = "DOWNLOAD"
+private const val REMOTE_FILE_OPERATION_OPEN_TERMINAL = "OPEN_TERMINAL"
+private const val REMOTE_FILE_STATUS_PENDING = "PENDING"
+private const val REMOTE_FILE_STATUS_PROCESSING = "PROCESSING"
+private const val REMOTE_FILE_STATUS_SUCCEEDED = "SUCCEEDED"
+private const val REMOTE_FILE_STATUS_FAILED = "FAILED"
+private const val REMOTE_FILE_STATUS_CANCELLED = "CANCELLED"
+private const val REMOTE_FILE_STATUS_EXPIRED = "EXPIRED"
+private const val REMOTE_FILE_OPERATION_POLL_INTERVAL_MILLIS = 750L
+private const val REMOTE_DOWNLOAD_PERSIST_INTERVAL_MILLIS = 1_000L
+private const val REMOTE_SHELL_CATALOG_TIMEOUT_MILLIS = 30_000L
+private const val REMOTE_FILE_PATH_MAX_BYTES = 4_096
+private const val REMOTE_FILE_LIST_PAGE_MAX_ENTRIES = 500
+
 internal class ProductionProductRepository(
     private val activity: Activity,
     private val launchAuthorization: (Intent) -> Unit,
@@ -108,23 +376,80 @@ internal class ProductionProductRepository(
     private val historyRepository = HistoryRepository(database)
     private val authService = AuthorizationService(activity)
     private val http = OkHttpClient()
+    private val remoteDownloadStore: RemoteDownloadRecordStore =
+        SharedPreferencesRemoteDownloadRecordStore(activity)
+    private val storedRemoteDownloads = remoteDownloadStore.load()
+    private val interruptedRemoteDownloads = storedRemoteDownloads
+        .filter { it.status.isActive }
+    private val restoredRemoteDownloads = restoreRemoteDownloadRecords(storedRemoteDownloads).also {
+        remoteDownloadStore.save(it)
+    }
+    private val remoteFileDownloader = RemoteFileDownloader(
+        contentResolver = activity.contentResolver,
+        client = http,
+        allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
+    )
+    private val terminalSnapshotReadinessHttp = http.newBuilder()
+        .callTimeout(TERMINAL_SNAPSHOT_READINESS_REQUEST_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
+        .build()
     private val updatePreferences = activity.getSharedPreferences(UPDATE_PREFERENCES, android.content.Context.MODE_PRIVATE)
     private val nativeAuthHttp = secureNativeHttpClient()
     private val nativeOidc = NativeOidcClient(nativeAuthHttp, Json { ignoreUnknownKeys = true })
     private val json = Json { ignoreUnknownKeys = true }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val connectivityManager = activity.getSystemService(ConnectivityManager::class.java)
+    private val realtimeNetworkLock = Any()
+    private var realtimeNetwork: Network? = null
+    private var hasObservedRealtimeNetwork = false
+    private var realtimeNetworkCallbackRegistered = false
+    private val realtimeNetworkAvailableCount = AtomicInteger(0)
+    private val realtimeNetworkLostCount = AtomicInteger(0)
+    private val realtimeNetworkReconnectCount = AtomicInteger(0)
+    private val realtimeNetworkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            realtimeNetworkAvailableCount.incrementAndGet()
+            val reconnect = synchronized(realtimeNetworkLock) {
+                val changed = hasObservedRealtimeNetwork && realtimeNetwork != network
+                hasObservedRealtimeNetwork = true
+                realtimeNetwork = network
+                changed
+            }
+            if (reconnect) {
+                realtimeNetworkReconnectCount.incrementAndGet()
+                scope.launch {
+                    realtimeMultiplexer?.onNetworkAvailable()
+                }
+            }
+        }
+
+        override fun onLost(network: Network) {
+            realtimeNetworkLostCount.incrementAndGet()
+            synchronized(realtimeNetworkLock) {
+                hasObservedRealtimeNetwork = true
+                if (realtimeNetwork == network) realtimeNetwork = null
+            }
+        }
+    }
     private val liveSessions = ConcurrentHashMap<UUID, LiveProductSession>()
+    @Volatile private var realtimeMultiplexer: ProductionRealtimeMultiplexer? = null
     private val historyEngines = ConcurrentHashMap<UUID, TermuxTerminalEngine>()
     private val historyDownloads = ConcurrentHashMap<UUID, HistoryDownloadRequest>()
+    private val transcriptLoads = ConcurrentHashMap<TranscriptLoadKey, Deferred<Unit>>()
+    private val deletedSessionIds = ConcurrentHashMap.newKeySet<UUID>()
+    private val remoteDownloadJobs = ConcurrentHashMap<UUID, Job>()
+    private var remoteDownloadRecoveryJob: Job? = null
+    private val remoteDownloadStateLock = Any()
     private val liveSessionLock = Any()
     private val accessStateLock = Mutex()
     private val refreshStateLock = Mutex()
+    private val sessionLifecycleLock = Mutex()
     private val updateCheckLock = Mutex()
+    private val updateDownloadLock = Mutex()
     private val keyMetadataRefreshLock = Mutex()
     private val tokenRefresh = TokenRefreshCoordinator { requestFreshAccessToken() }
     // The first production client is intentionally pinned to the public service.
     // Migrate older installs that may still have a locally edited endpoint.
-    private val initialServerUrl = PUBLIC_SERVER_URL.also {
+    private val initialServerUrl = PRODUCT_PUBLIC_SERVER_URL.also {
         if (sessionStore.serverUrl != it) sessionStore.serverUrl = it
     }
     private val billing = BillingCoordinator(
@@ -154,6 +479,11 @@ internal class ProductionProductRepository(
     private var closed = false
     private val updateArchitecture = Build.SUPPORTED_ABIS.firstOrNull()?.takeIf { it.isNotBlank() } ?: "universal"
     private val updateRequestKey = "$PRODUCT_APPSHIP_SLUG|android|$updateArchitecture|stable|${BuildConfig.VERSION_CODE}"
+    private val updateDownloader = ProductUpdateDownloader(
+        context = activity,
+        client = http,
+        currentBuild = BuildConfig.VERSION_CODE.toLong(),
+    )
 
     private fun accountDisplayLabel(): String? = sessionStore.accountLogin
 
@@ -174,6 +504,7 @@ internal class ProductionProductRepository(
             },
             enrollmentState = ProductEnrollmentState.UNKNOWN,
             serverUrl = initialServerUrl,
+            remoteDownloads = restoredRemoteDownloads,
         ),
     )
     override val snapshot: StateFlow<ProductSnapshot> = mutableSnapshot.asStateFlow()
@@ -182,17 +513,62 @@ internal class ProductionProductRepository(
             mutableSnapshot.value = mutableSnapshot.value.copy(billing = state)
         }
     }
+    private val sessionCatalogPollJob = scope.launch {
+        while (isActive) {
+            delay(SESSION_CATALOG_POLL_INTERVAL_MILLIS)
+            if (!mutableSnapshot.value.signedIn ||
+                mutableSnapshot.value.enrollmentState == ProductEnrollmentState.REVOKED
+            ) continue
+            try {
+                withApi { api -> pollSessionCatalogWithApi(api) }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                // A transient catalog poll must not replace the authoritative
+                // global connection state or flash a user-visible error.
+            }
+        }
+    }
 
     init {
+        realtimeNetworkCallbackRegistered = runCatching {
+            connectivityManager.registerDefaultNetworkCallback(realtimeNetworkCallback)
+            true
+        }.getOrDefault(false)
         if (authState?.isAuthorized == true) {
             scope.launch { runCatching { refresh() } }
+        }
+        if (interruptedRemoteDownloads.isNotEmpty()) {
+            remoteDownloadRecoveryJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                withContext(NonCancellable) {
+                    withContext(Dispatchers.IO) {
+                        interruptedRemoteDownloads.forEach { record ->
+                            Uri.parse(record.targetUri).takeIf {
+                                it.scheme == android.content.ContentResolver.SCHEME_CONTENT
+                            }?.let { uri ->
+                                remoteFileDownloader.cleanupIncompleteDocument(uri)
+                                remoteFileDownloader.releasePersistedPermission(uri)
+                            }
+                        }
+                    }
+                    // A killed process may also have left Windows compressing
+                    // or uploading. Reuse the persisted operation ID when the
+                    // restored account can still authenticate.
+                    interruptedRemoteDownloads.forEach { record ->
+                        record.operationId?.let { operationId ->
+                            cancelKnownRemoteFileOperationBestEffort(record.pcId, operationId)
+                        }
+                    }
+                }
+            }
         }
     }
 
     override suspend fun configureServer(url: String) {
-        val normalized = PUBLIC_SERVER_URL
+        val normalized = PRODUCT_PUBLIC_SERVER_URL
         val changed = normalized != sessionStore.serverUrl
         if (changed) {
+            cancelRemoteDownloadsAndJoin(clearMetadata = true)
             closeLiveSessions()
             closeHistoryEngines()
             clearRoomCache()
@@ -249,32 +625,33 @@ internal class ProductionProductRepository(
         }
     }
 
-    override suspend fun register(username: String, email: String, password: CharArray, confirm: CharArray) {
+    override suspend fun register(
+        username: String,
+        email: String,
+        firstName: String,
+        lastName: String,
+        password: CharArray,
+        confirm: CharArray,
+    ) = withClearedRegistrationSecrets(password, confirm) {
         check(!closed) { "Repository is closed" }
-        require(username.trim().length in 3..128) { "Username is invalid" }
-        require(email.trim().length in 3..320) { "Email is invalid" }
-        require(password.size in 8..1024 && password.contentEquals(confirm)) { "Password is invalid" }
-        try {
-            val root = PUBLIC_SERVER_URL
-            val body = buildJsonObject {
-                put("username", username.trim())
-                put("email", email.trim())
-                put("password", String(password))
-                put("password_confirm", String(confirm))
+        val body = accountRegistrationRequestBody(
+            username = username,
+            email = email,
+            firstName = firstName,
+            lastName = lastName,
+            password = password,
+            confirm = confirm,
+        )
+        val root = PRODUCT_PUBLIC_SERVER_URL
+        val request = Request.Builder()
+            .url("$root/v1/auth/register")
+            .post(body.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .header("Cache-Control", "no-store")
+            .build()
+        withContext(Dispatchers.IO) {
+            nativeAuthHttp.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) throw IllegalStateException("Account registration was rejected")
             }
-            val request = Request.Builder()
-                .url("$root/v1/auth/register")
-                .post(body.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                .header("Cache-Control", "no-store")
-                .build()
-            withContext(Dispatchers.IO) {
-                nativeAuthHttp.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) throw IllegalStateException("Account registration was rejected")
-                }
-            }
-        } finally {
-            password.fill('\u0000')
-            confirm.fill('\u0000')
         }
     }
 
@@ -302,7 +679,10 @@ internal class ProductionProductRepository(
                     intervalMs = UPDATE_CACHE_INTERVAL_MILLIS,
                 )
             ) {
-                return@withContext publishUpdateStatus(cached.copy(fromCache = true, checkedAt = Instant.now()))
+                return@withContext publishCheckedUpdateStatus(
+                    cached.copy(fromCache = true, checkedAt = Instant.now()),
+                    force = false,
+                )
             }
 
             val status = try {
@@ -379,7 +759,55 @@ internal class ProductionProductRepository(
                     checkedAt = Instant.now(),
                 )
             }
-            publishUpdateStatus(status)
+            publishCheckedUpdateStatus(status, force)
+        }
+    }
+
+    override suspend fun downloadUpdate() = updateDownloadLock.withLock {
+        val update = mutableSnapshot.value.updateStatus
+        val build = update.buildNumber
+            ?: return@withLock publishUpdateDownloadState(
+                expectedBuild = null,
+                state = ProductUpdateDownloadState.Failed(
+                    "Update metadata is incomplete / 更新信息不完整",
+                ),
+            )
+        if (update.decision !in setOf(ProductUpdateDecision.OPTIONAL, ProductUpdateDecision.REQUIRED)) {
+            return@withLock
+        }
+        publishUpdateDownloadState(
+            build,
+            ProductUpdateDownloadState.Downloading(0L, update.artifactSizeBytes ?: 0L),
+        )
+        try {
+            val file = updateDownloader.download(
+                update = update,
+                onProgress = { downloaded, total ->
+                    publishUpdateDownloadState(
+                        build,
+                        ProductUpdateDownloadState.Downloading(downloaded, total),
+                    )
+                },
+                onVerifying = {
+                    publishUpdateDownloadState(build, ProductUpdateDownloadState.Verifying)
+                },
+            )
+            publishUpdateDownloadState(build, ProductUpdateDownloadState.Ready(file.absolutePath))
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            publishUpdateDownloadState(
+                build,
+                ProductUpdateDownloadState.Failed(
+                    error.message?.take(240) ?: "APK download failed / APK 下载失败",
+                ),
+            )
+        }
+    }
+
+    override fun dismissUpdate() {
+        mutableSnapshot.update { snapshot ->
+            snapshot.copy(updateStatus = snapshot.updateStatus.copy(dialogVisible = false))
         }
     }
 
@@ -476,6 +904,7 @@ internal class ProductionProductRepository(
     }
 
     override suspend fun signOut() {
+        cancelRemoteDownloadsAndJoin(clearMetadata = true)
         authState = null
         sessionStore.clearAuthState()
         sessionStore.accountLogin = null
@@ -493,7 +922,7 @@ internal class ProductionProductRepository(
             authenticationState = ProductAuthenticationState.SIGNED_OUT,
             connectionState = ProductConnectionState.CONFIGURED,
             enrollmentState = ProductEnrollmentState.UNKNOWN,
-            serverUrl = PUBLIC_SERVER_URL,
+            serverUrl = PRODUCT_PUBLIC_SERVER_URL,
         )
     }
 
@@ -598,8 +1027,14 @@ internal class ProductionProductRepository(
     override suspend fun requestControl(sessionId: UUID) {
         freshAccessToken()
         openSession(sessionId)
-        liveSessions.getValue(sessionId).client.requestControl()
-        appendActivity("Control granted", "Session $sessionId", Severity.SUCCESS)
+        val live = liveSessions.getValue(sessionId)
+        val acquired = live.controlRequestLock.withLock {
+            acquireControlLeaseWithRetry(
+                remoteState = { live.client.sessionState.value },
+                request = live.client::requestControl,
+            )
+        }
+        if (acquired) appendActivity("Control granted", "Session $sessionId", Severity.SUCCESS)
     }
 
     override suspend fun releaseControl(sessionId: UUID) {
@@ -612,18 +1047,31 @@ internal class ProductionProductRepository(
     override suspend fun releaseAllControlLeases() {
         // Keep the realtime clients and terminal engines alive for read-only
         // viewing. Only the server-issued control leases are released.
-        val active = liveSessions.values.filter {
-            it.client.sessionState.value is RemoteSessionState.Controlling
-        }
+        // releaseControl also advances the client's local arbitration fence
+        // when no lease has arrived yet. Include every live client so an HTTP
+        // acquire response that races with onStop is deleted as stale.
+        val active = liveSessions.values.toList()
         if (active.isEmpty()) return
 
-        val tokenFailure = runCatching { freshAccessToken() }.exceptionOrNull()
+        val tokenFailure = try {
+            freshAccessToken()
+            null
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            error
+        }
         if (tokenFailure != null) publishFailure(tokenFailure)
         var firstFailure: Throwable? = null
         if (tokenFailure != null) firstFailure = tokenFailure
         active.forEach { live ->
-            runCatching { live.client.releaseControl() }
-                .onFailure { error -> firstFailure = firstFailure ?: error }
+            try {
+                live.client.releaseControl()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                firstFailure = firstFailure ?: error
+            }
         }
         if (firstFailure != null) {
             publishFailure(firstFailure!!)
@@ -632,15 +1080,31 @@ internal class ProductionProductRepository(
         }
     }
 
-    override suspend fun openSession(sessionId: UUID) {
-        if (liveSessions.containsKey(sessionId)) return
+    override suspend fun openSession(sessionId: UUID): Unit = sessionLifecycleLock.withLock {
+        liveSessions[sessionId]?.let { existing ->
+            if (!shouldReplaceLiveSessionForOpen(
+                    liveSessionExists = true,
+                    remoteState = mutableSnapshot.value.sessionStates[sessionId],
+                )
+            ) return@withLock
+
+            // A failed bootstrap can leave an installed renderer/client behind
+            // while the UI exposes retry. Reusing it makes retry a no-op. Fence
+            // that exact instance, close it, and rebuild under the lifecycle
+            // mutex so no second client can register the same session UUID.
+            val removed = synchronized(liveSessionLock) {
+                liveSessions.remove(sessionId, existing)
+            }
+            if (removed) existing.close()
+            if (liveSessions.containsKey(sessionId)) return@withLock
+        }
         // Keep every opened session alive. The Android pager is a viewer over
         // multiple concurrent terminals; switching pages must not terminate
         // another session's realtime stream.
         val product = mutableSnapshot.value
         val summary = product.sessions.firstOrNull { it.id == sessionId }
             ?: error("The selected session is unavailable")
-        require(summary.state != SessionState.EXITED) { "The selected session has exited" }
+        require(summary.online) { "The selected session is offline" }
         val pc = product.pcs.firstOrNull { it.id == summary.pcId }
             ?: error("The session PC is unavailable")
         val pcDevice = product.devices.firstOrNull {
@@ -648,20 +1112,48 @@ internal class ProductionProductRepository(
         } ?: error("The session PC is not a trusted device")
         require(pcDevice.exchangePublicKey.size == 32) { "The PC exchange public key is unavailable" }
         freshAccessToken()
-        val root = PUBLIC_SERVER_URL
+        mutableSnapshot.update { current ->
+            current.copy(
+                sessionStates = current.sessionStates + (
+                    sessionId to RemoteSessionState.Reconnecting(
+                        lastAckedSequence = current.liveAcknowledgements[sessionId]?.toLong() ?: 0L,
+                        reason = SESSION_BOOTSTRAP_IN_PROGRESS_REASON,
+                    )
+                ),
+            )
+        }
+        val root = PRODUCT_PUBLIC_SERVER_URL
         val stored = identity()
         val engine = TermuxTerminalEngine(
             initialSize = TerminalSize(summary.columns.coerceAtLeast(1), summary.rows.coerceAtLeast(1)),
         )
-        val client = try {
-            val restoredHistory = restoreLiveHistory(
+        val restoredHistory = try {
+            restoreLiveHistory(
                 session = summary,
                 pc = pc,
                 pcDevice = pcDevice,
                 stored = stored,
                 engine = engine,
             )
-            val ackRendererGeneration = AtomicLong(restoredHistory.rendererGeneration)
+        } catch (error: CancellationException) {
+            engine.dispose()
+            throw error
+        } catch (error: Throwable) {
+            engine.dispose()
+            observeBootstrapFailure(sessionId)
+            throw error
+        }
+        val transport = try {
+            deviceRealtimeMultiplexer(stored).register(sessionId)
+        } catch (error: CancellationException) {
+            engine.dispose()
+            throw error
+        } catch (error: Throwable) {
+            engine.dispose()
+            observeBootstrapFailure(sessionId)
+            throw error
+        }
+        val client = try {
             ProductionRealtimeSessionClient(
                 engine = engine,
                 config = ProductionRealtimeSessionConfig(
@@ -677,35 +1169,54 @@ internal class ProductionProductRepository(
                 ),
                 identity = stored.identity,
                 parentScope = scope,
+                transport = transport,
                 httpClient = http,
+                allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
                 inputSequenceProvider = ReservedInputSequenceProvider {
                     sessionStore.reserveInputSequenceRange(sessionId)
                 },
                 envelopeSequenceProvider = ReservedInputSequenceProvider {
                     sessionStore.reserveEnvelopeSequenceRange(sessionId)
                 },
-                initialAcknowledgedSequence = restoredHistory.acknowledgement,
+                initialRendererState = restoredHistory.rendererState,
                 initialObservedLocalInputEpoch = restoredHistory.localInputEpoch,
-                acknowledgementObserver = { sequence ->
-                    historyRepository.putAckCursor(
-                        sessionId,
-                        LIVE_OUTPUT_ACK_DIRECTION,
-                        ackRendererGeneration.get(),
-                        sequence.toULong(),
-                    ).toLong()
+                acknowledgementObserver = { expectedGeneration, sequence ->
+                    if (sessionId in deletedSessionIds) {
+                        DurableAckCommit(sequence, expectedGeneration)
+                    } else {
+                        val persisted = historyRepository.putAckCursor(
+                            sessionId,
+                            LIVE_OUTPUT_ACK_DIRECTION,
+                            expectedGeneration,
+                            sequence.toULong(),
+                        )
+                        observeLiveAcknowledgement(sessionId, persisted)
+                        DurableAckCommit(persisted.toLong(), expectedGeneration)
+                    }
                 },
-                acknowledgementResetObserver = {
-                    val reset = historyRepository.resetAckCursor(
-                        sessionId,
-                        LIVE_OUTPUT_ACK_DIRECTION,
-                        ackRendererGeneration.get(),
-                    )
-                    ackRendererGeneration.set(reset.rendererGeneration)
+                acknowledgementResetObserver = { expectedGeneration ->
+                    if (sessionId in deletedSessionIds) {
+                        DurableAckCommit(0, expectedGeneration + 1)
+                    } else {
+                        val reset = historyRepository.resetAckCursor(
+                            sessionId,
+                            LIVE_OUTPUT_ACK_DIRECTION,
+                            expectedGeneration,
+                        )
+                        observeLiveAcknowledgement(sessionId, reset.sequence)
+                        DurableAckCommit(reset.sequence.toLong(), reset.rendererGeneration)
+                    }
                 },
                 authoritativeMetadataRefreshObserver = { refreshLiveKeyMetadata() },
             )
-        } catch (error: Throwable) {
+        } catch (error: CancellationException) {
+            transport.close()
             engine.dispose()
+            throw error
+        } catch (error: Throwable) {
+            transport.close()
+            engine.dispose()
+            observeBootstrapFailure(sessionId)
             throw error
         }
         val live = LiveProductSession(engine, client)
@@ -718,13 +1229,45 @@ internal class ProductionProductRepository(
         }
         if (!installed) {
             client.close()
-            return
+            return@withLock
         }
+        observeBootstrap(sessionId, restoredHistory)
         live.stateJob = scope.launch {
-            client.sessionState.collect { state ->
-                mutableSnapshot.value = mutableSnapshot.value.copy(
-                    sessionStates = mutableSnapshot.value.sessionStates + (sessionId to state),
+            combine(
+                client.sessionState,
+                engine.authoritativeSize,
+                client.sessionTitle,
+                engine.title,
+            ) { state, size, publishedTitle, rendererTitle ->
+                // Console-title polling and OSC parsing are complementary.
+                // Prefer the ordered E2EE metadata event and retain the
+                // renderer title as compatibility fallback for older Agents.
+                RuntimeSessionProjection(
+                    state,
+                    size,
+                    liveSessionTitleOverride(publishedTitle, rendererTitle),
                 )
+            }.collect { runtime ->
+                mutableSnapshot.update { product ->
+                    val index = product.sessions.indexOfFirst { it.id == sessionId }
+                    if (index < 0) return@update product
+                    val projected = projectLiveSessionSummary(
+                        product.sessions[index],
+                        runtime.state,
+                        runtime.size,
+                    )
+                    val sessions = product.sessions.toMutableList().also { it[index] = projected }
+                    product.copy(
+                        sessions = sessions,
+                        sessionStates = product.sessionStates + (sessionId to runtime.state),
+                        sessionTitles = when {
+                            runtime.titleOverride == null -> product.sessionTitles
+                            runtime.titleOverride.isBlank() -> product.sessionTitles - sessionId
+                            else -> product.sessionTitles + (sessionId to runtime.titleOverride)
+                        },
+                    )
+                }
+                val state = runtime.state
                 if (state is RemoteSessionState.HistoryGap && live.recoveryJob?.isActive != true) {
                     live.recoveryJob = scope.launch {
                         recoverLiveHistoryGap(sessionId, live)
@@ -742,20 +1285,161 @@ internal class ProductionProductRepository(
                     }
             }
         }
-        client.start()
+        try {
+            client.start()
+        } catch (error: CancellationException) {
+            synchronized(liveSessionLock) {
+                liveSessions.remove(sessionId, live)
+            }
+            live.close()
+            throw error
+        } catch (error: Throwable) {
+            synchronized(liveSessionLock) {
+                liveSessions.remove(sessionId, live)
+            }
+            live.close()
+            observeBootstrapFailure(sessionId)
+            throw error
+        }
     }
 
     override fun terminalEngine(sessionId: UUID): TermuxTerminalEngine? = liveSessions[sessionId]?.engine
 
     override fun historyEngine(historyObjectId: UUID): TermuxTerminalEngine? = historyEngines[historyObjectId]
 
-    override suspend fun stopSession(sessionId: UUID): Unit =
-        error("Remote shell termination is not exposed by the production protocol")
+    override suspend fun loadTranscriptBefore(sessionId: UUID) {
+        check(!closed) { "Repository is closed" }
+        val viewport = mutableSnapshot.value.transcriptViewports[sessionId] ?: return
+        val before = viewport.nextBeforeLineId ?: return
+        val key = TranscriptLoadKey(
+            sessionId = sessionId,
+            snapshotSequence = viewport.snapshotAnchorSequence,
+            beforeLineId = before,
+            cursor = viewport.nextCursor,
+            viewportGeneration = viewport.viewportGeneration,
+        )
+        awaitCoalescedTranscriptLoad(scope, transcriptLoads, key) {
+            sessionLifecycleLock.withLock { loadTranscriptPage(key) }
+        }
+    }
+
+    override fun clearTranscript(sessionId: UUID) {
+        mutableSnapshot.update { product ->
+            val existing = product.transcriptViewports[sessionId] ?: return@update product
+            product.copy(
+                transcriptViewports = product.transcriptViewports + (
+                    sessionId to existing.copy(
+                        nextBeforeLineId = existing.initialBeforeLineId.takeIf { it > 0u },
+                        nextCursor = null,
+                        pages = emptyList(),
+                        loadedObjectIds = emptySet(),
+                        consumedCursors = emptySet(),
+                        loading = false,
+                        error = null,
+                        hasMoreBefore = existing.initialBeforeLineId > 0u,
+                        viewportGeneration = Math.addExact(existing.viewportGeneration, 1L),
+                    )
+                ),
+            )
+        }
+    }
+
+    /** Debug/E2E hook: returns cache counts only and never opens encrypted objects. */
+    internal suspend fun debugHistoryObjectCounts(sessionId: UUID): HistoryObjectCounts =
+        historyRepository.historyObjectCounts(sessionId)
+
+    internal fun debugRealtimeDiagnostics(sessionId: UUID): ProductRealtimeDiagnostics? {
+        val realtime = liveSessions[sessionId]?.client?.diagnostics() ?: return null
+        return ProductRealtimeDiagnostics(
+            socketPhase = realtime.multiplexer.phase,
+            socketGeneration = realtime.multiplexer.socket.generation,
+            connectedGeneration = realtime.multiplexer.socket.connectedGeneration,
+            socketState = realtime.multiplexer.socket.state,
+            endpointCount = realtime.multiplexer.endpointCount,
+            transportState = realtime.transportState,
+            remoteState = realtime.remoteState,
+            transportCollectorActive = realtime.transportCollectorActive,
+            reconnectActive = realtime.reconnectActive,
+            subscriberReady = realtime.subscriberReady,
+            reconnectAttempt = realtime.reconnectAttempt,
+            subscribeSendCount = realtime.subscribeSendCount,
+            lastSubscribeCursor = realtime.lastSubscribeCursor,
+            flowControlSendCount = realtime.flowControlSendCount,
+            lastReceivedSequence = realtime.lastReceivedSequence,
+            lastHandledSequence = realtime.lastHandledSequence,
+            networkAvailableCount = realtimeNetworkAvailableCount.get(),
+            networkLostCount = realtimeNetworkLostCount.get(),
+            networkReconnectCount = realtimeNetworkReconnectCount.get(),
+        )
+    }
+
+    override suspend fun stopSession(sessionId: UUID) {
+        check(!closed) { "Repository is closed" }
+        val product = mutableSnapshot.value
+        val session = product.sessions.firstOrNull { it.id == sessionId }
+            ?: error("The selected session is unavailable")
+        require(session.online) { "Only an online session can be closed" }
+
+        // Opening is idempotent and registers this exact UUID on the shared
+        // device socket. The client then waits for its own SUBSCRIBE route to
+        // be ready before sending the E2EE termination request.
+        openSession(sessionId)
+        val live = liveSessions[sessionId] ?: error("The selected session is no longer available")
+        live.client.requestTermination()
+
+        // The encrypted realtime request intentionally contains no server-
+        // readable command.  The Windows Agent therefore needs a short window
+        // to terminate the exact SessionHost and publish EXITED before the
+        // REST deletion fence will accept this session.  Retry only that
+        // explicit active-session conflict; authentication, authorization and
+        // transport failures must remain visible to the user.  Once deletion
+        // succeeds, permanently fence in-flight catalog/realtime events and
+        // remove the renderer, Room history, and directory row together.
+        withApi { api ->
+            refreshStateLock.withLock {
+                sessionLifecycleLock.withLock {
+                    deleteClosedSessionAfterTermination(
+                        deleteRemote = { api.delete("/v1/sessions/$sessionId") },
+                        deleteLocal = { deleteLocalSession(sessionId) },
+                    )
+                }
+            }
+        }
+        appendActivity(
+            "Session closed",
+            "The Windows command line was closed and its session record was removed",
+            Severity.INFO,
+        )
+    }
+
+    override suspend fun deleteSession(sessionId: UUID) {
+        check(!closed) { "Repository is closed" }
+        withApi { api ->
+            // A refresh that began before this request must publish before the
+            // deletion, never resurrect the deleted session afterward. The
+            // lifecycle lock also prevents an open/replay from installing a
+            // new client or history engine between server success and cleanup.
+            refreshStateLock.withLock {
+                sessionLifecycleLock.withLock {
+                    deleteSessionAfterRemoteSuccess(
+                        deleteRemote = { api.delete("/v1/sessions/$sessionId") },
+                        deleteLocal = { deleteLocalSession(sessionId) },
+                    )
+                }
+            }
+        }
+    }
 
     override suspend fun sendPaste(sessionId: UUID, text: String) {
         require(text.isNotEmpty()) { "Paste text is empty" }
         val live = liveSessions[sessionId] ?: error("Open the session before sending input")
         check(live.engine.submitPaste(text)) { "Request control before sending input" }
+    }
+
+    override suspend fun sendCommand(sessionId: UUID, text: String) {
+        val live = liveSessions[sessionId] ?: error("Open the session before sending input")
+        val submission = live.client.remoteSession.submitInput(commandInputBytes(text))
+        commandSubmissionFailure(submission)?.let(::error)
     }
 
     override suspend fun sendTerminalAction(sessionId: UUID, action: TerminalAction) {
@@ -764,6 +1448,8 @@ internal class ProductionProductRepository(
             TerminalAction.ESCAPE -> live.engine.submitKeyCode(KeyEvent.KEYCODE_ESCAPE)
             TerminalAction.TAB -> live.engine.submitKeyCode(KeyEvent.KEYCODE_TAB)
             TerminalAction.ENTER -> live.engine.submitKeyCode(KeyEvent.KEYCODE_ENTER)
+            TerminalAction.BACKSPACE -> live.engine.submitKeyCode(KeyEvent.KEYCODE_DEL)
+            TerminalAction.DELETE -> live.engine.submitKeyCode(KeyEvent.KEYCODE_FORWARD_DEL)
             TerminalAction.ARROW_LEFT -> live.engine.submitKeyCode(KeyEvent.KEYCODE_DPAD_LEFT)
             TerminalAction.ARROW_UP -> live.engine.submitKeyCode(KeyEvent.KEYCODE_DPAD_UP)
             TerminalAction.ARROW_DOWN -> live.engine.submitKeyCode(KeyEvent.KEYCODE_DPAD_DOWN)
@@ -773,7 +1459,53 @@ internal class ProductionProductRepository(
         check(accepted) { "Request control before sending input" }
     }
 
-    override suspend fun replayHistory(entry: HistoryEntry) {
+    override suspend fun sendTerminalKeyCombination(sessionId: UUID, combination: String) {
+        val live = liveSessions[sessionId] ?: error("Open the session before sending input")
+        val parsed = TerminalKeyCombination.parse(combination)
+            ?: throw IllegalArgumentException("Unsupported terminal key combination")
+        val printable = when (parsed.key) {
+            "Space" -> ' '.code
+            else -> parsed.printableCodePoint
+        }
+        val accepted = if (printable != null) {
+            val shifted = if (parsed.shift) terminalShiftedCodePoint(printable) else printable
+            live.engine.submitCodePoint(
+                shifted,
+                controlDown = parsed.control,
+                altDown = parsed.alt,
+            )
+        } else {
+            val keyCode = when (parsed.key) {
+                "Esc" -> KeyEvent.KEYCODE_ESCAPE
+                "Tab" -> KeyEvent.KEYCODE_TAB
+                "Enter" -> KeyEvent.KEYCODE_ENTER
+                "Backspace" -> KeyEvent.KEYCODE_DEL
+                "Delete" -> KeyEvent.KEYCODE_FORWARD_DEL
+                "Left" -> KeyEvent.KEYCODE_DPAD_LEFT
+                "Up" -> KeyEvent.KEYCODE_DPAD_UP
+                "Down" -> KeyEvent.KEYCODE_DPAD_DOWN
+                "Right" -> KeyEvent.KEYCODE_DPAD_RIGHT
+                "Home" -> KeyEvent.KEYCODE_MOVE_HOME
+                "End" -> KeyEvent.KEYCODE_MOVE_END
+                "PageUp" -> KeyEvent.KEYCODE_PAGE_UP
+                "PageDown" -> KeyEvent.KEYCODE_PAGE_DOWN
+                "Insert" -> KeyEvent.KEYCODE_INSERT
+                else -> parsed.key.drop(1).toIntOrNull()
+                    ?.takeIf { parsed.key.startsWith("F") && it in 1..12 }
+                    ?.let { KeyEvent.KEYCODE_F1 + it - 1 }
+                    ?: throw IllegalArgumentException("Unsupported terminal key: ${parsed.key}")
+            }
+            live.engine.submitKeyCode(
+                keyCode,
+                controlDown = parsed.control,
+                altDown = parsed.alt,
+                shiftDown = parsed.shift,
+            )
+        }
+        check(accepted) { "Request control before sending input" }
+    }
+
+    override suspend fun replayHistory(entry: HistoryEntry): Unit = sessionLifecycleLock.withLock {
         require(entry.historyObject.kind == HistoryObject.Kind.CHUNK) { "This history object cannot be replayed by this client" }
         val download = historyDownloads[entry.historyObject.id] ?: error("Refresh history before replaying this object")
         val product = mutableSnapshot.value
@@ -802,6 +1534,511 @@ internal class ProductionProductRepository(
         appendActivity("History replayed", entry.sessionLabel, Severity.SUCCESS)
     }
 
+    override suspend fun browseRemoteDirectory(
+        pcId: UUID,
+        pcName: String,
+        path: String,
+        offset: Long?,
+    ) {
+        require(path.encodeToByteArray().size <= REMOTE_FILE_PATH_MAX_BYTES && '\u0000' !in path) {
+            "The Windows path is invalid"
+        }
+        require(offset == null || offset >= 0L) { "The directory offset is invalid" }
+        val requestId = UUID.randomUUID()
+        mutableSnapshot.update { current ->
+            current.copy(
+                remoteFileBrowser = reduceRemoteFileBrowser(
+                    current.remoteFileBrowser,
+                    RemoteFileBrowserEvent.LoadStarted(requestId, pcId, pcName, path, offset),
+                ),
+            )
+        }
+        try {
+            val operation = createRemoteFileOperation(
+                pcId = pcId,
+                operation = REMOTE_FILE_OPERATION_LIST,
+                path = path,
+                offset = offset,
+            )
+            val completed = awaitRemoteFileOperation(pcId, operation)
+            val page = completed.result?.toRemoteDirectoryPage()
+                ?: error("The Windows PC returned no directory listing")
+            mutableSnapshot.update { current ->
+                current.copy(
+                    remoteFileBrowser = reduceRemoteFileBrowser(
+                        current.remoteFileBrowser,
+                        RemoteFileBrowserEvent.LoadSucceeded(requestId, page),
+                    ),
+                )
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            mutableSnapshot.update { current ->
+                current.copy(
+                    remoteFileBrowser = reduceRemoteFileBrowser(
+                        current.remoteFileBrowser,
+                        RemoteFileBrowserEvent.LoadFailed(requestId, remoteFileErrorMessage(error)),
+                    ),
+                )
+            }
+            throw error
+        }
+    }
+
+    override fun startRemoteDownload(selection: RemoteFileDownloadSelection, targetUri: Uri) {
+        check(!closed) { "Repository is closed" }
+        require(selection.retryRecordId == null) { "A new download cannot carry a retry record ID" }
+        require(targetUri.scheme == android.content.ContentResolver.SCHEME_CONTENT) {
+            "The selected Android document is invalid"
+        }
+        require(selection.remotePath.isNotBlank() &&
+            selection.remotePath.encodeToByteArray().size <= REMOTE_FILE_PATH_MAX_BYTES &&
+            '\u0000' !in selection.remotePath
+        ) { "The Windows path is invalid" }
+        val now = Instant.now()
+        val record = RemoteDownloadRecord(
+            id = UUID.randomUUID(),
+            pcId = selection.pcId,
+            pcName = selection.pcName.take(256),
+            remotePath = selection.remotePath,
+            filename = selection.suggestedFilename.take(255),
+            directoryZip = selection.directoryZip,
+            status = RemoteDownloadStatus.PREPARING,
+            targetUri = targetUri.toString(),
+            createdAt = now,
+            updatedAt = now,
+        )
+        updateRemoteDownloads { records -> listOf(record) + records.filterNot { it.id == record.id } }
+        launchRemoteDownload(record.id)
+    }
+
+    override fun retryRemoteDownload(recordId: UUID, targetUri: Uri) {
+        check(!closed) { "Repository is closed" }
+        require(targetUri.scheme == android.content.ContentResolver.SCHEME_CONTENT) {
+            "The selected Android document is invalid"
+        }
+        val current = mutableSnapshot.value.remoteDownloads.firstOrNull { it.id == recordId }
+            ?: error("The download record is unavailable")
+        require(current.status == RemoteDownloadStatus.FAILED || current.status == RemoteDownloadStatus.CANCELLED) {
+            "Only failed or cancelled downloads can be retried"
+        }
+        updateRemoteDownload(recordId) { record ->
+            record.copy(
+                status = RemoteDownloadStatus.PREPARING,
+                targetUri = targetUri.toString(),
+                operationId = null,
+                totalBytes = null,
+                downloadedBytes = 0L,
+                updatedAt = Instant.now(),
+                error = null,
+            )
+        }
+        launchRemoteDownload(recordId)
+    }
+
+    override suspend fun cancelRemoteDownload(recordId: UUID) {
+        val current = mutableSnapshot.value.remoteDownloads.firstOrNull { it.id == recordId }
+            ?: return
+        if (!current.status.isActive) return
+        remoteDownloadJobs[recordId]?.cancelAndJoin()
+        val operationId = mutableSnapshot.value.remoteDownloads
+            .firstOrNull { it.id == recordId }
+            ?.operationId
+        if (operationId != null) {
+            try {
+                withApi { api ->
+                    val cancelled = remoteFileOperationResponseFromJson(
+                        api.delete(remoteFileOperationPath(current.pcId, operationId)).jsonObject,
+                    )
+                    require(cancelled.id == operationId) {
+                        "The server returned a different Windows file operation"
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                // Local cancellation and SAF cleanup are authoritative for the
+                // Android surface even if the already-terminal server task races.
+            }
+        }
+        updateRemoteDownload(recordId) { record ->
+            if (record.status == RemoteDownloadStatus.COMPLETED) record else record.copy(
+                status = RemoteDownloadStatus.CANCELLED,
+                updatedAt = Instant.now(),
+                error = null,
+            )
+        }
+    }
+
+    override fun deleteRemoteDownloadRecord(recordId: UUID) {
+        val record = mutableSnapshot.value.remoteDownloads.firstOrNull { it.id == recordId } ?: return
+        require(record.status.isTerminal) { "An active download cannot be removed" }
+        // This deliberately changes metadata only. In particular, completed
+        // content:// documents are never passed to DocumentsContract.deleteDocument.
+        updateRemoteDownloads { records -> removeRemoteDownloadRecord(records, recordId) }
+    }
+
+    override suspend fun openRemoteShell(
+        pcId: UUID,
+        path: String,
+        shellType: RemoteShellType,
+    ): UUID {
+        require(path.isNotBlank() && path.encodeToByteArray().size <= REMOTE_FILE_PATH_MAX_BYTES && '\u0000' !in path) {
+            "The Windows directory is invalid"
+        }
+        mutableSnapshot.update { current ->
+            current.copy(
+                remoteFileBrowser = reduceRemoteFileBrowser(
+                    current.remoteFileBrowser,
+                    RemoteFileBrowserEvent.ShellStarted(shellType),
+                ),
+            )
+        }
+        try {
+            val operation = createRemoteFileOperation(
+                pcId = pcId,
+                operation = REMOTE_FILE_OPERATION_OPEN_TERMINAL,
+                path = path,
+                shellType = shellType,
+            )
+            val completed = awaitRemoteFileOperation(pcId, operation)
+            val result = completed.result ?: error("The Windows PC returned no terminal session")
+            val sessionId = UUID.fromString(result.requiredString("session_id"))
+            require(RemoteShellType.fromWireValue(result.requiredString("shell_type")) == shellType) {
+                "The Windows PC returned a different shell type"
+            }
+            val ready = withTimeoutOrNull(REMOTE_SHELL_CATALOG_TIMEOUT_MILLIS) {
+                while (true) {
+                    withApi { api -> pollSessionCatalogWithApi(api) }
+                    if (mutableSnapshot.value.sessions.any { it.id == sessionId && it.online }) break
+                    delay(REMOTE_FILE_OPERATION_POLL_INTERVAL_MILLIS)
+                }
+                true
+            } ?: false
+            check(ready) { "The new terminal session did not become available" }
+            mutableSnapshot.update { current ->
+                current.copy(
+                    remoteFileBrowser = reduceRemoteFileBrowser(
+                        current.remoteFileBrowser,
+                        RemoteFileBrowserEvent.ShellFinished,
+                    ),
+                )
+            }
+            return sessionId
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            mutableSnapshot.update { current ->
+                current.copy(
+                    remoteFileBrowser = reduceRemoteFileBrowser(
+                        current.remoteFileBrowser,
+                        RemoteFileBrowserEvent.ShellFailed(remoteFileErrorMessage(error)),
+                    ),
+                )
+            }
+            throw error
+        }
+    }
+
+    private fun launchRemoteDownload(recordId: UUID) {
+        val job = scope.launch(start = CoroutineStart.LAZY) { performRemoteDownload(recordId) }
+        remoteDownloadJobs.put(recordId, job)?.cancel()
+        job.invokeOnCompletion { remoteDownloadJobs.remove(recordId, job) }
+        job.start()
+    }
+
+    private suspend fun performRemoteDownload(recordId: UUID) {
+        val initial = mutableSnapshot.value.remoteDownloads.firstOrNull { it.id == recordId }
+            ?: return
+        val destination = Uri.parse(initial.targetUri)
+        try {
+            val operation = createRemoteFileOperation(
+                pcId = initial.pcId,
+                operation = REMOTE_FILE_OPERATION_DOWNLOAD,
+                path = initial.remotePath,
+                onCreated = { created ->
+                    // This callback runs inside the POST response boundary. A
+                    // cancellation delivered immediately after withApi returns
+                    // therefore cannot strand an operation before its ID is saved.
+                    updateRemoteDownload(recordId) { record ->
+                        if (!record.status.isActive) record else record.copy(
+                            operationId = created.id,
+                            updatedAt = Instant.now(),
+                        )
+                    }
+                },
+            )
+            val completed = awaitRemoteFileOperation(initial.pcId, operation)
+            val descriptor = completed.download?.let(::remoteDownloadDescriptorFromJson)
+                ?: error("The server returned no download descriptor")
+            require(descriptor.directoryZip == initial.directoryZip) {
+                "The Windows PC returned an unexpected download type"
+            }
+            updateRemoteDownload(recordId) { record ->
+                if (!record.status.isActive) record else record.copy(
+                    filename = descriptor.filename,
+                    directoryZip = descriptor.directoryZip,
+                    status = RemoteDownloadStatus.DOWNLOADING,
+                    totalBytes = descriptor.sizeBytes,
+                    downloadedBytes = 0L,
+                    updatedAt = Instant.now(),
+                    error = null,
+                )
+            }
+            var lastPersistedAt = 0L
+            remoteFileDownloader.download(
+                descriptor = descriptor,
+                destination = destination,
+                onProgress = { downloaded ->
+                    val nowMillis = System.currentTimeMillis()
+                    val persist = downloaded == descriptor.sizeBytes ||
+                        nowMillis - lastPersistedAt >= REMOTE_DOWNLOAD_PERSIST_INTERVAL_MILLIS
+                    if (persist) lastPersistedAt = nowMillis
+                    updateRemoteDownload(recordId, persist = persist) { record ->
+                        if (!record.status.isActive) record else record.copy(
+                            status = RemoteDownloadStatus.DOWNLOADING,
+                            downloadedBytes = downloaded,
+                            updatedAt = Instant.now(),
+                        )
+                    }
+                },
+                onVerifying = {
+                    updateRemoteDownload(recordId) { record ->
+                        if (!record.status.isActive) record else record.copy(
+                            status = RemoteDownloadStatus.VERIFYING,
+                            downloadedBytes = descriptor.sizeBytes,
+                            updatedAt = Instant.now(),
+                        )
+                    }
+                },
+            )
+            updateRemoteDownload(recordId) { record ->
+                if (!record.status.isActive) record else record.copy(
+                    status = RemoteDownloadStatus.COMPLETED,
+                    downloadedBytes = descriptor.sizeBytes,
+                    updatedAt = Instant.now(),
+                    error = null,
+                )
+            }
+        } catch (error: CancellationException) {
+            cancelRemoteFileOperationBestEffort(recordId, initial.pcId)
+            discardIncompleteRemoteDocument(destination)
+            updateRemoteDownload(recordId) { record ->
+                if (record.status == RemoteDownloadStatus.COMPLETED) record else record.copy(
+                    status = RemoteDownloadStatus.CANCELLED,
+                    updatedAt = Instant.now(),
+                    error = null,
+                )
+            }
+            throw error
+        } catch (error: Throwable) {
+            cancelRemoteFileOperationBestEffort(recordId, initial.pcId)
+            discardIncompleteRemoteDocument(destination)
+            updateRemoteDownload(recordId) { record ->
+                if (record.status == RemoteDownloadStatus.COMPLETED) record else record.copy(
+                    status = RemoteDownloadStatus.FAILED,
+                    updatedAt = Instant.now(),
+                    error = remoteFileErrorMessage(error),
+                )
+            }
+        } finally {
+            releaseRemoteDocumentPermission(destination)
+        }
+    }
+
+    private suspend fun discardIncompleteRemoteDocument(destination: Uri) {
+        withContext(NonCancellable + Dispatchers.IO) {
+            remoteFileDownloader.cleanupIncompleteDocument(destination)
+        }
+    }
+
+    private suspend fun releaseRemoteDocumentPermission(destination: Uri) {
+        withContext(NonCancellable + Dispatchers.IO) {
+            remoteFileDownloader.releasePersistedPermission(destination)
+        }
+    }
+
+    private suspend fun cancelRemoteFileOperationBestEffort(recordId: UUID, pcId: UUID) {
+        val operationId = mutableSnapshot.value.remoteDownloads
+            .firstOrNull { it.id == recordId }
+            ?.operationId
+            ?: return
+        cancelKnownRemoteFileOperationBestEffort(pcId, operationId)
+    }
+
+    private suspend fun cancelKnownRemoteFileOperationBestEffort(pcId: UUID, operationId: UUID) {
+        withContext(NonCancellable) {
+            try {
+                withApi { api ->
+                    val cancelled = remoteFileOperationResponseFromJson(
+                        api.delete(remoteFileOperationPath(pcId, operationId)).jsonObject,
+                    )
+                    require(cancelled.id == operationId) {
+                        "The server returned a different Windows file operation"
+                    }
+                }
+            } catch (_: Throwable) {
+                // Cancellation remains locally authoritative. A later explicit
+                // cancel can retry DELETE, while server expiry is the backstop.
+            }
+        }
+    }
+
+    private fun updateRemoteDownload(
+        recordId: UUID,
+        persist: Boolean = true,
+        transform: (RemoteDownloadRecord) -> RemoteDownloadRecord,
+    ) {
+        updateRemoteDownloads(persist) { records ->
+            records.map { record -> if (record.id == recordId) transform(record) else record }
+        }
+    }
+
+    private fun updateRemoteDownloads(
+        persist: Boolean = true,
+        transform: (List<RemoteDownloadRecord>) -> List<RemoteDownloadRecord>,
+    ) {
+        synchronized(remoteDownloadStateLock) {
+            mutableSnapshot.update { current ->
+                current.copy(
+                    remoteDownloads = transform(current.remoteDownloads)
+                        .sortedByDescending(RemoteDownloadRecord::createdAt)
+                        .take(MAX_REMOTE_DOWNLOAD_RECORDS),
+                )
+            }
+            if (persist) remoteDownloadStore.save(mutableSnapshot.value.remoteDownloads)
+        }
+    }
+
+    private suspend fun cancelRemoteDownloadsAndJoin(clearMetadata: Boolean) {
+        val jobs = remoteDownloadJobs.values.toList()
+        jobs.forEach(Job::cancel)
+        for (job in jobs) job.join()
+        remoteDownloadJobs.clear()
+        if (clearMetadata) {
+            synchronized(remoteDownloadStateLock) {
+                remoteDownloadStore.clear()
+                mutableSnapshot.value = mutableSnapshot.value.copy(remoteDownloads = emptyList())
+            }
+        }
+    }
+
+    private suspend fun createRemoteFileOperation(
+        pcId: UUID,
+        operation: String,
+        path: String,
+        offset: Long? = null,
+        shellType: RemoteShellType? = null,
+        onCreated: (RemoteFileOperationResponse) -> Unit = {},
+    ): RemoteFileOperationResponse {
+        // One stable key belongs to this create attempt. If transport retry is
+        // added below this boundary, it must reuse this value with the same body.
+        val idempotencyKey = UUID.randomUUID().toString()
+        return withApi { api ->
+        remoteFileOperationResponseFromJson(
+            api.post(
+                remoteFileOperationPath(pcId),
+                buildJsonObject {
+                    put("operation", operation)
+                    put("path", path)
+                    offset?.let { put("offset", it) }
+                    shellType?.let { put("shell_type", it.wireValue) }
+                },
+                idempotencyKey = idempotencyKey,
+            ).jsonObject,
+        ).also(onCreated)
+        }
+    }
+
+    private suspend fun awaitRemoteFileOperation(
+        pcId: UUID,
+        initial: RemoteFileOperationResponse,
+    ): RemoteFileOperationResponse {
+        var current = initial
+        while (current.status == REMOTE_FILE_STATUS_PENDING ||
+            current.status == REMOTE_FILE_STATUS_PROCESSING
+        ) {
+            delay(REMOTE_FILE_OPERATION_POLL_INTERVAL_MILLIS)
+            current = withApi { api ->
+                remoteFileOperationResponseFromJson(
+                    api.get(remoteFileOperationPath(pcId, current.id)).jsonObject,
+                ).also { response ->
+                    require(response.id == current.id) {
+                        "The server returned a different Windows file operation"
+                    }
+                }
+            }
+        }
+        return when (current.status) {
+            REMOTE_FILE_STATUS_SUCCEEDED -> current
+            REMOTE_FILE_STATUS_FAILED -> error(current.error ?: "The Windows file operation failed")
+            REMOTE_FILE_STATUS_CANCELLED -> error("The Windows file operation was cancelled")
+            REMOTE_FILE_STATUS_EXPIRED -> error("The Windows file operation expired")
+            else -> error("The server returned an unknown Windows file-operation state")
+        }
+    }
+
+    private fun JsonObject.toRemoteDirectoryPage(): RemoteDirectoryPage {
+        val entries = getValue("entries").jsonArray.map { value ->
+            val item = value.jsonObject
+            val kind = RemoteFileKind.fromWireValue(item.requiredString("kind"))
+            val size = item["size_bytes"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.long
+            if (kind == RemoteFileKind.DIRECTORY) require(size == null) {
+                "A Windows directory unexpectedly reported a byte size"
+            }
+            RemoteFileEntry(
+                name = item.requiredString("name").take(255),
+                path = item.requiredString("path").also {
+                    require(it.encodeToByteArray().size <= REMOTE_FILE_PATH_MAX_BYTES && '\u0000' !in it) {
+                        "The Windows PC returned an invalid path"
+                    }
+                },
+                kind = kind,
+                sizeBytes = size?.also { require(it >= 0L) { "A Windows file reported a negative size" } },
+                modifiedAt = item["modified_at"]?.jsonPrimitive?.contentOrNull?.let(Instant::parse),
+                attributes = item["attributes"]?.jsonArray
+                    ?.mapTo(linkedSetOf()) { it.jsonPrimitive.content }
+                    .orEmpty(),
+            )
+        }
+        require(entries.size <= REMOTE_FILE_LIST_PAGE_MAX_ENTRIES) {
+            "The Windows PC returned too many directory entries"
+        }
+        val currentPath = requiredString("current_path")
+        val parentPath = get("parent_path")?.jsonPrimitive?.contentOrNull
+        val nextOffset = get("next_offset")?.takeUnless { it is JsonNull }?.jsonPrimitive?.long
+        require(nextOffset == null || nextOffset >= 0L) { "The Windows PC returned an invalid page offset" }
+        return RemoteDirectoryPage(currentPath, parentPath, entries, nextOffset)
+    }
+
+    private fun remoteFileOperationPath(pcId: UUID, operationId: UUID? = null): String =
+        "/v1/pcs/$pcId/file-operations" + (operationId?.let { "/$it" } ?: "")
+
+    private fun remoteFileErrorMessage(error: Throwable): String = when (error) {
+        is TermLinkApiException -> activity.getString(R.string.remote_file_error_server, error.status)
+        is java.io.IOException -> activity.getString(R.string.remote_file_error_connection)
+        else -> activity.getString(R.string.remote_file_error_generic)
+    }
+
+    private suspend fun deleteLocalSession(sessionId: UUID) {
+        // Fence any realtime acknowledgement already in flight before the
+        // Room transaction. UUIDs are never reused, so the fence is permanent
+        // for this repository lifetime.
+        deletedSessionIds += sessionId
+        val historyObjectIds = mutableSnapshot.value.history.asSequence()
+            .filter { it.sessionId == sessionId }
+            .mapTo(mutableSetOf()) { it.historyObject.id }
+        val live = synchronized(liveSessionLock) { liveSessions.remove(sessionId) }
+        live?.closeAndJoin()
+        historyObjectIds.forEach { objectId ->
+            historyEngines.remove(objectId)?.dispose()
+            historyDownloads.remove(objectId)
+        }
+        historyRepository.deleteSession(sessionId)
+        mutableSnapshot.update { snapshot -> snapshot.withoutSession(sessionId) }
+    }
+
     override suspend fun refresh() {
         check(!closed) { "Repository is closed" }
         mutableSnapshot.value = mutableSnapshot.value.copy(
@@ -816,6 +2053,8 @@ internal class ProductionProductRepository(
         )
         try {
             withApi { api -> refreshWithApi(api) }
+        } catch (error: CancellationException) {
+            throw error
         } catch (error: Throwable) {
             publishFailure(error)
             throw error
@@ -823,16 +2062,18 @@ internal class ProductionProductRepository(
     }
 
     private suspend fun refreshWithApi(api: ProductionApiClient): Unit = refreshStateLock.withLock {
-        val self = ProductResponseParser.self(api.get("/v1/devices/self").jsonObject)
-        if (self.trustState != DeviceTrustState.TRUSTED) {
+        val self = resolveSameAccountDevice(api, ProductResponseParser.self(api.get("/v1/devices/self").jsonObject))
+        if (sameAccountDeviceAction(self.trustState) == SameAccountDeviceAction.BLOCK_REVOKED) {
             clearAccessControlledState(self)
             return
         }
         val devices = ProductResponseParser.itemObjects(api.get("/v1/devices").jsonObject).map { it.toDevice() }
         val pcs = ProductResponseParser.itemObjects(api.get("/v1/pcs").jsonObject).map { it.toPc() }
         val sessions = pcs.flatMap { pc ->
-            ProductResponseParser.itemObjects(api.get("/v1/pcs/${pc.id}/sessions").jsonObject).map { it.toSession() }
-        }
+            ProductResponseParser.itemObjects(
+                api.get("/v1/pcs/${pc.id}/sessions?include_ended=true").jsonObject,
+            ).map { it.toSession() }
+        }.filterNot { it.id in deletedSessionIds }
         val entitlement = api.get("/v1/account/entitlements").jsonObject.toEntitlement()
         val catalogPlans = ProductResponseParser.catalogPlanObjects(api.get("/v1/billing/plans").jsonObject)
             .map { it.toCatalogPlan() }
@@ -840,20 +2081,23 @@ internal class ProductionProductRepository(
         // Reject an epoch rollback or same-epoch public-key substitution before
         // any untrusted metadata reaches Room. Refreshes are serialized so a
         // slower response cannot overwrite a newer validated snapshot.
+        closeLiveSessionsForChangedPcIdentities(pcs, sessions)
         validateAuthoritativeSessionKeys(devices, pcs, sessions)
         historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
         sessions.forEach { historyRepository.upsertSession(it) }
-        val ownDeviceId = identity().deviceId
+        val storedIdentity = identity()
+        val ownDeviceId = storedIdentity.deviceId
+        val directoryTitles = decryptSessionDirectoryTitles(devices, pcs, sessions, storedIdentity)
         val refreshedDownloads = mutableMapOf<UUID, HistoryDownloadRequest>()
         val historyEntries = sessions.flatMap { session ->
             val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@flatMap emptyList()
             val response = try {
-                api.get("/v1/sessions/${session.id}/history").jsonObject
+                api.get(sessionChunkHistoryRequestPath(session.id)).jsonObject
             } catch (error: TermLinkApiException) {
                 if (error.status == 503) return@flatMap emptyList()
                 throw error
             }
-            ProductResponseParser.itemObjects(response).mapNotNull { item ->
+            boundedChunkHistoryItems(response).mapNotNull { item ->
                 val keyId = item.requiredString("key_id")
                 val historyEpoch = historyKeyEpoch(ownDeviceId, keyId)
                 if (!item.requiredString("kind").equals("chunk", ignoreCase = true) ||
@@ -882,32 +2126,46 @@ internal class ProductionProductRepository(
             }
             .mapTo(mutableSetOf(), PcSummary::id)
         closeLiveSessionsExcept(
-            sessions.filter {
-                it.state != SessionState.EXITED && it.pcId in trustedPcIds
-            }.mapTo(mutableSetOf(), SessionSummary::id),
+            retainedLiveSessionIds(sessions, trustedPcIds),
         )
-        val retainedStates = mutableSnapshot.value.sessionStates.filterKeys { id -> sessions.any { it.id == id } }
-        mutableSnapshot.value = mutableSnapshot.value.copy(
-            signedIn = true,
-            configured = true,
-            connectionState = ProductConnectionState.CONNECTED,
-            connectionError = null,
-            enrollmentState = ProductEnrollmentState.TRUSTED,
-            enrollmentConfirmationRequired = false,
-            accountLabel = accountDisplayLabel(),
-            devices = devices,
-            pcs = pcs,
-            sessions = sessions,
-            sessionStates = retainedStates,
-            history = historyEntries,
-            replayedHistoryObjectIds = mutableSnapshot.value.replayedHistoryObjectIds.intersect(
-                historyEntries.mapTo(mutableSetOf()) { it.historyObject.id },
-            ),
-            catalogPlans = catalogPlans,
-            entitlement = entitlement,
-            catalogPlan = catalog,
-            lastSyncedAt = Instant.now(),
-        )
+        val runtimeSessions = sessions.map { session ->
+            liveSessions[session.id]?.let { live ->
+                projectLiveSessionSummary(session, live.client.sessionState.value, live.engine.authoritativeSize.value)
+            } ?: session
+        }
+        val retainedSessionIds = sessions.mapTo(mutableSetOf(), SessionSummary::id)
+        mutableSnapshot.update { current ->
+            current.copy(
+                signedIn = true,
+                configured = true,
+                connectionState = ProductConnectionState.CONNECTED,
+                connectionError = null,
+                enrollmentState = ProductEnrollmentState.TRUSTED,
+                enrollmentConfirmationRequired = false,
+                accountLabel = accountDisplayLabel(),
+                devices = devices,
+                pcs = pcs,
+                sessions = runtimeSessions,
+                sessionStates = current.sessionStates.filterKeys(retainedSessionIds::contains),
+                sessionTitles = reconcileSessionDirectoryTitles(
+                    current.sessionTitles,
+                    runtimeSessions,
+                    directoryTitles,
+                    currentLiveSessionTitles(),
+                ),
+                history = historyEntries,
+                replayedHistoryObjectIds = current.replayedHistoryObjectIds.intersect(
+                    historyEntries.mapTo(mutableSetOf()) { it.historyObject.id },
+                ),
+                transcriptViewports = current.transcriptViewports.filterKeys(retainedSessionIds::contains),
+                liveAcknowledgements = current.liveAcknowledgements.filterKeys(retainedSessionIds::contains),
+                bootstrapSources = current.bootstrapSources.filterKeys(retainedSessionIds::contains),
+                catalogPlans = catalogPlans,
+                entitlement = entitlement,
+                catalogPlan = catalog,
+                lastSyncedAt = Instant.now(),
+            )
+        }
         scope.launch { billing.syncCatalog(catalogPlans) }
     }
 
@@ -920,15 +2178,135 @@ internal class ProductionProductRepository(
         }
     }
 
-    private suspend fun <T> withApi(block: suspend (ProductionApiClient) -> T): T = withContext(Dispatchers.IO) {
-        val root = PUBLIC_SERVER_URL
+    private suspend fun pollSessionCatalogWithApi(api: ProductionApiClient): Unit = refreshStateLock.withLock {
+        val devices = ProductResponseParser.itemObjects(api.get("/v1/devices").jsonObject).map { it.toDevice() }
+        val pcs = ProductResponseParser.itemObjects(api.get("/v1/pcs").jsonObject).map { it.toPc() }
+        val catalogSessions = pcs.flatMap { pc ->
+            ProductResponseParser.itemObjects(
+                api.get("/v1/pcs/${pc.id}/sessions?include_ended=true").jsonObject,
+            ).map { it.toSession() }
+        }.filterNot { it.id in deletedSessionIds }
+        closeLiveSessionsForChangedPcIdentities(pcs, catalogSessions)
+        validateAuthoritativeSessionKeys(devices, pcs, catalogSessions)
+        historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
+        catalogSessions.forEach { historyRepository.upsertSession(it) }
+        val directoryTitles = decryptSessionDirectoryTitles(devices, pcs, catalogSessions, identity())
+        rotateLiveSessionKeys(devices, pcs, catalogSessions)
+
+        val trustedPcIds = pcs.asSequence()
+            .filter { pc ->
+                devices.any { device ->
+                    device.id == pc.deviceId &&
+                        device.type == DeviceType.WINDOWS_PC &&
+                        device.trustState == DeviceTrustState.TRUSTED
+                }
+            }
+            .mapTo(hashSetOf(), PcSummary::id)
+        closeLiveSessionsExcept(
+            retainedLiveSessionIds(catalogSessions, trustedPcIds),
+        )
+
+        val runtimeSessions = catalogSessions.map { session ->
+            liveSessions[session.id]?.let { live ->
+                projectLiveSessionSummary(session, live.client.sessionState.value, live.engine.authoritativeSize.value)
+            } ?: session
+        }
+        mutableSnapshot.update { current ->
+            val reconciled = reconcileSessionCatalog(
+                current = current.copy(devices = devices),
+                pcs = pcs,
+                sessions = runtimeSessions,
+                deletedSessionIds = deletedSessionIds,
+            )
+            reconciled.copy(
+                sessionTitles = reconcileSessionDirectoryTitles(
+                    reconciled.sessionTitles,
+                    runtimeSessions,
+                    directoryTitles,
+                    currentLiveSessionTitles(),
+                ),
+                lastSyncedAt = Instant.now(),
+            )
+        }
+    }
+
+    private suspend fun <T> withApi(
+        httpClient: OkHttpClient = http,
+        block: suspend (ProductionApiClient) -> T,
+    ): T = withContext(Dispatchers.IO) {
+        val root = PRODUCT_PUBLIC_SERVER_URL
         val token = freshAccessToken()
         val identity = identity()
-        ProductionApiClient(root, AccessTokenProvider { token }, identity.deviceId, identity.identity, http, allowCleartextForLocalTest = false).use { api ->
+        ProductionApiClient(
+            root,
+            AccessTokenProvider { token },
+            identity.deviceId,
+            identity.identity,
+            httpClient,
+            allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
+        ).use { api ->
             ensureRegistered(api, identity)
             block(api)
         }
     }
+
+    private fun decryptSessionDirectoryTitles(
+        devices: List<DeviceSummary>,
+        pcs: List<PcSummary>,
+        sessions: List<SessionSummary>,
+        stored: DeviceKeyVault.StoredIdentity,
+    ): Map<UUID, String> {
+        val pcsById = pcs.associateBy(PcSummary::id)
+        val devicesById = devices.associateBy(DeviceSummary::id)
+        return buildMap {
+            sessions.forEach { session ->
+                val sealed = session.encryptedTitle ?: return@forEach
+                val pc = pcsById[session.pcId] ?: return@forEach
+                val pcDevice = devicesById[pc.deviceId] ?: return@forEach
+                if (pcDevice.type != DeviceType.WINDOWS_PC ||
+                    pcDevice.trustState != DeviceTrustState.TRUSTED ||
+                    pcDevice.exchangePublicKey.size != 32 || pc.keyEpoch < 1
+                ) {
+                    return@forEach
+                }
+                val pairwise = try {
+                    SessionCrypto.derivePairwiseKey(
+                        stored.identity.exchange.privateKey,
+                        pcDevice.exchangePublicKey,
+                        pc.deviceId,
+                        stored.deviceId,
+                        pc.keyEpoch,
+                    )
+                } catch (_: Exception) {
+                    return@forEach
+                }
+                try {
+                    put(
+                        session.id,
+                        SessionTitleCrypto.open(
+                            pairwiseKey = pairwise,
+                            sealedEnvelope = sealed,
+                            expectedSessionId = session.id,
+                            expectedPcDeviceId = pc.deviceId,
+                            expectedRecipientDeviceId = stored.deviceId,
+                            expectedKeyEpoch = pc.keyEpoch,
+                        ),
+                    )
+                } catch (_: Exception) {
+                    // The directory remains usable when a legacy, stale-key or
+                    // malformed title envelope is encountered. Its title is
+                    // omitted instead of displaying unauthenticated metadata.
+                } finally {
+                    pairwise.fill(0)
+                }
+            }
+        }
+    }
+
+    /** Snapshots the exact tri-state title precedence used by the realtime collector. */
+    private fun currentLiveSessionTitles(): Map<UUID, String> = liveSessions.mapValues { (_, live) ->
+        liveSessionTitleOverride(live.client.sessionTitle.value, live.engine.title.value)
+    }.mapNotNull { (sessionId, title) -> title?.let { sessionId to it } }.toMap()
 
     private fun ensureRegistered(api: ProductionApiClient, identity: DeviceKeyVault.StoredIdentity) {
         try {
@@ -1007,7 +2385,7 @@ internal class ProductionProductRepository(
 
     private suspend fun ensureOidcConfiguration(): NativeOidcConfiguration {
         oidcConfiguration?.let { return it }
-        val root = PUBLIC_SERVER_URL
+        val root = PRODUCT_PUBLIC_SERVER_URL
         val client = fetchClientConfiguration(root)
         return withContext(Dispatchers.IO) {
             nativeOidc.discover(client.issuer.toString(), client.clientId, client.redirectUri)
@@ -1051,29 +2429,28 @@ internal class ProductionProductRepository(
         }
         establishAccountScope(AccountScope.canonical(configuration.issuer, subject))
         withApi { api ->
-            val self = ProductResponseParser.self(api.get("/v1/devices/self").jsonObject)
-            when (self.trustState) {
-                DeviceTrustState.TRUSTED -> {
-                    mutableSnapshot.value = mutableSnapshot.value.copy(
-                        signedIn = true,
-                        configured = true,
-                        connectionState = ProductConnectionState.CONNECTED,
-                        enrollmentState = ProductEnrollmentState.TRUSTED,
-                        enrollmentConfirmationRequired = false,
-                        accountLabel = accountDisplayLabel(),
-                        devices = listOf(self),
-                    )
-                    refreshWithApi(api)
-                }
-                DeviceTrustState.PENDING -> {
-                    clearAccessControlledState(self, prompt = true)
-                }
-                DeviceTrustState.REVOKED -> {
-                    clearAccessControlledState(self, prompt = false)
+            // withApi registers this account-scoped key first. Continue directly
+            // into the authoritative refresh; no enrollment confirmation step is
+            // part of the same-account Android flow.
+            refreshWithApi(api)
+        }
+    }
+
+    private fun resolveSameAccountDevice(api: ProductionApiClient, self: DeviceSummary): DeviceSummary =
+        when (sameAccountDeviceAction(self.trustState)) {
+            SameAccountDeviceAction.REFRESH,
+            SameAccountDeviceAction.BLOCK_REVOKED -> self
+            SameAccountDeviceAction.ACTIVATE_LEGACY_AND_REFRESH -> {
+                // Compatibility for older servers that still create account-owned
+                // Android keys as pending. This is automatic and never user-facing.
+                api.post("/v1/devices/self/trust", buildJsonObject { })
+                ProductResponseParser.self(api.get("/v1/devices/self").jsonObject).also { activated ->
+                    check(activated.trustState != DeviceTrustState.PENDING) {
+                        "The server did not activate this same-account device"
+                    }
                 }
             }
         }
-    }
 
     private suspend fun establishAccountScope(nextScope: String) {
         if (accountScope != null && accountScope != nextScope) {
@@ -1109,15 +2486,12 @@ internal class ProductionProductRepository(
     }
 
     /**
-     * A server refresh can downgrade this device from trusted to pending or
-     * revoked.  Close all access-bearing runtime state and erase the local
-     * encrypted session/history rows before exposing the downgraded snapshot.
-     * The device identity is intentionally retained so the pairing flow can
-     * complete without manufacturing a new device.
+     * A revoked server response closes access-bearing runtime state and erases
+     * local encrypted session/history rows. The account-scoped identity remains
+     * in Android Keystore so a later sign-in does not manufacture a new device.
      */
     private suspend fun clearAccessControlledState(
         self: DeviceSummary,
-        prompt: Boolean = mutableSnapshot.value.enrollmentConfirmationRequired,
     ) = accessStateLock.withLock {
         closeLiveSessions()
         closeHistoryEngines()
@@ -1134,15 +2508,19 @@ internal class ProductionProductRepository(
                 DeviceTrustState.REVOKED -> ProductEnrollmentState.REVOKED
                 DeviceTrustState.TRUSTED -> ProductEnrollmentState.TRUSTED
             },
-            enrollmentConfirmationRequired = prompt && self.trustState == DeviceTrustState.PENDING,
+            enrollmentConfirmationRequired = false,
             accountLabel = accountDisplayLabel(),
             devices = listOf(self),
             pcs = emptyList(),
             sessions = emptyList(),
             sessionStates = emptyMap(),
+            sessionTitles = emptyMap(),
             pairingChallenge = null,
             history = emptyList(),
             replayedHistoryObjectIds = emptySet(),
+            transcriptViewports = emptyMap(),
+            liveAcknowledgements = emptyMap(),
+            bootstrapSources = emptyMap(),
             catalogPlans = emptyList(),
             entitlement = null,
             catalogPlan = null,
@@ -1151,21 +2529,50 @@ internal class ProductionProductRepository(
         )
     }
 
-    private suspend fun clearRoomCache() = withContext(Dispatchers.IO) {
-        database.withTransaction {
-            database.eventChunks().clear()
-            database.snapshots().clear()
-            database.ackCursors().clear()
-            database.sessions().clear()
-            database.pcs().clear()
-            database.devices().clear()
-            database.preferences().clear()
+    private suspend fun clearRoomCache() {
+        val activeTranscriptLoads = transcriptLoads.values.toSet()
+        transcriptLoads.clear()
+        activeTranscriptLoads.forEach { it.cancelAndJoin() }
+        withContext(Dispatchers.IO) {
+            clearProductRoomCache(historyRepository)
         }
     }
 
     private fun publishUpdateStatus(status: ProductUpdateStatus): ProductUpdateStatus {
         mutableSnapshot.value = mutableSnapshot.value.copy(updateStatus = status)
         return status
+    }
+
+    private fun publishCheckedUpdateStatus(
+        status: ProductUpdateStatus,
+        force: Boolean,
+    ): ProductUpdateStatus {
+        val previous = mutableSnapshot.value.updateStatus
+        val available = status.decision == ProductUpdateDecision.OPTIONAL ||
+            status.decision == ProductUpdateDecision.REQUIRED
+        val sameBuild = status.buildNumber != null && status.buildNumber == previous.buildNumber
+        return publishUpdateStatus(
+            status.copy(
+                dialogVisible = available && (force || !sameBuild || previous.dialogVisible),
+                downloadState = if (sameBuild) previous.downloadState else ProductUpdateDownloadState.Idle,
+            ),
+        )
+    }
+
+    private fun publishUpdateDownloadState(
+        expectedBuild: Long?,
+        state: ProductUpdateDownloadState,
+    ) {
+        mutableSnapshot.update { snapshot ->
+            val update = snapshot.updateStatus
+            if (expectedBuild != null && update.buildNumber != expectedBuild) return@update snapshot
+            snapshot.copy(
+                updateStatus = update.copy(
+                    dialogVisible = true,
+                    downloadState = state,
+                ),
+            )
+        }
     }
 
     private fun cachedUpdateStatus(baseUrl: String): ProductUpdateStatus? {
@@ -1250,7 +2657,38 @@ internal class ProductionProductRepository(
         }
         mutableSnapshot.value = mutableSnapshot.value.copy(
             sessionStates = mutableSnapshot.value.sessionStates.filterKeys(retained::contains),
+            sessionTitles = mutableSnapshot.value.sessionTitles.filterKeys(retained::contains),
         )
+    }
+
+    /**
+     * A live client binds its E2EE material to one Windows device UUID. If the
+     * PC record is re-enrolled under a replacement device, retire every client
+     * created for the old identity before validating or persisting new keys.
+     */
+    private suspend fun closeLiveSessionsForChangedPcIdentities(
+        incomingPcs: List<PcSummary>,
+        incomingSessions: List<SessionSummary>,
+    ) {
+        val storedPcs = historyRepository.pcs()
+        val affected = changedPcDeviceIdentitySessionIds(
+            storedPcs = storedPcs,
+            incomingPcs = incomingPcs,
+            sessions = mutableSnapshot.value.sessions + incomingSessions,
+        )
+        if (affected.isEmpty()) return
+        sessionLifecycleLock.withLock {
+            val retired = synchronized(liveSessionLock) {
+                affected.mapNotNull { sessionId -> liveSessions.remove(sessionId) }
+            }
+            retired.forEach { it.closeAndJoin() }
+            mutableSnapshot.update { snapshot ->
+                snapshot.copy(
+                    sessionStates = snapshot.sessionStates - affected,
+                    sessionTitles = snapshot.sessionTitles - affected,
+                )
+            }
+        }
     }
 
     private suspend fun rotateLiveSessionKeys(
@@ -1280,6 +2718,7 @@ internal class ProductionProductRepository(
             val devices = ProductResponseParser.itemObjects(api.get("/v1/devices").jsonObject).map { it.toDevice() }
             val pcs = ProductResponseParser.itemObjects(api.get("/v1/pcs").jsonObject).map { it.toPc() }
             val sessions = mutableSnapshot.value.sessions
+            closeLiveSessionsForChangedPcIdentities(pcs, sessions)
             liveSessions.toMap().forEach { (sessionId, live) ->
                 val session = sessions.firstOrNull { it.id == sessionId } ?: return@forEach
                 val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@forEach
@@ -1304,8 +2743,7 @@ internal class ProductionProductRepository(
                 }
                 .mapTo(mutableSetOf(), PcSummary::id)
             closeLiveSessionsExcept(
-                sessions.filter { it.state != SessionState.EXITED && it.pcId in trustedPcIds }
-                    .mapTo(mutableSetOf(), SessionSummary::id),
+                retainedLiveSessionIds(sessions, trustedPcIds),
             )
         }
     }
@@ -1319,14 +2757,12 @@ internal class ProductionProductRepository(
         val storedDevices = historyRepository.devices().associateBy(DeviceSummary::id)
         pcs.forEach { pc ->
             val storedPc = storedPcs[pc.id] ?: return@forEach
-            require(pc.keyEpoch >= storedPc.keyEpoch) { "key epoch must not regress" }
-            val nextKey = devices.firstOrNull { it.id == pc.deviceId }?.exchangePublicKey
-            val storedKey = storedDevices[storedPc.deviceId]?.exchangePublicKey
-            if (nextKey != null && storedKey != null && storedKey.isNotEmpty()) {
-                require(nextKey.contentEquals(storedKey)) {
-                    "PC exchange key changed without a new device identity"
-                }
-            }
+            validateAuthoritativePcKeyTransition(
+                storedPc = storedPc,
+                storedDevice = storedDevices[storedPc.deviceId],
+                incomingPc = pc,
+                incomingDevice = devices.firstOrNull { it.id == pc.deviceId },
+            )
         }
         liveSessions.toMap().forEach { (sessionId, live) ->
             val session = sessions.firstOrNull { it.id == sessionId } ?: return@forEach
@@ -1340,12 +2776,288 @@ internal class ProductionProductRepository(
         }
     }
 
+    private fun observeLiveAcknowledgement(sessionId: UUID, sequence: ULong) {
+        mutableSnapshot.update { product ->
+            if (sessionId in deletedSessionIds) product else product.copy(
+                liveAcknowledgements = product.liveAcknowledgements + (sessionId to sequence),
+            )
+        }
+    }
+
+    private fun observeBootstrapFailure(sessionId: UUID) {
+        mutableSnapshot.update { current ->
+            val state = current.sessionStates[sessionId]
+            if (state is RemoteSessionState.Exited) {
+                current
+            } else {
+                current.copy(
+                    sessionStates = current.sessionStates + (
+                        sessionId to RemoteSessionState.Reconnecting(
+                            lastAckedSequence = state?.lastAckedSequence
+                                ?: current.liveAcknowledgements[sessionId]?.toLong()
+                                ?: 0L,
+                            reason = SESSION_BOOTSTRAP_FAILED_REASON,
+                        )
+                    ),
+                )
+            }
+        }
+    }
+
+    private fun observeBootstrap(sessionId: UUID, restored: RestoredLiveHistory) {
+        mutableSnapshot.update { product ->
+            val currentGeneration = product.transcriptViewports[sessionId]?.viewportGeneration ?: 0L
+            val viewports = restored.transcriptAnchor?.let { anchor ->
+                product.transcriptViewports + (
+                    sessionId to TranscriptViewportState(
+                        sessionId = sessionId,
+                        snapshotAnchorSequence = anchor.snapshotSequence,
+                        initialBeforeLineId = anchor.beforeLineId,
+                        viewportGeneration = Math.addExact(currentGeneration, 1L),
+                    )
+                )
+            } ?: (product.transcriptViewports - sessionId)
+            product.copy(
+                transcriptViewports = viewports,
+                liveAcknowledgements = product.liveAcknowledgements + (sessionId to restored.durableAcknowledgement),
+                bootstrapSources = product.bootstrapSources + (sessionId to restored.bootstrapSource),
+            )
+        }
+    }
+
+    private suspend fun loadTranscriptPage(key: TranscriptLoadKey) {
+        val selected = mutableSnapshot.value.transcriptViewports[key.sessionId]
+        if (selected == null || selected.snapshotAnchorSequence != key.snapshotSequence ||
+            selected.nextBeforeLineId != key.beforeLineId || selected.viewportGeneration != key.viewportGeneration
+            || selected.nextCursor != key.cursor
+        ) return
+        mutableSnapshot.update { product ->
+            val current = product.transcriptViewports[key.sessionId]
+            if (!current.matches(key)) product else product.copy(
+                transcriptViewports = product.transcriptViewports + (
+                    key.sessionId to current!!.copy(loading = true, error = null)
+                ),
+            )
+        }
+        try {
+            val product = mutableSnapshot.value
+            val session = product.sessions.firstOrNull { it.id == key.sessionId }
+                ?: error("The transcript session is unavailable")
+            val pc = product.pcs.firstOrNull { it.id == session.pcId }
+                ?: error("The transcript PC is unavailable")
+            val pcDevice = product.devices.firstOrNull {
+                it.id == pc.deviceId && it.type == DeviceType.WINDOWS_PC && it.trustState == DeviceTrustState.TRUSTED
+            } ?: error("The transcript PC is not a trusted device")
+            val stored = identity()
+            // Always fetch the authenticated selector before consulting Room.
+            // The ciphertext may be reusable, but the server response owns the
+            // fixed-revision continuation cursor and publication readiness.
+            val selection = awaitExpectedTranscriptPage {
+                latestTranscriptPage(key, session, stored.deviceId, pc.keyEpoch)
+            }
+            if (selection === TranscriptSelection.Pending) {
+                error("The expected terminal transcript page is not available yet")
+            }
+            if (selection === TranscriptSelection.Complete) {
+                finishEmptyTranscriptPage(key)
+                return
+            }
+            val ready = selection as TranscriptSelection.ReadyPage<TranscriptDownloadDescriptor>
+            validateTranscriptDescriptorNotLoaded(selected, ready.value.metadata)
+            val cached = historyRepository.transcriptPageForCursor(
+                key.sessionId,
+                key.snapshotSequence,
+                key.beforeLineId,
+            )
+            val encrypted = reuseOrLoadTranscriptCiphertext(cached, ready.value.metadata) {
+                val sealed = withContext(Dispatchers.IO) {
+                    downloadTranscript(ready.value.download, ready.value.metadata)
+                }
+                try {
+                    historyRepository.putTranscriptPage(
+                        sessionId = key.sessionId,
+                        snapshotSequence = key.snapshotSequence,
+                        requestBeforeLineId = key.beforeLineId,
+                        firstLineId = ready.value.metadata.firstLineId,
+                        lastLineId = ready.value.metadata.lastLineId,
+                        objectKey = ready.value.metadata.objectKey,
+                        keyId = ready.value.metadata.keyId,
+                        ciphertext = sealed,
+                        id = ready.value.metadata.id,
+                        ciphertextSha256 = ready.value.metadata.ciphertextSha256,
+                    )
+                    EncryptedTranscriptPage(ready.value.metadata.copyDigest(), sealed.copyOf())
+                } finally {
+                    sealed.fill(0)
+                }
+            }
+            val page = try {
+                openTranscriptPage(session, pc, pcDevice, stored, encrypted)
+            } finally {
+                encrypted.ciphertext.fill(0)
+            }
+            mutableSnapshot.update { currentProduct ->
+                val current = currentProduct.transcriptViewports[key.sessionId]
+                if (!current.matches(key)) currentProduct else currentProduct.copy(
+                    transcriptViewports = currentProduct.transcriptViewports + (
+                        key.sessionId to mergeTranscriptPage(
+                            viewport = requireNotNull(current),
+                            requestedBeforeLineId = key.beforeLineId,
+                            requestedCursor = key.cursor,
+                            objectId = ready.value.metadata.id,
+                            outerHasMore = ready.hasMore,
+                            outerNextCursor = ready.nextCursor,
+                            page = page,
+                        )
+                    ),
+                )
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            if (BuildConfig.DEBUG) {
+                Log.e(
+                    "TermLinkTailFirst",
+                    "Transcript page load failed session=${key.sessionId} snapshot=${key.snapshotSequence} " +
+                        "before=${key.beforeLineId}",
+                    error,
+                )
+            }
+            mutableSnapshot.update { product ->
+                val current = product.transcriptViewports[key.sessionId]
+                if (!current.matches(key)) product else product.copy(
+                    transcriptViewports = product.transcriptViewports + (
+                        key.sessionId to current!!.copy(
+                            loading = false,
+                            error = "Unable to load older terminal output",
+                        )
+                    ),
+                )
+            }
+            throw error
+        }
+    }
+
+    private fun finishEmptyTranscriptPage(key: TranscriptLoadKey) {
+        mutableSnapshot.update { product ->
+            val current = product.transcriptViewports[key.sessionId]
+            if (!current.matches(key)) product else product.copy(
+                transcriptViewports = product.transcriptViewports + (
+                    key.sessionId to current!!.copy(
+                        nextBeforeLineId = null,
+                        nextCursor = null,
+                        loading = false,
+                        error = null,
+                        hasMoreBefore = false,
+                    )
+                ),
+            )
+        }
+    }
+
+    private fun TranscriptViewportState?.matches(key: TranscriptLoadKey): Boolean =
+        this != null && sessionId == key.sessionId && snapshotAnchorSequence == key.snapshotSequence &&
+            nextBeforeLineId == key.beforeLineId && nextCursor == key.cursor &&
+            viewportGeneration == key.viewportGeneration
+
+    private suspend fun latestTranscriptPage(
+        key: TranscriptLoadKey,
+        session: SessionSummary,
+        recipientDeviceId: UUID,
+        authoritativeKeyEpoch: Long,
+    ): TranscriptSelection<TranscriptDownloadDescriptor> = withApi { api ->
+        val response = api.get(
+            transcriptHistoryRequestPath(session.id, key.snapshotSequence, key.beforeLineId, key.cursor),
+        ).jsonObject
+        when (val selected = parseTranscriptSelectorResponse(response, key.snapshotSequence, key.beforeLineId)) {
+            TranscriptSelection.Pending -> TranscriptSelection.Pending
+            TranscriptSelection.Complete -> TranscriptSelection.Complete
+            is TranscriptSelection.ReadyPage -> TranscriptSelection.ReadyPage(
+                value = selected.value.toTranscriptDownloadDescriptor(
+                    session = session,
+                    recipientDeviceId = recipientDeviceId,
+                    expectedSnapshotSequence = key.snapshotSequence,
+                    requestBeforeLineId = key.beforeLineId,
+                    authoritativeKeyEpoch = authoritativeKeyEpoch,
+                ),
+                hasMore = selected.hasMore,
+                nextCursor = selected.nextCursor,
+            )
+        }
+    }
+
+    private suspend fun openTranscriptPage(
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        encrypted: EncryptedTranscriptPage,
+    ): TerminalTranscriptPageV1 = withContext(Dispatchers.Default) {
+        val metadata = encrypted.metadata
+        val keyEpoch = requireNotNull(transcriptKeyEpoch(stored.deviceId, metadata.keyId)) {
+            "Transcript key ID is not for this device"
+        }
+        require(keyEpoch <= pc.keyEpoch) { "Transcript key epoch is newer than the authoritative PC epoch" }
+        val pairwise = SessionCrypto.derivePairwiseKey(
+            stored.identity.exchange.privateKey,
+            pcDevice.exchangePublicKey,
+            pc.deviceId,
+            stored.deviceId,
+            keyEpoch,
+        )
+        try {
+            val wire = TerminalSnapshotCrypto.openTranscript(
+                pairwiseKey = pairwise,
+                sealedObject = encrypted.ciphertext,
+                expectedSessionId = session.id,
+                expectedPcDeviceId = pc.deviceId,
+                expectedRecipientDeviceId = stored.deviceId,
+                expectedKeyEpoch = keyEpoch,
+                expectedKeyId = metadata.keyId,
+                expectedAsOfSnapshotSequence = metadata.snapshotSequence,
+                expectedFirstLineId = metadata.firstLineId,
+                expectedLastLineId = metadata.lastLineId,
+            )
+            TerminalTranscriptDomainDecoder.decode(wire).also { page ->
+                require(page.snapshotAnchorSequence.toULong() == metadata.snapshotSequence) {
+                    "Transcript plaintext changed its snapshot anchor"
+                }
+                require(page.firstLineId.toULong() == metadata.firstLineId &&
+                    page.lastLineId.toULong() == metadata.lastLineId
+                ) { "Transcript plaintext changed its line range" }
+            }
+        } finally {
+            pairwise.fill(0)
+        }
+    }
+
     private fun closeLiveSessions() {
         synchronized(liveSessionLock) {
             liveSessions.values.toList().forEach(LiveProductSession::close)
             liveSessions.clear()
         }
-        mutableSnapshot.value = mutableSnapshot.value.copy(sessionStates = emptyMap())
+        realtimeMultiplexer?.close()
+        realtimeMultiplexer = null
+        mutableSnapshot.value = mutableSnapshot.value.copy(
+            sessionStates = emptyMap(),
+            sessionTitles = emptyMap(),
+        )
+    }
+
+    private fun deviceRealtimeMultiplexer(
+        stored: DeviceKeyVault.StoredIdentity,
+    ): ProductionRealtimeMultiplexer = synchronized(liveSessionLock) {
+        realtimeMultiplexer ?: ProductionRealtimeMultiplexer(
+            rootUrl = PRODUCT_PUBLIC_SERVER_URL,
+            tokenProvider = AccessTokenProvider {
+                authState?.accessToken ?: error("OIDC access token is unavailable")
+            },
+            deviceId = stored.deviceId,
+            identity = stored.identity,
+            parentScope = scope,
+            httpClient = http,
+            allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
+        ).also { realtimeMultiplexer = it }
     }
 
     private fun closeHistoryEnginesExcept(retained: Set<UUID>) {
@@ -1362,28 +3074,51 @@ internal class ProductionProductRepository(
     override fun close() {
         if (closed) return
         closed = true
+        if (realtimeNetworkCallbackRegistered) {
+            runCatching { connectivityManager.unregisterNetworkCallback(realtimeNetworkCallback) }
+            realtimeNetworkCallbackRegistered = false
+        }
         closeLiveSessions()
         closeHistoryEngines()
-        billing.close()
-        billingStateJob.cancel()
-        scope.cancel()
-        storedIdentity?.identity?.destroy()
-        storedIdentity = null
-        authService.dispose()
-        database.close()
-        http.dispatcher.cancelAll()
-        val executor = http.dispatcher.executorService
-        val connectionPool = http.connectionPool
-        thread(start = true, isDaemon = true, name = "TermLink-OkHttp-Close") {
-            try {
-                connectionPool.evictAll()
-            } finally {
-                executor.shutdown()
+        val closingDownloadJobs = remoteDownloadJobs.values.toList()
+        val closingRecoveryJob = remoteDownloadRecoveryJob
+        closingDownloadJobs.forEach(Job::cancel)
+        // Keep authentication, device proof keys and OkHttp alive until each
+        // cancelled download has had a chance to DELETE its server operation.
+        scope.launch {
+            for (job in closingDownloadJobs) job.join()
+            closingRecoveryJob?.join()
+            remoteDownloadRecoveryJob = null
+            remoteDownloadJobs.clear()
+            updateRemoteDownloads { records ->
+                records.map { record ->
+                    if (record.status.isActive) record.copy(
+                        status = RemoteDownloadStatus.CANCELLED,
+                        updatedAt = Instant.now(),
+                        error = null,
+                    ) else record
+                }
             }
+            billing.close()
+            billingStateJob.cancel()
+            sessionCatalogPollJob.cancel()
+            storedIdentity?.identity?.destroy()
+            storedIdentity = null
+            authService.dispose()
+            database.close()
+            http.dispatcher.cancelAll()
+            val executor = http.dispatcher.executorService
+            val connectionPool = http.connectionPool
+            thread(start = true, isDaemon = true, name = "TermLink-OkHttp-Close") {
+                try {
+                    connectionPool.evictAll()
+                } finally {
+                    executor.shutdown()
+                }
+            }
+            scope.cancel()
         }
     }
-
-    private fun normalizeServerUrl(value: String): String = ServerUrlPolicy.normalize(value)
 
     private enum class BrowserAuthFlow { REGISTRATION, ACCOUNT_SETUP }
 
@@ -1395,13 +3130,56 @@ internal class ProductionProductRepository(
         val headers: Map<String, List<String>>,
     )
 
+    private data class SnapshotDownloadDescriptor(
+        val metadata: HistoryObject,
+        val rows: Int,
+        val columns: Int,
+        val download: HistoryDownloadRequest,
+    )
+
+    private data class TerminalSnapshotReadinessObservation(
+        val lastOutputSequence: ULong,
+        val snapshot: SnapshotDownloadDescriptor?,
+    )
+
+    private data class TranscriptDownloadDescriptor(
+        val metadata: TranscriptPageMetadata,
+        val download: HistoryDownloadRequest,
+    )
+
+    private data class TranscriptLoadKey(
+        val sessionId: UUID,
+        val snapshotSequence: ULong,
+        val beforeLineId: ULong,
+        val cursor: String?,
+        val viewportGeneration: Long,
+    )
+
+    private data class TranscriptAnchor(
+        val snapshotSequence: ULong,
+        val beforeLineId: ULong,
+    )
+
+    private data class PreparedTerminalSnapshot(
+        val checkpoint: PreparedTerminalCheckpoint,
+        val transcriptAnchor: TranscriptAnchor,
+    )
+
     private class LiveProductSession(
         val engine: TermuxTerminalEngine,
         val client: ProductionRealtimeSessionClient,
     ) : AutoCloseable {
+        val controlRequestLock = Mutex()
         var stateJob: Job? = null
         var tokenRefreshJob: Job? = null
         var recoveryJob: Job? = null
+
+        suspend fun closeAndJoin() {
+            val caller = currentCoroutineContext()[Job]
+            val jobs = listOfNotNull(stateJob, tokenRefreshJob, recoveryJob)
+            close()
+            jobs.filterNot { it === caller }.forEach { it.join() }
+        }
 
         override fun close() {
             stateJob?.cancel()
@@ -1462,7 +3240,7 @@ internal class ProductionProductRepository(
         agentVersion = requiredString("agent_version"),
         keyEpoch = getValue("key_epoch").jsonPrimitive.long,
         remoteRoutingEnabled = getValue("remote_routing_enabled").jsonPrimitive.boolean,
-        online = optionalInstant("last_seen_at")?.isAfter(Instant.now().minusSeconds(45)) == true,
+        online = authoritativePcOnline(this),
         lastSeenAt = optionalInstant("last_seen_at"),
     )
 
@@ -1477,6 +3255,10 @@ internal class ProductionProductRepository(
         lastOutputSequence = getValue("last_output_seq").jsonPrimitive.long.toULong(),
         createdAt = instant("created_at"),
         endedAt = optionalInstant("ended_at"),
+        // Older servers did not return a session-level reachability signal.
+        // Treat that response as offline instead of reviving it from PC state
+        // or failing the entire catalog refresh during a rolling deployment.
+        online = get("online")?.jsonPrimitive?.booleanOrNull ?: false,
     )
 
     private fun JsonObject.toEntitlement() = Entitlement(
@@ -1523,9 +3305,124 @@ internal class ProductionProductRepository(
         )
     }
 
+    private fun JsonObject.toSnapshotDownloadDescriptor(
+        session: SessionSummary,
+        recipientDeviceId: UUID,
+        authoritativeKeyEpoch: Long,
+    ): SnapshotDownloadDescriptor {
+        require(requiredString("kind").equals("snapshot", ignoreCase = true)) {
+            "History selector returned a non-snapshot object"
+        }
+        val id = UUID.fromString(requiredString("id"))
+        val sequenceValue = getValue("snapshot_seq").jsonPrimitive.long
+        require(sequenceValue > 0) { "Snapshot sequence must be positive" }
+        val sequence = sequenceValue.toULong()
+        require(sequence <= session.lastOutputSequence) {
+            "Snapshot sequence is outside the resumable session range"
+        }
+        val rows = getValue("rows").jsonPrimitive.int
+        val columns = getValue("columns").jsonPrimitive.int
+        require(rows in 1..HistoryRepository.MAX_TERMINAL_SNAPSHOT_ROWS) { "Snapshot rows are out of bounds" }
+        require(columns in 1..HistoryRepository.MAX_TERMINAL_SNAPSHOT_COLUMNS) { "Snapshot columns are out of bounds" }
+        val sizeBytes = getValue("size_bytes").jsonPrimitive.long
+        require(sizeBytes in 1..HistoryRepository.MAX_TERMINAL_SNAPSHOT_BYTES) { "Snapshot size is out of bounds" }
+        val formatName = requiredString("format_name")
+        val formatVersion = getValue("format_version").jsonPrimitive.int
+        require(formatName == HistoryRepository.TERMINAL_SNAPSHOT_FORMAT && formatVersion == 1) {
+            "Snapshot format is unsupported"
+        }
+        val keyId = requiredString("key_id")
+        val keyEpoch = requireNotNull(snapshotKeyEpoch(recipientDeviceId, keyId)) {
+            "Snapshot key ID is not for this device"
+        }
+        require(keyEpoch <= authoritativeKeyEpoch) { "Snapshot key epoch is newer than the authoritative PC epoch" }
+        val digest = Base64.getUrlDecoder().decode(requiredString("ciphertext_sha256"))
+        require(digest.size == 32) { "Invalid snapshot digest" }
+        return SnapshotDownloadDescriptor(
+            metadata = HistoryObject(
+                id = id,
+                kind = HistoryObject.Kind.SNAPSHOT,
+                objectKey = "server/${session.id}/snapshot/$id",
+                keyId = keyId,
+                ciphertextSha256 = digest,
+                sizeBytes = sizeBytes,
+                startSequence = null,
+                endSequence = null,
+                snapshotSequence = sequence,
+                formatName = formatName,
+                formatVersion = formatVersion,
+            ),
+            rows = rows,
+            columns = columns,
+            download = getValue("download").jsonObject.toHistoryDownloadRequest(),
+        )
+    }
+
+    private fun JsonObject.toTranscriptDownloadDescriptor(
+        session: SessionSummary,
+        recipientDeviceId: UUID,
+        expectedSnapshotSequence: ULong,
+        requestBeforeLineId: ULong,
+        authoritativeKeyEpoch: Long,
+    ): TranscriptDownloadDescriptor {
+        require(requiredString("kind").equals("transcript", ignoreCase = true)) {
+            "History selector returned a non-transcript object"
+        }
+        val id = UUID.fromString(requiredString("id"))
+        val anchorValue = getValue("as_of_snapshot_seq").jsonPrimitive.long
+        require(anchorValue > 0 && anchorValue.toULong() == expectedSnapshotSequence) {
+            "Transcript snapshot anchor changed"
+        }
+        require(expectedSnapshotSequence <= session.lastOutputSequence) {
+            "Transcript snapshot anchor is newer than the authoritative session"
+        }
+        val firstValue = getValue("first_line_id").jsonPrimitive.long
+        val lastValue = getValue("last_line_id").jsonPrimitive.long
+        require(firstValue > 0 && lastValue >= firstValue && lastValue.toULong() < requestBeforeLineId) {
+            "Transcript line range is invalid for its exclusive cursor"
+        }
+        val sizeBytes = getValue("size_bytes").jsonPrimitive.long
+        require(sizeBytes in 1..HistoryRepository.MAX_TERMINAL_TRANSCRIPT_BYTES) {
+            "Transcript size is out of bounds"
+        }
+        val formatName = requiredString("format_name")
+        val formatVersion = getValue("format_version").jsonPrimitive.int
+        require(formatName == HistoryRepository.TERMINAL_TRANSCRIPT_FORMAT && formatVersion == 1) {
+            "Transcript format is unsupported"
+        }
+        val keyId = requiredString("key_id")
+        val keyEpoch = requireNotNull(transcriptKeyEpoch(recipientDeviceId, keyId)) {
+            "Transcript key ID is not for this device"
+        }
+        require(keyEpoch <= authoritativeKeyEpoch) {
+            "Transcript key epoch is newer than the authoritative PC epoch"
+        }
+        val digest = Base64.getUrlDecoder().decode(requiredString("ciphertext_sha256"))
+        require(digest.size == HistoryRepository.SHA256_BYTES) { "Invalid transcript digest" }
+        return TranscriptDownloadDescriptor(
+            metadata = TranscriptPageMetadata(
+                id = id,
+                sessionId = session.id,
+                snapshotSequence = expectedSnapshotSequence,
+                requestBeforeLineId = requestBeforeLineId,
+                firstLineId = firstValue.toULong(),
+                lastLineId = lastValue.toULong(),
+                objectKey = "server/${session.id}/transcript/$id",
+                keyId = keyId,
+                ciphertextSha256 = digest,
+                sizeBytes = sizeBytes,
+                formatName = formatName,
+                formatVersion = formatVersion,
+            ),
+            download = getValue("download").jsonObject.toHistoryDownloadRequest(),
+        )
+    }
+
     private fun JsonObject.toHistoryDownloadRequest(): HistoryDownloadRequest {
         val uri = URI(requiredString("url"))
-        require(uri.scheme.equals("https", ignoreCase = true)) { "History downloads must use HTTPS" }
+        require(historyDownloadUriAllowed(uri, BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST)) {
+            "History downloads must use HTTPS outside an explicit local debug build"
+        }
         val method = requiredString("method").uppercase()
         require(method == "GET") { "History download method must be GET" }
         val headers = get("headers")?.jsonObject?.mapValues { (_, value) ->
@@ -1550,6 +3447,365 @@ internal class ProductionProductRepository(
         }
     }
 
+    private fun downloadTranscript(
+        request: HistoryDownloadRequest,
+        metadata: TranscriptPageMetadata,
+    ): ByteArray {
+        val builder = Request.Builder().url(request.url).get()
+        request.headers.forEach { (name, values) ->
+            if (!name.equals("host", ignoreCase = true)) values.forEach { builder.addHeader(name, it) }
+        }
+        http.newCall(builder.build()).execute().use { response ->
+            check(response.isSuccessful) { "Transcript download returned HTTP ${response.code}" }
+            val declaredLength = response.body?.contentLength() ?: -1L
+            require(declaredLength < 0 || declaredLength == metadata.sizeBytes) {
+                "Transcript download size mismatch"
+            }
+            val bytes = response.body?.bytes() ?: error("Transcript download was empty")
+            require(bytes.size.toLong() == metadata.sizeBytes) { "Transcript download size mismatch" }
+            require(MessageDigest.isEqual(HistoryRepository.sha256(bytes), metadata.ciphertextSha256)) {
+                "Transcript download integrity check failed"
+            }
+            return bytes
+        }
+    }
+
+    private suspend fun resetLiveRendererAndCursor(
+        session: SessionSummary,
+        engine: TermuxTerminalEngine,
+        expectedRendererGeneration: Long,
+    ): RestoredLiveHistory = withContext(NonCancellable) {
+        engine.clear()
+        engine.resize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1))
+        val reset = historyRepository.resetAckCursor(
+            session.id,
+            LIVE_OUTPUT_ACK_DIRECTION,
+            expectedRendererGeneration,
+        )
+        RestoredLiveHistory(RendererBootstrapState.Empty(reset.rendererGeneration))
+    }
+
+    private suspend fun prepareTerminalSnapshot(
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        engine: TermuxTerminalEngine,
+        metadata: HistoryObject,
+        rows: Int,
+        columns: Int,
+        sealedObject: ByteArray,
+    ) = withContext(Dispatchers.Default) {
+        val sequence = requireNotNull(metadata.snapshotSequence) { "Snapshot sequence is missing" }
+        require(metadata.kind == HistoryObject.Kind.SNAPSHOT) { "History object is not a terminal snapshot" }
+        require(metadata.formatName == HistoryRepository.TERMINAL_SNAPSHOT_FORMAT && metadata.formatVersion == 1) {
+            "Snapshot format is unsupported"
+        }
+        val keyEpoch = requireNotNull(snapshotKeyEpoch(stored.deviceId, metadata.keyId)) {
+            "Snapshot key ID is not for this device"
+        }
+        require(keyEpoch <= pc.keyEpoch) { "Snapshot key epoch is newer than the authoritative PC epoch" }
+        val pairwise = SessionCrypto.derivePairwiseKey(
+            stored.identity.exchange.privateKey,
+            pcDevice.exchangePublicKey,
+            pc.deviceId,
+            stored.deviceId,
+            keyEpoch,
+        )
+        try {
+            val wire = TerminalSnapshotCrypto.openSnapshot(
+                pairwiseKey = pairwise,
+                sealedObject = sealedObject,
+                expectedSessionId = session.id,
+                expectedPcDeviceId = pc.deviceId,
+                expectedRecipientDeviceId = stored.deviceId,
+                expectedKeyEpoch = keyEpoch,
+                expectedKeyId = metadata.keyId,
+                expectedSnapshotSequence = sequence,
+                expectedColumns = columns,
+                expectedRows = rows,
+            )
+            val initialBeforeLineId = TerminalSnapshotCrypto.initialTranscriptBeforeLineId(wire)
+            val decoded = TerminalSnapshotDomainDecoder.decode(wire)
+            PreparedTerminalSnapshot(
+                checkpoint = engine.prepareSnapshot(decoded),
+                transcriptAnchor = TranscriptAnchor(
+                    snapshotSequence = decoded.sequence.toULong(),
+                    beforeLineId = initialBeforeLineId,
+                ),
+            )
+        } finally {
+            pairwise.fill(0)
+        }
+    }
+
+    private suspend fun restoreBoundTerminalCheckpoint(
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        engine: TermuxTerminalEngine,
+    ): RestoredLiveHistory? {
+        val checkpoint = try {
+            historyRepository.rendererCheckpointState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            // A broken binding must block opening rather than silently reset
+            // the durable cursor and trigger a replay from sequence zero.
+            throw error
+        } ?: return null
+        val currentTail = try {
+            latestAuthoritativeSessionTail(session)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        if (!snapshotHasBoundedLiveSuffix(checkpoint.snapshotSequence, currentTail)) return null
+        val prepared = prepareTerminalSnapshot(
+            session,
+            pc,
+            pcDevice,
+            stored,
+            engine,
+            checkpoint.snapshot.metadata,
+            checkpoint.snapshotRows,
+            checkpoint.snapshotColumns,
+            checkpoint.snapshot.ciphertext,
+        )
+        val confirmedTail = latestAuthoritativeSessionTail(session) ?: return null
+        if (!snapshotHasBoundedLiveSuffix(checkpoint.snapshotSequence, confirmedTail)) return null
+        return withContext(NonCancellable) {
+            val bound = if (checkpoint.durableAcknowledgement > checkpoint.snapshotSequence) {
+                historyRepository.bindRendererCheckpoint(
+                    sessionId = session.id,
+                    direction = LIVE_OUTPUT_ACK_DIRECTION,
+                    expectedRendererGeneration = checkpoint.rendererGeneration,
+                    snapshotId = checkpoint.snapshot.metadata.id,
+                    snapshotSequence = checkpoint.snapshotSequence,
+                    ciphertextSha256 = checkpoint.snapshot.metadata.ciphertextSha256,
+                )
+            } else {
+                checkpoint
+            }
+            try {
+                val installed = engine.installPrepared(prepared.checkpoint)
+                check(installed.sequence.toULong() == bound.snapshotSequence &&
+                    installed.size == TerminalSize(bound.snapshotColumns, bound.snapshotRows)
+                ) { "Installed renderer checkpoint does not match its durable binding" }
+                RestoredLiveHistory(
+                    rendererState = RendererBootstrapState.ExactCheckpoint(
+                        sequence = installed.sequence,
+                        rendererGeneration = bound.rendererGeneration,
+                        snapshotId = bound.snapshot.metadata.id,
+                        ciphertextSha256 = bound.snapshot.metadata.ciphertextSha256,
+                    ),
+                    localInputEpoch = installed.projection.observedLocalInputEpoch,
+                    transcriptAnchor = prepared.transcriptAnchor,
+                    durableAcknowledgement = bound.snapshotSequence,
+                    bootstrapSource = ProductBootstrapSource.BOUND_SNAPSHOT,
+                )
+            } catch (error: Exception) {
+                resetLiveRendererAndCursor(session, engine, bound.rendererGeneration)
+                throw error
+            }
+        }
+    }
+
+    private suspend fun latestTerminalSnapshot(
+        initialSession: SessionSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        authoritativeKeyEpoch: Long,
+    ): TerminalSnapshotReadinessObservation? {
+        return withApi(terminalSnapshotReadinessHttp) { api ->
+            // The session list can become visible before its final snapshot is
+            // committed. Refresh only this PC's authoritative session metadata
+            // on every bounded readiness attempt, including when the first
+            // session observation still reported sequence zero.
+            val session = ProductResponseParser.itemObjects(
+                api.get("/v1/pcs/${initialSession.pcId}/sessions").jsonObject,
+            ).map { it.toSession() }
+                .singleOrNull { it.id == initialSession.id }
+                ?: return@withApi null
+            val descriptor = if (session.lastOutputSequence == 0uL) {
+                null
+            } else {
+                try {
+                    val response = api.get(
+                        "/v1/sessions/${session.id}/history" +
+                            "?kind=snapshot&format_name=${HistoryRepository.TERMINAL_SNAPSHOT_FORMAT}&limit=1",
+                    ).jsonObject
+                    val items = ProductResponseParser.itemObjects(response)
+                    require(items.size <= 1) { "Latest snapshot selector returned more than one object" }
+                    items.singleOrNull()?.toSnapshotDownloadDescriptor(
+                        session,
+                        stored.deviceId,
+                        authoritativeKeyEpoch,
+                    )?.takeIf { candidate ->
+                        // A near-tail Snapshot opens immediately and realtime
+                        // fills only its small bounded suffix. A genuinely old
+                        // Snapshot is rejected so opening can never degrade to
+                        // an unbounded prefix replay.
+                        snapshotHasBoundedLiveSuffix(
+                            snapshotSequence = requireNotNull(candidate.metadata.snapshotSequence),
+                            currentSessionSequence = session.lastOutputSequence,
+                        )
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    // Preserve the independently verified current tail even if
+                    // object metadata is temporarily unavailable. That latch is
+                    // what prevents a stale catalog value of zero from causing a
+                    // full realtime replay.
+                    if (BuildConfig.DEBUG) {
+                        Log.e("TermLinkTailFirst", "Snapshot metadata readiness failed", error)
+                    }
+                    null
+                }
+            }
+            if (BuildConfig.DEBUG) {
+                Log.d(
+                    "TermLinkTailFirst",
+                    "Snapshot readiness tail=${session.lastOutputSequence} " +
+                        "candidate=${descriptor?.metadata?.snapshotSequence ?: 0uL}",
+                )
+            }
+            TerminalSnapshotReadinessObservation(session.lastOutputSequence, descriptor)
+        }
+    }
+
+    private suspend fun latestAuthoritativeSessionTail(initialSession: SessionSummary): ULong? =
+        withApi(terminalSnapshotReadinessHttp) { api ->
+            ProductResponseParser.itemObjects(
+                api.get("/v1/pcs/${initialSession.pcId}/sessions").jsonObject,
+            ).map { it.toSession() }
+                .singleOrNull { it.id == initialSession.id }
+                ?.lastOutputSequence
+        }
+
+    /** Returns null only when no durable binding was changed and the caller may use full replay. */
+    private suspend fun restoreRemoteTerminalSnapshot(
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        engine: TermuxTerminalEngine,
+        expectedRendererGeneration: Long,
+        descriptor: SnapshotDownloadDescriptor,
+    ): RestoredLiveHistory? {
+        val metadata = descriptor.metadata
+        val sequence = requireNotNull(metadata.snapshotSequence)
+        val cached = try {
+            historyRepository.getHistoryObject(metadata.id)?.takeIf { value ->
+                value.metadata.kind == HistoryObject.Kind.SNAPSHOT &&
+                    MessageDigest.isEqual(value.metadata.ciphertextSha256, metadata.ciphertextSha256)
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            null
+        }
+        return prepareBindInstallSnapshot(
+            loadAndCache = {
+                try {
+                    val sealedObject = cached?.ciphertext ?: withContext(Dispatchers.IO) {
+                        downloadHistory(descriptor.download, metadata)
+                    }
+                    if (cached == null) {
+                        historyRepository.putSnapshot(
+                            sessionId = session.id,
+                            snapshotSequence = sequence,
+                            rows = descriptor.rows,
+                            columns = descriptor.columns,
+                            objectKey = metadata.objectKey,
+                            keyId = metadata.keyId,
+                            formatName = requireNotNull(metadata.formatName),
+                            formatVersion = requireNotNull(metadata.formatVersion),
+                            ciphertext = sealedObject,
+                            id = metadata.id,
+                            ciphertextSha256 = metadata.ciphertextSha256,
+                        )
+                    }
+                    sealedObject
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    if (BuildConfig.DEBUG) {
+                        Log.e("TermLinkTailFirst", "Snapshot download/cache failed", error)
+                    }
+                    throw error
+                }
+            },
+            prepare = { sealedObject ->
+                try {
+                    prepareTerminalSnapshot(
+                        session,
+                        pc,
+                        pcDevice,
+                        stored,
+                        engine,
+                        metadata,
+                        descriptor.rows,
+                        descriptor.columns,
+                        sealedObject,
+                    )
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    if (BuildConfig.DEBUG) {
+                        Log.e("TermLinkTailFirst", "Snapshot decrypt/prepare failed", error)
+                    }
+                    throw error
+                }
+            },
+            preparedIsCurrent = {
+                val currentTail = latestAuthoritativeSessionTail(session)
+                val current = currentTail != null && snapshotHasBoundedLiveSuffix(sequence, currentTail)
+                if (BuildConfig.DEBUG && !current) {
+                    Log.d(
+                        "TermLinkTailFirst",
+                        "Snapshot drifted before bind snapshot=$sequence tail=${currentTail ?: 0uL}",
+                    )
+                }
+                current
+            },
+            bind = {
+                historyRepository.bindRendererCheckpoint(
+                    sessionId = session.id,
+                    direction = LIVE_OUTPUT_ACK_DIRECTION,
+                    expectedRendererGeneration = expectedRendererGeneration,
+                    snapshotId = metadata.id,
+                    snapshotSequence = sequence,
+                    ciphertextSha256 = metadata.ciphertextSha256,
+                )
+            },
+            installAndMap = { prepared, bound ->
+                val installed = engine.installPrepared(prepared.checkpoint)
+                check(installed.sequence.toULong() == bound.snapshotSequence &&
+                    installed.size == TerminalSize(bound.snapshotColumns, bound.snapshotRows)
+                ) { "Installed renderer checkpoint does not match the bound snapshot" }
+                RestoredLiveHistory(
+                    rendererState = RendererBootstrapState.ExactCheckpoint(
+                        sequence = installed.sequence,
+                        rendererGeneration = bound.rendererGeneration,
+                        snapshotId = metadata.id,
+                        ciphertextSha256 = metadata.ciphertextSha256,
+                    ),
+                    localInputEpoch = installed.projection.observedLocalInputEpoch,
+                    transcriptAnchor = prepared.transcriptAnchor,
+                    durableAcknowledgement = bound.durableAcknowledgement,
+                    bootstrapSource = ProductBootstrapSource.REMOTE_SNAPSHOT,
+                )
+            },
+            resetAfterInstallFailure = { bound ->
+                resetLiveRendererAndCursor(session, engine, bound.rendererGeneration)
+                error("Unable to install the verified terminal snapshot")
+            },
+        )
+    }
+
     /**
      * Rebuilds the renderer through the last durable cumulative ACK before a
      * fresh socket subscribes. A cursor is never used by itself: if encrypted
@@ -1565,19 +3821,89 @@ internal class ProductionProductRepository(
     ): RestoredLiveHistory {
         val cursor = historyRepository.ackCursorState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
             ?: historyRepository.initializeAckCursor(session.id, LIVE_OUTPUT_ACK_DIRECTION)
+        var latestAuthoritativeTail = session.lastOutputSequence
+        var authoritativeReadinessObserved = false
+        val restoredSnapshot = restoreSnapshotWhenEnabled(
+            enabled = BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME,
+            remoteRetryDelaysMillis = TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS,
+            remoteReadinessTimeoutMillis = TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS,
+            restoreBound = {
+                restoreBoundTerminalCheckpoint(
+                    session,
+                    pc,
+                    pcDevice,
+                    stored,
+                    engine,
+                )
+            },
+            latestRemote = {
+                try {
+                    latestTerminalSnapshot(session, stored, pc.keyEpoch)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    if (BuildConfig.DEBUG) {
+                        Log.e("TermLinkTailFirst", "Snapshot readiness request failed", error)
+                    }
+                    throw error
+                }
+            },
+            remoteReady = { observation -> observation.snapshot != null },
+            onRemoteObserved = { observation ->
+                authoritativeReadinessObserved = true
+                latestAuthoritativeTail = maxOf(
+                    latestAuthoritativeTail,
+                    observation.lastOutputSequence,
+                )
+            },
+            restoreRemote = { observation ->
+                restoreRemoteTerminalSnapshot(
+                    session,
+                    pc,
+                    pcDevice,
+                    stored,
+                    engine,
+                    cursor.rendererGeneration,
+                    requireNotNull(observation.snapshot),
+                )
+            },
+        )
+        if (restoredSnapshot != null) {
+            // The tail can advance while a large object is downloaded,
+            // decrypted, and installed. Revalidate after installation but
+            // before the realtime transport is registered. The Snapshot may
+            // trail by one bounded flow-control window, never by an unbounded
+            // historical prefix.
+            val currentTail = latestAuthoritativeSessionTail(session)
+                ?: error("The authoritative terminal tail is unavailable")
+            check(
+                snapshotHasBoundedLiveSuffix(
+                    restoredSnapshot.rendererState.sequence.toULong(),
+                    currentTail,
+                ),
+            ) { "The verified terminal snapshot no longer matches the authoritative tail" }
+            return restoredSnapshot
+        }
+        // A brand-new silent session has no historical terminal state to
+        // bootstrap. Subscribing from zero is tail-safe because sequence zero
+        // cannot cause an old output prefix to be replayed.
+        if (canSafelySubscribeFromZeroWithoutSnapshot(
+                currentSessionSequence = latestAuthoritativeTail,
+                durableAcknowledgement = cursor.sequence,
+                authoritativeReadinessObserved = authoritativeReadinessObserved,
+            )
+        ) {
+            return RestoredLiveHistory(RendererBootstrapState.Empty(cursor.rendererGeneration))
+        }
+        if (BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME) {
+            error("A verified terminal snapshot is not available for this session")
+        }
         if (cursor.sequence == 0uL) {
-            return RestoredLiveHistory(rendererGeneration = cursor.rendererGeneration)
+            return RestoredLiveHistory(RendererBootstrapState.Empty(cursor.rendererGeneration))
         }
         val target = cursor.sequence
         suspend fun resetRendererAndCursor(): RestoredLiveHistory {
-            engine.clear()
-            engine.resize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1))
-            val reset = historyRepository.resetAckCursor(
-                session.id,
-                LIVE_OUTPUT_ACK_DIRECTION,
-                cursor.rendererGeneration,
-            )
-            return RestoredLiveHistory(rendererGeneration = reset.rendererGeneration)
+            return resetLiveRendererAndCursor(session, engine, cursor.rendererGeneration)
         }
         val candidates = mutableSnapshot.value.history
             .asSequence()
@@ -1617,9 +3943,10 @@ internal class ProductionProductRepository(
             }
             if (restored == target) {
                 RestoredLiveHistory(
-                    acknowledgement = restored.toLong(),
+                    rendererState = RendererBootstrapState.FullPrefix(restored.toLong(), cursor.rendererGeneration),
                     localInputEpoch = localInputEpoch,
-                    rendererGeneration = cursor.rendererGeneration,
+                    durableAcknowledgement = target,
+                    bootstrapSource = ProductBootstrapSource.LEGACY_REPLAY,
                 )
             } else {
                 resetRendererAndCursor()
@@ -1826,19 +4153,7 @@ internal class ProductionProductRepository(
                     )
                 }
                 MessageType.SESSION_UPSERT -> SessionUpsertPayload.parseFrom(payload).let { value ->
-                    val lifecycle = when (value.lifecycle.uppercase()) {
-                        "RUNNING", "STARTED", "CHANGED" -> RemoteLifecycle.RUNNING
-                        "INTERRUPTED" -> RemoteLifecycle.INTERRUPTED
-                        "EXITED", "ENDED" -> RemoteLifecycle.ENDED
-                        else -> error("Unknown history lifecycle")
-                    }
-                    DecodedHistoryEvent(
-                        RemoteSessionEvent.Lifecycle(
-                            event.seq,
-                            lifecycle,
-                            value.exitCode.takeIf { value.hasExitCode() },
-                        ),
-                    )
+                    DecodedHistoryEvent(productSessionUpsertEvent(event.seq, value))
                 }
                 MessageType.SESSION_STARTED -> DecodedHistoryEvent(
                     RemoteSessionEvent.Lifecycle(event.seq, RemoteLifecycle.RUNNING),
@@ -1910,6 +4225,24 @@ internal class ProductionProductRepository(
         return epoch.takeIf { HistoryCrypto.keyId(recipientDeviceId, it) == keyId }
     }
 
+    private fun snapshotKeyEpoch(recipientDeviceId: UUID, keyId: String): Long? {
+        val prefix = "snapshot-v1:${recipientDeviceId.toString().replace("-", "")}:"
+        if (!keyId.startsWith(prefix)) return null
+        val encoded = keyId.removePrefix(prefix)
+        if (encoded.length != 8 || encoded.any { !it.isDigit() }) return null
+        val epoch = encoded.toLongOrNull()?.takeIf { it > 0 } ?: return null
+        return epoch.takeIf { TerminalSnapshotCrypto.snapshotKeyId(recipientDeviceId, it) == keyId }
+    }
+
+    private fun transcriptKeyEpoch(recipientDeviceId: UUID, keyId: String): Long? {
+        val prefix = "transcript-v1:${recipientDeviceId.toString().replace("-", "")}:"
+        if (!keyId.startsWith(prefix)) return null
+        val encoded = keyId.removePrefix(prefix)
+        if (encoded.length != 8 || encoded.any { !it.isDigit() }) return null
+        val epoch = encoded.toLongOrNull()?.takeIf { it > 0 } ?: return null
+        return epoch.takeIf { TerminalSnapshotCrypto.transcriptKeyId(recipientDeviceId, it) == keyId }
+    }
+
     private fun wipeHistoryEvents(events: List<RemoteSessionEvent>) {
         events.forEach { event ->
             if (event is RemoteSessionEvent.Output) event.bytes.fill(0)
@@ -1950,9 +4283,11 @@ internal class ProductionProductRepository(
     }
 
     private data class RestoredLiveHistory(
-        val acknowledgement: Long = 0,
+        val rendererState: RendererBootstrapState,
         val localInputEpoch: Long = 0,
-        val rendererGeneration: Long,
+        val transcriptAnchor: TranscriptAnchor? = null,
+        val durableAcknowledgement: ULong = 0u,
+        val bootstrapSource: ProductBootstrapSource = ProductBootstrapSource.EMPTY,
     )
 
     private data class LoadedLiveHistory(
@@ -1966,7 +4301,6 @@ internal class ProductionProductRepository(
     )
 
     private companion object {
-        const val PUBLIC_SERVER_URL = "https://termlink.kget.cc:8910"
         const val UPDATE_PREFERENCES = "update_service"
         const val UPDATE_CHANNEL = "stable"
         const val UPDATE_REQUEST_KEY = "cache_request"
@@ -1977,8 +4311,466 @@ internal class ProductionProductRepository(
         const val UPDATE_MAX_RESPONSE_BYTES = 1_048_576
         const val LIVE_TOKEN_REFRESH_INTERVAL_MILLIS = 15_000L
         const val LIVE_TOKEN_REFRESH_RETRY_MILLIS = 45_000L
+        const val SESSION_CATALOG_POLL_INTERVAL_MILLIS = 2_000L
         const val LIVE_OUTPUT_ACK_DIRECTION = "PC_TO_ANDROID"
         val HISTORY_RECOVERY_DELAYS_MILLIS = longArrayOf(500, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000)
         val sensitiveIdentifierPattern = Regex("(?i)\\b[0-9a-f]{8}-[0-9a-f-]{27,}\\b")
+    }
+}
+
+internal suspend fun clearProductRoomCache(historyRepository: HistoryRepository) {
+    historyRepository.clearAll()
+}
+
+internal const val SESSION_CHUNK_HISTORY_PAGE_LIMIT = 50
+
+internal fun sessionChunkHistoryRequestPath(sessionId: UUID): String =
+    "/v1/sessions/$sessionId/history?kind=chunk&limit=$SESSION_CHUNK_HISTORY_PAGE_LIMIT"
+
+internal fun boundedChunkHistoryItems(response: JsonObject): List<JsonObject> =
+    ProductResponseParser.itemObjects(response).also { items ->
+        require(items.size <= SESSION_CHUNK_HISTORY_PAGE_LIMIT) {
+            "Chunk history page exceeded the requested limit"
+        }
+        require(items.all { item ->
+            item["kind"]?.jsonPrimitive?.contentOrNull.equals("chunk", ignoreCase = true)
+        }) { "Chunk history selector returned a non-chunk object" }
+    }
+
+internal fun transcriptHistoryRequestPath(
+    sessionId: UUID,
+    snapshotSequence: ULong,
+    beforeLineId: ULong,
+    cursor: String? = null,
+): String = if (cursor == null) {
+    "/v1/sessions/$sessionId/history" +
+        "?kind=transcript&as_of_snapshot_seq=$snapshotSequence" +
+        "&before_line_id=$beforeLineId&limit=1"
+} else {
+    require(cursor.isNotBlank()) { "Transcript cursor must not be blank" }
+    val encoded = URLEncoder.encode(cursor, StandardCharsets.UTF_8.name())
+    "/v1/sessions/$sessionId/history?cursor=$encoded&limit=1"
+}
+
+/** Tri-state transcript publication result. No ciphertext is touched while [Pending]. */
+internal sealed interface TranscriptSelection<out Value> {
+    data object Pending : TranscriptSelection<Nothing>
+    data object Complete : TranscriptSelection<Nothing>
+    data class ReadyPage<Value>(
+        val value: Value,
+        val hasMore: Boolean,
+        val nextCursor: String?,
+    ) : TranscriptSelection<Value>
+}
+
+/**
+ * Parses the outer authenticated paging contract before any object download.
+ * `ready` is optional only for rolling compatibility with the previous server.
+ */
+internal fun parseTranscriptSelectorResponse(
+    response: JsonObject,
+    expectedSnapshotSequence: ULong,
+    requestBeforeLineId: ULong,
+): TranscriptSelection<JsonObject> {
+    val anchorPrimitive = response.getValue("as_of_snapshot_seq").jsonPrimitive
+    require(!anchorPrimitive.isString) { "Transcript selector anchor must be an integer" }
+    val anchorValue = anchorPrimitive.long
+    require(anchorValue > 0 && anchorValue.toULong() == expectedSnapshotSequence) {
+        "Transcript selector changed its snapshot anchor"
+    }
+    val items = ProductResponseParser.itemObjects(response)
+    require(items.size <= 1) { "Transcript selector returned more than one object" }
+    val hasMorePrimitive = response.getValue("has_more").jsonPrimitive
+    require(!hasMorePrimitive.isString) { "Transcript selector has_more must be a boolean" }
+    val hasMore = hasMorePrimitive.booleanOrNull
+        ?: error("Transcript selector has_more must be a boolean")
+    val nextCursor = when (val element = response["next_cursor"]) {
+        null, JsonNull -> null
+        else -> element.jsonPrimitive.also {
+            require(it.isString) { "Transcript selector cursor must be a string or null" }
+        }.contentOrNull?.also {
+            require(it.isNotBlank()) { "Transcript selector cursor must not be blank" }
+        } ?: error("Transcript selector cursor must be a string or null")
+    }
+    require(hasMore == (nextCursor != null)) {
+        "Transcript selector continuation contract is inconsistent"
+    }
+
+    val explicitReady = response["ready"]?.let { element ->
+        val primitive = element.jsonPrimitive
+        require(!primitive.isString) { "Transcript selector ready must be a boolean" }
+        requireNotNull(primitive.booleanOrNull) { "Transcript selector ready must be a boolean" }
+    }
+    val ready = explicitReady ?: when {
+        items.isNotEmpty() -> true
+        requestBeforeLineId > 1uL -> false
+        else -> true
+    }
+    if (!ready) {
+        require(items.isEmpty() && !hasMore) {
+            "Pending transcript publication must not expose a page or cursor"
+        }
+        return TranscriptSelection.Pending
+    }
+    if (items.isEmpty()) {
+        require(!hasMore) { "Completed empty transcript publication cannot have another page" }
+        return TranscriptSelection.Complete
+    }
+    return TranscriptSelection.ReadyPage(items.single(), hasMore, nextCursor)
+}
+
+internal fun mergeTranscriptPage(
+    viewport: TranscriptViewportState,
+    requestedBeforeLineId: ULong,
+    requestedCursor: String?,
+    objectId: UUID,
+    outerHasMore: Boolean,
+    outerNextCursor: String?,
+    page: TerminalTranscriptPageV1,
+): TranscriptViewportState {
+    require(viewport.nextBeforeLineId == requestedBeforeLineId) { "transcript request cursor is stale" }
+    require(viewport.nextCursor == requestedCursor) { "transcript opaque request cursor is stale" }
+    require(requestedCursor == null || requestedCursor !in viewport.consumedCursors) {
+        "transcript request cursor was already consumed"
+    }
+    require(objectId !in viewport.loadedObjectIds) { "transcript object was already loaded" }
+    require(page.snapshotAnchorSequence >= 0 && page.snapshotAnchorSequence.toULong() == viewport.snapshotAnchorSequence) {
+        "transcript page changed the fixed snapshot anchor"
+    }
+    require(page.firstLineId > 0 && page.lastLineId >= page.firstLineId &&
+        page.lastLineId.toULong() < requestedBeforeLineId
+    ) { "transcript page is outside its exclusive cursor" }
+    val overlaps = viewport.pages.any { existing ->
+        page.firstLineId <= existing.lastLineId && existing.firstLineId <= page.lastLineId
+    }
+    require(!overlaps) { "transcript page overlaps the existing viewport" }
+    require(outerHasMore == (outerNextCursor != null)) {
+        "transcript outer continuation contract is inconsistent"
+    }
+    require(page.hasMoreBefore == outerHasMore) {
+        "transcript ciphertext disagrees with the authenticated continuation"
+    }
+    val merged = (viewport.pages + page).sortedBy(TerminalTranscriptPageV1::firstLineId)
+    require(merged.zipWithNext().all { (older, newer) -> older.lastLineId < newer.firstLineId }) {
+        "transcript page merge is not strictly ordered"
+    }
+    val next = if (outerHasMore) {
+        page.nextBeforeLineId.also {
+            require(it > 0 && it == page.firstLineId && it.toULong() < requestedBeforeLineId) {
+                "transcript page did not advance its cursor"
+            }
+        }.toULong()
+    } else {
+        require(page.nextBeforeLineId == 0L) {
+            "completed transcript ciphertext retained a line cursor"
+        }
+        null
+    }
+    require(outerNextCursor == null || outerNextCursor != requestedCursor) {
+        "transcript opaque cursor did not advance"
+    }
+    require(outerNextCursor == null || outerNextCursor !in viewport.consumedCursors) {
+        "transcript opaque cursor loop was detected"
+    }
+    val retainedPages = retainOldestTranscriptPages(merged)
+    return viewport.copy(
+        nextBeforeLineId = next,
+        nextCursor = outerNextCursor,
+        pages = retainedPages,
+        loadedObjectIds = boundedTranscriptIdentitySet(viewport.loadedObjectIds, objectId),
+        consumedCursors = requestedCursor?.let {
+            boundedTranscriptIdentitySet(viewport.consumedCursors, it)
+        } ?: viewport.consumedCursors,
+        loading = false,
+        error = null,
+        hasMoreBefore = next != null,
+    )
+}
+
+private fun <T> boundedTranscriptIdentitySet(existing: Set<T>, value: T): Set<T> {
+    val bounded = LinkedHashSet<T>(minOf(existing.size + 1, MAX_TRANSCRIPT_VIEWPORT_IDENTITIES))
+    existing.forEach(bounded::add)
+    bounded.add(value)
+    while (bounded.size > MAX_TRANSCRIPT_VIEWPORT_IDENTITIES) {
+        val iterator = bounded.iterator()
+        iterator.next()
+        iterator.remove()
+    }
+    return bounded
+}
+
+internal suspend fun <Key> awaitCoalescedTranscriptLoad(
+    scope: CoroutineScope,
+    active: ConcurrentMap<Key, Deferred<Unit>>,
+    key: Key,
+    load: suspend () -> Unit,
+) {
+    val candidate = scope.async(start = CoroutineStart.LAZY) { load() }
+    candidate.invokeOnCompletion { active.remove(key, candidate) }
+    val existing = active.putIfAbsent(key, candidate)
+    val shared = existing ?: candidate.also { it.start() }
+    if (existing != null) candidate.cancel()
+    shared.await()
+}
+
+/**
+ * A committed Snapshot is intentionally published before its bulk Transcript.
+ * Retry only an explicit server/compatibility [TranscriptSelection.Pending].
+ * A ready empty response is authoritative completion even when its line cursor
+ * is greater than one.
+ */
+internal suspend fun <Page> awaitExpectedTranscriptPage(
+    retryDelaysMillis: List<Long> = TRANSCRIPT_PUBLICATION_RETRY_DELAYS_MILLIS,
+    pause: suspend (Long) -> Unit = { delay(it) },
+    fetch: suspend () -> TranscriptSelection<Page>,
+): TranscriptSelection<Page> {
+    require(retryDelaysMillis.all { it >= 0L }) { "Transcript retry delays must not be negative" }
+    val attempts = retryDelaysMillis.size + 1
+    repeat(attempts) { attempt ->
+        val selected = fetch()
+        if (selected !== TranscriptSelection.Pending) return selected
+        if (attempt < attempts - 1) pause(retryDelaysMillis[attempt])
+    }
+    return TranscriptSelection.Pending
+}
+
+internal fun validateTranscriptDescriptorNotLoaded(
+    viewport: TranscriptViewportState,
+    metadata: TranscriptPageMetadata,
+) {
+    require(metadata.id !in viewport.loadedObjectIds) { "Transcript selector replayed an object" }
+    require(viewport.pages.none { page ->
+        metadata.firstLineId.toLong() <= page.lastLineId && page.firstLineId <= metadata.lastLineId.toLong()
+    }) { "Transcript selector replayed or overlapped a line range" }
+}
+
+internal suspend fun reuseOrLoadTranscriptCiphertext(
+    cached: EncryptedTranscriptPage?,
+    expected: TranscriptPageMetadata,
+    load: suspend () -> EncryptedTranscriptPage,
+): EncryptedTranscriptPage {
+    val selected = cached ?: load()
+    require(sameTranscriptMetadata(selected.metadata, expected)) {
+        "Cached transcript ciphertext does not match the authenticated selector"
+    }
+    return selected
+}
+
+private fun sameTranscriptMetadata(actual: TranscriptPageMetadata, expected: TranscriptPageMetadata): Boolean =
+    actual.id == expected.id && actual.sessionId == expected.sessionId &&
+        actual.snapshotSequence == expected.snapshotSequence &&
+        actual.requestBeforeLineId == expected.requestBeforeLineId &&
+        actual.firstLineId == expected.firstLineId && actual.lastLineId == expected.lastLineId &&
+        actual.objectKey == expected.objectKey && actual.keyId == expected.keyId &&
+        MessageDigest.isEqual(actual.ciphertextSha256, expected.ciphertextSha256) &&
+        actual.sizeBytes == expected.sizeBytes && actual.formatName == expected.formatName &&
+        actual.formatVersion == expected.formatVersion
+
+/**
+ * Makes the irreversible ordering explicit and independently testable: no
+ * local resource is touched unless the server has accepted the deletion.
+ * Once accepted, cancellation cannot strand the live client or Room rows.
+ */
+internal suspend fun deleteSessionAfterRemoteSuccess(
+    deleteRemote: suspend () -> Unit,
+    deleteLocal: suspend () -> Unit,
+) {
+    deleteRemote()
+    withContext(NonCancellable) { deleteLocal() }
+}
+
+/**
+ * Waits for the Windows Agent's authoritative EXITED publication before
+ * permanently deleting a user-closed session.  Only SESSION_ACTIVE is
+ * retryable; every other failure preserves local state and is surfaced.
+ */
+internal suspend fun deleteClosedSessionAfterTermination(
+    retryDelaysMillis: List<Long> = SESSION_TERMINATION_DELETE_RETRY_DELAYS_MILLIS,
+    pause: suspend (Long) -> Unit = { delay(it) },
+    deleteRemote: suspend () -> Unit,
+    deleteLocal: suspend () -> Unit,
+) {
+    require(retryDelaysMillis.all { it >= 0L }) {
+        "Session termination delete retry delays must not be negative"
+    }
+    for (attempt in 0..retryDelaysMillis.size) {
+        try {
+            deleteRemote()
+            withContext(NonCancellable) { deleteLocal() }
+            return
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: TermLinkApiException) {
+            val retryable = error.status == 409 && error.code == "SESSION_ACTIVE" &&
+                attempt < retryDelaysMillis.size
+            if (!retryable) throw error
+        }
+        pause(retryDelaysMillis[attempt])
+    }
+}
+
+internal val SESSION_TERMINATION_DELETE_RETRY_DELAYS_MILLIS: List<Long> =
+    listOf(250L, 250L, 500L, 500L, 1_000L, 1_000L, 1_000L, 2_000L, 2_000L, 2_000L, 2_000L)
+
+internal fun historyDownloadUriAllowed(uri: URI, allowCleartextForLocalTest: Boolean): Boolean {
+    val scheme = uri.scheme?.lowercase()
+    return scheme == "https" || allowCleartextForLocalTest && scheme == "http"
+}
+
+/** Runs snapshot bootstrap only when the complete product path is explicitly enabled. */
+internal suspend fun <Remote, Restored> restoreSnapshotWhenEnabled(
+    enabled: Boolean,
+    restoreBound: suspend () -> Restored?,
+    latestRemote: suspend () -> Remote?,
+    restoreRemote: suspend (Remote) -> Restored?,
+    remoteRetryDelaysMillis: List<Long> = emptyList(),
+    remoteReadinessTimeoutMillis: Long? = null,
+    pause: suspend (Long) -> Unit = { delay(it) },
+    remoteReady: (Remote) -> Boolean = { true },
+    onRemoteObserved: (Remote) -> Unit = {},
+): Restored? {
+    if (!enabled) return null
+    restoreBound()?.let { return it }
+    require(remoteRetryDelaysMillis.all { it >= 0L }) { "Snapshot readiness delays must not be negative" }
+    require(remoteReadinessTimeoutMillis == null || remoteReadinessTimeoutMillis > 0L) {
+        "Snapshot readiness timeout must be positive"
+    }
+    suspend fun awaitRemote(): Remote? {
+        for (attempt in 0..remoteRetryDelaysMillis.size) {
+            val remote = try {
+                latestRemote()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                null
+            }
+            if (remote != null) {
+                onRemoteObserved(remote)
+                if (remoteReady(remote)) return remote
+            }
+            if (attempt < remoteRetryDelaysMillis.size) pause(remoteRetryDelaysMillis[attempt])
+        }
+        return null
+    }
+    val remote = if (remoteReadinessTimeoutMillis == null) {
+        awaitRemote()
+    } else {
+        withTimeoutOrNull(remoteReadinessTimeoutMillis) { awaitRemote() }
+    } ?: return null
+    return restoreRemote(remote)
+}
+
+internal fun snapshotHasBoundedLiveSuffix(
+    snapshotSequence: ULong,
+    currentSessionSequence: ULong,
+): Boolean = snapshotSequence > 0uL &&
+    snapshotSequence <= currentSessionSequence &&
+    currentSessionSequence - snapshotSequence <= TERMINAL_SNAPSHOT_MAX_LIVE_SUFFIX_EVENTS.toULong()
+
+/** Sequence zero is safe only when neither endpoint has historical output. */
+internal fun canSafelySubscribeFromZeroWithoutSnapshot(
+    currentSessionSequence: ULong,
+    durableAcknowledgement: ULong,
+    authoritativeReadinessObserved: Boolean,
+): Boolean = authoritativeReadinessObserved &&
+    currentSessionSequence == 0uL && durableAcknowledgement == 0uL
+
+internal const val SESSION_BOOTSTRAP_IN_PROGRESS_REASON = "snapshot bootstrap in progress"
+internal const val SESSION_BOOTSTRAP_FAILED_REASON = "snapshot bootstrap failed"
+
+internal fun shouldReplaceLiveSessionForOpen(
+    liveSessionExists: Boolean,
+    remoteState: RemoteSessionState?,
+): Boolean = liveSessionExists &&
+    remoteState is RemoteSessionState.Reconnecting &&
+    remoteState.reason == SESSION_BOOTSTRAP_FAILED_REASON
+
+/**
+ * Bounded to 10 seconds in total. Snapshot-capable sessions get enough time for
+ * the Agent -> object store -> history-index pipeline to settle, while older
+ * Agents that never publish snapshots do not block session opening indefinitely.
+ * The retry schedule extends beyond the absolute deadline so a fast empty
+ * response cannot exhaust the attempts before the readiness window closes.
+ */
+internal val TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS =
+    listOf(100L, 200L, 400L, 800L, 1_500L, 2_000L, 2_000L, 2_000L, 2_000L)
+internal const val TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS = 10_000L
+internal const val TERMINAL_SNAPSHOT_READINESS_REQUEST_TIMEOUT_MILLIS = 1_000L
+internal val TRANSCRIPT_PUBLICATION_RETRY_DELAYS_MILLIS = listOf(100L, 200L, 400L, 800L, 1_000L, 1_500L)
+// Matches one Windows realtime flow-control window. This lets an active
+// terminal advance during Snapshot publication without permitting a large
+// historical replay to delay or disconnect Android first-open.
+internal const val TERMINAL_SNAPSHOT_MAX_LIVE_SUFFIX_EVENTS = 128
+
+/**
+ * Separates the reversible snapshot work from the durable ACK/checkpoint bind.
+ * Once [bind] succeeds, failures must reset that exact generation or propagate.
+ */
+internal suspend fun <Loaded, Prepared, Bound, Restored> prepareBindInstallSnapshot(
+    loadAndCache: suspend () -> Loaded,
+    prepare: suspend (Loaded) -> Prepared,
+    preparedIsCurrent: suspend (Prepared) -> Boolean = { true },
+    bind: suspend () -> Bound,
+    installAndMap: suspend (Prepared, Bound) -> Restored,
+    resetAfterInstallFailure: suspend (Bound) -> Restored,
+): Restored? {
+    val prepared = try {
+        prepare(loadAndCache())
+    } catch (error: CancellationException) {
+        throw error
+    } catch (_: Exception) {
+        return null
+    }
+    if (!preparedIsCurrent(prepared)) return null
+    return withContext(NonCancellable) {
+        val bound = bind()
+        try {
+            installAndMap(prepared, bound)
+        } catch (_: Exception) {
+            resetAfterInstallFailure(bound)
+        }
+    }
+}
+
+internal val CONTROL_LEASE_HELD_RETRY_DELAYS_MILLIS = listOf(1_000L, 2_000L, 4_000L, 8_000L, 15_000L, 5_000L)
+
+internal fun commandInputBytes(text: String): ByteArray {
+    require(text.isNotEmpty()) { "Command text is empty" }
+    return (text + '\r').encodeToByteArray()
+}
+
+internal fun commandSubmissionFailure(submission: InputSubmission): String? = when (submission) {
+    is InputSubmission.Sent -> null
+    is InputSubmission.RejectedByRemote -> "The Windows Agent rejected the command: ${submission.reasonCode}"
+    is InputSubmission.DeliveryUnknown -> "Command delivery could not be confirmed"
+    InputSubmission.RejectedNoLease -> "Request control before sending a command"
+    InputSubmission.RejectedExited -> "The remote session has exited"
+    InputSubmission.RejectedEmpty -> "Command text is empty"
+}
+
+/**
+ * A force-stopped client cannot release its 30-second server lease. Retry only
+ * that explicit conflict, and make a final attempt after the full TTL. The
+ * caller owns cancellation so leaving the session page stops the schedule.
+ */
+internal suspend fun acquireControlLeaseWithRetry(
+    remoteState: () -> RemoteSessionState,
+    request: suspend () -> Unit,
+    retryDelaysMillis: List<Long> = CONTROL_LEASE_HELD_RETRY_DELAYS_MILLIS,
+    pause: suspend (Long) -> Unit = { delay(it) },
+): Boolean {
+    if (remoteState() is RemoteSessionState.Controlling) return false
+
+    var retryIndex = 0
+    while (true) {
+        try {
+            request()
+            return true
+        } catch (error: TermLinkApiException) {
+            val retryable = error.status == 409 && error.code == "LEASE_HELD"
+            if (!retryable || retryIndex >= retryDelaysMillis.size) throw error
+        }
+        pause(retryDelaysMillis[retryIndex++])
+        if (remoteState() is RemoteSessionState.Controlling) return false
     }
 }

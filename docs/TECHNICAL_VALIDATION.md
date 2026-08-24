@@ -466,7 +466,15 @@ Termux、Compose、OkHttp 或 LAN Replay。状态机包含 `Live`、`Reconnectin
 - 输入必须持有未过期租约，每次生成唯一 `input_id`，发送失败后不自动重试；
 - exited、无租约和 History Gap 状态阻止输入；
 - `sizeEvents` 去重并在 100～200 ms 内防抖；
-- 未冻结跨端 Snapshot 前，只允许从序号 1 清空并回放有界原始流，拒绝中段 reset。
+- Android 已实现 `TerminalSnapshotV1` 的完整解密/校验、protobuf 到 domain 的唯一 decoder、
+  Termux detached prepare/install importer，以及 Room renderer checkpoint 与 ACK S 原子绑定；
+- 产品 snapshot bootstrap 仅允许 debug 构建通过
+  `TERMLINK_TERMINAL_SNAPSHOT_RUNTIME` 显式开启，默认关闭且 release 强制关闭。未开启时仍从
+  序号 1 清空并回放有界原始流，拒绝中段 reset。
+
+共享 `protocol/test-vectors/terminal-snapshot-v1.json` 已同时由 Kotlin 与 C# 测试消费，覆盖
+固定密文的 seal/open、结构校验和 metadata tamper 拒绝。这一证据本身只证明对象层跨语言
+兼容，不能替代 Windows producer 或生产 snapshot bootstrap 的最终构建与 E2E 验证。
 
 11 个协程单元测试全部通过，新增回归确认 Ended 已应用后即使最终 ACK 发送失败，状态仍
 保持 `Exited`。证据为
@@ -509,7 +517,100 @@ Agent 或真实 Shell，不实现设备批准，也不使用 Termux 私有状态
 - Agent/Tray 使用生产受信发布证书与时间戳的安装/更新，以及实际注销/登录 StartupTask；
 - 真实 DNS 上的 ACME 证书签发、外部 OIDC/Billing Provider、告警接收器和 GitHub OIDC release tag；
 - Windows Agent → 公网生产 Relay → Android 的真实端到端输入、ACK、背压和恢复闭环；
-- 通过兼容评审后再冻结 Protobuf Envelope 与可移植 `TerminalSnapshotV1`；
+- Protobuf Envelope 已冻结；可移植 `TerminalSnapshotV1`/`TerminalTranscriptPageV1` 的
+  Phase 1 对象契约也已冻结。共享 E2EE 双端向量、Android detached importer/decoder 和 Room
+  原子绑定已存在。最终工作树也已包含 DPAPI write-through per-frame `LocalFrame` WAL、
+  `PortableTerminalModelV1` producer、持久 ordered outbox、每接收方密封、
+  `ProductionHistoryUploader` 的 Transcript-first/Snapshot-last 接线，以及 Android 独立 Transcript
+  viewport；这些并行改动仍待主代理完成最终构建、故障注入和真实产品 E2E。在
+  `replay(1..N) == restore(S) + replay(S+1..N)` 等价验收和七项上线门完成前，不得宣告
+  `terminal_snapshot_v1`；
+- 当前 wire representation 尚不能无损表示 saved autoWrap、saved DEC private-mode bank、
+  DECSACE state 和 title stack；必须由严格 producer profile 拒绝依赖这些状态的 checkpoint，
+  或以后续兼容契约完整表示后，才可通过运行能力门禁；
 - arm64 真机、厂商 IME、键鼠、平板/折叠屏、TalkBack 和后台生命周期。
 
 LAN Replay 和 Phase 1 Test Session 都只能使用固定非敏感夹具，不能用来替代上述验收。
+
+### 7.7 Tail-first 真实产品 E2E 验证设计与当前状态
+
+Tail-first 的最终证据必须来自真实 Windows 受管 Session -> production Relay/History ->
+冷启动 Android 产品页面，不得用伪造数据库行、fake renderer、LAN Replay、Phase 1 Test
+Session 或模块单测替代。标准入口与观察合同见
+[`TAIL_FIRST_E2E.md`](TAIL_FIRST_E2E.md)；该文档当前明确采用 fail-closed runner。
+
+验证顺序如下：
+
+```mermaid
+flowchart LR
+    PRE[Read-only preflight: tools APK hook services cold AVD] --> WIN[Start real managed Windows session]
+    WIN --> EMIT[Emit 1000 unique run-scoped markers]
+    EMIT --> STORE[Observe durable producer and recipient-bound REST objects]
+    STORE --> COLD[Cold boot Android and open newest real session]
+    COLD --> TAIL[Assert initial last screen only]
+    TAIL --> PAGE[Perform exact real upward page gestures]
+    PAGE --> CONCURRENT[Keep history open and emit a new live marker]
+    CONCURRENT --> RETURN[Close history and verify return to live tail]
+    RETURN --> IME[Open real IME and verify display bounds]
+    IME --> RECIPIENT[Repeat recipient isolation checks with a second Android device]
+    RECIPIENT --> EVIDENCE[Write sanitized evidence and screenshots]
+```
+
+runner 必须只读取已在外部启动且健康的 acceptance stack，不得启动、停止、重建或清理
+Compose 容器/卷。目标 AVD 必须从关机状态冷启动。Debug 观察 hook 只能存在于 Debug 构建，
+只能驱动真实产品页面；Release 不得包含 receiver 或合同 asset。观察响应不得出现 Token、密码、
+Cookie、Authorization、私钥、credential 或 key material，进程输出也不得作为可能含敏感正文的证据保存。
+
+Android 关键交互必须在一个真实 session 上观测：选择本设备 Snapshot S，下载、验证、detached
+prepare、durable cache、checkpoint/ACK S 原子绑定、安装，然后 `SUBSCRIBE(S)` 并接收 S+1。
+初次打开时 `snapshot_count=1`、`transcript_count=0`、`chunk_count=0`；最后 marker 可见、首个
+marker 不可见。每个 `page_up` 只触发一个真实手势，`rows_loaded <= 200`，`snapshot_sequence_s`
+和手势前后的 live ACK 不变。历史 overlay 打开后新 Windows marker 必须让 live ACK 前进；关闭
+overlay 后必须返回 live tail。IME 打开时 Terminal 与底栏都在 display 内、互不重叠，并位于可见
+IME 边界上方。
+
+同账号多 Android 是独立安全验收，不能从单设备 E2E 推导。至少使用两个未撤销 recipient：
+两者可发现同一 session，但每个 REST 选择结果、对象 ID/URL、AEAD AAD、Key Epoch 与本地缓存
+只绑定自身 `recipient_device_id`；交换 URL、metadata、密文或缓存必须失败，并且失败不改变
+任一设备 live ACK。随后撤销其中一个设备，确认其不再获得新对象，另一设备不受影响。
+
+会话标题另有不推进 ACK 的目录/实时合并验收。当前 Windows 与 Android 已有 `TLTITLE1`
+多接收者实现：REST `title_cipher` 将 Session ID、PC device ID、recipient device ID、recipient
+index/count、Key Epoch、Key ID、nonce 和明文长度绑定进 AAD；Android 仅解开本机 entry，并在任何
+格式、身份、epoch、AEAD 或严格 UTF-8 失败时忽略标题而保持会话目录可用。真实 E2E 仍需用两台 Android
+验证同一 envelope 的各自正向解密、交叉 recipient/旧 epoch 拒绝，以及实时 `sessionTitle` 优先于
+认证目录标题、旧 Agent OSC title 仅作兼容回退、最终无标题时显示 `shellType`。失败不得改变
+renderer、Session 选择或 live ACK。
+
+失败注入至少覆盖 producer WAL 写入失败、Transcript 上传或提交中断、Snapshot-last 提交中断、
+重复上传、对象摘要/身份/Key Epoch 篡改、下载中断、prepare/cache/bind/install 各阶段失败、缺少
+S+1、Transcript 分页失败和进程在原子绑定前后崩溃。预绑定失败保留旧安全 ACK并回到
+`bounded_event_replay_v1`；绑定后无法恢复相同 checkpoint 时必须原子重置，重置失败则不打开
+Realtime Socket；分页失败只保留已有 history viewport，不改变 live parser/ACK。
+
+能力门禁也属于 E2E：Android Debug 只能通过 Gradle 属性
+`-PtermlinkEnableTerminalSnapshotRuntime=true` 显式打开
+`TERMLINK_TERMINAL_SNAPSHOT_RUNTIME`，Release 中该常量必须保持 `false`，直到
+Windows durable producer/WAL、transcript-first/snapshot-last、逐 recipient 密封、Android S/S+1
+原子路径、等价重放、崩溃矩阵和下表七项均通过。旧 `bounded_event_replay_v1` 在此之前保持生产
+默认。`TerminalTranscriptPageV1` 受 `terminal_snapshot_v1` 同一门禁约束，不是独立 wire
+capability。所有用户可见状态需分别在简体中文与 English 下执行一次，并检查大字体与 IME 布局。
+
+当前仓库存在并行实现变更，因此本节不根据文件存在或模块测试提前宣告产品 E2E 已通过。
+`TAIL_FIRST_E2E.md` 在本文编辑基线记录的已知门禁是 Debug product observation hook 尚缺，
+preflight 应以 `E2E_HOOK_CONTRACT_MISSING` fail closed；是否已由并行实现补齐，必须由主代理以
+最终工作树重新运行 preflight 和完整 E2E 后更新。
+
+| ID | 验证项 | 预期证据 | 当前结果 |
+| --- | --- | --- | --- |
+| TF-01 | durable frame -> WAL -> Transcript first -> Snapshot last | producer 序号、提交顺序、幂等/崩溃观察，且每个 recipient 独立 | 待主代理最终验证；run ID/证据路径待填 |
+| TF-02 | Android select/download/prepare/cache/bind/install/subscribe S/S+1 | 冷启动各阶段观察、原子 checkpoint/ACK、首个事件 S+1 | 待主代理最终验证；run ID/证据路径待填 |
+| TF-03 | 首次仅 last screen | 1 Snapshot、0 Transcript、0 Chunk，marker 1000 可见、0001 不可见 | 待主代理最终验证；截图/observation 待填 |
+| TF-04 | 固定 S 独立 viewport 分页 | 每手势 1 页、最多 200 行、S/ACK 不变、不写 live parser | 待主代理最终验证；截图/observation 待填 |
+| TF-05 | overlay 与 live 并行 | overlay 打开时 ACK 前进，关闭后显示新 live marker | 待主代理最终验证；截图/observation 待填 |
+| TF-06 | same-account 多 Android recipient 隔离 | 双设备正向访问、交叉对象拒绝、单设备撤销不影响另一设备 | 待主代理最终验证；双设备证据待填 |
+| TF-07 | 失败回退、双语与 IME | 故障注入结果、旧能力回退、中英截图、bounds 无越界/重叠 | 待主代理最终验证；故障与截图证据待填 |
+
+最终结果记录占位：`验证时间=待填`，`commit/worktree=待填`，`Acceptance Origin=待填`，
+`Windows/Agent build=待填`，`AVD/API/ABI=待填`，`APK SHA-256=待填`，`run-id=待填`，
+`总体结论=NOT VERIFIED（等待主代理最终验证）`。

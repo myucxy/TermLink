@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyName>TermLink.ProductionSubscriberRecovery.Validation</AssemblyName>
+    <RootNamespace>TermLink.ProductionSubscriberRecovery.Validation</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Agent\TermLink.Agent.csproj" />
+    <ProjectReference Include="..\..\src\Protocol\TermLink.Protocol.csproj" />
+  </ItemGroup>
+</Project>

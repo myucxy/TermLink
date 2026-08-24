@@ -11,8 +11,9 @@ param(
     [Parameter(Mandatory)]
     [Security.SecureString]$CertificatePassword,
     [string]$TimestampUrl,
+    [switch]$AllowHttpTimestamp,
     [switch]$Development,
-    [string]$DotNetPath = (Join-Path $env:TEMP 'termlink-dotnet-sdk-8.0.303\dotnet.exe'),
+    [string]$DotNetPath,
     [string]$OutputPath = (Join-Path $PSScriptRoot "..\artifacts\TermLink-$Version-x64.msix")
 )
 
@@ -22,6 +23,20 @@ Set-StrictMode -Version Latest
 function Assert-True {
     param([bool]$Condition, [string]$Message)
     if (-not $Condition) { throw $Message }
+}
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try { $hashBytes = $sha256.ComputeHash($stream) }
+        finally { $sha256.Dispose() }
+    }
+    finally { $stream.Dispose() }
+
+    return ([BitConverter]::ToString($hashBytes)).Replace('-', '').ToLowerInvariant()
 }
 
 function Find-WindowsSdkTool {
@@ -97,7 +112,11 @@ Assert-True ($versionParts.Count -eq 4 -and @($versionParts | Where-Object { $_ 
     'MSIX version parts must each be between 0 and 65535.'
 Assert-True (-not [string]::IsNullOrWhiteSpace($Publisher)) 'Publisher is required.'
 Assert-True (-not [string]::IsNullOrWhiteSpace($PublisherDisplayName)) 'Publisher display name is required.'
-Assert-True (Test-Path -LiteralPath $DotNetPath -PathType Leaf) ".NET SDK not found: $DotNetPath"
+$projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$dotNetPathWasExplicit = $PSBoundParameters.ContainsKey('DotNetPath')
+. (Join-Path $projectRoot 'scripts\Resolve-DotNetSdk.ps1')
+$candidate = Resolve-TermLinkDotNetSdk -ProjectRoot $projectRoot `
+    -DotNetPath $DotNetPath -DotNetPathWasExplicit:$dotNetPathWasExplicit
 Assert-True (Test-Path -LiteralPath $CertificatePath -PathType Leaf) `
     "Signing certificate not found: $CertificatePath"
 if (-not $Development) {
@@ -105,9 +124,16 @@ if (-not $Development) {
         'A trusted RFC 3161 TimestampUrl is required for non-development packages.'
 }
 if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) {
-    $timestampUri = [Uri]$TimestampUrl
-    Assert-True ($timestampUri.IsAbsoluteUri -and $timestampUri.Scheme -eq 'https') `
-        'TimestampUrl must be an absolute HTTPS URL.'
+    $timestampUri = $null
+    $validTimestamp = [Uri]::TryCreate($TimestampUrl, [UriKind]::Absolute, [ref]$timestampUri)
+    if ($validTimestamp) {
+        $validTimestamp = -not [string]::IsNullOrWhiteSpace($timestampUri.Host) -and
+            [string]::IsNullOrEmpty($timestampUri.UserInfo) -and
+            ($timestampUri.Scheme -eq 'https' -or
+                ($timestampUri.Scheme -eq 'http' -and $AllowHttpTimestamp))
+    }
+    Assert-True $validTimestamp `
+        'TimestampUrl must be absolute HTTPS; HTTP additionally requires -AllowHttpTimestamp.'
 }
 
 $plainPassword = [Net.NetworkCredential]::new('', $CertificatePassword).Password
@@ -139,12 +165,11 @@ try {
     [IO.Directory]::CreateDirectory($layout) | Out-Null
     try {
         $projects = @(
-            'src\Agent\TermLink.Agent.csproj',
             'src\SessionHost\TermLink.SessionHost.csproj',
             'src\Tray\TermLink.Tray.csproj'
         )
         foreach ($project in $projects) {
-            Invoke-Tool -FilePath $DotNetPath -Arguments @(
+            Invoke-Tool -FilePath $candidate -Arguments @(
                 'publish', (Join-Path $PSScriptRoot "..\$project"),
                 '--configuration', 'Release',
                 '--runtime', 'win-x64',
@@ -157,8 +182,20 @@ try {
                 "-p:Version=$Version"
             )
         }
+        $standaloneAgentFiles = @(
+            'TermLink.Agent.exe',
+            'TermLink.Agent.deps.json',
+            'TermLink.Agent.runtimeconfig.json',
+            'TermLink.Agent.pdb'
+        )
+        foreach ($standaloneAgentFile in $standaloneAgentFiles) {
+            $standaloneAgentPath = Join-Path $layout $standaloneAgentFile
+            if (Test-Path -LiteralPath $standaloneAgentPath) {
+                Remove-Item -LiteralPath $standaloneAgentPath -Force
+            }
+        }
         $updaterPublish = Join-Path $workRoot 'updater-publish'
-        Invoke-Tool -FilePath $DotNetPath -Arguments @(
+        Invoke-Tool -FilePath $candidate -Arguments @(
             'publish', (Join-Path $PSScriptRoot '..\src\Updater\TermLink.Updater.csproj'),
             '--configuration', 'Release',
             '--runtime', 'win-x64',
@@ -174,15 +211,26 @@ try {
         )
         Copy-Item -LiteralPath (Join-Path $updaterPublish 'TermLink.Updater.exe') `
             -Destination (Join-Path $layout 'TermLink.Updater.exe')
-        foreach ($name in @(
-            'TermLink.Agent.exe',
+        $expectedProductExecutables = @(
             'TermLink.SessionHost.exe',
-            'TermLink.Tray.exe',
+            'TermLink.exe',
             'TermLink.Updater.exe'
-        )) {
+        )
+        foreach ($name in $expectedProductExecutables) {
             Assert-True (Test-Path -LiteralPath (Join-Path $layout $name) -PathType Leaf) `
                 "Published executable is missing: $name"
         }
+        $publishedProductExecutables = @(Get-ChildItem -LiteralPath $layout -File -Filter 'TermLink*.exe' |
+            Select-Object -ExpandProperty Name)
+        Assert-True ($publishedProductExecutables.Count -eq $expectedProductExecutables.Count -and
+            @($publishedProductExecutables | Where-Object { $expectedProductExecutables -cnotcontains $_ }).Count -eq 0) `
+            "The package contains an unexpected product executable: $($publishedProductExecutables -join ', ')"
+        foreach ($standaloneAgentFile in $standaloneAgentFiles) {
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $layout $standaloneAgentFile))) `
+                "The integrated package must not ship standalone Agent entry-point file: $standaloneAgentFile"
+        }
+        Assert-True (Test-Path -LiteralPath (Join-Path $layout 'TermLink.Agent.dll') -PathType Leaf) `
+            'The integrated package is missing the in-process Agent runtime assembly.'
         Assert-True (Test-Path -LiteralPath (Join-Path $layout 'coreclr.dll') -PathType Leaf) `
             'The package layout is not self-contained.'
         [IO.File]::WriteAllBytes(
@@ -258,6 +306,8 @@ try {
                 [Convert]::FromBase64String($commandMatch.Groups[1].Value))
             Assert-True ($childCommand -ceq $expected[2]) `
                 "The packaged child command changed for $guid."
+            Assert-True ([string]$profile.closeOnExit -ceq 'always') `
+                "The packaged TermLink profile does not close its tab with SessionHost: $guid"
         }
 
         $signArguments = @('sign', '/fd', 'SHA256', '/f', [IO.Path]::GetFullPath($CertificatePath), '/p', $plainPassword)
@@ -265,7 +315,7 @@ try {
             $signArguments += @('/tr', $TimestampUrl, '/td', 'SHA256')
         }
         $ownedBinaries = @(Get-ChildItem -LiteralPath $layout -File |
-            Where-Object { $_.Name -match '^TermLink\..+\.(exe|dll)$' } |
+            Where-Object { $_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' } |
             Sort-Object Name)
         Assert-True ($ownedBinaries.Count -ge 4) 'No TermLink binaries were found to sign.'
         foreach ($binary in $ownedBinaries) {
@@ -292,7 +342,7 @@ try {
             SignedTermLinkBinaries = $ownedBinaries.Count
             TerminalExecutionAlias = 'termlink-session.exe'
             TerminalProfiles = $terminalProfiles.Count
-            Sha256 = (Get-FileHash -LiteralPath $resolvedOutput -Algorithm SHA256).Hash.ToLowerInvariant()
+            Sha256 = Get-Sha256Hex -Path $resolvedOutput
         }
     }
     finally {

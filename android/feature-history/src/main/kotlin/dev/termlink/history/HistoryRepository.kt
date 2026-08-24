@@ -6,9 +6,11 @@ import dev.termlink.database.DeviceEntity
 import dev.termlink.database.EventChunkEntity
 import dev.termlink.database.HistoryPreferenceEntity
 import dev.termlink.database.PcEntity
+import dev.termlink.database.RendererCheckpointEntity
 import dev.termlink.database.SessionEntity
 import dev.termlink.database.SnapshotEntity
 import dev.termlink.database.TermLinkDatabase
+import dev.termlink.database.TranscriptPageEntity
 import dev.termlink.model.DeviceSummary
 import dev.termlink.model.DeviceTrustState
 import dev.termlink.model.DeviceType
@@ -43,6 +45,27 @@ data class AckCursorState(
     val rendererGeneration: Long,
 ) {
     init {
+        require(rendererGeneration > 0) { "renderer generation must be positive" }
+    }
+}
+
+/** Cached encrypted snapshot plus the durable renderer generation it anchors. */
+data class RendererCheckpointState(
+    val snapshot: EncryptedHistoryObject,
+    val snapshotRows: Int,
+    val snapshotColumns: Int,
+    val snapshotSequence: ULong,
+    /**
+     * The renderer may advertise this cursor only after restoring the snapshot
+     * and replaying every ordered event through this sequence.
+     */
+    val durableAcknowledgement: ULong,
+    val rendererGeneration: Long,
+) {
+    init {
+        require(snapshot.metadata.kind == HistoryObject.Kind.SNAPSHOT) { "renderer checkpoint must reference a snapshot" }
+        require(snapshot.metadata.snapshotSequence == snapshotSequence) { "renderer checkpoint sequence mismatch" }
+        require(durableAcknowledgement >= snapshotSequence) { "renderer ACK precedes its checkpoint" }
         require(rendererGeneration > 0) { "renderer generation must be positive" }
     }
 }
@@ -84,10 +107,66 @@ data class EncryptedPreference(
     fun copyCiphertext(): EncryptedPreference = copy(ciphertext = ciphertext.copyOf())
 }
 
+/** Authenticated transcript selector metadata; row plaintext is never persisted here. */
+data class TranscriptPageMetadata(
+    val id: UUID,
+    val sessionId: UUID,
+    val snapshotSequence: ULong,
+    val requestBeforeLineId: ULong,
+    val firstLineId: ULong,
+    val lastLineId: ULong,
+    val objectKey: String,
+    val keyId: String,
+    val ciphertextSha256: ByteArray,
+    val sizeBytes: Long,
+    val formatName: String,
+    val formatVersion: Int,
+) {
+    init {
+        require(snapshotSequence > 0u) { "transcript snapshot anchor must be positive" }
+        require(firstLineId > 0u && lastLineId >= firstLineId) { "transcript line range is invalid" }
+        require(lastLineId < requestBeforeLineId) { "transcript line range is not before its exclusive cursor" }
+        require(ciphertextSha256.size == HistoryRepository.SHA256_BYTES) { "transcript hash must be SHA-256" }
+        require(sizeBytes in 1..HistoryRepository.MAX_TERMINAL_TRANSCRIPT_BYTES) {
+            "transcript ciphertext size is out of bounds"
+        }
+        require(formatName == HistoryRepository.TERMINAL_TRANSCRIPT_FORMAT && formatVersion == 1) {
+            "transcript format is unsupported"
+        }
+    }
+
+    fun copyDigest(): TranscriptPageMetadata = copy(ciphertextSha256 = ciphertextSha256.copyOf())
+}
+
+/** A cached transcript object remains ciphertext until the product explicitly opens a page. */
+data class EncryptedTranscriptPage(
+    val metadata: TranscriptPageMetadata,
+    val ciphertext: ByteArray,
+) {
+    init {
+        require(metadata.sizeBytes == ciphertext.size.toLong()) { "transcript ciphertext size mismatch" }
+        require(MessageDigest.isEqual(metadata.ciphertextSha256, HistoryRepository.sha256(ciphertext))) {
+            "transcript ciphertext hash mismatch"
+        }
+    }
+
+    fun copyCiphertext(): EncryptedTranscriptPage = copy(
+        metadata = metadata.copyDigest(),
+        ciphertext = ciphertext.copyOf(),
+    )
+}
+
 data class HistorySearchHit(
     val objectId: UUID,
     val sequence: ULong?,
     val preview: String,
+)
+
+/** Ciphertext cache cardinality only; no object metadata or content leaves this diagnostic. */
+data class HistoryObjectCounts(
+    val chunks: Int,
+    val snapshots: Int,
+    val transcripts: Int,
 )
 
 class HistoryIntegrityException(message: String) : IllegalStateException(message)
@@ -111,7 +190,9 @@ class HistoryRepository(
     private val sessions get() = database.sessions()
     private val chunks get() = database.eventChunks()
     private val snapshots get() = database.snapshots()
+    private val transcriptPages get() = database.transcriptPages()
     private val acks get() = database.ackCursors()
+    private val rendererCheckpoints get() = database.rendererCheckpoints()
     private val preferences get() = database.preferences()
 
     suspend fun upsertDevice(summary: DeviceSummary) {
@@ -315,7 +396,16 @@ class HistoryRepository(
                 throw HistoryIntegrityException("event chunk ciphertext hash mismatch before persistence")
             }
         }
-        chunks.upsert(entity)
+        database.withTransaction {
+            val existing = eventChunkIdentityMatches(entity)
+            if (existing.isNotEmpty()) {
+                existing.forEach { requireSameEventChunk(it, entity) }
+            } else if (chunks.insertIfAbsent(entity) == -1L) {
+                val raced = eventChunkIdentityMatches(entity)
+                check(raced.isNotEmpty()) { "event chunk identity conflict could not be resolved" }
+                raced.forEach { requireSameEventChunk(it, entity) }
+            }
+        }
         return id
     }
 
@@ -369,8 +459,7 @@ class HistoryRepository(
                 throw HistoryIntegrityException("snapshot ciphertext hash mismatch before persistence")
             }
         }
-        snapshots.upsert(
-            SnapshotEntity(
+        val entity = SnapshotEntity(
                 id = id.requireUuidString(),
                 sessionId = sessionId.requireUuidString(),
                 snapshotSequence = sequence,
@@ -385,8 +474,17 @@ class HistoryRepository(
                 formatVersion = formatVersion,
                 createdAtEpochMillis = clockMillis(),
                 expiresAtEpochMillis = expiresAt?.toEpochMilli(),
-            ),
-        )
+            )
+        database.withTransaction {
+            val existing = snapshots.get(entity.id)
+            if (existing == null) {
+                check(snapshots.insertIfAbsent(entity) != -1L) {
+                    "snapshot identity conflicts with an existing immutable object"
+                }
+            } else {
+                requireSameSnapshot(existing, entity)
+            }
+        }
         return id
     }
 
@@ -410,6 +508,93 @@ class HistoryRepository(
     suspend fun getHistoryObject(objectId: UUID): EncryptedHistoryObject? =
         chunks.get(objectId.requireUuidString())?.let { chunkObject(it).copyCiphertext() }
             ?: snapshots.get(objectId.requireUuidString())?.let { snapshotObject(it).copyCiphertext() }
+
+    suspend fun putTranscriptPage(
+        sessionId: UUID,
+        snapshotSequence: ULong,
+        requestBeforeLineId: ULong,
+        firstLineId: ULong,
+        lastLineId: ULong,
+        objectKey: String,
+        keyId: String,
+        ciphertext: ByteArray,
+        id: UUID = UUID.randomUUID(),
+        expiresAt: Instant? = null,
+        ciphertextSha256: ByteArray? = null,
+    ): UUID {
+        val anchor = snapshotSequence.toPositiveRoomSequence("transcript snapshot anchor")
+        val before = requestBeforeLineId.toPositiveRoomSequence("transcript request cursor")
+        val first = firstLineId.toPositiveRoomSequence("transcript first line ID")
+        val last = lastLineId.toPositiveRoomSequence("transcript last line ID")
+        require(last in first until before) { "transcript line range is not before its exclusive cursor" }
+        val bytes = ciphertext.copyOf()
+        require(bytes.isNotEmpty() && bytes.size.toLong() <= MAX_TERMINAL_TRANSCRIPT_BYTES) {
+            "transcript ciphertext size is out of bounds"
+        }
+        val digest = sha256(bytes)
+        ciphertextSha256?.let { supplied ->
+            if (!MessageDigest.isEqual(supplied, digest)) {
+                throw HistoryIntegrityException("transcript ciphertext hash mismatch before persistence")
+            }
+        }
+        val entity = TranscriptPageEntity(
+            id = id.requireUuidString(),
+            sessionId = sessionId.requireUuidString(),
+            snapshotSequence = anchor,
+            requestBeforeLineId = before,
+            firstLineId = first,
+            lastLineId = last,
+            objectKey = objectKey.requireNonBlank("transcript object key"),
+            keyId = keyId.requireNonBlank("transcript key id"),
+            ciphertextSha256 = digest,
+            sizeBytes = bytes.size.toLong(),
+            ciphertext = bytes,
+            formatName = TERMINAL_TRANSCRIPT_FORMAT,
+            formatVersion = 1,
+            createdAtEpochMillis = clockMillis(),
+            expiresAtEpochMillis = expiresAt?.toEpochMilli(),
+        )
+        database.withTransaction {
+            val existing = transcriptPages.get(entity.id)
+                ?: transcriptPages.getForCursor(entity.sessionId, anchor, before)
+                ?: transcriptPages.getByObjectKey(entity.objectKey)
+            if (existing != null) {
+                requireSameTranscriptPage(existing, entity)
+            } else if (transcriptPages.insertIfAbsent(entity) == -1L) {
+                val raced = transcriptPages.get(entity.id)
+                    ?: transcriptPages.getForCursor(entity.sessionId, anchor, before)
+                    ?: transcriptPages.getByObjectKey(entity.objectKey)
+                    ?: error("transcript identity conflict could not be resolved")
+                requireSameTranscriptPage(raced, entity)
+            }
+        }
+        return id
+    }
+
+    suspend fun transcriptPageForCursor(
+        sessionId: UUID,
+        snapshotSequence: ULong,
+        requestBeforeLineId: ULong,
+    ): EncryptedTranscriptPage? = transcriptPages.getForCursor(
+        sessionId.requireUuidString(),
+        snapshotSequence.toPositiveRoomSequence("transcript snapshot anchor"),
+        requestBeforeLineId.toPositiveRoomSequence("transcript request cursor"),
+    )?.let { transcriptPage(it).copyCiphertext() }
+
+    suspend fun transcriptPages(sessionId: UUID, snapshotSequence: ULong): List<EncryptedTranscriptPage> =
+        transcriptPages.listForAnchor(
+            sessionId.requireUuidString(),
+            snapshotSequence.toPositiveRoomSequence("transcript snapshot anchor"),
+        ).map { transcriptPage(it).copyCiphertext() }
+
+    suspend fun historyObjectCounts(sessionId: UUID): HistoryObjectCounts {
+        val id = sessionId.requireUuidString()
+        return HistoryObjectCounts(
+            chunks = chunks.countForSession(id),
+            snapshots = snapshots.countForSession(id),
+            transcripts = transcriptPages.countForSession(id),
+        )
+    }
 
     suspend fun initializeAckCursor(sessionId: UUID, direction: String): AckCursorState {
         val safeSessionId = sessionId.requireUuidString()
@@ -437,20 +622,31 @@ class HistoryRepository(
         val requested = sequence.toRoomSequence("ACK sequence")
         val safeSessionId = sessionId.requireUuidString()
         val updatedAt = clockMillis()
-        check(
-            acks.advance(
-                AckCursorEntity(
-                    sessionId = safeSessionId,
-                    direction = safeDirection,
-                    rendererGeneration = rendererGeneration,
-                    highestContiguousSequence = requested,
-                    updatedAtEpochMillis = updatedAt,
+        return database.withTransaction {
+            check(
+                acks.advance(
+                    AckCursorEntity(
+                        sessionId = safeSessionId,
+                        direction = safeDirection,
+                        rendererGeneration = rendererGeneration,
+                        highestContiguousSequence = requested,
+                        updatedAtEpochMillis = updatedAt,
+                    ),
                 ),
-            ),
-        ) { "ACK renderer generation is stale" }
-        val persisted = requireNotNull(acks.get(safeSessionId, safeDirection)) { "ACK cursor was not persisted" }
-        check(persisted.rendererGeneration == rendererGeneration) { "ACK renderer generation changed during commit" }
-        return persisted.highestContiguousSequence.toULongChecked("ACK sequence")
+            ) { "ACK renderer generation is stale" }
+            val persisted = requireNotNull(acks.get(safeSessionId, safeDirection)) {
+                "ACK cursor was not persisted"
+            }
+            check(persisted.rendererGeneration == rendererGeneration) {
+                "ACK renderer generation changed during commit"
+            }
+            // Keep the last verified snapshot binding even after the live ACK
+            // advances beyond it. On the next process start the product first
+            // restores this exact snapshot, then atomically re-anchors the ACK
+            // generation to its sequence before advertising a resume cursor.
+            // Deleting the binding here forced a full prefix replay from 1.
+            persisted.highestContiguousSequence.toULongChecked("ACK sequence")
+        }
     }
 
     suspend fun ackCursorState(sessionId: UUID, direction: String): AckCursorState? =
@@ -462,6 +658,129 @@ class HistoryRepository(
             it.direction to it.highestContiguousSequence.toULongChecked("ACK sequence")
         }
 
+    /**
+     * Atomically fences the old renderer and binds ACK [snapshotSequence] to
+     * one exact cached encrypted snapshot. The caller may install its already
+     * validated off-screen renderer only after this transaction succeeds.
+     */
+    suspend fun bindRendererCheckpoint(
+        sessionId: UUID,
+        direction: String,
+        expectedRendererGeneration: Long,
+        snapshotId: UUID,
+        snapshotSequence: ULong,
+        ciphertextSha256: ByteArray,
+    ): RendererCheckpointState {
+        require(expectedRendererGeneration > 0) { "renderer generation must be positive" }
+        require(expectedRendererGeneration < Long.MAX_VALUE) { "renderer generation is exhausted" }
+        require(snapshotSequence > 0u) { "snapshot sequence must be positive" }
+        require(ciphertextSha256.size == SHA256_BYTES) { "snapshot ciphertext hash must be SHA-256" }
+        val safeSessionId = sessionId.requireUuidString()
+        val safeDirection = direction.requireNonBlank("ACK direction")
+        val safeSnapshotId = snapshotId.requireUuidString()
+        val sequence = snapshotSequence.toRoomSequence("snapshot sequence")
+        val expectedDigest = ciphertextSha256.copyOf()
+        return database.withTransaction {
+            val snapshot = requireNotNull(snapshots.get(safeSnapshotId)) {
+                "renderer checkpoint snapshot is not cached"
+            }
+            require(snapshot.sessionId == safeSessionId) { "renderer checkpoint snapshot belongs to another session" }
+            require(snapshot.snapshotSequence == sequence) { "renderer checkpoint snapshot sequence mismatch" }
+            require(snapshot.formatName == TERMINAL_SNAPSHOT_FORMAT && snapshot.formatVersion == 1) {
+                "renderer checkpoint uses an unsupported snapshot format"
+            }
+            require(snapshot.sizeBytes in 1..MAX_TERMINAL_SNAPSHOT_BYTES) {
+                "renderer checkpoint snapshot size is out of bounds"
+            }
+            require(snapshot.rows in 1..MAX_TERMINAL_SNAPSHOT_ROWS) {
+                "renderer checkpoint snapshot rows are out of bounds"
+            }
+            require(snapshot.columns in 1..MAX_TERMINAL_SNAPSHOT_COLUMNS) {
+                "renderer checkpoint snapshot columns are out of bounds"
+            }
+            require(MessageDigest.isEqual(snapshot.ciphertextSha256, expectedDigest)) {
+                "renderer checkpoint snapshot hash mismatch"
+            }
+            verifyHash(snapshot.ciphertext, snapshot.ciphertextSha256, "snapshot ${snapshot.id}", snapshot.sizeBytes)
+
+            val cursor = requireNotNull(acks.get(safeSessionId, safeDirection)) {
+                "ACK cursor must be initialized before binding a renderer checkpoint"
+            }
+            require(cursor.rendererGeneration == expectedRendererGeneration) { "ACK renderer generation is stale" }
+            val updatedAt = clockMillis()
+            val bindingGeneration = if (cursor.highestContiguousSequence <= sequence) {
+                expectedRendererGeneration
+            } else {
+                require(expectedRendererGeneration < Long.MAX_VALUE - 1) {
+                    "renderer generation is exhausted"
+                }
+                // Re-anchoring to an older, already verified snapshot must be
+                // one Room transaction: fence the live renderer, lower its ACK
+                // to zero, then bind the prepared snapshot. Any failure rolls
+                // the complete transaction back to the original durable ACK.
+                acks.reset(
+                    safeSessionId,
+                    safeDirection,
+                    expectedRendererGeneration,
+                    updatedAt,
+                ).rendererGeneration
+            }
+            check(
+                acks.installRendererCheckpoint(
+                    safeSessionId,
+                    safeDirection,
+                    bindingGeneration,
+                    sequence,
+                    updatedAt,
+                ) == 1,
+            ) { "ACK renderer generation changed during checkpoint binding" }
+            val nextGeneration = bindingGeneration + 1
+            rendererCheckpoints.upsert(
+                RendererCheckpointEntity(
+                    sessionId = safeSessionId,
+                    direction = safeDirection,
+                    rendererGeneration = nextGeneration,
+                    snapshotId = safeSnapshotId,
+                    snapshotSequence = sequence,
+                    ciphertextSha256 = expectedDigest,
+                    updatedAtEpochMillis = updatedAt,
+                ),
+            )
+            checkpointState(snapshot, sequence, nextGeneration, sequence)
+        }
+    }
+
+    /** Returns null when the cursor has no snapshot binding; inconsistent bindings fail closed. */
+    suspend fun rendererCheckpointState(sessionId: UUID, direction: String): RendererCheckpointState? {
+        val safeSessionId = sessionId.requireUuidString()
+        val safeDirection = direction.requireNonBlank("ACK direction")
+        return database.withTransaction {
+            val checkpoint = rendererCheckpoints.get(safeSessionId, safeDirection) ?: return@withTransaction null
+            val cursor = acks.get(safeSessionId, safeDirection)
+                ?: throw HistoryIntegrityException("renderer checkpoint has no ACK cursor")
+            if (cursor.rendererGeneration != checkpoint.rendererGeneration ||
+                cursor.highestContiguousSequence < checkpoint.snapshotSequence
+            ) {
+                throw HistoryIntegrityException("renderer checkpoint does not match its ACK generation")
+            }
+            val snapshot = snapshots.get(checkpoint.snapshotId)
+                ?: throw HistoryIntegrityException("renderer checkpoint snapshot is missing")
+            if (snapshot.sessionId != safeSessionId ||
+                snapshot.snapshotSequence != checkpoint.snapshotSequence ||
+                !MessageDigest.isEqual(snapshot.ciphertextSha256, checkpoint.ciphertextSha256)
+            ) {
+                throw HistoryIntegrityException("renderer checkpoint snapshot identity mismatch")
+            }
+            verifyHash(snapshot.ciphertext, snapshot.ciphertextSha256, "snapshot ${snapshot.id}", snapshot.sizeBytes)
+            checkpointState(
+                snapshot,
+                checkpoint.snapshotSequence,
+                checkpoint.rendererGeneration,
+                cursor.highestContiguousSequence,
+            )
+        }
+    }
+
     /** Resets one cursor and permanently fences writers from its old renderer. */
     suspend fun resetAckCursor(
         sessionId: UUID,
@@ -469,12 +788,19 @@ class HistoryRepository(
         expectedRendererGeneration: Long,
     ): AckCursorState {
         require(expectedRendererGeneration > 0) { "renderer generation must be positive" }
-        return acks.reset(
-            sessionId.requireUuidString(),
-            direction.requireNonBlank("ACK direction"),
-            expectedRendererGeneration,
-            clockMillis(),
-        ).toAckCursorState()
+        require(expectedRendererGeneration < Long.MAX_VALUE) { "renderer generation is exhausted" }
+        val safeSessionId = sessionId.requireUuidString()
+        val safeDirection = direction.requireNonBlank("ACK direction")
+        return database.withTransaction {
+            val reset = acks.reset(
+                safeSessionId,
+                safeDirection,
+                expectedRendererGeneration,
+                clockMillis(),
+            )
+            rendererCheckpoints.delete(safeSessionId, safeDirection)
+            reset.toAckCursorState()
+        }
     }
 
     suspend fun putPreference(
@@ -657,6 +983,8 @@ class HistoryRepository(
         val id = sessionId.requireUuidString()
         database.withTransaction {
             chunks.deleteForSession(id)
+            transcriptPages.deleteForSession(id)
+            rendererCheckpoints.deleteForSession(id)
             snapshots.deleteForSession(id)
             acks.deleteForSession(id)
             sessions.delete(id)
@@ -669,6 +997,8 @@ class HistoryRepository(
         val id = sessionId.requireUuidString()
         database.withTransaction {
             chunks.deleteForSession(id)
+            transcriptPages.deleteForSession(id)
+            rendererCheckpoints.deleteForSession(id)
             snapshots.deleteForSession(id)
             acks.deleteForSession(id)
         }
@@ -678,6 +1008,8 @@ class HistoryRepository(
     suspend fun clearAll() {
         database.withTransaction {
             chunks.clear()
+            transcriptPages.clear()
+            rendererCheckpoints.clear()
             snapshots.clear()
             acks.clear()
             preferences.clear()
@@ -767,6 +1099,96 @@ class HistoryRepository(
             ciphertext = entity.ciphertext.copyOf(),
         )
 
+    private fun transcriptPage(entity: TranscriptPageEntity): EncryptedTranscriptPage =
+        EncryptedTranscriptPage(
+            metadata = TranscriptPageMetadata(
+                id = entity.id.toUuid(),
+                sessionId = entity.sessionId.toUuid(),
+                snapshotSequence = entity.snapshotSequence.toULongChecked("transcript snapshot anchor"),
+                requestBeforeLineId = entity.requestBeforeLineId.toULongChecked("transcript request cursor"),
+                firstLineId = entity.firstLineId.toULongChecked("transcript first line ID"),
+                lastLineId = entity.lastLineId.toULongChecked("transcript last line ID"),
+                objectKey = entity.objectKey,
+                keyId = entity.keyId,
+                ciphertextSha256 = entity.ciphertextSha256.copyOf(),
+                sizeBytes = entity.sizeBytes,
+                formatName = entity.formatName,
+                formatVersion = entity.formatVersion,
+            ),
+            ciphertext = entity.ciphertext.copyOf(),
+        )
+
+    private fun checkpointState(
+        snapshot: SnapshotEntity,
+        snapshotSequence: Long,
+        rendererGeneration: Long,
+        acknowledgement: Long,
+    ): RendererCheckpointState = RendererCheckpointState(
+        snapshot = snapshotObject(snapshot).copyCiphertext(),
+        snapshotRows = snapshot.rows,
+        snapshotColumns = snapshot.columns,
+        snapshotSequence = snapshotSequence.toULongChecked("snapshot sequence"),
+        durableAcknowledgement = acknowledgement.toULongChecked("ACK sequence"),
+        rendererGeneration = rendererGeneration,
+    )
+
+    /** Returns every row addressed by one of the candidate's immutable identities. */
+    private suspend fun eventChunkIdentityMatches(candidate: EventChunkEntity): List<EventChunkEntity> =
+        listOfNotNull(
+            chunks.get(candidate.id),
+            chunks.getByObjectKey(candidate.objectKey),
+            chunks.getForRange(candidate.sessionId, candidate.startSequence, candidate.endSequence),
+        ).distinctBy(EventChunkEntity::id)
+
+    private fun requireSameEventChunk(existing: EventChunkEntity, candidate: EventChunkEntity) {
+        // The sealed object bytes contain the authenticated recipient and nonce;
+        // compare the entire container in constant time. As with snapshots and
+        // transcript pages, createdAtEpochMillis and expiresAtEpochMillis are
+        // local cache policy metadata rather than immutable object identity.
+        require(existing.id == candidate.id &&
+            existing.sessionId == candidate.sessionId &&
+            existing.startSequence == candidate.startSequence &&
+            existing.endSequence == candidate.endSequence &&
+            existing.objectKey == candidate.objectKey &&
+            existing.keyId == candidate.keyId &&
+            MessageDigest.isEqual(existing.ciphertextSha256, candidate.ciphertextSha256) &&
+            existing.sizeBytes == candidate.sizeBytes &&
+            MessageDigest.isEqual(existing.ciphertext, candidate.ciphertext)
+        ) { "event chunk identity is already bound to different immutable content" }
+    }
+
+    private fun requireSameSnapshot(existing: SnapshotEntity, candidate: SnapshotEntity) {
+        require(existing.sessionId == candidate.sessionId &&
+            existing.snapshotSequence == candidate.snapshotSequence &&
+            existing.rows == candidate.rows &&
+            existing.columns == candidate.columns &&
+            existing.objectKey == candidate.objectKey &&
+            existing.keyId == candidate.keyId &&
+            MessageDigest.isEqual(existing.ciphertextSha256, candidate.ciphertextSha256) &&
+            existing.sizeBytes == candidate.sizeBytes &&
+            MessageDigest.isEqual(existing.ciphertext, candidate.ciphertext) &&
+            existing.formatName == candidate.formatName &&
+            existing.formatVersion == candidate.formatVersion
+        ) { "snapshot ID is already bound to different immutable content" }
+    }
+
+    private fun requireSameTranscriptPage(existing: TranscriptPageEntity, candidate: TranscriptPageEntity) {
+        require(existing.id == candidate.id &&
+            existing.sessionId == candidate.sessionId &&
+            existing.snapshotSequence == candidate.snapshotSequence &&
+            existing.requestBeforeLineId == candidate.requestBeforeLineId &&
+            existing.firstLineId == candidate.firstLineId &&
+            existing.lastLineId == candidate.lastLineId &&
+            existing.objectKey == candidate.objectKey &&
+            existing.keyId == candidate.keyId &&
+            MessageDigest.isEqual(existing.ciphertextSha256, candidate.ciphertextSha256) &&
+            existing.sizeBytes == candidate.sizeBytes &&
+            MessageDigest.isEqual(existing.ciphertext, candidate.ciphertext) &&
+            existing.formatName == candidate.formatName &&
+            existing.formatVersion == candidate.formatVersion
+        ) { "transcript identity is already bound to different immutable content" }
+    }
+
     private fun chunkMetadata(entity: EventChunkEntity): HistoryObject = HistoryObject(
         id = entity.id.toUuid(),
         kind = HistoryObject.Kind.CHUNK,
@@ -834,6 +1256,11 @@ class HistoryRepository(
         return toLong()
     }
 
+    private fun ULong.toPositiveRoomSequence(label: String): Long {
+        require(this > 0u) { "$label must be positive" }
+        return toRoomSequence(label)
+    }
+
     private fun Long.toULongChecked(label: String): ULong {
         require(this >= 0) { "$label must not be negative" }
         return toULong()
@@ -854,6 +1281,12 @@ class HistoryRepository(
 
     companion object {
         const val BOUNDED_EVENT_REPLAY_FORMAT = "BOUNDED_EVENT_REPLAY"
+        const val TERMINAL_SNAPSHOT_FORMAT = "TERMLINK_TERMINAL_SNAPSHOT"
+        const val TERMINAL_TRANSCRIPT_FORMAT = "TERMLINK_TERMINAL_TRANSCRIPT"
+        const val MAX_TERMINAL_SNAPSHOT_BYTES = 2L * 1024 * 1024
+        const val MAX_TERMINAL_TRANSCRIPT_BYTES = 512L * 1024
+        const val MAX_TERMINAL_SNAPSHOT_ROWS = 256
+        const val MAX_TERMINAL_SNAPSHOT_COLUMNS = 512
         const val SESSION_PREFERENCE_SCOPE = "session"
         const val SHA256_BYTES = 32
         const val DEFAULT_SEARCH_LIMIT = 100

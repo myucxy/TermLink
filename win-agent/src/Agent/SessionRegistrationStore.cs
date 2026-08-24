@@ -11,6 +11,7 @@ namespace TermLink.Agent
     {
         IList<SessionRegistration> Load();
         void Upsert(SessionRegistration registration);
+        void Retire(Guid sessionId);
         void Remove(Guid sessionId);
         void Clear();
     }
@@ -27,6 +28,10 @@ namespace TermLink.Agent
         }
 
         public void Remove(Guid sessionId)
+        {
+        }
+
+        public void Retire(Guid sessionId)
         {
         }
 
@@ -283,9 +288,9 @@ namespace TermLink.Agent
     {
         private static readonly byte[] Magic = Encoding.ASCII.GetBytes("TLRI");
         private static readonly byte[] Entropy = Encoding.UTF8.GetBytes("TermLink.Registry.Index.V1");
-        private const byte Version = 2;
-        private const int MaximumFileBytes = 1024 * 1024;
-        private const int MaximumEntries = 1000;
+        private const byte Version = 3;
+        private const int MaximumFileBytes = 64 * 1024 * 1024;
+        private const int MaximumEntries = 100000;
         private readonly string indexPath;
         private readonly Dictionary<Guid, SessionRegistration> registrations =
             new Dictionary<Guid, SessionRegistration>();
@@ -310,6 +315,10 @@ namespace TermLink.Agent
             if (registration == null) throw new ArgumentNullException("registration");
             SessionRegistration previous;
             var replaced = registrations.TryGetValue(registration.SessionId, out previous);
+            if (replaced && !previous.HasSameHostIdentity(registration))
+                throw new InvalidDataException("A Session ID cannot be rebound to another Host identity.");
+            if (replaced && previous.Retired && !registration.Retired)
+                throw new InvalidDataException("A retired Session ID cannot be reactivated.");
             registrations[registration.SessionId] = registration;
             try
             {
@@ -319,6 +328,22 @@ namespace TermLink.Agent
             {
                 if (replaced) registrations[registration.SessionId] = previous;
                 else registrations.Remove(registration.SessionId);
+                throw;
+            }
+        }
+
+        public void Retire(Guid sessionId)
+        {
+            SessionRegistration previous;
+            if (!registrations.TryGetValue(sessionId, out previous) || previous.Retired) return;
+            registrations[sessionId] = previous.AsRetired();
+            try
+            {
+                Save();
+            }
+            catch
+            {
+                registrations[sessionId] = previous;
                 throw;
             }
         }
@@ -342,13 +367,17 @@ namespace TermLink.Agent
         public void Clear()
         {
             var previous = new Dictionary<Guid, SessionRegistration>(registrations);
-            registrations.Clear();
+            foreach (var item in previous)
+            {
+                registrations[item.Key] = item.Value.AsRecoveryOnly();
+            }
             try
             {
-                if (File.Exists(indexPath)) File.Delete(indexPath);
+                Save();
             }
             catch
             {
+                registrations.Clear();
                 foreach (var item in previous) registrations[item.Key] = item.Value;
                 throw;
             }
@@ -407,6 +436,7 @@ namespace TermLink.Agent
                         var token = ReadExact(reader, SessionRegistration.HandshakeTokenBytes);
                         var pipeName = ReadString(reader);
                         var recoveryOnly = storedVersion >= 2 && reader.ReadBoolean();
+                        var retired = storedVersion >= 3 && reader.ReadBoolean();
                         var registration = new SessionRegistration(
                             sessionId,
                             pipeName,
@@ -415,7 +445,8 @@ namespace TermLink.Agent
                             (ManagedShellType)shellValue,
                             processStart,
                             registeredAt,
-                            recoveryOnly);
+                            recoveryOnly,
+                            retired);
                         if (registrations.ContainsKey(sessionId))
                         {
                             throw new InvalidDataException("Registry registration index contains a duplicate session ID.");
@@ -457,6 +488,7 @@ namespace TermLink.Agent
                     writer.Write(registration.HandshakeToken);
                     WriteString(writer, registration.PipeName);
                     writer.Write(registration.RecoveryOnly);
+                    writer.Write(registration.Retired);
                 }
                 writer.Flush();
                 plain = stream.ToArray();

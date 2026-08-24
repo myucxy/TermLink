@@ -5,15 +5,21 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationIcon>..\..\..\assets\brand\windows\TermLink.ico</ApplicationIcon>
-    <AssemblyName>TermLink.Tray</AssemblyName>
+    <AssemblyName>TermLink</AssemblyName>
     <RootNamespace>TermLink.Tray</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="..\Common\WindowsTerminalIntegration.cs" Link="Common\WindowsTerminalIntegration.cs" />
     <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
     <ProjectReference Include="..\Agent\TermLink.Agent.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="TermLink.Tray.UpdateValidation" />
+  </ItemGroup>
+  <ItemGroup>
     <EmbeddedResource Include="..\..\..\assets\brand\windows\TermLink.ico"
                       LogicalName="TermLink.Tray.Assets.TermLink.ico" />
+    <EmbeddedResource Include="..\..\..\assets\brand\windows\TermLink-preview-256.png"
+                      LogicalName="TermLink.Tray.Assets.TermLink-preview-256.png" />
   </ItemGroup>
 </Project>

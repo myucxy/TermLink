@@ -16,10 +16,10 @@ namespace TermLink.AgentRecoveryValidation
 
         public static int Main(string[] args)
         {
-            if (args.Length != 4)
+            if (args.Length != 6)
             {
                 Console.Error.WriteLine(
-                    "Usage: SessionRecoveryValidation <agent.exe> <tray.exe> <session-host.exe> <buffer-root>");
+                    "Usage: SessionRecoveryValidation <agent.exe> <tray.exe> <session-host.exe> <buffer-root> <isolated-local-app-data> <isolation-marker>");
                 return 2;
             }
 
@@ -33,12 +33,14 @@ namespace TermLink.AgentRecoveryValidation
                 var trayExecutable = Path.GetFullPath(args[1]);
                 var hostExecutable = Path.GetFullPath(args[2]);
                 var bufferRoot = Path.GetFullPath(args[3]);
+                ValidationIsolation.Initialize(args[4], args[5]);
                 Directory.CreateDirectory(bufferRoot);
                 var controlPipe = "termlink-recovery-control-" + Guid.NewGuid().ToString("N");
                 var indexPath = Path.Combine(bufferRoot, "registrations.dpapi");
 
                 firstAgent = AgentFixture.Start(agentExecutable, controlPipe, bufferRoot);
                 WaitForAgent(controlPipe, 15000);
+                AssertProductionRuntimeAbsent(controlPipe);
                 for (var index = 0; index < SessionCount; index++)
                 {
                     var host = HostFixture.Start(hostExecutable, index);
@@ -57,18 +59,19 @@ namespace TermLink.AgentRecoveryValidation
                 var registeredTimes = before.ToDictionary(item => item.SessionId, item => item.RegisteredAtUtc);
                 Require(File.Exists(indexPath), "DPAPI registration index was not created.");
                 AssertIndexCiphertext(indexPath, hosts);
-                ValidateTrayStatus(trayExecutable, agentExecutable, controlPipe, bufferRoot, SessionCount, "before");
+                ValidateTrayStatus(trayExecutable, controlPipe, bufferRoot, SessionCount, "before");
 
                 firstAgent.Kill();
                 firstAgent.Dispose();
                 firstAgent = null;
                 recoveredAgent = AgentFixture.Start(agentExecutable, controlPipe, bufferRoot);
                 var recovered = WaitForConnectedSessions(controlPipe, hosts, 45000);
+                AssertProductionRuntimeAbsent(controlPipe);
                 Require(recovered.Count == SessionCount, "Recovered Registry session count was not 20.");
                 Require(recovered.All(item => registeredTimes[item.SessionId].Ticks == item.RegisteredAtUtc.Ticks),
                     "A recovered registration lost its original registration time.");
                 AssertIndexCiphertext(indexPath, hosts);
-                ValidateTrayStatus(trayExecutable, agentExecutable, controlPipe, bufferRoot, SessionCount, "after");
+                ValidateTrayStatus(trayExecutable, controlPipe, bufferRoot, SessionCount, "after");
 
                 var restart = Send(controlPipe, new RegistryRequest { Command = RegistryCommand.RestartAgent });
                 Require(restart.Success && restart.Code == "AGENT_RESTART_READY" &&
@@ -83,12 +86,13 @@ namespace TermLink.AgentRecoveryValidation
 
                 finalAgent = AgentFixture.Start(agentExecutable, controlPipe, bufferRoot);
                 var controlledRecovery = WaitForConnectedSessions(controlPipe, hosts, 45000);
+                AssertProductionRuntimeAbsent(controlPipe);
                 Require(controlledRecovery.Count == SessionCount,
                     "Controlled restart did not recover all 20 sessions.");
                 Require(controlledRecovery.All(item =>
                     registeredTimes[item.SessionId].Ticks == item.RegisteredAtUtc.Ticks),
                     "Controlled restart lost an original registration time.");
-                ValidateTrayStatus(trayExecutable, agentExecutable, controlPipe, bufferRoot, SessionCount, "controlled");
+                ValidateTrayStatus(trayExecutable, controlPipe, bufferRoot, SessionCount, "controlled");
 
                 var stopped = Send(controlPipe, new RegistryRequest { Command = RegistryCommand.StopAllRemoteAccess });
                 Require(stopped.Success && stopped.Code == "REMOTE_ACCESS_STOPPED" &&
@@ -103,7 +107,7 @@ namespace TermLink.AgentRecoveryValidation
                 foreach (var host in hosts) host.BeginLocalCompletion();
                 foreach (var host in hosts) host.VerifyLocalCompletion();
 
-                ShutdownWithTray(trayExecutable, agentExecutable, controlPipe, bufferRoot);
+                ShutdownWithTray(trayExecutable, controlPipe, bufferRoot);
                 Require(finalAgent.WaitForExit(15000), "Final Agent did not exit after Tray shutdown command.");
                 var diagnostics = finalAgent.ReadOutput();
                 Require(diagnostics.IndexOf(";recovered=20;", StringComparison.Ordinal) >= 0,
@@ -117,7 +121,10 @@ namespace TermLink.AgentRecoveryValidation
                     ";dpapi_index_plaintext=false" +
                     ";tray_status_sessions=20" +
                     ";local_shells_survived=20" +
-                    ";terminal_index_retained=true");
+                    ";terminal_index_retained=true" +
+                    ";isolated_local_app_data=true" +
+                    ";production_runtime_absent=true" +
+                    ";production_configured=false");
                 return 0;
             }
             catch (Exception error)
@@ -161,9 +168,24 @@ namespace TermLink.AgentRecoveryValidation
             }, timeoutMilliseconds, "Agent control pipe did not become ready.");
         }
 
+        private static void AssertProductionRuntimeAbsent(string controlPipe)
+        {
+            var status = Send(controlPipe, new RegistryRequest { Command = RegistryCommand.List });
+            Require(status.Success && status.Production != null,
+                "Isolated Agent did not return a production status contract.");
+            Require(!status.Production.Configured && !status.Production.AccountLinked &&
+                status.Production.RelayState == ProductionRelayState.NotConfigured,
+                "Isolated Agent loaded a production account or started a production runtime.");
+            var retry = Send(controlPipe, new RegistryRequest
+            {
+                Command = RegistryCommand.RetryProductionConnection
+            });
+            Require(!retry.Success && retry.Code == "PRODUCTION_NOT_CONFIGURED",
+                "Isolated Agent unexpectedly accepted a production Relay reconnect request.");
+        }
+
         private static void ValidateTrayStatus(
             string trayExecutable,
-            string agentExecutable,
             string controlPipe,
             string bufferRoot,
             int expectedSessions,
@@ -172,7 +194,6 @@ namespace TermLink.AgentRecoveryValidation
             var destination = Path.Combine(bufferRoot, "tray-status-" + label + ".json");
             var process = StartTray(
                 trayExecutable,
-                agentExecutable,
                 controlPipe,
                 bufferRoot,
                 "--status-json",
@@ -198,13 +219,11 @@ namespace TermLink.AgentRecoveryValidation
 
         private static void ShutdownWithTray(
             string trayExecutable,
-            string agentExecutable,
             string controlPipe,
             string bufferRoot)
         {
             var process = StartTray(
                 trayExecutable,
-                agentExecutable,
                 controlPipe,
                 bufferRoot,
                 "--shutdown-agent",
@@ -218,7 +237,6 @@ namespace TermLink.AgentRecoveryValidation
 
         private static Process StartTray(
             string trayExecutable,
-            string agentExecutable,
             string controlPipe,
             string bufferRoot,
             string command,
@@ -229,17 +247,17 @@ namespace TermLink.AgentRecoveryValidation
             AppendArgument(arguments, controlPipe);
             AppendArgument(arguments, "--buffer-root");
             AppendArgument(arguments, bufferRoot);
-            AppendArgument(arguments, "--agent-exe");
-            AppendArgument(arguments, agentExecutable);
             AppendArgument(arguments, command);
             if (value != null) AppendArgument(arguments, value);
-            return Process.Start(new ProcessStartInfo
+            var start = new ProcessStartInfo
             {
                 FileName = trayExecutable,
                 Arguments = arguments.ToString(),
                 UseShellExecute = false,
                 CreateNoWindow = true
-            });
+            };
+            ValidationIsolation.Apply(start);
+            return Process.Start(start);
         }
 
         private static void AssertIndexCiphertext(string indexPath, IEnumerable<HostFixture> hosts)
@@ -247,7 +265,7 @@ namespace TermLink.AgentRecoveryValidation
             var bytes = File.ReadAllBytes(indexPath);
             Require(bytes.Length > 5 && bytes[0] == (byte)'T' && bytes[1] == (byte)'L' &&
                 bytes[2] == (byte)'R' && bytes[3] == (byte)'I' &&
-                (bytes[4] == 1 || bytes[4] == 2),
+                (bytes[4] == 1 || bytes[4] == 2 || bytes[4] == 3),
                 "Registration index header is invalid.");
             foreach (var host in hosts)
             {
@@ -352,6 +370,7 @@ namespace TermLink.AgentRecoveryValidation
                 StandardOutputEncoding = new UTF8Encoding(false),
                 StandardErrorEncoding = new UTF8Encoding(false)
             };
+            ValidationIsolation.Apply(start);
             var process = Process.Start(start);
             if (process == null) throw new InvalidOperationException("Agent process could not be started.");
             return new AgentFixture(process);
@@ -383,6 +402,54 @@ namespace TermLink.AgentRecoveryValidation
             Kill();
             Process.Dispose();
             Process = null;
+        }
+    }
+
+    internal static class ValidationIsolation
+    {
+        private const string LocalAppDataEnvironment = "LOCALAPPDATA";
+        private const string AcceptanceRootEnvironment = "TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT";
+        private const string AcceptanceCAEnvironment = "TERMLINK_ACCEPTANCE_CA_FILE";
+        private static string isolatedRoot;
+        private static string isolationMarker;
+
+        public static void Initialize(string expectedRoot, string expectedMarker)
+        {
+            isolatedRoot = Path.GetFullPath(expectedRoot);
+            isolationMarker = Path.GetFullPath(expectedMarker);
+            RequireEnvironment(LocalAppDataEnvironment, isolatedRoot);
+            RequireEnvironment(AcceptanceRootEnvironment, isolatedRoot);
+            RequireEnvironment(AcceptanceCAEnvironment, isolationMarker);
+            if (!Directory.Exists(isolatedRoot))
+                throw new InvalidOperationException("The isolated LocalAppData root does not exist.");
+            var termLinkRoot = Path.Combine(isolatedRoot, "TermLink");
+            if (File.Exists(Path.Combine(termLinkRoot, "production-config.json")) ||
+                File.Exists(Path.Combine(termLinkRoot, "production-credentials.dpapi")))
+            {
+                throw new InvalidOperationException(
+                    "The isolated LocalAppData root already contains production account files.");
+            }
+        }
+
+        public static void Apply(ProcessStartInfo start)
+        {
+            if (start == null) throw new ArgumentNullException("start");
+            if (string.IsNullOrWhiteSpace(isolatedRoot) || string.IsNullOrWhiteSpace(isolationMarker))
+                throw new InvalidOperationException("Validation isolation was not initialized.");
+            start.EnvironmentVariables[LocalAppDataEnvironment] = isolatedRoot;
+            start.EnvironmentVariables[AcceptanceRootEnvironment] = isolatedRoot;
+            start.EnvironmentVariables[AcceptanceCAEnvironment] = isolationMarker;
+        }
+
+        private static void RequireEnvironment(string name, string expected)
+        {
+            var actual = Environment.GetEnvironmentVariable(name);
+            if (string.IsNullOrWhiteSpace(actual) ||
+                !string.Equals(Path.GetFullPath(actual), expected, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "Validation child process did not receive isolated environment variable " + name + ".");
+            }
         }
     }
 

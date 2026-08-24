@@ -28,7 +28,7 @@
   <Applications>
     <Application
       Id="TermLinkTray"
-      Executable="TermLink.Tray.exe"
+      Executable="TermLink.exe"
       EntryPoint="Windows.FullTrustApplication">
       <Extensions>
         <uap3:Extension
@@ -48,7 +48,7 @@
         </uap3:Extension>
         <desktop:Extension
           Category="windows.startupTask"
-          Executable="TermLink.Tray.exe"
+          Executable="TermLink.exe"
           EntryPoint="Windows.FullTrustApplication">
           <desktop:StartupTask
             TaskId="TermLinkTrayStartup"

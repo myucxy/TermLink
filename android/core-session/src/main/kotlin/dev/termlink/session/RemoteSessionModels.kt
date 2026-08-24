@@ -3,6 +3,59 @@ package dev.termlink.session
 import dev.termlink.terminal.api.TerminalSize
 import java.util.UUID
 
+/** Proof that the renderer already contains every ordered event through [sequence]. */
+sealed interface RendererBootstrapState {
+    val sequence: Long
+    val rendererGeneration: Long
+
+    data class Empty(
+        override val rendererGeneration: Long = 1,
+    ) : RendererBootstrapState {
+        override val sequence: Long = 0
+
+        init {
+            require(rendererGeneration > 0) { "renderer generation must be positive" }
+        }
+    }
+
+    /** Created only after a verified contiguous replay from event 1 through [sequence]. */
+    data class FullPrefix(
+        override val sequence: Long,
+        override val rendererGeneration: Long,
+    ) : RendererBootstrapState {
+        init {
+            require(sequence > 0) { "full renderer prefix must be non-empty" }
+            require(rendererGeneration > 0) { "renderer generation must be positive" }
+        }
+    }
+
+    /** Created only after the exact durable checkpoint has been installed into the renderer. */
+    class ExactCheckpoint(
+        override val sequence: Long,
+        override val rendererGeneration: Long,
+        val snapshotId: UUID,
+        ciphertextSha256: ByteArray,
+    ) : RendererBootstrapState {
+        val ciphertextSha256: ByteArray = ciphertextSha256.copyOf()
+
+        init {
+            require(sequence > 0) { "checkpoint sequence must be positive" }
+            require(rendererGeneration > 0) { "renderer generation must be positive" }
+            require(ciphertextSha256.size == 32) { "checkpoint digest must be SHA-256" }
+        }
+    }
+}
+
+data class DurableAckCommit(
+    val sequence: Long,
+    val rendererGeneration: Long,
+) {
+    init {
+        require(sequence >= 0) { "durable ACK must not be negative" }
+        require(rendererGeneration > 0) { "renderer generation must be positive" }
+    }
+}
+
 sealed interface RemoteSessionState {
     val lastAckedSequence: Long
 
@@ -112,12 +165,12 @@ interface RemoteSessionOutbound {
 
     /**
      * Commits a cumulative renderer cursor to durable storage. Implementations
-     * that have no durable store may use the default identity commit.
-     *
-     * The returned sequence must equal [highestContiguousSequence]. Returning
-     * a different value is treated as a broken persistence contract.
+     * The returned sequence and generation must match the requested values.
      */
-    suspend fun persistAcknowledgement(highestContiguousSequence: Long): Long = highestContiguousSequence
+    suspend fun persistAcknowledgement(
+        expectedRendererGeneration: Long,
+        highestContiguousSequence: Long,
+    ): DurableAckCommit
 
     /** Publishes an already-durable cumulative ACK to the peer. */
     suspend fun acknowledge(highestContiguousSequence: Long)
@@ -127,7 +180,7 @@ interface RemoteSessionOutbound {
      * Production implementations must remove the persisted cursor before a
      * blank renderer is allowed to resume from zero.
      */
-    suspend fun resetAcknowledgement() = Unit
+    suspend fun resetAcknowledgement(expectedRendererGeneration: Long): DurableAckCommit
 
     suspend fun sendInput(input: RemoteInput)
 

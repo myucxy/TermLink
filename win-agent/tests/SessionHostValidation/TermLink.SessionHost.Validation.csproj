@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyName>TermLink.SessionHost.Validation</AssemblyName>
+    <RootNamespace>TermLink.SessionHost.Validation</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\SessionHost\TermLink.SessionHost.csproj" />
+  </ItemGroup>
+</Project>

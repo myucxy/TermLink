@@ -8,7 +8,7 @@ Set-StrictMode -Version Latest
 
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $agent = Join-Path $projectRoot 'src\Agent\bin\Release\net8.0-windows\TermLink.Agent.exe'
-$tray = Join-Path $projectRoot 'src\Tray\bin\Release\net8.0-windows\TermLink.Tray.exe'
+$tray = Join-Path $projectRoot 'src\Tray\bin\Release\net8.0-windows\TermLink.exe'
 $sessionHost = Join-Path $projectRoot 'src\SessionHost\bin\Release\net8.0-windows\TermLink.SessionHost.exe'
 $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
 $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
@@ -41,8 +41,7 @@ function Get-RuntimeSnapshot {
     if (Test-Path -LiteralPath $statusPath -PathType Leaf) {
         Remove-Item -LiteralPath $statusPath -Force
     }
-    & $tray --control-pipe $controlPipe --buffer-root $bufferRoot `
-        --agent-exe $agent --status-json $statusPath
+    & $tray --control-pipe $controlPipe --buffer-root $bufferRoot --status-json $statusPath
     $statusDeadline = [DateTime]::UtcNow.AddSeconds(12)
     while (-not (Test-Path -LiteralPath $statusPath -PathType Leaf) -and
         [DateTime]::UtcNow -lt $statusDeadline) {
@@ -170,8 +169,7 @@ finally {
         $hostProcess.Dispose()
     }
     try {
-        & $tray --control-pipe $controlPipe --buffer-root $bufferRoot `
-            --agent-exe $agent --shutdown-agent | Out-Null
+        & $tray --control-pipe $controlPipe --buffer-root $bufferRoot --shutdown-agent | Out-Null
         $shutdownDeadline = [DateTime]::UtcNow.AddSeconds(12)
         do {
             $matchingAgents = @(Get-CimInstance Win32_Process | Where-Object {

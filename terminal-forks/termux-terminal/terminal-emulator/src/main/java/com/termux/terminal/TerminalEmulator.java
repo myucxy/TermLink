@@ -348,6 +348,128 @@ public final class TerminalEmulator {
         return mScreen;
     }
 
+    /**
+     * Restores a previously validated state into this detached emulator. Callers must never invoke
+     * this on the renderer currently attached to a view; construct a candidate and install it only
+     * after this method succeeds.
+     */
+    public void restoreState(TerminalRestorableState state) {
+        Objects.requireNonNull(state, "state");
+        if (state.columns != mColumns || state.rows != mRows)
+            throw new IllegalArgumentException("restored state size does not match the emulator");
+
+        mMainBuffer.restoreVisibleRows(state.primaryScreen.visibleRows);
+        mAltBuffer.restoreVisibleRows(state.alternateScreen.visibleRows);
+        mScreen = state.alternateScreenActive ? mAltBuffer : mMainBuffer;
+
+        TerminalRestorableState.ScreenState active = state.alternateScreenActive
+            ? state.alternateScreen
+            : state.primaryScreen;
+        mCursorCol = active.cursor.column;
+        mCursorRow = active.cursor.row;
+        mCursorStyle = active.cursor.cursorStyle;
+        mCursorBlinkingEnabled = active.cursor.blink;
+        mCursorBlinkState = true;
+        mTopMargin = active.scrollTop;
+        mBottomMargin = active.scrollBottom;
+        mLeftMargin = active.marginLeft;
+        mRightMargin = active.marginRight;
+        mAboutToAutoWrap = active.pendingWrap;
+        mForeColor = TextStyle.decodeForeColor(active.currentStyle);
+        mBackColor = TextStyle.decodeBackColor(active.currentStyle);
+        mEffect = TextStyle.decodeEffect(active.currentStyle);
+        mUnderlineColor = TextStyle.COLOR_INDEX_FOREGROUND;
+        mLastEmittedCodePoint = active.lastPrintedCodePoint;
+        applyCharset(active.charset);
+
+        mCurrentDecSetFlags = decSetFlags(state.modes, active.cursor.visible);
+        mSavedDecSetFlags = mCurrentDecSetFlags;
+        mInsertMode = state.modes.insert;
+        restoreSavedScreenState(mSavedStateMain, state.primaryScreen.savedCursor, state.modes.autoWrap);
+        restoreSavedScreenState(mSavedStateAlt, state.alternateScreen.savedCursor, state.modes.autoWrap);
+
+        System.arraycopy(state.paletteArgb, 0, mColors.mCurrentColors, 0, state.paletteArgb.length);
+        mTabStop = state.tabStops.clone();
+        mTitle = state.title;
+        mTitleStack.clear();
+
+        mArgIndex = 0;
+        Arrays.fill(mArgs, 0);
+        mArgsSubParamsBitSet = 0;
+        mOSCOrDeviceControlArgs.setLength(0);
+        mContinueSequence = false;
+        mEscapeState = ESC_NONE;
+        mUtf8Index = mUtf8ToFollow = 0;
+        Arrays.fill(mUtf8InputBuffer, (byte) 0);
+        mScrollCounter = 0;
+        mAutoScrollDisabled = false;
+    }
+
+    /**
+     * Installs a detached read-only transcript projection. Callers must not expose this emulator's
+     * append path as a history API; transcript rows are presentation state, not VT parser state.
+     */
+    public void installReadOnlyTranscriptProjection(
+        TerminalRestorableState.RowState[] rows,
+        long[] lineIds,
+        int[] paletteArgb
+    ) {
+        if (paletteArgb == null || paletteArgb.length != TextStyle.NUM_INDEXED_COLORS)
+            throw new IllegalArgumentException("transcript palette must contain 259 Termux colors");
+        mMainBuffer.restoreTranscriptProjection(rows, lineIds);
+        mScreen = mMainBuffer;
+        System.arraycopy(paletteArgb, 0, mColors.mCurrentColors, 0, paletteArgb.length);
+        mCursorCol = mCursorRow = 0;
+        mTopMargin = mLeftMargin = 0;
+        mBottomMargin = mRows;
+        mRightMargin = mColumns;
+        mAboutToAutoWrap = false;
+        mCurrentDecSetFlags = 0;
+        mSavedDecSetFlags = 0;
+        mScrollCounter = 0;
+        mAutoScrollDisabled = false;
+    }
+
+    private int decSetFlags(TerminalRestorableState.Modes modes, boolean cursorVisible) {
+        int flags = 0;
+        if (modes.applicationCursor) flags |= DECSET_BIT_APPLICATION_CURSOR_KEYS;
+        if (modes.reverseVideo) flags |= DECSET_BIT_REVERSE_VIDEO;
+        if (modes.origin) flags |= DECSET_BIT_ORIGIN_MODE;
+        if (modes.autoWrap) flags |= DECSET_BIT_AUTOWRAP;
+        if (cursorVisible) flags |= DECSET_BIT_CURSOR_ENABLED;
+        if (modes.applicationKeypad) flags |= DECSET_BIT_APPLICATION_KEYPAD;
+        if (modes.mouseTracking == 1) flags |= DECSET_BIT_MOUSE_TRACKING_PRESS_RELEASE;
+        if (modes.mouseTracking == 2) flags |= DECSET_BIT_MOUSE_TRACKING_BUTTON_EVENT;
+        if (modes.focusReporting) flags |= DECSET_BIT_SEND_FOCUS_EVENTS;
+        if (modes.sgrMouseEncoding) flags |= DECSET_BIT_MOUSE_PROTOCOL_SGR;
+        if (modes.bracketedPaste) flags |= DECSET_BIT_BRACKETED_PASTE_MODE;
+        if (modes.leftRightMargin) flags |= DECSET_BIT_LEFTRIGHT_MARGIN_MODE;
+        return flags;
+    }
+
+    private void restoreSavedScreenState(
+        SavedScreenState target,
+        TerminalRestorableState.CursorState source,
+        boolean autoWrap
+    ) {
+        target.mSavedCursorCol = source.column;
+        target.mSavedCursorRow = source.row;
+        target.mSavedForeColor = TextStyle.decodeForeColor(source.renditionStyle);
+        target.mSavedBackColor = TextStyle.decodeBackColor(source.renditionStyle);
+        target.mSavedEffect = TextStyle.decodeEffect(source.renditionStyle);
+        target.mSavedDecFlags = (autoWrap ? DECSET_BIT_AUTOWRAP : 0) |
+            (source.originMode ? DECSET_BIT_ORIGIN_MODE : 0);
+        target.mUseLineDrawingG0 = source.charset.lineDrawingG0;
+        target.mUseLineDrawingG1 = source.charset.lineDrawingG1;
+        target.mUseLineDrawingUsesG0 = source.charset.gl == 0;
+    }
+
+    private void applyCharset(TerminalRestorableState.CharsetState charset) {
+        mUseLineDrawingG0 = charset.lineDrawingG0;
+        mUseLineDrawingG1 = charset.lineDrawingG1;
+        mUseLineDrawingUsesG0 = charset.gl == 0;
+    }
+
     public boolean isAlternateBufferActive() {
         return mScreen == mAltBuffer;
     }

@@ -19,7 +19,9 @@ namespace TermLink.LocalIpc
         RemoteInputV2 = 11,
         RemoteInputResult = 12,
         Capabilities = 13,
-        RemoteInputReject = 14
+        RemoteInputReject = 14,
+        Title = 15,
+        SessionRemoved = 16
     }
 
     internal enum LocalRemoteInputResult : byte
@@ -202,6 +204,8 @@ namespace TermLink.LocalIpc
     internal static class LocalPayloadCodec
     {
         public const int HandshakeTokenBytes = 32;
+        public const int MaximumTitleBytes = 4096;
+        private static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(false, true);
 
         public static byte[] Capabilities(bool remoteInputReject)
         {
@@ -287,6 +291,53 @@ namespace TermLink.LocalIpc
             }
             exitCode = unchecked((int)LocalFrameCodec.ReadUInt32(payload, 1));
             return (LocalLifecycleState)payload[0];
+        }
+
+        public static byte[] Title(string title)
+        {
+            title = NormalizeTitle(title);
+            var payload = StrictUtf8.GetBytes(title);
+            if (payload.Length > MaximumTitleBytes)
+                throw new ArgumentException("terminal title exceeds the UTF-8 limit", "title");
+            return payload;
+        }
+
+        public static string ParseTitle(byte[] payload)
+        {
+            if (payload == null || payload.Length > MaximumTitleBytes)
+                throw new InvalidDataException("Invalid local IPC title payload.");
+            string title;
+            try { title = StrictUtf8.GetString(payload); }
+            catch (DecoderFallbackException error)
+            {
+                throw new InvalidDataException("Local IPC title is not valid UTF-8.", error);
+            }
+            if (!string.Equals(title, NormalizeTitle(title), StringComparison.Ordinal))
+                throw new InvalidDataException("Local IPC title contains unsupported control characters.");
+            return title;
+        }
+
+        public static byte[] SessionRemoved()
+        {
+            return new byte[0];
+        }
+
+        public static void ParseSessionRemoved(byte[] payload)
+        {
+            if (payload == null || payload.Length != 0)
+                throw new InvalidDataException("Invalid local IPC session-removed payload.");
+        }
+
+        private static string NormalizeTitle(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return string.Empty;
+            var builder = new StringBuilder(value.Length);
+            foreach (var character in value)
+            {
+                if (character == '\t' || (!char.IsControl(character) && character != '\u007f'))
+                    builder.Append(character);
+            }
+            return builder.ToString().Trim();
         }
 
         public static byte[] Input(Guid inputId, byte[] bytes)

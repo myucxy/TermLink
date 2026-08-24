@@ -34,6 +34,17 @@ Termux 源码固定到 `termux/termux-app` 提交
 
 `DiagnosticTerminalEngine` 仍保留为字节诊断工具，但 Harness 已不再使用它渲染终端。
 
+生产会话 Dock 默认包含 Backspace 与 Delete，两者分别发送终端退格和前向删除序列；软键盘的
+`deleteSurroundingText(left, right)` 也会分别处理光标两侧。设置页可添加最多 24 个本地自定义
+快捷键，分别保存可选的“按钮显示字段”和必填的“实际按键组合字段”；显示字段为空时，Dock
+直接显示规范化后的按键组合，填写后优先显示自定义名称。组合字段支持虚拟键盘输入，也支持直接
+捕获物理/模拟按键，语法可组合 Ctrl、Alt、Shift、导航键、Home/End、PageUp/PageDown、F1–F12
+或一个可打印字符。快捷键偏好只保存在 Android 本机，点击后仍走现有 E2EE 输入通道。
+
+手机会话页保持 Windows 端提供的终端行列数，不从 Android View 反向 resize Windows。终端画面
+使用标题栏以下、快捷 Dock 以上的全部剩余高度；IME 显示时会收起会话选择条，并由唯一的底部
+Inset 所有者把终端和 Dock 一起移动到输入法上沿，避免遮挡最后一行。
+
 ## 构建
 
 ```powershell

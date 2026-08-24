@@ -54,6 +54,42 @@ internal endpoint when omitted. For the disposable integration Compose stack,
 the internal endpoint remains `http://minio:9000` while the host-reachable
 presigned endpoint is `http://127.0.0.1:59000`.
 
+## Minimal production stack with external OIDC and S3
+
+`core.compose.yml` already expects an external OIDC issuer. When an external S3
+provider is also available, add `external-services.compose.yml` instead of
+`history.compose.yml`. This keeps the required PostgreSQL and Valkey services,
+but does not create Keycloak or MinIO. Its edge configuration serves only the
+TermLink application host, so Caddy does not request a certificate for or proxy
+the external object-storage host.
+
+```powershell
+docker compose --env-file .env `
+  -f compose\core.compose.yml `
+  -f compose\external-services.compose.yml `
+  --profile edge config
+
+docker compose --env-file .env `
+  -f compose\core.compose.yml `
+  -f compose\external-services.compose.yml `
+  --profile edge up --detach --wait
+
+# Migration is a successful one-shot dependency; remove only its stopped
+# container after startup. This does not remove images or named data volumes.
+docker compose --env-file .env `
+  -f compose\core.compose.yml `
+  -f compose\external-services.compose.yml `
+  rm --force migrate
+```
+
+Set `TERMLINK_S3_ENDPOINT`, `TERMLINK_S3_PUBLIC_ENDPOINT`,
+`TERMLINK_S3_ACCESS_KEY_FILE`, and `TERMLINK_S3_SECRET_KEY_FILE` for that
+provider. After removing the completed migration job, the steady state is three
+containers without the optional edge profile (`server`, PostgreSQL, and
+Valkey), or four with the included edge. OIDC and S3 remain required
+capabilities; this shape
+externalizes them rather than disabling login or encrypted history.
+
 The Go config package fails fast for missing, empty, or over-permissive secret
 files. Its `Secret` values redact themselves in ordinary and `%#v` formatting;
 startup errors identify only the configuration field, never the secret value.
@@ -62,7 +98,7 @@ startup errors identify only the configuration field, never the secret value.
 
 | 开发项 | 范围 | 状态 | 验证与边界 |
 | --- | --- | --- | --- |
-| 1 | 生产账号/OIDC/设备注册与配对 | **已实现并验证** | Go `auth`、设备注册/配对 API、Android OIDC/API 客户端、Windows 配对流程；Go/Android/.NET 自动化验收通过。 |
+| 1 | 生产账号/OIDC、同账号设备直连与撤销 | **已实现并验证** | 生产 server 启用账号级自动设备注册/路由；store 与 E2E 门禁覆盖同 OIDC subject 的 PC/Android 无 Grant 发现、Session 路由、Lease、Realtime 输入输出与跨账号拒绝。`production-e2e-probe` 已切到无自授信/无 Grant 时序；旧 pairing/grant/trust 表/API 仅作兼容。 |
 | 2 | 生产 Protobuf 实时协议、X25519 + ChaCha20-Poly1305、Relay | **已实现并验证** | `protocol/protobuf/termlink_realtime.proto`、Go `realtimewire`/Relay、Android `core-network`、Windows `src/Protocol`；向量、协议和 Relay 测试通过。 |
 | 3 | Windows ConPTY 到 Android 真实输入输出、ACK/Gap/重连、租约与本地输入优先 | **已实现并验证** | Windows `ProductionAgentRuntime`、Android 生产 Session Client、服务端租约/撤销；生产路径自动化覆盖有界重放、ACK/Gap、输入去重、租约和本地输入 epoch。 |
 | 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
@@ -74,6 +110,11 @@ startup errors identify only the configuration field, never the secret value.
 Harness 都是测试夹具，不是生产协议；Android 历史客户端只接受 HTTPS。Integration
 Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-7
 的本地自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏或外部生产发布已经验证。
+
+首版运行时以 OIDC issuer + subject 对应的账号作为发现和路由边界：Windows Agent 与 Android
+登录同一账号后直接使用该账号的受管 PC/Session，不要求配对、自授信或逐 PC Grant。每台设备
+仍生成独立密钥并证明私钥持有，跨账号请求必须拒绝；远程输入仍要求短时 Lease，本地输入优先；
+显式设备撤销会断开连接并停止新 Key Epoch 分发。普通客户端退出登录不是服务端设备撤销或解绑。
 
 运行时配置仍要求真实 OIDC/Google/Web Billing Provider 在部署前注入；本地默认配置只验证
 契约和 `BILLING_UNAVAILABLE` 失败边界，不冒充线上购买或公网部署结果。

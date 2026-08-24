@@ -2,24 +2,24 @@
 
 文档版本：1.0
 状态：开发基线
-更新日期：2026-08-02
+更新日期：2026-08-22
 适用范围：Windows Agent、Docker 服务端、Android 客户端、终端引擎与 UI/UX
 
 ## 1. 文档目的与最终决策
 
-本文把 TermLink 已确认的产品需求、ConPTY 技术验证、Android Terminal 引擎调研、服务端部署要求和 UI 设计合并为统一开发基线。若本文与早期草案冲突，以本文为准；底层验证证据仍以专项文档为准。
+本文把 TermLink 已确认的产品需求、ConPTY 技术验证、Android Terminal 引擎调研、服务端部署要求和 UI 设计合并为统一开发基线。若本文与早期草案冲突，以本文为准；底层验证证据仍以专项文档为准。终端信息获取、事件语义和“经服务端转发到客户端”的专项规定以[终端信息获取与服务端转发需求基线](TERMINAL_INFORMATION_FORWARDING_REQUIREMENTS.md)为准。
 
 已经确定的核心决策：
 
-1. TermLink 管理自己创建的终端会话，不通过窗口抓取、键盘钩子或进程注入接管任意既有 Windows Terminal 标签页。
-2. Windows 端使用 ConPTY 创建 PowerShell、CMD 和 WSL；首轮实机验证已经通过输出捕获、输入、resize 和退出码测试。
+1. 目标是由 TermLink 管理自己创建并注册到 terminal-main 异步通道的终端会话，不通过窗口抓取、键盘钩子、进程注入或直接 ConPTY 读写接管任意既有 Windows Terminal 标签页；当前注册/IPC 尚未完成。
+2. 目标 Windows 端以 terminal-main 的 `TerminalConnection` 边界作为输入输出来源，通过独立异步通道交给 Agent；当前 `ProductionAgentRuntime` 仍使用 ConPTY/SessionHost，旧链路在切换前保留为 Golden Stream 对照。
 3. Android 不移植完整 Windows Terminal。默认使用 Termux `terminal-emulator` + `terminal-view` 派生 Fork，xterm.js 离线 WebView 作为兼容性对照与运行时回退。
-4. PC 与 Android 传输原始、有序的 VT/ANSI 字节，不传屏幕截图，也不在 Relay 中转换成字符串。
-5. 登录同一账号只用于设备发现；新设备必须经过配对批准，远程输入还需要设备权限与会话输入租约。
+4. terminal-main 异步通道目标是产生有序的终端输入输出事件；PC 与 Android 的目标载荷带明确编码版本，不传屏幕截图，也不在 Relay 中转换成字符串。当前生产载荷仍是隐式 UTF-8，编码扩展待完成。
+5. Windows Agent 与 Android 登录同一 OIDC 账号后直接发现和使用该账号下的 PC/受管 Session，不需要用户配对、自授信或逐 PC Grant；远程输入仍需要短时会话输入租约。
 6. 服务端采用 Go，可用 Docker Image 和 Docker Compose 部署；PostgreSQL 保存元数据，Redis/Valkey 保存在线状态与租约，S3 兼容存储保存可选的端到端加密历史块。
-7. 服务端只路由密文。终端正文、输入和快照在 PC 与已批准 Android 设备之间端到端加密。
+7. 服务端只路由密文。终端正文、输入和快照在 PC 与同账号、未撤销且持有独立设备私钥的 Android 之间端到端加密。
 8. UI 采用“Quiet Focus / 安静专注”设计语言：低干扰、内容优先、上下文操作、清晰状态和渐进披露，不以炫光、渐变或大量卡片代替可用性。
-9. 服务端提供可配置套餐目录；首发预置 Free（1 台远程 PC、3 个实时 Session）与 Pro Monthly，但套餐名称、周期、额度、渠道映射和上下架状态均不硬编码在客户端。
+9. 服务端保留可配置套餐目录和购买验证接口；同一账号的 Windows PC 与实时 Session 数量不限，历史额度字段以 `-1` 表示 unlimited，套餐名称、周期、功能标记、渠道映射和上下架状态均不硬编码在客户端。
 
 ## 2. 产品定义
 
@@ -41,15 +41,17 @@ TermLink 是远程终端系统，不是：
 
 | 角色 | 目标 | 默认能力 |
 | --- | --- | --- |
-| 账号所有者 | 管理 PC、手机、权限和记录策略 | 设备管理 |
+| 账号所有者 | 管理本账号 PC、手机、撤销和记录策略 | 账号内设备管理 |
 | PC 本地用户 | 本地运行 Shell，并决定是否允许远程访问 | 本地最高优先级 |
-| Android 远程用户 | 浏览、观察、取得控制权并输入命令 | 由设备授权决定 |
+| Android 远程用户 | 浏览同账号受管会话、观察，并在取得短时租约后输入命令 | 同账号直接访问；输入受租约约束 |
 
-设备权限分为：
+底层兼容权限分为：
 
 - `VIEWER`：查看在线状态、实时输出和授权范围内历史；
 - `CONTROLLER`：拥有 Viewer 能力，并可申请输入租约；
-- `MANAGER`：可批准、降权、撤销设备以及修改 PC 访问策略。
+- `MANAGER`：可管理兼容 Grant、撤销设备以及修改 PC 访问策略。
+
+首版生产主流程启用账号级直接访问：同账号、未撤销设备不依赖上述 Grant 才能发现或订阅 PC/Session。`trust_state` 与 `VIEW/CONTROL/MANAGE` 数据仅用于旧部署/旧客户端兼容和撤销状态表达，不得作为当前产品 UI 的前置步骤。
 
 ### 2.4 MVP 范围
 
@@ -57,13 +59,13 @@ TermLink 是远程终端系统，不是：
 
 - Windows 10 1809+，优先保证 Windows 11；
 - PowerShell 7、Windows PowerShell 5.1、CMD、WSL 2；
-- 单账号最多 5 台 PC，每台 PC 最多 20 个并发受管会话；
+- 单账号可管理不限数量的 PC 和并发受管会话；
 - 多 PC/多会话发现、实时显示、远程输入、断线恢复和最近历史；
 - ANSI 16 色、256 色、True Color、常见 TUI、鼠标、IME 和组合键；
-- 设备配对、分级授权、输入租约、设备撤销和 E2EE；
+- 同账号设备直接发现、账号隔离、输入租约、设备撤销和逐设备 E2EE；
 - Windows Terminal Scheme 配色同步；
 - Docker Compose 单机部署和外部 S3/OIDC 接入。
-- Free 方案和月付会员的购买、恢复、续费、宽限、降级及配额执行。
+- Free 方案和月付会员的购买、恢复、续费、宽限与功能状态同步；PC/Session 数量不设配额。
 
 暂不纳入：
 
@@ -80,7 +82,7 @@ TermLink 是远程终端系统，不是：
 | 指标 | MVP 目标 |
 | --- | --- |
 | 稳定网络输出显示延迟 | 区域内 P95 ≤ 250 ms |
-| Android 输入写入 ConPTY | 区域内 P95 ≤ 250 ms |
+| Android 输入经 terminal-main 异步通道 | 区域内 P95 ≤ 250 ms |
 | 持续输出能力 | 单会话 2 MB/s 持续 10 分钟无 OOM |
 | 断线恢复 | 断线 30 秒后从 ACK/快照恢复，不重复输入 |
 | 终端网格兼容 | Golden Stream 最终网格正确率 ≥ 99% |
@@ -93,11 +95,11 @@ TermLink 是远程终端系统，不是：
 
 | ID | 需求 |
 | --- | --- |
-| AUTH-001 | Android 使用 OAuth 2.1/OIDC Authorization Code + PKCE 登录。 |
+| AUTH-001 | Android 使用固定 HTTPS OIDC 端点原生登录，不持久化密码；身份提供方要求交互时使用 Authorization Code + PKCE 浏览器回退。 |
 | AUTH-002 | PC Agent 使用浏览器设备授权，不保存账号密码。 |
 | AUTH-003 | 每台设备生成独立公私钥；PC 私钥由 DPAPI、Android 私钥由 Keystore 保护。 |
-| AUTH-004 | 同账号新设备默认未受信任，必须由 PC 或已有 Manager 批准。 |
-| AUTH-005 | 支持 Viewer、Controller、Manager 三档权限和按 PC 授权。 |
+| AUTH-004 | Windows/Android 登录同一 OIDC subject 后自动注册为账号内设备，无需配对、自授信或逐 PC Grant；不同 subject 严格隔离。 |
+| AUTH-005 | `trust_state`、pairing 与 Viewer/Controller/Manager Grant 作为兼容模型保留，但不作为首版产品发现/订阅前置条件。 |
 | AUTH-006 | 撤销设备后立即断开连接、拒绝旧 Token，并轮换受影响的会话密钥。 |
 
 ### 3.2 Windows Agent
@@ -106,15 +108,15 @@ TermLink 是远程终端系统，不是：
 | --- | --- |
 | WIN-001 | 安装后提供托盘应用、自动启动、卸载和签名更新。 |
 | WIN-002 | 注册 TermLink PowerShell、CMD、WSL Windows Terminal Profile。 |
-| WIN-003 | 每个 Session Host 独立创建 ConPTY 与 Shell 进程树。 |
-| WIN-004 | 捕获原始输出、远端/本地输入、resize、标题、创建、退出码和中断事件。 |
+| WIN-003 | terminal-main 为每个受管会话创建并注册一个独立异步输入输出通道；TermLink 不直接持有 ConPTY。 |
+| WIN-004 | 通过异步通道转发输出、远端输入结果、resize、支持范围内的标题、创建、退出码和中断事件；本地输入正文默认不采集。 |
 | WIN-005 | 创建、列出、重命名、终止、归档和删除受管会话。 |
 | WIN-006 | 网络中断时写入有界的本地加密环形缓冲，恢复后按序补发。 |
 | WIN-007 | 本地键盘输入可立即撤销远端输入租约。 |
 | WIN-008 | 托盘明确显示远程查看者和控制者，并提供“一键停止远程访问”。 |
 | WIN-009 | 支持仅本机、只读远程、允许控制三种 PC 策略。 |
 | WIN-010 | Agent 重启后准确标记会话中断，不伪造在线会话。 |
-| WIN-011 | Session Host 不继承 Token、日志、Relay Socket 等敏感句柄。 |
+| WIN-011 | terminal-main 异步通道和 Agent 不向终端宿主暴露 Token、日志、Relay Socket 或私钥等敏感句柄。 |
 | WIN-012 | 支持停止同步、停止记录、清除本地历史和配置保留期限。 |
 
 ### 3.3 服务端与 Docker
@@ -122,10 +124,10 @@ TermLink 是远程终端系统，不是：
 | ID | 需求 |
 | --- | --- |
 | SRV-001 | 提供版本化 REST API 和 TLS WebSocket Realtime Relay。 |
-| SRV-002 | 管理账号映射、设备、公钥、授权、PC 在线状态、会话索引和审计元数据。 |
+| SRV-002 | 管理 OIDC 账号映射、设备归属、公钥、撤销状态、PC 在线状态、会话索引和审计元数据；兼容授权记录不得改变首版账号级直连主流程。 |
 | SRV-003 | 支持输出 ACK、续传、去重、限流、背压、心跳和输入租约。 |
 | SRV-004 | 终端载荷保持 E2EE，服务端不得持有正文解密密钥。 |
-| SRV-005 | 历史开启时只保存加密 Event Chunk 与 Snapshot Blob。 |
+| SRV-005 | 历史开启时只保存加密 Event Chunk、Terminal Snapshot 与 Terminal Transcript Page 对象。 |
 | SRV-006 | 官方发布多架构 Docker Image，支持 Docker Compose 单机部署。 |
 | SRV-007 | 容器以非 root 用户运行，提供健康检查、只读根文件系统和外部 Secret 注入。 |
 | SRV-008 | PostgreSQL、Redis/Valkey 和对象存储支持内置 Compose 或外部托管服务。 |
@@ -136,7 +138,7 @@ TermLink 是远程终端系统，不是：
 
 | ID | 需求 |
 | --- | --- |
-| AND-001 | 展示多 PC 在线状态、版本、最近在线时间与访问权限。 |
+| AND-001 | 展示同账号多 PC 在线状态、版本和最近在线时间；不得显示配对/Grant 前置条件。 |
 | AND-002 | 按 PC 展示运行中、已退出、已归档会话，并支持搜索和状态筛选。 |
 | AND-003 | 会话页支持 ANSI/VT、True Color、备用屏幕、滚动区、TUI 和鼠标。 |
 | AND-004 | 支持中文 IME、emoji、宽字符、组合字符、软键盘辅助栏和硬件键盘。 |
@@ -145,7 +147,7 @@ TermLink 是远程终端系统，不是：
 | AND-007 | 支持快照 + 增量事件恢复、历史回放、跳转最新和本地明文搜索。 |
 | AND-008 | 横竖屏适配、字体缩放、保持常亮、后台恢复和可选前台监控通知。 |
 | AND-009 | 控制请求展示租约持有者、期限和 PC 本地确认状态。 |
-| AND-010 | 本地缓存使用 Keystore 包装的数据密钥加密；退出/撤销后清除可恢复密钥。 |
+| AND-010 | 本地缓存使用 Keystore 包装的数据密钥加密；普通退出清理 Token、实时连接与账号缓存但不等同于设备撤销，设备撤销后再清除不可继续使用的会话材料。 |
 
 ### 3.5 终端兼容与主题
 
@@ -175,17 +177,17 @@ TermLink 是远程终端系统，不是：
 
 | ID | 需求 |
 | --- | --- |
-| BILL-001 | 首发 Free 默认最多启用 1 台 PC 的远程访问。 |
-| BILL-002 | 首发 Free 默认最多同时远程显示 3 个不同的实时 Session。 |
-| BILL-003 | 首发 Pro Monthly 按月自动续费，解锁更多 PC 和实时 Session。 |
+| BILL-001 | 同一账号可启用不限数量 PC 的远程访问。 |
+| BILL-002 | 同一账号可同时远程显示不限数量的实时 Session。 |
+| BILL-003 | 首发 Pro Monthly 按月自动续费，购买状态仅影响可选功能，不改变 PC/Session 数量。 |
 | BILL-004 | 实际价格、货币、税费和续费条款由购买渠道在确认前展示，不硬编码在客户端。 |
 | BILL-005 | Android 使用 Google Play Billing；其他渠道通过服务端购买 Provider 抽象接入。 |
 | BILL-006 | 客户端不能自报会员状态，服务端验证购买凭据并签发版本化 Entitlement。 |
-| BILL-007 | 会员到期不终止本地 Shell、不删除设备和历史，只暂停超过 Free 配额的远程能力。 |
-| BILL-008 | 降级超额时允许用户按目标套餐的当前额度选择保留 PC 和实时 Session。 |
-| BILL-009 | 套餐名称、周期、额度、排序、上下架、降级目标和渠道 Product ID 由服务端版本化配置。 |
+| BILL-007 | 会员到期不终止本地 Shell、不删除设备、历史或已有实时订阅。 |
+| BILL-008 | 不执行 PC/Session 超额降级选择或清理。 |
+| BILL-009 | 套餐名称、周期、功能标记、排序、上下架和渠道 Product ID 由服务端版本化配置；数量字段仅兼容保留。 |
 | BILL-010 | Android、Windows 和 Web 只渲染服务端已发布的套餐目录，不依赖 `FREE/PRO` 客户端枚举。 |
-| BILL-009 | E2EE、设备批准、撤销、本地优先和紧急停止等安全能力不得放入付费墙。 |
+| BILL-011 | E2EE、账号隔离、逐设备密钥、撤销、本地优先和紧急停止等安全能力不得放入付费墙。 |
 
 ## 4. 总体架构
 
@@ -194,13 +196,11 @@ TermLink 是远程终端系统，不是：
 ```mermaid
 flowchart LR
     subgraph PC[Windows PC · 用户信任域]
-        WT[Windows Terminal]
-        HOST[Session Host\nInner ConPTY Owner]
+        TM[terminal-main\nAsyncTerminalChannel]
         SHELL[PowerShell / CMD / WSL]
         AGENT[PC Agent\nSession + Crypto + Buffer]
-        WT -->|外层 stdin / stdout| HOST
-        HOST <-->|ConPTY bytes + resize| SHELL
-        HOST <-->|ACL Named Pipe| AGENT
+        TM <-->|ITerminalConnection input/output| SHELL
+        TM -->|target adapter events| AGENT
     end
 
     subgraph CLOUD[Docker 服务端 · 不可信正文域]
@@ -231,9 +231,9 @@ flowchart LR
 
 | 边界 | 信任假设 | 强制措施 |
 | --- | --- | --- |
-| Session Host ↔ Agent | 同一 Windows 用户，但进程隔离 | 当前用户 SID ACL Named Pipe、进程身份校验、长度限制 |
+| terminal-main ↔ Agent | 同一 Windows 用户，宿主与 Agent 进程隔离 | 当前用户 ACL 异步桥接、会话身份校验、长度限制 |
 | Agent ↔ Relay | Relay 不可信终端正文 | TLS + E2EE + 序号 + AEAD |
-| Relay ↔ Android | 网络和 Relay 均可被观察 | TLS + E2EE + 设备批准 |
+| Relay ↔ Android | 网络和 Relay 均可被观察 | TLS + E2EE + OIDC 账号隔离 + 未撤销设备签名证明 |
 | Android UI ↔ Terminal Engine | 终端输出可能恶意 | OSC/URL/剪贴板策略、资源限制、无任意脚本 |
 | Docker Edge ↔ 内部服务 | 仅 Edge 暴露公网 | 私有网络、非 root、Secret、最小端口 |
 
@@ -241,12 +241,17 @@ flowchart LR
 
 ```mermaid
 sequenceDiagram
-    participant H as Session Host
+    participant T as terminal-main
     participant A as PC Agent
     participant R as Docker Relay
     participant M as Android
 
-    H->>A: output(seq, raw bytes)
+    A->>R: same OIDC subject + Windows device proof
+    M->>R: same OIDC subject + Android device proof
+    R-->>M: account-scoped PC / managed Session list
+    Note over A,M: no pairing, self-trust confirmation, or per-PC Grant
+
+    T->>A: channel ordinal / source sequence, UTF-16 units
     A->>A: compress chunk → E2EE encrypt
     A->>R: Envelope(ciphertext)
     R->>M: opaque forward
@@ -261,17 +266,214 @@ sequenceDiagram
     M->>R: InputEvent(inputId, encrypted bytes)
     R->>A: opaque forward
     A->>A: lease check + decrypt + deduplicate
-    A->>H: write ConPTY input
+    A->>T: WriteInputAsync(inputId, UTF-16 units)
 ```
+
+#### 4.3.1 会话标题目录、实时事件与显示合并
+
+标题使用两条互补通路，不能互相替代：REST 会话目录中的 `title_cipher` 让后打开的 Android
+在订阅 Realtime 前取得最近一次认证标题；已打开会话的标题变化则作为有序 E2EE
+`sessionTitle` 元数据事件随实时序列到达。Relay 和数据库在两条通路中都不能得到标题明文。
+
+当前 Windows runtime 从账号内未移除、具备有效 32-byte pairwise key 和 Key Epoch 的接收设备
+构造一个多接收者 envelope；每个 Android 使用自己的 entry、密钥和随机 nonce。同一 envelope 可由
+服务器原样分发给同账号多个 Android，但一台设备不能解开另一台设备的 entry。
+
+```mermaid
+sequenceDiagram
+    participant H as Windows Session Host
+    participant A as Windows Agent
+    participant S as Server Session Directory
+    participant M1 as Android A
+    participant M2 as Android B
+
+    H->>A: ordered title change
+    A->>A: collect eligible recipient devices and Key Epochs
+    A->>A: seal one independent entry per Android
+    A->>S: PUT metadata plus Base64URL title_cipher
+    S->>S: decode and persist opaque envelope
+    M1->>S: GET account-scoped session directory
+    M2->>S: GET account-scoped session directory
+    S-->>M1: same opaque title_cipher
+    S-->>M2: same opaque title_cipher
+    M1->>M1: verify Session PC recipient epoch and AEAD
+    M2->>M2: verify Session PC recipient epoch and AEAD
+    Note over M1,M2: each device opens only its exact recipient entry
+```
+
+`TLTITLE1` version 1 是大端二进制结构。根部依次为 8-byte magic、`uint32` format version、
+16-byte Session UUID、16-byte PC device UUID 和 `uint32` recipient count；每个 entry 依次为
+16-byte recipient device UUID、`int64` Key Epoch、12-byte nonce、`uint32` ciphertext length 和
+AEAD ciphertext（含 16-byte tag）。Key ID 固定为
+`title-v1:<recipient UUID N>:<epoch 8 位十进制>`。AAD 除固定前缀和格式版本外，还绑定
+Session ID、PC device ID、recipient count/index、recipient device ID、Key Epoch、Key ID、
+nonce 与明文长度，防止跨会话、跨 PC、跨设备、跨 epoch 或 entry 重排使用。
+
+双端约束为：标题严格 UTF-8 且最多 4,096 bytes，envelope 最多 1,048,576 bytes，recipient
+最多 4,096 个，pairwise key 必须是 32 bytes，recipient 不得等于 PC device ID 或重复，所有
+entry 的明文长度必须一致。服务器 REST JSON body 上限为 2 MiB，以容纳 1 MiB envelope 的
+Base64URL 膨胀；服务器只做 Base64URL 解码和 opaque bytes 持久化，不解析或解密 envelope。
+
+没有可用 recipient 时 Windows 发送空 `title_cipher`；recipient directory 暂时不可用时仍继续
+metadata heartbeat，并省略标题更新。两种情况都保留服务器上一次成功密封的标题，不以空字符串
+清除它。Android 必须同时传入并核对 expected Session ID、expected PC device ID、本机 recipient
+device ID 和 expected Key Epoch；magic/version/尺寸、身份绑定、recipient 唯一性、epoch、entry
+长度、截断/尾随字节、AEAD 或严格 UTF-8 任一检查失败时，只省略该标题并继续展示会话目录，
+不得尝试其他 recipient entry，也不得显示密文或未认证字符串。
+
+```mermaid
+flowchart TD
+    A[Directory returns title_cipher] --> B{Size and format valid?}
+    B -->|no| F[Omit unauthenticated directory title]
+    B -->|yes| C{Session PC recipient and epoch match?}
+    C -->|no| F
+    C -->|yes| D{AEAD and strict UTF-8 valid?}
+    D -->|no| F
+    D -->|yes| E[Authenticated directory title]
+    E --> G{Session is open?}
+    F --> G
+    G -->|no| K{Authenticated directory title exists?}
+    K -->|yes| I[Display directory title]
+    K -->|no| J[Display shellType fallback]
+    G -->|yes| L{Ordered realtime title non-empty?}
+    L -->|yes| H[Display realtime title]
+    L -->|no| M{Renderer OSC title non-empty?}
+    M -->|yes| N[Display renderer title]
+    M -->|no| J
+```
+
+Android repository 将认证后的目录标题与当前会话投影合并到同一个 `sessionTitles` 展示映射：
+未打开会话由认证目录标题填充；会话已打开时，优先级为有序 E2EE realtime `sessionTitle`，其次为
+Termux renderer 从 OSC 解析出的 title（兼容旧 Agent），显式空 runtime title 会清除旧的展示标题。
+UI 最终只取该映射中的非空 projected title，否则显示目录记录的 `shellType`。因此“目录标题”和
+“实时标题”是来源概念，不是两个可以互相覆盖安全边界的 UI 字段。
 
 ### 4.4 断线恢复原则
 
-1. 输出序号由 PC Agent 按会话单调生成，Android 只 ACK 已连续接收的最高序号。
-2. Android 重连时提交 `last_acked_seq` 和可用 `snapshot_id`。
-3. Agent 有增量时直接续传；增量过期时发送最新快照及其后事件。
-4. 数据已经永久缺失时，Android 清空旧解析状态，从新快照恢复并显示 History gap。
-5. 输入 ACK 只表示 PC Agent 已接受该 `input_id`，不表示命令执行成功。
-6. 多行粘贴只有明确确认 PC Agent 从未接受对应 `input_id` 时才能整体重试。
+`TerminalSnapshotV1` 是锚定已有输出序号 S 的 REST 历史对象，不是 Realtime
+`Envelope`。它不分配或消耗新的 `Envelope.seq`，也不由 Agent 通过 WebSocket
+直接发送。启用 `terminal_snapshot_v1` 后，完整恢复时序固定如下：
+
+```mermaid
+sequenceDiagram
+    participant D as Android Durable State
+    participant M as Android Bootstrap
+    participant H as History REST Selector
+    participant O as Object Storage
+    participant C as Crypto and Validator
+    participant P as Detached Termux Engine
+    participant L as Live Renderer
+    participant R as Realtime Relay
+    participant A as PC Agent
+
+    M->>D: read durable cumulative ACK A
+    M->>H: request one eligible snapshot for A
+    H->>H: select at most one S where A <= S <= last output seq
+    H-->>M: snapshot metadata S and signed download URL
+    M->>O: download sealed snapshot object
+    O-->>M: TerminalSnapshotCiphertextV1
+    M->>C: verify digest, identity, epoch, AAD and AEAD
+    C->>C: decode and fully validate TerminalSnapshotV1 at S
+    C-->>M: validated snapshot S
+    M->>P: prepare snapshot in a detached renderer
+    P-->>M: prepared candidate at S
+    M->>D: durably cache the sealed object
+    M->>D: atomically bind checkpoint identity and ACK S
+    D-->>M: bound renderer generation at S
+    M->>L: install prepared candidate
+    M->>R: SUBSCRIBE resume_from_seq S with Envelope ACK S
+    R->>A: subscriber resumes after S
+    A->>R: first ordered Envelope seq S+1
+    R->>M: first ordered Envelope seq S+1
+    M->>L: apply event S+1
+    M->>D: commit cumulative ACK S+1 after apply
+
+    Note over A,R: Snapshot bytes never travel as realtime Envelope data
+    Note over M,L: Before atomic bind, failure may fall back; after bind, restore or reset must complete before opening the socket
+```
+
+1. 目标输出序号由受控本地适配器按会话持久化生成；当前合同桥接要求源提供连续 Sequence/Gap，channel ordinal 仅作本地诊断，Android 只 ACK 已连续接收且成功应用的最高序号。
+2. 无可用快照时使用从安全前缀开始的有界原始事件回放；不得把中间一段 raw VT 喂给空 parser。数据永久缺失时显示 `History gap`，且 Gap 本身不能推进 ACK。
+3. 快照 S 完整认证、detached prepare、持久缓存，并原子绑定 renderer checkpoint 与 ACK S 后，Android 才能发布 `SUBSCRIBE(S)`；仅下载或解密快照不授权 ACK S。
+4. 绑定后的进程重启必须先从同一密文缓存恢复完全相同的 renderer checkpoint。安装失败时必须原子重置 renderer/ACK；重置失败则禁止启动 Realtime Socket。
+5. 首个新事件必须是 S+1。重复事件按既有去重规则处理；缺少 S+1 时显示 `History gap`，不得继续推进 ACK。
+6. 输入 ACK 只表示 PC Agent 已接受该 `input_id`，不表示命令执行成功。多行粘贴只有明确确认 Agent 从未接受对应 `input_id` 时才能整体重试。
+
+### 4.5 Tail-first 历史生产、逐设备隔离与上线门
+
+Tail-first 不是“截取 raw VT 尾部”，而是从同一 durable `LocalFrame` 前缀生成两类
+可验证对象。Windows 必须先把帧写入 producer WAL，再以固定序号 S 物化并提交所有
+Transcript Page，最后才提交 Snapshot S。Snapshot 的可选择性是这一批对象的提交屏障，
+不能在 Transcript 尚未完成时提前发布。
+
+```mermaid
+flowchart LR
+    FRAME[Durable LocalFrame seq 1..S] --> WAL[Append and fsync producer WAL]
+    WAL --> MODEL[Replay portable terminal model through S]
+    MODEL --> MATERIALIZE[Materialize Snapshot S and Transcript Pages from the same prefix]
+    MATERIALIZE --> OUTBOX[Persist ordered per-recipient outbox]
+    OUTBOX --> TUPLOAD[Upload per-recipient Transcript Pages first]
+    TUPLOAD --> TCOMMIT[Commit all transcript metadata and object digests]
+    TCOMMIT --> SUPLOAD[Upload per-recipient Snapshot S last]
+    SUPLOAD --> PUBLISH[Publish Snapshot S as eligible for selection]
+```
+
+- `LocalFrame` 的序号和 WAL 提交必须可跨 Agent 崩溃恢复；上传重试使用稳定对象标识和摘要，
+  相同内容重复提交必须幂等。
+- 最终工作树中的 WAL 是每帧一个 DPAPI 保护的 `.wal.dpapi` 文件，使用原子替换、
+  `FileOptions.WriteThrough` 和 `Flush(true)`；自动裁剪/retention 不属于当前已验收能力，未来引入
+  时不得早于所有目标 recipient 的 durable delivery 状态。
+- Transcript-first 是提交顺序，不要求首开下载 Transcript。没有更早主屏行时，Transcript
+  集合为空，提交屏障仍成立，随后才允许提交 Snapshot。
+- Snapshot 和 Transcript 都针对每个同账号、未撤销 Android 接收设备分别密封；对象索引
+  至少绑定 `account_id`、`session_id`、`recipient_device_id`、对象类型、S、页游标和 Key Epoch。
+  同账号两台 Android 可以看到同一逻辑会话，但不得互取、互解或覆盖对方对象与缓存。
+- Android 的规范首开时序就是 4.4 的 `select -> download -> verify -> detached prepare ->
+  durable cache -> atomic bind -> install -> SUBSCRIBE(S) -> S+1`。首次只安装 Snapshot S
+  的最后可见屏幕，不预取 Transcript 或 Event Chunk。
+- 用户向上越界时，分页锚点固定为本次安装的 S，每次最多 200 行；页面只进入独立 history
+  viewport。实时 parser 继续消费 S+1 以后事件并正常推进 live ACK，分页成功、失败或重试都
+  不改变 ACK。
+
+失败和回退必须遵循以下闭环：
+
+```mermaid
+flowchart TD
+    START[Open managed session] --> CAP{Snapshot and transcript capabilities enabled on both ends?}
+    CAP -->|no| LEGACY[Use bounded_event_replay_v1]
+    CAP -->|yes| SELECT{Eligible recipient-bound Snapshot S found?}
+    SELECT -->|no| LEGACY
+    SELECT -->|yes| PRE[Download verify detached prepare and durable cache]
+    PRE --> PREF{All pre-bind steps valid?}
+    PREF -->|no| DISCARD[Discard candidate keep previous safe ACK]
+    DISCARD --> LEGACY
+    PREF -->|yes| BIND[Atomically bind renderer checkpoint and ACK S]
+    BIND --> INSTALL{Install or recover identical cached checkpoint?}
+    INSTALL -->|no| RESET{Atomic renderer and ACK reset succeeds?}
+    RESET -->|yes| LEGACY
+    RESET -->|no| BLOCK[Block realtime socket and show recoverable error]
+    INSTALL -->|yes| SUB[Subscribe at S]
+    SUB --> NEXT{First new event is S+1?}
+    NEXT -->|yes| LIVE[Apply live stream and advance ACK after apply]
+    NEXT -->|no| GAP[Show History gap and keep ACK at S]
+    LIVE --> PAGE{User pages above top?}
+    PAGE -->|yes| HISTORY[Fetch recipient-bound transcript at fixed S]
+    HISTORY -->|failure| KEEP[Keep current history viewport and live ACK]
+    HISTORY -->|success| VIEW[Insert rows only into independent viewport]
+```
+
+能力与发布门禁如下：
+
+| 能力或门禁 | 旧/新路径 | 当前发布策略 | 开启条件 |
+| --- | --- | --- | --- |
+| `bounded_event_replay_v1` | 旧的安全连续事件回放 | 生产默认，作为失败回退 | 保持既有 ACK、Gap 和 E2EE 回归通过 |
+| `terminal_snapshot_v1` | 新的 Snapshot S bootstrap 及 `TerminalTranscriptPageV1` REST 对象 | Android Release 强制关闭；Debug 仅可用 `-PtermlinkEnableTerminalSnapshotRuntime=true` 显式开启 | Windows durable producer/WAL、transcript-first/snapshot-last 屏障、逐设备密封、Android 原子绑定、崩溃恢复和 S/S+1 等价 E2E 全部通过后，Agent/Android 才可共同宣告 capability |
+| Tail-first Debug 观察合同（非 wire capability） | Debug-only 产品 E2E 门禁 | receiver 与合同 asset 不得进入 Release | 真实 Windows -> 生产 Relay/History -> 冷启动 Android 七项验收全部有非敏感证据 |
+
+上线必须 fail closed：任一必需能力未协商、任一端开关关闭、对象身份/摘要/Key Epoch 不匹配，
+或真实产品 E2E 未通过时，都继续使用 `bounded_event_replay_v1`，不得宣告 tail-first 已上线。
+所有用户可见状态、错误、空态和恢复操作必须同时提供简体中文与 English 资源；测试还需核对
+两种语言下顶部状态、历史入口、分页失败、History gap、重试按钮和 IME 布局均不截断或重叠。
 
 ## 5. Windows Agent 设计
 
@@ -279,10 +481,8 @@ sequenceDiagram
 
 ```mermaid
 flowchart TB
-    PROFILE[Windows Terminal Profile] --> CLI[termlink-session-host.exe]
-    CLI --> CONPTY[Inner ConPTY]
-    CONPTY --> PROC[Shell Process Tree]
-    CLI <-->|Per-session Named Pipe| CORE[TermLink.Agent.exe]
+    PROFILE[TermLink Profile] --> TM[terminal-main]
+    TM -->|AsyncTerminalChannel| CORE[TermLink.Agent.exe]
     TRAY[TermLink.Tray.exe] <-->|User IPC| CORE
     UPDATE[TermLink.Updater.exe] --> CORE
     CORE --> CACHE[(Encrypted Ring Buffer)]
@@ -293,39 +493,39 @@ flowchart TB
 | --- | --- | --- |
 | `TermLink.Tray.exe` | 当前交互用户 | 登录、策略、会话列表、远端状态、紧急停止 |
 | `TermLink.Agent.exe` | 当前用户后台进程 | 账号、密钥、Relay、会话目录、缓冲、授权和 IPC |
-| `termlink-session-host.exe` | 每个终端会话一个 | 创建 ConPTY、启动 Shell、桥接本地/远程 I/O、上报生命周期 |
+| `terminal-main` 异步通道 | 每个受管终端会话一个（目标） | 当前实现暴露输出/状态/输入结果/resize 结果回调；lifecycle 生产记录仍需集成适配器映射，不把 ConPTY 句柄交给 TermLink |
 | `TermLink.Updater.exe` | 受控提升 | 验证签名、原子更新和失败回滚 |
 
 MVP 不让高权限 Windows Service 直接托管用户 Shell。若后续需要无人登录持续在线，可增加 Broker Service，但它只能负责用户会话发现与启动，Shell 仍以目标用户身份运行。
 
-### 5.2 Windows Terminal Profile 与双层 PTY
+### 5.2 terminal-main Profile 与异步通道
 
 Windows Terminal Profile 启动命令示例：
 
 ```text
-termlink-session-host.exe start --shell pwsh --profile-id powershell-7
+（未来示意）terminal-main.exe --termlink-profile powershell-7 --session-id <uuid>
 ```
 
-Windows Terminal 拥有外层控制台，Session Host 创建内层 ConPTY 并运行真实 Shell：
+terminal-main 负责本地 Shell 连接和渲染，未来集成层只订阅其连接抽象并通过异步通道交换事件；当前尚无该进程注册/IPC 实现：
 
 ```text
-Windows Terminal outer PTY
-    ↕ local keyboard / rendered output
-Session Host bridge
-    ↕ captured raw VT bytes / remote input / resize
-Inner ConPTY
-    ↕
-PowerShell / CMD / WSL
+terminal-main TerminalConnection
+    ↕ local keyboard / TerminalOutput(Char[])
+AsyncTerminalChannel
+    ↕ target adapter input / output / resize / lifecycle records
+TermLink.Agent
+    ↕ E2EE Envelope
+Server Relay / Android
 ```
 
-这一结构保证本地窗口与 Android 收到相同的 Shell 输出。必须用 Golden Test 检查双层 PTY 对标题、颜色、输入模式和 resize 的影响；若某个 Shell 存在差异，允许提供独立 TermLink 桌面窗口作为本地前端，但不改变远程协议。
+这一结构是目标设计，尚未保证本地 terminal-main 与 Android 使用同一条生产事件源。必须用 AsyncTerminalChannel 隔离测试和后续 IPC/Registry 集成测试检查标题来源、颜色、输入模式、resize、取消和关闭竞态；不通过截图、缓冲区回读或 ConPTY 句柄验证终端信息。
 
 ### 5.3 Session Host 生命周期
 
 ```mermaid
 stateDiagram-v2
     [*] --> Starting
-    Starting --> Running: ConPTY + Shell ready
+    Starting --> Running: channel + terminal connection ready
     Starting --> Failed: create error
     Running --> Disconnected: Agent pipe lost
     Disconnected --> Running: pipe reattached
@@ -336,24 +536,24 @@ stateDiagram-v2
     Ended --> [*]
 ```
 
-关闭顺序固定为：停止远端输入 → 关闭 ConPTY 输入写端 → 等待或终止 Shell 进程树 → 关闭 ConPTY → 排空剩余输出 → 发布唯一的 Ended 事件。
+关闭顺序固定为：停止远端输入 → 取消异步通道新写入 → 撤销输出/状态回调 → 等待已提交回调排空 → 关闭 terminal-main 连接 → 发布唯一的 Ended 事件。Shell 的具体关闭由 terminal-main 按其 `closeOnExit` 和连接后端策略负责。
 
 ### 5.4 本地 IPC
 
-每个会话使用独立 Named Pipe：
+每个会话使用独立的、当前用户授权的异步桥接通道：
 
 - Pipe ACL 只允许当前用户 SID 和 Agent 进程；
-- Agent 与 Host 相互校验 PID、用户 SID、Session ID 和一次性握手 Token；
+- Agent 与 terminal-main 桥接端相互校验进程身份、用户 SID、Session ID 和一次性握手 Token；
 - 帧格式为长度前缀 + 类型 + Session ID + 序号 + Payload；
 - 单帧默认上限 1 MiB，输出按 16～64 KiB 批量；
-- Host 断开 Agent 时继续服务本地终端并进入有界缓冲；
-- 不把 Relay Socket、Token 或加密私钥传入 Session Host。
+- terminal-main 断开 Agent 时继续服务本地终端并进入有界缓冲；
+- 不把 Relay Socket、Token 或加密私钥传入 terminal-main 连接通道。
 
 ### 5.5 Agent 内部模块
 
 | 模块 | 职责 |
 | --- | --- |
-| Session Registry | 会话元数据、状态机、Host IPC 和 Shell 类型 |
+| Session Registry | 会话元数据、状态机、terminal-main 异步桥接和 Shell 类型 |
 | Stream Sequencer | 分配输出 seq、批处理、压缩和 ACK 窗口 |
 | Local Buffer | DPAPI 包装数据密钥，加密事件块与环形淘汰 |
 | Realtime Client | WebSocket、心跳、重连、背压和能力协商 |
@@ -401,11 +601,11 @@ MVP 将 REST API、WebSocket Relay、租约协调和后台清理任务编译成�
 
 | 逻辑组件 | 职责 | 是否接触正文 |
 | --- | --- | --- |
-| API | 设备、PC、会话索引、授权、配对和审计 API | 否 |
+| API | 账号归属、设备、PC、会话索引、撤销和审计 API；兼容授权/配对端点 | 否 |
 | Realtime Relay | WebSocket 认证、路由、ACK、背压和心跳 | 只见 Envelope |
 | Lease Coordinator | 输入租约申请、续约、释放和抢占 | 否 |
-| History Indexer | 加密 Event Chunk/Snapshot 索引和过期删除 | 只见密文 Blob |
-| Worker | 撤销传播、过期、配额、审计保留和删除任务 | 否 |
+| History Indexer | 加密 Event Chunk/Snapshot/Transcript 索引和过期删除 | 只见密文 Blob |
+| Worker | 撤销传播、过期、审计保留和删除任务 | 否 |
 
 ### 6.2 Docker Compose 拓扑
 
@@ -480,34 +680,145 @@ ghcr.io/termlink/termlink-server:<semver>
 
 Secret 优先使用 Docker Secret 文件；环境变量只保存非敏感值。配置加载失败时进程必须 Fail Fast，不静默使用不安全默认值。
 
+### 6.5.1 本机 LAN 产品 E2E / Local-LAN product E2E
+
+本机跨设备验收只使用当前 TermLink 仓库，不复制其他仓库的产物，也不依赖同级仓库。
+All commands and artifacts for this flow come from the current TermLink checkout;
+no sibling repository is required.
+
+1. 在仓库根目录运行
+   `.\server\ops\Start-ProductionAcceptance.ps1 -LanAddress 192.168.9.28`。
+   Run the same command from the repository root; `-LanAddress` must be an IPv4
+   address assigned to this host.
+2. 地址 `<LAN-IP>` 对应的产品、API 和 OIDC Origin 是
+   `https://termlink.<LAN-IP>.sslip.io:9443`，历史对象 Origin 是
+   `https://history.<LAN-IP>.sslip.io:9443`。脚本导出一次性 CA 到
+   `server\secrets\acceptance\acceptance-root-ca.crt`。The script exports that
+   disposable CA at the same path.
+3. 在 `android` 目录构建 Debug APK 时传入
+   `-PtermlinkServerUrl=https://termlink.<LAN-IP>.sslip.io:9443`，并在测试手机或
+   模拟器上显式配置对上述 CA 的信任。Build the Android Debug APK with that
+   Gradle property and explicitly configure the test device/emulator to trust
+   the exported CA; the app does not install or bypass CA trust automatically.
+4. Windows Agent 账号关联和 Tray 分别通过
+   `--server-url https://termlink.<LAN-IP>.sslip.io:9443` 选择 LAN Origin，并让测试
+   进程的 `TERMLINK_ACCEPTANCE_CA_FILE` 指向导出的 CA。Use `--server-url` for
+   both the Agent CLI and Tray; hostname verification remains enabled.
+5. Windows 与 Android 登录同一 OIDC 账号，在 Windows 创建 TermLink 受管 Session，
+   再由 Android 发现该 Session、建立生产 Relay/E2EE 连接并取得输入租约。Sign in on
+   both clients with the same OIDC account, create a TermLink-managed session on
+   Windows, discover it on Android, then acquire a lease before sending input.
+
+该脚本自动完成的是服务端生产 REST/Realtime/Lease/History 协议探测，不代替真实 Android
+与 Windows 产品链路的人工 E2E。手机和 PC 必须能解析 `sslip.io` 并访问主机 TCP 9443；
+宿主机防火墙规则由操作者按局域网范围配置。一次性 CA 只用于 Debug/E2E，不是生产信任锚。
+Android Release 和 Windows 默认配置不会继承 LAN 覆盖，仍固定使用公开 Origin
+`https://termlink.kget.cc:8910`。只有 TermLink 创建并管理的 Session 会被转发；系统不能附加
+或接管任意已经打开的 cmd、PowerShell 或 Windows Terminal 标签页。当前发布运行时仍通过旧
+ConPTY/SessionHost 管理这些会话，目标 terminal-main 注册/IPC 切换完成前不得宣称该新链路已
+完成跨设备生产 E2E。
+
+The script's automatic probe validates the server-side production protocol, not
+the complete physical Android-to-Windows product path. DNS, TCP 9443, firewall,
+and explicit device trust must be prepared separately. Release clients continue
+to use the public origin, and only TermLink-managed sessions are forwarded.
+
+### 6.5.2 2026-08-21 真实 LAN 验收证据 / Live LAN acceptance evidence
+
+本次验收使用产品/API/OIDC Origin
+`https://termlink.192.168.9.28.sslip.io:9443`，Android 16 模拟器和 Windows Agent 均登录
+`acceptance-probe`。Windows 侧运行 PowerShell 7 受管 Session；Android 发出的第一条命令在
+Windows 创建 marker `D:\Dev\Temp\TLANDROID1787315819158`，终端输出也返回 Android。
+数据库验收查询确认 Device Grant 行数为 `0`、Pairing Challenge 行数为 `0`，因此该结果没有
+依赖配对、自授信或逐 PC Grant。
+
+This live run used `https://termlink.192.168.9.28.sslip.io:9443` for product,
+API, and OIDC traffic. Both an Android 16 emulator and the Windows Agent signed
+in as `acceptance-probe`. Input sent by Android executed in a managed PowerShell
+7 session and created `D:\Dev\Temp\TLANDROID1787315819158` on Windows; terminal
+output returned to Android. Acceptance database checks found zero Device Grant
+rows and zero Pairing Challenge rows, so pairing, self-trust, and per-PC Grants
+were not prerequisites for this path.
+
+早期复验在人工切换 `Devices -> Sessions` 后重新取得租约，第二条 Android 输入在 Windows 创建
+`D:\Dev\Temp\TLRECONNECT1787316577617`。同持有者租约恢复实现后的后续复验已经取代当时的
+Tab 切换限制：Android PID 从 `8234` 经强停变为空，再冷启动为 `8360`；无需切换 Tab，恢复页
+语义即为 `SessionsSelected=True`、`SessionTitle=True`、`EnterPresent=True`，历史 marker
+`TLANDROID1787315819158` 和 `TLRECONNECT1787316577617` 均自动恢复。同一过程中 Valkey 租约
+TTL 依次观测为 `27882 ms`、`25145 ms`、`20007 ms`。因此强停/冷启后的 Session 页面、历史和同持有者
+租约恢复已经验证；证据截图为
+`D:\Dev\Temp\termlink-fixed-cold-start-20260821-221034.png`。
+
+Android 16 IME 修复和标准命令输入框已经实现，但最新命令 marker
+`tlcold20260821223551` 尚未确认在 Windows 执行成功。该项仍属于真实 E2E 待验证，不能从上述
+页面、历史和租约证据推断为已通过。
+
+The earlier run reacquired control only after a manual `Devices -> Sessions`
+transition and then created `D:\Dev\Temp\TLRECONNECT1787316577617`. A later run
+after same-holder lease resume was implemented superseded that tab-switch
+limitation: Android PID `8234` was force-stopped, disappeared, and cold-started
+as PID `8360`. With no tab transition, the restored screen reported
+`SessionsSelected=True`, `SessionTitle=True`, and `EnterPresent=True`; historical
+markers `TLANDROID1787315819158` and `TLRECONNECT1787316577617` were restored
+automatically. Valkey lease TTL observations during the sequence were `27882 ms`,
+`25145 ms`, and `20007 ms`. Cold-start Session/UI, history, and same-holder lease
+restoration are therefore verified. The evidence screenshot is
+`D:\Dev\Temp\termlink-fixed-cold-start-20260821-221034.png`.
+
+The Android 16 IME fix and standard command input field are implemented, but
+successful Windows execution of the latest marker `tlcold20260821223551` has
+not been confirmed. That live E2E command result remains pending and must not be
+inferred from the UI, history, or lease evidence above.
+
+为避免与同一 Windows 用户下的其他 Agent 共用 `%LOCALAPPDATA%\TermLink`，该次运行设置了
+`TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT`，实际隔离根为
+`D:\Dev\Temp\TermLink-MainE2E-mainmt2xowb8`。Agent 只有在
+`TERMLINK_ACCEPTANCE_CA_FILE` 同时设置时才接受此覆盖；默认配置和 DPAPI 凭据路径不变，
+验收前后的默认文件哈希也保持一致。This acceptance-only storage override is
+enabled only when the explicit acceptance CA environment variable is also set;
+it does not redirect normal production storage.
+
+该环境的用户系统代理为 `127.0.0.1:7897`。REST/OIDC 已走 LAN acceptance 直连，但
+`ClientWebSocket` 最初继承系统代理并出现 WSS TLS EOF。修复后，只有加载显式 acceptance CA
+的受限 WebSocket 配置会设置 `Proxy = null`，TLS 主机名校验仍保留；Relay 随后稳定进入
+Connected。The explicit LAN-acceptance WebSocket path now bypasses the inherited
+system proxy while retaining hostname validation.
+
+本机验收截图是
+`D:\Dev\Temp\termlink-TLANDROID1787315819158-output.png`、
+`D:\Dev\Temp\termlink-TLRECONNECT1787316577617-reconnect.png` 和
+`D:\Dev\Temp\termlink-fixed-cold-start-20260821-221034.png`。These screenshots
+are local acceptance artifacts only; they are not checked into this repository
+and are not portable test fixtures. No password, token, private key, or secret
+is recorded in this evidence.
+
 ### 6.6 REST API
 
-所有路径以 `/v1` 开头，使用 OIDC Access Token 与设备签名证明：
+所有路径以 `/v1` 开头，使用 OIDC Access Token 与设备签名证明。当前生产主流程按 OIDC subject 做账号级设备/PC/Session 路由；下表中的 approve/pairing/grant 接口仅为旧部署和旧客户端兼容，不是用户前置步骤：
 
 | 方法与路径 | 用途 |
 | --- | --- |
 | `POST /v1/devices/register` | 注册设备公钥和设备证明 |
 | `GET /v1/devices` | 获取账号设备与信任状态 |
-| `POST /v1/devices/{id}/approve` | 批准新设备 |
+| `POST /v1/devices/{id}/approve` | 兼容：批准旧 `PENDING` 设备 |
 | `POST /v1/devices/{id}/revoke` | 撤销设备 |
 | `GET /v1/pcs` | PC 列表与 Presence |
 | `GET /v1/pcs/{pcId}/sessions` | 会话摘要列表 |
-| `POST /v1/pcs/{pcId}/grants` | 设置设备对 PC 的权限 |
+| `POST /v1/pcs/{pcId}/grants` | 兼容：设置旧客户端设备对 PC 的权限 |
 | `POST /v1/sessions/{id}/subscribe` | 创建短时订阅授权 |
 | `POST /v1/sessions/{id}/lease` | 请求输入租约 |
 | `DELETE /v1/sessions/{id}/lease/{leaseId}` | 主动释放租约 |
-| `GET /v1/sessions/{id}/history` | 获取加密块索引和签名下载地址 |
+| `GET /v1/sessions/{id}/history` | 分页选择 Event Chunk、Terminal Snapshot 或 Terminal Transcript Page 元数据和签名下载地址 |
 | `DELETE /v1/sessions/{id}` | 删除索引并触发密文清理 |
 | `GET /v1/audit-events` | 获取不含正文的安全审计 |
 | `GET /v1/billing/plans` | 获取已发布套餐目录、权益与渠道 Product ID 映射 |
-| `GET /v1/account/entitlements` | 获取服务端签发的当前配额 |
+| `GET /v1/account/entitlements` | 获取服务端签发的当前功能状态（数量字段为 `-1` 表示不限） |
 | `POST /v1/billing/google/verify` | 验证 Google Play Purchase Token |
 | `POST /v1/billing/web/checkout` | 创建合规的 Web Checkout |
 | `POST /v1/billing/restore` | 恢复/重新同步购买 |
 | `POST /v1/admin/billing/plans` | 新建套餐草稿 |
-| `PUT /v1/admin/billing/plans/{id}` | 修改套餐、额度和渠道映射 |
+| `PUT /v1/admin/billing/plans/{id}` | 修改套餐、功能标记和渠道映射（数量字段仅兼容保留） |
 | `POST /v1/admin/billing/catalog/publish` | 校验并发布新套餐目录版本 |
-| `POST /v1/account/quota-selection` | 降级时选择保留的 PC/Session |
 
 所有变更 API 支持 Idempotency Key。列表接口使用游标分页，错误返回稳定的机器码、用户可读文案 Key 与 Trace ID。
 
@@ -519,7 +830,7 @@ Secret 优先使用 Docker Secret 文件；环境变量只保存非敏感值。�
 2. Device ID、设备签名 Challenge 和撤销状态校验；
 3. 协议版本与能力协商；
 4. 注册 PC 或 Android 连接角色；
-5. 仅对已授权 Session 建立路由。
+5. 仅对同账号、未撤销设备的受管 Session 建立路由；不查询显式 Grant 作为首版必需前置条件。
 
 服务端限制：
 
@@ -534,19 +845,27 @@ Secret 优先使用 Docker Secret 文件；环境变量只保存非敏感值。�
 | 表 | 关键字段 |
 | --- | --- |
 | `users` | `id`, `oidc_subject_hash`, `status`, `created_at` |
-| `devices` | `id`, `user_id`, `type`, `name`, `public_key`, `trust_state`, `revoked_at` |
+| `devices` | `id`, `user_id`, `type`, `name`, `public_key`, `trust_state`, `revoked_at`；`user_id`/撤销状态是当前主流程边界，`trust_state` 兼容保留 |
 | `pcs` | `id`, `owner_user_id`, `name`, `agent_version`, `last_seen_at` |
-| `device_grants` | `device_id`, `pc_id`, `permission`, `approved_by`, `expires_at` |
-| `sessions` | `id`, `pc_id`, `shell_type`, `title_cipher`, `state`, `created_at`, `ended_at` |
+| `device_grants` | 兼容层：`device_id`, `pc_id`, `permission`, `approved_by`, `expires_at`；账号级直连不依赖该表 |
+| `sessions` | `id`, `pc_id`, `shell_type`, opaque `title_cipher`, `state`, `created_at`, `ended_at`；标题密文合同见 4.3.1 |
 | `control_leases` | `session_id`, `holder_device_id`, `lease_id`, `expires_at`, `version` |
 | `event_chunks` | `session_id`, `start_seq`, `end_seq`, `object_key`, `size`, `expires_at` |
-| `snapshots` | `session_id`, `snapshot_seq`, `rows`, `columns`, `object_key`, `format_version` |
+| `snapshots` | `session_id`, `snapshot_seq`, `rows`, `columns`, `object_key`, `format_version`；`snapshot_seq` 锚定已有事件，不是新 Envelope 序号 |
 | `audit_events` | `actor_device_id`, `action`, `target_type`, `target_id`, `result`, `ip_hash`, `created_at` |
 | `subscriptions` | `account_id`, `provider`, `product_id`, `provider_ref_hash`, `status`, `renews_at`, `grace_until` |
 | `entitlements` | `account_id`, `plan`, `max_remote_pcs`, `max_live_sessions`, `version`, `effective_at`, `expires_at` |
 | `outbox` | `event_type`, `payload`, `available_at`, `attempts` |
 
-标题与工作目录可能包含敏感信息，默认由 PC 生成经过裁剪的显示标题；需要云同步完整值时以密文字段保存。
+标题与工作目录可能包含敏感信息。当前只同步经大小限制、逐 recipient 认证加密的标题；数据库不得
+增加明文标题列。Agent 没有可用 recipient 或 recipient directory 暂时不可用时保留旧
+`title_cipher`；Android 解密失败时忽略标题并继续使用目录，而不是把未认证值投影到 UI。
+
+`TerminalSnapshotCiphertextV1` 与 `TerminalTranscriptCiphertextV1` 都属于 REST
+历史对象。最终工作树已包含 Snapshot/Transcript 上传提交、recipient-bound 选择与固定 S
+Transcript 分页；Windows runtime 也已接线 durable producer/outbox，Android 产品代码已接线
+独立分页 viewport。上述实现仍需主代理在最终工作树完成构建、故障注入和真实产品 E2E，且
+`terminal_snapshot_v1` 仍未被 Agent/Android 宣告，不能把代码存在理解为生产能力已启用。
 
 ### 6.9 租约一致性
 
@@ -575,7 +894,7 @@ Secret 优先使用 Docker Secret 文件；环境变量只保存非敏感值。�
 - Envelope 数量、字节数、路由延迟、ACK Lag、慢消费者断开；
 - Lease 申请/拒绝/过期数量；
 - REST 延迟、状态码、数据库连接池和任务积压；
-- Event Chunk/Snapshot 大小，不记录内容。
+- Event Chunk/Snapshot/Transcript 大小，不记录内容。
 
 日志字段允许：Trace ID、Device/Session 的不可逆短 Hash、消息类型、大小、耗时和错误码。禁止记录 Ciphertext、Token、完整公钥、标题、命令、终端正文和剪贴板内容。
 
@@ -640,7 +959,7 @@ flowchart LR
 - 每个终端引擎只有一个串行解析 Dispatcher，保持 VT 状态确定性；
 - View 刷新合并到一帧一次，避免每个字节触发重绘；
 - 切后台时停止无意义绘制，但继续接收有界缓冲或主动降级订阅；
-- 超过内存水位后请求快照恢复，不无限积压 UI 任务。
+- 超过内存水位后暂停/取消正文订阅并从安全 ACK 使用有界回放；只有双方协商并实际启用 `terminal_snapshot_v1` 后才允许改用快照恢复。
 
 ### 7.4 Termux Fork 集成
 
@@ -659,7 +978,7 @@ interface TerminalSessionPort {
 
 - Relay 输出调用 `TerminalEmulator.append`；
 - 键盘、鼠标、Paste 和终端查询响应通过 `write` 送入输入加密管线；
-- View 尺寸变化先计算稳定 Columns/Rows，经去抖后同时调用本地 `resize` 和远端 ConPTY resize；
+- View 尺寸变化先计算稳定 Columns/Rows，经去抖后同时调用本地 `resize` 和远端 terminal-main 异步通道 `ResizeAsync`；
 - Compose 使用 `AndroidView` 承载 TerminalView，页面其余区域保持 Compose；
 - 上游 Fork 以独立补丁集维护，每次同步 Termux 后运行全部 Golden Stream。
 
@@ -672,19 +991,19 @@ interface TerminalSessionPort {
 - 禁止文件访问、混合内容、任意导航和外部网络；
 - Kotlin 层负责登录、网络、密钥、Clipboard、URL 和下载策略；
 - Release 关闭 WebView 调试；
-- 引擎切换只能从快照 + 增量事件重新构建，不复制另一个引擎的私有状态。
+- 引擎切换只能从完整连续事件前缀重建；双方启用 `terminal_snapshot_v1` 后可改为认证快照 + S+1 增量事件，不能复制另一个引擎的私有状态。
 
 ### 7.6 本地缓存
 
 Android 保存：
 
 - 设备/会话非敏感摘要；
-- 最后连续 ACK 和 Snapshot 索引；
+- 最后连续 ACK、renderer generation，以及实验性 Snapshot 密文缓存与 renderer checkpoint 的原子绑定；
 - 用户允许的加密历史块；
 - UI 偏好和主题；
 - 设备密钥的 Keystore 引用。
 
-默认不保存输入正文。退出账号清除 Token 和可恢复的数据密钥；设备被撤销时立即锁定 UI、关闭连接并清理会话内存。
+默认不保存输入正文。Android 当前加密保存经过清理的 OIDC AuthState，用于进程重启后恢复登录；Windows 保存受保护的生产凭据并轮换 Refresh Token。普通退出清除当前 Token、实时连接与本地账号缓存，但不等同于删除服务端设备记录或撤销/解绑设备；重新登录同一账号可继续使用账号作用域的设备身份。设备被显式撤销时立即锁定 UI、关闭连接并清理不可继续使用的会话材料。各端独立“解绑此设备”入口及退出/撤销跨端一致性仍需发布构建验收。
 
 ### 7.7 Android 生命周期
 
@@ -694,12 +1013,13 @@ Android 保存：
 | 前台列表 | 降低输出订阅，仅接收摘要/通知；用户选择的监控会话除外 |
 | 后台短时 | 有界接收并 ACK，停止绘制 |
 | 后台长期 | 默认取消正文订阅，保留 Presence；可选前台监控服务 |
-| Doze/网络切换 | 恢复后用 ACK/Snapshot 重建 |
+| Doze/网络切换 | 恢复后从安全 ACK 重建；能力协商开启后可使用已认证并绑定的 Snapshot |
 | 被撤销/Token 失效 | 关闭 WS、清内存、进入重新认证页 |
 
 ### 7.8 输入与移动端键盘
 
-- 点击 Terminal 获取 IME 焦点，不显示普通文本输入框；
+- Terminal View 保留渲染与硬件键盘焦点；Android 16 软键盘通过标准命令输入框提交文本，
+  IME 修复已实现，但最新真实 LAN 命令 marker 尚未确认执行成功；
 - Extra Keys 默认提供 `Esc`、`Tab`、`Ctrl`、`Alt`、方向键和可配置按键；
 - Ctrl/Alt 使用一次性锁定和长按锁定两种状态，并有明确视觉反馈；
 - 多行粘贴显示行数、字符数和前几行预览，确认后形成一个 `input_id`；
@@ -745,18 +1065,24 @@ message Envelope {
 | 主题 | `theme_changed` |
 | 生命周期 | `session_started`, `session_interrupted`, `session_ended` |
 
+`SNAPSHOT_OFFER` 与 `SNAPSHOT_CHUNK` 的枚举值和方向 ACL 仅为 wire 兼容保留，
+Phase 1 不使用它们传输 `TerminalSnapshotV1`。Snapshot/Transcript 只经认证 REST
+元数据与对象存储 URL 获取。
+
 ### 8.3 顺序、ACK 与背压
 
 - PC 输出与 Android 输入使用独立方向序号；
 - 输出序号覆盖 Output、Resize、Title 和 Lifecycle，使回放顺序唯一；
 - ACK 为累计 ACK，可附带小型缺口范围用于快速重传；
 - Agent 保留最近 ACK 窗口和磁盘 Chunk；Relay 只保留短时内存缓冲；
+- Snapshot/Transcript 对象只锚定已有序号，不占用 `Envelope.seq`，也不能插入 Realtime 有序流；
 - Android 解析队列超过软上限时发送 `flow_control`；Agent 降低批次频率但不能改变字节顺序；
-- 达到硬上限时 Android 断开当前正文流并从快照恢复，不能随意丢弃中间 VT 字节。
+- 达到硬上限时 Android 断开当前正文流并从安全 ACK 恢复；只有已协商并启用 `terminal_snapshot_v1` 时才能从认证快照 S 恢复，不能随意丢弃中间 VT 字节。
 
 ### 8.4 快照格式
 
-跨设备快照不能使用 xterm.js/Termux 私有序列化。`TerminalSnapshotV1` 至少包含：
+跨设备快照不能使用 xterm.js/Termux 私有序列化。Phase 1
+`TerminalSnapshotV1` 是规范化的 parser/renderer checkpoint，至少包含：
 
 ```text
 snapshot_seq, columns, rows
@@ -765,12 +1091,26 @@ modes(alt_screen, origin, wrap, mouse, bracketed_paste)
 scroll_region
 palette + default colors
 visible cells(codepoints, width, style, fg, bg)
-bounded transcript rows
+primary and alternate visible rows
 title
 format_version
 ```
 
-Snapshot 与 Columns/Rows 绑定。应用快照后只能继续消费 `snapshot_seq + 1` 之后的事件。MVP 可先回放有界原始事件流，规范化快照在兼容性验证后启用。
+Snapshot 与 Columns/Rows 绑定，并同时保存主/备用屏幕、光标与 saved cursor、
+模式、边距、charset、tab stop、palette/style、pending-wrap、title 和 lifecycle
+projection。Phase 1 的 `scrollback_rows` 必须为空，不允许截取 raw VT 尾部伪造最后一屏；
+更早的主屏行只来自独立 `TerminalTranscriptPageV1` REST 对象。
+
+Snapshot S 应用后只能继续消费 S+1 及之后的实时事件。Transcript Page 以固定
+`as_of_snapshot_seq=S` 和排他的 `before_line_id` 向前分页，每页最多 200 行；它是只读
+行投影，不是 parser state，不能 prepend 到 live parser，也不能改变实时 ACK。
+
+字段分配、严格验证和 C#/Kotlin 共享 golden vector 已存在，但 runtime 仍未启用：
+
+- Android Release 的 `TERMLINK_TERMINAL_SNAPSHOT_RUNTIME` 强制为 `false`；Debug 默认也是 `false`，只允许用显式 Gradle 属性进行实验；
+- Windows 最终工作树已包含 DPAPI write-through per-frame WAL、portable producer、持久 outbox、逐接收设备 seal 和 Transcript-first/Snapshot-last uploader 接线；Android 已包含产品 bootstrap 与独立 Transcript viewport，但这些并行改动仍待主代理最终构建和 E2E 验证；
+- saved auto-wrap、saved DEC private-mode bank、DECSACE、title stack 的无损表示或 producer 明确拒绝，以及完整 Windows producer/Android importer 等价语料，仍是 capability enablement blockers；
+- 任一端在这些门槛满足前都不得宣告 `terminal_snapshot_v1`、上传这些对象，或用快照推进生产 ACK。生产恢复继续使用 `bounded_event_replay_v1`。
 
 ### 8.5 主题协议
 
@@ -793,26 +1133,27 @@ PC Agent 只提取 Windows Terminal Scheme 与安全的显示字段，不上传�
 ### 8.6 版本兼容
 
 - `protocol_version` 控制信封破坏性变更；
-- `capabilities` 独立声明 `snapshot_v1`、`osc8`、`mouse_1003`、`win32_input_mode` 等能力；
+- `capabilities` 独立声明 `terminal_snapshot_v1`、`osc8`、`mouse_1003`、`win32_input_mode` 等能力；
 - 未知可选消息可忽略，未知必需能力必须拒绝并给出升级提示；
 - Server 与 Agent/Android 至少兼容前一正式版本；
 - 每个发布版本保留固定 Golden Capture 与跨版本连接测试。
 
 ## 9. 安全与密码学设计
 
-### 9.1 设备信任与配对
+### 9.1 账号归属、设备证明与撤销
 
-1. 设备首次登录 OIDC 后生成设备密钥对并向服务端登记公钥。
-2. 服务端把新设备标记为 `PENDING`，不授予 PC 或会话访问权。
-3. PC 或已有 Manager 展示短验证码/二维码，其中包含 Device ID、公钥指纹、一次性 Challenge 和过期时间。
-4. 双方确认后，批准设备对指定 PC 的 Grant；审计日志记录批准者与结果。
-5. 后续每次连接同时证明 OIDC 身份和设备私钥持有权。
+1. Windows Agent 与 Android 分别登录 OIDC；服务端以规范化 issuer + subject 映射同一 TermLink 账号。
+2. 设备首次登录后生成独立设备密钥对、登记公钥，并在当前首版策略下自动成为该账号内可用设备。
+3. 同账号、未撤销设备可直接发现 PC 与受管 Session，并建立逐设备 E2EE 接收关系；不需要短码/二维码、用户自授信或逐 PC Grant。
+4. 每次 REST/Realtime 连接同时证明 OIDC 账号身份和设备私钥持有权。服务端在列表、路由、历史和密钥接收方选择上都强制 `user_id`/subject 账号隔离。
+5. 远程输入另行申请短时 Session Lease；PC 本地策略、本地键盘抢占和设备撤销均可拒绝或终止输入。
+6. 显式撤销设备后关闭现有连接、拒绝后续设备证明，并停止向其分发新 Key Epoch 的材料。
 
-二维码不是永久登录凭据，默认 5 分钟过期并只能使用一次。
+旧 `PENDING/TRUSTED` 状态、pairing challenge、二维码/短码和 `device_grants` 表/API 仍可用于兼容旧客户端或旧部署，但不得出现在当前产品主流程。兼容路径使用的短时挑战仍应单次使用、默认 5 分钟过期并写安全审计。
 
 ### 9.2 会话密钥
 
-- 每台 PC 与每个已批准 Android 使用 X25519 建立共享材料；
+- 每台 PC 与每个同账号、未撤销 Android 使用 X25519 建立独立共享材料；
 - 通过 HKDF 派生账号/设备通道密钥，再为每个 Session、方向和 Key Epoch 派生子密钥；
 - 输出和输入方向使用不同密钥；
 - Nonce 必须在同一 Key 下唯一，可由随机前缀 + 单调序号构成；
@@ -825,7 +1166,7 @@ PC Agent 只提取 Windows Terminal Scheme 与安全的显示字段，不上传�
 
 | 威胁 | 对策 |
 | --- | --- |
-| 账号 Token 泄露 | 设备私钥二次证明、新设备待批准、短 Access Token |
+| 账号 Token 泄露 | 设备私钥二次证明、短 Access Token、异常登录告警和设备显式撤销；账号级自动接入带来的风险须单独审计 |
 | Relay/数据库泄露 | E2EE、密文 Blob、元数据最小化 |
 | 重放远程命令 | Direction Seq、AEAD、唯一 `input_id`、Agent 去重 |
 | 旧设备继续访问 | 撤销广播、断连接、Key Epoch 轮换 |
@@ -844,14 +1185,15 @@ PC Agent 只提取 Windows Terminal Scheme 与安全的显示字段，不上传�
 
 ## 10. 会话记录、历史与回放
 
-### 10.1 事件类型
+### 10.1 有序事件与 REST 历史对象
 
 | 类型 | 内容 | 默认持久化 |
 | --- | --- | --- |
-| `output` | ConPTY 原始字节 | PC 本地是 |
+| `output` | terminal-main 异步通道输出（UTF-16 code unit，按版本编码后传输） | PC 本地是 |
 | `input` | 本地或远端输入 | 否 |
 | `resize` | Columns/Rows 和像素单元信息 | 是 |
-| `snapshot` | 版本化终端状态 | 是 |
+| `terminal_snapshot_v1` | 锚定已有序号 S 的规范化终端 checkpoint；REST 历史对象，不消耗 `Envelope.seq` | Runtime 关闭 |
+| `terminal_transcript_page_v1` | 固定 S 的只读主屏历史行分页；REST 历史对象，不进入 parser | Runtime 关闭 |
 | `title` | 标题变化 | 可配置，敏感 |
 | `lifecycle` | 创建、中断、恢复、退出码 | 是 |
 | `control` | 租约变化 | 仅元数据 |
@@ -865,13 +1207,45 @@ PC Agent 只提取 Windows Terminal Scheme 与安全的显示字段，不上传�
 - 默认 PC 本地保留 7 天；云历史默认关闭；
 - 输入正文不进入 Event Chunk，除非用户明确开启并接受风险。
 
-### 10.3 回放
+### 10.3 最后一屏与上滑分页
 
-- 打开长会话先选取目标时间之前最近 Snapshot；
-- 应用 Snapshot 后按序回放 Event Chunk；
-- 用户拖动时间轴时使用最近 Snapshot 跳转，不从会话开头逐字重放；
-- 回放模式严格只读，键盘输入不会发送到已退出会话；
-- 搜索在 Android 解密后的本地缓冲执行，Relay 不建立明文索引。
+打开实时会话时只恢复 Snapshot S 中的主/备用可见屏幕；Phase 1 Snapshot 的
+`scrollback_rows` 必须为空，首屏不主动下载任何 Transcript Page。用户上滑后才以安装
+Snapshot 的固定 S 请求更早行，不能随着实时 ACK 增长而改变该分页锚点：
+
+```mermaid
+flowchart TB
+    subgraph LIVE[Realtime ordered stream]
+        WS[WebSocket Envelope S+1 onward] --> ORDER[Decrypt reorder and deduplicate]
+        ORDER --> PARSER[Live Termux parser]
+        PARSER --> CANVAS[Live terminal surface]
+        PARSER --> ACK[Commit live cumulative ACK after apply]
+    end
+
+    subgraph HISTORY[REST transcript browsing]
+        OPEN[Install Snapshot S last visible screen] --> PIN[Pin as_of_snapshot_seq to S]
+        PIN --> NONE[Initial transcript page set is empty]
+        NONE --> SCROLL[User scrolls upward]
+        SCROLL --> QUERY[REST select page before exclusive line cursor at fixed S]
+        QUERY --> DOWNLOAD[Download TerminalTranscriptCiphertextV1]
+        DOWNLOAD --> VALIDATE[Verify decrypt and validate page]
+        VALIDATE --> PAGE[Insert rows into independent history viewport]
+        PAGE --> MORE{has_more_before}
+        MORE -->|yes| CURSOR[Use next_before_line_id]
+        CURSOR --> QUERY
+        MORE -->|no| START[Show beginning of retained history]
+    end
+
+    PAGE --> RULE[Do not prepend cells or raw bytes to live parser]
+    RULE --> STABLE[Keep live ACK unchanged]
+    CANVAS -. live output may continue while browsing .-> PAGE
+```
+
+- `TerminalTranscriptPageV1` 只包含主屏 sealed rows，Phase 1 不把备用屏幕行当作 transcript；
+- 每页行按 `line_id` 从旧到新排序，`before_line_id` 为排他游标，`sealed_at_seq <= S`；
+- 独立 history viewport 可以缓存、搜索和丢弃页面，但不得重建 raw VT 后喂给 live parser；
+- 浏览期间 Realtime 可以继续应用 S+1、S+2 等事件并正常推进 ACK，历史 viewport 的固定 S 与实时 ACK 互不影响；
+- 已退出会话的时间轴回放同样只读；搜索只在 Android 解密后的本地数据执行，Relay 不建立明文索引。
 
 ## 11. UI/UX 总体设计
 
@@ -959,37 +1333,36 @@ flowchart TB
 | 屏幕 | 核心内容 | 主操作 |
 | --- | --- | --- |
 | 启动/登录 | 品牌、价值、OIDC 登录、自托管地址 | 登录 |
-| 设备批准 | PC/手机名称、公钥指纹、短码、权限 | 批准/拒绝 |
 | 设备首页 | PC 分组、在线状态、运行会话、最近活动 | 打开 PC/新建会话 |
 | PC 详情 | Presence、策略、运行中/历史会话 | 进入会话 |
 | Terminal | 状态、终端画布、Extra Keys、租约 | 观察/申请控制 |
 | 会话信息 | Shell、尺寸、延迟、创建时间、引擎 | 重命名/归档/终止 |
 | 历史回放 | Terminal、时间轴、速度、搜索 | 跳转/导出允许内容 |
-| 活动 | 登录、配对、租约、撤销、会话生命周期 | 查看详情 |
-| 可信设备 | 手机/PC、权限、最后活动 | 降权/撤销 |
+| 活动 | 登录、设备注册/撤销、租约、会话生命周期 | 查看详情 |
+| 设备安全（待完善） | 同账号手机/PC、最后活动、撤销状态 | 显式撤销；不做配对/Grant |
 | 设置 | 外观、终端、历史、安全、通知、诊断 | 保存 |
-| 会员与配额 | 当前方案、PC/Session 用量、月付升级、恢复购买 | 订阅/管理会员 |
+| 会员与功能 | 当前方案、PC/Session 用量（不限）、月付升级、恢复购买 | 订阅/管理会员 |
 
 ### 11.7 设备首页线框
 
 ```text
 ┌──────────────────────────────────────┐
 │ TermLink                  搜索   头像 │
-│ Free · 1/1 台 PC · 实时会话 2/3      │
+│ Free · PC 不限 · 实时会话不限         │
 │                                      │
 │ 我的设备                              │
 │ ● OFFICE-PC                 在线  28ms│
 │   PowerShell · build-release   LIVE  │
 │   WSL · api-server            12m    │
 │                                      │
-│ 🔒 添加更多 PC                       │
-│   免费版已使用 1/1 · 升级月付会员    │
+│ ＋ 添加更多 PC                       │
+│   在 Windows Agent 登录同一账号       │
 │                                      │
 │ 设备              活动              设置│
 └──────────────────────────────────────┘
 ```
 
-列表直接展示最需要决策的信息：在线、延迟、权限和活动 Session。避免顶部 KPI 卡片占据空间。
+列表直接展示最需要决策的信息：在线、延迟和活动 Session。避免顶部 KPI 卡片占据空间，也不显示配对或 Grant 状态。
 
 ### 11.8 Terminal 页面线框
 
@@ -1050,7 +1423,7 @@ stateDiagram-v2
 
 - 顶部明确标记 `Replay`，避免用户误以为仍在 Live Session；
 - 底部时间轴显示会话开始、断线、恢复、退出和 Snapshot 点；
-- 默认 1×，支持 0.5×、2×、4×，拖动后从最近 Snapshot 恢复；
+- 默认 1×，支持 0.5×、2×、4×；启用 `terminal_snapshot_v1` 后拖动可从目标时间前最近 Snapshot 恢复，否则从可用的连续 Event Chunk 前缀回放；
 - 搜索结果显示本地匹配数和上/下一处；
 - 终端正文不会发送到服务端搜索；
 - 已退出会话不显示输入栏，只有“复制、搜索、跳转时间”。
@@ -1066,23 +1439,24 @@ stateDiagram-v2
 - 横屏和折叠屏使用双栏：左侧 Session，右侧 Terminal；
 - 所有颜色状态有文本/图标冗余；
 - 日期、数字、快捷键与 RTL 布局使用资源化格式；
-- 中文、英文作为首批语言，终端内容方向不随 App RTL 自动反转。
+- 中文、英文作为首批语言，终端内容方向不随 App RTL 自动反转；
+- 当前 Windows Tray 已实现跟随系统/中文/English 偏好；Android 已提供中英文资源并跟随系统，App 内固定语言切换和所有动态错误本地化仍待验收；Server 账号门户也必须按实际部署复核，不能用原型切换能力代替产品完成声明。
 
 ## 12. 会员、计费与权益设计
 
 ### 12.1 可配置套餐目录
 
-以下是首发预置值，不是客户端硬编码常量：
+以下为兼容性展示值，不是服务端数量限制，也不是客户端硬编码常量：
 
 | 权益 | Free（首发默认） | Pro Monthly（首发默认） |
 | --- | --- | --- |
-| 远程 PC | 1 台 | 5 台 |
-| 同时远程显示实时 Session | 3 个不同 Session | 20 个 |
+| 远程 PC | 不限数量 | 不限数量 |
+| 同时远程显示实时 Session | 不限数量 | 不限数量 |
 | Windows 本地 Shell | 不限制 | 不限制 |
-| E2EE、设备批准和撤销 | 完整 | 完整 |
+| E2EE、账号隔离、逐设备密钥和撤销 | 完整 | 完整 |
 | 计费 | 免费 | 月付、自动续费、可取消 |
 
-管理员可以配置 `plan_id`、展示名称、说明、计费周期、PC/实时 Session 额度、功能标记、渠道 Product ID、排序、可见平台、上下架时间和降级目标。套餐以 Catalog Version 发布；修改已售套餐时创建新版本，存量订阅保留购买时版本或按显式迁移策略升级，禁止静默改变已付费权益。
+管理员可以配置 `plan_id`、展示名称、说明、计费周期、功能标记、渠道 Product ID、排序、可见平台和上下架时间。历史 PC/实时 Session 数量字段仅为兼容保留，套餐以 Catalog Version 发布；修改已售套餐时创建新版本，存量订阅保留购买时版本或按显式迁移策略升级，禁止静默改变已付费权益。
 
 具体价格不写死在 App 或 Agent。Android 使用 Google Play Billing 返回本地化价格；Web/Windows 从服务端购买渠道返回价格。确认购买前必须展示实际货币、税费、周期、自动续费和取消方式。
 
@@ -1104,15 +1478,14 @@ PlanDefinition {
 }
 ```
 
-### 12.2 配额计数
+### 12.2 数量策略
 
-- PC 配额计算账号下启用远程路由的不同 `pc_id`；
-- 实时 Session 配额计算账号当前订阅正文的不同 `session_id`；
-- 同一个 Session 在同一账号多个 Android 页面显示时可按账号 + Session 去重；
-- 历史回放不占实时 Session 配额；
-- Android 进入后台并取消正文订阅后释放配额；
+- `max_remote_pcs` 与 `max_concurrent_live_sessions` 为历史数据库/API 字段，统一以 `-1` 表示 unlimited；
+- PC 注册只校验账号归属、Windows 类型、信任状态和 PC/设备 ID 一致性，不执行数量比较；
+- 实时 Session 订阅只在 Valkey 中登记短时活动成员并自动过期，不执行账号级计数或额度淘汰；
+- 同一个 Session 在同一账号多个 Android 页面仍可订阅；历史回放不改变实时订阅状态；
 - Windows 本地运行的 Shell 数量不受会员限制；
-- 当实时订阅达到当前 Entitlement 上限时返回 `ENTITLEMENT_LIMIT_REACHED`；首发 Free 配置下即为第四个会话。
+- 不再返回 `ENTITLEMENT_LIMIT_REACHED`，也不执行降级选择或超额清理。
 
 ### 12.3 权益模型
 
@@ -1121,8 +1494,8 @@ Entitlement {
   account_id
   plan_id
   plan_version
-  max_remote_pcs
-  max_concurrent_live_sessions
+  max_remote_pcs: -1
+  max_concurrent_live_sessions: -1
   effective_at
   expires_at
   grace_until
@@ -1132,7 +1505,7 @@ Entitlement {
 }
 ```
 
-客户端缓存 Entitlement 仅用于提前展示 UI，服务端在 PC Presence 注册和 Session Subscribe 时再次检查。Redis/Valkey 原子维护短时占用，PostgreSQL Entitlement 是权威来源。
+客户端缓存 Entitlement 仅用于展示；服务端在 PC Presence 注册和 Session Subscribe 时继续检查身份、设备和会话权限。Redis/Valkey 原子维护短时活动租约，PostgreSQL Entitlement 仅保留购买与功能标记元数据。
 
 ### 12.4 购买与同步
 
@@ -1152,12 +1525,12 @@ sequenceDiagram
     P-->>S: verified subscription
     S->>S: update subscription + entitlement version
     S-->>C: entitlement_changed
-    S-->>C: 新 PC/Session 配额生效
+    S-->>C: 新功能状态生效（PC/Session 数量始终不限）
 ```
 
 Android 发行版本遵守 Google Play Billing 规则。服务端通过 Real-time Developer Notifications/Webhook 与周期性对账同步续费、取消、退款和 Chargeback。
 
-### 12.5 生命周期与降级
+### 12.5 生命周期与状态变化
 
 ```mermaid
 stateDiagram-v2
@@ -1167,23 +1540,21 @@ stateDiagram-v2
     PurchasePending --> DefaultPlan: 取消/失败
     PaidActive --> Grace: 续费失败
     Grace --> PaidActive: 补扣成功
-    Grace --> FallbackOverLimit: 宽限期结束
-    FallbackOverLimit --> DefaultPlan: 按目标套餐选择保留配额
-    FallbackOverLimit --> PaidActive: 重新订阅
+    Grace --> DefaultPlan: 宽限期结束
 ```
 
 降级原则：
 
 1. 不终止任何 Windows 本地 Shell；
-2. 不删除 PC、设备授权、历史或密钥；
-3. 用户按目标套餐当前 Entitlement 额度选择要保留的 PC 和实时 Session；首发默认 Free 为 1 台和 3 个；
-4. 未选择前暂停新增远程订阅，现有超额订阅进入有限宽限，而不是随机断开；
+2. 不删除 PC、设备身份/撤销记录、历史或密钥；
+3. 不执行 PC/Session 数量降级选择、暂停或清理；
+4. 购买状态只影响可选功能和展示，不改变 PC/Session 数量；
 5. 安全入口、设备撤销、停止远程访问和数据删除始终免费可用。
 
 ### 12.6 多端 UI
 
-- Android：设备首页显示当前套餐与实际额度，会员页渲染服务端套餐目录、购买和恢复购买；
-- Windows：托盘显示紧凑配额，主窗口提供账户与会员页；
+- Android：设备首页显示当前套餐与“不限数量”，会员页渲染服务端套餐目录、购买和恢复购买；
+- Windows：托盘显示功能状态，主窗口提供账户与会员页；
 - Server Console：订阅与权益页管理套餐草稿、发布版本、Product ID 映射、Provider/Webhook、Subscription 和 Entitlement；
 - 完整布局稿见 [多端 UI 布局设计稿](UI_LAYOUT_DESIGNS.md)。
 
@@ -1193,12 +1564,12 @@ stateDiagram-v2
 | --- | --- | --- |
 | Relay 不可达 | 顶部 `正在重连`，保留最后画面 | 指数退避，PC 本地继续 |
 | PC 离线 | PC 行显示最后在线时间 | 停止订阅，允许打开历史 |
-| 输出缺口 | `History gap` 可解释提示 | 请求 Snapshot 并重置引擎 |
+| 输出缺口 | `History gap` 可解释提示 | 保持 ACK 不变；优先请求安全连续回放，协商启用后才允许从认证 Snapshot 重置引擎 |
 | 租约被本地夺回 | 底部提示具体原因 | 立即阻止新输入，清 Modifier 状态 |
 | 手机被撤销 | 全屏安全锁定 | 断 WS、清 Token/Key、跳登录 |
-| Terminal Engine 崩溃 | 保留 Session，提供重载/切换引擎 | 从 Snapshot 恢复，不重发输入 |
+| Terminal Engine 崩溃 | 保留 Session，提供重载/切换引擎 | 从完整连续前缀恢复；能力启用后可从已绑定 Snapshot 恢复，不重发输入 |
 | 历史为空 | 说明云历史默认关闭或没有记录 | 提供相关设置入口 |
-| 无 PC | 引导安装 Win-Agent 与配对 | 展示下载/二维码，不显示空 Dashboard |
+| 无 PC | 引导安装 Win-Agent 并登录同一 OIDC 账号 | 展示下载与登录说明，不显示配对/Grant 步骤 |
 
 ## 14. 测试与验收
 
@@ -1227,12 +1598,12 @@ stateDiagram-v2
 ### 14.3 网络、服务端与计费
 
 - 丢包、乱序、重复、慢消费者、Wi-Fi/蜂窝切换和 30 秒离线；
-- 同一 `input_id` 重复 100 次仍只写入 ConPTY 一次；
+- 同一 `input_id` 重复 100 次仍只调用 terminal-main 异步通道一次；
 - 多 Android 争抢租约、租约过期、PC 本地抢占；
 - Docker 首次启动、迁移、滚动升级、数据库恢复和对象删除；
-- 单账号 5 PC × 20 Session，持续 2 MB/s 压测；
+- 单账号多 PC × 多 Session，持续 2 MB/s 压测；
 - Relay 日志、DB、Redis、S3 和监控全链路明文扫描。
-- 使用首发 Free 默认配置时，第二台 PC 和第四个实时 Session 均被一致拒绝；修改套餐额度并发布后，各入口使用新 Entitlement 一致执行；
+- 同账号第二台及更多 PC、第四个及更多实时 Session 均可成功注册/订阅；
 - Google Play/Web 购买验证、重复 Webhook、乱序续费、取消、退款、Grace Period 和恢复购买；
 - 客户端篡改 `isPro`、过期缓存或重放 Purchase Token 均不能提升 Entitlement。
 
@@ -1246,7 +1617,7 @@ stateDiagram-v2
 
 ### 14.5 MVP 验收门槛
 
-1. Android 经批准后能发现至少三种 Shell 会话并实时显示。
+1. Android 与 Windows Agent 登录同一 OIDC 账号后，无配对、自授信或 Grant 即可发现至少三种受管 Shell 会话并实时显示；不同账号不可见且不可路由。
 2. 常见 ANSI、True Color、中文、光标和一个全屏 TUI 正确。
 3. 获得租约后文本、Enter、方向键、Ctrl+C 和 Paste 正常；只读输入可靠拒绝。
 4. 网络断开 30 秒后恢复，输出不乱序，输入不重复。
@@ -1254,30 +1625,58 @@ stateDiagram-v2
 6. Relay 停机时 Windows 本地会话正常运行。
 7. Docker Compose 能在全新主机启动、健康检查通过并完成备份恢复演练。
 8. Termux Fork 达到 ≥99% Golden Grid 门槛；未达门槛的会话可以安全切换 xterm.js 回退。
-9. 首发 Free 默认严格执行 1 台 PC、3 个同时实时 Session；发布套餐新版本或验证购买后，无须重新登录即可刷新权益。
-10. 会员到期和退款不会结束本地 Shell，超额远程能力按选择/宽限规则降级。
+9. 首发 Free 与 Pro 均可注册不限数量 PC、同时订阅不限数量实时 Session；接口返回 `-1` 表示不限。
+10. 会员到期和退款不会结束本地 Shell、删除设备或清理实时订阅。
+
+### 14.6 Tail-first 七项原始需求验收矩阵
+
+下表是上线门，不是当前通过声明。`结果/证据` 由主代理在最终代码、Debug APK、真实 Windows
+受管会话、生产 Relay/History 和冷启动 Android 环境上完成验证后填写；模块单测、固定夹具、
+LAN Replay 或文档中的设计图不能替代该结果。
+
+| ID | 原始需求 | 可观测验收 | 结果/证据 |
+| --- | --- | --- | --- |
+| TF-01 | Windows durable producer | 1000 个唯一 marker 均先进入可恢复 `LocalFrame`/WAL；每个接收设备均为 Transcript 先提交、Snapshot S 最后提交，崩溃重试不产生冲突对象。 | 待主代理最终验证；证据路径待填 |
+| TF-02 | Android S/S+1 bootstrap | 产品路径完成 select/download/verify/prepare/cache/bind/install，随后以 S 订阅且首个新事件为 S+1；任何预绑定失败不推进 ACK。 | 待主代理最终验证；证据路径待填 |
+| TF-03 | 首次仅最后一屏 | 初次打开恰有一个 Snapshot、本地 Transcript/Event Chunk 均为 0；marker 1000 可见且 marker 0001 不可见。 | 待主代理最终验证；证据路径待填 |
+| TF-04 | 顶部越界分页 | 每个真实上滑手势只前移一页且最多载入 200 行；锚点始终为 S，页面只进入独立 viewport，S 与 live ACK 均不因分页改变。 | 待主代理最终验证；证据路径待填 |
+| TF-05 | 浏览历史时实时继续 | 历史 overlay 打开期间新 marker 使 live ACK 前进；关闭 overlay 返回实时尾部并显示该 marker，历史 viewport 不污染 live parser。 | 待主代理最终验证；证据路径待填 |
+| TF-06 | 同账号多 Android 接收方隔离 | 至少两台未撤销 Android 各自只能选择、下载和解密自己的 Snapshot/Transcript；交叉 URL、对象 ID、密钥或缓存均被拒绝。 | 待主代理最终验证；证据路径待填 |
+| TF-07 | 失败回退、双语与布局 | 缺对象、篡改、Key Epoch 错误、安装失败、缺 S+1、分页失败均 fail closed 并按设计回退；中英文状态完整；Terminal/底栏在显示区内、互不重叠且位于可见 IME 上方。 | 待主代理最终验证；证据路径待填 |
 
 ## 15. 交付阶段
 
-### 阶段 0：兼容性验证（1～2 周）
+### 阶段 0：terminal-main 异步通道兼容性验证（1～2 周）
 
-- 扩展现有 ConPTY Probe，录制 Golden Stream；
+- 以 terminal-main 的 `ITerminalConnection` Mock/真实连接录制 Golden Stream；旧 ConPTY Probe 仅作为迁移前对照；
 - 建立 Termux Fork 最小 Android Harness；
-- 验证双层 PTY、控制键、TUI、IME、鼠标和配色；
+- 验证异步通道、控制键、TUI、IME、鼠标、取消/关闭竞态和配色；
 - 输出明确的不兼容清单。
 
-### 阶段 1：本地闭环（3～4 周）
+### 阶段 1：terminal-main 到 Agent 的本地闭环（3～4 周）
 
-- Win-Agent、Session Host、Named Pipe 和本地加密 Buffer；
+- terminal-main AsyncTerminalChannel、Agent 桥接、本地授权通道和本地加密 Buffer；
 - Android `RemoteTerminalSession`、设备/Session UI；
 - 测试 Relay 上完成实时显示、输入、ACK、Snapshot 和恢复。
+
+2026-08-15 本轮已完成阶段 0 及阶段 1 的本地代码骨架：`termForward/terminal-main` 的
+`AsyncTerminalChannel` 已连接 `ITerminalConnection`，提供有界异步输入、输出、resize、
+状态、取消和幂等关闭；Windows Agent 已加入 `TerminalMainChannelBridge`，验证 UTF-16
+跨块编码、提交后累计 ACK、Gap 和损坏输入统计。进程内注册、本地授权通道、DPAPI Buffer
+进程注册、认证 IPC、可重放/幂等持久化 sink、Registry 接入和公网生产 runtime 切换仍未完成；旧 SessionHost/ConPTY 结果继续只作为迁移前对照。
 
 截至 2026-08-04 的实施状态（不改变上述生产设计）：Host-Agent IPC、DPAPI Buffer、
 Session Registry、正式 .NET 8 Agent/SessionHost/Tray/Updater、DPAPI 注册索引和 20 个真实
 ConPTY Session 的 Agent 强制结束/受控重启恢复已经验证。Android 状态机及 Android → Docker
 临时双向测试 Relay → 真实 Termux View 的 ACK、断线恢复、输入 accepted、测试租约、Flow Control、
 History Gap 和 exited 也已验证。测试链路使用隔离的明文 `TLT1` 格式，不是生产
-Protobuf/Relay/E2EE；可移植 Snapshot 仍未冻结，也未用 Termux 私有状态替代。Updater 已用
+Protobuf/Relay/E2EE。`TerminalSnapshotV1`/`TerminalTranscriptPageV1` 的 Phase 1 字段、
+严格校验规则和 C#/Kotlin 共享 golden vector 已冻结；最终工作树已包含 Android
+crypto/domain decoder、detached prepare/install、checkpoint/ACK 原子绑定、独立 Transcript
+viewport，以及 Windows durable `LocalFrame` producer、逐接收设备 seal 和
+Snapshot/Transcript ordered uploader 的 runtime 接线。Release 开关仍强制为 `false`，Agent/
+Android 仍未宣告 `terminal_snapshot_v1`；这些并行改动必须由主代理完成最终构建、故障矩阵和
+真实产品 E2E 后才能更新状态。Updater 已用
 两个真实开发签名 MSIX 验证签名清单、身份/版本/哈希、篡改拒绝和故障回滚状态机；第 7 项
 还在临时 `LocalMachine/TrustedPeople` 开发信任下完成真实 AppX 安装、包身份启动、更新、
 降级和卸载。生产发布证书链与实际登录周期仍未外部验收。
@@ -1285,7 +1684,7 @@ Protobuf/Relay/E2EE；可移植 Snapshot 仍未冻结，也未用 Termux 私有�
 ### 阶段 2：Docker 服务端与账号（3～4 周）
 
 - Go API/Relay、PostgreSQL、Redis/Valkey 和 Compose；
-- OIDC、设备注册、配对、Grant、Lease 和撤销；
+- OIDC、同账号设备自动注册/直连、账号隔离、Lease 和撤销；旧 pairing/Grant 仅做兼容回归；
 - E2EE、Key Epoch、审计与无正文可观测性。
 
 ### 阶段 3：产品化（3～5 周）
@@ -1340,7 +1739,7 @@ Termux Fork 可以使用 Git Subtree/Submodule + Patch Queue，也可以镜像�
 | 决策 | 默认值 |
 | --- | --- |
 | 目标用户 | 个人多设备用户，兼顾小型团队未来扩展 |
-| 远程访问 | 新设备必须批准 |
+| 远程访问 | 同 OIDC 账号、未撤销设备直接访问；无需配对或 Grant |
 | 远程首次控制 | 首次需要 PC 本地确认；之后按 PC 策略 |
 | 本地优先 | 始终开启 |
 | PC 本地历史 | 7 天 |
@@ -1350,21 +1749,22 @@ Termux Fork 可以使用 Git Subtree/Submodule + Patch Queue，也可以镜像�
 | Android 默认引擎 | Termux Fork |
 | 兼容回退 | xterm.js 离线 WebView |
 | 自托管 | Docker Compose 官方支持 |
-| 首发 Free 默认配额 | 1 台远程 PC、同时 3 个不同 Session |
+| 首发 Free 默认配额 | PC 与实时 Session 均不限数量（API 为 `-1`） |
 | 首发付费套餐 | Pro Monthly，月付自动续费、可取消 |
 | 套餐配置 | 名称、周期、权益、渠道映射、排序和上下架均由服务端版本化发布 |
 | 客户端套餐逻辑 | 读取已发布 Catalog 和 Entitlement，不硬编码 Free/Pro 枚举 |
-| 会员降级 | 不终止本地 Shell；按目标套餐额度选择保留 PC 和实时 Session |
+| 会员状态变化 | 不终止本地 Shell；不执行 PC/Session 数量降级清理 |
 
 ## 18. 已知风险与下一项技术验证
 
-最高风险不再是 ConPTY 能否读写，而是：
+迁移阶段的主要风险包括旧 ConPTY/SessionHost 基线与新链路并存，以及：
 
 1. Session Host 双层 PTY 在 Windows Terminal 中的透明程度；
 2. Termux Fork 对 PowerShell/Windows ConPTY 边缘 VT 行为的兼容度；
 3. Android IME、复杂 Unicode 与高吞吐增量绘制；
 4. 多设备 E2EE 的历史密钥恢复和撤销语义；
-5. Docker 服务端慢消费者和大规模 WebSocket 路由。
+5. Docker 服务端慢消费者和大规模 WebSocket 路由；
+6. Windows Snapshot producer/uploader 与 Android 独立 Transcript viewport 已在最终工作树接线，但 producer/importer 等价语料、崩溃矩阵和真实 tail-first E2E 尚未达到 `terminal_snapshot_v1` 启用门槛。
 
 当前环境已经完成 Golden Stream → Termux/xterm.js 对照，以及 Android → Docker 临时测试
 Relay → Termux View 的双向闭环，以及正式 .NET 8 Agent/Tray、DPAPI 注册索引和 20 Session
@@ -1372,7 +1772,9 @@ Relay → Termux View 的双向闭环，以及正式 .NET 8 Agent/Tray、DPAPI �
 开发证书下的包结构、签名、更新输入、故障回滚以及真实 AppX 安装/更新/降级/卸载均已验证，
 演练只临时使用本机 TrustedPeople 并已清理。服务端 TLS、无正文指标、告警、备份恢复和镜像
 供应链也已完成本地验证。生产发布证书、真实域名 ACME、GitHub OIDC release tag、外部 Provider
-和实际登录周期仍需外部验收。兼容和安全评审完成后再冻结生产 Envelope 和可移植 Snapshot；
+和实际登录周期仍需外部验收。Snapshot/Transcript 对象合同和主要 runtime 接线已进入最终
+工作树，但生产能力必须等主代理确认构建、Windows producer/Android importer 等价语料、
+崩溃边界、S+1 并发和七项真实产品 E2E 全部通过后再启用；
 arm64 真机、厂商 IME、外接键鼠与更多屏幕形态仍需真实硬件验证。
 
 ## 19. 关联文档

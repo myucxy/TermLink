@@ -23,6 +23,8 @@ artifacts/
 
 # Local tooling
 .idea/
+**/.codex/
+.tmp-*.json
 *.log
 Thumbs.db
 .DS_Store

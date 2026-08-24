@@ -417,7 +417,7 @@ function Assert-StartupDeclaration {
     Assert-True ($null -ne $startup) 'Installed package does not declare a desktop startup task.'
     Assert-True ($startup.GetAttribute('TaskId') -eq 'TermLinkTrayStartup') 'Startup task ID is incorrect.'
     Assert-True ($startup.GetAttribute('Enabled') -eq 'true') 'Startup task is not enabled by default.'
-    Assert-True ($startup.ParentNode.GetAttribute('Executable') -eq 'TermLink.Tray.exe') `
+    Assert-True ($startup.ParentNode.GetAttribute('Executable') -eq 'TermLink.exe') `
         'Startup task does not launch the installed Tray executable.'
     return $true
 }
@@ -584,7 +584,7 @@ function Invoke-TrayHealth {
         [Parameter(Mandatory)][hashtable]$TrackedProcesses,
         [Parameter(Mandatory)][string]$StatusPath
     )
-    $trayPath = Join-Path $Package.InstallLocation 'TermLink.Tray.exe'
+    $trayPath = Join-Path $Package.InstallLocation 'TermLink.exe'
     Assert-True (Test-Path -LiteralPath $trayPath -PathType Leaf) 'Installed Tray executable is missing.'
     $appUserModelID = "shell:AppsFolder\$($Package.PackageFamilyName)!TermLinkTray"
     Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList $appUserModelID | Out-Null
@@ -640,7 +640,7 @@ function Invoke-TerminalAliasHealth {
     $expectedHostPath = Join-Path $Package.InstallLocation 'TermLink.SessionHost.exe'
     Assert-True (Test-Path -LiteralPath $expectedHostPath -PathType Leaf) `
         'The installed SessionHost executable is missing.'
-    $trayPath = Join-Path $Package.InstallLocation 'TermLink.Tray.exe'
+    $trayPath = Join-Path $Package.InstallLocation 'TermLink.exe'
     Assert-True (Test-Path -LiteralPath $trayPath -PathType Leaf) `
         'The installed Tray executable is missing.'
 
@@ -791,7 +791,7 @@ function Invoke-TerminalAliasHealth {
 
 function Stop-PackagedAgent {
     param([Parameter(Mandatory)]$Package)
-    $trayPath = Join-Path $Package.InstallLocation 'TermLink.Tray.exe'
+    $trayPath = Join-Path $Package.InstallLocation 'TermLink.exe'
     if (-not (Test-Path -LiteralPath $trayPath -PathType Leaf)) { return }
     try {
         [void](Invoke-InPackageContext -Package $Package -Command $trayPath -Arguments @('--shutdown-agent'))

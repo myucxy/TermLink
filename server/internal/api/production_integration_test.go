@@ -233,7 +233,12 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	signedJSON(t, server.URL, android, http.MethodGet, "/v1/pcs/"+pcID.String()+"/grants", nil, "", http.StatusForbidden)
 	signedJSON(t, server.URL, pc, http.MethodPut, "/v1/sessions/"+sessionID.String(), map[string]any{"pc_id": pcID, "shell_type": "pwsh", "title_cipher": "", "state": "RUNNING", "columns": 100, "rows": 30, "last_output_seq": 0}, "upsert-session", http.StatusOK)
 	signedJSON(t, server.URL, pc, http.MethodPut, "/v1/sessions/"+historySessionID.String(), map[string]any{"pc_id": pcID, "shell_type": "pwsh", "title_cipher": "", "state": "RUNNING", "columns": 100, "rows": 30, "last_output_seq": 0}, "upsert-history-session", http.StatusOK)
-	testHistoryUpload(t, server.URL, pc, historySessionID, s3Endpoint, s3Region, s3AccessKey, s3SecretKey)
+	signedJSON(t, server.URL, pc, http.MethodDelete, "/v1/sessions/"+historySessionID.String(), nil, "reject-active-history-session-delete", http.StatusConflict)
+	signedJSON(t, server.URL, pc, http.MethodPut, "/v1/sessions/"+historySessionID.String(), map[string]any{
+		"pc_id": pcID, "shell_type": "pwsh", "title_cipher": "", "state": "EXITED",
+		"columns": 100, "rows": 30, "last_output_seq": 0, "ended_at": time.Now().UTC(),
+	}, "exit-history-session", http.StatusOK)
+	testHistoryUpload(t, server.URL, pc, android, historySessionID, s3Endpoint, s3Region, s3AccessKey, s3SecretKey)
 	leaseOne := signedJSON(t, server.URL, android, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/lease", map[string]any{}, "lease-repeat", http.StatusCreated)
 	leaseTwo := signedJSON(t, server.URL, android, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/lease", map[string]any{}, "lease-repeat", http.StatusCreated)
 	if leaseOne["lease_id"] != leaseTwo["lease_id"] {
@@ -411,7 +416,7 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 
 func assertProductionMigrations(t *testing.T, repository *store.Postgres) {
 	t.Helper()
-	rows, err := repository.Pool.Query(context.Background(), `SELECT version,name FROM schema_migrations WHERE version BETWEEN 1 AND 8 ORDER BY version`)
+	rows, err := repository.Pool.Query(context.Background(), `SELECT version,name FROM schema_migrations WHERE version BETWEEN 1 AND 15 ORDER BY version`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,6 +433,13 @@ func assertProductionMigrations(t *testing.T, repository *store.Postgres) {
 		{6, "000006_account_roles.up.sql"},
 		{7, "000007_android_self_trust.up.sql"},
 		{8, "000008_windows_bootstrap_fence.up.sql"},
+		{9, "000009_unlimited_account_resources.up.sql"},
+		{10, "000010_same_account_direct_access.up.sql"},
+		{11, "000011_history_paging.up.sql"},
+		{12, "000012_history_recipients.up.sql"},
+		{13, "000013_history_recipient_backfill_hardening.up.sql"},
+		{14, "000014_transcript_history.up.sql"},
+		{15, "000015_session_automatic_cleanup.up.sql"},
 	}
 	index := 0
 	for rows.Next() {
@@ -455,12 +467,13 @@ type integrationPresignedRequest struct {
 	Headers map[string][]string `json:"headers"`
 }
 
-func testHistoryUpload(t *testing.T, root string, pc testDevice, sessionID uuid.UUID, s3Endpoint, s3Region, s3AccessKey, s3SecretKey string) {
+func testHistoryUpload(t *testing.T, root string, pc, recipient testDevice, sessionID uuid.UUID, s3Endpoint, s3Region, s3AccessKey, s3SecretKey string) {
 	t.Helper()
 	ciphertext := []byte("production-history-ciphertext-v1")
 	digest := sha256.Sum256(ciphertext)
+	historyKeyID := fmt.Sprintf("history-v1:%s:%08d", strings.ReplaceAll(recipient.id.String(), "-", ""), 1)
 	createBody := map[string]any{
-		"kind": "CHUNK", "key_id": "epoch-0001", "ciphertext_sha256": base64.RawURLEncoding.EncodeToString(digest[:]),
+		"kind": "CHUNK", "key_id": historyKeyID, "ciphertext_sha256": base64.RawURLEncoding.EncodeToString(digest[:]),
 		"size_bytes": len(ciphertext), "start_seq": 1, "end_seq": 3,
 	}
 	created := signedJSON(t, root, pc, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/history/uploads", createBody, "history-upload-valid", http.StatusCreated)
@@ -496,7 +509,7 @@ func testHistoryUpload(t *testing.T, root string, pc testDevice, sessionID uuid.
 	}
 	expectedDigest := sha256.Sum256(expected)
 	badCreate := signedJSON(t, root, pc, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/history/uploads", map[string]any{
-		"kind": "CHUNK", "key_id": "epoch-0002", "ciphertext_sha256": base64.RawURLEncoding.EncodeToString(expectedDigest[:]),
+		"kind": "CHUNK", "key_id": historyKeyID, "ciphertext_sha256": base64.RawURLEncoding.EncodeToString(expectedDigest[:]),
 		"size_bytes": len(expected), "start_seq": 4, "end_seq": 5,
 	}, "history-upload-mismatch", http.StatusCreated)
 	badUploadID := badCreate["upload_id"].(string)
@@ -506,18 +519,27 @@ func testHistoryUpload(t *testing.T, root string, pc testDevice, sessionID uuid.
 	signedJSON(t, root, pc, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/history/uploads/"+badUploadID+"/commit", nil, "history-commit-mismatch", http.StatusUnprocessableEntity)
 
 	signedJSON(t, root, pc, http.MethodDelete, "/v1/sessions/"+sessionID.String(), nil, "delete-history-session", http.StatusNoContent)
-	request, err := http.NewRequest(http.MethodGet, download.URL, nil)
-	if err != nil {
-		t.Fatal("deleted history presigned URL was invalid")
-	}
-	applyPresignedHeaders(request, download.Headers)
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatalf("deleted history request transport failure (%T)", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusNotFound {
-		t.Fatalf("deleted history status=%d s3_code=%s", response.StatusCode, integrationS3Code(response.Body))
+	deleteDeadline := time.Now().Add(10 * time.Second)
+	for {
+		request, err := http.NewRequest(http.MethodGet, download.URL, nil)
+		if err != nil {
+			t.Fatal("deleted history presigned URL was invalid")
+		}
+		applyPresignedHeaders(request, download.Headers)
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatalf("deleted history request transport failure (%T)", err)
+		}
+		if response.StatusCode == http.StatusNotFound {
+			response.Body.Close()
+			break
+		}
+		code := integrationS3Code(response.Body)
+		response.Body.Close()
+		if time.Now().After(deleteDeadline) {
+			t.Fatalf("deleted history status=%d s3_code=%s", response.StatusCode, code)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 

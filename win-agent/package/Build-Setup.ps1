@@ -2,13 +2,14 @@
 param(
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
     [string]$Version = '0.1.0.0',
-    [Parameter(Mandatory)]
     [string]$CertificatePath,
-    [Parameter(Mandatory)]
     [Security.SecureString]$CertificatePassword,
+    [ValidatePattern('^[0-9A-Fa-f]{40}$')]
+    [string]$CertificateThumbprint,
     [string]$TimestampUrl,
+    [switch]$AllowHttpTimestamp,
     [switch]$Development,
-    [string]$DotNetPath = (Join-Path $env:TEMP 'termlink-dotnet-sdk-8.0.303\dotnet.exe'),
+    [string]$DotNetPath,
     [string]$OutputPath = (Join-Path $PSScriptRoot "..\artifacts\TermLink-Setup-$Version.exe")
 )
 
@@ -18,6 +19,20 @@ Set-StrictMode -Version Latest
 function Assert-True {
     param([bool]$Condition, [string]$Message)
     if (-not $Condition) { throw $Message }
+}
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try { $hashBytes = $sha256.ComputeHash($stream) }
+        finally { $sha256.Dispose() }
+    }
+    finally { $stream.Dispose() }
+
+    return ([BitConverter]::ToString($hashBytes)).Replace('-', '').ToLowerInvariant()
 }
 
 function Find-WindowsSdkTool {
@@ -82,31 +97,54 @@ function Confirm-EmbeddedSignature {
     throw "Embedded signature verification failed for '$Path'."
 }
 
-$candidate = $DotNetPath
-if ($DotNetPath -eq 'dotnet') {
-    $temporarySdk = Join-Path $env:TEMP 'termlink-dotnet-sdk-8.0.303\dotnet.exe'
-    $sdks = & dotnet --list-sdks 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $sdks) {
-        if (Test-Path -LiteralPath $temporarySdk -PathType Leaf) { $candidate = $temporarySdk }
-    }
+$projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$dotNetPathWasExplicit = $PSBoundParameters.ContainsKey('DotNetPath')
+. (Join-Path $projectRoot 'scripts\Resolve-DotNetSdk.ps1')
+$candidate = Resolve-TermLinkDotNetSdk -ProjectRoot $projectRoot `
+    -DotNetPath $DotNetPath -DotNetPathWasExplicit:$dotNetPathWasExplicit
+$usesCertificateStore = -not [string]::IsNullOrWhiteSpace($CertificateThumbprint)
+$usesCertificateFile = -not [string]::IsNullOrWhiteSpace($CertificatePath) -or $null -ne $CertificatePassword
+Assert-True ($usesCertificateStore -xor $usesCertificateFile) `
+    'Specify exactly one signing source: CertificateThumbprint, or CertificatePath with CertificatePassword.'
+if ($usesCertificateFile) {
+    Assert-True (-not [string]::IsNullOrWhiteSpace($CertificatePath)) `
+        'CertificatePath is required when signing from a PFX file.'
+    Assert-True ($null -ne $CertificatePassword) `
+        'CertificatePassword is required when signing from a PFX file.'
+    Assert-True (Test-Path -LiteralPath $CertificatePath -PathType Leaf) `
+        "Signing certificate not found: $CertificatePath"
 }
-Assert-True (Test-Path -LiteralPath $candidate -PathType Leaf) ".NET SDK executable not found: $candidate"
-Assert-True (Test-Path -LiteralPath $CertificatePath -PathType Leaf) "Signing certificate not found: $CertificatePath"
 if (-not $Development) {
     Assert-True (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) `
         'A trusted RFC 3161 TimestampUrl is required for non-development installers.'
 }
 if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) {
-    $timestampUri = [Uri]$TimestampUrl
-    Assert-True ($timestampUri.IsAbsoluteUri -and $timestampUri.Scheme -eq 'https') `
-        'TimestampUrl must be an absolute HTTPS URL.'
+    $timestampUri = $null
+    $validTimestamp = [Uri]::TryCreate($TimestampUrl, [UriKind]::Absolute, [ref]$timestampUri)
+    if ($validTimestamp) {
+        $validTimestamp = -not [string]::IsNullOrWhiteSpace($timestampUri.Host) -and
+            [string]::IsNullOrEmpty($timestampUri.UserInfo) -and
+            ($timestampUri.Scheme -eq 'https' -or
+                ($timestampUri.Scheme -eq 'http' -and $AllowHttpTimestamp))
+    }
+    Assert-True $validTimestamp `
+        'TimestampUrl must be absolute HTTPS; HTTP additionally requires -AllowHttpTimestamp.'
 }
 
-$plainPassword = [Net.NetworkCredential]::new('', $CertificatePassword).Password
-$certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
-    [IO.Path]::GetFullPath($CertificatePath),
-    $plainPassword,
-    [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
+$plainPassword = $null
+if ($usesCertificateStore) {
+    $storePath = "Cert:\CurrentUser\My\$CertificateThumbprint"
+    Assert-True (Test-Path -LiteralPath $storePath -PathType Leaf) `
+        "Signing certificate was not found in CurrentUser/My: $CertificateThumbprint"
+    $certificate = Get-Item -LiteralPath $storePath
+}
+else {
+    $plainPassword = [Net.NetworkCredential]::new('', $CertificatePassword).Password
+    $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        [IO.Path]::GetFullPath($CertificatePath),
+        $plainPassword,
+        [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
+}
 try {
     Assert-True $certificate.HasPrivateKey 'The signing certificate does not contain a private key.'
     $now = [DateTime]::UtcNow
@@ -130,7 +168,6 @@ try {
     [IO.Directory]::CreateDirectory($layout) | Out-Null
     try {
         $projects = @(
-            'src\Agent\TermLink.Agent.csproj',
             'src\SessionHost\TermLink.SessionHost.csproj',
             'src\Tray\TermLink.Tray.csproj'
         )
@@ -147,6 +184,21 @@ try {
                 '-p:PublishSingleFile=false',
                 "-p:Version=$Version"
             )
+        }
+        # The Tray references Agent as an in-process runtime library. dotnet
+        # publish also copies the referenced Exe project's apphost and launch
+        # metadata; remove only those standalone entry-point files.
+        $standaloneAgentFiles = @(
+            'TermLink.Agent.exe',
+            'TermLink.Agent.deps.json',
+            'TermLink.Agent.runtimeconfig.json',
+            'TermLink.Agent.pdb'
+        )
+        foreach ($standaloneAgentFile in $standaloneAgentFiles) {
+            $standaloneAgentPath = Join-Path $layout $standaloneAgentFile
+            if (Test-Path -LiteralPath $standaloneAgentPath) {
+                Remove-Item -LiteralPath $standaloneAgentPath -Force
+            }
         }
         Invoke-Tool -FilePath $candidate -Arguments @(
             'publish', (Join-Path $PSScriptRoot '..\src\Updater\TermLink.Updater.csproj'),
@@ -165,22 +217,39 @@ try {
         Copy-Item -LiteralPath (Join-Path $updaterPublish 'TermLink.Updater.exe') `
             -Destination (Join-Path $layout 'TermLink.Updater.exe')
 
-        foreach ($name in @('TermLink.Agent.exe', 'TermLink.SessionHost.exe', 'TermLink.Tray.exe', 'TermLink.Updater.exe')) {
+        $expectedProductExecutables = @('TermLink.exe', 'TermLink.SessionHost.exe', 'TermLink.Updater.exe')
+        foreach ($name in $expectedProductExecutables) {
             Assert-True (Test-Path -LiteralPath (Join-Path $layout $name) -PathType Leaf) `
                 "Published executable is missing: $name"
         }
+        $publishedProductExecutables = @(Get-ChildItem -LiteralPath $layout -File -Filter 'TermLink*.exe' |
+            Select-Object -ExpandProperty Name)
+        Assert-True ($publishedProductExecutables.Count -eq $expectedProductExecutables.Count -and
+            @($publishedProductExecutables | Where-Object { $expectedProductExecutables -cnotcontains $_ }).Count -eq 0) `
+            "The setup contains an unexpected product executable: $($publishedProductExecutables -join ', ')"
+        foreach ($standaloneAgentFile in $standaloneAgentFiles) {
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $layout $standaloneAgentFile))) `
+                "The integrated setup must not ship standalone Agent entry-point file: $standaloneAgentFile"
+        }
+        Assert-True (Test-Path -LiteralPath (Join-Path $layout 'TermLink.Agent.dll') -PathType Leaf) `
+            'The integrated setup is missing the in-process Agent runtime assembly.'
         Assert-True (Test-Path -LiteralPath (Join-Path $layout 'coreclr.dll') -PathType Leaf) `
             'The setup payload is not self-contained.'
         [IO.File]::WriteAllBytes(
             (Join-Path $layout 'TermLink.UpdatePublisher.cer'),
             $certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
 
-        $signArguments = @('sign', '/fd', 'SHA256', '/f', [IO.Path]::GetFullPath($CertificatePath), '/p', $plainPassword)
+        $signArguments = if ($usesCertificateStore) {
+            @('sign', '/fd', 'SHA256', '/sha1', $CertificateThumbprint, '/s', 'My')
+        }
+        else {
+            @('sign', '/fd', 'SHA256', '/f', [IO.Path]::GetFullPath($CertificatePath), '/p', $plainPassword)
+        }
         if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) {
             $signArguments += @('/tr', $TimestampUrl, '/td', 'SHA256')
         }
         $ownedBinaries = @(Get-ChildItem -LiteralPath $layout -File |
-            Where-Object { $_.Name -match '^TermLink\..+\.(exe|dll)$' } | Sort-Object Name)
+            Where-Object { $_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' } | Sort-Object Name)
         Assert-True ($ownedBinaries.Count -ge 4) 'No TermLink binaries were found in the setup payload.'
         foreach ($binary in $ownedBinaries) {
             Invoke-Tool -FilePath $signTool -Arguments ($signArguments + @($binary.FullName))
@@ -219,7 +288,7 @@ try {
             SelfContained = $true
             EmbeddedPayload = $true
             SignedPayloadBinaries = $ownedBinaries.Count
-            Sha256 = (Get-FileHash -LiteralPath $resolvedOutput -Algorithm SHA256).Hash.ToLowerInvariant()
+            Sha256 = Get-Sha256Hex -Path $resolvedOutput
         }
     }
     finally {

@@ -2,6 +2,7 @@ package dev.termlink.terminal.termux
 
 import android.view.KeyEvent
 import com.termux.terminal.TerminalEmulator
+import com.termux.view.TerminalSessionPort
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.replay.GoldenStreamBundle
 import dev.termlink.terminal.replay.GoldenStreamReplayer
@@ -25,6 +26,16 @@ import kotlin.test.assertTrue
 
 class TermuxTerminalEngineTest {
     @Test
+    fun terminalSessionPortReturnsTheOuterEmulatorWithoutRecursing() {
+        val engine = TermuxTerminalEngine()
+        val field = engine.javaClass.getDeclaredField("sessionPort").apply { isAccessible = true }
+        val sessionPort = field.get(engine) as TerminalSessionPort
+
+        assertTrue(sessionPort.emulator === sessionPort.emulator)
+        engine.dispose()
+    }
+
+    @Test
     fun burstInputDoesNotDropBytesWhileCollectorIsBackpressured() = runTest {
         val engine = TermuxTerminalEngine()
         engine.setReadOnly(false)
@@ -47,15 +58,58 @@ class TermuxTerminalEngineTest {
     @Test
     fun remoteResizeDoesNotPublishAnOutboundViewSize() = runTest {
         val engine = TermuxTerminalEngine(TerminalSize(80, 24))
-        val outboundSize = async(start = CoroutineStart.UNDISPATCHED) {
-            withTimeoutOrNull(1) { engine.sizeEvents.take(1).toList().single() }
-        }
 
         engine.resize(120, 30)
 
         assertEquals(TerminalSize(120, 30), engine.currentSize())
-        assertEquals(null, outboundSize.await())
+        assertTrue(engine.sizeEvents.toList().isEmpty())
         engine.dispose()
+    }
+
+    @Test
+    fun phoneViewMeasurementNeverOverwritesTheRemoteGrid() = runTest {
+        val engine = TermuxTerminalEngine(TerminalSize(132, 43))
+        val field = engine.javaClass.getDeclaredField("sessionPort").apply { isAccessible = true }
+        val sessionPort = field.get(engine) as TerminalSessionPort
+
+        sessionPort.updateSize(37, 12, 9, 18)
+
+        assertEquals(TerminalSize(132, 43), engine.currentSize())
+        assertEquals(TerminalSize(132, 43), engine.authoritativeSize.value)
+        assertTrue(engine.sizeEvents.toList().isEmpty())
+        engine.dispose()
+    }
+
+    @Test
+    fun oscTitleAndGridRemainIsolatedPerEngine() = runTest {
+        val engineA = TermuxTerminalEngine(TerminalSize(80, 24))
+        val engineB = TermuxTerminalEngine(TerminalSize(100, 31))
+
+        engineA.feed(1, ByteBuffer.wrap("\u001b]0;alpha\u0007".encodeToByteArray()))
+        engineB.feed(1, ByteBuffer.wrap("\u001b]0;beta\u0007".encodeToByteArray()))
+        engineA.resize(132, 43)
+
+        assertEquals("alpha", engineA.title.value)
+        assertEquals("beta", engineB.title.value)
+        assertEquals(TerminalSize(132, 43), engineA.authoritativeSize.value)
+        assertEquals(TerminalSize(100, 31), engineB.authoritativeSize.value)
+        engineA.dispose()
+        engineB.dispose()
+    }
+
+    @Test
+    fun fittedFontUsesWidthOnlyAndNeverCrossesTheReadableFloor() {
+        val preferred = 24
+        val readableFloor = 10
+        val normal = fittedTerminalTextSizePx(1_080, 1_920, TerminalSize(80, 24), preferred, 1f, readableFloor)
+        val short = fittedTerminalTextSizePx(1_080, 240, TerminalSize(240, 24), preferred, 1f, readableFloor)
+        val tall = fittedTerminalTextSizePx(1_080, 1_920, TerminalSize(240, 80), preferred, 1f, readableFloor)
+
+        assertTrue(normal in readableFloor..preferred)
+        assertTrue(tall in readableFloor..preferred)
+        assertTrue(tall <= normal)
+        assertTrue(tall < preferred)
+        assertEquals(short, tall)
     }
 
     @Test
@@ -108,6 +162,26 @@ class TermuxTerminalEngineTest {
             engine.submitKeyCode(KeyEvent.KEYCODE_DPAD_UP)
         }
         assertContentEquals("\u001b[A".encodeToByteArray(), normalCursor.single())
+
+        val backspace = captureInput(engine, 1) {
+            engine.submitKeyCode(KeyEvent.KEYCODE_DEL)
+        }
+        assertContentEquals(byteArrayOf(0x7f), backspace.single())
+
+        val delete = captureInput(engine, 1) {
+            engine.submitKeyCode(KeyEvent.KEYCODE_FORWARD_DEL)
+        }
+        assertContentEquals("\u001b[3~".encodeToByteArray(), delete.single())
+
+        val modifiedHome = captureInput(engine, 1) {
+            engine.submitKeyCode(
+                KeyEvent.KEYCODE_MOVE_HOME,
+                controlDown = true,
+                altDown = false,
+                shiftDown = true,
+            )
+        }
+        assertContentEquals("\u001b[1;6H".encodeToByteArray(), modifiedHome.single())
 
         engine.feed(1, ByteBuffer.wrap("\u001b[?1h".encodeToByteArray()))
         val applicationCursor = captureInput(engine, 1) {

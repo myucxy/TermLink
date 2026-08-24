@@ -42,16 +42,33 @@ https://id.127.0.0.1.sslip.io:9443 {
 	reverse_proxy keycloak:8080
 }
 
+# A single production-shaped origin keeps OIDC discovery, token exchange,
+# REST, and Realtime on the same LAN endpoint used by packaged clients.
+https://{$TERMLINK_ACCEPTANCE_PUBLIC_HOST}:{$TERMLINK_ACCEPTANCE_PUBLIC_PORT} {
+	tls internal
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	@identity path /realms/* /resources/* /robots.txt
+	handle @identity {
+		reverse_proxy keycloak:8080
+	}
+	handle {
+		reverse_proxy server:8080
+	}
+}
+
 # Presigned history data is deliberately isolated to this host and path. The
 # server signs URLs against the /termlink-history bucket prefix; Caddy only
 # forwards the two object methods when the SigV4 query carries the algorithm,
 # credential, expiry, signed-header set, and signature fields. MinIO remains
 # the authority for cryptographic verification and object authorization.
-https://history.127.0.0.1.sslip.io:9443 {
+https://{$TERMLINK_ACCEPTANCE_HISTORY_HOST}:9443 {
 	tls internal
-	request_body {
-		max_size 67108864
-	}
 	header {
 		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options "nosniff"
@@ -61,7 +78,7 @@ https://history.127.0.0.1.sslip.io:9443 {
 
 	@historyObject {
 		method GET PUT
-		path_regexp history_object_path ^/termlink-history/accounts/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/sessions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/(chunk|snapshot)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]bin$
+		path_regexp history_object_path ^/termlink-history/accounts/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/sessions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/(chunk|snapshot|transcript)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]bin$
 		query X-Amz-Algorithm=AWS4-HMAC-SHA256
 		query X-Amz-Credential=*
 		query X-Amz-Date=*
@@ -71,13 +88,57 @@ https://history.127.0.0.1.sslip.io:9443 {
 	}
 	@historyObjectTooLarge {
 		method PUT
-		path_regexp oversized_history_object_path ^/termlink-history/accounts/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/sessions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/(chunk|snapshot)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]bin$
+		path_regexp oversized_history_object_path ^/termlink-history/accounts/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/sessions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/(chunk|snapshot|transcript)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]bin$
+		query X-Amz-Algorithm=AWS4-HMAC-SHA256
+		query X-Amz-Credential=*
+		query X-Amz-Date=*
+		query X-Amz-Expires=*
+		query X-Amz-SignedHeaders=*
+		query X-Amz-Signature=*
 		expression `{http.request.header.Content-Length} != '' && int({http.request.header.Content-Length}) > 67108864`
 	}
 	handle @historyObjectTooLarge {
 		respond 413
 	}
 	handle @historyObject {
+		request_body {
+			max_size 67108864
+		}
+		header Cache-Control "private, no-store"
+		reverse_proxy minio:9000
+	}
+
+	# PC file transfers use a separate object shape and the product-wide 5 GiB
+	# ceiling. Keep this matcher independent so the 64 MiB history limit cannot
+	# be widened accidentally.
+	@fileTransferObject {
+		method GET PUT
+		path_regexp file_transfer_object_path ^/termlink-history/accounts/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/file-transfers/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]bin$
+		query X-Amz-Algorithm=AWS4-HMAC-SHA256
+		query X-Amz-Credential=*
+		query X-Amz-Date=*
+		query X-Amz-Expires=*
+		query X-Amz-SignedHeaders=*
+		query X-Amz-Signature=*
+	}
+	@fileTransferObjectTooLarge {
+		method PUT
+		path_regexp oversized_file_transfer_object_path ^/termlink-history/accounts/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/file-transfers/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]bin$
+		query X-Amz-Algorithm=AWS4-HMAC-SHA256
+		query X-Amz-Credential=*
+		query X-Amz-Date=*
+		query X-Amz-Expires=*
+		query X-Amz-SignedHeaders=*
+		query X-Amz-Signature=*
+		expression `{http.request.header.Content-Length} != '' && int({http.request.header.Content-Length}) > 5368709120`
+	}
+	handle @fileTransferObjectTooLarge {
+		respond 413
+	}
+	handle @fileTransferObject {
+		request_body {
+			max_size 5368709120
+		}
 		header Cache-Control "private, no-store"
 		reverse_proxy minio:9000
 	}

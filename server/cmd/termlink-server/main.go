@@ -18,6 +18,7 @@ import (
 	"github.com/termlink/termlink/server/internal/api"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/config"
+	"github.com/termlink/termlink/server/internal/fileoperationcleanup"
 	"github.com/termlink/termlink/server/internal/history"
 	"github.com/termlink/termlink/server/internal/kv"
 	"github.com/termlink/termlink/server/internal/lanreplay"
@@ -27,6 +28,7 @@ import (
 	"github.com/termlink/termlink/server/internal/phase1test"
 	"github.com/termlink/termlink/server/internal/realtime"
 	serverruntime "github.com/termlink/termlink/server/internal/runtime"
+	"github.com/termlink/termlink/server/internal/sessioncleanup"
 	"github.com/termlink/termlink/server/internal/store"
 	"github.com/termlink/termlink/server/internal/webportal"
 )
@@ -156,7 +158,9 @@ func runProduction() error {
 	case <-time.After(5 * time.Second):
 		return errors.New("realtime authority subscription did not become ready")
 	}
-	go (outbox.Dispatcher{Store: repository, Valkey: valkey, Logger: slog.Default()}).Run(ctx)
+	go (outbox.Dispatcher{Store: repository, Valkey: valkey, History: historyStore, Logger: slog.Default()}).Run(ctx)
+	go fileoperationcleanup.New(repository, fileoperationcleanup.Options{Logger: slog.Default()}).Run(ctx)
+	go sessioncleanup.New(repository, sessioncleanup.Options{Logger: slog.Default()}).Run(ctx)
 	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "history_enabled", cfg.HistoryEnabled, "metrics_enabled", cfg.MetricsListenAddr != "")
 	return serveProduction(ctx, serverruntime.New(cfg, metrics.HTTPMiddleware(mux)), metrics, cfg.MetricsListenAddr)
 }

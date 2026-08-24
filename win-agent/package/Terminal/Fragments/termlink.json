@@ -5,6 +5,7 @@
       "name": "TermLink CMD",
       "commandline": "termlink-session.exe --command-base64 Y21kLmV4ZQ== --managed-shell command-prompt",
       "startingDirectory": "%USERPROFILE%",
+      "closeOnExit": "always",
       "hidden": false
     },
     {
@@ -12,6 +13,7 @@
       "name": "TermLink Windows PowerShell",
       "commandline": "termlink-session.exe --command-base64 cG93ZXJzaGVsbC5leGUgLU5vTG9nbyAtTm9Qcm9maWxl --managed-shell windows-powershell",
       "startingDirectory": "%USERPROFILE%",
+      "closeOnExit": "always",
       "hidden": false
     },
     {
@@ -19,6 +21,7 @@
       "name": "TermLink PowerShell 7",
       "commandline": "termlink-session.exe --command-base64 cHdzaC5leGUgLU5vTG9nbyAtTm9Qcm9maWxl --managed-shell powershell-7",
       "startingDirectory": "%USERPROFILE%",
+      "closeOnExit": "always",
       "hidden": false
     },
     {
@@ -26,6 +29,7 @@
       "name": "TermLink WSL",
       "commandline": "termlink-session.exe --command-base64 d3NsLmV4ZQ== --managed-shell wsl",
       "startingDirectory": "%USERPROFILE%",
+      "closeOnExit": "always",
       "hidden": false
     }
   ]

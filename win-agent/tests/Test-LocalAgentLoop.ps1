@@ -64,8 +64,6 @@ try {
         '--input-id', $inputId.ToString('D'),
         '--remote-input-v2',
         '--duplicate-input-attempts', '2',
-        '--resize-columns', '111',
-        '--resize-rows', '37',
         '--wait-ms', '20000',
         '--test-disconnect-after-frames', '2',
         '--diagnostics'
@@ -131,7 +129,7 @@ exit 17
         'Session Host did not confirm exactly one successful ConPTY write.'
     Assert-True ([int]$agentFields.remote_input_results_rejected -eq 1) `
         'Session Host did not publish the ordered duplicate-sequence rejection.'
-    Assert-True ([int]$agentFields.resize_applied -ge 1) 'Agent did not observe the requested 111x37 resize.'
+    Assert-True ([int]$agentFields.resize_applied -ge 1) 'Agent did not observe the PC terminal size.'
     Assert-True ([int]$agentFields.reconnects -ge 1) 'Host-Agent reconnect and retransmit path was not exercised.'
     Assert-True ([int]$agentFields.output_frames -ge 1) 'Agent did not receive terminal output.'
     Assert-True ([int]$agentFields.output_bytes -gt 0) 'Agent terminal output was empty.'
@@ -157,6 +155,7 @@ exit 17
     $bufferFields = Get-ResultFields -Text ($bufferOutput -join "`n") -Prefix '__BUFFER_RESULT__:'
     Assert-True ([int]$bufferFields.input_frames -eq 0) 'Input frames entered the encrypted event Buffer.'
     Assert-True ([int]$bufferFields.gap_frames -eq 0) 'The normal reconnect path unexpectedly created a history gap.'
+    Assert-True ([int]$bufferFields.removed_frames -eq 1) 'The terminal buffer did not contain exactly one explicit SessionRemoved frame.'
     Assert-True ([uint64]$bufferFields.last_seq -eq [uint64]$agentFields.last_seq) `
         'Encrypted Buffer did not persist through the final lifecycle frame.'
     Assert-True ($bufferFields.output_sha256 -match '^[0-9a-f]{64}$') 'Buffer output SHA-256 is invalid.'
@@ -194,7 +193,7 @@ exit 17
         conpty_input_result_accepted = [int]$agentFields.remote_input_results_accepted
         conpty_input_result_rejected = [int]$agentFields.remote_input_results_rejected
         input_frames_persisted = [int]$bufferFields.input_frames
-        resize_111x37_observed = ([int]$agentFields.resize_applied -ge 1)
+        pc_authoritative_resize_observed = ([int]$agentFields.resize_applied -ge 1)
         lifecycle_exit_code = [int]$agentFields.exit
         final_ack = $hostAck
         buffer_protection = 'Windows DPAPI CurrentUser per event chunk'

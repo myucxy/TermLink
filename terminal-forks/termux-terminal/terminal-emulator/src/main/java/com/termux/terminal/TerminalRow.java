@@ -148,6 +148,12 @@ public final class TerminalRow {
         mHasNonOneWidthOrSurrogateChars = false;
     }
 
+    void setStyle(int column, long style) {
+        if (column < 0 || column >= mStyle.length)
+            throw new IllegalArgumentException("TerminalRow.setStyle(): column=" + column);
+        mStyle[column] = style;
+    }
+
     // https://github.com/steven676/Android-Terminal-Emulator/commit/9a47042620bec87617f0b4f5d50568535668fe26
     public void setChar(int columnToSet, int codePoint, long style) {
         if (columnToSet  < 0 || columnToSet >= mStyle.length)

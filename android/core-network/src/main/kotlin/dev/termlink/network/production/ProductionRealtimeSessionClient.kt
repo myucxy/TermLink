@@ -14,14 +14,17 @@ import dev.termlink.protocol.realtime.v1.MessageType
 import dev.termlink.protocol.realtime.v1.OutputAckPayload
 import dev.termlink.protocol.realtime.v1.OutputChunkPayload
 import dev.termlink.protocol.realtime.v1.ResizePayload
+import dev.termlink.protocol.realtime.v1.SessionTerminateRequestPayload
 import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
 import dev.termlink.protocol.realtime.v1.SubscribePayload
 import dev.termlink.session.EventAcceptance
+import dev.termlink.session.DurableAckCommit
 import dev.termlink.session.RemoteControlLease
 import dev.termlink.session.RemoteInput
 import dev.termlink.session.RemoteInputDeliveryUnknownException
 import dev.termlink.session.RemoteInputRejectedException
 import dev.termlink.session.RemoteLifecycle
+import dev.termlink.session.RendererBootstrapState
 import dev.termlink.session.RemoteSessionEvent
 import dev.termlink.session.RemoteSessionOutbound
 import dev.termlink.session.RemoteSessionState
@@ -50,6 +53,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -99,6 +104,23 @@ private class InMemoryInputSequenceProvider : InputSequenceProvider {
     override fun next(): Long = sequence.incrementAndGet()
 }
 
+private const val TERMINATION_REASON_USER_REQUESTED = "USER_REQUESTED"
+
+data class ProductionRealtimeSessionDiagnostics(
+    val transportState: String,
+    val remoteState: String,
+    val transportCollectorActive: Boolean,
+    val reconnectActive: Boolean,
+    val subscriberReady: Boolean,
+    val reconnectAttempt: Int,
+    val subscribeSendCount: Long,
+    val lastSubscribeCursor: Long,
+    val flowControlSendCount: Long,
+    val lastReceivedSequence: Long,
+    val lastHandledSequence: Long,
+    val multiplexer: ProductionRealtimeMultiplexerDiagnostics,
+)
+
 /**
  * E2EE Android session transport. It translates production Envelopes into the
  * renderer-independent [RemoteTerminalSession] contract and owns reconnect,
@@ -109,20 +131,22 @@ class ProductionRealtimeSessionClient(
     private val config: ProductionRealtimeSessionConfig,
     private val identity: DeviceIdentity,
     parentScope: CoroutineScope,
+    private val transport: ProductionRealtimeSessionTransport,
     private val httpClient: OkHttpClient = ProductionRealtimeClient.defaultHttpClient,
     allowCleartextForLocalTest: Boolean = false,
     private val reconnectDelaysMillis: List<Long> = listOf(250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000),
     private val inputAcceptanceTimeoutMillis: Long = 5_000,
     private val inputSequenceProvider: InputSequenceProvider = InMemoryInputSequenceProvider(),
     private val envelopeSequenceProvider: InputSequenceProvider = InMemoryInputSequenceProvider(),
-    initialAcknowledgedSequence: Long = 0,
+    initialRendererState: RendererBootstrapState = RendererBootstrapState.Empty(),
     initialObservedLocalInputEpoch: Long = 0,
-    private val acknowledgementObserver: suspend (Long) -> Long = { it },
-    private val acknowledgementResetObserver: suspend () -> Unit = {},
+    private val acknowledgementObserver: suspend (Long, Long) -> DurableAckCommit,
+    private val acknowledgementResetObserver: suspend (Long) -> DurableAckCommit,
     private val authoritativeMetadataRefreshObserver: suspend () -> Unit = {},
     private val metadataRefreshCooldownMillis: Long = 10_000,
     private val previousEpochGraceMillis: Long = 30_000,
     private val subscriberRefreshIntervalMillis: Long = 15_000,
+    private val terminationReadinessTimeoutMillis: Long = 15_000,
     leaseRenewalIntervalMillis: Long = 10_000,
     disposeEngineOnClose: Boolean = true,
 ) : RemoteSessionOutbound, Closeable {
@@ -162,15 +186,6 @@ class ProductionRealtimeSessionClient(
     )
     private var previousMaterial: SessionKeyMaterial? = null
     private var previousMaterialGeneration = 0L
-    private val transport = ProductionRealtimeClient(
-        rootUrl = config.rootUrl,
-        tokenProvider = config.tokenProvider,
-        deviceId = config.androidDeviceId,
-        identity = identity,
-        role = "android",
-        httpClient = httpClient,
-        allowCleartextForLocalTest = allowCleartextForLocalTest,
-    )
     private val api = ProductionApiClient(
         rootUrl = config.rootUrl,
         tokenProvider = config.tokenProvider,
@@ -180,12 +195,17 @@ class ProductionRealtimeSessionClient(
         allowCleartextForLocalTest = allowCleartextForLocalTest,
     )
     private val incomingJob: Job
-    private val transportStateJob: Job
+    private var transportStateJob: Job? = null
     private val receivePressureJob: Job
     private lateinit var session: RemoteTerminalSession
-    private val subscriberReady = AtomicBoolean(false)
+    private val subscriberReady = MutableStateFlow(false)
     private val semanticFlowHold = AtomicBoolean(false)
     private val flowControlEpoch = AtomicLong(0)
+    private val subscribeSendCount = AtomicLong(0)
+    private val lastSubscribeCursor = AtomicLong(0)
+    private val flowControlSendCount = AtomicLong(0)
+    private val lastReceivedSequence = AtomicLong(0)
+    private val lastHandledSequence = AtomicLong(0)
     private val flowControlMutex = Mutex()
     private var lastFlowControlGeneration = Int.MIN_VALUE
     private var lastFlowControlPaused: Boolean? = null
@@ -199,11 +219,12 @@ class ProductionRealtimeSessionClient(
         require(metadataRefreshCooldownMillis > 0) { "metadata refresh cooldown must be positive" }
         require(previousEpochGraceMillis in 1..60_000) { "previous epoch grace must be 1..60000 milliseconds" }
         require(subscriberRefreshIntervalMillis > 0) { "subscriber refresh interval must be positive" }
+        require(terminationReadinessTimeoutMillis > 0) { "termination readiness timeout must be positive" }
         val session = RemoteTerminalSession(
             engine = engine,
             outbound = this,
             parentScope = scope,
-            initialAcknowledgedSequence = initialAcknowledgedSequence,
+            initialRendererState = initialRendererState,
             leaseRenewalIntervalMillis = leaseRenewalIntervalMillis,
             disposeEngineOnClose = disposeEngineOnClose,
         )
@@ -240,12 +261,9 @@ class ProductionRealtimeSessionClient(
                 }
             }
         }
-        transportStateJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
-            transport.state.collect(::handleTransportState)
-        }
         receivePressureJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
             transport.receivePressure.collect {
-                if (subscriberReady.get() && mutableTransportState.value is ProductionTransportState.Connected) {
+                if (subscriberReady.value && mutableTransportState.value is ProductionTransportState.Connected) {
                     try {
                         sendFlowControl(force = false)
                     } catch (error: CancellationException) {
@@ -262,12 +280,33 @@ class ProductionRealtimeSessionClient(
         get() = session
     val sessionState: StateFlow<RemoteSessionState>
         get() = session.state
+    /** Null until an ordered title event is observed; blank means explicitly cleared. */
+    val sessionTitle: StateFlow<String?>
+        get() = session.title
     val transportState: StateFlow<ProductionTransportState> = mutableTransportState.asStateFlow()
+
+    fun diagnostics(): ProductionRealtimeSessionDiagnostics = ProductionRealtimeSessionDiagnostics(
+        transportState = mutableTransportState.value.diagnosticName(),
+        remoteState = session.state.value.diagnosticName(),
+        transportCollectorActive = transportStateJob?.isActive == true,
+        reconnectActive = reconnectJob?.isActive == true,
+        subscriberReady = subscriberReady.value,
+        reconnectAttempt = reconnectAttempt,
+        subscribeSendCount = subscribeSendCount.get(),
+        lastSubscribeCursor = lastSubscribeCursor.get(),
+        flowControlSendCount = flowControlSendCount.get(),
+        lastReceivedSequence = lastReceivedSequence.get(),
+        lastHandledSequence = lastHandledSequence.get(),
+        multiplexer = transport.diagnostics(),
+    )
 
     fun start() {
         check(!closed.get()) { "production session client is closed" }
         check(started.compareAndSet(false, true)) { "production session client is already started" }
         session.start()
+        transportStateJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            transport.state.collect(::handleTransportState)
+        }
         transport.connect()
     }
 
@@ -299,6 +338,34 @@ class ProductionRealtimeSessionClient(
             }
             throw ProductionTransportException("control request was superseded by a newer revoke")
         }
+    }
+
+    /**
+     * Requests termination of the authoritative Windows SessionHost. This is
+     * independent from both the control lease and permanent REST deletion of
+     * an offline session record.
+     */
+    suspend fun requestTermination(): UUID {
+        check(started.get()) { "production session client is not started" }
+        check(!closed.get()) { "production session client is closed" }
+        try {
+            withTimeout(terminationReadinessTimeoutMillis) {
+                combine(mutableTransportState, subscriberReady) { transportState, ready ->
+                    transportState is ProductionTransportState.Connected && ready
+                }.first { it }
+            }
+        } catch (_: TimeoutCancellationException) {
+            throw ProductionTransportException("session terminate transport was not ready")
+        }
+
+        val requestId = UUID.randomUUID()
+        val payload = SessionTerminateRequestPayload.newBuilder()
+            .setRequestId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(requestId)))
+            .setReasonCode(TERMINATION_REASON_USER_REQUESTED)
+            .build()
+            .toByteArray()
+        sendEncrypted(MessageType.SESSION_TERMINATE_REQUEST, payload)
+        return requestId
     }
 
     suspend fun releaseControl() {
@@ -341,17 +408,15 @@ class ProductionRealtimeSessionClient(
                 session.recoverFromHistory(
                     events,
                     expectedGap,
-                    persist = { recovered ->
+                    persist = { expectedGeneration, recovered ->
                         withContext(NonCancellable) {
-                            require(persistAcknowledgement(recovered) == recovered) {
-                                "durable ACK commit did not reach the recovered cursor"
-                            }
+                            persistAcknowledgement(expectedGeneration, recovered)
                         }
                     },
                     publish = { recovered ->
                         sendAcknowledgement(recovered)
                         resume(recovered)
-                        subscriberReady.set(true)
+                        subscriberReady.value = true
                         semanticFlowHold.set(false)
                         sendFlowControl(force = true)
                     },
@@ -475,6 +540,8 @@ class ProductionRealtimeSessionClient(
             .build()
             .toByteArray()
         sendEncrypted(MessageType.SUBSCRIBE, payload, acknowledgement = lastAckedSequence)
+        lastSubscribeCursor.set(lastAckedSequence)
+        subscribeSendCount.incrementAndGet()
     }
 
     override suspend fun acknowledge(highestContiguousSequence: Long) {
@@ -482,10 +549,13 @@ class ProductionRealtimeSessionClient(
         sendAcknowledgement(highestContiguousSequence)
     }
 
-    override suspend fun persistAcknowledgement(highestContiguousSequence: Long): Long =
-        acknowledgementObserver(highestContiguousSequence)
+    override suspend fun persistAcknowledgement(
+        expectedRendererGeneration: Long,
+        highestContiguousSequence: Long,
+    ): DurableAckCommit = acknowledgementObserver(expectedRendererGeneration, highestContiguousSequence)
 
-    override suspend fun resetAcknowledgement() = acknowledgementResetObserver()
+    override suspend fun resetAcknowledgement(expectedRendererGeneration: Long): DurableAckCommit =
+        acknowledgementResetObserver(expectedRendererGeneration)
 
     private suspend fun sendAcknowledgement(highestContiguousSequence: Long) {
         val payload = OutputAckPayload.newBuilder()
@@ -540,20 +610,10 @@ class ProductionRealtimeSessionClient(
     }
 
     override suspend fun sendResize(size: TerminalSize) {
-        val controlling = session.state.value as? RemoteSessionState.Controlling
-            ?: throw ProductionTransportException("control lease is required")
-        val payload = ResizePayload.newBuilder()
-            .setColumns(size.columns)
-            .setRows(size.rows)
-            .setLeaseId(ByteString.copyFrom(leaseIdBytes(controlling.leaseId)))
-            .setLeaseVersion(controlling.leaseVersion)
-            .build()
-            .toByteArray()
-        try {
-            sendEncrypted(MessageType.RESIZE_REQUEST, payload)
-        } finally {
-            payload.fill(0)
-        }
+        // Android is a viewer/controller of the Windows PTY. Its viewport can
+        // never author a terminal grid, even if a future caller accidentally
+        // reaches this legacy outbound interface.
+        Unit
     }
 
     override suspend fun renewLease(leaseId: String, leaseVersion: Long): RemoteControlLease =
@@ -578,7 +638,8 @@ class ProductionRealtimeSessionClient(
         transport.close()
         api.close()
         incomingJob.cancel()
-        transportStateJob.cancel()
+        transportStateJob?.cancel()
+        transportStateJob = null
         receivePressureJob.cancel()
         scope.cancel()
         synchronized(materialLock) {
@@ -609,7 +670,7 @@ class ProductionRealtimeSessionClient(
 
     private suspend fun sendFlowControl(force: Boolean) {
         flowControlMutex.withLock {
-            if (!subscriberReady.get() ||
+            if (!subscriberReady.value ||
                 mutableTransportState.value !is ProductionTransportState.Connected
             ) return
             val pressure = transport.receivePressure.value
@@ -637,6 +698,7 @@ class ProductionRealtimeSessionClient(
                 .build()
                 .toByteArray()
             sendEncrypted(MessageType.FLOW_CONTROL, payload, acknowledgement)
+            flowControlSendCount.incrementAndGet()
             lastFlowControlGeneration = pressure.generation
             lastFlowControlPaused = paused
         }
@@ -644,7 +706,7 @@ class ProductionRealtimeSessionClient(
 
     private fun setSemanticFlowHold(held: Boolean) {
         if (semanticFlowHold.getAndSet(held) == held) return
-        if (subscriberReady.get() && mutableTransportState.value is ProductionTransportState.Connected) {
+        if (subscriberReady.value && mutableTransportState.value is ProductionTransportState.Connected) {
             scope.launch {
                 try {
                     sendFlowControl(force = true)
@@ -710,6 +772,7 @@ class ProductionRealtimeSessionClient(
 
     private suspend fun handleIncoming(envelope: Envelope) {
         check(!closed.get()) { "production session client is closed" }
+        lastReceivedSequence.accumulateAndGet(envelope.seq, ::maxOf)
         validateEnvelope(envelope)
         val incomingKeyId = envelope.keyId.toByteArray()
         val (key, usedCurrentMaterial) = try {
@@ -779,25 +842,12 @@ class ProductionRealtimeSessionClient(
                 }
                 MessageType.SESSION_UPSERT -> {
                     val payload = SessionUpsertPayload.parseFrom(plaintext)
-                    val lifecycle = payload.lifecycle.uppercase()
-                    when (lifecycle) {
-                        "RUNNING", "STARTED", "CHANGED" -> requireApplied(
-                            session.accept(RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.RUNNING)),
-                        )
-                        "INTERRUPTED" -> requireApplied(
-                            session.accept(RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.INTERRUPTED)),
-                        )
-                        "EXITED", "ENDED" -> requireApplied(
-                            session.accept(
-                                RemoteSessionEvent.Lifecycle(
-                                    envelope.seq,
-                                    RemoteLifecycle.ENDED,
-                                    payload.exitCode.takeIf { payload.hasExitCode() },
-                                ),
-                            ),
-                        )
-                        else -> error("unknown session lifecycle")
-                    }
+                    // One Envelope sequence represents exactly one ordered
+                    // event. A title-bearing upsert is therefore applied as a
+                    // Title event only; lifecycle transitions continue to use
+                    // their dedicated SESSION_* messages or a legacy upsert
+                    // without field 9.
+                    requireApplied(session.accept(sessionUpsertEvent(envelope.seq, payload)))
                 }
                 MessageType.SESSION_STARTED -> requireApplied(
                     session.accept(RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.RUNNING)),
@@ -817,6 +867,9 @@ class ProductionRealtimeSessionClient(
                         ),
                     )
                 }
+                MessageType.SESSION_REMOVED -> requireApplied(
+                    session.accept(RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.ENDED)),
+                )
                 MessageType.INPUT_ACCEPTED, MessageType.INPUT_REJECTED -> {
                     val result = InputResultPayload.parseFrom(plaintext)
                     val inputId = ProductionRealtimeClient.uuidFromBytes(result.inputId.toByteArray())
@@ -886,8 +939,31 @@ class ProductionRealtimeSessionClient(
                 MessageType.OUTPUT_ACK, MessageType.HEARTBEAT -> Unit
                 else -> error("unsupported production message type ${envelope.messageType}")
             }
+            lastHandledSequence.accumulateAndGet(envelope.seq, ::maxOf)
         } finally {
             plaintext.fill(0)
+        }
+    }
+
+    internal companion object {
+        internal fun sessionUpsertEvent(
+            sequence: Long,
+            payload: SessionUpsertPayload,
+        ): RemoteSessionEvent {
+            require(sequence > 0) { "session event sequence must be positive" }
+            if (payload.hasTitle()) return RemoteSessionEvent.Title(sequence, payload.title)
+            return when (payload.lifecycle.uppercase()) {
+                "RUNNING", "STARTED", "CHANGED" ->
+                    RemoteSessionEvent.Lifecycle(sequence, RemoteLifecycle.RUNNING)
+                "INTERRUPTED" ->
+                    RemoteSessionEvent.Lifecycle(sequence, RemoteLifecycle.INTERRUPTED)
+                "EXITED", "ENDED" -> RemoteSessionEvent.Lifecycle(
+                    sequence,
+                    RemoteLifecycle.ENDED,
+                    payload.exitCode.takeIf { payload.hasExitCode() },
+                )
+                else -> error("unknown session lifecycle")
+            }
         }
     }
 
@@ -921,11 +997,28 @@ class ProductionRealtimeSessionClient(
         return RemoteControlLease(leaseId, expiresAt, version)
     }
 
+    private fun ProductionTransportState.diagnosticName(): String = when (this) {
+        ProductionTransportState.Connecting -> "CONNECTING"
+        ProductionTransportState.Connected -> "CONNECTED"
+        is ProductionTransportState.Reconnecting -> "RECONNECTING"
+        is ProductionTransportState.Failed -> "FAILED"
+        ProductionTransportState.Closed -> "CLOSED"
+    }
+
+    private fun RemoteSessionState.diagnosticName(): String = when (this) {
+        is RemoteSessionState.Live -> "LIVE"
+        is RemoteSessionState.Reconnecting -> "RECONNECTING"
+        is RemoteSessionState.ReadOnly -> "READ_ONLY"
+        is RemoteSessionState.Controlling -> "CONTROLLING"
+        is RemoteSessionState.Exited -> "EXITED"
+        is RemoteSessionState.HistoryGap -> "HISTORY_GAP"
+    }
+
     private suspend fun handleTransportState(state: RealtimeState) {
         if (closed.get()) return
         when (state) {
             RealtimeState.Connecting -> {
-                subscriberReady.set(false)
+                subscriberReady.value = false
                 mutableTransportState.value = ProductionTransportState.Connecting
             }
             RealtimeState.Connected -> {
@@ -933,27 +1026,40 @@ class ProductionRealtimeSessionClient(
                 reconnectJob = null
                 reconnectAttempt = 0
                 mutableTransportState.value = ProductionTransportState.Connected
-                if (!session.onConnected()) {
-                    failTransport("initial session subscribe failed")
-                } else if (session.state.value !is RemoteSessionState.HistoryGap) {
-                    subscriberReady.set(true)
-                    sendFlowControl(force = true)
-                    startSubscriberRefresh()
+                try {
+                    if (!session.onConnected()) {
+                        failTransport("initial session subscribe failed")
+                    } else if (session.state.value !is RemoteSessionState.HistoryGap) {
+                        subscriberReady.value = true
+                        sendFlowControl(force = true)
+                        startSubscriberRefresh()
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    failTransport(error.message ?: "realtime subscribe failed")
                 }
             }
             is RealtimeState.Failed -> {
                 subscriberRefreshJob?.cancel()
                 subscriberRefreshJob = null
-                subscriberReady.set(false)
+                subscriberReady.value = false
                 failPendingInputs(state.reason)
-                session.onDisconnected(state.reason)
-                scheduleReconnect(state.reason)
+                val reconnectReason = try {
+                    session.onDisconnected(state.reason)
+                    state.reason
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    error.message ?: state.reason
+                }
+                scheduleReconnect(reconnectReason)
             }
             is RealtimeState.Reconnecting -> Unit
             RealtimeState.Closed -> {
                 subscriberRefreshJob?.cancel()
                 subscriberRefreshJob = null
-                subscriberReady.set(false)
+                subscriberReady.value = false
                 failPendingInputs("production transport closed")
                 mutableTransportState.value = ProductionTransportState.Closed
             }

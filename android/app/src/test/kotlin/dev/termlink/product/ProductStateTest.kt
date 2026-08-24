@@ -2,10 +2,13 @@ package dev.termlink.product
 
 import dev.termlink.model.DeviceTrustState
 import dev.termlink.model.PcSummary
+import dev.termlink.harness.BuildConfig
 import java.time.Instant
 import java.util.UUID
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -42,7 +45,128 @@ class ProductStateTest {
         assertTrue(ProductDestination.ACCOUNT.isVisibleInProductShell)
         assertFalse(ProductDestination.MEMBERSHIP.isVisibleInProductShell)
         assertFalse(ProductDestination.TRUSTED_DEVICES.isVisibleInProductShell)
-        assertEquals("https://termlink.kget.cc:8910", PRODUCT_PUBLIC_SERVER_URL)
+        assertEquals("https://termlink.kget.cc:8910", PRODUCT_DEFAULT_SERVER_URL)
+    }
+
+    @Test
+    fun debugBuildDefaultsToPublicServerAndNormalizesLanInjection() {
+        assertEquals(
+            PRODUCT_DEFAULT_SERVER_URL,
+            configuredProductServerUrl(configuredUrl = null, isDebug = true),
+        )
+        assertEquals(
+            "https://termlink.192.168.9.28.sslip.io:9443",
+            configuredProductServerUrl(
+                configuredUrl = " HTTPS://TermLink.192.168.9.28.sslip.io:9443/ ",
+                isDebug = true,
+            ),
+        )
+    }
+
+    @Test
+    fun activeBuildUsesItsNormalizedBuildConfigServer() {
+        val configuredServerUrl = configuredProductServerUrl(
+            configuredUrl = BuildConfig.TERMLINK_SERVER_URL,
+            isDebug = BuildConfig.DEBUG,
+            allowCleartextLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
+        )
+
+        assertEquals(configuredServerUrl, PRODUCT_PUBLIC_SERVER_URL)
+        if (BuildConfig.DEBUG) {
+            assertEquals(
+                ServerUrlPolicy.normalize(
+                    BuildConfig.TERMLINK_SERVER_URL,
+                    allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
+                ),
+                PRODUCT_PUBLIC_SERVER_URL,
+            )
+        } else {
+            assertEquals(PRODUCT_DEFAULT_SERVER_URL, BuildConfig.TERMLINK_SERVER_URL)
+            assertFalse(BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST)
+            assertEquals(PRODUCT_DEFAULT_SERVER_URL, PRODUCT_PUBLIC_SERVER_URL)
+        }
+    }
+
+    @Test
+    fun releaseBuildIgnoresInjectedServerAndDisallowsCleartext() {
+        assertEquals(
+            PRODUCT_DEFAULT_SERVER_URL,
+            configuredProductServerUrl(
+                configuredUrl = "https://termlink.192.168.9.28.sslip.io:9443",
+                isDebug = false,
+            ),
+        )
+        assertEquals(
+            PRODUCT_DEFAULT_SERVER_URL,
+            configuredProductServerUrl(
+                configuredUrl = "http://192.168.9.28:8080",
+                isDebug = false,
+                allowCleartextLocalTest = true,
+            ),
+        )
+    }
+
+    @Test
+    fun debugCleartextRequiresExplicitPrivateLanOptIn() {
+        assertEquals(
+            "http://192.168.9.28:8080",
+            configuredProductServerUrl(
+                configuredUrl = "http://192.168.9.28:8080/",
+                isDebug = true,
+                allowCleartextLocalTest = true,
+            ),
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            configuredProductServerUrl(
+                configuredUrl = "http://example.com:8080",
+                isDebug = true,
+                allowCleartextLocalTest = true,
+            )
+        }
+    }
+
+    @Test
+    fun sameAccountDevicePolicyNeverRequiresUserEnrollment() {
+        assertEquals(SameAccountDeviceAction.REFRESH, sameAccountDeviceAction(DeviceTrustState.TRUSTED))
+        assertEquals(
+            SameAccountDeviceAction.ACTIVATE_LEGACY_AND_REFRESH,
+            sameAccountDeviceAction(DeviceTrustState.PENDING),
+        )
+        assertEquals(SameAccountDeviceAction.BLOCK_REVOKED, sameAccountDeviceAction(DeviceTrustState.REVOKED))
+        assertFalse(ProductSnapshot().enrollmentConfirmationRequired)
+    }
+
+    @Test
+    fun registrationResultClosesOnlyAfterSuccess() = runBlocking {
+        var successfulCalls = 0
+        val success = submitAccountRegistration { successfulCalls += 1 }
+        val failure = submitAccountRegistration { error("registration rejected") }
+
+        assertEquals(1, successfulCalls)
+        assertTrue(success is AccountRegistrationResult.Success)
+        assertTrue(failure is AccountRegistrationResult.Failure)
+        assertEquals("registration rejected", (failure as AccountRegistrationResult.Failure).error.message)
+    }
+
+    @Test
+    fun unavailableRegistrationClearsItsPasswordArguments() = runBlocking {
+        val password = "password123".toCharArray()
+        val confirm = "password123".toCharArray()
+
+        val failure = runCatching {
+            UnavailableProductRepository().register(
+                username = "alice",
+                email = "alice@example.test",
+                firstName = "Alice",
+                lastName = "Example",
+                password = password,
+                confirm = confirm,
+            )
+        }
+
+        assertTrue(failure.isFailure)
+        assertTrue(password.all { it == '\u0000' })
+        assertTrue(confirm.all { it == '\u0000' })
     }
 
     @Test
@@ -122,5 +246,126 @@ class ProductStateTest {
         assertEquals("Next", normalized.label(TerminalAction.TAB))
         assertEquals("Ctrl+C", normalized.label(TerminalAction.CTRL_C))
         assertEquals(listOf(TerminalAction.TAB, TerminalAction.ENTER), normalized.visibleActions)
+    }
+
+    @Test
+    fun terminalKeyCombinationsNormalizeModifiersNamedKeysAndPrintableKeys() {
+        assertEquals(
+            TerminalKeyCombination("P", control = true, shift = true),
+            TerminalKeyCombination.parse(" control + shift + P "),
+        )
+        assertEquals("Alt+Delete", TerminalKeyCombination.parse("option+del")?.canonical)
+        assertEquals("Ctrl+F12", TerminalKeyCombination.parse("Ctrl+f12")?.canonical)
+        assertEquals("Backspace", TerminalKeyCombination.parse("bksp")?.canonical)
+        assertEquals("+", TerminalKeyCombination.parse("plus")?.canonical)
+        assertEquals("+", TerminalKeyCombination.parse("+")?.canonical)
+        assertEquals("Ctrl++", TerminalKeyCombination.parse("control+plus")?.canonical)
+        assertEquals("Ctrl++", TerminalKeyCombination.parse("Ctrl++")?.canonical)
+        assertEquals(null, TerminalKeyCombination.parse("Ctrl+K+P"))
+        assertEquals(null, TerminalKeyCombination.parse("Ctrl"))
+        assertEquals('P'.code, terminalShiftedCodePoint('p'.code))
+        assertEquals('!'.code, terminalShiftedCodePoint('1'.code))
+        assertEquals('?'.code, terminalShiftedCodePoint('/'.code))
+    }
+
+    @Test
+    fun everyCanonicalTerminalCombinationCanBeParsedAgain() {
+        listOf(
+            "plus",
+            "Ctrl+plus",
+            "Alt+Shift+plus",
+            "Backspace",
+            "Ctrl+Shift+p",
+            "Alt+Delete",
+            "F12",
+        ).forEach { raw ->
+            val canonical = requireNotNull(TerminalKeyCombination.parse(raw)).canonical
+            assertEquals(canonical, TerminalKeyCombination.parse(canonical)?.canonical)
+        }
+    }
+
+    @Test
+    fun customTerminalShortcutsRejectInvalidRowsAndRemainBounded() {
+        val valid = TerminalCustomShortcut("build", "  Build  ", "control+shift+p")
+        val unnamed = TerminalCustomShortcut("palette", "   ", "Ctrl+Shift+P")
+        val invalid = TerminalCustomShortcut("bad id!", "Bad", "Ctrl")
+        val normalized = TerminalShortcutPreferences(
+            customShortcuts = listOf(valid, valid.copy(label = "duplicate"), unnamed, invalid),
+        ).normalized
+
+        assertEquals(2, normalized.customShortcuts.size)
+        assertEquals("Build", normalized.customShortcuts[0].label)
+        assertEquals("Build", normalized.customShortcuts[0].displayLabel)
+        assertEquals("Ctrl+Shift+p", normalized.customShortcuts[0].keyCombination)
+        assertEquals("", normalized.customShortcuts[1].label)
+        assertEquals("Ctrl+Shift+P", normalized.customShortcuts[1].displayLabel)
+        assertTrue(TerminalAction.BACKSPACE in TerminalShortcutPreferences().visibleActions)
+        assertTrue(TerminalAction.DELETE in TerminalShortcutPreferences().visibleActions)
+    }
+
+    @Test
+    fun quickInputShortcutsPreserveTextRejectBlankValuesAndRemainBounded() {
+        val command = "codex --dangerously-bypass-approvals-and-sandbox resume"
+        val quickInput = TerminalCustomShortcut(
+            id = "resume-codex",
+            label = "",
+            value = command,
+            type = TerminalCustomShortcutType.QUICK_INPUT,
+        )
+        val blank = quickInput.copy(id = "blank", value = "  \n")
+        val long = quickInput.copy(id = "long", value = "x".repeat(MAX_TERMINAL_QUICK_INPUT_LENGTH + 20))
+
+        val normalized = TerminalShortcutPreferences(
+            customShortcuts = listOf(quickInput, blank, long),
+        ).normalized
+
+        assertEquals(2, normalized.customShortcuts.size)
+        assertEquals(command, normalized.customShortcuts[0].quickInput)
+        assertEquals("", normalized.customShortcuts[0].keyCombination)
+        assertEquals(command, normalized.customShortcuts[0].displayLabel)
+        assertEquals(MAX_TERMINAL_QUICK_INPUT_LENGTH, normalized.customShortcuts[1].value.length)
+    }
+
+    @Test
+    fun quickInputDispatchesExactSavedTextWithoutUsingTheKeyPath() = runBlocking {
+        val command = "codex --dangerously-bypass-approvals-and-sandbox resume"
+        var keyCombination: String? = null
+        var quickInput: String? = null
+
+        dispatchTerminalCustomShortcut(
+            shortcut = TerminalCustomShortcut(
+                id = "resume-codex",
+                label = "Codex",
+                value = command,
+                type = TerminalCustomShortcutType.QUICK_INPUT,
+            ),
+            sendKeyCombination = { keyCombination = it },
+            sendQuickInput = { quickInput = it },
+        )
+
+        assertEquals(null, keyCombination)
+        assertEquals(command, quickInput)
+        assertFalse(quickInput!!.endsWith('\r'))
+        assertFalse(quickInput!!.endsWith('\n'))
+    }
+
+    @Test
+    fun shortcutSettingsShowVisibleActionsInDockOrderThenHiddenActions() {
+        val preferences = TerminalShortcutPreferences(
+            visibleActions = listOf(
+                TerminalAction.DELETE,
+                TerminalAction.TAB,
+                TerminalAction.ENTER,
+            ),
+        )
+
+        val order = terminalShortcutSettingsOrder(preferences)
+
+        assertEquals(
+            listOf(TerminalAction.DELETE, TerminalAction.TAB, TerminalAction.ENTER),
+            order.take(3),
+        )
+        assertEquals(TerminalAction.entries.toSet(), order.toSet())
+        assertEquals(TerminalAction.entries.size, order.size)
     }
 }

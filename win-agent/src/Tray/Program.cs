@@ -15,13 +15,18 @@ namespace TermLink.Tray
         [STAThread]
         public static int Main(string[] args)
         {
+            // DPI awareness must be selected before Agent startup, argument
+            // diagnostics, or any failure MessageBox can create a UI handle.
+            Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
             try
             {
                 var options = TrayOptions.Parse(args);
-                var controller = new AgentController(options);
                 if (!string.IsNullOrEmpty(options.StatusJsonPath))
                 {
-                    var response = controller.EnsureAgent();
+                    var response = ExternalAgentDiagnostics.Send(
+                        options,
+                        new RegistryRequest { Command = RegistryCommand.List },
+                        10000);
                     // Pairing challenges contain a short-lived code and nonce. They
                     // are available only inside the interactive pairing surface and
                     // must never be written to diagnostic JSON.
@@ -41,15 +46,22 @@ namespace TermLink.Tray
                 }
                 if (options.ShutdownAgent)
                 {
-                    var response = controller.Send(RegistryCommand.Shutdown);
+                    var response = ExternalAgentDiagnostics.Send(
+                        options,
+                        new RegistryRequest { Command = RegistryCommand.Shutdown },
+                        20000);
                     return response.Success ? 0 : 1;
                 }
                 if (options.RestartAgent)
                 {
-                    var response = controller.RestartAgent();
+                    var response = ExternalAgentDiagnostics.Send(
+                        options,
+                        new RegistryRequest { Command = RegistryCommand.RestartAgent },
+                        20000);
                     return response.Success ? 0 : 1;
                 }
 
+                using var controller = new AgentController(options);
                 bool ownsTrayMutex;
                 using (var trayMutex = new Mutex(
                     true,
@@ -57,19 +69,69 @@ namespace TermLink.Tray
                     out ownsTrayMutex))
                 {
                     if (!ownsTrayMutex) return 0;
+                    // The UI and Agent are one process. Construct the complete
+                    // local runtime before the WinForms message loop starts;
+                    // Relay connection itself remains asynchronous.
+                    controller.StartInteractive();
                     // The shell is sized in device-independent pixels and is safe to
                     // move between monitors with different scale factors.
-                    Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
                     Application.Run(new TrayApplicationContext(controller));
                     return 0;
                 }
             }
-            catch
+            catch (Exception error)
             {
+                WriteStartupFailure(error);
+                if (Array.IndexOf(args ?? Array.Empty<string>(), "--status-json") < 0 &&
+                    Array.IndexOf(args ?? Array.Empty<string>(), "--shutdown-agent") < 0 &&
+                    Array.IndexOf(args ?? Array.Empty<string>(), "--restart-agent") < 0)
+                {
+                    MessageBox.Show(
+                        TrayText.Pick(
+                            "TermLink 启动失败：" + error.Message + "\n\n诊断日志已写入本机 TermLink 日志目录。",
+                            "TermLink could not start: " + error.Message + "\n\nA diagnostic was written to the local TermLink log directory."),
+                        "TermLink",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
                 return 125;
             }
+        }
+
+        private static void WriteStartupFailure(Exception error)
+        {
+            try
+            {
+                var root = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "TermLink", "logs");
+                Directory.CreateDirectory(root);
+                File.AppendAllText(
+                    Path.Combine(root, "TermLink-startup.log"),
+                    DateTime.UtcNow.ToString("O") + Environment.NewLine + error + Environment.NewLine,
+                    new UTF8Encoding(false));
+            }
+            catch
+            {
+                // Diagnostics must never replace the original startup failure.
+            }
+        }
+    }
+
+    internal static class ExternalAgentDiagnostics
+    {
+        public static RegistryResponse Send(
+            TrayOptions options,
+            RegistryRequest request,
+            int timeoutMilliseconds)
+        {
+            if (options == null) throw new ArgumentNullException(nameof(options));
+            return RegistryControlClient.Send(
+                options.ControlPipeName,
+                request,
+                timeoutMilliseconds);
         }
     }
 
@@ -77,7 +139,7 @@ namespace TermLink.Tray
     {
         public string ControlPipeName { get; private set; }
         public string BufferRoot { get; private set; }
-        public string AgentExecutable { get; private set; }
+        public string ServerUrl { get; private set; }
         public string StatusJsonPath { get; private set; }
         public bool ShutdownAgent { get; private set; }
         public bool RestartAgent { get; private set; }
@@ -86,8 +148,8 @@ namespace TermLink.Tray
         {
             var localData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             var bufferRoot = Path.Combine(localData, "TermLink", "Agent");
-            var agentExecutable = Path.Combine(AppContext.BaseDirectory, "TermLink.Agent.exe");
             var pipeName = TermLinkControlPipe.DefaultName();
+            var serverUrl = ProductionEnrollment.PublicServerUrl;
             string statusJson = null;
             var shutdown = false;
             var restart = false;
@@ -97,7 +159,7 @@ namespace TermLink.Tray
                 {
                     case "--control-pipe": pipeName = Required(args, ref index, "--control-pipe"); break;
                     case "--buffer-root": bufferRoot = Required(args, ref index, "--buffer-root"); break;
-                    case "--agent-exe": agentExecutable = Required(args, ref index, "--agent-exe"); break;
+                    case "--server-url": serverUrl = Required(args, ref index, "--server-url"); break;
                     case "--status-json": statusJson = Required(args, ref index, "--status-json"); break;
                     case "--shutdown-agent": shutdown = true; break;
                     case "--restart-agent": restart = true; break;
@@ -109,6 +171,10 @@ namespace TermLink.Tray
             {
                 throw new ArgumentException("control pipe name is invalid");
             }
+            if (!TrayInputValidation.TryNormalizeServerOrigin(serverUrl, out var serverOrigin))
+            {
+                throw new ArgumentException("server URL must be an HTTPS origin");
+            }
             var commandCount = (shutdown ? 1 : 0) + (restart ? 1 : 0) +
                 (!string.IsNullOrEmpty(statusJson) ? 1 : 0);
             if (commandCount > 1)
@@ -119,7 +185,7 @@ namespace TermLink.Tray
             {
                 ControlPipeName = pipeName,
                 BufferRoot = Path.GetFullPath(bufferRoot),
-                AgentExecutable = Path.GetFullPath(agentExecutable),
+                ServerUrl = serverOrigin,
                 StatusJsonPath = statusJson,
                 ShutdownAgent = shutdown,
                 RestartAgent = restart
@@ -137,55 +203,65 @@ namespace TermLink.Tray
 
     }
 
-    internal sealed class AgentController
+    internal sealed class AgentController : IDisposable
     {
         private readonly TrayOptions options;
+        private readonly object lifecycleSync = new object();
+        private readonly EmbeddedAgentHost embeddedHost;
+        private bool disposed;
 
         public AgentController(TrayOptions options)
         {
             this.options = options ?? throw new ArgumentNullException(nameof(options));
+            embeddedHost = new EmbeddedAgentHost(options.ControlPipeName, options.BufferRoot);
+        }
+
+        public string ServerUrl { get { return options.ServerUrl; } }
+
+        public void StartInteractive()
+        {
+            lock (lifecycleSync)
+            {
+                ThrowIfDisposed();
+                Directory.CreateDirectory(options.BufferRoot);
+                embeddedHost.BeginStart();
+            }
         }
 
         public RegistryResponse EnsureAgent()
         {
-            RegistryResponse response;
-            if (TryList(250, out response)) return response;
-            if (!File.Exists(options.AgentExecutable))
-            {
-                throw new FileNotFoundException("TermLink Agent executable was not found.", options.AgentExecutable);
-            }
-            Directory.CreateDirectory(options.BufferRoot);
-            var start = new ProcessStartInfo
-            {
-                FileName = options.AgentExecutable,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden
-            };
-            start.ArgumentList.Add("--registry");
-            start.ArgumentList.Add("--control-pipe");
-            start.ArgumentList.Add(options.ControlPipeName);
-            start.ArgumentList.Add("--buffer-root");
-            start.ArgumentList.Add(options.BufferRoot);
-            var process = Process.Start(start);
-            if (process == null) throw new InvalidOperationException("TermLink Agent could not be started.");
-            process.Dispose();
+            lock (lifecycleSync) return EnsureAgentCore();
+        }
 
-            var deadline = DateTime.UtcNow.AddSeconds(10);
-            while (DateTime.UtcNow < deadline)
-            {
-                if (TryList(500, out response)) return response;
-                Thread.Sleep(50);
-            }
-            throw new TimeoutException("TermLink Agent did not open its control pipe.");
+        private RegistryResponse EnsureAgentCore()
+        {
+            ThrowIfDisposed();
+            Directory.CreateDirectory(options.BufferRoot);
+            // Interactive startup is deliberately non-blocking. Status refreshes
+            // wait off the UI thread for the same initialization attempt and can
+            // show its precise failure once one exists.
+            embeddedHost.Start();
+            return embeddedHost.Dispatch(new RegistryRequest { Command = RegistryCommand.List });
         }
 
         public RegistryResponse Send(RegistryCommand command)
         {
-            return RegistryControlClient.Send(
-                options.ControlPipeName,
-                new RegistryRequest { Command = command },
-                5000);
+            return SendRequest(new RegistryRequest { Command = command });
+        }
+
+        private RegistryResponse SendRequest(RegistryRequest request)
+        {
+            lock (lifecycleSync)
+            {
+                if (request == null) throw new ArgumentNullException(nameof(request));
+                ThrowIfDisposed();
+                if (!embeddedHost.IsRunning)
+                {
+                    Directory.CreateDirectory(options.BufferRoot);
+                    embeddedHost.Start();
+                }
+                return embeddedHost.Dispatch(request);
+            }
         }
 
         /// <summary>
@@ -197,19 +273,24 @@ namespace TermLink.Tray
         /// </summary>
         public void ShutdownAndWait()
         {
-            try
+            lock (lifecycleSync) ShutdownAndWaitCore();
+        }
+
+        private void ShutdownAndWaitCore()
+        {
+            if (embeddedHost.IsRunning)
             {
-                RegistryControlClient.Send(
-                    options.ControlPipeName,
-                    new RegistryRequest { Command = RegistryCommand.Shutdown },
-                    15000);
+                try
+                {
+                    embeddedHost.Dispatch(new RegistryRequest { Command = RegistryCommand.Shutdown });
+                }
+                catch (InvalidOperationException)
+                {
+                    // The background runtime may have completed concurrently.
+                }
             }
-            catch (Exception)
-            {
-                // The Agent may already be stopping or its pipe may have closed.
-                // The scoped process sweep below still guarantees no TermLink
-                // process from this installation is left behind.
-            }
+
+            embeddedHost.Stop(TimeSpan.FromSeconds(15));
 
             WaitForOwnedProcesses(DateTime.UtcNow.AddSeconds(10));
             foreach (var process in GetOwnedProcesses())
@@ -237,18 +318,18 @@ namespace TermLink.Tray
 
         public RegistryResponse StopSession(Guid sessionId)
         {
-            return RegistryControlClient.Send(
-                options.ControlPipeName,
-                new RegistryRequest { Command = RegistryCommand.StopSession, SessionId = sessionId },
-                7000);
+            return SendRequest(
+                new RegistryRequest { Command = RegistryCommand.StopSession, SessionId = sessionId });
         }
 
         public RegistryResponse RefreshProductionStatus()
         {
-            return RegistryControlClient.Send(
-                options.ControlPipeName,
-                new RegistryRequest { Command = RegistryCommand.RefreshProductionStatus },
-                7000);
+            return Send(RegistryCommand.RefreshProductionStatus);
+        }
+
+        public RegistryResponse RetryProductionConnection()
+        {
+            return Send(RegistryCommand.RetryProductionConnection);
         }
 
         public RegistryResponse CreatePairingChallenge(Guid deviceId, string permission)
@@ -257,111 +338,140 @@ namespace TermLink.Tray
             permission = (permission ?? string.Empty).Trim().ToUpperInvariant();
             if (permission != "VIEW" && permission != "CONTROL" && permission != "MANAGE")
                 throw new ArgumentException("A supported pairing permission is required.", nameof(permission));
-            return RegistryControlClient.Send(
-                options.ControlPipeName,
+            return SendRequest(
                 new RegistryRequest
                 {
                     Command = RegistryCommand.CreatePairingChallenge,
                     DeviceId = deviceId,
                     PairingPermission = permission
-                },
-                10000);
+                });
         }
 
         public RegistryResponse GrantDevice(Guid deviceId, string permission)
         {
             if (deviceId == Guid.Empty) throw new ArgumentException("A device is required.", nameof(deviceId));
             permission = ProductionDeviceGrantContract.NormalizePermission(permission);
-            return RegistryControlClient.Send(
-                options.ControlPipeName,
+            return SendRequest(
                 new RegistryRequest
                 {
                     Command = RegistryCommand.GrantDevice,
                     DeviceId = deviceId,
                     GrantPermission = permission
-                },
-                10000);
+                });
         }
 
         public RegistryResponse RevokeDevice(Guid deviceId)
         {
             if (deviceId == Guid.Empty) throw new ArgumentException("A device is required.", nameof(deviceId));
-            return RegistryControlClient.Send(
-                options.ControlPipeName,
+            return SendRequest(
                 new RegistryRequest
                 {
                     Command = RegistryCommand.RevokeDevice,
                     DeviceId = deviceId
-                },
-                10000);
+                });
         }
 
         public RegistryResponse RestartAgent()
         {
-            var response = Send(RegistryCommand.RestartAgent);
-            if (!response.Success) return response;
-            Thread.Sleep(100);
-            return EnsureAgent();
+            lock (lifecycleSync)
+            {
+                ThrowIfDisposed();
+                var response = Send(RegistryCommand.RestartAgent);
+                if (!response.Success) return response;
+                embeddedHost.Stop(TimeSpan.FromSeconds(15));
+                return EnsureAgentCore();
+            }
+        }
+
+        /// <summary>
+        /// Ends the in-memory account session before removing the two known
+        /// production account files, then starts a fresh unconfigured Agent.
+        /// This is deliberately separate from tray exit, which preserves the
+        /// local account for the next launch.
+        /// </summary>
+        public RegistryResponse ForgetLocalAccountAndRestart()
+        {
+            lock (lifecycleSync)
+            {
+                ShutdownAndWaitCore();
+                Exception forgetError = null;
+                try
+                {
+                    ProductionEnrollment.ForgetLocalAccount();
+                }
+                catch (Exception error)
+                {
+                    forgetError = error;
+                }
+
+                RegistryResponse response = null;
+                Exception restartError = null;
+                try
+                {
+                    response = EnsureAgentCore();
+                    if (response == null || !response.Success ||
+                        (response.Production != null &&
+                            (response.Production.Configured || response.Production.AccountLinked)))
+                    {
+                        throw new InvalidOperationException("The restarted Agent is not in a signed-out state.");
+                    }
+                }
+                catch (Exception error)
+                {
+                    restartError = error;
+                }
+                if (forgetError != null || restartError != null)
+                {
+                    var errors = new List<Exception>();
+                    if (forgetError != null) errors.Add(forgetError);
+                    if (restartError != null) errors.Add(restartError);
+                    throw new AggregateException(
+                        "The local TermLink account could not be forgotten and restarted safely.",
+                        errors);
+                }
+                return response;
+            }
+        }
+
+        public void LinkAccount(string pcName)
+        {
+            if (!TrayInputValidation.TryNormalizePcName(pcName, out var normalizedPcName))
+                throw new ArgumentException("A valid PC name is required.", nameof(pcName));
+            lock (lifecycleSync)
+            {
+                ProductionEnrollment.LinkAccount(options.ServerUrl, normalizedPcName);
+            }
         }
 
         public void LinkAccount(string serverUrl, string pcName)
         {
-            if (!TrayInputValidation.TryNormalizeServerOrigin(serverUrl, out var serverOrigin))
-                throw new ArgumentException("A valid HTTPS server origin is required.", nameof(serverUrl));
-            if (!TrayInputValidation.TryNormalizePcName(pcName, out var normalizedPcName))
-                throw new ArgumentException("A valid PC name is required.", nameof(pcName));
-            var start = new ProcessStartInfo
+            if (!TrayInputValidation.TryNormalizeServerOrigin(serverUrl, out var serverOrigin) ||
+                !string.Equals(serverOrigin, options.ServerUrl, StringComparison.OrdinalIgnoreCase))
             {
-                FileName = options.AgentExecutable,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden
-            };
-            start.ArgumentList.Add("--link-account");
-            start.ArgumentList.Add("--server-url");
-            start.ArgumentList.Add(serverOrigin);
-            start.ArgumentList.Add("--pc-name");
-            start.ArgumentList.Add(normalizedPcName);
-            using (var process = Process.Start(start))
-            {
-                if (process == null) throw new InvalidOperationException("TermLink account linking could not be started.");
-                if (!process.WaitForExit(6 * 60 * 1000))
-                {
-                    try { process.Kill(true); } catch { }
-                    throw new TimeoutException("TermLink account linking expired.");
-                }
-                if (process.ExitCode != 0) throw new InvalidOperationException("TermLink account linking failed or was cancelled.");
+                throw new ArgumentException("The account-link server must match the Tray server URL.", nameof(serverUrl));
             }
+            LinkAccount(pcName);
         }
 
         public void LoginAccount(string username, string password, string pcName)
         {
-            ProductionEnrollment.LoginDirect(ProductionEnrollment.PublicServerUrl, pcName, username, password);
+            lock (lifecycleSync)
+            {
+                ProductionEnrollment.LoginDirect(options.ServerUrl, pcName, username, password);
+            }
         }
 
         public void RegisterAccount(string username, string email, string password, string confirm, string pcName)
         {
-            ProductionEnrollment.RegisterDirect(ProductionEnrollment.PublicServerUrl, pcName, username, email, password, confirm);
+            lock (lifecycleSync)
+            {
+                ProductionEnrollment.RegisterDirect(options.ServerUrl, pcName, username, email, password, confirm);
+            }
         }
 
-        private bool TryList(int timeoutMilliseconds, out RegistryResponse response)
+        private void ThrowIfDisposed()
         {
-            try
-            {
-                response = RegistryControlClient.Send(
-                    options.ControlPipeName,
-                    new RegistryRequest { Command = RegistryCommand.List },
-                    timeoutMilliseconds);
-                return response.Success;
-            }
-            catch (IOException)
-            {
-            }
-            catch (TimeoutException)
-            {
-            }
-            response = null;
-            return false;
+            if (disposed) throw new ObjectDisposedException(nameof(AgentController));
         }
 
         private void WaitForOwnedProcesses(DateTime deadlineUtc)
@@ -379,11 +489,11 @@ namespace TermLink.Tray
         private List<Process> GetOwnedProcesses()
         {
             var result = new List<Process>();
-            var installRoot = Path.GetDirectoryName(options.AgentExecutable);
+            var installRoot = AppContext.BaseDirectory;
             if (string.IsNullOrWhiteSpace(installRoot)) return result;
             installRoot = Path.GetFullPath(installRoot).TrimEnd(Path.DirectorySeparatorChar) +
                 Path.DirectorySeparatorChar;
-            foreach (var name in new[] { "TermLink.Agent", "TermLink.SessionHost" })
+            foreach (var name in new[] { "TermLink.SessionHost" })
             {
                 foreach (var process in Process.GetProcessesByName(name))
                 {
@@ -407,6 +517,26 @@ namespace TermLink.Tray
                 }
             }
             return result;
+        }
+
+        public void Dispose()
+        {
+            lock (lifecycleSync)
+            {
+                if (disposed) return;
+                disposed = true;
+                try
+                {
+                    embeddedHost.Dispose();
+                }
+                catch (Exception error)
+                {
+                    // Exiting the UI must not be reclassified as a startup
+                    // failure merely because the already-stopping background
+                    // runtime reported a late network/account cleanup error.
+                    Debug.WriteLine("TermLink embedded runtime cleanup failed: " + error);
+                }
+            }
         }
     }
 }

@@ -13,6 +13,10 @@ if (args.Length > 0)
 }
 
 var sessionId = Guid.Parse("00112233-4455-6677-8899-aabbccddeeff");
+var defaultControlPipe = TermLinkControlPipe.DefaultName();
+Require(defaultControlPipe.StartsWith("termlink-agent-control-v2-", StringComparison.Ordinal) &&
+    defaultControlPipe.Length == "termlink-agent-control-v2-".Length + 16,
+    "The integrated runtime did not use the V2 account-scoped control-pipe namespace.");
 var deviceId = Guid.Parse("10213243-5465-7687-98a9-bacbdcedfe0f");
 var token = Enumerable.Range(0, SessionRegistration.HandshakeTokenBytes).Select(value => (byte)value).ToArray();
 var registration = new SessionRegistration(
@@ -41,7 +45,8 @@ foreach (var command in new[]
     RegistryCommand.EnableRemoteAccess,
     RegistryCommand.Shutdown,
     RegistryCommand.RestartAgent,
-    RegistryCommand.RefreshProductionStatus
+    RegistryCommand.RefreshProductionStatus,
+    RegistryCommand.RetryProductionConnection
 })
 {
     Require(RoundTripRequest(new RegistryRequest { Command = command }).Command == command, command + " changed.");
@@ -116,9 +121,11 @@ var response = new RegistryResponse
         AccountUsername = "codec-user",
         AccountEmail = "codec@example.test",
         ServerHost = "relay.example.test",
+        ServerOrigin = "https://relay.example.test:9443",
+        TerminalSnapshotEnabled = true,
         PcName = "Codec PC",
-        RelayState = ProductionRelayState.Connected,
-        LastErrorCode = string.Empty,
+        RelayState = ProductionRelayState.Reconnecting,
+        LastErrorCode = "CONNECTION_REFUSED",
         LastConnectedAtUtc = now,
         Devices = new List<ProductionDeviceSummary>
         {
@@ -152,8 +159,13 @@ var decoded = RoundTripResponse(response);
 Require(decoded.Success && decoded.Code == "OK" && decoded.RemoteAccessEnabled, "Response header changed.");
 Require(decoded.AffectedSessions == 2 && decoded.TimedOutSessions == 1, "Response counts changed.");
 Require(decoded.Summaries.Count == 1 && decoded.Summaries[0].ExitCode == 17, "Session summary changed.");
-Require(decoded.Production.Configured && decoded.Production.RelayState == ProductionRelayState.Connected, "Production state changed.");
+Require(decoded.Production.Configured &&
+    decoded.Production.RelayState == ProductionRelayState.Reconnecting &&
+    decoded.Production.LastErrorCode == "CONNECTION_REFUSED",
+    "Production connection state or failure reason changed.");
 Require(decoded.Production.AccountUsername == "codec-user" && decoded.Production.AccountEmail == "codec@example.test", "Account identity changed.");
+Require(decoded.Production.ServerOrigin == "https://relay.example.test:9443", "Server origin changed.");
+Require(decoded.Production.TerminalSnapshotEnabled, "Terminal Snapshot capability changed.");
 Require(decoded.Production.Devices.Count == 1 && decoded.Production.Devices[0].DeviceId == deviceId, "Device summary changed.");
 Require(decoded.Production.Sessions.Count == 1 && decoded.Production.Sessions[0].ControllerDeviceId == deviceId, "Production session changed.");
 Require(decoded.Production.PairingChallenge != null &&
@@ -169,8 +181,34 @@ var defaultProduction = RoundTripResponse(new RegistryResponse
 });
 Require(defaultProduction.Production.RelayState == ProductionRelayState.NotConfigured, "Default production state changed.");
 Require(defaultProduction.Production.Devices.Count == 0 && defaultProduction.Production.Sessions.Count == 0, "Default production collections changed.");
+Require(string.IsNullOrEmpty(defaultProduction.Production.ServerOrigin), "Default production status exposed a Server origin.");
+Require(!defaultProduction.Production.TerminalSnapshotEnabled, "Default production status enabled Terminal Snapshot.");
 
-Console.WriteLine("TermLink Agent control Pipe V5 round-trip validation passed.");
+using (var legacyRequestStream = new MemoryStream())
+{
+    RegistryControlCodec.WriteRequest(
+        legacyRequestStream,
+        new RegistryRequest { Command = RegistryCommand.RefreshProductionStatus });
+    legacyRequestStream.GetBuffer()[4] = 5;
+    legacyRequestStream.Position = 0;
+    byte legacyRequestVersion;
+    var legacyRequest = RegistryControlCodec.ReadRequest(legacyRequestStream, out legacyRequestVersion);
+    Require(legacyRequestVersion == 5 && legacyRequest.Command == RegistryCommand.RefreshProductionStatus,
+        "Pipe V5 request compatibility changed.");
+}
+
+using (var legacyResponseStream = new MemoryStream())
+{
+    RegistryControlCodec.WriteResponse(legacyResponseStream, response, 5);
+    legacyResponseStream.Position = 0;
+    var legacyResponse = RegistryControlCodec.ReadResponse(legacyResponseStream);
+    Require(string.IsNullOrEmpty(legacyResponse.Production.ServerOrigin),
+        "Pipe V5 response synthesized a Server origin.");
+    Require(!legacyResponse.Production.TerminalSnapshotEnabled,
+        "Pipe V5 response synthesized Terminal Snapshot capability.");
+}
+
+Console.WriteLine("TermLink Agent control Pipe V6/V5-compatible round-trip validation passed.");
 
 static RegistryRequest RoundTripRequest(RegistryRequest request)
 {

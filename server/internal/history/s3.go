@@ -16,10 +16,19 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/google/uuid"
 )
 
-const MaxObjectBytes int64 = 64 << 20
+const (
+	MaxObjectBytes           int64 = 64 << 20
+	MaxTranscriptObjectBytes int64 = 512 << 10
+	// MaxFileTransferObjectBytes is Amazon S3's exact single-PUT ceiling. The
+	// broker does not implement multipart upload, so it must never advertise a
+	// larger transfer. History limits remain independently much smaller.
+	MaxFileTransferObjectBytes int64 = 5 << 30
+	fileTransferSHA256Metadata       = "termlink-sha256"
+)
 
 type Store struct {
 	client  *s3.Client
@@ -83,13 +92,22 @@ func (s *Store) PresignPut(ctx context.Context, objectKey string, size int64, di
 	if err := validateObject(objectKey, size, digest); err != nil {
 		return PresignedRequest{}, err
 	}
-	result, err := s.presign.PresignPutObject(ctx, &s3.PutObjectInput{
+	encodedDigest := base64.StdEncoding.EncodeToString(digest)
+	input := &s3.PutObjectInput{
 		Bucket:         aws.String(s.bucket),
 		Key:            aws.String(objectKey),
 		ContentLength:  aws.Int64(size),
-		ChecksumSHA256: aws.String(base64.StdEncoding.EncodeToString(digest)),
+		ChecksumSHA256: aws.String(encodedDigest),
 		ContentType:    aws.String("application/octet-stream"),
-	}, s3.WithPresignExpires(lifetime))
+	}
+	if objectKeyKind(objectKey) == "file-transfer" {
+		// S3-compatible backends differ in whether HeadObject exposes the
+		// checksum family. Bind the expected digest into signed user metadata as
+		// the portable completion proof. The client cannot omit or alter this
+		// header without invalidating SigV4.
+		input.Metadata = map[string]string{fileTransferSHA256Metadata: encodedDigest}
+	}
+	result, err := s.presign.PresignPutObject(ctx, input, s3.WithPresignExpires(lifetime))
 	if err != nil {
 		return PresignedRequest{}, fmt.Errorf("presign history upload: %w", err)
 	}
@@ -107,18 +125,35 @@ func (s *Store) PresignGet(ctx context.Context, objectKey string, lifetime time.
 	return PresignedRequest{URL: result.URL, Method: result.Method, Headers: cloneHeaders(result.SignedHeader), ExpiresAt: time.Now().UTC().Add(lifetime)}, nil
 }
 
-// VerifyCiphertext streams the opaque object through SHA-256 before its
-// metadata is committed. The server never decrypts or interprets the bytes.
+// VerifyCiphertext streams bounded history objects, but verifies potentially
+// 5 GiB file transfers using signed immutable object metadata plus HEAD length.
+// The server never decrypts or interprets the bytes.
 func (s *Store) VerifyCiphertext(ctx context.Context, objectKey string, size int64, expectedDigest []byte) error {
 	if err := validateObject(objectKey, size, expectedDigest); err != nil {
 		return err
 	}
-	head, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(objectKey)})
+	fileTransfer := objectKeyKind(objectKey) == "file-transfer"
+	headInput := &s3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(objectKey)}
+	if fileTransfer {
+		headInput.ChecksumMode = types.ChecksumModeEnabled
+	}
+	head, err := s.client.HeadObject(ctx, headInput)
 	if err != nil {
 		return fmt.Errorf("stat history ciphertext: %w", err)
 	}
 	if head.ContentLength == nil || *head.ContentLength != size {
 		return errors.New("history ciphertext size mismatch")
+	}
+	if fileTransfer {
+		encodedDigest, present := head.Metadata[fileTransferSHA256Metadata]
+		if !present || encodedDigest == "" {
+			return errors.New("file transfer checksum metadata is missing")
+		}
+		actualDigest, decodeErr := base64.StdEncoding.Strict().DecodeString(encodedDigest)
+		if decodeErr != nil || !equalDigest(actualDigest, expectedDigest) {
+			return errors.New("file transfer checksum metadata mismatch")
+		}
+		return nil
 	}
 	object, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(objectKey)})
 	if err != nil {
@@ -148,16 +183,45 @@ func (s *Store) Delete(ctx context.Context, objectKey string) error {
 }
 
 func validateObject(key string, size int64, digest []byte) error {
-	if !validObjectKey(key) || size < 1 || size > MaxObjectBytes || len(digest) != sha256.Size {
+	maxSize := MaxObjectBytes
+	minSize := int64(1)
+	switch objectKeyKind(key) {
+	case "transcript":
+		maxSize = MaxTranscriptObjectBytes
+	case "file-transfer":
+		minSize = 0
+		maxSize = MaxFileTransferObjectBytes
+	}
+	if !validObjectKey(key) || size < minSize || size > maxSize || len(digest) != sha256.Size {
 		return errors.New("invalid history object metadata")
 	}
 	return nil
 }
 
+func objectKeyKind(value string) string {
+	parts := strings.Split(value, "/")
+	if len(parts) == 5 && parts[0] == "accounts" && parts[2] == "file-transfers" {
+		return "file-transfer"
+	}
+	if len(parts) != 6 {
+		return ""
+	}
+	return parts[4]
+}
+
 func validObjectKey(value string) bool {
 	parts := strings.Split(value, "/")
+	if len(parts) == 5 && parts[0] == "accounts" && parts[2] == "file-transfers" && strings.HasSuffix(parts[4], ".bin") {
+		accountID, accountErr := uuid.Parse(parts[1])
+		pcID, pcErr := uuid.Parse(parts[3])
+		operationText := strings.TrimSuffix(parts[4], ".bin")
+		operationID, operationErr := uuid.Parse(operationText)
+		return accountErr == nil && accountID.String() == parts[1] &&
+			pcErr == nil && pcID.String() == parts[3] &&
+			operationErr == nil && operationID.String() == operationText
+	}
 	if len(parts) != 6 || parts[0] != "accounts" || parts[2] != "sessions" ||
-		(parts[4] != "chunk" && parts[4] != "snapshot") || !strings.HasSuffix(parts[5], ".bin") {
+		(parts[4] != "chunk" && parts[4] != "snapshot" && parts[4] != "transcript") || !strings.HasSuffix(parts[5], ".bin") {
 		return false
 	}
 	accountID, err := uuid.Parse(parts[1])

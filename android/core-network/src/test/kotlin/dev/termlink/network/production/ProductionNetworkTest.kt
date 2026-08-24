@@ -9,6 +9,7 @@ import dev.termlink.protocol.realtime.v1.MessageType
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
@@ -21,6 +22,7 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import okhttp3.OkHttpClient
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okhttp3.mockwebserver.MockResponse
@@ -33,6 +35,23 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProductionNetworkTest {
+    @Test
+    fun realtimeNormalizesSharedRestClientForLongLivedWebSockets() {
+        val restClient = OkHttpClient.Builder()
+            .readTimeout(10, TimeUnit.SECONDS)
+            .pingInterval(0, TimeUnit.MILLISECONDS)
+            .build()
+
+        val realtimeClient = ProductionRealtimeClient.normalizedWebSocketHttpClient(restClient)
+
+        assertEquals(0, realtimeClient.readTimeoutMillis)
+        assertEquals(15_000, realtimeClient.pingIntervalMillis)
+        assertTrue(realtimeClient.dispatcher === restClient.dispatcher)
+        assertTrue(realtimeClient.connectionPool === restClient.connectionPool)
+        assertEquals(10_000, restClient.readTimeoutMillis)
+        assertEquals(0, restClient.pingIntervalMillis)
+    }
+
     @Test
     fun apiRequestCarriesValidOidcAndDeviceProof() {
         val server = MockWebServer()

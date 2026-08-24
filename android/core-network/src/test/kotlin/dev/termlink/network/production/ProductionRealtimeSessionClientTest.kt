@@ -4,6 +4,7 @@ import com.google.protobuf.ByteString
 import dev.termlink.crypto.CryptoDirection
 import dev.termlink.crypto.DeviceIdentity
 import dev.termlink.crypto.SessionCrypto
+import dev.termlink.protocol.realtime.v1.Direction
 import dev.termlink.protocol.realtime.v1.Envelope
 import dev.termlink.protocol.realtime.v1.GapPayload
 import dev.termlink.protocol.realtime.v1.InputResultPayload
@@ -11,8 +12,11 @@ import dev.termlink.protocol.realtime.v1.LeasePayload
 import dev.termlink.protocol.realtime.v1.MessageType
 import dev.termlink.protocol.realtime.v1.OutputAckPayload
 import dev.termlink.protocol.realtime.v1.OutputChunkPayload
+import dev.termlink.protocol.realtime.v1.SessionTerminateRequestPayload
 import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
 import dev.termlink.protocol.realtime.v1.SubscribePayload
+import dev.termlink.session.DurableAckCommit
+import dev.termlink.session.RemoteLifecycle
 import dev.termlink.session.RemoteSessionEvent
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.TerminalEngine
@@ -21,8 +25,10 @@ import dev.termlink.terminal.api.TerminalThemeV1
 import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -54,6 +60,7 @@ import kotlin.test.assertIs
 class ProductionRealtimeSessionClientTest {
     private lateinit var server: MockWebServer
     private lateinit var scope: CoroutineScope
+    private val multiplexers = CopyOnWriteArrayList<ProductionRealtimeMultiplexer>()
 
     @Before
     fun setUp() {
@@ -63,8 +70,205 @@ class ProductionRealtimeSessionClientTest {
 
     @After
     fun tearDown() {
+        multiplexers.forEach(ProductionRealtimeMultiplexer::close)
+        multiplexers.clear()
         scope.cancel()
         server.close()
+    }
+
+    @Test
+    fun sessionUpsertOptionalTitleIsOneOrderedEventAndLegacyLifecycleStillWorks() {
+        val titled = SessionUpsertPayload.newBuilder()
+            .setLifecycle("CHANGED")
+            .setTitle("Codex — 构建")
+            .build()
+        assertTrue(titled.hasTitle())
+        val titleEvent = assertIs<RemoteSessionEvent.Title>(
+            ProductionRealtimeSessionClient.sessionUpsertEvent(7, titled),
+        )
+        assertEquals(7L, titleEvent.sequence)
+        assertEquals("Codex — 构建", titleEvent.value)
+
+        val cleared = SessionUpsertPayload.newBuilder()
+            .setLifecycle("CHANGED")
+            .setTitle("")
+            .build()
+        assertTrue(cleared.hasTitle())
+        assertEquals(
+            "",
+            assertIs<RemoteSessionEvent.Title>(
+                ProductionRealtimeSessionClient.sessionUpsertEvent(8, cleared),
+            ).value,
+        )
+
+        val legacy = SessionUpsertPayload.newBuilder()
+            .setLifecycle("INTERRUPTED")
+            .build()
+        assertTrue(!legacy.hasTitle())
+        val lifecycleEvent = assertIs<RemoteSessionEvent.Lifecycle>(
+            ProductionRealtimeSessionClient.sessionUpsertEvent(9, legacy),
+        )
+        assertEquals(RemoteLifecycle.INTERRUPTED, lifecycleEvent.state)
+    }
+
+    @Test
+    fun sessionTitlePassThroughPreservesUnpublishedAndExplicitBlankStates(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        server.start()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = server.url("/").toString(),
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = testTransport(server.url("/").toString(), androidId, androidIdentity, sessionId),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            assertEquals(null, client.sessionTitle.value)
+            client.remoteSession.onConnected()
+            client.remoteSession.accept(RemoteSessionEvent.Title(1, ""))
+            assertEquals("", client.sessionTitle.value)
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    private fun testTransport(
+        rootUrl: String,
+        androidId: UUID,
+        identity: DeviceIdentity,
+        sessionId: UUID,
+        parentScope: CoroutineScope = scope,
+    ): ProductionRealtimeSessionTransport {
+        val multiplexer = ProductionRealtimeMultiplexer(
+            rootUrl = rootUrl,
+            tokenProvider = AccessTokenProvider { "oidc-token" },
+            deviceId = androidId,
+            identity = identity,
+            parentScope = parentScope,
+            allowCleartextForLocalTest = true,
+        )
+        multiplexers += multiplexer
+        return multiplexer.register(sessionId)
+    }
+
+    @Test
+    fun terminationWaitsForSubscriptionAndSendsEncryptedManageRequest(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val received = CompletableDeferred<Pair<Envelope, SessionTerminateRequestPayload>>()
+        val helloReceived = CompletableDeferred<WebSocket>()
+        val serverWebSocket = AtomicReference<WebSocket>()
+        val serverWebSocketClosed = CountDownLatch(1)
+
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
+                        serverWebSocket.set(webSocket)
+                    }
+
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        helloReceived.complete(webSocket)
+                    }
+
+                    override fun onMessage(webSocket: WebSocket, bytes: OkioByteString) {
+                        val envelope = Envelope.parseFrom(bytes.toByteArray())
+                        val pairwise = SessionCrypto.derivePairwiseKey(
+                            pcIdentity.exchange.privateKey,
+                            androidIdentity.exchange.publicKey,
+                            pcId,
+                            androidId,
+                            7,
+                        )
+                        val sessionKey = SessionCrypto.deriveSessionKey(
+                            pairwise,
+                            sessionId,
+                            CryptoDirection.ANDROID_TO_PC,
+                            envelope.keyId.toByteArray(),
+                        )
+                        val plaintext = ProductionRealtimeClient.decryptEnvelope(envelope, sessionKey)
+                        try {
+                            if (envelope.messageType == MessageType.SESSION_TERMINATE_REQUEST) {
+                                received.complete(
+                                    envelope to SessionTerminateRequestPayload.parseFrom(plaintext),
+                                )
+                            }
+                        } finally {
+                            plaintext.fill(0)
+                            sessionKey.fill(0)
+                            pairwise.fill(0)
+                        }
+                    }
+
+                    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                        serverWebSocketClosed.countDown()
+                    }
+                },
+            ),
+        )
+        server.start()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = server.url("/").toString(),
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = testTransport(server.url("/").toString(), androidId, androidIdentity, sessionId),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            client.start()
+            val pendingRequest = async { client.requestTermination() }
+            val webSocket = withTimeout(5_000) { helloReceived.await() }
+            assertTrue(!pendingRequest.isCompleted)
+            check(webSocket.send("{\"type\":\"welcome\",\"protocol_version\":1}"))
+            val requestId = withTimeout(5_000) { pendingRequest.await() }
+            val (envelope, payload) = withTimeout(5_000) { received.await() }
+
+            assertEquals(MessageType.SESSION_TERMINATE_REQUEST, envelope.messageType)
+            assertEquals(83, envelope.messageTypeValue)
+            assertEquals(Direction.ANDROID_TO_PC, envelope.direction)
+            assertArrayEquals(ProductionRealtimeClient.uuidBytes(pcId), envelope.recipientDeviceId.toByteArray())
+            assertArrayEquals(ProductionRealtimeClient.uuidBytes(requestId), payload.requestId.toByteArray())
+            assertEquals(16, payload.requestId.size())
+            assertEquals("USER_REQUESTED", payload.reasonCode)
+        } finally {
+            if (serverWebSocket.getAndSet(null)?.close(1000, "test complete") == true) {
+                serverWebSocketClosed.await(2, TimeUnit.SECONDS)
+            }
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
     }
 
     @Test
@@ -77,7 +281,7 @@ class ProductionRealtimeSessionClientTest {
         val keyId = "epoch-00000007".encodeToByteArray()
         val pcNoncePrefix = byteArrayOf(1, 2, 3, 4)
         val resumes = CopyOnWriteArrayList<Long>()
-        val persistedAcknowledgements = CopyOnWriteArrayList<Long>()
+        val persistedAcknowledgements = CopyOnWriteArrayList<DurableAckCommit>()
         val outputs = CopyOnWriteArrayList<ByteArray>()
         val listeners = arrayOfNulls<WebSocketListener>(2)
 
@@ -242,18 +446,19 @@ class ProductionRealtimeSessionClientTest {
             ),
             identity = androidIdentity,
             parentScope = scope,
+            transport = testTransport(server.url("/").toString(), androidId, androidIdentity, sessionId),
             reconnectDelaysMillis = listOf(25),
-            acknowledgementObserver = { sequence ->
-                persistedAcknowledgements += sequence
-                sequence
+            acknowledgementObserver = { generation, sequence ->
+                DurableAckCommit(sequence, generation).also(persistedAcknowledgements::add)
             },
+            acknowledgementResetObserver = ::resetAcknowledgement,
             allowCleartextForLocalTest = true,
         )
         try {
             client.start()
             withTimeout(10_000) { client.sessionState.first { it.lastAckedSequence == 4L } }
             assertEquals(listOf(0L, 1L), resumes)
-            assertCumulativeCursor(persistedAcknowledgements, expectedFinal = 4L)
+            assertDurableCursor(persistedAcknowledgements, expectedFinal = 4L, expectedGeneration = 1L)
             assertEquals(2, outputs.size)
             assertArrayEquals(byteArrayOf(7), outputs[0])
             assertArrayEquals(byteArrayOf(8), outputs[1])
@@ -368,7 +573,10 @@ class ProductionRealtimeSessionClientTest {
             ),
             identity = androidIdentity,
             parentScope = scope,
+            transport = testTransport(server.url("/").toString(), androidId, androidIdentity, sessionId),
             subscriberRefreshIntervalMillis = 25,
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
             allowCleartextForLocalTest = true,
         )
         try {
@@ -394,7 +602,7 @@ class ProductionRealtimeSessionClientTest {
         val pcIdentity = DeviceIdentity.generate()
         val keyId = "epoch-00000007".encodeToByteArray()
         val resumes = CopyOnWriteArrayList<Long>()
-        val durableAcks = CopyOnWriteArrayList<Long>()
+        val durableAcks = CopyOnWriteArrayList<DurableAckCommit>()
         val wireAcks = CopyOnWriteArrayList<Long>()
         val outputs = CopyOnWriteArrayList<ByteArray>()
 
@@ -517,10 +725,11 @@ class ProductionRealtimeSessionClientTest {
             ),
             identity = androidIdentity,
             parentScope = scope,
-            acknowledgementObserver = { sequence ->
-                durableAcks += sequence
-                sequence
+            transport = testTransport(server.url("/").toString(), androidId, androidIdentity, sessionId),
+            acknowledgementObserver = { generation, sequence ->
+                DurableAckCommit(sequence, generation).also(durableAcks::add)
             },
+            acknowledgementResetObserver = ::resetAcknowledgement,
             allowCleartextForLocalTest = true,
         )
         val replay = listOf(
@@ -537,7 +746,7 @@ class ProductionRealtimeSessionClientTest {
                 while (resumes.lastOrNull() != 3L || wireAcks.lastOrNull() != 3L) kotlinx.coroutines.yield()
             }
             assertEquals(listOf(0L, 3L), resumes.take(2))
-            assertCumulativeCursor(durableAcks, expectedFinal = 3L)
+            assertDurableCursor(durableAcks, expectedFinal = 3L, expectedGeneration = 1L)
             assertCumulativeCursor(wireAcks, expectedFinal = 3L)
             assertEquals(listOf(1, 2, 3), outputs.map { it.single().toInt() })
         } finally {
@@ -558,7 +767,8 @@ class ProductionRealtimeSessionClientTest {
         val pcIdentity = DeviceIdentity.generate()
         val keyId = "epoch-00000007".encodeToByteArray()
         val resumes = CopyOnWriteArrayList<Long>()
-        val durableAcks = CopyOnWriteArrayList<Long>()
+        val durableAcks = CopyOnWriteArrayList<DurableAckCommit>()
+        val durableResets = CopyOnWriteArrayList<DurableAckCommit>()
         val wireAcks = CopyOnWriteArrayList<Long>()
         val outputs = CopyOnWriteArrayList<ByteArray>()
         val engine = RecordingEngine(outputs, failOnFeedSequence = 2L)
@@ -675,9 +885,12 @@ class ProductionRealtimeSessionClientTest {
             ),
             identity = androidIdentity,
             parentScope = scope,
-            acknowledgementObserver = { sequence ->
-                durableAcks += sequence
-                sequence
+            transport = testTransport(server.url("/").toString(), androidId, androidIdentity, sessionId),
+            acknowledgementObserver = { generation, sequence ->
+                DurableAckCommit(sequence, generation).also(durableAcks::add)
+            },
+            acknowledgementResetObserver = { generation ->
+                resetAcknowledgement(generation).also(durableResets::add)
             },
             allowCleartextForLocalTest = true,
         )
@@ -711,6 +924,7 @@ class ProductionRealtimeSessionClientTest {
             assertTrue(outputs.isEmpty())
             assertEquals(durableBeforeFailure, durableAcks.toList())
             assertEquals(wireBeforeFailure, wireAcks.toList())
+            assertEquals(listOf(DurableAckCommit(sequence = 0L, rendererGeneration = 2L)), durableResets)
 
             assertEquals(
                 3L,
@@ -727,7 +941,7 @@ class ProductionRealtimeSessionClientTest {
                 }
             }
             assertEquals(listOf(0L, 3L), resumes.take(2))
-            assertCumulativeCursor(durableAcks, expectedFinal = 3L)
+            assertDurableCursor(durableAcks, expectedFinal = 3L, expectedGeneration = 2L)
             assertCumulativeCursor(wireAcks, expectedFinal = 3L)
             assertEquals(listOf(1, 2, 3), outputs.map { it.single().toInt() })
         } finally {
@@ -860,6 +1074,9 @@ class ProductionRealtimeSessionClientTest {
             ),
             identity = androidIdentity,
             parentScope = scope,
+            transport = testTransport(server.url("/").toString(), androidId, androidIdentity, sessionId),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
             authoritativeMetadataRefreshObserver = { metadataRefreshes += Unit },
             allowCleartextForLocalTest = true,
         )
@@ -1000,6 +1217,9 @@ class ProductionRealtimeSessionClientTest {
             ),
             identity = androidIdentity,
             parentScope = scope,
+            transport = testTransport(server.url("/").toString(), androidId, androidIdentity, sessionId),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
             authoritativeMetadataRefreshObserver = { metadataRefreshes += Unit },
             previousEpochGraceMillis = 40,
             reconnectDelaysMillis = listOf(1_000),
@@ -1049,6 +1269,9 @@ class ProductionRealtimeSessionClientTest {
             ),
             identity = androidIdentity,
             parentScope = scope,
+            transport = testTransport(server.url("/").toString(), androidId, androidIdentity, sessionId),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
             allowCleartextForLocalTest = true,
         )
         try {
@@ -1160,11 +1383,19 @@ class ProductionRealtimeSessionClientTest {
             ),
             identity = androidIdentity,
             parentScope = singleScope,
-            acknowledgementObserver = { sequence ->
+            transport = testTransport(
+                server.url("/").toString(),
+                androidId,
+                androidIdentity,
+                sessionId,
+                parentScope = singleScope,
+            ),
+            acknowledgementObserver = { generation, sequence ->
                 ackStarted.complete(Unit)
                 releaseAck.await()
-                sequence
+                DurableAckCommit(sequence, generation)
             },
+            acknowledgementResetObserver = ::resetAcknowledgement,
             allowCleartextForLocalTest = true,
         )
         try {
@@ -1222,7 +1453,10 @@ class ProductionRealtimeSessionClientTest {
             ),
             identity = androidIdentity,
             parentScope = scope,
+            transport = testTransport(server.url("/").toString(), androidId, androidIdentity, sessionId),
             reconnectDelaysMillis = listOf(0),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
             allowCleartextForLocalTest = true,
         )
         try {
@@ -1295,6 +1529,9 @@ class ProductionRealtimeSessionClientTest {
             ),
             identity = androidIdentity,
             parentScope = scope,
+            transport = testTransport(server.url("/").toString(), androidId, androidIdentity, sessionId),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
             allowCleartextForLocalTest = true,
         )
         try {
@@ -1382,7 +1619,7 @@ class ProductionRealtimeSessionClientTest {
         val androidIdentity = DeviceIdentity.generate()
         val pcIdentity = DeviceIdentity.generate()
         val keyId = "epoch-00000007".encodeToByteArray()
-        val durableAcks = CopyOnWriteArrayList<Long>()
+        val durableAcks = CopyOnWriteArrayList<DurableAckCommit>()
         val wireAcks = CopyOnWriteArrayList<Long>()
         val leaseId = UUID.fromString("01234567-89ab-cdef-0123-456789abcdef")
         val leaseExpiresAt = 1_900_000_000_000L
@@ -1509,10 +1746,11 @@ class ProductionRealtimeSessionClientTest {
             ),
             identity = androidIdentity,
             parentScope = scope,
-            acknowledgementObserver = { sequence ->
-                durableAcks += sequence
-                sequence
+            transport = testTransport(server.url("/").toString(), androidId, androidIdentity, sessionId),
+            acknowledgementObserver = { generation, sequence ->
+                DurableAckCommit(sequence, generation).also(durableAcks::add)
             },
+            acknowledgementResetObserver = ::resetAcknowledgement,
             allowCleartextForLocalTest = true,
         )
         try {
@@ -1525,11 +1763,11 @@ class ProductionRealtimeSessionClientTest {
             val finalState = assertIs<RemoteSessionState.ReadOnly>(client.sessionState.value)
             assertEquals("revoked", finalState.reason)
             withTimeout(2_000) {
-                while (durableAcks.lastOrNull() != 2L || wireAcks.lastOrNull() != 2L) {
+                while (durableAcks.lastOrNull()?.sequence != 2L || wireAcks.lastOrNull() != 2L) {
                     kotlinx.coroutines.yield()
                 }
             }
-            assertCumulativeCursor(durableAcks, expectedFinal = 2L)
+            assertDurableCursor(durableAcks, expectedFinal = 2L, expectedGeneration = 1L)
             assertCumulativeCursor(wireAcks, expectedFinal = 2L)
         } finally {
             client.close()
@@ -1550,7 +1788,7 @@ class ProductionRealtimeSessionClientTest {
         val pcIdentity = DeviceIdentity.generate()
         val keyId = "epoch-00000007".encodeToByteArray()
         val resumes = CopyOnWriteArrayList<Long>()
-        val durableAcks = CopyOnWriteArrayList<Long>()
+        val durableAcks = CopyOnWriteArrayList<DurableAckCommit>()
         val wireAcks = CopyOnWriteArrayList<Long>()
         val outputs = CopyOnWriteArrayList<ByteArray>()
 
@@ -1679,10 +1917,11 @@ class ProductionRealtimeSessionClientTest {
             ),
             identity = androidIdentity,
             parentScope = scope,
-            acknowledgementObserver = { sequence ->
-                durableAcks += sequence
-                sequence
+            transport = testTransport(server.url("/").toString(), androidId, androidIdentity, sessionId),
+            acknowledgementObserver = { generation, sequence ->
+                DurableAckCommit(sequence, generation).also(durableAcks::add)
             },
+            acknowledgementResetObserver = ::resetAcknowledgement,
             allowCleartextForLocalTest = true,
         )
         val replay = listOf(
@@ -1709,7 +1948,7 @@ class ProductionRealtimeSessionClientTest {
             }
             assertEquals(listOf(0L, 3L), resumes.take(2))
             assertEquals(listOf(1, 2, 3), outputs.map { it.single().toInt() })
-            assertCumulativeCursor(durableAcks, expectedFinal = 4L)
+            assertDurableCursor(durableAcks, expectedFinal = 4L, expectedGeneration = 1L)
             assertCumulativeCursor(wireAcks, expectedFinal = 4L)
         } finally {
             replay.forEach { (it as RemoteSessionEvent.Output).bytes.fill(0) }
@@ -1729,6 +1968,21 @@ class ProductionRealtimeSessionClientTest {
         assertEquals(expectedFinal, snapshot.last())
         assertTrue(snapshot.zipWithNext().all { (previous, current) -> previous < current })
     }
+
+    private fun assertDurableCursor(
+        values: List<DurableAckCommit>,
+        expectedFinal: Long,
+        expectedGeneration: Long,
+    ) {
+        assertCumulativeCursor(values.map(DurableAckCommit::sequence), expectedFinal)
+        assertTrue(values.all { it.rendererGeneration == expectedGeneration })
+    }
+
+    private suspend fun commitAcknowledgement(generation: Long, sequence: Long): DurableAckCommit =
+        DurableAckCommit(sequence = sequence, rendererGeneration = generation)
+
+    private suspend fun resetAcknowledgement(generation: Long): DurableAckCommit =
+        DurableAckCommit(sequence = 0L, rendererGeneration = generation + 1L)
 
     private class RecordingEngine(
         private val outputs: MutableList<ByteArray>,

@@ -1,17 +1,438 @@
 package dev.termlink.product
 
 import dev.termlink.model.DeviceTrustState
+import dev.termlink.model.SessionState
+import dev.termlink.network.production.TermLinkApiException
+import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
+import dev.termlink.session.InputSubmission
+import dev.termlink.session.RemoteLifecycle
+import dev.termlink.session.RemoteSessionEvent
+import dev.termlink.session.RemoteSessionState
+import java.net.URI
 import java.util.Base64
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProductContractsTest {
+    @Test
+    fun encryptedHistorySessionUpsertPreservesTitlePresenceAndLegacyLifecycle() {
+        val title = productSessionUpsertEvent(
+            41,
+            SessionUpsertPayload.newBuilder()
+                .setLifecycle("CHANGED")
+                .setTitle("Codex — 构建")
+                .build(),
+        )
+        assertTrue(title is RemoteSessionEvent.Title)
+        assertEquals("Codex — 构建", (title as RemoteSessionEvent.Title).value)
+
+        val cleared = productSessionUpsertEvent(
+            42,
+            SessionUpsertPayload.newBuilder()
+                .setLifecycle("CHANGED")
+                .setTitle("")
+                .build(),
+        )
+        assertTrue(cleared is RemoteSessionEvent.Title)
+        assertEquals("", (cleared as RemoteSessionEvent.Title).value)
+
+        val legacy = productSessionUpsertEvent(
+            43,
+            SessionUpsertPayload.newBuilder().setLifecycle("INTERRUPTED").build(),
+        )
+        assertTrue(legacy is RemoteSessionEvent.Lifecycle)
+        assertEquals(RemoteLifecycle.INTERRUPTED, (legacy as RemoteSessionEvent.Lifecycle).state)
+    }
+
+    @Test
+    fun sessionHistoryCatalogUsesOneBoundedChunkPageAndRejectsSelectorDrift() {
+        val sessionId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        assertEquals(
+            "/v1/sessions/$sessionId/history?kind=chunk&limit=50",
+            sessionChunkHistoryRequestPath(sessionId),
+        )
+
+        val page = buildJsonObject {
+            putJsonArray("items") {
+                repeat(SESSION_CHUNK_HISTORY_PAGE_LIMIT) {
+                    add(buildJsonObject { put("kind", "chunk") })
+                }
+            }
+        }
+        assertEquals(SESSION_CHUNK_HISTORY_PAGE_LIMIT, boundedChunkHistoryItems(page).size)
+
+        val wrongKind = buildJsonObject {
+            putJsonArray("items") { add(buildJsonObject { put("kind", "snapshot") }) }
+        }
+        assertThrows(IllegalArgumentException::class.java) { boundedChunkHistoryItems(wrongKind) }
+
+        val oversized = buildJsonObject {
+            putJsonArray("items") {
+                repeat(SESSION_CHUNK_HISTORY_PAGE_LIMIT + 1) {
+                    add(buildJsonObject { put("kind", "chunk") })
+                }
+            }
+        }
+        assertThrows(IllegalArgumentException::class.java) { boundedChunkHistoryItems(oversized) }
+    }
+
+    @Test
+    fun directRegistrationPayloadIncludesTheIdentityProfile() = runBlocking {
+        val password = "password123".toCharArray()
+        val confirm = "password123".toCharArray()
+
+        val payload = withClearedRegistrationSecrets(password, confirm) {
+            accountRegistrationRequestBody(
+                username = "  alice  ",
+                email = "  alice@example.test  ",
+                firstName = "  Alice  ",
+                lastName = "  Example  ",
+                password = password,
+                confirm = confirm,
+            )
+        }
+        val json = Json.parseToJsonElement(payload).jsonObject
+
+        assertEquals("alice", json.getValue("username").jsonPrimitive.content)
+        assertEquals("alice@example.test", json.getValue("email").jsonPrimitive.content)
+        assertEquals("Alice", json.getValue("first_name").jsonPrimitive.content)
+        assertEquals("Example", json.getValue("last_name").jsonPrimitive.content)
+        assertEquals("password123", json.getValue("password").jsonPrimitive.content)
+        assertEquals("password123", json.getValue("password_confirm").jsonPrimitive.content)
+        assertArrayEquals(CharArray(password.size), password)
+        assertArrayEquals(CharArray(confirm.size), confirm)
+    }
+
+    @Test
+    fun directRegistrationSecretsAreClearedAfterLocalValidationFailure() = runBlocking {
+        val password = "password123".toCharArray()
+        val confirm = "password123".toCharArray()
+
+        val failure = runCatching {
+            withClearedRegistrationSecrets(password, confirm) {
+                accountRegistrationRequestBody(
+                    username = "alice",
+                    email = "alice@example.test",
+                    firstName = "",
+                    lastName = "Example",
+                    password = password,
+                    confirm = confirm,
+                )
+            }
+        }
+
+        assertTrue(failure.exceptionOrNull() is IllegalArgumentException)
+        assertArrayEquals(CharArray(password.size), password)
+        assertArrayEquals(CharArray(confirm.size), confirm)
+
+        val remotePassword = "password456".toCharArray()
+        val remoteConfirm = "password456".toCharArray()
+        val remoteFailure = runCatching {
+            withClearedRegistrationSecrets(remotePassword, remoteConfirm) {
+                error("registration rejected")
+            }
+        }
+        assertEquals("registration rejected", remoteFailure.exceptionOrNull()?.message)
+        assertArrayEquals(CharArray(remotePassword.size), remotePassword)
+        assertArrayEquals(CharArray(remoteConfirm.size), remoteConfirm)
+    }
+
+    @Test
+    fun commandSubmissionIsOneOrderedInputEndingInCarriageReturn() {
+        assertEquals("ni TLFINAL123\r", commandInputBytes("ni TLFINAL123").decodeToString())
+        assertEquals(null, commandSubmissionFailure(InputSubmission.Sent(UUID.randomUUID())))
+        assertEquals(
+            "Request control before sending a command",
+            commandSubmissionFailure(InputSubmission.RejectedNoLease),
+        )
+        assertThrows(IllegalArgumentException::class.java) { commandInputBytes("") }
+    }
+
+    @Test
+    fun selectedRunningSessionRequestsControlInitiallyAndAfterRealtimeReconnect() {
+        assertEquals(
+            SessionControlRequestTrigger.INITIAL_OPEN,
+            sessionControlRequestTrigger(
+                foreground = true,
+                online = true,
+                remoteState = null,
+            ),
+        )
+        assertEquals(
+            SessionControlRequestTrigger.NONE,
+            sessionControlRequestTrigger(
+                foreground = true,
+                online = true,
+                remoteState = RemoteSessionState.Reconnecting(lastAckedSequence = 40),
+            ),
+        )
+        assertEquals(
+            SessionControlRequestTrigger.REALTIME_LIVE,
+            sessionControlRequestTrigger(
+                foreground = true,
+                online = true,
+                remoteState = RemoteSessionState.Live(lastAckedSequence = 40),
+            ),
+        )
+        // ACK progress keeps the same stable effect key, so terminal output
+        // cannot create a lease-request loop.
+        assertEquals(
+            SessionControlRequestTrigger.REALTIME_LIVE,
+            sessionControlRequestTrigger(
+                foreground = true,
+                online = true,
+                remoteState = RemoteSessionState.Live(lastAckedSequence = 41),
+            ),
+        )
+        assertEquals(
+            SessionControlRequestTrigger.NONE,
+            sessionControlRequestTrigger(
+                foreground = true,
+                online = true,
+                remoteState = RemoteSessionState.Controlling(
+                    lastAckedSequence = 41,
+                    leaseId = UUID.randomUUID().toString(),
+                    expiresAtEpochMillis = Long.MAX_VALUE,
+                ),
+            ),
+        )
+        assertEquals(
+            SessionControlRequestTrigger.FOREGROUND_RESUME,
+            sessionControlRequestTrigger(
+                foreground = true,
+                online = true,
+                remoteState = RemoteSessionState.ReadOnly(
+                    lastAckedSequence = 41,
+                    reason = "transport reconnected without a live lease",
+                ),
+            ),
+        )
+        assertEquals(
+            SessionControlRequestTrigger.NONE,
+            sessionControlRequestTrigger(
+                foreground = true,
+                online = false,
+                remoteState = null,
+            ),
+        )
+        assertEquals(
+            SessionControlRequestTrigger.NONE,
+            sessionControlRequestTrigger(
+                foreground = false,
+                online = true,
+                remoteState = RemoteSessionState.Live(lastAckedSequence = 41),
+            ),
+        )
+        assertEquals(
+            SessionControlRequestTrigger.FOREGROUND_RESUME,
+            sessionControlRequestTrigger(
+                foreground = true,
+                online = true,
+                remoteState = RemoteSessionState.ReadOnly(
+                    lastAckedSequence = 41,
+                    reason = "control released",
+                ),
+            ),
+        )
+        assertEquals(
+            SessionControlRequestTrigger.FOREGROUND_RESUME,
+            sessionControlRequestTrigger(
+                foreground = true,
+                online = true,
+                remoteState = RemoteSessionState.ReadOnly(
+                    lastAckedSequence = 41,
+                    reason = "LOCAL_INPUT_WON",
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun controlRequestEffectIsStableAcrossAckButAdvancesForEveryForegroundEntry() {
+        val initial = sessionControlRequestEffectKey(
+            foreground = true,
+            foregroundGeneration = 1,
+            online = true,
+            remoteState = null,
+        )
+        assertEquals(
+            SessionControlRequestEffectKey(1, SessionControlRequestTrigger.INITIAL_OPEN),
+            initial,
+        )
+
+        val liveAt40 = sessionControlRequestEffectKey(
+            foreground = true,
+            foregroundGeneration = 1,
+            online = true,
+            remoteState = RemoteSessionState.Live(lastAckedSequence = 40),
+        )
+        val liveAt41 = sessionControlRequestEffectKey(
+            foreground = true,
+            foregroundGeneration = 1,
+            online = true,
+            remoteState = RemoteSessionState.Live(lastAckedSequence = 41),
+        )
+        assertEquals(liveAt40, liveAt41)
+        assertEquals(
+            null,
+            sessionControlRequestEffectKey(
+                foreground = false,
+                foregroundGeneration = 1,
+                online = true,
+                remoteState = RemoteSessionState.Live(lastAckedSequence = 41),
+            ),
+        )
+
+        val secondForegroundGeneration = nextForegroundGeneration(1)
+        assertEquals(2L, secondForegroundGeneration)
+        val resumed = sessionControlRequestEffectKey(
+            foreground = true,
+            foregroundGeneration = secondForegroundGeneration,
+            online = true,
+            remoteState = RemoteSessionState.Live(lastAckedSequence = 41),
+        )
+        assertTrue(resumed != liveAt41)
+        assertEquals(3L, nextForegroundGeneration(secondForegroundGeneration))
+    }
+
+    @Test
+    fun failedBootstrapRetryReplacesOnlyTheInvalidInstalledClient() {
+        val failed = RemoteSessionState.Reconnecting(
+            lastAckedSequence = 40,
+            reason = SESSION_BOOTSTRAP_FAILED_REASON,
+        )
+        assertTrue(shouldReplaceLiveSessionForOpen(liveSessionExists = true, remoteState = failed))
+        assertFalse(shouldReplaceLiveSessionForOpen(liveSessionExists = false, remoteState = failed))
+        assertFalse(
+            shouldReplaceLiveSessionForOpen(
+                liveSessionExists = true,
+                remoteState = RemoteSessionState.Reconnecting(
+                    lastAckedSequence = 40,
+                    reason = SESSION_BOOTSTRAP_IN_PROGRESS_REASON,
+                ),
+            ),
+        )
+        assertFalse(
+            shouldReplaceLiveSessionForOpen(
+                liveSessionExists = true,
+                remoteState = RemoteSessionState.Live(lastAckedSequence = 40),
+            ),
+        )
+    }
+
+    @Test
+    fun leaseHeldRetryOutlivesServerTtlButStopsAfterItsBoundedSchedule() = runBlocking {
+        assertTrue(CONTROL_LEASE_HELD_RETRY_DELAYS_MILLIS.sum() > 30_000L)
+        var requests = 0
+        val pauses = mutableListOf<Long>()
+
+        val acquired = acquireControlLeaseWithRetry(
+            remoteState = { RemoteSessionState.Live(lastAckedSequence = 50) },
+            request = {
+                requests += 1
+                if (requests < 3) throw TermLinkApiException(409, "LEASE_HELD", traceId = null)
+            },
+            retryDelaysMillis = listOf(1_000L, 2_000L),
+            pause = { pauses += it },
+        )
+
+        assertTrue(acquired)
+        assertEquals(3, requests)
+        assertEquals(listOf(1_000L, 2_000L), pauses)
+    }
+
+    @Test
+    fun leaseRetryRejectsOtherFailuresAndSkipsAnExistingLease() {
+        var requests = 0
+        val failure = assertThrows(TermLinkApiException::class.java) {
+            runBlocking {
+                acquireControlLeaseWithRetry(
+                    remoteState = { RemoteSessionState.Live(lastAckedSequence = 50) },
+                    request = {
+                        requests += 1
+                        throw TermLinkApiException(503, "LEASE_UNAVAILABLE", traceId = null)
+                    },
+                    retryDelaysMillis = listOf(1L),
+                    pause = { error("must not retry") },
+                )
+            }
+        }
+        assertEquals("LEASE_UNAVAILABLE", failure.code)
+        assertEquals(1, requests)
+
+        val skipped = runBlocking {
+            acquireControlLeaseWithRetry(
+                remoteState = {
+                    RemoteSessionState.Controlling(
+                        lastAckedSequence = 50,
+                        leaseId = UUID.randomUUID().toString(),
+                        expiresAtEpochMillis = Long.MAX_VALUE,
+                    )
+                },
+                request = { error("must not request an existing lease") },
+            )
+        }
+        assertFalse(skipped)
+    }
+
+    @Test
+    fun leaseHeldRetryStopsAfterTheConfiguredAttempts() {
+        var requests = 0
+        val pauses = mutableListOf<Long>()
+        val failure = assertThrows(TermLinkApiException::class.java) {
+            runBlocking {
+                acquireControlLeaseWithRetry(
+                    remoteState = { RemoteSessionState.Live(lastAckedSequence = 50) },
+                    request = {
+                        requests += 1
+                        throw TermLinkApiException(409, "LEASE_HELD", traceId = null)
+                    },
+                    retryDelaysMillis = listOf(1L, 2L),
+                    pause = { pauses += it },
+                )
+            }
+        }
+
+        assertEquals("LEASE_HELD", failure.code)
+        assertEquals(3, requests)
+        assertEquals(listOf(1L, 2L), pauses)
+    }
+
+    @Test
+    fun leaseRetryPropagatesCancellationWithoutAnotherRequest() {
+        val cancellation = CancellationException("session page left")
+        var requests = 0
+        val thrown = assertThrows(CancellationException::class.java) {
+            runBlocking {
+                acquireControlLeaseWithRetry(
+                    remoteState = { RemoteSessionState.Live(lastAckedSequence = 50) },
+                    request = {
+                        requests += 1
+                        throw TermLinkApiException(409, "LEASE_HELD", traceId = null)
+                    },
+                    retryDelaysMillis = listOf(1L),
+                    pause = { throw cancellation },
+                )
+            }
+        }
+
+        assertTrue(thrown === cancellation)
+        assertEquals(1, requests)
+    }
+
     @Test
     fun serverUrlPolicyRequiresHttpsUnlessExplicitlyTestingCleartext() {
         assertEquals("https://example.com:8443", ServerUrlPolicy.normalize(" HTTPS://Example.com:8443/ "))
@@ -20,6 +441,14 @@ class ProductContractsTest {
         assertThrows(IllegalArgumentException::class.java) { ServerUrlPolicy.normalize("https://user:pass@example.com") }
         assertThrows(IllegalArgumentException::class.java) { ServerUrlPolicy.normalize("https://example.com/api") }
         assertThrows(IllegalArgumentException::class.java) { ServerUrlPolicy.normalize("https://example.com?debug=true") }
+    }
+
+    @Test
+    fun historyDownloadsUseTheSameDebugOnlyCleartextGate() {
+        assertTrue(historyDownloadUriAllowed(URI("https://objects.example/history"), false))
+        assertTrue(historyDownloadUriAllowed(URI("http://192.168.9.28:8080/history"), true))
+        assertFalse(historyDownloadUriAllowed(URI("http://192.168.9.28:8080/history"), false))
+        assertFalse(historyDownloadUriAllowed(URI("ftp://192.168.9.28/history"), true))
     }
 
     @Test
@@ -48,6 +477,23 @@ class ProductContractsTest {
         assertEquals(DeviceTrustState.TRUSTED, trusted.trustState)
         assertEquals(id, pending.id)
         assertEquals(id, trusted.id)
+    }
+
+    @Test
+    fun pcReachabilityUsesTheServerOnlineFieldInsteadOfLastSeenTime() {
+        val onlineWithOldHeartbeat = Json.parseToJsonElement(
+            """{"online":true,"last_seen_at":"2000-01-01T00:00:00Z"}""",
+        ).jsonObject
+        val offlineWithFutureHeartbeat = Json.parseToJsonElement(
+            """{"online":false,"last_seen_at":"2999-01-01T00:00:00Z"}""",
+        ).jsonObject
+        val missingOnline = Json.parseToJsonElement(
+            """{"last_seen_at":"2999-01-01T00:00:00Z"}""",
+        ).jsonObject
+
+        assertTrue(authoritativePcOnline(onlineWithOldHeartbeat))
+        assertFalse(authoritativePcOnline(offlineWithFutureHeartbeat))
+        assertFalse(authoritativePcOnline(missingOnline))
     }
 
     @Test

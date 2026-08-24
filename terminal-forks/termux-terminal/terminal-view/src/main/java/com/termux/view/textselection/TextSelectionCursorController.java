@@ -192,8 +192,8 @@ public class TextSelectionCursorController implements CursorController {
 
             @Override
             public void onGetContentRect(ActionMode mode, View view, Rect outRect) {
-                int x1 = Math.round(mSelX1 * terminalView.mRenderer.getFontWidth());
-                int x2 = Math.round(mSelX2 * terminalView.mRenderer.getFontWidth());
+                int x1 = terminalView.getPointX(mSelX1);
+                int x2 = terminalView.getPointX(mSelX2);
                 int y1 = Math.round((mSelY1 - 1 - terminalView.getTopRow()) * terminalView.mRenderer.getFontLineSpacing());
                 int y2 = Math.round((mSelY2 + 1 - terminalView.getTopRow()) * terminalView.mRenderer.getFontLineSpacing());
 
@@ -217,7 +217,7 @@ public class TextSelectionCursorController implements CursorController {
     @Override
     public void updatePosition(TextSelectionHandleView handle, int x, int y) {
         TerminalBuffer screen = terminalView.mEmulator.getScreen();
-        final int scrollRows = screen.getActiveRows() - terminalView.mEmulator.mRows;
+        final int scrollRows = screen.getActiveTranscriptRows();
         if (handle == mStartHandle) {
             mSelX1 = terminalView.getCursorX(x);
             mSelY1 = terminalView.getCursorY(y);
@@ -248,10 +248,10 @@ public class TextSelectionCursorController implements CursorController {
                     if (topRow < -scrollRows) {
                         topRow = -scrollRows;
                     }
-                } else if (mSelY1 >= topRow + terminalView.mEmulator.mRows) {
+                } else if (mSelY1 >= topRow + terminalView.getVisibleRows()) {
                     topRow++;
-                    if (topRow > 0) {
-                        topRow = 0;
+                    if (topRow > terminalView.getMaximumTopRowForViewport()) {
+                        topRow = terminalView.getMaximumTopRowForViewport();
                     }
                 }
 
@@ -288,10 +288,10 @@ public class TextSelectionCursorController implements CursorController {
                     if (topRow < -scrollRows) {
                         topRow = -scrollRows;
                     }
-                } else if (mSelY2 >= topRow + terminalView.mEmulator.mRows) {
+                } else if (mSelY2 >= topRow + terminalView.getVisibleRows()) {
                     topRow++;
-                    if (topRow > 0) {
-                        topRow = 0;
+                    if (topRow > terminalView.getMaximumTopRowForViewport()) {
+                        topRow = terminalView.getMaximumTopRowForViewport();
                     }
                 }
 

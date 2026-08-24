@@ -70,6 +70,14 @@ namespace TermLink.Agent
         }
     }
 
+    internal sealed class ProductionIdentitySelection
+    {
+        public bool ReuseDeviceIdentity { get; set; }
+        public bool ReusePcIdentity { get; set; }
+        public Guid DeviceId { get; set; }
+        public Guid PcId { get; set; }
+    }
+
     public static class ProductionEnrollment
     {
         private const string AuthorizationScopes = "openid profile email offline_access";
@@ -116,6 +124,22 @@ namespace TermLink.Agent
             return 0;
         }
 
+        /// <summary>
+        /// Runs the browser-based OIDC flow inside the interactive TermLink
+        /// process. The browser remains external, but no standalone Agent
+        /// process is created for enrollment.
+        /// </summary>
+        public static void LinkAccount(string serverUrl, string pcName)
+        {
+            var options = ProductionEnrollmentOptions.Parse(new[]
+            {
+                "--link-account",
+                "--server-url", serverUrl,
+                "--pc-name", pcName
+            });
+            RunAsync(options).GetAwaiter().GetResult();
+        }
+
         public static void LoginDirect(string serverUrl, string pcName, string username, string password)
         {
             RunDirectAsync(serverUrl, pcName, username, null, password, false).GetAwaiter().GetResult();
@@ -124,6 +148,37 @@ namespace TermLink.Agent
         public static void RegisterDirect(string serverUrl, string pcName, string username, string email, string password, string confirm)
         {
             RunDirectAsync(serverUrl, pcName, username, email, password, true, confirm).GetAwaiter().GetResult();
+        }
+
+        /// <summary>
+        /// Forgets only the local production account session. The caller must
+        /// stop the running Agent first so in-memory credentials cannot continue
+        /// a Relay session or race with file removal.
+        /// </summary>
+        public static void ForgetLocalAccount()
+        {
+            ProductionAccountStorage.ForgetLocalAccount();
+        }
+
+        internal static ProductionIdentitySelection SelectIdentity(
+            string credentialAccountKey,
+            Guid existingDeviceId,
+            string configAccountKey,
+            Guid existingPcId,
+            string incomingAccountKey)
+        {
+            var accountMatches = existingDeviceId != Guid.Empty &&
+                ProductionCredentials.CanReuseIdentity(credentialAccountKey, incomingAccountKey) &&
+                (string.IsNullOrWhiteSpace(configAccountKey) ||
+                    ProductionCredentials.CanReuseIdentity(configAccountKey, incomingAccountKey));
+            var pcMatches = accountMatches && existingPcId != Guid.Empty;
+            return new ProductionIdentitySelection
+            {
+                ReuseDeviceIdentity = accountMatches,
+                ReusePcIdentity = pcMatches,
+                DeviceId = accountMatches ? existingDeviceId : Guid.NewGuid(),
+                PcId = pcMatches ? existingPcId : Guid.NewGuid()
+            };
         }
 
         private static async Task RunDirectAsync(string serverUrl, string pcName, string username, string email, string password, bool register, string confirm = null)
@@ -184,26 +239,53 @@ namespace TermLink.Agent
                 throw new InvalidOperationException("The existing TermLink device is linked to a different server.");
             using var existingCredentials = ProductionCredentials.TryLoad();
             var account = ProductionCredentials.ReadAccountClaims(tokens.AccessToken);
+            var accountKey = ProductionCredentials.ReadAccountKey(tokens.AccessToken, client.OIDCIssuer);
+            if (string.IsNullOrWhiteSpace(accountKey))
+                throw new InvalidDataException("The OIDC access token does not identify a stable issuer and subject.");
+            var selection = SelectIdentity(
+                existingCredentials?.AccountKey,
+                existingCredentials == null ? Guid.Empty : existingCredentials.DeviceId,
+                existingConfig?.AccountKey,
+                existingConfig == null ? Guid.Empty : existingConfig.PcId,
+                accountKey);
             DeviceIdentity identity = null;
             try
             {
-                identity = existingCredentials == null ? DeviceIdentity.Generate() : existingCredentials.Identity;
-                var deviceId = existingCredentials == null ? Guid.NewGuid() : existingCredentials.DeviceId;
-                ProductionCredentials.SaveWithRefreshToken(deviceId, identity, tokens.AccessToken, tokens.RefreshToken, DateTime.UtcNow.AddSeconds(tokens.ExpiresIn));
+                identity = selection.ReuseDeviceIdentity ? existingCredentials.Identity : DeviceIdentity.Generate();
+                ProductionCredentials.SaveWithRefreshToken(
+                    selection.DeviceId,
+                    identity,
+                    accountKey,
+                    tokens.AccessToken,
+                    tokens.RefreshToken,
+                    DateTime.UtcNow.AddSeconds(tokens.ExpiresIn));
                 ProductionAgentConfig.Save(new ProductionAgentConfig
                 {
-                    ServerUrl = serverUrl, PcId = existingConfig == null ? Guid.NewGuid() : existingConfig.PcId,
-                    PcName = existingConfig == null ? (pcName ?? Environment.MachineName) : existingConfig.PcName,
-                    AccountUsername = string.IsNullOrWhiteSpace(account.Username) ? existingConfig?.AccountUsername : account.Username,
-                    AccountEmail = string.IsNullOrWhiteSpace(account.Email) ? existingConfig?.AccountEmail : account.Email,
+                    ServerUrl = serverUrl,
+                    PcId = selection.PcId,
+                    PcName = selection.ReusePcIdentity && existingConfig != null
+                        ? existingConfig.PcName
+                        : NormalizePcName(pcName),
+                    AccountKey = accountKey,
+                    AccountUsername = string.IsNullOrWhiteSpace(account.Username) && selection.ReusePcIdentity ? existingConfig?.AccountUsername : account.Username,
+                    AccountEmail = string.IsNullOrWhiteSpace(account.Email) && selection.ReusePcIdentity ? existingConfig?.AccountEmail : account.Email,
                     AgentVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown",
-                    KeyEpoch = existingConfig == null ? 1 : existingConfig.KeyEpoch, OIDCIssuer = client.OIDCIssuer, OIDCClientId = client.ClientId
+                    KeyEpoch = selection.ReusePcIdentity && existingConfig != null ? existingConfig.KeyEpoch : 1,
+                    OIDCIssuer = client.OIDCIssuer,
+                    OIDCClientId = client.ClientId
                 });
             }
             finally
             {
-                if (existingCredentials == null) identity?.Dispose();
+                if (!selection.ReuseDeviceIdentity) identity?.Dispose();
             }
+        }
+
+        private static string NormalizePcName(string pcName)
+        {
+            pcName = (pcName ?? Environment.MachineName).Trim();
+            if (pcName.Length < 1 || pcName.Length > 128) return Environment.MachineName;
+            return pcName;
         }
 
         private static async Task RunAsync(ProductionEnrollmentOptions options)
@@ -285,46 +367,12 @@ namespace TermLink.Agent
             if (string.IsNullOrWhiteSpace(tokens.AccessToken) || string.IsNullOrWhiteSpace(tokens.RefreshToken) || tokens.ExpiresIn < 30)
                 throw new InvalidDataException("OIDC token response is incomplete.");
 
-            var existingConfig = ProductionAgentConfig.TryLoad();
-            if (existingConfig != null && !string.Equals(
-                existingConfig.ServerUrl,
-                options.ServerUrl,
-                StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidOperationException("The existing TermLink device is linked to a different server.");
-            }
-
-            var existingCredentials = ProductionCredentials.TryLoad();
-            var account = ProductionCredentials.ReadAccountClaims(tokens.AccessToken);
-            DeviceIdentity identity = null;
             try
             {
-                identity = existingCredentials == null ? DeviceIdentity.Generate() : existingCredentials.Identity;
-                var deviceId = existingCredentials == null ? Guid.NewGuid() : existingCredentials.DeviceId;
-                var expiresAt = DateTime.UtcNow.AddSeconds(tokens.ExpiresIn);
-                ProductionCredentials.SaveWithRefreshToken(
-                    deviceId,
-                    identity,
-                    tokens.AccessToken,
-                    tokens.RefreshToken,
-                    expiresAt);
-                ProductionAgentConfig.Save(new ProductionAgentConfig
-                {
-                    ServerUrl = options.ServerUrl,
-                    PcId = existingConfig == null ? Guid.NewGuid() : existingConfig.PcId,
-                    PcName = existingConfig == null ? options.PcName : existingConfig.PcName,
-                    AccountUsername = string.IsNullOrWhiteSpace(account.Username) ? existingConfig?.AccountUsername : account.Username,
-                    AccountEmail = string.IsNullOrWhiteSpace(account.Email) ? existingConfig?.AccountEmail : account.Email,
-                    AgentVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown",
-                    KeyEpoch = existingConfig == null ? 1 : existingConfig.KeyEpoch,
-                    OIDCIssuer = client.OIDCIssuer,
-                    OIDCClientId = client.ClientId
-                });
+                PersistTokens(options.ServerUrl, options.PcName, client, tokens);
             }
             finally
             {
-                if (existingCredentials != null) existingCredentials.Dispose();
-                else if (identity != null) identity.Dispose();
                 verifier = null;
                 state = null;
                 code = null;

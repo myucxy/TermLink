@@ -72,14 +72,16 @@ func TestUpsertSessionKeepsTerminalStatesAndOutputCursorMonotonic(t *testing.T) 
 			t.Fatalf("upsert %s seq=%d: %v", state, sequence, err)
 		}
 	}
+	expectedTitleCipher := []byte("encrypted-session-title-v1")
 	read := func(wantState string, wantSequence uint64, wantEndedAt *time.Time) {
 		t.Helper()
 		var state string
 		var sequence int64
 		var endedAt *time.Time
+		var titleCipher []byte
 		if err := repository.Pool.QueryRow(ctx,
-			`SELECT state,last_output_seq,ended_at FROM sessions WHERE id=$1`, sessionID).
-			Scan(&state, &sequence, &endedAt); err != nil {
+			`SELECT state,last_output_seq,ended_at,title_cipher FROM sessions WHERE id=$1`, sessionID).
+			Scan(&state, &sequence, &endedAt, &titleCipher); err != nil {
 			t.Fatal(err)
 		}
 		if state != wantState {
@@ -94,10 +96,36 @@ func TestUpsertSessionKeepsTerminalStatesAndOutputCursorMonotonic(t *testing.T) 
 		case wantEndedAt != nil && (endedAt == nil || !endedAt.Equal(*wantEndedAt)):
 			t.Fatalf("ended_at=%v, want %v", endedAt, wantEndedAt)
 		}
+		if string(titleCipher) != string(expectedTitleCipher) {
+			t.Fatalf("title_cipher=%q, want preserved encrypted title %q", titleCipher, expectedTitleCipher)
+		}
 	}
 
+	if err := repository.UpsertSession(ctx, userID, deviceID, SessionRecord{
+		ID: sessionID, PCID: pcID, ShellType: "powershell", TitleCipher: expectedTitleCipher,
+		State: "RUNNING", Columns: 120, Rows: 40, LastOutputSequence: 1,
+	}); err != nil {
+		t.Fatalf("initial title upsert: %v", err)
+	}
+	// A metadata heartbeat without a title envelope must preserve the last
+	// encrypted directory title rather than clear it during a transient
+	// recipient-authority refresh.
 	upsert("RUNNING", 2, nil)
 	read("RUNNING", 2, nil)
+
+	// A present, non-empty recipient envelope must take the conflict-update
+	// branch and replace the stored title. Later absent updates keep this value.
+	updatedTitleCipher := []byte("encrypted-session-title-v2")
+	if err := repository.UpsertSession(ctx, userID, deviceID, SessionRecord{
+		ID: sessionID, PCID: pcID, ShellType: "powershell", TitleCipher: updatedTitleCipher,
+		State: "RUNNING", Columns: 120, Rows: 40, LastOutputSequence: 3,
+	}); err != nil {
+		t.Fatalf("updated title upsert: %v", err)
+	}
+	expectedTitleCipher = updatedTitleCipher
+	read("RUNNING", 3, nil)
+	upsert("RUNNING", 4, nil)
+	read("RUNNING", 4, nil)
 
 	endedAt := time.Now().UTC().Truncate(time.Microsecond)
 	upsert("EXITED", 10, &endedAt)

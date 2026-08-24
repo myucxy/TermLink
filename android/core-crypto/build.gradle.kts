@@ -20,4 +20,5 @@ dependencies {
     implementation("org.bouncycastle:bcprov-jdk18on:1.80")
     testImplementation(kotlin("test"))
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1")
 }

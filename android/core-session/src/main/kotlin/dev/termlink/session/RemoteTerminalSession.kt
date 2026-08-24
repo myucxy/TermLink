@@ -6,7 +6,6 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -15,8 +14,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.debounce
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -29,13 +26,14 @@ class RemoteTerminalSession(
     private val engine: TerminalEngine,
     private val outbound: RemoteSessionOutbound,
     parentScope: CoroutineScope,
-    initialAcknowledgedSequence: Long = 0,
+    initialRendererState: RendererBootstrapState = RendererBootstrapState.Empty(),
     private val resizeDebounceMillis: Long = 150,
     private val leaseRenewalIntervalMillis: Long = 10_000,
     private val clockMillis: () -> Long = System::currentTimeMillis,
     private val inputIdFactory: () -> UUID = UUID::randomUUID,
     private val disposeEngineOnClose: Boolean = true,
 ) : AutoCloseable {
+    private val initialAcknowledgedSequence = initialRendererState.sequence
     private val sessionJob = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + sessionJob)
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -47,22 +45,24 @@ class RemoteTerminalSession(
     private val mutableState = MutableStateFlow<RemoteSessionState>(
         RemoteSessionState.Reconnecting(lastAckedSequence = initialAcknowledgedSequence),
     )
-    private val mutableTitle = MutableStateFlow("")
+    // Null means no ordered title event has been observed for the current
+    // renderer generation. An empty string is a real, explicitly published
+    // title and must remain distinguishable so callers can clear fallbacks.
+    private val mutableTitle = MutableStateFlow<String?>(null)
     private val acknowledgementHighWater = AtomicLong(initialAcknowledgedSequence)
     private val acknowledgementSignal = Channel<Unit>(Channel.CONFLATED)
     private val acknowledgementJob: Job
     private var lastAppliedSequence = initialAcknowledgedSequence
     private var lastAckedSequence = initialAcknowledgedSequence
+    private var rendererGeneration = initialRendererState.rendererGeneration
     private var gapGeneration = 0L
-    private var latestTerminalSize: TerminalSize? = null
     private var leaseExpiryJob: Job? = null
     private var leaseRenewalJob: Job? = null
 
     val state: StateFlow<RemoteSessionState> = mutableState.asStateFlow()
-    val title: StateFlow<String> = mutableTitle.asStateFlow()
+    val title: StateFlow<String?> = mutableTitle.asStateFlow()
 
     init {
-        require(initialAcknowledgedSequence >= 0) { "initialAcknowledgedSequence must not be negative" }
         require(resizeDebounceMillis in 100..200) {
             "resizeDebounceMillis must be from 100 through 200"
         }
@@ -74,7 +74,6 @@ class RemoteTerminalSession(
         }
     }
 
-    @OptIn(FlowPreview::class)
     fun start() {
         check(!closed.get()) { "RemoteTerminalSession is closed" }
         check(started.compareAndSet(false, true)) { "RemoteTerminalSession is already started" }
@@ -82,12 +81,6 @@ class RemoteTerminalSession(
             engine.inputEvents.collect { bytes ->
                 submitInput(bytes)
             }
-        }
-        scope.launch {
-            engine.sizeEvents
-                .distinctUntilChanged()
-                .debounce(resizeDebounceMillis)
-                .collect(::observeResize)
         }
     }
 
@@ -143,7 +136,7 @@ class RemoteTerminalSession(
     ) {
         require(leaseId.isNotBlank()) { "leaseId is required" }
         require(expiresAtEpochMillis > clockMillis()) { "control lease is already expired" }
-        val terminalSize = mutex.withLock {
+        mutex.withLock {
             check(!closed.get()) { "RemoteTerminalSession is closed" }
             check(mutableState.value !is RemoteSessionState.Exited) { "session has exited" }
             check(mutableState.value !is RemoteSessionState.HistoryGap) {
@@ -193,10 +186,6 @@ class RemoteTerminalSession(
                     }
                 }
             }
-            latestTerminalSize
-        }
-        if (terminalSize != null) {
-            sendResize(terminalSize)
         }
     }
 
@@ -289,9 +278,9 @@ class RemoteTerminalSession(
                 val committed = acknowledgementCommitMutex.withLock {
                     val durableBefore = mutex.withLock { lastAckedSequence }
                     if (target <= durableBefore) return@withLock false
-                    val persisted = outbound.persistAcknowledgement(target)
-                    require(persisted == target) {
-                        "durable ACK commit returned $persisted for requested sequence $target"
+                    val persisted = outbound.persistAcknowledgement(rendererGeneration, target)
+                    require(persisted.sequence == target && persisted.rendererGeneration == rendererGeneration) {
+                        "durable ACK commit does not match the active renderer"
                     }
                     mutex.withLock {
                         check(target <= lastAppliedSequence) {
@@ -326,7 +315,7 @@ class RemoteTerminalSession(
             return acknowledgementCommitMutex.withLock {
                 mutex.withLock {
                     check(!closed.get()) { "RemoteTerminalSession is closed" }
-                    outbound.resetAcknowledgement()
+                    installResetCommit(outbound.resetAcknowledgement(rendererGeneration))
                     leaseExpiryJob?.cancel()
                     leaseExpiryJob = null
                     leaseRenewalJob?.cancel()
@@ -337,7 +326,7 @@ class RemoteTerminalSession(
                         lastAppliedSequence = 0
                         lastAckedSequence = 0
                         acknowledgementHighWater.set(0)
-                        mutableTitle.value = ""
+                        mutableTitle.value = null
                         mutableState.value = RemoteSessionState.Live(lastAckedSequence)
                         for (event in events) {
                             when (event) {
@@ -362,7 +351,7 @@ class RemoteTerminalSession(
                         lastAppliedSequence = 0
                         lastAckedSequence = 0
                         acknowledgementHighWater.set(0)
-                        mutableTitle.value = ""
+                        mutableTitle.value = null
                         runCatching { engine.clear() }.exceptionOrNull()?.let(error::addSuppressed)
                         gapGeneration++
                         mutableState.value = RemoteSessionState.HistoryGap(
@@ -390,7 +379,7 @@ class RemoteTerminalSession(
     suspend fun recoverFromHistory(
         events: List<RemoteSessionEvent>,
         expectedGap: RemoteSessionState.HistoryGap,
-        persist: suspend (Long) -> Unit,
+        persist: suspend (Long, Long) -> DurableAckCommit,
         publish: suspend (Long) -> Unit,
     ): Long {
         check(!closed.get()) { "RemoteTerminalSession is closed" }
@@ -433,7 +422,7 @@ class RemoteTerminalSession(
                 engine.setReadOnly(true)
                 engine.clear()
                 lastAppliedSequence = 0
-                mutableTitle.value = ""
+                mutableTitle.value = null
                 var recoveredState: RemoteSessionState = RemoteSessionState.Live(lastAckedSequence)
                 var durable = false
                 try {
@@ -464,7 +453,10 @@ class RemoteTerminalSession(
                             else -> recoveredState
                         }
                     }
-                    persist(target)
+                    val commit = persist(rendererGeneration, target)
+                    require(commit.sequence == target && commit.rendererGeneration == rendererGeneration) {
+                        "history recovery commit does not match the active renderer"
+                    }
                     durable = true
                     lastAckedSequence = target
                     acknowledgementHighWater.set(target)
@@ -482,14 +474,14 @@ class RemoteTerminalSession(
                     } else {
                         var resetFailure: Throwable? = null
                         try {
-                            outbound.resetAcknowledgement()
+                            installResetCommit(outbound.resetAcknowledgement(rendererGeneration))
                         } catch (resetError: Throwable) {
                             resetFailure = resetError
                         }
                         lastAppliedSequence = 0
                         lastAckedSequence = 0
                         acknowledgementHighWater.set(0)
-                        mutableTitle.value = ""
+                        mutableTitle.value = null
                         runCatching { engine.clear() }.exceptionOrNull()?.let(error::addSuppressed)
                         mutableState.value = RemoteSessionState.HistoryGap(
                             lastAckedSequence = 0,
@@ -511,7 +503,7 @@ class RemoteTerminalSession(
 
     suspend fun recoverFromHistory(
         events: List<RemoteSessionEvent>,
-        persist: suspend (Long) -> Unit,
+        persist: suspend (Long, Long) -> DurableAckCommit,
         publish: suspend (Long) -> Unit,
     ): Long {
         val expected = state.value as? RemoteSessionState.HistoryGap
@@ -538,6 +530,12 @@ class RemoteTerminalSession(
         require(events.last().sequence == target) {
             "raw replay does not completely fill the active history gap"
         }
+    }
+
+    private fun installResetCommit(commit: DurableAckCommit) {
+        require(commit.sequence == 0L) { "renderer reset must persist ACK zero" }
+        require(commit.rendererGeneration > rendererGeneration) { "renderer reset did not advance generation" }
+        rendererGeneration = commit.rendererGeneration
     }
 
     suspend fun submitInput(bytes: ByteArray): InputSubmission {
@@ -572,25 +570,6 @@ class RemoteTerminalSession(
                 }
             }
             InputSubmission.DeliveryUnknown(input.inputId)
-        }
-    }
-
-    private suspend fun observeResize(size: TerminalSize) {
-        val shouldSend = mutex.withLock {
-            if (closed.get()) return
-            latestTerminalSize = size
-            mutableState.value is RemoteSessionState.Controlling
-        }
-        if (shouldSend) sendResize(size)
-    }
-
-    private suspend fun sendResize(size: TerminalSize) {
-        try {
-            outbound.sendResize(size)
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            markReconnecting("resize failed")
         }
     }
 

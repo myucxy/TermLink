@@ -13,6 +13,66 @@ import org.robolectric.annotation.Config
 @Config(sdk = [26])
 class TermLinkDatabaseMigrationTest {
     @Test
+    fun migrateV4ToV5AddsEmptyEncryptedTranscriptCacheWithoutChangingExistingRows() {
+        createDatabaseAtVersion(4) {
+            execSQL(
+                """
+                INSERT INTO ack_cursors(sessionId, direction, rendererGeneration, highestContiguousSequence, updatedAtEpochMillis)
+                VALUES ('session-v4', 'PC_TO_ANDROID', 3, 42, 1234)
+                """.trimIndent(),
+            )
+        }
+
+        val migrated = openMigratedDatabase()
+        try {
+            val database = migrated.openHelper.writableDatabase
+            database.query(
+                "SELECT rendererGeneration, highestContiguousSequence FROM ack_cursors WHERE sessionId = 'session-v4'",
+            ).use { cursor ->
+                check(cursor.moveToFirst())
+                assertEquals(3L, cursor.getLong(0))
+                assertEquals(42L, cursor.getLong(1))
+            }
+            database.query("SELECT COUNT(*) FROM transcript_pages").use { cursor ->
+                check(cursor.moveToFirst())
+                assertEquals(0L, cursor.getLong(0))
+            }
+        } finally {
+            migrated.close()
+        }
+    }
+
+    @Test
+    fun migrateV3ToV4PreservesAckCursorWithoutInventingRendererCheckpoint() {
+        createDatabaseAtVersion(3) {
+            execSQL(
+                """
+                INSERT INTO ack_cursors(sessionId, direction, rendererGeneration, highestContiguousSequence, updatedAtEpochMillis)
+                VALUES ('session-v3', 'PC_TO_ANDROID', 7, 42, 1234)
+                """.trimIndent(),
+            )
+        }
+
+        val migrated = openMigratedDatabase()
+        try {
+            val database = migrated.openHelper.writableDatabase
+            database.query(
+                "SELECT rendererGeneration, highestContiguousSequence FROM ack_cursors WHERE sessionId = 'session-v3' AND direction = 'PC_TO_ANDROID'",
+            ).use { cursor ->
+                check(cursor.moveToFirst())
+                assertEquals(7L, cursor.getLong(0))
+                assertEquals(42L, cursor.getLong(1))
+            }
+            database.query("SELECT COUNT(*) FROM renderer_checkpoints").use { cursor ->
+                check(cursor.moveToFirst())
+                assertEquals(0L, cursor.getLong(0))
+            }
+        } finally {
+            migrated.close()
+        }
+    }
+
+    @Test
     fun migrateV2ToV3PreservesAckCursorAndInitializesRendererGeneration() {
         createDatabaseAtVersion(2) {
             execSQL(
@@ -78,7 +138,7 @@ class TermLinkDatabaseMigrationTest {
     /**
      * Room's MigrationTestHelper expects schemas packaged as test assets, while
      * this module exports them to the repository-level schemas directory. Seed
-     * a real v3 Room database, rebuild only the columns introduced by later
+     * a real current Room database, rebuild only the columns introduced by later
      * versions, and then let Room run the production migrations against it.
      */
     private fun createDatabaseAtVersion(
@@ -92,8 +152,19 @@ class TermLinkDatabaseMigrationTest {
             .build()
         val database = seed.openHelper.writableDatabase
         when (version) {
-            1 -> downgradeV3ToV1(database)
-            2 -> downgradeV3ToV2(database)
+            1 -> {
+                downgradeV5ToV4(database)
+                downgradeV4ToV1(database)
+            }
+            2 -> {
+                downgradeV5ToV4(database)
+                downgradeV4ToV2(database)
+            }
+            3 -> {
+                downgradeV5ToV4(database)
+                downgradeV4ToV3(database)
+            }
+            4 -> downgradeV5ToV4(database)
             else -> error("Unsupported test database version: $version")
         }
         database.insertRows()
@@ -103,14 +174,30 @@ class TermLinkDatabaseMigrationTest {
     private fun openMigratedDatabase(): TermLinkDatabase {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val migrated = Room.databaseBuilder(context, TermLinkDatabase::class.java, DATABASE_NAME)
-            .addMigrations(TermLinkDatabase.MIGRATION_1_2, TermLinkDatabase.MIGRATION_2_3)
+            .addMigrations(
+                TermLinkDatabase.MIGRATION_1_2,
+                TermLinkDatabase.MIGRATION_2_3,
+                TermLinkDatabase.MIGRATION_3_4,
+                TermLinkDatabase.MIGRATION_4_5,
+            )
             .allowMainThreadQueries()
             .build()
         migrated.openHelper.writableDatabase
         return migrated
     }
 
-    private fun downgradeV3ToV2(database: SupportSQLiteDatabase) {
+    private fun downgradeV5ToV4(database: SupportSQLiteDatabase) {
+        database.execSQL("DROP TABLE transcript_pages")
+        setRoomVersion(database, 4, V4_IDENTITY_HASH)
+    }
+
+    private fun downgradeV4ToV3(database: SupportSQLiteDatabase) {
+        database.execSQL("DROP TABLE renderer_checkpoints")
+        setRoomVersion(database, 3, V3_IDENTITY_HASH)
+    }
+
+    private fun downgradeV4ToV2(database: SupportSQLiteDatabase) {
+        downgradeV4ToV3(database)
         database.execSQL(
             """
             CREATE TABLE ack_cursors_legacy (
@@ -136,8 +223,8 @@ class TermLinkDatabaseMigrationTest {
         setRoomVersion(database, 2, V2_IDENTITY_HASH)
     }
 
-    private fun downgradeV3ToV1(database: SupportSQLiteDatabase) {
-        downgradeV3ToV2(database)
+    private fun downgradeV4ToV1(database: SupportSQLiteDatabase) {
+        downgradeV4ToV2(database)
         database.execSQL(
             """
             CREATE TABLE devices_legacy (
@@ -198,5 +285,7 @@ class TermLinkDatabaseMigrationTest {
         const val DATABASE_NAME = "termlink-migration-test.db"
         const val V1_IDENTITY_HASH = "0e5a433e894b631b4fcd81e47a099256"
         const val V2_IDENTITY_HASH = "db77fd61744b9b1bd762519fc91e1618"
+        const val V3_IDENTITY_HASH = "1ff9378e8357f8db649a79c32492baec"
+        const val V4_IDENTITY_HASH = "5256cfab24318a815b71dfa8dcbdca0e"
     }
 }

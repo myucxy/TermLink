@@ -1,5 +1,7 @@
 # Windows Agent
 
+> 2026-08-15 迁移说明：目标生产结构由 `termForward/terminal-main` 的 `AsyncTerminalChannel` 提供输入输出，Agent 负责本地桥接、E2EE 和服务端转发。当前 `AsyncTerminalChannel` 与 `TerminalMainChannelBridge` 只是本地实现/合同隔离测试；ProductionAgentRuntime 尚未切换生产数据源，本文后续的 `SessionHost`/ConPTY 内容仍是迁移前验证基线。权威需求见 [`docs/TERMINAL_INFORMATION_FORWARDING_REQUIREMENTS.md`](../docs/TERMINAL_INFORMATION_FORWARDING_REQUIREMENTS.md)。
+
 正式 Windows Agent 将使用 C# / .NET 8。阶段 0 已在
 [`prototypes/conpty-probe`](../prototypes/conpty-probe) 验证和固定原始 ConPTY 录制格式，
 并把已验证的生命周期代码迁入独立 `SessionHost` 进程。
@@ -7,6 +9,7 @@
 目录边界：
 
 - `src/Agent`：会话目录、Relay、加密缓冲与访问控制；
+- `src/Agent/TerminalMainChannelBridge.cs`：terminal-main UTF-16 异步事件到本机 UTF-8 帧的合同适配（提交后 ACK）；不依赖 ConPTY，尚未连接生产进程注册、持久化 sink 或 runtime；
 - `src/Protocol`：生产 Protobuf Envelope、设备证明、X25519/HKDF 和 ChaCha20-Poly1305；
 - `src/Tray`：当前用户托盘和设置 UI；
 - `src/SessionHost`：每会话一个 ConPTY Owner；
@@ -37,6 +40,7 @@ WinForms Tray 和单文件 Updater：
 .\tests\Test-SessionHost.ps1
 .\tests\Test-LocalAgentLoop.ps1
 .\tests\Test-LocalAgentGap.ps1
+.\tests\Test-TerminalMainChannelBridge.ps1 -DotNetPath <dotnet-8.0.303-sdk>
 .\tests\Test-SessionRegistry.ps1
 ```
 
@@ -141,18 +145,28 @@ Terminal 与内层 ConPTY。Host 退出后墓碑可安全清理，新开的 Prof
 `TermLink.Setup` 是独立的安装器工程，不加入产品运行时解决方案；由 `package/Build-Setup.ps1`
 先生成并签名 payload，再以资源形式嵌入后发布为单文件 EXE。
 
-Tray 退出不会关闭 Agent 或本地 Shell。默认控制 Pipe 名包含当前用户 SID 的 SHA-256
+“退出托盘”会停止 Agent，但保留 DPAPI 登录信息供下次启动恢复；“退出登录”会先停止 Agent，
+再只删除生产账号配置与凭据。两者都不会关闭本地 Shell。默认控制 Pipe 名包含当前用户 SID 的 SHA-256
 截断值；Tray 只消费 `SessionSummary` 和脱敏 `ProductionStatus`，不会获得 Pipe 名、Token、
 密钥、Buffer 路径或终端正文。
 `--status-json` 仅供诊断输出同一份脱敏摘要；`--restart-agent` 为受控更新保留注册索引，
 `--shutdown-agent` 按停止远程访问语义清除索引。
+
+验收进程需要与同一用户下正在运行的 TermLink Agent 隔离账号数据时，可同时设置
+`TERMLINK_ACCEPTANCE_CA_FILE` 和 `TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT`。后者必须是
+绝对路径且不能是盘符或共享根；配置和 CurrentUser DPAPI 凭据仍分别写入
+`<override>\TermLink\production-config.json` 与
+`<override>\TermLink\production-credentials.dpapi`。未设置覆盖时默认路径仍为
+`%LOCALAPPDATA%\TermLink`；未同时设置验收 CA、使用相对路径或根路径时，Agent 会拒绝该覆盖。
+退出登录仅删除解析后根目录中的上述两个已知文件，不会读取、移动或删除默认账号文件或其他
+TermLink 数据。该开关只供显式 acceptance 流程使用，不应写入常规生产启动环境。
 
 Registry 在 Buffer Root 保存 `registrations.dpapi`。文件载荷使用 DPAPI CurrentUser，写入时
 原子替换；只包含恢复路由所需的 Session ID、Shell 类型、Host PID 与启动时间、注册时间、
 Pipe 名和握手 Token。启动时必须同时匹配 PID 与进程启动时间才会恢复，以防 PID 重用；
 受控重启保留活动会话路由；正常 Session 结束、停止单会话、停止全部远程访问或受控关闭
 会把条目标记为仅恢复终端 Buffer。Agent 重启时此类条目只恢复已结束的 DPAPI 事件流，绝不
-重新连接仍在运行的本地 Host。只有该 Session 面向全部当前有效 Grant 的 E2EE 历史均已持久
+重新连接仍在运行的本地 Host。只有该 Session 面向全部当前同账号、未撤销 Android 接收方的 E2EE 历史均已持久
 提交后，Agent 才删除恢复索引和事件 chunk；History 权益或服务不可用时继续保留本地有界
 Buffer。该索引不包含终端正文、输入、标题或工作目录，也不是跨设备 Snapshot。
 
@@ -162,18 +176,36 @@ SessionHost，分别在强制结束和受控重启 Agent 后从加密索引恢�
 `docs/validation/phase1-windows-app.json`。
 
 生产 Agent 由 `src/Agent/ProductionAgentRuntime.cs` 接入 HTTPS API、生产 Protobuf
-realtime Relay、设备配对/撤销、租约和每 Android 设备历史上传；`src/Protocol` 的
+realtime Relay、同账号接收方发现、设备撤销、租约和每 Android 设备历史上传；旧配对/Grant
+端点仅保留为兼容层，不是产品前置步骤。`src/Protocol` 的
 E2EE 实现与 `protocol/protobuf/termlink_realtime.proto` 保持同一 Envelope。生产 runtime
 验证脚本覆盖无配置拒绝、DPAPI 有界重放、Gap、发送背压、刷新失败隔离、生命周期释放和
 配置密钥边界；它不把本机 V3 控制 Pipe 或 Phase 1 测试帧冒充公网协议。
+
+### Terminal Snapshot V1 运行边界
+
+`src/Protocol/SnapshotCrypto.cs` 和 ProtocolValidation 已消费共享
+`protocol/test-vectors/terminal-snapshot-v1.json`，与 Kotlin 测试复现并打开同一组 snapshot /
+transcript 密封对象，也验证严格结构和 metadata tamper 拒绝。这只是对象层互操作证据。
+
+`src/Agent/PortableTerminalModelV1.cs` 是受限 ASCII 子集的本地等价性模型，不是完整 Windows
+终端 producer，也没有消费 SessionAgent durable buffer 中的有序 `LocalFrame`。当前
+`ProductionHistoryUploader` 只创建和提交 `kind = "CHUNK"` 的历史对象，尚未生成、按接收方
+密封或上传 `SNAPSHOT`。因此 Windows Agent 不得宣告 `terminal_snapshot_v1`，不得用 snapshot
+推进 ACK；该 capability 保持默认关闭。
+
+此外，当前 wire representation 尚不能无损表示 saved autoWrap、saved DEC private-mode
+bank、DECSACE state 和 title stack。Windows producer 必须先实现对这些状态的严格拒绝或等价
+表示，再接入 durable `LocalFrame`、幂等 snapshot 上传和 capability negotiation；不能用当前
+mode 代替 saved mode，也不能静默丢弃 title stack。
 
 ## 开发项 1-7 完成矩阵
 
 | 开发项 | 范围 | 状态 | 验证与边界 |
 | --- | --- | --- | --- |
-| 1 | 生产账号/OIDC/设备注册与配对 | **已实现并验证（预配置接入）** | Go `auth`、设备注册/配对 API、Android AppAuth/Keystore、Windows challenge/撤销；Windows runtime 当前读取本机预配置的 DPAPI 凭据，不包含浏览器 OIDC enrollment UI。 |
+| 1 | 生产账号/OIDC、同账号自动注册与登录记忆 | **已实现并验证** | Windows 托盘与 Android 均可注册/登录；Windows 用 CurrentUser DPAPI、Android 用 Keystore 保护可恢复登录状态。同一 OIDC 账号无需配对、自授信或逐 PC Grant 即可发现受管 PC/Session；跨账号轮换 Windows DeviceId/PcId。旧 pairing/grant/trust API 仅作兼容。 |
 | 2 | 生产 Protobuf 实时协议、X25519 + ChaCha20-Poly1305、Relay | **已实现并验证** | `protocol/protobuf/termlink_realtime.proto`、Go `realtimewire`/Relay、Android `core-network`、Windows `src/Protocol`；向量、协议和 Relay 测试通过。 |
-| 3 | Windows ConPTY 到 Android 真实输入输出、ACK/Gap/重连、租约与本地输入优先 | **已实现并验证（模块/契约级）** | Windows `ProductionAgentRuntime`、Android 生产 Session Client、服务端租约/撤销；真实 ConPTY、跨端向量和各端自动化覆盖有界重放、ACK/Gap、输入去重、租约和本地输入 epoch，尚未做公网生产部署验收。 |
+| 3 | terminal-main 异步通道到 Android 的输入输出、ACK/Gap/重连、租约与本地输入优先 | **本地通道/合同适配已实现，生产切换待完成** | C++ 通道与 C# 假源/假 sink 隔离测试已加入；`ProductionAgentRuntime` 当前仍消费旧 SessionHost/ConPTY 帧，terminal-main 注册、认证 IPC、可重放序号、幂等 sink 与公网端到端验收均待完成。 |
 | 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
 | 5 | 服务端 Catalog、计费验证边界、权益与配额 | **核心已实现并验证（Provider 待配置）** | Go Catalog/entitlement、可注入 verified-purchase 契约和 Android Play Billing 协调已测试；生产 main 在真实 Google/Web verifier 未配置时返回 `BILLING_UNAVAILABLE`，未冒充线上购买验证。 |
 | 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |
@@ -242,9 +274,23 @@ $password = Read-Host 'PFX password' -AsSecureString
 安装器会为当前用户创建登录自启，并在
 `%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\TermLink\termlink.json` 生成独立
 Terminal Fragment。Fragment 中的 `commandline` 使用实际安装目录并正确处理空格，不会修改用户的
-`settings.json`；安装器同时在当前用户桌面和开始菜单 `Programs\TermLink` 创建指向
+`settings.json`。安装和升级每次都会原子重建 TermLink 专用的 `termlink.json`，即使旧安装标记
+缺失或旧 Fragment 仍指向已移动的目录，也会先替换这一个 TermLink 文件；不会触碰其他应用的
+Fragment/Profile。Windows 客户端“设置 → Windows Terminal 配置”提供同一修复入口，修复后
+重新打开 Windows Terminal 即可。安装器同时在当前用户桌面和开始菜单 `Programs\TermLink` 创建指向
 `TermLink.Tray.exe` 的快捷方式，升级会复用并重新生成，卸载只删除仍与安装器记录的哈希一致的
 快捷方式和 Fragment。
+
+原地升级会先检查当前安装目录中的 Agent、SessionHost、Tray 和 Updater。图形安装向导会列出
+正在运行的进程及 PID，并在终止前要求用户确认；选择“否”不会修改现有安装。静默升级默认也会
+在检测到占用时安全退出，只有调用方显式授权后才会终止这些进程及其子进程并继续升级：
+
+```powershell
+& .\artifacts\TermLink-Setup-0.1.0.0.exe `
+  --install-dir 'D:\Apps\TermLink' `
+  --terminate-running `
+  --quiet
+```
 
 静默卸载使用：
 
@@ -268,6 +314,24 @@ SessionHost，但不会处理不属于 TermLink 的普通 Windows Terminal 窗�
 
 验证脚本使用临时开发证书构建并签名单文件安装器，在带空格的临时目录执行安装、原地升级和卸载，
 核对自包含 payload、固定更新发布者证书、实际安装路径 Terminal Fragment 以及所有权受控清理。
+
+### Tray 的 AppShip EXE 更新闭环
+
+Tray 启动约 15 秒后在后台检查 `termlink-win64/stable`，设置页的“检查更新”复用同一流程。
+发现新版后会显示中英双语确认窗口；只有用户确认后才下载到
+`%LOCALAPPDATA%\TermLink\Updates`，显示进度并验证 AppShip 的大小、SHA-256 和
+Authenticode 签名。下载及最多三次重定向都必须使用 HTTPS。签名者必须匹配安装目录中的
+`TermLink.UpdatePublisher.cer` 或显式配置的发布者身份，因此开发自签名证书可在链未受信时使用，
+但缺少签名、摘要错误或签名者不匹配仍会被拒绝。验证通过后 Tray 使用 Windows Shell 打开 Setup，
+升级仍由交互式安装向导完成，不执行静默安装。
+
+受控发布者轮换可设置 `TERMLINK_UPDATE_PUBLISHER_CERTIFICATE`（CER 路径）或
+`TERMLINK_UPDATE_SIGNER_THUMBPRINT`（40 位 SHA-1 证书指纹）；同时设置时两者必须一致。
+协议和校验逻辑可独立运行：
+
+```powershell
+dotnet run --project .\tests\TrayUpdateValidation\TermLink.Tray.UpdateValidation.csproj -c Release
+```
 
 ### 下载后的 EXE 被 Windows 拦截
 
@@ -298,9 +362,10 @@ Get-Content "$env:TEMP\TermLink-Setup-error.log" -Tail 80 -ErrorAction SilentlyC
 文件权限问题。登录启动项属于可选功能，若当前用户注册表策略拒绝写入，安装器会保留核心程序
 并跳过该项。
 
-如果错误提示 `TermLink Terminal Fragment 已存在但不属于本安装器`，请换一个空安装目录，或先备份并
-处理该用户自己的 `termlink.json`；安装器不会覆盖未知的 Windows Terminal Fragment。正式生产发布
-仍必须换用受信代码签名证书和 RFC 3161 时间戳。
+TermLink 只拥有 `%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\TermLink\termlink.json`；
+此文件会在安装、升级和设置页修复时完整重建。任何其他 Fragment、Windows Terminal 的
+`settings.json` 以及普通 Profile 都不在覆盖范围。正式生产发布仍必须换用受信代码签名证书和
+RFC 3161 时间戳。
 
 ### 验收 MSIX 的证书信任
 

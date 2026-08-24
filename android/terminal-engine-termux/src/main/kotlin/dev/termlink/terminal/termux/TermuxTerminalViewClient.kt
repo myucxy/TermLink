@@ -14,15 +14,23 @@ internal class TermuxTerminalViewClient(
     private val view: TerminalView,
     private val baseTextSizePx: Int,
     private val lineSpacingMultiplier: Float,
+    private val minimumReadableTextSizePx: Int = 1,
+    private val acceptsInput: Boolean = true,
+    private val onTextSizeRequested: ((Int) -> Unit)? = null,
 ) : TerminalViewClient {
     override fun onScale(scale: Float): Float {
-        val bounded = scale.coerceIn(MIN_SCALE, MAX_SCALE)
-        view.setTextSize((baseTextSizePx * bounded).roundToInt().coerceAtLeast(1))
+        val minimumScale = (minimumReadableTextSizePx.toFloat() / baseTextSizePx)
+            .coerceIn(MIN_SCALE, 1f)
+        val bounded = scale.coerceIn(minimumScale, MAX_SCALE)
+        val requested = (baseTextSizePx * bounded).roundToInt().coerceAtLeast(minimumReadableTextSizePx)
+        onTextSizeRequested?.invoke(requested)
+        view.setTextSize(requested)
         view.setLineSpacing(lineSpacingMultiplier)
         return bounded
     }
 
     override fun onSingleTapUp(event: MotionEvent) {
+        if (!acceptsInput) return
         view.requestFocus()
         val inputMethod = view.context.getSystemService(Context.INPUT_METHOD_SERVICE)
             as? InputMethodManager
@@ -31,7 +39,11 @@ internal class TermuxTerminalViewClient(
 
     override fun shouldBackButtonBeMappedToEscape(): Boolean = false
 
-    override fun shouldEnforceCharBasedInput(): Boolean = false
+    // Android 16 Gboard no longer reliably turns TYPE_NULL keyboard presses
+    // into TerminalView key events. Character input makes the IME use the
+    // InputConnection.commitText() path while still disabling suggestions,
+    // so normal terminal typing works without composing or learning commands.
+    override fun shouldEnforceCharBasedInput(): Boolean = true
 
     override fun shouldUseCtrlSpaceWorkaround(): Boolean = false
 

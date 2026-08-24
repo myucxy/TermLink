@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
+using System.Linq;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
@@ -55,11 +56,6 @@ namespace TermLink.Agent
         bool TrySendRemoteInputRejection(Guid inputId, LocalRemoteInputResult result);
     }
 
-    internal interface IRemoteResizableSession
-    {
-        bool TrySendResize(short columns, short rows);
-    }
-
     // Kept separate from IRegistryManagedSession so existing registry test
     // doubles do not need to implement the production replay surface.
     internal interface IBufferedRegistryManagedSession
@@ -69,6 +65,13 @@ namespace TermLink.Agent
             ulong resumeFromSequence,
             out ulong earliestRetainedSequence,
             out ulong latestSequence);
+        IList<LocalFrame> ReadBufferedEvents(
+            ulong resumeFromSequence,
+            int maximumEvents,
+            long maximumStoredBytes,
+            out ulong earliestRetainedSequence,
+            out ulong latestSequence,
+            out bool hasMore);
         void DeleteBufferedEvents();
     }
 
@@ -82,12 +85,15 @@ namespace TermLink.Agent
         private readonly HashSet<Guid> releasedCompletedSessions = new HashSet<Guid>();
         private readonly HashSet<IRegistryManagedSession> retiring = new HashSet<IRegistryManagedSession>();
         private readonly HashSet<Guid> retainOnCompletion = new HashSet<Guid>();
+        private readonly HashSet<Guid> terminatingSessionIds = new HashSet<Guid>();
         private readonly IRegistryManagedSessionFactory sessionFactory;
         private readonly IRegistryRegistrationStore registrationStore;
         private readonly IRemoteAccessPolicyStore remoteAccessPolicyStore;
         private readonly Dictionary<Guid, StoppedHostIdentity> stoppedHosts =
             new Dictionary<Guid, StoppedHostIdentity>();
         private readonly HashSet<Guid> stoppedSessionIds = new HashSet<Guid>();
+        private readonly Dictionary<Guid, SessionRegistration> knownRegistrations =
+            new Dictionary<Guid, SessionRegistration>();
         private readonly int maximumSessions;
         private readonly bool retainCompletedSessions;
         private readonly string bufferRoot;
@@ -303,6 +309,10 @@ namespace TermLink.Agent
         {
             foreach (var registration in registrationStore.Load())
             {
+                if (knownRegistrations.ContainsKey(registration.SessionId))
+                    throw new InvalidDataException("Registry registration store returned duplicate Session IDs.");
+                knownRegistrations.Add(registration.SessionId, registration);
+                if (registration.Retired) continue;
                 var blockedByStoppedHost = false;
                 lock (sync)
                 {
@@ -313,22 +323,23 @@ namespace TermLink.Agent
                 {
                     var recoveryOnly = registration.AsRecoveryOnly();
                     registrationStore.Upsert(recoveryOnly);
+                    knownRegistrations[recoveryOnly.SessionId] = recoveryOnly;
                     if (RecoverCompletedSession(recoveryOnly)) recoveredSessionCount++;
-                    else registrationStore.Remove(registration.SessionId);
+                    else if (!recoveryOnly.MatchesRunningHost()) RetireRegistration(recoveryOnly.SessionId);
                     continue;
                 }
-                if (registration.RecoveryOnly || !registration.MatchesRunningHost())
+                if (!registration.MatchesRunningHost())
                 {
                     if (RecoverCompletedSession(registration))
                     {
                         recoveredSessionCount++;
                         continue;
                     }
-                    registrationStore.Remove(registration.SessionId);
+                    RetireRegistration(registration.SessionId);
                     continue;
                 }
                 string error;
-                if (!TryRegister(registration, out error))
+                if (!TryRegister(registration.AsActive(), out error))
                 {
                     throw new InvalidOperationException(
                         "Unable to recover Registry session " + registration.SessionId.ToString("D") + ": " + error);
@@ -380,6 +391,20 @@ namespace TermLink.Agent
                     error = "SESSION_STOPPED";
                     return false;
                 }
+                SessionRegistration known;
+                if (knownRegistrations.TryGetValue(registration.SessionId, out known))
+                {
+                    if (known.Retired)
+                    {
+                        error = "SESSION_RETIRED";
+                        return false;
+                    }
+                    if (!known.HasSameHostIdentity(registration))
+                    {
+                        error = "SESSION_ID_REUSED";
+                        return false;
+                    }
+                }
                 if (sessions.ContainsKey(registration.SessionId) || completedSessions.ContainsKey(registration.SessionId))
                 {
                     error = "SESSION_ALREADY_REGISTERED";
@@ -393,15 +418,23 @@ namespace TermLink.Agent
                         return false;
                     }
                 }
-                if (sessions.Count + completedSessions.Count + retiring.Count >= maximumSessions)
+                // The limit bounds workers that can still consume live Host/IPC
+                // resources. Retained completed sessions are read-only history;
+                // counting that backlog here eventually prevents every new
+                // terminal from registering until its history is uploaded.
+                // Retiring workers remain live until their stop completes and
+                // therefore continue to consume a slot.
+                if (sessions.Count + retiring.Count >= maximumSessions)
                 {
                     error = "SESSION_LIMIT_REACHED";
                     return false;
                 }
 
-                managed = sessionFactory.Create(registration, OnSessionCompleted);
-                registrationStore.Upsert(registration);
-                sessions.Add(registration.SessionId, managed);
+                var activeRegistration = registration.AsActive();
+                managed = sessionFactory.Create(activeRegistration, OnSessionCompleted);
+                registrationStore.Upsert(activeRegistration);
+                knownRegistrations[activeRegistration.SessionId] = activeRegistration;
+                sessions.Add(activeRegistration.SessionId, managed);
             }
 
             try
@@ -420,7 +453,9 @@ namespace TermLink.Agent
                     {
                         sessions.Remove(registration.SessionId);
                     }
-                    registrationStore.Remove(registration.SessionId);
+                    var recoveryOnly = registration.AsRecoveryOnly();
+                    registrationStore.Upsert(recoveryOnly);
+                    knownRegistrations[recoveryOnly.SessionId] = recoveryOnly;
                 }
                 managed.Dispose();
                 throw;
@@ -465,18 +500,6 @@ namespace TermLink.Agent
             return controllable != null && controllable.TrySendRemoteInputRejection(inputId, result);
         }
 
-        public bool TrySendResize(Guid sessionId, short columns, short rows)
-        {
-            IRemoteResizableSession resizable;
-            lock (sync)
-            {
-                IRegistryManagedSession managed;
-                if (!remoteAccessEnabled || !sessions.TryGetValue(sessionId, out managed)) return false;
-                resizable = managed as IRemoteResizableSession;
-            }
-            return resizable != null && resizable.TrySendResize(columns, rows);
-        }
-
         internal bool TryReadBufferedEvents(
             Guid sessionId,
             ulong resumeFromSequence,
@@ -515,12 +538,56 @@ namespace TermLink.Agent
             return true;
         }
 
+        internal bool TryReadBufferedEvents(
+            Guid sessionId,
+            ulong resumeFromSequence,
+            int maximumEvents,
+            long maximumStoredBytes,
+            out IList<LocalFrame> frames,
+            out ulong earliestRetainedSequence,
+            out ulong latestSequence,
+            out bool hasMore)
+        {
+            frames = null;
+            earliestRetainedSequence = 0;
+            latestSequence = 0;
+            hasMore = false;
+            IBufferedRegistryManagedSession buffered;
+            lock (sync)
+            {
+                IRegistryManagedSession managed;
+                if (!sessions.TryGetValue(sessionId, out managed) &&
+                    !completedSessions.TryGetValue(sessionId, out managed))
+                {
+                    managed = null;
+                    foreach (var candidate in retiring)
+                    {
+                        if (candidate.SessionId == sessionId)
+                        {
+                            managed = candidate;
+                            break;
+                        }
+                    }
+                    if (managed == null) return false;
+                }
+                buffered = managed as IBufferedRegistryManagedSession;
+            }
+            if (buffered == null) return false;
+            frames = buffered.ReadBufferedEvents(
+                resumeFromSequence,
+                maximumEvents,
+                maximumStoredBytes,
+                out earliestRetainedSequence,
+                out latestSequence,
+                out hasMore);
+            return true;
+        }
+
         internal void ReleaseBufferedSession(Guid sessionId)
         {
             IRegistryManagedSession completed = null;
             lock (sync)
             {
-                registrationStore.Remove(sessionId);
                 if (!completedSessions.TryGetValue(sessionId, out completed))
                 {
                     if (sessions.ContainsKey(sessionId)) releasedCompletedSessions.Add(sessionId);
@@ -538,6 +605,7 @@ namespace TermLink.Agent
                     return;
                 }
                 completedSessions.Remove(sessionId);
+                FinalizeRegistration(completed);
             }
             DeleteBufferedEvents(completed);
             completed.Dispose();
@@ -555,7 +623,7 @@ namespace TermLink.Agent
                 {
                     retainOnCompletion.Add(sessionId);
                 }
-                else registrationStore.Remove(sessionId);
+                else MarkRecoveryOnly(managed);
                 sessions.Remove(sessionId);
                 retiring.Add(managed);
             }
@@ -572,6 +640,75 @@ namespace TermLink.Agent
                 TimedOutSessions = completed ? 0 : 1,
                 PolicyPersistenceFailed = !policyDurable
             };
+        }
+
+        public bool TerminateSession(Guid sessionId)
+        {
+            if (sessionId == Guid.Empty) return false;
+            IRegistryManagedSession managed;
+            SessionRegistration registration;
+            lock (sync)
+            {
+                if (terminatingSessionIds.Contains(sessionId)) return true;
+                if (!sessions.TryGetValue(sessionId, out managed)) return false;
+                var recoverable = managed as IRecoveryRegistrationSession;
+                if (recoverable == null) return false;
+                registration = recoverable.Registration;
+            }
+
+            var terminated = false;
+            try
+            {
+                using (var process = Process.GetProcessById(registration.ExpectedHostProcessId))
+                {
+                    // PID alone is unsafe because Windows can reuse it. Verify
+                    // the durable registration's process start time again while
+                    // holding a Process handle, then recheck Registry ownership
+                    // immediately before terminating the tree.
+                    if (process.StartTime.ToUniversalTime().Ticks !=
+                        registration.ExpectedHostStartTimeUtc.Ticks)
+                    {
+                        return false;
+                    }
+                    lock (sync)
+                    {
+                        if (terminatingSessionIds.Contains(sessionId)) return true;
+                        IRegistryManagedSession current;
+                        if (!sessions.TryGetValue(sessionId, out current) ||
+                            !ReferenceEquals(current, managed))
+                        {
+                            return false;
+                        }
+                        var currentRegistration = current as IRecoveryRegistrationSession;
+                        if (currentRegistration == null ||
+                            !registration.HasSameHostIdentity(currentRegistration.Registration))
+                        {
+                            return false;
+                        }
+                        terminatingSessionIds.Add(sessionId);
+                    }
+#if TERMLINK_PRODUCTION_RUNTIME
+                    process.Kill(entireProcessTree: true);
+#else
+                    // The isolated .NET Framework validation build lacks the
+                    // Process.Kill(bool) API. Production always compiles the
+                    // entire-tree overload above.
+                    process.Kill();
+#endif
+                    terminated = process.WaitForExit(5000);
+                    return terminated;
+                }
+            }
+            catch (ArgumentException) { return false; }
+            catch (InvalidOperationException) { return false; }
+            catch (System.ComponentModel.Win32Exception) { return false; }
+            finally
+            {
+                if (!terminated)
+                {
+                    lock (sync) terminatingSessionIds.Remove(sessionId);
+                }
+            }
         }
 
         public SessionStopResult StopAllRemoteAccess()
@@ -640,7 +777,7 @@ namespace TermLink.Agent
                     }
                     else if (!preserveRegistrationsOnShutdown)
                     {
-                        registrationStore.Remove(completed.SessionId);
+                        FinalizeRegistration(completed);
                     }
                     if (wasActive) sessions.Remove(completed.SessionId);
                 }
@@ -717,7 +854,32 @@ namespace TermLink.Agent
         private void MarkRecoveryOnly(IRegistryManagedSession session)
         {
             var recoverable = session as IRecoveryRegistrationSession;
-            if (recoverable != null) registrationStore.Upsert(recoverable.Registration.AsRecoveryOnly());
+            if (recoverable == null) return;
+            var recoveryOnly = recoverable.Registration.AsRecoveryOnly();
+            registrationStore.Upsert(recoveryOnly);
+            knownRegistrations[recoveryOnly.SessionId] = recoveryOnly;
+        }
+
+        private void RetireRegistration(Guid sessionId)
+        {
+            SessionRegistration registration;
+            if (!knownRegistrations.TryGetValue(sessionId, out registration)) return;
+            registrationStore.Retire(sessionId);
+            knownRegistrations[sessionId] = registration.AsRetired();
+        }
+
+        private void FinalizeRegistration(IRegistryManagedSession session)
+        {
+            var recoverable = session as IRecoveryRegistrationSession;
+            if (recoverable == null) return;
+            var summary = session.GetSummary();
+            if (summary.Lifecycle == SessionAgentLifecycle.Ended ||
+                !recoverable.Registration.MatchesRunningHost())
+            {
+                RetireRegistration(session.SessionId);
+                return;
+            }
+            MarkRecoveryOnly(session);
         }
 
         private SessionStopResult StopSessions(IList<IRegistryManagedSession> stopped, bool commitInterruptedLifecycle)
@@ -780,9 +942,10 @@ namespace TermLink.Agent
         }
     }
 
-    internal sealed class RecoveredBufferedSession : IRegistryManagedSession, IBufferedRegistryManagedSession
+    internal sealed class RecoveredBufferedSession : IRegistryManagedSession, IRecoveryRegistrationSession, IBufferedRegistryManagedSession
     {
         private readonly EncryptedEventBuffer buffer;
+        private readonly SessionRegistration registration;
         private readonly ManagedShellType shellType;
         private readonly DateTime registeredAtUtc;
         private LocalLifecycleState lifecycle;
@@ -794,6 +957,7 @@ namespace TermLink.Agent
             long maximumBufferBytes)
         {
             if (registration == null) throw new ArgumentNullException("registration");
+            this.registration = registration;
             SessionId = registration.SessionId;
             shellType = registration.ShellType;
             registeredAtUtc = registration.RegisteredAtUtc;
@@ -802,35 +966,65 @@ namespace TermLink.Agent
 
         public Guid SessionId { get; private set; }
         public ManagedShellType ShellType { get { return shellType; } }
+        public SessionRegistration Registration { get { return registration; } }
 
         public LocalFrame EnsureTerminalFrame()
         {
             ulong earliest;
             ulong latest;
             var frames = buffer.ReadFrom(0, out earliest, out latest);
+            LocalFrame terminalLifecycle = null;
             if (frames.Count > 0)
             {
                 var last = frames[frames.Count - 1];
+                if (last.Type == LocalFrameType.SessionRemoved)
+                {
+                    LocalPayloadCodec.ParseSessionRemoved(last.Payload);
+                    for (var index = frames.Count - 2; index >= 0; index--)
+                    {
+                        if (frames[index].Type != LocalFrameType.Lifecycle) continue;
+                        terminalLifecycle = frames[index];
+                        break;
+                    }
+                    if (terminalLifecycle == null)
+                        throw new InvalidDataException("Recovered removal has no preceding terminal lifecycle.");
+                    lifecycle = LocalPayloadCodec.ParseLifecycle(terminalLifecycle.Payload, out exitCode);
+                    if (lifecycle != LocalLifecycleState.Ended &&
+                        lifecycle != LocalLifecycleState.Interrupted)
+                        throw new InvalidDataException("Recovered removal follows a non-terminal lifecycle.");
+                    return last;
+                }
                 if (last.Type == LocalFrameType.Lifecycle)
                 {
                     var state = LocalPayloadCodec.ParseLifecycle(last.Payload, out exitCode);
                     if (state == LocalLifecycleState.Ended || state == LocalLifecycleState.Interrupted)
                     {
                         lifecycle = state;
-                        return last;
+                        terminalLifecycle = last;
                     }
                 }
             }
             if (latest == ulong.MaxValue) throw new InvalidDataException("Recovered event sequence is exhausted.");
-            lifecycle = LocalLifecycleState.Interrupted;
-            exitCode = 0;
-            var terminal = new LocalFrame(
-                LocalFrameType.Lifecycle,
+            if (terminalLifecycle == null)
+            {
+                lifecycle = LocalLifecycleState.Interrupted;
+                exitCode = 0;
+                terminalLifecycle = new LocalFrame(
+                    LocalFrameType.Lifecycle,
+                    SessionId,
+                    latest + 1,
+                    LocalPayloadCodec.Lifecycle(lifecycle, exitCode));
+                buffer.Append(terminalLifecycle);
+                latest = terminalLifecycle.Sequence;
+                if (latest == ulong.MaxValue) throw new InvalidDataException("Recovered event sequence is exhausted.");
+            }
+            var removal = new LocalFrame(
+                LocalFrameType.SessionRemoved,
                 SessionId,
                 latest + 1,
-                LocalPayloadCodec.Lifecycle(lifecycle, exitCode));
-            buffer.Append(terminal);
-            return terminal;
+                LocalPayloadCodec.SessionRemoved());
+            buffer.Append(removal);
+            return removal;
         }
 
         public void Start() { }
@@ -865,6 +1059,23 @@ namespace TermLink.Agent
                 out latestSequence);
         }
 
+        public IList<LocalFrame> ReadBufferedEvents(
+            ulong resumeFromSequence,
+            int maximumEvents,
+            long maximumStoredBytes,
+            out ulong earliestRetainedSequence,
+            out ulong latestSequence,
+            out bool hasMore)
+        {
+            return buffer.ReadFrom(
+                resumeFromSequence,
+                maximumEvents,
+                maximumStoredBytes,
+                out earliestRetainedSequence,
+                out latestSequence,
+                out hasMore);
+        }
+
         public void DeleteBufferedEvents()
         {
             buffer.DeleteAll();
@@ -876,7 +1087,7 @@ namespace TermLink.Agent
         }
     }
 
-    internal sealed class ManagedSession : IRegistryManagedSession, IInterruptibleRegistryManagedSession, IRecoveryRegistrationSession, IRemoteControllableSession, IRemoteResizableSession, IBufferedRegistryManagedSession
+    internal sealed class ManagedSession : IRegistryManagedSession, IInterruptibleRegistryManagedSession, IRecoveryRegistrationSession, IRemoteControllableSession, IBufferedRegistryManagedSession
     {
         private readonly SessionAgent agent;
         private readonly SessionRegistration registration;
@@ -991,11 +1202,6 @@ namespace TermLink.Agent
             return agent.TrySendRemoteInputRejection(inputId, result);
         }
 
-        public bool TrySendResize(short columns, short rows)
-        {
-            return agent.TrySendResize(columns, rows);
-        }
-
         public IList<LocalFrame> ReadBufferedEvents(
             ulong resumeFromSequence,
             out ulong earliestRetainedSequence,
@@ -1005,6 +1211,23 @@ namespace TermLink.Agent
                 resumeFromSequence,
                 out earliestRetainedSequence,
                 out latestSequence);
+        }
+
+        public IList<LocalFrame> ReadBufferedEvents(
+            ulong resumeFromSequence,
+            int maximumEvents,
+            long maximumStoredBytes,
+            out ulong earliestRetainedSequence,
+            out ulong latestSequence,
+            out bool hasMore)
+        {
+            return agent.ReadBufferedEvents(
+                resumeFromSequence,
+                maximumEvents,
+                maximumStoredBytes,
+                out earliestRetainedSequence,
+                out latestSequence,
+                out hasMore);
         }
 
         public void DeleteBufferedEvents()
@@ -1130,7 +1353,8 @@ namespace TermLink.Agent
         private readonly IDisposable productionRuntime;
 #endif
         private readonly object sync = new object();
-        private NamedPipeServerStream activeControlPipe;
+        private readonly HashSet<NamedPipeServerStream> activeControlPipes =
+            new HashSet<NamedPipeServerStream>();
         private volatile bool shutdownRequested;
         private int requests;
         private bool disposed;
@@ -1187,69 +1411,22 @@ namespace TermLink.Agent
             Console.CancelKeyPress += cancelHandler;
             try
             {
-                while (!shutdownRequested)
+                // Control requests are short and independent, while SessionHost
+                // registration can arrive in bursts when Terminal restores many
+                // tabs. Keep enough listeners posted so clients do not mistake
+                // normal load for a missing runtime.
+                const int workerCount = 32;
+                var workers = new Thread[workerCount];
+                for (var index = 0; index < workers.Length; index++)
                 {
-                    using (var pipe = CreateControlPipe(options.ControlPipeName))
+                    workers[index] = new Thread(RunControlPipeWorker)
                     {
-                        lock (sync) activeControlPipe = pipe;
-                        try
-                        {
-                            pipe.WaitForConnection();
-                            RegistryResponse response;
-                            try
-                            {
-                                response = Handle(RegistryControlCodec.ReadRequest(pipe));
-                            }
-                            catch (InvalidDataException)
-                            {
-                                response = Response(false, "INVALID_REQUEST", 0);
-                            }
-                            catch (ArgumentException)
-                            {
-                                response = Response(false, "INVALID_REQUEST", 0);
-                            }
-                            catch (InvalidOperationException)
-                            {
-                                response = Response(false, "OPERATION_FAILED", 0);
-                            }
-                            catch (TimeoutException)
-                            {
-                                response = Response(false, "OPERATION_TIMEOUT", 0);
-                            }
-#if TERMLINK_PRODUCTION_RUNTIME
-                            catch (System.Net.Http.HttpRequestException)
-                            {
-                                response = Response(false, "PRODUCTION_REQUEST_FAILED", 0);
-                            }
-                            catch (System.Text.Json.JsonException)
-                            {
-                                response = Response(false, "PRODUCTION_RESPONSE_INVALID", 0);
-                            }
-                            catch (OperationCanceledException)
-                            {
-                                response = Response(false, "PRODUCTION_REQUEST_CANCELLED", 0);
-                            }
-#endif
-                            RegistryControlCodec.WriteResponse(pipe, response);
-                            requests++;
-                        }
-                        catch (IOException)
-                        {
-                            if (!shutdownRequested) continue;
-                        }
-                        catch (ObjectDisposedException)
-                        {
-                            if (!shutdownRequested) throw;
-                        }
-                        finally
-                        {
-                            lock (sync)
-                            {
-                                if (ReferenceEquals(activeControlPipe, pipe)) activeControlPipe = null;
-                            }
-                        }
-                    }
+                        IsBackground = true,
+                        Name = "TermLink Control " + (index + 1)
+                    };
+                    workers[index].Start();
                 }
+                foreach (var worker in workers) worker.Join();
             }
             finally
             {
@@ -1264,6 +1441,106 @@ namespace TermLink.Agent
                     ";remote_enabled=" + registry.RemoteAccessEnabled.ToString().ToLowerInvariant());
             }
             return 0;
+        }
+
+        private void RunControlPipeWorker()
+        {
+            while (true)
+            {
+                NamedPipeServerStream pipe;
+                lock (sync)
+                {
+                    if (shutdownRequested) return;
+                    pipe = CreateControlPipe(options.ControlPipeName);
+                    activeControlPipes.Add(pipe);
+                }
+                using (pipe)
+                {
+                    try
+                    {
+                        pipe.WaitForConnection();
+                        RegistryResponse response;
+                        var responseVersion = RegistryControlCodec.CurrentVersion;
+                        try
+                        {
+                            byte requestVersion;
+                            var request = RegistryControlCodec.ReadRequest(pipe, out requestVersion);
+                            responseVersion = requestVersion;
+                            response = Handle(request);
+                        }
+                        catch (InvalidDataException)
+                        {
+                            response = Response(false, "INVALID_REQUEST", 0);
+                        }
+                        catch (ArgumentException)
+                        {
+                            response = Response(false, "INVALID_REQUEST", 0);
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            response = Response(false, "OPERATION_FAILED", 0);
+                        }
+                        catch (TimeoutException)
+                        {
+                            response = Response(false, "OPERATION_TIMEOUT", 0);
+                        }
+#if TERMLINK_PRODUCTION_RUNTIME
+                        catch (System.Net.Http.HttpRequestException)
+                        {
+                            response = Response(false, "PRODUCTION_REQUEST_FAILED", 0);
+                        }
+                        catch (System.Text.Json.JsonException)
+                        {
+                            response = Response(false, "PRODUCTION_RESPONSE_INVALID", 0);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            response = Response(false, "PRODUCTION_REQUEST_CANCELLED", 0);
+                        }
+#endif
+                        RegistryControlCodec.WriteResponse(pipe, response, responseVersion);
+                        Interlocked.Increment(ref requests);
+                        if (shutdownRequested) DisposeOtherControlPipes(pipe);
+                    }
+                    catch (IOException)
+                    {
+                        if (!shutdownRequested) continue;
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        if (!shutdownRequested) throw;
+                    }
+                    finally
+                    {
+                        lock (sync) activeControlPipes.Remove(pipe);
+                    }
+                }
+            }
+        }
+
+        private void DisposeOtherControlPipes(NamedPipeServerStream current)
+        {
+            NamedPipeServerStream[] pipes;
+            lock (sync) pipes = activeControlPipes.Where(pipe => !ReferenceEquals(pipe, current)).ToArray();
+            foreach (var pipe in pipes)
+            {
+                try { pipe.Dispose(); }
+                catch (ObjectDisposedException) { }
+            }
+        }
+
+        /// <summary>
+        /// Dispatches a control request in-process. The interactive TermLink UI
+        /// uses this path so it does not have to wait for or call back through
+        /// its own named pipe. SessionHost and compatibility tools continue to
+        /// use the authenticated per-user pipe.
+        /// </summary>
+        internal RegistryResponse Dispatch(RegistryRequest request)
+        {
+            if (request == null) throw new ArgumentNullException("request");
+            var response = Handle(request);
+            if (shutdownRequested) DisposeOtherControlPipes(null);
+            return response;
         }
 
         private RegistryResponse Handle(RegistryRequest request)
@@ -1334,6 +1611,14 @@ namespace TermLink.Agent
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
 #endif
+                case RegistryCommand.RetryProductionConnection:
+#if TERMLINK_PRODUCTION_RUNTIME
+                    if (productionRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+                    productionRuntime.RequestReconnect();
+                    return Response(true, "PRODUCTION_RECONNECT_REQUESTED", 0);
+#else
+                    return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+#endif
                 case RegistryCommand.CreatePairingChallenge:
 #if TERMLINK_PRODUCTION_RUNTIME
                     if (productionRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
@@ -1400,6 +1685,8 @@ namespace TermLink.Agent
             {
                 Configured = false,
                 AccountLinked = false,
+                ServerOrigin = string.Empty,
+                TerminalSnapshotEnabled = false,
                 RelayState = ProductionRelayState.NotConfigured,
                 Devices = new List<ProductionDeviceSummary>(),
                 Sessions = new List<ProductionSessionSummary>()
@@ -1408,15 +1695,15 @@ namespace TermLink.Agent
 
         private static NamedPipeServerStream CreateControlPipe(string pipeName)
         {
-            return CurrentUserPipe.Create(pipeName, 1, PipeOptions.None, 16 * 1024, 16 * 1024);
+            return CurrentUserPipe.Create(pipeName, 64, PipeOptions.Asynchronous, 16 * 1024, 16 * 1024);
         }
 
         public void RequestShutdown()
         {
-            NamedPipeServerStream pipe;
+            NamedPipeServerStream[] pipes;
             shutdownRequested = true;
-            lock (sync) pipe = activeControlPipe;
-            if (pipe != null)
+            lock (sync) pipes = activeControlPipes.ToArray();
+            foreach (var pipe in pipes)
             {
                 try { pipe.Dispose(); }
                 catch (ObjectDisposedException) { }

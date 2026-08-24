@@ -1,8 +1,8 @@
 # TermLink 多端 UI 布局设计稿
 
-文档版本：1.2
+文档版本：1.3
 状态：生产级交互原型；生产 API Adapter 待各阶段后端实现
-更新日期：2026-08-04
+更新日期：2026-08-22
 覆盖：Android、Windows Agent、Docker Server Console、账号身份、双语、会员与兑换码
 
 ## 1. 设计稿入口
@@ -24,12 +24,12 @@ python -m http.server 4173
 
 当前原型已完成 UI 层生产化：20 个页面具有稳定 Hash 路由与恢复、语言/明暗主题持久化、
 统一命令面板、确认弹层、详情抽屉、Toast、筛选/搜索、设置子页、回放控制、控制租约、
-可信设备、远程紧急停止、账号注册登录、邮箱验证、首次管理员强制改密、角色管理、会员
+兼容设备管理、远程紧急停止、账号注册登录、邮箱验证、首次管理员强制改密、角色管理、会员
 兑换码、部署操作和版本化 Catalog 管理交互。所有按钮均有明确行为，高风险操作必须二次
 确认，320px 宽度没有页面级横向溢出。
 
 “生产级交互原型”只表示 UI 信息架构、状态、交互、安全文案、响应式和无障碍契约已经
-可作为正式客户端实现基线。账号、E2EE、设备授权、Session Host、Relay、计费验证、
+可作为正式客户端实现基线。账号、E2EE、账号隔离、设备撤销、Session Host、Relay、计费验证、
 备份和 Catalog 发布仍必须连接对应生产 API；原型对这些外部写操作只展示明确的待接入
 状态，不伪造服务端成功结果。
 
@@ -79,14 +79,14 @@ Level 4  Critical：撤销、终止、停止所有远程访问
 
 ### 3.4 语言与本地化
 
-- 支持 `跟随系统`、`简体中文` 和 `English`，首次启动默认跟随系统；
-- Android 设置页和评审页顶部均提供语言入口，Server 账号门户也可直接切换；
+- 产品目标支持 `跟随系统`、`简体中文` 和 `English`，首次启动默认跟随系统；
+- 当前 Windows Tray 已有跟随系统/中文/English 偏好；Android 已提供中英文资源并跟随系统，但 App 内固定语言切换与完整动态文案覆盖仍待验收；Server 账号门户的双语覆盖也需按实际部署逐页验证；
 - 静态页面、动态 Dialog/Drawer、Toast、筛选项、占位文字和 Accessible Name 使用同一词典；
 - 语言切换不清空当前端、页面、表单模式、主题和会话筛选状态；
 - 服务端返回错误码，客户端按本地词典显示，不依赖服务端返回可直接展示的中文或英文；
 - 日期、时间、数字、货币和复数使用目标语言区域格式，产品名、协议名和 ID 不翻译。
 
-## 4. 会员与配额规则
+## 4. 会员与数量策略
 
 ### 4.1 可配置套餐目录
 
@@ -95,33 +95,30 @@ Level 4  Critical：撤销、终止、停止所有远程访问
 | 权益 | Free（首发默认） | Pro Monthly（首发默认） |
 | --- | --- | --- |
 | 账号 | 1 个个人账号 | 同一账号 |
-| 可远程连接 PC | 1 台 | 5 台 |
-| 同时远程显示的实时会话 | 3 个不同 Session | 20 个 |
+| 可远程连接 PC | 不限数量 | 不限数量 |
+| 同时远程显示的实时会话 | 不限数量 | 不限数量 |
 | Windows 本地 Shell | 不限制 | 不限制 |
-| E2EE、设备批准和安全能力 | 完整提供 | 完整提供 |
+| E2EE、账号隔离、设备撤销和安全能力 | 完整提供 | 完整提供 |
 | 计费周期 | 免费 | 月付、自动续费、可取消 |
 
-服务端可以配置套餐名称、说明、周期、PC/Session 额度、功能标记、渠道 Product ID、排序、可见平台、上下架时间和降级目标，并以版本化 Catalog 发布。存量订阅保留原版本或按显式迁移规则处理。
+服务端可以配置套餐名称、说明、周期、功能标记、渠道 Product ID、排序、可见平台和上下架时间，并以版本化 Catalog 发布。历史 PC/Session 额度字段保留用于兼容，接口固定返回 `-1`（不限）。
 
 最终价格不写死在客户端。Android 从 Google Play Billing 返回本地化价格；Web/Windows 从服务端配置的购买渠道返回价格。所有页面在进入购买确认前展示实际价格、税费、周期和续费规则。
 
-### 4.2 “同时显示三个会话”的定义
+### 4.2 实时会话策略
 
-- 计数对象是账号当前订阅的不同 `session_id`；
-- 同一个 Session 在同一用户两台 Android 上显示，服务端可按账号 + Session 去重；
-- 历史回放不占实时会话名额；
-- 后台已经取消正文订阅的页面不占名额；
-- Windows 本地打开多少个 Shell 都不占远程显示名额；
-- 达到当前 Entitlement 上限后的实时订阅请求返回 `ENTITLEMENT_LIMIT_REACHED`；首发 Free 默认下即为第四个会话。
+- 同一账号可订阅不限数量的不同 `session_id`；
+- 同一个 Session 在同一用户多台 Android 上显示，服务端为每个设备维护独立活动租约；
+- 历史回放不改变实时订阅状态；
+- `max_remote_pcs` 与 `max_live_sessions` 为历史兼容字段，服务端统一以 `-1` 表示不限；PC 注册和实时订阅不会因数量返回 `ENTITLEMENT_LIMIT_REACHED`。
 
-### 4.3 PC 限额
+### 4.3 PC 数量策略
 
-- 首发 Free 默认只能激活一台 PC 的远程访问；
-- 第二台 Agent 登录时仍可完成账号认证，但进入 `Upgrade required` 状态，不获得远程 Presence/Session 路由；
-- 用户可免费更换主 PC，但应设置短冷却或安全确认，防止被滥用为并发切换；
-- 付费套餐过期时不会结束本地 Shell；用户按降级目标套餐额度选择保留 PC，其余 PC 暂停远程路由。
+- 同一账号可激活不限数量的 Windows PC 远程路由；
+- 每个 PC 必须使用属于该 OIDC 账号、未撤销的独立 Windows 设备身份，并通过设备签名校验；无需用户配对、自授信或创建 Grant；
+- 会员状态变化不会暂停或清理 PC/Session。
 
-### 4.4 续费与降级
+### 4.4 续费与状态变化
 
 ```mermaid
 stateDiagram-v2
@@ -131,12 +128,10 @@ stateDiagram-v2
     PurchasePending --> DefaultPlan: 取消/验证失败
     PaidActive --> Grace: 续费失败
     Grace --> PaidActive: 补扣成功
-    Grace --> FallbackOverLimit: 宽限期结束
-    FallbackOverLimit --> DefaultPlan: 用户按目标套餐选择保留资源
-    FallbackOverLimit --> PaidActive: 重新订阅
+    Grace --> DefaultPlan: 宽限期结束
 ```
 
-降级不终止 Windows 本地进程，不删除设备和历史；只暂停超过目标套餐配额的远程能力。UI 必须按服务端返回的降级额度允许用户明确选择保留哪些 PC 和实时订阅。
+状态变化不终止 Windows 本地进程，不删除设备、历史或实时订阅；UI 只展示购买/同步结果，不提供配额保留选择。
 
 ## 5. Android 布局
 
@@ -146,18 +141,19 @@ stateDiagram-v2
 
 ```text
 Brand + welcome context
-Verified Server：公开 HTTPS Origin / TLS / 更改服务器
+Verified Server：固定公开 HTTPS Origin / TLS
 Segmented mode：登录 / 创建账号
 Credential fields：用户名或邮箱 / 密码 / 邮箱验证
-Primary action：登录并绑定设备 / 创建账号并验证邮箱
-Security note：系统安全浏览器 + Authorization Code + PKCE
+Primary action：登录 / 创建账号
+Security note：固定 HTTPS OIDC 端点；需要交互时使用受控浏览器回退
 ```
 
 - 客户端公开地址固定展示 `https://termlink.kget.cc:8910`，不向用户暴露 Lucky 上游地址；
-- 提交账号动作后转入系统安全浏览器，App 只接收并校验授权结果，不持久化账号密码；
-- 注册必须覆盖服务条款确认、邮箱验证、验证邮件重发和过期处理；
+- Android 当前把凭据仅提交给固定 HTTPS OIDC Token Endpoint，不持久化密码；身份提供方要求账号设置或额外交互时，使用 Authorization Code + PKCE 浏览器回退；
+- 注册必须覆盖服务条款确认；当前部署未要求邮箱验证，若运营方后续启用验证，再展示邮件重发和过期处理；
 - 找回密码对账号存在与否返回相同提示，链接 30 分钟内有效且只能使用一次；
-- 登录成功后设备先进入 `PENDING`，同账号登录不自动获得任何 PC 访问权；
+- 登录成功后设备按同一 OIDC subject 自动注册，可直接发现和使用同账号 PC/Session；产品 UI 不显示 `PENDING`、配对、自授信或逐 PC Grant 前置步骤；
+- Android 加密保存经过清理的 OIDC 会话以支持进程重启后恢复登录；此行为需继续覆盖冷启动与 Refresh Token 轮换验收；
 - 登录、注册与安全说明采用单一纵向节奏，注册字段增加时允许页面自然滚动。
 
 ### 5.2 设备首页
@@ -166,24 +162,26 @@ Security note：系统安全浏览器 + Authorization Code + PKCE
 System status
 App Bar：问候 + 页面标题 + 账号
 Command Search：PC / Session / Action
-Ambient Summary：Free · 1/1 PC · Live 2/3
+Ambient Summary：账号状态 · PC/Live Session 不限数量
 PC List
   ├─ OFFICE-PC：在线、延迟、2 个 Session
-  └─ 添加更多 PC：会员升级入口
+  └─ 添加更多 PC：安装/登录 Windows Agent 引导
 Bottom Navigation：设备 / 活动 / 设置
 ```
 
 行为：
 
 - 点击 PC 进入 PC/Session 列表；原型直接进入第一个 Live Session；
-- 免费额度已满时，“添加 PC”行保持可见，但不伪装成错误；
+- “添加 PC”进入 Windows Agent 安装与同账号登录引导，不进入会员、配对或 Grant 流程；
 - 搜索按钮打开统一命令面板，可切 PC、Session 或设置；
-- 设备状态同时显示 Presence、延迟和最近在线时间。
+- 设备状态同时显示 Presence、延迟和最近在线时间；
+- 设备页右下角提供固定刷新按钮；刷新中显示进度且忽略重复点击，列表末尾预留空间，按钮不得覆盖最后一台 PC；
+- 会话只有在 `state != RUNNING` 或所属 PC Presence 已超时后才显示永久删除入口。客户端先确认，服务端再次权威校验；删除同时清理服务器密文历史且不可恢复。
 
 ### 5.3 实时 Terminal
 
 ```text
-Top App Bar：返回 / Session + PC / 更多
+Compact Header：PC 名 / Session 名 / 状态
 State Bar：Live · E2EE · 82×28 · 只读/控制中
 Terminal Surface：Termux Fork
 Jump Latest
@@ -198,7 +196,13 @@ Control Bar：申请控制 / 释放控制
 3. 快捷键和输入；
 4. 会话信息、主题、搜索等次级操作。
 
-键盘弹出后隐藏非必要标题元数据，将可用高度用于 Terminal，并以 100～200ms 去抖同步 Resize。
+当前 Android 实现把 PC 名与会话名放在紧凑双行标题中，长名称使用 marquee；快捷栏是 Terminal
+下方的独立布局区域而不是覆盖层，并可水平滚动。`adjustResize` 与会话页局部 IME inset 共同保证
+键盘弹出时最后一行、光标和快捷栏都位于输入法上方，并以 100～200ms 去抖同步 Resize。
+
+手机端以左右拖动切换相邻会话。切换必须是明确手势：拖动距离严格超过页面宽度 65% 才切页，
+短而快速的甩动也不能绕过距离阈值，一次最多切换一页；切换完成后清除已滑出页面的 Terminal
+输入焦点，防止 IME 继续把内容发送给旧会话。
 
 ### 5.4 历史回放
 
@@ -209,20 +213,28 @@ Control Bar：申请控制 / 释放控制
 - 搜索仅处理手机端已解密数据；
 - 拖动后从最近 Snapshot 恢复。
 
-### 5.5 可信设备
+“新设备首次打开只恢复最后一屏、上滑再加载更早历史”必须建立在可移植
+`TerminalSnapshotV1` 和独立只读 transcript 分页之上。现有生产链路仍只有从序号 1 开始的有界
+VT 事件回放；在快照格式、Windows 生产者和 Termux 原子 importer 冻结前，不允许截取中段 raw
+VT bytes 或把旧字节 prepend 到实时 parser 来伪装尾屏加载。服务端倒序 cursor、Snapshot 恢复后
+原子保存 ACK=S、随后 `SUBSCRIBE(S)` 以及上滑分页仍是跨端后续工作。
+Phase 1 的字段、边界、E2EE domain 和启用门禁已记录在
+[`TERMINAL_SNAPSHOT_V1.md`](../protocol/test-vectors/TERMINAL_SNAPSHOT_V1.md)；协议落地不等于
+Windows producer、Android importer 或上滑历史 UI 已经交付。
 
-- 当前设备独立分组并显示 `MANAGER`；
-- 其他 PC/Android 显示类型、最近活动、授权 PC 和权限；
-- 点击设备进入详情，可降权或撤销；
-- 批准新设备使用二维码/短码；
-- 撤销弹窗必须显示会导致哪些连接断开。
+### 5.5 设备安全与兼容管理
 
-### 5.6 会员与配额
+- 首版当前产品导航不展示可信设备、配对、二维码/短码或逐 PC 权限页；同账号设备自动注册并直接使用；
+- 账号安全面可以显示本账号设备类型、名称、最近活动和撤销状态，但不得暗示用户还需“批准”才能发现 PC；
+- 撤销是独立于退出登录的安全动作，弹窗必须说明会断开哪些连接并停止向该设备提供新密钥；
+- 旧 `PENDING/TRUSTED`、pairing 与 `VIEW/CONTROL/MANAGE` 页面只可作为兼容/运维界面，不进入当前主流程。当前 Android 独立“解绑此设备”产品入口尚待实现与端到端验收。
+
+### 5.6 会员与功能状态
 
 页面顺序：
 
 1. 当前方案身份；
-2. PC 和实时 Session 实际用量；
+2. PC 和实时 Session 实际用量（上限显示“不限数量”）；
 3. 服务端返回的可购买套餐及其权益；
 4. “查看月付价格并订阅”；
 5. 输入会员兑换码；
@@ -232,20 +244,21 @@ Control Bar：申请控制 / 释放控制
 
 ### 5.7 设置与账号安全
 
-- 集中提供账号中心、可信设备、会员与兑换码、语言、主题和服务器设置；
+- 集中提供账号中心、语言、主题、Terminal 和诊断设置；兼容设备/会员页面不进入首版主导航；
 - 登录与安全覆盖修改密码、MFA、活跃登录和撤销其他登录；
-- “退出当前设备”仅清理当前登录，不删除账号或其他设备；
+- “退出登录”清理当前 Token、实时连接和本地会话缓存，不删除账号、其他设备，也不等同于撤销/解绑当前设备；
+- “解绑/撤销此设备”必须是独立的高风险动作；当前 Android 产品入口及 Windows/Server 跨端一致性仍待验证；
 - 删除账号需要重新认证、输入确认词并进入 7 天冷静期；
-- 冷静期结束后删除账号、设备授权和云端密文，合规审计只保留不可逆元数据。
+- 冷静期结束后删除账号、设备记录/兼容授权记录和云端密文，合规审计只保留不可逆元数据。
 
 ### 5.8 Android 付费触发点
 
 | 场景 | UI |
 | --- | --- |
-| 添加第二台 PC | 在设备首页显示 `1/1`，点击添加后进入会员页 |
-| 打开第四个 Live Session | Bottom Sheet 说明当前 `3/3`，提供关闭现有 Session 或升级 |
+| 添加更多 PC | 直接注册并显示在线状态，不进入会员拦截页 |
+| 打开更多 Live Session | 直接创建/订阅，不显示数量配额弹窗 |
 | Pro 续费失败 | 顶部非阻断 Warning，展示宽限截止时间 |
-| Pro 已过期且超额 | 选择保留 PC/Session 页面，未选择前不随机终止 |
+| Pro 已过期 | 保留现有 PC、Session 和本地 Shell，不强制清理 |
 | 恢复购买 | 显示渠道同步状态和明确结果 |
 
 ## 6. Windows Agent 布局
@@ -260,7 +273,7 @@ Relay connection + latency
 Remote policy
 Active sessions
 New managed terminal
-Free/Pro quota row
+Account features and billing status (no PC/session quota)
 Stop all remote access
 Version + Open TermLink
 ```
@@ -291,14 +304,16 @@ Tab：常规、Terminal Profile、历史、网络、高级。
 ### 6.5 账户与会员
 
 - 显示账号级 Free/Pro 状态；
-- PC 配额和实时会话配额分别显示；
+- PC 与实时会话显示“不限数量”；
 - Windows 购买按钮可以打开合规 Web Checkout，返回后刷新 Entitlement；
-- 明确说明升级只扩展远程能力，不影响 E2EE；
-- 明确说明会员过期不会终止本地 Shell。
+- 明确说明购买只影响可选功能，不影响 E2EE；
+- 明确说明会员状态变化不会终止本地 Shell 或实时订阅。
 
 账号注册、改密、MFA 和兑换码不在 Windows 本地窗口重复实现。Agent 使用系统浏览器打开公开
 账号中心，显示“等待浏览器授权、已返回、已取消、已过期、服务器不匹配”状态，并用
-Authorization Code + PKCE 将结果交回当前 Agent。重新登录不覆盖或导出既有设备私钥。
+Authorization Code + PKCE 将结果交回当前 Agent。登录同一 OIDC 账号后直接发布 PC/Session，
+不展示配对或 Grant 控件；重新登录不覆盖或导出既有设备私钥。Windows 登录记忆、主动退出与
+显式设备撤销的完整 UI 语义仍需按实际发布构建验收。
 
 ## 7. Docker Server Console 布局
 
@@ -309,7 +324,7 @@ Server Console 是自托管运维与订阅管理 UI，不是终端内容后台�
 账号门户采用左侧身份/信任上下文和右侧独立认证工作区：
 
 - 登录、注册、邮箱验证、找回密码、MFA 和活跃登录；
-- Android/Windows 系统浏览器授权回调和 PKCE 校验；
+- Android 的原生 OIDC 登录/受控浏览器回退，以及 Windows 系统浏览器授权回调和 PKCE 校验；
 - 公开 Origin、Issuer、注册策略和身份服务健康状态；
 - Docker 首次启动管理员初始化与强制改密说明。
 
@@ -358,7 +373,7 @@ Server Console 是自托管运维与订阅管理 UI，不是终端内容后台�
 
 ### 7.7 安全审计
 
-审计时间线按 Login/Device、Grant、Lease、Delete 分类。允许显示 Trace ID、不可逆 Hash、动作和结果；禁止显示命令、Terminal 正文、Token、完整 IP、公钥和 Ciphertext。
+审计时间线按 Login、Device register/revoke、Lease、Delete 分类；兼容 API 发生 Pairing/Grant 时可单独归类，但不得把它们显示成当前必经步骤。允许显示 Trace ID、不可逆 Hash、动作和结果；禁止显示命令、Terminal 正文、Token、完整 IP、公钥和 Ciphertext。
 
 ### 7.8 订阅与权益
 
@@ -368,7 +383,7 @@ Server Console 是自托管运维与订阅管理 UI，不是终端内容后台�
 - 套餐草稿、Catalog 发布版本、渠道 Product ID 映射与 Entitlement；
 - 最近订阅状态；
 - Grace Period、取消和恢复购买事件；
-- 配额规则发布、回滚与存量订阅迁移策略。
+- 功能规则发布、回滚与存量订阅迁移策略（PC/Session 数量字段仅兼容展示）。
 
 服务端只信任经过渠道签名/服务端 API 验证的购买状态。客户端上报的 `isPro=true` 永远不能直接生效。
 
@@ -382,8 +397,8 @@ PlanDefinition {
   version
   display_name
   billing_period
-  max_remote_pcs
-  max_concurrent_live_sessions
+  max_remote_pcs: -1 (unlimited; legacy field)
+  max_concurrent_live_sessions: -1 (unlimited; legacy field)
   provider_products[]
   fallback_plan_id
   status
@@ -395,8 +410,8 @@ Entitlement {
   account_id
   plan_id
   plan_version
-  max_remote_pcs
-  max_concurrent_live_sessions
+  max_remote_pcs: -1 (unlimited; legacy field)
+  max_concurrent_live_sessions: -1 (unlimited; legacy field)
   effective_at
   expires_at
   grace_until
@@ -416,7 +431,6 @@ Entitlement {
 | `POST /v1/billing/web/checkout` | 创建 Web Checkout Session |
 | `POST /v1/billing/webhooks/{provider}` | 接收签名 Webhook |
 | `POST /v1/billing/restore` | 重新同步购买状态 |
-| `POST /v1/account/quota-selection` | 降级时选择保留 PC/Live Session |
 | `GET /v1/account/security` | 返回邮箱验证、MFA 和活跃登录摘要，不返回 Secret |
 | `POST /v1/account/sessions/revoke` | 撤销指定或其他登录会话 |
 | `POST /v1/billing/redemptions/preview` | 校验兑换码并返回套餐、时长和预计到期，不立即兑换 |
@@ -431,12 +445,11 @@ Entitlement {
 
 ### 8.3 强制执行点
 
-- PC Agent Presence 注册时检查 `max_remote_pcs`；
-- Android/Relay 创建 Session Subscription 时检查 `max_concurrent_live_sessions`；
-- REST 和 WebSocket 使用同一 Entitlement Service；
-- 配额占用通过 Redis/Valkey 原子操作维护，并以 PostgreSQL 权益为权威；
-- 购买成功后服务端增加 Entitlement Version，并通过 Realtime 推送 `entitlement_changed`；
-- 客户端缓存只用于显示，不能越过服务端限制。
+- PC Agent Presence 注册不再读取或比较 `max_remote_pcs`；仅校验设备归属、类型、信任状态和 PC ID 一致性；
+- Android/Relay 创建 Session Subscription 不再读取或比较 `max_concurrent_live_sessions`；Valkey 只维护短时过期租约；
+- REST 和 WebSocket 继续执行同一套身份、设备签名、会话权限和输入租约校验；
+- 购买成功后服务端仍增加 Entitlement Version，并通过 Realtime 推送 `entitlement_changed`；
+- 客户端收到 `-1` 时展示“不限数量”，不得把旧额度当作拒绝条件。
 
 ## 9. 响应式规则
 
@@ -455,7 +468,7 @@ Windows 主窗口建议最小 900 × 620px；Server Console 建议最小 1024 ×
 - 所有图标按钮有 Accessible Name；
 - 键盘可遍历导航、表格动作、购买和危险确认；
 - 会员升级不能阻断“停止远程访问”“撤销设备”等安全操作；
-- Free 与 Pro 均提供相同的 E2EE、配对、撤销和本地优先能力；
+- Free 与 Pro 均提供相同的 E2EE、账号隔离、逐设备密钥、撤销和本地优先能力；
 - 支持 200% 字体缩放和系统减少动画；
 - Terminal 配色不使用 App 主题自动重映射。
 
@@ -464,7 +477,7 @@ Windows 主窗口建议最小 900 × 620px；Server Console 建议最小 1024 ×
 1. 三端所有页面可在布局原型中切换，无脚本错误。
 2. 320px 宽度下 Android 画板不发生页面级横向溢出。
 3. 深浅主题均可读，关键正文达到 WCAG AA。
-4. Free 用户在添加第二台 PC 或第四个 Live Session 前能看到清晰配额。
+4. 同账号添加多台 PC、订阅多个 Live Session 均不出现配额拦截或横向滚动溢出。
 5. 购买前显示月付、自动续费、取消/恢复购买入口和渠道实际价格。
 6. 会员过期 UI 不暗示会杀掉本地 Shell 或删除历史。
 7. Server Console 任何页面都不展示 Terminal 正文或完整支付凭据。
@@ -473,6 +486,8 @@ Windows 主窗口建议最小 900 × 620px；Server Console 建议最小 1024 ×
 10. Android 与 Server 登录/注册模式均可切换，注册页可滚动但无横向溢出。
 11. `admin` 首次登录必须完成改密；临时密码普通重启不再展示。
 12. 完整兑换码只在新批次创建后显示/导出一次，旧批次不能恢复明文。
+13. Windows Agent 与 Android 登录同一 OIDC 账号后，无配对、自授信或 Grant 即可发现并打开受管 Session；不同账号看不到列表且不能建立 Realtime 路由。
+14. “退出登录”和“撤销/解绑设备”使用不同文案与确认；退出后可重新登录，撤销后连接关闭且设备不再接收新密钥。尚未落地的解绑入口必须标为待验证。
 
 2026-08-04 浏览器复核结果：
 

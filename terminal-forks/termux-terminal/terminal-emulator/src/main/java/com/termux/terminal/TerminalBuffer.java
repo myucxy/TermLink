@@ -11,6 +11,8 @@ import java.util.Arrays;
 public final class TerminalBuffer {
 
     TerminalRow[] mLines;
+    /** Stable IDs are populated only by the detached read-only transcript projection. */
+    long[] mLineIds;
     /** The length of {@link #mLines}. */
     int mTotalRows;
     /** The number of rows and columns visible on the screen. */
@@ -33,6 +35,7 @@ public final class TerminalBuffer {
         mTotalRows = totalRows;
         mScreenRows = screenRows;
         mLines = new TerminalRow[totalRows];
+        mLineIds = new long[totalRows];
 
         blockSet(0, 0, columns, screenRows, ' ', TextStyle.NORMAL);
     }
@@ -234,6 +237,7 @@ public final class TerminalBuffer {
             // Copy away old state and update new:
             TerminalRow[] oldLines = mLines;
             mLines = new TerminalRow[newTotalRows];
+            mLineIds = new long[newTotalRows];
             for (int i = 0; i < newTotalRows; i++)
                 mLines[i] = new TerminalRow(newColumns, currentStyle);
 
@@ -367,11 +371,15 @@ public final class TerminalBuffer {
         int start = len - 1;
         // Save away line to be overwritten:
         TerminalRow lineToBeOverWritten = mLines[(srcInternal + start + 1) % totalRows];
+        long lineIdToBeOverWritten = mLineIds[(srcInternal + start + 1) % totalRows];
         // Do the copy from bottom to top.
-        for (int i = start; i >= 0; --i)
+        for (int i = start; i >= 0; --i) {
             mLines[(srcInternal + i + 1) % totalRows] = mLines[(srcInternal + i) % totalRows];
+            mLineIds[(srcInternal + i + 1) % totalRows] = mLineIds[(srcInternal + i) % totalRows];
+        }
         // Put back overwritten line, now above the block:
         mLines[(srcInternal) % totalRows] = lineToBeOverWritten;
+        mLineIds[(srcInternal) % totalRows] = lineIdToBeOverWritten;
     }
 
     /**
@@ -403,6 +411,7 @@ public final class TerminalBuffer {
         } else {
             mLines[blankRow].clear(style);
         }
+        mLineIds[blankRow] = 0;
     }
 
     /**
@@ -491,7 +500,107 @@ public final class TerminalBuffer {
         } else {
             Arrays.fill(mLines, mScreenFirstRow - mActiveTranscriptRows, mScreenFirstRow, null);
         }
+        Arrays.fill(mLineIds, 0);
         mActiveTranscriptRows = 0;
+    }
+
+    /** Replaces only the visible grid. Snapshot V1 deliberately carries no in-buffer transcript. */
+    void restoreVisibleRows(TerminalRestorableState.RowState[] rows) {
+        if (rows == null || rows.length != mScreenRows)
+            throw new IllegalArgumentException("restored row count does not match the screen");
+        TerminalRow[] restored = new TerminalRow[mTotalRows];
+        for (int rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+            TerminalRestorableState.RowState source = rows[rowIndex];
+            if (source == null || source.cells == null || source.cells.length != mColumns)
+                throw new IllegalArgumentException("restored row width does not match the screen");
+            TerminalRow target = new TerminalRow(mColumns, TextStyle.NORMAL);
+            for (int column = 0; column < mColumns; column++) {
+                TerminalRestorableState.CellState cell = source.cells[column];
+                if (cell.wideContinuation) {
+                    target.setStyle(column, cell.style);
+                    continue;
+                }
+                int offset = 0;
+                while (offset < cell.grapheme.length()) {
+                    int codePoint = cell.grapheme.codePointAt(offset);
+                    target.setChar(column, codePoint, cell.style);
+                    offset += Character.charCount(codePoint);
+                }
+            }
+            target.mLineWrap = source.softWrapped;
+            restored[rowIndex] = target;
+        }
+        mLines = restored;
+        mLineIds = new long[mTotalRows];
+        mScreenFirstRow = 0;
+        mActiveTranscriptRows = 0;
+    }
+
+    /**
+     * Installs oldest-to-newest rows without passing reconstructed bytes through the VT parser.
+     * The newest rows occupy the visible screen and older rows occupy the transcript.
+     */
+    void restoreTranscriptProjection(TerminalRestorableState.RowState[] rows, long[] lineIds) {
+        if (rows == null || lineIds == null || rows.length != lineIds.length)
+            throw new IllegalArgumentException("transcript rows and line IDs must have equal length");
+        if (rows.length == 0 || rows.length > mTotalRows)
+            throw new IllegalArgumentException("transcript projection row count is outside the buffer capacity");
+
+        TerminalRow[] restored = new TerminalRow[mTotalRows];
+        long[] restoredLineIds = new long[mTotalRows];
+        int visibleRows = Math.min(rows.length, mScreenRows);
+        int transcriptRows = rows.length - visibleRows;
+        int screenFirstRow = transcriptRows;
+        long previousLineId = 0;
+        for (int rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+            long lineId = lineIds[rowIndex];
+            if (lineId <= previousLineId)
+                throw new IllegalArgumentException("transcript line IDs must be positive and strictly increasing");
+            TerminalRestorableState.RowState source = rows[rowIndex];
+            if (source == null || source.cells == null || source.cells.length != mColumns)
+                throw new IllegalArgumentException("transcript row width does not match the screen");
+            restored[rowIndex] = restoreRow(source);
+            restoredLineIds[rowIndex] = lineId;
+            previousLineId = lineId;
+        }
+        for (int rowIndex = rows.length; rowIndex < screenFirstRow + mScreenRows; rowIndex++)
+            restored[rowIndex] = new TerminalRow(mColumns, TextStyle.NORMAL);
+
+        mLines = restored;
+        mLineIds = restoredLineIds;
+        mScreenFirstRow = screenFirstRow;
+        mActiveTranscriptRows = transcriptRows;
+    }
+
+    public long getLineId(int externalRow) {
+        return mLineIds[externalToInternalRow(externalRow)];
+    }
+
+    public int findExternalRowByLineId(long lineId) {
+        if (lineId <= 0) return Integer.MIN_VALUE;
+        for (int row = -mActiveTranscriptRows; row < mScreenRows; row++) {
+            if (getLineId(row) == lineId) return row;
+        }
+        return Integer.MIN_VALUE;
+    }
+
+    private TerminalRow restoreRow(TerminalRestorableState.RowState source) {
+        TerminalRow target = new TerminalRow(mColumns, TextStyle.NORMAL);
+        for (int column = 0; column < mColumns; column++) {
+            TerminalRestorableState.CellState cell = source.cells[column];
+            if (cell.wideContinuation) {
+                target.setStyle(column, cell.style);
+                continue;
+            }
+            int offset = 0;
+            while (offset < cell.grapheme.length()) {
+                int codePoint = cell.grapheme.codePointAt(offset);
+                target.setChar(column, codePoint, cell.style);
+                offset += Character.charCount(codePoint);
+            }
+        }
+        target.mLineWrap = source.softWrapped;
+        return target;
     }
 
 }

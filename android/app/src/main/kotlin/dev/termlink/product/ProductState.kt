@@ -1,6 +1,8 @@
 package dev.termlink.product
 
+import android.net.Uri
 import dev.termlink.billing.BillingSnapshot
+import dev.termlink.harness.BuildConfig
 import dev.termlink.model.CatalogPlan
 import dev.termlink.model.DeviceSummary
 import dev.termlink.model.Entitlement
@@ -8,10 +10,13 @@ import dev.termlink.model.HistoryObject
 import dev.termlink.model.PcSummary
 import dev.termlink.model.SessionSummary
 import dev.termlink.session.RemoteSessionState
+import dev.termlink.terminal.api.TerminalTranscriptPageV1
 import dev.termlink.terminal.termux.TermuxTerminalEngine
+import dev.termlink.terminal.termux.TermuxTranscriptViewport
 import java.io.Closeable
 import java.time.Instant
 import java.util.UUID
+import java.util.Locale
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -19,6 +24,8 @@ import kotlinx.coroutines.flow.asStateFlow
 /** Destinations exposed by the product shell. */
 enum class ProductDestination(val label: String) {
     DEVICES("Devices"),
+    FILES("Files"),
+    DOWNLOADS("Downloads"),
     SESSIONS("Sessions"),
     ACTIVITY("Activity"),
     HISTORY("History"),
@@ -29,12 +36,44 @@ enum class ProductDestination(val label: String) {
 }
 
 /**
- * The production app is pinned to the public service.  Keep this UI-facing
- * value alongside the state contract so screens cannot accidentally expose a
- * mutable endpoint field.  [ProductionProductRepository] uses the same
- * default URL for its persisted session store.
+ * Release is pinned to the public service. Debug may inject a build-time LAN
+ * endpoint, but the UI and every repository transport still consume the same
+ * normalized value declared beside this state contract.
  */
-const val PRODUCT_PUBLIC_SERVER_URL = "https://termlink.kget.cc:8910"
+const val PRODUCT_DEFAULT_SERVER_URL = "https://termlink.kget.cc:8910"
+
+/**
+ * Resolves the only server root used by the Android product. Release builds
+ * remain pinned even if a build environment accidentally supplies an override.
+ */
+internal fun configuredProductServerUrl(
+    configuredUrl: String?,
+    isDebug: Boolean,
+    allowCleartextLocalTest: Boolean = false,
+): String {
+    val candidate = configuredUrl?.takeIf { isDebug && it.isNotBlank() } ?: PRODUCT_DEFAULT_SERVER_URL
+    val localCleartext = allowCleartextLocalTest && isDebug && isExplicitLocalTestUrl(candidate)
+    return ServerUrlPolicy.normalize(candidate, allowCleartextForLocalTest = localCleartext)
+}
+
+private fun isExplicitLocalTestUrl(value: String): Boolean {
+    val uri = runCatching { java.net.URI(value.trim()) }.getOrNull() ?: return false
+    if (!uri.scheme.equals("http", ignoreCase = true)) return false
+    val host = uri.host?.lowercase() ?: return false
+    if (host == "localhost" || host.endsWith(".localhost") || host == "::1") return true
+    val octets = host.split('.').mapNotNull(String::toIntOrNull)
+    if (octets.size != 4 || octets.any { it !in 0..255 }) return false
+    return octets[0] == 10 ||
+        octets[0] == 127 ||
+        octets[0] == 192 && octets[1] == 168 ||
+        octets[0] == 172 && octets[1] in 16..31
+}
+
+val PRODUCT_PUBLIC_SERVER_URL: String = configuredProductServerUrl(
+    configuredUrl = BuildConfig.TERMLINK_SERVER_URL,
+    isDebug = BuildConfig.DEBUG,
+    allowCleartextLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
+)
 
 /** First-release account policy: same-account Android devices get full access. */
 const val PRODUCT_DEFAULT_ANDROID_PERMISSION = "MANAGE"
@@ -50,6 +89,14 @@ enum class ProductUpdateDecision {
     ERROR,
 }
 
+sealed interface ProductUpdateDownloadState {
+    data object Idle : ProductUpdateDownloadState
+    data class Downloading(val downloadedBytes: Long, val totalBytes: Long) : ProductUpdateDownloadState
+    data object Verifying : ProductUpdateDownloadState
+    data class Ready(val apkPath: String) : ProductUpdateDownloadState
+    data class Failed(val message: String) : ProductUpdateDownloadState
+}
+
 data class ProductUpdateStatus(
     val decision: ProductUpdateDecision = ProductUpdateDecision.NOT_CONFIGURED,
     val versionName: String? = null,
@@ -62,6 +109,8 @@ data class ProductUpdateStatus(
     val artifactSha256: String? = null,
     val minSupportedBuild: Long? = null,
     val fromCache: Boolean = false,
+    val dialogVisible: Boolean = false,
+    val downloadState: ProductUpdateDownloadState = ProductUpdateDownloadState.Idle,
 )
 
 /**
@@ -114,7 +163,9 @@ data class TerminalDisplayPreferences(
 }
 
 fun ProductDestination.primaryDestination(): ProductPrimaryDestination = when (this) {
-    ProductDestination.DEVICES -> ProductPrimaryDestination.DEVICES
+    ProductDestination.DEVICES,
+    ProductDestination.FILES,
+    ProductDestination.DOWNLOADS -> ProductPrimaryDestination.DEVICES
     ProductDestination.SESSIONS -> ProductPrimaryDestination.SESSIONS
     // Activity and history remain reachable from secondary actions. Keep the
     // devices destination selected while those pages are open because the
@@ -154,10 +205,28 @@ enum class ProductConnectionState {
 /** Server-authoritative enrollment state for this account-scoped phone key. */
 enum class ProductEnrollmentState {
     UNKNOWN,
+    /** Legacy server value retained for transport compatibility; it is never a user prompt. */
     PENDING_CONFIRMATION,
     TRUSTED,
     REVOKED,
 }
+
+/**
+ * Same-account phones are usable immediately. A pending response is handled
+ * through the legacy self-activation endpoint without exposing enrollment UI.
+ */
+internal enum class SameAccountDeviceAction {
+    REFRESH,
+    ACTIVATE_LEGACY_AND_REFRESH,
+    BLOCK_REVOKED,
+}
+
+internal fun sameAccountDeviceAction(trustState: dev.termlink.model.DeviceTrustState): SameAccountDeviceAction =
+    when (trustState) {
+        dev.termlink.model.DeviceTrustState.TRUSTED -> SameAccountDeviceAction.REFRESH
+        dev.termlink.model.DeviceTrustState.PENDING -> SameAccountDeviceAction.ACTIVATE_LEGACY_AND_REFRESH
+        dev.termlink.model.DeviceTrustState.REVOKED -> SameAccountDeviceAction.BLOCK_REVOKED
+    }
 
 enum class ProductAuthenticationState {
     SIGNED_OUT,
@@ -195,6 +264,8 @@ enum class TerminalAction {
     ESCAPE,
     TAB,
     ENTER,
+    BACKSPACE,
+    DELETE,
     ARROW_LEFT,
     ARROW_UP,
     ARROW_DOWN,
@@ -202,10 +273,178 @@ enum class TerminalAction {
     CTRL_C,
 }
 
+/** A validated terminal key chord entered by the user in Settings. */
+data class TerminalKeyCombination(
+    val key: String,
+    val control: Boolean = false,
+    val alt: Boolean = false,
+    val shift: Boolean = false,
+) {
+    val canonical: String
+        get() = buildList {
+            if (control) add("Ctrl")
+            if (alt) add("Alt")
+            if (shift) add("Shift")
+            add(key)
+        }.joinToString("+")
+
+    val printableCodePoint: Int?
+        get() = key.takeIf { it.codePointCount(0, it.length) == 1 }
+            ?.codePointAt(0)
+
+    companion object {
+        private val aliases = mapOf(
+            "esc" to "Esc",
+            "escape" to "Esc",
+            "tab" to "Tab",
+            "enter" to "Enter",
+            "return" to "Enter",
+            "backspace" to "Backspace",
+            "bksp" to "Backspace",
+            "delete" to "Delete",
+            "del" to "Delete",
+            "left" to "Left",
+            "arrowleft" to "Left",
+            "up" to "Up",
+            "arrowup" to "Up",
+            "down" to "Down",
+            "arrowdown" to "Down",
+            "right" to "Right",
+            "arrowright" to "Right",
+            "home" to "Home",
+            "end" to "End",
+            "pageup" to "PageUp",
+            "pgup" to "PageUp",
+            "pagedown" to "PageDown",
+            "pgdn" to "PageDown",
+            "insert" to "Insert",
+            "ins" to "Insert",
+            "space" to "Space",
+            "plus" to "+",
+        )
+
+        fun parse(raw: String): TerminalKeyCombination? {
+            val trimmed = raw.trim()
+            val literalPlusKey = trimmed == "+" || trimmed.endsWith("++")
+            val tokenSource = if (literalPlusKey && trimmed != "+") trimmed.dropLast(1) else trimmed
+            val tokens = tokenSource.split('+').map(String::trim).filter(String::isNotEmpty).toMutableList()
+            if (literalPlusKey) tokens += "+"
+            if (tokens.isEmpty()) return null
+            var control = false
+            var alt = false
+            var shift = false
+            val keys = mutableListOf<String>()
+            tokens.forEach { token ->
+                when (token.lowercase(Locale.ROOT)) {
+                    "ctrl", "control" -> control = true
+                    "alt", "option" -> alt = true
+                    "shift" -> shift = true
+                    else -> keys += token
+                }
+            }
+            if (keys.size != 1) return null
+            val rawKey = keys.single()
+            val folded = rawKey.lowercase(Locale.ROOT).replace(" ", "").replace("-", "")
+            val key = aliases[folded]
+                ?: rawKey.uppercase(Locale.ROOT).takeIf { candidate ->
+                    candidate.length in 2..3 && candidate.startsWith("F") &&
+                        candidate.drop(1).toIntOrNull()?.let { it in 1..12 } == true
+                }
+                ?: rawKey.takeIf {
+                    it.codePointCount(0, it.length) == 1 &&
+                        !Character.isISOControl(it.codePointAt(0))
+                }
+                ?: return null
+            return TerminalKeyCombination(key, control, alt, shift)
+        }
+    }
+}
+
+enum class TerminalCustomShortcutType {
+    KEY_COMBINATION,
+    QUICK_INPUT,
+}
+
+data class TerminalCustomShortcut(
+    val id: String,
+    val label: String,
+    val value: String,
+    val type: TerminalCustomShortcutType = TerminalCustomShortcutType.KEY_COMBINATION,
+) {
+    /** Compatibility accessor for callers and preferences created before typed shortcuts. */
+    val keyCombination: String
+        get() = value.takeIf { type == TerminalCustomShortcutType.KEY_COMBINATION }.orEmpty()
+
+    val quickInput: String
+        get() = value.takeIf { type == TerminalCustomShortcutType.QUICK_INPUT }.orEmpty()
+
+    val displayLabel: String
+        get() = label.ifBlank {
+            value.replace(Regex("\\s+"), " ").trim()
+        }
+
+    val normalizedOrNull: TerminalCustomShortcut?
+        get() {
+            val normalizedId = id.trim().take(64).takeIf {
+                it.isNotEmpty() && it.all { character -> character.isLetterOrDigit() || character == '-' || character == '_' }
+            } ?: return null
+            val normalizedLabel = label.trim().take(16)
+            val normalizedValue = when (type) {
+                TerminalCustomShortcutType.KEY_COMBINATION ->
+                    TerminalKeyCombination.parse(value)?.canonical ?: return null
+                TerminalCustomShortcutType.QUICK_INPUT ->
+                    value.take(MAX_TERMINAL_QUICK_INPUT_LENGTH).takeIf(String::isNotBlank) ?: return null
+            }
+            return copy(
+                id = normalizedId,
+                label = normalizedLabel,
+                value = normalizedValue,
+            )
+    }
+}
+
+internal suspend fun dispatchTerminalCustomShortcut(
+    shortcut: TerminalCustomShortcut,
+    sendKeyCombination: suspend (String) -> Unit,
+    sendQuickInput: suspend (String) -> Unit,
+) {
+    val normalized = requireNotNull(shortcut.normalizedOrNull) { "Terminal shortcut is invalid" }
+    when (normalized.type) {
+        TerminalCustomShortcutType.KEY_COMBINATION -> sendKeyCombination(normalized.keyCombination)
+        TerminalCustomShortcutType.QUICK_INPUT -> sendQuickInput(normalized.quickInput)
+    }
+}
+
+internal fun terminalShiftedCodePoint(codePoint: Int): Int = when (codePoint) {
+    '1'.code -> '!'.code
+    '2'.code -> '@'.code
+    '3'.code -> '#'.code
+    '4'.code -> '$'.code
+    '5'.code -> '%'.code
+    '6'.code -> '^'.code
+    '7'.code -> '&'.code
+    '8'.code -> '*'.code
+    '9'.code -> '('.code
+    '0'.code -> ')'.code
+    '-'.code -> '_'.code
+    '='.code -> '+'.code
+    '['.code -> '{'.code
+    ']'.code -> '}'.code
+    '\\'.code -> '|'.code
+    ';'.code -> ':'.code
+    '\''.code -> '"'.code
+    ','.code -> '<'.code
+    '.'.code -> '>'.code
+    '/'.code -> '?'.code
+    '`'.code -> '~'.code
+    else -> Character.toUpperCase(codePoint)
+}
+
 /** Local labels for the compact shortcut dock; the action semantics remain fixed. */
 data class TerminalShortcutPreferences(
     val labels: Map<TerminalAction, String> = defaultTerminalShortcutLabels(),
     val visibleActions: List<TerminalAction> = defaultTerminalShortcutActions(),
+    val customShortcuts: List<TerminalCustomShortcut> = emptyList(),
 ) {
     fun label(action: TerminalAction): String = labels[action].orEmpty().ifBlank { defaultTerminalShortcutLabels()[action].orEmpty() }
 
@@ -217,13 +456,22 @@ data class TerminalShortcutPreferences(
             visibleActions = (visibleActions + TerminalAction.ENTER)
                 .distinct()
                 .filter(TerminalAction.entries::contains),
+            customShortcuts = customShortcuts
+                .mapNotNull(TerminalCustomShortcut::normalizedOrNull)
+                .distinctBy(TerminalCustomShortcut::id)
+                .take(MAX_CUSTOM_TERMINAL_SHORTCUTS),
         )
 }
+
+const val MAX_CUSTOM_TERMINAL_SHORTCUTS = 24
+const val MAX_TERMINAL_QUICK_INPUT_LENGTH = 4096
 
 private fun defaultTerminalShortcutLabels(): Map<TerminalAction, String> = mapOf(
     TerminalAction.ESCAPE to "Esc",
     TerminalAction.TAB to "Tab",
     TerminalAction.ENTER to "Enter",
+    TerminalAction.BACKSPACE to "⌫",
+    TerminalAction.DELETE to "Del",
     TerminalAction.ARROW_LEFT to "←",
     TerminalAction.ARROW_UP to "↑",
     TerminalAction.ARROW_DOWN to "↓",
@@ -235,6 +483,8 @@ private fun defaultTerminalShortcutActions(): List<TerminalAction> = listOf(
     TerminalAction.ESCAPE,
     TerminalAction.TAB,
     TerminalAction.ENTER,
+    TerminalAction.BACKSPACE,
+    TerminalAction.DELETE,
     TerminalAction.ARROW_LEFT,
     TerminalAction.ARROW_UP,
     TerminalAction.ARROW_DOWN,
@@ -248,6 +498,102 @@ data class HistoryEntry(
     val historyObject: HistoryObject,
     val createdAt: Instant? = null,
 )
+
+/** Independent read-only scrollback anchored to the snapshot installed for one live session. */
+data class TranscriptViewportState(
+    val sessionId: UUID,
+    val snapshotAnchorSequence: ULong,
+    val initialBeforeLineId: ULong,
+    val nextBeforeLineId: ULong? = initialBeforeLineId.takeIf { it > 0u },
+    /**
+     * Server-authenticated continuation. The initial request deliberately has
+     * no opaque cursor and is selected by [snapshotAnchorSequence] plus
+     * [initialBeforeLineId]; every ready page after that advances only with
+     * the cursor returned alongside that page.
+     */
+    val nextCursor: String? = null,
+    /** Pages are ordered oldest to newest; each page owns its own style and palette tables. */
+    val pages: List<TerminalTranscriptPageV1> = emptyList(),
+    /** Object identities already admitted to this viewport, used to reject replay under another cursor. */
+    val loadedObjectIds: Set<UUID> = emptySet(),
+    /** Opaque selectors already consumed by a successful merge, used to reject cursor loops. */
+    val consumedCursors: Set<String> = emptySet(),
+    val loading: Boolean = false,
+    val error: String? = null,
+    val hasMoreBefore: Boolean = nextBeforeLineId != null,
+    /** Fences a page completing after the viewport was cleared or re-anchored. */
+    val viewportGeneration: Long = 1,
+) {
+    init {
+        require(snapshotAnchorSequence > 0u) { "transcript snapshot anchor must be positive" }
+        require(nextBeforeLineId == null || nextBeforeLineId > 0u) { "transcript cursor must be positive" }
+        require(nextCursor == null || nextCursor.isNotBlank()) { "transcript opaque cursor must not be blank" }
+        require(consumedCursors.none(String::isBlank)) { "consumed transcript cursors must not be blank" }
+        require(loadedObjectIds.size <= MAX_TRANSCRIPT_VIEWPORT_IDENTITIES) {
+            "loaded transcript identity window exceeds renderer capacity"
+        }
+        require(consumedCursors.size <= MAX_TRANSCRIPT_VIEWPORT_IDENTITIES) {
+            "consumed transcript cursor window exceeds renderer capacity"
+        }
+        require(hasMoreBefore == (nextBeforeLineId != null)) { "transcript pagination state is inconsistent" }
+        require(viewportGeneration > 0) { "transcript viewport generation must be positive" }
+        require(pages.all { it.snapshotAnchorSequence.toULong() == snapshotAnchorSequence }) {
+            "transcript page anchor changed within a viewport"
+        }
+        require(pages.zipWithNext().all { (older, newer) -> older.lastLineId < newer.firstLineId }) {
+            "transcript pages overlap or are out of order"
+        }
+        require(pages.size <= MAX_TRANSCRIPT_VIEWPORT_IDENTITIES) {
+            "transcript page window exceeds renderer capacity"
+        }
+        require(transcriptViewportRowCount(pages) <= MAX_TRANSCRIPT_VIEWPORT_ROWS) {
+            "transcript row window exceeds renderer capacity"
+        }
+    }
+}
+
+/** The state window and detached Termux renderer deliberately share one hard capacity. */
+internal const val MAX_TRANSCRIPT_VIEWPORT_ROWS = TermuxTranscriptViewport.MAX_RENDERED_ROWS
+internal const val MAX_TRANSCRIPT_VIEWPORT_IDENTITIES = MAX_TRANSCRIPT_VIEWPORT_ROWS
+
+internal fun transcriptViewportRowCount(pages: List<TerminalTranscriptPageV1>): Int {
+    var total = 0
+    pages.forEach { page ->
+        require(page.rows.size <= MAX_TRANSCRIPT_VIEWPORT_ROWS - total) {
+            "transcript row window exceeds renderer capacity"
+        }
+        total += page.rows.size
+    }
+    return total
+}
+
+/**
+ * Keeps the oldest rows after a prepend. A top-boundary user's visible anchor therefore survives,
+ * while newer rows leave the detached history surface and remain available again at the live tail.
+ */
+internal fun retainOldestTranscriptPages(
+    orderedPages: List<TerminalTranscriptPageV1>,
+    maxRows: Int = MAX_TRANSCRIPT_VIEWPORT_ROWS,
+): List<TerminalTranscriptPageV1> {
+    require(maxRows > 0) { "transcript renderer capacity must be positive" }
+    require(orderedPages.all { it.rows.size <= maxRows }) {
+        "one transcript page exceeds the renderer capacity"
+    }
+    var retainedCount = orderedPages.size
+    var retainedRows = orderedPages.sumOf { it.rows.size.toLong() }
+    while (retainedCount > 0 && (retainedRows > maxRows.toLong() || retainedCount > maxRows)) {
+        retainedCount -= 1
+        retainedRows -= orderedPages[retainedCount].rows.size
+    }
+    return orderedPages.take(retainedCount)
+}
+
+enum class ProductBootstrapSource {
+    EMPTY,
+    LEGACY_REPLAY,
+    BOUND_SNAPSHOT,
+    REMOTE_SNAPSHOT,
+}
 
 /**
  * This is the state consumed by the product UI. It is deliberately server-shaped:
@@ -264,18 +610,26 @@ data class ProductSnapshot(
     val connectionError: String? = null,
     val authenticationState: ProductAuthenticationState = ProductAuthenticationState.SIGNED_OUT,
     val enrollmentState: ProductEnrollmentState = ProductEnrollmentState.UNKNOWN,
-    /** True only while the explicit first-login confirmation dialog is shown. */
+    /** Legacy compatibility flag. The current Android product never renders an enrollment prompt. */
     val enrollmentConfirmationRequired: Boolean = false,
     val accountLabel: String? = null,
     val serverUrl: String? = null,
     val devices: List<DeviceSummary> = emptyList(),
     val pcs: List<PcSummary> = emptyList(),
     val sessions: List<SessionSummary> = emptyList(),
+    val remoteFileBrowser: RemoteFileBrowserState = RemoteFileBrowserState(),
+    val remoteDownloads: List<RemoteDownloadRecord> = emptyList(),
     val sessionStates: Map<UUID, RemoteSessionState> = emptyMap(),
+    /** Decrypted OSC/checkpoint titles, keyed only by their owning session UUID. */
+    val sessionTitles: Map<UUID, String> = emptyMap(),
     val activity: List<ActivityEntry> = emptyList(),
     val pairingChallenge: PairingChallengeState? = null,
     val history: List<HistoryEntry> = emptyList(),
     val replayedHistoryObjectIds: Set<UUID> = emptySet(),
+    val transcriptViewports: Map<UUID, TranscriptViewportState> = emptyMap(),
+    /** Diagnostics only; these mirrors do not participate in ACK or bootstrap decisions. */
+    val liveAcknowledgements: Map<UUID, ULong> = emptyMap(),
+    val bootstrapSources: Map<UUID, ProductBootstrapSource> = emptyMap(),
     val catalogPlans: List<CatalogPlan> = emptyList(),
     val entitlement: Entitlement? = null,
     val catalogPlan: CatalogPlan? = null,
@@ -283,6 +637,22 @@ data class ProductSnapshot(
     val updateStatus: ProductUpdateStatus = ProductUpdateStatus(),
     val lastSyncedAt: Instant? = null,
 )
+
+internal sealed interface AccountRegistrationResult {
+    data object Success : AccountRegistrationResult
+    data class Failure(val error: Throwable) : AccountRegistrationResult
+}
+
+/** Keeps registration success/failure semantics independent from Compose dialog lifetime. */
+internal suspend fun submitAccountRegistration(operation: suspend () -> Unit): AccountRegistrationResult =
+    try {
+        operation()
+        AccountRegistrationResult.Success
+    } catch (error: kotlinx.coroutines.CancellationException) {
+        throw error
+    } catch (error: Throwable) {
+        AccountRegistrationResult.Failure(error)
+    }
 
 /** Prepends a local event while retaining a bounded device-local activity window. */
 fun ProductSnapshot.withLocalActivity(entry: ActivityEntry): ProductSnapshot = copy(
@@ -292,6 +662,23 @@ fun ProductSnapshot.withLocalActivity(entry: ActivityEntry): ProductSnapshot = c
 )
 
 fun ProductSnapshot.isConnected(): Boolean = connectionState == ProductConnectionState.CONNECTED
+
+/** Removes one session and every snapshot-owned reference to its history in one state transition. */
+internal fun ProductSnapshot.withoutSession(sessionId: UUID): ProductSnapshot {
+    val removedHistoryObjectIds = history.asSequence()
+        .filter { it.sessionId == sessionId }
+        .mapTo(mutableSetOf()) { it.historyObject.id }
+    return copy(
+        sessions = sessions.filterNot { it.id == sessionId },
+        sessionStates = sessionStates - sessionId,
+        sessionTitles = sessionTitles - sessionId,
+        history = history.filterNot { it.sessionId == sessionId },
+        replayedHistoryObjectIds = replayedHistoryObjectIds - removedHistoryObjectIds,
+        transcriptViewports = transcriptViewports - sessionId,
+        liveAcknowledgements = liveAcknowledgements - sessionId,
+        bootstrapSources = bootstrapSources - sessionId,
+    )
+}
 
 /** Returns true only when an existing trusted PC can actually manage pending devices. */
 fun ProductSnapshot.canApprovePendingDevice(): Boolean =
@@ -315,10 +702,25 @@ interface ProductRepository : Closeable {
     /** Legacy no-argument entry point retained for settings/fakes; it never opens a browser. */
     suspend fun signIn(): Unit = error("Enter a username and password to sign in")
     /** Creates an account through the server's direct registration boundary. */
-    suspend fun register(username: String, email: String, password: CharArray, confirm: CharArray): Unit =
+    suspend fun register(
+        username: String,
+        email: String,
+        firstName: String,
+        lastName: String,
+        password: CharArray,
+        confirm: CharArray,
+    ): Unit = try {
         error("Direct account registration is unavailable")
+    } finally {
+        password.fill('\u0000')
+        confirm.fill('\u0000')
+    }
     /** Checks the public AppShip update decision without an account token. */
     suspend fun checkForUpdate(force: Boolean = true): ProductUpdateStatus = ProductUpdateStatus()
+    /** Downloads and verifies the APK selected by [checkForUpdate]. */
+    suspend fun downloadUpdate() = Unit
+    /** Hides the current update prompt without discarding its verified download state. */
+    fun dismissUpdate() = Unit
     /**
      * Direct registration is intentionally not part of this contract yet:
      * the current service exposes registration only through its browser/PKCE
@@ -339,13 +741,38 @@ interface ProductRepository : Closeable {
     suspend fun releaseControl(sessionId: UUID)
     /** Release all active server control leases while keeping read-only viewing alive. */
     suspend fun releaseAllControlLeases() = Unit
+    /** Lists one Windows directory page. An empty path requests the drive roots. */
+    suspend fun browseRemoteDirectory(
+        pcId: UUID,
+        pcName: String,
+        path: String,
+        offset: Long? = null,
+    ): Unit = error("Remote file browsing is unavailable")
+    /** Starts the server DOWNLOAD operation only after SAF returned [targetUri]. */
+    fun startRemoteDownload(selection: RemoteFileDownloadSelection, targetUri: Uri) {
+        error("Remote file downloads are unavailable")
+    }
+    suspend fun cancelRemoteDownload(recordId: UUID): Unit = error("Remote file downloads are unavailable")
+    fun retryRemoteDownload(recordId: UUID, targetUri: Uri) {
+        error("Remote file downloads are unavailable")
+    }
+    /** Removes download-center metadata. It never deletes the completed SAF document. */
+    fun deleteRemoteDownloadRecord(recordId: UUID) = Unit
+    /** Opens one fixed Windows shell in [path] and returns its authoritative session ID. */
+    suspend fun openRemoteShell(pcId: UUID, path: String, shellType: RemoteShellType): UUID =
+        error("Remote terminal launch is unavailable")
     suspend fun openSession(sessionId: UUID)
     fun terminalEngine(sessionId: UUID): TermuxTerminalEngine?
     fun historyEngine(historyObjectId: UUID): TermuxTerminalEngine?
     suspend fun stopSession(sessionId: UUID)
+    suspend fun deleteSession(sessionId: UUID)
     suspend fun sendTerminalAction(sessionId: UUID, action: TerminalAction)
+    suspend fun sendTerminalKeyCombination(sessionId: UUID, combination: String)
     suspend fun sendPaste(sessionId: UUID, text: String)
+    suspend fun sendCommand(sessionId: UUID, text: String)
     suspend fun replayHistory(entry: HistoryEntry)
+    suspend fun loadTranscriptBefore(sessionId: UUID)
+    fun clearTranscript(sessionId: UUID)
 }
 
 /**
@@ -358,7 +785,19 @@ class UnavailableProductRepository : ProductRepository {
 
     override suspend fun refresh() = unavailable()
     override suspend fun signIn(username: String, password: CharArray) = unavailable()
-    override suspend fun register(username: String, email: String, password: CharArray, confirm: CharArray) = unavailable()
+    override suspend fun register(
+        username: String,
+        email: String,
+        firstName: String,
+        lastName: String,
+        password: CharArray,
+        confirm: CharArray,
+    ) = try {
+        unavailable()
+    } finally {
+        password.fill('\u0000')
+        confirm.fill('\u0000')
+    }
     override suspend fun checkForUpdate(force: Boolean): ProductUpdateStatus = ProductUpdateStatus(
         decision = ProductUpdateDecision.NOT_CONFIGURED,
         message = "Update service is not configured",
@@ -376,13 +815,24 @@ class UnavailableProductRepository : ProductRepository {
     override suspend fun revokeDevice(deviceId: UUID) = unavailable()
     override suspend fun requestControl(sessionId: UUID) = unavailable()
     override suspend fun releaseControl(sessionId: UUID) = unavailable()
+    override suspend fun browseRemoteDirectory(pcId: UUID, pcName: String, path: String, offset: Long?) = unavailable()
+    override fun startRemoteDownload(selection: RemoteFileDownloadSelection, targetUri: Uri) = unavailable()
+    override suspend fun cancelRemoteDownload(recordId: UUID) = unavailable()
+    override fun retryRemoteDownload(recordId: UUID, targetUri: Uri) = unavailable()
+    override fun deleteRemoteDownloadRecord(recordId: UUID) = Unit
+    override suspend fun openRemoteShell(pcId: UUID, path: String, shellType: RemoteShellType): UUID = unavailable()
     override suspend fun openSession(sessionId: UUID) = unavailable()
     override fun terminalEngine(sessionId: UUID): TermuxTerminalEngine? = null
     override fun historyEngine(historyObjectId: UUID): TermuxTerminalEngine? = null
     override suspend fun stopSession(sessionId: UUID) = unavailable()
+    override suspend fun deleteSession(sessionId: UUID) = unavailable()
     override suspend fun sendTerminalAction(sessionId: UUID, action: TerminalAction) = unavailable()
+    override suspend fun sendTerminalKeyCombination(sessionId: UUID, combination: String) = unavailable()
     override suspend fun sendPaste(sessionId: UUID, text: String) = unavailable()
+    override suspend fun sendCommand(sessionId: UUID, text: String) = unavailable()
     override suspend fun replayHistory(entry: HistoryEntry) = unavailable()
+    override suspend fun loadTranscriptBefore(sessionId: UUID) = unavailable()
+    override fun clearTranscript(sessionId: UUID) = Unit
 
     override fun close() = Unit
 

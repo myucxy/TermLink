@@ -1,6 +1,7 @@
 package dev.termlink.network.testrelay
 
 import dev.termlink.session.EventAcceptance
+import dev.termlink.session.DurableAckCommit
 import dev.termlink.session.RemoteInput
 import dev.termlink.session.RemoteLifecycle
 import dev.termlink.session.RemoteSessionEvent
@@ -171,6 +172,14 @@ class Phase1TestSessionClient(
             ),
         )
     }
+
+    override suspend fun persistAcknowledgement(
+        expectedRendererGeneration: Long,
+        highestContiguousSequence: Long,
+    ): DurableAckCommit = DurableAckCommit(highestContiguousSequence, expectedRendererGeneration)
+
+    override suspend fun resetAcknowledgement(expectedRendererGeneration: Long): DurableAckCommit =
+        DurableAckCommit(0, expectedRendererGeneration + 1)
 
     override suspend fun sendInput(input: RemoteInput) {
         val accepted = CompletableDeferred<Unit>()

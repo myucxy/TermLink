@@ -47,15 +47,18 @@ data class SessionSummary(
     val lastOutputSequence: ULong,
     val createdAt: Instant,
     val endedAt: Instant?,
+    /** Server-authoritative reachability of this exact session UUID. */
+    val online: Boolean = false,
 ) {
     override fun equals(other: Any?): Boolean =
         other is SessionSummary && id == other.id && pcId == other.pcId &&
             shellType == other.shellType && encryptedTitle.contentEquals(other.encryptedTitle) &&
             state == other.state && columns == other.columns && rows == other.rows &&
             lastOutputSequence == other.lastOutputSequence && createdAt == other.createdAt &&
-            endedAt == other.endedAt
+            endedAt == other.endedAt && online == other.online
 
-    override fun hashCode(): Int = 31 * id.hashCode() + (encryptedTitle?.contentHashCode() ?: 0)
+    override fun hashCode(): Int =
+        31 * (31 * id.hashCode() + (encryptedTitle?.contentHashCode() ?: 0)) + online.hashCode()
 }
 
 data class HistoryObject(

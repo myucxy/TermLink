@@ -56,6 +56,15 @@ data class ProductionReceivePressure(
     val bufferedWireBytes: Long,
 )
 
+data class ProductionRealtimeSocketDiagnostics(
+    val generation: Int,
+    val connectedGeneration: Int,
+    val socketPresent: Boolean,
+    val state: String,
+    val bufferedEvents: Int,
+    val bufferedWireBytes: Long,
+)
+
 class ProductionReceivedEnvelope internal constructor(
     val envelope: Envelope,
     val wireBytes: Int,
@@ -74,16 +83,40 @@ class ProductionReceivedEnvelope internal constructor(
  * framing and opaque protobuf Envelopes; session keys and payload semantics
  * live in [ProductionRealtimeSessionClient].
  */
+internal interface ProductionRealtimeSocket : Closeable {
+    val receivedEnvelopes: Flow<ProductionReceivedEnvelope>
+    val receivePressure: StateFlow<ProductionReceivePressure>
+    val state: SharedFlow<RealtimeState>
+
+    fun connect()
+    fun send(envelope: Envelope): Boolean
+    fun disconnect(reason: String)
+    fun diagnostics(): ProductionRealtimeSocketDiagnostics = ProductionRealtimeSocketDiagnostics(
+        generation = 0,
+        connectedGeneration = 0,
+        socketPresent = false,
+        state = "UNKNOWN",
+        bufferedEvents = 0,
+        bufferedWireBytes = 0,
+    )
+}
+
 class ProductionRealtimeClient(
     rootUrl: String,
     private val tokenProvider: AccessTokenProvider,
     private val deviceId: UUID,
     private val identity: DeviceIdentity,
     private val role: String,
-    private val httpClient: OkHttpClient = defaultHttpClient,
+    httpClient: OkHttpClient = defaultHttpClient,
     allowCleartextForLocalTest: Boolean = false,
-) : Closeable {
+) : ProductionRealtimeSocket {
     private val websocketUrl = normalizeWebSocket(rootUrl, allowCleartextForLocalTest) + "/v1/realtime"
+    // Callers normally share their REST client with realtime. REST defaults
+    // are unsafe for a long-lived WebSocket: a finite read timeout can close
+    // healthy idle terminals, while no ping leaves a connection half-open
+    // after Android changes network. Preserve the caller's dispatcher, pool,
+    // TLS and proxy configuration, but always enforce realtime liveness.
+    private val httpClient = normalizedWebSocketHttpClient(httpClient)
     private val closed = AtomicBoolean(false)
     private val generation = AtomicInteger(0)
     private val lastIncomingSequences = ConcurrentHashMap<IncomingCursor, java.util.concurrent.atomic.AtomicLong>()
@@ -113,16 +146,16 @@ class ProductionRealtimeClient(
     val incoming: Flow<Envelope> = incomingReceived.map { received ->
         try { received.envelope } finally { received.close() }
     }
-    internal val receivedEnvelopes: Flow<ProductionReceivedEnvelope> = incomingReceived
-    val receivePressure: StateFlow<ProductionReceivePressure> = mutableReceivePressure.asStateFlow()
-    val state: SharedFlow<RealtimeState> = mutableState.asSharedFlow()
+    override val receivedEnvelopes: Flow<ProductionReceivedEnvelope> = incomingReceived
+    override val receivePressure: StateFlow<ProductionReceivePressure> = mutableReceivePressure.asStateFlow()
+    override val state: SharedFlow<RealtimeState> = mutableState.asSharedFlow()
 
     init {
         require(role == "pc" || role == "android") { "role must be pc or android" }
     }
 
     /** Starts one socket generation. Reconnect policy is owned by the session bridge. */
-    fun connect() {
+    override fun connect() {
         check(!closed.get()) { "realtime client is closed" }
         val nextGeneration = generation.incrementAndGet()
         synchronized(sendLock) {
@@ -135,25 +168,34 @@ class ProductionRealtimeClient(
         // frame that was queued but not consumed before disconnect.
         lastIncomingSequences.clear()
         mutableState.tryEmit(RealtimeState.Connecting)
-        val target = URI(websocketUrl).rawPath
-        val proof = DeviceProof.create(identity, deviceId.toString(), "GET", target, ByteArray(0))
-        val request = Request.Builder()
-            .url(websocketUrl)
-            .header("Authorization", "Bearer ${tokenProvider.accessToken()}")
-            .header("X-TermLink-Device", proof.deviceId)
-            .header("X-TermLink-Timestamp", proof.timestampMillis.toString())
-            .header("X-TermLink-Nonce", proof.nonce)
-            .header("X-TermLink-Signature", proof.signature)
-            .header("Sec-WebSocket-Protocol", "termlink.realtime.v1")
-            .build()
-        val opened = httpClient.newWebSocket(request, Listener(nextGeneration))
+        val opened = try {
+            val target = URI(websocketUrl).rawPath
+            val proof = DeviceProof.create(identity, deviceId.toString(), "GET", target, ByteArray(0))
+            val request = Request.Builder()
+                .url(websocketUrl)
+                .header("Authorization", "Bearer ${tokenProvider.accessToken()}")
+                .header("X-TermLink-Device", proof.deviceId)
+                .header("X-TermLink-Timestamp", proof.timestampMillis.toString())
+                .header("X-TermLink-Nonce", proof.nonce)
+                .header("X-TermLink-Signature", proof.signature)
+                .header("Sec-WebSocket-Protocol", "termlink.realtime.v1")
+                .build()
+            httpClient.newWebSocket(request, Listener(nextGeneration))
+        } catch (error: Exception) {
+            if (!closed.get() && generation.get() == nextGeneration) {
+                mutableState.tryEmit(
+                    RealtimeState.Failed(error.message ?: "realtime connection could not start"),
+                )
+            }
+            return
+        }
         synchronized(sendLock) {
             if (!closed.get() && generation.get() == nextGeneration) socket = opened else opened.cancel()
         }
     }
 
     /** Sends a validated opaque Envelope on the currently connected socket. */
-    fun send(envelope: Envelope): Boolean {
+    override fun send(envelope: Envelope): Boolean {
         require(envelope.protocolVersion == 1) { "unsupported Envelope protocol version" }
         require(envelope.senderDeviceId.toByteArray().contentEquals(uuidBytes(deviceId))) {
             "Envelope sender does not match this device"
@@ -175,7 +217,7 @@ class ProductionRealtimeClient(
     }
 
     /** Closes only the current generation, allowing the owner to reconnect. */
-    internal fun disconnect(reason: String) {
+    override fun disconnect(reason: String) {
         if (closed.get()) return
         val active = synchronized(sendLock) {
             generation.incrementAndGet()
@@ -200,6 +242,15 @@ class ProductionRealtimeClient(
         lastIncomingSequences.clear()
         incomingChannel.cancel()
     }
+
+    override fun diagnostics(): ProductionRealtimeSocketDiagnostics = ProductionRealtimeSocketDiagnostics(
+        generation = generation.get(),
+        connectedGeneration = connectedGeneration,
+        socketPresent = socket != null,
+        state = mutableState.replayCache.lastOrNull().diagnosticName(),
+        bufferedEvents = bufferedIncomingEvents.get(),
+        bufferedWireBytes = bufferedIncomingWireBytes.get(),
+    )
 
     private inner class Listener(private val listenerGeneration: Int) : WebSocketListener() {
         private var welcomed = false
@@ -380,6 +431,15 @@ class ProductionRealtimeClient(
 
     private data class IncomingCursor(val sessionId: UUID, val senderId: UUID)
 
+    private fun RealtimeState?.diagnosticName(): String = when (this) {
+        RealtimeState.Connecting -> "CONNECTING"
+        RealtimeState.Connected -> "CONNECTED"
+        is RealtimeState.Reconnecting -> "RECONNECTING"
+        is RealtimeState.Failed -> "FAILED"
+        RealtimeState.Closed -> "CLOSED"
+        null -> "IDLE"
+    }
+
     companion object {
         const val MAX_FRAME_BYTES: Int = 1 shl 20
         const val MAX_BUFFERED_EVENTS: Int = 128
@@ -394,6 +454,12 @@ class ProductionRealtimeClient(
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .pingInterval(15, TimeUnit.SECONDS)
             .build()
+
+        internal fun normalizedWebSocketHttpClient(source: OkHttpClient): OkHttpClient =
+            source.newBuilder()
+                .readTimeout(0, TimeUnit.MILLISECONDS)
+                .pingInterval(15, TimeUnit.SECONDS)
+                .build()
 
         fun encryptedEnvelope(
             sessionId: UUID,

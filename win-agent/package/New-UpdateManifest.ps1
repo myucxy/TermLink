@@ -25,6 +25,20 @@ function Assert-True {
     if (-not $Condition) { throw $Message }
 }
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try { $hashBytes = $sha256.ComputeHash($stream) }
+        finally { $sha256.Dispose() }
+    }
+    finally { $stream.Dispose() }
+
+    return ([BitConverter]::ToString($hashBytes)).Replace('-', '').ToLowerInvariant()
+}
+
 $resolvedPackage = [IO.Path]::GetFullPath($PackagePath)
 $resolvedCertificate = [IO.Path]::GetFullPath($CertificatePath)
 Assert-True (Test-Path -LiteralPath $resolvedPackage -PathType Leaf) "MSIX package not found: $resolvedPackage"
@@ -102,7 +116,7 @@ try {
         version = $version
         minimum_current_version = $MinimumCurrentVersion
         package_file = [IO.Path]::GetFileName($resolvedPackage)
-        sha256 = (Get-FileHash -LiteralPath $resolvedPackage -Algorithm SHA256).Hash.ToLowerInvariant()
+        sha256 = Get-Sha256Hex -Path $resolvedPackage
         created_at_utc = $now.ToString('o')
         expires_at_utc = $now.AddDays($ValidityDays).ToString('o')
     }

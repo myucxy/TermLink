@@ -8,5 +8,6 @@
   <ItemGroup>
     <Compile Include="..\Common\LocalIpc.cs" Link="Common\LocalIpc.cs" />
     <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
+    <InternalsVisibleTo Include="TermLink.SessionHost.Validation" />
   </ItemGroup>
 </Project>

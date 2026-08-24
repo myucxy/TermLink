@@ -2,6 +2,7 @@ package realtime
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -75,6 +76,7 @@ func TestRealtimeMessageDirectionACLIsExhaustive(t *testing.T) {
 		realtimewire.LeaseDenied, realtimewire.LeaseRevoked,
 		realtimewire.ThemeChanged, realtimewire.SessionStarted,
 		realtimewire.SessionInterrupted, realtimewire.SessionEnded,
+		realtimewire.SessionTerminateRequest,
 	}
 	android := map[realtimewire.MessageType]bool{
 		realtimewire.Heartbeat: true, realtimewire.Goodbye: true,
@@ -82,6 +84,7 @@ func TestRealtimeMessageDirectionACLIsExhaustive(t *testing.T) {
 		realtimewire.OutputACK: true, realtimewire.FlowControl: true,
 		realtimewire.InputEvent: true, realtimewire.ResizeRequest: true,
 		realtimewire.ResumeRequest: true, realtimewire.LeaseRequest: true,
+		realtimewire.SessionTerminateRequest: true,
 	}
 	pc := map[realtimewire.MessageType]bool{
 		realtimewire.Heartbeat: true, realtimewire.Goodbye: true,
@@ -120,6 +123,7 @@ func TestEnvelopeACKMetadataContract(t *testing.T) {
 	for _, messageType := range []realtimewire.MessageType{
 		realtimewire.OutputChunk, realtimewire.InputEvent, realtimewire.ResizeRequest,
 		realtimewire.LeaseRequest, realtimewire.SessionEnded,
+		realtimewire.SessionTerminateRequest,
 	} {
 		if validEnvelopeACK(realtimewire.Envelope{MessageType: messageType, ACK: 42}) {
 			t.Fatalf("message %d accepted a forbidden ACK", messageType)
@@ -127,6 +131,36 @@ func TestEnvelopeACKMetadataContract(t *testing.T) {
 		if !validEnvelopeACK(realtimewire.Envelope{MessageType: messageType}) {
 			t.Fatalf("message %d rejected ack=0", messageType)
 		}
+	}
+}
+
+func TestAndroidControlMessagePermissionPolicy(t *testing.T) {
+	tests := []struct {
+		name        string
+		messageType realtimewire.MessageType
+		permission  string
+		want        bool
+	}{
+		{name: "terminate view", messageType: realtimewire.SessionTerminateRequest, permission: "VIEW"},
+		{name: "terminate control", messageType: realtimewire.SessionTerminateRequest, permission: "CONTROL"},
+		{name: "terminate manage", messageType: realtimewire.SessionTerminateRequest, permission: "MANAGE", want: true},
+		{name: "input view", messageType: realtimewire.InputEvent, permission: "VIEW"},
+		{name: "input control", messageType: realtimewire.InputEvent, permission: "CONTROL", want: true},
+		{name: "input manage", messageType: realtimewire.InputEvent, permission: "MANAGE", want: true},
+		{name: "resize view", messageType: realtimewire.ResizeRequest, permission: "VIEW"},
+		{name: "resize control", messageType: realtimewire.ResizeRequest, permission: "CONTROL", want: true},
+		{name: "resize manage", messageType: realtimewire.ResizeRequest, permission: "MANAGE", want: true},
+		{name: "lease view", messageType: realtimewire.LeaseRequest, permission: "VIEW"},
+		{name: "lease control", messageType: realtimewire.LeaseRequest, permission: "CONTROL", want: true},
+		{name: "lease manage", messageType: realtimewire.LeaseRequest, permission: "MANAGE", want: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := allowedRoutePermission(test.messageType, test.permission); got != test.want {
+				t.Fatalf("allowedRoutePermission(%d, %q) = %v, want %v", test.messageType, test.permission, got, test.want)
+			}
+		})
 	}
 }
 
@@ -193,6 +227,102 @@ func TestPCPeerRejectsSameSequenceCiphertextReplacement(t *testing.T) {
 	if !peer.acceptPCSequence(sessionID, uuid.New(), 42, []byte("opaque-frame-b")) {
 		t.Fatal("same logical sequence for an independent recipient was rejected")
 	}
+}
+
+func TestPCPeerAcceptsOrderedReplayBeyondDigestWindowAfterVisibleSubscribeACK(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID := uuid.New()
+	pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New()
+	pc := testPeer(hub, pcID)
+	pc.role = "pc"
+	pc.principal.UserID = userID
+	android := testPeer(hub, androidID)
+	android.role = "android"
+	android.principal.UserID = userID
+	hub.peers[pcID] = pc
+	hub.peers[androidID] = android
+
+	for sequence := uint64(1); sequence <= maxPCReplayFrames+256; sequence++ {
+		if !pc.acceptPCSequence(sessionID, androidID, sequence, replayTestFrame(sequence)) {
+			t.Fatalf("initial sequence %d was rejected", sequence)
+		}
+	}
+
+	// A successfully authorized SUBSCRIBE is the ACK visible to this PC. Its
+	// route-specific epoch permits replay from ACK+1 even though sequence 1 was
+	// evicted from the finite digest cache long ago.
+	hub.sendSubscriptionToPC(android, pcID, sessionID, 0, []byte("subscribe-ack-0"))
+	if !pc.acceptPCSequence(sessionID, androidID, 1, replayTestFrame(1)) {
+		t.Fatal("ordered replay beyond the digest window was rejected")
+	}
+	select {
+	case <-pc.done:
+		t.Fatal("legal old replay closed the entire PC")
+	default:
+	}
+	if pc.acceptPCSequence(sessionID, androidID, 1, []byte("tampered-ciphertext")) {
+		t.Fatal("same sequence with different serialized frame was accepted inside replay epoch")
+	}
+	if !pc.acceptPCSequence(sessionID, androidID, 2, replayTestFrame(2)) {
+		t.Fatal("next ordered frame in replay epoch was rejected")
+	}
+
+	// A later visible cumulative ACK advances the epoch without requiring the
+	// relay to retain every historical frame digest.
+	hub.sendSubscriptionToPC(android, pcID, sessionID, 99, []byte("subscribe-ack-99"))
+	if !pc.acceptPCSequence(sessionID, androidID, 100, replayTestFrame(100)) {
+		t.Fatal("advanced replay epoch did not start at ACK+1")
+	}
+	if pc.acceptPCSequence(sessionID, androidID, 100, []byte("tampered-after-advance")) {
+		t.Fatal("advanced replay epoch allowed ciphertext replacement")
+	}
+}
+
+func TestPCReplayDigestEvictionIsIsolatedByRecipientAndSession(t *testing.T) {
+	pc := testPeer(NewHubWithObserver(nil, nil, nil, nil), uuid.New())
+	pc.role = "pc"
+	busySession, otherSession := uuid.New(), uuid.New()
+	busyRecipient, otherRecipient := uuid.New(), uuid.New()
+
+	protected := []struct {
+		name        string
+		sessionID   uuid.UUID
+		recipientID uuid.UUID
+		frame       []byte
+	}{
+		{name: "recipient", sessionID: busySession, recipientID: otherRecipient, frame: []byte("recipient-frame")},
+		{name: "session", sessionID: otherSession, recipientID: busyRecipient, frame: []byte("session-frame")},
+	}
+	for _, route := range protected {
+		if !pc.acceptPCSequence(route.sessionID, route.recipientID, 7, route.frame) {
+			t.Fatalf("initial %s route frame was rejected", route.name)
+		}
+	}
+	for sequence := uint64(1); sequence <= maxPCReplayFrames+256; sequence++ {
+		if !pc.acceptPCSequence(busySession, busyRecipient, sequence, replayTestFrame(sequence)) {
+			t.Fatalf("busy route sequence %d was rejected", sequence)
+		}
+	}
+	busyState := pc.pcReplayRoutes[pcRouteKey{sessionID: busySession, recipientID: busyRecipient}]
+	if busyState == nil {
+		t.Fatal("busy route replay state was not created")
+	}
+	if len(busyState.digests) != maxPCReplayFrames || len(busyState.order) != maxPCReplayFrames {
+		t.Fatalf("busy route digest/order size=%d/%d, want bounded %d/%d",
+			len(busyState.digests), len(busyState.order), maxPCReplayFrames, maxPCReplayFrames)
+	}
+	for _, route := range protected {
+		if !pc.acceptPCSequence(route.sessionID, route.recipientID, 7, route.frame) {
+			t.Fatalf("busy route evicted %s route digest", route.name)
+		}
+		if pc.acceptPCSequence(route.sessionID, route.recipientID, 7, []byte("replacement")) {
+			t.Fatalf("%s route accepted ciphertext replacement after unrelated eviction", route.name)
+		}
+	}
+}
+
+func replayTestFrame(sequence uint64) []byte {
+	return []byte(fmt.Sprintf("opaque-frame-%d", sequence))
 }
 
 func TestAndroidPeerRejectsReplayedInputSequence(t *testing.T) {
@@ -283,6 +413,86 @@ func TestPCOutputRejectsSubscriptionOwnedByAnotherPC(t *testing.T) {
 	}
 }
 
+func TestReplacementPCImmediatelyReceivesExistingAndroidSubscriptions(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID := uuid.New()
+	pcID := uuid.New()
+	androidID := uuid.New()
+	sessionID := uuid.New()
+	android := testPeer(hub, androidID)
+	android.role = "android"
+	android.principal.UserID = userID
+	hub.peers[androidID] = android
+	hub.subscribe(android, sessionID, store.SessionRouteAuthorization{
+		Permission: "CONTROL",
+		PCDeviceID: pcID,
+	})
+	subscribeFrame := []byte("signed-subscribe-ack-73")
+	if !hub.rememberSubscriptionFrame(android, sessionID, 73, subscribeFrame) {
+		t.Fatal("authorized Android subscription was not cached")
+	}
+
+	replacement := testPeer(hub, pcID)
+	replacement.role = "pc"
+	replacement.principal.UserID = userID
+	hub.peers[pcID] = replacement
+	hub.replaySubscriptionsToPC(replacement)
+
+	select {
+	case received := <-replacement.send:
+		if string(received) != string(subscribeFrame) {
+			t.Fatalf("replayed subscription = %q, want %q", received, subscribeFrame)
+		}
+	default:
+		t.Fatal("replacement PC did not immediately receive the existing subscription")
+	}
+
+	outputFrame := []byte("output-after-pc-reconnect")
+	if err := replacement.route(realtimewire.Envelope{
+		RecipientDeviceID: androidID[:],
+		MessageType:       realtimewire.OutputChunk,
+	}, sessionID, outputFrame); err != nil {
+		t.Fatalf("replacement PC could not route output: %v", err)
+	}
+	select {
+	case received := <-android.send:
+		if string(received) != string(outputFrame) {
+			t.Fatalf("routed output = %q, want %q", received, outputFrame)
+		}
+	default:
+		t.Fatal("Android did not receive output after PC reconnect")
+	}
+}
+
+func TestUnsubscribeRemovesCachedSubscriptionReplay(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID := uuid.New()
+	pcID := uuid.New()
+	android := testPeer(hub, uuid.New())
+	android.role = "android"
+	android.principal.UserID = userID
+	sessionID := uuid.New()
+	hub.peers[android.principal.Device.ID] = android
+	hub.subscribe(android, sessionID, store.SessionRouteAuthorization{PCDeviceID: pcID})
+	if !hub.rememberSubscriptionFrame(android, sessionID, 4, []byte("subscribe")) {
+		t.Fatal("authorized Android subscription was not cached")
+	}
+	if !hub.unsubscribe(android, sessionID) {
+		t.Fatal("subscription was not removed")
+	}
+
+	replacement := testPeer(hub, pcID)
+	replacement.role = "pc"
+	replacement.principal.UserID = userID
+	hub.peers[pcID] = replacement
+	hub.replaySubscriptionsToPC(replacement)
+	select {
+	case frame := <-replacement.send:
+		t.Fatalf("unsubscribed frame was replayed: %q", frame)
+	default:
+	}
+}
+
 func TestDisableAccountClosesOnlyMatchingPeers(t *testing.T) {
 	hub := NewHubWithObserver(nil, nil, nil, nil)
 	lockedUser := uuid.New()
@@ -341,6 +551,9 @@ func testPeer(hub *Hub, deviceID uuid.UUID) *peer {
 		lastSequences:      map[uuid.UUID]uint64{},
 		subscriptions:      map[uuid.UUID]bool{},
 		subscriptionRoutes: map[uuid.UUID]store.SessionRouteAuthorization{},
+		subscriptionFrames: map[uuid.UUID][]byte{},
+		subscriptionACKs:   map[uuid.UUID]uint64{},
+		pcReplayRoutes:     map[pcRouteKey]*pcReplayRoute{},
 	}
 }
 

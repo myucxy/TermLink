@@ -45,7 +45,7 @@ Assert-Policy ($activeWorkflow -notmatch '(?im)^\s*image:\s*[^\s]+:latest\s*$') 
     'Release workflow contains a latest image reference.'
 Assert-Policy ($dockerfile.StartsWith($dockerfileFrontend, [StringComparison]::Ordinal)) `
     'Dockerfile frontend is not pinned to the reviewed immutable digest.'
-$baseImages = @([regex]::Matches($activeDockerfile, '(?im)^FROM\s+([^\s]+)'))
+$baseImages = @([regex]::Matches($activeDockerfile, '(?im)^FROM\s+(?:--platform=[^\s]+\s+)?([^\s]+)'))
 Assert-Policy ($baseImages.Count -ge 2) 'Dockerfile build and runtime stages were not found.'
 foreach ($baseImage in $baseImages) {
     Assert-Policy ($baseImage.Groups[1].Value -match '@sha256:[0-9a-f]{64}$') `
@@ -94,8 +94,9 @@ foreach ($requiredPattern in @(
 }
 
 foreach ($requiredPattern in @(
-    '(?m)^ARG TARGETOS=linux\s*$',
-    '(?m)^ARG TARGETARCH=amd64\s*$',
+    '(?m)^FROM --platform=\$BUILDPLATFORM\s+',
+    '(?m)^ARG TARGETOS\s*$',
+    '(?m)^ARG TARGETARCH\s*$',
     '(?m)^RUN CGO_ENABLED=0 GOOS=\$\{TARGETOS\} GOARCH=\$\{TARGETARCH\} go build[ \t]*\\[ \t]*\r?$',
     '(?m)^\s*org\.opencontainers\.image\.source=',
     '(?m)^\s*org\.opencontainers\.image\.revision=',
@@ -105,5 +106,8 @@ foreach ($requiredPattern in @(
     Assert-Policy ($activeDockerfile -match $requiredPattern) `
         "Dockerfile is missing release invariant: $requiredPattern"
 }
+
+Assert-Policy ($activeDockerfile -notmatch '(?m)^ARG TARGET(?:OS|ARCH)=') `
+    'Dockerfile must not override BuildKit automatic target-platform arguments.'
 
 Write-Host 'TermLink release workflow and Dockerfile policy validation passed.'

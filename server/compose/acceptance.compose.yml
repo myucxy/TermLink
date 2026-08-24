@@ -5,10 +5,15 @@ services:
     image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
     command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
     ports:
-      - "0.0.0.0:8080:8080"
+      - "${TERMLINK_ACCEPTANCE_LUCKY_BIND_IP:-0.0.0.0}:${TERMLINK_ACCEPTANCE_LUCKY_PORT:-8080}:8080"
+    environment:
+      TERMLINK_ACCEPTANCE_PUBLIC_HOST: ${TERMLINK_ACCEPTANCE_PUBLIC_HOST:-termlink.kget.cc}
+      TERMLINK_ACCEPTANCE_PUBLIC_PORT: ${TERMLINK_ACCEPTANCE_PUBLIC_PORT:-8910}
+      TERMLINK_ACCEPTANCE_PUBLIC_SCHEME: ${TERMLINK_ACCEPTANCE_PUBLIC_SCHEME:-https}
     networks:
-      - public
-      - frontend
+      public:
+      frontend:
+      object:
     volumes:
       - ../acceptance/LuckyUpstream.Caddyfile:/etc/caddy/Caddyfile:ro
     read_only: true
@@ -30,17 +35,21 @@ services:
     image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
     command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
     ports:
-      - "127.0.0.1:9443:9443"
+      - "${TERMLINK_ACCEPTANCE_EDGE_BIND_IP:-127.0.0.1}:9443:9443"
+    environment:
+      TERMLINK_ACCEPTANCE_PUBLIC_HOST: ${TERMLINK_ACCEPTANCE_PUBLIC_HOST:-termlink.kget.cc}
+      TERMLINK_ACCEPTANCE_PUBLIC_PORT: ${TERMLINK_ACCEPTANCE_PUBLIC_PORT:-8910}
+      TERMLINK_ACCEPTANCE_HISTORY_HOST: ${TERMLINK_ACCEPTANCE_HISTORY_HOST:-history.127.0.0.1.sslip.io}
     networks:
       public:
       frontend:
         aliases:
           - api.127.0.0.1.sslip.io
           - id.127.0.0.1.sslip.io
-          - history.127.0.0.1.sslip.io
+          - ${TERMLINK_ACCEPTANCE_PUBLIC_HOST:-termlink.kget.cc}
       object:
         aliases:
-          - history.127.0.0.1.sslip.io
+          - ${TERMLINK_ACCEPTANCE_HISTORY_HOST:-history.127.0.0.1.sslip.io}
     volumes:
       - ../acceptance/Caddyfile:/etc/caddy/Caddyfile:ro
       - acceptance-caddy-data:/data
@@ -56,27 +65,6 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
-
-  oidc-ca-ready:
-    image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
-    entrypoint: ["/bin/sh", "-ec"]
-    command:
-      - >-
-        for attempt in $$(seq 1 60); do
-          test -s /data/caddy/pki/authorities/local/root.crt && exit 0;
-          sleep 1;
-        done;
-        exit 1
-    volumes:
-      - acceptance-caddy-data:/data:ro
-    networks: ["frontend"]
-    read_only: true
-    cap_drop: ["ALL"]
-    security_opt: ["no-new-privileges:true"]
-    depends_on:
-      edge:
-        condition: service_healthy
-    restart: "no"
 
   # Docker Desktop exposes file-backed Compose secrets with host-derived
   # permissions and ignores uid/gid/mode metadata. Copy them once into
@@ -142,10 +130,13 @@ services:
       KC_BOOTSTRAP_ADMIN_USERNAME: acceptance-admin
       KC_HEALTH_ENABLED: "true"
       KC_DB: dev-file
-      KC_HOSTNAME: https://termlink.kget.cc:8910
+      KC_HOSTNAME: ${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}
       KC_HTTP_ENABLED: "true"
       KC_PROXY_HEADERS: xforwarded
       KC_CACHE: local
+      # The acceptance realm is intentionally small. Bound the JVM heap so a
+      # disposable identity provider cannot expand to the Docker host limit.
+      JAVA_OPTS_KC_HEAP: -XX:InitialRAMPercentage=10 -XX:MaxRAMPercentage=45
     networks: ["frontend"]
     volumes:
       - ../acceptance/keycloak-realm.json:/opt/keycloak/data/import/termlink-realm.json:ro
@@ -156,6 +147,23 @@ services:
       - /tmp:rw,noexec,nosuid,size=64m
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
+    mem_limit: 768m
+    mem_reservation: 384m
+    cpus: 2.0
+    healthcheck:
+      test:
+        - CMD
+        - /bin/bash
+        - -ec
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000;
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3;
+          response="$$(cat <&3)";
+          [[ "$$response" == *'"status": "UP"'* ]]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
     depends_on:
       runtime-secrets-init:
         condition: service_completed_successfully
@@ -326,10 +334,10 @@ services:
         /opt/keycloak/bin/kcadm.sh update "clients/$$web_client_id" \
           --config /tmp/kcadm.config -r termlink \
           -s 'name=TermLink 个人中心' \
-          -s rootUrl=https://termlink.kget.cc:8910 \
-          -s baseUrl=https://termlink.kget.cc:8910/account \
-          -s 'redirectUris=["https://termlink.kget.cc:8910/auth/callback","https://termlink.kget.cc:8910/account"]' \
-          -s 'webOrigins=["https://termlink.kget.cc:8910"]' >/dev/null
+          -s rootUrl=${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910} \
+          -s baseUrl=${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}/account \
+          -s 'redirectUris=["${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}/auth/callback","${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}/account"]' \
+          -s 'webOrigins=["${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}"]' >/dev/null
         for scope_name in web-origins acr roles profile basic email; do
           scope_id=$$(printf '%s\n' "$$client_scope_table" | while IFS=, read -r id name; do
             if test "$$name" = "$$scope_name"; then printf '%s' "$$id"; fi
@@ -442,7 +450,7 @@ services:
     security_opt: ["no-new-privileges:true"]
     depends_on:
       keycloak:
-        condition: service_started
+        condition: service_healthy
       runtime-secrets-init:
         condition: service_completed_successfully
     restart: "no"
@@ -557,13 +565,13 @@ services:
 
   migrate:
     image: termlink-production-acceptance-server:local
-    build:
-      context: ../..
-      dockerfile: server/Dockerfile
+    # The server service owns the sole build definition for this shared image.
+    # Compose builds all declared images before it creates the dependency graph,
+    # so migrate reuses the exact image without a duplicate build invocation.
     command: ["migrate"]
     environment: &termlink_environment
-      TERMLINK_PUBLIC_URL: https://termlink.kget.cc:8910
-      TERMLINK_OIDC_ISSUER: https://termlink.kget.cc:8910/realms/termlink
+      TERMLINK_PUBLIC_URL: ${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}
+      TERMLINK_OIDC_ISSUER: ${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}/realms/termlink
       TERMLINK_OIDC_CLIENT_ID: termlink-server
       TERMLINK_OIDC_ALLOWED_PARTIES: termlink-android,termlink-windows,termlink-acceptance-cli
       TERMLINK_ANDROID_OIDC_CLIENT_ID: termlink-android
@@ -572,14 +580,14 @@ services:
       TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES: termlink-windows,termlink-acceptance-cli
       TERMLINK_WINDOWS_OIDC_REDIRECT_URI: http://127.0.0.1:43971/oauth2/callback
       TERMLINK_WEB_OIDC_CLIENT_ID: termlink-web
-      TERMLINK_WEB_OIDC_REDIRECT_URI: https://termlink.kget.cc:8910/auth/callback
+      TERMLINK_WEB_OIDC_REDIRECT_URI: ${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}/auth/callback
       TERMLINK_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
       TERMLINK_DATABASE_URL_FILE: /run/secrets/database_url
       TERMLINK_REDIS_URL_FILE: /run/secrets/redis_url
       TERMLINK_TOKEN_SIGNING_KEY_FILE: /run/secrets/token_signing_key
       TERMLINK_HISTORY_ENABLED: "true"
       TERMLINK_S3_ENDPOINT: http://minio:9000
-      TERMLINK_S3_PUBLIC_ENDPOINT: https://history.127.0.0.1.sslip.io:9443
+      TERMLINK_S3_PUBLIC_ENDPOINT: ${TERMLINK_ACCEPTANCE_HISTORY_ORIGIN:-https://history.127.0.0.1.sslip.io:9443}
       TERMLINK_S3_BUCKET: termlink-history
       TERMLINK_S3_REGION: us-east-1
       TERMLINK_S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
@@ -630,8 +638,6 @@ services:
       retries: 45
     depends_on:
       migrate:
-        condition: service_completed_successfully
-      oidc-ca-ready:
         condition: service_completed_successfully
       keycloak-init:
         condition: service_completed_successfully

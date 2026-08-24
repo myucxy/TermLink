@@ -48,42 +48,36 @@ type Lease struct {
 }
 
 var ErrLeaseHeld = errors.New("control lease already held")
+
+// ErrQuotaReached is retained for source compatibility with older callers;
+// ReserveLiveSession no longer returns it because live subscriptions are
+// unlimited.
 var ErrQuotaReached = errors.New("live session quota reached")
 
 var reserveLiveScript = redis.NewScript(`
 local key=KEYS[1]
 local now=tonumber(ARGV[1])
 local expires=tonumber(ARGV[2])
-local limit=tonumber(ARGV[3])
-local member=ARGV[4]
-local target=ARGV[5]
+local member=ARGV[3]
 redis.call('ZREMRANGEBYSCORE',key,'-inf',now)
-local entries=redis.call('ZRANGE',key,0,-1)
-local seen={}
-local count=0
-local target_present=false
-for _,entry in ipairs(entries) do
-  local session=string.sub(entry,1,36)
-  if not seen[session] then seen[session]=true;count=count+1 end
-  if session==target then target_present=true end
-end
-if not target_present and count>=limit then return 0 end
 redis.call('ZADD',key,expires,member)
 redis.call('PEXPIRE',key,120000)
 return 1`)
 
-func (v *Valkey) ReserveLiveSession(ctx context.Context, userID, sessionID, deviceID uuid.UUID, limit int) (bool, error) {
-	if limit < 1 {
-		return false, ErrQuotaReached
-	}
+// ReserveLiveSession records an active subscription for its short lease
+// window.  There is intentionally no account-wide quota: the sorted set is
+// only an expiry/reconnect registry and remains bounded by active clients.
+// The variadic argument is accepted for source compatibility with older
+// callers, but is ignored.
+func (v *Valkey) ReserveLiveSession(ctx context.Context, userID, sessionID, deviceID uuid.UUID, _ ...int) (bool, error) {
 	now := time.Now().UTC()
 	member := sessionID.String() + ":" + deviceID.String()
-	result, err := reserveLiveScript.Run(ctx, v.Client, []string{"live-sessions:" + userID.String()}, now.UnixMilli(), now.Add(60*time.Second).UnixMilli(), limit, member, sessionID.String()).Int()
+	result, err := reserveLiveScript.Run(ctx, v.Client, []string{"live-sessions:" + userID.String()}, now.UnixMilli(), now.Add(60*time.Second).UnixMilli(), member).Int()
 	if err != nil {
 		return false, err
 	}
 	if result != 1 {
-		return false, ErrQuotaReached
+		return false, errors.New("live session reservation was not accepted")
 	}
 	return true, nil
 }
@@ -91,25 +85,41 @@ func (v *Valkey) ReleaseLiveSession(ctx context.Context, userID, sessionID, devi
 	return v.Client.ZRem(ctx, "live-sessions:"+userID.String(), sessionID.String()+":"+deviceID.String()).Err()
 }
 
-// Acquire uses one Lua script so holder renewal and lease replacement cannot
-// race across Relay instances.
+var acquireScript = redis.NewScript(`
+local current=redis.call('GET',KEYS[1])
+if current then
+  local separator=string.find(current,'|',1,true)
+  if separator and string.sub(current,1,separator-1)==ARGV[1] then
+    redis.call('PEXPIRE',KEYS[1],ARGV[3])
+    return current
+  end
+  return false
+end
+local version=redis.call('INCR',KEYS[2])
+local value=ARGV[1]..'|'..ARGV[2]..'|'..version
+redis.call('PSETEX',KEYS[1],ARGV[3],value)
+return value`)
+
+// Acquire atomically creates a lease or resumes the current holder's lease.
+// A resume preserves the lease ID and fencing version while restoring its full
+// duration. Competing holders cannot consume versions or replace the lease.
 func (v *Valkey) Acquire(ctx context.Context, sessionID, holderID uuid.UUID, duration time.Duration) (Lease, error) {
 	key := "lease:" + sessionID.String()
 	leaseID := uuid.New()
 	now := time.Now().UTC()
-	version, err := v.Client.Incr(ctx, key+":version").Result()
-	if err != nil {
-		return Lease{}, err
-	}
-	value := holderID.String() + "|" + leaseID.String() + "|" + fmt.Sprint(version)
-	ok, err := v.Client.SetNX(ctx, key, value, duration).Result()
-	if err != nil {
-		return Lease{}, err
-	}
-	if !ok {
+	value, err := acquireScript.Run(ctx, v.Client, []string{key, key + ":version"}, holderID.String(), leaseID.String(), duration.Milliseconds()).Text()
+	if errors.Is(err, redis.Nil) {
 		return Lease{}, ErrLeaseHeld
 	}
-	return Lease{SessionID: sessionID, HolderDeviceID: holderID, ID: leaseID, Version: version, ExpiresAt: now.Add(duration)}, nil
+	if err != nil {
+		return Lease{}, err
+	}
+	lease, err := parseLeaseValue(sessionID, value)
+	if err != nil {
+		return Lease{}, err
+	}
+	lease.ExpiresAt = now.Add(duration)
+	return lease, nil
 }
 
 var releaseScript = redis.NewScript(`if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('DEL',KEYS[1]) else return 0 end`)

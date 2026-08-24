@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"mime"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -28,6 +29,9 @@ var (
 	formActionPattern       = regexp.MustCompile(`(?is)<form[^>]*id=["']kc-register-form["'][^>]*action=["']([^"']+)["']`)
 	formActionPatternAlt    = regexp.MustCompile(`(?is)<form[^>]*action=["']([^"']+)["'][^>]*id=["']kc-register-form["']`)
 	registrationLinkPattern = regexp.MustCompile(`(?is)href=["']([^"']*(?:login-actions/)?registration[^"']*)["']`)
+	htmlClassPattern        = regexp.MustCompile(`(?is)(?:<|\s)class\s*=\s*["']([^"']*)["']`)
+	htmlIDPattern           = regexp.MustCompile(`(?is)(?:<|\s)id\s*=\s*["']([^"']*)["']`)
+	ariaInvalidPattern      = regexp.MustCompile(`(?is)(?:<|\s)aria-invalid\s*=\s*["']true["']`)
 )
 
 type DirectRegistrationConfig struct {
@@ -96,6 +100,10 @@ func (s *DirectRegistrationService) Register(ctx context.Context, input DirectRe
 	if err := validateRegistrationInput(input); err != nil {
 		return err
 	}
+	session, err := s.newSession()
+	if err != nil {
+		return errRegistrationRejected
+	}
 	state, err := randomRegistrationText(32)
 	if err != nil {
 		return err
@@ -119,7 +127,7 @@ func (s *DirectRegistrationService) Register(ctx context.Context, input DirectRe
 	authURL := *s.issuer
 	authURL.Path = strings.TrimRight(authURL.Path, "/") + "/protocol/openid-connect/auth"
 	authURL.RawQuery = query.Encode()
-	page, err := s.get(ctx, authURL.String())
+	page, err := session.get(ctx, authURL.String())
 	if err != nil {
 		return errRegistrationRejected
 	}
@@ -127,7 +135,7 @@ func (s *DirectRegistrationService) Register(ctx context.Context, input DirectRe
 	if !ok {
 		return errRegistrationRejected
 	}
-	registrationPage, err := s.get(ctx, registrationURL)
+	registrationPage, err := session.get(ctx, registrationURL)
 	if err != nil {
 		return errRegistrationRejected
 	}
@@ -153,7 +161,7 @@ func (s *DirectRegistrationService) Register(ctx context.Context, input DirectRe
 	form.Set("password-confirm", input.Confirm)
 	form.Set("firstName", input.FirstName)
 	form.Set("lastName", input.LastName)
-	response, err := s.post(ctx, action, form)
+	response, err := session.post(ctx, action, form)
 	if err != nil {
 		return errRegistrationRejected
 	}
@@ -162,18 +170,38 @@ func (s *DirectRegistrationService) Register(ctx context.Context, input DirectRe
 		// Keycloak redirects a successful registration back into the auth flow.
 		// The client performs the actual password grant immediately afterwards.
 		location := response.Header.Get("Location")
-		if isIssuerURL(location, s.issuer) {
+		if isRegistrationCallback(location, s.redirectURI, state) {
 			return nil
 		}
 		return errRegistrationRejected
 	}
 	if response.StatusCode == http.StatusOK {
+		mediaType, _, contentTypeErr := mime.ParseMediaType(response.Header.Get("Content-Type"))
+		if contentTypeErr != nil || !strings.EqualFold(mediaType, "text/html") {
+			return errRegistrationRejected
+		}
 		body, readErr := readBounded(response.Body, 256*1024)
-		if readErr == nil && !containsRegistrationError(body) && !strings.Contains(body, `id="kc-register-form"`) {
+		if readErr == nil && isExplicitRegistrationSuccessPage(body) {
 			return nil
 		}
 	}
 	return errRegistrationRejected
+}
+
+// newSession preserves the configured client's transport and request policies,
+// but gives each registration flow its own cookies. Keycloak binds registration
+// actions to those cookies, so sharing a jar can make a later request reuse an
+// earlier flow's session code.
+func (s *DirectRegistrationService) newSession() (*DirectRegistrationService, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, err
+	}
+	client := *s.http
+	client.Jar = jar
+	session := *s
+	session.http = &client
+	return &session, nil
 }
 
 func validateRegistrationInput(input DirectRegistrationInput) error {
@@ -244,14 +272,92 @@ func registrationForm(page string, issuer *url.URL) (string, map[string]string, 
 	return actionURL.String(), hidden, true
 }
 
-func containsRegistrationError(body string) bool {
-	lower := strings.ToLower(body)
-	return strings.Contains(lower, "kc-register-form") || strings.Contains(lower, "kc-feedback-text") || strings.Contains(lower, "aria-invalid=\"true\"")
+func isExplicitRegistrationSuccessPage(body string) bool {
+	// Keycloak normally completes an app registration with the validated OIDC
+	// callback handled above. Some themes instead render a 200 success alert.
+	// Accept only those machine-identifiable alerts: arbitrary 200 pages (for
+	// example a login or maintenance page) must never become registration
+	// success merely because they do not contain a known error string.
+	if hasHTMLID(body, "kc-register-form", "kc-form-login") ||
+		ariaInvalidPattern.MatchString(body) ||
+		hasHTMLClass(body, "tl-alert-error", "tl-alert-warning", "pf-m-danger", "alert-error") {
+		return false
+	}
+	if hasHTMLClass(body, "tl-alert-success") {
+		return true
+	}
+	// These are the success markers emitted by Keycloak's current and legacy
+	// base themes. Requiring kc-feedback-text prevents an unrelated framework
+	// success banner from being treated as an identity-provider result.
+	return hasHTMLClass(body, "kc-feedback-text") &&
+		hasHTMLClass(body, "pf-m-success", "alert-success")
+}
+
+func hasHTMLID(body string, accepted ...string) bool {
+	values := make(map[string]struct{}, len(accepted))
+	for _, value := range accepted {
+		values[strings.ToLower(value)] = struct{}{}
+	}
+	for _, match := range htmlIDPattern.FindAllStringSubmatch(body, -1) {
+		if len(match) != 2 {
+			continue
+		}
+		value := strings.ToLower(strings.TrimSpace(html.UnescapeString(match[1])))
+		if _, ok := values[value]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func hasHTMLClass(body string, accepted ...string) bool {
+	values := make(map[string]struct{}, len(accepted))
+	for _, value := range accepted {
+		values[strings.ToLower(value)] = struct{}{}
+	}
+	for _, match := range htmlClassPattern.FindAllStringSubmatch(body, -1) {
+		if len(match) != 2 {
+			continue
+		}
+		for _, class := range strings.Fields(strings.ToLower(html.UnescapeString(match[1]))) {
+			if _, ok := values[class]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isIssuerURL(value string, issuer *url.URL) bool {
 	parsed, err := url.Parse(value)
 	return err == nil && parsed.Scheme == issuer.Scheme && strings.EqualFold(parsed.Host, issuer.Host) && strings.HasPrefix(parsed.Path, strings.TrimRight(issuer.Path, "/"))
+}
+
+func isRegistrationCallback(value, redirectURI, state string) bool {
+	callback, err := url.Parse(value)
+	if err != nil || callback.User != nil || callback.Opaque != "" || strings.Contains(value, "#") {
+		return false
+	}
+	expected, err := url.Parse(redirectURI)
+	if err != nil || !validDirectRegistrationRedirect(expected) {
+		return false
+	}
+	if !strings.EqualFold(callback.Scheme, expected.Scheme) ||
+		!strings.EqualFold(callback.Host, expected.Host) ||
+		callback.EscapedPath() != expected.EscapedPath() {
+		return false
+	}
+	query, err := url.ParseQuery(callback.RawQuery)
+	if err != nil {
+		return false
+	}
+	if _, hasError := query["error"]; hasError {
+		return false
+	}
+	codes, codeOK := query["code"]
+	states, stateOK := query["state"]
+	return codeOK && len(codes) == 1 && codes[0] != "" &&
+		stateOK && len(states) == 1 && states[0] == state
 }
 
 func (s *DirectRegistrationService) get(ctx context.Context, target string) (string, error) {

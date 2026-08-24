@@ -52,6 +52,13 @@ copy of the cumulative output cursor and is non-zero only for `SUBSCRIBE`,
 cursor MUST equal `Envelope.ack`; every other application message MUST carry
 `ack = 0`.
 
+A cumulative ACK normally means that every ordered event through that sequence
+has been applied. The experimental snapshot path may establish the same cursor
+only after an authenticated snapshot anchored at S has been completely
+restored and durably bound to the renderer checkpoint. The next subscription is
+then `SUBSCRIBE(S)` and the first newly applied event is S+1. Merely downloading
+or decrypting a snapshot never authorizes ACK S.
+
 Pairwise device-channel messages set `recipient_device_id` and are delivered
 only to that approved device. Empty-recipient messages are limited to message
 types whose semantics explicitly allow account/session broadcast. Session
@@ -60,9 +67,13 @@ output in V1 is recipient-specific; Relay never maps Key IDs to private keys.
 ## Capabilities
 
 Version 1 requires `e2ee_x25519_chacha20poly1305`, `cumulative_ack`,
-`flow_control_v1`, and `lease_v1`. `bounded_event_replay_v1` is supported for recovery. The proposed
-`terminal_snapshot_v1` capability remains experimental until Termux/xterm
-cross-engine compatibility validation is accepted; it is not a stable format.
+`flow_control_v1`, and `lease_v1`. `bounded_event_replay_v1` is supported for
+recovery. The additive Phase 1 `TerminalSnapshotV1` and
+`TerminalTranscriptPageV1` object field allocations are frozen in
+`../test-vectors/TERMINAL_SNAPSHOT_V1.md`, but the `terminal_snapshot_v1`
+runtime capability remains experimental and disabled. Clients and Agents MUST
+NOT advertise it until checked-in producer/importer equivalence and
+cross-language E2EE tests satisfy that document's enablement gate.
 
 ## Direction and message ACL
 
@@ -71,8 +82,15 @@ applies this allowlist before looking up a route:
 
 | Direction | Message types |
 | --- | --- |
-| Android → PC | `SUBSCRIBE`, `UNSUBSCRIBE`, `OUTPUT_ACK`, `FLOW_CONTROL`, `INPUT_EVENT`, `RESIZE_REQUEST`, `RESUME_REQUEST`, `LEASE_REQUEST`, `GOODBYE`, `HEARTBEAT` |
+| Android → PC | `SUBSCRIBE`, `UNSUBSCRIBE`, `OUTPUT_ACK`, `FLOW_CONTROL`, `INPUT_EVENT`, `RESIZE_REQUEST`, `RESUME_REQUEST`, `LEASE_REQUEST`, `SESSION_TERMINATE_REQUEST`, `GOODBYE`, `HEARTBEAT` |
 | PC → Android | `SESSION_UPSERT`, `SESSION_REMOVED`, `OUTPUT_CHUNK`, `GAP`, `INPUT_ACCEPTED`, `INPUT_REJECTED`, `RESIZE_APPLIED`, `SNAPSHOT_OFFER`, `SNAPSHOT_CHUNK`, `LEASE_GRANTED`, `LEASE_DENIED`, `LEASE_REVOKED`, `THEME_CHANGED`, `SESSION_STARTED`, `SESSION_INTERRUPTED`, `SESSION_ENDED`, `GOODBYE`, `HEARTBEAT` |
+
+`SNAPSHOT_OFFER` and `SNAPSHOT_CHUNK` retain their existing numbers and ACL
+positions for wire compatibility, but are reserved and unused by
+`terminal_snapshot_v1`. A Phase 1 terminal snapshot is a pairwise E2EE history
+object delivered over REST. It anchors the existing terminal sequence at S,
+does not consume an `Envelope.seq`, and is never inserted into the realtime
+event stream.
 
 `FLOW_CONTROL` is Android → PC only in V1. It is encrypted and contains the
 same `highest_contiguous_seq` as `Envelope.ack`, absolute finite limits for
@@ -91,9 +109,32 @@ version, and input sequence. The PC Agent validates the lease again immediately
 before writing to ConPTY and keeps a bounded duplicate-input cache. Local PC
 input revokes the remote lease and always takes priority.
 
+Revocation fences input that was already in flight; it does not permanently
+disable a foreground same-account Android client. After observing the newer
+`local_input_epoch`, that client may acquire a fresh lease and continue typing.
+
 The ordered `LEASE_REVOKED` payload carries the new monotonic
 `local_input_epoch`. Subsequent Android input echoes the latest observed epoch,
 so a stale lease or in-flight input cannot cross a local-input boundary.
+
+## Experimental REST snapshot bootstrap
+
+The normative object schema, validation bounds, E2EE domains, atomic restore
+state machine, transcript cursor, compatibility behavior, and enablement gate
+are defined in `../test-vectors/TERMINAL_SNAPSHOT_V1.md`.
+
+At a high level, an enabled client reads durable ACK A, asks authenticated REST
+metadata for at most one eligible pairwise snapshot S where
+`A <= S <= last_output_seq`, verifies and restores it off-screen, atomically
+binds the checkpoint and ACK S, and only then sends `SUBSCRIBE(S)`. Existing
+replay serialization prevents a concurrent live event from overtaking replay.
+If S+1 is unavailable, the PC sends an explicit Gap and the client does not
+advance its ACK.
+
+Phase 1 snapshots contain both visible terminal buffers but an empty snapshot
+scrollback. Older rows are separate, bounded `TerminalTranscriptPageV1`
+objects fetched only on upward scroll. Transcript browsing never changes the
+live ACK and transcript data is never prepended to a live VT parser.
 
 ## Lifecycle results
 
@@ -102,3 +143,11 @@ so a stale lease or in-flight input cannot cross a local-input boundary.
 32-bit exit result inside E2EE. Presence is required even when the real value is
 zero. An absent field means that an older sender did not publish the result; a
 receiver must not reinterpret that unknown value as a successful exit.
+
+`SESSION_TERMINATE_REQUEST` is a distinct Android-to-PC MANAGE operation. Its
+encrypted payload carries a 16-byte request ID and the fixed reason
+`USER_REQUESTED`. The Relay authorizes and routes the opaque frame but cannot
+read it. The Windows Agent validates the request, terminates only the
+registered SessionHost identity and its child Shell tree, and then publishes
+the normal lifecycle/removal events. Permanent deletion of offline history
+remains a separate REST operation.

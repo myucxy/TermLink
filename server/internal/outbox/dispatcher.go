@@ -15,13 +15,18 @@ import (
 )
 
 type Dispatcher struct {
-	Store  *store.Postgres
-	Valkey *kv.Valkey
-	Logger *slog.Logger
+	Store   *store.Postgres
+	Valkey  *kv.Valkey
+	History HistoryObjectStore
+	Logger  *slog.Logger
+}
+
+type HistoryObjectStore interface {
+	Delete(context.Context, string) error
 }
 
 func (d Dispatcher) Run(ctx context.Context) {
-	if d.Store == nil || d.Valkey == nil {
+	if d.Store == nil {
 		return
 	}
 	logger := d.Logger
@@ -101,6 +106,17 @@ func (d Dispatcher) deliver(ctx context.Context, event store.OutboxEvent) error 
 		return d.publishAggregate(ctx, "account-status-changed", event.AggregateID)
 	case "entitlement.changed":
 		return d.publishAggregate(ctx, "account-entitlement-changed", event.AggregateID)
+	case "history.object.delete":
+		var payload struct {
+			ObjectKey string `json:"object_key"`
+		}
+		if err := json.Unmarshal(event.Payload, &payload); err != nil || payload.ObjectKey == "" {
+			return errors.New("invalid history object deletion payload")
+		}
+		if d.History == nil {
+			return errors.New("history object store is unavailable")
+		}
+		return d.History.Delete(ctx, payload.ObjectKey)
 	default:
 		return errors.New("unsupported authority outbox event")
 	}
@@ -109,6 +125,9 @@ func (d Dispatcher) deliver(ctx context.Context, event store.OutboxEvent) error 
 func (d Dispatcher) publishAggregate(ctx context.Context, channel string, id *uuid.UUID) error {
 	if id == nil || *id == uuid.Nil {
 		return errors.New("authority outbox aggregate is missing")
+	}
+	if d.Valkey == nil {
+		return errors.New("authority invalidation store is unavailable")
 	}
 	return d.Valkey.Client.Publish(ctx, channel, id.String()).Err()
 }
