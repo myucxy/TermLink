@@ -1008,6 +1008,24 @@ fun ProductApp(
         runOperation(repository::refresh) { refreshInFlight = false }
     }
 
+    fun refreshCurrentDestination() {
+        if (destination != ProductDestination.FILES) {
+            refresh()
+            return
+        }
+        val pcId = selectedRemotePcId
+            ?.let { value -> runCatching { java.util.UUID.fromString(value) }.getOrNull() }
+            ?: return
+        val pcName = snapshot.pcs.firstOrNull { pc -> pc.id == pcId }?.name
+            ?: selectedRemotePcName
+        val currentState = snapshot.remoteFileBrowser.takeIf { state -> state.pcId == pcId } ?: return
+        if (currentState.loading) return
+        val currentPath = currentState.currentPath
+        runOperation {
+            repository.browseRemoteDirectory(pcId, pcName, currentPath, null)
+        }
+    }
+
     suspend fun runSessionOperation(operation: suspend () -> Unit) {
         try {
             operation()
@@ -1131,7 +1149,24 @@ fun ProductApp(
                         } else {
                             { navigateTo(destination.primaryDestination().destination()) }
                         },
-                        onRefresh = ::refresh,
+                        onRefresh = ::refreshCurrentDestination,
+                        refreshEnabled = if (destination != ProductDestination.FILES) {
+                            true
+                        } else {
+                            val selectedPcId = selectedRemotePcId?.let { value ->
+                                runCatching { java.util.UUID.fromString(value) }.getOrNull()
+                            }
+                            selectedPcId != null &&
+                                snapshot.remoteFileBrowser.pcId == selectedPcId &&
+                                !snapshot.remoteFileBrowser.loading
+                        },
+                        refreshContentDescription = stringResource(
+                            if (destination == ProductDestination.FILES) {
+                                R.string.remote_files_refresh_current
+                            } else {
+                                R.string.action_refresh
+                            },
+                        ),
                     )
                 }
             },
@@ -1283,6 +1318,14 @@ fun ProductApp(
                                     path = entry.path,
                                 ),
                             )
+                            remoteDirectoryFavoriteStore.save(accountScope, next)
+                            remoteDirectoryFavorites = next
+                        }
+                    },
+                    onRemoveRemoteFavorite = { favorite ->
+                        val accountScope = remoteDirectoryFavoriteScope
+                        if (accountScope != null) {
+                            val next = removeRemoteDirectoryFavorite(remoteDirectoryFavorites, favorite)
                             remoteDirectoryFavoriteStore.save(accountScope, next)
                             remoteDirectoryFavorites = next
                         }
@@ -2610,6 +2653,8 @@ private fun ProductTopBar(
     destination: ProductDestination,
     onBack: (() -> Unit)?,
     onRefresh: () -> Unit,
+    refreshEnabled: Boolean,
+    refreshContentDescription: String,
 ) {
     CenterAlignedTopAppBar(
         title = { Text(destination.localizedLabel(), style = MaterialTheme.typography.titleLarge) },
@@ -2621,8 +2666,8 @@ private fun ProductTopBar(
             }
         },
         actions = {
-            IconButton(onClick = onRefresh) {
-                Icon(Icons.Filled.Refresh, contentDescription = stringResource(R.string.action_refresh))
+            IconButton(onClick = onRefresh, enabled = refreshEnabled) {
+                Icon(Icons.Filled.Refresh, contentDescription = refreshContentDescription)
             }
         },
     )
@@ -2738,6 +2783,7 @@ private fun ProductContent(
     onOpenDownloads: () -> Unit,
     onOpenRemoteFavorite: (RemoteDirectoryFavorite) -> Unit,
     onToggleRemoteFavorite: (java.util.UUID, String, RemoteFileEntry) -> Unit,
+    onRemoveRemoteFavorite: (RemoteDirectoryFavorite) -> Unit,
     onBrowseRemoteDirectory: (java.util.UUID, String, String, Long?) -> Unit,
     onDownloadRemoteEntry: (java.util.UUID, String, RemoteFileEntry) -> Unit,
     onOpenRemoteShell: (java.util.UUID, String, RemoteShellType) -> Unit,
@@ -2778,6 +2824,11 @@ private fun ProductContent(
             state = state,
             supportedShells = remotePc?.let(::supportedRemoteShellTypes).orEmpty(),
             favorites = remoteDirectoryFavorites,
+            favoriteSupportedShells = { favorite ->
+                snapshot.pcs.firstOrNull { pc -> pc.id == favorite.pcId }
+                    ?.let(::supportedRemoteShellTypes)
+                    .orEmpty()
+            },
             onOpenDirectory = { path ->
                 onBrowseRemoteDirectory(remotePcId, remotePcName, path, null)
             },
@@ -2785,14 +2836,29 @@ private fun ProductContent(
             onLoadMore = { path, offset ->
                 onBrowseRemoteDirectory(remotePcId, remotePcName, path, offset)
             },
-            onRefresh = { path ->
-                onBrowseRemoteDirectory(remotePcId, remotePcName, path, null)
-            },
             onDownload = { entry -> onDownloadRemoteEntry(remotePcId, remotePcName, entry) },
+            onDownloadFavorite = { favorite ->
+                val favoritePcName = snapshot.pcs.firstOrNull { pc -> pc.id == favorite.pcId }
+                    ?.name
+                    ?: favorite.pcName
+                onDownloadRemoteEntry(
+                    favorite.pcId,
+                    favoritePcName,
+                    RemoteFileEntry(
+                        name = favorite.directoryName.ifBlank { "directory" },
+                        path = favorite.path,
+                        kind = RemoteFileKind.DIRECTORY,
+                    ),
+                )
+            },
             onOpenShell = { path, shell -> onOpenRemoteShell(remotePcId, path, shell) },
+            onOpenFavoriteShell = { favorite, shell ->
+                onOpenRemoteShell(favorite.pcId, favorite.path, shell)
+            },
             onToggleFavorite = { entry ->
                 onToggleRemoteFavorite(remotePcId, remotePcName, entry)
             },
+            onRemoveFavorite = onRemoveRemoteFavorite,
             modifier = modifier.fillMaxSize(),
         )
         return
@@ -3028,7 +3094,7 @@ private fun PcRow(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(end = 13.dp),
+                        .padding(end = 28.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
@@ -3039,26 +3105,12 @@ private fun PcRow(
                         tint = MaterialTheme.colorScheme.primary,
                     )
                     Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(3.dp),
-                        ) {
-                            Text(
-                                pc.name,
-                                modifier = Modifier.weight(1f),
-                                style = MaterialTheme.typography.titleMedium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            if (sessions.isNotEmpty()) {
-                                Icon(
-                                    imageVector = if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(20.dp),
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
+                        Text(
+                            pc.name,
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                         Text(
                             stringResource(
                                 R.string.pc_routing_status,
@@ -3086,15 +3138,34 @@ private fun PcRow(
                         }
                     }
                 }
-                StatusDot(
-                    color = if (pc.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
-                    contentDescription = if (pc.online) {
-                        stringResource(R.string.pc_online_accessibility)
-                    } else {
-                        stringResource(R.string.pc_offline_accessibility)
-                    },
-                    modifier = Modifier.align(Alignment.TopEnd),
-                )
+                Box(
+                    modifier = Modifier.align(Alignment.TopEnd).width(24.dp),
+                    contentAlignment = Alignment.TopCenter,
+                ) {
+                    StatusDot(
+                        color = if (pc.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        contentDescription = if (pc.online) {
+                            stringResource(R.string.pc_online_accessibility)
+                        } else {
+                            stringResource(R.string.pc_offline_accessibility)
+                        },
+                    )
+                }
+                if (sessions.isNotEmpty()) {
+                    Box(
+                        modifier = Modifier.align(Alignment.BottomEnd).width(24.dp),
+                        contentAlignment = Alignment.BottomCenter,
+                    ) {
+                        Icon(
+                            imageVector = if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                            contentDescription = stringResource(
+                                if (expanded) R.string.action_collapse_sessions else R.string.action_expand_sessions,
+                            ),
+                            modifier = Modifier.size(20.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
             }
             if (expanded && sessions.isNotEmpty()) {
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))

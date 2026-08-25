@@ -114,12 +114,17 @@
     <string name="action_more_options">更多选项</string>
     <string name="action_add_favorite">收藏该目录</string>
     <string name="action_remove_favorite">取消收藏</string>
+    <string name="action_delete_favorite">删除收藏</string>
+    <string name="action_expand_sessions">展开会话</string>
+    <string name="action_collapse_sessions">收起会话</string>
     <string name="remote_files_root">Windows 驱动器根目录</string>
+    <string name="remote_files_refresh_current">刷新当前目录</string>
     <string name="remote_files_parent">上一级</string>
     <string name="remote_files_loading">正在加载 Windows 目录…</string>
     <string name="remote_files_empty">此目录为空。</string>
     <string name="remote_files_load_more">加载更多</string>
     <string name="remote_favorites_title">收藏目录</string>
+    <string name="remote_favorites_empty">暂无收藏目录。</string>
     <string name="remote_directory_contents">目录内容</string>
     <string name="remote_favorite_location">%1$s · %2$s</string>
     <string name="remote_shells_unavailable">该 PC 未上报可用命令行</string>

@@ -369,12 +369,17 @@
     <string name="action_more_options">More options</string>
     <string name="action_add_favorite">Add directory to favorites</string>
     <string name="action_remove_favorite">Remove from favorites</string>
+    <string name="action_delete_favorite">Delete favorite</string>
+    <string name="action_expand_sessions">Expand sessions</string>
+    <string name="action_collapse_sessions">Collapse sessions</string>
     <string name="remote_files_root">Windows drive roots</string>
+    <string name="remote_files_refresh_current">Refresh current directory</string>
     <string name="remote_files_parent">Parent</string>
     <string name="remote_files_loading">Loading Windows directory…</string>
     <string name="remote_files_empty">This directory is empty.</string>
     <string name="remote_files_load_more">Load more</string>
     <string name="remote_favorites_title">Favorite directories</string>
+    <string name="remote_favorites_empty">No favorite directories yet.</string>
     <string name="remote_directory_contents">Directory contents</string>
     <string name="remote_favorite_location">%1$s · %2$s</string>
     <string name="remote_shells_unavailable">This PC did not report an available command line</string>

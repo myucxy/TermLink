@@ -31,19 +31,24 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
@@ -56,126 +61,140 @@ import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun RemoteFileBrowserPage(
     state: RemoteFileBrowserState,
     supportedShells: List<RemoteShellType>,
     favorites: List<RemoteDirectoryFavorite>,
+    favoriteSupportedShells: (RemoteDirectoryFavorite) -> List<RemoteShellType>,
     onOpenDirectory: (String) -> Unit,
     onOpenFavorite: (RemoteDirectoryFavorite) -> Unit,
     onLoadMore: (String, Long) -> Unit,
-    onRefresh: (String) -> Unit,
     onDownload: (RemoteFileEntry) -> Unit,
+    onDownloadFavorite: (RemoteDirectoryFavorite) -> Unit,
     onOpenShell: (String, RemoteShellType) -> Unit,
+    onOpenFavoriteShell: (RemoteDirectoryFavorite, RemoteShellType) -> Unit,
     onToggleFavorite: (RemoteFileEntry) -> Unit,
+    onRemoveFavorite: (RemoteDirectoryFavorite) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var selectedTabIndex by rememberSaveable(state.pcId) { mutableIntStateOf(0) }
     val parentTarget = remoteFileParentTarget(state.currentPath, state.parentPath)
-    LazyColumn(
-        modifier = modifier.fillMaxSize(),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 14.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        item(key = "header") {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(state.pcName, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Text(
-                    state.currentPath.ifBlank { stringResource(R.string.remote_files_root) },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(
-                        onClick = { parentTarget?.let(onOpenDirectory) },
-                        enabled = parentTarget != null && !state.loading,
-                        modifier = Modifier.heightIn(min = 48.dp),
-                    ) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text(stringResource(R.string.remote_files_parent))
-                    }
-                    OutlinedButton(
-                        onClick = { onRefresh(state.currentPath) },
-                        enabled = !state.loading,
-                        modifier = Modifier.heightIn(min = 48.dp),
-                    ) {
-                        Icon(Icons.Filled.Refresh, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text(stringResource(R.string.action_refresh))
+    Column(modifier = modifier.fillMaxSize()) {
+        PrimaryTabRow(selectedTabIndex = selectedTabIndex) {
+            Tab(
+                selected = selectedTabIndex == 0,
+                onClick = { selectedTabIndex = 0 },
+                text = { Text(stringResource(R.string.remote_directory_contents)) },
+            )
+            Tab(
+                selected = selectedTabIndex == 1,
+                onClick = { selectedTabIndex = 1 },
+                text = { Text(stringResource(R.string.remote_favorites_title)) },
+            )
+        }
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            if (selectedTabIndex == 0) {
+                item(key = "header") {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(state.pcName, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            state.currentPath.ifBlank { stringResource(R.string.remote_files_root) },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 3,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        OutlinedButton(
+                            onClick = { parentTarget?.let(onOpenDirectory) },
+                            enabled = parentTarget != null && !state.loading,
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null)
+                            Spacer(Modifier.width(6.dp))
+                            Text(stringResource(R.string.remote_files_parent))
+                        }
+                        state.error?.let { error ->
+                            Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                        }
+                        if (state.loading && state.entries.isEmpty()) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
+                                horizontalArrangement = Arrangement.Center,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.width(10.dp))
+                                Text(stringResource(R.string.remote_files_loading))
+                            }
+                        } else if (!state.loading && state.entries.isEmpty() && state.error == null) {
+                            Text(
+                                stringResource(R.string.remote_files_empty),
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
                 }
-                state.error?.let { error ->
-                    Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                items(state.entries, key = RemoteFileEntry::path) { entry ->
+                    RemoteFileEntryRow(
+                        entry = entry,
+                        shellOpening = state.openingShell,
+                        supportedShells = supportedShells,
+                        favorite = state.pcId?.let { pcId ->
+                            isRemoteDirectoryFavorite(favorites, pcId, entry.path)
+                        } == true,
+                        onOpenDirectory = onOpenDirectory,
+                        onDownload = onDownload,
+                        onOpenShell = onOpenShell,
+                        onToggleFavorite = { onToggleFavorite(entry) },
+                    )
                 }
-                if (state.loading && state.entries.isEmpty()) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
-                        Spacer(Modifier.width(10.dp))
-                        Text(stringResource(R.string.remote_files_loading))
+                state.nextOffset?.let { offset ->
+                    item(key = "more-$offset") {
+                        Button(
+                            onClick = { onLoadMore(state.currentPath, offset) },
+                            enabled = !state.loading,
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                        ) {
+                            if (state.loading) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                            }
+                            Text(stringResource(R.string.remote_files_load_more))
+                        }
                     }
-                } else if (!state.loading && state.entries.isEmpty() && state.error == null) {
+                }
+            } else if (favorites.isEmpty()) {
+                item(key = "favorites-empty") {
                     Text(
-                        stringResource(R.string.remote_files_empty),
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
+                        stringResource(R.string.remote_favorites_empty),
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 28.dp),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-            }
-        }
-        if (favorites.isNotEmpty()) {
-            item(key = "favorites-heading") {
-                Text(
-                    stringResource(R.string.remote_favorites_title),
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            items(
-                items = favorites,
-                key = { favorite -> "favorite-${favorite.pcId}-${favorite.path.lowercase(Locale.ROOT)}" },
-            ) { favorite ->
-                RemoteDirectoryFavoriteRow(favorite = favorite, onOpen = { onOpenFavorite(favorite) })
-            }
-            item(key = "directory-heading") {
-                Text(
-                    stringResource(R.string.remote_directory_contents),
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-        }
-        items(state.entries, key = RemoteFileEntry::path) { entry ->
-            RemoteFileEntryRow(
-                entry = entry,
-                shellOpening = state.openingShell,
-                supportedShells = supportedShells,
-                favorite = state.pcId?.let { pcId ->
-                    isRemoteDirectoryFavorite(favorites, pcId, entry.path)
-                } == true,
-                onOpenDirectory = onOpenDirectory,
-                onDownload = onDownload,
-                onOpenShell = onOpenShell,
-                onToggleFavorite = { onToggleFavorite(entry) },
-            )
-        }
-        state.nextOffset?.let { offset ->
-            item(key = "more-$offset") {
-                Button(
-                    onClick = { onLoadMore(state.currentPath, offset) },
-                    enabled = !state.loading,
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                ) {
-                    if (state.loading) {
-                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                        Spacer(Modifier.width(8.dp))
-                    }
-                    Text(stringResource(R.string.remote_files_load_more))
+            } else {
+                items(
+                    items = favorites,
+                    key = { favorite -> "favorite-${favorite.pcId}-${favorite.path.lowercase(Locale.ROOT)}" },
+                ) { favorite ->
+                    RemoteDirectoryFavoriteRow(
+                        favorite = favorite,
+                        shellOpening = state.openingShell,
+                        supportedShells = favoriteSupportedShells(favorite),
+                        onOpen = {
+                            selectedTabIndex = 0
+                            onOpenFavorite(favorite)
+                        },
+                        onDownload = { onDownloadFavorite(favorite) },
+                        onOpenShell = { shell -> onOpenFavoriteShell(favorite, shell) },
+                        onRemove = { onRemoveFavorite(favorite) },
+                    )
                 }
             }
         }
@@ -185,8 +204,14 @@ internal fun RemoteFileBrowserPage(
 @Composable
 private fun RemoteDirectoryFavoriteRow(
     favorite: RemoteDirectoryFavorite,
+    shellOpening: RemoteShellType?,
+    supportedShells: List<RemoteShellType>,
     onOpen: () -> Unit,
+    onDownload: () -> Unit,
+    onOpenShell: (RemoteShellType) -> Unit,
+    onRemove: () -> Unit,
 ) {
+    var menuExpanded by remember(favorite.pcId, favorite.path) { mutableStateOf(false) }
     Surface(
         modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen),
         shape = ProductShape,
@@ -211,6 +236,54 @@ private fun RemoteDirectoryFavoriteRow(
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
+            }
+            Box {
+                IconButton(onClick = { menuExpanded = true }, modifier = Modifier.size(48.dp)) {
+                    Icon(Icons.Filled.MoreVert, contentDescription = stringResource(R.string.action_more_options))
+                }
+                DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.action_download_zip)) },
+                        leadingIcon = { Icon(Icons.Filled.Download, contentDescription = null) },
+                        onClick = {
+                            menuExpanded = false
+                            onDownload()
+                        },
+                    )
+                    supportedShells.forEach { shell ->
+                        DropdownMenuItem(
+                            text = { Text(shell.localizedLabel()) },
+                            leadingIcon = {
+                                if (shellOpening == shell) {
+                                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                } else {
+                                    Icon(Icons.Filled.Terminal, contentDescription = null)
+                                }
+                            },
+                            enabled = shellOpening == null,
+                            onClick = {
+                                menuExpanded = false
+                                onOpenShell(shell)
+                            },
+                        )
+                    }
+                    if (supportedShells.isEmpty()) {
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.remote_shells_unavailable)) },
+                            leadingIcon = { Icon(Icons.Filled.Terminal, contentDescription = null) },
+                            enabled = false,
+                            onClick = {},
+                        )
+                    }
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.action_delete_favorite)) },
+                        leadingIcon = { Icon(Icons.Filled.DeleteForever, contentDescription = null) },
+                        onClick = {
+                            menuExpanded = false
+                            onRemove()
+                        },
+                    )
+                }
             }
         }
     }

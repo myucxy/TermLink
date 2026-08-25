@@ -42,6 +42,24 @@ class RemoteDirectoryFavoriteTest {
     }
 
     @Test
+    fun removeIsCaseInsensitiveAndNeverAddsMissingFavorite() {
+        val favorite = RemoteDirectoryFavorite(pcId, "PC", "Work", "C:\\Work\\")
+        val other = RemoteDirectoryFavorite(pcId, "PC", "Other", "D:\\Other")
+
+        assertEquals(
+            listOf(other),
+            removeRemoteDirectoryFavorite(
+                listOf(favorite, other),
+                favorite.copy(path = "c:/WORK"),
+            ),
+        )
+        assertEquals(
+            listOf(other),
+            removeRemoteDirectoryFavorite(listOf(other), favorite),
+        )
+    }
+
+    @Test
     fun storeIsAccountScopedAndRoundTripsMetadata() {
         val favorite = RemoteDirectoryFavorite(pcId, "Office PC", "Source", "D:\\Source")
         store.save("https://server.example\nalice", listOf(favorite))

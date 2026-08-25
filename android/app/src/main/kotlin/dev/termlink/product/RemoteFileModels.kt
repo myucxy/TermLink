@@ -119,10 +119,19 @@ internal fun toggleRemoteDirectoryFavorite(
 ): List<RemoteDirectoryFavorite> {
     require(favorite.path.isNotBlank() && favorite.path.encodeToByteArray().size <= REMOTE_FILE_PATH_MAX_BYTES)
     val existing = isRemoteDirectoryFavorite(favorites, favorite.pcId, favorite.path)
-    val retained = favorites.filterNot { item ->
-        item.pcId == favorite.pcId && remoteFavoritePathKey(item.path) == remoteFavoritePathKey(favorite.path)
-    }
+    val retained = removeRemoteDirectoryFavorite(favorites, favorite)
     return if (existing) retained else (listOf(favorite) + retained).take(MAX_REMOTE_DIRECTORY_FAVORITES)
+}
+
+/** Removes a bookmark without the add-on-miss semantics of [toggleRemoteDirectoryFavorite]. */
+internal fun removeRemoteDirectoryFavorite(
+    favorites: List<RemoteDirectoryFavorite>,
+    favorite: RemoteDirectoryFavorite,
+): List<RemoteDirectoryFavorite> {
+    val pathKey = remoteFavoritePathKey(favorite.path)
+    return favorites.filterNot { item ->
+        item.pcId == favorite.pcId && remoteFavoritePathKey(item.path) == pathKey
+    }
 }
 
 internal fun remoteDirectoryFavoriteAccountScope(serverUrl: String?, accountLabel: String?): String? {
