@@ -174,8 +174,10 @@ func run() error {
 		return err
 	}
 	sessionID := uuid.New()
+	supportedShells := []string{"command-prompt", "windows-powershell"}
 	if _, err := p.signedJSON(pc, http.MethodPut, "/v1/pcs/"+pcID.String(), map[string]any{
 		"name": "Acceptance PC", "agent_version": "acceptance", "key_epoch": initialKeyEpoch,
+		"supported_shells": supportedShells,
 	}, newProbeRunIdempotencyKey("pc-presence"), http.StatusOK); err != nil {
 		return fmt.Errorf("upsert PC: %w", err)
 	}
@@ -188,6 +190,9 @@ func run() error {
 	}
 	if err := validateDiscoveredListItem(pcsDirect, pcID, "device_id", pc.id); err != nil {
 		return fmt.Errorf("same-account Android did not discover its PC: %w", err)
+	}
+	if err := validatePCSupportedShells(pcsDirect, pcID, supportedShells); err != nil {
+		return fmt.Errorf("same-account Android did not receive PC shell capabilities: %w", err)
 	}
 	recipients, err := p.signedJSON(pc, http.MethodGet, "/v1/pcs/"+pcID.String()+"/grants", nil, "", http.StatusOK)
 	if err != nil {
@@ -985,6 +990,30 @@ func validateDiscoveredListItem(response map[string]any, itemID uuid.UUID, owner
 		return nil
 	}
 	return fmt.Errorf("item %s is missing", itemID)
+}
+
+func validatePCSupportedShells(response map[string]any, pcID uuid.UUID, expected []string) error {
+	items, ok := response["items"].([]any)
+	if !ok {
+		return errors.New("items field is invalid")
+	}
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok || fmt.Sprint(item["id"]) != pcID.String() {
+			continue
+		}
+		shells, ok := item["supported_shells"].([]any)
+		if !ok || len(shells) != len(expected) {
+			return fmt.Errorf("PC %s has invalid supported_shells", pcID)
+		}
+		for index := range expected {
+			if fmt.Sprint(shells[index]) != expected[index] {
+				return fmt.Errorf("PC %s has invalid supported_shells", pcID)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("PC %s is missing", pcID)
 }
 
 func spaceSeparatedContains(value, expected string) bool {
