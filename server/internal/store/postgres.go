@@ -616,20 +616,36 @@ func (s *Postgres) RevokeDevice(ctx context.Context, userID, actorID, targetID u
 }
 
 type PCRecord struct {
-	ID                        uuid.UUID  `json:"id"`
-	DeviceID                  uuid.UUID  `json:"device_id"`
-	Name                      string     `json:"name"`
-	AgentVersion              string     `json:"agent_version"`
-	KeyEpoch                  int64      `json:"key_epoch"`
-	RemoteRoutingEnabled      bool       `json:"remote_routing_enabled"`
-	SessionHeartbeatCapable   bool       `json:"session_heartbeat_capable"`
-	SessionHeartbeatEnabledAt *time.Time `json:"session_heartbeat_enabled_at,omitempty"`
-	SupportedShells           []string   `json:"supported_shells"`
-	Online                    bool       `json:"online"`
-	LastSeenAt                *time.Time `json:"last_seen_at,omitempty"`
+	ID                        uuid.UUID                   `json:"id"`
+	DeviceID                  uuid.UUID                   `json:"device_id"`
+	Name                      string                      `json:"name"`
+	AgentVersion              string                      `json:"agent_version"`
+	KeyEpoch                  int64                       `json:"key_epoch"`
+	RemoteRoutingEnabled      bool                        `json:"remote_routing_enabled"`
+	SessionHeartbeatCapable   bool                        `json:"session_heartbeat_capable"`
+	SessionHeartbeatEnabledAt *time.Time                  `json:"session_heartbeat_enabled_at,omitempty"`
+	RemoteAgentUpdateCapable  bool                        `json:"remote_agent_update_capable"`
+	SupportedShells           []string                    `json:"supported_shells"`
+	TerminalCommands          []TerminalCommandCapability `json:"terminal_commands"`
+	Online                    bool                        `json:"online"`
+	LastSeenAt                *time.Time                  `json:"last_seen_at,omitempty"`
+}
+
+type TerminalCommandCapability struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	ShellType   string `json:"shell_type"`
+	Source      string `json:"source"`
 }
 
 func (s *Postgres) UpsertPC(ctx context.Context, userID, deviceID uuid.UUID, item PCRecord) error {
+	if item.TerminalCommands == nil {
+		item.TerminalCommands = []TerminalCommandCapability{}
+	}
+	terminalCommands, err := json.Marshal(item.TerminalCommands)
+	if err != nil {
+		return fmt.Errorf("encode terminal command capabilities: %w", err)
+	}
 	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return err
@@ -660,14 +676,18 @@ func (s *Postgres) UpsertPC(ctx context.Context, userID, deviceID uuid.UUID, ite
 	_, err = tx.Exec(ctx, `
 		INSERT INTO pcs(
 			id,owner_user_id,device_id,name,agent_version,key_epoch,last_seen_at,
-			session_heartbeat_capable,session_heartbeat_enabled_at,supported_shells)
-		VALUES($1,$2,$3,$4,$5,$6,now(),$7,CASE WHEN $7 THEN now() END,COALESCE($8::text[],ARRAY[]::text[]))
+			session_heartbeat_capable,session_heartbeat_enabled_at,supported_shells,
+			remote_agent_update_capable,terminal_commands)
+		VALUES($1,$2,$3,$4,$5,$6,now(),$7,CASE WHEN $7 THEN now() END,
+		       COALESCE($8::text[],ARRAY[]::text[]),$9,$10::jsonb)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name,agent_version=excluded.agent_version,
 		key_epoch=GREATEST(pcs.key_epoch,excluded.key_epoch),last_seen_at=now(),
 		session_heartbeat_capable=pcs.session_heartbeat_capable OR excluded.session_heartbeat_capable,
 		session_heartbeat_enabled_at=COALESCE(pcs.session_heartbeat_enabled_at,excluded.session_heartbeat_enabled_at),
-		supported_shells=excluded.supported_shells
-		WHERE pcs.owner_user_id=$2 AND pcs.device_id=$3`, item.ID, userID, deviceID, item.Name, item.AgentVersion, item.KeyEpoch, item.SessionHeartbeatCapable, item.SupportedShells)
+		supported_shells=excluded.supported_shells,
+		remote_agent_update_capable=excluded.remote_agent_update_capable,
+		terminal_commands=excluded.terminal_commands
+		WHERE pcs.owner_user_id=$2 AND pcs.device_id=$3`, item.ID, userID, deviceID, item.Name, item.AgentVersion, item.KeyEpoch, item.SessionHeartbeatCapable, item.SupportedShells, item.RemoteAgentUpdateCapable, terminalCommands)
 	if err != nil {
 		return err
 	}
@@ -716,7 +736,7 @@ func (s *Postgres) ListPCs(ctx context.Context, userID, deviceID uuid.UUID) ([]P
 	rows, err := s.Pool.Query(ctx, `
 		SELECT p.id,p.device_id,p.name,p.agent_version,p.key_epoch,p.remote_routing_enabled,
 		       p.session_heartbeat_capable,p.session_heartbeat_enabled_at,
-		       p.supported_shells,
+		       p.remote_agent_update_capable,p.supported_shells,p.terminal_commands,
 		       COALESCE(p.last_seen_at > now()-($4 * interval '1 second'),false),p.last_seen_at
 		FROM pcs p
 		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
@@ -736,10 +756,14 @@ func (s *Postgres) ListPCs(ctx context.Context, userID, deviceID uuid.UUID) ([]P
 	result := make([]PCRecord, 0)
 	for rows.Next() {
 		var item PCRecord
+		var terminalCommands []byte
 		if err := rows.Scan(&item.ID, &item.DeviceID, &item.Name, &item.AgentVersion, &item.KeyEpoch,
 			&item.RemoteRoutingEnabled, &item.SessionHeartbeatCapable, &item.SessionHeartbeatEnabledAt,
-			&item.SupportedShells, &item.Online, &item.LastSeenAt); err != nil {
+			&item.RemoteAgentUpdateCapable, &item.SupportedShells, &terminalCommands, &item.Online, &item.LastSeenAt); err != nil {
 			return nil, err
+		}
+		if err := json.Unmarshal(terminalCommands, &item.TerminalCommands); err != nil {
+			return nil, fmt.Errorf("decode terminal command capabilities: %w", err)
 		}
 		result = append(result, item)
 	}

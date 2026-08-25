@@ -36,6 +36,17 @@ data class PcSummary(
     val lastSeenAt: Instant?,
     /** Agent-detected managed shells; clients must never infer this list. */
     val supportedShells: Set<String> = emptySet(),
+    /** Agent-authoritative terminal commands, including Windows-configured manual entries. */
+    val terminalCommands: List<TerminalCommandCapability> = emptyList(),
+    /** Server-authoritative support for Android-triggered transactional Agent updates. */
+    val remoteAgentUpdateCapable: Boolean = false,
+)
+
+data class TerminalCommandCapability(
+    val id: String,
+    val displayName: String,
+    val shellType: String,
+    val source: String,
 )
 
 data class SessionSummary(

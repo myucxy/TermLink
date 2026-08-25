@@ -3,6 +3,8 @@ package api
 import (
 	"reflect"
 	"testing"
+
+	"github.com/termlink/termlink/server/internal/store"
 )
 
 func TestNormalizeSupportedShells(t *testing.T) {
@@ -27,5 +29,27 @@ func TestNormalizeSupportedShells(t *testing.T) {
 				t.Fatalf("normalizeSupportedShells() = %#v, want %#v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeTerminalCommands(t *testing.T) {
+	valid := []store.TerminalCommandCapability{
+		{ID: "command-prompt", DisplayName: "Command Prompt", ShellType: "command-prompt", Source: "detected"},
+		{ID: "custom-123", DisplayName: "Project CLI", ShellType: "custom", Source: "manual"},
+	}
+	got, err := normalizeTerminalCommands(valid)
+	if err != nil || !reflect.DeepEqual(got, valid) {
+		t.Fatalf("valid terminal commands got=%#v err=%v", got, err)
+	}
+	for _, invalid := range [][]store.TerminalCommandCapability{
+		{{ID: "CUSTOM", DisplayName: "Bad", ShellType: "custom", Source: "manual"}},
+		{{ID: "custom-1", DisplayName: " Bad", ShellType: "custom", Source: "manual"}},
+		{{ID: "custom-1", DisplayName: "Bad", ShellType: "wsl", Source: "manual"}},
+		{{ID: "command-prompt", DisplayName: "Bad", ShellType: "custom", Source: "detected"}},
+		{{ID: "custom-1", DisplayName: "One", ShellType: "custom", Source: "manual"}, {ID: "custom-1", DisplayName: "Two", ShellType: "custom", Source: "manual"}},
+	} {
+		if _, err := normalizeTerminalCommands(invalid); err == nil {
+			t.Fatalf("invalid terminal command capabilities accepted: %#v", invalid)
+		}
 	}
 }

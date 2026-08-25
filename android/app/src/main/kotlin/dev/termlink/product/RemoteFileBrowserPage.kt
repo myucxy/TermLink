@@ -56,6 +56,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.termlink.harness.R
+import dev.termlink.model.TerminalCommandCapability
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
@@ -65,16 +66,16 @@ import java.util.UUID
 @Composable
 internal fun RemoteFileBrowserPage(
     state: RemoteFileBrowserState,
-    supportedShells: List<RemoteShellType>,
+    supportedCommands: List<TerminalCommandCapability>,
     favorites: List<RemoteDirectoryFavorite>,
-    favoriteSupportedShells: (RemoteDirectoryFavorite) -> List<RemoteShellType>,
+    favoriteSupportedCommands: (RemoteDirectoryFavorite) -> List<TerminalCommandCapability>,
     onOpenDirectory: (String) -> Unit,
     onOpenFavorite: (RemoteDirectoryFavorite) -> Unit,
     onLoadMore: (String, Long) -> Unit,
     onDownload: (RemoteFileEntry) -> Unit,
     onDownloadFavorite: (RemoteDirectoryFavorite) -> Unit,
-    onOpenShell: (String, RemoteShellType) -> Unit,
-    onOpenFavoriteShell: (RemoteDirectoryFavorite, RemoteShellType) -> Unit,
+    onOpenShell: (String, TerminalCommandCapability) -> Unit,
+    onOpenFavoriteShell: (RemoteDirectoryFavorite, TerminalCommandCapability) -> Unit,
     onToggleFavorite: (RemoteFileEntry) -> Unit,
     onRemoveFavorite: (RemoteDirectoryFavorite) -> Unit,
     modifier: Modifier = Modifier,
@@ -133,8 +134,8 @@ internal fun RemoteFileBrowserPage(
                             }
                             CurrentDirectoryActions(
                                 directory = currentDirectory,
-                                shellOpening = state.openingShell,
-                                supportedShells = supportedShells,
+                                openingCommandId = state.openingCommandId,
+                                supportedCommands = supportedCommands,
                                 favorite = currentDirectoryFavorite,
                                 onDownload = onDownload,
                                 onOpenShell = onOpenShell,
@@ -166,8 +167,8 @@ internal fun RemoteFileBrowserPage(
                 items(state.entries, key = RemoteFileEntry::path) { entry ->
                     RemoteFileEntryRow(
                         entry = entry,
-                        shellOpening = state.openingShell,
-                        supportedShells = supportedShells,
+                        openingCommandId = state.openingCommandId,
+                        supportedCommands = supportedCommands,
                         favorite = state.pcId?.let { pcId ->
                             isRemoteDirectoryFavorite(favorites, pcId, entry.path)
                         } == true,
@@ -207,8 +208,8 @@ internal fun RemoteFileBrowserPage(
                 ) { favorite ->
                     RemoteDirectoryFavoriteRow(
                         favorite = favorite,
-                        shellOpening = state.openingShell,
-                        supportedShells = favoriteSupportedShells(favorite),
+                        openingCommandId = state.openingCommandId,
+                        supportedCommands = favoriteSupportedCommands(favorite),
                         onOpen = {
                             selectedTabIndex = 0
                             onOpenFavorite(favorite)
@@ -226,11 +227,11 @@ internal fun RemoteFileBrowserPage(
 @Composable
 private fun CurrentDirectoryActions(
     directory: RemoteFileEntry?,
-    shellOpening: RemoteShellType?,
-    supportedShells: List<RemoteShellType>,
+    openingCommandId: String?,
+    supportedCommands: List<TerminalCommandCapability>,
     favorite: Boolean,
     onDownload: (RemoteFileEntry) -> Unit,
-    onOpenShell: (String, RemoteShellType) -> Unit,
+    onOpenShell: (String, TerminalCommandCapability) -> Unit,
     onToggleFavorite: (RemoteFileEntry) -> Unit,
 ) {
     var menuExpanded by remember(directory?.path) { mutableStateOf(false) }
@@ -257,24 +258,24 @@ private fun CurrentDirectoryActions(
                         onDownload(directory)
                     },
                 )
-                supportedShells.forEach { shell ->
+                supportedCommands.forEach { command ->
                     DropdownMenuItem(
-                        text = { Text(shell.localizedLabel()) },
+                        text = { Text(stringResource(R.string.action_open_terminal_command, command.displayName)) },
                         leadingIcon = {
-                            if (shellOpening == shell) {
+                            if (openingCommandId == command.id) {
                                 CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
                             } else {
                                 Icon(Icons.Filled.Terminal, contentDescription = null)
                             }
                         },
-                        enabled = shellOpening == null,
+                        enabled = openingCommandId == null,
                         onClick = {
                             menuExpanded = false
-                            onOpenShell(directory.path, shell)
+                            onOpenShell(directory.path, command)
                         },
                     )
                 }
-                if (supportedShells.isEmpty()) {
+                if (supportedCommands.isEmpty()) {
                     DropdownMenuItem(
                         text = { Text(stringResource(R.string.remote_shells_unavailable)) },
                         leadingIcon = { Icon(Icons.Filled.Terminal, contentDescription = null) },
@@ -307,11 +308,11 @@ private fun CurrentDirectoryActions(
 @Composable
 private fun RemoteDirectoryFavoriteRow(
     favorite: RemoteDirectoryFavorite,
-    shellOpening: RemoteShellType?,
-    supportedShells: List<RemoteShellType>,
+    openingCommandId: String?,
+    supportedCommands: List<TerminalCommandCapability>,
     onOpen: () -> Unit,
     onDownload: () -> Unit,
-    onOpenShell: (RemoteShellType) -> Unit,
+    onOpenShell: (TerminalCommandCapability) -> Unit,
     onRemove: () -> Unit,
 ) {
     var menuExpanded by remember(favorite.pcId, favorite.path) { mutableStateOf(false) }
@@ -353,24 +354,24 @@ private fun RemoteDirectoryFavoriteRow(
                             onDownload()
                         },
                     )
-                    supportedShells.forEach { shell ->
+                    supportedCommands.forEach { command ->
                         DropdownMenuItem(
-                            text = { Text(shell.localizedLabel()) },
+                            text = { Text(stringResource(R.string.action_open_terminal_command, command.displayName)) },
                             leadingIcon = {
-                                if (shellOpening == shell) {
+                                if (openingCommandId == command.id) {
                                     CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
                                 } else {
                                     Icon(Icons.Filled.Terminal, contentDescription = null)
                                 }
                             },
-                            enabled = shellOpening == null,
+                            enabled = openingCommandId == null,
                             onClick = {
                                 menuExpanded = false
-                                onOpenShell(shell)
+                                onOpenShell(command)
                             },
                         )
                     }
-                    if (supportedShells.isEmpty()) {
+                    if (supportedCommands.isEmpty()) {
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.remote_shells_unavailable)) },
                             leadingIcon = { Icon(Icons.Filled.Terminal, contentDescription = null) },
@@ -395,12 +396,12 @@ private fun RemoteDirectoryFavoriteRow(
 @Composable
 private fun RemoteFileEntryRow(
     entry: RemoteFileEntry,
-    shellOpening: RemoteShellType?,
-    supportedShells: List<RemoteShellType>,
+    openingCommandId: String?,
+    supportedCommands: List<TerminalCommandCapability>,
     favorite: Boolean,
     onOpenDirectory: (String) -> Unit,
     onDownload: (RemoteFileEntry) -> Unit,
-    onOpenShell: (String, RemoteShellType) -> Unit,
+    onOpenShell: (String, TerminalCommandCapability) -> Unit,
     onToggleFavorite: () -> Unit,
 ) {
     var menuExpanded by remember(entry.path) { mutableStateOf(false) }
@@ -468,24 +469,24 @@ private fun RemoteFileEntryRow(
                             },
                         )
                         if (entry.kind == RemoteFileKind.DIRECTORY) {
-                            supportedShells.forEach { shell ->
+                            supportedCommands.forEach { command ->
                                 DropdownMenuItem(
-                                    text = { Text(shell.localizedLabel()) },
+                                    text = { Text(stringResource(R.string.action_open_terminal_command, command.displayName)) },
                                     leadingIcon = {
-                                        if (shellOpening == shell) {
+                                        if (openingCommandId == command.id) {
                                             CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
                                         } else {
                                             Icon(Icons.Filled.Terminal, contentDescription = null)
                                         }
                                     },
-                                    enabled = shellOpening == null,
+                                    enabled = openingCommandId == null,
                                     onClick = {
                                         menuExpanded = false
-                                        onOpenShell(entry.path, shell)
+                                        onOpenShell(entry.path, command)
                                     },
                                 )
                             }
-                            if (supportedShells.isEmpty()) {
+                            if (supportedCommands.isEmpty()) {
                                 DropdownMenuItem(
                                     text = { Text(stringResource(R.string.remote_shells_unavailable)) },
                                     leadingIcon = { Icon(Icons.Filled.Terminal, contentDescription = null) },
@@ -516,14 +517,6 @@ private fun RemoteFileEntryRow(
             }
         }
     }
-}
-
-@Composable
-private fun RemoteShellType.localizedLabel(): String = when (this) {
-    RemoteShellType.COMMAND_PROMPT -> stringResource(R.string.action_open_cmd)
-    RemoteShellType.WINDOWS_POWERSHELL -> stringResource(R.string.action_open_powershell)
-    RemoteShellType.POWERSHELL_7 -> stringResource(R.string.action_open_powershell_7)
-    RemoteShellType.WSL -> stringResource(R.string.action_open_wsl)
 }
 
 @Composable

@@ -29,6 +29,13 @@ namespace TermLink.Agent
         [JsonPropertyName("shell_type")]
         public string ShellType { get; set; }
 
+        [JsonPropertyName("terminal_command_id")]
+        public string TerminalCommandId { get; set; }
+
+        [JsonIgnore]
+        public string RequestedTerminalCommandId =>
+            string.IsNullOrWhiteSpace(TerminalCommandId) ? ShellType : TerminalCommandId;
+
         [JsonPropertyName("lease_token")]
         public string LeaseToken { get; set; }
 
@@ -761,8 +768,10 @@ namespace TermLink.Agent
             CancellationToken token)
         {
             var workingDirectory = terminals.NormalizeWorkingDirectory(operation.Path);
+            var commandId = operation.RequestedTerminalCommandId;
+            var managedShellType = terminals.ManagedShellTypeFor(commandId);
             if (!sessionVisible(sessionId))
-                terminals.Launch(operation.ShellType, workingDirectory, sessionId);
+                terminals.Launch(commandId, workingDirectory, sessionId);
             var deadline = DateTime.UtcNow.Add(registrationWait);
             while (!sessionVisible(sessionId))
             {
@@ -774,10 +783,20 @@ namespace TermLink.Agent
                 }
                 await Task.Delay(RemoteAccessPollInterval, token).ConfigureAwait(false);
             }
+            if (ManagedTerminalLauncher.IsBuiltInShellType(commandId))
+            {
+                return JsonSerializer.SerializeToElement(new
+                {
+                    session_id = sessionId,
+                    shell_type = managedShellType,
+                    cwd = operation.Path
+                });
+            }
             return JsonSerializer.SerializeToElement(new
             {
                 session_id = sessionId,
-                shell_type = operation.ShellType,
+                terminal_command_id = commandId,
+                shell_type = managedShellType,
                 cwd = operation.Path
             });
         }

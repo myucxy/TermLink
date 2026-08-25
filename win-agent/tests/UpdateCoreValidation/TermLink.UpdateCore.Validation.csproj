@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyName>TermLink.UpdateCore.Validation</AssemblyName>
+    <RootNamespace>TermLink.UpdateCore.Validation</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\UpdateCore\TermLink.UpdateCore.csproj" />
+  </ItemGroup>
+</Project>

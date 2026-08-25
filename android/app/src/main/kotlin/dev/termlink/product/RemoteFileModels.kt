@@ -7,6 +7,7 @@ import java.time.Instant
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.UUID
+import dev.termlink.model.TerminalCommandCapability
 import java.util.Base64
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
@@ -96,6 +97,26 @@ enum class RemoteShellType(val wireValue: String) {
 /** Maps only server/Agent-authoritative capabilities in a stable UX order. */
 internal fun supportedRemoteShellTypes(pc: PcSummary): List<RemoteShellType> =
     RemoteShellType.entries.filter { shell -> shell.wireValue in pc.supportedShells }
+
+/** Uses standardized Agent capabilities and falls back only for pre-capability Agents. */
+internal fun supportedRemoteTerminalCommands(pc: PcSummary): List<TerminalCommandCapability> =
+    if (pc.terminalCommands.isNotEmpty()) {
+        pc.terminalCommands
+    } else {
+        supportedRemoteShellTypes(pc).map { shell ->
+            TerminalCommandCapability(
+                id = shell.wireValue,
+                displayName = when (shell) {
+                    RemoteShellType.COMMAND_PROMPT -> "Command Prompt"
+                    RemoteShellType.WINDOWS_POWERSHELL -> "Windows PowerShell"
+                    RemoteShellType.POWERSHELL_7 -> "PowerShell 7"
+                    RemoteShellType.WSL -> "WSL"
+                },
+                shellType = shell.wireValue,
+                source = "legacy",
+            )
+        }
+    }
 
 internal fun remoteCurrentDirectoryEntry(path: String): RemoteFileEntry? {
     if (path.isBlank()) return null

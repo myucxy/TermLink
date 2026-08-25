@@ -162,6 +162,10 @@ func (s *Postgres) CreateFileOperation(ctx context.Context, userID, requesterID,
 		JOIN devices agent ON agent.id=p.device_id AND agent.user_id=$2
 			AND agent.device_type='WINDOWS_PC' AND agent.trust_state='TRUSTED'
 		WHERE p.id=$9 AND p.owner_user_id=$2
+		  AND ($4<>'OPEN_TERMINAL' OR $7=ANY(p.supported_shells) OR EXISTS (
+			SELECT 1 FROM jsonb_array_elements(p.terminal_commands) command
+			WHERE command->>'id'=$7
+		  ))
 		RETURNING `+fileOperationColumns,
 		itemID, userID, requesterID, input.Operation, input.Path, input.Offset, input.ShellType, input.ExpiresAt, pcID)
 	item, err := scanFileOperation(row)

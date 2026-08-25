@@ -202,6 +202,49 @@ class ProductStateTest {
     }
 
     @Test
+    fun agentUpdateCancellationStopsAtInstallBoundary() {
+        val base = AgentUpdateProgress(
+            id = UUID.randomUUID(),
+            pcId = UUID.randomUUID(),
+            currentVersion = "0.1.31.37",
+            currentBuild = 37,
+            targetVersion = "0.1.32",
+            targetBuild = 38,
+            status = "PROCESSING",
+            phase = "VERIFIED",
+            progressPercent = 70,
+        )
+
+        assertTrue(base.cancelable)
+        assertFalse(base.terminal)
+        assertFalse(base.copy(phase = "DRAINING_SESSIONS", progressPercent = 75).cancelable)
+        assertFalse(base.copy(phase = "INSTALLING", progressPercent = 85).cancelable)
+    }
+
+    @Test
+    fun agentUpdateTerminalStatesStopMonitoring() {
+        val base = AgentUpdateProgress(
+            id = UUID.randomUUID(),
+            pcId = UUID.randomUUID(),
+            currentVersion = "0.1.31.37",
+            currentBuild = 37,
+            targetVersion = "0.1.32",
+            targetBuild = 38,
+            status = "PENDING",
+            phase = "REQUESTED",
+            progressPercent = 0,
+        )
+
+        assertFalse(base.terminal)
+        for (status in listOf(
+            "SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED", "ROLLED_BACK", "ROLLBACK_FAILED",
+        )) {
+            assertTrue("$status must stop polling", base.copy(status = status).terminal)
+            assertFalse("$status cannot remain cancelable", base.copy(status = status).cancelable)
+        }
+    }
+
+    @Test
     fun localActivityIsBoundedAndMarkedDeviceLocal() {
         var snapshot = ProductSnapshot()
         repeat(MAX_DEVICE_LOCAL_ACTIVITY_ENTRIES + 7) { index ->

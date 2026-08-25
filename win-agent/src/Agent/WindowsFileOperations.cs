@@ -734,6 +734,7 @@ namespace TermLink.Agent
         internal const string WindowsPowerShellShellType = "windows-powershell";
         internal const string PowerShell7ShellType = "powershell-7";
         internal const string WslShellType = "wsl";
+        internal const string CustomShellType = "custom";
         internal const int DefaultRegistrationTimeoutMilliseconds = 30000;
         private readonly WindowsPathService paths;
         private readonly IProcessStarter processes;
@@ -788,16 +789,16 @@ namespace TermLink.Agent
         internal Guid Launch(string shellType, string workingDirectory, Guid? requestedSessionId = null)
         {
             var directory = paths.NormalizeExistingDirectory(workingDirectory);
-            var shell = ResolveShell(shellType);
+            var profile = ResolveCommand(shellType);
             if (!File.Exists(sessionHostPath))
                 throw new FileOperationException("SESSION_HOST_NOT_FOUND", "TermLink.SessionHost.exe is not installed.");
-            if (!File.Exists(shell))
+            if (!File.Exists(profile.ExecutablePath))
                 throw new FileOperationException("SHELL_NOT_FOUND", "The requested Windows shell is not installed.");
 
             var sessionId = requestedSessionId.GetValueOrDefault(Guid.NewGuid());
             if (sessionId == Guid.Empty)
                 throw new FileOperationException("SESSION_ID_INVALID", "A non-empty managed session ID is required.");
-            var arguments = BuildSessionHostArguments(shellType, shell, directory, sessionId);
+            var arguments = BuildSessionHostArgumentsForProfile(profile, directory, sessionId);
             var windowsTerminal = windowsTerminalResolver();
             if (!string.IsNullOrWhiteSpace(windowsTerminal))
             {
@@ -857,6 +858,8 @@ namespace TermLink.Agent
         internal string NormalizeWorkingDirectory(string workingDirectory) =>
             paths.NormalizeExistingDirectory(workingDirectory);
 
+        internal string ManagedShellTypeFor(string commandId) => ResolveCommand(commandId).ManagedShell;
+
         /// <summary>
         /// Returns only managed shells that this installation can actually
         /// launch. SessionHost is part of the capability because a shell
@@ -879,6 +882,23 @@ namespace TermLink.Agent
                     Path.Combine(Environment.SystemDirectory, "wsl.exe"),
                     "wsl.exe"));
         }
+
+        internal static TerminalCommandCapability[] DetectTerminalCommandCapabilities()
+        {
+            var launcher = new ManagedTerminalLauncher();
+            return launcher.AvailableProfiles()
+                .Select(profile => new TerminalCommandCapability
+                {
+                    Id = profile.Id,
+                    DisplayName = profile.DisplayName,
+                    ShellType = profile.ManagedShell,
+                    Source = profile.Source
+                })
+                .ToArray();
+        }
+
+        internal static TerminalCommandProfile[] LoadAvailableTerminalCommandProfiles() =>
+            new ManagedTerminalLauncher().AvailableProfiles().ToArray();
 
         internal static string[] DetectSupportedShellTypesAtPaths(
             string sessionHostPath,
@@ -926,6 +946,26 @@ namespace TermLink.Agent
             };
         }
 
+        internal static string[] BuildSessionHostArgumentsForProfile(
+            TerminalCommandProfile profile,
+            string workingDirectory,
+            Guid sessionId)
+        {
+            if (profile == null) throw new ArgumentNullException(nameof(profile));
+            ValidateManagedShellType(profile.ManagedShell);
+            if (sessionId == Guid.Empty) throw new ArgumentException("Session ID is required.", nameof(sessionId));
+            var commandLine = BuildCommandLine(profile);
+            return new[]
+            {
+                "--command-base64", Convert.ToBase64String(Encoding.UTF8.GetBytes(commandLine)),
+                "--managed-shell", profile.ManagedShell,
+                "--managed-session-id", sessionId.ToString("D"),
+                "--working-directory-base64", Convert.ToBase64String(Encoding.UTF8.GetBytes(workingDirectory)),
+                "--registration-timeout-ms", DefaultRegistrationTimeoutMilliseconds.ToString(
+                    System.Globalization.CultureInfo.InvariantCulture)
+            };
+        }
+
         internal static void ValidateShellType(string shellType)
         {
             if (!string.Equals(shellType, CommandPromptShellType, StringComparison.Ordinal) &&
@@ -939,16 +979,79 @@ namespace TermLink.Agent
             }
         }
 
-        private string ResolveShell(string shellType)
+        internal static bool IsBuiltInShellType(string shellType) =>
+            string.Equals(shellType, CommandPromptShellType, StringComparison.Ordinal) ||
+            string.Equals(shellType, WindowsPowerShellShellType, StringComparison.Ordinal) ||
+            string.Equals(shellType, PowerShell7ShellType, StringComparison.Ordinal) ||
+            string.Equals(shellType, WslShellType, StringComparison.Ordinal);
+
+        private static void ValidateManagedShellType(string shellType)
         {
+            if (string.Equals(shellType, CustomShellType, StringComparison.Ordinal)) return;
             ValidateShellType(shellType);
-            if (string.Equals(shellType, CommandPromptShellType, StringComparison.Ordinal))
-                return commandPromptPath;
-            if (string.Equals(shellType, WindowsPowerShellShellType, StringComparison.Ordinal))
-                return windowsPowerShellPath;
-            if (string.Equals(shellType, PowerShell7ShellType, StringComparison.Ordinal))
-                return powerShell7Path;
-            return wslPath;
+        }
+
+        private TerminalCommandProfile ResolveCommand(string commandId)
+        {
+            var profile = AvailableProfiles().FirstOrDefault(item =>
+                string.Equals(item.Id, commandId, StringComparison.Ordinal));
+            if (profile != null) return profile;
+            throw new FileOperationException(
+                "SHELL_NOT_ALLOWED",
+                "Only terminal commands currently advertised by this PC are supported.");
+        }
+
+        private IReadOnlyList<TerminalCommandProfile> AvailableProfiles()
+        {
+            if (!File.Exists(sessionHostPath)) return Array.Empty<TerminalCommandProfile>();
+            var result = new List<TerminalCommandProfile>(24);
+            AddBuiltIn(result, CommandPromptShellType, "Command Prompt", commandPromptPath, string.Empty);
+            AddBuiltIn(result, WindowsPowerShellShellType, "Windows PowerShell", windowsPowerShellPath, "-NoLogo -NoProfile");
+            AddBuiltIn(result, PowerShell7ShellType, "PowerShell 7", powerShell7Path, "-NoLogo -NoProfile");
+            AddBuiltIn(result, WslShellType, "WSL", wslPath, string.Empty);
+            foreach (var profile in TerminalCommandProfileStore.LoadManualProfiles())
+            {
+                if (profile.Enabled && File.Exists(profile.ExecutablePath)) result.Add(profile);
+            }
+            return result;
+        }
+
+        private static void AddBuiltIn(
+            ICollection<TerminalCommandProfile> result,
+            string id,
+            string displayName,
+            string executablePath,
+            string arguments)
+        {
+            if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath)) return;
+            result.Add(new TerminalCommandProfile
+            {
+                Id = id,
+                DisplayName = displayName,
+                ExecutablePath = executablePath,
+                Arguments = arguments,
+                ManagedShell = id,
+                Source = "detected",
+                Enabled = true
+            });
+        }
+
+        private static string BuildCommandLine(TerminalCommandProfile profile)
+        {
+            var arguments = string.IsNullOrWhiteSpace(profile.Arguments)
+                ? string.Empty
+                : " " + profile.Arguments;
+            var extension = Path.GetExtension(profile.ExecutablePath);
+            if (string.Equals(extension, ".cmd", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(extension, ".bat", StringComparison.OrdinalIgnoreCase))
+            {
+                var commandPrompt = Environment.GetEnvironmentVariable("ComSpec");
+                if (string.IsNullOrWhiteSpace(commandPrompt))
+                    commandPrompt = Path.Combine(Environment.SystemDirectory, "cmd.exe");
+                return QuoteWindowsArgument(commandPrompt) + " /D /S /C \"" +
+                    QuoteWindowsArgument(profile.ExecutablePath) + arguments + "\"";
+            }
+            return QuoteWindowsArgument(profile.ExecutablePath) + arguments;
         }
 
         private static string NormalizeOptionalExecutablePath(string path) =>

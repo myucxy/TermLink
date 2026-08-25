@@ -12,6 +12,7 @@
   <ItemGroup>
     <Compile Include="..\Common\WindowsTerminalIntegration.cs" Link="Common\WindowsTerminalIntegration.cs" />
     <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
+    <ProjectReference Include="..\UpdateCore\TermLink.UpdateCore.csproj" />
     <EmbeddedResource Include="..\..\..\assets\brand\windows\TermLink.ico"
                       LogicalName="TermLink.Setup.Assets.TermLink.ico" />
     <EmbeddedResource Include="$(PayloadPath)"

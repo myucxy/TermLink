@@ -15,11 +15,16 @@ var isolatedReconnectPreferencesPath = Path.Combine(
     isolatedRoot,
     "Agent",
     "connection.preferences.json");
+var isolatedTerminalCommandsPath = Path.Combine(
+    isolatedRoot,
+    "Agent",
+    "terminal-commands.json");
 Directory.CreateDirectory(isolatedRoot);
 AppContext.SetData("TermLink.TrayPreferences.StoragePath", isolatedPreferencesPath);
 AppContext.SetData(
     "TermLink.ProductionReconnectPreferences.StoragePath",
     isolatedReconnectPreferencesPath);
+AppContext.SetData("TermLink.TerminalCommands.StoragePath", isolatedTerminalCommandsPath);
 // The unified desktop executable keeps the TermLink.Tray namespace, but its
 // assembly name is TermLink so the installed UI and background runtime ship as
 // one program. Load the product assembly name instead of the pre-unification
@@ -34,6 +39,8 @@ var formType = assembly.GetType("TermLink.Tray.MainWindowForm", true)!;
 var trayPopupType = assembly.GetType("TermLink.Tray.TrayPopupForm", true)!;
 var accountLinkType = assembly.GetType("TermLink.Tray.AccountLinkForm", true)!;
 var accountRegisterType = assembly.GetType("TermLink.Tray.AccountRegisterForm", true)!;
+var terminalCommandsType = assembly.GetType("TermLink.Tray.TerminalCommandSettingsForm", true)!;
+var terminalCommandEditorType = assembly.GetType("TermLink.Tray.TerminalCommandEditorForm", true)!;
 var updateResultType = assembly.GetType("TermLink.Tray.WindowsUpdateResult", true)!;
 var updateAvailableType = assembly.GetType("TermLink.Tray.UpdateAvailableForm", true)!;
 var parse = optionsType.GetMethod("Parse", BindingFlags.Public | BindingFlags.Static)!;
@@ -130,6 +137,17 @@ try
                     Save(form, Path.Combine(
                         dpiRoot,
                         $"{language.ToLowerInvariant()}-{theme.ToLowerInvariant()}-{page}.png"));
+                    if (page == "settings" && language == "Chinese" && theme == "Light")
+                    {
+                        ScrollControlIntoView(form, "管理命令");
+                        Application.DoEvents();
+                        AssertLayoutTree(form, targetDpi == initialDpi);
+                        Save(form, Path.Combine(dpiRoot, "chinese-light-settings-commands.png"));
+                        ScrollToBottom(form);
+                        Application.DoEvents();
+                        AssertLayoutTree(form, targetDpi == initialDpi);
+                        Save(form, Path.Combine(dpiRoot, "chinese-light-settings-bottom.png"));
+                    }
                 }
 
                 // Users can resize the window down to MinimumSize. Exercise
@@ -171,6 +189,11 @@ try
 
                 CaptureFixedDialog(accountLinkType, "account-link", language, theme, targetDpi, dpiRoot, 500, 300, null);
                 CaptureFixedDialog(accountRegisterType, "account-register", language, theme, targetDpi, dpiRoot, 500, 370, null);
+                if (language == "Chinese" && theme == "Light")
+                {
+                    CaptureFlexibleDialog(terminalCommandsType, "terminal-commands", targetDpi, dpiRoot, null);
+                    CaptureFlexibleDialog(terminalCommandEditorType, "terminal-command-editor", targetDpi, dpiRoot, new object[] { null });
+                }
                 CaptureFixedDialog(
                     trayPopupType,
                     "tray-popup",
@@ -222,6 +245,7 @@ finally
     AppContext.SetData(
         "TermLink.ProductionReconnectPreferences.StoragePath",
         null);
+    AppContext.SetData("TermLink.TerminalCommands.StoragePath", null);
     DeleteIsolatedRoot(isolatedRootParent, isolatedRoot);
 }
 
@@ -238,12 +262,9 @@ static void CaptureFixedDialog(
 {
     using var form = (Form)(constructorArguments == null
         ? Activator.CreateInstance(formType, nonPublic: true)!
-        : Activator.CreateInstance(
-            formType,
-            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
-            binder: null,
-            args: constructorArguments,
-            culture: null)!);
+        : formType.GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .Single(constructor => constructor.GetParameters().Length == constructorArguments.Length)
+            .Invoke(constructorArguments));
     form.StartPosition = FormStartPosition.Manual;
     form.Location = new Point(40, 40);
     form.Show();
@@ -256,6 +277,57 @@ static void CaptureFixedDialog(
     Save(form, Path.Combine(
         outputRoot,
         $"{language.ToLowerInvariant()}-{theme.ToLowerInvariant()}-{name}.png"));
+}
+
+static void CaptureFlexibleDialog(
+    Type formType,
+    string name,
+    int targetDpi,
+    string outputRoot,
+    object[] constructorArguments)
+{
+    using var form = (Form)(constructorArguments == null
+        ? Activator.CreateInstance(formType, nonPublic: true)!
+        : formType.GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .Single(constructor => constructor.GetParameters().Length == constructorArguments.Length)
+            .Invoke(constructorArguments));
+    form.StartPosition = FormStartPosition.Manual;
+    form.Location = new Point(40, 40);
+    form.Show();
+    Application.DoEvents();
+    var initialDpi = form.DeviceDpi;
+    ApplyDpi(form, targetDpi);
+    AssertLayoutTree(form, targetDpi == initialDpi);
+    Save(form, Path.Combine(outputRoot, $"chinese-light-{name}.png"));
+}
+
+static void ScrollToBottom(Control root)
+{
+    foreach (Control child in root.Controls)
+    {
+        if (child is ScrollableControl scrollable && scrollable.AutoScroll &&
+            scrollable.DisplayRectangle.Height > scrollable.ClientSize.Height)
+        {
+            scrollable.AutoScrollPosition = new Point(0, scrollable.DisplayRectangle.Height);
+        }
+        ScrollToBottom(child);
+    }
+}
+
+static void ScrollControlIntoView(Control root, string text)
+{
+    var target = Descendants(root).FirstOrDefault(control =>
+        control is Button && string.Equals(control.Text, text, StringComparison.Ordinal));
+    if (target == null) throw new InvalidOperationException("Expected settings control was not found: " + text);
+    for (var parent = target.Parent; parent != null; parent = parent.Parent)
+    {
+        if (parent is ScrollableControl scrollable && scrollable.AutoScroll)
+        {
+            scrollable.ScrollControlIntoView(target);
+            return;
+        }
+    }
+    throw new InvalidOperationException("Expected settings control is not inside an auto-scroll container: " + text);
 }
 
 static void SetProperty(object target, string name, object value)

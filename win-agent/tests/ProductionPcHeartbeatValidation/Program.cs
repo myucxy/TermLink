@@ -158,9 +158,20 @@ internal static class Program
             var buildCapabilitiesBody = Method(runtimeType, "BuildPCUpsertBodyWithCapabilities");
             var detectShells = Method(terminalLauncherType, "DetectSupportedShellTypes");
             var initialShells = (string[])detectShells.Invoke(null, null);
-            var expectedBody = (byte[])buildCapabilitiesBody.Invoke(
+            var legacyCapabilitiesBody = (byte[])buildCapabilitiesBody.Invoke(
                 null,
                 new object[] { "Heartbeat Validation PC", "validation-1", 7L, initialShells });
+            using (var legacyCapabilitiesJson = JsonDocument.Parse(legacyCapabilitiesBody))
+            {
+                Require(!legacyCapabilitiesJson.RootElement.TryGetProperty("terminal_commands", out _),
+                    "The supported-shell compatibility helper changed its contract.");
+            }
+            var detectTerminalCommands = Method(terminalLauncherType, "DetectTerminalCommandCapabilities");
+            var initialCommands = detectTerminalCommands.Invoke(null, null);
+            var buildTerminalCommandsBody = Method(runtimeType, "BuildPCUpsertBodyWithTerminalCommands");
+            var expectedBody = (byte[])buildTerminalCommandsBody.Invoke(
+                null,
+                new[] { (object)"Heartbeat Validation PC", "validation-1", 7L, initialShells, initialCommands });
             Require(initial.Method == HttpMethod.Put && initial.Body.SequenceEqual(expectedBody),
                 "Initial registration did not advertise detected PC capabilities.");
             var pcUpsertKey = Method(runtimeType, "PCUpsertIdempotencyKey");
@@ -187,6 +198,8 @@ internal static class Program
                     json.RootElement.GetProperty("supported_shells").EnumerateArray()
                         .Select(value => value.GetString()).SequenceEqual(initialShells),
                     "PC upsert did not advertise the detected managed shells.");
+                Require(json.RootElement.GetProperty("terminal_commands").ValueKind == JsonValueKind.Array,
+                    "PC upsert did not advertise standardized terminal commands.");
             }
 
             var capabilityRoot = Path.Combine(Path.GetTempPath(), "termlink-shell-capabilities-" + Guid.NewGuid().ToString("N"));

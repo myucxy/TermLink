@@ -25,6 +25,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.horizontalScroll
@@ -92,6 +93,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
@@ -168,6 +171,7 @@ import dev.termlink.model.SessionState
 import dev.termlink.harness.R
 import dev.termlink.harness.BuildConfig
 import dev.termlink.model.SessionSummary
+import dev.termlink.model.TerminalCommandCapability
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.network.production.TermLinkApiException
 import dev.termlink.terminal.api.ArgbColor
@@ -184,6 +188,7 @@ import java.util.Locale
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import androidx.core.view.WindowCompat
@@ -198,12 +203,35 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlin.coroutines.resume
+
+private sealed interface AgentUpdateDialogState {
+    val pc: PcSummary
+
+    data class Loading(override val pc: PcSummary) : AgentUpdateDialogState
+    data class Offer(
+        override val pc: PcSummary,
+        val eligibility: AgentUpdateEligibility,
+    ) : AgentUpdateDialogState
+    data class Starting(
+        override val pc: PcSummary,
+        val eligibility: AgentUpdateEligibility,
+    ) : AgentUpdateDialogState
+    data class Running(
+        override val pc: PcSummary,
+        val progress: AgentUpdateProgress,
+    ) : AgentUpdateDialogState
+    data class Failure(
+        override val pc: PcSummary,
+        val error: Throwable,
+    ) : AgentUpdateDialogState
+}
 
 private sealed class DestructiveProductAction {
     data object SignOut : DestructiveProductAction()
@@ -882,6 +910,11 @@ fun ProductApp(
     var refreshInFlight by remember { mutableStateOf(false) }
     var signOutConfirmation by remember { mutableStateOf(false) }
     var registrationOpen by remember { mutableStateOf(false) }
+    var agentUpdateDialog by remember { mutableStateOf<AgentUpdateDialogState?>(null) }
+    var agentUpdateJob by remember { mutableStateOf<Job?>(null) }
+    var checkedAgentUpdatePcIds by remember(remoteDirectoryFavoriteScope) {
+        mutableStateOf(emptySet<java.util.UUID>())
+    }
     val deletableSessionId = pendingDeleteSessionId?.takeIf { sessionId ->
         val session = snapshot.sessions.firstOrNull { it.id == sessionId } ?: return@takeIf false
         !isDeviceSessionActive(session.online)
@@ -896,6 +929,29 @@ fun ProductApp(
     val activeSessionDeleteMessage = stringResource(R.string.failure_session_active)
     val sessionCloseRequestSentMessage = stringResource(R.string.session_close_request_sent)
     val sessionCloseRequestFailedMessage = stringResource(R.string.failure_session_close_request)
+
+    fun monitorAgentUpdate(pc: PcSummary, initial: AgentUpdateProgress) {
+        agentUpdateJob?.cancel()
+        agentUpdateDialog = AgentUpdateDialogState.Running(pc, initial)
+        if (initial.terminal) {
+            agentUpdateJob = null
+            return
+        }
+        agentUpdateJob = scope.launch {
+            try {
+                val result = repository.monitorAgentUpdate(pc.id, initial.id) { progress ->
+                    agentUpdateDialog = AgentUpdateDialogState.Running(pc, progress)
+                }
+                agentUpdateDialog = AgentUpdateDialogState.Running(pc, result)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                agentUpdateDialog = AgentUpdateDialogState.Failure(pc, error)
+            } finally {
+                agentUpdateJob = null
+            }
+        }
+    }
 
     LaunchedEffect(pendingDeleteSessionId, deletableSessionId) {
         // A refresh may make the PC/session active while the confirmation is
@@ -926,6 +982,42 @@ fun ProductApp(
             openedSessionIds = retained
             selectedSessionId = selectedSessionId?.takeIf(retained::contains) ?: retained.lastOrNull()
             saveProductSessionTabs(context, retained, selectedSessionId)
+        }
+    }
+
+    LaunchedEffect(
+        snapshot.connectionState,
+        snapshot.pcs.map { Triple(it.id, it.online, it.remoteAgentUpdateCapable) },
+        agentUpdateDialog,
+    ) {
+        if (snapshot.connectionState != ProductConnectionState.CONNECTED || agentUpdateDialog != null) {
+            return@LaunchedEffect
+        }
+        repeat(3) { attempt ->
+            var transientFailure = false
+            for (pc in snapshot.pcs) {
+                if (pc.id in checkedAgentUpdatePcIds) continue
+                val active = try {
+                    repository.activeAgentUpdate(pc.id).also {
+                        checkedAgentUpdatePcIds = checkedAgentUpdatePcIds + pc.id
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Throwable) {
+                    transientFailure = true
+                    null
+                }
+                if (active != null) {
+                    monitorAgentUpdate(pc, active)
+                    return@LaunchedEffect
+                }
+            }
+            if (!transientFailure || attempt == 2) return@LaunchedEffect
+            delay(2_000)
+            if (agentUpdateDialog != null) return@LaunchedEffect
+            if (snapshot.connectionState != ProductConnectionState.CONNECTED) {
+                return@LaunchedEffect
+            }
         }
     }
 
@@ -1310,6 +1402,26 @@ fun ProductApp(
                             repository.browseRemoteDirectory(pc.id, pc.name, "", null)
                         }
                     },
+                    onAgentUpdateRequested = { pc ->
+                        agentUpdateDialog = AgentUpdateDialogState.Loading(pc)
+                        scope.launch {
+                            try {
+                                val active = repository.activeAgentUpdate(pc.id)
+                                if (active != null) {
+                                    monitorAgentUpdate(pc, active)
+                                } else {
+                                    agentUpdateDialog = AgentUpdateDialogState.Offer(
+                                        pc,
+                                        repository.agentUpdateEligibility(pc.id),
+                                    )
+                                }
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: Throwable) {
+                                agentUpdateDialog = AgentUpdateDialogState.Failure(pc, error)
+                            }
+                        }
+                    },
                     onOpenDownloads = {
                         selectedRemotePcId = null
                         selectedRemotePcName = ""
@@ -1361,10 +1473,10 @@ fun ProductApp(
                     onDownloadRemoteEntry = { pcId, pcName, entry ->
                         onCreateRemoteDocument(remoteDownloadSelection(pcId, pcName, entry))
                     },
-                    onOpenRemoteShell = { pcId, path, shellType ->
+                    onOpenRemoteShell = { pcId, path, command ->
                         scope.launch {
                             try {
-                                val sessionId = repository.openRemoteShell(pcId, path, shellType)
+                                val sessionId = repository.openRemoteShell(pcId, path, command)
                                 if (selectSessionTab(sessionId, addIfMissing = true)) {
                                     navigateTo(ProductDestination.SESSIONS)
                                 }
@@ -1429,6 +1541,46 @@ fun ProductApp(
         onDownload = { runOperation(repository::downloadUpdate) },
         onInstall = onInstallUpdate,
     )
+    agentUpdateDialog?.let { state ->
+        AgentUpdateDialog(
+            state = state,
+            onDismiss = { agentUpdateDialog = null },
+            onInstall = { offer ->
+                val targetBuild = offer.eligibility.targetBuild ?: return@AgentUpdateDialog
+                agentUpdateDialog = AgentUpdateDialogState.Starting(offer.pc, offer.eligibility)
+                agentUpdateJob = scope.launch {
+                    try {
+                        val result = repository.runAgentUpdate(offer.pc.id, targetBuild) { progress ->
+                            agentUpdateDialog = AgentUpdateDialogState.Running(offer.pc, progress)
+                        }
+                        agentUpdateDialog = AgentUpdateDialogState.Running(offer.pc, result)
+                    } catch (error: CancellationException) {
+                        // An explicit pre-install cancellation is completed by the separate cancel request.
+                    } catch (error: Throwable) {
+                        agentUpdateDialog = AgentUpdateDialogState.Failure(offer.pc, error)
+                    } finally {
+                        agentUpdateJob = null
+                    }
+                }
+            },
+            onCancel = { running ->
+                if (running.progress.cancelable) {
+                    agentUpdateJob?.cancel()
+                    agentUpdateJob = null
+                    scope.launch {
+                        try {
+                            val cancelled = repository.cancelAgentUpdate(running.pc.id, running.progress.id)
+                            agentUpdateDialog = AgentUpdateDialogState.Running(running.pc, cancelled)
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Throwable) {
+                            agentUpdateDialog = AgentUpdateDialogState.Failure(running.pc, error)
+                        }
+                    }
+                }
+            },
+        )
+    }
 
     if (commandSearchOpen) {
         CommandSearchDialog(
@@ -2805,13 +2957,14 @@ private fun ProductContent(
     expandedPcIds: Set<String>,
     onTogglePcExpanded: (java.util.UUID) -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
+    onAgentUpdateRequested: (PcSummary) -> Unit,
     onOpenDownloads: () -> Unit,
     onOpenRemoteFavorite: (RemoteDirectoryFavorite) -> Unit,
     onToggleRemoteFavorite: (java.util.UUID, String, RemoteFileEntry) -> Unit,
     onRemoveRemoteFavorite: (RemoteDirectoryFavorite) -> Unit,
     onBrowseRemoteDirectory: (java.util.UUID, String, String, Long?) -> Unit,
     onDownloadRemoteEntry: (java.util.UUID, String, RemoteFileEntry) -> Unit,
-    onOpenRemoteShell: (java.util.UUID, String, RemoteShellType) -> Unit,
+    onOpenRemoteShell: (java.util.UUID, String, TerminalCommandCapability) -> Unit,
     onCancelRemoteDownload: (java.util.UUID) -> Unit,
     onRetryRemoteDownload: (RemoteDownloadRecord) -> Unit,
     onDeleteRemoteDownloadRecord: (java.util.UUID) -> Unit,
@@ -2847,11 +3000,11 @@ private fun ProductContent(
         }
         RemoteFileBrowserPage(
             state = state,
-            supportedShells = remotePc?.let(::supportedRemoteShellTypes).orEmpty(),
+            supportedCommands = remotePc?.let(::supportedRemoteTerminalCommands).orEmpty(),
             favorites = remoteDirectoryFavorites,
-            favoriteSupportedShells = { favorite ->
+            favoriteSupportedCommands = { favorite ->
                 snapshot.pcs.firstOrNull { pc -> pc.id == favorite.pcId }
-                    ?.let(::supportedRemoteShellTypes)
+                    ?.let(::supportedRemoteTerminalCommands)
                     .orEmpty()
             },
             onOpenDirectory = { path ->
@@ -2946,6 +3099,7 @@ private fun ProductContent(
                 },
                 onOpenDownloads = onOpenDownloads,
                 onBrowsePc = onBrowsePc,
+                onAgentUpdateRequested = onAgentUpdateRequested,
                 onOpenCommandSearch = onOpenCommandSearch,
                 onStopSessionRequested = onStopSessionRequested,
                 onDeleteSessionRequested = onDeleteSessionRequested,
@@ -3024,6 +3178,7 @@ private fun DevicesPage(
     onOpenSession: (java.util.UUID) -> Unit,
     onOpenDownloads: () -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
+    onAgentUpdateRequested: (PcSummary) -> Unit,
     onOpenCommandSearch: () -> Unit,
     onStopSessionRequested: (java.util.UUID) -> Unit,
     onDeleteSessionRequested: (java.util.UUID) -> Unit,
@@ -3067,6 +3222,7 @@ private fun DevicesPage(
                     onToggleExpanded = { onTogglePcExpanded(pc.id) },
                     onOpenSession = onOpenSession,
                     onBrowseFiles = { onBrowsePc(pc) },
+                    onAgentUpdate = { onAgentUpdateRequested(pc) },
                     onStopSessionRequested = onStopSessionRequested,
                     onDeleteSessionRequested = onDeleteSessionRequested,
                 )
@@ -3075,6 +3231,185 @@ private fun DevicesPage(
     }
     // Keep the final device/session row clear of the home refresh FAB.
     Spacer(Modifier.height(72.dp))
+}
+
+@Composable
+private fun AgentUpdateDialog(
+    state: AgentUpdateDialogState,
+    onDismiss: () -> Unit,
+    onInstall: (AgentUpdateDialogState.Offer) -> Unit,
+    onCancel: (AgentUpdateDialogState.Running) -> Unit,
+) {
+    val dismissible = when (state) {
+        is AgentUpdateDialogState.Running -> state.progress.terminal
+        is AgentUpdateDialogState.Starting -> false
+        else -> true
+    }
+    val title = when (state) {
+        is AgentUpdateDialogState.Loading -> stringResource(R.string.agent_update_checking)
+        is AgentUpdateDialogState.Offer -> if (state.eligibility.eligible) {
+            stringResource(R.string.agent_update_confirm_title, state.pc.name)
+        } else {
+            stringResource(R.string.agent_update_unavailable_title)
+        }
+        is AgentUpdateDialogState.Starting -> stringResource(R.string.agent_update_starting)
+        is AgentUpdateDialogState.Running -> when (state.progress.status) {
+            "SUCCEEDED" -> stringResource(R.string.agent_update_succeeded)
+            "ROLLED_BACK" -> stringResource(R.string.agent_update_rolled_back)
+            "ROLLBACK_FAILED" -> stringResource(R.string.agent_update_rollback_failed)
+            "FAILED", "EXPIRED", "CANCELLED" -> stringResource(R.string.agent_update_failed)
+            else -> stringResource(R.string.agent_update_in_progress)
+        }
+        is AgentUpdateDialogState.Failure -> stringResource(R.string.agent_update_request_failed)
+    }
+    AlertDialog(
+        onDismissRequest = { if (dismissible) onDismiss() },
+        title = { Text(title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                when (state) {
+                    is AgentUpdateDialogState.Loading -> {
+                        CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                        Text(stringResource(R.string.agent_update_checking_copy, state.pc.agentVersion))
+                    }
+                    is AgentUpdateDialogState.Offer -> {
+                        val offer = state.eligibility
+                        if (offer.eligible) {
+                            Text(
+                                stringResource(
+                                    R.string.agent_update_versions,
+                                    offer.currentVersion,
+                                    offer.targetVersion.orEmpty(),
+                                    offer.targetBuild ?: 0L,
+                                ),
+                            )
+                            if (!offer.releaseNotes.isNullOrBlank()) Text(offer.releaseNotes)
+                            Text(
+                                stringResource(
+                                    R.string.agent_update_session_warning,
+                                    offer.activeSessionCount,
+                                ),
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                            Text(stringResource(R.string.agent_update_rollback_copy))
+                        } else {
+                            Text(agentUpdateReasonText(offer.reasonCode))
+                            Text(stringResource(R.string.agent_update_current_version, offer.currentVersion))
+                        }
+                    }
+                    is AgentUpdateDialogState.Starting -> {
+                        CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                        Text(stringResource(R.string.agent_update_creating_job))
+                    }
+                    is AgentUpdateDialogState.Running -> {
+                        val progress = state.progress
+                        LinearProgressIndicator(
+                            progress = { progress.progressPercent / 100f },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text(
+                            stringResource(
+                                R.string.agent_update_progress,
+                                agentUpdatePhaseText(progress.phase),
+                                progress.progressPercent,
+                            ),
+                        )
+                        progress.activeSessionCount?.let {
+                            Text(stringResource(R.string.agent_update_active_sessions, it))
+                        }
+                        if (!progress.errorCode.isNullOrBlank()) {
+                            Text(
+                                stringResource(R.string.agent_update_error_code, progress.errorCode),
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                        if (!progress.errorDetail.isNullOrBlank()) {
+                            Text(progress.errorDetail, color = MaterialTheme.colorScheme.error)
+                        }
+                        if (progress.status == "ROLLED_BACK") {
+                            Text(stringResource(R.string.agent_update_restored_version, progress.observedAgentVersion.orEmpty()))
+                        }
+                        if (!progress.cancelable && !progress.terminal) {
+                            Text(stringResource(R.string.agent_update_cannot_cancel))
+                        }
+                    }
+                    is AgentUpdateDialogState.Failure -> {
+                        val apiError = state.error as? TermLinkApiException
+                        Text(
+                            if (apiError != null) {
+                                stringResource(
+                                    R.string.agent_update_server_error,
+                                    apiError.status,
+                                    apiError.code,
+                                    apiError.traceId ?: "-",
+                                )
+                            } else {
+                                state.error.message?.take(500)
+                                    ?: stringResource(R.string.agent_update_unknown_error)
+                            },
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            when (state) {
+                is AgentUpdateDialogState.Offer -> if (state.eligibility.eligible) {
+                    Button(onClick = { onInstall(state) }) {
+                        Text(stringResource(R.string.agent_update_confirm))
+                    }
+                } else {
+                    TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_close)) }
+                }
+                is AgentUpdateDialogState.Running -> if (state.progress.terminal) {
+                    TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_close)) }
+                }
+                is AgentUpdateDialogState.Loading,
+                is AgentUpdateDialogState.Failure -> {
+                    TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_close)) }
+                }
+                is AgentUpdateDialogState.Starting -> Unit
+            }
+        },
+        dismissButton = {
+            when {
+                state is AgentUpdateDialogState.Offer && state.eligibility.eligible -> {
+                    TextButton(onClick = onDismiss) { Text(stringResource(R.string.update_action_later)) }
+                }
+                state is AgentUpdateDialogState.Running && state.progress.cancelable -> {
+                    TextButton(onClick = { onCancel(state) }) { Text(stringResource(R.string.action_cancel)) }
+                }
+            }
+        },
+    )
+}
+
+@Composable
+private fun agentUpdateReasonText(code: String?): String = when (code) {
+    "PC_OFFLINE" -> stringResource(R.string.agent_update_reason_offline)
+    "REMOTE_UPDATE_DISABLED" -> stringResource(R.string.agent_update_reason_routing_disabled)
+    "REMOTE_UPDATE_UNSUPPORTED" -> stringResource(R.string.agent_update_reason_unsupported)
+    "AGENT_VERSION_UNSUPPORTED" -> stringResource(R.string.agent_update_reason_seed_required)
+    "UPDATE_NOT_AVAILABLE" -> stringResource(R.string.agent_update_reason_current)
+    else -> stringResource(R.string.agent_update_reason_unknown, code ?: "-")
+}
+
+@Composable
+private fun agentUpdatePhaseText(phase: String): String = when (phase) {
+    "REQUESTED" -> stringResource(R.string.agent_update_phase_requested)
+    "PRECHECKING" -> stringResource(R.string.agent_update_phase_prechecking)
+    "DOWNLOADING" -> stringResource(R.string.agent_update_phase_downloading)
+    "VERIFIED" -> stringResource(R.string.agent_update_phase_verified)
+    "DRAINING_SESSIONS" -> stringResource(R.string.agent_update_phase_draining)
+    "INSTALLING" -> stringResource(R.string.agent_update_phase_installing)
+    "STARTING_NEW_AGENT" -> stringResource(R.string.agent_update_phase_starting_agent)
+    "VERIFYING_CONNECTION" -> stringResource(R.string.agent_update_phase_verifying_connection)
+    "ROLLING_BACK" -> stringResource(R.string.agent_update_phase_rolling_back)
+    "SUCCEEDED" -> stringResource(R.string.agent_update_succeeded)
+    "ROLLED_BACK" -> stringResource(R.string.agent_update_rolled_back)
+    "ROLLBACK_FAILED" -> stringResource(R.string.agent_update_rollback_failed)
+    else -> stringResource(R.string.agent_update_failed)
 }
 
 /**
@@ -3090,6 +3425,7 @@ internal fun visibleOnlineWindowsPcs(snapshot: ProductSnapshot): List<PcSummary>
 }
 
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
 private fun PcRow(
     pc: PcSummary,
     sessions: List<SessionSummary> = emptyList(),
@@ -3098,9 +3434,12 @@ private fun PcRow(
     onToggleExpanded: (() -> Unit)? = null,
     onOpenSession: ((java.util.UUID) -> Unit)? = null,
     onBrowseFiles: (() -> Unit)? = null,
+    onAgentUpdate: (() -> Unit)? = null,
     onStopSessionRequested: ((java.util.UUID) -> Unit)? = null,
     onDeleteSessionRequested: ((java.util.UUID) -> Unit)? = null,
 ) {
+    var deviceMenuExpanded by remember { mutableStateOf(false) }
+    val deviceMenuDescription = stringResource(R.string.device_menu_accessibility)
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = ProductShape,
@@ -3111,10 +3450,15 @@ private fun PcRow(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable(enabled = sessions.isNotEmpty() && onToggleExpanded != null) {
-                        onToggleExpanded?.invoke()
-                    }
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                    .combinedClickable(
+                        enabled = onToggleExpanded != null || onAgentUpdate != null || onBrowseFiles != null,
+                        onClick = {
+                            if (sessions.isNotEmpty()) onToggleExpanded?.invoke()
+                        },
+                        onLongClick = { deviceMenuExpanded = true },
+                        onLongClickLabel = deviceMenuDescription,
+                    )
+                    .padding(start = 12.dp, top = 8.dp, end = 8.dp, bottom = 8.dp),
             ) {
                 Row(
                     modifier = Modifier
@@ -3164,8 +3508,9 @@ private fun PcRow(
                     }
                 }
                 Box(
-                    modifier = Modifier.align(Alignment.TopEnd).width(24.dp),
-                    contentAlignment = Alignment.TopCenter,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 5.5.dp, end = 5.5.dp),
                 ) {
                     StatusDot(
                         color = if (pc.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -3178,8 +3523,9 @@ private fun PcRow(
                 }
                 if (sessions.isNotEmpty()) {
                     Box(
-                        modifier = Modifier.align(Alignment.BottomEnd).width(24.dp),
-                        contentAlignment = Alignment.BottomCenter,
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(bottom = 5.5.dp),
                     ) {
                         Icon(
                             imageVector = if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
@@ -3188,6 +3534,31 @@ private fun PcRow(
                             ),
                             modifier = Modifier.size(20.dp),
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                DropdownMenu(
+                    expanded = deviceMenuExpanded,
+                    onDismissRequest = { deviceMenuExpanded = false },
+                ) {
+                    onBrowseFiles?.let { browse ->
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.action_browse_files)) },
+                            leadingIcon = { Icon(Icons.Filled.Folder, contentDescription = null) },
+                            onClick = {
+                                deviceMenuExpanded = false
+                                browse()
+                            },
+                        )
+                    }
+                    onAgentUpdate?.let { update ->
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.agent_update_action)) },
+                            leadingIcon = { Icon(Icons.Filled.Refresh, contentDescription = null) },
+                            onClick = {
+                                deviceMenuExpanded = false
+                                update()
+                            },
                         )
                     }
                 }

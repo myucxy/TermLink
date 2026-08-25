@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/termlink/termlink/server/internal/agentupdate"
 	"github.com/termlink/termlink/server/internal/api"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/config"
@@ -103,6 +104,10 @@ func runProduction() error {
 	if err != nil {
 		return fmt.Errorf("initialize direct registration: %w", err)
 	}
+	updateCatalog, err := agentupdate.NewAppShipCatalog(os.Getenv("TERMLINK_APPSHIP_BASE_URL"), nil)
+	if err != nil {
+		return fmt.Errorf("initialize Agent update catalog: %w", err)
+	}
 	var historyStore *history.Store
 	if cfg.HistoryEnabled {
 		historyStore, err = history.Open(ctx, cfg.S3Endpoint, cfg.S3PublicEndpoint, cfg.S3Region, cfg.S3Bucket, cfg.S3AccessKey.Value(), cfg.S3SecretKey.Value())
@@ -113,6 +118,7 @@ func runProduction() error {
 	productionAPI := &api.API{
 		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication, Registration: registration,
 		SubjectKey: subjectKey, TokenKey: tokenKey, History: optionalHistoryStore(historyStore),
+		AgentUpdateCatalog: updateCatalog,
 		ClientConfig: api.ClientConfiguration{
 			OIDCIssuer: cfg.OIDCIssuer, OIDCClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI,
 			WindowsClientID: cfg.WindowsOIDCClientID, WindowsRegistrationParties: cfg.WindowsRegistrationOIDCParties,

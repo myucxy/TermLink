@@ -30,6 +30,9 @@ namespace TermLink.Updater
                     case "execute":
                         return new UpdateTransactionRunner(new PowerShellMsixDeployment()).Run(
                             options.Required("transaction"));
+                    case "remote-execute":
+                    case "remote-resume":
+                        return new RemoteSetupTransactionRunner().Run(options.Required("transaction"));
                     default:
                         throw new ArgumentException("Unknown updater command: " + options.Command);
                 }

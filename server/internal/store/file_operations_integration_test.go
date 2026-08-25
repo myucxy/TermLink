@@ -299,6 +299,34 @@ func TestFileOperationClaimAuthorizationRetryUploadCancellationAndExpiry(t *test
 		t.Fatalf("valid terminal completion=%+v err=%v", completedTerminal, err)
 	}
 
+	customCommand := "custom-project"
+	customTerminal, err := repository.CreateFileOperation(ctx, accountID, requesterID, pcID, FileOperationCreateInput{
+		Operation: FileOperationOpenTerminal, Path: terminalPath, ShellType: &customCommand, ExpiresAt: time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	customClaim, customToken, err := repository.ClaimFileOperation(ctx, accountID, agentID, pcID, time.Hour)
+	if err != nil || customClaim == nil || customClaim.ID != customTerminal.ID {
+		t.Fatalf("custom terminal claim=%+v err=%v", customClaim, err)
+	}
+	customResult, _ := json.Marshal(map[string]string{
+		"session_id": uuid.NewString(), "terminal_command_id": customCommand,
+		"shell_type": "custom", "cwd": terminalPath,
+	})
+	customHash := fileOperationLeaseHash(t, customToken)
+	if completed, err := repository.CompleteFileOperation(ctx, accountID, agentID, pcID, customTerminal.ID, customHash, FileOperationCompleteInput{
+		Status: FileOperationSucceeded, Result: customResult,
+	}); err != nil || completed.Status != FileOperationSucceeded {
+		t.Fatalf("custom terminal completion=%+v err=%v", completed, err)
+	}
+	unadvertised := "custom-unadvertised"
+	if _, err := repository.CreateFileOperation(ctx, accountID, requesterID, pcID, FileOperationCreateInput{
+		Operation: FileOperationOpenTerminal, Path: terminalPath, ShellType: &unadvertised, ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}); !errors.Is(err, ErrDenied) {
+		t.Fatalf("unadvertised terminal command error=%v, want ErrDenied", err)
+	}
+
 	expiring, err := repository.CreateFileOperation(ctx, accountID, requesterID, pcID, FileOperationCreateInput{
 		Operation: FileOperationList, Path: "", ExpiresAt: time.Now().UTC().Add(time.Hour),
 	})
@@ -339,7 +367,11 @@ func insertFileOperationFixture(t *testing.T, ctx context.Context, repository *P
 	if extraRequesterID != uuid.Nil {
 		insertDevice(extraRequesterID, "ANDROID", "Other requester", seed+2, &agentID)
 	}
-	if _, err := repository.Pool.Exec(ctx, `INSERT INTO pcs(id,owner_user_id,device_id,name,agent_version,key_epoch) VALUES($1,$2,$3,'PC','test',1)`, pcID, accountID, agentID); err != nil {
+	if _, err := repository.Pool.Exec(ctx, `
+		INSERT INTO pcs(id,owner_user_id,device_id,name,agent_version,key_epoch,supported_shells,terminal_commands)
+		VALUES($1,$2,$3,'PC','test',1,ARRAY['command-prompt','windows-powershell']::text[],
+		       '[{"id":"custom-project","display_name":"Project CLI","shell_type":"custom","source":"manual"}]'::jsonb)`,
+		pcID, accountID, agentID); err != nil {
 		t.Fatal(err)
 	}
 }

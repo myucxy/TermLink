@@ -35,6 +35,7 @@ import dev.termlink.model.HistoryObject
 import dev.termlink.model.PcSummary
 import dev.termlink.model.SessionState
 import dev.termlink.model.SessionSummary
+import dev.termlink.model.TerminalCommandCapability
 import dev.termlink.network.production.AccessTokenProvider
 import dev.termlink.network.production.InputSequenceProvider
 import dev.termlink.network.production.ProductionApiClient
@@ -407,6 +408,7 @@ private const val REMOTE_DOWNLOAD_PERSIST_INTERVAL_MILLIS = 1_000L
 private const val REMOTE_SHELL_CATALOG_TIMEOUT_MILLIS = 30_000L
 private const val REMOTE_FILE_PATH_MAX_BYTES = 4_096
 private const val REMOTE_FILE_LIST_PAGE_MAX_ENTRIES = 500
+private const val AGENT_UPDATE_POLL_INTERVAL_MILLIS = 1_000L
 
 internal class ProductionProductRepository(
     private val activity: Activity,
@@ -1092,6 +1094,66 @@ internal class ProductionProductRepository(
     override suspend fun revokeDevice(deviceId: UUID) = withApi { api ->
         api.post("/v1/devices/$deviceId/revoke", buildJsonObject { })
         refreshWithApiPublished(api)
+    }
+
+    override suspend fun agentUpdateEligibility(pcId: UUID): AgentUpdateEligibility {
+        val response = withApi { api ->
+            api.get("/v1/pcs/$pcId/agent-update-eligibility").jsonObject
+        }
+        return response.toAgentUpdateEligibility(pcId)
+    }
+
+    override suspend fun activeAgentUpdate(pcId: UUID): AgentUpdateProgress? {
+        val response = withApi { api ->
+            api.get("/v1/pcs/$pcId/agent-updates/active")
+        }
+        if (response is JsonNull) return null
+        return response.jsonObject.getValue("agent_update").jsonObject.toAgentUpdateProgress(pcId)
+    }
+
+    override suspend fun runAgentUpdate(
+        pcId: UUID,
+        expectedTargetBuild: Long,
+        onProgress: (AgentUpdateProgress) -> Unit,
+    ): AgentUpdateProgress {
+        require(expectedTargetBuild > 0) { "The Agent update target build is invalid" }
+        var current = withApi { api ->
+            api.post(
+                "/v1/pcs/$pcId/agent-updates",
+                buildJsonObject { put("expected_target_build", expectedTargetBuild) },
+                idempotencyKey = UUID.randomUUID().toString(),
+            ).jsonObject.getValue("agent_update").jsonObject.toAgentUpdateProgress(pcId)
+        }
+        onProgress(current)
+        return monitorAgentUpdate(pcId, current.id, onProgress)
+    }
+
+    override suspend fun monitorAgentUpdate(
+        pcId: UUID,
+        updateId: UUID,
+        onProgress: (AgentUpdateProgress) -> Unit,
+    ): AgentUpdateProgress {
+        var current = withApi { api ->
+            api.get("/v1/pcs/$pcId/agent-updates/$updateId")
+                .jsonObject.getValue("agent_update").jsonObject.toAgentUpdateProgress(pcId)
+        }
+        require(current.id == updateId) { "The server returned a different Agent update" }
+        onProgress(current)
+        while (!current.terminal) {
+            delay(AGENT_UPDATE_POLL_INTERVAL_MILLIS)
+            current = withApi { api ->
+                api.get("/v1/pcs/$pcId/agent-updates/$updateId")
+                    .jsonObject.getValue("agent_update").jsonObject.toAgentUpdateProgress(pcId)
+            }
+            require(current.id == updateId) { "The server returned a different Agent update" }
+            onProgress(current)
+        }
+        return current
+    }
+
+    override suspend fun cancelAgentUpdate(pcId: UUID, updateId: UUID): AgentUpdateProgress = withApi { api ->
+        api.delete("/v1/pcs/$pcId/agent-updates/$updateId")
+            .jsonObject.getValue("agent_update").jsonObject.toAgentUpdateProgress(pcId)
     }
 
     override suspend fun requestControl(sessionId: UUID) {
@@ -1797,7 +1859,7 @@ internal class ProductionProductRepository(
     override suspend fun openRemoteShell(
         pcId: UUID,
         path: String,
-        shellType: RemoteShellType,
+        command: TerminalCommandCapability,
     ): UUID {
         require(path.isNotBlank() && path.encodeToByteArray().size <= REMOTE_FILE_PATH_MAX_BYTES && '\u0000' !in path) {
             "The Windows directory is invalid"
@@ -1806,7 +1868,7 @@ internal class ProductionProductRepository(
             current.copy(
                 remoteFileBrowser = reduceRemoteFileBrowser(
                     current.remoteFileBrowser,
-                    RemoteFileBrowserEvent.ShellStarted(shellType),
+                    RemoteFileBrowserEvent.ShellStarted(command.id),
                 ),
             )
         }
@@ -1815,13 +1877,15 @@ internal class ProductionProductRepository(
                 pcId = pcId,
                 operation = REMOTE_FILE_OPERATION_OPEN_TERMINAL,
                 path = path,
-                shellType = shellType,
+                terminalCommand = command,
             )
             val completed = awaitRemoteFileOperation(pcId, operation)
             val result = completed.result ?: error("The Windows PC returned no terminal session")
             val sessionId = UUID.fromString(result.requiredString("session_id"))
-            require(RemoteShellType.fromWireValue(result.requiredString("shell_type")) == shellType) {
-                "The Windows PC returned a different shell type"
+            val resultCommandId = result["terminal_command_id"]?.jsonPrimitive?.contentOrNull
+                ?: result.requiredString("shell_type")
+            require(resultCommandId == command.id) {
+                "The Windows PC returned a different terminal command"
             }
             val ready = withTimeoutOrNull(REMOTE_SHELL_CATALOG_TIMEOUT_MILLIS) {
                 while (true) {
@@ -2045,7 +2109,7 @@ internal class ProductionProductRepository(
         operation: String,
         path: String,
         offset: Long? = null,
-        shellType: RemoteShellType? = null,
+        terminalCommand: TerminalCommandCapability? = null,
         onCreated: (RemoteFileOperationResponse) -> Unit = {},
     ): RemoteFileOperationResponse {
         // One stable key belongs to this create attempt. If transport retry is
@@ -2059,7 +2123,10 @@ internal class ProductionProductRepository(
                     put("operation", operation)
                     put("path", path)
                     offset?.let { put("offset", it) }
-                    shellType?.let { put("shell_type", it.wireValue) }
+                    terminalCommand?.let { command ->
+                        if (command.source == "legacy") put("shell_type", command.id)
+                        else put("terminal_command_id", command.id)
+                    }
                 },
                 idempotencyKey = idempotencyKey,
             ).jsonObject,
@@ -3464,6 +3531,76 @@ internal class ProductionProductRepository(
                 RemoteShellType.entries.any { shell -> shell.wireValue == value }
             }
             .orEmpty(),
+        terminalCommands = get("terminal_commands")?.jsonArray
+            ?.map { value ->
+                val command = value.jsonObject
+                dev.termlink.model.TerminalCommandCapability(
+                    id = command.requiredString("id").also { id ->
+                        require(id.matches(Regex("[a-z][a-z0-9._-]{0,63}")))
+                    },
+                    displayName = command.requiredString("display_name").also { name ->
+                        require(name.encodeToByteArray().size in 1..80 && name.none(Char::isISOControl))
+                    },
+                    shellType = command.requiredString("shell_type").also { shell ->
+                        require(shell in setOf("command-prompt", "windows-powershell", "powershell-7", "wsl", "custom"))
+                    },
+                    source = command.requiredString("source").also { source ->
+                        require(source == "detected" || source == "manual")
+                    },
+                ).also { capability ->
+                    require(
+                        capability.source == "manual" && capability.shellType == "custom" ||
+                            capability.source == "detected" && capability.shellType == capability.id &&
+                            capability.id in setOf("command-prompt", "windows-powershell", "powershell-7", "wsl"),
+                    )
+                }
+            }
+            ?.also { commands ->
+                require(commands.size <= 24 && commands.distinctBy { command -> command.id }.size == commands.size)
+            }
+            .orEmpty(),
+        remoteAgentUpdateCapable = get("remote_agent_update_capable")?.jsonPrimitive?.booleanOrNull ?: false,
+    )
+
+    private fun JsonObject.toAgentUpdateEligibility(pcId: UUID): AgentUpdateEligibility {
+        val eligible = getValue("eligible").jsonPrimitive.boolean
+        return AgentUpdateEligibility(
+            pcId = pcId,
+            eligible = eligible,
+            reasonCode = get("reason_code")?.jsonPrimitive?.contentOrNull,
+            currentVersion = requiredString("current_version"),
+            currentBuild = get("current_build")?.jsonPrimitive?.long,
+            targetVersion = get("target_version")?.jsonPrimitive?.contentOrNull,
+            targetBuild = get("target_build")?.jsonPrimitive?.long,
+            required = get("required")?.jsonPrimitive?.booleanOrNull ?: false,
+            releaseNotes = get("release_notes")?.jsonPrimitive?.contentOrNull,
+            activeSessionCount = get("active_session_count")?.jsonPrimitive?.int ?: 0,
+        ).also { result ->
+            require(!result.eligible || result.targetBuild != null && !result.targetVersion.isNullOrBlank()) {
+                "The Agent update eligibility response is incomplete"
+            }
+        }
+    }
+
+    private fun JsonObject.toAgentUpdateProgress(expectedPcId: UUID): AgentUpdateProgress = AgentUpdateProgress(
+        id = UUID.fromString(requiredString("id")),
+        pcId = UUID.fromString(requiredString("pc_id")).also { require(it == expectedPcId) },
+        currentVersion = requiredString("current_version"),
+        currentBuild = getValue("current_build").jsonPrimitive.long,
+        targetVersion = requiredString("target_version"),
+        targetBuild = getValue("target_build").jsonPrimitive.long,
+        status = requiredString("status").also {
+            require(it in setOf("PENDING", "PROCESSING", "SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED", "ROLLED_BACK", "ROLLBACK_FAILED"))
+        },
+        phase = requiredString("phase").also {
+            require(it in setOf("REQUESTED", "PRECHECKING", "DOWNLOADING", "VERIFIED", "DRAINING_SESSIONS", "INSTALLING", "STARTING_NEW_AGENT", "VERIFYING_CONNECTION", "ROLLING_BACK", "SUCCEEDED", "FAILED", "ROLLED_BACK", "ROLLBACK_FAILED"))
+        },
+        progressPercent = getValue("progress_percent").jsonPrimitive.int.also { require(it in 0..100) },
+        activeSessionCount = get("active_session_count")?.jsonPrimitive?.int,
+        errorCode = get("error_code")?.jsonPrimitive?.contentOrNull,
+        errorDetail = get("error_detail")?.jsonPrimitive?.contentOrNull,
+        observedAgentVersion = get("observed_agent_version")?.jsonPrimitive?.contentOrNull,
+        observedAgentBuild = get("observed_agent_build")?.jsonPrimitive?.long,
     )
 
     private fun JsonObject.toSession() = SessionSummary(

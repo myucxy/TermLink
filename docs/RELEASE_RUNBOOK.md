@@ -33,6 +33,19 @@
 
 Production APK 必须来自统一 manifest，并由连续性证书签名。发布前至少确认：
 
+本机验证固定使用 `D:\Dev\Env\gradle\gradle-8.13-clean\bin\gradle.bat`，并把
+`GRADLE_USER_HOME` 指向 `D:\Dev\Env\gradle\user-home`。不要使用
+`D:\Dev\Env\gradle\gradle-8.13`：该目录的全局 `init.d` 会注入不安全的 HTTP `Bstek` 仓库，Gradle 会在
+依赖解析前拒绝构建。所需进程环境为：
+
+```powershell
+$env:JAVA_HOME = 'D:\Dev\Env\Jdk\jdk-21'
+$env:ANDROID_HOME = 'D:\Dev\Env\Android\Sdk'
+$env:ANDROID_SDK_ROOT = 'D:\Dev\Env\Android\Sdk'
+$env:GRADLE_USER_HOME = 'D:\Dev\Env\gradle\user-home'
+$gradle = 'D:\Dev\Env\gradle\gradle-8.13-clean\bin\gradle.bat'
+```
+
 ```powershell
 & .\release\Verify-LocalRelease.ps1 `
   -ManifestPath '.\artifacts\release\<version>-<build>\artifact-manifest.json' `
@@ -76,6 +89,10 @@ PowerShell 中每个 `-P...` 必须作为单独字符串传入。未引用的
 至少现场打开一条已有 OpenCode/Claude/Codex 会话，确认最终画面恢复而不是只确认进程能启动。
 
 ## 4. Windows 本机原地升级
+
+Windows 源码复核固定使用 `D:\Dev\Env\dotnet-sdk-8.0.303\dotnet.exe` 构建
+`win-agent\TermLink.Windows.sln -c Release`。多个验证项目引用相同的 `UpdateCore`、`Agent` 等项目，会共享
+`obj` 输出；不得并行运行 solution build 或这些验证项目，否则会出现 `CS2012` 文件占用。构建和验证必须串行。
 
 先从注册表读取当前安装根，校验 Setup 哈希和 Authenticode，再显式传入该目录：
 

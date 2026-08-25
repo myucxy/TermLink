@@ -12,6 +12,7 @@
     <Compile Include="..\Common\WindowsTerminalIntegration.cs" Link="Common\WindowsTerminalIntegration.cs" />
     <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
     <ProjectReference Include="..\Agent\TermLink.Agent.csproj" />
+    <ProjectReference Include="..\UpdateCore\TermLink.UpdateCore.csproj" />
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="TermLink.Tray.UpdateValidation" />

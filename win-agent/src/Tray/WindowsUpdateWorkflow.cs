@@ -11,6 +11,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using TermLink.UpdateCore;
 
 namespace TermLink.Tray
 {
@@ -30,26 +31,15 @@ namespace TermLink.Tray
 
     internal static class UpdatePackageValidator
     {
-        internal const uint TrustSuccess = 0x00000000;
-        internal const uint CertificateUntrustedRoot = 0x800B0109;
-        internal const uint CertificateChaining = 0x800B010A;
-        internal const uint TrustBadDigest = 0x80096010;
-        internal const uint TrustNoSignature = 0x800B0100;
+        internal const uint TrustSuccess = WindowsUpdateSecurity.TrustSuccess;
+        internal const uint CertificateUntrustedRoot = WindowsUpdateSecurity.CertificateUntrustedRoot;
+        internal const uint CertificateChaining = WindowsUpdateSecurity.CertificateChaining;
+        internal const uint TrustBadDigest = WindowsUpdateSecurity.TrustBadDigest;
+        internal const uint TrustNoSignature = WindowsUpdateSecurity.TrustNoSignature;
 
         internal static void ValidateIntegrity(string path, long expectedSize, string expectedSha256)
         {
-            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
-                throw new FileNotFoundException("The downloaded update package is missing.", path);
-            var normalizedHash = AppShipUpdateClient.NormalizeHex(expectedSha256);
-            if (expectedSize <= 0 || !AppShipUpdateClient.IsHex(normalizedHash, 64))
-                throw new InvalidDataException("The expected update size or SHA-256 is invalid.");
-            var info = new FileInfo(path);
-            if (info.Length != expectedSize)
-                throw new InvalidDataException("The downloaded update size does not match AppShip metadata.");
-            byte[] actual;
-            using (var stream = File.OpenRead(path)) actual = SHA256.HashData(stream);
-            if (!CryptographicOperations.FixedTimeEquals(actual, Convert.FromHexString(normalizedHash)))
-                throw new CryptographicException("The downloaded update SHA-256 does not match AppShip metadata.");
+            WindowsUpdateSecurity.ValidateIntegrity(path, expectedSize, expectedSha256);
         }
 
         internal static string ValidateAuthenticode(
@@ -57,25 +47,12 @@ namespace TermLink.Tray
             string expectedThumbprint,
             string reportedThumbprint)
         {
-            var status = AuthenticodeVerifier.VerifyEmbeddedSignature(path);
-            if (!IsAcceptableAuthenticodeStatus(status))
-            {
-                throw new CryptographicException(
-                    "The update Authenticode signature failed validation (0x" + status.ToString("X8") + ").");
-            }
-            var actual = AuthenticodeVerifier.ReadSignerThumbprint(path);
-            ValidateSignerIdentity(actual, expectedThumbprint, reportedThumbprint);
-            return actual;
+            return WindowsUpdateSecurity.ValidateAuthenticode(path, expectedThumbprint, reportedThumbprint);
         }
 
         internal static bool IsAcceptableAuthenticodeStatus(uint status)
         {
-            // WinVerifyTrust has already checked the embedded digest. A missing
-            // public trust anchor is accepted only because the signer is pinned
-            // independently below; bad digests and every other trust error fail.
-            return status == TrustSuccess ||
-                status == CertificateUntrustedRoot ||
-                status == CertificateChaining;
+            return WindowsUpdateSecurity.IsAcceptableAuthenticodeStatus(status);
         }
 
         internal static void ValidateSignerIdentity(
@@ -83,31 +60,12 @@ namespace TermLink.Tray
             string expectedThumbprint,
             string reportedThumbprint)
         {
-            var actual = NormalizeThumbprint(actualThumbprint, "downloaded Authenticode signer");
-            var expected = NormalizeThumbprint(expectedThumbprint, "installed/configured update signer");
-            if (!FixedHexEquals(actual, expected))
-                throw new CryptographicException("The update signer does not match the installed or configured TermLink publisher.");
-            if (!string.IsNullOrWhiteSpace(reportedThumbprint))
-            {
-                var reported = NormalizeThumbprint(reportedThumbprint, "AppShip signer fingerprint");
-                if (!FixedHexEquals(actual, reported))
-                    throw new CryptographicException("The update signer does not match the AppShip signer fingerprint.");
-            }
+            WindowsUpdateSecurity.ValidateSignerIdentity(actualThumbprint, expectedThumbprint, reportedThumbprint);
         }
 
         internal static string NormalizeThumbprint(string value, string description)
         {
-            var normalized = AppShipUpdateClient.NormalizeHex(value);
-            if (!AppShipUpdateClient.IsHex(normalized, 40))
-                throw new CryptographicException("The " + description + " is not a SHA-1 certificate thumbprint.");
-            return normalized;
-        }
-
-        private static bool FixedHexEquals(string left, string right)
-        {
-            return CryptographicOperations.FixedTimeEquals(
-                Convert.FromHexString(left),
-                Convert.FromHexString(right));
+            return WindowsUpdateSecurity.NormalizeThumbprint(value, description);
         }
     }
 
@@ -117,68 +75,12 @@ namespace TermLink.Tray
 
         internal static string ResolveExpectedThumbprint()
         {
-            var configuredThumbprint = Environment.GetEnvironmentVariable("TERMLINK_UPDATE_SIGNER_THUMBPRINT");
-            var configuredCertificate = Environment.GetEnvironmentVariable("TERMLINK_UPDATE_PUBLISHER_CERTIFICATE");
-            string expected = null;
-            if (!string.IsNullOrWhiteSpace(configuredThumbprint))
-            {
-                expected = UpdatePackageValidator.NormalizeThumbprint(
-                    configuredThumbprint,
-                    "configured update signer");
-            }
-            if (!string.IsNullOrWhiteSpace(configuredCertificate))
-            {
-                var certificateThumbprint = ReadCertificateThumbprint(configuredCertificate, required: true);
-                if (expected != null)
-                {
-                    UpdatePackageValidator.ValidateSignerIdentity(certificateThumbprint, expected, null);
-                }
-                expected = certificateThumbprint;
-            }
-            // An explicit identity supports controlled publisher rotation and
-            // takes precedence over the identity shipped by the old install.
-            if (expected != null) return expected;
-
-            var bundledCertificate = Path.Combine(AppContext.BaseDirectory, PublisherCertificateFileName);
-            if (File.Exists(bundledCertificate))
-            {
-                expected = ReadCertificateThumbprint(bundledCertificate, required: true);
-                var processPath = Environment.ProcessPath;
-                if (IsTrayExecutable(processPath))
-                {
-                    var currentSigner = AuthenticodeVerifier.ReadSignerThumbprint(processPath);
-                    UpdatePackageValidator.ValidateSignerIdentity(currentSigner, expected, null);
-                }
-                return expected;
-            }
-
-            var currentPath = Environment.ProcessPath;
-            if (IsTrayExecutable(currentPath))
-            {
-                var status = AuthenticodeVerifier.VerifyEmbeddedSignature(currentPath);
-                if (!UpdatePackageValidator.IsAcceptableAuthenticodeStatus(status))
-                    throw new CryptographicException("The installed Tray signature cannot establish an update publisher identity.");
-                return UpdatePackageValidator.NormalizeThumbprint(
-                    AuthenticodeVerifier.ReadSignerThumbprint(currentPath),
-                    "installed Tray signer");
-            }
-            throw new CryptographicException(
-                "No installed or configured TermLink update publisher identity is available.");
+            return WindowsUpdateSecurity.ResolveExpectedSignerThumbprint();
         }
 
         internal static string ReadCertificateThumbprint(string path, bool required)
         {
-            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
-            {
-                if (required) throw new FileNotFoundException("The configured update publisher certificate was not found.", path);
-                return null;
-            }
-            using (var certificate = new X509Certificate2(Path.GetFullPath(path)))
-            {
-                return UpdatePackageValidator.NormalizeThumbprint(
-                    certificate.Thumbprint,
-                    "update publisher certificate thumbprint");
-            }
+            return WindowsUpdateSecurity.ReadCertificateThumbprint(path, required);
         }
 
         private static bool IsTrayExecutable(string path)
@@ -195,67 +97,12 @@ namespace TermLink.Tray
 
         internal static uint VerifyEmbeddedSignature(string path)
         {
-            if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Authenticode verification requires Windows.");
-            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
-                throw new FileNotFoundException("The Authenticode file was not found.", path);
-
-            var pathPointer = Marshal.StringToCoTaskMemUni(Path.GetFullPath(path));
-            var filePointer = IntPtr.Zero;
-            var dataPointer = IntPtr.Zero;
-            try
-            {
-                var file = new WinTrustFileInfo
-                {
-                    StructureSize = checked((uint)Marshal.SizeOf<WinTrustFileInfo>()),
-                    FilePath = pathPointer,
-                    FileHandle = IntPtr.Zero,
-                    KnownSubject = IntPtr.Zero
-                };
-                filePointer = Marshal.AllocCoTaskMem(Marshal.SizeOf<WinTrustFileInfo>());
-                Marshal.StructureToPtr(file, filePointer, false);
-                var data = new WinTrustData
-                {
-                    StructureSize = checked((uint)Marshal.SizeOf<WinTrustData>()),
-                    PolicyCallbackData = IntPtr.Zero,
-                    SipClientData = IntPtr.Zero,
-                    UiChoice = 2, // WTD_UI_NONE
-                    RevocationChecks = 0, // WTD_REVOKE_NONE
-                    UnionChoice = 1, // WTD_CHOICE_FILE
-                    File = filePointer,
-                    StateAction = 0, // WTD_STATEACTION_IGNORE
-                    StateData = IntPtr.Zero,
-                    UrlReference = IntPtr.Zero,
-                    ProviderFlags = 0x00001000, // WTD_CACHE_ONLY_URL_RETRIEVAL
-                    UiContext = 0
-                };
-                dataPointer = Marshal.AllocCoTaskMem(Marshal.SizeOf<WinTrustData>());
-                Marshal.StructureToPtr(data, dataPointer, false);
-                return unchecked((uint)WinVerifyTrust(IntPtr.Zero, GenericVerifyV2, dataPointer));
-            }
-            finally
-            {
-                if (dataPointer != IntPtr.Zero) Marshal.FreeCoTaskMem(dataPointer);
-                if (filePointer != IntPtr.Zero) Marshal.FreeCoTaskMem(filePointer);
-                Marshal.FreeCoTaskMem(pathPointer);
-            }
+            return WindowsUpdateSecurity.VerifyEmbeddedSignature(path);
         }
 
         internal static string ReadSignerThumbprint(string path)
         {
-            try
-            {
-                using (var certificate = X509Certificate.CreateFromSignedFile(Path.GetFullPath(path)))
-                using (var certificate2 = new X509Certificate2(certificate.GetRawCertData()))
-                {
-                    return UpdatePackageValidator.NormalizeThumbprint(
-                        certificate2.Thumbprint,
-                        "Authenticode signer thumbprint");
-                }
-            }
-            catch (CryptographicException error)
-            {
-                throw new CryptographicException("The update EXE has no readable Authenticode signer.", error);
-            }
+            return WindowsUpdateSecurity.ReadSignerThumbprint(path);
         }
 
         [DllImport("wintrust.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]

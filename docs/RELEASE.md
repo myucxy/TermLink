@@ -7,6 +7,12 @@
 [发布与部署运行手册](RELEASE_RUNBOOK.md)。该手册记录已经现场验证过的命令约束；遇到相同错误时
 不要跳过门禁或重复使用已知无效的调用方式。
 
+Android 独占触发的 Windows Agent 自动升级协议、事务、取消与回滚边界见
+[Windows Agent 远程自动升级](REMOTE_AGENT_UPDATE.md)。
+
+Windows 命令配置、Server 能力同步和 Android 受控启动的兼容契约见
+[远程终端命令协议](REMOTE_TERMINAL_COMMANDS.md)。包含 migration 22 的服务端必须先于自定义命令发布。
+
 ## 版本与目标
 
 每次调用只接收一份 `-Version` 和 `-BuildNumber`：

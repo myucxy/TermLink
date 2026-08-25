@@ -2,6 +2,7 @@ package dev.termlink.product
 
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
+import dev.termlink.model.TerminalCommandCapability
 import java.util.UUID
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -90,5 +91,26 @@ class RemoteDirectoryFavoriteTest {
             ),
             supportedRemoteShellTypes(pc),
         )
+    }
+
+    @Test
+    fun standardizedTerminalCommandsPreserveWindowsNamesAndOrder() {
+        val commands = listOf(
+            TerminalCommandCapability("custom-project", "Project CLI", "custom", "manual"),
+            TerminalCommandCapability("powershell-7", "PowerShell 7", "powershell-7", "detected"),
+        )
+        val pc = dev.termlink.model.PcSummary(
+            id = pcId,
+            deviceId = UUID.randomUUID(),
+            name = "PC",
+            agentVersion = "test",
+            remoteRoutingEnabled = true,
+            online = true,
+            lastSeenAt = null,
+            supportedShells = setOf("command-prompt"),
+            terminalCommands = commands,
+        )
+
+        assertEquals(commands, supportedRemoteTerminalCommands(pc))
     }
 }

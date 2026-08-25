@@ -9,6 +9,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\AgentControl\TermLink.AgentControl.csproj" />
+    <ProjectReference Include="..\..\src\UpdateCore\TermLink.UpdateCore.csproj" />
     <Compile Include="..\..\src\Common\WindowsTerminalIntegration.cs" Link="Common\WindowsTerminalIntegration.cs" />
     <Compile Include="..\..\src\Setup\Program.cs" Link="Setup\Program.cs" />
     <Compile Include="..\..\src\Setup\SetupForm.cs" Link="Setup\SetupForm.cs" />

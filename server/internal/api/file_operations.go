@@ -53,16 +53,18 @@ func (a *API) createFileOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Operation string  `json:"operation"`
-		Path      string  `json:"path"`
-		Offset    *int64  `json:"offset"`
-		ShellType *string `json:"shell_type"`
+		Operation         string  `json:"operation"`
+		Path              string  `json:"path"`
+		Offset            *int64  `json:"offset"`
+		ShellType         *string `json:"shell_type"`
+		TerminalCommandID *string `json:"terminal_command_id"`
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err)
 		return
 	}
-	if err := validateFileOperationRequest(input.Operation, input.Path, input.Offset, input.ShellType); err != nil {
+	if err := validateFileOperationRequestWithCommand(
+		input.Operation, input.Path, input.Offset, input.ShellType, input.TerminalCommandID); err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_FILE_OPERATION", err)
 		return
 	}
@@ -71,8 +73,12 @@ func (a *API) createFileOperation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusServiceUnavailable, "FILE_OPERATIONS_UNAVAILABLE", errors.New("file-operation store unavailable"))
 		return
 	}
+	requestedCommand := input.TerminalCommandID
+	if requestedCommand == nil {
+		requestedCommand = input.ShellType
+	}
 	item, err := repository.CreateFileOperation(r.Context(), p.UserID, p.Device.ID, pcID, store.FileOperationCreateInput{
-		Operation: input.Operation, Path: input.Path, Offset: input.Offset, ShellType: input.ShellType,
+		Operation: input.Operation, Path: input.Path, Offset: input.Offset, ShellType: requestedCommand,
 		ExpiresAt: a.now().Add(fileOperationLifetime),
 	})
 	if err != nil {
@@ -355,9 +361,10 @@ func validateOpenTerminalResult(result json.RawMessage, requestedShell *string, 
 		return errors.New("terminal result required")
 	}
 	var value struct {
-		SessionID string `json:"session_id"`
-		ShellType string `json:"shell_type"`
-		CWD       string `json:"cwd"`
+		SessionID         string  `json:"session_id"`
+		TerminalCommandID *string `json:"terminal_command_id"`
+		ShellType         string  `json:"shell_type"`
+		CWD               string  `json:"cwd"`
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(result)))
 	decoder.DisallowUnknownFields()
@@ -365,30 +372,45 @@ func validateOpenTerminalResult(result json.RawMessage, requestedShell *string, 
 		return errors.New("invalid terminal result")
 	}
 	sessionID, err := uuid.Parse(value.SessionID)
+	legacyResult := value.TerminalCommandID == nil && value.ShellType == *requestedShell
+	commandResult := value.TerminalCommandID != nil && *value.TerminalCommandID == *requestedShell &&
+		(value.ShellType == "command-prompt" || value.ShellType == "windows-powershell" ||
+			value.ShellType == "powershell-7" || value.ShellType == "wsl" || value.ShellType == "custom")
 	if err != nil || sessionID == uuid.Nil || sessionID.String() != value.SessionID ||
-		value.ShellType != *requestedShell || value.CWD != requestedPath {
+		(!legacyResult && !commandResult) || value.CWD != requestedPath {
 		return errors.New("invalid terminal result")
 	}
 	return nil
 }
 
 func validateFileOperationRequest(operation, path string, offset *int64, shellType *string) error {
+	return validateFileOperationRequestWithCommand(operation, path, offset, shellType, nil)
+}
+
+func validateFileOperationRequestWithCommand(
+	operation, path string,
+	offset *int64,
+	shellType, terminalCommandID *string,
+) error {
 	if !utf8.ValidString(path) || len(path) > store.MaxFileOperationPathBytes || strings.ContainsRune(path, '\x00') {
 		return errors.New("invalid path")
 	}
 	switch operation {
 	case store.FileOperationList:
-		if shellType != nil || (offset != nil && *offset < 0) {
+		if shellType != nil || terminalCommandID != nil || (offset != nil && *offset < 0) {
 			return errors.New("invalid LIST parameters")
 		}
 	case store.FileOperationDownload:
-		if path == "" || offset != nil || shellType != nil {
+		if path == "" || offset != nil || shellType != nil || terminalCommandID != nil {
 			return errors.New("invalid DOWNLOAD parameters")
 		}
 	case store.FileOperationOpenTerminal:
-		if path == "" || offset != nil || shellType == nil ||
-			(*shellType != "command-prompt" && *shellType != "windows-powershell" &&
-				*shellType != "powershell-7" && *shellType != "wsl") {
+		legacyShell := shellType != nil && terminalCommandID == nil &&
+			(*shellType == "command-prompt" || *shellType == "windows-powershell" ||
+				*shellType == "powershell-7" || *shellType == "wsl")
+		standardCommand := shellType == nil && terminalCommandID != nil &&
+			terminalCommandIDPattern.MatchString(*terminalCommandID)
+		if path == "" || offset != nil || (!legacyShell && !standardCommand) {
 			return errors.New("invalid OPEN_TERMINAL parameters")
 		}
 	default:
@@ -444,6 +466,7 @@ func fileOperationView(item store.FileOperationRecord) map[string]any {
 	}
 	if item.ShellType != nil {
 		result["shell_type"] = *item.ShellType
+		result["terminal_command_id"] = *item.ShellType
 	}
 	if item.LeaseExpiresAt != nil && item.Status == store.FileOperationProcessing {
 		result["lease_expires_at"] = *item.LeaseExpiresAt

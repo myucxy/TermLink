@@ -20,6 +20,7 @@ using Google.Protobuf;
 using TermLink.LocalIpc;
 using TermLink.Protocol;
 using TermLink.Protocol.Realtime.V1;
+using TermLink.UpdateCore;
 using CoreTerminalInput = TermLink.TerminalCore.TerminalInput;
 using CoreTerminalInputModifiers = TermLink.TerminalCore.TerminalInputModifiers;
 using CoreTerminalKey = TermLink.TerminalCore.TerminalKey;
@@ -186,6 +187,7 @@ namespace TermLink.Agent
         private ClientWebSocket socket;
         private ProductionHistoryUploader historyUploader;
         private ProductionFileOperationWorker fileOperationWorker;
+        private ProductionAgentUpdateWorker agentUpdateWorker;
         private DateTime authorityExpiresUtc;
         private DateTime lastPCUpsertAttemptUtc;
         private DateTime statusExpiresUtc;
@@ -277,7 +279,8 @@ namespace TermLink.Agent
                 "flow_control_v1",
                 "lease_v1",
                 "bounded_event_replay_v1",
-                "terminal_presentation_metadata_v1"
+                "terminal_presentation_metadata_v1",
+                "remote_agent_update_v1"
             };
             if (terminalSnapshotEnabled) capabilities.Add("terminal_snapshot_v1");
             if (typedInputEnabled) capabilities.Add("terminal_typed_input_v1");
@@ -351,6 +354,19 @@ namespace TermLink.Agent
                     sessionId => registry.ContainsSession(sessionId),
                     sessionId => registry.TerminateSession(sessionId));
                 fileOperationWorker.Start();
+                agentUpdateWorker = new ProductionAgentUpdateWorker(
+                    new ProductionAgentUpdateApi(config.PcId, SendAsync),
+                    config.PcId,
+                    config.AgentVersion,
+                    WindowsUpdateVersion.GetBuild(typeof(ProductionAgentRuntime).Assembly.GetName().Version),
+                    cancellation.Token,
+                    () => registry.GetSummaries().Select(value => value.SessionId).ToList(),
+                    sessionId => registry.TerminateSession(sessionId),
+                    () =>
+                    {
+                        lock (statusSync) return relayState == ProductionRelayState.Connected;
+                    });
+                agentUpdateWorker.Start();
                 historyWorker = Task.Run(HistoryUploadLoopAsync);
                 metadataWorker = Task.Run(MetadataUpsertLoopAsync);
                 worker = Task.Run(RunAsync);
@@ -774,17 +790,64 @@ namespace TermLink.Agent
                 agent_version = agentVersion,
                 key_epoch = keyEpoch,
                 session_heartbeat_capable = true,
-                supported_shells = normalizedShells
+                supported_shells = normalizedShells,
+                remote_agent_update_capable = true
+            });
+        }
+
+        internal static byte[] BuildPCUpsertBodyWithTerminalCommands(
+            string pcName,
+            string agentVersion,
+            long keyEpoch,
+            string[] supportedShells,
+            TerminalCommandCapability[] terminalCommands)
+        {
+            if (terminalCommands == null) throw new ArgumentNullException(nameof(terminalCommands));
+            _ = BuildPCUpsertBodyWithCapabilities(pcName, agentVersion, keyEpoch, supportedShells);
+            var normalizedShells = supportedShells
+                .Select(value => value ?? string.Empty)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            if (terminalCommands.Length > 24 ||
+                terminalCommands.Select(command => command?.Id).Distinct(StringComparer.Ordinal).Count() != terminalCommands.Length)
+                throw new ArgumentException("Terminal command capabilities must be unique and bounded.", nameof(terminalCommands));
+            var normalizedCommands = terminalCommands.Select(command =>
+            {
+                if (command == null || string.IsNullOrWhiteSpace(command.Id) ||
+                    string.IsNullOrWhiteSpace(command.DisplayName) ||
+                    string.IsNullOrWhiteSpace(command.ShellType) ||
+                    (command.Source != "detected" && command.Source != "manual"))
+                {
+                    throw new ArgumentException("A terminal command capability is invalid.", nameof(terminalCommands));
+                }
+                return new
+                {
+                    id = command.Id,
+                    display_name = command.DisplayName,
+                    shell_type = command.ShellType,
+                    source = command.Source
+                };
+            }).ToArray();
+            return JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                name = pcName,
+                agent_version = agentVersion,
+                key_epoch = keyEpoch,
+                session_heartbeat_capable = true,
+                supported_shells = normalizedShells,
+                terminal_commands = normalizedCommands,
+                remote_agent_update_capable = true
             });
         }
 
         private async Task UpsertPCAsync(CancellationToken token)
         {
-            var body = BuildPCUpsertBodyWithCapabilities(
+            var body = BuildPCUpsertBodyWithTerminalCommands(
                 config.PcName,
                 config.AgentVersion,
                 config.KeyEpoch,
-                ManagedTerminalLauncher.DetectSupportedShellTypes());
+                ManagedTerminalLauncher.DetectSupportedShellTypes(),
+                ManagedTerminalLauncher.DetectTerminalCommandCapabilities());
             try
             {
                 using var response = await SendAsync(
@@ -3851,6 +3914,7 @@ namespace TermLink.Agent
                 catch (ObjectDisposedException) { }
             }
 
+            if (agentUpdateWorker != null) agentUpdateWorker.Dispose();
             if (fileOperationWorker != null) fileOperationWorker.Dispose();
             if (historyUploader != null) historyUploader.Dispose();
             fileUploadHttp.Dispose();

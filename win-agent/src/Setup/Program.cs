@@ -14,6 +14,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using Microsoft.Win32;
 using TermLink.Agent;
+using TermLink.UpdateCore;
 using TermLink.WindowsIntegration;
 
 namespace TermLink.Setup
@@ -74,10 +75,11 @@ namespace TermLink.Setup
                 {
                     var installDirectory = Path.GetFullPath(options.InstallDirectory);
                     DetachFromInheritedWorkingDirectory();
-                    Installer.Install(
-                        installDirectory,
-                        options.CreateStartup,
-                        options.TerminateRunningProcesses);
+                    if (!string.IsNullOrWhiteSpace(options.RemoteUpdateTransaction))
+                    {
+                        return RunRemoteUpdateInstall(options, installDirectory);
+                    }
+                    Installer.Install(installDirectory, options.CreateStartup, options.TerminateRunningProcesses);
                     if (!options.NoLaunch && !Installer.TryLaunchTray(installDirectory))
                     {
                         Console.Error.WriteLine(
@@ -129,6 +131,44 @@ namespace TermLink.Setup
             }
         }
 
+        private static int RunRemoteUpdateInstall(SetupArguments options, string installDirectory)
+        {
+            var journalPath = Path.GetFullPath(options.RemoteUpdateTransaction);
+            var transaction = RemoteUpdateTransactionStore.Load(journalPath);
+            if (transaction.State != RemoteUpdateTransactionState.SetupRunning ||
+                !string.Equals(Path.GetFullPath(transaction.InstallRoot), installDirectory, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("The remote update transaction does not authorize this install root.");
+            var setupVersion = typeof(Program).Assembly.GetName().Version ??
+                throw new InvalidDataException("The Setup assembly version is unavailable.");
+            if (WindowsUpdateVersion.GetBuild(setupVersion) != transaction.TargetBuild)
+                throw new InvalidDataException("The remote update transaction target does not match this Setup build.");
+            try
+            {
+                var outcome = Installer.Install(
+                    installDirectory,
+                    options.CreateStartup,
+                    terminateRunningProcesses: true,
+                    preserveBackupForExternalCommit: true);
+                if (string.IsNullOrWhiteSpace(outcome.PreservedBackupPath) ||
+                    !Directory.Exists(outcome.PreservedBackupPath))
+                    throw new InvalidDataException("The remote update did not preserve the previous installation backup.");
+                transaction.BackupPath = outcome.PreservedBackupPath;
+                transaction.State = RemoteUpdateTransactionState.AwaitingNewAgent;
+                transaction.HealthDeadlineUtc = DateTimeOffset.UtcNow.AddMinutes(3);
+                transaction.LastErrorCode = null;
+                transaction.LastErrorDetail = null;
+                RemoteUpdateTransactionStore.Save(journalPath, transaction);
+                return 0;
+            }
+            catch (Exception error)
+            {
+                transaction.LastErrorCode = "SETUP_INSTALL_FAILED";
+                transaction.LastErrorDetail = Installer.SafeDiagnostic(error);
+                RemoteUpdateTransactionStore.Save(journalPath, transaction);
+                throw;
+            }
+        }
+
         private static bool IsUninstallerExecutable()
         {
             var processPath = Environment.ProcessPath;
@@ -155,6 +195,7 @@ namespace TermLink.Setup
             "  TermLink-Setup.exe --install-dir <目录> --no-startup\n" +
             "  TermLink-Setup.exe --install-dir <目录> --no-launch\n" +
             "  TermLink-Setup.exe --install-dir <目录> --terminate-running\n" +
+            "  TermLink-Setup.exe --install-dir <目录> --terminate-running --no-launch --remote-update-transaction <journal>\n" +
             "  TermLink-Setup.exe --uninstall [<目录>]     卸载\n" +
             "  TermLink-Setup.exe --uninstall [<目录>] --purge-known-runtime-data\n" +
             "  TermLink-Setup.exe --help                   显示帮助";
@@ -167,6 +208,7 @@ namespace TermLink.Setup
         public bool NoLaunch { get; private set; }
         public bool Help { get; private set; }
         public string CleanupSelfPath { get; private set; }
+        public string RemoteUpdateTransaction { get; private set; }
 
         public static SetupArguments Parse(string[] args)
         {
@@ -202,6 +244,9 @@ namespace TermLink.Setup
                     case "--cleanup-self":
                         result.CleanupSelfPath = Required(args, ref index, "--cleanup-self");
                         break;
+                    case "--remote-update-transaction":
+                        result.RemoteUpdateTransaction = Required(args, ref index, "--remote-update-transaction");
+                        break;
                     case "--help":
                     case "-h":
                     case "/?":
@@ -229,6 +274,13 @@ namespace TermLink.Setup
                 (result.Uninstall || string.IsNullOrWhiteSpace(result.InstallDirectory)))
             {
                 throw new ArgumentException("--no-launch 只能和 --install-dir 一起使用。");
+            }
+            if (!string.IsNullOrWhiteSpace(result.RemoteUpdateTransaction) &&
+                (result.Uninstall || string.IsNullOrWhiteSpace(result.InstallDirectory) ||
+                 !result.TerminateRunningProcesses || !result.NoLaunch))
+            {
+                throw new ArgumentException(
+                    "--remote-update-transaction requires --install-dir, --terminate-running and --no-launch.");
             }
             return result;
         }
@@ -409,6 +461,7 @@ namespace TermLink.Setup
         public string TerminalStatus { get; }
         public string TerminalMessage { get; }
         public string TerminalDiagnosticLogPath { get; }
+        public string PreservedBackupPath { get; internal set; }
         public bool TerminalConfigured =>
             string.Equals(TerminalStatus, "configured", StringComparison.Ordinal) ||
             string.Equals(TerminalStatus, "configured-terminal-not-installed", StringComparison.Ordinal);
@@ -755,7 +808,8 @@ namespace TermLink.Setup
             bool createStartup,
             bool terminateRunningProcesses = false,
             CancellationToken cancellationToken = default,
-            Func<bool> tryBeginCommit = null)
+            Func<bool> tryBeginCommit = null,
+            bool preserveBackupForExternalCommit = false)
         {
             cancellationToken.ThrowIfCancellationRequested();
             // Run the platform checks before creating or moving any directory.
@@ -866,8 +920,8 @@ namespace TermLink.Setup
                 // is post-commit best effort: a locked file in the old backup
                 // must never trigger rollback that deletes the working new root.
                 installSucceeded = true;
-                TryDeleteDirectory(backup);
-                if (Directory.Exists(backup))
+                if (!preserveBackupForExternalCommit) TryDeleteDirectory(backup);
+                if (!preserveBackupForExternalCommit && Directory.Exists(backup))
                 {
                     Console.Error.WriteLine(
                         "旧版本备份暂时无法清理，已保留以避免数据损坏: " + backup);
@@ -885,6 +939,7 @@ namespace TermLink.Setup
                         Console.Error.WriteLine("Windows Terminal 集成诊断: " + terminalOutcome.TerminalDiagnosticLogPath);
                     }
                 }
+                if (preserveBackupForExternalCommit) terminalOutcome.PreservedBackupPath = backup;
                 return terminalOutcome;
             }
             catch (Exception installError)
@@ -949,8 +1004,15 @@ namespace TermLink.Setup
             finally
             {
                 TryDeleteDirectory(staging);
-                if (installSucceeded) TryDeleteDirectory(backup);
+                if (installSucceeded && !preserveBackupForExternalCommit) TryDeleteDirectory(backup);
             }
+        }
+
+        internal static string SafeDiagnostic(Exception error)
+        {
+            var value = (error?.GetType().Name ?? "Exception") + ": " + (error?.Message ?? "Unknown error");
+            value = value.Replace('\r', ' ').Replace('\n', ' ').Trim();
+            return value.Length <= 1000 ? value : value.Substring(0, 1000);
         }
 
         internal static void Uninstall(string installDirectory, bool purgeKnownRuntimeData = false)

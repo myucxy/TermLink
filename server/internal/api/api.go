@@ -22,9 +22,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"github.com/termlink/termlink/server/internal/agentupdate"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/billing"
 	"github.com/termlink/termlink/server/internal/history"
@@ -54,21 +56,23 @@ const (
 const pairingCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 type API struct {
-	Store           *store.Postgres
-	Valkey          *kv.Valkey
-	Tokens          auth.TokenVerifier
-	Auth            auth.Middleware
-	SubjectKey      []byte
-	TokenKey        []byte
-	History         HistoryObjectStore
-	Billing         *billing.Registry
-	Registration    *auth.DirectRegistrationService
-	ClientConfig    ClientConfiguration
-	Clock           func() time.Time
-	historyPages    historyPageLister
-	historyUploads  historyUploadStore
-	transcriptPages transcriptPageLister
-	fileOperations  fileOperationStore
+	Store              *store.Postgres
+	Valkey             *kv.Valkey
+	Tokens             auth.TokenVerifier
+	Auth               auth.Middleware
+	SubjectKey         []byte
+	TokenKey           []byte
+	History            HistoryObjectStore
+	Billing            *billing.Registry
+	Registration       *auth.DirectRegistrationService
+	ClientConfig       ClientConfiguration
+	Clock              func() time.Time
+	historyPages       historyPageLister
+	historyUploads     historyUploadStore
+	transcriptPages    transcriptPageLister
+	fileOperations     fileOperationStore
+	agentUpdates       agentUpdateStore
+	AgentUpdateCatalog agentupdate.Catalog
 }
 
 type historyPageLister interface {
@@ -126,6 +130,15 @@ func (a *API) Handler() http.Handler {
 	trusted.HandleFunc("POST /v1/pcs/{pcId}/file-operations/{operationId}/upload", a.uploadFileOperation)
 	trusted.HandleFunc("POST /v1/pcs/{pcId}/file-operations/{operationId}/renew", a.renewFileOperation)
 	trusted.HandleFunc("POST /v1/pcs/{pcId}/file-operations/{operationId}/complete", a.completeFileOperation)
+	trusted.HandleFunc("GET /v1/pcs/{pcId}/agent-update-eligibility", a.getAgentUpdateEligibility)
+	trusted.HandleFunc("POST /v1/pcs/{pcId}/agent-updates", a.createAgentUpdate)
+	trusted.HandleFunc("POST /v1/pcs/{pcId}/agent-updates/claim", a.claimAgentUpdate)
+	trusted.HandleFunc("GET /v1/pcs/{pcId}/agent-updates/active", a.getActiveAgentUpdate)
+	trusted.HandleFunc("GET /v1/pcs/{pcId}/agent-updates/{updateId}", a.getAgentUpdate)
+	trusted.HandleFunc("DELETE /v1/pcs/{pcId}/agent-updates/{updateId}", a.cancelAgentUpdate)
+	trusted.HandleFunc("POST /v1/pcs/{pcId}/agent-updates/{updateId}/renew", a.renewAgentUpdate)
+	trusted.HandleFunc("POST /v1/pcs/{pcId}/agent-updates/{updateId}/progress", a.progressAgentUpdate)
+	trusted.HandleFunc("POST /v1/pcs/{pcId}/agent-updates/{updateId}/complete", a.completeAgentUpdate)
 	trusted.HandleFunc("GET /v1/pcs/{id}/grants", a.listPCGrants)
 	trusted.HandleFunc("POST /v1/pcs/{id}/grants", a.putGrant)
 	trusted.HandleFunc("DELETE /v1/pcs/{id}/grants/{deviceId}", a.deleteGrant)
@@ -610,11 +623,13 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Name                    string   `json:"name"`
-		AgentVersion            string   `json:"agent_version"`
-		KeyEpoch                int64    `json:"key_epoch"`
-		SessionHeartbeatCapable bool     `json:"session_heartbeat_capable"`
-		SupportedShells         []string `json:"supported_shells"`
+		Name                     string                            `json:"name"`
+		AgentVersion             string                            `json:"agent_version"`
+		KeyEpoch                 int64                             `json:"key_epoch"`
+		SessionHeartbeatCapable  bool                              `json:"session_heartbeat_capable"`
+		RemoteAgentUpdateCapable bool                              `json:"remote_agent_update_capable"`
+		SupportedShells          []string                          `json:"supported_shells"`
+		TerminalCommands         []store.TerminalCommandCapability `json:"terminal_commands"`
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		writeError(w, r, 400, "INVALID_REQUEST", err)
@@ -629,15 +644,56 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 400, "INVALID_REQUEST", err)
 		return
 	}
+	terminalCommands, err := normalizeTerminalCommands(input.TerminalCommands)
+	if err != nil {
+		writeError(w, r, 400, "INVALID_REQUEST", err)
+		return
+	}
 	if err := a.Store.UpsertPC(r.Context(), p.UserID, p.Device.ID, store.PCRecord{
 		ID: id, Name: input.Name, AgentVersion: input.AgentVersion, KeyEpoch: input.KeyEpoch,
-		SessionHeartbeatCapable: input.SessionHeartbeatCapable,
-		SupportedShells:         supportedShells,
+		SessionHeartbeatCapable:  input.SessionHeartbeatCapable,
+		RemoteAgentUpdateCapable: input.RemoteAgentUpdateCapable,
+		SupportedShells:          supportedShells,
+		TerminalCommands:         terminalCommands,
 	}); err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": id})
+}
+
+var terminalCommandIDPattern = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,63}$`)
+
+func normalizeTerminalCommands(values []store.TerminalCommandCapability) ([]store.TerminalCommandCapability, error) {
+	if len(values) > 24 {
+		return nil, errors.New("too many terminal commands")
+	}
+	seen := make(map[string]bool, len(values))
+	result := make([]store.TerminalCommandCapability, 0, len(values))
+	for _, value := range values {
+		if !terminalCommandIDPattern.MatchString(value.ID) || seen[value.ID] ||
+			!utf8.ValidString(value.DisplayName) || strings.TrimSpace(value.DisplayName) != value.DisplayName ||
+			len(value.DisplayName) < 1 || len(value.DisplayName) > 80 || strings.IndexFunc(value.DisplayName, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+			return nil, errors.New("invalid terminal command capability")
+		}
+		switch value.Source {
+		case "detected":
+			if value.ShellType != value.ID ||
+				(value.ID != "command-prompt" && value.ID != "windows-powershell" &&
+					value.ID != "powershell-7" && value.ID != "wsl") {
+				return nil, errors.New("invalid detected terminal command capability")
+			}
+		case "manual":
+			if value.ShellType != "custom" {
+				return nil, errors.New("invalid manual terminal command capability")
+			}
+		default:
+			return nil, errors.New("invalid terminal command source")
+		}
+		seen[value.ID] = true
+		result = append(result, value)
+	}
+	return result, nil
 }
 
 func normalizeSupportedShells(values []string) ([]string, error) {

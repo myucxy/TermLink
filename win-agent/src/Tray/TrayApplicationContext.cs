@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading;
@@ -2016,6 +2017,8 @@ namespace TermLink.Tray
         private Button updateCheckButton;
         private Label terminalIntegrationStatusLabel;
         private Button terminalIntegrationButton;
+        private Label terminalCommandsStatusLabel;
+        private Button terminalCommandsButton;
         private Label membershipAccountStatusLabel;
         private Label membershipAccountDetailLabel;
         private Label membershipDeviceQuotaLabel;
@@ -2710,6 +2713,28 @@ namespace TermLink.Tray
             reconnectBody.Controls.Add(reconnectActions);
             stack.Controls.Add(reconnect);
 
+            var terminalCommands = CreateCard(
+                TrayText.Pick("命令", "Commands"),
+                out var terminalCommandsBody);
+            terminalCommandsStatusLabel = CreateValueLabel(TerminalCommandSummary(), 10, false);
+            terminalCommandsBody.Controls.Add(terminalCommandsStatusLabel);
+            var terminalCommandActions = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = true,
+                Padding = new Padding(0, 10, 0, 0)
+            };
+            terminalCommandsButton = CreateButton(TrayText.Pick("管理命令", "Manage commands"));
+            terminalCommandsButton.AccessibleName = TrayText.Pick(
+                "管理 Android 文件页面可用的终端命令",
+                "Manage terminal commands available on the Android Files page");
+            terminalCommandsButton.Click += async delegate { await OpenTerminalCommandsAsync(); };
+            terminalCommandActions.Controls.Add(terminalCommandsButton);
+            terminalCommandsBody.Controls.Add(terminalCommandActions);
+            stack.Controls.Add(terminalCommands);
+
             var terminalIntegration = CreateCard(
                 TrayText.Pick("Windows Terminal 配置", "Windows Terminal integration"),
                 out var terminalIntegrationBody);
@@ -2776,6 +2801,50 @@ namespace TermLink.Tray
             contentHost.Controls.Add(shell);
             contentHost.Controls.SetChildIndex(shell, 0);
             applyingPreferences = false;
+        }
+
+        private static string TerminalCommandSummary()
+        {
+            var detected = ManagedTerminalLauncher.LoadAvailableTerminalCommandProfiles()
+                .Where(profile => profile.Source == "detected")
+                .Select(profile => profile.DisplayName)
+                .ToArray();
+            var manual = TerminalCommandProfileStore.LoadManualProfiles();
+            var detectedText = detected.Length == 0
+                ? TrayText.Pick("无", "none")
+                : string.Join("、", detected);
+            return TrayText.Pick(
+                "自动检测：" + detectedText + "。手动配置：" + manual.Count + " 项。保存后，已启用项会同步到 Android 文件页面。",
+                "Detected: " + detectedText + ". Manual: " + manual.Count + ". Enabled entries are synchronized to the Android Files page after saving.");
+        }
+
+        private async Task OpenTerminalCommandsAsync()
+        {
+            using var dialog = new TerminalCommandSettingsForm();
+            if (dialog.ShowDialog(this) != DialogResult.OK) return;
+            SetBusy(true);
+            terminalCommandsStatusLabel.Text = TrayText.Pick(
+                "正在同步命令配置并重启后台 Agent…",
+                "Synchronizing command settings and restarting the background Agent…");
+            try
+            {
+                var response = await Task.Run(() => controller.RestartAgent());
+                if (response == null || !response.Success)
+                    throw new InvalidOperationException(response?.Code ?? "The Agent restart failed.");
+                terminalCommandsStatusLabel.Text = TerminalCommandSummary();
+                await RefreshAsync();
+            }
+            catch (Exception error)
+            {
+                terminalCommandsStatusLabel.Text = TrayText.Pick(
+                    "命令已保存，但 Agent 重启失败：" + error.Message,
+                    "Commands were saved, but the Agent restart failed: " + error.Message);
+                MessageBox.Show(this, terminalCommandsStatusLabel.Text, "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                SetBusy(false);
+            }
         }
 
         private async Task ReconfigureTerminalAsync()
@@ -3224,6 +3293,7 @@ namespace TermLink.Tray
             if (remoteStopButton != null) remoteStopButton.Enabled = !busy && latestResponse != null && latestResponse.RemoteAccessEnabled;
             if (connectionRetryButton != null && busy) connectionRetryButton.Enabled = false;
             if (terminalIntegrationButton != null) terminalIntegrationButton.Enabled = !busy;
+            if (terminalCommandsButton != null) terminalCommandsButton.Enabled = !busy;
             if (reconnectSettingsSaveButton != null) reconnectSettingsSaveButton.Enabled = !busy;
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
         }

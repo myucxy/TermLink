@@ -130,6 +130,28 @@ func TestValidateOpenTerminalResult(t *testing.T) {
 	}
 }
 
+func TestStandardTerminalCommandRequestAndResult(t *testing.T) {
+	commandID := "custom-123456"
+	path := `C:\folder`
+	if err := validateFileOperationRequestWithCommand(
+		store.FileOperationOpenTerminal, path, nil, nil, &commandID); err != nil {
+		t.Fatalf("standard terminal command rejected: %v", err)
+	}
+	if err := validateFileOperationRequestWithCommand(
+		store.FileOperationOpenTerminal, path, nil, &commandID, &commandID); err == nil {
+		t.Fatal("ambiguous terminal command request accepted")
+	}
+	sessionID := uuid.NewString()
+	valid := json.RawMessage(`{"session_id":"` + sessionID + `","terminal_command_id":"` + commandID + `","shell_type":"custom","cwd":"C:\\folder"}`)
+	if err := validateOpenTerminalResult(valid, &commandID, path); err != nil {
+		t.Fatalf("standard terminal result rejected: %v", err)
+	}
+	wrongCommand := json.RawMessage(`{"session_id":"` + sessionID + `","terminal_command_id":"custom-other","shell_type":"custom","cwd":"C:\\folder"}`)
+	if err := validateOpenTerminalResult(wrongCommand, &commandID, path); err == nil {
+		t.Fatal("mismatched terminal command result accepted")
+	}
+}
+
 func TestZeroByteUploadHandlerAcceptsEmptyFileAndRejectsNegativeSize(t *testing.T) {
 	accountID, pcID, operationID, windowsID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)

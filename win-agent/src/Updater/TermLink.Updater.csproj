@@ -5,4 +5,7 @@
     <AssemblyName>TermLink.Updater</AssemblyName>
     <RootNamespace>TermLink.Updater</RootNamespace>
   </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\UpdateCore\TermLink.UpdateCore.csproj" />
+  </ItemGroup>
 </Project>

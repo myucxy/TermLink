@@ -13,7 +13,7 @@ data class RemoteFileBrowserState(
     val activeRequestId: UUID? = null,
     val requestOffset: Long? = null,
     val loading: Boolean = false,
-    val openingShell: RemoteShellType? = null,
+    val openingCommandId: String? = null,
     val error: String? = null,
     val rollbackPage: RemoteDirectoryPage? = null,
 )
@@ -41,7 +41,7 @@ internal sealed interface RemoteFileBrowserEvent {
         val message: String,
     ) : RemoteFileBrowserEvent
 
-    data class ShellStarted(val shellType: RemoteShellType) : RemoteFileBrowserEvent
+    data class ShellStarted(val commandId: String) : RemoteFileBrowserEvent
     data object ShellFinished : RemoteFileBrowserEvent
     data class ShellFailed(val message: String) : RemoteFileBrowserEvent
 }
@@ -115,7 +115,7 @@ internal fun reduceRemoteFileBrowser(
             )
         }
     }
-    is RemoteFileBrowserEvent.ShellStarted -> state.copy(openingShell = event.shellType, error = null)
-    RemoteFileBrowserEvent.ShellFinished -> state.copy(openingShell = null)
-    is RemoteFileBrowserEvent.ShellFailed -> state.copy(openingShell = null, error = event.message)
+    is RemoteFileBrowserEvent.ShellStarted -> state.copy(openingCommandId = event.commandId, error = null)
+    RemoteFileBrowserEvent.ShellFinished -> state.copy(openingCommandId = null)
+    is RemoteFileBrowserEvent.ShellFailed -> state.copy(openingCommandId = null, error = event.message)
 }

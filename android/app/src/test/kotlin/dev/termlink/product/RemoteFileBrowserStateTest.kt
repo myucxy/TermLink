@@ -110,5 +110,15 @@ class RemoteFileBrowserStateTest {
         assertFalse(state.loading)
     }
 
+    @Test
+    fun openingStateTracksTheExactTerminalCommandId() {
+        val started = reduceRemoteFileBrowser(
+            RemoteFileBrowserState(),
+            RemoteFileBrowserEvent.ShellStarted("custom-project"),
+        )
+        assertEquals("custom-project", started.openingCommandId)
+        assertNull(reduceRemoteFileBrowser(started, RemoteFileBrowserEvent.ShellFinished).openingCommandId)
+    }
+
     private fun entry(name: String, path: String) = RemoteFileEntry(name, path, RemoteFileKind.DIRECTORY)
 }

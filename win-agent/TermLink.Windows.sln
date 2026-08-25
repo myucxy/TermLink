@@ -21,6 +21,12 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Protocol", "src\Pr
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.TerminalCore", "src\TerminalCore\TermLink.TerminalCore.csproj", "{C6D9B1EE-CAD4-46B8-BDC7-E3096FF1B53D}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.UpdateCore", "src\UpdateCore\TermLink.UpdateCore.csproj", "{3F63D9A7-CB86-49E6-AEE6-BE17702A1692}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.UpdateCore.Validation", "tests\UpdateCoreValidation\TermLink.UpdateCore.Validation.csproj", "{4B47B6B3-504D-4C4F-8544-A8F96D33B4ED}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.AgentUpdate.Validation", "tests\AgentUpdateValidation\TermLink.AgentUpdate.Validation.csproj", "{9A40C555-2831-476F-9A4D-21044B289070}"
+EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.TerminalCore.Validation", "tests\TerminalCoreValidation\TermLink.TerminalCore.Validation.csproj", "{E7DB16DB-C360-4A67-B66D-7F7D4AA4C565}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.AgentControl.Validation", "tests\AgentControlValidation\TermLink.AgentControl.Validation.csproj", "{F356B28D-7AC5-4C6F-AE99-DF9A29C9B1DF}"
@@ -73,6 +79,18 @@ Global
 		{C6D9B1EE-CAD4-46B8-BDC7-E3096FF1B53D}.Debug|x64.Build.0 = Debug|Any CPU
 		{C6D9B1EE-CAD4-46B8-BDC7-E3096FF1B53D}.Release|x64.ActiveCfg = Release|Any CPU
 		{C6D9B1EE-CAD4-46B8-BDC7-E3096FF1B53D}.Release|x64.Build.0 = Release|Any CPU
+		{3F63D9A7-CB86-49E6-AEE6-BE17702A1692}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{3F63D9A7-CB86-49E6-AEE6-BE17702A1692}.Debug|x64.Build.0 = Debug|Any CPU
+		{3F63D9A7-CB86-49E6-AEE6-BE17702A1692}.Release|x64.ActiveCfg = Release|Any CPU
+		{3F63D9A7-CB86-49E6-AEE6-BE17702A1692}.Release|x64.Build.0 = Release|Any CPU
+		{4B47B6B3-504D-4C4F-8544-A8F96D33B4ED}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{4B47B6B3-504D-4C4F-8544-A8F96D33B4ED}.Debug|x64.Build.0 = Debug|Any CPU
+		{4B47B6B3-504D-4C4F-8544-A8F96D33B4ED}.Release|x64.ActiveCfg = Release|Any CPU
+		{4B47B6B3-504D-4C4F-8544-A8F96D33B4ED}.Release|x64.Build.0 = Release|Any CPU
+		{9A40C555-2831-476F-9A4D-21044B289070}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{9A40C555-2831-476F-9A4D-21044B289070}.Debug|x64.Build.0 = Debug|Any CPU
+		{9A40C555-2831-476F-9A4D-21044B289070}.Release|x64.ActiveCfg = Release|Any CPU
+		{9A40C555-2831-476F-9A4D-21044B289070}.Release|x64.Build.0 = Release|Any CPU
 		{E7DB16DB-C360-4A67-B66D-7F7D4AA4C565}.Debug|x64.ActiveCfg = Debug|Any CPU
 		{E7DB16DB-C360-4A67-B66D-7F7D4AA4C565}.Debug|x64.Build.0 = Debug|Any CPU
 		{E7DB16DB-C360-4A67-B66D-7F7D4AA4C565}.Release|x64.ActiveCfg = Release|Any CPU
@@ -93,5 +111,7 @@ Global
 	GlobalSection(NestedProjects) = preSolution
 		{6C50ED51-D383-41F3-A33C-1E6F86783414} = {5F5F9B01-0E93-4DF9-AB2C-8EF697D8E2C5}
 		{E7DB16DB-C360-4A67-B66D-7F7D4AA4C565} = {5F5F9B01-0E93-4DF9-AB2C-8EF697D8E2C5}
+		{4B47B6B3-504D-4C4F-8544-A8F96D33B4ED} = {5F5F9B01-0E93-4DF9-AB2C-8EF697D8E2C5}
+		{9A40C555-2831-476F-9A4D-21044B289070} = {5F5F9B01-0E93-4DF9-AB2C-8EF697D8E2C5}
 	EndGlobalSection
 EndGlobal

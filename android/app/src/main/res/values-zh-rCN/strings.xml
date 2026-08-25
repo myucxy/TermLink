@@ -34,7 +34,7 @@
     <string name="failure_server_request">服务器请求失败，请检查 HTTPS 地址后重试。</string>
     <string name="enrollment_confirm_title">信任此手机？</string><string name="enrollment_confirm_copy">首次登录已将此手机登记为待确认。确认只会信任此手机，不会授予 PC 查看、控制或管理权限。你可以取消并稍后确认。</string><string name="enrollment_confirm_action">信任此手机</string>
     <string name="server_dialog_title">服务器</string><string name="server_url_label">HTTPS 地址</string><string name="server_url_hint">https://termlink.example.com</string>
-    <string name="action_save">保存</string><string name="action_cancel">取消</string>
+    <string name="action_save">保存</string><string name="action_cancel">取消</string><string name="action_close">关闭</string>
     <string name="page_devices_subtitle">同账号下的 Windows PC 与终端会话。</string>
     <string name="page_sessions_subtitle">按 PC 查看会话和实时终端流。</string><string name="page_activity_subtitle">最近的设备本地操作；不是服务器审计日志。</string>
     <string name="page_history_subtitle">服务器返回的加密历史对象。</string><string name="page_membership_subtitle">服务器套餐目录返回的权益和配额。</string>
@@ -138,6 +138,7 @@
     <string name="remote_directory_contents">目录内容</string>
     <string name="remote_favorite_location">%1$s · %2$s</string>
     <string name="remote_shells_unavailable">该 PC 未上报可用命令行</string>
+    <string name="action_open_terminal_command">使用 %1$s 打开</string>
     <string name="action_open_cmd">CMD</string>
     <string name="action_open_powershell">Windows PowerShell</string>
     <string name="action_open_powershell_7">PowerShell 7</string>
@@ -166,4 +167,45 @@
     <string name="remote_file_error_connection">无法连接 Windows 电脑，请重试。</string>
     <string name="remote_file_error_generic">Windows 文件操作失败，请重试。</string>
     <string name="failure_authentication_expired">登录已过期，请重新登录。</string>
+    <string name="device_menu_accessibility">打开设备操作菜单</string>
+    <string name="agent_update_action">自动升级 Agent</string>
+    <string name="agent_update_checking">正在检查 Agent 更新</string>
+    <string name="agent_update_checking_copy">正在读取 Agent %1$s 对应的签名稳定版更新。</string>
+    <string name="agent_update_confirm_title">升级 %1$s？</string>
+    <string name="agent_update_unavailable_title">当前无法升级 Agent</string>
+    <string name="agent_update_starting">正在发起 Agent 升级</string>
+    <string name="agent_update_in_progress">正在升级 Windows Agent</string>
+    <string name="agent_update_succeeded">Agent 升级完成</string>
+    <string name="agent_update_rolled_back">已恢复原 Agent</string>
+    <string name="agent_update_rollback_failed">Agent 回滚需要处理</string>
+    <string name="agent_update_failed">Agent 升级失败</string>
+    <string name="agent_update_request_failed">无法管理 Agent 升级</string>
+    <string name="agent_update_versions">%1$s 升级到 %2$s（构建 %3$d）</string>
+    <string name="agent_update_session_warning">将关闭 %1$d 个由 TermLink 管理的活动会话，以及其中的 CLI 子进程。</string>
+    <string name="agent_update_rollback_copy">新 Agent 重新连接 Relay 且服务端接受目标构建前，旧安装会一直保留以便自动回滚。</string>
+    <string name="agent_update_current_version">当前 Agent：%1$s</string>
+    <string name="agent_update_creating_job">正在创建由服务端授权的升级事务。</string>
+    <string name="agent_update_progress">%1$s · %2$d%%</string>
+    <string name="agent_update_active_sessions">活动受管会话：%1$d</string>
+    <string name="agent_update_error_code">错误代码：%1$s</string>
+    <string name="agent_update_restored_version">已恢复 Agent：%1$s</string>
+    <string name="agent_update_cannot_cancel">安装已经开始；连接验证或回滚期间不能取消。</string>
+    <string name="agent_update_server_error">服务端请求失败：HTTP %1$d · %2$s · trace %3$s</string>
+    <string name="agent_update_unknown_error">Agent 升级失败，但没有返回诊断信息。</string>
+    <string name="agent_update_confirm">升级 Agent</string>
+    <string name="agent_update_reason_offline">该 PC 当前离线。</string>
+    <string name="agent_update_reason_routing_disabled">该 PC 已关闭远程路由。</string>
+    <string name="agent_update_reason_unsupported">该 Agent 尚未声明事务式远程升级能力。</string>
+    <string name="agent_update_reason_seed_required">请先在 Windows 上手动安装一次引导版本，之后才能由 Android 自动升级。</string>
+    <string name="agent_update_reason_current">该 Agent 已是最新稳定构建。</string>
+    <string name="agent_update_reason_unknown">服务端拒绝升级资格：%1$s</string>
+    <string name="agent_update_phase_requested">等待 Windows Agent 领取任务</string>
+    <string name="agent_update_phase_prechecking">正在检查升级前置条件</string>
+    <string name="agent_update_phase_downloading">正在下载已签名 Setup</string>
+    <string name="agent_update_phase_verified">Setup 签名校验完成</string>
+    <string name="agent_update_phase_draining">正在关闭受管命令行会话</string>
+    <string name="agent_update_phase_installing">正在安装目标 Agent</string>
+    <string name="agent_update_phase_starting_agent">正在启动目标 Agent</string>
+    <string name="agent_update_phase_verifying_connection">正在验证 Relay 和服务端连接</string>
+    <string name="agent_update_phase_rolling_back">正在恢复原 Agent</string>
 </resources>

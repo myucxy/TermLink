@@ -64,6 +64,7 @@ Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当�
 - [重新打开会话时的开发交接](DEVELOPMENT_HANDOFF.md)
 - [完整产品与系统设计（开发基线）](docs/COMPLETE_SYSTEM_DESIGN.md)
 - [Android ↔ Server ↔ Windows 文件操作 E2E](docs/REMOTE_FILE_OPERATIONS_E2E.md)
+- [Windows 命令配置与 Android 受控启动协议](docs/REMOTE_TERMINAL_COMMANDS.md)
 - [终端信息获取与服务端转发需求基线](docs/TERMINAL_INFORMATION_FORWARDING_REQUIREMENTS.md)
 - `termForward/terminal-main/doc/async-terminal-channel.md`（异步通道契约与实现说明）
 - [Android / Windows Agent / Server Console UI 布局设计稿](docs/UI_LAYOUT_DESIGNS.md)

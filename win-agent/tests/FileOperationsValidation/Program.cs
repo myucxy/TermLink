@@ -580,6 +580,39 @@ static void ValidateTerminalLaunch(string testRoot)
     Require(!wslCommand.Contains("-NoLogo", StringComparison.Ordinal) && wslCommand.Contains(stub, StringComparison.Ordinal),
         "WSL launch received PowerShell-only flags or lost its executable");
     RequireFileOperationCode(() => launcher.Launch("unknown-shell", testRoot), "SHELL_NOT_ALLOWED");
+
+    var settingsPath = Path.Combine(testRoot, "terminal-commands.json");
+    AppContext.SetData(TerminalCommandProfileStore.StoragePathAppContextKey, settingsPath);
+    try
+    {
+        var custom = TerminalCommandProfileStore.CreateManualProfile(
+            null, "Project CLI", stub, "--project alpha --interactive");
+        TerminalCommandProfileStore.SaveManualProfiles(new[] { custom });
+        var roundTrip = TerminalCommandProfileStore.LoadManualProfiles().Single();
+        Require(roundTrip.Id == custom.Id && roundTrip.DisplayName == "Project CLI" &&
+            roundTrip.Arguments == "--project alpha --interactive",
+            "manual terminal command settings did not round-trip");
+        var customStarts = new RecordingProcessStarter();
+        var customLauncher = new ManagedTerminalLauncher(
+            new WindowsPathService(), customStarts, () => null, stub, stub, stub, stub, stub);
+        customLauncher.Launch(custom.Id, testRoot);
+        var customStart = customStarts.Starts.Single();
+        var customCommandIndex = customStart.ArgumentList.IndexOf("--command-base64");
+        var customCommand = Encoding.UTF8.GetString(
+            Convert.FromBase64String(customStart.ArgumentList[customCommandIndex + 1]));
+        var managedShellIndex = customStart.ArgumentList.IndexOf("--managed-shell");
+        Require(customCommand.Contains("--project alpha --interactive", StringComparison.Ordinal) &&
+            customStart.ArgumentList[managedShellIndex + 1] == "custom",
+            "custom terminal command was not resolved, launched, and advertised as a managed custom shell");
+
+        File.WriteAllText(settingsPath, "not-json", Encoding.UTF8);
+        Require(TerminalCommandProfileStore.LoadManualProfiles().Count == 0,
+            "corrupt terminal command settings were not rejected fail-closed");
+    }
+    finally
+    {
+        AppContext.SetData(TerminalCommandProfileStore.StoragePathAppContextKey, null);
+    }
 }
 
 static async Task ValidateApiContractAsync()

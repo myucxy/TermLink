@@ -54,6 +54,10 @@ func TestListPCsReportsServerAuthoritativeOnline(t *testing.T) {
 		AgentVersion:    "integration-test",
 		KeyEpoch:        1,
 		SupportedShells: []string{"command-prompt", "windows-powershell"},
+		TerminalCommands: []TerminalCommandCapability{
+			{ID: "command-prompt", DisplayName: "Command Prompt", ShellType: "command-prompt", Source: "detected"},
+			{ID: "custom-test", DisplayName: "Test CLI", ShellType: "custom", Source: "manual"},
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -67,6 +71,9 @@ func TestListPCsReportsServerAuthoritativeOnline(t *testing.T) {
 	}
 	if got := pcs[0].SupportedShells; len(got) != 2 || got[0] != "command-prompt" || got[1] != "windows-powershell" {
 		t.Fatalf("supported shells=%v, want Agent-reported ordered capabilities", got)
+	}
+	if got := pcs[0].TerminalCommands; len(got) != 2 || got[1].ID != "custom-test" || got[1].DisplayName != "Test CLI" {
+		t.Fatalf("terminal commands=%v, want Agent-reported command descriptors", got)
 	}
 
 	if _, err := repository.Pool.Exec(ctx,

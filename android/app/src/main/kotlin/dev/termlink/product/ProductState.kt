@@ -9,6 +9,7 @@ import dev.termlink.model.Entitlement
 import dev.termlink.model.HistoryObject
 import dev.termlink.model.PcSummary
 import dev.termlink.model.SessionSummary
+import dev.termlink.model.TerminalCommandCapability
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
 import dev.termlink.terminal.termux.TermuxTerminalEngine
@@ -637,6 +638,42 @@ enum class ProductBootstrapSource {
     REMOTE_SNAPSHOT,
 }
 
+data class AgentUpdateEligibility(
+    val pcId: UUID,
+    val eligible: Boolean,
+    val reasonCode: String? = null,
+    val currentVersion: String,
+    val currentBuild: Long? = null,
+    val targetVersion: String? = null,
+    val targetBuild: Long? = null,
+    val required: Boolean = false,
+    val releaseNotes: String? = null,
+    val activeSessionCount: Int = 0,
+)
+
+data class AgentUpdateProgress(
+    val id: UUID,
+    val pcId: UUID,
+    val currentVersion: String,
+    val currentBuild: Long,
+    val targetVersion: String,
+    val targetBuild: Long,
+    val status: String,
+    val phase: String,
+    val progressPercent: Int,
+    val activeSessionCount: Int? = null,
+    val errorCode: String? = null,
+    val errorDetail: String? = null,
+    val observedAgentVersion: String? = null,
+    val observedAgentBuild: Long? = null,
+) {
+    val terminal: Boolean
+        get() = status in setOf("SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED", "ROLLED_BACK", "ROLLBACK_FAILED")
+
+    val cancelable: Boolean
+        get() = !terminal && phase in setOf("REQUESTED", "PRECHECKING", "DOWNLOADING", "VERIFIED")
+}
+
 /**
  * This is the state consumed by the product UI. It is deliberately server-shaped:
  * an empty or null value means that the server has not supplied the information.
@@ -782,6 +819,24 @@ interface ProductRepository : Closeable {
     suspend fun purchaseProduct(productId: String)
     suspend fun restorePurchases()
     suspend fun revokeDevice(deviceId: UUID)
+    /** Reads Server eligibility; the client never derives a target release locally. */
+    suspend fun agentUpdateEligibility(pcId: UUID): AgentUpdateEligibility =
+        error("Remote Agent updates are unavailable")
+    /** Recovers the update created by this Android device after process restart. */
+    suspend fun activeAgentUpdate(pcId: UUID): AgentUpdateProgress? = null
+    /** Creates one Server-pinned update and reports each authoritative state until terminal. */
+    suspend fun runAgentUpdate(
+        pcId: UUID,
+        expectedTargetBuild: Long,
+        onProgress: (AgentUpdateProgress) -> Unit,
+    ): AgentUpdateProgress = error("Remote Agent updates are unavailable")
+    suspend fun monitorAgentUpdate(
+        pcId: UUID,
+        updateId: UUID,
+        onProgress: (AgentUpdateProgress) -> Unit,
+    ): AgentUpdateProgress = error("Remote Agent updates are unavailable")
+    suspend fun cancelAgentUpdate(pcId: UUID, updateId: UUID): AgentUpdateProgress =
+        error("Remote Agent updates are unavailable")
     suspend fun requestControl(sessionId: UUID)
     suspend fun releaseControl(sessionId: UUID)
     /** Release all active server control leases while keeping read-only viewing alive. */
@@ -803,8 +858,8 @@ interface ProductRepository : Closeable {
     }
     /** Removes download-center metadata. It never deletes the completed SAF document. */
     fun deleteRemoteDownloadRecord(recordId: UUID) = Unit
-    /** Opens one fixed Windows shell in [path] and returns its authoritative session ID. */
-    suspend fun openRemoteShell(pcId: UUID, path: String, shellType: RemoteShellType): UUID =
+    /** Opens one Agent-advertised Windows terminal command in [path]. */
+    suspend fun openRemoteShell(pcId: UUID, path: String, command: TerminalCommandCapability): UUID =
         error("Remote terminal launch is unavailable")
     suspend fun openSession(sessionId: UUID)
     /** Closes only this Android viewer/transport; the Windows shell remains running. */
@@ -867,7 +922,7 @@ class UnavailableProductRepository : ProductRepository {
     override suspend fun cancelRemoteDownload(recordId: UUID) = unavailable()
     override fun retryRemoteDownload(recordId: UUID, targetUri: Uri) = unavailable()
     override fun deleteRemoteDownloadRecord(recordId: UUID) = Unit
-    override suspend fun openRemoteShell(pcId: UUID, path: String, shellType: RemoteShellType): UUID = unavailable()
+    override suspend fun openRemoteShell(pcId: UUID, path: String, command: TerminalCommandCapability): UUID = unavailable()
     override suspend fun openSession(sessionId: UUID) = unavailable()
     override suspend fun closeSessionView(sessionId: UUID) = Unit
     override fun terminalEngine(sessionId: UUID): TermuxTerminalEngine? = null
