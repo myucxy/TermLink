@@ -161,7 +161,9 @@ Windows hosts、系统 DNS 或 Docker Desktop 全局代理。
 4. 通过 `docker-credential-desktop.exe get` 在内存读取 Docker Hub 凭据，将最小 `config.json` 通过 stdin
    写入容器的 `/root/.docker` tmpfs。不得打印 helper 输出、不得把凭据放进 `docker exec` 参数。
 5. 在同一容器内运行 `buildctl build`，指定 `platform=linux/amd64,linux/arm64`、四个 OCI build args、
-   `attest:provenance=mode=max`、`attest:sbom=` 和 `push=true`。
+   `attest:provenance=mode=max`、`attest:sbom=` 和 `push=true`。本机固定的 BuildKit v0.32.2 `buildctl`
+   没有顶层 `--attest` 参数；两项证明必须作为 Dockerfile frontend 参数传入：
+   `--opt 'attest:provenance=mode=max' --opt 'attest:sbom='`。误用 `--attest` 会在构建和推送开始前直接失败。
 6. 从 `--metadata-file` 读取 index digest；在 `finally` 中先检查 ownership label，再删除精确容器。容器删除后
    tmpfs 凭据随之消失。
 
@@ -175,6 +177,12 @@ Windows hosts、系统 DNS 或 Docker Desktop 全局代理。
 - 每个平台的 attestation manifest 至少包含 `https://spdx.dev/Document` 与
   `https://slsa.dev/provenance/v1`；
 - 记录 index 的 `sha256`，后续部署只使用该摘要。
+
+若主机上的 `docker buildx imagetools inspect` 因 `registry-1.docker.io` 被经典 DNS 解析到无关地址而失败，
+不要修改系统 hosts/DNS，也不要据此判定已经成功的 push 失败。可用一次性本地 Alpine 容器取得公开 pull token：
+仅对 `auth.docker.io` 注入 DoH 验证地址并加入 `NO_PROXY`，Registry 请求继续走 Docker Desktop 代理，然后通过
+Registry API 读取 index、manifest、config blob 和 attestation descriptor。该校验不需要向容器注入 Docker Hub
+写凭据，容器退出后不保留状态。
 
 ## 8. Compose 无损升级
 
