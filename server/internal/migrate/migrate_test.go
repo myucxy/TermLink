@@ -14,7 +14,7 @@ func TestEmbeddedMigrationsAreOrderedAndStable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load() error = %v", err)
 	}
-	if len(items) != 19 || items[0].version != 1 || items[0].name != "000001_production_core.up.sql" ||
+	if len(items) != 20 || items[0].version != 1 || items[0].name != "000001_production_core.up.sql" ||
 		items[1].version != 2 || items[1].name != "000002_pairing_grants.up.sql" ||
 		items[2].version != 3 || items[2].name != "000003_history_uploads.up.sql" ||
 		items[3].version != 4 || items[3].name != "000004_pc_key_epoch.up.sql" ||
@@ -32,7 +32,8 @@ func TestEmbeddedMigrationsAreOrderedAndStable(t *testing.T) {
 		items[15].version != 16 || items[15].name != "000016_transcript_publications.up.sql" ||
 		items[16].version != 17 || items[16].name != "000017_pc_file_operations.up.sql" ||
 		items[17].version != 18 || items[17].name != "000018_pc_file_operations_hardening.up.sql" ||
-		items[18].version != 19 || items[18].name != "000019_pc_supported_shells.up.sql" {
+		items[18].version != 19 || items[18].name != "000019_pc_supported_shells.up.sql" ||
+		items[19].version != 20 || items[19].name != "000020_session_snapshot_diagnostics.up.sql" {
 		t.Fatalf("unexpected migration set: %#v", items)
 	}
 	if items[len(items)-1].version != migrations.LatestVersion {

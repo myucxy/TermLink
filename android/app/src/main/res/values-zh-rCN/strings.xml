@@ -57,6 +57,7 @@
     <string name="terminal_live">实时终端</string><string name="terminal_connecting">连接中</string><string name="terminal_controlling">控制中</string><string name="terminal_live_state">实时</string><string name="terminal_reconnecting">正在重连</string><string name="terminal_read_only">只读</string><string name="terminal_history_gap">历史缺口</string><string name="terminal_exited">已退出</string><string name="terminal_history_loading">正在加载更早输出…</string><string name="terminal_history_unavailable">无法加载更早输出。</string><string name="terminal_history_retry">重试</string>
     <string name="terminal_error_message">[%1$s] %2$s%3$s\n%4$s</string>
     <string name="terminal_error_http_status">（HTTP %1$d）</string>
+    <string name="terminal_error_diagnostic_code">（Agent 诊断：%1$s）</string>
     <string name="terminal_error_session_unavailable">服务器会话列表中已找不到此会话。</string>
     <string name="terminal_error_session_offline">Windows 会话已离线或暂时不可达。</string>
     <string name="terminal_error_session_ended">Windows 命令行会话已经结束。</string>
@@ -79,6 +80,12 @@
     <string name="terminal_error_terminal_renderer">快照包含当前 App 版本无法恢复的终端渲染状态。</string>
     <string name="terminal_error_local_checkpoint">本地加密快照缓存或渲染检查点无法安全绑定。</string>
     <string name="terminal_error_snapshot_install">已验证的快照无法安装到 Android 终端渲染器。</string>
+    <string name="terminal_error_history_not_ready">当前没有可用快照，且加密事件历史尚未上传为从序号 1 开始的连续前缀。</string>
+    <string name="terminal_error_history_gap">当前没有可用快照，且加密事件历史不是从序号 1 开始，或其中存在永久缺口。</string>
+    <string name="terminal_error_history_replay_limit">当前会话没有可用快照，事件前缀超过冷启动最多 4096 个事件的有界回放限制。</string>
+    <string name="terminal_error_history_replay">无法安全校验、解密或应用连续的加密事件历史。</string>
+    <string name="terminal_error_snapshot_unsupported">Windows Agent 已确认当前终端数据暂时无法表示为可移植快照。</string>
+    <string name="terminal_error_snapshot_production_failed">Windows Agent 在生成或持久化可移植终端快照时失败。</string>
     <string name="terminal_error_realtime_connection">无法建立实时会话通道。</string>
     <string name="terminal_error_control_lease">另一个客户端仍持有此会话的控制租约。</string>
     <string name="terminal_error_unknown">由于未分类的本地或传输故障，无法打开会话。</string>
@@ -91,6 +98,8 @@
     <string name="terminal_error_action_check_network">建议：检查 Android 网络和服务器状态后重试。</string>
     <string name="terminal_error_action_retry">建议：重试；若重复出现，请反馈此错误码。</string>
     <string name="terminal_error_action_retry_later">建议：让 Agent 保持在线片刻以发布最新快照，然后重试。</string>
+    <string name="terminal_error_action_wait_history">建议：保持 Windows Agent 在线，并让终端输出短暂停稳，等待加密历史上传完成后重试。</string>
+    <string name="terminal_error_action_republish_history">建议：保持 Windows 在线并产生新的终端输出；若缺口仍存在，请更新 Windows Agent 并反馈此错误码。</string>
     <string name="terminal_error_action_republish">建议：保持 Windows 和 Agent 在线，为此设备重新发布快照。</string>
     <string name="terminal_error_action_refresh_keys">建议：刷新可信设备；若密钥已更新，请让 Windows 发布新快照。</string>
     <string name="terminal_error_action_update">建议：将 Android 和 Windows TermLink 更新到兼容版本。</string>

@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -798,6 +799,8 @@ func (a *API) upsertSession(w http.ResponseWriter, r *http.Request) {
 		Rows                    int        `json:"rows"`
 		LastOutputSequence      uint64     `json:"last_output_seq"`
 		EndedAt                 *time.Time `json:"ended_at"`
+		SnapshotStatus          *string    `json:"snapshot_status"`
+		SnapshotReasonCode      *string    `json:"snapshot_reason_code"`
 		SessionHeartbeatCapable bool       `json:"session_heartbeat_capable"`
 	}
 	if err := decodeJSON(r, &input); err != nil {
@@ -822,10 +825,15 @@ func (a *API) upsertSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 400, "INVALID_SIZE", errors.New("invalid terminal size"))
 		return
 	}
+	if err := validateSessionSnapshotDiagnostic(input.SnapshotStatus, input.SnapshotReasonCode); err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_SNAPSHOT_DIAGNOSTIC", err)
+		return
+	}
 	item := store.SessionRecord{
 		ID: sessionID, PCID: pcID, ShellType: input.ShellType, TitleCipher: title,
 		State: input.State, Columns: input.Columns, Rows: input.Rows,
 		LastOutputSequence: input.LastOutputSequence, EndedAt: input.EndedAt,
+		SnapshotStatus: input.SnapshotStatus, SnapshotReasonCode: input.SnapshotReasonCode,
 		SessionHeartbeatCapable: input.SessionHeartbeatCapable,
 	}
 	if err := a.Store.UpsertSession(r.Context(), p.UserID, p.Device.ID, item); err != nil {
@@ -833,6 +841,31 @@ func (a *API) upsertSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": sessionID})
+}
+
+var safeSnapshotReasonCode = regexp.MustCompile(`^[A-Z0-9_]{1,64}$`)
+
+func validateSessionSnapshotDiagnostic(status, reason *string) error {
+	if status == nil {
+		if reason != nil {
+			return errors.New("snapshot reason requires a status")
+		}
+		return nil
+	}
+	switch *status {
+	case "READY":
+		if reason != nil {
+			return errors.New("ready snapshot status cannot include a reason")
+		}
+		return nil
+	case "PENDING", "UNSUPPORTED", "FAILED":
+		if reason == nil || !safeSnapshotReasonCode.MatchString(*reason) {
+			return errors.New("snapshot status requires a safe bounded reason code")
+		}
+		return nil
+	default:
+		return errors.New("unsupported snapshot status")
+	}
 }
 
 func decodeSessionTitleCipher(encoded *string) ([]byte, error) {

@@ -51,16 +51,22 @@ data class SessionSummary(
     val endedAt: Instant?,
     /** Server-authoritative reachability of this exact session UUID. */
     val online: Boolean = false,
+    /** Safe producer diagnostic metadata; never contains terminal text. */
+    val snapshotStatus: String? = null,
+    val snapshotReasonCode: String? = null,
 ) {
     override fun equals(other: Any?): Boolean =
         other is SessionSummary && id == other.id && pcId == other.pcId &&
             shellType == other.shellType && encryptedTitle.contentEquals(other.encryptedTitle) &&
             state == other.state && columns == other.columns && rows == other.rows &&
             lastOutputSequence == other.lastOutputSequence && createdAt == other.createdAt &&
-            endedAt == other.endedAt && online == other.online
+            endedAt == other.endedAt && online == other.online &&
+            snapshotStatus == other.snapshotStatus && snapshotReasonCode == other.snapshotReasonCode
 
     override fun hashCode(): Int =
-        31 * (31 * id.hashCode() + (encryptedTitle?.contentHashCode() ?: 0)) + online.hashCode()
+        31 * (31 * (31 * (31 * id.hashCode() +
+            (encryptedTitle?.contentHashCode() ?: 0)) + online.hashCode()) +
+            (snapshotStatus?.hashCode() ?: 0)) + (snapshotReasonCode?.hashCode() ?: 0)
 }
 
 data class HistoryObject(

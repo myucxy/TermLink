@@ -36,6 +36,12 @@ enum class SessionOpenFailureCode(
     TERMINAL_RENDERER("TL-H110", false, R.string.terminal_error_terminal_renderer, R.string.terminal_error_action_update),
     LOCAL_CHECKPOINT("TL-H111", true, R.string.terminal_error_local_checkpoint, R.string.terminal_error_action_retry),
     SNAPSHOT_INSTALL("TL-H112", true, R.string.terminal_error_snapshot_install, R.string.terminal_error_action_retry),
+    HISTORY_NOT_READY("TL-H113", true, R.string.terminal_error_history_not_ready, R.string.terminal_error_action_wait_history),
+    HISTORY_GAP("TL-H114", false, R.string.terminal_error_history_gap, R.string.terminal_error_action_republish_history),
+    HISTORY_REPLAY_LIMIT("TL-H115", false, R.string.terminal_error_history_replay_limit, R.string.terminal_error_action_update),
+    HISTORY_REPLAY("TL-H116", true, R.string.terminal_error_history_replay, R.string.terminal_error_action_retry),
+    SNAPSHOT_UNSUPPORTED("TL-H117", false, R.string.terminal_error_snapshot_unsupported, R.string.terminal_error_action_update),
+    SNAPSHOT_PRODUCTION_FAILED("TL-H118", true, R.string.terminal_error_snapshot_production_failed, R.string.terminal_error_action_retry),
     REALTIME_CONNECTION("TL-R001", true, R.string.terminal_error_realtime_connection, R.string.terminal_error_action_check_network),
     CONTROL_LEASE_HELD("TL-C001", true, R.string.terminal_error_control_lease, R.string.terminal_error_action_wait_lease),
     UNKNOWN("TL-X001", true, R.string.terminal_error_unknown, R.string.terminal_error_action_retry),
@@ -45,7 +51,14 @@ data class SessionOpenFailure(
     val code: SessionOpenFailureCode,
     /** Safe transport metadata only. Never store a URL, token, key ID, or terminal text here. */
     val httpStatus: Int? = null,
-)
+    val diagnosticCode: String? = null,
+) {
+    init {
+        require(diagnosticCode == null || diagnosticCode.matches(Regex("[A-Z0-9_]{1,64}"))) {
+            "Session diagnostic code is not safe"
+        }
+    }
+}
 
 internal class SessionOpenException(
     val failure: SessionOpenFailure,
@@ -59,6 +72,9 @@ internal enum class SessionFailureStage {
     SNAPSHOT_PREPARE,
     SNAPSHOT_CHECKPOINT,
     SNAPSHOT_INSTALL,
+    HISTORY_METADATA,
+    HISTORY_DOWNLOAD,
+    HISTORY_REPLAY,
     REALTIME,
     CONTROL,
 }
@@ -83,6 +99,8 @@ internal fun classifySessionOpenException(
             else -> when (stage) {
                 SessionFailureStage.SNAPSHOT_METADATA -> SessionOpenFailureCode.SNAPSHOT_METADATA
                 SessionFailureStage.SNAPSHOT_DOWNLOAD -> SessionOpenFailureCode.SNAPSHOT_DOWNLOAD
+                SessionFailureStage.HISTORY_METADATA -> SessionOpenFailureCode.HISTORY_NOT_READY
+                SessionFailureStage.HISTORY_DOWNLOAD -> SessionOpenFailureCode.HISTORY_REPLAY
                 SessionFailureStage.REALTIME -> SessionOpenFailureCode.REALTIME_CONNECTION
                 else -> SessionOpenFailureCode.SERVER_REJECTED
             }
@@ -120,6 +138,9 @@ internal fun classifySessionOpenException(
         stage == SessionFailureStage.SNAPSHOT_PREPARE -> SessionOpenFailureCode.SNAPSHOT_DECRYPTION
         stage == SessionFailureStage.SNAPSHOT_CHECKPOINT -> SessionOpenFailureCode.LOCAL_CHECKPOINT
         stage == SessionFailureStage.SNAPSHOT_INSTALL -> SessionOpenFailureCode.SNAPSHOT_INSTALL
+        stage == SessionFailureStage.HISTORY_METADATA -> SessionOpenFailureCode.HISTORY_NOT_READY
+        stage == SessionFailureStage.HISTORY_DOWNLOAD || stage == SessionFailureStage.HISTORY_REPLAY ->
+            SessionOpenFailureCode.HISTORY_REPLAY
         stage == SessionFailureStage.REALTIME -> SessionOpenFailureCode.REALTIME_CONNECTION
         stage == SessionFailureStage.CONTROL -> SessionOpenFailureCode.SERVER_REJECTED
         else -> SessionOpenFailureCode.UNKNOWN
@@ -131,7 +152,10 @@ internal fun SessionOpenFailure.localizedMessage(context: Context): String {
     val detail = context.getString(code.detailResource)
     val action = context.getString(code.actionResource)
     val status = httpStatus?.let { context.getString(R.string.terminal_error_http_status, it) }.orEmpty()
-    return context.getString(R.string.terminal_error_message, code.stableCode, detail, status, action)
+    val diagnostic = diagnosticCode
+        ?.let { context.getString(R.string.terminal_error_diagnostic_code, it) }
+        .orEmpty()
+    return context.getString(R.string.terminal_error_message, code.stableCode, detail, status + diagnostic, action)
 }
 
 private inline fun <reified T : Throwable> Throwable.causedBy(): Boolean {

@@ -16,6 +16,7 @@ namespace TermLink.Agent
         public Guid SessionId { get; set; }
         public ulong LastSequence { get; set; }
         public bool SnapshotEligible { get; set; }
+        public bool PermanentlyIneligible { get; set; }
         public string IneligibilityCode { get; set; }
         public int TranscriptPageCount { get; set; }
     }
@@ -166,12 +167,15 @@ namespace TermLink.Agent
             };
             if (state.Model.Columns > MaximumWireColumns || state.Model.Rows > MaximumWireRows)
             {
+                result.PermanentlyIneligible = true;
                 result.IneligibilityCode = "WIRE_DIMENSIONS_UNSUPPORTED";
                 SaveRejectedCheckpoint(result);
                 return result;
             }
             if (!state.Model.TryCreateSnapshot(out var portable))
             {
+                result.PermanentlyIneligible = !string.IsNullOrWhiteSpace(
+                    state.Model.PermanentRejectionCode);
                 result.IneligibilityCode = string.IsNullOrWhiteSpace(state.Model.PermanentRejectionCode)
                     ? state.Model.ParserBoundaryCode
                     : state.Model.PermanentRejectionCode;

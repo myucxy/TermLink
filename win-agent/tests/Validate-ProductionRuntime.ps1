@@ -463,6 +463,29 @@ try {
         $restPropertyNames -contains 'title' -or $restBodyObject.title_cipher -ne '') {
         throw 'REST Session upsert exposed title plaintext or claimed plaintext was title ciphertext.'
     }
+    $snapshotStatusField = $projectionA.GetType().GetField(
+        'SnapshotStatus', [Reflection.BindingFlags]'Instance,Public,NonPublic')
+    $snapshotReasonField = $projectionA.GetType().GetField(
+        'SnapshotReasonCode', [Reflection.BindingFlags]'Instance,Public,NonPublic')
+    if ($null -eq $snapshotStatusField -or $null -eq $snapshotReasonField) {
+        throw 'Session publication snapshot omitted bounded Snapshot diagnostics.'
+    }
+    $snapshotStatusField.SetValue($projectionA, 'UNSUPPORTED')
+    $snapshotReasonField.SetValue($projectionA, 'DCS_UNSUPPORTED')
+    [byte[]]$diagnosticRestBody = $buildSessionUpsertBody.Invoke(
+        $null,
+        [object[]]@([Guid]::Parse('12345678-90ab-cdef-1234-567890abcdef'), $projectionA))
+    $diagnosticRestObject = [Text.Encoding]::UTF8.GetString($diagnosticRestBody) | ConvertFrom-Json
+    if ($diagnosticRestObject.snapshot_status -ne 'UNSUPPORTED' -or
+        $diagnosticRestObject.snapshot_reason_code -ne 'DCS_UNSUPPORTED') {
+        throw 'REST Session upsert omitted safe Snapshot producer diagnostics.'
+    }
+    $normalizeSnapshotReason = Get-InternalMethod $runtimeType 'NormalizeSnapshotReasonCode'
+    if ($normalizeSnapshotReason.Invoke($null, [object[]]@('CSI_PRIVATE_MODE_UNSUPPORTED')) -ne
+            'CSI_PRIVATE_MODE_UNSUPPORTED' -or
+        $normalizeSnapshotReason.Invoke($null, [object[]]@('terminal text')) -ne 'UNKNOWN') {
+        throw 'Snapshot diagnostic reason normalization is not fail-closed.'
+    }
     $titleCipherField = $projectionA.GetType().GetField(
         'TitleCipher',
         [Reflection.BindingFlags]'Instance,Public,NonPublic')

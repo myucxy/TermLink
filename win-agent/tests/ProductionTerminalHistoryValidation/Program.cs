@@ -695,7 +695,8 @@ namespace TermLink.ProductionTerminalHistory.Validation
             var rejected = producer.ProcessSession(sessionId);
             var retained = producer.LoadOutbox(sessionId);
             var retry = producer.PrepareNextUpload(sessionId, recipient);
-            Require(!rejected.SnapshotEligible && rejected.IneligibilityCode == "DCS_UNSUPPORTED" &&
+            Require(!rejected.SnapshotEligible && rejected.PermanentlyIneligible &&
+                rejected.IneligibilityCode == "DCS_UNSUPPORTED" &&
                 retained.SnapshotSequence == eligible.LastSequence &&
                 retry != null && retry.SealedObject.SequenceEqual(pending.SealedObject),
                 "A newer rejected prefix stranded or replaced an incomplete older terminal outbox.");

@@ -5,6 +5,7 @@ import java.io.IOException
 import java.net.SocketTimeoutException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -15,6 +16,16 @@ class SessionOpenFailureTest {
 
         assertEquals(codes.size, codes.toSet().size)
         assertTrue(codes.all { it.matches(Regex("TL-[A-Z][0-9]{3}")) })
+        assertThrows(IllegalArgumentException::class.java) {
+            SessionOpenFailure(SessionOpenFailureCode.HISTORY_NOT_READY, diagnosticCode = "terminal text")
+        }
+        assertEquals(
+            "CSI_PRIVATE_MODE_UNSUPPORTED",
+            SessionOpenFailure(
+                SessionOpenFailureCode.HISTORY_NOT_READY,
+                diagnosticCode = "CSI_PRIVATE_MODE_UNSUPPORTED",
+            ).diagnosticCode,
+        )
     }
 
     @Test
@@ -95,6 +106,27 @@ class SessionOpenFailureTest {
         val original = sessionOpenException(SessionOpenFailureCode.TERMINAL_RENDERER)
 
         assertTrue(classifySessionOpenException(original, SessionFailureStage.CONTROL) === original)
+    }
+
+    @Test
+    fun historyFailuresRemainSeparateFromSnapshotAndRealtimeFailures() {
+        assertClassified(
+            SessionOpenFailureCode.HISTORY_NOT_READY,
+            classifySessionOpenException(
+                TermLinkApiException(503, "HISTORY_UNAVAILABLE", null),
+                SessionFailureStage.HISTORY_METADATA,
+            ),
+        )
+        assertClassified(
+            SessionOpenFailureCode.HISTORY_REPLAY,
+            classifySessionOpenException(
+                IllegalStateException("history replay failed"),
+                SessionFailureStage.HISTORY_REPLAY,
+            ),
+        )
+        assertTrue(SessionOpenFailureCode.HISTORY_NOT_READY.retryable)
+        assertFalse(SessionOpenFailureCode.HISTORY_GAP.retryable)
+        assertFalse(SessionOpenFailureCode.HISTORY_REPLAY_LIMIT.retryable)
     }
 
     private fun assertClassified(expected: SessionOpenFailureCode, error: SessionOpenException) {

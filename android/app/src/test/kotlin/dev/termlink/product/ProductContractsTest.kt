@@ -66,6 +66,13 @@ class ProductContractsTest {
             "/v1/sessions/$sessionId/history?kind=chunk&limit=50",
             sessionChunkHistoryRequestPath(sessionId),
         )
+        assertEquals(
+            "/v1/sessions/$sessionId/history?cursor=page%2B2%2F%3D&limit=50",
+            sessionChunkHistoryRequestPath(sessionId, "page+2/="),
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            sessionChunkHistoryRequestPath(sessionId, " ")
+        }
 
         val page = buildJsonObject {
             putJsonArray("items") {

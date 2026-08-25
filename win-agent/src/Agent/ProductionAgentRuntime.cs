@@ -86,6 +86,8 @@ namespace TermLink.Agent
             public DateTime LastRestConfirmedUtc;
             public ulong LastRestConfirmedOutputSequence;
             public ulong TailFirstSnapshotPublicationSequence;
+            public string SnapshotStatus;
+            public string SnapshotReasonCode;
         }
         private sealed class SessionPublicationSnapshot
         {
@@ -102,6 +104,8 @@ namespace TermLink.Agent
             public ulong LastOutputSequence;
             public ulong LastEventSequence;
             public DateTimeOffset? EndedAt;
+            public string SnapshotStatus;
+            public string SnapshotReasonCode;
         }
         private sealed class Subscriber
         {
@@ -1317,6 +1321,7 @@ namespace TermLink.Agent
                     catch (Exception error)
                     {
                         terminalHistoryPersistenceFailures[pending.Key] = error.GetType().Name;
+                        ObserveTerminalSnapshotFailure(pending.Key);
                         historyReconcileSessions[pending.Key] = 0;
                         pendingHistorySessions[pending.Key] = 0;
                         retry = true;
@@ -1439,7 +1444,9 @@ namespace TermLink.Agent
                 ExitCode = state.ExitCode,
                 LastOutputSequence = state.LastOutputSequence,
                 LastEventSequence = state.LastEventSequence,
-                EndedAt = state.EndedAt
+                EndedAt = state.EndedAt,
+                SnapshotStatus = state.SnapshotStatus,
+                SnapshotReasonCode = state.SnapshotReasonCode
             };
         }
 
@@ -1482,12 +1489,56 @@ namespace TermLink.Agent
             var publicationSequence = production.SnapshotEligible
                 ? production.LastSequence
                 : 0UL;
+            var snapshotStatus = production.SnapshotEligible
+                ? "READY"
+                : production.PermanentlyIneligible ? "UNSUPPORTED" : "PENDING";
+            var snapshotReasonCode = production.SnapshotEligible
+                ? null
+                : NormalizeSnapshotReasonCode(production.IneligibilityCode);
             var changed = false;
             lock (state.Sync)
             {
-                if (state.TailFirstSnapshotPublicationSequence != publicationSequence)
+                if (state.TailFirstSnapshotPublicationSequence != publicationSequence ||
+                    !string.Equals(state.SnapshotStatus, snapshotStatus, StringComparison.Ordinal) ||
+                    !string.Equals(state.SnapshotReasonCode, snapshotReasonCode, StringComparison.Ordinal))
                 {
                     state.TailFirstSnapshotPublicationSequence = publicationSequence;
+                    state.SnapshotStatus = snapshotStatus;
+                    state.SnapshotReasonCode = snapshotReasonCode;
+                    MarkRestDirtyLocked(state);
+                    changed = true;
+                }
+            }
+            if (!changed) return;
+            try { metadataSignal.Release(); }
+            catch (SemaphoreFullException) { }
+            catch (ObjectDisposedException) { }
+        }
+
+        internal static string NormalizeSnapshotReasonCode(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value) || value.Length > 64) return "UNKNOWN";
+            for (var index = 0; index < value.Length; index++)
+            {
+                var item = value[index];
+                if ((item < 'A' || item > 'Z') && (item < '0' || item > '9') && item != '_')
+                    return "UNKNOWN";
+            }
+            return value;
+        }
+
+        private void ObserveTerminalSnapshotFailure(Guid sessionId)
+        {
+            if (!terminalSnapshotEnabled || sessionId == Guid.Empty ||
+                !publicationStates.TryGetValue(sessionId, out var state)) return;
+            var changed = false;
+            lock (state.Sync)
+            {
+                if (!string.Equals(state.SnapshotStatus, "FAILED", StringComparison.Ordinal) ||
+                    !string.Equals(state.SnapshotReasonCode, "HISTORY_PRODUCTION_FAILED", StringComparison.Ordinal))
+                {
+                    state.SnapshotStatus = "FAILED";
+                    state.SnapshotReasonCode = "HISTORY_PRODUCTION_FAILED";
                     MarkRestDirtyLocked(state);
                     changed = true;
                 }
@@ -1885,6 +1936,8 @@ namespace TermLink.Agent
                 rows = snapshot.Rows,
                 last_output_seq = snapshot.LastOutputSequence,
                 ended_at = snapshot.EndedAt,
+                snapshot_status = snapshot.SnapshotStatus,
+                snapshot_reason_code = snapshot.SnapshotReasonCode,
                 session_heartbeat_capable = true
             });
         }

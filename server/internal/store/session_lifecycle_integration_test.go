@@ -73,15 +73,20 @@ func TestUpsertSessionKeepsTerminalStatesAndOutputCursorMonotonic(t *testing.T) 
 		}
 	}
 	expectedTitleCipher := []byte("encrypted-session-title-v1")
+	unsupported, unsupportedReason := "UNSUPPORTED", "DCS_UNSUPPORTED"
+	wantSnapshotStatus := &unsupported
+	wantSnapshotReason := &unsupportedReason
 	read := func(wantState string, wantSequence uint64, wantEndedAt *time.Time) {
 		t.Helper()
 		var state string
 		var sequence int64
 		var endedAt *time.Time
 		var titleCipher []byte
+		var snapshotStatus, snapshotReason *string
 		if err := repository.Pool.QueryRow(ctx,
-			`SELECT state,last_output_seq,ended_at,title_cipher FROM sessions WHERE id=$1`, sessionID).
-			Scan(&state, &sequence, &endedAt, &titleCipher); err != nil {
+			`SELECT state,last_output_seq,ended_at,title_cipher,snapshot_status,snapshot_reason_code
+			 FROM sessions WHERE id=$1`, sessionID).
+			Scan(&state, &sequence, &endedAt, &titleCipher, &snapshotStatus, &snapshotReason); err != nil {
 			t.Fatal(err)
 		}
 		if state != wantState {
@@ -99,11 +104,19 @@ func TestUpsertSessionKeepsTerminalStatesAndOutputCursorMonotonic(t *testing.T) 
 		if string(titleCipher) != string(expectedTitleCipher) {
 			t.Fatalf("title_cipher=%q, want preserved encrypted title %q", titleCipher, expectedTitleCipher)
 		}
+		if wantSnapshotStatus == nil && snapshotStatus != nil ||
+			wantSnapshotStatus != nil && (snapshotStatus == nil || *snapshotStatus != *wantSnapshotStatus) ||
+			wantSnapshotReason == nil && snapshotReason != nil ||
+			wantSnapshotReason != nil && (snapshotReason == nil || *snapshotReason != *wantSnapshotReason) {
+			t.Fatalf("snapshot diagnostic=%v/%v, want %v/%v",
+				snapshotStatus, snapshotReason, wantSnapshotStatus, wantSnapshotReason)
+		}
 	}
 
 	if err := repository.UpsertSession(ctx, userID, deviceID, SessionRecord{
 		ID: sessionID, PCID: pcID, ShellType: "powershell", TitleCipher: expectedTitleCipher,
 		State: "RUNNING", Columns: 120, Rows: 40, LastOutputSequence: 1,
+		SnapshotStatus: &unsupported, SnapshotReasonCode: &unsupportedReason,
 	}); err != nil {
 		t.Fatalf("initial title upsert: %v", err)
 	}
@@ -126,6 +139,20 @@ func TestUpsertSessionKeepsTerminalStatesAndOutputCursorMonotonic(t *testing.T) 
 	read("RUNNING", 3, nil)
 	upsert("RUNNING", 4, nil)
 	read("RUNNING", 4, nil)
+
+	ready := "READY"
+	if err := repository.UpsertSession(ctx, userID, deviceID, SessionRecord{
+		ID: sessionID, PCID: pcID, ShellType: "powershell",
+		State: "RUNNING", Columns: 120, Rows: 40, LastOutputSequence: 5,
+		SnapshotStatus: &ready,
+	}); err != nil {
+		t.Fatalf("ready snapshot diagnostic upsert: %v", err)
+	}
+	wantSnapshotStatus, wantSnapshotReason = &ready, nil
+	read("RUNNING", 5, nil)
+	// Later rolling-compatible metadata that omits diagnostics preserves READY.
+	upsert("RUNNING", 6, nil)
+	read("RUNNING", 6, nil)
 
 	endedAt := time.Now().UTC().Truncate(time.Microsecond)
 	upsert("EXITED", 10, &endedAt)

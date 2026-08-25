@@ -755,6 +755,8 @@ type SessionRecord struct {
 	Columns                 int        `json:"columns"`
 	Rows                    int        `json:"rows"`
 	LastOutputSequence      uint64     `json:"last_output_seq"`
+	SnapshotStatus          *string    `json:"snapshot_status,omitempty"`
+	SnapshotReasonCode      *string    `json:"snapshot_reason_code,omitempty"`
 	SessionHeartbeatCapable bool       `json:"session_heartbeat_capable,omitempty"`
 	Online                  bool       `json:"online"`
 	CreatedAt               time.Time  `json:"created_at"`
@@ -811,13 +813,24 @@ func (s *Postgres) upsertSessionOnce(ctx context.Context, userID, deviceID uuid.
 	heartbeat := item.SessionHeartbeatCapable && pcHeartbeatCapable
 	command, err := tx.Exec(ctx, `
 		INSERT INTO sessions(
-			id,pc_id,shell_type,title_cipher,state,columns,rows,last_output_seq,ended_at,last_seen_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CASE WHEN $10 THEN now() END)
+			id,pc_id,shell_type,title_cipher,state,columns,rows,last_output_seq,ended_at,
+			snapshot_status,snapshot_reason_code,last_seen_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,CASE WHEN $12 THEN now() END)
 		ON CONFLICT(id) DO UPDATE SET
 			title_cipher=CASE
 				WHEN sessions.state='DELETED' AND sessions.deletion_reason IS DISTINCT FROM 'AUTO_STALE' THEN sessions.title_cipher
-				WHEN NOT $11 THEN sessions.title_cipher
+				WHEN NOT $13 THEN sessions.title_cipher
 				ELSE excluded.title_cipher
+			END,
+			snapshot_status=CASE
+				WHEN sessions.state='DELETED' AND sessions.deletion_reason IS DISTINCT FROM 'AUTO_STALE' THEN sessions.snapshot_status
+				WHEN NOT $14 THEN sessions.snapshot_status
+				ELSE excluded.snapshot_status
+			END,
+			snapshot_reason_code=CASE
+				WHEN sessions.state='DELETED' AND sessions.deletion_reason IS DISTINCT FROM 'AUTO_STALE' THEN sessions.snapshot_reason_code
+				WHEN NOT $14 THEN sessions.snapshot_reason_code
+				ELSE excluded.snapshot_reason_code
 			END,
 			state=CASE
 				WHEN sessions.state='DELETED' AND sessions.deletion_reason='AUTO_STALE' THEN excluded.state
@@ -846,7 +859,7 @@ func (s *Postgres) upsertSessionOnce(ctx context.Context, userID, deviceID uuid.
 			END,
 			last_seen_at=CASE
 				WHEN sessions.state='DELETED' AND sessions.deletion_reason IS DISTINCT FROM 'AUTO_STALE' THEN sessions.last_seen_at
-				WHEN $10 OR (sessions.state='DELETED' AND sessions.deletion_reason='AUTO_STALE') THEN now()
+				WHEN $12 OR (sessions.state='DELETED' AND sessions.deletion_reason='AUTO_STALE') THEN now()
 				ELSE sessions.last_seen_at
 			END,
 			deleted_at=CASE
@@ -858,7 +871,9 @@ func (s *Postgres) upsertSessionOnce(ctx context.Context, userID, deviceID uuid.
 				ELSE sessions.deletion_reason
 			END
 		WHERE sessions.pc_id=$2`, item.ID, item.PCID, item.ShellType, item.TitleCipher, item.State,
-		item.Columns, item.Rows, int64(item.LastOutputSequence), item.EndedAt, heartbeat, item.TitleCipher != nil)
+		item.Columns, item.Rows, int64(item.LastOutputSequence), item.EndedAt,
+		item.SnapshotStatus, item.SnapshotReasonCode, heartbeat, item.TitleCipher != nil,
+		item.SnapshotStatus != nil)
 	if err != nil {
 		return err
 	}
@@ -883,7 +898,7 @@ func (s *Postgres) ListSessionsIncludingEnded(ctx context.Context, userID, devic
 func (s *Postgres) listSessions(ctx context.Context, userID, deviceID, pcID uuid.UUID, includeEnded bool) ([]SessionRecord, error) {
 	rows, err := s.Pool.Query(ctx, `
 		SELECT s.id,s.pc_id,s.shell_type,s.title_cipher,s.state,s.columns,s.rows,s.last_output_seq,
-		       s.created_at,s.last_seen_at,s.ended_at,presence.online
+		       s.snapshot_status,s.snapshot_reason_code,s.created_at,s.last_seen_at,s.ended_at,presence.online
 		FROM sessions s
 		JOIN pcs p ON p.id=s.pc_id
 		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
@@ -917,7 +932,8 @@ func (s *Postgres) listSessions(ctx context.Context, userID, deviceID, pcID uuid
 		var i SessionRecord
 		var seq int64
 		if err := rows.Scan(&i.ID, &i.PCID, &i.ShellType, &i.TitleCipher, &i.State, &i.Columns,
-			&i.Rows, &seq, &i.CreatedAt, &i.LastSeenAt, &i.EndedAt, &i.Online); err != nil {
+			&i.Rows, &seq, &i.SnapshotStatus, &i.SnapshotReasonCode,
+			&i.CreatedAt, &i.LastSeenAt, &i.EndedAt, &i.Online); err != nil {
 			return nil, err
 		}
 		i.LastOutputSequence = uint64(seq)

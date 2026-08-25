@@ -59,6 +59,77 @@ class TerminalSnapshotBootstrapTest {
     }
 
     @Test
+    fun permanentSnapshotRejectionSettlesReadinessWithoutDelayingChunkFallback() {
+        assertTrue(snapshotReadinessIsSettled(snapshotAvailable = true, failure = null))
+        assertTrue(
+            snapshotReadinessIsSettled(
+                snapshotAvailable = false,
+                failure = SessionOpenFailure(SessionOpenFailureCode.SNAPSHOT_UNSUPPORTED),
+            ),
+        )
+        assertFalse(
+            snapshotReadinessIsSettled(
+                snapshotAvailable = false,
+                failure = SessionOpenFailure(SessionOpenFailureCode.SNAPSHOT_PRODUCTION_FAILED),
+            ),
+        )
+        assertFalse(snapshotReadinessIsSettled(snapshotAvailable = false, failure = null))
+    }
+
+    @Test
+    fun boundedReplayRequiresAnExactPrefixAndDistinguishesPendingGapAndLimit() {
+        assertEquals(
+            BoundedEventReplayReadiness.READY,
+            boundedEventReplayReadiness(
+                listOf(HistorySequenceRange(37uL, 269uL), HistorySequenceRange(1uL, 36uL)),
+                throughSequence = 268uL,
+            ),
+        )
+        assertEquals(
+            BoundedEventReplayReadiness.NOT_YET_COMPLETE,
+            boundedEventReplayReadiness(
+                listOf(HistorySequenceRange(1uL, 32uL), HistorySequenceRange(33uL, 39uL)),
+                throughSequence = 2_716uL,
+            ),
+        )
+        assertEquals(
+            BoundedEventReplayReadiness.GAP,
+            boundedEventReplayReadiness(
+                listOf(HistorySequenceRange(2uL, 40uL)),
+                throughSequence = 40uL,
+            ),
+        )
+        assertEquals(
+            BoundedEventReplayReadiness.GAP,
+            boundedEventReplayReadiness(
+                listOf(HistorySequenceRange(1uL, 20uL), HistorySequenceRange(20uL, 40uL)),
+                throughSequence = 40uL,
+            ),
+        )
+        assertEquals(
+            BoundedEventReplayReadiness.GAP,
+            boundedEventReplayReadiness(
+                listOf(HistorySequenceRange(1uL, 40uL), HistorySequenceRange(20uL, 40uL)),
+                throughSequence = 40uL,
+            ),
+        )
+        assertEquals(
+            BoundedEventReplayReadiness.READY,
+            boundedEventReplayReadiness(
+                listOf(HistorySequenceRange(1uL, 40uL), HistorySequenceRange(41uL, 50uL)),
+                throughSequence = 40uL,
+            ),
+        )
+        assertEquals(
+            BoundedEventReplayReadiness.LIMIT_EXCEEDED,
+            boundedEventReplayReadiness(
+                listOf(HistorySequenceRange(1uL, 4_097uL)),
+                throughSequence = 4_097uL,
+            ),
+        )
+    }
+
+    @Test
     fun staleZeroCatalogCannotReplayFromZeroAfterReadinessObservesOutput() = runBlocking {
         data class Observation(val tail: ULong, val snapshotReady: Boolean)
 

@@ -185,6 +185,7 @@
     <string name="terminal_history_retry">Retry</string>
     <string name="terminal_error_message">[%1$s] %2$s%3$s\n%4$s</string>
     <string name="terminal_error_http_status"> (HTTP %1$d)</string>
+    <string name="terminal_error_diagnostic_code"> (Agent diagnostic: %1$s)</string>
     <string name="terminal_error_session_unavailable">This session is no longer present in the server catalog.</string>
     <string name="terminal_error_session_offline">The Windows session is offline or temporarily unreachable.</string>
     <string name="terminal_error_session_ended">The Windows command-line session has ended.</string>
@@ -207,6 +208,12 @@
     <string name="terminal_error_terminal_renderer">The snapshot contains terminal rendering state that this app version cannot restore.</string>
     <string name="terminal_error_local_checkpoint">The local encrypted snapshot cache or renderer checkpoint could not be bound safely.</string>
     <string name="terminal_error_snapshot_install">The verified snapshot could not be installed into the Android terminal renderer.</string>
+    <string name="terminal_error_history_not_ready">No current snapshot is available and the encrypted event history has not finished uploading a continuous prefix yet.</string>
+    <string name="terminal_error_history_gap">No current snapshot is available and the encrypted event history does not start at sequence 1 or contains a permanent gap.</string>
+    <string name="terminal_error_history_replay_limit">The session has no current snapshot and its event prefix exceeds the bounded 4096-event cold-start replay limit.</string>
+    <string name="terminal_error_history_replay">The continuous encrypted event history could not be verified, decrypted, or applied safely.</string>
+    <string name="terminal_error_snapshot_unsupported">The Windows Agent determined that this terminal stream cannot currently be represented as a portable snapshot.</string>
+    <string name="terminal_error_snapshot_production_failed">The Windows Agent failed while producing or persisting the portable terminal snapshot.</string>
     <string name="terminal_error_realtime_connection">The realtime session channel could not be established.</string>
     <string name="terminal_error_control_lease">Another client still holds the session control lease.</string>
     <string name="terminal_error_unknown">The session could not be opened because of an unclassified local or transport failure.</string>
@@ -219,6 +226,8 @@
     <string name="terminal_error_action_check_network">Action: check Android networking and server availability, then retry.</string>
     <string name="terminal_error_action_retry">Action: retry; if it repeats, report the displayed error code.</string>
     <string name="terminal_error_action_retry_later">Action: keep the Agent online briefly so it can publish a current snapshot, then retry.</string>
+    <string name="terminal_error_action_wait_history">Action: keep the Windows Agent online and let terminal output settle briefly so encrypted history can finish uploading, then retry.</string>
+    <string name="terminal_error_action_republish_history">Action: keep Windows online and create fresh output; if the gap remains, update the Windows Agent and report this code.</string>
     <string name="terminal_error_action_republish">Action: keep Windows and the Agent online to republish a snapshot for this device.</string>
     <string name="terminal_error_action_refresh_keys">Action: refresh trusted devices; if keys changed, let Windows publish a new snapshot.</string>
     <string name="terminal_error_action_update">Action: update TermLink on Android and Windows to compatible versions.</string>
