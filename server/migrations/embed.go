@@ -4,6 +4,12 @@ package migrations
 
 import "embed"
 
+// LatestVersion is shared by migration loading and runtime schema validation.
+// TestEmbeddedMigrationsAreOrderedAndStable requires the newest embedded file
+// to match it, preventing a migration from making the deployed server reject
+// the schema it just applied.
+const LatestVersion int64 = 19
+
 // Files contains all versioned up/down migration scripts.
 //
 //go:embed *.sql

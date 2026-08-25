@@ -35,6 +35,10 @@ func TestEmbeddedMigrationsAreOrderedAndStable(t *testing.T) {
 		items[18].version != 19 || items[18].name != "000019_pc_supported_shells.up.sql" {
 		t.Fatalf("unexpected migration set: %#v", items)
 	}
+	if items[len(items)-1].version != migrations.LatestVersion {
+		t.Fatalf("latest embedded migration = %d, runtime schema version = %d",
+			items[len(items)-1].version, migrations.LatestVersion)
+	}
 	for _, item := range items {
 		if len(item.checksum) != 64 {
 			t.Fatalf("migration %d checksum length = %d", item.version, len(item.checksum))

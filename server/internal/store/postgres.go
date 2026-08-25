@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/billing"
+	"github.com/termlink/termlink/server/migrations"
 )
 
 var (
@@ -57,7 +58,7 @@ const (
 // back to PC presence until they advertise that capability.
 const sessionOnlineWindow = 45 * time.Second
 
-const latestSchemaVersion int64 = 18
+const latestSchemaVersion int64 = migrations.LatestVersion
 
 type Postgres struct {
 	Pool *pgxpool.Pool
