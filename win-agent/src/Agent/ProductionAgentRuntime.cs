@@ -746,9 +746,41 @@ namespace TermLink.Agent
             });
         }
 
+        internal static byte[] BuildPCUpsertBodyWithCapabilities(
+            string pcName,
+            string agentVersion,
+            long keyEpoch,
+            string[] supportedShells)
+        {
+            if (string.IsNullOrWhiteSpace(pcName)) throw new ArgumentException("A PC name is required.", nameof(pcName));
+            if (string.IsNullOrWhiteSpace(agentVersion)) throw new ArgumentException("An Agent version is required.", nameof(agentVersion));
+            if (keyEpoch < 1) throw new ArgumentOutOfRangeException(nameof(keyEpoch));
+            if (supportedShells == null) throw new ArgumentNullException(nameof(supportedShells));
+
+            var normalizedShells = supportedShells
+                .Select(value => value ?? string.Empty)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            foreach (var shell in normalizedShells)
+                ManagedTerminalLauncher.ValidateShellType(shell);
+
+            return JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                name = pcName,
+                agent_version = agentVersion,
+                key_epoch = keyEpoch,
+                session_heartbeat_capable = true,
+                supported_shells = normalizedShells
+            });
+        }
+
         private async Task UpsertPCAsync(CancellationToken token)
         {
-            var body = BuildPCUpsertBody(config.PcName, config.AgentVersion, config.KeyEpoch);
+            var body = BuildPCUpsertBodyWithCapabilities(
+                config.PcName,
+                config.AgentVersion,
+                config.KeyEpoch,
+                ManagedTerminalLauncher.DetectSupportedShellTypes());
             try
             {
                 using var response = await SendAsync(

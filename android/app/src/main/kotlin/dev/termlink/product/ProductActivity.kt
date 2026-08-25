@@ -844,6 +844,20 @@ fun ProductApp(
 ) {
     val context = LocalContext.current
     val snapshot by repository.snapshot.collectAsStateCompat()
+    val remoteDirectoryFavoriteStore = remember(context) {
+        SharedPreferencesRemoteDirectoryFavoriteStore(context)
+    }
+    val remoteDirectoryFavoriteScope = remoteDirectoryFavoriteAccountScope(
+        snapshot.serverUrl,
+        snapshot.accountLabel,
+    )
+    var remoteDirectoryFavorites by remember(remoteDirectoryFavoriteScope) {
+        mutableStateOf(
+            remoteDirectoryFavoriteScope
+                ?.let(remoteDirectoryFavoriteStore::load)
+                .orEmpty(),
+        )
+    }
     val restoredNavigation = remember(context) { loadProductNavigationState(context) }
     var destinationName by rememberSaveable {
         mutableStateOf(restoredNavigation.primaryDestination.destination().name)
@@ -1001,7 +1015,8 @@ fun ProductApp(
             throw error
         } catch (error: Throwable) {
             snackbarHostState.showSnackbar(
-                safeOperationMessage(error, unavailableOperationMessage, activeSessionDeleteMessage),
+                (error as? SessionOpenException)?.failure?.localizedMessage(context)
+                    ?: safeOperationMessage(error, unavailableOperationMessage, activeSessionDeleteMessage),
             )
         }
     }
@@ -1218,9 +1233,9 @@ fun ProductApp(
                     onHistorySelected = { selectedHistoryId = it.historyObject.id.toString() },
                     onOpenSessions = { navigateTo(ProductDestination.SESSIONS) },
                     onOpenHistory = { navigateTo(ProductDestination.HISTORY) },
-                    onOpenAccount = { navigateTo(ProductDestination.ACCOUNT) },
                     selectedRemotePcId = selectedRemotePcId,
                     selectedRemotePcName = selectedRemotePcName,
+                    remoteDirectoryFavorites = remoteDirectoryFavorites,
                     expandedPcIds = expandedPcIds,
                     onTogglePcExpanded = { pcId ->
                         val value = pcId.toString()
@@ -1235,10 +1250,42 @@ fun ProductApp(
                             repository.browseRemoteDirectory(pc.id, pc.name, "", null)
                         }
                     },
-                    onOpenPcDownloads = { pc ->
-                        selectedRemotePcId = pc.id.toString()
-                        selectedRemotePcName = pc.name
+                    onOpenDownloads = {
+                        selectedRemotePcId = null
+                        selectedRemotePcName = ""
                         navigateTo(ProductDestination.DOWNLOADS)
+                    },
+                    onOpenRemoteFavorite = { favorite ->
+                        val currentPcName = snapshot.pcs.firstOrNull { pc -> pc.id == favorite.pcId }
+                            ?.name
+                            ?: favorite.pcName
+                        selectedRemotePcId = favorite.pcId.toString()
+                        selectedRemotePcName = currentPcName
+                        navigateTo(ProductDestination.FILES)
+                        runOperation {
+                            repository.browseRemoteDirectory(
+                                favorite.pcId,
+                                currentPcName,
+                                favorite.path,
+                                null,
+                            )
+                        }
+                    },
+                    onToggleRemoteFavorite = { pcId, pcName, entry ->
+                        val accountScope = remoteDirectoryFavoriteScope
+                        if (accountScope != null && entry.kind == RemoteFileKind.DIRECTORY) {
+                            val next = toggleRemoteDirectoryFavorite(
+                                remoteDirectoryFavorites,
+                                RemoteDirectoryFavorite(
+                                    pcId = pcId,
+                                    pcName = pcName,
+                                    directoryName = entry.name,
+                                    path = entry.path,
+                                ),
+                            )
+                            remoteDirectoryFavoriteStore.save(accountScope, next)
+                            remoteDirectoryFavorites = next
+                        }
                     },
                     onBrowseRemoteDirectory = { pcId, pcName, path, offset ->
                         runOperation { repository.browseRemoteDirectory(pcId, pcName, path, offset) }
@@ -2682,13 +2729,15 @@ private fun ProductContent(
     onHistorySelected: (HistoryEntry) -> Unit,
     onOpenSessions: () -> Unit,
     onOpenHistory: () -> Unit,
-    onOpenAccount: () -> Unit,
     selectedRemotePcId: String?,
     selectedRemotePcName: String,
+    remoteDirectoryFavorites: List<RemoteDirectoryFavorite>,
     expandedPcIds: Set<String>,
     onTogglePcExpanded: (java.util.UUID) -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
-    onOpenPcDownloads: (PcSummary) -> Unit,
+    onOpenDownloads: () -> Unit,
+    onOpenRemoteFavorite: (RemoteDirectoryFavorite) -> Unit,
+    onToggleRemoteFavorite: (java.util.UUID, String, RemoteFileEntry) -> Unit,
     onBrowseRemoteDirectory: (java.util.UUID, String, String, Long?) -> Unit,
     onDownloadRemoteEntry: (java.util.UUID, String, RemoteFileEntry) -> Unit,
     onOpenRemoteShell: (java.util.UUID, String, RemoteShellType) -> Unit,
@@ -2717,33 +2766,41 @@ private fun ProductContent(
         runCatching { java.util.UUID.fromString(value) }.getOrNull()
     }
     if (destination == ProductDestination.FILES && remotePcId != null) {
+        val remotePc = snapshot.pcs.firstOrNull { pc -> pc.id == remotePcId }
+        val remotePcName = remotePc?.name ?: selectedRemotePcName
         val state = snapshot.remoteFileBrowser.let { current ->
             if (current.pcId == remotePcId) current else RemoteFileBrowserState(
                 pcId = remotePcId,
-                pcName = selectedRemotePcName,
+                pcName = remotePcName,
             )
         }
         RemoteFileBrowserPage(
             state = state,
+            supportedShells = remotePc?.let(::supportedRemoteShellTypes).orEmpty(),
+            favorites = remoteDirectoryFavorites,
             onOpenDirectory = { path ->
-                onBrowseRemoteDirectory(remotePcId, selectedRemotePcName, path, null)
+                onBrowseRemoteDirectory(remotePcId, remotePcName, path, null)
             },
+            onOpenFavorite = onOpenRemoteFavorite,
             onLoadMore = { path, offset ->
-                onBrowseRemoteDirectory(remotePcId, selectedRemotePcName, path, offset)
+                onBrowseRemoteDirectory(remotePcId, remotePcName, path, offset)
             },
             onRefresh = { path ->
-                onBrowseRemoteDirectory(remotePcId, selectedRemotePcName, path, null)
+                onBrowseRemoteDirectory(remotePcId, remotePcName, path, null)
             },
-            onDownload = { entry -> onDownloadRemoteEntry(remotePcId, selectedRemotePcName, entry) },
+            onDownload = { entry -> onDownloadRemoteEntry(remotePcId, remotePcName, entry) },
             onOpenShell = { path, shell -> onOpenRemoteShell(remotePcId, path, shell) },
+            onToggleFavorite = { entry ->
+                onToggleRemoteFavorite(remotePcId, remotePcName, entry)
+            },
             modifier = modifier.fillMaxSize(),
         )
         return
     }
-    if (destination == ProductDestination.DOWNLOADS && remotePcId != null) {
+    if (destination == ProductDestination.DOWNLOADS) {
         RemoteDownloadCenterPage(
             pcId = remotePcId,
-            pcName = selectedRemotePcName,
+            pcName = selectedRemotePcName.takeIf(String::isNotBlank),
             records = snapshot.remoteDownloads,
             onCancel = onCancelRemoteDownload,
             onRetry = onRetryRemoteDownload,
@@ -2796,9 +2853,8 @@ private fun ProductContent(
                 onOpenSession = { sessionId ->
                     if (onSessionSelected(sessionId)) onOpenSessions()
                 },
-                onOpenAccount = onOpenAccount,
+                onOpenDownloads = onOpenDownloads,
                 onBrowsePc = onBrowsePc,
-                onOpenPcDownloads = onOpenPcDownloads,
                 onOpenCommandSearch = onOpenCommandSearch,
                 onStopSessionRequested = onStopSessionRequested,
                 onDeleteSessionRequested = onDeleteSessionRequested,
@@ -2853,7 +2909,7 @@ private fun HiddenProductDestinationPage() {
 }
 
 @Composable
-private fun PrimaryHomeHeader(onOpenAccount: () -> Unit) {
+private fun PrimaryHomeHeader(onOpenDownloads: () -> Unit) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.Top,
@@ -2863,8 +2919,8 @@ private fun PrimaryHomeHeader(onOpenAccount: () -> Unit) {
             Text(stringResource(R.string.home_greeting), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.secondary)
             Text(stringResource(R.string.home_title), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
         }
-        IconButton(onClick = onOpenAccount, modifier = Modifier.size(48.dp)) {
-            Icon(Icons.Filled.AccountCircle, contentDescription = stringResource(R.string.action_account_settings), modifier = Modifier.size(30.dp))
+        IconButton(onClick = onOpenDownloads, modifier = Modifier.size(48.dp)) {
+            Icon(Icons.Filled.Download, contentDescription = stringResource(R.string.action_download_center), modifier = Modifier.size(30.dp))
         }
     }
 }
@@ -2875,14 +2931,13 @@ private fun DevicesPage(
     expandedPcIds: Set<String>,
     onTogglePcExpanded: (java.util.UUID) -> Unit,
     onOpenSession: (java.util.UUID) -> Unit,
-    onOpenAccount: () -> Unit,
+    onOpenDownloads: () -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
-    onOpenPcDownloads: (PcSummary) -> Unit,
     onOpenCommandSearch: () -> Unit,
     onStopSessionRequested: (java.util.UUID) -> Unit,
     onDeleteSessionRequested: (java.util.UUID) -> Unit,
 ) {
-    PrimaryHomeHeader(onOpenAccount = onOpenAccount)
+    PrimaryHomeHeader(onOpenDownloads = onOpenDownloads)
     OutlinedButton(
         onClick = onOpenCommandSearch,
         modifier = Modifier
@@ -2920,7 +2975,6 @@ private fun DevicesPage(
                 onToggleExpanded = { onTogglePcExpanded(pc.id) },
                 onOpenSession = onOpenSession,
                 onBrowseFiles = { onBrowsePc(pc) },
-                onOpenDownloads = { onOpenPcDownloads(pc) },
                 onStopSessionRequested = onStopSessionRequested,
                 onDeleteSessionRequested = onDeleteSessionRequested,
             )
@@ -2951,7 +3005,6 @@ private fun PcRow(
     onToggleExpanded: (() -> Unit)? = null,
     onOpenSession: ((java.util.UUID) -> Unit)? = null,
     onBrowseFiles: (() -> Unit)? = null,
-    onOpenDownloads: (() -> Unit)? = null,
     onStopSessionRequested: ((java.util.UUID) -> Unit)? = null,
     onDeleteSessionRequested: ((java.util.UUID) -> Unit)? = null,
 ) {
@@ -2969,7 +3022,7 @@ private fun PcRow(
                         onToggleExpanded?.invoke()
                     }
                     .padding(14.dp),
-                verticalAlignment = Alignment.CenterVertically,
+                verticalAlignment = Alignment.Top,
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 Icon(Icons.Filled.LaptopWindows, contentDescription = stringResource(R.string.windows_pc_accessibility), tint = MaterialTheme.colorScheme.primary)
@@ -2987,36 +3040,35 @@ private fun PcRow(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-                StatusDot(
-                    color = if (pc.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
-                    contentDescription = if (pc.online) stringResource(R.string.pc_online_accessibility) else stringResource(R.string.pc_offline_accessibility),
-                )
-                if (sessions.isNotEmpty()) {
-                    Icon(
-                        imageVector = if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-            if (onBrowseFiles != null || onOpenDownloads != null) {
-                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-                    horizontalArrangement = Arrangement.End,
+                Column(
+                    horizontalAlignment = Alignment.End,
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
-                    onBrowseFiles?.let { browse ->
-                        TextButton(onClick = browse, modifier = Modifier.heightIn(min = 48.dp)) {
-                            Icon(Icons.Filled.Folder, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text(stringResource(R.string.action_browse_files))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        if (sessions.isNotEmpty()) {
+                            Icon(
+                                imageVector = if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
+                        StatusDot(
+                            color = if (pc.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            contentDescription = if (pc.online) stringResource(R.string.pc_online_accessibility) else stringResource(R.string.pc_offline_accessibility),
+                        )
                     }
-                    onOpenDownloads?.let { downloads ->
-                        TextButton(onClick = downloads, modifier = Modifier.heightIn(min = 48.dp)) {
-                            Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text(stringResource(R.string.action_download_center))
+                    onBrowseFiles?.let { browse ->
+                        TextButton(
+                            onClick = browse,
+                            modifier = Modifier.heightIn(min = 40.dp),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                        ) {
+                            Icon(Icons.Filled.Folder, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(5.dp))
+                            Text(stringResource(R.string.action_browse_files))
                         }
                     }
                 }
@@ -3235,6 +3287,7 @@ private fun SessionsPage(
                         transcriptState = snapshot.transcriptViewports[selected.id],
                         liveAcknowledgement = snapshot.liveAcknowledgements[selected.id],
                         bootstrapSource = snapshot.bootstrapSources[selected.id],
+                        sessionOpenFailure = snapshot.sessionOpenFailures[selected.id],
                         onLoadTranscript = { onLoadTranscript(selected.id) },
                         onClearTranscript = { onClearTranscript(selected.id) },
                         onRetryOpen = {
@@ -3266,6 +3319,7 @@ private fun SessionsPage(
                     transcriptViewports = snapshot.transcriptViewports,
                     liveAcknowledgements = snapshot.liveAcknowledgements,
                     bootstrapSources = snapshot.bootstrapSources,
+                    sessionOpenFailures = snapshot.sessionOpenFailures,
                     onLoadTranscript = onLoadTranscript,
                     onClearTranscript = onClearTranscript,
                     onRetryOpen = { sessionId ->
@@ -3298,6 +3352,7 @@ private fun MobileSessionContent(
     transcriptViewports: Map<java.util.UUID, TranscriptViewportState>,
     liveAcknowledgements: Map<java.util.UUID, ULong>,
     bootstrapSources: Map<java.util.UUID, ProductBootstrapSource>,
+    sessionOpenFailures: Map<java.util.UUID, SessionOpenFailure>,
     onLoadTranscript: (java.util.UUID) -> Unit,
     onClearTranscript: (java.util.UUID) -> Unit,
     onRetryOpen: (java.util.UUID) -> Unit,
@@ -3366,6 +3421,7 @@ private fun MobileSessionContent(
             transcriptState = transcriptViewports[session.id],
             liveAcknowledgement = liveAcknowledgements[session.id],
             bootstrapSource = bootstrapSources[session.id],
+            sessionOpenFailure = sessionOpenFailures[session.id],
             onLoadTranscript = { onLoadTranscript(session.id) },
             onClearTranscript = { onClearTranscript(session.id) },
             onRetryOpen = { onRetryOpen(session.id) },
@@ -3534,6 +3590,7 @@ private fun SessionDetail(
     transcriptState: TranscriptViewportState?,
     liveAcknowledgement: ULong?,
     bootstrapSource: ProductBootstrapSource?,
+    sessionOpenFailure: SessionOpenFailure?,
     onLoadTranscript: () -> Unit,
     onClearTranscript: () -> Unit,
     onRetryOpen: () -> Unit,
@@ -3576,16 +3633,13 @@ private fun SessionDetail(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                 )
-                if (remoteState is RemoteSessionState.Reconnecting &&
-                    remoteState.reason == SESSION_BOOTSTRAP_FAILED_REASON
-                ) {
-                    TextButton(
-                        onClick = onRetryOpen,
-                        modifier = Modifier.testTag("session-open-retry:${session.id}"),
-                    ) {
-                        Text(stringResource(R.string.terminal_history_retry))
-                    }
-                }
+            }
+            sessionOpenFailure?.let { failure ->
+                SessionOpenFailureCard(
+                    failure = failure,
+                    onRetry = onRetryOpen,
+                    testTag = "session-open-retry:${session.id}",
+                )
             }
             TerminalSurface(
                 session = session,
@@ -3606,6 +3660,48 @@ private fun SessionDetail(
                     .fillMaxWidth()
                     .weight(1f),
             )
+        }
+    }
+}
+
+@Composable
+private fun SessionOpenFailureCard(
+    failure: SessionOpenFailure,
+    onRetry: () -> Unit,
+    testTag: String,
+) {
+    val context = LocalContext.current
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.errorContainer,
+        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 10.dp, top = 8.dp, end = 6.dp, bottom = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Filled.Warning,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+            )
+            Text(
+                text = failure.localizedMessage(context),
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodySmall,
+            )
+            if (failure.code.retryable) {
+                TextButton(
+                    onClick = onRetry,
+                    modifier = Modifier.testTag(testTag),
+                ) {
+                    Text(stringResource(R.string.terminal_history_retry))
+                }
+            }
         }
     }
 }

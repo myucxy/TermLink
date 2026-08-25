@@ -313,6 +313,34 @@ class TerminalSnapshotBootstrapTest {
     }
 
     @Test
+    fun loadAndPrepareFailuresRemainDistinguishableWithoutBinding() = runBlocking {
+        val failures = mutableListOf<String>()
+
+        val loadResult = prepareBindInstallSnapshot<Unit, Unit, Unit, Unit>(
+            loadAndCache = { error("download") },
+            prepare = { error("prepare must not run") },
+            bind = { error("bind must not run") },
+            installAndMap = { _, _ -> error("install must not run") },
+            resetAfterInstallFailure = { error("reset must not run") },
+            onLoadFailure = { failures += "load:${it.message}" },
+            onPrepareFailure = { failures += "prepare:${it.message}" },
+        )
+        val prepareResult = prepareBindInstallSnapshot<Unit, Unit, Unit, Unit>(
+            loadAndCache = { Unit },
+            prepare = { error("decode") },
+            bind = { error("bind must not run") },
+            installAndMap = { _, _ -> error("install must not run") },
+            resetAfterInstallFailure = { error("reset must not run") },
+            onLoadFailure = { failures += "load:${it.message}" },
+            onPrepareFailure = { failures += "prepare:${it.message}" },
+        )
+
+        assertNull(loadResult)
+        assertNull(prepareResult)
+        assertEquals(listOf("load:download", "prepare:decode"), failures)
+    }
+
+    @Test
     fun installFailureAfterBindResetsAndReturnsEmpty() = runBlocking {
         val events = mutableListOf<String>()
 

@@ -34,6 +34,8 @@ data class PcSummary(
     val remoteRoutingEnabled: Boolean,
     val online: Boolean,
     val lastSeenAt: Instant?,
+    /** Agent-detected managed shells; clients must never infer this list. */
+    val supportedShells: Set<String> = emptySet(),
 )
 
 data class SessionSummary(

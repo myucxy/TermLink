@@ -2,7 +2,9 @@ package dev.termlink.product
 
 import android.annotation.SuppressLint
 import android.content.Context
+import dev.termlink.model.PcSummary
 import java.time.Instant
+import java.security.MessageDigest
 import java.util.Locale
 import java.util.UUID
 import java.util.Base64
@@ -86,6 +88,112 @@ enum class RemoteShellType(val wireValue: String) {
         fun fromWireValue(value: String): RemoteShellType =
             entries.firstOrNull { it.wireValue == value }
                 ?: error("Unsupported Windows shell type")
+    }
+}
+
+/** Maps only server/Agent-authoritative capabilities in a stable UX order. */
+internal fun supportedRemoteShellTypes(pc: PcSummary): List<RemoteShellType> =
+    RemoteShellType.entries.filter { shell -> shell.wireValue in pc.supportedShells }
+
+data class RemoteDirectoryFavorite(
+    val pcId: UUID,
+    val pcName: String,
+    val directoryName: String,
+    val path: String,
+)
+
+internal fun isRemoteDirectoryFavorite(
+    favorites: List<RemoteDirectoryFavorite>,
+    pcId: UUID,
+    path: String,
+): Boolean {
+    val pathKey = remoteFavoritePathKey(path)
+    return favorites.any { favorite ->
+        favorite.pcId == pcId && remoteFavoritePathKey(favorite.path) == pathKey
+    }
+}
+
+internal fun toggleRemoteDirectoryFavorite(
+    favorites: List<RemoteDirectoryFavorite>,
+    favorite: RemoteDirectoryFavorite,
+): List<RemoteDirectoryFavorite> {
+    require(favorite.path.isNotBlank() && favorite.path.encodeToByteArray().size <= REMOTE_FILE_PATH_MAX_BYTES)
+    val existing = isRemoteDirectoryFavorite(favorites, favorite.pcId, favorite.path)
+    val retained = favorites.filterNot { item ->
+        item.pcId == favorite.pcId && remoteFavoritePathKey(item.path) == remoteFavoritePathKey(favorite.path)
+    }
+    return if (existing) retained else (listOf(favorite) + retained).take(MAX_REMOTE_DIRECTORY_FAVORITES)
+}
+
+internal fun remoteDirectoryFavoriteAccountScope(serverUrl: String?, accountLabel: String?): String? {
+    val server = serverUrl?.trim()?.takeIf(String::isNotEmpty) ?: return null
+    val account = accountLabel?.trim()?.takeIf(String::isNotEmpty) ?: return null
+    return "$server\n$account"
+}
+
+private fun remoteFavoritePathKey(path: String): String =
+    path.replace('/', '\\').trimEnd('\\').lowercase(Locale.ROOT)
+
+internal interface RemoteDirectoryFavoriteStore {
+    fun load(accountScope: String): List<RemoteDirectoryFavorite>
+    fun save(accountScope: String, favorites: List<RemoteDirectoryFavorite>)
+}
+
+@SuppressLint("ApplySharedPref", "UseKtx")
+internal class SharedPreferencesRemoteDirectoryFavoriteStore(context: Context) : RemoteDirectoryFavoriteStore {
+    private val preferences = context.applicationContext.getSharedPreferences(
+        REMOTE_DIRECTORY_FAVORITES_PREFERENCES,
+        Context.MODE_PRIVATE,
+    )
+
+    override fun load(accountScope: String): List<RemoteDirectoryFavorite> {
+        val raw = preferences.getString(storageKey(accountScope), null) ?: return emptyList()
+        return runCatching {
+            val array = JSONArray(raw)
+            buildList {
+                repeat(array.length().coerceAtMost(MAX_REMOTE_DIRECTORY_FAVORITES)) { index ->
+                    val item = array.getJSONObject(index)
+                    val favorite = RemoteDirectoryFavorite(
+                        pcId = UUID.fromString(item.getString("pc_id")),
+                        pcName = item.getString("pc_name").take(256),
+                        directoryName = item.getString("directory_name").take(256),
+                        path = item.getString("path").take(REMOTE_FILE_PATH_MAX_BYTES),
+                    )
+                    if (favorite.path.isNotBlank() &&
+                        !isRemoteDirectoryFavorite(this, favorite.pcId, favorite.path)
+                    ) add(favorite)
+                }
+            }
+        }.getOrElse { emptyList() }
+    }
+
+    override fun save(accountScope: String, favorites: List<RemoteDirectoryFavorite>) {
+        val array = JSONArray()
+        favorites.take(MAX_REMOTE_DIRECTORY_FAVORITES).forEach { favorite ->
+            array.put(
+                JSONObject().apply {
+                    put("pc_id", favorite.pcId.toString())
+                    put("pc_name", favorite.pcName.take(256))
+                    put("directory_name", favorite.directoryName.take(256))
+                    put("path", favorite.path.take(REMOTE_FILE_PATH_MAX_BYTES))
+                },
+            )
+        }
+        check(preferences.edit().putString(storageKey(accountScope), array.toString()).commit()) {
+            "Remote directory favorites could not be persisted"
+        }
+    }
+
+    private fun storageKey(accountScope: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(accountScope.encodeToByteArray())
+        return REMOTE_DIRECTORY_FAVORITES_KEY_PREFIX + digest.joinToString("") { byte ->
+            "%02x".format(byte.toInt() and 0xff)
+        }
+    }
+
+    private companion object {
+        const val REMOTE_DIRECTORY_FAVORITES_PREFERENCES = "termlink_remote_directory_favorites"
+        const val REMOTE_DIRECTORY_FAVORITES_KEY_PREFIX = "favorites_v1_"
     }
 }
 
@@ -318,4 +426,6 @@ internal class SharedPreferencesRemoteDownloadRecordStore(context: Context) : Re
 }
 
 internal const val MAX_REMOTE_DOWNLOAD_RECORDS = 100
+internal const val MAX_REMOTE_DIRECTORY_FAVORITES = 100
+private const val REMOTE_FILE_PATH_MAX_BYTES = 4_096
 internal const val MAX_REMOTE_FILE_TRANSFER_BYTES = 5_368_709_120L

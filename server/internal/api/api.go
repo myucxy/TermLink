@@ -609,10 +609,11 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Name                    string `json:"name"`
-		AgentVersion            string `json:"agent_version"`
-		KeyEpoch                int64  `json:"key_epoch"`
-		SessionHeartbeatCapable bool   `json:"session_heartbeat_capable"`
+		Name                    string   `json:"name"`
+		AgentVersion            string   `json:"agent_version"`
+		KeyEpoch                int64    `json:"key_epoch"`
+		SessionHeartbeatCapable bool     `json:"session_heartbeat_capable"`
+		SupportedShells         []string `json:"supported_shells"`
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		writeError(w, r, 400, "INVALID_REQUEST", err)
@@ -622,14 +623,42 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 400, "INVALID_REQUEST", errors.New("invalid PC metadata"))
 		return
 	}
+	supportedShells, err := normalizeSupportedShells(input.SupportedShells)
+	if err != nil {
+		writeError(w, r, 400, "INVALID_REQUEST", err)
+		return
+	}
 	if err := a.Store.UpsertPC(r.Context(), p.UserID, p.Device.ID, store.PCRecord{
 		ID: id, Name: input.Name, AgentVersion: input.AgentVersion, KeyEpoch: input.KeyEpoch,
 		SessionHeartbeatCapable: input.SessionHeartbeatCapable,
+		SupportedShells:         supportedShells,
 	}); err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": id})
+}
+
+func normalizeSupportedShells(values []string) ([]string, error) {
+	if len(values) > 8 {
+		return nil, errors.New("too many supported shells")
+	}
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		switch value {
+		case "command-prompt", "windows-powershell":
+			seen[value] = true
+		default:
+			return nil, errors.New("unsupported shell capability")
+		}
+	}
+	normalized := make([]string, 0, len(seen))
+	for _, value := range []string{"command-prompt", "windows-powershell"} {
+		if seen[value] {
+			normalized = append(normalized, value)
+		}
+	}
+	return normalized, nil
 }
 func (a *API) putGrant(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)

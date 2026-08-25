@@ -36,6 +36,24 @@ class TermuxSnapshotRestoreTest {
     }
 
     @Test
+    fun rgbForegroundAndBackgroundSnapshotRestores() = runTest {
+        val engine = TermuxTerminalEngine(TerminalSize(COLUMNS, ROWS))
+        val rgbStyle = TerminalStyleSnapshotV1(
+            foreground = TerminalColorSnapshotV1.Rgb(0x12_34_56),
+            background = TerminalColorSnapshotV1.Rgb(0xab_cd_ef),
+        )
+
+        val prepared = engine.prepareSnapshot(
+            snapshot(sequence = 10, firstRow = "RGB", style = rgbStyle),
+        )
+        val installed = engine.installPrepared(prepared)
+
+        assertEquals(10, installed.sequence)
+        assertContains(engine.visibleText(), "RGB")
+        engine.dispose()
+    }
+
+    @Test
     fun invalidPrepareLeavesInstalledRendererUntouched() = runTest {
         val engine = TermuxTerminalEngine(TerminalSize(COLUMNS, ROWS))
         engine.feed(1, ByteBuffer.wrap("KEEP".encodeToByteArray()))
@@ -78,7 +96,14 @@ class TermuxSnapshotRestoreTest {
         target.dispose()
     }
 
-    private fun snapshot(sequence: Long, firstRow: String): TerminalSnapshotV1 {
+    private fun snapshot(
+        sequence: Long,
+        firstRow: String,
+        style: TerminalStyleSnapshotV1 = TerminalStyleSnapshotV1(
+            foreground = TerminalColorSnapshotV1.Default,
+            background = TerminalColorSnapshotV1.Default,
+        ),
+    ): TerminalSnapshotV1 {
         val value = screen(firstRow)
         return TerminalSnapshotV1(
             sequence = sequence,
@@ -94,12 +119,7 @@ class TermuxSnapshotRestoreTest {
                 defaultCursorRgb = 0x00ff_ffff,
             ),
             tabStops = emptyList(),
-            styleTable = listOf(
-                TerminalStyleSnapshotV1(
-                    foreground = TerminalColorSnapshotV1.Default,
-                    background = TerminalColorSnapshotV1.Default,
-                ),
-            ),
+            styleTable = listOf(style),
         )
     }
 

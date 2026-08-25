@@ -30,11 +30,24 @@ public class TextStyleTest extends TestCase {
 					int argb = 0xFF000000 | (red << 16) | (green << 8) | blue;
 					long encoded = TextStyle.encode(argb, 0, 0);
 					assertEquals(argb, TextStyle.decodeForeColor(encoded));
+					assertEquals(0, TextStyle.decodeEffect(encoded));
 					encoded = TextStyle.encode(0, argb, 0);
 					assertEquals(argb, TextStyle.decodeBackColor(encoded));
+					assertEquals(0, TextStyle.decodeEffect(encoded));
 				}
 			}
 		}
+	}
+
+	public void testEncoding24BitDoesNotLeakColorMarkersIntoEffects() {
+		int foreground = 0xff123456;
+		int background = 0xffabcdef;
+		int effects = TextStyle.CHARACTER_ATTRIBUTE_BOLD | TextStyle.CHARACTER_ATTRIBUTE_DIM;
+		long encoded = TextStyle.encode(foreground, background, effects);
+
+		assertEquals(foreground, TextStyle.decodeForeColor(encoded));
+		assertEquals(background, TextStyle.decodeBackColor(encoded));
+		assertEquals(effects, TextStyle.decodeEffect(encoded));
 	}
 
 

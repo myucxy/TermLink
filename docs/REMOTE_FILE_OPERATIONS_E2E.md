@@ -2,16 +2,17 @@
 
 本文记录当前已经落入源码的远程文件操作契约、端到端数据路径、Android 下载中心生命周期、Docker 部署取舍与验收边界。中文是产品主说明，首次出现的主要界面词同时给出英文，便于核对中英文资源。
 
-实现基线：2026-08-24。协议真值以 `server/internal/api/file_operations.go`、`server/internal/store/file_operations.go`、数据库 Migration 17/18、`win-agent/src/Agent/ProductionFileOperationWorker.cs`、`win-agent/src/Agent/WindowsFileOperations.cs`、`android/app/src/main/kotlin/dev/termlink/product/ProductionProductRepository.kt` 和 `RemoteFileModels.kt` 为准。
+实现基线：2026-08-25。协议真值以 `server/internal/api/file_operations.go`、`server/internal/store/file_operations.go`、数据库 Migration 17/18/19、`win-agent/src/Agent/ProductionFileOperationWorker.cs`、`win-agent/src/Agent/WindowsFileOperations.cs`、`android/app/src/main/kotlin/dev/termlink/product/ProductionProductRepository.kt` 和 `RemoteFileModels.kt` 为准。
 
 ## 已实现的产品行为
 
-- Android 设备页只展示在线 Windows PC；每台 PC 提供“浏览文件 / Browse files”和“下载中心 / Download center”入口。
+- Android 设备页只展示在线 Windows PC；每台 PC 的右上状态区域提供“浏览文件 / Browse files”，设备页右上角提供跨 PC 聚合的“下载中心 / Download center”。
 - 文件浏览从空路径开始列出 Windows 逻辑驱动器。进入目录后支持返回上一级、刷新和“加载更多 / Load more”。目录优先，再按名称排序。
 - 文件和目录都可下载。文件按原始字节传输；目录先在 Windows 端生成包含所选根目录的 ZIP，保留空目录，不跟随 junction、symlink 等 reparse point。
 - Android 先通过 Storage Access Framework（SAF）选择保存位置，再创建服务端 `DOWNLOAD` 任务。文件内容不经过 TermLink API 进程中转：Windows Agent 使用预签名 `PUT` 直传 S3/MinIO，Android 使用预签名 `GET` 直下对象。
 - Android 下载时流式写入 SAF 文档，同时检查声明长度和 SHA-256；支持零字节文件。任何截断、超长或摘要不符都转为失败，并删除或清空不完整目标。
-- 目录页面可在当前目录或某个子目录中启动 CMD（`cmd.exe`）或 Windows PowerShell（`powershell.exe -NoLogo -NoProfile`）。新窗口由 TermLink SessionHost 托管，随后按返回的准确 `session_id` 出现在 Android 会话页。
+- 文件/目录行右侧统一使用操作菜单；目录菜单提供 ZIP 下载、收藏/取消收藏，以及该 PC Agent 实际上报可用的命令行。收藏按服务端与账号隔离，并记录 PC 与绝对路径，可从收藏目录跨 PC 直达。
+- 目录页面只在 PC 的 `supported_shells` 中包含相应值时，才允许启动 CMD（`cmd.exe`）或 Windows PowerShell（`powershell.exe -NoLogo -NoProfile`）。新窗口由 TermLink SessionHost 托管，随后按返回的准确 `session_id` 出现在 Android 会话页。
 - 下载中心显示准备/压缩、下载、校验、完成、失败和取消状态以及字节进度；支持取消、失败或取消后的重试、终态记录删除。删除记录只删 Android 元数据，不删除已经保存的 SAF 文档。
 - Android 和 Windows Agent 使用同一账号时直接发现并处理任务，不要求用户执行逐 PC 配对或 Grant。文件操作仍只会路由到所选 PC 自己的 Agent。
 - 文件浏览、下载和远程开 Shell 都受 Windows 的“远程访问已启用”开关约束；关闭后 Agent 不再领取新任务，并取消正在处理的长任务。
@@ -274,6 +275,26 @@ Android 进程被杀后，原 `PREPARING`、`DOWNLOADING` 或 `VERIFYING` 记录
 
 “移除记录 / Remove record”只允许终态记录，并且不会调用 `DocumentsContract.deleteDocument` 删除已完成文件。退出登录或切换服务配置会停止活动下载并清空属于原账号上下文的下载元数据。
 
+## PC 命令行能力协商
+
+Windows Agent 在每次 PC upsert/心跳元数据中发送实际探测结果：
+
+```json
+{
+  "name": "Office PC",
+  "agent_version": "0.1.29.35",
+  "key_epoch": 1,
+  "session_heartbeat_capable": true,
+  "supported_shells": ["command-prompt", "windows-powershell"]
+}
+```
+
+能力成立需要 `TermLink.SessionHost.exe` 与对应 Shell 可执行文件同时存在。服务端仅接受
+`command-prompt`、`windows-powershell`，去重后按固定顺序写入 `pcs.supported_shells` 并从
+`GET /v1/pcs` 原样返回。旧 Agent 不发送字段时保存空数组；Android 对字段缺失、空数组或未知值
+均不猜测，不显示命令行选项。该字段是 Agent → Server → Client 的能力协商接口；新增 Shell 必须
+同时扩展 Agent 探测/启动白名单、服务端输入与数据库约束、客户端映射和协议测试，不能只改 UI。
+
 ## 在所选目录打开终端
 
 ```mermaid
@@ -360,7 +381,7 @@ PostgreSQL 保存任务和 outbox，Valkey 支撑当前认证/实时协调，OID
 
 ## 部署与 E2E 验收清单
 
-1. 把数据库迁移到 Migration 18：Migration 17 创建 `pc_file_operations` 和 claim 索引，Migration 18 把 `size_bytes` 收紧到 5 GiB，并固化 lease 不超过任务到期时间及严格的 OPEN_TERMINAL 结果约束。
+1. 把数据库迁移到 Migration 19：Migration 17 创建 `pc_file_operations` 和 claim 索引，Migration 18 把 `size_bytes` 收紧到 5 GiB 并固化 OPEN_TERMINAL 约束，Migration 19 增加白名单约束的 `pcs.supported_shells`。
 2. 确认 `TERMLINK_HISTORY_ENABLED=true`，S3 internal/public endpoint、bucket、region 和凭据可用；公网客户端拿到的预签名 URL 必须从 Android 和 Windows 都可达。
 3. 若使用仓库 Caddy，确认 file-transfer matcher、`GET PUT`、5 GiB 限制和对象存储 upstream 生效。若使用外部 ingress，等价复制这些约束。
 4. 访问 `/readyz` 应为 `200`；访问 `/v1/client-config`，OIDC issuer 和客户端看到的 public origin 必须是实际公网域名，而不是 Docker hostname 或 LAN 临时地址。
@@ -369,7 +390,7 @@ PostgreSQL 保存任务和 outbox，Valkey 支撑当前认证/实时协调，OID
 7. 下载普通文件、零字节文件和目录 ZIP，逐一核对文件名、长度、SHA-256、ZIP 根目录、空目录和内容。
 8. 在 ZIP 准备阶段及实际下载阶段各取消一次，确认 Android 变为 `CANCELLED`、不完整 SAF 文档被清理，服务端任务最终为 `CANCELLED` 或按竞态已经终态。
 9. 对失败和取消记录执行重试；删除完成记录后确认 Android 文件仍存在。
-10. 分别打开 CMD 和 Windows PowerShell，确认返回 `session_id` 唯一、`cwd` 正确、Android 会话目录出现同一 ID，并能进入实时终端。
+10. 先确认 PC 列表只回显 Agent 实际探测到的 `supported_shells`；再分别打开已上报的 CMD 和 Windows PowerShell，确认返回 `session_id` 唯一、`cwd` 正确、Android 会话目录出现同一 ID，并能进入实时终端。对缺失 Shell 或旧 Agent，确认 Android 不显示对应命令。
 11. 检查终态 download 对象已创建延迟删除 outbox；用自动化时钟测试验证 55 分钟 descriptor 宽限、10 分钟 GET 和 65 分钟删除关系，不建议人工等待。
 
 仓库中的协议级真实链路脚本见 [File operations end-to-end validation](FILE_OPERATIONS_E2E.md)。它验证生产 REST、对象传输和 Windows Agent 路径，但不代替 Android UI/SAF 验收。

@@ -31,6 +31,8 @@ public final class TextStyle {
     public final static int CHARACTER_ATTRIBUTE_PROTECTED = 1 << 7;
     /** Dim colors. Also known as faint or half intensity. */
     public final static int CHARACTER_ATTRIBUTE_DIM = 1 << 8;
+    /** Public rendition effects occupy the low nine bits. */
+    private final static int CHARACTER_EFFECT_MASK = (1 << 9) - 1;
     /** If true (24-bit) color is used for the cell for foreground. */
     private final static int CHARACTER_ATTRIBUTE_TRUECOLOR_FOREGROUND = 1 << 9;
     /** If true (24-bit) color is used for the cell for foreground. */
@@ -47,7 +49,7 @@ public final class TextStyle {
     final static long NORMAL = encode(COLOR_INDEX_FOREGROUND, COLOR_INDEX_BACKGROUND, 0);
 
     static long encode(int foreColor, int backColor, int effect) {
-        long result = effect & 0b111111111;
+        long result = effect & CHARACTER_EFFECT_MASK;
         if ((0xff000000 & foreColor) == 0xff000000) {
             // 24-bit color.
             result |= CHARACTER_ATTRIBUTE_TRUECOLOR_FOREGROUND | ((foreColor & 0x00ffffffL) << 40L);
@@ -84,7 +86,10 @@ public final class TextStyle {
     }
 
     public static int decodeEffect(long style) {
-        return (int) (style & 0b11111111111);
+        // Bits 9 and 10 are internal color representation markers. Exposing
+        // them as rendition effects makes an otherwise valid RGB cell fail
+        // snapshot validation and leaks storage details into rendering state.
+        return (int) (style & CHARACTER_EFFECT_MASK);
     }
 
 }

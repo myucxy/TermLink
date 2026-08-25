@@ -730,6 +730,8 @@ namespace TermLink.Agent
 
     internal sealed class ManagedTerminalLauncher
     {
+        internal const string CommandPromptShellType = "command-prompt";
+        internal const string WindowsPowerShellShellType = "windows-powershell";
         internal const int DefaultRegistrationTimeoutMilliseconds = 15000;
         private readonly WindowsPathService paths;
         private readonly IProcessStarter processes;
@@ -839,6 +841,37 @@ namespace TermLink.Agent
         internal string NormalizeWorkingDirectory(string workingDirectory) =>
             paths.NormalizeExistingDirectory(workingDirectory);
 
+        /// <summary>
+        /// Returns only managed shells that this installation can actually
+        /// launch. SessionHost is part of the capability because a shell
+        /// executable alone is not a remotely openable TermLink terminal.
+        /// </summary>
+        internal static string[] DetectSupportedShellTypes()
+        {
+            return DetectSupportedShellTypesAtPaths(
+                Path.Combine(AppContext.BaseDirectory, "TermLink.SessionHost.exe"),
+                Path.Combine(Environment.SystemDirectory, "cmd.exe"),
+                Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                    "System32", "WindowsPowerShell", "v1.0", "powershell.exe"));
+        }
+
+        internal static string[] DetectSupportedShellTypesAtPaths(
+            string sessionHostPath,
+            string commandPromptPath,
+            string windowsPowerShellPath)
+        {
+            if (string.IsNullOrWhiteSpace(sessionHostPath) || !File.Exists(sessionHostPath))
+                return Array.Empty<string>();
+
+            var result = new List<string>(2);
+            if (!string.IsNullOrWhiteSpace(commandPromptPath) && File.Exists(commandPromptPath))
+                result.Add(CommandPromptShellType);
+            if (!string.IsNullOrWhiteSpace(windowsPowerShellPath) && File.Exists(windowsPowerShellPath))
+                result.Add(WindowsPowerShellShellType);
+            return result.ToArray();
+        }
+
         internal static string[] BuildSessionHostArguments(
             string shellType,
             string shellPath,
@@ -864,8 +897,8 @@ namespace TermLink.Agent
 
         internal static void ValidateShellType(string shellType)
         {
-            if (!string.Equals(shellType, "command-prompt", StringComparison.Ordinal) &&
-                !string.Equals(shellType, "windows-powershell", StringComparison.Ordinal))
+            if (!string.Equals(shellType, CommandPromptShellType, StringComparison.Ordinal) &&
+                !string.Equals(shellType, WindowsPowerShellShellType, StringComparison.Ordinal))
             {
                 throw new FileOperationException(
                     "SHELL_NOT_ALLOWED",
@@ -876,7 +909,7 @@ namespace TermLink.Agent
         private string ResolveShell(string shellType)
         {
             ValidateShellType(shellType);
-            return string.Equals(shellType, "command-prompt", StringComparison.Ordinal)
+            return string.Equals(shellType, CommandPromptShellType, StringComparison.Ordinal)
                 ? commandPromptPath
                 : windowsPowerShellPath;
         }

@@ -1094,16 +1094,29 @@ internal class ProductionProductRepository(
     }
 
     override suspend fun requestControl(sessionId: UUID) {
-        freshAccessToken()
-        openSession(sessionId)
-        val live = liveSessions.getValue(sessionId)
-        val acquired = live.controlRequestLock.withLock {
-            acquireControlLeaseWithRetry(
-                remoteState = { live.client.sessionState.value },
-                request = live.client::requestControl,
+        try {
+            freshAccessToken()
+            openSession(sessionId)
+            val live = liveSessions.getValue(sessionId)
+            val acquired = live.controlRequestLock.withLock {
+                acquireControlLeaseWithRetry(
+                    remoteState = { live.client.sessionState.value },
+                    request = live.client::requestControl,
+                )
+            }
+            if (acquired) appendActivity("Control granted", "Session $sessionId", Severity.SUCCESS)
+            clearSessionOpenFailure(sessionId)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            val classified = classifySessionOpenException(error, SessionFailureStage.CONTROL)
+            observeSessionOpenFailure(
+                sessionId = sessionId,
+                failure = classified.failure,
+                reconnect = liveSessions[sessionId] == null,
             )
+            throw classified
         }
-        if (acquired) appendActivity("Control granted", "Session $sessionId", Severity.SUCCESS)
     }
 
     override suspend fun releaseControl(sessionId: UUID) {
@@ -1172,17 +1185,23 @@ internal class ProductionProductRepository(
         // another session's realtime stream.
         val product = mutableSnapshot.value
         val summary = product.sessions.firstOrNull { it.id == sessionId }
-            ?: error("The selected session is unavailable")
-        require(summary.online) { "The selected session is offline" }
+            ?: throw sessionOpenException(SessionOpenFailureCode.SESSION_UNAVAILABLE)
+        if (summary.state == SessionState.EXITED) {
+            throw sessionOpenException(SessionOpenFailureCode.SESSION_ENDED)
+        }
+        if (!summary.online) throw sessionOpenException(SessionOpenFailureCode.SESSION_OFFLINE)
         val pc = product.pcs.firstOrNull { it.id == summary.pcId }
-            ?: error("The session PC is unavailable")
+            ?: throw sessionOpenException(SessionOpenFailureCode.PC_UNAVAILABLE)
         val pcDevice = product.devices.firstOrNull {
             it.id == pc.deviceId && it.type == DeviceType.WINDOWS_PC && it.trustState == DeviceTrustState.TRUSTED
-        } ?: error("The session PC is not a trusted device")
-        require(pcDevice.exchangePublicKey.size == 32) { "The PC exchange public key is unavailable" }
+        } ?: throw sessionOpenException(SessionOpenFailureCode.PC_NOT_TRUSTED)
+        if (pcDevice.exchangePublicKey.size != 32) {
+            throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
+        }
         freshAccessToken()
         mutableSnapshot.update { current ->
             current.copy(
+                sessionOpenFailures = current.sessionOpenFailures - sessionId,
                 sessionStates = current.sessionStates + (
                     sessionId to RemoteSessionState.Reconnecting(
                         lastAckedSequence = current.liveAcknowledgements[sessionId]?.toLong() ?: 0L,
@@ -1209,8 +1228,9 @@ internal class ProductionProductRepository(
             throw error
         } catch (error: Throwable) {
             engine.dispose()
-            observeBootstrapFailure(sessionId)
-            throw error
+            val classified = classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_PREPARE)
+            observeBootstrapFailure(sessionId, classified.failure)
+            throw classified
         }
         val transport = try {
             deviceRealtimeMultiplexer(stored).register(sessionId)
@@ -1219,8 +1239,9 @@ internal class ProductionProductRepository(
             throw error
         } catch (error: Throwable) {
             engine.dispose()
-            observeBootstrapFailure(sessionId)
-            throw error
+            val classified = classifySessionOpenException(error, SessionFailureStage.REALTIME)
+            observeBootstrapFailure(sessionId, classified.failure)
+            throw classified
         }
         val client = try {
             ProductionRealtimeSessionClient(
@@ -1283,8 +1304,9 @@ internal class ProductionProductRepository(
         } catch (error: Throwable) {
             transport.close()
             engine.dispose()
-            observeBootstrapFailure(sessionId)
-            throw error
+            val classified = classifySessionOpenException(error, SessionFailureStage.REALTIME)
+            observeBootstrapFailure(sessionId, classified.failure)
+            throw classified
         }
         val live = LiveProductSession(engine, client)
         val installed = synchronized(liveSessionLock) {
@@ -1367,8 +1389,9 @@ internal class ProductionProductRepository(
                 liveSessions.remove(sessionId, live)
             }
             live.close()
-            observeBootstrapFailure(sessionId)
-            throw error
+            val classified = classifySessionOpenException(error, SessionFailureStage.REALTIME)
+            observeBootstrapFailure(sessionId, classified.failure)
+            throw classified
         }
     }
 
@@ -1382,6 +1405,7 @@ internal class ProductionProductRepository(
         mutableSnapshot.update { snapshot ->
             snapshot.copy(
                 sessionStates = snapshot.sessionStates - sessionId,
+                sessionOpenFailures = snapshot.sessionOpenFailures - sessionId,
                 transcriptViewports = snapshot.transcriptViewports - sessionId,
                 liveAcknowledgements = snapshot.liveAcknowledgements - sessionId,
                 bootstrapSources = snapshot.bootstrapSources - sessionId,
@@ -2234,6 +2258,7 @@ internal class ProductionProductRepository(
                 pcs = pcs,
                 sessions = runtimeSessions,
                 sessionStates = current.sessionStates.filterKeys(retainedSessionIds::contains),
+                sessionOpenFailures = current.sessionOpenFailures.filterKeys(retainedSessionIds::contains),
                 sessionTitles = reconcileSessionDirectoryTitles(
                     current.sessionTitles,
                     runtimeSessions,
@@ -2638,6 +2663,7 @@ internal class ProductionProductRepository(
             pcs = emptyList(),
             sessions = emptyList(),
             sessionStates = emptyMap(),
+            sessionOpenFailures = emptyMap(),
             sessionTitles = emptyMap(),
             pairingChallenge = null,
             history = emptyList(),
@@ -2781,6 +2807,7 @@ internal class ProductionProductRepository(
         }
         mutableSnapshot.value = mutableSnapshot.value.copy(
             sessionStates = mutableSnapshot.value.sessionStates.filterKeys(retained::contains),
+            sessionOpenFailures = mutableSnapshot.value.sessionOpenFailures.filterKeys(retained::contains),
             sessionTitles = mutableSnapshot.value.sessionTitles.filterKeys(retained::contains),
         )
     }
@@ -2809,6 +2836,7 @@ internal class ProductionProductRepository(
             mutableSnapshot.update { snapshot ->
                 snapshot.copy(
                     sessionStates = snapshot.sessionStates - affected,
+                    sessionOpenFailures = snapshot.sessionOpenFailures - affected,
                     sessionTitles = snapshot.sessionTitles - affected,
                 )
             }
@@ -2908,14 +2936,27 @@ internal class ProductionProductRepository(
         }
     }
 
-    private fun observeBootstrapFailure(sessionId: UUID) {
+    private fun clearSessionOpenFailure(sessionId: UUID) {
+        mutableSnapshot.update { current ->
+            if (sessionId !in current.sessionOpenFailures) current else current.copy(
+                sessionOpenFailures = current.sessionOpenFailures - sessionId,
+            )
+        }
+    }
+
+    private fun observeSessionOpenFailure(
+        sessionId: UUID,
+        failure: SessionOpenFailure,
+        reconnect: Boolean,
+    ) {
         mutableSnapshot.update { current ->
             val state = current.sessionStates[sessionId]
             if (state is RemoteSessionState.Exited) {
-                current
+                current.copy(sessionOpenFailures = current.sessionOpenFailures + (sessionId to failure))
             } else {
                 current.copy(
-                    sessionStates = current.sessionStates + (
+                    sessionOpenFailures = current.sessionOpenFailures + (sessionId to failure),
+                    sessionStates = if (!reconnect) current.sessionStates else current.sessionStates + (
                         sessionId to RemoteSessionState.Reconnecting(
                             lastAckedSequence = state?.lastAckedSequence
                                 ?: current.liveAcknowledgements[sessionId]?.toLong()
@@ -2927,6 +2968,9 @@ internal class ProductionProductRepository(
             }
         }
     }
+
+    private fun observeBootstrapFailure(sessionId: UUID, failure: SessionOpenFailure) =
+        observeSessionOpenFailure(sessionId, failure, reconnect = true)
 
     private fun observeBootstrap(sessionId: UUID, restored: RestoredLiveHistory) {
         mutableSnapshot.update { product ->
@@ -2945,6 +2989,7 @@ internal class ProductionProductRepository(
                 transcriptViewports = viewports,
                 liveAcknowledgements = product.liveAcknowledgements + (sessionId to restored.durableAcknowledgement),
                 bootstrapSources = product.bootstrapSources + (sessionId to restored.bootstrapSource),
+                sessionOpenFailures = product.sessionOpenFailures - sessionId,
             )
         }
     }
@@ -3168,6 +3213,7 @@ internal class ProductionProductRepository(
         }
         mutableSnapshot.value = mutableSnapshot.value.copy(
             sessionStates = emptyMap(),
+            sessionOpenFailures = emptyMap(),
             sessionTitles = emptyMap(),
         )
         return retired
@@ -3299,6 +3345,7 @@ internal class ProductionProductRepository(
     private data class TerminalSnapshotReadinessObservation(
         val lastOutputSequence: ULong,
         val snapshot: SnapshotDownloadDescriptor?,
+        val failure: SessionOpenFailure? = null,
     )
 
     private data class TranscriptDownloadDescriptor(
@@ -3406,6 +3453,12 @@ internal class ProductionProductRepository(
         remoteRoutingEnabled = getValue("remote_routing_enabled").jsonPrimitive.boolean,
         online = authoritativePcOnline(this),
         lastSeenAt = optionalInstant("last_seen_at"),
+        supportedShells = get("supported_shells")?.jsonArray
+            ?.mapNotNull { value -> value.jsonPrimitive.contentOrNull }
+            ?.filterTo(linkedSetOf()) { value ->
+                RemoteShellType.entries.any { shell -> shell.wireValue == value }
+            }
+            .orEmpty(),
     )
 
     private fun JsonObject.toSession() = SessionSummary(
@@ -3662,13 +3715,12 @@ internal class ProductionProductRepository(
     ) = withContext(Dispatchers.Default) {
         val sequence = requireNotNull(metadata.snapshotSequence) { "Snapshot sequence is missing" }
         require(metadata.kind == HistoryObject.Kind.SNAPSHOT) { "History object is not a terminal snapshot" }
-        require(metadata.formatName == HistoryRepository.TERMINAL_SNAPSHOT_FORMAT && metadata.formatVersion == 1) {
-            "Snapshot format is unsupported"
+        if (metadata.formatName != HistoryRepository.TERMINAL_SNAPSHOT_FORMAT || metadata.formatVersion != 1) {
+            throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_FORMAT)
         }
-        val keyEpoch = requireNotNull(snapshotKeyEpoch(stored.deviceId, metadata.keyId)) {
-            "Snapshot key ID is not for this device"
-        }
-        require(keyEpoch <= pc.keyEpoch) { "Snapshot key epoch is newer than the authoritative PC epoch" }
+        val keyEpoch = snapshotKeyEpoch(stored.deviceId, metadata.keyId)
+            ?: throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_RECIPIENT)
+        if (keyEpoch > pc.keyEpoch) throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
         val pairwise = SessionCrypto.derivePairwiseKey(
             stored.identity.exchange.privateKey,
             pcDevice.exchangePublicKey,
@@ -3677,22 +3729,39 @@ internal class ProductionProductRepository(
             keyEpoch,
         )
         try {
-            val wire = TerminalSnapshotCrypto.openSnapshot(
-                pairwiseKey = pairwise,
-                sealedObject = sealedObject,
-                expectedSessionId = session.id,
-                expectedPcDeviceId = pc.deviceId,
-                expectedRecipientDeviceId = stored.deviceId,
-                expectedKeyEpoch = keyEpoch,
-                expectedKeyId = metadata.keyId,
-                expectedSnapshotSequence = sequence,
-                expectedColumns = columns,
-                expectedRows = rows,
-            )
-            val initialBeforeLineId = TerminalSnapshotCrypto.initialTranscriptBeforeLineId(wire)
-            val decoded = TerminalSnapshotDomainDecoder.decode(wire)
+            val wire = try {
+                TerminalSnapshotCrypto.openSnapshot(
+                    pairwiseKey = pairwise,
+                    sealedObject = sealedObject,
+                    expectedSessionId = session.id,
+                    expectedPcDeviceId = pc.deviceId,
+                    expectedRecipientDeviceId = stored.deviceId,
+                    expectedKeyEpoch = keyEpoch,
+                    expectedKeyId = metadata.keyId,
+                    expectedSnapshotSequence = sequence,
+                    expectedColumns = columns,
+                    expectedRows = rows,
+                )
+            } catch (error: Exception) {
+                throw classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_PREPARE)
+            }
+            val initialBeforeLineId = try {
+                TerminalSnapshotCrypto.initialTranscriptBeforeLineId(wire)
+            } catch (error: Exception) {
+                throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_FORMAT, error)
+            }
+            val decoded = try {
+                TerminalSnapshotDomainDecoder.decode(wire)
+            } catch (error: Exception) {
+                throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_FORMAT, error)
+            }
+            val checkpoint = try {
+                engine.prepareSnapshot(decoded)
+            } catch (error: Exception) {
+                throw sessionOpenException(SessionOpenFailureCode.TERMINAL_RENDERER, error)
+            }
             PreparedTerminalSnapshot(
-                checkpoint = engine.prepareSnapshot(decoded),
+                checkpoint = checkpoint,
                 transcriptAnchor = TranscriptAnchor(
                     snapshotSequence = decoded.sequence.toULong(),
                     beforeLineId = initialBeforeLineId,
@@ -3717,7 +3786,7 @@ internal class ProductionProductRepository(
         } catch (error: Exception) {
             // A broken binding must block opening rather than silently reset
             // the durable cursor and trigger a replay from sequence zero.
-            throw error
+            throw sessionOpenException(SessionOpenFailureCode.LOCAL_CHECKPOINT, error)
         } ?: return null
         val currentTail = try {
             latestAuthoritativeSessionTail(session)
@@ -3742,14 +3811,18 @@ internal class ProductionProductRepository(
         if (!snapshotHasBoundedLiveSuffix(checkpoint.snapshotSequence, confirmedTail)) return null
         return withContext(NonCancellable) {
             val bound = if (checkpoint.durableAcknowledgement > checkpoint.snapshotSequence) {
-                historyRepository.bindRendererCheckpoint(
-                    sessionId = session.id,
-                    direction = LIVE_OUTPUT_ACK_DIRECTION,
-                    expectedRendererGeneration = checkpoint.rendererGeneration,
-                    snapshotId = checkpoint.snapshot.metadata.id,
-                    snapshotSequence = checkpoint.snapshotSequence,
-                    ciphertextSha256 = checkpoint.snapshot.metadata.ciphertextSha256,
-                )
+                try {
+                    historyRepository.bindRendererCheckpoint(
+                        sessionId = session.id,
+                        direction = LIVE_OUTPUT_ACK_DIRECTION,
+                        expectedRendererGeneration = checkpoint.rendererGeneration,
+                        snapshotId = checkpoint.snapshot.metadata.id,
+                        snapshotSequence = checkpoint.snapshotSequence,
+                        ciphertextSha256 = checkpoint.snapshot.metadata.ciphertextSha256,
+                    )
+                } catch (error: Exception) {
+                    throw sessionOpenException(SessionOpenFailureCode.LOCAL_CHECKPOINT, error)
+                }
             } else {
                 checkpoint
             }
@@ -3772,7 +3845,7 @@ internal class ProductionProductRepository(
                 )
             } catch (error: Exception) {
                 resetLiveRendererAndCursor(session, engine, bound.rendererGeneration)
-                throw error
+                throw classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_INSTALL)
             }
         }
     }
@@ -3791,7 +3864,8 @@ internal class ProductionProductRepository(
                 api.get("/v1/pcs/${initialSession.pcId}/sessions").jsonObject,
             ).map { it.toSession() }
                 .singleOrNull { it.id == initialSession.id }
-                ?: return@withApi null
+                ?: throw sessionOpenException(SessionOpenFailureCode.SESSION_UNAVAILABLE)
+            var observedFailure: SessionOpenFailure? = null
             val descriptor = if (session.lastOutputSequence == 0uL) {
                 null
             } else {
@@ -3802,19 +3876,22 @@ internal class ProductionProductRepository(
                     ).jsonObject
                     val items = ProductResponseParser.itemObjects(response)
                     require(items.size <= 1) { "Latest snapshot selector returned more than one object" }
-                    items.singleOrNull()?.toSnapshotDownloadDescriptor(
+                    val candidate = items.singleOrNull()?.toSnapshotDownloadDescriptor(
                         session,
                         stored.deviceId,
                         authoritativeKeyEpoch,
-                    )?.takeIf { candidate ->
+                    )
+                    candidate?.takeIf { value ->
                         // A near-tail Snapshot opens immediately and realtime
                         // fills only its small bounded suffix. A genuinely old
                         // Snapshot is rejected so opening can never degrade to
                         // an unbounded prefix replay.
-                        snapshotHasBoundedLiveSuffix(
-                            snapshotSequence = requireNotNull(candidate.metadata.snapshotSequence),
+                        val current = snapshotHasBoundedLiveSuffix(
+                            snapshotSequence = requireNotNull(value.metadata.snapshotSequence),
                             currentSessionSequence = session.lastOutputSequence,
                         )
+                        if (!current) observedFailure = SessionOpenFailure(SessionOpenFailureCode.SNAPSHOT_STALE)
+                        current
                     }
                 } catch (error: CancellationException) {
                     throw error
@@ -3824,8 +3901,16 @@ internal class ProductionProductRepository(
                     // what prevents a stale catalog value of zero from causing a
                     // full realtime replay.
                     if (BuildConfig.DEBUG) {
-                        Log.e("TermLinkTailFirst", "Snapshot metadata readiness failed", error)
+                        val failure = classifySessionOpenException(
+                            error,
+                            SessionFailureStage.SNAPSHOT_METADATA,
+                        ).failure.code.stableCode
+                        Log.e("TermLinkTailFirst", "Snapshot metadata readiness failed [$failure]")
                     }
+                    observedFailure = classifySessionOpenException(
+                        error,
+                        SessionFailureStage.SNAPSHOT_METADATA,
+                    ).failure
                     null
                 }
             }
@@ -3836,7 +3921,7 @@ internal class ProductionProductRepository(
                         "candidate=${descriptor?.metadata?.snapshotSequence ?: 0uL}",
                 )
             }
-            TerminalSnapshotReadinessObservation(session.lastOutputSequence, descriptor)
+            TerminalSnapshotReadinessObservation(session.lastOutputSequence, descriptor, observedFailure)
         }
     }
 
@@ -3858,6 +3943,7 @@ internal class ProductionProductRepository(
         engine: TermuxTerminalEngine,
         expectedRendererGeneration: Long,
         descriptor: SnapshotDownloadDescriptor,
+        onFailure: (SessionOpenFailure) -> Unit,
     ): RestoredLiveHistory? {
         val metadata = descriptor.metadata
         val sequence = requireNotNull(metadata.snapshotSequence)
@@ -3874,30 +3960,42 @@ internal class ProductionProductRepository(
         return prepareBindInstallSnapshot(
             loadAndCache = {
                 try {
-                    val sealedObject = cached?.ciphertext ?: withContext(Dispatchers.IO) {
-                        downloadHistory(descriptor.download, metadata)
+                    val sealedObject = cached?.ciphertext ?: try {
+                        withContext(Dispatchers.IO) {
+                            downloadHistory(descriptor.download, metadata)
+                        }
+                    } catch (error: Exception) {
+                        throw classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_DOWNLOAD)
                     }
                     if (cached == null) {
-                        historyRepository.putSnapshot(
-                            sessionId = session.id,
-                            snapshotSequence = sequence,
-                            rows = descriptor.rows,
-                            columns = descriptor.columns,
-                            objectKey = metadata.objectKey,
-                            keyId = metadata.keyId,
-                            formatName = requireNotNull(metadata.formatName),
-                            formatVersion = requireNotNull(metadata.formatVersion),
-                            ciphertext = sealedObject,
-                            id = metadata.id,
-                            ciphertextSha256 = metadata.ciphertextSha256,
-                        )
+                        try {
+                            historyRepository.putSnapshot(
+                                sessionId = session.id,
+                                snapshotSequence = sequence,
+                                rows = descriptor.rows,
+                                columns = descriptor.columns,
+                                objectKey = metadata.objectKey,
+                                keyId = metadata.keyId,
+                                formatName = requireNotNull(metadata.formatName),
+                                formatVersion = requireNotNull(metadata.formatVersion),
+                                ciphertext = sealedObject,
+                                id = metadata.id,
+                                ciphertextSha256 = metadata.ciphertextSha256,
+                            )
+                        } catch (error: Exception) {
+                            throw sessionOpenException(SessionOpenFailureCode.LOCAL_CHECKPOINT, error)
+                        }
                     }
                     sealedObject
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Exception) {
                     if (BuildConfig.DEBUG) {
-                        Log.e("TermLinkTailFirst", "Snapshot download/cache failed", error)
+                        val failure = classifySessionOpenException(
+                            error,
+                            SessionFailureStage.SNAPSHOT_DOWNLOAD,
+                        ).failure.code.stableCode
+                        Log.e("TermLinkTailFirst", "Snapshot download/cache failed [$failure]")
                     }
                     throw error
                 }
@@ -3919,7 +4017,11 @@ internal class ProductionProductRepository(
                     throw error
                 } catch (error: Exception) {
                     if (BuildConfig.DEBUG) {
-                        Log.e("TermLinkTailFirst", "Snapshot decrypt/prepare failed", error)
+                        val failure = classifySessionOpenException(
+                            error,
+                            SessionFailureStage.SNAPSHOT_PREPARE,
+                        ).failure.code.stableCode
+                        Log.e("TermLinkTailFirst", "Snapshot decrypt/prepare failed [$failure]")
                     }
                     throw error
                 }
@@ -3933,23 +4035,33 @@ internal class ProductionProductRepository(
                         "Snapshot drifted before bind snapshot=$sequence tail=${currentTail ?: 0uL}",
                     )
                 }
+                if (!current) onFailure(SessionOpenFailure(SessionOpenFailureCode.SNAPSHOT_STALE))
                 current
             },
             bind = {
-                historyRepository.bindRendererCheckpoint(
-                    sessionId = session.id,
-                    direction = LIVE_OUTPUT_ACK_DIRECTION,
-                    expectedRendererGeneration = expectedRendererGeneration,
-                    snapshotId = metadata.id,
-                    snapshotSequence = sequence,
-                    ciphertextSha256 = metadata.ciphertextSha256,
-                )
+                try {
+                    historyRepository.bindRendererCheckpoint(
+                        sessionId = session.id,
+                        direction = LIVE_OUTPUT_ACK_DIRECTION,
+                        expectedRendererGeneration = expectedRendererGeneration,
+                        snapshotId = metadata.id,
+                        snapshotSequence = sequence,
+                        ciphertextSha256 = metadata.ciphertextSha256,
+                    )
+                } catch (error: Exception) {
+                    throw sessionOpenException(SessionOpenFailureCode.LOCAL_CHECKPOINT, error)
+                }
             },
             installAndMap = { prepared, bound ->
-                val installed = engine.installPrepared(prepared.checkpoint)
-                check(installed.sequence.toULong() == bound.snapshotSequence &&
-                    installed.size == TerminalSize(bound.snapshotColumns, bound.snapshotRows)
-                ) { "Installed renderer checkpoint does not match the bound snapshot" }
+                val installed = try {
+                    engine.installPrepared(prepared.checkpoint).also { value ->
+                        check(value.sequence.toULong() == bound.snapshotSequence &&
+                            value.size == TerminalSize(bound.snapshotColumns, bound.snapshotRows)
+                        ) { "Installed renderer checkpoint does not match the bound snapshot" }
+                    }
+                } catch (error: Exception) {
+                    throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_INSTALL, error)
+                }
                 RestoredLiveHistory(
                     rendererState = RendererBootstrapState.ExactCheckpoint(
                         sequence = installed.sequence,
@@ -3965,7 +4077,13 @@ internal class ProductionProductRepository(
             },
             resetAfterInstallFailure = { bound ->
                 resetLiveRendererAndCursor(session, engine, bound.rendererGeneration)
-                error("Unable to install the verified terminal snapshot")
+                throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_INSTALL)
+            },
+            onLoadFailure = { error ->
+                onFailure(classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_DOWNLOAD).failure)
+            },
+            onPrepareFailure = { error ->
+                onFailure(classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_PREPARE).failure)
             },
         )
     }
@@ -3987,6 +4105,7 @@ internal class ProductionProductRepository(
             ?: historyRepository.initializeAckCursor(session.id, LIVE_OUTPUT_ACK_DIRECTION)
         var latestAuthoritativeTail = session.lastOutputSequence
         var authoritativeReadinessObserved = false
+        var latestSnapshotFailure: SessionOpenFailure? = null
         val restoredSnapshot = restoreSnapshotWhenEnabled(
             enabled = BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME,
             remoteRetryDelaysMillis = TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS,
@@ -4007,7 +4126,11 @@ internal class ProductionProductRepository(
                     throw error
                 } catch (error: Exception) {
                     if (BuildConfig.DEBUG) {
-                        Log.e("TermLinkTailFirst", "Snapshot readiness request failed", error)
+                        val failure = classifySessionOpenException(
+                            error,
+                            SessionFailureStage.SNAPSHOT_METADATA,
+                        ).failure.code.stableCode
+                        Log.e("TermLinkTailFirst", "Snapshot readiness request failed [$failure]")
                     }
                     throw error
                 }
@@ -4015,6 +4138,7 @@ internal class ProductionProductRepository(
             remoteReady = { observation -> observation.snapshot != null },
             onRemoteObserved = { observation ->
                 authoritativeReadinessObserved = true
+                observation.failure?.let { latestSnapshotFailure = it }
                 latestAuthoritativeTail = maxOf(
                     latestAuthoritativeTail,
                     observation.lastOutputSequence,
@@ -4029,7 +4153,14 @@ internal class ProductionProductRepository(
                     engine,
                     cursor.rendererGeneration,
                     requireNotNull(observation.snapshot),
+                    onFailure = { latestSnapshotFailure = it },
                 )
+            },
+            onRemoteFailure = { error ->
+                latestSnapshotFailure = classifySessionOpenException(
+                    error,
+                    SessionFailureStage.SNAPSHOT_METADATA,
+                ).failure
             },
         )
         if (restoredSnapshot != null) {
@@ -4039,13 +4170,12 @@ internal class ProductionProductRepository(
             // trail by one bounded flow-control window, never by an unbounded
             // historical prefix.
             val currentTail = latestAuthoritativeSessionTail(session)
-                ?: error("The authoritative terminal tail is unavailable")
-            check(
-                snapshotHasBoundedLiveSuffix(
+                ?: throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_METADATA)
+            if (!snapshotHasBoundedLiveSuffix(
                     restoredSnapshot.rendererState.sequence.toULong(),
                     currentTail,
-                ),
-            ) { "The verified terminal snapshot no longer matches the authoritative tail" }
+                )
+            ) throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_STALE)
             return restoredSnapshot
         }
         // A brand-new silent session has no historical terminal state to
@@ -4060,7 +4190,9 @@ internal class ProductionProductRepository(
             return RestoredLiveHistory(RendererBootstrapState.Empty(cursor.rendererGeneration))
         }
         if (BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME) {
-            error("A verified terminal snapshot is not available for this session")
+            throw SessionOpenException(
+                latestSnapshotFailure ?: SessionOpenFailure(SessionOpenFailureCode.SNAPSHOT_NOT_READY),
+            )
         }
         if (cursor.sequence == 0uL) {
             return RestoredLiveHistory(RendererBootstrapState.Empty(cursor.rendererGeneration))
@@ -4792,6 +4924,7 @@ internal suspend fun <Remote, Restored> restoreSnapshotWhenEnabled(
     pause: suspend (Long) -> Unit = { delay(it) },
     remoteReady: (Remote) -> Boolean = { true },
     onRemoteObserved: (Remote) -> Unit = {},
+    onRemoteFailure: (Exception) -> Unit = {},
 ): Restored? {
     if (!enabled) return null
     restoreBound()?.let { return it }
@@ -4805,7 +4938,8 @@ internal suspend fun <Remote, Restored> restoreSnapshotWhenEnabled(
                 latestRemote()
             } catch (error: CancellationException) {
                 throw error
-            } catch (_: Exception) {
+            } catch (error: Exception) {
+                onRemoteFailure(error)
                 null
             }
             if (remote != null) {
@@ -4877,12 +5011,23 @@ internal suspend fun <Loaded, Prepared, Bound, Restored> prepareBindInstallSnaps
     bind: suspend () -> Bound,
     installAndMap: suspend (Prepared, Bound) -> Restored,
     resetAfterInstallFailure: suspend (Bound) -> Restored,
+    onLoadFailure: (Exception) -> Unit = {},
+    onPrepareFailure: (Exception) -> Unit = {},
 ): Restored? {
-    val prepared = try {
-        prepare(loadAndCache())
+    val loaded = try {
+        loadAndCache()
     } catch (error: CancellationException) {
         throw error
-    } catch (_: Exception) {
+    } catch (error: Exception) {
+        onLoadFailure(error)
+        return null
+    }
+    val prepared = try {
+        prepare(loaded)
+    } catch (error: CancellationException) {
+        throw error
+    } catch (error: Exception) {
+        onPrepareFailure(error)
         return null
     }
     if (!preparedIsCurrent(prepared)) return null

@@ -1,0 +1,104 @@
+package dev.termlink.product
+
+import dev.termlink.network.production.TermLinkApiException
+import java.io.IOException
+import java.net.SocketTimeoutException
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class SessionOpenFailureTest {
+    @Test
+    fun stableCodesAreUniqueAndSafeForUserReports() {
+        val codes = SessionOpenFailureCode.entries.map(SessionOpenFailureCode::stableCode)
+
+        assertEquals(codes.size, codes.toSet().size)
+        assertTrue(codes.all { it.matches(Regex("TL-[A-Z][0-9]{3}")) })
+    }
+
+    @Test
+    fun serverAndNetworkFailuresRetainActionableCategories() {
+        assertClassified(
+            SessionOpenFailureCode.AUTHENTICATION_EXPIRED,
+            classifySessionOpenException(
+                TermLinkApiException(401, "TOKEN_EXPIRED", null),
+                SessionFailureStage.REALTIME,
+            ),
+        )
+        val forbidden = classifySessionOpenException(
+            TermLinkApiException(403, "DEVICE_FORBIDDEN", null),
+            SessionFailureStage.REALTIME,
+        )
+        assertClassified(SessionOpenFailureCode.ACCESS_DENIED, forbidden)
+        assertEquals(403, forbidden.failure.httpStatus)
+        assertClassified(
+            SessionOpenFailureCode.CONTROL_LEASE_HELD,
+            classifySessionOpenException(
+                TermLinkApiException(409, "LEASE_HELD", null),
+                SessionFailureStage.CONTROL,
+            ),
+        )
+        assertClassified(
+            SessionOpenFailureCode.SERVICE_TIMEOUT,
+            classifySessionOpenException(SocketTimeoutException(), SessionFailureStage.SNAPSHOT_METADATA),
+        )
+        assertClassified(
+            SessionOpenFailureCode.SNAPSHOT_DOWNLOAD,
+            classifySessionOpenException(IOException("private URL omitted"), SessionFailureStage.SNAPSHOT_DOWNLOAD),
+        )
+    }
+
+    @Test
+    fun snapshotFailuresSeparateIntegrityKeysFormatRendererAndInstall() {
+        assertClassified(
+            SessionOpenFailureCode.SNAPSHOT_INTEGRITY,
+            classifySessionOpenException(
+                IllegalArgumentException("History download integrity check failed"),
+                SessionFailureStage.SNAPSHOT_DOWNLOAD,
+            ),
+        )
+        assertClassified(
+            SessionOpenFailureCode.SNAPSHOT_RECIPIENT,
+            classifySessionOpenException(
+                IllegalArgumentException("Snapshot key ID is not for this device"),
+                SessionFailureStage.SNAPSHOT_PREPARE,
+            ),
+        )
+        assertClassified(
+            SessionOpenFailureCode.SNAPSHOT_FORMAT,
+            classifySessionOpenException(
+                IllegalArgumentException("Snapshot format is unsupported"),
+                SessionFailureStage.SNAPSHOT_PREPARE,
+            ),
+        )
+        assertClassified(
+            SessionOpenFailureCode.TERMINAL_RENDERER,
+            classifySessionOpenException(
+                IllegalArgumentException("primary cell style has unsupported effects"),
+                SessionFailureStage.SNAPSHOT_PREPARE,
+            ),
+        )
+        assertClassified(
+            SessionOpenFailureCode.SNAPSHOT_INSTALL,
+            classifySessionOpenException(
+                IllegalStateException("install failed"),
+                SessionFailureStage.SNAPSHOT_INSTALL,
+            ),
+        )
+        assertFalse(SessionOpenFailureCode.SNAPSHOT_FORMAT.retryable)
+        assertTrue(SessionOpenFailureCode.SNAPSHOT_INSTALL.retryable)
+    }
+
+    @Test
+    fun alreadyClassifiedFailureIsNotDowngradedByOuterStage() {
+        val original = sessionOpenException(SessionOpenFailureCode.TERMINAL_RENDERER)
+
+        assertTrue(classifySessionOpenException(original, SessionFailureStage.CONTROL) === original)
+    }
+
+    private fun assertClassified(expected: SessionOpenFailureCode, error: SessionOpenException) {
+        assertEquals(expected, error.failure.code)
+        assertEquals(expected.stableCode, error.message)
+    }
+}

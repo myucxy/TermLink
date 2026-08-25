@@ -623,6 +623,7 @@ type PCRecord struct {
 	RemoteRoutingEnabled      bool       `json:"remote_routing_enabled"`
 	SessionHeartbeatCapable   bool       `json:"session_heartbeat_capable"`
 	SessionHeartbeatEnabledAt *time.Time `json:"session_heartbeat_enabled_at,omitempty"`
+	SupportedShells           []string   `json:"supported_shells"`
 	Online                    bool       `json:"online"`
 	LastSeenAt                *time.Time `json:"last_seen_at,omitempty"`
 }
@@ -658,13 +659,14 @@ func (s *Postgres) UpsertPC(ctx context.Context, userID, deviceID uuid.UUID, ite
 	_, err = tx.Exec(ctx, `
 		INSERT INTO pcs(
 			id,owner_user_id,device_id,name,agent_version,key_epoch,last_seen_at,
-			session_heartbeat_capable,session_heartbeat_enabled_at)
-		VALUES($1,$2,$3,$4,$5,$6,now(),$7,CASE WHEN $7 THEN now() END)
+			session_heartbeat_capable,session_heartbeat_enabled_at,supported_shells)
+		VALUES($1,$2,$3,$4,$5,$6,now(),$7,CASE WHEN $7 THEN now() END,COALESCE($8::text[],ARRAY[]::text[]))
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name,agent_version=excluded.agent_version,
 		key_epoch=GREATEST(pcs.key_epoch,excluded.key_epoch),last_seen_at=now(),
 		session_heartbeat_capable=pcs.session_heartbeat_capable OR excluded.session_heartbeat_capable,
-		session_heartbeat_enabled_at=COALESCE(pcs.session_heartbeat_enabled_at,excluded.session_heartbeat_enabled_at)
-		WHERE pcs.owner_user_id=$2 AND pcs.device_id=$3`, item.ID, userID, deviceID, item.Name, item.AgentVersion, item.KeyEpoch, item.SessionHeartbeatCapable)
+		session_heartbeat_enabled_at=COALESCE(pcs.session_heartbeat_enabled_at,excluded.session_heartbeat_enabled_at),
+		supported_shells=excluded.supported_shells
+		WHERE pcs.owner_user_id=$2 AND pcs.device_id=$3`, item.ID, userID, deviceID, item.Name, item.AgentVersion, item.KeyEpoch, item.SessionHeartbeatCapable, item.SupportedShells)
 	if err != nil {
 		return err
 	}
@@ -713,6 +715,7 @@ func (s *Postgres) ListPCs(ctx context.Context, userID, deviceID uuid.UUID) ([]P
 	rows, err := s.Pool.Query(ctx, `
 		SELECT p.id,p.device_id,p.name,p.agent_version,p.key_epoch,p.remote_routing_enabled,
 		       p.session_heartbeat_capable,p.session_heartbeat_enabled_at,
+		       p.supported_shells,
 		       COALESCE(p.last_seen_at > now()-($4 * interval '1 second'),false),p.last_seen_at
 		FROM pcs p
 		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
@@ -734,7 +737,7 @@ func (s *Postgres) ListPCs(ctx context.Context, userID, deviceID uuid.UUID) ([]P
 		var item PCRecord
 		if err := rows.Scan(&item.ID, &item.DeviceID, &item.Name, &item.AgentVersion, &item.KeyEpoch,
 			&item.RemoteRoutingEnabled, &item.SessionHeartbeatCapable, &item.SessionHeartbeatEnabledAt,
-			&item.Online, &item.LastSeenAt); err != nil {
+			&item.SupportedShells, &item.Online, &item.LastSeenAt); err != nil {
 			return nil, err
 		}
 		result = append(result, item)

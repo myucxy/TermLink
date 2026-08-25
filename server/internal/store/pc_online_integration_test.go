@@ -49,10 +49,11 @@ func TestListPCsReportsServerAuthoritativeOnline(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := repository.UpsertPC(ctx, userID, deviceID, PCRecord{
-		ID:           pcID,
-		Name:         "Online PC",
-		AgentVersion: "integration-test",
-		KeyEpoch:     1,
+		ID:              pcID,
+		Name:            "Online PC",
+		AgentVersion:    "integration-test",
+		KeyEpoch:        1,
+		SupportedShells: []string{"command-prompt", "windows-powershell"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -63,6 +64,9 @@ func TestListPCsReportsServerAuthoritativeOnline(t *testing.T) {
 	}
 	if len(pcs) != 1 || pcs[0].ID != pcID || !pcs[0].Online {
 		t.Fatalf("fresh PCs=%+v, want PC %s online", pcs, pcID)
+	}
+	if got := pcs[0].SupportedShells; len(got) != 2 || got[0] != "command-prompt" || got[1] != "windows-powershell" {
+		t.Fatalf("supported shells=%v, want Agent-reported ordered capabilities", got)
 	}
 
 	if _, err := repository.Pool.Exec(ctx,

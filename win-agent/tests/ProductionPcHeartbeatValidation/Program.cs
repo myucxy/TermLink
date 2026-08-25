@@ -109,6 +109,7 @@ internal static class Program
             ValidateReconnectPreferences();
             var agentAssembly = Assembly.Load("TermLink.Agent");
             var runtimeType = agentAssembly.GetType("TermLink.Agent.ProductionAgentRuntime", true);
+            var terminalLauncherType = agentAssembly.GetType("TermLink.Agent.ManagedTerminalLauncher", true);
             var configType = agentAssembly.GetType("TermLink.Agent.ProductionAgentConfig", true);
             var credentialsType = agentAssembly.GetType("TermLink.Agent.ProductionCredentials", true);
             var relayStateType = Field(runtimeType, "relayState").FieldType;
@@ -146,11 +147,22 @@ internal static class Program
             var initial = PCRequests(handler, pcId).Single();
 
             var buildBody = Method(runtimeType, "BuildPCUpsertBody");
-            var expectedBody = (byte[])buildBody.Invoke(
+            var legacyBody = (byte[])buildBody.Invoke(
                 null,
                 new object[] { "Heartbeat Validation PC", "validation-1", 7L });
+            using (var legacyJson = JsonDocument.Parse(legacyBody))
+            {
+                Require(!legacyJson.RootElement.TryGetProperty("supported_shells", out _),
+                    "The legacy PC upsert helper changed its compatibility contract.");
+            }
+            var buildCapabilitiesBody = Method(runtimeType, "BuildPCUpsertBodyWithCapabilities");
+            var detectShells = Method(terminalLauncherType, "DetectSupportedShellTypes");
+            var initialShells = (string[])detectShells.Invoke(null, null);
+            var expectedBody = (byte[])buildCapabilitiesBody.Invoke(
+                null,
+                new object[] { "Heartbeat Validation PC", "validation-1", 7L, initialShells });
             Require(initial.Method == HttpMethod.Put && initial.Body.SequenceEqual(expectedBody),
-                "Initial registration did not use the shared PC upsert body.");
+                "Initial registration did not advertise detected PC capabilities.");
             var pcUpsertKey = Method(runtimeType, "PCUpsertIdempotencyKey");
             var sameKey = (string)pcUpsertKey.Invoke(null, new object[] { pcId, expectedBody });
             var changedBody = (byte[])buildBody.Invoke(
@@ -171,6 +183,36 @@ internal static class Program
             {
                 Require(json.RootElement.GetProperty("session_heartbeat_capable").GetBoolean(),
                     "PC upsert did not advertise heartbeat capability.");
+                Require(
+                    json.RootElement.GetProperty("supported_shells").EnumerateArray()
+                        .Select(value => value.GetString()).SequenceEqual(initialShells),
+                    "PC upsert did not advertise the detected managed shells.");
+            }
+
+            var capabilityRoot = Path.Combine(Path.GetTempPath(), "termlink-shell-capabilities-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(capabilityRoot);
+            try
+            {
+                var sessionHost = Path.Combine(capabilityRoot, "TermLink.SessionHost.exe");
+                var cmd = Path.Combine(capabilityRoot, "cmd.exe");
+                var powershell = Path.Combine(capabilityRoot, "powershell.exe");
+                File.WriteAllBytes(sessionHost, Array.Empty<byte>());
+                File.WriteAllBytes(cmd, Array.Empty<byte>());
+                var detectShellsAtPaths = Method(terminalLauncherType, "DetectSupportedShellTypesAtPaths");
+                var detected = (string[])detectShellsAtPaths.Invoke(null, new object[] { sessionHost, cmd, powershell });
+                Require(detected.SequenceEqual(new[] { "command-prompt" }),
+                    "Shell capability detection did not exclude a missing executable.");
+                File.WriteAllBytes(powershell, Array.Empty<byte>());
+                detected = (string[])detectShellsAtPaths.Invoke(null, new object[] { sessionHost, cmd, powershell });
+                Require(detected.SequenceEqual(new[] { "command-prompt", "windows-powershell" }),
+                    "Shell capability detection is not stable and ordered.");
+                File.Delete(sessionHost);
+                Require(((string[])detectShellsAtPaths.Invoke(null, new object[] { sessionHost, cmd, powershell })).Length == 0,
+                    "Shell capability detection ignored a missing SessionHost.");
+            }
+            finally
+            {
+                Directory.Delete(capabilityRoot, recursive: true);
             }
 
             var sessionUpsertKey = Method(runtimeType, "SessionUpsertIdempotencyKey");

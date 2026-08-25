@@ -662,6 +662,8 @@ data class ProductSnapshot(
     val remoteFileBrowser: RemoteFileBrowserState = RemoteFileBrowserState(),
     val remoteDownloads: List<RemoteDownloadRecord> = emptyList(),
     val sessionStates: Map<UUID, RemoteSessionState> = emptyMap(),
+    /** Detailed, non-sensitive failures for a single session open/control path. */
+    val sessionOpenFailures: Map<UUID, SessionOpenFailure> = emptyMap(),
     /** Decrypted OSC/checkpoint titles, keyed only by their owning session UUID. */
     val sessionTitles: Map<UUID, String> = emptyMap(),
     val activity: List<ActivityEntry> = emptyList(),
@@ -713,6 +715,7 @@ internal fun ProductSnapshot.withoutSession(sessionId: UUID): ProductSnapshot {
     return copy(
         sessions = sessions.filterNot { it.id == sessionId },
         sessionStates = sessionStates - sessionId,
+        sessionOpenFailures = sessionOpenFailures - sessionId,
         sessionTitles = sessionTitles - sessionId,
         history = history.filterNot { it.sessionId == sessionId },
         replayedHistoryObjectIds = replayedHistoryObjectIds - removedHistoryObjectIds,
