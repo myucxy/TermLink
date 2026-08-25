@@ -12,12 +12,16 @@ import org.junit.Test
 
 class TerminalSnapshotBootstrapTest {
     @Test
-    fun productionReadinessPolicyUsesTenSecondBudgetWithShortRequests() {
-        assertEquals(10_000L, TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS)
+    fun productionReadinessPolicyCoversSlowWindowsRegistrationWithShortRequests() {
+        assertEquals(30_000L, TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS)
         assertEquals(1_000L, TERMINAL_SNAPSHOT_READINESS_REQUEST_TIMEOUT_MILLIS)
         assertEquals(128, TERMINAL_SNAPSHOT_MAX_LIVE_SUFFIX_EVENTS)
         assertEquals(
-            listOf(100L, 200L, 400L, 800L, 1_500L, 2_000L, 2_000L, 2_000L, 2_000L),
+            listOf(
+                100L, 200L, 400L, 800L, 1_500L,
+                2_000L, 2_000L, 2_000L, 2_000L, 2_000L, 2_000L, 2_000L,
+                2_000L, 2_000L, 2_000L, 2_000L, 2_000L, 2_000L, 2_000L,
+            ),
             TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS,
         )
         assertTrue(
@@ -32,6 +36,14 @@ class TerminalSnapshotBootstrapTest {
             TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS.sum() >=
                 TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS,
         )
+    }
+
+    @Test
+    fun freshSessionCanUseOnlyTheBoundedAgentReplayWindow() {
+        assertTrue(canFreshSessionReplayFromZero(0uL, 0uL))
+        assertTrue(canFreshSessionReplayFromZero(128uL, 0uL))
+        assertFalse(canFreshSessionReplayFromZero(129uL, 0uL))
+        assertFalse(canFreshSessionReplayFromZero(1uL, 1uL))
     }
 
     @Test

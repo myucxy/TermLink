@@ -478,6 +478,7 @@ internal class ProductionProductRepository(
     private val historyDownloads = ConcurrentHashMap<UUID, HistoryDownloadRequest>()
     private val transcriptLoads = ConcurrentHashMap<TranscriptLoadKey, Deferred<Unit>>()
     private val deletedSessionIds = ConcurrentHashMap.newKeySet<UUID>()
+    private val newlyLaunchedSessionIds = ConcurrentHashMap.newKeySet<UUID>()
     private val remoteDownloadJobs = ConcurrentHashMap<UUID, Job>()
     private var remoteDownloadRecoveryJob: Job? = null
     private val remoteDownloadStateLock = Any()
@@ -1222,6 +1223,7 @@ internal class ProductionProductRepository(
                 pcDevice = pcDevice,
                 stored = stored,
                 engine = engine,
+                allowFreshReplayFromZero = sessionId in newlyLaunchedSessionIds,
             )
         } catch (error: CancellationException) {
             engine.dispose()
@@ -1378,6 +1380,7 @@ internal class ProductionProductRepository(
         }
         try {
             client.start()
+            newlyLaunchedSessionIds.remove(sessionId)
         } catch (error: CancellationException) {
             synchronized(liveSessionLock) {
                 liveSessions.remove(sessionId, live)
@@ -1397,6 +1400,7 @@ internal class ProductionProductRepository(
 
     override suspend fun closeSessionView(sessionId: UUID): Unit = sessionLifecycleLock.withLock {
         check(!closed) { "Repository is closed" }
+        newlyLaunchedSessionIds.remove(sessionId)
         val live = synchronized(liveSessionLock) { liveSessions.remove(sessionId) }
         live?.closeAndJoin()
         // Closing an Android tab is intentionally local. Keep the authoritative
@@ -1828,6 +1832,7 @@ internal class ProductionProductRepository(
                 true
             } ?: false
             check(ready) { "The new terminal session did not become available" }
+            newlyLaunchedSessionIds.add(sessionId)
             mutableSnapshot.update { current ->
                 current.copy(
                     remoteFileBrowser = reduceRemoteFileBrowser(
@@ -4177,9 +4182,26 @@ internal class ProductionProductRepository(
         pcDevice: DeviceSummary,
         stored: DeviceKeyVault.StoredIdentity,
         engine: TermuxTerminalEngine,
+        allowFreshReplayFromZero: Boolean = false,
     ): RestoredLiveHistory {
         val cursor = historyRepository.ackCursorState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
             ?: historyRepository.initializeAckCursor(session.id, LIVE_OUTPUT_ACK_DIRECTION)
+        if (allowFreshReplayFromZero && cursor.sequence == 0uL) {
+            val currentTail = try {
+                latestAuthoritativeSessionTail(session)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                null
+            }
+            if (currentTail != null && canFreshSessionReplayFromZero(currentTail, cursor.sequence)) {
+                // This ID was allocated by the current Android launch request,
+                // so there is no older output outside the Agent replay window.
+                // Connecting immediately avoids reporting TL-H113 while a new
+                // session's first Snapshot/history publication is still queued.
+                return RestoredLiveHistory(RendererBootstrapState.Empty(cursor.rendererGeneration))
+            }
+        }
         var latestAuthoritativeTail = session.lastOutputSequence
         var authoritativeReadinessObserved = false
         var latestSnapshotFailure: SessionOpenFailure? = null
@@ -5211,6 +5233,13 @@ internal fun canSafelySubscribeFromZeroWithoutSnapshot(
 ): Boolean = authoritativeReadinessObserved &&
     currentSessionSequence == 0uL && durableAcknowledgement == 0uL
 
+/** A locally requested new shell can replay its bounded startup suffix live. */
+internal fun canFreshSessionReplayFromZero(
+    currentSessionSequence: ULong,
+    durableAcknowledgement: ULong,
+): Boolean = durableAcknowledgement == 0uL &&
+    currentSessionSequence <= TERMINAL_SNAPSHOT_MAX_LIVE_SUFFIX_EVENTS.toULong()
+
 /** A permanent producer rejection cannot become ready by polling the same prefix. */
 internal fun snapshotReadinessIsSettled(
     snapshotAvailable: Boolean,
@@ -5228,15 +5257,21 @@ internal fun shouldReplaceLiveSessionForOpen(
     remoteState.reason == SESSION_BOOTSTRAP_FAILED_REASON
 
 /**
- * Bounded to 10 seconds in total. Snapshot-capable sessions get enough time for
- * the Agent -> object store -> history-index pipeline to settle, while older
- * Agents that never publish snapshots do not block session opening indefinitely.
+ * Bounded to 30 seconds in total. A remotely launched Windows shell can spend
+ * up to 30 seconds registering with the Agent before its first Snapshot enters
+ * the Agent -> object store -> history-index pipeline. Keeping a second bounded
+ * window here prevents a new session from being classified as TL-H113 while
+ * that normal startup pipeline is still settling.
  * The retry schedule extends beyond the absolute deadline so a fast empty
  * response cannot exhaust the attempts before the readiness window closes.
  */
 internal val TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS =
-    listOf(100L, 200L, 400L, 800L, 1_500L, 2_000L, 2_000L, 2_000L, 2_000L)
-internal const val TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS = 10_000L
+    listOf(
+        100L, 200L, 400L, 800L, 1_500L,
+        2_000L, 2_000L, 2_000L, 2_000L, 2_000L, 2_000L, 2_000L,
+        2_000L, 2_000L, 2_000L, 2_000L, 2_000L, 2_000L, 2_000L,
+    )
+internal const val TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS = 30_000L
 internal const val TERMINAL_SNAPSHOT_READINESS_REQUEST_TIMEOUT_MILLIS = 1_000L
 internal val TRANSCRIPT_PUBLICATION_RETRY_DELAYS_MILLIS = listOf(100L, 200L, 400L, 800L, 1_000L, 1_500L)
 // Matches one Windows realtime flow-control window. This lets an active

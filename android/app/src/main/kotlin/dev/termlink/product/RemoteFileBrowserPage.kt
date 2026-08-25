@@ -36,7 +36,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedIconButton
 import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
@@ -81,6 +81,10 @@ internal fun RemoteFileBrowserPage(
 ) {
     var selectedTabIndex by rememberSaveable(state.pcId) { mutableIntStateOf(0) }
     val parentTarget = remoteFileParentTarget(state.currentPath, state.parentPath)
+    val currentDirectory = remoteCurrentDirectoryEntry(state.currentPath)
+    val currentDirectoryFavorite = currentDirectory != null && state.pcId?.let { pcId ->
+        isRemoteDirectoryFavorite(favorites, pcId, currentDirectory.path)
+    } == true
     Column(modifier = modifier.fillMaxSize()) {
         PrimaryTabRow(selectedTabIndex = selectedTabIndex) {
             Tab(
@@ -110,14 +114,32 @@ internal fun RemoteFileBrowserPage(
                             maxLines = 3,
                             overflow = TextOverflow.Ellipsis,
                         )
-                        OutlinedButton(
-                            onClick = { parentTarget?.let(onOpenDirectory) },
-                            enabled = parentTarget != null && !state.loading,
-                            modifier = Modifier.heightIn(min = 48.dp),
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null)
-                            Spacer(Modifier.width(6.dp))
-                            Text(stringResource(R.string.remote_files_parent))
+                            OutlinedIconButton(
+                                onClick = { parentTarget?.let(onOpenDirectory) },
+                                enabled = parentTarget != null && !state.loading,
+                                modifier = Modifier.size(40.dp),
+                                shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
+                            ) {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.ArrowBack,
+                                    contentDescription = stringResource(R.string.remote_files_parent),
+                                    modifier = Modifier.size(20.dp),
+                                )
+                            }
+                            CurrentDirectoryActions(
+                                directory = currentDirectory,
+                                shellOpening = state.openingShell,
+                                supportedShells = supportedShells,
+                                favorite = currentDirectoryFavorite,
+                                onDownload = onDownload,
+                                onOpenShell = onOpenShell,
+                                onToggleFavorite = { directory -> onToggleFavorite(directory) },
+                            )
                         }
                         state.error?.let { error ->
                             Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
@@ -196,6 +218,87 @@ internal fun RemoteFileBrowserPage(
                         onRemove = { onRemoveFavorite(favorite) },
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CurrentDirectoryActions(
+    directory: RemoteFileEntry?,
+    shellOpening: RemoteShellType?,
+    supportedShells: List<RemoteShellType>,
+    favorite: Boolean,
+    onDownload: (RemoteFileEntry) -> Unit,
+    onOpenShell: (String, RemoteShellType) -> Unit,
+    onToggleFavorite: (RemoteFileEntry) -> Unit,
+) {
+    var menuExpanded by remember(directory?.path) { mutableStateOf(false) }
+    Box {
+        OutlinedIconButton(
+            onClick = { menuExpanded = true },
+            enabled = directory != null,
+            modifier = Modifier.size(40.dp),
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
+        ) {
+            Icon(
+                Icons.Filled.MoreVert,
+                contentDescription = stringResource(R.string.remote_current_directory_actions),
+                modifier = Modifier.size(20.dp),
+            )
+        }
+        DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+            if (directory != null) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.action_download_zip)) },
+                    leadingIcon = { Icon(Icons.Filled.Download, contentDescription = null) },
+                    onClick = {
+                        menuExpanded = false
+                        onDownload(directory)
+                    },
+                )
+                supportedShells.forEach { shell ->
+                    DropdownMenuItem(
+                        text = { Text(shell.localizedLabel()) },
+                        leadingIcon = {
+                            if (shellOpening == shell) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Filled.Terminal, contentDescription = null)
+                            }
+                        },
+                        enabled = shellOpening == null,
+                        onClick = {
+                            menuExpanded = false
+                            onOpenShell(directory.path, shell)
+                        },
+                    )
+                }
+                if (supportedShells.isEmpty()) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.remote_shells_unavailable)) },
+                        leadingIcon = { Icon(Icons.Filled.Terminal, contentDescription = null) },
+                        enabled = false,
+                        onClick = {},
+                    )
+                }
+                DropdownMenuItem(
+                    text = {
+                        Text(stringResource(
+                            if (favorite) R.string.action_remove_favorite else R.string.action_add_favorite,
+                        ))
+                    },
+                    leadingIcon = {
+                        Icon(
+                            if (favorite) Icons.Filled.Star else Icons.Filled.StarBorder,
+                            contentDescription = null,
+                        )
+                    },
+                    onClick = {
+                        menuExpanded = false
+                        onToggleFavorite(directory)
+                    },
+                )
             }
         }
     }
@@ -419,6 +522,8 @@ private fun RemoteFileEntryRow(
 private fun RemoteShellType.localizedLabel(): String = when (this) {
     RemoteShellType.COMMAND_PROMPT -> stringResource(R.string.action_open_cmd)
     RemoteShellType.WINDOWS_POWERSHELL -> stringResource(R.string.action_open_powershell)
+    RemoteShellType.POWERSHELL_7 -> stringResource(R.string.action_open_powershell_7)
+    RemoteShellType.WSL -> stringResource(R.string.action_open_wsl)
 }
 
 @Composable

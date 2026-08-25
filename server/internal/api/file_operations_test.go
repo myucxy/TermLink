@@ -27,6 +27,8 @@ import (
 func TestValidateFileOperationRequestShapes(t *testing.T) {
 	offset := int64(10)
 	powershell := "windows-powershell"
+	powershell7 := "powershell-7"
+	wsl := "wsl"
 	for _, test := range []struct {
 		name      string
 		operation string
@@ -39,6 +41,8 @@ func TestValidateFileOperationRequestShapes(t *testing.T) {
 		{"paged list", store.FileOperationList, `C:\`, &offset, nil, true},
 		{"download", store.FileOperationDownload, `C:\file.txt`, nil, nil, true},
 		{"terminal", store.FileOperationOpenTerminal, `C:\folder`, nil, &powershell, true},
+		{"PowerShell 7 terminal", store.FileOperationOpenTerminal, `C:\folder`, nil, &powershell7, true},
+		{"WSL terminal", store.FileOperationOpenTerminal, `C:\folder`, nil, &wsl, true},
 		{"empty download", store.FileOperationDownload, "", nil, nil, false},
 		{"download offset", store.FileOperationDownload, `C:\file.txt`, &offset, nil, false},
 		{"unknown shell", store.FileOperationOpenTerminal, `C:\`, nil, stringPointerAPI("bash"), false},

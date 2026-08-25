@@ -173,7 +173,7 @@
     <string name="entitlement_effective_from">Effective from %1$s</string>
     <string name="entitlement_effective_until">Effective %1$s · expires %2$s</string>
     <string name="terminal_live">Live terminal</string>
-    <string name="terminal_connecting">Connecting</string>
+    <string name="terminal_connecting">Establishing connection</string>
     <string name="terminal_controlling">Controlling</string>
     <string name="terminal_live_state">Live</string>
     <string name="terminal_reconnecting">Reconnecting</string>
@@ -376,6 +376,7 @@
     <string name="action_download">Download</string>
     <string name="action_download_zip">Download as ZIP</string>
     <string name="action_more_options">More options</string>
+    <string name="remote_current_directory_actions">Current directory actions</string>
     <string name="action_add_favorite">Add directory to favorites</string>
     <string name="action_remove_favorite">Remove from favorites</string>
     <string name="action_delete_favorite">Delete favorite</string>
@@ -394,6 +395,9 @@
     <string name="remote_shells_unavailable">This PC did not report an available command line</string>
     <string name="action_open_cmd">CMD</string>
     <string name="action_open_powershell">Windows PowerShell</string>
+    <string name="action_open_powershell_7">PowerShell 7</string>
+    <string name="action_open_wsl">WSL</string>
+    <string name="devices_back_again_to_exit">Press back again to exit</string>
     <string name="remote_pc_unavailable">Windows PC unavailable</string>
     <string name="remote_pc_unavailable_copy">Return to Devices and select an online Windows PC.</string>
     <string name="remote_download_preparing">Preparing on Windows</string>

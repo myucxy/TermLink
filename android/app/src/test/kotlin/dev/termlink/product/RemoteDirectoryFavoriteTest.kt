@@ -4,7 +4,6 @@ import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import java.util.UUID
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -79,10 +78,17 @@ class RemoteDirectoryFavoriteTest {
             remoteRoutingEnabled = true,
             online = true,
             lastSeenAt = null,
-            supportedShells = setOf("windows-powershell", "unknown-shell"),
+            supportedShells = setOf("wsl", "powershell-7", "windows-powershell", "command-prompt", "unknown-shell"),
         )
 
-        assertEquals(listOf(RemoteShellType.WINDOWS_POWERSHELL), supportedRemoteShellTypes(pc))
-        assertFalse(supportedRemoteShellTypes(pc).contains(RemoteShellType.COMMAND_PROMPT))
+        assertEquals(
+            listOf(
+                RemoteShellType.COMMAND_PROMPT,
+                RemoteShellType.WINDOWS_POWERSHELL,
+                RemoteShellType.POWERSHELL_7,
+                RemoteShellType.WSL,
+            ),
+            supportedRemoteShellTypes(pc),
+        )
     }
 }

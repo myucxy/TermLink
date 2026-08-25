@@ -870,6 +870,7 @@ fun ProductApp(
     var selectedSessionId by rememberSaveable { mutableStateOf(restoredNavigation.selectedSessionId) }
     var openedSessionIds by remember { mutableStateOf(restoredNavigation.openedSessionIds) }
     var expandedPcIds by remember { mutableStateOf(restoredNavigation.expandedPcIds) }
+    var deviceBackArmedAt by remember { mutableStateOf<Long?>(null) }
     var selectedHistoryId by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedRemotePcId by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedRemotePcName by rememberSaveable { mutableStateOf("") }
@@ -930,6 +931,7 @@ fun ProductApp(
 
     fun navigateTo(next: ProductDestination) {
         if (next.isVisibleInProductShell) {
+            if (next != ProductDestination.DEVICES) deviceBackArmedAt = null
             destinationName = next.name
             if (next == next.primaryDestination().destination()) {
                 saveProductPrimaryDestination(context, next.primaryDestination())
@@ -982,8 +984,31 @@ fun ProductApp(
         }
     }
 
-    BackHandler(enabled = destination.primaryDestination().destination() != destination) {
-        navigateTo(destination.primaryDestination().destination())
+    val deviceBackExitMessage = stringResource(R.string.devices_back_again_to_exit)
+    BackHandler(
+        enabled = destination == ProductDestination.SESSIONS ||
+            destination == ProductDestination.DEVICES ||
+            destination.primaryDestination().destination() != destination,
+    ) {
+        when {
+            destination == ProductDestination.SESSIONS -> {
+                deviceBackArmedAt = null
+                navigateTo(ProductDestination.DEVICES)
+            }
+            destination.primaryDestination().destination() != destination -> {
+                navigateTo(destination.primaryDestination().destination())
+            }
+            destination == ProductDestination.DEVICES -> {
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (shouldExitAfterDeviceBack(now, deviceBackArmedAt)) {
+                    deviceBackArmedAt = null
+                    (context as? android.app.Activity)?.finish()
+                } else {
+                    deviceBackArmedAt = now
+                    Toast.makeText(context, deviceBackExitMessage, Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
     }
 
     fun runOperation(operation: suspend () -> Unit, onComplete: () -> Unit) {
@@ -3939,6 +3964,7 @@ private fun sessionStatusColor(
 ): Color = when {
     state == SessionState.EXITED -> ProductMuted
     remoteState is RemoteSessionState.Exited -> ProductMuted
+    isEstablishingSessionConnection(remoteState) -> ProductWarning
     remoteState is RemoteSessionState.Reconnecting || remoteState is RemoteSessionState.HistoryGap -> ProductDanger
     state == SessionState.INTERRUPTED -> ProductDanger
     !sessionOnline -> ProductMuted
@@ -3950,13 +3976,28 @@ private fun RemoteSessionState?.localizedTerminalStatus(): String = stringResour
     when (this) {
         null -> R.string.terminal_connecting
         is RemoteSessionState.Live -> R.string.terminal_live_state
-        is RemoteSessionState.Reconnecting -> R.string.terminal_reconnecting
+        is RemoteSessionState.Reconnecting -> if (isEstablishingSessionConnection(this)) {
+            R.string.terminal_connecting
+        } else {
+            R.string.terminal_reconnecting
+        }
         is RemoteSessionState.ReadOnly -> R.string.terminal_read_only
         is RemoteSessionState.Controlling -> R.string.terminal_controlling
         is RemoteSessionState.Exited -> R.string.terminal_exited
         is RemoteSessionState.HistoryGap -> R.string.terminal_history_gap
     },
 )
+
+internal const val DEVICE_BACK_EXIT_WINDOW_MILLIS = 2_000L
+
+internal fun shouldExitAfterDeviceBack(nowMillis: Long, armedAtMillis: Long?): Boolean =
+    armedAtMillis != null && nowMillis >= armedAtMillis &&
+        nowMillis - armedAtMillis <= DEVICE_BACK_EXIT_WINDOW_MILLIS
+
+internal fun isEstablishingSessionConnection(state: RemoteSessionState?): Boolean =
+    state is RemoteSessionState.Reconnecting &&
+        (state.reason == SESSION_BOOTSTRAP_IN_PROGRESS_REASON ||
+            state.reason == SESSION_BOOTSTRAP_FAILED_REASON)
 
 @Composable
 private fun StatusDot(

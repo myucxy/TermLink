@@ -343,6 +343,35 @@ class ProductContractsTest {
     }
 
     @Test
+    fun initialBootstrapIsEstablishingAndDeviceBackRequiresASecondPress() {
+        assertTrue(
+            isEstablishingSessionConnection(
+                RemoteSessionState.Reconnecting(
+                    lastAckedSequence = 0,
+                    reason = SESSION_BOOTSTRAP_IN_PROGRESS_REASON,
+                ),
+            ),
+        )
+        assertTrue(
+            isEstablishingSessionConnection(
+                RemoteSessionState.Reconnecting(
+                    lastAckedSequence = 0,
+                    reason = SESSION_BOOTSTRAP_FAILED_REASON,
+                ),
+            ),
+        )
+        assertFalse(
+            isEstablishingSessionConnection(
+                RemoteSessionState.Reconnecting(lastAckedSequence = 4, reason = "remote session interrupted"),
+            ),
+        )
+        assertFalse(shouldExitAfterDeviceBack(nowMillis = 10_000L, armedAtMillis = null))
+        assertTrue(shouldExitAfterDeviceBack(nowMillis = 11_999L, armedAtMillis = 10_000L))
+        assertTrue(shouldExitAfterDeviceBack(nowMillis = 12_000L, armedAtMillis = 10_000L))
+        assertFalse(shouldExitAfterDeviceBack(nowMillis = 12_001L, armedAtMillis = 10_000L))
+    }
+
+    @Test
     fun leaseHeldRetryOutlivesServerTtlButStopsAfterItsBoundedSchedule() = runBlocking {
         assertTrue(CONTROL_LEASE_HELD_RETRY_DELAYS_MILLIS.sum() > 30_000L)
         var requests = 0

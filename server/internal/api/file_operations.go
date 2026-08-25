@@ -386,7 +386,9 @@ func validateFileOperationRequest(operation, path string, offset *int64, shellTy
 			return errors.New("invalid DOWNLOAD parameters")
 		}
 	case store.FileOperationOpenTerminal:
-		if path == "" || offset != nil || shellType == nil || (*shellType != "command-prompt" && *shellType != "windows-powershell") {
+		if path == "" || offset != nil || shellType == nil ||
+			(*shellType != "command-prompt" && *shellType != "windows-powershell" &&
+				*shellType != "powershell-7" && *shellType != "wsl") {
 			return errors.New("invalid OPEN_TERMINAL parameters")
 		}
 	default:

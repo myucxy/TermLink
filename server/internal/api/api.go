@@ -647,14 +647,14 @@ func normalizeSupportedShells(values []string) ([]string, error) {
 	seen := make(map[string]bool, len(values))
 	for _, value := range values {
 		switch value {
-		case "command-prompt", "windows-powershell":
+		case "command-prompt", "windows-powershell", "powershell-7", "wsl":
 			seen[value] = true
 		default:
 			return nil, errors.New("unsupported shell capability")
 		}
 	}
 	normalized := make([]string, 0, len(seen))
-	for _, value := range []string{"command-prompt", "windows-powershell"} {
+	for _, value := range []string{"command-prompt", "windows-powershell", "powershell-7", "wsl"} {
 		if seen[value] {
 			normalized = append(normalized, value)
 		}

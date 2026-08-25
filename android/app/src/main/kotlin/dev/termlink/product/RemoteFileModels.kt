@@ -82,7 +82,9 @@ private val REMOTE_FILE_OPERATION_STATUSES = setOf(
 
 enum class RemoteShellType(val wireValue: String) {
     COMMAND_PROMPT("command-prompt"),
-    WINDOWS_POWERSHELL("windows-powershell");
+    WINDOWS_POWERSHELL("windows-powershell"),
+    POWERSHELL_7("powershell-7"),
+    WSL("wsl");
 
     companion object {
         fun fromWireValue(value: String): RemoteShellType =
@@ -94,6 +96,17 @@ enum class RemoteShellType(val wireValue: String) {
 /** Maps only server/Agent-authoritative capabilities in a stable UX order. */
 internal fun supportedRemoteShellTypes(pc: PcSummary): List<RemoteShellType> =
     RemoteShellType.entries.filter { shell -> shell.wireValue in pc.supportedShells }
+
+internal fun remoteCurrentDirectoryEntry(path: String): RemoteFileEntry? {
+    if (path.isBlank()) return null
+    val normalized = path.trimEnd('\\', '/').ifBlank { path }
+    val name = normalized.substringAfterLast('\\').substringAfterLast('/').ifBlank { normalized }
+    return RemoteFileEntry(
+        name = name,
+        path = path,
+        kind = RemoteFileKind.DIRECTORY,
+    )
+}
 
 data class RemoteDirectoryFavorite(
     val pcId: UUID,

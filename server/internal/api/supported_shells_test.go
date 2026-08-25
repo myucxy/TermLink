@@ -13,7 +13,7 @@ func TestNormalizeSupportedShells(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "old agent", input: nil, want: []string{}},
-		{name: "ordered and unique", input: []string{"windows-powershell", "command-prompt", "windows-powershell"}, want: []string{"command-prompt", "windows-powershell"}},
+		{name: "ordered and unique", input: []string{"wsl", "windows-powershell", "powershell-7", "command-prompt", "wsl"}, want: []string{"command-prompt", "windows-powershell", "powershell-7", "wsl"}},
 		{name: "unknown rejected", input: []string{"pwsh"}, wantErr: true},
 		{name: "case variants rejected", input: []string{"COMMAND-PROMPT"}, wantErr: true},
 	}

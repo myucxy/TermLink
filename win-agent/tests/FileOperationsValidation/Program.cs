@@ -545,7 +545,7 @@ static void ValidateTerminalLaunch(string testRoot)
     File.WriteAllBytes(stub, new byte[] { 0x4d, 0x5a });
     var starts = new RecordingProcessStarter { FailFirst = true };
     var launcher = new ManagedTerminalLauncher(
-        new WindowsPathService(), starts, () => stub, stub, stub, stub);
+        new WindowsPathService(), starts, () => stub, stub, stub, stub, stub, stub);
     var sessionId = Guid.NewGuid();
     Require(launcher.Launch("windows-powershell", testRoot, sessionId) == sessionId,
         "terminal launcher did not preserve the allocated session ID");
@@ -558,11 +558,28 @@ static void ValidateTerminalLaunch(string testRoot)
         direct.ArgumentList.Contains("--working-directory-base64") &&
         direct.ArgumentList.Contains("--registration-timeout-ms"),
         "terminal launcher omitted managed SessionHost identity or working-directory arguments");
+    var registrationTimeoutIndex = direct.ArgumentList.IndexOf("--registration-timeout-ms");
+    Require(direct.ArgumentList[registrationTimeoutIndex + 1] == "30000",
+        "terminal launcher did not preserve the extended registration window");
     var commandIndex = direct.ArgumentList.IndexOf("--command-base64");
     var decodedCommand = Encoding.UTF8.GetString(Convert.FromBase64String(direct.ArgumentList[commandIndex + 1]));
     Require(decodedCommand.Contains("-NoLogo -NoProfile", StringComparison.Ordinal),
         "Windows PowerShell launch omitted the required clean startup flags");
-    RequireFileOperationCode(() => launcher.Launch("powershell-7", testRoot), "SHELL_NOT_ALLOWED");
+    launcher.Launch("powershell-7", testRoot);
+    var powerShell7Start = starts.Starts.Last();
+    var powerShell7CommandIndex = powerShell7Start.ArgumentList.IndexOf("--command-base64");
+    var powerShell7Command = Encoding.UTF8.GetString(
+        Convert.FromBase64String(powerShell7Start.ArgumentList[powerShell7CommandIndex + 1]));
+    Require(powerShell7Command.Contains("-NoLogo -NoProfile", StringComparison.Ordinal),
+        "PowerShell 7 launch omitted the required clean startup flags");
+    launcher.Launch("wsl", testRoot);
+    var wslStart = starts.Starts.Last();
+    var wslCommandIndex = wslStart.ArgumentList.IndexOf("--command-base64");
+    var wslCommand = Encoding.UTF8.GetString(
+        Convert.FromBase64String(wslStart.ArgumentList[wslCommandIndex + 1]));
+    Require(!wslCommand.Contains("-NoLogo", StringComparison.Ordinal) && wslCommand.Contains(stub, StringComparison.Ordinal),
+        "WSL launch received PowerShell-only flags or lost its executable");
+    RequireFileOperationCode(() => launcher.Launch("unknown-shell", testRoot), "SHELL_NOT_ALLOWED");
 }
 
 static async Task ValidateApiContractAsync()

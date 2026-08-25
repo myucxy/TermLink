@@ -732,13 +732,17 @@ namespace TermLink.Agent
     {
         internal const string CommandPromptShellType = "command-prompt";
         internal const string WindowsPowerShellShellType = "windows-powershell";
-        internal const int DefaultRegistrationTimeoutMilliseconds = 15000;
+        internal const string PowerShell7ShellType = "powershell-7";
+        internal const string WslShellType = "wsl";
+        internal const int DefaultRegistrationTimeoutMilliseconds = 30000;
         private readonly WindowsPathService paths;
         private readonly IProcessStarter processes;
         private readonly Func<string> windowsTerminalResolver;
         private readonly string sessionHostPath;
         private readonly string commandPromptPath;
         private readonly string windowsPowerShellPath;
+        private readonly string powerShell7Path;
+        private readonly string wslPath;
 
         internal ManagedTerminalLauncher()
             : this(
@@ -749,7 +753,15 @@ namespace TermLink.Agent
                 Path.Combine(Environment.SystemDirectory, "cmd.exe"),
                 Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.Windows),
-                    "System32", "WindowsPowerShell", "v1.0", "powershell.exe"))
+                    "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+                ResolvePreferredExecutable(
+                    Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                        "PowerShell", "7", "pwsh.exe"),
+                    "pwsh.exe"),
+                ResolvePreferredExecutable(
+                    Path.Combine(Environment.SystemDirectory, "wsl.exe"),
+                    "wsl.exe"))
         {
         }
 
@@ -759,7 +771,9 @@ namespace TermLink.Agent
             Func<string> windowsTerminalResolver,
             string sessionHostPath,
             string commandPromptPath,
-            string windowsPowerShellPath)
+            string windowsPowerShellPath,
+            string powerShell7Path = null,
+            string wslPath = null)
         {
             this.paths = paths ?? throw new ArgumentNullException(nameof(paths));
             this.processes = processes ?? throw new ArgumentNullException(nameof(processes));
@@ -767,6 +781,8 @@ namespace TermLink.Agent
             this.sessionHostPath = Path.GetFullPath(sessionHostPath ?? throw new ArgumentNullException(nameof(sessionHostPath)));
             this.commandPromptPath = Path.GetFullPath(commandPromptPath ?? throw new ArgumentNullException(nameof(commandPromptPath)));
             this.windowsPowerShellPath = Path.GetFullPath(windowsPowerShellPath ?? throw new ArgumentNullException(nameof(windowsPowerShellPath)));
+            this.powerShell7Path = NormalizeOptionalExecutablePath(powerShell7Path);
+            this.wslPath = NormalizeOptionalExecutablePath(wslPath);
         }
 
         internal Guid Launch(string shellType, string workingDirectory, Guid? requestedSessionId = null)
@@ -853,22 +869,36 @@ namespace TermLink.Agent
                 Path.Combine(Environment.SystemDirectory, "cmd.exe"),
                 Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.Windows),
-                    "System32", "WindowsPowerShell", "v1.0", "powershell.exe"));
+                    "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+                ResolvePreferredExecutable(
+                    Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                        "PowerShell", "7", "pwsh.exe"),
+                    "pwsh.exe"),
+                ResolvePreferredExecutable(
+                    Path.Combine(Environment.SystemDirectory, "wsl.exe"),
+                    "wsl.exe"));
         }
 
         internal static string[] DetectSupportedShellTypesAtPaths(
             string sessionHostPath,
             string commandPromptPath,
-            string windowsPowerShellPath)
+            string windowsPowerShellPath,
+            string powerShell7Path,
+            string wslPath)
         {
             if (string.IsNullOrWhiteSpace(sessionHostPath) || !File.Exists(sessionHostPath))
                 return Array.Empty<string>();
 
-            var result = new List<string>(2);
+            var result = new List<string>(4);
             if (!string.IsNullOrWhiteSpace(commandPromptPath) && File.Exists(commandPromptPath))
                 result.Add(CommandPromptShellType);
             if (!string.IsNullOrWhiteSpace(windowsPowerShellPath) && File.Exists(windowsPowerShellPath))
                 result.Add(WindowsPowerShellShellType);
+            if (!string.IsNullOrWhiteSpace(powerShell7Path) && File.Exists(powerShell7Path))
+                result.Add(PowerShell7ShellType);
+            if (!string.IsNullOrWhiteSpace(wslPath) && File.Exists(wslPath))
+                result.Add(WslShellType);
             return result.ToArray();
         }
 
@@ -881,7 +911,8 @@ namespace TermLink.Agent
             ValidateShellType(shellType);
             if (sessionId == Guid.Empty) throw new ArgumentException("Session ID is required.", nameof(sessionId));
             var commandLine = QuoteWindowsArgument(shellPath) +
-                (string.Equals(shellType, "windows-powershell", StringComparison.Ordinal)
+                (string.Equals(shellType, WindowsPowerShellShellType, StringComparison.Ordinal) ||
+                 string.Equals(shellType, PowerShell7ShellType, StringComparison.Ordinal)
                     ? " -NoLogo -NoProfile"
                     : string.Empty);
             return new[]
@@ -898,20 +929,57 @@ namespace TermLink.Agent
         internal static void ValidateShellType(string shellType)
         {
             if (!string.Equals(shellType, CommandPromptShellType, StringComparison.Ordinal) &&
-                !string.Equals(shellType, WindowsPowerShellShellType, StringComparison.Ordinal))
+                !string.Equals(shellType, WindowsPowerShellShellType, StringComparison.Ordinal) &&
+                !string.Equals(shellType, PowerShell7ShellType, StringComparison.Ordinal) &&
+                !string.Equals(shellType, WslShellType, StringComparison.Ordinal))
             {
                 throw new FileOperationException(
                     "SHELL_NOT_ALLOWED",
-                    "Only command-prompt and windows-powershell are supported.");
+                    "Only advertised managed shell types are supported.");
             }
         }
 
         private string ResolveShell(string shellType)
         {
             ValidateShellType(shellType);
-            return string.Equals(shellType, CommandPromptShellType, StringComparison.Ordinal)
-                ? commandPromptPath
-                : windowsPowerShellPath;
+            if (string.Equals(shellType, CommandPromptShellType, StringComparison.Ordinal))
+                return commandPromptPath;
+            if (string.Equals(shellType, WindowsPowerShellShellType, StringComparison.Ordinal))
+                return windowsPowerShellPath;
+            if (string.Equals(shellType, PowerShell7ShellType, StringComparison.Ordinal))
+                return powerShell7Path;
+            return wslPath;
+        }
+
+        private static string NormalizeOptionalExecutablePath(string path) =>
+            string.IsNullOrWhiteSpace(path) ? null : Path.GetFullPath(path);
+
+        private static string ResolvePreferredExecutable(string preferredPath, string fileName)
+        {
+            if (!string.IsNullOrWhiteSpace(preferredPath) && File.Exists(preferredPath))
+                return preferredPath;
+            return FindExecutableOnPath(fileName);
+        }
+
+        private static string FindExecutableOnPath(string fileName)
+        {
+            if (string.IsNullOrWhiteSpace(fileName)) return null;
+            var path = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+            foreach (var directory in path.Split(Path.PathSeparator))
+            {
+                if (string.IsNullOrWhiteSpace(directory)) continue;
+                try
+                {
+                    var candidate = Path.Combine(directory.Trim().Trim('"'), fileName);
+                    if (File.Exists(candidate)) return Path.GetFullPath(candidate);
+                }
+                catch (Exception error) when (
+                    error is ArgumentException || error is NotSupportedException || error is PathTooLongException)
+                {
+                    // A malformed PATH entry does not hide executables in later entries.
+                }
+            }
+            return null;
         }
 
         private static string ResolveWindowsTerminal()

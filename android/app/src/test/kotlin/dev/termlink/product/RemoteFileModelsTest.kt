@@ -60,10 +60,21 @@ class RemoteFileModelsTest {
     fun fixedWindowsShellValuesRoundTripAndRejectUnknownShell() {
         assertEquals(RemoteShellType.COMMAND_PROMPT, RemoteShellType.fromWireValue("command-prompt"))
         assertEquals(RemoteShellType.WINDOWS_POWERSHELL, RemoteShellType.fromWireValue("windows-powershell"))
+        assertEquals(RemoteShellType.POWERSHELL_7, RemoteShellType.fromWireValue("powershell-7"))
+        assertEquals(RemoteShellType.WSL, RemoteShellType.fromWireValue("wsl"))
         assertEquals("command-prompt", RemoteShellType.COMMAND_PROMPT.wireValue)
         assertEquals("windows-powershell", RemoteShellType.WINDOWS_POWERSHELL.wireValue)
+        assertEquals("powershell-7", RemoteShellType.POWERSHELL_7.wireValue)
+        assertEquals("wsl", RemoteShellType.WSL.wireValue)
         val rejected = runCatching { RemoteShellType.fromWireValue("pwsh") }.isFailure
         assertTrue(rejected)
+    }
+
+    @Test
+    fun currentDirectoryEntrySupportsDriveAndNestedWindowsPaths() {
+        assertEquals("C:", remoteCurrentDirectoryEntry("C:\\")?.name)
+        assertEquals("work", remoteCurrentDirectoryEntry("C:\\dev\\work\\")?.name)
+        assertEquals(null, remoteCurrentDirectoryEntry(""))
     }
 
     @Test

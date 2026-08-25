@@ -474,7 +474,7 @@ namespace TermLink.Agent
         private static readonly TimeSpan IdlePollInterval = TimeSpan.FromMilliseconds(750);
         private static readonly TimeSpan RemoteAccessPollInterval = TimeSpan.FromMilliseconds(100);
         private static readonly TimeSpan DefaultLeaseRenewInterval = TimeSpan.FromSeconds(5);
-        private static readonly TimeSpan DefaultRegistrationWait = TimeSpan.FromSeconds(17);
+        private static readonly TimeSpan DefaultRegistrationWait = TimeSpan.FromSeconds(32);
         private static readonly TimeSpan FallbackLeaseDuration = TimeSpan.FromHours(1);
         private readonly IFileOperationApi api;
         private readonly DirectoryListingService listings;

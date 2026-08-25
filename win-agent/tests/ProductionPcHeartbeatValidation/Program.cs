@@ -196,18 +196,25 @@ internal static class Program
                 var sessionHost = Path.Combine(capabilityRoot, "TermLink.SessionHost.exe");
                 var cmd = Path.Combine(capabilityRoot, "cmd.exe");
                 var powershell = Path.Combine(capabilityRoot, "powershell.exe");
+                var pwsh = Path.Combine(capabilityRoot, "pwsh.exe");
+                var wsl = Path.Combine(capabilityRoot, "wsl.exe");
                 File.WriteAllBytes(sessionHost, Array.Empty<byte>());
                 File.WriteAllBytes(cmd, Array.Empty<byte>());
                 var detectShellsAtPaths = Method(terminalLauncherType, "DetectSupportedShellTypesAtPaths");
-                var detected = (string[])detectShellsAtPaths.Invoke(null, new object[] { sessionHost, cmd, powershell });
+                var detected = (string[])detectShellsAtPaths.Invoke(null, new object[] { sessionHost, cmd, powershell, pwsh, wsl });
                 Require(detected.SequenceEqual(new[] { "command-prompt" }),
                     "Shell capability detection did not exclude a missing executable.");
                 File.WriteAllBytes(powershell, Array.Empty<byte>());
-                detected = (string[])detectShellsAtPaths.Invoke(null, new object[] { sessionHost, cmd, powershell });
+                detected = (string[])detectShellsAtPaths.Invoke(null, new object[] { sessionHost, cmd, powershell, pwsh, wsl });
                 Require(detected.SequenceEqual(new[] { "command-prompt", "windows-powershell" }),
                     "Shell capability detection is not stable and ordered.");
+                File.WriteAllBytes(pwsh, Array.Empty<byte>());
+                File.WriteAllBytes(wsl, Array.Empty<byte>());
+                detected = (string[])detectShellsAtPaths.Invoke(null, new object[] { sessionHost, cmd, powershell, pwsh, wsl });
+                Require(detected.SequenceEqual(new[] { "command-prompt", "windows-powershell", "powershell-7", "wsl" }),
+                    "Extended shell capability detection is not stable and ordered.");
                 File.Delete(sessionHost);
-                Require(((string[])detectShellsAtPaths.Invoke(null, new object[] { sessionHost, cmd, powershell })).Length == 0,
+                Require(((string[])detectShellsAtPaths.Invoke(null, new object[] { sessionHost, cmd, powershell, pwsh, wsl })).Length == 0,
                     "Shell capability detection ignored a missing SessionHost.");
             }
             finally
