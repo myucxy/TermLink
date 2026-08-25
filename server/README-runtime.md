@@ -151,7 +151,7 @@ docker compose --env-file .env `
 ```
 
 The policy check requires the complete reviewed service set, the TermLink image
-from `ghcr.io/myucxy/termlink-server` at an immutable digest, exact reviewed
+from `docker.io/myucxy/termlink` at an immutable digest, exact reviewed
 third-party images, fixed network membership, approved environment keys,
 `/run/secrets` references, and no declared secret value anywhere in the rendered
 configuration. It also rejects unexpected ports, non-loopback management ports,
@@ -182,7 +182,7 @@ keeps application services stopped if restoration fails:
 ```
 
 The release workflow builds `linux/amd64` and `linux/arm64`, emits SPDX and
-CycloneDX SBOMs plus maximum BuildKit provenance, and signs the immutable GHCR
+CycloneDX SBOMs plus maximum BuildKit provenance, and signs the immutable Docker Hub
 digest plus SLSA provenance and both SBOM attestations with GitHub OIDC/Cosign. All third-party Actions and
 container bases are pinned. Local policy and post-release verification entry
 points are:
@@ -190,10 +190,25 @@ points are:
 ```powershell
 .\release\Test-ReleasePolicy.ps1
 .\release\Verify-ImageRelease.ps1 `
-  -Image 'ghcr.io/myucxy/termlink-server' `
+  -Image 'docker.io/myucxy/termlink' `
   -Digest 'sha256:<64-lowercase-hex>' `
   -Tag 'v1.0.0'
 ```
+
+After the signed workflow has completed, upgrade the local production-acceptance
+stack with the exact published digest (without resetting persistent data):
+
+```powershell
+.\ops\Start-ProductionAcceptance.ps1 `
+  -LuckyBindAddress '0.0.0.0' `
+  -LuckyPort 8080 `
+  -ServerImage 'docker.io/myucxy/termlink:1.0.0@sha256:<64-lowercase-hex>'
+```
+
+The published-image overlay removes the local server build definition, uses the
+same immutable reference for `migrate` and `server`, and rejects images whose OCI
+version, source, creation time, or Git revision metadata is missing. Do not pass
+`-Reset` for an in-place upgrade.
 
 Local validation cannot substitute for real DNS/ACME issuance, an approved
 Alertmanager receiver, or execution of a signed GitHub release tag.

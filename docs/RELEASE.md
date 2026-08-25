@@ -98,6 +98,12 @@ Server 使用 `docker buildx build --output type=oci,dest=...` 生成本地多�
 没有 `--push`。`-Publish` 是为未来审核后的发布实现预留的显式闸门；当前传入它会立即报错，
 即使同时使用 `-Plan` 也不会调用 registry、AppShip 或其他上传入口。
 
+正式 Server registry 发布由 `.github/workflows/release.yml` 在严格的 `vX.Y.Z` tag 上执行，
+目标固定为 `docker.io/myucxy/termlink`。工作流使用受保护的 `DOCKERHUB_USERNAME` 与
+`DOCKERHUB_TOKEN` secrets 登录 Docker Hub，构建 `linux/amd64`/`linux/arm64` manifest，生成
+BuildKit provenance 和 SPDX/CycloneDX SBOM，并通过 GitHub OIDC/Cosign 对 immutable digest
+及三类 attestation 签名和就地复核。工作流不发布 `latest` 标签。
+
 ## AppShip Production 包装门禁
 
 AppShip 只能通过 `scripts/Publish-AppShipProduction.ps1` 接收本仓库的 Android APK 或

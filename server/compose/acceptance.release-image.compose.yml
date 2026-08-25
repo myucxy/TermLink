@@ -1,0 +1,9 @@
+# Use only an already-published immutable server image while keeping the
+# acceptance stack's reviewed identity, data, and edge services unchanged.
+services:
+  migrate:
+    image: ${TERMLINK_ACCEPTANCE_SERVER_IMAGE:?immutable Docker Hub server image is required}
+
+  server:
+    image: ${TERMLINK_ACCEPTANCE_SERVER_IMAGE:?immutable Docker Hub server image is required}
+    build: !reset null

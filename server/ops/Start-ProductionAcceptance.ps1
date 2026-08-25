@@ -3,7 +3,9 @@ param(
     [switch]$Reset,
     [string]$LanAddress,
     [string]$LuckyBindAddress = '0.0.0.0',
-    [ValidateRange(1, 65535)][int]$LuckyPort = 8080
+    [ValidateRange(1, 65535)][int]$LuckyPort = 8080,
+    [ValidatePattern('^docker\.io/myucxy/termlink:[A-Za-z0-9_.-]+@sha256:[0-9a-f]{64}$')]
+    [string]$ServerImage
 )
 
 $ErrorActionPreference = 'Stop'
@@ -118,9 +120,11 @@ function Write-SecretFile {
 
 function Wait-ProductionAcceptanceStack {
     param(
-        [Parameter(Mandatory)][string]$ComposeFile,
+        [Parameter(Mandatory)][string[]]$ComposeFile,
         [ValidateRange(30, 900)][int]$TimeoutSeconds = 300
     )
+
+    $composeFileArguments = @($ComposeFile | ForEach-Object { '-f'; $_ })
 
     $healthyServices = @('edge', 'lucky-upstream', 'postgres', 'valkey', 'minio', 'server', 'keycloak')
     $runningServices = @()
@@ -132,7 +136,7 @@ function Wait-ProductionAcceptanceStack {
     $lastState = @{}
 
     while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
-        $rows = @(& docker compose -f $ComposeFile ps --all --format json)
+        $rows = @(& docker compose @composeFileArguments ps --all --format json)
         if ($LASTEXITCODE -ne 0) {
             throw 'Could not inspect the production acceptance stack.'
         }
@@ -196,6 +200,29 @@ $endpoints = Set-AcceptanceEndpointEnvironment `
     -PublicUpstreamBindAddress $LuckyBindAddress `
     -PublicUpstreamPort $LuckyPort
 $paths = Get-TermLinkAcceptancePaths
+$composeFiles = @($paths.ComposeFile)
+if (-not [string]::IsNullOrWhiteSpace($ServerImage)) {
+    $releaseImageComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.release-image.compose.yml'
+    if (-not (Test-Path -LiteralPath $releaseImageComposeFile -PathType Leaf)) {
+        throw "Published-image Compose overlay not found: $releaseImageComposeFile"
+    }
+    $env:TERMLINK_ACCEPTANCE_SERVER_IMAGE = $ServerImage
+    & docker pull $ServerImage
+    if ($LASTEXITCODE -ne 0) { throw 'Could not pull the immutable production server image.' }
+    $imageMetadataJson = & docker image inspect $ServerImage --format '{{json .Config.Labels}}'
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($imageMetadataJson)) {
+        throw 'Could not inspect the immutable production server image.'
+    }
+    $imageMetadata = $imageMetadataJson | ConvertFrom-Json
+    if ([string]$imageMetadata.'org.opencontainers.image.revision' -notmatch '^[0-9a-f]{40}$' -or
+        [string]$imageMetadata.'org.opencontainers.image.version' -notmatch '^v?[0-9]+\.[0-9]+\.[0-9]+(?:\+[0-9]+)?$' -or
+        [string]$imageMetadata.'org.opencontainers.image.created' -eq 'unknown' -or
+        [string]$imageMetadata.'org.opencontainers.image.source' -cne 'https://github.com/myucxy/TermLink') {
+        throw 'Published server image OCI source metadata is missing or inconsistent.'
+    }
+    $composeFiles += $releaseImageComposeFile
+}
+$composeFileArguments = @($composeFiles | ForEach-Object { '-f'; $_ })
 if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container)) {
     if (-not (Test-Path -LiteralPath $paths.Marker -PathType Leaf)) {
         throw "Refusing to reset an unmanaged directory: $($paths.SecretRoot)"
@@ -204,7 +231,7 @@ if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container)) 
     if (-not (Test-Path -LiteralPath $paths.InitialAdminPassword -PathType Leaf)) {
         $env:TERMLINK_ACCEPTANCE_ADMIN_INITIAL_PASSWORD_FILE = $paths.AdminPassword
     }
-    & docker compose -f $paths.ComposeFile down --volumes --remove-orphans
+    & docker compose @composeFileArguments down --volumes --remove-orphans
     if ($LASTEXITCODE -ne 0) { throw 'Could not reset the production acceptance stack.' }
     $productionPolicyEnvironment = Join-Path $paths.SecretRoot 'production-policy.env'
     foreach ($file in @(
@@ -287,22 +314,22 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($env:TERMLINK_ACCEPTANC
 # Keep the public Lucky upstream closed while the idempotent initializer
 # reconciles the realm. This prevents a fresh or partially configured realm
 # from exposing registration before the managed admin identity is verified.
-& docker compose -f $paths.ComposeFile stop lucky-upstream
+& docker compose @composeFileArguments stop lucky-upstream
 if ($LASTEXITCODE -ne 0) { throw 'Could not close the public acceptance upstream before identity initialization.' }
 # Realm imports only affect an empty Keycloak data volume, so retaining an
 # exited init container would otherwise leave registration and client policy
 # changes unapplied on an existing deployment. Secret staging jobs must also
 # rerun so rotations reach their service-private volumes.
-& docker compose -f $paths.ComposeFile rm --stop --force runtime-secrets-init server-secrets-init keycloak-init
+& docker compose @composeFileArguments rm --stop --force runtime-secrets-init server-secrets-init keycloak-init
 if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the Keycloak policy initializer.' }
 # Recreate/build the project once. A second `compose up --wait` can restart the
 # completed initializer jobs and race Compose's own container replacement on
 # Docker Desktop, leaving the waiter bound to a removed container ID. Poll the
 # single stable container set instead and require every initializer and health
 # check to reach its production-ready terminal state.
-& docker compose -f $paths.ComposeFile up --build --detach --remove-orphans
+& docker compose @composeFileArguments up --build --detach --remove-orphans
 if ($LASTEXITCODE -ne 0) { throw 'Could not build or recreate the production acceptance stack.' }
-Wait-ProductionAcceptanceStack -ComposeFile $paths.ComposeFile -TimeoutSeconds 300
+Wait-ProductionAcceptanceStack -ComposeFile $composeFiles -TimeoutSeconds 300
 
 function Assert-RuntimeSecretMetadata {
     param(
@@ -310,7 +337,7 @@ function Assert-RuntimeSecretMetadata {
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$Expected
     )
-    $actual = (& docker compose -f $paths.ComposeFile exec -T $Service stat -c '%a:%u:%g' $Path).Trim()
+    $actual = (& docker compose @composeFileArguments exec -T $Service stat -c '%a:%u:%g' $Path).Trim()
     if ($LASTEXITCODE -ne 0 -or $actual -cne $Expected) {
         throw "Service '$Service' secret '$Path' has metadata '$actual'; expected '$Expected'."
     }
@@ -325,7 +352,7 @@ Assert-RuntimeSecretMetadata -Service minio -Path /run/secrets/s3_secret_key -Ex
 if (Test-Path -LiteralPath $paths.RootCa -PathType Leaf) {
     Remove-Item -LiteralPath $paths.RootCa -Force
 }
-& docker compose -f $paths.ComposeFile cp edge:/data/caddy/pki/authorities/local/root.crt $paths.RootCa
+& docker compose @composeFileArguments cp edge:/data/caddy/pki/authorities/local/root.crt $paths.RootCa
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $paths.RootCa -PathType Leaf)) {
     throw 'Could not export the disposable acceptance CA certificate.'
 }
@@ -362,7 +389,7 @@ Protect-TermLinkAcceptanceSecretTree -SecretRoot $paths.SecretRoot
 $oneShotServices = @(
     'runtime-secrets-init', 'keycloak-init', 'server-secrets-init', 'migrate'
 )
-& docker compose -f $paths.ComposeFile rm --force @oneShotServices
+& docker compose @composeFileArguments rm --force @oneShotServices
 if ($LASTEXITCODE -ne 0) { throw 'Could not remove completed production acceptance jobs.' }
 
 Write-Output 'TermLink production acceptance stack is running.'

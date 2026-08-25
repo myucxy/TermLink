@@ -367,7 +367,7 @@ foreach ($serviceProperty in $services) {
         "Service '$name' healthcheck differs from the reviewed command."
     $image = [string](Get-PropertyValue $service 'image')
     if ($name -in @('server', 'migrate')) {
-        Assert-Production ($image -match '^ghcr\.io/myucxy/termlink-server:[A-Za-z0-9_.-]+@sha256:[0-9a-f]{64}$') `
+        Assert-Production ($image -match '^docker\.io/myucxy/termlink:[A-Za-z0-9_.-]+@sha256:[0-9a-f]{64}$') `
             "Service '$name' must use the approved TermLink GHCR repository and immutable digest: $image"
         Assert-Production ($image -notmatch ':latest@' -and $image -notmatch '@sha256:0{64}$') `
             "Service '$name' cannot use a latest tag or the all-zero placeholder digest."

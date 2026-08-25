@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidatePattern('^ghcr\.io/myucxy/termlink-server$')]
+    [ValidatePattern('^docker\.io/myucxy/termlink$')]
     [string]$Image,
     [Parameter(Mandatory)]
     [ValidatePattern('^sha256:[0-9a-f]{64}$')]

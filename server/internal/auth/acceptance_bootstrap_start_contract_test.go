@@ -12,9 +12,9 @@ func TestAcceptanceStartClosesPublicIngressBeforeReinitializingIdentity(t *testi
 		t.Fatal(err)
 	}
 	script := string(data)
-	stopIngress := strings.Index(script, "docker compose -f $paths.ComposeFile stop lucky-upstream")
-	removeInitializer := strings.Index(script, "docker compose -f $paths.ComposeFile rm --stop --force")
-	startStack := strings.Index(script, "docker compose -f $paths.ComposeFile up --build --detach")
+	stopIngress := strings.Index(script, "docker compose @composeFileArguments stop lucky-upstream")
+	removeInitializer := strings.Index(script, "docker compose @composeFileArguments rm --stop --force")
+	startStack := strings.Index(script, "docker compose @composeFileArguments up --build --detach")
 	if stopIngress < 0 || removeInitializer < 0 || startStack < 0 ||
 		!(stopIngress < removeInitializer && removeInitializer < startStack) {
 		t.Fatal("acceptance startup must close public ingress before rerunning identity initialization")
@@ -31,8 +31,8 @@ func TestAcceptanceStartWaitsOnOneStableContainerSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := string(data)
-	startStack := strings.Index(script, "docker compose -f $paths.ComposeFile up --build --detach")
-	waitStack := strings.LastIndex(script, "Wait-ProductionAcceptanceStack -ComposeFile $paths.ComposeFile")
+	startStack := strings.Index(script, "docker compose @composeFileArguments up --build --detach")
+	waitStack := strings.LastIndex(script, "Wait-ProductionAcceptanceStack -ComposeFile $composeFiles")
 	if startStack < 0 || waitStack < 0 || startStack >= waitStack {
 		t.Fatal("acceptance startup must wait after creating the production container set")
 	}

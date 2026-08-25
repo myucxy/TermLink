@@ -1,7 +1,11 @@
 [CmdletBinding()]
 param(
     [string]$WorkflowPath = (Join-Path $PSScriptRoot '..\..\.github\workflows\release.yml'),
-    [string]$DockerfilePath = (Join-Path $PSScriptRoot '..\Dockerfile')
+    [string]$DockerfilePath = (Join-Path $PSScriptRoot '..\Dockerfile'),
+    [string]$VerifierPath = (Join-Path $PSScriptRoot 'Verify-ImageRelease.ps1'),
+    [string]$DeploymentPolicyPath = (Join-Path $PSScriptRoot '..\ops\Test-ProductionDeployment.ps1'),
+    [string]$AcceptanceStartPath = (Join-Path $PSScriptRoot '..\ops\Start-ProductionAcceptance.ps1'),
+    [string]$AcceptanceOverlayPath = (Join-Path $PSScriptRoot '..\compose\acceptance.release-image.compose.yml')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,6 +38,10 @@ function Remove-YamlComment {
 
 $workflow = Get-Content -Raw -LiteralPath $WorkflowPath
 $dockerfile = Get-Content -Raw -LiteralPath $DockerfilePath
+$verifier = Get-Content -Raw -LiteralPath $VerifierPath
+$deploymentPolicy = Get-Content -Raw -LiteralPath $DeploymentPolicyPath
+$acceptanceStart = Get-Content -Raw -LiteralPath $AcceptanceStartPath
+$acceptanceOverlay = Get-Content -Raw -LiteralPath $AcceptanceOverlayPath
 $dockerfileFrontend = '# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e'
 $activeWorkflow = ((($workflow -split '\r?\n') | ForEach-Object { Remove-YamlComment $_ }) |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [Environment]::NewLine
@@ -43,6 +51,18 @@ $activeDockerfile = ((($dockerfile -split '\r?\n') |
 
 Assert-Policy ($activeWorkflow -notmatch '(?im)^\s*image:\s*[^\s]+:latest\s*$') `
     'Release workflow contains a latest image reference.'
+Assert-Policy ($activeWorkflow -match '(?m)^\s*IMAGE:\s*docker\.io/myucxy/termlink\s*$') `
+    'Release workflow does not target the reviewed Docker Hub repository.'
+Assert-Policy ($activeWorkflow -notmatch 'ghcr\.io|secrets\.GITHUB_TOKEN|github\.actor') `
+    'Release workflow retains an unreviewed GHCR login or image reference.'
+foreach ($requiredPattern in @(
+    '(?m)^\s*registry:\s*docker\.io\s*$',
+    '(?m)^\s*username:\s*\$\{\{\s*secrets\.DOCKERHUB_USERNAME\s*\}\}\s*$',
+    '(?m)^\s*password:\s*\$\{\{\s*secrets\.DOCKERHUB_TOKEN\s*\}\}\s*$'
+)) {
+    Assert-Policy ($activeWorkflow -match $requiredPattern) `
+        "Release workflow is missing Docker Hub credential binding: $requiredPattern"
+}
 Assert-Policy ($dockerfile.StartsWith($dockerfileFrontend, [StringComparison]::Ordinal)) `
     'Dockerfile frontend is not pinned to the reviewed immutable digest.'
 $baseImages = @([regex]::Matches($activeDockerfile, '(?im)^FROM\s+(?:--platform=[^\s]+\s+)?([^\s]+)'))
@@ -109,5 +129,18 @@ foreach ($requiredPattern in @(
 
 Assert-Policy ($activeDockerfile -notmatch '(?m)^ARG TARGET(?:OS|ARCH)=') `
     'Dockerfile must not override BuildKit automatic target-platform arguments.'
+
+$immutableDockerHubPattern = '^docker\.io/myucxy/termlink:[A-Za-z0-9_.-]+@sha256:[0-9a-f]{64}$'
+Assert-Policy ($verifier.Contains('^docker\.io/myucxy/termlink$')) `
+    'Post-release signature verifier does not pin the reviewed Docker Hub repository.'
+Assert-Policy ($deploymentPolicy.Contains($immutableDockerHubPattern)) `
+    'Production deployment policy does not require the immutable Docker Hub image.'
+Assert-Policy ($acceptanceStart.Contains($immutableDockerHubPattern) -and
+    $acceptanceStart.Contains('org.opencontainers.image.revision') -and
+    $acceptanceStart.Contains('org.opencontainers.image.source')) `
+    'Acceptance deployment does not validate immutable image identity and OCI source metadata.'
+Assert-Policy ($acceptanceOverlay.Contains('TERMLINK_ACCEPTANCE_SERVER_IMAGE') -and
+    $acceptanceOverlay.Contains('build: !reset null')) `
+    'Acceptance image overlay can rebuild or substitute the published server image.'
 
 Write-Host 'TermLink release workflow and Dockerfile policy validation passed.'
