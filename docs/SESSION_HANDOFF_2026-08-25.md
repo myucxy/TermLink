@@ -522,7 +522,8 @@ Docker Hub 发布链再推送。
 - 模拟器 `emulator-5554` 原装 0.1.29 是 Android Debug signer，不能被 production APK 覆盖。没有卸载；使用
   同一提交构建 `0.1.30 (36)` debug APK 后执行 `adb install -r`。升级前后 `appId=10216`、
   `firstInstallTime=2026-08-19 13:19:39` 未变化。App 启动无崩溃，OpenCode 既有会话最终画面、中文、颜色、
-  光标和控制状态均成功恢复。
+  光标和控制状态均成功恢复。另一条历史尚未上传成从序号 1 开始连续前缀、且快照模型拒绝
+  `CSI_PRIVATE_MODE_UNSUPPORTED` 的现场会话显示详细 `TL-H113` 和可操作建议，不再回退为笼统 `TL-H101`。
 - Windows 从 `0.1.28.34` 原地升级至 `0.1.30.36`，安装根仍是 `D:\Dev\Tool\TermLink`。所有产品 EXE 的
   ProductVersion 均为 `0.1.30.36+c8befe1abf6d993053c2afc3913f46e695f2ec71`；`--status-json` 返回
   `Success=true`、`RemoteAccessEnabled=true`、账号已关联且 Relay 已连接。
