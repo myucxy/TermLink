@@ -3,6 +3,10 @@
 仓库根入口为 `scripts/Build-Release.ps1`。它只编排已有的组件构建器并把产物集中到
 `artifacts/release/<Version>-<BuildNumber>/`；本入口不会上传产物，也不会调用外部发布技能。
 
+实际提交、AppShip 上传、Docker Hub 发布、本机客户端升级和服务部署的顺序、故障恢复与复核清单见
+[发布与部署运行手册](RELEASE_RUNBOOK.md)。该手册记录已经现场验证过的命令约束；遇到相同错误时
+不要跳过门禁或重复使用已知无效的调用方式。
+
 ## 版本与目标
 
 每次调用只接收一份 `-Version` 和 `-BuildNumber`：

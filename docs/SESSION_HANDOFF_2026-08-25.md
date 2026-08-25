@@ -473,3 +473,56 @@ Docker Hub 发布链再推送。
 5. 根据任务判断是否改动 `server/`；没有服务端改动就不要重建/推送 Docker。
 6. 发布前重新跑与改动范围匹配的测试，不复用旧测试结果冒充新构建证据。
 7. 构建前先提交功能代码，使 Windows `ProductVersion` 和 Server OCI revision 能绑定真实 Git commit。
+
+## 12. 2026-08-25 0.1.30 最终发布与部署（覆盖前文旧状态）
+
+本节是本文件最新状态；第 5、6、10 节中关于 0.1.29、Docker Hub 尚未发布和下一步版本号的描述仅保留为
+历史记录。后续发布先阅读[发布与部署运行手册](RELEASE_RUNBOOK.md)，不要重复使用本次已经确认无效的命令。
+
+### 12.1 源码与正式客户端产物
+
+- 功能发布提交：`c8befe1abf6d993053c2afc3913f46e695f2ec71`；当时 `origin/main` 与 `v0.1.30` 均指向该提交。
+- Git 只提交源码、测试、脚本和文档；`artifacts/` 中的 APK、EXE、manifest、截图与 `.appship/` 状态不进入 Git。
+- Android：`0.1.30 (36)`，SHA-256
+  `2113f2779bf7ef8a206c28e22d76fb5a44e3d6cd62961d4c720bbca4006abe08`，signer SHA-256
+  `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b`，v2 签名通过。
+- Windows Setup：`0.1.30.36`，SHA-256
+  `0b823ac18c300072296bec5cae8a8ec0c03821c0ab86de41c8c354f4155017b1`，Authenticode `Valid`，signer
+  SHA-1 `91AE60BC06D866628B8EB2C62F32BDE9DAB56466`，RFC 3161 时间戳通过。
+
+### 12.2 AppShip
+
+| 目标 | application ID | release ID | artifact ID | 状态 |
+| --- | --- | --- | --- | --- |
+| `termlink-android/stable` | `4759ec79-a6a2-45d1-9eb9-7ea16b2a3fb2` | `8f6a86be-00b6-4e40-939d-88deffb0a8ca` | `a0cc56ba-7d56-4f0e-bccf-48894845036b` | `published` / `ready` |
+| `termlink-win64/stable` | `0ae760b3-294e-48e8-a793-95d162f685e2` | `0fc70a98-9410-42d6-9d87-20db55b3b8f1` | `9de54f6a-a238-40f9-aaa0-90fea8b770b4` | `published` / `ready` |
+
+两个 build 35 更新检查均返回 `status=optional`、latest `0.1.30 (36)`；build 36 均返回
+`status=no_update`。幂等状态文件位于 `.appship/termlink-android-stable-0.1.30-build36-signature-approved.json`
+与 `.appship/termlink-win64-stable-0.1.30-build36-signature-approved.json`，必须保留但不提交。
+
+### 12.3 Docker Hub 与本地服务
+
+- Docker Hub：`docker.io/myucxy/termlink:0.1.30`。
+- OCI index digest：`sha256:8a8af2b7c18cca74fce30e7eb1f63eededda260f09e9ee499dfd684684a4e942`。
+- amd64 manifest：`sha256:70905569783996fa5d63a9de2d35dc9cfd3d0a53cf02dae0d081abdb23e9a2b6`。
+- arm64 manifest：`sha256:f50c01caf0df5093ee360cfbc5881967ae00153125d573b3023b682cbfabeca8`。
+- 两个平台均验证有 SPDX SBOM 与 SLSA provenance，OCI revision 为 `c8befe1abf6d993053c2afc3913f46e695f2ec71`。
+- GitHub Actions run `32835273986` 在 `docker/login-action` 因 Docker Hub secret 失败，未执行构建和签名。镜像改用
+  运行手册中的一次性 BuildKit/tmpfs 降级路径发布，因此没有 GitHub OIDC/Cosign keyless signature，也没有
+  独立 CycloneDX attestation；不得描述为完整供应链签名发布。
+- 本地 Compose 使用
+  `docker.io/myucxy/termlink:0.1.30@sha256:8a8af2b7c18cca74fce30e7eb1f63eededda260f09e9ee499dfd684684a4e942`。
+  `server`、`lucky-upstream`、`keycloak`、`edge`、`valkey`、`minio`、`postgres` 共 7 个服务均健康；
+  `schema_migrations` 最高版本为 20，原有 12 个 named volumes 全部保留，公网 `/readyz` 返回
+  `{"status":"ready"}`，Production OIDC/TLS/API/Realtime probe 通过。
+
+### 12.4 本机客户端
+
+- 模拟器 `emulator-5554` 原装 0.1.29 是 Android Debug signer，不能被 production APK 覆盖。没有卸载；使用
+  同一提交构建 `0.1.30 (36)` debug APK 后执行 `adb install -r`。升级前后 `appId=10216`、
+  `firstInstallTime=2026-08-19 13:19:39` 未变化。App 启动无崩溃，OpenCode 既有会话最终画面、中文、颜色、
+  光标和控制状态均成功恢复。
+- Windows 从 `0.1.28.34` 原地升级至 `0.1.30.36`，安装根仍是 `D:\Dev\Tool\TermLink`。所有产品 EXE 的
+  ProductVersion 均为 `0.1.30.36+c8befe1abf6d993053c2afc3913f46e695f2ec71`；`--status-json` 返回
+  `Success=true`、`RemoteAccessEnabled=true`、账号已关联且 Relay 已连接。
