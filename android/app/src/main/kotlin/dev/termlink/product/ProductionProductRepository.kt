@@ -4021,7 +4021,10 @@ internal class ProductionProductRepository(
                             error,
                             SessionFailureStage.SNAPSHOT_PREPARE,
                         ).failure.code.stableCode
-                        Log.e("TermLinkTailFirst", "Snapshot decrypt/prepare failed [$failure]")
+                        Log.e(
+                            "TermLinkTailFirst",
+                            "Snapshot decrypt/prepare failed [$failure] ${safeSnapshotFailureLocation(error)}",
+                        )
                     }
                     throw error
                 }
@@ -4612,6 +4615,34 @@ internal class ProductionProductRepository(
         val HISTORY_RECOVERY_DELAYS_MILLIS = longArrayOf(500, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000)
         val sensitiveIdentifierPattern = Regex("(?i)\\b[0-9a-f]{8}-[0-9a-f-]{27,}\\b")
     }
+}
+
+/**
+ * Returns only implementation metadata that is safe for local Debug diagnostics. Exception
+ * messages are deliberately excluded because they can contain transport or terminal data.
+ */
+private fun safeSnapshotFailureLocation(error: Throwable): String {
+    val chain = mutableListOf<Throwable>()
+    var current: Throwable? = error
+    repeat(8) {
+        val cause = current ?: return@repeat
+        chain += cause
+        current = cause.cause
+    }
+    for (cause in chain.asReversed()) {
+        val frame = cause.stackTrace.firstOrNull { value ->
+            value.className.startsWith("com.termux.") ||
+                value.className.startsWith("dev.termlink.terminal.")
+        } ?: cause.stackTrace.firstOrNull { value ->
+            value.className.startsWith("dev.termlink.") &&
+                value.className != "dev.termlink.product.SessionOpenFailureKt"
+        } ?: continue
+        val type = cause::class.java.simpleName.take(80).ifEmpty { "unknown" }
+        val className = frame.className.take(160)
+        val methodName = frame.methodName.take(80)
+        return "type=$type frame=$className.$methodName:${frame.lineNumber}"
+    }
+    return "type=unknown frame=unavailable"
 }
 
 internal suspend fun clearProductRoomCache(historyRepository: HistoryRepository) {

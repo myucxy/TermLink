@@ -2964,20 +2964,22 @@ private fun DevicesPage(
             onAction = {},
         )
     } else {
-        pcs.forEach { pc ->
-            val sessions = snapshot.sessions.filter { it.pcId == pc.id }
-            val pcKey = pc.id.toString()
-            PcRow(
-                pc = pc,
-                sessions = sessions,
-                sessionTitles = snapshot.sessionTitles,
-                expanded = pcKey in expandedPcIds,
-                onToggleExpanded = { onTogglePcExpanded(pc.id) },
-                onOpenSession = onOpenSession,
-                onBrowseFiles = { onBrowsePc(pc) },
-                onStopSessionRequested = onStopSessionRequested,
-                onDeleteSessionRequested = onDeleteSessionRequested,
-            )
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            pcs.forEach { pc ->
+                val sessions = snapshot.sessions.filter { it.pcId == pc.id }
+                val pcKey = pc.id.toString()
+                PcRow(
+                    pc = pc,
+                    sessions = sessions,
+                    sessionTitles = snapshot.sessionTitles,
+                    expanded = pcKey in expandedPcIds,
+                    onToggleExpanded = { onTogglePcExpanded(pc.id) },
+                    onOpenSession = onOpenSession,
+                    onBrowseFiles = { onBrowsePc(pc) },
+                    onStopSessionRequested = onStopSessionRequested,
+                    onDeleteSessionRequested = onDeleteSessionRequested,
+                )
+            }
         }
     }
     // Keep the final device/session row clear of the home refresh FAB.
@@ -3015,70 +3017,91 @@ private fun PcRow(
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
     ) {
         Column {
-            Row(
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable(enabled = sessions.isNotEmpty() && onToggleExpanded != null) {
                         onToggleExpanded?.invoke()
                     }
-                    .padding(14.dp),
-                verticalAlignment = Alignment.Top,
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
             ) {
-                Icon(Icons.Filled.LaptopWindows, contentDescription = stringResource(R.string.windows_pc_accessibility), tint = MaterialTheme.colorScheme.primary)
-                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(pc.name, style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        stringResource(
-                            R.string.pc_routing_status,
-                            pc.agentVersion,
-                            stringResource(if (pc.remoteRoutingEnabled) R.string.remote_enabled else R.string.remote_disabled),
-                        ),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                Column(
-                    horizontalAlignment = Alignment.End,
-                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(end = 13.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        if (sessions.isNotEmpty()) {
-                            Icon(
-                                imageVector = if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    Icon(
+                        Icons.Filled.LaptopWindows,
+                        contentDescription = stringResource(R.string.windows_pc_accessibility),
+                        modifier = Modifier.size(22.dp),
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(3.dp),
+                        ) {
+                            Text(
+                                pc.name,
+                                modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.titleMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                             )
+                            if (sessions.isNotEmpty()) {
+                                Icon(
+                                    imageVector = if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(20.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
-                        StatusDot(
-                            color = if (pc.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
-                            contentDescription = if (pc.online) stringResource(R.string.pc_online_accessibility) else stringResource(R.string.pc_offline_accessibility),
+                        Text(
+                            stringResource(
+                                R.string.pc_routing_status,
+                                pc.agentVersion,
+                                stringResource(if (pc.remoteRoutingEnabled) R.string.remote_enabled else R.string.remote_disabled),
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
                     onBrowseFiles?.let { browse ->
                         TextButton(
                             onClick = browse,
-                            modifier = Modifier.heightIn(min = 40.dp),
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                            modifier = Modifier.heightIn(min = 36.dp),
+                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
                         ) {
-                            Icon(Icons.Filled.Folder, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(5.dp))
-                            Text(stringResource(R.string.action_browse_files))
+                            Icon(Icons.Filled.Folder, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                stringResource(R.string.action_browse_files),
+                                style = MaterialTheme.typography.labelMedium,
+                            )
                         }
                     }
                 }
+                StatusDot(
+                    color = if (pc.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    contentDescription = if (pc.online) {
+                        stringResource(R.string.pc_online_accessibility)
+                    } else {
+                        stringResource(R.string.pc_offline_accessibility)
+                    },
+                    modifier = Modifier.align(Alignment.TopEnd),
+                )
             }
             if (expanded && sessions.isNotEmpty()) {
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 42.dp, end = 12.dp, top = 8.dp, bottom = 10.dp),
+                        .padding(start = 42.dp, end = 10.dp, top = 5.dp, bottom = 7.dp),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     sessions.forEach { session ->
@@ -3092,7 +3115,7 @@ private fun PcRow(
                                 ) {
                                     onOpenSession?.invoke(session.id)
                                 }
-                                .padding(horizontal = 8.dp, vertical = 8.dp),
+                                .padding(horizontal = 7.dp, vertical = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
@@ -3117,7 +3140,7 @@ private fun PcRow(
                                 DeviceSessionDestructiveAction.CLOSE_ONLINE -> if (onStopSessionRequested != null) {
                                     IconButton(
                                         onClick = { onStopSessionRequested(session.id) },
-                                        modifier = Modifier.size(40.dp),
+                                        modifier = Modifier.size(36.dp),
                                     ) {
                                         Icon(
                                             Icons.Filled.Close,
@@ -3129,7 +3152,7 @@ private fun PcRow(
                                 DeviceSessionDestructiveAction.DELETE_OFFLINE_RECORD -> if (onDeleteSessionRequested != null) {
                                     IconButton(
                                         onClick = { onDeleteSessionRequested(session.id) },
-                                        modifier = Modifier.size(40.dp),
+                                        modifier = Modifier.size(36.dp),
                                     ) {
                                         Icon(
                                             Icons.Filled.DeleteForever,
@@ -3865,9 +3888,14 @@ private fun RemoteSessionState?.localizedTerminalStatus(): String = stringResour
 )
 
 @Composable
-private fun StatusDot(color: Color, contentDescription: String) {
+private fun StatusDot(
+    color: Color,
+    contentDescription: String,
+    modifier: Modifier = Modifier,
+) {
     Box(
-        modifier = Modifier
+        modifier = modifier
+            .semantics { this.contentDescription = contentDescription }
             .size(9.dp)
             .clip(RoundedCornerShape(50))
             .background(color)

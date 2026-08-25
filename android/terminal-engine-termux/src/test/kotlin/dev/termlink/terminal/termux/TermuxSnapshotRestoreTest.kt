@@ -54,6 +54,22 @@ class TermuxSnapshotRestoreTest {
     }
 
     @Test
+    fun wideCharacterContinuationRemainsEmptyDuringRestore() = runTest {
+        val engine = TermuxTerminalEngine(TerminalSize(COLUMNS, ROWS))
+        val screen = screen("").copy(visibleRows = listOf(wideRow("中"), row("")))
+        val value = snapshot(sequence = 10, firstRow = "").copy(
+            primaryScreen = screen,
+            alternateScreen = screen,
+        )
+
+        val installed = engine.installPrepared(engine.prepareSnapshot(value))
+
+        assertEquals(10, installed.sequence)
+        assertContains(engine.visibleText(), "中")
+        engine.dispose()
+    }
+
+    @Test
     fun invalidPrepareLeavesInstalledRendererUntouched() = runTest {
         val engine = TermuxTerminalEngine(TerminalSize(COLUMNS, ROWS))
         engine.feed(1, ByteBuffer.wrap("KEEP".encodeToByteArray()))
@@ -153,6 +169,28 @@ class TermuxSnapshotRestoreTest {
             },
         )
     }
+
+    private fun wideRow(grapheme: String): TerminalRowSnapshotV1 = TerminalRowSnapshotV1(
+        cells = listOf(
+            TerminalCellSnapshotV1(
+                grapheme = grapheme,
+                displayWidth = 2,
+                styleIndex = 0,
+            ),
+            TerminalCellSnapshotV1(
+                grapheme = "",
+                displayWidth = 0,
+                styleIndex = 0,
+                wideContinuation = true,
+            ),
+        ) + List(COLUMNS - 2) {
+            TerminalCellSnapshotV1(
+                grapheme = " ",
+                displayWidth = 1,
+                styleIndex = 0,
+            )
+        },
+    )
 
     private companion object {
         const val COLUMNS = 6

@@ -317,7 +317,7 @@ internal object TermuxSnapshotMapper {
                 if (cell.displayWidth == 2) wideLead = cell
             }
             TerminalRestorableState.CellState(
-                cell.grapheme.ifEmpty { " " },
+                if (cell.wideContinuation) cell.grapheme else cell.grapheme.ifEmpty { " " },
                 cell.displayWidth,
                 styles[cell.styleIndex],
                 cell.wideContinuation,
