@@ -1,6 +1,7 @@
 package dev.termlink.session
 
 import dev.termlink.terminal.api.TerminalEngine
+import dev.termlink.terminal.api.TerminalInput
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalThemeV1
 import kotlinx.coroutines.CompletableDeferred
@@ -24,6 +25,40 @@ import kotlin.test.assertIs
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class RemoteTerminalSessionTest {
+    @Test
+    fun presentationRevisionRegressionRequiresAuthenticatedResync() = runTest {
+        val engine = RecordingEngine()
+        val session = RemoteTerminalSession(engine, RecordingOutbound(), backgroundScope)
+        session.onConnected()
+
+        assertEquals(
+            EventAcceptance.Applied(1),
+            session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1), 1, 7)),
+        )
+        assertEquals(
+            EventAcceptance.HistoryGap(2, 2),
+            session.accept(RemoteSessionEvent.Output(2, byteArrayOf(2), 2, 6)),
+        )
+        assertEquals(1, engine.feeds.size)
+        assertIs<RemoteSessionState.HistoryGap>(session.state.value)
+        session.close()
+    }
+
+    @Test
+    fun semanticInputRetainsTypedAndLegacyRepresentations() = runTest {
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(RecordingEngine(), outbound, backgroundScope)
+        session.onConnected()
+        session.grantControl("lease", Long.MAX_VALUE)
+
+        val typed = TerminalInput.Text("echo 中文\r")
+        assertIs<InputSubmission.Sent>(session.submitInput(typed))
+        assertEquals(1, outbound.inputs.size)
+        assertEquals(typed, outbound.inputs.single().typedInput)
+        assertArrayEquals("echo 中文\r".encodeToByteArray(), outbound.inputs.single().bytes)
+        session.close()
+    }
+
     @Test
     fun titlePresenceDistinguishesUnpublishedFromExplicitClear() = runTest {
         val session = RemoteTerminalSession(RecordingEngine(), RecordingOutbound(), backgroundScope)
@@ -107,31 +142,6 @@ class RemoteTerminalSessionTest {
         runCurrent()
         assertEquals(listOf(42L), outbound.acknowledgements)
         assertEquals(listOf(41L, 42L), engine.feeds.map { it.first })
-        session.close()
-    }
-
-    @Test
-    fun tailOnlyRendererStartsBlankAtDirectoryCursorAndReconnectsFromLiveProgress() = runTest {
-        val engine = RecordingEngine()
-        val outbound = RecordingOutbound()
-        val session = RemoteTerminalSession(
-            engine = engine,
-            outbound = outbound,
-            parentScope = backgroundScope,
-            initialRendererState = RendererBootstrapState.TailOnly(41, rendererGeneration = 3),
-        )
-
-        assertTrue(session.onConnected())
-        assertEquals(emptyList<Pair<Long, ByteArray>>(), engine.feeds)
-        assertEquals(EventAcceptance.Duplicate(41), session.accept(RemoteSessionEvent.Output(41, byteArrayOf(1))))
-        assertEquals(EventAcceptance.Applied(42), session.accept(RemoteSessionEvent.Output(42, byteArrayOf(2))))
-        runCurrent()
-        session.onDisconnected("network switch")
-        assertTrue(session.onConnected())
-
-        assertEquals(listOf(41L, 42L), outbound.resumes)
-        assertEquals(listOf(42L), engine.feeds.map { it.first })
-        assertEquals(42L, session.state.value.lastAckedSequence)
         session.close()
     }
 

@@ -20,6 +20,9 @@ using Google.Protobuf;
 using TermLink.LocalIpc;
 using TermLink.Protocol;
 using TermLink.Protocol.Realtime.V1;
+using CoreTerminalInput = TermLink.TerminalCore.TerminalInput;
+using CoreTerminalInputModifiers = TermLink.TerminalCore.TerminalInputModifiers;
+using CoreTerminalKey = TermLink.TerminalCore.TerminalKey;
 
 namespace TermLink.Agent
 {
@@ -60,6 +63,7 @@ namespace TermLink.Agent
         private static readonly TimeSpan RealtimeSendTimeout = TimeSpan.FromSeconds(15);
         private const int MaxRememberedTerminationRequests = 4096;
         private const string TerminalSnapshotEnvironment = "TERMLINK_ENABLE_TERMINAL_SNAPSHOT_V1";
+        private const string TypedInputEnvironment = "TERMLINK_ENABLE_TYPED_INPUT_V1";
         private sealed class CommittedEvent { public ManagedShellType ShellType; public LocalFrame Frame; }
         private sealed class PendingSession { public ManagedShellType ShellType; }
         private sealed class SessionPublicationState
@@ -166,6 +170,9 @@ namespace TermLink.Agent
         private readonly ProductionTerminalHistoryStore terminalHistoryStore;
         private readonly ProductionTerminalHistoryProducer terminalHistoryProducer;
         private readonly bool terminalSnapshotEnabled;
+        private readonly bool typedInputEnabled;
+        private static readonly TermLink.TerminalCore.VtTerminalInputEncoder TypedInputEncoder =
+            new TermLink.TerminalCore.VtTerminalInputEncoder();
         private readonly object lifecycleSync = new object();
         private readonly object statusSync = new object();
         private SessionRegistry registry;
@@ -212,6 +219,8 @@ namespace TermLink.Agent
             fileUploadHttp.Timeout = Timeout.InfiniteTimeSpan;
             terminalSnapshotEnabled = IsTerminalSnapshotRuntimeEnabled(
                 Environment.GetEnvironmentVariable(TerminalSnapshotEnvironment));
+            typedInputEnabled = IsTypedInputRuntimeEnabled(
+                Environment.GetEnvironmentVariable(TypedInputEnvironment));
             terminalHistoryStore = new ProductionTerminalHistoryStore(
                 ProductionTerminalHistoryRoot(config.PcId),
                 credentials.DeviceId);
@@ -235,6 +244,9 @@ namespace TermLink.Agent
         internal static bool IsTerminalSnapshotRuntimeEnabled(string value) =>
             !string.Equals(value, "0", StringComparison.Ordinal);
 
+        internal static bool IsTypedInputRuntimeEnabled(string value) =>
+            !string.Equals(value, "0", StringComparison.Ordinal);
+
         internal static string NormalizeServerOrigin(string serverUrl)
         {
             if (!Uri.TryCreate(serverUrl, UriKind.Absolute, out var server) ||
@@ -249,7 +261,10 @@ namespace TermLink.Agent
             return origin.GetComponents(UriComponents.SchemeAndServer, UriFormat.UriEscaped).TrimEnd('/');
         }
 
-        internal static byte[] BuildHelloPayload(bool terminalSnapshotEnabled)
+        internal static byte[] BuildHelloPayload(bool terminalSnapshotEnabled) =>
+            BuildHelloPayloadWithFeatures(terminalSnapshotEnabled, true);
+
+        internal static byte[] BuildHelloPayloadWithFeatures(bool terminalSnapshotEnabled, bool typedInputEnabled)
         {
             var capabilities = new List<string>
             {
@@ -257,9 +272,11 @@ namespace TermLink.Agent
                 "e2ee_x25519_chacha20poly1305",
                 "flow_control_v1",
                 "lease_v1",
-                "bounded_event_replay_v1"
+                "bounded_event_replay_v1",
+                "terminal_presentation_metadata_v1"
             };
             if (terminalSnapshotEnabled) capabilities.Add("terminal_snapshot_v1");
+            if (typedInputEnabled) capabilities.Add("terminal_typed_input_v1");
             return JsonSerializer.SerializeToUtf8Bytes(new
             {
                 role = "pc",
@@ -840,7 +857,7 @@ namespace TermLink.Agent
                     try
                     {
                         await active.ConnectAsync(wsUri, handshakeCancellation.Token).ConfigureAwait(false);
-                        var hello = BuildHelloPayload(terminalSnapshotEnabled);
+                        var hello = BuildHelloPayloadWithFeatures(terminalSnapshotEnabled, typedInputEnabled);
                         try
                         {
                             await SendWebSocketAsync(
@@ -2088,6 +2105,18 @@ namespace TermLink.Agent
                 var input = InputEventPayload.Parser.ParseFrom(plaintext);
                 if (input.InputId.Length != 16 || input.LeaseId.Length != 16 || input.InputSeq == 0 || input.Input.Length == 0) return;
                 var inputId = GuidFromBytes(input.InputId.Span); var leaseId = GuidFromBytes(input.LeaseId.Span);
+                byte[] canonicalInput = null;
+                if (typedInputEnabled && input.TypedInput != null)
+                {
+                    if (!TryEncodeTypedInput(input.TypedInput, out canonicalInput) ||
+                        canonicalInput.Length != input.Input.Length ||
+                        !CryptographicOperations.FixedTimeEquals(canonicalInput, input.Input.Span))
+                    {
+                        if (canonicalInput != null) CryptographicOperations.ZeroMemory(canonicalInput);
+                        registry.TrySendRemoteInputRejection(sessionId, inputId, LocalRemoteInputResult.InputPayloadRejected);
+                        return;
+                    }
+                }
                 var sequenceKey = sessionId.ToString("N") + senderId.ToString("N");
                 var previous = inputSequences.GetOrAdd(sequenceKey, 0);
                 if (input.InputSeq <= previous)
@@ -2100,7 +2129,7 @@ namespace TermLink.Agent
                     registry.TrySendRemoteInputRejection(sessionId, inputId, LocalRemoteInputResult.ControlLeaseRejected);
                     return;
                 }
-                var inputBytes = input.Input.ToByteArray();
+                var inputBytes = canonicalInput ?? input.Input.ToByteArray();
                 try
                 {
                     if (registry.TrySendRemoteInput(sessionId, inputId, input.ObservedLocalInputEpoch, inputBytes))
@@ -3220,7 +3249,15 @@ namespace TermLink.Agent
             ManagedShellType shellType,
             SessionPublicationSnapshot metadata)
         {
-            if (frame.Type == LocalFrameType.Output) return new OutputChunkPayload { Output = ByteString.CopyFrom(frame.Payload) };
+            if (frame.Type == LocalFrameType.Output)
+            {
+                return new OutputChunkPayload
+                {
+                    Output = ByteString.CopyFrom(frame.Payload),
+                    SourceEventSeq = frame.Sequence,
+                    PresentationRevision = frame.Sequence
+                };
+            }
             if (frame.Type == LocalFrameType.Resize)
             {
                 LocalPayloadCodec.ParseResize(frame.Payload, out var columns, out var rows);
@@ -3317,7 +3354,58 @@ namespace TermLink.Agent
             if (result == LocalRemoteInputResult.InputSequenceRejected) return "INPUT_SEQUENCE_REJECTED";
             if (result == LocalRemoteInputResult.ControlLeaseRejected) return "CONTROL_LEASE_REJECTED";
             if (result == LocalRemoteInputResult.SessionInputUnavailable) return "SESSION_INPUT_UNAVAILABLE";
+            if (result == LocalRemoteInputResult.InputPayloadRejected) return "INPUT_PAYLOAD_REJECTED";
             return "CONPTY_WRITE_FAILED";
+        }
+
+        internal static bool TryEncodeTypedInput(TerminalInputV1 wire, out byte[] encoded)
+        {
+            encoded = null;
+            if (wire == null || wire.FormatVersion != 1) return false;
+            try
+            {
+                CoreTerminalInput input;
+                var modifiers = CoreTerminalInputModifiers.None;
+                if (wire.Modifiers != null)
+                {
+                    if (wire.Modifiers.Control) modifiers |= CoreTerminalInputModifiers.Control;
+                    if (wire.Modifiers.Alt) modifiers |= CoreTerminalInputModifiers.Alt;
+                    if (wire.Modifiers.Shift) modifiers |= CoreTerminalInputModifiers.Shift;
+                    if (wire.Modifiers.Meta) modifiers |= CoreTerminalInputModifiers.Meta;
+                }
+                switch ((int)wire.Kind)
+                {
+                    case 1:
+                        if (wire.ValueCase != TerminalInputV1.ValueOneofCase.Text) return false;
+                        input = CoreTerminalInput.FromText(wire.Text, modifiers);
+                        break;
+                    case 2:
+                        if (wire.ValueCase != TerminalInputV1.ValueOneofCase.Key ||
+                            !Enum.IsDefined(typeof(CoreTerminalKey), (int)wire.Key)) return false;
+                        input = CoreTerminalInput.FromKey((CoreTerminalKey)(int)wire.Key, modifiers);
+                        break;
+                    case 3:
+                        if (wire.ValueCase != TerminalInputV1.ValueOneofCase.Paste ||
+                            modifiers != CoreTerminalInputModifiers.None) return false;
+                        input = CoreTerminalInput.FromPaste(wire.Paste.Memory);
+                        break;
+                    case 4:
+                        if (wire.ValueCase != TerminalInputV1.ValueOneofCase.RawBytes ||
+                            modifiers != CoreTerminalInputModifiers.None) return false;
+                        input = CoreTerminalInput.FromRawBytes(wire.RawBytes.Memory);
+                        break;
+                    default:
+                        return false;
+                }
+                encoded = TypedInputEncoder.Encode(input);
+                return true;
+            }
+            catch (ArgumentException)
+            {
+                if (encoded != null) CryptographicOperations.ZeroMemory(encoded);
+                encoded = null;
+                return false;
+            }
         }
 
         private static byte[] SnapshotPairwiseKey(Subscriber subscriber, out long keyEpoch)

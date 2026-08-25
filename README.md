@@ -60,6 +60,7 @@ Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当�
 
 ## 文档
 
+- [终端兼容核心、标准传输与 P0–P6 实现](docs/TERMINAL_COMPATIBILITY_CORE_V1.md)
 - [重新打开会话时的开发交接](DEVELOPMENT_HANDOFF.md)
 - [完整产品与系统设计（开发基线）](docs/COMPLETE_SYSTEM_DESIGN.md)
 - [Android ↔ Server ↔ Windows 文件操作 E2E](docs/REMOTE_FILE_OPERATIONS_E2E.md)

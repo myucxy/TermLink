@@ -32,7 +32,8 @@ namespace TermLink.LocalIpc
         WriteFailed = 4,
         InputSequenceRejected = 5,
         ControlLeaseRejected = 6,
-        SessionInputUnavailable = 7
+        SessionInputUnavailable = 7,
+        InputPayloadRejected = 8
     }
 
     internal enum LocalLifecycleState : byte

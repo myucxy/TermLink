@@ -1,8 +1,8 @@
 # Portable Terminal Model V1 validation boundary
 
-This project validates a Windows-producer foundation only. It does not define the cross-device
-`TerminalSnapshotV1` wire format and does not enable `terminal_snapshot_v1` in the production
-runtime.
+This project validates the portable Windows producer used by the production history pipeline.
+The cross-device `TerminalSnapshotV1` contract remains defined in `protocol/`; this project proves
+only the parser/profile and snapshot+suffix equivalence needed to publish a checkpoint.
 
 No compatible mature VT parser is currently referenced by `TermLink.Agent`. The checked-in
 xterm.js package is a browser-only oracle and the checked-in Termux parser is Android/Java code.
@@ -11,14 +11,16 @@ in `PortableTerminalSnapshotV1`.
 
 | Input or state | Result | Restored state |
 | --- | --- | --- |
-| Printable ASCII, NUL, BEL, CR, LF | Supported | Cells, wrap flags, cursor and bounded scrollback |
-| Basic SGR attributes and ANSI 16 colors | Supported | Per-cell and current style |
+| Printable assigned Unicode, NUL, BEL, BS, HT, CR, LF, VT, FF | Supported | Cells, wrap flags, cursor and bounded scrollback |
+| SGR attributes, ANSI 16/256 colors and 24-bit RGB | Supported | Per-cell/current style and lossless palette/RGB references |
 | CSI `A/B/C/D/G/d/H/f` | Supported | Cursor and pending-wrap state |
 | CSI ED/EL modes `0/1/2` | Supported | Visible cells and styles |
-| CSI `?25h` / `?25l` | Supported | Cursor visibility |
+| CSI `?25h/l`, `?1004h/l`, `?2004h/l` | Supported | Cursor visibility, focus reporting and bracketed-paste mode |
+| CSI `0..6 SP q` (DECSCUSR) | Supported | Cursor shape and blink state |
+| CSI `?2026h/l` synchronized output | Supported | Checkpoints are withheld until the atomic output batch ends |
 | `ESC c` | Supported | Full safe-subset reset |
 | Resize before content or exact no-op resize | Supported | New dimensions without reflow |
-| Incomplete ESC/CSI | Temporarily ineligible | Eligible again only after a supported sequence reaches ground |
+| Incomplete ESC/CSI or active synchronized-output batch | Temporarily ineligible | Eligible again only after a supported sequence reaches ground / the batch ends |
 | Common assigned Unicode, including CJK wide graphemes | Supported | Deterministic width-one/two cells; ambiguous characters remain width one |
 | Combining marks and variation selectors | Supported with a preceding base | Appended to the preceding grapheme; VS15/VS16 adjusts known emoji presentation width |
 | Incomplete UTF-8 scalar | Temporarily ineligible | Completion resumes parsing; invalid or non-continuation input is permanently rejected |

@@ -58,6 +58,7 @@ import dev.termlink.session.InputSubmission
 import dev.termlink.session.RemoteSessionEvent
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.TerminalSize
+import dev.termlink.terminal.api.TerminalInput
 import dev.termlink.terminal.api.PreparedTerminalCheckpoint
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
 import dev.termlink.terminal.termux.TermuxTerminalEngine
@@ -1196,30 +1197,12 @@ internal class ProductionProductRepository(
             initialSize = TerminalSize(summary.columns.coerceAtLeast(1), summary.rows.coerceAtLeast(1)),
         )
         val restoredHistory = try {
-            restoreHistoryOrUseTail(
-                restoreHistory = {
-                    restoreLiveHistory(
-                        session = summary,
-                        pc = pc,
-                        pcDevice = pcDevice,
-                        stored = stored,
-                        engine = engine,
-                    )
-                },
-                tailOnly = { error ->
-                    if (BuildConfig.DEBUG) {
-                        Log.e(
-                            "TermLinkTailFirst",
-                            "History bootstrap failed; opening realtime at directory tail " +
-                                "session=$sessionId tail=${summary.lastOutputSequence}",
-                            error,
-                        )
-                    }
-                    val authoritativeTail = latestTailOrDirectoryTail(summary.lastOutputSequence) {
-                        latestAuthoritativeSessionTail(summary)
-                    }
-                    prepareTailOnlyBootstrap(summary, authoritativeTail, engine)
-                },
+            restoreLiveHistory(
+                session = summary,
+                pc = pc,
+                pcDevice = pcDevice,
+                stored = stored,
+                engine = engine,
             )
         } catch (error: CancellationException) {
             engine.dispose()
@@ -1541,7 +1524,8 @@ internal class ProductionProductRepository(
 
     override suspend fun sendCommand(sessionId: UUID, text: String) {
         val live = liveSessions[sessionId] ?: error("Open the session before sending input")
-        val submission = live.client.remoteSession.submitInput(commandInputBytes(text))
+        require(text.isNotEmpty()) { "Command text is empty" }
+        val submission = live.client.remoteSession.submitInput(TerminalInput.Text(text + '\r'))
         commandSubmissionFailure(submission)?.let(::error)
     }
 
@@ -3665,42 +3649,6 @@ internal class ProductionProductRepository(
         RestoredLiveHistory(RendererBootstrapState.Empty(reset.rendererGeneration))
     }
 
-    private suspend fun prepareTailOnlyBootstrap(
-        session: SessionSummary,
-        authoritativeTail: ULong,
-        engine: TermuxTerminalEngine,
-    ): RestoredLiveHistory {
-        val cursor = historyRepository.ackCursorState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
-            ?: historyRepository.initializeAckCursor(session.id, LIVE_OUTPUT_ACK_DIRECTION)
-        val rendererState = prepareTailOnlyRendererState(
-            authoritativeTail = tailOnlyCursor(authoritativeTail, cursor.sequence),
-            clearRenderer = {
-                engine.clear()
-                engine.resize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1))
-            },
-            resetCursor = {
-                historyRepository.resetAckCursor(
-                    session.id,
-                    LIVE_OUTPUT_ACK_DIRECTION,
-                    cursor.rendererGeneration,
-                ).let { DurableAckCommit(it.sequence.toLong(), it.rendererGeneration) }
-            },
-            persistTail = { generation, tail ->
-                historyRepository.putAckCursor(
-                    session.id,
-                    LIVE_OUTPUT_ACK_DIRECTION,
-                    generation,
-                    tail,
-                )
-            },
-        )
-        return RestoredLiveHistory(
-            rendererState = rendererState,
-            durableAcknowledgement = rendererState.sequence.toULong(),
-            bootstrapSource = ProductBootstrapSource.TAIL_ONLY,
-        )
-    }
-
     private suspend fun prepareTerminalSnapshot(
         session: SessionSummary,
         pc: PcSummary,
@@ -4893,61 +4841,6 @@ internal fun canSafelySubscribeFromZeroWithoutSnapshot(
 
 internal const val SESSION_BOOTSTRAP_IN_PROGRESS_REASON = "snapshot bootstrap in progress"
 internal const val SESSION_BOOTSTRAP_FAILED_REASON = "snapshot bootstrap failed"
-
-/** History recovery is optional for opening an otherwise valid realtime session. */
-internal suspend fun <Restored> restoreHistoryOrUseTail(
-    restoreHistory: suspend () -> Restored,
-    tailOnly: suspend (Exception) -> Restored,
-): Restored = try {
-    restoreHistory()
-} catch (error: CancellationException) {
-    throw error
-} catch (error: Exception) {
-    tailOnly(error)
-}
-
-/** A failed best-effort refresh must never turn a valid directory row into an open failure. */
-internal suspend fun latestTailOrDirectoryTail(
-    directoryTail: ULong,
-    latestAuthoritativeTail: suspend () -> ULong?,
-): ULong = try {
-    maxOf(directoryTail, latestAuthoritativeTail() ?: directoryTail)
-} catch (error: CancellationException) {
-    throw error
-} catch (_: Exception) {
-    directoryTail
-}
-
-/** Never lets an eventually-consistent directory move behind this device's durable cursor. */
-internal fun tailOnlyCursor(
-    authoritativeTail: ULong,
-    durableAcknowledgement: ULong,
-): ULong = maxOf(authoritativeTail, durableAcknowledgement)
-
-/**
- * Permanently fences the previous renderer before anchoring a blank renderer
- * at the monotonic live tail. The returned state is safe to hand to realtime only
- * after the tail cursor itself is durable.
- */
-internal suspend fun prepareTailOnlyRendererState(
-    authoritativeTail: ULong,
-    clearRenderer: () -> Unit,
-    resetCursor: suspend () -> DurableAckCommit,
-    persistTail: suspend (rendererGeneration: Long, tail: ULong) -> ULong,
-): RendererBootstrapState.TailOnly {
-    require(authoritativeTail <= Long.MAX_VALUE.toULong()) { "authoritative tail is out of range" }
-    return withContext(NonCancellable) {
-        clearRenderer()
-        val reset = resetCursor()
-        check(reset.sequence == 0L) { "renderer reset did not clear its ACK cursor" }
-        val persisted = persistTail(reset.rendererGeneration, authoritativeTail)
-        check(persisted == authoritativeTail) { "tail-only cursor was not persisted" }
-        RendererBootstrapState.TailOnly(
-            sequence = persisted.toLong(),
-            rendererGeneration = reset.rendererGeneration,
-        )
-    }
-}
 
 internal fun shouldReplaceLiveSessionForOpen(
     liveSessionExists: Boolean,

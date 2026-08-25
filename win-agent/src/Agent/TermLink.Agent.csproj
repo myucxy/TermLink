@@ -10,9 +10,11 @@
     <Compile Include="..\Common\LocalIpc.cs" Link="Common\LocalIpc.cs" />
     <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
     <ProjectReference Include="..\Protocol\TermLink.Protocol.csproj" />
+    <ProjectReference Include="..\TerminalCore\TermLink.TerminalCore.csproj" />
     <PackageReference Include="Google.Protobuf" Version="3.31.1" />
     <PackageReference Include="System.IO.Pipes.AccessControl" Version="5.0.0" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
     <InternalsVisibleTo Include="TermLink.FileOperations.Validation" />
+    <InternalsVisibleTo Include="TermLink.TerminalCore.Validation" />
   </ItemGroup>
 </Project>

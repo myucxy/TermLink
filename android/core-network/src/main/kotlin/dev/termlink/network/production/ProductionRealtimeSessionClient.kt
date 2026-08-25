@@ -17,6 +17,10 @@ import dev.termlink.protocol.realtime.v1.ResizePayload
 import dev.termlink.protocol.realtime.v1.SessionTerminateRequestPayload
 import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
 import dev.termlink.protocol.realtime.v1.SubscribePayload
+import dev.termlink.protocol.realtime.v1.TerminalInputKindV1
+import dev.termlink.protocol.realtime.v1.TerminalInputModifiersV1
+import dev.termlink.protocol.realtime.v1.TerminalInputV1
+import dev.termlink.protocol.realtime.v1.TerminalKeyV1
 import dev.termlink.session.EventAcceptance
 import dev.termlink.session.DurableAckCommit
 import dev.termlink.session.RemoteControlLease
@@ -30,7 +34,10 @@ import dev.termlink.session.RemoteSessionOutbound
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.session.RemoteTerminalSession
 import dev.termlink.terminal.api.TerminalEngine
+import dev.termlink.terminal.api.TerminalInput
+import dev.termlink.terminal.api.TerminalKey
 import dev.termlink.terminal.api.TerminalSize
+import dev.termlink.terminal.api.VtTerminalInputEncoder
 import java.io.Closeable
 import java.security.SecureRandom
 import java.time.Instant
@@ -76,6 +83,8 @@ data class ProductionRealtimeSessionConfig(
     val pcExchangePublicKey: ByteArray,
     val keyId: ByteArray = "epoch-${keyEpoch.toString().padStart(8, '0')}".encodeToByteArray(),
     val noncePrefix: ByteArray = ByteArray(4).also(SecureRandom()::nextBytes),
+    /** Emergency compatibility rollback; legacy input bytes remain valid. */
+    val typedInputEnabled: Boolean = true,
 ) {
     init {
         require(keyEpoch > 0) { "keyEpoch must be positive" }
@@ -571,18 +580,30 @@ class ProductionRealtimeSessionClient(
 
     override suspend fun sendInput(input: RemoteInput) {
         require(input.bytes.isNotEmpty()) { "input must not be empty" }
+        val typedInput = if (config.typedInputEnabled) {
+            input.typedInput ?: TerminalInput.RawBytes(input.bytes)
+        } else {
+            null
+        }
+        val canonicalBytes = typedInput?.let(VtTerminalInputEncoder::encode) ?: input.bytes.copyOf()
+        if (typedInput != null) {
+            require(canonicalBytes.contentEquals(input.bytes)) {
+                "typed input and compatibility bytes must encode identically"
+            }
+        }
         val controlling = session.state.value as? RemoteSessionState.Controlling
             ?: throw ProductionTransportException("control lease is required")
         val inputSeq = inputSequenceProvider.next()
         require(inputSeq > 0) { "input sequence provider returned a non-positive value" }
-        val plaintext = InputEventPayload.newBuilder()
+        val inputBuilder = InputEventPayload.newBuilder()
             .setInputId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(input.inputId)))
             .setLeaseId(ByteString.copyFrom(leaseIdBytes(controlling.leaseId)))
             .setLeaseVersion(controlling.leaseVersion)
             .setInputSeq(inputSeq)
-            .setInput(ByteString.copyFrom(input.bytes))
+            .setInput(ByteString.copyFrom(canonicalBytes))
             .setObservedLocalInputEpoch(observedLocalInputEpoch.get())
-            .build()
+        if (typedInput != null) inputBuilder.setTypedInput(typedInput.toWireInput())
+        val plaintext = inputBuilder.build()
             .toByteArray()
         val pending = CompletableDeferred<Unit>()
         try {
@@ -606,7 +627,66 @@ class ProductionRealtimeSessionClient(
         } finally {
             pendingInputs.remove(input.inputId, pending)
             plaintext.fill(0)
+            canonicalBytes.fill(0)
         }
+    }
+
+    private fun TerminalInput.toWireInput(): TerminalInputV1 {
+        val builder = TerminalInputV1.newBuilder().setFormatVersion(1)
+        when (this) {
+            is TerminalInput.Text -> builder
+                .setKind(TerminalInputKindV1.TERMINAL_INPUT_KIND_V1_TEXT)
+                .setText(value)
+                .setModifiers(modifiers.toWireModifiers())
+            is TerminalInput.Key -> builder
+                .setKind(TerminalInputKindV1.TERMINAL_INPUT_KIND_V1_KEY)
+                .setKey(value.toWireKey())
+                .setModifiers(modifiers.toWireModifiers())
+            is TerminalInput.Paste -> builder
+                .setKind(TerminalInputKindV1.TERMINAL_INPUT_KIND_V1_PASTE)
+                .setPaste(ByteString.copyFrom(bytes))
+            is TerminalInput.RawBytes -> builder
+                .setKind(TerminalInputKindV1.TERMINAL_INPUT_KIND_V1_RAW_BYTES)
+                .setRawBytes(ByteString.copyFrom(bytes))
+        }
+        return builder.build()
+    }
+
+    private fun dev.termlink.terminal.api.TerminalInputModifiers.toWireModifiers(): TerminalInputModifiersV1 =
+        TerminalInputModifiersV1.newBuilder()
+            .setControl(control)
+            .setAlt(alt)
+            .setShift(shift)
+            .setMeta(meta)
+            .build()
+
+    private fun TerminalKey.toWireKey(): TerminalKeyV1 = when (this) {
+        TerminalKey.ENTER -> TerminalKeyV1.TERMINAL_KEY_V1_ENTER
+        TerminalKey.TAB -> TerminalKeyV1.TERMINAL_KEY_V1_TAB
+        TerminalKey.BACKSPACE -> TerminalKeyV1.TERMINAL_KEY_V1_BACKSPACE
+        TerminalKey.ESCAPE -> TerminalKeyV1.TERMINAL_KEY_V1_ESCAPE
+        TerminalKey.DELETE -> TerminalKeyV1.TERMINAL_KEY_V1_DELETE
+        TerminalKey.INSERT -> TerminalKeyV1.TERMINAL_KEY_V1_INSERT
+        TerminalKey.HOME -> TerminalKeyV1.TERMINAL_KEY_V1_HOME
+        TerminalKey.END -> TerminalKeyV1.TERMINAL_KEY_V1_END
+        TerminalKey.PAGE_UP -> TerminalKeyV1.TERMINAL_KEY_V1_PAGE_UP
+        TerminalKey.PAGE_DOWN -> TerminalKeyV1.TERMINAL_KEY_V1_PAGE_DOWN
+        TerminalKey.ARROW_UP -> TerminalKeyV1.TERMINAL_KEY_V1_ARROW_UP
+        TerminalKey.ARROW_DOWN -> TerminalKeyV1.TERMINAL_KEY_V1_ARROW_DOWN
+        TerminalKey.ARROW_LEFT -> TerminalKeyV1.TERMINAL_KEY_V1_ARROW_LEFT
+        TerminalKey.ARROW_RIGHT -> TerminalKeyV1.TERMINAL_KEY_V1_ARROW_RIGHT
+        TerminalKey.F1 -> TerminalKeyV1.TERMINAL_KEY_V1_F1
+        TerminalKey.F2 -> TerminalKeyV1.TERMINAL_KEY_V1_F2
+        TerminalKey.F3 -> TerminalKeyV1.TERMINAL_KEY_V1_F3
+        TerminalKey.F4 -> TerminalKeyV1.TERMINAL_KEY_V1_F4
+        TerminalKey.F5 -> TerminalKeyV1.TERMINAL_KEY_V1_F5
+        TerminalKey.F6 -> TerminalKeyV1.TERMINAL_KEY_V1_F6
+        TerminalKey.F7 -> TerminalKeyV1.TERMINAL_KEY_V1_F7
+        TerminalKey.F8 -> TerminalKeyV1.TERMINAL_KEY_V1_F8
+        TerminalKey.F9 -> TerminalKeyV1.TERMINAL_KEY_V1_F9
+        TerminalKey.F10 -> TerminalKeyV1.TERMINAL_KEY_V1_F10
+        TerminalKey.F11 -> TerminalKeyV1.TERMINAL_KEY_V1_F11
+        TerminalKey.F12 -> TerminalKeyV1.TERMINAL_KEY_V1_F12
     }
 
     override suspend fun sendResize(size: TerminalSize) {
@@ -815,7 +895,22 @@ class ProductionRealtimeSessionClient(
                 MessageType.OUTPUT_CHUNK -> {
                     val payload = OutputChunkPayload.parseFrom(plaintext)
                     require(payload.output.size() > 0) { "output chunk is empty" }
-                    requireApplied(session.accept(RemoteSessionEvent.Output(envelope.seq, payload.output.toByteArray())))
+                    val sourceEventSequence = payload.sourceEventSeq.takeIf { it > 0 } ?: envelope.seq
+                    val presentationRevision = payload.presentationRevision.takeIf { it > 0 }
+                        ?: sourceEventSequence
+                    require(sourceEventSequence == envelope.seq) {
+                        "output source event sequence does not match Envelope.seq"
+                    }
+                    requireApplied(
+                        session.accept(
+                            RemoteSessionEvent.Output(
+                                sequence = envelope.seq,
+                                bytes = payload.output.toByteArray(),
+                                sourceEventSequence = sourceEventSequence,
+                                presentationRevision = presentationRevision,
+                            ),
+                        ),
+                    )
                 }
                 MessageType.RESIZE_APPLIED -> {
                     val payload = ResizePayload.parseFrom(plaintext)

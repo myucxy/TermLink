@@ -354,6 +354,8 @@ namespace TermLink.Agent
                 Modes = new TerminalModesV1
                 {
                     AutoWrap = true,
+                    BracketedPaste = source.BracketedPaste,
+                    FocusReporting = source.FocusReporting,
                     MouseTracking = TerminalMouseTrackingV1.None,
                     MouseEncoding = TerminalMouseEncodingV1.Default
                 },
@@ -387,10 +389,20 @@ namespace TermLink.Agent
                     checked((uint)source.CursorColumn),
                     checked((uint)source.CursorRow),
                     source.CursorVisible,
+                    source.CursorStyle,
+                    source.CursorBlink,
                     checked((uint)styles.IndexOf(source.CurrentStyle)),
                     source.PendingAutoWrap,
                     charset),
-                SavedCursor = CreateCursor(0, 0, source.CursorVisible, 0, false, charset),
+                SavedCursor = CreateCursor(
+                    0,
+                    0,
+                    source.CursorVisible,
+                    source.CursorStyle,
+                    source.CursorBlink,
+                    0,
+                    false,
+                    charset),
                 ScrollTop = 0,
                 ScrollBottom = checked((uint)(source.Rows - 1)),
                 MarginLeft = 0,
@@ -419,10 +431,20 @@ namespace TermLink.Agent
                     checked((uint)source.CursorColumn),
                     checked((uint)source.CursorRow),
                     source.CursorVisible,
+                    source.CursorStyle,
+                    source.CursorBlink,
                     currentStyleIndex,
                     source.PendingAutoWrap,
                     charset),
-                SavedCursor = CreateCursor(0, 0, source.CursorVisible, 0, false, charset),
+                SavedCursor = CreateCursor(
+                    0,
+                    0,
+                    source.CursorVisible,
+                    source.CursorStyle,
+                    source.CursorBlink,
+                    0,
+                    false,
+                    charset),
                 ScrollTop = 0,
                 ScrollBottom = checked((uint)(source.Rows - 1)),
                 MarginLeft = 0,
@@ -446,6 +468,8 @@ namespace TermLink.Agent
             uint column,
             uint row,
             bool visible,
+            PortableTerminalCursorStyleV1 cursorStyle,
+            bool cursorBlink,
             uint styleIndex,
             bool pendingWrap,
             TerminalCharsetStateV1 charset)
@@ -455,8 +479,14 @@ namespace TermLink.Agent
                 Column = column,
                 Row = row,
                 Visible = visible,
-                Style = TerminalCursorStyleV1.Block,
-                Blink = true,
+                Style = cursorStyle switch
+                {
+                    PortableTerminalCursorStyleV1.Block => TerminalCursorStyleV1.Block,
+                    PortableTerminalCursorStyleV1.Underline => TerminalCursorStyleV1.Underline,
+                    PortableTerminalCursorStyleV1.Bar => TerminalCursorStyleV1.Bar,
+                    _ => throw new InvalidDataException("Terminal cursor style is unsupported.")
+                },
+                Blink = cursorBlink,
                 RenditionStyleIndex = styleIndex,
                 Charset = charset.Clone(),
                 OriginMode = false,
@@ -532,11 +562,13 @@ namespace TermLink.Agent
             };
         }
 
-        private static TerminalColorRefV1 ToWireColor(short color)
+        private static TerminalColorRefV1 ToWireColor(int color)
         {
-            return color == PortableTerminalStyleV1.DefaultColor
-                ? new TerminalColorRefV1 { DefaultColor = true }
-                : new TerminalColorRefV1 { PaletteIndex = checked((uint)color) };
+            if (color == PortableTerminalStyleV1.DefaultColor)
+                return new TerminalColorRefV1 { DefaultColor = true };
+            if (PortableTerminalStyleV1.TryGetRgb(color, out var rgb))
+                return new TerminalColorRefV1 { Rgb = checked((uint)rgb) };
+            return new TerminalColorRefV1 { PaletteIndex = checked((uint)color) };
         }
 
         private static TerminalCharsetStateV1 CreateCharset()

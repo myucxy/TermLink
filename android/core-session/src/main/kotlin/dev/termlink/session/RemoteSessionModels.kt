@@ -1,12 +1,13 @@
 package dev.termlink.session
 
 import dev.termlink.terminal.api.TerminalSize
+import dev.termlink.terminal.api.TerminalInput
 import java.util.UUID
 
 /**
  * Declares the cursor and generation installed before realtime starts.
- * All states except [TailOnly] prove the renderer contains the corresponding
- * prefix; [TailOnly] explicitly records that the historical prefix was skipped.
+ * Every non-empty state proves the renderer contains the corresponding prefix.
+ * A renderer must never be anchored past content it did not install.
  */
 sealed interface RendererBootstrapState {
     val sequence: Long
@@ -29,21 +30,6 @@ sealed interface RendererBootstrapState {
     ) : RendererBootstrapState {
         init {
             require(sequence > 0) { "full renderer prefix must be non-empty" }
-            require(rendererGeneration > 0) { "renderer generation must be positive" }
-        }
-    }
-
-    /**
-     * A deliberately blank renderer anchored at the authoritative directory
-     * tail. Historical output is absent, but new ordered events can continue
-     * from [sequence] without replaying an unavailable prefix.
-     */
-    data class TailOnly(
-        override val sequence: Long,
-        override val rendererGeneration: Long,
-    ) : RendererBootstrapState {
-        init {
-            require(sequence >= 0) { "tail-only cursor must not be negative" }
             require(rendererGeneration > 0) { "renderer generation must be positive" }
         }
     }
@@ -124,7 +110,14 @@ sealed interface RemoteSessionEvent {
     data class Output(
         override val sequence: Long,
         val bytes: ByteArray,
-    ) : RemoteSessionEvent
+        val sourceEventSequence: Long = sequence,
+        val presentationRevision: Long = sourceEventSequence,
+    ) : RemoteSessionEvent {
+        init {
+            require(sourceEventSequence > 0) { "source event sequence must be positive" }
+            require(presentationRevision > 0) { "presentation revision must be positive" }
+        }
+    }
 
     data class Resize(
         override val sequence: Long,
@@ -171,6 +164,8 @@ sealed interface RemoteSessionEvent {
 data class RemoteInput(
     val inputId: UUID,
     val bytes: ByteArray,
+    /** Semantic form; null is encoded as RAW_BYTES for old call sites. */
+    val typedInput: TerminalInput? = null,
 )
 
 data class RemoteControlLease(

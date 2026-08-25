@@ -45,6 +45,13 @@ const (
 
 var requiredCapabilities = []string{"cumulative_ack", "e2ee_x25519_chacha20poly1305", "flow_control_v1", "lease_v1"}
 
+var optionalCapabilities = []string{
+	"bounded_event_replay_v1",
+	"terminal_snapshot_v1",
+	"terminal_presentation_metadata_v1",
+	"terminal_typed_input_v1",
+}
+
 type Hub struct {
 	store         *store.Postgres
 	leases        *kv.Valkey
@@ -96,10 +103,11 @@ type clientHello struct {
 	Capabilities     []string `json:"capabilities"`
 }
 type serverWelcome struct {
-	Type             string `json:"type"`
-	ProtocolVersion  uint32 `json:"protocol_version"`
-	HeartbeatSeconds int    `json:"heartbeat_seconds"`
-	ConnectionID     string `json:"connection_id"`
+	Type             string   `json:"type"`
+	ProtocolVersion  uint32   `json:"protocol_version"`
+	HeartbeatSeconds int      `json:"heartbeat_seconds"`
+	ConnectionID     string   `json:"connection_id"`
+	Capabilities     []string `json:"capabilities"`
 }
 
 type peer struct {
@@ -194,7 +202,11 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		h.remove(connection)
 		h.observer.ConnectionClosed(connection.role)
 	}()
-	welcome := serverWelcome{Type: "welcome", ProtocolVersion: 1, HeartbeatSeconds: int(pingInterval.Seconds()), ConnectionID: uuid.NewString()}
+	welcome := serverWelcome{
+		Type: "welcome", ProtocolVersion: 1,
+		HeartbeatSeconds: int(pingInterval.Seconds()), ConnectionID: uuid.NewString(),
+		Capabilities: negotiatedCapabilities(hello.Capabilities),
+	}
 	if err := socket.WriteJSON(welcome); err != nil {
 		return
 	}
@@ -232,6 +244,16 @@ func validHello(hello clientHello) bool {
 		}
 	}
 	return true
+}
+
+func negotiatedCapabilities(offered []string) []string {
+	result := make([]string, 0, len(requiredCapabilities)+len(optionalCapabilities))
+	for _, capability := range append(append([]string(nil), requiredCapabilities...), optionalCapabilities...) {
+		if slices.Contains(offered, capability) {
+			result = append(result, capability)
+		}
+	}
+	return result
 }
 
 func (h *Hub) add(p *peer) bool {

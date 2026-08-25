@@ -61,6 +61,30 @@ func TestPeerQueueByteBudgetIsHardBound(t *testing.T) {
 	}
 }
 
+func TestNegotiatedCapabilitiesAreBoundedAndOrdered(t *testing.T) {
+	offered := []string{
+		"terminal_typed_input_v1",
+		"unknown_future_capability",
+		"lease_v1",
+		"cumulative_ack",
+		"flow_control_v1",
+		"e2ee_x25519_chacha20poly1305",
+		"terminal_presentation_metadata_v1",
+	}
+	got := negotiatedCapabilities(offered)
+	want := []string{
+		"cumulative_ack",
+		"e2ee_x25519_chacha20poly1305",
+		"flow_control_v1",
+		"lease_v1",
+		"terminal_presentation_metadata_v1",
+		"terminal_typed_input_v1",
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("negotiated capabilities = %v, want %v", got, want)
+	}
+}
+
 func TestRealtimeMessageDirectionACLIsExhaustive(t *testing.T) {
 	all := []realtimewire.MessageType{
 		realtimewire.Heartbeat, realtimewire.Goodbye,

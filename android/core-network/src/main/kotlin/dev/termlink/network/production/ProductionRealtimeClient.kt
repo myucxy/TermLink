@@ -274,6 +274,8 @@ class ProductionRealtimeClient(
                         "flow_control_v1",
                         "lease_v1",
                         "bounded_event_replay_v1",
+                        "terminal_presentation_metadata_v1",
+                        "terminal_typed_input_v1",
                     ).forEach { add(kotlinx.serialization.json.JsonPrimitive(it)) }
                 }
             }

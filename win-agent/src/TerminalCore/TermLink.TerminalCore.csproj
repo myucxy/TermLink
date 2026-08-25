@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>TermLink.TerminalCore</AssemblyName>
+    <RootNamespace>TermLink.TerminalCore</RootNamespace>
+  </PropertyGroup>
+</Project>

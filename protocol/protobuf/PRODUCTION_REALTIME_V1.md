@@ -70,10 +70,22 @@ Version 1 requires `e2ee_x25519_chacha20poly1305`, `cumulative_ack`,
 `flow_control_v1`, and `lease_v1`. `bounded_event_replay_v1` is supported for
 recovery. The additive Phase 1 `TerminalSnapshotV1` and
 `TerminalTranscriptPageV1` object field allocations are frozen in
-`../test-vectors/TERMINAL_SNAPSHOT_V1.md`, but the `terminal_snapshot_v1`
-runtime capability remains experimental and disabled. Clients and Agents MUST
-NOT advertise it until checked-in producer/importer equivalence and
-cross-language E2EE tests satisfy that document's enablement gate.
+`../test-vectors/TERMINAL_SNAPSHOT_V1.md`. The recipient-bound REST
+`terminal_snapshot_v1` path may be advertised after producer/importer
+equivalence and cross-language E2EE gates pass; it remains independently
+rollbackable. This does not enable normalized realtime presentation deltas.
+
+Additive implementations may advertise `terminal_presentation_metadata_v1`
+and `terminal_typed_input_v1`. The Relay returns the bounded intersection of
+recognized capabilities in `ServerWelcome.capabilities`; older peers may omit
+or ignore that field. Full normalized Snapshot/Delta/Resync delivery is a
+separate `terminal_presentation_v1` gate and is not implied by metadata support.
+
+An `OUTPUT_CHUNK` from a metadata-capable producer sets `source_event_seq` to
+the authoritative SessionHost journal sequence and a monotonic
+`presentation_revision`. A legacy zero value means `Envelope.seq`. A receiver
+must resync instead of applying an update whose non-zero source anchor differs
+from `Envelope.seq` or whose presentation revision regresses.
 
 ## Direction and message ACL
 
@@ -108,6 +120,12 @@ An input payload contains a unique `input_id`, the active `lease_id`, lease
 version, and input sequence. The PC Agent validates the lease again immediately
 before writing to ConPTY and keeps a bounded duplicate-input cache. Local PC
 input revokes the remote lease and always takes priority.
+
+During the V1 typed-input compatibility window, `InputEventPayload.input`
+remains present. A sender may additionally set `typed_input`; a capable PC
+deterministically encodes it and requires byte equality with the legacy field
+before writing to ConPTY. This permits old/new peers in either direction and
+prevents a plugin-visible semantic command from differing from executed bytes.
 
 Revocation fences input that was already in flight; it does not permanently
 disable a foreground same-account Android client. After observing the newer

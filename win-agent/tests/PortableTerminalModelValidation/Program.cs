@@ -27,6 +27,7 @@ namespace TermLink.PortableTerminalModel.Validation
                 var repositoryRoot = ParseRepositoryRoot(args);
                 ValidateSupportedSnapshotRoundTrip();
                 ValidateIncompleteBoundariesAndRejections();
+                ValidateCodexControlAndColorCompatibility();
                 ValidateUnicodeWidthAndCombining();
                 ValidateOscControlStrings();
                 ValidateClearCursorAndResizeContracts();
@@ -93,7 +94,7 @@ namespace TermLink.PortableTerminalModel.Validation
 
             RequireRejected("DCS_UNSUPPORTED", Bytes("\u001bP1;2|data\u001b\\"));
             RequireRejected("CSI_FINAL_UNSUPPORTED", Bytes("\u001b[2;3r"));
-            RequireRejected("C0_CONTROL_UNSUPPORTED", new byte[] { 0x09 });
+            RequireRejected("C0_CONTROL_UNSUPPORTED", new byte[] { 0x01 });
             RequireRejected("INVALID_UTF8", new byte[] { 0xE0, 0x80, 0x80 });
             RequireRejected("INVALID_UTF8", new byte[] { 0xED, 0xA0, 0x80 });
 
@@ -109,6 +110,41 @@ namespace TermLink.PortableTerminalModel.Validation
             gap.AdvanceNonTerminalEvent(2);
             Require(gap.PermanentRejectionCode == "SEQUENCE_NOT_CONTIGUOUS",
                 "A non-contiguous producer sequence remained eligible.");
+        }
+
+        private static void ValidateCodexControlAndColorCompatibility()
+        {
+            var model = new PortableTerminalModelV1(16, 4);
+            model.ApplyOutput(1, Bytes(
+                "abc\bZ\tX" +
+                "\u001b[?2004h\u001b[?1004l" +
+                "\u001b[0 q\u001b[25l" +
+                "\u001b[38;2;246;226;183mF" +
+                "\u001b[48;5;42mB\u001b[m"));
+            Require(model.TryCreateSnapshot(out var snapshot),
+                "Codex control/color subset did not produce a checkpoint.");
+            Require(snapshot.ScreenRows[0].Cells[2].Character == "Z" &&
+                snapshot.ScreenRows[0].Cells[8].Character == "X",
+                "Backspace or horizontal tab did not preserve the Codex grid.");
+            Require(snapshot.BracketedPaste && !snapshot.FocusReporting && !snapshot.CursorVisible &&
+                snapshot.CursorStyle == PortableTerminalCursorStyleV1.Block && snapshot.CursorBlink,
+                "Codex terminal modes were not captured in the checkpoint.");
+            Require(PortableTerminalStyleV1.TryGetRgb(snapshot.ScreenRows[0].Cells[9].Style.Foreground, out var rgb) &&
+                rgb == 0x00f6e2b7 && snapshot.ScreenRows[0].Cells[10].Style.Background == 42,
+                "Codex true-color or 256-color SGR was not captured losslessly.");
+
+            model.ApplyOutput(2, Bytes("\u001b[?2026hpartial"));
+            Require(!model.SnapshotEligible && model.ParserBoundaryCode == "SYNCHRONIZED_OUTPUT_ACTIVE",
+                "Synchronized output exposed a partial presentation checkpoint.");
+            model.ApplyOutput(3, Bytes("\u001b[?2026l"));
+            Require(model.TryCreateSnapshot(out var synchronizedSnapshot),
+                "Synchronized output did not publish after the atomic batch ended.");
+
+            var restored = PortableTerminalModelV1.Restore(synchronizedSnapshot);
+            model.ApplyOutput(4, Bytes("!"));
+            restored.ApplyOutput(4, Bytes("!"));
+            Require(model.ValidationFingerprint() == restored.ValidationFingerprint(),
+                "Codex modes/colors diverged after checkpoint restoration.");
         }
 
         private static void ValidateUnicodeWidthAndCombining()
@@ -340,8 +376,8 @@ namespace TermLink.PortableTerminalModel.Validation
 
         private static void PrintCoverageMatrix()
         {
-            Console.WriteLine("SUPPORTED: ASCII and assigned Unicode text; common CJK/emoji width two; combining/variation scalars; BEL/ST-terminated OSC; NUL/BEL; CR/LF; ESC c; basic SGR/ANSI16; CSI A/B/C/D/G/d/H/f; ED 0/1/2; EL 0/1/2; ?25h/?25l; pristine/no-op resize; bounded scrollback.");
-            Console.WriteLine("TEMPORARY_INELIGIBLE: incomplete ESC/CSI/OSC; incomplete UTF-8 scalar.");
+            Console.WriteLine("SUPPORTED: assigned Unicode/CJK/emoji/combining text; OSC skip; NUL/BEL/BS/HT/CR/LF/VT/FF; ESC c; SGR attributes plus ANSI16/256/RGB; CSI cursor/erase; DECSCUSR; ?25/?1004/?2004; synchronized-output ?2026; pristine/no-op resize; bounded scrollback.");
+            Console.WriteLine("TEMPORARY_INELIGIBLE: incomplete ESC/CSI/OSC/UTF-8; active synchronized-output batch.");
             Console.WriteLine("PERMANENT_REJECT: invalid UTF-8; orphan combining scalars; unsupported or terminal-dependent Unicode widths; DCS/APC/PM/SOS; unsupported ESC/CSI/private modes/SGR/C0; resize reflow; scrollback overflow; sequence gap.");
         }
 

@@ -22,9 +22,11 @@ namespace TermLink.Agent
 
     internal readonly struct PortableTerminalStyleV1 : IEquatable<PortableTerminalStyleV1>
     {
-        public const short DefaultColor = -1;
+        public const int DefaultColor = -1;
+        private const int RgbFlag = 1 << 24;
+        private const int RgbMask = 0x00ffffff;
 
-        public PortableTerminalStyleV1(short foreground, short background, PortableTerminalAttributesV1 attributes)
+        public PortableTerminalStyleV1(int foreground, int background, PortableTerminalAttributesV1 attributes)
         {
             ValidateColor(foreground, nameof(foreground));
             ValidateColor(background, nameof(background));
@@ -35,8 +37,8 @@ namespace TermLink.Agent
             Attributes = attributes;
         }
 
-        public short Foreground { get; }
-        public short Background { get; }
+        public int Foreground { get; }
+        public int Background { get; }
         public PortableTerminalAttributesV1 Attributes { get; }
 
         public static PortableTerminalStyleV1 Default =>
@@ -49,11 +51,30 @@ namespace TermLink.Agent
 
         public override int GetHashCode() => HashCode.Combine(Foreground, Background, (ushort)Attributes);
 
-        internal PortableTerminalStyleV1 WithForeground(short value) =>
+        internal PortableTerminalStyleV1 WithForeground(int value) =>
             new PortableTerminalStyleV1(value, Background, Attributes);
 
-        internal PortableTerminalStyleV1 WithBackground(short value) =>
+        internal PortableTerminalStyleV1 WithBackground(int value) =>
             new PortableTerminalStyleV1(Foreground, value, Attributes);
+
+        internal static int PaletteColor(int index)
+        {
+            if (index < 0 || index > 255) throw new ArgumentOutOfRangeException(nameof(index));
+            return index;
+        }
+
+        internal static int RgbColor(int red, int green, int blue)
+        {
+            if ((uint)red > 255 || (uint)green > 255 || (uint)blue > 255)
+                throw new ArgumentOutOfRangeException(nameof(red), "RGB components must be bytes.");
+            return RgbFlag | (red << 16) | (green << 8) | blue;
+        }
+
+        internal static bool TryGetRgb(int value, out int rgb)
+        {
+            rgb = value & RgbMask;
+            return value >= RgbFlag && value <= (RgbFlag | RgbMask);
+        }
 
         internal PortableTerminalStyleV1 WithAttributes(PortableTerminalAttributesV1 value) =>
             new PortableTerminalStyleV1(Foreground, Background, value);
@@ -68,11 +89,21 @@ namespace TermLink.Agent
             PortableTerminalAttributesV1.Invisible |
             PortableTerminalAttributesV1.Strikethrough;
 
-        private static void ValidateColor(short value, string name)
+        private static void ValidateColor(int value, string name)
         {
-            if (value != DefaultColor && (value < 0 || value > 15))
-                throw new ArgumentOutOfRangeException(name, "Only the default and ANSI 16-color palette are supported.");
+            if (value != DefaultColor && (value < 0 ||
+                (value > 255 && (value < RgbFlag || value > (RgbFlag | RgbMask)))))
+            {
+                throw new ArgumentOutOfRangeException(name, "Terminal color must be default, palette, or RGB.");
+            }
         }
+    }
+
+    internal enum PortableTerminalCursorStyleV1 : byte
+    {
+        Block,
+        Underline,
+        Bar
     }
 
     internal sealed class PortableTerminalCellV1
@@ -206,7 +237,11 @@ namespace TermLink.Agent
             int cursorColumn,
             int cursorRow,
             bool cursorVisible,
+            PortableTerminalCursorStyleV1 cursorStyle,
+            bool cursorBlink,
             bool pendingAutoWrap,
+            bool bracketedPaste,
+            bool focusReporting,
             PortableTerminalStyleV1 currentStyle,
             IEnumerable<PortableTerminalRowV1> scrollbackRows,
             IEnumerable<PortableTerminalRowV1> screenRows,
@@ -223,7 +258,11 @@ namespace TermLink.Agent
             CursorColumn = cursorColumn;
             CursorRow = cursorRow;
             CursorVisible = cursorVisible;
+            CursorStyle = cursorStyle;
+            CursorBlink = cursorBlink;
             PendingAutoWrap = pendingAutoWrap;
+            BracketedPaste = bracketedPaste;
+            FocusReporting = focusReporting;
             CurrentStyle = currentStyle;
             NextLineId = nextLineId;
             this.scrollbackRows = CloneRows(scrollbackRows, columns, null);
@@ -240,7 +279,11 @@ namespace TermLink.Agent
         public int CursorColumn { get; }
         public int CursorRow { get; }
         public bool CursorVisible { get; }
+        public PortableTerminalCursorStyleV1 CursorStyle { get; }
+        public bool CursorBlink { get; }
         public bool PendingAutoWrap { get; }
+        public bool BracketedPaste { get; }
+        public bool FocusReporting { get; }
         public PortableTerminalStyleV1 CurrentStyle { get; }
         public ulong NextLineId { get; }
         public IReadOnlyList<PortableTerminalRowV1> ScrollbackRows => readOnlyScrollbackRows;
@@ -303,7 +346,12 @@ namespace TermLink.Agent
         private int cursorColumn;
         private int cursorRow;
         private bool cursorVisible = true;
+        private PortableTerminalCursorStyleV1 cursorStyle = PortableTerminalCursorStyleV1.Block;
+        private bool cursorBlink = true;
         private bool pendingAutoWrap;
+        private bool bracketedPaste;
+        private bool focusReporting;
+        private bool synchronizedOutput;
         private PortableTerminalStyleV1 currentStyle = PortableTerminalStyleV1.Default;
         private ulong lastSequence;
         private ulong nextLineId = 1;
@@ -347,12 +395,14 @@ namespace TermLink.Agent
                 if (parserState == ParserState.Csi) return "INCOMPLETE_CSI";
                 if (parserState == ParserState.Osc || parserState == ParserState.OscEscape)
                     return "INCOMPLETE_OSC";
+                if (synchronizedOutput) return "SYNCHRONIZED_OUTPUT_ACTIVE";
                 return "GROUND";
             }
         }
 
         public bool SnapshotEligible =>
-            permanentRejectionCode == null && parserState == ParserState.Ground && utf8ExpectedBytes == 0;
+            permanentRejectionCode == null && parserState == ParserState.Ground &&
+            utf8ExpectedBytes == 0 && !synchronizedOutput;
 
         public void AdvanceNonTerminalEvent(ulong sequence)
         {
@@ -417,7 +467,11 @@ namespace TermLink.Agent
                 cursorColumn,
                 cursorRow,
                 cursorVisible,
+                cursorStyle,
+                cursorBlink,
                 pendingAutoWrap,
+                bracketedPaste,
+                focusReporting,
                 currentStyle,
                 SnapshotRows(scrollback),
                 SnapshotRows(screen),
@@ -442,7 +496,11 @@ namespace TermLink.Agent
                 cursorColumn = snapshot.CursorColumn,
                 cursorRow = snapshot.CursorRow,
                 cursorVisible = snapshot.CursorVisible,
+                cursorStyle = snapshot.CursorStyle,
+                cursorBlink = snapshot.CursorBlink,
                 pendingAutoWrap = snapshot.PendingAutoWrap,
+                bracketedPaste = snapshot.BracketedPaste,
+                focusReporting = snapshot.FocusReporting,
                 currentStyle = snapshot.CurrentStyle,
                 nextLineId = snapshot.NextLineId
             };
@@ -458,7 +516,10 @@ namespace TermLink.Agent
             var value = new StringBuilder();
             value.Append(lastSequence).Append('|').Append(columns).Append('x').Append(rows).Append('|')
                 .Append(cursorColumn).Append(',').Append(cursorRow).Append('|')
-                .Append(cursorVisible ? '1' : '0').Append('|').Append(pendingAutoWrap ? '1' : '0').Append('|')
+                .Append(cursorVisible ? '1' : '0').Append(',').Append((int)cursorStyle).Append(',')
+                .Append(cursorBlink ? '1' : '0').Append('|').Append(pendingAutoWrap ? '1' : '0').Append('|')
+                .Append(bracketedPaste ? '1' : '0').Append(',').Append(focusReporting ? '1' : '0').Append(',')
+                .Append(synchronizedOutput ? '1' : '0').Append('|')
                 .Append((int)currentStyle.Foreground).Append(',').Append((int)currentStyle.Background).Append(',')
                 .Append((ushort)currentStyle.Attributes).Append('|')
                 .Append(ParserBoundaryCode).Append('|').Append(PermanentRejectionCode).Append('@')
@@ -549,7 +610,15 @@ namespace TermLink.Agent
                 case 0x00: // NUL has no terminal model state.
                 case 0x07: // BEL is transient and has no restorable state.
                     return;
+                case 0x08:
+                    Backspace();
+                    return;
+                case 0x09:
+                    HorizontalTab();
+                    return;
                 case 0x0A:
+                case 0x0B:
+                case 0x0C:
                     LineFeed(sequence);
                     return;
                 case 0x0D:
@@ -656,8 +725,7 @@ namespace TermLink.Agent
                 ExecuteCsi(parameters, (char)value, sequence);
                 return;
             }
-            if ((value >= (byte)'0' && value <= (byte)'9') || value == (byte)';' ||
-                (value == (byte)'?' && csi.Length == 0))
+            if ((value >= 0x20 && value <= 0x3F))
             {
                 if (csi.Length >= MaximumCsiBytes)
                 {
@@ -674,12 +742,22 @@ namespace TermLink.Agent
         {
             if (text.StartsWith("?", StringComparison.Ordinal))
             {
-                if ((final == 'h' || final == 'l') && string.Equals(text, "?25", StringComparison.Ordinal))
+                if (final == 'h' || final == 'l')
                 {
-                    cursorVisible = final == 'h';
-                    return;
+                    if (ApplyPrivateModes(text.Substring(1), final == 'h', sequence)) return;
                 }
                 Reject("CSI_PRIVATE_MODE_UNSUPPORTED", sequence);
+                return;
+            }
+
+            if (text.EndsWith(" ", StringComparison.Ordinal))
+            {
+                if (final == 'q' && TryParseParameters(text.Substring(0, text.Length - 1), out var cursorParameters))
+                {
+                    ApplyCursorStyle(cursorParameters, sequence);
+                    return;
+                }
+                Reject("CSI_INTERMEDIATE_UNSUPPORTED", sequence);
                 return;
             }
 
@@ -706,6 +784,15 @@ namespace TermLink.Agent
                     return;
                 case 'J': ApplyEraseDisplay(parameters, sequence); return;
                 case 'K': ApplyEraseLine(parameters, sequence); return;
+                case 'h':
+                case 'l':
+                    if (parameters.Length == 1 && parameters[0] == 25)
+                    {
+                        cursorVisible = final == 'h';
+                        return;
+                    }
+                    Reject("CSI_MODE_UNSUPPORTED", sequence);
+                    return;
                 default:
                     Reject("CSI_FINAL_UNSUPPORTED", sequence);
                     return;
@@ -715,18 +802,9 @@ namespace TermLink.Agent
         private void ApplySgr(int[] parameters, ulong sequence)
         {
             var values = parameters.Length == 0 ? new[] { 0 } : parameters;
-            foreach (var value in values)
+            for (var index = 0; index < values.Length; index++)
             {
-                var code = value < 0 ? 0 : value;
-                if (!IsSupportedSgr(code))
-                {
-                    Reject("SGR_UNSUPPORTED", sequence);
-                    return;
-                }
-            }
-            foreach (var value in values)
-            {
-                var code = value < 0 ? 0 : value;
+                var code = values[index] < 0 ? 0 : values[index];
                 if (code == 0) currentStyle = PortableTerminalStyleV1.Default;
                 else if (code == 1) AddAttribute(PortableTerminalAttributesV1.Bold);
                 else if (code == 2) AddAttribute(PortableTerminalAttributesV1.Dim);
@@ -743,13 +821,124 @@ namespace TermLink.Agent
                 else if (code == 27) RemoveAttributes(PortableTerminalAttributesV1.Inverse);
                 else if (code == 28) RemoveAttributes(PortableTerminalAttributesV1.Invisible);
                 else if (code == 29) RemoveAttributes(PortableTerminalAttributesV1.Strikethrough);
-                else if (code >= 30 && code <= 37) currentStyle = currentStyle.WithForeground((short)(code - 30));
+                else if (code >= 30 && code <= 37) currentStyle = currentStyle.WithForeground(code - 30);
                 else if (code == 39) currentStyle = currentStyle.WithForeground(PortableTerminalStyleV1.DefaultColor);
-                else if (code >= 40 && code <= 47) currentStyle = currentStyle.WithBackground((short)(code - 40));
+                else if (code >= 40 && code <= 47) currentStyle = currentStyle.WithBackground(code - 40);
                 else if (code == 49) currentStyle = currentStyle.WithBackground(PortableTerminalStyleV1.DefaultColor);
-                else if (code >= 90 && code <= 97) currentStyle = currentStyle.WithForeground((short)(code - 90 + 8));
-                else if (code >= 100 && code <= 107) currentStyle = currentStyle.WithBackground((short)(code - 100 + 8));
+                else if (code >= 90 && code <= 97) currentStyle = currentStyle.WithForeground(code - 90 + 8);
+                else if (code >= 100 && code <= 107) currentStyle = currentStyle.WithBackground(code - 100 + 8);
+                else if (code == 38 || code == 48)
+                {
+                    if (!TryReadExtendedColor(values, ref index, out var color))
+                    {
+                        Reject("SGR_EXTENDED_COLOR_INVALID", sequence);
+                        return;
+                    }
+                    currentStyle = code == 38
+                        ? currentStyle.WithForeground(color)
+                        : currentStyle.WithBackground(color);
+                }
+                else
+                {
+                    Reject("SGR_UNSUPPORTED", sequence);
+                    return;
+                }
             }
+        }
+
+        private bool ApplyPrivateModes(string text, bool enabled, ulong sequence)
+        {
+            if (!TryParseParameters(text, out var modes) || modes.Length == 0)
+            {
+                Reject("CSI_PRIVATE_MODE_INVALID", sequence);
+                return false;
+            }
+            foreach (var mode in modes)
+            {
+                switch (mode)
+                {
+                    case 25:
+                    case 1004:
+                    case 2004:
+                    case 2026:
+                        break;
+                    default:
+                        return false;
+                }
+            }
+            foreach (var mode in modes)
+            {
+                if (mode == 25) cursorVisible = enabled;
+                else if (mode == 1004) focusReporting = enabled;
+                else if (mode == 2004) bracketedPaste = enabled;
+                else if (mode == 2026) synchronizedOutput = enabled;
+            }
+            return true;
+        }
+
+        private void ApplyCursorStyle(int[] parameters, ulong sequence)
+        {
+            if (!TrySingleParameter(parameters, 0, out var style))
+            {
+                Reject("CSI_ARITY_UNSUPPORTED", sequence);
+                return;
+            }
+            switch (style)
+            {
+                case 0:
+                case 1:
+                    cursorStyle = PortableTerminalCursorStyleV1.Block;
+                    cursorBlink = true;
+                    break;
+                case 2:
+                    cursorStyle = PortableTerminalCursorStyleV1.Block;
+                    cursorBlink = false;
+                    break;
+                case 3:
+                    cursorStyle = PortableTerminalCursorStyleV1.Underline;
+                    cursorBlink = true;
+                    break;
+                case 4:
+                    cursorStyle = PortableTerminalCursorStyleV1.Underline;
+                    cursorBlink = false;
+                    break;
+                case 5:
+                    cursorStyle = PortableTerminalCursorStyleV1.Bar;
+                    cursorBlink = true;
+                    break;
+                case 6:
+                    cursorStyle = PortableTerminalCursorStyleV1.Bar;
+                    cursorBlink = false;
+                    break;
+                default:
+                    Reject("CURSOR_STYLE_UNSUPPORTED", sequence);
+                    break;
+            }
+        }
+
+        private static bool TryReadExtendedColor(int[] values, ref int index, out int color)
+        {
+            color = PortableTerminalStyleV1.DefaultColor;
+            if (index + 1 >= values.Length) return false;
+            var mode = values[++index];
+            if (mode == 5)
+            {
+                if (index + 1 >= values.Length || values[index + 1] < 0 || values[index + 1] > 255)
+                    return false;
+                color = PortableTerminalStyleV1.PaletteColor(values[++index]);
+                return true;
+            }
+            if (mode == 2)
+            {
+                if (index + 3 >= values.Length) return false;
+                var red = values[++index];
+                var green = values[++index];
+                var blue = values[++index];
+                if ((uint)red > 255 || (uint)green > 255 || (uint)blue > 255) return false;
+                color = PortableTerminalStyleV1.RgbColor(red, green, blue);
+                return true;
+            }
+            return false;
         }
 
         private void ApplyCursorPosition(int[] parameters, ulong sequence)
@@ -937,6 +1126,22 @@ namespace TermLink.Agent
             return column >= 0 && screen[row].Cells[column].DisplayWidth > 0;
         }
 
+        private void Backspace()
+        {
+            pendingAutoWrap = false;
+            if (cursorColumn == 0) return;
+            cursorColumn--;
+            if (screen[cursorRow].Cells[cursorColumn].WideContinuation && cursorColumn > 0)
+                cursorColumn--;
+        }
+
+        private void HorizontalTab()
+        {
+            pendingAutoWrap = false;
+            var next = ((cursorColumn / 8) + 1) * 8;
+            cursorColumn = Math.Min(columns - 1, next);
+        }
+
         private void Wrap(ulong sequence)
         {
             screen[cursorRow].Wrapped = true;
@@ -1103,7 +1308,12 @@ namespace TermLink.Agent
             cursorColumn = 0;
             cursorRow = 0;
             cursorVisible = true;
+            cursorStyle = PortableTerminalCursorStyleV1.Block;
+            cursorBlink = true;
             pendingAutoWrap = false;
+            bracketedPaste = false;
+            focusReporting = false;
+            synchronizedOutput = false;
             currentStyle = PortableTerminalStyleV1.Default;
             scrollback.Clear();
             ReplaceWithBlankScreen();

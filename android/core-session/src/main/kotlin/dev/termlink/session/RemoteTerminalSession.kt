@@ -1,7 +1,9 @@
 package dev.termlink.session
 
 import dev.termlink.terminal.api.TerminalEngine
+import dev.termlink.terminal.api.TerminalInput
 import dev.termlink.terminal.api.TerminalSize
+import dev.termlink.terminal.api.VtTerminalInputEncoder
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -54,6 +56,7 @@ class RemoteTerminalSession(
     private val acknowledgementJob: Job
     private var lastAppliedSequence = initialAcknowledgedSequence
     private var lastAckedSequence = initialAcknowledgedSequence
+    private var lastPresentationRevision = initialAcknowledgedSequence
     private var rendererGeneration = initialRendererState.rendererGeneration
     private var gapGeneration = 0L
     private var leaseExpiryJob: Job? = null
@@ -237,11 +240,18 @@ class RemoteTerminalSession(
             enterHistoryGap(expected, event.sequence)
             return EventAcceptance.HistoryGap(expected, event.sequence)
         }
+        if (event is RemoteSessionEvent.Output &&
+            (event.sourceEventSequence != event.sequence ||
+                event.presentationRevision <= lastPresentationRevision)
+        ) {
+            enterHistoryGap(expected, event.sequence)
+            return EventAcceptance.HistoryGap(expected, event.sequence)
+        }
 
         when (event) {
             is RemoteSessionEvent.Output -> {
                 require(event.bytes.isNotEmpty()) { "output event is empty" }
-                engine.feed(event.sequence, ByteBuffer.wrap(event.bytes).asReadOnlyBuffer())
+                applyOutput(event)
             }
             is RemoteSessionEvent.Resize -> engine.resize(event.size.columns, event.size.rows)
             is RemoteSessionEvent.Title -> mutableTitle.value = event.value
@@ -325,13 +335,13 @@ class RemoteTerminalSession(
                         engine.clear()
                         lastAppliedSequence = 0
                         lastAckedSequence = 0
+                        lastPresentationRevision = 0
                         acknowledgementHighWater.set(0)
                         mutableTitle.value = null
                         mutableState.value = RemoteSessionState.Live(lastAckedSequence)
                         for (event in events) {
                             when (event) {
-                                is RemoteSessionEvent.Output ->
-                                    engine.feed(event.sequence, ByteBuffer.wrap(event.bytes).asReadOnlyBuffer())
+                                is RemoteSessionEvent.Output -> applyOutput(event)
                                 is RemoteSessionEvent.Resize -> engine.resize(event.size.columns, event.size.rows)
                                 is RemoteSessionEvent.Title -> mutableTitle.value = event.value
                                 is RemoteSessionEvent.InputResult,
@@ -350,6 +360,7 @@ class RemoteTerminalSession(
                     } catch (error: Throwable) {
                         lastAppliedSequence = 0
                         lastAckedSequence = 0
+                        lastPresentationRevision = 0
                         acknowledgementHighWater.set(0)
                         mutableTitle.value = null
                         runCatching { engine.clear() }.exceptionOrNull()?.let(error::addSuppressed)
@@ -422,14 +433,14 @@ class RemoteTerminalSession(
                 engine.setReadOnly(true)
                 engine.clear()
                 lastAppliedSequence = 0
+                lastPresentationRevision = 0
                 mutableTitle.value = null
                 var recoveredState: RemoteSessionState = RemoteSessionState.Live(lastAckedSequence)
                 var durable = false
                 try {
                     for (event in events) {
                         when (event) {
-                            is RemoteSessionEvent.Output ->
-                                engine.feed(event.sequence, ByteBuffer.wrap(event.bytes).asReadOnlyBuffer())
+                            is RemoteSessionEvent.Output -> applyOutput(event)
                             is RemoteSessionEvent.Resize -> engine.resize(event.size.columns, event.size.rows)
                             is RemoteSessionEvent.Title -> mutableTitle.value = event.value
                             is RemoteSessionEvent.InputResult,
@@ -480,6 +491,7 @@ class RemoteTerminalSession(
                         }
                         lastAppliedSequence = 0
                         lastAckedSequence = 0
+                        lastPresentationRevision = 0
                         acknowledgementHighWater.set(0)
                         mutableTitle.value = null
                         runCatching { engine.clear() }.exceptionOrNull()?.let(error::addSuppressed)
@@ -538,7 +550,30 @@ class RemoteTerminalSession(
         rendererGeneration = commit.rendererGeneration
     }
 
-    suspend fun submitInput(bytes: ByteArray): InputSubmission {
+    private suspend fun applyOutput(event: RemoteSessionEvent.Output) {
+        require(event.bytes.isNotEmpty()) { "output event is empty" }
+        require(event.sourceEventSequence == event.sequence) {
+            "output presentation is anchored to another source event"
+        }
+        require(event.presentationRevision > lastPresentationRevision) {
+            "output presentation revision did not advance"
+        }
+        engine.feed(event.sequence, ByteBuffer.wrap(event.bytes).asReadOnlyBuffer())
+        lastPresentationRevision = event.presentationRevision
+    }
+
+    suspend fun submitInput(bytes: ByteArray): InputSubmission = submitInput(bytes, null)
+
+    suspend fun submitInput(input: TerminalInput): InputSubmission {
+        val bytes = VtTerminalInputEncoder.encode(input)
+        return try {
+            submitInput(bytes, input.copyForTransport())
+        } finally {
+            bytes.fill(0)
+        }
+    }
+
+    private suspend fun submitInput(bytes: ByteArray, typedInput: TerminalInput?): InputSubmission {
         val input = mutex.withLock {
             check(!closed.get()) { "RemoteTerminalSession is closed" }
             if (bytes.isEmpty()) return InputSubmission.RejectedEmpty
@@ -551,7 +586,7 @@ class RemoteTerminalSession(
                 }
                 return InputSubmission.RejectedNoLease
             }
-            RemoteInput(inputIdFactory(), bytes.copyOf())
+            RemoteInput(inputIdFactory(), bytes.copyOf(), typedInput)
         }
         return try {
             // Do not hold the session mutex while waiting for InputAccepted;
@@ -571,6 +606,13 @@ class RemoteTerminalSession(
             }
             InputSubmission.DeliveryUnknown(input.inputId)
         }
+    }
+
+    private fun TerminalInput.copyForTransport(): TerminalInput = when (this) {
+        is TerminalInput.Text -> copy()
+        is TerminalInput.Key -> copy()
+        is TerminalInput.Paste -> TerminalInput.Paste(bytes.copyOf())
+        is TerminalInput.RawBytes -> TerminalInput.RawBytes(bytes.copyOf())
     }
 
     private fun stateAfterAppliedEvent(event: RemoteSessionEvent): RemoteSessionState {

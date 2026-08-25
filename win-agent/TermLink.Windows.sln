@@ -19,6 +19,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Updater", "src\Upd
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Protocol", "src\Protocol\TermLink.Protocol.csproj", "{A3E48690-DFE2-4D4E-9AE8-3E1F244712B9}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.TerminalCore", "src\TerminalCore\TermLink.TerminalCore.csproj", "{C6D9B1EE-CAD4-46B8-BDC7-E3096FF1B53D}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.TerminalCore.Validation", "tests\TerminalCoreValidation\TermLink.TerminalCore.Validation.csproj", "{E7DB16DB-C360-4A67-B66D-7F7D4AA4C565}"
+EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.AgentControl.Validation", "tests\AgentControlValidation\TermLink.AgentControl.Validation.csproj", "{F356B28D-7AC5-4C6F-AE99-DF9A29C9B1DF}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TermLink.Tray.UpdateValidation", "tests\TrayUpdateValidation\TermLink.Tray.UpdateValidation.csproj", "{733F90E8-117B-4DB4-A32E-7BEDE75C85D8}"
@@ -65,6 +69,14 @@ Global
 		{A3E48690-DFE2-4D4E-9AE8-3E1F244712B9}.Debug|x64.Build.0 = Debug|Any CPU
 		{A3E48690-DFE2-4D4E-9AE8-3E1F244712B9}.Release|x64.ActiveCfg = Release|Any CPU
 		{A3E48690-DFE2-4D4E-9AE8-3E1F244712B9}.Release|x64.Build.0 = Release|Any CPU
+		{C6D9B1EE-CAD4-46B8-BDC7-E3096FF1B53D}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{C6D9B1EE-CAD4-46B8-BDC7-E3096FF1B53D}.Debug|x64.Build.0 = Debug|Any CPU
+		{C6D9B1EE-CAD4-46B8-BDC7-E3096FF1B53D}.Release|x64.ActiveCfg = Release|Any CPU
+		{C6D9B1EE-CAD4-46B8-BDC7-E3096FF1B53D}.Release|x64.Build.0 = Release|Any CPU
+		{E7DB16DB-C360-4A67-B66D-7F7D4AA4C565}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{E7DB16DB-C360-4A67-B66D-7F7D4AA4C565}.Debug|x64.Build.0 = Debug|Any CPU
+		{E7DB16DB-C360-4A67-B66D-7F7D4AA4C565}.Release|x64.ActiveCfg = Release|Any CPU
+		{E7DB16DB-C360-4A67-B66D-7F7D4AA4C565}.Release|x64.Build.0 = Release|Any CPU
 		{F356B28D-7AC5-4C6F-AE99-DF9A29C9B1DF}.Debug|x64.ActiveCfg = Debug|Any CPU
 		{F356B28D-7AC5-4C6F-AE99-DF9A29C9B1DF}.Debug|x64.Build.0 = Debug|Any CPU
 		{F356B28D-7AC5-4C6F-AE99-DF9A29C9B1DF}.Release|x64.ActiveCfg = Release|Any CPU
@@ -80,5 +92,6 @@ Global
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{6C50ED51-D383-41F3-A33C-1E6F86783414} = {5F5F9B01-0E93-4DF9-AB2C-8EF697D8E2C5}
+		{E7DB16DB-C360-4A67-B66D-7F7D4AA4C565} = {5F5F9B01-0E93-4DF9-AB2C-8EF697D8E2C5}
 	EndGlobalSection
 EndGlobal
