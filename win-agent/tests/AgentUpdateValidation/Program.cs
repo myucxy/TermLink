@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -56,6 +57,7 @@ namespace TermLink.AgentUpdate.Validation
                     ProductionAgentUpdateWorker.EnsureNewerTarget(update, 36),
                     "an Agent with the wrong executing build accepted the claim");
                 ValidateSupervisorRecoveryDecisions();
+                await ValidateVerifiedDownloadPromotionAsync();
 
                 await api.ProgressAsync(update, "PRECHECKING", 2, 0, CancellationToken.None);
                 await api.ProgressAsync(update, "DOWNLOADING", 5, null, CancellationToken.None);
@@ -120,6 +122,44 @@ namespace TermLink.AgentUpdate.Validation
                     "the target Agent did not resume rollback supervisor state " + state);
                 Assert(!ProductionAgentUpdateWorker.RequiresSupervisorRecovery(transaction, 37),
                     "the restored Agent tried to rerun completed rollback state " + state);
+            }
+        }
+
+        private static async Task ValidateVerifiedDownloadPromotionAsync()
+        {
+            var directory = Path.Combine(
+                Path.GetTempPath(),
+                "termlink-agent-update-validation-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(directory);
+            try
+            {
+                var destination = Path.Combine(directory, "TermLink-Setup.exe");
+                var content = Encoding.UTF8.GetBytes("verified remote update artifact");
+                var digest = Convert.ToHexString(SHA256.HashData(content)).ToLowerInvariant();
+                var progress = new List<int>();
+                using var input = new MemoryStream(content, writable: false);
+                await ProductionAgentUpdateWorker.WriteVerifiedDownloadAsync(
+                    input,
+                    destination,
+                    content.LongLength,
+                    digest,
+                    value =>
+                    {
+                        progress.Add(value);
+                        return Task.CompletedTask;
+                    },
+                    CancellationToken.None);
+                Assert(File.Exists(destination), "the verified Agent update was not promoted");
+                Assert(File.ReadAllBytes(destination).SequenceEqual(content),
+                    "the promoted Agent update bytes changed");
+                Assert(!File.Exists(destination + ".download"),
+                    "the partial Agent update remained after promotion");
+                Assert(progress.Count != 0 && progress[^1] == 65,
+                    "the verified Agent update did not report final download progress");
+            }
+            finally
+            {
+                if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
             }
         }
 

@@ -544,48 +544,85 @@ namespace TermLink.Agent
                 if (response.Content.Headers.ContentLength.HasValue &&
                     response.Content.Headers.ContentLength.Value != update.ArtifactSizeBytes)
                     throw new InvalidDataException("The update Content-Length does not match the fixed artifact size.");
-                var temporary = destination + ".download";
-                try
+                using var input = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
+                await WriteVerifiedDownloadAsync(
+                    input,
+                    destination,
+                    update.ArtifactSizeBytes,
+                    update.ArtifactSha256,
+                    async percent => await api.ProgressAsync(
+                        update,
+                        "DOWNLOADING",
+                        percent,
+                        null,
+                        token).ConfigureAwait(false),
+                    token).ConfigureAwait(false);
+            }
+        }
+
+        internal static async Task WriteVerifiedDownloadAsync(
+            Stream input,
+            string destination,
+            long expectedSize,
+            string expectedSha256,
+            Func<int, Task> reportProgress,
+            CancellationToken token)
+        {
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (string.IsNullOrWhiteSpace(destination))
+                throw new ArgumentException("A download destination is required.", nameof(destination));
+            if (expectedSize < 1) throw new ArgumentOutOfRangeException(nameof(expectedSize));
+            if (string.IsNullOrWhiteSpace(expectedSha256))
+                throw new ArgumentException("An artifact digest is required.", nameof(expectedSha256));
+            if (reportProgress == null) throw new ArgumentNullException(nameof(reportProgress));
+            var temporary = Path.GetFullPath(destination) + ".download";
+            try
+            {
+                long received;
+                byte[] actualHash;
+                using (var output = new FileStream(
+                    temporary,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    128 * 1024,
+                    FileOptions.Asynchronous | FileOptions.SequentialScan))
+                using (var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
                 {
-                    using var input = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
-                    using var output = new FileStream(
-                        temporary,
-                        FileMode.CreateNew,
-                        FileAccess.Write,
-                        FileShare.None,
-                        128 * 1024,
-                        FileOptions.Asynchronous | FileOptions.SequentialScan);
-                    using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
                     var buffer = new byte[128 * 1024];
-                    long received = 0;
+                    received = 0;
                     var lastPercent = 5;
                     int count;
                     while ((count = await input.ReadAsync(buffer, token).ConfigureAwait(false)) != 0)
                     {
                         received = checked(received + count);
-                        if (received > update.ArtifactSizeBytes)
+                        if (received > expectedSize)
                             throw new InvalidDataException("The update download exceeded the fixed artifact size.");
                         await output.WriteAsync(buffer.AsMemory(0, count), token).ConfigureAwait(false);
                         hash.AppendData(buffer, 0, count);
-                        var percent = 5 + (int)(received * 60 / update.ArtifactSizeBytes);
+                        var percent = 5 + (int)(received * 60 / expectedSize);
                         if (percent >= lastPercent + 5)
                         {
                             lastPercent = percent;
-                            await api.ProgressAsync(update, "DOWNLOADING", percent, null, token).ConfigureAwait(false);
+                            await reportProgress(percent).ConfigureAwait(false);
                         }
                     }
                     await output.FlushAsync(token).ConfigureAwait(false);
-                    if (received != update.ArtifactSizeBytes ||
-                        !CryptographicOperations.FixedTimeEquals(
-                            hash.GetHashAndReset(),
-                            Convert.FromHexString(update.ArtifactSha256)))
-                        throw new CryptographicException("The downloaded Setup does not match the fixed artifact digest.");
-                    File.Move(temporary, destination, true);
+                    actualHash = hash.GetHashAndReset();
                 }
-                finally
-                {
-                    if (File.Exists(temporary)) File.Delete(temporary);
-                }
+                if (received != expectedSize ||
+                    !CryptographicOperations.FixedTimeEquals(
+                        actualHash,
+                        Convert.FromHexString(expectedSha256)))
+                    throw new CryptographicException("The downloaded Setup does not match the fixed artifact digest.");
+
+                // FileShare.None deliberately protects the partial artifact.
+                // Close that handle before promoting the verified file on Windows.
+                File.Move(temporary, destination, true);
+            }
+            finally
+            {
+                if (File.Exists(temporary)) File.Delete(temporary);
             }
         }
 
