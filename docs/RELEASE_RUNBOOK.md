@@ -129,13 +129,25 @@ if ($process.ExitCode -ne 0) { throw "TermLink Setup failed: $($process.ExitCode
   新 Tray 正常运行时调用反而永不返回。应使用 `-PassThru` 后调用安装器 `Process.WaitForExit(timeout)`，
   它只等待该 PID。
 
-完成后核对 `.termlink-install.json`、所有 `TermLink*.exe` 的 FileVersion/ProductVersion，并执行：
+完成后核对 `.termlink-install.json`、所有 `TermLink*.exe` 的 FileVersion/ProductVersion，并通过保留的
+Legacy 诊断入口读取独立 Agent 状态：
 
 ```powershell
-& (Join-Path $installRoot 'TermLink.exe') --status-json '<ignored diagnostic path>'
+$statusPath = Join-Path $env:TEMP 'termlink-installed-status.json'
+$diagnostic = Start-Process `
+  -FilePath (Join-Path $installRoot 'TermLink.Legacy.exe') `
+  -ArgumentList @('--status-json', $statusPath) `
+  -WindowStyle Hidden -PassThru
+if (-not $diagnostic.WaitForExit(30000)) { throw 'TermLink diagnostic timed out.' }
+if ($diagnostic.ExitCode -ne 0) { throw "TermLink diagnostic failed: $($diagnostic.ExitCode)" }
+$status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
 ```
 
-要求 `Success=true`、`RemoteAccessEnabled=true`、账号仍关联、Relay 已连接，且版本中的 revision 是计划发布提交。
+Avalonia 主程序 `TermLink.exe` 不处理 `--status-json`，传入该参数只会打开 UI，不能作为 Agent 验收入口。
+`TermLink.Legacy.exe` 是 Windows GUI 子系统程序，PowerShell 的直接调用可能先于诊断文件落盘返回，因此必须按
+上例等待准确 PID 退出后再读取文件。要求 `$status.Success=true`、`$status.RemoteAccessEnabled=true`、
+`$status.Production.AccountLinked=true`、`$status.Production.RelayState=2`（Connected），且版本中的 revision
+是计划发布提交。
 
 ### 4.1 Avalonia Preview 发布
 
