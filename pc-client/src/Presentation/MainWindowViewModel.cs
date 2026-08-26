@@ -144,7 +144,8 @@ public sealed class SettingsPageViewModel : PageViewModel
     public string NewArguments { get => newArguments; set => SetProperty(ref newArguments, value); }
     public bool NewRunAsAdministrator { get => newRunAsAdministrator; set => SetProperty(ref newRunAsAdministrator, value); }
     public string ApplicationVersion { get; internal set; } = "1.0.0.0";
-    public string Author { get; internal set; } = "myucxy";
+    public string Author { get; internal set; } = "清风惹尘丶";
+    public string ReleaseNotes { get; internal set; } = PresentationText.CurrentVersionReleaseNotes;
     public string? EditingCommandId { get => editingCommandId; internal set => SetProperty(ref editingCommandId, value); }
     public bool CommandEditorOpen { get => commandEditorOpen; internal set => SetProperty(ref commandEditorOpen, value); }
     public bool HasUnsavedCommands { get => hasUnsavedCommands; internal set => SetProperty(ref hasUnsavedCommands, value); }
@@ -203,7 +204,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         IDesktopOperations? desktopOperations = null,
         IAppearanceController? appearanceController = null,
         string applicationVersion = "1.0.0.0",
-        string author = "myucxy")
+        string author = "清风惹尘丶")
     {
         this.stateStore = stateStore ?? throw new ArgumentNullException(nameof(stateStore));
         this.client = client ?? throw new ArgumentNullException(nameof(client));

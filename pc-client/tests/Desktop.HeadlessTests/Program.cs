@@ -149,8 +149,9 @@ public static class Program
         viewModel.SelectSettingsSection("about");
         Dispatcher.UIThread.RunJobs();
         Require(viewModel.IsAboutSettingsSelected && aboutRoot.IsVisible &&
-                viewModel.Settings.Author == "myucxy",
-            "The About section did not expose the author at the end of Settings.");
+                viewModel.Settings.Author == "清风惹尘丶" &&
+                viewModel.Settings.ReleaseNotes.Contains("UAC", StringComparison.Ordinal),
+            "The About section did not expose the author and current-version fixes at the end of Settings.");
         viewModel.SelectSettingsSection("integration");
         Dispatcher.UIThread.RunJobs();
         Require(viewModel.IsIntegrationSettingsSelected && integrationRoot.IsVisible,

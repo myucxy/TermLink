@@ -4,8 +4,8 @@
     <TargetFrameworks>net8.0;net8.0-windows</TargetFrameworks>
     <AssemblyName>TermLink</AssemblyName>
     <RootNamespace>TermLink.Desktop</RootNamespace>
-    <Authors>myucxy</Authors>
-    <Company>myucxy</Company>
+    <Authors>清风惹尘丶</Authors>
+    <Company>清风惹尘丶</Company>
     <ApplicationIcon Condition="'$(TargetFramework)' == 'net8.0-windows'">..\..\..\assets\brand\windows\TermLink.ico</ApplicationIcon>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
   </PropertyGroup>

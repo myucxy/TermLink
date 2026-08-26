@@ -4,7 +4,7 @@ namespace TermLink.Desktop;
 
 public static class DesktopProductInfo
 {
-    public const string Author = "myucxy";
+    public const string Author = "清风惹尘丶";
 
     public static string Version { get; } = ResolveVersion();
 

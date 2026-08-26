@@ -381,6 +381,12 @@
                   </StackPanel>
                 </Border>
                 <Border Classes="card">
+                  <StackPanel Spacing="8">
+                    <TextBlock Classes="section-title" Text="{x:Static text:PresentationText.CurrentVersionChanges}" />
+                    <TextBlock Text="{Binding Settings.ReleaseNotes}" Classes="muted" TextWrapping="Wrap" LineHeight="24" />
+                  </StackPanel>
+                </Border>
+                <Border Classes="card">
                   <Grid ColumnDefinitions="*,Auto" ColumnSpacing="18">
                     <StackPanel><TextBlock Classes="section-title" Text="{x:Static text:PresentationText.DesktopAndUpdates}" /><TextBlock Text="{x:Static text:PresentationText.UpdateSafetyDetail}" Classes="muted" TextWrapping="Wrap" Margin="0,4,0,0" /></StackPanel>
                     <Button Grid.Column="1" Classes="primary" Content="{x:Static text:PresentationText.CheckUpdates}" AutomationProperties.Name="检查 TermLink 更新" Command="{Binding CheckForUpdatesCommand}" VerticalAlignment="Center" />
