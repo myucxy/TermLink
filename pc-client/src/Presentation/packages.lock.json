@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "dependencies": {
+    "net8.0": {
+      "termlink.pc.contracts": {
+        "type": "Project"
+      },
+      "termlink.platform.abstractions": {
+        "type": "Project",
+        "dependencies": {
+          "TermLink.Pc.Contracts": "[1.0.0, )"
+        }
+      }
+    }
+  }
+}

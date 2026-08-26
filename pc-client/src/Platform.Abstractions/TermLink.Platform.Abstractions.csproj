@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>TermLink.Platform.Abstractions</AssemblyName>
+    <RootNamespace>TermLink.Platform</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Contracts\TermLink.Pc.Contracts.csproj" />
+  </ItemGroup>
+</Project>

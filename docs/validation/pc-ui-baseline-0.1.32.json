@@ -1,0 +1,31 @@
+{
+  "schema": "termlink.pc-ui-baseline/v1",
+  "captured_at": "2026-08-26T09:53:45+08:00",
+  "source_commit": "896b3a4947230087b26500d5a7f945142b1adfc0",
+  "source_tag": "pc-avalonia-baseline-v0.1.32",
+  "product_version": "0.1.32.38",
+  "machine": {
+    "logical_processors": 16,
+    "process_architecture": "x64",
+    "platform": "windows"
+  },
+  "idle_sample": {
+    "duration_seconds": 5,
+    "cpu_seconds_delta": 0.0,
+    "working_set_mib": 335.8,
+    "private_working_set_mib": 237.25,
+    "private_bytes_mib": 272.5,
+    "peak_working_set_mib": 386.1,
+    "thread_count": 51,
+    "handle_count": 684,
+    "responding": true
+  },
+  "implementation_observations": [
+    "navigation disposes and reconstructs the active page",
+    "theme application recursively visits the complete control tree",
+    "a three-second status timer can overlap page-initiated refreshes",
+    "session and device controls clear and rebuild their complete item collections",
+    "UI and production Agent share one process"
+  ],
+  "limitations": "This is a single-machine idle observation. Navigation P95 and UI-thread stall traces must be captured by the P2 telemetry harness."
+}

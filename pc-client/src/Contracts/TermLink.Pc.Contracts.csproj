@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>TermLink.Pc.Contracts</AssemblyName>
+    <RootNamespace>TermLink.Pc.Contracts</RootNamespace>
+  </PropertyGroup>
+</Project>
