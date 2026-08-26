@@ -14,7 +14,8 @@ reference Avalonia, WinForms, WPF, a platform implementation, or the production 
 Use the pinned SDK:
 
 ```powershell
-& 'D:\Dev\Env\dotnet-sdk-8.0.303\dotnet.exe' build .\pc-client\TermLink.Pc.sln
+& 'D:\Dev\Env\dotnet-sdk-8.0.303\dotnet.exe' build .\pc-client\TermLink.Pc.sln `
+    -c Release -p:RestoreLockedMode=true
 ```
 
 Run the portable architecture and Avalonia headless validations:

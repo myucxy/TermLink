@@ -367,7 +367,7 @@ namespace TermLink.Agent
             }
             catch
             {
-                Transition(SessionAgentLifecycle.Faulted);
+                TryTransitionUnlessStopping(SessionAgentLifecycle.Faulted);
                 try { CommitInterruptedLifecycle(); }
                 catch { }
                 throw;
@@ -512,7 +512,7 @@ namespace TermLink.Agent
             {
                 if (actualHostProcessId > 0 && !IsProcessRunning(actualHostProcessId))
                 {
-                    Transition(SessionAgentLifecycle.HostLost);
+                    TryTransitionUnlessStopping(SessionAgentLifecycle.HostLost);
                     return;
                 }
 
@@ -523,7 +523,7 @@ namespace TermLink.Agent
                     {
                         SetWaitingPipe(null);
                         if (stopRequested) return;
-                        Transition(SessionAgentLifecycle.HostLost);
+                        TryTransitionUnlessStopping(SessionAgentLifecycle.HostLost);
                         return;
                     }
                     SetWaitingPipe(null);
@@ -555,10 +555,10 @@ namespace TermLink.Agent
                 {
                     if (actualHostProcessId > 0 && !IsProcessRunning(actualHostProcessId))
                     {
-                        Transition(SessionAgentLifecycle.HostLost);
+                        TryTransitionUnlessStopping(SessionAgentLifecycle.HostLost);
                         return;
                     }
-                    Transition(SessionAgentLifecycle.Disconnected);
+                    TryTransitionUnlessStopping(SessionAgentLifecycle.Disconnected);
                     disconnectedDeadline = DateTime.UtcNow.AddMilliseconds(options.WaitMilliseconds);
                 }
             }
@@ -883,6 +883,21 @@ namespace TermLink.Agent
             {
                 lifecycle = value;
                 lastActivityUtc = DateTime.UtcNow;
+            }
+        }
+
+        private bool TryTransitionUnlessStopping(SessionAgentLifecycle value)
+        {
+            lock (statusSync)
+            {
+                // RequestRemoteStop uses the same lock. Once it has selected the
+                // RemoteStopped terminal state, a connection teardown racing on
+                // the worker thread must not overwrite it with Disconnected,
+                // HostLost, or Faulted before CommitInterruptedLifecycle runs.
+                if (stopRequested) return false;
+                lifecycle = value;
+                lastActivityUtc = DateTime.UtcNow;
+                return true;
             }
         }
 

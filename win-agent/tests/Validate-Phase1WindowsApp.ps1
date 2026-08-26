@@ -64,6 +64,7 @@ try {
         /r:System.Core.dll `
         "/out:$validationExecutable" `
         (Join-Path $PSScriptRoot '..\src\AgentControl\AgentControl.cs') `
+        (Join-Path $PSScriptRoot '..\src\AgentControl\RegistryControlSecurity.cs') `
         (Join-Path $PSScriptRoot 'SessionRecoveryValidation.cs')
     if ($LASTEXITCODE -ne 0) {
         throw "Session recovery validation compilation failed with exit code $LASTEXITCODE."
@@ -121,6 +122,7 @@ try {
 
     $sourceFiles = @(
         'src\AgentControl\AgentControl.cs',
+        'src\AgentControl\RegistryControlSecurity.cs',
         'src\Agent\CurrentUserPipe.cs',
         'src\Agent\SessionRegistrationStore.cs',
         'src\Agent\SessionRegistry.cs',
@@ -160,7 +162,7 @@ try {
         isolated_local_app_data = [bool]::Parse($fields.isolated_local_app_data)
         production_runtime_absent = [bool]::Parse($fields.production_runtime_absent)
         production_configured = [bool]::Parse($fields.production_configured)
-        tray_boundary = 'current-user control Pipe V3 and redacted SessionSummary/ProductionStatus only'
+        tray_boundary = 'bounded current-user control Pipe V7 with DPAPI secret/HMAC/replay protection and redacted SessionSummary/ProductionStatus only'
         source_sha256 = $hashes
     }
     $resolvedEvidence = [IO.Path]::GetFullPath($EvidencePath)

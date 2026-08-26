@@ -32,10 +32,17 @@ $hostExecutable = & (Join-Path $PSScriptRoot '..\src\SessionHost\Build-SessionHo
 $temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ('TermLink-Registry-' + [Guid]::NewGuid().ToString('N'))
 $testExecutable = Join-Path $temporaryDirectory 'SessionRegistryValidation.exe'
 $bufferRoot = Join-Path $temporaryDirectory 'buffers'
+$accountRoot = Join-Path $temporaryDirectory 'local-app-data'
+$acceptanceMarker = Join-Path $temporaryDirectory 'acceptance-root.cer'
 [IO.Directory]::CreateDirectory($temporaryDirectory) | Out-Null
 [IO.Directory]::CreateDirectory($bufferRoot) | Out-Null
+[IO.Directory]::CreateDirectory($accountRoot) | Out-Null
+$originalAccountRoot = [Environment]::GetEnvironmentVariable('TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT')
+$originalAcceptanceCA = [Environment]::GetEnvironmentVariable('TERMLINK_ACCEPTANCE_CA_FILE')
 
 try {
+    [Environment]::SetEnvironmentVariable('TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT', $accountRoot)
+    [Environment]::SetEnvironmentVariable('TERMLINK_ACCEPTANCE_CA_FILE', $acceptanceMarker)
     & $compiler `
         /nologo `
         /target:exe `
@@ -47,6 +54,7 @@ try {
         "/out:$testExecutable" `
         (Join-Path $PSScriptRoot '..\src\Common\LocalIpc.cs') `
         (Join-Path $PSScriptRoot '..\src\AgentControl\AgentControl.cs') `
+        (Join-Path $PSScriptRoot '..\src\AgentControl\RegistryControlSecurity.cs') `
         (Join-Path $PSScriptRoot '..\src\Agent\CurrentUserPipe.cs') `
         (Join-Path $PSScriptRoot '..\src\Agent\SessionRegistrationStore.cs') `
         (Join-Path $PSScriptRoot '..\src\Agent\SessionRegistry.cs') `
@@ -87,7 +95,7 @@ try {
         classification = 'local Win-Agent Registry and current-user control IPC; not production Relay or protocol'
         passed = $true
         registry_process_model = 'one long-lived Registry with one isolated SessionAgent worker per Host'
-        local_control_protocol = 'current-user Registry Pipe V3; not production Protobuf'
+        local_control_protocol = 'bounded Registry Pipe V7 with current-user SID ACL, DPAPI installation secret, HMAC, timestamp, and nonce replay protection'
         simultaneous_sessions = [int]$fields.multi_sessions
         summaries_exclude_terminal_body_pipe_token_and_buffer_path = [bool]::Parse($fields.summary_redacted)
         single_remote_stop_preserved_local_shell = [bool]::Parse($fields.single_stop_local_alive)
@@ -119,6 +127,8 @@ try {
     Write-Host "Phase 1 Session Registry validation passed. Evidence: $resolvedEvidence"
 }
 finally {
+    [Environment]::SetEnvironmentVariable('TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT', $originalAccountRoot)
+    [Environment]::SetEnvironmentVariable('TERMLINK_ACCEPTANCE_CA_FILE', $originalAcceptanceCA)
     $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
     $resolvedTemporary = [IO.Path]::GetFullPath($temporaryDirectory)
     if ($resolvedTemporary.StartsWith($temporaryRoot, [StringComparison]::OrdinalIgnoreCase) -and

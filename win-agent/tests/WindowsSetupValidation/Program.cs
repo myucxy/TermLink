@@ -29,6 +29,7 @@ namespace TermLink.Setup.Validation
                 ValidateArguments();
                 ValidateCrossDirectoryUpgradeIsRejected(temporaryRoot);
                 ValidateInstalledLaunchVersionIdentity(temporaryRoot);
+                ValidateIndependentAgentStartupCommands(temporaryRoot);
                 ValidateLaunchHealthIsProcessBound();
                 ValidateUpgradeTerminationConsent();
                 ValidateUpgradeTerminationPrompt();
@@ -179,6 +180,9 @@ namespace TermLink.Setup.Validation
 
         private static void ValidateLaunchHealthIsProcessBound()
         {
+            var authenticationSecret = Enumerable.Range(0, RegistryControlAuthentication.SecretBytes)
+                .Select(value => (byte)(value + 11))
+                .ToArray();
             var matchingPipeName = "termlink-setup-health-match-" + Guid.NewGuid().ToString("N");
             using (var matchingServer = new NamedPipeServerStream(
                 matchingPipeName,
@@ -193,15 +197,18 @@ namespace TermLink.Setup.Validation
                     var request = RegistryControlCodec.ReadRequest(matchingServer, out var requestVersion);
                     Assert(request.Command == RegistryCommand.List,
                         "The setup launch probe sent an unexpected health command.");
-                    RegistryControlCodec.WriteResponse(
-                        matchingServer,
-                        new RegistryResponse { Success = true, Code = "healthy" },
-                        requestVersion);
+                    var response = new RegistryResponse { Success = true, Code = "healthy" };
+                    RegistryControlAuthentication.PrepareResponse(
+                        response,
+                        request,
+                        authenticationSecret);
+                    RegistryControlCodec.WriteResponse(matchingServer, response, requestVersion);
                 });
                 var response = Installer.SendHealthRequestToLaunchedTray(
                     matchingPipeName,
                     Environment.ProcessId,
-                    5000);
+                    5000,
+                    authenticationSecret);
                 Assert(response != null && response.Success,
                     "The launch probe rejected the control pipe owned by the launched process.");
                 Assert(serverTask.Wait(5000),
@@ -230,12 +237,14 @@ namespace TermLink.Setup.Validation
                 var response = Installer.SendHealthRequestToLaunchedTray(
                     foreignPipeName,
                     Environment.ProcessId == int.MaxValue ? int.MaxValue - 1 : Environment.ProcessId + 1,
-                    5000);
+                    5000,
+                    authenticationSecret);
                 Assert(response == null,
                     "A healthy global pipe owned by another process was accepted for the new launch.");
                 Assert(connectionObserved.Wait(5000) && serverTask.Wait(5000),
                     "The foreign launch-health server did not observe the probe connection.");
             }
+            Array.Clear(authenticationSecret, 0, authenticationSecret.Length);
         }
 
         private static void ValidateInstalledLaunchVersionIdentity(string temporaryRoot)
@@ -243,6 +252,7 @@ namespace TermLink.Setup.Validation
             var root = Path.Combine(temporaryRoot, "launch-version-identity", "TermLink");
             Directory.CreateDirectory(root);
             File.WriteAllBytes(Path.Combine(root, "TermLink.exe"), new byte[] { 0x4d, 0x5a });
+            File.WriteAllBytes(Path.Combine(root, "TermLink.Agent.exe"), new byte[] { 0x4d, 0x5a });
             File.WriteAllBytes(Path.Combine(root, "TermLink.SessionHost.exe"), new byte[] { 0x4d, 0x5a });
             var validationAssembly = typeof(ValidationProgram).Assembly.Location;
             File.Copy(validationAssembly, Path.Combine(root, "TermLink.dll"), overwrite: false);
@@ -269,6 +279,23 @@ namespace TermLink.Setup.Validation
                 new UTF8Encoding(false));
             Assert(!Installer.IsInstalledLaunchIdentityValid(root),
                 "A marker/Tray assembly version mismatch was accepted for launch.");
+        }
+
+        private static void ValidateIndependentAgentStartupCommands(string temporaryRoot)
+        {
+            var root = Path.Combine(temporaryRoot, "startup commands", "TermLink");
+            var localData = Path.Combine(temporaryRoot, "startup local data");
+            var commands = Installer.CreateStartupCommands(root, localData);
+            Assert(commands.Tray == "\"" + Path.Combine(root, "TermLink.exe") + "\"",
+                "The UI startup command changed unexpectedly.");
+            Assert(commands.Agent.StartsWith(
+                    "\"" + Path.Combine(root, "TermLink.Agent.exe") +
+                        "\" --registry --control-pipe termlink-agent-control-v2-",
+                    StringComparison.Ordinal) &&
+                commands.Agent.EndsWith(
+                    " --buffer-root \"" + Path.Combine(localData, "TermLink", "Agent") + "\"",
+                    StringComparison.Ordinal),
+                "The independent Agent startup command is incomplete or not account-scoped.");
         }
 
         private static void ValidateServiceImagePathParsing()

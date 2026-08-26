@@ -19,7 +19,13 @@ if (-not (Test-Path -LiteralPath $agent -PathType Leaf) -or
 $suffix = [guid]::NewGuid().ToString('N')
 $pipe = "termlink-concurrency-$suffix"
 $buffer = Join-Path $env:TEMP "termlink-concurrency-$suffix"
+$accountRoot = Join-Path $buffer 'local-app-data'
+$acceptanceMarker = Join-Path $buffer 'acceptance-root.cer'
 $server = 'https://termlink.kget.cc:8910'
+$originalAccountRoot = [Environment]::GetEnvironmentVariable('TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT')
+$originalAcceptanceCA = [Environment]::GetEnvironmentVariable('TERMLINK_ACCEPTANCE_CA_FILE')
+[Environment]::SetEnvironmentVariable('TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT', $accountRoot)
+[Environment]::SetEnvironmentVariable('TERMLINK_ACCEPTANCE_CA_FILE', $acceptanceMarker)
 $agentProcess = Start-Process -FilePath $agent -ArgumentList @(
     '--registry', '--control-pipe', $pipe, '--buffer-root', $buffer
 ) -PassThru -WindowStyle Hidden
@@ -82,5 +88,13 @@ finally {
     if (-not $agentProcess.HasExited) {
         $agentProcess.Kill($true)
         $agentProcess.WaitForExit()
+    }
+    [Environment]::SetEnvironmentVariable('TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT', $originalAccountRoot)
+    [Environment]::SetEnvironmentVariable('TERMLINK_ACCEPTANCE_CA_FILE', $originalAcceptanceCA)
+    $resolvedBuffer = [IO.Path]::GetFullPath($buffer)
+    $temporaryRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'
+    if ($resolvedBuffer.StartsWith($temporaryRoot, [StringComparison]::OrdinalIgnoreCase) -and
+        [IO.Path]::GetFileName($resolvedBuffer).StartsWith('termlink-concurrency-', [StringComparison]::Ordinal)) {
+        Remove-Item -LiteralPath $resolvedBuffer -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

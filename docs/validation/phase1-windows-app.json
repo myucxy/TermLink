@@ -1,7 +1,7 @@
 {
   "schema": "termlink.phase1-windows-app-validation",
   "version": 1,
-  "generated_at_utc": "2026-08-22T16:50:44.3650145Z",
+  "generated_at_utc": "2026-08-26T03:23:07.2966581Z",
   "classification": "current-user .NET 8 Agent/Tray and local recovery; not production Relay, installer, or E2EE",
   "passed": true,
   "dotnet_sdk": "8.0.303",
@@ -17,17 +17,21 @@
   "tray_summary_sessions": 20,
   "local_shells_survived_remote_stop": 20,
   "remote_stop_retained_terminal_recovery_index": true,
-  "tray_boundary": "current-user control Pipe V3 and redacted SessionSummary/ProductionStatus only",
+  "isolated_local_app_data": true,
+  "production_runtime_absent": true,
+  "production_configured": false,
+  "tray_boundary": "bounded current-user control Pipe V7 with DPAPI secret/HMAC/replay protection and redacted SessionSummary/ProductionStatus only",
   "source_sha256": {
-    "src/AgentControl/AgentControl.cs": "1a1db0c013395de869e956410e133f1eea1e8f8a22912b4e0bb21924b8b9bd70",
+    "src/AgentControl/AgentControl.cs": "c6903ba9a3987c3ac552c8152183fbd160a8d3646903c4df09e18318681a6c8d",
+    "src/AgentControl/RegistryControlSecurity.cs": "b6732e7d9afb1bafc1f8d60bb9a7364e968ea6042e5c2af6e24222384ff3cb7b",
     "src/Agent/CurrentUserPipe.cs": "0e93db425e2ad4ecd4667ac1ae5e700f84ad2ee5d6b73909183e5d4828e8c727",
     "src/Agent/SessionRegistrationStore.cs": "f9616d40afde59d78348e5bca06a04fbc325223687ecc7528accec0cd91af02a",
-    "src/Agent/SessionRegistry.cs": "0a2dccc6ccb603647da9ebefc442022f0f5676ce1e1204404831439b8f0545db",
-    "src/Agent/TermLink.Agent.csproj": "0fffed7d9cd6797ef420733289bf8b93cf3aedea9e3ef139839d4e2d8d6c4a89",
+    "src/Agent/SessionRegistry.cs": "ab8bbf9b2afc8877fb7e7fbed5e39003ea88ef78004bd6d9c73fb09d0cdb3f47",
+    "src/Agent/TermLink.Agent.csproj": "9f17566547840c0eae1bced8f334a70c1e51e407c5372896a54713399e9ee31f",
     "src/SessionHost/TermLink.SessionHost.csproj": "9c23a6ca0fe30013337e81140ecbce50bef3f3c83b71599e6edfc2648e3797ed",
-    "src/Tray/Program.cs": "9871147353d6a216e54f1971484bfa05788a4024f3c75881ac8cec1b3b87820f",
-    "src/Tray/TrayApplicationContext.cs": "00492e9dcee168d3566324d369a9c57a61e1d6e1216e048b3570a52959f4db55",
-    "src/Tray/TermLink.Tray.csproj": "2be19c7abf929b0dbed62892a7b521f4c9e4cf44a044c3a26ca4ec29e77ce388",
-    "tests/SessionRecoveryValidation.cs": "b62c557d793cd67f30b0f23c23495c43cd96232f803346928066c72a20d81dbe"
+    "src/Tray/Program.cs": "c90fc4e30e966f63fae38628bb65afcca276f75611879e53f56d3292011b03d6",
+    "src/Tray/TrayApplicationContext.cs": "776c3cdfbfe06e8518ca80038692c9ae03b2ca2339dc4d01444ab0acf69f8a32",
+    "src/Tray/TermLink.Tray.csproj": "78f53bdc35bf7a0ecaabb01e9ba61e0a5ef8396efa9a99988215cc31c07b5d63",
+    "tests/SessionRecoveryValidation.cs": "d1d6716ce985aa07c8a4639b86d4883e76664d84bc871887e5d90481dcb1cf0a"
   }
 }

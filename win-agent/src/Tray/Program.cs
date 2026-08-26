@@ -69,9 +69,8 @@ namespace TermLink.Tray
                     out ownsTrayMutex))
                 {
                     if (!ownsTrayMutex) return 0;
-                    // The UI and Agent are one process. Construct the complete
-                    // local runtime before the WinForms message loop starts;
-                    // Relay connection itself remains asynchronous.
+                    // Start or attach to the independent Agent without blocking
+                    // the WinForms message loop on account/session recovery.
                     controller.StartInteractive();
                     // The shell is sized in device-independent pixels and is safe to
                     // move between monitors with different scale factors.
@@ -207,13 +206,13 @@ namespace TermLink.Tray
     {
         private readonly TrayOptions options;
         private readonly object lifecycleSync = new object();
-        private readonly EmbeddedAgentHost embeddedHost;
+        private readonly ExternalAgentHost externalHost;
         private bool disposed;
 
         public AgentController(TrayOptions options)
         {
             this.options = options ?? throw new ArgumentNullException(nameof(options));
-            embeddedHost = new EmbeddedAgentHost(options.ControlPipeName, options.BufferRoot);
+            externalHost = new ExternalAgentHost(options.ControlPipeName, options.BufferRoot);
         }
 
         public string ServerUrl { get { return options.ServerUrl; } }
@@ -224,7 +223,7 @@ namespace TermLink.Tray
             {
                 ThrowIfDisposed();
                 Directory.CreateDirectory(options.BufferRoot);
-                embeddedHost.BeginStart();
+                externalHost.BeginStart();
             }
         }
 
@@ -237,11 +236,8 @@ namespace TermLink.Tray
         {
             ThrowIfDisposed();
             Directory.CreateDirectory(options.BufferRoot);
-            // Interactive startup is deliberately non-blocking. Status refreshes
-            // wait off the UI thread for the same initialization attempt and can
-            // show its precise failure once one exists.
-            embeddedHost.Start();
-            return embeddedHost.Dispatch(new RegistryRequest { Command = RegistryCommand.List });
+            externalHost.Start();
+            return externalHost.Dispatch(new RegistryRequest { Command = RegistryCommand.List });
         }
 
         public RegistryResponse Send(RegistryCommand command)
@@ -255,12 +251,8 @@ namespace TermLink.Tray
             {
                 if (request == null) throw new ArgumentNullException(nameof(request));
                 ThrowIfDisposed();
-                if (!embeddedHost.IsRunning)
-                {
-                    Directory.CreateDirectory(options.BufferRoot);
-                    embeddedHost.Start();
-                }
-                return embeddedHost.Dispatch(request);
+                Directory.CreateDirectory(options.BufferRoot);
+                return externalHost.Dispatch(request);
             }
         }
 
@@ -278,19 +270,7 @@ namespace TermLink.Tray
 
         private void ShutdownAndWaitCore()
         {
-            if (embeddedHost.IsRunning)
-            {
-                try
-                {
-                    embeddedHost.Dispatch(new RegistryRequest { Command = RegistryCommand.Shutdown });
-                }
-                catch (InvalidOperationException)
-                {
-                    // The background runtime may have completed concurrently.
-                }
-            }
-
-            embeddedHost.Stop(TimeSpan.FromSeconds(15));
+            externalHost.Shutdown();
 
             WaitForOwnedProcesses(DateTime.UtcNow.AddSeconds(10));
             foreach (var process in GetOwnedProcesses())
@@ -376,10 +356,7 @@ namespace TermLink.Tray
             lock (lifecycleSync)
             {
                 ThrowIfDisposed();
-                var response = Send(RegistryCommand.RestartAgent);
-                if (!response.Success) return response;
-                embeddedHost.Stop(TimeSpan.FromSeconds(15));
-                return EnsureAgentCore();
+                return externalHost.Restart();
             }
         }
 
@@ -493,7 +470,7 @@ namespace TermLink.Tray
             if (string.IsNullOrWhiteSpace(installRoot)) return result;
             installRoot = Path.GetFullPath(installRoot).TrimEnd(Path.DirectorySeparatorChar) +
                 Path.DirectorySeparatorChar;
-            foreach (var name in new[] { "TermLink.SessionHost" })
+            foreach (var name in new[] { "TermLink.Agent", "TermLink.SessionHost" })
             {
                 foreach (var process in Process.GetProcessesByName(name))
                 {
@@ -527,14 +504,14 @@ namespace TermLink.Tray
                 disposed = true;
                 try
                 {
-                    embeddedHost.Dispose();
+                    externalHost.Dispose();
                 }
                 catch (Exception error)
                 {
                     // Exiting the UI must not be reclassified as a startup
                     // failure merely because the already-stopping background
                     // runtime reported a late network/account cleanup error.
-                    Debug.WriteLine("TermLink embedded runtime cleanup failed: " + error);
+                    Debug.WriteLine("TermLink external Agent supervisor cleanup failed: " + error);
                 }
             }
         }

@@ -1355,6 +1355,8 @@ namespace TermLink.Agent
         private readonly object sync = new object();
         private readonly HashSet<NamedPipeServerStream> activeControlPipes =
             new HashSet<NamedPipeServerStream>();
+        private readonly byte[] controlSecret;
+        private readonly RegistryControlReplayWindow controlReplay = new RegistryControlReplayWindow();
         private volatile bool shutdownRequested;
         private int requests;
         private bool disposed;
@@ -1363,6 +1365,7 @@ namespace TermLink.Agent
         {
             if (options == null) throw new ArgumentNullException("options");
             this.options = options;
+            controlSecret = RegistryControlSecretStore.GetOrCreateDefault();
 #if TERMLINK_PRODUCTION_RUNTIME
             var runtime = ProductionAgentRuntime.TryCreate();
             try
@@ -1380,6 +1383,7 @@ namespace TermLink.Agent
             {
                 if (runtime != null) runtime.Dispose();
                 if (registry != null) registry.Dispose();
+                Array.Clear(controlSecret, 0, controlSecret.Length);
                 throw;
             }
 #else
@@ -1398,6 +1402,7 @@ namespace TermLink.Agent
             if (registry == null) throw new ArgumentNullException("registry");
             this.options = options;
             this.registry = registry;
+            controlSecret = RegistryControlSecretStore.GetOrCreateDefault();
             productionRuntime = null;
         }
 
@@ -1460,13 +1465,18 @@ namespace TermLink.Agent
                     {
                         pipe.WaitForConnection();
                         RegistryResponse response;
-                        var responseVersion = RegistryControlCodec.CurrentVersion;
+                        RegistryRequest controlRequest = null;
+                        var responseVersion = (byte)6;
                         try
                         {
                             byte requestVersion;
                             var request = RegistryControlCodec.ReadRequest(pipe, out requestVersion);
+                            controlRequest = request;
                             responseVersion = requestVersion;
-                            response = Handle(request);
+                            string authenticationCode;
+                            response = IsAuthorized(request, requestVersion, out authenticationCode)
+                                ? Handle(request)
+                                : Response(false, authenticationCode, 0);
                         }
                         catch (InvalidDataException)
                         {
@@ -1502,6 +1512,11 @@ namespace TermLink.Agent
                             response = Response(false, "PRODUCTION_REQUEST_CANCELLED", 0);
                         }
 #endif
+                        if (responseVersion >= 7 && controlRequest != null)
+                            RegistryControlAuthentication.PrepareResponse(
+                                response,
+                                controlRequest,
+                                controlSecret);
                         RegistryControlCodec.WriteResponse(pipe, response, responseVersion);
                         Interlocked.Increment(ref requests);
                         if (shutdownRequested) DisposeOtherControlPipes(pipe);
@@ -1533,11 +1548,38 @@ namespace TermLink.Agent
             }
         }
 
+        private bool IsAuthorized(RegistryRequest request, byte requestVersion, out string code)
+        {
+            if (requestVersion < 7)
+            {
+                // V5/V6 remains accepted only for SessionHost registration so
+                // terminals that survived an in-place upgrade can reconnect.
+                // Every UI/diagnostic/lifecycle command requires V7 authentication.
+                code = request.Command == RegistryCommand.Register
+                    ? "LEGACY_SESSION_REGISTRATION"
+                    : "AUTHENTICATION_REQUIRED";
+                return request.Command == RegistryCommand.Register;
+            }
+            var now = DateTime.UtcNow;
+            if (!RegistryControlAuthentication.Verify(request, controlSecret, now))
+            {
+                code = "AUTHENTICATION_FAILED";
+                return false;
+            }
+            if (!controlReplay.TryAccept(request, now))
+            {
+                code = "AUTHENTICATION_REPLAYED";
+                return false;
+            }
+            code = "AUTHENTICATED";
+            return true;
+        }
+
         /// <summary>
-        /// Dispatches a control request in-process. The interactive TermLink UI
-        /// uses this path so it does not have to wait for or call back through
-        /// its own named pipe. SessionHost and compatibility tools continue to
-        /// use the authenticated per-user pipe.
+        /// Dispatches a control request inside the Agent process. This entry point
+        /// is retained for Agent-owned hosting and validation; external UI,
+        /// SessionHost, diagnostics, and lifecycle clients use the authenticated
+        /// per-user pipe.
         /// </summary>
         internal RegistryResponse Dispatch(RegistryRequest request)
         {
@@ -1736,7 +1778,14 @@ namespace TermLink.Agent
         {
             if (disposed) return;
             disposed = true;
-            RequestShutdown();
+            try
+            {
+                RequestShutdown();
+            }
+            finally
+            {
+                Array.Clear(controlSecret, 0, controlSecret.Length);
+            }
         }
     }
 

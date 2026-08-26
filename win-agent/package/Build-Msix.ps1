@@ -165,6 +165,7 @@ try {
     [IO.Directory]::CreateDirectory($layout) | Out-Null
     try {
         $projects = @(
+            'src\Agent\TermLink.Agent.csproj',
             'src\SessionHost\TermLink.SessionHost.csproj',
             'src\Tray\TermLink.Tray.csproj'
         )
@@ -181,18 +182,6 @@ try {
                 '-p:PublishSingleFile=false',
                 "-p:Version=$Version"
             )
-        }
-        $standaloneAgentFiles = @(
-            'TermLink.Agent.exe',
-            'TermLink.Agent.deps.json',
-            'TermLink.Agent.runtimeconfig.json',
-            'TermLink.Agent.pdb'
-        )
-        foreach ($standaloneAgentFile in $standaloneAgentFiles) {
-            $standaloneAgentPath = Join-Path $layout $standaloneAgentFile
-            if (Test-Path -LiteralPath $standaloneAgentPath) {
-                Remove-Item -LiteralPath $standaloneAgentPath -Force
-            }
         }
         $updaterPublish = Join-Path $workRoot 'updater-publish'
         Invoke-Tool -FilePath $candidate -Arguments @(
@@ -212,6 +201,7 @@ try {
         Copy-Item -LiteralPath (Join-Path $updaterPublish 'TermLink.Updater.exe') `
             -Destination (Join-Path $layout 'TermLink.Updater.exe')
         $expectedProductExecutables = @(
+            'TermLink.Agent.exe',
             'TermLink.SessionHost.exe',
             'TermLink.exe',
             'TermLink.Updater.exe'
@@ -225,12 +215,8 @@ try {
         Assert-True ($publishedProductExecutables.Count -eq $expectedProductExecutables.Count -and
             @($publishedProductExecutables | Where-Object { $expectedProductExecutables -cnotcontains $_ }).Count -eq 0) `
             "The package contains an unexpected product executable: $($publishedProductExecutables -join ', ')"
-        foreach ($standaloneAgentFile in $standaloneAgentFiles) {
-            Assert-True (-not (Test-Path -LiteralPath (Join-Path $layout $standaloneAgentFile))) `
-                "The integrated package must not ship standalone Agent entry-point file: $standaloneAgentFile"
-        }
         Assert-True (Test-Path -LiteralPath (Join-Path $layout 'TermLink.Agent.dll') -PathType Leaf) `
-            'The integrated package is missing the in-process Agent runtime assembly.'
+            'The package is missing the independent Agent runtime assembly.'
         Assert-True (Test-Path -LiteralPath (Join-Path $layout 'coreclr.dll') -PathType Leaf) `
             'The package layout is not self-contained.'
         [IO.File]::WriteAllBytes(

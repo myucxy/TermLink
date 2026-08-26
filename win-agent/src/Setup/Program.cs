@@ -24,6 +24,7 @@ namespace TermLink.Setup
         internal const string PayloadResourceName = "TermLink.Setup.Payload.zip";
         internal const string ProductId = "TermLink";
         internal const string RunValueName = "TermLink";
+        internal const string AgentRunValueName = "TermLink.Agent";
 
         [STAThread]
         public static int Main(string[] args)
@@ -306,6 +307,7 @@ namespace TermLink.Setup
         public string TerminalIntegrationStatus { get; set; }
         public string TerminalIntegrationDiagnostic { get; set; }
         public string StartupCommand { get; set; }
+        public string AgentStartupCommand { get; set; }
         public string DesktopShortcutPath { get; set; }
         public string DesktopShortcutSha256 { get; set; }
         public string StartMenuShortcutPath { get; set; }
@@ -524,6 +526,7 @@ namespace TermLink.Setup
         private static readonly string[] RequiredPayloadFiles =
         {
             "TermLink.exe",
+            "TermLink.Agent.exe",
             "TermLink.SessionHost.exe"
         };
 
@@ -831,6 +834,7 @@ namespace TermLink.Setup
             InstallMarker marker = null;
             var previousTerminalFragment = ReadExistingTerminalFragment();
             var previousStartupCommand = ReadOwnedStartupCommand(previous);
+            var previousAgentStartupCommand = ReadOwnedAgentStartupCommand(previous);
             var previousDesktopShortcut = ReadOwnedFile(
                 previous?.DesktopShortcutPath,
                 previous?.DesktopShortcutSha256);
@@ -899,6 +903,7 @@ namespace TermLink.Setup
                         // application is still usable without auto-start; do not make
                         // the whole install fail for an optional convenience feature.
                         marker.StartupCommand = null;
+                        marker.AgentStartupCommand = null;
                         Console.Error.WriteLine("登录启动项未配置（当前用户注册表权限不足）。");
                     }
                 }
@@ -963,6 +968,7 @@ namespace TermLink.Setup
                     TryRemoveUninstallerIfOwned(marker);
                 }
                 TryRestoreStartupAfterRollback(previousStartupCommand);
+                TryRestoreAgentStartupAfterRollback(previousAgentStartupCommand);
                 TryRestoreOwnedFileAfterRollback(
                     previous?.DesktopShortcutPath,
                     previousDesktopShortcut);
@@ -1994,6 +2000,27 @@ namespace TermLink.Setup
             int launchedProcessId,
             int timeoutMilliseconds)
         {
+            var secret = RegistryControlSecretStore.LoadDefault();
+            try
+            {
+                return SendHealthRequestToLaunchedTray(
+                    pipeName,
+                    launchedProcessId,
+                    timeoutMilliseconds,
+                    secret);
+            }
+            finally
+            {
+                Array.Clear(secret, 0, secret.Length);
+            }
+        }
+
+        internal static RegistryResponse SendHealthRequestToLaunchedTray(
+            string pipeName,
+            int launchedProcessId,
+            int timeoutMilliseconds,
+            byte[] authenticationSecret)
+        {
             using (var pipe = new NamedPipeClientStream(
                 ".",
                 pipeName,
@@ -2003,15 +2030,39 @@ namespace TermLink.Setup
                 pipe.Connect(timeoutMilliseconds);
                 if (!GetNamedPipeServerProcessId(
                         pipe.SafePipeHandle.DangerousGetHandle(),
-                        out var serverProcessId) ||
-                    serverProcessId != (uint)launchedProcessId)
+                        out var serverProcessId))
                 {
                     return null;
                 }
-                RegistryControlCodec.WriteRequest(
-                    pipe,
-                    new RegistryRequest { Command = RegistryCommand.List });
-                return RegistryControlCodec.ReadResponse(pipe);
+                if (serverProcessId != (uint)launchedProcessId)
+                {
+                    var launchedPath = TryGetProcessImagePath(launchedProcessId);
+                    var serverPath = serverProcessId > int.MaxValue
+                        ? null
+                        : TryGetProcessImagePath((int)serverProcessId);
+                    if (string.IsNullOrWhiteSpace(launchedPath) || string.IsNullOrWhiteSpace(serverPath) ||
+                        !string.Equals(
+                            Path.GetDirectoryName(Path.GetFullPath(launchedPath)),
+                            Path.GetDirectoryName(Path.GetFullPath(serverPath)),
+                            StringComparison.OrdinalIgnoreCase) ||
+                        !string.Equals(
+                            Path.GetFileName(serverPath),
+                            "TermLink.Agent.exe",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        return null;
+                    }
+                }
+                var request = new RegistryRequest { Command = RegistryCommand.List };
+                RegistryControlAuthentication.Prepare(request, authenticationSecret, DateTime.UtcNow);
+                RegistryControlCodec.WriteRequest(pipe, request);
+                var response = RegistryControlCodec.ReadResponse(pipe);
+                return RegistryControlAuthentication.VerifyResponse(
+                    response,
+                    request,
+                    authenticationSecret)
+                    ? response
+                    : null;
             }
         }
 
@@ -2034,41 +2085,82 @@ namespace TermLink.Setup
 
         private static void ConfigureStartup(string root, InstallMarker marker)
         {
-            var tray = Path.Combine(root, "TermLink.exe");
-            var command = Quote(tray);
+            var commands = CreateStartupCommands(
+                root,
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
             using (var key = Registry.CurrentUser.CreateSubKey("Software\\Microsoft\\Windows\\CurrentVersion\\Run"))
             {
-                key.SetValue(Program.RunValueName, command, RegistryValueKind.String);
+                key.SetValue(Program.RunValueName, commands.Tray, RegistryValueKind.String);
+                key.SetValue(Program.AgentRunValueName, commands.Agent, RegistryValueKind.String);
             }
-            marker.StartupCommand = command;
+            marker.StartupCommand = commands.Tray;
+            marker.AgentStartupCommand = commands.Agent;
+        }
+
+        internal static (string Tray, string Agent) CreateStartupCommands(
+            string installRoot,
+            string localApplicationData)
+        {
+            if (string.IsNullOrWhiteSpace(installRoot))
+                throw new ArgumentException("Install root is required.", nameof(installRoot));
+            if (string.IsNullOrWhiteSpace(localApplicationData))
+                throw new ArgumentException("Local application data is required.", nameof(localApplicationData));
+            var root = Path.GetFullPath(installRoot);
+            var tray = Quote(Path.Combine(root, "TermLink.exe"));
+            var agent = Quote(Path.Combine(root, "TermLink.Agent.exe")) +
+                " --registry --control-pipe " + TermLinkControlPipe.DefaultName() +
+                " --buffer-root " + Quote(Path.Combine(
+                    Path.GetFullPath(localApplicationData),
+                    "TermLink",
+                    "Agent"));
+            return (tray, agent);
         }
 
         private static void RemoveStartupIfOwned(InstallMarker marker)
         {
-            if (marker == null || string.IsNullOrWhiteSpace(marker.StartupCommand)) return;
+            if (marker == null) return;
             using (var key = Registry.CurrentUser.OpenSubKey("Software\\Microsoft\\Windows\\CurrentVersion\\Run", true))
             {
-                var value = key?.GetValue(Program.RunValueName) as string;
-                if (string.Equals(value, marker.StartupCommand, StringComparison.OrdinalIgnoreCase))
+                if (!string.IsNullOrWhiteSpace(marker.StartupCommand) && string.Equals(
+                        key?.GetValue(Program.RunValueName) as string,
+                        marker.StartupCommand,
+                        StringComparison.OrdinalIgnoreCase))
                 {
                     key.DeleteValue(Program.RunValueName, false);
+                }
+                if (!string.IsNullOrWhiteSpace(marker.AgentStartupCommand) && string.Equals(
+                        key?.GetValue(Program.AgentRunValueName) as string,
+                        marker.AgentStartupCommand,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    key.DeleteValue(Program.AgentRunValueName, false);
                 }
             }
         }
 
         private static string ReadOwnedStartupCommand(InstallMarker marker)
         {
-            if (marker == null || string.IsNullOrWhiteSpace(marker.StartupCommand)) return null;
+            return ReadOwnedStartupCommand(marker?.StartupCommand, Program.RunValueName);
+        }
+
+        private static string ReadOwnedAgentStartupCommand(InstallMarker marker)
+        {
+            return ReadOwnedStartupCommand(marker?.AgentStartupCommand, Program.AgentRunValueName);
+        }
+
+        private static string ReadOwnedStartupCommand(string markerCommand, string valueName)
+        {
+            if (string.IsNullOrWhiteSpace(markerCommand)) return null;
             try
             {
                 using (var key = Registry.CurrentUser.OpenSubKey(
                     "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
                     writable: false))
                 {
-                    var current = key?.GetValue(Program.RunValueName) as string;
+                    var current = key?.GetValue(valueName) as string;
                     return string.Equals(
                         current,
-                        marker.StartupCommand,
+                        markerCommand,
                         StringComparison.OrdinalIgnoreCase)
                         ? current
                         : null;
@@ -2085,6 +2177,16 @@ namespace TermLink.Setup
 
         private static void TryRestoreStartupAfterRollback(string previousCommand)
         {
+            TryRestoreStartupAfterRollback(previousCommand, Program.RunValueName);
+        }
+
+        private static void TryRestoreAgentStartupAfterRollback(string previousCommand)
+        {
+            TryRestoreStartupAfterRollback(previousCommand, Program.AgentRunValueName);
+        }
+
+        private static void TryRestoreStartupAfterRollback(string previousCommand, string valueName)
+        {
             if (string.IsNullOrWhiteSpace(previousCommand)) return;
             try
             {
@@ -2092,10 +2194,10 @@ namespace TermLink.Setup
                     "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
                     writable: true))
                 {
-                    var current = key?.GetValue(Program.RunValueName) as string;
+                    var current = key?.GetValue(valueName) as string;
                     if (string.IsNullOrWhiteSpace(current))
                     {
-                        key?.SetValue(Program.RunValueName, previousCommand, RegistryValueKind.String);
+                        key?.SetValue(valueName, previousCommand, RegistryValueKind.String);
                     }
                 }
             }
@@ -2502,6 +2604,7 @@ namespace TermLink.Setup
             {
                 Path.Combine(root, "production-config.json"),
                 Path.Combine(root, "production-credentials.dpapi"),
+                Path.Combine(root, "Agent", "control.secret"),
                 Path.Combine(root, "Agent", "registrations.dpapi"),
                 Path.Combine(root, "Agent", "remote-access-policy.dpapi"),
                 Path.Combine(root, "Tray", "ui.preferences")

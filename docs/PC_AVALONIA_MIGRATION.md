@@ -65,6 +65,23 @@ Exit: a Windows preview can run beside the released application without changing
 
 Exit: killing and restarting the UI does not interrupt Relay or managed sessions.
 
+Implementation note (2026-08-26): Windows control Pipe V7 keeps the 64 KiB frame bound and current-user
+SID ACL, and adds a DPAPI CurrentUser installation secret, HMAC-SHA256, a two-minute timestamp window, and
+nonce replay protection. The server response returns a domain-separated HMAC bound to the request nonce,
+and authenticates the complete response body, so a same-user process cannot impersonate the Agent by
+claiming the Pipe name or relay a valid proof onto modified status data. V5/V6 is accepted only for
+registration by a SessionHost that survived upgrade;
+legacy UI/lifecycle commands fail with `AUTHENTICATION_REQUIRED`. The Tray supervises a separately shipped
+`TermLink.Agent.exe`; disposing the UI supervisor no longer stops it, while explicit sign-out, upgrade, and
+shutdown retain bounded stop behavior. Setup writes separate current-user startup entries for the Agent and
+UI, and records/restores both independently across upgrade rollback. See
+`docs/validation/pc-agent-p3-windows.json`.
+
+The P3 stress gate also reproduced a controlled-stop race where a worker-side disconnect could overwrite
+`RemoteStopped` with `Disconnected` before `Interrupted` and `SessionRemoved` were committed. Stop and
+disconnect transitions now arbitrate under one lock; three consecutive complete SessionRegistry pressure
+runs passed after the fix.
+
 ### P4 - Windows parity preview release
 
 - Complete login, account, devices, sessions, remote-access, command settings, update, tray, diagnostics,

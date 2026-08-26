@@ -1,11 +1,11 @@
 {
   "schema": "termlink.phase1-session-registry-validation",
   "version": 1,
-  "generated_at_utc": "2026-08-23T20:10:39.4846174Z",
+  "generated_at_utc": "2026-08-26T03:21:52.2900531Z",
   "classification": "local Win-Agent Registry and current-user control IPC; not production Relay or protocol",
   "passed": true,
   "registry_process_model": "one long-lived Registry with one isolated SessionAgent worker per Host",
-  "local_control_protocol": "current-user Registry Pipe V3; not production Protobuf",
+  "local_control_protocol": "bounded Registry Pipe V7 with current-user SID ACL, DPAPI installation secret, HMAC, timestamp, and nonce replay protection",
   "simultaneous_sessions": 3,
   "summaries_exclude_terminal_body_pipe_token_and_buffer_path": true,
   "single_remote_stop_preserved_local_shell": true,

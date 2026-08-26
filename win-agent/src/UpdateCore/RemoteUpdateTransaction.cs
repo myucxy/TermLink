@@ -222,7 +222,8 @@ namespace TermLink.UpdateCore
                 record.State == RemoteUpdateTransactionState.RollingBack ||
                 record.State == RemoteUpdateTransactionState.RollbackFailed;
             if (!installMayBeInTransit &&
-                !File.Exists(Path.Combine(installRoot, "TermLink.Agent.dll")))
+                (!File.Exists(Path.Combine(installRoot, "TermLink.Agent.dll")) ||
+                    !File.Exists(Path.Combine(installRoot, "TermLink.Agent.exe"))))
                 throw new FileNotFoundException("The authorized Agent install root is incomplete.", record.InstallRoot);
             if (!string.IsNullOrWhiteSpace(record.BackupPath))
                 RequireBackupPath(installRoot, record.BackupPath);

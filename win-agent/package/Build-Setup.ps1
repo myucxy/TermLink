@@ -168,6 +168,7 @@ try {
     [IO.Directory]::CreateDirectory($layout) | Out-Null
     try {
         $projects = @(
+            'src\Agent\TermLink.Agent.csproj',
             'src\SessionHost\TermLink.SessionHost.csproj',
             'src\Tray\TermLink.Tray.csproj'
         )
@@ -184,21 +185,6 @@ try {
                 '-p:PublishSingleFile=false',
                 "-p:Version=$Version"
             )
-        }
-        # The Tray references Agent as an in-process runtime library. dotnet
-        # publish also copies the referenced Exe project's apphost and launch
-        # metadata; remove only those standalone entry-point files.
-        $standaloneAgentFiles = @(
-            'TermLink.Agent.exe',
-            'TermLink.Agent.deps.json',
-            'TermLink.Agent.runtimeconfig.json',
-            'TermLink.Agent.pdb'
-        )
-        foreach ($standaloneAgentFile in $standaloneAgentFiles) {
-            $standaloneAgentPath = Join-Path $layout $standaloneAgentFile
-            if (Test-Path -LiteralPath $standaloneAgentPath) {
-                Remove-Item -LiteralPath $standaloneAgentPath -Force
-            }
         }
         Invoke-Tool -FilePath $candidate -Arguments @(
             'publish', (Join-Path $PSScriptRoot '..\src\Updater\TermLink.Updater.csproj'),
@@ -217,7 +203,12 @@ try {
         Copy-Item -LiteralPath (Join-Path $updaterPublish 'TermLink.Updater.exe') `
             -Destination (Join-Path $layout 'TermLink.Updater.exe')
 
-        $expectedProductExecutables = @('TermLink.exe', 'TermLink.SessionHost.exe', 'TermLink.Updater.exe')
+        $expectedProductExecutables = @(
+            'TermLink.Agent.exe',
+            'TermLink.exe',
+            'TermLink.SessionHost.exe',
+            'TermLink.Updater.exe'
+        )
         foreach ($name in $expectedProductExecutables) {
             Assert-True (Test-Path -LiteralPath (Join-Path $layout $name) -PathType Leaf) `
                 "Published executable is missing: $name"
@@ -227,12 +218,8 @@ try {
         Assert-True ($publishedProductExecutables.Count -eq $expectedProductExecutables.Count -and
             @($publishedProductExecutables | Where-Object { $expectedProductExecutables -cnotcontains $_ }).Count -eq 0) `
             "The setup contains an unexpected product executable: $($publishedProductExecutables -join ', ')"
-        foreach ($standaloneAgentFile in $standaloneAgentFiles) {
-            Assert-True (-not (Test-Path -LiteralPath (Join-Path $layout $standaloneAgentFile))) `
-                "The integrated setup must not ship standalone Agent entry-point file: $standaloneAgentFile"
-        }
         Assert-True (Test-Path -LiteralPath (Join-Path $layout 'TermLink.Agent.dll') -PathType Leaf) `
-            'The integrated setup is missing the in-process Agent runtime assembly.'
+            'The setup is missing the independent Agent runtime assembly.'
         Assert-True (Test-Path -LiteralPath (Join-Path $layout 'coreclr.dll') -PathType Leaf) `
             'The setup payload is not self-contained.'
         [IO.File]::WriteAllBytes(

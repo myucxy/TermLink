@@ -892,12 +892,12 @@ namespace TermLink.Tray
             notifyIcon.ShowBalloonTip(4000, "TermLink", message, ToolTipIcon.Error);
         }
 
-        private async void ExitTray()
+        private void ExitTray()
         {
             if (MessageBox.Show(
                 TrayText.Pick(
-                    "完全退出 TermLink 并停止后台连接？\n\n你仍会保持登录；下次启动 TermLink 时会继续使用此账号。",
-                    "Exit TermLink and stop its background connection?\n\nYou will remain signed in. TermLink will use this account again the next time it starts."),
+                    "退出 TermLink 控制界面？\n\n后台 Agent 和当前命令行会话将继续运行；你仍会保持登录。",
+                    "Exit the TermLink control UI?\n\nThe background Agent and current terminal sessions will keep running, and you will remain signed in."),
                 "TermLink",
                 MessageBoxButtons.OKCancel,
                 MessageBoxIcon.Information,
@@ -909,21 +909,9 @@ namespace TermLink.Tray
             exitItem.Enabled = false;
             refreshTimer.Stop();
             notifyIcon.Visible = false;
-            try
-            {
-                await Task.Run(() => controller.ShutdownAndWait());
-            }
-            catch
-            {
-                // Tray exit is best effort from the UI perspective; the controller
-                // already performed the bounded, path-scoped process sweep.
-            }
-            finally
-            {
-                notifyIcon.Dispose();
-                if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.Close();
-                ExitThread();
-            }
+            notifyIcon.Dispose();
+            if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.Close();
+            ExitThread();
         }
 
         protected override void Dispose(bool disposing)

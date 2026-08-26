@@ -54,6 +54,7 @@ namespace TermLink.UpdateCore.Validation
             var installRoot = Path.Combine(root, "installed");
             Directory.CreateDirectory(installRoot);
             File.WriteAllBytes(Path.Combine(installRoot, "TermLink.Agent.dll"), new byte[] { 1 });
+            File.WriteAllBytes(Path.Combine(installRoot, "TermLink.Agent.exe"), new byte[] { 1 });
             var journalPath = RemoteUpdateTransactionStore.JournalPath(root);
             var record = new RemoteUpdateTransactionRecord
             {
@@ -111,6 +112,7 @@ namespace TermLink.UpdateCore.Validation
                 var secondInstall = Path.Combine(secondRoot, "installed");
                 Directory.CreateDirectory(secondInstall);
                 File.WriteAllBytes(Path.Combine(secondInstall, "TermLink.Agent.dll"), new byte[] { 2 });
+                File.WriteAllBytes(Path.Combine(secondInstall, "TermLink.Agent.exe"), new byte[] { 2 });
                 var second = new RemoteUpdateTransactionRecord
                 {
                     UpdateId = secondId,

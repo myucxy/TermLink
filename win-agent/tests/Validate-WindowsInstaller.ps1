@@ -203,16 +203,15 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'TermLink.Updater.exe') -PathType Leaf) `
         'Installed package does not contain the external single-file Updater.'
     Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'TermLink.Agent.dll') -PathType Leaf) `
-        'Installed package does not contain the in-process Agent runtime assembly.'
-    foreach ($name in @(
+        'Installed package does not contain the independent Agent runtime assembly.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'TermLink.Agent.exe') -PathType Leaf) `
+        'Installed package does not contain the independent Agent executable.'
+    $expectedProductExecutables = @(
         'TermLink.Agent.exe',
-        'TermLink.Agent.deps.json',
-        'TermLink.Agent.runtimeconfig.json'
-    )) {
-        Assert-True (-not (Test-Path -LiteralPath (Join-Path $installLocation $name))) `
-            "Installed package contains obsolete standalone Agent file: $name"
-    }
-    $expectedProductExecutables = @('TermLink.exe', 'TermLink.SessionHost.exe', 'TermLink.Updater.exe')
+        'TermLink.exe',
+        'TermLink.SessionHost.exe',
+        'TermLink.Updater.exe'
+    )
     $installedProductExecutables = @(Get-ChildItem -LiteralPath $installLocation -File -Filter 'TermLink*.exe' |
         Select-Object -ExpandProperty Name)
     Assert-True ($installedProductExecutables.Count -eq $expectedProductExecutables.Count -and
@@ -298,9 +297,10 @@ try {
 
     $agentProcesses = @(Find-PackagedProcesses -Name 'TermLink.Agent' -InstallLocation $installLocation `
         -ExcludedIds $beforeAgentIds)
-    Assert-True ($agentProcesses.Count -eq 0) `
-        'Packaged Tray started an obsolete standalone Agent process instead of its in-process runtime.'
-    Write-Output 'STEP=embedded_agent_started'
+    Assert-True ($agentProcesses.Count -eq 1) `
+        'Packaged Tray did not start exactly one independent Agent process.'
+    $validationProcessIds += @($agentProcesses | Select-Object -ExpandProperty Id)
+    Write-Output 'STEP=independent_agent_started'
 
     $statusProcess = Start-Process -FilePath $installedTray `
         -ArgumentList @($trayIsolationArguments + @('--status-json', $statusPath)) -Wait -PassThru

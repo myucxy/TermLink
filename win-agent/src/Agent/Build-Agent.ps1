@@ -22,6 +22,7 @@ $executable = Join-Path $output 'TermLink.Agent.exe'
     "/out:$executable" `
     (Join-Path $PSScriptRoot '..\Common\LocalIpc.cs') `
     (Join-Path $PSScriptRoot '..\AgentControl\AgentControl.cs') `
+    (Join-Path $PSScriptRoot '..\AgentControl\RegistryControlSecurity.cs') `
     (Join-Path $PSScriptRoot 'CurrentUserPipe.cs') `
     (Join-Path $PSScriptRoot 'SessionRegistrationStore.cs') `
     (Join-Path $PSScriptRoot 'SessionRegistry.cs') `

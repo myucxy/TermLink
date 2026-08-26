@@ -339,6 +339,9 @@ namespace TermLink.Agent
         public Guid DeviceId { get; set; }
         public string PairingPermission { get; set; }
         public string GrantPermission { get; set; }
+        public long AuthenticationTimestampUnixSeconds { get; set; }
+        public byte[] AuthenticationNonce { get; set; }
+        public byte[] AuthenticationTag { get; set; }
     }
 
     /// <summary>
@@ -430,6 +433,8 @@ namespace TermLink.Agent
 
     public sealed class RegistryResponse
     {
+        public byte[] AuthenticationNonce { get; set; }
+        public byte[] AuthenticationTag { get; set; }
         public bool Success { get; set; }
         public string Code { get; set; }
         public bool RemoteAccessEnabled { get; set; }
@@ -441,44 +446,39 @@ namespace TermLink.Agent
 
     public static class RegistryControlCodec
     {
-        public const byte CurrentVersion = 6;
+        public const byte CurrentVersion = 7;
         private const byte MinimumSupportedVersion = 5;
         private const int MaximumBytes = 64 * 1024;
 
         public static void WriteRequest(Stream stream, RegistryRequest request)
         {
+            WriteRequest(stream, request, CurrentVersion);
+        }
+
+        public static void WriteRequest(Stream stream, RegistryRequest request, byte version)
+        {
             if (stream == null) throw new ArgumentNullException("stream");
             if (request == null) throw new ArgumentNullException("request");
+            ValidateVersion(version, "control");
             using (var body = new MemoryStream())
             using (var writer = new BinaryWriter(body, Encoding.UTF8))
             {
-                writer.Write(CurrentVersion);
-                writer.Write((byte)request.Command);
-                switch (request.Command)
+                writer.Write(version);
+                if (version >= 7)
                 {
-                    case RegistryCommand.Register:
-                        if (request.Registration == null) throw new InvalidDataException("Registration is required.");
-                        WriteGuid(writer, request.Registration.SessionId);
-                        writer.Write(request.Registration.ExpectedHostProcessId);
-                        writer.Write((byte)request.Registration.ShellType);
-                        writer.Write(request.Registration.HandshakeToken);
-                        WriteString(writer, request.Registration.PipeName);
-                        break;
-                    case RegistryCommand.StopSession:
-                        WriteGuid(writer, request.SessionId);
-                        break;
-                    case RegistryCommand.CreatePairingChallenge:
-                        WriteGuid(writer, request.DeviceId);
-                        WriteString(writer, request.PairingPermission ?? string.Empty);
-                        break;
-                    case RegistryCommand.GrantDevice:
-                        WriteGuid(writer, request.DeviceId);
-                        WriteString(writer, request.GrantPermission ?? string.Empty);
-                        break;
-                    case RegistryCommand.RevokeDevice:
-                        WriteGuid(writer, request.DeviceId);
-                        break;
+                    if (request.AuthenticationTimestampUnixSeconds <= 0 ||
+                        request.AuthenticationNonce == null ||
+                        request.AuthenticationNonce.Length != RegistryControlAuthentication.NonceBytes ||
+                        request.AuthenticationTag == null ||
+                        request.AuthenticationTag.Length != RegistryControlAuthentication.TagBytes)
+                    {
+                        throw new InvalidDataException("Registry V7 authentication fields are invalid.");
+                    }
+                    writer.Write(request.AuthenticationTimestampUnixSeconds);
+                    writer.Write(request.AuthenticationNonce);
+                    writer.Write(request.AuthenticationTag);
                 }
+                WriteCommand(writer, request);
                 writer.Flush();
                 WriteFrame(stream, body.ToArray());
             }
@@ -497,39 +497,118 @@ namespace TermLink.Agent
             {
                 version = reader.ReadByte();
                 ValidateVersion(version, "control");
-                var commandValue = reader.ReadByte();
-                if (!Enum.IsDefined(typeof(RegistryCommand), commandValue)) throw new InvalidDataException("Unknown Registry command.");
-                var request = new RegistryRequest { Command = (RegistryCommand)commandValue };
-                switch (request.Command)
-                {
-                    case RegistryCommand.Register:
-                        var sessionId = ReadGuid(reader);
-                        var pid = reader.ReadInt32();
-                        var shellValue = reader.ReadByte();
-                        if (!Enum.IsDefined(typeof(ManagedShellType), shellValue)) throw new InvalidDataException("Unknown shell type.");
-                        var token = ReadExact(reader, SessionRegistration.HandshakeTokenBytes);
-                        var pipeName = ReadString(reader);
-                        request.Registration = new SessionRegistration(
-                            sessionId, pipeName, token, pid, (ManagedShellType)shellValue);
-                        break;
-                    case RegistryCommand.StopSession:
-                        request.SessionId = ReadGuid(reader);
-                        break;
-                    case RegistryCommand.CreatePairingChallenge:
-                        request.DeviceId = ReadGuid(reader);
-                        request.PairingPermission = ReadString(reader);
-                        break;
-                    case RegistryCommand.GrantDevice:
-                        request.DeviceId = ReadGuid(reader);
-                        request.GrantPermission = ReadString(reader);
-                        break;
-                    case RegistryCommand.RevokeDevice:
-                        request.DeviceId = ReadGuid(reader);
-                        break;
-                }
+                long timestamp = 0;
+                byte[] nonce = null;
+                byte[] tag = null;
+                if (version >= 7) ReadAuthentication(reader, out timestamp, out nonce, out tag);
+                var request = ReadCommand(reader);
+                request.AuthenticationTimestampUnixSeconds = timestamp;
+                request.AuthenticationNonce = nonce;
+                request.AuthenticationTag = tag;
                 if (body.Position != body.Length) throw new InvalidDataException("Registry request has trailing bytes.");
                 return request;
             }
+        }
+
+        internal static byte[] AuthenticationPayload(RegistryRequest request)
+        {
+            if (request == null) throw new ArgumentNullException("request");
+            if (request.AuthenticationTimestampUnixSeconds <= 0 ||
+                request.AuthenticationNonce == null ||
+                request.AuthenticationNonce.Length != RegistryControlAuthentication.NonceBytes)
+            {
+                throw new InvalidDataException("Registry authentication payload fields are invalid.");
+            }
+            using (var body = new MemoryStream())
+            using (var writer = new BinaryWriter(body, Encoding.UTF8))
+            {
+                writer.Write(CurrentVersion);
+                writer.Write(request.AuthenticationTimestampUnixSeconds);
+                writer.Write(request.AuthenticationNonce);
+                WriteCommand(writer, request);
+                writer.Flush();
+                return body.ToArray();
+            }
+        }
+
+        private static void ReadAuthentication(
+            BinaryReader reader,
+            out long timestamp,
+            out byte[] nonce,
+            out byte[] tag)
+        {
+            timestamp = reader.ReadInt64();
+            nonce = ReadExact(reader, RegistryControlAuthentication.NonceBytes);
+            tag = ReadExact(reader, RegistryControlAuthentication.TagBytes);
+        }
+
+        private static void WriteCommand(BinaryWriter writer, RegistryRequest request)
+        {
+            if (!Enum.IsDefined(typeof(RegistryCommand), request.Command))
+                throw new InvalidDataException("Unknown Registry command.");
+            writer.Write((byte)request.Command);
+            switch (request.Command)
+            {
+                case RegistryCommand.Register:
+                    if (request.Registration == null) throw new InvalidDataException("Registration is required.");
+                    WriteGuid(writer, request.Registration.SessionId);
+                    writer.Write(request.Registration.ExpectedHostProcessId);
+                    writer.Write((byte)request.Registration.ShellType);
+                    writer.Write(request.Registration.HandshakeToken);
+                    WriteString(writer, request.Registration.PipeName);
+                    break;
+                case RegistryCommand.StopSession:
+                    WriteGuid(writer, request.SessionId);
+                    break;
+                case RegistryCommand.CreatePairingChallenge:
+                    WriteGuid(writer, request.DeviceId);
+                    WriteString(writer, request.PairingPermission ?? string.Empty);
+                    break;
+                case RegistryCommand.GrantDevice:
+                    WriteGuid(writer, request.DeviceId);
+                    WriteString(writer, request.GrantPermission ?? string.Empty);
+                    break;
+                case RegistryCommand.RevokeDevice:
+                    WriteGuid(writer, request.DeviceId);
+                    break;
+            }
+        }
+
+        private static RegistryRequest ReadCommand(BinaryReader reader)
+        {
+            var commandValue = reader.ReadByte();
+            if (!Enum.IsDefined(typeof(RegistryCommand), commandValue))
+                throw new InvalidDataException("Unknown Registry command.");
+            var request = new RegistryRequest { Command = (RegistryCommand)commandValue };
+            switch (request.Command)
+            {
+                case RegistryCommand.Register:
+                    var sessionId = ReadGuid(reader);
+                    var pid = reader.ReadInt32();
+                    var shellValue = reader.ReadByte();
+                    if (!Enum.IsDefined(typeof(ManagedShellType), shellValue))
+                        throw new InvalidDataException("Unknown shell type.");
+                    var token = ReadExact(reader, SessionRegistration.HandshakeTokenBytes);
+                    var pipeName = ReadString(reader);
+                    request.Registration = new SessionRegistration(
+                        sessionId, pipeName, token, pid, (ManagedShellType)shellValue);
+                    break;
+                case RegistryCommand.StopSession:
+                    request.SessionId = ReadGuid(reader);
+                    break;
+                case RegistryCommand.CreatePairingChallenge:
+                    request.DeviceId = ReadGuid(reader);
+                    request.PairingPermission = ReadString(reader);
+                    break;
+                case RegistryCommand.GrantDevice:
+                    request.DeviceId = ReadGuid(reader);
+                    request.GrantPermission = ReadString(reader);
+                    break;
+                case RegistryCommand.RevokeDevice:
+                    request.DeviceId = ReadGuid(reader);
+                    break;
+            }
+            return request;
         }
 
         public static void WriteResponse(Stream stream, RegistryResponse response)
@@ -546,29 +625,70 @@ namespace TermLink.Agent
             using (var writer = new BinaryWriter(body, Encoding.UTF8))
             {
                 writer.Write(version);
-                writer.Write(response.Success);
-                WriteString(writer, response.Code ?? string.Empty);
-                writer.Write(response.RemoteAccessEnabled);
-                writer.Write(response.AffectedSessions);
-                writer.Write(response.TimedOutSessions);
-                var summaries = response.Summaries ?? new List<SessionSummary>();
-                writer.Write(summaries.Count);
-                foreach (var summary in summaries)
+                if (version >= 7)
                 {
-                    WriteGuid(writer, summary.SessionId);
-                    writer.Write((byte)summary.ShellType);
-                    writer.Write((byte)summary.Lifecycle);
-                    writer.Write(summary.HostProcessId);
-                    writer.Write(summary.LastSequence);
-                    writer.Write(summary.RegisteredAtUtc.Ticks);
-                    writer.Write(summary.LastActivityUtc.Ticks);
-                    writer.Write(summary.ExitCode.HasValue);
-                    if (summary.ExitCode.HasValue) writer.Write(summary.ExitCode.Value);
+                    if (response.AuthenticationNonce == null ||
+                        response.AuthenticationNonce.Length != RegistryControlAuthentication.NonceBytes ||
+                        response.AuthenticationTag == null ||
+                        response.AuthenticationTag.Length != RegistryControlAuthentication.TagBytes)
+                    {
+                        throw new InvalidDataException("Registry V7 response authentication fields are invalid.");
+                    }
+                    writer.Write(response.AuthenticationNonce);
+                    writer.Write(response.AuthenticationTag);
                 }
-                WriteProductionStatus(writer, response.Production, version);
+                WriteResponseBody(writer, response, version);
                 writer.Flush();
                 WriteFrame(stream, body.ToArray());
             }
+        }
+
+        internal static byte[] ResponseAuthenticationPayload(
+            RegistryResponse response,
+            byte[] requestNonce)
+        {
+            if (response == null) throw new ArgumentNullException("response");
+            if (requestNonce == null ||
+                requestNonce.Length != RegistryControlAuthentication.NonceBytes)
+            {
+                throw new InvalidDataException("Registry response authentication nonce is invalid.");
+            }
+            using (var body = new MemoryStream())
+            using (var writer = new BinaryWriter(body, Encoding.UTF8))
+            {
+                writer.Write(CurrentVersion);
+                writer.Write(requestNonce);
+                WriteResponseBody(writer, response, CurrentVersion);
+                writer.Flush();
+                return body.ToArray();
+            }
+        }
+
+        private static void WriteResponseBody(
+            BinaryWriter writer,
+            RegistryResponse response,
+            byte version)
+        {
+            writer.Write(response.Success);
+            WriteString(writer, response.Code ?? string.Empty);
+            writer.Write(response.RemoteAccessEnabled);
+            writer.Write(response.AffectedSessions);
+            writer.Write(response.TimedOutSessions);
+            var summaries = response.Summaries ?? new List<SessionSummary>();
+            writer.Write(summaries.Count);
+            foreach (var summary in summaries)
+            {
+                WriteGuid(writer, summary.SessionId);
+                writer.Write((byte)summary.ShellType);
+                writer.Write((byte)summary.Lifecycle);
+                writer.Write(summary.HostProcessId);
+                writer.Write(summary.LastSequence);
+                writer.Write(summary.RegisteredAtUtc.Ticks);
+                writer.Write(summary.LastActivityUtc.Ticks);
+                writer.Write(summary.ExitCode.HasValue);
+                if (summary.ExitCode.HasValue) writer.Write(summary.ExitCode.Value);
+            }
+            WriteProductionStatus(writer, response.Production, version);
         }
 
         public static RegistryResponse ReadResponse(Stream stream)
@@ -578,8 +698,16 @@ namespace TermLink.Agent
             {
                 var version = reader.ReadByte();
                 ValidateVersion(version, "response");
+                var authenticationNonce = version >= 7
+                    ? ReadExact(reader, RegistryControlAuthentication.NonceBytes)
+                    : null;
+                var authenticationTag = version >= 7
+                    ? ReadExact(reader, RegistryControlAuthentication.TagBytes)
+                    : null;
                 var response = new RegistryResponse
                 {
+                    AuthenticationNonce = authenticationNonce,
+                    AuthenticationTag = authenticationTag,
                     Success = reader.ReadBoolean(),
                     Code = ReadString(reader),
                     RemoteAccessEnabled = reader.ReadBoolean(),
@@ -892,8 +1020,20 @@ namespace TermLink.Agent
             }
             using (pipe)
             {
-                RegistryControlCodec.WriteRequest(pipe, request);
-                return RegistryControlCodec.ReadResponse(pipe);
+                var secret = RegistryControlSecretStore.LoadDefault();
+                try
+                {
+                    RegistryControlAuthentication.Prepare(request, secret, DateTime.UtcNow);
+                    RegistryControlCodec.WriteRequest(pipe, request);
+                    var response = RegistryControlCodec.ReadResponse(pipe);
+                    if (!RegistryControlAuthentication.VerifyResponse(response, request, secret))
+                        throw new InvalidDataException("Registry control response authentication failed.");
+                    return response;
+                }
+                finally
+                {
+                    Array.Clear(secret, 0, secret.Length);
+                }
             }
         }
     }

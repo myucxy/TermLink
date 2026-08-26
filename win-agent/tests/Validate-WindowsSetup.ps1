@@ -69,6 +69,8 @@ $fragmentBytes = if ($fragmentExisted) { [IO.File]::ReadAllBytes($fragmentPath) 
 $runKey = Get-ItemProperty -LiteralPath $runKeyPath -ErrorAction SilentlyContinue
 $runExisted = $null -ne $runKey -and $null -ne $runKey.PSObject.Properties['TermLink']
 $runValue = if ($runExisted) { [string]$runKey.TermLink } else { $null }
+$agentRunExisted = $null -ne $runKey -and $null -ne $runKey.PSObject.Properties['TermLink.Agent']
+$agentRunValue = if ($agentRunExisted) { [string]$runKey.'TermLink.Agent' } else { $null }
 $installState = Get-ItemProperty -LiteralPath $installStateKeyPath -ErrorAction SilentlyContinue
 $installRootValueExisted = $null -ne $installState -and
     $null -ne $installState.PSObject.Properties['InstallRoot']
@@ -138,6 +140,7 @@ try {
         '--install-dir', $installRoot, '--no-startup', '--no-launch', '--quiet')
     $installed = $true
     foreach ($name in @(
+        'TermLink.Agent.exe',
         'TermLink.SessionHost.exe',
         'TermLink.exe',
         'TermLink.Updater.exe',
@@ -150,15 +153,12 @@ try {
         Assert-True (Test-Path -LiteralPath (Join-Path $installRoot $name) -PathType Leaf) `
             "Installed setup payload is missing: $name"
     }
-    foreach ($name in @(
+    $expectedProductExecutables = @(
         'TermLink.Agent.exe',
-        'TermLink.Agent.deps.json',
-        'TermLink.Agent.runtimeconfig.json'
-    )) {
-        Assert-True (-not (Test-Path -LiteralPath (Join-Path $installRoot $name))) `
-            "Installed setup payload contains obsolete standalone Agent file: $name"
-    }
-    $expectedProductExecutables = @('TermLink.exe', 'TermLink.SessionHost.exe', 'TermLink.Updater.exe')
+        'TermLink.exe',
+        'TermLink.SessionHost.exe',
+        'TermLink.Updater.exe'
+    )
     $installedProductExecutables = @(Get-ChildItem -LiteralPath $installRoot -File -Filter 'TermLink*.exe' |
         Where-Object { $_.Name -cne 'TermLink.Uninstall.exe' } |
         Select-Object -ExpandProperty Name)
@@ -211,6 +211,12 @@ try {
     } else { $null }
     Assert-True ([string]::Equals($afterRunValue, $runValue, [StringComparison]::Ordinal)) `
         '--no-startup changed the current-user startup registration.'
+    $afterAgentRunValue = if ($null -ne $afterRun -and
+        $null -ne $afterRun.PSObject.Properties['TermLink.Agent']) {
+        [string]$afterRun.'TermLink.Agent'
+    } else { $null }
+    Assert-True ([string]::Equals($afterAgentRunValue, $agentRunValue, [StringComparison]::Ordinal)) `
+        '--no-startup changed the independent Agent startup registration.'
     $afterInstallState = Get-ItemProperty -LiteralPath $installStateKeyPath -ErrorAction SilentlyContinue
     $afterInstallRoot = if ($null -ne $afterInstallState -and
         $null -ne $afterInstallState.PSObject.Properties['InstallRoot']) {
@@ -443,6 +449,20 @@ finally {
     }
     elseif (-not $runExisted -and $null -ne $currentRunValue) {
         Remove-ItemProperty -LiteralPath $runKeyPath -Name 'TermLink' -Force
+    }
+    $currentAgentRunValue = if ($null -ne $currentRun -and
+        $null -ne $currentRun.PSObject.Properties['TermLink.Agent']) {
+        [string]$currentRun.'TermLink.Agent'
+    } else { $null }
+    if ($agentRunExisted -and -not [string]::Equals(
+            $currentAgentRunValue,
+            $agentRunValue,
+            [StringComparison]::Ordinal)) {
+        New-ItemProperty -LiteralPath $runKeyPath -Name 'TermLink.Agent' -Value $agentRunValue `
+            -PropertyType String -Force | Out-Null
+    }
+    elseif (-not $agentRunExisted -and $null -ne $currentAgentRunValue) {
+        Remove-ItemProperty -LiteralPath $runKeyPath -Name 'TermLink.Agent' -Force
     }
     $currentInstallState = Get-ItemProperty -LiteralPath $installStateKeyPath -ErrorAction SilentlyContinue
     $currentInstallRoot = if ($null -ne $currentInstallState -and

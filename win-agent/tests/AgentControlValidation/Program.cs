@@ -37,6 +37,7 @@ Require(registrationResult.Registration.PipeName == registration.PipeName, "Regi
 Require(registrationResult.Registration.ExpectedHostProcessId == registration.ExpectedHostProcessId, "Register PID changed.");
 Require(registrationResult.Registration.ShellType == ManagedShellType.PowerShell7, "Register shell changed.");
 Require(registrationResult.Registration.HandshakeToken.SequenceEqual(token), "Register token changed.");
+ValidateAuthenticationAndSecretStore();
 
 foreach (var command in new[]
 {
@@ -188,8 +189,8 @@ using (var legacyRequestStream = new MemoryStream())
 {
     RegistryControlCodec.WriteRequest(
         legacyRequestStream,
-        new RegistryRequest { Command = RegistryCommand.RefreshProductionStatus });
-    legacyRequestStream.GetBuffer()[4] = 5;
+        new RegistryRequest { Command = RegistryCommand.RefreshProductionStatus },
+        5);
     legacyRequestStream.Position = 0;
     byte legacyRequestVersion;
     var legacyRequest = RegistryControlCodec.ReadRequest(legacyRequestStream, out legacyRequestVersion);
@@ -208,20 +209,81 @@ using (var legacyResponseStream = new MemoryStream())
         "Pipe V5 response synthesized Terminal Snapshot capability.");
 }
 
-Console.WriteLine("TermLink Agent control Pipe V6/V5-compatible round-trip validation passed.");
+Console.WriteLine("TermLink Agent control Pipe V7 authentication and V6/V5 compatibility validation passed.");
 
 static RegistryRequest RoundTripRequest(RegistryRequest request)
 {
+    var secret = Enumerable.Range(0, RegistryControlAuthentication.SecretBytes)
+        .Select(value => (byte)(value + 1))
+        .ToArray();
+    RegistryControlAuthentication.Prepare(request, secret, DateTime.UtcNow);
     using var stream = new MemoryStream();
     RegistryControlCodec.WriteRequest(stream, request);
     stream.Position = 0;
-    return RegistryControlCodec.ReadRequest(stream);
+    var decoded = RegistryControlCodec.ReadRequest(stream);
+    Require(RegistryControlAuthentication.Verify(decoded, secret, DateTime.UtcNow),
+        "V7 request authentication changed during codec round trip.");
+    Array.Clear(secret, 0, secret.Length);
+    return decoded;
+}
+
+static void ValidateAuthenticationAndSecretStore()
+{
+    var secret = Enumerable.Range(0, RegistryControlAuthentication.SecretBytes)
+        .Select(value => (byte)(255 - value))
+        .ToArray();
+    var request = new RegistryRequest { Command = RegistryCommand.List };
+    var now = DateTime.UtcNow;
+    RegistryControlAuthentication.Prepare(request, secret, now);
+    Require(RegistryControlAuthentication.Verify(request, secret, now),
+        "A valid V7 authentication tag was rejected.");
+    var replay = new RegistryControlReplayWindow();
+    Require(replay.TryAccept(request, now) && !replay.TryAccept(request, now),
+        "A V7 nonce replay was accepted.");
+    request.AuthenticationTag[0] ^= 0x80;
+    Require(!RegistryControlAuthentication.Verify(request, secret, now),
+        "A modified V7 authentication tag was accepted.");
+    request.AuthenticationTag[0] ^= 0x80;
+    Require(!RegistryControlAuthentication.Verify(
+            request,
+            secret,
+            now + RegistryControlAuthentication.MaximumClockSkew + TimeSpan.FromSeconds(1)),
+        "An expired V7 request timestamp was accepted.");
+    var response = new RegistryResponse { Success = true, Code = "OK" };
+    RegistryControlAuthentication.PrepareResponse(response, request, secret);
+    Require(RegistryControlAuthentication.VerifyResponse(response, request, secret),
+        "A valid V7 server response proof was rejected.");
+    response.Code = "TAMPERED";
+    Require(!RegistryControlAuthentication.VerifyResponse(response, request, secret),
+        "A V7 response with a modified body was accepted.");
+    response.Code = "OK";
+    response.AuthenticationTag[0] ^= 0x40;
+    Require(!RegistryControlAuthentication.VerifyResponse(response, request, secret),
+        "A modified V7 server response proof was accepted.");
+
+    var root = Path.Combine(Path.GetTempPath(), "TermLink-AgentControlValidation-" + Guid.NewGuid().ToString("N"));
+    var path = Path.Combine(root, "control.secret");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var created = RegistryControlSecretStore.GetOrCreate(path);
+        var loaded = RegistryControlSecretStore.Load(path);
+        Require(created.SequenceEqual(loaded) && created.Length == RegistryControlAuthentication.SecretBytes,
+            "The DPAPI control secret did not round trip.");
+        Array.Clear(created, 0, created.Length);
+        Array.Clear(loaded, 0, loaded.Length);
+    }
+    finally
+    {
+        if (Directory.Exists(root)) Directory.Delete(root, true);
+        Array.Clear(secret, 0, secret.Length);
+    }
 }
 
 static RegistryResponse RoundTripResponse(RegistryResponse response)
 {
     using var stream = new MemoryStream();
-    RegistryControlCodec.WriteResponse(stream, response);
+    RegistryControlCodec.WriteResponse(stream, response, 6);
     stream.Position = 0;
     return RegistryControlCodec.ReadResponse(stream);
 }
