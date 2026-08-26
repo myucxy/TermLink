@@ -52,6 +52,18 @@ class ProductUiLogicTest {
     }
 
     @Test
+    fun devicePageIncludesGenericPcAgentsAndStillExcludesAndroidRoutes() {
+        val deviceId = UUID.fromString("20000000-0000-0000-0000-000000000005")
+        val pcId = UUID.fromString("30000000-0000-0000-0000-000000000005")
+        val snapshot = ProductSnapshot(
+            devices = listOf(device(deviceId, DeviceType.PC_AGENT)),
+            pcs = listOf(pc(pcId, deviceId, online = true).copy(platform = "linux", architecture = "arm64")),
+        )
+
+        assertEquals(listOf(pcId), visibleOnlineWindowsPcs(snapshot).map(PcSummary::id))
+    }
+
+    @Test
     fun devicePageProjectionRespondsToPcStatusUpdatesForTheSameUuid() {
         val deviceId = UUID.fromString("20000000-0000-0000-0000-000000000003")
         val pcId = UUID.fromString("30000000-0000-0000-0000-000000000003")

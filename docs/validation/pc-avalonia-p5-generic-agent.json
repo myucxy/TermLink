@@ -1,0 +1,52 @@
+{
+  "schema": "termlink.pc-avalonia-p5-generic-agent",
+  "version": 1,
+  "generated_at_utc": "2026-08-26T05:30:00Z",
+  "passed": true,
+  "server_schema_version": 23,
+  "device_types": ["WINDOWS_PC", "PC_AGENT", "ANDROID"],
+  "pc_platforms": ["windows", "linux", "macos"],
+  "pc_architectures": ["x64", "arm64", "unknown-legacy-only"],
+  "maximum_capabilities": 64,
+  "capability_authorization": {
+    "file_operations_v1": true,
+    "terminal_commands_v1": true,
+    "remote_agent_update_v1_windows_only": true
+  },
+  "compatibility": {
+    "new_windows_registration": "PC_AGENT",
+    "old_server_registration_fallback": "WINDOWS_PC",
+    "old_server_pc_upsert_fallback": true,
+    "released_android_device_projection": "PC_AGENT -> WINDOWS_PC",
+    "legacy_pc_capability_backfill": true
+  },
+  "migration": {
+    "expand_contract": true,
+    "device_id_preserved": true,
+    "pc_id_preserved": true,
+    "down_maps_pc_agent_to_windows_pc": true,
+    "down_up_round_trip_tested_with_postgresql_17_5": true
+  },
+  "android": {
+    "room_schema": 6,
+    "v5_to_v6_migration_tested": true,
+    "full_unit_suite_passed": true,
+    "emulator": "emulator-5554",
+    "upgrade_from": "0.1.32.38-debug",
+    "upgrade_to": "0.2.2.41-debug",
+    "first_install_time_preserved": true,
+    "old_server_home_pc_visible": true,
+    "room_migration_errors": 0
+  },
+  "windows": {
+    "locked_solution_warnings": 0,
+    "locked_solution_errors": 0,
+    "pc_heartbeat_validation_passed": true,
+    "new_and_legacy_server_paths_tested": true
+  },
+  "server": {
+    "go_packages_passed": true,
+    "real_postgresql_capability_allow_deny_tested": true
+  },
+  "remaining_release_gates": []
+}

@@ -137,9 +137,10 @@ func (s *Postgres) CreateAgentUpdate(
 		JOIN devices requester ON requester.id=$3 AND requester.user_id=$2
 			AND requester.device_type='ANDROID' AND requester.trust_state='TRUSTED'
 		JOIN devices agent ON agent.id=p.device_id AND agent.user_id=$2
-			AND agent.device_type='WINDOWS_PC' AND agent.trust_state='TRUSTED'
+			AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
 		WHERE p.id=$14 AND p.owner_user_id=$2 AND p.agent_version=$4
-		  AND p.remote_agent_update_capable AND p.remote_routing_enabled
+		  AND p.platform='windows' AND 'remote_agent_update_v1'=ANY(p.capabilities)
+		  AND p.remote_routing_enabled
 		  AND p.last_seen_at > now()-($15 * interval '1 second')
 		RETURNING `+agentUpdateColumns,
 		uuid.New(), userID, requesterID, input.CurrentVersion, input.CurrentBuild,
@@ -264,8 +265,8 @@ func (s *Postgres) ClaimAgentUpdate(
 	if err := tx.QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM pcs p JOIN devices d ON d.id=p.device_id
 		WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3
-		  AND p.remote_agent_update_capable
-		  AND d.user_id=$2 AND d.device_type='WINDOWS_PC' AND d.trust_state='TRUSTED')`,
+		  AND p.platform='windows' AND 'remote_agent_update_v1'=ANY(p.capabilities)
+		  AND d.user_id=$2 AND d.device_type IN ('WINDOWS_PC','PC_AGENT') AND d.trust_state='TRUSTED')`,
 		pcID, userID, agentDeviceID,
 	).Scan(&authorized); err != nil {
 		return nil, "", err
@@ -418,7 +419,8 @@ func (s *Postgres) mutateAgentUpdateLease(
 		WHERE job.id=$1 AND job.account_id=$2 AND job.pc_id=$3
 		  AND EXISTS(SELECT 1 FROM pcs p JOIN devices d ON d.id=p.device_id
 		      WHERE p.id=$3 AND p.owner_user_id=$2 AND p.device_id=$4
-		        AND d.user_id=$2 AND d.device_type='WINDOWS_PC' AND d.trust_state='TRUSTED')
+		        AND p.platform='windows' AND 'remote_agent_update_v1'=ANY(p.capabilities)
+		        AND d.user_id=$2 AND d.device_type IN ('WINDOWS_PC','PC_AGENT') AND d.trust_state='TRUSTED')
 		FOR UPDATE`, jobID, userID, pcID, agentDeviceID,
 	))
 	if err != nil {

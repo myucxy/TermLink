@@ -166,12 +166,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import dev.termlink.model.DeviceType
+import dev.termlink.model.PcCapabilityIds
 import dev.termlink.model.PcSummary
 import dev.termlink.model.SessionState
 import dev.termlink.harness.R
 import dev.termlink.harness.BuildConfig
 import dev.termlink.model.SessionSummary
 import dev.termlink.model.TerminalCommandCapability
+import dev.termlink.model.isPcAgent
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.network.production.TermLinkApiException
 import dev.termlink.terminal.api.ArgbColor
@@ -987,7 +989,7 @@ fun ProductApp(
 
     LaunchedEffect(
         snapshot.connectionState,
-        snapshot.pcs.map { Triple(it.id, it.online, it.remoteAgentUpdateCapable) },
+        snapshot.pcs.map { Triple(it.id, it.online, PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in it.capabilities) },
         agentUpdateDialog,
     ) {
         if (snapshot.connectionState != ProductConnectionState.CONNECTED || agentUpdateDialog != null) {
@@ -995,7 +997,9 @@ fun ProductApp(
         }
         repeat(3) { attempt ->
             var transientFailure = false
-            for (pc in snapshot.pcs) {
+            for (pc in snapshot.pcs.filter {
+                it.platform == "windows" && PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in it.capabilities
+            }) {
                 if (pc.id in checkedAgentUpdatePcIds) continue
                 val active = try {
                     repository.activeAgentUpdate(pc.id).also {
@@ -3221,8 +3225,18 @@ private fun DevicesPage(
                     expanded = pcKey in expandedPcIds,
                     onToggleExpanded = { onTogglePcExpanded(pc.id) },
                     onOpenSession = onOpenSession,
-                    onBrowseFiles = { onBrowsePc(pc) },
-                    onAgentUpdate = { onAgentUpdateRequested(pc) },
+                    onBrowseFiles = if (PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) {
+                        { onBrowsePc(pc) }
+                    } else {
+                        null
+                    },
+                    onAgentUpdate = if (
+                        pc.platform == "windows" && PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in pc.capabilities
+                    ) {
+                        { onAgentUpdateRequested(pc) }
+                    } else {
+                        null
+                    },
                     onStopSessionRequested = onStopSessionRequested,
                     onDeleteSessionRequested = onDeleteSessionRequested,
                 )
@@ -3415,11 +3429,11 @@ private fun agentUpdatePhaseText(phase: String): String = when (phase) {
 /**
  * Device-page projection. Repository state intentionally retains offline PCs
  * for session/history reconciliation; this surface shows only server-online
- * Windows PCs.
+ * trusted PC Agents across all supported desktop platforms.
  */
 internal fun visibleOnlineWindowsPcs(snapshot: ProductSnapshot): List<PcSummary> {
     val windowsDeviceIds = snapshot.devices.asSequence()
-        .filter { it.type == DeviceType.WINDOWS_PC }
+        .filter { it.type.isPcAgent() }
         .mapTo(hashSetOf()) { it.id }
     return snapshot.pcs.filter { it.online && it.deviceId in windowsDeviceIds }
 }
@@ -3440,6 +3454,13 @@ private fun PcRow(
 ) {
     var deviceMenuExpanded by remember { mutableStateOf(false) }
     val deviceMenuDescription = stringResource(R.string.device_menu_accessibility)
+    val platformLabel = stringResource(
+        when (pc.platform) {
+            "linux" -> R.string.pc_platform_linux
+            "macos" -> R.string.pc_platform_macos
+            else -> R.string.pc_platform_windows
+        },
+    )
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = ProductShape,
@@ -3468,8 +3489,8 @@ private fun PcRow(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Icon(
-                        Icons.Filled.LaptopWindows,
-                        contentDescription = stringResource(R.string.windows_pc_accessibility),
+                        if (pc.platform == "windows") Icons.Filled.LaptopWindows else Icons.Filled.Terminal,
+                        contentDescription = platformLabel,
                         modifier = Modifier.size(22.dp),
                         tint = MaterialTheme.colorScheme.primary,
                     )
@@ -3485,6 +3506,7 @@ private fun PcRow(
                                 R.string.pc_routing_status,
                                 pc.agentVersion,
                                 stringResource(if (pc.remoteRoutingEnabled) R.string.remote_enabled else R.string.remote_disabled),
+                                platformLabel,
                             ),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,

@@ -19,7 +19,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         RendererCheckpointEntity::class,
         HistoryPreferenceEntity::class,
     ],
-    version = 5,
+    version = 6,
     exportSchema = true,
 )
 abstract class TermLinkDatabase : RoomDatabase() {
@@ -54,7 +54,7 @@ abstract class TermLinkDatabase : RoomDatabase() {
         @JvmStatic
         fun open(context: Context, name: String = DEFAULT_NAME): TermLinkDatabase =
             Room.databaseBuilder(context.applicationContext, TermLinkDatabase::class.java, name)
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
                 .build()
 
         @JvmStatic
@@ -149,6 +149,16 @@ abstract class TermLinkDatabase : RoomDatabase() {
                 database.execSQL(
                     "CREATE UNIQUE INDEX IF NOT EXISTS index_transcript_pages_objectKey ON transcript_pages(objectKey)",
                 )
+            }
+        }
+
+        @JvmField
+        val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE pcs ADD COLUMN platform TEXT NOT NULL DEFAULT 'windows'")
+                database.execSQL("ALTER TABLE pcs ADD COLUMN architecture TEXT NOT NULL DEFAULT 'unknown'")
+                database.execSQL("ALTER TABLE pcs ADD COLUMN platformVersion TEXT NOT NULL DEFAULT 'legacy'")
+                database.execSQL("ALTER TABLE pcs ADD COLUMN capabilitiesCsv TEXT NOT NULL DEFAULT ''")
             }
         }
     }

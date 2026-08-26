@@ -5,6 +5,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -30,6 +31,8 @@ internal static class Program
         internal Exception FailNextPc;
         internal bool FailRecipientRefresh;
         internal int FailSessionResponses;
+        internal bool RejectNextPCAgentRegistration;
+        internal bool RejectNextGenericPCUpsert;
         internal TaskCompletionSource<bool> Entered = NewSignal();
         internal TaskCompletionSource<bool> Release = NewSignal();
 
@@ -48,6 +51,34 @@ internal static class Program
                 request.RequestUri.AbsolutePath,
                 (byte[])body.Clone(),
                 key));
+
+            if (request.Method == HttpMethod.Post && request.RequestUri.AbsolutePath == "/v1/devices/register" &&
+                RejectNextPCAgentRegistration)
+            {
+                using var registration = JsonDocument.Parse(body);
+                if (registration.RootElement.GetProperty("type").GetString() == "PC_AGENT")
+                {
+                    RejectNextPCAgentRegistration = false;
+                    return new HttpResponseMessage(HttpStatusCode.BadRequest)
+                    {
+                        Content = new ByteArrayContent("{\"error\":{\"code\":\"INVALID_DEVICE_TYPE\"}}"u8.ToArray())
+                    };
+                }
+            }
+
+            if (request.Method == HttpMethod.Put && request.RequestUri.AbsolutePath.StartsWith("/v1/pcs/", StringComparison.Ordinal) &&
+                RejectNextGenericPCUpsert)
+            {
+                using var metadata = JsonDocument.Parse(body);
+                if (metadata.RootElement.TryGetProperty("platform", out _))
+                {
+                    RejectNextGenericPCUpsert = false;
+                    return new HttpResponseMessage(HttpStatusCode.BadRequest)
+                    {
+                        Content = new ByteArrayContent("{\"error\":{\"code\":\"INVALID_REQUEST\"}}"u8.ToArray())
+                    };
+                }
+            }
 
             if (request.Method == HttpMethod.Get &&
                 request.RequestUri.AbsolutePath.EndsWith("/grants", StringComparison.Ordinal) &&
@@ -145,6 +176,13 @@ internal static class Program
             var ensureRegistered = Method(runtimeType, "EnsureRegisteredAsync");
             await InvokeTask(ensureRegistered, runtime, CancellationToken.None);
             var initial = PCRequests(handler, pcId).Single();
+            var registrationRequest = handler.Requests.Single(value =>
+                value.Method == HttpMethod.Post && value.Path == "/v1/devices/register");
+            using (var registrationJson = JsonDocument.Parse(registrationRequest.Body))
+            {
+                Require(registrationJson.RootElement.GetProperty("type").GetString() == "PC_AGENT",
+                    "A new Windows Agent did not prefer the generic PC_AGENT device type.");
+            }
 
             var buildBody = Method(runtimeType, "BuildPCUpsertBody");
             var legacyBody = (byte[])buildBody.Invoke(
@@ -169,9 +207,17 @@ internal static class Program
             var detectTerminalCommands = Method(terminalLauncherType, "DetectTerminalCommandCapabilities");
             var initialCommands = detectTerminalCommands.Invoke(null, null);
             var buildTerminalCommandsBody = Method(runtimeType, "BuildPCUpsertBodyWithTerminalCommands");
-            var expectedBody = (byte[])buildTerminalCommandsBody.Invoke(
+            var buildPCAgentBody = Method(runtimeType, "BuildPCAgentUpsertBodyWithTerminalCommands");
+            var architecture = RuntimeInformation.OSArchitecture == Architecture.Arm64 ? "arm64" : "x64";
+            var expectedBody = (byte[])buildPCAgentBody.Invoke(
                 null,
-                new[] { (object)"Heartbeat Validation PC", "validation-1", 7L, initialShells, initialCommands });
+                new[]
+                {
+                    (object)"Heartbeat Validation PC", "validation-1", 7L,
+                    RuntimeInformation.OSDescription, architecture,
+                    (bool)Field(runtimeType, "terminalSnapshotEnabled").GetValue(runtime),
+                    initialShells, initialCommands
+                });
             Require(initial.Method == HttpMethod.Put && initial.Body.SequenceEqual(expectedBody),
                 "Initial registration did not advertise detected PC capabilities.");
             var pcUpsertKey = Method(runtimeType, "PCUpsertIdempotencyKey");
@@ -200,6 +246,17 @@ internal static class Program
                     "PC upsert did not advertise the detected managed shells.");
                 Require(json.RootElement.GetProperty("terminal_commands").ValueKind == JsonValueKind.Array,
                     "PC upsert did not advertise standardized terminal commands.");
+                Require(json.RootElement.GetProperty("platform").GetString() == "windows" &&
+                    json.RootElement.GetProperty("architecture").GetString() == architecture &&
+                    json.RootElement.GetProperty("platform_version").GetString() == RuntimeInformation.OSDescription,
+                    "PC upsert did not advertise its bounded platform identity.");
+                var capabilities = json.RootElement.GetProperty("capabilities").EnumerateArray()
+                    .Select(value => value.GetString()).ToHashSet(StringComparer.Ordinal);
+                Require(capabilities.Contains("realtime_terminal_v1") &&
+                    capabilities.Contains("file_operations_v1") &&
+                    capabilities.Contains("terminal_commands_v1") &&
+                    capabilities.Contains("remote_agent_update_v1"),
+                    "PC upsert did not advertise the generic bounded capability set.");
             }
 
             var capabilityRoot = Path.Combine(Path.GetTempPath(), "termlink-shell-capabilities-" + Guid.NewGuid().ToString("N"));
@@ -439,6 +496,35 @@ internal static class Program
             Require(runtimeType.GetField("pcHeartbeatWorker", BindingFlags.Instance | BindingFlags.NonPublic) == null &&
                 runtimeType.GetField("metadataWorker", BindingFlags.Instance | BindingFlags.NonPublic) != null,
                 "PC heartbeat added a worker instead of reusing metadata scheduling.");
+
+            var beforeLegacyFallback = handler.Requests.Count;
+            handler.RejectNextPCAgentRegistration = true;
+            handler.RejectNextGenericPCUpsert = true;
+            await InvokeTask(ensureRegistered, runtime, CancellationToken.None);
+            var fallbackRequests = handler.Requests.Skip(beforeLegacyFallback).ToArray();
+            var fallbackRegistrations = fallbackRequests.Where(value =>
+                value.Method == HttpMethod.Post && value.Path == "/v1/devices/register").ToArray();
+            Require(fallbackRegistrations.Length == 2,
+                "Legacy Server fallback did not retry registration exactly once.");
+            using (var firstRegistration = JsonDocument.Parse(fallbackRegistrations[0].Body))
+            using (var secondRegistration = JsonDocument.Parse(fallbackRegistrations[1].Body))
+            {
+                Require(firstRegistration.RootElement.GetProperty("type").GetString() == "PC_AGENT" &&
+                    secondRegistration.RootElement.GetProperty("type").GetString() == "WINDOWS_PC",
+                    "Legacy Server fallback did not downgrade only the device type.");
+            }
+            var fallbackUpserts = fallbackRequests.Where(value =>
+                value.Method == HttpMethod.Put && value.Path == "/v1/pcs/" + pcId.ToString("D")).ToArray();
+            Require(fallbackUpserts.Length == 2,
+                "Legacy Server fallback did not retry PC metadata exactly once.");
+            using (var genericMetadata = JsonDocument.Parse(fallbackUpserts[0].Body))
+            using (var legacyMetadata = JsonDocument.Parse(fallbackUpserts[1].Body))
+            {
+                Require(genericMetadata.RootElement.TryGetProperty("capabilities", out _) &&
+                    !legacyMetadata.RootElement.TryGetProperty("capabilities", out _) &&
+                    !legacyMetadata.RootElement.TryGetProperty("platform", out _),
+                    "Legacy Server fallback did not preserve the pre-P5 PC metadata contract.");
+            }
 
             Console.WriteLine("Production PC heartbeat validation passed.");
             return 0;

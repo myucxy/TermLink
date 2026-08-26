@@ -148,7 +148,7 @@ func (s *Postgres) RegisterDevice(ctx context.Context, subjectHash [32]byte, inp
 		FROM users WHERE id=$1 FOR UPDATE`, userID).Scan(&bootstrapConsumedAt); err != nil {
 		return uuid.Nil, DeviceRecord{}, false, err
 	}
-	bootstrap := input.Type == "WINDOWS_PC" && bootstrapConsumedAt == nil
+	bootstrap := IsPCAgentDeviceType(input.Type) && bootstrapConsumedAt == nil
 	trustState := "PENDING"
 	var approvedAt *time.Time
 	var approvedBy *uuid.UUID
@@ -163,12 +163,12 @@ func (s *Postgres) RegisterDevice(ctx context.Context, subjectHash [32]byte, inp
 	// second nil-approved row (which would make the Agent an unknown device).
 	// The user row is locked above, so this lookup is serialized with all other
 	// registrations for the account.
-	if input.Type == "WINDOWS_PC" && !bootstrap && s.AutoTrustDevices {
+	if IsPCAgentDeviceType(input.Type) && !bootstrap && s.AutoTrustDevices {
 		var bootstrapID uuid.UUID
 		err := tx.QueryRow(ctx, `
 			SELECT id
 			FROM devices
-			WHERE user_id=$1 AND device_type='WINDOWS_PC' AND approved_by IS NULL
+			WHERE user_id=$1 AND device_type IN ('WINDOWS_PC','PC_AGENT') AND approved_by IS NULL
 			ORDER BY created_at,id
 			LIMIT 1`, userID).Scan(&bootstrapID)
 		if err == nil {
@@ -546,7 +546,7 @@ func (s *Postgres) RevokeDevice(ctx context.Context, userID, actorID, targetID u
 			FROM actor
 			WHERE actor.id=$3
 			   OR $4
-			   OR (actor.device_type='WINDOWS_PC' AND actor.approved_by IS NULL)
+			   OR (actor.device_type IN ('WINDOWS_PC','PC_AGENT') AND actor.approved_by IS NULL)
 			   OR (
 				EXISTS(SELECT 1 FROM affected_pcs)
 				AND NOT EXISTS (
@@ -620,6 +620,10 @@ type PCRecord struct {
 	DeviceID                  uuid.UUID                   `json:"device_id"`
 	Name                      string                      `json:"name"`
 	AgentVersion              string                      `json:"agent_version"`
+	Platform                  string                      `json:"platform"`
+	Architecture              string                      `json:"architecture"`
+	PlatformVersion           string                      `json:"platform_version"`
+	Capabilities              []string                    `json:"capabilities"`
 	KeyEpoch                  int64                       `json:"key_epoch"`
 	RemoteRoutingEnabled      bool                        `json:"remote_routing_enabled"`
 	SessionHeartbeatCapable   bool                        `json:"session_heartbeat_capable"`
@@ -639,6 +643,7 @@ type TerminalCommandCapability struct {
 }
 
 func (s *Postgres) UpsertPC(ctx context.Context, userID, deviceID uuid.UUID, item PCRecord) error {
+	applyLegacyPCDefaults(&item)
 	if item.TerminalCommands == nil {
 		item.TerminalCommands = []TerminalCommandCapability{}
 	}
@@ -658,7 +663,7 @@ func (s *Postgres) UpsertPC(ctx context.Context, userID, deviceID uuid.UUID, ite
 	if err := tx.QueryRow(ctx, `
 		SELECT 1
 		FROM devices d
-		WHERE d.id=$1 AND d.user_id=$2 AND d.device_type='WINDOWS_PC' AND d.trust_state='TRUSTED'
+		WHERE d.id=$1 AND d.user_id=$2 AND d.device_type IN ('WINDOWS_PC','PC_AGENT') AND d.trust_state='TRUSTED'
 		FOR UPDATE`, deviceID, userID).Scan(&trustedDevice); errors.Is(err, pgx.ErrNoRows) {
 		return ErrDenied
 	} else if err != nil {
@@ -677,17 +682,19 @@ func (s *Postgres) UpsertPC(ctx context.Context, userID, deviceID uuid.UUID, ite
 		INSERT INTO pcs(
 			id,owner_user_id,device_id,name,agent_version,key_epoch,last_seen_at,
 			session_heartbeat_capable,session_heartbeat_enabled_at,supported_shells,
-			remote_agent_update_capable,terminal_commands)
+			remote_agent_update_capable,terminal_commands,platform,architecture,platform_version,capabilities)
 		VALUES($1,$2,$3,$4,$5,$6,now(),$7,CASE WHEN $7 THEN now() END,
-		       COALESCE($8::text[],ARRAY[]::text[]),$9,$10::jsonb)
+		       COALESCE($8::text[],ARRAY[]::text[]),$9,$10::jsonb,$11,$12,$13,COALESCE($14::text[],ARRAY[]::text[]))
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name,agent_version=excluded.agent_version,
 		key_epoch=GREATEST(pcs.key_epoch,excluded.key_epoch),last_seen_at=now(),
 		session_heartbeat_capable=pcs.session_heartbeat_capable OR excluded.session_heartbeat_capable,
 		session_heartbeat_enabled_at=COALESCE(pcs.session_heartbeat_enabled_at,excluded.session_heartbeat_enabled_at),
 		supported_shells=excluded.supported_shells,
 		remote_agent_update_capable=excluded.remote_agent_update_capable,
-		terminal_commands=excluded.terminal_commands
-		WHERE pcs.owner_user_id=$2 AND pcs.device_id=$3`, item.ID, userID, deviceID, item.Name, item.AgentVersion, item.KeyEpoch, item.SessionHeartbeatCapable, item.SupportedShells, item.RemoteAgentUpdateCapable, terminalCommands)
+		terminal_commands=excluded.terminal_commands,
+		platform=excluded.platform,architecture=excluded.architecture,
+		platform_version=excluded.platform_version,capabilities=excluded.capabilities
+		WHERE pcs.owner_user_id=$2 AND pcs.device_id=$3`, item.ID, userID, deviceID, item.Name, item.AgentVersion, item.KeyEpoch, item.SessionHeartbeatCapable, item.SupportedShells, item.RemoteAgentUpdateCapable, terminalCommands, item.Platform, item.Architecture, item.PlatformVersion, item.Capabilities)
 	if err != nil {
 		return err
 	}
@@ -701,7 +708,7 @@ func (s *Postgres) TouchPCPresence(ctx context.Context, userID, deviceID uuid.UU
 	command, err := s.Pool.Exec(ctx, `
 		WITH trusted AS (
 			UPDATE devices SET last_seen_at=now()
-			WHERE id=$1 AND user_id=$2 AND device_type='WINDOWS_PC' AND trust_state='TRUSTED'
+			WHERE id=$1 AND user_id=$2 AND device_type IN ('WINDOWS_PC','PC_AGENT') AND trust_state='TRUSTED'
 			  AND EXISTS(SELECT 1 FROM users WHERE id=$2 AND status='ACTIVE')
 			RETURNING id
 		)
@@ -734,7 +741,8 @@ func (s *Postgres) TouchDevicePresence(ctx context.Context, userID, deviceID uui
 
 func (s *Postgres) ListPCs(ctx context.Context, userID, deviceID uuid.UUID) ([]PCRecord, error) {
 	rows, err := s.Pool.Query(ctx, `
-		SELECT p.id,p.device_id,p.name,p.agent_version,p.key_epoch,p.remote_routing_enabled,
+		SELECT p.id,p.device_id,p.name,p.agent_version,p.platform,p.architecture,p.platform_version,p.capabilities,
+		       p.key_epoch,p.remote_routing_enabled,
 		       p.session_heartbeat_capable,p.session_heartbeat_enabled_at,
 		       p.remote_agent_update_capable,p.supported_shells,p.terminal_commands,
 		       COALESCE(p.last_seen_at > now()-($4 * interval '1 second'),false),p.last_seen_at
@@ -757,7 +765,8 @@ func (s *Postgres) ListPCs(ctx context.Context, userID, deviceID uuid.UUID) ([]P
 	for rows.Next() {
 		var item PCRecord
 		var terminalCommands []byte
-		if err := rows.Scan(&item.ID, &item.DeviceID, &item.Name, &item.AgentVersion, &item.KeyEpoch,
+		if err := rows.Scan(&item.ID, &item.DeviceID, &item.Name, &item.AgentVersion,
+			&item.Platform, &item.Architecture, &item.PlatformVersion, &item.Capabilities, &item.KeyEpoch,
 			&item.RemoteRoutingEnabled, &item.SessionHeartbeatCapable, &item.SessionHeartbeatEnabledAt,
 			&item.RemoteAgentUpdateCapable, &item.SupportedShells, &terminalCommands, &item.Online, &item.LastSeenAt); err != nil {
 			return nil, err
@@ -1487,7 +1496,7 @@ func (s *Postgres) CreateHistoryUpload(ctx context.Context, userID, actorID uuid
 		  ON pc.id=session.pc_id AND pc.owner_user_id=$1 AND pc.device_id=$2
 		 AND pc.remote_routing_enabled AND pc.key_epoch=$5
 		JOIN devices actor
-		  ON actor.id=$2 AND actor.user_id=$1 AND actor.device_type='WINDOWS_PC' AND actor.trust_state='TRUSTED'
+		  ON actor.id=$2 AND actor.user_id=$1 AND actor.device_type IN ('WINDOWS_PC','PC_AGENT') AND actor.trust_state='TRUSTED'
 		JOIN devices recipient
 		  ON recipient.id=$4 AND recipient.user_id=$1 AND recipient.device_type='ANDROID' AND recipient.trust_state='TRUSTED'
 		LEFT JOIN device_grants recipient_grant
@@ -1514,7 +1523,7 @@ func (s *Postgres) CreateHistoryUpload(ctx context.Context, userID, actorID uuid
 		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24
 		FROM sessions s
 		JOIN pcs p ON p.id=s.pc_id AND p.owner_user_id=$2 AND p.device_id=$3 AND p.remote_routing_enabled AND p.key_epoch=$23
-		JOIN devices actor ON actor.id=$3 AND actor.user_id=$2 AND actor.device_type='WINDOWS_PC' AND actor.trust_state='TRUSTED'
+		JOIN devices actor ON actor.id=$3 AND actor.user_id=$2 AND actor.device_type IN ('WINDOWS_PC','PC_AGENT') AND actor.trust_state='TRUSTED'
 		JOIN devices recipient ON recipient.id=$22 AND recipient.user_id=$2 AND recipient.device_type='ANDROID' AND recipient.trust_state='TRUSTED'
 		LEFT JOIN device_grants recipient_grant
 		  ON recipient_grant.pc_id=p.id AND recipient_grant.device_id=recipient.id
@@ -1602,7 +1611,7 @@ func (s *Postgres) requireHistoryRecipientAuthority(
 		  ON p.id=s.pc_id AND p.owner_user_id=$1 AND p.device_id=$2
 		 AND p.remote_routing_enabled AND p.key_epoch=$5
 		JOIN devices actor
-		  ON actor.id=$2 AND actor.user_id=$1 AND actor.device_type='WINDOWS_PC' AND actor.trust_state='TRUSTED'
+		  ON actor.id=$2 AND actor.user_id=$1 AND actor.device_type IN ('WINDOWS_PC','PC_AGENT') AND actor.trust_state='TRUSTED'
 		JOIN devices recipient
 		  ON recipient.id=$4 AND recipient.user_id=$1 AND recipient.device_type='ANDROID' AND recipient.trust_state='TRUSTED'
 		LEFT JOIN device_grants recipient_grant

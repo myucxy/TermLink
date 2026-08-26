@@ -67,7 +67,8 @@ func (a *API) getAgentUpdateEligibility(w http.ResponseWriter, r *http.Request) 
 		})
 		return
 	}
-	if !pc.Online || !pc.RemoteRoutingEnabled || !pc.RemoteAgentUpdateCapable {
+	if !pc.Online || !pc.RemoteRoutingEnabled || pc.Platform != store.PCPlatformWindows ||
+		!store.HasPCCapability(pc.Capabilities, store.PCCapabilityRemoteAgentUpdateV1) {
 		reason := "REMOTE_UPDATE_UNSUPPORTED"
 		if !pc.Online {
 			reason = "PC_OFFLINE"
@@ -130,7 +131,8 @@ func (a *API) createAgentUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	currentBuild, err := agentupdate.WindowsAgentBuild(pc.AgentVersion)
-	if err != nil || !pc.Online || !pc.RemoteRoutingEnabled || !pc.RemoteAgentUpdateCapable {
+	if err != nil || !pc.Online || !pc.RemoteRoutingEnabled || pc.Platform != store.PCPlatformWindows ||
+		!store.HasPCCapability(pc.Capabilities, store.PCCapabilityRemoteAgentUpdateV1) {
 		writeError(w, r, http.StatusConflict, "REMOTE_UPDATE_UNAVAILABLE", store.ErrConflict)
 		return
 	}
@@ -179,7 +181,7 @@ func (a *API) createAgentUpdate(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) claimAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "WINDOWS_PC" {
+	if !store.IsPCAgentDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "WINDOWS_AGENT_REQUIRED", store.ErrDenied)
 		return
 	}
@@ -299,7 +301,7 @@ func (a *API) renewAgentUpdate(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) progressAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "WINDOWS_PC" {
+	if !store.IsPCAgentDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "WINDOWS_AGENT_REQUIRED", store.ErrDenied)
 		return
 	}
@@ -340,7 +342,7 @@ func (a *API) progressAgentUpdate(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) completeAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "WINDOWS_PC" {
+	if !store.IsPCAgentDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "WINDOWS_AGENT_REQUIRED", store.ErrDenied)
 		return
 	}
@@ -401,7 +403,7 @@ func (a *API) agentUpdateLeaseRequest(
 	r *http.Request,
 ) (auth.Principal, uuid.UUID, uuid.UUID, [32]byte, bool) {
 	p := principal(r)
-	if p.Device.Type != "WINDOWS_PC" {
+	if !store.IsPCAgentDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "WINDOWS_AGENT_REQUIRED", store.ErrDenied)
 		return auth.Principal{}, uuid.Nil, uuid.Nil, [32]byte{}, false
 	}

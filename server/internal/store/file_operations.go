@@ -160,12 +160,13 @@ func (s *Postgres) CreateFileOperation(ctx context.Context, userID, requesterID,
 		JOIN devices requester ON requester.id=$3 AND requester.user_id=$2
 			AND requester.device_type='ANDROID' AND requester.trust_state='TRUSTED'
 		JOIN devices agent ON agent.id=p.device_id AND agent.user_id=$2
-			AND agent.device_type='WINDOWS_PC' AND agent.trust_state='TRUSTED'
+			AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
 		WHERE p.id=$9 AND p.owner_user_id=$2
-		  AND ($4<>'OPEN_TERMINAL' OR $7=ANY(p.supported_shells) OR EXISTS (
+		  AND 'file_operations_v1'=ANY(p.capabilities)
+		  AND ($4<>'OPEN_TERMINAL' OR ('terminal_commands_v1'=ANY(p.capabilities) AND ($7=ANY(p.supported_shells) OR EXISTS (
 			SELECT 1 FROM jsonb_array_elements(p.terminal_commands) command
 			WHERE command->>'id'=$7
-		  ))
+		  ))))
 		RETURNING `+fileOperationColumns,
 		itemID, userID, requesterID, input.Operation, input.Path, input.Offset, input.ShellType, input.ExpiresAt, pcID)
 	item, err := scanFileOperation(row)
@@ -297,7 +298,8 @@ func (s *Postgres) ClaimFileOperation(ctx context.Context, userID, agentDeviceID
 		SELECT EXISTS (
 			SELECT 1 FROM pcs p JOIN devices agent ON agent.id=p.device_id
 			WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3
-			  AND agent.user_id=$2 AND agent.device_type='WINDOWS_PC' AND agent.trust_state='TRUSTED'
+			  AND 'file_operations_v1'=ANY(p.capabilities)
+			  AND agent.user_id=$2 AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
 		)`, pcID, userID, agentDeviceID).Scan(&authorized); err != nil {
 		return nil, "", err
 	}
@@ -313,7 +315,8 @@ func (s *Postgres) ClaimFileOperation(ctx context.Context, userID, agentDeviceID
 		  AND EXISTS (
 			SELECT 1 FROM pcs p JOIN devices agent ON agent.id=p.device_id
 			WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3
-			  AND agent.user_id=$2 AND agent.device_type='WINDOWS_PC' AND agent.trust_state='TRUSTED'
+			  AND 'file_operations_v1'=ANY(p.capabilities)
+			  AND agent.user_id=$2 AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
 		  )
 			RETURNING operation.id,operation.object_key
 		)
@@ -329,7 +332,8 @@ func (s *Postgres) ClaimFileOperation(ctx context.Context, userID, agentDeviceID
 		WITH authority AS (
 			SELECT 1 FROM pcs p JOIN devices agent ON agent.id=p.device_id
 			WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3
-			  AND agent.user_id=$2 AND agent.device_type='WINDOWS_PC' AND agent.trust_state='TRUSTED'
+			  AND 'file_operations_v1'=ANY(p.capabilities)
+			  AND agent.user_id=$2 AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
 		), candidate AS (
 			SELECT operation.id
 			FROM pc_file_operations operation, authority
@@ -489,7 +493,8 @@ func (s *Postgres) AgentFileOperation(ctx context.Context, userID, agentDeviceID
 		WHERE id=$1 AND account_id=$2 AND pc_id=$3 AND lease_token_hash=$4
 		  AND EXISTS (SELECT 1 FROM pcs p JOIN devices d ON d.id=p.device_id
 			WHERE p.id=$3 AND p.owner_user_id=$2 AND p.device_id=$5
-			  AND d.user_id=$2 AND d.device_type='WINDOWS_PC' AND d.trust_state='TRUSTED')`,
+			  AND 'file_operations_v1'=ANY(p.capabilities)
+			  AND d.user_id=$2 AND d.device_type IN ('WINDOWS_PC','PC_AGENT') AND d.trust_state='TRUSTED')`,
 		operationID, userID, pcID, leaseHash[:], agentDeviceID))
 	return item, err
 }
@@ -592,7 +597,8 @@ func (s *Postgres) getAgentFileOperationForUpdate(ctx context.Context, tx pgx.Tx
 		WHERE id=$1 AND account_id=$2 AND pc_id=$3
 		  AND EXISTS (SELECT 1 FROM pcs p JOIN devices d ON d.id=p.device_id
 			WHERE p.id=$3 AND p.owner_user_id=$2 AND p.device_id=$4
-			  AND d.user_id=$2 AND d.device_type='WINDOWS_PC' AND d.trust_state='TRUSTED')
+			  AND 'file_operations_v1'=ANY(p.capabilities)
+			  AND d.user_id=$2 AND d.device_type IN ('WINDOWS_PC','PC_AGENT') AND d.trust_state='TRUSTED')
 		FOR UPDATE`, operationID, userID, pcID, agentDeviceID))
 	return item, err
 }

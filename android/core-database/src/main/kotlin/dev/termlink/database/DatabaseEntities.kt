@@ -37,6 +37,10 @@ data class PcEntity(
     val remoteRoutingEnabled: Boolean,
     val online: Boolean,
     val lastSeenAtEpochMillis: Long?,
+    val platform: String = "windows",
+    val architecture: String = "unknown",
+    val platformVersion: String = "legacy",
+    val capabilitiesCsv: String = "",
 )
 
 @Entity(

@@ -3,7 +3,8 @@ package dev.termlink.model
 import java.time.Instant
 import java.util.UUID
 
-enum class DeviceType { WINDOWS_PC, ANDROID }
+enum class DeviceType { WINDOWS_PC, PC_AGENT, ANDROID }
+fun DeviceType.isPcAgent(): Boolean = this == DeviceType.WINDOWS_PC || this == DeviceType.PC_AGENT
 enum class DeviceTrustState { PENDING, TRUSTED, REVOKED }
 enum class GrantPermission { VIEW, CONTROL, MANAGE }
 enum class SessionState { RUNNING, INTERRUPTED, EXITED }
@@ -34,6 +35,12 @@ data class PcSummary(
     val remoteRoutingEnabled: Boolean,
     val online: Boolean,
     val lastSeenAt: Instant?,
+    /** Server-authoritative runtime platform; legacy Windows records default to windows. */
+    val platform: String = "windows",
+    val architecture: String = "unknown",
+    val platformVersion: String = "legacy",
+    /** Bounded Agent feature identifiers used to gate remote actions. */
+    val capabilities: Set<String> = emptySet(),
     /** Agent-detected managed shells; clients must never infer this list. */
     val supportedShells: Set<String> = emptySet(),
     /** Agent-authoritative terminal commands, including Windows-configured manual entries. */
@@ -41,6 +48,14 @@ data class PcSummary(
     /** Server-authoritative support for Android-triggered transactional Agent updates. */
     val remoteAgentUpdateCapable: Boolean = false,
 )
+
+object PcCapabilityIds {
+    const val REALTIME_TERMINAL_V1 = "realtime_terminal_v1"
+    const val TERMINAL_SNAPSHOT_V1 = "terminal_snapshot_v1"
+    const val FILE_OPERATIONS_V1 = "file_operations_v1"
+    const val TERMINAL_COMMANDS_V1 = "terminal_commands_v1"
+    const val REMOTE_AGENT_UPDATE_V1 = "remote_agent_update_v1"
+}
 
 data class TerminalCommandCapability(
     val id: String,

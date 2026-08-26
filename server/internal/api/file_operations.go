@@ -90,7 +90,7 @@ func (a *API) createFileOperation(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) claimFileOperation(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "WINDOWS_PC" {
+	if !store.IsPCAgentDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "WINDOWS_AGENT_REQUIRED", store.ErrDenied)
 		return
 	}
@@ -187,7 +187,7 @@ func (a *API) uploadFileOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := principal(r)
-	if p.Device.Type != "WINDOWS_PC" {
+	if !store.IsPCAgentDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "WINDOWS_AGENT_REQUIRED", store.ErrDenied)
 		return
 	}
@@ -239,7 +239,7 @@ func (a *API) uploadFileOperation(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) renewFileOperation(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "WINDOWS_PC" {
+	if !store.IsPCAgentDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "WINDOWS_AGENT_REQUIRED", store.ErrDenied)
 		return
 	}
@@ -274,7 +274,7 @@ func (a *API) renewFileOperation(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) completeFileOperation(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "WINDOWS_PC" {
+	if !store.IsPCAgentDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "WINDOWS_AGENT_REQUIRED", store.ErrDenied)
 		return
 	}

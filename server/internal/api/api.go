@@ -287,7 +287,7 @@ func (a *API) registerDevice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_PUBLIC_KEY", errors.New("invalid exchange key"))
 		return
 	}
-	if input.Type != "WINDOWS_PC" && input.Type != "ANDROID" {
+	if !store.IsPCAgentDeviceType(input.Type) && input.Type != "ANDROID" {
 		writeError(w, r, http.StatusBadRequest, "INVALID_DEVICE_TYPE", errors.New("invalid device type"))
 		return
 	}
@@ -339,7 +339,7 @@ func (a *API) canRegisterDeviceType(deviceType, authorizedParty string) bool {
 	switch deviceType {
 	case "ANDROID":
 		return authorizedParty != "" && authorizedParty == a.ClientConfig.OIDCClientID
-	case "WINDOWS_PC":
+	case store.DeviceTypeLegacyWindowsPC, store.DeviceTypePCAgent:
 		for _, party := range a.ClientConfig.WindowsRegistrationParties {
 			if authorizedParty != "" && authorizedParty == party {
 				return true
@@ -356,7 +356,19 @@ func (a *API) listDevices(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, r, err)
 		return
 	}
+	// Device list V1 predates PC_AGENT and is still consumed by released
+	// Android clients using a closed enum. Preserve that wire value during the
+	// compatibility window; platform and capability truth is exposed by /v1/pcs.
+	projectDeviceTypesForV1(items)
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func projectDeviceTypesForV1(items []store.DeviceRecord) {
+	for index := range items {
+		if items[index].Type == store.DeviceTypePCAgent {
+			items[index].Type = store.DeviceTypeLegacyWindowsPC
+		}
+	}
 }
 
 func (a *API) getCurrentDevice(w http.ResponseWriter, r *http.Request) {
@@ -626,6 +638,10 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 		Name                     string                            `json:"name"`
 		AgentVersion             string                            `json:"agent_version"`
 		KeyEpoch                 int64                             `json:"key_epoch"`
+		Platform                 string                            `json:"platform"`
+		Architecture             string                            `json:"architecture"`
+		PlatformVersion          string                            `json:"platform_version"`
+		Capabilities             []string                          `json:"capabilities"`
 		SessionHeartbeatCapable  bool                              `json:"session_heartbeat_capable"`
 		RemoteAgentUpdateCapable bool                              `json:"remote_agent_update_capable"`
 		SupportedShells          []string                          `json:"supported_shells"`
@@ -639,6 +655,10 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 400, "INVALID_REQUEST", errors.New("invalid PC metadata"))
 		return
 	}
+	if !store.IsPCAgentDeviceType(p.Device.Type) {
+		writeError(w, r, http.StatusForbidden, "PC_AGENT_REQUIRED", store.ErrDenied)
+		return
+	}
 	supportedShells, err := normalizeSupportedShells(input.SupportedShells)
 	if err != nil {
 		writeError(w, r, 400, "INVALID_REQUEST", err)
@@ -649,10 +669,27 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 400, "INVALID_REQUEST", err)
 		return
 	}
+	platform, architecture, platformVersion, capabilities, err := normalizePCAgentMetadata(
+		p.Device.Type,
+		input.Platform,
+		input.Architecture,
+		input.PlatformVersion,
+		input.Capabilities,
+		input.SessionHeartbeatCapable,
+		input.RemoteAgentUpdateCapable,
+		supportedShells,
+		terminalCommands,
+	)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_PC_AGENT_METADATA", err)
+		return
+	}
 	if err := a.Store.UpsertPC(r.Context(), p.UserID, p.Device.ID, store.PCRecord{
 		ID: id, Name: input.Name, AgentVersion: input.AgentVersion, KeyEpoch: input.KeyEpoch,
+		Platform: platform, Architecture: architecture, PlatformVersion: platformVersion,
+		Capabilities:             capabilities,
 		SessionHeartbeatCapable:  input.SessionHeartbeatCapable,
-		RemoteAgentUpdateCapable: input.RemoteAgentUpdateCapable,
+		RemoteAgentUpdateCapable: store.HasPCCapability(capabilities, store.PCCapabilityRemoteAgentUpdateV1),
 		SupportedShells:          supportedShells,
 		TerminalCommands:         terminalCommands,
 	}); err != nil {
@@ -663,6 +700,80 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 }
 
 var terminalCommandIDPattern = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,63}$`)
+var pcCapabilityIDPattern = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,63}$`)
+
+func normalizePCAgentMetadata(
+	deviceType, platform, architecture, platformVersion string,
+	capabilities []string,
+	sessionHeartbeatCapable, remoteAgentUpdateCapable bool,
+	supportedShells []string,
+	terminalCommands []store.TerminalCommandCapability,
+) (string, string, string, []string, error) {
+	legacy := deviceType == store.DeviceTypeLegacyWindowsPC
+	platform = strings.ToLower(strings.TrimSpace(platform))
+	architecture = strings.ToLower(strings.TrimSpace(architecture))
+	platformVersion = strings.TrimSpace(platformVersion)
+	if legacy {
+		if platform == "" {
+			platform = store.PCPlatformWindows
+		}
+		if architecture == "" {
+			architecture = store.PCArchitectureUnknown
+		}
+		if platformVersion == "" {
+			platformVersion = "legacy"
+		}
+		if capabilities == nil {
+			capabilities = []string{
+				store.PCCapabilityRealtimeTerminalV1,
+				store.PCCapabilityFileOperationsV1,
+			}
+			if sessionHeartbeatCapable {
+				capabilities = append(capabilities, store.PCCapabilityTerminalSnapshotV1)
+			}
+			if len(supportedShells) > 0 || len(terminalCommands) > 0 {
+				capabilities = append(capabilities, store.PCCapabilityTerminalCommandsV1)
+			}
+			if remoteAgentUpdateCapable {
+				capabilities = append(capabilities, store.PCCapabilityRemoteAgentUpdateV1)
+			}
+		}
+	}
+	if platform != store.PCPlatformWindows && platform != store.PCPlatformLinux && platform != store.PCPlatformMacOS {
+		return "", "", "", nil, errors.New("unsupported PC platform")
+	}
+	if legacy && platform != store.PCPlatformWindows {
+		return "", "", "", nil, errors.New("legacy Windows device reported a different platform")
+	}
+	if architecture != store.PCArchitectureX64 && architecture != store.PCArchitectureArm64 &&
+		!(legacy && architecture == store.PCArchitectureUnknown) {
+		return "", "", "", nil, errors.New("unsupported PC architecture")
+	}
+	if !utf8.ValidString(platformVersion) || len(platformVersion) < 1 || len([]byte(platformVersion)) > 160 ||
+		strings.IndexFunc(platformVersion, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+		return "", "", "", nil, errors.New("invalid platform version")
+	}
+	if len(capabilities) > store.MaxPCCapabilities {
+		return "", "", "", nil, errors.New("too many PC capabilities")
+	}
+	seen := make(map[string]bool, len(capabilities))
+	normalized := make([]string, 0, len(capabilities))
+	for _, capability := range capabilities {
+		if !pcCapabilityIDPattern.MatchString(capability) || seen[capability] {
+			return "", "", "", nil, errors.New("invalid PC capability")
+		}
+		seen[capability] = true
+		normalized = append(normalized, capability)
+	}
+	if !store.HasPCCapability(normalized, store.PCCapabilityRealtimeTerminalV1) {
+		return "", "", "", nil, errors.New("realtime terminal capability is required")
+	}
+	if (len(supportedShells) > 0 || len(terminalCommands) > 0) &&
+		!store.HasPCCapability(normalized, store.PCCapabilityTerminalCommandsV1) {
+		return "", "", "", nil, errors.New("terminal commands require their capability")
+	}
+	return platform, architecture, platformVersion, normalized, nil
+}
 
 func normalizeTerminalCommands(values []store.TerminalCommandCapability) ([]store.TerminalCommandCapability, error) {
 	if len(values) > 24 {

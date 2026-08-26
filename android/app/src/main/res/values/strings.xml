@@ -162,7 +162,10 @@
     <string name="server_history_empty_copy">History is available only when the server returns encrypted chunks or snapshots.</string>
     <string name="server_devices_empty_copy">No online Windows PCs are currently available for this account.</string>
     <string name="server_device_trust_copy">Device trust and pending requests are server data.</string>
-    <string name="pc_routing_status">Agent %1$s · remote routing %2$s</string>
+    <string name="pc_routing_status">%3$s · Agent %1$s · remote routing %2$s</string>
+    <string name="pc_platform_windows">Windows</string>
+    <string name="pc_platform_linux">Linux</string>
+    <string name="pc_platform_macos">macOS</string>
     <string name="remote_enabled">enabled</string>
     <string name="remote_disabled">disabled</string>
     <string name="session_summary">%1$s · %2$s · %3$d × %4$d</string>

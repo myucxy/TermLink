@@ -10,6 +10,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Net.WebSockets;
+using System.Runtime.InteropServices;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Text;
@@ -730,26 +731,43 @@ namespace TermLink.Agent
 
         private async Task EnsureRegisteredAsync(CancellationToken token)
         {
+            var response = await RegisterDeviceAsync("PC_AGENT", token).ConfigureAwait(false);
+            var errorCode = response.IsSuccessStatusCode
+                ? string.Empty
+                : await ReadServerErrorCodeAsync(response, token).ConfigureAwait(false);
+            if ((response.StatusCode == HttpStatusCode.BadRequest || response.StatusCode == HttpStatusCode.Forbidden) &&
+                (errorCode == "INVALID_DEVICE_TYPE" || errorCode == "DEVICE_TYPE_NOT_ALLOWED"))
+            {
+                response.Dispose();
+                response = await RegisterDeviceAsync("WINDOWS_PC", token).ConfigureAwait(false);
+            }
+            using (response)
+            {
+                if (response.StatusCode == HttpStatusCode.Unauthorized ||
+                    response.StatusCode == HttpStatusCode.Forbidden)
+                {
+                    throw new ProductionReauthenticationRequiredException();
+                }
+                if (response.StatusCode != HttpStatusCode.Created && response.StatusCode != HttpStatusCode.Conflict)
+                    await EnsureServerSuccessAsync(response, "DEVICE_REGISTER", token).ConfigureAwait(false);
+            }
+            lock (statusSync) lastPCUpsertAttemptUtc = DateTime.UtcNow;
+            await UpsertPCAsync(token).ConfigureAwait(false);
+        }
+
+        private async Task<HttpResponseMessage> RegisterDeviceAsync(string deviceType, CancellationToken token)
+        {
             var registration = new Dictionary<string, object>
             {
-                ["id"] = credentials.DeviceId, ["type"] = "WINDOWS_PC", ["name"] = config.PcName,
+                ["id"] = credentials.DeviceId, ["type"] = deviceType, ["name"] = config.PcName,
                 ["signing_public_key"] = Base64Url(credentials.Identity.SigningPublicKey), ["exchange_public_key"] = Base64Url(credentials.Identity.Exchange.PublicKey),
                 ["key_id"] = "device-key-" + credentials.DeviceId.ToString("D")
             };
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(); var nonce = RandomNonce();
-            var canonical = string.Join("\n", "TERMLINK-DEVICE-REGISTER-V1", credentials.DeviceId.ToString("D"), "WINDOWS_PC", config.PcName,
+            var canonical = string.Join("\n", "TERMLINK-DEVICE-REGISTER-V1", credentials.DeviceId.ToString("D"), deviceType, config.PcName,
                 registration["signing_public_key"], registration["exchange_public_key"], registration["key_id"], now, nonce);
             registration["timestamp_ms"] = now; registration["nonce"] = nonce; registration["signature"] = Base64Url(credentials.Identity.Sign(Encoding.UTF8.GetBytes(canonical)));
-            using var response = await SendAsync(HttpMethod.Post, "/v1/devices/register", JsonSerializer.SerializeToUtf8Bytes(registration), false, null, token).ConfigureAwait(false);
-            if (response.StatusCode == HttpStatusCode.Unauthorized ||
-                response.StatusCode == HttpStatusCode.Forbidden)
-            {
-                throw new ProductionReauthenticationRequiredException();
-            }
-            if (response.StatusCode != HttpStatusCode.Created && response.StatusCode != HttpStatusCode.Conflict)
-                await EnsureServerSuccessAsync(response, "DEVICE_REGISTER", token).ConfigureAwait(false);
-            lock (statusSync) lastPCUpsertAttemptUtc = DateTime.UtcNow;
-            await UpsertPCAsync(token).ConfigureAwait(false);
+            return await SendAsync(HttpMethod.Post, "/v1/devices/register", JsonSerializer.SerializeToUtf8Bytes(registration), false, null, token).ConfigureAwait(false);
         }
 
         internal static byte[] BuildPCUpsertBody(string pcName, string agentVersion, long keyEpoch)
@@ -840,26 +858,112 @@ namespace TermLink.Agent
             });
         }
 
+        internal static byte[] BuildPCAgentUpsertBodyWithTerminalCommands(
+            string pcName,
+            string agentVersion,
+            long keyEpoch,
+            string platformVersion,
+            string architecture,
+            bool terminalSnapshotCapable,
+            string[] supportedShells,
+            TerminalCommandCapability[] terminalCommands)
+        {
+            if (string.IsNullOrWhiteSpace(platformVersion) || Encoding.UTF8.GetByteCount(platformVersion) > 160)
+                throw new ArgumentException("A bounded platform version is required.", nameof(platformVersion));
+            if (architecture != "x64" && architecture != "arm64")
+                throw new ArgumentException("A supported PC architecture is required.", nameof(architecture));
+            var validationBody = BuildPCUpsertBodyWithTerminalCommands(
+                pcName, agentVersion, keyEpoch, supportedShells, terminalCommands);
+            CryptographicOperations.ZeroMemory(validationBody);
+            var capabilities = new List<string>
+            {
+                "realtime_terminal_v1",
+                "file_operations_v1",
+                "terminal_commands_v1",
+                "remote_agent_update_v1"
+            };
+            if (terminalSnapshotCapable) capabilities.Insert(1, "terminal_snapshot_v1");
+            var normalizedCommands = terminalCommands.Select(command => new
+            {
+                id = command.Id,
+                display_name = command.DisplayName,
+                shell_type = command.ShellType,
+                source = command.Source
+            }).ToArray();
+            return JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                name = pcName,
+                agent_version = agentVersion,
+                key_epoch = keyEpoch,
+                platform = "windows",
+                architecture,
+                platform_version = platformVersion,
+                capabilities,
+                session_heartbeat_capable = true,
+                supported_shells = supportedShells.Distinct(StringComparer.Ordinal).ToArray(),
+                terminal_commands = normalizedCommands,
+                remote_agent_update_capable = true
+            });
+        }
+
         private async Task UpsertPCAsync(CancellationToken token)
         {
-            var body = BuildPCUpsertBodyWithTerminalCommands(
+            var legacyBody = BuildPCUpsertBodyWithTerminalCommands(
                 config.PcName,
                 config.AgentVersion,
                 config.KeyEpoch,
                 ManagedTerminalLauncher.DetectSupportedShellTypes(),
                 ManagedTerminalLauncher.DetectTerminalCommandCapabilities());
+            var body = BuildPCAgentUpsertBodyWithTerminalCommands(
+                config.PcName,
+                config.AgentVersion,
+                config.KeyEpoch,
+                RuntimeInformation.OSDescription,
+                PCAgentArchitecture(RuntimeInformation.OSArchitecture),
+                terminalSnapshotEnabled,
+                ManagedTerminalLauncher.DetectSupportedShellTypes(),
+                ManagedTerminalLauncher.DetectTerminalCommandCapabilities());
             try
             {
-                using var response = await SendAsync(
+                var response = await SendAsync(
                     HttpMethod.Put,
                     "/v1/pcs/" + config.PcId.ToString("D"),
                     body,
                     true,
                     PCUpsertIdempotencyKey(config.PcId, body),
                     token).ConfigureAwait(false);
-                await EnsureServerSuccessAsync(response, "PC_UPSERT", token).ConfigureAwait(false);
+                var errorCode = response.StatusCode == HttpStatusCode.BadRequest
+                    ? await ReadServerErrorCodeAsync(response, token).ConfigureAwait(false)
+                    : string.Empty;
+                if (response.StatusCode == HttpStatusCode.BadRequest && errorCode == "INVALID_REQUEST")
+                {
+                    response.Dispose();
+                    response = await SendAsync(
+                        HttpMethod.Put,
+                        "/v1/pcs/" + config.PcId.ToString("D"),
+                        legacyBody,
+                        true,
+                        PCUpsertIdempotencyKey(config.PcId, legacyBody),
+                        token).ConfigureAwait(false);
+                }
+                using (response)
+                    await EnsureServerSuccessAsync(response, "PC_UPSERT", token).ConfigureAwait(false);
             }
-            finally { CryptographicOperations.ZeroMemory(body); }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(body);
+                CryptographicOperations.ZeroMemory(legacyBody);
+            }
+        }
+
+        private static string PCAgentArchitecture(Architecture architecture)
+        {
+            return architecture switch
+            {
+                Architecture.X64 => "x64",
+                Architecture.Arm64 => "arm64",
+                _ => throw new PlatformNotSupportedException("TermLink PC Agent requires x64 or arm64.")
+            };
         }
 
         internal static bool IsPCHeartbeatDue(
@@ -893,10 +997,19 @@ namespace TermLink.Agent
         private static async Task EnsureServerSuccessAsync(HttpResponseMessage response, string operation, CancellationToken token)
         {
             if (response.IsSuccessStatusCode) return;
+            var code = await ReadServerErrorCodeAsync(response, token).ConfigureAwait(false);
+            throw new ProductionServerResponseException(
+                response.StatusCode,
+                string.IsNullOrWhiteSpace(code) ? operation : operation + "_" + code);
+        }
+
+        private static async Task<string> ReadServerErrorCodeAsync(HttpResponseMessage response, CancellationToken token)
+        {
             var code = string.Empty;
+            byte[] bytes = null;
             try
             {
-                var bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
+                bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
                 if (bytes.Length <= 64 * 1024)
                 {
                     using var document = JsonDocument.Parse(bytes);
@@ -920,14 +1033,15 @@ namespace TermLink.Agent
                         }
                     }
                 }
-                CryptographicOperations.ZeroMemory(bytes);
             }
             catch (JsonException)
             {
             }
-            throw new ProductionServerResponseException(
-                response.StatusCode,
-                string.IsNullOrWhiteSpace(code) ? operation : operation + "_" + code);
+            finally
+            {
+                if (bytes != null) CryptographicOperations.ZeroMemory(bytes);
+            }
+            return code;
         }
 
         private async Task ConnectAndPumpAsync(CancellationToken token)

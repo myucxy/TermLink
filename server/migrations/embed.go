@@ -8,7 +8,7 @@ import "embed"
 // TestEmbeddedMigrationsAreOrderedAndStable requires the newest embedded file
 // to match it, preventing a migration from making the deployed server reject
 // the schema it just applied.
-const LatestVersion int64 = 22
+const LatestVersion int64 = 23
 
 // Files contains all versioned up/down migration scripts.
 //

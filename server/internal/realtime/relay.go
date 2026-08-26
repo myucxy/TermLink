@@ -188,7 +188,7 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		closeSocket(socket, websocket.ClosePolicyViolation, "unsupported role or capabilities")
 		return
 	}
-	if hello.Role == "pc" && principal.Device.Type != "WINDOWS_PC" || hello.Role == "android" && principal.Device.Type != "ANDROID" {
+	if hello.Role == "pc" && !store.IsPCAgentDeviceType(principal.Device.Type) || hello.Role == "android" && principal.Device.Type != "ANDROID" {
 		closeSocket(socket, websocket.ClosePolicyViolation, "role does not match device")
 		return
 	}

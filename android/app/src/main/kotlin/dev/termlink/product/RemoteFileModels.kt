@@ -3,6 +3,7 @@ package dev.termlink.product
 import android.annotation.SuppressLint
 import android.content.Context
 import dev.termlink.model.PcSummary
+import dev.termlink.model.PcCapabilityIds
 import java.time.Instant
 import java.security.MessageDigest
 import java.util.Locale
@@ -96,11 +97,17 @@ enum class RemoteShellType(val wireValue: String) {
 
 /** Maps only server/Agent-authoritative capabilities in a stable UX order. */
 internal fun supportedRemoteShellTypes(pc: PcSummary): List<RemoteShellType> =
-    RemoteShellType.entries.filter { shell -> shell.wireValue in pc.supportedShells }
+    if (pc.capabilities.isNotEmpty() && PcCapabilityIds.TERMINAL_COMMANDS_V1 !in pc.capabilities) {
+        emptyList()
+    } else {
+        RemoteShellType.entries.filter { shell -> shell.wireValue in pc.supportedShells }
+    }
 
 /** Uses standardized Agent capabilities and falls back only for pre-capability Agents. */
 internal fun supportedRemoteTerminalCommands(pc: PcSummary): List<TerminalCommandCapability> =
-    if (pc.terminalCommands.isNotEmpty()) {
+    if (pc.capabilities.isNotEmpty() && PcCapabilityIds.TERMINAL_COMMANDS_V1 !in pc.capabilities) {
+        emptyList()
+    } else if (pc.terminalCommands.isNotEmpty()) {
         pc.terminalCommands
     } else {
         supportedRemoteShellTypes(pc).map { shell ->

@@ -30,6 +30,7 @@ import dev.termlink.model.CatalogPlan
 import dev.termlink.model.DeviceSummary
 import dev.termlink.model.DeviceTrustState
 import dev.termlink.model.DeviceType
+import dev.termlink.model.isPcAgent
 import dev.termlink.model.Entitlement
 import dev.termlink.model.HistoryObject
 import dev.termlink.model.PcSummary
@@ -1256,7 +1257,7 @@ internal class ProductionProductRepository(
         val pc = product.pcs.firstOrNull { it.id == summary.pcId }
             ?: throw sessionOpenException(SessionOpenFailureCode.PC_UNAVAILABLE)
         val pcDevice = product.devices.firstOrNull {
-            it.id == pc.deviceId && it.type == DeviceType.WINDOWS_PC && it.trustState == DeviceTrustState.TRUSTED
+            it.id == pc.deviceId && it.type.isPcAgent() && it.trustState == DeviceTrustState.TRUSTED
         } ?: throw sessionOpenException(SessionOpenFailureCode.PC_NOT_TRUSTED)
         if (pcDevice.exchangePublicKey.size != 32) {
             throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
@@ -1689,7 +1690,7 @@ internal class ProductionProductRepository(
         val session = product.sessions.firstOrNull { it.id == entry.sessionId } ?: error("The history session is unavailable")
         val pc = product.pcs.firstOrNull { it.id == session.pcId } ?: error("The history PC is unavailable")
         val pcDevice = product.devices.firstOrNull {
-            it.id == pc.deviceId && it.type == DeviceType.WINDOWS_PC && it.trustState == DeviceTrustState.TRUSTED
+            it.id == pc.deviceId && it.type.isPcAgent() && it.trustState == DeviceTrustState.TRUSTED
         } ?: error("The history PC is not trusted")
         val stored = identity()
         val historyEpoch = historyKeyEpoch(stored.deviceId, entry.historyObject.keyId)
@@ -2303,7 +2304,7 @@ internal class ProductionProductRepository(
             .filter { pc ->
                 devices.any { device ->
                     device.id == pc.deviceId &&
-                        device.type == DeviceType.WINDOWS_PC &&
+                        device.type.isPcAgent() &&
                         device.trustState == DeviceTrustState.TRUSTED
                 }
             }
@@ -2381,7 +2382,7 @@ internal class ProductionProductRepository(
             .filter { pc ->
                 devices.any { device ->
                     device.id == pc.deviceId &&
-                        device.type == DeviceType.WINDOWS_PC &&
+                        device.type.isPcAgent() &&
                         device.trustState == DeviceTrustState.TRUSTED
                 }
             }
@@ -2447,7 +2448,7 @@ internal class ProductionProductRepository(
                 val sealed = session.encryptedTitle ?: return@forEach
                 val pc = pcsById[session.pcId] ?: return@forEach
                 val pcDevice = devicesById[pc.deviceId] ?: return@forEach
-                if (pcDevice.type != DeviceType.WINDOWS_PC ||
+                if (!pcDevice.type.isPcAgent() ||
                     pcDevice.trustState != DeviceTrustState.TRUSTED ||
                     pcDevice.exchangePublicKey.size != 32 || pc.keyEpoch < 1
                 ) {
@@ -2925,7 +2926,7 @@ internal class ProductionProductRepository(
             val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@forEach
             val device = devices.firstOrNull {
                 it.id == pc.deviceId &&
-                    it.type == DeviceType.WINDOWS_PC &&
+                    it.type.isPcAgent() &&
                     it.trustState == DeviceTrustState.TRUSTED
             } ?: return@forEach
             live.client.rotateKeyMaterial(pc.keyEpoch, device.exchangePublicKey)
@@ -2948,7 +2949,7 @@ internal class ProductionProductRepository(
                 val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@forEach
                 val device = devices.firstOrNull {
                     it.id == pc.deviceId &&
-                        it.type == DeviceType.WINDOWS_PC &&
+                        it.type.isPcAgent() &&
                         it.trustState == DeviceTrustState.TRUSTED
                 } ?: return@forEach
                 live.client.validateKeyMaterialUpdate(pc.keyEpoch, device.exchangePublicKey)
@@ -2961,7 +2962,7 @@ internal class ProductionProductRepository(
                 .filter { pc ->
                     devices.any { device ->
                         device.id == pc.deviceId &&
-                            device.type == DeviceType.WINDOWS_PC &&
+                            device.type.isPcAgent() &&
                             device.trustState == DeviceTrustState.TRUSTED
                     }
                 }
@@ -2993,7 +2994,7 @@ internal class ProductionProductRepository(
             val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@forEach
             val device = devices.firstOrNull {
                 it.id == pc.deviceId &&
-                    it.type == DeviceType.WINDOWS_PC &&
+                    it.type.isPcAgent() &&
                     it.trustState == DeviceTrustState.TRUSTED
             } ?: return@forEach
             live.client.validateKeyMaterialUpdate(pc.keyEpoch, device.exchangePublicKey)
@@ -3087,7 +3088,7 @@ internal class ProductionProductRepository(
             val pc = product.pcs.firstOrNull { it.id == session.pcId }
                 ?: error("The transcript PC is unavailable")
             val pcDevice = product.devices.firstOrNull {
-                it.id == pc.deviceId && it.type == DeviceType.WINDOWS_PC && it.trustState == DeviceTrustState.TRUSTED
+                it.id == pc.deviceId && it.type.isPcAgent() && it.trustState == DeviceTrustState.TRUSTED
             } ?: error("The transcript PC is not a trusted device")
             val stored = identity()
             // Always fetch the authenticated selector before consulting Room.
@@ -3516,22 +3517,14 @@ internal class ProductionProductRepository(
         createdAt = instant("created_at"),
     )
 
-    private fun JsonObject.toPc() = PcSummary(
-        id = UUID.fromString(requiredString("id")),
-        deviceId = UUID.fromString(requiredString("device_id")),
-        name = requiredString("name"),
-        agentVersion = requiredString("agent_version"),
-        keyEpoch = getValue("key_epoch").jsonPrimitive.long,
-        remoteRoutingEnabled = getValue("remote_routing_enabled").jsonPrimitive.boolean,
-        online = authoritativePcOnline(this),
-        lastSeenAt = optionalInstant("last_seen_at"),
-        supportedShells = get("supported_shells")?.jsonArray
+    private fun JsonObject.toPc(): PcSummary {
+        val supportedShells = get("supported_shells")?.jsonArray
             ?.mapNotNull { value -> value.jsonPrimitive.contentOrNull }
             ?.filterTo(linkedSetOf()) { value ->
                 RemoteShellType.entries.any { shell -> shell.wireValue == value }
             }
-            .orEmpty(),
-        terminalCommands = get("terminal_commands")?.jsonArray
+            .orEmpty()
+        val terminalCommands = get("terminal_commands")?.jsonArray
             ?.map { value ->
                 val command = value.jsonObject
                 dev.termlink.model.TerminalCommandCapability(
@@ -3558,9 +3551,41 @@ internal class ProductionProductRepository(
             ?.also { commands ->
                 require(commands.size <= 24 && commands.distinctBy { command -> command.id }.size == commands.size)
             }
-            .orEmpty(),
-        remoteAgentUpdateCapable = get("remote_agent_update_capable")?.jsonPrimitive?.booleanOrNull ?: false,
-    )
+            .orEmpty()
+        val legacyRemoteUpdate = get("remote_agent_update_capable")?.jsonPrimitive?.booleanOrNull ?: false
+        val capabilities = get("capabilities")?.jsonArray
+            ?.map { value -> value.jsonPrimitive.content }
+            ?.also { values ->
+                require(values.size <= 64 && values.distinct().size == values.size)
+                require(values.all { it.matches(Regex("[a-z][a-z0-9._-]{0,63}")) })
+            }
+            ?.toSet()
+            ?: buildSet {
+                add(dev.termlink.model.PcCapabilityIds.REALTIME_TERMINAL_V1)
+                add(dev.termlink.model.PcCapabilityIds.FILE_OPERATIONS_V1)
+                if (terminalCommands.isNotEmpty() || supportedShells.isNotEmpty()) {
+                    add(dev.termlink.model.PcCapabilityIds.TERMINAL_COMMANDS_V1)
+                }
+                if (legacyRemoteUpdate) add(dev.termlink.model.PcCapabilityIds.REMOTE_AGENT_UPDATE_V1)
+            }
+        return PcSummary(
+            id = UUID.fromString(requiredString("id")),
+            deviceId = UUID.fromString(requiredString("device_id")),
+            name = requiredString("name"),
+            agentVersion = requiredString("agent_version"),
+            keyEpoch = getValue("key_epoch").jsonPrimitive.long,
+            remoteRoutingEnabled = getValue("remote_routing_enabled").jsonPrimitive.boolean,
+            online = authoritativePcOnline(this),
+            lastSeenAt = optionalInstant("last_seen_at"),
+            platform = get("platform")?.jsonPrimitive?.contentOrNull ?: "windows",
+            architecture = get("architecture")?.jsonPrimitive?.contentOrNull ?: "unknown",
+            platformVersion = get("platform_version")?.jsonPrimitive?.contentOrNull ?: "legacy",
+            capabilities = capabilities,
+            supportedShells = supportedShells,
+            terminalCommands = terminalCommands,
+            remoteAgentUpdateCapable = dev.termlink.model.PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in capabilities,
+        )
+    }
 
     private fun JsonObject.toAgentUpdateEligibility(pcId: UUID): AgentUpdateEligibility {
         val eligible = getValue("eligible").jsonPrimitive.boolean
@@ -4633,7 +4658,7 @@ internal class ProductionProductRepository(
                 val pc = product.pcs.firstOrNull { it.id == session.pcId } ?: return
                 val pcDevice = product.devices.firstOrNull {
                     it.id == pc.deviceId &&
-                        it.type == DeviceType.WINDOWS_PC &&
+                        it.type.isPcAgent() &&
                         it.trustState == DeviceTrustState.TRUSTED
                 } ?: return
                 val activeGap = live.client.sessionState.value as? RemoteSessionState.HistoryGap ?: return

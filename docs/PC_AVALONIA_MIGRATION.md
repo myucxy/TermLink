@@ -120,6 +120,17 @@ logical core and 80.46 MiB private memory, Agent at 0% and 8.78 MiB, and 89.24 M
 
 Exit: new and legacy clients coexist against the same server and migration rollback is tested.
 
+Implementation note (2026-08-26): migration 23 expands the device constraint with `PC_AGENT` and adds
+bounded `platform`, `architecture`, `platform_version`, and capability fields without rewriting existing
+device or PC UUIDs. Existing `WINDOWS_PC` registrations retain a compatibility path; new Windows Agents
+prefer `PC_AGENT` and retry the pre-P5 registration/upsert contract only when an older server explicitly
+rejects the new shape. The V1 device-list response projects `PC_AGENT` as `WINDOWS_PC` for released Android
+closed enums while `/v1/pcs` is authoritative for platform and capabilities. File operations, terminal
+commands, and Windows remote Agent update now require their advertised capability, rather than inferring
+eligibility from a device label. Android Room migration 5-to-6 preserves the encrypted local history cache
+and adds only non-sensitive platform/capability metadata. See
+`docs/validation/pc-avalonia-p5-generic-agent.json`.
+
 ### P6 - Linux Agent
 
 - Implement PTY, process groups, resize, signals, terminal discovery, filesystem rules, Secret Service,

@@ -13,6 +13,33 @@ import org.robolectric.annotation.Config
 @Config(sdk = [26])
 class TermLinkDatabaseMigrationTest {
     @Test
+    fun migrateV5ToV6PreservesPcAndInitializesLegacyPlatformMetadata() {
+        createDatabaseAtVersion(5) {
+            execSQL(
+                """
+                INSERT INTO pcs(id, deviceId, name, agentVersion, keyEpoch, remoteRoutingEnabled, online, lastSeenAtEpochMillis)
+                VALUES ('pc-v5', 'device-v5', 'legacy-pc', '0.1.32.38', 7, 1, 1, 1234)
+                """.trimIndent(),
+            )
+        }
+        val migrated = openMigratedDatabase()
+        try {
+            migrated.openHelper.writableDatabase.query(
+                "SELECT platform, architecture, platformVersion, capabilitiesCsv, keyEpoch FROM pcs WHERE id='pc-v5'",
+            ).use { cursor ->
+                check(cursor.moveToFirst())
+                assertEquals("windows", cursor.getString(0))
+                assertEquals("unknown", cursor.getString(1))
+                assertEquals("legacy", cursor.getString(2))
+                assertEquals("", cursor.getString(3))
+                assertEquals(7L, cursor.getLong(4))
+            }
+        } finally {
+            migrated.close()
+        }
+    }
+
+    @Test
     fun migrateV4ToV5AddsEmptyEncryptedTranscriptCacheWithoutChangingExistingRows() {
         createDatabaseAtVersion(4) {
             execSQL(
@@ -153,18 +180,25 @@ class TermLinkDatabaseMigrationTest {
         val database = seed.openHelper.writableDatabase
         when (version) {
             1 -> {
+                downgradeV6ToV5(database)
                 downgradeV5ToV4(database)
                 downgradeV4ToV1(database)
             }
             2 -> {
+                downgradeV6ToV5(database)
                 downgradeV5ToV4(database)
                 downgradeV4ToV2(database)
             }
             3 -> {
+                downgradeV6ToV5(database)
                 downgradeV5ToV4(database)
                 downgradeV4ToV3(database)
             }
-            4 -> downgradeV5ToV4(database)
+            4 -> {
+                downgradeV6ToV5(database)
+                downgradeV5ToV4(database)
+            }
+            5 -> downgradeV6ToV5(database)
             else -> error("Unsupported test database version: $version")
         }
         database.insertRows()
@@ -179,11 +213,41 @@ class TermLinkDatabaseMigrationTest {
                 TermLinkDatabase.MIGRATION_2_3,
                 TermLinkDatabase.MIGRATION_3_4,
                 TermLinkDatabase.MIGRATION_4_5,
+                TermLinkDatabase.MIGRATION_5_6,
             )
             .allowMainThreadQueries()
             .build()
         migrated.openHelper.writableDatabase
         return migrated
+    }
+
+    private fun downgradeV6ToV5(database: SupportSQLiteDatabase) {
+        database.execSQL(
+            """
+            CREATE TABLE pcs_v5 (
+                id TEXT NOT NULL,
+                deviceId TEXT NOT NULL,
+                name TEXT NOT NULL,
+                agentVersion TEXT NOT NULL,
+                keyEpoch INTEGER NOT NULL,
+                remoteRoutingEnabled INTEGER NOT NULL,
+                online INTEGER NOT NULL,
+                lastSeenAtEpochMillis INTEGER,
+                PRIMARY KEY(id)
+            )
+            """.trimIndent(),
+        )
+        database.execSQL(
+            """
+            INSERT INTO pcs_v5(id, deviceId, name, agentVersion, keyEpoch, remoteRoutingEnabled, online, lastSeenAtEpochMillis)
+            SELECT id, deviceId, name, agentVersion, keyEpoch, remoteRoutingEnabled, online, lastSeenAtEpochMillis FROM pcs
+            """.trimIndent(),
+        )
+        database.execSQL("DROP TABLE pcs")
+        database.execSQL("ALTER TABLE pcs_v5 RENAME TO pcs")
+        database.execSQL("CREATE INDEX index_pcs_deviceId ON pcs(deviceId)")
+        database.execSQL("CREATE INDEX index_pcs_online_lastSeenAtEpochMillis ON pcs(online, lastSeenAtEpochMillis)")
+        setRoomVersion(database, 5, V5_IDENTITY_HASH)
     }
 
     private fun downgradeV5ToV4(database: SupportSQLiteDatabase) {
@@ -287,5 +351,6 @@ class TermLinkDatabaseMigrationTest {
         const val V2_IDENTITY_HASH = "db77fd61744b9b1bd762519fc91e1618"
         const val V3_IDENTITY_HASH = "1ff9378e8357f8db649a79c32492baec"
         const val V4_IDENTITY_HASH = "5256cfab24318a815b71dfa8dcbdca0e"
+        const val V5_IDENTITY_HASH = "67871d1456c2ccef2e9d2d23526a07c3"
     }
 }

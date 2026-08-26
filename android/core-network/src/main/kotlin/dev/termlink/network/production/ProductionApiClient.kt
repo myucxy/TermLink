@@ -31,7 +31,7 @@ class ProductionApiClient(
     private val json = Json { ignoreUnknownKeys = false; explicitNulls = false }
 
     fun registerDevice(type: String, name: String, keyId: String): JsonElement {
-        require(type == "WINDOWS_PC" || type == "ANDROID")
+        require(type == "WINDOWS_PC" || type == "PC_AGENT" || type == "ANDROID")
         val timestamp = System.currentTimeMillis()
         val nonceBytes = ByteArray(16).also(java.security.SecureRandom()::nextBytes)
         val nonce = DeviceProof.base64Url(nonceBytes)

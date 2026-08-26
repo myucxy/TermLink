@@ -14,6 +14,7 @@ import dev.termlink.database.TranscriptPageEntity
 import dev.termlink.model.DeviceSummary
 import dev.termlink.model.DeviceTrustState
 import dev.termlink.model.DeviceType
+import dev.termlink.model.isPcAgent
 import dev.termlink.model.HistoryObject
 import dev.termlink.model.PcSummary
 import dev.termlink.model.SessionState
@@ -244,7 +245,7 @@ class HistoryRepository(
             val nextDevice = requireNotNull(nextDevices[summary.deviceId]) {
                 "authoritative PC metadata is missing its device key"
             }
-            require(nextDevice.type == DeviceType.WINDOWS_PC) { "PC metadata references a non-PC device" }
+            require(nextDevice.type.isPcAgent()) { "PC metadata references a non-PC device" }
         }
         database.withTransaction {
             deviceSummaries.forEach { summary ->
@@ -335,6 +336,10 @@ class HistoryRepository(
             remoteRoutingEnabled = entity.remoteRoutingEnabled,
             online = entity.online,
             lastSeenAt = entity.lastSeenAtEpochMillis?.let(Instant::ofEpochMilli),
+            platform = entity.platform,
+            architecture = entity.architecture,
+            platformVersion = entity.platformVersion,
+            capabilities = entity.capabilitiesCsv.split(',').filter(String::isNotBlank).toSet(),
         )
     }
 
@@ -1045,6 +1050,10 @@ class HistoryRepository(
         remoteRoutingEnabled = summary.remoteRoutingEnabled,
         online = summary.online,
         lastSeenAtEpochMillis = summary.lastSeenAt?.toEpochMilli(),
+        platform = summary.platform,
+        architecture = summary.architecture,
+        platformVersion = summary.platformVersion,
+        capabilitiesCsv = summary.capabilities.sorted().joinToString(","),
     )
 
     private fun eventChunkEntity(
