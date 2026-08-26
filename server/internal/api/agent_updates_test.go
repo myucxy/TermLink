@@ -94,6 +94,22 @@ func TestObservedAgentIdentityRequiresMatchingBuild(t *testing.T) {
 	}
 }
 
+func TestRemoteAgentUpdateBootstrapBuildBoundary(t *testing.T) {
+	if minimumRemoteAgentUpdateBuild != 47 {
+		t.Fatalf("minimum remote Agent update build=%d, want 47", minimumRemoteAgentUpdateBuild)
+	}
+	for _, build := range []int64{0, 45, 46} {
+		if remoteAgentUpdateBootstrapCapable(build) {
+			t.Fatalf("known broken downloader build %d was accepted", build)
+		}
+	}
+	for _, build := range []int64{47, 48, 100} {
+		if !remoteAgentUpdateBootstrapCapable(build) {
+			t.Fatalf("fixed downloader build %d was rejected", build)
+		}
+	}
+}
+
 type fakeAgentUpdateStore struct {
 	active          *store.AgentUpdateRecord
 	activeCalls     int

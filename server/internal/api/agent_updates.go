@@ -20,6 +20,10 @@ import (
 const (
 	agentUpdateLeaseDuration = 30 * time.Minute
 	agentUpdateLifetime      = 2 * time.Hour
+	// Builds before 47 keep the downloaded Setup open with FileShare.None
+	// while promoting it, so every Windows remote update fails before install.
+	// They require one manual Windows-side bootstrap to a fixed build.
+	minimumRemoteAgentUpdateBuild = int64(47)
 )
 
 var agentUpdateErrorCodePattern = regexp.MustCompile(`^[A-Z0-9_]{1,64}$`)
@@ -81,6 +85,14 @@ func (a *API) getAgentUpdateEligibility(w http.ResponseWriter, r *http.Request) 
 		})
 		return
 	}
+	if !remoteAgentUpdateBootstrapCapable(currentBuild) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"eligible": false, "reason_code": "AGENT_VERSION_UNSUPPORTED",
+			"current_version": pc.AgentVersion, "current_build": currentBuild,
+			"active_session_count": sessions,
+		})
+		return
+	}
 	if a.AgentUpdateCatalog == nil {
 		writeError(w, r, http.StatusServiceUnavailable, "AGENT_UPDATE_CATALOG_UNAVAILABLE", agentupdate.ErrUnavailable)
 		return
@@ -134,6 +146,10 @@ func (a *API) createAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	if err != nil || !pc.Online || !pc.RemoteRoutingEnabled || pc.Platform != store.PCPlatformWindows ||
 		!store.HasPCCapability(pc.Capabilities, store.PCCapabilityRemoteAgentUpdateV1) {
 		writeError(w, r, http.StatusConflict, "REMOTE_UPDATE_UNAVAILABLE", store.ErrConflict)
+		return
+	}
+	if !remoteAgentUpdateBootstrapCapable(currentBuild) {
+		writeError(w, r, http.StatusConflict, "AGENT_VERSION_UNSUPPORTED", store.ErrConflict)
 		return
 	}
 	if a.AgentUpdateCatalog == nil {
@@ -385,6 +401,10 @@ func (a *API) completeAgentUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"agent_update": agentUpdateView(item, true)})
+}
+
+func remoteAgentUpdateBootstrapCapable(currentBuild int64) bool {
+	return currentBuild >= minimumRemoteAgentUpdateBuild
 }
 
 func validObservedAgentIdentity(version *string, build *int64) bool {
