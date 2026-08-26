@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
 using TermLink.WindowsIntegration;
 
 namespace TermLink.Platform.Windows;
@@ -10,6 +12,7 @@ namespace TermLink.Platform.Windows;
 /// </summary>
 public sealed class WindowsDesktopOperations : IDesktopOperations
 {
+    private const long MaximumUpdateResultBytes = 64 * 1024;
     private readonly string installationRoot;
     private readonly string localApplicationData;
 
@@ -25,7 +28,9 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
 
     public static WindowsDesktopOperations CreateDefault() => new(AppContext.BaseDirectory);
 
-    public ValueTask<string> CheckForUpdatesAsync(CancellationToken cancellationToken)
+    public async ValueTask<DesktopUpdateStatus> CheckForUpdatesAsync(
+        bool interactive,
+        CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var rollbackUi = Path.Combine(installationRoot, "TermLink.Legacy.exe");
@@ -36,6 +41,9 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
                 rollbackUi);
         }
 
+        var resultDirectory = Path.Combine(localApplicationData, "TermLink", "UpdateChecks");
+        Directory.CreateDirectory(resultDirectory);
+        var resultPath = Path.Combine(resultDirectory, $"desktop-{Guid.NewGuid():N}.json");
         var start = new ProcessStartInfo
         {
             FileName = rollbackUi,
@@ -43,9 +51,49 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
             WorkingDirectory = installationRoot,
         };
         start.ArgumentList.Add("--check-update");
-        using var process = Process.Start(start) ??
-            throw new InvalidOperationException("无法启动更新检查组件。");
-        return ValueTask.FromResult("已打开安全更新检查；安装前仍会验证签名和 SHA-256。");
+        if (!interactive) start.ArgumentList.Add("--check-update-silent");
+        start.ArgumentList.Add("--check-update-result-json");
+        start.ArgumentList.Add(resultPath);
+        try
+        {
+            using var process = Process.Start(start) ??
+                throw new InvalidOperationException("无法启动更新检查组件。");
+            if (interactive)
+            {
+                // The user-visible signed updater owns its lifecycle once it is
+                // shown. Never translate an Avalonia command cancellation into
+                // terminating a Setup process the user has already accepted.
+                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            else
+            {
+                try
+                {
+                    await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    TryStopUpdateCheck(process);
+                    throw;
+                }
+            }
+            if (!File.Exists(resultPath))
+            {
+                throw new InvalidDataException(
+                    $"更新检查组件未返回结构化结果（退出码 {process.ExitCode}）。");
+            }
+            var info = new FileInfo(resultPath);
+            if (info.Length <= 0 || info.Length > MaximumUpdateResultBytes)
+                throw new InvalidDataException("更新检查组件返回的结果大小无效。");
+            var json = await File.ReadAllTextAsync(resultPath, Encoding.UTF8, cancellationToken)
+                .ConfigureAwait(false);
+            return ParseUpdateStatus(json);
+        }
+        finally
+        {
+            TryDeleteResult(resultPath);
+        }
     }
 
     public ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken)
@@ -79,5 +127,67 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
             throw new ArgumentException("Directory is required.", parameterName);
         return Path.GetFullPath(value).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
             Path.DirectorySeparatorChar;
+    }
+
+    internal static DesktopUpdateStatus ParseUpdateStatus(string json)
+    {
+        UpdateResultDocument? document;
+        try
+        {
+            document = JsonSerializer.Deserialize<UpdateResultDocument>(json, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true,
+            });
+        }
+        catch (JsonException error)
+        {
+            throw new InvalidDataException("更新检查组件返回了无效 JSON。", error);
+        }
+        if (document is null || document.SchemaVersion != 1 ||
+            !Enum.TryParse<DesktopUpdateDecision>(document.Decision, true, out var decision))
+        {
+            throw new InvalidDataException("更新检查组件返回了不支持的结果格式。");
+        }
+        if (document.BuildNumber is < 0)
+            throw new InvalidDataException("更新检查组件返回了无效构建号。");
+        return new DesktopUpdateStatus(
+            decision,
+            NormalizeField(document.VersionName),
+            document.BuildNumber,
+            NormalizeField(document.ReleaseNotes),
+            NormalizeField(document.Message));
+    }
+
+    private static string? NormalizeField(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private static void TryStopUpdateCheck(Process process)
+    {
+        try
+        {
+            if (!process.HasExited) process.Kill(entireProcessTree: true);
+        }
+        catch (InvalidOperationException) { }
+        catch (System.ComponentModel.Win32Exception) { }
+    }
+
+    private static void TryDeleteResult(string path)
+    {
+        try
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    private sealed class UpdateResultDocument
+    {
+        public int SchemaVersion { get; set; }
+        public string? Decision { get; set; }
+        public string? VersionName { get; set; }
+        public long? BuildNumber { get; set; }
+        public string? ReleaseNotes { get; set; }
+        public string? Message { get; set; }
     }
 }

@@ -13,4 +13,7 @@
     <ProjectReference Include="..\..\..\win-agent\src\AgentControl\TermLink.AgentControl.csproj"
                       AdditionalProperties="Configuration=$(Configuration)" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="TermLink.Platform.Windows.Validation" />
+  </ItemGroup>
 </Project>

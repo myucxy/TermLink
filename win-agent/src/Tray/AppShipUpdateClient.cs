@@ -34,6 +34,37 @@ namespace TermLink.Tray
     }
 
     /// <summary>
+    /// Exports only the update fields the Avalonia About page can display. The
+    /// signed Legacy component retains artifact URLs, hashes, signer identity,
+    /// and all authority to download or launch Setup.
+    /// </summary>
+    internal static class WindowsUpdateResultExport
+    {
+        internal static string Serialize(WindowsUpdateResult result)
+        {
+            if (result == null) throw new ArgumentNullException(nameof(result));
+            return JsonSerializer.Serialize(
+                new
+                {
+                    schemaVersion = 1,
+                    decision = result.Decision.ToString(),
+                    versionName = Bounded(result.VersionName, 80),
+                    buildNumber = result.BuildNumber,
+                    releaseNotes = Bounded(result.ReleaseNotes, 32 * 1024),
+                    message = Bounded(result.Message, 1024)
+                },
+                new JsonSerializerOptions { WriteIndented = true });
+        }
+
+        private static string Bounded(string value, int maximumLength)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return null;
+            value = value.Trim();
+            return value.Length <= maximumLength ? value : value.Substring(0, maximumLength);
+        }
+    }
+
+    /// <summary>
     /// Enforces the HTTPS-only, bounded redirect policy shared by update checks
     /// and artifact downloads. Redirects are handled by application code so an
     /// AppShip response can never silently downgrade a request to HTTP.

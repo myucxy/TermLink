@@ -7,6 +7,21 @@ using TermLink.Platform.Windows;
 if (args.Length != 1 || !File.Exists(args[0]))
     throw new ArgumentException("Usage: WindowsAdapterValidation <TermLink.Agent.exe>");
 
+var appShipStatus = WindowsDesktopOperations.ParseUpdateStatus("""
+    {
+      "schemaVersion": 1,
+      "decision": "NoUpdate",
+      "versionName": "0.2.4",
+      "buildNumber": 45,
+      "releaseNotes": " AppShip adapter fixture ",
+      "message": "current"
+    }
+    """);
+Require(appShipStatus.Decision == DesktopUpdateDecision.NoUpdate &&
+        appShipStatus.BuildNumber == 45 &&
+        appShipStatus.ReleaseNotes == "AppShip adapter fixture",
+    "The Windows desktop adapter did not parse the bounded AppShip result contract.");
+
 var root = Path.Combine(Path.GetTempPath(), "TermLink-WindowsAdapter-" + Guid.NewGuid().ToString("N"));
 var localData = Path.Combine(root, "local-app-data");
 var buffer = Path.Combine(root, "buffer");

@@ -40,12 +40,29 @@ namespace TermLink.Tray
                 }
                 if (options.CheckUpdate)
                 {
-                    Application.EnableVisualStyles();
-                    Application.SetCompatibleTextRenderingDefault(false);
-                    var result = new WindowsUpdateWorkflow()
-                        .CheckAndOfferAsync(null, manual: true)
-                        .GetAwaiter()
-                        .GetResult();
+                    WindowsUpdateResult result;
+                    if (options.CheckUpdateSilent)
+                    {
+                        var current = typeof(Program).Assembly.GetName().Version ?? new Version(0, 0, 0, 0);
+                        result = AppShipUpdateClient.CheckAsync(
+                                AppShipUpdateClient.ConfiguredBaseUrl(),
+                                current)
+                            .GetAwaiter()
+                            .GetResult();
+                    }
+                    else
+                    {
+                        Application.EnableVisualStyles();
+                        Application.SetCompatibleTextRenderingDefault(false);
+                        result = new WindowsUpdateWorkflow()
+                            .CheckAndOfferAsync(null, manual: true)
+                            .GetAwaiter()
+                            .GetResult();
+                    }
+                    if (!string.IsNullOrEmpty(options.CheckUpdateResultJsonPath))
+                    {
+                        WriteUpdateResult(options.CheckUpdateResultJsonPath, result);
+                    }
                     return result.Decision == WindowsUpdateDecision.Error ||
                         result.Decision == WindowsUpdateDecision.NotConfigured
                         ? 1
@@ -115,7 +132,8 @@ namespace TermLink.Tray
                 WriteStartupFailure(error);
                 if (Array.IndexOf(args ?? Array.Empty<string>(), "--status-json") < 0 &&
                     Array.IndexOf(args ?? Array.Empty<string>(), "--shutdown-agent") < 0 &&
-                    Array.IndexOf(args ?? Array.Empty<string>(), "--restart-agent") < 0)
+                    Array.IndexOf(args ?? Array.Empty<string>(), "--restart-agent") < 0 &&
+                    Array.IndexOf(args ?? Array.Empty<string>(), "--check-update-silent") < 0)
                 {
                     MessageBox.Show(
                         TrayText.Pick(
@@ -127,6 +145,17 @@ namespace TermLink.Tray
                 }
                 return 125;
             }
+        }
+
+        private static void WriteUpdateResult(string path, WindowsUpdateResult result)
+        {
+            var destination = Path.GetFullPath(path);
+            var directory = Path.GetDirectoryName(destination);
+            if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+            File.WriteAllText(
+                destination,
+                WindowsUpdateResultExport.Serialize(result) + Environment.NewLine,
+                new UTF8Encoding(false));
         }
 
         private static void WriteStartupFailure(Exception error)
@@ -173,6 +202,8 @@ namespace TermLink.Tray
         public bool ShutdownAgent { get; private set; }
         public bool RestartAgent { get; private set; }
         public bool CheckUpdate { get; private set; }
+        public bool CheckUpdateSilent { get; private set; }
+        public string CheckUpdateResultJsonPath { get; private set; }
         public string UpdateConfigJsonPath { get; private set; }
 
         public static TrayOptions Parse(string[] args)
@@ -185,6 +216,8 @@ namespace TermLink.Tray
             var shutdown = false;
             var restart = false;
             var checkUpdate = false;
+            var checkUpdateSilent = false;
+            string checkUpdateResultJson = null;
             string updateConfigJson = null;
             for (var index = 0; index < args.Length; index++)
             {
@@ -197,6 +230,8 @@ namespace TermLink.Tray
                     case "--shutdown-agent": shutdown = true; break;
                     case "--restart-agent": restart = true; break;
                     case "--check-update": checkUpdate = true; break;
+                    case "--check-update-silent": checkUpdateSilent = true; break;
+                    case "--check-update-result-json": checkUpdateResultJson = Required(args, ref index, "--check-update-result-json"); break;
                     case "--update-config-json": updateConfigJson = Required(args, ref index, "--update-config-json"); break;
                     default: throw new ArgumentException("Unknown Tray argument: " + args[index]);
                 }
@@ -209,6 +244,10 @@ namespace TermLink.Tray
             if (!TrayInputValidation.TryNormalizeServerOrigin(serverUrl, out var serverOrigin))
             {
                 throw new ArgumentException("server URL must be an HTTPS origin");
+            }
+            if ((checkUpdateSilent || !string.IsNullOrEmpty(checkUpdateResultJson)) && !checkUpdate)
+            {
+                throw new ArgumentException("Update result options require --check-update.");
             }
             var commandCount = (shutdown ? 1 : 0) + (restart ? 1 : 0) + (checkUpdate ? 1 : 0) +
                 (!string.IsNullOrEmpty(updateConfigJson) ? 1 : 0) +
@@ -226,6 +265,8 @@ namespace TermLink.Tray
                 ShutdownAgent = shutdown,
                 RestartAgent = restart,
                 CheckUpdate = checkUpdate,
+                CheckUpdateSilent = checkUpdateSilent,
+                CheckUpdateResultJsonPath = checkUpdateResultJson,
                 UpdateConfigJsonPath = updateConfigJson
             };
         }

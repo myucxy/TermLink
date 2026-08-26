@@ -135,6 +135,9 @@ public sealed class SettingsPageViewModel : PageViewModel
     private string? editingCommandId;
     private bool commandEditorOpen;
     private bool hasUnsavedCommands;
+    private string releaseNotes = string.Empty;
+    private string releaseNotesTitle = PresentationText.AppShipReleaseNotes;
+    private string updateStatusText = PresentationText.UpdateNotChecked;
 
     public SettingsPageViewModel() : base("settings", PresentationText.Settings) { }
     public string Platform { get => platform; internal set => SetProperty(ref platform, value); }
@@ -145,7 +148,17 @@ public sealed class SettingsPageViewModel : PageViewModel
     public bool NewRunAsAdministrator { get => newRunAsAdministrator; set => SetProperty(ref newRunAsAdministrator, value); }
     public string ApplicationVersion { get; internal set; } = "1.0.0.0";
     public string Author { get; internal set; } = "清风惹尘丶";
-    public string ReleaseNotes { get; internal set; } = PresentationText.CurrentVersionReleaseNotes;
+    public string ReleaseNotes
+    {
+        get => releaseNotes;
+        internal set
+        {
+            if (SetProperty(ref releaseNotes, value)) RaisePropertyChanged(nameof(HasReleaseNotes));
+        }
+    }
+    public string ReleaseNotesTitle { get => releaseNotesTitle; internal set => SetProperty(ref releaseNotesTitle, value); }
+    public string UpdateStatusText { get => updateStatusText; internal set => SetProperty(ref updateStatusText, value); }
+    public bool HasReleaseNotes => !string.IsNullOrWhiteSpace(ReleaseNotes);
     public string? EditingCommandId { get => editingCommandId; internal set => SetProperty(ref editingCommandId, value); }
     public bool CommandEditorOpen { get => commandEditorOpen; internal set => SetProperty(ref commandEditorOpen, value); }
     public bool HasUnsavedCommands { get => hasUnsavedCommands; internal set => SetProperty(ref hasUnsavedCommands, value); }
@@ -179,6 +192,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private readonly IAppearanceController? appearanceController;
     private readonly IUiDispatcher dispatcher;
     private readonly INavigationTelemetry? navigationTelemetry;
+    private readonly CancellationTokenSource lifetimeCancellation = new();
+    private readonly SemaphoreSlim updateCheckLock = new(1, 1);
     private readonly Dictionary<string, PageViewModel> pages;
     private PageViewModel currentPage;
     private string settingsSection = "general";
@@ -292,7 +307,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         });
         SaveTerminalCommandsCommand = new AsyncCommand((_, cancellationToken) => SaveTerminalCommandsAsync(cancellationToken));
         CheckForUpdatesCommand = new AsyncCommand((_, cancellationToken) =>
-            RunDesktopOperationAsync(token => RequireDesktopOperations().CheckForUpdatesAsync(token), cancellationToken));
+            CheckForUpdatesAsync(interactive: true, showNotice: true, cancellationToken));
         OpenDiagnosticsDirectoryCommand = new AsyncCommand((_, cancellationToken) =>
             RunDesktopOperationAsync(token => RequireDesktopOperations().OpenDiagnosticsDirectoryAsync(token), cancellationToken));
         RepairTerminalIntegrationCommand = new AsyncCommand((_, cancellationToken) =>
@@ -397,7 +412,17 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public bool IsLoginMode => Account.FormMode == AccountFormMode.Login;
     public bool IsRegisterMode => Account.FormMode == AccountFormMode.Register;
 
-    public void Start() => stateStore.Start();
+    public void Start()
+    {
+        stateStore.Start();
+        if (desktopOperations is not null)
+        {
+            _ = CheckForUpdatesAsync(
+                interactive: false,
+                showNotice: false,
+                lifetimeCancellation.Token);
+        }
+    }
 
     public void Navigate(string? key)
     {
@@ -607,6 +632,83 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             await ShowFailureAsync(error);
         }
+    }
+
+    private async Task CheckForUpdatesAsync(
+        bool interactive,
+        bool showNotice,
+        CancellationToken cancellationToken)
+    {
+        var entered = false;
+        try
+        {
+            await updateCheckLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            entered = true;
+            if (showNotice)
+            {
+                await dispatcher.InvokeAsync(
+                    () => ShowNotice(UiNoticeSeverity.Info, PresentationText.CheckingUpdates, string.Empty),
+                    cancellationToken);
+            }
+            var status = await RequireDesktopOperations()
+                .CheckForUpdatesAsync(interactive, cancellationToken)
+                .ConfigureAwait(false);
+            await dispatcher.InvokeAsync(() =>
+            {
+                ApplyUpdateStatus(status);
+                if (!showNotice) return;
+                var severity = status.Decision switch
+                {
+                    DesktopUpdateDecision.Error => UiNoticeSeverity.Error,
+                    DesktopUpdateDecision.NotConfigured => UiNoticeSeverity.Warning,
+                    _ => UiNoticeSeverity.Success,
+                };
+                ShowNotice(
+                    severity,
+                    PresentationText.UpdateStatus(status),
+                    status.Message ?? string.Empty);
+            }, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // App shutdown or command cancellation owns this outcome.
+        }
+        catch (Exception error)
+        {
+            var failure = LocalizeFailure(ErrorCode(error), error.Message);
+            await dispatcher.InvokeAsync(() =>
+            {
+                ClearUpdateStatus(PresentationText.UpdateCheckFailed(failure.Detail));
+                if (showNotice)
+                {
+                    ShowNotice(
+                        UiNoticeSeverity.Error,
+                        PresentationText.OperationFailedTitle,
+                        failure.Detail,
+                        failure.Code);
+                }
+            }, CancellationToken.None);
+        }
+        finally
+        {
+            if (entered) updateCheckLock.Release();
+        }
+    }
+
+    private void ApplyUpdateStatus(DesktopUpdateStatus status)
+    {
+        Settings.UpdateStatusText = PresentationText.UpdateStatus(status);
+        Settings.ReleaseNotes = status.ReleaseNotes?.Trim() ?? string.Empty;
+        Settings.ReleaseNotesTitle = PresentationText.UpdateReleaseNotesTitle(
+            status.VersionName,
+            status.BuildNumber);
+    }
+
+    private void ClearUpdateStatus(string statusText)
+    {
+        Settings.UpdateStatusText = statusText;
+        Settings.ReleaseNotes = string.Empty;
+        Settings.ReleaseNotesTitle = PresentationText.AppShipReleaseNotes;
     }
 
     private IDesktopOperations RequireDesktopOperations() =>
@@ -930,8 +1032,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        lifetimeCancellation.Cancel();
         pendingConfirmation?.TrySetResult(false);
         stateStore.Changed -= StateChanged;
         await stateStore.DisposeAsync().ConfigureAwait(false);
+        lifetimeCancellation.Dispose();
     }
 }

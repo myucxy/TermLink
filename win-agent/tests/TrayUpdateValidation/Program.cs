@@ -4,6 +4,7 @@ using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Security.Cryptography;
+using System.Text.Json;
 using TermLink.Tray;
 
 namespace TermLink.Tray.UpdateValidation
@@ -17,6 +18,8 @@ namespace TermLink.Tray.UpdateValidation
             try
             {
                 ParsesAppShipArtifactContract();
+                ExportsBoundedDesktopUpdateStatus();
+                ParsesDesktopUpdateArguments();
                 UsesFourthVersionComponentAsAppShipBuild();
                 UsesBuildBoundUpdateChannel();
                 RejectsIncompleteOrWrongArtifactMetadata();
@@ -58,8 +61,52 @@ namespace TermLink.Tray.UpdateValidation
             Assert(result.Sha256 == hash && result.SignerFingerprint == signer, "valid response hashes");
             Assert(result.DownloadUrl == "https://updates.example.test/setup.exe", "valid response URL");
             var current = AppShipUpdateClient.ParseForValidation(json, 123);
-            Assert(current.Decision == WindowsUpdateDecision.NoUpdate, "stale response cannot downgrade current build");
+            Assert(current.Decision == WindowsUpdateDecision.NoUpdate && current.ReleaseNotes == "notes",
+                "stale response cannot downgrade current build and preserves AppShip notes");
             Cases.Add("appship_contract");
+        }
+
+        private static void ExportsBoundedDesktopUpdateStatus()
+        {
+            var json = WindowsUpdateResultExport.Serialize(new WindowsUpdateResult
+            {
+                Decision = WindowsUpdateDecision.NoUpdate,
+                VersionName = "0.2.4",
+                BuildNumber = 45,
+                ReleaseNotes = " AppShip export fixture ",
+                DownloadUrl = "https://updates.example.test/private-implementation-detail.exe",
+                Sha256 = new string('a', 64),
+                Message = "current"
+            });
+            using var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+            Assert(root.GetProperty("schemaVersion").GetInt32() == 1, "desktop export schema version");
+            Assert(root.GetProperty("releaseNotes").GetString() == "AppShip export fixture",
+                "desktop export release notes");
+            Assert(!root.TryGetProperty("downloadUrl", out _) && !root.TryGetProperty("sha256", out _),
+                "desktop export excludes update authority fields");
+            Cases.Add("desktop_update_export");
+        }
+
+        private static void ParsesDesktopUpdateArguments()
+        {
+            var resultPath = Path.Combine(Path.GetTempPath(), "termlink-update-result.json");
+            var options = TrayOptions.Parse(new[]
+            {
+                "--check-update",
+                "--check-update-silent",
+                "--check-update-result-json",
+                resultPath
+            });
+            Assert(options.CheckUpdate && options.CheckUpdateSilent &&
+                options.CheckUpdateResultJsonPath == resultPath,
+                "desktop update result arguments");
+            Expect<ArgumentException>(() => TrayOptions.Parse(new[]
+            {
+                "--check-update-result-json",
+                resultPath
+            }));
+            Cases.Add("desktop_update_arguments");
         }
 
         private static void UsesFourthVersionComponentAsAppShipBuild()

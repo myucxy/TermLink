@@ -106,6 +106,27 @@ public interface IPlatformNotification
     ValueTask ShowAsync(string title, string message, CancellationToken cancellationToken);
 }
 
+public enum DesktopUpdateDecision
+{
+    NotConfigured = 0,
+    NoUpdate = 1,
+    Optional = 2,
+    Required = 3,
+    Error = 4,
+}
+
+/// <summary>
+/// The bounded, display-safe part of an AppShip update response. Download
+/// locations and integrity metadata deliberately stay inside the signed update
+/// component instead of crossing into the desktop presentation process.
+/// </summary>
+public sealed record DesktopUpdateStatus(
+    DesktopUpdateDecision Decision,
+    string? VersionName,
+    long? BuildNumber,
+    string? ReleaseNotes,
+    string? Message);
+
 /// <summary>
 /// Desktop-shell operations which are intentionally kept outside Presentation.
 /// Implementations may open an operating-system surface, but must never take
@@ -113,7 +134,7 @@ public interface IPlatformNotification
 /// </summary>
 public interface IDesktopOperations
 {
-    ValueTask<string> CheckForUpdatesAsync(CancellationToken cancellationToken);
+    ValueTask<DesktopUpdateStatus> CheckForUpdatesAsync(bool interactive, CancellationToken cancellationToken);
     ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken);
     ValueTask<string> RepairTerminalIntegrationAsync(CancellationToken cancellationToken);
 }

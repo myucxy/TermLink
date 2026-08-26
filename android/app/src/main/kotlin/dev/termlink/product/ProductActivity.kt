@@ -125,6 +125,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
@@ -183,6 +184,7 @@ import dev.termlink.terminal.api.TerminalTranscriptPageV1
 import dev.termlink.terminal.termux.TermuxTerminalEngine
 import dev.termlink.terminal.termux.TermuxTranscriptViewport
 import java.time.Instant
+import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
@@ -248,6 +250,17 @@ private val ProductPositive = Color(0xFF65D6A1)
 private val ProductWarning = Color(0xFFF1C96B)
 private val ProductDanger = Color(0xFFFF8C91)
 private val ProductMuted = Color(0xFFAAB5C5)
+
+internal enum class HomeGreetingPeriod { MORNING, AFTERNOON, EVENING }
+
+internal fun homeGreetingPeriod(hourOfDay: Int): HomeGreetingPeriod {
+    require(hourOfDay in 0..23) { "hourOfDay must be between 0 and 23" }
+    return when (hourOfDay) {
+        in 5..11 -> HomeGreetingPeriod.MORNING
+        in 12..17 -> HomeGreetingPeriod.AFTERNOON
+        else -> HomeGreetingPeriod.EVENING
+    }
+}
 
 private val productColors = androidx.compose.material3.darkColorScheme(
     primary = ProductPrimary,
@@ -3159,13 +3172,28 @@ private fun HiddenProductDestinationPage() {
 
 @Composable
 private fun PrimaryHomeHeader(onOpenDownloads: () -> Unit) {
+    val greetingPeriod by produceState(initialValue = homeGreetingPeriod(LocalTime.now().hour)) {
+        while (true) {
+            val now = LocalTime.now()
+            value = homeGreetingPeriod(now.hour)
+            val delayUntilNextMinute = (
+                (60L - now.second) * 1_000L - now.nano / 1_000_000L
+            ).coerceAtLeast(250L)
+            delay(delayUntilNextMinute)
+        }
+    }
+    val greeting = when (greetingPeriod) {
+        HomeGreetingPeriod.MORNING -> R.string.home_greeting_morning
+        HomeGreetingPeriod.AFTERNOON -> R.string.home_greeting_afternoon
+        HomeGreetingPeriod.EVENING -> R.string.home_greeting_evening
+    }
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.Top,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(stringResource(R.string.home_greeting), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.secondary)
+            Text(stringResource(greeting), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.secondary)
             Text(stringResource(R.string.home_title), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
         }
         IconButton(onClick = onOpenDownloads, modifier = Modifier.size(48.dp)) {

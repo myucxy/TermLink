@@ -1,4 +1,5 @@
 using System.Globalization;
+using TermLink.Platform;
 
 namespace TermLink.Presentation;
 
@@ -101,16 +102,9 @@ public static class PresentationText
     public static string Author => Pick("作者", "Author");
     public static string ApplicationVersion => Pick("桌面端版本", "Desktop version");
     public static string AboutDetail => Pick("TermLink 桌面控制端和更新信息。", "TermLink desktop control UI and update information.");
-    public static string CurrentVersionChanges => Pick("本版本修复与优化", "Fixes and improvements in this version");
-    public static string CurrentVersionReleaseNotes => Pick(
-        "• 修复重复启动生成多个桌面控制窗口的问题，现会唤醒已有窗口。\n" +
-        "• 修复自动检测命令无法编辑、删除的问题，并持久化已隐藏的命令。\n" +
-        "• 新增管理员权限默认策略，启动命令时遵循 Windows UAC 授权。\n" +
-        "• 优化设置与设备页面，并将更新入口统一归入“关于”。",
-        "• Fixed duplicate control windows; later launches now activate the existing window.\n" +
-        "• Auto-detected commands can now be edited or removed, with hidden commands persisted.\n" +
-        "• Added an administrator-by-default policy that honors Windows UAC.\n" +
-        "• Refined Settings and Devices and moved the update action into About.");
+    public static string AppShipReleaseNotes => Pick("AppShip 版本说明", "AppShip release notes");
+    public static string UpdateNotChecked => Pick("正在等待 AppShip 版本信息。", "Waiting for AppShip version information.");
+    public static string CheckingUpdates => Pick("正在检查 AppShip 更新…", "Checking AppShip for updates…");
     public static string Appearance => Pick("外观", "Appearance");
     public static string AppearanceDetail => Pick("与 Android 使用同一套品牌颜色。", "Uses the same brand colors as Android.");
     public static string FollowSystem => Pick("跟随系统", "System");
@@ -139,6 +133,34 @@ public static class PresentationText
     public static string UnexpectedFailureDetail => Pick("发生未预期错误。可在诊断页面查看原始错误信息。", "An unexpected error occurred. Open Diagnostics for the original detail.");
     public static string RemoteAccessUpdated => Pick("远程访问设置已更新。", "Remote access was updated.");
     public static string RetryRequested => Pick("已请求立即重连。", "An immediate reconnect was requested.");
+
+    public static string UpdateStatus(DesktopUpdateStatus status)
+    {
+        ArgumentNullException.ThrowIfNull(status);
+        var version = UpdateVersion(status.VersionName, status.BuildNumber);
+        return status.Decision switch
+        {
+            DesktopUpdateDecision.NoUpdate => Pick($"当前已是最新版本 · {version}", $"Up to date · {version}"),
+            DesktopUpdateDecision.Optional => Pick($"发现可选更新 · {version}", $"Optional update available · {version}"),
+            DesktopUpdateDecision.Required => Pick($"发现必要更新 · {version}", $"Required update available · {version}"),
+            DesktopUpdateDecision.NotConfigured => Pick("AppShip 更新服务未配置。", "AppShip update service is not configured."),
+            _ => Pick("AppShip 更新检查失败。", "AppShip update check failed."),
+        };
+    }
+
+    public static string UpdateReleaseNotesTitle(string? versionName, long? buildNumber) =>
+        Pick($"{UpdateVersion(versionName, buildNumber)} · 更新内容", $"{UpdateVersion(versionName, buildNumber)} · What's new");
+
+    public static string UpdateCheckFailed(string detail) =>
+        Pick($"AppShip 更新检查失败 · {detail}", $"AppShip update check failed · {detail}");
+
+    private static string UpdateVersion(string? versionName, long? buildNumber)
+    {
+        var version = string.IsNullOrWhiteSpace(versionName) ? "-" : $"v{versionName.Trim()}";
+        return buildNumber.HasValue
+            ? Pick($"{version}（构建 {buildNumber.Value}）", $"{version} (build {buildNumber.Value})")
+            : version;
+    }
     public static string SessionStopped => Pick("会话的远程访问已停止。", "Remote access to the session was stopped.");
     public static string DeviceGranted => Pick("设备控制权限已更新。", "Device control permission was updated.");
     public static string DeviceRevoked => Pick("设备授权已撤销。", "Device authorization was revoked.");

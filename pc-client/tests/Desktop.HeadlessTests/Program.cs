@@ -65,7 +65,7 @@ public static class Program
             sessions,
             devices);
         var client = new StaticAgentClient(snapshot);
-        var desktopOperations = new FailingDesktopOperations();
+        var desktopOperations = new FixtureDesktopOperations();
         await using var stateStore = new AgentStateStore(client, TimeSpan.FromMinutes(1));
         var telemetry = new CapturingNavigationTelemetry();
         var viewModel = new MainWindowViewModel(
@@ -150,8 +150,14 @@ public static class Program
         Dispatcher.UIThread.RunJobs();
         Require(viewModel.IsAboutSettingsSelected && aboutRoot.IsVisible &&
                 viewModel.Settings.Author == "清风惹尘丶" &&
-                viewModel.Settings.ReleaseNotes.Contains("UAC", StringComparison.Ordinal),
-            "The About section did not expose the author and current-version fixes at the end of Settings.");
+                !viewModel.Settings.HasReleaseNotes,
+            "The About section did not expose the author or started with hard-coded release notes.");
+        viewModel.CheckForUpdatesCommand.Execute(null);
+        await DrainCommandAsync(viewModel.CheckForUpdatesCommand);
+        Require(viewModel.Settings.HasReleaseNotes &&
+                viewModel.Settings.ReleaseNotes == "AppShip release fixture" &&
+                viewModel.Settings.ReleaseNotesTitle.Contains("45", StringComparison.Ordinal),
+            "The About section did not render the structured AppShip release notes fixture.");
         viewModel.SelectSettingsSection("integration");
         Dispatcher.UIThread.RunJobs();
         Require(viewModel.IsIntegrationSettingsSelected && integrationRoot.IsVisible,
@@ -167,10 +173,13 @@ public static class Program
         await DrainCommandAsync(viewModel.StopSessionCommand);
         Require(!client.StopSessionCalled, "Cancelling the confirmation still stopped the session.");
 
+        desktopOperations.FailUpdateChecks = true;
         viewModel.CheckForUpdatesCommand.Execute(null);
         await DrainCommandAsync(viewModel.CheckForUpdatesCommand);
-        Require(viewModel.OperationMessage.Contains("operation fixture", StringComparison.Ordinal),
-            "A desktop-operation failure was not converted into UI state.");
+        Require(viewModel.OperationMessage.Contains("operation fixture", StringComparison.Ordinal) &&
+                !viewModel.Settings.HasReleaseNotes &&
+                viewModel.Settings.UpdateStatusText.Contains("AppShip", StringComparison.Ordinal),
+            "An AppShip failure was not isolated from previously loaded release notes.");
         viewModel.OpenDiagnosticsDirectoryCommand.Execute(null);
         await DrainCommandAsync(viewModel.OpenDiagnosticsDirectoryCommand);
         Require(viewModel.NoticeCode == "ACCESS_DENIED" && viewModel.NoticeDetail == PresentationText.AccessDeniedDetail,
@@ -314,10 +323,20 @@ public static class Program
         public void Record(NavigationMeasurement measurement) => Measurements.Add(measurement);
     }
 
-    private sealed class FailingDesktopOperations : IDesktopOperations
+    private sealed class FixtureDesktopOperations : IDesktopOperations
     {
-        public ValueTask<string> CheckForUpdatesAsync(CancellationToken cancellationToken) =>
-            ValueTask.FromException<string>(new InvalidOperationException("operation fixture"));
+        public bool FailUpdateChecks { get; set; }
+
+        public ValueTask<DesktopUpdateStatus> CheckForUpdatesAsync(
+            bool interactive,
+            CancellationToken cancellationToken) => FailUpdateChecks
+                ? ValueTask.FromException<DesktopUpdateStatus>(new InvalidOperationException("operation fixture"))
+                : ValueTask.FromResult(new DesktopUpdateStatus(
+                    DesktopUpdateDecision.NoUpdate,
+                    "0.2.4",
+                    45,
+                    "AppShip release fixture",
+                    "fixture is current"));
         public ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken) =>
             ValueTask.FromException<string>(new UnauthorizedAccessException("Access to path is denied"));
         public ValueTask<string> RepairTerminalIntegrationAsync(CancellationToken cancellationToken) =>
