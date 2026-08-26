@@ -86,13 +86,15 @@ public sealed partial class App : Application
                 client = new PreviewAgentClient(descriptor, Program.UsePreviewFixture);
             }
             var stateStore = new AgentStateStore(client);
+            var appearanceController = new AvaloniaAppearanceController();
             mainWindowViewModel = new MainWindowViewModel(
                 stateStore,
                 client,
                 new AvaloniaUiDispatcher(),
                 descriptor,
                 new TraceNavigationTelemetry(),
-                desktopOperations);
+                desktopOperations,
+                appearanceController);
             mainWindow = new MainWindow { DataContext = mainWindowViewModel };
             if (Program.StartHidden) mainWindow.Opened += (_, _) => mainWindow.Hide();
             mainWindow.Closing += OnMainWindowClosing;

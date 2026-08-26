@@ -126,6 +126,20 @@ public sealed class PreviewAgentClient : IAgentClient
                     observedAt,
                     42),
             },
-            Array.Empty<AccountDeviceSnapshot>());
+            new[]
+            {
+                new AccountDeviceSnapshot(
+                    Guid.Parse("69e6d7d4-bcdc-4f2a-88db-5b38b904f128"),
+                    "Pixel 9 Pro",
+                    "ANDROID",
+                    "TRUSTED",
+                    true),
+                new AccountDeviceSnapshot(
+                    Guid.Parse("088c5ef4-413c-4293-a61f-4c5e766b70d8"),
+                    "Office tablet",
+                    "ANDROID",
+                    "TRUSTED",
+                    false),
+            });
     }
 }

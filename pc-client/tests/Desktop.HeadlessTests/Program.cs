@@ -80,33 +80,47 @@ public static class Program
         await stateStore.RefreshAsync();
         Dispatcher.UIThread.RunJobs();
 
-        var connectionRoot = RequireControl<Grid>(window, "ConnectionPageRoot");
+        var connectionRoot = RequireControl<Control>(window, "ConnectionPageRoot");
         var sessionsRoot = RequireControl<Grid>(window, "SessionsPageRoot");
         var settingsRoot = RequireControl<Grid>(window, "SettingsPageRoot");
-        var devicesRoot = RequireControl<Grid>(window, "DevicesPageRoot");
-        var accountRoot = RequireControl<Grid>(window, "AccountPageRoot");
-        var diagnosticsRoot = RequireControl<Grid>(window, "DiagnosticsPageRoot");
+        var devicesRoot = RequireControl<Control>(window, "DevicesPageRoot");
+        var accountRoot = RequireControl<Control>(window, "AccountPageRoot");
+        var diagnosticsRoot = RequireControl<Control>(window, "DiagnosticsPageRoot");
         var sessionList = RequireControl<ListBox>(window, "SessionList");
         var deviceList = RequireControl<ListBox>(window, "DeviceList");
         var commandList = RequireControl<ListBox>(window, "CommandList");
         Require(viewModel.Sessions.Sessions.Count == 100, "The 100-session snapshot was not applied.");
         Require(viewModel.Devices.Devices.Count == 100, "The 100-device snapshot was not applied.");
         Require(viewModel.Settings.TerminalCommands.Count == 2, "Terminal commands were not applied.");
-        Require(sessionList.ItemsPanelRoot is VirtualizingStackPanel, "The session list is not virtualized.");
+        Require(viewModel.SessionCountText == PresentationText.SessionCount(100),
+            "The localized session-count display text was not composed by the presentation layer.");
+        Require(viewModel.Sessions.Items[0].DetailText.Contains(" · ", StringComparison.Ordinal)
+                && viewModel.Devices.Items[0].DetailText.Contains(" · ", StringComparison.Ordinal),
+            "Theme-safe session and device detail text was not composed by the presentation layer.");
+        Require(viewModel.CurrentPage.Key == "devices" && viewModel.Pages.Count == 3,
+            "The Android-aligned three-destination desktop shell was not selected by default.");
 
-        viewModel.Navigate("devices");
         Dispatcher.UIThread.RunJobs();
         Require(deviceList.ItemsPanelRoot is VirtualizingStackPanel, "The device list is not virtualized.");
+        viewModel.Navigate("sessions");
+        Dispatcher.UIThread.RunJobs();
+        Require(sessionList.ItemsPanelRoot is VirtualizingStackPanel, "The session list is not virtualized.");
         viewModel.Navigate("settings");
+        viewModel.SelectSettingsSection("commands");
         Dispatcher.UIThread.RunJobs();
         Require(commandList.ItemsPanelRoot is VirtualizingStackPanel, "The command list is not virtualized.");
 
+        viewModel.OpenTerminalCommandEditorCommand.Execute(null);
+        await DrainCommandAsync(viewModel.OpenTerminalCommandEditorCommand);
+        Require(viewModel.Settings.CommandEditorOpen, "The custom-command editor did not open explicitly.");
         viewModel.Settings.NewCommandName = "Custom shell";
         viewModel.Settings.NewExecutable = "custom-shell.exe";
         viewModel.Settings.NewArguments = "--login";
         viewModel.AddTerminalCommandCommand.Execute(null);
         await DrainCommandAsync(viewModel.AddTerminalCommandCommand);
         Require(viewModel.Settings.TerminalCommands.Count == 3, "A manual command was not added.");
+        Require(viewModel.Settings.HasUnsavedCommands && !viewModel.Settings.CommandEditorOpen,
+            "A custom command did not enter the explicit unsaved state.");
         var added = viewModel.Settings.TerminalCommands.Single(command => command.DisplayName == "Custom shell");
         viewModel.RemoveTerminalCommandCommand.Execute(added);
         await DrainCommandAsync(viewModel.RemoveTerminalCommandCommand);
@@ -115,10 +129,24 @@ public static class Program
         await DrainCommandAsync(viewModel.RemoveTerminalCommandCommand);
         Require(viewModel.Settings.TerminalCommands.Count == 2, "An auto-detected command was removable.");
 
+        viewModel.Navigate("sessions");
+        var firstSessionId = viewModel.Sessions.Items[0].SessionId;
+        viewModel.StopSessionCommand.Execute(firstSessionId);
+        await WaitForAsync(() => viewModel.ConfirmationVisible, "A destructive session action did not request confirmation.");
+        Require(!client.StopSessionCalled, "The session was stopped before confirmation.");
+        viewModel.CancelPendingActionCommand.Execute(null);
+        await DrainCommandAsync(viewModel.CancelPendingActionCommand);
+        await DrainCommandAsync(viewModel.StopSessionCommand);
+        Require(!client.StopSessionCalled, "Cancelling the confirmation still stopped the session.");
+
         viewModel.CheckForUpdatesCommand.Execute(null);
         await DrainCommandAsync(viewModel.CheckForUpdatesCommand);
         Require(viewModel.OperationMessage.Contains("operation fixture", StringComparison.Ordinal),
             "A desktop-operation failure was not converted into UI state.");
+        viewModel.OpenDiagnosticsDirectoryCommand.Execute(null);
+        await DrainCommandAsync(viewModel.OpenDiagnosticsDirectoryCommand);
+        Require(viewModel.NoticeCode == "ACCESS_DENIED" && viewModel.NoticeDetail == PresentationText.AccessDeniedDetail,
+            "A path-access failure was not classified as ACCESS_DENIED.");
 
         var durations = new List<double>(300);
         var keys = new[] { "connection", "settings", "sessions" };
@@ -130,17 +158,17 @@ public static class Program
             durations.Add(Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds);
         }
 
-        Require(ReferenceEquals(connectionRoot, RequireControl<Grid>(window, "ConnectionPageRoot")),
+        Require(ReferenceEquals(connectionRoot, RequireControl<Control>(window, "ConnectionPageRoot")),
             "The connection page was reconstructed during navigation.");
         Require(ReferenceEquals(sessionsRoot, RequireControl<Grid>(window, "SessionsPageRoot")),
             "The sessions page was reconstructed during navigation.");
         Require(ReferenceEquals(settingsRoot, RequireControl<Grid>(window, "SettingsPageRoot")),
             "The settings page was reconstructed during navigation.");
-        Require(ReferenceEquals(devicesRoot, RequireControl<Grid>(window, "DevicesPageRoot")),
+        Require(ReferenceEquals(devicesRoot, RequireControl<Control>(window, "DevicesPageRoot")),
             "The devices page was reconstructed during navigation.");
-        Require(ReferenceEquals(accountRoot, RequireControl<Grid>(window, "AccountPageRoot")),
+        Require(ReferenceEquals(accountRoot, RequireControl<Control>(window, "AccountPageRoot")),
             "The account page was reconstructed during navigation.");
-        Require(ReferenceEquals(diagnosticsRoot, RequireControl<Grid>(window, "DiagnosticsPageRoot")),
+        Require(ReferenceEquals(diagnosticsRoot, RequireControl<Control>(window, "DiagnosticsPageRoot")),
             "The diagnostics page was reconstructed during navigation.");
         var p95 = Percentile(durations, 0.95);
         Require(p95 <= 100, $"Headless navigation P95 exceeded 100 ms: {p95:F3} ms.");
@@ -178,6 +206,18 @@ public static class Program
         Require(!command.IsRunning, "An async UI command did not complete.");
     }
 
+    private static async Task WaitForAsync(Func<bool> condition, string message)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (!condition() && DateTime.UtcNow < deadline)
+        {
+            Dispatcher.UIThread.RunJobs();
+            await Task.Delay(1);
+        }
+        Dispatcher.UIThread.RunJobs();
+        Require(condition(), message);
+    }
+
     private static T RequireControl<T>(Control root, string name) where T : Control =>
         root.FindControl<T>(name) ?? throw new InvalidOperationException($"Control '{name}' was not found.");
 
@@ -195,6 +235,7 @@ public static class Program
 
     private sealed class StaticAgentClient(AgentStatusSnapshot snapshot) : IAgentClient
     {
+        public bool StopSessionCalled { get; private set; }
         public ValueTask<AgentStatusSnapshot> GetStatusAsync(bool forceRefresh, CancellationToken cancellationToken) =>
             ValueTask.FromResult(snapshot);
 
@@ -202,7 +243,11 @@ public static class Program
             ValueTask.CompletedTask;
 
         public ValueTask RetryConnectionAsync(CancellationToken cancellationToken) => ValueTask.CompletedTask;
-        public ValueTask StopSessionAsync(Guid sessionId, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask StopSessionAsync(Guid sessionId, CancellationToken cancellationToken)
+        {
+            StopSessionCalled = true;
+            return ValueTask.CompletedTask;
+        }
         public ValueTask GrantDeviceAsync(Guid deviceId, string permission, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask RevokeDeviceAsync(Guid deviceId, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask LoginAsync(string username, string password, string pcName, CancellationToken cancellationToken) => ValueTask.CompletedTask;
@@ -222,7 +267,7 @@ public static class Program
         public ValueTask<string> CheckForUpdatesAsync(CancellationToken cancellationToken) =>
             ValueTask.FromException<string>(new InvalidOperationException("operation fixture"));
         public ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken) =>
-            ValueTask.FromResult("opened");
+            ValueTask.FromException<string>(new UnauthorizedAccessException("Access to path is denied"));
         public ValueTask<string> RepairTerminalIntegrationAsync(CancellationToken cancellationToken) =>
             ValueTask.FromResult("repaired");
     }
