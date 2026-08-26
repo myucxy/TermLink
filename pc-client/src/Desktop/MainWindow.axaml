@@ -125,8 +125,8 @@
       </Grid>
 
       <Grid Grid.Row="2" Margin="28,20,28,26">
-        <ScrollViewer x:Name="DevicesPageRoot" IsVisible="{Binding IsDevicesPageSelected}" HorizontalScrollBarVisibility="Disabled">
-          <StackPanel MaxWidth="{DynamicResource TermLinkContentMaxWidth}" HorizontalAlignment="Stretch" Spacing="18" Margin="0,0,8,0">
+        <ScrollViewer x:Name="DevicesPageRoot" IsVisible="{Binding IsDevicesPageSelected}" HorizontalScrollBarVisibility="Disabled" AllowAutoHide="False">
+          <StackPanel x:Name="DevicesContentRoot" MaxWidth="{DynamicResource TermLinkContentMaxWidth}" HorizontalAlignment="Stretch" Spacing="18" Margin="0,0,16,0">
             <StackPanel>
               <TextBlock Classes="eyebrow" Text="{x:Static text:PresentationText.ThisDevice}" />
               <TextBlock Classes="page-title" Text="{Binding AgentName}" Margin="0,2,0,0" />
@@ -190,11 +190,11 @@
                 <TextBlock Text="{x:Static text:PresentationText.NoSessionsDetail}" Classes="muted" TextWrapping="Wrap" TextAlignment="Center" MaxWidth="480" />
               </StackPanel>
             </Border>
-            <ListBox x:Name="SessionList" Classes="clean" ItemsSource="{Binding Sessions.Items}" IsVisible="{Binding HasSessions}">
+            <ListBox x:Name="SessionList" Classes="clean" ItemsSource="{Binding Sessions.Items}" IsVisible="{Binding HasSessions}" ScrollViewer.AllowAutoHide="False">
               <ListBox.ItemsPanel><ItemsPanelTemplate><VirtualizingStackPanel /></ItemsPanelTemplate></ListBox.ItemsPanel>
               <ListBox.ItemTemplate>
                 <DataTemplate x:DataType="vm:SessionListItemViewModel">
-                  <Border Classes="card compact" Margin="0,0,0,8">
+                  <Border Classes="card compact" Margin="0,0,16,8">
                     <Grid ColumnDefinitions="Auto,*,170,Auto" ColumnSpacing="12">
                       <Grid Width="24" Height="24" VerticalAlignment="Center">
                         <Border Classes="status-dot" HorizontalAlignment="Center" VerticalAlignment="Center" />
@@ -236,8 +236,8 @@
             </WrapPanel>
           </StackPanel>
 
-          <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled">
-            <Grid>
+          <ScrollViewer x:Name="SettingsContentScroll" Grid.Row="1" HorizontalScrollBarVisibility="Disabled" AllowAutoHide="False">
+            <Grid x:Name="SettingsContentRoot" Margin="0,0,16,0">
               <StackPanel x:Name="GeneralSettingsRoot" IsVisible="{Binding IsGeneralSettingsSelected}" Spacing="14">
                 <Border Classes="card">
                   <StackPanel Spacing="14">

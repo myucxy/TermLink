@@ -32,6 +32,7 @@ namespace TermLink.Setup.Validation
                 ValidateInstalledLaunchVersionIdentity(temporaryRoot);
                 ValidateIndependentAgentStartupCommands(temporaryRoot);
                 ValidateLaunchHealthIsProcessBound();
+                ValidateLaunchHealthIsInstallRootBound(temporaryRoot);
                 ValidateUpgradeTerminationConsent();
                 ValidateUpgradeTerminationPrompt();
                 ValidateServiceImagePathParsing();
@@ -271,6 +272,34 @@ namespace TermLink.Setup.Validation
                     "The foreign launch-health server did not observe the probe connection.");
             }
             Array.Clear(authenticationSecret, 0, authenticationSecret.Length);
+        }
+
+        private static void ValidateLaunchHealthIsInstallRootBound(string temporaryRoot)
+        {
+            var root = Path.Combine(temporaryRoot, "launch-health", "TermLink");
+            var otherRoot = Path.Combine(temporaryRoot, "launch-health", "OtherTermLink");
+            Assert(Installer.IsOwnedLaunchHealthServerPath(
+                    Path.Combine(root, "TermLink.exe"),
+                    root),
+                "The installed Avalonia control process was rejected as a launch-health server.");
+            Assert(Installer.IsOwnedLaunchHealthServerPath(
+                    Path.Combine(root, "TermLink.Agent.exe"),
+                    root),
+                "The installed Agent process was rejected as a launch-health server.");
+            Assert(!Installer.IsOwnedLaunchHealthServerPath(
+                    Path.Combine(root, "TermLink.SessionHost.exe"),
+                    root),
+                "SessionHost was accepted as an installer launch-health server.");
+            Assert(!Installer.IsOwnedLaunchHealthServerPath(
+                    Path.Combine(root, "nested", "TermLink.Agent.exe"),
+                    root),
+                "A nested executable was accepted as the installed Agent.");
+            Assert(!Installer.IsOwnedLaunchHealthServerPath(
+                    Path.Combine(otherRoot, "TermLink.Agent.exe"),
+                    root),
+                "An Agent from another installation was accepted by the launch check.");
+            Assert(Installer.LaunchHealthTimeout >= TimeSpan.FromSeconds(75),
+                "Setup does not leave enough cold-start headroom after WindowsAgentClient's Agent deadline.");
         }
 
         private static void ValidateInstalledLaunchVersionIdentity(string temporaryRoot)

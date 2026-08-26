@@ -90,6 +90,9 @@ public static class Program
         var aboutRoot = RequireControl<Control>(window, "AboutSettingsRoot");
         var sessionList = RequireControl<ListBox>(window, "SessionList");
         var commandList = RequireControl<ListBox>(window, "CommandList");
+        var devicesContentRoot = RequireControl<StackPanel>(window, "DevicesContentRoot");
+        var settingsContentScroll = RequireControl<ScrollViewer>(window, "SettingsContentScroll");
+        var settingsContentRoot = RequireControl<Grid>(window, "SettingsContentRoot");
         Require(viewModel.Sessions.Sessions.Count == 100, "The 100-session snapshot was not applied.");
         Require(viewModel.Devices.Devices.Count == 100, "The 100-device snapshot was not applied.");
         Require(viewModel.Settings.TerminalCommands.Count == 2, "Terminal commands were not applied.");
@@ -100,6 +103,11 @@ public static class Program
             "Theme-safe session and device detail text was not composed by the presentation layer.");
         Require(viewModel.CurrentPage.Key == "devices" && viewModel.Pages.Count == 3,
             "The Android-aligned three-destination desktop shell was not selected by default.");
+        Require(devicesContentRoot.Margin.Right >= 16 &&
+                settingsContentRoot.Margin.Right >= 16 &&
+                !settingsContentScroll.AllowAutoHide &&
+                !ScrollViewer.GetAllowAutoHide(sessionList),
+            "Compact-window scrollbars can still auto-hide over edge-aligned content.");
 
         viewModel.Navigate("sessions");
         Dispatcher.UIThread.RunJobs();

@@ -514,6 +514,10 @@ namespace TermLink.Setup
         private const string MarkerName = ".termlink-install.json";
         private const string FragmentFileName = "termlink.json";
         private const string UninstallerFileName = "TermLink.Uninstall.exe";
+        // WindowsAgentClient allows the independent Agent 65 seconds after the
+        // Avalonia UI has initialized. Leave additional room for a cold UI start.
+        internal static readonly TimeSpan LaunchHealthTimeout = TimeSpan.FromSeconds(90);
+        private const int LaunchHealthConnectTimeoutMilliseconds = 1000;
         private const string InstallStateSubKey = @"Software\TermLink";
         private const string InstallRootValueName = "InstallRoot";
         private const uint DeleteAccess = 0x00010000;
@@ -1920,25 +1924,35 @@ namespace TermLink.Setup
                 }))
                 {
                     if (process == null) return false;
-                    var deadline = DateTime.UtcNow.AddSeconds(15);
+                    var deadline = DateTime.UtcNow.Add(LaunchHealthTimeout);
                     while (DateTime.UtcNow < deadline)
                     {
-                        if (process.HasExited) return false;
-                        var launchedPath = TryGetProcessImagePath(process.Id);
-                        if (!string.IsNullOrWhiteSpace(launchedPath) &&
-                            !string.Equals(
-                                Path.GetFullPath(launchedPath),
-                                Path.GetFullPath(tray),
-                                StringComparison.OrdinalIgnoreCase))
+                        if (process.HasExited)
                         {
-                            return false;
+                            // Avalonia uses a per-user single-instance coordinator.
+                            // A secondary TermLink.exe can legitimately hand activation
+                            // to the already-starting primary process and exit. Keep
+                            // probing when that primary belongs to this installation.
+                            if (!IsOwnedTrayRunning(root)) return false;
+                        }
+                        else
+                        {
+                            var launchedPath = TryGetProcessImagePath(process.Id);
+                            if (!string.IsNullOrWhiteSpace(launchedPath) &&
+                                !string.Equals(
+                                    Path.GetFullPath(launchedPath),
+                                    Path.GetFullPath(tray),
+                                    StringComparison.OrdinalIgnoreCase))
+                            {
+                                return false;
+                            }
                         }
                         try
                         {
-                            var response = SendHealthRequestToLaunchedTray(
+                            var response = SendHealthRequestToOwnedInstallation(
                                 TermLinkControlPipe.DefaultName(),
-                                process.Id,
-                                500);
+                                root,
+                                LaunchHealthConnectTimeoutMilliseconds);
                             if (response != null && response.Success) return true;
                         }
                         catch (Exception error) when (
@@ -1947,12 +1961,11 @@ namespace TermLink.Setup
                             error is UnauthorizedAccessException)
                         {
                         }
-                        Thread.Sleep(100);
+                        Thread.Sleep(150);
                     }
                     // A process that merely remains alive is not sufficient. The
-                    // default pipe may still belong to another installation, and
-                    // reporting success in that state makes a failed relocation
-                    // indistinguishable from a working upgrade.
+                    // authenticated control pipe must also be hosted by the exact
+                    // TermLink.exe or TermLink.Agent.exe under this install root.
                     return false;
                 }
             }
@@ -2020,6 +2033,105 @@ namespace TermLink.Setup
             int timeoutMilliseconds,
             byte[] authenticationSecret)
         {
+            return SendAuthenticatedHealthRequest(
+                pipeName,
+                timeoutMilliseconds,
+                authenticationSecret,
+                serverProcessId =>
+                {
+                    if (serverProcessId == (uint)launchedProcessId) return true;
+                    var launchedPath = TryGetProcessImagePath(launchedProcessId);
+                    var serverPath = serverProcessId > int.MaxValue
+                        ? null
+                        : TryGetProcessImagePath((int)serverProcessId);
+                    return !string.IsNullOrWhiteSpace(launchedPath) &&
+                        !string.IsNullOrWhiteSpace(serverPath) &&
+                        string.Equals(
+                            Path.GetDirectoryName(Path.GetFullPath(launchedPath)),
+                            Path.GetDirectoryName(Path.GetFullPath(serverPath)),
+                            StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(
+                            Path.GetFileName(serverPath),
+                            "TermLink.Agent.exe",
+                            StringComparison.OrdinalIgnoreCase);
+                });
+        }
+
+        internal static RegistryResponse SendHealthRequestToOwnedInstallation(
+            string pipeName,
+            string installDirectory,
+            int timeoutMilliseconds)
+        {
+            var secret = RegistryControlSecretStore.LoadDefault();
+            try
+            {
+                return SendHealthRequestToOwnedInstallation(
+                    pipeName,
+                    installDirectory,
+                    timeoutMilliseconds,
+                    secret);
+            }
+            finally
+            {
+                Array.Clear(secret, 0, secret.Length);
+            }
+        }
+
+        internal static RegistryResponse SendHealthRequestToOwnedInstallation(
+            string pipeName,
+            string installDirectory,
+            int timeoutMilliseconds,
+            byte[] authenticationSecret)
+        {
+            var root = NormalizeInstallRoot(installDirectory);
+            return SendAuthenticatedHealthRequest(
+                pipeName,
+                timeoutMilliseconds,
+                authenticationSecret,
+                serverProcessId =>
+                {
+                    if (serverProcessId > int.MaxValue) return false;
+                    return IsOwnedLaunchHealthServerPath(
+                        TryGetProcessImagePath((int)serverProcessId),
+                        root);
+                });
+        }
+
+        internal static bool IsOwnedLaunchHealthServerPath(
+            string executablePath,
+            string installDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(executablePath) ||
+                string.IsNullOrWhiteSpace(installDirectory)) return false;
+            try
+            {
+                var root = NormalizeInstallRoot(installDirectory);
+                var candidate = Path.GetFullPath(executablePath);
+                return string.Equals(
+                        candidate,
+                        Path.Combine(root, "TermLink.exe"),
+                        StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(
+                        candidate,
+                        Path.Combine(root, "TermLink.Agent.exe"),
+                        StringComparison.OrdinalIgnoreCase);
+            }
+            catch (Exception error) when (
+                error is ArgumentException ||
+                error is IOException ||
+                error is NotSupportedException ||
+                error is SecurityException)
+            {
+                return false;
+            }
+        }
+
+        private static RegistryResponse SendAuthenticatedHealthRequest(
+            string pipeName,
+            int timeoutMilliseconds,
+            byte[] authenticationSecret,
+            Func<uint, bool> isExpectedServer)
+        {
             using (var pipe = new NamedPipeClientStream(
                 ".",
                 pipeName,
@@ -2029,29 +2141,8 @@ namespace TermLink.Setup
                 pipe.Connect(timeoutMilliseconds);
                 if (!GetNamedPipeServerProcessId(
                         pipe.SafePipeHandle.DangerousGetHandle(),
-                        out var serverProcessId))
-                {
-                    return null;
-                }
-                if (serverProcessId != (uint)launchedProcessId)
-                {
-                    var launchedPath = TryGetProcessImagePath(launchedProcessId);
-                    var serverPath = serverProcessId > int.MaxValue
-                        ? null
-                        : TryGetProcessImagePath((int)serverProcessId);
-                    if (string.IsNullOrWhiteSpace(launchedPath) || string.IsNullOrWhiteSpace(serverPath) ||
-                        !string.Equals(
-                            Path.GetDirectoryName(Path.GetFullPath(launchedPath)),
-                            Path.GetDirectoryName(Path.GetFullPath(serverPath)),
-                            StringComparison.OrdinalIgnoreCase) ||
-                        !string.Equals(
-                            Path.GetFileName(serverPath),
-                            "TermLink.Agent.exe",
-                            StringComparison.OrdinalIgnoreCase))
-                    {
-                        return null;
-                    }
-                }
+                        out var serverProcessId) ||
+                    !isExpectedServer(serverProcessId)) return null;
                 var request = new RegistryRequest { Command = RegistryCommand.List };
                 RegistryControlAuthentication.Prepare(request, authenticationSecret, DateTime.UtcNow);
                 RegistryControlCodec.WriteRequest(pipe, request);
