@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>TermLink.Desktop.HeadlessTests</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Avalonia" ExcludeAssets="analyzers" GeneratePathProperty="true" />
+    <PackageReference Include="Avalonia.Headless" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Desktop\TermLink.Desktop.csproj" />
+  </ItemGroup>
+  <Target Name="RemoveIncompatibleAvaloniaAnalyzers" BeforeTargets="CoreCompile">
+    <ItemGroup>
+      <Analyzer Remove="$(PkgAvalonia)\analyzers\dotnet\cs\*.dll" />
+    </ItemGroup>
+  </Target>
+</Project>

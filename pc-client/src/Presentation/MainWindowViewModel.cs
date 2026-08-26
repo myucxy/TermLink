@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using TermLink.Pc.Contracts;
 using TermLink.Platform;
 
@@ -8,6 +9,17 @@ public abstract class PageViewModel(string key, string title) : ObservableObject
 {
     public string Key { get; } = key;
     public string Title { get; } = title;
+}
+
+public readonly record struct NavigationMeasurement(
+    string FromPage,
+    string ToPage,
+    TimeSpan Duration,
+    DateTimeOffset ObservedAt);
+
+public interface INavigationTelemetry
+{
+    void Record(NavigationMeasurement measurement);
 }
 
 public sealed class ConnectionPageViewModel : PageViewModel
@@ -44,15 +56,21 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 {
     private readonly AgentStateStore stateStore;
     private readonly IUiDispatcher dispatcher;
+    private readonly INavigationTelemetry? navigationTelemetry;
     private readonly Dictionary<string, PageViewModel> pages;
     private PageViewModel currentPage;
     private string agentName = "TermLink";
     private string statusText = "正在连接";
 
-    public MainWindowViewModel(AgentStateStore stateStore, IUiDispatcher dispatcher, PlatformDescriptor descriptor)
+    public MainWindowViewModel(
+        AgentStateStore stateStore,
+        IUiDispatcher dispatcher,
+        PlatformDescriptor descriptor,
+        INavigationTelemetry? navigationTelemetry = null)
     {
         this.stateStore = stateStore ?? throw new ArgumentNullException(nameof(stateStore));
         this.dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+        this.navigationTelemetry = navigationTelemetry;
         ArgumentNullException.ThrowIfNull(descriptor);
         Connection = new ConnectionPageViewModel();
         Sessions = new SessionsPageViewModel();
@@ -79,6 +97,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand RefreshCommand { get; }
     public IReadOnlyCollection<PageViewModel> Pages => pages.Values;
     public PageViewModel CurrentPage { get => currentPage; private set => SetProperty(ref currentPage, value); }
+    public bool IsConnectionPageSelected => ReferenceEquals(CurrentPage, Connection);
+    public bool IsSessionsPageSelected => ReferenceEquals(CurrentPage, Sessions);
+    public bool IsSettingsPageSelected => ReferenceEquals(CurrentPage, Settings);
     public string AgentName { get => agentName; private set => SetProperty(ref agentName, value); }
     public string StatusText { get => statusText; private set => SetProperty(ref statusText, value); }
 
@@ -89,7 +110,18 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     public void Navigate(string? key)
     {
-        if (key is not null && pages.TryGetValue(key, out var page)) CurrentPage = page;
+        if (key is null || !pages.TryGetValue(key, out var page) || ReferenceEquals(page, CurrentPage)) return;
+        var fromPage = CurrentPage.Key;
+        var startedAt = Stopwatch.GetTimestamp();
+        CurrentPage = page;
+        RaisePropertyChanged(nameof(IsConnectionPageSelected));
+        RaisePropertyChanged(nameof(IsSessionsPageSelected));
+        RaisePropertyChanged(nameof(IsSettingsPageSelected));
+        navigationTelemetry?.Record(new NavigationMeasurement(
+            fromPage,
+            page.Key,
+            Stopwatch.GetElapsedTime(startedAt),
+            DateTimeOffset.UtcNow));
     }
 
     private void StateChanged(object? sender, AgentStatusSnapshot snapshot)

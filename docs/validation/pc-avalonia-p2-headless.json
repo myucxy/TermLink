@@ -1,0 +1,21 @@
+{
+  "schema": "termlink.pc-ui-validation/v1",
+  "captured_at": "2026-08-26T10:43:00+08:00",
+  "phase": "P2",
+  "sdk": "8.0.303",
+  "avalonia": "12.1.1",
+  "configuration": "Release",
+  "platform": "windows-x64-headless",
+  "checks": {
+    "solution_build_warnings": 0,
+    "solution_build_errors": 0,
+    "cached_page_instances": true,
+    "session_count": 100,
+    "session_list_virtualized": true,
+    "navigation_iterations": 300,
+    "navigation_p95_ms": 0.205,
+    "navigation_gate_ms": 100,
+    "architecture_validation": "passed"
+  },
+  "limitations": "Headless navigation evidence validates the P2 shell and is not a substitute for P4 compositor, input-latency, idle-memory, or real Windows/Android end-to-end measurements."
+}

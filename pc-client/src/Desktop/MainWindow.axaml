@@ -1,0 +1,158 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:TermLink.Presentation"
+        xmlns:contracts="using:TermLink.Pc.Contracts"
+        x:Class="TermLink.Desktop.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="TermLink PC Preview"
+        Width="980"
+        Height="680"
+        MinWidth="760"
+        MinHeight="520">
+  <Window.Styles>
+    <Style Selector="Border.card">
+      <Setter Property="Background" Value="{DynamicResource SystemControlBackgroundChromeMediumLowBrush}" />
+      <Setter Property="CornerRadius" Value="12" />
+      <Setter Property="Padding" Value="16" />
+    </Style>
+    <Style Selector="Button.nav">
+      <Setter Property="HorizontalContentAlignment" Value="Left" />
+      <Setter Property="Padding" Value="14,10" />
+      <Setter Property="Margin" Value="0,0,0,6" />
+    </Style>
+    <Style Selector="TextBlock.page-title">
+      <Setter Property="FontSize" Value="24" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="Margin" Value="0,0,0,16" />
+    </Style>
+  </Window.Styles>
+
+  <Grid ColumnDefinitions="220,*" RowDefinitions="Auto,*">
+    <Border Grid.RowSpan="2"
+            Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+            Padding="18">
+      <Grid RowDefinitions="Auto,Auto,*,Auto">
+        <StackPanel>
+          <TextBlock Text="TermLink" FontSize="24" FontWeight="Bold" />
+          <TextBlock Text="Avalonia Preview" Opacity="0.7" />
+        </StackPanel>
+        <StackPanel Grid.Row="1" Margin="0,28,0,0">
+          <Button Classes="nav"
+                  Content="连接服务器"
+                  Command="{Binding NavigateCommand}"
+                  CommandParameter="connection" />
+          <Button Classes="nav"
+                  Content="会话"
+                  Command="{Binding NavigateCommand}"
+                  CommandParameter="sessions" />
+          <Button Classes="nav"
+                  Content="设置"
+                  Command="{Binding NavigateCommand}"
+                  CommandParameter="settings" />
+        </StackPanel>
+        <StackPanel Grid.Row="3">
+          <TextBlock Text="{Binding AgentName}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+          <TextBlock Text="{Binding StatusText}" Opacity="0.7" TextTrimming="CharacterEllipsis" />
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <Border Grid.Column="1" Padding="24,16" BorderThickness="0,0,0,1">
+      <Grid ColumnDefinitions="*,Auto">
+        <TextBlock Text="PC 控制台" VerticalAlignment="Center" FontSize="16" FontWeight="SemiBold" />
+        <Button Grid.Column="1" Content="刷新" Command="{Binding RefreshCommand}" />
+      </Grid>
+    </Border>
+
+    <Grid Grid.Row="1" Grid.Column="1" Margin="24">
+      <Grid x:Name="ConnectionPageRoot" IsVisible="{Binding IsConnectionPageSelected}" RowDefinitions="Auto,*">
+        <TextBlock Classes="page-title" Text="连接服务器" />
+        <StackPanel Grid.Row="1" Spacing="12">
+          <Border Classes="card">
+            <StackPanel Spacing="6">
+              <TextBlock Text="{Binding Connection.Summary}" FontSize="18" FontWeight="SemiBold" />
+              <TextBlock Text="{Binding Connection.Detail}" TextWrapping="Wrap" Opacity="0.75" />
+            </StackPanel>
+          </Border>
+          <Border Classes="card">
+            <Grid ColumnDefinitions="*,Auto">
+              <StackPanel>
+                <TextBlock Text="允许远程访问" FontWeight="SemiBold" />
+                <TextBlock Text="P2 仅展示状态，不接管生产 Agent。" Opacity="0.7" />
+              </StackPanel>
+              <ToggleSwitch Grid.Column="1" IsChecked="{Binding Connection.RemoteAccessEnabled}" IsEnabled="False" />
+            </Grid>
+          </Border>
+        </StackPanel>
+      </Grid>
+
+      <Grid x:Name="SessionsPageRoot" IsVisible="{Binding IsSessionsPageSelected}" RowDefinitions="Auto,*">
+        <Grid ColumnDefinitions="*,Auto">
+          <TextBlock Classes="page-title" Text="会话" />
+          <TextBlock Grid.Column="1"
+                     Text="{Binding Sessions.Sessions.Count, StringFormat='{}{0} 个会话'}"
+                     VerticalAlignment="Center"
+                     Opacity="0.7" />
+        </Grid>
+        <ListBox x:Name="SessionList" Grid.Row="1" ItemsSource="{Binding Sessions.Sessions}">
+          <ListBox.ItemsPanel>
+            <ItemsPanelTemplate>
+              <VirtualizingStackPanel />
+            </ItemsPanelTemplate>
+          </ListBox.ItemsPanel>
+          <ListBox.ItemTemplate>
+            <DataTemplate x:DataType="contracts:ManagedSessionSnapshot">
+              <Border Classes="card" Margin="0,0,0,8">
+                <Grid ColumnDefinitions="*,Auto">
+                  <StackPanel>
+                    <TextBlock Text="{Binding Title}" FontWeight="SemiBold" />
+                    <TextBlock Text="{Binding ShellType}" Opacity="0.7" />
+                  </StackPanel>
+                  <StackPanel Grid.Column="1" HorizontalAlignment="Right">
+                    <TextBlock Text="{Binding State}" HorizontalAlignment="Right" />
+                    <TextBlock Text="{Binding ViewerCount, StringFormat='{}查看者 {0}'}" Opacity="0.7" />
+                  </StackPanel>
+                </Grid>
+              </Border>
+            </DataTemplate>
+          </ListBox.ItemTemplate>
+        </ListBox>
+      </Grid>
+
+      <Grid x:Name="SettingsPageRoot" IsVisible="{Binding IsSettingsPageSelected}" RowDefinitions="Auto,Auto,*">
+        <TextBlock Classes="page-title" Text="设置" />
+        <Border Grid.Row="1" Classes="card" Margin="0,0,0,12">
+          <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto,Auto">
+            <TextBlock Text="平台" FontWeight="SemiBold" Margin="0,0,16,6" />
+            <TextBlock Grid.Column="1" Text="{Binding Settings.Platform}" TextWrapping="Wrap" />
+            <TextBlock Grid.Row="1" Text="Agent" FontWeight="SemiBold" Margin="0,0,16,0" />
+            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Settings.Version}" />
+          </Grid>
+        </Border>
+        <Grid Grid.Row="2" RowDefinitions="Auto,*">
+          <TextBlock Text="可用命令" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,8" />
+          <ListBox Grid.Row="1" ItemsSource="{Binding Settings.TerminalCommands}">
+            <ListBox.ItemsPanel>
+              <ItemsPanelTemplate>
+                <VirtualizingStackPanel />
+              </ItemsPanelTemplate>
+            </ListBox.ItemsPanel>
+            <ListBox.ItemTemplate>
+              <DataTemplate x:DataType="contracts:TerminalCommandCapability">
+                <Border Classes="card" Margin="0,0,0,8">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <StackPanel>
+                      <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" />
+                      <TextBlock Text="{Binding Executable}" Opacity="0.7" />
+                    </StackPanel>
+                    <TextBlock Grid.Column="1" Text="{Binding Detected, StringFormat='{}自动检测：{0}'}" />
+                  </Grid>
+                </Border>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+        </Grid>
+      </Grid>
+    </Grid>
+  </Grid>
+</Window>
