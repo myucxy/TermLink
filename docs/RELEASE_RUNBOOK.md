@@ -139,6 +139,9 @@ Preview 只能发布到 `termlink-win64-preview/beta`，不得把同一产物上
 产品轨道参数仍是 `preview`，它会显式映射到 AppShip 唯一支持的非稳定渠道 `beta`；稳定版继续使用
 `termlink-win64/stable`。P4 的一个 Preview 周期内，Avalonia 是 `TermLink.exe`，旧 WinForms 仅作为
 `TermLink.Legacy.exe` 回滚面保留；下一个阶段移除前必须先验证 Preview 更新与回滚统计。
+首次发布时包装器会通过审核过的 AppShip 客户端创建私有 Preview 应用并启用签名审核；已有应用只做
+slug 解析，不重复创建。若首次尝试因缺少应用而在上传前失败，保留原状态文件，将其归档到 `.appship/failed/`
+后再以修正后的完整输入开始新状态；不能把失败状态删除或改发 stable。
 
 PC 项目的锁文件预先包含 `win-x64`、`win-arm64`、`linux-x64`、`linux-arm64`、`osx-x64`、`osx-arm64`
 六个 RID。任何 `dotnet publish -r ...` 都必须使用 `-p:RestoreLockedMode=true`。发布前后比较

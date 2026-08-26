@@ -562,7 +562,8 @@ try {
     $appShipPreviewPlan = $appShipPreviewPlanJson | ConvertFrom-Json
     Assert-True ($appShipPreviewPlan.application_slug -ceq 'termlink-win64-preview' -and
         $appShipPreviewPlan.release_track -ceq 'preview' -and
-        $appShipPreviewPlan.channel -ceq 'beta') `
+        $appShipPreviewPlan.channel -ceq 'beta' -and
+        $appShipPreviewPlan.create_application_if_missing -eq $true) `
         'Preview track was not mapped to the AppShip beta channel.'
 
     $appShipManifest.release_mode = 'development'

@@ -168,6 +168,17 @@ else {
     if ($Channel -eq 'preview') { 'termlink-win64-preview' } else { 'termlink-win64' }
 }
 $appShipChannel = if ($Channel -eq 'preview') { 'beta' } else { 'stable' }
+$createApplicationIfMissing = $Channel -eq 'preview'
+$previewApplicationName = if ($Target -eq 'AndroidApk') {
+    'TermLink Android Preview'
+} else {
+    'TermLink Windows Preview'
+}
+$previewApplicationSummary = if ($Target -eq 'AndroidApk') {
+    'Private non-stable TermLink Android preview releases.'
+} else {
+    'Private non-stable TermLink Windows preview releases.'
+}
 $platform = if ($Target -eq 'AndroidApk') { 'android' } else { 'windows' }
 $fileKind = if ($Target -eq 'AndroidApk') { 'apk' } else { 'exe' }
 $architecture = if ($Target -eq 'AndroidApk') { 'universal' } else { 'x64' }
@@ -217,6 +228,7 @@ $publishPlan = [pscustomobject][ordered]@{
     architecture = $architecture
     release_track = $Channel
     channel = $appShipChannel
+    create_application_if_missing = $createApplicationIfMissing
     version_name = $version
     build_number = $buildNumber
     state_path = $resolvedStatePath
@@ -309,6 +321,13 @@ $publishParameters = @{
     StatePath = $resolvedStatePath
 }
 if ($Resume) { $publishParameters.Resume = $true }
+if ($createApplicationIfMissing) {
+    $publishParameters.CreateApplicationIfMissing = $true
+    $publishParameters.ApplicationName = $previewApplicationName
+    $publishParameters.ApplicationSummary = $previewApplicationSummary
+    $publishParameters.ApplicationDescription = $previewApplicationSummary
+    $publishParameters.ApplicationVisibility = 'private'
+}
 
 [IO.Directory]::CreateDirectory($appShipStateRoot) | Out-Null
 $publishLockPath = "$resolvedStatePath.lock"
