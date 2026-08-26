@@ -17,7 +17,7 @@
   "validation": {
     "solution_locked_build": "passed",
     "linux_macos_four_rid_cross_publish": "passed",
-    "unified_preview_stable_promotion_tamper_test": "pending_clean_commit",
+    "unified_preview_stable_promotion_tamper_test": "passed",
     "all_supported_native_signed_artifacts": "not_available",
     "all_platform_install_update_rollback_e2e": "not_available"
   },
