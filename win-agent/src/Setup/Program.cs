@@ -526,7 +526,6 @@ namespace TermLink.Setup
         private static readonly string[] RequiredPayloadFiles =
         {
             "TermLink.exe",
-            "TermLink.Agent.exe",
             "TermLink.SessionHost.exe"
         };
 

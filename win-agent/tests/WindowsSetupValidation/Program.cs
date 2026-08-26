@@ -27,6 +27,7 @@ namespace TermLink.Setup.Validation
             try
             {
                 ValidateArguments();
+                ValidateLegacyInstallOwnership(temporaryRoot);
                 ValidateCrossDirectoryUpgradeIsRejected(temporaryRoot);
                 ValidateInstalledLaunchVersionIdentity(temporaryRoot);
                 ValidateIndependentAgentStartupCommands(temporaryRoot);
@@ -107,6 +108,31 @@ namespace TermLink.Setup.Validation
             AssertThrows<ArgumentException>(
                 () => SetupArguments.Parse(new[] { "--no-launch" }),
                 "No-launch must be rejected without an install directory.");
+        }
+
+        private static void ValidateLegacyInstallOwnership(string temporaryRoot)
+        {
+            var root = Path.Combine(temporaryRoot, "legacy-install-ownership", "TermLink");
+            Directory.CreateDirectory(root);
+            File.WriteAllBytes(Path.Combine(root, "TermLink.exe"), new byte[] { 0x4d, 0x5a });
+            File.WriteAllBytes(Path.Combine(root, "TermLink.SessionHost.exe"), new byte[] { 0x4d, 0x5a });
+            var marker = new InstallMarker
+            {
+                Product = global::TermLink.Setup.Program.ProductId,
+                Version = "0.1.32.38",
+                InstallRoot = root,
+                InstalledUtc = DateTime.UtcNow.ToString("O")
+            };
+            File.WriteAllText(
+                Path.Combine(root, ".termlink-install.json"),
+                System.Text.Json.JsonSerializer.Serialize(marker),
+                new UTF8Encoding(false));
+
+            Assert(Installer.IsValidInstallDirectory(root),
+                "A marker-owned pre-P3 installation without TermLink.Agent.exe was rejected for in-place upgrade.");
+            File.Delete(Path.Combine(root, "TermLink.SessionHost.exe"));
+            Assert(!Installer.IsValidInstallDirectory(root),
+                "A marker without the legacy SessionHost ownership anchor was accepted.");
         }
 
         private static void ValidateUpgradeTerminationConsent()

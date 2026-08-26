@@ -5,8 +5,8 @@
   "classification": "local Windows parity pre-publication gate; AppShip publication and real Android/Relay E2E are verified after source commit",
   "passed": true,
   "baseline_tag": "pc-avalonia-baseline-v0.1.32",
-  "candidate_version": "0.2.0",
-  "candidate_build": 39,
+  "candidate_version": "0.2.1",
+  "candidate_build": 40,
   "dotnet_sdk": "8.0.303",
   "locked_builds": {
     "windows_solution": { "warnings": 0, "errors": 0 },

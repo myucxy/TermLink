@@ -101,6 +101,9 @@ Preview packages are compile-time bound to AppShip application `termlink-win64-p
 `beta` channel (the TermLink build/publish track is named `preview`);
 stable packages remain bound to `termlink-win64` and `stable`. The package contains only one primary
 `TermLink.exe`, and the rollback executable cannot silently query the stable application when built for Preview.
+The Setup ownership check accepts the signed-marker layout of the last pre-P3 stable client, where
+`TermLink.Agent.dll` existed but `TermLink.Agent.exe` did not; it still requires the marker root plus both legacy
+`TermLink.exe` and `TermLink.SessionHost.exe` anchors before allowing an in-place directory replacement.
 The local pre-publication gate passed locked Windows/PC builds, architecture and headless checks, authenticated
 V8 plus V7/V6/V5 compatibility, 32 concurrent control clients, three consecutive SessionRegistry pressure
 runs, 20 real ConPTY sessions across forced and controlled Agent restarts, Setup install/upgrade/rollback/uninstall,

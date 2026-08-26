@@ -139,6 +139,9 @@ Preview 只能发布到 `termlink-win64-preview/beta`，不得把同一产物上
 产品轨道参数仍是 `preview`，它会显式映射到 AppShip 唯一支持的非稳定渠道 `beta`；稳定版继续使用
 `termlink-win64/stable`。P4 的一个 Preview 周期内，Avalonia 是 `TermLink.exe`，旧 WinForms 仅作为
 `TermLink.Legacy.exe` 回滚面保留；下一个阶段移除前必须先验证 Preview 更新与回滚统计。
+从 0.1.32 等 P3 以前稳定版原地升级时，旧目录没有 `TermLink.Agent.exe` 属于正常布局；P4 安装器通过
+`.termlink-install.json`、`TermLink.exe` 和 `TermLink.SessionHost.exe` 三个归属锚点兼容识别。不能通过手工
+补一个空的 Agent 文件绕过旧安装器，也不能放宽到只看目录名。
 首次发布时包装器会通过审核过的 AppShip 客户端创建私有 Preview 应用并启用签名审核；已有应用只做
 slug 解析，不重复创建。若首次尝试因缺少应用而在上传前失败，保留原状态文件，将其归档到 `.appship/failed/`
 后再以修正后的完整输入开始新状态；不能把失败状态删除或改发 stable。
