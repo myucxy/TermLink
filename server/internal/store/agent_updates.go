@@ -101,6 +101,16 @@ const agentUpdateColumns = `
 	status,phase,progress_percent,active_session_count,attempt_count,lease_token_hash,lease_expires_at,
 	error_code,error_detail,observed_agent_version,observed_agent_build,expires_at,started_at,completed_at,cancelled_at,created_at,updated_at`
 
+// agentUpdateJobColumns must be used by UPDATE ... FROM queries whose joined
+// relations expose columns with the same names as agent_update_jobs. PostgreSQL
+// resolves unqualified RETURNING columns against every relation in scope, so a
+// bare id is ambiguous when ClaimAgentUpdate joins the candidate CTE.
+const agentUpdateJobColumns = `
+	job.id,job.account_id,job.pc_id,job.requester_device_id,job.current_version,job.current_build,job.target_version,job.target_build,
+	job.artifact_url,job.artifact_filename,job.artifact_size_bytes,job.artifact_sha256,job.artifact_signer_fingerprint,
+	job.status,job.phase,job.progress_percent,job.active_session_count,job.attempt_count,job.lease_token_hash,job.lease_expires_at,
+	job.error_code,job.error_detail,job.observed_agent_version,job.observed_agent_build,job.expires_at,job.started_at,job.completed_at,job.cancelled_at,job.created_at,job.updated_at`
+
 type agentUpdateRow interface {
 	Scan(...any) error
 }
@@ -294,7 +304,7 @@ func (s *Postgres) ClaimAgentUpdate(
 		SET status='PROCESSING',attempt_count=attempt_count+1,lease_token_hash=$3,
 		    lease_expires_at=LEAST(job.expires_at,now()+($4 * interval '1 millisecond')),
 		    started_at=COALESCE(started_at,now()),updated_at=now()
-		FROM candidate WHERE job.id=candidate.id RETURNING `+agentUpdateColumns,
+		FROM candidate WHERE job.id=candidate.id RETURNING `+agentUpdateJobColumns,
 		userID, pcID, tokenHash[:], leaseDuration.Milliseconds(),
 	))
 	if errors.Is(err, ErrNotFound) {

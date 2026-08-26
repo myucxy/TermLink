@@ -1,6 +1,24 @@
 package store
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestAgentUpdateJobColumnsMatchScanOrderAndAreQualified(t *testing.T) {
+	plain := strings.Split(strings.ReplaceAll(agentUpdateColumns, "\n", ""), ",")
+	qualified := strings.Split(strings.ReplaceAll(agentUpdateJobColumns, "\n", ""), ",")
+	if len(plain) != len(qualified) {
+		t.Fatalf("qualified column count=%d, want %d", len(qualified), len(plain))
+	}
+	for i := range plain {
+		plainColumn := strings.TrimSpace(plain[i])
+		qualifiedColumn := strings.TrimSpace(qualified[i])
+		if qualifiedColumn != "job."+plainColumn {
+			t.Fatalf("qualified column[%d]=%q, want %q", i, qualifiedColumn, "job."+plainColumn)
+		}
+	}
+}
 
 func TestTerminalAgentUpdatePhaseAllowsPreInstallDrainFailure(t *testing.T) {
 	phase, progress, valid := terminalAgentUpdatePhase(AgentUpdateDrainingSessions, AgentUpdateFailed)
