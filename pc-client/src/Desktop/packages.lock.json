@@ -206,6 +206,14 @@
           "System.IO.Pipelines": "8.0.0"
         }
       },
+      "termlink.agent.local": {
+        "type": "Project",
+        "dependencies": {
+          "TermLink.Pc.Contracts": "[1.0.0, )",
+          "TermLink.Platform.Abstractions": "[1.0.0, )",
+          "TermLink.Presentation": "[1.0.0, )"
+        }
+      },
       "termlink.pc.contracts": {
         "type": "Project"
       },
@@ -213,6 +221,29 @@
         "type": "Project",
         "dependencies": {
           "TermLink.Pc.Contracts": "[1.0.0, )"
+        }
+      },
+      "termlink.platform.linux": {
+        "type": "Project",
+        "dependencies": {
+          "TermLink.Pc.Contracts": "[1.0.0, )",
+          "TermLink.Platform.Abstractions": "[1.0.0, )",
+          "TermLink.Platform.Unix": "[1.0.0, )"
+        }
+      },
+      "termlink.platform.macos": {
+        "type": "Project",
+        "dependencies": {
+          "TermLink.Pc.Contracts": "[1.0.0, )",
+          "TermLink.Platform.Abstractions": "[1.0.0, )",
+          "TermLink.Platform.Unix": "[1.0.0, )"
+        }
+      },
+      "termlink.platform.unix": {
+        "type": "Project",
+        "dependencies": {
+          "TermLink.Pc.Contracts": "[1.0.0, )",
+          "TermLink.Platform.Abstractions": "[1.0.0, )"
         }
       },
       "termlink.presentation": {

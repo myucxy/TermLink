@@ -18,6 +18,14 @@ public sealed record TerminalLaunchRequest(
 
 public sealed record TerminalLaunchResult(Guid SessionId, int ProcessId, string ShellType);
 
+public enum TerminalSignal
+{
+    Hangup = 1,
+    Interrupt = 2,
+    Terminate = 15,
+    Kill = 9,
+}
+
 public sealed record FileSystemEntry(
     string Name,
     string FullPath,
@@ -57,6 +65,9 @@ public interface ITerminalSessionHost
     ValueTask<TerminalLaunchResult> LaunchAsync(TerminalLaunchRequest request, CancellationToken cancellationToken);
     ValueTask ResizeAsync(Guid sessionId, int columns, int rows, CancellationToken cancellationToken);
     ValueTask SendInputAsync(Guid sessionId, ReadOnlyMemory<byte> input, CancellationToken cancellationToken);
+    ValueTask<int> ReadOutputAsync(Guid sessionId, Memory<byte> output, CancellationToken cancellationToken);
+    ValueTask SignalAsync(Guid sessionId, TerminalSignal signal, CancellationToken cancellationToken);
+    ValueTask<int> WaitForExitAsync(Guid sessionId, CancellationToken cancellationToken);
     ValueTask StopAsync(Guid sessionId, CancellationToken cancellationToken);
 }
 

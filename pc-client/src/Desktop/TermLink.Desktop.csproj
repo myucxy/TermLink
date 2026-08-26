@@ -16,6 +16,11 @@
   <ItemGroup Condition="'$(TargetFramework)' == 'net8.0-windows'">
     <ProjectReference Include="..\Windows\TermLink.Platform.Windows.csproj" />
   </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
+    <ProjectReference Include="..\Agent.Local\TermLink.Agent.Local.csproj" />
+    <ProjectReference Include="..\Linux\TermLink.Platform.Linux.csproj" />
+    <ProjectReference Include="..\MacOS\TermLink.Platform.MacOS.csproj" />
+  </ItemGroup>
   <ItemGroup>
     <AvaloniaResource Include="..\..\..\assets\brand\windows\TermLink.ico"
                       Link="Assets\TermLink.ico" />

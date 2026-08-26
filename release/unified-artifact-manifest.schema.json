@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://termlink.dev/schemas/unified-release-v2.json",
+  "title": "TermLink unified release manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "product", "version", "build_number", "track", "release_mode", "source_revision", "generated_at_utc", "artifacts"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schema_version": { "const": 2 },
+    "product": { "const": "TermLink" },
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "build_number": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "track": { "enum": ["preview", "stable"] },
+    "release_mode": { "enum": ["development", "production"] },
+    "source_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "generated_at_utc": { "type": "string", "format": "date-time" },
+    "promotion": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["source_track", "source_manifest_sha256"],
+      "properties": {
+        "source_track": { "const": "preview" },
+        "source_manifest_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/artifact" }
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "platform", "architecture", "file_kind", "size", "sha256", "minimum_os", "signature", "updater", "qualification", "appship"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,79}$" },
+        "path": { "type": "string", "pattern": "^artifacts/release/" },
+        "platform": { "enum": ["windows", "android", "linux", "macos"] },
+        "architecture": { "enum": ["x64", "arm64", "universal"] },
+        "file_kind": { "enum": ["exe", "apk", "appimage", "pkg", "dmg"] },
+        "size": { "type": "integer", "minimum": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "minimum_os": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "signature": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["policy", "identity", "verified", "evidence"],
+          "properties": {
+            "policy": { "enum": ["authenticode-rfc3161", "android-apk-v2", "openpgp-detached", "apple-developer-id-notarized"] },
+            "identity": { "type": "string", "minLength": 16, "maxLength": 200 },
+            "verified": { "type": "boolean" },
+            "evidence": { "type": "string", "minLength": 1, "maxLength": 1000 }
+          }
+        },
+        "updater": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy", "rollback_verified"],
+          "properties": {
+            "strategy": { "enum": ["windows-setup", "android-package-installer", "appimage-atomic-swap", "macos-user-visible-package"] },
+            "rollback_verified": { "type": "boolean" }
+          }
+        },
+        "qualification": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["build_verified", "platform_e2e_verified", "health_verified", "blockers"],
+          "properties": {
+            "build_verified": { "type": "boolean" },
+            "platform_e2e_verified": { "type": "boolean" },
+            "health_verified": { "type": "boolean" },
+            "blockers": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 300 }, "maxItems": 32 }
+          }
+        },
+        "appship": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["application_slug", "channel"],
+          "properties": {
+            "application_slug": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,79}$" },
+            "channel": { "enum": ["stable", "beta"] }
+          }
+        }
+      }
+    }
+  }
+}

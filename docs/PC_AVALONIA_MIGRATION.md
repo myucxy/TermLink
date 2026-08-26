@@ -139,6 +139,21 @@ and adds only non-sensitive platform/capability metadata. See
 
 Exit: Ubuntu LTS x64 and arm64 CI plus a real desktop E2E pass.
 
+Implementation note (2026-08-26): the portable Unix layer now provides a bounded current-user Unix-domain
+socket, peer-UID verification, native `forkpty`/`execve`, non-blocking cancellable PTY I/O, process-group
+signals, terminal resize, POSIX path-root/symlink containment, and bash/zsh/fish/pwsh/sh discovery. The Linux
+adapter adds Secret Service/KWallet with no plaintext fallback, systemd-user hardening with an XDG fallback,
+AppImage hash/signature verification, atomic replacement, and rollback. The Avalonia UI connects to a separate
+portable Agent Host over HMAC-SHA256 authenticated local IPC with request/response binding, a 64 KiB frame
+limit, a two-minute clock window, and nonce replay prevention.
+
+Ubuntu 24.04 WSL2 x64 ran the native PTY, Unicode/ANSI, resize, process-group termination, UDS mode/peer,
+filesystem containment, command discovery, secret-store fail-closed, autostart generation, AppImage rollback,
+and local-Agent attack tests. Locked cross-publish passed for linux-x64 and linux-arm64. This does **not** meet
+the P6 exit gate: the portable Relay worker still rejects remote mutations with
+`PORTABLE_RELAY_NOT_CONFIGURED`, and Ubuntu arm64 plus a real Secret Service desktop and Android-control E2E
+remain unavailable. See `docs/validation/pc-avalonia-p6-linux.json`.
+
 ### P7 - macOS Agent
 
 - Implement PTY, process groups, Keychain, launchd, command discovery, package update, rollback, signing,
@@ -146,6 +161,15 @@ Exit: Ubuntu LTS x64 and arm64 CI plus a real desktop E2E pass.
 - Validate zsh/bash, Apple Silicon and Intel, sleep/wake, resume, files, and Android control.
 
 Exit: notarized artifacts and real arm64/x64 E2E evidence exist. Windows cannot substitute for this gate.
+
+Implementation note (2026-08-26): the macOS adapter uses Security.framework Keychain APIs, launchd user-agent
+generation with restart throttling, the common POSIX PTY/files/commands implementation, user-visible PKG/DMG
+updates, Gatekeeper signer matching, stapled-notarization validation, and retained rollback packages. The
+release script requires Developer ID Application and Installer identities, hardened runtime timestamps,
+notarytool submission, stapling, and final `spctl` assessment; it fails closed off macOS. Locked osx-x64 and
+osx-arm64 cross-publish and static plist/Keychain failure tests pass. The P7 exit gate remains unmet because
+this Windows host cannot produce or validate notarized bytes or run Intel/Apple-Silicon, Keychain, sleep/wake,
+and Android-control E2E. See `docs/validation/pc-avalonia-p7-macos.json`.
 
 ### P8 - unified release and GA
 
@@ -156,6 +180,19 @@ Exit: notarized artifacts and real arm64/x64 E2E evidence exist. Windows cannot 
 
 Exit: all supported artifacts are reproducibly identified, signed under their platform policy, published,
 and independently install/update/rollback verified.
+
+Implementation note (2026-08-26): unified manifest schema V2 records platform, architecture, package kind,
+minimum OS, exact bytes, signature policy/evidence, updater strategy, rollback/health/E2E qualification, and
+explicit AppShip application/channel mappings. Preview requires verified build and signature; Stable also
+requires rollback, platform E2E, health evidence, no blocker, identical Preview bytes, and Preview manifest
+provenance. The reviewed AppShip client remains the only upload implementation and its persistent state is
+kept for safe resume. Linux/macOS package scripts fail closed without their native signing hosts.
+
+The P8 GA exit gate remains unmet. AppShip exposes beta/stable atomic channel pointers and rollback but its
+reviewed publishing client has no staged-percentage/health-telemetry or channel-rollback operation, and the
+Linux/macOS platform gates above are incomplete. Consequently only already-qualified Windows/Android
+Preview artifacts may be published from this host; Stable promotion and portable artifacts are rejected by
+the new gate. See `docs/validation/pc-avalonia-p8-release.json`.
 
 ## Performance gates
 

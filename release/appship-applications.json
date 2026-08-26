@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "mappings": [
+    { "platform": "windows", "architecture": "x64", "track": "preview", "application_slug": "termlink-win64-preview", "appship_channel": "beta" },
+    { "platform": "windows", "architecture": "x64", "track": "stable", "application_slug": "termlink-win64", "appship_channel": "stable" },
+    { "platform": "android", "architecture": "universal", "track": "preview", "application_slug": "termlink-android-preview", "appship_channel": "beta" },
+    { "platform": "android", "architecture": "universal", "track": "stable", "application_slug": "termlink-android", "appship_channel": "stable" },
+    { "platform": "linux", "architecture": "x64", "track": "preview", "application_slug": "termlink-linux-x64-preview", "appship_channel": "beta" },
+    { "platform": "linux", "architecture": "arm64", "track": "preview", "application_slug": "termlink-linux-arm64-preview", "appship_channel": "beta" },
+    { "platform": "linux", "architecture": "x64", "track": "stable", "application_slug": "termlink-linux-x64", "appship_channel": "stable" },
+    { "platform": "linux", "architecture": "arm64", "track": "stable", "application_slug": "termlink-linux-arm64", "appship_channel": "stable" },
+    { "platform": "macos", "architecture": "x64", "track": "preview", "application_slug": "termlink-macos-x64-preview", "appship_channel": "beta" },
+    { "platform": "macos", "architecture": "arm64", "track": "preview", "application_slug": "termlink-macos-arm64-preview", "appship_channel": "beta" },
+    { "platform": "macos", "architecture": "x64", "track": "stable", "application_slug": "termlink-macos-x64", "appship_channel": "stable" },
+    { "platform": "macos", "architecture": "arm64", "track": "stable", "application_slug": "termlink-macos-arm64", "appship_channel": "stable" }
+  ]
+}

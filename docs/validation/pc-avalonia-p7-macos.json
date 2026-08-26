@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "phase": "P7",
+  "recorded_at": "2026-08-26",
+  "source_platform": "Windows 11 cross-build only",
+  "implementation": {
+    "security_framework_keychain": true,
+    "launchd_user_agent": true,
+    "posix_pty_files_and_commands": true,
+    "gatekeeper_signer_check": true,
+    "stapled_notarization_check": true,
+    "user_visible_package_update_and_rollback": true,
+    "hardened_runtime_notarization_script": true
+  },
+  "validation": {
+    "plist_xml_escape_and_restart_policy": "passed",
+    "keychain_fail_closed_off_macos": "passed",
+    "osx_x64_locked_cross_publish": "passed",
+    "osx_arm64_locked_cross_publish": "passed",
+    "developer_id_codesign": "not_run",
+    "notarytool_and_stapler": "not_run",
+    "apple_silicon_e2e": "not_run",
+    "intel_e2e": "not_run",
+    "keychain_sleep_wake_android_control": "not_run"
+  },
+  "phase_exit_met": false,
+  "blockers": [
+    "Apple signing identities, notarization service, and macOS arm64/x64 hosts are unavailable on this machine.",
+    "Portable Relay and real Android-control E2E remain incomplete."
+  ]
+}

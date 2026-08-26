@@ -192,6 +192,17 @@
           "Avalonia.Desktop": "[12.1.1, )",
           "Avalonia.Fonts.Inter": "[12.1.1, )",
           "Avalonia.Themes.Fluent": "[12.1.1, )",
+          "TermLink.Agent.Local": "[1.0.0, )",
+          "TermLink.Pc.Contracts": "[1.0.0, )",
+          "TermLink.Platform.Abstractions": "[1.0.0, )",
+          "TermLink.Platform.Linux": "[1.0.0, )",
+          "TermLink.Platform.MacOS": "[1.0.0, )",
+          "TermLink.Presentation": "[1.0.0, )"
+        }
+      },
+      "termlink.agent.local": {
+        "type": "Project",
+        "dependencies": {
           "TermLink.Pc.Contracts": "[1.0.0, )",
           "TermLink.Platform.Abstractions": "[1.0.0, )",
           "TermLink.Presentation": "[1.0.0, )"
@@ -204,6 +215,29 @@
         "type": "Project",
         "dependencies": {
           "TermLink.Pc.Contracts": "[1.0.0, )"
+        }
+      },
+      "termlink.platform.linux": {
+        "type": "Project",
+        "dependencies": {
+          "TermLink.Pc.Contracts": "[1.0.0, )",
+          "TermLink.Platform.Abstractions": "[1.0.0, )",
+          "TermLink.Platform.Unix": "[1.0.0, )"
+        }
+      },
+      "termlink.platform.macos": {
+        "type": "Project",
+        "dependencies": {
+          "TermLink.Pc.Contracts": "[1.0.0, )",
+          "TermLink.Platform.Abstractions": "[1.0.0, )",
+          "TermLink.Platform.Unix": "[1.0.0, )"
+        }
+      },
+      "termlink.platform.unix": {
+        "type": "Project",
+        "dependencies": {
+          "TermLink.Pc.Contracts": "[1.0.0, )",
+          "TermLink.Platform.Abstractions": "[1.0.0, )"
         }
       },
       "termlink.presentation": {

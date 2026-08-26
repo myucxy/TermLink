@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "phase": "P8",
+  "recorded_at": "2026-08-26",
+  "implementation": {
+    "unified_manifest_schema_v2": true,
+    "explicit_platform_architecture_package_signature_policy": true,
+    "explicit_appship_slug_and_channel_mapping": true,
+    "preview_signature_and_build_gate": true,
+    "stable_e2e_health_rollback_no_blocker_gate": true,
+    "preview_byte_identity_promotion_gate": true,
+    "resumable_appship_state": true,
+    "native_linux_and_macos_fail_closed_builds": true,
+    "appship_percentage_rollout_and_health_telemetry": false,
+    "reviewed_appship_channel_rollback_automation": false
+  },
+  "validation": {
+    "solution_locked_build": "passed",
+    "linux_macos_four_rid_cross_publish": "passed",
+    "unified_preview_stable_promotion_tamper_test": "pending_clean_commit",
+    "all_supported_native_signed_artifacts": "not_available",
+    "all_platform_install_update_rollback_e2e": "not_available"
+  },
+  "phase_exit_met": false,
+  "blockers": [
+    "P6 and P7 native platform exit gates are not met.",
+    "The reviewed AppShip client has no staged-percentage/health-telemetry or channel-rollback operation; direct HTTP is intentionally forbidden."
+  ]
+}

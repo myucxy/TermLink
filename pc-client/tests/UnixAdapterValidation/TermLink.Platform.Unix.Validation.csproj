@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>TermLink.Platform.Unix.Validation</AssemblyName>
+    <RootNamespace>TermLink.Platform.Unix.Validation</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Contracts\TermLink.Pc.Contracts.csproj" />
+    <ProjectReference Include="..\..\src\Platform.Abstractions\TermLink.Platform.Abstractions.csproj" />
+    <ProjectReference Include="..\..\src\Unix\TermLink.Platform.Unix.csproj" />
+    <ProjectReference Include="..\..\src\Linux\TermLink.Platform.Linux.csproj" />
+  </ItemGroup>
+</Project>

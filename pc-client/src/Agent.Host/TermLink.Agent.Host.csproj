@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>TermLink.Agent</AssemblyName>
+    <RootNamespace>TermLink.Agent.Host</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Agent.Local\TermLink.Agent.Local.csproj" />
+    <ProjectReference Include="..\Contracts\TermLink.Pc.Contracts.csproj" />
+    <ProjectReference Include="..\Platform.Abstractions\TermLink.Platform.Abstractions.csproj" />
+    <ProjectReference Include="..\Linux\TermLink.Platform.Linux.csproj" />
+    <ProjectReference Include="..\MacOS\TermLink.Platform.MacOS.csproj" />
+  </ItemGroup>
+</Project>

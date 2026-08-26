@@ -39,5 +39,21 @@ development inventory advances to an SDK that provides Roslyn 4.14 or newer.
 
 On Windows, running without `--preview-fixture` attaches to or starts the separately shipped Agent through
 authenticated control Pipe V8. `--preview-fixture` remains available for bounded headless/UI measurements and
-never takes production Relay, terminal, identity, updater, or autostart ownership. On other platforms it remains
-the only runnable data source until the P6/P7 platform adapters are added.
+never takes production Relay, terminal, identity, updater, or autostart ownership. Linux and macOS now use a
+separate portable Agent Host over authenticated Unix-domain IPC; they never fall back to fixture data unless
+`--preview-fixture` is explicit. The portable Host currently exposes local platform status and fails remote
+Relay mutations closed with `PORTABLE_RELAY_NOT_CONFIGURED` until real Linux/macOS Relay E2E is complete.
+
+Linux native/runtime validation from Windows uses Ubuntu 24.04 WSL2:
+
+```powershell
+& 'D:\Dev\Env\dotnet-sdk-8.0.303\dotnet.exe' publish `
+    .\pc-client\tests\UnixAdapterValidation\TermLink.Platform.Unix.Validation.csproj `
+    -c Release -r linux-x64 --self-contained true -p:RestoreLockedMode=true `
+    -o D:\Dev\Temp\TermLink-P6-UnixValidation
+wsl.exe -d Ubuntu-24.04 -- bash -lc `
+    '/mnt/e/WorkSpace/AICodeProject/TermLink/pc-client/native/posix/build-native.sh /mnt/d/Dev/Temp/TermLink-P6-UnixValidation && cd /mnt/d/Dev/Temp/TermLink-P6-UnixValidation && LD_LIBRARY_PATH=. ./TermLink.Platform.Unix.Validation'
+```
+
+Production Linux AppImage and macOS PKG scripts are under `pc-client/package`. They intentionally require
+native hosts and pinned signing inputs; cross-publish output alone is never a distributable release.

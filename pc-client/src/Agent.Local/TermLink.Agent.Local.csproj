@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>TermLink.Agent.Local</AssemblyName>
+    <RootNamespace>TermLink.Agent.Local</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Contracts\TermLink.Pc.Contracts.csproj" />
+    <ProjectReference Include="..\Platform.Abstractions\TermLink.Platform.Abstractions.csproj" />
+    <ProjectReference Include="..\Presentation\TermLink.Presentation.csproj" />
+  </ItemGroup>
+</Project>

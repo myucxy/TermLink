@@ -3,6 +3,21 @@
 本文用于每次 TermLink 正式版本的现场发布、故障恢复和最终复核。构建与签名门禁仍以
 [统一发布构建](RELEASE.md)为准；本文补充执行顺序和已经验证过的运行环境陷阱。
 
+## P6-P8 PC 统一发布资格
+
+便携 PC 制品使用 `release/unified-artifact-manifest.schema.json`，AppShip 映射固定在
+`release/appship-applications.json`。使用 `scripts/New-UnifiedReleaseManifest.ps1` 生成、再用
+`scripts/Test-UnifiedReleaseManifest.ps1` 复核 V2 清单。Preview 必须已有构建和签名证据；Stable 还必须
+具备回滚、原生平台 E2E、健康检查、零阻塞项，并与记录的 Preview 清单保持字节完全相同。
+
+`scripts/Publish-UnifiedPortableAppShip.ps1` 仅接受完成资格验证的 Linux/macOS 制品，并委托已审查、可恢复的
+`appship-publish` 客户端上传。Windows 和 Android 继续使用 `scripts/Publish-AppShipProduction.ps1`，它会在上传
+前再次验证原生签名与版本。中断后不能删除 `.appship` 状态或 draft，必须用完全相同的输入恢复。
+
+AppShip 当前支持 beta/stable 原子频道指针和服务端回滚，但已审查的自动化客户端尚未提供按百分比灰度、
+健康遥测或频道回滚操作。不能把 beta 到 stable 描述成 GA 完成，也不能用直接 HTTP 绕过。相关客户端与
+服务端契约补齐、且所有平台验收文件的退出门禁通过之前，Stable 保持阻塞。
+
 ## 1. 不可破坏的边界
 
 - Git 只提交和推送源码、测试、脚本与文档。`artifacts/`、`.appship/`、APK、EXE、截图和本地状态文件

@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "dependencies": {
+    "net8.0": {
+      "termlink.pc.contracts": {
+        "type": "Project"
+      },
+      "termlink.platform.abstractions": {
+        "type": "Project",
+        "dependencies": {
+          "TermLink.Pc.Contracts": "[1.0.0, )"
+        }
+      }
+    },
+    "net8.0/linux-arm64": {},
+    "net8.0/linux-x64": {},
+    "net8.0/osx-arm64": {},
+    "net8.0/osx-x64": {},
+    "net8.0/win-arm64": {},
+    "net8.0/win-x64": {}
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "phase": "P6",
+  "recorded_at": "2026-08-26",
+  "source_platform": "Windows 11 with Ubuntu 24.04 WSL2 x64",
+  "implementation": {
+    "unix_domain_socket_peer_uid_and_mode_0600": true,
+    "authenticated_local_ipc_hmac_replay_protection": true,
+    "native_posix_pty": true,
+    "nonblocking_cancellable_io": true,
+    "process_group_resize_and_signals": true,
+    "posix_path_and_symlink_containment": true,
+    "shell_discovery": ["bash", "zsh", "fish", "pwsh", "sh"],
+    "secret_service_or_kwallet_fail_closed": true,
+    "systemd_user_and_xdg_generation": true,
+    "appimage_verification_atomic_swap_and_rollback": true,
+    "independent_portable_agent_host": true,
+    "portable_relay_worker": false
+  },
+  "validation": {
+    "ubuntu_24_04_wsl2_x64_native_runtime": "passed",
+    "unicode_ansi_resize_process_group": "passed",
+    "uds_file_commands_secret_autostart_appimage": "passed",
+    "local_ipc_attack_regression": "passed",
+    "linux_x64_locked_cross_publish": "passed",
+    "linux_arm64_locked_cross_publish": "passed",
+    "ubuntu_lts_arm64_runtime": "not_run",
+    "real_desktop_secret_service": "not_run",
+    "android_remote_control_e2e": "not_run"
+  },
+  "phase_exit_met": false,
+  "blockers": [
+    "Portable Relay enrollment and remote worker are not yet implemented; remote mutations fail closed with PORTABLE_RELAY_NOT_CONFIGURED.",
+    "No Ubuntu arm64 runner or real Linux desktop Secret Service/Android E2E evidence is available."
+  ]
+}
