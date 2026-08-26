@@ -421,6 +421,7 @@ namespace TermLink.Agent
         public string ShellType { get; set; }
         public bool Detected { get; set; }
         public bool Enabled { get; set; }
+        public bool RunAsAdministrator { get; set; } = true;
     }
 
     public sealed class PairingChallengeSummary
@@ -472,7 +473,7 @@ namespace TermLink.Agent
 
     public static class RegistryControlCodec
     {
-        public const byte CurrentVersion = 8;
+        public const byte CurrentVersion = 9;
         private const byte MinimumSupportedVersion = 5;
         private const int MaximumBytes = 64 * 1024;
 
@@ -507,7 +508,7 @@ namespace TermLink.Agent
                     writer.Write(request.AuthenticationNonce);
                     writer.Write(request.AuthenticationTag);
                 }
-                WriteCommand(writer, request);
+                WriteCommand(writer, request, version);
                 writer.Flush();
                 WriteFrame(stream, body.ToArray());
             }
@@ -530,7 +531,7 @@ namespace TermLink.Agent
                 byte[] nonce = null;
                 byte[] tag = null;
                 if (version >= 7) ReadAuthentication(reader, out timestamp, out nonce, out tag);
-                var request = ReadCommand(reader);
+                var request = ReadCommand(reader, version);
                 request.ProtocolVersion = version;
                 request.AuthenticationTimestampUnixSeconds = timestamp;
                 request.AuthenticationNonce = nonce;
@@ -559,7 +560,7 @@ namespace TermLink.Agent
                 writer.Write(version);
                 writer.Write(request.AuthenticationTimestampUnixSeconds);
                 writer.Write(request.AuthenticationNonce);
-                WriteCommand(writer, request);
+                WriteCommand(writer, request, version);
                 writer.Flush();
                 return body.ToArray();
             }
@@ -576,7 +577,7 @@ namespace TermLink.Agent
             tag = ReadExact(reader, RegistryControlAuthentication.TagBytes);
         }
 
-        private static void WriteCommand(BinaryWriter writer, RegistryRequest request)
+        private static void WriteCommand(BinaryWriter writer, RegistryRequest request, byte version)
         {
             if (!Enum.IsDefined(typeof(RegistryCommand), request.Command))
                 throw new InvalidDataException("Unknown Registry command.");
@@ -619,7 +620,8 @@ namespace TermLink.Agent
                     break;
                 case RegistryCommand.SaveTerminalCommands:
                     var commands = request.TerminalCommands ?? new List<ProductionTerminalCommandSummary>();
-                    if (commands.Count > 20) throw new InvalidDataException("Too many manual terminal commands.");
+                    var maximumCommands = version >= 9 ? 24 : 20;
+                    if (commands.Count > maximumCommands) throw new InvalidDataException("Too many terminal commands.");
                     writer.Write(commands.Count);
                     foreach (var command in commands)
                     {
@@ -629,12 +631,18 @@ namespace TermLink.Agent
                         WriteString(writer, command.Executable ?? string.Empty);
                         WriteString(writer, command.Arguments ?? string.Empty);
                         writer.Write(command.Enabled);
+                        if (version >= 9)
+                        {
+                            WriteString(writer, command.ShellType ?? string.Empty);
+                            writer.Write(command.Detected);
+                            writer.Write(command.RunAsAdministrator);
+                        }
                     }
                     break;
             }
         }
 
-        private static RegistryRequest ReadCommand(BinaryReader reader)
+        private static RegistryRequest ReadCommand(BinaryReader reader, byte version)
         {
             var commandValue = reader.ReadByte();
             if (!Enum.IsDefined(typeof(RegistryCommand), commandValue))
@@ -681,20 +689,30 @@ namespace TermLink.Agent
                     break;
                 case RegistryCommand.SaveTerminalCommands:
                     var count = reader.ReadInt32();
-                    if (count < 0 || count > 20)
-                        throw new InvalidDataException("Invalid manual terminal command count.");
+                    var maximumCommands = version >= 9 ? 24 : 20;
+                    if (count < 0 || count > maximumCommands)
+                        throw new InvalidDataException("Invalid terminal command count.");
                     var commands = new List<ProductionTerminalCommandSummary>(count);
                     for (var index = 0; index < count; index++)
                     {
-                        commands.Add(new ProductionTerminalCommandSummary
+                        var terminalCommand = new ProductionTerminalCommandSummary
                         {
                             Id = ReadString(reader),
                             DisplayName = ReadString(reader),
                             Executable = ReadString(reader),
                             Arguments = ReadString(reader),
                             Enabled = reader.ReadBoolean(),
-                            Detected = false
-                        });
+                            Detected = false,
+                            ShellType = "custom",
+                            RunAsAdministrator = true
+                        };
+                        if (version >= 9)
+                        {
+                            terminalCommand.ShellType = ReadString(reader);
+                            terminalCommand.Detected = reader.ReadBoolean();
+                            terminalCommand.RunAsAdministrator = reader.ReadBoolean();
+                        }
+                        commands.Add(terminalCommand);
                     }
                     request.TerminalCommands = commands;
                     break;
@@ -918,6 +936,7 @@ namespace TermLink.Agent
                     WriteString(writer, command.ShellType ?? string.Empty);
                     writer.Write(command.Detected);
                     writer.Write(command.Enabled);
+                    if (version >= 9) writer.Write(command.RunAsAdministrator);
                 }
             }
         }
@@ -1008,7 +1027,8 @@ namespace TermLink.Agent
                         Arguments = ReadString(reader),
                         ShellType = ReadString(reader),
                         Detected = reader.ReadBoolean(),
-                        Enabled = reader.ReadBoolean()
+                        Enabled = reader.ReadBoolean(),
+                        RunAsAdministrator = version < 9 || reader.ReadBoolean()
                     });
                 }
                 status.TerminalCommands = terminalCommands;

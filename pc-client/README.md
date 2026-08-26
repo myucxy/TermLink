@@ -38,7 +38,7 @@ warnings-as-errors, and headless validation remain enabled. Remove this compatib
 development inventory advances to an SDK that provides Roslyn 4.14 or newer.
 
 On Windows, running without `--preview-fixture` attaches to or starts the separately shipped Agent through
-authenticated control Pipe V8. `--preview-fixture` remains available for bounded headless/UI measurements and
+authenticated control Pipe V9 (with V8-V5 decoding compatibility). `--preview-fixture` remains available for bounded headless/UI measurements and
 never takes production Relay, terminal, identity, updater, or autostart ownership. Linux and macOS now use a
 separate portable Agent Host over authenticated Unix-domain IPC; they never fall back to fixture data unless
 `--preview-fixture` is explicit. The portable Host currently exposes local platform status and fails remote

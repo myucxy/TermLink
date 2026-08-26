@@ -1275,7 +1275,8 @@ namespace TermLink.Agent
                             Arguments = profile.Arguments,
                             ShellType = profile.ManagedShell,
                             Detected = string.Equals(profile.Source, "detected", StringComparison.Ordinal),
-                            Enabled = profile.Enabled
+                            Enabled = profile.Enabled,
+                            RunAsAdministrator = profile.RunAsAdministrator
                         })
                         .ToList(),
                     PairingChallenge = pairingChallenge == null ? null : new PairingChallengeSummary

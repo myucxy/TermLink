@@ -4,6 +4,7 @@ using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Markup.Xaml;
 using Avalonia.Platform;
+using Avalonia.Threading;
 using TermLink.Pc.Contracts;
 using TermLink.Platform;
 using TermLink.Presentation;
@@ -94,14 +95,18 @@ public sealed partial class App : Application
                 descriptor,
                 new TraceNavigationTelemetry(),
                 desktopOperations,
-                appearanceController);
+                appearanceController,
+                DesktopProductInfo.Version,
+                DesktopProductInfo.Author);
             mainWindow = new MainWindow { DataContext = mainWindowViewModel };
             if (Program.StartHidden) mainWindow.Opened += (_, _) => mainWindow.Hide();
             mainWindow.Closing += OnMainWindowClosing;
             desktop.MainWindow = mainWindow;
             trayIcon = CreateTrayIcon();
             desktop.Exit += OnExit;
+            Program.ActivationRequested += OnActivationRequested;
             mainWindowViewModel.Start();
+            if (Program.ConsumePendingActivation()) ShowMainWindow();
         }
 
         base.OnFrameworkInitializationCompleted();
@@ -109,6 +114,7 @@ public sealed partial class App : Application
 
     private void OnExit(object? sender, ControlledApplicationLifetimeExitEventArgs e)
     {
+        Program.ActivationRequested -= OnActivationRequested;
         trayIcon?.Dispose();
         trayIcon = null;
         if (mainWindow is not null)
@@ -127,6 +133,9 @@ public sealed partial class App : Application
         platformLifetime = null;
         desktopLifetime = null;
     }
+
+    private void OnActivationRequested(object? sender, EventArgs e) =>
+        Dispatcher.UIThread.Post(ShowMainWindow);
 
     private TrayIcon CreateTrayIcon()
     {
@@ -154,7 +163,7 @@ public sealed partial class App : Application
         var result = new TrayIcon
         {
             Icon = new WindowIcon(iconStream),
-            ToolTipText = "TermLink PC",
+            ToolTipText = DesktopProductInfo.Title,
             Menu = menu,
             IsVisible = true,
         };

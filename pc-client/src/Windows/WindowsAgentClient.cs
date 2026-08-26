@@ -182,22 +182,23 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(commands);
-        var manual = commands.Where(command => !command.Detected)
+        var configured = commands
             .Select(command => new ProductionTerminalCommandSummary
             {
                 Id = command.Id,
                 DisplayName = command.DisplayName,
                 Executable = command.Executable,
                 Arguments = command.Arguments.Count == 0 ? string.Empty : command.Arguments[0],
-                ShellType = "custom",
-                Detected = false,
-                Enabled = true
+                ShellType = command.Detected ? command.Id : "custom",
+                Detected = command.Detected,
+                Enabled = command.Enabled,
+                RunAsAdministrator = command.RunAsAdministrator
             })
             .ToList();
         await SendRequiredAsync(new RegistryRequest
         {
             Command = RegistryCommand.SaveTerminalCommands,
-            TerminalCommands = manual
+            TerminalCommands = configured
         }, 30_000, cancellationToken).ConfigureAwait(false);
     }
 
@@ -335,7 +336,10 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
                 string.IsNullOrWhiteSpace(command.Arguments)
                     ? Array.Empty<string>()
                     : new[] { command.Arguments },
-                command.Detected))
+                command.Detected,
+                command.RunAsAdministrator,
+                command.Enabled))
+            .Where(command => command.Enabled)
             .ToArray();
         var capabilities = new HashSet<string> { PcCapabilityIds.RealtimeTerminalV1 };
         if (production.TerminalSnapshotEnabled) capabilities.Add(PcCapabilityIds.TerminalSnapshotV1);

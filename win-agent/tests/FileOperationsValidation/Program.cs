@@ -558,6 +558,8 @@ static void ValidateTerminalLaunch(string testRoot)
         direct.ArgumentList.Contains("--working-directory-base64") &&
         direct.ArgumentList.Contains("--registration-timeout-ms"),
         "terminal launcher omitted managed SessionHost identity or working-directory arguments");
+    Require(direct.UseShellExecute && direct.Verb == "runas",
+        "default terminal launch did not request administrator authorization");
     var registrationTimeoutIndex = direct.ArgumentList.IndexOf("--registration-timeout-ms");
     Require(direct.ArgumentList[registrationTimeoutIndex + 1] == "30000",
         "terminal launcher did not preserve the extended registration window");
@@ -586,11 +588,12 @@ static void ValidateTerminalLaunch(string testRoot)
     try
     {
         var custom = TerminalCommandProfileStore.CreateManualProfile(
-            null, "Project CLI", stub, "--project alpha --interactive");
+            null, "Project CLI", stub, "--project alpha --interactive", true, false);
         TerminalCommandProfileStore.SaveManualProfiles(new[] { custom });
         var roundTrip = TerminalCommandProfileStore.LoadManualProfiles().Single();
         Require(roundTrip.Id == custom.Id && roundTrip.DisplayName == "Project CLI" &&
-            roundTrip.Arguments == "--project alpha --interactive",
+            roundTrip.Arguments == "--project alpha --interactive" &&
+            !roundTrip.RunAsAdministrator,
             "manual terminal command settings did not round-trip");
         var customStarts = new RecordingProcessStarter();
         var customLauncher = new ManagedTerminalLauncher(
@@ -602,8 +605,31 @@ static void ValidateTerminalLaunch(string testRoot)
             Convert.FromBase64String(customStart.ArgumentList[customCommandIndex + 1]));
         var managedShellIndex = customStart.ArgumentList.IndexOf("--managed-shell");
         Require(customCommand.Contains("--project alpha --interactive", StringComparison.Ordinal) &&
-            customStart.ArgumentList[managedShellIndex + 1] == "custom",
+            customStart.ArgumentList[managedShellIndex + 1] == "custom" &&
+            string.IsNullOrEmpty(customStart.Verb),
             "custom terminal command was not resolved, launched, and advertised as a managed custom shell");
+
+        var detectedOverride = TerminalCommandProfileStore.CreateConfiguredProfile(
+            "windows-powershell", "PowerShell hidden", stub, "-NoLogo", "windows-powershell",
+            true, false, false);
+        TerminalCommandProfileStore.SaveConfiguredProfiles(new[] { custom, detectedOverride });
+        var configuredRoundTrip = TerminalCommandProfileStore.LoadConfiguredProfiles();
+        Require(configuredRoundTrip.Count == 2 &&
+            configuredRoundTrip.Single(profile => profile.Id == "windows-powershell").Enabled == false,
+            "a deleted auto-detected command override was not persisted");
+        var overriddenLauncher = new ManagedTerminalLauncher(
+            new WindowsPathService(), new RecordingProcessStarter(), () => null, stub, stub, stub, stub, stub);
+        RequireFileOperationCode(
+            () => overriddenLauncher.Launch("windows-powershell", testRoot),
+            "SHELL_NOT_ALLOWED");
+
+        File.WriteAllText(settingsPath,
+            "[{\"id\":\"legacy-profile\",\"display_name\":\"Legacy\",\"executable_path\":" +
+            JsonSerializer.Serialize(stub) +
+            ",\"arguments\":\"\",\"managed_shell\":\"custom\",\"source\":\"manual\",\"enabled\":true}]",
+            Encoding.UTF8);
+        Require(TerminalCommandProfileStore.LoadManualProfiles().Single().RunAsAdministrator,
+            "legacy terminal-command JSON did not default administrator launch to true");
 
         File.WriteAllText(settingsPath, "not-json", Encoding.UTF8);
         Require(TerminalCommandProfileStore.LoadManualProfiles().Count == 0,

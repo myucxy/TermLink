@@ -46,7 +46,8 @@ try
         "Validation Command",
         Path.Combine(Environment.SystemDirectory, "cmd.exe"),
         new[] { "/d /q" },
-        false);
+        false,
+        true);
     await client.SaveTerminalCommandsAsync(new[] { command }, CancellationToken.None);
     var commandPath = Path.Combine(localData, "TermLink", "Agent", "terminal-commands.json");
     Require(File.Exists(commandPath), "The Agent did not persist the manual terminal command in the isolated root.");
@@ -63,7 +64,7 @@ try
     Require(!signedOut.AccountLinked && signedOut.ConnectionState == AgentConnectionState.NotConfigured,
         "The isolated sign-out flow did not restart into an unconfigured state.");
     Console.WriteLine(
-        "Windows Avalonia adapter validation passed: authenticated V8 status/actions, stable revisions, " +
+        "Windows Avalonia adapter validation passed: authenticated V9 status/actions, stable revisions, " +
         "isolated command settings, and sign-out restart.");
 }
 finally

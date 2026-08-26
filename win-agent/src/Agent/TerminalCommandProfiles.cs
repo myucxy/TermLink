@@ -30,6 +30,9 @@ namespace TermLink.Agent
 
         [JsonPropertyName("enabled")]
         public bool Enabled { get; set; }
+
+        [JsonPropertyName("run_as_administrator")]
+        public bool RunAsAdministrator { get; set; } = true;
     }
 
     internal sealed class TerminalCommandCapability
@@ -61,10 +64,18 @@ namespace TermLink.Agent
         private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-            WriteIndented = true
+            WriteIndented = true,
+            PreferredObjectCreationHandling = JsonObjectCreationHandling.Populate
         };
 
         internal static IReadOnlyList<TerminalCommandProfile> LoadManualProfiles()
+        {
+            return LoadConfiguredProfiles()
+                .Where(profile => string.Equals(profile.Source, "manual", StringComparison.Ordinal))
+                .ToArray();
+        }
+
+        internal static IReadOnlyList<TerminalCommandProfile> LoadConfiguredProfiles()
         {
             lock (Gate)
             {
@@ -87,6 +98,14 @@ namespace TermLink.Agent
         }
 
         internal static void SaveManualProfiles(IEnumerable<TerminalCommandProfile> profiles)
+        {
+            if (profiles == null) throw new ArgumentNullException(nameof(profiles));
+            var detected = LoadConfiguredProfiles()
+                .Where(profile => string.Equals(profile.Source, "detected", StringComparison.Ordinal));
+            SaveConfiguredProfiles(detected.Concat(profiles));
+        }
+
+        internal static void SaveConfiguredProfiles(IEnumerable<TerminalCommandProfile> profiles)
         {
             if (profiles == null) throw new ArgumentNullException(nameof(profiles));
             var normalized = NormalizeProfiles(profiles, requireExecutable: true);
@@ -118,7 +137,8 @@ namespace TermLink.Agent
             string displayName,
             string executable,
             string arguments,
-            bool enabled = true)
+            bool enabled = true,
+            bool runAsAdministrator = true)
         {
             var resolvedExecutable = ResolveExecutable(executable);
             return NormalizeProfile(new TerminalCommandProfile
@@ -129,7 +149,32 @@ namespace TermLink.Agent
                 Arguments = arguments,
                 ManagedShell = ManagedTerminalLauncher.CustomShellType,
                 Source = "manual",
-                Enabled = enabled
+                Enabled = enabled,
+                RunAsAdministrator = runAsAdministrator
+            }, requireExecutable: true);
+        }
+
+        internal static TerminalCommandProfile CreateConfiguredProfile(
+            string id,
+            string displayName,
+            string executable,
+            string arguments,
+            string managedShell,
+            bool detected,
+            bool enabled,
+            bool runAsAdministrator)
+        {
+            var resolvedExecutable = ResolveExecutable(executable);
+            return NormalizeProfile(new TerminalCommandProfile
+            {
+                Id = id,
+                DisplayName = displayName,
+                ExecutablePath = resolvedExecutable,
+                Arguments = arguments,
+                ManagedShell = managedShell,
+                Source = detected ? "detected" : "manual",
+                Enabled = enabled,
+                RunAsAdministrator = runAsAdministrator
             }, requireExecutable: true);
         }
 
@@ -177,8 +222,8 @@ namespace TermLink.Agent
             var identifiers = new HashSet<string>(StringComparer.Ordinal);
             foreach (var profile in profiles)
             {
-                if (result.Count >= MaximumManualProfiles)
-                    throw new InvalidDataException("Too many manual terminal commands are configured.");
+                if (result.Count >= 24)
+                    throw new InvalidDataException("Too many terminal commands are configured.");
                 var normalized = NormalizeProfile(profile, requireExecutable);
                 if (!identifiers.Add(normalized.Id))
                     throw new InvalidDataException("Terminal command identifiers must be unique.");
@@ -193,8 +238,9 @@ namespace TermLink.Agent
         {
             if (profile == null) throw new InvalidDataException("A terminal command is missing.");
             var id = (profile.Id ?? string.Empty).Trim().ToLowerInvariant();
-            if (!ValidIdentifier(id) || ManagedTerminalLauncher.IsBuiltInShellType(id))
-                throw new InvalidDataException("The terminal command identifier is invalid or reserved.");
+            var detected = string.Equals(profile.Source, "detected", StringComparison.Ordinal);
+            if (!ValidIdentifier(id) || detected != ManagedTerminalLauncher.IsBuiltInShellType(id))
+                throw new InvalidDataException("The terminal command identifier or source is invalid.");
             var displayName = (profile.DisplayName ?? string.Empty).Trim();
             if (displayName.Length == 0 || Encoding.UTF8.GetByteCount(displayName) > MaximumDisplayNameBytes ||
                 displayName.Any(char.IsControl))
@@ -208,15 +254,19 @@ namespace TermLink.Agent
             executable = Path.GetFullPath(executable);
             if (requireExecutable && profile.Enabled && !File.Exists(executable))
                 throw new FileNotFoundException("The terminal command executable was not found.", executable);
+            var managedShell = detected ? id : ManagedTerminalLauncher.CustomShellType;
+            if (detected && !string.Equals(profile.ManagedShell, managedShell, StringComparison.Ordinal))
+                throw new InvalidDataException("The detected terminal command shell is invalid.");
             return new TerminalCommandProfile
             {
                 Id = id,
                 DisplayName = displayName,
                 ExecutablePath = executable,
                 Arguments = arguments,
-                ManagedShell = ManagedTerminalLauncher.CustomShellType,
-                Source = "manual",
-                Enabled = profile.Enabled
+                ManagedShell = managedShell,
+                Source = detected ? "detected" : "manual",
+                Enabled = profile.Enabled,
+                RunAsAdministrator = profile.RunAsAdministrator
             };
         }
 

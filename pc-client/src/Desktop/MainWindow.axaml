@@ -19,7 +19,10 @@
             Padding="16">
       <Grid RowDefinitions="Auto,Auto,*,Auto">
         <StackPanel Margin="4,4,4,0">
-          <TextBlock Text="TermLink" FontSize="24" FontWeight="Bold" />
+          <Grid ColumnDefinitions="32,*" ColumnSpacing="9">
+            <Image Source="avares://TermLink/Assets/TermLink.ico" Width="28" Height="28" VerticalAlignment="Center" />
+            <TextBlock Grid.Column="1" Text="TermLink" FontSize="24" FontWeight="Bold" VerticalAlignment="Center" />
+          </Grid>
           <TextBlock Text="{x:Static text:PresentationText.ControlCenter}" Classes="muted" Margin="0,2,0,0" />
         </StackPanel>
 
@@ -152,7 +155,7 @@
                             Command="{Binding RetryConnectionCommand}" />
                   </StackPanel>
                 </Grid>
-                <Grid ColumnDefinitions="*,*,*,*" ColumnSpacing="10">
+                <Grid ColumnDefinitions="*,*,*" ColumnSpacing="10">
                   <Border Classes="subtle-card">
                     <StackPanel><TextBlock Text="{x:Static text:PresentationText.RemoteAccess}" Classes="muted" FontSize="12" /><TextBlock Text="{Binding RemoteAccessStatusText}" FontWeight="SemiBold" Margin="0,3,0,0" /></StackPanel>
                   </Border>
@@ -160,56 +163,11 @@
                     <StackPanel><TextBlock Text="{x:Static text:PresentationText.ActiveSessions}" Classes="muted" FontSize="12" /><TextBlock Text="{Binding ActiveSessionCount}" FontSize="20" FontWeight="SemiBold" /></StackPanel>
                   </Border>
                   <Border Grid.Column="2" Classes="subtle-card">
-                    <StackPanel><TextBlock Text="{x:Static text:PresentationText.OnlineDevices}" Classes="muted" FontSize="12" /><TextBlock Text="{Binding OnlineDeviceCount}" FontSize="20" FontWeight="SemiBold" /></StackPanel>
-                  </Border>
-                  <Border Grid.Column="3" Classes="subtle-card">
                     <StackPanel><TextBlock Text="{x:Static text:PresentationText.AgentVersion}" Classes="muted" FontSize="12" /><TextBlock Text="{Binding Settings.Version}" FontWeight="SemiBold" Margin="0,3,0,0" /></StackPanel>
                   </Border>
                 </Grid>
               </StackPanel>
             </Border>
-
-            <Grid ColumnDefinitions="*,Auto">
-              <StackPanel>
-                <TextBlock Classes="section-title" Text="{x:Static text:PresentationText.SignedInDevices}" />
-                <TextBlock Classes="muted" Text="{x:Static text:PresentationText.SignInDetail}" FontSize="12" Margin="0,3,0,0" />
-              </StackPanel>
-              <TextBlock Grid.Column="1" Text="{Binding Devices.Items.Count}" Classes="muted" VerticalAlignment="Center" />
-            </Grid>
-
-            <Border Classes="card" IsVisible="{Binding HasNoDevices}">
-              <StackPanel HorizontalAlignment="Center" Margin="20,34" Spacing="7">
-                <PathIcon Data="{DynamicResource TermLinkDevicesIcon}" Width="42" Height="42" Foreground="{DynamicResource TermLinkMutedBrush}" />
-                <TextBlock Text="{x:Static text:PresentationText.NoDevices}" FontSize="18" FontWeight="SemiBold" HorizontalAlignment="Center" />
-                <TextBlock Text="{x:Static text:PresentationText.NoDevicesDetail}" Classes="muted" TextWrapping="Wrap" TextAlignment="Center" MaxWidth="440" />
-              </StackPanel>
-            </Border>
-
-            <ListBox x:Name="DeviceList" Classes="clean" ItemsSource="{Binding Devices.Items}" IsVisible="{Binding HasDevices}">
-              <ListBox.ItemsPanel><ItemsPanelTemplate><VirtualizingStackPanel /></ItemsPanelTemplate></ListBox.ItemsPanel>
-              <ListBox.ItemTemplate>
-                <DataTemplate x:DataType="vm:DeviceListItemViewModel">
-                  <Border Classes="card compact" Margin="0,0,0,8">
-                    <Grid ColumnDefinitions="Auto,*,Auto,Auto" ColumnSpacing="12">
-                      <PathIcon Data="{DynamicResource TermLinkDevicesIcon}" Width="22" Height="22" Foreground="{DynamicResource TermLinkPrimaryBrush}" VerticalAlignment="Center" />
-                      <StackPanel Grid.Column="1">
-                        <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
-                        <TextBlock Text="{Binding DetailText}" Classes="muted" FontSize="12" />
-                      </StackPanel>
-                      <Border Grid.Column="2" Classes="status-pill" VerticalAlignment="Center">
-                        <Grid ColumnDefinitions="Auto,Auto" ColumnSpacing="7">
-                          <Border Classes="status-dot" Classes.online="{Binding Online}" VerticalAlignment="Center" />
-                          <TextBlock Grid.Column="1" Text="{Binding OnlineState}" FontSize="12" />
-                        </Grid>
-                      </Border>
-                      <Button Grid.Column="3" Classes="ghost" Content="{x:Static text:PresentationText.Revoke}"
-                              Command="{Binding $parent[Window].DataContext.RevokeDeviceCommand}"
-                              CommandParameter="{Binding DeviceId}" />
-                    </Grid>
-                  </Border>
-                </DataTemplate>
-              </ListBox.ItemTemplate>
-            </ListBox>
           </StackPanel>
         </ScrollViewer>
 
@@ -272,8 +230,9 @@
               <Button Classes="section-nav" Classes.selected="{Binding IsGeneralSettingsSelected}" Content="{x:Static text:PresentationText.General}" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="general" />
               <Button Classes="section-nav" Classes.selected="{Binding IsAccountSettingsSelected}" Content="{x:Static text:PresentationText.Account}" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="account" />
               <Button Classes="section-nav" Classes.selected="{Binding IsCommandsSettingsSelected}" Content="{x:Static text:PresentationText.Commands}" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="commands" />
-              <Button Classes="section-nav" Classes.selected="{Binding IsUpdatesSettingsSelected}" Content="{x:Static text:PresentationText.UpdateAndIntegration}" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="updates" />
+              <Button Classes="section-nav" Classes.selected="{Binding IsIntegrationSettingsSelected}" Content="{x:Static text:PresentationText.Integration}" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="integration" />
               <Button Classes="section-nav" Classes.selected="{Binding IsDiagnosticsSettingsSelected}" Content="{x:Static text:PresentationText.Diagnostics}" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="diagnostics" />
+              <Button Classes="section-nav" Classes.selected="{Binding IsAboutSettingsSelected}" Content="{x:Static text:PresentationText.About}" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="about" />
             </WrapPanel>
           </StackPanel>
 
@@ -366,7 +325,7 @@
                               <TextBlock Text="{x:Static text:PresentationText.CustomCommand}" IsVisible="{Binding !Detected}" FontSize="12" />
                             </Grid>
                           </Border>
-                          <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" IsVisible="{Binding !Detected}">
+                          <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6">
                             <Button Classes="subtle" Content="{x:Static text:PresentationText.Edit}" Command="{Binding $parent[Window].DataContext.OpenTerminalCommandEditorCommand}" CommandParameter="{Binding}" />
                             <Button Classes="danger" Content="{x:Static text:PresentationText.Delete}" Command="{Binding $parent[Window].DataContext.RemoveTerminalCommandCommand}" CommandParameter="{Binding}" />
                           </StackPanel>
@@ -377,13 +336,7 @@
                 </ListBox>
               </Grid>
 
-              <StackPanel x:Name="UpdatesSettingsRoot" IsVisible="{Binding IsUpdatesSettingsSelected}" Spacing="14">
-                <Border Classes="card">
-                  <Grid ColumnDefinitions="*,Auto" ColumnSpacing="18">
-                    <StackPanel><TextBlock Classes="section-title" Text="{x:Static text:PresentationText.DesktopAndUpdates}" /><TextBlock Text="{x:Static text:PresentationText.UpdateSafetyDetail}" Classes="muted" TextWrapping="Wrap" Margin="0,4,0,0" /></StackPanel>
-                    <Button Grid.Column="1" Classes="primary" Content="{x:Static text:PresentationText.CheckUpdates}" AutomationProperties.Name="检查 TermLink 更新" Command="{Binding CheckForUpdatesCommand}" VerticalAlignment="Center" />
-                  </Grid>
-                </Border>
+              <StackPanel x:Name="IntegrationSettingsRoot" IsVisible="{Binding IsIntegrationSettingsSelected}" Spacing="14">
                 <Border Classes="card">
                   <Grid ColumnDefinitions="*,Auto" ColumnSpacing="18">
                     <StackPanel><TextBlock Classes="section-title" Text="Windows Terminal" /><TextBlock Text="{x:Static text:PresentationText.TerminalIntegrationDetail}" Classes="muted" /></StackPanel>
@@ -407,6 +360,32 @@
                   </StackPanel>
                 </Border>
                 <Button Classes="subtle" Content="{x:Static text:PresentationText.OpenLogs}" AutomationProperties.Name="打开 TermLink 诊断日志目录" Command="{Binding OpenDiagnosticsDirectoryCommand}" HorizontalAlignment="Left" />
+              </StackPanel>
+
+              <StackPanel x:Name="AboutSettingsRoot" IsVisible="{Binding IsAboutSettingsSelected}" Spacing="14">
+                <Border Classes="card">
+                  <StackPanel Spacing="18">
+                    <Grid ColumnDefinitions="64,*" ColumnSpacing="16">
+                      <Image Source="avares://TermLink/Assets/TermLink.ico" Width="56" Height="56" />
+                      <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                        <TextBlock Text="TermLink PC" FontSize="24" FontWeight="SemiBold" />
+                        <TextBlock Text="{x:Static text:PresentationText.AboutDetail}" Classes="muted" TextWrapping="Wrap" />
+                      </StackPanel>
+                    </Grid>
+                    <Grid ColumnDefinitions="150,*" RowDefinitions="Auto,Auto" RowSpacing="12">
+                      <TextBlock Text="{x:Static text:PresentationText.ApplicationVersion}" FontWeight="SemiBold" />
+                      <TextBlock Grid.Column="1" Text="{Binding Settings.ApplicationVersion}" Classes="mono" />
+                      <TextBlock Grid.Row="1" Text="{x:Static text:PresentationText.Author}" FontWeight="SemiBold" />
+                      <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Settings.Author}" />
+                    </Grid>
+                  </StackPanel>
+                </Border>
+                <Border Classes="card">
+                  <Grid ColumnDefinitions="*,Auto" ColumnSpacing="18">
+                    <StackPanel><TextBlock Classes="section-title" Text="{x:Static text:PresentationText.DesktopAndUpdates}" /><TextBlock Text="{x:Static text:PresentationText.UpdateSafetyDetail}" Classes="muted" TextWrapping="Wrap" Margin="0,4,0,0" /></StackPanel>
+                    <Button Grid.Column="1" Classes="primary" Content="{x:Static text:PresentationText.CheckUpdates}" AutomationProperties.Name="检查 TermLink 更新" Command="{Binding CheckForUpdatesCommand}" VerticalAlignment="Center" />
+                  </Grid>
+                </Border>
               </StackPanel>
             </Grid>
           </ScrollViewer>
@@ -436,6 +415,12 @@
           <StackPanel Spacing="5"><TextBlock Text="{x:Static text:PresentationText.CommandDisplayName}" /><TextBox x:Name="NewCommandName" Text="{Binding Settings.NewCommandName}" AutomationProperties.Name="命令显示名称" /></StackPanel>
           <StackPanel Spacing="5"><TextBlock Text="{x:Static text:PresentationText.CommandExecutable}" /><TextBox Text="{Binding Settings.NewExecutable}" AutomationProperties.Name="命令可执行文件" /></StackPanel>
           <StackPanel Spacing="5"><TextBlock Text="{x:Static text:PresentationText.CommandArguments}" /><TextBox Text="{Binding Settings.NewArguments}" AutomationProperties.Name="命令参数" /></StackPanel>
+          <CheckBox IsChecked="{Binding Settings.NewRunAsAdministrator}" AutomationProperties.Name="默认使用管理员权限打开">
+            <StackPanel>
+              <TextBlock Text="{x:Static text:PresentationText.RunAsAdministrator}" FontWeight="SemiBold" />
+              <TextBlock Text="{x:Static text:PresentationText.RunAsAdministratorDetail}" Classes="muted" FontSize="12" TextWrapping="Wrap" />
+            </StackPanel>
+          </CheckBox>
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
             <Button Classes="subtle" Content="{x:Static text:PresentationText.Cancel}" Command="{Binding CancelTerminalCommandEditorCommand}" />
             <Button Classes="primary" Content="{x:Static text:PresentationText.Add}" Command="{Binding AddTerminalCommandCommand}" />

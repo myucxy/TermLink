@@ -812,6 +812,7 @@ namespace TermLink.Agent
                 terminalStart.ArgumentList.Add("-w");
                 terminalStart.ArgumentList.Add("new");
                 terminalStart.ArgumentList.Add("new-tab");
+                if (profile.RunAsAdministrator) terminalStart.ArgumentList.Add("--elevate");
                 terminalStart.ArgumentList.Add("-d");
                 terminalStart.ArgumentList.Add(directory);
                 terminalStart.ArgumentList.Add(sessionHostPath);
@@ -837,6 +838,7 @@ namespace TermLink.Agent
                 WorkingDirectory = directory,
                 UseShellExecute = true
             };
+            if (profile.RunAsAdministrator) directStart.Verb = "runas";
             foreach (var argument in arguments) directStart.ArgumentList.Add(argument);
             try
             {
@@ -1004,12 +1006,17 @@ namespace TermLink.Agent
         private IReadOnlyList<TerminalCommandProfile> AvailableProfiles()
         {
             if (!File.Exists(sessionHostPath)) return Array.Empty<TerminalCommandProfile>();
+            var configured = TerminalCommandProfileStore.LoadConfiguredProfiles();
+            var overrides = configured
+                .Where(profile => string.Equals(profile.Source, "detected", StringComparison.Ordinal))
+                .ToDictionary(profile => profile.Id, StringComparer.Ordinal);
             var result = new List<TerminalCommandProfile>(24);
-            AddBuiltIn(result, CommandPromptShellType, "Command Prompt", commandPromptPath, string.Empty);
-            AddBuiltIn(result, WindowsPowerShellShellType, "Windows PowerShell", windowsPowerShellPath, "-NoLogo -NoProfile");
-            AddBuiltIn(result, PowerShell7ShellType, "PowerShell 7", powerShell7Path, "-NoLogo -NoProfile");
-            AddBuiltIn(result, WslShellType, "WSL", wslPath, string.Empty);
-            foreach (var profile in TerminalCommandProfileStore.LoadManualProfiles())
+            AddBuiltIn(result, overrides, CommandPromptShellType, "Command Prompt", commandPromptPath, string.Empty);
+            AddBuiltIn(result, overrides, WindowsPowerShellShellType, "Windows PowerShell", windowsPowerShellPath, "-NoLogo -NoProfile");
+            AddBuiltIn(result, overrides, PowerShell7ShellType, "PowerShell 7", powerShell7Path, "-NoLogo -NoProfile");
+            AddBuiltIn(result, overrides, WslShellType, "WSL", wslPath, string.Empty);
+            foreach (var profile in configured.Where(profile =>
+                string.Equals(profile.Source, "manual", StringComparison.Ordinal)))
             {
                 if (profile.Enabled && File.Exists(profile.ExecutablePath)) result.Add(profile);
             }
@@ -1018,12 +1025,18 @@ namespace TermLink.Agent
 
         private static void AddBuiltIn(
             ICollection<TerminalCommandProfile> result,
+            IReadOnlyDictionary<string, TerminalCommandProfile> overrides,
             string id,
             string displayName,
             string executablePath,
             string arguments)
         {
             if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath)) return;
+            if (overrides.TryGetValue(id, out var configured))
+            {
+                if (configured.Enabled && File.Exists(configured.ExecutablePath)) result.Add(configured);
+                return;
+            }
             result.Add(new TerminalCommandProfile
             {
                 Id = id,
@@ -1032,7 +1045,8 @@ namespace TermLink.Agent
                 Arguments = arguments,
                 ManagedShell = id,
                 Source = "detected",
-                Enabled = true
+                Enabled = true,
+                RunAsAdministrator = true
             });
         }
 

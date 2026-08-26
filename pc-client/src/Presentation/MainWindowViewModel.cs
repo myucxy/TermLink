@@ -131,6 +131,7 @@ public sealed class SettingsPageViewModel : PageViewModel
     private string newCommandName = string.Empty;
     private string newExecutable = string.Empty;
     private string newArguments = string.Empty;
+    private bool newRunAsAdministrator = true;
     private string? editingCommandId;
     private bool commandEditorOpen;
     private bool hasUnsavedCommands;
@@ -141,10 +142,14 @@ public sealed class SettingsPageViewModel : PageViewModel
     public string NewCommandName { get => newCommandName; set => SetProperty(ref newCommandName, value); }
     public string NewExecutable { get => newExecutable; set => SetProperty(ref newExecutable, value); }
     public string NewArguments { get => newArguments; set => SetProperty(ref newArguments, value); }
+    public bool NewRunAsAdministrator { get => newRunAsAdministrator; set => SetProperty(ref newRunAsAdministrator, value); }
+    public string ApplicationVersion { get; internal set; } = "1.0.0.0";
+    public string Author { get; internal set; } = "myucxy";
     public string? EditingCommandId { get => editingCommandId; internal set => SetProperty(ref editingCommandId, value); }
     public bool CommandEditorOpen { get => commandEditorOpen; internal set => SetProperty(ref commandEditorOpen, value); }
     public bool HasUnsavedCommands { get => hasUnsavedCommands; internal set => SetProperty(ref hasUnsavedCommands, value); }
     public ObservableCollection<TerminalCommandCapability> TerminalCommands { get; } = new();
+    internal List<TerminalCommandCapability> RemovedTerminalCommands { get; } = new();
 }
 
 public sealed class DiagnosticsPageViewModel : ObservableObject
@@ -166,7 +171,7 @@ public sealed class DiagnosticsPageViewModel : ObservableObject
 
 public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 {
-    private static readonly string[] SettingsSections = ["general", "account", "commands", "updates", "diagnostics"];
+    private static readonly string[] SettingsSections = ["general", "account", "commands", "integration", "diagnostics", "about"];
     private readonly AgentStateStore stateStore;
     private readonly IAgentClient client;
     private readonly IDesktopOperations? desktopOperations;
@@ -196,7 +201,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         PlatformDescriptor descriptor,
         INavigationTelemetry? navigationTelemetry = null,
         IDesktopOperations? desktopOperations = null,
-        IAppearanceController? appearanceController = null)
+        IAppearanceController? appearanceController = null,
+        string applicationVersion = "1.0.0.0",
+        string author = "myucxy")
     {
         this.stateStore = stateStore ?? throw new ArgumentNullException(nameof(stateStore));
         this.client = client ?? throw new ArgumentNullException(nameof(client));
@@ -215,6 +222,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Settings = new SettingsPageViewModel
         {
             Platform = $"{descriptor.Platform} · {descriptor.Architecture} · {descriptor.PlatformVersion}",
+            ApplicationVersion = applicationVersion,
+            Author = author,
         };
         pages = new PageViewModel[] { Devices, Sessions, Settings }
             .ToDictionary(page => page.Key, StringComparer.Ordinal);
@@ -347,8 +356,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public bool IsGeneralSettingsSelected => settingsSection == "general";
     public bool IsAccountSettingsSelected => settingsSection == "account";
     public bool IsCommandsSettingsSelected => settingsSection == "commands";
-    public bool IsUpdatesSettingsSelected => settingsSection == "updates";
+    public bool IsIntegrationSettingsSelected => settingsSection == "integration";
     public bool IsDiagnosticsSettingsSelected => settingsSection == "diagnostics";
+    public bool IsAboutSettingsSelected => settingsSection == "about";
     public string AgentName { get => agentName; private set => SetProperty(ref agentName, value); }
     public string StatusText { get => statusText; private set => SetProperty(ref statusText, value); }
     public string OperationMessage { get => operationMessage; private set => SetProperty(ref operationMessage, value); }
@@ -416,8 +426,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         RaisePropertyChanged(nameof(IsGeneralSettingsSelected));
         RaisePropertyChanged(nameof(IsAccountSettingsSelected));
         RaisePropertyChanged(nameof(IsCommandsSettingsSelected));
-        RaisePropertyChanged(nameof(IsUpdatesSettingsSelected));
+        RaisePropertyChanged(nameof(IsIntegrationSettingsSelected));
         RaisePropertyChanged(nameof(IsDiagnosticsSettingsSelected));
+        RaisePropertyChanged(nameof(IsAboutSettingsSelected));
         RaisePropertyChanged(nameof(IsAccountPageSelected));
         RaisePropertyChanged(nameof(IsDiagnosticsPageSelected));
     }
@@ -631,11 +642,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     private void OpenTerminalCommandEditor(TerminalCommandCapability? command)
     {
-        if (command?.Detected == true) return;
         Settings.EditingCommandId = command?.Id;
         Settings.NewCommandName = command?.DisplayName ?? string.Empty;
         Settings.NewExecutable = command?.Executable ?? string.Empty;
         Settings.NewArguments = command is null ? string.Empty : string.Join(' ', command.Arguments);
+        Settings.NewRunAsAdministrator = command?.RunAsAdministrator ?? true;
         Settings.CommandEditorOpen = true;
     }
 
@@ -660,6 +671,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 DisplayName = name,
                 Executable = executable,
                 Arguments = arguments,
+                RunAsAdministrator = Settings.NewRunAsAdministrator,
             };
             ShowNotice(UiNoticeSeverity.Info, PresentationText.CommandUpdated, string.Empty);
         }
@@ -670,7 +682,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 name,
                 executable,
                 arguments,
-                false));
+                false,
+                Settings.NewRunAsAdministrator));
             ShowNotice(UiNoticeSeverity.Info, PresentationText.CommandAdded, string.Empty);
         }
         Settings.HasUnsavedCommands = true;
@@ -679,8 +692,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     private void RemoveTerminalCommand(TerminalCommandCapability? command)
     {
-        if (command is null || command.Detected) return;
+        if (command is null) return;
         Settings.TerminalCommands.Remove(command);
+        Settings.RemovedTerminalCommands.RemoveAll(item => item.Id == command.Id);
+        Settings.RemovedTerminalCommands.Add(command with { Enabled = false });
         Settings.HasUnsavedCommands = true;
         ShowNotice(UiNoticeSeverity.Info, PresentationText.CommandRemoved, string.Empty);
     }
@@ -690,14 +705,20 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         if (!Settings.HasUnsavedCommands) return;
         await MutateAsync(
             token => client.SaveTerminalCommandsAsync(
-                Settings.TerminalCommands.Where(command => !command.Detected).ToArray(),
+                Settings.TerminalCommands
+                    .Concat(Settings.RemovedTerminalCommands)
+                    .ToArray(),
                 token),
             PresentationText.CommandsSaved,
             cancellationToken).ConfigureAwait(false);
         if (NoticeSeverity == UiNoticeSeverity.Success)
         {
             await dispatcher.InvokeAsync(
-                () => Settings.HasUnsavedCommands = false,
+                () =>
+                {
+                    Settings.HasUnsavedCommands = false;
+                    Settings.RemovedTerminalCommands.Clear();
+                },
                 cancellationToken);
         }
     }
@@ -708,6 +729,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Settings.NewCommandName = string.Empty;
         Settings.NewExecutable = string.Empty;
         Settings.NewArguments = string.Empty;
+        Settings.NewRunAsAdministrator = true;
         Settings.CommandEditorOpen = false;
     }
 

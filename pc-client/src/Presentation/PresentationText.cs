@@ -18,7 +18,7 @@ public static class PresentationText
     public static string Console => Pick("TermLink 桌面端", "TermLink Desktop");
     public static string DeviceOverview => Pick("设备", "Device");
     public static string ThisDevice => Pick("这台终端", "This terminal");
-    public static string ThisDeviceDetail => Pick("管理本机 Agent、远程访问和已登录设备。", "Manage this Agent, remote access, and signed-in devices.");
+    public static string ThisDeviceDetail => Pick("管理本机 Agent、远程访问和活动会话。", "Manage this Agent, remote access, and active sessions.");
     public static string Connection => Pick("连接服务器", "Connection");
     public static string Sessions => Pick("会话", "Sessions");
     public static string Devices => Pick("设备", "Devices");
@@ -76,6 +76,8 @@ public static class PresentationText
     public static string CommandDisplayName => Pick("手机端显示名称", "Mobile display name");
     public static string CommandExecutable => Pick("可执行文件或绝对路径", "Executable or absolute path");
     public static string CommandArguments => Pick("参数组合", "Arguments");
+    public static string RunAsAdministrator => Pick("默认使用管理员权限打开", "Open as administrator by default");
+    public static string RunAsAdministratorDetail => Pick("启动时由 Windows 显示 UAC 确认；TermLink 不会绕过系统授权。", "Windows shows a UAC prompt at launch; TermLink never bypasses system authorization.");
     public static string Add => Pick("添加", "Add");
     public static string Save => Pick("保存", "Save");
     public static string AddCustomCommand => Pick("添加自定义命令", "Add custom command");
@@ -85,7 +87,7 @@ public static class PresentationText
     public static string UnsavedChanges => Pick("命令配置有尚未保存的更改", "Command settings have unsaved changes");
     public static string AutomaticCommand => Pick("自动检测", "Auto-detected");
     public static string CustomCommand => Pick("自定义", "Custom");
-    public static string DesktopAndUpdates => Pick("桌面与更新", "Desktop and updates");
+    public static string DesktopAndUpdates => Pick("桌面更新", "Desktop updates");
     public static string UpdateSafetyDetail => Pick(
         "更新由保留的已签名组件执行；关闭控制 UI 不会关闭 Agent。",
         "Updates run through the retained signed component; closing the control UI does not stop the Agent.");
@@ -94,7 +96,11 @@ public static class PresentationText
     public static string Delete => Pick("删除", "Delete");
     public static string General => Pick("常规", "General");
     public static string Commands => Pick("命令", "Commands");
-    public static string UpdateAndIntegration => Pick("更新与集成", "Updates and integration");
+    public static string Integration => Pick("集成", "Integration");
+    public static string About => Pick("关于", "About");
+    public static string Author => Pick("作者", "Author");
+    public static string ApplicationVersion => Pick("桌面端版本", "Desktop version");
+    public static string AboutDetail => Pick("TermLink 桌面控制端和更新信息。", "TermLink desktop control UI and update information.");
     public static string Appearance => Pick("外观", "Appearance");
     public static string AppearanceDetail => Pick("与 Android 使用同一套品牌颜色。", "Uses the same brand colors as Android.");
     public static string FollowSystem => Pick("跟随系统", "System");

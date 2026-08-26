@@ -86,8 +86,9 @@ public static class Program
         var devicesRoot = RequireControl<Control>(window, "DevicesPageRoot");
         var accountRoot = RequireControl<Control>(window, "AccountPageRoot");
         var diagnosticsRoot = RequireControl<Control>(window, "DiagnosticsPageRoot");
+        var integrationRoot = RequireControl<Control>(window, "IntegrationSettingsRoot");
+        var aboutRoot = RequireControl<Control>(window, "AboutSettingsRoot");
         var sessionList = RequireControl<ListBox>(window, "SessionList");
-        var deviceList = RequireControl<ListBox>(window, "DeviceList");
         var commandList = RequireControl<ListBox>(window, "CommandList");
         Require(viewModel.Sessions.Sessions.Count == 100, "The 100-session snapshot was not applied.");
         Require(viewModel.Devices.Devices.Count == 100, "The 100-device snapshot was not applied.");
@@ -100,8 +101,6 @@ public static class Program
         Require(viewModel.CurrentPage.Key == "devices" && viewModel.Pages.Count == 3,
             "The Android-aligned three-destination desktop shell was not selected by default.");
 
-        Dispatcher.UIThread.RunJobs();
-        Require(deviceList.ItemsPanelRoot is VirtualizingStackPanel, "The device list is not virtualized.");
         viewModel.Navigate("sessions");
         Dispatcher.UIThread.RunJobs();
         Require(sessionList.ItemsPanelRoot is VirtualizingStackPanel, "The session list is not virtualized.");
@@ -113,6 +112,8 @@ public static class Program
         viewModel.OpenTerminalCommandEditorCommand.Execute(null);
         await DrainCommandAsync(viewModel.OpenTerminalCommandEditorCommand);
         Require(viewModel.Settings.CommandEditorOpen, "The custom-command editor did not open explicitly.");
+        Require(viewModel.Settings.NewRunAsAdministrator,
+            "New terminal commands did not default to administrator launch.");
         viewModel.Settings.NewCommandName = "Custom shell";
         viewModel.Settings.NewExecutable = "custom-shell.exe";
         viewModel.Settings.NewArguments = "--login";
@@ -125,9 +126,35 @@ public static class Program
         viewModel.RemoveTerminalCommandCommand.Execute(added);
         await DrainCommandAsync(viewModel.RemoveTerminalCommandCommand);
         Require(viewModel.Settings.TerminalCommands.Count == 2, "A manual command was not removed.");
-        viewModel.RemoveTerminalCommandCommand.Execute(viewModel.Settings.TerminalCommands[0]);
+        var detected = viewModel.Settings.TerminalCommands[0];
+        viewModel.OpenTerminalCommandEditorCommand.Execute(detected);
+        await DrainCommandAsync(viewModel.OpenTerminalCommandEditorCommand);
+        Require(viewModel.Settings.CommandEditorOpen && viewModel.Settings.EditingCommandId == detected.Id,
+            "An auto-detected command was not editable.");
+        viewModel.Settings.NewCommandName = "PowerShell edited";
+        viewModel.AddTerminalCommandCommand.Execute(null);
+        await DrainCommandAsync(viewModel.AddTerminalCommandCommand);
+        detected = viewModel.Settings.TerminalCommands.Single(command => command.Id == detected.Id);
+        Require(detected.DisplayName == "PowerShell edited",
+            "Editing an auto-detected command did not update its display name.");
+        viewModel.RemoveTerminalCommandCommand.Execute(detected);
         await DrainCommandAsync(viewModel.RemoveTerminalCommandCommand);
-        Require(viewModel.Settings.TerminalCommands.Count == 2, "An auto-detected command was removable.");
+        Require(viewModel.Settings.TerminalCommands.Count == 1, "An auto-detected command was not removable.");
+        viewModel.SaveTerminalCommandsCommand.Execute(null);
+        await DrainCommandAsync(viewModel.SaveTerminalCommandsCommand);
+        Require(client.SavedTerminalCommands.Any(command =>
+                command.Id == "pwsh" && command.Detected && !command.Enabled),
+            "Deleting an auto-detected command did not persist a disabled override.");
+
+        viewModel.SelectSettingsSection("about");
+        Dispatcher.UIThread.RunJobs();
+        Require(viewModel.IsAboutSettingsSelected && aboutRoot.IsVisible &&
+                viewModel.Settings.Author == "myucxy",
+            "The About section did not expose the author at the end of Settings.");
+        viewModel.SelectSettingsSection("integration");
+        Dispatcher.UIThread.RunJobs();
+        Require(viewModel.IsIntegrationSettingsSelected && integrationRoot.IsVisible,
+            "The update action was not separated from the integration section.");
 
         viewModel.Navigate("sessions");
         var firstSessionId = viewModel.Sessions.Items[0].SessionId;
@@ -189,8 +216,10 @@ public static class Program
         Require(!closeProbe.IsVisible && controlLifetime.ExitRequested,
             "Explicit control-UI exit did not allow the window to close.");
 
+        VerifySingleInstanceActivation();
+
         Console.WriteLine(
-            $"Avalonia headless shell passed: cached pages, virtualized 100-session/100-device lists, commands, tray-window lifecycle and failure isolation, navigation P95={p95:F3} ms.");
+            $"Avalonia headless shell passed: cached pages, virtualized 100-session list, About/integration, commands, single-instance activation, tray-window lifecycle and failure isolation, navigation P95={p95:F3} ms.");
         window.Close();
     }
 
@@ -218,6 +247,23 @@ public static class Program
         Require(condition(), message);
     }
 
+    private static void VerifySingleInstanceActivation()
+    {
+        var scope = "headless-" + Guid.NewGuid().ToString("N");
+        using var primary = new SingleInstanceCoordinator(scope);
+        Require(primary.TryAcquire(), "The first desktop instance did not acquire ownership.");
+        var activated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        primary.StartListening(() => activated.TrySetResult());
+        var secondaryResult = Task.Run(async () =>
+        {
+            using var secondary = new SingleInstanceCoordinator(scope);
+            return !secondary.TryAcquire() &&
+                await secondary.SignalPrimaryAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        }).GetAwaiter().GetResult();
+        Require(secondaryResult, "A second desktop instance did not signal the primary instance.");
+        activated.Task.WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+    }
+
     private static T RequireControl<T>(Control root, string name) where T : Control =>
         root.FindControl<T>(name) ?? throw new InvalidOperationException($"Control '{name}' was not found.");
 
@@ -236,6 +282,7 @@ public static class Program
     private sealed class StaticAgentClient(AgentStatusSnapshot snapshot) : IAgentClient
     {
         public bool StopSessionCalled { get; private set; }
+        public IReadOnlyList<TerminalCommandCapability> SavedTerminalCommands { get; private set; } = Array.Empty<TerminalCommandCapability>();
         public ValueTask<AgentStatusSnapshot> GetStatusAsync(bool forceRefresh, CancellationToken cancellationToken) =>
             ValueTask.FromResult(snapshot);
 
@@ -253,7 +300,11 @@ public static class Program
         public ValueTask LoginAsync(string username, string password, string pcName, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask RegisterAsync(string username, string email, string password, string passwordConfirmation, string pcName, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask SignOutAsync(CancellationToken cancellationToken) => ValueTask.CompletedTask;
-        public ValueTask SaveTerminalCommandsAsync(IReadOnlyList<TerminalCommandCapability> commands, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SaveTerminalCommandsAsync(IReadOnlyList<TerminalCommandCapability> commands, CancellationToken cancellationToken)
+        {
+            SavedTerminalCommands = commands.ToArray();
+            return ValueTask.CompletedTask;
+        }
     }
 
     private sealed class CapturingNavigationTelemetry : INavigationTelemetry

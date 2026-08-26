@@ -1739,18 +1739,31 @@ namespace TermLink.Agent
 #endif
                 case RegistryCommand.SaveTerminalCommands:
 #if TERMLINK_PRODUCTION_RUNTIME
-                    var manualCommands = (request.TerminalCommands ??
+                    var configuredCommands = (request.TerminalCommands ??
                             new List<ProductionTerminalCommandSummary>())
-                        .Select(command => TerminalCommandProfileStore.CreateManualProfile(
+                        .Where(command => command.Detected || command.Enabled)
+                        .Select(command => TerminalCommandProfileStore.CreateConfiguredProfile(
                             command.Id,
                             command.DisplayName,
                             command.Executable,
                             command.Arguments,
-                            command.Enabled))
+                            command.ShellType,
+                            command.Detected,
+                            command.Enabled,
+                            command.RunAsAdministrator))
                         .ToArray();
-                    TerminalCommandProfileStore.SaveManualProfiles(manualCommands);
+                    var submittedIds = new HashSet<string>(
+                        configuredCommands.Select(command => command.Id),
+                        StringComparer.Ordinal);
+                    var retainedDisabledDetected = TerminalCommandProfileStore.LoadConfiguredProfiles()
+                        .Where(command =>
+                            string.Equals(command.Source, "detected", StringComparison.Ordinal) &&
+                            !command.Enabled &&
+                            !submittedIds.Contains(command.Id));
+                    TerminalCommandProfileStore.SaveConfiguredProfiles(
+                        configuredCommands.Concat(retainedDisabledDetected));
                     if (productionRuntime != null) productionRuntime.RequestReconnect();
-                    return Response(true, "TERMINAL_COMMANDS_SAVED", manualCommands.Length);
+                    return Response(true, "TERMINAL_COMMANDS_SAVED", configuredCommands.Length);
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
 #endif
@@ -1862,7 +1875,8 @@ namespace TermLink.Agent
                         Arguments = profile.Arguments,
                         ShellType = profile.ManagedShell,
                         Detected = string.Equals(profile.Source, "detected", StringComparison.Ordinal),
-                        Enabled = profile.Enabled
+                        Enabled = profile.Enabled,
+                        RunAsAdministrator = profile.RunAsAdministrator
                     })
                     .ToList();
 #else

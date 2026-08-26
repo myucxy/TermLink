@@ -204,7 +204,7 @@ the new gate. See `docs/validation/pc-avalonia-p8-release.json`.
 | Desktop private memory | <= 120 MiB target |
 | Desktop plus Agent private memory | <= 200 MiB target |
 | Unchanged snapshot | no page/list rebuild |
-| List scale | 100 sessions and 100 devices scroll without visible stalls |
+| List scale | 100 sessions and 24 terminal commands scroll without visible stalls |
 | UI restart | no Relay/session interruption |
 | Remote input latency | no regression from the published baseline |
 

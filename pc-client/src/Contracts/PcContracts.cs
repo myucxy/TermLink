@@ -70,7 +70,9 @@ public sealed record TerminalCommandCapability(
     string DisplayName,
     string Executable,
     IReadOnlyList<string> Arguments,
-    bool Detected);
+    bool Detected,
+    bool RunAsAdministrator = true,
+    bool Enabled = true);
 
 public sealed record ManagedSessionSnapshot(
     Guid SessionId,

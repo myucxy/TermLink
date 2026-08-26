@@ -123,12 +123,16 @@ var commandSettingsRequest = RoundTripRequest(new RegistryRequest
             DisplayName = "Codec Shell",
             Executable = "codec.exe",
             Arguments = "--codec value",
-            Enabled = true
+            ShellType = "custom",
+            Detected = false,
+            Enabled = true,
+            RunAsAdministrator = true
         }
     }
 });
 Require(commandSettingsRequest.TerminalCommands.Count == 1 &&
-    commandSettingsRequest.TerminalCommands[0].Arguments == "--codec value",
+    commandSettingsRequest.TerminalCommands[0].Arguments == "--codec value" &&
+    commandSettingsRequest.TerminalCommands[0].RunAsAdministrator,
     "Terminal-command settings request changed.");
 
 var now = new DateTime(638925120000000000, DateTimeKind.Utc);
@@ -192,7 +196,8 @@ var response = new RegistryResponse
                 Arguments = "-NoLogo -NoProfile",
                 ShellType = "powershell-7",
                 Detected = true,
-                Enabled = true
+                Enabled = true,
+                RunAsAdministrator = true
             }
         },
         PairingChallenge = new PairingChallengeSummary
@@ -223,8 +228,9 @@ Require(decoded.Production.PcId == pcId && decoded.Production.AgentVersion == "0
     "V8 PC identity or Agent version changed.");
 Require(decoded.Production.TerminalSnapshotEnabled, "Terminal Snapshot capability changed.");
 Require(decoded.Production.TerminalCommands.Count == 1 &&
-    decoded.Production.TerminalCommands[0].Executable == "C:\\PowerShell\\pwsh.exe",
-    "V8 terminal-command settings changed.");
+    decoded.Production.TerminalCommands[0].Executable == "C:\\PowerShell\\pwsh.exe" &&
+    decoded.Production.TerminalCommands[0].RunAsAdministrator,
+    "V9 terminal-command settings changed.");
 Require(decoded.Production.Devices.Count == 1 && decoded.Production.Devices[0].DeviceId == deviceId, "Device summary changed.");
 Require(decoded.Production.Sessions.Count == 1 && decoded.Production.Sessions[0].ControllerDeviceId == deviceId, "Production session changed.");
 Require(decoded.Production.PairingChallenge != null &&
@@ -273,6 +279,38 @@ using (var legacyV7RequestStream = new MemoryStream())
     Array.Clear(legacySecret, 0, legacySecret.Length);
 }
 
+using (var legacyV8RequestStream = new MemoryStream())
+{
+    var legacySecret = Enumerable.Range(0, RegistryControlAuthentication.SecretBytes)
+        .Select(value => (byte)(value + 8))
+        .ToArray();
+    var legacyV8 = new RegistryRequest
+    {
+        Command = RegistryCommand.SaveTerminalCommands,
+        TerminalCommands = new List<ProductionTerminalCommandSummary>
+        {
+            new ProductionTerminalCommandSummary
+            {
+                Id = "legacy-command",
+                DisplayName = "Legacy command",
+                Executable = "legacy.exe",
+                Arguments = string.Empty,
+                Enabled = true
+            }
+        }
+    };
+    RegistryControlAuthentication.Prepare(legacyV8, legacySecret, DateTime.UtcNow, 8);
+    RegistryControlCodec.WriteRequest(legacyV8RequestStream, legacyV8, 8);
+    legacyV8RequestStream.Position = 0;
+    byte legacyV8Version;
+    var decodedLegacyV8 = RegistryControlCodec.ReadRequest(legacyV8RequestStream, out legacyV8Version);
+    Require(legacyV8Version == 8 &&
+        decodedLegacyV8.TerminalCommands.Single().RunAsAdministrator &&
+        decodedLegacyV8.TerminalCommands.Single().ShellType == "custom",
+        "Pipe V8 terminal-command compatibility did not default administrator launch safely.");
+    Array.Clear(legacySecret, 0, legacySecret.Length);
+}
+
 using (var legacyResponseStream = new MemoryStream())
 {
     RegistryControlCodec.WriteResponse(legacyResponseStream, response, 5);
@@ -284,7 +322,7 @@ using (var legacyResponseStream = new MemoryStream())
         "Pipe V5 response synthesized Terminal Snapshot capability.");
 }
 
-Console.WriteLine("TermLink Agent control Pipe V8 authentication and V7/V6/V5 compatibility validation passed.");
+Console.WriteLine("TermLink Agent control Pipe V9 command policy and V8/V7/V6/V5 compatibility validation passed.");
 
 static RegistryRequest RoundTripRequest(RegistryRequest request)
 {
