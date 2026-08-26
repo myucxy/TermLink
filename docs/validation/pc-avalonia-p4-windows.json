@@ -44,7 +44,8 @@
   },
   "preview_package": {
     "application_slug": "termlink-win64-preview",
-    "channel": "preview",
+    "release_track": "preview",
+    "channel": "beta",
     "single_file_setup": true,
     "self_contained": true,
     "install_upgrade_rollback_uninstall": true,

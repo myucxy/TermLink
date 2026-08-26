@@ -181,8 +181,9 @@ try {
         '--update-config-json', $updateConfigPath)
     $updateConfig = Get-Content -LiteralPath $updateConfigPath -Raw | ConvertFrom-Json
     $expectedUpdateSlug = if ($UpdateChannel -eq 'preview') { 'termlink-win64-preview' } else { 'termlink-win64' }
+    $expectedAppShipChannel = if ($UpdateChannel -eq 'preview') { 'beta' } else { 'stable' }
     Assert-True ([string]$updateConfig.application_slug -ceq $expectedUpdateSlug -and
-        [string]$updateConfig.channel -ceq $UpdateChannel) `
+        [string]$updateConfig.channel -ceq $expectedAppShipChannel) `
         'The installed rollback/update surface is not bound to the requested AppShip application and channel.'
 
     Assert-True (Test-Path -LiteralPath $fragmentPath -PathType Leaf) `
@@ -385,7 +386,8 @@ try {
         embedded_payload = $true
         selected_install_directory_applied = $true
         tray_assembly_version = $trayAssemblyVersion
-        update_channel = $UpdateChannel
+        release_track = $UpdateChannel
+        update_channel = $expectedAppShipChannel
         update_application_slug = $expectedUpdateSlug
         terminal_profile_count = $profiles.Count
         terminal_fragment_stale_upgrade_overwrite = $true

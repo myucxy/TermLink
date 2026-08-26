@@ -167,6 +167,7 @@ $applicationSlug = if ($Target -eq 'AndroidApk') {
 else {
     if ($Channel -eq 'preview') { 'termlink-win64-preview' } else { 'termlink-win64' }
 }
+$appShipChannel = if ($Channel -eq 'preview') { 'beta' } else { 'stable' }
 $platform = if ($Target -eq 'AndroidApk') { 'android' } else { 'windows' }
 $fileKind = if ($Target -eq 'AndroidApk') { 'apk' } else { 'exe' }
 $architecture = if ($Target -eq 'AndroidApk') { 'universal' } else { 'x64' }
@@ -214,7 +215,8 @@ $publishPlan = [pscustomobject][ordered]@{
     platform = $platform
     file_kind = $fileKind
     architecture = $architecture
-    channel = $Channel
+    release_track = $Channel
+    channel = $appShipChannel
     version_name = $version
     build_number = $buildNumber
     state_path = $resolvedStatePath
@@ -295,7 +297,7 @@ $publishParameters = @{
     Platform = $platform
     FileKind = $fileKind
     Architecture = $architecture
-    Channel = $Channel
+    Channel = $appShipChannel
     VersionName = $version
     BuildNumber = [long]$buildNumber
     Title = $effectiveTitle

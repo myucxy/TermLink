@@ -131,11 +131,12 @@ P4 Preview 与正式版是两个独立更新域。构建时向统一发布脚本
 ```json
 {
   "application_slug": "termlink-win64-preview",
-  "channel": "preview"
+  "channel": "beta"
 }
 ```
 
-Preview 只能发布到 `termlink-win64-preview`，不得把同一产物上传至 `termlink-win64`。稳定版继续使用
+Preview 只能发布到 `termlink-win64-preview/beta`，不得把同一产物上传至 `termlink-win64`。仓库脚本的
+产品轨道参数仍是 `preview`，它会显式映射到 AppShip 唯一支持的非稳定渠道 `beta`；稳定版继续使用
 `termlink-win64/stable`。P4 的一个 Preview 周期内，Avalonia 是 `TermLink.exe`，旧 WinForms 仅作为
 `TermLink.Legacy.exe` 回滚面保留；下一个阶段移除前必须先验证 Preview 更新与回滚统计。
 

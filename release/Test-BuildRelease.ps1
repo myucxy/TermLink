@@ -550,6 +550,20 @@ try {
     Assert-True ([IO.Path]::GetFileName([string]$appShipWindowsPlan.state_path) -ceq
         "termlink-win64-stable-$appShipProbeVersion-build$appShipProbeBuild-signature-approved.json") `
         'AppShip Windows state path is not unique to application/channel/version.'
+    $appShipPreviewPlanJson = @(& $appShipWrapperPath `
+        -ManifestPath $appShipManifestPath `
+        -Target WindowsSetup `
+        -BaseURL 'https://appship.example.test:8910' `
+        -AndroidSdkPath 'D:\AndroidSdkPlanProbe' `
+        -ExpectedAndroidSignerSha256 $androidSignerSha256 `
+        -ExpectedWindowsSignerSha1 $windowsSignerSha1 `
+        -Channel preview `
+        -Plan) -join "`n"
+    $appShipPreviewPlan = $appShipPreviewPlanJson | ConvertFrom-Json
+    Assert-True ($appShipPreviewPlan.application_slug -ceq 'termlink-win64-preview' -and
+        $appShipPreviewPlan.release_track -ceq 'preview' -and
+        $appShipPreviewPlan.channel -ceq 'beta') `
+        'Preview track was not mapped to the AppShip beta channel.'
 
     $appShipManifest.release_mode = 'development'
     [IO.File]::WriteAllText(

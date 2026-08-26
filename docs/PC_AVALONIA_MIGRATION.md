@@ -97,7 +97,8 @@ cycle. The Avalonia UI uses authenticated control Pipe V8 to expose connection, 
 terminal-command settings, diagnostics, update, Windows Terminal repair, tray hide/show, and explicit UI-only
 exit. Closing or upgrading the UI does not stop the independent Agent or its Session Hosts.
 
-Preview packages are compile-time bound to AppShip application `termlink-win64-preview` and channel `preview`;
+Preview packages are compile-time bound to AppShip application `termlink-win64-preview` and its non-stable
+`beta` channel (the TermLink build/publish track is named `preview`);
 stable packages remain bound to `termlink-win64` and `stable`. The package contains only one primary
 `TermLink.exe`, and the rollback executable cannot silently query the stable application when built for Preview.
 The local pre-publication gate passed locked Windows/PC builds, architecture and headless checks, authenticated

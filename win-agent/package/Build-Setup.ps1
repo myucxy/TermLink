@@ -19,6 +19,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $updateApplicationSlug = if ($UpdateChannel -eq 'preview') { 'termlink-win64-preview' } else { 'termlink-win64' }
+$appShipUpdateChannel = if ($UpdateChannel -eq 'preview') { 'beta' } else { 'stable' }
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -212,7 +213,7 @@ try {
             '-p:IncludeNativeLibrariesForSelfExtract=true',
             '-p:EnableCompressionInSingleFile=true',
             "-p:TermLinkUpdateApplicationSlug=$updateApplicationSlug",
-            "-p:TermLinkUpdateChannel=$UpdateChannel",
+            "-p:TermLinkUpdateChannel=$appShipUpdateChannel",
             "-p:Version=$Version"
         )
         Copy-Item -LiteralPath (Join-Path $legacyPublish 'TermLink.exe') `
