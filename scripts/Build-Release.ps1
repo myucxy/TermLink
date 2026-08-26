@@ -35,6 +35,8 @@ param(
     [string]$WindowsCertificateThumbprint,
     [string]$WindowsTimestampUrl,
     [switch]$AllowHttpWindowsTimestamp,
+    [ValidateSet('stable', 'preview')]
+    [string]$WindowsUpdateChannel = 'stable',
     [string]$WindowsPackageIdentityName = 'TermLink.Terminal',
     [string]$WindowsPublisher,
     [string]$WindowsPublisherDisplayName = 'TermLink',
@@ -352,7 +354,7 @@ if ($WindowsSetup) {
         type = 'setup'
         working_directory = '.'
         command = 'win-agent/package/Build-Setup.ps1'
-        arguments = @('-Version', $windowsVersion) + $windowsSetupSigningArguments +
+        arguments = @('-Version', $windowsVersion, '-UpdateChannel', $WindowsUpdateChannel) + $windowsSetupSigningArguments +
             @('-OutputPath', (Get-RepoRelativePath -RepositoryRoot $repositoryRoot -Path $setupArtifactPath))
         requirements = if ($isProduction) {
             @('.NET 8 SDK', 'Windows SDK signing tools',
@@ -631,6 +633,7 @@ if ($WindowsSetup) {
         Development = $isDevelopment
         DotNetPath = $resolvedDotNet
         OutputPath = $setupArtifactPath
+        UpdateChannel = $WindowsUpdateChannel
     }
     if (-not [string]::IsNullOrWhiteSpace($resolvedWindowsCertificateThumbprint)) {
         $setupParameters.CertificateThumbprint = $resolvedWindowsCertificateThumbprint

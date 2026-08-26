@@ -233,8 +233,24 @@ namespace TermLink.Agent
         {
             var overridePath = AppContext.GetData(StoragePathAppContextKey) as string;
             if (!string.IsNullOrWhiteSpace(overridePath)) return Path.GetFullPath(overridePath);
+            var localData = Environment.GetEnvironmentVariable(
+                "TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT");
+            if (!string.IsNullOrWhiteSpace(localData))
+            {
+                if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TERMLINK_ACCEPTANCE_CA_FILE")) ||
+                    !Path.IsPathRooted(localData))
+                {
+                    throw new InvalidOperationException(
+                        "The acceptance terminal-command root is not authorized.");
+                }
+                localData = Path.GetFullPath(localData);
+            }
+            else
+            {
+                localData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            }
             return Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                localData,
                 "TermLink",
                 "Agent",
                 "terminal-commands.json");

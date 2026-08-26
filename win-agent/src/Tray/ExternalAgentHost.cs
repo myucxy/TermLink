@@ -31,7 +31,13 @@ namespace TermLink.Tray
                 throw new ArgumentException("A buffer root is required.", "bufferRoot");
             this.controlPipeName = controlPipeName;
             this.bufferRoot = Path.GetFullPath(bufferRoot);
+            // A test/plugin host loads this assembly from beside the Agent,
+            // while a single-file rollback build has no Assembly.Location.
+            // Use the location only when it exists and fall back to the bundle
+            // base directory for the released Legacy executable.
+#pragma warning disable IL3000
             var executableRoot = Path.GetDirectoryName(typeof(ExternalAgentHost).Assembly.Location);
+#pragma warning restore IL3000
             if (string.IsNullOrWhiteSpace(executableRoot)) executableRoot = AppContext.BaseDirectory;
             agentPath = Path.GetFullPath(Path.Combine(executableRoot, "TermLink.Agent.exe"));
         }

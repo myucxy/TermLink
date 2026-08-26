@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyName>TermLink.Platform.Windows</AssemblyName>
+    <RootNamespace>TermLink.Platform.Windows</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\..\win-agent\src\Common\WindowsTerminalIntegration.cs"
+             Link="Common\WindowsTerminalIntegration.cs" />
+    <ProjectReference Include="..\Contracts\TermLink.Pc.Contracts.csproj" />
+    <ProjectReference Include="..\Platform.Abstractions\TermLink.Platform.Abstractions.csproj" />
+    <ProjectReference Include="..\Presentation\TermLink.Presentation.csproj" />
+    <ProjectReference Include="..\..\..\win-agent\src\AgentControl\TermLink.AgentControl.csproj"
+                      AdditionalProperties="Configuration=$(Configuration)" />
+  </ItemGroup>
+</Project>

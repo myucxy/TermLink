@@ -83,4 +83,11 @@ file sealed class FakeAgentClient(AgentStatusSnapshot status) : IAgentClient
 
     public ValueTask SetRemoteAccessAsync(bool enabled, CancellationToken cancellationToken) => ValueTask.CompletedTask;
     public ValueTask RetryConnectionAsync(CancellationToken cancellationToken) => ValueTask.CompletedTask;
+    public ValueTask StopSessionAsync(Guid sessionId, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+    public ValueTask GrantDeviceAsync(Guid deviceId, string permission, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+    public ValueTask RevokeDeviceAsync(Guid deviceId, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+    public ValueTask LoginAsync(string username, string password, string pcName, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+    public ValueTask RegisterAsync(string username, string email, string password, string passwordConfirmation, string pcName, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+    public ValueTask SignOutAsync(CancellationToken cancellationToken) => ValueTask.CompletedTask;
+    public ValueTask SaveTerminalCommandsAsync(IReadOnlyList<TerminalCommandCapability> commands, CancellationToken cancellationToken) => ValueTask.CompletedTask;
 }

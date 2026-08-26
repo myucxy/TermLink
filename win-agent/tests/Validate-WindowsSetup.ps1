@@ -4,6 +4,8 @@ param(
     [string]$EvidencePath = (Join-Path $PSScriptRoot '..\..\docs\validation\phase1-windows-setup.json'),
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
     [string]$Version = '0.1.2.0',
+    [ValidateSet('stable', 'preview')]
+    [string]$UpdateChannel = 'stable',
     [string]$OutputSetupPath
 )
 
@@ -124,6 +126,7 @@ try {
         -CertificatePath $pfxPath `
         -CertificatePassword $password `
         -Development `
+        -UpdateChannel $UpdateChannel `
         -DotNetPath $DotNetPath `
         -OutputPath $setupPath)
     # Build-Setup emits tool progress for interactive callers. Select the final
@@ -143,6 +146,7 @@ try {
         'TermLink.Agent.exe',
         'TermLink.SessionHost.exe',
         'TermLink.exe',
+        'TermLink.Legacy.exe',
         'TermLink.Updater.exe',
         'TermLink.Agent.dll',
         'TermLink.UpdatePublisher.cer',
@@ -156,6 +160,7 @@ try {
     $expectedProductExecutables = @(
         'TermLink.Agent.exe',
         'TermLink.exe',
+        'TermLink.Legacy.exe',
         'TermLink.SessionHost.exe',
         'TermLink.Updater.exe'
     )
@@ -171,6 +176,14 @@ try {
     $trayAssemblyVersion = [Reflection.AssemblyName]::GetAssemblyName($trayAssemblyPath).Version.ToString()
     Assert-True ([string]::Equals($trayAssemblyVersion, $Version, [StringComparison]::Ordinal)) `
         "Installed Tray assembly version is '$trayAssemblyVersion', expected '$Version'."
+    $updateConfigPath = Join-Path $workRoot 'update-config.json'
+    Invoke-Setup -SetupPath (Join-Path $installRoot 'TermLink.Legacy.exe') -Arguments @(
+        '--update-config-json', $updateConfigPath)
+    $updateConfig = Get-Content -LiteralPath $updateConfigPath -Raw | ConvertFrom-Json
+    $expectedUpdateSlug = if ($UpdateChannel -eq 'preview') { 'termlink-win64-preview' } else { 'termlink-win64' }
+    Assert-True ([string]$updateConfig.application_slug -ceq $expectedUpdateSlug -and
+        [string]$updateConfig.channel -ceq $UpdateChannel) `
+        'The installed rollback/update surface is not bound to the requested AppShip application and channel.'
 
     Assert-True (Test-Path -LiteralPath $fragmentPath -PathType Leaf) `
         'The setup did not create the Windows Terminal fragment.'
@@ -372,6 +385,8 @@ try {
         embedded_payload = $true
         selected_install_directory_applied = $true
         tray_assembly_version = $trayAssemblyVersion
+        update_channel = $UpdateChannel
+        update_application_slug = $expectedUpdateSlug
         terminal_profile_count = $profiles.Count
         terminal_fragment_stale_upgrade_overwrite = $true
         terminal_fragment_owned_cleanup = $true

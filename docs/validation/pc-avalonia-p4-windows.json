@@ -1,0 +1,73 @@
+{
+  "schema": "termlink.pc-avalonia-p4-windows",
+  "version": 1,
+  "generated_at_utc": "2026-08-26T04:26:30Z",
+  "classification": "local Windows parity pre-publication gate; AppShip publication and real Android/Relay E2E are verified after source commit",
+  "passed": true,
+  "baseline_tag": "pc-avalonia-baseline-v0.1.32",
+  "candidate_version": "0.2.0",
+  "candidate_build": 39,
+  "dotnet_sdk": "8.0.303",
+  "locked_builds": {
+    "windows_solution": { "warnings": 0, "errors": 0 },
+    "pc_solution": { "warnings": 0, "errors": 0 },
+    "supported_runtime_identifiers": [
+      "win-x64",
+      "win-arm64",
+      "linux-x64",
+      "linux-arm64",
+      "osx-x64",
+      "osx-arm64"
+    ]
+  },
+  "avalonia": {
+    "primary_executable": "TermLink.exe",
+    "legacy_rollback_executable": "TermLink.Legacy.exe",
+    "cached_pages": 6,
+    "virtualized_sessions": 100,
+    "virtualized_devices": 100,
+    "navigation_p95_ms": 0.220,
+    "headless_failure_isolation": true,
+    "tray_hide_show_and_ui_only_exit": true,
+    "windows_adapter": "authenticated Agent control Pipe V8"
+  },
+  "agent_and_terminal_recovery": {
+    "control_protocol_current": 8,
+    "compatible_protocols": [7, 6, 5],
+    "concurrent_control_clients": 32,
+    "concurrent_control_failures": 0,
+    "session_registry_consecutive_passes": 3,
+    "real_conpty_sessions": 20,
+    "forced_restart_recovered": 20,
+    "controlled_restart_recovered": 20,
+    "local_shells_survived_remote_stop": 20
+  },
+  "preview_package": {
+    "application_slug": "termlink-win64-preview",
+    "channel": "preview",
+    "single_file_setup": true,
+    "self_contained": true,
+    "install_upgrade_rollback_uninstall": true,
+    "terminal_fragment": true,
+    "legacy_update_binding_verified": true
+  },
+  "updater": {
+    "manifest_tamper_rejected": true,
+    "package_tamper_rejected": true,
+    "deployment_failure_recovery": true,
+    "health_failure_rollback": true,
+    "rollback_failure_reported": true,
+    "interrupted_rollback_resumed": true
+  },
+  "performance_evidence": "docs/validation/pc-avalonia-p4-performance.json",
+  "recovery_evidence": "docs/validation/phase1-windows-app.json",
+  "registry_evidence": "docs/validation/phase1-session-registry.json",
+  "setup_evidence": "docs/validation/phase1-windows-setup.json",
+  "updater_evidence": "docs/validation/phase1-windows-updater.json",
+  "remaining_release_gates": [
+    "production Authenticode verification and AppShip preview publication",
+    "previous/current preview update API decisions",
+    "real install/update/rollback using the published package",
+    "Android client control of a real Windows session"
+  ]
+}

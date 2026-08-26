@@ -95,6 +95,18 @@ public interface IPlatformNotification
     ValueTask ShowAsync(string title, string message, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// Desktop-shell operations which are intentionally kept outside Presentation.
+/// Implementations may open an operating-system surface, but must never take
+/// ownership of the long-running Agent or its terminal sessions.
+/// </summary>
+public interface IDesktopOperations
+{
+    ValueTask<string> CheckForUpdatesAsync(CancellationToken cancellationToken);
+    ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken);
+    ValueTask<string> RepairTerminalIntegrationAsync(CancellationToken cancellationToken);
+}
+
 public interface IPlatformServices
 {
     PlatformDescriptor Descriptor { get; }

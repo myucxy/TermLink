@@ -9,12 +9,16 @@ param(
     [string]$TimestampUrl,
     [switch]$AllowHttpTimestamp,
     [switch]$Development,
+    [ValidateSet('stable', 'preview')]
+    [string]$UpdateChannel = 'stable',
     [string]$DotNetPath,
     [string]$OutputPath = (Join-Path $PSScriptRoot "..\artifacts\TermLink-Setup-$Version.exe")
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+$updateApplicationSlug = if ($UpdateChannel -eq 'preview') { 'termlink-win64-preview' } else { 'termlink-win64' }
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -162,30 +166,57 @@ try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $workRoot = Join-Path ([IO.Path]::GetTempPath()) ('TermLink-Setup-' + [guid]::NewGuid().ToString('N'))
     $layout = Join-Path $workRoot 'payload'
+    $legacyPublish = Join-Path $workRoot 'legacy-publish'
     $updaterPublish = Join-Path $workRoot 'updater-publish'
     $setupPublish = Join-Path $workRoot 'setup-publish'
     $payloadZip = Join-Path $workRoot 'TermLink.payload.zip'
     [IO.Directory]::CreateDirectory($layout) | Out-Null
     try {
         $projects = @(
-            'src\Agent\TermLink.Agent.csproj',
-            'src\SessionHost\TermLink.SessionHost.csproj',
-            'src\Tray\TermLink.Tray.csproj'
+            (Join-Path $PSScriptRoot '..\src\Agent\TermLink.Agent.csproj'),
+            (Join-Path $PSScriptRoot '..\src\SessionHost\TermLink.SessionHost.csproj'),
+            (Join-Path $PSScriptRoot '..\..\pc-client\src\Desktop\TermLink.Desktop.csproj')
         )
         foreach ($project in $projects) {
             Invoke-Tool -FilePath $candidate -Arguments @(
-                'publish', (Join-Path $PSScriptRoot "..\$project"),
+                'publish', $project,
                 '--configuration', 'Release',
                 '--runtime', 'win-x64',
+                '--framework', 'net8.0-windows',
                 '--self-contained', 'true',
                 '--output', $layout,
                 '--nologo',
+                '-p:RestoreLockedMode=true',
+                '-p:PackageVersion=1.0.0',
                 '-p:DebugSymbols=false',
                 '-p:DebugType=None',
                 '-p:PublishSingleFile=false',
                 "-p:Version=$Version"
             )
         }
+        # Keep the WinForms implementation as an isolated single-file rollback
+        # and update surface for one Preview cycle. Its dependency graph must not
+        # overwrite Avalonia assemblies in the primary payload.
+        Invoke-Tool -FilePath $candidate -Arguments @(
+            'publish', (Join-Path $PSScriptRoot '..\src\Tray\TermLink.Tray.csproj'),
+            '--configuration', 'Release',
+            '--runtime', 'win-x64',
+            '--self-contained', 'true',
+            '--output', $legacyPublish,
+            '--nologo',
+            '-p:RestoreLockedMode=true',
+            '-p:PackageVersion=1.0.0',
+            '-p:DebugSymbols=false',
+            '-p:DebugType=None',
+            '-p:PublishSingleFile=true',
+            '-p:IncludeNativeLibrariesForSelfExtract=true',
+            '-p:EnableCompressionInSingleFile=true',
+            "-p:TermLinkUpdateApplicationSlug=$updateApplicationSlug",
+            "-p:TermLinkUpdateChannel=$UpdateChannel",
+            "-p:Version=$Version"
+        )
+        Copy-Item -LiteralPath (Join-Path $legacyPublish 'TermLink.exe') `
+            -Destination (Join-Path $layout 'TermLink.Legacy.exe')
         Invoke-Tool -FilePath $candidate -Arguments @(
             'publish', (Join-Path $PSScriptRoot '..\src\Updater\TermLink.Updater.csproj'),
             '--configuration', 'Release',
@@ -193,6 +224,8 @@ try {
             '--self-contained', 'true',
             '--output', $updaterPublish,
             '--nologo',
+            '-p:RestoreLockedMode=true',
+            '-p:PackageVersion=1.0.0',
             '-p:DebugSymbols=false',
             '-p:DebugType=None',
             '-p:PublishSingleFile=true',
@@ -206,6 +239,7 @@ try {
         $expectedProductExecutables = @(
             'TermLink.Agent.exe',
             'TermLink.exe',
+            'TermLink.Legacy.exe',
             'TermLink.SessionHost.exe',
             'TermLink.Updater.exe'
         )
@@ -251,6 +285,8 @@ try {
             '--self-contained', 'true',
             '--output', $setupPublish,
             '--nologo',
+            '-p:RestoreLockedMode=true',
+            '-p:PackageVersion=1.0.0',
             '-p:DebugSymbols=false',
             '-p:DebugType=None',
             '-p:PublishSingleFile=true',

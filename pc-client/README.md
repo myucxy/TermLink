@@ -1,7 +1,8 @@
 # TermLink PC client
 
-This tree contains the portable desktop migration. The released WinForms client remains in `win-agent`
-until the P4 Windows parity gate is met.
+This tree contains the portable desktop client. On Windows, the P4 Preview packages Avalonia as
+`TermLink.exe`; the previous WinForms implementation remains in `win-agent` and is packaged only as
+`TermLink.Legacy.exe` for one rollback cycle.
 
 The dependency direction is enforced as follows:
 
@@ -23,6 +24,11 @@ Run the portable architecture and Avalonia headless validations:
 ```powershell
 & 'D:\Dev\Env\dotnet-sdk-8.0.303\dotnet.exe' run --project .\pc-client\tests\ArchitectureValidation -c Release
 & 'D:\Dev\Env\dotnet-sdk-8.0.303\dotnet.exe' run --project .\pc-client\tests\Desktop.HeadlessTests -c Release
+& 'D:\Dev\Env\dotnet-sdk-8.0.303\dotnet.exe' run `
+    --project .\pc-client\tests\WindowsAdapterValidation -c Release -- `
+    .\win-agent\src\Agent\bin\Release\net8.0-windows\TermLink.Agent.exe
+& .\pc-client\tests\Measure-Performance.ps1 `
+    -DotNetPath 'D:\Dev\Env\dotnet-sdk-8.0.303\dotnet.exe'
 ```
 
 Avalonia 12.1.1 ships optional Roslyn analyzers built against compiler 4.14, while the inventory-pinned
@@ -31,6 +37,7 @@ immediately before compilation and load XAML explicitly with `AvaloniaXamlLoader
 warnings-as-errors, and headless validation remain enabled. Remove this compatibility target once the
 development inventory advances to an SDK that provides Roslyn 4.14 or newer.
 
-The P2 executable is deliberately isolated from the released Agent. Run with `--preview-fixture` to show
-bounded sample data; without that argument it displays `PC-PREVIEW-NO_AGENT` and does not claim production
-Agent, Relay, terminal, identity, updater, or autostart ownership.
+On Windows, running without `--preview-fixture` attaches to or starts the separately shipped Agent through
+authenticated control Pipe V8. `--preview-fixture` remains available for bounded headless/UI measurements and
+never takes production Relay, terminal, identity, updater, or autostart ownership. On other platforms it remains
+the only runnable data source until the P6/P7 platform adapters are added.

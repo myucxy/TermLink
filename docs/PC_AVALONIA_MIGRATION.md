@@ -91,6 +91,22 @@ runs passed after the fix.
 
 Exit: real Windows/Android end-to-end validation passes and the preview update/rollback path is proven.
 
+Implementation note (2026-08-26): the Windows parity candidate makes Avalonia the installed `TermLink.exe`
+and retains the previous WinForms surface as the isolated, single-file `TermLink.Legacy.exe` for one Preview
+cycle. The Avalonia UI uses authenticated control Pipe V8 to expose connection, sessions, devices, account,
+terminal-command settings, diagnostics, update, Windows Terminal repair, tray hide/show, and explicit UI-only
+exit. Closing or upgrading the UI does not stop the independent Agent or its Session Hosts.
+
+Preview packages are compile-time bound to AppShip application `termlink-win64-preview` and channel `preview`;
+stable packages remain bound to `termlink-win64` and `stable`. The package contains only one primary
+`TermLink.exe`, and the rollback executable cannot silently query the stable application when built for Preview.
+The local pre-publication gate passed locked Windows/PC builds, architecture and headless checks, authenticated
+V8 plus V7/V6/V5 compatibility, 32 concurrent control clients, three consecutive SessionRegistry pressure
+runs, 20 real ConPTY sessions across forced and controlled Agent restarts, Setup install/upgrade/rollback/uninstall,
+and Updater tamper/failure/resume cases. The reproducible 20-second idle sample measured Desktop at 0.312% of one
+logical core and 80.46 MiB private memory, Agent at 0% and 8.78 MiB, and 89.24 MiB combined. See
+`docs/validation/pc-avalonia-p4-windows.json` and `docs/validation/pc-avalonia-p4-performance.json`.
+
 ### P5 - generic PC Agent server model
 
 - Add `PC_AGENT` plus `platform`, `architecture`, `platform_version`, and bounded capabilities.
@@ -151,3 +167,9 @@ enabled. A single idle sample is evidence, not a universal benchmark.
 - Server migrations are expand/contract: add new columns/types first, dual-read/write next, retire legacy
   values only after the minimum-supported client fence advances.
 - Every installer keeps the last verified package until the new Agent reconnects and reports its build.
+
+## Reproducible runtime restore
+
+Every PC project lock graph contains all six supported package RIDs (`win-x64`, `win-arm64`, `linux-x64`,
+`linux-arm64`, `osx-x64`, and `osx-arm64`). Platform publish commands must use `RestoreLockedMode=true`; adding a
+RID only on a publish command can otherwise rewrite `packages.lock.json` and make a release build alter source.

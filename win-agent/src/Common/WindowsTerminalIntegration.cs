@@ -1,3 +1,4 @@
+#nullable disable
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -331,3 +332,4 @@ namespace TermLink.WindowsIntegration
             StringBuilder packageFullName);
     }
 }
+#nullable restore

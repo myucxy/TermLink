@@ -162,7 +162,7 @@ try {
         isolated_local_app_data = [bool]::Parse($fields.isolated_local_app_data)
         production_runtime_absent = [bool]::Parse($fields.production_runtime_absent)
         production_configured = [bool]::Parse($fields.production_configured)
-        tray_boundary = 'bounded current-user control Pipe V7 with DPAPI secret/HMAC/replay protection and redacted SessionSummary/ProductionStatus only'
+        tray_boundary = 'bounded current-user control Pipe V8 with V7/V6/V5 compatibility, DPAPI secret/HMAC/replay protection, and authenticated response bodies'
         source_sha256 = $hashes
     }
     $resolvedEvidence = [IO.Path]::GetFullPath($EvidencePath)

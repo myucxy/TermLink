@@ -8,6 +8,8 @@ param(
     [string]$StatePath,
     [string]$Title,
     [AllowEmptyString()][string]$ReleaseNotes = '',
+    [ValidateSet('stable', 'preview')]
+    [string]$Channel = 'stable',
     [string]$AndroidSdkPath,
     [ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedAndroidSignerSha256,
     [ValidatePattern('^[0-9A-Fa-f]{40}$')][string]$ExpectedWindowsSignerSha1,
@@ -159,7 +161,12 @@ $validBaseUrl = [Uri]::TryCreate($BaseURL, [UriKind]::Absolute, [ref]$baseUri) -
     ($baseUri.AbsolutePath -eq '/' -or [string]::IsNullOrWhiteSpace($baseUri.AbsolutePath))
 Assert-PublishCondition $validBaseUrl 'Production AppShip BaseURL must be an absolute HTTPS URL without credentials.'
 
-$applicationSlug = if ($Target -eq 'AndroidApk') { 'termlink-android' } else { 'termlink-win64' }
+$applicationSlug = if ($Target -eq 'AndroidApk') {
+    if ($Channel -eq 'preview') { 'termlink-android-preview' } else { 'termlink-android' }
+}
+else {
+    if ($Channel -eq 'preview') { 'termlink-win64-preview' } else { 'termlink-win64' }
+}
 $platform = if ($Target -eq 'AndroidApk') { 'android' } else { 'windows' }
 $fileKind = if ($Target -eq 'AndroidApk') { 'apk' } else { 'exe' }
 $architecture = if ($Target -eq 'AndroidApk') { 'universal' } else { 'x64' }
@@ -173,7 +180,7 @@ else {
 }
 
 $expectedStatePath = [IO.Path]::GetFullPath((Join-Path $repositoryRoot `
-    ".appship\$applicationSlug-stable-$version-build$buildNumber-signature-approved.json"))
+    ".appship\$applicationSlug-$Channel-$version-build$buildNumber-signature-approved.json"))
 if ([string]::IsNullOrWhiteSpace($StatePath)) {
     $resolvedStatePath = $expectedStatePath
 }
@@ -207,7 +214,7 @@ $publishPlan = [pscustomobject][ordered]@{
     platform = $platform
     file_kind = $fileKind
     architecture = $architecture
-    channel = 'stable'
+    channel = $Channel
     version_name = $version
     build_number = $buildNumber
     state_path = $resolvedStatePath
@@ -288,7 +295,7 @@ $publishParameters = @{
     Platform = $platform
     FileKind = $fileKind
     Architecture = $architecture
-    Channel = 'stable'
+    Channel = $Channel
     VersionName = $version
     BuildNumber = [long]$buildNumber
     Title = $effectiveTitle

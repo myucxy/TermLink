@@ -406,11 +406,15 @@ namespace TermLink.Tray
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Information);
                 }
-                else if (manual && result.Decision == WindowsUpdateDecision.Error)
+                else if (manual &&
+                    (result.Decision == WindowsUpdateDecision.Error ||
+                     result.Decision == WindowsUpdateDecision.NotConfigured))
                 {
                     MessageBox.Show(
                         owner,
-                        TrayText.Pick("检查更新失败。", "Update check failed.") +
+                        (result.Decision == WindowsUpdateDecision.NotConfigured
+                            ? TrayText.Pick("更新服务尚未配置。", "Update service is not configured.")
+                            : TrayText.Pick("检查更新失败。", "Update check failed.")) +
                             "\r\n\r\n" + result.Message,
                         "TermLink",
                         MessageBoxButtons.OK,

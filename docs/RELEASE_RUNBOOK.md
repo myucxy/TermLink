@@ -122,6 +122,28 @@ if ($process.ExitCode -ne 0) { throw "TermLink Setup failed: $($process.ExitCode
 
 要求 `Success=true`、`RemoteAccessEnabled=true`、账号仍关联、Relay 已连接，且版本中的 revision 是计划发布提交。
 
+### 4.1 Avalonia Preview 发布
+
+P4 Preview 与正式版是两个独立更新域。构建时向统一发布脚本传
+`-WindowsUpdateChannel preview`，发布时向仓库包装器传 `-Channel preview`。必须核对安装后的
+`TermLink.Legacy.exe --update-config-json <path>` 返回：
+
+```json
+{
+  "application_slug": "termlink-win64-preview",
+  "channel": "preview"
+}
+```
+
+Preview 只能发布到 `termlink-win64-preview`，不得把同一产物上传至 `termlink-win64`。稳定版继续使用
+`termlink-win64/stable`。P4 的一个 Preview 周期内，Avalonia 是 `TermLink.exe`，旧 WinForms 仅作为
+`TermLink.Legacy.exe` 回滚面保留；下一个阶段移除前必须先验证 Preview 更新与回滚统计。
+
+PC 项目的锁文件预先包含 `win-x64`、`win-arm64`、`linux-x64`、`linux-arm64`、`osx-x64`、`osx-arm64`
+六个 RID。任何 `dotnet publish -r ...` 都必须使用 `-p:RestoreLockedMode=true`。发布前后比较
+`git status --short`；若 publish 改写了 `packages.lock.json`，立即停止发布并补齐锁图，不能把构建污染
+作为源码提交。
+
 ## 5. AppShip 正式发布与恢复
 
 只使用 `scripts/Publish-AppShipProduction.ps1` 和审核过的 `appship-publish/scripts/publish.ps1`，不要自行实现
@@ -132,7 +154,8 @@ AppShip HTTP 上传。manifest 同时含 APK 与 Setup 时，每次发布任一�
   `-Resume`；不要创建新 release 或新状态文件。
 - 凭据从 Windows Credential Manager 的 `TermLink-AppShip-release-manager` 读取并在内存中构造
   `PSCredential`。不得输出 `CredRead` 返回的 blob。
-- 两端状态文件固定保存在 `.appship/<slug>-stable-<version>-build<build>-signature-approved.json`。
+- 状态文件固定保存在 `.appship/<slug>-<channel>-<version>-build<build>-signature-approved.json`；Preview
+  与 stable 不能共享状态文件。
 - 成功后必须同时记录 application ID、release ID、artifact ID，并确认 release=`published`、
   artifact=`ready`。
 

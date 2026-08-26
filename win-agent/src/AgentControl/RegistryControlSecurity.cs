@@ -16,11 +16,23 @@ namespace TermLink.Agent
 
         public static void Prepare(RegistryRequest request, byte[] secret, DateTime utcNow)
         {
+            Prepare(request, secret, utcNow, RegistryControlCodec.CurrentVersion);
+        }
+
+        public static void Prepare(
+            RegistryRequest request,
+            byte[] secret,
+            DateTime utcNow,
+            byte protocolVersion)
+        {
             if (request == null) throw new ArgumentNullException("request");
             ValidateSecret(secret);
             if (utcNow.Kind != DateTimeKind.Utc)
                 throw new ArgumentException("Authentication time must be UTC.", "utcNow");
+            if (protocolVersion < 7 || protocolVersion > RegistryControlCodec.CurrentVersion)
+                throw new ArgumentOutOfRangeException("protocolVersion");
             request.AuthenticationTimestampUnixSeconds = new DateTimeOffset(utcNow).ToUnixTimeSeconds();
+            request.ProtocolVersion = protocolVersion;
             request.AuthenticationNonce = new byte[NonceBytes];
             using (var random = RandomNumberGenerator.Create())
                 random.GetBytes(request.AuthenticationNonce);
@@ -76,6 +88,9 @@ namespace TermLink.Agent
                 throw new ArgumentException("An authenticated Registry request is required.", "request");
             }
             ValidateSecret(secret);
+            response.ProtocolVersion = request.ProtocolVersion == 0
+                ? RegistryControlCodec.CurrentVersion
+                : request.ProtocolVersion;
             response.AuthenticationNonce = (byte[])request.AuthenticationNonce.Clone();
             response.AuthenticationTag = ComputeResponseTag(
                 response,

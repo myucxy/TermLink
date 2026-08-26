@@ -328,17 +328,28 @@ namespace TermLink.Agent
         CreatePairingChallenge = 9,
         RevokeDevice = 10,
         GrantDevice = 11,
-        RetryProductionConnection = 12
+        RetryProductionConnection = 12,
+        LoginAccount = 13,
+        RegisterAccount = 14,
+        SignOutAccount = 15,
+        SaveTerminalCommands = 16
     }
 
     public sealed class RegistryRequest
     {
+        public byte ProtocolVersion { get; set; }
         public RegistryCommand Command { get; set; }
         public SessionRegistration Registration { get; set; }
         public Guid SessionId { get; set; }
         public Guid DeviceId { get; set; }
         public string PairingPermission { get; set; }
         public string GrantPermission { get; set; }
+        public string AccountUsername { get; set; }
+        public string AccountEmail { get; set; }
+        public string AccountPassword { get; set; }
+        public string AccountPasswordConfirmation { get; set; }
+        public string PcName { get; set; }
+        public IList<ProductionTerminalCommandSummary> TerminalCommands { get; set; }
         public long AuthenticationTimestampUnixSeconds { get; set; }
         public byte[] AuthenticationNonce { get; set; }
         public byte[] AuthenticationTag { get; set; }
@@ -401,6 +412,17 @@ namespace TermLink.Agent
         public DateTime? LeaseExpiresAtUtc { get; set; }
     }
 
+    public sealed class ProductionTerminalCommandSummary
+    {
+        public string Id { get; set; }
+        public string DisplayName { get; set; }
+        public string Executable { get; set; }
+        public string Arguments { get; set; }
+        public string ShellType { get; set; }
+        public bool Detected { get; set; }
+        public bool Enabled { get; set; }
+    }
+
     public sealed class PairingChallengeSummary
     {
         public Guid ChallengeId { get; set; }
@@ -415,6 +437,8 @@ namespace TermLink.Agent
 
     public sealed class ProductionStatus
     {
+        public Guid PcId { get; set; }
+        public string AgentVersion { get; set; }
         public bool Configured { get; set; }
         public bool AccountLinked { get; set; }
         public string AccountUsername { get; set; }
@@ -428,11 +452,13 @@ namespace TermLink.Agent
         public DateTime? LastConnectedAtUtc { get; set; }
         public IList<ProductionDeviceSummary> Devices { get; set; }
         public IList<ProductionSessionSummary> Sessions { get; set; }
+        public IList<ProductionTerminalCommandSummary> TerminalCommands { get; set; }
         public PairingChallengeSummary PairingChallenge { get; set; }
     }
 
     public sealed class RegistryResponse
     {
+        public byte ProtocolVersion { get; set; }
         public byte[] AuthenticationNonce { get; set; }
         public byte[] AuthenticationTag { get; set; }
         public bool Success { get; set; }
@@ -446,7 +472,7 @@ namespace TermLink.Agent
 
     public static class RegistryControlCodec
     {
-        public const byte CurrentVersion = 7;
+        public const byte CurrentVersion = 8;
         private const byte MinimumSupportedVersion = 5;
         private const int MaximumBytes = 64 * 1024;
 
@@ -460,6 +486,9 @@ namespace TermLink.Agent
             if (stream == null) throw new ArgumentNullException("stream");
             if (request == null) throw new ArgumentNullException("request");
             ValidateVersion(version, "control");
+            if (version < 8 && request.Command >= RegistryCommand.LoginAccount)
+                throw new InvalidDataException("Registry account and command settings require control V8.");
+            request.ProtocolVersion = version;
             using (var body = new MemoryStream())
             using (var writer = new BinaryWriter(body, Encoding.UTF8))
             {
@@ -502,6 +531,7 @@ namespace TermLink.Agent
                 byte[] tag = null;
                 if (version >= 7) ReadAuthentication(reader, out timestamp, out nonce, out tag);
                 var request = ReadCommand(reader);
+                request.ProtocolVersion = version;
                 request.AuthenticationTimestampUnixSeconds = timestamp;
                 request.AuthenticationNonce = nonce;
                 request.AuthenticationTag = tag;
@@ -522,7 +552,11 @@ namespace TermLink.Agent
             using (var body = new MemoryStream())
             using (var writer = new BinaryWriter(body, Encoding.UTF8))
             {
-                writer.Write(CurrentVersion);
+                var version = request.ProtocolVersion == 0
+                    ? CurrentVersion
+                    : request.ProtocolVersion;
+                ValidateVersion(version, "authentication");
+                writer.Write(version);
                 writer.Write(request.AuthenticationTimestampUnixSeconds);
                 writer.Write(request.AuthenticationNonce);
                 WriteCommand(writer, request);
@@ -571,6 +605,32 @@ namespace TermLink.Agent
                 case RegistryCommand.RevokeDevice:
                     WriteGuid(writer, request.DeviceId);
                     break;
+                case RegistryCommand.LoginAccount:
+                    WriteString(writer, request.AccountUsername ?? string.Empty);
+                    WriteString(writer, request.AccountPassword ?? string.Empty);
+                    WriteString(writer, request.PcName ?? string.Empty);
+                    break;
+                case RegistryCommand.RegisterAccount:
+                    WriteString(writer, request.AccountUsername ?? string.Empty);
+                    WriteString(writer, request.AccountEmail ?? string.Empty);
+                    WriteString(writer, request.AccountPassword ?? string.Empty);
+                    WriteString(writer, request.AccountPasswordConfirmation ?? string.Empty);
+                    WriteString(writer, request.PcName ?? string.Empty);
+                    break;
+                case RegistryCommand.SaveTerminalCommands:
+                    var commands = request.TerminalCommands ?? new List<ProductionTerminalCommandSummary>();
+                    if (commands.Count > 20) throw new InvalidDataException("Too many manual terminal commands.");
+                    writer.Write(commands.Count);
+                    foreach (var command in commands)
+                    {
+                        if (command == null) throw new InvalidDataException("A terminal command is missing.");
+                        WriteString(writer, command.Id ?? string.Empty);
+                        WriteString(writer, command.DisplayName ?? string.Empty);
+                        WriteString(writer, command.Executable ?? string.Empty);
+                        WriteString(writer, command.Arguments ?? string.Empty);
+                        writer.Write(command.Enabled);
+                    }
+                    break;
             }
         }
 
@@ -607,6 +667,37 @@ namespace TermLink.Agent
                 case RegistryCommand.RevokeDevice:
                     request.DeviceId = ReadGuid(reader);
                     break;
+                case RegistryCommand.LoginAccount:
+                    request.AccountUsername = ReadString(reader);
+                    request.AccountPassword = ReadString(reader);
+                    request.PcName = ReadString(reader);
+                    break;
+                case RegistryCommand.RegisterAccount:
+                    request.AccountUsername = ReadString(reader);
+                    request.AccountEmail = ReadString(reader);
+                    request.AccountPassword = ReadString(reader);
+                    request.AccountPasswordConfirmation = ReadString(reader);
+                    request.PcName = ReadString(reader);
+                    break;
+                case RegistryCommand.SaveTerminalCommands:
+                    var count = reader.ReadInt32();
+                    if (count < 0 || count > 20)
+                        throw new InvalidDataException("Invalid manual terminal command count.");
+                    var commands = new List<ProductionTerminalCommandSummary>(count);
+                    for (var index = 0; index < count; index++)
+                    {
+                        commands.Add(new ProductionTerminalCommandSummary
+                        {
+                            Id = ReadString(reader),
+                            DisplayName = ReadString(reader),
+                            Executable = ReadString(reader),
+                            Arguments = ReadString(reader),
+                            Enabled = reader.ReadBoolean(),
+                            Detected = false
+                        });
+                    }
+                    request.TerminalCommands = commands;
+                    break;
             }
             return request;
         }
@@ -621,6 +712,7 @@ namespace TermLink.Agent
             if (stream == null) throw new ArgumentNullException("stream");
             if (response == null) throw new ArgumentNullException("response");
             ValidateVersion(version, "response");
+            response.ProtocolVersion = version;
             using (var body = new MemoryStream())
             using (var writer = new BinaryWriter(body, Encoding.UTF8))
             {
@@ -656,9 +748,13 @@ namespace TermLink.Agent
             using (var body = new MemoryStream())
             using (var writer = new BinaryWriter(body, Encoding.UTF8))
             {
-                writer.Write(CurrentVersion);
+                var version = response.ProtocolVersion == 0
+                    ? CurrentVersion
+                    : response.ProtocolVersion;
+                ValidateVersion(version, "response authentication");
+                writer.Write(version);
                 writer.Write(requestNonce);
-                WriteResponseBody(writer, response, CurrentVersion);
+                WriteResponseBody(writer, response, version);
                 writer.Flush();
                 return body.ToArray();
             }
@@ -706,6 +802,7 @@ namespace TermLink.Agent
                     : null;
                 var response = new RegistryResponse
                 {
+                    ProtocolVersion = version,
                     AuthenticationNonce = authenticationNonce,
                     AuthenticationTag = authenticationTag,
                     Success = reader.ReadBoolean(),
@@ -802,6 +899,27 @@ namespace TermLink.Agent
                 WriteString(writer, status.ServerOrigin ?? string.Empty);
                 writer.Write(status.TerminalSnapshotEnabled);
             }
+            if (version >= 8)
+            {
+                writer.Write(status.PcId.ToByteArray());
+                WriteString(writer, status.AgentVersion ?? string.Empty);
+                var terminalCommands = status.TerminalCommands ??
+                    new List<ProductionTerminalCommandSummary>();
+                if (terminalCommands.Count > 24)
+                    throw new InvalidDataException("Too many production terminal commands.");
+                writer.Write(terminalCommands.Count);
+                foreach (var command in terminalCommands)
+                {
+                    if (command == null) throw new InvalidDataException("A production terminal command is missing.");
+                    WriteString(writer, command.Id ?? string.Empty);
+                    WriteString(writer, command.DisplayName ?? string.Empty);
+                    WriteString(writer, command.Executable ?? string.Empty);
+                    WriteString(writer, command.Arguments ?? string.Empty);
+                    WriteString(writer, command.ShellType ?? string.Empty);
+                    writer.Write(command.Detected);
+                    writer.Write(command.Enabled);
+                }
+            }
         }
 
         private static ProductionStatus ReadProductionStatus(BinaryReader reader, byte version)
@@ -871,6 +989,34 @@ namespace TermLink.Agent
             {
                 status.ServerOrigin = ReadString(reader);
                 status.TerminalSnapshotEnabled = reader.ReadBoolean();
+            }
+            if (version >= 8)
+            {
+                status.PcId = new Guid(ReadExact(reader, 16));
+                status.AgentVersion = ReadString(reader);
+                var commandCount = reader.ReadInt32();
+                if (commandCount < 0 || commandCount > 24)
+                    throw new InvalidDataException("Invalid production terminal command count.");
+                var terminalCommands = new List<ProductionTerminalCommandSummary>(commandCount);
+                for (var index = 0; index < commandCount; index++)
+                {
+                    terminalCommands.Add(new ProductionTerminalCommandSummary
+                    {
+                        Id = ReadString(reader),
+                        DisplayName = ReadString(reader),
+                        Executable = ReadString(reader),
+                        Arguments = ReadString(reader),
+                        ShellType = ReadString(reader),
+                        Detected = reader.ReadBoolean(),
+                        Enabled = reader.ReadBoolean()
+                    });
+                }
+                status.TerminalCommands = terminalCommands;
+            }
+            else
+            {
+                status.AgentVersion = string.Empty;
+                status.TerminalCommands = new List<ProductionTerminalCommandSummary>();
             }
             return status;
         }

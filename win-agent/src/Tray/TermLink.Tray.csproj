@@ -8,7 +8,13 @@
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <AssemblyName>TermLink</AssemblyName>
     <RootNamespace>TermLink.Tray</RootNamespace>
+    <TermLinkUpdateApplicationSlug Condition="'$(TermLinkUpdateApplicationSlug)' == ''">termlink-win64</TermLinkUpdateApplicationSlug>
+    <TermLinkUpdateChannel Condition="'$(TermLinkUpdateChannel)' == ''">stable</TermLinkUpdateChannel>
   </PropertyGroup>
+  <ItemGroup>
+    <AssemblyMetadata Include="TermLinkUpdateApplicationSlug" Value="$(TermLinkUpdateApplicationSlug)" />
+    <AssemblyMetadata Include="TermLinkUpdateChannel" Value="$(TermLinkUpdateChannel)" />
+  </ItemGroup>
   <ItemGroup>
     <Compile Include="..\Common\WindowsTerminalIntegration.cs" Link="Common\WindowsTerminalIntegration.cs" />
     <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />

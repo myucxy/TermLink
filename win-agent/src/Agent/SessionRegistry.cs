@@ -1696,10 +1696,84 @@ namespace TermLink.Agent
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
 #endif
+                case RegistryCommand.LoginAccount:
+#if TERMLINK_PRODUCTION_RUNTIME
+                    ProductionEnrollment.LoginDirect(
+                        ProductionEnrollment.PublicServerUrl,
+                        request.PcName,
+                        request.AccountUsername,
+                        request.AccountPassword);
+                    return PrepareAccountRestart("ACCOUNT_LOGIN_ACCEPTED");
+#else
+                    return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+#endif
+                case RegistryCommand.RegisterAccount:
+#if TERMLINK_PRODUCTION_RUNTIME
+                    ProductionEnrollment.RegisterDirect(
+                        ProductionEnrollment.PublicServerUrl,
+                        request.PcName,
+                        request.AccountUsername,
+                        request.AccountEmail,
+                        request.AccountPassword,
+                        request.AccountPasswordConfirmation);
+                    return PrepareAccountRestart("ACCOUNT_REGISTRATION_ACCEPTED");
+#else
+                    return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+#endif
+                case RegistryCommand.SignOutAccount:
+#if TERMLINK_PRODUCTION_RUNTIME
+                    shutdownRequested = true;
+                    var signOut = registry.ShutdownForRestart();
+                    if (productionRuntime != null)
+                    {
+                        productionRuntime.DrainTerminalPublications(TimeSpan.FromSeconds(10));
+                        productionRuntime.Dispose();
+                    }
+                    ProductionEnrollment.ForgetLocalAccount();
+                    return BareStopResponse(
+                        signOut,
+                        "ACCOUNT_SIGNED_OUT",
+                        "ACCOUNT_SIGNED_OUT_WITH_TIMEOUTS");
+#else
+                    return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+#endif
+                case RegistryCommand.SaveTerminalCommands:
+#if TERMLINK_PRODUCTION_RUNTIME
+                    var manualCommands = (request.TerminalCommands ??
+                            new List<ProductionTerminalCommandSummary>())
+                        .Select(command => TerminalCommandProfileStore.CreateManualProfile(
+                            command.Id,
+                            command.DisplayName,
+                            command.Executable,
+                            command.Arguments,
+                            command.Enabled))
+                        .ToArray();
+                    TerminalCommandProfileStore.SaveManualProfiles(manualCommands);
+                    if (productionRuntime != null) productionRuntime.RequestReconnect();
+                    return Response(true, "TERMINAL_COMMANDS_SAVED", manualCommands.Length);
+#else
+                    return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+#endif
                 default:
                     return Response(false, "UNKNOWN_COMMAND", 0);
             }
         }
+
+#if TERMLINK_PRODUCTION_RUNTIME
+        private RegistryResponse PrepareAccountRestart(string successCode)
+        {
+            shutdownRequested = true;
+            var restart = registry.ShutdownForRestart();
+            if (productionRuntime != null)
+            {
+                productionRuntime.DrainTerminalPublications(TimeSpan.FromSeconds(10));
+            }
+            return BareStopResponse(
+                restart,
+                successCode,
+                successCode + "_WITH_TIMEOUTS");
+        }
+#endif
 
         private RegistryResponse Response(bool success, string code, int affected)
         {
@@ -1729,6 +1803,34 @@ namespace TermLink.Agent
             };
         }
 
+        private static RegistryResponse BareStopResponse(
+            SessionStopResult result,
+            string successCode,
+            string timeoutCode)
+        {
+            return new RegistryResponse
+            {
+                Success = result.Success,
+                Code = result.Success ? successCode : timeoutCode,
+                RemoteAccessEnabled = false,
+                Summaries = new List<SessionSummary>(),
+                AffectedSessions = result.RequestedSessions,
+                TimedOutSessions = result.TimedOutSessions,
+                Production = new ProductionStatus
+                {
+                    Configured = false,
+                    AccountLinked = false,
+                    ServerOrigin = string.Empty,
+                    AgentVersion = string.Empty,
+                    TerminalSnapshotEnabled = false,
+                    RelayState = ProductionRelayState.Stopped,
+                    Devices = new List<ProductionDeviceSummary>(),
+                    Sessions = new List<ProductionSessionSummary>(),
+                    TerminalCommands = new List<ProductionTerminalCommandSummary>()
+                }
+            };
+        }
+
         private ProductionStatus ProductionSnapshot(bool forceRefresh)
         {
 #if TERMLINK_PRODUCTION_RUNTIME
@@ -1740,10 +1842,35 @@ namespace TermLink.Agent
                 AccountLinked = false,
                 ServerOrigin = string.Empty,
                 TerminalSnapshotEnabled = false,
+                AgentVersion = string.Empty,
                 RelayState = ProductionRelayState.NotConfigured,
                 Devices = new List<ProductionDeviceSummary>(),
-                Sessions = new List<ProductionSessionSummary>()
+                Sessions = new List<ProductionSessionSummary>(),
+                TerminalCommands = AvailableTerminalCommands()
             };
+        }
+
+        private static List<ProductionTerminalCommandSummary> AvailableTerminalCommands()
+        {
+#if TERMLINK_PRODUCTION_RUNTIME
+            return ManagedTerminalLauncher.LoadAvailableTerminalCommandProfiles()
+                    .Select(profile => new ProductionTerminalCommandSummary
+                    {
+                        Id = profile.Id,
+                        DisplayName = profile.DisplayName,
+                        Executable = profile.ExecutablePath,
+                        Arguments = profile.Arguments,
+                        ShellType = profile.ManagedShell,
+                        Detected = string.Equals(profile.Source, "detected", StringComparison.Ordinal),
+                        Enabled = profile.Enabled
+                    })
+                    .ToList();
+#else
+            // The portable recovery harness compiles SessionRegistry without
+            // WindowsFileOperations. Command discovery is a production runtime
+            // capability and must not pull platform launchers into that oracle.
+            return new List<ProductionTerminalCommandSummary>();
+#endif
         }
 
         private static NamedPipeServerStream CreateControlPipe(string pipeName)

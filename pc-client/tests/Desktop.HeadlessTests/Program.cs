@@ -36,6 +36,19 @@ public static class Program
                 DateTimeOffset.UnixEpoch.AddSeconds(index),
                 (ulong)index))
             .ToArray();
+        var devices = Enumerable.Range(0, 100)
+            .Select(index => new AccountDeviceSnapshot(
+                Guid.Parse($"10000000-0000-0000-0000-{index + 1:000000000000}"),
+                $"android-{index:000}",
+                "ANDROID",
+                index % 2 == 0 ? "CONTROL" : "VIEW",
+                index % 3 != 0))
+            .ToArray();
+        var terminalCommands = new[]
+        {
+            new TerminalCommandCapability("pwsh", "PowerShell 7", "pwsh.exe", Array.Empty<string>(), true),
+            new TerminalCommandCapability("custom-existing", "Existing", "cmd.exe", new[] { "/k" }, false),
+        };
         var snapshot = new AgentStatusSnapshot(
             1,
             DateTimeOffset.UnixEpoch,
@@ -48,17 +61,20 @@ public static class Program
             null,
             null,
             new HashSet<string> { PcCapabilityIds.RealtimeTerminalV1 },
-            Array.Empty<TerminalCommandCapability>(),
+            terminalCommands,
             sessions,
-            Array.Empty<AccountDeviceSnapshot>());
+            devices);
         var client = new StaticAgentClient(snapshot);
+        var desktopOperations = new FailingDesktopOperations();
         await using var stateStore = new AgentStateStore(client, TimeSpan.FromMinutes(1));
         var telemetry = new CapturingNavigationTelemetry();
         var viewModel = new MainWindowViewModel(
             stateStore,
+            client,
             new ImmediateUiDispatcher(),
             new PlatformDescriptor(PcPlatform.Windows, PcArchitecture.X64, "Windows headless", "win-x64", false),
-            telemetry);
+            telemetry,
+            desktopOperations);
         var window = new MainWindow { DataContext = viewModel };
         window.Show();
         await stateStore.RefreshAsync();
@@ -67,9 +83,42 @@ public static class Program
         var connectionRoot = RequireControl<Grid>(window, "ConnectionPageRoot");
         var sessionsRoot = RequireControl<Grid>(window, "SessionsPageRoot");
         var settingsRoot = RequireControl<Grid>(window, "SettingsPageRoot");
+        var devicesRoot = RequireControl<Grid>(window, "DevicesPageRoot");
+        var accountRoot = RequireControl<Grid>(window, "AccountPageRoot");
+        var diagnosticsRoot = RequireControl<Grid>(window, "DiagnosticsPageRoot");
         var sessionList = RequireControl<ListBox>(window, "SessionList");
+        var deviceList = RequireControl<ListBox>(window, "DeviceList");
+        var commandList = RequireControl<ListBox>(window, "CommandList");
         Require(viewModel.Sessions.Sessions.Count == 100, "The 100-session snapshot was not applied.");
+        Require(viewModel.Devices.Devices.Count == 100, "The 100-device snapshot was not applied.");
+        Require(viewModel.Settings.TerminalCommands.Count == 2, "Terminal commands were not applied.");
         Require(sessionList.ItemsPanelRoot is VirtualizingStackPanel, "The session list is not virtualized.");
+
+        viewModel.Navigate("devices");
+        Dispatcher.UIThread.RunJobs();
+        Require(deviceList.ItemsPanelRoot is VirtualizingStackPanel, "The device list is not virtualized.");
+        viewModel.Navigate("settings");
+        Dispatcher.UIThread.RunJobs();
+        Require(commandList.ItemsPanelRoot is VirtualizingStackPanel, "The command list is not virtualized.");
+
+        viewModel.Settings.NewCommandName = "Custom shell";
+        viewModel.Settings.NewExecutable = "custom-shell.exe";
+        viewModel.Settings.NewArguments = "--login";
+        viewModel.AddTerminalCommandCommand.Execute(null);
+        await DrainCommandAsync(viewModel.AddTerminalCommandCommand);
+        Require(viewModel.Settings.TerminalCommands.Count == 3, "A manual command was not added.");
+        var added = viewModel.Settings.TerminalCommands.Single(command => command.DisplayName == "Custom shell");
+        viewModel.RemoveTerminalCommandCommand.Execute(added);
+        await DrainCommandAsync(viewModel.RemoveTerminalCommandCommand);
+        Require(viewModel.Settings.TerminalCommands.Count == 2, "A manual command was not removed.");
+        viewModel.RemoveTerminalCommandCommand.Execute(viewModel.Settings.TerminalCommands[0]);
+        await DrainCommandAsync(viewModel.RemoveTerminalCommandCommand);
+        Require(viewModel.Settings.TerminalCommands.Count == 2, "An auto-detected command was removable.");
+
+        viewModel.CheckForUpdatesCommand.Execute(null);
+        await DrainCommandAsync(viewModel.CheckForUpdatesCommand);
+        Require(viewModel.OperationMessage.Contains("operation fixture", StringComparison.Ordinal),
+            "A desktop-operation failure was not converted into UI state.");
 
         var durations = new List<double>(300);
         var keys = new[] { "connection", "settings", "sessions" };
@@ -87,13 +136,46 @@ public static class Program
             "The sessions page was reconstructed during navigation.");
         Require(ReferenceEquals(settingsRoot, RequireControl<Grid>(window, "SettingsPageRoot")),
             "The settings page was reconstructed during navigation.");
+        Require(ReferenceEquals(devicesRoot, RequireControl<Grid>(window, "DevicesPageRoot")),
+            "The devices page was reconstructed during navigation.");
+        Require(ReferenceEquals(accountRoot, RequireControl<Grid>(window, "AccountPageRoot")),
+            "The account page was reconstructed during navigation.");
+        Require(ReferenceEquals(diagnosticsRoot, RequireControl<Grid>(window, "DiagnosticsPageRoot")),
+            "The diagnostics page was reconstructed during navigation.");
         var p95 = Percentile(durations, 0.95);
         Require(p95 <= 100, $"Headless navigation P95 exceeded 100 ms: {p95:F3} ms.");
         Require(telemetry.Measurements.Count >= 299, "Navigation telemetry did not capture page transitions.");
 
+        var controlLifetime = new ControlUiWindowLifetime();
+        var closeProbe = new Window();
+        closeProbe.Closing += controlLifetime.HandleClosing;
+        closeProbe.Show();
+        closeProbe.Close();
+        Dispatcher.UIThread.RunJobs();
+        Require(!closeProbe.IsVisible && !controlLifetime.ExitRequested,
+            "Closing the control window did not hide it while keeping the UI lifetime active.");
+        closeProbe.Show();
+        controlLifetime.RequestExit();
+        closeProbe.Close();
+        Dispatcher.UIThread.RunJobs();
+        Require(!closeProbe.IsVisible && controlLifetime.ExitRequested,
+            "Explicit control-UI exit did not allow the window to close.");
+
         Console.WriteLine(
-            $"Avalonia headless shell passed: cached pages, virtualized 100-session list, navigation P95={p95:F3} ms.");
+            $"Avalonia headless shell passed: cached pages, virtualized 100-session/100-device lists, commands, tray-window lifecycle and failure isolation, navigation P95={p95:F3} ms.");
         window.Close();
+    }
+
+    private static async Task DrainCommandAsync(AsyncCommand command)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (command.IsRunning && DateTime.UtcNow < deadline)
+        {
+            Dispatcher.UIThread.RunJobs();
+            await Task.Delay(1);
+        }
+        Dispatcher.UIThread.RunJobs();
+        Require(!command.IsRunning, "An async UI command did not complete.");
     }
 
     private static T RequireControl<T>(Control root, string name) where T : Control =>
@@ -120,11 +202,28 @@ public static class Program
             ValueTask.CompletedTask;
 
         public ValueTask RetryConnectionAsync(CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask StopSessionAsync(Guid sessionId, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask GrantDeviceAsync(Guid deviceId, string permission, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask RevokeDeviceAsync(Guid deviceId, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask LoginAsync(string username, string password, string pcName, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask RegisterAsync(string username, string email, string password, string passwordConfirmation, string pcName, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SignOutAsync(CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SaveTerminalCommandsAsync(IReadOnlyList<TerminalCommandCapability> commands, CancellationToken cancellationToken) => ValueTask.CompletedTask;
     }
 
     private sealed class CapturingNavigationTelemetry : INavigationTelemetry
     {
         public List<NavigationMeasurement> Measurements { get; } = new();
         public void Record(NavigationMeasurement measurement) => Measurements.Add(measurement);
+    }
+
+    private sealed class FailingDesktopOperations : IDesktopOperations
+    {
+        public ValueTask<string> CheckForUpdatesAsync(CancellationToken cancellationToken) =>
+            ValueTask.FromException<string>(new InvalidOperationException("operation fixture"));
+        public ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken) =>
+            ValueTask.FromResult("opened");
+        public ValueTask<string> RepairTerminalIntegrationAsync(CancellationToken cancellationToken) =>
+            ValueTask.FromResult("repaired");
     }
 }

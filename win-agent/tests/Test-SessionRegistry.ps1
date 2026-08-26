@@ -95,7 +95,7 @@ try {
         classification = 'local Win-Agent Registry and current-user control IPC; not production Relay or protocol'
         passed = $true
         registry_process_model = 'one long-lived Registry with one isolated SessionAgent worker per Host'
-        local_control_protocol = 'bounded Registry Pipe V7 with current-user SID ACL, DPAPI installation secret, HMAC, timestamp, and nonce replay protection'
+        local_control_protocol = 'bounded Registry Pipe V8 with V7/V6/V5 compatibility, current-user SID ACL, DPAPI installation secret, HMAC, timestamp, nonce replay protection, and authenticated response bodies'
         simultaneous_sessions = [int]$fields.multi_sessions
         summaries_exclude_terminal_body_pipe_token_and_buffer_path = [bool]::Parse($fields.summary_redacted)
         single_remote_stop_preserved_local_shell = [bool]::Parse($fields.single_stop_local_alive)

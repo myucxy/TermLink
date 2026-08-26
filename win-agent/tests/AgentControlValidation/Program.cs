@@ -92,6 +92,44 @@ catch (ArgumentException) { invalidPermissionRejected = true; }
 Require(invalidPermissionRejected, "Unsupported direct grant permission was accepted.");
 var revokeRequest = RoundTripRequest(new RegistryRequest { Command = RegistryCommand.RevokeDevice, DeviceId = deviceId });
 Require(revokeRequest.DeviceId == deviceId, "RevokeDevice ID changed.");
+var loginRequest = RoundTripRequest(new RegistryRequest
+{
+    Command = RegistryCommand.LoginAccount,
+    AccountUsername = "codec-user",
+    AccountPassword = "codec-password",
+    PcName = "Codec PC"
+});
+Require(loginRequest.AccountUsername == "codec-user" && loginRequest.AccountPassword == "codec-password" &&
+    loginRequest.PcName == "Codec PC", "Login request changed.");
+var registerRequest = RoundTripRequest(new RegistryRequest
+{
+    Command = RegistryCommand.RegisterAccount,
+    AccountUsername = "new-user",
+    AccountEmail = "new@example.test",
+    AccountPassword = "new-password",
+    AccountPasswordConfirmation = "new-password",
+    PcName = "Codec PC"
+});
+Require(registerRequest.AccountEmail == "new@example.test" &&
+    registerRequest.AccountPasswordConfirmation == "new-password", "Registration request changed.");
+var commandSettingsRequest = RoundTripRequest(new RegistryRequest
+{
+    Command = RegistryCommand.SaveTerminalCommands,
+    TerminalCommands = new List<ProductionTerminalCommandSummary>
+    {
+        new ProductionTerminalCommandSummary
+        {
+            Id = "custom-codec",
+            DisplayName = "Codec Shell",
+            Executable = "codec.exe",
+            Arguments = "--codec value",
+            Enabled = true
+        }
+    }
+});
+Require(commandSettingsRequest.TerminalCommands.Count == 1 &&
+    commandSettingsRequest.TerminalCommands[0].Arguments == "--codec value",
+    "Terminal-command settings request changed.");
 
 var now = new DateTime(638925120000000000, DateTimeKind.Utc);
 var response = new RegistryResponse
@@ -117,6 +155,8 @@ var response = new RegistryResponse
     },
     Production = new ProductionStatus
     {
+        PcId = pcId,
+        AgentVersion = "0.2.0-preview.4",
         Configured = true,
         AccountLinked = true,
         AccountUsername = "codec-user",
@@ -140,6 +180,19 @@ var response = new RegistryResponse
                 ViewerCount = 2,
                 ControllerDeviceId = deviceId,
                 LeaseExpiresAtUtc = now.AddMinutes(1)
+            }
+        },
+        TerminalCommands = new List<ProductionTerminalCommandSummary>
+        {
+            new ProductionTerminalCommandSummary
+            {
+                Id = "pwsh",
+                DisplayName = "PowerShell 7",
+                Executable = "C:\\PowerShell\\pwsh.exe",
+                Arguments = "-NoLogo -NoProfile",
+                ShellType = "powershell-7",
+                Detected = true,
+                Enabled = true
             }
         },
         PairingChallenge = new PairingChallengeSummary
@@ -166,7 +219,12 @@ Require(decoded.Production.Configured &&
     "Production connection state or failure reason changed.");
 Require(decoded.Production.AccountUsername == "codec-user" && decoded.Production.AccountEmail == "codec@example.test", "Account identity changed.");
 Require(decoded.Production.ServerOrigin == "https://relay.example.test:9443", "Server origin changed.");
+Require(decoded.Production.PcId == pcId && decoded.Production.AgentVersion == "0.2.0-preview.4",
+    "V8 PC identity or Agent version changed.");
 Require(decoded.Production.TerminalSnapshotEnabled, "Terminal Snapshot capability changed.");
+Require(decoded.Production.TerminalCommands.Count == 1 &&
+    decoded.Production.TerminalCommands[0].Executable == "C:\\PowerShell\\pwsh.exe",
+    "V8 terminal-command settings changed.");
 Require(decoded.Production.Devices.Count == 1 && decoded.Production.Devices[0].DeviceId == deviceId, "Device summary changed.");
 Require(decoded.Production.Sessions.Count == 1 && decoded.Production.Sessions[0].ControllerDeviceId == deviceId, "Production session changed.");
 Require(decoded.Production.PairingChallenge != null &&
@@ -198,6 +256,23 @@ using (var legacyRequestStream = new MemoryStream())
         "Pipe V5 request compatibility changed.");
 }
 
+using (var legacyV7RequestStream = new MemoryStream())
+{
+    var legacySecret = Enumerable.Range(0, RegistryControlAuthentication.SecretBytes)
+        .Select(value => (byte)(value + 7))
+        .ToArray();
+    var legacyV7 = new RegistryRequest { Command = RegistryCommand.List };
+    RegistryControlAuthentication.Prepare(legacyV7, legacySecret, DateTime.UtcNow, 7);
+    RegistryControlCodec.WriteRequest(legacyV7RequestStream, legacyV7, 7);
+    legacyV7RequestStream.Position = 0;
+    byte legacyV7Version;
+    var decodedLegacyV7 = RegistryControlCodec.ReadRequest(legacyV7RequestStream, out legacyV7Version);
+    Require(legacyV7Version == 7 &&
+        RegistryControlAuthentication.Verify(decodedLegacyV7, legacySecret, DateTime.UtcNow),
+        "Authenticated Pipe V7 request compatibility changed.");
+    Array.Clear(legacySecret, 0, legacySecret.Length);
+}
+
 using (var legacyResponseStream = new MemoryStream())
 {
     RegistryControlCodec.WriteResponse(legacyResponseStream, response, 5);
@@ -209,7 +284,7 @@ using (var legacyResponseStream = new MemoryStream())
         "Pipe V5 response synthesized Terminal Snapshot capability.");
 }
 
-Console.WriteLine("TermLink Agent control Pipe V7 authentication and V6/V5 compatibility validation passed.");
+Console.WriteLine("TermLink Agent control Pipe V8 authentication and V7/V6/V5 compatibility validation passed.");
 
 static RegistryRequest RoundTripRequest(RegistryRequest request)
 {
@@ -282,8 +357,10 @@ static void ValidateAuthenticationAndSecretStore()
 
 static RegistryResponse RoundTripResponse(RegistryResponse response)
 {
+    response.AuthenticationNonce = new byte[RegistryControlAuthentication.NonceBytes];
+    response.AuthenticationTag = new byte[RegistryControlAuthentication.TagBytes];
     using var stream = new MemoryStream();
-    RegistryControlCodec.WriteResponse(stream, response, 6);
+    RegistryControlCodec.WriteResponse(stream, response);
     stream.Position = 0;
     return RegistryControlCodec.ReadResponse(stream);
 }

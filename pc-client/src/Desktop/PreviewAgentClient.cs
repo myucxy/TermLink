@@ -39,6 +39,38 @@ public sealed class PreviewAgentClient : IAgentClient
         return ValueTask.CompletedTask;
     }
 
+    public ValueTask StopSessionAsync(Guid sessionId, CancellationToken cancellationToken) =>
+        Unsupported(cancellationToken);
+
+    public ValueTask GrantDeviceAsync(Guid deviceId, string permission, CancellationToken cancellationToken) =>
+        Unsupported(cancellationToken);
+
+    public ValueTask RevokeDeviceAsync(Guid deviceId, CancellationToken cancellationToken) =>
+        Unsupported(cancellationToken);
+
+    public ValueTask LoginAsync(string username, string password, string pcName, CancellationToken cancellationToken) =>
+        Unsupported(cancellationToken);
+
+    public ValueTask RegisterAsync(
+        string username,
+        string email,
+        string password,
+        string passwordConfirmation,
+        string pcName,
+        CancellationToken cancellationToken) => Unsupported(cancellationToken);
+
+    public ValueTask SignOutAsync(CancellationToken cancellationToken) => Unsupported(cancellationToken);
+
+    public ValueTask SaveTerminalCommandsAsync(
+        IReadOnlyList<TerminalCommandCapability> commands,
+        CancellationToken cancellationToken) => Unsupported(cancellationToken);
+
+    private static ValueTask Unsupported(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.FromException(new NotSupportedException("The preview fixture does not mutate a production Agent."));
+    }
+
     private AgentStatusSnapshot CreateSnapshot()
     {
         var identity = new PcAgentIdentity(

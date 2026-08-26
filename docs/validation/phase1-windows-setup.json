@@ -1,15 +1,17 @@
 {
   "schema": "termlink.phase1-windows-setup-validation",
   "version": 1,
-  "generated_at_utc": "2026-08-26T03:24:46.1354721Z",
+  "generated_at_utc": "2026-08-26T04:24:07.5347458Z",
   "passed": true,
-  "setup_version": "0.1.2.0",
+  "setup_version": "0.2.0.39",
   "architecture": "win-x64",
   "single_file_setup": true,
   "self_contained_payload": true,
   "embedded_payload": true,
   "selected_install_directory_applied": true,
-  "tray_assembly_version": "0.1.2.0",
+  "tray_assembly_version": "0.2.0.39",
+  "update_channel": "preview",
+  "update_application_slug": "termlink-win64-preview",
   "terminal_profile_count": 4,
   "terminal_fragment_stale_upgrade_overwrite": true,
   "terminal_fragment_owned_cleanup": true,
@@ -21,5 +23,5 @@
   "previous_install_directory_auto_discovered": true,
   "installed_uninstaller": true,
   "uninstall": true,
-  "setup_sha256": "a7ed9127cf3c6aa06f2965442345f91519d9d63cd0b8470c35a8c86819a8081e"
+  "setup_sha256": "a82405374c9d22fbbaa36a7cdae0eb4e30319ad0243dcc9a60f3831d7e8a10b1"
 }

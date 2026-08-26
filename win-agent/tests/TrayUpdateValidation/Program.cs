@@ -18,6 +18,7 @@ namespace TermLink.Tray.UpdateValidation
             {
                 ParsesAppShipArtifactContract();
                 UsesFourthVersionComponentAsAppShipBuild();
+                UsesBuildBoundUpdateChannel();
                 RejectsIncompleteOrWrongArtifactMetadata();
                 EnforcesHttpsRedirectLimit();
                 ValidatesSizeAndSha256();
@@ -32,6 +33,13 @@ namespace TermLink.Tray.UpdateValidation
                 Console.Error.WriteLine(error);
                 return 1;
             }
+        }
+
+        private static void UsesBuildBoundUpdateChannel()
+        {
+            Assert(AppShipUpdateClient.ApplicationSlug == "termlink-win64", "stable application slug metadata");
+            Assert(AppShipUpdateClient.UpdateChannel == "stable", "stable update channel metadata");
+            Cases.Add("build_bound_update_channel");
         }
 
         private static void ParsesAppShipArtifactContract()

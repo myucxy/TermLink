@@ -21,6 +21,36 @@ namespace TermLink.Tray
             try
             {
                 var options = TrayOptions.Parse(args);
+                if (!string.IsNullOrEmpty(options.UpdateConfigJsonPath))
+                {
+                    var destination = Path.GetFullPath(options.UpdateConfigJsonPath);
+                    var directory = Path.GetDirectoryName(destination);
+                    if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+                    File.WriteAllText(
+                        destination,
+                        JsonSerializer.Serialize(
+                            new
+                            {
+                                application_slug = AppShipUpdateClient.ApplicationSlug,
+                                channel = AppShipUpdateClient.UpdateChannel
+                            },
+                            new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine,
+                        new UTF8Encoding(false));
+                    return 0;
+                }
+                if (options.CheckUpdate)
+                {
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    var result = new WindowsUpdateWorkflow()
+                        .CheckAndOfferAsync(null, manual: true)
+                        .GetAwaiter()
+                        .GetResult();
+                    return result.Decision == WindowsUpdateDecision.Error ||
+                        result.Decision == WindowsUpdateDecision.NotConfigured
+                        ? 1
+                        : 0;
+                }
                 if (!string.IsNullOrEmpty(options.StatusJsonPath))
                 {
                     var response = ExternalAgentDiagnostics.Send(
@@ -142,6 +172,8 @@ namespace TermLink.Tray
         public string StatusJsonPath { get; private set; }
         public bool ShutdownAgent { get; private set; }
         public bool RestartAgent { get; private set; }
+        public bool CheckUpdate { get; private set; }
+        public string UpdateConfigJsonPath { get; private set; }
 
         public static TrayOptions Parse(string[] args)
         {
@@ -152,6 +184,8 @@ namespace TermLink.Tray
             string statusJson = null;
             var shutdown = false;
             var restart = false;
+            var checkUpdate = false;
+            string updateConfigJson = null;
             for (var index = 0; index < args.Length; index++)
             {
                 switch (args[index])
@@ -162,6 +196,8 @@ namespace TermLink.Tray
                     case "--status-json": statusJson = Required(args, ref index, "--status-json"); break;
                     case "--shutdown-agent": shutdown = true; break;
                     case "--restart-agent": restart = true; break;
+                    case "--check-update": checkUpdate = true; break;
+                    case "--update-config-json": updateConfigJson = Required(args, ref index, "--update-config-json"); break;
                     default: throw new ArgumentException("Unknown Tray argument: " + args[index]);
                 }
             }
@@ -174,7 +210,8 @@ namespace TermLink.Tray
             {
                 throw new ArgumentException("server URL must be an HTTPS origin");
             }
-            var commandCount = (shutdown ? 1 : 0) + (restart ? 1 : 0) +
+            var commandCount = (shutdown ? 1 : 0) + (restart ? 1 : 0) + (checkUpdate ? 1 : 0) +
+                (!string.IsNullOrEmpty(updateConfigJson) ? 1 : 0) +
                 (!string.IsNullOrEmpty(statusJson) ? 1 : 0);
             if (commandCount > 1)
             {
@@ -187,7 +224,9 @@ namespace TermLink.Tray
                 ServerUrl = serverOrigin,
                 StatusJsonPath = statusJson,
                 ShutdownAgent = shutdown,
-                RestartAgent = restart
+                RestartAgent = restart,
+                CheckUpdate = checkUpdate,
+                UpdateConfigJsonPath = updateConfigJson
             };
         }
 

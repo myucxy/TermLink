@@ -11,6 +11,21 @@ public interface IAgentClient
     ValueTask<AgentStatusSnapshot> GetStatusAsync(bool forceRefresh, CancellationToken cancellationToken);
     ValueTask SetRemoteAccessAsync(bool enabled, CancellationToken cancellationToken);
     ValueTask RetryConnectionAsync(CancellationToken cancellationToken);
+    ValueTask StopSessionAsync(Guid sessionId, CancellationToken cancellationToken);
+    ValueTask GrantDeviceAsync(Guid deviceId, string permission, CancellationToken cancellationToken);
+    ValueTask RevokeDeviceAsync(Guid deviceId, CancellationToken cancellationToken);
+    ValueTask LoginAsync(string username, string password, string pcName, CancellationToken cancellationToken);
+    ValueTask RegisterAsync(
+        string username,
+        string email,
+        string password,
+        string passwordConfirmation,
+        string pcName,
+        CancellationToken cancellationToken);
+    ValueTask SignOutAsync(CancellationToken cancellationToken);
+    ValueTask SaveTerminalCommandsAsync(
+        IReadOnlyList<TerminalCommandCapability> commands,
+        CancellationToken cancellationToken);
 }
 public interface IUiDispatcher
 {

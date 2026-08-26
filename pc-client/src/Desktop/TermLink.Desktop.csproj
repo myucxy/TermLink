@@ -1,9 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
-    <AssemblyName>TermLink.Desktop</AssemblyName>
+    <TargetFrameworks>net8.0;net8.0-windows</TargetFrameworks>
+    <AssemblyName>TermLink</AssemblyName>
     <RootNamespace>TermLink.Desktop</RootNamespace>
+    <ApplicationIcon Condition="'$(TargetFramework)' == 'net8.0-windows'">..\..\..\assets\brand\windows\TermLink.ico</ApplicationIcon>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
   </PropertyGroup>
   <ItemGroup>
@@ -12,7 +13,12 @@
     <PackageReference Include="Avalonia.Fonts.Inter" />
     <PackageReference Include="Avalonia.Themes.Fluent" />
   </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net8.0-windows'">
+    <ProjectReference Include="..\Windows\TermLink.Platform.Windows.csproj" />
+  </ItemGroup>
   <ItemGroup>
+    <AvaloniaResource Include="..\..\..\assets\brand\windows\TermLink.ico"
+                      Link="Assets\TermLink.ico" />
     <ProjectReference Include="..\Contracts\TermLink.Pc.Contracts.csproj" />
     <ProjectReference Include="..\Platform.Abstractions\TermLink.Platform.Abstractions.csproj" />
     <ProjectReference Include="..\Presentation\TermLink.Presentation.csproj" />

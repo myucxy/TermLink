@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -85,7 +86,12 @@ namespace TermLink.Tray
 
     internal static class AppShipUpdateClient
     {
-        internal const string ApplicationSlug = "termlink-win64";
+        internal static string ApplicationSlug => ReadBuildMetadata(
+            "TermLinkUpdateApplicationSlug",
+            "termlink-win64");
+        internal static string UpdateChannel => ReadBuildMetadata(
+            "TermLinkUpdateChannel",
+            "stable");
         private const string PublicBaseUrl = "https://appship.kget.cc:8910";
         private const int MaximumResponseBytes = 256 * 1024;
         private const long MaximumArtifactBytes = 2L * 1024 * 1024 * 1024;
@@ -134,7 +140,7 @@ namespace TermLink.Tray
 
             var build = CurrentBuild(currentVersion);
             var relative = "api/v1/apps/" + ApplicationSlug +
-                "/updates?platform=windows&arch=x64&channel=stable&build=" + build;
+                "/updates?platform=windows&arch=x64&channel=" + UpdateChannel + "&build=" + build;
             var endpoint = new Uri(root, relative);
             try
             {
@@ -174,6 +180,20 @@ namespace TermLink.Tray
         internal static WindowsUpdateResult ParseForValidation(string body, long currentBuild = 0)
         {
             return Parse(body, currentBuild);
+        }
+
+        private static string ReadBuildMetadata(string key, string fallback)
+        {
+            foreach (var metadata in typeof(AppShipUpdateClient).Assembly
+                .GetCustomAttributes<AssemblyMetadataAttribute>())
+            {
+                if (string.Equals(metadata.Key, key, StringComparison.Ordinal) &&
+                    !string.IsNullOrWhiteSpace(metadata.Value))
+                {
+                    return metadata.Value;
+                }
+            }
+            return fallback;
         }
 
         internal static async Task<HttpResponseMessage> SendWithRedirectsAsync(

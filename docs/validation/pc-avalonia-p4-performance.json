@@ -1,0 +1,35 @@
+{
+  "schema": "termlink.pc-avalonia-p4-performance",
+  "version": 1,
+  "generated_at_utc": "2026-08-26T04:26:22.0355207Z",
+  "classification": "isolated Windows idle sample; Avalonia Desktop uses preview fixture and Agent uses an isolated unconfigured registry",
+  "passed": true,
+  "hardware": {
+    "operating_system": "Microsoft Windows 10 专业版",
+    "processor": "Intel(R) Core(TM) i9-9900KF CPU @ 3.60GHz",
+    "logical_processors": 16
+  },
+  "sample": {
+    "warmup_seconds": 5,
+    "duration_seconds": 20.005,
+    "diagnostics_enabled": false
+  },
+  "desktop": {
+    "single_core_cpu_percent": 0.312,
+    "private_memory_mib": 80.46,
+    "threads": 42,
+    "handles": 678
+  },
+  "agent": {
+    "single_core_cpu_percent": 0.0,
+    "private_memory_mib": 8.78,
+    "threads": 42,
+    "handles": 394
+  },
+  "total_private_memory_mib": 89.24,
+  "gates": {
+    "desktop_single_core_cpu_percent_max": 0.5,
+    "desktop_private_memory_mib_max": 120,
+    "desktop_plus_agent_private_memory_mib_max": 200
+  }
+}

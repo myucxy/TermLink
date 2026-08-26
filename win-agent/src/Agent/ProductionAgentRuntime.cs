@@ -1137,6 +1137,8 @@ namespace TermLink.Agent
                 }
                 return new ProductionStatus
                 {
+                    PcId = config.PcId,
+                    AgentVersion = config.AgentVersion,
                     Configured = true,
                     AccountLinked = true,
                     AccountUsername = accountUsername,
@@ -1150,6 +1152,18 @@ namespace TermLink.Agent
                     LastConnectedAtUtc = lastConnectedAtUtc,
                     Devices = devices,
                     Sessions = sessions,
+                    TerminalCommands = ManagedTerminalLauncher.LoadAvailableTerminalCommandProfiles()
+                        .Select(profile => new ProductionTerminalCommandSummary
+                        {
+                            Id = profile.Id,
+                            DisplayName = profile.DisplayName,
+                            Executable = profile.ExecutablePath,
+                            Arguments = profile.Arguments,
+                            ShellType = profile.ManagedShell,
+                            Detected = string.Equals(profile.Source, "detected", StringComparison.Ordinal),
+                            Enabled = profile.Enabled
+                        })
+                        .ToList(),
                     PairingChallenge = pairingChallenge == null ? null : new PairingChallengeSummary
                     {
                         ChallengeId = pairingChallenge.ChallengeId,
