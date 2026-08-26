@@ -2,7 +2,7 @@
   "schema": "termlink.pc-avalonia-p4-windows",
   "version": 1,
   "generated_at_utc": "2026-08-26T04:26:30Z",
-  "classification": "local Windows parity pre-publication gate; AppShip publication and real Android/Relay E2E are verified after source commit",
+  "classification": "local Windows parity gate with AppShip Preview publication and real Android/Relay E2E acceptance",
   "passed": true,
   "baseline_tag": "pc-avalonia-baseline-v0.1.32",
   "candidate_version": "0.2.1",
@@ -60,15 +60,57 @@
     "rollback_failure_reported": true,
     "interrupted_rollback_resumed": true
   },
+  "published_preview": {
+    "application_slug": "termlink-win64-preview",
+    "application_id": "0a8ea61d-e68a-414b-8dd1-77a18923099d",
+    "application_visibility": "unlisted",
+    "channel": "beta",
+    "channel_visibility": "public",
+    "release_id": "0c8f24e7-893b-46dc-96ab-76dade6733e6",
+    "artifact_id": "c36ee224-5337-4ab3-881e-569a3529a584",
+    "artifact_sha256": "2736ce4a14ae4291c79ef89b6130069e559167be86fb6459795a196fd22748e7",
+    "signature_status": "Valid",
+    "signer_sha1": "91ae60bc06d866628b8eb2c62f32bde9dab56466",
+    "rfc3161_timestamp": true,
+    "previous_build_decision": "optional",
+    "current_build_decision": "no_update"
+  },
+  "real_installation": {
+    "install_root": "D:/Dev/Tool/TermLink",
+    "upgrade_from": "0.1.32.38",
+    "upgrade_to": "0.2.1.40",
+    "rollback_to": "0.1.32.38",
+    "reinstalled": "0.2.1.40",
+    "account_preserved": true,
+    "pc_id_preserved": "9bb1a214-81f6-4a08-9a79-414be28ffb0a",
+    "remote_access_preserved": true,
+    "relay_reconnected": true,
+    "installed_control_protocol": 8,
+    "installed_agent_processes": 1
+  },
+  "android_relay_e2e": {
+    "device": "emulator-5554",
+    "android_version": "0.1.32.38-debug",
+    "application_data_preserved": true,
+    "windows_device": "HOME-PC",
+    "windows_agent_version": "0.2.1.40",
+    "relay_online": true,
+    "file_roots_returned": ["C:/", "D:/", "E:/", "F:/", "I:/"],
+    "discovered_terminal_commands": [
+      "Command Prompt",
+      "Windows PowerShell",
+      "PowerShell 7",
+      "WSL"
+    ],
+    "powershell_7_started_from_c_root": true,
+    "session_control_state": "controlling",
+    "encrypted_remote_close_confirmed": true,
+    "test_session_removed": true
+  },
   "performance_evidence": "docs/validation/pc-avalonia-p4-performance.json",
   "recovery_evidence": "docs/validation/phase1-windows-app.json",
   "registry_evidence": "docs/validation/phase1-session-registry.json",
   "setup_evidence": "docs/validation/phase1-windows-setup.json",
   "updater_evidence": "docs/validation/phase1-windows-updater.json",
-  "remaining_release_gates": [
-    "production Authenticode verification and AppShip preview publication",
-    "previous/current preview update API decisions",
-    "real install/update/rollback using the published package",
-    "Android client control of a real Windows session"
-  ]
+  "remaining_release_gates": []
 }
