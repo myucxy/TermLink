@@ -23,6 +23,9 @@ public sealed partial class App : Application
     private MainWindowViewModel? mainWindowViewModel;
     private IAsyncDisposable? agentClientLifetime;
     private IAsyncDisposable? platformLifetime;
+#if WINDOWS
+    private WindowsAgentClient? windowsAgentClient;
+#endif
     private MainWindow? mainWindow;
     private TrayIcon? trayIcon;
     private IClassicDesktopStyleApplicationLifetime? desktopLifetime;
@@ -44,6 +47,7 @@ public sealed partial class App : Application
             {
                 var windowsClient = new WindowsAgentClient(WindowsAgentClientOptions.CreateDefault(descriptor));
                 client = windowsClient;
+                windowsAgentClient = windowsClient;
                 agentClientLifetime = windowsClient;
                 desktopOperations = WindowsDesktopOperations.CreateDefault();
             }
@@ -154,11 +158,18 @@ public sealed partial class App : Application
         };
         var exitItem = new NativeMenuItem { Header = PresentationText.ExitControlUi };
         exitItem.Click += (_, _) => ExitControlUi();
+#if WINDOWS
+        var fullExitItem = new NativeMenuItem { Header = PresentationText.ExitTermLinkCompletely };
+        fullExitItem.Click += async (_, _) => await ExitTermLinkCompletelyAsync();
+#endif
         menu.Items.Add(openItem);
         menu.Items.Add(updateItem);
         menu.Items.Add(diagnosticsItem);
         menu.Items.Add(new NativeMenuItemSeparator());
         menu.Items.Add(exitItem);
+#if WINDOWS
+        if (windowsAgentClient is not null) menu.Items.Add(fullExitItem);
+#endif
 
         var result = new TrayIcon
         {
@@ -193,6 +204,36 @@ public sealed partial class App : Application
         trayIcon = null;
         desktopLifetime?.Shutdown();
     }
+
+#if WINDOWS
+    private int fullExitInFlight;
+
+    private async Task ExitTermLinkCompletelyAsync()
+    {
+        var client = windowsAgentClient;
+        var viewModel = mainWindowViewModel;
+        if (client is null || viewModel is null || Volatile.Read(ref fullExitInFlight) != 0) return;
+
+        ShowMainWindow();
+        if (!await viewModel.RequestConfirmationAsync(
+                PresentationText.ConfirmFullExitTitle,
+                PresentationText.ConfirmFullExitDetail,
+                CancellationToken.None)) return;
+        if (Interlocked.Exchange(ref fullExitInFlight, 1) != 0) return;
+
+        try
+        {
+            await client.ShutdownCompletelyAsync(CancellationToken.None);
+            ExitControlUi();
+        }
+        catch (Exception error)
+        {
+            Volatile.Write(ref fullExitInFlight, 0);
+            await viewModel.ReportFailureAsync(error);
+            ShowMainWindow();
+        }
+    }
+#endif
 
     private static PlatformDescriptor CreatePlatformDescriptor()
     {

@@ -34,6 +34,7 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
     private readonly object revisionSync = new();
     private byte[]? lastFingerprint;
     private long revision;
+    private int fullShutdownRequested;
     private bool disposed;
 
     public WindowsAgentClient(WindowsAgentClientOptions options)
@@ -177,6 +178,58 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
         await RestartAfterMutationAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Stops the authenticated Agent and every Agent/SessionHost process owned by
+    /// this installation. Once entered, status polling cannot restart the Agent.
+    /// A failed shutdown restores normal client operation so the UI can report and
+    /// retry the failure without silently losing its control surface.
+    /// </summary>
+    public async ValueTask ShutdownCompletelyAsync(CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        if (Interlocked.Exchange(ref fullShutdownRequested, 1) != 0) return;
+
+        var entered = false;
+        try
+        {
+            await lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
+            entered = true;
+            try
+            {
+                var response = await SendAsync(
+                    new RegistryRequest { Command = RegistryCommand.Shutdown },
+                    20_000,
+                    cancellationToken).ConfigureAwait(false);
+                if (!response.Success)
+                    throw new InvalidOperationException(response.Code ?? "AGENT_SHUTDOWN_FAILED");
+            }
+            catch (Exception error) when (IsConnectionFailure(error))
+            {
+                // No authenticated Agent is serving this installation. The
+                // path-scoped sweep below still closes any orphan SessionHost.
+            }
+
+            await WaitForPipeToStopAsync(DateTime.UtcNow.AddSeconds(20), cancellationToken)
+                .ConfigureAwait(false);
+            await WaitForOwnedProcessesAsync(DateTime.UtcNow.AddSeconds(10), cancellationToken)
+                .ConfigureAwait(false);
+            KillOwnedProcesses();
+            await WaitForOwnedProcessesAsync(DateTime.UtcNow.AddSeconds(5), cancellationToken)
+                .ConfigureAwait(false);
+            if (HasOwnedProcesses())
+                throw new InvalidOperationException("TermLink Agent or SessionHost processes are still running.");
+        }
+        catch
+        {
+            Volatile.Write(ref fullShutdownRequested, 0);
+            throw;
+        }
+        finally
+        {
+            if (entered) lifecycle.Release();
+        }
+    }
+
     public async ValueTask SaveTerminalCommandsAsync(
         IReadOnlyList<TerminalCommandCapability> commands,
         CancellationToken cancellationToken)
@@ -216,10 +269,14 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
 
     private async Task EnsureAgentAsync(CancellationToken cancellationToken)
     {
+        if (Volatile.Read(ref fullShutdownRequested) != 0)
+            throw new InvalidOperationException("TermLink is exiting completely; the Agent will not be restarted.");
         await lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ThrowIfDisposed();
+            if (Volatile.Read(ref fullShutdownRequested) != 0)
+                throw new InvalidOperationException("TermLink is exiting completely; the Agent will not be restarted.");
             if (await TryListAsync(750, cancellationToken).ConfigureAwait(false) is not null) return;
             var agentPath = Path.GetFullPath(options.AgentExecutablePath);
             if (!File.Exists(agentPath))
@@ -297,6 +354,105 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
                 request,
                 timeoutMilliseconds),
             cancellationToken);
+
+    private async Task WaitForPipeToStopAsync(DateTime deadlineUtc, CancellationToken cancellationToken)
+    {
+        while (DateTime.UtcNow < deadlineUtc)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (await TryListAsync(250, cancellationToken).ConfigureAwait(false) is null) return;
+            await Task.Delay(75, cancellationToken).ConfigureAwait(false);
+        }
+        throw new TimeoutException("The independent TermLink Agent did not release its control pipe.");
+    }
+
+    private async Task WaitForOwnedProcessesAsync(DateTime deadlineUtc, CancellationToken cancellationToken)
+    {
+        while (DateTime.UtcNow < deadlineUtc)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var processes = GetOwnedProcesses();
+            try
+            {
+                if (processes.Count == 0) return;
+            }
+            finally
+            {
+                foreach (var process in processes) process.Dispose();
+            }
+            await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private void KillOwnedProcesses()
+    {
+        foreach (var process in GetOwnedProcesses())
+        {
+            using (process)
+            {
+                try
+                {
+                    if (!process.HasExited) process.Kill(entireProcessTree: true);
+                    process.WaitForExit(5_000);
+                }
+                catch (InvalidOperationException)
+                {
+                    // The process exited between enumeration and termination.
+                }
+                catch (Win32Exception)
+                {
+                    // The final ownership check reports a precise failure without
+                    // broadening termination to unrelated TermLink installations.
+                }
+            }
+        }
+    }
+
+    private List<Process> GetOwnedProcesses()
+    {
+        var result = new List<Process>();
+        var installRoot = Path.GetDirectoryName(Path.GetFullPath(options.AgentExecutablePath));
+        if (string.IsNullOrWhiteSpace(installRoot)) return result;
+        var installPrefix = installRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
+            Path.DirectorySeparatorChar;
+        foreach (var name in new[] { "TermLink.Agent", "TermLink.SessionHost" })
+        {
+            foreach (var process in Process.GetProcessesByName(name))
+            {
+                try
+                {
+                    var path = process.MainModule?.FileName;
+                    if (!string.IsNullOrWhiteSpace(path) &&
+                        Path.GetFullPath(path).StartsWith(installPrefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        result.Add(process);
+                        continue;
+                    }
+                }
+                catch (InvalidOperationException)
+                {
+                }
+                catch (Win32Exception)
+                {
+                }
+                process.Dispose();
+            }
+        }
+        return result;
+    }
+
+    private bool HasOwnedProcesses()
+    {
+        var processes = GetOwnedProcesses();
+        try
+        {
+            return processes.Count != 0;
+        }
+        finally
+        {
+            foreach (var process in processes) process.Dispose();
+        }
+    }
 
     private AgentStatusSnapshot Map(RegistryResponse response)
     {

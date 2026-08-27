@@ -199,11 +199,25 @@ $restartIndex = $programSource.IndexOf('response = EnsureAgentCore();', $forgetI
 Assert-True ($signOutIndex -ge 0 -and $shutdownIndex -gt $signOutIndex -and $forgetIndex -gt $shutdownIndex -and $restartIndex -gt $forgetIndex) 'Sign-out does not stop, clear, and restart the Agent in order.'
 Assert-True ($programSource.Contains('response.Production.Configured || response.Production.AccountLinked')) 'Sign-out does not verify that the restarted Agent is logged out.'
 
-$exitStart = $traySource.IndexOf('private async void ExitTray()', [StringComparison]::Ordinal)
-$exitEnd = $traySource.IndexOf('protected override void Dispose', $exitStart, [StringComparison]::Ordinal)
-Assert-True ($exitStart -ge 0 -and $exitEnd -gt $exitStart) 'ExitTray implementation was not found.'
-$exitBody = $traySource.Substring($exitStart, $exitEnd - $exitStart)
-Assert-True ($exitBody.Contains('You will remain signed in.')) 'Exit tray does not tell the user that login is retained.'
-Assert-True (-not $exitBody.Contains('ForgetLocalAccount')) 'Exit tray incorrectly clears the local account.'
+$exitUiStart = $traySource.IndexOf('private void ExitTray()', [StringComparison]::Ordinal)
+$exitCompletelyStart = $traySource.IndexOf('private async void ExitTermLinkCompletely()', [StringComparison]::Ordinal)
+$exitEnd = $traySource.IndexOf('protected override void Dispose', $exitCompletelyStart, [StringComparison]::Ordinal)
+Assert-True ($exitUiStart -ge 0 -and $exitCompletelyStart -gt $exitUiStart -and $exitEnd -gt $exitCompletelyStart) `
+    'The separate control-UI and full-exit implementations were not found.'
+$exitUiBody = $traySource.Substring($exitUiStart, $exitCompletelyStart - $exitUiStart)
+$exitCompletelyBody = $traySource.Substring($exitCompletelyStart, $exitEnd - $exitCompletelyStart)
+Assert-True ($traySource.Contains('Exit control UI') -and $traySource.Contains('Exit TermLink completely')) `
+    'The tray does not expose distinct control-UI and full-exit actions.'
+Assert-True ($exitUiBody.Contains('you will remain signed in.')) `
+    'Exit control UI does not tell the user that login is retained.'
+Assert-True (-not $exitUiBody.Contains('ShutdownAndWait')) `
+    'Exit control UI incorrectly stops the independent Agent.'
+Assert-True ($exitCompletelyBody.Contains('controller.ShutdownAndWait()')) `
+    'Full exit does not stop the independent Agent and managed SessionHosts.'
+Assert-True ($exitCompletelyBody.Contains('Unsaved session work may be lost.')) `
+    'Full exit does not disclose the managed-session data-loss boundary.'
+Assert-True (-not $exitUiBody.Contains('ForgetLocalAccount') -and
+    -not $exitCompletelyBody.Contains('ForgetLocalAccount')) `
+    'An exit action incorrectly clears the local account.'
 
 Write-Output 'Account session identity, rotation, sign-out clearing, and exit-tray retention validation passed.'

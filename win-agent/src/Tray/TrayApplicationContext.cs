@@ -561,7 +561,8 @@ namespace TermLink.Tray
         private readonly ToolStripMenuItem signOutItem;
         private readonly ToolStripMenuItem openItem;
         private readonly ToolStripMenuItem settingsItem;
-        private readonly ToolStripMenuItem exitItem;
+        private readonly ToolStripMenuItem exitUiItem;
+        private readonly ToolStripMenuItem exitCompletelyItem;
         private readonly System.Windows.Forms.Timer refreshTimer;
         private readonly System.Windows.Forms.Timer updateCheckTimer;
         private readonly WindowsUpdateWorkflow updateWorkflow;
@@ -589,7 +590,14 @@ namespace TermLink.Tray
             signOutItem = new ToolStripMenuItem(TrayText.Pick("退出登录并忘记本机账号", "Sign out and forget local account"), null, delegate { SignOutAccount(); }) { Enabled = false };
             openItem = new ToolStripMenuItem(TrayText.Pick("打开 TermLink", "Open TermLink"), null, delegate { OpenMainWindow("connection"); });
             settingsItem = new ToolStripMenuItem(TrayText.Pick("设置", "Settings"), null, delegate { OpenMainWindow("settings"); });
-            exitItem = new ToolStripMenuItem(TrayText.Pick("退出 TermLink", "Exit TermLink"), null, delegate { ExitTray(); });
+            exitUiItem = new ToolStripMenuItem(
+                TrayText.Pick("退出控制界面", "Exit control UI"),
+                null,
+                delegate { ExitTray(); });
+            exitCompletelyItem = new ToolStripMenuItem(
+                TrayText.Pick("完全退出 TermLink", "Exit TermLink completely"),
+                null,
+                delegate { ExitTermLinkCompletely(); });
             var menu = new ContextMenuStrip();
             menu.Items.Add(new ToolStripMenuItem("TermLink") { Enabled = false });
             menu.Items.Add(statusItem);
@@ -602,7 +610,8 @@ namespace TermLink.Tray
             menu.Items.Add(openItem);
             menu.Items.Add(settingsItem);
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(exitItem);
+            menu.Items.Add(exitUiItem);
+            menu.Items.Add(exitCompletelyItem);
             menu.Opening += delegate
             {
                 _ = RefreshStateAsync(false);
@@ -645,6 +654,7 @@ namespace TermLink.Tray
 
         private async Task RefreshStateAsync(bool showFailure)
         {
+            if (Volatile.Read(ref exitInFlight) != 0) return;
             if (Interlocked.Exchange(ref refreshInFlight, 1) != 0) return;
             try
             {
@@ -668,7 +678,8 @@ namespace TermLink.Tray
             signOutItem.Text = TrayText.Pick("退出登录并忘记本机账号", "Sign out and forget local account");
             openItem.Text = TrayText.Pick("打开 TermLink", "Open TermLink");
             settingsItem.Text = TrayText.Pick("设置", "Settings");
-            exitItem.Text = TrayText.Pick("退出 TermLink", "Exit TermLink");
+            exitUiItem.Text = TrayText.Pick("退出控制界面", "Exit control UI");
+            exitCompletelyItem.Text = TrayText.Pick("完全退出 TermLink", "Exit TermLink completely");
         }
 
         private void ApplyState(RegistryResponse response)
@@ -908,8 +919,67 @@ namespace TermLink.Tray
                 return;
             }
             if (Interlocked.Exchange(ref exitInFlight, 1) != 0) return;
-            exitItem.Enabled = false;
+            FinishTrayExit();
+        }
+
+        private async void ExitTermLinkCompletely()
+        {
+            if (MessageBox.Show(
+                TrayText.Pick(
+                    "完全退出 TermLink？\n\n这将停止后台 Agent、断开所有远程连接，并结束当前由 TermLink 管理的命令行会话。未保存的会话工作可能丢失。\n\n本机登录信息会保留，下次启动后可继续使用。",
+                    "Exit TermLink completely?\n\nThis stops the background Agent, disconnects every remote connection, and ends terminal sessions managed by TermLink. Unsaved session work may be lost.\n\nYour local sign-in is retained for the next launch."),
+                "TermLink",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) != DialogResult.OK)
+            {
+                return;
+            }
+            if (Interlocked.Exchange(ref exitInFlight, 1) != 0) return;
+            exitUiItem.Enabled = false;
+            exitCompletelyItem.Enabled = false;
             refreshTimer.Stop();
+            updateCheckTimer.Stop();
+            if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.Close();
+            statusItem.Text = TrayText.Pick("正在完全退出…", "Exiting completely…");
+            try
+            {
+                await WaitForRefreshToFinishAsync();
+                await Task.Run(() => controller.ShutdownAndWait());
+                FinishTrayExit();
+            }
+            catch (Exception error)
+            {
+                Volatile.Write(ref exitInFlight, 0);
+                exitUiItem.Enabled = true;
+                exitCompletelyItem.Enabled = true;
+                refreshTimer.Start();
+                MessageBox.Show(
+                    TrayText.Pick(
+                        "完全退出失败，控制界面将保持运行。\n\n" + error.Message,
+                        "TermLink could not exit completely. The control UI will remain open.\n\n" + error.Message),
+                    "TermLink",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                await RefreshStateAsync(false);
+            }
+        }
+
+        private async Task WaitForRefreshToFinishAsync()
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(20);
+            while (Volatile.Read(ref refreshInFlight) != 0 && DateTime.UtcNow < deadline)
+                await Task.Delay(50);
+            if (Volatile.Read(ref refreshInFlight) != 0)
+                throw new TimeoutException("The in-flight Agent status refresh did not finish in time.");
+        }
+
+        private void FinishTrayExit()
+        {
+            exitUiItem.Enabled = false;
+            exitCompletelyItem.Enabled = false;
+            refreshTimer.Stop();
+            updateCheckTimer.Stop();
             notifyIcon.Visible = false;
             notifyIcon.Dispose();
             if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.Close();

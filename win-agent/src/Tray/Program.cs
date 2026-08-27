@@ -338,10 +338,10 @@ namespace TermLink.Tray
 
         /// <summary>
         /// Stops the registry Agent and every managed SessionHost left from this
-        /// installation. The tray exit action must not leave a background relay
-        /// connection alive after its UI has disappeared, so a graceful registry
-        /// shutdown is followed by a path-scoped process sweep and a last-resort
-        /// tree kill for processes that did not terminate in time.
+        /// installation. The explicit full-exit action must not leave a background
+        /// relay connection alive after its UI has disappeared, so a graceful
+        /// registry shutdown is followed by a path-scoped process sweep and a
+        /// last-resort tree kill for processes that did not terminate in time.
         /// </summary>
         public void ShutdownAndWait()
         {

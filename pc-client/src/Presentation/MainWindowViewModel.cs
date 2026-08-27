@@ -862,7 +862,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         return -1;
     }
 
-    private async Task<bool> RequestConfirmationAsync(string title, string detail, CancellationToken cancellationToken)
+    public async Task<bool> RequestConfirmationAsync(string title, string detail, CancellationToken cancellationToken)
     {
         if (pendingConfirmation is not null) return false;
         var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -881,6 +881,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             ConfirmationTitle = string.Empty;
             ConfirmationDetail = string.Empty;
         }
+    }
+
+    public Task ReportFailureAsync(Exception error)
+    {
+        ArgumentNullException.ThrowIfNull(error);
+        return ShowFailureAsync(error);
     }
 
     private async Task ShowFailureAsync(Exception error)

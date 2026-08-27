@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using TermLink.Agent;
 using TermLink.Pc.Contracts;
@@ -78,9 +79,32 @@ try
     var signedOut = await client.GetStatusAsync(false, CancellationToken.None);
     Require(!signedOut.AccountLinked && signedOut.ConnectionState == AgentConnectionState.NotConfigured,
         "The isolated sign-out flow did not restart into an unconfigured state.");
+
+    await client.ShutdownCompletelyAsync(CancellationToken.None);
+    var afterShutdown = await client.GetStatusAsync(false, CancellationToken.None);
+    Require(afterShutdown.ConnectionState == AgentConnectionState.Offline,
+        "Status polling restarted the Agent after an explicit complete shutdown.");
+    await Task.Delay(300);
+    Require(!Process.GetProcessesByName("TermLink.Agent").Any(process =>
+    {
+        using (process)
+        {
+            try
+            {
+                return string.Equals(
+                    Path.GetFullPath(process.MainModule?.FileName ?? string.Empty),
+                    Path.GetFullPath(args[0]),
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }), "Complete shutdown left the isolated Agent process running.");
     Console.WriteLine(
         "Windows Avalonia adapter validation passed: authenticated V9 status/actions, stable revisions, " +
-        "isolated command settings, and sign-out restart.");
+        "isolated command settings, sign-out restart, and complete shutdown without restart.");
 }
 finally
 {

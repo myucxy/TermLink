@@ -126,6 +126,7 @@ public static class PresentationText
     public static string RefreshStatus => Pick("刷新状态", "Refresh status");
     public static string OpenTermLink => Pick("打开 TermLink", "Open TermLink");
     public static string ExitControlUi => Pick("退出控制 UI（Agent 继续运行）", "Exit control UI (Agent keeps running)");
+    public static string ExitTermLinkCompletely => Pick("完全退出 TermLink", "Exit TermLink completely");
     public static string ConnectingAgent => Pick("正在连接 Agent…", "Connecting to Agent…");
     public static string Processing => Pick("正在处理…", "Working…");
     public static string OperationCompleted => Pick("操作已完成。", "Operation completed.");
@@ -205,4 +206,8 @@ public static class PresentationText
     public static string ConfirmRevokeDeviceDetail(string name) => Pick($"“{name}”需要重新登录才能再次访问这台终端。", $"“{name}” must sign in again before accessing this terminal.");
     public static string ConfirmSignOutTitle => Pick("退出 TermLink 账户？", "Sign out of TermLink?");
     public static string ConfirmSignOutDetail => Pick("此 PC 将停止向同账户设备发布状态，现有本地终端不会关闭。", "This PC will stop publishing to account devices. Local terminals stay open.");
+    public static string ConfirmFullExitTitle => Pick("完全退出 TermLink？", "Exit TermLink completely?");
+    public static string ConfirmFullExitDetail => Pick(
+        "这将停止后台 Agent、断开所有远程连接，并结束 TermLink 管理的命令行会话。未保存的会话工作可能丢失；本机登录信息会保留。",
+        "This stops the background Agent, disconnects every remote connection, and ends command-line sessions managed by TermLink. Unsaved session work may be lost; your local sign-in is retained.");
 }
