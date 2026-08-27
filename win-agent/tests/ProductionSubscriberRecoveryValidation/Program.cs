@@ -34,6 +34,7 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                 ValidateStaleLeaseReleaseDoesNotBlockPublication(runtimeType);
                 ValidateLeaseReleaseDoesNotSwallowUnexpectedFailures(runtimeType);
                 ValidateRepeatedUnauthorizedRequiresReauthentication(runtimeType);
+                ValidateRejectedRefreshTokenStabilizesRuntime(runtimeType);
                 ValidateForbiddenIdentityEndpointsRequireReauthentication(runtimeType);
                 Console.WriteLine("Production subscriber recovery validation passed.");
                 return 0;
@@ -257,6 +258,48 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                 Require(statusHandler.RequestCount == 1,
                     "Forbidden account/device status refresh unexpectedly retried as a generic failure.");
             }
+        }
+
+        private static void ValidateRejectedRefreshTokenStabilizesRuntime(Type runtimeType)
+        {
+            var getAccessToken = runtimeType.GetMethod("GetAccessTokenAsync", InstanceFlags);
+            var requestReconnect = runtimeType.GetMethod("RequestReconnect", InstanceFlags);
+            Require(getAccessToken != null && requestReconnect != null,
+                "Authentication terminal-state hooks are unavailable.");
+
+            var handler = new ScriptedHandler((request, _) =>
+            {
+                Require(request.Method == HttpMethod.Post &&
+                    request.RequestUri.AbsolutePath == "/token",
+                    "Rejected refresh-token validation used an unexpected endpoint.");
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest));
+            });
+            using var context = CreateAuthenticationRuntime(
+                runtimeType,
+                handler,
+                refreshToken: "revoked-unit-test-refresh",
+                tokenEndpoint: "https://oidc.unit.test/token");
+
+            var first = CaptureAsyncFailure(
+                getAccessToken,
+                context.Runtime,
+                true,
+                CancellationToken.None);
+            RequireReauthentication(first, "Rejected refresh token");
+            RequireAuthenticationTerminalState(runtimeType, context.Runtime);
+            Require(handler.RequestCount == 1,
+                "Rejected refresh token did not perform exactly one token request.");
+
+            var second = CaptureAsyncFailure(
+                getAccessToken,
+                context.Runtime,
+                true,
+                CancellationToken.None);
+            RequireReauthentication(second, "Repeated access after rejected refresh token");
+            requestReconnect.Invoke(context.Runtime, Array.Empty<object>());
+            RequireAuthenticationTerminalState(runtimeType, context.Runtime);
+            Require(handler.RequestCount == 1,
+                "Authentication terminal state allowed another token request or manual reconnect.");
         }
 
         private static void ValidateSharedAccountLeaseInput(Type runtimeType)
@@ -530,6 +573,8 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
             SetField(runtimeType, runtime, "http", http);
             SetField(runtimeType, runtime, "tokenRefreshGate", new SemaphoreSlim(1, 1));
             SetField(runtimeType, runtime, "statusRefreshGate", new SemaphoreSlim(1, 1));
+            SetField(runtimeType, runtime, "lifecycleSync", new object());
+            SetField(runtimeType, runtime, "statusSync", new object());
             if (tokenEndpoint != null)
                 SetField(runtimeType, runtime, "tokenEndpoint", tokenEndpoint);
             return new AuthenticationRuntimeContext(runtime, http, identity);
@@ -797,6 +842,15 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                 error.GetType().Name == "ProductionReauthenticationRequiredException",
                 operation + " did not stabilize as an account reauthentication requirement; got " +
                 (error == null ? "success" : error.GetType().FullName) + ".");
+        }
+
+        private static void RequireAuthenticationTerminalState(Type runtimeType, object runtime)
+        {
+            var terminal = (int)runtimeType.GetField("reauthenticationRequired", InstanceFlags).GetValue(runtime);
+            var relayState = runtimeType.GetField("relayState", InstanceFlags).GetValue(runtime).ToString();
+            var errorCode = (string)runtimeType.GetField("relayErrorCode", InstanceFlags).GetValue(runtime);
+            Require(terminal == 1 && relayState == "Failed" && errorCode == "ACCOUNT_REAUTH_REQUIRED",
+                "Rejected authentication did not remain in the actionable terminal state.");
         }
 
         private static HttpResponseMessage ServerError(HttpStatusCode status, string code)

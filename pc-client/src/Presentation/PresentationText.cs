@@ -67,6 +67,11 @@ public static class PresentationText
     public static string SignOut => Pick("退出登录", "Sign out");
     public static string SignedIn => Pick("已登录", "Signed in");
     public static string AccountSignedOut => Pick("未登录", "Signed out");
+    public static string AuthenticationExpired => Pick("登录已失效", "Sign-in expired");
+    public static string AuthenticationExpiredDetail => Pick(
+        "账号凭据已过期或被撤销，请重新登录。重新登录后 Agent 会自动恢复连接。",
+        "The account credential expired or was revoked. Sign in again and the Agent will reconnect automatically.");
+    public static string SignInAgain => Pick("立即重新登录", "Sign in again now");
     public static string SignInDetail => Pick("登录同一账户后，Android 可以发现并访问这台终端。", "Sign in with the same account so Android can discover this terminal.");
     public static string SignInInputRequired => Pick("请输入登录信息", "Enter sign-in details");
     public static string LoginMode => Pick("登录", "Sign in");

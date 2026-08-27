@@ -212,6 +212,19 @@ internal fun authenticationExpiredSnapshot(
     connectionError = message,
 )
 
+/** Only a rejected refresh credential terminates an established sign-in. */
+internal fun isAuthenticationRefreshRejection(error: Throwable): Boolean =
+    error is NativeOidcException && error.reason == NativeOidcFailure.INVALID_CREDENTIALS
+
+/** An outer refresh catch must not replace the actionable expiry message. */
+internal fun shouldPreserveAuthenticationExpiredFailure(
+    snapshot: ProductSnapshot,
+    expiredMessage: String,
+): Boolean = !snapshot.signedIn &&
+    snapshot.authenticationState == ProductAuthenticationState.SIGNED_OUT &&
+    snapshot.connectionState == ProductConnectionState.ERROR &&
+    snapshot.connectionError == expiredMessage
+
 /** Reads only the reachability decision published by the PC catalog. */
 internal fun authoritativePcOnline(root: JsonObject): Boolean =
     root["online"]?.jsonPrimitive?.booleanOrNull == true
@@ -2574,6 +2587,9 @@ internal class ProductionProductRepository(
                 realtimeAccessToken.publish(payload.accessToken)
                 if (continuation.isActive) continuation.resume(payload.accessToken)
             } catch (error: Throwable) {
+                if (isAuthenticationRefreshRejection(error) && isCurrentAuthentication(generation, state)) {
+                    invalidateAuthentication(error)
+                }
                 if (continuation.isActive) continuation.resumeWithException(error)
             }
         }
@@ -2848,6 +2864,8 @@ internal class ProductionProductRepository(
     }
 
     private fun publishFailure(error: Throwable) {
+        val expiredMessage = activity.getString(R.string.failure_authentication_expired)
+        if (shouldPreserveAuthenticationExpiredFailure(mutableSnapshot.value, expiredMessage)) return
         val message = safeFailureMessage(error)
         mutableSnapshot.value = mutableSnapshot.value.copy(
             connectionState = ProductConnectionState.ERROR,

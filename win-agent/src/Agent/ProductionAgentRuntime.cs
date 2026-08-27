@@ -200,6 +200,7 @@ namespace TermLink.Agent
         private Task statusRefreshWorker;
         private string tokenEndpoint;
         private int disposed;
+        private int reauthenticationRequired;
         private long successfulConnectionGeneration;
 
         private ProductionAgentRuntime(ProductionAgentConfig config, ProductionCredentials credentials)
@@ -492,15 +493,22 @@ namespace TermLink.Agent
 
         public ProductionStatus GetStatus(bool forceRefresh)
         {
-            if (forceRefresh)
+            if (forceRefresh && !IsReauthenticationRequired)
             {
-                RefreshStatusAsync(cancellation.Token).GetAwaiter().GetResult();
+                try
+                {
+                    RefreshStatusAsync(cancellation.Token).GetAwaiter().GetResult();
+                }
+                catch (ProductionReauthenticationRequiredException)
+                {
+                    MarkReauthenticationRequired();
+                }
             }
-            else if (DateTime.UtcNow >= statusExpiresUtc)
+            else if (!IsReauthenticationRequired && DateTime.UtcNow >= statusExpiresUtc)
             {
                 lock (lifecycleSync)
                 {
-                    if (Volatile.Read(ref disposed) == 0 &&
+                    if (Volatile.Read(ref disposed) == 0 && !IsReauthenticationRequired &&
                         (statusRefreshWorker == null || statusRefreshWorker.IsCompleted))
                     {
                         statusRefreshWorker = Task.Run(async () =>
@@ -523,7 +531,7 @@ namespace TermLink.Agent
         /// </summary>
         public void RequestReconnect()
         {
-            if (Volatile.Read(ref disposed) != 0) return;
+            if (Volatile.Read(ref disposed) != 0 || IsReauthenticationRequired) return;
             ClientWebSocket active;
             lock (lifecycleSync) active = socket;
             try { active?.Abort(); }
@@ -641,7 +649,7 @@ namespace TermLink.Agent
                 catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return; }
                 catch (ProductionReauthenticationRequiredException)
                 {
-                    SetRelayState(ProductionRelayState.Failed, "ACCOUNT_REAUTH_REQUIRED");
+                    MarkReauthenticationRequired();
                     // An invalid/expired refresh credential cannot recover through
                     // periodic socket retries. Keep the actionable authentication
                     // state stable until the user explicitly retries or the login
@@ -746,7 +754,7 @@ namespace TermLink.Agent
                 if (response.StatusCode == HttpStatusCode.Unauthorized ||
                     response.StatusCode == HttpStatusCode.Forbidden)
                 {
-                    throw new ProductionReauthenticationRequiredException();
+                    throw ReauthenticationRequired();
                 }
                 if (response.StatusCode != HttpStatusCode.Created && response.StatusCode != HttpStatusCode.Conflict)
                     await EnsureServerSuccessAsync(response, "DEVICE_REGISTER", token).ConfigureAwait(false);
@@ -1157,7 +1165,7 @@ namespace TermLink.Agent
                 if (response.StatusCode == HttpStatusCode.Unauthorized ||
                     response.StatusCode == HttpStatusCode.Forbidden)
                 {
-                    throw new ProductionReauthenticationRequiredException();
+                    throw ReauthenticationRequired();
                 }
                 response.EnsureSuccessStatusCode();
                 using var document = JsonDocument.Parse(await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
@@ -1296,6 +1304,11 @@ namespace TermLink.Agent
 
         private void SetRelayState(ProductionRelayState state, string errorCode)
         {
+            if (IsReauthenticationRequired && state != ProductionRelayState.Stopped)
+            {
+                state = ProductionRelayState.Failed;
+                errorCode = "ACCOUNT_REAUTH_REQUIRED";
+            }
             var connected = false;
             lock (statusSync)
             {
@@ -3919,24 +3932,26 @@ namespace TermLink.Agent
                     var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
                     if (response.StatusCode != HttpStatusCode.Unauthorized) return response;
                     response.Dispose();
-                    if (attempt > 0) throw new ProductionReauthenticationRequiredException();
+                    if (attempt > 0) throw ReauthenticationRequired();
                 }
             }
-            throw new ProductionReauthenticationRequiredException();
+            throw ReauthenticationRequired();
         }
 
         private async Task<string> GetAccessTokenAsync(bool forceRefresh, CancellationToken token)
         {
+            if (IsReauthenticationRequired) throw new ProductionReauthenticationRequiredException();
             if (!forceRefresh && !credentials.ShouldRefresh(DateTime.UtcNow, TimeSpan.FromMinutes(1)))
                 return credentials.GetAccessToken();
             if (!credentials.CanRefresh || string.IsNullOrWhiteSpace(config.OIDCIssuer) || string.IsNullOrWhiteSpace(config.OIDCClientId))
             {
-                if (forceRefresh) throw new ProductionReauthenticationRequiredException();
+                if (forceRefresh) throw ReauthenticationRequired();
                 return credentials.GetAccessToken();
             }
             await tokenRefreshGate.WaitAsync(token).ConfigureAwait(false);
             try
             {
+                if (IsReauthenticationRequired) throw new ProductionReauthenticationRequiredException();
                 if (!forceRefresh && !credentials.ShouldRefresh(DateTime.UtcNow, TimeSpan.FromMinutes(1)))
                     return credentials.GetAccessToken();
                 if (string.IsNullOrWhiteSpace(tokenEndpoint))
@@ -3964,7 +3979,7 @@ namespace TermLink.Agent
                 };
                 using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
                 if (response.StatusCode == HttpStatusCode.BadRequest || response.StatusCode == HttpStatusCode.Unauthorized)
-                    throw new ProductionReauthenticationRequiredException();
+                    throw ReauthenticationRequired();
                 response.EnsureSuccessStatusCode();
                 using var tokens = JsonDocument.Parse(
                     await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
@@ -3979,6 +3994,25 @@ namespace TermLink.Agent
                 return accessToken;
             }
             finally { tokenRefreshGate.Release(); }
+        }
+
+        private bool IsReauthenticationRequired => Volatile.Read(ref reauthenticationRequired) != 0;
+
+        private ProductionReauthenticationRequiredException ReauthenticationRequired()
+        {
+            MarkReauthenticationRequired();
+            return new ProductionReauthenticationRequiredException();
+        }
+
+        private void MarkReauthenticationRequired()
+        {
+            Interlocked.Exchange(ref reauthenticationRequired, 1);
+            statusExpiresUtc = DateTime.MaxValue;
+            SetRelayState(ProductionRelayState.Failed, "ACCOUNT_REAUTH_REQUIRED");
+            ClientWebSocket active;
+            lock (lifecycleSync) active = socket;
+            try { active?.Abort(); }
+            catch (ObjectDisposedException) { }
         }
 
         private void AddProofHeaders(HttpRequestHeaders headers, HttpMethod method, string target, byte[] body)

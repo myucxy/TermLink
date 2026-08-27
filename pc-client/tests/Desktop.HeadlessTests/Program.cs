@@ -193,6 +193,47 @@ public static class Program
         Require(viewModel.NoticeCode == "ACCESS_DENIED" && viewModel.NoticeDetail == PresentationText.AccessDeniedDetail,
             "A path-access failure was not classified as ACCESS_DENIED.");
 
+        var reauthenticationSnapshot = snapshot with
+        {
+            Revision = 2,
+            ConnectionState = AgentConnectionState.ReauthenticationRequired,
+            LastErrorCode = "ACCOUNT_REAUTH_REQUIRED",
+            LastErrorDetail = "Authentication expired",
+        };
+        var reauthenticationClient = new StaticAgentClient(reauthenticationSnapshot);
+        var reauthenticationStore = new AgentStateStore(reauthenticationClient, TimeSpan.FromMinutes(1));
+        await using var reauthenticationViewModel = new MainWindowViewModel(
+            reauthenticationStore,
+            reauthenticationClient,
+            new ImmediateUiDispatcher(),
+            new PlatformDescriptor(PcPlatform.Windows, PcArchitecture.X64, "Windows headless", "win-x64", false));
+        var reauthenticationWindow = new MainWindow { DataContext = reauthenticationViewModel };
+        reauthenticationWindow.Show();
+        await reauthenticationStore.RefreshAsync();
+        Dispatcher.UIThread.RunJobs();
+        reauthenticationViewModel.Navigate("settings");
+        reauthenticationViewModel.SelectSettingsSection("account");
+        Dispatcher.UIThread.RunJobs();
+        Require(reauthenticationViewModel.Account.AccountLinked &&
+                reauthenticationViewModel.RequiresReauthentication &&
+                !reauthenticationViewModel.IsAccountLinked &&
+                reauthenticationViewModel.IsAccountSignedOut &&
+                !reauthenticationViewModel.CanRetryConnection &&
+                !reauthenticationViewModel.CanDisableRemoteAccess,
+            "Expired Windows credentials still appeared as a usable signed-in account.");
+        Require(!RequireControl<Control>(reauthenticationWindow, "LinkedAccountCard").IsVisible &&
+                RequireControl<Control>(reauthenticationWindow, "AccountSignInCard").IsVisible &&
+                reauthenticationViewModel.AccountStateTitle == PresentationText.AuthenticationExpired,
+            "The account page did not replace Sign out with the reauthentication form.");
+        reauthenticationViewModel.Navigate("devices");
+        reauthenticationViewModel.OpenAccountSettingsCommand.Execute(null);
+        await DrainCommandAsync(reauthenticationViewModel.OpenAccountSettingsCommand);
+        Require(reauthenticationViewModel.IsSettingsPageSelected &&
+                reauthenticationViewModel.IsAccountSettingsSelected &&
+                reauthenticationViewModel.IsLoginMode,
+            "The sign-in-expired action did not navigate directly to account login.");
+        reauthenticationWindow.Close();
+
         var durations = new List<double>(300);
         var keys = new[] { "connection", "settings", "sessions" };
         for (var index = 0; index < 300; index++)

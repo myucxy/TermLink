@@ -266,6 +266,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             SetRemoteAccessAsync(ParseBoolean(parameter), cancellationToken));
         RetryConnectionCommand = new AsyncCommand((_, cancellationToken) =>
             MutateAsync(client.RetryConnectionAsync, PresentationText.RetryRequested, cancellationToken));
+        OpenAccountSettingsCommand = new AsyncCommand((_, _) =>
+        {
+            Navigate("settings");
+            SelectSettingsSection("account");
+            Account.FormMode = AccountFormMode.Login;
+            RaiseAccountStateProperties();
+            return Task.CompletedTask;
+        });
         StopSessionCommand = new AsyncCommand((parameter, cancellationToken) =>
             parameter is Guid sessionId ? StopSessionAsync(sessionId, cancellationToken) : Task.CompletedTask);
         GrantDeviceCommand = new AsyncCommand((parameter, cancellationToken) =>
@@ -342,6 +350,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand RefreshCommand { get; }
     public AsyncCommand SetRemoteAccessCommand { get; }
     public AsyncCommand RetryConnectionCommand { get; }
+    public AsyncCommand OpenAccountSettingsCommand { get; }
     public AsyncCommand StopSessionCommand { get; }
     public AsyncCommand GrantDeviceCommand { get; }
     public AsyncCommand RevokeDeviceCommand { get; }
@@ -396,9 +405,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public bool IsDarkAppearance => AppearancePreference == AppearancePreference.Dark;
     public bool IsConnected => Connection.State == AgentConnectionState.Connected;
     public bool IsConnectionBusy => Connection.State is AgentConnectionState.Connecting or AgentConnectionState.Reconnecting;
-    public bool CanRetryConnection => Connection.State is AgentConnectionState.Offline or AgentConnectionState.Faulted or AgentConnectionState.ReauthenticationRequired;
+    public bool CanRetryConnection => Connection.State is AgentConnectionState.Offline or AgentConnectionState.Faulted;
     public bool CanEnableRemoteAccess => !Connection.RemoteAccessEnabled && Account.AccountLinked && IsConnected;
-    public bool CanDisableRemoteAccess => Connection.RemoteAccessEnabled;
+    public bool CanDisableRemoteAccess => Connection.RemoteAccessEnabled && !RequiresReauthentication;
     public string RemoteAccessStatusText => Connection.RemoteAccessEnabled ? PresentationText.RemoteAccessOn : PresentationText.RemoteAccessOff;
     public int ActiveSessionCount => Sessions.Sessions.Count(session => session.State is ManagedSessionState.Starting or ManagedSessionState.Connected or ManagedSessionState.Disconnected);
     public string SessionCountText => PresentationText.SessionCount(Sessions.Items.Count);
@@ -407,8 +416,16 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public bool HasNoSessions => !HasSessions;
     public bool HasDevices => Devices.Items.Count > 0;
     public bool HasNoDevices => !HasDevices;
-    public bool IsAccountLinked => Account.AccountLinked;
-    public bool IsAccountSignedOut => !Account.AccountLinked;
+    public bool RequiresReauthentication => Connection.State == AgentConnectionState.ReauthenticationRequired;
+    public bool IsAccountLinked => Account.AccountLinked && !RequiresReauthentication;
+    public bool IsAccountSignedOut => !IsAccountLinked;
+    public bool CanRegisterAccount => !RequiresReauthentication;
+    public string AccountStateTitle => RequiresReauthentication
+        ? PresentationText.AuthenticationExpired
+        : PresentationText.AccountSignedOut;
+    public string AccountStateDetail => RequiresReauthentication
+        ? PresentationText.AuthenticationExpiredDetail
+        : PresentationText.SignInDetail;
     public bool IsLoginMode => Account.FormMode == AccountFormMode.Login;
     public bool IsRegisterMode => Account.FormMode == AccountFormMode.Register;
 
@@ -484,6 +501,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Settings.Version = snapshot.Identity.AgentVersion;
         Account.AccountLinked = snapshot.AccountLinked;
         Account.AccountDisplayName = snapshot.AccountDisplayName;
+        if (snapshot.ConnectionState == AgentConnectionState.ReauthenticationRequired)
+            Account.FormMode = AccountFormMode.Login;
         if (string.IsNullOrWhiteSpace(Account.PcName)) Account.PcName = snapshot.Identity.Name;
         ObservableCollectionDiff.Apply(Sessions.Sessions, snapshot.Sessions, item => item.SessionId);
         ObservableCollectionDiff.Apply(Devices.Devices, snapshot.Devices, item => item.DeviceId);
@@ -916,6 +935,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         RaisePropertyChanged(nameof(IsConnected));
         RaisePropertyChanged(nameof(IsConnectionBusy));
         RaisePropertyChanged(nameof(CanRetryConnection));
+        RaisePropertyChanged(nameof(RequiresReauthentication));
         RaisePropertyChanged(nameof(CanEnableRemoteAccess));
         RaisePropertyChanged(nameof(CanDisableRemoteAccess));
         RaisePropertyChanged(nameof(RemoteAccessStatusText));
@@ -932,6 +952,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     {
         RaisePropertyChanged(nameof(IsAccountLinked));
         RaisePropertyChanged(nameof(IsAccountSignedOut));
+        RaisePropertyChanged(nameof(CanRegisterAccount));
+        RaisePropertyChanged(nameof(AccountStateTitle));
+        RaisePropertyChanged(nameof(AccountStateDetail));
         RaisePropertyChanged(nameof(IsLoginMode));
         RaisePropertyChanged(nameof(IsRegisterMode));
         RaisePropertyChanged(nameof(CanEnableRemoteAccess));

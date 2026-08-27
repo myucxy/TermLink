@@ -150,6 +150,9 @@
                     <Button Classes="danger" Content="{x:Static text:PresentationText.Stop}"
                             IsVisible="{Binding CanDisableRemoteAccess}"
                             Command="{Binding SetRemoteAccessCommand}" CommandParameter="false" />
+                    <Button Classes="primary" Content="{x:Static text:PresentationText.SignInAgain}"
+                            IsVisible="{Binding RequiresReauthentication}"
+                            Command="{Binding OpenAccountSettingsCommand}" />
                     <Button Classes="subtle" Content="{x:Static text:PresentationText.RetryNow}"
                             IsVisible="{Binding CanRetryConnection}"
                             Command="{Binding RetryConnectionCommand}" />
@@ -265,7 +268,7 @@
               </StackPanel>
 
               <StackPanel x:Name="AccountPageRoot" IsVisible="{Binding IsAccountSettingsSelected}" Spacing="14">
-                <Border Classes="card" IsVisible="{Binding IsAccountLinked}">
+                <Border x:Name="LinkedAccountCard" Classes="card" IsVisible="{Binding IsAccountLinked}">
                   <Grid ColumnDefinitions="*,Auto" ColumnSpacing="18">
                     <StackPanel Spacing="5">
                       <TextBlock Classes="eyebrow" Text="{x:Static text:PresentationText.SignedIn}" />
@@ -276,12 +279,12 @@
                   </Grid>
                 </Border>
 
-                <Border Classes="card" IsVisible="{Binding IsAccountSignedOut}">
+                <Border x:Name="AccountSignInCard" Classes="card" IsVisible="{Binding IsAccountSignedOut}">
                   <StackPanel Spacing="16" MaxWidth="560" HorizontalAlignment="Left">
-                    <StackPanel><TextBlock Classes="section-title" Text="{x:Static text:PresentationText.AccountSignedOut}" /><TextBlock Classes="muted" Text="{x:Static text:PresentationText.SignInDetail}" TextWrapping="Wrap" /></StackPanel>
+                    <StackPanel><TextBlock Classes="section-title" Text="{Binding AccountStateTitle}" /><TextBlock Classes="muted" Text="{Binding AccountStateDetail}" TextWrapping="Wrap" /></StackPanel>
                     <WrapPanel>
                       <Button Classes="section-nav" Classes.selected="{Binding IsLoginMode}" Content="{x:Static text:PresentationText.LoginMode}" Command="{Binding SetAccountFormModeCommand}" CommandParameter="login" />
-                      <Button Classes="section-nav" Classes.selected="{Binding IsRegisterMode}" Content="{x:Static text:PresentationText.RegisterMode}" Command="{Binding SetAccountFormModeCommand}" CommandParameter="register" />
+                      <Button Classes="section-nav" Classes.selected="{Binding IsRegisterMode}" Content="{x:Static text:PresentationText.RegisterMode}" Command="{Binding SetAccountFormModeCommand}" CommandParameter="register" IsVisible="{Binding CanRegisterAccount}" />
                     </WrapPanel>
                     <Grid ColumnDefinitions="130,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto" RowSpacing="10">
                       <TextBlock Text="{x:Static text:PresentationText.PcName}" VerticalAlignment="Center" />

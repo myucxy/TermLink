@@ -624,6 +624,45 @@ class ProductContractsTest {
     }
 
     @Test
+    fun onlyRejectedRefreshCredentialsExpireAnEstablishedAuthentication() {
+        assertTrue(
+            isAuthenticationRefreshRejection(
+                NativeOidcException(NativeOidcFailure.INVALID_CREDENTIALS),
+            ),
+        )
+        assertFalse(
+            isAuthenticationRefreshRejection(
+                NativeOidcException(NativeOidcFailure.NETWORK),
+            ),
+        )
+        assertFalse(isAuthenticationRefreshRejection(IllegalStateException("temporary failure")))
+    }
+
+    @Test
+    fun outerRefreshFailureCannotReplaceThePublishedAuthenticationExpiry() {
+        val message = "Authentication expired"
+        val expired = authenticationExpiredSnapshot(
+            snapshot = ProductSnapshot(
+                signedIn = true,
+                authenticationState = ProductAuthenticationState.AUTHENTICATED,
+                connectionState = ProductConnectionState.CONNECTED,
+            ),
+            message = message,
+        )
+
+        assertTrue(shouldPreserveAuthenticationExpiredFailure(expired, message))
+        assertFalse(
+            shouldPreserveAuthenticationExpiredFailure(
+                expired.copy(
+                    authenticationState = ProductAuthenticationState.NATIVE_CREDENTIALS,
+                    connectionError = null,
+                ),
+                message,
+            ),
+        )
+    }
+
+    @Test
     fun realtimeTokenSourcePublishesTheLatestRefreshedTokenAndClearsOnSignOut() {
         val source = RealtimeAccessTokenSource()
         val provider = AccessTokenProvider(source::requireCurrent)

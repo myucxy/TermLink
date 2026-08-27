@@ -685,7 +685,8 @@ namespace TermLink.Tray
                 ? TrayText.Pick("需要重新登录", "Sign in again required")
                 : TrayText.Pick("Relay：", "Relay: ") + TrayDisplay.LocalizedRelayStatus(production.RelayState);
             sessionsItem.Enabled = true;
-            signOutItem.Enabled = production.Configured && production.AccountLinked;
+            signOutItem.Visible = production.Configured && production.AccountLinked && !requiresReauthentication;
+            signOutItem.Enabled = signOutItem.Visible;
             notifyIcon.Text = requiresReauthentication
                 ? TrayText.Pick("TermLink · 登录已失效", "TermLink · sign-in expired")
                 : "TermLink · " + TrayDisplay.LocalizedRelayStatus(production.RelayState);
@@ -715,6 +716,7 @@ namespace TermLink.Tray
             accountItem.Text = TrayText.Pick("账户：不可用", "Account: unavailable");
             relayItem.Text = TrayText.Pick("Relay：不可用", "Relay: unavailable");
             sessionsItem.Enabled = false;
+            signOutItem.Visible = false;
             signOutItem.Enabled = false;
             if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.ApplyUnavailable(error);
             if (showFailure) ShowFailure(error.Message);
@@ -2301,7 +2303,7 @@ namespace TermLink.Tray
                     ? TrayText.Pick("立即登录", "Sign in now")
                     : TrayText.Pick("重新登录", "Sign in again");
                 accountRegisterButton.Visible = false;
-                accountSignOutButton.Visible = true;
+                accountSignOutButton.Visible = !requiresReauthentication;
             }
             else
             {
