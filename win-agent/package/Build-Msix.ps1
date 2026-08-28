@@ -14,6 +14,7 @@ param(
     [switch]$AllowHttpTimestamp,
     [switch]$Development,
     [string]$DotNetPath,
+    [string]$CargoPath,
     [string]$OutputPath = (Join-Path $PSScriptRoot "..\artifacts\TermLink-$Version-x64.msix")
 )
 
@@ -164,6 +165,9 @@ try {
     $temporaryPackage = Join-Path $workRoot 'TermLink.msix'
     [IO.Directory]::CreateDirectory($layout) | Out-Null
     try {
+        $null = & (Join-Path $projectRoot 'scripts\Build-TerminalCoreNative.ps1') `
+            -CargoPath $CargoPath `
+            -OutputDirectory $layout
         $projects = @(
             'src\Agent\TermLink.Agent.csproj',
             'src\SessionHost\TermLink.SessionHost.csproj',
@@ -217,6 +221,10 @@ try {
             "The package contains an unexpected product executable: $($publishedProductExecutables -join ', ')"
         Assert-True (Test-Path -LiteralPath (Join-Path $layout 'TermLink.Agent.dll') -PathType Leaf) `
             'The package is missing the independent Agent runtime assembly.'
+        Assert-True (Test-Path -LiteralPath (Join-Path $layout 'TermLink.TerminalCore.dll') -PathType Leaf) `
+            'The package is missing the Windows terminal-core managed runtime.'
+        Assert-True (Test-Path -LiteralPath (Join-Path $layout 'termlink_terminal_ffi.dll') -PathType Leaf) `
+            'The package is missing the Windows terminal-core native runtime.'
         Assert-True (Test-Path -LiteralPath (Join-Path $layout 'coreclr.dll') -PathType Leaf) `
             'The package layout is not self-contained.'
         [IO.File]::WriteAllBytes(
@@ -301,7 +309,10 @@ try {
             $signArguments += @('/tr', $TimestampUrl, '/td', 'SHA256')
         }
         $ownedBinaries = @(Get-ChildItem -LiteralPath $layout -File |
-            Where-Object { $_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' } |
+            Where-Object {
+                $_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' -or
+                $_.Name -ceq 'termlink_terminal_ffi.dll'
+            } |
             Sort-Object Name)
         Assert-True ($ownedBinaries.Count -ge 4) 'No TermLink binaries were found to sign.'
         foreach ($binary in $ownedBinaries) {

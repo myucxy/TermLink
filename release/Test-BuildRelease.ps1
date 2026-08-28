@@ -17,6 +17,7 @@ $verificationModulePath = Join-Path $PSScriptRoot 'ReleaseVerification.psm1'
 $appShipWrapperPath = Join-Path $repositoryRoot 'scripts\Publish-AppShipProduction.ps1'
 $setupBuilderPath = Join-Path $repositoryRoot 'win-agent\package\Build-Setup.ps1'
 $msixBuilderPath = Join-Path $repositoryRoot 'win-agent\package\Build-Msix.ps1'
+$installerValidatorPath = Join-Path $repositoryRoot 'win-agent\tests\Validate-WindowsInstaller.ps1'
 
 $tokens = $null
 $parseErrors = $null
@@ -26,7 +27,7 @@ Assert-True ($parseErrors.Count -eq 0) `
 $null = Get-Content -LiteralPath $schemaPath -Raw | ConvertFrom-Json
 $verificationTokens = $null
 $verificationParseErrors = $null
-$null = [Management.Automation.Language.Parser]::ParseFile(
+$verificationAst = [Management.Automation.Language.Parser]::ParseFile(
     $verificationScriptPath,
     [ref]$verificationTokens,
     [ref]$verificationParseErrors)
@@ -50,9 +51,11 @@ Assert-True ($wrapperParseErrors.Count -eq 0) `
     ("Publish-AppShipProduction.ps1 parser errors:`n" + (($wrapperParseErrors | ForEach-Object { $_.Message }) -join "`n"))
 Import-Module $verificationModulePath -Force
 $releaseScriptSource = Get-Content -LiteralPath $scriptPath -Raw
+$verificationScriptSource = Get-Content -LiteralPath $verificationScriptPath -Raw
 $appShipWrapperSource = Get-Content -LiteralPath $appShipWrapperPath -Raw
 $setupBuilderSource = Get-Content -LiteralPath $setupBuilderPath -Raw
 $msixBuilderSource = Get-Content -LiteralPath $msixBuilderPath -Raw
+$installerValidatorSource = Get-Content -LiteralPath $installerValidatorPath -Raw
 Assert-True ($releaseScriptSource.Contains('status --porcelain --untracked-files=normal')) `
     'Server source identity does not inspect the worktree status.'
 Assert-True ($releaseScriptSource.Contains('$serverSourceRevision-dirty')) `
@@ -65,12 +68,116 @@ Assert-True ($releaseScriptSource.Contains('ExpectedAndroidSignerSha256')) `
     'Production release orchestration has no Android signer continuity input.'
 Assert-True ($releaseScriptSource.Contains('ExpectedWindowsSignerSha1')) `
     'Production release orchestration has no Windows signer continuity input.'
+Assert-True ($releaseScriptSource.Contains('[string]$CargoPath')) `
+    'Production release orchestration has no explicit CargoPath input.'
+Assert-True ($releaseScriptSource.Contains('Rust 1.97.1 with x86_64-pc-windows-msvc target')) `
+    'Windows release plans do not record the pinned Rust toolchain requirement.'
 Assert-True ($releaseScriptSource.Contains('AllowHttpWindowsTimestamp')) `
     'Production release orchestration has no explicit HTTP RFC 3161 opt-in.'
 Assert-True ($setupBuilderSource.Contains('AllowHttpTimestamp')) `
     'Windows Setup builder has no explicit HTTP RFC 3161 opt-in.'
 Assert-True ($msixBuilderSource.Contains('AllowHttpTimestamp')) `
     'Windows MSIX builder has no explicit HTTP RFC 3161 opt-in.'
+foreach ($marker in @(
+    'Export-TermLinkSetupPayloadArchive',
+    'Resolve-SafeArchiveTarget',
+    'TermLink.Setup.Payload.zip',
+    'TermLink.TerminalCore.dll',
+    'termlink_terminal_ffi.dll',
+    '[IO.FileMode]::CreateNew',
+    '[IO.FileAttributes]::ReparsePoint',
+    '$ownedPayloadBinaries',
+    'Assert-TermLinkWindowsSignatureEvidence')) {
+    Assert-True ($verificationScriptSource.Contains($marker)) `
+        "Production Setup payload verification is missing required guard: $marker"
+}
+Assert-True ($verificationScriptSource.Contains("`$_.Name -match '^TermLink(?:\..+)?\.(exe|dll)`$'")) `
+    'Production Setup verifier does not cover every TermLink-owned payload binary.'
+Assert-True ($installerValidatorSource.Contains('$acceptedSignatureStatuses -contains $signature.Status')) `
+    'MSIX development validation does not enforce an explicit signature-status allowlist.'
+foreach ($status in @('Valid', 'UnknownError', 'NotTrusted')) {
+    Assert-True ($installerValidatorSource.Contains("[Management.Automation.SignatureStatus]::$status")) `
+        "MSIX development validation does not allow the intended signature status: $status"
+}
+
+$payloadHelperNames = @(
+    'Assert-Release',
+    'Resolve-SafeArchiveTarget',
+    'Assert-NoReparsePoint',
+    'Expand-SafePayloadArchive'
+)
+$payloadHelperSource = @($verificationAst.FindAll({
+    $args[0] -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $payloadHelperNames -contains $args[0].Name
+}, $true) | ForEach-Object { $_.Extent.Text }) -join [Environment]::NewLine
+. ([scriptblock]::Create($payloadHelperSource))
+
+$archiveSafetyRoot = Join-Path $repositoryRoot 'artifacts\release\payload-archive-safety-probe'
+Assert-True (-not (Test-Path -LiteralPath $archiveSafetyRoot)) `
+    "Payload archive safety probe path already exists: $archiveSafetyRoot"
+[IO.Directory]::CreateDirectory($archiveSafetyRoot) | Out-Null
+try {
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $traversalArchivePath = Join-Path $archiveSafetyRoot 'traversal.zip'
+    $traversalArchive = [IO.Compression.ZipFile]::Open(
+        $traversalArchivePath, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $entry = $traversalArchive.CreateEntry('../escaped.dll')
+        $writer = [IO.StreamWriter]::new($entry.Open())
+        try { $writer.Write('not allowed') } finally { $writer.Dispose() }
+    }
+    finally { $traversalArchive.Dispose() }
+    $traversalRejected = $false
+    try {
+        Expand-SafePayloadArchive -ArchivePath $traversalArchivePath `
+            -Destination (Join-Path $archiveSafetyRoot 'traversal-output')
+    }
+    catch { $traversalRejected = $_.Exception.Message.Contains('traversal segment') }
+    Assert-True $traversalRejected 'Setup payload extraction accepted a parent-directory traversal entry.'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $archiveSafetyRoot 'escaped.dll'))) `
+        'Setup payload traversal probe wrote outside its extraction directory.'
+
+    $linkArchivePath = Join-Path $archiveSafetyRoot 'symbolic-link.zip'
+    $linkArchive = [IO.Compression.ZipFile]::Open($linkArchivePath, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $entry = $linkArchive.CreateEntry('link.dll')
+        $entry.ExternalAttributes = [BitConverter]::ToInt32(
+            [BitConverter]::GetBytes([Convert]::ToUInt32('A1FF0000', 16)), 0)
+        $writer = [IO.StreamWriter]::new($entry.Open())
+        try { $writer.Write('target') } finally { $writer.Dispose() }
+    }
+    finally { $linkArchive.Dispose() }
+    $linkRejected = $false
+    try {
+        Expand-SafePayloadArchive -ArchivePath $linkArchivePath `
+            -Destination (Join-Path $archiveSafetyRoot 'link-output')
+    }
+    catch { $linkRejected = $_.Exception.Message.Contains('symbolic link or reparse point') }
+    Assert-True $linkRejected 'Setup payload extraction accepted a symbolic-link ZIP entry.'
+
+    $validArchivePath = Join-Path $archiveSafetyRoot 'valid.zip'
+    $validArchive = [IO.Compression.ZipFile]::Open($validArchivePath, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $entry = $validArchive.CreateEntry('TermLink.TerminalCore.dll')
+        $writer = [IO.StreamWriter]::new($entry.Open())
+        try { $writer.Write('managed terminal core') } finally { $writer.Dispose() }
+    }
+    finally { $validArchive.Dispose() }
+    $validOutput = Join-Path $archiveSafetyRoot 'valid-output'
+    Expand-SafePayloadArchive -ArchivePath $validArchivePath -Destination $validOutput
+    Assert-True ((Get-Content -LiteralPath (Join-Path $validOutput 'TermLink.TerminalCore.dll') -Raw) -ceq
+        'managed terminal core') 'Setup payload extraction rejected or changed a safe regular file.'
+}
+finally {
+    $releaseArtifactsRoot = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'artifacts\release'))
+    $resolvedArchiveSafetyRoot = [IO.Path]::GetFullPath($archiveSafetyRoot)
+    $archiveSafetyPrefix = $releaseArtifactsRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    if ($resolvedArchiveSafetyRoot.StartsWith($archiveSafetyPrefix, [StringComparison]::OrdinalIgnoreCase) -and
+        [IO.Path]::GetFileName($resolvedArchiveSafetyRoot) -ceq 'payload-archive-safety-probe') {
+        Remove-Item -LiteralPath $resolvedArchiveSafetyRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 Assert-True ($releaseScriptSource.Contains("[string]::IsNullOrEmpty(`$timestampUri.UserInfo)")) `
     'Production release orchestration does not reject timestamp URLs containing userinfo.'
 Assert-True ($releaseScriptSource.Contains("'ANDROID_SDK_ROOT', 'ANDROID_HOME'")) `
@@ -247,6 +354,7 @@ $commonArguments = @{
     AndroidAab = $true
     ReleaseMode = 'Development'
     OutputDirectory = $probeOutput
+    CargoPath = 'D:\CargoPlanProbe\cargo.exe'
 }
 $planOne = (@(& $scriptPath @commonArguments -Plan) -join "`n")
 $planTwo = (@(& $scriptPath @commonArguments -Plan) -join "`n")
@@ -270,6 +378,17 @@ $serverArguments = @($serverStep.arguments)
 Assert-True ($serverArguments -contains '--output') 'The server plan does not export a local OCI artifact.'
 Assert-True (-not ($serverArguments -contains '--push')) 'The server plan contains a push argument.'
 Assert-True ($serverStep.publish -eq $false) 'The server step unexpectedly enables publishing.'
+
+foreach ($windowsStep in @($planObject.steps | Where-Object { $_.id -in @('windows-setup', 'windows-msix') })) {
+    $windowsArguments = @($windowsStep.arguments)
+    $cargoIndex = [Array]::IndexOf($windowsArguments, '-CargoPath')
+    Assert-True ($cargoIndex -ge 0 -and $cargoIndex -lt ($windowsArguments.Count - 1) -and
+        $windowsArguments[$cargoIndex + 1] -ceq '<CargoPath>') `
+        "The $($windowsStep.id) plan does not expose CargoPath."
+    Assert-True (@($windowsStep.requirements) -contains `
+        'Rust 1.97.1 with x86_64-pc-windows-msvc target') `
+        "The $($windowsStep.id) plan does not record the pinned Rust toolchain."
+}
 
 $androidStep = @($planObject.steps | Where-Object { $_.id -eq 'android-release' })[0]
 Assert-True (@($androidStep.arguments) -contains '--project-dir') `

@@ -3,5 +3,9 @@
     <TargetFramework>net8.0</TargetFramework>
     <AssemblyName>TermLink.TerminalCore</AssemblyName>
     <RootNamespace>TermLink.TerminalCore</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="TermLink.NativeTerminalCore.Validation" />
+  </ItemGroup>
 </Project>

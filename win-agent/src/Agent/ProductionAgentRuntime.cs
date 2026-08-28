@@ -66,6 +66,7 @@ namespace TermLink.Agent
         private const int MaxRememberedTerminationRequests = 4096;
         private const string TerminalSnapshotEnvironment = "TERMLINK_ENABLE_TERMINAL_SNAPSHOT_V1";
         private const string TypedInputEnvironment = "TERMLINK_ENABLE_TYPED_INPUT_V1";
+        private const string TerminalCoreShadowEnvironment = "TERMLINK_ENABLE_TERMINAL_CORE_SHADOW";
         private sealed class CommittedEvent { public ManagedShellType ShellType; public LocalFrame Frame; }
         private sealed class PendingSession { public ManagedShellType ShellType; }
         private sealed class SessionPublicationState
@@ -177,6 +178,9 @@ namespace TermLink.Agent
         private readonly ProductionTerminalHistoryProducer terminalHistoryProducer;
         private readonly bool terminalSnapshotEnabled;
         private readonly bool typedInputEnabled;
+        private readonly bool terminalCoreShadowEnabled;
+        private readonly ConcurrentDictionary<Guid, string> terminalCoreShadowStates =
+            new ConcurrentDictionary<Guid, string>();
         private static readonly TermLink.TerminalCore.VtTerminalInputEncoder TypedInputEncoder =
             new TermLink.TerminalCore.VtTerminalInputEncoder();
         private readonly object lifecycleSync = new object();
@@ -229,12 +233,16 @@ namespace TermLink.Agent
                 Environment.GetEnvironmentVariable(TerminalSnapshotEnvironment));
             typedInputEnabled = IsTypedInputRuntimeEnabled(
                 Environment.GetEnvironmentVariable(TypedInputEnvironment));
+            terminalCoreShadowEnabled = IsTerminalCoreShadowRuntimeEnabled(
+                Environment.GetEnvironmentVariable(TerminalCoreShadowEnvironment));
             terminalHistoryStore = new ProductionTerminalHistoryStore(
                 ProductionTerminalHistoryRoot(config.PcId),
                 credentials.DeviceId);
             terminalHistoryProducer = new ProductionTerminalHistoryProducer(
                 terminalHistoryStore,
-                credentials.DeviceId);
+                credentials.DeviceId,
+                terminalCoreShadowEnabled,
+                ObserveTerminalCoreShadow);
         }
 
         private static string ProductionTerminalHistoryRoot(Guid pcId)
@@ -246,14 +254,26 @@ namespace TermLink.Agent
                 pcId.ToString("N"));
         }
 
-        // Tail-first history is part of the installed product contract. Keep a
-        // narrowly scoped emergency rollback for diagnostics, but do not make
-        // normal Tray/installer startup depend on a machine environment value.
+        // Snapshot restore remains an experimental capability until the native
+        // TerminalCore exporter and the cross-renderer equivalence gates pass.
+        // Missing, malformed, or casually inherited environment values must
+        // therefore fail closed instead of advertising an incomplete runtime.
         internal static bool IsTerminalSnapshotRuntimeEnabled(string value) =>
-            !string.Equals(value, "0", StringComparison.Ordinal);
+            string.Equals(value, "1", StringComparison.Ordinal) ||
+            string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
 
         internal static bool IsTypedInputRuntimeEnabled(string value) =>
             !string.Equals(value, "0", StringComparison.Ordinal);
+
+        // Shadowing cannot change user-visible terminal state and is enabled by default so every
+        // packaged Windows build contributes migration evidence.  Operators retain an immediate
+        // local rollback that does not affect the existing Portable producer.
+        internal static bool IsTerminalCoreShadowRuntimeEnabled(string value)
+        {
+            var normalized = value?.Trim();
+            return !string.Equals(normalized, "0", StringComparison.Ordinal) &&
+                !string.Equals(normalized, "false", StringComparison.OrdinalIgnoreCase);
+        }
 
         internal static string NormalizeServerOrigin(string serverUrl)
         {
@@ -1432,6 +1452,41 @@ namespace TermLink.Agent
             return true;
         }
 
+        private static bool HasValidFinalRecoveredTerminalMarker(
+            Guid sessionId,
+            IList<LocalFrame> frames)
+        {
+            if (sessionId == Guid.Empty || frames == null || frames.Count == 0) return false;
+            ulong previousSequence = 0;
+            for (var index = 0; index < frames.Count; index++)
+            {
+                var frame = frames[index];
+                if (frame == null || frame.SessionId != sessionId || frame.Sequence == 0 ||
+                    frame.Sequence <= previousSequence)
+                    return false;
+                previousSequence = frame.Sequence;
+            }
+
+            var final = frames[frames.Count - 1];
+            try
+            {
+                if (final.Type == LocalFrameType.SessionRemoved)
+                {
+                    LocalPayloadCodec.ParseSessionRemoved(final.Payload);
+                    return true;
+                }
+                if (final.Type != LocalFrameType.Lifecycle) return false;
+                return LocalPayloadCodec.ParseLifecycle(final.Payload, out var ignoredExitCode) ==
+                    LocalLifecycleState.Ended;
+            }
+            catch
+            {
+                // Recovery classification is a release gate. Malformed terminal metadata must
+                // remain active/fail closed and be handled by the ordinary history retry path.
+                return false;
+            }
+        }
+
         private void QueueHistoryUpload(Guid sessionId, bool terminal)
         {
             if (sessionId == Guid.Empty || Volatile.Read(ref disposed) != 0) return;
@@ -1465,6 +1520,7 @@ namespace TermLink.Agent
                 foreach (var pending in pendingHistorySessions)
                 {
                     if (!pendingHistorySessions.TryRemove(pending.Key, out var ignored)) continue;
+                    var terminalPass = false;
                     try
                     {
                         var queuedFrames = DrainPendingHistoryFrames(pending.Key);
@@ -1496,10 +1552,20 @@ namespace TermLink.Agent
                                 terminalHistoryStore.AppendCommittedFrame(frame);
                             uploadFrames = queuedFrames;
                         }
+                        terminalPass = terminalHistorySessions.ContainsKey(pending.Key) ||
+                            (reconcile && HasValidFinalRecoveredTerminalMarker(
+                                pending.Key,
+                                uploadFrames));
                         terminalHistoryPersistenceFailures.TryRemove(pending.Key, out _);
-                        var production = terminalSnapshotEnabled
-                            ? terminalHistoryProducer.ProcessSession(pending.Key, uploadFrames)
+                        var evaluated = terminalSnapshotEnabled || terminalCoreShadowEnabled
+                            ? terminalHistoryProducer.ProcessSession(
+                                pending.Key,
+                                uploadFrames,
+                                persistLegacyArtifacts: terminalSnapshotEnabled)
                             : null;
+                        if (terminalPass)
+                            terminalHistoryProducer.RetireShadowSession(pending.Key);
+                        var production = terminalSnapshotEnabled ? evaluated : null;
                         ObserveTerminalSnapshotProduction(pending.Key, production);
                         var events = new List<HistoryEventV1>(uploadFrames.Count);
                         foreach (var frame in uploadFrames.OrderBy(value => value.Sequence))
@@ -1517,14 +1583,19 @@ namespace TermLink.Agent
                             retry = true;
                             continue;
                         }
-                        if (terminalHistorySessions.TryRemove(pending.Key, out ignored) && registry != null)
+                        if (terminalPass)
                         {
-                            registry.ReleaseBufferedSession(pending.Key);
+                            terminalHistorySessions.TryRemove(pending.Key, out ignored);
+                            registry?.ReleaseBufferedSession(pending.Key);
+                            terminalHistoryProducer.ReleaseSession(pending.Key);
+                            terminalCoreShadowStates.TryRemove(pending.Key, out _);
                         }
                     }
                     catch (OperationCanceledException) when (token.IsCancellationRequested) { return; }
                     catch (Exception error)
                     {
+                        if (terminalPass || terminalHistorySessions.ContainsKey(pending.Key))
+                            terminalHistoryProducer.RetireShadowSession(pending.Key);
                         terminalHistoryPersistenceFailures[pending.Key] = error.GetType().Name;
                         ObserveTerminalSnapshotFailure(pending.Key);
                         historyReconcileSessions[pending.Key] = 0;
@@ -1718,6 +1789,48 @@ namespace TermLink.Agent
             try { metadataSignal.Release(); }
             catch (SemaphoreFullException) { }
             catch (ObjectDisposedException) { }
+        }
+
+        private void ObserveTerminalCoreShadow(
+            Guid sessionId,
+            ProductionTerminalCoreShadowResult result)
+        {
+            if (!terminalCoreShadowEnabled || sessionId == Guid.Empty || result == null ||
+                Volatile.Read(ref disposed) != 0)
+                return;
+            var state = result.Status + "|" + result.ReasonCode;
+            if (terminalCoreShadowStates.TryGetValue(sessionId, out var previous) &&
+                string.Equals(previous, state, StringComparison.Ordinal))
+                return;
+            terminalCoreShadowStates[sessionId] = state;
+            try
+            {
+                var root = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "TermLink",
+                    "logs");
+                Directory.CreateDirectory(root);
+                var line = JsonSerializer.Serialize(new
+                {
+                    timestamp_utc = DateTime.UtcNow.ToString("O"),
+                    component = "windows-terminal-core-shadow",
+                    session_id = sessionId.ToString("D"),
+                    status = result.Status,
+                    reason_code = result.ReasonCode,
+                    last_applied_sequence = result.LastAppliedSequence,
+                    next_source_sequence = result.NextSourceSequence,
+                    presentation_revision = result.PresentationRevision,
+                    snapshot_sha256 = result.SnapshotSha256
+                });
+                File.AppendAllText(
+                    Path.Combine(root, "TermLink-terminal-core-shadow.jsonl"),
+                    line + Environment.NewLine,
+                    new UTF8Encoding(false));
+            }
+            catch
+            {
+                // A diagnostic path must never become part of terminal or history authority.
+            }
         }
 
         internal static string NormalizeSnapshotReasonCode(string value)
@@ -4094,6 +4207,8 @@ namespace TermLink.Agent
             pendingHistoryFrames.Clear();
             historyReconcileSessions.Clear();
             terminalHistoryPersistenceFailures.Clear();
+            terminalCoreShadowStates.Clear();
+            terminalHistoryProducer.Dispose();
             publishedSequences.Clear();
             foreach (var state in publicationStates.Values) state.RestUpsertGate.Dispose();
             publicationStates.Clear();

@@ -12,6 +12,7 @@ param(
     [ValidateSet('stable', 'preview')]
     [string]$UpdateChannel = 'stable',
     [string]$DotNetPath,
+    [string]$CargoPath,
     [string]$OutputPath = (Join-Path $PSScriptRoot "..\artifacts\TermLink-Setup-$Version.exe")
 )
 
@@ -173,6 +174,9 @@ try {
     $payloadZip = Join-Path $workRoot 'TermLink.payload.zip'
     [IO.Directory]::CreateDirectory($layout) | Out-Null
     try {
+        $null = & (Join-Path $projectRoot 'scripts\Build-TerminalCoreNative.ps1') `
+            -CargoPath $CargoPath `
+            -OutputDirectory $layout
         $projects = @(
             (Join-Path $PSScriptRoot '..\src\Agent\TermLink.Agent.csproj'),
             (Join-Path $PSScriptRoot '..\src\SessionHost\TermLink.SessionHost.csproj'),
@@ -255,6 +259,10 @@ try {
             "The setup contains an unexpected product executable: $($publishedProductExecutables -join ', ')"
         Assert-True (Test-Path -LiteralPath (Join-Path $layout 'TermLink.Agent.dll') -PathType Leaf) `
             'The setup is missing the independent Agent runtime assembly.'
+        Assert-True (Test-Path -LiteralPath (Join-Path $layout 'TermLink.TerminalCore.dll') -PathType Leaf) `
+            'The setup is missing the Windows terminal-core managed runtime.'
+        Assert-True (Test-Path -LiteralPath (Join-Path $layout 'termlink_terminal_ffi.dll') -PathType Leaf) `
+            'The setup is missing the Windows terminal-core native runtime.'
         Assert-True (Test-Path -LiteralPath (Join-Path $layout 'coreclr.dll') -PathType Leaf) `
             'The setup payload is not self-contained.'
         [IO.File]::WriteAllBytes(
@@ -271,7 +279,10 @@ try {
             $signArguments += @('/tr', $TimestampUrl, '/td', 'SHA256')
         }
         $ownedBinaries = @(Get-ChildItem -LiteralPath $layout -File |
-            Where-Object { $_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' } | Sort-Object Name)
+            Where-Object {
+                $_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' -or
+                $_.Name -ceq 'termlink_terminal_ffi.dll'
+            } | Sort-Object Name)
         Assert-True ($ownedBinaries.Count -ge 4) 'No TermLink binaries were found in the setup payload.'
         foreach ($binary in $ownedBinaries) {
             Invoke-Tool -FilePath $signTool -Arguments ($signArguments + @($binary.FullName))

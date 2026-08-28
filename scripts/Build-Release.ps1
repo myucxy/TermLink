@@ -29,6 +29,7 @@ param(
     [Security.SecureString]$ServerSigningKeyPassword,
 
     [string]$DotNetPath = 'dotnet',
+    [string]$CargoPath,
     [string]$WindowsCertificatePath,
     [Security.SecureString]$WindowsCertificatePassword,
     [ValidatePattern('^[0-9A-Fa-f]{40}$')]
@@ -354,14 +355,15 @@ if ($WindowsSetup) {
         type = 'setup'
         working_directory = '.'
         command = 'win-agent/package/Build-Setup.ps1'
-        arguments = @('-Version', $windowsVersion, '-UpdateChannel', $WindowsUpdateChannel) + $windowsSetupSigningArguments +
+        arguments = @('-Version', $windowsVersion, '-UpdateChannel', $WindowsUpdateChannel,
+            '-CargoPath', '<CargoPath>') + $windowsSetupSigningArguments +
             @('-OutputPath', (Get-RepoRelativePath -RepositoryRoot $repositoryRoot -Path $setupArtifactPath))
         requirements = if ($isProduction) {
-            @('.NET 8 SDK', 'Windows SDK signing tools',
+            @('.NET 8 SDK', 'Rust 1.97.1 with x86_64-pc-windows-msvc target', 'Windows SDK signing tools',
                 "production $windowsSetupSigningRequirement", 'RFC 3161 timestamp URL (HTTP requires explicit opt-in)',
                 'explicit expected Authenticode signer SHA-1 continuity fingerprint')
         } else {
-            @('.NET 8 SDK', 'Windows SDK signing tools',
+            @('.NET 8 SDK', 'Rust 1.97.1 with x86_64-pc-windows-msvc target', 'Windows SDK signing tools',
                 "development $windowsSetupSigningRequirement")
         }
         outputs = @((Get-RepoRelativePath -RepositoryRoot $repositoryRoot -Path $setupArtifactPath))
@@ -379,12 +381,15 @@ if ($WindowsMsix) {
         command = 'win-agent/package/Build-Msix.ps1'
         arguments = @('-Version', $windowsVersion, '-Publisher', '<WindowsPublisher>',
             '-CertificatePath', '<WindowsCertificatePath>', '-CertificatePassword', '<secure>',
+            '-CargoPath', '<CargoPath>',
             '-OutputPath', (Get-RepoRelativePath -RepositoryRoot $repositoryRoot -Path $msixArtifactPath))
         requirements = if ($isProduction) {
-            @('.NET 8 SDK', 'Windows SDK packaging/signing tools', 'production code-signing PFX and password',
+            @('.NET 8 SDK', 'Rust 1.97.1 with x86_64-pc-windows-msvc target',
+                'Windows SDK packaging/signing tools', 'production code-signing PFX and password',
                 'matching publisher subject', 'RFC 3161 timestamp URL (HTTP requires explicit opt-in)')
         } else {
-            @('.NET 8 SDK', 'Windows SDK packaging/signing tools', 'development code-signing PFX and password')
+            @('.NET 8 SDK', 'Rust 1.97.1 with x86_64-pc-windows-msvc target',
+                'Windows SDK packaging/signing tools', 'development code-signing PFX and password')
         }
         outputs = @((Get-RepoRelativePath -RepositoryRoot $repositoryRoot -Path $msixArtifactPath))
         publish = $false
@@ -452,6 +457,7 @@ $resolvedDocker = $null
 $resolvedCosign = $null
 $resolvedServerKey = $null
 $resolvedDotNet = $null
+$resolvedCargo = $null
 $resolvedWindowsCertificate = $null
 $resolvedWindowsCertificateThumbprint = $null
 $resolvedWindowsPublisher = $WindowsPublisher
@@ -491,6 +497,12 @@ if ($WindowsSetup -or $WindowsMsix) {
         $resolvedWindowsCertificateThumbprint = $WindowsCertificateThumbprint.ToUpperInvariant()
     }
     $resolvedDotNet = Resolve-Executable -Path $DotNetPath -Name '.NET SDK'
+    $cargoCandidate = if ([string]::IsNullOrWhiteSpace($CargoPath)) {
+        $managedCargo = 'D:\Dev\Env\Rust\cargo\bin\cargo.exe'
+        if (Test-Path -LiteralPath $managedCargo -PathType Leaf) { $managedCargo } else { 'cargo' }
+    }
+    else { $CargoPath }
+    $resolvedCargo = Resolve-Executable -Path $cargoCandidate -Name 'Cargo 1.97.1'
     if ($isProduction) {
         Assert-Condition (-not [string]::IsNullOrWhiteSpace($WindowsTimestampUrl)) `
             'WindowsTimestampUrl is required for production Windows artifacts.'
@@ -632,6 +644,7 @@ if ($WindowsSetup) {
         Version = $windowsVersion
         Development = $isDevelopment
         DotNetPath = $resolvedDotNet
+        CargoPath = $resolvedCargo
         OutputPath = $setupArtifactPath
         UpdateChannel = $WindowsUpdateChannel
     }
@@ -664,6 +677,7 @@ if ($WindowsMsix) {
         CertificatePassword = $WindowsCertificatePassword
         Development = $isDevelopment
         DotNetPath = $resolvedDotNet
+        CargoPath = $resolvedCargo
         OutputPath = $msixArtifactPath
     }
     if (-not [string]::IsNullOrWhiteSpace($WindowsTimestampUrl)) {

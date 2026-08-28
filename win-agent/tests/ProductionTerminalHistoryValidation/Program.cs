@@ -144,9 +144,29 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 var sessionId = Guid.Parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
                 ValidateUploaderConstructorCompatibility();
                 ValidateRuntimeCapabilityAndPublicationGate(root, pcDeviceId);
+                ValidateRecoveredTerminalHistoryClassification();
+                ValidateTerminalCoreShadow(root, pcDeviceId);
+                ValidateTerminalCoreShadowDispatcherBoundaries();
+                ValidateTerminalHistoryLifecycleGate(root, pcDeviceId);
+                ValidateTerminalCoreShadowGoldenStreams(root, pcDeviceId);
                 var store = new ProductionTerminalHistoryStore(root, pcDeviceId);
                 var producer = new ProductionTerminalHistoryProducer(store, pcDeviceId);
                 AppendSupportedSession(producer, sessionId);
+                ValidateScrollMarginSnapshot(
+                    producer,
+                    Guid.Parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeef"));
+                ValidatePresentationMetadataSnapshot(
+                    producer,
+                    Guid.Parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeed"));
+                ValidateTermuxProfileFailures(
+                    producer,
+                    Guid.Parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee0"));
+                ValidateArtifactSizeFailure(
+                    producer,
+                    Guid.Parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeec"));
+                ValidateSavedCursorStateAndAlternateProfile(
+                    producer,
+                    Guid.Parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee8"));
                 ValidateWalIdentityAndProtection(store, producer, sessionId);
                 var result = producer.ProcessSession(sessionId);
                 Require(result.SnapshotEligible && result.LastSequence == 2 && result.TranscriptPageCount == 2,
@@ -192,11 +212,15 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 throwOnError: true);
             var staticFlags = BindingFlags.Static | BindingFlags.NonPublic;
             var parseFlag = runtimeType.GetMethod("IsTerminalSnapshotRuntimeEnabled", staticFlags);
+            var parseTerminalCoreShadow = runtimeType.GetMethod(
+                "IsTerminalCoreShadowRuntimeEnabled",
+                staticFlags);
             var buildHello = runtimeType.GetMethod("BuildHelloPayload", staticFlags);
             var process = runtimeType.GetMethod("ProcessTerminalHistoryIfEnabled", staticFlags);
             var recordPublication = runtimeType.GetMethod("RecordPublicationOutcome", staticFlags);
             var validateEnvelopeSize = runtimeType.GetMethod("ValidateRealtimeEnvelopeSize", staticFlags);
-            Require(parseFlag != null && buildHello != null && process != null && recordPublication != null &&
+            Require(parseFlag != null && parseTerminalCoreShadow != null && buildHello != null &&
+                process != null && recordPublication != null &&
                 validateEnvelopeSize != null,
                 "Production runtime terminal-snapshot gate hooks are unavailable.");
 
@@ -231,12 +255,21 @@ namespace TermLink.ProductionTerminalHistory.Validation
             CryptographicOperations.ZeroMemory(retainedFour);
             CryptographicOperations.ZeroMemory(replayedFour);
 
-            Require((bool)parseFlag.Invoke(null, new object[] { null }) &&
+            Require(!(bool)parseFlag.Invoke(null, new object[] { null }) &&
                 (bool)parseFlag.Invoke(null, new object[] { "1" }) &&
                 (bool)parseFlag.Invoke(null, new object[] { "true" }) &&
                 !(bool)parseFlag.Invoke(null, new object[] { "0" }) &&
-                (bool)parseFlag.Invoke(null, new object[] { " 0" }),
-                "Terminal snapshot runtime must default on and accept only exact 0 as the emergency rollback.");
+                !(bool)parseFlag.Invoke(null, new object[] { " 1" }) &&
+                !(bool)parseFlag.Invoke(null, new object[] { "invalid" }),
+                "Terminal snapshot runtime must fail closed unless it receives an exact explicit opt-in.");
+            Require((bool)parseTerminalCoreShadow.Invoke(null, new object[] { null }) &&
+                (bool)parseTerminalCoreShadow.Invoke(null, new object[] { "1" }) &&
+                !(bool)parseTerminalCoreShadow.Invoke(null, new object[] { "0" }) &&
+                !(bool)parseTerminalCoreShadow.Invoke(null, new object[] { "false" }) &&
+                !(bool)parseTerminalCoreShadow.Invoke(null, new object[] { " false " }) &&
+                !(bool)parseTerminalCoreShadow.Invoke(null, new object[] { " 0 " }) &&
+                (bool)parseTerminalCoreShadow.Invoke(null, new object[] { "invalid" }),
+                "Terminal-core shadow must default on and retain an explicit local rollback.");
 
             using (var disabledHello = JsonDocument.Parse((byte[])buildHello.Invoke(null, new object[] { false })))
             using (var enabledHello = JsonDocument.Parse((byte[])buildHello.Invoke(null, new object[] { true })))
@@ -318,6 +351,853 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 sessionId,
                 3,
                 LocalPayloadCodec.Lifecycle(LocalLifecycleState.Ended, 17)));
+        }
+
+        private static void ValidateRecoveredTerminalHistoryClassification()
+        {
+            var runtimeType = Assembly.Load("TermLink.Agent").GetType(
+                "TermLink.Agent.ProductionAgentRuntime",
+                throwOnError: true);
+            var classify = runtimeType.GetMethod(
+                "HasValidFinalRecoveredTerminalMarker",
+                BindingFlags.Static | BindingFlags.NonPublic);
+            Require(classify != null,
+                "The persisted terminal-history recovery classifier is missing.");
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000086");
+
+            bool IsRecoveredTerminal(params LocalFrame[] frames)
+            {
+                // Local IPC sources are linked into this validation executable as well as the
+                // Agent. Rehydrate the Agent assembly's internal frame identity for reflection.
+                var agentFrameType = runtimeType.Assembly.GetType(
+                    "TermLink.LocalIpc.LocalFrame",
+                    throwOnError: true);
+                var agentFrameTypeEnum = runtimeType.Assembly.GetType(
+                    "TermLink.LocalIpc.LocalFrameType",
+                    throwOnError: true);
+                var list = (System.Collections.IList)Activator.CreateInstance(
+                    typeof(List<>).MakeGenericType(agentFrameType));
+                foreach (var frame in frames)
+                {
+                    var agentType = Enum.ToObject(agentFrameTypeEnum, (byte)frame.Type);
+                    var agentFrame = Activator.CreateInstance(
+                        agentFrameType,
+                        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                        binder: null,
+                        args: new object[]
+                        {
+                            agentType,
+                            frame.SessionId,
+                            frame.Sequence,
+                            frame.Payload
+                        },
+                        culture: null);
+                    list.Add(agentFrame);
+                }
+                return (bool)classify.Invoke(null, new object[] { sessionId, list });
+            }
+
+            Require(IsRecoveredTerminal(
+                    new LocalFrame(
+                        LocalFrameType.Output,
+                        sessionId,
+                        1,
+                        Encoding.UTF8.GetBytes("ended")),
+                    new LocalFrame(
+                        LocalFrameType.Lifecycle,
+                        sessionId,
+                        2,
+                        LocalPayloadCodec.Lifecycle(LocalLifecycleState.Ended, 0))),
+                "A persisted history stream ending in a valid Ended marker was not terminal.");
+            Require(IsRecoveredTerminal(
+                    new LocalFrame(
+                        LocalFrameType.Lifecycle,
+                        sessionId,
+                        1,
+                        LocalPayloadCodec.Lifecycle(LocalLifecycleState.Ended, 0)),
+                    new LocalFrame(
+                        LocalFrameType.SessionRemoved,
+                        sessionId,
+                        2,
+                        LocalPayloadCodec.SessionRemoved())),
+                "A persisted history stream ending in a valid SessionRemoved marker was not terminal.");
+
+            Require(!IsRecoveredTerminal(
+                    new LocalFrame(
+                        LocalFrameType.Output,
+                        sessionId,
+                        1,
+                        Encoding.UTF8.GetBytes("active")),
+                    new LocalFrame(
+                        LocalFrameType.Lifecycle,
+                        sessionId,
+                        2,
+                        LocalPayloadCodec.Lifecycle(LocalLifecycleState.Running, 0))),
+                "A recovered active session was misclassified as terminal.");
+            Require(!IsRecoveredTerminal(
+                    new LocalFrame(
+                        LocalFrameType.Lifecycle,
+                        sessionId,
+                        1,
+                        LocalPayloadCodec.Lifecycle(LocalLifecycleState.Ended, 0)),
+                    new LocalFrame(
+                        LocalFrameType.Output,
+                        sessionId,
+                        2,
+                        Encoding.UTF8.GetBytes("later non-terminal frame"))),
+                "A non-final terminal marker released a recovered active session.");
+            Require(!IsRecoveredTerminal(
+                    new LocalFrame(
+                        LocalFrameType.Output,
+                        sessionId,
+                        1,
+                        Encoding.UTF8.GetBytes("identity")),
+                    new LocalFrame(
+                        LocalFrameType.SessionRemoved,
+                        Guid.Parse("aaaaaaaa-0000-4000-8000-000000000087"),
+                        2,
+                        LocalPayloadCodec.SessionRemoved())),
+                "A terminal marker for another session passed recovery classification.");
+            Require(!IsRecoveredTerminal(
+                    new LocalFrame(
+                        LocalFrameType.Output,
+                        sessionId,
+                        2,
+                        Encoding.UTF8.GetBytes("sequence")),
+                    new LocalFrame(
+                        LocalFrameType.SessionRemoved,
+                        sessionId,
+                        2,
+                        LocalPayloadCodec.SessionRemoved())),
+                "A non-increasing recovery sequence passed terminal classification.");
+            Require(!IsRecoveredTerminal(
+                    new LocalFrame(
+                        LocalFrameType.SessionRemoved,
+                        sessionId,
+                        1,
+                        new byte[] { 1 })),
+                "Malformed recovered terminal metadata passed classification.");
+        }
+
+        private static void ValidateTerminalCoreShadow(string root, Guid pcDeviceId)
+        {
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000079");
+            var store = new ProductionTerminalHistoryStore(
+                Path.Combine(root, "terminal-core-shadow"),
+                pcDeviceId);
+            ProductionTerminalCoreShadowResult observedShadow = null;
+            using var shadowReady = new ManualResetEventSlim();
+            using var producer = new ProductionTerminalHistoryProducer(
+                store,
+                pcDeviceId,
+                terminalCoreShadowEnabled: true,
+                (observedSessionId, result) =>
+                {
+                    if (observedSessionId != sessionId) return;
+                    observedShadow = result;
+                    shadowReady.Set();
+                });
+            var frames = new List<LocalFrame>
+            {
+                new LocalFrame(
+                    LocalFrameType.Resize,
+                    sessionId,
+                    1,
+                    LocalPayloadCodec.Resize(8, 3)),
+                new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    2,
+                    Encoding.UTF8.GetBytes(
+                        "\u001b]0;OSC title\u0007" +
+                        "\u001b[31;1m\u001b]8;;https://example.invalid\u001b\\" +
+                        "hello\u001b]8;;\u001b\\\u001b[0m")),
+                new LocalFrame(
+                    LocalFrameType.Title,
+                    sessionId,
+                    3,
+                    LocalPayloadCodec.Title("Structured title")),
+                new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    4,
+                    Encoding.UTF8.GetBytes("!"))
+            };
+            var result = producer.ProcessSession(
+                sessionId,
+                frames,
+                persistLegacyArtifacts: false);
+            Require(shadowReady.Wait(TimeSpan.FromSeconds(10)),
+                "Windows terminal-core shadow did not complete asynchronously.");
+            Require(observedShadow != null &&
+                observedShadow.Status == "SHADOW_MATCH_LIMITED" &&
+                observedShadow.ReasonCode.Split('+').Contains("TITLE_OUT_OF_BAND") &&
+                observedShadow.LastAppliedSequence == 4 &&
+                observedShadow.NextSourceSequence == 5 &&
+                observedShadow.PresentationRevision > 0 &&
+                observedShadow.SnapshotSha256.Length == 64,
+                "Windows terminal-core shadow did not match the Portable projection: " +
+                (observedShadow == null
+                        ? "missing"
+                    : observedShadow.Status + "/" +
+                        observedShadow.ReasonCode));
+            Require(producer.ActiveProjectionCount == 1 &&
+                producer.ActiveShadowSessionCount == 1,
+                "Windows terminal-core shadow state was not retained while its session was active.");
+            producer.RetireShadowSession(sessionId);
+            Require(producer.ActiveProjectionCount == 1 &&
+                producer.ActiveShadowSessionCount == 0,
+                "A terminal pass did not release native shadow state independently of durable history.");
+            producer.ProcessSession(
+                sessionId,
+                Array.Empty<LocalFrame>(),
+                persistLegacyArtifacts: false);
+            Require(producer.ActiveShadowSessionCount == 0,
+                "Late history retry recreated a retired native shadow session.");
+            producer.ReleaseSession(sessionId);
+            Require(producer.ActiveProjectionCount == 0 &&
+                producer.ActiveShadowSessionCount == 0,
+                "Windows terminal-core shadow state was not released with its session.");
+            var released = producer.ProcessSession(
+                sessionId,
+                Array.Empty<LocalFrame>(),
+                persistLegacyArtifacts: false);
+            Require(released.IneligibilityCode == "SESSION_RELEASED" &&
+                producer.ActiveProjectionCount == 0 &&
+                producer.ActiveShadowSessionCount == 0,
+                "Late work recreated a released terminal-core shadow session.");
+            Require(result.IneligibilityCode == "LEGACY_PUBLICATION_DISABLED" &&
+                store.LoadCheckpoint(sessionId) == null &&
+                store.LoadOutbox(sessionId) == null,
+                "Shadow-only evaluation persisted or advertised a legacy terminal artifact.");
+
+            producer.RetireShadowSession(sessionId);
+            Require(producer.ActiveShadowSessionCount == 0 &&
+                producer.RetainedShadowSessionCount == 0,
+                "A late retire recreated dispatcher state after final release.");
+        }
+
+        private static void ValidateTerminalCoreShadowDispatcherBoundaries()
+        {
+            var preRetiredSessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000078");
+            var preRetiredObserverCalls = 0;
+            using (var preRetiredDispatcher = new ProductionTerminalCoreShadowDispatcher(
+                (_, _) => Interlocked.Increment(ref preRetiredObserverCalls)))
+            {
+                preRetiredDispatcher.RetireSession(preRetiredSessionId);
+                Require(preRetiredDispatcher.SessionCount == 0 &&
+                    preRetiredDispatcher.RetainedSessionCount == 1,
+                    "Retiring before first work did not create a dispatcher tombstone.");
+                preRetiredDispatcher.Enqueue(
+                    preRetiredSessionId,
+                    new[]
+                    {
+                        new LocalFrame(
+                            LocalFrameType.Output,
+                            Guid.Parse("aaaaaaaa-0000-4000-8000-000000000088"),
+                            1,
+                            Encoding.UTF8.GetBytes("must-not-estimate"))
+                    },
+                    null,
+                    1,
+                    "PORTABLE_UNAVAILABLE");
+                Require(Volatile.Read(ref preRetiredObserverCalls) == 0 &&
+                    preRetiredDispatcher.SessionCount == 0 &&
+                    preRetiredDispatcher.RetainedSessionCount == 1,
+                    "Work recreated a shadow generation after pre-retirement.");
+                preRetiredDispatcher.ReleaseSession(preRetiredSessionId);
+                Require(preRetiredDispatcher.RetainedSessionCount == 0,
+                    "Pre-retired dispatcher state was not finally released.");
+            }
+
+            var rejectedObserverCalls = 0;
+            using (var rejectedDispatcher = new ProductionTerminalCoreShadowDispatcher(
+                (_, _) => Interlocked.Increment(ref rejectedObserverCalls)))
+            {
+                var preRejectedSessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000081");
+                rejectedDispatcher.Enqueue(
+                    preRejectedSessionId,
+                    new[]
+                    {
+                        // A mismatched identity proves rejection happens before retained-byte
+                        // validation as well as before state creation.
+                        new LocalFrame(
+                            LocalFrameType.Output,
+                            Guid.Parse("aaaaaaaa-0000-4000-8000-000000000082"),
+                            1,
+                            Encoding.UTF8.GetBytes("must-not-validate"))
+                    },
+                    null,
+                    1,
+                    "PORTABLE_UNAVAILABLE",
+                    rejectPredicate: () => true);
+                Require(rejectedDispatcher.SessionCount == 0 &&
+                    rejectedDispatcher.RetainedSessionCount == 0 &&
+                    Volatile.Read(ref rejectedObserverCalls) == 0,
+                    "A pre-rejected shadow dispatch validated work, created state, or notified its observer.");
+
+                var predicateCalls = 0;
+                var postCreateRejectedSessionId =
+                    Guid.Parse("aaaaaaaa-0000-4000-8000-000000000083");
+                rejectedDispatcher.Enqueue(
+                    postCreateRejectedSessionId,
+                    new[]
+                    {
+                        new LocalFrame(
+                            LocalFrameType.Output,
+                            postCreateRejectedSessionId,
+                            1,
+                            Encoding.UTF8.GetBytes("must-not-run"))
+                    },
+                    null,
+                    1,
+                    "PORTABLE_UNAVAILABLE",
+                    rejectPredicate: () => Interlocked.Increment(ref predicateCalls) >= 2);
+                Require(Volatile.Read(ref predicateCalls) == 2 &&
+                    rejectedDispatcher.SessionCount == 0 &&
+                    rejectedDispatcher.RetainedSessionCount == 0 &&
+                    Volatile.Read(ref rejectedObserverCalls) == 0,
+                    "A dispatch rejected after GetOrAdd retained state or executed work.");
+
+                var throwingPredicateSessionId =
+                    Guid.Parse("aaaaaaaa-0000-4000-8000-000000000084");
+                rejectedDispatcher.Enqueue(
+                    throwingPredicateSessionId,
+                    new[]
+                    {
+                        new LocalFrame(
+                            LocalFrameType.Output,
+                            throwingPredicateSessionId,
+                            1,
+                            Encoding.UTF8.GetBytes("must-fail-closed"))
+                    },
+                    null,
+                    1,
+                    "PORTABLE_UNAVAILABLE",
+                    rejectPredicate: () => throw new InvalidOperationException("predicate failure"));
+                Require(rejectedDispatcher.SessionCount == 0 &&
+                    rejectedDispatcher.RetainedSessionCount == 0 &&
+                    Volatile.Read(ref rejectedObserverCalls) == 0,
+                    "A throwing shadow rejection predicate escaped or admitted work.");
+            }
+
+            var admissionFailureSessionId =
+                Guid.Parse("aaaaaaaa-0000-4000-8000-000000000086");
+            using var admissionFailureObserverEntered = new ManualResetEventSlim();
+            using var releaseAdmissionFailureObserver = new ManualResetEventSlim();
+            var admissionFailureObserverCalls = 0;
+            using (var admissionFailureDispatcher = new ProductionTerminalCoreShadowDispatcher(
+                (observedSessionId, result) =>
+                {
+                    if (observedSessionId != admissionFailureSessionId ||
+                        result.Status != "SHADOW_RETIRED") return;
+                    Interlocked.Increment(ref admissionFailureObserverCalls);
+                    admissionFailureObserverEntered.Set();
+                    releaseAdmissionFailureObserver.Wait(TimeSpan.FromSeconds(10));
+                }))
+            {
+                Task admissionFailureDispatch = null;
+                try
+                {
+                    admissionFailureDispatch = Task.Run(() =>
+                        admissionFailureDispatcher.Enqueue(
+                            admissionFailureSessionId,
+                            new[]
+                            {
+                                // Invalid identity deterministically fails during retained-byte
+                                // estimation, before the dispatcher normally creates session state.
+                                new LocalFrame(
+                                    LocalFrameType.Output,
+                                    Guid.Parse("aaaaaaaa-0000-4000-8000-000000000087"),
+                                    1,
+                                    Encoding.UTF8.GetBytes("must-retire-before-notify"))
+                            },
+                            null,
+                            1,
+                            "PORTABLE_UNAVAILABLE"));
+                    Require(admissionFailureObserverEntered.Wait(TimeSpan.FromSeconds(10)),
+                        "An admission failure did not reach its observer.");
+                    Require(admissionFailureDispatcher.SessionCount == 0 &&
+                        admissionFailureDispatcher.RetainedSessionCount == 1,
+                        "Admission failure did not install its tombstone before observer notification.");
+                    var callsAfterAdmissionFailure =
+                        Volatile.Read(ref admissionFailureObserverCalls);
+                    admissionFailureDispatcher.Enqueue(
+                        admissionFailureSessionId,
+                        new[]
+                        {
+                            new LocalFrame(
+                                LocalFrameType.Output,
+                                admissionFailureSessionId,
+                                2,
+                                Encoding.UTF8.GetBytes("must-not-run"))
+                        },
+                        null,
+                        2,
+                        "PORTABLE_UNAVAILABLE");
+                    Require(admissionFailureDispatcher.SessionCount == 0 &&
+                        admissionFailureDispatcher.RetainedSessionCount == 1 &&
+                        Volatile.Read(ref admissionFailureObserverCalls) == callsAfterAdmissionFailure,
+                        "Late work was admitted after an admission failure retired the shadow.");
+                    admissionFailureDispatcher.ReleaseSession(admissionFailureSessionId);
+                    Require(admissionFailureDispatcher.RetainedSessionCount == 0,
+                        "Final release did not remove the admission-failure tombstone.");
+                }
+                finally
+                {
+                    releaseAdmissionFailureObserver.Set();
+                    admissionFailureDispatch?.GetAwaiter().GetResult();
+                }
+            }
+
+            var nativeRetiredSessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000085");
+            using var nativeRetiredObserverEntered = new ManualResetEventSlim();
+            using var releaseNativeRetiredObserver = new ManualResetEventSlim();
+            var nativeRetiredObserverCalls = 0;
+            using (var nativeRetiredDispatcher = new ProductionTerminalCoreShadowDispatcher(
+                (observedSessionId, result) =>
+                {
+                    if (observedSessionId != nativeRetiredSessionId) return;
+                    Interlocked.Increment(ref nativeRetiredObserverCalls);
+                    if (result.Status != "SHADOW_RETIRED") return;
+                    nativeRetiredObserverEntered.Set();
+                    releaseNativeRetiredObserver.Wait(TimeSpan.FromSeconds(10));
+                }))
+            {
+                try
+                {
+                    nativeRetiredDispatcher.Enqueue(
+                        nativeRetiredSessionId,
+                        new[]
+                        {
+                            // A malformed Resize is accepted by the local frame envelope but
+                            // deterministically retires the native shadow during Apply.
+                            new LocalFrame(
+                                LocalFrameType.Resize,
+                                nativeRetiredSessionId,
+                                1,
+                                Array.Empty<byte>())
+                        },
+                        null,
+                        1,
+                        "PORTABLE_UNAVAILABLE");
+                    Require(nativeRetiredObserverEntered.Wait(TimeSpan.FromSeconds(10)),
+                        "A native SHADOW_RETIRED result did not reach its observer.");
+                    Require(nativeRetiredDispatcher.SessionCount == 0 &&
+                        nativeRetiredDispatcher.RetainedSessionCount == 1,
+                        "Native retirement did not install its tombstone before observer notification.");
+                    var callsAfterNativeRetirement = Volatile.Read(ref nativeRetiredObserverCalls);
+                    nativeRetiredDispatcher.Enqueue(
+                        nativeRetiredSessionId,
+                        new[]
+                        {
+                            new LocalFrame(
+                                LocalFrameType.Output,
+                                Guid.Parse("aaaaaaaa-0000-4000-8000-000000000089"),
+                                2,
+                                Encoding.UTF8.GetBytes("must-not-estimate"))
+                        },
+                        null,
+                        2,
+                        "PORTABLE_UNAVAILABLE");
+                    Require(nativeRetiredDispatcher.SessionCount == 0 &&
+                        nativeRetiredDispatcher.RetainedSessionCount == 1 &&
+                        Volatile.Read(ref nativeRetiredObserverCalls) == callsAfterNativeRetirement,
+                        "Late work was admitted after the native shadow retired.");
+                    nativeRetiredDispatcher.ReleaseSession(nativeRetiredSessionId);
+                    Require(nativeRetiredDispatcher.RetainedSessionCount == 0,
+                        "Final release did not remove the native-retirement tombstone.");
+                }
+                finally
+                {
+                    releaseNativeRetiredObserver.Set();
+                }
+            }
+
+            var queuedSessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-00000000007a");
+            using var firstObserverEntered = new ManualResetEventSlim();
+            using var releaseFirstObserver = new ManualResetEventSlim();
+            using var overflowObserved = new ManualResetEventSlim();
+            var observerCalls = 0;
+            using (var dispatcher = new ProductionTerminalCoreShadowDispatcher(
+                (observedSessionId, result) =>
+                {
+                    if (observedSessionId != queuedSessionId) return;
+                    if (Interlocked.Increment(ref observerCalls) == 1)
+                    {
+                        firstObserverEntered.Set();
+                        releaseFirstObserver.Wait(TimeSpan.FromSeconds(10));
+                    }
+                    if (result.ReasonCode == "DISPATCH_QUEUE_OVERFLOW") overflowObserved.Set();
+                }))
+            {
+                dispatcher.Enqueue(
+                    queuedSessionId,
+                    new[]
+                    {
+                        new LocalFrame(
+                            LocalFrameType.Output,
+                            queuedSessionId,
+                            1,
+                            Encoding.UTF8.GetBytes("a"))
+                    },
+                    null,
+                    1,
+                    "PORTABLE_UNAVAILABLE");
+                Require(firstObserverEntered.Wait(TimeSpan.FromSeconds(10)),
+                    "The shadow dispatcher did not enter its blocking observer.");
+                for (ulong sequence = 2;
+                    sequence <= (ulong)ProductionTerminalCoreShadowDispatcher.MaximumPendingWorkItemsPerSession + 1;
+                    sequence++)
+                {
+                    dispatcher.Enqueue(
+                        queuedSessionId,
+                        new[]
+                        {
+                            new LocalFrame(
+                                LocalFrameType.Output,
+                                queuedSessionId,
+                                sequence,
+                                Encoding.UTF8.GetBytes("b"))
+                        },
+                        null,
+                        sequence,
+                        "PORTABLE_UNAVAILABLE");
+                }
+                Require(dispatcher.SessionCount == 0 && dispatcher.RetainedSessionCount == 1,
+                    "Queue overload did not retain exactly one retired session tombstone.");
+                releaseFirstObserver.Set();
+                Require(overflowObserved.Wait(TimeSpan.FromSeconds(10)),
+                    "Queue overload did not report its retirement reason.");
+                var callsAfterRetirement = Volatile.Read(ref observerCalls);
+                dispatcher.Enqueue(
+                    queuedSessionId,
+                    new[]
+                    {
+                        new LocalFrame(
+                            LocalFrameType.Output,
+                            Guid.Parse("aaaaaaaa-0000-4000-8000-00000000008a"),
+                            99,
+                            Encoding.UTF8.GetBytes("must-not-estimate"))
+                    },
+                    null,
+                    99,
+                    "PORTABLE_UNAVAILABLE");
+                Require(dispatcher.SessionCount == 0 && dispatcher.RetainedSessionCount == 1 &&
+                    Volatile.Read(ref observerCalls) == callsAfterRetirement,
+                    "Late work recreated a new shadow generation after overload.");
+                dispatcher.ReleaseSession(queuedSessionId);
+                Require(dispatcher.RetainedSessionCount == 0,
+                    "Final release did not remove the retired dispatcher tombstone.");
+            }
+
+            var exactSessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-00000000007b");
+            var exact = CreateRetainedBudgetFrames(
+                exactSessionId,
+                ProductionTerminalCoreShadowDispatcher.MaximumPendingRetainedBytesPerSession);
+            Require(ProductionTerminalCoreShadowDispatcher.EstimateRetainedBytes(
+                    exact,
+                    null,
+                    exactSessionId,
+                    "PORTABLE_UNAVAILABLE") ==
+                ProductionTerminalCoreShadowDispatcher.MaximumPendingRetainedBytesPerSession,
+                "The dispatcher retained-byte boundary calculation drifted.");
+            using var exactObserved = new ManualResetEventSlim();
+            using (var exactDispatcher = new ProductionTerminalCoreShadowDispatcher(
+                (observedSessionId, _) =>
+                {
+                    if (observedSessionId == exactSessionId) exactObserved.Set();
+                }))
+            {
+                exactDispatcher.Enqueue(
+                    exactSessionId,
+                    exact,
+                    null,
+                    checked((ulong)exact.Count),
+                    "PORTABLE_UNAVAILABLE");
+                Require(exactDispatcher.SessionCount == 1,
+                    "A work item exactly at the retained-byte limit was rejected.");
+                Require(exactObserved.Wait(TimeSpan.FromSeconds(20)),
+                    "A work item exactly at the retained-byte limit did not execute.");
+                exactDispatcher.ReleaseSession(exactSessionId);
+            }
+
+            var oversizedSessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-00000000007c");
+            using var oversizedObserved = new ManualResetEventSlim();
+            var oversized = CreateRetainedBudgetFrames(
+                oversizedSessionId,
+                ProductionTerminalCoreShadowDispatcher.MaximumPendingRetainedBytesPerSession + 1);
+            using (var oversizedDispatcher = new ProductionTerminalCoreShadowDispatcher(
+                (observedSessionId, result) =>
+                {
+                    if (observedSessionId == oversizedSessionId &&
+                        result.ReasonCode == "DISPATCH_QUEUE_OVERFLOW")
+                        oversizedObserved.Set();
+                }))
+            {
+                oversizedDispatcher.Enqueue(
+                    oversizedSessionId,
+                    oversized,
+                    null,
+                    checked((ulong)oversized.Count),
+                    "PORTABLE_UNAVAILABLE");
+                Require(oversizedObserved.Wait(TimeSpan.FromSeconds(10)) &&
+                    oversizedDispatcher.SessionCount == 0 &&
+                    oversizedDispatcher.RetainedSessionCount == 1,
+                    "A work item above the retained-byte limit did not retire its session.");
+                oversizedDispatcher.ReleaseSession(oversizedSessionId);
+            }
+        }
+
+        private static IReadOnlyList<LocalFrame> CreateRetainedBudgetFrames(
+            Guid sessionId,
+            long targetRetainedBytes)
+        {
+            const int frameCount = 17;
+            const string reasonCode = "PORTABLE_UNAVAILABLE";
+            var frames = Enumerable.Range(1, frameCount)
+                .Select(sequence => new LocalFrame(
+                    LocalFrameType.Capabilities,
+                    sessionId,
+                    checked((ulong)sequence),
+                    Array.Empty<byte>()))
+                .ToArray();
+            var fixedBytes = ProductionTerminalCoreShadowDispatcher.EstimateRetainedBytes(
+                frames,
+                null,
+                sessionId,
+                reasonCode);
+            var payloadBytes = checked(targetRetainedBytes - fixedBytes);
+            var maximumPayloadBytes = LocalFrameCodec.MaximumFrameBytes - 64;
+            for (var index = 0; index < frames.Length; index++)
+            {
+                var length = checked((int)Math.Min(payloadBytes, maximumPayloadBytes));
+                frames[index] = new LocalFrame(
+                    LocalFrameType.Capabilities,
+                    sessionId,
+                    checked((ulong)(index + 1)),
+                    new byte[length]);
+                payloadBytes -= length;
+            }
+            Require(payloadBytes == 0,
+                "The retained-byte fixture could not fit within legal local frame payloads.");
+            return frames;
+        }
+
+        private static void ValidateTerminalHistoryLifecycleGate(string root, Guid pcDeviceId)
+        {
+            var store = new ProductionTerminalHistoryStore(
+                Path.Combine(root, "terminal-history-lifecycle-gate"),
+                pcDeviceId);
+            var producer = new ProductionTerminalHistoryProducer(
+                store,
+                pcDeviceId,
+                terminalCoreShadowEnabled: false);
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-00000000007d");
+            producer.ProcessSession(
+                sessionId,
+                new[]
+                {
+                    new LocalFrame(
+                        LocalFrameType.Output,
+                        sessionId,
+                        1,
+                        Encoding.UTF8.GetBytes("lifecycle"))
+                },
+                persistLegacyArtifacts: false);
+            var gateField = typeof(ProductionTerminalHistoryProducer).GetField(
+                "lifecycleGate",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            var gate = (ReaderWriterLockSlim)gateField?.GetValue(producer);
+            Require(gate != null, "The terminal history lifecycle gate is missing.");
+            var statesField = typeof(ProductionTerminalHistoryProducer).GetField(
+                "states",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            var states = statesField?.GetValue(producer);
+            var tryGetValue = states?.GetType().GetMethod("TryGetValue");
+            var lookupArguments = new object[] { sessionId, null };
+            Require(tryGetValue != null && (bool)tryGetValue.Invoke(states, lookupArguments),
+                "The lifecycle validation could not locate its production state.");
+            var state = lookupArguments[1];
+            var stateSync = state?.GetType().GetField("Sync")?.GetValue(state);
+            Require(stateSync != null, "The lifecycle validation could not locate the production state lock.");
+            var stateLockHeld = false;
+            try
+            {
+                Monitor.Enter(stateSync);
+                stateLockHeld = true;
+                var processing = Task.Run(() => producer.ProcessSession(
+                    sessionId,
+                    Array.Empty<LocalFrame>(),
+                    persistLegacyArtifacts: false));
+                Require(SpinWait.SpinUntil(
+                        () => gate.CurrentReadCount > 0,
+                        TimeSpan.FromSeconds(10)),
+                    "A real ProcessSession call did not acquire the lifecycle read lease.");
+                var dispose = Task.Run(producer.Dispose);
+                Require(!dispose.Wait(TimeSpan.FromMilliseconds(200)),
+                    "Producer Dispose did not wait for the active ProcessSession call.");
+                Monitor.Exit(stateSync);
+                stateLockHeld = false;
+                Require(processing.Wait(TimeSpan.FromSeconds(10)),
+                    "The blocked ProcessSession call did not complete after its state lock was released.");
+                Require(dispose.Wait(TimeSpan.FromSeconds(10)),
+                    "Producer Dispose did not complete after processing drained.");
+                var disposed = false;
+                try
+                {
+                    producer.ProcessSession(
+                        sessionId,
+                        Array.Empty<LocalFrame>(),
+                        persistLegacyArtifacts: false);
+                }
+                catch (ObjectDisposedException) { disposed = true; }
+                Require(disposed, "A disposed terminal history producer accepted new processing.");
+            }
+            finally
+            {
+                if (stateLockHeld) Monitor.Exit(stateSync);
+                producer.Dispose();
+            }
+        }
+
+        private static void ValidateTerminalCoreShadowGoldenStreams(string root, Guid pcDeviceId)
+        {
+            var goldenRoot = FindTerminalGoldenStreamsRoot();
+            var cases = Directory.GetDirectories(goldenRoot)
+                .OrderBy(value => value, StringComparer.Ordinal)
+                .ToArray();
+            Require(cases.Length > 0, "No terminal golden streams were found.");
+
+            var summaries = new List<string>();
+            for (var caseIndex = 0; caseIndex < cases.Length; caseIndex++)
+            {
+                var caseRoot = cases[caseIndex];
+                var caseName = Path.GetFileName(caseRoot);
+                var output = File.ReadAllBytes(Path.Combine(caseRoot, "output.bin"));
+                var sessionIdBytes = new byte[16];
+                sessionIdBytes[0] = checked((byte)(caseIndex + 1));
+                sessionIdBytes[6] = 0x40;
+                sessionIdBytes[8] = 0x80;
+                var sessionId = new Guid(sessionIdBytes);
+                var frames = new List<LocalFrame>();
+                ulong lastOutputSequence = 0;
+
+                foreach (var line in File.ReadLines(Path.Combine(caseRoot, "events.jsonl")))
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    using var document = JsonDocument.Parse(line);
+                    var item = document.RootElement;
+                    var sequence = item.GetProperty("seq").GetUInt64();
+                    var type = item.GetProperty("type").GetString();
+                    switch (type)
+                    {
+                        case "output":
+                            var offset = item.GetProperty("data_offset").GetInt32();
+                            var length = item.GetProperty("data_length").GetInt32();
+                            var payload = new byte[length];
+                            Buffer.BlockCopy(output, offset, payload, 0, length);
+                            frames.Add(new LocalFrame(
+                                LocalFrameType.Output,
+                                sessionId,
+                                sequence,
+                                payload));
+                            lastOutputSequence = sequence;
+                            break;
+                        case "resize":
+                            frames.Add(new LocalFrame(
+                                LocalFrameType.Resize,
+                                sessionId,
+                                sequence,
+                                LocalPayloadCodec.Resize(
+                                    checked((short)item.GetProperty("columns").GetInt32()),
+                                    checked((short)item.GetProperty("rows").GetInt32()))));
+                            break;
+                        case "lifecycle":
+                            var ended = string.Equals(
+                                item.GetProperty("state").GetString(),
+                                "ended",
+                                StringComparison.Ordinal);
+                            var exitCode = ended && item.TryGetProperty("exit_code", out var code)
+                                ? code.GetInt32()
+                                : 0;
+                            frames.Add(new LocalFrame(
+                                LocalFrameType.Lifecycle,
+                                sessionId,
+                                sequence,
+                                LocalPayloadCodec.Lifecycle(
+                                    ended ? LocalLifecycleState.Ended : LocalLifecycleState.Running,
+                                    exitCode)));
+                            break;
+                        default:
+                            throw new InvalidDataException(
+                                "Unsupported golden stream event type: " + type);
+                    }
+                }
+
+                Require(lastOutputSequence > 0, caseName + " has no output event.");
+                var store = new ProductionTerminalHistoryStore(
+                    Path.Combine(root, "terminal-core-shadow-golden", caseName),
+                    pcDeviceId);
+                ProductionTerminalCoreShadowResult observedShadow = null;
+                using var shadowReady = new ManualResetEventSlim();
+                using var producer = new ProductionTerminalHistoryProducer(
+                    store,
+                    pcDeviceId,
+                    terminalCoreShadowEnabled: true,
+                    (observedSessionId, value) =>
+                    {
+                        if (observedSessionId != sessionId) return;
+                        observedShadow = value;
+                        shadowReady.Set();
+                    });
+                var result = producer.ProcessSession(
+                    sessionId,
+                    frames,
+                    persistLegacyArtifacts: false);
+                Require(shadowReady.Wait(TimeSpan.FromSeconds(10)),
+                    caseName + " shadow replay did not complete asynchronously.");
+                var shadow = observedShadow;
+                Require(shadow != null, caseName + " did not produce a shadow result.");
+                Require(shadow.Status == "SHADOW_MATCH" ||
+                    shadow.Status == "SHADOW_MATCH_LIMITED" ||
+                    shadow.Status == "SHADOW_READY",
+                    caseName + " could not produce a native checkpoint: " +
+                    shadow.Status + "/" + shadow.ReasonCode);
+                Require(shadow.LastAppliedSequence == lastOutputSequence &&
+                    shadow.NextSourceSequence == lastOutputSequence + 1 &&
+                    shadow.SnapshotSha256.Length == 64,
+                    caseName + " produced inconsistent native checkpoint metadata.");
+                Require(store.LoadCheckpoint(sessionId) == null &&
+                    store.LoadOutbox(sessionId) == null,
+                    caseName + " persisted a legacy artifact during shadow-only replay.");
+                summaries.Add(caseName + "=" + shadow.Status +
+                    (string.IsNullOrWhiteSpace(shadow.ReasonCode)
+                        ? string.Empty
+                        : "/" + shadow.ReasonCode));
+            }
+
+            Console.WriteLine("Terminal core shadow golden matrix: " +
+                string.Join(", ", summaries));
+        }
+
+        private static string FindTerminalGoldenStreamsRoot()
+        {
+            foreach (var start in new[] { Directory.GetCurrentDirectory(), AppContext.BaseDirectory })
+            {
+                var current = new DirectoryInfo(start);
+                while (current != null)
+                {
+                    var candidate = Path.Combine(
+                        current.FullName,
+                        "testdata",
+                        "terminal-golden-streams");
+                    if (Directory.Exists(candidate)) return candidate;
+                    current = current.Parent;
+                }
+            }
+            throw new DirectoryNotFoundException(
+                "Repository terminal golden streams directory was not found.");
         }
 
         private static void ValidateFivePagePublication(string root, Guid pcDeviceId)
@@ -483,6 +1363,264 @@ namespace TermLink.ProductionTerminalHistory.Validation
             Require(!Contains(stored, Encoding.UTF8.GetBytes("0000\r\n0001")), "Terminal WAL exposed output plaintext.");
         }
 
+        private static void ValidateScrollMarginSnapshot(
+            ProductionTerminalHistoryProducer producer,
+            Guid sessionId)
+        {
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                sessionId,
+                1,
+                Encoding.UTF8.GetBytes("\u001b[2;4r\u001b[4;1Hmargin")));
+            var result = producer.ProcessSession(sessionId);
+            var checkpoint = producer.LoadCheckpoint(sessionId);
+            var snapshot = TerminalSnapshotV1.Parser.ParseFrom(checkpoint.SnapshotPlaintext);
+            SnapshotCrypto.ValidateSnapshotForProducer(snapshot);
+            Require(result.SnapshotEligible &&
+                snapshot.PrimaryScreen.ScrollTop == 1 && snapshot.PrimaryScreen.ScrollBottom == 3 &&
+                snapshot.AlternateScreen.ScrollTop == 1 && snapshot.AlternateScreen.ScrollBottom == 3,
+                "The producer did not publish active DECSTBM margins in its portable snapshot.");
+        }
+
+        private static void ValidatePresentationMetadataSnapshot(
+            ProductionTerminalHistoryProducer producer,
+            Guid sessionId)
+        {
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                sessionId,
+                1,
+                Encoding.UTF8.GetBytes(
+                    "\u001b]4;2;#123456\u0007")));
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Title,
+                sessionId,
+                2,
+                LocalPayloadCodec.Title("Structured title")));
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                sessionId,
+                3,
+                Encoding.UTF8.GetBytes("!\u001b[H")));
+            var result = producer.ProcessSession(sessionId);
+            var checkpoint = producer.LoadCheckpoint(sessionId);
+            var snapshot = TerminalSnapshotV1.Parser.ParseFrom(checkpoint.SnapshotPlaintext);
+            SnapshotCrypto.ValidateSnapshotForProducer(snapshot);
+            Require(result.SnapshotEligible && snapshot.Title == "Structured title" &&
+                snapshot.Palette.ColorsRgb[2] == 0x00123456 &&
+                snapshot.HyperlinkTable.Count == 0 &&
+                snapshot.StyleTable.All(value => value.HyperlinkIndexPlusOne == 0),
+                "The producer dropped title/palette state or fabricated a hyperlink table: " +
+                snapshot.Title + "/" + snapshot.Palette.ColorsRgb[2] + "/" +
+                snapshot.HyperlinkTable.Count + "/" +
+                string.Join(",", snapshot.StyleTable.Select(value => value.HyperlinkIndexPlusOne)));
+        }
+
+        private static void ValidateTermuxProfileFailures(
+            ProductionTerminalHistoryProducer producer,
+            Guid firstSessionId)
+        {
+            var hyperlinkSession = firstSessionId;
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                hyperlinkSession,
+                1,
+                Encoding.UTF8.GetBytes(
+                    "\u001b]8;id=docs;https://example.test/docs\u001b\\link\u001b]8;;\u001b\\\u001b[H")));
+            RequireRejected(producer, hyperlinkSession, "TERMUX_HYPERLINK_UNSUPPORTED");
+
+            var graphemeSession = IncrementGuid(firstSessionId, 1);
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                graphemeSession,
+                1,
+                Encoding.UTF8.GetBytes("A" + string.Concat(Enumerable.Repeat("\u0301", 16)) + "\u001b[H")));
+            RequireRejected(producer, graphemeSession, "TERMUX_GRAPHEME_UNSUPPORTED");
+
+            var savedWrapSession = IncrementGuid(firstSessionId, 2);
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                savedWrapSession,
+                1,
+                Encoding.UTF8.GetBytes("\u001b7\u001b[?7l")));
+            RequireRejected(producer, savedWrapSession, "TERMUX_SAVED_AUTOWRAP_UNREPRESENTABLE");
+
+            var savedPendingSession = IncrementGuid(firstSessionId, 3);
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Resize,
+                savedPendingSession,
+                1,
+                LocalPayloadCodec.Resize(4, 2)));
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                savedPendingSession,
+                2,
+                Encoding.UTF8.GetBytes("1234\u001b7\u001b[H")));
+            RequireRejected(producer, savedPendingSession, "TERMUX_SAVED_PENDING_WRAP_UNREPRESENTABLE");
+
+            var styleSession = IncrementGuid(firstSessionId, 4);
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Resize,
+                styleSession,
+                1,
+                LocalPayloadCodec.Resize(512, 3)));
+            var styled = new StringBuilder();
+            for (var index = 0; index < 1_025; index++)
+            {
+                styled.Append("\u001b[38;2;")
+                    .Append((index >> 16) & 0xff).Append(';')
+                    .Append((index >> 8) & 0xff).Append(';')
+                    .Append(index & 0xff).Append("mX");
+            }
+            styled.Append("\u001b[0m\u001b[H");
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                styleSession,
+                2,
+                Encoding.UTF8.GetBytes(styled.ToString())));
+            RequireRejected(producer, styleSession, "TERMUX_STYLE_TABLE_LIMIT_EXCEEDED");
+
+            var spacingMarkSession = IncrementGuid(firstSessionId, 5);
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                spacingMarkSession,
+                1,
+                Encoding.UTF8.GetBytes("A\u0903\u001b[H")));
+            RequireRejected(producer, spacingMarkSession, "TERMUX_GRAPHEME_UNSUPPORTED");
+
+            var clearedTabsSession = IncrementGuid(firstSessionId, 6);
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                clearedTabsSession,
+                1,
+                Encoding.UTF8.GetBytes("\u001b[3g\u001b[H")));
+            RequireRejected(producer, clearedTabsSession, "TERMUX_TAB_STOP_STATE_UNREPRESENTABLE");
+
+            var hiddenTabSession = IncrementGuid(firstSessionId, 7);
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                hiddenTabSession,
+                1,
+                Encoding.UTF8.GetBytes("\u001b[1;17H\u001b[g")));
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Resize,
+                hiddenTabSession,
+                2,
+                LocalPayloadCodec.Resize(10, 24)));
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                hiddenTabSession,
+                3,
+                Encoding.UTF8.GetBytes("\u001b[H")));
+            RequireRejected(producer, hiddenTabSession, "TERMUX_TAB_STOP_STATE_UNREPRESENTABLE");
+
+            var unusedHyperlinkSession = Guid.Parse("cccccccc-dddd-4eee-8fff-000000000001");
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                unusedHyperlinkSession,
+                1,
+                Encoding.UTF8.GetBytes(
+                    "\u001b]8;id=unused;https://example.test/unused\u001b\\\u001b]8;;\u001b\\X\u001b[H")));
+            RequireRejected(producer, unusedHyperlinkSession, "TERMUX_HYPERLINK_UNSUPPORTED");
+        }
+
+        private static void ValidateSavedCursorStateAndAlternateProfile(
+            ProductionTerminalHistoryProducer producer,
+            Guid firstSessionId)
+        {
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                firstSessionId,
+                1,
+                Encoding.UTF8.GetBytes("\u001b(0\u001b7\u001b(B\u001b[H")));
+            var saved = producer.ProcessSession(firstSessionId);
+            var savedSnapshot = TerminalSnapshotV1.Parser.ParseFrom(
+                producer.LoadCheckpoint(firstSessionId).SnapshotPlaintext);
+            Require(saved.SnapshotEligible &&
+                savedSnapshot.PrimaryScreen.Charset.G0 == TerminalCharsetV1.Ascii &&
+                savedSnapshot.PrimaryScreen.SavedCursor.Charset.G0 == TerminalCharsetV1.DecSpecialGraphics,
+                "Producer substituted current charset for the saved cursor charset.");
+
+            var incompatible47 = IncrementGuid(firstSessionId, 1);
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                incompatible47,
+                1,
+                Encoding.UTF8.GetBytes("\u001b[2;2H\u001b7\u001b[H\u001b[?47h")));
+            RequireRejected(producer, incompatible47, "TERMUX_DUAL_SCREEN_CURSOR_UNSUPPORTED");
+
+            var compatible1049 = IncrementGuid(firstSessionId, 2);
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                compatible1049,
+                1,
+                Encoding.UTF8.GetBytes("\u001b[2;2H\u001b[?1049h")));
+            var alternate = producer.ProcessSession(compatible1049);
+            var alternateSnapshot = TerminalSnapshotV1.Parser.ParseFrom(
+                producer.LoadCheckpoint(compatible1049).SnapshotPlaintext);
+            Require(alternate.SnapshotEligible && alternateSnapshot.ActiveScreen == TerminalScreenKindV1.Alternate &&
+                alternateSnapshot.PrimaryScreen.Cursor.Equals(alternateSnapshot.PrimaryScreen.SavedCursor),
+                "A lossless 1049 alternate-screen state was not accepted exactly.");
+
+            var savedOrigin = IncrementGuid(firstSessionId, 3);
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                savedOrigin,
+                1,
+                Encoding.UTF8.GetBytes("\u001b[3;10r\u001b[?6h\u001b[2;1H\u001b7\u001b[?6l\u001b[H")));
+            var originResult = producer.ProcessSession(savedOrigin);
+            var originSnapshot = TerminalSnapshotV1.Parser.ParseFrom(
+                producer.LoadCheckpoint(savedOrigin).SnapshotPlaintext);
+            Require(originResult.SnapshotEligible &&
+                originSnapshot.PrimaryScreen.ScrollTop == 2 &&
+                originSnapshot.PrimaryScreen.SavedCursor.OriginMode &&
+                originSnapshot.PrimaryScreen.SavedCursor.Row == 3,
+                "Producer did not convert a relative origin-mode saved row to Termux's absolute row.");
+        }
+
+        private static void ValidateArtifactSizeFailure(
+            ProductionTerminalHistoryProducer producer,
+            Guid sessionId)
+        {
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Resize,
+                sessionId,
+                1,
+                LocalPayloadCodec.Resize(512, 2)));
+            var output = new StringBuilder();
+            var grapheme = "A\u0301\u0301";
+            for (var row = 0; row < 202; row++)
+            {
+                for (var column = 0; column < 512; column++) output.Append(grapheme);
+                output.Append("\r\n");
+            }
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                sessionId,
+                2,
+                Encoding.UTF8.GetBytes(output.ToString())));
+            RequireRejected(producer, sessionId, "TRANSCRIPT_OBJECT_LIMIT_EXCEEDED");
+        }
+
+        private static void RequireRejected(
+            ProductionTerminalHistoryProducer producer,
+            Guid sessionId,
+            string expectedCode)
+        {
+            var result = producer.ProcessSession(sessionId);
+            var checkpoint = producer.LoadCheckpoint(sessionId);
+            Require(!result.SnapshotEligible && result.IneligibilityCode == expectedCode &&
+                checkpoint != null && !checkpoint.SnapshotEligible && checkpoint.SnapshotPlaintext == null,
+                "Producer did not fail closed with " + expectedCode + ": " + result.IneligibilityCode + ".");
+        }
+
+        private static Guid IncrementGuid(Guid value, byte increment)
+        {
+            var bytes = value.ToByteArray();
+            bytes[15] = checked((byte)(bytes[15] + increment));
+            return new Guid(bytes);
+        }
+
         private static void ValidateCheckpointAndOutbox(ProductionTerminalHistoryProducer producer, Guid sessionId)
         {
             var checkpoint = producer.LoadCheckpoint(sessionId);
@@ -498,6 +1636,11 @@ namespace TermLink.ProductionTerminalHistory.Validation
                     (left, right) => left.LineId < right.LineId).All(value => value) &&
                 snapshot.NextTranscriptLineId == snapshot.PrimaryScreen.VisibleRows[^1].LineId + 1,
                 "Primary line IDs are not stable and monotonic.");
+            Require(snapshot.PrimaryScreen.VisibleRows
+                    .SelectMany(value => value.Runs)
+                    .Any(value => value.Repeat > 1 && value.Grapheme.Length == 0 &&
+                        value.DisplayWidth == 1 && !value.WideContinuation),
+                "Snapshot rows did not use the canonical empty-grapheme RLE form for blank cells.");
             Require(snapshot.PrimaryScreen.Charset.Gr == 0 &&
                 snapshot.PrimaryScreen.Cursor.Charset.Gr == 0 &&
                 snapshot.PrimaryScreen.SavedCursor.Charset.Gr == 0 &&
@@ -691,12 +1834,12 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 LocalFrameType.Output,
                 sessionId,
                 3,
-                Encoding.UTF8.GetBytes("\u001bP1;2|unsupported\u001b\\")));
+                Encoding.UTF8.GetBytes("\u001bPq#0;2;0;0;0~\u001b\\")));
             var rejected = producer.ProcessSession(sessionId);
             var retained = producer.LoadOutbox(sessionId);
             var retry = producer.PrepareNextUpload(sessionId, recipient);
             Require(!rejected.SnapshotEligible && rejected.PermanentlyIneligible &&
-                rejected.IneligibilityCode == "DCS_UNSUPPORTED" &&
+                rejected.IneligibilityCode == "DCS_SIXEL_UNSUPPORTED" &&
                 retained.SnapshotSequence == eligible.LastSequence &&
                 retry != null && retry.SealedObject.SequenceEqual(pending.SealedObject),
                 "A newer rejected prefix stranded or replaced an incomplete older terminal outbox.");

@@ -1,6 +1,9 @@
+#requires -Version 7.0
+
 [CmdletBinding()]
 param(
     [string]$DotNetPath = (Join-Path $env:TEMP 'termlink-dotnet-sdk-8.0.303\dotnet.exe'),
+    [string]$CargoPath = 'D:\Dev\Env\Rust\cargo\bin\cargo.exe',
     [string]$EvidencePath = (Join-Path $PSScriptRoot '..\..\docs\validation\phase1-windows-setup.json'),
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
     [string]$Version = '0.1.2.0',
@@ -16,6 +19,8 @@ function Assert-True {
     param([bool]$Condition, [string]$Message)
     if (-not $Condition) { throw $Message }
 }
+
+Assert-True (Test-Path -LiteralPath $CargoPath -PathType Leaf) "Cargo executable not found: $CargoPath"
 
 function Invoke-Setup {
     param(
@@ -128,12 +133,14 @@ try {
         -Development `
         -UpdateChannel $UpdateChannel `
         -DotNetPath $DotNetPath `
+        -CargoPath $CargoPath `
         -OutputPath $setupPath)
     # Build-Setup emits tool progress for interactive callers. Select the final
     # summary object instead of relying on pipeline cardinality.
     $result = @($buildOutput | Where-Object {
         $_ -is [psobject] -and $_.PSObject.Properties['SetupPath'] -and
-        $_.PSObject.Properties['SelfContained'] -and $_.PSObject.Properties['EmbeddedPayload']
+        $_.PSObject.Properties['SelfContained'] -and $_.PSObject.Properties['EmbeddedPayload'] -and
+        $_.PSObject.Properties['SignedPayloadBinaries']
     } | Select-Object -Last 1)
     Assert-True (Test-Path -LiteralPath $setupPath -PathType Leaf) 'The single-file setup executable was not created.'
     Assert-True ($result.Count -eq 1 -and [bool]$result[0].SelfContained -and [bool]$result[0].EmbeddedPayload) `
@@ -149,6 +156,8 @@ try {
         'TermLink.Legacy.exe',
         'TermLink.Updater.exe',
         'TermLink.Agent.dll',
+        'TermLink.TerminalCore.dll',
+        'termlink_terminal_ffi.dll',
         'TermLink.UpdatePublisher.cer',
         'TermLink.Uninstall.exe',
         'coreclr.dll',
@@ -170,6 +179,28 @@ try {
     Assert-True ($installedProductExecutables.Count -eq $expectedProductExecutables.Count -and
         @($installedProductExecutables | Where-Object { $expectedProductExecutables -cnotcontains $_ }).Count -eq 0) `
         "Installed setup contains an unexpected product executable: $($installedProductExecutables -join ', ')"
+    $signedPayloadBinaries = @(Get-ChildItem -LiteralPath $installRoot -File |
+        Where-Object {
+            ($_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' -or
+                $_.Name -ceq 'termlink_terminal_ffi.dll') -and
+            $_.Name -cne 'TermLink.Uninstall.exe'
+        } |
+        Sort-Object Name)
+    Assert-True ($signedPayloadBinaries.Count -eq [int]$result[0].SignedPayloadBinaries) `
+        'Installed signed payload binary count differs from the setup build.'
+    $acceptedSignatureStatuses = @(
+        [Management.Automation.SignatureStatus]::Valid,
+        [Management.Automation.SignatureStatus]::UnknownError,
+        [Management.Automation.SignatureStatus]::NotTrusted
+    )
+    foreach ($binary in $signedPayloadBinaries) {
+        $signature = Get-AuthenticodeSignature -LiteralPath $binary.FullName
+        Assert-True ($null -ne $signature.SignerCertificate -and
+            [string]::Equals($signature.SignerCertificate.Thumbprint, $certificate.Thumbprint,
+                [StringComparison]::OrdinalIgnoreCase) -and
+            $acceptedSignatureStatuses -contains $signature.Status) `
+            "Installed payload binary signature is invalid: $($binary.Name) ($($signature.Status))"
+    }
     $trayAssemblyPath = Join-Path $installRoot 'TermLink.dll'
     Assert-True (Test-Path -LiteralPath $trayAssemblyPath -PathType Leaf) `
         'Installed setup payload is missing: TermLink.dll'

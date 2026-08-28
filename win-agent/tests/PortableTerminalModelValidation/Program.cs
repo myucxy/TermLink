@@ -27,10 +27,18 @@ namespace TermLink.PortableTerminalModel.Validation
                 var repositoryRoot = ParseRepositoryRoot(args);
                 ValidateSupportedSnapshotRoundTrip();
                 ValidateIncompleteBoundariesAndRejections();
+                ValidateTopBottomScrollMargins();
+                ValidateEditingModesTabsAndAlternateScreen();
                 ValidateCodexControlAndColorCompatibility();
                 ValidateUnicodeWidthAndCombining();
                 ValidateOscControlStrings();
                 ValidateClearCursorAndResizeContracts();
+                ValidateParserInterruptAndDcsContracts();
+                ValidateSavedCursorAndAlternateContracts();
+                ValidateMarginRectangleAndEraseContracts();
+                ValidateTabAndCharsetContracts();
+                ValidateResizeAndScrollbackInvariants();
+                ValidateOscSafetyLimits();
                 var golden = ValidateGoldenStreams(repositoryRoot);
                 Console.WriteLine(
                     "Portable terminal model validation passed. " +
@@ -93,7 +101,7 @@ namespace TermLink.PortableTerminalModel.Validation
                 "A split CJK scalar was not represented as one width-two grapheme.");
 
             RequireRejected("DCS_UNSUPPORTED", Bytes("\u001bP1;2|data\u001b\\"));
-            RequireRejected("CSI_FINAL_UNSUPPORTED", Bytes("\u001b[2;3r"));
+            RequireRejected("DCS_SIXEL_UNSUPPORTED", Bytes("\u001bPq#0;2;0;0;0~\u001b\\"));
             RequireRejected("C0_CONTROL_UNSUPPORTED", new byte[] { 0x01 });
             RequireRejected("INVALID_UTF8", new byte[] { 0xE0, 0x80, 0x80 });
             RequireRejected("INVALID_UTF8", new byte[] { 0xED, 0xA0, 0x80 });
@@ -110,6 +118,32 @@ namespace TermLink.PortableTerminalModel.Validation
             gap.AdvanceNonTerminalEvent(2);
             Require(gap.PermanentRejectionCode == "SEQUENCE_NOT_CONTIGUOUS",
                 "A non-contiguous producer sequence remained eligible.");
+        }
+
+        private static void ValidateTopBottomScrollMargins()
+        {
+            var model = new PortableTerminalModelV1(6, 5);
+            model.ApplyOutput(1, Bytes("0\r\n1\r\n2\r\n3\r\n4"));
+            model.ApplyOutput(2, Bytes("\u001b[2;4r\u001b[4;1H\n"));
+            Require(model.TryCreateSnapshot(out var snapshot),
+                "DECSTBM made a common terminal stream permanently ineligible.");
+            Require(snapshot.ScrollTop == 1 && snapshot.ScrollBottomExclusive == 4,
+                "DECSTBM margins were not retained in the portable checkpoint.");
+            Require(snapshot.ScreenRows[0].Cells[0].Character == "0" &&
+                snapshot.ScreenRows[1].Cells[0].Character == "2" &&
+                snapshot.ScreenRows[2].Cells[0].Character == "3" &&
+                snapshot.ScreenRows[3].Cells[0].Character == " " &&
+                snapshot.ScreenRows[4].Cells[0].Character == "4",
+                "A line feed did not scroll only the configured vertical region.");
+
+            var restored = PortableTerminalModelV1.Restore(snapshot);
+            model.ApplyOutput(3, Bytes("X\u001b[r\u001b[5;1HY"));
+            restored.ApplyOutput(3, Bytes("X\u001b[r\u001b[5;1HY"));
+            Require(model.ValidationFingerprint() == restored.ValidationFingerprint(),
+                "DECSTBM state diverged after checkpoint restoration.");
+            Require(restored.TryCreateSnapshot(out var reset) &&
+                reset.ScrollTop == 0 && reset.ScrollBottomExclusive == 5,
+                "CSI r did not restore the full-screen scrolling region.");
         }
 
         private static void ValidateCodexControlAndColorCompatibility()
@@ -145,6 +179,75 @@ namespace TermLink.PortableTerminalModel.Validation
             restored.ApplyOutput(4, Bytes("!"));
             Require(model.ValidationFingerprint() == restored.ValidationFingerprint(),
                 "Codex modes/colors diverged after checkpoint restoration.");
+        }
+
+        private static void ValidateEditingModesTabsAndAlternateScreen()
+        {
+            var characters = new PortableTerminalModelV1(10, 5);
+            characters.ApplyOutput(1, Bytes("abcdef\u001b[1;3H\u001b[2@XY\u001b[1;5H\u001b[2P\u001b[1;9H\u001b[2X"));
+            Require(characters.TryCreateSnapshot(out var characterSnapshot) &&
+                RowText(characterSnapshot.ScreenRows[0]) == "abXYef    ",
+                "ICH/DCH/ECH did not preserve Windows Terminal character-edit semantics.");
+
+            var lines = new PortableTerminalModelV1(6, 5);
+            lines.ApplyOutput(1, Bytes("0\r\n1\r\n2\r\n3\r\n4"));
+            lines.ApplyOutput(2, Bytes("\u001b[2;4r\u001b[3;1H\u001b[LX\u001b[M\u001b[S\u001b[T"));
+            Require(lines.TryCreateSnapshot(out var lineSnapshot) &&
+                lineSnapshot.ScrollTop == 1 && lineSnapshot.ScrollBottomExclusive == 4,
+                "IL/DL/SU/SD rejected a valid scrolling-region stream.");
+
+            var modes = new PortableTerminalModelV1(8, 5);
+            modes.ApplyOutput(1, Bytes(
+                "\u001b[2;4r\u001b[?6h\u001b[2;2H" +
+                "\u001b[4hAB\u001b[4l" +
+                "\u001b[?7l\u001b[1;8HXY\u001b[?7h" +
+                "\u001b7\u001b[4;4HZ\u001b8Q"));
+            Require(modes.TryCreateSnapshot(out var modeSnapshot) &&
+                modeSnapshot.OriginMode && modeSnapshot.AutoWrap && !modeSnapshot.InsertMode &&
+                modeSnapshot.CursorRow == 1 && modeSnapshot.PendingAutoWrap,
+                "Origin/insert/autowrap or DECSC/DECRC state was not modeled.");
+
+            var tabs = new PortableTerminalModelV1(16, 4);
+            tabs.ApplyOutput(1, Bytes("\u001b[3g\u001b[1;5H\u001bH\r\tA\u001b[1;5H\u001b[g\r\tB"));
+            Require(tabs.TryCreateSnapshot(out var tabSnapshot) &&
+                tabSnapshot.TabStops.Count == 0 &&
+                tabSnapshot.ScreenRows[0].Cells[4].Character == "A" &&
+                tabSnapshot.ScreenRows[0].Cells[15].Character == "B",
+                "HTS/TBC did not update the dynamic tab-stop bitmap.");
+
+            var alternate = new PortableTerminalModelV1(8, 4);
+            alternate.ApplyOutput(1, Bytes("main\u001b[?1049halt"));
+            Require(alternate.TryCreateSnapshot(out var alternateSnapshot) &&
+                alternateSnapshot.ActiveAlternateScreen &&
+                RowText(alternateSnapshot.ScreenRows[0]).StartsWith("main", StringComparison.Ordinal) &&
+                RowText(alternateSnapshot.AlternateScreenRows[0]).Substring(4).StartsWith("alt", StringComparison.Ordinal),
+                "DECSET 1049 did not preserve independent primary and alternate grids.");
+            var resumed = PortableTerminalModelV1.Restore(alternateSnapshot);
+            alternate.ApplyOutput(2, Bytes("\u001b[?1049lX"));
+            resumed.ApplyOutput(2, Bytes("\u001b[?1049lX"));
+            Require(alternate.ValidationFingerprint() == resumed.ValidationFingerprint() &&
+                resumed.TryCreateSnapshot(out var restored) &&
+                !restored.ActiveAlternateScreen &&
+                RowText(restored.ScreenRows[0]).StartsWith("mainX", StringComparison.Ordinal),
+                "DECRST 1049 did not restore the primary cursor and grid after checkpoint restore.");
+
+            var charset = new PortableTerminalModelV1(12, 4);
+            charset.ApplyOutput(1, Bytes("\u001b(0lqqk\u001b(B \u001b)0\u000ex\u000f"));
+            Require(charset.TryCreateSnapshot(out var charsetSnapshot) &&
+                RowText(charsetSnapshot.ScreenRows[0]).StartsWith("┌──┐ │", StringComparison.Ordinal) &&
+                charsetSnapshot.LineDrawingG1 && charsetSnapshot.CharsetGl == 0,
+                "DEC special graphics designation or SI/SO selection was not preserved.");
+
+            var rectangles = new PortableTerminalModelV1(8, 4);
+            rectangles.ApplyOutput(1, Bytes(
+                "\u001b[35;1;2;2;4$x" +
+                "\u001b[2;3;2;3$z" +
+                "\u001b[1;2;1;4;1;3;5;1$v"));
+            Require(rectangles.TryCreateSnapshot(out var rectangleSnapshot) &&
+                RowText(rectangleSnapshot.ScreenRows[0]) == " ###    " &&
+                RowText(rectangleSnapshot.ScreenRows[1]) == " # #    " &&
+                RowText(rectangleSnapshot.ScreenRows[2]) == "    ### ",
+                "DECFRA/DECERA/DECCRA did not produce the expected rectangular grid edits.");
         }
 
         private static void ValidateUnicodeWidthAndCombining()
@@ -215,7 +318,8 @@ namespace TermLink.PortableTerminalModel.Validation
             bel.ApplyOutput(1, Bytes("A\u001b]0;中文标题\u0007B"));
             Require(bel.SnapshotEligible && bel.TryCreateSnapshot(out var belSnapshot) &&
                 belSnapshot.ScreenRows[0].Cells[0].Character == "A" &&
-                belSnapshot.ScreenRows[0].Cells[1].Character == "B",
+                belSnapshot.ScreenRows[0].Cells[1].Character == "B" &&
+                belSnapshot.Title == "中文标题",
                 "A BEL-terminated OSC title swallowed following terminal output.");
 
             var st = new PortableTerminalModelV1(12, 4);
@@ -251,6 +355,26 @@ namespace TermLink.PortableTerminalModel.Validation
                 "A chunked UTF-8 OSC title did not resume ordinary output after ST.");
 
             RequireRejected("INVALID_UTF8", new byte[] { 0x1B, (byte)']', (byte)'0', (byte)';', 0xE0, 0x80, 0x80 });
+
+            var presentation = new PortableTerminalModelV1(12, 4);
+            presentation.ApplyOutput(1, Bytes(
+                "\u001b]4;1;rgb:ff/22/33\u0007" +
+                "\u001b]10;#abcdef\u001b\\" +
+                "\u001b]8;id=docs;https://example.test/docs\u001b\\link" +
+                "\u001b]8;;\u001b\\"));
+            Require(presentation.TryCreateSnapshot(out var presentationSnapshot) &&
+                presentationSnapshot.PaletteRgb[1] == 0x00ff2233 &&
+                presentationSnapshot.DefaultForegroundRgb == 0x00abcdef &&
+                presentationSnapshot.Hyperlinks.Count == 1 &&
+                presentationSnapshot.Hyperlinks[0].Uri == "https://example.test/docs" &&
+                presentationSnapshot.ScreenRows[0].Cells[0].Style.HyperlinkIndexPlusOne == 1 &&
+                presentationSnapshot.CurrentStyle.HyperlinkIndexPlusOne == 0,
+                "OSC palette/default color or hyperlink state was not retained.");
+            var restoredPresentation = PortableTerminalModelV1.Restore(presentationSnapshot);
+            presentation.ApplyOutput(2, Bytes("!"));
+            restoredPresentation.ApplyOutput(2, Bytes("!"));
+            Require(presentation.ValidationFingerprint() == restoredPresentation.ValidationFingerprint(),
+                "OSC presentation state diverged after checkpoint restoration.");
         }
 
         private static void ValidateClearCursorAndResizeContracts()
@@ -269,10 +393,319 @@ namespace TermLink.PortableTerminalModel.Validation
                 "Erase-in-line did not preserve the prefix and clear the requested suffix.");
 
             var reflow = new PortableTerminalModelV1(5, 3);
-            reflow.ApplyOutput(1, Bytes("content"));
+            reflow.ApplyOutput(1, Bytes("content中!"));
             reflow.ApplyResize(2, 6, 4);
-            Require(reflow.PermanentRejectionCode == "RESIZE_REFLOW_UNSUPPORTED",
-                "A resize requiring reflow incorrectly remained eligible.");
+            Require(reflow.TryCreateSnapshot(out var reflowed) &&
+                reflowed.Columns == 6 && reflowed.Rows == 4 &&
+                RowText(reflowed.ScreenRows[0]) == "conten" && reflowed.ScreenRows[0].Wrapped &&
+                reflowed.ScreenRows[1].Cells[1].Character == "中" &&
+                reflowed.ScreenRows[1].Cells[1].DisplayWidth == 2 &&
+                reflowed.ScreenRows[1].Cells[2].WideContinuation,
+                "A non-empty resize did not reflow text and wide graphemes safely.");
+            var restored = PortableTerminalModelV1.Restore(reflowed);
+            reflow.ApplyOutput(3, Bytes("?"));
+            restored.ApplyOutput(3, Bytes("?"));
+            Require(reflow.ValidationFingerprint() == restored.ValidationFingerprint(),
+                "A reflowed checkpoint diverged after suffix replay.");
+        }
+
+        private static void ValidateParserInterruptAndDcsContracts()
+        {
+            var crossEventCan = new PortableTerminalModelV1(8, 4);
+            crossEventCan.ApplyOutput(1, Bytes("\u001bP1;2"));
+            Require(crossEventCan.PermanentRejectionCode.Length == 0 &&
+                crossEventCan.ParserBoundaryCode == "INCOMPLETE_DCS",
+                "A split DCS identifier was not retained as a temporary boundary before CAN.");
+            crossEventCan.ApplyOutput(2, Bytes("\u0018X"));
+            Require(crossEventCan.TryCreateSnapshot(out var crossEventCanSnapshot) &&
+                crossEventCanSnapshot.ScreenRows[0].Cells[0].Character == "X",
+                "CAN did not cancel an incomplete DCS across ApplyOutput events.");
+
+            var crossEventSub = new PortableTerminalModelV1(8, 4);
+            crossEventSub.ApplyOutput(1, Bytes("\u001bP1;2"));
+            Require(crossEventSub.PermanentRejectionCode.Length == 0 &&
+                crossEventSub.ParserBoundaryCode == "INCOMPLETE_DCS",
+                "A split DCS identifier was not retained as a temporary boundary before SUB.");
+            crossEventSub.ApplyOutput(2, Bytes("\u001aY"));
+            Require(crossEventSub.TryCreateSnapshot(out var crossEventSubSnapshot) &&
+                crossEventSubSnapshot.ScreenRows[0].Cells[0].Character == "Y",
+                "SUB did not cancel an incomplete DCS across ApplyOutput events.");
+
+            var crossEventEscape = new PortableTerminalModelV1(8, 4);
+            crossEventEscape.ApplyOutput(1, Bytes("A\u001bP1;2"));
+            Require(crossEventEscape.PermanentRejectionCode.Length == 0 &&
+                crossEventEscape.ParserBoundaryCode == "INCOMPLETE_DCS",
+                "A split DCS identifier was not retained as a temporary boundary before ESC.");
+            crossEventEscape.ApplyOutput(2, Bytes("\u001b[2JX"));
+            Require(crossEventEscape.TryCreateSnapshot(out var crossEventEscapeSnapshot) &&
+                crossEventEscapeSnapshot.ScreenRows[0].Cells[0].Character == " " &&
+                crossEventEscapeSnapshot.ScreenRows[0].Cells[1].Character == "X",
+                "ESC did not terminate an incomplete DCS across ApplyOutput events.");
+
+            var crossEventFinal = new PortableTerminalModelV1(8, 4);
+            crossEventFinal.ApplyOutput(1, Bytes("\u001bP1;2"));
+            Require(crossEventFinal.PermanentRejectionCode.Length == 0 &&
+                crossEventFinal.ParserBoundaryCode == "INCOMPLETE_DCS",
+                "A split DCS identifier was rejected before its final byte arrived.");
+            crossEventFinal.ApplyOutput(2, Bytes("|"));
+            Require(crossEventFinal.PermanentRejectionCode == "DCS_UNSUPPORTED" &&
+                crossEventFinal.PermanentRejectionSequence == 2,
+                "An unsupported DCS final arriving in a later event was not rejected permanently.");
+            crossEventFinal.ApplyOutput(3, Bytes("\u0018Z"));
+            Require(crossEventFinal.PermanentRejectionCode == "DCS_UNSUPPORTED" &&
+                !crossEventFinal.TryCreateSnapshot(out _),
+                "CAN incorrectly cleared a permanent rejection after a DCS final was recognized.");
+
+            var can = new PortableTerminalModelV1(8, 4);
+            can.ApplyOutput(1, Bytes("\u001bP1;2\u0018X"));
+            Require(can.TryCreateSnapshot(out var canSnapshot) &&
+                canSnapshot.ScreenRows[0].Cells[0].Character == "X",
+                "CAN did not cancel an in-progress DCS from anywhere.");
+
+            var sub = new PortableTerminalModelV1(8, 4);
+            sub.ApplyOutput(1, Bytes("\u001bP1;2\u001aY"));
+            Require(sub.TryCreateSnapshot(out var subSnapshot) &&
+                subSnapshot.ScreenRows[0].Cells[0].Character == "Y",
+                "SUB did not cancel an in-progress DCS from anywhere.");
+
+            var dcsEscape = new PortableTerminalModelV1(8, 4);
+            dcsEscape.ApplyOutput(1, Bytes("A\u001bP1;2\u001b[2JX"));
+            Require(dcsEscape.TryCreateSnapshot(out var dcsEscapeSnapshot) &&
+                dcsEscapeSnapshot.ScreenRows[0].Cells[0].Character == " " &&
+                dcsEscapeSnapshot.ScreenRows[0].Cells[1].Character == "X",
+                "ESC inside DCS did not start a fresh escape sequence.");
+
+            var oscEscape = new PortableTerminalModelV1(8, 4);
+            oscEscape.ApplyOutput(1, Bytes("A\u001b]2;bad\u001b[2JX"));
+            Require(oscEscape.TryCreateSnapshot(out var oscEscapeSnapshot) &&
+                oscEscapeSnapshot.Title.Length == 0 &&
+                oscEscapeSnapshot.ScreenRows[0].Cells[0].Character == " " &&
+                oscEscapeSnapshot.ScreenRows[0].Cells[1].Character == "X",
+                "A non-ST ESC inside OSC did not start a fresh escape sequence.");
+
+            var xtGetTcap = new PortableTerminalModelV1(8, 4);
+            xtGetTcap.ApplyOutput(1, Bytes("\u001bP+q544e\u001b\\Z"));
+            Require(xtGetTcap.PermanentRejectionCode == "DCS_UNSUPPORTED",
+                "XTGETTCAP DCS +q was misclassified as SIXEL.");
+        }
+
+        private static void ValidateSavedCursorAndAlternateContracts()
+        {
+            var originCharset = new PortableTerminalModelV1(8, 5);
+            originCharset.ApplyOutput(1, Bytes(
+                "\u001b[2;4r\u001b[?6h\u001b[2;2H\u001b(0\u001b7" +
+                "\u001b(B\u001b[?6l\u001b8\u001b[Hq"));
+            Require(originCharset.TryCreateSnapshot(out var originSnapshot) &&
+                originSnapshot.SavedCursorOriginMode && originSnapshot.SavedCursorLineDrawingG0 &&
+                originSnapshot.SavedCursorCharsetGl == 0 && originSnapshot.OriginMode &&
+                originSnapshot.ScreenRows[1].Cells[0].Character == "─",
+                "DECSC/DECRC did not restore origin-relative position and DEC charset state.");
+
+            var delayedWrap = new PortableTerminalModelV1(3, 3);
+            delayedWrap.ApplyOutput(1, Bytes("ABC\u001b7\r\u001b8X"));
+            Require(delayedWrap.TryCreateSnapshot(out var delayedSnapshot) &&
+                delayedSnapshot.SavedCursorPendingAutoWrap &&
+                delayedSnapshot.ScreenRows[1].Cells[0].Character == "X",
+                "DECSC/DECRC did not restore delayed EOL wrap.");
+
+            var savedAutoWrap = new PortableTerminalModelV1(4, 3);
+            savedAutoWrap.ApplyOutput(1, Bytes("\u001b[?7l\u001b7\u001b[?7h\u001b8"));
+            Require(savedAutoWrap.TryCreateSnapshot(out var autoWrapSnapshot) &&
+                !autoWrapSnapshot.SavedCursorAutoWrap && autoWrapSnapshot.AutoWrap,
+                "Saved-cursor DECAWM metadata was lost or DECRC incorrectly restored DECAWM.");
+
+            var alternate = new PortableTerminalModelV1(8, 5);
+            alternate.ApplyOutput(1, Bytes(
+                "\u001b[2;4r\u001b[3;4H\u001b[31;1m\u001b[?1049hX"));
+            Require(alternate.TryCreateSnapshot(out var alternateSnapshot) &&
+                alternateSnapshot.ActiveAlternateScreen &&
+                alternateSnapshot.ScrollTop == 1 && alternateSnapshot.AlternateScrollTop == 1 &&
+                alternateSnapshot.ScrollBottomExclusive == 4 &&
+                alternateSnapshot.AlternateScrollBottomExclusive == 4 &&
+                alternateSnapshot.AlternateScreenRows[2].Cells[3].Character == "X" &&
+                alternateSnapshot.AlternateScreenRows[2].Cells[3].Style.Foreground == 1 &&
+                alternateSnapshot.AlternateScreenRows[2].Cells[3].Style.Attributes ==
+                    PortableTerminalAttributesV1.None,
+                "DECSET 1049 did not copy cursor/erase colors or retain global margins.");
+            alternate.ApplyOutput(2, Bytes("\u001b[?1049lY"));
+            Require(alternate.TryCreateSnapshot(out var mainSnapshot) &&
+                mainSnapshot.ScreenRows[2].Cells[3].Character == "Y" &&
+                (mainSnapshot.ScreenRows[2].Cells[3].Style.Attributes &
+                    PortableTerminalAttributesV1.Bold) != 0,
+                "DECRST 1049 did not restore the complete primary saved cursor state.");
+
+            var alternateSaved = new PortableTerminalModelV1(6, 4);
+            alternateSaved.ApplyOutput(1, Bytes(
+                "\u001b[?1049h\u001b[2;2H\u001b7\u001b[?1049l" +
+                "\u001b[?1049h\u001b8Z"));
+            Require(alternateSaved.TryCreateSnapshot(out var alternateSavedSnapshot) &&
+                alternateSavedSnapshot.AlternateScreenRows[1].Cells[1].Character == "Z",
+                "The alternate screen's independent saved cursor state did not survive re-entry.");
+        }
+
+        private static void ValidateMarginRectangleAndEraseContracts()
+        {
+            var movement = new PortableTerminalModelV1(6, 5);
+            movement.ApplyOutput(1, Bytes("\u001b[2;4r\u001b[3;1H\u001b[99BX"));
+            Require(movement.TryCreateSnapshot(out var movementSnapshot) &&
+                movementSnapshot.ScreenRows[3].Cells[0].Character == "X" &&
+                movementSnapshot.ScreenRows[4].Cells[0].Character == " ",
+                "CUD crossed the bottom margin while origin mode was reset.");
+
+            var fill = new PortableTerminalModelV1(5, 5);
+            fill.ApplyOutput(1, Bytes("\u001b[2;3r\u001b[?6h\u001b[88$x"));
+            Require(fill.TryCreateSnapshot(out var fillSnapshot) &&
+                fillSnapshot.ScreenRows[1].Cells[0].Character == "X" &&
+                fillSnapshot.ScreenRows[2].Cells[4].Character == "X" &&
+                fillSnapshot.ScreenRows[0].Cells[0].Character == " " &&
+                fillSnapshot.ScreenRows[3].Cells[0].Character == " ",
+                "Origin-relative DECFRA escaped the vertical margins.");
+
+            var copy = new PortableTerminalModelV1(5, 5);
+            copy.ApplyOutput(1, Bytes(
+                "\u001b[3;4r\u001b[?6h" +
+                "\u001b[65;1;1;1;1$x" +
+                "\u001b[1;1;1;1;1;2;1;1$v"));
+            Require(copy.TryCreateSnapshot(out var copySnapshot) &&
+                copySnapshot.ScreenRows[2].Cells[0].Character == "A" &&
+                copySnapshot.ScreenRows[3].Cells[0].Character == "A" &&
+                copySnapshot.ScreenRows[1].Cells[0].Character == " ",
+                "DECCRA did not apply origin mode to its destination rectangle.");
+
+            var erase = new PortableTerminalModelV1(8, 4);
+            erase.ApplyOutput(1, Bytes(
+                "\u001b]8;;https://example.test\u001b\\\u001b[31;1;4mZ\r\u001b[X"));
+            Require(erase.TryCreateSnapshot(out var eraseSnapshot) &&
+                eraseSnapshot.ScreenRows[0].Cells[0].Character == " " &&
+                eraseSnapshot.ScreenRows[0].Cells[0].Style.Foreground == 1 &&
+                eraseSnapshot.ScreenRows[0].Cells[0].Style.Attributes ==
+                    PortableTerminalAttributesV1.None &&
+                eraseSnapshot.ScreenRows[0].Cells[0].Style.HyperlinkIndexPlusOne == 0,
+                "ECH did not use standard erase attributes.");
+
+            var insertLine = new PortableTerminalModelV1(6, 4);
+            insertLine.ApplyOutput(1, Bytes("\u001b[2;3H\u001b[LX"));
+            Require(insertLine.TryCreateSnapshot(out var insertSnapshot) &&
+                insertSnapshot.ScreenRows[1].Cells[0].Character == "X",
+                "IL did not move the cursor to the left margin.");
+            var deleteLine = new PortableTerminalModelV1(6, 4);
+            deleteLine.ApplyOutput(1, Bytes("\u001b[2;3H\u001b[MY"));
+            Require(deleteLine.TryCreateSnapshot(out var deleteSnapshot) &&
+                deleteSnapshot.ScreenRows[1].Cells[0].Character == "Y",
+                "DL did not move the cursor to the left margin.");
+        }
+
+        private static void ValidateTabAndCharsetContracts()
+        {
+            var clearedTabs = new PortableTerminalModelV1(10, 3);
+            clearedTabs.ApplyOutput(1, Bytes("\u001b[3g"));
+            clearedTabs.ApplyResize(2, 20, 3);
+            clearedTabs.ApplyOutput(3, Bytes("\r\tX"));
+            Require(clearedTabs.TryCreateSnapshot(out var clearedSnapshot) &&
+                !clearedSnapshot.DefaultTabStopsEnabled && clearedSnapshot.TabStops.Count == 0 &&
+                clearedSnapshot.ScreenRows[0].Cells[19].Character == "X",
+                "Resize recreated default tab stops after TBC 3.");
+
+            var offscreenTabs = new PortableTerminalModelV1(20, 3);
+            offscreenTabs.ApplyOutput(1, Bytes("\u001b[3g\u001b[1;16H\u001bH"));
+            offscreenTabs.ApplyResize(2, 10, 3);
+            Require(offscreenTabs.TryCreateSnapshot(out var narrowSnapshot) &&
+                narrowSnapshot.TabStopCapacity == 20 &&
+                narrowSnapshot.TabStops.Contains(15),
+                "Tab-stop capacity or a custom stop was discarded outside the current width.");
+            var restoredTabs = PortableTerminalModelV1.Restore(narrowSnapshot);
+            offscreenTabs.ApplyResize(3, 20, 3);
+            restoredTabs.ApplyResize(3, 20, 3);
+            offscreenTabs.ApplyOutput(4, Bytes("\u001b[1;1H\tX"));
+            restoredTabs.ApplyOutput(4, Bytes("\u001b[1;1H\tX"));
+            Require(offscreenTabs.ValidationFingerprint() == restoredTabs.ValidationFingerprint() &&
+                restoredTabs.TryCreateSnapshot(out var wideTabs) &&
+                wideTabs.ScreenRows[0].Cells[15].Character == "X",
+                "An offscreen custom tab stop did not survive checkpoint and re-expansion.");
+
+            var tabWrap = new PortableTerminalModelV1(3, 3);
+            tabWrap.ApplyOutput(1, Bytes("ABC\tX"));
+            Require(tabWrap.TryCreateSnapshot(out var tabWrapSnapshot) &&
+                tabWrapSnapshot.ScreenRows[1].Cells[0].Character == "X",
+                "HT cleared delayed EOL wrap.");
+
+            var charset = new PortableTerminalModelV1(20, 3);
+            charset.ApplyOutput(1, Bytes("\u001b(0_bcdehi\u001b(B"));
+            Require(charset.TryCreateSnapshot(out var charsetSnapshot) &&
+                RowText(charsetSnapshot.ScreenRows[0]).StartsWith(" ␉␌␍␊␤␋", StringComparison.Ordinal),
+                "The DEC Special Graphics control-picture mappings are incomplete.");
+        }
+
+        private static void ValidateResizeAndScrollbackInvariants()
+        {
+            var cursorVisible = new PortableTerminalModelV1(5, 5);
+            cursorVisible.ApplyOutput(1, Bytes("A"));
+            cursorVisible.ApplyResize(2, 5, 3);
+            Require(cursorVisible.TryCreateSnapshot(out var resized) &&
+                resized.ScrollbackRows.Count == 0 &&
+                resized.ScreenRows[0].Cells[0].Character == "A" && resized.CursorRow == 0,
+                "A height shrink detached the cursor from its logical row.");
+            var restored = PortableTerminalModelV1.Restore(resized);
+            cursorVisible.ApplyOutput(3, Bytes("B"));
+            restored.ApplyOutput(3, Bytes("B"));
+            Require(cursorVisible.ValidationFingerprint() == restored.ValidationFingerprint(),
+                "A cursor-preserving resize did not remain snapshot-restorable.");
+
+            var resizedMargins = new PortableTerminalModelV1(8, 6);
+            resizedMargins.ApplyOutput(1, Bytes("\u001b[2;5r"));
+            resizedMargins.ApplyResize(2, 8, 4);
+            resizedMargins.ApplyResize(3, 8, 7);
+            Require(resizedMargins.TryCreateSnapshot(out var resizedMarginSnapshot) &&
+                resizedMarginSnapshot.ScrollTop == 1 &&
+                resizedMarginSnapshot.ScrollBottomExclusive == 5 &&
+                resizedMarginSnapshot.ConfiguredScrollBottomExclusive == 5,
+                "Resize reset DECSTBM instead of clamping and retaining the global margins.");
+
+            var explicitScroll = new PortableTerminalModelV1(4, 2);
+            explicitScroll.ApplyOutput(1, Bytes("A\r\nB\u001b[S"));
+            Require(explicitScroll.TryCreateSnapshot(out var scrollSnapshot) &&
+                scrollSnapshot.ScrollbackRows.Count == 0 &&
+                scrollSnapshot.ScreenRows[0].Cells[0].Character == "B",
+                "Explicit SU incorrectly appended a row to transcript history.");
+
+            var alternateScroll = new PortableTerminalModelV1(4, 2);
+            alternateScroll.ApplyOutput(1, Bytes("M\u001b[?1049hA\u001b[S\u001b[?1049l"));
+            Require(alternateScroll.TryCreateSnapshot(out var alternateScrollSnapshot) &&
+                alternateScrollSnapshot.ScrollbackRows.Count == 0 &&
+                alternateScrollSnapshot.ScreenRows[0].Cells[0].Character == "M",
+                "Alternate-screen SU polluted primary transcript history.");
+
+            var alternateResize = new PortableTerminalModelV1(4, 3);
+            alternateResize.ApplyOutput(1, Bytes("\u001b[?1049hTUI"));
+            alternateResize.ApplyResize(2, 6, 4);
+            Require(alternateResize.PermanentRejectionCode == "ACTIVE_ALTERNATE_RESIZE_UNSUPPORTED" &&
+                !alternateResize.TryCreateSnapshot(out _),
+                "An active-alternate resize approximated Windows Terminal's deferred main reflow.");
+
+            var overflow = new PortableTerminalModelV1(1000, 5);
+            var longRows = string.Join("\r\n", Enumerable.Repeat(new string('W', 1000), 5));
+            overflow.ApplyOutput(1, Bytes(longRows));
+            overflow.ApplyResize(2, 2, 5);
+            Require(overflow.PermanentRejectionCode == "SCROLLBACK_LIMIT_EXCEEDED" &&
+                !overflow.TryCreateSnapshot(out _),
+                "Reflow produced a snapshot whose scrollback exceeded the restore bound.");
+        }
+
+        private static void ValidateOscSafetyLimits()
+        {
+            var c0 = new PortableTerminalModelV1(8, 3);
+            c0.ApplyOutput(1, Bytes("\u001b]2;a\n\rb\u0007X"));
+            Require(c0.TryCreateSnapshot(out var c0Snapshot) && c0Snapshot.Title == "ab" &&
+                c0Snapshot.ScreenRows[0].Cells[0].Character == "X",
+                "OSC retained invalid C0 controls in its payload.");
+
+            var links = new StringBuilder();
+            for (var index = 0; index < 257; index++)
+                links.Append("\u001b]8;;u").Append(index).Append("\u001b\\");
+            var hyperlinkOverflow = new PortableTerminalModelV1(8, 3);
+            hyperlinkOverflow.ApplyOutput(1, Bytes(links.ToString()));
+            Require(hyperlinkOverflow.PermanentRejectionCode == "HYPERLINK_LIMIT_EXCEEDED",
+                "OSC 8 hyperlink-table overflow silently retained the previous link.");
         }
 
         private static (int Cases, int Checkpoints, int RejectedCases) ValidateGoldenStreams(string repositoryRoot)
@@ -374,11 +807,14 @@ namespace TermLink.PortableTerminalModel.Validation
 
         private static byte[] Bytes(string value) => Encoding.UTF8.GetBytes(value);
 
+        private static string RowText(PortableTerminalRowV1 row) =>
+            string.Concat(row.Cells.Where(cell => !cell.WideContinuation).Select(cell => cell.Character));
+
         private static void PrintCoverageMatrix()
         {
-            Console.WriteLine("SUPPORTED: assigned Unicode/CJK/emoji/combining text; OSC skip; NUL/BEL/BS/HT/CR/LF/VT/FF; ESC c; SGR attributes plus ANSI16/256/RGB; CSI cursor/erase; DECSCUSR; ?25/?1004/?2004; synchronized-output ?2026; pristine/no-op resize; bounded scrollback.");
-            Console.WriteLine("TEMPORARY_INELIGIBLE: incomplete ESC/CSI/OSC/UTF-8; active synchronized-output batch.");
-            Console.WriteLine("PERMANENT_REJECT: invalid UTF-8; orphan combining scalars; unsupported or terminal-dependent Unicode widths; DCS/APC/PM/SOS; unsupported ESC/CSI/private modes/SGR/C0; resize reflow; scrollback overflow; sequence gap.");
+            Console.WriteLine("SUPPORTED: Unicode/CJK/emoji/combining; SGR/ANSI16/256/RGB; CSI cursor/erase/edit/scroll/DECSTBM/rectangle; saved cursor; origin/insert/autowrap; alternate screen; dynamic tabs; OSC title/palette/hyperlink; DEC line drawing; non-empty resize/reflow; synchronized output; bounded scrollback.");
+            Console.WriteLine("TEMPORARY_INELIGIBLE: incomplete ESC/CSI/OSC/DCS/UTF-8; active synchronized-output batch.");
+            Console.WriteLine("PERMANENT_REJECT: invalid UTF-8; orphan/terminal-dependent Unicode; DCS/SIXEL/APC/PM/SOS; unsupported ESC/CSI/private modes/SGR/C0/rectangle; active-alternate resize; scrollback overflow; sequence gap.");
         }
 
         private static void Require(bool condition, string message)

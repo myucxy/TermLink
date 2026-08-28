@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/termlink-terminal-core",
+    "crates/termlink-terminal-ffi",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97.1"
+license = "Proprietary"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+linker_messages = "allow"
+
+[workspace.lints.clippy]
+all = "deny"
+
+# The C ABI converts Rust panics into TL_STATUS_PANIC with catch_unwind.
+# Pin release builds to unwinding so an optimization-profile default cannot
+# silently invalidate that boundary. Allocator OOM and invalid foreign
+# pointers remain outside what catch_unwind can recover.
+[profile.release]
+panic = "unwind"

@@ -1,6 +1,14 @@
 # TermLink
 
-TermLink 是一个面向个人和小型团队的多 PC 远程终端系统。目标结构由 `termForward/terminal-main` 的异步通道把受管会话输入输出交给 Agent；Windows Agent 与 Android 登录同一 OIDC 账号后，Android 直接发现并使用该账号下的 PC 和受管会话，不要求用户先做设备配对、自授信或逐 PC Grant。远程输入仍必须取得短时会话租约，云端 Relay 负责认证、账号隔离、设备发现和加密数据转发。当前发布的 `ProductionAgentRuntime` 仍使用旧 ConPTY/SessionHost 链路；新通道和桥接仅完成本地隔离实现，待注册、IPC、持久化序号和运行时切换完成后再切生产。
+TermLink 是一个面向个人和小型团队的多 PC 远程终端系统。目标结构采用仓库内完全自研的
+`TermLinkTerminalCore` 解析由 Windows ConPTY 或 POSIX PTY 产生的受管会话事件；不复制、链接、
+编译或运行依赖 Windows Terminal `terminal-main/TerminalCore`。Windows Agent 与 Android 登录
+同一 OIDC 账号后，Android 直接发现并使用该账号下的 PC 和受管会话，不要求用户先做设备配对、
+自授信或逐 PC Grant。远程输入仍必须取得短时会话租约，云端 Relay 负责认证、账号隔离、设备
+发现和加密数据转发。当前 `ProductionAgentRuntime` 仍使用 ConPTY/SessionHost 与默认关闭的 V1
+实验快照；自研 V2 通过跨平台恢复等价门禁前不声明生产 capability。
+
+自研核心架构与门禁见 [TermLink 自研跨平台终端核心 V2](docs/TERMLINK_TERMINAL_CORE_V2.md)。
 
 阶段 0 当前环境可自动化验收已完成。旧独立 ConPTY Session Host、Golden Stream V1、
 `TerminalEngine` API、Android Compose Harness、固定 Termux emulator/view Fork、完全离线
@@ -24,13 +32,12 @@ Updater 和自包含 .NET 运行库；开发证书下已验证安装、Terminal 
 卸载。MSIX 仅保留为历史兼容验证路径，不作为本版本对外发布格式。生产发布仍需真实代码
 签名证书链、RFC 3161 时间戳、AppShip 发布凭据及外部告警接收器验收。
 
-本轮已在 `termForward/terminal-main` 的 `TerminalConnection` 项目中加入
-`AsyncTerminalChannel`：它只订阅 `ITerminalConnection` 的 UTF-16 输出/状态事件，
-并在独立有界 worker 上执行输入、resize 和关闭；Windows Agent 同时增加了
-`TerminalMainChannelBridge` 合同适配器，在本地提交后把 UTF-16 块连续编码为现有 UTF-8 本机帧并累计 ACK。
-两部分已有隔离测试，但桥接的 terminal-main 进程注册、认证 IPC、可重放源、幂等持久化 sink
-和 ProductionAgentRuntime/Android/Relay 切换尚未实现；当前生产载荷仍沿用旧 UTF-8 格式，
-不把新通道宣称为公网端到端已切换。
+历史技术验证曾评估 `termForward/terminal-main` 通道和 `TerminalMainChannelBridge`；它们今后只可
+作为公开行为的参考或差分基准，不得作为源码、构建、运行时或发布依赖。目标迁移路径将把已
+持久化的有序本机帧送入仓库顶层 `terminal-core/` 自研 Rust 核心，经独立 Snapshot V2 合同交给
+Windows 和 Android 适配层；语义键盘/粘贴输入 ABI 已实现，Delta ABI 当前仅预留。跨平台恢复等价、真实 journal 崩溃恢复和
+客户端渲染门禁尚未全部通过，现有生产载荷继续沿用旧 UTF-8 路径，也不声明
+`terminal_snapshot_v2` capability。
 
 ## 开发项 1-7 完成矩阵
 
@@ -38,7 +45,7 @@ Updater 和自包含 .NET 运行库；开发证书下已验证安装、Terminal 
 | --- | --- | --- | --- |
 | 1 | 生产账号/OIDC、同账号设备直连与撤销 | **已实现并验证** | Windows/Android 设备按同一 OIDC subject 归属账号并自动注册、直接发现 PC/Session；账号隔离、逐设备密钥和撤销测试已覆盖。旧 pairing/grant/trust 表与 API 仅作兼容层保留，不是首版产品前置流程；真实外部 OIDC enrollment/provider 部署不在本次验收范围。 |
 | 2 | 生产 Protobuf 实时协议、X25519 + ChaCha20-Poly1305、Relay | **已实现并验证** | `protocol/protobuf/termlink_realtime.proto`、Go `realtimewire`/Relay、Android `core-network`、Windows `src/Protocol`；向量、协议和本地 Relay 集成通过，Relay 保持密文不透明，公网 TLS 部署未验收。 |
-| 3 | terminal-main 异步通道到 Android 的实时输入输出、ACK/Gap/重连、租约与本地输入优先 | **本地通道与 Agent 适配已实现，生产切换待完成** | `termForward/terminal-main/src/cascadia/TerminalConnection/AsyncTerminalChannel.*`、`win-agent/src/Agent/TerminalMainChannelBridge.cs` 及隔离测试已加入；现有 ProductionAgentRuntime/Android/Relay 保持兼容旧 UTF-8 载荷，公网生产端到端尚未切换。 |
+| 3 | 自研跨平台终端核心到 Android 的实时输入输出、ACK/Gap/重连、租约与本地输入优先 | **V2 核心与适配层迁移中，生产切换待门禁** | `terminal-core/` 已建立确定性状态与 Snapshot V2 基础，Windows Phase 1 诊断 shadow 已接入；SessionHost authority/durable ACK adapter、Android JNI/native bridge 与自研 View 尚未完成真实接入。现有 ProductionAgentRuntime/Android/Relay 保持兼容旧 UTF-8 载荷，V2 capability 尚未启用。 |
 | 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
 | 5 | 服务端 Catalog、计费验证边界、权益与功能状态 | **核心已实现并验证（Provider 待配置）** | Go `billing`/Catalog/entitlement API、账号级不限 PC/Session、可注入 verified-purchase 契约与 Android `feature-billing` 已测试；真实 Google/Web verifier 未配置时生产入口返回 `BILLING_UNAVAILABLE`。 |
 | 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |
@@ -66,7 +73,8 @@ Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当�
 - [Android ↔ Server ↔ Windows 文件操作 E2E](docs/REMOTE_FILE_OPERATIONS_E2E.md)
 - [Windows 命令配置与 Android 受控启动协议](docs/REMOTE_TERMINAL_COMMANDS.md)
 - [终端信息获取与服务端转发需求基线](docs/TERMINAL_INFORMATION_FORWARDING_REQUIREMENTS.md)
-- `termForward/terminal-main/doc/async-terminal-channel.md`（异步通道契约与实现说明）
+- [自研跨平台终端核心 V2](docs/TERMLINK_TERMINAL_CORE_V2.md)
+- [已停止的 Windows Terminal 原生状态方案（历史差距分析）](docs/WINDOWS_TERMINAL_NATIVE_PRESENTATION_V2.md)
 - [Android / Windows Agent / Server Console UI 布局设计稿](docs/UI_LAYOUT_DESIGNS.md)
 - [生产级多端交互 UI 原型](ui-prototypes/index.html)
 - [产品需求与技术方案](docs/PRODUCT_REQUIREMENTS_AND_SOLUTION.md)

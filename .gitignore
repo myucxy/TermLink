@@ -12,6 +12,7 @@ server/secrets/
 **/bin/
 **/obj/
 **/build/
+**/target/
 .gradle/
 .kotlin/
 local.properties

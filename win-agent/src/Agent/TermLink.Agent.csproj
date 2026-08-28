@@ -20,4 +20,10 @@
     <InternalsVisibleTo Include="TermLink.AgentUpdate.Validation" />
     <InternalsVisibleTo Include="TermLink" />
   </ItemGroup>
+  <ItemGroup Condition="Exists('..\..\..\terminal-core\target\x86_64-pc-windows-msvc\release\termlink_terminal_ffi.dll')">
+    <None Include="..\..\..\terminal-core\target\x86_64-pc-windows-msvc\release\termlink_terminal_ffi.dll"
+          Link="termlink_terminal_ffi.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

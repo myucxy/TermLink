@@ -1,6 +1,10 @@
 # Windows Agent
 
-> 2026-08-15 迁移说明：目标生产结构由 `termForward/terminal-main` 的 `AsyncTerminalChannel` 提供输入输出，Agent 负责本地桥接、E2EE 和服务端转发。当前 `AsyncTerminalChannel` 与 `TerminalMainChannelBridge` 只是本地实现/合同隔离测试；ProductionAgentRuntime 尚未切换生产数据源，本文后续的 `SessionHost`/ConPTY 内容仍是迁移前验证基线。权威需求见 [`docs/TERMINAL_INFORMATION_FORWARDING_REQUIREMENTS.md`](../docs/TERMINAL_INFORMATION_FORWARDING_REQUIREMENTS.md)。
+> 2026-08-28 迁移说明：目标生产结构改为仓库内完全自研的 `terminal-core/`，不再把
+> `termForward/terminal-main` 作为源码、构建或运行时依赖。`ProductionAgentRuntime` 已接入默认启用、
+> 可独立回滚的 Phase 1 诊断 shadow；Portable V1 仍是 Snapshot/Transcript 生产权威，SessionHost
+> authority 和 durable ACK 尚未切换。`TerminalMainChannelBridge` 只保留为历史技术验证。
+> 现行边界见 [`TERMLINK_TERMINAL_CORE_V2.md`](../docs/TERMLINK_TERMINAL_CORE_V2.md)。
 
 正式 Windows Agent 将使用 C# / .NET 8。阶段 0 已在
 [`prototypes/conpty-probe`](../prototypes/conpty-probe) 验证和固定原始 ConPTY 录制格式，
@@ -9,7 +13,9 @@
 目录边界：
 
 - `src/Agent`：会话目录、Relay、加密缓冲与访问控制；
-- `src/Agent/TerminalMainChannelBridge.cs`：terminal-main UTF-16 异步事件到本机 UTF-8 帧的合同适配（提交后 ACK）；不依赖 ConPTY，尚未连接生产进程注册、持久化 sink 或 runtime；
+- `src/Agent/ProductionTerminalCoreShadow*.cs`：按会话隔离的 terminal-core 诊断重放与有界调度；
+- `src/TerminalCore`：自研 Rust 核心的 Windows SafeHandle/P/Invoke 绑定与严格 frame decoder；
+- `src/Agent/TerminalMainChannelBridge.cs`：历史 terminal-main 合同适配，仅保留隔离测试，不是目标生产依赖；
 - `src/Protocol`：生产 Protobuf Envelope、设备证明、X25519/HKDF 和 ChaCha20-Poly1305；
 - `src/Tray`：当前用户托盘和设置 UI；
 - `src/SessionHost`：每会话一个 ConPTY Owner；
@@ -205,7 +211,7 @@ mode 代替 saved mode，也不能静默丢弃 title stack。
 | --- | --- | --- | --- |
 | 1 | 生产账号/OIDC、同账号自动注册与登录记忆 | **已实现并验证** | Windows 托盘与 Android 均可注册/登录；Windows 用 CurrentUser DPAPI、Android 用 Keystore 保护可恢复登录状态。同一 OIDC 账号无需配对、自授信或逐 PC Grant 即可发现受管 PC/Session；跨账号轮换 Windows DeviceId/PcId。旧 pairing/grant/trust API 仅作兼容。 |
 | 2 | 生产 Protobuf 实时协议、X25519 + ChaCha20-Poly1305、Relay | **已实现并验证** | `protocol/protobuf/termlink_realtime.proto`、Go `realtimewire`/Relay、Android `core-network`、Windows `src/Protocol`；向量、协议和 Relay 测试通过。 |
-| 3 | terminal-main 异步通道到 Android 的输入输出、ACK/Gap/重连、租约与本地输入优先 | **本地通道/合同适配已实现，生产切换待完成** | C++ 通道与 C# 假源/假 sink 隔离测试已加入；`ProductionAgentRuntime` 当前仍消费旧 SessionHost/ConPTY 帧，terminal-main 注册、认证 IPC、可重放序号、幂等 sink 与公网端到端验收均待完成。 |
+| 3 | 自研跨平台终端核心到 Android 的输入输出、ACK/Gap/重连、租约与本地输入优先 | **Windows Phase 1 shadow 已接入，生产 authority 待门禁** | `terminal-core/`、Windows P/Invoke/decoder、Portable V1 对比和有界异步 shadow 已接入 `ProductionAgentRuntime`；现有 ConPTY/Relay 原始 UTF-8、Portable Snapshot/Transcript 仍是生产权威，SessionHost durable-ACK authority 与 Android JNI/native 接入尚未完成。 |
 | 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
 | 5 | 服务端 Catalog、计费验证边界、权益与配额 | **核心已实现并验证（Provider 待配置）** | Go Catalog/entitlement、可注入 verified-purchase 契约和 Android Play Billing 协调已测试；生产 main 在真实 Google/Web verifier 未配置时返回 `BILLING_UNAVAILABLE`，未冒充线上购买验证。 |
 | 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |

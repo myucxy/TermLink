@@ -1,6 +1,9 @@
+#requires -Version 7.0
+
 [CmdletBinding()]
 param(
     [string]$DotNetPath = (Join-Path $env:TEMP 'termlink-dotnet-sdk-8.0.303\dotnet.exe'),
+    [string]$CargoPath = 'D:\Dev\Env\Rust\cargo\bin\cargo.exe',
     [string]$EvidencePath = (Join-Path $PSScriptRoot '..\..\docs\validation\phase1-windows-installer.json')
 )
 
@@ -55,6 +58,7 @@ function Stop-ValidationProcesses {
 }
 
 Assert-True (Test-Path -LiteralPath $DotNetPath -PathType Leaf) ".NET SDK not found: $DotNetPath"
+Assert-True (Test-Path -LiteralPath $CargoPath -PathType Leaf) "Cargo executable not found: $CargoPath"
 $identityName = 'TermLink.Terminal.Validation'
 $packageVersion = '0.1.0.0'
 $publisher = 'CN=TermLink Development'
@@ -119,6 +123,7 @@ try {
         -CertificatePassword $securePassword `
         -Development `
         -DotNetPath $DotNetPath `
+        -CargoPath $CargoPath `
         -OutputPath $packagePath
     Assert-True ($null -ne $buildResult) 'MSIX build did not return package metadata.'
     Assert-True (Test-Path -LiteralPath $packagePath -PathType Leaf) 'Signed MSIX was not created.'
@@ -204,6 +209,10 @@ try {
         'Installed package does not contain the external single-file Updater.'
     Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'TermLink.Agent.dll') -PathType Leaf) `
         'Installed package does not contain the independent Agent runtime assembly.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'TermLink.TerminalCore.dll') -PathType Leaf) `
+        'Installed package does not contain the Windows terminal-core managed runtime.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'termlink_terminal_ffi.dll') -PathType Leaf) `
+        'Installed package does not contain the Windows terminal-core native runtime.'
     Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'TermLink.Agent.exe') -PathType Leaf) `
         'Installed package does not contain the independent Agent executable.'
     $expectedProductExecutables = @(
@@ -239,15 +248,22 @@ try {
     }
 
     $signedBinaries = @(Get-ChildItem -LiteralPath $installLocation -File |
-        Where-Object { $_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' })
+        Where-Object {
+            $_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' -or
+            $_.Name -ceq 'termlink_terminal_ffi.dll'
+        })
     Assert-True ($signedBinaries.Count -eq $buildResult.SignedTermLinkBinaries) `
         'Installed TermLink binary count differs from the signed build.'
+    $acceptedSignatureStatuses = @(
+        [Management.Automation.SignatureStatus]::Valid,
+        [Management.Automation.SignatureStatus]::UnknownError,
+        [Management.Automation.SignatureStatus]::NotTrusted
+    )
     foreach ($binary in $signedBinaries) {
         $signature = Get-AuthenticodeSignature -LiteralPath $binary.FullName
         Assert-True ($null -ne $signature.SignerCertificate -and
             $signature.SignerCertificate.Thumbprint -eq $certificate.Thumbprint -and
-            $signature.Status -ne [Management.Automation.SignatureStatus]::HashMismatch -and
-            $signature.Status -ne [Management.Automation.SignatureStatus]::NotSigned) `
+            $acceptedSignatureStatuses -contains $signature.Status) `
             "Packaged binary signature is invalid: $($binary.Name)"
     }
     Write-Output 'STEP=payload_verified'
@@ -295,8 +311,13 @@ try {
     Assert-True $secondTrayLaunch.HasExited 'The second Tray process did not exit after single-instance detection.'
     Write-Output 'STEP=tray_single_instance'
 
-    $agentProcesses = @(Find-PackagedProcesses -Name 'TermLink.Agent' -InstallLocation $installLocation `
-        -ExcludedIds $beforeAgentIds)
+    $agentDeadline = [DateTime]::UtcNow.AddSeconds(15)
+    $agentProcesses = @()
+    do {
+        Start-Sleep -Milliseconds 100
+        $agentProcesses = @(Find-PackagedProcesses -Name 'TermLink.Agent' -InstallLocation $installLocation `
+            -ExcludedIds $beforeAgentIds)
+    } while ($agentProcesses.Count -eq 0 -and [DateTime]::UtcNow -lt $agentDeadline)
     Assert-True ($agentProcesses.Count -eq 1) `
         'Packaged Tray did not start exactly one independent Agent process.'
     $validationProcessIds += @($agentProcesses | Select-Object -ExpandProperty Id)
