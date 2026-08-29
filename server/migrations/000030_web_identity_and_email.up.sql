@@ -41,3 +41,4 @@ CREATE INDEX registration_email_challenges_email_created
 CREATE INDEX registration_email_challenges_expiry
     ON registration_email_challenges(expires_at)
     WHERE consumed_at IS NULL;
+
