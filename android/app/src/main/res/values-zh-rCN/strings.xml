@@ -93,6 +93,11 @@
     <string name="terminal_error_snapshot_unsupported">Windows Agent 已确认当前终端数据暂时无法表示为可移植快照。</string>
     <string name="terminal_error_snapshot_production_failed">Windows Agent 在生成或持久化可移植终端快照时失败。</string>
     <string name="terminal_error_local_storage_full">Android 本地空间不足，无法安全缓存加密终端历史。</string>
+    <string name="terminal_error_native_core_unavailable">应用内置的 terminal-core 库不可用，或与当前 App 版本不匹配。</string>
+    <string name="terminal_error_native_renderer_failed_closed">terminal-core 拒绝了终端状态，并已关闭当前渲染代，防止显示错误输出。</string>
+    <string name="terminal_error_unsupported_terminal_capability">当前 Android 与 Windows 安装的 terminal-core 版本不支持此终端能力。</string>
+    <string name="terminal_error_history_core_rebuild_failed">terminal-core 无法通过已验证且连续的加密历史重建实时终端。</string>
+    <string name="terminal_error_gap_recovery_required">实时终端检测到有序事件缺失，需要通过完整加密历史重新构建。</string>
     <string name="terminal_error_realtime_connection">无法建立实时会话通道。</string>
     <string name="terminal_error_control_lease">另一个客户端仍持有此会话的控制租约。</string>
     <string name="terminal_error_unknown">由于未分类的本地或传输故障，无法打开会话。</string>

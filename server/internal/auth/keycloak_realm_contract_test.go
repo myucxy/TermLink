@@ -117,6 +117,17 @@ func TestAcceptanceRealmUsesGatedRegistrationAndNativeClientLogin(t *testing.T) 
 		!containsString(windows.RedirectURIs, "http://127.0.0.1:43971/oauth2/callback") {
 		t.Fatal("termlink-windows browser fallback policy is incomplete")
 	}
+	foundWindowsNickname := false
+	for _, mapper := range windows.ProtocolMappers {
+		if mapper.Name == "termlink-windows-nickname" {
+			foundWindowsNickname = mapper.ProtocolMapper == "oidc-usermodel-attribute-mapper" &&
+				mapper.Config["user.attribute"] == "nickname" && mapper.Config["claim.name"] == "nickname" &&
+				mapper.Config["access.token.claim"] == "true" && mapper.Config["id.token.claim"] == "false"
+		}
+	}
+	if !foundWindowsNickname {
+		t.Fatal("termlink-windows access tokens must include the display nickname")
+	}
 	var web *acceptanceRealmClient
 	for i := range realm.Clients {
 		if realm.Clients[i].ClientID == "termlink-web" {

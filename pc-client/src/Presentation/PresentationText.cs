@@ -59,6 +59,7 @@ public static class PresentationText
         "The independent Agent handles sign-in, registration, and sign-out; credentials are never written to UI logs.");
     public static string PcName => Pick("PC 名称", "PC name");
     public static string Username => Pick("用户名", "Username");
+    public static string Nickname => Pick("昵称", "Nickname");
     public static string RegistrationEmail => Pick("邮箱（注册）", "Email (registration)");
     public static string Password => Pick("密码", "Password");
     public static string ConfirmPassword => Pick("确认密码（注册）", "Confirm password (registration)");
@@ -99,6 +100,8 @@ public static class PresentationText
         "Updates run through the retained signed component; closing the control UI does not stop the Agent.");
     public static string RepairTerminal => Pick("修复 Terminal 集成", "Repair Terminal integration");
     public static string CheckUpdates => Pick("检查更新", "Check for updates");
+    public static string StartUpdate => Pick("开始更新", "Start update");
+    public static string AccountLoading => Pick("正在读取账户…", "Loading account…");
     public static string Delete => Pick("删除", "Delete");
     public static string General => Pick("常规", "General");
     public static string Commands => Pick("命令", "Commands");
@@ -156,6 +159,13 @@ public static class PresentationText
 
     public static string UpdateReleaseNotesTitle(string? versionName, long? buildNumber) =>
         Pick($"{UpdateVersion(versionName, buildNumber)} · 更新内容", $"{UpdateVersion(versionName, buildNumber)} · What's new");
+
+    public static string AvailableUpdate(DesktopUpdateStatus status)
+    {
+        ArgumentNullException.ThrowIfNull(status);
+        var version = UpdateVersion(status.VersionName, status.BuildNumber);
+        return Pick($"发现新版本 · {version}", $"New version available · {version}");
+    }
 
     public static string UpdateCheckFailed(string detail) =>
         Pick($"AppShip 更新检查失败 · {detail}", $"AppShip update check failed · {detail}");

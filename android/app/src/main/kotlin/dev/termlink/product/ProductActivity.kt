@@ -181,6 +181,7 @@ import dev.termlink.terminal.api.ArgbColor
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalThemeV1
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
+import dev.termlink.terminal.api.TerminalViewportEngine
 import dev.termlink.terminal.termux.TermuxTerminalEngine
 import dev.termlink.terminal.termux.TermuxTranscriptViewport
 import java.time.Instant
@@ -2992,8 +2993,8 @@ private fun ProductContent(
     onOpenSession: suspend (java.util.UUID) -> Unit,
     onLoadTranscript: (java.util.UUID) -> Unit,
     onClearTranscript: (java.util.UUID) -> Unit,
-    terminalEngine: (java.util.UUID) -> TermuxTerminalEngine?,
-    historyEngine: (java.util.UUID) -> TermuxTerminalEngine?,
+    terminalEngine: (java.util.UUID) -> TerminalViewportEngine?,
+    historyEngine: (java.util.UUID) -> TerminalViewportEngine?,
     selectedHistoryId: String?,
     onHistorySelected: (HistoryEntry) -> Unit,
     onOpenSessions: () -> Unit,
@@ -3744,7 +3745,7 @@ private fun SessionsPage(
     onOpenSession: suspend (java.util.UUID) -> Unit,
     onLoadTranscript: (java.util.UUID) -> Unit,
     onClearTranscript: (java.util.UUID) -> Unit,
-    terminalEngine: (java.util.UUID) -> TermuxTerminalEngine?,
+    terminalEngine: (java.util.UUID) -> TerminalViewportEngine?,
     onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
     onTerminalCustomShortcut: (java.util.UUID, TerminalCustomShortcut) -> Unit,
     onPasteRequested: (java.util.UUID) -> Unit,
@@ -3909,7 +3910,7 @@ private fun MobileSessionContent(
     onSessionSelected: (java.util.UUID) -> Unit,
     onCloseSessionTab: (java.util.UUID) -> Unit,
     pcLabel: (SessionSummary) -> String,
-    selectedEngine: TermuxTerminalEngine?,
+    selectedEngine: TerminalViewportEngine?,
     sessionStates: Map<java.util.UUID, RemoteSessionState>,
     onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
     onTerminalCustomShortcut: (java.util.UUID, TerminalCustomShortcut) -> Unit,
@@ -4161,7 +4162,7 @@ private fun SessionDetail(
     onClearTranscript: () -> Unit,
     onRetryOpen: () -> Unit,
     remoteState: RemoteSessionState?,
-    engine: TermuxTerminalEngine?,
+    engine: TerminalViewportEngine?,
     terminalPreferences: TerminalDisplayPreferences,
     shortcutPreferences: TerminalShortcutPreferences,
     modifier: Modifier,
@@ -4582,7 +4583,7 @@ internal fun SessionSummary.resolveDisplayedRemoteState(actual: RemoteSessionSta
 @Composable
 private fun TerminalSurface(
     session: SessionSummary,
-    engine: TermuxTerminalEngine?,
+    engine: TerminalViewportEngine?,
     remoteState: RemoteSessionState?,
     transcriptState: TranscriptViewportState?,
     liveAcknowledgement: ULong?,
@@ -5021,7 +5022,7 @@ private fun HistoryPage(
     selectedHistoryId: String?,
     onHistorySelected: (HistoryEntry) -> Unit,
     onReplay: (HistoryEntry) -> Unit,
-    historyEngine: (java.util.UUID) -> TermuxTerminalEngine?,
+    historyEngine: (java.util.UUID) -> TerminalViewportEngine?,
     terminalPreferences: TerminalDisplayPreferences,
 ) {
     PageHeader(stringResource(R.string.nav_history), stringResource(R.string.page_history_subtitle), Icons.Filled.History)
@@ -5065,7 +5066,7 @@ private fun HistoryPage(
 @Composable
 private fun HistoryReplaySurface(
     entry: HistoryEntry,
-    engine: TermuxTerminalEngine?,
+    engine: TerminalViewportEngine?,
     terminalPreferences: TerminalDisplayPreferences,
     onReplay: (HistoryEntry) -> Unit,
 ) {
@@ -5114,7 +5115,7 @@ private fun HistoryReplaySurface(
 @Composable
 private fun HistoryTerminalSurface(
     entry: HistoryEntry,
-    engine: TermuxTerminalEngine?,
+    engine: TerminalViewportEngine?,
     terminalPreferences: TerminalDisplayPreferences,
 ) {
     val placeholder = remember(entry.historyObject.id) {

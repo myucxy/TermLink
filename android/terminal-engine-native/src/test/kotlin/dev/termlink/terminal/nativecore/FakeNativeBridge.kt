@@ -1,7 +1,11 @@
 package dev.termlink.terminal.nativecore
 
 import dev.termlink.terminal.api.TerminalKittyFunctionalKey
+import dev.termlink.terminal.api.TerminalInput
+import dev.termlink.terminal.api.TerminalInputModifiers
+import dev.termlink.terminal.api.TerminalKey
 import dev.termlink.terminal.api.TerminalSize
+import dev.termlink.terminal.api.VtTerminalInputEncoder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.CharacterCodingException
@@ -17,10 +21,13 @@ internal class FakeNativeBridge : NativeBridge {
     override var abiVersion: Int = TERMLINK_TERMINAL_ABI_VERSION
     override var renderFrameFormatVersion: Int = TERMLINK_RENDER_FRAME_V1_FORMAT_VERSION
     override var maxRenderFrameBytes: Int = TERMLINK_RENDER_FRAME_V1_MAX_BYTES
+    override var renderFrameV3FormatVersion: Int = TERMLINK_RENDER_FRAME_V3_FORMAT_VERSION
+    override var maxRenderFrameV3Bytes: Int = TERMLINK_RENDER_FRAME_V3_MAX_BYTES
     override var hostEffectFrameV2FormatVersion: Int =
         TERMLINK_HOST_EFFECT_FRAME_V2_FORMAT_VERSION
     override var maxHostEffectFrameV2Bytes: Int = TERMLINK_HOST_EFFECT_FRAME_V2_MAX_BYTES
     override var mouseInputV1StructSize: Int = TERMLINK_MOUSE_INPUT_V1_STRUCT_SIZE
+    override var inputV1StructSize: Int = TERMLINK_INPUT_V1_STRUCT_SIZE
     override var inputV2StructSize: Int = TERMLINK_INPUT_V2_STRUCT_SIZE
     override var inputV3StructSize: Int = TERMLINK_INPUT_V3_STRUCT_SIZE
     override var configV3StructSize: Int = TERMLINK_CONFIG_V3_STRUCT_SIZE
@@ -36,6 +43,9 @@ internal class FakeNativeBridge : NativeBridge {
     var forcedInputV3Failure: NativeBridgeResult.Failure? = null
     var forcedCheckpointFailure: NativeBridgeResult.Failure? = null
     var forcedRenderFrame: NativeBridgeRenderFrame? = null
+    var forcedRenderFrameV3: NativeBridgeRenderFrame? = null
+    var forcedInputV1Failure: NativeBridgeResult.Failure? = null
+    var forcedInputV1EncodedInput: NativeBridgeEncodedInput? = null
     var forcedMouseEncodedInput: NativeBridgeEncodedInput? = null
     var forcedInputV2EncodedInput: NativeBridgeEncodedInput? = null
     var forcedInputV3EncodedInput: NativeBridgeEncodedInput? = null
@@ -58,11 +68,15 @@ internal class FakeNativeBridge : NativeBridge {
         private set
     var mouseCalls: Int = 0
         private set
+    var inputV1Calls: Int = 0
+        private set
     var inputV2Calls: Int = 0
         private set
     var inputV3Calls: Int = 0
         private set
     var lastMouseInput: NativeMouseInputV1? = null
+        private set
+    var lastInputV1: NativeTerminalInputV1? = null
         private set
     var lastInputV2: NativeWin32KeyInputV2? = null
         private set
@@ -328,6 +342,61 @@ internal class FakeNativeBridge : NativeBridge {
         NativeBridgeResult.Success(
             NativeBridgeRenderFrame(payload = payload),
         )
+    }
+
+    override fun renderV3(
+        handle: NativeBridgeHandle,
+        request: NativeRenderRequest,
+    ): NativeBridgeResult<NativeBridgeRenderFrame> = synchronized(this) {
+        forcedRenderFailure?.let { return it }
+        val state = states[handle]
+            ?: return NativeBridgeResult.Failure(NativeTerminalStatus.NULL_POINTER.code)
+        val payload = forcedRenderFrameV3?.payload?.copyOf() ?: fakeRenderFrameV3(
+            nextSourceSequence = state.nextSourceSequence,
+            presentationRevision = state.presentationRevision,
+            size = state.size,
+        )
+        if (payload.size > request.maxPayloadBytes) {
+            return NativeBridgeResult.Failure(NativeTerminalStatus.LIMIT_EXCEEDED.code)
+        }
+        NativeBridgeResult.Success(NativeBridgeRenderFrame(payload))
+    }
+
+    override fun encodeInputV1(
+        handle: NativeBridgeHandle,
+        input: NativeTerminalInputV1,
+    ): NativeBridgeResult<NativeBridgeEncodedInput> = synchronized(this) {
+        inputV1Calls += 1
+        lastInputV1 = input.copyForBridge()
+        forcedInputV1Failure?.let { return it }
+        forcedInputV1EncodedInput?.let {
+            return NativeBridgeResult.Success(NativeBridgeEncodedInput(it.payload.copyOf()))
+        }
+        val state = states[handle]
+            ?: return NativeBridgeResult.Failure(NativeTerminalStatus.NULL_POINTER.code)
+        if (state.failedClosed) {
+            return NativeBridgeResult.Failure(NativeTerminalStatus.FAILED_CLOSED.code)
+        }
+        validateInputV1(input)?.let { return it }
+        val modifiers = TerminalInputModifiers(
+            control = input.modifiers and NATIVE_INPUT_MODIFIER_CONTROL != 0,
+            alt = input.modifiers and NATIVE_INPUT_MODIFIER_ALT != 0,
+            shift = input.modifiers and NATIVE_INPUT_MODIFIER_SHIFT != 0,
+            meta = input.modifiers and NATIVE_INPUT_MODIFIER_META != 0,
+        )
+        val semantic = when (input.kind) {
+            NATIVE_INPUT_KIND_KEY -> if (input.key == NATIVE_INPUT_KEY_CHARACTER.toInt()) {
+                TerminalInput.Text(String(Character.toChars(input.character)), modifiers)
+            } else {
+                TerminalInput.Key(fakeTerminalKey(input.key)!!, modifiers)
+            }
+            NATIVE_INPUT_KIND_PASTE -> TerminalInput.Paste(input.copyData())
+            NATIVE_INPUT_KIND_FOCUS_GAINED,
+            NATIVE_INPUT_KIND_FOCUS_LOST,
+            -> return NativeBridgeResult.Success(NativeBridgeEncodedInput(byteArrayOf()))
+            else -> error("validated input kind is outside Input V1")
+        }
+        NativeBridgeResult.Success(NativeBridgeEncodedInput(VtTerminalInputEncoder.encode(semantic)))
     }
 
     override fun encodeMouse(
@@ -897,6 +966,71 @@ private fun NativeMouseInputV1.isHeld(button: Int): Boolean = when (button) {
 private fun isNativeMouseButton(button: Int): Boolean =
     button in NATIVE_MOUSE_BUTTON_LEFT..NATIVE_MOUSE_BUTTON_RIGHT
 
+private fun validateInputV1(input: NativeTerminalInputV1): NativeBridgeResult.Failure? {
+    if (
+        input.abiVersion != TERMLINK_TERMINAL_ABI_VERSION ||
+        input.structSize != TERMLINK_INPUT_V1_STRUCT_SIZE ||
+        input.modifiers and NATIVE_INPUT_MODIFIERS_ALL.inv() != 0 ||
+        input.dataLength != input.dataByteCount.toLong() ||
+        input.reserved0 != 0L ||
+        input.reserved1 != 0L
+    ) {
+        return NativeBridgeResult.Failure(NativeTerminalStatus.INVALID_ARGUMENT.code)
+    }
+    val valid = when (input.kind) {
+        NATIVE_INPUT_KIND_KEY -> {
+            input.dataByteCount == 0 &&
+                if (input.key == NATIVE_INPUT_KEY_CHARACTER.toInt()) {
+                    Character.isValidCodePoint(input.character) &&
+                        input.character !in
+                        Character.MIN_SURROGATE.code..Character.MAX_SURROGATE.code
+                } else {
+                    input.character == 0 && fakeTerminalKey(input.key) != null
+                }
+        }
+        NATIVE_INPUT_KIND_PASTE -> input.key == 0 && input.modifiers == 0 &&
+            input.character == 0 && input.dataByteCount > 0
+        NATIVE_INPUT_KIND_FOCUS_GAINED,
+        NATIVE_INPUT_KIND_FOCUS_LOST,
+        -> input.key == 0 && input.modifiers == 0 && input.character == 0 &&
+            input.dataByteCount == 0
+        else -> false
+    }
+    return if (valid) null else {
+        NativeBridgeResult.Failure(NativeTerminalStatus.INVALID_ARGUMENT.code)
+    }
+}
+
+private fun fakeTerminalKey(key: Int): TerminalKey? = when (key) {
+    2 -> TerminalKey.ENTER
+    3 -> TerminalKey.BACKSPACE
+    4 -> TerminalKey.TAB
+    5 -> TerminalKey.ESCAPE
+    6 -> TerminalKey.DELETE
+    7 -> TerminalKey.INSERT
+    8 -> TerminalKey.HOME
+    9 -> TerminalKey.END
+    10 -> TerminalKey.PAGE_UP
+    11 -> TerminalKey.PAGE_DOWN
+    12 -> TerminalKey.ARROW_UP
+    13 -> TerminalKey.ARROW_DOWN
+    14 -> TerminalKey.ARROW_LEFT
+    15 -> TerminalKey.ARROW_RIGHT
+    16 -> TerminalKey.F1
+    17 -> TerminalKey.F2
+    18 -> TerminalKey.F3
+    19 -> TerminalKey.F4
+    20 -> TerminalKey.F5
+    21 -> TerminalKey.F6
+    22 -> TerminalKey.F7
+    23 -> TerminalKey.F8
+    24 -> TerminalKey.F9
+    25 -> TerminalKey.F10
+    26 -> TerminalKey.F11
+    27 -> TerminalKey.F12
+    else -> null
+}
+
 private fun Int.toUnsignedLong(): Long = Integer.toUnsignedLong(this)
 
 private const val NATIVE_INPUT_MODIFIERS_ALL =
@@ -1061,6 +1195,25 @@ internal fun fakeRenderFrameV1(
     writer.putInt(88, fakeCrc32c(frame, FAKE_RENDER_HEADER_BYTES, frame.size))
     writer.putInt(92, fakeCrc32c(frame, 0, 92))
     return frame
+}
+
+internal fun fakeRenderFrameV3(
+    nextSourceSequence: Long,
+    presentationRevision: Long = nextSourceSequence,
+    size: TerminalSize,
+): ByteArray = fakeRenderFrameV1(
+    nextSourceSequence = nextSourceSequence,
+    presentationRevision = presentationRevision,
+    size = size,
+).also { frame ->
+    frame[6] = '3'.code.toByte()
+    val writer = ByteBuffer.wrap(frame).order(ByteOrder.LITTLE_ENDIAN)
+    writer.putShort(8, 3.toShort())
+    writer.putLong(72, 0x7f)
+    val renditionDirectory = FAKE_RENDER_HEADER_BYTES + FAKE_RENDER_DIRECTORY_ENTRY_BYTES
+    writer.putShort(renditionDirectory + 4, 2.toShort())
+    writer.putInt(88, fakeCrc32c(frame, FAKE_RENDER_HEADER_BYTES, frame.size))
+    writer.putInt(92, fakeCrc32c(frame, 0, 92))
 }
 
 private data class FakeRenderSection(

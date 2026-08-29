@@ -17,6 +17,7 @@ public interface IAgentClient
     ValueTask LoginAsync(string username, string password, string pcName, CancellationToken cancellationToken);
     ValueTask RegisterAsync(
         string username,
+        string nickname,
         string email,
         string password,
         string passwordConfirmation,

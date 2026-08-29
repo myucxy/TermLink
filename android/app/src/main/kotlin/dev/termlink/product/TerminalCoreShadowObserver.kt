@@ -29,7 +29,8 @@ internal fun createJniTerminalCoreShadowObserver(
 }
 
 /**
- * Diagnostic terminal-core shadow. Termux remains the only production renderer and input owner.
+ * Legacy diagnostic terminal-core comparator. The native terminal-core engine is production
+ * renderer/input authority; this observer is isolated, optional, and must never advance ACKs.
  *
  * A non-empty Termux bootstrap cannot seed terminal-core, so the observer stays dormant until a
  * verified renderer reset announces a complete replay beginning at sequence 1.

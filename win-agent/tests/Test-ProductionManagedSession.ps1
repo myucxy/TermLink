@@ -1,15 +1,24 @@
 [CmdletBinding()]
 param(
-    [ValidateRange(10, 180)][int]$TimeoutSeconds = 60
+    [ValidateRange(10, 180)][int]$TimeoutSeconds = 60,
+    [string]$ArtifactsPath
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$agent = Join-Path $projectRoot 'src\Agent\bin\Release\net8.0-windows\TermLink.Agent.exe'
-$tray = Join-Path $projectRoot 'src\Tray\bin\Release\net8.0-windows\TermLink.exe'
-$sessionHost = Join-Path $projectRoot 'src\SessionHost\bin\Release\net8.0-windows\TermLink.SessionHost.exe'
+if ([string]::IsNullOrWhiteSpace($ArtifactsPath)) {
+    $agent = Join-Path $projectRoot 'src\Agent\bin\Release\net8.0-windows\TermLink.Agent.exe'
+    $tray = Join-Path $projectRoot 'src\Tray\bin\Release\net8.0-windows\TermLink.exe'
+    $sessionHost = Join-Path $projectRoot 'src\SessionHost\bin\Release\net8.0-windows\TermLink.SessionHost.exe'
+}
+else {
+    $ArtifactsPath = [IO.Path]::GetFullPath($ArtifactsPath)
+    $agent = Join-Path $ArtifactsPath 'bin\TermLink.Agent\release\TermLink.Agent.exe'
+    $tray = Join-Path $ArtifactsPath 'bin\TermLink.Tray\release\TermLink.exe'
+    $sessionHost = Join-Path $ArtifactsPath 'bin\TermLink.SessionHost\release\TermLink.SessionHost.exe'
+}
 $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
 $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
 $productionRoot = Join-Path $localAppData 'TermLink'
@@ -36,6 +45,9 @@ $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)
 if (-not $resolvedTestRoot.StartsWith($resolvedTemp, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Refusing to use a test directory outside the temporary root: $resolvedTestRoot"
 }
+$agentProcess = $null
+$agentOutputTask = $null
+$agentErrorTask = $null
 
 function Get-RuntimeSnapshot {
     if (Test-Path -LiteralPath $statusPath -PathType Leaf) {
@@ -48,7 +60,15 @@ function Get-RuntimeSnapshot {
         Start-Sleep -Milliseconds 50
     }
     if (-not (Test-Path -LiteralPath $statusPath -PathType Leaf)) {
-        throw 'Production managed-session status was unavailable.'
+        $agentExit = if ($null -ne $agentProcess -and $agentProcess.HasExited) {
+            [string]$agentProcess.ExitCode
+        }
+        else { 'running' }
+        $agentError = if ($null -ne $agentErrorTask -and $agentErrorTask.IsCompleted) {
+            $agentErrorTask.GetAwaiter().GetResult()
+        }
+        else { '' }
+        throw "Production managed-session status was unavailable (Agent: $agentExit). $agentError"
     }
     Get-Content -Raw -LiteralPath $statusPath | ConvertFrom-Json
 }
@@ -61,6 +81,26 @@ $snapshot = $null
 $managedSession = $null
 $localMarker = '__TERMLINK_MANAGED_LOCAL_INPUT__'
 try {
+    $agentStart = [Diagnostics.ProcessStartInfo]::new()
+    $agentStart.FileName = $agent
+    $agentStart.UseShellExecute = $false
+    $agentStart.CreateNoWindow = $true
+    $agentStart.RedirectStandardOutput = $true
+    $agentStart.RedirectStandardError = $true
+    $agentStart.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $agentStart.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    foreach ($argument in @(
+        '--registry',
+        '--control-pipe', $controlPipe,
+        '--buffer-root', $bufferRoot
+    )) {
+        $agentStart.ArgumentList.Add($argument)
+    }
+    $agentProcess = [Diagnostics.Process]::Start($agentStart)
+    if ($null -eq $agentProcess) { throw 'Production managed-session Agent could not be started.' }
+    $agentOutputTask = $agentProcess.StandardOutput.ReadToEndAsync()
+    $agentErrorTask = $agentProcess.StandardError.ReadToEndAsync()
+
     $script =
         '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);' +
         '[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);' +
@@ -180,6 +220,17 @@ finally {
         } while ([DateTime]::UtcNow -lt $shutdownDeadline)
     }
     catch {
+    }
+    if ($null -ne $agentProcess) {
+        try {
+            if (-not $agentProcess.WaitForExit(5000)) {
+                $agentProcess.Kill($true)
+                $agentProcess.WaitForExit(5000) | Out-Null
+            }
+        }
+        catch {
+        }
+        $agentProcess.Dispose()
     }
     if (Test-Path -LiteralPath $resolvedTestRoot -PathType Container) {
         Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force

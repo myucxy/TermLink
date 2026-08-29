@@ -8,11 +8,16 @@ object JniNativeBridge : NativeBridge {
     override val renderFrameFormatVersion: Int get() = JniNativeMethods.renderFrameV1FormatVersion()
     override val maxRenderFrameBytes: Int
         get() = JniNativeMethods.renderFrameV1MaxBytes().checkedInt("render frame maximum")
+    override val renderFrameV3FormatVersion: Int
+        get() = JniNativeMethods.renderFrameV3FormatVersion()
+    override val maxRenderFrameV3Bytes: Int
+        get() = JniNativeMethods.renderFrameV3MaxBytes().checkedInt("render frame v3 maximum")
     override val hostEffectFrameV2FormatVersion: Int
         get() = JniNativeMethods.hostEffectFrameV2FormatVersion()
     override val maxHostEffectFrameV2Bytes: Int
         get() = JniNativeMethods.hostEffectFrameV2MaxBytes().checkedInt("host-effect frame maximum")
     override val mouseInputV1StructSize: Int get() = JniNativeMethods.mouseInputV1StructSize()
+    override val inputV1StructSize: Int get() = JniNativeMethods.inputV1StructSize()
     override val inputV2StructSize: Int get() = JniNativeMethods.inputV2StructSize()
     override val inputV3StructSize: Int get() = JniNativeMethods.inputV3StructSize()
     override val configV3StructSize: Int get() = JniNativeMethods.configV3StructSize()
@@ -72,6 +77,25 @@ object JniNativeBridge : NativeBridge {
     ): NativeBridgeResult<NativeBridgeRenderFrame> = payloadResult("render") { output ->
         JniNativeMethods.render(handle.value, request.maxPayloadBytes.toLong(), output)
     }.mapPayload(::NativeBridgeRenderFrame)
+
+    override fun renderV3(
+        handle: NativeBridgeHandle,
+        request: NativeRenderRequest,
+    ): NativeBridgeResult<NativeBridgeRenderFrame> = payloadResult("renderV3") { output ->
+        JniNativeMethods.renderV3(handle.value, request.maxPayloadBytes.toLong(), output)
+    }.mapPayload(::NativeBridgeRenderFrame)
+
+    override fun encodeInputV1(
+        handle: NativeBridgeHandle,
+        input: NativeTerminalInputV1,
+    ): NativeBridgeResult<NativeBridgeEncodedInput> = payloadResult("encodeInputV1") { output ->
+        JniNativeMethods.encodeInputV1(
+            handle.value,
+            input.toWords(),
+            input.copyData(),
+            output,
+        )
+    }.mapPayload(::NativeBridgeEncodedInput)
 
     override fun encodeMouse(
         handle: NativeBridgeHandle,
@@ -176,6 +200,11 @@ private fun NativeMouseInputV1.toWords(): LongArray = longArrayOf(
     abiVersion.toLong(), structSize.toLong(), action.toLong(), button.toLong(), wheel.toLong(),
     buttonsHeld.toLong(), positionFlags.toLong(), modifiers.toLong(), cellColumn.toLong(),
     cellRow.toLong(), pixelX.toLong(), pixelY.toLong(), reserved0, reserved1,
+)
+
+private fun NativeTerminalInputV1.toWords(): LongArray = longArrayOf(
+    abiVersion.toLong(), structSize.toLong(), kind.toLong(), key.toLong(), modifiers.toLong(),
+    character.toLong(), dataLength, reserved0, reserved1,
 )
 
 private fun NativeWin32KeyInputV2.toWords(): LongArray = longArrayOf(

@@ -436,6 +436,7 @@ namespace TermLink.Agent
                 "Local IPC capabilities lost remote-input rejection support.");
             Require(!LocalPayloadCodec.ParseCapabilities(LocalPayloadCodec.Capabilities(false)),
                 "Local IPC capabilities enabled an unsupported feature.");
+            LocalPayloadCodec.ParseRemoteAccessStopped(LocalPayloadCodec.RemoteAccessStopped());
             var invalidRejected = false;
             try { LocalPayloadCodec.ParseCapabilities(new byte[] { 1, 2 }); }
             catch (InvalidDataException) { invalidRejected = true; }

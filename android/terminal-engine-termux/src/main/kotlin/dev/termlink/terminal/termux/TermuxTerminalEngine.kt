@@ -22,6 +22,7 @@ import dev.termlink.terminal.api.TerminalSessionProjectionSnapshotV1
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalSnapshotV1
 import dev.termlink.terminal.api.TerminalThemeV1
+import dev.termlink.terminal.api.TerminalViewportEngine
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -49,7 +50,7 @@ import kotlin.math.roundToInt
 class TermuxTerminalEngine(
     initialSize: TerminalSize = TerminalSize(DEFAULT_COLUMNS, DEFAULT_ROWS),
     private val transcriptRows: Int = DEFAULT_TRANSCRIPT_ROWS,
-) : CheckpointTerminalEngine {
+) : CheckpointTerminalEngine, TerminalViewportEngine {
     private val lock = Any()
     private val inputEventChannel = Channel<ByteArray>(Channel.UNLIMITED)
     private val mutableAuthoritativeSize = MutableStateFlow(initialSize)
@@ -192,8 +193,8 @@ class TermuxTerminalEngine(
 
     override val inputEvents: Flow<ByteArray> = inputEventChannel.receiveAsFlow()
     override val sizeEvents: Flow<TerminalSize> = emptyFlow()
-    val authoritativeSize: StateFlow<TerminalSize> = mutableAuthoritativeSize.asStateFlow()
-    val title: StateFlow<String> = mutableTitle.asStateFlow()
+    override val authoritativeSize: StateFlow<TerminalSize> = mutableAuthoritativeSize.asStateFlow()
+    override val title: StateFlow<String> = mutableTitle.asStateFlow()
 
     override suspend fun feed(seq: Long, bytes: ByteBuffer) {
         require(seq > 0) { "Terminal sequence must be positive" }
@@ -293,12 +294,12 @@ class TermuxTerminalEngine(
     }
 
     /** Creates the real Android terminal surface used by the Compose harness. */
-    fun createView(
+    override fun createView(
         context: Context,
-        textSizeSp: Float = DEFAULT_TEXT_SIZE_SP,
-        lineSpacingMultiplier: Float = 1f,
-        onScrollPastTop: (() -> Unit)? = null,
-        onScrollPastBottom: (() -> Unit)? = null,
+        textSizeSp: Float,
+        lineSpacingMultiplier: Float,
+        onScrollPastTop: (() -> Unit)?,
+        onScrollPastBottom: (() -> Unit)?,
     ): View {
         val mount = synchronized(lock) {
             checkActive()
@@ -382,7 +383,7 @@ class TermuxTerminalEngine(
     }
 
     /** Returns the current visible grid as text for deterministic regression tests. */
-    fun visibleText(): String = synchronized(lock) {
+    override fun visibleText(): String = synchronized(lock) {
         checkActive()
         emulator.getScreen().getSelectedText(
             0,
@@ -393,7 +394,7 @@ class TermuxTerminalEngine(
         )
     }
 
-    fun currentSize(): TerminalSize = synchronized(lock) {
+    override fun currentSize(): TerminalSize = synchronized(lock) {
         checkActive()
         currentSize
     }
@@ -402,7 +403,7 @@ class TermuxTerminalEngine(
      * Replaces the listener notified after real local user input has entered [inputEvents].
      * Passing null clears it. Emulator-generated replies (for example CSI queries) never notify it.
      */
-    fun setOnAcceptedLocalUserInputListener(listener: (() -> Unit)?) {
+    override fun setOnAcceptedLocalUserInputListener(listener: (() -> Unit)?) {
         synchronized(lock) {
             checkActive()
             acceptedLocalUserInputListener = listener
@@ -414,7 +415,7 @@ class TermuxTerminalEngine(
     }
 
     /** Returns an attached live view to its cursor-following tail without changing transport state. */
-    fun scrollToLatest() {
+    override fun scrollToLatest() {
         val view = synchronized(lock) {
             checkActive()
             viewReference?.get()
@@ -426,7 +427,7 @@ class TermuxTerminalEngine(
     }
 
     /** Drives the same primary/non-mouse top-boundary path used by an upward history gesture. */
-    fun scrollPastTopBoundary() {
+    override fun scrollPastTopBoundary() {
         val view = synchronized(lock) {
             checkActive()
             viewReference?.get()
@@ -439,7 +440,7 @@ class TermuxTerminalEngine(
     }
 
     /** Sends committed IME text through the same UTF-8 boundary as the real TerminalView. */
-    fun submitText(text: String): Boolean {
+    override fun submitText(text: String): Boolean {
         if (!canWriteInput()) return false
         var accepted = false
         text.codePoints().forEach { codePoint ->
@@ -454,7 +455,7 @@ class TermuxTerminalEngine(
     }
 
     /** Sends a printable code point, including the VT control and Alt transformations. */
-    fun submitCodePoint(codePoint: Int, controlDown: Boolean = false, altDown: Boolean = false): Boolean {
+    override fun submitCodePoint(codePoint: Int, controlDown: Boolean, altDown: Boolean): Boolean {
         require(Character.isValidCodePoint(codePoint)) { "Invalid Unicode code point: $codePoint" }
         if (!canWriteInput()) return false
         val transformed = if (controlDown) controlCodePoint(codePoint) else codePoint
@@ -468,7 +469,7 @@ class TermuxTerminalEngine(
     }
 
     /** Sends a non-text Android key using the pinned Termux key mapping. */
-    fun submitKeyCode(keyCode: Int, modifiers: Int = 0): Boolean {
+    override fun submitKeyCode(keyCode: Int, modifiers: Int): Boolean {
         if (!canWriteInput()) return false
         val encoded = synchronized(lock) {
             checkActive()
@@ -487,7 +488,7 @@ class TermuxTerminalEngine(
     }
 
     /** Sends a named key chord without depending on Android hardware meta-state delivery. */
-    fun submitKeyCode(
+    override fun submitKeyCode(
         keyCode: Int,
         controlDown: Boolean,
         altDown: Boolean,
@@ -501,7 +502,7 @@ class TermuxTerminalEngine(
     }
 
     /** Applies the emulator's sanitization and DECSET 2004 bracketed-paste behavior. */
-    fun submitPaste(text: String): Boolean {
+    override fun submitPaste(text: String): Boolean {
         if (!canWriteInput()) return false
         var accepted = false
         mutateSynchronously {

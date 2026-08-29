@@ -5,6 +5,9 @@ import android.database.sqlite.SQLiteFullException
 import androidx.annotation.StringRes
 import dev.termlink.harness.R
 import dev.termlink.network.production.TermLinkApiException
+import dev.termlink.terminal.nativecore.NativeTerminalContractException
+import dev.termlink.terminal.nativecore.NativeTerminalException
+import dev.termlink.terminal.nativecore.NativeTerminalStatus
 import java.io.IOException
 import java.net.SocketTimeoutException
 
@@ -43,6 +46,11 @@ enum class SessionOpenFailureCode(
     SNAPSHOT_UNSUPPORTED("TL-H117", false, R.string.terminal_error_snapshot_unsupported, R.string.terminal_error_action_update),
     SNAPSHOT_PRODUCTION_FAILED("TL-H118", true, R.string.terminal_error_snapshot_production_failed, R.string.terminal_error_action_retry),
     LOCAL_STORAGE_FULL("TL-H119", true, R.string.terminal_error_local_storage_full, R.string.terminal_error_action_free_storage),
+    NATIVE_CORE_UNAVAILABLE("TL-H120", false, R.string.terminal_error_native_core_unavailable, R.string.terminal_error_action_update),
+    NATIVE_RENDERER_FAILED_CLOSED("TL-H121", true, R.string.terminal_error_native_renderer_failed_closed, R.string.terminal_error_action_retry),
+    UNSUPPORTED_TERMINAL_CAPABILITY("TL-H122", false, R.string.terminal_error_unsupported_terminal_capability, R.string.terminal_error_action_update),
+    HISTORY_CORE_REBUILD_FAILED("TL-H123", true, R.string.terminal_error_history_core_rebuild_failed, R.string.terminal_error_action_retry),
+    GAP_RECOVERY_REQUIRED("TL-H124", true, R.string.terminal_error_gap_recovery_required, R.string.terminal_error_action_wait_history),
     REALTIME_CONNECTION("TL-R001", true, R.string.terminal_error_realtime_connection, R.string.terminal_error_action_check_network),
     CONTROL_LEASE_HELD("TL-C001", true, R.string.terminal_error_control_lease, R.string.terminal_error_action_wait_lease),
     UNKNOWN("TL-X001", true, R.string.terminal_error_unknown, R.string.terminal_error_action_retry),
@@ -94,6 +102,33 @@ internal fun classifySessionOpenException(
     if (error is SessionOpenException) return error
     if (error is SQLiteFullException || error.causedBy<SQLiteFullException>()) {
         return sessionOpenException(SessionOpenFailureCode.LOCAL_STORAGE_FULL, error)
+    }
+    val native = error.findCause<NativeTerminalException>()
+    if (native != null) {
+        val code = when (native.status) {
+            NativeTerminalStatus.ABI_MISMATCH,
+            NativeTerminalStatus.BRIDGE_FAILURE,
+            NativeTerminalStatus.MALFORMED_BRIDGE_RESULT,
+            -> SessionOpenFailureCode.NATIVE_CORE_UNAVAILABLE
+            NativeTerminalStatus.FAILED_CLOSED ->
+                SessionOpenFailureCode.NATIVE_RENDERER_FAILED_CLOSED
+            NativeTerminalStatus.UNSUPPORTED,
+            NativeTerminalStatus.HOST_EFFECT_VERSION_REQUIRED,
+            -> SessionOpenFailureCode.UNSUPPORTED_TERMINAL_CAPABILITY
+            NativeTerminalStatus.GAP -> SessionOpenFailureCode.GAP_RECOVERY_REQUIRED
+            else -> if (stage == SessionFailureStage.HISTORY_REPLAY) {
+                SessionOpenFailureCode.HISTORY_CORE_REBUILD_FAILED
+            } else {
+                SessionOpenFailureCode.NATIVE_RENDERER_FAILED_CLOSED
+            }
+        }
+        return sessionOpenException(code, error)
+    }
+    if (error.findCause<NativeTerminalContractException>() != null) {
+        return sessionOpenException(SessionOpenFailureCode.NATIVE_RENDERER_FAILED_CLOSED, error)
+    }
+    if (error is UnsatisfiedLinkError || error.chainClassNameContains("UnsatisfiedLink")) {
+        return sessionOpenException(SessionOpenFailureCode.NATIVE_CORE_UNAVAILABLE, error)
     }
     if (error is TermLinkApiException) {
         val code = when {
@@ -170,6 +205,15 @@ private inline fun <reified T : Throwable> Throwable.causedBy(): Boolean {
         current = current?.cause
     }
     return false
+}
+
+private inline fun <reified T : Throwable> Throwable.findCause(): T? {
+    var current: Throwable? = this
+    repeat(8) {
+        if (current is T) return current
+        current = current?.cause
+    }
+    return null
 }
 
 private fun Throwable.chainClassNameContains(value: String): Boolean {

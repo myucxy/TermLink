@@ -47,8 +47,9 @@ TerminalCore 当前是进程内静态 C++ 库，没有稳定序列化 ABI。读�
 ```
 
 当时评估的原生 exporter 挂点是 `ControlCore::_connectionOutputHandler`。该挂点不再实施。新的
-目标路径将从 durable ordered journal 向自研 Rust 核心提交完整事件。当前只有不改变生产权威的
-Phase 1 诊断 shadow 接入 `ProductionAgentRuntime`；SessionHost authority 与 durable ACK 尚未切换。
+目标路径已经从 durable ordered journal 向自研 Rust 核心提交完整事件：`SessionHost` 只在 Agent
+返回 durable ACK 后按序 apply，Gap fail closed，并由同一串行域写入核心 PTY reply 与用户输入。
+Phase 1 诊断 shadow 仍可用于差分回归，但不再承担 production authority。
 
 以下内容仅保留为非权威的历史差距清单；现行需求、状态与门禁以
 [TermLink 自研跨平台终端核心 V2](TERMLINK_TERMINAL_CORE_V2.md) 为准。

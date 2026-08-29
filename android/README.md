@@ -4,8 +4,10 @@
 
 - `terminal-engine-api`：不依赖 Termux、WebView 或业务 UI 的稳定引擎边界；
 - `terminal-engine-replay`：严格校验 Golden Stream V1 和 LAN Replay V1；
-- `terminal-engine-termux`：把远程原始 VT 字节、resize、主题和只读输入边界适配到
-  Termux emulator/view；
+- `terminal-engine-native`：把各 ABI 打包的 terminal-core JNI 库、严格 frame decoder、语义输入和
+  自研 View 接入 production renderer；
+- `terminal-engine-termux`：保留 Termux-derived emulator/view 作为 Harness、旧归档 CHUNK 查看与
+  差分测试适配层，不承担 live renderer、ACK 或恢复的 production authority；
 - `core-session`：与 Termux、Compose 和具体网络实现解耦的 `RemoteTerminalSession`；
 - `core-network`：生产 HTTPS/OIDC/API 与 Protobuf realtime client；另以独立包保留
   Phase 1 临时双向测试 Relay 适配；
@@ -13,7 +15,7 @@
 - `core-database`、`core-model`：Room 加密历史索引、设备/会话/权益模型；
 - `feature-history`、`feature-billing`：每 Android 设备有界历史和 Google Play Billing；
 - `app`：Compose 产品页面与 Harness，以分段模式隔离本地 Bundle、只读 LAN Replay 和
-  临时双向会话；生产页面与三条测试路径均驱动真实 `TerminalView` 网格。
+  临时双向会话；生产页面由 terminal-core native View 渲染，测试路径仍保持各自的隔离夹具。
 
 浏览器侧的固定 xterm.js 对照位于
 [`terminal-reference/xterm-harness`](../terminal-reference/xterm-harness/README.md)。
@@ -99,8 +101,9 @@ android/app/build/outputs/apk/debug/app-debug.apk
 自动重试。它还绑定测试租约、Flow Control 和明确的 History Gap。5 个单元测试的证据位于
 `docs/validation/phase1-android-network.json`。
 
-规范化 Snapshot 尚未冻结。因此状态机明确拒绝从中段清空并回放，不能用 Termux 私有网格
-序列化冒充跨端 Snapshot。`core-network` 的 `production` 包现在接入生产 HTTPS/WebSocket、
+规范化 Snapshot 仍使用独立 capability 门禁。状态机明确拒绝从中段清空并回放，不能用 Termux
+私有网格或兼容投影冒充跨端 Snapshot；production native renderer 只接受 terminal-core checkpoint
+或从事件 1 开始的已验证连续历史重建。`core-network` 的 `production` 包现在接入生产 HTTPS/WebSocket、
 Crypto、设备授权和正式 API；`testrelay` 包及“双向会话”页面仍只接入临时明文测试协议，
 LAN Replay 继续保持只读。生产历史请求默认只接受 HTTPS；测试 Compose 的 MinIO HTTP
 端口仅供 loopback 集成测试。
@@ -111,7 +114,7 @@ LAN Replay 继续保持只读。生产历史请求默认只接受 HTTPS；测试
 | --- | --- | --- | --- |
 | 1 | 生产账号/OIDC/设备注册与配对 | **已实现并验证（预配置接入）** | Go `auth`、设备注册/配对 API、Android AppAuth/Keystore、Windows challenge/撤销；Windows runtime 当前读取本机预配置的 DPAPI 凭据，不包含浏览器 OIDC enrollment UI。 |
 | 2 | 生产 Protobuf 实时协议、X25519 + ChaCha20-Poly1305、Relay | **已实现并验证** | `protocol/protobuf/termlink_realtime.proto`、Go `realtimewire`/Relay、Android `core-network`、Windows `src/Protocol`；向量、协议和 Relay 测试通过。 |
-| 3 | Windows ConPTY 到 Android 真实输入输出、ACK/Gap/重连、租约与本地输入优先 | **已实现并验证（模块/契约级）** | Windows `ProductionAgentRuntime`、Android 生产 Session Client、服务端租约/撤销；真实 ConPTY、跨端向量和各端自动化覆盖有界重放、ACK/Gap、输入去重、租约和本地输入 epoch，尚未做公网生产部署验收。 |
+| 3 | Windows ConPTY 到 Android 真实输入输出、ACK/Gap/重连、租约与本地输入优先 | **production authority 已切换并完成公网验收** | Windows `SessionHost` durable-ACK authority、Android terminal-core JNI/native View、生产 Session Client 与服务端租约/撤销已经接通；真实 ConPTY、公网 TL-H115 任意长度恢复、ACK/Gap/重连、输入去重、租约、本地输入 epoch、IME 和首尾 marker 均已验收。 |
 | 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
 | 5 | 服务端 Catalog、计费验证边界、权益与配额 | **核心已实现并验证（Provider 待配置）** | Go Catalog/entitlement、可注入 verified-purchase 契约和 Android Play Billing 协调已测试；生产 main 在真实 Google/Web verifier 未配置时返回 `BILLING_UNAVAILABLE`，未冒充线上购买验证。 |
 | 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |

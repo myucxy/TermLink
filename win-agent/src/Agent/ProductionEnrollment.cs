@@ -142,12 +142,24 @@ namespace TermLink.Agent
 
         public static void LoginDirect(string serverUrl, string pcName, string username, string password)
         {
-            RunDirectAsync(serverUrl, pcName, username, null, password, false).GetAwaiter().GetResult();
+            RunDirectAsync(serverUrl, pcName, username, null, null, password, false).GetAwaiter().GetResult();
         }
 
         public static void RegisterDirect(string serverUrl, string pcName, string username, string email, string password, string confirm)
         {
-            RunDirectAsync(serverUrl, pcName, username, email, password, true, confirm).GetAwaiter().GetResult();
+            RegisterDirect(serverUrl, pcName, username, username, email, password, confirm);
+        }
+
+        public static void RegisterDirect(
+            string serverUrl,
+            string pcName,
+            string username,
+            string nickname,
+            string email,
+            string password,
+            string confirm)
+        {
+            RunDirectAsync(serverUrl, pcName, username, nickname, email, password, true, confirm).GetAwaiter().GetResult();
         }
 
         /// <summary>
@@ -181,7 +193,15 @@ namespace TermLink.Agent
             };
         }
 
-        private static async Task RunDirectAsync(string serverUrl, string pcName, string username, string email, string password, bool register, string confirm = null)
+        private static async Task RunDirectAsync(
+            string serverUrl,
+            string pcName,
+            string username,
+            string nickname,
+            string email,
+            string password,
+            bool register,
+            string confirm = null)
         {
             if (!Uri.TryCreate(serverUrl, UriKind.Absolute, out var server) || server.Scheme != Uri.UriSchemeHttps ||
                 !string.IsNullOrEmpty(server.Query) || !string.IsNullOrEmpty(server.Fragment))
@@ -194,13 +214,15 @@ namespace TermLink.Agent
             ValidateClientConfigurationForDirect(client);
             if (register)
             {
-                if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(confirm) || password != confirm)
+                if (string.IsNullOrWhiteSpace(nickname) || string.IsNullOrWhiteSpace(email) ||
+                    string.IsNullOrWhiteSpace(confirm) || password != confirm)
                     throw new ArgumentException("Registration fields are invalid.");
                 using var registration = new HttpRequestMessage(HttpMethod.Post, serverUrl.TrimEnd('/') + "/v1/auth/register")
                 {
                     Content = new StringContent(JsonSerializer.Serialize(new
                     {
-                        username = username.Trim(), email = email.Trim(), password, password_confirm = confirm
+                        username = username.Trim(), nickname = nickname.Trim(), email = email.Trim(),
+                        password, password_confirm = confirm
                     }), Encoding.UTF8, "application/json")
                 };
                 using var registrationResponse = await http.SendAsync(registration, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
@@ -268,6 +290,7 @@ namespace TermLink.Agent
                         : NormalizePcName(pcName),
                     AccountKey = accountKey,
                     AccountUsername = string.IsNullOrWhiteSpace(account.Username) && selection.ReusePcIdentity ? existingConfig?.AccountUsername : account.Username,
+                    AccountNickname = string.IsNullOrWhiteSpace(account.Nickname) && selection.ReusePcIdentity ? existingConfig?.AccountNickname : account.Nickname,
                     AccountEmail = string.IsNullOrWhiteSpace(account.Email) && selection.ReusePcIdentity ? existingConfig?.AccountEmail : account.Email,
                     AgentVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown",
                     KeyEpoch = selection.ReusePcIdentity && existingConfig != null ? existingConfig.KeyEpoch : 1,

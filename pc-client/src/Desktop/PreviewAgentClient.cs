@@ -53,6 +53,7 @@ public sealed class PreviewAgentClient : IAgentClient
 
     public ValueTask RegisterAsync(
         string username,
+        string nickname,
         string email,
         string password,
         string passwordConfirmation,
@@ -98,6 +99,7 @@ public sealed class PreviewAgentClient : IAgentClient
             identity,
             AgentConnectionState.Connected,
             true,
+            "preview-user",
             "Preview Account",
             "https://preview.invalid",
             remoteAccessEnabled,

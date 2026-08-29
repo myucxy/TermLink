@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.Globalization;
 using TermLink.Pc.Contracts;
 using TermLink.Platform;
 
@@ -106,22 +107,63 @@ public enum AccountFormMode
 public sealed class AccountPageViewModel : ObservableObject
 {
     private string username = string.Empty;
+    private string nickname = string.Empty;
     private string email = string.Empty;
     private string password = string.Empty;
     private string passwordConfirmation = string.Empty;
     private string pcName = Environment.MachineName;
     private bool accountLinked;
-    private string accountDisplayName = string.Empty;
+    private string currentUsername = string.Empty;
+    private string currentNickname = string.Empty;
     private AccountFormMode formMode;
 
     public string Username { get => username; set => SetProperty(ref username, value); }
+    public string Nickname { get => nickname; set => SetProperty(ref nickname, value); }
     public string Email { get => email; set => SetProperty(ref email, value); }
     public string Password { get => password; set => SetProperty(ref password, value); }
     public string PasswordConfirmation { get => passwordConfirmation; set => SetProperty(ref passwordConfirmation, value); }
     public string PcName { get => pcName; set => SetProperty(ref pcName, value); }
     public bool AccountLinked { get => accountLinked; internal set => SetProperty(ref accountLinked, value); }
-    public string AccountDisplayName { get => accountDisplayName; internal set => SetProperty(ref accountDisplayName, value); }
+    public string CurrentUsername
+    {
+        get => currentUsername;
+        internal set
+        {
+            if (!SetProperty(ref currentUsername, value)) return;
+            RaiseAccountIdentityProperties();
+        }
+    }
+    public string CurrentNickname
+    {
+        get => currentNickname;
+        internal set
+        {
+            if (!SetProperty(ref currentNickname, value)) return;
+            RaiseAccountIdentityProperties();
+        }
+    }
+    public string AccountDisplayName => FirstNonEmpty(CurrentNickname, CurrentUsername, PresentationText.Account);
+    public string AccountUsernameDisplay => string.IsNullOrWhiteSpace(CurrentUsername) ? string.Empty : $"@{CurrentUsername.Trim()}";
+    public string AccountAvatarInitial
+    {
+        get
+        {
+            var source = FirstNonEmpty(CurrentNickname, CurrentUsername, PresentationText.Account);
+            var initial = StringInfo.GetNextTextElement(source.Trim());
+            return initial.Length == 1 ? initial.ToUpperInvariant() : initial;
+        }
+    }
     public AccountFormMode FormMode { get => formMode; internal set => SetProperty(ref formMode, value); }
+
+    private void RaiseAccountIdentityProperties()
+    {
+        RaisePropertyChanged(nameof(AccountDisplayName));
+        RaisePropertyChanged(nameof(AccountUsernameDisplay));
+        RaisePropertyChanged(nameof(AccountAvatarInitial));
+    }
+
+    private static string FirstNonEmpty(params string[] values) =>
+        values.First(value => !string.IsNullOrWhiteSpace(value)).Trim();
 }
 
 public sealed class SettingsPageViewModel : PageViewModel
@@ -194,6 +236,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private readonly INavigationTelemetry? navigationTelemetry;
     private readonly CancellationTokenSource lifetimeCancellation = new();
     private readonly SemaphoreSlim updateCheckLock = new(1, 1);
+    private readonly TimeSpan updateCheckInterval;
     private readonly Dictionary<string, PageViewModel> pages;
     private PageViewModel currentPage;
     private string settingsSection = "general";
@@ -209,6 +252,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private string confirmationDetail = string.Empty;
     private TaskCompletionSource<bool>? pendingConfirmation;
     private AppearancePreference appearancePreference;
+    private bool accountStateKnown;
+    private bool hasAvailableUpdate;
+    private string availableUpdateText = string.Empty;
+    private Task? updatePolling;
 
     public MainWindowViewModel(
         AgentStateStore stateStore,
@@ -219,7 +266,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         IDesktopOperations? desktopOperations = null,
         IAppearanceController? appearanceController = null,
         string applicationVersion = "1.0.0.0",
-        string author = "清风惹尘丶")
+        string author = "清风惹尘丶",
+        TimeSpan? updateCheckInterval = null)
     {
         this.stateStore = stateStore ?? throw new ArgumentNullException(nameof(stateStore));
         this.client = client ?? throw new ArgumentNullException(nameof(client));
@@ -227,6 +275,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         this.navigationTelemetry = navigationTelemetry;
         this.desktopOperations = desktopOperations;
         this.appearanceController = appearanceController;
+        this.updateCheckInterval = updateCheckInterval ?? TimeSpan.FromHours(6);
+        if (this.updateCheckInterval <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(updateCheckInterval));
         appearancePreference = appearanceController?.Current ?? AppearancePreference.System;
         ArgumentNullException.ThrowIfNull(descriptor);
 
@@ -274,6 +325,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             RaiseAccountStateProperties();
             return Task.CompletedTask;
         });
+        OpenAboutUpdatesCommand = new AsyncCommand((_, _) =>
+        {
+            Navigate("settings");
+            SelectSettingsSection("about");
+            return Task.CompletedTask;
+        });
         StopSessionCommand = new AsyncCommand((parameter, cancellationToken) =>
             parameter is Guid sessionId ? StopSessionAsync(sessionId, cancellationToken) : Task.CompletedTask);
         GrantDeviceCommand = new AsyncCommand((parameter, cancellationToken) =>
@@ -316,6 +373,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         SaveTerminalCommandsCommand = new AsyncCommand((_, cancellationToken) => SaveTerminalCommandsAsync(cancellationToken));
         CheckForUpdatesCommand = new AsyncCommand((_, cancellationToken) =>
             CheckForUpdatesAsync(interactive: true, showNotice: true, cancellationToken));
+        UpdateActionCommand = new AsyncCommand((_, cancellationToken) =>
+            CheckForUpdatesAsync(interactive: true, showNotice: true, cancellationToken));
         OpenDiagnosticsDirectoryCommand = new AsyncCommand((_, cancellationToken) =>
             RunDesktopOperationAsync(token => RequireDesktopOperations().OpenDiagnosticsDirectoryAsync(token), cancellationToken));
         RepairTerminalIntegrationCommand = new AsyncCommand((_, cancellationToken) =>
@@ -351,6 +410,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand SetRemoteAccessCommand { get; }
     public AsyncCommand RetryConnectionCommand { get; }
     public AsyncCommand OpenAccountSettingsCommand { get; }
+    public AsyncCommand OpenAboutUpdatesCommand { get; }
     public AsyncCommand StopSessionCommand { get; }
     public AsyncCommand GrantDeviceCommand { get; }
     public AsyncCommand RevokeDeviceCommand { get; }
@@ -364,6 +424,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand RemoveTerminalCommandCommand { get; }
     public AsyncCommand SaveTerminalCommandsCommand { get; }
     public AsyncCommand CheckForUpdatesCommand { get; }
+    public AsyncCommand UpdateActionCommand { get; }
     public AsyncCommand OpenDiagnosticsDirectoryCommand { get; }
     public AsyncCommand RepairTerminalIntegrationCommand { get; }
     public AsyncCommand DismissNoticeCommand { get; }
@@ -417,8 +478,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public bool HasDevices => Devices.Items.Count > 0;
     public bool HasNoDevices => !HasDevices;
     public bool RequiresReauthentication => Connection.State == AgentConnectionState.ReauthenticationRequired;
-    public bool IsAccountLinked => Account.AccountLinked && !RequiresReauthentication;
-    public bool IsAccountSignedOut => !IsAccountLinked;
+    public bool IsAccountStateKnown => accountStateKnown;
+    public bool IsAccountStateLoading => !IsAccountStateKnown;
+    public bool IsAccountLinked => IsAccountStateKnown && Account.AccountLinked && !RequiresReauthentication;
+    public bool IsAccountSignedOut => IsAccountStateKnown && !IsAccountLinked;
     public bool CanRegisterAccount => !RequiresReauthentication;
     public string AccountStateTitle => RequiresReauthentication
         ? PresentationText.AuthenticationExpired
@@ -428,17 +491,24 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         : PresentationText.SignInDetail;
     public bool IsLoginMode => Account.FormMode == AccountFormMode.Login;
     public bool IsRegisterMode => Account.FormMode == AccountFormMode.Register;
+    public string AccountActionText => RequiresReauthentication ? PresentationText.SignInAgain : PresentationText.Login;
+    public bool HasAvailableUpdate
+    {
+        get => hasAvailableUpdate;
+        private set
+        {
+            if (!SetProperty(ref hasAvailableUpdate, value)) return;
+            RaisePropertyChanged(nameof(UpdateActionText));
+        }
+    }
+    public string AvailableUpdateText { get => availableUpdateText; private set => SetProperty(ref availableUpdateText, value); }
+    public string UpdateActionText => HasAvailableUpdate ? PresentationText.StartUpdate : PresentationText.CheckUpdates;
 
     public void Start()
     {
         stateStore.Start();
         if (desktopOperations is not null)
-        {
-            _ = CheckForUpdatesAsync(
-                interactive: false,
-                showNotice: false,
-                lifetimeCancellation.Token);
-        }
+            updatePolling ??= PollForUpdatesAsync(lifetimeCancellation.Token);
     }
 
     public void Navigate(string? key)
@@ -500,7 +570,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Connection.RemoteAccessEnabled = snapshot.RemoteAccessEnabled;
         Settings.Version = snapshot.Identity.AgentVersion;
         Account.AccountLinked = snapshot.AccountLinked;
-        Account.AccountDisplayName = snapshot.AccountDisplayName;
+        Account.CurrentUsername = snapshot.AccountUsername;
+        Account.CurrentNickname = snapshot.AccountNickname;
+        accountStateKnown = true;
         if (snapshot.ConnectionState == AgentConnectionState.ReauthenticationRequired)
             Account.FormMode = AccountFormMode.Login;
         if (string.IsNullOrWhiteSpace(Account.PcName)) Account.PcName = snapshot.Identity.Name;
@@ -600,17 +672,19 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     private Task RegisterAsync(CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(Account.Username) || string.IsNullOrWhiteSpace(Account.Email) ||
+        if (string.IsNullOrWhiteSpace(Account.Username) || string.IsNullOrWhiteSpace(Account.Nickname) ||
+            string.IsNullOrWhiteSpace(Account.Email) ||
             string.IsNullOrWhiteSpace(Account.Password) || Account.Password != Account.PasswordConfirmation)
         {
             ShowNotice(UiNoticeSeverity.Warning,
                 PresentationText.Pick("请检查注册信息", "Check registration details"),
-                PresentationText.Pick("用户名、邮箱和密码不能为空，两次密码必须一致。", "Username, email, and password are required, and passwords must match."));
+                PresentationText.Pick("用户名、昵称、邮箱和密码不能为空，两次密码必须一致。", "Username, nickname, email, and password are required, and passwords must match."));
             return Task.CompletedTask;
         }
         return MutateAsync(
             token => client.RegisterAsync(
                 Account.Username.Trim(),
+                Account.Nickname.Trim(),
                 Account.Email.Trim(),
                 Account.Password,
                 Account.PasswordConfirmation,
@@ -714,6 +788,28 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
+    private async Task PollForUpdatesAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await CheckForUpdatesAsync(
+                interactive: false,
+                showNotice: false,
+                cancellationToken).ConfigureAwait(false);
+            using var timer = new PeriodicTimer(updateCheckInterval);
+            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+            {
+                await CheckForUpdatesAsync(
+                    interactive: false,
+                    showNotice: false,
+                    cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+    }
+
     private void ApplyUpdateStatus(DesktopUpdateStatus status)
     {
         Settings.UpdateStatusText = PresentationText.UpdateStatus(status);
@@ -721,6 +817,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Settings.ReleaseNotesTitle = PresentationText.UpdateReleaseNotesTitle(
             status.VersionName,
             status.BuildNumber);
+        HasAvailableUpdate = status.Decision is DesktopUpdateDecision.Optional or DesktopUpdateDecision.Required;
+        AvailableUpdateText = HasAvailableUpdate ? PresentationText.AvailableUpdate(status) : string.Empty;
     }
 
     private void ClearUpdateStatus(string statusText)
@@ -952,10 +1050,13 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         RaisePropertyChanged(nameof(HasNoSessions));
         RaisePropertyChanged(nameof(HasDevices));
         RaisePropertyChanged(nameof(HasNoDevices));
+        RaisePropertyChanged(nameof(AccountActionText));
     }
 
     private void RaiseAccountStateProperties()
     {
+        RaisePropertyChanged(nameof(IsAccountStateKnown));
+        RaisePropertyChanged(nameof(IsAccountStateLoading));
         RaisePropertyChanged(nameof(IsAccountLinked));
         RaisePropertyChanged(nameof(IsAccountSignedOut));
         RaisePropertyChanged(nameof(CanRegisterAccount));
@@ -963,6 +1064,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         RaisePropertyChanged(nameof(AccountStateDetail));
         RaisePropertyChanged(nameof(IsLoginMode));
         RaisePropertyChanged(nameof(IsRegisterMode));
+        RaisePropertyChanged(nameof(AccountActionText));
         RaisePropertyChanged(nameof(CanEnableRemoteAccess));
     }
 
@@ -1064,6 +1166,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         lifetimeCancellation.Cancel();
         pendingConfirmation?.TrySetResult(false);
         stateStore.Changed -= StateChanged;
+        if (updatePolling is not null)
+        {
+            try { await updatePolling.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+        }
         await stateStore.DisposeAsync().ConfigureAwait(false);
         lifetimeCancellation.Dispose();
     }

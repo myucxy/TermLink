@@ -437,6 +437,35 @@ services:
         /opt/keycloak/bin/kcadm.sh update \
           "clients/$$windows_client_id/optional-client-scopes/$$offline_scope_id" \
           --config /tmp/kcadm.config -r termlink >/dev/null
+        cat > /tmp/termlink-windows-nickname.json <<'JSON'
+        {
+          "name": "termlink-windows-nickname",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "nickname",
+            "claim.name": "nickname",
+            "jsonType.label": "String",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        }
+        JSON
+        windows_mapper_table=$$(/opt/keycloak/bin/kcadm.sh get \
+          "clients/$$windows_client_id/protocol-mappers/models" \
+          --config /tmp/kcadm.config -r termlink \
+          --fields id,name --format csv --noquotes)
+        windows_nickname_mapper_id=$$(printf '%s\n' "$$windows_mapper_table" | while IFS=, read -r id name; do
+          if test "$$name" = termlink-windows-nickname; then printf '%s' "$$id"; fi
+        done)
+        if test -z "$$windows_nickname_mapper_id"; then
+          /opt/keycloak/bin/kcadm.sh create \
+            "clients/$$windows_client_id/protocol-mappers/models" \
+            --config /tmp/kcadm.config -r termlink \
+            -f /tmp/termlink-windows-nickname.json >/dev/null
+        fi
         web_client_id=$$(/opt/keycloak/bin/kcadm.sh get clients \
           --config /tmp/kcadm.config \
           -r termlink -q clientId=termlink-web \

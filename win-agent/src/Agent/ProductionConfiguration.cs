@@ -17,6 +17,7 @@ namespace TermLink.Agent
         // must never decide whether a device identity can be reused.
         public string AccountKey { get; set; }
         public string AccountUsername { get; set; }
+        public string AccountNickname { get; set; }
         public string AccountEmail { get; set; }
         public string AgentVersion { get; set; }
         public long KeyEpoch { get; set; }
@@ -180,13 +181,13 @@ namespace TermLink.Agent
 
         // These claims are display-only account labels. They never participate
         // in device authorization or Relay authentication decisions.
-        internal static (string Username, string Email) ReadAccountClaims(string accessToken)
+        internal static (string Username, string Nickname, string Email) ReadAccountClaims(string accessToken)
         {
-            if (string.IsNullOrWhiteSpace(accessToken)) return (null, null);
+            if (string.IsNullOrWhiteSpace(accessToken)) return (null, null, null);
             try
             {
                 var parts = accessToken.Split('.');
-                if (parts.Length != 3) return (null, null);
+                if (parts.Length != 3) return (null, null, null);
                 var encoded = parts[1].Replace('-', '+').Replace('_', '/');
                 encoded += new string('=', (4 - encoded.Length % 4) % 4);
                 var payload = Convert.FromBase64String(encoded);
@@ -194,12 +195,13 @@ namespace TermLink.Agent
                 var root = document.RootElement;
                 var username = root.TryGetProperty("preferred_username", out var preferred) ? preferred.GetString() : null;
                 if (string.IsNullOrWhiteSpace(username) && root.TryGetProperty("username", out var rawUsername)) username = rawUsername.GetString();
+                var nickname = root.TryGetProperty("nickname", out var nicknameValue) ? nicknameValue.GetString() : null;
                 var email = root.TryGetProperty("email", out var emailValue) ? emailValue.GetString() : null;
-                return (NormalizeClaim(username), NormalizeClaim(email));
+                return (NormalizeClaim(username), NormalizeClaim(nickname), NormalizeClaim(email));
             }
             catch (Exception error) when (error is FormatException || error is JsonException || error is ArgumentException || error is InvalidOperationException)
             {
-                return (null, null);
+                return (null, null, null);
             }
         }
 

@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Text;
 using TermLink.LocalIpc;
 using TermLink.SessionHost;
+using TermLink.TerminalCore;
 
 var encodedCommand = Convert.ToBase64String(Encoding.UTF8.GetBytes("cmd.exe"));
 var firstOptions = SessionHostOptions.Parse(new[] { "--command-base64", encodedCommand, "--managed-shell", "custom" });
@@ -130,6 +131,245 @@ using (var sessionHost = new ConPtySessionHost(firstOptions))
         "changed or explicitly cleared titles were not published exactly once");
 }
 
+using var suppressor = new OuterTerminalReplySuppressor();
+suppressor.Expect(Encoding.ASCII.GetBytes("\u001b[?1;2c"));
+var primaryWithUserInput = Encoding.ASCII.GetBytes("\u001b[?1;0cuser");
+Require(
+    Encoding.ASCII.GetString(suppressor.Filter(primaryWithUserInput, primaryWithUserInput.Length)) == "user" &&
+        suppressor.PendingCount == 0,
+    "Windows Terminal primary-DA compatibility reply was not suppressed semantically");
+suppressor.Expect(Encoding.ASCII.GetBytes("\u001b[3;4R"));
+var ordinaryArrow = Encoding.ASCII.GetBytes("\u001b[A");
+Require(suppressor.Filter(ordinaryArrow, ordinaryArrow.Length).SequenceEqual(ordinaryArrow) &&
+    suppressor.PendingCount == 1,
+    "ordinary user key input consumed a terminal reply expectation");
+var cursorReply = Encoding.ASCII.GetBytes("\u001b[20;70R");
+Require(suppressor.Filter(cursorReply, cursorReply.Length).Length == 0 &&
+    suppressor.PendingCount == 0,
+    "cursor-position compatibility reply was not suppressed");
+
+suppressor.Expect(Encoding.ASCII.GetBytes("\u001b[?1;2c"));
+var splitCsiParts = new[] { "\u001b", "[?1;", "0cuser" };
+var splitCsiOutput = new List<byte>();
+foreach (var part in splitCsiParts)
+{
+    var bytes = Encoding.ASCII.GetBytes(part);
+    splitCsiOutput.AddRange(suppressor.Filter(bytes, bytes.Length));
+}
+Require(Encoding.ASCII.GetString(splitCsiOutput.ToArray()) == "user" &&
+    suppressor.BufferedCandidateBytes == 0 && suppressor.PendingCount == 0,
+    "a CSI terminal reply split across reads was not suppressed exactly");
+
+suppressor.Expect(Encoding.ASCII.GetBytes("\u001b]10;rgb:ffff/ffff/ffff\u0007"));
+foreach (var part in new[] { "\u001b]10;rgb:", "0000/1111/", "2222\u0007" })
+{
+    var bytes = Encoding.ASCII.GetBytes(part);
+    Require(suppressor.Filter(bytes, bytes.Length).Length == 0,
+        "an OSC BEL reply fragment escaped suppression");
+}
+Require(suppressor.PendingCount == 0,
+    "an OSC BEL reply split across reads did not consume its expectation");
+
+suppressor.Expect(Encoding.ASCII.GetBytes("\u001b]11;rgb:0000/0000/0000\u001b\\"));
+foreach (var part in new[] { "\u001b]11;rgb:ffff/", "eeee/dddd\u001b", "\\" })
+{
+    var bytes = Encoding.ASCII.GetBytes(part);
+    Require(suppressor.Filter(bytes, bytes.Length).Length == 0,
+        "an OSC ST reply fragment escaped suppression");
+}
+Require(suppressor.PendingCount == 0,
+    "an OSC ST reply split across reads did not consume its expectation");
+
+suppressor.Expect(Encoding.ASCII.GetBytes("\u001bP1$r0m\u001b\\"));
+foreach (var part in new[] { "\u001bP1$", "r1m\u001b", "\\" })
+{
+    var bytes = Encoding.ASCII.GetBytes(part);
+    Require(suppressor.Filter(bytes, bytes.Length).Length == 0,
+        "a DCS reply fragment escaped suppression");
+}
+Require(suppressor.PendingCount == 0,
+    "a DCS reply split across reads did not consume its expectation");
+
+var fragmentDispositions = new List<bool>();
+suppressor.Expect(Encoding.ASCII.GetBytes("\u001b[6;9R"));
+foreach (var part in new[] { "\u001b", "[6;", "20R" })
+{
+    var bytes = Encoding.ASCII.GetBytes(part);
+    suppressor.FilterFragment(bytes, bytes.Length, passed => fragmentDispositions.Add(passed));
+}
+Require(fragmentDispositions.SequenceEqual(new[] { false, false, false }) &&
+    suppressor.PendingCount == 0,
+    "console fragments belonging to a split terminal reply were not resolved as suppressed");
+
+fragmentDispositions.Clear();
+suppressor.Expect(Encoding.ASCII.GetBytes("\u001b[1;1R"));
+foreach (var part in new[] { "\u001b", "x" })
+{
+    var bytes = Encoding.ASCII.GetBytes(part);
+    suppressor.FilterFragment(bytes, bytes.Length, passed => fragmentDispositions.Add(passed));
+}
+Require(fragmentDispositions.SequenceEqual(new[] { true, true }) &&
+    suppressor.PendingCount == 1,
+    "an ordinary split Alt key sequence was delayed after becoming unambiguous");
+var finalExpectedCursor = Encoding.ASCII.GetBytes("\u001b[99;99R");
+Require(suppressor.Filter(finalExpectedCursor, finalExpectedCursor.Length).Length == 0 &&
+    suppressor.PendingCount == 0,
+    "the expectation following split Alt input was not retained");
+
+byte[] expiredRawInput = null;
+using (var expirySignal = new System.Threading.ManualResetEventSlim(false))
+using (var expiringSuppressor = new OuterTerminalReplySuppressor(bytes =>
+{
+    expiredRawInput = bytes;
+    expirySignal.Set();
+}))
+{
+    expiringSuppressor.Expect(Encoding.ASCII.GetBytes("\u001b[4;4R"));
+    var loneEscape = new byte[] { 0x1b };
+    Require(expiringSuppressor.Filter(loneEscape, loneEscape.Length).Length == 0,
+        "a potentially split reply prefix was not buffered");
+    Require(expirySignal.Wait(TimeSpan.FromSeconds(2)) &&
+        expiredRawInput != null && expiredRawInput.SequenceEqual(loneEscape),
+        "an expired raw reply candidate was not released without another input read");
+}
+
+var durableApplyOrder = new List<ulong>();
+var authorityBridge = new AgentPipeBridge(
+    "unused-authority-validation-pipe",
+    Guid.NewGuid(),
+    new byte[LocalPayloadCodec.HandshakeTokenBytes],
+    (_, _) => { },
+    (_, _, _) => LocalRemoteInputResult.Accepted,
+    1024 * 1024,
+    frame => durableApplyOrder.Add(frame.Sequence));
+authorityBridge.Publish(LocalFrameType.Lifecycle,
+    LocalPayloadCodec.Lifecycle(LocalLifecycleState.Running, 0));
+authorityBridge.Publish(LocalFrameType.Output, Encoding.ASCII.GetBytes("durable"));
+typeof(AgentPipeBridge).GetMethod("Acknowledge", BindingFlags.Instance | BindingFlags.NonPublic)!
+    .Invoke(authorityBridge, new object[] { 2UL });
+Require(durableApplyOrder.SequenceEqual(new[] { 1UL, 2UL }) &&
+    authorityBridge.LastAcknowledgedSequence == 2,
+    "cumulative Agent ACK became visible before ordered authority apply completed");
+authorityBridge.Dispose();
+
+var localOnlyApplyOrder = new List<ulong>();
+var localOnlyBridge = new AgentPipeBridge(
+    "unused-local-only-validation-pipe",
+    Guid.NewGuid(),
+    new byte[LocalPayloadCodec.HandshakeTokenBytes],
+    (_, _) => { },
+    (_, _, _) => LocalRemoteInputResult.Accepted,
+    1024 * 1024,
+    frame => localOnlyApplyOrder.Add(frame.Sequence));
+localOnlyBridge.Publish(LocalFrameType.Lifecycle,
+    LocalPayloadCodec.Lifecycle(LocalLifecycleState.Running, 0));
+typeof(AgentPipeBridge).GetMethod("EnterLocalOnly", BindingFlags.Instance | BindingFlags.NonPublic)!
+    .Invoke(localOnlyBridge, Array.Empty<object>());
+localOnlyBridge.Publish(LocalFrameType.Output, Encoding.ASCII.GetBytes("local-only"));
+Require(localOnlyApplyOrder.SequenceEqual(new[] { 1UL, 2UL }) &&
+    localOnlyBridge.LastAcknowledgedSequence == 2 &&
+    localOnlyBridge.LastDurablyAcknowledgedSequence == 0,
+    "explicit remote-access stop did not preserve ordered local-only terminal authority");
+localOnlyBridge.Dispose();
+
+var ptyReplies = new List<byte[]>();
+var outerExpectations = new List<byte[]>();
+using (var authority = new TerminalCoreAuthority(
+    80,
+    24,
+    bytes => ptyReplies.Add((byte[])bytes.Clone()),
+    bytes => outerExpectations.Add((byte[])bytes.Clone())))
+{
+    var authoritySession = Guid.NewGuid();
+    authority.ApplyDurable(new LocalFrame(
+        LocalFrameType.Lifecycle,
+        authoritySession,
+        1,
+        LocalPayloadCodec.Lifecycle(LocalLifecycleState.Running, 0)));
+    authority.ApplyDurable(new LocalFrame(
+        LocalFrameType.Output,
+        authoritySession,
+        2,
+        Encoding.ASCII.GetBytes("\u001b[5n")));
+    Require(authority.LastAppliedSequence == 2 && !authority.FailedClosed &&
+        ptyReplies.Count == 1 && outerExpectations.Count == 1 &&
+        Encoding.ASCII.GetString(ptyReplies[0]) == "\u001b[0n" &&
+        ptyReplies[0].SequenceEqual(outerExpectations[0]),
+        "durable terminal-core authority did not emit exactly one ordered PTY reply");
+    Require(authority.ExportSnapshot().Length > 0,
+        "terminal-core authority did not expose its canonical checkpoint");
+
+    var arrowDown = new NativeTerminalWin32KeyEvent(
+        0x26, 0x48, '\0', true, 0x0100, 1);
+    Require(authority.EncodeConsoleKey(arrowDown)
+            .SequenceEqual(Encoding.ASCII.GetBytes("\u001b[A")),
+        "normal-mode console arrow input bypassed terminal-core encoding");
+    _ = authority.EncodeConsoleKey(new NativeTerminalWin32KeyEvent(
+        0x26, 0x48, '\0', false, 0x0100, 1));
+
+    authority.ApplyDurable(new LocalFrame(
+        LocalFrameType.Output,
+        authoritySession,
+        3,
+        Encoding.ASCII.GetBytes("\u001b[?1h\u001b=")));
+    Require(authority.EncodeConsoleKey(arrowDown)
+            .SequenceEqual(Encoding.ASCII.GetBytes("\u001bOA")),
+        "application-cursor mode did not affect terminal-core console encoding");
+    _ = authority.EncodeConsoleKey(new NativeTerminalWin32KeyEvent(
+        0x26, 0x48, '\0', false, 0x0100, 1));
+    Require(authority.EncodeConsoleKey(new NativeTerminalWin32KeyEvent(
+            0x61, 0x4f, '1', true, 0, 1))
+            .SequenceEqual(Encoding.ASCII.GetBytes("\u001bOq")),
+        "application-keypad mode did not affect terminal-core console encoding");
+
+    Require(authority.EncodeConsoleKey(new NativeTerminalWin32KeyEvent(
+            0x58, 0x2d, 'x', true, 0, 3))
+            .SequenceEqual(Encoding.ASCII.GetBytes("xxx")),
+        "console repeat count was not preserved by terminal-core semantic encoding");
+    Require(authority.EncodeConsoleKey(new NativeTerminalWin32KeyEvent(
+            0x43, 0x2e, '\u0003', true, 0x0008, 1))
+            .SequenceEqual(new byte[] { 0x03 }),
+        "Ctrl+C was not resolved through terminal-core semantic input");
+
+    authority.ApplyDurable(new LocalFrame(
+        LocalFrameType.Output,
+        authoritySession,
+        4,
+        Encoding.ASCII.GetBytes("\u001b[=3u")));
+    var f3Down = new NativeTerminalWin32KeyEvent(0x72, 0x3d, '\0', true, 0, 1);
+    Require(authority.EncodeConsoleKey(f3Down)
+            .SequenceEqual(Encoding.ASCII.GetBytes("\u001b[13;1:1~")),
+        "negotiated Kitty key press was not encoded by terminal-core V3");
+    Require(authority.EncodeConsoleKey(new NativeTerminalWin32KeyEvent(
+            0x72, 0x3d, '\0', false, 0, 1))
+            .SequenceEqual(Encoding.ASCII.GetBytes("\u001b[13;1:3~")),
+        "negotiated Kitty key release was not preserved");
+
+    authority.ApplyDurable(new LocalFrame(
+        LocalFrameType.Output,
+        authoritySession,
+        5,
+        Encoding.ASCII.GetBytes("\u001b[?9001h")));
+    Require(authority.EncodeConsoleKey(new NativeTerminalWin32KeyEvent(
+            0x70, 0x3b, '\0', true, 0x0008, 2))
+            .SequenceEqual(Encoding.ASCII.GetBytes("\u001b[112;59;0;1;8;2_")),
+        "DEC 9001 did not preserve the complete Win32 key record");
+}
+
+using (var gapAuthority = new TerminalCoreAuthority(80, 24, _ => { }, _ => { }))
+{
+    var gapSession = Guid.NewGuid();
+    RequireThrowsInvalidData(
+        () => gapAuthority.ApplyDurable(new LocalFrame(
+            LocalFrameType.Gap,
+            gapSession,
+            4,
+            LocalPayloadCodec.Gap(1, 3))),
+        "terminal-core authority accepted an unrecoverable common-journal gap");
+    Require(gapAuthority.FailedClosed,
+        "terminal-core authority remained usable after a common-journal gap");
+}
+
 Console.WriteLine("SessionHost title validation passed.");
 
 static void Require(bool condition, string message)
@@ -141,5 +381,12 @@ static void RequireThrows(Action action, string message)
 {
     try { action(); }
     catch (ArgumentException) { return; }
+    throw new InvalidOperationException(message);
+}
+
+static void RequireThrowsInvalidData(Action action, string message)
+{
+    try { action(); }
+    catch (InvalidDataException) { return; }
     throw new InvalidOperationException(message);
 }

@@ -3,6 +3,7 @@ package dev.termlink.terminal.nativecore
 import dev.termlink.terminal.api.TerminalHostEffectFrameV2
 import dev.termlink.terminal.api.TerminalInputModifiers
 import dev.termlink.terminal.api.TerminalKittyKeyInput
+import dev.termlink.terminal.api.TerminalKey
 import dev.termlink.terminal.api.TerminalMouseButton
 import dev.termlink.terminal.api.TerminalMouseButtons
 import dev.termlink.terminal.api.TerminalMouseInput
@@ -253,6 +254,112 @@ class NativeTerminalHandle private constructor(
         NativeRenderFrame(decoded)
     }
 
+    /** Exports the canonical V3 frame consumed by the production Android terminal view. */
+    fun renderV3(
+        maxPayloadBytes: Int = limits.maxRenderFrameBytes,
+    ): NativeRenderFrameV3 = synchronized(lock) {
+        val current = requireUsable()
+        require(maxPayloadBytes in 1..limits.maxRenderFrameBytes) {
+            "render payload limit must be in 1..${limits.maxRenderFrameBytes}"
+        }
+        val request = NativeRenderRequest(maxPayloadBytes = maxPayloadBytes)
+        val raw = invokeBridge("renderV3") { bridge.renderV3(current.handle, request) }
+        if (raw.payload.size > maxPayloadBytes || raw.payload.size > limits.maxRenderFrameBytes) {
+            throw NativeTerminalContractException(
+                "renderV3",
+                "frame payload exceeds the requested bound",
+            )
+        }
+        val decoded = try {
+            RenderFrameV3Decoder.decode(raw.payload)
+        } catch (error: RenderFrameV3DecodeException) {
+            throw NativeTerminalContractException("renderV3", error.message ?: "malformed frame")
+        }
+        if (decoded.nextSourceSequence != current.nextSourceSequence) {
+            throw NativeTerminalContractException(
+                "renderV3",
+                "expected next source sequence ${current.nextSourceSequence}, " +
+                    "received ${decoded.nextSourceSequence}",
+            )
+        }
+        if (decoded.presentationRevision != current.presentationRevision) {
+            throw NativeTerminalContractException(
+                "renderV3",
+                "expected presentation revision ${current.presentationRevision}, " +
+                    "received ${decoded.presentationRevision}",
+            )
+        }
+        try {
+            limits.validateSize(decoded.size, "render frame v3")
+        } catch (error: IllegalArgumentException) {
+            throw NativeTerminalContractException(
+                "renderV3",
+                error.message ?: "invalid frame size",
+            )
+        }
+        NativeRenderFrameV3(decoded)
+    }
+
+    /** Encodes one mode-aware semantic key through terminal-core Input V1. */
+    fun encodeKey(
+        key: TerminalKey,
+        modifiers: TerminalInputModifiers = TerminalInputModifiers(),
+    ): ByteArray = encodeInputV1(
+        NativeTerminalInputV1(
+            kind = NATIVE_INPUT_KIND_KEY,
+            key = nativeKey(key),
+            modifiers = nativeModifiers(modifiers),
+        ),
+    )
+
+    /** Encodes one Unicode scalar through terminal-core Input V1. */
+    fun encodeCharacter(
+        codePoint: Int,
+        modifiers: TerminalInputModifiers = TerminalInputModifiers(),
+    ): ByteArray {
+        require(
+            Character.isValidCodePoint(codePoint) &&
+                codePoint !in Character.MIN_SURROGATE.code..Character.MAX_SURROGATE.code,
+        ) { "character must be a Unicode scalar" }
+        return encodeInputV1(
+            NativeTerminalInputV1(
+                kind = NATIVE_INPUT_KIND_KEY,
+                key = NATIVE_INPUT_KEY_CHARACTER.toInt(),
+                modifiers = nativeModifiers(modifiers),
+                character = codePoint,
+            ),
+        )
+    }
+
+    /** Encodes an owned paste payload through terminal-core Input V1. */
+    fun encodePaste(bytes: ByteArray): ByteArray {
+        require(bytes.isNotEmpty()) { "paste input must not be empty" }
+        return encodeInputV1(
+            NativeTerminalInputV1(
+                kind = NATIVE_INPUT_KIND_PASTE,
+                data = bytes,
+            ),
+        )
+    }
+
+    /** Encodes a focus transition, returning an empty payload when focus reporting is disabled. */
+    fun encodeFocus(focused: Boolean): ByteArray = encodeInputV1(
+        NativeTerminalInputV1(
+            kind = if (focused) NATIVE_INPUT_KIND_FOCUS_GAINED else NATIVE_INPUT_KIND_FOCUS_LOST,
+        ),
+    )
+
+    private fun encodeInputV1(input: NativeTerminalInputV1): ByteArray = synchronized(lock) {
+        val current = requireUsable()
+        val encoded = invokeBridge(
+            operation = "encodeInputV1",
+            poisonOnFailure = { it !in RETRYABLE_INPUT_FAILURES },
+        ) {
+            bridge.encodeInputV1(current.handle, input)
+        }
+        encoded.payload.copyOf()
+    }
+
     /** Encodes one semantic mouse event against the terminal's current tracking/wire modes. */
     fun encodeMouse(input: TerminalMouseInput): ByteArray = synchronized(lock) {
         val current = requireUsable()
@@ -463,6 +570,42 @@ class NativeTerminalHandle private constructor(
         private const val UNSIGNED_SHORT_MAX = 0xffff
         private const val UNSIGNED_INT_MAX = 0xffff_ffffL
 
+        private fun nativeModifiers(modifiers: TerminalInputModifiers): Int = with(modifiers) {
+            (if (shift) NATIVE_INPUT_MODIFIER_SHIFT else 0) or
+                (if (alt) NATIVE_INPUT_MODIFIER_ALT else 0) or
+                (if (control) NATIVE_INPUT_MODIFIER_CONTROL else 0) or
+                (if (meta) NATIVE_INPUT_MODIFIER_META else 0)
+        }
+
+        private fun nativeKey(key: TerminalKey): Int = when (key) {
+            TerminalKey.ENTER -> 2
+            TerminalKey.BACKSPACE -> 3
+            TerminalKey.TAB -> 4
+            TerminalKey.ESCAPE -> 5
+            TerminalKey.DELETE -> 6
+            TerminalKey.INSERT -> 7
+            TerminalKey.HOME -> 8
+            TerminalKey.END -> 9
+            TerminalKey.PAGE_UP -> 10
+            TerminalKey.PAGE_DOWN -> 11
+            TerminalKey.ARROW_UP -> 12
+            TerminalKey.ARROW_DOWN -> 13
+            TerminalKey.ARROW_LEFT -> 14
+            TerminalKey.ARROW_RIGHT -> 15
+            TerminalKey.F1 -> 16
+            TerminalKey.F2 -> 17
+            TerminalKey.F3 -> 18
+            TerminalKey.F4 -> 19
+            TerminalKey.F5 -> 20
+            TerminalKey.F6 -> 21
+            TerminalKey.F7 -> 22
+            TerminalKey.F8 -> 23
+            TerminalKey.F9 -> 24
+            TerminalKey.F10 -> 25
+            TerminalKey.F11 -> 26
+            TerminalKey.F12 -> 27
+        }
+
         fun create(
             bridge: NativeBridge,
             size: TerminalSize,
@@ -603,6 +746,28 @@ class NativeTerminalHandle private constructor(
                         "received $actualMaximum",
                 )
             }
+            val actualV3Format = readDiscovery("renderFrameV3FormatVersion") {
+                bridge.renderFrameV3FormatVersion
+            }
+            if (actualV3Format != TERMLINK_RENDER_FRAME_V3_FORMAT_VERSION) {
+                throw NativeTerminalException(
+                    operation = "renderFrameV3FormatVersion",
+                    status = NativeTerminalStatus.ABI_MISMATCH,
+                    diagnostic = "expected $TERMLINK_RENDER_FRAME_V3_FORMAT_VERSION, " +
+                        "received $actualV3Format",
+                )
+            }
+            val actualV3Maximum = readDiscovery("maxRenderFrameV3Bytes") {
+                bridge.maxRenderFrameV3Bytes
+            }
+            if (actualV3Maximum != TERMLINK_RENDER_FRAME_V3_MAX_BYTES) {
+                throw NativeTerminalException(
+                    operation = "maxRenderFrameV3Bytes",
+                    status = NativeTerminalStatus.ABI_MISMATCH,
+                    diagnostic = "expected $TERMLINK_RENDER_FRAME_V3_MAX_BYTES, " +
+                        "received $actualV3Maximum",
+                )
+            }
             val actualHostEffectV2Format = readDiscovery("hostEffectFrameV2FormatVersion") {
                 bridge.hostEffectFrameV2FormatVersion
             }
@@ -636,6 +801,17 @@ class NativeTerminalHandle private constructor(
                     diagnostic = "expected $TERMLINK_MOUSE_INPUT_V1_STRUCT_SIZE, " +
                         "received $actualMouseInputSize",
                     )
+            }
+            val actualInputV1Size = readDiscovery("inputV1StructSize") {
+                bridge.inputV1StructSize
+            }
+            if (actualInputV1Size != TERMLINK_INPUT_V1_STRUCT_SIZE) {
+                throw NativeTerminalException(
+                    operation = "inputV1StructSize",
+                    status = NativeTerminalStatus.ABI_MISMATCH,
+                    diagnostic = "expected $TERMLINK_INPUT_V1_STRUCT_SIZE, " +
+                        "received $actualInputV1Size",
+                )
             }
             val actualInputV2Size = readDiscovery("inputV2StructSize") {
                 bridge.inputV2StructSize

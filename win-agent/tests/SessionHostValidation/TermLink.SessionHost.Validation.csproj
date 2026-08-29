@@ -7,5 +7,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\SessionHost\TermLink.SessionHost.csproj" />
+    <ProjectReference Include="..\..\src\TerminalCore\TermLink.TerminalCore.csproj" />
   </ItemGroup>
 </Project>

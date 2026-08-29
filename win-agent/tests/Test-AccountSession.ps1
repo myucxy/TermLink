@@ -27,6 +27,7 @@ function New-TestAccessToken {
         iss = $Issuer
         sub = $Subject
         preferred_username = $Username
+        nickname = "$Username nickname"
         email = "$Username@example.test"
     } | ConvertTo-Json -Compress
     $payload = ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes($payloadJson))
@@ -74,6 +75,7 @@ $credentialsType = $assembly.GetType('TermLink.Agent.ProductionCredentials', $tr
 $enrollmentType = $assembly.GetType('TermLink.Agent.ProductionEnrollment', $true)
 $storageType = $assembly.GetType('TermLink.Agent.ProductionAccountStorage', $true)
 $readAccountKey = Get-StaticMethod $credentialsType 'ReadAccountKey' ([Type[]]@([string], [string]))
+$readAccountClaims = Get-StaticMethod $credentialsType 'ReadAccountClaims' ([Type[]]@([string]))
 $canReuse = Get-StaticMethod $credentialsType 'CanReuseIdentity' ([Type[]]@([string], [string]))
 $selectIdentity = Get-StaticMethod $enrollmentType 'SelectIdentity' ([Type[]]@(
     [string], [Guid], [string], [Guid], [string]))
@@ -95,6 +97,11 @@ $keyARenamed = [string]$readAccountKey.Invoke($null, [object[]]@($accountARename
 $keyB = [string]$readAccountKey.Invoke($null, [object[]]@($accountBToken, $issuerA))
 $otherIssuerKey = [string]$readAccountKey.Invoke($null, [object[]]@($otherIssuerToken, $issuerB))
 $issuerMismatch = $readAccountKey.Invoke($null, [object[]]@($otherIssuerToken, $issuerA))
+$displayClaims = $readAccountClaims.Invoke($null, [object[]]@($accountAToken))
+Assert-True ($displayClaims.Item1 -eq 'same-visible-name' -and
+    $displayClaims.Item2 -eq 'same-visible-name nickname' -and
+    $displayClaims.Item3 -eq 'same-visible-name@example.test') `
+    'Username, nickname, and email display claims were not read independently.'
 Assert-True (-not [string]::IsNullOrWhiteSpace($keyA)) 'Issuer+subject did not produce an account key.'
 Assert-True ($keyA -eq $keyARenamed) 'Changing username/email changed the stable account key.'
 Assert-True ($keyA -ne $keyB) 'Different subjects reused one account key.'

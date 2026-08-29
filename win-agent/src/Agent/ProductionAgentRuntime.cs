@@ -1289,14 +1289,17 @@ namespace TermLink.Agent
             }
             lock (statusSync)
             {
-                var accountUsername = config.AccountUsername;
-                var accountEmail = config.AccountEmail;
-                if (string.IsNullOrWhiteSpace(accountUsername) || string.IsNullOrWhiteSpace(accountEmail))
-                {
-                    var account = ProductionCredentials.ReadAccountClaims(credentials.GetAccessToken());
-                    if (string.IsNullOrWhiteSpace(accountUsername)) accountUsername = account.Username;
-                    if (string.IsNullOrWhiteSpace(accountEmail)) accountEmail = account.Email;
-                }
+                var account = ProductionCredentials.ReadAccountClaims(credentials.GetAccessToken());
+                var accountUsername = string.IsNullOrWhiteSpace(account.Username)
+                    ? config.AccountUsername
+                    : account.Username;
+                var accountNickname = string.IsNullOrWhiteSpace(account.Nickname)
+                    ? config.AccountNickname
+                    : account.Nickname;
+                if (string.IsNullOrWhiteSpace(accountNickname)) accountNickname = accountUsername;
+                var accountEmail = string.IsNullOrWhiteSpace(account.Email)
+                    ? config.AccountEmail
+                    : account.Email;
                 var devices = new List<ProductionDeviceSummary>();
                 foreach (var device in productionDevices)
                 {
@@ -1315,6 +1318,7 @@ namespace TermLink.Agent
                     Configured = true,
                     AccountLinked = true,
                     AccountUsername = accountUsername,
+                    AccountNickname = accountNickname,
                     AccountEmail = accountEmail,
                     ServerHost = new Uri(config.ServerUrl).Host,
                     ServerOrigin = NormalizeServerOrigin(config.ServerUrl),

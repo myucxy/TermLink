@@ -33,11 +33,12 @@ Updater 和自包含 .NET 运行库；开发证书下已验证安装、Terminal 
 签名证书链、RFC 3161 时间戳、AppShip 发布凭据及外部告警接收器验收。
 
 历史技术验证曾评估 `termForward/terminal-main` 通道和 `TerminalMainChannelBridge`；它们今后只可
-作为公开行为的参考或差分基准，不得作为源码、构建、运行时或发布依赖。目标迁移路径将把已
-持久化的有序本机帧送入仓库顶层 `terminal-core/` 自研 Rust 核心，经独立 Snapshot V2 合同交给
-Windows 和 Android 适配层；语义键盘/粘贴输入 ABI 已实现，Delta ABI 当前仅预留。跨平台恢复等价、真实 journal 崩溃恢复和
-客户端渲染门禁尚未全部通过，现有生产载荷继续沿用旧 UTF-8 路径，也不声明
-`terminal_snapshot_v2` capability。
+作为公开行为的参考或差分基准，不得作为源码、构建、运行时或发布依赖。当前生产路径把已
+持久化的有序本机帧送入仓库顶层 `terminal-core/` 自研 Rust 核心：Windows `SessionHost` 只在
+Agent 返回 durable ACK 后按序 apply，并串行处理核心 Host Effect 与输入；Android 通过打包的 JNI
+库和自研 View 使用同一核心渲染、输入与连续历史重建。遗留 shadow 仅保留为可关闭的差分诊断，
+不再承担 production authority。无法证明连续性或无损恢复时路径会 fail closed，不会以旧 UTF-8
+投影或任意中段回放冒充终端状态；`terminal_snapshot_v2` 仍需满足独立 capability 门禁后才能声明。
 
 ## 开发项 1-7 完成矩阵
 
@@ -45,7 +46,7 @@ Windows 和 Android 适配层；语义键盘/粘贴输入 ABI 已实现，Delta 
 | --- | --- | --- | --- |
 | 1 | 生产账号/OIDC、同账号设备直连与撤销 | **已实现并验证** | Windows/Android 设备按同一 OIDC subject 归属账号并自动注册、直接发现 PC/Session；账号隔离、逐设备密钥和撤销测试已覆盖。旧 pairing/grant/trust 表与 API 仅作兼容层保留，不是首版产品前置流程；真实外部 OIDC enrollment/provider 部署不在本次验收范围。 |
 | 2 | 生产 Protobuf 实时协议、X25519 + ChaCha20-Poly1305、Relay | **已实现并验证** | `protocol/protobuf/termlink_realtime.proto`、Go `realtimewire`/Relay、Android `core-network`、Windows `src/Protocol`；向量、协议和本地 Relay 集成通过，Relay 保持密文不透明，公网 TLS 部署未验收。 |
-| 3 | 自研跨平台终端核心到 Android 的实时输入输出、ACK/Gap/重连、租约与本地输入优先 | **V2 核心与适配层迁移中，生产切换待门禁** | `terminal-core/` 已建立确定性状态与 Snapshot V2 基础，Windows Phase 1 诊断 shadow 已接入；SessionHost authority/durable ACK adapter、Android JNI/native bridge 与自研 View 尚未完成真实接入。现有 ProductionAgentRuntime/Android/Relay 保持兼容旧 UTF-8 载荷，V2 capability 尚未启用。 |
+| 3 | 自研跨平台终端核心到 Android 的实时输入输出、ACK/Gap/重连、租约与本地输入优先 | **production authority 已切换并验证** | Windows `SessionHost` 在 durable ACK 后按序 apply terminal-core，统一 Host Effect/输入顺序并对 Gap fail closed；Android APK 打包各 ABI JNI 核心并由 native View 负责渲染、输入和任意长度连续历史重建。公网 TL-H115、Gap/重连、IME、首尾 marker 与 native Snapshot/Transcript 门禁已验证；诊断 shadow 只保留为非权威差分路径。 |
 | 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
 | 5 | 服务端 Catalog、计费验证边界、权益与功能状态 | **核心已实现并验证（Provider 待配置）** | Go `billing`/Catalog/entitlement API、账号级不限 PC/Session、可注入 verified-purchase 契约与 Android `feature-billing` 已测试；真实 Google/Web verifier 未配置时生产入口返回 `BILLING_UNAVAILABLE`。 |
 | 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |

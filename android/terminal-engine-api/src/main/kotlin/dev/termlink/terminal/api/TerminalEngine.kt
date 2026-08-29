@@ -49,6 +49,15 @@ interface TerminalEngine {
 
     suspend fun feed(seq: Long, bytes: ByteBuffer)
 
+    /** Consumes one ordered non-output source event without changing terminal presentation. */
+    suspend fun advance(seq: Long) = Unit
+
+    /** Applies one ordered remote grid change. */
+    suspend fun resize(seq: Long, columns: Int, rows: Int) = resize(columns, rows)
+
+    /** Permanently fails the current renderer generation closed at an unrecoverable gap. */
+    suspend fun reportGap(seq: Long) = Unit
+
     fun resize(columns: Int, rows: Int)
 
     fun applyTheme(theme: TerminalThemeV1)

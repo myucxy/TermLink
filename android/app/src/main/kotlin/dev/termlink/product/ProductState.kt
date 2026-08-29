@@ -12,7 +12,7 @@ import dev.termlink.model.SessionSummary
 import dev.termlink.model.TerminalCommandCapability
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
-import dev.termlink.terminal.termux.TermuxTerminalEngine
+import dev.termlink.terminal.api.TerminalViewportEngine
 import dev.termlink.terminal.termux.TermuxTranscriptViewport
 import java.io.Closeable
 import java.time.Instant
@@ -633,6 +633,7 @@ internal fun retainOldestTranscriptPages(
 
 enum class ProductBootstrapSource {
     EMPTY,
+    NATIVE_FULL_PREFIX,
     LEGACY_REPLAY,
     TAIL_REPLAY,
     BOUND_SNAPSHOT,
@@ -865,8 +866,8 @@ interface ProductRepository : Closeable {
     suspend fun openSession(sessionId: UUID)
     /** Closes only this Android viewer/transport; the Windows shell remains running. */
     suspend fun closeSessionView(sessionId: UUID) = Unit
-    fun terminalEngine(sessionId: UUID): TermuxTerminalEngine?
-    fun historyEngine(historyObjectId: UUID): TermuxTerminalEngine?
+    fun terminalEngine(sessionId: UUID): TerminalViewportEngine?
+    fun historyEngine(historyObjectId: UUID): TerminalViewportEngine?
     suspend fun stopSession(sessionId: UUID)
     suspend fun deleteSession(sessionId: UUID)
     suspend fun sendTerminalAction(sessionId: UUID, action: TerminalAction)
@@ -926,8 +927,8 @@ class UnavailableProductRepository : ProductRepository {
     override suspend fun openRemoteShell(pcId: UUID, path: String, command: TerminalCommandCapability): UUID = unavailable()
     override suspend fun openSession(sessionId: UUID) = unavailable()
     override suspend fun closeSessionView(sessionId: UUID) = Unit
-    override fun terminalEngine(sessionId: UUID): TermuxTerminalEngine? = null
-    override fun historyEngine(historyObjectId: UUID): TermuxTerminalEngine? = null
+    override fun terminalEngine(sessionId: UUID): TerminalViewportEngine? = null
+    override fun historyEngine(historyObjectId: UUID): TerminalViewportEngine? = null
     override suspend fun stopSession(sessionId: UUID) = unavailable()
     override suspend fun deleteSession(sessionId: UUID) = unavailable()
     override suspend fun sendTerminalAction(sessionId: UUID, action: TerminalAction) = unavailable()

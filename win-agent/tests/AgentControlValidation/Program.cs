@@ -105,12 +105,13 @@ var registerRequest = RoundTripRequest(new RegistryRequest
 {
     Command = RegistryCommand.RegisterAccount,
     AccountUsername = "new-user",
+    AccountNickname = "New User",
     AccountEmail = "new@example.test",
     AccountPassword = "new-password",
     AccountPasswordConfirmation = "new-password",
     PcName = "Codec PC"
 });
-Require(registerRequest.AccountEmail == "new@example.test" &&
+Require(registerRequest.AccountNickname == "New User" && registerRequest.AccountEmail == "new@example.test" &&
     registerRequest.AccountPasswordConfirmation == "new-password", "Registration request changed.");
 var commandSettingsRequest = RoundTripRequest(new RegistryRequest
 {
@@ -164,6 +165,7 @@ var response = new RegistryResponse
         Configured = true,
         AccountLinked = true,
         AccountUsername = "codec-user",
+        AccountNickname = "Codec User",
         AccountEmail = "codec@example.test",
         ServerHost = "relay.example.test",
         ServerOrigin = "https://relay.example.test:9443",
@@ -222,7 +224,9 @@ Require(decoded.Production.Configured &&
     decoded.Production.RelayState == ProductionRelayState.Reconnecting &&
     decoded.Production.LastErrorCode == "CONNECTION_REFUSED",
     "Production connection state or failure reason changed.");
-Require(decoded.Production.AccountUsername == "codec-user" && decoded.Production.AccountEmail == "codec@example.test", "Account identity changed.");
+Require(decoded.Production.AccountUsername == "codec-user" &&
+    decoded.Production.AccountNickname == "Codec User" &&
+    decoded.Production.AccountEmail == "codec@example.test", "Account identity changed.");
 Require(decoded.Production.ServerOrigin == "https://relay.example.test:9443", "Server origin changed.");
 Require(decoded.Production.PcId == pcId && decoded.Production.AgentVersion == "0.2.0-preview.4",
     "V8 PC identity or Agent version changed.");
@@ -322,7 +326,16 @@ using (var legacyResponseStream = new MemoryStream())
         "Pipe V5 response synthesized Terminal Snapshot capability.");
 }
 
-Console.WriteLine("TermLink Agent control Pipe V9 command policy and V8/V7/V6/V5 compatibility validation passed.");
+using (var legacyV9ResponseStream = new MemoryStream())
+{
+    RegistryControlCodec.WriteResponse(legacyV9ResponseStream, response, 9);
+    legacyV9ResponseStream.Position = 0;
+    var legacyV9Response = RegistryControlCodec.ReadResponse(legacyV9ResponseStream);
+    Require(string.IsNullOrEmpty(legacyV9Response.Production.AccountNickname),
+        "Pipe V9 response synthesized an account nickname.");
+}
+
+Console.WriteLine("TermLink Agent control Pipe V10 account identity and V9/V8/V7/V6/V5 compatibility validation passed.");
 
 static RegistryRequest RoundTripRequest(RegistryRequest request)
 {

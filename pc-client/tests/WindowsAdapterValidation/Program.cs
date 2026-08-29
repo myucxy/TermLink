@@ -103,7 +103,7 @@ try
         }
     }), "Complete shutdown left the isolated Agent process running.");
     Console.WriteLine(
-        "Windows Avalonia adapter validation passed: authenticated V9 status/actions, stable revisions, " +
+        "Windows Avalonia adapter validation passed: authenticated V10 status/actions, stable revisions, " +
         "isolated command settings, sign-out restart, and complete shutdown without restart.");
 }
 finally

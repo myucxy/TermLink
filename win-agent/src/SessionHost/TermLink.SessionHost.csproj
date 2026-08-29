@@ -8,6 +8,13 @@
   <ItemGroup>
     <Compile Include="..\Common\LocalIpc.cs" Link="Common\LocalIpc.cs" />
     <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
+    <ProjectReference Include="..\TerminalCore\TermLink.TerminalCore.csproj" />
     <InternalsVisibleTo Include="TermLink.SessionHost.Validation" />
+  </ItemGroup>
+  <ItemGroup Condition="Exists('..\..\..\terminal-core\target\x86_64-pc-windows-msvc\release\termlink_terminal_ffi.dll')">
+    <None Include="..\..\..\terminal-core\target\x86_64-pc-windows-msvc\release\termlink_terminal_ffi.dll"
+          Link="termlink_terminal_ffi.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

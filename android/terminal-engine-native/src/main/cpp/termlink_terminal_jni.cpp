@@ -22,6 +22,7 @@ constexpr jsize kAllocationWords = 3;
 constexpr jsize kConfigV3Words = 14;
 constexpr jsize kEventWords = 5;
 constexpr jsize kMouseWords = 14;
+constexpr jsize kInputV1Words = 9;
 constexpr jsize kInputV2Words = 18;
 constexpr jsize kInputV3Words = 27;
 constexpr jsize kMaximumBatchEvents = 256;
@@ -33,6 +34,7 @@ static_assert(sizeof(TlTerminalEvent) == 56);
 static_assert(sizeof(TlTerminalBuffer) == 24);
 static_assert(sizeof(TlTerminalCheckpointInfo) == 40);
 static_assert(sizeof(TlTerminalPresentationInfoV1) == 48);
+static_assert(sizeof(TlTerminalInputV1) == 56);
 static_assert(sizeof(TlTerminalInputV2) == 96);
 static_assert(sizeof(TlTerminalInputV3) == 160);
 static_assert(sizeof(TlTerminalMouseInputV1) == 64);
@@ -344,6 +346,14 @@ Java_dev_termlink_terminal_nativecore_JniNativeMethods_renderFrameV1MaxBytes(JNI
     return static_cast<jlong>(tl_terminal_render_frame_v1_max_bytes());
 }
 extern "C" JNIEXPORT jint JNICALL
+Java_dev_termlink_terminal_nativecore_JniNativeMethods_renderFrameV3FormatVersion(JNIEnv*, jobject) {
+    return static_cast<jint>(tl_terminal_render_frame_v3_format_version());
+}
+extern "C" JNIEXPORT jlong JNICALL
+Java_dev_termlink_terminal_nativecore_JniNativeMethods_renderFrameV3MaxBytes(JNIEnv*, jobject) {
+    return static_cast<jlong>(tl_terminal_render_frame_v3_max_bytes());
+}
+extern "C" JNIEXPORT jint JNICALL
 Java_dev_termlink_terminal_nativecore_JniNativeMethods_hostEffectFrameV2FormatVersion(JNIEnv*, jobject) {
     return static_cast<jint>(tl_terminal_host_effect_frame_v2_format_version());
 }
@@ -354,6 +364,10 @@ Java_dev_termlink_terminal_nativecore_JniNativeMethods_hostEffectFrameV2MaxBytes
 extern "C" JNIEXPORT jint JNICALL
 Java_dev_termlink_terminal_nativecore_JniNativeMethods_mouseInputV1StructSize(JNIEnv*, jobject) {
     return static_cast<jint>(tl_terminal_mouse_input_v1_struct_size());
+}
+extern "C" JNIEXPORT jint JNICALL
+Java_dev_termlink_terminal_nativecore_JniNativeMethods_inputV1StructSize(JNIEnv*, jobject) {
+    return static_cast<jint>(tl_terminal_input_v1_struct_size());
 }
 extern "C" JNIEXPORT jint JNICALL
 Java_dev_termlink_terminal_nativecore_JniNativeMethods_inputV2StructSize(JNIEnv*, jobject) {
@@ -523,6 +537,68 @@ Java_dev_termlink_terminal_nativecore_JniNativeMethods_render(
             return status;
         }
         return publish_buffer(env, output, &buffer, static_cast<uint64_t>(maximum));
+    });
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_dev_termlink_terminal_nativecore_JniNativeMethods_renderV3(
+    JNIEnv* env, jobject, jlong token, jlong maximum, jobjectArray output) {
+    return safe_status([&]() -> uint32_t {
+        if (maximum <= 0) {
+            return TL_STATUS_INVALID_ARGUMENT;
+        }
+        BufferOwner buffer;
+        const uint32_t status = with_terminal(token, [&](TlTerminal* terminal) {
+            CheckpointOwner checkpoint;
+            uint32_t inner = checkpoint_for(terminal, &checkpoint, nullptr);
+            if (inner == TL_STATUS_OK) {
+                inner = tl_terminal_checkpoint_export_render_frame_v3(
+                    checkpoint.get(), static_cast<uint64_t>(maximum), buffer.out());
+            }
+            return inner;
+        });
+        if (status != TL_STATUS_OK) {
+            return status;
+        }
+        return publish_buffer(env, output, &buffer, static_cast<uint64_t>(maximum));
+    });
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_dev_termlink_terminal_nativecore_JniNativeMethods_encodeInputV1(
+    JNIEnv* env, jobject, jlong token, jlongArray raw_input, jbyteArray raw_data,
+    jobjectArray output) {
+    return safe_status([&]() -> uint32_t {
+        std::vector<jlong> words;
+        if (!read_longs(env, raw_input, kInputV1Words, &words)) {
+            return TL_STATUS_INVALID_ARGUMENT;
+        }
+        ByteArrayPin data(env, raw_data);
+        if (!data.valid()) {
+            return TL_STATUS_PANIC;
+        }
+        if (words[6] < 0 || static_cast<uint64_t>(words[6]) != data.size()) {
+            return TL_STATUS_INVALID_ARGUMENT;
+        }
+        TlTerminalInputV1 input{};
+        input.abi_version = static_cast<uint32_t>(words[0]);
+        input.struct_size = static_cast<uint32_t>(words[1]);
+        input.kind = static_cast<uint32_t>(words[2]);
+        input.key = static_cast<uint32_t>(words[3]);
+        input.modifiers = static_cast<uint32_t>(words[4]);
+        input.character = static_cast<uint32_t>(words[5]);
+        input.data = data.data();
+        input.data_len = data.size();
+        input.reserved[0] = static_cast<uint64_t>(words[7]);
+        input.reserved[1] = static_cast<uint64_t>(words[8]);
+        BufferOwner buffer;
+        const uint32_t status = with_terminal(token, [&](TlTerminal* terminal) {
+            return tl_terminal_encode_input_v1(terminal, &input, buffer.out());
+        });
+        if (status != TL_STATUS_OK) {
+            return status;
+        }
+        return publish_buffer(env, output, &buffer, tl_terminal_host_effect_frame_v2_max_bytes());
     });
 }
 
@@ -709,12 +785,18 @@ extern "C" __attribute__((visibility("default"))) jint JNICALL JNI_OnLoad(JavaVM
          reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_renderFrameV1FormatVersion)},
         {const_cast<char*>("renderFrameV1MaxBytes"), const_cast<char*>("()J"),
          reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_renderFrameV1MaxBytes)},
+        {const_cast<char*>("renderFrameV3FormatVersion"), const_cast<char*>("()I"),
+         reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_renderFrameV3FormatVersion)},
+        {const_cast<char*>("renderFrameV3MaxBytes"), const_cast<char*>("()J"),
+         reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_renderFrameV3MaxBytes)},
         {const_cast<char*>("hostEffectFrameV2FormatVersion"), const_cast<char*>("()I"),
          reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_hostEffectFrameV2FormatVersion)},
         {const_cast<char*>("hostEffectFrameV2MaxBytes"), const_cast<char*>("()J"),
          reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_hostEffectFrameV2MaxBytes)},
         {const_cast<char*>("mouseInputV1StructSize"), const_cast<char*>("()I"),
          reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_mouseInputV1StructSize)},
+        {const_cast<char*>("inputV1StructSize"), const_cast<char*>("()I"),
+         reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_inputV1StructSize)},
         {const_cast<char*>("inputV2StructSize"), const_cast<char*>("()I"),
          reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_inputV2StructSize)},
         {const_cast<char*>("inputV3StructSize"), const_cast<char*>("()I"),
@@ -736,6 +818,10 @@ extern "C" __attribute__((visibility("default"))) jint JNICALL JNI_OnLoad(JavaVM
          reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_applyBatchWithHostEffectsV2)},
         {const_cast<char*>("render"), const_cast<char*>("(JJ[[B)I"),
          reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_render)},
+        {const_cast<char*>("renderV3"), const_cast<char*>("(JJ[[B)I"),
+         reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_renderV3)},
+        {const_cast<char*>("encodeInputV1"), const_cast<char*>("(J[J[B[[B)I"),
+         reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_encodeInputV1)},
         {const_cast<char*>("encodeMouse"), const_cast<char*>("(J[J[[B)I"),
          reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_encodeMouse)},
         {const_cast<char*>("encodeInputV2"), const_cast<char*>("(J[J[[B)I"),

@@ -1,22 +1,52 @@
 package dev.termlink.terminal.nativecore
 
+import android.view.inputmethod.BaseInputConnection
+import android.view.inputmethod.EditorInfo
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
 import dev.termlink.terminal.api.TerminalKittyKey
 import dev.termlink.terminal.api.TerminalKittyKeyInput
+import dev.termlink.terminal.api.TerminalInputModifiers
+import dev.termlink.terminal.api.TerminalKey
 import dev.termlink.terminal.api.TerminalCellPosition
 import dev.termlink.terminal.api.TerminalMouseInput
 import dev.termlink.terminal.api.TerminalMousePosition
 import dev.termlink.terminal.api.TerminalOutputProfile
 import dev.termlink.terminal.api.TerminalSize
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
+import kotlinx.coroutines.flow.first
 
 @RunWith(AndroidJUnit4::class)
 class JniNativeBridgeInstrumentedTest {
+    @Test
+    fun nativeViewInputConnectionOwnsNonRecursiveEditableBuffer() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        lateinit var connection: BaseInputConnection
+        instrumentation.runOnMainSync {
+            val view = NativeTerminalView(
+                context = instrumentation.targetContext,
+                engine = null,
+                textSizeSp = 14f,
+                lineSpacingMultiplier = 1f,
+            )
+            connection = view.onCreateInputConnection(EditorInfo()) as BaseInputConnection
+        }
+
+        val editable = connection.editable
+        assertNotNull(editable)
+        assertTrue(connection.setComposingText("draft", 1))
+        assertEquals("draft", editable.toString())
+        assertTrue(connection.finishComposingText())
+        assertEquals("", editable.toString())
+    }
+
     @Test
     fun nativeCreateApplyRenderCheckpointImportAndDestroyRoundTrip() {
         assertEquals(TERMLINK_TERMINAL_ABI_VERSION, JniNativeBridge.abiVersion)
@@ -96,6 +126,59 @@ class JniNativeBridgeInstrumentedTest {
             assertEquals(2, hostEffects.formatVersion)
             assertTrue(hostEffects.effects.isEmpty())
             assertEquals(2, terminal.render().nextSourceSequence)
+        }
+    }
+
+    @Test
+    fun inputV1AndRenderFrameV3AreProductionNativeContracts() {
+        NativeTerminalHandle.create(
+            bridge = JniNativeBridge,
+            size = TerminalSize(80, 24),
+            initialNextSourceSequence = 1,
+            outputProfile = TerminalOutputProfile.UTF8,
+            historyCapacityRows = 10_000,
+        ).use { terminal ->
+            terminal.feed(
+                1,
+                "\u001b[?1h\u001b[?1004h\u001b[?2004h\u001b]2;Native V3\u0007"
+                    .encodeToByteArray(),
+            )
+            assertArrayEquals("\u001bOA".encodeToByteArray(), terminal.encodeKey(TerminalKey.ARROW_UP))
+            assertArrayEquals(
+                byteArrayOf(3),
+                terminal.encodeCharacter('c'.code, TerminalInputModifiers(control = true)),
+            )
+            assertArrayEquals(
+                "\u001b[200~paste\u001b[201~".encodeToByteArray(),
+                terminal.encodePaste("paste".encodeToByteArray()),
+            )
+            assertArrayEquals("\u001b[I".encodeToByteArray(), terminal.encodeFocus(true))
+            assertArrayEquals("\u001b[O".encodeToByteArray(), terminal.encodeFocus(false))
+
+            val frame = terminal.renderV3().renderFrame
+            assertEquals(2, frame.nextSourceSequence)
+            assertEquals("Native V3", frame.title)
+            assertEquals(80, frame.size.columns)
+            assertEquals(24, frame.size.rows)
+        }
+    }
+
+    @Test
+    fun productionEngineUsesNativeAuthorityForOrderedStateAndSemanticInput() = kotlinx.coroutines.runBlocking {
+        val engine = NativeTerminalEngine(TerminalSize(8, 2))
+        try {
+            engine.feed(1, java.nio.ByteBuffer.wrap("hello".encodeToByteArray()))
+            engine.advance(2)
+            engine.resize(3, 10, 3)
+            assertEquals(4, engine.frames.value.nextSourceSequence)
+            assertEquals(TerminalSize(10, 3), engine.authoritativeSize.value)
+
+            engine.setReadOnly(false)
+            assertTrue(engine.submitCodePoint('c'.code, controlDown = true))
+            val encoded = engine.inputEvents.first()
+            assertArrayEquals(byteArrayOf(3), encoded)
+        } finally {
+            engine.dispose()
         }
     }
 

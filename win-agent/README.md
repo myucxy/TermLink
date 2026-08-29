@@ -1,9 +1,10 @@
 # Windows Agent
 
-> 2026-08-28 迁移说明：目标生产结构改为仓库内完全自研的 `terminal-core/`，不再把
-> `termForward/terminal-main` 作为源码、构建或运行时依赖。`ProductionAgentRuntime` 已接入默认启用、
-> 可独立回滚的 Phase 1 诊断 shadow；Portable V1 仍是 Snapshot/Transcript 生产权威，SessionHost
-> authority 和 durable ACK 尚未切换。`TerminalMainChannelBridge` 只保留为历史技术验证。
+> 2026-08-29 迁移状态：生产结构已经切换到仓库内完全自研的 `terminal-core/`，不再把
+> `termForward/terminal-main` 作为源码、构建或运行时依赖。`SessionHost` 只在 Agent durable ACK 后
+> 按 common sequence apply terminal-core，并由同一串行域处理核心 PTY reply 与用户输入；Gap 会使
+> 当前 authority fail closed。`ProductionAgentRuntime` 中的 Phase 1 shadow 仅保留为可关闭的差分诊断，
+> 不再决定渲染、ACK、Snapshot 或 Transcript。`TerminalMainChannelBridge` 只保留为历史技术验证。
 > 现行边界见 [`TERMLINK_TERMINAL_CORE_V2.md`](../docs/TERMLINK_TERMINAL_CORE_V2.md)。
 
 正式 Windows Agent 将使用 C# / .NET 8。阶段 0 已在
@@ -15,6 +16,10 @@
 - `src/Agent`：会话目录、Relay、加密缓冲与访问控制；
 - `src/Agent/ProductionTerminalCoreShadow*.cs`：按会话隔离的 terminal-core 诊断重放与有界调度；
 - `src/TerminalCore`：自研 Rust 核心的 Windows SafeHandle/P/Invoke 绑定与严格 frame decoder；
+- `src/SessionHost/TerminalCoreAuthority.cs`：durable ACK 后的有序 production apply、checkpoint 与
+  Host Effect 处理；
+- `src/SessionHost/OuterTerminalReplySuppressor.cs`、`WindowsConsoleInputEncoder.cs`：外层终端兼容回复
+  去重与 terminal-core 语义输入编码；
 - `src/Agent/TerminalMainChannelBridge.cs`：历史 terminal-main 合同适配，仅保留隔离测试，不是目标生产依赖；
 - `src/Protocol`：生产 Protobuf Envelope、设备证明、X25519/HKDF 和 ChaCha20-Poly1305；
 - `src/Tray`：当前用户托盘和设置 UI；
@@ -194,11 +199,11 @@ E2EE 实现与 `protocol/protobuf/termlink_realtime.proto` 保持同一 Envelope
 `protocol/test-vectors/terminal-snapshot-v1.json`，与 Kotlin 测试复现并打开同一组 snapshot /
 transcript 密封对象，也验证严格结构和 metadata tamper 拒绝。这只是对象层互操作证据。
 
-`src/Agent/PortableTerminalModelV1.cs` 是受限 ASCII 子集的本地等价性模型，不是完整 Windows
-终端 producer，也没有消费 SessionAgent durable buffer 中的有序 `LocalFrame`。当前
-`ProductionHistoryUploader` 只创建和提交 `kind = "CHUNK"` 的历史对象，尚未生成、按接收方
-密封或上传 `SNAPSHOT`。因此 Windows Agent 不得宣告 `terminal_snapshot_v1`，不得用 snapshot
-推进 ACK；该 capability 保持默认关闭。
+`src/Agent/PortableTerminalModelV1.cs` 是受限 ASCII 子集的兼容投影，不是 production terminal
+authority。完整终端状态由 `SessionHost` 内的 terminal-core 按 durable common sequence 维护；
+Snapshot/Transcript 只有通过 native authority 的连续性与可表示性门禁才可导出。现有服务端
+`terminal_snapshot_v1` capability 仍保持默认关闭，不能用兼容投影推进 durable ACK，也不能从任意
+中段事件开始恢复。
 
 此外，当前 wire representation 尚不能无损表示 saved autoWrap、saved DEC private-mode
 bank、DECSACE state 和 title stack。Windows producer 必须先实现对这些状态的严格拒绝或等价
@@ -211,7 +216,7 @@ mode 代替 saved mode，也不能静默丢弃 title stack。
 | --- | --- | --- | --- |
 | 1 | 生产账号/OIDC、同账号自动注册与登录记忆 | **已实现并验证** | Windows 托盘与 Android 均可注册/登录；Windows 用 CurrentUser DPAPI、Android 用 Keystore 保护可恢复登录状态。同一 OIDC 账号无需配对、自授信或逐 PC Grant 即可发现受管 PC/Session；跨账号轮换 Windows DeviceId/PcId。旧 pairing/grant/trust API 仅作兼容。 |
 | 2 | 生产 Protobuf 实时协议、X25519 + ChaCha20-Poly1305、Relay | **已实现并验证** | `protocol/protobuf/termlink_realtime.proto`、Go `realtimewire`/Relay、Android `core-network`、Windows `src/Protocol`；向量、协议和 Relay 测试通过。 |
-| 3 | 自研跨平台终端核心到 Android 的输入输出、ACK/Gap/重连、租约与本地输入优先 | **Windows Phase 1 shadow 已接入，生产 authority 待门禁** | `terminal-core/`、Windows P/Invoke/decoder、Portable V1 对比和有界异步 shadow 已接入 `ProductionAgentRuntime`；现有 ConPTY/Relay 原始 UTF-8、Portable Snapshot/Transcript 仍是生产权威，SessionHost durable-ACK authority 与 Android JNI/native 接入尚未完成。 |
+| 3 | 自研跨平台终端核心到 Android 的输入输出、ACK/Gap/重连、租约与本地输入优先 | **production authority 已切换并验证** | `SessionHost` 在 Agent durable ACK 后按序 apply terminal-core，核心 Host Effect 与输入共用串行顺序域，Gap fail closed；Android JNI/native View 使用同一核心并从连续加密历史重建。Portable V1 与异步 shadow 仅作兼容/差分，不再是 Snapshot/Transcript 或实时渲染 authority。 |
 | 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
 | 5 | 服务端 Catalog、计费验证边界、权益与配额 | **核心已实现并验证（Provider 待配置）** | Go Catalog/entitlement、可注入 verified-purchase 契约和 Android Play Billing 协调已测试；生产 main 在真实 Google/Web verifier 未配置时返回 `BILLING_UNAVAILABLE`，未冒充线上购买验证。 |
 | 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |

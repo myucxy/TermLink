@@ -345,6 +345,7 @@ namespace TermLink.Agent
         public string PairingPermission { get; set; }
         public string GrantPermission { get; set; }
         public string AccountUsername { get; set; }
+        public string AccountNickname { get; set; }
         public string AccountEmail { get; set; }
         public string AccountPassword { get; set; }
         public string AccountPasswordConfirmation { get; set; }
@@ -448,6 +449,7 @@ namespace TermLink.Agent
         public bool Configured { get; set; }
         public bool AccountLinked { get; set; }
         public string AccountUsername { get; set; }
+        public string AccountNickname { get; set; }
         public string AccountEmail { get; set; }
         public string ServerHost { get; set; }
         public string ServerOrigin { get; set; }
@@ -478,7 +480,7 @@ namespace TermLink.Agent
 
     public static class RegistryControlCodec
     {
-        public const byte CurrentVersion = 9;
+        public const byte CurrentVersion = 10;
         private const byte MinimumSupportedVersion = 5;
         private const int MaximumBytes = 64 * 1024;
 
@@ -619,6 +621,7 @@ namespace TermLink.Agent
                 case RegistryCommand.RegisterAccount:
                     WriteString(writer, request.AccountUsername ?? string.Empty);
                     WriteString(writer, request.AccountEmail ?? string.Empty);
+                    if (version >= 10) WriteString(writer, request.AccountNickname ?? string.Empty);
                     WriteString(writer, request.AccountPassword ?? string.Empty);
                     WriteString(writer, request.AccountPasswordConfirmation ?? string.Empty);
                     WriteString(writer, request.PcName ?? string.Empty);
@@ -688,6 +691,7 @@ namespace TermLink.Agent
                 case RegistryCommand.RegisterAccount:
                     request.AccountUsername = ReadString(reader);
                     request.AccountEmail = ReadString(reader);
+                    if (version >= 10) request.AccountNickname = ReadString(reader);
                     request.AccountPassword = ReadString(reader);
                     request.AccountPasswordConfirmation = ReadString(reader);
                     request.PcName = ReadString(reader);
@@ -944,6 +948,7 @@ namespace TermLink.Agent
                     if (version >= 9) writer.Write(command.RunAsAdministrator);
                 }
             }
+            if (version >= 10) WriteString(writer, status.AccountNickname ?? string.Empty);
         }
 
         private static ProductionStatus ReadProductionStatus(BinaryReader reader, byte version)
@@ -1043,6 +1048,7 @@ namespace TermLink.Agent
                 status.AgentVersion = string.Empty;
                 status.TerminalCommands = new List<ProductionTerminalCommandSummary>();
             }
+            status.AccountNickname = version >= 10 ? ReadString(reader) : string.Empty;
             return status;
         }
 

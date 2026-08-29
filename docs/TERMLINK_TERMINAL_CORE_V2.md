@@ -48,10 +48,11 @@ terminal-core/
 
 `win-agent/src/TerminalCore/NativeTerminalCoreV2.cs` 是 Windows SafeHandle/P/Invoke 绑定，已经真实接通
 Config V3/output profile、Render Frame V2/V3、Host Effect Frame V1 与 Input V2 的 ABI discovery、
-effect-aware apply、Win32 key 编码、buffer free 和严格 .NET decoder。本次提交只接入 Windows；
-Android JNI/NDK、本地 `.so`、native exporter、自研 View 和 Host Effect authority API 均不在本次范围。
-Windows 生产链仍使用 `PortableTerminalModelV1` 发布 Snapshot/Transcript V1，但 Windows 历史帧链
-已经加入按会话隔离的 terminal-core 影子重放。影子在有界的异步 per-session 队列上导出 Snapshot V2
+effect-aware apply、Win32 key 编码、buffer free 和严格 .NET decoder。`SessionHost` 现在只在 Agent
+durable ACK 后按 common sequence apply，并把 Host Effect PTY reply 与用户输入放入同一串行顺序域。
+Android 各 ABI JNI `.so`、严格 native bridge、自研 View 与连续历史重建也已接入 production。
+
+Windows 历史帧链仍保留按会话隔离的 terminal-core 影子重放，作为非权威差分诊断。影子在有界的异步 per-session 队列上导出 Snapshot V2
 和 Render Frame V3，不在 production history 锁内执行 native checkpoint/export。每会话上限为 8 个
 pending work item 和 16 MiB conservative managed-retention estimate；后者不是 payload、wire、native
 heap 或精确 CLR heap 上限，而是显式估入 cloned payload/frame/array 与排队 continuation 持有的
@@ -71,7 +72,8 @@ retire 会停止接受新 work、把 native dispose 排在已有 per-session tai
 tombstone 和 Portable projection，producer-lifetime released-session tombstone 仍阻止迟到任务。由于
 native call 与 observer 都在进程内，若其中之一永久阻塞，排在 tail 后的 release 也无法执行，只能在
 进程退出时由 OS 回收；若要提供可强制终止的 hard isolation，后续必须改为 out-of-process worker。
-Android 产品链仍使用 Termux-derived engine，因此不能表述为两端已经完成生产切换。
+Android live production 产品链使用 native terminal-core engine；Termux-derived engine 仅保留 Harness、
+旧归档 CHUNK 查看与差分测试，不承担 live renderer、ACK 或恢复 authority。
 
 Windows 影子默认启用，可把进程变量 `TERMLINK_ENABLE_TERMINAL_CORE_SHADOW` 设为 `0` 或 `false`
 关闭。状态变化写入
@@ -80,16 +82,16 @@ Rust 1.97.1 编译、签名并携带 `TermLink.TerminalCore.dll` 与 `termlink_t
 检查两层 DLL 的存在、签名集合和签名计数。
 
 rollback 变量按 trim 后的值解析：`0` 或大小写不敏感的 `false` 关闭；未设置、空值和其他值均保持
-默认启用。该开关只控制诊断影子，不改变 Portable V1 production authority。
+默认启用。该开关只控制诊断影子，不改变 SessionHost terminal-core production authority。
 
-## Windows Phase 2 authority 方案（尚未实现）
+## Windows Phase 2 authority（已实现）
 
-Phase 2 的目标设计是把 `NativeTerminal` owner 放在拥有对应 ConPTY 的 `SessionHost`，而不是 Agent
+Phase 2 把 `NativeTerminal` owner 放在拥有对应 ConPTY 的 `SessionHost`，而不是 Agent
 history worker。每个 common `LocalFrame` 必须先由 Agent 写入 durable journal 并得到 durability ACK；
 SessionHost 只能在收到该 ACK 后，按同一个 sequence 把同一 frame apply 到 native terminal。authority
-apply 应使用 Host Effect Frame V2，并把其中有序的 PTY reply 写回同一个 ConPTY。
+apply 使用 Host Effect Frame，并把其中有序的 PTY reply 写回同一个 ConPTY。
 
-本轮没有切换 authority。实施前至少必须完成并验收：
+当前实现已经完成并验收以下门禁：
 
 - 明确定义并 crash-test 以 `Flush(true)` 为边界的 journal durable ACK，不能把“已入内存队列”当作
   durable；
@@ -100,8 +102,8 @@ apply 应使用 Host Effect Frame V2，并把其中有序的 PTY reply 写回同
 - 把用户/远程 input write 与 Host Effect V2 reply write 放进同一个 per-session 串行顺序域，避免字节
   交错或逆序。
 
-这些条件完成前，`PortableTerminalModelV1` 继续作为 Snapshot/Transcript artifact authority，现有
-Windows Terminal/ConPTY 路径继续负责实时终端行为；Phase 1 只收集差分诊断证据。
+`PortableTerminalModelV1` 和 Phase 1 shadow 继续保留为兼容/差分工具，但不再推进 durable ACK，
+也不再决定 Snapshot/Transcript 或实时终端状态。
 
 ## 当前实现矩阵
 
@@ -118,8 +120,8 @@ Windows Terminal/ConPTY 路径继续负责实时终端行为；Phase 1 只收集
 | Snapshot V2.0..V2.8 | canonical little-endian、固定 header/critical directory、双 CRC32C、完整双屏/charset/OSC/mode/margin/tab 状态；NRC 状态选择 feature `0x8_0000` 的 V2.7（64 profiles），standalone-C1 output profile 选择 feature `0x10_0000` 的 V2.8（128 profiles）；当前源码推导上界为 44,568,090 bytes，导入硬上限 64 MiB | 默认 UTF-8 profile 继续选择最低可保真的 V2.0..V2.7；所有 history-enabled profile 只投影可见双屏，不携带隐藏 history cells 或 sealed revision；parser/UTF-8 非 quiescent 或 `?2026` active 时不可导出；不是 V1 DTO 的封装 |
 | Render Frame V1/V2/V3 | 三者均为 renderer-only canonical little-endian、96-byte header、6 sections、双 CRC32C；V1/V2 API/bytes 冻结；V3 使用 `TLRFRM3\0`、required features `0x7f`、rendition section v2 和不扩大的 16-byte record 保真保存扩展 SGR；硬上限均为 16 MiB，精确最坏值均为 13,395,208 bytes | V1/V2 丢弃 faint/overline/underline color，并把所有非 none underline 降为 single 后重新 canonical sort/dedup/remap；隐藏 history 不进入 table/row/cell；三版严格隔离，不能导入恢复；当前每次导出 full frame，没有 damage/delta |
 | C ABI / 输入 | native ABI 版本仍为 1；Config V1/V2 保持 UTF-8 profile，88-byte `TlTerminalConfigV3`/`tl_terminal_create_v3` 同时选择 history 与显式 output profile；Frame/Host Effect/输入保持 additive versioned surface 与同库 buffer free | Config V3 要求 exact `struct_size == 88`、全部 reserved 为 0、history 不超过 `u32::MAX`，且 profile 只能是 UTF-8 或 UTF-8-with-standalone-C1；raw-input 占位入口与 Delta 导出入口返回 `TL_STATUS_UNSUPPORTED` |
-| .NET binding | `ValidateAbi()` 增加 Config V3 的 88-byte discovery；显式 overload 通过 `tl_terminal_create_v3` 选择 history 与 `NativeTerminalOutputProfile`，旧 overload 继续走 V1/V2 UTF-8；真实 DLL 验证覆盖未知 profile 拒绝、两种 profile 对 raw C1 OSC/ST 的差异及 Snapshot 恢复 | 这是已验证的 native/.NET contract 与适配能力，不等同于 Windows durable journal、PTY writer 或生产 renderer 已切换 |
-| 平台接入 | Rust core、C ABI 和 Windows P/Invoke/严格 decoder 已接入；win-x64 release DLL 已通过实际 DLL/.NET 加载，Linux、macOS aarch64 和四个 Android ABI 已通过 non-host `cargo check` | 本次不包含 Android JNI/NDK `.so`、native exporter、自研 terminal View、设备验收或产品接线；Windows durable journal/renderer 生产链也尚未切换 |
+| .NET binding | `ValidateAbi()` 增加 Config V3 的 88-byte discovery；显式 overload 通过 `tl_terminal_create_v3` 选择 history 与 `NativeTerminalOutputProfile`，旧 overload 继续走 V1/V2 UTF-8；真实 DLL 验证覆盖未知 profile 拒绝、两种 profile 对 raw C1 OSC/ST 的差异及 Snapshot 恢复 | `SessionHost` authority 复用该严格 binding；诊断 shadow 和 Portable V1 仍不得据此推进 durable ACK |
+| 平台接入 | Rust core、C ABI、Windows P/Invoke/SessionHost authority 与 Android JNI/native View 已接入；win-x64 release DLL 和四个 Android ABI `.so` 均已从制品加载并通过运行门禁，Linux/macOS aarch64 通过 non-host `cargo check` | Linux/macOS 仍未发布产品 runtime；Android/Windows 遇到 ABI、连续性、decoder 或 Gap 异常时 fail closed，不回退成有损 authority |
 
 “实现”只表示上表所列的有界子集，不表示完整 VT、xterm 或 Windows Terminal 兼容。仓库内自有
 ConPTY capture 已全部进入默认测试并能完整解析/应用而不 fail closed；它们是 acceptance regression，
@@ -196,11 +198,11 @@ profile 只接受 `TL_OUTPUT_PROFILE_UTF8=0` 或
 `tl_terminal_create_v3` P/Invoke 和带 `NativeTerminalOutputProfile` 的新 overload；旧 overload 保持
 V1/V2 UTF-8 行为。真实 DLL validation 路径覆盖 unknown profile/非法 size/reserved 拒绝、默认
 UTF-8 与 standalone-C1 对 raw C1 OSC/ST 的不同处理，以及 Snapshot import 后 profile 保持。
-Windows production renderer 与 V1 artifact authority 仍未从 `PortableTerminalModelV1` 切换；
-terminal-core 当前只在同一 durable frame 旁路影子运行。
+Windows production renderer 已由 `SessionHost` terminal-core authority 按 durable frame 驱动；
+`PortableTerminalModelV1` 与 Agent shadow 只保留为非权威兼容/差分路径。
 
-Android renderer contract、JNI/NDK `.so`、native exporter、自研 View 和产品接线不在本次
-Windows-first 提交范围；未来接入必须复用同一 Config/Frame ABI，并独立通过严格 decoder 门禁。
+Android renderer contract、JNI/NDK `.so`、native exporter、自研 View 和产品接线已复用同一
+Config/Frame ABI，并通过严格 decoder、设备仪器测试和公网产品 E2E 门禁。
 
 Render Frame V2/V3 同样不提升 native ABI，也不改变 V1/V2 已有 symbol 或 bytes。V2 增加：
 
@@ -217,8 +219,8 @@ V3 对应增加：
 .NET 的 `ValidateAbi()` 同时门禁 V1/V2/V3 format version 与 16 MiB hard limit；
 `NativeTerminalCheckpoint.ExportRenderFrameV2()` 真实调用新增 export symbol，并把 DLL 产生的 bytes
 交给 `NativeTerminalRenderFrameV2Decoder` 严格解码；V3 的 discovery/export/DTO/decoder 也走独立入口，
-并验证扩展 rendition 与恶意 frame 拒绝。这个链路已由 real-DLL native validation 覆盖，但 Windows
-产品仍使用 `PortableTerminalModelV1`，不能据此声明 production renderer/journal 已切换。
+并验证扩展 rendition 与恶意 frame 拒绝。这个链路已由 real-DLL native validation 覆盖，并由
+`SessionHost` production authority 在 durable ACK 后调用；`PortableTerminalModelV1` 只保留兼容投影。
 
 DEC synchronized output 同样只增加 ABI surface，不提升 native ABI version。新增稳定状态
 `TL_STATUS_PRESENTATION_DEFERRED = 13`；48-byte `TlTerminalPresentationInfoV1` 的 layout 为
@@ -228,7 +230,7 @@ DEC synchronized output 同样只增加 ABI surface，不提升 native ABI versi
 `tl_terminal_presentation_info_v1_struct_size()` 做 layout handshake，再调用
 `tl_terminal_get_presentation_info_v1()`；getter 即使在 failed closed 后也成功返回组合 flags。
 Windows binding 对该结构做 48-byte/offset/reserved/flag 一致性门禁，并把 checkpoint status 12 和
-13 都作为临时不可发布。Android JNI getter 和 native `.so` 不在本次范围。
+13 都作为临时不可发布。Android JNI getter 和各 ABI native `.so` 复用同一 discovery 与失败关闭规则。
 
 ## Host Effect Frame V1
 
@@ -672,7 +674,8 @@ V3 保真输出全部扩展 rendition；V1/V2 丢弃 faint、overline、underlin
 underline 降为 single，再重新 canonical sort/dedup/remap rendition IDs。这是确定性的 legacy 投影，
 避免新增状态改变 V1/V2 bytes。Windows .NET V3 DTO/strict decoder 会检查版本隔离、offset/length、
 padding、CRC、UTF-8、表排序与引用、宽字符 continuation、颜色、cursor style、保留位、revision 和
-sequence，并覆盖恶意 frame mutation。Android renderer/JNI/exporter/`.so` 和产品接线不在本次范围。
+sequence，并覆盖恶意 frame mutation。Android renderer/JNI/exporter/`.so` 和产品接线也使用 V3
+strict decoder，并通过设备仪器测试与产品 E2E。
 
 三版 header flags bit 0 表示 alternate screen、bit 1 表示 DECSCNM global reverse video。V1/V2
 rendition flags bit 5/6 分别表示 conceal/strikethrough，并严格拒绝扩展位；V3 使用上面的 `0x0fff`
@@ -696,11 +699,6 @@ known mask。
 - Kitty graphics 和一般化 query-reply 覆盖；Kitty keyboard negotiation、semantic Input V3 与 Snapshot
   V2.6 状态持久化已经实现，但 APC ignore 不是 Kitty graphics 实现；DEC private mode `?9001` 与
   ConPTY Win32 key record 仍是独立路径；
-- 真实 Android NDK/JNI `.so` 和使用该核心状态的自研渲染 View；当前 Android JVM 模块只有
-  renderer-neutral bridge contract、V1/V2/V3 Frame DTO、Input V2/Win32 DTO、严格 decoder 和测试
-  fixture，`NativeTerminalHandle.render()` 仍固定走 V1，没有 native exporter 或产品接线；
-- Windows durable journal 到 V2 checkpoint/history/capability 的生产接线；现有 P/Invoke 绑定与
-  native validation 不等同于该接线。
 - XTQMODKEYS、OSC color query、OSC 52 clipboard 和 window report 的后续 host-effect kind；
   DA1/DA2、DSR 5/6、DEC DSR 5、DECXCPR 6 是当前已通过 Host Effect V1 实现的有序 PTY replies，
   不能据此声称已经覆盖一般化 query reply。
@@ -719,9 +717,10 @@ i686、x86_64 六个 non-host target 均完成 workspace `cargo check`。这些�
 Config V3 profile 选择/拒绝、UTF-8 与 standalone-C1 行为差异、Snapshot V2.8 profile 恢复，以及既有
 Frame、Host Effect、Input、严格 decoder、恶意输入拒绝与 owned-buffer release。
 
-当前仍没有 Android NDK/JNI `.so`、使用该核心的自研 terminal View、设备运行验收或 Android 产品接线。
-Windows 生产渲染和 artifact authority 尚未切换到该核心（仅 journal 旁路影子重放）。因此不能声明 Linux/macOS/Android native runtime
-或整体产品已经获得生产支持，也不把本轮易变的 DLL 大小或 hash 当作长期协议契约。
+Android APK 已打包各 ABI NDK/JNI `.so`，自研 terminal View、设备仪器测试和产品 E2E 均已通过；
+Windows 生产渲染与 native Snapshot/Transcript 门禁已切换到 SessionHost authority。Linux/macOS
+仍只具备源码级可移植性验证，不能据此声明对应产品 runtime 已发布；易变的 DLL/SO 大小或 hash
+也不是长期协议契约。
 
 仓库已用 `terminal-core/rust-toolchain.toml` 固定 Rust 1.97.1。从仓库根目录执行：
 

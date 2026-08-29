@@ -151,6 +151,7 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
 
     public async ValueTask RegisterAsync(
         string username,
+        string nickname,
         string email,
         string password,
         string passwordConfirmation,
@@ -161,6 +162,7 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
         {
             Command = RegistryCommand.RegisterAccount,
             AccountUsername = username,
+            AccountNickname = nickname,
             AccountEmail = email,
             AccountPassword = password,
             AccountPasswordConfirmation = passwordConfirmation,
@@ -502,17 +504,16 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
         if (commands.Length > 0) capabilities.Add(PcCapabilityIds.TerminalCommandsV1);
         if (production.Configured) capabilities.Add(PcCapabilityIds.FileOperationsV1);
         capabilities.Add(PcCapabilityIds.RemoteAgentUpdateV1);
-        var accountName = string.Join(
-            " · ",
-            new[] { production.AccountUsername, production.AccountEmail }
-                .Where(value => !string.IsNullOrWhiteSpace(value)));
         return new AgentStatusSnapshot(
             0,
             DateTimeOffset.UtcNow,
             CreateIdentity(production),
             MapConnectionState(production),
             production.AccountLinked,
-            accountName,
+            production.AccountUsername ?? string.Empty,
+            string.IsNullOrWhiteSpace(production.AccountNickname)
+                ? production.AccountUsername ?? string.Empty
+                : production.AccountNickname,
             production.ServerOrigin ?? string.Empty,
             response.RemoteAccessEnabled,
             string.IsNullOrWhiteSpace(production.LastErrorCode) ? null : production.LastErrorCode,
@@ -566,7 +567,8 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
     {
         var builder = new StringBuilder();
         builder.Append(snapshot.Identity).Append('|').Append(snapshot.ConnectionState).Append('|')
-            .Append(snapshot.AccountLinked).Append('|').Append(snapshot.AccountDisplayName).Append('|')
+            .Append(snapshot.AccountLinked).Append('|').Append(snapshot.AccountUsername).Append('|')
+            .Append(snapshot.AccountNickname).Append('|')
             .Append(snapshot.ServerOrigin).Append('|').Append(snapshot.RemoteAccessEnabled).Append('|')
             .Append(snapshot.LastErrorCode).Append('|').Append(snapshot.LastErrorDetail);
         foreach (var session in snapshot.Sessions) builder.Append('|').Append(session);

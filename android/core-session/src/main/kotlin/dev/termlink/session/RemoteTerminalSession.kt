@@ -236,6 +236,7 @@ class RemoteTerminalSession(
             // When the peer replays that same marker its missing range is now
             // fully covered; consume it as a no-op sequence event and ACK it.
             check(event.sequence == expected) { "covered gap marker is not the next sequence" }
+            engine.advance(event.sequence)
             lastAppliedSequence = event.sequence
             mutableState.value = withUpdatedAck(mutableState.value)
             if (sendAcknowledgement) requestAcknowledgement(lastAppliedSequence)
@@ -259,18 +260,22 @@ class RemoteTerminalSession(
                 require(event.bytes.isNotEmpty()) { "output event is empty" }
                 applyOutput(event)
             }
-            is RemoteSessionEvent.Resize -> engine.resize(event.size.columns, event.size.rows)
-            is RemoteSessionEvent.Title -> mutableTitle.value = event.value
-            is RemoteSessionEvent.InputResult -> Unit
-            is RemoteSessionEvent.ControlGranted -> Unit
+            is RemoteSessionEvent.Resize -> engine.resize(event.sequence, event.size.columns, event.size.rows)
+            is RemoteSessionEvent.Title -> {
+                engine.advance(event.sequence)
+                mutableTitle.value = event.value
+            }
+            is RemoteSessionEvent.InputResult -> engine.advance(event.sequence)
+            is RemoteSessionEvent.ControlGranted -> engine.advance(event.sequence)
             is RemoteSessionEvent.ControlRevoked -> {
+                engine.advance(event.sequence)
                 leaseExpiryJob?.cancel()
                 leaseExpiryJob = null
                 leaseRenewalJob?.cancel()
                 leaseRenewalJob = null
                 engine.setReadOnly(true)
             }
-            is RemoteSessionEvent.Lifecycle -> Unit
+            is RemoteSessionEvent.Lifecycle -> engine.advance(event.sequence)
             is RemoteSessionEvent.Gap -> error("handled above")
         }
 
@@ -350,13 +355,23 @@ class RemoteTerminalSession(
                         for (event in events) {
                             when (event) {
                                 is RemoteSessionEvent.Output -> applyOutput(event)
-                                is RemoteSessionEvent.Resize -> engine.resize(event.size.columns, event.size.rows)
-                                is RemoteSessionEvent.Title -> mutableTitle.value = event.value
+                                is RemoteSessionEvent.Resize -> engine.resize(
+                                    event.sequence,
+                                    event.size.columns,
+                                    event.size.rows,
+                                )
+                                is RemoteSessionEvent.Title -> {
+                                    engine.advance(event.sequence)
+                                    mutableTitle.value = event.value
+                                }
                                 is RemoteSessionEvent.InputResult,
                                 is RemoteSessionEvent.ControlGranted,
-                                -> Unit
-                                is RemoteSessionEvent.ControlRevoked -> engine.setReadOnly(true)
-                                is RemoteSessionEvent.Lifecycle -> Unit
+                                -> engine.advance(event.sequence)
+                                is RemoteSessionEvent.ControlRevoked -> {
+                                    engine.advance(event.sequence)
+                                    engine.setReadOnly(true)
+                                }
+                                is RemoteSessionEvent.Lifecycle -> engine.advance(event.sequence)
                                 is RemoteSessionEvent.Gap -> error("raw replay contains a permanent gap")
                             }
                             lastAppliedSequence = event.sequence
@@ -452,13 +467,23 @@ class RemoteTerminalSession(
                     for (event in events) {
                         when (event) {
                             is RemoteSessionEvent.Output -> applyOutput(event)
-                            is RemoteSessionEvent.Resize -> engine.resize(event.size.columns, event.size.rows)
-                            is RemoteSessionEvent.Title -> mutableTitle.value = event.value
+                            is RemoteSessionEvent.Resize -> engine.resize(
+                                event.sequence,
+                                event.size.columns,
+                                event.size.rows,
+                            )
+                            is RemoteSessionEvent.Title -> {
+                                engine.advance(event.sequence)
+                                mutableTitle.value = event.value
+                            }
                             is RemoteSessionEvent.InputResult,
                             is RemoteSessionEvent.ControlGranted,
-                            -> Unit
-                            is RemoteSessionEvent.ControlRevoked -> engine.setReadOnly(true)
-                            is RemoteSessionEvent.Lifecycle -> Unit
+                            -> engine.advance(event.sequence)
+                            is RemoteSessionEvent.ControlRevoked -> {
+                                engine.advance(event.sequence)
+                                engine.setReadOnly(true)
+                            }
+                            is RemoteSessionEvent.Lifecycle -> engine.advance(event.sequence)
                             is RemoteSessionEvent.Gap -> error("raw replay contains a permanent gap")
                         }
                         lastAppliedSequence = event.sequence
@@ -669,12 +694,13 @@ class RemoteTerminalSession(
         is RemoteSessionState.HistoryGap -> current.copy(lastAckedSequence = lastAckedSequence)
     }
 
-    private fun enterHistoryGap(expected: Long, received: Long) {
+    private suspend fun enterHistoryGap(expected: Long, received: Long) {
         leaseExpiryJob?.cancel()
         leaseExpiryJob = null
         leaseRenewalJob?.cancel()
         leaseRenewalJob = null
         engine.setReadOnly(true)
+        val rendererFailure = runCatching { engine.reportGap(expected) }.exceptionOrNull()
         gapGeneration++
         mutableState.value = RemoteSessionState.HistoryGap(
             lastAckedSequence,
@@ -683,6 +709,7 @@ class RemoteTerminalSession(
             gapGeneration,
         )
         orderedEventDispatcher?.offerInvalidated(rendererGeneration)
+        rendererFailure?.let { throw it }
     }
 
     private suspend fun markReconnecting(reason: String?) {

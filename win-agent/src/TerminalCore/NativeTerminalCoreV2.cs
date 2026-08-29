@@ -1390,6 +1390,27 @@ namespace TermLink.TerminalCore
         }
 
         /// <summary>
+        /// Attempts to encode one lossless Win32 record. A false result means that the
+        /// terminal has not negotiated DEC private mode 9001; all other failures remain fatal.
+        /// </summary>
+        public bool TryEncodeWin32Key(
+            NativeTerminalWin32KeyEvent keyEvent,
+            out byte[] encoded)
+        {
+            try
+            {
+                encoded = EncodeWin32Key(keyEvent);
+                return true;
+            }
+            catch (NativeTerminalException error)
+                when (error.Status == NativeTerminalStatus.Unsupported)
+            {
+                encoded = null;
+                return false;
+            }
+        }
+
+        /// <summary>
         /// Encodes one semantic Kitty keyboard event according to the terminal's
         /// currently negotiated Kitty keyboard flags.
         /// </summary>

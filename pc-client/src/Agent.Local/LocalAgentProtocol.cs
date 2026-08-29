@@ -278,5 +278,11 @@ public sealed record SetRemoteAccessPayload(bool Enabled);
 public sealed record SessionPayload(Guid SessionId);
 public sealed record DevicePayload(Guid DeviceId, string? Permission = null);
 public sealed record LoginPayload(string Username, string Password, string PcName);
-public sealed record RegisterPayload(string Username, string Email, string Password, string PasswordConfirmation, string PcName);
+public sealed record RegisterPayload(
+    string Username,
+    string Nickname,
+    string Email,
+    string Password,
+    string PasswordConfirmation,
+    string PcName);
 public sealed record TerminalCommandsPayload(IReadOnlyList<TerminalCommandCapability> Commands);

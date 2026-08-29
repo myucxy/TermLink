@@ -63,8 +63,11 @@ import dev.termlink.session.RemoteSessionEvent
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalInput
+import dev.termlink.terminal.api.TerminalEngine
 import dev.termlink.terminal.api.PreparedTerminalCheckpoint
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
+import dev.termlink.terminal.api.TerminalViewportEngine
+import dev.termlink.terminal.nativecore.NativeTerminalEngine
 import dev.termlink.terminal.termux.TermuxTerminalEngine
 import java.time.Instant
 import java.net.URI
@@ -1349,7 +1352,7 @@ internal class ProductionProductRepository(
         }
         val root = PRODUCT_PUBLIC_SERVER_URL
         val stored = identity()
-        val engine = TermuxTerminalEngine(
+        val engine = NativeTerminalEngine(
             initialSize = TerminalSize(summary.columns.coerceAtLeast(1), summary.rows.coerceAtLeast(1)),
         )
         val restoredHistory = try {
@@ -1381,12 +1384,7 @@ internal class ProductionProductRepository(
             observeBootstrapFailure(sessionId, classified.failure)
             throw classified
         }
-        var terminalCoreShadow: TerminalCoreShadowObserver? = null
         val client = try {
-            terminalCoreShadow = createJniTerminalCoreShadowObserver(
-                initialRendererState = restoredHistory.rendererState,
-                initialSize = engine.authoritativeSize.value,
-            )
             ProductionRealtimeSessionClient(
                 engine = engine,
                 config = ProductionRealtimeSessionConfig(
@@ -1439,15 +1437,12 @@ internal class ProductionProductRepository(
                     }
                 },
                 authoritativeMetadataRefreshObserver = { refreshLiveKeyMetadata() },
-                orderedEventObserver = terminalCoreShadow,
             )
         } catch (error: CancellationException) {
-            terminalCoreShadow?.close()
             transport.close()
             engine.dispose()
             throw error
         } catch (error: Throwable) {
-            terminalCoreShadow?.close()
             transport.close()
             engine.dispose()
             val classified = classifySessionOpenException(error, SessionFailureStage.REALTIME)
@@ -1561,9 +1556,9 @@ internal class ProductionProductRepository(
         }
     }
 
-    override fun terminalEngine(sessionId: UUID): TermuxTerminalEngine? = liveSessions[sessionId]?.engine
+    override fun terminalEngine(sessionId: UUID): TerminalViewportEngine? = liveSessions[sessionId]?.engine
 
-    override fun historyEngine(historyObjectId: UUID): TermuxTerminalEngine? = historyEngines[historyObjectId]
+    override fun historyEngine(historyObjectId: UUID): TerminalViewportEngine? = historyEngines[historyObjectId]
 
     override suspend fun loadTranscriptBefore(sessionId: UUID) {
         check(!closed) { "Repository is closed" }
@@ -1697,8 +1692,7 @@ internal class ProductionProductRepository(
     override suspend fun sendCommand(sessionId: UUID, text: String) {
         val live = liveSessions[sessionId] ?: error("Open the session before sending input")
         require(text.isNotEmpty()) { "Command text is empty" }
-        val submission = live.client.remoteSession.submitInput(TerminalInput.Text(text + '\r'))
-        commandSubmissionFailure(submission)?.let(::error)
+        check(live.engine.submitText(text + '\r')) { "Request control before sending input" }
     }
 
     override suspend fun sendTerminalAction(sessionId: UUID, action: TerminalAction) {
@@ -3676,7 +3670,7 @@ internal class ProductionProductRepository(
     )
 
     private class LiveProductSession(
-        val engine: TermuxTerminalEngine,
+        val engine: NativeTerminalEngine,
         val client: ProductionRealtimeSessionClient,
     ) : AutoCloseable {
         val controlRequestLock = Mutex()
@@ -4095,7 +4089,7 @@ internal class ProductionProductRepository(
 
     private suspend fun resetLiveRendererAndCursor(
         session: SessionSummary,
-        engine: TermuxTerminalEngine,
+        engine: TerminalEngine,
         expectedRendererGeneration: Long,
     ): RestoredLiveHistory = withContext(NonCancellable) {
         engine.clear()
@@ -4528,7 +4522,7 @@ internal class ProductionProductRepository(
         pc: PcSummary,
         pcDevice: DeviceSummary,
         stored: DeviceKeyVault.StoredIdentity,
-        engine: TermuxTerminalEngine,
+        engine: TerminalEngine,
         afterSequence: ULong,
         throughSequence: ULong,
         initialLocalInputEpoch: Long,
@@ -4773,7 +4767,7 @@ internal class ProductionProductRepository(
         pc: PcSummary,
         pcDevice: DeviceSummary,
         stored: DeviceKeyVault.StoredIdentity,
-        engine: TermuxTerminalEngine,
+        engine: NativeTerminalEngine,
         allowFreshReplayFromZero: Boolean = false,
     ): RestoredLiveHistory {
         val cursor = historyRepository.ackCursorState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
@@ -4794,99 +4788,24 @@ internal class ProductionProductRepository(
                 return RestoredLiveHistory(RendererBootstrapState.Empty(cursor.rendererGeneration))
             }
         }
-        var latestAuthoritativeTail = session.lastOutputSequence
-        var authoritativeReadinessObserved = false
-        var latestSnapshotFailure: SessionOpenFailure? = null
-        val snapshotRuntimeNegotiated = terminalSnapshotRuntimeNegotiated(
-            localRuntimeEnabled = BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME,
-            pcCapabilities = pc.capabilities,
-        )
-        val restoredSnapshot = restoreSnapshotWhenEnabled(
-            enabled = snapshotRuntimeNegotiated,
-            remoteRetryDelaysMillis = TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS,
-            remoteReadinessTimeoutMillis = TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS,
-            restoreBound = {
-                restoreBoundTerminalCheckpoint(
-                    session,
-                    pc,
-                    pcDevice,
-                    stored,
-                    engine,
-                )
-            },
-            latestRemote = {
-                try {
-                    latestTerminalSnapshot(session, stored, pc.keyEpoch)
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (error: Exception) {
-                    if (BuildConfig.DEBUG) {
-                        val failure = classifySessionOpenException(
-                            error,
-                            SessionFailureStage.SNAPSHOT_METADATA,
-                        ).failure.code.stableCode
-                        Log.e("TermLinkTailFirst", "Snapshot readiness request failed [$failure]")
-                    }
-                    throw error
-                }
-            },
-            remoteReady = { observation ->
-                snapshotReadinessIsSettled(
-                    snapshotAvailable = observation.snapshot != null,
-                    failure = observation.failure,
-                )
-            },
-            onRemoteObserved = { observation ->
-                authoritativeReadinessObserved = true
-                observation.failure?.let { latestSnapshotFailure = it }
-                latestAuthoritativeTail = maxOf(
-                    latestAuthoritativeTail,
-                    observation.lastOutputSequence,
-                )
-            },
-            restoreRemote = { observation ->
-                observation.snapshot?.let { descriptor ->
-                    restoreRemoteTerminalSnapshot(
-                        session,
-                        pc,
-                        pcDevice,
-                        stored,
-                        engine,
-                        cursor.rendererGeneration,
-                        descriptor,
-                        onFailure = { latestSnapshotFailure = it },
-                    )
-                }
-            },
-            onRemoteFailure = { error ->
-                latestSnapshotFailure = classifySessionOpenException(
-                    error,
-                    SessionFailureStage.SNAPSHOT_METADATA,
-                ).failure
-            },
-        )
-        if (restoredSnapshot != null) {
-            // The tail can advance while a large object is downloaded,
-            // decrypted, and installed. Revalidate after installation but
-            // before the realtime transport is registered. The Snapshot may
-            // trail by one bounded flow-control window, never by an unbounded
-            // historical prefix.
-            val currentTail = latestAuthoritativeSessionTail(session)
-                ?: throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_METADATA)
-            if (!snapshotHasBoundedLiveSuffix(
-                    restoredSnapshot.rendererState.sequence.toULong(),
-                    currentTail,
-                )
-            ) throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_STALE)
-            return restoredSnapshot
-        }
+        // Portable Snapshot V1 belongs to the legacy Termux projection and is not binary-compatible
+        // with terminal-core's canonical Snapshot V2. Production native authority therefore
+        // rebuilds from encrypted CHUNK pages only. Pages and decrypted chunks remain bounded, but
+        // the number of pages and total session length are intentionally unbounded (TL-H115).
+        val latestAuthoritativeTail = try {
+            latestAuthoritativeSessionTail(session)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            throw classifySessionOpenException(error, SessionFailureStage.HISTORY_METADATA)
+        } ?: throw sessionOpenException(SessionOpenFailureCode.SESSION_UNAVAILABLE)
         // A brand-new silent session has no historical terminal state to
         // bootstrap. Subscribing from zero is tail-safe because sequence zero
         // cannot cause an old output prefix to be replayed.
         if (canSafelySubscribeFromZeroWithoutSnapshot(
                 currentSessionSequence = latestAuthoritativeTail,
                 durableAcknowledgement = cursor.sequence,
-                authoritativeReadinessObserved = authoritativeReadinessObserved,
+                authoritativeReadinessObserved = true,
             )
         ) {
             return RestoredLiveHistory(RendererBootstrapState.Empty(cursor.rendererGeneration))
@@ -4896,13 +4815,7 @@ internal class ProductionProductRepository(
             resetLiveRendererAndCursor(session, engine, activeRendererGeneration).also { reset ->
                 activeRendererGeneration = reset.rendererState.rendererGeneration
             }
-        val initialTail = try {
-            latestAuthoritativeSessionTail(session)
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Exception) {
-            throw classifySessionOpenException(error, SessionFailureStage.HISTORY_METADATA)
-        } ?: throw sessionOpenException(SessionOpenFailureCode.SESSION_UNAVAILABLE)
+        val initialTail = latestAuthoritativeTail
         if (initialTail == 0uL) {
             if (cursor.sequence == 0uL) {
                 return RestoredLiveHistory(RendererBootstrapState.Empty(cursor.rendererGeneration))
@@ -4968,7 +4881,7 @@ internal class ProductionProductRepository(
                 ),
                 localInputEpoch = localInputEpoch,
                 durableAcknowledgement = restored,
-                bootstrapSource = ProductBootstrapSource.LEGACY_REPLAY,
+                bootstrapSource = ProductBootstrapSource.NATIVE_FULL_PREFIX,
             )
         } catch (error: CancellationException) {
             resetRendererAndCursor()
@@ -5273,36 +5186,35 @@ internal class ProductionProductRepository(
         }
     }
 
-    private suspend fun applyHistoryEvent(engine: TermuxTerminalEngine, event: HistoryEventV1): Long {
-        val payload = event.payload.toByteArray()
-        return try {
-            when (event.messageType) {
-                MessageType.OUTPUT_CHUNK -> {
-                    val output = OutputChunkPayload.parseFrom(payload).output.toByteArray()
-                    try { engine.feed(event.seq, ByteBuffer.wrap(output)) } finally { output.fill(0) }
-                    0
-                }
-                MessageType.RESIZE_APPLIED -> ResizePayload.parseFrom(payload).also { resize ->
-                    engine.resize(resize.columns.coerceAtLeast(1), resize.rows.coerceAtLeast(1))
-                }.let { 0 }
-                MessageType.GAP -> {
-                    val gap = GapPayload.parseFrom(payload)
-                    error("History gap ${gap.start}..${gap.end}")
-                }
-                MessageType.SESSION_UPSERT,
-                MessageType.SESSION_STARTED,
-                MessageType.SESSION_INTERRUPTED,
-                MessageType.SESSION_ENDED,
-                MessageType.INPUT_ACCEPTED,
-                MessageType.INPUT_REJECTED,
-                MessageType.LEASE_GRANTED -> 0
-                MessageType.LEASE_DENIED,
-                MessageType.LEASE_REVOKED,
-                -> LeasePayload.parseFrom(payload).localInputEpoch
-                else -> error("Unsupported history event ${event.messageType}")
+    private suspend fun applyHistoryEvent(engine: TerminalEngine, event: HistoryEventV1): Long {
+        if (event.messageType == MessageType.GAP) {
+            val payload = event.payload.toByteArray()
+            try {
+                val gap = GapPayload.parseFrom(payload)
+                runCatching { engine.reportGap(event.seq) }
+                error("History gap ${gap.start}..${gap.end}")
+            } finally {
+                payload.fill(0)
             }
+        }
+        val decoded = decodeHistoryEvent(event)
+        return try {
+            when (val remote = decoded.event) {
+                is RemoteSessionEvent.Output ->
+                    engine.feed(remote.sequence, ByteBuffer.wrap(remote.bytes).asReadOnlyBuffer())
+                is RemoteSessionEvent.Resize ->
+                    engine.resize(remote.sequence, remote.size.columns, remote.size.rows)
+                is RemoteSessionEvent.Title,
+                is RemoteSessionEvent.InputResult,
+                is RemoteSessionEvent.ControlGranted,
+                is RemoteSessionEvent.ControlRevoked,
+                is RemoteSessionEvent.Lifecycle,
+                -> engine.advance(remote.sequence)
+                is RemoteSessionEvent.Gap -> error("Decoded history unexpectedly retained a gap")
+            }
+            decoded.localInputEpoch
         } finally {
-            payload.fill(0)
+            if (decoded.event is RemoteSessionEvent.Output) decoded.event.bytes.fill(0)
         }
     }
 

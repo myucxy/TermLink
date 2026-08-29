@@ -129,6 +129,15 @@ Assert-True ($targetModeValues.Count -eq 2 -and
     $targetModeValues -ccontains 'ManagedAcceptanceCompose' -and
     $targetModeValues -ccontains 'ExternalHttps') 'TargetMode does not expose exactly the two supported modes.'
 
+$observationTimeoutParameter = @($ast.ParamBlock.Parameters | Where-Object {
+    $_.Name.VariablePath.UserPath -eq 'ObservationTimeoutSeconds'
+})
+Assert-True ($observationTimeoutParameter.Count -eq 1) `
+    'The runner does not declare exactly one ObservationTimeoutSeconds parameter.'
+$observationTimeoutDefault = [int]$observationTimeoutParameter[0].DefaultValue.SafeGetValue()
+Assert-True ($observationTimeoutDefault -ge 300) `
+    'The runner observation timeout is too short for the 5200-event streamed-prefix fixture.'
+
 Assert-True ($source.Contains("Get-ManifestTool 'android-sdk'")) 'The runner does not select ADB through D:\Dev.'
 Assert-True ($source.Contains("Get-ManifestTool 'dotnet'")) 'The runner does not preflight the D:\Dev .NET SDK.'
 Assert-True ($source.Contains("Get-ManifestTool 'go'")) 'The runner does not preflight the D:\Dev Go toolchain.'
@@ -138,6 +147,8 @@ Assert-True ($source.Contains('$streamedPrefixMarkerCount = 5200')) `
     'The streamed Chunk-prefix runner does not emit enough independently flushed events.'
 Assert-True ($source.Contains('$streamedPrefixMinimumTail = [uint64]4097')) `
     'The streamed Chunk-prefix runner does not gate open beyond the 4096-event window.'
+Assert-True ($source.Contains("'NATIVE_FULL_PREFIX'")) `
+    'The streamed Chunk-prefix runner does not require native terminal-core authority.'
 foreach ($streamedProof in @(
     "'streamed-prefix-ack-exceeds-4096'",
     "'streamed-prefix-bootstrap-source'",

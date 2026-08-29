@@ -1718,6 +1718,7 @@ namespace TermLink.Agent
                         ProductionEnrollment.PublicServerUrl,
                         request.PcName,
                         request.AccountUsername,
+                        request.AccountNickname,
                         request.AccountEmail,
                         request.AccountPassword,
                         request.AccountPasswordConfirmation);

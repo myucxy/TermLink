@@ -37,7 +37,7 @@ param(
     [ValidateRange(30, 600)]
     [int]$BootTimeoutSeconds = 180,
     [ValidateRange(30, 600)]
-    [int]$ObservationTimeoutSeconds = 120,
+    [int]$ObservationTimeoutSeconds = 300,
 
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')]
     [string]$ArtifactRunId = ('run-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)),
@@ -1413,8 +1413,8 @@ while ($true) {
             ($initialObservation.chunk_count -gt 0)
         Add-Assertion 'streamed-prefix-snapshot-sequence-zero' '0' $initialObservation.snapshot_sequence_s `
             ($initialObservation.snapshot_sequence_s -eq 0)
-        Add-Assertion 'streamed-prefix-bootstrap-source' 'LEGACY_REPLAY' $initialObservation.bootstrap_source `
-            ($initialObservation.bootstrap_source -ceq 'LEGACY_REPLAY')
+        Add-Assertion 'streamed-prefix-bootstrap-source' 'NATIVE_FULL_PREFIX' $initialObservation.bootstrap_source `
+            ($initialObservation.bootstrap_source -ceq 'NATIVE_FULL_PREFIX')
         Add-Assertion 'streamed-prefix-ack-exceeds-4096' ">=$minimumOpenTail" $initialObservation.live_ack `
             ($initialObservation.live_ack -ge $minimumOpenTail)
         Add-Assertion 'streamed-prefix-history-overlay-hidden' 'false' $initialObservation.history_overlay `
@@ -1457,8 +1457,8 @@ while ($true) {
         $script:evidence.observations += $closedObservation
         Add-Assertion 'streamed-prefix-live-session-fixed' $fixedSessionId $closedObservation.session_id `
             ($closedObservation.session_id -ceq $fixedSessionId)
-        Add-Assertion 'streamed-prefix-live-bootstrap-source-fixed' 'LEGACY_REPLAY' `
-            $closedObservation.bootstrap_source ($closedObservation.bootstrap_source -ceq 'LEGACY_REPLAY')
+        Add-Assertion 'streamed-prefix-live-bootstrap-source-fixed' 'NATIVE_FULL_PREFIX' `
+            $closedObservation.bootstrap_source ($closedObservation.bootstrap_source -ceq 'NATIVE_FULL_PREFIX')
         Add-Assertion 'streamed-prefix-live-snapshot-count-zero' '0' $closedObservation.snapshot_count `
             ($closedObservation.snapshot_count -eq 0)
         Add-Assertion 'streamed-prefix-live-transcript-count-zero' '0' $closedObservation.transcript_count `

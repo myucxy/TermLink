@@ -59,15 +59,80 @@
           </Button>
         </StackPanel>
 
-        <Border Grid.Row="3" Classes="subtle-card" Padding="12">
-          <Grid ColumnDefinitions="Auto,*" ColumnSpacing="10">
-            <Border Classes="status-dot" Classes.online="{Binding IsConnected}" VerticalAlignment="Center" />
-            <StackPanel Grid.Column="1">
-              <TextBlock Text="{Binding AgentName}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
-              <TextBlock Text="{Binding StatusText}" Classes="muted" FontSize="12" TextTrimming="CharacterEllipsis" />
-            </StackPanel>
-          </Grid>
-        </Border>
+        <StackPanel x:Name="SidebarIdentityPanel" Grid.Row="3" Spacing="8">
+          <Border Classes="subtle-card" Padding="11">
+            <Grid ColumnDefinitions="24,*" ColumnSpacing="9">
+              <PathIcon Data="{DynamicResource TermLinkDevicesIcon}" Width="18" Height="18" VerticalAlignment="Center" />
+              <TextBlock x:Name="SidebarComputerNameText" Grid.Column="1"
+                         Text="{Binding AgentName}"
+                         ToolTip.Tip="{Binding AgentName}"
+                         FontWeight="SemiBold"
+                         VerticalAlignment="Center"
+                         TextWrapping="NoWrap"
+                         TextTrimming="CharacterEllipsis" />
+            </Grid>
+          </Border>
+
+          <Border x:Name="SidebarAccountLoading" Classes="subtle-card" Padding="11" IsVisible="{Binding IsAccountStateLoading}">
+            <TextBlock Text="{x:Static text:PresentationText.AccountLoading}" Classes="muted" FontSize="12" />
+          </Border>
+
+          <Button x:Name="SidebarAccountButton"
+                  Classes="sidebar-card"
+                  IsVisible="{Binding IsAccountLinked}"
+                  Command="{Binding OpenAccountSettingsCommand}"
+                  AutomationProperties.Name="当前账户">
+            <Grid ColumnDefinitions="36,*" ColumnSpacing="10">
+              <Border Classes="account-avatar">
+                <TextBlock x:Name="SidebarAvatarInitialText" Text="{Binding Account.AccountAvatarInitial}" Foreground="{DynamicResource TermLinkOnPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" FontWeight="Bold" />
+              </Border>
+              <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                <TextBlock x:Name="SidebarNicknameText" Text="{Binding Account.AccountDisplayName}"
+                           ToolTip.Tip="{Binding Account.AccountDisplayName}"
+                           FontWeight="SemiBold"
+                           TextWrapping="NoWrap"
+                           TextTrimming="CharacterEllipsis" />
+                <TextBlock x:Name="SidebarUsernameText" Text="{Binding Account.AccountUsernameDisplay}"
+                           ToolTip.Tip="{Binding Account.AccountUsernameDisplay}"
+                           Classes="muted"
+                           FontSize="12"
+                           TextWrapping="NoWrap"
+                           TextTrimming="CharacterEllipsis" />
+              </StackPanel>
+            </Grid>
+          </Button>
+
+          <Button x:Name="SidebarLoginButton"
+                  Classes="sidebar-card"
+                  IsVisible="{Binding IsAccountSignedOut}"
+                  Command="{Binding OpenAccountSettingsCommand}"
+                  AutomationProperties.Name="登录 TermLink 账户">
+            <Grid ColumnDefinitions="36,*" ColumnSpacing="10">
+              <Border Classes="account-avatar muted">
+                <PathIcon Data="{DynamicResource TermLinkAccountIcon}" Foreground="{DynamicResource TermLinkMutedBrush}" Width="20" Height="20" HorizontalAlignment="Center" VerticalAlignment="Center" />
+              </Border>
+              <TextBlock Grid.Column="1" Text="{Binding AccountActionText}" FontWeight="SemiBold" VerticalAlignment="Center" />
+            </Grid>
+          </Button>
+
+          <Button x:Name="SidebarUpdateButton"
+                  Classes="sidebar-card update"
+                  IsVisible="{Binding HasAvailableUpdate}"
+                  Command="{Binding OpenAboutUpdatesCommand}"
+                  AutomationProperties.Name="打开 TermLink 更新">
+            <Grid ColumnDefinitions="24,*" ColumnSpacing="9">
+              <PathIcon Data="{DynamicResource TermLinkRefreshIcon}" Width="18" Height="18" VerticalAlignment="Center" />
+              <TextBlock Grid.Column="1"
+                         Text="{Binding AvailableUpdateText}"
+                         ToolTip.Tip="{Binding AvailableUpdateText}"
+                         FontSize="12"
+                         FontWeight="SemiBold"
+                         TextWrapping="NoWrap"
+                         TextTrimming="CharacterEllipsis"
+                         VerticalAlignment="Center" />
+            </Grid>
+          </Button>
+        </StackPanel>
       </Grid>
     </Border>
 
@@ -273,6 +338,7 @@
                     <StackPanel Spacing="5">
                       <TextBlock Classes="eyebrow" Text="{x:Static text:PresentationText.SignedIn}" />
                       <TextBlock Text="{Binding Account.AccountDisplayName}" FontSize="22" FontWeight="SemiBold" />
+                      <TextBlock Text="{Binding Account.AccountUsernameDisplay}" Classes="muted" />
                       <TextBlock Text="{x:Static text:PresentationText.AccountPrivacy}" Classes="muted" TextWrapping="Wrap" />
                     </StackPanel>
                     <Button Grid.Column="1" Classes="danger" Content="{x:Static text:PresentationText.SignOut}" Command="{Binding SignOutCommand}" VerticalAlignment="Center" />
@@ -286,17 +352,19 @@
                       <Button Classes="section-nav" Classes.selected="{Binding IsLoginMode}" Content="{x:Static text:PresentationText.LoginMode}" Command="{Binding SetAccountFormModeCommand}" CommandParameter="login" />
                       <Button Classes="section-nav" Classes.selected="{Binding IsRegisterMode}" Content="{x:Static text:PresentationText.RegisterMode}" Command="{Binding SetAccountFormModeCommand}" CommandParameter="register" IsVisible="{Binding CanRegisterAccount}" />
                     </WrapPanel>
-                    <Grid ColumnDefinitions="130,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto" RowSpacing="10">
+                    <Grid ColumnDefinitions="130,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto" RowSpacing="10">
                       <TextBlock Text="{x:Static text:PresentationText.PcName}" VerticalAlignment="Center" />
                       <TextBox Grid.Column="1" Text="{Binding Account.PcName}" AutomationProperties.Name="PC 名称" />
                       <TextBlock Grid.Row="1" Text="{x:Static text:PresentationText.Username}" VerticalAlignment="Center" />
                       <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding Account.Username}" AutomationProperties.Name="用户名" />
-                      <TextBlock Grid.Row="2" Text="{x:Static text:PresentationText.RegistrationEmail}" VerticalAlignment="Center" IsVisible="{Binding IsRegisterMode}" />
-                      <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding Account.Email}" AutomationProperties.Name="注册邮箱" IsVisible="{Binding IsRegisterMode}" />
-                      <TextBlock Grid.Row="3" Text="{x:Static text:PresentationText.Password}" VerticalAlignment="Center" />
-                      <TextBox Grid.Row="3" Grid.Column="1" PasswordChar="●" Text="{Binding Account.Password}" AutomationProperties.Name="密码" />
-                      <TextBlock Grid.Row="4" Text="{x:Static text:PresentationText.ConfirmPassword}" VerticalAlignment="Center" IsVisible="{Binding IsRegisterMode}" />
-                      <TextBox Grid.Row="4" Grid.Column="1" PasswordChar="●" Text="{Binding Account.PasswordConfirmation}" AutomationProperties.Name="确认密码" IsVisible="{Binding IsRegisterMode}" />
+                      <TextBlock Grid.Row="2" Text="{x:Static text:PresentationText.Nickname}" VerticalAlignment="Center" IsVisible="{Binding IsRegisterMode}" />
+                      <TextBox x:Name="AccountNicknameInput" Grid.Row="2" Grid.Column="1" Text="{Binding Account.Nickname}" AutomationProperties.Name="昵称" IsVisible="{Binding IsRegisterMode}" />
+                      <TextBlock Grid.Row="3" Text="{x:Static text:PresentationText.RegistrationEmail}" VerticalAlignment="Center" IsVisible="{Binding IsRegisterMode}" />
+                      <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding Account.Email}" AutomationProperties.Name="注册邮箱" IsVisible="{Binding IsRegisterMode}" />
+                      <TextBlock Grid.Row="4" Text="{x:Static text:PresentationText.Password}" VerticalAlignment="Center" />
+                      <TextBox Grid.Row="4" Grid.Column="1" PasswordChar="●" Text="{Binding Account.Password}" AutomationProperties.Name="密码" />
+                      <TextBlock Grid.Row="5" Text="{x:Static text:PresentationText.ConfirmPassword}" VerticalAlignment="Center" IsVisible="{Binding IsRegisterMode}" />
+                      <TextBox Grid.Row="5" Grid.Column="1" PasswordChar="●" Text="{Binding Account.PasswordConfirmation}" AutomationProperties.Name="确认密码" IsVisible="{Binding IsRegisterMode}" />
                     </Grid>
                     <Button Classes="primary" Content="{x:Static text:PresentationText.Login}" Command="{Binding LoginCommand}" IsVisible="{Binding IsLoginMode}" HorizontalAlignment="Left" />
                     <Button Classes="primary" Content="{x:Static text:PresentationText.Register}" Command="{Binding RegisterCommand}" IsVisible="{Binding IsRegisterMode}" HorizontalAlignment="Left" />
@@ -392,7 +460,7 @@
                 <Border Classes="card">
                   <Grid ColumnDefinitions="*,Auto" ColumnSpacing="18">
                     <StackPanel Spacing="5"><TextBlock Classes="section-title" Text="{x:Static text:PresentationText.DesktopAndUpdates}" /><TextBlock Text="{x:Static text:PresentationText.UpdateSafetyDetail}" Classes="muted" TextWrapping="Wrap" /><TextBlock Text="{Binding Settings.UpdateStatusText}" Classes="muted" TextWrapping="Wrap" /></StackPanel>
-                    <Button Grid.Column="1" Classes="primary" Content="{x:Static text:PresentationText.CheckUpdates}" AutomationProperties.Name="检查 TermLink 更新" Command="{Binding CheckForUpdatesCommand}" VerticalAlignment="Center" />
+                    <Button x:Name="AboutUpdateActionButton" Grid.Column="1" Classes="primary" Content="{Binding UpdateActionText}" AutomationProperties.Name="执行 TermLink 更新操作" Command="{Binding UpdateActionCommand}" VerticalAlignment="Center" />
                   </Grid>
                 </Border>
               </StackPanel>

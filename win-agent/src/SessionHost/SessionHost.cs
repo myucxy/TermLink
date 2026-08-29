@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -10,6 +11,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using TermLink.Agent;
 using TermLink.LocalIpc;
+using TermLink.TerminalCore;
 
 namespace TermLink.SessionHost
 {
@@ -119,7 +121,7 @@ namespace TermLink.SessionHost
                     case "--test-agent-buffer-bytes":
                         agentBufferBytes = ParseInteger(
                             RequiredValue(args, ref index, "--test-agent-buffer-bytes"),
-                            64 * 1024,
+                            1024,
                             4 * 1024 * 1024,
                             "test Agent buffer bytes");
                         hasTestAgentBuffer = true;
@@ -365,6 +367,7 @@ namespace TermLink.SessionHost
         private readonly object titleSync = new object();
         private readonly ManualResetEventSlim inputThreadReady = new ManualResetEventSlim(false);
         private readonly TerminalTitleTracker titleTracker = new TerminalTitleTracker();
+        private readonly OuterTerminalReplySuppressor outerReplySuppressor;
         private IntPtr pseudoConsoleInput = IntPtr.Zero;
         private IntPtr terminalInput = IntPtr.Zero;
         private IntPtr terminalOutput = IntPtr.Zero;
@@ -390,15 +393,18 @@ namespace TermLink.SessionHost
         private string lastPublishedTitle;
         private AgentPipeBridge agentPipe;
         private AgentRegistryRegistration agentRegistration;
+        private TerminalCoreAuthority terminalAuthority;
         private COORD innerSize;
         private volatile bool stopInput;
         private volatile bool stopResize;
         private volatile bool outputDisconnected;
+        private volatile bool authorityFailed;
         private bool disposed;
 
         public ConPtySessionHost(SessionHostOptions options)
         {
             this.options = options;
+            outerReplySuppressor = new OuterTerminalReplySuppressor(WriteExpiredRawInput);
         }
 
         public int Run()
@@ -410,6 +416,14 @@ namespace TermLink.SessionHost
 
             var size = QueryOuterSize(outerOutput, options.FallbackColumns, options.FallbackRows);
             CreateInnerPseudoConsole(size);
+            if (options.UseAgentPipe)
+            {
+                terminalAuthority = new TerminalCoreAuthority(
+                    size.X,
+                    size.Y,
+                    WriteAuthorityPtyReply,
+                    outerReplySuppressor.Expect);
+            }
             StartChildSuspended();
 
             if (options.UseAgentPipe)
@@ -420,7 +434,8 @@ namespace TermLink.SessionHost
                     options.HandshakeToken,
                     ApplyAgentInput,
                     ApplyAgentRemoteInput,
-                    options.AgentBufferBytes);
+                    options.AgentBufferBytes,
+                    ApplyDurableAuthorityFrame);
                 agentPipe.Start();
                 if (options.AutoRegister)
                 {
@@ -520,8 +535,18 @@ namespace TermLink.SessionHost
             RestoreOuterInputMode();
             stopResize = true;
             resizeTask.Wait(1000);
-            ClosePseudoConsoleForDrain();
-            if (!outputTask.Wait(5000))
+            var outputStopped = false;
+            if (outputDisconnected)
+            {
+                if (IsValid(terminalOutput))
+                {
+                    CancelIoEx(terminalOutput, IntPtr.Zero);
+                    CloseIfValid(ref terminalOutput);
+                }
+                outputStopped = outputTask.Wait(5000);
+            }
+            ClosePseudoConsoleForDrain(outputDisconnected);
+            if (!outputStopped && !outputTask.Wait(5000))
             {
                 outputDisconnected = true;
                 CloseIfValid(ref terminalOutput);
@@ -544,7 +569,7 @@ namespace TermLink.SessionHost
             GC.WaitForPendingFinalizers();
             var handlesAtEnd = Process.GetCurrentProcess().HandleCount;
 
-            if (options.Diagnostics && !outputDisconnected)
+            if (options.Diagnostics)
             {
                 Console.Error.WriteLine(
                     "__SESSION_HOST_RESULT__:reason=" + reason +
@@ -556,9 +581,60 @@ namespace TermLink.SessionHost
                     ";input_events=" + inputEventsPending +
                     ";input_mode=0x" + outerConsoleInputMode.ToString("X") +
                     ";input_cp=" + outerConsoleInputCodePage +
-                    ";agent_ack=" + (agentPipe == null ? 0 : agentPipe.LastAcknowledgedSequence));
+                    ";agent_ack=" + (agentPipe == null ? 0 : agentPipe.LastAcknowledgedSequence) +
+                    ";durable_ack=" + (agentPipe == null ? 0 : agentPipe.LastDurablyAcknowledgedSequence) +
+                    ";authority_failed=" + authorityFailed.ToString().ToLowerInvariant() +
+                    ";output_disconnected=" + outputDisconnected.ToString().ToLowerInvariant());
             }
             return reason == "timeout" ? 124 : unchecked((int)rawExitCode);
+        }
+
+        private void ApplyDurableAuthorityFrame(LocalFrame frame)
+        {
+            try
+            {
+                terminalAuthority.ApplyDurable(frame);
+            }
+            catch
+            {
+                authorityFailed = true;
+                outputDisconnected = true;
+                CloseInput();
+                throw;
+            }
+        }
+
+        private void WriteAuthorityPtyReply(byte[] bytes)
+        {
+            IntPtr destination;
+            lock (inputSync) destination = terminalInput;
+            if (!IsValid(destination))
+                throw new IOException("ConPTY input is closed for a terminal reply.");
+            lock (terminalWriteSync)
+            {
+                if (!WriteAll(destination, bytes, bytes.Length))
+                    throw new IOException("The terminal-core PTY reply could not be written.");
+            }
+            Interlocked.Add(ref inputBytesWritten, bytes.Length);
+        }
+
+        private void WriteExpiredRawInput(byte[] bytes)
+        {
+            if (bytes == null || bytes.Length == 0 || stopInput) return;
+            try
+            {
+                if (!WriteLocalInput(bytes, bytes.Length))
+                {
+                    outputDisconnected = true;
+                    stopInput = true;
+                }
+            }
+            catch
+            {
+                outputDisconnected = true;
+                stopInput = true;
+                CloseInput();
+            }
         }
 
         internal static bool ShouldAbortUnregisteredSession(
@@ -724,8 +800,25 @@ namespace TermLink.SessionHost
         private void BridgeConsoleInput(IntPtr outerInput)
         {
             var records = new INPUT_RECORD[128];
+            var resolved = new ConcurrentQueue<KEY_EVENT_RECORD>();
+            var resolutionSync = new object();
+            var pendingByPhysicalKey = new Dictionary<uint, List<PendingConsoleKey>>();
             while (!stopInput)
             {
+                var wait = WaitForSingleObject(outerInput, 50);
+                if (wait == WaitTimeout)
+                {
+                    outerReplySuppressor.Filter(Array.Empty<byte>(), 0);
+                    if (!WriteResolvedConsoleKeys(resolved)) break;
+                    continue;
+                }
+                if (wait != WaitObject0)
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    if (stopInput || error == ErrorOperationAborted || error == ErrorBrokenPipe) break;
+                    throw new Win32Exception(error, "Waiting for console input failed.");
+                }
+
                 uint recordsRead;
                 if (!ReadConsoleInput(outerInput, records, (uint)records.Length, out recordsRead))
                 {
@@ -736,18 +829,134 @@ namespace TermLink.SessionHost
                 if (recordsRead == 0) break;
                 Interlocked.Add(ref inputUnitsRead, recordsRead);
 
-                var input = new StringBuilder();
+                if (terminalAuthority == null)
+                {
+                    var input = new StringBuilder();
+                    for (var index = 0; index < recordsRead; index++)
+                    {
+                        var record = records[index];
+                        if (record.EventType != KeyEvent || !record.KeyEvent.KeyDown) continue;
+                        AppendKeyInput(input, record.KeyEvent);
+                    }
+                    if (input.Length == 0) continue;
+                    var bytes = Encoding.UTF8.GetBytes(input.ToString());
+                    var filtered = outerReplySuppressor.Filter(bytes, bytes.Length);
+                    if (filtered.Length != 0 && !WriteLocalInput(filtered, filtered.Length)) break;
+                    continue;
+                }
+
                 for (var index = 0; index < recordsRead; index++)
                 {
                     var record = records[index];
-                    if (record.EventType != KeyEvent || !record.KeyEvent.KeyDown) continue;
-                    AppendKeyInput(input, record.KeyEvent);
+                    if (record.EventType != KeyEvent) continue;
+                    var key = record.KeyEvent;
+                    var signature = PhysicalKeySignature(key);
+                    if (!key.KeyDown)
+                    {
+                        lock (resolutionSync)
+                        {
+                            if (pendingByPhysicalKey.TryGetValue(signature, out var pendingKeys))
+                            {
+                                PendingConsoleKey pending = null;
+                                for (var pendingIndex = 0; pendingIndex < pendingKeys.Count; pendingIndex++)
+                                {
+                                    if (!pendingKeys[pendingIndex].KeyUp.HasValue)
+                                    {
+                                        pending = pendingKeys[pendingIndex];
+                                        break;
+                                    }
+                                }
+                                if (pending != null)
+                                {
+                                    pending.KeyUp = key;
+                                    if (pending.IsResolved)
+                                    {
+                                        if (pending.PassThrough) resolved.Enqueue(key);
+                                        pendingKeys.Remove(pending);
+                                        if (pendingKeys.Count == 0)
+                                            pendingByPhysicalKey.Remove(signature);
+                                    }
+                                    continue;
+                                }
+                            }
+                            resolved.Enqueue(key);
+                        }
+                        continue;
+                    }
+
+                    var projection = EncodeCompatibilityKey(key);
+                    if (projection.Length == 0)
+                    {
+                        resolved.Enqueue(key);
+                        continue;
+                    }
+
+                    var pendingKey = new PendingConsoleKey(key);
+                    lock (resolutionSync)
+                    {
+                        if (!pendingByPhysicalKey.TryGetValue(signature, out var pendingKeys))
+                        {
+                            pendingKeys = new List<PendingConsoleKey>();
+                            pendingByPhysicalKey.Add(signature, pendingKeys);
+                        }
+                        pendingKeys.Add(pendingKey);
+                    }
+                    outerReplySuppressor.FilterFragment(
+                        projection,
+                        projection.Length,
+                        passThrough =>
+                        {
+                            lock (resolutionSync)
+                            {
+                                pendingKey.IsResolved = true;
+                                pendingKey.PassThrough = passThrough;
+                                if (passThrough) resolved.Enqueue(pendingKey.KeyDown);
+                                if (pendingKey.KeyUp.HasValue)
+                                {
+                                    if (passThrough) resolved.Enqueue(pendingKey.KeyUp.Value);
+                                    if (pendingByPhysicalKey.TryGetValue(signature, out var pendingKeys))
+                                    {
+                                        pendingKeys.Remove(pendingKey);
+                                        if (pendingKeys.Count == 0)
+                                            pendingByPhysicalKey.Remove(signature);
+                                    }
+                                }
+                            }
+                        });
                 }
-                if (input.Length == 0) continue;
-                var bytes = Encoding.UTF8.GetBytes(input.ToString());
-                if (!WriteLocalInput(bytes, bytes.Length)) break;
+                if (!WriteResolvedConsoleKeys(resolved)) break;
             }
         }
+
+        private bool WriteResolvedConsoleKeys(ConcurrentQueue<KEY_EVENT_RECORD> resolved)
+        {
+            while (resolved.TryDequeue(out var key))
+            {
+                var nativeKey = new NativeTerminalWin32KeyEvent(
+                    key.VirtualKeyCode,
+                    key.VirtualScanCode,
+                    key.UnicodeChar,
+                    key.KeyDown,
+                    key.ControlKeyState,
+                    key.RepeatCount);
+                if (!terminalAuthority.EncodeAndWriteConsoleKey(nativeKey, bytes =>
+                    WriteLocalInput(bytes, bytes.Length)))
+                    return false;
+            }
+            return true;
+        }
+
+        private static byte[] EncodeCompatibilityKey(KEY_EVENT_RECORD key)
+        {
+            var input = new StringBuilder();
+            AppendKeyInput(input, key);
+            return input.Length == 0
+                ? Array.Empty<byte>()
+                : Encoding.UTF8.GetBytes(input.ToString());
+        }
+
+        private static uint PhysicalKeySignature(KEY_EVENT_RECORD key) =>
+            ((uint)key.VirtualKeyCode << 16) | key.VirtualScanCode;
 
         private static void AppendKeyInput(StringBuilder input, KEY_EVENT_RECORD key)
         {
@@ -829,7 +1038,8 @@ namespace TermLink.SessionHost
                 }
                 if (read == 0) break;
                 Interlocked.Add(ref inputUnitsRead, read);
-                if (!WriteLocalInput(buffer, checked((int)read))) break;
+                var filtered = outerReplySuppressor.Filter(buffer, checked((int)read));
+                if (filtered.Length != 0 && !WriteLocalInput(filtered, filtered.Length)) break;
             }
         }
 
@@ -965,7 +1175,12 @@ namespace TermLink.SessionHost
                 }
                 var agentBytes = new byte[total];
                 Buffer.BlockCopy(buffer, 0, agentBytes, 0, total);
-                PublishAgentFrame(LocalFrameType.Output, agentBytes);
+                var outputSequence = PublishAgentFrame(LocalFrameType.Output, agentBytes);
+                if (agentPipe != null && !WaitForAuthority(outputSequence))
+                {
+                    outputDisconnected = true;
+                    break;
+                }
                 titleTracker.Process(agentBytes, PublishTitleIfChanged);
                 if (!WriteAll(outerOutput, buffer, total))
                 {
@@ -1029,14 +1244,32 @@ namespace TermLink.SessionHost
             return agentPipe == null ? 0 : agentPipe.Publish(type, payload);
         }
 
-        private void ClosePseudoConsoleForDrain()
+        private bool WaitForAuthority(ulong sequence)
+        {
+            if (sequence == 0 || agentPipe == null) return false;
+            while (!authorityFailed && !disposed && !outputDisconnected)
+            {
+                if (agentPipe.WaitForAck(sequence, 250)) return true;
+            }
+            return false;
+        }
+
+        private void ClosePseudoConsoleForDrain(bool abandonOutput)
         {
             CloseIfValid(ref pseudoConsoleInput);
             CloseIfValid(ref pseudoConsoleOutput);
             if (pseudoConsole != IntPtr.Zero)
             {
-                ClosePseudoConsole(pseudoConsole);
+                var ownedPseudoConsole = pseudoConsole;
                 pseudoConsole = IntPtr.Zero;
+                if (abandonOutput)
+                {
+                    Task.Run(() => ClosePseudoConsole(ownedPseudoConsole));
+                }
+                else
+                {
+                    ClosePseudoConsole(ownedPseudoConsole);
+                }
             }
         }
 
@@ -1131,6 +1364,12 @@ namespace TermLink.SessionHost
                 agentPipe.Dispose();
                 agentPipe = null;
             }
+            if (terminalAuthority != null)
+            {
+                terminalAuthority.Dispose();
+                terminalAuthority = null;
+            }
+            outerReplySuppressor.Dispose();
             CloseIfValid(ref pseudoConsoleInput);
             CloseIfValid(ref pseudoConsoleOutput);
             if (pseudoConsole != IntPtr.Zero)
@@ -1203,6 +1442,19 @@ namespace TermLink.SessionHost
             public ushort VirtualScanCode;
             public char UnicodeChar;
             public uint ControlKeyState;
+        }
+
+        private sealed class PendingConsoleKey
+        {
+            internal PendingConsoleKey(KEY_EVENT_RECORD keyDown)
+            {
+                KeyDown = keyDown;
+            }
+
+            internal KEY_EVENT_RECORD KeyDown { get; }
+            internal KEY_EVENT_RECORD? KeyUp { get; set; }
+            internal bool IsResolved { get; set; }
+            internal bool PassThrough { get; set; }
         }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -1310,6 +1562,9 @@ namespace TermLink.SessionHost
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CancelSynchronousIo(IntPtr thread);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CancelIoEx(IntPtr file, IntPtr overlapped);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool GetConsoleScreenBufferInfo(IntPtr output, out CONSOLE_SCREEN_BUFFER_INFO info);
@@ -1505,17 +1760,22 @@ namespace TermLink.SessionHost
         private readonly byte[] handshakeToken;
         private readonly Action<Guid, byte[]> inputHandler;
         private readonly Func<Guid, ulong, byte[], LocalRemoteInputResult> remoteInputHandler;
+        private readonly Action<LocalFrame> acknowledgedFrameHandler;
         private readonly int maximumBufferedBytes;
         private readonly object sync = new object();
+        private readonly object authorityApplySync = new object();
         private readonly LinkedList<LocalFrame> pending = new LinkedList<LocalFrame>();
         private readonly AutoResetEvent sendPending = new AutoResetEvent(false);
         private NamedPipeClientStream pipe;
         private Task connectionTask;
         private ulong nextSequence;
-        private ulong lastAcknowledgedSequence;
+        private ulong lastAuthorityAcknowledgedSequence;
+        private ulong lastDurablyAcknowledgedSequence;
         private ulong lastAgentCommandSequence;
         private int pendingBytes;
         private volatile bool stop;
+        private bool acknowledgedFrameHandlerFailed;
+        private bool localOnly;
         private bool disposed;
 
         public AgentPipeBridge(
@@ -1524,7 +1784,8 @@ namespace TermLink.SessionHost
             byte[] handshakeToken,
             Action<Guid, byte[]> inputHandler,
             Func<Guid, ulong, byte[], LocalRemoteInputResult> remoteInputHandler,
-            int maximumBufferedBytes)
+            int maximumBufferedBytes,
+            Action<LocalFrame> acknowledgedFrameHandler = null)
         {
             this.pipeName = pipeName;
             this.sessionId = sessionId;
@@ -1532,11 +1793,17 @@ namespace TermLink.SessionHost
             this.inputHandler = inputHandler;
             this.remoteInputHandler = remoteInputHandler;
             this.maximumBufferedBytes = maximumBufferedBytes;
+            this.acknowledgedFrameHandler = acknowledgedFrameHandler;
         }
 
         public ulong LastAcknowledgedSequence
         {
-            get { lock (sync) return lastAcknowledgedSequence; }
+            get { lock (sync) return lastAuthorityAcknowledgedSequence; }
+        }
+
+        public ulong LastDurablyAcknowledgedSequence
+        {
+            get { lock (sync) return lastDurablyAcknowledgedSequence; }
         }
 
         public bool IsConnected
@@ -1555,14 +1822,21 @@ namespace TermLink.SessionHost
 
         public ulong Publish(LocalFrameType type, byte[] payload)
         {
+            LocalFrame frame;
+            bool applyLocally;
             lock (sync)
             {
                 if (disposed) return 0;
-                var frame = new LocalFrame(type, sessionId, ++nextSequence, payload);
-                AddPending(frame);
-                sendPending.Set();
-                return frame.Sequence;
+                frame = new LocalFrame(type, sessionId, ++nextSequence, payload);
+                applyLocally = localOnly;
+                if (!applyLocally)
+                {
+                    AddPending(frame);
+                    sendPending.Set();
+                }
             }
+            if (applyLocally) TryApplyAuthorityFrame(frame);
+            return frame.Sequence;
         }
 
         public bool WaitForAck(ulong sequence, int timeoutMilliseconds)
@@ -1570,13 +1844,13 @@ namespace TermLink.SessionHost
             var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
             lock (sync)
             {
-                while (!disposed && lastAcknowledgedSequence < sequence)
+                while (!disposed && lastAuthorityAcknowledgedSequence < sequence)
                 {
                     var remaining = deadline - DateTime.UtcNow;
                     if (remaining <= TimeSpan.Zero) return false;
                     Monitor.Wait(sync, remaining);
                 }
-                return lastAcknowledgedSequence >= sequence;
+                return lastAuthorityAcknowledgedSequence >= sequence;
             }
         }
 
@@ -1725,6 +1999,10 @@ namespace TermLink.SessionHost
                             LocalFrameType.RemoteInputResult,
                             LocalPayloadCodec.RemoteInputResult(rejectedInputId, rejectedResult));
                         break;
+                    case LocalFrameType.RemoteAccessStopped:
+                        LocalPayloadCodec.ParseRemoteAccessStopped(frame.Payload);
+                        EnterLocalOnly();
+                        return;
                     default:
                         throw new InvalidDataException("Agent sent an invalid command type: " + frame.Type + ".");
                 }
@@ -1733,18 +2011,93 @@ namespace TermLink.SessionHost
 
         private void Acknowledge(ulong sequence)
         {
+            List<LocalFrame> acknowledged = null;
+            var applyToAuthority = false;
             lock (sync)
             {
                 if (sequence > nextSequence) throw new InvalidDataException("Agent ACK exceeds published sequence.");
-                if (sequence <= lastAcknowledgedSequence) return;
-                lastAcknowledgedSequence = sequence;
+                if (sequence <= lastDurablyAcknowledgedSequence) return;
+                applyToAuthority = acknowledgedFrameHandler != null && !acknowledgedFrameHandlerFailed;
+                if (applyToAuthority)
+                {
+                    acknowledged = new List<LocalFrame>();
+                    var node = pending.First;
+                    while (node != null && node.Value.Sequence <= sequence)
+                    {
+                        acknowledged.Add(node.Value);
+                        node = node.Next;
+                    }
+                }
+                lastDurablyAcknowledgedSequence = sequence;
                 while (pending.First != null && pending.First.Value.Sequence <= sequence)
                 {
                     pendingBytes -= StoredBytes(pending.First.Value);
                     pending.RemoveFirst();
                 }
+                if (acknowledgedFrameHandler == null)
+                    lastAuthorityAcknowledgedSequence = sequence;
                 Monitor.PulseAll(sync);
                 sendPending.Set();
+            }
+
+            // The wire ACK is durable journal evidence and must release transport backlog even
+            // when terminal-core rejects a Gap.  The authority cursor advances independently,
+            // only after each frame and its Host Effects have applied successfully.
+            if (!applyToAuthority) return;
+            foreach (var frame in acknowledged)
+            {
+                if (!TryApplyAuthorityFrame(frame)) return;
+            }
+        }
+
+        private void EnterLocalOnly()
+        {
+            List<LocalFrame> queued;
+            lock (authorityApplySync)
+            {
+                lock (sync)
+                {
+                    if (localOnly) return;
+                    localOnly = true;
+                    stop = true;
+                    queued = new List<LocalFrame>(pending);
+                    pending.Clear();
+                    pendingBytes = 0;
+                    Monitor.PulseAll(sync);
+                    sendPending.Set();
+                }
+                foreach (var frame in queued)
+                    if (!TryApplyAuthorityFrame(frame)) break;
+            }
+        }
+
+        private bool TryApplyAuthorityFrame(LocalFrame frame)
+        {
+            lock (authorityApplySync)
+            {
+                lock (sync)
+                {
+                    if (acknowledgedFrameHandlerFailed) return false;
+                }
+                try
+                {
+                    if (acknowledgedFrameHandler != null) acknowledgedFrameHandler(frame);
+                    lock (sync)
+                    {
+                        lastAuthorityAcknowledgedSequence = frame.Sequence;
+                        Monitor.PulseAll(sync);
+                    }
+                    return true;
+                }
+                catch
+                {
+                    lock (sync)
+                    {
+                        acknowledgedFrameHandlerFailed = true;
+                        Monitor.PulseAll(sync);
+                    }
+                    return false;
+                }
             }
         }
 
@@ -1788,7 +2141,7 @@ namespace TermLink.SessionHost
             pendingBytes += StoredBytes(frame);
             if (pendingBytes <= maximumBufferedBytes) return;
 
-            var gapStart = lastAcknowledgedSequence + 1;
+            var gapStart = lastDurablyAcknowledgedSequence + 1;
             var gapEnd = frame.Sequence;
             pending.Clear();
             pendingBytes = 0;

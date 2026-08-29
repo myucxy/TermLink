@@ -96,7 +96,8 @@ public sealed record AgentStatusSnapshot(
     PcAgentIdentity Identity,
     AgentConnectionState ConnectionState,
     bool AccountLinked,
-    string AccountDisplayName,
+    string AccountUsername,
+    string AccountNickname,
     string ServerOrigin,
     bool RemoteAccessEnabled,
     string? LastErrorCode,
@@ -115,6 +116,7 @@ public sealed record AgentStatusSnapshot(
             false,
             string.Empty,
             string.Empty,
+            string.Empty,
             false,
             code,
             detail,
@@ -130,7 +132,8 @@ public static class PcContractValidator
     {
         ArgumentNullException.ThrowIfNull(value);
         ValidateIdentity(value.Identity);
-        ValidateUtf8(value.AccountDisplayName, PcContractLimits.MaximumDisplayNameBytes, nameof(value.AccountDisplayName), true);
+        ValidateUtf8(value.AccountUsername, PcContractLimits.MaximumDisplayNameBytes, nameof(value.AccountUsername), true);
+        ValidateUtf8(value.AccountNickname, PcContractLimits.MaximumDisplayNameBytes, nameof(value.AccountNickname), true);
         ValidateUtf8(value.ServerOrigin, PcContractLimits.MaximumDetailBytes, nameof(value.ServerOrigin), true);
         ValidateUtf8(value.LastErrorCode, PcContractLimits.MaximumIdentifierBytes, nameof(value.LastErrorCode), true);
         ValidateUtf8(value.LastErrorDetail, PcContractLimits.MaximumDetailBytes, nameof(value.LastErrorDetail), true);

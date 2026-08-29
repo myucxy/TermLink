@@ -6,11 +6,15 @@ import dev.termlink.terminal.api.TerminalKittyKeyEventType
 import dev.termlink.terminal.api.TerminalKittyKeyInput
 import dev.termlink.terminal.api.TerminalOutputProfile
 import dev.termlink.terminal.api.TerminalRenderFrameV1
+import dev.termlink.terminal.api.TerminalRenderFrameV3
 import dev.termlink.terminal.api.TerminalSize
 
 const val TERMLINK_TERMINAL_ABI_VERSION: Int = 1
 const val TERMLINK_RENDER_FRAME_V1_FORMAT_VERSION: Int = 1
 const val TERMLINK_RENDER_FRAME_V1_MAX_BYTES: Int = 16 * 1024 * 1024
+const val TERMLINK_RENDER_FRAME_V3_FORMAT_VERSION: Int = 3
+const val TERMLINK_RENDER_FRAME_V3_MAX_BYTES: Int = 16 * 1024 * 1024
+const val TERMLINK_INPUT_V1_STRUCT_SIZE: Int = 56
 const val TERMLINK_INPUT_V2_STRUCT_SIZE: Int = 96
 const val TERMLINK_INPUT_V3_STRUCT_SIZE: Int = 160
 const val TERMLINK_CONFIG_V3_STRUCT_SIZE: Int = 88
@@ -18,6 +22,10 @@ const val TERMLINK_MOUSE_INPUT_V1_STRUCT_SIZE: Int = 64
 const val TERMLINK_HOST_EFFECT_FRAME_V2_FORMAT_VERSION: Int = 2
 const val TERMLINK_HOST_EFFECT_FRAME_V2_MAX_BYTES: Int = 123_033_008
 
+const val NATIVE_INPUT_KIND_KEY: Int = 1
+const val NATIVE_INPUT_KIND_PASTE: Int = 2
+const val NATIVE_INPUT_KIND_FOCUS_GAINED: Int = 3
+const val NATIVE_INPUT_KIND_FOCUS_LOST: Int = 4
 const val NATIVE_INPUT_KIND_WIN32_KEY: Int = 5
 const val NATIVE_INPUT_KIND_KITTY_KEY: Int = 6
 const val NATIVE_INPUT_KEY_CHARACTER: Long = 1
@@ -289,6 +297,45 @@ class NativeBridgeApplyWithHostEffectsV2(
 data class NativeRenderRequest(
     val maxPayloadBytes: Int,
 )
+
+/**
+ * Owned representation of the fixed 56-byte `TlTerminalInputV1` semantic-input ABI.
+ *
+ * Kotlin owns [data] and JNI only pins its copied value for the duration of one native call. Key
+ * and focus inputs carry an empty array; paste carries the exact bytes supplied by the caller.
+ */
+class NativeTerminalInputV1(
+    val abiVersion: Int = TERMLINK_TERMINAL_ABI_VERSION,
+    val structSize: Int = TERMLINK_INPUT_V1_STRUCT_SIZE,
+    val kind: Int,
+    val key: Int = 0,
+    val modifiers: Int = 0,
+    val character: Int = 0,
+    data: ByteArray = byteArrayOf(),
+    val dataLength: Long = data.size.toLong(),
+    val reserved0: Long = 0,
+    val reserved1: Long = 0,
+) {
+    private val ownedData = data.copyOf()
+
+    val dataByteCount: Int
+        get() = ownedData.size
+
+    fun copyData(): ByteArray = ownedData.copyOf()
+
+    internal fun copyForBridge(): NativeTerminalInputV1 = NativeTerminalInputV1(
+        abiVersion = abiVersion,
+        structSize = structSize,
+        kind = kind,
+        key = key,
+        modifiers = modifiers,
+        character = character,
+        data = ownedData,
+        dataLength = dataLength,
+        reserved0 = reserved0,
+        reserved1 = reserved1,
+    )
+}
 
 /**
  * Field-for-field representation of the fixed 64-byte `TlTerminalMouseInputV1` C ABI.
@@ -601,6 +648,20 @@ class NativeRenderFrame internal constructor(
         get() = renderFrame.size
 }
 
+/** Immutable Render Frame V3 returned by the production Android renderer boundary. */
+class NativeRenderFrameV3 internal constructor(
+    val renderFrame: TerminalRenderFrameV3,
+) {
+    val nextSourceSequence: Long
+        get() = renderFrame.nextSourceSequence
+
+    val presentationRevision: Long
+        get() = renderFrame.presentationRevision
+
+    val size: TerminalSize
+        get() = renderFrame.size
+}
+
 class NativeCheckpoint internal constructor(
     val nextSourceSequence: Long,
     val presentationRevision: Long,
@@ -630,12 +691,18 @@ interface NativeBridge {
     val abiVersion: Int
     val renderFrameFormatVersion: Int
     val maxRenderFrameBytes: Int
+    /** Result of `tl_terminal_render_frame_v3_format_version`. */
+    val renderFrameV3FormatVersion: Int
+    /** Result of `tl_terminal_render_frame_v3_max_bytes`. */
+    val maxRenderFrameV3Bytes: Int
     /** Result of `tl_terminal_host_effect_frame_v2_format_version`. */
     val hostEffectFrameV2FormatVersion: Int
     /** Result of `tl_terminal_host_effect_frame_v2_max_bytes`. */
     val maxHostEffectFrameV2Bytes: Int
     /** Result of the C ABI's `tl_terminal_mouse_input_v1_struct_size` discovery call. */
     val mouseInputV1StructSize: Int
+    /** Result of the C ABI's `tl_terminal_input_v1_struct_size` discovery call. */
+    val inputV1StructSize: Int
     /** Result of the C ABI's `tl_terminal_input_v2_struct_size` discovery call. */
     val inputV2StructSize: Int
     /** Result of the C ABI's `tl_terminal_input_v3_struct_size` discovery call. */
@@ -673,6 +740,18 @@ interface NativeBridge {
         handle: NativeBridgeHandle,
         request: NativeRenderRequest,
     ): NativeBridgeResult<NativeBridgeRenderFrame>
+
+    /** Exports the canonical Render Frame V3 used by the production Android view. */
+    fun renderV3(
+        handle: NativeBridgeHandle,
+        request: NativeRenderRequest,
+    ): NativeBridgeResult<NativeBridgeRenderFrame>
+
+    /** Maps directly to the mode-aware `tl_terminal_encode_input_v1` C ABI call. */
+    fun encodeInputV1(
+        handle: NativeBridgeHandle,
+        input: NativeTerminalInputV1,
+    ): NativeBridgeResult<NativeBridgeEncodedInput>
 
     /** Maps directly to the independent `tl_terminal_encode_mouse_input_v1` C ABI call. */
     fun encodeMouse(

@@ -21,7 +21,7 @@ public static class Program
 
         var identity = new PcAgentIdentity(
             Guid.Parse("f77bd947-015a-49b5-9f93-df8397983209"),
-            "headless-pc",
+            "headless-pc-with-a-name-that-must-not-expand-the-sidebar",
             PcPlatform.Windows,
             PcArchitecture.X64,
             "Windows headless",
@@ -55,7 +55,8 @@ public static class Program
             identity,
             AgentConnectionState.Connected,
             true,
-            "headless",
+            "headless-user-with-a-very-long-account-name",
+            "清风惹尘丶的超长昵称用于验证侧栏省略",
             "https://example.invalid",
             true,
             null,
@@ -93,6 +94,14 @@ public static class Program
         var devicesContentRoot = RequireControl<StackPanel>(window, "DevicesContentRoot");
         var settingsContentScroll = RequireControl<ScrollViewer>(window, "SettingsContentScroll");
         var settingsContentRoot = RequireControl<Grid>(window, "SettingsContentRoot");
+        var sidebarAccountButton = RequireControl<Button>(window, "SidebarAccountButton");
+        var sidebarLoginButton = RequireControl<Button>(window, "SidebarLoginButton");
+        var sidebarUpdateButton = RequireControl<Button>(window, "SidebarUpdateButton");
+        var sidebarComputerName = RequireControl<TextBlock>(window, "SidebarComputerNameText");
+        var sidebarNickname = RequireControl<TextBlock>(window, "SidebarNicknameText");
+        var sidebarUsername = RequireControl<TextBlock>(window, "SidebarUsernameText");
+        var sidebarAvatarInitial = RequireControl<TextBlock>(window, "SidebarAvatarInitialText");
+        var aboutUpdateAction = RequireControl<Button>(window, "AboutUpdateActionButton");
         Require(viewModel.Sessions.Sessions.Count == 100, "The 100-session snapshot was not applied.");
         Require(viewModel.Devices.Devices.Count == 100, "The 100-device snapshot was not applied.");
         Require(viewModel.Settings.TerminalCommands.Count == 2, "Terminal commands were not applied.");
@@ -103,6 +112,16 @@ public static class Program
             "Theme-safe session and device detail text was not composed by the presentation layer.");
         Require(viewModel.CurrentPage.Key == "devices" && viewModel.Pages.Count == 3,
             "The Android-aligned three-destination desktop shell was not selected by default.");
+        Require(sidebarAccountButton.IsVisible && !sidebarLoginButton.IsVisible &&
+                sidebarNickname.Text == snapshot.AccountNickname &&
+                sidebarUsername.Text == $"@{snapshot.AccountUsername}" &&
+                sidebarAvatarInitial.Text == "清",
+            "The sidebar did not show the signed-in nickname, username, and Unicode avatar initial.");
+        Require(sidebarComputerName.TextTrimming.ToString() == "CharacterEllipsis" &&
+                sidebarNickname.TextTrimming.ToString() == "CharacterEllipsis" &&
+                sidebarUsername.TextTrimming.ToString() == "CharacterEllipsis" &&
+                sidebarComputerName.TextWrapping.ToString() == "NoWrap",
+            "Long sidebar identity labels are not constrained to one ellipsized line.");
         Require(devicesContentRoot.Margin.Right >= 16 &&
                 settingsContentRoot.Margin.Right >= 16 &&
                 !settingsContentScroll.AllowAutoHide &&
@@ -166,6 +185,24 @@ public static class Program
                 viewModel.Settings.ReleaseNotes == "AppShip release fixture" &&
                 viewModel.Settings.ReleaseNotesTitle.Contains("45", StringComparison.Ordinal),
             "The About section did not render the structured AppShip release notes fixture.");
+        desktopOperations.Status = new DesktopUpdateStatus(
+            DesktopUpdateDecision.Optional,
+            "0.3.0",
+            52,
+            "New version fixture",
+            "fixture update available");
+        viewModel.CheckForUpdatesCommand.Execute(null);
+        await DrainCommandAsync(viewModel.CheckForUpdatesCommand);
+        Dispatcher.UIThread.RunJobs();
+        Require(viewModel.HasAvailableUpdate && sidebarUpdateButton.IsVisible &&
+                viewModel.UpdateActionText == PresentationText.StartUpdate &&
+                Equals(aboutUpdateAction.Content, PresentationText.StartUpdate),
+            "An available update did not create the sidebar entry or switch the About action to Start update.");
+        viewModel.Navigate("devices");
+        viewModel.OpenAboutUpdatesCommand.Execute(null);
+        await DrainCommandAsync(viewModel.OpenAboutUpdatesCommand);
+        Require(viewModel.IsSettingsPageSelected && viewModel.IsAboutSettingsSelected && aboutRoot.IsVisible,
+            "The sidebar update entry did not navigate directly to About updates.");
         viewModel.SelectSettingsSection("integration");
         Dispatcher.UIThread.RunJobs();
         Require(viewModel.IsIntegrationSettingsSelected && integrationRoot.IsVisible,
@@ -223,6 +260,9 @@ public static class Program
             "Expired Windows credentials still appeared as a usable signed-in account.");
         Require(!RequireControl<Control>(reauthenticationWindow, "LinkedAccountCard").IsVisible &&
                 RequireControl<Control>(reauthenticationWindow, "AccountSignInCard").IsVisible &&
+                !RequireControl<Button>(reauthenticationWindow, "SidebarAccountButton").IsVisible &&
+                RequireControl<Button>(reauthenticationWindow, "SidebarLoginButton").IsVisible &&
+                reauthenticationViewModel.AccountActionText == PresentationText.SignInAgain &&
                 reauthenticationViewModel.AccountStateTitle == PresentationText.AuthenticationExpired,
             "The account page did not replace Sign out with the reauthentication form.");
         reauthenticationViewModel.Navigate("devices");
@@ -276,6 +316,29 @@ public static class Program
             "Explicit control-UI exit did not allow the window to close.");
 
         VerifySingleInstanceActivation();
+
+        var periodicOperations = new FixtureDesktopOperations();
+        var periodicClient = new StaticAgentClient(snapshot);
+        var periodicStore = new AgentStateStore(periodicClient, TimeSpan.FromMinutes(1));
+        var periodicViewModel = new MainWindowViewModel(
+            periodicStore,
+            periodicClient,
+            new ImmediateUiDispatcher(),
+            new PlatformDescriptor(PcPlatform.Windows, PcArchitecture.X64, "Windows headless", "win-x64", false),
+            desktopOperations: periodicOperations,
+            updateCheckInterval: TimeSpan.FromMilliseconds(20));
+        try
+        {
+            periodicViewModel.Start();
+            Require(
+                SpinWait.SpinUntil(() => periodicOperations.CheckCount >= 2, TimeSpan.FromSeconds(5)),
+                "The lifecycle update monitor did not perform periodic silent checks.");
+        }
+        finally
+        {
+            periodicViewModel.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            periodicStore.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
 
         Console.WriteLine(
             $"Avalonia headless shell passed: cached pages, virtualized 100-session list, About/integration, commands, single-instance activation, tray-window lifecycle and failure isolation, navigation P95={p95:F3} ms.");
@@ -357,7 +420,7 @@ public static class Program
         public ValueTask GrantDeviceAsync(Guid deviceId, string permission, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask RevokeDeviceAsync(Guid deviceId, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask LoginAsync(string username, string password, string pcName, CancellationToken cancellationToken) => ValueTask.CompletedTask;
-        public ValueTask RegisterAsync(string username, string email, string password, string passwordConfirmation, string pcName, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask RegisterAsync(string username, string nickname, string email, string password, string passwordConfirmation, string pcName, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask SignOutAsync(CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask SaveTerminalCommandsAsync(IReadOnlyList<TerminalCommandCapability> commands, CancellationToken cancellationToken)
         {
@@ -375,17 +438,24 @@ public static class Program
     private sealed class FixtureDesktopOperations : IDesktopOperations
     {
         public bool FailUpdateChecks { get; set; }
+        private int checkCount;
+        public int CheckCount => Volatile.Read(ref checkCount);
+        public DesktopUpdateStatus Status { get; set; } = new(
+            DesktopUpdateDecision.NoUpdate,
+            "0.2.4",
+            45,
+            "AppShip release fixture",
+            "fixture is current");
 
         public ValueTask<DesktopUpdateStatus> CheckForUpdatesAsync(
             bool interactive,
-            CancellationToken cancellationToken) => FailUpdateChecks
+            CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref checkCount);
+            return FailUpdateChecks
                 ? ValueTask.FromException<DesktopUpdateStatus>(new InvalidOperationException("operation fixture"))
-                : ValueTask.FromResult(new DesktopUpdateStatus(
-                    DesktopUpdateDecision.NoUpdate,
-                    "0.2.4",
-                    45,
-                    "AppShip release fixture",
-                    "fixture is current"));
+                : ValueTask.FromResult(Status);
+        }
         public ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken) =>
             ValueTask.FromException<string>(new UnauthorizedAccessException("Access to path is denied"));
         public ValueTask<string> RepairTerminalIntegrationAsync(CancellationToken cancellationToken) =>

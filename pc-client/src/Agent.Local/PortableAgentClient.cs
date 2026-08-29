@@ -58,13 +58,14 @@ public sealed class PortableAgentClient : IAgentClient, IAsyncDisposable
 
     public ValueTask RegisterAsync(
         string username,
+        string nickname,
         string email,
         string password,
         string passwordConfirmation,
         string pcName,
         CancellationToken cancellationToken) =>
         SendEmptyAsync(LocalAgentCommand.Register,
-            new RegisterPayload(username, email, password, passwordConfirmation, pcName), cancellationToken);
+            new RegisterPayload(username, nickname, email, password, passwordConfirmation, pcName), cancellationToken);
 
     public ValueTask SignOutAsync(CancellationToken cancellationToken) =>
         SendEmptyAsync(LocalAgentCommand.SignOut, null, cancellationToken);

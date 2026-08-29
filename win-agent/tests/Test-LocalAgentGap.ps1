@@ -49,6 +49,12 @@ function Start-CapturedProcess {
     }
 }
 
+function Get-TextTail {
+    param([AllowEmptyString()][string]$Text, [int]$MaximumCharacters = 4096)
+    if ($null -eq $Text -or $Text.Length -le $MaximumCharacters) { return $Text }
+    $Text.Substring($Text.Length - $MaximumCharacters)
+}
+
 $agentExecutable = & (Join-Path $PSScriptRoot '..\src\Agent\Build-Agent.ps1')
 $hostExecutable = & (Join-Path $PSScriptRoot '..\src\SessionHost\Build-SessionHost.ps1')
 $sessionId = [Guid]::NewGuid()
@@ -78,7 +84,7 @@ exit 23
         '--agent-pipe', (Quote-Argument $pipeName),
         '--session-id', $sessionId.ToString('D'),
         '--handshake-token', (Quote-Argument $token),
-        '--test-agent-buffer-bytes', (64 * 1024),
+        '--test-agent-buffer-bytes', '1024',
         '--diagnostics'
     ) -join ' '
     $hostCapture = Start-CapturedProcess -FileName $hostExecutable -Arguments $hostArguments
@@ -96,25 +102,55 @@ exit 23
     ) -join ' '
     $agentCapture = Start-CapturedProcess -FileName $agentExecutable -Arguments $agentArguments
 
-    Assert-True ($hostCapture.Process.WaitForExit(60000)) 'Session Host did not stop in the history-gap scenario.'
+    if (-not $hostCapture.Process.WaitForExit(30000)) {
+        $hostCapture.Process.Kill()
+        $hostCapture.Process.WaitForExit()
+        if (-not $agentCapture.Process.WaitForExit(5000)) {
+            $agentCapture.Process.Kill()
+            $agentCapture.Process.WaitForExit()
+        }
+        $timeoutHostOutput = $hostCapture.OutputTask.GetAwaiter().GetResult()
+        $timeoutHostError = $hostCapture.ErrorTask.GetAwaiter().GetResult()
+        $timeoutAgentOutput = $agentCapture.OutputTask.GetAwaiter().GetResult()
+        $timeoutAgentError = $agentCapture.ErrorTask.GetAwaiter().GetResult()
+        $timeoutBuffer = & $agentExecutable `
+            --session-id $sessionId.ToString('D') `
+            --buffer-directory $bufferDirectory `
+            --inspect-buffer 2>&1
+        throw (
+            'Session Host did not stop in the history-gap scenario. ' +
+            "host_stdout_length=$($timeoutHostOutput.Length); " +
+            "host_stderr=$(Get-TextTail $timeoutHostError); " +
+            "agent_stdout=$(Get-TextTail $timeoutAgentOutput); " +
+            "agent_stderr=$(Get-TextTail $timeoutAgentError); " +
+            "buffer=$($timeoutBuffer -join ' ')")
+    }
     Assert-True ($agentCapture.Process.WaitForExit(30000)) 'Session Agent did not stop in the history-gap scenario.'
     $hostOutput = $hostCapture.OutputTask.GetAwaiter().GetResult()
     $hostError = $hostCapture.ErrorTask.GetAwaiter().GetResult()
     $agentOutput = $agentCapture.OutputTask.GetAwaiter().GetResult()
     $agentError = $agentCapture.ErrorTask.GetAwaiter().GetResult()
 
-    Assert-True ($hostCapture.Process.ExitCode -eq 23) `
-        "Session Host returned $($hostCapture.Process.ExitCode), expected 23: $hostError"
-    Assert-True ($agentCapture.Process.ExitCode -eq 23) `
-        "Session Agent returned $($agentCapture.Process.ExitCode), expected 23: $agentError"
-    Assert-True ($hostOutput.Length -gt (200 * 1024)) `
-        "The bounded-backlog output producer was truncated at $($hostOutput.Length) characters."
+    Assert-True ($hostCapture.Process.ExitCode -eq 125) `
+        "Session Host returned $($hostCapture.Process.ExitCode), expected authority fail-closed exit 125: $hostError"
+    Assert-True ($agentCapture.Process.ExitCode -eq 125) `
+        "Session Agent returned $($agentCapture.Process.ExitCode), expected authority fail-closed exit 125: $agentError"
+    Assert-True (-not $hostOutput.Contains('__PHASE1_GAP_OUTPUT_END__')) `
+        'Session Host displayed output beyond the unrecoverable journal gap.'
     Assert-True ([string]::IsNullOrWhiteSpace($agentError)) "Session Agent wrote an error: $agentError"
 
     $agentFields = Get-ResultFields -Text $agentOutput -Prefix '__AGENT_RESULT__:'
     $hostFields = Get-ResultFields -Text $hostError -Prefix '__SESSION_HOST_RESULT__:'
-    Assert-True ([uint64]$hostFields.agent_ack -eq [uint64]$agentFields.last_seq) `
-        'Session Host did not receive the final ACK after the history gap.'
+    Assert-True ($hostFields.reason -eq 'output-disconnected') `
+        "Session Host did not report the authority shutdown: $($hostFields.reason)"
+    Assert-True ($hostFields.authority_failed -eq 'true') `
+        'Session Host did not report terminal-core authority failure after the gap.'
+    Assert-True ($hostFields.output_disconnected -eq 'true') `
+        'Session Host did not close the output path after terminal-core rejected the gap.'
+    Assert-True ([uint64]$hostFields.agent_ack -lt [uint64]$agentFields.last_seq) `
+        'Session Host advanced its authority ACK across an unrecoverable journal gap.'
+    Assert-True ([uint64]$hostFields.durable_ack -eq [uint64]$agentFields.last_seq) `
+        'Session Host did not release the durable transport backlog through the final lifecycle frame.'
 
     $bufferOutput = & $agentExecutable `
         --session-id $sessionId.ToString('D') `
@@ -124,33 +160,48 @@ exit 23
     $bufferFields = Get-ResultFields -Text ($bufferOutput -join "`n") -Prefix '__BUFFER_RESULT__:'
     Assert-True ([int]$bufferFields.gap_frames -ge 1) 'A bounded Host backlog did not produce a persisted gap declaration.'
     Assert-True ([int]$bufferFields.input_frames -eq 0) 'Input frames entered the gap-scenario Buffer.'
-    Assert-True ([uint64]$bufferFields.first_seq -gt 1) 'Gap scenario unexpectedly retained the beginning of the stream.'
+    Assert-True ([uint64]$bufferFields.first_seq -eq 1) `
+        'Gap scenario did not retain the already durable continuous prefix.'
+    Assert-True ([uint64]$bufferFields.first_gap_start -gt [uint64]$hostFields.agent_ack) `
+        'The persisted Gap overlaps terminal-core authority state that was already applied.'
+    Assert-True ([uint64]$bufferFields.first_gap_end -ge [uint64]$bufferFields.first_gap_start) `
+        'The persisted Gap range is empty or reversed.'
+    Assert-True ([uint64]$bufferFields.first_gap_seq -eq [uint64]$bufferFields.first_gap_end + 1) `
+        'The persisted Gap frame sequence does not follow its exact missing range.'
     Assert-True ([int64]$bufferFields.output_bytes -lt (256 * 1024)) `
         'Gap scenario did not discard output beyond the bounded Host backlog.'
+    Assert-True ([uint64]$bufferFields.last_seq -eq [uint64]$agentFields.last_seq) `
+        'Encrypted Buffer did not persist the final fail-closed lifecycle frame.'
 
     $evidence = [ordered]@{
         schema = 'termlink.phase1-local-agent-gap-validation'
-        version = 1
+        version = 2
         generated_at_utc = [DateTime]::UtcNow.ToString('o')
-        classification = 'local Host-Agent bounded backlog only; not production backpressure or Snapshot'
+        classification = 'production terminal-core authority fail-closed on a local Host-Agent journal gap'
         session_id = $sessionId.ToString('D')
         passed = $true
         production_buffer_limit_bytes = 4 * 1024 * 1024
-        diagnostic_buffer_limit_bytes = 64 * 1024
+        diagnostic_buffer_limit_bytes = 1024
         produced_output_bytes = 256 * 1024
         first_persisted_sequence = [uint64]$bufferFields.first_seq
         last_persisted_sequence = [uint64]$bufferFields.last_seq
         persisted_frames = [int]$bufferFields.frames
         persisted_gap_frames = [int]$bufferFields.gap_frames
+        first_gap_sequence = [uint64]$bufferFields.first_gap_seq
+        first_gap_start = [uint64]$bufferFields.first_gap_start
+        first_gap_end = [uint64]$bufferFields.first_gap_end
         persisted_output_bytes = [int64]$bufferFields.output_bytes
         input_frames_persisted = [int]$bufferFields.input_frames
-        final_ack = [uint64]$hostFields.agent_ack
+        final_authority_ack = [uint64]$hostFields.agent_ack
+        final_durable_ack = [uint64]$hostFields.durable_ack
         lifecycle_exit_code = [int]$agentFields.exit
+        authority_failed = [bool]::Parse($hostFields.authority_failed)
+        output_disconnected = [bool]::Parse($hostFields.output_disconnected)
     }
     $resolvedEvidence = [IO.Path]::GetFullPath($EvidencePath)
     [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($resolvedEvidence)) | Out-Null
     $evidence | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $resolvedEvidence -Encoding utf8
-    Write-Host "Phase 1 bounded history-gap path passed. Evidence: $resolvedEvidence"
+    Write-Host "Production terminal-core authority Gap fail-closed path passed. Evidence: $resolvedEvidence"
 }
 finally {
     foreach ($capture in @($agentCapture, $hostCapture)) {

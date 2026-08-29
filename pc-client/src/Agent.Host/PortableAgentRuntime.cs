@@ -112,6 +112,7 @@ public sealed class PortableAgentRuntime : ILocalAgentCommandHandler
         false,
         string.Empty,
         string.Empty,
+        string.Empty,
         false,
         "PORTABLE_RELAY_NOT_CONFIGURED",
         "The portable Agent is running locally; Relay enrollment has not been completed.",

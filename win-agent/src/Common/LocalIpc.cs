@@ -21,7 +21,8 @@ namespace TermLink.LocalIpc
         Capabilities = 13,
         RemoteInputReject = 14,
         Title = 15,
-        SessionRemoved = 16
+        SessionRemoved = 16,
+        RemoteAccessStopped = 17
     }
 
     internal enum LocalRemoteInputResult : byte
@@ -327,6 +328,17 @@ namespace TermLink.LocalIpc
         {
             if (payload == null || payload.Length != 0)
                 throw new InvalidDataException("Invalid local IPC session-removed payload.");
+        }
+
+        public static byte[] RemoteAccessStopped()
+        {
+            return new byte[0];
+        }
+
+        public static void ParseRemoteAccessStopped(byte[] payload)
+        {
+            if (payload == null || payload.Length != 0)
+                throw new InvalidDataException("Invalid local IPC remote-access-stopped payload.");
         }
 
         private static string NormalizeTitle(string value)

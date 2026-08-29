@@ -237,6 +237,11 @@
     <string name="terminal_error_snapshot_unsupported">The Windows Agent determined that this terminal stream cannot currently be represented as a portable snapshot.</string>
     <string name="terminal_error_snapshot_production_failed">The Windows Agent failed while producing or persisting the portable terminal snapshot.</string>
     <string name="terminal_error_local_storage_full">Android does not have enough local storage to cache the encrypted terminal history safely.</string>
+    <string name="terminal_error_native_core_unavailable">The packaged terminal-core library is unavailable or does not match this app build.</string>
+    <string name="terminal_error_native_renderer_failed_closed">terminal-core rejected terminal state and stopped this renderer generation to prevent incorrect output.</string>
+    <string name="terminal_error_unsupported_terminal_capability">This terminal capability is not supported by the installed Android and Windows terminal-core versions.</string>
+    <string name="terminal_error_history_core_rebuild_failed">terminal-core could not rebuild the live terminal from the verified continuous encrypted history.</string>
+    <string name="terminal_error_gap_recovery_required">The live terminal detected a missing ordered event and requires a complete encrypted-history rebuild.</string>
     <string name="terminal_error_realtime_connection">The realtime session channel could not be established.</string>
     <string name="terminal_error_control_lease">Another client still holds the session control lease.</string>
     <string name="terminal_error_unknown">The session could not be opened because of an unclassified local or transport failure.</string>

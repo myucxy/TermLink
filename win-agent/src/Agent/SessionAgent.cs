@@ -487,19 +487,39 @@ namespace TermLink.Agent
         {
             NamedPipeServerStream wait;
             NamedPipeServerStream connected;
-            lock (statusSync)
+            lock (commandSync)
             {
-                if (stopRequested)
+                lock (statusSync)
                 {
-                    if (commitInterruptedLifecycle) commitInterruptedOnStop = true;
-                    return;
+                    if (stopRequested)
+                    {
+                        if (commitInterruptedLifecycle) commitInterruptedOnStop = true;
+                        return;
+                    }
+                    commitInterruptedOnStop = commitInterruptedLifecycle;
+                    stopRequested = true;
+                    lifecycle = SessionAgentLifecycle.RemoteStopped;
+                    lastActivityUtc = DateTime.UtcNow;
+                    wait = waitingPipe;
+                    connected = connectedPipe;
                 }
-                commitInterruptedOnStop = commitInterruptedLifecycle;
-                stopRequested = true;
-                lifecycle = SessionAgentLifecycle.RemoteStopped;
-                lastActivityUtc = DateTime.UtcNow;
-                wait = waitingPipe;
-                connected = connectedPipe;
+                if (commitInterruptedLifecycle && connected != null)
+                {
+                    try
+                    {
+                        if (!connected.IsConnected) throw new IOException("Session Host pipe is disconnected.");
+                        nextCommandSequence = checked(nextCommandSequence + 1);
+                        commandSequenceStore.Save(nextCommandSequence);
+                        LocalFrameCodec.Write(connected, new LocalFrame(
+                            LocalFrameType.RemoteAccessStopped,
+                            options.SessionId,
+                            nextCommandSequence,
+                            LocalPayloadCodec.RemoteAccessStopped()));
+                    }
+                    catch (IOException) { }
+                    catch (ObjectDisposedException) { }
+                    catch (InvalidOperationException) { }
+                }
             }
             DisposePipe(connected);
             if (!ReferenceEquals(wait, connected)) DisposePipe(wait);
@@ -593,7 +613,8 @@ namespace TermLink.Agent
                 }
                 if (frame.Type == LocalFrameType.HostHello || frame.Type == LocalFrameType.AgentHello ||
                     frame.Type == LocalFrameType.Input || frame.Type == LocalFrameType.ResizeRequest ||
-                    frame.Type == LocalFrameType.RemoteInputV2 || frame.Type == LocalFrameType.RemoteInputReject)
+                    frame.Type == LocalFrameType.RemoteInputV2 || frame.Type == LocalFrameType.RemoteInputReject ||
+                    frame.Type == LocalFrameType.RemoteAccessStopped)
                 {
                     throw new InvalidDataException("Host sent an invalid frame type: " + frame.Type + ".");
                 }
@@ -1012,9 +1033,32 @@ namespace TermLink.Agent
         internal static void AtomicWrite(string path, byte[] bytes)
         {
             var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            File.WriteAllBytes(temporary, bytes);
-            if (File.Exists(path)) File.Replace(temporary, path, null);
-            else File.Move(temporary, path);
+            try
+            {
+                using (var stream = new FileStream(
+                    temporary,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    64 * 1024,
+                    FileOptions.WriteThrough))
+                {
+                    stream.Write(bytes, 0, bytes.Length);
+                    // SessionAgent sends the Host ACK only after Append returns. Keep this
+                    // explicit physical-media boundary in the shared atomic writer so event
+                    // chunks, command sequence state, and input de-duplication all have the
+                    // same crash-durable contract.
+                    stream.Flush(true);
+                }
+                if (File.Exists(path)) File.Replace(temporary, path, null);
+                else File.Move(temporary, path);
+            }
+            finally
+            {
+                try { if (File.Exists(temporary)) File.Delete(temporary); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
         }
     }
 
@@ -1092,6 +1136,7 @@ namespace TermLink.Agent
         {
             if (frame.Type == LocalFrameType.Input || frame.Type == LocalFrameType.ResizeRequest ||
                 frame.Type == LocalFrameType.RemoteInputV2 || frame.Type == LocalFrameType.RemoteInputReject ||
+                frame.Type == LocalFrameType.RemoteAccessStopped ||
                 frame.Type == LocalFrameType.HostHello || frame.Type == LocalFrameType.Capabilities ||
                 frame.Type == LocalFrameType.AgentHello)
             {
@@ -1263,6 +1308,9 @@ namespace TermLink.Agent
             var removedFrames = 0;
             ulong firstSequence = 0;
             ulong lastSequence = 0;
+            ulong firstGapSequence = 0;
+            ulong firstGapStart = 0;
+            ulong firstGapEnd = 0;
             using (var hash = SHA256.Create())
             using (var output = new MemoryStream())
             {
@@ -1286,6 +1334,12 @@ namespace TermLink.Agent
                         ulong gapStart;
                         ulong gapEnd;
                         LocalPayloadCodec.ParseGap(frame.Payload, out gapStart, out gapEnd);
+                        if (firstGapSequence == 0)
+                        {
+                            firstGapSequence = frame.Sequence;
+                            firstGapStart = gapStart;
+                            firstGapEnd = gapEnd;
+                        }
                         if (gapEnd != frame.Sequence - 1 ||
                             (lastSequence > 0 && gapStart > lastSequence + 1))
                         {
@@ -1325,6 +1379,9 @@ namespace TermLink.Agent
                     ";output_bytes=" + outputBytes +
                     ";input_frames=" + inputFrames +
                     ";gap_frames=" + gapFrames +
+                    ";first_gap_seq=" + firstGapSequence +
+                    ";first_gap_start=" + firstGapStart +
+                    ";first_gap_end=" + firstGapEnd +
                     ";removed_frames=" + removedFrames +
                     ";output_sha256=" + ToHex(digest);
             }

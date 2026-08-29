@@ -9,9 +9,12 @@ internal object JniNativeMethods {
     external fun abiVersion(): Int
     external fun renderFrameV1FormatVersion(): Int
     external fun renderFrameV1MaxBytes(): Long
+    external fun renderFrameV3FormatVersion(): Int
+    external fun renderFrameV3MaxBytes(): Long
     external fun hostEffectFrameV2FormatVersion(): Int
     external fun hostEffectFrameV2MaxBytes(): Long
     external fun mouseInputV1StructSize(): Int
+    external fun inputV1StructSize(): Int
     external fun inputV2StructSize(): Int
     external fun inputV3StructSize(): Int
     external fun configV3StructSize(): Int
@@ -28,6 +31,13 @@ internal object JniNativeMethods {
         outFrame: Array<ByteArray?>,
     ): Int
     external fun render(token: Long, maxBytes: Long, outFrame: Array<ByteArray?>): Int
+    external fun renderV3(token: Long, maxBytes: Long, outFrame: Array<ByteArray?>): Int
+    external fun encodeInputV1(
+        token: Long,
+        input: LongArray,
+        data: ByteArray,
+        outPayload: Array<ByteArray?>,
+    ): Int
     external fun encodeMouse(token: Long, input: LongArray, outPayload: Array<ByteArray?>): Int
     external fun encodeInputV2(token: Long, input: LongArray, outPayload: Array<ByteArray?>): Int
     external fun encodeInputV3(
