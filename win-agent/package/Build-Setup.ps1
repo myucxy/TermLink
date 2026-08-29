@@ -171,6 +171,7 @@ try {
     $legacyPublish = Join-Path $workRoot 'legacy-publish'
     $updaterPublish = Join-Path $workRoot 'updater-publish'
     $setupPublish = Join-Path $workRoot 'setup-publish'
+    $dotnetArtifacts = Join-Path $workRoot 'dotnet-artifacts'
     $payloadZip = Join-Path $workRoot 'TermLink.payload.zip'
     [IO.Directory]::CreateDirectory($layout) | Out-Null
     try {
@@ -190,6 +191,7 @@ try {
                 '--framework', 'net8.0-windows',
                 '--self-contained', 'true',
                 '--output', $layout,
+                '--artifacts-path', $dotnetArtifacts,
                 '--nologo',
                 '-p:RestoreLockedMode=true',
                 '-p:PackageVersion=1.0.0',
@@ -208,6 +210,7 @@ try {
             '--runtime', 'win-x64',
             '--self-contained', 'true',
             '--output', $legacyPublish,
+            '--artifacts-path', $dotnetArtifacts,
             '--nologo',
             '-p:RestoreLockedMode=true',
             '-p:PackageVersion=1.0.0',
@@ -228,6 +231,7 @@ try {
             '--runtime', 'win-x64',
             '--self-contained', 'true',
             '--output', $updaterPublish,
+            '--artifacts-path', $dotnetArtifacts,
             '--nologo',
             '-p:RestoreLockedMode=true',
             '-p:PackageVersion=1.0.0',
@@ -296,6 +300,7 @@ try {
             '--runtime', 'win-x64',
             '--self-contained', 'true',
             '--output', $setupPublish,
+            '--artifacts-path', $dotnetArtifacts,
             '--nologo',
             '-p:RestoreLockedMode=true',
             '-p:PackageVersion=1.0.0',
