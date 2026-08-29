@@ -58,14 +58,17 @@ Windows 命令配置、Server 能力同步和 Android 受控启动的兼容契�
   `-AndroidKeyAlias`，可选 `-AndroidKeyPassword`。也兼容已有的
   `TERMLINK_RELEASE_STORE_FILE`、`TERMLINK_RELEASE_STORE_PASSWORD`、
   `TERMLINK_RELEASE_KEY_ALIAS`、`TERMLINK_RELEASE_KEY_PASSWORD` 进程环境变量。
-  APK 另须传入 `-ExpectedAndroidSignerSha256` 和 `-AndroidSdkPath`（也可通过
-  `ANDROID_SDK_ROOT`/`ANDROID_HOME` 定位 SDK）；最终 APK 必须通过 v2 或更新签名方案，
+  APK/AAB 均须传入 `-ExpectedAndroidSignerSha256`；APK 还须传入 `-AndroidSdkPath`（也可通过
+  `ANDROID_SDK_ROOT`/`ANDROID_HOME` 定位 SDK）。最终 APK 必须通过 v2 或更新签名方案，
   `Number of signers` 必须严格等于 1，且该唯一签名证书 SHA-256 必须与连续性指纹一致。
+  AAB 会直接复核 protobuf base manifest 的 applicationId、versionName、raw/compiled versionCode，
+  要求唯一 JAR `.SF`/签名块和唯一 CMS SignerInfo，校验 PKCS#7、SHA-256 manifest 绑定、每个载荷
+  ZIP entry 的 SHA-256 覆盖，并要求证书指纹与 APK 使用同一条批准的连续性指纹。
 
-Production 的 MSIX 与 AAB 目前会在计划或构建开始前明确失败：二者尚未接入与 APK/Setup
-等价的完整后置身份、版本、连续性签名和时间戳复核。它们只能用
-`-ReleaseMode Development` 构建用于本地验证，不能生成 Production manifest，也不能进入
-AppShip Production 包装入口。
+Production AAB 已接入完整后置身份、版本、单签名者、连续性指纹和载荷摘要复核，可以进入
+Production manifest。Production MSIX 仍会在计划或构建开始前明确失败，因为它尚未接入与
+Setup 等价的完整身份、版本、连续性签名和 RFC 3161 时间戳复核；MSIX 只能以
+`-ReleaseMode Development` 构建用于本地验证。
 
 连续性指纹不是秘密，可以进入审计日志；PFX/keystore 密码仍只能使用 SecureString 或受保护的
 进程环境变量。指纹门禁不根据证书 Subject、Issuer 或是否自签进行判断：Windows 允许经当前系统
@@ -84,7 +87,7 @@ $cosignPassword = Read-Host 'Cosign key password' -AsSecureString
 
 & .\scripts\Build-Release.ps1 `
   -Version 1.4.2 -BuildNumber 107 `
-  -ServerImage -WindowsSetup -AndroidApk `
+  -ServerImage -WindowsSetup -AndroidApk -AndroidAab `
   -ServerSigningKeyPath 'D:\ReleaseSecrets\termlink-server.key' `
   -ServerSigningKeyPassword $cosignPassword `
   -WindowsCertificatePath 'D:\ReleaseSecrets\termlink-code-signing.pfx' `
@@ -122,6 +125,8 @@ Windows Setup。包装入口拒绝 `development`、`.pending`、改名或放错�
 `release/Verify-LocalRelease.ps1`；manifest 同时包含 APK 与 Setup 时会复核两端，而不是只复核
 本次选中的单个文件。随后再次检查所选文件的大小与哈希，才把这个精确路径交给经过审核的
 `appship-publish` 客户端。
+Production AAB 是供应用商店分发的正式制品，但当前不是 AppShip 包装入口支持的上传类型；
+不得把 AAB 改名为 APK 或绕过 manifest/验证器交给 AppShip。
 
 先在 PowerShell 5.1 或 7 中只读查看发布计划；`-Plan` 不需要凭据、不创建状态文件、不上传：
 
@@ -182,7 +187,7 @@ Production 构建先生成同目录的临时 manifest，完成产物哈希、版
 }
 ```
 
-执行轻量验收（不需要证书，也不运行组件构建）：
+执行轻量验收（不需要生产证书，也不运行组件构建；测试会临时生成并清理隔离 AAB 签名证书）：
 
 ```powershell
 pwsh -NoProfile -File .\release\Test-BuildRelease.ps1
@@ -190,5 +195,6 @@ pwsh -NoProfile -File .\release\Test-BuildRelease.ps1
 
 测试覆盖 PowerShell parser、重复 `-Plan/-DryRun` 输出一致性、no-push、Production 缺签名
 fail-closed、严格 APK signer count、Android/Windows 连续性指纹、ProductVersion/FileVersion、
-RFC 3161/legacy countersignature、MSIX/AAB Production 拒绝、Production/development manifest、
+完整 AAB protobuf 身份/版本/JAR 单签名者/载荷摘要及篡改回归、RFC 3161/legacy countersignature、
+MSIX Production 拒绝、Production/development manifest、
 AppShip 精确路径与哈希门禁、`-Publish` 拒绝以及严格输出路径。

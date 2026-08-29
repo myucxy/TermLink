@@ -95,12 +95,12 @@ Assert-PublishCondition ([string]::Equals(
 
 $artifactRecords = @($manifest.artifacts)
 Assert-PublishCondition ($artifactRecords.Count -gt 0) 'Artifact manifest contains no artifacts.'
-$unsupportedProductionRecords = @($artifactRecords | Where-Object { $_.type -in @('aab', 'msix') })
+$unsupportedProductionRecords = @($artifactRecords | Where-Object { $_.type -eq 'msix' })
 Assert-PublishCondition ($unsupportedProductionRecords.Count -eq 0) `
-    'Production AppShip publishing rejects AAB/MSIX until complete post-build verification is implemented.'
-$unexpectedRecordTypes = @($artifactRecords | Where-Object { $_.type -notin @('apk', 'setup') })
+    'Production AppShip publishing rejects MSIX until complete post-build verification is implemented.'
+$unexpectedRecordTypes = @($artifactRecords | Where-Object { $_.type -notin @('apk', 'aab', 'setup') })
 Assert-PublishCondition ($unexpectedRecordTypes.Count -eq 0) `
-    'This AppShip production wrapper accepts manifests containing APK and/or Windows Setup only.'
+    'This AppShip production wrapper accepts client manifests containing APK, AAB, and/or Windows Setup only.'
 $apkRecords = @($artifactRecords | Where-Object { $_.type -ceq 'apk' })
 $setupRecords = @($artifactRecords | Where-Object { $_.type -ceq 'setup' })
 Assert-PublishCondition ($apkRecords.Count -le 1) `

@@ -296,8 +296,6 @@ $isDevelopment = -not $isProduction
 if ($isProduction) {
     Assert-Condition (-not $WindowsMsix) `
         'Production WindowsMsix is disabled until MSIX identity, version, signer continuity, and RFC 3161 timestamp receive complete post-build verification.'
-    Assert-Condition (-not $AndroidAab) `
-        'Production AndroidAab is disabled until AAB application identity, version, and signer continuity receive complete post-build verification.'
 }
 if ($isProduction -and -not ($Plan -or $DryRun)) {
     Assert-Condition (Test-Path -LiteralPath $releaseVerifierPath -PathType Leaf) `
@@ -415,9 +413,7 @@ if ($AndroidApk -or $AndroidAab) {
     $androidRequirements = @('JDK 17', 'Android SDK', 'Gradle wrapper')
     if ($isProduction) {
         $androidRequirements += @('release keystore', 'keystore password', 'key alias')
-        if ($AndroidApk) {
-            $androidRequirements += 'explicit expected APK signer certificate SHA-256 continuity fingerprint'
-        }
+        $androidRequirements += 'explicit expected Android signer certificate SHA-256 continuity fingerprint'
     }
     $steps.Add([pscustomobject][ordered]@{
         order = $stepNumber
@@ -547,19 +543,21 @@ if ($AndroidApk -or $AndroidAab) {
         Assert-Condition (Test-Path -LiteralPath $resolvedAndroidSdk -PathType Container) `
             "Android SDK directory not found: $resolvedAndroidSdk"
     }
-    if ($isProduction -and $AndroidApk) {
+    if ($isProduction) {
         Assert-Condition (-not [string]::IsNullOrWhiteSpace($ExpectedAndroidSignerSha256)) `
-            'ExpectedAndroidSignerSha256 is required for a production APK.'
-        Assert-Condition ($null -ne $resolvedAndroidSdk) `
-            'AndroidSdkPath, ANDROID_SDK_ROOT, or ANDROID_HOME is required to verify a production APK.'
-        $androidBuildToolsRoot = Join-Path $resolvedAndroidSdk 'build-tools'
-        $androidVerifierTools = @(Get-ChildItem -LiteralPath $androidBuildToolsRoot -Directory -ErrorAction SilentlyContinue |
-            Where-Object {
-                (Test-Path -LiteralPath (Join-Path $_.FullName 'aapt2.exe') -PathType Leaf) -and
-                (Test-Path -LiteralPath (Join-Path $_.FullName 'apksigner.bat') -PathType Leaf)
-            })
-        Assert-Condition ($androidVerifierTools.Count -gt 0) `
-            "Android SDK has no build-tools installation containing aapt2.exe and apksigner.bat: $androidBuildToolsRoot"
+            'ExpectedAndroidSignerSha256 is required for a production Android artifact.'
+        if ($AndroidApk) {
+            Assert-Condition ($null -ne $resolvedAndroidSdk) `
+                'AndroidSdkPath, ANDROID_SDK_ROOT, or ANDROID_HOME is required to verify a production APK.'
+            $androidBuildToolsRoot = Join-Path $resolvedAndroidSdk 'build-tools'
+            $androidVerifierTools = @(Get-ChildItem -LiteralPath $androidBuildToolsRoot -Directory -ErrorAction SilentlyContinue |
+                Where-Object {
+                    (Test-Path -LiteralPath (Join-Path $_.FullName 'aapt2.exe') -PathType Leaf) -and
+                    (Test-Path -LiteralPath (Join-Path $_.FullName 'apksigner.bat') -PathType Leaf)
+                })
+            Assert-Condition ($androidVerifierTools.Count -gt 0) `
+                "Android SDK has no build-tools installation containing aapt2.exe and apksigner.bat: $androidBuildToolsRoot"
+        }
     }
 }
 
@@ -794,10 +792,10 @@ if ($isProduction) {
             ManifestPath = $pendingManifestPath
             ExpectedReleaseMode = 'Production'
         }
-        if ($AndroidApk) {
-            $verificationParameters.AndroidSdkPath = $resolvedAndroidSdk
+        if ($AndroidApk -or $AndroidAab) {
             $verificationParameters.ExpectedAndroidSignerSha256 = $ExpectedAndroidSignerSha256
         }
+        if ($AndroidApk) { $verificationParameters.AndroidSdkPath = $resolvedAndroidSdk }
         if ($WindowsSetup) {
             $verificationParameters.ExpectedWindowsSignerSha1 = $ExpectedWindowsSignerSha1
             $verificationParameters.RequireWindowsTimestamp = $true

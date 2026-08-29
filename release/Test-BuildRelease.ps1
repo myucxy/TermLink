@@ -9,6 +9,110 @@ function Assert-True {
     if (-not $Condition) { throw $Message }
 }
 
+function Join-TestByteArrays {
+    param([Parameter(Mandatory)][object[]]$Arrays)
+
+    $bytes = [Collections.Generic.List[byte]]::new()
+    foreach ($array in $Arrays) { $bytes.AddRange([byte[]]$array) }
+    return ,$bytes.ToArray()
+}
+
+function ConvertTo-TestProtobufVarint {
+    param([Parameter(Mandatory)][uint64]$Value)
+
+    $bytes = [Collections.Generic.List[byte]]::new()
+    do {
+        [byte]$current = $Value -band 0x7F
+        $Value = $Value -shr 7
+        if ($Value -ne 0) { $current = $current -bor 0x80 }
+        $bytes.Add($current)
+    } while ($Value -ne 0)
+    return ,$bytes.ToArray()
+}
+
+function New-TestProtobufVarintField {
+    param([Parameter(Mandatory)][int]$Number, [Parameter(Mandatory)][uint64]$Value)
+
+    return ,(Join-TestByteArrays @(
+        (ConvertTo-TestProtobufVarint ([uint64]($Number -shl 3))),
+        (ConvertTo-TestProtobufVarint $Value)
+    ))
+}
+
+function New-TestProtobufBytesField {
+    param([Parameter(Mandatory)][int]$Number, [Parameter(Mandatory)][byte[]]$Bytes)
+
+    return ,(Join-TestByteArrays @(
+        (ConvertTo-TestProtobufVarint ([uint64](($Number -shl 3) -bor 2))),
+        (ConvertTo-TestProtobufVarint ([uint64]$Bytes.Length)),
+        $Bytes
+    ))
+}
+
+function New-TestProtobufStringField {
+    param([Parameter(Mandatory)][int]$Number, [Parameter(Mandatory)][string]$Value)
+
+    return ,(New-TestProtobufBytesField -Number $Number -Bytes ([Text.Encoding]::UTF8.GetBytes($Value)))
+}
+
+function New-TestAabAttribute {
+    param(
+        [string]$Namespace,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Value,
+        [switch]$VersionCode
+    )
+
+    $parts = [Collections.Generic.List[object]]::new()
+    if (-not [string]::IsNullOrEmpty($Namespace)) {
+        $parts.Add((New-TestProtobufStringField -Number 1 -Value $Namespace))
+    }
+    $parts.Add((New-TestProtobufStringField -Number 2 -Value $Name))
+    $parts.Add((New-TestProtobufStringField -Number 3 -Value $Value))
+    if ($VersionCode) {
+        $parts.Add((New-TestProtobufVarintField -Number 5 -Value 0x0101021B))
+        $primitive = New-TestProtobufVarintField -Number 6 -Value ([uint64]::Parse($Value))
+        $item = New-TestProtobufBytesField -Number 7 -Bytes $primitive
+        $parts.Add((New-TestProtobufBytesField -Number 6 -Bytes $item))
+    }
+    return ,(Join-TestByteArrays $parts.ToArray())
+}
+
+function New-TestAabManifest {
+    param(
+        [Parameter(Mandatory)][string]$ApplicationId,
+        [Parameter(Mandatory)][string]$VersionName,
+        [Parameter(Mandatory)][int]$VersionCode
+    )
+
+    $androidNamespace = 'http://schemas.android.com/apk/res/android'
+    $elementParts = [Collections.Generic.List[object]]::new()
+    $elementParts.Add((New-TestProtobufStringField -Number 3 -Value 'manifest'))
+    foreach ($attribute in @(
+        (New-TestAabAttribute -Name 'package' -Value $ApplicationId),
+        (New-TestAabAttribute -Namespace $androidNamespace -Name 'versionCode' `
+            -Value ([string]$VersionCode) -VersionCode),
+        (New-TestAabAttribute -Namespace $androidNamespace -Name 'versionName' -Value $VersionName)
+    )) {
+        $elementParts.Add((New-TestProtobufBytesField -Number 4 -Bytes $attribute))
+    }
+    $element = Join-TestByteArrays $elementParts.ToArray()
+    return ,(New-TestProtobufBytesField -Number 1 -Bytes $element)
+}
+
+function Add-TestZipBytes {
+    param(
+        [Parameter(Mandatory)][IO.Compression.ZipArchive]$Archive,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][byte[]]$Bytes
+    )
+
+    $entry = $Archive.CreateEntry($Name, [IO.Compression.CompressionLevel]::Optimal)
+    $stream = $entry.Open()
+    try { $stream.Write($Bytes, 0, $Bytes.Length) }
+    finally { $stream.Dispose() }
+}
+
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $scriptPath = Join-Path $repositoryRoot 'scripts\Build-Release.ps1'
 $schemaPath = Join-Path $PSScriptRoot 'artifact-manifest.schema.json'
@@ -66,6 +170,8 @@ Assert-True ($releaseScriptSource.Contains('$pendingManifestPath')) `
     'Production release verification does not stage the manifest before promotion.'
 Assert-True ($releaseScriptSource.Contains('ExpectedAndroidSignerSha256')) `
     'Production release orchestration has no Android signer continuity input.'
+Assert-True ($verificationScriptSource.Contains('Get-TermLinkAabVerificationEvidence')) `
+    'Production release verification has no complete AAB identity/signature inspection.'
 Assert-True ($releaseScriptSource.Contains('ExpectedWindowsSignerSha1')) `
     'Production release orchestration has no Windows signer continuity input.'
 Assert-True ($releaseScriptSource.Contains('[string]$CargoPath')) `
@@ -252,6 +358,153 @@ catch {
 }
 Assert-True $missingSignerCountRejected 'APK signer count evidence was optional instead of fail-closed.'
 
+$jdkCandidates = @(
+    if (-not [string]::IsNullOrWhiteSpace($env:JAVA_HOME)) { Join-Path $env:JAVA_HOME 'bin' },
+    'D:\Dev\Env\Jdk\jdk-21\bin',
+    'D:\Dev\Env\Jdk\jdk-17.0.17\bin'
+)
+$jdkBin = @($jdkCandidates | Where-Object {
+    (Test-Path -LiteralPath (Join-Path $_ 'keytool.exe') -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $_ 'jarsigner.exe') -PathType Leaf)
+} | Select-Object -First 1)
+Assert-True ($jdkBin.Count -eq 1) 'A manifest-approved JDK with keytool and jarsigner is required for AAB tests.'
+$keytoolPath = Join-Path $jdkBin[0] 'keytool.exe'
+$jarsignerPath = Join-Path $jdkBin[0] 'jarsigner.exe'
+$aabFixtureName = 'aab-verification-probe-' + [guid]::NewGuid().ToString('N')
+$aabFixtureRoot = Join-Path $repositoryRoot "artifacts\release\$aabFixtureName"
+[IO.Directory]::CreateDirectory($aabFixtureRoot) | Out-Null
+try {
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $fixtureKeystorePath = Join-Path $aabFixtureRoot 'fixture.p12'
+    $fixturePassword = 'TermLink-Aab-Fixture-Only-42'
+    $null = & $keytoolPath -genkeypair -noprompt -storetype PKCS12 `
+        -keystore $fixtureKeystorePath -storepass $fixturePassword -keypass $fixturePassword `
+        -alias fixture -dname 'CN=TermLink AAB Fixture' -keyalg RSA -keysize 2048 `
+        -sigalg SHA256withRSA -validity 3650 2>&1
+    Assert-True ($LASTEXITCODE -eq 0) 'keytool failed to generate the first AAB fixture signer.'
+
+    $fixtureAabPath = Join-Path $aabFixtureRoot 'TermLink-Android-0.2.10-52.aab'
+    $fixtureArchive = [IO.Compression.ZipFile]::Open(
+        $fixtureAabPath, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        Add-TestZipBytes -Archive $fixtureArchive -Name 'base/manifest/AndroidManifest.xml' `
+            -Bytes (New-TestAabManifest -ApplicationId 'dev.termlink.harness' `
+                -VersionName '0.2.10' -VersionCode 52)
+        Add-TestZipBytes -Archive $fixtureArchive -Name 'base/dex/classes.dex' `
+            -Bytes ([Text.Encoding]::UTF8.GetBytes('signed payload fixture'))
+    }
+    finally { $fixtureArchive.Dispose() }
+    $null = & $jarsignerPath '-J-Duser.language=en' '-J-Duser.country=US' `
+        -keystore $fixtureKeystorePath -storetype PKCS12 -storepass $fixturePassword `
+        -keypass $fixturePassword -digestalg SHA-256 -sigalg SHA256withRSA `
+        $fixtureAabPath fixture 2>&1
+    Assert-True ($LASTEXITCODE -eq 0) 'jarsigner failed to sign the AAB fixture.'
+
+    $certificateOutput = @(& $keytoolPath '-J-Duser.language=en' '-J-Duser.country=US' `
+        -exportcert -rfc -keystore $fixtureKeystorePath -storetype PKCS12 `
+        -storepass $fixturePassword -alias fixture 2>&1)
+    Assert-True ($LASTEXITCODE -eq 0) 'keytool failed to export the AAB fixture certificate.'
+    $certificatePem = $certificateOutput -join "`n"
+    $certificateMatch = [regex]::Match(
+        $certificatePem,
+        '(?s)-----BEGIN CERTIFICATE-----\s*(.*?)\s*-----END CERTIFICATE-----')
+    Assert-True $certificateMatch.Success 'The exported AAB fixture certificate was malformed.'
+    $certificateBytes = [Convert]::FromBase64String(($certificateMatch.Groups[1].Value -replace '\s', ''))
+    $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new($certificateBytes)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try { $fixtureSignerSha256 = ([BitConverter]::ToString(
+            $sha256.ComputeHash($certificate.RawData))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha256.Dispose() }
+
+    $aabEvidence = Get-TermLinkAabVerificationEvidence -Path $fixtureAabPath `
+        -ExpectedSha256 $fixtureSignerSha256
+    Assert-True ($aabEvidence.application_id -ceq 'dev.termlink.harness' -and
+        $aabEvidence.version_name -ceq '0.2.10' -and $aabEvidence.version_code -eq 52 -and
+        $aabEvidence.signer_count -eq 1 -and $aabEvidence.payload_sha256_coverage -eq $true -and
+        $aabEvidence.jar_signature_valid -eq $true) `
+        'A correctly signed AAB did not retain complete identity, version, signer, and payload evidence.'
+
+    $fixtureFile = Get-Item -LiteralPath $fixtureAabPath
+    $fixtureHash = (Get-FileHash -LiteralPath $fixtureAabPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $fixtureManifest = [pscustomobject][ordered]@{
+        schema_version = 1
+        version = '0.2.10'
+        build_number = 52
+        release_mode = 'production'
+        artifacts = @([pscustomobject][ordered]@{
+            path = "artifacts/release/$aabFixtureName/$($fixtureFile.Name)"
+            size = [int64]$fixtureFile.Length
+            sha256 = $fixtureHash
+            platform = 'android'
+            type = 'aab'
+            version = '0.2.10'
+        })
+    }
+    $fixtureManifestPath = Join-Path $aabFixtureRoot 'artifact-manifest.json'
+    [IO.File]::WriteAllText(
+        $fixtureManifestPath,
+        (($fixtureManifest | ConvertTo-Json -Depth 6) + [Environment]::NewLine),
+        (New-Object Text.UTF8Encoding -ArgumentList $false))
+    $fixtureVerification = @(& $verificationScriptPath -ReleaseDirectory $aabFixtureRoot `
+        -ExpectedReleaseMode Production -ExpectedAndroidSignerSha256 $fixtureSignerSha256) `
+        -join "`n" | ConvertFrom-Json
+    Assert-True ($fixtureVerification.verified -eq $true -and
+        $fixtureVerification.android_aab.application_id -ceq 'dev.termlink.harness' -and
+        $fixtureVerification.android_aab.version_code -eq 52) `
+        'The standalone Production verifier rejected a complete, correctly signed AAB.'
+
+    $tamperedAabPath = Join-Path $aabFixtureRoot 'tampered.aab'
+    Copy-Item -LiteralPath $fixtureAabPath -Destination $tamperedAabPath
+    $tamperedArchive = [IO.Compression.ZipFile]::Open(
+        $tamperedAabPath, [IO.Compression.ZipArchiveMode]::Update)
+    try {
+        $tamperedManifestEntry = $tamperedArchive.GetEntry('base/manifest/AndroidManifest.xml')
+        $tamperedManifestEntry.Delete()
+        Add-TestZipBytes -Archive $tamperedArchive -Name 'base/manifest/AndroidManifest.xml' `
+            -Bytes (New-TestAabManifest -ApplicationId 'dev.termlink.harness' `
+                -VersionName '0.2.10' -VersionCode 53)
+    }
+    finally { $tamperedArchive.Dispose() }
+    $tamperedAabRejected = $false
+    try {
+        $null = Get-TermLinkAabVerificationEvidence -Path $tamperedAabPath `
+            -ExpectedSha256 $fixtureSignerSha256
+    }
+    catch { $tamperedAabRejected = $_.Exception.Message.Contains('payload digest') }
+    Assert-True $tamperedAabRejected 'An AAB changed after JAR signing was accepted.'
+
+    $null = & $keytoolPath -genkeypair -noprompt -storetype PKCS12 `
+        -keystore $fixtureKeystorePath -storepass $fixturePassword -keypass $fixturePassword `
+        -alias fixture2 -dname 'CN=TermLink AAB Second Fixture' -keyalg RSA -keysize 2048 `
+        -sigalg SHA256withRSA -validity 3650 2>&1
+    Assert-True ($LASTEXITCODE -eq 0) 'keytool failed to generate the second AAB fixture signer.'
+    $multiSignerAabPath = Join-Path $aabFixtureRoot 'multi-signer.aab'
+    Copy-Item -LiteralPath $fixtureAabPath -Destination $multiSignerAabPath
+    $null = & $jarsignerPath '-J-Duser.language=en' '-J-Duser.country=US' `
+        -keystore $fixtureKeystorePath -storetype PKCS12 -storepass $fixturePassword `
+        -keypass $fixturePassword -digestalg SHA-256 -sigalg SHA256withRSA `
+        $multiSignerAabPath fixture2 2>&1
+    Assert-True ($LASTEXITCODE -eq 0) 'jarsigner failed to apply the second AAB fixture signer.'
+    $multiSignerAabRejected = $false
+    try {
+        $null = Get-TermLinkAabVerificationEvidence -Path $multiSignerAabPath `
+            -ExpectedSha256 $fixtureSignerSha256
+    }
+    catch { $multiSignerAabRejected = $_.Exception.Message.Contains('exactly one supported JAR signature') }
+    Assert-True $multiSignerAabRejected 'An AAB carrying multiple JAR signers was accepted.'
+}
+finally {
+    $releaseArtifactsRoot = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'artifacts\release'))
+    $resolvedAabFixtureRoot = [IO.Path]::GetFullPath($aabFixtureRoot)
+    $aabFixturePrefix = $releaseArtifactsRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    if ($resolvedAabFixtureRoot.StartsWith($aabFixturePrefix, [StringComparison]::OrdinalIgnoreCase) -and
+        [IO.Path]::GetFileName($resolvedAabFixtureRoot).StartsWith(
+            'aab-verification-probe-', [StringComparison]::Ordinal)) {
+        Remove-Item -LiteralPath $resolvedAabFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $windowsSignerSha1 = '91ae60bc06d866628b8eb2c62f32bde9dab56466'
 $acceptedWindowsSigner = Assert-TermLinkWindowsSignatureEvidence -Status 'Valid' `
     -ActualSha1 $windowsSignerSha1.ToUpperInvariant() -ExpectedSha1 $windowsSignerSha1
@@ -416,15 +669,13 @@ catch {
 }
 Assert-True $productionMsixRejected `
     'Production MSIX was accepted without complete post-build identity/signature/timestamp verification.'
-$productionAabRejected = $false
-try {
-    $null = & $scriptPath -Version '1.2.3' -BuildNumber 4 -AndroidAab -Plan
-}
-catch {
-    $productionAabRejected = $_.Exception.Message.Contains('Production AndroidAab is disabled')
-}
-Assert-True $productionAabRejected `
-    'Production AAB was accepted without complete post-build identity/version/signer verification.'
+$productionAabPlan = & $scriptPath -Version '1.2.3' -BuildNumber 4 -AndroidAab -Plan | ConvertFrom-Json
+$productionAabStep = @($productionAabPlan.steps | Where-Object { $_.id -eq 'android-release' })[0]
+Assert-True ($productionAabPlan.release_mode -ceq 'production' -and
+    @($productionAabStep.arguments) -contains ':app:bundleRelease' -and
+    @($productionAabStep.requirements) -contains
+        'explicit expected Android signer certificate SHA-256 continuity fingerprint') `
+    'Production AAB plan does not require the complete identity/version/signer gate.'
 Assert-True (-not (Test-Path -LiteralPath $probeOutput)) `
     'Unsupported production target preflight created an output path.'
 
@@ -529,7 +780,7 @@ try {
     Assert-True ($verificationResult.verified -eq $true -and $verificationResult.release_mode -ceq 'production') `
         'A valid production artifact manifest did not pass the release verifier.'
 
-    $probeManifest.artifacts[0].type = 'aab'
+    $probeManifest.artifacts[0].type = 'msix'
     [IO.File]::WriteAllText(
         $probeManifestPath,
         (($probeManifest | ConvertTo-Json -Depth 6) + [Environment]::NewLine),
@@ -540,10 +791,10 @@ try {
             -ExpectedReleaseMode Production
     }
     catch {
-        $unsupportedProductionManifestRejected = $_.Exception.Message.Contains('rejects AAB/MSIX')
+        $unsupportedProductionManifestRejected = $_.Exception.Message.Contains('rejects MSIX')
     }
     Assert-True $unsupportedProductionManifestRejected `
-        'The standalone Production verifier accepted an incompletely verified AAB/MSIX record.'
+        'The standalone Production verifier accepted an incompletely verified MSIX record.'
     $probeManifest.artifacts[0].type = 'signature'
 
     $probeManifest.release_mode = 'development'
@@ -590,6 +841,14 @@ try {
         (New-Object Text.UTF8Encoding -ArgumentList $false))
     $appShipApk = Get-Item -LiteralPath $appShipApkPath
     $appShipApkHash = (Get-FileHash -LiteralPath $appShipApkPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $appShipAabName = "TermLink-Android-$appShipProbeVersion-$appShipProbeBuild.aab"
+    $appShipAabPath = Join-Path $appShipProbeRoot $appShipAabName
+    [IO.File]::WriteAllText(
+        $appShipAabPath,
+        'appship-production-aab-coexistence-gate-probe',
+        (New-Object Text.UTF8Encoding -ArgumentList $false))
+    $appShipAab = Get-Item -LiteralPath $appShipAabPath
+    $appShipAabHash = (Get-FileHash -LiteralPath $appShipAabPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $appShipSetupName = "TermLink-Setup-$appShipProbeVersion.$appShipProbeBuild-x64.exe"
     $appShipSetupPath = Join-Path $appShipProbeRoot $appShipSetupName
     [IO.File]::WriteAllText(
@@ -610,6 +869,14 @@ try {
                 sha256 = $appShipApkHash
                 platform = 'android'
                 type = 'apk'
+                version = $appShipProbeVersion
+            },
+            [pscustomobject][ordered]@{
+                path = "artifacts/release/$appShipProbeVersion-$appShipProbeBuild/$appShipAabName"
+                size = [int64]$appShipAab.Length
+                sha256 = $appShipAabHash
+                platform = 'android'
+                type = 'aab'
                 version = $appShipProbeVersion
             },
             [pscustomobject][ordered]@{

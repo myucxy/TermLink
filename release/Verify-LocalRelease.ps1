@@ -490,9 +490,9 @@ Assert-Release ([string]$manifest.release_mode -ceq $expectedMode) `
 $artifactRecords = @($manifest.artifacts)
 Assert-Release ($artifactRecords.Count -gt 0) 'Artifact manifest must contain at least one artifact.'
 if ($expectedMode -ceq 'production') {
-    $unsupportedProductionRecords = @($artifactRecords | Where-Object { $_.type -in @('aab', 'msix') })
+    $unsupportedProductionRecords = @($artifactRecords | Where-Object { $_.type -eq 'msix' })
     Assert-Release ($unsupportedProductionRecords.Count -eq 0) `
-        'Production verification rejects AAB/MSIX until complete post-build identity, version, signer continuity, and timestamp checks are implemented.'
+        'Production verification rejects MSIX until complete post-build identity, version, signer continuity, and timestamp checks are implemented.'
 }
 
 $resolvedArtifactPaths = @{}
@@ -560,6 +560,23 @@ if ($apkRecords.Count -eq 1) {
         signer_sha256 = $signerEvidence.signer_sha256
         verified_schemes = @($signerEvidence.verified_schemes)
     }
+}
+
+$androidAabResult = $null
+$aabRecords = @($artifactRecords | Where-Object { $_.type -eq 'aab' })
+Assert-Release ($aabRecords.Count -le 1) 'Release must not contain more than one Android App Bundle.'
+if ($aabRecords.Count -eq 1) {
+    Assert-Release (-not [string]::IsNullOrWhiteSpace($ExpectedAndroidSignerSha256)) `
+        'ExpectedAndroidSignerSha256 is required to verify an AAB.'
+    $aabPath = $resolvedArtifactPaths[[string]$aabRecords[0].path]
+    $androidAabResult = Get-TermLinkAabVerificationEvidence -Path $aabPath `
+        -ExpectedSha256 $ExpectedAndroidSignerSha256
+    Assert-Release ($androidAabResult.application_id -ceq 'dev.termlink.harness') `
+        'AAB applicationId does not match dev.termlink.harness.'
+    Assert-Release ($androidAabResult.version_name -ceq [string]$manifest.version) `
+        'AAB versionName does not match the release manifest.'
+    Assert-Release ($androidAabResult.version_code -eq [int]$manifest.build_number) `
+        'AAB versionCode does not match the release manifest build number.'
 }
 
 $windowsResult = $null
@@ -756,6 +773,7 @@ if ($ociRecords.Count -eq 1) {
     release_mode = [string]$manifest.release_mode
     artifacts = $hashResults
     android = $androidResult
+    android_aab = $androidAabResult
     windows = $windowsResult
     server = $platformResults
 } | ConvertTo-Json -Depth 8
