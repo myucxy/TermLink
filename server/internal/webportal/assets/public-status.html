@@ -1,0 +1,20 @@
+{{template "public-page-start" .}}
+<section class="public-intro status-intro" aria-labelledby="public-title">
+  <p class="eyebrow">PUBLIC STATUS</p>
+  <h1 id="public-title">服务状态</h1>
+  <p>{{.Description}}</p>
+  <span class="checked-at">检查时间 {{.CheckedAt}}</span>
+</section>
+
+<section class="status-list public-card" aria-label="公开服务状态" data-status-list>
+  {{range .Services}}
+  <article class="status-row" data-service-state="{{.StateClass}}">
+    <span class="status-indicator status-{{.StateClass}}" aria-hidden="true"></span>
+    <div><h2>{{.Name}}</h2><p>{{.Description}}</p></div>
+    <strong class="state-pill state-{{.StateClass}}">{{.State}}</strong>
+  </article>
+  {{end}}
+</section>
+
+<aside class="public-note"><strong>说明</strong><p>“未公开”表示该组件不通过公共页面披露实时内部健康信息，并不表示发生故障。运维监控与公开状态相互隔离。</p></aside>
+{{template "public-page-end" .}}

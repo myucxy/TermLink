@@ -194,6 +194,7 @@ import org.json.JSONObject
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import androidx.core.view.WindowCompat
 import androidx.core.view.ViewCompat
@@ -636,7 +637,8 @@ private data class TailFirstSurfaceObservation(
 
 private const val TAIL_FIRST_IME_REQUIRED_STABLE_FRAMES = 2
 private const val TAIL_FIRST_IME_MAX_LAYOUT_GAP_PIXELS = 1
-private const val TAIL_FIRST_IME_STABILITY_TIMEOUT_MILLIS = 10_000L
+private const val TAIL_FIRST_IME_RETRY_FRAME_INTERVAL = 30
+private const val TAIL_FIRST_IME_STABILITY_TIMEOUT_MILLIS = 30_000L
 private const val TAIL_FIRST_E2E_LOG_TAG = "TermLinkTailFirst"
 
 private interface TailFirstTerminalSurfaceController {
@@ -1967,7 +1969,7 @@ private fun ProductUpdateDialog(
                         fontWeight = FontWeight.SemiBold,
                     )
                     is ProductUpdateDownloadState.Failed -> Text(
-                        download.message,
+                        stringResource(R.string.update_download_failed),
                         color = MaterialTheme.colorScheme.error,
                     )
                 }
@@ -2021,7 +2023,8 @@ private suspend fun executeTailFirstProductOperation(
         when (operation) {
             "probe" -> tailFirstProbeResponse(repository, requestId, operation)
             "open_session" -> {
-                val session = awaitNewTailFirstSession(repository)
+                val minimumTail = arguments["minimum_tail"]?.toULongOrNull() ?: 0uL
+                val session = awaitNewTailFirstSession(repository, minimumTail)
                     ?: return tailFirstFailure(requestId, operation, "SESSION_UNAVAILABLE")
                 TailFirstE2EProductBridge.selectSession(session.id)
                 onSelectSession(session.id)
@@ -2042,7 +2045,6 @@ private suspend fun executeTailFirstProductOperation(
                 val before = repository.snapshot.value.transcriptViewports[sessionId]
                 val beforePages = before?.pages?.size ?: 0
                 val beforeRows = transcriptRowCount(repository.snapshot.value, sessionId)
-                val requestBeforeLineId = before?.nextBeforeLineId
                 val existingPageRanges = before?.pages
                     ?.mapTo(mutableSetOf()) { it.firstLineId to it.lastLineId }
                     .orEmpty()
@@ -2066,7 +2068,7 @@ private suspend fun executeTailFirstProductOperation(
                     ),
                     loadedTranscriptPage = loadedPage?.let { page ->
                         TailFirstLoadedTranscriptPage(
-                            requestBeforeLineId = requireNotNull(requestBeforeLineId).toLong(),
+                            requestBeforeLineId = Math.addExact(page.lastLineId, 1L),
                             firstLineId = page.firstLineId,
                             lastLineId = page.lastLineId,
                             hasMoreBefore = page.hasMoreBefore,
@@ -2083,7 +2085,6 @@ private suspend fun executeTailFirstProductOperation(
                 val before = repository.snapshot.value.transcriptViewports[sessionId]
                 val beforePages = before?.pages?.size ?: 0
                 val beforeRows = before?.pages?.sumOf { it.rows.size } ?: 0
-                val requestBeforeLineId = before?.nextBeforeLineId
                 val existingPageRanges = before?.pages
                     ?.mapTo(mutableSetOf()) { it.firstLineId to it.lastLineId }
                     .orEmpty()
@@ -2121,7 +2122,7 @@ private suspend fun executeTailFirstProductOperation(
                     ),
                     loadedTranscriptPage = loadedPage?.let { page ->
                         TailFirstLoadedTranscriptPage(
-                            requestBeforeLineId = requireNotNull(requestBeforeLineId).toLong(),
+                            requestBeforeLineId = Math.addExact(page.lastLineId, 1L),
                             firstLineId = page.firstLineId,
                             lastLineId = page.lastLineId,
                             hasMoreBefore = page.hasMoreBefore,
@@ -2168,6 +2169,16 @@ private suspend fun executeTailFirstProductOperation(
             }
             else -> tailFirstFailure(requestId, operation, "OPERATION_UNSUPPORTED")
         }
+    } catch (error: SessionOpenException) {
+        tailFirstFailure(requestId, operation, tailFirstSessionOpenFailureCode(error.failure))
+    } catch (error: TimeoutCancellationException) {
+        val observedFailure = TailFirstE2EProductBridge.selectedSession()
+            ?.let(repository.snapshot.value.sessionOpenFailures::get)
+        tailFirstFailure(
+            requestId,
+            operation,
+            observedFailure?.let(::tailFirstSessionOpenFailureCode) ?: "OPERATION_TIMEOUT",
+        )
     } catch (error: CancellationException) {
         throw error
     } catch (error: TailFirstImeStabilityTimeout) {
@@ -2183,12 +2194,18 @@ private suspend fun executeTailFirstProductOperation(
     }
 }
 
+internal fun tailFirstSessionOpenFailureCode(failure: SessionOpenFailure): String =
+    "SESSION_OPEN_${failure.code.stableCode.replace('-', '_')}"
+
 private fun tailFirstSelectedSession(requestId: String, operation: String): java.util.UUID? =
     TailFirstE2EProductBridge.selectedSession()
 
-private suspend fun awaitNewTailFirstSession(repository: ProductRepository): SessionSummary? {
+private suspend fun awaitNewTailFirstSession(
+    repository: ProductRepository,
+    minimumTail: ULong = 0uL,
+): SessionSummary? {
     val existingSessionIds = repository.snapshot.value.sessions.mapTo(mutableSetOf(), SessionSummary::id)
-    return withTimeoutOrNull(45_000) {
+    return withTimeoutOrNull(150_000) {
         while (true) {
             try {
                 repository.refresh()
@@ -2198,7 +2215,9 @@ private suspend fun awaitNewTailFirstSession(repository: ProductRepository): Ses
                 delay(500)
                 continue
             }
-            newestNewNonExitedSession(repository.snapshot.value.sessions, existingSessionIds)?.let {
+            newestNewNonExitedSession(repository.snapshot.value.sessions, existingSessionIds)
+                ?.takeIf { it.lastOutputSequence >= minimumTail }
+                ?.let {
                 return@withTimeoutOrNull it
             }
             delay(500)
@@ -2269,6 +2288,7 @@ private suspend fun tailFirstStateResponse(
         put("chunk_count", counts?.chunks ?: 0)
         put("snapshot_sequence_s", (viewport?.snapshotAnchorSequence ?: 0u).toLong())
         put("live_ack", (snapshot.liveAcknowledgements[sessionId] ?: 0u).toLong())
+        put("bootstrap_source", snapshot.bootstrapSources[sessionId]?.name ?: "UNKNOWN")
         put("realtime_socket_phase", realtime?.socketPhase ?: "UNKNOWN")
         put("realtime_socket_generation", realtime?.socketGeneration ?: 0)
         put("realtime_connected_generation", realtime?.connectedGeneration ?: 0)
@@ -2387,12 +2407,22 @@ private suspend fun awaitStableTailFirstIme(
     surface: TailFirstTerminalSurfaceController,
 ): TailFirstSurfaceObservation {
     val tracker = TailFirstImeStabilityTracker()
+    var framesSinceImeRequest = 0
     val stableObservation = withTimeoutOrNull(TAIL_FIRST_IME_STABILITY_TIMEOUT_MILLIS) {
         while (true) {
             awaitTailFirstUiFrame()
             val observation = withContext(Dispatchers.Main.immediate) { surface.observe() }
             if (tracker.recordFrame(observation.imeLayoutSample())) {
                 return@withTimeoutOrNull observation
+            }
+            // ViewRoot focus/served-view ownership can be lost while the
+            // terminal is catching up after a large history replay. Reassert
+            // the same idempotent debug request periodically; readiness still
+            // requires two exact, non-overlapping geometry samples.
+            framesSinceImeRequest += 1
+            if (framesSinceImeRequest >= TAIL_FIRST_IME_RETRY_FRAME_INTERVAL) {
+                withContext(Dispatchers.Main.immediate) { surface.showIme() }
+                framesSinceImeRequest = 0
             }
         }
         error("unreachable")
@@ -3365,9 +3395,6 @@ private fun AgentUpdateDialog(
                                 color = MaterialTheme.colorScheme.error,
                             )
                         }
-                        if (!progress.errorDetail.isNullOrBlank()) {
-                            Text(progress.errorDetail, color = MaterialTheme.colorScheme.error)
-                        }
                         if (progress.status == "ROLLED_BACK") {
                             Text(stringResource(R.string.agent_update_restored_version, progress.observedAgentVersion.orEmpty()))
                         }
@@ -3386,8 +3413,7 @@ private fun AgentUpdateDialog(
                                     apiError.traceId ?: "-",
                                 )
                             } else {
-                                state.error.message?.take(500)
-                                    ?: stringResource(R.string.agent_update_unknown_error)
+                                stringResource(R.string.agent_update_unknown_error)
                             },
                             color = MaterialTheme.colorScheme.error,
                         )
@@ -4260,38 +4286,41 @@ private fun TerminalActionBar(
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .background(Color.Black.copy(alpha = 0.62f), RoundedCornerShape(6.dp))
-            .padding(horizontal = 4.dp, vertical = 2.dp),
+            .background(Color.Black.copy(alpha = 0.62f), RoundedCornerShape(7.dp))
+            .padding(horizontal = 3.dp, vertical = 2.dp),
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            IconButton(
+            TerminalDockButton(
                 onClick = { onExpandedChanged(!expanded) },
                 modifier = Modifier
-                    .size(30.dp)
+                    .width(30.dp)
                     .testTag(terminalCommandTestTag("dock-toggle")),
             ) {
-                Icon(
+                color -> Icon(
                     if (expanded) Icons.Filled.KeyboardArrowDown else Icons.Filled.KeyboardArrowUp,
                     contentDescription = if (expanded) stringResource(R.string.terminal_dock_hide) else stringResource(R.string.terminal_dock_show),
-                    tint = Color.White.copy(alpha = 0.82f),
+                    tint = color,
+                    modifier = Modifier.size(18.dp),
                 )
             }
-            IconButton(
+            TerminalDockButton(
                 onClick = onPasteRequested,
                 enabled = enabled,
                 modifier = Modifier
-                    .size(30.dp)
+                    .width(30.dp)
                     .testTag(terminalCommandTestTag("paste")),
             ) {
-                Icon(
+                color -> Icon(
                     Icons.Filled.ContentPaste,
                     contentDescription = stringResource(R.string.action_paste),
+                    tint = color,
+                    modifier = Modifier.size(17.dp),
                 )
             }
             if (expanded) {
@@ -4322,20 +4351,20 @@ private fun TerminalCustomTextKey(
     enabled: Boolean,
     onActivate: (TerminalCustomShortcut) -> Unit,
 ) {
-    OutlinedButton(
+    TerminalDockButton(
         onClick = { onActivate(shortcut) },
         enabled = enabled,
         modifier = Modifier
-            .heightIn(min = 30.dp)
-            .widthIn(max = 200.dp)
+            .widthIn(min = 32.dp, max = 160.dp)
             .testTag(terminalCommandTestTag("custom-${shortcut.id}")),
-        contentPadding = PaddingValues(horizontal = 7.dp, vertical = 0.dp),
     ) {
-        Text(
+        color -> Text(
             shortcut.displayLabel,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             style = MaterialTheme.typography.labelSmall,
+            color = color,
+            modifier = Modifier.padding(horizontal = 7.dp),
         )
     }
 }
@@ -4347,15 +4376,20 @@ private fun TerminalTextKey(
     enabled: Boolean,
     onAction: (TerminalAction) -> Unit,
 ) {
-    OutlinedButton(
+    TerminalDockButton(
         onClick = { onAction(action) },
         enabled = enabled,
         modifier = Modifier
-            .heightIn(min = 30.dp)
+            .widthIn(min = 32.dp)
             .testTag(terminalCommandTestTag(action.name.lowercase(Locale.ROOT))),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 7.dp, vertical = 0.dp),
     ) {
-        Text(label, maxLines = 1, style = MaterialTheme.typography.labelSmall)
+        color -> Text(
+            label,
+            maxLines = 1,
+            style = MaterialTheme.typography.labelSmall,
+            color = color,
+            modifier = Modifier.padding(horizontal = 7.dp),
+        )
     }
 }
 
@@ -4367,14 +4401,45 @@ private fun TerminalIconKey(
     enabled: Boolean,
     onAction: (TerminalAction) -> Unit,
 ) {
-    IconButton(
+    TerminalDockButton(
         onClick = { onAction(action) },
         enabled = enabled,
         modifier = Modifier
-            .size(30.dp)
+            .width(30.dp)
             .testTag(terminalCommandTestTag(action.name.lowercase(Locale.ROOT))),
     ) {
-        Icon(icon, contentDescription = description)
+        color -> Icon(
+            icon,
+            contentDescription = description,
+            tint = color,
+            modifier = Modifier.size(18.dp),
+        )
+    }
+}
+
+@Composable
+private fun TerminalDockButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    content: @Composable (Color) -> Unit,
+) {
+    val shape = RoundedCornerShape(5.dp)
+    val contentColor = Color.White.copy(alpha = if (enabled) 0.92f else 0.38f)
+    Box(
+        modifier = modifier
+            .height(28.dp)
+            .clip(shape)
+            .background(Color.White.copy(alpha = if (enabled) 0.09f else 0.025f))
+            .border(
+                width = 1.dp,
+                color = Color.White.copy(alpha = if (enabled) 0.34f else 0.12f),
+                shape = shape,
+            )
+            .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        content(contentColor)
     }
 }
 
@@ -4682,14 +4747,7 @@ private fun TerminalSurface(
 
             override fun showIme() {
                 if (overlayVisible) returnToLiveTail()
-                liveViewHolder[0]?.let { view ->
-                    view.isFocusable = true
-                    view.isFocusableInTouchMode = true
-                    view.requestFocus()
-                    val inputMethod = view.context.getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
-                        as? InputMethodManager
-                    inputMethod?.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
-                }
+                liveViewHolder[0]?.let(::requestTailFirstTerminalIme)
             }
         }
         SideEffect {
@@ -4867,6 +4925,32 @@ private fun TerminalSurface(
                     )
                 }
                 .testTag(terminalDockTestTag(session.id)),
+        )
+    }
+}
+
+/**
+ * Focus ownership is committed asynchronously by ViewRootImpl. Calling
+ * showSoftInput in the same stack as requestFocus can therefore be rejected as
+ * "view is not served" after a detached transcript overlay closes. Post the
+ * request through the UI queue and use both modern insets and compatibility
+ * IME paths; the short retries are idempotent and remain debug-E2E-only.
+ */
+private fun requestTailFirstTerminalIme(view: View) {
+    view.isFocusable = true
+    view.isFocusableInTouchMode = true
+    view.requestFocus()
+    val inputMethod = view.context.getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
+        as? InputMethodManager
+    listOf(0L, 100L, 300L).forEach { delayMillis ->
+        view.postDelayed(
+            {
+                if (!view.isAttachedToWindow) return@postDelayed
+                if (!view.hasFocus()) view.requestFocus()
+                ViewCompat.getWindowInsetsController(view)?.show(WindowInsetsCompat.Type.ime())
+                inputMethod?.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
+            },
+            delayMillis,
         )
     }
 }
@@ -5284,13 +5368,11 @@ private fun SettingsAboutCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             if (update.decision == ProductUpdateDecision.ERROR) {
-                update.message?.let {
-                    Text(
-                        it,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
+                Text(
+                    stringResource(R.string.update_error_detail),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
             }
             update.releaseNotes?.let {
                 Text(
@@ -6214,8 +6296,7 @@ private fun safeOperationMessage(
     activeSessionDeleteMessage: String = fallback,
 ): String = when {
     error is TermLinkApiException && error.code == "SESSION_ACTIVE" -> activeSessionDeleteMessage
-    error is IllegalArgumentException ->
-        error.message?.let(::safeActivityDetail)?.takeIf { it.isNotBlank() } ?: fallback
+    error is IllegalArgumentException -> fallback
     else -> fallback
 }
 

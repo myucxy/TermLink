@@ -107,11 +107,17 @@ func (r *Runner) runAndLog(ctx context.Context) {
 	cleaned, err := r.RunOnce(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
-			r.logger.Error("automatic session cleanup failed", "error", err)
+			logCleanupFailure(r.logger, cleaned, err)
 		}
 		return
 	}
 	if cleaned > 0 {
 		r.logger.Info("automatic session cleanup completed", "sessions", cleaned)
 	}
+}
+
+func logCleanupFailure(logger *slog.Logger, cleaned int, _ error) {
+	logger.Error("automatic session cleanup failed",
+		"error_class", "session_cleanup_failed",
+		"sessions", cleaned)
 }

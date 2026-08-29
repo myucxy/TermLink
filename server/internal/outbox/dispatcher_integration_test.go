@@ -43,7 +43,7 @@ func TestDispatcherDeliversAuthorityEvents(t *testing.T) {
 
 	dispatcher := Dispatcher{Store: repository, Valkey: valkey}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	outboxIDs := make([]int64, 0, 3)
+	outboxIDs := make([]int64, 0, 4)
 	t.Cleanup(func() {
 		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cleanupCancel()
@@ -79,6 +79,29 @@ func TestDispatcherDeliversAuthorityEvents(t *testing.T) {
 
 grantPublished:
 	assertOutboxState(t, repository, ctx, grantEventID, true, 1, "")
+
+	refundID := uuid.New()
+	refundSubscription := valkey.Client.Subscribe(ctx, "refund-approval-changed")
+	defer refundSubscription.Close()
+	if _, err := refundSubscription.Receive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	refundEventID := insertOutboxFixture(t, repository, ctx, "refund.approval.changed", &refundID, `{"refund_id":"`+refundID.String()+`","status":"CREATED","version":2}`)
+	outboxIDs = append(outboxIDs, refundEventID)
+	dispatcher.dispatchBatch(ctx, logger)
+	for {
+		select {
+		case message := <-refundSubscription.Channel():
+			if message != nil && message.Channel == "refund-approval-changed" && message.Payload == refundID.String() {
+				goto refundPublished
+			}
+		case <-ctx.Done():
+			t.Fatal("refund approval event was not published")
+		}
+	}
+
+refundPublished:
+	assertOutboxState(t, repository, ctx, refundEventID, true, 1, "")
 
 	sessionID := uuid.New()
 	holderID := uuid.New()

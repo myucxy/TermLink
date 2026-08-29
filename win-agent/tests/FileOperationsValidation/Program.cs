@@ -543,6 +543,8 @@ static void ValidateTerminalLaunch(string testRoot)
 {
     var stub = Path.Combine(testRoot, "terminal-stub.exe");
     File.WriteAllBytes(stub, new byte[] { 0x4d, 0x5a });
+    var settingsPath = Path.Combine(testRoot, "terminal-commands.json");
+    AppContext.SetData(TerminalCommandProfileStore.StoragePathAppContextKey, settingsPath);
     var starts = new RecordingProcessStarter { FailFirst = true };
     var launcher = new ManagedTerminalLauncher(
         new WindowsPathService(), starts, () => stub, stub, stub, stub, stub, stub);
@@ -583,8 +585,6 @@ static void ValidateTerminalLaunch(string testRoot)
         "WSL launch received PowerShell-only flags or lost its executable");
     RequireFileOperationCode(() => launcher.Launch("unknown-shell", testRoot), "SHELL_NOT_ALLOWED");
 
-    var settingsPath = Path.Combine(testRoot, "terminal-commands.json");
-    AppContext.SetData(TerminalCommandProfileStore.StoragePathAppContextKey, settingsPath);
     try
     {
         var custom = TerminalCommandProfileStore.CreateManualProfile(

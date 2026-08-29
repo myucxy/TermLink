@@ -24,6 +24,21 @@ const (
 
 const portalBootstrapLockID int64 = 0x544c504f5254414c
 
+// PortalIdentityAssertion carries the bounded authorization facts extracted
+// from a cryptographically verified Web OIDC token. BootstrapManaged must only
+// be set for the deployment-owned bootstrap marker role; a generic
+// SUPER_ADMIN claim is deliberately insufficient to move database authority.
+type PortalIdentityAssertion struct {
+	Role             Role
+	BootstrapManaged bool
+}
+
+type portalBootstrapCandidate struct {
+	ID               uuid.UUID
+	BootstrapManaged bool
+	DeviceCount      int64
+}
+
 var ErrLastSuperAdmin = errors.New("the last active super administrator is protected")
 
 func ParseRole(value string) (Role, error) {
@@ -103,12 +118,141 @@ type PortalAdminDashboard struct {
 	AuditEvents         []PortalAuditEvent
 }
 
+// PortalAdminSection loads only the bounded data required by one console
+// section. The legacy PortalAdminDashboard method remains for compatibility
+// and integration diagnostics, while production page requests avoid its
+// accounts + connections + audit mega-query fan-out.
+func (s *Postgres) PortalAdminSection(ctx context.Context, actorID uuid.UUID, section string) (PortalAdminDashboard, error) {
+	var actorRole Role
+	var actorStatus string
+	if err := s.Pool.QueryRow(ctx, `SELECT role,status FROM users WHERE id=$1`, actorID).Scan(&actorRole, &actorStatus); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return PortalAdminDashboard{}, ErrDenied
+		}
+		return PortalAdminDashboard{}, err
+	}
+	if actorStatus != "ACTIVE" || !actorRole.CanOpenConsole() {
+		return PortalAdminDashboard{}, ErrDenied
+	}
+
+	var result PortalAdminDashboard
+	switch section {
+	case "overview":
+		if err := s.Pool.QueryRow(ctx, `
+			SELECT
+				(SELECT max(version) FROM schema_migrations),
+				(SELECT count(*) FROM users WHERE status <> 'DELETED'),
+				(SELECT count(*) FROM users WHERE status <> 'DELETED' AND role IN ('SUPER_ADMIN','ADMIN','AUDITOR')),
+				(SELECT count(*) FROM devices),
+				(SELECT count(*) FROM devices WHERE trust_state='TRUSTED'),
+				(SELECT count(*) FROM pcs),
+				(SELECT count(*) FROM sessions WHERE state <> 'DELETED'),
+				(SELECT count(*) FROM sessions WHERE state='RUNNING'),
+				(SELECT count(*) FROM plans),
+				(SELECT count(*) FROM subscriptions WHERE status IN ('ACTIVE','GRACE'))`).
+			Scan(&result.SchemaVersion, &result.Users, &result.ConsoleAccounts, &result.Devices,
+				&result.TrustedDevices, &result.PCs, &result.Sessions, &result.RunningSessions,
+				&result.Plans, &result.ActiveSubscriptions); err != nil {
+			return PortalAdminDashboard{}, err
+		}
+		rows, err := s.Pool.Query(ctx, `
+			SELECT id,action,target_type,coalesce(target_id::text,''),result,trace_id,created_at
+			FROM audit_events ORDER BY id DESC LIMIT 7`)
+		if err != nil {
+			return PortalAdminDashboard{}, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var item PortalAuditEvent
+			if err := rows.Scan(&item.ID, &item.Action, &item.TargetType, &item.TargetID, &item.Result, &item.TraceID, &item.CreatedAt); err != nil {
+				return PortalAdminDashboard{}, err
+			}
+			result.AuditEvents = append(result.AuditEvents, item)
+		}
+		return result, rows.Err()
+	case "connections":
+		rows, err := s.Pool.Query(ctx, `
+			SELECT d.id,d.name,d.device_type,d.trust_state,d.last_seen_at,
+				count(s.id) FILTER (WHERE s.state='RUNNING'),coalesce(max(s.last_output_seq),0)
+			FROM devices d
+			LEFT JOIN pcs p ON p.device_id=d.id
+			LEFT JOIN sessions s ON s.pc_id=p.id AND s.state <> 'DELETED'
+			GROUP BY d.id,d.name,d.device_type,d.trust_state,d.last_seen_at
+			ORDER BY d.last_seen_at DESC NULLS LAST,d.created_at DESC LIMIT 100`)
+		if err != nil {
+			return PortalAdminDashboard{}, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var item PortalConnection
+			if err := rows.Scan(&item.ID, &item.Name, &item.DeviceType, &item.TrustState, &item.LastSeenAt, &item.RunningSessions, &item.LastOutputSeq); err != nil {
+				return PortalAdminDashboard{}, err
+			}
+			result.Connections = append(result.Connections, item)
+		}
+		return result, rows.Err()
+	case "accounts":
+		rows, err := s.Pool.Query(ctx, `
+			SELECT u.id,u.role,u.status,u.created_at,count(d.id)
+			FROM users u LEFT JOIN devices d ON d.user_id=u.id
+			WHERE u.status <> 'DELETED'
+			GROUP BY u.id,u.role,u.status,u.created_at
+			ORDER BY CASE u.role WHEN 'SUPER_ADMIN' THEN 0 WHEN 'ADMIN' THEN 1 WHEN 'AUDITOR' THEN 2 ELSE 3 END,u.created_at,u.id
+			LIMIT 200`)
+		if err != nil {
+			return PortalAdminDashboard{}, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var item PortalAdminAccount
+			if err := rows.Scan(&item.ID, &item.Role, &item.Status, &item.CreatedAt, &item.Devices); err != nil {
+				return PortalAdminDashboard{}, err
+			}
+			item.Reference = "acct_" + item.ID.String()[:8]
+			result.Accounts = append(result.Accounts, item)
+		}
+		return result, rows.Err()
+	case "audit":
+		rows, err := s.Pool.Query(ctx, `
+			SELECT id,action,target_type,coalesce(target_id::text,''),result,trace_id,created_at
+			FROM audit_events ORDER BY id DESC LIMIT 100`)
+		if err != nil {
+			return PortalAdminDashboard{}, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var item PortalAuditEvent
+			if err := rows.Scan(&item.ID, &item.Action, &item.TargetType, &item.TargetID, &item.Result, &item.TraceID, &item.CreatedAt); err != nil {
+				return PortalAdminDashboard{}, err
+			}
+			result.AuditEvents = append(result.AuditEvents, item)
+		}
+		return result, rows.Err()
+	case "billing":
+		if err := s.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM plans),(SELECT count(*) FROM subscriptions WHERE status IN ('ACTIVE','GRACE'))`).
+			Scan(&result.Plans, &result.ActiveSubscriptions); err != nil {
+			return PortalAdminDashboard{}, err
+		}
+		return result, nil
+	case "deployment":
+		if err := s.Pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&result.SchemaVersion); err != nil {
+			return PortalAdminDashboard{}, err
+		}
+		return result, nil
+	default:
+		return result, nil
+	}
+}
+
 // SyncPortalIdentity creates the account record used by the browser portal.
 // A signed SUPER_ADMIN assertion can grant the role only while the database
-// has no active SUPER_ADMIN. Every later grant is an audited database action.
-func (s *Postgres) SyncPortalIdentity(ctx context.Context, subjectHash [32]byte, asserted Role, traceID string) (PortalAccount, error) {
-	if !asserted.Valid() {
-		asserted = RoleUser
+// has no active SUPER_ADMIN. A deployment-managed assertion may additionally
+// recover authority from one device-free bootstrap identity that no longer
+// matches the current IdP subject. Every grant or recovery is transactional
+// and audited; ordinary IdP role assertions never replace database authority.
+func (s *Postgres) SyncPortalIdentity(ctx context.Context, subjectHash [32]byte, assertion PortalIdentityAssertion, traceID string) (PortalAccount, error) {
+	if !assertion.Role.Valid() {
+		assertion.Role = RoleUser
 	}
 	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
@@ -140,17 +284,32 @@ func (s *Postgres) SyncPortalIdentity(ctx context.Context, subjectHash [32]byte,
 		}
 		return PortalAccount{}, ErrDenied
 	}
-	if asserted == RoleSuperAdmin && result.Role != RoleSuperAdmin {
-		var superAdmins int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM users WHERE role='SUPER_ADMIN' AND status='ACTIVE'`).Scan(&superAdmins); err != nil {
+	if assertion.Role == RoleSuperAdmin && result.Role != RoleSuperAdmin {
+		candidates, err := portalBootstrapCandidates(ctx, tx, userID)
+		if err != nil {
 			return PortalAccount{}, err
 		}
-		if superAdmins == 0 {
+		if len(candidates) == 0 {
 			result.Role = RoleSuperAdmin
 			if _, err := tx.Exec(ctx, `UPDATE users SET role='SUPER_ADMIN',is_admin=true,updated_at=now() WHERE id=$1`, userID); err != nil {
 				return PortalAccount{}, err
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO audit_events(user_id,action,target_type,target_id,result,trace_id,metadata) VALUES($1,'identity.bootstrap.super_admin','account',$1,'SUCCEEDED','identity-bootstrap',jsonb_build_object('role','SUPER_ADMIN'))`, userID); err != nil {
+				return PortalAccount{}, err
+			}
+		} else if previousID, ok := managedBootstrapRebindCandidate(assertion, candidates); ok {
+			if _, err := tx.Exec(ctx, `UPDATE users SET role='USER',is_admin=false,updated_at=now() WHERE id=$1`, previousID); err != nil {
+				return PortalAccount{}, err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE users SET role='SUPER_ADMIN',is_admin=true,updated_at=now() WHERE id=$1`, userID); err != nil {
+				return PortalAccount{}, err
+			}
+			result.Role = RoleSuperAdmin
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO audit_events(user_id,action,target_type,target_id,result,trace_id,metadata)
+				VALUES($1,'identity.bootstrap.super_admin.rebind','account',$2,'SUCCEEDED',$3,
+					jsonb_build_object('previous_role','SUPER_ADMIN','new_role','SUPER_ADMIN','previous_account_role','USER'))`,
+				userID, previousID, traceID); err != nil {
 				return PortalAccount{}, err
 			}
 		}
@@ -165,6 +324,52 @@ func (s *Postgres) SyncPortalIdentity(ctx context.Context, subjectHash [32]byte,
 		return PortalAccount{}, err
 	}
 	return result, nil
+}
+
+func portalBootstrapCandidates(ctx context.Context, tx pgx.Tx, currentID uuid.UUID) ([]portalBootstrapCandidate, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT u.id,
+			EXISTS (
+				SELECT 1 FROM audit_events bootstrap
+				WHERE bootstrap.user_id=u.id
+				  AND bootstrap.action IN ('identity.bootstrap.super_admin','identity.bootstrap.super_admin.rebind')
+				  AND bootstrap.result='SUCCEEDED'
+			) AND NOT EXISTS (
+				SELECT 1 FROM audit_events changed
+				WHERE changed.target_id=u.id AND changed.action='admin.account.role.update'
+			) AS bootstrap_managed,
+			(SELECT count(*) FROM devices d WHERE d.user_id=u.id) AS device_count
+		FROM users u
+		WHERE u.role='SUPER_ADMIN' AND u.status='ACTIVE' AND u.id<>$1
+		ORDER BY u.id
+		FOR UPDATE OF u`, currentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	candidates := make([]portalBootstrapCandidate, 0, 2)
+	for rows.Next() {
+		var candidate portalBootstrapCandidate
+		if err := rows.Scan(&candidate.ID, &candidate.BootstrapManaged, &candidate.DeviceCount); err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return candidates, nil
+}
+
+func managedBootstrapRebindCandidate(assertion PortalIdentityAssertion, candidates []portalBootstrapCandidate) (uuid.UUID, bool) {
+	if assertion.Role != RoleSuperAdmin || !assertion.BootstrapManaged || len(candidates) != 1 {
+		return uuid.Nil, false
+	}
+	candidate := candidates[0]
+	if candidate.ID == uuid.Nil || !candidate.BootstrapManaged || candidate.DeviceCount != 0 {
+		return uuid.Nil, false
+	}
+	return candidate.ID, true
 }
 
 // RecordPortalLoginFailure captures only a stable failure reason and trace ID.

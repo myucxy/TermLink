@@ -6,6 +6,7 @@ using System.IO.Pipes;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -26,6 +27,7 @@ namespace TermLink.Setup.Validation
             Directory.CreateDirectory(temporaryRoot);
             try
             {
+                ValidateBilingualSetupText();
                 ValidateArguments();
                 ValidateLegacyInstallOwnership(temporaryRoot);
                 ValidateCrossDirectoryUpgradeIsRejected(temporaryRoot);
@@ -45,6 +47,7 @@ namespace TermLink.Setup.Validation
                 ValidateFailedUpgradeRestoresPreviousRoot(temporaryRoot);
                 ValidateOldWindowsIsRejected();
                 ValidateMissingTerminalIsOptional(temporaryRoot);
+                ValidateTerminalIntegrationFailureIsPublicSafe(temporaryRoot);
                 ValidateArchitectureAndConPty();
                 ValidateCurrentMachineProbe();
                 ValidateStrictFragmentOwnership(temporaryRoot);
@@ -71,6 +74,68 @@ namespace TermLink.Setup.Validation
                     Directory.Delete(resolved, recursive: true);
                 }
             }
+        }
+
+        private static void ValidateBilingualSetupText()
+        {
+            var chineseUsage = WithUiCulture("zh-CN", () =>
+            {
+                Assert(SetupText.IsChinese, "Simplified Chinese UI culture was not recognized.");
+                return SetupArguments.Usage;
+            });
+            Assert(chineseUsage.Contains("打开安装向导", StringComparison.Ordinal) &&
+                chineseUsage.Contains("显示帮助", StringComparison.Ordinal),
+                "The Chinese Setup help text is incomplete.");
+
+            var englishUsage = WithUiCulture("en-US", () =>
+            {
+                Assert(!SetupText.IsChinese, "English UI culture was incorrectly treated as Chinese.");
+                return SetupArguments.Usage;
+            });
+            Assert(englishUsage.Contains("Open the setup wizard", StringComparison.Ordinal) &&
+                englishUsage.Contains("Show help", StringComparison.Ordinal),
+                "The English Setup help text is incomplete.");
+
+            var chineseError = WithUiCulture("zh-CN", () => AssertThrows<ArgumentException>(
+                () => SetupArguments.Parse(new[] { "--unknown" }),
+                "The Chinese invalid-argument path did not fail closed.").Message);
+            var englishError = WithUiCulture("en-US", () => AssertThrows<ArgumentException>(
+                () => SetupArguments.Parse(new[] { "--unknown" }),
+                "The English invalid-argument path did not fail closed.").Message);
+            Assert(chineseError.Contains("未知参数", StringComparison.Ordinal) &&
+                englishError.Contains("Unknown argument", StringComparison.Ordinal),
+                "Setup argument errors are not localized in both supported languages.");
+
+            const string privateDiagnostic = "C:\\Users\\private\\must-not-leak.txt: backend detail";
+            var chinesePublicError = WithUiCulture("zh-CN", () =>
+                SetupText.PublicError(new InvalidOperationException(privateDiagnostic)));
+            var englishPublicError = WithUiCulture("en-US", () =>
+                SetupText.PublicError(new InvalidOperationException(privateDiagnostic)));
+            Assert(chinesePublicError.Contains("安装操作失败", StringComparison.Ordinal) &&
+                englishPublicError.Contains("setup operation failed", StringComparison.OrdinalIgnoreCase),
+                "Generic Setup failures are not localized in both supported languages.");
+            Assert(!chinesePublicError.Contains(privateDiagnostic, StringComparison.Ordinal) &&
+                !englishPublicError.Contains(privateDiagnostic, StringComparison.Ordinal),
+                "Setup exposed a raw exception or private path to the user.");
+
+            var codedError = WithUiCulture("en-US", () =>
+                SetupText.PublicError(new InvalidOperationException("SETUP_INSTALL_FAILED")));
+            Assert(codedError.Contains("[SETUP_INSTALL_FAILED]", StringComparison.Ordinal),
+                "Setup discarded a safe stable error code.");
+
+            var fileError = WithUiCulture("zh-CN", () =>
+                SetupText.PublicError(new IOException(privateDiagnostic)));
+            Assert(fileError.Contains("文件操作失败", StringComparison.Ordinal) &&
+                !fileError.Contains(privateDiagnostic, StringComparison.Ordinal),
+                "Setup file errors are not safely localized.");
+
+            var chineseDiagnostic = WithUiCulture("zh-CN", SetupText.DiagnosticRecorded);
+            var englishDiagnostic = WithUiCulture("en-US", SetupText.DiagnosticRecorded);
+            Assert(chineseDiagnostic.Contains("诊断", StringComparison.Ordinal) &&
+                englishDiagnostic.Contains("diagnostics", StringComparison.OrdinalIgnoreCase) &&
+                !chineseDiagnostic.Contains("\\", StringComparison.Ordinal) &&
+                !englishDiagnostic.Contains("\\", StringComparison.Ordinal),
+                "Setup diagnostic guidance is not bilingual or exposes a filesystem path.");
         }
 
         private static void ValidateArguments()
@@ -165,20 +230,35 @@ namespace TermLink.Setup.Validation
                     "TermLink.SessionHost",
                     "C:\\TermLink\\TermLink.SessionHost.exe")
             };
-            var prompt = Installer.FormatUpgradeTerminationPrompt(
-                running,
-                Array.Empty<RunningTermLinkService>());
-            Assert(prompt.Contains("所有由 TermLink SessionHost 承载的命令行会话", StringComparison.Ordinal) &&
-                prompt.Contains("PID 2468", StringComparison.Ordinal) &&
-                prompt.Contains("关闭后的会话无法恢复", StringComparison.Ordinal) &&
-                prompt.Contains("all TermLink-hosted terminal sessions", StringComparison.Ordinal),
-                "The upgrade prompt does not explicitly disclose terminal-session termination in both languages.");
+            var chinesePrompt = WithUiCulture("zh-CN", () =>
+                Installer.FormatUpgradeTerminationPrompt(
+                    running,
+                    Array.Empty<RunningTermLinkService>()));
+            Assert(chinesePrompt.Contains("所有由 TermLink SessionHost 承载的命令行会话", StringComparison.Ordinal) &&
+                chinesePrompt.Contains("PID 2468", StringComparison.Ordinal) &&
+                chinesePrompt.Contains("关闭后的会话无法恢复", StringComparison.Ordinal),
+                "The Chinese upgrade prompt does not explicitly disclose terminal-session termination.");
 
-            var quietPrompt = Installer.FormatUpgradeTerminationPrompt(
-                Array.Empty<RunningTermLinkProcess>(),
-                Array.Empty<RunningTermLinkService>());
-            Assert(quietPrompt.Contains("提交安装前仍会再次检查", StringComparison.Ordinal),
-                "An idle upgrade no longer warns that a final process sweep will run before commit.");
+            var englishPrompt = WithUiCulture("en-US", () =>
+                Installer.FormatUpgradeTerminationPrompt(
+                    running,
+                    Array.Empty<RunningTermLinkService>()));
+            Assert(englishPrompt.Contains("all command-line sessions hosted by TermLink SessionHost", StringComparison.Ordinal) &&
+                englishPrompt.Contains("PID 2468", StringComparison.Ordinal) &&
+                englishPrompt.Contains("Closed sessions cannot be restored", StringComparison.Ordinal),
+                "The English upgrade prompt does not explicitly disclose terminal-session termination.");
+
+            var chineseQuietPrompt = WithUiCulture("zh-CN", () =>
+                Installer.FormatUpgradeTerminationPrompt(
+                    Array.Empty<RunningTermLinkProcess>(),
+                    Array.Empty<RunningTermLinkService>()));
+            var englishQuietPrompt = WithUiCulture("en-US", () =>
+                Installer.FormatUpgradeTerminationPrompt(
+                    Array.Empty<RunningTermLinkProcess>(),
+                    Array.Empty<RunningTermLinkService>()));
+            Assert(chineseQuietPrompt.Contains("提交安装前仍会再次检查", StringComparison.Ordinal) &&
+                englishQuietPrompt.Contains("check again before committing", StringComparison.Ordinal),
+                "An idle upgrade no longer warns in both languages that a final process sweep will run before commit.");
         }
 
         private static void ValidateCrossDirectoryUpgradeIsRejected(string temporaryRoot)
@@ -195,7 +275,7 @@ namespace TermLink.Setup.Validation
                 "A cross-directory upgrade was accepted.");
             Assert(error.Message.Contains(activeRoot, StringComparison.OrdinalIgnoreCase) &&
                 error.Message.Contains(requestedRoot, StringComparison.OrdinalIgnoreCase) &&
-                error.Message.Contains("先", StringComparison.Ordinal),
+                error.Message.Contains(SetupText.Pick("先", "first"), StringComparison.OrdinalIgnoreCase),
                 "The relocation rejection did not identify both roots or the uninstall-first action.");
             Assert(File.ReadAllBytes(sentinel).SequenceEqual(sentinelBytes),
                 "Rejecting a cross-directory upgrade changed the active installation.");
@@ -776,7 +856,9 @@ namespace TermLink.Setup.Validation
             Assert(result.Supported, "Missing Windows Terminal incorrectly blocked Agent installation.");
             Assert(!result.WindowsTerminalInstalled && result.Warnings.Count == 1,
                 "Missing Windows Terminal did not produce one explicit optional-frontend warning.");
-            Assert(result.Warnings[0].Contains("不会自动安装、替换或修改", StringComparison.Ordinal),
+            Assert(result.Warnings[0].Contains(
+                    SetupText.Pick("不会自动安装、替换或修改", "will not install, replace, or modify"),
+                    StringComparison.OrdinalIgnoreCase),
                 "Missing Terminal warning does not promise the non-replacement boundary.");
 
             var marker = new InstallMarker();
@@ -807,8 +889,35 @@ namespace TermLink.Setup.Validation
                             .Contains(expectedHost, StringComparison.OrdinalIgnoreCase)),
                     "The preconfigured fragment does not point every profile at the new SessionHost path.");
             }
-            Assert(outcome.TerminalMessage.Contains("没有安装、替换或修改 Terminal 本体", StringComparison.Ordinal),
+            Assert(outcome.TerminalMessage.Contains(
+                    SetupText.Pick("没有安装、替换或修改 Terminal 本体", "did not install, replace, or modify Windows Terminal itself"),
+                    StringComparison.OrdinalIgnoreCase),
                 "The no-Terminal outcome lost the non-replacement boundary.");
+        }
+
+        private static void ValidateTerminalIntegrationFailureIsPublicSafe(string temporaryRoot)
+        {
+            var installRoot = Path.Combine(temporaryRoot, "terminal-failure-install");
+            Directory.CreateDirectory(installRoot);
+            File.WriteAllBytes(Path.Combine(installRoot, "TermLink.SessionHost.exe"), new byte[] { 0x4d, 0x5a });
+            var privateFragmentPath = Path.Combine(
+                temporaryRoot, "private-user-path", "Fragments", "TermLink", "termlink.json");
+            Directory.CreateDirectory(privateFragmentPath);
+
+            var marker = new InstallMarker();
+            var outcome = WithUiCulture("en-US", () => Installer.ConfigureTerminalSafely(
+                installRoot,
+                marker,
+                previous: null,
+                windowsTerminalInstalled: true,
+                terminalFragmentPath: privateFragmentPath));
+
+            Assert(!outcome.TerminalConfigured &&
+                outcome.TerminalMessage.Contains("optional Windows Terminal profile", StringComparison.OrdinalIgnoreCase),
+                "An optional Terminal integration failure did not produce a public English explanation.");
+            Assert(!outcome.TerminalMessage.Contains(privateFragmentPath, StringComparison.OrdinalIgnoreCase) &&
+                !outcome.TerminalMessage.Contains("private-user-path", StringComparison.OrdinalIgnoreCase),
+                "The optional Terminal integration failure exposed a private path.");
         }
 
         private static void ValidateArchitectureAndConPty()
@@ -952,6 +1061,20 @@ namespace TermLink.Setup.Validation
             Assert(known.All(path => !File.Exists(path)), "An allowlisted runtime file survived purge.");
             Assert(File.Exists(unrelated),
                 "Runtime purge recursively removed a file outside the explicit allowlist.");
+        }
+
+        private static T WithUiCulture<T>(string cultureName, Func<T> action)
+        {
+            var previous = CultureInfo.CurrentUICulture;
+            try
+            {
+                CultureInfo.CurrentUICulture = CultureInfo.GetCultureInfo(cultureName);
+                return action();
+            }
+            finally
+            {
+                CultureInfo.CurrentUICulture = previous;
+            }
         }
 
         private static string Sha256(string path)

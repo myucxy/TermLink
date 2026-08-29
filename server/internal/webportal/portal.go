@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -19,25 +20,36 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/google/uuid"
+	"github.com/termlink/termlink/server/internal/accountdeletion"
+	"github.com/termlink/termlink/server/internal/adminroute"
 	"github.com/termlink/termlink/server/internal/auth"
+	"github.com/termlink/termlink/server/internal/buildinfo"
+	commercecontrol "github.com/termlink/termlink/server/internal/commerce"
+	"github.com/termlink/termlink/server/internal/serviceemail"
 	"github.com/termlink/termlink/server/internal/store"
 	"golang.org/x/oauth2"
 )
 
 const (
-	oauthCookieName     = "__Host-termlink-oauth"
-	sessionCookieName   = "__Host-termlink-session"
-	oauthStateTTL       = 10 * time.Minute
-	webSessionTTL       = 8 * time.Hour
-	sensitiveActionTTL  = 10 * time.Minute
-	maximumCookieSize   = 3800
-	recentAuditLimit    = 7
-	themeQueryParameter = "termlink_theme"
+	oauthCookieName         = "__Host-termlink-oauth"
+	legacySessionCookie     = "__Host-termlink-session"
+	sessionCookieName       = "__Host-termlink-session-v2"
+	sensitiveOIDCPurpose    = "sensitive-action"
+	sensitiveMethodMFA      = "mfa"
+	sensitiveMethodPassword = "password"
+	oauthStateTTL           = 10 * time.Minute
+	webSessionTTL           = 8 * time.Hour
+	recentLoginTTL          = 10 * time.Minute
+	sensitiveActionTTL      = 20 * time.Minute
+	maximumCookieSize       = 3800
+	recentAuditLimit        = 7
+	themeQueryParameter     = "termlink_theme"
 )
 
 //go:embed assets/*.html assets/*.css assets/*.js assets/*.svg
@@ -45,27 +57,85 @@ var portalAssets embed.FS
 
 // Config contains only the public OIDC metadata and the server-held cookie key.
 type Config struct {
-	PublicURL            string
-	Issuer               string
-	ClientID             string
-	RedirectURI          string
-	CookieKey            []byte
-	SubjectKey           []byte
-	Repository           portalRepository
-	AccountStatusChanged func(context.Context, uuid.UUID, string) error
-	Clock                func() time.Time
+	PublicURL                string
+	Issuer                   string
+	ClientID                 string
+	StepUpClientID           string
+	RedirectURI              string
+	CookieKey                []byte
+	SubjectKey               []byte
+	AppShipBaseURL           string
+	AppShipAllowedPrivateIPs string
+	AppShipHTTPClient        *http.Client
+	ReleaseSource            PublicReleaseSource
+	BuildInfo                buildinfo.Info
+	CommerceKey              []byte
+	Commerce                 commercePortalService
+	DataExportDownloader     PrivacyExportDownloader
+	AccountDeletionBinder    accountdeletion.RequestBinder
+	ServiceEmail             *serviceemail.Service
+	AdminRoutes              *adminroute.Service
+	IdentityProfiles         identityProfileService
+	IdentityMFAStatus        identityMFAStatusService
+	Reconciliation           ReconciliationOperations
+	Repository               portalRepository
+	AccountStatusChanged     func(context.Context, uuid.UUID, string) error
+	Clock                    func() time.Time
+}
+
+type commercePortalService interface {
+	CreateOrder(context.Context, commercecontrol.CreateOrderRequest) (store.Order, error)
+	StartPayment(context.Context, uuid.UUID, uuid.UUID) (commercecontrol.PaymentInstruction, error)
+	QueryAndFulfill(context.Context, uuid.UUID, uuid.UUID) (commercecontrol.PaymentOutcome, error)
+	ValidatePaymentChannelVersion(context.Context, store.PaymentChannel, store.PaymentChannelVersion) error
+	ProbePaymentChannelVersion(context.Context, store.PaymentChannel, store.PaymentChannelVersion) error
+	CreateRefund(context.Context, commercecontrol.CreateRefundRequest) (commercecontrol.RefundOutcome, error)
+	ConfirmRefund(context.Context, commercecontrol.ConfirmRefundRequest) (commercecontrol.RefundOutcome, error)
+}
+
+type identityProfileService interface {
+	UpdateNickname(context.Context, string, string) error
+	UpdateVerifiedEmail(context.Context, string, string) error
+}
+
+type identityMFAStatusService interface {
+	HasConfiguredOTP(context.Context, string) (bool, error)
 }
 
 type accountIdentity struct {
-	Subject  string
-	Username string
-	Name     string
-	Email    string
-	Roles    []string
+	Subject          string
+	Username         string
+	Nickname         string
+	Name             string
+	Email            string
+	Roles            []string
+	BootstrapManaged bool
+	AuthenticatedAt  time.Time
+	MFA              bool
+	Password         bool
+	ACR              string
+}
+
+type oidcPortalClaims struct {
+	Subject           string   `json:"sub"`
+	Nonce             string   `json:"nonce"`
+	PreferredUsername string   `json:"preferred_username"`
+	Nickname          string   `json:"nickname"`
+	Name              string   `json:"name"`
+	Email             string   `json:"email"`
+	AuthenticatedAt   int64    `json:"auth_time"`
+	AMR               []string `json:"amr"`
+	ACR               string   `json:"acr"`
+	RealmAccess       struct {
+		Roles []string `json:"roles"`
+	} `json:"realm_access"`
+	ResourceAccess map[string]struct {
+		Roles []string `json:"roles"`
+	} `json:"resource_access"`
 }
 
 type portalRepository interface {
-	SyncPortalIdentity(context.Context, [32]byte, store.Role, string) (store.PortalAccount, error)
+	SyncPortalIdentity(context.Context, [32]byte, store.PortalIdentityAssertion, string) (store.PortalAccount, error)
 	RecordPortalLoginFailure(context.Context, string, string) error
 	GetPortalAccount(context.Context, [32]byte) (store.PortalAccount, error)
 	PortalAdminDashboard(context.Context, uuid.UUID) (store.PortalAdminDashboard, error)
@@ -73,9 +143,20 @@ type portalRepository interface {
 	UpdatePortalAccountStatus(context.Context, uuid.UUID, uuid.UUID, string, string) error
 }
 
+type registrationPortalRepository interface {
+	GetRegistrationPolicy(context.Context) (store.RegistrationPolicy, error)
+	ConfirmPendingInvitationForEmail(context.Context, uuid.UUID, [32]byte) (store.Entitlement, error)
+}
+
+type sectionPortalRepository interface {
+	PortalAdminSection(context.Context, uuid.UUID, string) (store.PortalAdminDashboard, error)
+}
+
 type oidcFlow interface {
 	AuthorizationURL(state, nonce, challenge, theme string) string
+	StepUpAuthorizationURL(state, nonce, challenge, theme, method string) string
 	ExchangeAndVerify(context.Context, string, string, string) (accountIdentity, error)
+	ExchangeStepUpAndVerify(context.Context, string, string, string, string) (accountIdentity, error)
 	LogoutURL() string
 	AccountURL() string
 }
@@ -86,18 +167,24 @@ type oauthState struct {
 	Verifier   string `json:"verifier"`
 	ReturnTo   string `json:"return_to"`
 	Theme      string `json:"theme,omitempty"`
+	Purpose    string `json:"purpose,omitempty"`
+	Method     string `json:"method,omitempty"`
 	IssuedAtMS int64  `json:"issued_at_ms"`
 }
 
 type webSession struct {
-	Subject           string `json:"subject"`
-	Username          string `json:"username"`
-	Name              string `json:"name"`
-	Email             string `json:"email"`
-	Role              string `json:"role"`
-	CSRF              string `json:"csrf"`
-	AuthenticatedAtMS int64  `json:"authenticated_at_ms"`
-	ExpiresAtMS       int64  `json:"expires_at_ms"`
+	Subject               string `json:"subject"`
+	Username              string `json:"username"`
+	Nickname              string `json:"nickname,omitempty"`
+	Name                  string `json:"name"`
+	Email                 string `json:"email"`
+	Role                  string `json:"role"`
+	CSRF                  string `json:"csrf"`
+	AuthenticatedAtMS     int64  `json:"authenticated_at_ms"`
+	MFA                   bool   `json:"mfa"`
+	SensitiveVerifiedAtMS int64  `json:"sensitive_verified_at_ms,omitempty"`
+	SensitiveMethod       string `json:"sensitive_method,omitempty"`
+	ExpiresAtMS           int64  `json:"expires_at_ms"`
 }
 
 type cookieCodec struct {
@@ -107,24 +194,32 @@ type cookieCodec struct {
 
 // Portal is the production web handler.
 type Portal struct {
-	config       Config
-	publicOrigin *url.URL
-	identityURL  string
-	flow         oidcFlow
-	oauthCodec   cookieCodec
-	sessionCodec cookieCodec
-	templates    *template.Template
-	styles       []byte
-	adminStyles  []byte
-	themeInit    []byte
-	themeScript  []byte
-	appIcon      []byte
-	favicon      []byte
+	config         Config
+	publicOrigin   *url.URL
+	identityURL    string
+	flow           oidcFlow
+	oauthCodec     cookieCodec
+	sessionCodec   cookieCodec
+	templates      *template.Template
+	styles         []byte
+	adminStyles    []byte
+	commerceStyles []byte
+	publicStyles   []byte
+	themeInit      []byte
+	themeScript    []byte
+	registerScript []byte
+	appIcon        []byte
+	favicon        []byte
+	releaseSource  PublicReleaseSource
+	releaseCache   *publicReleaseCache
+	systemVersions *SystemVersionsService
 }
 
 type productionOIDCFlow struct {
 	oauthConfig        oauth2.Config
 	verifier           *oidc.IDTokenVerifier
+	stepUpOAuthConfig  oauth2.Config
+	stepUpVerifier     *oidc.IDTokenVerifier
 	issuer             string
 	clientID           string
 	publicURL          string
@@ -133,15 +228,22 @@ type productionOIDCFlow struct {
 }
 
 type homePageData struct {
-	SignedIn   bool
-	Username   string
-	LoginURL   string
-	AccountURL string
-	ConsoleURL string
+	LoginURL         string
+	RegisterURL      string
+	RegistrationOpen bool
+}
+
+type registerPageData struct {
+	Mode                      string
+	RegistrationOpen          bool
+	InvitationRequired        bool
+	EmailVerificationRequired bool
 }
 
 type accountPageData struct {
+	AccountID          uuid.UUID
 	Username           string
+	Nickname           string
 	Name               string
 	Email              string
 	IdentityAccountURL string
@@ -153,30 +255,44 @@ type accountPageData struct {
 }
 
 type adminPageData struct {
-	Username           string
-	Role               store.Role
-	RoleLabel          string
-	CSRF               string
-	Section            string
-	SectionTitle       string
-	CanManageAccounts  bool
-	Dashboard          store.PortalAdminDashboard
-	RecentAuditEvents  []store.PortalAuditEvent
-	IdentityAccountURL string
-	PublicURL          string
-	Issuer             string
-	Notice             string
+	Username               string
+	Role                   store.Role
+	RoleLabel              string
+	CSRF                   string
+	Section                string
+	SectionTitle           string
+	CanManageAccounts      bool
+	Dashboard              store.PortalAdminDashboard
+	RecentAuditEvents      []store.PortalAuditEvent
+	IdentityAccountURL     string
+	PublicURL              string
+	Issuer                 string
+	Notice                 string
+	ActionNonce            string
+	SystemVersions         SystemVersions
+	Announcements          []store.WebAnnouncement
+	CanManageAnnouncements bool
+	ServiceEmail           serviceemail.AdminView
+	AdminRoute             adminroute.View
+	CanConfigureSystem     bool
+	CommerceNavigation     bool
 }
 
 type errorPageData struct {
-	Title   string
-	Message string
+	Title          string
+	Message        string
+	EnglishTitle   string
+	EnglishMessage string
+	Reference      string
 }
 
 // New discovers the configured OIDC issuer and constructs the public portal.
 func New(ctx context.Context, config Config) (*Portal, error) {
 	if ctx == nil {
 		return nil, errors.New("web portal context is required")
+	}
+	if strings.TrimSpace(config.StepUpClientID) == "" {
+		config.StepUpClientID = strings.TrimSpace(config.ClientID) + "-step-up"
 	}
 	publicOrigin, err := validateConfig(config)
 	if err != nil {
@@ -204,12 +320,26 @@ func New(ctx context.Context, config Config) (*Portal, error) {
 			RedirectURL: config.RedirectURI,
 			Scopes:      []string{oidc.ScopeOpenID, "profile", "email"},
 		},
-		verifier:           provider.Verifier(&oidc.Config{ClientID: config.ClientID}),
+		verifier: provider.Verifier(&oidc.Config{ClientID: config.ClientID}),
+		stepUpOAuthConfig: oauth2.Config{
+			ClientID: config.StepUpClientID, Endpoint: provider.Endpoint(), RedirectURL: config.RedirectURI,
+			Scopes: []string{oidc.ScopeOpenID, "profile", "email"},
+		},
+		stepUpVerifier:     provider.Verifier(&oidc.Config{ClientID: config.StepUpClientID}),
 		issuer:             strings.TrimRight(config.Issuer, "/"),
 		clientID:           config.ClientID,
 		publicURL:          strings.TrimRight(config.PublicURL, "/"),
 		accountURL:         accountURL,
 		endSessionEndpoint: discovery.EndSessionEndpoint,
+	}
+	if config.ReleaseSource == nil {
+		releaseSource, sourceErr := NewAppShipPublicReleaseSourceWithAllowedPrivateIPs(
+			config.AppShipBaseURL, config.AppShipHTTPClient, config.AppShipAllowedPrivateIPs,
+		)
+		if sourceErr != nil {
+			return nil, fmt.Errorf("configure public AppShip release source: %w", sourceErr)
+		}
+		config.ReleaseSource = releaseSource
 	}
 	return newPortal(config, publicOrigin, flow)
 }
@@ -220,11 +350,24 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 		return nil, err
 	}
 	parsed, err := template.New("portal").Funcs(template.FuncMap{
-		"formatTime":         formatPortalTime,
-		"formatOptionalTime": formatOptionalPortalTime,
-		"shortID":            shortID,
-		"roleLabel":          roleLabel,
-		"statusLabel":        statusLabel,
+		"formatTime":                       formatPortalTime,
+		"formatOptionalTime":               formatOptionalPortalTime,
+		"shortID":                          shortID,
+		"roleLabel":                        roleLabel,
+		"statusLabel":                      statusLabel,
+		"formatMoney":                      formatCommerceMoney,
+		"commerceStatusLabel":              commerceStatusLabel,
+		"commerceConsistencyCategoryLabel": commerceConsistencyCategoryLabel,
+		"commerceConsistencyActionLabel":   commerceConsistencyActionLabel,
+		"commerceQuotaLabel":               commerceQuotaLabel,
+		"formatOptionalCommerceTime":       formatOptionalCommerceTime,
+		"userPortalControlModeLabel":       userPortalControlModeLabel,
+		"userPortalDeletionCanConfirm":     userPortalDeletionCanConfirm,
+		"userPortalDeletionCanCancel":      userPortalDeletionCanCancel,
+		"actionKey":                        sensitiveActionKey,
+		"formatAnnouncementTimeInput":      formatAnnouncementTimeInput,
+		"announcementSeverityLabel":        announcementSeverityLabel,
+		"announcementStatusLabel":          announcementStatusLabel,
 	}).ParseFS(portalAssets, "assets/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("parse web portal templates: %w", err)
@@ -237,6 +380,14 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 	if err != nil {
 		return nil, fmt.Errorf("read web portal admin styles: %w", err)
 	}
+	commerceStyles, err := portalAssets.ReadFile("assets/commerce-portal.css")
+	if err != nil {
+		return nil, fmt.Errorf("read web portal commerce styles: %w", err)
+	}
+	publicStyles, err := portalAssets.ReadFile("assets/public-pages.css")
+	if err != nil {
+		return nil, fmt.Errorf("read web portal public page styles: %w", err)
+	}
 	themeInit, err := portalAssets.ReadFile("assets/theme-init.js")
 	if err != nil {
 		return nil, fmt.Errorf("read web portal pre-paint theme script: %w", err)
@@ -244,6 +395,10 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 	themeScript, err := portalAssets.ReadFile("assets/theme.js")
 	if err != nil {
 		return nil, fmt.Errorf("read web portal theme script: %w", err)
+	}
+	registerScript, err := portalAssets.ReadFile("assets/register.js")
+	if err != nil {
+		return nil, fmt.Errorf("read web portal registration script: %w", err)
 	}
 	appIcon, err := portalAssets.ReadFile("assets/termlink-app-icon.svg")
 	if err != nil {
@@ -265,19 +420,27 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 		config.Clock = time.Now
 	}
 	return &Portal{
-		config:       config,
-		publicOrigin: publicOrigin,
-		identityURL:  identityURL,
-		flow:         flow,
-		oauthCodec:   oauthCodec,
-		sessionCodec: sessionCodec,
-		templates:    parsed,
-		styles:       styles,
-		adminStyles:  adminStyles,
-		themeInit:    themeInit,
-		themeScript:  themeScript,
-		appIcon:      appIcon,
-		favicon:      favicon,
+		config:         config,
+		publicOrigin:   publicOrigin,
+		identityURL:    identityURL,
+		flow:           flow,
+		oauthCodec:     oauthCodec,
+		sessionCodec:   sessionCodec,
+		templates:      parsed,
+		styles:         styles,
+		adminStyles:    adminStyles,
+		commerceStyles: commerceStyles,
+		publicStyles:   publicStyles,
+		themeInit:      themeInit,
+		themeScript:    themeScript,
+		registerScript: registerScript,
+		appIcon:        appIcon,
+		favicon:        favicon,
+		releaseSource:  config.ReleaseSource,
+		releaseCache:   newPublicReleaseCache(publicReleaseCacheTTL, config.Clock),
+		systemVersions: NewSystemVersionsService(SystemVersionsOptions{
+			Server: config.BuildInfo, ReleaseSource: config.ReleaseSource, Clock: config.Clock,
+		}),
 	}, nil
 }
 
@@ -299,6 +462,12 @@ func validateConfig(config Config) (*url.URL, error) {
 	}
 	if strings.TrimSpace(config.ClientID) == "" {
 		return nil, errors.New("web portal OIDC client ID is required")
+	}
+	if strings.TrimSpace(config.StepUpClientID) == "" {
+		config.StepUpClientID = strings.TrimSpace(config.ClientID) + "-step-up"
+	}
+	if config.ClientID == config.StepUpClientID {
+		return nil, errors.New("web portal MFA step-up OIDC client ID must be distinct")
 	}
 	if len(config.CookieKey) < 32 {
 		return nil, errors.New("web portal cookie key must contain at least 32 bytes")
@@ -376,34 +545,129 @@ func (p *Portal) Handler() http.Handler {
 	mux.HandleFunc("GET /{$}", p.home)
 	mux.HandleFunc("GET /assets/site.css", p.siteCSS)
 	mux.HandleFunc("GET /assets/admin.css", p.adminCSS)
+	mux.HandleFunc("GET /assets/commerce-portal.css", p.commerceCSS)
+	mux.HandleFunc("GET /assets/public-pages.css", p.publicCSS)
 	mux.HandleFunc("GET /assets/theme-init.js", p.themeInitJS)
 	mux.HandleFunc("GET /assets/theme.js", p.themeJS)
+	mux.HandleFunc("GET /assets/register.js", p.registerJS)
 	mux.HandleFunc("GET /assets/termlink-app-icon.svg", p.svgAsset(p.appIcon))
 	mux.HandleFunc("GET /assets/termlink-favicon.svg", p.svgAsset(p.favicon))
 	mux.HandleFunc("GET /login", p.login)
+	mux.HandleFunc("GET /register", p.registerPage)
+	mux.HandleFunc("GET /downloads", p.publicDownloads)
+	mux.HandleFunc("GET /releases", p.publicReleases)
+	mux.HandleFunc("GET /plans", p.publicPlans)
+	mux.HandleFunc("GET /security", p.publicSecurity)
+	mux.HandleFunc("GET /status", p.publicStatus)
 	mux.HandleFunc("GET /auth/callback", p.callback)
+	mux.HandleFunc("GET /auth/step-up", p.sensitiveStepUp)
+	mux.HandleFunc("GET /auth/step-up/status", p.sensitiveStepUpStatus)
+	mux.HandleFunc("GET /auth/step-up/result", p.sensitiveStepUpResult)
 	mux.HandleFunc("GET /account", p.account)
+	mux.HandleFunc("POST /account/redemptions/preview", p.commercePreviewRedemption)
+	mux.HandleFunc("POST /account/redemptions", p.commerceClaimRedemption)
+	mux.HandleFunc("POST /account/orders", p.commerceCreateOrder)
+	mux.HandleFunc("POST /account/orders/{id}/pay", p.commerceStartPayment)
+	mux.HandleFunc("POST /account/orders/{id}/query", p.commerceQueryPayment)
+	mux.HandleFunc("POST /account/orders/{id}/cancel", p.commerceCancelOrder)
+	mux.HandleFunc("POST /account/devices/{id}/revoke", p.strongAccountAction("user.device.revoke", p.userPortalRevokeDevice))
+	mux.HandleFunc("POST /account/pcs/{id}/control-policy", p.strongAccountAction("user.pc.control_policy.update", p.userPortalUpdatePCControlPolicy))
+	mux.HandleFunc("POST /account/sessions/{id}/history/delete", p.strongAccountAction("user.session_history.delete", p.userPortalDeleteSessionHistory))
+	mux.HandleFunc("POST /account/privacy/exports", p.strongAccountAction("user.data_export.request", p.userPortalRequestDataExport))
+	mux.HandleFunc("POST /account/privacy/exports/{id}/download", p.sensitiveAction("user.data_export.download", p.userPortalDownloadDataExport))
+	mux.HandleFunc("POST /account/privacy/deletions", p.strongAccountAction("user.account_deletion.request", p.userPortalRequestAccountDeletion))
+	mux.HandleFunc("POST /account/privacy/deletions/{id}/confirm", p.strongAccountAction("user.account_deletion.confirm", p.userPortalConfirmAccountDeletion))
+	mux.HandleFunc("POST /account/privacy/deletions/{id}/cancel", p.strongAccountAction("user.account_deletion.cancel", p.userPortalCancelAccountDeletion))
+	mux.HandleFunc("POST /account/profile/nickname", p.accountUpdateNickname)
+	mux.HandleFunc("POST /account/profile/email-code", p.accountRequestEmailCode)
+	mux.HandleFunc("POST /account/profile/email", p.accountConfirmEmail)
+	mux.HandleFunc("GET /commerce", p.legacyCommerce)
+	mux.HandleFunc("POST /commerce/redemptions/preview", p.commercePreviewRedemption)
+	mux.HandleFunc("POST /commerce/redemptions", p.commerceClaimRedemption)
+	mux.HandleFunc("POST /commerce/orders", p.commerceCreateOrder)
+	mux.HandleFunc("POST /commerce/orders/{id}/pay", p.commerceStartPayment)
+	mux.HandleFunc("POST /commerce/orders/{id}/query", p.commerceQueryPayment)
+	mux.HandleFunc("POST /commerce/orders/{id}/cancel", p.commerceCancelOrder)
+	mux.HandleFunc("POST /commerce/devices/{id}/revoke", p.strongAccountAction("user.device.revoke", p.userPortalRevokeDevice))
+	mux.HandleFunc("POST /commerce/pcs/{id}/control-policy", p.strongAccountAction("user.pc.control_policy.update", p.userPortalUpdatePCControlPolicy))
+	mux.HandleFunc("POST /commerce/sessions/{id}/history/delete", p.strongAccountAction("user.session_history.delete", p.userPortalDeleteSessionHistory))
+	mux.HandleFunc("POST /commerce/privacy/exports", p.strongAccountAction("user.data_export.request", p.userPortalRequestDataExport))
+	mux.HandleFunc("POST /commerce/privacy/exports/{id}/download", p.sensitiveAction("user.data_export.download", p.userPortalDownloadDataExport))
+	mux.HandleFunc("POST /commerce/privacy/deletions", p.strongAccountAction("user.account_deletion.request", p.userPortalRequestAccountDeletion))
+	mux.HandleFunc("POST /commerce/privacy/deletions/{id}/confirm", p.strongAccountAction("user.account_deletion.confirm", p.userPortalConfirmAccountDeletion))
+	mux.HandleFunc("POST /commerce/privacy/deletions/{id}/cancel", p.strongAccountAction("user.account_deletion.cancel", p.userPortalCancelAccountDeletion))
 	mux.HandleFunc("GET /account/identity", p.identity)
+	mux.HandleFunc("GET /account/identity/{action}", p.identity)
 	mux.HandleFunc("GET /admin", p.admin)
-	mux.HandleFunc("POST /admin/accounts/{id}/role", p.adminUpdateRole)
-	mux.HandleFunc("POST /admin/accounts/{id}/status", p.adminUpdateStatus)
+	mux.HandleFunc("GET /admin/commerce", p.adminCommerceDashboard)
+	mux.HandleFunc("POST /admin/commerce/orders/export.csv", p.sensitiveAction("commerce.orders.export", p.adminCommerceExportOrders))
+	mux.HandleFunc("POST /admin/commerce/orders/{id}/query", p.sensitiveAction("commerce.order.query", p.adminCommerceQueryOrder))
+	mux.HandleFunc("POST /admin/commerce/orders/{id}/retry-fulfillment", p.sensitiveAction("commerce.order.fulfillment.retry", p.adminCommerceRetryOrderFulfillment))
+	mux.HandleFunc("POST /admin/commerce/catalog/plans", p.sensitiveAction("commerce.catalog.plan.create", p.adminCommerceCreatePlanDraft))
+	mux.HandleFunc("POST /admin/commerce/catalog/plans/{id}", p.sensitiveAction("commerce.catalog.plan.update", p.adminCommerceUpdatePlanDraft))
+	mux.HandleFunc("POST /admin/commerce/catalog/publish", p.sensitiveAction("commerce.catalog.publish", p.adminCommercePublishCatalog))
+	mux.HandleFunc("POST /admin/commerce/manual-entitlements", p.sensitiveAction("commerce.manual_entitlement.create", p.adminCommerceCreateManualEntitlement))
+	mux.HandleFunc("POST /admin/commerce/manual-entitlements/{id}/revoke", p.sensitiveAction("commerce.manual_entitlement.revoke", p.adminCommerceRevokeManualEntitlement))
+	mux.HandleFunc("POST /admin/commerce/registration-policy", p.sensitiveAction("commerce.registration_policy.update", p.adminCommerceRegistrationPolicy))
+	mux.HandleFunc("POST /admin/commerce/invitations/batches", p.sensitiveAction("commerce.invitation_batch.create", p.adminCommerceCreateInvitationBatch))
+	mux.HandleFunc("POST /admin/commerce/invitations/batches/{id}/codes", p.sensitiveAction("commerce.invitation_codes.generate", p.adminCommerceGenerateInvitationCodes))
+	mux.HandleFunc("POST /admin/commerce/invitations/batches/{id}/status", p.sensitiveAction("commerce.invitation_batch.status", p.adminCommerceInvitationBatchStatus))
+	mux.HandleFunc("POST /admin/commerce/invitations/codes/{id}/status", p.sensitiveAction("commerce.invitation_code.status", p.adminCommerceInvitationCodeStatus))
+	mux.HandleFunc("POST /admin/commerce/redemptions/batches", p.sensitiveAction("commerce.redemption_batch.create", p.adminCommerceCreateRedemptionBatch))
+	mux.HandleFunc("POST /admin/commerce/redemptions/batches/{id}/codes", p.sensitiveAction("commerce.redemption_codes.generate", p.adminCommerceGenerateRedemptionCodes))
+	mux.HandleFunc("POST /admin/commerce/redemptions/batches/{id}/status", p.sensitiveAction("commerce.redemption_batch.status", p.adminCommerceRedemptionBatchStatus))
+	mux.HandleFunc("POST /admin/commerce/redemptions/codes/{id}/status", p.sensitiveAction("commerce.redemption_code.status", p.adminCommerceRedemptionCodeStatus))
+	mux.HandleFunc("POST /admin/commerce/refunds", p.sensitiveAction("commerce.refund.create", p.adminCommerceCreateRefund))
+	mux.HandleFunc("POST /admin/commerce/refunds/{id}/confirm", p.sensitiveAction("commerce.refund.confirm", p.adminCommerceConfirmRefund))
+	mux.HandleFunc("POST /admin/commerce/orders/{id}/close", p.sensitiveAction("commerce.order.close", p.adminCommerceCloseOrder))
+	mux.HandleFunc("POST /admin/commerce/reconciliation", p.sensitiveAction("commerce.reconciliation.create", p.adminCommerceCreateReconciliation))
+	mux.HandleFunc("POST /admin/commerce/reconciliation/discrepancies/{id}/transition", p.strongConsoleAction("commerce.reconciliation.discrepancy.transition", p.adminReconciliationTransition))
+	mux.HandleFunc("POST /admin/commerce/payment-channels", p.sensitiveAction("commerce.payment_channel.ensure", p.adminCommerceEnsurePaymentChannel))
+	mux.HandleFunc("POST /admin/commerce/payment-channels/{id}/versions", p.sensitiveAction("commerce.payment_version.create", p.adminCommerceCreatePaymentVersion))
+	mux.HandleFunc("POST /admin/commerce/payment-channels/{id}/activate", p.sensitiveAction("commerce.payment_version.activate", p.adminCommerceActivatePaymentVersion))
+	mux.HandleFunc("POST /admin/commerce/payment-channels/{id}/disable", p.sensitiveAction("commerce.payment_channel.disable", p.adminCommerceDisablePaymentChannel))
+	mux.HandleFunc("POST /admin/accounts/{id}/role", p.sensitiveAction("admin.account.role.update", p.adminUpdateRole))
+	mux.HandleFunc("POST /admin/accounts/{id}/status", p.sensitiveAction("admin.account.status.update", p.adminUpdateStatus))
+	mux.HandleFunc("POST /admin/announcements", p.sensitiveAction("announcement.create", p.adminCreateAnnouncement))
+	mux.HandleFunc("POST /admin/announcements/{id}", p.sensitiveAction("announcement.update", p.adminUpdateAnnouncement))
+	mux.HandleFunc("POST /admin/announcements/{id}/transition", p.sensitiveAction("announcement.transition", p.adminTransitionAnnouncement))
+	mux.HandleFunc("POST /admin/settings/service-email", p.sensitiveAction("admin.service_email.update", p.adminUpdateServiceEmail))
+	mux.HandleFunc("POST /admin/settings/admin-route", p.sensitiveAction("admin.route.update", p.adminUpdateRoute))
 	mux.HandleFunc("POST /logout", p.logout)
 	mux.HandleFunc("/", p.notFound)
-	return p.securityHeaders(mux)
+	return p.securityHeaders(p.routeAdminRequests(mux))
 }
 
 func (p *Portal) home(w http.ResponseWriter, r *http.Request) {
-	data := homePageData{LoginURL: "/login", AccountURL: "/account"}
+	data := homePageData{LoginURL: "/login", RegisterURL: "/register"}
+	if repository, ok := p.config.Repository.(registrationPortalRepository); ok {
+		if policy, err := repository.GetRegistrationPolicy(r.Context()); err == nil {
+			data.RegistrationOpen = policy.Mode != store.RegistrationClosed
+		}
+	}
 	if session, err := p.readSession(r); err == nil {
-		if account, accountErr := p.currentAccount(r.Context(), session); accountErr == nil {
-			data.SignedIn = true
-			data.Username = session.Username
-			if account.Role.CanOpenConsole() {
-				data.ConsoleURL = "/admin"
-			}
+		if _, accountErr := p.currentAccount(r.Context(), session); accountErr == nil {
+			http.Redirect(w, r, "/account", http.StatusSeeOther)
+			return
 		}
 	}
 	p.render(w, http.StatusOK, "home.html", data)
+}
+
+// legacyCommerce keeps old bookmarks valid for one compatibility cycle while
+// ensuring users never remain on an implementation-named portal URL.
+func (p *Portal) legacyCommerce(w http.ResponseWriter, r *http.Request) {
+	query := url.Values{}
+	for _, name := range []string{"section", "notice", "export_id", "deletion_id"} {
+		if value := strings.TrimSpace(r.URL.Query().Get(name)); value != "" {
+			query.Set(name, value)
+		}
+	}
+	target := "/account"
+	if encoded := query.Encode(); encoded != "" {
+		target += "?" + encoded
+	}
+	http.Redirect(w, r, target, http.StatusPermanentRedirect)
 }
 
 func (p *Portal) siteCSS(w http.ResponseWriter, _ *http.Request) {
@@ -414,12 +678,60 @@ func (p *Portal) adminCSS(w http.ResponseWriter, _ *http.Request) {
 	p.staticAsset(w, "text/css; charset=utf-8", p.adminStyles)
 }
 
+func (p *Portal) commerceCSS(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	_, _ = w.Write(p.commerceStyles)
+}
+
+func (p *Portal) publicCSS(w http.ResponseWriter, _ *http.Request) {
+	p.staticAsset(w, "text/css; charset=utf-8", p.publicStyles)
+}
+
 func (p *Portal) themeJS(w http.ResponseWriter, _ *http.Request) {
 	p.staticAsset(w, "text/javascript; charset=utf-8", p.themeScript)
 }
 
 func (p *Portal) themeInitJS(w http.ResponseWriter, _ *http.Request) {
 	p.staticAsset(w, "text/javascript; charset=utf-8", p.themeInit)
+}
+
+func (p *Portal) registerJS(w http.ResponseWriter, _ *http.Request) {
+	p.staticAsset(w, "text/javascript; charset=utf-8", p.registerScript)
+}
+
+func (p *Portal) registerPage(w http.ResponseWriter, r *http.Request) {
+	if !p.usesPublicHost(r) {
+		http.Redirect(w, r, strings.TrimRight(p.config.PublicURL, "/")+"/register", http.StatusSeeOther)
+		return
+	}
+	repository, ok := p.config.Repository.(registrationPortalRepository)
+	if !ok {
+		p.renderError(w, http.StatusServiceUnavailable, "注册暂不可用", "服务端尚未启用注册策略。")
+		return
+	}
+	policy, err := repository.GetRegistrationPolicy(r.Context())
+	if err != nil {
+		p.internalError(w, err)
+		return
+	}
+	emailVerificationRequired := false
+	if p.config.ServiceEmail != nil {
+		emailVerificationRequired, err = p.config.ServiceEmail.RegistrationVerificationPolicy(r.Context())
+		if err != nil {
+			p.renderError(w, http.StatusServiceUnavailable, "注册邮箱验证暂不可用", "服务端暂时无法读取邮箱验证策略，请稍后重试。")
+			return
+		}
+		if emailVerificationRequired && !p.config.ServiceEmail.Runtime(r.Context()).ServiceAvailable {
+			p.renderError(w, http.StatusServiceUnavailable, "注册邮箱验证暂不可用", "当前注册必须验证邮箱，但邮件服务暂时不可用；系统不会绕过验证创建账号。")
+			return
+		}
+	}
+	p.render(w, http.StatusOK, "register.html", registerPageData{
+		Mode: policy.Mode, RegistrationOpen: policy.Mode != store.RegistrationClosed,
+		InvitationRequired:        policy.Mode == store.RegistrationInviteRequired,
+		EmailVerificationRequired: emailVerificationRequired,
+	})
 }
 
 func (p *Portal) staticAsset(w http.ResponseWriter, contentType string, contents []byte) {
@@ -454,6 +766,10 @@ func (p *Portal) login(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, target, http.StatusSeeOther)
 		return
 	}
+	p.beginOIDC(w, r, normalizePortalReturnTo(r.URL.Query().Get("return_to")), normalizeTheme(r.URL.Query().Get(themeQueryParameter)), "", "")
+}
+
+func (p *Portal) beginOIDC(w http.ResponseWriter, r *http.Request, returnTo, theme, purpose, method string) {
 	state, err := randomText(32)
 	if err != nil {
 		p.internalError(w, err)
@@ -470,14 +786,14 @@ func (p *Portal) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	challenge := sha256.Sum256([]byte(verifier))
-	returnTo := normalizePortalReturnTo(r.URL.Query().Get("return_to"))
-	theme := normalizeTheme(r.URL.Query().Get(themeQueryParameter))
 	stateCookie, err := p.oauthCodec.seal(oauthState{
 		State:      state,
 		Nonce:      nonce,
 		Verifier:   verifier,
 		ReturnTo:   returnTo,
 		Theme:      theme,
+		Purpose:    purpose,
+		Method:     method,
 		IssuedAtMS: p.now().UnixMilli(),
 	})
 	if err != nil {
@@ -486,6 +802,9 @@ func (p *Portal) login(w http.ResponseWriter, r *http.Request) {
 	}
 	p.setCookie(w, oauthCookieName, stateCookie, p.now().Add(oauthStateTTL))
 	location := p.flow.AuthorizationURL(state, nonce, base64.RawURLEncoding.EncodeToString(challenge[:]), theme)
+	if purpose == sensitiveOIDCPurpose {
+		location = p.flow.StepUpAuthorizationURL(state, nonce, base64.RawURLEncoding.EncodeToString(challenge[:]), theme, method)
+	}
 	clear(challenge[:])
 	w.Header().Set("Cache-Control", "no-store")
 	http.Redirect(w, r, location, http.StatusFound)
@@ -511,17 +830,39 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 		p.renderError(w, http.StatusBadRequest, "登录校验失败", "授权响应未通过状态校验，请返回首页重新登录。")
 		return
 	}
+	if pending.Purpose != "" && pending.Purpose != sensitiveOIDCPurpose {
+		p.renderError(w, http.StatusBadRequest, "登录校验失败", "授权用途无效，请重新发起登录。")
+		return
+	}
 	code := r.URL.Query().Get("code")
 	if code == "" || r.URL.Query().Get("error") != "" {
 		_ = p.config.Repository.RecordPortalLoginFailure(r.Context(), loginTraceID, "authorization_incomplete")
+		if pending.Purpose == sensitiveOIDCPurpose {
+			p.renderSensitiveStepUpResult(w, http.StatusBadRequest, "failed", "", "安全验证已取消", "本次高风险操作尚未执行；关闭窗口后可重新验证。")
+			return
+		}
 		p.renderError(w, http.StatusBadRequest, "登录未完成", "身份服务没有返回有效授权，请返回首页重试。")
 		return
 	}
-	identity, err := p.flow.ExchangeAndVerify(r.Context(), code, pending.Verifier, pending.Nonce)
+	var identity accountIdentity
+	if pending.Purpose == sensitiveOIDCPurpose {
+		identity, err = p.flow.ExchangeStepUpAndVerify(r.Context(), code, pending.Verifier, pending.Nonce, pending.Method)
+	} else {
+		identity, err = p.flow.ExchangeAndVerify(r.Context(), code, pending.Verifier, pending.Nonce)
+	}
 	if err != nil {
 		_ = p.config.Repository.RecordPortalLoginFailure(r.Context(), loginTraceID, "token_verification_failed")
-		slog.Warn("web OIDC callback rejected", "error", err)
+		logPortalFailure(r.Context(), slog.LevelWarn, "web OIDC callback rejected",
+			"oidc_token_verification_failed", loginTraceID, err)
+		if pending.Purpose == sensitiveOIDCPurpose {
+			p.renderSensitiveStepUpResult(w, http.StatusUnauthorized, "failed", "", "安全验证未完成", "身份服务未能完成本次验证，请关闭窗口后重试。")
+			return
+		}
 		p.renderError(w, http.StatusUnauthorized, "登录校验失败", "身份令牌未通过校验，请返回首页重新登录。")
+		return
+	}
+	if pending.Purpose == sensitiveOIDCPurpose {
+		p.completeSensitiveStepUp(w, r, pending, identity)
 		return
 	}
 	csrf, err := randomText(32)
@@ -529,26 +870,41 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 		p.internalError(w, err)
 		return
 	}
-	username := firstNonEmpty(identity.Username, identity.Name, identity.Email, "TermLink 用户")
+	username := firstNonEmpty(identity.Username, identity.Email, "TermLink 用户")
+	nickname := firstNonEmpty(identity.Nickname, identity.Username, identity.Name, identity.Email, "TermLink 用户")
 	account, err := p.config.Repository.SyncPortalIdentity(
 		r.Context(),
 		auth.SubjectHash(p.config.SubjectKey, auth.Identity{Issuer: p.config.Issuer, Subject: identity.Subject}),
-		assertedRole(identity.Roles),
+		portalIdentityAssertion(identity),
 		loginTraceID,
 	)
 	if err != nil {
-		slog.Warn("web OIDC account authorization rejected", "error", err)
+		logPortalFailure(r.Context(), slog.LevelWarn, "web OIDC account authorization rejected",
+			"oidc_account_authorization_failed", loginTraceID, err)
 		p.renderError(w, http.StatusForbidden, "账号不可用", "账号未启用或授权状态无效，请联系 TermLink 管理员。")
 		return
+	}
+	if identity.Email != "" && len(p.config.CommerceKey) >= 32 {
+		if repository, ok := p.config.Repository.(registrationPortalRepository); ok {
+			email := strings.ToLower(strings.TrimSpace(identity.Email))
+			digest := commerceDigest(p.config.CommerceKey, "registration-email", email)
+			if _, linkErr := repository.ConfirmPendingInvitationForEmail(r.Context(), account.ID, digest); linkErr != nil && !errors.Is(linkErr, store.ErrNotFound) {
+				logPortalFailure(r.Context(), slog.LevelWarn, "link registration invitation after OIDC login",
+					"registration_invitation_link_failed", loginTraceID, linkErr,
+					slog.String("account_id", account.ID.String()))
+			}
+		}
 	}
 	sessionCookie, err := p.sessionCodec.seal(webSession{
 		Subject:           identity.Subject,
 		Username:          username,
+		Nickname:          nickname,
 		Name:              identity.Name,
 		Email:             identity.Email,
 		Role:              string(account.Role),
 		CSRF:              csrf,
-		AuthenticatedAtMS: p.now().UnixMilli(),
+		AuthenticatedAtMS: authenticatedAtMilliseconds(identity.AuthenticatedAt, p.now()),
+		MFA:               identity.MFA,
 		ExpiresAtMS:       p.now().Add(webSessionTTL).UnixMilli(),
 	})
 	if err != nil {
@@ -556,20 +912,30 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.setCookie(w, sessionCookieName, sessionCookie, p.now().Add(webSessionTTL))
+	p.clearCookie(w, legacySessionCookie)
 	returnTo := "/account"
 	switch normalizePortalReturnTo(pending.ReturnTo) {
 	case "/admin":
 		if account.Role.CanOpenConsole() {
-			returnTo = "/admin"
+			returnTo, err = p.adminBasePath(r.Context())
+			if err != nil {
+				p.internalError(w, err)
+				return
+			}
 		}
-	case "/account/identity":
-		returnTo = addThemeToURL(p.identityURL, pending.Theme)
+	case "/account/identity", "/account/identity/password", "/account/identity/mfa", "/account/identity/sessions":
+		returnTo = identityAccountSectionURL(p.identityURL, pending.ReturnTo, pending.Theme)
 	}
 	http.Redirect(w, r, returnTo, http.StatusSeeOther)
 }
 
 func (p *Portal) identity(w http.ResponseWriter, r *http.Request) {
-	target := "/login?return_to=%2Faccount%2Fidentity"
+	returnTo := identityReturnPath(r.PathValue("action"))
+	if returnTo == "" {
+		http.NotFound(w, r)
+		return
+	}
+	target := "/login?return_to=" + url.QueryEscape(returnTo)
 	if theme := normalizeTheme(r.URL.Query().Get(themeQueryParameter)); theme != "" {
 		target += "&" + themeQueryParameter + "=" + url.QueryEscape(theme)
 	}
@@ -585,6 +951,12 @@ func (p *Portal) account(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, strings.TrimRight(p.config.PublicURL, "/")+"/account", http.StatusSeeOther)
 		return
 	}
+	if _, commerceOK := p.config.Repository.(commerceAccountRepository); commerceOK {
+		if _, portalOK := p.config.Repository.(userPortalRepository); portalOK {
+			p.commerceDashboard(w, r)
+			return
+		}
+	}
 	session, err := p.readSession(r)
 	if err != nil {
 		p.clearCookie(w, sessionCookieName)
@@ -597,16 +969,19 @@ func (p *Portal) account(w http.ResponseWriter, r *http.Request) {
 		p.renderError(w, http.StatusForbidden, "账号不可用", "账号已被停用或浏览器会话需要重新登录。")
 		return
 	}
+	consoleURL, _ := p.adminBasePath(r.Context())
 	p.render(w, http.StatusOK, "account.html", accountPageData{
+		AccountID:          portalAccount.ID,
 		Username:           session.Username,
+		Nickname:           firstNonEmpty(session.Nickname, session.Username),
 		Name:               session.Name,
 		Email:              session.Email,
 		IdentityAccountURL: "/account/identity",
 		CSRF:               session.CSRF,
 		Role:               portalAccount.Role,
 		RoleLabel:          roleLabel(portalAccount.Role),
-		CanOpenConsole:     portalAccount.Role.CanOpenConsole(),
-		ConsoleURL:         "/admin",
+		CanOpenConsole:     portalAccount.Role.CanOpenConsole() && consoleURL != "",
+		ConsoleURL:         consoleURL,
 	})
 }
 
@@ -619,31 +994,160 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	dashboard, err := p.config.Repository.PortalAdminDashboard(r.Context(), account.ID)
+	section := normalizeAdminSection(r.URL.Query().Get("section"))
+	if section == "settings" && account.Role != store.RoleSuperAdmin {
+		p.renderError(w, http.StatusForbidden, "需要超级管理员", "系统安全设置仅允许 SUPER_ADMIN 查看和修改。")
+		return
+	}
+	var dashboard store.PortalAdminDashboard
+	var err error
+	if repository, ok := p.config.Repository.(sectionPortalRepository); ok {
+		dashboard, err = repository.PortalAdminSection(r.Context(), account.ID, section)
+	} else {
+		dashboard, err = p.config.Repository.PortalAdminDashboard(r.Context(), account.ID)
+	}
 	if err != nil {
 		p.internalError(w, err)
 		return
 	}
-	section := normalizeAdminSection(r.URL.Query().Get("section"))
+	var systemVersions SystemVersions
+	if section == "versions" {
+		systemVersions = p.systemVersions.Load(r.Context())
+	}
+	var announcements []store.WebAnnouncement
+	if section == "announcements" {
+		repository, available := p.config.Repository.(announcementRepository)
+		if !available {
+			p.renderError(w, http.StatusServiceUnavailable, "公告管理暂不可用", "当前服务端尚未完成公告存储配置。")
+			return
+		}
+		announcements, err = repository.ListAdminWebAnnouncements(r.Context(), account.ID, 100)
+		if err != nil {
+			p.internalError(w, err)
+			return
+		}
+	}
+	var serviceEmailSettings serviceemail.AdminView
+	if section == "settings" && p.config.ServiceEmail != nil {
+		serviceEmailSettings, err = p.config.ServiceEmail.Admin(r.Context())
+		if err != nil {
+			p.internalError(w, err)
+			return
+		}
+	}
+	adminRoute := adminroute.View{BasePath: adminroute.DefaultBasePath, Version: 1}
+	if p.config.AdminRoutes != nil {
+		adminRoute, err = p.config.AdminRoutes.Current(r.Context())
+		if err != nil {
+			p.internalError(w, err)
+			return
+		}
+	}
 	recentAuditEvents := dashboard.AuditEvents
 	if len(recentAuditEvents) > recentAuditLimit {
 		recentAuditEvents = recentAuditEvents[:recentAuditLimit]
 	}
+	actionNonce, err := randomText(24)
+	if err != nil {
+		p.internalError(w, err)
+		return
+	}
 	p.render(w, http.StatusOK, "admin.html", adminPageData{
-		Username:           session.Username,
-		Role:               account.Role,
-		RoleLabel:          roleLabel(account.Role),
-		CSRF:               session.CSRF,
-		Section:            section,
-		SectionTitle:       adminSectionTitle(section),
-		CanManageAccounts:  account.Role.CanManageAccounts(),
-		Dashboard:          dashboard,
-		RecentAuditEvents:  recentAuditEvents,
-		IdentityAccountURL: "/account/identity",
-		PublicURL:          strings.TrimRight(p.config.PublicURL, "/"),
-		Issuer:             strings.TrimRight(p.config.Issuer, "/"),
-		Notice:             adminNotice(r.URL.Query().Get("notice")),
+		Username:               session.Username,
+		Role:                   account.Role,
+		RoleLabel:              roleLabel(account.Role),
+		CSRF:                   session.CSRF,
+		Section:                section,
+		SectionTitle:           adminSectionTitle(section),
+		CanManageAccounts:      account.Role.CanManageAccounts(),
+		Dashboard:              dashboard,
+		RecentAuditEvents:      recentAuditEvents,
+		IdentityAccountURL:     "/account/identity",
+		PublicURL:              strings.TrimRight(p.config.PublicURL, "/"),
+		Issuer:                 strings.TrimRight(p.config.Issuer, "/"),
+		Notice:                 adminNotice(r.URL.Query().Get("notice")),
+		ActionNonce:            actionNonce,
+		SystemVersions:         systemVersions,
+		Announcements:          announcements,
+		CanManageAnnouncements: account.Role.IsAdministrator(),
+		ServiceEmail:           serviceEmailSettings,
+		AdminRoute:             adminRoute,
+		CanConfigureSystem:     account.Role == store.RoleSuperAdmin,
 	})
+}
+
+func (p *Portal) adminUpdateServiceEmail(w http.ResponseWriter, r *http.Request) {
+	session, account, ok := p.requireSuperAdminAction(w, r)
+	if !ok {
+		return
+	}
+	if p.config.ServiceEmail == nil || r.ParseForm() != nil || !p.usesTrustedFormOrigin(r) ||
+		!constantTextEqual(session.CSRF, r.Form.Get("csrf")) {
+		p.renderError(w, http.StatusServiceUnavailable, "服务邮箱不可用", "当前部署尚未配置安全的服务邮箱管理能力。")
+		return
+	}
+	port, portErr := strconv.Atoi(r.Form.Get("smtp_port"))
+	version, versionErr := strconv.ParseInt(r.Form.Get("expected_version"), 10, 64)
+	if portErr != nil || versionErr != nil {
+		p.renderError(w, http.StatusBadRequest, "邮件配置无效", "SMTP 端口或配置版本无效。")
+		return
+	}
+	_, err := p.config.ServiceEmail.UpdateAndTest(r.Context(), account.ID, serviceemail.UpdateInput{
+		ServiceEnabled:                  r.Form.Get("service_enabled") == "on",
+		RegistrationVerificationEnabled: r.Form.Get("registration_verification_enabled") == "on",
+		PasswordResetEnabled:            r.Form.Get("password_reset_enabled") == "on",
+		SMTPHost:                        r.Form.Get("smtp_host"), SMTPPort: port, SMTPSecurity: r.Form.Get("smtp_security"),
+		FromName: r.Form.Get("from_name"), FromAddress: r.Form.Get("from_address"), ReplyTo: r.Form.Get("reply_to"),
+		SMTPUsername: r.Form.Get("smtp_username"), SMTPPassword: r.Form.Get("smtp_password"),
+		TestRecipient: r.Form.Get("test_recipient"), ExpectedVersion: version,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, serviceemail.ErrInvalidConfiguration):
+			p.renderError(w, http.StatusBadRequest, "邮件配置无效", "请检查 SMTP 地址、端口、TLS、发件地址和测试收件地址。")
+		case errors.Is(err, serviceemail.ErrDeliveryFailed):
+			p.renderError(w, http.StatusBadGateway, "测试邮件发送失败", "邮件服务器拒绝连接、认证或投递；原有配置保持不变。")
+		case errors.Is(err, serviceemail.ErrIdentityUnavailable):
+			p.renderError(w, http.StatusServiceUnavailable, "身份服务同步失败", "Keycloak 邮件配置未同步，原有配置保持不变。")
+		case errors.Is(err, store.ErrConflict):
+			p.renderError(w, http.StatusConflict, "配置已经变化", "请刷新系统设置后重新提交。")
+		default:
+			p.internalError(w, err)
+		}
+		return
+	}
+	http.Redirect(w, r, "/admin?section=settings&notice=service-email-updated", http.StatusSeeOther)
+}
+
+func (p *Portal) adminUpdateRoute(w http.ResponseWriter, r *http.Request) {
+	_, account, ok := p.requireSuperAdminAction(w, r)
+	if !ok {
+		return
+	}
+	if p.config.AdminRoutes == nil {
+		p.renderError(w, http.StatusServiceUnavailable, "安全入口不可用", "当前部署尚未配置管理中心安全入口能力。")
+		return
+	}
+	version, err := strconv.ParseInt(r.Form.Get("expected_version"), 10, 64)
+	if err != nil {
+		p.renderError(w, http.StatusBadRequest, "安全入口无效", "配置版本无效，请刷新页面后重试。")
+		return
+	}
+	updated, err := p.config.AdminRoutes.Update(r.Context(), account.ID, r.Form.Get("route_segment"), r.Form.Get("route_confirmation"), version)
+	if err != nil {
+		switch {
+		case errors.Is(err, adminroute.ErrInvalidRoute):
+			p.renderError(w, http.StatusBadRequest, "安全入口无效", "入口必须为 16–64 位字母、数字、短横线或下划线，并且两次输入一致。")
+		case errors.Is(err, store.ErrConflict):
+			p.renderError(w, http.StatusConflict, "设置已经变化", "其他管理员刚刚修改了系统设置，请刷新后重试。")
+		case errors.Is(err, store.ErrDenied):
+			p.renderError(w, http.StatusForbidden, "安全入口修改被拒绝", "当前账号状态不允许修改安全入口。")
+		default:
+			p.internalError(w, err)
+		}
+		return
+	}
+	http.Redirect(w, r, updated.BasePath+"?section=settings&notice=admin-route-updated", http.StatusSeeOther)
 }
 
 func (p *Portal) adminUpdateRole(w http.ResponseWriter, r *http.Request) {
@@ -699,7 +1203,9 @@ func (p *Portal) adminUpdateStatus(w http.ResponseWriter, r *http.Request) {
 			// The database mutation is already committed. Periodic Realtime
 			// authority checks still fail closed; retain the successful response
 			// and surface only a content-free operational warning.
-			slog.Warn("publish account status change", "error", err)
+			logPortalFailure(r.Context(), slog.LevelWarn, "publish account status change",
+				"account_status_publish_failed", traceID, err,
+				slog.String("account_id", targetID.String()))
 		}
 	}
 	http.Redirect(w, r, "/admin?section=accounts&notice=status-updated", http.StatusSeeOther)
@@ -721,6 +1227,7 @@ func (p *Portal) logout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.clearCookie(w, sessionCookieName)
+	p.clearCookie(w, legacySessionCookie)
 	http.Redirect(w, r, p.flow.LogoutURL(), http.StatusSeeOther)
 }
 
@@ -739,7 +1246,6 @@ func (p *Portal) readSession(r *http.Request) (webSession, error) {
 	}
 	role, roleErr := store.ParseRole(session.Role)
 	if strings.TrimSpace(session.Subject) == "" || strings.TrimSpace(session.CSRF) == "" || roleErr != nil ||
-		session.AuthenticatedAtMS <= 0 || session.AuthenticatedAtMS > p.now().UnixMilli() ||
 		p.now().UnixMilli() >= session.ExpiresAtMS {
 		return webSession{}, errors.New("web session expired")
 	}
@@ -760,16 +1266,47 @@ func (p *Portal) render(w http.ResponseWriter, status int, name string, data any
 }
 
 func (p *Portal) renderError(w http.ResponseWriter, status int, title, message string) {
-	p.render(w, status, "error.html", errorPageData{Title: title, Message: message})
+	englishTitle, englishMessage := publicEnglishError(status)
+	p.render(w, status, "error.html", errorPageData{
+		Title: title, Message: message, EnglishTitle: englishTitle, EnglishMessage: englishMessage,
+	})
+}
+
+func publicEnglishError(status int) (string, string) {
+	switch status {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		return "Invalid request", "Check the submitted information, refresh the page, and try again."
+	case http.StatusUnauthorized:
+		return "Sign-in required", "Return to the home page and sign in again before retrying this request."
+	case http.StatusForbidden:
+		return "Request rejected", "The account, permission, or security check does not allow this request. Refresh the page or sign in again."
+	case http.StatusNotFound:
+		return "Not found", "The requested page or record does not exist or is not available to this account."
+	case http.StatusConflict:
+		return "State changed", "The record changed before this request completed. Refresh the page and try again."
+	case http.StatusGone:
+		return "Request expired", "This request is no longer valid. Refresh the page and start the operation again."
+	case http.StatusTooManyRequests:
+		return "Too many requests", "Wait a moment before trying this operation again."
+	case http.StatusBadGateway:
+		return "Upstream service failed", "A dependent service could not complete the request. No unverified result was applied; try again later."
+	default:
+		return "Service temporarily unavailable", "TermLink cannot complete this request right now. Try again later."
+	}
 }
 
 func (p *Portal) internalError(w http.ResponseWriter, err error) {
-	slog.Error("web portal request failed", "error", err)
+	requestTraceID := uuid.NewString()
+	logPortalFailure(context.Background(), slog.LevelError, "web portal request failed",
+		"portal_request_failed", requestTraceID, err)
 	var output bytes.Buffer
+	englishTitle, englishMessage := publicEnglishError(http.StatusInternalServerError)
 	if templateErr := p.templates.ExecuteTemplate(&output, "error.html", errorPageData{
 		Title: "服务暂时不可用", Message: "TermLink 服务端暂时无法完成该请求，请稍后重试。",
+		EnglishTitle: englishTitle, EnglishMessage: englishMessage, Reference: requestTraceID,
 	}); templateErr != nil {
-		slog.Error("render web portal internal error page", "error", templateErr)
+		logPortalFailure(context.Background(), slog.LevelError, "render web portal internal error page",
+			"portal_error_page_render_failed", requestTraceID, templateErr)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		http.Error(w, "TermLink portal is temporarily unavailable.", http.StatusInternalServerError)
@@ -783,7 +1320,7 @@ func (p *Portal) internalError(w http.ResponseWriter, err error) {
 
 func (p *Portal) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -848,19 +1385,49 @@ func (p *Portal) usesTrustedFormOrigin(r *http.Request) bool {
 func (p *Portal) now() time.Time { return p.config.Clock().UTC() }
 
 func (f *productionOIDCFlow) AuthorizationURL(state, nonce, challenge, theme string) string {
+	return oidcAuthorizationURL(f.oauthConfig, state, nonce, challenge, theme, true)
+}
+
+func (f *productionOIDCFlow) StepUpAuthorizationURL(state, nonce, challenge, theme, method string) string {
+	if method == sensitiveMethodMFA {
+		// The dedicated Keycloak client is bound to Cookie (REQUIRED) followed
+		// by OTP Form (REQUIRED), so an existing SSO identity goes directly to
+		// its configured authenticator without asking for the password again.
+		return oidcAuthorizationURL(f.stepUpOAuthConfig, state, nonce, challenge, theme, false)
+	}
+	return oidcAuthorizationURL(f.oauthConfig, state, nonce, challenge, theme, true)
+}
+
+func oidcAuthorizationURL(config oauth2.Config, state, nonce, challenge, theme string, promptLogin bool) string {
 	options := []oauth2.AuthCodeOption{
 		oauth2.SetAuthURLParam("nonce", nonce),
 		oauth2.SetAuthURLParam("code_challenge", challenge),
 		oauth2.SetAuthURLParam("code_challenge_method", "S256"),
 	}
-	if theme == "light" || theme == "dark" {
+	if promptLogin {
+		// Web authentication and password fallback must evaluate credentials
+		// instead of silently accepting an existing native-client SSO cookie.
+		options = append(options, oauth2.SetAuthURLParam("prompt", "login"))
+	}
+	if theme == "system" || theme == "light" || theme == "dark" {
 		options = append(options, oauth2.SetAuthURLParam(themeQueryParameter, theme))
 	}
-	return f.oauthConfig.AuthCodeURL(state, options...)
+	return config.AuthCodeURL(state, options...)
 }
 
 func (f *productionOIDCFlow) ExchangeAndVerify(ctx context.Context, code, verifier, expectedNonce string) (accountIdentity, error) {
-	token, err := f.oauthConfig.Exchange(ctx, code, oauth2.VerifierOption(verifier))
+	return exchangePortalIdentity(ctx, f.oauthConfig, f.verifier, f.clientID, code, verifier, expectedNonce)
+}
+
+func (f *productionOIDCFlow) ExchangeStepUpAndVerify(ctx context.Context, code, verifier, expectedNonce, method string) (accountIdentity, error) {
+	if method == sensitiveMethodMFA {
+		return exchangePortalIdentity(ctx, f.stepUpOAuthConfig, f.stepUpVerifier, f.stepUpOAuthConfig.ClientID, code, verifier, expectedNonce)
+	}
+	return f.ExchangeAndVerify(ctx, code, verifier, expectedNonce)
+}
+
+func exchangePortalIdentity(ctx context.Context, config oauth2.Config, verifier *oidc.IDTokenVerifier, clientID, code, pkceVerifier, expectedNonce string) (accountIdentity, error) {
+	token, err := config.Exchange(ctx, code, oauth2.VerifierOption(pkceVerifier))
 	if err != nil {
 		return accountIdentity{}, fmt.Errorf("exchange web OIDC code: %w", err)
 	}
@@ -868,40 +1435,65 @@ func (f *productionOIDCFlow) ExchangeAndVerify(ctx context.Context, code, verifi
 	if !ok || rawIDToken == "" {
 		return accountIdentity{}, errors.New("web OIDC ID token is missing")
 	}
-	idToken, err := f.verifier.Verify(ctx, rawIDToken)
+	idToken, err := verifier.Verify(ctx, rawIDToken)
 	if err != nil {
 		return accountIdentity{}, fmt.Errorf("verify web OIDC ID token: %w", err)
 	}
-	var claims struct {
-		Subject           string `json:"sub"`
-		Nonce             string `json:"nonce"`
-		PreferredUsername string `json:"preferred_username"`
-		Name              string `json:"name"`
-		Email             string `json:"email"`
-		RealmAccess       struct {
-			Roles []string `json:"roles"`
-		} `json:"realm_access"`
-		ResourceAccess map[string]struct {
-			Roles []string `json:"roles"`
-		} `json:"resource_access"`
-	}
+	var claims oidcPortalClaims
 	if err := idToken.Claims(&claims); err != nil {
 		return accountIdentity{}, errors.New("web OIDC claims are invalid")
 	}
+	return portalIdentityFromClaims(claims, clientID, expectedNonce)
+}
+
+func portalIdentityFromClaims(claims oidcPortalClaims, clientID, expectedNonce string) (accountIdentity, error) {
 	if strings.TrimSpace(claims.Subject) == "" || !constantTextEqual(claims.Nonce, expectedNonce) {
 		return accountIdentity{}, errors.New("web OIDC nonce or subject is invalid")
 	}
 	roles := append([]string(nil), claims.RealmAccess.Roles...)
-	if resource, ok := claims.ResourceAccess[f.clientID]; ok {
+	bootstrapManaged := hasOIDCRole(claims.RealmAccess.Roles, bootstrapManagedOIDCRole)
+	if resource, ok := claims.ResourceAccess[clientID]; ok {
 		roles = append(roles, resource.Roles...)
 	}
+	var authenticatedAt time.Time
+	if claims.AuthenticatedAt > 0 {
+		authenticatedAt = time.Unix(claims.AuthenticatedAt, 0).UTC()
+	}
+	acr := strings.TrimSpace(claims.ACR)
+	if len(acr) > 256 || !safePublicText(acr, 256, false) {
+		acr = ""
+	}
 	return accountIdentity{
-		Subject:  claims.Subject,
-		Username: claims.PreferredUsername,
-		Name:     claims.Name,
-		Email:    claims.Email,
-		Roles:    roles,
+		Subject: claims.Subject, Username: claims.PreferredUsername, Nickname: claims.Nickname, Name: claims.Name, Email: claims.Email,
+		Roles: roles, BootstrapManaged: bootstrapManaged,
+		AuthenticatedAt: authenticatedAt, MFA: portalAMRProvesMFA(claims.AMR), Password: portalAMRProvesPassword(claims.AMR), ACR: acr,
 	}, nil
+}
+
+func portalAMRProvesMFA(methods []string) bool {
+	for _, method := range methods {
+		switch strings.ToLower(strings.TrimSpace(method)) {
+		case "mfa", "otp", "hwk", "swk", "fpt", "face":
+			return true
+		}
+	}
+	return false
+}
+
+func portalAMRProvesPassword(methods []string) bool {
+	for _, method := range methods {
+		if strings.EqualFold(strings.TrimSpace(method), "pwd") {
+			return true
+		}
+	}
+	return false
+}
+
+func authenticatedAtMilliseconds(authenticatedAt, now time.Time) int64 {
+	if authenticatedAt.IsZero() || authenticatedAt.After(now) {
+		return 0
+	}
+	return authenticatedAt.UTC().UnixMilli()
 }
 
 func (f *productionOIDCFlow) LogoutURL() string {
@@ -949,7 +1541,7 @@ func firstNonEmpty(values ...string) string {
 
 func normalizeTheme(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
-	if value == "light" || value == "dark" {
+	if value == "system" || value == "light" || value == "dark" {
 		return value
 	}
 	return ""
@@ -959,11 +1551,36 @@ func normalizePortalReturnTo(value string) string {
 	switch strings.TrimSpace(value) {
 	case "/admin":
 		return "/admin"
-	case "/account/identity":
-		return "/account/identity"
+	case "/account/identity", "/account/identity/password", "/account/identity/mfa", "/account/identity/sessions":
+		return strings.TrimSpace(value)
 	default:
 		return "/account"
 	}
+}
+
+func identityReturnPath(action string) string {
+	switch strings.TrimSpace(action) {
+	case "":
+		return "/account/identity"
+	case "password", "mfa", "sessions":
+		return "/account/identity/" + strings.TrimSpace(action)
+	default:
+		return ""
+	}
+}
+
+func identityAccountSectionURL(base, returnTo, theme string) string {
+	target, err := url.Parse(addThemeToURL(base, theme))
+	if err != nil {
+		return "/account"
+	}
+	switch normalizePortalReturnTo(returnTo) {
+	case "/account/identity/password", "/account/identity/mfa":
+		target.Fragment = "/security/signingin"
+	case "/account/identity/sessions":
+		target.Fragment = "/security/device-activity"
+	}
+	return target.String()
 }
 
 func validateIdentityAccountURL(config Config, value string) (string, error) {
@@ -1029,6 +1646,24 @@ func assertedRole(roles []string) store.Role {
 	return result
 }
 
+const bootstrapManagedOIDCRole = "TERMLINK_BOOTSTRAP_MANAGED_V1"
+
+func portalIdentityAssertion(identity accountIdentity) store.PortalIdentityAssertion {
+	return store.PortalIdentityAssertion{
+		Role:             assertedRole(identity.Roles),
+		BootstrapManaged: identity.BootstrapManaged,
+	}
+}
+
+func hasOIDCRole(roles []string, expected string) bool {
+	for _, value := range roles {
+		if strings.EqualFold(strings.TrimSpace(value), expected) {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Portal) currentAccount(ctx context.Context, session webSession) (store.PortalAccount, error) {
 	return p.config.Repository.GetPortalAccount(ctx, auth.SubjectHash(
 		p.config.SubjectKey,
@@ -1052,24 +1687,7 @@ func (p *Portal) requireConsole(w http.ResponseWriter, r *http.Request) (webSess
 }
 
 func (p *Portal) requireSuperAdminAction(w http.ResponseWriter, r *http.Request) (webSession, store.PortalAccount, bool) {
-	session, account, ok := p.requireConsole(w, r)
-	if !ok {
-		return webSession{}, store.PortalAccount{}, false
-	}
-	if !p.usesTrustedFormOrigin(r) || r.ParseForm() != nil || !constantTextEqual(session.CSRF, r.Form.Get("csrf")) {
-		p.renderError(w, http.StatusForbidden, "管理请求被拒绝", "请求来源或安全校验无效，请刷新管理台后重试。")
-		return webSession{}, store.PortalAccount{}, false
-	}
-	if account.Role != store.RoleSuperAdmin || store.Role(session.Role) != store.RoleSuperAdmin {
-		p.renderError(w, http.StatusForbidden, "需要超级管理员", "该操作仅允许 SUPER_ADMIN 执行。")
-		return webSession{}, store.PortalAccount{}, false
-	}
-	age := p.now().Sub(time.UnixMilli(session.AuthenticatedAtMS))
-	if age < 0 || age > sensitiveActionTTL {
-		p.renderError(w, http.StatusForbidden, "需要重新认证", "高风险操作仅允许在最近登录后的 10 分钟内执行，请安全退出并重新登录。")
-		return webSession{}, store.PortalAccount{}, false
-	}
-	return session, account, true
+	return p.requireSensitiveAdminAction(w, r, true)
 }
 
 func (p *Portal) handleAdminMutationError(w http.ResponseWriter, err error) {
@@ -1087,7 +1705,7 @@ func (p *Portal) handleAdminMutationError(w http.ResponseWriter, err error) {
 
 func normalizeAdminSection(value string) string {
 	switch value {
-	case "overview", "connections", "deployment", "audit", "billing", "identity", "accounts", "redemptions":
+	case "overview", "connections", "deployment", "versions", "announcements", "audit", "billing", "identity", "accounts", "redemptions", "settings":
 		return value
 	default:
 		return "overview"
@@ -1097,20 +1715,39 @@ func normalizeAdminSection(value string) string {
 func adminSectionTitle(section string) string {
 	return map[string]string{
 		"overview": "运行概览", "connections": "连接与路由", "deployment": "Docker 部署",
-		"audit": "安全审计", "billing": "订阅与权益", "identity": "身份与安全",
+		"versions":      "系统版本",
+		"announcements": "公告管理",
+		"audit":         "安全审计", "billing": "订阅与权益", "identity": "身份与安全",
 		"accounts": "账号与角色", "redemptions": "兑换码管理",
+		"settings": "系统设置",
 	}[normalizeAdminSection(section)]
 }
 
 func adminNotice(value string) string {
 	switch value {
 	case "role-updated":
-		return "账号角色已更新，并已写入安全审计。"
+		return bilingualPortalNotice("账号角色已更新，并已写入安全审计。", "The account role was updated and recorded in the security audit.")
 	case "status-updated":
-		return "账号状态已更新，并已写入安全审计。"
+		return bilingualPortalNotice("账号状态已更新，并已写入安全审计。", "The account status was updated and recorded in the security audit.")
+	case "service-email-updated":
+		return bilingualPortalNotice("测试邮件已发送，服务邮箱配置和功能开关已发布。", "The test email was sent, and the service email settings are now active.")
+	case "admin-route-updated":
+		return bilingualPortalNotice("管理中心安全入口已经更新，旧入口已立即失效。请将新地址保存在受信任的密码管理器中。", "The secure admin route was updated and the old route is no longer valid. Store the new address in a trusted password manager.")
+	case "announcement-created":
+		return bilingualPortalNotice("公告草稿已创建；确认内容与生效时间后再发布。", "The announcement draft was created. Review its content and schedule before publishing.")
+	case "announcement-updated":
+		return bilingualPortalNotice("公告内容已更新并写入安全审计。", "The announcement was updated and recorded in the security audit.")
+	case "announcement-published":
+		return bilingualPortalNotice("公告已发布，将按设定的生效时间向用户展示。", "The announcement was published and will appear at its scheduled time.")
+	case "announcement-archived":
+		return bilingualPortalNotice("公告已下线，用户中心不再展示。", "The announcement was archived and is no longer shown in the account portal.")
 	default:
 		return ""
 	}
+}
+
+func bilingualPortalNotice(chinese, english string) string {
+	return chinese + " / " + english
 }
 
 func roleLabel(role store.Role) string {
@@ -1165,4 +1802,15 @@ func clear(value []byte) {
 	for index := range value {
 		value[index] = 0
 	}
+}
+
+func commerceDigest(key []byte, purpose, value string) [32]byte {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte("TermLink commerce v1\x00"))
+	_, _ = mac.Write([]byte(purpose))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(value))
+	var result [32]byte
+	copy(result[:], mac.Sum(nil))
+	return result
 }

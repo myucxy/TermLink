@@ -158,6 +158,9 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 ValidatePresentationMetadataSnapshot(
                     producer,
                     Guid.Parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeed"));
+                ValidateCommonCsiFinals(
+                    producer,
+                    Guid.Parse("cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeeb"));
                 ValidateTermuxProfileFailures(
                     producer,
                     Guid.Parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee0"));
@@ -1578,6 +1581,35 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 "Producer did not convert a relative origin-mode saved row to Termux's absolute row.");
         }
 
+        private static void ValidateCommonCsiFinals(
+            ProductionTerminalHistoryProducer producer,
+            Guid sessionId)
+        {
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                sessionId,
+                1,
+                Encoding.UTF8.GetBytes(
+                    "\u001b[1^A\u001b[5`B\u001b[2aC\u001b[2eD" +
+                    "\u001b[5n\u001b[?6n\u001b[c\u001b[>0c" +
+                    "\u001b[22;0;0t\u001b]0;temporary title\u0007\u001b[23;0;0t" +
+                    "\u001b[11t\u001b[0x\u001b[0q" +
+                    "\u001b[>4;2m\u001b[>4;m\u001b[?4m\u001b[0%m")));
+
+            var result = producer.ProcessSession(sessionId);
+            var checkpoint = producer.LoadCheckpoint(sessionId);
+            Require(result.SnapshotEligible && result.LastSequence == 1 &&
+                checkpoint != null && checkpoint.SnapshotEligible &&
+                checkpoint.SnapshotPlaintext != null,
+                "Common cursor aliases and non-rendering CSI queries disabled portable snapshots: " +
+                result.IneligibilityCode + ".");
+            var snapshot = TerminalSnapshotV1.Parser.ParseFrom(checkpoint.SnapshotPlaintext);
+            SnapshotCrypto.ValidateSnapshotForProducer(snapshot);
+            Require(snapshot.PrimaryScreen.Cursor.Row == 2 &&
+                snapshot.PrimaryScreen.Cursor.Column == 9,
+                "Common CSI cursor aliases did not preserve the exact terminal cursor.");
+        }
+
         private static void ValidateArtifactSizeFailure(
             ProductionTerminalHistoryProducer producer,
             Guid sessionId)
@@ -1966,6 +1998,43 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 store.ReadFramesAfter(incrementalSession, 1)
                     .Select(value => value.Sequence).SequenceEqual(new[] { 2UL, 3UL }),
                 "Incremental history production rescanned or skipped its coalesced suffix.");
+
+            var yieldingSession = Guid.NewGuid();
+            var yieldingFrames = new[]
+            {
+                new LocalFrame(
+                    LocalFrameType.Output,
+                    yieldingSession,
+                    1,
+                    Encoding.UTF8.GetBytes("first")),
+                new LocalFrame(
+                    LocalFrameType.Output,
+                    yieldingSession,
+                    2,
+                    Encoding.UTF8.GetBytes("-second"))
+            };
+            foreach (var frame in yieldingFrames) producer.AppendCommittedFrame(frame);
+            var readChecks = 0;
+            var interruptedRead = store.ReadFrames(
+                yieldingSession,
+                shouldYield: () => ++readChecks >= 2);
+            Require(interruptedRead == null && store.ReadFrames(yieldingSession).Count == 2,
+                "Yielded DPAPI WAL read changed or lost its immutable persisted frames.");
+            var yieldChecks = 0;
+            var yielded = producer.ProcessSession(
+                yieldingSession,
+                yieldingFrames,
+                persistLegacyArtifacts: true,
+                shouldYield: () => ++yieldChecks >= 2);
+            Require(yielded == null,
+                "Persisted terminal replay did not yield when live work became ready.");
+            var resumed = producer.ProcessSession(
+                yieldingSession,
+                yieldingFrames,
+                persistLegacyArtifacts: true,
+                shouldYield: () => false);
+            Require(resumed.SnapshotEligible && resumed.LastSequence == 2,
+                "Yielded terminal replay did not resume from its ordered applied sequence.");
         }
 
         private static async Task ValidateRecipientSealingAndUploaderAsync(

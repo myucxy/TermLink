@@ -1,0 +1,23 @@
+{{template "public-page-start" .}}
+<section class="public-intro" aria-labelledby="public-title">
+  <p class="eyebrow">SECURITY BOUNDARY</p>
+  <h1 id="public-title">安全说明</h1>
+  <p>{{.Description}}</p>
+</section>
+
+<section class="security-principles" aria-label="安全原则" data-security-grid>
+  <article class="public-card"><span class="principle-index">01</span><h2>终端正文端到端加密</h2><p>Relay 只处理路由与密文，不在 Web 页面、管理台或服务端日志展示终端输出、命令、快照和历史正文。</p></article>
+  <article class="public-card"><span class="principle-index">02</span><h2>设备身份独立</h2><p>每台 Android 与 Windows 设备使用独立身份和密钥。撤销一个设备不会把其他设备的密钥或缓存共享给它。</p></article>
+  <article class="public-card"><span class="principle-index">03</span><h2>本地优先</h2><p>Windows 本地用户始终拥有最高控制权。网络、账号或 Relay 故障不能被用来终止本机 Shell。</p></article>
+  <article class="public-card"><span class="principle-index">04</span><h2>最小公开信息</h2><p>公开状态页不披露主机名、数据库、队列、服务拓扑或内部错误；账号页只展示完成操作所需的元数据。</p></article>
+</section>
+
+<section class="boundary-table public-card" aria-labelledby="boundary-title">
+  <div><p class="eyebrow">DATA VISIBILITY</p><h2 id="boundary-title">数据可见性边界</h2></div>
+  <dl>
+    <div><dt>服务端可见</dt><dd>账号归属、设备状态、会话标识、路由、租约和必要审计元数据。</dd></div>
+    <div><dt>服务端不可见</dt><dd>终端命令、输出正文、端到端密钥、设备私钥和本地凭据。</dd></div>
+    <div><dt>用户可控制</dt><dd>设备撤销、远程访问策略、控制租约、历史生命周期和账号安全设置。</dd></div>
+  </dl>
+</section>
+{{template "public-page-end" .}}

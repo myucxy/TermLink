@@ -198,7 +198,7 @@ namespace TermLink.Tray
                 error is ArgumentException || error is InvalidDataException ||
                 error is IOException || error is UnauthorizedAccessException)
             {
-                MessageBox.Show(this, error.Message, "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(this, TrayText.PublicError(error), "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
     }
@@ -338,7 +338,7 @@ namespace TermLink.Tray
                 error is ArgumentException || error is InvalidDataException ||
                 error is IOException || error is UnauthorizedAccessException)
             {
-                MessageBox.Show(this, error.Message, "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this, TrayText.PublicError(error), "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
     }

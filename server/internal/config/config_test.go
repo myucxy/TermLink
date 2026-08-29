@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadFromEnvReadsSecretsAndRedactsDiagnostics(t *testing.T) {
@@ -40,6 +42,23 @@ func TestLoadFromEnvReadsSecretsAndRedactsDiagnostics(t *testing.T) {
 	if c.MetricsListenAddr != "" {
 		t.Fatalf("MetricsListenAddr = %q, want disabled", c.MetricsListenAddr)
 	}
+	if c.PostgresMaxConns != 20 || c.PostgresMinConns != 2 ||
+		c.PostgresMaxConnLifetime != 30*time.Minute || c.PostgresMaxConnIdleTime != 5*time.Minute ||
+		c.PostgresHealthCheckPeriod != time.Minute || c.PostgresConnectTimeout != 5*time.Second {
+		t.Fatalf("PostgreSQL defaults not applied: %#v", c)
+	}
+	if c.RedisPoolSize != 20 || c.RedisMinIdleConns != 2 ||
+		c.RedisDialTimeout != 5*time.Second || c.RedisReadTimeout != 3*time.Second ||
+		c.RedisWriteTimeout != 3*time.Second || c.RedisPoolTimeout != 4*time.Second {
+		t.Fatalf("Valkey defaults not applied: %#v", c)
+	}
+	if c.PaymentSecretsDir != "/run/secrets" {
+		t.Fatalf("PaymentSecretsDir = %q, want /run/secrets", c.PaymentSecretsDir)
+	}
+	if c.RegistrationRecoveryEnabled || c.KeycloakAdminClientID != "termlink-registration-recovery" ||
+		c.KeycloakAdminBaseURL != "" || !c.KeycloakAdminClientSecret.Empty() {
+		t.Fatalf("registration recovery defaults not applied: %#v", c)
+	}
 	output := c.String()
 	for _, secret := range []string{"oidc-secret", "postgres://termlink:password@postgres/termlink", "redis://:password@valkey:6379/0", "01234567890123456789012345678901"} {
 		if strings.Contains(output, secret) {
@@ -51,6 +70,256 @@ func TestLoadFromEnvReadsSecretsAndRedactsDiagnostics(t *testing.T) {
 	}
 	if got := fmt.Sprintf("%#v", c); strings.Contains(got, "oidc-secret") {
 		t.Fatalf("GoString() leaked secret: %s", got)
+	}
+}
+
+func TestLoadRegistrationRecoveryUsesDedicatedSecret(t *testing.T) {
+	files := writeSecrets(t, map[string]string{
+		"oidc": "oidc-secret", "admin": "keycloak-admin-secret", "db": "db-secret", "redis": "redis-secret",
+		"sign": "01234567890123456789012345678901",
+	})
+	env := baseEnv(files)
+	env["TERMLINK_REGISTRATION_RECOVERY_ENABLED"] = "true"
+	env["TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID"] = "registration-recovery"
+	env["TERMLINK_KEYCLOAK_ADMIN_BASE_URL"] = "http://keycloak:8080"
+
+	if _, err := LoadFromEnv(env); err == nil || !errors.Is(err, ErrMissing) || !strings.Contains(err.Error(), "TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE") {
+		t.Fatalf("missing recovery secret error = %v, want field-scoped ErrMissing", err)
+	}
+	env["TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE"] = files["admin"]
+	c, err := LoadFromEnv(env)
+	if err != nil {
+		t.Fatalf("LoadFromEnv() error = %v", err)
+	}
+	if !c.RegistrationRecoveryEnabled || c.KeycloakAdminClientID != "registration-recovery" ||
+		c.KeycloakAdminBaseURL != "http://keycloak:8080" || c.KeycloakAdminClientSecret.Value() != "keycloak-admin-secret" {
+		t.Fatalf("registration recovery config not loaded: %#v", c)
+	}
+	if c.KeycloakAdminClientSecretFile != files["admin"] {
+		t.Fatalf("KeycloakAdminClientSecretFile = %q, want %q", c.KeycloakAdminClientSecretFile, files["admin"])
+	}
+	for _, forbidden := range []string{"keycloak-admin-secret", files["admin"]} {
+		if output := c.String(); strings.Contains(output, forbidden) {
+			t.Fatalf("String() leaked recovery secret material %q: %s", forbidden, output)
+		}
+	}
+
+	env["TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID"] = "invalid client"
+	if _, err := LoadFromEnv(env); err == nil || !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID") {
+		t.Fatalf("invalid recovery client ID error = %v, want field-scoped ErrInvalid", err)
+	}
+}
+
+func TestLoadRegistrationRecoveryRejectsUnsafeAdminBaseURL(t *testing.T) {
+	files := writeSecrets(t, map[string]string{
+		"oidc": "oidc-secret", "admin": "keycloak-admin-secret", "db": "db-secret", "redis": "redis-secret",
+		"sign": "01234567890123456789012345678901",
+	})
+	base := baseEnv(files)
+	base["TERMLINK_REGISTRATION_RECOVERY_ENABLED"] = "true"
+	base["TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE"] = files["admin"]
+	for _, unsafe := range []string{
+		"file:///run/keycloak", "https://user@identity.example.test", "https://identity.example.test?next=other",
+		"https://identity.example.test/base/../other", "http://identity.example.test:8080", "http://keycloak",
+		"https://0.0.0.0:8443",
+	} {
+		env := make(map[string]string, len(base)+1)
+		for name, value := range base {
+			env[name] = value
+		}
+		env["TERMLINK_KEYCLOAK_ADMIN_BASE_URL"] = unsafe
+		if _, err := LoadFromEnv(env); err == nil || !errors.Is(err, ErrInvalid) ||
+			!strings.Contains(err.Error(), "TERMLINK_KEYCLOAK_ADMIN_BASE_URL") {
+			t.Fatalf("unsafe admin base %q error=%v", unsafe, err)
+		}
+	}
+}
+
+func TestLoadAccountDeletionRequiresDedicatedIdentityKeyAndDependencies(t *testing.T) {
+	encodedKey := base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	files := writeSecrets(t, map[string]string{
+		"oidc": "oidc-secret", "admin": "keycloak-admin-secret", "deletion": encodedKey,
+		"db": "db-secret", "redis": "redis-secret", "sign": "01234567890123456789012345678901",
+	})
+	env := baseEnv(files)
+	env["TERMLINK_ACCOUNT_DELETION_ENABLED"] = "true"
+	env["TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE"] = files["admin"]
+	env["TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE"] = files["deletion"]
+	env["TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION"] = "7"
+
+	if _, err := LoadFromEnv(env); err == nil || !errors.Is(err, ErrInvalid) ||
+		!strings.Contains(err.Error(), "TERMLINK_HISTORY_ENABLED") {
+		t.Fatalf("account deletion without history error = %v, want field-scoped ErrInvalid", err)
+	}
+	env["TERMLINK_HISTORY_ENABLED"] = "true"
+	env["TERMLINK_S3_ENDPOINT"] = "http://minio:9000"
+	env["TERMLINK_S3_ACCESS_KEY_FILE"] = files["access"]
+	env["TERMLINK_S3_SECRET_KEY_FILE"] = files["secret"]
+	c, err := LoadFromEnv(env)
+	if err != nil {
+		t.Fatalf("LoadFromEnv(account deletion) error = %v", err)
+	}
+	key, err := c.AccountDeletionIdentityKeyBytes()
+	if err != nil || string(key) != "0123456789abcdef0123456789abcdef" {
+		t.Fatalf("decoded account deletion key is invalid: len=%d err=%v", len(key), err)
+	}
+	clear(key)
+	if !c.AccountDeletionEnabled || c.AccountDeletionIdentityKeyVersion != 7 ||
+		c.AccountDeletionIdentityKeyFile != files["deletion"] || c.KeycloakAdminClientSecret.Empty() {
+		t.Fatalf("account deletion config not loaded: %#v", c)
+	}
+	for _, forbidden := range []string{encodedKey, files["deletion"], "keycloak-admin-secret"} {
+		if output := c.String(); strings.Contains(output, forbidden) {
+			t.Fatalf("String() leaked account deletion material %q: %s", forbidden, output)
+		}
+	}
+
+	invalidKeyPath := writeSecret(t, filepath.Dir(files["deletion"]), "invalid-deletion", "not-a-32-byte-base64-key")
+	env["TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE"] = invalidKeyPath
+	if _, err := LoadFromEnv(env); err == nil || !errors.Is(err, ErrSecret) ||
+		!strings.Contains(err.Error(), "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE") {
+		t.Fatalf("invalid deletion key error = %v, want field-scoped ErrSecret", err)
+	}
+
+	delete(env, "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE")
+	if _, err := LoadFromEnv(env); err == nil || !errors.Is(err, ErrMissing) ||
+		!strings.Contains(err.Error(), "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE") {
+		t.Fatalf("missing deletion key error = %v, want field-scoped ErrMissing", err)
+	}
+}
+
+func TestAccountDeletionIdentityKeyRingSupportsSafeRotation(t *testing.T) {
+	first := base64.RawURLEncoding.EncodeToString([]byte("11111111111111111111111111111111"))
+	second := base64.StdEncoding.EncodeToString([]byte("22222222222222222222222222222222"))
+	config := Config{
+		AccountDeletionIdentityKey:        Secret(`[{"version":6,"key":"` + first + `"},{"version":7,"key":"` + second + `"}]`),
+		AccountDeletionIdentityKeyVersion: 7,
+	}
+	keys, err := config.AccountDeletionIdentityKeys()
+	if err != nil || len(keys) != 2 || string(keys[6]) != "11111111111111111111111111111111" ||
+		string(keys[7]) != "22222222222222222222222222222222" {
+		t.Fatalf("AccountDeletionIdentityKeys() = %#v, %v", keys, err)
+	}
+	clearAccountDeletionIdentityKeys(keys)
+
+	for name, value := range map[string]string{
+		"missing current": `[{"version":6,"key":"` + first + `"}]`,
+		"duplicate":       `[{"version":7,"key":"` + first + `"},{"version":7,"key":"` + second + `"}]`,
+		"unknown field":   `[{"version":7,"key":"` + second + `","secret":"unexpected"}]`,
+		"trailing data":   `[{"version":7,"key":"` + second + `"}] true`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			config.AccountDeletionIdentityKey = Secret(value)
+			if _, err := config.AccountDeletionIdentityKeys(); err == nil || !errors.Is(err, ErrSecret) {
+				t.Fatalf("AccountDeletionIdentityKeys(%s) error = %v, want ErrSecret", name, err)
+			}
+		})
+	}
+}
+
+func TestLoadConnectionPoolAndTimeoutOverrides(t *testing.T) {
+	files := writeSecrets(t, map[string]string{
+		"oidc": "oidc-secret", "db": "db-secret", "redis": "redis-secret",
+		"sign": "01234567890123456789012345678901",
+	})
+	env := baseEnv(files)
+	env["TERMLINK_POSTGRES_MAX_CONNS"] = "64"
+	env["TERMLINK_POSTGRES_MIN_CONNS"] = "4"
+	env["TERMLINK_POSTGRES_MAX_CONN_LIFETIME"] = "45m"
+	env["TERMLINK_POSTGRES_MAX_CONN_IDLE_TIME"] = "10m"
+	env["TERMLINK_POSTGRES_HEALTH_CHECK_PERIOD"] = "30s"
+	env["TERMLINK_POSTGRES_CONNECT_TIMEOUT"] = "8s"
+	env["TERMLINK_REDIS_POOL_SIZE"] = "48"
+	env["TERMLINK_REDIS_MIN_IDLE_CONNS"] = "6"
+	env["TERMLINK_REDIS_DIAL_TIMEOUT"] = "7s"
+	env["TERMLINK_REDIS_READ_TIMEOUT"] = "4s"
+	env["TERMLINK_REDIS_WRITE_TIMEOUT"] = "5s"
+	env["TERMLINK_REDIS_POOL_TIMEOUT"] = "6s"
+	env["TERMLINK_PAYMENT_SECRETS_DIR"] = filepath.Join(t.TempDir(), "payment-secrets")
+	env["TERMLINK_LOG_LEVEL"] = "DEBUG"
+
+	c, err := LoadFromEnv(env)
+	if err != nil {
+		t.Fatalf("LoadFromEnv() error = %v", err)
+	}
+	if c.PostgresMaxConns != 64 || c.PostgresMinConns != 4 ||
+		c.PostgresMaxConnLifetime != 45*time.Minute || c.PostgresMaxConnIdleTime != 10*time.Minute ||
+		c.PostgresHealthCheckPeriod != 30*time.Second || c.PostgresConnectTimeout != 8*time.Second {
+		t.Fatalf("PostgreSQL overrides not applied: %#v", c)
+	}
+	if c.RedisPoolSize != 48 || c.RedisMinIdleConns != 6 ||
+		c.RedisDialTimeout != 7*time.Second || c.RedisReadTimeout != 4*time.Second ||
+		c.RedisWriteTimeout != 5*time.Second || c.RedisPoolTimeout != 6*time.Second {
+		t.Fatalf("Valkey overrides not applied: %#v", c)
+	}
+	if c.LogLevel != "debug" {
+		t.Fatalf("LogLevel = %q, want normalized debug", c.LogLevel)
+	}
+	if c.PaymentSecretsDir != env["TERMLINK_PAYMENT_SECRETS_DIR"] {
+		t.Fatalf("PaymentSecretsDir = %q, want %q", c.PaymentSecretsDir, env["TERMLINK_PAYMENT_SECRETS_DIR"])
+	}
+}
+
+func TestLoadRejectsInvalidConnectionControlsWithoutEchoingValues(t *testing.T) {
+	files := writeSecrets(t, map[string]string{
+		"oidc": "oidc-secret", "db": "db-secret", "redis": "redis-secret",
+		"sign": "01234567890123456789012345678901",
+	})
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{"TERMLINK_POSTGRES_MAX_CONNS", "0"},
+		{"TERMLINK_POSTGRES_MIN_CONNS", "21"},
+		{"TERMLINK_POSTGRES_MAX_CONN_LIFETIME", "secret-invalid-duration"},
+		{"TERMLINK_POSTGRES_MAX_CONN_IDLE_TIME", "30s"},
+		{"TERMLINK_POSTGRES_HEALTH_CHECK_PERIOD", "1s"},
+		{"TERMLINK_POSTGRES_CONNECT_TIMEOUT", "0"},
+		{"TERMLINK_REDIS_POOL_SIZE", "1001"},
+		{"TERMLINK_REDIS_MIN_IDLE_CONNS", "21"},
+		{"TERMLINK_REDIS_DIAL_TIMEOUT", "10ms"},
+		{"TERMLINK_REDIS_READ_TIMEOUT", "forever"},
+		{"TERMLINK_REDIS_WRITE_TIMEOUT", "0"},
+		{"TERMLINK_REDIS_POOL_TIMEOUT", "3h"},
+		{"TERMLINK_LOG_LEVEL", "trace"},
+		{"TERMLINK_REGISTRATION_RECOVERY_ENABLED", "sometimes"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := baseEnv(files)
+			env[test.name] = test.value
+			_, err := LoadFromEnv(env)
+			if err == nil || !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), test.name) {
+				t.Fatalf("LoadFromEnv() error = %v, want invalid %s", err, test.name)
+			}
+			if strings.Contains(err.Error(), test.value) {
+				t.Fatalf("error echoed configuration value %q: %v", test.value, err)
+			}
+		})
+	}
+}
+
+func TestPaymentSecretsDirectoryIsAbsoluteCleanAndNonRoot(t *testing.T) {
+	input := Input{
+		PublicURL: "https://termlink.example.test", OIDCIssuer: "https://issuer.example.test",
+		OIDCClientID: "client", OIDCClientSecret: "oidc", DatabaseURL: "postgres",
+		RedisURL: "redis", TokenSigningKey: "01234567890123456789012345678901",
+		PaymentSecretsDir: filepath.Join(t.TempDir(), "payment", "..", "provider-secrets"),
+	}
+	c, err := New(input)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if c.PaymentSecretsDir != filepath.Clean(input.PaymentSecretsDir) {
+		t.Fatalf("PaymentSecretsDir = %q, want clean %q", c.PaymentSecretsDir, filepath.Clean(input.PaymentSecretsDir))
+	}
+
+	for _, invalid := range []string{"relative/secrets", "/"} {
+		input.PaymentSecretsDir = invalid
+		_, err := New(input)
+		if err == nil || !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "TERMLINK_PAYMENT_SECRETS_DIR") {
+			t.Fatalf("New(PaymentSecretsDir=%q) error = %v, want ErrInvalid", invalid, err)
+		}
 	}
 }
 
@@ -231,9 +500,26 @@ func TestNewExplicitInputAppliesDefaultsAndValidates(t *testing.T) {
 		c.WindowsOIDCRedirectURI != "http://127.0.0.1:43971/oauth2/callback" {
 		t.Fatalf("Windows OIDC defaults not applied: %#v", c)
 	}
-	if c.WebOIDCClientID != "termlink-web" ||
+	if c.WebOIDCClientID != "termlink-web" || c.WebOIDCStepUpClientID != "termlink-web-step-up" ||
 		c.WebOIDCRedirectURI != "https://termlink.example.test/auth/callback" {
 		t.Fatalf("Web OIDC defaults not applied: %#v", c)
+	}
+}
+
+func TestWebOIDCStepUpClientMustBeDistinct(t *testing.T) {
+	_, err := New(Input{
+		PublicURL:             "https://termlink.example.test",
+		OIDCIssuer:            "https://issuer.example.test",
+		OIDCClientID:          "client",
+		WebOIDCClientID:       "termlink-web",
+		WebOIDCStepUpClientID: "termlink-web",
+		OIDCClientSecret:      "oidc",
+		DatabaseURL:           "postgres",
+		RedisURL:              "redis",
+		TokenSigningKey:       "01234567890123456789012345678901",
+	})
+	if err == nil || !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID") {
+		t.Fatalf("New() error=%v, want distinct Web Step-up client error", err)
 	}
 }
 

@@ -166,6 +166,14 @@ internal static class Program
 
     public static async Task<int> Main()
     {
+        // This validation exercises the opt-in TerminalSnapshot publication
+        // path. Keep the fixture independent of the caller's environment so
+        // a clean developer shell cannot silently take the generic history
+        // path and complete before the Snapshot barrier is reached.
+        Environment.SetEnvironmentVariable(
+            "TERMLINK_ENABLE_TERMINAL_SNAPSHOT_V1",
+            "1",
+            EnvironmentVariableTarget.Process);
         var root = Path.Combine(Path.GetTempPath(), "termlink-history-ordering-" + Guid.NewGuid().ToString("N"));
         object runtime = null;
         OrderingHandler handler = null;
@@ -184,6 +192,48 @@ internal static class Program
             var localFrameType = Type(assembly, "TermLink.LocalIpc.LocalFrame");
             var localFrameKindType = Type(assembly, "TermLink.LocalIpc.LocalFrameType");
             var payloadCodecType = Type(assembly, "TermLink.LocalIpc.LocalPayloadCodec");
+
+            var backlogSession = Guid.Parse("00000000-0000-4000-8000-000000000010");
+            var terminalSession = Guid.Parse("00000000-0000-4000-8000-000000000020");
+            var activeSession = Guid.Parse("00000000-0000-4000-8000-000000000030");
+            var orderedCandidates = (IEnumerable<Guid>)Method(
+                runtimeType,
+                "OrderHistoryUploadCandidates").Invoke(
+                    null,
+                    new object[]
+                    {
+                        new[] { backlogSession, activeSession, terminalSession, backlogSession },
+                        new Func<Guid, int>(value => value == activeSession ? 0 : value == terminalSession ? 1 : 2)
+                    });
+            Require(
+                orderedCandidates.SequenceEqual(new[] { activeSession, terminalSession, backlogSession }),
+                "History upload scheduling did not prioritize active and terminal sessions ahead of old backlog.");
+            var canPromoteBacklog = Method(runtimeType, "CanPromotePersistedHistoryBacklog");
+            bool CanPromote(
+                bool hasBacklog,
+                bool hasActiveSession,
+                bool hasRealtimeHistoryWork,
+                long lastLiveTick,
+                long nowTick,
+                long idleDelay) => (bool)canPromoteBacklog.Invoke(
+                    null,
+                    new object[]
+                    {
+                        hasBacklog,
+                        hasActiveSession,
+                        hasRealtimeHistoryWork,
+                        lastLiveTick,
+                        nowTick,
+                        idleDelay
+                    });
+            Require(!CanPromote(true, false, false, 1_000, 5_999, 5_000),
+                "Persisted history backlog ignored the required idle interval.");
+            Require(!CanPromote(true, true, false, 1_000, 6_000, 5_000),
+                "Persisted history backlog ran while a live terminal existed.");
+            Require(!CanPromote(true, false, true, 1_000, 6_000, 5_000),
+                "Persisted history backlog ran while realtime history work was pending.");
+            Require(CanPromote(true, false, false, 1_000, 6_000, 5_000),
+                "Persisted history backlog did not resume after a verified idle interval.");
 
             var pcId = Guid.Parse("10000000-0000-4000-8000-000000000001");
             var pcDeviceId = Guid.Parse("20000000-0000-4000-8000-000000000002");
@@ -287,7 +337,23 @@ internal static class Program
                 uploadHistory,
                 runtime,
                 new object[] { sessionId, events, production, CancellationToken.None });
-            await handler.SnapshotCreateEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            var snapshotEntry = handler.SnapshotCreateEntered.Task;
+            var entryTimeout = Task.Delay(TimeSpan.FromSeconds(2));
+            var entryWinner = await Task.WhenAny(firstAttempt, snapshotEntry, entryTimeout);
+            if (entryWinner == firstAttempt)
+            {
+                var firstResult = await firstAttempt;
+                throw new InvalidOperationException(
+                    "The first history attempt completed before entering Snapshot creation " +
+                    $"(durable={firstResult}, operations={string.Join(", ", handler.Operations)}).");
+            }
+            if (entryWinner == entryTimeout)
+            {
+                throw new TimeoutException(
+                    "The first history attempt remained active but did not enter Snapshot creation " +
+                    $"within 2 seconds (status={firstAttempt.Status}, " +
+                    $"operations={string.Join(", ", handler.Operations)}).");
+            }
 
             // Keep producing output while the first recipient Snapshot is in
             // flight, then force the independent REST publisher to observe the

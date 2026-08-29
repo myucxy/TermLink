@@ -589,6 +589,7 @@ namespace TermLink.Agent
         private bool dcsFinalSeen;
         private readonly List<PortableTerminalHyperlinkV1> hyperlinks =
             new List<PortableTerminalHyperlinkV1>();
+        private readonly List<string> titleStack = new List<string>();
         private readonly byte[] utf8 = new byte[4];
         private ParserState parserState;
         private int utf8ExpectedBytes;
@@ -696,6 +697,7 @@ namespace TermLink.Agent
                     return "INCOMPLETE_OSC";
                 if (parserState == ParserState.Dcs || parserState == ParserState.DcsEscape)
                     return "INCOMPLETE_DCS";
+                if (titleStack.Count > 0) return "TITLE_STACK_ACTIVE";
                 if (synchronizedOutput) return "SYNCHRONIZED_OUTPUT_ACTIVE";
                 return "GROUND";
             }
@@ -703,7 +705,7 @@ namespace TermLink.Agent
 
         public bool SnapshotEligible =>
             permanentRejectionCode == null && parserState == ParserState.Ground &&
-            utf8ExpectedBytes == 0 && !synchronizedOutput;
+            utf8ExpectedBytes == 0 && titleStack.Count == 0 && !synchronizedOutput;
 
         public void AdvanceNonTerminalEvent(ulong sequence)
         {
@@ -1638,6 +1640,12 @@ namespace TermLink.Agent
 
         private void ExecuteCsi(string text, char final, ulong sequence)
         {
+            // Device/window status requests are answered by the live terminal
+            // host and do not mutate restorable renderer state. Accept the
+            // well-defined query forms so ordinary shells cannot permanently
+            // disable portable snapshots merely by probing their terminal.
+            if (TryApplyNonRenderingCsi(text, final, sequence)) return;
+
             if (text.StartsWith("?", StringComparison.Ordinal))
             {
                 if (final == 'h' || final == 'l')
@@ -1688,7 +1696,10 @@ namespace TermLink.Agent
                 case 'E': MoveCursorLine(CursorDistance(parameters, sequence), parameters, sequence); return;
                 case 'F': MoveCursorLine(-CursorDistance(parameters, sequence), parameters, sequence); return;
                 case 'G': SetCursorColumn(CursorAbsolute(parameters, sequence) - 1, parameters, sequence); return;
+                case '`': SetCursorColumn(CursorAbsolute(parameters, sequence) - 1, parameters, sequence); return;
+                case 'a': MoveCursorRelative(CursorDistance(parameters, sequence), 0, parameters, sequence); return;
                 case 'd': SetCursor(cursorColumn, CursorAbsolute(parameters, sequence) - 1, parameters, sequence); return;
+                case 'e': MoveCursorRelative(0, CursorDistance(parameters, sequence), parameters, sequence); return;
                 case 'H':
                 case 'f':
                     ApplyCursorPosition(parameters, sequence);
@@ -1701,12 +1712,14 @@ namespace TermLink.Agent
                 case 'M': DeleteLines(parameters, sequence); return;
                 case 'S': ScrollUp(parameters, sequence); return;
                 case 'T': ScrollDown(parameters, sequence); return;
+                case '^': ScrollDown(parameters, sequence); return;
                 case 'X': EraseCharacters(parameters, sequence); return;
                 case 'I': CursorForwardTabs(parameters, sequence); return;
                 case 'Z': CursorBackwardTabs(parameters, sequence); return;
                 case 'g': ClearTabStops(parameters, sequence); return;
                 case 'r': ApplyScrollMargins(parameters, sequence); return;
                 case 's': SaveCursor(parameters, sequence); return;
+                case 't': ApplyWindowManipulation(parameters); return;
                 case 'u': RestoreCursor(parameters, sequence); return;
                 case 'h':
                 case 'l':
@@ -1725,6 +1738,85 @@ namespace TermLink.Agent
                 default:
                     Reject("CSI_FINAL_UNSUPPORTED", sequence);
                     return;
+            }
+        }
+
+        private void RejectCsiQueryArity(ulong sequence)
+        {
+            Reject("CSI_ARITY_UNSUPPORTED", sequence);
+        }
+
+        private bool TryApplyNonRenderingCsi(string text, char final, ulong sequence)
+        {
+            // Intermediates have their own semantics (for example DECSCUSR),
+            // so this handler is deliberately limited to parameter bytes and
+            // the private query prefixes used by DA/DSR.
+            if (final == 'm' && text.EndsWith("%", StringComparison.Ordinal) &&
+                TryParseParameters(text.Substring(0, text.Length - 1), out _))
+            {
+                // Termux consumes the legacy encoding-selection extension but
+                // remains on the UTF-8 stream contract used by TermLink.
+                return true;
+            }
+            if (text.IndexOfAny(new[] { ' ', '$', '!', '\"' }) >= 0) return false;
+            var prefix = '\0';
+            var parametersText = text;
+            if (parametersText.Length > 0 &&
+                (parametersText[0] == '?' || parametersText[0] == '>' || parametersText[0] == '='))
+            {
+                prefix = parametersText[0];
+                parametersText = parametersText.Substring(1);
+            }
+            if (!TryParseParameters(parametersText, out var parameters)) return false;
+
+            switch (final)
+            {
+                case 'c': // DA/secondary DA/tertiary DA request.
+                    if (prefix != '\0' && prefix != '>' && prefix != '=') return false;
+                    if (parameters.Length > 1) RejectCsiQueryArity(sequence);
+                    return true;
+                case 'n': // DSR and DEC private DSR request.
+                    if (prefix != '\0' && prefix != '?') return false;
+                    if (parameters.Length != 1) RejectCsiQueryArity(sequence);
+                    return true;
+                case 'R': // A CPR response is non-printing if echoed in the output stream.
+                    if (prefix != '\0') return false;
+                    if (parameters.Length != 2) RejectCsiQueryArity(sequence);
+                    return true;
+                case 'q': // DECLL keyboard LED request; no renderer state.
+                    if (prefix != '\0') return false;
+                    return true;
+                case 'm':
+                    // xterm modifyOtherKeys and related keyboard-reporting
+                    // controls change host input negotiation, not the terminal
+                    // cells or portable renderer state.
+                    return prefix == '>' || prefix == '?';
+                case 'x': // DECREQTPARM request; response is host-owned.
+                    if (prefix != '\0' || parameters.Length > 1) return false;
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private void ApplyWindowManipulation(int[] parameters)
+        {
+            // Match the Termux renderer restored on Android. It ignores window
+            // geometry operations, answers reports through the live host, and
+            // keeps only the bounded xterm title stack. A snapshot is emitted
+            // only after this transient stack is balanced, so no hidden parser
+            // state is lost across a checkpoint.
+            var operation = ParameterOrDefault(parameters, 0, 0);
+            if (operation == 22)
+            {
+                titleStack.Add(title);
+                if (titleStack.Count > 20) titleStack.RemoveAt(0);
+            }
+            else if (operation == 23 && titleStack.Count > 0)
+            {
+                var last = titleStack.Count - 1;
+                title = titleStack[last];
+                titleStack.RemoveAt(last);
             }
         }
 
@@ -3020,6 +3112,7 @@ namespace TermLink.Agent
             defaultBackgroundRgb = 0;
             defaultCursorRgb = 0x00c0c0c0;
             title = string.Empty;
+            titleStack.Clear();
             hyperlinks.Clear();
             tabStops = CreateDefaultTabStops(columns);
             defaultTabStopsEnabled = true;

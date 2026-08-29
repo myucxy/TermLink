@@ -31,11 +31,17 @@ class TailFirstImeStabilityTest {
         val terminalSurface = source
             .substringAfter("private fun TerminalSurface(")
             .substringBefore("private fun ActivityPage(")
+        val imeRequest = source
+            .substringAfter("private fun requestTailFirstTerminalIme(")
+            .substringBefore("@Composable\nprivate fun ActivityPage(")
 
         assertFalse(showImeOperation.contains("delay(750)"))
         assertTrue(showImeOperation.contains("awaitStableTailFirstIme(surface)"))
         assertTrue(stabilityWait.contains("withTimeoutOrNull(TAIL_FIRST_IME_STABILITY_TIMEOUT_MILLIS)"))
         assertTrue(stabilityWait.contains("awaitTailFirstUiFrame()"))
+        assertTrue(stabilityWait.contains("surface.showIme()"))
+        assertTrue(source.contains("private const val TAIL_FIRST_IME_RETRY_FRAME_INTERVAL = 30"))
+        assertTrue(source.contains("private const val TAIL_FIRST_IME_STABILITY_TIMEOUT_MILLIS = 30_000L"))
         assertTrue(source.contains("private const val TAIL_FIRST_IME_REQUIRED_STABLE_FRAMES = 2"))
         assertTrue(timeoutFailure.contains("\"observed_frames\""))
         assertTrue(timeoutFailure.contains("\"stable_frames\""))
@@ -56,6 +62,10 @@ class TailFirstImeStabilityTest {
         assertFalse(terminalSurface.contains("onSize"))
         assertTrue(terminalSurface.contains(".padding(horizontal = 6.dp)"))
         assertFalse(terminalSurface.contains(".padding(6.dp)"))
+        assertTrue(imeRequest.contains("view.postDelayed("))
+        assertTrue(imeRequest.contains("view.hasFocus()"))
+        assertTrue(imeRequest.contains("getWindowInsetsController(view)?.show(WindowInsetsCompat.Type.ime())"))
+        assertTrue(imeRequest.contains("showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)"))
 
         val manifest = Files.newBufferedReader(appRoot.resolve("src/main/AndroidManifest.xml")).use { it.readText() }
         assertTrue(manifest.contains("android:windowSoftInputMode=\"adjustNothing\""))

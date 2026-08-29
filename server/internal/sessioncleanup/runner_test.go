@@ -1,10 +1,23 @@
 package sessioncleanup
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
+
+type sensitiveLogError struct {
+	text  string
+	calls int
+}
+
+func (e *sensitiveLogError) Error() string {
+	e.calls++
+	return e.text
+}
 
 type recordingStore struct {
 	endedBefore time.Time
@@ -59,5 +72,21 @@ func TestNewClampsOversizedBatch(t *testing.T) {
 	}
 	if store.batchSize != DefaultBatchSize {
 		t.Fatalf("batch=%d, want %d", store.batchSize, DefaultBatchSize)
+	}
+}
+
+func TestCleanupFailureLogDoesNotFormatError(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, nil))
+	sensitiveErr := &sensitiveLogError{text: "password=session-cleanup-secret"}
+
+	logCleanupFailure(logger, 5, sensitiveErr)
+
+	logged := output.String()
+	if sensitiveErr.calls != 0 || strings.Contains(logged, "session-cleanup-secret") {
+		t.Fatalf("cleanup log formatted or exposed the error: calls=%d log=%s", sensitiveErr.calls, logged)
+	}
+	if !strings.Contains(logged, `"error_class":"session_cleanup_failed"`) || !strings.Contains(logged, `"sessions":5`) {
+		t.Fatalf("cleanup log is missing stable fields: %s", logged)
 	}
 }

@@ -15,8 +15,15 @@ namespace TermLink.Tray.UpdateValidation
 
         public static int Main(string[] args)
         {
+            var preferencePath = Path.Combine(
+                Path.GetTempPath(),
+                "TermLink.Tray.UpdateValidation",
+                Guid.NewGuid().ToString("N"),
+                "ui.preferences");
+            AppContext.SetData(TrayPreferences.StoragePathAppContextKey, preferencePath);
             try
             {
+                LocalizesAndSanitizesPublicErrors();
                 ParsesAppShipArtifactContract();
                 ExportsBoundedDesktopUpdateStatus();
                 ParsesDesktopUpdateArguments();
@@ -36,6 +43,40 @@ namespace TermLink.Tray.UpdateValidation
                 Console.Error.WriteLine(error);
                 return 1;
             }
+            finally
+            {
+                try
+                {
+                    var directory = Path.GetDirectoryName(preferencePath);
+                    if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
+                        Directory.Delete(directory, true);
+                }
+                catch
+                {
+                    // Isolated presentation preferences do not affect validation.
+                }
+                AppContext.SetData(TrayPreferences.StoragePathAppContextKey, null);
+            }
+        }
+
+        private static void LocalizesAndSanitizesPublicErrors()
+        {
+            const string internalDetail = "secret endpoint C:\\private\\credentials.json";
+            TrayPreferences.Update(TrayLanguage.Chinese, TrayTheme.FollowSystem);
+            var chinese = TrayText.PublicError(new InvalidOperationException(internalDetail));
+            TrayPreferences.Update(TrayLanguage.English, TrayTheme.FollowSystem);
+            var english = TrayText.PublicError(new InvalidOperationException(internalDetail));
+            var stableCode = TrayText.PublicError("NO_RESPONSE");
+
+            Assert(chinese.Contains("操作失败", StringComparison.Ordinal) &&
+                !chinese.Contains(internalDetail, StringComparison.Ordinal),
+                "Chinese public error is localized and sanitized");
+            Assert(english.Contains("operation failed", StringComparison.OrdinalIgnoreCase) &&
+                !english.Contains(internalDetail, StringComparison.Ordinal),
+                "English public error is localized and sanitized");
+            Assert(stableCode.Contains("[NO_RESPONSE]", StringComparison.Ordinal),
+                "stable public error code retained");
+            Cases.Add("localized_safe_errors");
         }
 
         private static void UsesBuildBoundUpdateChannel()

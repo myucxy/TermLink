@@ -1,0 +1,36 @@
+{{define "admin-navigation"}}
+<nav class="admin-nav" aria-label="管理中心">
+  <div class="admin-nav-group" role="group" aria-label="总览">
+    <a href="/admin?section=overview"{{if and (not .CommerceNavigation) (eq .Section "overview")}} aria-current="page"{{end}}><span class="admin-nav-text">总览与待办</span></a>
+  </div>
+  <div class="admin-nav-group" role="group" aria-label="用户与准入">
+    <a href="/admin?section=accounts"{{if and (not .CommerceNavigation) (eq .Section "accounts")}} aria-current="page"{{end}}><span class="admin-nav-text">账号与角色</span></a>
+    <a href="/admin/commerce?section=registration"{{if and .CommerceNavigation (eq .Section "registration")}} aria-current="page"{{end}}><span class="admin-nav-text">注册与邀请码</span></a>
+  </div>
+  <div class="admin-nav-group" role="group" aria-label="设备与连接">
+    <a href="/admin?section=connections"{{if and (not .CommerceNavigation) (eq .Section "connections")}} aria-current="page"{{end}}><span class="admin-nav-text">连接路由</span></a>
+  </div>
+  <div class="admin-nav-group" role="group" aria-label="产品与分发">
+    <a href="/admin?section=versions"{{if and (not .CommerceNavigation) (eq .Section "versions")}} aria-current="page"{{end}}><span class="admin-nav-text">客户端版本</span></a>
+    <a href="/admin/commerce?section=catalog"{{if and .CommerceNavigation (eq .Section "catalog")}} aria-current="page"{{end}}><span class="admin-nav-text">套餐目录</span></a>
+    <a href="/admin/commerce?section=redemptions"{{if and .CommerceNavigation (eq .Section "redemptions")}} aria-current="page"{{end}}><span class="admin-nav-text">兑换码</span></a>
+  </div>
+  <div class="admin-nav-group" role="group" aria-label="订单与财务">
+    <a href="/admin/commerce?section=orders"{{if and .CommerceNavigation (eq .Section "orders")}} aria-current="page"{{end}}><span class="admin-nav-text">订单与退款</span></a>
+    <a href="/admin/commerce?section=reports"{{if and .CommerceNavigation (eq .Section "reports")}} aria-current="page"{{end}}><span class="admin-nav-text">订单报表</span></a>
+    <a href="/admin/commerce?section=consistency"{{if and .CommerceNavigation (eq .Section "consistency")}} aria-current="page"{{end}}><span class="admin-nav-text">账务一致性</span></a>
+    <a href="/admin/commerce?section=reconciliation"{{if and .CommerceNavigation (eq .Section "reconciliation")}} aria-current="page"{{end}}><span class="admin-nav-text">对账差异</span></a>
+    <a href="/admin/commerce?section=payments"{{if and .CommerceNavigation (eq .Section "payments")}} aria-current="page"{{end}}><span class="admin-nav-text">支付事件</span></a>
+    <a href="/admin/commerce?section=channels"{{if and .CommerceNavigation (eq .Section "channels")}} aria-current="page"{{end}}><span class="admin-nav-text">支付渠道</span></a>
+  </div>
+  <div class="admin-nav-group" role="group" aria-label="运营与安全">
+    <a href="/admin?section=announcements"{{if and (not .CommerceNavigation) (eq .Section "announcements")}} aria-current="page"{{end}}><span class="admin-nav-text">公告管理</span></a>
+    <a href="/admin/commerce?section=entitlements"{{if and .CommerceNavigation (eq .Section "entitlements")}} aria-current="page"{{end}}><span class="admin-nav-text">人工权益</span></a>
+    <a href="/admin?section=audit"{{if and (not .CommerceNavigation) (eq .Section "audit")}} aria-current="page"{{end}}><span class="admin-nav-text">安全审计</span></a>
+  </div>
+  <div class="admin-nav-group" role="group" aria-label="系统">
+    <a href="/admin?section=deployment"{{if and (not .CommerceNavigation) (eq .Section "deployment")}} aria-current="page"{{end}}><span class="admin-nav-text">系统运行</span></a>
+    {{if .CanConfigureSystem}}<a href="/admin?section=settings"{{if and (not .CommerceNavigation) (eq .Section "settings")}} aria-current="page"{{end}}><span class="admin-nav-text">系统设置</span></a>{{end}}
+  </div>
+</nav>
+{{end}}

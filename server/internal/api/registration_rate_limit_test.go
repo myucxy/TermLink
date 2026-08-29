@@ -150,7 +150,7 @@ func newRegistrationServiceForRateLimitTest(t *testing.T) *auth.DirectRegistrati
 
 func performAccountRegistration(t *testing.T, handler http.Handler, username, clientIP string) int {
 	t.Helper()
-	body := []byte(fmt.Sprintf(`{"username":%q,"email":%q,"password":"correct horse battery staple","password_confirm":"correct horse battery staple"}`, username, username+"@example.test"))
+	body := []byte(fmt.Sprintf(`{"username":%q,"nickname":%q,"email":%q,"password":"correct horse battery staple","password_confirm":"correct horse battery staple"}`, username, username, username+"@example.test"))
 	request := httptest.NewRequest(http.MethodPost, "/v1/auth/register", bytes.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Forwarded-For", "192.168.9.28")

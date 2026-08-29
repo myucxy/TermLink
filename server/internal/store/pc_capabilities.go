@@ -47,10 +47,9 @@ func applyLegacyPCDefaults(item *PCRecord) {
 	if item.Capabilities != nil {
 		return
 	}
+	// Heartbeat support only describes liveness reporting. Snapshot restore is
+	// fail-closed and must be explicitly advertised by the Agent.
 	item.Capabilities = []string{PCCapabilityRealtimeTerminalV1, PCCapabilityFileOperationsV1}
-	if item.SessionHeartbeatCapable {
-		item.Capabilities = append(item.Capabilities, PCCapabilityTerminalSnapshotV1)
-	}
 	if len(item.SupportedShells) > 0 || len(item.TerminalCommands) > 0 {
 		item.Capabilities = append(item.Capabilities, PCCapabilityTerminalCommandsV1)
 	}

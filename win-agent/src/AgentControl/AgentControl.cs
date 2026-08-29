@@ -414,6 +414,11 @@ namespace TermLink.Agent
 
     public sealed class ProductionTerminalCommandSummary
     {
+        public ProductionTerminalCommandSummary()
+        {
+            RunAsAdministrator = true;
+        }
+
         public string Id { get; set; }
         public string DisplayName { get; set; }
         public string Executable { get; set; }
@@ -421,7 +426,7 @@ namespace TermLink.Agent
         public string ShellType { get; set; }
         public bool Detected { get; set; }
         public bool Enabled { get; set; }
-        public bool RunAsAdministrator { get; set; } = true;
+        public bool RunAsAdministrator { get; set; }
     }
 
     public sealed class PairingChallengeSummary

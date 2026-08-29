@@ -8,27 +8,29 @@
   <title>{{.Title}} · TermLink</title>
   <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
   <script src="/assets/theme-init.js?v=01b-v11"></script>
-  <link rel="stylesheet" href="/assets/site.css?v=01b-v11">
+  <link rel="stylesheet" href="/assets/site.css?v=01b-v12">
   <script src="/assets/theme.js?v=01b-v11" defer></script>
 </head>
 <body class="error-body">
   <main class="error-card">
     <div class="error-card-header">
-      <a class="brand" href="/" aria-label="TermLink 首页">
+      <a class="brand" href="/" aria-label="TermLink 首页 / TermLink home">
         <img class="brand-mark" src="/assets/termlink-app-icon.svg" alt="">
         <span><strong>TermLink</strong><small>Secure account portal</small></span>
       </a>
-      <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题">
+      <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题 / Toggle theme" title="切换主题 / Toggle theme">
         <span class="theme-toggle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path class="theme-icon-moon" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/><g class="theme-icon-sun"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></g></svg></span>
-        <span class="theme-toggle-label">主题</span>
+        <span class="theme-toggle-label">主题 / Theme</span>
       </button>
     </div>
-    <p class="eyebrow">REQUEST NOT COMPLETED</p>
-    <h1>{{.Title}}</h1>
-    <p>{{.Message}}</p>
-    <div class="final-cta-actions" aria-label="错误恢复导航">
-      <a class="button button-primary" href="/account">返回个人中心</a>
-      <a class="button button-quiet" href="/">返回首页</a>
+    <p class="eyebrow">请求未完成 / REQUEST NOT COMPLETED</p>
+    <h1><span lang="zh-CN">{{.Title}}</span><br><span lang="en">{{.EnglishTitle}}</span></h1>
+    <p lang="zh-CN">{{.Message}}</p>
+    <p lang="en">{{.EnglishMessage}}</p>
+    {{if .Reference}}<p class="error-reference">问题编号 / Reference: <code>{{.Reference}}</code></p>{{end}}
+    <div class="final-cta-actions" aria-label="错误恢复导航 / Error recovery navigation">
+      <a class="button button-primary" href="/account">返回个人中心 / Account</a>
+      <a class="button button-quiet" href="/">返回首页 / Home</a>
     </div>
   </main>
 </body>

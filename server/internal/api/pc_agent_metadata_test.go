@@ -1,6 +1,7 @@
 package api
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/google/uuid"
@@ -63,7 +64,6 @@ func TestNormalizeLegacyWindowsMetadataSynthesizesCompatibilityCapabilities(t *t
 	}
 	for _, expected := range []string{
 		store.PCCapabilityRealtimeTerminalV1,
-		store.PCCapabilityTerminalSnapshotV1,
 		store.PCCapabilityFileOperationsV1,
 		store.PCCapabilityTerminalCommandsV1,
 		store.PCCapabilityRemoteAgentUpdateV1,
@@ -74,5 +74,41 @@ func TestNormalizeLegacyWindowsMetadataSynthesizesCompatibilityCapabilities(t *t
 	}
 	if platform != "windows" || architecture != "unknown" || version != "legacy" {
 		t.Fatalf("unexpected legacy defaults: %q %q %q", platform, architecture, version)
+	}
+	if store.HasPCCapability(capabilities, store.PCCapabilityTerminalSnapshotV1) {
+		t.Fatalf("legacy heartbeat incorrectly synthesized snapshot capability: %#v", capabilities)
+	}
+}
+
+func TestNormalizePCAgentMetadataPreservesOnlyExplicitSnapshotCapability(t *testing.T) {
+	const futureCapability = "future_terminal_presentation_v2"
+	want := []string{
+		store.PCCapabilityRealtimeTerminalV1,
+		store.PCCapabilityTerminalSnapshotV1,
+		futureCapability,
+	}
+	_, _, _, capabilities, err := normalizePCAgentMetadata(
+		store.DeviceTypeLegacyWindowsPC, "", "", "", append([]string(nil), want...),
+		true, false, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(capabilities, want) {
+		t.Fatalf("explicit and unknown capabilities = %#v, want %#v", capabilities, want)
+	}
+}
+
+func TestNormalizePCAgentMetadataRejectsDuplicateCapabilities(t *testing.T) {
+	_, _, _, _, err := normalizePCAgentMetadata(
+		store.DeviceTypePCAgent, "windows", "x64", "Windows 11", []string{
+			store.PCCapabilityRealtimeTerminalV1,
+			store.PCCapabilityTerminalSnapshotV1,
+			store.PCCapabilityTerminalSnapshotV1,
+		},
+		false, false, nil, nil,
+	)
+	if err == nil {
+		t.Fatal("duplicate PC capabilities were accepted")
 	}
 }

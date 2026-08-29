@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 func TestDirectRegistrationServiceSubmitsBoundedForm(t *testing.T) {
@@ -52,6 +55,236 @@ func TestDirectRegistrationServiceSubmitsBoundedForm(t *testing.T) {
 	}
 	if !strings.Contains(posted.Get("password"), "correct horse") {
 		t.Fatal("password was not submitted to the identity provider")
+	}
+	if posted.Get("user.attributes."+RegistrationAttemptIDAttribute) != "" ||
+		posted.Get("user.attributes."+RegistrationAttemptProofAttribute) != "" {
+		t.Fatal("legacy registration unexpectedly submitted recovery attributes")
+	}
+}
+
+func TestDirectRegistrationServiceRegisterAttemptSubmitsServerProof(t *testing.T) {
+	attemptID := uuid.MustParse("10000000-0000-4000-8000-000000000001")
+	proofKey := bytes.Repeat([]byte{0x5a}, 32)
+	var posted url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/realms/test/protocol/openid-connect/auth":
+			_, _ = fmt.Fprintf(w, `<a href="/realms/test/login-actions/registration?session_code=opaque&amp;flow_state=%s">Create</a>`, url.QueryEscape(r.URL.Query().Get("state")))
+		case r.URL.Path == "/realms/test/login-actions/registration" && r.Method == http.MethodGet:
+			// Even a malicious provider theme cannot preserve attacker values:
+			// RegisterAttempt writes both controlled fields after hidden inputs.
+			_, _ = fmt.Fprintf(w, `<form id="kc-register-form" action="http://%s/realms/test/login-actions/registration?session_code=opaque&amp;flow_state=%s" method="post">
+				<input type="hidden" name="user.attributes.%s" value="attacker-attempt"/>
+				<input type="hidden" name="user.attributes.%s" value="attacker-proof"/>
+			</form>`, r.Host, url.QueryEscape(r.URL.Query().Get("flow_state")), RegistrationAttemptIDAttribute, RegistrationAttemptProofAttribute)
+		case r.URL.Path == "/realms/test/login-actions/registration" && r.Method == http.MethodPost:
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			posted = r.PostForm
+			w.Header().Set("Location", "dev.termlink:/oauth2redirect?code=created&state="+url.QueryEscape(r.URL.Query().Get("flow_state")))
+			w.WriteHeader(http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	issuer, _ := url.Parse(server.URL + "/realms/test")
+	service := &DirectRegistrationService{
+		issuer: issuer, clientID: "termlink-android", redirectURI: "dev.termlink:/oauth2redirect",
+		proofKey: proofKey,
+		http:     &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
+	}
+	input := DirectRegistrationInput{
+		Username: "alice", Email: "alice@example.test", Password: "correct horse battery staple", Confirm: "correct horse battery staple",
+	}
+	if err := service.RegisterAttempt(context.Background(), attemptID, input); err != nil {
+		t.Fatal(err)
+	}
+	if got := posted.Get("user.attributes." + RegistrationAttemptIDAttribute); got != attemptID.String() {
+		t.Fatalf("attempt attribute = %q, want %q", got, attemptID)
+	}
+	proof := posted.Get("user.attributes." + RegistrationAttemptProofAttribute)
+	if !validRegistrationAttemptProof(proofKey, attemptID, proof) {
+		t.Fatalf("provider received an invalid attempt proof: %q", proof)
+	}
+}
+
+func TestDirectRegistrationServiceRegisterAttemptUsesDeclarativeProfileFields(t *testing.T) {
+	attemptID := uuid.MustParse("20000000-0000-4000-8000-000000000002")
+	proofKey := bytes.Repeat([]byte{0x6b}, 32)
+	var posted url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/realms/test/protocol/openid-connect/auth":
+			if !strings.Contains(r.URL.Query().Get("scope"), RegistrationAttemptScope) {
+				t.Fatal("registration attempt scope was not requested")
+			}
+			_, _ = fmt.Fprintf(w, `<form id="kc-register-form" action="http://%s/realms/test/login-actions/registration?flow_state=%s" method="post">
+				<input name="%s"/><input name="%s"/>
+			</form>`, r.Host, url.QueryEscape(r.URL.Query().Get("state")), RegistrationAttemptIDAttribute, RegistrationAttemptProofAttribute)
+		case r.URL.Path == "/realms/test/login-actions/registration" && r.Method == http.MethodPost:
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			posted = r.PostForm
+			w.Header().Set("Location", "dev.termlink:/oauth2redirect?code=created&state="+url.QueryEscape(r.URL.Query().Get("flow_state")))
+			w.WriteHeader(http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	issuer, _ := url.Parse(server.URL + "/realms/test")
+	service := &DirectRegistrationService{
+		issuer: issuer, clientID: "termlink-android", redirectURI: "dev.termlink:/oauth2redirect",
+		proofKey: proofKey,
+		http:     &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
+	}
+	err := service.RegisterAttempt(context.Background(), attemptID, DirectRegistrationInput{
+		Username: "alice", Email: "alice@example.test", Password: "correct horse battery staple", Confirm: "correct horse battery staple",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if posted.Get(RegistrationAttemptIDAttribute) != attemptID.String() ||
+		!validRegistrationAttemptProof(proofKey, attemptID, posted.Get(RegistrationAttemptProofAttribute)) {
+		t.Fatal("declarative User Profile fields did not receive the controlled values")
+	}
+	if posted.Get("user.attributes."+RegistrationAttemptIDAttribute) != "" ||
+		posted.Get("user.attributes."+RegistrationAttemptProofAttribute) != "" {
+		t.Fatal("Keycloak 26 form unexpectedly received legacy attribute fields")
+	}
+}
+
+func TestDirectRegistrationServiceUsesAuthorizationRegistrationFormDirectly(t *testing.T) {
+	var (
+		followedLoginLink bool
+		posted            bool
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/realms/test/protocol/openid-connect/auth":
+			// Keycloak 26 prompt=create returns this form immediately. The
+			// authenticate link is intentionally present to catch a regression
+			// that leaves the registration flow before submitting the form.
+			_, _ = fmt.Fprintf(w, `<form id="kc-register-form" action="http://%s/realms/test/login-actions/registration?flow_state=%s" method="post"></form><a href="/realms/test/login-actions/authenticate?execution=registration">Sign in</a>`, r.Host, url.QueryEscape(r.URL.Query().Get("state")))
+		case r.URL.Path == "/realms/test/login-actions/authenticate":
+			followedLoginLink = true
+			_, _ = w.Write([]byte(`<form id="kc-form-login"></form>`))
+		case r.URL.Path == "/realms/test/login-actions/registration" && r.Method == http.MethodPost:
+			posted = true
+			w.Header().Set("Location", "dev.termlink:/oauth2redirect?code=created&state="+url.QueryEscape(r.URL.Query().Get("flow_state")))
+			w.WriteHeader(http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	issuer, _ := url.Parse(server.URL + "/realms/test")
+	service := &DirectRegistrationService{
+		issuer: issuer, clientID: "termlink-android", redirectURI: "dev.termlink:/oauth2redirect",
+		http: &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
+	}
+	err := service.Register(context.Background(), DirectRegistrationInput{
+		Username: "alice", Email: "alice@example.test", Password: "correct horse battery staple", Confirm: "correct horse battery staple",
+	})
+	if err != nil || !posted || followedLoginLink {
+		t.Fatalf("direct registration form result: err=%v posted=%v followed_login=%v", err, posted, followedLoginLink)
+	}
+}
+
+func TestDirectRegistrationServiceRegisterAttemptRequiresProofKey(t *testing.T) {
+	posted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/realms/test/protocol/openid-connect/auth":
+			_, _ = fmt.Fprintf(w, `<a href="/realms/test/login-actions/registration?session_code=opaque&amp;flow_state=%s">Create</a>`, url.QueryEscape(r.URL.Query().Get("state")))
+		case r.URL.Path == "/realms/test/login-actions/registration" && r.Method == http.MethodGet:
+			_, _ = fmt.Fprintf(w, `<form id="kc-register-form" action="http://%s/realms/test/login-actions/registration?session_code=opaque&amp;flow_state=%s" method="post"><input name="%s"/><input name="%s"/></form>`, r.Host, url.QueryEscape(r.URL.Query().Get("flow_state")), RegistrationAttemptIDAttribute, RegistrationAttemptProofAttribute)
+		case r.URL.Path == "/realms/test/login-actions/registration" && r.Method == http.MethodPost:
+			posted = true
+			w.WriteHeader(http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	issuer, _ := url.Parse(server.URL + "/realms/test")
+	service := &DirectRegistrationService{
+		issuer: issuer, clientID: "termlink-android", redirectURI: "dev.termlink:/oauth2redirect",
+		http: &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
+	}
+	err := service.RegisterAttempt(context.Background(), uuid.New(), DirectRegistrationInput{
+		Username: "alice", Email: "alice@example.test", Password: "correct horse battery staple", Confirm: "correct horse battery staple",
+	})
+	if !errors.Is(err, errRegistrationRejected) || posted {
+		t.Fatalf("missing proof key result: err=%v posted=%v", err, posted)
+	}
+}
+
+func TestDirectRegistrationServicePostTimeoutHasUnknownOutcome(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/realms/test/protocol/openid-connect/auth":
+			_, _ = fmt.Fprintf(w, `<a href="/realms/test/login-actions/registration?session_code=opaque&amp;flow_state=%s">Create</a>`, url.QueryEscape(r.URL.Query().Get("state")))
+		case r.URL.Path == "/realms/test/login-actions/registration" && r.Method == http.MethodGet:
+			_, _ = fmt.Fprintf(w, `<form id="kc-register-form" action="http://%s/realms/test/login-actions/registration?session_code=opaque&amp;flow_state=%s" method="post"><input name="%s"/><input name="%s"/></form>`, r.Host, url.QueryEscape(r.URL.Query().Get("flow_state")), RegistrationAttemptIDAttribute, RegistrationAttemptProofAttribute)
+		case r.URL.Path == "/realms/test/login-actions/registration" && r.Method == http.MethodPost:
+			time.Sleep(250 * time.Millisecond)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	issuer, _ := url.Parse(server.URL + "/realms/test")
+	service := &DirectRegistrationService{
+		issuer: issuer, clientID: "termlink-android", redirectURI: "dev.termlink:/oauth2redirect",
+		proofKey: bytes.Repeat([]byte{0x5a}, 32),
+		http: &http.Client{
+			Timeout:       100 * time.Millisecond,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+		},
+	}
+	err := service.RegisterAttempt(context.Background(), uuid.New(), DirectRegistrationInput{
+		Username: "alice", Email: "alice@example.test", Password: "correct horse battery staple", Confirm: "correct horse battery staple",
+	})
+	if !errors.Is(err, ErrRegistrationOutcomeUnknown) {
+		t.Fatalf("POST timeout error = %v, want unknown outcome", err)
+	}
+}
+
+func TestDirectRegistrationServiceExplicitProviderRejectionIsNotAmbiguous(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/realms/test/protocol/openid-connect/auth":
+			_, _ = fmt.Fprintf(w, `<a href="/realms/test/login-actions/registration?session_code=opaque&amp;flow_state=%s">Create</a>`, url.QueryEscape(r.URL.Query().Get("state")))
+		case r.URL.Path == "/realms/test/login-actions/registration" && r.Method == http.MethodGet:
+			_, _ = fmt.Fprintf(w, `<form id="kc-register-form" action="http://%s/realms/test/login-actions/registration?session_code=opaque&amp;flow_state=%s" method="post"></form>`, r.Host, url.QueryEscape(r.URL.Query().Get("flow_state")))
+		case r.URL.Path == "/realms/test/login-actions/registration" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusConflict)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	issuer, _ := url.Parse(server.URL + "/realms/test")
+	service := &DirectRegistrationService{
+		issuer: issuer, clientID: "termlink-android", redirectURI: "dev.termlink:/oauth2redirect",
+		http: &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
+	}
+	err := service.Register(context.Background(), DirectRegistrationInput{
+		Username: "alice", Email: "alice@example.test", Password: "correct horse battery staple", Confirm: "correct horse battery staple",
+	})
+	if !errors.Is(err, errRegistrationRejected) || errors.Is(err, ErrRegistrationOutcomeUnknown) {
+		t.Fatalf("explicit rejection error = %v", err)
 	}
 }
 
@@ -261,8 +494,8 @@ func TestDirectRegistrationServiceRejectsInvalidCallbacks(t *testing.T) {
 			err := service.Register(context.Background(), DirectRegistrationInput{
 				Username: "alice", Email: "alice@example.test", Password: "correct horse battery staple", Confirm: "correct horse battery staple",
 			})
-			if !errors.Is(err, errRegistrationRejected) {
-				t.Fatalf("invalid callback was not rejected: %v", err)
+			if !errors.Is(err, ErrRegistrationOutcomeUnknown) {
+				t.Fatalf("ambiguous callback was treated as an authoritative rejection: %v", err)
 			}
 		})
 	}
@@ -349,8 +582,8 @@ func TestDirectRegistrationServiceHTTP200RequiresExplicitSuccessMarker(t *testin
 			if test.success && err != nil {
 				t.Fatalf("explicit Keycloak success marker was rejected: %v", err)
 			}
-			if !test.success && !errors.Is(err, errRegistrationRejected) {
-				t.Fatalf("HTTP 200 page was not rejected: %v", err)
+			if !test.success && err == nil {
+				t.Fatal("HTTP 200 page was accepted without an explicit success marker")
 			}
 		})
 	}

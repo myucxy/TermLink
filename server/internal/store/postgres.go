@@ -68,14 +68,48 @@ type Postgres struct {
 	AutoTrustDevices bool
 }
 
+type OpenOptions struct {
+	MaxConns          int32
+	MinConns          int32
+	MaxConnLifetime   time.Duration
+	MaxConnIdleTime   time.Duration
+	HealthCheckPeriod time.Duration
+	ConnectTimeout    time.Duration
+}
+
 func Open(ctx context.Context, databaseURL string) (*Postgres, error) {
+	return OpenWithOptions(ctx, databaseURL, OpenOptions{MinConns: 2})
+}
+
+func OpenWithOptions(ctx context.Context, databaseURL string, options OpenOptions) (*Postgres, error) {
 	config, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse PostgreSQL URL: %w", err)
 	}
-	config.MaxConns = 20
-	config.MinConns = 2
-	config.MaxConnLifetime = 30 * time.Minute
+	if options.MaxConns <= 0 {
+		options.MaxConns = 20
+	}
+	if options.MinConns < 0 {
+		options.MinConns = 0
+	}
+	if options.MaxConnLifetime <= 0 {
+		options.MaxConnLifetime = 30 * time.Minute
+	}
+	if options.MaxConnIdleTime <= 0 {
+		options.MaxConnIdleTime = 5 * time.Minute
+	}
+	if options.HealthCheckPeriod <= 0 {
+		options.HealthCheckPeriod = time.Minute
+	}
+	if options.ConnectTimeout <= 0 {
+		options.ConnectTimeout = 5 * time.Second
+	}
+	config.MaxConns = options.MaxConns
+	config.MinConns = options.MinConns
+	config.MaxConnLifetime = options.MaxConnLifetime
+	config.MaxConnIdleTime = options.MaxConnIdleTime
+	config.HealthCheckPeriod = options.HealthCheckPeriod
+	config.ConnConfig.ConnectTimeout = options.ConnectTimeout
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("open PostgreSQL: %w", err)
@@ -2667,6 +2701,8 @@ type Plan struct {
 	FeatureFlags    json.RawMessage `json:"feature_flags"`
 	ChannelProducts json.RawMessage `json:"channel_products"`
 	SortOrder       int             `json:"sort_order"`
+	PriceMinor      int64           `json:"price_minor"`
+	Currency        string          `json:"currency"`
 }
 
 // PlanDraftInput is the server-side catalog definition. JSON values are
@@ -2686,6 +2722,8 @@ type PlanDraftInput struct {
 	AvailableFrom    *time.Time
 	AvailableUntil   *time.Time
 	FallbackPlanKey  string
+	PriceMinor       int64
+	Currency         string
 }
 
 type PlanDraft struct {
@@ -2704,6 +2742,8 @@ type PlanDraft struct {
 	AvailableFrom    *time.Time      `json:"available_from,omitempty"`
 	AvailableUntil   *time.Time      `json:"available_until,omitempty"`
 	FallbackPlanKey  string          `json:"fallback_plan_key,omitempty"`
+	PriceMinor       int64           `json:"price_minor"`
+	Currency         string          `json:"currency"`
 }
 
 // IsAdmin is intentionally a database lookup. No client claim or device
@@ -2735,7 +2775,10 @@ func validatePlanDraftInput(input PlanDraftInput) error {
 	if input.BillingPeriod != "FREE" && input.BillingPeriod != "MONTHLY" && input.BillingPeriod != "YEARLY" {
 		return ErrDenied
 	}
-	if input.MaxRemotePCs != UnlimitedQuota || input.MaxLiveSessions != UnlimitedQuota || input.SortOrder < -100000 || input.SortOrder > 100000 {
+	if input.MaxRemotePCs != UnlimitedQuota || input.MaxLiveSessions != UnlimitedQuota || input.SortOrder < -100000 || input.SortOrder > 100000 || input.PriceMinor < 0 || input.PriceMinor > 100_000_000 {
+		return ErrDenied
+	}
+	if input.Currency != "CNY" || (input.BillingPeriod == "FREE" && input.PriceMinor != 0) {
 		return ErrDenied
 	}
 	if input.AvailableFrom != nil && input.AvailableUntil != nil && !input.AvailableUntil.After(*input.AvailableFrom) {
@@ -2767,6 +2810,10 @@ func normalizePlanDraftInput(input PlanDraftInput) PlanDraftInput {
 	}
 	if len(input.VisiblePlatforms) == 0 {
 		input.VisiblePlatforms = []string{"ANDROID", "WEB"}
+	}
+	input.Currency = strings.ToUpper(strings.TrimSpace(input.Currency))
+	if input.Currency == "" {
+		input.Currency = "CNY"
 	}
 	return input
 }
@@ -2800,7 +2847,7 @@ func scanPlanDraft(row pgx.Row) (PlanDraft, error) {
 	err := row.Scan(&item.ID, &item.CatalogVersion, &item.Key, &item.DisplayName, &item.Description,
 		&item.BillingPeriod, &item.MaxRemotePCs, &item.MaxLiveSessions, &item.FeatureFlags,
 		&item.ChannelProducts, &item.SortOrder, &item.VisiblePlatforms, &item.AvailableFrom,
-		&item.AvailableUntil, &item.FallbackPlanKey)
+		&item.AvailableUntil, &item.FallbackPlanKey, &item.PriceMinor, &item.Currency)
 	return item, err
 }
 
@@ -2830,13 +2877,15 @@ func (s *Postgres) CreatePlanDraft(ctx context.Context, adminID, actorDeviceID u
 		// Start a draft from the current published catalog. This preserves the
 		// free plan and any unchanged plans when an administrator publishes one
 		// new or edited definition.
-		rows, queryErr := tx.Query(ctx, `SELECT p.plan_key,p.display_name,p.description,p.billing_period,p.max_remote_pcs,p.max_live_sessions,p.feature_flags,p.channel_products,p.sort_order,p.visible_platforms,p.available_from,p.available_until,p.fallback_plan_key FROM plans p JOIN catalog_versions c ON c.id=p.catalog_version_id WHERE c.status='PUBLISHED'`)
+		rows, queryErr := tx.Query(ctx, `SELECT p.plan_key,p.display_name,p.description,p.billing_period,p.max_remote_pcs,p.max_live_sessions,p.feature_flags,p.channel_products,p.sort_order,p.visible_platforms,p.available_from,p.available_until,p.fallback_plan_key,p.price_minor,p.currency FROM plans p JOIN catalog_versions c ON c.id=p.catalog_version_id WHERE c.status='PUBLISHED'`)
 		if queryErr != nil {
 			return PlanDraft{}, queryErr
 		}
 		type planCopy struct {
 			key, displayName, description, period string
 			maxPCs, maxSessions, sortOrder        int
+			priceMinor                            int64
+			currency                              string
 			flags, products                       json.RawMessage
 			platforms                             []string
 			from, until                           *time.Time
@@ -2850,11 +2899,13 @@ func (s *Postgres) CreatePlanDraft(ctx context.Context, adminID, actorDeviceID u
 			var platforms []string
 			var from, until *time.Time
 			var fallback *string
-			if scanErr := rows.Scan(&key, &displayName, &description, &period, &maxPCs, &maxSessions, &flags, &products, &sortOrder, &platforms, &from, &until, &fallback); scanErr != nil {
+			var priceMinor int64
+			var currency string
+			if scanErr := rows.Scan(&key, &displayName, &description, &period, &maxPCs, &maxSessions, &flags, &products, &sortOrder, &platforms, &from, &until, &fallback, &priceMinor, &currency); scanErr != nil {
 				rows.Close()
 				return PlanDraft{}, scanErr
 			}
-			copies = append(copies, planCopy{key: key, displayName: displayName, description: description, period: period, maxPCs: maxPCs, maxSessions: maxSessions, sortOrder: sortOrder, flags: flags, products: products, platforms: platforms, from: from, until: until, fallback: fallback})
+			copies = append(copies, planCopy{key: key, displayName: displayName, description: description, period: period, maxPCs: maxPCs, maxSessions: maxSessions, sortOrder: sortOrder, flags: flags, products: products, platforms: platforms, from: from, until: until, fallback: fallback, priceMinor: priceMinor, currency: currency})
 		}
 		if rowsErr := rows.Err(); rowsErr != nil {
 			rows.Close()
@@ -2862,7 +2913,7 @@ func (s *Postgres) CreatePlanDraft(ctx context.Context, adminID, actorDeviceID u
 		}
 		rows.Close()
 		for _, copy := range copies {
-			if _, insertErr := tx.Exec(ctx, `INSERT INTO plans(id,catalog_version_id,plan_key,display_name,description,billing_period,max_remote_pcs,max_live_sessions,feature_flags,channel_products,sort_order,visible_platforms,available_from,available_until,fallback_plan_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12,$13,$14,$15)`, uuid.New(), catalogID, copy.key, copy.displayName, copy.description, copy.period, copy.maxPCs, copy.maxSessions, copy.flags, copy.products, copy.sortOrder, copy.platforms, copy.from, copy.until, copy.fallback); insertErr != nil {
+			if _, insertErr := tx.Exec(ctx, `INSERT INTO plans(id,catalog_version_id,plan_key,display_name,description,billing_period,max_remote_pcs,max_live_sessions,feature_flags,channel_products,sort_order,visible_platforms,available_from,available_until,fallback_plan_key,price_minor,currency) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12,$13,$14,$15,$16,$17)`, uuid.New(), catalogID, copy.key, copy.displayName, copy.description, copy.period, copy.maxPCs, copy.maxSessions, copy.flags, copy.products, copy.sortOrder, copy.platforms, copy.from, copy.until, copy.fallback, copy.priceMinor, copy.currency); insertErr != nil {
 				return PlanDraft{}, insertErr
 			}
 		}
@@ -2872,17 +2923,17 @@ func (s *Postgres) CreatePlanDraft(ctx context.Context, adminID, actorDeviceID u
 	itemID := uuid.New()
 	existingErr := tx.QueryRow(ctx, `SELECT id FROM plans WHERE catalog_version_id=$1 AND plan_key=$2`, catalogID, strings.TrimSpace(input.PlanKey)).Scan(&itemID)
 	if existingErr == nil {
-		_, err = tx.Exec(ctx, `UPDATE plans SET display_name=$2,description=$3,billing_period=$4,max_remote_pcs=$5,max_live_sessions=$6,feature_flags=$7::jsonb,channel_products=$8::jsonb,sort_order=$9,visible_platforms=$10,available_from=$11,available_until=$12,fallback_plan_key=NULLIF($13,'') WHERE id=$1`,
-			itemID, strings.TrimSpace(input.DisplayName), strings.TrimSpace(input.Description), strings.ToUpper(strings.TrimSpace(input.BillingPeriod)), input.MaxRemotePCs, input.MaxLiveSessions, input.FeatureFlags, input.ChannelProducts, input.SortOrder, input.VisiblePlatforms, input.AvailableFrom, input.AvailableUntil, strings.TrimSpace(input.FallbackPlanKey))
+		_, err = tx.Exec(ctx, `UPDATE plans SET display_name=$2,description=$3,billing_period=$4,max_remote_pcs=$5,max_live_sessions=$6,feature_flags=$7::jsonb,channel_products=$8::jsonb,sort_order=$9,visible_platforms=$10,available_from=$11,available_until=$12,fallback_plan_key=NULLIF($13,''),price_minor=$14,currency=$15 WHERE id=$1`,
+			itemID, strings.TrimSpace(input.DisplayName), strings.TrimSpace(input.Description), strings.ToUpper(strings.TrimSpace(input.BillingPeriod)), input.MaxRemotePCs, input.MaxLiveSessions, input.FeatureFlags, input.ChannelProducts, input.SortOrder, input.VisiblePlatforms, input.AvailableFrom, input.AvailableUntil, strings.TrimSpace(input.FallbackPlanKey), input.PriceMinor, input.Currency)
 	} else {
 		if !errors.Is(existingErr, pgx.ErrNoRows) {
 			return PlanDraft{}, existingErr
 		}
 		_, err = tx.Exec(ctx, `
-			INSERT INTO plans(id,catalog_version_id,plan_key,display_name,description,billing_period,max_remote_pcs,max_live_sessions,feature_flags,channel_products,sort_order,visible_platforms,available_from,available_until,fallback_plan_key)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12,$13,$14,NULLIF($15,''))`,
+			INSERT INTO plans(id,catalog_version_id,plan_key,display_name,description,billing_period,max_remote_pcs,max_live_sessions,feature_flags,channel_products,sort_order,visible_platforms,available_from,available_until,fallback_plan_key,price_minor,currency)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12,$13,$14,NULLIF($15,''),$16,$17)`,
 			itemID, catalogID, strings.TrimSpace(input.PlanKey), strings.TrimSpace(input.DisplayName), strings.TrimSpace(input.Description), strings.ToUpper(strings.TrimSpace(input.BillingPeriod)),
-			input.MaxRemotePCs, input.MaxLiveSessions, input.FeatureFlags, input.ChannelProducts, input.SortOrder, input.VisiblePlatforms, input.AvailableFrom, input.AvailableUntil, strings.TrimSpace(input.FallbackPlanKey))
+			input.MaxRemotePCs, input.MaxLiveSessions, input.FeatureFlags, input.ChannelProducts, input.SortOrder, input.VisiblePlatforms, input.AvailableFrom, input.AvailableUntil, strings.TrimSpace(input.FallbackPlanKey), input.PriceMinor, input.Currency)
 		if err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "duplicate") {
 				return PlanDraft{}, ErrConflict
@@ -2896,11 +2947,11 @@ func (s *Postgres) CreatePlanDraft(ctx context.Context, adminID, actorDeviceID u
 		}
 		return PlanDraft{}, err
 	}
-	item, err := scanPlanDraft(tx.QueryRow(ctx, `SELECT id,$2::bigint,plan_key,display_name,description,billing_period,max_remote_pcs,max_live_sessions,feature_flags,channel_products,sort_order,visible_platforms,available_from,available_until,COALESCE(fallback_plan_key,'') FROM plans WHERE id=$1`, itemID, version))
+	item, err := scanPlanDraft(tx.QueryRow(ctx, `SELECT id,$2::bigint,plan_key,display_name,description,billing_period,max_remote_pcs,max_live_sessions,feature_flags,channel_products,sort_order,visible_platforms,available_from,available_until,COALESCE(fallback_plan_key,''),price_minor,currency FROM plans WHERE id=$1`, itemID, version))
 	if err != nil {
 		return PlanDraft{}, err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata) VALUES($1,$2,'billing.plan.create','plan',$3,'SUCCEEDED',$4,jsonb_build_object('catalog_version',$5::bigint))`, adminID, actorDeviceID, itemID, traceID, version); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata) VALUES($1,NULLIF($2,'00000000-0000-0000-0000-000000000000'::uuid),'billing.plan.create','plan',$3,'SUCCEEDED',$4,jsonb_build_object('catalog_version',$5::bigint))`, adminID, actorDeviceID, itemID, traceID, version); err != nil {
 		return PlanDraft{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -2924,10 +2975,10 @@ func (s *Postgres) UpdatePlanDraft(ctx context.Context, adminID, actorDeviceID, 
 	defer func() { _ = tx.Rollback(ctx) }()
 	command, err := tx.Exec(ctx, `
 		UPDATE plans p SET plan_key=$2,display_name=$3,description=$4,billing_period=$5,max_remote_pcs=$6,max_live_sessions=$7,
-		feature_flags=$8::jsonb,channel_products=$9::jsonb,sort_order=$10,visible_platforms=$11,available_from=$12,available_until=$13,fallback_plan_key=NULLIF($14,'')
+		feature_flags=$8::jsonb,channel_products=$9::jsonb,sort_order=$10,visible_platforms=$11,available_from=$12,available_until=$13,fallback_plan_key=NULLIF($14,''),price_minor=$15,currency=$16
 		FROM catalog_versions c WHERE p.catalog_version_id=c.id AND c.status='DRAFT' AND p.id=$1`,
 		planID, strings.TrimSpace(input.PlanKey), strings.TrimSpace(input.DisplayName), strings.TrimSpace(input.Description), strings.ToUpper(strings.TrimSpace(input.BillingPeriod)),
-		input.MaxRemotePCs, input.MaxLiveSessions, input.FeatureFlags, input.ChannelProducts, input.SortOrder, input.VisiblePlatforms, input.AvailableFrom, input.AvailableUntil, strings.TrimSpace(input.FallbackPlanKey))
+		input.MaxRemotePCs, input.MaxLiveSessions, input.FeatureFlags, input.ChannelProducts, input.SortOrder, input.VisiblePlatforms, input.AvailableFrom, input.AvailableUntil, strings.TrimSpace(input.FallbackPlanKey), input.PriceMinor, input.Currency)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "duplicate") {
 			return PlanDraft{}, ErrConflict
@@ -2937,11 +2988,11 @@ func (s *Postgres) UpdatePlanDraft(ctx context.Context, adminID, actorDeviceID, 
 	if command.RowsAffected() != 1 {
 		return PlanDraft{}, ErrNotFound
 	}
-	item, err := scanPlanDraft(tx.QueryRow(ctx, `SELECT p.id,c.version,p.plan_key,p.display_name,p.description,p.billing_period,p.max_remote_pcs,p.max_live_sessions,p.feature_flags,p.channel_products,p.sort_order,p.visible_platforms,p.available_from,p.available_until,COALESCE(p.fallback_plan_key,'') FROM plans p JOIN catalog_versions c ON c.id=p.catalog_version_id WHERE p.id=$1`, planID))
+	item, err := scanPlanDraft(tx.QueryRow(ctx, `SELECT p.id,c.version,p.plan_key,p.display_name,p.description,p.billing_period,p.max_remote_pcs,p.max_live_sessions,p.feature_flags,p.channel_products,p.sort_order,p.visible_platforms,p.available_from,p.available_until,COALESCE(p.fallback_plan_key,''),p.price_minor,p.currency FROM plans p JOIN catalog_versions c ON c.id=p.catalog_version_id WHERE p.id=$1`, planID))
 	if err != nil {
 		return PlanDraft{}, err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id) VALUES($1,$2,'billing.plan.update','plan',$3,'SUCCEEDED',$4)`, adminID, actorDeviceID, planID, traceID); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id) VALUES($1,NULLIF($2,'00000000-0000-0000-0000-000000000000'::uuid),'billing.plan.update','plan',$3,'SUCCEEDED',$4)`, adminID, actorDeviceID, planID, traceID); err != nil {
 		return PlanDraft{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -2978,6 +3029,14 @@ func (s *Postgres) PublishCatalog(ctx context.Context, adminID, actorDeviceID uu
 	if _, err := tx.Exec(ctx, `UPDATE catalog_versions SET status='PUBLISHED',published_at=now() WHERE id=$1`, draftID); err != nil {
 		return 0, err
 	}
+	// DEFAULT grants are the durable fallback used by the commerce aggregator.
+	// Move them with the published free plan so a later paid/promo expiration
+	// cannot resurrect a retired catalog definition.
+	if _, err := tx.Exec(ctx, `UPDATE entitlement_grants
+		SET plan_key='free',catalog_version=$1,ends_at=NULL,grace_until=NULL,status='ACTIVE',updated_at=now()
+		WHERE source_type='DEFAULT'`, version); err != nil {
+		return 0, err
+	}
 	// Only default/free accounts are migrated. Existing paid subscriptions are
 	// deliberately left on their purchase-time catalog definition.
 	if _, err := tx.Exec(ctx, `
@@ -2996,7 +3055,7 @@ func (s *Postgres) PublishCatalog(ctx context.Context, adminID, actorDeviceID uu
 		FROM changed`, freePlanID); err != nil {
 		return 0, err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata) VALUES($1,$2,'billing.catalog.publish','catalog',$3,'SUCCEEDED',$4,jsonb_build_object('version',$5::bigint))`, adminID, actorDeviceID, draftID, traceID, version); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata) VALUES($1,NULLIF($2,'00000000-0000-0000-0000-000000000000'::uuid),'billing.catalog.publish','catalog',$3,'SUCCEEDED',$4,jsonb_build_object('version',$5::bigint))`, adminID, actorDeviceID, draftID, traceID, version); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -3010,7 +3069,7 @@ func (s *Postgres) PublishedPlans(ctx context.Context) (int64, []Plan, error) {
 	if err := s.Pool.QueryRow(ctx, `SELECT version FROM catalog_versions WHERE status='PUBLISHED'`).Scan(&version); err != nil {
 		return 0, nil, err
 	}
-	rows, err := s.Pool.Query(ctx, `SELECT p.plan_key,p.display_name,p.description,p.billing_period,p.max_remote_pcs,p.max_live_sessions,p.feature_flags,p.channel_products,p.sort_order FROM plans p JOIN catalog_versions c ON c.id=p.catalog_version_id WHERE c.status='PUBLISHED' ORDER BY p.sort_order,p.plan_key`)
+	rows, err := s.Pool.Query(ctx, `SELECT p.plan_key,p.display_name,p.description,p.billing_period,p.max_remote_pcs,p.max_live_sessions,p.feature_flags,p.channel_products,p.sort_order,p.price_minor,p.currency FROM plans p JOIN catalog_versions c ON c.id=p.catalog_version_id WHERE c.status='PUBLISHED' ORDER BY p.sort_order,p.plan_key`)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -3018,7 +3077,7 @@ func (s *Postgres) PublishedPlans(ctx context.Context) (int64, []Plan, error) {
 	result := make([]Plan, 0)
 	for rows.Next() {
 		var i Plan
-		if err := rows.Scan(&i.Key, &i.DisplayName, &i.Description, &i.BillingPeriod, &i.MaxRemotePCs, &i.MaxLiveSessions, &i.FeatureFlags, &i.ChannelProducts, &i.SortOrder); err != nil {
+		if err := rows.Scan(&i.Key, &i.DisplayName, &i.Description, &i.BillingPeriod, &i.MaxRemotePCs, &i.MaxLiveSessions, &i.FeatureFlags, &i.ChannelProducts, &i.SortOrder, &i.PriceMinor, &i.Currency); err != nil {
 			return 0, nil, err
 		}
 		i.MaxRemotePCs = UnlimitedQuota
@@ -3308,11 +3367,12 @@ func (s *Postgres) ApplyVerifiedPurchase(ctx context.Context, userID, actorDevic
 	if err != nil {
 		return Entitlement{}, fmt.Errorf("billing product lookup: %w", err)
 	}
+	var subscriptionID uuid.UUID
 	var existingAccount uuid.UUID
 	var existingPlan string
 	var existingVersion int64
 	var existingProduct string
-	err = tx.QueryRow(ctx, `SELECT account_id,plan_key,catalog_version,product_id FROM subscriptions WHERE provider=$1 AND provider_ref_hash=$2 FOR UPDATE`, provider, refHash[:]).Scan(&existingAccount, &existingPlan, &existingVersion, &existingProduct)
+	err = tx.QueryRow(ctx, `SELECT id,account_id,plan_key,catalog_version,product_id FROM subscriptions WHERE provider=$1 AND provider_ref_hash=$2 FOR UPDATE`, provider, refHash[:]).Scan(&subscriptionID, &existingAccount, &existingPlan, &existingVersion, &existingProduct)
 	hasSubscription := err == nil
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return Entitlement{}, fmt.Errorf("subscription lookup: %w", err)
@@ -3328,7 +3388,8 @@ func (s *Postgres) ApplyVerifiedPurchase(ctx context.Context, userID, actorDevic
 			return Entitlement{}, fmt.Errorf("historical plan lookup: %w", err)
 		}
 	} else {
-		if _, err := tx.Exec(ctx, `INSERT INTO subscriptions(id,account_id,provider,product_id,provider_ref_hash,plan_key,catalog_version,status,renews_at,grace_until) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, uuid.New(), userID, provider, purchase.ProductID, refHash[:], planKey, catalogVersion, purchase.Status, purchase.RenewsAt, purchase.GraceUntil); err != nil {
+		subscriptionID = uuid.New()
+		if _, err := tx.Exec(ctx, `INSERT INTO subscriptions(id,account_id,provider,product_id,provider_ref_hash,plan_key,catalog_version,status,renews_at,grace_until) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, subscriptionID, userID, provider, purchase.ProductID, refHash[:], planKey, catalogVersion, purchase.Status, purchase.RenewsAt, purchase.GraceUntil); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "duplicate") {
 				return Entitlement{}, ErrConflict
 			}
@@ -3340,55 +3401,45 @@ func (s *Postgres) ApplyVerifiedPurchase(ctx context.Context, userID, actorDevic
 			return Entitlement{}, fmt.Errorf("subscription update: %w", err)
 		}
 	}
-	active := purchase.Status == "ACTIVE" || purchase.Status == "GRACE" || (purchase.Status == "CANCELED" && purchase.RenewsAt != nil && purchase.RenewsAt.After(now))
-	if !active {
-		if err := tx.QueryRow(ctx, `SELECT p.plan_key,c.version,p.max_remote_pcs,p.max_live_sessions,p.feature_flags FROM plans p JOIN catalog_versions c ON c.id=p.catalog_version_id WHERE c.status='PUBLISHED' AND p.plan_key='free'`).Scan(&planKey, &catalogVersion, &maxRemotePCs, &maxLiveSessions, &featureFlags); err != nil {
-			return Entitlement{}, err
-		}
-	}
-	source := "DEFAULT"
-	var providerHash []byte
-	graceUntil := (*time.Time)(nil)
+	active := purchase.Status == "ACTIVE" ||
+		(purchase.Status == "GRACE" && purchase.GraceUntil != nil && purchase.GraceUntil.After(now)) ||
+		(purchase.Status == "CANCELED" && purchase.RenewsAt != nil && purchase.RenewsAt.After(now))
+	grantStatus := "ACTIVE"
+	var grantEnd, grantGrace *time.Time
 	if active {
-		source = provider
-		providerHash = refHash[:]
-		graceUntil = purchase.GraceUntil
-	}
-	var current Entitlement
-	err = tx.QueryRow(ctx, `SELECT plan_key,catalog_version,max_remote_pcs,max_live_sessions,feature_flags,version,effective_at,expires_at,grace_until,source,provider_reference_hash FROM entitlements WHERE account_id=$1 FOR UPDATE`, userID).Scan(&current.PlanKey, &current.CatalogVersion, &current.MaxRemotePCs, &current.MaxLiveSessions, &current.FeatureFlags, &current.Version, &current.EffectiveAt, &current.ExpiresAt, &current.GraceUntil, &current.Source, &current.ProviderRefHash)
-	hasEntitlement := err == nil
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return Entitlement{}, fmt.Errorf("entitlement lookup: %w", err)
-	}
-	changed := !hasEntitlement || current.PlanKey != planKey || current.CatalogVersion != catalogVersion || current.MaxRemotePCs != maxRemotePCs || current.MaxLiveSessions != maxLiveSessions || !bytesEqual(current.FeatureFlags, featureFlags) || current.Source != source || !bytesEqual(current.ProviderRefHash, providerHash) || !sameTime(current.ExpiresAt, nil) || !sameTime(current.GraceUntil, graceUntil)
-	if !changed {
-		if err := tx.Commit(ctx); err != nil {
-			return Entitlement{}, err
+		switch purchase.Status {
+		case "GRACE":
+			grantEnd, grantGrace = purchase.GraceUntil, purchase.GraceUntil
+		case "CANCELED":
+			grantEnd = purchase.RenewsAt
 		}
-		current.MaxRemotePCs = UnlimitedQuota
-		current.MaxLiveSessions = UnlimitedQuota
-		return current, nil
+	} else if purchase.Status == "REVOKED" {
+		grantStatus = "REVOKED"
+	} else {
+		grantStatus = "EXPIRED"
 	}
-	version := int64(1)
-	if hasEntitlement {
-		version = current.Version + 1
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO entitlement_grants(
+			id,account_id,source_type,source_id,plan_key,catalog_version,starts_at,
+			ends_at,grace_until,provider_reference_hash,status,metadata
+		) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+			jsonb_build_object('product_id',$12::text))
+		ON CONFLICT(source_type,source_id) WHERE source_id IS NOT NULL DO UPDATE SET
+			plan_key=excluded.plan_key,catalog_version=excluded.catalog_version,
+			ends_at=excluded.ends_at,grace_until=excluded.grace_until,
+			provider_reference_hash=excluded.provider_reference_hash,
+			status=excluded.status,metadata=excluded.metadata,updated_at=now()`,
+		uuid.New(), userID, provider, subscriptionID, planKey, catalogVersion, now,
+		grantEnd, grantGrace, refHash[:], grantStatus, purchase.ProductID); err != nil {
+		return Entitlement{}, fmt.Errorf("subscription grant upsert: %w", err)
 	}
-	if hasEntitlement {
-		if _, err := tx.Exec(ctx, `UPDATE entitlements SET plan_key=$2,catalog_version=$3,max_remote_pcs=$4,max_live_sessions=$5,feature_flags=$6::jsonb,version=$7,effective_at=now(),expires_at=NULL,grace_until=$8,source=$9,provider_reference_hash=$10,updated_at=now() WHERE account_id=$1`, userID, planKey, catalogVersion, maxRemotePCs, maxLiveSessions, featureFlags, version, graceUntil, source, providerHash); err != nil {
-			return Entitlement{}, fmt.Errorf("entitlement update: %w", err)
-		}
-	} else if _, err := tx.Exec(ctx, `INSERT INTO entitlements(account_id,plan_key,catalog_version,max_remote_pcs,max_live_sessions,feature_flags,version,effective_at,grace_until,source,provider_reference_hash) VALUES($1,$2,$3,$4,$5,$6,$7,now(),$8,$9,$10)`, userID, planKey, catalogVersion, maxRemotePCs, maxLiveSessions, featureFlags, version, graceUntil, source, providerHash); err != nil {
-		return Entitlement{}, fmt.Errorf("entitlement insert: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO outbox(event_type,aggregate_id,payload) VALUES('entitlement.changed',$1::uuid,jsonb_build_object('account_id',$1::uuid::text,'plan_key',$2::text,'catalog_version',$3::bigint,'version',$4::bigint,'source',$5::text))`, userID, planKey, catalogVersion, version, source); err != nil {
-		return Entitlement{}, fmt.Errorf("entitlement outbox: %w", err)
+	current, err := recomputeEntitlement(ctx, tx, userID)
+	if err != nil {
+		return Entitlement{}, fmt.Errorf("subscription entitlement recompute: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata) VALUES($1,$2,'billing.purchase.verify','subscription',$1,'SUCCEEDED',$3,jsonb_build_object('provider',$4::text,'product_id',$5::text,'status',$6::text,'reference_hash',$7::text))`, userID, actorDeviceID, traceID, provider, purchase.ProductID, purchase.Status, fmt.Sprintf("%x", refHash[:])); err != nil {
 		return Entitlement{}, fmt.Errorf("entitlement audit: %w", err)
 	}
-	current = Entitlement{PlanKey: planKey, CatalogVersion: catalogVersion, MaxRemotePCs: maxRemotePCs, MaxLiveSessions: maxLiveSessions, FeatureFlags: featureFlags, Version: version, EffectiveAt: now, GraceUntil: graceUntil, Source: source, ProviderRefHash: providerHash}
-	current.MaxRemotePCs = UnlimitedQuota
-	current.MaxLiveSessions = UnlimitedQuota
 	if err := tx.Commit(ctx); err != nil {
 		return Entitlement{}, err
 	}
@@ -3407,7 +3458,15 @@ func sameTime(a, b *time.Time) bool {
 }
 
 func (s *Postgres) Audit(ctx context.Context, userID, actorID uuid.UUID, action, targetType string, targetID uuid.UUID, result, traceID, metadata string) error {
-	_, err := s.Pool.Exec(ctx, `INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`, userID, actorID, action, targetType, targetID, result, traceID, metadata)
+	var actorDeviceID any
+	if actorID != uuid.Nil {
+		actorDeviceID = actorID
+	}
+	var optionalTargetID any
+	if targetID != uuid.Nil {
+		optionalTargetID = targetID
+	}
+	_, err := s.Pool.Exec(ctx, `INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`, userID, actorDeviceID, action, targetType, optionalTargetID, result, traceID, metadata)
 	return err
 }
 

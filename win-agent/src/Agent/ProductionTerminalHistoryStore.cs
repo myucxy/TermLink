@@ -184,7 +184,18 @@ namespace TermLink.Agent
 
         public IList<LocalFrame> ReadFrames(Guid sessionId) => ReadFramesAfter(sessionId, 0);
 
+        internal IList<LocalFrame> ReadFrames(Guid sessionId, Func<bool> shouldYield) =>
+            ReadFramesAfter(sessionId, 0, shouldYield);
+
         public IList<LocalFrame> ReadFramesAfter(Guid sessionId, ulong afterSequence)
+        {
+            return ReadFramesAfter(sessionId, afterSequence, shouldYield: null);
+        }
+
+        private IList<LocalFrame> ReadFramesAfter(
+            Guid sessionId,
+            ulong afterSequence,
+            Func<bool> shouldYield)
         {
             ValidateSessionId(sessionId);
             lock (SessionLock(sessionId))
@@ -198,6 +209,10 @@ namespace TermLink.Agent
                 ulong previous = 0;
                 foreach (var path in paths)
                 {
+                    // DPAPI and protobuf decoding of a large persisted backlog
+                    // is intentionally preemptible between immutable WAL files.
+                    // Returning null discards only this in-memory read attempt.
+                    if (shouldYield?.Invoke() == true) return null;
                     var name = Path.GetFileName(path);
                     var sequenceText = name.Substring(0, name.Length - WalExtension.Length);
                     if (!ulong.TryParse(sequenceText, out var sequence) || sequence == 0 || sequence <= previous)

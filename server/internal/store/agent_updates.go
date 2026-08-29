@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/termlink/termlink/server/internal/agentupdate"
 )
 
 const (
@@ -115,6 +116,11 @@ type agentUpdateRow interface {
 	Scan(...any) error
 }
 
+type agentUpdateExecutor interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
 func scanAgentUpdate(row agentUpdateRow) (AgentUpdateRecord, error) {
 	var item AgentUpdateRecord
 	err := row.Scan(
@@ -173,6 +179,9 @@ func (s *Postgres) GetAgentUpdate(
 	ctx context.Context,
 	userID, requesterID, pcID, jobID uuid.UUID,
 ) (AgentUpdateRecord, error) {
+	if err := reconcileSatisfiedAgentUpdates(ctx, s.Pool, userID, pcID); err != nil {
+		return AgentUpdateRecord{}, err
+	}
 	if err := s.expireAgentUpdate(ctx, userID, pcID, jobID); err != nil {
 		return AgentUpdateRecord{}, err
 	}
@@ -190,6 +199,9 @@ func (s *Postgres) GetActiveAgentUpdate(
 	ctx context.Context,
 	userID, requesterID, pcID uuid.UUID,
 ) (*AgentUpdateRecord, error) {
+	if err := reconcileSatisfiedAgentUpdates(ctx, s.Pool, userID, pcID); err != nil {
+		return nil, err
+	}
 	if _, err := s.Pool.Exec(ctx, `
 		UPDATE agent_update_jobs SET status='EXPIRED',updated_at=now()
 		WHERE account_id=$1 AND pc_id=$2 AND requester_device_id=$3
@@ -284,6 +296,9 @@ func (s *Postgres) ClaimAgentUpdate(
 	if !authorized {
 		return nil, "", ErrDenied
 	}
+	if err := reconcileSatisfiedAgentUpdates(ctx, tx, userID, pcID); err != nil {
+		return nil, "", err
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE agent_update_jobs SET status='EXPIRED',updated_at=now()
 		WHERE account_id=$1 AND pc_id=$2 AND status IN ('PENDING','PROCESSING') AND expires_at<=now()`,
@@ -320,6 +335,46 @@ func (s *Postgres) ClaimAgentUpdate(
 		return nil, "", err
 	}
 	return &item, base64.RawURLEncoding.EncodeToString(token), nil
+}
+
+// reconcileSatisfiedAgentUpdates closes the gap between the transactional
+// Android workflow and an independently completed Windows installation. A
+// manually installed target (or a newer build) is already the desired outcome;
+// leaving the old job in INSTALLING causes Android to display 85% forever and
+// makes every new Agent repeatedly claim a transaction it cannot resume.
+//
+// The PC version is authoritative only after the authenticated Agent has
+// registered it. Invalid/legacy development versions are ignored rather than
+// breaking normal PC registration and update reads.
+func reconcileSatisfiedAgentUpdates(
+	ctx context.Context,
+	executor agentUpdateExecutor,
+	userID, pcID uuid.UUID,
+) error {
+	var advertisedVersion string
+	if err := executor.QueryRow(ctx, `
+		SELECT agent_version FROM pcs WHERE id=$1 AND owner_user_id=$2`, pcID, userID,
+	).Scan(&advertisedVersion); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	advertisedBuild, err := agentupdate.WindowsAgentBuild(advertisedVersion)
+	if err != nil {
+		return nil
+	}
+	_, err = executor.Exec(ctx, `
+		UPDATE agent_update_jobs
+		SET status='SUCCEEDED',phase='SUCCEEDED',progress_percent=100,
+		    attempt_count=GREATEST(attempt_count,1),
+		    lease_token_hash=NULL,lease_expires_at=NULL,
+		    error_code=NULL,error_detail=NULL,
+		    observed_agent_version=$3,observed_agent_build=$4,
+		    started_at=COALESCE(started_at,now()),completed_at=now(),updated_at=now()
+		WHERE account_id=$1 AND pc_id=$2 AND status IN ('PENDING','PROCESSING')
+		  AND target_build<=$4`, userID, pcID, advertisedVersion, advertisedBuild)
+	return err
 }
 
 func (s *Postgres) RenewAgentUpdate(

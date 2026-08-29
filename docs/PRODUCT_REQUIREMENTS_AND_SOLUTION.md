@@ -1,8 +1,8 @@
 # TermLink 产品需求与技术方案
 
 文档版本：0.1
-状态：立项草案（终端信息获取与服务端转发以[专项需求基线](TERMINAL_INFORMATION_FORWARDING_REQUIREMENTS.md)为准）
-更新日期：2026-08-21
+状态：立项草案（终端信息获取与服务端转发以[专项需求基线](TERMINAL_INFORMATION_FORWARDING_REQUIREMENTS.md)为准；Server Web、邀请码、兑换码与支付以[商业化控制面需求](SERVER_WEB_PRODUCT_REQUIREMENTS.md)为准）
+更新日期：2026-08-27
 
 ## 1. 项目定义
 

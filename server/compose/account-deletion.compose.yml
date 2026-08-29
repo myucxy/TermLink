@@ -1,0 +1,28 @@
+services:
+  server:
+    environment:
+      TERMLINK_ACCOUNT_DELETION_ENABLED: "true"
+      TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE: /run/secrets/account_deletion_identity_key
+      TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION: ${TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION:?TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION is required}
+      TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID: ${TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID:-termlink-registration-recovery}
+      # Empty means derive the admin API origin from the HTTPS realm issuer.
+      # Docker deployments may select the separately validated internal URL.
+      TERMLINK_KEYCLOAK_ADMIN_BASE_URL: ${TERMLINK_KEYCLOAK_ADMIN_BASE_URL:-}
+      TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE: /run/secrets/keycloak_admin_client_secret
+    secrets:
+      - source: account_deletion_identity_key
+        target: account_deletion_identity_key
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+      - source: keycloak_admin_client_secret
+        target: keycloak_admin_client_secret
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+
+secrets:
+  account_deletion_identity_key:
+    file: ${TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE:?TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE is required}
+  keycloak_admin_client_secret:
+    file: ${TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE:?TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE is required}

@@ -63,6 +63,7 @@ namespace TermLink.Agent
         private static readonly TimeSpan PCHeartbeatInterval = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan RealtimeHandshakeTimeout = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan RealtimeSendTimeout = TimeSpan.FromSeconds(15);
+        private static readonly TimeSpan PersistedHistoryIdleDelay = TimeSpan.FromSeconds(5);
         private const int MaxRememberedTerminationRequests = 4096;
         private const string TerminalSnapshotEnvironment = "TERMLINK_ENABLE_TERMINAL_SNAPSHOT_V1";
         private const string TypedInputEnvironment = "TERMLINK_ENABLE_TYPED_INPUT_V1";
@@ -161,6 +162,13 @@ namespace TermLink.Agent
         private readonly ConcurrentDictionary<Guid, Subscriber> authorizedRecipients = new ConcurrentDictionary<Guid, Subscriber>();
         private readonly ConcurrentDictionary<Guid, byte> pendingHistorySessions = new ConcurrentDictionary<Guid, byte>();
         private readonly ConcurrentDictionary<Guid, byte> terminalHistorySessions = new ConcurrentDictionary<Guid, byte>();
+        private readonly ConcurrentQueue<Guid> persistedHistoryBacklog = new ConcurrentQueue<Guid>();
+        private readonly ConcurrentDictionary<Guid, byte> persistedHistoryBacklogSessions =
+            new ConcurrentDictionary<Guid, byte>();
+        private readonly ConcurrentDictionary<Guid, byte> persistedHistoryWorkSessions =
+            new ConcurrentDictionary<Guid, byte>();
+        private readonly ConcurrentDictionary<Guid, byte> activeHistoryWorkSessions =
+            new ConcurrentDictionary<Guid, byte>();
         private readonly ConcurrentDictionary<Guid, ConcurrentQueue<LocalFrame>> pendingHistoryFrames = new ConcurrentDictionary<Guid, ConcurrentQueue<LocalFrame>>();
         private readonly ConcurrentDictionary<Guid, byte> historyReconcileSessions = new ConcurrentDictionary<Guid, byte>();
         private readonly ConcurrentDictionary<Guid, string> terminalHistoryPersistenceFailures = new ConcurrentDictionary<Guid, string>();
@@ -169,6 +177,7 @@ namespace TermLink.Agent
         private readonly SemaphoreSlim statusRefreshGate = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim tokenRefreshGate = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim reconnectSignal = new SemaphoreSlim(0, 1);
+        private readonly object persistedHistoryCancellationSync = new object();
         private readonly ConcurrentDictionary<Guid, LeaseStatus> leaseStatuses = new ConcurrentDictionary<Guid, LeaseStatus>();
         private readonly ConcurrentDictionary<Guid, ulong> localInputEpochs = new ConcurrentDictionary<Guid, ulong>();
         private readonly ConcurrentDictionary<string, ulong> inputSequences = new ConcurrentDictionary<string, ulong>();
@@ -188,6 +197,7 @@ namespace TermLink.Agent
         private SessionRegistry registry;
         private Task worker;
         private Task historyWorker;
+        private Task priorityHistoryWorker;
         private Task metadataWorker;
         private ClientWebSocket socket;
         private ProductionHistoryUploader historyUploader;
@@ -206,6 +216,9 @@ namespace TermLink.Agent
         private int disposed;
         private int reauthenticationRequired;
         private long successfulConnectionGeneration;
+        private long lastLiveHistoryActivityTick = Environment.TickCount64;
+        private CancellationTokenSource persistedHistoryCancellation;
+        private Guid persistedHistoryCancellationSessionId;
 
         private ProductionAgentRuntime(ProductionAgentConfig config, ProductionCredentials credentials)
             : this(config, credentials, new ProductionReconnectPreferences())
@@ -389,7 +402,12 @@ namespace TermLink.Agent
                         lock (statusSync) return relayState == ProductionRelayState.Connected;
                     });
                 agentUpdateWorker.Start();
-                historyWorker = Task.Run(HistoryUploadLoopAsync);
+                historyWorker = Task.Run(() => HistoryUploadLoopAsync(allowPersistedBacklog: true));
+                // A persisted frame can contain a very large output payload and
+                // is only cooperatively preemptible between terminal parser
+                // events. Keep one independent realtime lane so that even an
+                // in-progress legacy replay can never delay a new Snapshot.
+                priorityHistoryWorker = Task.Run(() => HistoryUploadLoopAsync(allowPersistedBacklog: false));
                 metadataWorker = Task.Run(MetadataUpsertLoopAsync);
                 worker = Task.Run(RunAsync);
             }
@@ -399,21 +417,34 @@ namespace TermLink.Agent
         {
             foreach (var sessionId in terminalHistoryStore.ListSessions())
             {
-                historyReconcileSessions[sessionId] = 0;
-                pendingHistorySessions[sessionId] = 0;
+                QueuePersistedHistoryBacklog(sessionId);
             }
             if (registry != null)
             {
                 foreach (var session in registry.GetSummaries())
                 {
+                    persistedHistoryBacklogSessions.TryRemove(session.SessionId, out _);
                     historyReconcileSessions[session.SessionId] = 0;
                     pendingHistorySessions[session.SessionId] = 0;
                 }
             }
-            if (pendingHistorySessions.IsEmpty) return;
+            if (pendingHistorySessions.IsEmpty && persistedHistoryBacklogSessions.IsEmpty) return;
             try { historySignal.Release(); }
             catch (SemaphoreFullException) { }
             catch (ObjectDisposedException) { }
+        }
+
+        private void QueuePersistedHistoryBacklog(Guid sessionId)
+        {
+            if (sessionId == Guid.Empty ||
+                (registry != null && registry.ContainsActiveSession(sessionId)) ||
+                pendingHistorySessions.ContainsKey(sessionId) ||
+                persistedHistoryWorkSessions.ContainsKey(sessionId) ||
+                !persistedHistoryBacklogSessions.TryAdd(sessionId, 0))
+            {
+                return;
+            }
+            persistedHistoryBacklog.Enqueue(sessionId);
         }
 
         private void QueueRegisteredSessionsForReplay()
@@ -1490,6 +1521,8 @@ namespace TermLink.Agent
         private void QueueHistoryUpload(Guid sessionId, bool terminal)
         {
             if (sessionId == Guid.Empty || Volatile.Read(ref disposed) != 0) return;
+            RecordLiveHistoryActivity();
+            persistedHistoryBacklogSessions.TryRemove(sessionId, out _);
             if (terminal)
             {
                 terminalHistorySessions[sessionId] = 0;
@@ -1503,7 +1536,17 @@ namespace TermLink.Agent
             catch (ObjectDisposedException) { }
         }
 
-        private async Task HistoryUploadLoopAsync()
+        private void RecordLiveHistoryActivity()
+        {
+            Interlocked.Exchange(ref lastLiveHistoryActivityTick, Environment.TickCount64);
+            CancellationTokenSource active;
+            lock (persistedHistoryCancellationSync) active = persistedHistoryCancellation;
+            if (active == null) return;
+            try { active.Cancel(); }
+            catch (ObjectDisposedException) { }
+        }
+
+        private async Task HistoryUploadLoopAsync(bool allowPersistedBacklog)
         {
             var token = cancellation.Token;
             var historyPassReady = false;
@@ -1517,14 +1560,26 @@ namespace TermLink.Agent
                 // delay and is reconciled before buffer release.
                 await Task.Delay(TimeSpan.FromMilliseconds(100), token).ConfigureAwait(false);
                 var retry = false;
-                foreach (var pending in pendingHistorySessions)
+                var retryImmediately = false;
+                if (allowPersistedBacklog && pendingHistorySessions.IsEmpty &&
+                    persistedHistoryWorkSessions.IsEmpty)
+                    TryPromotePersistedHistoryBacklog(Environment.TickCount64);
+                var attemptedHistorySessions = new HashSet<Guid>();
+                while (TryTakeNextPendingHistorySession(
+                    attemptedHistorySessions,
+                    allowPersistedBacklog,
+                    out var pending))
                 {
-                    if (!pendingHistorySessions.TryRemove(pending.Key, out var ignored)) continue;
                     var terminalPass = false;
+                    var persistedBacklogPass = persistedHistoryWorkSessions.ContainsKey(pending.Key);
+                    var workCancellation = persistedBacklogPass
+                        ? BeginPersistedHistoryWork(pending.Key, token)
+                        : null;
+                    var workToken = workCancellation?.Token ?? token;
                     try
                     {
                         var queuedFrames = DrainPendingHistoryFrames(pending.Key);
-                        var reconcile = historyReconcileSessions.TryRemove(pending.Key, out ignored) ||
+                        var reconcile = historyReconcileSessions.TryRemove(pending.Key, out _) ||
                             terminalHistoryPersistenceFailures.ContainsKey(pending.Key);
                         IList<LocalFrame> uploadFrames;
                         if (reconcile)
@@ -1544,7 +1599,20 @@ namespace TermLink.Agent
                             }
                             foreach (var frame in queuedFrames)
                                 terminalHistoryStore.AppendCommittedFrame(frame);
-                            uploadFrames = terminalHistoryStore.ReadFrames(pending.Key);
+                            uploadFrames = terminalHistoryStore.ReadFrames(
+                                pending.Key,
+                                () => workToken.IsCancellationRequested ||
+                                    ShouldYieldHistoryUpload(pending.Key));
+                            if (uploadFrames == null)
+                            {
+                                retryImmediately |= HasSupersedingHistoryWork(
+                                    pending.Key,
+                                    workToken,
+                                    token);
+                                RequeueHistoryWork(pending.Key, persistedBacklogPass);
+                                retry = true;
+                                continue;
+                            }
                         }
                         else
                         {
@@ -1557,12 +1625,28 @@ namespace TermLink.Agent
                                 pending.Key,
                                 uploadFrames));
                         terminalHistoryPersistenceFailures.TryRemove(pending.Key, out _);
-                        var evaluated = terminalSnapshotEnabled || terminalCoreShadowEnabled
-                            ? terminalHistoryProducer.ProcessSession(
+                        var evaluated = terminalSnapshotEnabled
+                            ? ReusePersistedTerminalProduction(pending.Key, uploadFrames)
+                            : null;
+                        if (evaluated == null && (terminalSnapshotEnabled || terminalCoreShadowEnabled))
+                        {
+                            evaluated = terminalHistoryProducer.ProcessSession(
                                 pending.Key,
                                 uploadFrames,
-                                persistLegacyArtifacts: terminalSnapshotEnabled)
-                            : null;
+                                persistLegacyArtifacts: terminalSnapshotEnabled,
+                                shouldYield: () => workToken.IsCancellationRequested ||
+                                    ShouldYieldHistoryUpload(pending.Key));
+                            if (evaluated == null)
+                            {
+                                retryImmediately |= HasSupersedingHistoryWork(
+                                    pending.Key,
+                                    workToken,
+                                    token);
+                                RequeueHistoryWork(pending.Key, persistedBacklogPass);
+                                retry = true;
+                                continue;
+                            }
+                        }
                         if (terminalPass)
                             terminalHistoryProducer.RetireShadowSession(pending.Key);
                         var production = terminalSnapshotEnabled ? evaluated : null;
@@ -1575,35 +1659,55 @@ namespace TermLink.Agent
                         }
                         var durable = !terminalHistoryPersistenceFailures.ContainsKey(pending.Key) &&
                             events.Count > 0 &&
-                            await UploadHistoryAsync(pending.Key, events, production, token).ConfigureAwait(false);
+                            await UploadHistoryAsync(pending.Key, events, production, workToken).ConfigureAwait(false);
                         if (!durable)
                         {
-                            historyReconcileSessions[pending.Key] = 0;
-                            pendingHistorySessions[pending.Key] = 0;
+                            retryImmediately |= HasSupersedingHistoryWork(
+                                pending.Key,
+                                workToken,
+                                token);
+                            RequeueHistoryWork(pending.Key, persistedBacklogPass);
                             retry = true;
                             continue;
                         }
+                        persistedHistoryWorkSessions.TryRemove(pending.Key, out _);
                         if (terminalPass)
                         {
-                            terminalHistorySessions.TryRemove(pending.Key, out ignored);
+                            terminalHistorySessions.TryRemove(pending.Key, out _);
                             registry?.ReleaseBufferedSession(pending.Key);
                             terminalHistoryProducer.ReleaseSession(pending.Key);
                             terminalCoreShadowStates.TryRemove(pending.Key, out _);
                         }
                     }
                     catch (OperationCanceledException) when (token.IsCancellationRequested) { return; }
+                    catch (OperationCanceledException) when (
+                        persistedBacklogPass && workCancellation?.IsCancellationRequested == true)
+                    {
+                        retryImmediately = true;
+                        RequeueHistoryWork(pending.Key, persistedBacklogPass);
+                        retry = true;
+                    }
                     catch (Exception error)
                     {
                         if (terminalPass || terminalHistorySessions.ContainsKey(pending.Key))
                             terminalHistoryProducer.RetireShadowSession(pending.Key);
                         terminalHistoryPersistenceFailures[pending.Key] = error.GetType().Name;
                         ObserveTerminalSnapshotFailure(pending.Key);
-                        historyReconcileSessions[pending.Key] = 0;
-                        pendingHistorySessions[pending.Key] = 0;
+                        retryImmediately |= HasSupersedingHistoryWork(
+                            pending.Key,
+                            workToken,
+                            token);
+                        RequeueHistoryWork(pending.Key, persistedBacklogPass);
                         retry = true;
                     }
+                    finally
+                    {
+                        if (workCancellation != null)
+                            EndPersistedHistoryWork(pending.Key, workCancellation);
+                        activeHistoryWorkSessions.TryRemove(pending.Key, out _);
+                    }
                 }
-                if (retry)
+                if (retry || !persistedHistoryBacklogSessions.IsEmpty)
                 {
                     // History may be disabled by entitlement for an extended
                     // period. Retain the DPAPI buffer and retry without a hot
@@ -1611,7 +1715,8 @@ namespace TermLink.Agent
                     // retry path.
                     await WaitForHistoryRetryOrSignalAsync(
                         historySignal,
-                        TimeSpan.FromSeconds(30),
+                        retry ? TimeSpan.FromSeconds(30) : PersistedHistoryIdleDelay,
+                        retryImmediately,
                         token).ConfigureAwait(false);
                     // Either the timeout or the consumed signal authorizes the
                     // next snapshot pass; do not wait for a second signal.
@@ -1620,11 +1725,228 @@ namespace TermLink.Agent
             }
         }
 
+        private bool TryTakeNextPendingHistorySession(
+            ISet<Guid> attempted,
+            bool allowPersistedBacklog,
+            out KeyValuePair<Guid, byte> pending)
+        {
+            var ordered = OrderHistoryUploadCandidates(
+                pendingHistorySessions.Keys,
+                HistoryUploadPriority);
+            // A live terminal can append again while its first coalesced batch
+            // is uploading. Do not bury that new batch behind every persisted
+            // session remaining in this pass. End the pass so the ordinary
+            // 100 ms coalescing boundary runs again, then select live work first.
+            foreach (var sessionId in ordered.Where(value =>
+                HistoryUploadPriority(value) == 0 && !attempted.Contains(value) &&
+                !activeHistoryWorkSessions.ContainsKey(value)))
+            {
+                attempted.Add(sessionId);
+                if (!activeHistoryWorkSessions.TryAdd(sessionId, 0)) continue;
+                if (!pendingHistorySessions.TryRemove(sessionId, out var value))
+                {
+                    activeHistoryWorkSessions.TryRemove(sessionId, out _);
+                    continue;
+                }
+                pending = new KeyValuePair<Guid, byte>(sessionId, value);
+                return true;
+            }
+            if (ordered.Any(value => HistoryUploadPriority(value) == 0))
+            {
+                pending = default;
+                return false;
+            }
+            foreach (var sessionId in ordered)
+            {
+                if (!allowPersistedBacklog && HistoryUploadPriority(sessionId) >= 2) continue;
+                if (!attempted.Add(sessionId)) continue;
+                if (!activeHistoryWorkSessions.TryAdd(sessionId, 0)) continue;
+                if (!pendingHistorySessions.TryRemove(sessionId, out var value))
+                {
+                    activeHistoryWorkSessions.TryRemove(sessionId, out _);
+                    continue;
+                }
+                pending = new KeyValuePair<Guid, byte>(sessionId, value);
+                return true;
+            }
+            pending = default;
+            return false;
+        }
+
+        private bool TryPromotePersistedHistoryBacklog(long nowTick)
+        {
+            if (!CanPromotePersistedHistoryBacklog(
+                !persistedHistoryBacklogSessions.IsEmpty,
+                registry != null && registry.Count > 0,
+                !pendingHistorySessions.IsEmpty || !pendingHistoryFrames.IsEmpty ||
+                    !terminalHistorySessions.IsEmpty,
+                Interlocked.Read(ref lastLiveHistoryActivityTick),
+                nowTick,
+                checked((long)PersistedHistoryIdleDelay.TotalMilliseconds)))
+            {
+                return false;
+            }
+
+            while (persistedHistoryBacklog.TryDequeue(out var sessionId))
+            {
+                if (!persistedHistoryBacklogSessions.TryRemove(sessionId, out _)) continue;
+                if (registry != null && registry.ContainsActiveSession(sessionId)) continue;
+                historyReconcileSessions[sessionId] = 0;
+                persistedHistoryWorkSessions[sessionId] = 0;
+                pendingHistorySessions[sessionId] = 0;
+                return true;
+            }
+            return false;
+        }
+
+        internal static bool CanPromotePersistedHistoryBacklog(
+            bool hasBacklog,
+            bool hasActiveSession,
+            bool hasRealtimeHistoryWork,
+            long lastLiveActivityTick,
+            long nowTick,
+            long idleDelayMilliseconds)
+        {
+            if (lastLiveActivityTick < 0) throw new ArgumentOutOfRangeException(nameof(lastLiveActivityTick));
+            if (nowTick < 0) throw new ArgumentOutOfRangeException(nameof(nowTick));
+            if (idleDelayMilliseconds < 0) throw new ArgumentOutOfRangeException(nameof(idleDelayMilliseconds));
+            return hasBacklog && !hasActiveSession && !hasRealtimeHistoryWork &&
+                nowTick >= lastLiveActivityTick &&
+                nowTick - lastLiveActivityTick >= idleDelayMilliseconds;
+        }
+
+        private CancellationTokenSource BeginPersistedHistoryWork(
+            Guid sessionId,
+            CancellationToken token)
+        {
+            var linked = CancellationTokenSource.CreateLinkedTokenSource(token);
+            lock (persistedHistoryCancellationSync)
+            {
+                if (persistedHistoryCancellation != null)
+                    throw new InvalidOperationException("Persisted history work is already active.");
+                persistedHistoryCancellation = linked;
+                persistedHistoryCancellationSessionId = sessionId;
+            }
+            if (ShouldYieldHistoryUpload(sessionId)) linked.Cancel();
+            return linked;
+        }
+
+        private void EndPersistedHistoryWork(Guid sessionId, CancellationTokenSource expected)
+        {
+            lock (persistedHistoryCancellationSync)
+            {
+                if (ReferenceEquals(persistedHistoryCancellation, expected) &&
+                    persistedHistoryCancellationSessionId == sessionId)
+                {
+                    persistedHistoryCancellation = null;
+                    persistedHistoryCancellationSessionId = Guid.Empty;
+                }
+            }
+            expected.Dispose();
+        }
+
+        private void RequeueHistoryWork(Guid sessionId, bool persistedBacklogPass)
+        {
+            historyReconcileSessions[sessionId] = 0;
+            if (!persistedBacklogPass) pendingHistorySessions[sessionId] = 0;
+            else
+            {
+                persistedHistoryWorkSessions.TryRemove(sessionId, out _);
+                if ((registry != null && registry.ContainsActiveSession(sessionId)) ||
+                    terminalHistorySessions.ContainsKey(sessionId))
+                {
+                    pendingHistorySessions[sessionId] = 0;
+                }
+                else
+                {
+                    QueuePersistedHistoryBacklog(sessionId);
+                }
+            }
+        }
+
+        private int HistoryUploadPriority(Guid sessionId)
+        {
+            if (registry != null && registry.ContainsActiveSession(sessionId)) return 0;
+            if (terminalHistorySessions.ContainsKey(sessionId)) return 1;
+            return 2;
+        }
+
+        private bool ShouldYieldHistoryUpload(Guid sessionId)
+        {
+            var currentPriority = HistoryUploadPriority(sessionId);
+            if (currentPriority == 0) return false;
+            return pendingHistorySessions.Keys.Any(candidate =>
+                candidate != sessionId && HistoryUploadPriority(candidate) < currentPriority);
+        }
+
+        private bool HasSupersedingHistoryWork(
+            Guid sessionId,
+            CancellationToken workToken,
+            CancellationToken runtimeToken)
+        {
+            return !runtimeToken.IsCancellationRequested &&
+                (workToken.IsCancellationRequested ||
+                    pendingHistorySessions.ContainsKey(sessionId) ||
+                    ShouldYieldHistoryUpload(sessionId));
+        }
+
+        internal static IList<Guid> OrderHistoryUploadCandidates(
+            IEnumerable<Guid> sessionIds,
+            Func<Guid, int> priority)
+        {
+            if (sessionIds == null) throw new ArgumentNullException(nameof(sessionIds));
+            if (priority == null) throw new ArgumentNullException(nameof(priority));
+            return sessionIds
+                .Where(value => value != Guid.Empty)
+                .Distinct()
+                .OrderBy(priority)
+                .ThenBy(value => value)
+                .ToList();
+        }
+
+        private ProductionTerminalHistoryProductionResult ReusePersistedTerminalProduction(
+            Guid sessionId,
+            IList<LocalFrame> frames)
+        {
+            var checkpoint = terminalHistoryProducer.LoadCheckpoint(sessionId);
+            var outbox = terminalHistoryProducer.LoadOutbox(sessionId);
+            if (checkpoint == null || outbox == null || !checkpoint.SnapshotEligible ||
+                checkpoint.LastSequence == 0 || outbox.SnapshotSequence != checkpoint.LastSequence)
+            {
+                return null;
+            }
+            var latestOutput = frames
+                .Where(value => value != null && value.Type == LocalFrameType.Output)
+                .Select(value => value.Sequence)
+                .DefaultIfEmpty(0UL)
+                .Max();
+            if (latestOutput > checkpoint.LastSequence) return null;
+            var snapshots = outbox.Artifacts
+                .Where(value => value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot)
+                .ToList();
+            if (snapshots.Count != 1 || snapshots[0].SnapshotSequence != checkpoint.LastSequence)
+                return null;
+            return new ProductionTerminalHistoryProductionResult
+            {
+                SessionId = sessionId,
+                LastSequence = checkpoint.LastSequence,
+                SnapshotEligible = true,
+                TranscriptPageCount = outbox.Artifacts.Count(
+                    value => value.Kind == ProductionTerminalHistoryArtifactKind.Transcript)
+            };
+        }
+
         internal static async Task<bool> WaitForHistoryRetryOrSignalAsync(
             SemaphoreSlim signal,
             TimeSpan retryDelay,
+            bool retryImmediately,
             CancellationToken token)
         {
+            // The shared capacity-one signal may have been consumed by the
+            // other history worker while this worker was still committing a
+            // batch. Queue state is authoritative: known superseding work must
+            // start a fresh pass without falling into the transport backoff.
+            if (retryImmediately) return true;
             return await signal.WaitAsync(retryDelay, token).ConfigureAwait(false);
         }
 
@@ -2863,6 +3185,7 @@ namespace TermLink.Agent
             // The response carries the authoritative key epoch in the same
             // database snapshot.
             await RefreshAuthorizedRecipientsAsync(true, token).ConfigureAwait(false);
+            if (ShouldYieldHistoryUpload(sessionId)) return false;
             var recipients = new List<ProductionHistoryRecipient>();
             foreach (var recipient in authorizedRecipients.Values)
             {
@@ -2893,6 +3216,7 @@ namespace TermLink.Agent
                 if (terminalOutbox != null && recipients.Any(value =>
                     !HasUploadedTerminalSnapshot(terminalOutbox, value.DeviceId, value.KeyEpoch)))
                 {
+                    if (ShouldYieldHistoryUpload(sessionId)) return false;
                     // Tail usability is account-wide. Publish this anchor to
                     // one fixed authorization batch before any recipient can
                     // start CHUNK or Transcript backfill.
@@ -2905,6 +3229,7 @@ namespace TermLink.Agent
                     }
                     foreach (var recipient in recipients)
                     {
+                        if (ShouldYieldHistoryUpload(sessionId)) return false;
                         if (HasUploadedTerminalSnapshot(
                             terminalOutbox,
                             recipient.DeviceId,
@@ -2952,6 +3277,7 @@ namespace TermLink.Agent
 
                 foreach (var recipient in recipients)
                 {
+                    if (ShouldYieldHistoryUpload(sessionId)) return false;
                     if (terminalOutbox != null && !HasUploadedTerminalSnapshot(
                         terminalOutbox,
                         recipient.DeviceId,
@@ -2974,7 +3300,8 @@ namespace TermLink.Agent
                         recipient,
                         events,
                         token,
-                        () => pendingHistorySessions.ContainsKey(sessionId)).ConfigureAwait(false);
+                        () => pendingHistorySessions.ContainsKey(sessionId) ||
+                            ShouldYieldHistoryUpload(sessionId)).ConfigureAwait(false);
                     if (outcome != ProductionHistoryUploadOutcome.Durable)
                     {
                         durable = false;
@@ -2985,6 +3312,7 @@ namespace TermLink.Agent
                     {
                         while (true)
                         {
+                            if (ShouldYieldHistoryUpload(sessionId)) return false;
                             if (pendingHistorySessions.ContainsKey(sessionId)) return false;
                             var pending = terminalHistoryProducer.PrepareNextUpload(
                                 sessionId,
@@ -4151,12 +4479,14 @@ namespace TermLink.Agent
 
             Task activeWorker;
             Task activeHistoryWorker;
+            Task activePriorityHistoryWorker;
             Task activeMetadataWorker;
             Task activeStatusRefresh;
             lock (lifecycleSync)
             {
                 activeWorker = worker;
                 activeHistoryWorker = historyWorker;
+                activePriorityHistoryWorker = priorityHistoryWorker;
                 activeMetadataWorker = metadataWorker;
                 activeStatusRefresh = statusRefreshWorker;
             }
@@ -4170,6 +4500,13 @@ namespace TermLink.Agent
             if (activeHistoryWorker != null)
             {
                 try { activeHistoryWorker.GetAwaiter().GetResult(); }
+                catch (AggregateException) { }
+                catch (OperationCanceledException) { }
+                catch (ObjectDisposedException) { }
+            }
+            if (activePriorityHistoryWorker != null)
+            {
+                try { activePriorityHistoryWorker.GetAwaiter().GetResult(); }
                 catch (AggregateException) { }
                 catch (OperationCanceledException) { }
                 catch (ObjectDisposedException) { }
@@ -4204,6 +4541,10 @@ namespace TermLink.Agent
             authorizedRecipients.Clear();
             pendingHistorySessions.Clear();
             terminalHistorySessions.Clear();
+            while (persistedHistoryBacklog.TryDequeue(out _)) { }
+            persistedHistoryBacklogSessions.Clear();
+            persistedHistoryWorkSessions.Clear();
+            activeHistoryWorkSessions.Clear();
             pendingHistoryFrames.Clear();
             historyReconcileSessions.Clear();
             terminalHistoryPersistenceFailures.Clear();

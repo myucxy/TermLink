@@ -11,9 +11,12 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import org.junit.Assert.assertEquals
@@ -126,6 +129,79 @@ class TranscriptViewportStateTest {
         assertEquals(TranscriptSelection.ReadyPage("page", false, null), selected)
         assertEquals(3, fetches)
         assertEquals(listOf(10L, 20L), pauses)
+    }
+
+    @Test
+    fun defaultTranscriptPublicationPollPlanCoversTheFullReadinessWindow() {
+        assertTrue(
+            TRANSCRIPT_PUBLICATION_RETRY_DELAYS_MILLIS.sum() >
+                TRANSCRIPT_PUBLICATION_READINESS_TIMEOUT_MILLIS,
+        )
+    }
+
+    @Test
+    fun pendingTranscriptStopsAtItsAbsoluteReadinessDeadline() = runBlocking {
+        var fetches = 0
+
+        val selected = awaitExpectedTranscriptPage<String>(
+            retryDelaysMillis = listOf(5_000L),
+            readinessTimeoutMillis = 20L,
+            pause = { delay(it) },
+        ) {
+            fetches += 1
+            TranscriptSelection.Pending
+        }
+
+        assertEquals(TranscriptSelection.Pending, selected)
+        assertEquals(1, fetches)
+    }
+
+    @Test
+    fun callerCancellationIsNotConvertedIntoTranscriptPending() {
+        assertThrows(TimeoutCancellationException::class.java) {
+            runBlocking {
+                withTimeout(20L) {
+                    awaitExpectedTranscriptPage<String>(
+                        retryDelaysMillis = listOf(5_000L),
+                        readinessTimeoutMillis = 5_000L,
+                        pause = { delay(it) },
+                    ) {
+                        TranscriptSelection.Pending
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun pendingTranscriptCanRebaseOnlyToANewerDurablyRenderedSnapshot() {
+        val objectId = UUID.randomUUID()
+        val consumed = mergeTranscriptPage(
+            viewport = TranscriptViewportState(UUID.randomUUID(), 41u, 840u),
+            requestedBeforeLineId = 840u,
+            requestedCursor = null,
+            objectId = objectId,
+            outerHasMore = true,
+            outerNextCursor = "old-cursor",
+            page = page(41, 640, 839, hasMore = true, next = 640),
+        ).copy(error = "pending old anchor")
+
+        assertEquals(null, rebasePendingTranscriptViewport(consumed, 50u, 977u, 49u))
+        assertEquals(null, rebasePendingTranscriptViewport(consumed, 41u, 977u, 50u))
+        val rebased = requireNotNull(
+            rebasePendingTranscriptViewport(consumed, 50u, 977u, 50u),
+        )
+
+        assertEquals(50uL, rebased.snapshotAnchorSequence)
+        assertEquals(977uL, rebased.initialBeforeLineId)
+        assertEquals(977uL, rebased.nextBeforeLineId)
+        assertEquals(null, rebased.nextCursor)
+        assertTrue(rebased.pages.isEmpty())
+        assertTrue(rebased.loadedObjectIds.isEmpty())
+        assertTrue(rebased.consumedCursors.isEmpty())
+        assertEquals(null, rebased.error)
+        assertFalse(rebased.loading)
+        assertEquals(consumed.viewportGeneration + 1, rebased.viewportGeneration)
     }
 
     @Test

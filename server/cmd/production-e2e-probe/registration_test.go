@@ -40,7 +40,7 @@ func TestVerifyAnonymousRegistrationUsesOnlyThemedGETFlow(t *testing.T) {
 				return
 			}
 			registrationGets.Add(1)
-			_, _ = fmt.Fprint(w, `<!doctype html><div class="identity-form-shell"><form id="kc-register-form" method="post"><input name="username"><input name="email" type="email"><input name="password" type="password"><input name="password-confirm" type="password"></form></div>`)
+			_, _ = fmt.Fprint(w, `<!doctype html><div class="identity-form-shell"><form id="kc-register-form" method="post"><input name="username"><input name="email" type="email"><input name="user.attributes.nickname"><input name="password" type="password"><input name="password-confirm" type="password"></form></div>`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -73,8 +73,8 @@ func TestVerifyAnonymousRegistrationRejectsCrossOriginAuthorization(t *testing.T
 }
 
 func TestRegistrationFormFieldContract(t *testing.T) {
-	page := []byte(`<form id='kc-register-form'><input name='username'><input name='email'><input name='password'><input name='password-confirm'></form>`)
-	for _, field := range []string{"username", "email", "password", "password-confirm"} {
+	page := []byte(`<form id='kc-register-form'><input name='username'><input name='email'><input name='user.attributes.nickname'><input name='password'><input name='password-confirm'></form>`)
+	for _, field := range []string{"username", "email", "user.attributes.nickname", "password", "password-confirm"} {
 		if !hasHTMLAttribute(page, "input", "name", field) {
 			t.Fatalf("field %q was not detected", field)
 		}

@@ -6,11 +6,14 @@ import (
 	"crypto/sha256"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/termlink/termlink/server/internal/migrate"
 )
 
@@ -21,14 +24,38 @@ func TestCleanupFileOperationsBoundsAccountsAndWaitsForObjectDeletion(t *testing
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	if err := migrate.Up(ctx, databaseURL); err != nil {
-		t.Fatal(err)
-	}
-	repository, err := Open(ctx, databaseURL)
+	admin, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer repository.Close()
+	defer admin.Close()
+	schema := "file_operations_cleanup_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cleanupCancel()
+		if _, cleanupErr := admin.Exec(cleanupCtx, "DROP SCHEMA "+quotedSchema+" CASCADE"); cleanupErr != nil {
+			t.Errorf("drop isolated file-operation cleanup schema: %v", cleanupErr)
+		}
+	}()
+
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := migrate.UpPool(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	repository := &Postgres{Pool: pool}
 
 	cleanupAccountID, cappedAccountID := uuid.New(), uuid.New()
 	cleanupAgentID, cleanupRequesterID, cleanupPCID := uuid.New(), uuid.New(), uuid.New()

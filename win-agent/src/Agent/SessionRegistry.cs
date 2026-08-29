@@ -201,6 +201,11 @@ namespace TermLink.Agent
             lock (sync) return sessions.ContainsKey(sessionId) || completedSessions.ContainsKey(sessionId);
         }
 
+        internal bool ContainsActiveSession(Guid sessionId)
+        {
+            lock (sync) return sessions.ContainsKey(sessionId);
+        }
+
         private void LoadRemoteAccessPolicy()
         {
             var snapshot = remoteAccessPolicyStore.Load();

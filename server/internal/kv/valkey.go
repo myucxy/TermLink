@@ -15,10 +15,41 @@ import (
 
 type Valkey struct{ Client *redis.Client }
 
+type OpenOptions struct {
+	PoolSize     int
+	MinIdleConns int
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	PoolTimeout  time.Duration
+}
+
 func Open(ctx context.Context, redisURL string) (*Valkey, error) {
+	return OpenWithOptions(ctx, redisURL, OpenOptions{})
+}
+
+func OpenWithOptions(ctx context.Context, redisURL string, config OpenOptions) (*Valkey, error) {
 	options, err := redis.ParseURL(redisURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse Valkey URL: %w", err)
+	}
+	if config.PoolSize > 0 {
+		options.PoolSize = config.PoolSize
+	}
+	if config.MinIdleConns >= 0 {
+		options.MinIdleConns = config.MinIdleConns
+	}
+	if config.DialTimeout > 0 {
+		options.DialTimeout = config.DialTimeout
+	}
+	if config.ReadTimeout > 0 {
+		options.ReadTimeout = config.ReadTimeout
+	}
+	if config.WriteTimeout > 0 {
+		options.WriteTimeout = config.WriteTimeout
+	}
+	if config.PoolTimeout > 0 {
+		options.PoolTimeout = config.PoolTimeout
 	}
 	client := redis.NewClient(options)
 	if err := client.Ping(ctx).Err(); err != nil {
@@ -64,6 +95,20 @@ redis.call('ZADD',key,expires,member)
 redis.call('PEXPIRE',key,120000)
 return 1`)
 
+const maxLiveSessionReservationBatch = 256
+
+var reserveLiveSessionsScript = redis.NewScript(`
+local key=KEYS[1]
+local now=tonumber(ARGV[1])
+local expires=tonumber(ARGV[2])
+local device=ARGV[3]
+redis.call('ZREMRANGEBYSCORE',key,'-inf',now)
+for index=4,#ARGV do
+  redis.call('ZADD',key,expires,ARGV[index]..':'..device)
+end
+redis.call('PEXPIRE',key,120000)
+return #ARGV-3`)
+
 // ReserveLiveSession records an active subscription for its short lease
 // window.  There is intentionally no account-wide quota: the sorted set is
 // only an expiry/reconnect registry and remains bounded by active clients.
@@ -80,6 +125,36 @@ func (v *Valkey) ReserveLiveSession(ctx context.Context, userID, sessionID, devi
 		return false, errors.New("live session reservation was not accepted")
 	}
 	return true, nil
+}
+
+// ReserveLiveSessions refreshes a bounded set for one account/device in one
+// Valkey operation. It is used only by the Relay's already-bounded authority
+// refresh and preserves the same member format and expiry as the single-item
+// operation.
+func (v *Valkey) ReserveLiveSessions(ctx context.Context, userID uuid.UUID, sessionIDs []uuid.UUID, deviceID uuid.UUID) error {
+	if len(sessionIDs) == 0 {
+		return nil
+	}
+	if len(sessionIDs) > maxLiveSessionReservationBatch {
+		return errors.New("live session reservation batch exceeds limit")
+	}
+	now := time.Now().UTC()
+	arguments := make([]any, 0, len(sessionIDs)+3)
+	arguments = append(arguments, now.UnixMilli(), now.Add(60*time.Second).UnixMilli(), deviceID.String())
+	for _, sessionID := range sessionIDs {
+		if sessionID == uuid.Nil {
+			return errors.New("live session reservation contains invalid session")
+		}
+		arguments = append(arguments, sessionID.String())
+	}
+	reserved, err := reserveLiveSessionsScript.Run(ctx, v.Client, []string{"live-sessions:" + userID.String()}, arguments...).Int()
+	if err != nil {
+		return err
+	}
+	if reserved != len(sessionIDs) {
+		return errors.New("live session reservation batch was not accepted")
+	}
+	return nil
 }
 func (v *Valkey) ReleaseLiveSession(ctx context.Context, userID, sessionID, deviceID uuid.UUID) error {
 	return v.Client.ZRem(ctx, "live-sessions:"+userID.String(), sessionID.String()+":"+deviceID.String()).Err()
@@ -214,21 +289,33 @@ if not value then return nil end
 redis.call('DEL',KEYS[1],KEYS[2])
 return value`)
 
+var getLeaseScript = redis.NewScript(`
+local value=redis.call('GET',KEYS[1])
+if not value then return nil end
+return {value,redis.call('PTTL',KEYS[1])}`)
+
 func (v *Valkey) GetLease(ctx context.Context, sessionID uuid.UUID) (Lease, error) {
 	key := "lease:" + sessionID.String()
-	value, err := v.Client.Get(ctx, key).Result()
+	result, err := getLeaseScript.Run(ctx, v.Client, []string{key}).Slice()
 	if err != nil {
 		return Lease{}, err
+	}
+	if len(result) != 2 {
+		return Lease{}, errors.New("invalid lease state")
+	}
+	value, ok := result[0].(string)
+	if !ok {
+		return Lease{}, errors.New("invalid lease state")
+	}
+	ttlMilliseconds, ok := result[1].(int64)
+	if !ok {
+		return Lease{}, errors.New("invalid lease TTL")
 	}
 	lease, err := parseLeaseValue(sessionID, value)
 	if err != nil {
 		return Lease{}, err
 	}
-	ttl, err := v.Client.PTTL(ctx, key).Result()
-	if err != nil {
-		return Lease{}, err
-	}
-	lease.ExpiresAt = time.Now().UTC().Add(ttl)
+	lease.ExpiresAt = time.Now().UTC().Add(time.Duration(ttlMilliseconds) * time.Millisecond)
 	return lease, nil
 }
 

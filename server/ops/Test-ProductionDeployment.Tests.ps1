@@ -1,0 +1,506 @@
+[CmdletBinding()]
+param(
+    [string]$PolicyPath
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+if ([string]::IsNullOrWhiteSpace($PolicyPath)) {
+    $PolicyPath = Join-Path $PSScriptRoot 'Test-ProductionDeployment.ps1'
+}
+
+function Set-TestSecretPermissions {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][bool]$Directory)
+
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+        $mode = if ($Directory) {
+            [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute
+        } else {
+            [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite
+        }
+        [IO.File]::SetUnixFileMode($Path, $mode)
+        return
+    }
+
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    if ($Directory) {
+        $security = [Security.AccessControl.DirectorySecurity]::new()
+        $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        foreach ($sid in @($currentUser, $system, $administrators)) {
+            $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+                $sid,
+                [Security.AccessControl.FileSystemRights]::FullControl,
+                $inheritance,
+                [Security.AccessControl.PropagationFlags]::None,
+                [Security.AccessControl.AccessControlType]::Allow)
+            [void]$security.AddAccessRule($rule)
+        }
+    } else {
+        $security = [Security.AccessControl.FileSecurity]::new()
+        foreach ($sid in @($currentUser, $system, $administrators)) {
+            $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+                $sid,
+                [Security.AccessControl.FileSystemRights]::FullControl,
+                [Security.AccessControl.AccessControlType]::Allow)
+            [void]$security.AddAccessRule($rule)
+        }
+    }
+    $security.SetAccessRuleProtection($true, $false)
+    Set-Acl -LiteralPath $Path -AclObject $security
+}
+
+function ConvertTo-ComposeHostPath {
+    param([Parameter(Mandatory)][string]$Path)
+    return [IO.Path]::GetFullPath($Path).Replace('\', '/')
+}
+
+function Test-ComposeConfig {
+    param(
+        [Parameter(Mandatory)][string]$EnvironmentFile,
+        [Parameter(Mandatory)][string[]]$Files,
+        [bool]$IncludeEdge = $false
+    )
+
+    $arguments = @('compose', '--env-file', $EnvironmentFile, '--project-name', 'termlink-matrix-test')
+    foreach ($file in $Files) { $arguments += @('-f', $file) }
+    if ($IncludeEdge) { $arguments += @('--profile', 'edge') }
+    $arguments += @('config', '--quiet')
+    $output = @(& docker @arguments 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Compose matrix render failed: $($output -join ' ')"
+    }
+}
+
+function Assert-ComposeConfigRejected {
+    param(
+        [Parameter(Mandatory)][string]$EnvironmentFile,
+        [Parameter(Mandatory)][string[]]$Files,
+        [Parameter(Mandatory)][string]$ExpectedPattern
+    )
+
+    $arguments = @('compose', '--env-file', $EnvironmentFile, '--project-name', 'termlink-negative-test')
+    foreach ($file in $Files) { $arguments += @('-f', $file) }
+    $arguments += @('config', '--quiet')
+    $output = @(& docker @arguments 2>&1)
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -eq 0 -or ($output -join ' ') -notmatch $ExpectedPattern) {
+        throw "Compose did not fail closed with '$ExpectedPattern': exit=$exitCode output=$($output -join ' ')"
+    }
+}
+
+function New-FilteredEnvironmentFile {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string[]]$RemovePrefixes
+    )
+
+    $result = foreach ($line in [IO.File]::ReadAllLines($Source)) {
+        $remove = $false
+        foreach ($prefix in $RemovePrefixes) {
+            if ($line.StartsWith($prefix, [StringComparison]::Ordinal)) {
+                $remove = $true
+                break
+            }
+        }
+        if (-not $remove) { $line }
+    }
+    [IO.File]::WriteAllLines($Destination, @($result), [Text.UTF8Encoding]::new($false))
+    return $Destination
+}
+
+function Assert-PolicyRejected {
+    param(
+        [Parameter(Mandatory)][string]$Policy,
+        [Parameter(Mandatory)][string]$EnvironmentFile,
+        [Parameter(Mandatory)][string[]]$Files,
+        [Parameter(Mandatory)][string]$ExpectedPattern,
+        [string[]]$ForbiddenText = @(),
+        [bool]$IncludeEdge = $false
+    )
+
+    $rejected = $false
+    try {
+        & $Policy -EnvFile $EnvironmentFile -ComposeFile $Files -IncludeEdge:$IncludeEdge | Out-Null
+    }
+    catch {
+        $message = $_.Exception.Message
+        $rejected = $message -match $ExpectedPattern
+        foreach ($forbidden in $ForbiddenText) {
+            if (-not [string]::IsNullOrEmpty($forbidden) -and
+                $message.Contains($forbidden, [StringComparison]::Ordinal)) {
+                throw 'Production policy error disclosed account deletion key material.'
+            }
+        }
+    }
+    if (-not $rejected) {
+        throw "Production policy did not reject configuration with '$ExpectedPattern'."
+    }
+}
+
+function New-EnvironmentOverrideFile {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][hashtable]$Overrides
+    )
+
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $lines = foreach ($line in [IO.File]::ReadAllLines($Source)) {
+        $separator = $line.IndexOf('=')
+        $name = if ($separator -gt 0) { $line.Substring(0, $separator) } else { '' }
+        if ($name -ne '' -and $Overrides.ContainsKey($name)) {
+            [void]$seen.Add($name)
+            "$name=$($Overrides[$name])"
+        } else { $line }
+    }
+    foreach ($name in @($Overrides.Keys | Sort-Object)) {
+        if (-not $seen.Contains([string]$name)) { "$name=$($Overrides[$name])" }
+    }
+    [IO.File]::WriteAllLines($Destination, @($lines), [Text.UTF8Encoding]::new($false))
+    return $Destination
+}
+
+function New-ProtectedTestFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Value
+    )
+
+    [IO.File]::WriteAllText($Path, $Value, [Text.UTF8Encoding]::new($false))
+    Set-TestSecretPermissions -Path $Path -Directory $false
+    return $Path
+}
+
+function Test-ProductionDockerfileContract {
+    param([Parameter(Mandatory)][string]$ServerRoot)
+
+    $dockerfile = [IO.File]::ReadAllText((Join-Path $ServerRoot 'Dockerfile'))
+    foreach ($required in @(
+        'ARG SOURCE_DATE_EPOCH=1',
+        'ENV GOTOOLCHAIN=local',
+        'go mod download && go mod verify',
+        '-mod=readonly',
+        '-buildvcs=false',
+        'test -n "${SOURCE_DATE_EPOCH}"',
+        'touch -d "@${SOURCE_DATE_EPOCH}" /out/termlink-server'
+    )) {
+        if (-not $dockerfile.Contains($required, [StringComparison]::Ordinal)) {
+            throw "Production Dockerfile omitted reproducibility contract: $required"
+        }
+    }
+    $ignore = [IO.File]::ReadAllText((Join-Path $ServerRoot 'Dockerfile.dockerignore'))
+    foreach ($required in @('**', '!server/go.mod', '!server/go.sum', '!server/cmd/**', '!server/internal/**', '!server/migrations/**')) {
+        if (-not $ignore.Contains($required, [StringComparison]::Ordinal)) {
+            throw "Production Docker context allow-list omitted: $required"
+        }
+    }
+    foreach ($forbidden in @('!android/', '!win-agent/', '!pc-client/', '!artifacts/', '!.git/')) {
+        if ($ignore.Contains($forbidden, [StringComparison]::Ordinal)) {
+            throw "Production Docker context unexpectedly includes: $forbidden"
+        }
+    }
+}
+
+if ($null -eq (Get-Command docker -ErrorAction SilentlyContinue)) {
+    throw 'Docker CLI is required for production deployment policy tests.'
+}
+
+$policy = [IO.Path]::GetFullPath($PolicyPath)
+$serverRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$composeRoot = Join-Path $serverRoot 'compose'
+Test-ProductionDockerfileContract -ServerRoot $serverRoot
+$testRoot = Join-Path ([IO.Path]::GetTempPath()) ("termlink-production-policy-{0}" -f [guid]::NewGuid().ToString('N'))
+$secretRoot = Join-Path $testRoot 'secrets'
+[void][IO.Directory]::CreateDirectory($testRoot)
+[void][IO.Directory]::CreateDirectory($secretRoot)
+$paymentSecretRoot = Join-Path $testRoot 'payment-secrets'
+[void][IO.Directory]::CreateDirectory($paymentSecretRoot)
+$identityKeyBytes = $null
+$identityKey = $null
+$rotatedIdentityKeyBytes = $null
+$rotatedIdentityKey = $null
+$thirdIdentityKeyBytes = $null
+$thirdIdentityKey = $null
+
+try {
+    Set-TestSecretPermissions -Path $testRoot -Directory $true
+    Set-TestSecretPermissions -Path $secretRoot -Directory $true
+    Set-TestSecretPermissions -Path $paymentSecretRoot -Directory $true
+
+    $valkeyPassword = 'Valkey_Test_7Pz4mN8vQ2xK6cR9'
+    $identityKeyBytes = [byte[]](0..31)
+    $identityKey = [Convert]::ToBase64String($identityKeyBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $secretFixtures = [ordered]@{
+        'oidc-client-secret' = 'Oidc_Test_3mJ8pQ6sV2wX9kL5'
+        'database-url' = 'postgres://termlink:Db_Test_4xQ8mV2pL7nK@postgres:5432/termlink?sslmode=require'
+        'redis-url' = "redis://default:$valkeyPassword@valkey:6379/0"
+        'token-signing-key' = 'Token_Test_6vN2qR9mX4pK8sJ3wL7cD5hF1aB0eGzY'
+        'postgres-password' = 'Postgres_Test_9qL3vK7mX2pR8sN6'
+        'valkey-password' = $valkeyPassword
+        's3-access-key' = 'S3Access_Test_5mQ8vN2xK7pR'
+        's3-secret-key' = 'S3Secret_Test_8xL2qV6mN9pK4rJ7'
+        'grafana-admin-password' = 'Grafana_Test_2pV7mQ9xK4nR8sL6'
+        'keycloak-admin-client-secret' = 'Keycloak_Test_4nR8vM2qL7pX5sK9'
+        'account-deletion-identity-key' = $identityKey
+    }
+    foreach ($fixture in $secretFixtures.GetEnumerator()) {
+        $fixturePath = Join-Path $secretRoot $fixture.Key
+        [IO.File]::WriteAllText($fixturePath, $fixture.Value, [Text.UTF8Encoding]::new($false))
+        Set-TestSecretPermissions -Path $fixturePath -Directory $false
+    }
+
+    $envFile = Join-Path $testRoot 'production.env'
+    $alertmanagerConfig = Join-Path $testRoot 'alertmanager.yml'
+    [IO.File]::WriteAllText($alertmanagerConfig, @'
+global:
+  resolve_timeout: 5m
+route:
+  receiver: production-operations
+receivers:
+  - name: production-operations
+    webhook_configs:
+      - url: https://alerts.termlink.prod/alertmanager
+'@, [Text.UTF8Encoding]::new($false))
+    Set-TestSecretPermissions -Path $alertmanagerConfig -Directory $false
+    $environmentLines = @(
+        'COMPOSE_PROJECT_NAME=termlink-policy-test',
+        'TERMLINK_IMAGE=docker.io/myucxy/termlink:policy-test@sha256:1111111111111111111111111111111111111111111111111111111111111111',
+        'TERMLINK_PUBLIC_URL=https://app.termlink.prod',
+        'TERMLINK_PUBLIC_HOST=app.termlink.prod',
+        'TERMLINK_HISTORY_PUBLIC_HOST=history.termlink.prod',
+        'TERMLINK_ACME_CA=https://acme-v02.api.letsencrypt.org/directory',
+        'TERMLINK_ACME_EMAIL=operations@termlink.prod',
+        'TERMLINK_OIDC_ISSUER=https://identity.termlink.prod/realms/termlink',
+        'TERMLINK_OIDC_CLIENT_ID=termlink-server',
+        'TERMLINK_S3_ENDPOINT=https://storage.termlink.prod',
+        'TERMLINK_S3_PUBLIC_ENDPOINT=https://history.termlink.prod',
+        "TERMLINK_OIDC_CLIENT_SECRET_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'oidc-client-secret'))",
+        "TERMLINK_DATABASE_URL_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'database-url'))",
+        "TERMLINK_REDIS_URL_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'redis-url'))",
+        "TERMLINK_TOKEN_SIGNING_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'token-signing-key'))",
+        "TERMLINK_POSTGRES_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'postgres-password'))",
+        "TERMLINK_VALKEY_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'valkey-password'))",
+        "TERMLINK_S3_ACCESS_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 's3-access-key'))",
+        "TERMLINK_S3_SECRET_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 's3-secret-key'))",
+        "TERMLINK_GRAFANA_ADMIN_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'grafana-admin-password'))",
+        "TERMLINK_ALERTMANAGER_CONFIG_FILE=$(ConvertTo-ComposeHostPath $alertmanagerConfig)",
+        "TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'keycloak-admin-client-secret'))",
+        "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'account-deletion-identity-key'))",
+        'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION=1',
+        "TERMLINK_PAYMENT_SECRETS_HOST_DIR=$(ConvertTo-ComposeHostPath $paymentSecretRoot)"
+    )
+    [IO.File]::WriteAllLines($envFile, $environmentLines, [Text.UTF8Encoding]::new($false))
+
+    $core = Join-Path $composeRoot 'core.compose.yml'
+    $history = Join-Path $composeRoot 'history.compose.yml'
+    $observability = Join-Path $composeRoot 'observability.compose.yml'
+    $externalServices = Join-Path $composeRoot 'external-services.compose.yml'
+    $commerce = Join-Path $composeRoot 'commerce.compose.yml'
+    $registrationRecovery = Join-Path $composeRoot 'registration-recovery.compose.yml'
+    $accountDeletion = Join-Path $composeRoot 'account-deletion.compose.yml'
+    $acceptance = Join-Path $composeRoot 'acceptance.compose.yml'
+
+    # Render every valid overlay selection with and without edge. Account
+    # deletion is intentionally absent from the no-history branch.
+    $historyChoices = @(
+        [pscustomobject]@{ Name = 'no-history'; Files = @(); AllowsDeletion = $false },
+        [pscustomobject]@{ Name = 'local-history'; Files = @($history); AllowsDeletion = $true },
+        [pscustomobject]@{ Name = 'external-s3'; Files = @($externalServices); AllowsDeletion = $true }
+    )
+    $matrixCount = 0
+    foreach ($historyChoice in $historyChoices) {
+        for ($flags = 0; $flags -lt 8; $flags++) {
+            $featureFiles = @($core) + @($historyChoice.Files)
+            if (($flags -band 1) -ne 0) { $featureFiles += $commerce }
+            if (($flags -band 2) -ne 0) { $featureFiles += $observability }
+            if (($flags -band 4) -ne 0) { $featureFiles += $registrationRecovery }
+            $deletionOptions = if ($historyChoice.AllowsDeletion) { @($false, $true) } else { @($false) }
+            foreach ($withDeletion in $deletionOptions) {
+                $files = @($featureFiles)
+                if ($withDeletion) { $files += $accountDeletion }
+                foreach ($withEdge in @($false, $true)) {
+                    Test-ComposeConfig -EnvironmentFile $envFile -Files $files -IncludeEdge:$withEdge
+                    $matrixCount++
+                }
+            }
+        }
+    }
+    if ($matrixCount -ne 80) {
+        throw "Unexpected Compose matrix size: $matrixCount"
+    }
+
+    $cases = @(
+        @{ Name = 'core with edge'; Files = @($core); Edge = $true },
+        @{ Name = 'core without edge'; Files = @($core); Edge = $false },
+        @{ Name = 'core plus local history'; Files = @($core, $history); Edge = $true },
+        @{ Name = 'core plus observability'; Files = @($core, $observability); Edge = $true },
+        @{ Name = 'core plus commerce'; Files = @($core, $commerce); Edge = $true },
+        @{ Name = 'core plus registration recovery'; Files = @($core, $registrationRecovery); Edge = $true },
+        @{ Name = 'local history plus account deletion'; Files = @($core, $history, $accountDeletion); Edge = $true },
+        @{ Name = 'local history plus both recovery paths'; Files = @($core, $history, $registrationRecovery, $accountDeletion); Edge = $false },
+        @{ Name = 'default full stack'; Files = @($core, $history, $observability); Edge = $true },
+        @{ Name = 'external S3'; Files = @($core, $externalServices); Edge = $true },
+        @{ Name = 'external S3 plus observability'; Files = @($core, $externalServices, $observability); Edge = $true },
+        @{ Name = 'external full feature stack'; Files = @($core, $externalServices, $commerce, $observability, $registrationRecovery, $accountDeletion); Edge = $true }
+    )
+    foreach ($case in $cases) {
+        Write-Host "Validating $($case.Name)..."
+        & $policy -EnvFile $envFile -ComposeFile $case.Files -IncludeEdge:$case.Edge
+    }
+
+    Assert-PolicyRejected -Policy $policy -EnvironmentFile $envFile `
+        -Files @($core, $history, $externalServices) -ExpectedPattern 'mutually exclusive'
+    Assert-PolicyRejected -Policy $policy -EnvironmentFile $envFile `
+        -Files @($core, $accountDeletion) -ExpectedPattern 'requires one reviewed History/S3 provider'
+    Assert-PolicyRejected -Policy $policy -EnvironmentFile $envFile `
+        -Files @($core, $acceptance) -ExpectedPattern 'not part of the reviewed production matrix'
+
+    $noAcmeEnv = New-FilteredEnvironmentFile -Source $envFile -Destination (Join-Path $testRoot 'no-acme.env') `
+        -RemovePrefixes @('TERMLINK_ACME_EMAIL=')
+    & $policy -EnvFile $noAcmeEnv -ComposeFile @($core) -IncludeEdge:$false | Out-Null
+    Assert-PolicyRejected -Policy $policy -EnvironmentFile $noAcmeEnv -Files @($core) `
+        -IncludeEdge:$true -ExpectedPattern 'syntactically valid ACME contact email'
+
+    $missingCases = @(
+        @{ Name = 'commerce directory'; Files = @($core, $commerce); Remove = @('TERMLINK_PAYMENT_SECRETS_HOST_DIR='); Pattern = 'TERMLINK_PAYMENT_SECRETS_HOST_DIR' },
+        @{ Name = 'history public host'; Files = @($core, $history); Remove = @('TERMLINK_HISTORY_PUBLIC_HOST='); Pattern = 'TERMLINK_HISTORY_PUBLIC_HOST' },
+        @{ Name = 'history access key'; Files = @($core, $history); Remove = @('TERMLINK_S3_ACCESS_KEY_FILE='); Pattern = 'TERMLINK_S3_ACCESS_KEY_FILE' },
+        @{ Name = 'external S3 endpoint'; Files = @($core, $externalServices); Remove = @('TERMLINK_S3_ENDPOINT='); Pattern = 'TERMLINK_S3_ENDPOINT' },
+        @{ Name = 'observability receiver config'; Files = @($core, $observability); Remove = @('TERMLINK_ALERTMANAGER_CONFIG_FILE='); Pattern = 'TERMLINK_ALERTMANAGER_CONFIG_FILE' },
+        @{ Name = 'observability admin secret'; Files = @($core, $observability); Remove = @('TERMLINK_GRAFANA_ADMIN_PASSWORD_FILE='); Pattern = 'TERMLINK_GRAFANA_ADMIN_PASSWORD_FILE' },
+        @{ Name = 'registration recovery secret'; Files = @($core, $registrationRecovery); Remove = @('TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE='); Pattern = 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE' },
+        @{ Name = 'account deletion identity key'; Files = @($core, $history, $accountDeletion); Remove = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE='); Pattern = 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE' },
+        @{ Name = 'account deletion key version'; Files = @($core, $history, $accountDeletion); Remove = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION='); Pattern = 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION' }
+    )
+    foreach ($missingCase in $missingCases) {
+        $missingEnv = New-FilteredEnvironmentFile -Source $envFile `
+            -Destination (Join-Path $testRoot ("missing-{0}.env" -f ($missingCase.Name -replace ' ', '-'))) `
+            -RemovePrefixes $missingCase.Remove
+        Assert-ComposeConfigRejected -EnvironmentFile $missingEnv -Files $missingCase.Files `
+            -ExpectedPattern $missingCase.Pattern
+    }
+
+    $placeholderAlertEnv = Join-Path $testRoot 'placeholder-alertmanager.env'
+    $bundledAlertmanagerConfig = ConvertTo-ComposeHostPath (Join-Path $serverRoot 'observability/alertmanager/alertmanager.yml')
+    $placeholderAlertLines = [IO.File]::ReadAllLines($envFile) | ForEach-Object {
+        if ($_.StartsWith('TERMLINK_ALERTMANAGER_CONFIG_FILE=', [StringComparison]::Ordinal)) {
+            "TERMLINK_ALERTMANAGER_CONFIG_FILE=$bundledAlertmanagerConfig"
+        } else { $_ }
+    }
+    [IO.File]::WriteAllLines($placeholderAlertEnv, @($placeholderAlertLines), [Text.UTF8Encoding]::new($false))
+    Assert-PolicyRejected -Policy $policy -EnvironmentFile $placeholderAlertEnv `
+        -Files @($core, $observability) -ExpectedPattern 'no-delivery placeholder'
+
+    $invalidIdentityKeyPath = Join-Path $secretRoot 'invalid-account-deletion-identity-key'
+    [IO.File]::WriteAllText($invalidIdentityKeyPath, 'not-a-32-byte-base64-key', [Text.UTF8Encoding]::new($false))
+    Set-TestSecretPermissions -Path $invalidIdentityKeyPath -Directory $false
+    $invalidKeyEnv = Join-Path $testRoot 'invalid-account-key.env'
+    $invalidKeyLines = [IO.File]::ReadAllLines($envFile) | ForEach-Object {
+        if ($_.StartsWith('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE=', [StringComparison]::Ordinal)) {
+            "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE=$(ConvertTo-ComposeHostPath $invalidIdentityKeyPath)"
+        } else { $_ }
+    }
+    [IO.File]::WriteAllLines($invalidKeyEnv, @($invalidKeyLines), [Text.UTF8Encoding]::new($false))
+    Assert-PolicyRejected -Policy $policy -EnvironmentFile $invalidKeyEnv `
+        -Files @($core, $history, $accountDeletion) -ExpectedPattern 'one AES-256 key or a bounded versioned keyring' `
+        -ForbiddenText @('not-a-32-byte-base64-key')
+
+    $invalidVersionEnv = Join-Path $testRoot 'invalid-account-key-version.env'
+    $invalidVersionLines = [IO.File]::ReadAllLines($envFile) | ForEach-Object {
+        if ($_.StartsWith('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION=', [StringComparison]::Ordinal)) {
+            'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION=0'
+        } else { $_ }
+    }
+    [IO.File]::WriteAllLines($invalidVersionEnv, @($invalidVersionLines), [Text.UTF8Encoding]::new($false))
+    Assert-PolicyRejected -Policy $policy -EnvironmentFile $invalidVersionEnv `
+        -Files @($core, $history, $accountDeletion) -ExpectedPattern 'must be a positive integer'
+
+    $rotatedIdentityKeyBytes = [byte[]](32..63)
+    $rotatedIdentityKey = [Convert]::ToBase64String($rotatedIdentityKeyBytes)
+    $thirdIdentityKeyBytes = [byte[]](64..95)
+    $thirdIdentityKey = [Convert]::ToBase64String($thirdIdentityKeyBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $validKeyring = ConvertTo-Json -InputObject @(
+        [ordered]@{ version = 1; key = $identityKey },
+        [ordered]@{ version = 7; key = $rotatedIdentityKey }
+    ) -Compress
+    $validKeyringPath = New-ProtectedTestFile -Path (Join-Path $secretRoot 'valid-account-deletion-keyring') -Value $validKeyring
+    $validKeyringEnv = New-EnvironmentOverrideFile -Source $envFile -Destination (Join-Path $testRoot 'valid-keyring.env') `
+        -Overrides @{
+            TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE = (ConvertTo-ComposeHostPath $validKeyringPath)
+            TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION = '7'
+        }
+    & $policy -EnvFile $validKeyringEnv -ComposeFile @($core, $history, $accountDeletion) -IncludeEdge:$false | Out-Null
+
+    $unknownSecret = 'KEYRING_UNKNOWN_FIELD_MUST_NOT_BE_LOGGED'
+    $keyringCases = @(
+        @{
+            Name = 'duplicate-version'
+            Current = '1'
+            Value = (ConvertTo-Json -InputObject @(
+                [ordered]@{ version = 1; key = $identityKey },
+                [ordered]@{ version = 1; key = $rotatedIdentityKey }
+            ) -Compress)
+            Pattern = 'duplicate version'
+            Forbidden = @($identityKey, $rotatedIdentityKey)
+        },
+        @{
+            Name = 'unknown-field'
+            Current = '1'
+            Value = (ConvertTo-Json -InputObject @(
+                [ordered]@{ version = 1; key = $identityKey; private = $unknownSecret }
+            ) -Compress)
+            Pattern = 'only version and key'
+            Forbidden = @($identityKey, $unknownSecret)
+        },
+        @{
+            Name = 'missing-current-version'
+            Current = '7'
+            Value = (ConvertTo-Json -InputObject @(
+                [ordered]@{ version = 1; key = $identityKey },
+                [ordered]@{ version = 2; key = $thirdIdentityKey }
+            ) -Compress)
+            Pattern = 'does not contain the configured current version'
+            Forbidden = @($identityKey, $thirdIdentityKey)
+        },
+        @{
+            Name = 'over-32-entries'
+            Current = '1'
+            Value = (ConvertTo-Json -InputObject @(1..33 | ForEach-Object {
+                [ordered]@{ version = $_; key = $identityKey }
+            }) -Compress)
+            Pattern = 'between 1 and 32 entries'
+            Forbidden = @($identityKey)
+        }
+    )
+    foreach ($keyringCase in $keyringCases) {
+        $keyringPath = New-ProtectedTestFile `
+            -Path (Join-Path $secretRoot ("invalid-keyring-{0}" -f $keyringCase.Name)) `
+            -Value ([string]$keyringCase.Value)
+        $keyringEnv = New-EnvironmentOverrideFile -Source $envFile `
+            -Destination (Join-Path $testRoot ("invalid-keyring-{0}.env" -f $keyringCase.Name)) `
+            -Overrides @{
+                TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE = (ConvertTo-ComposeHostPath $keyringPath)
+                TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION = [string]$keyringCase.Current
+            }
+        Assert-PolicyRejected -Policy $policy -EnvironmentFile $keyringEnv `
+            -Files @($core, $history, $accountDeletion) -ExpectedPattern ([string]$keyringCase.Pattern) `
+            -ForbiddenText @($keyringCase.Forbidden)
+    }
+
+    Write-Host "TermLink production deployment policy matrix passed ($matrixCount Compose selections)."
+}
+finally {
+    if ($null -ne $identityKeyBytes) { [Array]::Clear($identityKeyBytes, 0, $identityKeyBytes.Length) }
+    if ($null -ne $rotatedIdentityKeyBytes) { [Array]::Clear($rotatedIdentityKeyBytes, 0, $rotatedIdentityKeyBytes.Length) }
+    if ($null -ne $thirdIdentityKeyBytes) { [Array]::Clear($thirdIdentityKeyBytes, 0, $thirdIdentityKeyBytes.Length) }
+    $identityKey = $null
+    $rotatedIdentityKey = $null
+    $thirdIdentityKey = $null
+    if (Test-Path -LiteralPath $testRoot) {
+        [IO.Directory]::Delete($testRoot, $true)
+    }
+}

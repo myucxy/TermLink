@@ -66,3 +66,126 @@ groups:
         annotations:
           summary: TermLink PostgreSQL pool is near saturation
           description: More than ninety percent of configured PostgreSQL connections are in use.
+
+  - name: termlink-commerce
+    interval: 30s
+    rules:
+      - alert: TermlinkCommerceSnapshotUnavailable
+        expr: absent(termlink_commerce_snapshot_up) or termlink_commerce_snapshot_up == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TermLink commerce snapshot is unavailable
+          description: The bounded commerce workflow and consistency snapshot has failed for five minutes.
+
+      - alert: TermlinkCommerceOperationErrorRatioHigh
+        expr: |
+          (
+            sum by (operation) (rate(termlink_commerce_http_operations_total{result="error"}[10m]))
+            /
+            clamp_min(sum by (operation) (rate(termlink_commerce_http_operations_total[10m])), 0.001)
+          ) > 0.10
+          and sum by (operation) (rate(termlink_commerce_http_operations_total[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TermLink commerce operation error ratio is elevated
+          description: A bounded commerce operation has returned server errors for more than ten percent of requests.
+
+      - alert: TermlinkRegistrationFailureRatioHigh
+        expr: |
+          (
+            sum(rate(termlink_commerce_http_operations_total{operation="registration",result=~"denied|error"}[10m]))
+            /
+            clamp_min(sum(rate(termlink_commerce_http_operations_total{operation="registration"}[10m])), 0.001)
+          ) > 0.25
+          and sum(rate(termlink_commerce_http_operations_total{operation="registration"}[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TermLink registration failure ratio is elevated
+          description: Registration denials or errors exceed twenty-five percent at sustained traffic.
+
+      - alert: TermlinkInvitationValidationDenialsHigh
+        expr: sum(rate(termlink_commerce_http_operations_total{operation="invitation_validation",result="denied"}[10m])) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TermLink invitation validation denials are elevated
+          description: Invitation validation is receiving a sustained high denial rate; investigate abuse without inspecting submitted codes.
+
+      - alert: TermlinkRedemptionFailuresHigh
+        expr: sum(rate(termlink_commerce_http_operations_total{operation=~"redemption_preview|redemption_claim",result=~"denied|error"}[10m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TermLink redemption failures are elevated
+          description: Redemption preview or claim failures are elevated across bounded result classes.
+
+      - alert: TermlinkPaymentWebhookErrors
+        expr: sum by (operation) (rate(termlink_commerce_http_operations_total{operation=~"webhook_alipay|webhook_wechat_pay",result="error"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: TermLink payment Webhook processing is failing
+          description: A payment provider Webhook endpoint is returning server failures and may require replay or recovery.
+
+      - alert: TermlinkPaymentOrOrderErrors
+        expr: sum by (operation) (rate(termlink_commerce_http_operations_total{operation=~"order_create|payment_start|payment_recovery|payment_recovery_admin",result="error"}[10m])) > 0.02
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TermLink order or payment operations are failing
+          description: Order creation, payment initiation, or authoritative payment recovery has a sustained server error rate.
+
+      - alert: TermlinkRefundOrReconciliationErrors
+        expr: sum by (operation) (rate(termlink_commerce_http_operations_total{operation=~"refund_create|reconciliation_create",result="error"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TermLink refund or reconciliation operation is failing
+          description: Refund or reconciliation creation has returned server errors for ten minutes.
+
+      - alert: TermlinkWebhookRetryBacklog
+        expr: termlink_commerce_workflow_items{workflow="webhook",state=~"RECEIVED|RETRY"} > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: TermLink payment Webhook backlog is not draining
+          description: Verified payment notifications remain received or retrying for more than ten minutes.
+
+      - alert: TermlinkRefundBacklog
+        expr: termlink_commerce_workflow_items{workflow="refund",state=~"CREATED|PENDING"} > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: TermLink refund backlog is not draining
+          description: One or more refunds have remained non-terminal for thirty minutes.
+
+      - alert: TermlinkReconciliationBacklog
+        expr: termlink_commerce_workflow_items{workflow="reconciliation",state=~"PENDING|RUNNING"} > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: TermLink reconciliation backlog is not draining
+          description: A reconciliation run has remained pending or running for one hour.
+
+      - alert: TermlinkCommerceConsistencyIssue
+        expr: termlink_commerce_consistency_issues > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: TermLink commerce consistency check failed
+          description: A bounded order, payment, grant, or materialized-entitlement consistency check reports unresolved rows.

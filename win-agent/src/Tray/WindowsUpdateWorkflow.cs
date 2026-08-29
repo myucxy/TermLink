@@ -393,7 +393,8 @@ namespace TermLink.Tray
                         }
                         else if (!string.IsNullOrWhiteSpace(progress.ErrorMessage))
                         {
-                            statusChanged?.Invoke(TrayText.Pick("更新失败 · ", "Update failed · ") + progress.ErrorMessage);
+                            statusChanged?.Invoke(TrayText.Pick("更新失败 · ", "Update failed · ") +
+                                TrayText.PublicError(progress.ErrorMessage));
                         }
                     }
                 }
@@ -415,7 +416,7 @@ namespace TermLink.Tray
                         (result.Decision == WindowsUpdateDecision.NotConfigured
                             ? TrayText.Pick("更新服务尚未配置。", "Update service is not configured.")
                             : TrayText.Pick("检查更新失败。", "Update check failed.")) +
-                            "\r\n\r\n" + result.Message,
+                            "\r\n\r\n" + TrayText.PublicError(result.Message),
                         "TermLink",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Error);
@@ -443,7 +444,9 @@ namespace TermLink.Tray
                     return TrayText.Pick("更新服务未配置", "Update service is not configured");
                 default:
                     return TrayText.Pick("检查更新失败", "Update check failed") +
-                        (string.IsNullOrWhiteSpace(result.Message) ? string.Empty : " · " + result.Message);
+                        (string.IsNullOrWhiteSpace(result.Message)
+                            ? string.Empty
+                            : " · " + TrayText.PublicError(result.Message));
             }
         }
     }
@@ -732,7 +735,7 @@ namespace TermLink.Tray
             }
             catch (Exception error)
             {
-                ErrorMessage = Limit(error.Message, 500);
+                ErrorMessage = TrayText.PublicError(error);
                 completed = true;
                 MessageBox.Show(
                     this,

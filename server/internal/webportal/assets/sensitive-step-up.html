@@ -1,0 +1,19 @@
+{{define "sensitive-step-up.html"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{.Title}} · TermLink</title>
+  <link rel="stylesheet" href="/assets/site.css?v=step-up-v2">
+  <script src="/assets/theme-init.js?v=step-up-v1"></script>
+</head>
+<body class="sensitive-step-up-result" data-sensitive-step-up-status="{{.Status}}" data-sensitive-step-up-method="{{.Method}}">
+  <main class="sensitive-step-up-result-card" aria-live="polite">
+    <span class="sensitive-step-up-result-icon" aria-hidden="true">{{if eq .Status "verified"}}✓{{else}}!{{end}}</span>
+    <p class="eyebrow">SECURE VERIFICATION</p>
+    <h1>{{.Title}}</h1>
+    <p>{{.Message}}</p>
+  </main>
+  <script src="/assets/theme.js?v=step-up-v2" defer></script>
+</body>
+</html>{{end}}

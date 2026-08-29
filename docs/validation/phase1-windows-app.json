@@ -1,7 +1,7 @@
 {
   "schema": "termlink.phase1-windows-app-validation",
   "version": 1,
-  "generated_at_utc": "2026-08-26T04:18:38.6199854Z",
+  "generated_at_utc": "2026-08-28T18:33:36.4726315Z",
   "classification": "current-user .NET 8 Agent/Tray and local recovery; not production Relay, installer, or E2EE",
   "passed": true,
   "dotnet_sdk": "8.0.303",
@@ -22,15 +22,15 @@
   "production_configured": false,
   "tray_boundary": "bounded current-user control Pipe V8 with V7/V6/V5 compatibility, DPAPI secret/HMAC/replay protection, and authenticated response bodies",
   "source_sha256": {
-    "src/AgentControl/AgentControl.cs": "5d2165d6c8fcfc0680e5fff3117d103b9ef7ec2232358e7a0873385f45b4059a",
+    "src/AgentControl/AgentControl.cs": "623608673ba861cdacb5515fef325a551512281e94b8fc1a3ae7d2e9696dbf65",
     "src/AgentControl/RegistryControlSecurity.cs": "1cfa677a2eb4b0d4332e2942707c9badf810f5f5a30dfa5a13b5442442320b72",
     "src/Agent/CurrentUserPipe.cs": "0e93db425e2ad4ecd4667ac1ae5e700f84ad2ee5d6b73909183e5d4828e8c727",
     "src/Agent/SessionRegistrationStore.cs": "f9616d40afde59d78348e5bca06a04fbc325223687ecc7528accec0cd91af02a",
-    "src/Agent/SessionRegistry.cs": "08664da7ea4e64a71e4b535ec3f352e6d99ba86a8e9bf9d81abffd68125f7d49",
-    "src/Agent/TermLink.Agent.csproj": "9f17566547840c0eae1bced8f334a70c1e51e407c5372896a54713399e9ee31f",
+    "src/Agent/SessionRegistry.cs": "9b484528689652284b82b9a291dc9155fa120f1fc7df57186685555be800ca1f",
+    "src/Agent/TermLink.Agent.csproj": "89ffff80390bdfc530bfc24833dd7b3c800d16e53090825a55572b1ca3901741",
     "src/SessionHost/TermLink.SessionHost.csproj": "9c23a6ca0fe30013337e81140ecbce50bef3f3c83b71599e6edfc2648e3797ed",
-    "src/Tray/Program.cs": "d48094b6c02f0916fb5018092cc0f80d64d3bf555dbee517f3e7d12dfd93eb28",
-    "src/Tray/TrayApplicationContext.cs": "776c3cdfbfe06e8518ca80038692c9ae03b2ca2339dc4d01444ab0acf69f8a32",
+    "src/Tray/Program.cs": "92faec8c2797705c9e54d204181a7d274ea2e5a27d634f2f76a51b1375b503ea",
+    "src/Tray/TrayApplicationContext.cs": "8792a1a0b3fb5766a70e7b8d24556bcb9781fa50c1852651007f94f971d25686",
     "src/Tray/TermLink.Tray.csproj": "0d5ade42d13ad81b405cf008737ecb9ef8f34f567f6b9b110e685ac8ed36409d",
     "tests/SessionRecoveryValidation.cs": "d1d6716ce985aa07c8a4639b86d4883e76664d84bc871887e5d90481dcb1cf0a"
   }

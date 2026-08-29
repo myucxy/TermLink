@@ -93,6 +93,19 @@ interface EventChunkDao {
         throughSequence: Long?,
     ): List<EventChunkEntity>
 
+    /**
+     * Returns the immutable chunk(s) beginning at one exact replay cursor.
+     * The repository rejects more than one result as an overlapping catalog;
+     * limiting this query keeps arbitrary-length replay memory independent of
+     * the total number of cached chunks.
+     */
+    @Query(
+        "SELECT * FROM event_chunks WHERE sessionId = :sessionId " +
+            "AND startSequence = :startSequence " +
+            "ORDER BY endSequence ASC, id ASC LIMIT 2",
+    )
+    suspend fun listStartingAt(sessionId: String, startSequence: Long): List<EventChunkEntity>
+
     @Query("SELECT * FROM event_chunks WHERE sessionId = :sessionId ORDER BY startSequence ASC, endSequence ASC, id ASC")
     suspend fun listForSession(sessionId: String): List<EventChunkEntity>
 

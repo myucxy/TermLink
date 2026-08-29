@@ -124,7 +124,9 @@ internal object TermuxSnapshotMapper {
             "Termux Phase 1 cannot restore terminal hyperlinks"
         }
         return snapshot.styleTable.mapIndexed { index, style ->
-            require(style.hyperlinkIndex == null) { "Style $index references an unsupported hyperlink" }
+            require(style.hyperlinkIndex == null) {
+                "Style $index references a terminal hyperlink Termux Phase 1 cannot restore"
+            }
             require(style.underlineColor == TerminalColorSnapshotV1.Default) {
                 "Style $index uses an underline color Termux cannot preserve"
             }

@@ -83,8 +83,9 @@ namespace TermLink.Setup
                     Installer.Install(installDirectory, options.CreateStartup, options.TerminateRunningProcesses);
                     if (!options.NoLaunch && !Installer.TryLaunchTray(installDirectory))
                     {
-                        Console.Error.WriteLine(
-                            "安装已完成，但 TermLink 主程序未通过本地控制管道健康检查；请从开始菜单重试启动 TermLink。");
+                        Console.Error.WriteLine(SetupText.Pick(
+                            "安装已完成，但 TermLink 主程序未通过本地控制管道健康检查；请从开始菜单重试启动 TermLink。",
+                            "Installation completed, but the TermLink app did not pass its local control-pipe health check. Try starting TermLink again from the Start menu."));
                         return 2;
                     }
                     return 0;
@@ -111,22 +112,24 @@ namespace TermLink.Setup
                 }
                 if (args.Any(value => string.Equals(value, "--quiet", StringComparison.OrdinalIgnoreCase)))
                 {
-                    Console.Error.WriteLine(error.Message);
+                    Console.Error.WriteLine(SetupText.PublicError(error));
+                    Console.Error.WriteLine(SetupText.DiagnosticRecorded());
                     return 1;
                 }
 
                 try
                 {
                     System.Windows.Forms.MessageBox.Show(
-                        error.Message + Environment.NewLine + Environment.NewLine +
-                        "详细日志: " + errorLogPath,
-                        "TermLink 安装程序",
+                        SetupText.PublicError(error) + Environment.NewLine + Environment.NewLine +
+                        SetupText.DiagnosticRecorded(),
+                        SetupText.Pick("TermLink 安装程序", "TermLink Setup"),
                         System.Windows.Forms.MessageBoxButtons.OK,
                         System.Windows.Forms.MessageBoxIcon.Error);
                 }
                 catch
                 {
-                    Console.Error.WriteLine(error.Message);
+                    Console.Error.WriteLine(SetupText.PublicError(error));
+                    Console.Error.WriteLine(SetupText.DiagnosticRecorded());
                 }
                 return 1;
             }
@@ -138,11 +141,17 @@ namespace TermLink.Setup
             var transaction = RemoteUpdateTransactionStore.Load(journalPath);
             if (transaction.State != RemoteUpdateTransactionState.SetupRunning ||
                 !string.Equals(Path.GetFullPath(transaction.InstallRoot), installDirectory, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("The remote update transaction does not authorize this install root.");
+                throw new InvalidDataException(SetupText.Pick(
+                    "远程更新事务未授权此安装目录。",
+                    "The remote update transaction does not authorize this install root."));
             var setupVersion = typeof(Program).Assembly.GetName().Version ??
-                throw new InvalidDataException("The Setup assembly version is unavailable.");
+                throw new InvalidDataException(SetupText.Pick(
+                    "无法读取安装程序程序集版本。",
+                    "The Setup assembly version is unavailable."));
             if (WindowsUpdateVersion.GetBuild(setupVersion) != transaction.TargetBuild)
-                throw new InvalidDataException("The remote update transaction target does not match this Setup build.");
+                throw new InvalidDataException(SetupText.Pick(
+                    "远程更新事务目标与当前安装程序构建不匹配。",
+                    "The remote update transaction target does not match this Setup build."));
             try
             {
                 var outcome = Installer.Install(
@@ -152,7 +161,9 @@ namespace TermLink.Setup
                     preserveBackupForExternalCommit: true);
                 if (string.IsNullOrWhiteSpace(outcome.PreservedBackupPath) ||
                     !Directory.Exists(outcome.PreservedBackupPath))
-                    throw new InvalidDataException("The remote update did not preserve the previous installation backup.");
+                    throw new InvalidDataException(SetupText.Pick(
+                        "远程更新未保留上一版本的安装备份。",
+                        "The remote update did not preserve the previous installation backup."));
                 transaction.BackupPath = outcome.PreservedBackupPath;
                 transaction.State = RemoteUpdateTransactionState.AwaitingNewAgent;
                 transaction.HealthDeadlineUtc = DateTimeOffset.UtcNow.AddMinutes(3);
@@ -189,8 +200,8 @@ namespace TermLink.Setup
 
     internal sealed class SetupArguments
     {
-        internal const string Usage =
-            "TermLink Setup\n" +
+        internal static string Usage => SetupText.Pick(
+            "TermLink 安装程序\n" +
             "  TermLink-Setup.exe                         打开安装向导\n" +
             "  TermLink-Setup.exe --install-dir <目录>     静默安装\n" +
             "  TermLink-Setup.exe --install-dir <目录> --no-startup\n" +
@@ -199,7 +210,17 @@ namespace TermLink.Setup
             "  TermLink-Setup.exe --install-dir <目录> --terminate-running --no-launch --remote-update-transaction <journal>\n" +
             "  TermLink-Setup.exe --uninstall [<目录>]     卸载\n" +
             "  TermLink-Setup.exe --uninstall [<目录>] --purge-known-runtime-data\n" +
-            "  TermLink-Setup.exe --help                   显示帮助";
+            "  TermLink-Setup.exe --help                   显示帮助",
+            "TermLink Setup\n" +
+            "  TermLink-Setup.exe                         Open the setup wizard\n" +
+            "  TermLink-Setup.exe --install-dir <folder>  Install silently\n" +
+            "  TermLink-Setup.exe --install-dir <folder> --no-startup\n" +
+            "  TermLink-Setup.exe --install-dir <folder> --no-launch\n" +
+            "  TermLink-Setup.exe --install-dir <folder> --terminate-running\n" +
+            "  TermLink-Setup.exe --install-dir <folder> --terminate-running --no-launch --remote-update-transaction <journal>\n" +
+            "  TermLink-Setup.exe --uninstall [<folder>]  Uninstall\n" +
+            "  TermLink-Setup.exe --uninstall [<folder>] --purge-known-runtime-data\n" +
+            "  TermLink-Setup.exe --help                   Show help");
 
         public string InstallDirectory { get; private set; }
         public bool Uninstall { get; private set; }
@@ -254,34 +275,45 @@ namespace TermLink.Setup
                         result.Help = true;
                         break;
                     default:
-                        throw new ArgumentException("未知参数: " + args[index]);
+                        throw new ArgumentException(SetupText.Pick(
+                            "未知参数: ",
+                            "Unknown argument: ") + args[index]);
                 }
             }
 
             if (result.Uninstall && args.Any(value => string.Equals(value, "--install-dir", StringComparison.OrdinalIgnoreCase)))
             {
-                throw new ArgumentException("--uninstall 不能和 --install-dir 同时使用。");
+                throw new ArgumentException(SetupText.Pick(
+                    "--uninstall 不能和 --install-dir 同时使用。",
+                    "--uninstall cannot be used with --install-dir."));
             }
             if (result.PurgeKnownRuntimeData && !result.Uninstall)
             {
-                throw new ArgumentException("--purge-known-runtime-data 只能和 --uninstall 一起使用。");
+                throw new ArgumentException(SetupText.Pick(
+                    "--purge-known-runtime-data 只能和 --uninstall 一起使用。",
+                    "--purge-known-runtime-data can only be used with --uninstall."));
             }
             if (result.TerminateRunningProcesses &&
                 (result.Uninstall || string.IsNullOrWhiteSpace(result.InstallDirectory)))
             {
-                throw new ArgumentException("--terminate-running 只能和 --install-dir 一起使用。");
+                throw new ArgumentException(SetupText.Pick(
+                    "--terminate-running 只能和 --install-dir 一起使用。",
+                    "--terminate-running can only be used with --install-dir."));
             }
             if (result.NoLaunch &&
                 (result.Uninstall || string.IsNullOrWhiteSpace(result.InstallDirectory)))
             {
-                throw new ArgumentException("--no-launch 只能和 --install-dir 一起使用。");
+                throw new ArgumentException(SetupText.Pick(
+                    "--no-launch 只能和 --install-dir 一起使用。",
+                    "--no-launch can only be used with --install-dir."));
             }
             if (!string.IsNullOrWhiteSpace(result.RemoteUpdateTransaction) &&
                 (result.Uninstall || string.IsNullOrWhiteSpace(result.InstallDirectory) ||
                  !result.TerminateRunningProcesses || !result.NoLaunch))
             {
-                throw new ArgumentException(
-                    "--remote-update-transaction requires --install-dir, --terminate-running and --no-launch.");
+                throw new ArgumentException(SetupText.Pick(
+                    "--remote-update-transaction 需要同时指定 --install-dir、--terminate-running 和 --no-launch。",
+                    "--remote-update-transaction requires --install-dir, --terminate-running and --no-launch."));
             }
             return result;
         }
@@ -290,7 +322,9 @@ namespace TermLink.Setup
         {
             if (++index >= args.Length || string.IsNullOrWhiteSpace(args[index]))
             {
-                throw new ArgumentException(option + " 需要一个目录参数。");
+                throw new ArgumentException(option + SetupText.Pick(
+                    " 需要一个目录参数。",
+                    " requires a folder argument."));
             }
             return args[index];
         }
@@ -353,35 +387,46 @@ namespace TermLink.Setup
             var warnings = new List<string>();
             if (!isWindows)
             {
-                errors.Add("TermLink Windows Agent 只能安装在 Windows 上。");
+                errors.Add(SetupText.Pick(
+                    "TermLink Windows Agent 只能安装在 Windows 上。",
+                    "TermLink Windows Agent can only be installed on Windows."));
             }
             else if (windowsBuild < MinimumWindowsBuild)
             {
-                errors.Add(
+                errors.Add(SetupText.Pick(
                     "Windows 版本过旧（当前 build " + windowsBuild +
-                    "）。TermLink 需要 Windows 10 1809 / Server 2019 (build 17763) 或更高版本。");
+                    "）。TermLink 需要 Windows 10 1809 / Server 2019 (build 17763) 或更高版本。",
+                    "This Windows version is too old (current build " + windowsBuild +
+                    "). TermLink requires Windows 10 1809 / Server 2019 (build 17763) or later."));
             }
 
             if (!is64BitOperatingSystem || processArchitecture != Architecture.X64)
             {
-                errors.Add(
+                errors.Add(SetupText.Pick(
                     "当前环境无法运行 TermLink x64 组件。" +
                     "需要 64 位 Windows 且安装程序必须以 x64 进程运行；当前进程架构为 " +
-                    processArchitecture + "。");
+                    processArchitecture + "。",
+                    "This environment cannot run the TermLink x64 components. " +
+                    "A 64-bit Windows installation and an x64 Setup process are required. The current process architecture is " +
+                    processArchitecture + "."));
             }
 
             if (!createPseudoConsoleAvailable)
             {
-                errors.Add(
+                errors.Add(SetupText.Pick(
                     "系统 kernel32.dll 未提供 CreatePseudoConsole (ConPTY)。" +
-                    "请安装受支持的 Windows 更新后重试。");
+                    "请安装受支持的 Windows 更新后重试。",
+                    "System kernel32.dll does not provide CreatePseudoConsole (ConPTY). " +
+                    "Install a supported Windows update and try again."));
             }
 
             if (!windowsTerminalInstalled)
             {
-                warnings.Add(
+                warnings.Add(SetupText.Pick(
                     "未检测到 Windows Terminal。TermLink Agent 仍可安装；" +
-                    "安装程序不会自动安装、替换或修改 Windows Terminal。");
+                    "安装程序不会自动安装、替换或修改 Windows Terminal。",
+                    "Windows Terminal was not detected. TermLink Agent can still be installed. " +
+                    "Setup will not install, replace, or modify Windows Terminal."));
             }
 
             return new SetupPrerequisiteResult(
@@ -408,9 +453,11 @@ namespace TermLink.Setup
             if (!result.Supported)
             {
                 throw new PlatformNotSupportedException(
-                    "TermLink 安装前置检查未通过：" + Environment.NewLine +
+                    SetupText.Pick(
+                        "TermLink 安装前置检查未通过：",
+                        "TermLink setup prerequisites were not met:") + Environment.NewLine +
                     string.Join(Environment.NewLine, result.Errors) + Environment.NewLine +
-                    "架构详情: " + result.ArchitectureDescription);
+                    SetupText.Pick("架构详情: ", "Architecture details: ") + result.ArchitectureDescription);
             }
             return result;
         }
@@ -501,10 +548,14 @@ namespace TermLink.Setup
     {
         internal RunningTermLinkProcessesException(IReadOnlyList<RunningTermLinkProcess> processes)
             : base(
-                "检测到正在运行的 TermLink 程序，未获得终止授权，升级已取消：" +
+                SetupText.Pick(
+                    "检测到正在运行的 TermLink 程序，未获得终止授权，升级已取消：",
+                    "Running TermLink processes were detected, but permission to stop them was not granted. The upgrade was cancelled:") +
                 Environment.NewLine + Installer.FormatRunningProcessList(processes) +
                 Environment.NewLine +
-                "请使用安装向导确认终止，或在无人值守安装时显式传入 --terminate-running。")
+                SetupText.Pick(
+                    "请使用安装向导确认终止，或在无人值守安装时显式传入 --terminate-running。",
+                    "Confirm termination in the setup wizard, or explicitly pass --terminate-running for unattended installation."))
         {
         }
     }
@@ -756,13 +807,17 @@ namespace TermLink.Setup
             var activeRoot = NormalizeInstallRoot(activeInstallDirectory);
             if (string.Equals(requestedRoot, activeRoot, StringComparison.OrdinalIgnoreCase)) return;
 
-            throw new InvalidOperationException(
+            throw new InvalidOperationException(SetupText.Pick(
                 "检测到 TermLink 已安装在：" + activeRoot + Environment.NewLine +
                 "安装器不支持直接把现有安装迁移到其他目录，以免旧版本继续运行或新版本被误报为已启动。" +
                 Environment.NewLine +
                 "如需改用以下目录，请先从原目录运行 TermLink.Uninstall.exe 完成卸载，再重新安装：" +
-                Environment.NewLine + requestedRoot + Environment.NewLine +
-                "Existing TermLink installation must be uninstalled before choosing a different install directory.");
+                Environment.NewLine + requestedRoot,
+                "TermLink is already installed at: " + activeRoot + Environment.NewLine +
+                "Setup cannot migrate an existing installation directly to another folder because the old version could keep running or the new version could be reported as started incorrectly." +
+                Environment.NewLine +
+                "To use the following folder, first run TermLink.Uninstall.exe from the existing folder, then install again:" +
+                Environment.NewLine + requestedRoot));
         }
 
         private static void RememberInstallDirectory(string root)
@@ -866,7 +921,9 @@ namespace TermLink.Setup
                     MoveDirectoryWithRetry(
                         root,
                         backup,
-                        "无法将旧版本移入安全备份目录",
+                        SetupText.Pick(
+                            "无法将旧版本移入安全备份目录",
+                            "Could not move the old version into the safe backup folder"),
                         cancellationToken: cancellationToken);
                     oldRootMoved = true;
                 }
@@ -874,7 +931,9 @@ namespace TermLink.Setup
                 MoveDirectoryWithRetry(
                     staging,
                     root,
-                    "无法激活新版本安装目录",
+                    SetupText.Pick(
+                        "无法激活新版本安装目录",
+                        "Could not activate the new version install folder"),
                     cancellationToken: cancellationToken);
                 newRootActivated = true;
                 cancellationToken.ThrowIfCancellationRequested();
@@ -907,7 +966,9 @@ namespace TermLink.Setup
                         // the whole install fail for an optional convenience feature.
                         marker.StartupCommand = null;
                         marker.AgentStartupCommand = null;
-                        Console.Error.WriteLine("登录启动项未配置（当前用户注册表权限不足）。");
+                        Console.Error.WriteLine(SetupText.Pick(
+                            "登录启动项未配置（当前用户注册表权限不足）。",
+                            "Startup at sign-in was not configured because the current user lacks registry access."));
                     }
                 }
                 else
@@ -932,19 +993,23 @@ namespace TermLink.Setup
                 if (!preserveBackupForExternalCommit && Directory.Exists(backup))
                 {
                     Console.Error.WriteLine(
-                        "旧版本备份暂时无法清理，已保留以避免数据损坏: " + backup);
+                        SetupText.Pick(
+                            "旧版本备份暂时无法清理，已保留以避免数据损坏: ",
+                            "The old-version backup could not be cleaned up and was retained to avoid data loss: ") + backup);
                 }
-                Console.WriteLine("TermLink 已安装到: " + root);
+                Console.WriteLine(SetupText.Pick("TermLink 已安装到: ", "TermLink was installed to: ") + root);
                 if (terminalOutcome.TerminalConfigured)
                 {
-                    Console.WriteLine("Windows Terminal 配置: " + marker.TerminalFragmentPath);
+                    Console.WriteLine(SetupText.Pick(
+                        "Windows Terminal 配置: ",
+                        "Windows Terminal configuration: ") + marker.TerminalFragmentPath);
                 }
                 else
                 {
                     Console.Error.WriteLine(terminalOutcome.TerminalMessage);
                     if (!string.IsNullOrWhiteSpace(terminalOutcome.TerminalDiagnosticLogPath))
                     {
-                        Console.Error.WriteLine("Windows Terminal 集成诊断: " + terminalOutcome.TerminalDiagnosticLogPath);
+                        Console.Error.WriteLine(SetupText.DiagnosticRecorded());
                     }
                 }
                 if (preserveBackupForExternalCommit) terminalOutcome.PreservedBackupPath = backup;
@@ -989,10 +1054,13 @@ namespace TermLink.Setup
                     }
                     catch (Exception rollbackError)
                     {
-                        throw new InvalidOperationException(
+                        throw new InvalidOperationException(SetupText.Pick(
                             "升级失败，且无法自动把旧版本恢复到原目录。" +
                             "旧版本备份仍保留在: " + backup + Environment.NewLine +
                             "请不要删除该目录，并根据详细日志手动恢复。",
+                            "The upgrade failed and the previous version could not be restored automatically to its original folder. " +
+                            "The old-version backup remains at: " + backup + Environment.NewLine +
+                            "Do not delete that folder. Use the detailed log to restore it manually."),
                             new AggregateException(installError, rollbackError));
                     }
                 }
@@ -1001,10 +1069,13 @@ namespace TermLink.Setup
                     TryDeleteDirectory(root);
                     if (Directory.Exists(root))
                     {
-                        throw new InvalidOperationException(
+                        throw new InvalidOperationException(SetupText.Pick(
                             "安装已取消，但无法清理尚未提交的新版本目录: " + root +
                             Environment.NewLine +
                             "该目录可能仍被防病毒软件、索引器或文件预览器占用，请关闭占用后手动删除。",
+                            "Installation was cancelled, but the uncommitted new-version folder could not be removed: " + root +
+                            Environment.NewLine +
+                            "Antivirus software, an indexer, or a file previewer may still be using this folder. Close the owner and delete it manually."),
                             installError);
                     }
                 }
@@ -1019,7 +1090,8 @@ namespace TermLink.Setup
 
         internal static string SafeDiagnostic(Exception error)
         {
-            var value = (error?.GetType().Name ?? "Exception") + ": " + (error?.Message ?? "Unknown error");
+            var value = (error?.GetType().Name ?? "Exception") + ": " +
+                (error?.Message ?? SetupText.Pick("未知错误", "Unknown error"));
             value = value.Replace('\r', ' ').Replace('\n', ' ').Trim();
             return value.Length <= 1000 ? value : value.Substring(0, 1000);
         }
@@ -1030,7 +1102,9 @@ namespace TermLink.Setup
             var marker = ReadMarkerIfPresent(root);
             if (marker == null || !string.Equals(marker.Product, Program.ProductId, StringComparison.Ordinal))
             {
-                throw new InvalidOperationException("指定目录不是 TermLink 安装目录，已拒绝删除: " + root);
+                throw new InvalidOperationException(SetupText.Pick(
+                    "指定目录不是 TermLink 安装目录，已拒绝删除: ",
+                    "The selected folder is not a TermLink installation. Deletion was refused: ") + root);
             }
 
             EnsureOwnedProcessesStopped(root, terminateRunningProcesses: true);
@@ -1043,13 +1117,17 @@ namespace TermLink.Setup
             {
                 var deleted = PurgeKnownRuntimeDataFiles(
                     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
-                Console.WriteLine("已清理明确列入清单的 TermLink 运行数据文件: " + deleted.Count);
+                Console.WriteLine(SetupText.Pick(
+                    "已清理明确列入清单的 TermLink 运行数据文件: ",
+                    "Deleted the explicitly allow-listed TermLink runtime data files: ") + deleted.Count);
             }
             else
             {
-                Console.WriteLine("TermLink 运行数据已保留；如需删除明确列入清单的数据，请使用 --purge-known-runtime-data。");
+                Console.WriteLine(SetupText.Pick(
+                    "TermLink 运行数据已保留；如需删除明确列入清单的数据，请使用 --purge-known-runtime-data。",
+                    "TermLink runtime data was retained. Use --purge-known-runtime-data to delete the explicitly allow-listed files."));
             }
-            Console.WriteLine("TermLink 已卸载: " + root);
+            Console.WriteLine(SetupText.Pick("TermLink 已卸载: ", "TermLink was uninstalled from: ") + root);
         }
 
         internal static int LaunchInstalledUninstaller(
@@ -1059,7 +1137,9 @@ namespace TermLink.Setup
             var source = Environment.ProcessPath;
             if (string.IsNullOrWhiteSpace(source) || !File.Exists(source))
             {
-                throw new InvalidOperationException("卸载程序路径不可用。");
+                throw new InvalidOperationException(SetupText.Pick(
+                    "卸载程序路径不可用。",
+                    "The uninstaller path is unavailable."));
             }
 
             var root = NormalizeInstallRoot(installDirectory ?? Path.GetDirectoryName(source));
@@ -1082,7 +1162,9 @@ namespace TermLink.Setup
             start.ArgumentList.Add("--quiet");
             using (var process = Process.Start(start))
             {
-                if (process == null) throw new InvalidOperationException("卸载程序无法启动清理进程。");
+                if (process == null) throw new InvalidOperationException(SetupText.Pick(
+                    "卸载程序无法启动清理进程。",
+                    "The uninstaller could not start its cleanup process."));
             }
             return 0;
         }
@@ -1121,7 +1203,9 @@ namespace TermLink.Setup
                     directoryRoot.TrimEnd(Path.DirectorySeparatorChar),
                     StringComparison.OrdinalIgnoreCase))
             {
-                throw new ArgumentException("不能把磁盘根目录作为 TermLink 安装目录。");
+                throw new ArgumentException(SetupText.Pick(
+                    "不能把磁盘根目录作为 TermLink 安装目录。",
+                    "A drive root cannot be used as the TermLink install folder."));
             }
             return root.TrimEnd(Path.DirectorySeparatorChar);
         }
@@ -1132,8 +1216,9 @@ namespace TermLink.Setup
             if (previous != null) return;
             if (Directory.EnumerateFileSystemEntries(root).Any())
             {
-                throw new InvalidOperationException(
-                    "安装目录已存在且不是 TermLink 目录，为避免覆盖用户文件，请选择空目录或已有 TermLink 目录: " + root);
+                throw new InvalidOperationException(SetupText.Pick(
+                    "安装目录已存在且不是 TermLink 目录，为避免覆盖用户文件，请选择空目录或已有 TermLink 目录: ",
+                    "The install folder already exists and is not a TermLink folder. Choose an empty folder or an existing TermLink folder to avoid overwriting user files: ") + root);
             }
         }
 
@@ -1181,7 +1266,9 @@ namespace TermLink.Setup
             var assembly = Assembly.GetExecutingAssembly();
             using (var stream = assembly.GetManifestResourceStream(Program.PayloadResourceName))
             {
-                if (stream == null) throw new InvalidOperationException("安装器没有内嵌 payload。");
+                if (stream == null) throw new InvalidOperationException(SetupText.Pick(
+                    "安装器没有内嵌 payload。",
+                    "Setup does not contain an embedded payload."));
                 using (var archive = new ZipArchive(stream, ZipArchiveMode.Read, false))
                 {
                     foreach (var entry in archive.Entries)
@@ -1192,7 +1279,9 @@ namespace TermLink.Setup
                         var prefix = destination.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
                         if (!target.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                         {
-                            throw new InvalidDataException("安装器 payload 包含越界路径: " + entry.FullName);
+                            throw new InvalidDataException(SetupText.Pick(
+                                "安装器 payload 包含越界路径: ",
+                                "The setup payload contains a path outside the install folder: ") + entry.FullName);
                         }
                         if (string.IsNullOrEmpty(entry.Name))
                         {
@@ -1289,7 +1378,8 @@ namespace TermLink.Setup
         internal static string FormatRunningProcessList(
             IReadOnlyList<RunningTermLinkProcess> processes)
         {
-            if (processes == null || processes.Count == 0) return "（无 / none）";
+            if (processes == null || processes.Count == 0)
+                return SetupText.Pick("（无）", "(none)");
             return string.Join(
                 Environment.NewLine,
                 processes.Select(value => "• " + value.Name + " (PID " + value.ProcessId + ")"));
@@ -1302,12 +1392,14 @@ namespace TermLink.Setup
             processes = processes ?? Array.Empty<RunningTermLinkProcess>();
             services = services ?? Array.Empty<RunningTermLinkService>();
             var processSummary = processes.Count == 0
-                ? "• 当前未检测到；提交安装前仍会再次检查并终止随后启动的 TermLink 程序。"
+                ? SetupText.Pick(
+                    "• 当前未检测到；提交安装前仍会再次检查并终止随后启动的 TermLink 程序。",
+                    "• None currently detected. Setup will check again before committing and stop any TermLink processes started later.")
                 : FormatRunningProcessList(processes);
             var serviceSummary = services.Count == 0
-                ? "• 无"
+                ? SetupText.Pick("• 无", "• None")
                 : FormatRunningServiceList(services);
-            return
+            return SetupText.Pick(
                 "检测到已有 TermLink 安装。升级将关闭 TermLink 主程序、后台 Agent，以及所有由 TermLink SessionHost 承载的命令行会话。" +
                 Environment.NewLine +
                 "请先保存终端中未完成的工作；关闭后的会话无法恢复。" +
@@ -1316,8 +1408,16 @@ namespace TermLink.Setup
                 Environment.NewLine + Environment.NewLine +
                 "Windows 服务：" + Environment.NewLine + serviceSummary +
                 Environment.NewLine + Environment.NewLine +
-                "是否终止这些程序和会话并继续升级？" + Environment.NewLine +
-                "The upgrade will stop TermLink, its Agent, and all TermLink-hosted terminal sessions. Continue?";
+                "是否终止这些程序和会话并继续升级？",
+                "An existing TermLink installation was found. The upgrade will stop the TermLink app, the background Agent, and all command-line sessions hosted by TermLink SessionHost." +
+                Environment.NewLine +
+                "Save any unfinished terminal work first. Closed sessions cannot be restored." +
+                Environment.NewLine + Environment.NewLine +
+                "Current TermLink processes:" + Environment.NewLine + processSummary +
+                Environment.NewLine + Environment.NewLine +
+                "Windows services:" + Environment.NewLine + serviceSummary +
+                Environment.NewLine + Environment.NewLine +
+                "Stop these processes and sessions and continue the upgrade?");
         }
 
         internal static IReadOnlyList<RunningTermLinkService> GetRunningOwnedServices(
@@ -1360,7 +1460,8 @@ namespace TermLink.Setup
         internal static string FormatRunningServiceList(
             IReadOnlyList<RunningTermLinkService> services)
         {
-            if (services == null || services.Count == 0) return "（无 / none）";
+            if (services == null || services.Count == 0)
+                return SetupText.Pick("（无）", "(none)");
             return string.Join(
                 Environment.NewLine,
                 services.Select(value => "• " +
@@ -1458,7 +1559,9 @@ namespace TermLink.Setup
             if (runningServices.Count > 0 && !terminateRunningProcesses)
             {
                 throw new InvalidOperationException(
-                    "检测到正在运行的 TermLink Windows 服务，未获得终止授权，升级已取消：" +
+                    SetupText.Pick(
+                        "检测到正在运行的 TermLink Windows 服务，未获得终止授权，升级已取消：",
+                        "Running TermLink Windows services were detected, but permission to stop them was not granted. The upgrade was cancelled:") +
                     Environment.NewLine + FormatRunningServiceList(runningServices));
             }
             if (running.Count == 0 && runningServices.Count == 0) return;
@@ -1478,7 +1581,9 @@ namespace TermLink.Setup
             if (remainingServices.Count > 0)
             {
                 throw new InvalidOperationException(
-                    "无法停止以下 TermLink Windows 服务，升级未修改现有安装：" +
+                    SetupText.Pick(
+                        "无法停止以下 TermLink Windows 服务，升级未修改现有安装：",
+                        "The following TermLink Windows services could not be stopped. The existing installation was not changed:") +
                     Environment.NewLine + FormatRunningServiceList(remainingServices));
             }
 
@@ -1575,14 +1680,18 @@ namespace TermLink.Setup
                     .ToArray();
                 var diagnostics = distinctDiagnostics.Length == 0
                     ? string.Empty
-                    : Environment.NewLine + "终止诊断：" + Environment.NewLine +
+                    : Environment.NewLine + SetupText.Pick("终止诊断：", "Termination diagnostics:") + Environment.NewLine +
                         string.Join(
                             Environment.NewLine,
                             distinctDiagnostics.Select(value => "• " + value));
                 throw new InvalidOperationException(
-                    "无法终止以下 TermLink 程序，升级未修改现有安装：" + Environment.NewLine +
+                    SetupText.Pick(
+                        "无法终止以下 TermLink 程序，升级未修改现有安装：",
+                        "The following TermLink processes could not be stopped. The existing installation was not changed:") + Environment.NewLine +
                     FormatRunningProcessList(remaining) + Environment.NewLine +
-                    "请在任务管理器中结束这些 PID 后重试；若诊断为拒绝访问，请以管理员身份运行安装器。" +
+                    SetupText.Pick(
+                        "请在任务管理器中结束这些 PID 后重试；若诊断为拒绝访问，请以管理员身份运行安装器。",
+                        "End these PIDs in Task Manager and try again. If diagnostics report access denied, run Setup as administrator.") +
                     diagnostics);
             }
         }
@@ -1607,7 +1716,9 @@ namespace TermLink.Setup
                     !Path.GetFullPath(path).StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                 {
                     return candidate.Name + " (PID " + candidate.ProcessId +
-                        "): PID 已变化或不再属于当前安装目录，未调用 taskkill。";
+                        SetupText.Pick(
+                            "): PID 已变化或不再属于当前安装目录，未调用 taskkill。",
+                            "): the PID changed or no longer belongs to the current install folder; taskkill was not invoked.");
                 }
 
                 using var taskKill = new Process
@@ -1643,7 +1754,9 @@ namespace TermLink.Setup
                     try { taskKill.Kill(true); }
                     catch { }
                     return candidate.Name + " (PID " + candidate.ProcessId +
-                        "): taskkill 等待超时。";
+                        SetupText.Pick(
+                            "): taskkill 等待超时。",
+                            "): timed out waiting for taskkill.");
                 }
                 var output = (taskKill.StandardOutput.ReadToEnd() + " " +
                     taskKill.StandardError.ReadToEnd()).Trim();
@@ -1654,7 +1767,9 @@ namespace TermLink.Setup
             catch (Exception error) when (error is not OperationCanceledException)
             {
                 return candidate.Name + " (PID " + candidate.ProcessId +
-                    "): taskkill 兜底失败，" + error.Message;
+                    SetupText.Pick(
+                        "): taskkill 兜底失败，",
+                        "): taskkill fallback failed: ") + error.Message;
             }
         }
 
@@ -1666,9 +1781,9 @@ namespace TermLink.Setup
             CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(source))
-                throw new ArgumentException("Source directory is required.", nameof(source));
+                throw new ArgumentException(SetupText.Pick("需要源目录。", "Source directory is required."), nameof(source));
             if (string.IsNullOrWhiteSpace(destination))
-                throw new ArgumentException("Destination directory is required.", nameof(destination));
+                throw new ArgumentException(SetupText.Pick("需要目标目录。", "Destination directory is required."), nameof(destination));
 
             var resolvedSource = Path.GetFullPath(source);
             var resolvedDestination = Path.GetFullPath(destination);
@@ -1709,26 +1824,35 @@ namespace TermLink.Setup
                 .Select(group => group.First())
                 .ToArray();
             var details = distinctBlockers.Length == 0
-                ? "未发现仍从相关目录运行的进程；可能是防病毒软件、索引器或文件预览器的临时句柄。"
-                : "仍在占用的进程：" + Environment.NewLine + FormatRunningProcessList(distinctBlockers);
+                ? SetupText.Pick(
+                    "未发现仍从相关目录运行的进程；可能是防病毒软件、索引器或文件预览器的临时句柄。",
+                    "No process still running from the related folders was found. Antivirus software, an indexer, or a file previewer may hold a temporary handle.")
+                : SetupText.Pick("仍在占用的进程：", "Processes still using the folder:") +
+                    Environment.NewLine + FormatRunningProcessList(distinctBlockers);
             var blockedPaths = Directory.Exists(resolvedSource)
                 ? FindDeleteBlockedPaths(resolvedSource, 12)
                 : Array.Empty<string>();
             if (blockedPaths.Count > 0)
             {
-                details += Environment.NewLine + "无法取得删除/改名访问权的路径：" +
+                details += Environment.NewLine + SetupText.Pick(
+                    "无法取得删除/改名访问权的路径：",
+                    "Paths without delete/rename access:") +
                     Environment.NewLine + string.Join(
                         Environment.NewLine,
                         blockedPaths.Select(path => "• " + path));
             }
             var win32Error = lastError == null ? 0 : lastError.HResult & 0xFFFF;
             throw new IOException(
-                (string.IsNullOrWhiteSpace(operation) ? "无法移动安装目录" : operation) + "。" +
+                (string.IsNullOrWhiteSpace(operation)
+                    ? SetupText.Pick("无法移动安装目录", "Could not move the install folder")
+                    : operation) + SetupText.Pick("。", ".") +
                 Environment.NewLine + details + Environment.NewLine +
-                "安装器已等待 " + Math.Ceiling(wait.TotalSeconds) +
-                " 秒且没有覆盖现有目录。请关闭相关程序后重试；若安全软件正在扫描，请等待扫描完成。" +
-                Environment.NewLine + "底层错误: Win32 " + win32Error +
-                " (0x" + win32Error.ToString("X") + ")，" + lastError?.Message,
+                SetupText.Pick("安装器已等待 ", "Setup waited ") + Math.Ceiling(wait.TotalSeconds) +
+                SetupText.Pick(
+                    " 秒且没有覆盖现有目录。请关闭相关程序后重试；若安全软件正在扫描，请等待扫描完成。",
+                    " seconds without overwriting the existing folder. Close related programs and try again. If security software is scanning, wait for it to finish.") +
+                Environment.NewLine + SetupText.Pick("底层错误: Win32 ", "Underlying error: Win32 ") + win32Error +
+                " (0x" + win32Error.ToString("X") + SetupText.Pick(")，", "), ") + lastError?.Message,
                 lastError);
         }
 
@@ -1737,7 +1861,7 @@ namespace TermLink.Setup
             int maximumResults = 12)
         {
             if (string.IsNullOrWhiteSpace(root))
-                throw new ArgumentException("Root directory is required.", nameof(root));
+                throw new ArgumentException(SetupText.Pick("需要根目录。", "Root directory is required."), nameof(root));
             if (maximumResults <= 0)
                 throw new ArgumentOutOfRangeException(nameof(maximumResults));
             var resolvedRoot = Path.GetFullPath(root);
@@ -1762,7 +1886,11 @@ namespace TermLink.Setup
                 error is IOException ||
                 error is UnauthorizedAccessException)
             {
-                return new[] { "<无法枚举安装目录: " + error.Message + ">" };
+                return new[]
+                {
+                    SetupText.Pick("<无法枚举安装目录: ", "<Could not enumerate the install folder: ") +
+                    error.Message + ">"
+                };
             }
 
             foreach (var path in entries)
@@ -1787,7 +1915,7 @@ namespace TermLink.Setup
                 var relative = Path.GetRelativePath(resolvedRoot, path);
                 blocked.Add(
                     (string.Equals(relative, ".", StringComparison.Ordinal)
-                        ? "<安装目录本身>"
+                        ? SetupText.Pick("<安装目录本身>", "<install folder itself>")
                         : relative) + " (Win32 " + error + ")");
                 if (blocked.Count >= maximumResults) break;
             }
@@ -1809,10 +1937,15 @@ namespace TermLink.Setup
                     : "configured-terminal-not-installed";
                 marker.TerminalIntegrationDiagnostic = windowsTerminalInstalled
                     ? null
-                    : "未检测到 Windows Terminal；TermLink 自有 Profile Fragment 已预先生成。" +
-                      "以后安装 Windows Terminal 即可读取该配置，TermLink 没有安装、替换或修改 Terminal 本体。";
+                    : SetupText.Pick(
+                        "未检测到 Windows Terminal；TermLink 自有 Profile Fragment 已预先生成。" +
+                        "以后安装 Windows Terminal 即可读取该配置，TermLink 没有安装、替换或修改 Terminal 本体。",
+                        "Windows Terminal was not detected. TermLink's own profile fragment was generated in advance. " +
+                        "Windows Terminal can read it after being installed later. TermLink did not install, replace, or modify Windows Terminal itself.");
                 var message = windowsTerminalInstalled
-                    ? "Windows Terminal Profile 已配置。"
+                    ? SetupText.Pick(
+                        "Windows Terminal Profile 已配置。",
+                        "The Windows Terminal profile was configured.")
                     : marker.TerminalIntegrationDiagnostic;
                 return new InstallOutcome(marker.TerminalIntegrationStatus, message, null);
             }
@@ -1826,10 +1959,12 @@ namespace TermLink.Setup
                 error is NotSupportedException)
             {
                 var diagnosticPath = WriteTerminalDiagnostic(error);
-                var message =
+                var message = SetupText.Pick(
                     "TermLink Agent 已安装，但可选的 Windows Terminal Profile 配置失败。" +
-                    "安装程序没有修改 Windows Terminal 的 settings.json，也不会替换现有 Terminal；原因: " +
-                    error.Message;
+                    "安装程序没有修改 Windows Terminal 的 settings.json，也不会替换现有 Terminal。",
+                    "TermLink Agent was installed, but the optional Windows Terminal profile could not be configured. " +
+                    "Setup did not modify Windows Terminal settings.json and will not replace an existing Terminal.") +
+                    Environment.NewLine + SetupText.PublicError(error);
                 marker.TerminalIntegrationStatus = "failed";
                 marker.TerminalIntegrationDiagnostic = message;
                 CarryForwardTerminalOwnership(marker, previous);
@@ -1863,8 +1998,8 @@ namespace TermLink.Setup
             }
             catch
             {
-                // Console/UI still receive the original diagnostic when the
-                // temporary directory is itself unavailable.
+                // The optional integration remains non-fatal when diagnostics
+                // cannot be persisted.
                 return null;
             }
         }
@@ -2192,9 +2327,9 @@ namespace TermLink.Setup
             string localApplicationData)
         {
             if (string.IsNullOrWhiteSpace(installRoot))
-                throw new ArgumentException("Install root is required.", nameof(installRoot));
+                throw new ArgumentException(SetupText.Pick("需要安装根目录。", "Install root is required."), nameof(installRoot));
             if (string.IsNullOrWhiteSpace(localApplicationData))
-                throw new ArgumentException("Local application data is required.", nameof(localApplicationData));
+                throw new ArgumentException(SetupText.Pick("需要本地应用数据目录。", "Local application data is required."), nameof(localApplicationData));
             var root = Path.GetFullPath(installRoot);
             var tray = Quote(Path.Combine(root, "TermLink.exe"));
             var agent = Quote(Path.Combine(root, "TermLink.Agent.exe")) +
@@ -2362,7 +2497,9 @@ namespace TermLink.Setup
                 var candidate = Path.Combine(directory, stem + " (" + suffix + ")" + extension);
                 if (!File.Exists(candidate)) return candidate;
             }
-            throw new IOException("无法为 TermLink 创建快捷方式：同名文件过多。请清理旧的 TermLink 快捷方式后重试。");
+            throw new IOException(SetupText.Pick(
+                "无法为 TermLink 创建快捷方式：同名文件过多。请清理旧的 TermLink 快捷方式后重试。",
+                "A TermLink shortcut could not be created because too many files have the same name. Remove old TermLink shortcuts and try again."));
         }
 
         private static void CreateShortcut(string path, string target, string workingDirectory)
@@ -2377,7 +2514,9 @@ namespace TermLink.Setup
                 var shellType = Type.GetTypeFromProgID("WScript.Shell");
                 if (shellType == null)
                 {
-                    throw new PlatformNotSupportedException("当前 Windows 环境缺少快捷方式创建组件 WScript.Shell。");
+                    throw new PlatformNotSupportedException(SetupText.Pick(
+                        "当前 Windows 环境缺少快捷方式创建组件 WScript.Shell。",
+                        "This Windows environment does not provide the WScript.Shell shortcut component."));
                 }
                 shell = Activator.CreateInstance(shellType);
                 shortcut = shellType.InvokeMember(
@@ -2400,8 +2539,9 @@ namespace TermLink.Setup
             }
             catch (UnauthorizedAccessException error)
             {
-                throw new InvalidOperationException(
+                throw new InvalidOperationException(SetupText.Pick(
                     "无法创建 TermLink 快捷方式：" + path + "。请确认当前用户对该目录有写入权限。",
+                    "The TermLink shortcut could not be created: " + path + ". Confirm that the current user can write to this folder."),
                     error);
             }
             finally
@@ -2606,7 +2746,9 @@ namespace TermLink.Setup
         {
             if (!Directory.Exists(backup))
             {
-                throw new DirectoryNotFoundException("旧版本备份不存在: " + backup);
+                throw new DirectoryNotFoundException(SetupText.Pick(
+                    "旧版本备份不存在: ",
+                    "The old-version backup does not exist: ") + backup);
             }
 
             string failedRoot = null;
@@ -2616,7 +2758,9 @@ namespace TermLink.Setup
                 MoveDirectoryWithRetry(
                     root,
                     failedRoot,
-                    "无法隔离失败的新版本目录",
+                    SetupText.Pick(
+                        "无法隔离失败的新版本目录",
+                        "Could not isolate the failed new-version folder"),
                     TimeSpan.FromSeconds(10));
             }
 
@@ -2625,7 +2769,9 @@ namespace TermLink.Setup
                 MoveDirectoryWithRetry(
                     backup,
                     root,
-                    "无法恢复旧版本安装目录",
+                    SetupText.Pick(
+                        "无法恢复旧版本安装目录",
+                        "Could not restore the old-version install folder"),
                     TimeSpan.FromSeconds(10));
             }
             catch
@@ -2642,7 +2788,9 @@ namespace TermLink.Setup
                         MoveDirectoryWithRetry(
                             failedRoot,
                             root,
-                            "无法重新激活失败的新版本目录",
+                            SetupText.Pick(
+                                "无法重新激活失败的新版本目录",
+                                "Could not reactivate the failed new-version folder"),
                             TimeSpan.FromSeconds(5));
                     }
                     catch { }
@@ -2656,7 +2804,10 @@ namespace TermLink.Setup
                 if (Directory.Exists(failedRoot))
                 {
                     Console.Error.WriteLine(
-                        "失败的新版本目录暂时无法清理，旧版本已恢复；保留目录: " + failedRoot);
+                        SetupText.Pick(
+                            "失败的新版本目录暂时无法清理，旧版本已恢复；保留目录: ",
+                            "The failed new-version folder could not be cleaned up. The old version was restored, and this folder was retained: ") +
+                        failedRoot);
                 }
             }
         }
@@ -2687,7 +2838,9 @@ namespace TermLink.Setup
         {
             if (string.IsNullOrWhiteSpace(localApplicationData))
             {
-                throw new ArgumentException("Local application data directory is required.", nameof(localApplicationData));
+                throw new ArgumentException(SetupText.Pick(
+                    "需要本地应用数据目录。",
+                    "Local application data directory is required."), nameof(localApplicationData));
             }
             var root = Path.Combine(Path.GetFullPath(localApplicationData), "TermLink");
             return new[]
@@ -2713,7 +2866,9 @@ namespace TermLink.Setup
                 var path = Path.GetFullPath(candidate);
                 if (!path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                 {
-                    throw new InvalidOperationException("运行数据清理路径超出 TermLink 专用目录，已拒绝: " + path);
+                    throw new InvalidOperationException(SetupText.Pick(
+                        "运行数据清理路径超出 TermLink 专用目录，已拒绝: ",
+                        "The runtime-data cleanup path is outside the TermLink-owned folder and was refused: ") + path);
                 }
                 if (!File.Exists(path)) continue;
                 File.Delete(path);

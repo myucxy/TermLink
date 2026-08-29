@@ -12,6 +12,14 @@ import org.junit.Test
 
 class TerminalSnapshotBootstrapTest {
     @Test
+    fun snapshotRuntimeRequiresBothLocalOptInAndPcCapability() {
+        val capability = dev.termlink.model.PcCapabilityIds.TERMINAL_SNAPSHOT_V1
+        assertFalse(terminalSnapshotRuntimeNegotiated(false, setOf(capability)))
+        assertFalse(terminalSnapshotRuntimeNegotiated(true, emptySet()))
+        assertTrue(terminalSnapshotRuntimeNegotiated(true, setOf(capability)))
+    }
+
+    @Test
     fun productionReadinessPolicyCoversSlowWindowsRegistrationWithShortRequests() {
         assertEquals(30_000L, TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS)
         assertEquals(1_000L, TERMINAL_SNAPSHOT_READINESS_REQUEST_TIMEOUT_MILLIS)
@@ -71,7 +79,7 @@ class TerminalSnapshotBootstrapTest {
     }
 
     @Test
-    fun permanentSnapshotRejectionSettlesReadinessWithoutDelayingChunkFallback() {
+    fun unsupportedSnapshotSettlesSnapshotPollingSoChunkPollingCanUseTheRemainingWindow() {
         assertTrue(snapshotReadinessIsSettled(snapshotAvailable = true, failure = null))
         assertTrue(
             snapshotReadinessIsSettled(
@@ -139,6 +147,268 @@ class TerminalSnapshotBootstrapTest {
                 throughSequence = 4_097uL,
             ),
         )
+    }
+
+    @Test
+    fun tailReplayStartsAfterOneAndEndsAtTheLatestAuthoritativeTail() {
+        val selection = boundedTailReplaySelection(
+            candidates = listOf(
+                HistorySequenceRange(9_801uL, 9_900uL),
+                HistorySequenceRange(9_951uL, 10_000uL),
+                HistorySequenceRange(9_901uL, 9_950uL),
+            ),
+            authoritativeTail = 10_000uL,
+            sequenceRange = { it },
+            maximumEvents = 100,
+        )
+
+        assertEquals(BoundedEventReplayReadiness.READY, selection.readiness)
+        assertEquals(9_901uL, selection.start)
+        assertEquals(10_000uL, selection.target)
+        assertEquals(100, selection.eventCount)
+        assertEquals(
+            listOf(
+                HistorySequenceRange(9_901uL, 9_950uL),
+                HistorySequenceRange(9_951uL, 10_000uL),
+            ),
+            selection.candidates,
+        )
+    }
+
+    @Test
+    fun tailReplayRejectsAGapInsideTheSelectedRecentWindow() {
+        val selection = boundedTailReplaySelection(
+            candidates = listOf(
+                HistorySequenceRange(101uL, 150uL),
+                HistorySequenceRange(152uL, 200uL),
+            ),
+            authoritativeTail = 200uL,
+            sequenceRange = { it },
+            maximumEvents = 100,
+        )
+
+        assertEquals(BoundedEventReplayReadiness.GAP, selection.readiness)
+        assertTrue(selection.candidates.isEmpty())
+        assertEquals(
+            BoundedEventReplayReadiness.GAP,
+            boundedTailReplaySelection(
+                candidates = listOf(
+                    HistorySequenceRange(101uL, 200uL),
+                    HistorySequenceRange(101uL, 200uL),
+                ),
+                authoritativeTail = 200uL,
+                sequenceRange = { it },
+                maximumEvents = 100,
+            ).readiness,
+        )
+    }
+
+    @Test
+    fun tailReplayTruncatesWholeOlderChunksInsteadOfExceedingItsLimit() {
+        val ranges = (0 until 9).map { index ->
+            val start = index.toULong() * 512uL + 1uL
+            HistorySequenceRange(start, start + 511uL)
+        }
+        val selection = boundedTailReplaySelection(
+            candidates = ranges,
+            authoritativeTail = 4_608uL,
+            sequenceRange = { it },
+        )
+
+        assertEquals(BoundedEventReplayReadiness.READY, selection.readiness)
+        assertEquals(513uL, selection.start)
+        assertEquals(4_608uL, selection.target)
+        assertEquals(4_096, selection.eventCount)
+        assertEquals(ranges.drop(1), selection.candidates)
+        assertEquals(
+            BoundedEventReplayReadiness.LIMIT_EXCEEDED,
+            boundedTailReplaySelection(
+                candidates = listOf(HistorySequenceRange(1uL, 4_097uL)),
+                authoritativeTail = 4_097uL,
+                sequenceRange = { it },
+            ).readiness,
+        )
+    }
+
+    @Test
+    fun tailCatalogWaitsForPublicationAndTracksTailAdvanceDuringOpen() = runBlocking {
+        var attempts = 0
+        val result = awaitBoundedTailReplayCatalog(
+            initialTarget = 200uL,
+            latestObservation = {
+                attempts += 1
+                when (attempts) {
+                    1 -> BoundedTailReplayCatalogObservation(
+                        authoritativeTail = 200uL,
+                        candidates = listOf(HistorySequenceRange(101uL, 180uL)),
+                    )
+                    2 -> BoundedTailReplayCatalogObservation(
+                        authoritativeTail = 220uL,
+                        candidates = listOf(HistorySequenceRange(101uL, 200uL)),
+                    )
+                    else -> BoundedTailReplayCatalogObservation(
+                        authoritativeTail = 220uL,
+                        candidates = listOf(
+                            HistorySequenceRange(101uL, 180uL),
+                            HistorySequenceRange(181uL, 220uL),
+                        ),
+                    )
+                }
+            },
+            sequenceRange = { it },
+            retryDelaysMillis = listOf(100L, 200L),
+            timeoutMillis = 1_000L,
+            maximumEvents = 200,
+            pause = { },
+        )
+
+        assertEquals(3, attempts)
+        assertEquals(BoundedEventReplayReadiness.READY, result.readiness)
+        assertEquals(101uL, result.start)
+        assertEquals(220uL, result.target)
+        assertEquals(120, result.eventCount)
+    }
+
+    @Test
+    fun tailCatalogPropagatesCallerCancellation() {
+        val cancellation = CancellationException("tail catalog cancelled")
+
+        val thrown = assertThrows(CancellationException::class.java) {
+            runBlocking {
+                awaitBoundedTailReplayCatalog<HistorySequenceRange>(
+                    initialTarget = 200uL,
+                    latestObservation = { throw cancellation },
+                    sequenceRange = { it },
+                    retryDelaysMillis = listOf(100L),
+                    timeoutMillis = 1_000L,
+                    pause = { error("pause must not run") },
+                )
+            }
+        }
+
+        assertEquals("tail catalog cancelled", thrown.message)
+    }
+
+    @Test
+    fun tailReplayRereadsAuthorityAndAllowsOnlyABoundedRealtimeSuffix() = runBlocking {
+        var tailReads = 0
+        assertEquals(
+            FullPrefixRealtimeSuffixValidation.READY,
+            validateTailReplayRealtimeSuffix(1_000uL) {
+                tailReads += 1
+                5_096uL
+            },
+        )
+        assertEquals(1, tailReads)
+        assertEquals(
+            FullPrefixRealtimeSuffixValidation.OUTSIDE_WINDOW,
+            validateTailReplayRealtimeSuffix(1_000uL) { 5_097uL },
+        )
+    }
+
+    @Test
+    fun chunkCatalogPublishedLaterSucceedsAgainstItsLatestObservedWatermark() = runBlocking {
+        var attempts = 0
+        val result = awaitBoundedEventReplayCatalog(
+            initialTarget = 40uL,
+            initialCandidates = emptyList<HistorySequenceRange>(),
+            sequenceRange = { it },
+            latestObservation = {
+                attempts += 1
+                when (attempts) {
+                    1 -> BoundedEventReplayCatalogObservation(
+                        authoritativeTail = 40uL,
+                        candidates = listOf(HistorySequenceRange(1uL, 32uL)),
+                    )
+                    2 -> BoundedEventReplayCatalogObservation(
+                        authoritativeTail = 48uL,
+                        candidates = listOf(HistorySequenceRange(1uL, 40uL)),
+                    )
+                    else -> BoundedEventReplayCatalogObservation(
+                        authoritativeTail = 48uL,
+                        candidates = listOf(HistorySequenceRange(1uL, 48uL)),
+                    )
+                }
+            },
+            retryDelaysMillis = listOf(100L, 200L),
+            timeoutMillis = 1_000L,
+            pause = { },
+        )
+
+        assertEquals(3, attempts)
+        assertEquals(48uL, result.target)
+        assertEquals(BoundedEventReplayReadiness.READY, result.readiness)
+        assertEquals(listOf(HistorySequenceRange(1uL, 48uL)), result.candidates)
+    }
+
+    @Test
+    fun chunkCatalogPollingStopsAtTheBoundedTimeout() = runBlocking {
+        var attempts = 0
+        val result = awaitBoundedEventReplayCatalog(
+            initialTarget = 40uL,
+            initialCandidates = emptyList<HistorySequenceRange>(),
+            sequenceRange = { it },
+            latestObservation = {
+                attempts += 1
+                BoundedEventReplayCatalogObservation(
+                    authoritativeTail = 40uL,
+                    candidates = emptyList(),
+                )
+            },
+            retryDelaysMillis = listOf(10_000L),
+            timeoutMillis = 20L,
+            pause = { delay(it) },
+        )
+
+        assertEquals(1, attempts)
+        assertEquals(40uL, result.target)
+        assertEquals(BoundedEventReplayReadiness.NOT_YET_COMPLETE, result.readiness)
+    }
+
+    @Test
+    fun chunkCatalogPollingPropagatesCallerCancellation() {
+        val cancellation = CancellationException("catalog polling cancelled")
+
+        val thrown = assertThrows(CancellationException::class.java) {
+            runBlocking {
+                awaitBoundedEventReplayCatalog(
+                    initialTarget = 40uL,
+                    initialCandidates = emptyList<HistorySequenceRange>(),
+                    sequenceRange = { it },
+                    latestObservation = { throw cancellation },
+                    retryDelaysMillis = listOf(100L),
+                    timeoutMillis = 1_000L,
+                    pause = { error("pause must not run") },
+                )
+            }
+        }
+
+        assertEquals("catalog polling cancelled", thrown.message)
+    }
+
+    @Test
+    fun fullPrefixReplayRereadsTailAndRejectsARealtimeWindowGapBeforeAck() = runBlocking {
+        val restoredTarget = 100uL
+        var authoritativeTail = restoredTarget
+        var tailReads = 0
+
+        // Simulates output produced while the complete prefix is being
+        // downloaded and applied. Validation must read this newer value.
+        authoritativeTail = 229uL
+        val outsideWindow = validateFullPrefixRealtimeSuffix(restoredTarget) {
+            tailReads += 1
+            authoritativeTail
+        }
+
+        assertEquals(1, tailReads)
+        assertEquals(FullPrefixRealtimeSuffixValidation.OUTSIDE_WINDOW, outsideWindow)
+        authoritativeTail = 228uL
+        assertEquals(
+            FullPrefixRealtimeSuffixValidation.READY,
+            validateFullPrefixRealtimeSuffix(restoredTarget) { authoritativeTail },
+        )
+        assertTrue(fullPrefixHasBoundedRealtimeSuffix(restoredTarget, 228uL))
+        assertFalse(fullPrefixHasBoundedRealtimeSuffix(restoredTarget, 229uL))
     }
 
     @Test

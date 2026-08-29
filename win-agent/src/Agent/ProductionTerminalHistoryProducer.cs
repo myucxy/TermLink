@@ -170,6 +170,19 @@ namespace TermLink.Agent
             IList<LocalFrame> committedFrames,
             bool persistLegacyArtifacts)
         {
+            return ProcessSession(
+                sessionId,
+                committedFrames,
+                persistLegacyArtifacts,
+                shouldYield: null);
+        }
+
+        internal ProductionTerminalHistoryProductionResult ProcessSession(
+            Guid sessionId,
+            IList<LocalFrame> committedFrames,
+            bool persistLegacyArtifacts,
+            Func<bool> shouldYield)
+        {
             if (sessionId == Guid.Empty) throw new ArgumentException("Session ID is required.", nameof(sessionId));
             if (committedFrames == null) throw new ArgumentNullException(nameof(committedFrames));
             lifecycleGate.EnterReadLock();
@@ -203,7 +216,8 @@ namespace TermLink.Agent
                         state,
                         frames,
                         persistLegacyArtifacts,
-                        out shadowDispatch);
+                        out shadowDispatch,
+                        shouldYield);
                 }
                 QueueTerminalCoreShadow(shadowDispatch);
                 return result;
@@ -216,7 +230,8 @@ namespace TermLink.Agent
             ProductionState state,
             IList<LocalFrame> frames,
             bool persistLegacyArtifacts,
-            out ShadowDispatchRequest shadowDispatch)
+            out ShadowDispatchRequest shadowDispatch,
+            Func<bool> shouldYield = null)
         {
             shadowDispatch = null;
             foreach (var frame in frames)
@@ -259,6 +274,11 @@ namespace TermLink.Agent
                 : null;
             foreach (var sequence in applied)
             {
+                // Persisted backlog can contain years of terminal output. Keep
+                // the already-applied projection in memory and yield between
+                // ordered frames when a live session needs its first Snapshot.
+                // A later pass ignores <= AppliedSequence and resumes exactly.
+                if (shouldYield?.Invoke() == true) return null;
                 var frame = state.PendingFrames[sequence];
                 ApplyFrame(state.Model, frame);
                 shadowFrames?.Add(frame);
@@ -272,6 +292,8 @@ namespace TermLink.Agent
                 if (frame.Type == LocalFrameType.Output) state.HasOutput = true;
                 state.PendingFrames.Remove(sequence);
             }
+
+            if (shouldYield?.Invoke() == true) return null;
 
             return ProduceCheckpoint(
                 sessionId,

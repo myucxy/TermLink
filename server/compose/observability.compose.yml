@@ -4,7 +4,7 @@ services:
   server:
     environment:
       # Keep the metrics listener separate from the edge-facing HTTP listener.
-      TERMLINK_METRICS_LISTEN_ADDR: ":9090"
+      TERMLINK_METRICS_LISTEN_ADDR: ${TERMLINK_METRICS_LISTEN_ADDR:-:9090}
 
   prometheus:
     image: prom/prometheus:v2.55.1@sha256:2659f4c2ebb718e7695cb9b25ffa7d6be64db013daba13e05c875451cf51b0d3
@@ -38,6 +38,16 @@ services:
       timeout: 5s
       retries: 12
       start_period: 15s
+    mem_limit: ${TERMLINK_PROMETHEUS_MEMORY_LIMIT:-1g}
+    mem_reservation: ${TERMLINK_PROMETHEUS_MEMORY_RESERVATION:-256m}
+    cpus: ${TERMLINK_PROMETHEUS_CPU_LIMIT:-1.00}
+    pids_limit: ${TERMLINK_PROMETHEUS_PIDS_LIMIT:-256}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${TERMLINK_CONTAINER_LOG_MAX_SIZE:-10m}
+        max-file: ${TERMLINK_CONTAINER_LOG_MAX_FILES:-5}
+    stop_grace_period: 30s
     restart: unless-stopped
 
   blackbox:
@@ -60,6 +70,15 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+    mem_limit: ${TERMLINK_BLACKBOX_MEMORY_LIMIT:-128m}
+    mem_reservation: ${TERMLINK_BLACKBOX_MEMORY_RESERVATION:-32m}
+    cpus: ${TERMLINK_BLACKBOX_CPU_LIMIT:-0.25}
+    pids_limit: ${TERMLINK_BLACKBOX_PIDS_LIMIT:-64}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${TERMLINK_CONTAINER_LOG_MAX_SIZE:-10m}
+        max-file: ${TERMLINK_CONTAINER_LOG_MAX_FILES:-5}
     restart: unless-stopped
 
   alertmanager:
@@ -74,7 +93,7 @@ services:
       - egress
     volumes:
       - alertmanager-data:/alertmanager
-      - ${TERMLINK_ALERTMANAGER_CONFIG_FILE:-../observability/alertmanager/alertmanager.yml}:/etc/alertmanager/alertmanager.yml:ro
+      - ${TERMLINK_ALERTMANAGER_CONFIG_FILE:?TERMLINK_ALERTMANAGER_CONFIG_FILE is required for observability}:/etc/alertmanager/alertmanager.yml:ro
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
@@ -88,6 +107,16 @@ services:
       timeout: 5s
       retries: 12
       start_period: 15s
+    mem_limit: ${TERMLINK_ALERTMANAGER_MEMORY_LIMIT:-256m}
+    mem_reservation: ${TERMLINK_ALERTMANAGER_MEMORY_RESERVATION:-64m}
+    cpus: ${TERMLINK_ALERTMANAGER_CPU_LIMIT:-0.50}
+    pids_limit: ${TERMLINK_ALERTMANAGER_PIDS_LIMIT:-128}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${TERMLINK_CONTAINER_LOG_MAX_SIZE:-10m}
+        max-file: ${TERMLINK_CONTAINER_LOG_MAX_FILES:-5}
+    stop_grace_period: 30s
     restart: unless-stopped
 
   grafana:
@@ -131,6 +160,16 @@ services:
       timeout: 5s
       retries: 12
       start_period: 30s
+    mem_limit: ${TERMLINK_GRAFANA_MEMORY_LIMIT:-512m}
+    mem_reservation: ${TERMLINK_GRAFANA_MEMORY_RESERVATION:-128m}
+    cpus: ${TERMLINK_GRAFANA_CPU_LIMIT:-1.00}
+    pids_limit: ${TERMLINK_GRAFANA_PIDS_LIMIT:-256}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${TERMLINK_CONTAINER_LOG_MAX_SIZE:-10m}
+        max-file: ${TERMLINK_CONTAINER_LOG_MAX_FILES:-5}
+    stop_grace_period: 30s
     restart: unless-stopped
 
 volumes:
@@ -140,4 +179,4 @@ volumes:
 
 secrets:
   grafana_admin_password:
-    file: ${TERMLINK_GRAFANA_ADMIN_PASSWORD_FILE:-../secrets/grafana-admin-password}
+    file: ${TERMLINK_GRAFANA_ADMIN_PASSWORD_FILE:?TERMLINK_GRAFANA_ADMIN_PASSWORD_FILE is required for observability}

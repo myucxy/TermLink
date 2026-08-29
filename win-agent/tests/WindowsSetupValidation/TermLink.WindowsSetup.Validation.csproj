@@ -13,5 +13,6 @@
     <Compile Include="..\..\src\Common\WindowsTerminalIntegration.cs" Link="Common\WindowsTerminalIntegration.cs" />
     <Compile Include="..\..\src\Setup\Program.cs" Link="Setup\Program.cs" />
     <Compile Include="..\..\src\Setup\SetupForm.cs" Link="Setup\SetupForm.cs" />
+    <Compile Include="..\..\src\Setup\SetupText.cs" Link="Setup\SetupText.cs" />
   </ItemGroup>
 </Project>

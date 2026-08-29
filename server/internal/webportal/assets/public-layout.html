@@ -1,0 +1,56 @@
+{{define "public-page-start"}}
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="{{.Description}}">
+  <title>{{.PageTitle}} · TermLink</title>
+  <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
+  <script src="/assets/theme-init.js?v=public-v1"></script>
+  <link rel="stylesheet" href="/assets/site.css?v=public-v2">
+  <link rel="stylesheet" href="/assets/public-pages.css?v=public-v1">
+  <script src="/assets/theme.js?v=public-v1" defer></script>
+</head>
+<body class="public-body" data-public-shell>
+  <header class="site-header public-header">
+    <a class="brand" href="/" aria-label="TermLink 首页">
+      <img class="brand-mark" src="/assets/termlink-app-icon.svg" alt="">
+      <span><strong>TermLink</strong><small>Remote terminal, locally alive.</small></span>
+    </a>
+    <nav class="public-nav" aria-label="公开页面导航" data-desktop-nav>
+      <a href="/downloads" {{if eq .ActivePage "downloads"}}aria-current="page"{{end}}>下载</a>
+      <a href="/releases" {{if eq .ActivePage "releases"}}aria-current="page"{{end}}>版本</a>
+      <a href="/plans" {{if eq .ActivePage "plans"}}aria-current="page"{{end}}>套餐</a>
+      <a href="/security" {{if eq .ActivePage "security"}}aria-current="page"{{end}}>安全</a>
+      <a href="/status" {{if eq .ActivePage "status"}}aria-current="page"{{end}}>状态</a>
+    </nav>
+    <div class="site-header-actions public-header-actions">
+      <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题">
+        <span class="theme-toggle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path class="theme-icon-moon" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/><g class="theme-icon-sun"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></g></svg></span>
+        <span class="theme-toggle-label">主题</span>
+      </button>
+      {{if .SignedIn}}<a class="button button-primary" href="{{.AccountURL}}">个人中心</a>{{else}}<a class="button button-primary" href="{{.LoginURL}}" data-theme-transfer>登录</a>{{end}}
+    </div>
+    <nav class="public-mobile-nav" aria-label="移动端公开页面导航" data-mobile-nav>
+      <a href="/downloads" {{if eq .ActivePage "downloads"}}aria-current="page"{{end}}>下载</a>
+      <a href="/releases" {{if eq .ActivePage "releases"}}aria-current="page"{{end}}>版本</a>
+      <a href="/plans" {{if eq .ActivePage "plans"}}aria-current="page"{{end}}>套餐</a>
+      <a href="/security" {{if eq .ActivePage "security"}}aria-current="page"{{end}}>安全</a>
+      <a href="/status" {{if eq .ActivePage "status"}}aria-current="page"{{end}}>状态</a>
+    </nav>
+  </header>
+  <main class="public-main" data-public-main>
+{{end}}
+
+{{define "public-page-end"}}
+  </main>
+  <footer class="site-footer public-footer">
+    <span>© TermLink · 清风惹尘丶</span>
+    <span>终端正文不进入 Web 管理台</span>
+    <nav aria-label="页脚导航"><a href="/security">安全</a><a href="/status">服务状态</a></nav>
+  </footer>
+</body>
+</html>
+{{end}}

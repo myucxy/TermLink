@@ -20,20 +20,15 @@ type OutboxEvent struct {
 	Attempts    int
 }
 
-// ClaimOutboxEvents leases a bounded batch with SKIP LOCKED. If a process
-// exits before acknowledging an event, available_at makes it claimable again.
-func (s *Postgres) ClaimOutboxEvents(ctx context.Context, limit int) ([]OutboxEvent, error) {
-	if limit < 1 || limit > 100 {
-		limit = 50
-	}
-	rows, err := s.Pool.Query(ctx, `
+const claimOutboxEventsSQL = `
 		WITH candidates AS (
 			SELECT id
 			FROM outbox
 			WHERE processed_at IS NULL AND available_at<=now()
 			  AND event_type IN (
 				'device.revoked','grant.revoked','grant.updated','lease.revoked',
-				'account.status.changed','entitlement.changed','history.object.delete'
+				'account.status.changed','entitlement.changed','history.object.delete',
+				'refund.approval.changed'
 			  )
 			ORDER BY id
 			FOR UPDATE SKIP LOCKED
@@ -45,7 +40,15 @@ func (s *Postgres) ClaimOutboxEvents(ctx context.Context, limit int) ([]OutboxEv
 			last_error=NULL
 		FROM candidates
 		WHERE event.id=candidates.id
-		RETURNING event.id,event.event_type,event.aggregate_id,event.payload,event.attempts`, limit)
+		RETURNING event.id,event.event_type,event.aggregate_id,event.payload,event.attempts`
+
+// ClaimOutboxEvents leases a bounded batch with SKIP LOCKED. If a process
+// exits before acknowledging an event, available_at makes it claimable again.
+func (s *Postgres) ClaimOutboxEvents(ctx context.Context, limit int) ([]OutboxEvent, error) {
+	if limit < 1 || limit > 100 {
+		limit = 50
+	}
+	rows, err := s.Pool.Query(ctx, claimOutboxEventsSQL, limit)
 	if err != nil {
 		return nil, err
 	}

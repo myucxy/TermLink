@@ -26,11 +26,14 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"github.com/termlink/termlink/server/internal/accountdeletion"
 	"github.com/termlink/termlink/server/internal/agentupdate"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/billing"
+	"github.com/termlink/termlink/server/internal/commerce"
 	"github.com/termlink/termlink/server/internal/history"
 	"github.com/termlink/termlink/server/internal/kv"
+	"github.com/termlink/termlink/server/internal/serviceemail"
 	"github.com/termlink/termlink/server/internal/store"
 )
 
@@ -56,15 +59,25 @@ const (
 const pairingCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 type API struct {
-	Store              *store.Postgres
-	Valkey             *kv.Valkey
-	Tokens             auth.TokenVerifier
-	Auth               auth.Middleware
-	SubjectKey         []byte
-	TokenKey           []byte
-	History            HistoryObjectStore
-	Billing            *billing.Registry
-	Registration       *auth.DirectRegistrationService
+	Store                    *store.Postgres
+	Valkey                   *kv.Valkey
+	Tokens                   auth.TokenVerifier
+	Auth                     auth.Middleware
+	SubjectKey               []byte
+	TokenKey                 []byte
+	CommerceKey              []byte
+	History                  HistoryObjectStore
+	DataExportDownloader     PrivacyExportDownloader
+	AccountDeletionBinder    accountdeletion.RequestBinder
+	Billing                  *billing.Registry
+	Commerce                 *commerce.Service
+	ReconciliationOperations ReconciliationOperations
+	Registration             *auth.DirectRegistrationService
+	ServiceEmail             *serviceemail.Service
+	VerifiedRegistration     interface {
+		RegisterVerifiedEmail(context.Context, auth.DirectRegistrationInput) error
+		RegisterVerifiedEmailAttempt(context.Context, uuid.UUID, auth.DirectRegistrationInput) error
+	}
 	ClientConfig       ClientConfiguration
 	Clock              func() time.Time
 	historyPages       historyPageLister
@@ -73,6 +86,8 @@ type API struct {
 	fileOperations     fileOperationStore
 	agentUpdates       agentUpdateStore
 	AgentUpdateCatalog agentupdate.Catalog
+	commerceSecurity   commerceSecurityStore
+	commerceReporting  commerceReportingStore
 }
 
 type historyPageLister interface {
@@ -112,7 +127,12 @@ func (a *API) Handler() http.Handler {
 	public.HandleFunc("POST /v1/devices/register", a.registerDevice)
 	public.HandleFunc("GET /v1/billing/plans", a.listPlans)
 	public.HandleFunc("GET /v1/client-config", a.getClientConfiguration)
+	public.HandleFunc("GET /v1/registration-policy", a.getRegistrationPolicy)
+	public.HandleFunc("POST /v1/auth/invitations/validate", a.validateInvitation)
+	public.HandleFunc("POST /v1/auth/register/email-code", a.sendRegistrationEmailCode)
 	public.HandleFunc("POST /v1/auth/register", a.registerAccount)
+	public.HandleFunc("POST /v1/billing/webhooks/alipay", a.handleAlipayWebhook)
+	public.HandleFunc("POST /v1/billing/webhooks/wechat-pay", a.handleWeChatWebhook)
 	registered := http.NewServeMux()
 	registered.HandleFunc("POST /v1/pairing/challenges/{id}/complete", a.completePairingChallenge)
 	registered.HandleFunc("GET /v1/devices/self", a.getCurrentDevice)
@@ -159,15 +179,64 @@ func (a *API) Handler() http.Handler {
 	trusted.HandleFunc("POST /v1/billing/google/verify", a.verifyGooglePurchase)
 	trusted.HandleFunc("POST /v1/billing/restore", a.restorePurchase)
 	trusted.HandleFunc("POST /v1/billing/web/checkout", a.createWebCheckout)
-	trusted.HandleFunc("POST /v1/admin/billing/plans", a.createPlanDraft)
-	trusted.HandleFunc("PUT /v1/admin/billing/plans/{id}", a.updatePlanDraft)
+	trusted.HandleFunc("POST /v1/billing/redemptions/preview", a.previewRedemption)
+	trusted.HandleFunc("POST /v1/billing/redemptions/claim", a.claimRedemption)
+	trusted.HandleFunc("GET /v1/account/redemptions", a.listAccountRedemptions)
+	trusted.HandleFunc("POST /v1/billing/orders", a.createCommerceOrder)
+	trusted.HandleFunc("GET /v1/billing/orders", a.listCommerceOrders)
+	trusted.HandleFunc("GET /v1/billing/orders/{orderId}", a.getCommerceOrder)
+	trusted.HandleFunc("POST /v1/billing/orders/{orderId}/pay", a.payCommerceOrder)
+	trusted.HandleFunc("POST /v1/billing/orders/{orderId}/query", a.queryCommerceOrder)
+	trusted.HandleFunc("POST /v1/billing/orders/{orderId}/cancel", a.cancelCommerceOrder)
+	trusted.HandleFunc("GET /v1/admin/registration-policy", a.adminGetRegistrationPolicy)
+	trusted.HandleFunc("PATCH /v1/admin/registration-policy", a.adminUpdateRegistrationPolicy)
+	trusted.HandleFunc("GET /v1/admin/invitation-batches", a.listInvitationBatches)
+	trusted.HandleFunc("POST /v1/admin/invitation-batches", a.createInvitationBatch)
+	trusted.HandleFunc("POST /v1/admin/invitation-batches/{batchId}/disable", a.disableInvitationBatch)
+	trusted.HandleFunc("GET /v1/admin/invitation-codes", a.listInvitationCodes)
+	trusted.HandleFunc("POST /v1/admin/invitation-codes/{codeId}/disable", a.disableInvitationCode)
+	trusted.HandleFunc("GET /v1/admin/invitation-redemptions", a.listInvitationRedemptions)
+	trusted.HandleFunc("GET /v1/admin/redemption-batches", a.listRedemptionBatches)
+	trusted.HandleFunc("POST /v1/admin/redemption-batches", a.createRedemptionBatch)
+	trusted.HandleFunc("POST /v1/admin/redemption-batches/{batchId}/disable", a.disableRedemptionBatch)
+	trusted.HandleFunc("GET /v1/admin/redemption-codes", a.listRedemptionCodes)
+	trusted.HandleFunc("POST /v1/admin/redemption-codes/{codeId}/disable", a.disableRedemptionCode)
+	trusted.HandleFunc("GET /v1/admin/redemption-claims", a.listAdminRedemptionClaims)
+	trusted.HandleFunc("GET /v1/admin/billing/orders", a.listAdminCommerceOrders)
+	trusted.HandleFunc("POST /v1/admin/billing/orders/{orderId}/query", a.queryAdminCommerceOrder)
+	trusted.HandleFunc("POST /v1/admin/billing/orders/{orderId}/retry-fulfillment", a.retryAdminOrderFulfillment)
+	trusted.HandleFunc("GET /v1/admin/billing/transactions", a.listAdminCommerceTransactions)
+	trusted.HandleFunc("POST /v1/admin/billing/orders/{orderId}/refunds", a.createCommerceRefund)
+	trusted.HandleFunc("POST /v1/admin/billing/refunds/{refundId}/confirm", a.confirmCommerceRefund)
+	trusted.HandleFunc("GET /v1/admin/billing/refunds", a.listCommerceRefunds)
+	trusted.HandleFunc("GET /v1/admin/billing/notifications", a.listPaymentNotifications)
+	trusted.HandleFunc("GET /v1/admin/billing/reconciliation-runs", a.listReconciliationRuns)
+	trusted.HandleFunc("POST /v1/admin/billing/reconciliation-runs", a.createReconciliationRun)
+	trusted.HandleFunc("GET /v1/admin/billing/catalog/draft", a.getCommerceCatalogDraft)
+	trusted.HandleFunc("GET /v1/admin/billing/order-report", a.listCommerceOrderReport)
+	trusted.HandleFunc("POST /v1/admin/billing/order-export", a.exportCommerceOrders)
+	trusted.HandleFunc("GET /v1/admin/billing/consistency", a.listCommerceConsistency)
+	trusted.HandleFunc("GET /v1/admin/payment-channels", a.listPaymentChannels)
+	trusted.HandleFunc("POST /v1/admin/payment-channels", a.createPaymentChannel)
+	trusted.HandleFunc("GET /v1/admin/payment-channels/{channelId}/versions", a.listPaymentChannelVersions)
+	trusted.HandleFunc("POST /v1/admin/payment-channels/{channelId}/versions", a.createPaymentChannelVersion)
+	trusted.HandleFunc("POST /v1/admin/payment-channels/{channelId}/validate", a.validatePaymentChannelVersion)
+	trusted.HandleFunc("POST /v1/admin/payment-channels/{channelId}/activate", a.activatePaymentChannelVersion)
+	trusted.HandleFunc("POST /v1/admin/payment-channels/{channelId}/disable", a.disablePaymentChannel)
+	trusted.Handle("POST /v1/admin/billing/plans", a.commerceHighRiskOperation("billing.plan.create.context", "catalog_draft", http.HandlerFunc(a.createPlanDraft)))
+	trusted.Handle("PUT /v1/admin/billing/plans/{id}", a.commerceHighRiskOperation("billing.plan.update.context", "catalog_draft", http.HandlerFunc(a.updatePlanDraft)))
 	trusted.HandleFunc("POST /v1/admin/billing/catalog/publish", a.publishCatalog)
 
 	root := http.NewServeMux()
 	root.Handle("/v1/devices/register", public)
 	root.Handle("/v1/billing/plans", public)
 	root.Handle("/v1/client-config", public)
+	root.Handle("/v1/registration-policy", public)
+	root.Handle("/v1/auth/invitations/validate", public)
+	root.Handle("/v1/auth/register/email-code", public)
 	root.Handle("/v1/auth/register", public)
+	root.Handle("/v1/billing/webhooks/alipay", public)
+	root.Handle("/v1/billing/webhooks/wechat-pay", public)
 	root.Handle("/v1/devices/self", a.Auth.AuthenticateRegistered(registered))
 	root.Handle("/v1/devices/self/trust", a.Auth.AuthenticateRegistered(a.idempotency(http.HandlerFunc(a.selfTrustAndroidDevice))))
 	// Register the exact create path as well as the completion subtree. Without
@@ -176,17 +245,100 @@ func (a *API) Handler() http.Handler {
 	// failure.
 	root.Handle("/v1/pairing/challenges", a.Auth.Authenticate(a.idempotency(http.HandlerFunc(a.createPairingChallenge))))
 	root.Handle("/v1/pairing/challenges/", a.Auth.AuthenticateRegistered(a.idempotency(registered)))
+	// Generated invitation and redemption codes are plaintext bearer secrets.
+	// Their successful response must never be replayed from the generic
+	// idempotency cache, so these two routes use a one-time response variant.
+	root.Handle("POST /v1/admin/invitation-batches/{batchId}/generate", a.Auth.Authenticate(a.oneTimeCommerceIdempotency(http.HandlerFunc(a.generateInvitationCodes))))
+	root.Handle("POST /v1/admin/redemption-batches/{batchId}/generate", a.Auth.Authenticate(a.oneTimeCommerceIdempotency(http.HandlerFunc(a.generateRedemptionCodes))))
+	root.Handle("POST /v1/admin/billing/orders/{orderId}/close", a.Auth.Authenticate(http.HandlerFunc(a.closeAdminCommerceOrder)))
+	// Reconciliation transitions own HMAC idempotency inside their database
+	// transaction and therefore must bypass the generic API idempotency layer.
+	root.Handle("GET /v1/admin/billing/reconciliation-discrepancies", a.Auth.Authenticate(http.HandlerFunc(a.listReconciliationDiscrepancies)))
+	root.Handle("POST /v1/admin/billing/reconciliation-discrepancies/{discrepancyId}/transition", a.Auth.Authenticate(http.HandlerFunc(a.transitionReconciliationDiscrepancy)))
+	// User-portal mutations own their durable, account-scoped idempotency
+	// records inside the Store transaction. Keep these exact routes outside the
+	// generic API idempotency wrapper so one request never claims the same key
+	// through two different hash domains.
+	root.Handle("POST /v1/account/devices/{deviceId}/revoke", a.Auth.Authenticate(http.HandlerFunc(a.revokeUserPortalDevice)))
+	root.Handle("GET /v1/account/pcs/control-policies", a.Auth.Authenticate(http.HandlerFunc(a.listUserPortalPCControlPolicies)))
+	root.Handle("PUT /v1/account/pcs/{pcId}/remote-routing", a.Auth.Authenticate(http.HandlerFunc(a.setUserPortalPCRemoteRouting)))
+	root.Handle("PUT /v1/account/pcs/{pcId}/control-policy", a.Auth.Authenticate(http.HandlerFunc(a.setUserPortalPCControlPolicy)))
+	root.Handle("DELETE /v1/account/sessions/{sessionId}/history", a.Auth.Authenticate(http.HandlerFunc(a.requestUserPortalHistoryDeletion)))
+	root.Handle("POST /v1/account/data-exports", a.Auth.Authenticate(http.HandlerFunc(a.requestUserPortalDataExport)))
+	root.Handle("GET /v1/account/data-exports/{exportId}", a.Auth.Authenticate(http.HandlerFunc(a.getUserPortalDataExport)))
+	root.Handle("GET /v1/account/data-exports/{exportId}/download", a.Auth.Authenticate(http.HandlerFunc(a.downloadUserPortalDataExport)))
+	root.Handle("GET /v1/account/deletion-preflight", a.Auth.Authenticate(http.HandlerFunc(a.getUserPortalAccountDeletionPreflight)))
+	root.Handle("POST /v1/account/deletion-requests", a.Auth.Authenticate(http.HandlerFunc(a.requestUserPortalAccountDeletion)))
+	root.Handle("GET /v1/account/deletion-requests/{requestId}", a.Auth.Authenticate(http.HandlerFunc(a.getUserPortalAccountDeletion)))
+	root.Handle("POST /v1/account/deletion-requests/{requestId}/cancel", a.Auth.Authenticate(http.HandlerFunc(a.cancelUserPortalAccountDeletion)))
+	// Manual entitlement mutations own actor-scoped idempotency in the same
+	// serializable transaction as the Grant and entitlement recomputation.
+	root.Handle("GET /v1/admin/manual-entitlements", a.Auth.Authenticate(http.HandlerFunc(a.adminListManualEntitlementGrants)))
+	root.Handle("POST /v1/admin/manual-entitlements", a.Auth.Authenticate(http.HandlerFunc(a.adminCreateManualEntitlementGrant)))
+	root.Handle("POST /v1/admin/manual-entitlements/{grantId}/revoke", a.Auth.Authenticate(http.HandlerFunc(a.adminRevokeManualEntitlementGrant)))
 	root.Handle("/v1/", a.Auth.Authenticate(a.idempotency(trusted)))
 	return traceMiddleware(root)
 }
 
 type registerAccountRequest struct {
-	Username  string `json:"username"`
-	Email     string `json:"email"`
-	Password  string `json:"password"`
-	Confirm   string `json:"password_confirm"`
-	FirstName string `json:"first_name"`
-	LastName  string `json:"last_name"`
+	Username string `json:"username"`
+	Nickname string `json:"nickname"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	Confirm  string `json:"password_confirm"`
+	// Legacy profile fields are accepted for one compatibility cycle but are
+	// intentionally ignored. New registrations never write first/last name.
+	LegacyFirstName string `json:"first_name"`
+	LegacyLastName  string `json:"last_name"`
+	InvitationCode  string `json:"invitation_code"`
+	VerificationID  string `json:"email_verification_id"`
+	EmailCode       string `json:"email_code"`
+}
+
+type registrationEmailCodeRequest struct {
+	Email string `json:"email"`
+}
+
+func (a *API) sendRegistrationEmailCode(w http.ResponseWriter, r *http.Request) {
+	if a.ServiceEmail == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "EMAIL_SERVICE_UNAVAILABLE", serviceemail.ErrUnavailable)
+		return
+	}
+	if a.Valkey != nil {
+		allowed, err := a.Valkey.Consume(r.Context(), accountRegistrationRateLimitScope(r), "email-code", time.Minute)
+		if err != nil {
+			writeError(w, r, http.StatusServiceUnavailable, "EMAIL_SERVICE_UNAVAILABLE", err)
+			return
+		}
+		if !allowed {
+			writeError(w, r, http.StatusTooManyRequests, "EMAIL_CODE_RATE_LIMITED", errors.New("email verification rate limit reached"))
+			return
+		}
+	}
+	var input registrationEmailCodeRequest
+	if err := decodeJSON(r, &input); err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err)
+		return
+	}
+	challenge, err := a.ServiceEmail.RequestRegistrationCode(r.Context(), input.Email)
+	if err != nil {
+		switch {
+		case errors.Is(err, serviceemail.ErrVerificationDisabled):
+			writeError(w, r, http.StatusConflict, "EMAIL_VERIFICATION_DISABLED", err)
+		case errors.Is(err, store.ErrEmailChallengeRateLimit):
+			writeError(w, r, http.StatusTooManyRequests, "EMAIL_CODE_RATE_LIMITED", err)
+		case errors.Is(err, serviceemail.ErrVerificationInvalid):
+			writeError(w, r, http.StatusBadRequest, "INVALID_EMAIL", err)
+		default:
+			writeError(w, r, http.StatusServiceUnavailable, "EMAIL_SERVICE_UNAVAILABLE", err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"verification_id": challenge.ID,
+		"expires_at":      challenge.ExpiresAt,
+		"message_key":     "EMAIL_CODE_SENT",
+	})
 }
 
 func (a *API) registerAccount(w http.ResponseWriter, r *http.Request) {
@@ -199,9 +351,13 @@ func (a *API) registerAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err)
 		return
 	}
+	if strings.TrimSpace(input.Nickname) == "" {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REGISTRATION", errors.New("nickname is required"))
+		return
+	}
 	registration := auth.DirectRegistrationInput{
-		Username: strings.TrimSpace(input.Username), Email: strings.TrimSpace(input.Email), Password: input.Password,
-		Confirm: input.Confirm, FirstName: strings.TrimSpace(input.FirstName), LastName: strings.TrimSpace(input.LastName),
+		Username: strings.TrimSpace(input.Username), Nickname: strings.TrimSpace(input.Nickname),
+		Email: strings.TrimSpace(input.Email), Password: input.Password, Confirm: input.Confirm,
 	}
 	if err := auth.ValidateDirectRegistrationInput(registration); err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REGISTRATION", err)
@@ -212,22 +368,125 @@ func (a *API) registerAccount(w http.ResponseWriter, r *http.Request) {
 	if a.Valkey != nil {
 		allowed, err := a.Valkey.Consume(r.Context(), accountRegistrationRateLimitScope(r), "attempt", time.Minute)
 		if err != nil {
+			a.recordCommerceSecurityEvent(r, "commerce.registration.rate_limit.denied", "registration", "FAILED", json.RawMessage(`{"reason":"LIMITER_UNAVAILABLE"}`))
 			writeError(w, r, http.StatusServiceUnavailable, "REGISTRATION_UNAVAILABLE", err)
 			return
 		}
 		if !allowed {
+			a.recordCommerceSecurityEvent(r, "commerce.registration.rate_limit.denied", "registration", "DENIED", json.RawMessage(`{"reason":"LIMIT_EXCEEDED"}`))
 			writeError(w, r, http.StatusTooManyRequests, "REGISTRATION_RATE_LIMITED", errors.New("registration rate limit reached"))
 			return
 		}
 	}
-	err := a.Registration.Register(r.Context(), registration)
+	verifiedEmailRegistration := false
+	var verificationID uuid.UUID
+	if a.ServiceEmail != nil {
+		required, policyErr := a.ServiceEmail.RegistrationVerificationPolicy(r.Context())
+		if policyErr != nil {
+			writeError(w, r, http.StatusServiceUnavailable, "EMAIL_SERVICE_UNAVAILABLE", policyErr)
+			return
+		}
+		if required {
+			verifiedEmailRegistration = true
+			var parseErr error
+			verificationID, parseErr = uuid.Parse(strings.TrimSpace(input.VerificationID))
+			if parseErr != nil || a.VerifiedRegistration == nil {
+				writeError(w, r, http.StatusServiceUnavailable, "EMAIL_SERVICE_UNAVAILABLE", serviceemail.ErrIdentityUnavailable)
+				return
+			}
+			if strings.TrimSpace(input.EmailCode) == "" {
+				writeError(w, r, http.StatusUnprocessableEntity, "EMAIL_CODE_INVALID", serviceemail.ErrVerificationInvalid)
+				return
+			}
+		}
+	}
+	attemptID, reservedInvitation, err := a.reserveRegistrationInvitation(r, input.InvitationCode, registration.Email)
+	if err != nil {
+		if writeRegistrationAdmissionError(w, r, err) {
+			return
+		}
+		writeError(w, r, http.StatusServiceUnavailable, "REGISTRATION_UNAVAILABLE", err)
+		return
+	}
+	if verifiedEmailRegistration {
+		if verifyErr := a.ServiceEmail.VerifyAndConsume(r.Context(), verificationID, registration.Email, input.EmailCode); verifyErr != nil {
+			if reservedInvitation && a.Store != nil {
+				if releaseErr := a.Store.ReleaseInvitation(r.Context(), attemptID); releaseErr != nil {
+					logAPIFailure(r.Context(), slog.LevelError, "email verification rejected but invitation release failed",
+						"registration_invitation_release_failed", releaseErr,
+						slog.String("registration_attempt_id", attemptID.String()))
+				}
+			}
+			writeError(w, r, http.StatusUnprocessableEntity, "EMAIL_CODE_INVALID", serviceemail.ErrVerificationInvalid)
+			return
+		}
+	}
+	if reservedInvitation {
+		if verifiedEmailRegistration {
+			if a.VerifiedRegistration == nil {
+				err = serviceemail.ErrIdentityUnavailable
+			} else {
+				err = a.VerifiedRegistration.RegisterVerifiedEmailAttempt(r.Context(), attemptID, registration)
+			}
+		} else {
+			err = a.Registration.RegisterAttempt(r.Context(), attemptID, registration)
+		}
+	} else {
+		if verifiedEmailRegistration {
+			if a.VerifiedRegistration == nil {
+				err = serviceemail.ErrIdentityUnavailable
+			} else {
+				err = a.VerifiedRegistration.RegisterVerifiedEmail(r.Context(), registration)
+			}
+		} else {
+			err = a.Registration.Register(r.Context(), registration)
+		}
+	}
 	// Never expose provider error text: it can contain identity-service
 	// internals or user-supplied field values. Clients classify by message_key.
 	if err != nil {
+		if errors.Is(err, auth.ErrRegistrationOutcomeUnknown) {
+			response := map[string]any{
+				"status":      "PENDING_RECONCILIATION",
+				"message_key": "PENDING_RECONCILIATION",
+			}
+			if reservedInvitation {
+				response["registration_attempt_id"] = attemptID
+				response["invitation_pending_identity_link"] = true
+				response["invitation_link_status"] = "PENDING_RECONCILIATION"
+			}
+			writeJSON(w, http.StatusAccepted, response)
+			return
+		}
+		if reservedInvitation && a.Store != nil {
+			if releaseErr := a.Store.ReleaseInvitation(r.Context(), attemptID); releaseErr != nil {
+				logAPIFailure(r.Context(), slog.LevelError, "registration rejected but invitation release failed",
+					"registration_invitation_release_failed", releaseErr,
+					slog.String("registration_attempt_id", attemptID.String()))
+			}
+		}
 		writeError(w, r, http.StatusUnprocessableEntity, "REGISTRATION_REJECTED", err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"registered": true})
+	response := map[string]any{"registered": true}
+	if reservedInvitation {
+		response["registration_attempt_id"] = attemptID
+		response["invitation_pending_identity_link"] = true
+		// The provider-accepted transition must happen only after Keycloak has
+		// actually created the identity.  Advancing it before the network call
+		// makes a rejected registration indistinguishable from a successful one
+		// and prevents safe inventory compensation.
+		if err := a.Store.MarkInvitationProviderAccepted(r.Context(), attemptID); err != nil {
+			logAPIFailure(r.Context(), slog.LevelError, "registration identity created but invitation saga update failed",
+				"registration_saga_transition_failed", err,
+				slog.String("registration_attempt_id", attemptID.String()))
+			response["invitation_link_status"] = "PENDING_RECONCILIATION"
+			writeJSON(w, http.StatusAccepted, response)
+			return
+		}
+		response["invitation_link_status"] = "PROVIDER_ACCEPTED"
+	}
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (a *API) getClientConfiguration(w http.ResponseWriter, r *http.Request) {
@@ -586,7 +845,9 @@ func (a *API) revokeDevice(w http.ResponseWriter, r *http.Request) {
 				// Revocation is already durable and Relay authorization fails closed.
 				// Keep the successful security response stable; the short Valkey TTL
 				// is the fallback if this best-effort reconciliation is unavailable.
-				slog.Warn("remove revoked device from shared lease", "trace_id", trace, "target_device_id", target, "session_id", sessionID, "error", err)
+				logAPIFailure(r.Context(), slog.LevelWarn, "remove revoked device from shared lease",
+					"lease_participant_cleanup_failed", err,
+					slog.String("target_device_id", target.String()), slog.String("session_id", sessionID.String()))
 			}
 		}
 	}
@@ -705,7 +966,7 @@ var pcCapabilityIDPattern = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,63}$`)
 func normalizePCAgentMetadata(
 	deviceType, platform, architecture, platformVersion string,
 	capabilities []string,
-	sessionHeartbeatCapable, remoteAgentUpdateCapable bool,
+	_, remoteAgentUpdateCapable bool,
 	supportedShells []string,
 	terminalCommands []store.TerminalCommandCapability,
 ) (string, string, string, []string, error) {
@@ -724,12 +985,11 @@ func normalizePCAgentMetadata(
 			platformVersion = "legacy"
 		}
 		if capabilities == nil {
+			// Heartbeat support does not imply that this Agent can produce a
+			// lossless terminal snapshot. That capability must be explicit.
 			capabilities = []string{
 				store.PCCapabilityRealtimeTerminalV1,
 				store.PCCapabilityFileOperationsV1,
-			}
-			if sessionHeartbeatCapable {
-				capabilities = append(capabilities, store.PCCapabilityTerminalSnapshotV1)
 			}
 			if len(supportedShells) > 0 || len(terminalCommands) > 0 {
 				capabilities = append(capabilities, store.PCCapabilityTerminalCommandsV1)
@@ -868,11 +1128,15 @@ func (a *API) putGrant(w http.ResponseWriter, r *http.Request) {
 		if sessions, listErr := a.Store.ListSessionsIncludingEnded(r.Context(), p.UserID, p.Device.ID, pcID); listErr == nil {
 			for _, session := range sessions {
 				if releaseErr := a.releaseLeaseParticipant(r.Context(), p.UserID, p.Device.ID, deviceID, session.ID, traceID(r.Context())); releaseErr != nil {
-					slog.Warn("remove downgraded device from shared lease", "trace_id", traceID(r.Context()), "target_device_id", deviceID, "session_id", session.ID, "error", releaseErr)
+					logAPIFailure(r.Context(), slog.LevelWarn, "remove downgraded device from shared lease",
+						"lease_participant_cleanup_failed", releaseErr,
+						slog.String("target_device_id", deviceID.String()), slog.String("session_id", session.ID.String()))
 				}
 			}
 		} else {
-			slog.Warn("list sessions for grant downgrade lease cleanup", "trace_id", traceID(r.Context()), "target_device_id", deviceID, "pc_id", pcID, "error", listErr)
+			logAPIFailure(r.Context(), slog.LevelWarn, "list sessions for grant downgrade lease cleanup",
+				"lease_session_list_failed", listErr,
+				slog.String("target_device_id", deviceID.String()), slog.String("pc_id", pcID.String()))
 		}
 	}
 	_ = a.Valkey.Client.Publish(r.Context(), "device-authorization-changed", deviceID.String()).Err()
@@ -901,7 +1165,9 @@ func (a *API) deleteGrant(w http.ResponseWriter, r *http.Request) {
 	// blocking another device while never releasing a newly acquired lease.
 	for _, sessionID := range result.LeaseSessionIDs {
 		if releaseErr := a.releaseLeaseParticipant(r.Context(), p.UserID, p.Device.ID, deviceID, sessionID, traceID(r.Context())); releaseErr != nil {
-			slog.Warn("remove grant-revoked device from shared lease", "trace_id", traceID(r.Context()), "target_device_id", deviceID, "session_id", sessionID, "error", releaseErr)
+			logAPIFailure(r.Context(), slog.LevelWarn, "remove grant-revoked device from shared lease",
+				"lease_participant_cleanup_failed", releaseErr,
+				slog.String("target_device_id", deviceID.String()), slog.String("session_id", sessionID.String()))
 		}
 	}
 	_ = a.Valkey.Client.Publish(r.Context(), "device-authorization-changed", deviceID.String()).Err()
@@ -1236,10 +1502,14 @@ func (a *API) renewLease(w http.ResponseWriter, r *http.Request) {
 		// fencing record. Do not leave a newly extended cache lease active when
 		// its durable renewal was rejected or could not be committed.
 		if accepted, released, releaseErr := a.Valkey.ReleaseForDevice(r.Context(), lease, p.Device.ID); releaseErr != nil {
-			slog.Warn("roll back lease renewal in Valkey", "error", releaseErr)
+			logAPIFailure(r.Context(), slog.LevelWarn, "roll back lease renewal in Valkey",
+				"lease_renewal_cache_rollback_failed", releaseErr,
+				slog.String("session_id", sessionID.String()), slog.String("lease_id", leaseID.String()))
 		} else if accepted && released {
 			if deleteErr := a.Store.DeleteLease(r.Context(), p.UserID, p.Device.ID, sessionID, leaseID, "", traceID(r.Context())); deleteErr != nil {
-				slog.Warn("roll back durable lease renewal", "error", deleteErr)
+				logAPIFailure(r.Context(), slog.LevelWarn, "roll back durable lease renewal",
+					"lease_renewal_store_rollback_failed", deleteErr,
+					slog.String("session_id", sessionID.String()), slog.String("lease_id", leaseID.String()))
 			}
 		}
 		writeStoreError(w, r, err)
@@ -1412,7 +1682,8 @@ func (a *API) createHistoryUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	upload, err := a.History.PresignPut(r.Context(), item.ObjectKey, item.SizeBytes, item.CiphertextSHA256, 10*time.Minute)
 	if err != nil {
-		slog.Error("presign history upload failed", "trace_id", traceID(r.Context()), "error", err)
+		logAPIFailure(r.Context(), slog.LevelError, "presign history upload failed",
+			"history_upload_presign_failed", err, slog.String("history_item_id", item.ID.String()))
 		writeError(w, r, http.StatusServiceUnavailable, "HISTORY_UNAVAILABLE", err)
 		return
 	}
@@ -2215,13 +2486,20 @@ type planDraftRequest struct {
 	AvailableFrom    *time.Time      `json:"available_from"`
 	AvailableUntil   *time.Time      `json:"available_until"`
 	FallbackPlanKey  string          `json:"fallback_plan_key"`
+	PriceMinor       int64           `json:"price_minor"`
+	Currency         string          `json:"currency"`
 }
 
 func (a *API) requireAdmin(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {
 	p := principal(r)
-	admin, err := a.Store.IsAdmin(r.Context(), p.UserID)
+	repository := a.securityStore()
+	if repository == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "COMMERCE_UNAVAILABLE", errors.New("commerce store is unavailable"))
+		return auth.Principal{}, false
+	}
+	admin, err := repository.IsAdmin(r.Context(), p.UserID)
 	if err != nil || !admin {
-		_ = a.Store.Audit(r.Context(), p.UserID, p.Device.ID, "billing.admin.denied", "catalog", uuid.Nil, "DENIED", traceID(r.Context()), "{}")
+		_ = repository.Audit(r.Context(), p.UserID, p.Device.ID, "billing.admin.denied", "catalog", uuid.Nil, "DENIED", traceID(r.Context()), "{}")
 		writeError(w, r, http.StatusForbidden, "ADMIN_REQUIRED", store.ErrDenied)
 		return auth.Principal{}, false
 	}
@@ -2274,11 +2552,15 @@ func (a *API) publishCatalog(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !a.requireRecentStepUp(w, r, p.UserID) {
+		return
+	}
 	version, err := a.Store.PublishCatalog(r.Context(), p.UserID, p.Device.ID, traceID(r.Context()))
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
+	a.auditCommerceOperationSuccess(r, p.UserID, "billing.catalog.publish.context", "catalog", uuid.Nil)
 	writeJSON(w, http.StatusOK, map[string]any{"catalog_version": version, "published": true})
 }
 
@@ -2307,7 +2589,8 @@ func (input planDraftRequest) storeInput() store.PlanDraftInput {
 	}
 	return store.PlanDraftInput{PlanKey: planKey, DisplayName: input.DisplayName, Description: input.Description, BillingPeriod: period,
 		MaxRemotePCs: input.MaxRemotePCs, MaxLiveSessions: input.MaxLiveSessions, FeatureFlags: flags, ChannelProducts: products,
-		SortOrder: input.SortOrder, VisiblePlatforms: platforms, AvailableFrom: input.AvailableFrom, AvailableUntil: input.AvailableUntil, FallbackPlanKey: input.FallbackPlanKey}
+		SortOrder: input.SortOrder, VisiblePlatforms: platforms, AvailableFrom: input.AvailableFrom, AvailableUntil: input.AvailableUntil, FallbackPlanKey: input.FallbackPlanKey,
+		PriceMinor: input.PriceMinor, Currency: input.Currency}
 }
 
 func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {
@@ -2392,7 +2675,7 @@ func writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, store.ErrEntitlement):
 		writeError(w, r, 409, "ENTITLEMENT_LIMIT_REACHED", err)
 	default:
-		slog.Error("API storage operation failed", "trace_id", traceID(r.Context()), "error", err)
+		logAPIFailure(r.Context(), slog.LevelError, "API storage operation failed", "storage_operation_failed", err)
 		writeError(w, r, 500, "INTERNAL", err)
 	}
 }
@@ -2428,7 +2711,7 @@ func traceID(ctx context.Context) string { id, _ := ctx.Value(traceKey{}).(strin
 
 func (a *API) idempotency(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete {
+		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch || r.Method == http.MethodDelete {
 			key := r.Header.Get("Idempotency-Key")
 			if len(key) < 8 || len(key) > 128 {
 				writeError(w, r, 400, "IDEMPOTENCY_KEY_REQUIRED", errors.New("missing idempotency key"))
@@ -2440,7 +2723,7 @@ func (a *API) idempotency(next http.Handler) http.Handler {
 				return
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
-			digest := sha256.Sum256(append([]byte(r.Method+"\n"+r.URL.RequestURI()+"\n"), body...))
+			digest := idempotencyRequestDigest(r, body)
 			p := principal(r)
 			result, err := a.Store.ClaimIdempotency(r.Context(), p.UserID, key, digest)
 			if err != nil {
@@ -2478,6 +2761,20 @@ func (a *API) idempotency(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func idempotencyRequestDigest(r *http.Request, body []byte) [32]byte {
+	material := make([]byte, 0, len(r.Method)+len(r.URL.RequestURI())+len(body)+560)
+	material = append(material, r.Method...)
+	material = append(material, '\n')
+	material = append(material, r.URL.RequestURI()...)
+	material = append(material, '\n')
+	material = append(material, body...)
+	if reason := strings.TrimSpace(r.Header.Get(commerceOperationReasonHeader)); reason != "" {
+		material = append(material, "\noperation-reason:"...)
+		material = append(material, reason...)
+	}
+	return sha256.Sum256(material)
 }
 
 func responseMayHaveBody(method string, status int) bool {

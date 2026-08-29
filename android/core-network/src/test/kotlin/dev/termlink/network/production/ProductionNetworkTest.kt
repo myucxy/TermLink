@@ -15,6 +15,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
@@ -37,6 +38,85 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProductionNetworkTest {
+    @Test
+    fun realtimeHelloAddsOnlyExplicitExperimentalCapabilities() {
+        val baseline = productionRealtimeCapabilities(emptySet())
+        val enabled = productionRealtimeCapabilities(setOf("terminal_snapshot_v1"))
+
+        assertTrue("terminal_snapshot_v1" !in baseline)
+        assertEquals(1, enabled.count { it == "terminal_snapshot_v1" })
+        assertEquals(enabled.sorted(), enabled)
+    }
+
+    @Test
+    fun realtimeAcceptsWelcomeThatEchoesExplicitSnapshotCapability(): Unit = runBlocking {
+        val server = MockWebServer()
+        val identity = DeviceIdentity.generate()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        assertTrue(text.contains("terminal_snapshot_v1"))
+                        check(
+                            webSocket.send(
+                                "{\"type\":\"welcome\",\"protocol_version\":1," +
+                                    "\"capabilities\":[\"terminal_snapshot_v1\"]}",
+                            ),
+                        )
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, reason)
+                    }
+                },
+            ),
+        )
+        server.start()
+        val client = ProductionRealtimeClient(
+            rootUrl = server.url("/").toString(),
+            tokenProvider = AccessTokenProvider { "oidc-token" },
+            deviceId = UUID.randomUUID(),
+            identity = identity,
+            role = "android",
+            additionalCapabilities = setOf("terminal_snapshot_v1"),
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            val connected = async(start = CoroutineStart.UNDISPATCHED) {
+                client.state.first { it == RealtimeState.Connected }
+            }
+            client.connect()
+            assertEquals(RealtimeState.Connected, withTimeout(5_000) { connected.await() })
+        } finally {
+            client.close()
+            identity.destroy()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun realtimeRejectsWelcomeMissingExplicitSnapshotCapability(): Unit = runBlocking {
+        listOf(
+            "{\"type\":\"welcome\",\"protocol_version\":1}",
+            "{\"type\":\"welcome\",\"protocol_version\":1," +
+                "\"capabilities\":[\"cumulative_ack\"]}",
+        ).forEach { welcome -> assertWelcomeRejectedByProtocol(welcome) }
+    }
+
+    @Test
+    fun realtimeRejectsMalformedWelcomeCapabilitiesByProtocolClose(): Unit = runBlocking {
+        listOf(
+            "{\"type\":\"welcome\",\"protocol_version\":1," +
+                "\"capabilities\":\"terminal_snapshot_v1\"}",
+            "{\"type\":\"welcome\",\"protocol_version\":1," +
+                "\"capabilities\":[1,\"terminal_snapshot_v1\"]}",
+            "{\"type\":\"welcome\",\"protocol_version\":1," +
+                "\"capabilities\":[\"terminal_snapshot_v1\",\"terminal_snapshot_v1\"]}",
+            "{\"type\":\"welcome\",\"protocol_version\":1," +
+                "\"capabilities\":[\"terminal_snapshot_v1\",\"INVALID CAPABILITY\"]}",
+        ).forEach { welcome -> assertWelcomeRejectedByProtocol(welcome) }
+    }
+
     @Test
     fun synchronousHandshakeFailureBeforeNewWebSocketReturnsIsNotDropped(): Unit = runBlocking {
         val server = MockWebServer()
@@ -265,6 +345,56 @@ class ProductionNetworkTest {
             .setNonce(ByteString.copyFrom(ByteArray(12) { sequence.toByte() }))
             .setCiphertext(ByteString.copyFrom(ByteArray(16) { sequence.toByte() }))
             .build()
+
+    private suspend fun assertWelcomeRejectedByProtocol(welcome: String): Unit = coroutineScope {
+        val server = MockWebServer()
+        val identity = DeviceIdentity.generate()
+        val protocolClose = CompletableDeferred<Pair<Int, String>>()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        check(webSocket.send(welcome))
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        protocolClose.complete(code to reason)
+                        webSocket.close(code, reason)
+                    }
+                },
+            ),
+        )
+        server.start()
+        val client = ProductionRealtimeClient(
+            rootUrl = server.url("/").toString(),
+            tokenProvider = AccessTokenProvider { "oidc-token" },
+            deviceId = UUID.randomUUID(),
+            identity = identity,
+            role = "android",
+            additionalCapabilities = setOf("terminal_snapshot_v1"),
+            allowCleartextForLocalTest = true,
+        )
+        val states = CopyOnWriteArrayList<RealtimeState>()
+        val collector = launch(start = CoroutineStart.UNDISPATCHED) {
+            client.state.collect(states::add)
+        }
+        try {
+            val failed = async(start = CoroutineStart.UNDISPATCHED) {
+                client.state.first { it is RealtimeState.Failed }
+            }
+            client.connect()
+            val (code, reason) = withTimeout(5_000) { protocolClose.await() }
+            withTimeout(5_000) { failed.await() }
+            assertEquals(1002, code)
+            assertEquals("invalid welcome control", reason)
+            assertTrue("invalid Welcome must not emit Connected: $states", RealtimeState.Connected !in states)
+        } finally {
+            collector.cancelAndJoin()
+            client.close()
+            identity.destroy()
+            server.shutdown()
+        }
+    }
 
     private class InlineExecutorService : AbstractExecutorService() {
         @Volatile private var stopped = false

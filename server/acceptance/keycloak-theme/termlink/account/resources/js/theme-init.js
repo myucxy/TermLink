@@ -3,12 +3,13 @@
 
   const storageKey = "termlink-theme";
   const transferParameter = "termlink_theme";
-  let theme = null;
+  const supportedPreferences = ["system", "light", "dark"];
+  let preference = null;
   try {
     const current = new URL(window.location.href);
     const transferred = current.searchParams.get(transferParameter);
-    if (transferred === "light" || transferred === "dark") {
-      theme = transferred;
+    if (supportedPreferences.includes(transferred)) {
+      preference = transferred;
       try {
         window.localStorage.setItem(storageKey, transferred);
       } catch (_) {
@@ -22,13 +23,15 @@
   }
   try {
     const stored = window.localStorage.getItem(storageKey);
-    if (!theme && (stored === "light" || stored === "dark")) theme = stored;
+    if (!preference && supportedPreferences.includes(stored)) preference = stored;
   } catch (_) {
     // The system preference remains available when storage is restricted.
   }
-  if (!theme) {
-    theme = window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-  }
+  if (!preference) preference = "system";
+  const theme = preference === "system"
+    ? (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+    : preference;
+  document.documentElement.dataset.themePreference = preference;
   document.documentElement.dataset.theme = theme;
   document.documentElement.classList.toggle("pf-v5-theme-dark", theme === "dark");
 })();

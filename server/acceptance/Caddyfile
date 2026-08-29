@@ -2,6 +2,10 @@
 	admin off
 	https_port 9443
 	auto_https disable_redirects
+	# The acceptance CA is exported explicitly for probes and browsers. Caddy
+	# runs in a minimal container without a host trust store, so attempting an
+	# in-container trust installation only produces a misleading startup error.
+	skip_install_trust
 	log default {
 		output stdout
 		format filter {

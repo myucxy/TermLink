@@ -3,7 +3,7 @@ ARG KEYCLOAK_BASE_IMAGE=quay.io/keycloak/keycloak:26.3.2@sha256:98fab020a3a490ab
 FROM ${KEYCLOAK_BASE_IMAGE} AS builder
 ENV KC_DB=dev-file \
     KC_HEALTH_ENABLED=true
-COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v17/
+COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v18/
 RUN /opt/keycloak/bin/kc.sh build
 
 FROM ${KEYCLOAK_BASE_IMAGE}

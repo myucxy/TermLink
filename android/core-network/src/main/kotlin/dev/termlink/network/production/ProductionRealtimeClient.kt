@@ -28,10 +28,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import okhttp3.OkHttpClient
@@ -66,6 +66,23 @@ data class ProductionRealtimeSocketDiagnostics(
     val bufferedEvents: Int,
     val bufferedWireBytes: Long,
 )
+
+private val REALTIME_CAPABILITY_IDENTIFIER = Regex("[a-z][a-z0-9._-]{0,63}")
+
+internal fun productionRealtimeCapabilities(additional: Set<String>): List<String> {
+    require(additional.all(REALTIME_CAPABILITY_IDENTIFIER::matches)) {
+        "Realtime capabilities must use stable protocol identifiers"
+    }
+    return (listOf(
+        "cumulative_ack",
+        "e2ee_x25519_chacha20poly1305",
+        "flow_control_v1",
+        "lease_v1",
+        "bounded_event_replay_v1",
+        "terminal_presentation_metadata_v1",
+        "terminal_typed_input_v1",
+    ) + additional).distinct().sorted()
+}
 
 class ProductionReceivedEnvelope internal constructor(
     val envelope: Envelope,
@@ -109,6 +126,7 @@ class ProductionRealtimeClient(
     private val deviceId: UUID,
     private val identity: DeviceIdentity,
     private val role: String,
+    additionalCapabilities: Set<String> = emptySet(),
     httpClient: OkHttpClient = defaultHttpClient,
     allowCleartextForLocalTest: Boolean = false,
 ) : ProductionRealtimeSocket {
@@ -137,6 +155,11 @@ class ProductionRealtimeClient(
         extraBufferCapacity = 4,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
+    // Snapshot the caller's explicit requirements. A mutable Set changing
+    // between reconnects must not silently alter the advertised or required
+    // protocol contract for this client instance.
+    private val requiredWelcomeCapabilities = additionalCapabilities.toSet()
+    private val advertisedCapabilities = productionRealtimeCapabilities(requiredWelcomeCapabilities)
     private val sendLock = Any()
     @Volatile private var socket: WebSocket? = null
     @Volatile private var connectedGeneration: Int = 0
@@ -268,15 +291,7 @@ class ProductionRealtimeClient(
                 put("role", role)
                 putJsonArray("protocol_versions") { add(kotlinx.serialization.json.JsonPrimitive(1)) }
                 putJsonArray("capabilities") {
-                    listOf(
-                        "cumulative_ack",
-                        "e2ee_x25519_chacha20poly1305",
-                        "flow_control_v1",
-                        "lease_v1",
-                        "bounded_event_replay_v1",
-                        "terminal_presentation_metadata_v1",
-                        "terminal_typed_input_v1",
-                    ).forEach { add(kotlinx.serialization.json.JsonPrimitive(it)) }
+                    advertisedCapabilities.forEach { add(kotlinx.serialization.json.JsonPrimitive(it)) }
                 }
             }
             if (!webSocket.send(Json.encodeToString(JsonObject.serializer(), hello))) {
@@ -287,19 +302,17 @@ class ProductionRealtimeClient(
         override fun onMessage(webSocket: WebSocket, text: String) {
             if (!isCurrent(webSocket)) return
             if (text.length > MAX_HELLO_BYTES) {
+                acceptingBinary = false
                 webSocket.close(1009, "welcome control too large")
                 return
             }
-            val accepted = runCatching {
-                val value = Json.parseToJsonElement(text).jsonObject
-                value["type"]?.jsonPrimitive?.content == "welcome" &&
-                    value["protocol_version"]?.jsonPrimitive?.content?.toIntOrNull() == 1
-            }.getOrDefault(false)
+            val accepted = validateWelcome(text)
             if (accepted && !welcomed) {
                 welcomed = true
                 connectedGeneration = listenerGeneration
                 mutableState.tryEmit(RealtimeState.Connected)
             } else {
+                acceptingBinary = false
                 webSocket.close(1002, "invalid welcome control")
             }
         }
@@ -397,6 +410,35 @@ class ProductionRealtimeClient(
                 else -> active === webSocket
             }
         }
+
+        private fun validateWelcome(text: String): Boolean = runCatching {
+            val value = Json.parseToJsonElement(text) as? JsonObject ?: return@runCatching false
+            val type = value["type"] as? JsonPrimitive ?: return@runCatching false
+            val protocolVersion = value["protocol_version"] as? JsonPrimitive
+                ?: return@runCatching false
+            if (!type.isString || type.content != "welcome" ||
+                protocolVersion.isString || protocolVersion.content != "1"
+            ) return@runCatching false
+
+            val capabilitiesElement = value["capabilities"]
+            if (capabilitiesElement == null) {
+                // Older Relays did not echo negotiated capabilities. Keep that
+                // compatibility only when this client did not explicitly opt
+                // into an additional capability.
+                return@runCatching requiredWelcomeCapabilities.isEmpty()
+            }
+            val capabilities = capabilitiesElement as? JsonArray ?: return@runCatching false
+            val negotiated = HashSet<String>(capabilities.size)
+            for (element in capabilities) {
+                val primitive = element as? JsonPrimitive ?: return@runCatching false
+                if (!primitive.isString) return@runCatching false
+                val capability = primitive.content
+                if (!REALTIME_CAPABILITY_IDENTIFIER.matches(capability) ||
+                    !negotiated.add(capability)
+                ) return@runCatching false
+            }
+            negotiated.containsAll(requiredWelcomeCapabilities)
+        }.getOrDefault(false)
     }
 
     private fun reserveIncoming(wireBytes: Int, pressureGeneration: Int): Boolean {

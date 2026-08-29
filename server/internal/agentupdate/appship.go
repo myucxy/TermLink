@@ -3,11 +3,14 @@ package agentupdate
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -21,7 +24,8 @@ const (
 	ApplicationSlug       = "termlink-win64"
 	maximumResponseBytes  = 256 * 1024
 	maximumArtifactBytes  = 2 * 1024 * 1024 * 1024
-	maximumRedirects      = 3
+	appShipRequestTimeout = 5 * time.Second
+	maximumHeaderBytes    = 32 * 1024
 )
 
 var (
@@ -52,87 +56,291 @@ type AppShipCatalog struct {
 	client  *http.Client
 }
 
+type appShipResolver interface {
+	LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
+}
+
+type appShipDialFunc func(context.Context, string, string) (net.Conn, error)
+
+// appShipNetworkOptions is an intentionally package-private test seam. The
+// production constructor always uses the system trust store, resolver, and a
+// bounded net.Dialer; callers cannot weaken the catalog's network policy.
+type appShipNetworkOptions struct {
+	resolver          appShipResolver
+	dial              appShipDialFunc
+	rootCAs           *x509.CertPool
+	allowedPrivateIPs []net.IP
+}
+
 func NewAppShipCatalog(baseURL string, client *http.Client) (*AppShipCatalog, error) {
+	return newAppShipCatalog(baseURL, client, appShipNetworkOptions{})
+}
+
+// NewAppShipCatalogWithAllowedPrivateIPs supports split-horizon DNS without
+// weakening the default SSRF boundary. The allowlist accepts only exact
+// RFC1918/ULA addresses; CIDRs, loopback, link-local, multicast, public, and
+// otherwise special-use addresses fail closed. TLS still authenticates the
+// configured AppShip hostname after the validated DNS answer is pinned.
+func NewAppShipCatalogWithAllowedPrivateIPs(baseURL string, client *http.Client, value string) (*AppShipCatalog, error) {
+	allowed, err := parseAllowedPrivateIPs(value)
+	if err != nil {
+		return nil, fmt.Errorf("%w: AppShip private IP allowlist is invalid", ErrUnavailable)
+	}
+	return newAppShipCatalog(baseURL, client, appShipNetworkOptions{allowedPrivateIPs: allowed})
+}
+
+func newAppShipCatalog(baseURL string, client *http.Client, network appShipNetworkOptions) (*AppShipCatalog, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = DefaultAppShipBaseURL
 	}
-	root, err := url.Parse(strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/")
-	if err != nil || !strings.EqualFold(root.Scheme, "https") || root.Host == "" || root.User != nil {
-		return nil, fmt.Errorf("%w: AppShip base URL must be an HTTPS origin", ErrUnavailable)
+	trimmedBaseURL := strings.TrimSpace(baseURL)
+	root, err := url.Parse(trimmedBaseURL)
+	if err != nil || !strings.EqualFold(root.Scheme, "https") || root.Host == "" || root.Hostname() == "" ||
+		root.User != nil || root.Opaque != "" || (root.Path != "" && root.Path != "/") || root.RawPath != "" ||
+		root.RawQuery != "" || root.ForceQuery || root.Fragment != "" || strings.Contains(trimmedBaseURL, "#") ||
+		strings.HasSuffix(root.Host, ":") {
+		return nil, fmt.Errorf("%w: AppShip base URL must be a credential-free HTTPS origin", ErrUnavailable)
 	}
-	if client == nil {
-		client = &http.Client{Timeout: 20 * time.Second}
+	if port := root.Port(); port != "" {
+		value, parseErr := strconv.Atoi(port)
+		if parseErr != nil || value < 1 || value > 65535 {
+			return nil, fmt.Errorf("%w: AppShip base URL must be a credential-free HTTPS origin", ErrUnavailable)
+		}
 	}
-	clone := *client
-	clone.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &AppShipCatalog{baseURL: root, client: &clone}, nil
+	if !validAppShipHost(root.Hostname()) {
+		return nil, fmt.Errorf("%w: AppShip host is not public", ErrUnavailable)
+	}
+	if network.resolver == nil {
+		network.resolver = net.DefaultResolver
+	}
+	if network.dial == nil {
+		dialer := &net.Dialer{Timeout: appShipRequestTimeout, KeepAlive: 30 * time.Second}
+		network.dial = dialer.DialContext
+	}
+	timeout := appShipRequestTimeout
+	if client != nil && client.Timeout > 0 && client.Timeout < timeout {
+		timeout = client.Timeout
+	}
+	transport := &http.Transport{
+		Proxy:                  nil,
+		DialContext:            appShipDialContext(network.resolver, network.dial, network.allowedPrivateIPs...),
+		ForceAttemptHTTP2:      true,
+		DisableCompression:     true,
+		MaxIdleConns:           4,
+		MaxIdleConnsPerHost:    2,
+		MaxConnsPerHost:        2,
+		IdleConnTimeout:        30 * time.Second,
+		TLSHandshakeTimeout:    timeout,
+		ResponseHeaderTimeout:  timeout,
+		ExpectContinueTimeout:  time.Second,
+		MaxResponseHeaderBytes: maximumHeaderBytes,
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    network.rootCAs,
+			ServerName: strings.TrimSuffix(root.Hostname(), "."),
+		},
+	}
+	secureClient := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	return &AppShipCatalog{baseURL: root, client: secureClient}, nil
 }
 
 func (c *AppShipCatalog) LatestWindowsStable(ctx context.Context, currentBuild int64) (Offer, error) {
-	if c == nil || c.baseURL == nil || c.client == nil || currentBuild < 0 {
+	if c == nil || c.baseURL == nil || c.client == nil || ctx == nil || currentBuild < 0 {
 		return Offer{}, ErrUnavailable
 	}
-	relative := "api/v1/apps/" + ApplicationSlug +
-		"/updates?platform=windows&arch=x64&channel=stable&build=" + strconv.FormatInt(currentBuild, 10)
-	endpoint := c.baseURL.ResolveReference(&url.URL{Path: relative[:strings.IndexByte(relative, '?')], RawQuery: relative[strings.IndexByte(relative, '?')+1:]})
-	response, err := c.send(ctx, endpoint)
+	endpoint := *c.baseURL
+	endpoint.Path = "/api/v1/apps/" + ApplicationSlug + "/updates"
+	query := url.Values{}
+	query.Set("platform", "windows")
+	query.Set("arch", "x64")
+	query.Set("channel", "stable")
+	query.Set("build", strconv.FormatInt(currentBuild, 10))
+	endpoint.RawQuery = query.Encode()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
-		return Offer{}, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return Offer{}, fmt.Errorf("%w: request could not be created", ErrUnavailable)
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Cache-Control", "no-cache")
+	request.Header.Set("User-Agent", "TermLink-Server-Agent-Updates/1")
+	response, err := c.client.Do(request)
+	if err != nil {
+		return Offer{}, fmt.Errorf("%w: request failed", ErrUnavailable)
 	}
 	defer response.Body.Close()
+	if response.Request == nil || response.Request.URL == nil || !sameAppShipOrigin(c.baseURL, response.Request.URL) {
+		return Offer{}, fmt.Errorf("%w: response origin is invalid", ErrUnavailable)
+	}
 	if response.StatusCode == http.StatusNotModified {
 		return Offer{}, nil
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return Offer{}, fmt.Errorf("%w: AppShip returned HTTP %d", ErrUnavailable, response.StatusCode)
+	if response.StatusCode != http.StatusOK {
+		return Offer{}, fmt.Errorf("%w: unexpected HTTP status", ErrUnavailable)
+	}
+	if response.ContentLength > maximumResponseBytes {
+		return Offer{}, fmt.Errorf("%w: response size is invalid", ErrUnavailable)
 	}
 	reader := io.LimitReader(response.Body, maximumResponseBytes+1)
 	body, err := io.ReadAll(reader)
 	if err != nil {
-		return Offer{}, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return Offer{}, fmt.Errorf("%w: response could not be read", ErrUnavailable)
 	}
 	if len(body) == 0 || len(body) > maximumResponseBytes {
 		return Offer{}, fmt.Errorf("%w: response size is invalid", ErrUnavailable)
 	}
-	return ParseOffer(body, currentBuild)
+	return parseOffer(body, currentBuild, c.baseURL)
 }
 
-func (c *AppShipCatalog) send(ctx context.Context, initial *url.URL) (*http.Response, error) {
-	current := initial
-	for redirects := 0; ; redirects++ {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, current.String(), nil)
-		if err != nil {
-			return nil, err
+func appShipDialContext(resolver appShipResolver, dial appShipDialFunc, allowedPrivateIPs ...net.IP) appShipDialFunc {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		if network != "tcp" && network != "tcp4" && network != "tcp6" {
+			return nil, ErrUnavailable
 		}
-		request.Header.Set("Accept", "application/json")
-		response, err := c.client.Do(request)
-		if err != nil {
-			return nil, err
+		host, port, err := net.SplitHostPort(address)
+		if err != nil || host == "" || port == "" || resolver == nil || dial == nil {
+			return nil, ErrUnavailable
 		}
-		if response.StatusCode != http.StatusMovedPermanently && response.StatusCode != http.StatusFound &&
-			response.StatusCode != http.StatusSeeOther && response.StatusCode != http.StatusTemporaryRedirect &&
-			response.StatusCode != http.StatusPermanentRedirect {
-			return response, nil
+		var addresses []net.IPAddr
+		if literal := net.ParseIP(host); literal != nil {
+			addresses = []net.IPAddr{{IP: literal}}
+		} else {
+			addresses, err = resolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, ErrUnavailable
+			}
 		}
-		if redirects >= maximumRedirects {
-			response.Body.Close()
-			return nil, errors.New("redirect limit exceeded")
+		if len(addresses) == 0 || len(addresses) > 16 {
+			return nil, ErrUnavailable
 		}
-		location, err := response.Location()
-		response.Body.Close()
-		if err != nil || !strings.EqualFold(location.Scheme, "https") || location.Host == "" || location.User != nil {
-			return nil, errors.New("redirect target is not HTTPS")
+		for _, candidate := range addresses {
+			if candidate.Zone != "" || !permittedAppShipIP(candidate.IP, allowedPrivateIPs) {
+				return nil, ErrUnavailable
+			}
 		}
-		current = location
+		for _, candidate := range addresses {
+			connection, dialErr := dial(ctx, network, net.JoinHostPort(candidate.IP.String(), port))
+			if dialErr == nil {
+				return connection, nil
+			}
+		}
+		return nil, ErrUnavailable
 	}
 }
 
+func parseAllowedPrivateIPs(value string) ([]net.IP, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	parts := strings.Split(value, ",")
+	if len(parts) > 8 {
+		return nil, ErrUnavailable
+	}
+	result := make([]net.IP, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		text := strings.TrimSpace(part)
+		ip := net.ParseIP(text)
+		if text == "" || ip == nil || !allowlistEligiblePrivateIP(ip) {
+			return nil, ErrUnavailable
+		}
+		if ipv4 := ip.To4(); ipv4 != nil {
+			ip = ipv4
+		} else {
+			ip = ip.To16()
+		}
+		key := ip.String()
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, ip)
+	}
+	return result, nil
+}
+
+func allowlistEligiblePrivateIP(ip net.IP) bool {
+	return ip != nil && ip.IsPrivate() && ip.IsGlobalUnicast() && !ip.IsUnspecified() &&
+		!ip.IsLoopback() && !ip.IsMulticast() && !ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast()
+}
+
+func permittedAppShipIP(ip net.IP, allowedPrivateIPs []net.IP) bool {
+	if safeAppShipIP(ip) {
+		return true
+	}
+	if !allowlistEligiblePrivateIP(ip) {
+		return false
+	}
+	for _, allowed := range allowedPrivateIPs {
+		if allowed != nil && allowed.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func validAppShipHost(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "" || strings.Contains(host, "%") || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return false
+	}
+	if literal := net.ParseIP(host); literal != nil {
+		return safeAppShipIP(literal)
+	}
+	return true
+}
+
+func safeAppShipIP(ip net.IP) bool {
+	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() || ip.IsMulticast() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || !ip.IsGlobalUnicast() {
+		return false
+	}
+	for _, network := range appShipDeniedNetworks {
+		if network.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+var appShipDeniedNetworks = func() []*net.IPNet {
+	values := []string{
+		"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24",
+		"198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4",
+		"64:ff9b::/96", "64:ff9b:1::/48", "100::/64", "2001::/23", "2001:db8::/32",
+		"2002::/16", "3fff::/20", "fec0::/10",
+	}
+	result := make([]*net.IPNet, 0, len(values))
+	for _, value := range values {
+		_, network, err := net.ParseCIDR(value)
+		if err != nil {
+			panic(err)
+		}
+		result = append(result, network)
+	}
+	return result
+}()
+
 func ParseOffer(body []byte, currentBuild int64) (Offer, error) {
+	return parseOffer(body, currentBuild, nil)
+}
+
+func parseOffer(body []byte, currentBuild int64, trustedOrigin *url.URL) (Offer, error) {
 	var root map[string]any
 	decoder := json.NewDecoder(strings.NewReader(string(body)))
 	decoder.UseNumber()
 	if err := decoder.Decode(&root); err != nil || root == nil {
 		return Offer{}, fmt.Errorf("%w: response is not valid JSON", ErrInvalidArtifact)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return Offer{}, fmt.Errorf("%w: response contains trailing data", ErrInvalidArtifact)
 	}
 	release := objectAt(root, "release", "update", "latest")
 	if release == nil {
@@ -165,7 +373,9 @@ func ParseOffer(body []byte, currentBuild int64) (Offer, error) {
 	}
 	downloadURL := stringAt(artifact, "downloadUrl", "download_url", "url")
 	download, err := url.Parse(downloadURL)
-	if err != nil || !strings.EqualFold(download.Scheme, "https") || download.Host == "" || download.User != nil {
+	if err != nil || !strings.EqualFold(download.Scheme, "https") || download.Host == "" || download.Hostname() == "" ||
+		download.User != nil || download.Opaque != "" || download.Fragment != "" ||
+		(trustedOrigin != nil && !sameAppShipOrigin(trustedOrigin, download)) {
 		return Offer{}, fmt.Errorf("%w: artifact URL is not HTTPS", ErrInvalidArtifact)
 	}
 	size, hasSize := int64At(artifact, "sizeBytes", "size_bytes", "size")
@@ -209,6 +419,12 @@ func ParseOffer(body []byte, currentBuild int64) (Offer, error) {
 		DownloadURL:  downloadURL, ArtifactFilename: filename, SizeBytes: size,
 		SHA256: digest, SHA256Hex: hashText, SignerFingerprint: signerPointer,
 	}, nil
+}
+
+func sameAppShipOrigin(left, right *url.URL) bool {
+	return left != nil && right != nil && left.User == nil && right.User == nil &&
+		strings.EqualFold(left.Scheme, "https") && strings.EqualFold(right.Scheme, "https") &&
+		strings.EqualFold(left.Host, right.Host)
 }
 
 func objectAt(parent map[string]any, names ...string) map[string]any {

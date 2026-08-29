@@ -8,22 +8,26 @@ import (
 )
 
 type acceptanceRealmClient struct {
-	ClientID                  string            `json:"clientId"`
-	Name                      string            `json:"name"`
-	RootURL                   string            `json:"rootUrl"`
-	BaseURL                   string            `json:"baseUrl"`
-	PublicClient              bool              `json:"publicClient"`
-	StandardFlowEnabled       bool              `json:"standardFlowEnabled"`
-	DirectAccessGrantsEnabled bool              `json:"directAccessGrantsEnabled"`
-	ImplicitFlowEnabled       bool              `json:"implicitFlowEnabled"`
-	ServiceAccountsEnabled    bool              `json:"serviceAccountsEnabled"`
-	FullScopeAllowed          bool              `json:"fullScopeAllowed"`
-	Secret                    string            `json:"secret"`
-	RedirectURIs              []string          `json:"redirectUris"`
-	Attributes                map[string]string `json:"attributes"`
-	ProtocolMappers           []struct {
-		Name   string            `json:"name"`
-		Config map[string]string `json:"config"`
+	ClientID                           string            `json:"clientId"`
+	Name                               string            `json:"name"`
+	RootURL                            string            `json:"rootUrl"`
+	BaseURL                            string            `json:"baseUrl"`
+	PublicClient                       bool              `json:"publicClient"`
+	StandardFlowEnabled                bool              `json:"standardFlowEnabled"`
+	DirectAccessGrantsEnabled          bool              `json:"directAccessGrantsEnabled"`
+	ImplicitFlowEnabled                bool              `json:"implicitFlowEnabled"`
+	ServiceAccountsEnabled             bool              `json:"serviceAccountsEnabled"`
+	FullScopeAllowed                   bool              `json:"fullScopeAllowed"`
+	Secret                             string            `json:"secret"`
+	RedirectURIs                       []string          `json:"redirectUris"`
+	Attributes                         map[string]string `json:"attributes"`
+	DefaultClientScopes                []string          `json:"defaultClientScopes"`
+	OptionalClientScopes               []string          `json:"optionalClientScopes"`
+	AuthenticationFlowBindingOverrides map[string]string `json:"authenticationFlowBindingOverrides"`
+	ProtocolMappers                    []struct {
+		Name           string            `json:"name"`
+		ProtocolMapper string            `json:"protocolMapper"`
+		Config         map[string]string `json:"config"`
 	} `json:"protocolMappers"`
 }
 
@@ -37,19 +41,30 @@ func TestAcceptanceRealmUsesGatedRegistrationAndNativeClientLogin(t *testing.T) 
 		AccountTheme         string                  `json:"accountTheme"`
 		RegistrationAllowed  bool                    `json:"registrationAllowed"`
 		VerifyEmail          bool                    `json:"verifyEmail"`
+		ResetPasswordAllowed bool                    `json:"resetPasswordAllowed"`
 		BruteForceProtected  bool                    `json:"bruteForceProtected"`
 		AccessTokenLifespan  int                     `json:"accessTokenLifespan"`
 		RevokeRefreshToken   bool                    `json:"revokeRefreshToken"`
 		RefreshTokenMaxReuse int                     `json:"refreshTokenMaxReuse"`
 		Clients              []acceptanceRealmClient `json:"clients"`
+		AuthenticationFlows  []struct {
+			ID                       string `json:"id"`
+			Alias                    string `json:"alias"`
+			TopLevel                 bool   `json:"topLevel"`
+			AuthenticationExecutions []struct {
+				Authenticator string `json:"authenticator"`
+				FlowAlias     string `json:"flowAlias"`
+				Requirement   string `json:"requirement"`
+			} `json:"authenticationExecutions"`
+		} `json:"authenticationFlows"`
 	}
 	if err := json.Unmarshal(data, &realm); err != nil {
 		t.Fatal(err)
 	}
 	// Imports fail closed. The idempotent initializer opens registration only
 	// after it has created or verified the managed bootstrap administrator.
-	if realm.LoginTheme != "termlink-01b-v17" || realm.AccountTheme != "termlink-01b-v17" ||
-		realm.RegistrationAllowed || realm.VerifyEmail || !realm.BruteForceProtected ||
+	if realm.LoginTheme != "termlink-01b-v18" || realm.AccountTheme != "termlink-01b-v18" ||
+		realm.RegistrationAllowed || realm.VerifyEmail || realm.ResetPasswordAllowed || !realm.BruteForceProtected ||
 		realm.AccessTokenLifespan <= 0 || realm.AccessTokenLifespan > 300 ||
 		!realm.RevokeRefreshToken || realm.RefreshTokenMaxReuse != 0 {
 		t.Fatalf("realm native-login policy is incomplete")
@@ -70,6 +85,9 @@ func TestAcceptanceRealmUsesGatedRegistrationAndNativeClientLogin(t *testing.T) 
 	}
 	if android.Attributes["pkce.code.challenge.method"] != "S256" {
 		t.Fatal("termlink-android must require S256 PKCE")
+	}
+	if containsString(android.DefaultClientScopes, RegistrationAttemptScope) {
+		t.Fatal("registration correlation scope must never be a default Android client scope")
 	}
 	foundAudience := false
 	for _, mapper := range android.ProtocolMappers {
@@ -113,6 +131,294 @@ func TestAcceptanceRealmUsesGatedRegistrationAndNativeClientLogin(t *testing.T) 
 		!containsString(web.RedirectURIs, "https://termlink.kget.cc:8910/account") {
 		t.Fatal("termlink-web account-center return contract is incomplete")
 	}
+	foundWebAMR := false
+	for _, mapper := range web.ProtocolMappers {
+		if mapper.Name == "termlink-web-amr" {
+			foundWebAMR = mapper.ProtocolMapper == "oidc-hardcoded-claim-mapper" &&
+				mapper.Config["claim.name"] == "amr" && mapper.Config["claim.value"] == `["pwd"]` &&
+				mapper.Config["jsonType.label"] == "JSON" &&
+				mapper.Config["id.token.claim"] == "true" && mapper.Config["access.token.claim"] == "true"
+		}
+	}
+	if !foundWebAMR {
+		t.Fatal("termlink-web must emit the password method enforced by fresh Web authorization")
+	}
+	var nativeFlowID string
+	for _, flow := range realm.AuthenticationFlows {
+		if flow.Alias != "termlink-native-browser" {
+			continue
+		}
+		nativeFlowID = flow.ID
+		if !flow.TopLevel || nativeFlowID == "" {
+			t.Fatal("native browser flow must be a stable top-level flow")
+		}
+		for _, execution := range flow.AuthenticationExecutions {
+			if execution.Authenticator == "auth-otp-form" || strings.Contains(strings.ToLower(execution.FlowAlias), "otp") {
+				t.Fatal("native browser flow must not contain Web OTP")
+			}
+		}
+	}
+	if nativeFlowID == "" || android.AuthenticationFlowBindingOverrides["browser"] != nativeFlowID ||
+		windows.AuthenticationFlowBindingOverrides["browser"] != nativeFlowID ||
+		web.AuthenticationFlowBindingOverrides["browser"] != "" {
+		t.Fatal("Web-only MFA flow isolation is incomplete")
+	}
+}
+
+func TestAcceptanceRealmUsesDedicatedMFAOnlyStepUpClient(t *testing.T) {
+	data, err := os.ReadFile("../../acceptance/keycloak-realm.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var realm struct {
+		Clients             []acceptanceRealmClient `json:"clients"`
+		AuthenticationFlows []struct {
+			ID                       string `json:"id"`
+			Alias                    string `json:"alias"`
+			TopLevel                 bool   `json:"topLevel"`
+			AuthenticationExecutions []struct {
+				Authenticator string `json:"authenticator"`
+				Requirement   string `json:"requirement"`
+			} `json:"authenticationExecutions"`
+		} `json:"authenticationFlows"`
+	}
+	if err := json.Unmarshal(data, &realm); err != nil {
+		t.Fatal(err)
+	}
+
+	var flowID string
+	for _, flow := range realm.AuthenticationFlows {
+		if flow.Alias != "termlink-web-mfa-step-up" {
+			continue
+		}
+		if !flow.TopLevel || flow.ID == "" || len(flow.AuthenticationExecutions) != 2 {
+			t.Fatal("MFA Step-up flow must be a stable top-level two-stage flow")
+		}
+		requirements := make(map[string]string, len(flow.AuthenticationExecutions))
+		for _, execution := range flow.AuthenticationExecutions {
+			requirements[execution.Authenticator] = execution.Requirement
+		}
+		if requirements["auth-cookie"] != "REQUIRED" || requirements["auth-otp-form"] != "REQUIRED" {
+			t.Fatalf("MFA Step-up flow must require existing SSO identity and OTP: %v", requirements)
+		}
+		flowID = flow.ID
+	}
+	if flowID == "" {
+		t.Fatal("MFA Step-up flow is missing")
+	}
+
+	var client *acceptanceRealmClient
+	for index := range realm.Clients {
+		if realm.Clients[index].ClientID == "termlink-web-step-up" {
+			client = &realm.Clients[index]
+			break
+		}
+	}
+	if client == nil || !client.PublicClient || !client.StandardFlowEnabled || client.DirectAccessGrantsEnabled ||
+		client.ImplicitFlowEnabled || client.ServiceAccountsEnabled || client.FullScopeAllowed || client.Secret != "" {
+		t.Fatal("MFA Step-up client flow policy is unsafe")
+	}
+	if client.Attributes["pkce.code.challenge.method"] != "S256" ||
+		client.AuthenticationFlowBindingOverrides["browser"] != flowID ||
+		!containsString(client.RedirectURIs, "https://termlink.kget.cc:8910/auth/callback") {
+		t.Fatal("MFA Step-up client PKCE, callback, or flow binding is incomplete")
+	}
+	foundAMR := false
+	for _, mapper := range client.ProtocolMappers {
+		if mapper.Name == "termlink-web-step-up-amr" {
+			foundAMR = mapper.ProtocolMapper == "oidc-hardcoded-claim-mapper" &&
+				mapper.Config["claim.name"] == "amr" && mapper.Config["claim.value"] == `["otp"]` &&
+				mapper.Config["jsonType.label"] == "JSON" &&
+				mapper.Config["id.token.claim"] == "true" && mapper.Config["access.token.claim"] == "true"
+		}
+	}
+	if !foundAMR {
+		t.Fatal("MFA Step-up client must emit AMR for server-side OTP verification")
+	}
+}
+
+func TestAcceptanceBootstrapReconcilesDedicatedMFAOnlyStepUpClient(t *testing.T) {
+	data, err := os.ReadFile("../../compose/acceptance.compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compose := string(data)
+	for _, contract := range []string{
+		"alias=termlink-web-mfa-step-up",
+		"provider=auth-cookie",
+		"provider=auth-otp-form",
+		`if test "$$name" = Cookie -a "$$level" = 0; then`,
+		`if test "$$name" = 'OTP Form' -a "$$level" = 0; then`,
+		`-s id="$$step_up_cookie_execution" -s requirement=REQUIRED`,
+		`-s id="$$step_up_otp_execution" -s requirement=REQUIRED`,
+		"clientId=termlink-web-step-up",
+		"-s directAccessGrantsEnabled=false",
+		"-s implicitFlowEnabled=false",
+		"-s serviceAccountsEnabled=false",
+		`-s 'attributes={"pkce.code.challenge.method":"S256"}'`,
+		`authenticationFlowBindingOverrides={\"browser\":\"$$step_up_flow_id\"}`,
+		`"name": "termlink-web-step-up-amr"`,
+		`"protocolMapper": "oidc-hardcoded-claim-mapper"`,
+		`"claim.name": "amr"`,
+		`"claim.value": "[\"otp\"]"`,
+		`"jsonType.label": "JSON"`,
+		`clients/$$step_up_client_id/protocol-mappers/models/$$step_up_amr_mapper_id`,
+		`TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID: termlink-web-step-up`,
+	} {
+		if !strings.Contains(compose, contract) {
+			t.Fatalf("acceptance MFA Step-up reconciliation omitted %q", contract)
+		}
+	}
+}
+
+func TestAcceptanceIdentityRecoveryUsesBoundedServiceAccountSecret(t *testing.T) {
+	data, err := os.ReadFile("../../compose/acceptance.compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compose := string(data)
+	clientStart := strings.Index(compose, "recovery_client_id=$$(/opt/keycloak/bin/kcadm.sh get clients")
+	secretWrite := strings.Index(compose, `printf '%s' "$$recovery_secret" > /target/server-secrets/keycloak_admin_client_secret`)
+	registrationOpen := strings.LastIndex(compose, "-s registrationAllowed=true")
+	if clientStart < 0 || secretWrite < 0 || registrationOpen < 0 || !(clientStart < secretWrite && secretWrite < registrationOpen) {
+		t.Fatal("acceptance identity recovery client must be provisioned before public registration opens")
+	}
+	for _, contract := range []string{
+		"clientId=termlink-registration-recovery",
+		"-s publicClient=false",
+		"-s standardFlowEnabled=false",
+		"-s directAccessGrantsEnabled=false",
+		"-s serviceAccountsEnabled=true",
+		"-s fullScopeAllowed=false",
+		"for recovery_role in query-users manage-users manage-realm; do",
+		`query-users|manage-users|manage-realm|'') ;;`,
+		"remove-roles",
+		`clients/$$recovery_client_id/scope-mappings/clients/$$realm_management_id`,
+		`termlink-recovery-scope-role.json`,
+		`TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE: /run/secrets/keycloak_admin_client_secret`,
+		"test -s /target/keycloak_admin_client_secret",
+		"chmod 0400 /target/keycloak_admin_client_secret",
+	} {
+		if !strings.Contains(compose, contract) {
+			t.Fatalf("acceptance identity recovery contract omitted %q", contract)
+		}
+	}
+	if strings.Contains(compose, "TERMLINK_KEYCLOAK_ADMIN_PASSWORD") || strings.Contains(compose, "TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET:") {
+		t.Fatal("server identity recovery must not receive an administrator password or inline client secret")
+	}
+	serverSecretInit := strings.Index(compose, "\n  server-secrets-init:")
+	migrateStart := strings.Index(compose, "\n  migrate:")
+	if serverSecretInit < 0 || migrateStart <= serverSecretInit ||
+		!strings.Contains(compose[serverSecretInit:migrateStart], "keycloak-init:\n        condition: service_completed_successfully") {
+		t.Fatal("server secret finalization must wait for the Keycloak service-account secret")
+	}
+	serverSecretFinalization := compose[serverSecretInit:migrateStart]
+	secretTemporaryChown := strings.Index(serverSecretFinalization, "chown 0:0 /target/keycloak_admin_client_secret")
+	secretChmod := strings.Index(serverSecretFinalization, "chmod 0400 /target/keycloak_admin_client_secret")
+	secretRuntimeChown := strings.Index(serverSecretFinalization, "chown 65532:65532 /target/keycloak_admin_client_secret")
+	if secretTemporaryChown < 0 || secretChmod < 0 || secretRuntimeChown < 0 ||
+		!(secretTemporaryChown < secretChmod && secretChmod < secretRuntimeChown) {
+		t.Fatal("service-account secret must be temporarily owned, permission-tightened, and assigned to the runtime user in order")
+	}
+	if strings.Contains(compose, "-s resetPasswordAllowed=true") {
+		t.Fatal("password reset must remain disabled until a tested service-email configuration enables it")
+	}
+}
+
+func TestAcceptanceExistingWebClientReceivesPasswordAMRMapperIdempotently(t *testing.T) {
+	data, err := os.ReadFile("../../compose/acceptance.compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compose := string(data)
+	for _, contract := range []string{
+		`"name": "termlink-web-amr"`,
+		`"protocolMapper": "oidc-hardcoded-claim-mapper"`,
+		`"claim.value": "[\"pwd\"]"`,
+		`if test "$$name" = termlink-web-amr; then`,
+		`clients/$$web_client_id/protocol-mappers/models/$$web_amr_mapper_id`,
+		`/opt/keycloak/bin/kcadm.sh delete`,
+	} {
+		if !strings.Contains(compose, contract) {
+			t.Fatalf("existing termlink-web client AMR reconciliation omitted %q", contract)
+		}
+	}
+}
+
+func TestAcceptanceRegistrationRecoveryUserProfileIsControlled(t *testing.T) {
+	data, err := os.ReadFile("../../acceptance/keycloak-user-profile.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile struct {
+		Attributes []struct {
+			Name        string              `json:"name"`
+			Validations map[string]any      `json:"validations"`
+			Permissions map[string][]string `json:"permissions"`
+			Selector    struct {
+				Scopes []string `json:"scopes"`
+			} `json:"selector"`
+			Multivalued bool `json:"multivalued"`
+		} `json:"attributes"`
+	}
+	if err := json.Unmarshal(data, &profile); err != nil {
+		t.Fatal(err)
+	}
+	wanted := map[string]struct{}{
+		RegistrationAttemptIDAttribute: {}, RegistrationAttemptProofAttribute: {},
+	}
+	registrationFields := map[string]struct{}{"username": {}, "email": {}, "nickname": {}}
+	for _, attribute := range profile.Attributes {
+		if _, ok := registrationFields[attribute.Name]; ok {
+			if !equalStrings(attribute.Permissions["view"], []string{"admin", "user"}) ||
+				!equalStrings(attribute.Permissions["edit"], []string{"admin", "user"}) {
+				t.Fatalf("registration field %q is not visible and editable during registration", attribute.Name)
+			}
+			delete(registrationFields, attribute.Name)
+		}
+		if _, ok := wanted[attribute.Name]; !ok {
+			continue
+		}
+		if !equalStrings(attribute.Permissions["view"], []string{"admin"}) ||
+			!equalStrings(attribute.Permissions["edit"], []string{"admin", "user"}) ||
+			!equalStrings(attribute.Selector.Scopes, []string{RegistrationAttemptScope}) ||
+			attribute.Multivalued || attribute.Validations["length"] == nil {
+			t.Fatalf("controlled registration attribute %q has unsafe profile permissions", attribute.Name)
+		}
+		delete(wanted, attribute.Name)
+	}
+	if len(wanted) != 0 {
+		t.Fatalf("controlled registration attributes are missing from User Profile: %v", wanted)
+	}
+	if len(registrationFields) != 0 {
+		t.Fatalf("public registration fields are missing from User Profile: %v", registrationFields)
+	}
+
+	composeData, err := os.ReadFile("../../compose/acceptance.compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compose := string(composeData)
+	profileUpdate := strings.Index(compose, "update realms/termlink/users/profile")
+	openRegistration := strings.LastIndex(compose, "-s registrationAllowed=true")
+	if profileUpdate < 0 || openRegistration < 0 || profileUpdate > openRegistration ||
+		!strings.Contains(compose, `"include.in.token.scope":"false"`) ||
+		!strings.Contains(compose, `optional-client-scopes/$$registration_scope_id`) ||
+		!strings.Contains(compose, `default-client-scopes/$$registration_scope_id`) {
+		t.Fatal("acceptance bootstrap does not reconcile the registration-only User Profile scope before opening registration")
+	}
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func containsString(values []string, target string) bool {
@@ -272,8 +578,8 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 		"account theme return styling":          ".tl-account-return",
 		"account SVG theme control":             `class="theme-icon-moon"`,
 		"account SVG return control":            `tl-account-return-icon`,
-		"production image account theme":        `COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v17/`,
-		"production runtime account theme":      `-s accountTheme=termlink-01b-v17`,
+		"production image account theme":        `COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v18/`,
+		"production runtime account theme":      `-s accountTheme=termlink-01b-v18`,
 	} {
 		var source string
 		switch name {

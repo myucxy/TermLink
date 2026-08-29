@@ -43,6 +43,8 @@ param(
     [string]$ArtifactRunId = ('run-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)),
     [ValidateSet('ManagedAcceptanceCompose', 'ExternalHttps')]
     [string]$TargetMode = 'ManagedAcceptanceCompose',
+    [ValidateSet('SnapshotTranscript', 'StreamedChunkPrefix')]
+    [string]$HistoryBootstrapMode = 'SnapshotTranscript',
     [string]$DockerPath = 'docker',
     [switch]$PreflightOnly,
     [switch]$KeepEmulator,
@@ -54,6 +56,7 @@ Set-StrictMode -Version Latest
 
 $script:failureCode = $null
 $script:failurePublicMessage = $null
+$script:hookFailureCode = $null
 $script:stage = 'initialize'
 $script:emulatorProcess = $null
 $script:emulatorOutputTask = $null
@@ -76,13 +79,28 @@ $hookSessionArmPath = 'no_backup/tail-first-e2e/session-arm.json'
 $requiredHookOperations = @(
     'probe', 'open_session', 'inspect', 'page_up', 'open_history', 'close_history', 'show_ime'
 )
-$markerCount = 1000
+$snapshotMarkerCount = 1000
+$streamedPrefixMarkerCount = 5200
+$streamedPrefixMinimumTail = [uint64]4097
+$markerCount = if ($HistoryBootstrapMode -ceq 'StreamedChunkPrefix') {
+    $streamedPrefixMarkerCount
+} else {
+    $snapshotMarkerCount
+}
+$minimumOpenTail = if ($HistoryBootstrapMode -ceq 'StreamedChunkPrefix') {
+    $streamedPrefixMinimumTail
+} else {
+    [uint64]0
+}
+# Opening history preserves the 24 marker rows already visible in the live
+# viewport (977..1000) and requests only the older prefix. This makes every
+# continuation contiguous without downloading or rendering duplicate rows.
 $expectedTranscriptPages = @(
-    [pscustomobject]@{ request_before = [uint64]1001; first = [uint64]825; last = [uint64]1000; has_more = $true },
-    [pscustomobject]@{ request_before = [uint64]825; first = [uint64]625; last = [uint64]824; has_more = $true },
-    [pscustomobject]@{ request_before = [uint64]625; first = [uint64]425; last = [uint64]624; has_more = $true },
-    [pscustomobject]@{ request_before = [uint64]425; first = [uint64]225; last = [uint64]424; has_more = $true },
-    [pscustomobject]@{ request_before = [uint64]225; first = [uint64]25; last = [uint64]224; has_more = $false }
+    [pscustomobject]@{ request_before = [uint64]977; first = [uint64]801; last = [uint64]976; has_more = $true },
+    [pscustomobject]@{ request_before = [uint64]801; first = [uint64]601; last = [uint64]800; has_more = $true },
+    [pscustomobject]@{ request_before = [uint64]601; first = [uint64]401; last = [uint64]600; has_more = $true },
+    [pscustomobject]@{ request_before = [uint64]401; first = [uint64]201; last = [uint64]400; has_more = $true },
+    [pscustomobject]@{ request_before = [uint64]201; first = [uint64]1; last = [uint64]200; has_more = $false }
 )
 $serial = "emulator-$EmulatorPort"
 
@@ -203,7 +221,8 @@ function Get-WindowsAgentPreflight {
     param(
         [Parameter(Mandatory)][string]$AgentControlAssembly,
         [string]$RequestedPipeName,
-        [Parameter(Mandatory)][string]$ExpectedOrigin
+        [Parameter(Mandatory)][string]$ExpectedOrigin,
+        [Parameter(Mandatory)][bool]$ExpectedTerminalSnapshotEnabled
     )
     try {
         $assembly = [Reflection.Assembly]::LoadFrom($AgentControlAssembly)
@@ -268,8 +287,18 @@ function Get-WindowsAgentPreflight {
         'The Windows Agent production relay is not connected.'
     Assert-E2E ([string]$production.ServerOrigin -ceq $ExpectedOrigin) 'WINDOWS_AGENT_ORIGIN_MISMATCH' `
         'The Windows Agent is linked to a different server origin.'
-    Assert-E2E ([bool]$production.TerminalSnapshotEnabled) 'WINDOWS_AGENT_SNAPSHOT_DISABLED' `
+    $snapshotMatchesMode = [bool]$production.TerminalSnapshotEnabled -eq $ExpectedTerminalSnapshotEnabled
+    $snapshotFailureCode = if ($ExpectedTerminalSnapshotEnabled) {
+        'WINDOWS_AGENT_SNAPSHOT_DISABLED'
+    } else {
+        'WINDOWS_AGENT_SNAPSHOT_ENABLED'
+    }
+    $snapshotFailureMessage = if ($ExpectedTerminalSnapshotEnabled) {
         'The Windows Agent terminal snapshot producer is disabled.'
+    } else {
+        'The Windows Agent terminal snapshot producer must be disabled for streamed Chunk-prefix acceptance.'
+    }
+    Assert-E2E $snapshotMatchesMode $snapshotFailureCode $snapshotFailureMessage
 
     return [pscustomobject][ordered]@{
         assembly = [IO.Path]::GetFileName($AgentControlAssembly)
@@ -281,7 +310,7 @@ function Get-WindowsAgentPreflight {
         account_linked = $true
         relay_state = $relayState
         server_origin = [string]$production.ServerOrigin
-        terminal_snapshot_enabled = $true
+        terminal_snapshot_enabled = [bool]$production.TerminalSnapshotEnabled
     }
 }
 
@@ -721,8 +750,12 @@ function Wait-HookOperation {
                         Assert-JsonProperties $response @('failure_code') "Debug hook operation '$Operation' failure"
                         Assert-E2E ([string]$response.failure_code -match '^[A-Z0-9_]{1,64}$') `
                             'E2E_HOOK_RESPONSE_INVALID' "Debug hook operation '$Operation' returned an invalid failure code."
-                        Assert-E2E ([bool]$AcceptFailure) 'E2E_HOOK_OPERATION_FAILED' `
-                            "Debug hook operation '$Operation' reported failure."
+                        if (-not [bool]$AcceptFailure) {
+                            $stableFailureCode = [string]$response.failure_code
+                            $script:hookFailureCode = $stableFailureCode
+                            Stop-TailFirstE2E 'E2E_HOOK_OPERATION_FAILED' `
+                                "Debug hook operation '$Operation' reported failure_code '$stableFailureCode'."
+                        }
                     }
                     return $response
                 }
@@ -849,7 +882,7 @@ function Get-StateObservation {
     param([Parameter(Mandatory)][string]$Phase, [Parameter(Mandatory)]$Response)
     Assert-JsonProperties $Response @(
         'session_id', 'snapshot_count', 'transcript_count', 'chunk_count',
-        'snapshot_sequence_s', 'live_ack', 'history_overlay',
+        'snapshot_sequence_s', 'live_ack', 'bootstrap_source', 'history_overlay',
         'first_marker_visible', 'last_marker_visible', 'live_marker_visible',
         'viewport_signature', 'terminal_columns', 'terminal_rows',
         'realtime_socket_phase', 'realtime_socket_state', 'realtime_transport_state',
@@ -883,7 +916,7 @@ function Get-StateObservation {
             'E2E_HOOK_RESPONSE_INVALID' "Debug hook state for '$Phase' has an invalid $field."
     }
     foreach ($field in @(
-        'realtime_socket_phase', 'realtime_socket_state',
+        'bootstrap_source', 'realtime_socket_phase', 'realtime_socket_state',
         'realtime_transport_state', 'realtime_remote_state'
     )) {
         Assert-E2E ([string]$Response.$field -cmatch '^[A-Z_]{2,32}$') `
@@ -914,6 +947,7 @@ function Get-StateObservation {
         chunk_count = [int]$Response.chunk_count
         snapshot_sequence_s = [uint64]$Response.snapshot_sequence_s
         live_ack = [uint64]$Response.live_ack
+        bootstrap_source = [string]$Response.bootstrap_source
         history_overlay = [bool]$Response.history_overlay
         first_marker_visible = [bool]$Response.first_marker_visible
         last_marker_visible = [bool]$Response.last_marker_visible
@@ -989,8 +1023,8 @@ function Get-PaginationObservation {
         ($observation.rows_loaded -eq $expectedRowCount)
     Add-Assertion "page-$PageNumber-transcript-count-advanced-once" ([string]($Previous.transcript_count + 1)) `
         $observation.transcript_count ($observation.transcript_count -eq $Previous.transcript_count + 1)
-    Add-Assertion "page-$PageNumber-snapshot-count-fixed" '1' $observation.snapshot_count `
-        ($observation.snapshot_count -eq 1)
+    Add-Assertion "page-$PageNumber-snapshot-count-fixed" ([string]$Previous.snapshot_count) `
+        $observation.snapshot_count ($observation.snapshot_count -eq $Previous.snapshot_count)
     Add-Assertion "page-$PageNumber-chunk-count-fixed" '0' $observation.chunk_count `
         ($observation.chunk_count -eq 0)
     Add-Assertion "page-$PageNumber-snapshot-s-fixed" ([string]$ExpectedSnapshot) $observation.snapshot_sequence_s `
@@ -1099,11 +1133,13 @@ $script:evidence = [pscustomobject][ordered]@{
     stage = $script:stage
     inputs = [pscustomobject][ordered]@{
         target_mode = $TargetMode
+        history_bootstrap_mode = $HistoryBootstrapMode
         avd = $AvdName
         emulator_serial = $serial
         acceptance_origin = $AcceptanceOrigin.GetLeftPart([UriPartial]::Authority)
         android_package = $AndroidPackageName
         marker_count = $markerCount
+        minimum_open_tail = $minimumOpenTail
         history_page_count = $HistoryPageCount
         history_page_size = $HistoryPageSize
     }
@@ -1149,7 +1185,11 @@ try {
         'TermLink.AgentControl.dll is unavailable beside the Windows SessionHost executable.'
     $expectedOrigin = $AcceptanceOrigin.GetLeftPart([UriPartial]::Authority).TrimEnd('/')
     $script:evidence.preflight | Add-Member -NotePropertyName windows_agent -NotePropertyValue `
-        (Get-WindowsAgentPreflight $agentControlAssembly $AgentControlPipe $expectedOrigin)
+        (Get-WindowsAgentPreflight `
+            $agentControlAssembly `
+            $AgentControlPipe `
+            $expectedOrigin `
+            ($HistoryBootstrapMode -ceq 'SnapshotTranscript'))
 
     if ($TargetMode -ceq 'ManagedAcceptanceCompose') {
         $script:stage = 'preflight-acceptance-stack'
@@ -1279,7 +1319,29 @@ try {
     $firstMarker = $markers[0]
     $lastMarker = $markers[-1]
     $liveMarker = "${markerStem}_LIVE_AFTER_OVERLAY"
-    $childScript = @'
+    $childScript = if ($HistoryBootstrapMode -ceq 'StreamedChunkPrefix') {
+        @'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+[Console]::WriteLine('__FIRST_MARKER__')
+1..__MARKER_COUNT__ | ForEach-Object {
+    $eventName = 'TLSP_EVENT_{0:D5}' -f $_
+    [Console]::Write("$eventName`r")
+    [Console]::Out.Flush()
+    Start-Sleep -Milliseconds 17
+}
+[Console]::WriteLine()
+[Console]::WriteLine('__LAST_MARKER__')
+while ($true) {
+    $line = [Console]::ReadLine()
+    if ($null -eq $line -or $line -eq '__TERMLINK_TAIL_FIRST_EXIT__') { break }
+    [Console]::WriteLine($line)
+}
+'@.Replace('__FIRST_MARKER__', $firstMarker).
+            Replace('__LAST_MARKER__', $lastMarker).
+            Replace('__MARKER_COUNT__', [string]$markerCount)
+    } else {
+        @'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 $stem = '__MARKER_STEM__'
@@ -1290,6 +1352,7 @@ while ($true) {
     [Console]::WriteLine($line)
 }
 '@.Replace('__MARKER_STEM__', $markerStem)
+    }
     $encodedChildScript = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
     $childCommand = '"{0}" -NoLogo -NoProfile -NonInteractive -EncodedCommand {1}' -f (Join-Path $PSHOME 'pwsh.exe'), $encodedChildScript
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($childCommand))
@@ -1313,6 +1376,7 @@ while ($true) {
         first_marker = $firstMarker
         last_marker = $lastMarker
         marker_count = [string]$markerCount
+        minimum_tail = [string]$minimumOpenTail
     }
     $sessionArm = Wait-SessionArm $openSessionRequest
     $sessionArm | Add-Member -NotePropertyName session_host_started_at_utc -NotePropertyValue ([DateTime]::UtcNow.ToString('o'))
@@ -1340,6 +1404,76 @@ while ($true) {
         $script:evidence.session_arm.session_host_started_at_utc `
         ([DateTimeOffset]::Parse($script:evidence.session_arm.session_host_started_at_utc) -ge
             [DateTimeOffset]::Parse($script:evidence.session_arm.armed_at_utc))
+    if ($HistoryBootstrapMode -ceq 'StreamedChunkPrefix') {
+        Add-Assertion 'streamed-prefix-snapshot-count' '0' $initialObservation.snapshot_count `
+            ($initialObservation.snapshot_count -eq 0)
+        Add-Assertion 'streamed-prefix-transcript-count' '0' $initialObservation.transcript_count `
+            ($initialObservation.transcript_count -eq 0)
+        Add-Assertion 'streamed-prefix-chunk-count-positive' '>0' $initialObservation.chunk_count `
+            ($initialObservation.chunk_count -gt 0)
+        Add-Assertion 'streamed-prefix-snapshot-sequence-zero' '0' $initialObservation.snapshot_sequence_s `
+            ($initialObservation.snapshot_sequence_s -eq 0)
+        Add-Assertion 'streamed-prefix-bootstrap-source' 'LEGACY_REPLAY' $initialObservation.bootstrap_source `
+            ($initialObservation.bootstrap_source -ceq 'LEGACY_REPLAY')
+        Add-Assertion 'streamed-prefix-ack-exceeds-4096' ">=$minimumOpenTail" $initialObservation.live_ack `
+            ($initialObservation.live_ack -ge $minimumOpenTail)
+        Add-Assertion 'streamed-prefix-history-overlay-hidden' 'false' $initialObservation.history_overlay `
+            (-not $initialObservation.history_overlay)
+        Add-Assertion 'streamed-prefix-first-marker-visible' 'true' $initialObservation.first_marker_visible `
+            $initialObservation.first_marker_visible
+        Add-Assertion 'streamed-prefix-last-marker-visible' 'true' $initialObservation.last_marker_visible `
+            $initialObservation.last_marker_visible
+        $script:evidence.screenshots += Save-Screenshot '01-streamed-prefix-restored.png'
+
+        $fixedSessionId = $initialObservation.session_id
+        $fixedSnapshot = [uint64]0
+        $fixedAck = $initialObservation.live_ack
+        $fixedColumns = $initialObservation.terminal_columns
+        $fixedRows = $initialObservation.terminal_rows
+        $script:stage = 'streamed-prefix-live-flow'
+        $script:evidence.stage = $script:stage
+        $script:sessionProcess.StandardInput.WriteLine($liveMarker)
+        $script:sessionProcess.StandardInput.Flush()
+        $liveDeadline = [DateTime]::UtcNow.AddSeconds($ObservationTimeoutSeconds)
+        $closedObservation = $null
+        $lastLiveCandidate = $null
+        do {
+            $live = Invoke-HookOperation 'inspect' @{ live_marker = $liveMarker }
+            $candidate = Get-StateObservation 'streamed-prefix-live' $live
+            $lastLiveCandidate = $candidate
+            if (-not $candidate.history_overlay -and $candidate.live_ack -gt $fixedAck -and
+                $candidate.live_marker_visible) {
+                $closedObservation = $candidate
+                break
+            }
+            Start-Sleep -Milliseconds 250
+        } while ([DateTime]::UtcNow -lt $liveDeadline)
+        if ($null -eq $closedObservation -and $null -ne $lastLiveCandidate) {
+            $lastLiveCandidate.phase = 'streamed-prefix-live-timeout'
+            $script:evidence.observations += $lastLiveCandidate
+        }
+        Assert-E2E ($null -ne $closedObservation) 'LIVE_ACK_DID_NOT_ADVANCE' `
+            'Live ACK did not advance after the streamed Chunk-prefix restore.'
+        $script:evidence.observations += $closedObservation
+        Add-Assertion 'streamed-prefix-live-session-fixed' $fixedSessionId $closedObservation.session_id `
+            ($closedObservation.session_id -ceq $fixedSessionId)
+        Add-Assertion 'streamed-prefix-live-bootstrap-source-fixed' 'LEGACY_REPLAY' `
+            $closedObservation.bootstrap_source ($closedObservation.bootstrap_source -ceq 'LEGACY_REPLAY')
+        Add-Assertion 'streamed-prefix-live-snapshot-count-zero' '0' $closedObservation.snapshot_count `
+            ($closedObservation.snapshot_count -eq 0)
+        Add-Assertion 'streamed-prefix-live-transcript-count-zero' '0' $closedObservation.transcript_count `
+            ($closedObservation.transcript_count -eq 0)
+        Add-Assertion 'streamed-prefix-live-ack-advanced' ">$fixedAck" $closedObservation.live_ack `
+            ($closedObservation.live_ack -gt $fixedAck)
+        Add-Assertion 'streamed-prefix-live-marker-visible' 'true' $closedObservation.live_marker_visible `
+            $closedObservation.live_marker_visible
+        Add-Assertion 'streamed-prefix-live-grid-columns-fixed' ([string]$fixedColumns) `
+            $closedObservation.terminal_columns ($closedObservation.terminal_columns -eq $fixedColumns)
+        Add-Assertion 'streamed-prefix-live-grid-rows-fixed' ([string]$fixedRows) `
+            $closedObservation.terminal_rows ($closedObservation.terminal_rows -eq $fixedRows)
+        $script:evidence.screenshots += Save-Screenshot '02-streamed-prefix-live.png'
+    }
+    else {
     Add-Assertion 'initial-snapshot-count' '1' $initialObservation.snapshot_count ($initialObservation.snapshot_count -eq 1)
     Add-Assertion 'initial-transcript-count' '0' $initialObservation.transcript_count ($initialObservation.transcript_count -eq 0)
     Add-Assertion 'initial-chunk-count' '0' $initialObservation.chunk_count ($initialObservation.chunk_count -eq 0)
@@ -1353,7 +1487,8 @@ while ($true) {
     $script:evidence.screenshots += Save-Screenshot '01-initial-tail.png'
 
     $fixedSessionId = $initialObservation.session_id
-    $fixedSnapshot = $initialObservation.snapshot_sequence_s
+    $initialSnapshot = $initialObservation.snapshot_sequence_s
+    $fixedSnapshot = $initialSnapshot
     $fixedAck = $initialObservation.live_ack
     $fixedColumns = $initialObservation.terminal_columns
     $fixedRows = $initialObservation.terminal_rows
@@ -1394,14 +1529,19 @@ while ($true) {
         ($overlayObservation.rows_loaded -ge 1 -and $overlayObservation.rows_loaded -le $HistoryPageSize)
     Add-Assertion 'history-initial-load-transcript-count' '1' $overlayObservation.transcript_count `
         ($overlayObservation.transcript_count -eq 1)
-    Add-Assertion 'history-initial-load-snapshot-count-fixed' '1' $overlayObservation.snapshot_count `
-        ($overlayObservation.snapshot_count -eq 1)
+    $expectedSnapshotCountAfterHistory = $initialObservation.snapshot_count +
+        [int]($overlayObservation.snapshot_sequence_s -ne $initialSnapshot)
+    Add-Assertion 'history-initial-load-snapshot-cache-matches-rebase' `
+        ([string]$expectedSnapshotCountAfterHistory) $overlayObservation.snapshot_count `
+        ($overlayObservation.snapshot_count -eq $expectedSnapshotCountAfterHistory)
     Add-Assertion 'history-initial-load-chunk-count-fixed' '0' $overlayObservation.chunk_count `
         ($overlayObservation.chunk_count -eq 0)
-    Add-Assertion 'history-initial-load-snapshot-s-fixed' ([string]$fixedSnapshot) $overlayObservation.snapshot_sequence_s `
-        ($overlayObservation.snapshot_sequence_s -eq $fixedSnapshot)
-    Add-Assertion 'history-initial-load-live-ack-fixed' ([string]$fixedAck) $overlayObservation.live_ack `
-        ($overlayObservation.live_ack -eq $fixedAck)
+    Add-Assertion 'history-initial-load-snapshot-rebase-covered-by-ack' `
+        "$initialSnapshot..$($overlayObservation.live_ack)" $overlayObservation.snapshot_sequence_s `
+        ($overlayObservation.snapshot_sequence_s -ge $initialSnapshot -and
+            $overlayObservation.snapshot_sequence_s -le $overlayObservation.live_ack)
+    Add-Assertion 'history-initial-load-live-ack-not-regressed' ">=$fixedAck" $overlayObservation.live_ack `
+        ($overlayObservation.live_ack -ge $fixedAck)
     Add-Assertion 'history-initial-load-grid-columns-fixed' ([string]$fixedColumns) $overlayObservation.terminal_columns `
         ($overlayObservation.terminal_columns -eq $fixedColumns)
     Add-Assertion 'history-initial-load-grid-rows-fixed' ([string]$fixedRows) $overlayObservation.terminal_rows `
@@ -1422,6 +1562,13 @@ while ($true) {
         $overlayObservation.loaded_has_more_before ($overlayObservation.loaded_has_more_before -eq $initialExpectedPage.has_more)
     Add-Assertion 'history-initial-next-cursor' ([string]$initialExpectedPage.first) `
         $overlayObservation.next_before_line_id ($overlayObservation.next_before_line_id -eq $initialExpectedPage.first)
+
+    # A pending Transcript may authenticate a newer Snapshot after the live
+    # renderer has durably covered it. Once the first page is loaded, all
+    # continuation requests remain fixed to that rebased anchor and the ACK
+    # observed in the same atomic bridge response.
+    $fixedSnapshot = $overlayObservation.snapshot_sequence_s
+    $fixedAck = $overlayObservation.live_ack
 
     $script:stage = 'history-page-up'
     $script:evidence.stage = $script:stage
@@ -1461,6 +1608,34 @@ while ($true) {
     try {
         Set-AndroidAirplaneMode $true
         $script:evidence.cleanup.network_failure_injected = $true
+        # Android's connectivity transition legitimately changes the session
+        # status from CONTROLLING to READ_ONLY and may remeasure the terminal
+        # surface. Capture the failure-retention baseline after that transition
+        # and immediately before the rejected page request, so the assertion
+        # proves the request itself does not move or replace the viewport.
+        $offlineBaselineDeadline = [DateTime]::UtcNow.AddSeconds(20)
+        $offlineBaselineObservation = $null
+        do {
+            $offlineBaselineResponse = Invoke-HookOperation 'inspect' @{ live_marker = $liveMarker }
+            $offlineBaselineObservation = Get-StateObservation 'history-offline-baseline' $offlineBaselineResponse
+            $appObservedNetworkLoss =
+                $offlineBaselineObservation.realtime_network_lost_count -gt
+                    $previousPageObservation.realtime_network_lost_count -and
+                $offlineBaselineObservation.realtime_remote_state -in @('READ_ONLY', 'RECONNECTING')
+            if (-not $appObservedNetworkLoss) { Start-Sleep -Milliseconds 250 }
+        } while (-not $appObservedNetworkLoss -and [DateTime]::UtcNow -lt $offlineBaselineDeadline)
+        Add-Assertion 'offline-baseline-observed-network-loss' 'true' $appObservedNetworkLoss `
+            $appObservedNetworkLoss
+        $script:evidence.observations += $offlineBaselineObservation
+        Add-Assertion 'offline-baseline-session-fixed' $fixedSessionId $offlineBaselineObservation.session_id `
+            ($offlineBaselineObservation.session_id -ceq $fixedSessionId -and
+                $offlineBaselineObservation.history_overlay)
+        Add-Assertion 'offline-baseline-history-objects' `
+            "$($previousPageObservation.snapshot_count)/$($previousPageObservation.transcript_count)/$($previousPageObservation.chunk_count)" `
+            "$($offlineBaselineObservation.snapshot_count)/$($offlineBaselineObservation.transcript_count)/$($offlineBaselineObservation.chunk_count)" `
+            ($offlineBaselineObservation.snapshot_count -eq $previousPageObservation.snapshot_count -and
+                $offlineBaselineObservation.transcript_count -eq $previousPageObservation.transcript_count -and
+                $offlineBaselineObservation.chunk_count -eq $previousPageObservation.chunk_count)
         $failedPage = Invoke-HookOperation 'page_up' @{
             first_marker = $firstMarker
             last_marker = $lastMarker
@@ -1496,9 +1671,9 @@ while ($true) {
             ($retainedObservation.snapshot_sequence_s -eq $fixedSnapshot)
         Add-Assertion 'failure-retains-live-ack' ([string]$fixedAck) $retainedObservation.live_ack `
             ($retainedObservation.live_ack -eq $fixedAck)
-        Add-Assertion 'failure-retains-viewport' $previousPageObservation.viewport_signature `
+        Add-Assertion 'failure-retains-viewport' $offlineBaselineObservation.viewport_signature `
             $retainedObservation.viewport_signature `
-            ($retainedObservation.viewport_signature -ceq $previousPageObservation.viewport_signature)
+            ($retainedObservation.viewport_signature -ceq $offlineBaselineObservation.viewport_signature)
         Add-Assertion 'failure-retains-grid-columns' ([string]$fixedColumns) $retainedObservation.terminal_columns `
             ($retainedObservation.terminal_columns -eq $fixedColumns)
         Add-Assertion 'failure-retains-grid-rows' ([string]$fixedRows) $retainedObservation.terminal_rows `
@@ -1511,6 +1686,38 @@ while ($true) {
             $script:evidence.cleanup.android_network_restored = $true
         }
     }
+
+    $script:stage = 'history-network-recovery'
+    $script:evidence.stage = $script:stage
+    # A cold emulator can expose the replacement network as partial
+    # connectivity for tens of seconds while Android's validation probes
+    # settle. Reuse the runner's bounded observation budget so this gate still
+    # waits for the product callback and the full realtime stack, without a
+    # shorter platform-timing false negative.
+    $onlineRecoveryDeadline = [DateTime]::UtcNow.AddSeconds($ObservationTimeoutSeconds)
+    $onlineRecoveryObservation = $null
+    $appObservedNetworkRecovery = $false
+    do {
+        $onlineRecoveryResponse = Invoke-HookOperation 'inspect' @{ live_marker = $liveMarker }
+        $onlineRecoveryObservation = Get-StateObservation 'history-online-recovery' $onlineRecoveryResponse
+        $appObservedNetworkRecovery =
+            $onlineRecoveryObservation.realtime_network_available_count -gt
+                $offlineBaselineObservation.realtime_network_available_count -and
+            $onlineRecoveryObservation.realtime_socket_state -ceq 'CONNECTED' -and
+            $onlineRecoveryObservation.realtime_transport_state -ceq 'CONNECTED' -and
+            $onlineRecoveryObservation.realtime_remote_state -ceq 'CONTROLLING' -and
+            $onlineRecoveryObservation.realtime_subscriber_ready
+        if (-not $appObservedNetworkRecovery) { Start-Sleep -Milliseconds 250 }
+    } while (-not $appObservedNetworkRecovery -and [DateTime]::UtcNow -lt $onlineRecoveryDeadline)
+    Add-Assertion 'online-retry-observed-network-recovery' 'true' $appObservedNetworkRecovery `
+        $appObservedNetworkRecovery
+    $script:evidence.observations += $onlineRecoveryObservation
+    Add-Assertion 'online-retry-retains-history-objects' `
+        "$($previousPageObservation.snapshot_count)/$($previousPageObservation.transcript_count)/$($previousPageObservation.chunk_count)" `
+        "$($onlineRecoveryObservation.snapshot_count)/$($onlineRecoveryObservation.transcript_count)/$($onlineRecoveryObservation.chunk_count)" `
+        ($onlineRecoveryObservation.snapshot_count -eq $previousPageObservation.snapshot_count -and
+            $onlineRecoveryObservation.transcript_count -eq $previousPageObservation.transcript_count -and
+            $onlineRecoveryObservation.chunk_count -eq $previousPageObservation.chunk_count)
 
     $script:stage = 'history-final-page-retry'
     $script:evidence.stage = $script:stage
@@ -1587,6 +1794,7 @@ while ($true) {
         ($closedObservation.terminal_rows -eq $fixedRows)
     Add-Assertion 'new-live-marker-visible-after-exit' 'true' $closedObservation.live_marker_visible $closedObservation.live_marker_visible
     $script:evidence.screenshots += Save-Screenshot '04-live-tail-restored.png'
+    }
 
     $script:stage = 'ime-layout'
     $script:evidence.stage = $script:stage
@@ -1651,6 +1859,7 @@ catch {
         code = $code
         stage = $script:stage
         message = $message
+        hook_failure_code = $script:hookFailureCode
     }
 }
 finally {

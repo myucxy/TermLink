@@ -8,11 +8,13 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -142,6 +144,35 @@ class RemoteTerminalSessionTest {
         runCurrent()
         assertEquals(listOf(42L), outbound.acknowledgements)
         assertEquals(listOf(41L, 42L), engine.feeds.map { it.first })
+        session.close()
+    }
+
+    @Test
+    fun restoredTailWindowContinuesFromItsEndWithoutRequestingTheOmittedPrefix() = runTest {
+        val engine = RecordingEngine()
+        engine.feed(40, ByteBuffer.wrap(byteArrayOf(1)))
+        engine.feed(41, ByteBuffer.wrap(byteArrayOf(2)))
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(
+            engine = engine,
+            outbound = outbound,
+            parentScope = backgroundScope,
+            initialRendererState = RendererBootstrapState.TailWindow(
+                startSequence = 40,
+                sequence = 41,
+                rendererGeneration = 1,
+            ),
+        )
+
+        assertTrue(session.onConnected())
+        assertEquals(listOf(41L), outbound.resumes)
+        assertEquals(
+            EventAcceptance.Applied(42),
+            session.accept(RemoteSessionEvent.Output(42, byteArrayOf(3))),
+        )
+        runCurrent()
+        assertEquals(listOf(42L), outbound.acknowledgements)
+        assertEquals(listOf(40L, 41L, 42L), engine.feeds.map { it.first })
         session.close()
     }
 
@@ -958,6 +989,212 @@ class RemoteTerminalSessionTest {
             session.grantControl("lease", Long.MAX_VALUE)
         }
         assertTrue(engine.feeds.isEmpty())
+    }
+
+    @Test
+    fun orderedObserverRunsAfterRendererAndOwnsOutputBytes() = runTest {
+        val engine = RecordingEngine()
+        val observed = CompletableDeferred<Pair<Long, ByteArray>>()
+        val observer = object : RemoteSessionOrderedEventObserver {
+            override suspend fun observe(notification: OrderedRemoteSessionNotification) {
+                if (notification is OrderedRemoteSessionNotification.Applied) {
+                    assertEquals(1, engine.feeds.size)
+                    val output = assertIs<RemoteSessionEvent.Output>(notification.event)
+                    observed.complete(notification.rendererGeneration to output.bytes.copyOf())
+                }
+            }
+        }
+        val session = RemoteTerminalSession(
+            engine = engine,
+            outbound = RecordingOutbound(),
+            parentScope = backgroundScope,
+            orderedEventObserver = observer,
+        )
+        val bytes = byteArrayOf(7, 8)
+
+        assertEquals(EventAcceptance.Applied(1), session.accept(RemoteSessionEvent.Output(1, bytes)))
+        bytes.fill(0)
+        val notification = withTimeout(5_000) { observed.await() }
+        assertArrayEquals(byteArrayOf(7, 8), notification.second)
+        assertEquals(1L, notification.first)
+        session.close()
+    }
+
+    @Test
+    fun orderedObserverFailureCannotChangeRendererOrAcknowledgements() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        val observerClosed = CompletableDeferred<Unit>()
+        val observer = object : RemoteSessionOrderedEventObserver {
+            override suspend fun observe(notification: OrderedRemoteSessionNotification) {
+                throw AssertionError("diagnostic shadow failed")
+            }
+
+            override fun close() {
+                observerClosed.complete(Unit)
+            }
+        }
+        val session = RemoteTerminalSession(
+            engine = engine,
+            outbound = outbound,
+            parentScope = backgroundScope,
+            orderedEventObserver = observer,
+        )
+
+        assertEquals(EventAcceptance.Applied(1), session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1))))
+        withTimeout(5_000) { observerClosed.await() }
+        assertEquals(EventAcceptance.Applied(2), session.accept(RemoteSessionEvent.Output(2, byteArrayOf(2))))
+        runCurrent()
+
+        assertEquals(listOf(1L, 2L), engine.feeds.map(Pair<Long, ByteArray>::first))
+        assertEquals(2L, session.state.value.lastAckedSequence)
+        assertEquals(listOf(2L), outbound.persistedAcknowledgements)
+        session.close()
+    }
+
+    @Test
+    fun orderedObserverOverflowRetiresOnlyObserver() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        val observingFirst = CompletableDeferred<Unit>()
+        val observerClosed = CompletableDeferred<Unit>()
+        val observer = object : RemoteSessionOrderedEventObserver {
+            override suspend fun observe(notification: OrderedRemoteSessionNotification) {
+                observingFirst.complete(Unit)
+                awaitCancellation()
+            }
+
+            override fun close() {
+                observerClosed.complete(Unit)
+            }
+        }
+        val session = RemoteTerminalSession(
+            engine = engine,
+            outbound = outbound,
+            parentScope = backgroundScope,
+            orderedEventObserver = observer,
+            orderedEventObserverCapacity = 1,
+        )
+
+        session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1)))
+        withTimeout(5_000) { observingFirst.await() }
+        session.accept(RemoteSessionEvent.Output(2, byteArrayOf(2)))
+        session.accept(RemoteSessionEvent.Output(3, byteArrayOf(3)))
+        withTimeout(5_000) { observerClosed.await() }
+        assertEquals(EventAcceptance.Applied(4), session.accept(RemoteSessionEvent.Output(4, byteArrayOf(4))))
+        runCurrent()
+
+        assertEquals(listOf(1L, 2L, 3L, 4L), engine.feeds.map(Pair<Long, ByteArray>::first))
+        assertEquals(4L, session.state.value.lastAckedSequence)
+        session.close()
+    }
+
+    @Test
+    fun rendererResetStartsANewObservedGenerationBeforeReplay() = runTest {
+        val notifications = mutableListOf<OrderedRemoteSessionNotification>()
+        val replayObserved = CompletableDeferred<Unit>()
+        val observer = object : RemoteSessionOrderedEventObserver {
+            override suspend fun observe(notification: OrderedRemoteSessionNotification) {
+                synchronized(notifications) { notifications += notification }
+                if (notification is OrderedRemoteSessionNotification.Applied && notification.event.sequence == 2L) {
+                    replayObserved.complete(Unit)
+                }
+            }
+        }
+        val session = RemoteTerminalSession(
+            engine = RecordingEngine(),
+            outbound = RecordingOutbound(),
+            parentScope = backgroundScope,
+            orderedEventObserver = observer,
+        )
+
+        assertEquals(
+            2L,
+            session.resetAndReplay(
+                listOf(
+                    RemoteSessionEvent.Title(1, "shell"),
+                    RemoteSessionEvent.Output(2, byteArrayOf(2)),
+                ),
+            ),
+        )
+        withTimeout(5_000) { replayObserved.await() }
+        val copy = synchronized(notifications) { notifications.toList() }
+
+        assertEquals(3, copy.size)
+        assertIs<OrderedRemoteSessionNotification.RendererReset>(copy[0])
+        assertEquals(listOf(2L, 2L, 2L), copy.map(OrderedRemoteSessionNotification::rendererGeneration))
+        assertEquals(listOf(1L, 2L), copy.drop(1).map { (it as OrderedRemoteSessionNotification.Applied).event.sequence })
+        session.close()
+    }
+
+    @Test
+    fun duplicateIsNotObservedAndHistoryGapInvalidatesWithoutAdvancingAck() = runTest {
+        val notifications = java.util.concurrent.CopyOnWriteArrayList<OrderedRemoteSessionNotification>()
+        val invalidated = CompletableDeferred<Unit>()
+        val observer = object : RemoteSessionOrderedEventObserver {
+            override suspend fun observe(notification: OrderedRemoteSessionNotification) {
+                notifications += notification
+                if (notification is OrderedRemoteSessionNotification.RendererInvalidated) {
+                    invalidated.complete(Unit)
+                }
+            }
+        }
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(
+            engine = RecordingEngine(),
+            outbound = outbound,
+            parentScope = backgroundScope,
+            orderedEventObserver = observer,
+        )
+
+        assertEquals(EventAcceptance.Applied(1), session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1))))
+        assertEquals(EventAcceptance.Duplicate(1), session.accept(RemoteSessionEvent.Output(1, byteArrayOf(9))))
+        assertEquals(EventAcceptance.HistoryGap(2, 3), session.accept(RemoteSessionEvent.Output(3, byteArrayOf(3))))
+        withTimeout(5_000) { invalidated.await() }
+        runCurrent()
+
+        assertEquals(2, notifications.size)
+        assertIs<OrderedRemoteSessionNotification.Applied>(notifications[0])
+        assertIs<OrderedRemoteSessionNotification.RendererInvalidated>(notifications[1])
+        assertEquals(listOf(1L), outbound.persistedAcknowledgements)
+        session.close()
+    }
+
+    @Test
+    fun orderedObserverOutputBudgetOverflowCannotStopProductionRenderer() = runTest {
+        val observingFirst = CompletableDeferred<Unit>()
+        val observerClosed = CompletableDeferred<Unit>()
+        val observer = object : RemoteSessionOrderedEventObserver {
+            override suspend fun observe(notification: OrderedRemoteSessionNotification) {
+                observingFirst.complete(Unit)
+                awaitCancellation()
+            }
+
+            override fun close() {
+                observerClosed.complete(Unit)
+            }
+        }
+        val engine = RecordingEngine()
+        val session = RemoteTerminalSession(
+            engine = engine,
+            outbound = RecordingOutbound(),
+            parentScope = backgroundScope,
+            orderedEventObserver = observer,
+            orderedEventObserverCapacity = 8,
+        )
+
+        session.accept(RemoteSessionEvent.Output(1, ByteArray(1024 * 1024)))
+        withTimeout(5_000) { observingFirst.await() }
+        for (sequence in 2L..5L) {
+            session.accept(RemoteSessionEvent.Output(sequence, ByteArray(1024 * 1024)))
+        }
+        withTimeout(5_000) { observerClosed.await() }
+        assertEquals(EventAcceptance.Applied(6), session.accept(RemoteSessionEvent.Output(6, byteArrayOf(6))))
+        runCurrent()
+
+        assertEquals((1L..6L).toList(), engine.feeds.map { it.first })
+        assertEquals(6L, session.state.value.lastAckedSequence)
+        session.close()
     }
 
     private class RecordingEngine(

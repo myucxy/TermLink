@@ -1,0 +1,18 @@
+{{define "admin-account-menu"}}
+<details class="admin-account-menu">
+  <summary class="admin-account-trigger" aria-label="打开管理员账号菜单">
+    <span class="admin-avatar" aria-hidden="true">{{printf "%.1s" .Username}}</span>
+    <span class="admin-account-name">{{.Username}}</span>
+  </summary>
+  <div class="admin-account-panel">
+    <strong>{{.Username}}</strong>
+    <small>{{.RoleLabel}} · {{.Role}}</small>
+    <a href="/account">返回个人中心</a>
+    <a href="/account?section=settings">个人设置与登录安全</a>
+    <form action="/logout" method="post">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit">退出登录</button>
+    </form>
+  </div>
+</details>
+{{end}}

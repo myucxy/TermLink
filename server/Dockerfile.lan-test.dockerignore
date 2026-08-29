@@ -1,0 +1,13 @@
+**
+!server/
+!server/go.mod
+!server/go.sum
+!server/cmd/
+!server/cmd/**
+!server/internal/
+!server/internal/**
+!server/migrations/
+!server/migrations/**
+!testdata/
+!testdata/terminal-golden-streams/
+!testdata/terminal-golden-streams/**

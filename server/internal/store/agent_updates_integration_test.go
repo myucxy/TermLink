@@ -90,4 +90,34 @@ func TestClaimAgentUpdateReturnsQualifiedJobColumns(t *testing.T) {
 	if claimed.Status != AgentUpdateProcessing || claimed.AttemptCount != 1 || leaseToken == "" {
 		t.Fatalf("claim state status=%q attempts=%d lease_present=%t", claimed.Status, claimed.AttemptCount, leaseToken != "")
 	}
+
+	// A user may finish the same goal with a manually launched, newer Setup while
+	// Android is monitoring INSTALLING. The authenticated Agent registration is
+	// then sufficient evidence to close the stale job without another lease.
+	const manuallyInstalledVersion = "0.2.7.49"
+	if err := repository.UpsertPC(ctx, userID, agentID, PCRecord{
+		ID: pcID, Name: "Windows Agent", AgentVersion: manuallyInstalledVersion, KeyEpoch: 1,
+		Platform: PCPlatformWindows, Architecture: PCArchitectureX64, PlatformVersion: "Windows 11",
+		Capabilities: []string{PCCapabilityRealtimeTerminalV1, PCCapabilityRemoteAgentUpdateV1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reconciled, err := repository.GetAgentUpdate(ctx, userID, androidID, pcID, created.ID)
+	if err != nil {
+		t.Fatalf("read reconciled Agent update: %v", err)
+	}
+	if reconciled.Status != AgentUpdateSucceeded || reconciled.Phase != AgentUpdateSucceeded ||
+		reconciled.ProgressPercent != 100 || reconciled.ObservedAgentVersion == nil ||
+		*reconciled.ObservedAgentVersion != manuallyInstalledVersion || reconciled.ObservedAgentBuild == nil ||
+		*reconciled.ObservedAgentBuild != 49 {
+		t.Fatalf("manual install was not reconciled: %#v", reconciled)
+	}
+	active, err := repository.GetActiveAgentUpdate(ctx, userID, androidID, pcID)
+	if err != nil || active != nil {
+		t.Fatalf("reconciled update remained active: active=%#v err=%v", active, err)
+	}
+	claimedAgain, _, err := repository.ClaimAgentUpdate(ctx, userID, agentID, pcID, 2*time.Minute)
+	if err != nil || claimedAgain != nil {
+		t.Fatalf("new Agent reclaimed the reconciled update: claimed=%#v err=%v", claimedAgain, err)
+	}
 }

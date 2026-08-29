@@ -161,6 +161,23 @@
     <string name="server_data_empty_copy">Device trust and pending requests are server data.</string>
     <string name="server_sessions_empty_copy">Open a Windows session from Devices to show it here.</string>
     <string name="server_activity_empty_copy">Activity on this screen is recorded locally on this device; it is not a server audit feed.</string>
+    <string name="activity_pairing_challenge_created">Pairing challenge created</string>
+    <string name="activity_pairing_challenge_detail">%1$s · expires %2$s</string>
+    <string name="activity_target_device">Target device</string>
+    <string name="activity_device_pairing_completed">Device pairing completed</string>
+    <string name="activity_device_pairing_completed_detail">This device is now trusted by the server.</string>
+    <string name="activity_control_granted">Control granted</string>
+    <string name="activity_control_released">Control released</string>
+    <string name="activity_session_detail">Session %1$s</string>
+    <string name="activity_control_leases_released">Control leases released</string>
+    <string name="activity_device_backgrounded">Device moved to the background.</string>
+    <string name="activity_session_closed">Session closed</string>
+    <string name="activity_session_closed_detail">The Windows command line was closed and its session record was removed.</string>
+    <string name="activity_history_replayed">History replayed</string>
+    <string name="activity_connection_failed">Connection failed</string>
+    <string name="activity_authentication_expired">Authentication expired</string>
+    <string name="activity_history_gap_recovered">History gap recovered</string>
+    <string name="activity_history_gap_recovered_detail">Encrypted replay restored through ACK %1$d.</string>
     <string name="server_history_empty_copy">History is available only when the server returns encrypted chunks or snapshots.</string>
     <string name="server_devices_empty_copy">No online Windows PCs are currently available for this account.</string>
     <string name="server_device_trust_copy">Device trust and pending requests are server data.</string>
@@ -216,10 +233,10 @@
     <string name="terminal_error_snapshot_install">The verified snapshot could not be installed into the Android terminal renderer.</string>
     <string name="terminal_error_history_not_ready">No current snapshot is available and the encrypted event history has not finished uploading a continuous prefix yet.</string>
     <string name="terminal_error_history_gap">No current snapshot is available and the encrypted event history does not start at sequence 1 or contains a permanent gap.</string>
-    <string name="terminal_error_history_replay_limit">The session has no current snapshot and its event prefix exceeds the bounded 4096-event cold-start replay limit.</string>
     <string name="terminal_error_history_replay">The continuous encrypted event history could not be verified, decrypted, or applied safely.</string>
     <string name="terminal_error_snapshot_unsupported">The Windows Agent determined that this terminal stream cannot currently be represented as a portable snapshot.</string>
     <string name="terminal_error_snapshot_production_failed">The Windows Agent failed while producing or persisting the portable terminal snapshot.</string>
+    <string name="terminal_error_local_storage_full">Android does not have enough local storage to cache the encrypted terminal history safely.</string>
     <string name="terminal_error_realtime_connection">The realtime session channel could not be established.</string>
     <string name="terminal_error_control_lease">Another client still holds the session control lease.</string>
     <string name="terminal_error_unknown">The session could not be opened because of an unclassified local or transport failure.</string>
@@ -238,6 +255,7 @@
     <string name="terminal_error_action_refresh_keys">Action: refresh trusted devices; if keys changed, let Windows publish a new snapshot.</string>
     <string name="terminal_error_action_update">Action: update TermLink on Android and Windows to compatible versions.</string>
     <string name="terminal_error_action_wait_lease">Action: wait for the other controller or the 30-second lease timeout, then retry.</string>
+    <string name="terminal_error_action_free_storage">Action: free some Android storage, then reopen the session. Cached encrypted history may be reused.</string>
     <string name="terminal_waiting_lease">Terminals stay read only until a server control lease is granted.</string>
     <string name="terminal_key_escape">Esc</string><string name="terminal_key_tab">Tab</string><string name="terminal_key_enter">Enter</string><string name="terminal_key_ctrl_c">Ctrl+C</string>
     <string name="arrow_left">Left arrow</string><string name="arrow_up">Up arrow</string><string name="arrow_down">Down arrow</string><string name="arrow_right">Right arrow</string>
@@ -307,6 +325,8 @@
     <string name="update_optional">Optional update available: %1$s</string>
     <string name="update_required">Required update: %1$s</string>
     <string name="update_error">Update check failed</string>
+    <string name="update_error_detail">The update service could not be checked. Verify the network and try again.</string>
+    <string name="update_download_failed">The update could not be downloaded or verified. Try again.</string>
     <string name="update_dialog_title">Update available: %1$s</string>
     <string name="update_dialog_build_size">Build %1$d · %2$s</string>
     <string name="update_dialog_release_notes">What’s new</string>

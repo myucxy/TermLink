@@ -23,6 +23,7 @@ internal static class Program
 
             await ValidateSignalInterruptsLongRetryAsync(waitMethod);
             await ValidateExistingSignalIsConsumedAsync(waitMethod);
+            await ValidateKnownWorkBypassesConsumedSignalAsync(waitMethod);
             await ValidateTimeoutDoesNotCreateSignalAsync(waitMethod);
             await ValidateCancellationInterruptsLongRetryAsync(waitMethod);
 
@@ -44,6 +45,7 @@ internal static class Program
             waitMethod,
             signal,
             TimeSpan.FromSeconds(30),
+            retryImmediately: false,
             CancellationToken.None);
         Require(!wait.IsCompleted, "Long history retry wait completed before a signal arrived.");
 
@@ -66,10 +68,29 @@ internal static class Program
             waitMethod,
             signal,
             TimeSpan.FromSeconds(30),
+            retryImmediately: false,
             CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2));
 
         Require(signaled && signal.CurrentCount == 0,
             "A history signal queued before the retry wait was lost or left unconsumed.");
+    }
+
+    private static async Task ValidateKnownWorkBypassesConsumedSignalAsync(MethodInfo waitMethod)
+    {
+        using var signal = new SemaphoreSlim(0, 1);
+        var stopwatch = Stopwatch.StartNew();
+        var ready = await InvokeWait(
+            waitMethod,
+            signal,
+            TimeSpan.FromSeconds(30),
+            retryImmediately: true,
+            CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2));
+        stopwatch.Stop();
+
+        Require(ready && stopwatch.Elapsed < TimeSpan.FromSeconds(2),
+            "Known superseding history work fell into the 30-second transport backoff after its signal was consumed.");
+        Require(signal.CurrentCount == 0,
+            "Immediate history retry manufactured a semaphore signal.");
     }
 
     private static async Task ValidateTimeoutDoesNotCreateSignalAsync(MethodInfo waitMethod)
@@ -80,6 +101,7 @@ internal static class Program
             waitMethod,
             signal,
             TimeSpan.FromMilliseconds(75),
+            retryImmediately: false,
             CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2));
         stopwatch.Stop();
 
@@ -92,6 +114,7 @@ internal static class Program
             waitMethod,
             signal,
             TimeSpan.FromSeconds(30),
+            retryImmediately: false,
             CancellationToken.None);
         var completed = await Task.WhenAny(secondWait, Task.Delay(TimeSpan.FromMilliseconds(150)));
         Require(completed != secondWait,
@@ -112,6 +135,7 @@ internal static class Program
             waitMethod,
             signal,
             TimeSpan.FromSeconds(30),
+            retryImmediately: false,
             cancellation.Token);
         Require(!wait.IsCompleted, "Cancelable history retry wait completed before cancellation.");
 
@@ -133,11 +157,14 @@ internal static class Program
         MethodInfo waitMethod,
         SemaphoreSlim signal,
         TimeSpan delay,
+        bool retryImmediately,
         CancellationToken token)
     {
         try
         {
-            return (Task<bool>)waitMethod.Invoke(null, new object[] { signal, delay, token });
+            return (Task<bool>)waitMethod.Invoke(
+                null,
+                new object[] { signal, delay, retryImmediately, token });
         }
         catch (TargetInvocationException error) when (error.InnerException != null)
         {

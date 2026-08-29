@@ -43,20 +43,30 @@ function Start-FakeAgentStatusServer {
 try {
     `$server.WaitForConnection()
     `$request = [TermLink.Agent.RegistryControlCodec]::ReadRequest(`$server)
-    if (`$request.Command -ne [TermLink.Agent.RegistryCommand]::RefreshProductionStatus) {
-        throw 'Unexpected Agent command.'
+    `$secret = [TermLink.Agent.RegistryControlSecretStore]::LoadDefault()
+    try {
+        if (-not [TermLink.Agent.RegistryControlAuthentication]::Verify(`$request, `$secret, [DateTime]::UtcNow)) {
+            throw 'Agent request authentication failed.'
+        }
+        if (`$request.Command -ne [TermLink.Agent.RegistryCommand]::RefreshProductionStatus) {
+            throw 'Unexpected Agent command.'
+        }
+        `$production = [TermLink.Agent.ProductionStatus]::new()
+        `$production.Configured = [bool]::Parse('$($AccountLinked.ToString().ToLowerInvariant())')
+        `$production.AccountLinked = [bool]::Parse('$($AccountLinked.ToString().ToLowerInvariant())')
+        `$production.ServerOrigin = '$quotedOrigin'
+        `$production.TerminalSnapshotEnabled = [bool]::Parse('$($TerminalSnapshotEnabled.ToString().ToLowerInvariant())')
+        `$production.RelayState = [TermLink.Agent.ProductionRelayState]::$RelayState
+        `$response = [TermLink.Agent.RegistryResponse]::new()
+        `$response.Success = [bool]::Parse('$($Success.ToString().ToLowerInvariant())')
+        `$response.RemoteAccessEnabled = [bool]::Parse('$($RemoteAccessEnabled.ToString().ToLowerInvariant())')
+        `$response.Production = `$production
+        [TermLink.Agent.RegistryControlAuthentication]::PrepareResponse(`$response, `$request, `$secret)
+        [TermLink.Agent.RegistryControlCodec]::WriteResponse(`$server, `$response, `$request.ProtocolVersion)
     }
-    `$production = [TermLink.Agent.ProductionStatus]::new()
-    `$production.Configured = [bool]::Parse('$($AccountLinked.ToString().ToLowerInvariant())')
-    `$production.AccountLinked = [bool]::Parse('$($AccountLinked.ToString().ToLowerInvariant())')
-    `$production.ServerOrigin = '$quotedOrigin'
-    `$production.TerminalSnapshotEnabled = [bool]::Parse('$($TerminalSnapshotEnabled.ToString().ToLowerInvariant())')
-    `$production.RelayState = [TermLink.Agent.ProductionRelayState]::$RelayState
-    `$response = [TermLink.Agent.RegistryResponse]::new()
-    `$response.Success = [bool]::Parse('$($Success.ToString().ToLowerInvariant())')
-    `$response.RemoteAccessEnabled = [bool]::Parse('$($RemoteAccessEnabled.ToString().ToLowerInvariant())')
-    `$response.Production = `$production
-    [TermLink.Agent.RegistryControlCodec]::WriteResponse(`$server, `$response)
+    finally {
+        if (`$null -ne `$secret) { [Array]::Clear(`$secret, 0, `$secret.Length) }
+    }
 }
 finally {
     `$server.Dispose()
@@ -122,13 +132,29 @@ Assert-True ($targetModeValues.Count -eq 2 -and
 Assert-True ($source.Contains("Get-ManifestTool 'android-sdk'")) 'The runner does not select ADB through D:\Dev.'
 Assert-True ($source.Contains("Get-ManifestTool 'dotnet'")) 'The runner does not preflight the D:\Dev .NET SDK.'
 Assert-True ($source.Contains("Get-ManifestTool 'go'")) 'The runner does not preflight the D:\Dev Go toolchain.'
-Assert-True ($source.Contains('$markerCount = 1000')) 'The runner does not fix the marker count at 1000.'
+Assert-True ($source.Contains('$snapshotMarkerCount = 1000')) `
+    'The Snapshot/Transcript runner does not retain its exact 1000-marker fixture.'
+Assert-True ($source.Contains('$streamedPrefixMarkerCount = 5200')) `
+    'The streamed Chunk-prefix runner does not emit enough independently flushed events.'
+Assert-True ($source.Contains('$streamedPrefixMinimumTail = [uint64]4097')) `
+    'The streamed Chunk-prefix runner does not gate open beyond the 4096-event window.'
+foreach ($streamedProof in @(
+    "'streamed-prefix-ack-exceeds-4096'",
+    "'streamed-prefix-bootstrap-source'",
+    "'streamed-prefix-first-marker-visible'",
+    "'streamed-prefix-last-marker-visible'",
+    "'streamed-prefix-live-ack-advanced'",
+    "'streamed-prefix-live-marker-visible'"
+)) {
+    Assert-True ($source.Contains($streamedProof)) `
+        "The streamed Chunk-prefix scenario lacks proof $streamedProof."
+}
 foreach ($rangeProof in @(
-    'request_before = [uint64]1001; first = [uint64]825; last = [uint64]1000',
-    'request_before = [uint64]825; first = [uint64]625; last = [uint64]824',
-    'request_before = [uint64]625; first = [uint64]425; last = [uint64]624',
-    'request_before = [uint64]425; first = [uint64]225; last = [uint64]424',
-    'request_before = [uint64]225; first = [uint64]25; last = [uint64]224'
+    'request_before = [uint64]977; first = [uint64]801; last = [uint64]976',
+    'request_before = [uint64]801; first = [uint64]601; last = [uint64]800',
+    'request_before = [uint64]601; first = [uint64]401; last = [uint64]600',
+    'request_before = [uint64]401; first = [uint64]201; last = [uint64]400',
+    'request_before = [uint64]201; first = [uint64]1; last = [uint64]200'
 )) {
     Assert-True ($source.Contains($rangeProof)) "The runner lacks exact transcript range '$rangeProof'."
 }
@@ -142,6 +168,12 @@ Assert-True ($source.Contains("'shell', 'am', 'broadcast', '--async', '-a', `$ho
     'The runner blocks on the open_session broadcast before SessionHost can start.'
 Assert-True ($source.Contains('$invalidJsonSeen = $true')) `
     'The asynchronous hook reader does not tolerate an in-progress AtomicFile write.'
+Assert-True ($source.Contains('$script:hookFailureCode = $stableFailureCode')) `
+    'The runner does not retain a validated Debug hook failure_code for evidence.'
+Assert-True ($source.Contains("reported failure_code '`$stableFailureCode'.")) `
+    'The runner public error does not expose the validated stable Debug hook failure_code.'
+Assert-True ($source.Contains('hook_failure_code = $script:hookFailureCode')) `
+    'The runner failure evidence does not expose the validated stable Debug hook failure_code.'
 Assert-True ($source.Contains('E2E_HOOK_CONTRACT_MISSING')) 'The missing Debug hook does not have an explicit failure code.'
 Assert-True ($source.Contains("'TermLink.AgentControl.dll'")) 'The runner does not load AgentControl beside SessionHost.'
 Assert-True ($source.Contains("'RefreshProductionStatus'")) 'The runner does not request refreshed Agent production status.'
@@ -219,7 +251,10 @@ foreach ($initialAssertion in @(
     "'history-initial-load-bounded-rows'",
     "'history-initial-load-exact-row-count'",
     "'history-initial-load-transcript-count'",
+    "'history-initial-load-snapshot-cache-matches-rebase'",
     "'history-initial-load-viewport-changed'",
+    "'history-initial-load-snapshot-rebase-covered-by-ack'",
+    "'history-initial-load-live-ack-not-regressed'",
     "'history-initial-request-cursor'",
     "'history-initial-first-line'",
     "'history-initial-last-line'",
@@ -229,6 +264,20 @@ foreach ($initialAssertion in @(
     Assert-True ($initialHistorySource.Contains($initialAssertion)) `
         "The initial history load lacks required proof '$initialAssertion'."
 }
+Assert-True ($initialHistorySource.Contains(
+    '$overlayObservation.snapshot_sequence_s -le $overlayObservation.live_ack'
+)) 'The initial Snapshot rebase is not fenced by its same-response durable ACK.'
+Assert-True ($initialHistorySource.Contains('$fixedAck = $overlayObservation.live_ack')) `
+    'Continuation pages are not pinned to the ACK sampled with the rebased Snapshot.'
+Assert-True ($initialHistorySource.Contains(
+    '$overlayObservation.snapshot_sequence_s -ge $initialSnapshot')) `
+    'The initial history load does not reject a regressing Snapshot rebase.'
+Assert-True ($initialHistorySource.Contains(
+    '$overlayObservation.live_ack -ge $fixedAck')) `
+    'The initial history load permits the durable live ACK to regress.'
+Assert-True ($initialHistorySource.Contains(
+    '$fixedSnapshot = $overlayObservation.snapshot_sequence_s')) `
+    'Transcript continuation pages are not fixed to the authenticated rebased Snapshot.'
 
 $paginationFunction = @($ast.FindAll({
     param($node)
@@ -260,6 +309,9 @@ foreach ($paginationProof in @(
 Assert-True ($paginationSource.Contains('$Previous.transcript_count + 1')) `
     'Pagination does not require the transcript cache count to advance exactly once.'
 Assert-True ($paginationSource.Contains(
+    '$observation.snapshot_count -eq $Previous.snapshot_count')) `
+    'Pagination does not keep the authenticated Snapshot cache fixed after the initial rebase.'
+Assert-True ($paginationSource.Contains(
     '$SeenViewportSignatures.Add($observation.viewport_signature)')) `
     'Pagination does not reject a duplicate rendered viewport.'
 
@@ -279,18 +331,31 @@ foreach ($failureProof in @(
     "'offline-probe-has-unloaded-page'",
     "'offline-probe-request-cursor'",
     "expected_result = 'transcript_load_failed'",
+    "'history-offline-baseline'",
+    "'offline-baseline-observed-network-loss'",
+    "'offline-baseline-history-objects'",
     "'failure-retains-history-objects'",
     "'failure-retains-viewport'",
     "'failure-retains-grid-columns'",
     "'failure-retains-grid-rows'",
     "'02a-failed-page-retained.png'",
-    'Set-AndroidAirplaneMode $false'
+    'Set-AndroidAirplaneMode $false',
+    "'history-network-recovery'",
+    '[DateTime]::UtcNow.AddSeconds($ObservationTimeoutSeconds)',
+    "'online-retry-observed-network-recovery'",
+    "'online-retry-retains-history-objects'",
+    "realtime_socket_state -ceq 'CONNECTED'",
+    "realtime_transport_state -ceq 'CONNECTED'",
+    "realtime_remote_state -ceq 'CONTROLLING'"
 )) {
     Assert-True ($failureRetentionSource.Contains($failureProof)) `
         "The controlled history failure lacks required proof '$failureProof'."
 }
 Assert-True ($failureRetentionSource.Contains("[string]`$failedPage.failure_code -ceq 'TRANSCRIPT_LOAD_FAILED'")) `
     'The offline probe accepts a generic OPERATION_FAILED response.'
+Assert-True ($failureRetentionSource.Contains(
+    '$retainedObservation.viewport_signature -ceq $offlineBaselineObservation.viewport_signature')) `
+    'Failure retention is not measured from the immediate post-network-transition viewport.'
 $finalRetryIndex = $source.IndexOf("`$script:stage = 'history-final-page-retry'", [StringComparison]::Ordinal)
 Assert-True ($finalRetryIndex -gt $failureRetentionStart -and $finalRetryIndex -lt $liveFlowStart) `
     'The final transcript page is not retried online before the live-flow stage.'
@@ -530,6 +595,8 @@ $message = Get-FailureMessage { & $scriptPath @common -ArtifactRunId '..\escape'
 Assert-True ($message -match 'ArtifactRunId') 'ArtifactRunId accepted path traversal.'
 $message = Get-FailureMessage { & $scriptPath @common -TargetMode 'UnknownTarget' }
 Assert-True ($message -match 'TargetMode') 'The runner accepted an unknown target mode.'
+$message = Get-FailureMessage { & $scriptPath @common -HistoryBootstrapMode 'UnknownBootstrap' }
+Assert-True ($message -match 'HistoryBootstrapMode') 'The runner accepted an unknown history bootstrap mode.'
 
 # Exercise the missing-hook failure before Docker/ADB touches a device. Both the
 # fake APK and the runner evidence live under repository artifacts.
@@ -635,6 +702,38 @@ try {
             'Ready-Agent evidence contains a sensitive or identity-bearing field.'
     }
     finally { Stop-FakeAgentStatusServer $positiveServer }
+
+    $streamedRunId = "static-agent-streamed-$testId"
+    $streamedRunDirectory = Join-Path $repositoryRoot "artifacts\tail-first-e2e\$streamedRunId"
+    $agentRunDirectories.Add($streamedRunDirectory)
+    Assert-True ([IO.Path]::GetFullPath($streamedRunDirectory).StartsWith(
+        $artifactsPrefix,
+        [StringComparison]::OrdinalIgnoreCase)) 'Streamed-Agent cleanup target escaped repository artifacts.'
+    $streamedPipe = "termlink-tail-first-streamed-$testId"
+    $streamedServer = Start-FakeAgentStatusServer `
+        $fixtureAgentControl `
+        $streamedPipe `
+        ([string]$contract.server_origin) `
+        -TerminalSnapshotEnabled $false
+    try {
+        $streamedArguments = $common.Clone()
+        $streamedArguments.AndroidApkPath = $validApk
+        $streamedArguments.SessionHostPath = $fixtureSessionHost
+        $streamedArguments.AgentControlPipe = $streamedPipe
+        $streamedArguments.DockerPath = 'termlink-intentionally-missing-docker'
+        $streamedArguments.ArtifactRunId = $streamedRunId
+        $streamedArguments.HistoryBootstrapMode = 'StreamedChunkPrefix'
+        $message = Get-FailureMessage { & $scriptPath @streamedArguments }
+        Assert-True ($message -match 'DOCKER_UNAVAILABLE') `
+            'A Snapshot-disabled Agent did not advance streamed Chunk-prefix mode to the Docker preflight boundary.'
+        $streamedEvidencePath = Join-Path $streamedRunDirectory 'evidence.json'
+        $streamedEvidence = Get-Content -Raw -LiteralPath $streamedEvidencePath | ConvertFrom-Json
+        Assert-True (-not [bool]$streamedEvidence.preflight.windows_agent.terminal_snapshot_enabled) `
+            'Streamed-Agent evidence did not record the disabled Snapshot producer.'
+        Assert-True ([string]$streamedEvidence.inputs.history_bootstrap_mode -eq 'StreamedChunkPrefix') `
+            'Streamed-Agent evidence did not record the selected bootstrap mode.'
+    }
+    finally { Stop-FakeAgentStatusServer $streamedServer }
 
     $negativeCases = @(
         [pscustomobject]@{ Name = 'remote-disabled'; Expected = 'WINDOWS_AGENT_REMOTE_ACCESS_DISABLED'; Options = @{ RemoteAccessEnabled = $false } }

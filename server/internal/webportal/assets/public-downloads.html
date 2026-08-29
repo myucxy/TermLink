@@ -1,0 +1,36 @@
+{{template "public-page-start" .}}
+<section class="public-intro" aria-labelledby="public-title">
+  <p class="eyebrow">STABLE DOWNLOADS</p>
+  <h1 id="public-title">下载 TermLink</h1>
+  <p>{{.Description}}下载前可核对文件名、大小与 SHA-256。</p>
+</section>
+
+<section class="public-card-grid download-grid" aria-label="稳定版本下载" data-release-grid>
+  {{range .Releases}}
+  <article class="public-card release-card" data-platform-card="{{.Target.Platform}}">
+    <div class="card-heading-row">
+      <div><span class="platform-mark" aria-hidden="true">{{if eq .Target.Platform "android"}}A{{else}}W{{end}}</span><h2>{{.Target.DisplayName}}</h2></div>
+      {{if .Available}}<span class="state-pill state-operational">稳定版</span>{{else}}<span class="state-pill state-unavailable">暂不可用</span>{{end}}
+    </div>
+    {{if .Available}}
+      <p class="release-version">v{{.Release.Version}} <span>Build {{.Release.Build}}</span></p>
+      <dl class="release-metadata">
+        <div><dt>发布时间</dt><dd>{{.PublishedDate}}</dd></div>
+        <div><dt>文件大小</dt><dd>{{.SizeLabel}}</dd></div>
+        <div><dt>最低系统</dt><dd>{{if .Release.MinimumOS}}{{.Release.MinimumOS}}{{else}}以安装程序检查为准{{end}}</dd></div>
+        <div><dt>文件名</dt><dd>{{.Release.ArtifactFilename}}</dd></div>
+      </dl>
+      <div class="checksum-block"><span>SHA-256</span><code>{{.Release.SHA256}}</code></div>
+      <a class="button button-primary card-action" href="{{.Release.DownloadURL}}" rel="noopener noreferrer">下载 {{.Target.DisplayName}}</a>
+    {{else}}
+      <div class="unavailable-panel"><strong>暂不可用</strong><p>目前无法从正式发布源确认该平台的完整产物信息，请稍后重试。</p></div>
+    {{end}}
+  </article>
+  {{end}}
+</section>
+
+<aside class="public-note" aria-label="安装提示">
+  <strong>安装提示</strong>
+  <p>Android 覆盖安装要求签名与已安装版本一致；Windows 安装器可能需要管理员权限。请只使用本页展示的稳定通道产物。</p>
+</aside>
+{{template "public-page-end" .}}

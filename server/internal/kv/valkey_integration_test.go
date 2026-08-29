@@ -322,6 +322,55 @@ func TestReserveLiveSessionDoesNotApplyLegacyQuota(t *testing.T) {
 	}
 }
 
+func TestReserveLiveSessionsBatchesOneDeviceRegistryUpdate(t *testing.T) {
+	redisURL := strings.TrimSpace(os.Getenv("TERMLINK_INTEGRATION_REDIS_URL"))
+	if redisURL == "" {
+		t.Skip("TERMLINK_INTEGRATION_REDIS_URL is required for the real Valkey batch reservation test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	valkey, err := Open(ctx, redisURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, deviceID := uuid.New(), uuid.New()
+	sessionIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+	key := "live-sessions:" + userID.String()
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cleanupCancel()
+		_ = valkey.Client.Del(cleanupContext, key).Err()
+		_ = valkey.Close()
+	})
+
+	if err := valkey.ReserveLiveSessions(ctx, userID, sessionIDs, deviceID); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := valkey.Client.ZCard(ctx, key).Result(); err != nil || count != int64(len(sessionIDs)) {
+		t.Fatalf("batch registry count/error = %d/%v, want %d/nil", count, err, len(sessionIDs))
+	}
+	for _, sessionID := range sessionIDs {
+		score, err := valkey.Client.ZScore(ctx, key, sessionID.String()+":"+deviceID.String()).Result()
+		if err != nil || score <= float64(time.Now().UnixMilli()) {
+			t.Fatalf("batch member %s score/error = %f/%v", sessionID, score, err)
+		}
+	}
+}
+
+func TestReserveLiveSessionsRejectsUnboundedOrInvalidBatchBeforeValkey(t *testing.T) {
+	valkey := &Valkey{}
+	tooMany := make([]uuid.UUID, maxLiveSessionReservationBatch+1)
+	for index := range tooMany {
+		tooMany[index] = uuid.New()
+	}
+	if err := valkey.ReserveLiveSessions(context.Background(), uuid.New(), tooMany, uuid.New()); err == nil {
+		t.Fatal("unbounded batch was accepted")
+	}
+	if err := valkey.ReserveLiveSessions(context.Background(), uuid.New(), []uuid.UUID{uuid.Nil}, uuid.New()); err == nil {
+		t.Fatal("nil session ID was accepted")
+	}
+}
+
 // TestForceReleasePreservesReplacementLease uses a real Valkey instance. The
 // hook makes the historical GET/PTTL/DEL implementation fail deterministically:
 // after it has read the old lease, another actor releases that lease and

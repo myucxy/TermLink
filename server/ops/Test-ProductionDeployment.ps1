@@ -3,10 +3,9 @@ param(
     [Parameter(Mandatory)]
     [string]$EnvFile,
     [string[]]$ComposeFile = @(
-        (Join-Path $PSScriptRoot '..\compose\core.compose.yml'),
-        (Join-Path $PSScriptRoot '..\compose\history.compose.yml'),
-        (Join-Path $PSScriptRoot '..\compose\observability.compose.yml')
-    )
+        (Join-Path $PSScriptRoot '..\compose\core.compose.yml')
+    ),
+    [bool]$IncludeEdge = $true
 )
 
 $ErrorActionPreference = 'Stop'
@@ -127,12 +126,122 @@ function Assert-ProductionHttpsUri {
     return $uri
 }
 
+function Convert-ProductionSizeToBytes {
+    param([string]$Value, [string]$Name)
+    $match = [regex]::Match($Value, '^(?<count>[1-9][0-9]*)(?<unit>[kKmMgG])(?:[bB])?$')
+    Assert-Production $match.Success "$Name must use a positive k, m, or g byte-size value."
+    $multiplier = switch ($match.Groups['unit'].Value.ToLowerInvariant()) {
+        'k' { 1KB }
+        'm' { 1MB }
+        'g' { 1GB }
+    }
+    $count = 0L
+    Assert-Production ([long]::TryParse($match.Groups['count'].Value, [ref]$count) -and
+        $count -le [long]::MaxValue / [long]$multiplier) "$Name exceeds the supported byte-size range."
+    return $count * [long]$multiplier
+}
+
+function Test-AccountDeletionAES256KeyEncoding {
+    param([object]$Value)
+
+    if ($Value -isnot [string]) { return $false }
+    $encoded = [string]$Value
+    $validEncoding = $encoded -cmatch '^[A-Za-z0-9+/]{43}=$' -or
+        $encoded -cmatch '^[A-Za-z0-9_-]{43}=?$'
+    if (-not $validEncoding) { return $false }
+    $normalized = $encoded.Replace('-', '+').Replace('_', '/')
+    while (($normalized.Length % 4) -ne 0) { $normalized += '=' }
+    $bytes = $null
+    try { $bytes = [Convert]::FromBase64String($normalized) } catch { return $false }
+    try { return $bytes.Length -eq 32 }
+    finally {
+        if ($null -ne $bytes) { [Array]::Clear($bytes, 0, $bytes.Length) }
+        $encoded = $null
+        $normalized = $null
+    }
+}
+
+function Assert-AccountDeletionIdentityKeyMaterial {
+    param(
+        [Parameter(Mandatory)][string]$Value,
+        [Parameter(Mandatory)][int]$CurrentVersion
+    )
+
+    if (Test-AccountDeletionAES256KeyEncoding -Value $Value) { return }
+    Assert-Production ($Value.StartsWith('[', [StringComparison]::Ordinal)) `
+        'Account deletion identity key must be one AES-256 key or a bounded versioned keyring.'
+    $parsed = $null
+    try { $parsed = @($Value | ConvertFrom-Json -Depth 5) }
+    catch {
+        throw 'Account deletion identity keyring must be valid strict JSON.'
+    }
+    Assert-Production ($parsed.Count -ge 1 -and $parsed.Count -le 32) `
+        'Account deletion identity keyring must contain between 1 and 32 entries.'
+    $versions = [Collections.Generic.HashSet[int]]::new()
+    $currentVersionFound = $false
+    foreach ($entry in $parsed) {
+        Assert-Production ($null -ne $entry -and $entry -is [Management.Automation.PSCustomObject]) `
+            'Account deletion identity keyring entries must be JSON objects.'
+        $propertyNames = @($entry.PSObject.Properties.Name | Sort-Object)
+        Assert-Production (@(Compare-Object @('key', 'version') $propertyNames).Count -eq 0) `
+            'Account deletion identity keyring entries must contain only version and key.'
+        $versionValue = Get-PropertyValue $entry 'version'
+        Assert-Production ($versionValue -is [int] -or $versionValue -is [long]) `
+            'Account deletion identity keyring version must be an integer.'
+        $version = [long]$versionValue
+        Assert-Production ($version -ge 1 -and $version -le 32767) `
+            'Account deletion identity keyring version is outside the supported range.'
+        Assert-Production ($versions.Add([int]$version)) `
+            'Account deletion identity keyring contains a duplicate version.'
+        Assert-Production (Test-AccountDeletionAES256KeyEncoding -Value (Get-PropertyValue $entry 'key')) `
+            'Account deletion identity keyring contains a key that is not exactly 32 decoded bytes.'
+        if ($version -eq $CurrentVersion) { $currentVersionFound = $true }
+    }
+    Assert-Production $currentVersionFound `
+        'Account deletion identity keyring does not contain the configured current version.'
+}
+
 $envPath = [IO.Path]::GetFullPath($EnvFile)
 Assert-Production (Test-Path -LiteralPath $envPath -PathType Leaf) "Environment file not found: $envPath"
 $composeFiles = @(Resolve-TermLinkComposeFiles -ComposeFile $ComposeFile)
+$coreComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\core.compose.yml'))
+$historyComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\history.compose.yml'))
+$observabilityComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\observability.compose.yml'))
+$externalServicesComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\external-services.compose.yml'))
+$commerceComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\commerce.compose.yml'))
+$registrationRecoveryComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\registration-recovery.compose.yml'))
+$accountDeletionComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\account-deletion.compose.yml'))
+$reviewedComposePaths = @(
+    $coreComposePath,
+    $historyComposePath,
+    $observabilityComposePath,
+    $externalServicesComposePath,
+    $commerceComposePath,
+    $registrationRecoveryComposePath,
+    $accountDeletionComposePath
+)
+foreach ($composeFile in $composeFiles) {
+    Assert-Production ($reviewedComposePaths -contains $composeFile) `
+        "Compose file is not part of the reviewed production matrix: $composeFile"
+}
+Assert-Production (@($composeFiles | Sort-Object -Unique).Count -eq $composeFiles.Count) `
+    'Production Compose files must not be supplied more than once.'
+$historyOverlayRequested = $composeFiles -contains $historyComposePath
+$observabilityOverlayRequested = $composeFiles -contains $observabilityComposePath
+$externalServicesOverlayRequested = $composeFiles -contains $externalServicesComposePath
+$commerceOverlayRequested = $composeFiles -contains $commerceComposePath
+$registrationRecoveryOverlayRequested = $composeFiles -contains $registrationRecoveryComposePath
+$accountDeletionOverlayRequested = $composeFiles -contains $accountDeletionComposePath
+Assert-Production ($composeFiles -contains $coreComposePath) `
+    'Production validation requires the reviewed core.compose.yml foundation.'
+Assert-Production (-not ($historyOverlayRequested -and $externalServicesOverlayRequested)) `
+    'history.compose.yml and external-services.compose.yml are mutually exclusive history providers.'
+Assert-Production (-not $accountDeletionOverlayRequested -or
+    $historyOverlayRequested -or $externalServicesOverlayRequested) `
+    'account-deletion.compose.yml requires one reviewed History/S3 provider.'
 $arguments = @('compose', '--env-file', $envPath, '--project-name', 'termlink-policy')
 foreach ($file in $composeFiles) { $arguments += @('-f', $file) }
-$arguments += @('--profile', 'edge')
+if ($IncludeEdge) { $arguments += @('--profile', 'edge') }
 $arguments += @('config', '--format', 'json')
 $rendered = Invoke-TermLinkDocker -Arguments $arguments
 try {
@@ -143,10 +252,16 @@ catch {
 }
 
 $services = @($config.services.PSObject.Properties)
-$requiredServices = @('alertmanager', 'blackbox', 'edge', 'grafana', 'migrate', 'minio', 'postgres', 'prometheus', 'server', 'valkey')
+$requiredServices = @('migrate', 'postgres', 'server', 'valkey')
+if ($IncludeEdge) { $requiredServices += 'edge' }
+if ($historyOverlayRequested) { $requiredServices += 'minio' }
+if ($observabilityOverlayRequested) {
+    $requiredServices += @('alertmanager', 'blackbox', 'grafana', 'prometheus')
+}
+$requiredServices = @($requiredServices | Sort-Object)
 $actualServices = @($services.Name | Sort-Object)
 Assert-Production (@(Compare-Object $requiredServices $actualServices).Count -eq 0) `
-    "Production Compose services differ from the reviewed full stack: $($actualServices -join ', ')"
+    "Production Compose services differ from the reviewed core/overlay selection: $($actualServices -join ', ')"
 $approvedImages = @{
     edge = 'caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c'
     postgres = 'postgres:17.5-alpine3.22@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa'
@@ -158,44 +273,62 @@ $approvedImages = @{
     grafana = 'grafana/grafana:11.2.0@sha256:408afb9726de5122b00a2576763a8a57a3c86d5b0eff5305bc994ceb3eb96c3f'
 }
 $expectedNetworks = @{
-    edge = @('frontend', 'object', 'public'); migrate = @('backend'); server = @('backend', 'egress', 'frontend', 'object-control')
+    edge = @('frontend', 'public'); migrate = @('backend'); server = @('backend', 'egress', 'frontend')
     postgres = @('backend'); valkey = @('backend'); minio = @('object', 'object-control')
     # Metrics and readiness probes use frontend to reach the application's
     # internal listeners.  Alertmanager also needs egress for configured
     # receivers; no observability service needs backend access.
     prometheus = @('frontend'); blackbox = @('frontend'); alertmanager = @('egress', 'frontend'); grafana = @('frontend')
 }
+if ($historyOverlayRequested) {
+    $expectedNetworks.edge = @('frontend', 'object', 'public')
+    $expectedNetworks.server = @('backend', 'egress', 'frontend', 'object-control')
+}
+$connectionEnvironment = @(
+    'TERMLINK_POSTGRES_CONNECT_TIMEOUT', 'TERMLINK_POSTGRES_HEALTH_CHECK_PERIOD',
+    'TERMLINK_POSTGRES_MAX_CONN_IDLE_TIME', 'TERMLINK_POSTGRES_MAX_CONN_LIFETIME',
+    'TERMLINK_POSTGRES_MAX_CONNS', 'TERMLINK_POSTGRES_MIN_CONNS',
+    'TERMLINK_REDIS_DIAL_TIMEOUT', 'TERMLINK_REDIS_MIN_IDLE_CONNS',
+    'TERMLINK_REDIS_POOL_SIZE', 'TERMLINK_REDIS_POOL_TIMEOUT',
+    'TERMLINK_REDIS_READ_TIMEOUT', 'TERMLINK_REDIS_WRITE_TIMEOUT'
+)
 $allowedEnvironment = @{
     edge = @('TERMLINK_ACME_CA', 'TERMLINK_ACME_EMAIL', 'TERMLINK_HISTORY_PUBLIC_HOST', 'TERMLINK_PUBLIC_HOST')
     # Keep the migration allow-list to the core server configuration.  It
     # deliberately excludes history credentials, which are only merged into
     # the long-running server by history.compose.yml.
-    migrate = @('TERMLINK_ANDROID_OIDC_CLIENT_ID', 'TERMLINK_ANDROID_OIDC_REDIRECT_URI',
+    migrate = @('TERMLINK_ACCOUNT_DELETION_ENABLED', 'TERMLINK_ANDROID_OIDC_CLIENT_ID', 'TERMLINK_ANDROID_OIDC_REDIRECT_URI',
         'TERMLINK_DATABASE_URL_FILE', 'TERMLINK_HISTORY_ENABLED', 'TERMLINK_LISTEN_ADDR',
         'TERMLINK_LOG_LEVEL', 'TERMLINK_OIDC_ALLOWED_PARTIES', 'TERMLINK_OIDC_CLIENT_ID', 'TERMLINK_OIDC_CLIENT_SECRET_FILE',
         'TERMLINK_OIDC_ISSUER', 'TERMLINK_PUBLIC_URL', 'TERMLINK_REDIS_URL_FILE',
-        'TERMLINK_S3_ENDPOINT', 'TERMLINK_TOKEN_SIGNING_KEY_FILE',
+        'TERMLINK_REGISTRATION_RECOVERY_ENABLED', 'TERMLINK_TOKEN_SIGNING_KEY_FILE',
         'TERMLINK_WINDOWS_OIDC_CLIENT_ID', 'TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES', 'TERMLINK_WINDOWS_OIDC_REDIRECT_URI',
         'TERMLINK_WEB_OIDC_CLIENT_ID', 'TERMLINK_WEB_OIDC_REDIRECT_URI')
     # The server receives the same public OIDC settings as migrate, plus its
     # metrics and optional history settings.  Secret values must remain
     # file-backed; the validation below enforces /run/secrets paths.
-    server = @('TERMLINK_ANDROID_OIDC_CLIENT_ID', 'TERMLINK_ANDROID_OIDC_REDIRECT_URI',
+    server = @('TERMLINK_ACCOUNT_DELETION_ENABLED', 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE',
+        'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION', 'TERMLINK_ANDROID_OIDC_CLIENT_ID', 'TERMLINK_ANDROID_OIDC_REDIRECT_URI',
+        'TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS', 'TERMLINK_APPSHIP_BASE_URL',
         'TERMLINK_DATABASE_URL_FILE', 'TERMLINK_HISTORY_ENABLED', 'TERMLINK_LISTEN_ADDR',
+        'TERMLINK_KEYCLOAK_ADMIN_BASE_URL', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE',
         'TERMLINK_LOG_LEVEL', 'TERMLINK_METRICS_LISTEN_ADDR', 'TERMLINK_OIDC_ALLOWED_PARTIES', 'TERMLINK_OIDC_CLIENT_ID',
         'TERMLINK_OIDC_CLIENT_SECRET_FILE', 'TERMLINK_OIDC_ISSUER', 'TERMLINK_PUBLIC_URL',
-        'TERMLINK_REDIS_URL_FILE', 'TERMLINK_S3_ACCESS_KEY_FILE', 'TERMLINK_S3_BUCKET',
+        'TERMLINK_PAYMENT_SECRETS_DIR', 'TERMLINK_REDIS_URL_FILE', 'TERMLINK_REGISTRATION_RECOVERY_ENABLED',
+        'TERMLINK_S3_ACCESS_KEY_FILE', 'TERMLINK_S3_BUCKET',
         'TERMLINK_S3_ENDPOINT', 'TERMLINK_S3_PUBLIC_ENDPOINT', 'TERMLINK_S3_REGION',
         'TERMLINK_S3_SECRET_KEY_FILE', 'TERMLINK_TOKEN_SIGNING_KEY_FILE',
         'TERMLINK_WINDOWS_OIDC_CLIENT_ID', 'TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES', 'TERMLINK_WINDOWS_OIDC_REDIRECT_URI',
         'TERMLINK_WEB_OIDC_CLIENT_ID', 'TERMLINK_WEB_OIDC_REDIRECT_URI')
     postgres = @('POSTGRES_DB', 'POSTGRES_PASSWORD_FILE', 'POSTGRES_USER')
-    valkey = @()
+    valkey = @('TERMLINK_VALKEY_MAXMEMORY')
     minio = @('MINIO_ROOT_PASSWORD_FILE', 'MINIO_ROOT_USER_FILE')
     prometheus = @(); blackbox = @(); alertmanager = @()
     grafana = @('GF_AUTH_ANONYMOUS_ENABLED', 'GF_PATHS_DATA', 'GF_PATHS_LOGS', 'GF_PATHS_PLUGINS',
         'GF_PATHS_PROVISIONING', 'GF_SECURITY_ADMIN_PASSWORD__FILE', 'GF_SECURITY_ADMIN_USER', 'GF_USERS_ALLOW_SIGN_UP')
 }
+$allowedEnvironment.migrate = @($allowedEnvironment.migrate + $connectionEnvironment | Sort-Object -Unique)
+$allowedEnvironment.server = @($allowedEnvironment.server + $connectionEnvironment | Sort-Object -Unique)
 # Keep credential-bearing environment names explicit per service.  The
 # rendered allow-list above contains public settings (including OIDC client
 # IDs/redirect URIs) as well as file-backed credentials.  This second list is
@@ -205,8 +338,8 @@ $allowedSecretEnvironment = @{
     edge = @()
     migrate = @('TERMLINK_DATABASE_URL_FILE', 'TERMLINK_OIDC_CLIENT_SECRET_FILE',
         'TERMLINK_REDIS_URL_FILE', 'TERMLINK_TOKEN_SIGNING_KEY_FILE')
-    server = @('TERMLINK_DATABASE_URL_FILE', 'TERMLINK_OIDC_CLIENT_SECRET_FILE',
-        'TERMLINK_REDIS_URL_FILE', 'TERMLINK_S3_ACCESS_KEY_FILE',
+    server = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE', 'TERMLINK_DATABASE_URL_FILE', 'TERMLINK_OIDC_CLIENT_SECRET_FILE',
+        'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE', 'TERMLINK_REDIS_URL_FILE', 'TERMLINK_S3_ACCESS_KEY_FILE',
         'TERMLINK_S3_SECRET_KEY_FILE', 'TERMLINK_TOKEN_SIGNING_KEY_FILE')
     postgres = @('POSTGRES_PASSWORD_FILE')
     valkey = @()
@@ -214,11 +347,15 @@ $allowedSecretEnvironment = @{
     prometheus = @(); blackbox = @(); alertmanager = @()
     grafana = @('GF_SECURITY_ADMIN_PASSWORD__FILE')
 }
-$credentialNamePattern = '(?i)(password|secret|token|database_url|redis_url|s3_access_key|s3_secret_key)'
+$credentialNamePattern = '(?i)(password|secret|token|identity_key_file|database_url|redis_url|s3_access_key|s3_secret_key)'
+$nonCredentialSecretEnvironment = @('TERMLINK_PAYMENT_SECRETS_DIR')
 foreach ($serviceName in $allowedEnvironment.Keys) {
     $declaredSecrets = @($allowedSecretEnvironment[$serviceName] | Sort-Object)
     $secretLikeNames = @($allowedEnvironment[$serviceName] |
-        Where-Object { $_ -match $credentialNamePattern -or $_ -ceq 'MINIO_ROOT_USER_FILE' } |
+        Where-Object {
+            ($_ -match $credentialNamePattern -and $nonCredentialSecretEnvironment -cnotcontains $_) -or
+                $_ -ceq 'MINIO_ROOT_USER_FILE'
+        } |
         Sort-Object)
     Assert-Production (@(Compare-Object $declaredSecrets $secretLikeNames).Count -eq 0) `
         "Service '$serviceName' secret environment allow-list is not explicit or minimal."
@@ -244,10 +381,13 @@ $expectedValkeyScriptLines = @(
     'password="$$(cat /run/secrets/valkey_password)"',
     'test -n "$$password"',
     'case "$$password" in *[!A-Za-z0-9_-]*) exit 1;; esac',
+    'maxmemory="$${TERMLINK_VALKEY_MAXMEMORY}"',
+    'case "$$maxmemory" in ''''|*[!0-9kKmMgGtTbB]*) exit 1;; esac',
     'umask 077',
     'printf ''user default on >%s ~* &* +@all\n'' "$$password" > /run/valkey/users.acl',
     'unset password',
-    'exec valkey-server --appendonly yes --aclfile /run/valkey/users.acl'
+    'exec valkey-server --appendonly yes --aclfile /run/valkey/users.acl \',
+    '--maxmemory "$$maxmemory" --maxmemory-policy noeviction'
 )
 $expectedSecretMounts = @{
     edge = @()
@@ -260,8 +400,6 @@ $expectedSecretMounts = @{
         'database_url:database_url:65532:65532:0400',
         'oidc_client_secret:oidc_client_secret:65532:65532:0400',
         'redis_url:redis_url:65532:65532:0400',
-        's3_access_key:s3_access_key:65532:65532:0400',
-        's3_secret_key:s3_secret_key:65532:65532:0400',
         'token_signing_key:token_signing_key:65532:65532:0400')
     postgres = @('postgres_password:postgres_password:::0400')
     valkey = @('valkey_password:valkey_password:999:1000:0400')
@@ -269,8 +407,32 @@ $expectedSecretMounts = @{
     prometheus = @(); blackbox = @(); alertmanager = @()
     grafana = @('grafana_admin_password:grafana_admin_password:472:472:0400')
 }
+$historySecretMounts = @(
+    's3_access_key:s3_access_key:65532:65532:0400',
+    's3_secret_key:s3_secret_key:65532:65532:0400'
+)
+if ($historyOverlayRequested -or $externalServicesOverlayRequested) {
+    $expectedSecretMounts.server = @($expectedSecretMounts.server + $historySecretMounts | Sort-Object)
+}
+if ($registrationRecoveryOverlayRequested) {
+    $expectedSecretMounts.server = @($expectedSecretMounts.server +
+        'keycloak_admin_client_secret:keycloak_admin_client_secret:65532:65532:0400' | Sort-Object)
+}
+if ($accountDeletionOverlayRequested) {
+    $expectedSecretMounts.server = @($expectedSecretMounts.server +
+        'account_deletion_identity_key:account_deletion_identity_key:65532:65532:0400' | Sort-Object)
+    if (-not $registrationRecoveryOverlayRequested) {
+        $expectedSecretMounts.server = @($expectedSecretMounts.server +
+            'keycloak_admin_client_secret:keycloak_admin_client_secret:65532:65532:0400' | Sort-Object)
+    }
+}
+$edgeCaddyfilePath = if ($historyOverlayRequested) {
+    [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Caddyfile'))
+} else {
+    [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\external-services.Caddyfile'))
+}
 $expectedBindSources = @{
-    edge = @{ '/etc/caddy/Caddyfile' = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Caddyfile')) }
+    edge = @{ '/etc/caddy/Caddyfile' = $edgeCaddyfilePath }
     prometheus = @{
         '/etc/prometheus/prometheus.yml' = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\observability\prometheus\prometheus.yml'))
         '/etc/prometheus/rules' = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\observability\prometheus\rules'))
@@ -282,12 +444,15 @@ $expectedBindSources = @{
         '/var/lib/grafana/dashboards' = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\observability\grafana\dashboards'))
     }
 }
+if ($commerceOverlayRequested) {
+    $expectedBindSources.server = @{ '/run/secrets/payment' = $null }
+}
 $allowedNamedVolumeTargets = @{
     edge = @('/config', '/data'); migrate = @(); server = @(); postgres = @('/var/lib/postgresql/data')
     valkey = @('/data'); minio = @('/data'); prometheus = @('/prometheus'); blackbox = @()
     alertmanager = @('/alertmanager'); grafana = @('/var/lib/grafana')
 }
-$readOnlyServices = @('alertmanager', 'blackbox', 'edge', 'grafana', 'migrate', 'prometheus', 'server', 'valkey')
+$readOnlyServices = @('alertmanager', 'blackbox', 'edge', 'grafana', 'migrate', 'minio', 'prometheus', 'server', 'valkey')
 $expectedUsers = @{
     migrate = '65532:65532'
     server = '65532:65532'
@@ -298,11 +463,16 @@ $expectedTmpfs = @{
     migrate = @('/tmp:rw,noexec,nosuid,size=16m')
     server = @('/tmp:rw,noexec,nosuid,size=16m')
     valkey = @('/run/valkey:rw,noexec,nosuid,size=1m,uid=999,gid=1000,mode=0700')
+    minio = @('/root/.minio:rw,noexec,nosuid,size=16m', '/tmp:rw,noexec,nosuid,size=32m')
     prometheus = @('/tmp:rw,noexec,nosuid,size=16m')
     blackbox = @('/tmp:rw,noexec,nosuid,size=8m')
     alertmanager = @('/tmp:rw,noexec,nosuid,size=16m')
     grafana = @('/tmp:rw,noexec,nosuid,size=32m')
 }
+$resourcePolicyServices = @(
+    'alertmanager', 'blackbox', 'edge', 'grafana', 'migrate', 'minio',
+    'postgres', 'prometheus', 'server', 'valkey'
+)
 foreach ($serviceProperty in $services) {
     $name = $serviceProperty.Name
     $service = $serviceProperty.Value
@@ -324,6 +494,11 @@ foreach ($serviceProperty in $services) {
         "Service '$name' has an unapproved security option."
     if ($readOnlyServices -contains $name) {
         Assert-Production ([bool](Get-PropertyValue $service 'read_only')) "Service '$name' must use a read-only root filesystem."
+        $capDrop = @((Get-PropertyValue $service 'cap_drop') | Where-Object { $null -ne $_ })
+        Assert-Production ($capDrop.Count -eq 1 -and [string]$capDrop[0] -ceq 'ALL') `
+            "Service '$name' must drop every Linux capability."
+        Assert-Production ($securityOptions.Count -eq 1 -and [string]$securityOptions[0] -ceq 'no-new-privileges:true') `
+            "Service '$name' must set only no-new-privileges."
     }
     elseif ($null -ne (Get-PropertyValue $service 'read_only')) {
         Assert-Production (-not [bool](Get-PropertyValue $service 'read_only')) `
@@ -337,6 +512,52 @@ foreach ($serviceProperty in $services) {
         $actualTmpfs = @((Get-PropertyValue $service 'tmpfs') | ForEach-Object { [string]$_ } | Sort-Object)
         Assert-Production (@(Compare-Object $expectedTmpfs[$name] $actualTmpfs).Count -eq 0) `
             "Service '$name' tmpfs configuration differs from the reviewed least-privilege contract."
+    }
+    if ($resourcePolicyServices -contains $name) {
+        $memoryLimit = 0L
+        $memoryReservation = 0L
+        $cpuLimit = 0.0
+        $pidLimit = 0
+        Assert-Production ([long]::TryParse([string](Get-PropertyValue $service 'mem_limit'), [ref]$memoryLimit) -and
+            $memoryLimit -ge 32MB -and $memoryLimit -le 64GB) `
+            "Service '$name' must have a bounded 32 MiB to 64 GiB memory limit."
+        Assert-Production ([long]::TryParse([string](Get-PropertyValue $service 'mem_reservation'), [ref]$memoryReservation) -and
+            $memoryReservation -ge 16MB -and $memoryReservation -le $memoryLimit) `
+            "Service '$name' must have a positive memory reservation no greater than its limit."
+        Assert-Production ([double]::TryParse([string](Get-PropertyValue $service 'cpus'),
+            [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$cpuLimit) -and
+            $cpuLimit -ge 0.05 -and $cpuLimit -le 16.0) `
+            "Service '$name' must have a bounded 0.05 to 16 CPU limit."
+        Assert-Production ([int]::TryParse([string](Get-PropertyValue $service 'pids_limit'), [ref]$pidLimit) -and
+            $pidLimit -ge 32 -and $pidLimit -le 4096) `
+            "Service '$name' must have a bounded 32 to 4096 PID limit."
+
+        $logging = Get-PropertyValue $service 'logging'
+        $loggingOptions = Get-PropertyValue $logging 'options'
+        $maxLogFiles = 0
+        Assert-Production ([string](Get-PropertyValue $logging 'driver') -ceq 'json-file') `
+            "Service '$name' must use the reviewed rotating json-file log driver."
+        $maxLogBytes = Convert-ProductionSizeToBytes `
+            -Value ([string](Get-PropertyValue $loggingOptions 'max-size')) -Name "Service '$name' log max-size"
+        Assert-Production ($maxLogBytes -ge 1MB -and $maxLogBytes -le 1GB) `
+            "Service '$name' log max-size must remain between 1 MiB and 1 GiB."
+        Assert-Production ([int]::TryParse([string](Get-PropertyValue $loggingOptions 'max-file'), [ref]$maxLogFiles) -and
+            $maxLogFiles -ge 1 -and $maxLogFiles -le 20) `
+            "Service '$name' log max-file must remain between 1 and 20."
+        if ($name -eq 'postgres') {
+            $sharedMemory = 0L
+            Assert-Production ([long]::TryParse([string](Get-PropertyValue $service 'shm_size'), [ref]$sharedMemory) -and
+                $sharedMemory -ge 16MB -and $sharedMemory -le $memoryLimit) `
+                "Service 'postgres' shared memory must remain between 16 MiB and its memory limit."
+        }
+        elseif ($name -eq 'valkey') {
+            $valkeyEnvironment = Get-PropertyValue $service 'environment'
+            $valkeyMaxMemory = Convert-ProductionSizeToBytes `
+                -Value ([string](Get-PropertyValue $valkeyEnvironment 'TERMLINK_VALKEY_MAXMEMORY')) `
+                -Name 'TERMLINK_VALKEY_MAXMEMORY'
+            Assert-Production ($valkeyMaxMemory -ge 16MB -and $valkeyMaxMemory -le $memoryLimit) `
+                'TERMLINK_VALKEY_MAXMEMORY must remain between 16 MiB and the Valkey container memory limit.'
+        }
     }
 
     $command = @((Get-PropertyValue $service 'command') | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
@@ -368,7 +589,7 @@ foreach ($serviceProperty in $services) {
     $image = [string](Get-PropertyValue $service 'image')
     if ($name -in @('server', 'migrate')) {
         Assert-Production ($image -match '^docker\.io/myucxy/termlink:[A-Za-z0-9_.-]+@sha256:[0-9a-f]{64}$') `
-            "Service '$name' must use the approved TermLink GHCR repository and immutable digest: $image"
+            "Service '$name' must use the approved TermLink Docker Hub repository and immutable digest: $image"
         Assert-Production ($image -notmatch ':latest@' -and $image -notmatch '@sha256:0{64}$') `
             "Service '$name' cannot use a latest tag or the all-zero placeholder digest."
     }
@@ -407,6 +628,23 @@ foreach ($serviceProperty in $services) {
             Assert-Production (Test-Path -LiteralPath $resolvedSource) `
                 "Service '$name' bind mount source does not exist: $resolvedSource"
             Assert-TermLinkPathHasNoReparsePoint -Path $resolvedSource -Root ([IO.Path]::GetPathRoot($resolvedSource)) | Out-Null
+            if ($name -eq 'alertmanager' -and $target -eq '/etc/alertmanager/alertmanager.yml') {
+                $bundledPlaceholder = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\observability\alertmanager\alertmanager.yml'))
+                Assert-Production (Test-Path -LiteralPath $resolvedSource -PathType Leaf) `
+                    'Alertmanager production configuration must be a regular file.'
+                Assert-Production (-not $resolvedSource.Equals($bundledPlaceholder, [StringComparison]::OrdinalIgnoreCase)) `
+                    'Observability requires an explicit reviewed Alertmanager receiver, not the bundled no-delivery placeholder.'
+                Assert-SecretPathPermissions -Path $resolvedSource -Directory $false `
+                    -DisplayName 'Alertmanager production configuration'
+            }
+            if ($name -eq 'server' -and $target -eq '/run/secrets/payment') {
+                Assert-Production (Test-Path -LiteralPath $resolvedSource -PathType Container) `
+                    'Payment secret bind source must be an existing directory.'
+                Assert-SecretPathPermissions -Path $resolvedSource -Directory $true -DisplayName 'Payment secret directory'
+                $bindOptions = Get-PropertyValue $volume 'bind'
+                Assert-Production ($null -ne $bindOptions -and -not [bool](Get-PropertyValue $bindOptions 'create_host_path')) `
+                    'Payment secret bind must disable automatic host-path creation.'
+            }
         }
         else { throw "Service '$name' uses an unapproved mount type: $type" }
     }
@@ -435,9 +673,14 @@ foreach ($serviceProperty in $services) {
         foreach ($entry in $environment.PSObject.Properties) {
             Assert-Production ($allowedEnvironment[$name] -contains $entry.Name) `
                 "Service '$name' has unapproved environment variable '$($entry.Name)'."
-            if ($entry.Name -match '(?i)(password|secret|token|database_url|redis_url|s3_access_key|s3_secret_key)' -and
+            if ($entry.Name -match '(?i)(password|secret|token|identity_key_file|database_url|redis_url|s3_access_key|s3_secret_key)' -and
+                $nonCredentialSecretEnvironment -cnotcontains $entry.Name -and
                 $entry.Name -notmatch '(?i)(_FILE|__FILE)$') {
                 throw "Service '$name' places secret-like configuration in environment variable '$($entry.Name)'."
+            }
+            if ($entry.Name -ceq 'TERMLINK_PAYMENT_SECRETS_DIR') {
+                Assert-Production ([string]$entry.Value -ceq '/run/secrets/payment') `
+                    "Service '$name' payment secret directory must remain /run/secrets/payment."
             }
             if ($entry.Name -match '(?i)(_FILE|__FILE)$') {
                 Assert-Production ([string]$entry.Value -match '^/run/secrets/[a-z0-9][a-z0-9_-]{0,62}$') `
@@ -464,9 +707,87 @@ $valkeySecurity = @((Get-PropertyValue $valkeyService 'security_opt'))
 Assert-Production ($valkeySecurity -contains 'no-new-privileges:true') 'Valkey must set no-new-privileges.'
 $serverEnvironment = Get-PropertyValue $server 'environment'
 $publicUri = Assert-ProductionHttpsUri -Value ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_PUBLIC_URL')) -Name 'TERMLINK_PUBLIC_URL'
-Assert-ProductionHttpsUri -Value ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_OIDC_ISSUER')) -Name 'TERMLINK_OIDC_ISSUER' | Out-Null
+$oidcIssuerUri = Assert-ProductionHttpsUri -Value ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_OIDC_ISSUER')) -Name 'TERMLINK_OIDC_ISSUER'
+$migration = Get-PropertyValue $config.services 'migrate'
+$migrationEnvironment = Get-PropertyValue $migration 'environment'
+Assert-Production ([string](Get-PropertyValue $migrationEnvironment 'TERMLINK_REGISTRATION_RECOVERY_ENABLED') -ceq 'false') `
+    'The migration job must never enable registration recovery.'
+Assert-Production ([string](Get-PropertyValue $migrationEnvironment 'TERMLINK_ACCOUNT_DELETION_ENABLED') -ceq 'false') `
+    'The migration job must never enable account deletion processing.'
+foreach ($name in @(
+    'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE', 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION',
+    'TERMLINK_KEYCLOAK_ADMIN_BASE_URL', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID',
+    'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE'
+)) {
+    Assert-Production ($null -eq (Get-PropertyValue $migrationEnvironment $name)) `
+        "The migration job must not receive recovery authority '$name'."
+}
+$recoveryEnabled = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_REGISTRATION_RECOVERY_ENABLED') -ceq 'true'
+Assert-Production ($recoveryEnabled -eq $registrationRecoveryOverlayRequested) `
+    'TERMLINK_REGISTRATION_RECOVERY_ENABLED must exactly match registration-recovery.compose.yml.'
+$accountDeletionEnabled = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_ACCOUNT_DELETION_ENABLED') -ceq 'true'
+Assert-Production ($accountDeletionEnabled -eq $accountDeletionOverlayRequested) `
+    'TERMLINK_ACCOUNT_DELETION_ENABLED must exactly match account-deletion.compose.yml.'
+$keycloakAdminRequested = $recoveryEnabled -or $accountDeletionEnabled
+if ($keycloakAdminRequested) {
+    Assert-Production ($oidcIssuerUri.AbsolutePath -match '^/realms/[^/]+/?$' -and
+        $oidcIssuerUri.Query -eq '' -and $oidcIssuerUri.Fragment -eq '' -and $oidcIssuerUri.UserInfo -eq '') `
+        'Keycloak administration requires a realm issuer URL ending in /realms/<realm>.'
+    $recoveryClientID = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID')
+    Assert-Production ($recoveryClientID -cmatch '^[A-Za-z0-9._-]{1,128}$') `
+        'Keycloak administration requires a bounded service-account client ID.'
+    Assert-Production ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE') -ceq
+        '/run/secrets/keycloak_admin_client_secret') `
+        'Keycloak administration must use only its reviewed file-backed client secret.'
+    $adminBaseURL = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_KEYCLOAK_ADMIN_BASE_URL')
+    if ($adminBaseURL -ne '') {
+        $adminBaseUri = Assert-ProductionHttpsUri -Value $adminBaseURL -Name 'TERMLINK_KEYCLOAK_ADMIN_BASE_URL'
+        Assert-Production ($adminBaseUri.Query -eq '' -and $adminBaseUri.Fragment -eq '' -and $adminBaseUri.UserInfo -eq '') `
+            'TERMLINK_KEYCLOAK_ADMIN_BASE_URL must not contain user info, query, or fragment data.'
+    }
+} else {
+    foreach ($name in @(
+        'TERMLINK_KEYCLOAK_ADMIN_BASE_URL', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID',
+        'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE'
+    )) {
+        Assert-Production ($null -eq (Get-PropertyValue $serverEnvironment $name)) `
+            "Core deployment unexpectedly includes Keycloak administration setting '$name'."
+    }
+}
+if ($accountDeletionEnabled) {
+    Assert-Production ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE') -ceq
+        '/run/secrets/account_deletion_identity_key') `
+        'Account deletion must use only its reviewed file-backed identity key.'
+    $identityKeyVersion = 0
+    Assert-Production ([int]::TryParse(
+        [string](Get-PropertyValue $serverEnvironment 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION'),
+        [ref]$identityKeyVersion) -and $identityKeyVersion -ge 1) `
+        'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION must be a positive integer.'
+} else {
+    foreach ($name in @(
+        'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE', 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION'
+    )) {
+        Assert-Production ($null -eq (Get-PropertyValue $serverEnvironment $name)) `
+            "Core deployment unexpectedly includes account-deletion setting '$name'."
+    }
+}
+$paymentSecretsDirectory = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_PAYMENT_SECRETS_DIR')
+Assert-Production (($paymentSecretsDirectory -ceq '/run/secrets/payment') -eq $commerceOverlayRequested) `
+    'TERMLINK_PAYMENT_SECRETS_DIR must be present only when commerce.compose.yml is selected.'
+$historyExpected = $historyOverlayRequested -or $externalServicesOverlayRequested
+$historyEnabled = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_HISTORY_ENABLED') -ceq 'true'
+Assert-Production ($historyEnabled -eq $historyExpected) `
+    'TERMLINK_HISTORY_ENABLED must exactly match the selected reviewed history overlay.'
+$metricsAddress = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_METRICS_LISTEN_ADDR')
+if ($observabilityOverlayRequested) {
+    Assert-Production ($metricsAddress -ceq ':9090') `
+        'The observability overlay must expose metrics only on the reviewed internal listener :9090.'
+} else {
+    Assert-Production ($metricsAddress -eq '') `
+        'Core deployments must not enable a metrics listener without the observability overlay.'
+}
 $s3PublicUri = $null
-if ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_HISTORY_ENABLED') -eq 'true') {
+if ($historyEnabled) {
     $s3PublicUri = Assert-ProductionHttpsUri -Value ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_S3_PUBLIC_ENDPOINT')) `
         -Name 'TERMLINK_S3_PUBLIC_ENDPOINT'
     Assert-Production ($s3PublicUri.AbsolutePath -eq '/' -and $s3PublicUri.Query -eq '' -and
@@ -474,6 +795,23 @@ if ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_HISTORY_ENABLED') -e
         'TERMLINK_S3_PUBLIC_ENDPOINT must be an HTTPS origin without path, query, fragment, or user info.'
     Assert-Production ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_S3_BUCKET') -ceq 'termlink-history') `
         'The production history bucket must remain termlink-history.'
+    $s3Endpoint = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_S3_ENDPOINT')
+    if ($historyOverlayRequested) {
+        Assert-Production ($s3Endpoint -ceq 'http://minio:9000') `
+            'The local history overlay must use only the isolated MinIO service endpoint.'
+    } else {
+        $s3EndpointUri = Assert-ProductionHttpsUri -Value $s3Endpoint -Name 'TERMLINK_S3_ENDPOINT'
+        Assert-Production ($s3EndpointUri.UserInfo -eq '' -and $s3EndpointUri.Fragment -eq '') `
+            'External TERMLINK_S3_ENDPOINT must not contain user info or a fragment.'
+    }
+} else {
+    foreach ($name in @(
+        'TERMLINK_S3_ACCESS_KEY_FILE', 'TERMLINK_S3_BUCKET', 'TERMLINK_S3_ENDPOINT',
+        'TERMLINK_S3_PUBLIC_ENDPOINT', 'TERMLINK_S3_REGION', 'TERMLINK_S3_SECRET_KEY_FILE'
+    )) {
+        Assert-Production ($null -eq (Get-PropertyValue $serverEnvironment $name)) `
+            "Core deployment unexpectedly includes history setting '$name'."
+    }
 }
 
 $frontendNetwork = Get-PropertyValue $config.networks 'frontend'
@@ -482,34 +820,64 @@ Assert-Production ($null -ne $frontendNetwork -and [bool](Get-PropertyValue $fro
 $backendNetwork = Get-PropertyValue $config.networks 'backend'
 Assert-Production ($null -ne $backendNetwork -and [bool](Get-PropertyValue $backendNetwork 'internal')) `
     'The PostgreSQL/Valkey backend network must remain internal.'
+$expectedNetworkNames = @('backend', 'egress', 'frontend')
+if ($IncludeEdge) { $expectedNetworkNames += 'public' }
+if ($historyOverlayRequested) { $expectedNetworkNames += @('object', 'object-control') }
+$actualNetworkNames = @($config.networks.PSObject.Properties.Name | Sort-Object)
+Assert-Production (@(Compare-Object ($expectedNetworkNames | Sort-Object) $actualNetworkNames).Count -eq 0) `
+    "Production Compose networks differ from the selected reviewed topology: $($actualNetworkNames -join ', ')"
 $objectNetwork = Get-PropertyValue $config.networks 'object'
-Assert-Production ($null -ne $objectNetwork -and [bool](Get-PropertyValue $objectNetwork 'internal')) `
-    'The edge/MinIO object network must remain internal.'
 $objectControlNetwork = Get-PropertyValue $config.networks 'object-control'
-Assert-Production ($null -ne $objectControlNetwork -and [bool](Get-PropertyValue $objectControlNetwork 'internal')) `
-    'The server/MinIO object-control network must remain internal.'
+if ($historyOverlayRequested) {
+    Assert-Production ($null -ne $objectNetwork -and [bool](Get-PropertyValue $objectNetwork 'internal')) `
+        'The edge/MinIO object network must remain internal.'
+    Assert-Production ($null -ne $objectControlNetwork -and [bool](Get-PropertyValue $objectControlNetwork 'internal')) `
+        'The server/MinIO object-control network must remain internal.'
+} else {
+    Assert-Production ($null -eq $objectNetwork -and $null -eq $objectControlNetwork) `
+        'Core and external-S3 deployments must not retain local object-store networks.'
+}
 Assert-Production ($null -eq (Get-PropertyValue $config.networks 'private')) `
     'The legacy private network name must not remain in production Compose.'
 $edgeService = Get-PropertyValue $config.services 'edge'
-$edgeEnvironment = Get-PropertyValue $edgeService 'environment'
-$acmeCA = [string](Get-PropertyValue $edgeEnvironment 'TERMLINK_ACME_CA')
-$acmeEmail = [string](Get-PropertyValue $edgeEnvironment 'TERMLINK_ACME_EMAIL')
-Assert-Production ($acmeEmail -match '^[^\s@]+@[^\s@]+\.[^\s@]+$') `
-    'Production edge requires a syntactically valid ACME contact email.'
-Assert-Production ($acmeCA -eq 'https://acme-v02.api.letsencrypt.org/directory') `
-    'Production edge must use the configured production ACME CA.'
-Assert-Production ([string](Get-PropertyValue $edgeEnvironment 'TERMLINK_PUBLIC_HOST') -ceq $publicUri.DnsSafeHost) `
-    'TERMLINK_PUBLIC_HOST must exactly match the public URL host.'
-$historyPublicHost = [string](Get-PropertyValue $edgeEnvironment 'TERMLINK_HISTORY_PUBLIC_HOST')
-Assert-ProductionHttpsUri -Value "https://$historyPublicHost" -Name 'TERMLINK_HISTORY_PUBLIC_HOST' | Out-Null
-if ($null -ne $s3PublicUri) {
-    Assert-Production ($s3PublicUri.DnsSafeHost -ieq $historyPublicHost -and
-        ($s3PublicUri.IsDefaultPort -or $s3PublicUri.Port -eq 443)) `
-        'TERMLINK_S3_PUBLIC_ENDPOINT must exactly use TERMLINK_HISTORY_PUBLIC_HOST on HTTPS port 443.'
+if ($IncludeEdge) {
+    Assert-Production ($null -ne $edgeService) 'The requested edge profile did not render the edge service.'
+    $edgeEnvironment = Get-PropertyValue $edgeService 'environment'
+    $acmeCA = [string](Get-PropertyValue $edgeEnvironment 'TERMLINK_ACME_CA')
+    $acmeEmail = [string](Get-PropertyValue $edgeEnvironment 'TERMLINK_ACME_EMAIL')
+    Assert-Production ($acmeEmail -match '^[^\s@]+@[^\s@]+\.[^\s@]+$') `
+        'Production edge requires a syntactically valid ACME contact email.'
+    Assert-Production ($acmeCA -eq 'https://acme-v02.api.letsencrypt.org/directory') `
+        'Production edge must use the configured production ACME CA.'
+    Assert-Production ([string](Get-PropertyValue $edgeEnvironment 'TERMLINK_PUBLIC_HOST') -ceq $publicUri.DnsSafeHost) `
+        'TERMLINK_PUBLIC_HOST must exactly match the public URL host.'
+    $historyPublicHost = [string](Get-PropertyValue $edgeEnvironment 'TERMLINK_HISTORY_PUBLIC_HOST')
+    if ($historyOverlayRequested) {
+        Assert-ProductionHttpsUri -Value "https://$historyPublicHost" -Name 'TERMLINK_HISTORY_PUBLIC_HOST' | Out-Null
+        Assert-Production ($s3PublicUri.DnsSafeHost -ieq $historyPublicHost -and
+            ($s3PublicUri.IsDefaultPort -or $s3PublicUri.Port -eq 443)) `
+            'TERMLINK_S3_PUBLIC_ENDPOINT must exactly use TERMLINK_HISTORY_PUBLIC_HOST on HTTPS port 443.'
+    } else {
+        Assert-Production ($historyPublicHost -eq '') `
+            'Core and external-S3 edge configurations must not expose a local history host.'
+    }
 }
 
-$caddyfilePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Caddyfile'))
+$caddyfilePath = $edgeCaddyfilePath
 $caddyfileText = [IO.File]::ReadAllText($caddyfilePath)
+Assert-Production ($caddyfileText -match '(?m)^\s*@internal path /metrics /metrics/\* /debug /debug/\*\s*$' -and
+    $caddyfileText -match '(?m)^\s*respond @internal 404\s*$') `
+    'The application edge must keep metrics and debug routes private.'
+Assert-Production ($caddyfileText -match '(?m)^\s*Strict-Transport-Security "max-age=31536000; includeSubDomains"\s*$') `
+    'The application edge must retain the reviewed HSTS policy.'
+Assert-Production ($caddyfileText -match '(?ms)fields\s*\{.*?request delete.*?url delete.*?uri delete.*?query delete.*?\}') `
+    'Caddy runtime logs must remove request URLs and query credentials.'
+if (-not $historyOverlayRequested) {
+    Assert-Production ($caddyfileText -notmatch '(?m)^\s*reverse_proxy minio:9000\s*$') `
+        'Core and external-S3 Caddy configurations must not route to local MinIO.'
+}
+
+if ($historyOverlayRequested) {
 $historyObjectMatcher = 'path_regexp history_object_path ^/termlink-history/accounts/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/sessions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/(chunk|snapshot|transcript)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]bin$'
 $fileTransferMatcher = 'path_regexp file_transfer_path ^/termlink-history/accounts/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/file-transfers/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]bin$'
 Assert-Production ($caddyfileText -match '(?m)^\s*method GET PUT\s*$') `
@@ -551,28 +919,53 @@ foreach ($acceptanceProxy in @(
     Assert-Production ($acceptanceProxyText -match '(?ms)handle @fileTransferObject\s*\{.*?max_size 5368709120.*?reverse_proxy minio:9000') `
         "Acceptance proxy '$acceptanceProxy' must use the independent exact 5 GiB file-transfer limit."
 }
+}
 
 # This is the key boundary of the production topology: the public edge may
 # reach PostgreSQL and Valkey only through the application. MinIO shares the
 # isolated object network with the edge for presigned URLs and a separate
 # object-control network with the server; it must never join backend.
-$edgeNetworks = @(Get-NetworkNames $edgeService)
-foreach ($dataServiceName in @('postgres', 'valkey')) {
-    $dataService = Get-PropertyValue $config.services $dataServiceName
-    $sharedNetworks = @((Get-NetworkNames $dataService) | Where-Object { $edgeNetworks -contains $_ })
-    Assert-Production ($sharedNetworks.Count -eq 0) `
-        "Edge must not share a Docker network with data service '$dataServiceName': $($sharedNetworks -join ', ')"
+$edgeNetworks = if ($IncludeEdge) { @(Get-NetworkNames $edgeService) } else { @() }
+if ($IncludeEdge) {
+    foreach ($dataServiceName in @('postgres', 'valkey')) {
+        $dataService = Get-PropertyValue $config.services $dataServiceName
+        $sharedNetworks = @((Get-NetworkNames $dataService) | Where-Object { $edgeNetworks -contains $_ })
+        Assert-Production ($sharedNetworks.Count -eq 0) `
+            "Edge must not share a Docker network with data service '$dataServiceName': $($sharedNetworks -join ', ')"
+    }
+    Assert-Production ($edgeNetworks -notcontains 'backend') 'Edge must never join the backend network.'
 }
 $minioService = Get-PropertyValue $config.services 'minio'
-$minioSharedNetworks = @((Get-NetworkNames $minioService) | Where-Object { $edgeNetworks -contains $_ })
-Assert-Production ($minioSharedNetworks.Count -eq 1 -and $minioSharedNetworks[0] -ceq 'object') `
-    "Edge and MinIO must share only the isolated object network: $($minioSharedNetworks -join ', ')"
-Assert-Production ($edgeNetworks -notcontains 'backend') 'Edge must never join the backend network.'
-$serverNetworks = @(Get-NetworkNames $server)
-$serverMinioSharedNetworks = @((Get-NetworkNames $minioService) | Where-Object { $serverNetworks -contains $_ })
-Assert-Production ($serverMinioSharedNetworks.Count -eq 1 -and $serverMinioSharedNetworks[0] -ceq 'object-control') `
-    "Server and MinIO must share only the isolated object-control network: $($serverMinioSharedNetworks -join ', ')"
-Assert-Production ((Get-NetworkNames $minioService) -notcontains 'backend') 'MinIO must never join the PostgreSQL/Valkey backend network.'
+if ($historyOverlayRequested) {
+    if ($IncludeEdge) {
+        $minioSharedNetworks = @((Get-NetworkNames $minioService) | Where-Object { $edgeNetworks -contains $_ })
+        Assert-Production ($minioSharedNetworks.Count -eq 1 -and $minioSharedNetworks[0] -ceq 'object') `
+            "Edge and MinIO must share only the isolated object network: $($minioSharedNetworks -join ', ')"
+    }
+    $serverNetworks = @(Get-NetworkNames $server)
+    $serverMinioSharedNetworks = @((Get-NetworkNames $minioService) | Where-Object { $serverNetworks -contains $_ })
+    Assert-Production ($serverMinioSharedNetworks.Count -eq 1 -and $serverMinioSharedNetworks[0] -ceq 'object-control') `
+        "Server and MinIO must share only the isolated object-control network: $($serverMinioSharedNetworks -join ', ')"
+    Assert-Production ((Get-NetworkNames $minioService) -notcontains 'backend') `
+        'MinIO must never join the PostgreSQL/Valkey backend network.'
+} else {
+    Assert-Production ($null -eq $minioService) `
+        'MinIO must appear only when history.compose.yml is selected.'
+}
+
+$expectedSecretNames = @(
+    'database_url', 'oidc_client_secret', 'postgres_password', 'redis_url',
+    'token_signing_key', 'valkey_password'
+)
+if ($historyExpected) { $expectedSecretNames += @('s3_access_key', 's3_secret_key') }
+if ($observabilityOverlayRequested) { $expectedSecretNames += 'grafana_admin_password' }
+if ($registrationRecoveryOverlayRequested -or $accountDeletionOverlayRequested) {
+    $expectedSecretNames += 'keycloak_admin_client_secret'
+}
+if ($accountDeletionOverlayRequested) { $expectedSecretNames += 'account_deletion_identity_key' }
+$actualSecretNames = @($config.secrets.PSObject.Properties.Name | Sort-Object)
+Assert-Production (@(Compare-Object ($expectedSecretNames | Sort-Object) $actualSecretNames).Count -eq 0) `
+    "Production Compose secrets differ from the selected reviewed topology: $($actualSecretNames -join ', ')"
 
 $secretValues = @()
 $checkedSecretDirectories = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -595,6 +988,14 @@ foreach ($secretProperty in @($config.secrets.PSObject.Properties)) {
     Assert-Production ($value.Length -ge 12) `
         "Compose secret '$($secretProperty.Name)' must contain at least 12 non-whitespace characters."
     $secretValues += [pscustomobject]@{ Name = $secretProperty.Name; Value = $value }
+}
+
+if ($accountDeletionOverlayRequested) {
+    $identityKeySecret = @($secretValues | Where-Object { $_.Name -ceq 'account_deletion_identity_key' })
+    Assert-Production ($identityKeySecret.Count -eq 1) `
+        'Account deletion requires exactly one identity encryption key secret.'
+    Assert-AccountDeletionIdentityKeyMaterial -Value ([string]$identityKeySecret[0].Value) `
+        -CurrentVersion $identityKeyVersion
 }
 
 $valkeyPasswordSecret = @($secretValues | Where-Object { $_.Name -ceq 'valkey_password' })

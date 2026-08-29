@@ -30,6 +30,26 @@ import org.junit.Test
 
 class ProductContractsTest {
     @Test
+    fun realtimeNetworkCapabilityFallbackDeduplicatesAndReconnectsAfterLoss() {
+        assertEquals(
+            RealtimeNetworkObservationTransition.INITIAL,
+            realtimeNetworkObservationTransition(false, null, "network-1"),
+        )
+        assertEquals(
+            RealtimeNetworkObservationTransition.UNCHANGED,
+            realtimeNetworkObservationTransition(true, "network-1", "network-1"),
+        )
+        assertEquals(
+            RealtimeNetworkObservationTransition.RECONNECTED,
+            realtimeNetworkObservationTransition(true, null, "network-1"),
+        )
+        assertEquals(
+            RealtimeNetworkObservationTransition.RECONNECTED,
+            realtimeNetworkObservationTransition(true, "network-1", "network-2"),
+        )
+    }
+
+    @Test
     fun encryptedHistorySessionUpsertPreservesTitlePresenceAndLegacyLifecycle() {
         val title = productSessionUpsertEvent(
             41,
@@ -96,6 +116,183 @@ class ProductContractsTest {
             }
         }
         assertThrows(IllegalArgumentException::class.java) { boundedChunkHistoryItems(oversized) }
+    }
+
+    @Test
+    fun streamedHistoryCachesMoreThanOneHundredThousandEventsAcrossBoundedPages() = runBlocking {
+        val totalEvents = 100_123uL
+        val chunkEvents = 127uL
+        val chunks = buildList {
+            var start = 1uL
+            while (start <= totalEvents) {
+                val end = minOf(totalEvents, start + chunkEvents - 1uL)
+                add(HistorySequenceRange(start, end))
+                start = end + 1uL
+            }
+        }.asReversed()
+        var largestPage = 0
+        var pageLoads = 0
+        val cached = mutableListOf<HistorySequenceRange>()
+
+        fun page(offset: Int): StreamedHistoryCatalogPage<HistorySequenceRange> {
+            val items = chunks.drop(offset).take(SESSION_CHUNK_HISTORY_PAGE_LIMIT)
+            largestPage = maxOf(largestPage, items.size)
+            val nextOffset = offset + items.size
+            return StreamedHistoryCatalogPage(
+                items = items,
+                hasMore = nextOffset < chunks.size,
+                nextCursor = nextOffset.toString().takeIf { nextOffset < chunks.size },
+            )
+        }
+
+        val restoredThrough = cacheContiguousHistoryRange(
+            minimumTarget = totalEvents,
+            stopAfterSequence = 0uL,
+            firstPage = page(0),
+            loadNextPage = { cursor ->
+                pageLoads += 1
+                page(cursor.toInt())
+            },
+            sequenceRange = { it },
+            cacheCandidate = { cached += it },
+        )
+
+        assertEquals(totalEvents, restoredThrough)
+        assertEquals(chunks, cached)
+        assertEquals(totalEvents, cached.sumOf { it.endInclusive - it.start + 1uL })
+        assertTrue(pageLoads > 1)
+        assertTrue(largestPage <= SESSION_CHUNK_HISTORY_PAGE_LIMIT)
+    }
+
+    @Test
+    fun streamedHistoryCatalogProgressHasNoTotalOrStallTimeout() = runBlocking {
+        val ends = ArrayDeque(listOf(100uL, 200uL, 300uL, 400uL, 500uL))
+        var elapsed = 0L
+
+        val ready = awaitStreamedHistoryCatalogHead(
+            minimumTarget = 500uL,
+            loadPage = { ends.removeFirst() },
+            newestEndSequence = { it },
+            pollMillis = 1L,
+            pause = { elapsed += 10_000L },
+        )
+
+        assertEquals(500uL, ready)
+        assertEquals(40_000L, elapsed)
+    }
+
+    @Test
+    fun streamedHistoryCatalogWaitsPastFormerStallLimitUntilCancelled() = runBlocking {
+        var elapsed = 0L
+        val cancellation = CancellationException("streamed history wait cancelled")
+
+        val failure = try {
+            awaitStreamedHistoryCatalogHead(
+                minimumTarget = 500uL,
+                loadPage = { 100uL },
+                newestEndSequence = { it },
+                pollMillis = 1L,
+                pause = {
+                    elapsed += 10_000L
+                    if (elapsed >= 60_000L) throw cancellation
+                },
+            )
+            error("Expected streamed history readiness cancellation")
+        } catch (error: CancellationException) {
+            error
+        }
+
+        assertEquals(cancellation, failure)
+        assertEquals(60_000L, elapsed)
+    }
+
+    @Test
+    fun streamedHistoryCanRestoreAvailablePrefixBeforeAuthoritativeTail() = runBlocking {
+        val published = listOf(
+            HistorySequenceRange(51uL, 100uL),
+            HistorySequenceRange(1uL, 50uL),
+        )
+        val cached = mutableListOf<HistorySequenceRange>()
+        val head = awaitStreamedHistoryCatalogHead(
+            minimumTarget = 1uL,
+            loadPage = { published },
+            newestEndSequence = { it.firstOrNull()?.endInclusive },
+            pollMillis = 0L,
+        )
+
+        val restoredThrough = cacheContiguousHistoryRange(
+            minimumTarget = 1uL,
+            stopAfterSequence = 0uL,
+            firstPage = StreamedHistoryCatalogPage(
+                items = head,
+                hasMore = false,
+                nextCursor = null,
+            ),
+            loadNextPage = { error("available prefix fits one bounded page") },
+            sequenceRange = { it },
+            cacheCandidate = { cached += it },
+        )
+
+        assertEquals(100uL, restoredThrough)
+        assertEquals(published, cached)
+    }
+
+    @Test
+    fun streamedHistoryRejectsAGapWithoutCachingPastIt() = runBlocking {
+        val cached = mutableListOf<HistorySequenceRange>()
+        val error = assertThrows(SessionOpenException::class.java) {
+            runBlocking {
+                cacheContiguousHistoryRange(
+                    minimumTarget = 100uL,
+                    stopAfterSequence = 0uL,
+                    firstPage = StreamedHistoryCatalogPage(
+                        items = listOf(
+                            HistorySequenceRange(91uL, 100uL),
+                            HistorySequenceRange(71uL, 80uL),
+                        ),
+                        hasMore = false,
+                        nextCursor = null,
+                    ),
+                    loadNextPage = { error("a terminal page must not load another page") },
+                    sequenceRange = { it },
+                    cacheCandidate = { cached += it },
+                )
+            }
+        }
+
+        assertEquals(SessionOpenFailureCode.HISTORY_GAP, error.failure.code)
+        assertEquals(listOf(HistorySequenceRange(91uL, 100uL)), cached)
+    }
+
+    @Test
+    fun streamedHistoryPropagatesCancellationBeforeTheRangeCompletes() {
+        val cancellation = CancellationException("streamed history cancelled")
+        var cached = 0
+        val error = assertThrows(CancellationException::class.java) {
+            runBlocking {
+                cacheContiguousHistoryRange(
+                    minimumTarget = 100uL,
+                    stopAfterSequence = 0uL,
+                    firstPage = StreamedHistoryCatalogPage(
+                        items = listOf(
+                            HistorySequenceRange(91uL, 100uL),
+                            HistorySequenceRange(81uL, 90uL),
+                        ),
+                        hasMore = true,
+                        nextCursor = "page-2",
+                    ),
+                    loadNextPage = { error("cancellation must stop paging") },
+                    sequenceRange = { it },
+                    cacheCandidate = {
+                        cached += 1
+                        if (cached == 2) throw cancellation
+                    },
+                )
+            }
+        }
+
+        assertEquals("streamed history cancelled", error.message)
+        assertEquals(2, cached)
     }
 
     @Test

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="robots" content="noindex,nofollow">
+  <title>创建账号 · TermLink</title>
+  <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
+  <script src="/assets/theme-init.js?v=registration-v2"></script>
+  <link rel="stylesheet" href="/assets/site.css?v=registration-v3">
+  <script src="/assets/theme.js?v=registration-v2" defer></script>
+  <script src="/assets/register.js?v=registration-v2" defer></script>
+</head>
+<body class="error-body registration-body">
+  <main class="error-card registration-card">
+    <div class="error-card-header">
+      <a class="brand" href="/" aria-label="TermLink 首页">
+        <img class="brand-mark" src="/assets/termlink-app-icon.svg" alt="">
+        <span><strong>TermLink</strong><small>Account registration</small></span>
+      </a>
+      <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题">
+        <span class="theme-toggle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path class="theme-icon-moon" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/><g class="theme-icon-sun"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></g></svg></span>
+        <span class="theme-toggle-label">主题</span>
+      </button>
+    </div>
+    <p class="eyebrow">REGISTRATION · {{.Mode}}</p>
+    {{if .RegistrationOpen}}
+    <h1>创建 TermLink 账号</h1>
+    <p>{{if .InvitationRequired}}当前注册需要有效邀请码。邀请码只用于注册准入，套餐赠送请登录后使用兑换码。{{else}}当前允许直接创建账号。{{end}}</p>
+    <form id="registration-form" class="registration-form" novalidate>
+      <label><span>用户名</span><input name="username" autocomplete="username" minlength="3" maxlength="128" required><small>创建后不可修改，可用于登录。</small></label>
+      <label><span>昵称</span><input name="nickname" autocomplete="nickname" minlength="1" maxlength="64" required><small>用于页面展示，可以与其他用户重复。</small></label>
+      <label><span>邮箱</span><input name="email" type="email" autocomplete="email" maxlength="320" required></label>
+      {{if .EmailVerificationRequired}}
+      <div class="registration-code-row">
+        <label><span>邮箱验证码</span><input name="email_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" minlength="6" maxlength="6" required></label>
+        <button id="send-email-code" class="button button-quiet" type="button">发送验证码</button>
+      </div>
+      <input name="email_verification_id" type="hidden" required>
+      {{end}}
+      {{if .InvitationRequired}}<label><span>邀请码</span><input name="invitation_code" autocomplete="off" spellcheck="false" maxlength="80" placeholder="TLI-XXXX-XXXX-XXXX" required></label>{{end}}
+      <label><span>密码</span><input name="password" type="password" autocomplete="new-password" minlength="8" maxlength="1024" required></label>
+      <label><span>确认密码</span><input name="password_confirm" type="password" autocomplete="new-password" minlength="8" maxlength="1024" required></label>
+      <div id="registration-message" class="registration-message" role="status" aria-live="polite"></div>
+      <button class="button button-primary" type="submit">创建账号</button>
+    </form>
+    {{else}}
+    <h1>注册暂未开放</h1>
+    <p>TermLink 当前暂停新账号注册。已有账号仍可正常登录和使用。</p>
+    {{end}}
+    <div class="final-cta-actions">
+      <a class="button button-quiet" href="/login?return_to=/account" data-theme-transfer>已有账号，去登录</a>
+      <a class="button button-quiet" href="/">返回首页</a>
+    </div>
+  </main>
+</body>
+</html>

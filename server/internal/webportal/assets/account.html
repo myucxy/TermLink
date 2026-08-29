@@ -8,7 +8,7 @@
   <title>个人中心 · TermLink</title>
   <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
   <script src="/assets/theme-init.js?v=01b-v11"></script>
-  <link rel="stylesheet" href="/assets/site.css?v=01b-v11">
+  <link rel="stylesheet" href="/assets/site.css?v=01b-v12">
   <script src="/assets/theme.js?v=01b-v11" defer></script>
 </head>
 <body class="account-body">
@@ -30,7 +30,7 @@
   <main class="account-shell">
     <aside class="account-context">
       <p class="eyebrow"><span class="status-dot"></span> ACCOUNT CONNECTED</p>
-      <h1>欢迎回来，<br>{{.Username}}</h1>
+      <h1>欢迎回来，<br>{{.Nickname}}</h1>
       <p>当前账号已通过公开 HTTPS 身份服务登录。Android 与 Windows 客户端都在应用内直接登录或注册；同账号设备自动登记并发现自己的 PC 与 Session。</p>
       <dl class="account-facts">
         <div><dt>身份通道</dt><dd>OIDC · HTTPS</dd></div>
@@ -50,15 +50,20 @@
       </div>
 
       <div class="profile-panel">
-        <div class="avatar" aria-hidden="true">{{printf "%.1s" .Username}}</div>
+        <div class="avatar" aria-hidden="true">{{printf "%.1s" .Nickname}}</div>
         <div>
-          <strong>{{.Name}}</strong>
-          <span>{{.Username}}</span>
+          <strong>{{.Nickname}}</strong>
+          <span>用户名：{{.Username}}（不可修改）</span>
           {{if .Email}}<span>{{.Email}}</span>{{end}}
+          <span>用户 ID：<code>{{.AccountID}}</code></span>
         </div>
       </div>
 
       <div class="account-actions">
+        <article>
+          <div><span class="action-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 9h18M7 15h4"/></svg></span><div><h3>订阅、权益与订单</h3><p>查看当前生效套餐、已发布目录和订单状态，或核销一次性兑换码。</p></div></div>
+          <a class="text-link" href="/account">管理订阅 <span aria-hidden="true">→</span></a>
+        </article>
         {{if .CanOpenConsole}}
         <article>
           <div><span class="action-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg></span><div><h3>TermLink Server Console</h3><p>查看真实运行元数据、安全审计和账号角色；终端正文始终不可见。</p></div></div>

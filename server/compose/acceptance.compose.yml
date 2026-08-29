@@ -92,6 +92,10 @@ services:
         copy_secret valkey_password /target/valkey/valkey_password 999:1000
         copy_secret s3_access_key /target/minio/s3_access_key 0:0
         copy_secret s3_secret_key /target/minio/s3_secret_key 0:0
+        rm -f /target/server/keycloak_admin_client_secret
+        : > /target/server/keycloak_admin_client_secret
+        chmod 0600 /target/server/keycloak_admin_client_secret
+        chown 1000:0 /target/server/keycloak_admin_client_secret
     secrets:
       - keycloak_admin_password
       - admin_initial_password
@@ -106,6 +110,7 @@ services:
       - acceptance-postgres-secrets:/target/postgres
       - acceptance-valkey-secrets:/target/valkey
       - acceptance-minio-secrets:/target/minio
+      - acceptance-server-secrets:/target/server
     network_mode: "none"
     read_only: true
     cap_drop: ["ALL"]
@@ -192,15 +197,15 @@ services:
         /opt/keycloak/bin/kcadm.sh update realms/termlink \
           --config /tmp/kcadm.config \
           -s displayName=TermLink \
-          -s loginTheme=termlink-01b-v17 \
-          -s accountTheme=termlink-01b-v17 \
+          -s loginTheme=termlink-01b-v18 \
+          -s accountTheme=termlink-01b-v18 \
           -s internationalizationEnabled=true \
           -s 'supportedLocales=["zh-CN","en"]' \
           -s defaultLocale=zh-CN \
           -s rememberMe=true \
           -s registrationAllowed=false \
           -s verifyEmail=false \
-          -s resetPasswordAllowed=true \
+          -s resetPasswordAllowed=false \
           -s bruteForceProtected=true \
           -s accessTokenLifespan=300 \
           -s accessTokenLifespanForImplicitFlow=300 \
@@ -216,6 +221,101 @@ services:
               -s name="$$role_name" >/dev/null
           fi
         done
+        registration_scope_table=$$(/opt/keycloak/bin/kcadm.sh get client-scopes \
+          --config /tmp/kcadm.config -r termlink \
+          --fields id,name --format csv --noquotes)
+        registration_scope_id=$$(printf '%s\n' "$$registration_scope_table" | while IFS=, read -r id name; do
+          if test "$$name" = termlink-registration-attempt; then printf '%s' "$$id"; fi
+        done)
+        if test -z "$$registration_scope_id"; then
+          registration_scope_id=$$(/opt/keycloak/bin/kcadm.sh create client-scopes \
+            --config /tmp/kcadm.config -r termlink \
+            -s name=termlink-registration-attempt \
+            -s protocol=openid-connect -i)
+        fi
+        /opt/keycloak/bin/kcadm.sh update "client-scopes/$$registration_scope_id" \
+          --config /tmp/kcadm.config -r termlink \
+          -s 'attributes={"include.in.token.scope":"false","display.on.consent.screen":"false"}' >/dev/null
+        /opt/keycloak/bin/kcadm.sh update realms/termlink/users/profile \
+          --config /tmp/kcadm.config \
+          -f /opt/keycloak/data/import/termlink-user-profile.json >/dev/null
+        native_flow_table=$$(/opt/keycloak/bin/kcadm.sh get authentication/flows \
+          --config /tmp/kcadm.config -r termlink \
+          --fields id,alias --format csv --noquotes)
+        native_flow_id=$$(printf '%s\n' "$$native_flow_table" | while IFS=, read -r id alias; do
+          if test "$$alias" = termlink-native-browser; then printf '%s' "$$id"; fi
+        done)
+        if test -z "$$native_flow_id"; then
+          native_flow_id=$$(/opt/keycloak/bin/kcadm.sh create authentication/flows \
+            --config /tmp/kcadm.config -r termlink -i \
+            -s alias=termlink-native-browser -s providerId=basic-flow \
+            -s topLevel=true -s builtIn=false)
+          /opt/keycloak/bin/kcadm.sh create \
+            authentication/flows/termlink-native-browser/executions/execution \
+            --config /tmp/kcadm.config -r termlink -s provider=auth-cookie >/dev/null
+          /opt/keycloak/bin/kcadm.sh create \
+            authentication/flows/termlink-native-browser/executions/flow \
+            --config /tmp/kcadm.config -r termlink \
+            -s alias=termlink-native-forms -s type=basic-flow >/dev/null
+          /opt/keycloak/bin/kcadm.sh create \
+            authentication/flows/termlink-native-forms/executions/execution \
+            --config /tmp/kcadm.config -r termlink \
+            -s provider=auth-username-password-form >/dev/null
+        fi
+        native_execution_table=$$(/opt/keycloak/bin/kcadm.sh get \
+          authentication/flows/termlink-native-browser/executions \
+          --config /tmp/kcadm.config -r termlink \
+          --fields id,displayName,level --format csv --noquotes)
+        native_cookie_execution=$$(printf '%s\n' "$$native_execution_table" | while IFS=, read -r id name level; do
+          if test "$$name" = Cookie -a "$$level" = 0; then printf '%s' "$$id"; fi
+        done)
+        native_forms_execution=$$(printf '%s\n' "$$native_execution_table" | while IFS=, read -r id name level; do
+          if test "$$name" = termlink-native-forms -a "$$level" = 0; then printf '%s' "$$id"; fi
+        done)
+        test -n "$$native_flow_id" -a -n "$$native_cookie_execution" -a -n "$$native_forms_execution"
+        /opt/keycloak/bin/kcadm.sh update \
+          authentication/flows/termlink-native-browser/executions \
+          --config /tmp/kcadm.config -r termlink -n \
+          -s id="$$native_cookie_execution" -s requirement=ALTERNATIVE >/dev/null
+        /opt/keycloak/bin/kcadm.sh update \
+          authentication/flows/termlink-native-browser/executions \
+          --config /tmp/kcadm.config -r termlink -n \
+          -s id="$$native_forms_execution" -s requirement=ALTERNATIVE >/dev/null
+        step_up_flow_id=$$(printf '%s\n' "$$native_flow_table" | while IFS=, read -r id alias; do
+          if test "$$alias" = termlink-web-mfa-step-up; then printf '%s' "$$id"; fi
+        done)
+        if test -z "$$step_up_flow_id"; then
+          step_up_flow_id=$$(/opt/keycloak/bin/kcadm.sh create authentication/flows \
+            --config /tmp/kcadm.config -r termlink -i \
+            -s alias=termlink-web-mfa-step-up -s providerId=basic-flow \
+            -s topLevel=true -s builtIn=false \
+            -s 'description=Same-account Web high-risk verification: existing SSO identity followed directly by OTP.')
+          /opt/keycloak/bin/kcadm.sh create \
+            authentication/flows/termlink-web-mfa-step-up/executions/execution \
+            --config /tmp/kcadm.config -r termlink -s provider=auth-cookie >/dev/null
+          /opt/keycloak/bin/kcadm.sh create \
+            authentication/flows/termlink-web-mfa-step-up/executions/execution \
+            --config /tmp/kcadm.config -r termlink -s provider=auth-otp-form >/dev/null
+        fi
+        step_up_execution_table=$$(/opt/keycloak/bin/kcadm.sh get \
+          authentication/flows/termlink-web-mfa-step-up/executions \
+          --config /tmp/kcadm.config -r termlink \
+          --fields id,displayName,level --format csv --noquotes)
+        step_up_cookie_execution=$$(printf '%s\n' "$$step_up_execution_table" | while IFS=, read -r id name level; do
+          if test "$$name" = Cookie -a "$$level" = 0; then printf '%s' "$$id"; fi
+        done)
+        step_up_otp_execution=$$(printf '%s\n' "$$step_up_execution_table" | while IFS=, read -r id name level; do
+          if test "$$name" = 'OTP Form' -a "$$level" = 0; then printf '%s' "$$id"; fi
+        done)
+        test -n "$$step_up_flow_id" -a -n "$$step_up_cookie_execution" -a -n "$$step_up_otp_execution"
+        /opt/keycloak/bin/kcadm.sh update \
+          authentication/flows/termlink-web-mfa-step-up/executions \
+          --config /tmp/kcadm.config -r termlink -n \
+          -s id="$$step_up_cookie_execution" -s requirement=REQUIRED >/dev/null
+        /opt/keycloak/bin/kcadm.sh update \
+          authentication/flows/termlink-web-mfa-step-up/executions \
+          --config /tmp/kcadm.config -r termlink -n \
+          -s id="$$step_up_otp_execution" -s requirement=REQUIRED >/dev/null
         android_client_id=$$(/opt/keycloak/bin/kcadm.sh get clients \
           --config /tmp/kcadm.config \
           -r termlink -q clientId=termlink-android \
@@ -230,7 +330,17 @@ services:
           -s serviceAccountsEnabled=false \
           -s fullScopeAllowed=false \
           -s 'redirectUris=["dev.termlink:/oauth2redirect"]' \
+          -s "authenticationFlowBindingOverrides={\"browser\":\"$$native_flow_id\"}" \
           -s 'attributes={"pkce.code.challenge.method":"S256"}' >/dev/null
+        # This scope must stay optional. RegisterAttempt requests it only for
+        # the create-account flow, while normal tokens and Account Console do
+        # not receive or reveal the controlled recovery fields.
+        /opt/keycloak/bin/kcadm.sh delete \
+          "clients/$$android_client_id/default-client-scopes/$$registration_scope_id" \
+          --config /tmp/kcadm.config -r termlink >/dev/null 2>&1 || true
+        /opt/keycloak/bin/kcadm.sh update \
+          "clients/$$android_client_id/optional-client-scopes/$$registration_scope_id" \
+          --config /tmp/kcadm.config -r termlink >/dev/null
         cat > /tmp/termlink-android-audience.json <<'JSON'
         {
           "name": "termlink-server-audience",
@@ -306,6 +416,7 @@ services:
           -s serviceAccountsEnabled=false \
           -s fullScopeAllowed=false \
           -s 'redirectUris=["http://127.0.0.1:43971/oauth2/callback"]' \
+          -s "authenticationFlowBindingOverrides={\"browser\":\"$$native_flow_id\"}" \
           -s 'attributes={"pkce.code.challenge.method":"S256"}' >/dev/null
         client_scope_table=$$(/opt/keycloak/bin/kcadm.sh get client-scopes \
           --config /tmp/kcadm.config \
@@ -363,6 +474,39 @@ services:
           }
         }
         JSON
+        cat > /tmp/termlink-web-nickname.json <<'JSON'
+        {
+          "name": "termlink-web-nickname",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "nickname",
+            "claim.name": "nickname",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+        JSON
+        cat > /tmp/termlink-web-amr.json <<'JSON'
+        {
+          "name": "termlink-web-amr",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "amr",
+            "claim.value": "[\"pwd\"]",
+            "jsonType.label": "JSON",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false",
+            "access.tokenResponse.claim": "false"
+          }
+        }
+        JSON
         web_mapper_table=$$(/opt/keycloak/bin/kcadm.sh get \
           "clients/$$web_client_id/protocol-mappers/models" \
           --config /tmp/kcadm.config -r termlink \
@@ -376,6 +520,177 @@ services:
             --config /tmp/kcadm.config -r termlink \
             -f /tmp/termlink-web-realm-roles.json >/dev/null
         fi
+        web_nickname_mapper_id=$$(printf '%s\n' "$$web_mapper_table" | while IFS=, read -r id name; do
+          if test "$$name" = termlink-web-nickname; then printf '%s' "$$id"; fi
+        done)
+        if test -z "$$web_nickname_mapper_id"; then
+          /opt/keycloak/bin/kcadm.sh create \
+            "clients/$$web_client_id/protocol-mappers/models" \
+            --config /tmp/kcadm.config -r termlink \
+            -f /tmp/termlink-web-nickname.json >/dev/null
+        fi
+        web_amr_mapper_id=$$(printf '%s\n' "$$web_mapper_table" | while IFS=, read -r id name; do
+          if test "$$name" = termlink-web-amr; then printf '%s' "$$id"; fi
+        done)
+        if test -z "$$web_amr_mapper_id"; then
+          /opt/keycloak/bin/kcadm.sh create \
+            "clients/$$web_client_id/protocol-mappers/models" \
+            --config /tmp/kcadm.config -r termlink \
+            -f /tmp/termlink-web-amr.json >/dev/null
+        else
+          /opt/keycloak/bin/kcadm.sh delete \
+            "clients/$$web_client_id/protocol-mappers/models/$$web_amr_mapper_id" \
+            --config /tmp/kcadm.config -r termlink >/dev/null
+          /opt/keycloak/bin/kcadm.sh create \
+            "clients/$$web_client_id/protocol-mappers/models" \
+            --config /tmp/kcadm.config -r termlink \
+            -f /tmp/termlink-web-amr.json >/dev/null
+        fi
+        step_up_client_id=$$(/opt/keycloak/bin/kcadm.sh get clients \
+          --config /tmp/kcadm.config -r termlink -q clientId=termlink-web-step-up \
+          --fields id --format csv --noquotes | tail -n 1)
+        if test -z "$$step_up_client_id"; then
+          step_up_client_id=$$(/opt/keycloak/bin/kcadm.sh create clients \
+            --config /tmp/kcadm.config -r termlink -i \
+            -s clientId=termlink-web-step-up -s protocol=openid-connect)
+        fi
+        test -n "$$step_up_client_id" -a -n "$$step_up_flow_id"
+        /opt/keycloak/bin/kcadm.sh update "clients/$$step_up_client_id" \
+          --config /tmp/kcadm.config -r termlink \
+          -s 'name=TermLink 高风险操作 MFA 验证' \
+          -s enabled=true \
+          -s publicClient=true \
+          -s standardFlowEnabled=true \
+          -s directAccessGrantsEnabled=false \
+          -s implicitFlowEnabled=false \
+          -s serviceAccountsEnabled=false \
+          -s fullScopeAllowed=false \
+          -s rootUrl=${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910} \
+          -s baseUrl=${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}/account \
+          -s 'redirectUris=["${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}/auth/callback"]' \
+          -s 'webOrigins=["${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}"]' \
+          -s 'attributes={"pkce.code.challenge.method":"S256"}' \
+          -s "authenticationFlowBindingOverrides={\"browser\":\"$$step_up_flow_id\"}" >/dev/null
+        for scope_name in web-origins acr profile basic email; do
+          scope_id=$$(printf '%s\n' "$$client_scope_table" | while IFS=, read -r id name; do
+            if test "$$name" = "$$scope_name"; then printf '%s' "$$id"; fi
+          done)
+          test -n "$$scope_id"
+          /opt/keycloak/bin/kcadm.sh update \
+            "clients/$$step_up_client_id/default-client-scopes/$$scope_id" \
+            --config /tmp/kcadm.config -r termlink >/dev/null
+        done
+        cat > /tmp/termlink-web-step-up-amr.json <<'JSON'
+        {
+          "name": "termlink-web-step-up-amr",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "amr",
+            "claim.value": "[\"otp\"]",
+            "jsonType.label": "JSON",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false",
+            "access.tokenResponse.claim": "false"
+          }
+        }
+        JSON
+        step_up_mapper_table=$$(/opt/keycloak/bin/kcadm.sh get \
+          "clients/$$step_up_client_id/protocol-mappers/models" \
+          --config /tmp/kcadm.config -r termlink \
+          --fields id,name --format csv --noquotes)
+        step_up_amr_mapper_id=$$(printf '%s\n' "$$step_up_mapper_table" | while IFS=, read -r id name; do
+          if test "$$name" = termlink-web-step-up-amr; then printf '%s' "$$id"; fi
+        done)
+        if test -n "$$step_up_amr_mapper_id"; then
+          /opt/keycloak/bin/kcadm.sh delete \
+            "clients/$$step_up_client_id/protocol-mappers/models/$$step_up_amr_mapper_id" \
+            --config /tmp/kcadm.config -r termlink >/dev/null
+        fi
+        /opt/keycloak/bin/kcadm.sh create \
+          "clients/$$step_up_client_id/protocol-mappers/models" \
+          --config /tmp/kcadm.config -r termlink \
+          -f /tmp/termlink-web-step-up-amr.json >/dev/null
+        recovery_client_id=$$(/opt/keycloak/bin/kcadm.sh get clients \
+          --config /tmp/kcadm.config -r termlink \
+          -q clientId=termlink-registration-recovery \
+          --fields id --format csv --noquotes | tail -n 1)
+        if test -z "$$recovery_client_id"; then
+          recovery_client_id=$$(/opt/keycloak/bin/kcadm.sh create clients \
+            --config /tmp/kcadm.config -r termlink -i \
+            -s clientId=termlink-registration-recovery \
+            -s 'name=TermLink Registration and Identity Recovery' \
+            -s enabled=true -s publicClient=false -s bearerOnly=false \
+            -s standardFlowEnabled=false -s implicitFlowEnabled=false \
+            -s directAccessGrantsEnabled=false -s serviceAccountsEnabled=true \
+            -s fullScopeAllowed=false)
+        else
+          /opt/keycloak/bin/kcadm.sh update "clients/$$recovery_client_id" \
+            --config /tmp/kcadm.config -r termlink \
+            -s enabled=true -s publicClient=false -s bearerOnly=false \
+            -s standardFlowEnabled=false -s implicitFlowEnabled=false \
+            -s directAccessGrantsEnabled=false -s serviceAccountsEnabled=true \
+            -s fullScopeAllowed=false >/dev/null
+        fi
+        recovery_service_account=$$(/opt/keycloak/bin/kcadm.sh get \
+          "clients/$$recovery_client_id/service-account-user" \
+          --config /tmp/kcadm.config -r termlink \
+          --fields id,username --format csv --noquotes | tail -n 1)
+        IFS=, read -r recovery_user_id recovery_username <<EOF
+        $$recovery_service_account
+        EOF
+        test -n "$$recovery_user_id" -a -n "$$recovery_username"
+        realm_management_id=$$(/opt/keycloak/bin/kcadm.sh get clients \
+          --config /tmp/kcadm.config -r termlink \
+          -q clientId=realm-management \
+          --fields id --format csv --noquotes | tail -n 1)
+        test -n "$$realm_management_id"
+        recovery_roles=$$(/opt/keycloak/bin/kcadm.sh get \
+          "users/$$recovery_user_id/role-mappings/clients/$$realm_management_id" \
+          --config /tmp/kcadm.config -r termlink \
+          --fields name --format csv --noquotes)
+        printf '%s\n' "$$recovery_roles" | while IFS= read -r assigned_role; do
+          case "$$assigned_role" in
+            query-users|manage-users|manage-realm|'') ;;
+            *)
+              /opt/keycloak/bin/kcadm.sh remove-roles \
+                --config /tmp/kcadm.config -r termlink \
+                --uusername "$$recovery_username" \
+                --cclientid realm-management \
+                --rolename "$$assigned_role" >/dev/null
+              ;;
+          esac
+        done
+        for recovery_role in query-users manage-users manage-realm; do
+          if ! printf '%s\n' "$$recovery_roles" | grep -Fxq "$$recovery_role"; then
+            /opt/keycloak/bin/kcadm.sh add-roles \
+              --config /tmp/kcadm.config -r termlink \
+              --uusername "$$recovery_username" \
+              --cclientid realm-management \
+              --rolename "$$recovery_role" >/dev/null
+          fi
+          recovery_role_id=$$(/opt/keycloak/bin/kcadm.sh get \
+            "clients/$$realm_management_id/roles/$$recovery_role" \
+            --config /tmp/kcadm.config -r termlink \
+            --fields id --format csv --noquotes | tail -n 1)
+          test -n "$$recovery_role_id"
+          printf '[{"id":"%s","name":"%s","clientRole":true,"containerId":"%s"}]' \
+            "$$recovery_role_id" "$$recovery_role" "$$realm_management_id" \
+            > /tmp/termlink-recovery-scope-role.json
+          /opt/keycloak/bin/kcadm.sh create \
+            "clients/$$recovery_client_id/scope-mappings/clients/$$realm_management_id" \
+            --config /tmp/kcadm.config -r termlink \
+            -f /tmp/termlink-recovery-scope-role.json >/dev/null
+        done
+        recovery_secret=$$(/opt/keycloak/bin/kcadm.sh get \
+          "clients/$$recovery_client_id/client-secret" \
+          --config /tmp/kcadm.config -r termlink \
+          --fields value --format csv --noquotes | tail -n 1)
+        test -n "$$recovery_secret"
+        printf '%s' "$$recovery_secret" > /target/server-secrets/keycloak_admin_client_secret
+        unset recovery_secret
         admin_user_id=$$(/opt/keycloak/bin/kcadm.sh get users \
           --config /tmp/kcadm.config \
           -r termlink -q exact=true -q username=admin \
@@ -386,7 +701,7 @@ services:
             -s username=admin -s enabled=true -i)
           /opt/keycloak/bin/kcadm.sh update "users/$$admin_user_id" \
             --config /tmp/kcadm.config -r termlink \
-            -s firstName=TermLink -s lastName=Administrator \
+            -s 'attributes.nickname=["TermLink 管理员"]' \
             -s email=admin@termlink.local -s emailVerified=true -s enabled=true >/dev/null
           /opt/keycloak/bin/kcadm.sh set-password \
             --config /tmp/kcadm.config \
@@ -428,8 +743,7 @@ services:
           /opt/keycloak/bin/kcadm.sh update "users/$$user_id" \
             --config /tmp/kcadm.config \
             -r termlink \
-            -s firstName=Acceptance \
-            -s lastName="$$username" \
+            -s "attributes.nickname=[\"$$username\"]" \
             -s email="$$username@termlink.local" \
             -s emailVerified=true \
             -s enabled=true >/dev/null
@@ -443,6 +757,8 @@ services:
     networks: ["frontend"]
     volumes:
       - acceptance-keycloak-init-secrets:/run/secrets:ro
+      - acceptance-server-secrets:/target/server-secrets
+      - ../acceptance/keycloak-user-profile.json:/opt/keycloak/data/import/termlink-user-profile.json:ro
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
@@ -542,7 +858,11 @@ services:
         rm -f /target/acceptance-root-ca.crt;
         cp /data/caddy/pki/authorities/local/root.crt /target/acceptance-root-ca.crt;
         chmod 0400 /target/acceptance-root-ca.crt;
-        chown 65532:65532 /target/acceptance-root-ca.crt
+        chown 65532:65532 /target/acceptance-root-ca.crt;
+        test -s /target/keycloak_admin_client_secret;
+        chown 0:0 /target/keycloak_admin_client_secret;
+        chmod 0400 /target/keycloak_admin_client_secret;
+        chown 65532:65532 /target/keycloak_admin_client_secret
     secrets:
       - oidc_client_secret
       - database_url
@@ -561,6 +881,8 @@ services:
     depends_on:
       edge:
         condition: service_healthy
+      keycloak-init:
+        condition: service_completed_successfully
     restart: "no"
 
   migrate:
@@ -580,6 +902,7 @@ services:
       TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES: termlink-windows,termlink-acceptance-cli
       TERMLINK_WINDOWS_OIDC_REDIRECT_URI: http://127.0.0.1:43971/oauth2/callback
       TERMLINK_WEB_OIDC_CLIENT_ID: termlink-web
+      TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID: termlink-web-step-up
       TERMLINK_WEB_OIDC_REDIRECT_URI: ${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}/auth/callback
       TERMLINK_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
       TERMLINK_DATABASE_URL_FILE: /run/secrets/database_url
@@ -618,6 +941,14 @@ services:
     environment:
       <<: *termlink_environment
       SSL_CERT_FILE: /run/secrets/acceptance-root-ca.crt
+      TERMLINK_APPSHIP_BASE_URL: ${TERMLINK_APPSHIP_BASE_URL:-https://appship.kget.cc:8910}
+      TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS: ${TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS:-}
+      TERMLINK_REGISTRATION_RECOVERY_ENABLED: "true"
+      TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID: termlink-registration-recovery
+      TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE: /run/secrets/keycloak_admin_client_secret
+      # Recovery uses the private identity-management hop. The public origin
+      # deliberately does not expose Keycloak's /admin API.
+      TERMLINK_KEYCLOAK_ADMIN_BASE_URL: http://keycloak:8080
     networks:
       - frontend
       - backend

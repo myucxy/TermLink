@@ -34,6 +34,8 @@ class RemoteTerminalSession(
     private val clockMillis: () -> Long = System::currentTimeMillis,
     private val inputIdFactory: () -> UUID = UUID::randomUUID,
     private val disposeEngineOnClose: Boolean = true,
+    orderedEventObserver: RemoteSessionOrderedEventObserver? = null,
+    orderedEventObserverCapacity: Int = 64,
 ) : AutoCloseable {
     private val initialAcknowledgedSequence = initialRendererState.sequence
     private val sessionJob = SupervisorJob(parentScope.coroutineContext[Job])
@@ -61,6 +63,9 @@ class RemoteTerminalSession(
     private var gapGeneration = 0L
     private var leaseExpiryJob: Job? = null
     private var leaseRenewalJob: Job? = null
+    private val orderedEventDispatcher = orderedEventObserver?.let {
+        FailIsolatedOrderedEventDispatcher(parentScope, it, orderedEventObserverCapacity)
+    }
 
     val state: StateFlow<RemoteSessionState> = mutableState.asStateFlow()
     val title: StateFlow<String?> = mutableTitle.asStateFlow()
@@ -234,6 +239,7 @@ class RemoteTerminalSession(
             lastAppliedSequence = event.sequence
             mutableState.value = withUpdatedAck(mutableState.value)
             if (sendAcknowledgement) requestAcknowledgement(lastAppliedSequence)
+            orderedEventDispatcher?.offerApplied(rendererGeneration, event)
             return EventAcceptance.Applied(event.sequence)
         }
         if (event.sequence != expected) {
@@ -273,6 +279,7 @@ class RemoteTerminalSession(
         if (sendAcknowledgement) {
             requestAcknowledgement(lastAppliedSequence)
         }
+        orderedEventDispatcher?.offerApplied(rendererGeneration, event)
         EventAcceptance.Applied(event.sequence)
     }
 
@@ -339,6 +346,7 @@ class RemoteTerminalSession(
                         acknowledgementHighWater.set(0)
                         mutableTitle.value = null
                         mutableState.value = RemoteSessionState.Live(lastAckedSequence)
+                        orderedEventDispatcher?.offerReset(rendererGeneration)
                         for (event in events) {
                             when (event) {
                                 is RemoteSessionEvent.Output -> applyOutput(event)
@@ -354,6 +362,7 @@ class RemoteTerminalSession(
                             lastAppliedSequence = event.sequence
                             mutableState.value = stateAfterAppliedEvent(event)
                             if (acknowledgeEach) requestAcknowledgement(lastAppliedSequence)
+                            orderedEventDispatcher?.offerApplied(rendererGeneration, event)
                         }
                         if (!acknowledgeEach) requestAcknowledgement(lastAppliedSequence)
                         lastAppliedSequence
@@ -364,6 +373,7 @@ class RemoteTerminalSession(
                         acknowledgementHighWater.set(0)
                         mutableTitle.value = null
                         runCatching { engine.clear() }.exceptionOrNull()?.let(error::addSuppressed)
+                        orderedEventDispatcher?.offerInvalidated(rendererGeneration)
                         gapGeneration++
                         mutableState.value = RemoteSessionState.HistoryGap(
                             lastAckedSequence = 0,
@@ -435,6 +445,7 @@ class RemoteTerminalSession(
                 lastAppliedSequence = 0
                 lastPresentationRevision = 0
                 mutableTitle.value = null
+                orderedEventDispatcher?.offerReset(rendererGeneration)
                 var recoveredState: RemoteSessionState = RemoteSessionState.Live(lastAckedSequence)
                 var durable = false
                 try {
@@ -463,6 +474,7 @@ class RemoteTerminalSession(
                             }
                             else -> recoveredState
                         }
+                        orderedEventDispatcher?.offerApplied(rendererGeneration, event)
                     }
                     val commit = persist(rendererGeneration, target)
                     require(commit.sequence == target && commit.rendererGeneration == rendererGeneration) {
@@ -495,6 +507,7 @@ class RemoteTerminalSession(
                         acknowledgementHighWater.set(0)
                         mutableTitle.value = null
                         runCatching { engine.clear() }.exceptionOrNull()?.let(error::addSuppressed)
+                        orderedEventDispatcher?.offerInvalidated(rendererGeneration)
                         mutableState.value = RemoteSessionState.HistoryGap(
                             lastAckedSequence = 0,
                             expectedSequence = 1,
@@ -669,6 +682,7 @@ class RemoteTerminalSession(
             received,
             gapGeneration,
         )
+        orderedEventDispatcher?.offerInvalidated(rendererGeneration)
     }
 
     private suspend fun markReconnecting(reason: String?) {
@@ -708,6 +722,7 @@ class RemoteTerminalSession(
         acknowledgementSignal.close()
         acknowledgementJob.cancel()
         scope.cancel()
+        orderedEventDispatcher?.close()
         if (mutex.tryLock()) {
             try {
                 closeEngine()

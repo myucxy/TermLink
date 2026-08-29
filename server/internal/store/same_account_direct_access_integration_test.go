@@ -135,6 +135,22 @@ func TestSameAccountDirectAccess(t *testing.T) {
 	if route.Permission != "MANAGE" || route.PCDeviceID != windows.ID || route.GrantExpiresAt != nil {
 		t.Fatalf("same-account route=%+v, want MANAGE through PC device %s without expiry", route, windows.ID)
 	}
+	policy, err := repository.SessionControlPolicy(ctx, userID, android.ID, sessionID)
+	if err != nil {
+		t.Fatalf("same-account control policy: %v", err)
+	}
+	if policy.Mode != ControlModeSingle || !policy.LocalPriority || policy.PolicyVersion != 1 ||
+		policy.PCID != pcID || policy.PCDeviceID != windows.ID || policy.GrantExpiresAt != nil {
+		t.Fatalf("same-account control policy=%+v, want default SINGLE policy for PC %s", policy, pcID)
+	}
+	routes, err := repository.SessionRoutes(ctx, userID, android.ID, []uuid.UUID{sessionID})
+	if err != nil {
+		t.Fatalf("same-account batch routes: %v", err)
+	}
+	batchRoute, ok := routes[sessionID]
+	if !ok || batchRoute.Permission != "MANAGE" || batchRoute.PCDeviceID != windows.ID || batchRoute.GrantExpiresAt != nil {
+		t.Fatalf("same-account batch route=%+v present=%v, want MANAGE through PC device %s without expiry", batchRoute, ok, windows.ID)
+	}
 
 	leaseID := uuid.New()
 	leaseExpiry := time.Now().UTC().Add(30 * time.Second)

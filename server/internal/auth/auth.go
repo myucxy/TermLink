@@ -39,6 +39,9 @@ type Identity struct {
 	Subject         string
 	AuthorizedParty string
 	TokenID         string
+	AuthenticatedAt time.Time
+	MFA             bool
+	ACR             string
 }
 
 type TokenVerifier interface {
@@ -80,10 +83,13 @@ func (v *OIDCVerifier) Verify(ctx context.Context, raw string) (Identity, error)
 		return Identity{}, fmt.Errorf("%w: invalid OIDC token", ErrUnauthenticated)
 	}
 	var claims struct {
-		Subject         string `json:"sub"`
-		AuthorizedParty string `json:"azp"`
-		TokenType       string `json:"typ"`
-		TokenID         string `json:"jti"`
+		Subject         string   `json:"sub"`
+		AuthorizedParty string   `json:"azp"`
+		TokenType       string   `json:"typ"`
+		TokenID         string   `json:"jti"`
+		AuthTime        int64    `json:"auth_time"`
+		AMR             []string `json:"amr"`
+		ACR             string   `json:"acr"`
 	}
 	if err := token.Claims(&claims); err != nil || strings.TrimSpace(claims.Subject) == "" {
 		return Identity{}, fmt.Errorf("%w: missing subject", ErrUnauthenticated)
@@ -97,12 +103,33 @@ func (v *OIDCVerifier) Verify(ctx context.Context, raw string) (Identity, error)
 	if strings.TrimSpace(claims.TokenID) == "" {
 		return Identity{}, fmt.Errorf("%w: missing token identifier", ErrUnauthenticated)
 	}
-	return Identity{
+	identity := Identity{
 		Issuer:          v.issuer,
 		Subject:         claims.Subject,
 		AuthorizedParty: claims.AuthorizedParty,
 		TokenID:         claims.TokenID,
-	}, nil
+		MFA:             isStrongAuthentication(claims.AMR, claims.ACR),
+		ACR:             strings.TrimSpace(claims.ACR),
+	}
+	if claims.AuthTime > 0 {
+		identity.AuthenticatedAt = time.Unix(claims.AuthTime, 0).UTC()
+	}
+	return identity, nil
+}
+
+func isStrongAuthentication(amr []string, acr string) bool {
+	for _, method := range amr {
+		switch strings.ToLower(strings.TrimSpace(method)) {
+		case "mfa", "otp", "hwk", "webauthn":
+			return true
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(acr)) {
+	case "urn:termlink:acr:mfa", "urn:mace:incommon:iap:silver", "multi-factor":
+		return true
+	default:
+		return false
+	}
 }
 
 // SubjectHash prevents raw OIDC subjects from being stored in PostgreSQL.
@@ -177,13 +204,29 @@ func (m Middleware) authenticate(next http.Handler, requireTrusted bool) http.Ha
 			}
 			slog.Warn("request authentication rejected",
 				"method", r.Method,
-				"path", requestTarget(r),
-				"reason", err.Error())
+				// Query values participate in the signed request target, but they
+				// may carry OAuth codes, tokens, or user-controlled data and must
+				// never be copied into authentication logs.
+				"path", r.URL.EscapedPath(),
+				"reason_class", authenticationFailureClass(err))
 			writeAuthError(w, status, err)
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, principal)))
 	})
+}
+
+func authenticationFailureClass(err error) string {
+	switch {
+	case errors.Is(err, ErrDevicePending):
+		return "DEVICE_PENDING"
+	case errors.Is(err, ErrDeviceRevoked):
+		return "DEVICE_REVOKED"
+	case errors.Is(err, ErrUnauthenticated):
+		return "UNAUTHENTICATED"
+	default:
+		return "AUTHENTICATION_REJECTED"
+	}
 }
 
 func (m Middleware) VerifyRequest(r *http.Request) (Principal, error) {

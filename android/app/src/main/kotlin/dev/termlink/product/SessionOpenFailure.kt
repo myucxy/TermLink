@@ -1,6 +1,7 @@
 package dev.termlink.product
 
 import android.content.Context
+import android.database.sqlite.SQLiteFullException
 import androidx.annotation.StringRes
 import dev.termlink.harness.R
 import dev.termlink.network.production.TermLinkApiException
@@ -38,10 +39,10 @@ enum class SessionOpenFailureCode(
     SNAPSHOT_INSTALL("TL-H112", true, R.string.terminal_error_snapshot_install, R.string.terminal_error_action_retry),
     HISTORY_NOT_READY("TL-H113", true, R.string.terminal_error_history_not_ready, R.string.terminal_error_action_wait_history),
     HISTORY_GAP("TL-H114", false, R.string.terminal_error_history_gap, R.string.terminal_error_action_republish_history),
-    HISTORY_REPLAY_LIMIT("TL-H115", false, R.string.terminal_error_history_replay_limit, R.string.terminal_error_action_update),
     HISTORY_REPLAY("TL-H116", true, R.string.terminal_error_history_replay, R.string.terminal_error_action_retry),
     SNAPSHOT_UNSUPPORTED("TL-H117", false, R.string.terminal_error_snapshot_unsupported, R.string.terminal_error_action_update),
     SNAPSHOT_PRODUCTION_FAILED("TL-H118", true, R.string.terminal_error_snapshot_production_failed, R.string.terminal_error_action_retry),
+    LOCAL_STORAGE_FULL("TL-H119", true, R.string.terminal_error_local_storage_full, R.string.terminal_error_action_free_storage),
     REALTIME_CONNECTION("TL-R001", true, R.string.terminal_error_realtime_connection, R.string.terminal_error_action_check_network),
     CONTROL_LEASE_HELD("TL-C001", true, R.string.terminal_error_control_lease, R.string.terminal_error_action_wait_lease),
     UNKNOWN("TL-X001", true, R.string.terminal_error_unknown, R.string.terminal_error_action_retry),
@@ -91,6 +92,9 @@ internal fun classifySessionOpenException(
     stage: SessionFailureStage,
 ): SessionOpenException {
     if (error is SessionOpenException) return error
+    if (error is SQLiteFullException || error.causedBy<SQLiteFullException>()) {
+        return sessionOpenException(SessionOpenFailureCode.LOCAL_STORAGE_FULL, error)
+    }
     if (error is TermLinkApiException) {
         val code = when {
             error.status == 401 -> SessionOpenFailureCode.AUTHENTICATION_EXPIRED

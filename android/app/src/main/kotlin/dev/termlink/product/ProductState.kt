@@ -634,6 +634,7 @@ internal fun retainOldestTranscriptPages(
 enum class ProductBootstrapSource {
     EMPTY,
     LEGACY_REPLAY,
+    TAIL_REPLAY,
     BOUND_SNAPSHOT,
     REMOTE_SNAPSHOT,
 }

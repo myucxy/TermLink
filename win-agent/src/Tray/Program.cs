@@ -137,8 +137,8 @@ namespace TermLink.Tray
                 {
                     MessageBox.Show(
                         TrayText.Pick(
-                            "TermLink 启动失败：" + error.Message + "\n\n诊断日志已写入本机 TermLink 日志目录。",
-                            "TermLink could not start: " + error.Message + "\n\nA diagnostic was written to the local TermLink log directory."),
+                            "TermLink 启动失败：" + TrayText.PublicError(error) + "\n\n诊断日志已写入本机 TermLink 日志目录。",
+                            "TermLink could not start: " + TrayText.PublicError(error) + "\n\nA diagnostic was written to the local TermLink log directory."),
                         "TermLink",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Error);

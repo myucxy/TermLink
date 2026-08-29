@@ -62,7 +62,7 @@ namespace TermLink.Setup
             var hasPreviousInstall = Installer.IsValidInstallDirectory(previousInstallDirectory);
             prerequisites = SetupPrerequisites.EvaluateCurrent();
 
-            Text = "TermLink 安装程序";
+            Text = SetupText.Pick("TermLink 安装程序", "TermLink Setup");
             Icon = LoadIcon();
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
@@ -75,7 +75,7 @@ namespace TermLink.Setup
                 AutoSize = true,
                 Font = new Font(Font, FontStyle.Bold),
                 Location = new Point(18, 18),
-                Text = "安装 TermLink Windows Agent"
+                Text = SetupText.Pick("安装 TermLink Windows Agent", "Install TermLink Windows Agent")
             };
             Controls.Add(title);
 
@@ -83,7 +83,7 @@ namespace TermLink.Setup
             {
                 AutoSize = true,
                 Location = new Point(18, 60),
-                Text = "安装目录："
+                Text = SetupText.Pick("安装目录：", "Install folder:")
             };
             Controls.Add(label);
 
@@ -101,7 +101,7 @@ namespace TermLink.Setup
                 Anchor = AnchorStyles.Top | AnchorStyles.Right,
                 Location = new Point(462, 54),
                 Size = new Size(80, 27),
-                Text = "浏览..."
+                Text = SetupText.Pick("浏览...", "Browse...")
             };
             browse.Click += BrowseClick;
             Controls.Add(browse);
@@ -110,7 +110,7 @@ namespace TermLink.Setup
             {
                 AutoSize = true,
                 Location = new Point(88, 92),
-                Text = "登录 Windows 时自动启动 TermLink",
+                Text = SetupText.Pick("登录 Windows 时自动启动 TermLink", "Start TermLink when I sign in to Windows"),
                 Checked = true
             };
             Controls.Add(startup);
@@ -121,12 +121,16 @@ namespace TermLink.Setup
                 Location = new Point(18, 127),
                 Size = new Size(524, 60),
                 Text = !prerequisites.Supported
-                    ? "无法安装：" + string.Join(" ", prerequisites.Errors)
+                    ? SetupText.Pick("无法安装：", "Cannot install: ") + string.Join(" ", prerequisites.Errors)
                     : !prerequisites.WindowsTerminalInstalled
                         ? string.Join(" ", prerequisites.Warnings)
                         : hasPreviousInstall
-                            ? "检测到已有安装，将在上次目录原地升级；如需更换目录，请先卸载现有版本。"
-                            : "检测到 Windows Terminal；安装器将配置独立的 TermLink Profile Fragment。"
+                            ? SetupText.Pick(
+                                "检测到已有安装，将在上次目录原地升级；如需更换目录，请先卸载现有版本。",
+                                "An existing installation was found and will be upgraded in place. Uninstall it first to change folders.")
+                            : SetupText.Pick(
+                                "检测到 Windows Terminal；安装器将配置独立的 TermLink Profile Fragment。",
+                                "Windows Terminal was found. Setup will configure a separate TermLink profile fragment.")
             };
             Controls.Add(status);
 
@@ -136,7 +140,7 @@ namespace TermLink.Setup
                 DialogResult = DialogResult.None,
                 Location = new Point(382, 196),
                 Size = new Size(78, 27),
-                Text = "安装",
+                Text = SetupText.Pick("安装", "Install"),
                 Enabled = prerequisites.Supported
             };
             install.Click += InstallClick;
@@ -148,7 +152,7 @@ namespace TermLink.Setup
                 DialogResult = DialogResult.None,
                 Location = new Point(464, 196),
                 Size = new Size(78, 27),
-                Text = "取消"
+                Text = SetupText.Pick("取消", "Cancel")
             };
             cancel.Click += CancelClick;
             Controls.Add(cancel);
@@ -194,7 +198,7 @@ namespace TermLink.Setup
         {
             using (var dialog = new FolderBrowserDialog
             {
-                Description = "选择 TermLink 安装目录",
+                Description = SetupText.Pick("选择 TermLink 安装目录", "Choose the TermLink install folder"),
                 SelectedPath = installDirectory.Text
             })
             {
@@ -211,7 +215,12 @@ namespace TermLink.Setup
             var target = installDirectory.Text.Trim();
             if (string.IsNullOrWhiteSpace(target))
             {
-                MessageBox.Show(this, "请输入安装目录。", "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(
+                    this,
+                    SetupText.Pick("请输入安装目录。", "Enter an install folder."),
+                    "TermLink",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
                 return;
             }
 
@@ -236,13 +245,15 @@ namespace TermLink.Setup
                     var decision = MessageBox.Show(
                         this,
                         Installer.FormatUpgradeTerminationPrompt(runningProcesses, runningServices),
-                        "TermLink 升级 / Upgrade",
+                        SetupText.Pick("TermLink 升级", "TermLink Upgrade"),
                         MessageBoxButtons.YesNo,
                         MessageBoxIcon.Warning,
                         MessageBoxDefaultButton.Button2);
                     if (decision != DialogResult.Yes)
                     {
-                        status.Text = "升级已取消；现有 TermLink 程序未被终止。";
+                        status.Text = SetupText.Pick(
+                            "升级已取消；现有 TermLink 程序未被终止。",
+                            "Upgrade cancelled. The existing TermLink processes were not stopped.");
                         return;
                     }
                     terminateRunningProcesses = true;
@@ -255,7 +266,7 @@ namespace TermLink.Setup
                 installCancellation = cancellation;
                 installCommitGate = commitGate;
                 SetInstallInputsEnabled(false);
-                status.Text = "正在安装，请稍候...";
+                status.Text = SetupText.Pick("正在安装，请稍候...", "Installing. Please wait...");
                 var outcome = await Task.Run(() => Installer.Install(
                     target,
                     createStartup,
@@ -272,14 +283,18 @@ namespace TermLink.Setup
                 if (ReferenceEquals(installCancellation, cancellation))
                     installCancellation = null;
                 cancel.Enabled = false;
-                cancel.Text = "关闭";
-                status.Text = "安装完成，正在启动 TermLink...";
+                cancel.Text = SetupText.Pick("关闭", "Close");
+                status.Text = SetupText.Pick(
+                    "安装完成，正在启动 TermLink...",
+                    "Installation complete. Starting TermLink...");
                 var trayRestarted = await Task.Run(() => Installer.TryLaunchTray(target));
                 committedInstallIsFinishing = false;
                 cancel.Enabled = true;
                 if (!trayRestarted)
                 {
-                    status.Text = "安装完成，但主程序启动失败。";
+                    status.Text = SetupText.Pick(
+                        "安装完成，但主程序启动失败。",
+                        "Installation completed, but the app did not start.");
                     if (closeWhenFinished)
                     {
                         closeSilently = true;
@@ -288,10 +303,14 @@ namespace TermLink.Setup
                     {
                         MessageBox.Show(
                             this,
-                            "TermLink 文件已完成安装，但主程序未通过本地控制管道健康检查。" +
-                            Environment.NewLine +
-                            "请从开始菜单重试；若仍失败，请查看 %LOCALAPPDATA%\\TermLink\\logs\\TermLink-startup.log。",
-                            "TermLink 启动失败 / Startup failed",
+                            SetupText.Pick(
+                                "TermLink 文件已完成安装，但主程序未通过本地控制管道健康检查。" +
+                                Environment.NewLine +
+                                "请从开始菜单重试；若仍失败，请查看本机 TermLink 日志。",
+                                "TermLink files were installed, but the app did not pass its local control-pipe health check." +
+                                Environment.NewLine +
+                                "Try again from the Start menu. If it still fails, check the local TermLink logs."),
+                            SetupText.Pick("TermLink 启动失败", "TermLink Startup Failed"),
                             MessageBoxButtons.OK,
                             MessageBoxIcon.Warning);
                     }
@@ -302,43 +321,55 @@ namespace TermLink.Setup
                 }
                 else
                 {
-                    status.Text = "安装完成。";
+                    status.Text = SetupText.Pick("安装完成。", "Installation complete.");
                     completionMessage = outcome.TerminalConfigured
-                        ? "TermLink 安装完成。重新打开 Windows Terminal 后即可看到 TermLink Profile。"
+                        ? SetupText.Pick(
+                            "TermLink 安装完成。重新打开 Windows Terminal 后即可看到 TermLink Profile。",
+                            "TermLink installation is complete. Reopen Windows Terminal to see the TermLink profile.")
                         : outcome.TerminalMessage +
                             (string.IsNullOrWhiteSpace(outcome.TerminalDiagnosticLogPath)
                                 ? string.Empty
                                 : Environment.NewLine + Environment.NewLine +
-                                    "诊断日志: " + outcome.TerminalDiagnosticLogPath);
+                                    SetupText.DiagnosticRecorded());
                     completionMessage += Environment.NewLine + Environment.NewLine +
-                        "TermLink 已使用新版本重新启动。";
+                        SetupText.Pick(
+                            "TermLink 已使用新版本重新启动。",
+                            "TermLink restarted with the new version.");
                 }
             }
             catch (OperationCanceledException) when (
                 !committed && cancellation != null && cancellation.IsCancellationRequested)
             {
                 cancelled = true;
-                status.Text = "安装已取消。";
+                status.Text = SetupText.Pick("安装已取消。", "Installation cancelled.");
                 if (Installer.IsValidInstallDirectory(target))
                 {
                     if (Installer.IsOwnedTrayRunning(target))
                     {
-                        status.Text = "安装已取消，现有 TermLink 仍在运行。";
+                        status.Text = SetupText.Pick(
+                            "安装已取消，现有 TermLink 仍在运行。",
+                            "Installation cancelled. The existing TermLink version is still running.");
                     }
                     else
                     {
-                        status.Text = "安装已取消，正在恢复现有 TermLink...";
+                        status.Text = SetupText.Pick(
+                            "安装已取消，正在恢复现有 TermLink...",
+                            "Installation cancelled. Restoring the existing TermLink version...");
                         var restoredProcess = await Task.Run(() => Installer.TryLaunchTray(target));
                         status.Text = restoredProcess
-                            ? "安装已取消，现有版本已恢复运行。"
-                            : "安装已取消，现有文件已恢复，但主程序未能自动启动。";
+                            ? SetupText.Pick(
+                                "安装已取消，现有版本已恢复运行。",
+                                "Installation cancelled. The existing version is running again.")
+                            : SetupText.Pick(
+                                "安装已取消，现有文件已恢复，但主程序未能自动启动。",
+                                "Installation cancelled. Existing files were restored, but the app could not be started automatically.");
                     }
                 }
             }
             catch (Exception error)
             {
                 install.Enabled = true;
-                status.Text = "安装失败。";
+                status.Text = SetupText.Pick("安装失败。", "Installation failed.");
                 var errorLogPath = Path.Combine(Path.GetTempPath(), "TermLink-Setup-error.log");
                 try
                 {
@@ -352,8 +383,9 @@ namespace TermLink.Setup
                 }
                 MessageBox.Show(
                     this,
-                    error.Message + Environment.NewLine + Environment.NewLine + "详细日志: " + errorLogPath,
-                    "TermLink 安装失败",
+                    SetupText.PublicError(error) + Environment.NewLine + Environment.NewLine +
+                        SetupText.DiagnosticRecorded(),
+                    SetupText.Pick("TermLink 安装失败", "TermLink Installation Failed"),
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
             }
@@ -393,7 +425,9 @@ namespace TermLink.Setup
             {
                 closeWhenFinished = true;
                 cancel.Enabled = false;
-                status.Text = "安装已提交，完成启动检查后将关闭。";
+                status.Text = SetupText.Pick(
+                    "安装已提交，完成启动检查后将关闭。",
+                    "Installation is committed. Setup will close after the startup check.");
                 return;
             }
             var cancellation = installCancellation;
@@ -414,7 +448,9 @@ namespace TermLink.Setup
                 args.Cancel = true;
                 closeWhenFinished = true;
                 cancel.Enabled = false;
-                status.Text = "安装已提交，完成启动检查后将关闭。";
+                status.Text = SetupText.Pick(
+                    "安装已提交，完成启动检查后将关闭。",
+                    "Installation is committed. Setup will close after the startup check.");
                 return;
             }
             var cancellation = installCancellation;
@@ -434,12 +470,16 @@ namespace TermLink.Setup
                 if (commitGate.State == InstallCommitGateState.CommitStarted)
                 {
                     cancel.Enabled = false;
-                    status.Text = "安装已提交，完成启动检查后将关闭。";
+                    status.Text = SetupText.Pick(
+                        "安装已提交，完成启动检查后将关闭。",
+                        "Installation is committed. Setup will close after the startup check.");
                 }
                 return;
             }
             cancel.Enabled = false;
-            status.Text = "正在安全取消并回滚，请稍候...";
+            status.Text = SetupText.Pick(
+                "正在安全取消并回滚，请稍候...",
+                "Cancelling safely and rolling back. Please wait...");
             cancellation.Cancel();
         }
 

@@ -3,6 +3,7 @@ package dev.termlink.terminal.termux
 import dev.termlink.terminal.api.TerminalCellSnapshotV1
 import dev.termlink.terminal.api.TerminalColorSnapshotV1
 import dev.termlink.terminal.api.TerminalCursorSnapshotV1
+import dev.termlink.terminal.api.TerminalHyperlinkSnapshotV1
 import dev.termlink.terminal.api.TerminalModesSnapshotV1
 import dev.termlink.terminal.api.TerminalPaletteSnapshotV1
 import dev.termlink.terminal.api.TerminalRowSnapshotV1
@@ -50,6 +51,52 @@ class TermuxSnapshotRestoreTest {
 
         assertEquals(10, installed.sequence)
         assertContains(engine.visibleText(), "RGB")
+        engine.dispose()
+    }
+
+    @Test
+    fun hyperlinkStyleFailsClosedBeforeRendererInstall() = runTest {
+        val engine = TermuxTerminalEngine(TerminalSize(COLUMNS, ROWS))
+        engine.feed(1, ByteBuffer.wrap("KEEP".encodeToByteArray()))
+        val before = engine.visibleText()
+        val linkedStyle = TerminalStyleSnapshotV1(
+            foreground = TerminalColorSnapshotV1.Default,
+            background = TerminalColorSnapshotV1.Default,
+            hyperlinkIndex = 0,
+        )
+        val value = snapshot(sequence = 10, firstRow = "LINK", style = linkedStyle).copy(
+            hyperlinks = listOf(
+                TerminalHyperlinkSnapshotV1(
+                    id = "docs",
+                    uri = "https://example.test/docs",
+                ),
+            ),
+        )
+
+        val error = assertFailsWith<IllegalArgumentException> { engine.prepareSnapshot(value) }
+
+        assertContains(error.message.orEmpty(), "cannot restore terminal hyperlinks")
+        assertEquals(before, engine.visibleText())
+        engine.dispose()
+    }
+
+    @Test
+    fun hyperlinkReferenceWithoutTableFailsClosedBeforeRendererInstall() = runTest {
+        val engine = TermuxTerminalEngine(TerminalSize(COLUMNS, ROWS))
+        engine.feed(1, ByteBuffer.wrap("KEEP".encodeToByteArray()))
+        val before = engine.visibleText()
+        val linkedStyle = TerminalStyleSnapshotV1(
+            foreground = TerminalColorSnapshotV1.Default,
+            background = TerminalColorSnapshotV1.Default,
+            hyperlinkIndex = 0,
+        )
+
+        val error = assertFailsWith<IllegalArgumentException> {
+            engine.prepareSnapshot(snapshot(sequence = 10, firstRow = "LINK", style = linkedStyle))
+        }
+
+        assertContains(error.message.orEmpty(), "references a terminal hyperlink")
+        assertEquals(before, engine.visibleText())
         engine.dispose()
     }
 

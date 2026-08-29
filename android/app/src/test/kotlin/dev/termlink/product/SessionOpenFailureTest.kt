@@ -1,5 +1,6 @@
 package dev.termlink.product
 
+import android.database.sqlite.SQLiteFullException
 import dev.termlink.network.production.TermLinkApiException
 import java.io.IOException
 import java.net.SocketTimeoutException
@@ -10,6 +11,20 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SessionOpenFailureTest {
+    @Test
+    fun tailFirstFailureCodeRetainsOnlyTheStableSessionTaxonomy() {
+        assertEquals(
+            "SESSION_OPEN_TL_H119",
+            tailFirstSessionOpenFailureCode(
+                SessionOpenFailure(
+                    SessionOpenFailureCode.LOCAL_STORAGE_FULL,
+                    httpStatus = 507,
+                    diagnosticCode = "SAFE_DIAGNOSTIC",
+                ),
+            ),
+        )
+    }
+
     @Test
     fun stableCodesAreUniqueAndSafeForUserReports() {
         val codes = SessionOpenFailureCode.entries.map(SessionOpenFailureCode::stableCode)
@@ -126,7 +141,18 @@ class SessionOpenFailureTest {
         )
         assertTrue(SessionOpenFailureCode.HISTORY_NOT_READY.retryable)
         assertFalse(SessionOpenFailureCode.HISTORY_GAP.retryable)
-        assertFalse(SessionOpenFailureCode.HISTORY_REPLAY_LIMIT.retryable)
+        assertFalse(SessionOpenFailureCode.entries.any { it.stableCode == "TL-H115" })
+    }
+
+    @Test
+    fun localDatabaseFullHasItsOwnLocalizedActionableFailure() {
+        val error = classifySessionOpenException(
+            IllegalStateException("room write failed", SQLiteFullException("database or disk is full")),
+            SessionFailureStage.HISTORY_REPLAY,
+        )
+
+        assertClassified(SessionOpenFailureCode.LOCAL_STORAGE_FULL, error)
+        assertTrue(error.failure.code.retryable)
     }
 
     private fun assertClassified(expected: SessionOpenFailureCode, error: SessionOpenException) {

@@ -5,6 +5,7 @@
   const TRANSFER_PARAMETER = "termlink_theme";
   const LIGHT = "light";
   const DARK = "dark";
+  const SYSTEM = "system";
   const root = document.documentElement;
   let accountReturnURL = null;
   const systemPreference = window.matchMedia
@@ -14,7 +15,7 @@
   function readStoredTheme() {
     try {
       const value = window.localStorage.getItem(STORAGE_KEY);
-      if (value === LIGHT || value === DARK) return value;
+      if (value === SYSTEM || value === LIGHT || value === DARK) return value;
       if (value !== null) window.localStorage.removeItem(STORAGE_KEY);
     } catch (_) {
       // A system preference still provides a deterministic safe fallback.
@@ -26,9 +27,21 @@
     return systemPreference.matches ? DARK : LIGHT;
   }
 
+  function resolvedTheme(preference) {
+    return preference === SYSTEM ? preferredTheme() : preference;
+  }
+
+  function nextPreference(preference) {
+    if (preference === SYSTEM) return LIGHT;
+    if (preference === LIGHT) return DARK;
+    return SYSTEM;
+  }
+
   function applyTheme() {
-    const theme = readStoredTheme() || preferredTheme();
+    const preference = readStoredTheme() || SYSTEM;
+    const theme = resolvedTheme(preference);
     root.dataset.theme = theme;
+    root.dataset.themePreference = preference;
     root.classList.toggle("pf-v5-theme-dark", theme === DARK);
     updateToggle(document.querySelector("[data-termlink-theme-toggle]"));
     updateAccountReturnTargets();
@@ -69,7 +82,7 @@
         environmentAccountReturnURL() || safeAccountReturnURL("/account");
     }
     const target = new URL(accountReturnURL);
-    target.searchParams.set(TRANSFER_PARAMETER, root.dataset.theme === DARK ? DARK : LIGHT);
+    target.searchParams.set(TRANSFER_PARAMETER, root.dataset.themePreference || SYSTEM);
     return target.href;
   }
 
@@ -94,6 +107,8 @@
           darkLabel: "深色主题",
           lightAction: "切换到明亮主题",
           lightLabel: "明亮主题",
+          systemAction: "切换到跟随系统",
+          systemLabel: "跟随系统",
         }
       : {
           accountAction: "Back to account center",
@@ -106,19 +121,24 @@
           darkLabel: "Dark theme",
           lightAction: "Switch to light theme",
           lightLabel: "Light theme",
+          systemAction: "Follow system theme",
+          systemLabel: "System theme",
         };
   }
 
   function updateToggle(button) {
     if (!button) return;
-    const dark = root.dataset.theme === DARK;
+    const preference = root.dataset.themePreference || SYSTEM;
+    const next = nextPreference(preference);
     const labels = translatedLabels();
-    button.setAttribute("aria-label", dark ? labels.lightAction : labels.darkAction);
-    button.setAttribute("title", dark ? labels.lightAction : labels.darkAction);
+    const action = next === SYSTEM ? labels.systemAction : (next === LIGHT ? labels.lightAction : labels.darkAction);
+    button.setAttribute("aria-label", action);
+    button.setAttribute("title", action);
     button.removeAttribute("aria-pressed");
+    button.dataset.themePreference = preference;
     const label = button.querySelector(".tl-account-theme-toggle-label");
-    const nextLabel = dark ? labels.lightLabel : labels.darkLabel;
-    if (label && label.textContent !== nextLabel) label.textContent = nextLabel;
+    const currentLabel = preference === SYSTEM ? labels.systemLabel : (preference === LIGHT ? labels.lightLabel : labels.darkLabel);
+    if (label && label.textContent !== currentLabel) label.textContent = currentLabel;
   }
 
   function persistTheme(theme) {
@@ -244,7 +264,7 @@
     label.className = "tl-account-theme-toggle-label";
     button.append(icon, label);
     button.addEventListener("click", () => {
-      persistTheme(root.dataset.theme === DARK ? LIGHT : DARK);
+      persistTheme(nextPreference(root.dataset.themePreference || SYSTEM));
       applyTheme();
     });
     actions.insertBefore(button, referrer);
@@ -358,7 +378,7 @@
 
   const desktopSidebar = window.matchMedia("(min-width: 1220px)");
   const handleSystemChange = () => {
-    if (!readStoredTheme()) applyTheme();
+    if ((readStoredTheme() || SYSTEM) === SYSTEM) applyTheme();
   };
   if (systemPreference.addEventListener) systemPreference.addEventListener("change", handleSystemChange);
   else systemPreference.addListener?.(handleSystemChange);

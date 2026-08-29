@@ -73,10 +73,17 @@ type presignedRequest struct {
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "production acceptance probe failed:", err)
+		writeProbeFailure(os.Stderr, err)
 		os.Exit(1)
 	}
 	fmt.Println("Production OIDC/TLS/API/Realtime acceptance probe passed.")
+}
+
+func writeProbeFailure(writer io.Writer, _ error) {
+	// Probe errors can wrap callback URLs, presigned query credentials, OIDC
+	// responses, and local secret paths. Keep process stderr stable and
+	// non-sensitive; detailed diagnosis belongs in the bounded test assertions.
+	_, _ = fmt.Fprintln(writer, "production acceptance probe failed (details redacted)")
 }
 
 func run() error {
@@ -908,6 +915,10 @@ func (p *probe) verifyAnonymousRegistration() error {
 		if !hasHTMLAttribute(registrationPage, "input", "name", field) {
 			return fmt.Errorf("anonymous OIDC registration form is missing the %s field", field)
 		}
+	}
+	if !hasHTMLAttribute(registrationPage, "input", "name", "nickname") &&
+		!hasHTMLAttribute(registrationPage, "input", "name", "user.attributes.nickname") {
+		return errors.New("anonymous OIDC registration form is missing the nickname field")
 	}
 	return nil
 }

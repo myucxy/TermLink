@@ -1,9 +1,17 @@
 services:
+  edge:
+    environment:
+      TERMLINK_HISTORY_PUBLIC_HOST: ${TERMLINK_HISTORY_PUBLIC_HOST:?TERMLINK_HISTORY_PUBLIC_HOST is required for local history}
+    networks:
+      - object
+    volumes:
+      - ../Caddyfile:/etc/caddy/Caddyfile:ro
+
   server:
     environment:
       TERMLINK_HISTORY_ENABLED: "true"
       TERMLINK_S3_ENDPOINT: http://minio:9000
-      TERMLINK_S3_PUBLIC_ENDPOINT: ${TERMLINK_S3_PUBLIC_ENDPOINT:-https://${TERMLINK_HISTORY_PUBLIC_HOST:-history.localhost}}
+      TERMLINK_S3_PUBLIC_ENDPOINT: ${TERMLINK_S3_PUBLIC_ENDPOINT:-https://${TERMLINK_HISTORY_PUBLIC_HOST:?TERMLINK_HISTORY_PUBLIC_HOST is required for local history}}
       TERMLINK_S3_BUCKET: termlink-history
       TERMLINK_S3_REGION: us-east-1
       TERMLINK_S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
@@ -39,11 +47,30 @@ services:
     networks: ["object-control", "object"]
     volumes:
       - minio-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+      - /root/.minio:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 10s
       timeout: 5s
       retries: 12
+      start_period: 10s
+    mem_limit: ${TERMLINK_MINIO_MEMORY_LIMIT:-1g}
+    mem_reservation: ${TERMLINK_MINIO_MEMORY_RESERVATION:-256m}
+    cpus: ${TERMLINK_MINIO_CPU_LIMIT:-1.00}
+    pids_limit: ${TERMLINK_MINIO_PIDS_LIMIT:-256}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${TERMLINK_CONTAINER_LOG_MAX_SIZE:-10m}
+        max-file: ${TERMLINK_CONTAINER_LOG_MAX_FILES:-5}
+    stop_grace_period: 30s
     restart: unless-stopped
 
 volumes:
@@ -51,10 +78,12 @@ volumes:
 
 secrets:
   s3_access_key:
-    file: ${TERMLINK_S3_ACCESS_KEY_FILE:-../secrets/s3-access-key}
+    file: ${TERMLINK_S3_ACCESS_KEY_FILE:?TERMLINK_S3_ACCESS_KEY_FILE is required for local history}
   s3_secret_key:
-    file: ${TERMLINK_S3_SECRET_KEY_FILE:-../secrets/s3-secret-key}
+    file: ${TERMLINK_S3_SECRET_KEY_FILE:?TERMLINK_S3_SECRET_KEY_FILE is required for local history}
 
 networks:
   object-control:
+    internal: true
+  object:
     internal: true

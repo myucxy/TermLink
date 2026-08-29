@@ -1473,6 +1473,108 @@ class ProductionRealtimeSessionClientTest {
     }
 
     @Test
+    fun restoresExplicitControlIntentAfterNetworkGenerationReconnect(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val firstLeaseId = UUID.fromString("01234567-89ab-cdef-0123-456789abcdef")
+        val restoredLeaseId = UUID.fromString("11234567-89ab-cdef-0123-456789abcdef")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val firstSubscribed = CompletableDeferred<Unit>()
+        val restoredSubscribed = CompletableDeferred<Unit>()
+
+        fun realtime(subscribed: CompletableDeferred<Unit>) = object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                check(webSocket.send("{\"type\":\"welcome\",\"protocol_version\":1}"))
+            }
+
+            override fun onMessage(webSocket: WebSocket, bytes: OkioByteString) {
+                if (Envelope.parseFrom(bytes.toByteArray()).messageType == MessageType.SUBSCRIBE) {
+                    subscribed.complete(Unit)
+                }
+            }
+
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                webSocket.close(code, reason)
+            }
+        }
+
+        server.enqueue(MockResponse().withWebSocketUpgrade(realtime(firstSubscribed)))
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
+                .setBody(
+                    """{"lease_id":"$firstLeaseId","expires_at":"2099-01-01T00:00:00Z","version":1}""",
+                ),
+        )
+        server.enqueue(MockResponse().withWebSocketUpgrade(realtime(restoredSubscribed)))
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
+                .setBody(
+                    """{"lease_id":"$restoredLeaseId","expires_at":"2099-01-01T00:00:00Z","version":2}""",
+                ),
+        )
+        server.start()
+
+        val multiplexer = ProductionRealtimeMultiplexer(
+            rootUrl = server.url("/").toString(),
+            tokenProvider = AccessTokenProvider { "oidc-token" },
+            deviceId = androidId,
+            identity = androidIdentity,
+            parentScope = scope,
+            allowCleartextForLocalTest = true,
+        ).also(multiplexers::add)
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = server.url("/").toString(),
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = multiplexer.register(sessionId),
+            reconnectDelaysMillis = listOf(0),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            client.start()
+            withTimeout(2_000) { firstSubscribed.await() }
+            assertEquals("/v1/realtime", server.takeRequest(2, TimeUnit.SECONDS)?.path)
+            client.requestControl()
+            assertEquals(
+                firstLeaseId.toString(),
+                assertIs<RemoteSessionState.Controlling>(client.sessionState.value).leaseId,
+            )
+            assertEquals("/v1/sessions/$sessionId/lease", server.takeRequest(2, TimeUnit.SECONDS)?.path)
+
+            multiplexer.onNetworkAvailable()
+
+            withTimeout(5_000) { restoredSubscribed.await() }
+            val restored = withTimeout(5_000) {
+                client.sessionState.first {
+                    it is RemoteSessionState.Controlling && it.leaseId == restoredLeaseId.toString()
+                }
+            }
+            assertEquals(2L, assertIs<RemoteSessionState.Controlling>(restored).leaseVersion)
+            assertEquals("/v1/realtime", server.takeRequest(2, TimeUnit.SECONDS)?.path)
+            assertEquals("/v1/sessions/$sessionId/lease", server.takeRequest(2, TimeUnit.SECONDS)?.path)
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
     fun lateRestLeaseCannotOverrideARealtimeLocalInputRevoke(): Unit = runBlocking {
         val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
         val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")

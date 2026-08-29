@@ -99,10 +99,9 @@ val debugAllowsCleartextLocalTest = debugServerUri.scheme.equals("http", ignoreC
     requestedDebugServerUrl != null &&
     isLocalTestHost(debugServerUri.host)
 val debugTerminalSnapshotRuntime = providers.gradleProperty("termlinkEnableTerminalSnapshotRuntime")
-    // Debug/emulator builds exercise the same tail-first bootstrap as release.
-    // Tests can still opt out explicitly with
-    // -PtermlinkEnableTerminalSnapshotRuntime=false.
-    .orElse("true")
+    // The portable V1 importer is an explicit experiment until its native
+    // TerminalCore equivalence and durable fallback gates are complete.
+    .orElse("false")
     .get()
     .toBooleanStrictOrNull()
     ?: throw GradleException("termlinkEnableTerminalSnapshotRuntime must be true or false")
@@ -175,7 +174,7 @@ android {
             // Release intentionally ignores all local Debug injection inputs.
             buildConfigField("String", "TERMLINK_SERVER_URL", buildConfigString(publicTermLinkServerUrl))
             buildConfigField("boolean", "TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST", "false")
-            buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", "true")
+            buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", "false")
         }
     }
 
@@ -243,6 +242,7 @@ dependencies {
     implementation(project(":terminal-engine-api"))
     implementation(project(":terminal-engine-replay"))
     implementation(project(":terminal-engine-termux"))
+    implementation(project(":terminal-engine-native"))
     implementation(project(":core-session"))
     implementation(project(":core-network"))
     implementation(project(":core-model"))

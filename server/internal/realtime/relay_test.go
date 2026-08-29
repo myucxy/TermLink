@@ -1,13 +1,16 @@
 package realtime
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/termlink/termlink/server/internal/auth"
+	"github.com/termlink/termlink/server/internal/kv"
 	"github.com/termlink/termlink/server/internal/realtimewire"
 	"github.com/termlink/termlink/server/internal/store"
 )
@@ -566,6 +569,792 @@ func TestRefreshDeviceClosesOnlyCurrentDevice(t *testing.T) {
 	}
 }
 
+func TestAndroidSubscribedRouteReusesInitialAuthorityForInputResizeAndACK(t *testing.T) {
+	authority := newCountingRouteAuthority()
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.store = authority
+	hub.leases = leasing
+	userID, androidID, pcID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	authority.set(userID, androidID, sessionID, store.SessionRouteAuthorization{Permission: "CONTROL", PCDeviceID: pcID}, nil)
+	android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+	leasing.setLease(sessionID, androidID)
+
+	if err := android.route(androidRouteEnvelope(realtimewire.Subscribe, pcID), sessionID, []byte("subscribe")); err != nil {
+		t.Fatalf("subscribe route: %v", err)
+	}
+	<-pc.send
+	for index, messageType := range []realtimewire.MessageType{
+		realtimewire.InputEvent,
+		realtimewire.ResizeRequest,
+		realtimewire.OutputACK,
+		realtimewire.FlowControl,
+		realtimewire.ResumeRequest,
+	} {
+		frame := []byte(fmt.Sprintf("hot-frame-%d", index))
+		if err := android.route(androidRouteEnvelope(messageType, pcID), sessionID, frame); err != nil {
+			t.Fatalf("route message %d: %v", messageType, err)
+		}
+		if got := <-pc.send; string(got) != string(frame) {
+			t.Fatalf("PC frame = %q, want %q", got, frame)
+		}
+	}
+	if got := authority.callsFor(userID, androidID, sessionID); got != 1 {
+		t.Fatalf("SessionRoute calls = %d, want only the initial subscription lookup", got)
+	}
+}
+
+func TestAndroidRouteCacheInvalidatesOnUnsubscribeAndRevoke(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		invalidate func(*Hub, *peer, uuid.UUID, uuid.UUID)
+	}{
+		{
+			name: "unsubscribe",
+			invalidate: func(_ *Hub, android *peer, sessionID, pcID uuid.UUID) {
+				if err := android.route(androidRouteEnvelope(realtimewire.Unsubscribe, pcID), sessionID, []byte("unsubscribe")); err != nil {
+					t.Fatalf("unsubscribe route: %v", err)
+				}
+			},
+		},
+		{
+			name: "revoke",
+			invalidate: func(hub *Hub, android *peer, _, _ uuid.UUID) {
+				hub.Revoke(android.principal.Device.ID)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authority := newCountingRouteAuthority()
+			leasing := &fakeLiveSessionStore{}
+			hub := NewHubWithObserver(nil, nil, nil, nil)
+			hub.store, hub.leases = authority, leasing
+			userID, androidID, pcID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+			authority.set(userID, androidID, sessionID, store.SessionRouteAuthorization{Permission: "CONTROL", PCDeviceID: pcID}, nil)
+			android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+			if err := android.route(androidRouteEnvelope(realtimewire.Subscribe, pcID), sessionID, []byte("subscribe")); err != nil {
+				t.Fatalf("subscribe route: %v", err)
+			}
+			<-pc.send
+
+			test.invalidate(hub, android, sessionID, pcID)
+			if test.name == "unsubscribe" {
+				<-pc.send
+			}
+			if err := android.route(androidRouteEnvelope(realtimewire.OutputACK, pcID), sessionID, []byte("denied")); !errors.Is(err, store.ErrDenied) {
+				t.Fatalf("post-invalidation route error = %v, want ErrDenied", err)
+			}
+			if got := authority.callsFor(userID, androidID, sessionID); got != 1 {
+				t.Fatalf("post-invalidation SessionRoute calls = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestAndroidExpiredRouteRevalidatesAndFailsClosed(t *testing.T) {
+	authority := newCountingRouteAuthority()
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.store, hub.leases = authority, leasing
+	userID, androidID, pcID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	authority.set(userID, androidID, sessionID, store.SessionRouteAuthorization{Permission: "CONTROL", PCDeviceID: pcID}, nil)
+	android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+	if err := android.route(androidRouteEnvelope(realtimewire.Subscribe, pcID), sessionID, []byte("subscribe")); err != nil {
+		t.Fatalf("subscribe route: %v", err)
+	}
+	<-pc.send
+
+	authority.set(userID, androidID, sessionID, store.SessionRouteAuthorization{}, store.ErrDenied)
+	hub.mu.Lock()
+	cached := android.subscriptionRoutes[sessionID]
+	cached.validUntil = time.Now().Add(-time.Second)
+	android.subscriptionRoutes[sessionID] = cached
+	hub.mu.Unlock()
+	if err := android.route(androidRouteEnvelope(realtimewire.OutputACK, pcID), sessionID, []byte("expired")); !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("expired route error = %v, want ErrDenied", err)
+	}
+	if got := authority.callsFor(userID, androidID, sessionID); got != 2 {
+		t.Fatalf("SessionRoute calls after cache expiry = %d, want relookup count 2", got)
+	}
+	if _, subscribed := hub.subscriptionRoute(android, sessionID); subscribed {
+		t.Fatal("authority-denied route remained subscribed")
+	}
+	if leasing.releaseCalls() != 1 {
+		t.Fatalf("live-session releases = %d, want 1", leasing.releaseCalls())
+	}
+	if err := android.route(androidRouteEnvelope(realtimewire.OutputACK, pcID), sessionID, []byte("still-denied")); !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("route after failed revalidation = %v, want ErrDenied", err)
+	}
+	if got := authority.callsFor(userID, androidID, sessionID); got != 2 {
+		t.Fatalf("unsubscribed route performed another lookup: %d", got)
+	}
+}
+
+func TestAndroidRouteCacheRejectsWrongSessionPCAndPCConnection(t *testing.T) {
+	authority := newCountingRouteAuthority()
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.store, hub.leases = authority, leasing
+	userID, androidID, pcID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	authority.set(userID, androidID, sessionID, store.SessionRouteAuthorization{Permission: "CONTROL", PCDeviceID: pcID}, nil)
+	android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+	if err := android.route(androidRouteEnvelope(realtimewire.Subscribe, pcID), sessionID, []byte("subscribe")); err != nil {
+		t.Fatalf("subscribe route: %v", err)
+	}
+	<-pc.send
+
+	if err := android.route(androidRouteEnvelope(realtimewire.OutputACK, pcID), uuid.New(), []byte("wrong-session")); !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("wrong-session error = %v, want ErrDenied", err)
+	}
+	if err := android.route(androidRouteEnvelope(realtimewire.OutputACK, uuid.New()), sessionID, []byte("wrong-pc")); !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("wrong-PC error = %v, want ErrDenied", err)
+	}
+	pc.role = "android"
+	if err := android.route(androidRouteEnvelope(realtimewire.OutputACK, pcID), sessionID, []byte("wrong-role")); err != nil {
+		t.Fatalf("valid cached route should tolerate an offline/non-PC recipient connection: %v", err)
+	}
+	select {
+	case frame := <-pc.send:
+		t.Fatalf("frame reached invalid PC connection: %q", frame)
+	default:
+	}
+	if got := authority.callsFor(userID, androidID, sessionID); got != 1 {
+		t.Fatalf("binding denials caused unexpected SessionRoute calls: %d", got)
+	}
+}
+
+func TestRefreshSubscriptionsUsesOneBatchAuthorityQuery(t *testing.T) {
+	authority := newBatchedRouteAuthority()
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.store, hub.leases = authority, leasing
+	userID, androidID, pcID := uuid.New(), uuid.New(), uuid.New()
+	android := activeSubscriptionPeer(hub, userID, androidID)
+	const subscriptionCount = 12
+	for range subscriptionCount {
+		sessionID := uuid.New()
+		route := store.SessionRouteAuthorization{Permission: "CONTROL", PCDeviceID: pcID}
+		authority.setRoute(sessionID, route)
+		hub.subscribe(android, sessionID, route)
+	}
+
+	android.refreshSubscriptions()
+	batchCalls, singleCalls, maxBatch := authority.counts()
+	if batchCalls != 1 || singleCalls != 0 {
+		t.Fatalf("authority calls batch/single = %d/%d, want 1/0", batchCalls, singleCalls)
+	}
+	if maxBatch != subscriptionCount {
+		t.Fatalf("largest authority batch = %d, want %d", maxBatch, subscriptionCount)
+	}
+	if leasing.reserveCalls() != subscriptionCount {
+		t.Fatalf("live-session renewals = %d, want %d", leasing.reserveCalls(), subscriptionCount)
+	}
+	if leasing.reserveBatchCalls() != 1 {
+		t.Fatalf("live-session reservation batches = %d, want 1", leasing.reserveBatchCalls())
+	}
+	if got := subscriptionCountForPeer(hub, android); got != subscriptionCount {
+		t.Fatalf("subscriptions after valid refresh = %d, want %d", got, subscriptionCount)
+	}
+}
+
+func TestRefreshSubscriptionsBatchReservationErrorFailsClosed(t *testing.T) {
+	authority := newBatchedRouteAuthority()
+	leasing := &fakeLiveSessionStore{reserveErr: errors.New("Valkey unavailable")}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.store, hub.leases = authority, leasing
+	android := activeSubscriptionPeer(hub, uuid.New(), uuid.New())
+	for range 4 {
+		sessionID := uuid.New()
+		route := store.SessionRouteAuthorization{Permission: "CONTROL", PCDeviceID: uuid.New()}
+		authority.setRoute(sessionID, route)
+		hub.subscribe(android, sessionID, route)
+	}
+
+	android.refreshSubscriptions()
+	if got := subscriptionCountForPeer(hub, android); got != 0 {
+		t.Fatalf("subscriptions after reservation batch error = %d, want 0", got)
+	}
+	if leasing.reserveBatchCalls() != 1 || leasing.releaseCalls() != 4 {
+		t.Fatalf("reservation batches/releases = %d/%d, want 1/4", leasing.reserveBatchCalls(), leasing.releaseCalls())
+	}
+}
+
+func TestPeerEnqueueHealthyPathAllocatesOnlyFrameCopy(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	peer := testPeer(hub, uuid.New())
+	frame := []byte("opaque terminal frame")
+	allocations := testing.AllocsPerRun(1000, func() {
+		peer.enqueue(frame)
+		queued := <-peer.send
+		peer.releaseQueueBytes(int64(len(queued)))
+	})
+	if allocations > 1 {
+		t.Fatalf("healthy enqueue allocations = %.2f, want at most one owned frame copy", allocations)
+	}
+	if queued := peer.queuedBytes.Load(); queued != 0 {
+		t.Fatalf("healthy enqueue retained %d queued bytes", queued)
+	}
+}
+
+func BenchmarkPeerEnqueueHealthyPath(b *testing.B) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	peer := testPeer(hub, uuid.New())
+	frame := []byte("opaque terminal frame")
+	b.ReportAllocs()
+	b.SetBytes(int64(len(frame)))
+	for b.Loop() {
+		peer.enqueue(frame)
+		queued := <-peer.send
+		peer.releaseQueueBytes(int64(len(queued)))
+	}
+}
+
+func BenchmarkPCOutputCachedRoute(b *testing.B) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+	route := store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID}
+	hub.subscribe(android, sessionID, route)
+	frame := []byte("opaque terminal output frame")
+	envelope := realtimewire.Envelope{RecipientDeviceID: androidID[:]}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(frame)))
+	for b.Loop() {
+		if err := pc.route(envelope, sessionID, frame); err != nil {
+			b.Fatal(err)
+		}
+		queued := <-android.send
+		android.releaseQueueBytes(int64(len(queued)))
+	}
+}
+
+func TestRefreshSubscriptionsBatchMissingAndExpiredResultsUnsubscribe(t *testing.T) {
+	authority := newBatchedRouteAuthority()
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.store, hub.leases = authority, leasing
+	userID, androidID, pcID := uuid.New(), uuid.New(), uuid.New()
+	android := activeSubscriptionPeer(hub, userID, androidID)
+	validID, expiredID, missingID := uuid.New(), uuid.New(), uuid.New()
+	validRoute := store.SessionRouteAuthorization{Permission: "CONTROL", PCDeviceID: pcID}
+	expiredAt := time.Now().Add(-time.Second)
+	expiredRoute := store.SessionRouteAuthorization{Permission: "CONTROL", PCDeviceID: pcID, GrantExpiresAt: &expiredAt}
+	for sessionID, route := range map[uuid.UUID]store.SessionRouteAuthorization{
+		validID: validRoute, expiredID: expiredRoute, missingID: validRoute,
+	} {
+		hub.subscribe(android, sessionID, route)
+	}
+	authority.setRoute(validID, validRoute)
+	authority.setRoute(expiredID, expiredRoute)
+
+	android.refreshSubscriptions()
+	if _, ok := hub.subscriptionRoute(android, validID); !ok {
+		t.Fatal("valid batch result was unsubscribed")
+	}
+	for _, sessionID := range []uuid.UUID{expiredID, missingID} {
+		if _, ok := hub.subscriptionRoute(android, sessionID); ok {
+			t.Fatalf("unauthorized session %s remained subscribed", sessionID)
+		}
+	}
+	if leasing.releaseCalls() != 2 {
+		t.Fatalf("live-session releases = %d, want 2", leasing.releaseCalls())
+	}
+}
+
+func TestRefreshSubscriptionsBatchErrorFailsClosed(t *testing.T) {
+	authority := newBatchedRouteAuthority()
+	authority.err = errors.New("authority database unavailable")
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.store, hub.leases = authority, leasing
+	android := activeSubscriptionPeer(hub, uuid.New(), uuid.New())
+	for range 4 {
+		hub.subscribe(android, uuid.New(), store.SessionRouteAuthorization{Permission: "CONTROL", PCDeviceID: uuid.New()})
+	}
+
+	android.refreshSubscriptions()
+	if got := subscriptionCountForPeer(hub, android); got != 0 {
+		t.Fatalf("subscriptions after batch error = %d, want 0", got)
+	}
+	if leasing.releaseCalls() != 4 {
+		t.Fatalf("live-session releases after batch error = %d, want 4", leasing.releaseCalls())
+	}
+	batchCalls, singleCalls, _ := authority.counts()
+	if batchCalls != 1 || singleCalls != 0 {
+		t.Fatalf("authority calls batch/single = %d/%d, want 1/0", batchCalls, singleCalls)
+	}
+}
+
+func TestRefreshSubscriptionsBoundsAuthorityBatchSize(t *testing.T) {
+	authority := newBatchedRouteAuthority()
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.store, hub.leases = authority, leasing
+	android := activeSubscriptionPeer(hub, uuid.New(), uuid.New())
+	for range store.MaxSessionRouteBatchSize + 1 {
+		sessionID := uuid.New()
+		route := store.SessionRouteAuthorization{Permission: "CONTROL", PCDeviceID: uuid.New()}
+		authority.setRoute(sessionID, route)
+		hub.subscribe(android, sessionID, route)
+	}
+
+	android.refreshSubscriptions()
+	batchCalls, singleCalls, maxBatch := authority.counts()
+	if batchCalls != 2 || singleCalls != 0 {
+		t.Fatalf("bounded authority calls batch/single = %d/%d, want 2/0", batchCalls, singleCalls)
+	}
+	if maxBatch > store.MaxSessionRouteBatchSize {
+		t.Fatalf("authority batch size = %d, limit = %d", maxBatch, store.MaxSessionRouteBatchSize)
+	}
+}
+
+func TestRefreshSubscriptionsSafelyFallsBackToSingleRouteStore(t *testing.T) {
+	authority := newCountingRouteAuthority()
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.store, hub.leases = authority, leasing
+	userID, androidID, pcID := uuid.New(), uuid.New(), uuid.New()
+	android := activeSubscriptionPeer(hub, userID, androidID)
+	sessionIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+	for _, sessionID := range sessionIDs {
+		route := store.SessionRouteAuthorization{Permission: "CONTROL", PCDeviceID: pcID}
+		authority.set(userID, androidID, sessionID, route, nil)
+		hub.subscribe(android, sessionID, route)
+	}
+
+	android.refreshSubscriptions()
+	for _, sessionID := range sessionIDs {
+		if got := authority.callsFor(userID, androidID, sessionID); got != 1 {
+			t.Fatalf("fallback SessionRoute calls for %s = %d, want 1", sessionID, got)
+		}
+	}
+	if got := subscriptionCountForPeer(hub, android); got != len(sessionIDs) {
+		t.Fatalf("fallback subscriptions = %d, want %d", got, len(sessionIDs))
+	}
+}
+
+func TestControlPolicyModesEnforceCurrentLeaseHolder(t *testing.T) {
+	for _, test := range []struct {
+		mode              store.ControlMode
+		secondDeviceInput bool
+	}{
+		{mode: store.ControlModeSingle},
+		{mode: store.ControlModeTakeover},
+		{mode: store.ControlModeCollaborative, secondDeviceInput: true},
+	} {
+		t.Run(string(test.mode), func(t *testing.T) {
+			hub, policyStore, leases, pc, first, second, sessionID := controlPolicyFixture(t, test.mode)
+			if err := first.route(androidRouteEnvelope(realtimewire.InputEvent, pc.principal.Device.ID), sessionID, []byte("first")); err != nil {
+				t.Fatalf("lease holder input denied: %v", err)
+			}
+			if got := string(<-pc.send); got != "first" {
+				t.Fatalf("holder frame = %q", got)
+			}
+			err := second.route(androidRouteEnvelope(realtimewire.InputEvent, pc.principal.Device.ID), sessionID, []byte("second"))
+			if test.secondDeviceInput {
+				if err != nil {
+					t.Fatalf("collaborative participant input denied: %v", err)
+				}
+				if got := string(<-pc.send); got != "second" {
+					t.Fatalf("collaborative frame = %q", got)
+				}
+			} else if !errors.Is(err, store.ErrDenied) {
+				t.Fatalf("non-holder input error = %v, want ErrDenied", err)
+			}
+			lease, leaseErr := leases.GetLease(context.Background(), sessionID)
+			if leaseErr != nil || lease.HolderDeviceID != first.principal.Device.ID || lease.Version != 1 {
+				t.Fatalf("mode %s silently changed lease fence: lease=%+v err=%v", test.mode, lease, leaseErr)
+			}
+			if calls := policyStore.callCount(); calls != 2 {
+				t.Fatalf("policy calls = %d, want one per subscribed Android", calls)
+			}
+			_ = hub
+		})
+	}
+}
+
+func TestTakeoverWithoutExplicitDecisionCannotReplaceHolder(t *testing.T) {
+	_, _, leases, pc, first, second, sessionID := controlPolicyFixture(t, store.ControlModeTakeover)
+	original, _ := leases.GetLease(context.Background(), sessionID)
+	for range 2 {
+		if err := second.route(androidRouteEnvelope(realtimewire.InputEvent, pc.principal.Device.ID), sessionID, []byte("implicit-takeover")); !errors.Is(err, store.ErrDenied) {
+			t.Fatalf("implicit takeover error = %v, want ErrDenied", err)
+		}
+	}
+	retained, _ := leases.GetLease(context.Background(), sessionID)
+	if retained.ID != original.ID || retained.Version != original.Version || retained.HolderDeviceID != first.principal.Device.ID {
+		t.Fatalf("implicit takeover replaced fence: original=%+v retained=%+v", original, retained)
+	}
+}
+
+func TestCollaborativeInputsAreSerializedAndDeviceSequencesRemainIndependent(t *testing.T) {
+	_, _, _, pc, first, second, sessionID := controlPolicyFixture(t, store.ControlModeCollaborative)
+	pc.send = make(chan []byte, 16)
+	const inputsPerDevice = 5
+	var wait sync.WaitGroup
+	for deviceIndex, android := range []*peer{first, second} {
+		wait.Add(1)
+		go func(deviceIndex int, android *peer) {
+			defer wait.Done()
+			for inputIndex := 1; inputIndex <= inputsPerDevice; inputIndex++ {
+				sequence := uint64(inputIndex)
+				if !android.acceptSequence(sessionID, sequence) {
+					t.Errorf("device %d input sequence %d rejected", deviceIndex, sequence)
+					return
+				}
+				frame := []byte(fmt.Sprintf("device-%d-input-%d", deviceIndex, inputIndex))
+				if err := android.route(androidRouteEnvelope(realtimewire.InputEvent, pc.principal.Device.ID), sessionID, frame); err != nil {
+					t.Errorf("device %d input %d route: %v", deviceIndex, inputIndex, err)
+					return
+				}
+			}
+		}(deviceIndex, android)
+	}
+	wait.Wait()
+	seen := map[string]bool{}
+	for range inputsPerDevice * 2 {
+		seen[string(<-pc.send)] = true
+	}
+	if len(seen) != inputsPerDevice*2 {
+		t.Fatalf("serialized collaborative frames = %d, want %d unique", len(seen), inputsPerDevice*2)
+	}
+	if first.acceptSequence(sessionID, inputsPerDevice) {
+		t.Fatal("duplicate device input sequence was accepted")
+	}
+}
+
+func TestControlPolicyChangeImmediatelyInvalidatesCache(t *testing.T) {
+	hub, policies, _, pc, first, second, sessionID := controlPolicyFixture(t, store.ControlModeSingle)
+	if err := second.route(androidRouteEnvelope(realtimewire.InputEvent, pc.principal.Device.ID), sessionID, []byte("single-denied")); !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("SINGLE non-holder error = %v", err)
+	}
+	policy := policies.policy
+	policy.Mode = store.ControlModeCollaborative
+	policy.PolicyVersion++
+	policies.set(policy, nil)
+	if err := second.route(androidRouteEnvelope(realtimewire.InputEvent, pc.principal.Device.ID), sessionID, []byte("still-cached")); !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("unpublished policy change unexpectedly bypassed cache: %v", err)
+	}
+	hub.RefreshControlPolicy(policy.PCID)
+	if err := second.route(androidRouteEnvelope(realtimewire.InputEvent, pc.principal.Device.ID), sessionID, []byte("collaborative")); err != nil {
+		t.Fatalf("published policy change was not applied: %v", err)
+	}
+	if got := string(<-pc.send); got != "collaborative" {
+		t.Fatalf("post-policy-change frame = %q", got)
+	}
+	if policies.callCount() != 2 {
+		t.Fatalf("policy query count = %d, want initial and invalidation refresh", policies.callCount())
+	}
+	_ = first
+}
+
+func TestControlPolicyFailureRevocationCrossAccountAndLocalPriorityFailClosed(t *testing.T) {
+	t.Run("policy store failure", func(t *testing.T) {
+		_, policies, _, pc, first, _, sessionID := controlPolicyFixture(t, store.ControlModeSingle)
+		policies.set(store.SessionControlPolicy{}, errors.New("policy unavailable"))
+		if err := first.route(androidRouteEnvelope(realtimewire.InputEvent, pc.principal.Device.ID), sessionID, []byte("denied")); !errors.Is(err, store.ErrDenied) {
+			t.Fatalf("policy failure error = %v, want ErrDenied", err)
+		}
+	})
+	t.Run("revoked device", func(t *testing.T) {
+		hub, _, _, pc, first, _, sessionID := controlPolicyFixture(t, store.ControlModeSingle)
+		hub.Revoke(first.principal.Device.ID)
+		if err := first.route(androidRouteEnvelope(realtimewire.InputEvent, pc.principal.Device.ID), sessionID, []byte("revoked")); !errors.Is(err, store.ErrDenied) {
+			t.Fatalf("revoked input error = %v, want ErrDenied", err)
+		}
+	})
+	t.Run("cross account PC", func(t *testing.T) {
+		_, _, _, pc, first, _, sessionID := controlPolicyFixture(t, store.ControlModeSingle)
+		pc.principal.UserID = uuid.New()
+		if err := first.route(androidRouteEnvelope(realtimewire.InputEvent, pc.principal.Device.ID), sessionID, []byte("cross-account")); !errors.Is(err, store.ErrDenied) {
+			t.Fatalf("cross-account input error = %v, want ErrDenied", err)
+		}
+	})
+	t.Run("local input released fence", func(t *testing.T) {
+		_, _, leases, pc, first, _, sessionID := controlPolicyFixture(t, store.ControlModeSingle)
+		leases.deleteLease(sessionID)
+		if err := first.route(androidRouteEnvelope(realtimewire.InputEvent, pc.principal.Device.ID), sessionID, []byte("after-local-input")); !errors.Is(err, store.ErrDenied) {
+			t.Fatalf("input after local-priority release = %v, want ErrDenied", err)
+		}
+	})
+}
+
+func controlPolicyFixture(t *testing.T, mode store.ControlMode) (*Hub, *fakeControlPolicyStore, *fakeLiveSessionStore, *peer, *peer, *peer, uuid.UUID) {
+	t.Helper()
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	policies := &fakeControlPolicyStore{}
+	hub.policyStore = policies
+	leasing := &fakeLiveSessionStore{}
+	hub.leases = leasing
+	userID, pcID, firstID, secondID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	pc := testPeer(hub, pcID)
+	pc.role, pc.principal.UserID = "pc", userID
+	first := testPeer(hub, firstID)
+	first.role, first.principal.UserID = "android", userID
+	second := testPeer(hub, secondID)
+	second.role, second.principal.UserID = "android", userID
+	hub.peers[pcID], hub.peers[firstID], hub.peers[secondID] = pc, first, second
+	route := store.SessionRouteAuthorization{Permission: "CONTROL", PCDeviceID: pcID}
+	hub.subscribe(first, sessionID, route)
+	hub.subscribe(second, sessionID, route)
+	policy := store.SessionControlPolicy{
+		Mode: mode, LocalPriority: true, PolicyVersion: 1,
+		PCID: uuid.New(), PCDeviceID: pcID,
+	}
+	policies.set(policy, nil)
+	leasing.setLease(sessionID, firstID)
+	return hub, policies, leasing, pc, first, second, sessionID
+}
+
+type fakeControlPolicyStore struct {
+	mu     sync.Mutex
+	policy store.SessionControlPolicy
+	err    error
+	calls  int
+}
+
+func (s *fakeControlPolicyStore) set(policy store.SessionControlPolicy, err error) {
+	s.mu.Lock()
+	s.policy, s.err = policy, err
+	s.mu.Unlock()
+}
+
+func (s *fakeControlPolicyStore) SessionControlPolicy(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (store.SessionControlPolicy, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	return s.policy, s.err
+}
+
+func (s *fakeControlPolicyStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func activeSubscriptionPeer(hub *Hub, userID, androidID uuid.UUID) *peer {
+	android := testPeer(hub, androidID)
+	android.role = "android"
+	android.principal.UserID = userID
+	hub.peers[androidID] = android
+	return android
+}
+
+func subscriptionCountForPeer(hub *Hub, android *peer) int {
+	hub.mu.RLock()
+	defer hub.mu.RUnlock()
+	return len(android.subscriptions)
+}
+
+func activeRoutePeers(hub *Hub, userID, androidID, pcID uuid.UUID) (*peer, *peer) {
+	android := testPeer(hub, androidID)
+	android.role = "android"
+	android.principal.UserID = userID
+	pc := testPeer(hub, pcID)
+	pc.role = "pc"
+	pc.principal.UserID = userID
+	hub.peers[androidID] = android
+	hub.peers[pcID] = pc
+	return android, pc
+}
+
+func androidRouteEnvelope(messageType realtimewire.MessageType, pcID uuid.UUID) realtimewire.Envelope {
+	return realtimewire.Envelope{MessageType: messageType, RecipientDeviceID: pcID[:]}
+}
+
+type routeAuthorityKey struct {
+	userID, deviceID, sessionID uuid.UUID
+}
+
+type routeAuthorityResult struct {
+	route store.SessionRouteAuthorization
+	err   error
+}
+
+type countingRouteAuthority struct {
+	mu      sync.Mutex
+	results map[routeAuthorityKey]routeAuthorityResult
+	calls   map[routeAuthorityKey]int
+}
+
+type batchedRouteAuthority struct {
+	mu          sync.Mutex
+	routes      map[uuid.UUID]store.SessionRouteAuthorization
+	err         error
+	batchCalls  int
+	singleCalls int
+	maxBatch    int
+}
+
+func newBatchedRouteAuthority() *batchedRouteAuthority {
+	return &batchedRouteAuthority{routes: map[uuid.UUID]store.SessionRouteAuthorization{}}
+}
+
+func (s *batchedRouteAuthority) setRoute(sessionID uuid.UUID, route store.SessionRouteAuthorization) {
+	s.mu.Lock()
+	s.routes[sessionID] = route
+	s.mu.Unlock()
+}
+
+func (s *batchedRouteAuthority) SessionRoute(_ context.Context, _, _, sessionID uuid.UUID) (store.SessionRouteAuthorization, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.singleCalls++
+	if s.err != nil {
+		return store.SessionRouteAuthorization{}, s.err
+	}
+	route, ok := s.routes[sessionID]
+	if !ok {
+		return store.SessionRouteAuthorization{}, store.ErrDenied
+	}
+	return route, nil
+}
+
+func (s *batchedRouteAuthority) SessionRoutes(_ context.Context, _, _ uuid.UUID, sessionIDs []uuid.UUID) (map[uuid.UUID]store.SessionRouteAuthorization, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.batchCalls++
+	if len(sessionIDs) > s.maxBatch {
+		s.maxBatch = len(sessionIDs)
+	}
+	if s.err != nil {
+		return nil, s.err
+	}
+	result := make(map[uuid.UUID]store.SessionRouteAuthorization, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		if route, ok := s.routes[sessionID]; ok {
+			result[sessionID] = route
+		}
+	}
+	return result, nil
+}
+
+func (*batchedRouteAuthority) TouchPCPresence(context.Context, uuid.UUID, uuid.UUID) error {
+	return nil
+}
+
+func (*batchedRouteAuthority) TouchDevicePresence(context.Context, uuid.UUID, uuid.UUID) error {
+	return nil
+}
+
+func (s *batchedRouteAuthority) counts() (batch, single, maxBatch int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.batchCalls, s.singleCalls, s.maxBatch
+}
+
+func newCountingRouteAuthority() *countingRouteAuthority {
+	return &countingRouteAuthority{results: map[routeAuthorityKey]routeAuthorityResult{}, calls: map[routeAuthorityKey]int{}}
+}
+
+func (s *countingRouteAuthority) set(userID, deviceID, sessionID uuid.UUID, route store.SessionRouteAuthorization, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.results[routeAuthorityKey{userID: userID, deviceID: deviceID, sessionID: sessionID}] = routeAuthorityResult{route: route, err: err}
+}
+
+func (s *countingRouteAuthority) SessionRoute(_ context.Context, userID, deviceID, sessionID uuid.UUID) (store.SessionRouteAuthorization, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := routeAuthorityKey{userID: userID, deviceID: deviceID, sessionID: sessionID}
+	s.calls[key]++
+	result, ok := s.results[key]
+	if !ok {
+		return store.SessionRouteAuthorization{}, store.ErrDenied
+	}
+	return result.route, result.err
+}
+
+func (*countingRouteAuthority) TouchPCPresence(context.Context, uuid.UUID, uuid.UUID) error {
+	return nil
+}
+
+func (*countingRouteAuthority) TouchDevicePresence(context.Context, uuid.UUID, uuid.UUID) error {
+	return nil
+}
+
+func (s *countingRouteAuthority) callsFor(userID, deviceID, sessionID uuid.UUID) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls[routeAuthorityKey{userID: userID, deviceID: deviceID, sessionID: sessionID}]
+}
+
+type fakeLiveSessionStore struct {
+	mu             sync.Mutex
+	releases       int
+	reserves       int
+	reserveBatches int
+	reserveErr     error
+	leases         map[uuid.UUID]kv.Lease
+}
+
+func (s *fakeLiveSessionStore) ReserveLiveSession(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, ...int) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reserves++
+	return s.reserveErr == nil, s.reserveErr
+}
+
+func (s *fakeLiveSessionStore) ReserveLiveSessions(_ context.Context, _ uuid.UUID, sessionIDs []uuid.UUID, _ uuid.UUID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reserveBatches++
+	s.reserves += len(sessionIDs)
+	return s.reserveErr
+}
+
+func (s *fakeLiveSessionStore) ReleaseLiveSession(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error {
+	s.mu.Lock()
+	s.releases++
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *fakeLiveSessionStore) GetLease(_ context.Context, sessionID uuid.UUID) (kv.Lease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lease, ok := s.leases[sessionID]
+	if !ok {
+		return kv.Lease{}, errors.New("lease not found")
+	}
+	return lease, nil
+}
+
+func (s *fakeLiveSessionStore) releaseCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.releases
+}
+
+func (s *fakeLiveSessionStore) reserveCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reserves
+}
+
+func (s *fakeLiveSessionStore) reserveBatchCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reserveBatches
+}
+
+func (s *fakeLiveSessionStore) setLease(sessionID, holderID uuid.UUID) kv.Lease {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.leases == nil {
+		s.leases = map[uuid.UUID]kv.Lease{}
+	}
+	lease := kv.Lease{SessionID: sessionID, HolderDeviceID: holderID, ID: uuid.New(), Version: 1, ExpiresAt: time.Now().Add(time.Minute)}
+	s.leases[sessionID] = lease
+	return lease
+}
+
+func (s *fakeLiveSessionStore) deleteLease(sessionID uuid.UUID) {
+	s.mu.Lock()
+	delete(s.leases, sessionID)
+	s.mu.Unlock()
+}
+
 func testPeer(hub *Hub, deviceID uuid.UUID) *peer {
 	return &peer{
 		hub:                hub,
@@ -574,9 +1363,10 @@ func testPeer(hub *Hub, deviceID uuid.UUID) *peer {
 		done:               make(chan struct{}),
 		lastSequences:      map[uuid.UUID]uint64{},
 		subscriptions:      map[uuid.UUID]bool{},
-		subscriptionRoutes: map[uuid.UUID]store.SessionRouteAuthorization{},
+		subscriptionRoutes: map[uuid.UUID]cachedSessionRoute{},
 		subscriptionFrames: map[uuid.UUID][]byte{},
 		subscriptionACKs:   map[uuid.UUID]uint64{},
+		controlPolicies:    map[uuid.UUID]cachedControlPolicy{},
 		pcReplayRoutes:     map[pcRouteKey]*pcReplayRoute{},
 	}
 }

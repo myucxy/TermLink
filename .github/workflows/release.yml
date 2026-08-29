@@ -56,7 +56,11 @@ jobs:
       - id: release-metadata
         name: Capture immutable build metadata
         shell: bash
-        run: echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "${GITHUB_OUTPUT}"
+        run: |
+          source_date_epoch="$(git show -s --format=%ct "${GITHUB_SHA}")"
+          test -n "${source_date_epoch}"
+          echo "source_date_epoch=${source_date_epoch}" >> "${GITHUB_OUTPUT}"
+          echo "created=$(date -u -d "@${source_date_epoch}" +'%Y-%m-%dT%H:%M:%SZ')" >> "${GITHUB_OUTPUT}"
 
       # docker/build-push-action v6.18.0
       - id: build
@@ -74,6 +78,7 @@ jobs:
             VERSION=${{ github.ref_name }}
             REVISION=${{ github.sha }}
             CREATED=${{ steps.release-metadata.outputs.created }}
+            SOURCE_DATE_EPOCH=${{ steps.release-metadata.outputs.source_date_epoch }}
             SOURCE=https://github.com/${{ github.repository }}
 
       # sigstore/cosign-installer v3.9.2

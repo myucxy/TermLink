@@ -514,6 +514,21 @@ class HistoryRepository(
         chunks.get(objectId.requireUuidString())?.let { chunkObject(it).copyCiphertext() }
             ?: snapshots.get(objectId.requireUuidString())?.let { snapshotObject(it).copyCiphertext() }
 
+    /**
+     * Loads exactly one encrypted chunk at the next full-prefix replay cursor.
+     * This deliberately never materializes the session catalog, so callers can
+     * replay an arbitrary number of chunks with a one-chunk memory working set.
+     */
+    suspend fun eventChunkStartingAt(sessionId: UUID, startSequence: ULong): EncryptedHistoryObject? {
+        val start = startSequence.toPositiveRoomSequence("event chunk replay start")
+        val rows = chunks.listStartingAt(sessionId.requireUuidString(), start)
+        require(rows.size <= 1) { "overlapping event chunks begin at sequence $startSequence" }
+        return rows.singleOrNull()?.let { row ->
+            verifyHash(row.ciphertext, row.ciphertextSha256, "event chunk ${row.id}", row.sizeBytes)
+            chunkObject(row).copyCiphertext()
+        }
+    }
+
     suspend fun putTranscriptPage(
         sessionId: UUID,
         snapshotSequence: ULong,

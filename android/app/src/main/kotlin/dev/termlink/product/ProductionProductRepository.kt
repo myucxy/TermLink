@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.util.Log
@@ -21,6 +22,7 @@ import dev.termlink.crypto.TerminalSnapshotCrypto
 import dev.termlink.database.TermLinkDatabase
 import dev.termlink.history.HistoryRepository
 import dev.termlink.history.HistoryObjectCounts
+import dev.termlink.history.EncryptedHistoryObject
 import dev.termlink.history.EncryptedTranscriptPage
 import dev.termlink.history.RendererCheckpointState
 import dev.termlink.history.TranscriptPageMetadata
@@ -91,6 +93,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -104,6 +107,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -408,6 +412,22 @@ internal data class ProductRealtimeDiagnostics(
     val networkReconnectCount: Int,
 )
 
+internal enum class RealtimeNetworkObservationTransition {
+    INITIAL,
+    RECONNECTED,
+    UNCHANGED,
+}
+
+internal fun <NetworkToken> realtimeNetworkObservationTransition(
+    hasObservedNetwork: Boolean,
+    currentNetwork: NetworkToken?,
+    observedNetwork: NetworkToken,
+): RealtimeNetworkObservationTransition = when {
+    !hasObservedNetwork -> RealtimeNetworkObservationTransition.INITIAL
+    currentNetwork != observedNetwork -> RealtimeNetworkObservationTransition.RECONNECTED
+    else -> RealtimeNetworkObservationTransition.UNCHANGED
+}
+
 private const val REMOTE_FILE_OPERATION_LIST = "LIST"
 private const val REMOTE_FILE_OPERATION_DOWNLOAD = "DOWNLOAD"
 private const val REMOTE_FILE_OPERATION_OPEN_TERMINAL = "OPEN_TERMINAL"
@@ -463,20 +483,40 @@ internal class ProductionProductRepository(
     private val realtimeNetworkAvailableCount = AtomicInteger(0)
     private val realtimeNetworkLostCount = AtomicInteger(0)
     private val realtimeNetworkReconnectCount = AtomicInteger(0)
+    private fun observeRealtimeNetworkAvailable(network: Network) {
+        val transition = synchronized(realtimeNetworkLock) {
+            realtimeNetworkObservationTransition(
+                hasObservedNetwork = hasObservedRealtimeNetwork,
+                currentNetwork = realtimeNetwork,
+                observedNetwork = network,
+            ).also { observed ->
+                if (observed != RealtimeNetworkObservationTransition.UNCHANGED) {
+                    hasObservedRealtimeNetwork = true
+                    realtimeNetwork = network
+                }
+            }
+        }
+        if (transition == RealtimeNetworkObservationTransition.UNCHANGED) return
+        realtimeNetworkAvailableCount.incrementAndGet()
+        if (transition == RealtimeNetworkObservationTransition.RECONNECTED) {
+            realtimeNetworkReconnectCount.incrementAndGet()
+            scope.launch {
+                realtimeMultiplexer?.onNetworkAvailable()
+            }
+        }
+    }
     private val realtimeNetworkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
-            realtimeNetworkAvailableCount.incrementAndGet()
-            val reconnect = synchronized(realtimeNetworkLock) {
-                val changed = hasObservedRealtimeNetwork && realtimeNetwork != network
-                hasObservedRealtimeNetwork = true
-                realtimeNetwork = network
-                changed
-            }
-            if (reconnect) {
-                realtimeNetworkReconnectCount.incrementAndGet()
-                scope.launch {
-                    realtimeMultiplexer?.onNetworkAvailable()
-                }
+            observeRealtimeNetworkAvailable(network)
+        }
+
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+            // Some emulator and OEM stacks replace the default network while
+            // it is still being provisioned and deliver the first usable
+            // signal as a capability change rather than a second onAvailable.
+            // Deduplication keeps this a single reconnect boundary.
+            if (networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                observeRealtimeNetworkAvailable(network)
             }
         }
 
@@ -1077,8 +1117,12 @@ internal class ProductionProductRepository(
             ),
         )
         appendActivity(
-            "Pairing challenge created",
-            "${challenge.targetName ?: "Target device"} | expires ${challenge.expiresAt ?: "soon"}",
+            activity.getString(R.string.activity_pairing_challenge_created),
+            activity.getString(
+                R.string.activity_pairing_challenge_detail,
+                challenge.targetName ?: activity.getString(R.string.activity_target_device),
+                challenge.expiresAt?.toString() ?: activity.getString(R.string.time_soon),
+            ),
             Severity.WARNING,
         )
     }
@@ -1093,7 +1137,11 @@ internal class ProductionProductRepository(
             },
         )
         mutableSnapshot.value = mutableSnapshot.value.copy(pairingChallenge = null)
-        appendActivity("Device pairing completed", "This device is now trusted by the server", Severity.SUCCESS)
+        appendActivity(
+            activity.getString(R.string.activity_device_pairing_completed),
+            activity.getString(R.string.activity_device_pairing_completed_detail),
+            Severity.SUCCESS,
+        )
         refreshWithApiPublished(api)
     }
 
@@ -1181,7 +1229,11 @@ internal class ProductionProductRepository(
                     request = live.client::requestControl,
                 )
             }
-            if (acquired) appendActivity("Control granted", "Session $sessionId", Severity.SUCCESS)
+            if (acquired) appendActivity(
+                activity.getString(R.string.activity_control_granted),
+                activity.getString(R.string.activity_session_detail, sessionId),
+                Severity.SUCCESS,
+            )
             clearSessionOpenFailure(sessionId)
         } catch (error: CancellationException) {
             throw error
@@ -1200,7 +1252,11 @@ internal class ProductionProductRepository(
         val live = liveSessions[sessionId] ?: error("Open the session before releasing control")
         freshAccessToken()
         live.client.releaseControl()
-        appendActivity("Control released", "Session $sessionId", Severity.INFO)
+        appendActivity(
+            activity.getString(R.string.activity_control_released),
+            activity.getString(R.string.activity_session_detail, sessionId),
+            Severity.INFO,
+        )
     }
 
     override suspend fun releaseAllControlLeases() {
@@ -1235,7 +1291,11 @@ internal class ProductionProductRepository(
         if (firstFailure != null) {
             publishFailure(firstFailure!!)
         } else {
-            appendActivity("Control leases released", "Device backgrounded", Severity.INFO)
+            appendActivity(
+                activity.getString(R.string.activity_control_leases_released),
+                activity.getString(R.string.activity_device_backgrounded),
+                Severity.INFO,
+            )
         }
     }
 
@@ -1321,7 +1381,12 @@ internal class ProductionProductRepository(
             observeBootstrapFailure(sessionId, classified.failure)
             throw classified
         }
+        var terminalCoreShadow: TerminalCoreShadowObserver? = null
         val client = try {
+            terminalCoreShadow = createJniTerminalCoreShadowObserver(
+                initialRendererState = restoredHistory.rendererState,
+                initialSize = engine.authoritativeSize.value,
+            )
             ProductionRealtimeSessionClient(
                 engine = engine,
                 config = ProductionRealtimeSessionConfig(
@@ -1374,12 +1439,15 @@ internal class ProductionProductRepository(
                     }
                 },
                 authoritativeMetadataRefreshObserver = { refreshLiveKeyMetadata() },
+                orderedEventObserver = terminalCoreShadow,
             )
         } catch (error: CancellationException) {
+            terminalCoreShadow?.close()
             transport.close()
             engine.dispose()
             throw error
         } catch (error: Throwable) {
+            terminalCoreShadow?.close()
             transport.close()
             engine.dispose()
             val classified = classifySessionOpenException(error, SessionFailureStage.REALTIME)
@@ -1596,8 +1664,8 @@ internal class ProductionProductRepository(
             }
         }
         appendActivity(
-            "Session closed",
-            "The Windows command line was closed and its session record was removed",
+            activity.getString(R.string.activity_session_closed),
+            activity.getString(R.string.activity_session_closed_detail),
             Severity.INFO,
         )
     }
@@ -1722,7 +1790,7 @@ internal class ProductionProductRepository(
         mutableSnapshot.value = mutableSnapshot.value.copy(
             replayedHistoryObjectIds = mutableSnapshot.value.replayedHistoryObjectIds + entry.historyObject.id,
         )
-        appendActivity("History replayed", entry.sessionLabel, Severity.SUCCESS)
+        appendActivity(activity.getString(R.string.activity_history_replayed), entry.sessionLabel, Severity.SUCCESS)
     }
 
     override suspend fun browseRemoteDirectory(
@@ -2871,7 +2939,7 @@ internal class ProductionProductRepository(
             connectionState = ProductConnectionState.ERROR,
             connectionError = message,
         )
-        appendActivity("Connection failed", message, Severity.ERROR)
+        appendActivity(activity.getString(R.string.activity_connection_failed), message, Severity.ERROR)
     }
 
     private fun safeFailureMessage(error: Throwable): String = when (error) {
@@ -3085,7 +3153,10 @@ internal class ProductionProductRepository(
         }
     }
 
-    private suspend fun loadTranscriptPage(key: TranscriptLoadKey) {
+    private suspend fun loadTranscriptPage(
+        key: TranscriptLoadKey,
+        remainingAnchorRebases: Int = MAX_TRANSCRIPT_ANCHOR_REBASES,
+    ) {
         val selected = mutableSnapshot.value.transcriptViewports[key.sessionId]
         if (selected == null || selected.snapshotAnchorSequence != key.snapshotSequence ||
             selected.nextBeforeLineId != key.beforeLineId || selected.viewportGeneration != key.viewportGeneration
@@ -3116,6 +3187,52 @@ internal class ProductionProductRepository(
                 latestTranscriptPage(key, session, stored.deviceId, pc.keyEpoch)
             }
             if (selection === TranscriptSelection.Pending) {
+                val liveAck = mutableSnapshot.value.liveAcknowledgements[key.sessionId] ?: 0u
+                val newerAnchor = if (remainingAnchorRebases > 0) {
+                    latestPublishedTranscriptAnchor(
+                        key = key,
+                        session = session,
+                        pc = pc,
+                        pcDevice = pcDevice,
+                        stored = stored,
+                        durableLiveAcknowledgement = liveAck,
+                    )
+                } else {
+                    null
+                }
+                val rebased = newerAnchor?.let { anchor ->
+                    rebasePendingTranscriptViewport(
+                        viewport = selected,
+                        newSnapshotSequence = anchor.snapshotSequence,
+                        newInitialBeforeLineId = anchor.beforeLineId,
+                        durableLiveAcknowledgement = liveAck,
+                    )
+                }
+                if (rebased != null) {
+                    mutableSnapshot.update { currentProduct ->
+                        val current = currentProduct.transcriptViewports[key.sessionId]
+                        if (!current.matches(key)) currentProduct else currentProduct.copy(
+                            transcriptViewports = currentProduct.transcriptViewports +
+                                (key.sessionId to rebased),
+                        )
+                    }
+                    val installed = mutableSnapshot.value.transcriptViewports[key.sessionId]
+                    if (installed?.snapshotAnchorSequence == rebased.snapshotAnchorSequence &&
+                        installed.viewportGeneration == rebased.viewportGeneration
+                    ) {
+                        loadTranscriptPage(
+                            TranscriptLoadKey(
+                                sessionId = key.sessionId,
+                                snapshotSequence = rebased.snapshotAnchorSequence,
+                                beforeLineId = requireNotNull(rebased.nextBeforeLineId),
+                                cursor = null,
+                                viewportGeneration = rebased.viewportGeneration,
+                            ),
+                            remainingAnchorRebases - 1,
+                        )
+                        return
+                    }
+                }
                 error("The expected terminal transcript page is not available yet")
             }
             if (selection === TranscriptSelection.Complete) {
@@ -3246,6 +3363,97 @@ internal class ProductionProductRepository(
         }
     }
 
+    private suspend fun latestPublishedTranscriptAnchor(
+        key: TranscriptLoadKey,
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        durableLiveAcknowledgement: ULong,
+    ): TranscriptAnchor? {
+        val descriptor = latestTerminalSnapshot(session, stored, pc.keyEpoch)?.snapshot ?: return null
+        val metadata = descriptor.metadata
+        val sequence = requireNotNull(metadata.snapshotSequence)
+        if (sequence <= key.snapshotSequence || sequence > durableLiveAcknowledgement) return null
+        val cached = historyRepository.getHistoryObject(metadata.id)?.takeIf { value ->
+            value.metadata.kind == HistoryObject.Kind.SNAPSHOT &&
+                MessageDigest.isEqual(value.metadata.ciphertextSha256, metadata.ciphertextSha256)
+        }
+        val sealedObject = cached?.ciphertext ?: withContext(Dispatchers.IO) {
+            downloadHistory(descriptor.download, metadata)
+        }
+        try {
+            if (cached == null) {
+                historyRepository.putSnapshot(
+                    sessionId = session.id,
+                    snapshotSequence = sequence,
+                    rows = descriptor.rows,
+                    columns = descriptor.columns,
+                    objectKey = metadata.objectKey,
+                    keyId = metadata.keyId,
+                    formatName = requireNotNull(metadata.formatName),
+                    formatVersion = requireNotNull(metadata.formatVersion),
+                    ciphertext = sealedObject,
+                    id = metadata.id,
+                    ciphertextSha256 = metadata.ciphertextSha256,
+                )
+            }
+            return openTerminalTranscriptAnchor(
+                session = session,
+                pc = pc,
+                pcDevice = pcDevice,
+                stored = stored,
+                descriptor = descriptor,
+                sealedObject = sealedObject,
+            )
+        } finally {
+            sealedObject.fill(0)
+        }
+    }
+
+    private suspend fun openTerminalTranscriptAnchor(
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        descriptor: SnapshotDownloadDescriptor,
+        sealedObject: ByteArray,
+    ): TranscriptAnchor = withContext(Dispatchers.Default) {
+        val metadata = descriptor.metadata
+        val sequence = requireNotNull(metadata.snapshotSequence)
+        require(metadata.kind == HistoryObject.Kind.SNAPSHOT)
+        require(metadata.formatName == HistoryRepository.TERMINAL_SNAPSHOT_FORMAT && metadata.formatVersion == 1)
+        val keyEpoch = requireNotNull(snapshotKeyEpoch(stored.deviceId, metadata.keyId))
+        require(keyEpoch <= pc.keyEpoch)
+        val pairwise = SessionCrypto.derivePairwiseKey(
+            stored.identity.exchange.privateKey,
+            pcDevice.exchangePublicKey,
+            pc.deviceId,
+            stored.deviceId,
+            keyEpoch,
+        )
+        try {
+            val wire = TerminalSnapshotCrypto.openSnapshot(
+                pairwiseKey = pairwise,
+                sealedObject = sealedObject,
+                expectedSessionId = session.id,
+                expectedPcDeviceId = pc.deviceId,
+                expectedRecipientDeviceId = stored.deviceId,
+                expectedKeyEpoch = keyEpoch,
+                expectedKeyId = metadata.keyId,
+                expectedSnapshotSequence = sequence,
+                expectedColumns = descriptor.columns,
+                expectedRows = descriptor.rows,
+            )
+            val beforeLineId = TerminalSnapshotCrypto.initialTranscriptBeforeLineId(wire)
+            val decoded = TerminalSnapshotDomainDecoder.decode(wire)
+            require(decoded.sequence.toULong() == sequence)
+            TranscriptAnchor(sequence, beforeLineId)
+        } finally {
+            pairwise.fill(0)
+        }
+    }
+
     private suspend fun openTranscriptPage(
         session: SessionSummary,
         pc: PcSummary,
@@ -3324,6 +3532,11 @@ internal class ProductionProductRepository(
             deviceId = stored.deviceId,
             identity = stored.identity,
             parentScope = scope,
+            additionalCapabilities = if (BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME) {
+                setOf(dev.termlink.model.PcCapabilityIds.TERMINAL_SNAPSHOT_V1)
+            } else {
+                emptySet()
+            },
             httpClient = http,
             allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
             authenticationRefresher = dev.termlink.network.production.RealtimeAuthenticationRefresher {
@@ -3342,7 +3555,7 @@ internal class ProductionProductRepository(
         runCatching { sessionStore.accountLogin = null }
         val message = activity.getString(R.string.failure_authentication_expired)
         mutableSnapshot.value = authenticationExpiredSnapshot(mutableSnapshot.value, message)
-        appendActivity("Authentication expired", message, Severity.ERROR)
+        appendActivity(activity.getString(R.string.activity_authentication_expired), message, Severity.ERROR)
         val retired = detachRealtimeRuntime()
         // This observer can run inside the multiplexer state collector. Yield
         // to the Repository parent scope before closing the captured old
@@ -4141,14 +4354,16 @@ internal class ProductionProductRepository(
         }
 
     /**
-     * Reads one immutable, recipient-filtered Chunk catalog. Cursor paging is
-     * required here because the server orders history newest first while a
-     * safe raw replay must prove the complete prefix beginning at sequence 1.
+     * Reads only the newest, recipient-filtered Chunk catalog pages needed by
+     * tail recovery. The server orders this selector newest first, so walking
+     * the entire catalog would turn the availability fallback into the same
+     * unbounded cold start it is intended to avoid.
      */
-    private suspend fun latestBoundedEventReplayCatalog(
+    private suspend fun latestBoundedTailReplayCatalog(
         session: SessionSummary,
         pc: PcSummary,
         stored: DeviceKeyVault.StoredIdentity,
+        authoritativeTail: ULong,
     ): List<HistoryEntry> = withApi(terminalSnapshotReadinessHttp) { api ->
         val entries = mutableListOf<HistoryEntry>()
         val downloads = mutableMapOf<UUID, HistoryDownloadRequest>()
@@ -4157,9 +4372,7 @@ internal class ProductionProductRepository(
         var cursor: String? = null
         var pageCount = 0
         while (true) {
-            require(pageCount < TERMINAL_BOUNDED_REPLAY_MAX_CATALOG_PAGES) {
-                "Chunk history catalog exceeded the bounded replay page limit"
-            }
+            require(pageCount < TERMINAL_TAIL_REPLAY_MAX_CATALOG_PAGES)
             val response = api.get(sessionChunkHistoryRequestPath(session.id, cursor)).jsonObject
             val items = boundedChunkHistoryItems(response)
             for (item in items) {
@@ -4183,6 +4396,15 @@ internal class ProductionProductRepository(
             val hasMore = response.getValue("has_more").jsonPrimitive.booleanOrNull
                 ?: error("Chunk history has_more must be a boolean")
             if (!hasMore) break
+            val selection = boundedTailReplaySelection(
+                entries,
+                authoritativeTail,
+                HistoryEntry::historySequenceRange,
+            )
+            if (selection.readiness == BoundedEventReplayReadiness.READY &&
+                selection.eventCount >= TERMINAL_BOUNDED_REPLAY_MAX_EVENTS
+            ) break
+            if (pageCount >= TERMINAL_TAIL_REPLAY_MAX_CATALOG_PAGES) break
             val next = response["next_cursor"]?.jsonPrimitive?.contentOrNull
                 ?.takeIf(String::isNotBlank)
                 ?: error("Chunk history page omitted its continuation cursor")
@@ -4191,6 +4413,195 @@ internal class ProductionProductRepository(
         }
         historyDownloads.putAll(downloads)
         entries
+    }
+
+    /**
+     * Caches one immutable, contiguous CHUNK range while holding at most one
+     * catalog page and one encrypted object in memory. The server's signed
+     * cursor fixes one catalog revision; [stopAfterSequence] lets a catch-up
+     * pass stop at the durable boundary from the preceding pass.
+     *
+     * The returned target may be newer than [minimumTarget] when output and
+     * durable history advanced between the authoritative-tail read and the
+     * first catalog request. That is safe because every admitted sequence is
+     * still authenticated, contiguous, and later rendered before its ACK.
+     */
+    private suspend fun cacheStreamedHistoryRange(
+        session: SessionSummary,
+        pc: PcSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        minimumTarget: ULong,
+        stopAfterSequence: ULong,
+    ): ULong = withApi(terminalSnapshotReadinessHttp) { api ->
+        require(minimumTarget > stopAfterSequence) { "Streamed history target must advance" }
+
+        val firstResponse = awaitStreamedHistoryCatalogHead(
+            minimumTarget = minimumTarget,
+            loadPage = { api.get(sessionChunkHistoryRequestPath(session.id)).jsonObject },
+            newestEndSequence = { response ->
+                boundedChunkHistoryItems(response)
+                    .firstOrNull()
+                    ?.toHistoryObject(session.id)
+                    ?.endSequence
+            },
+        )
+
+        cacheContiguousHistoryRange(
+            minimumTarget = minimumTarget,
+            stopAfterSequence = stopAfterSequence,
+            firstPage = firstResponse.toStreamedHistoryCatalogPage(),
+            loadNextPage = { cursor ->
+                api.get(sessionChunkHistoryRequestPath(session.id, cursor))
+                    .jsonObject
+                    .toStreamedHistoryCatalogPage()
+            },
+            sequenceRange = { item ->
+                val metadata = item.toHistoryObject(session.id)
+                val start = metadata.startSequence
+                val end = metadata.endSequence
+                if (start == null || end == null) null else HistorySequenceRange(start, end)
+            },
+            cacheCandidate = { item ->
+                val metadata = item.toHistoryObject(session.id)
+                val historyEpoch = historyKeyEpoch(stored.deviceId, metadata.keyId)
+                if (historyEpoch == null || historyEpoch > pc.keyEpoch) {
+                    throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
+                }
+                cacheRemoteHistoryChunk(
+                    sessionId = session.id,
+                    metadata = metadata,
+                    download = item.getValue("download").jsonObject.toHistoryDownloadRequest(),
+                )
+            },
+        )
+    }
+
+    private suspend fun cacheRemoteHistoryChunk(
+        sessionId: UUID,
+        metadata: HistoryObject,
+        download: HistoryDownloadRequest,
+    ) = withContext(Dispatchers.IO) {
+        val cached = historyRepository.getHistoryObject(metadata.id)
+        if (cached != null) {
+            try {
+                val existing = cached.metadata
+                require(existing.kind == HistoryObject.Kind.CHUNK &&
+                    existing.id == metadata.id &&
+                    existing.startSequence == metadata.startSequence &&
+                    existing.endSequence == metadata.endSequence &&
+                    existing.objectKey == metadata.objectKey &&
+                    existing.keyId == metadata.keyId &&
+                    existing.sizeBytes == metadata.sizeBytes &&
+                    MessageDigest.isEqual(existing.ciphertextSha256, metadata.ciphertextSha256)
+                ) { "Cached event chunk metadata changed" }
+            } finally {
+                cached.ciphertext.fill(0)
+            }
+            return@withContext
+        }
+
+        val sealedObject = downloadHistory(download, metadata)
+        try {
+            historyRepository.putEventChunk(
+                sessionId = sessionId,
+                startSequence = requireNotNull(metadata.startSequence),
+                endSequence = requireNotNull(metadata.endSequence),
+                objectKey = metadata.objectKey,
+                keyId = metadata.keyId,
+                ciphertext = sealedObject,
+                id = metadata.id,
+                ciphertextSha256 = metadata.ciphertextSha256,
+            )
+        } finally {
+            sealedObject.fill(0)
+        }
+    }
+
+    private data class StreamedReplayProgress(
+        val restoredThrough: ULong,
+        val localInputEpoch: Long,
+    )
+
+    /** Replays cached ciphertext one immutable CHUNK at a time. */
+    private suspend fun replayCachedHistoryRange(
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        engine: TermuxTerminalEngine,
+        afterSequence: ULong,
+        throughSequence: ULong,
+        initialLocalInputEpoch: Long,
+    ): StreamedReplayProgress {
+        require(throughSequence > afterSequence) { "Streamed history replay must advance" }
+        var expected = afterSequence + 1uL
+        var localInputEpoch = initialLocalInputEpoch
+        while (expected <= throughSequence) {
+            currentCoroutineContext().ensureActive()
+            val encrypted = historyRepository.eventChunkStartingAt(session.id, expected)
+                ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+            val metadata = encrypted.metadata
+            val end = metadata.endSequence
+                ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+            if (metadata.startSequence != expected || end < expected || end > throughSequence) {
+                encrypted.ciphertext.fill(0)
+                throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+            }
+            val chunk = try {
+                openCachedHistoryChunk(session, pc, pcDevice, stored, encrypted)
+            } finally {
+                encrypted.ciphertext.fill(0)
+            }
+            if (chunk.eventsCount == 0) throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+            for (event in chunk.eventsList) {
+                val sequence = event.seq.toULong()
+                if (sequence != expected || sequence > throughSequence) {
+                    throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+                }
+                localInputEpoch = maxOf(localInputEpoch, applyHistoryEvent(engine, event))
+                expected++
+            }
+            if (expected - 1uL != end) throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+            yield()
+        }
+        return StreamedReplayProgress(throughSequence, localInputEpoch)
+    }
+
+    private suspend fun openCachedHistoryChunk(
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        encrypted: EncryptedHistoryObject,
+    ): HistoryChunkV1 = withContext(Dispatchers.Default) {
+        val metadata = encrypted.metadata
+        val start = requireNotNull(metadata.startSequence)
+        val end = requireNotNull(metadata.endSequence)
+        val historyEpoch = historyKeyEpoch(stored.deviceId, metadata.keyId)
+            ?: throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
+        if (historyEpoch > pc.keyEpoch) throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
+        val pairwise = SessionCrypto.derivePairwiseKey(
+            stored.identity.exchange.privateKey,
+            pcDevice.exchangePublicKey,
+            pc.deviceId,
+            stored.deviceId,
+            historyEpoch,
+        )
+        try {
+            HistoryCrypto.open(
+                pairwise,
+                encrypted.ciphertext,
+                session.id,
+                pc.deviceId,
+                stored.deviceId,
+                historyEpoch,
+                metadata.keyId,
+                start,
+                end,
+            )
+        } finally {
+            pairwise.fill(0)
+        }
     }
 
     /** Returns null only when no durable binding was changed and the caller may use full replay. */
@@ -4351,10 +4762,11 @@ internal class ProductionProductRepository(
     }
 
     /**
-     * Rebuilds the renderer through the last durable cumulative ACK before a
-     * fresh socket subscribes. A cursor is never used by itself: if encrypted
-     * history cannot reconstruct a contiguous prefix from sequence 1, the
-     * client safely resumes from 0 and lets the Agent replay its bounded log.
+     * Installs an exact Snapshot when available. Otherwise it renders a
+     * bounded, contiguous recent Chunk suffix ending at an authoritative tail
+     * and declares that loss of the earlier prefix explicitly as TailWindow.
+     * A fresh socket is registered only after the rendered tail is rechecked
+     * against the realtime replay bound.
      */
     private suspend fun restoreLiveHistory(
         session: SessionSummary,
@@ -4385,8 +4797,12 @@ internal class ProductionProductRepository(
         var latestAuthoritativeTail = session.lastOutputSequence
         var authoritativeReadinessObserved = false
         var latestSnapshotFailure: SessionOpenFailure? = null
+        val snapshotRuntimeNegotiated = terminalSnapshotRuntimeNegotiated(
+            localRuntimeEnabled = BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME,
+            pcCapabilities = pc.capabilities,
+        )
         val restoredSnapshot = restoreSnapshotWhenEnabled(
-            enabled = BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME,
+            enabled = snapshotRuntimeNegotiated,
             remoteRetryDelaysMillis = TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS,
             remoteReadinessTimeoutMillis = TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS,
             restoreBound = {
@@ -4475,125 +4891,94 @@ internal class ProductionProductRepository(
         ) {
             return RestoredLiveHistory(RendererBootstrapState.Empty(cursor.rendererGeneration))
         }
-        val target = if (BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME) {
-            latestAuthoritativeTail
-        } else {
-            cursor.sequence
-        }
-        if (target == 0uL) {
-            return RestoredLiveHistory(RendererBootstrapState.Empty(cursor.rendererGeneration))
-        }
-        suspend fun resetRendererAndCursor(): RestoredLiveHistory {
-            return resetLiveRendererAndCursor(session, engine, cursor.rendererGeneration)
-        }
-        var candidates = mutableSnapshot.value.history
-            .asSequence()
-            .filter { entry ->
-                entry.sessionId == session.id &&
-                    entry.historyObject.kind == HistoryObject.Kind.CHUNK &&
-                    historyKeyEpoch(stored.deviceId, entry.historyObject.keyId)?.let { it <= pc.keyEpoch } == true
+        var activeRendererGeneration = cursor.rendererGeneration
+        suspend fun resetRendererAndCursor(): RestoredLiveHistory =
+            resetLiveRendererAndCursor(session, engine, activeRendererGeneration).also { reset ->
+                activeRendererGeneration = reset.rendererState.rendererGeneration
             }
-            .sortedWith(
-                compareBy<HistoryEntry> { it.historyObject.startSequence ?: ULong.MAX_VALUE }
-                    .thenBy { it.historyObject.endSequence ?: ULong.MAX_VALUE },
-            )
-            .toList()
-        var replayReadiness = boundedEventReplayReadiness(
-            candidates.mapNotNull(HistoryEntry::historySequenceRange),
-            target,
-        )
-        if (BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME &&
-            replayReadiness != BoundedEventReplayReadiness.READY
-        ) {
-            candidates = try {
-                latestBoundedEventReplayCatalog(session, pc, stored)
-                    .sortedWith(
-                        compareBy<HistoryEntry> { it.historyObject.startSequence ?: ULong.MAX_VALUE }
-                            .thenBy { it.historyObject.endSequence ?: ULong.MAX_VALUE },
-                    )
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                if (candidates.isEmpty()) {
-                    throw classifySessionOpenException(error, SessionFailureStage.HISTORY_METADATA)
-                }
-                candidates
+        val initialTail = try {
+            latestAuthoritativeSessionTail(session)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            throw classifySessionOpenException(error, SessionFailureStage.HISTORY_METADATA)
+        } ?: throw sessionOpenException(SessionOpenFailureCode.SESSION_UNAVAILABLE)
+        if (initialTail == 0uL) {
+            if (cursor.sequence == 0uL) {
+                return RestoredLiveHistory(RendererBootstrapState.Empty(cursor.rendererGeneration))
             }
-            replayReadiness = boundedEventReplayReadiness(
-                candidates.mapNotNull(HistoryEntry::historySequenceRange),
-                target,
-            )
+            resetRendererAndCursor()
+            throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
         }
-        if (replayReadiness != BoundedEventReplayReadiness.READY) {
-            if (!BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME) return resetRendererAndCursor()
-            val failure = when (replayReadiness) {
-                BoundedEventReplayReadiness.NOT_YET_COMPLETE -> SessionOpenFailureCode.HISTORY_NOT_READY
-                BoundedEventReplayReadiness.GAP -> SessionOpenFailureCode.HISTORY_GAP
-                BoundedEventReplayReadiness.LIMIT_EXCEEDED -> SessionOpenFailureCode.HISTORY_REPLAY_LIMIT
-                BoundedEventReplayReadiness.READY -> error("Ready replay was rejected")
-            }
-            throw SessionOpenException(
-                SessionOpenFailure(
-                    failure,
-                    diagnosticCode = latestSnapshotFailure?.diagnosticCode,
-                ),
-                latestSnapshotFailure?.let(::SessionOpenException),
-            )
-        }
-
-        var expected = 1uL
+        resetRendererAndCursor()
         var restored = 0uL
         var localInputEpoch = 0L
         return try {
-            engine.clear()
-            engine.resize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1))
-            while (expected <= target) {
-                val entry = candidates.firstOrNull { it.historyObject.startSequence == expected } ?: break
-                val download = historyDownloads[entry.historyObject.id] ?: break
-                val chunk = openHistoryChunk(entry, pc, pcDevice, stored, download)
-                for (event in chunk.eventsList) {
-                    val sequence = event.seq.toULong()
-                    check(sequence == expected) { "History recovery is not contiguous" }
-                    if (sequence > target) break
-                    localInputEpoch = maxOf(localInputEpoch, applyHistoryEvent(engine, event))
-                    restored = sequence
-                    expected++
-                }
-                if (restored >= target) break
-                val end = requireNotNull(entry.historyObject.endSequence) { "History end sequence is missing" }
-                if (restored < end) break
-            }
-            if (restored == target) {
-                val persisted = historyRepository.putAckCursor(
-                    sessionId = session.id,
-                    direction = LIVE_OUTPUT_ACK_DIRECTION,
-                    rendererGeneration = cursor.rendererGeneration,
-                    sequence = target,
+            while (true) {
+                val replayTarget = cacheStreamedHistoryRange(
+                    session = session,
+                    pc = pc,
+                    stored = stored,
+                    // Restore every newly durable prefix immediately instead
+                    // of waiting for the catalog to catch the authoritative
+                    // tail in one step. This keeps both memory and latency
+                    // bounded independently of the total session length.
+                    minimumTarget = restored + 1uL,
+                    stopAfterSequence = restored,
                 )
-                check(persisted == target) { "Bounded replay ACK was not persisted" }
-                RestoredLiveHistory(
-                    rendererState = RendererBootstrapState.FullPrefix(restored.toLong(), cursor.rendererGeneration),
-                    localInputEpoch = localInputEpoch,
-                    durableAcknowledgement = target,
-                    bootstrapSource = ProductBootstrapSource.LEGACY_REPLAY,
-                )
-            } else {
-                if (BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME) {
-                    resetRendererAndCursor()
+                if (replayTarget > Long.MAX_VALUE.toULong()) {
                     throw sessionOpenException(SessionOpenFailureCode.HISTORY_REPLAY)
                 }
-                resetRendererAndCursor()
+                val progress = replayCachedHistoryRange(
+                    session = session,
+                    pc = pc,
+                    pcDevice = pcDevice,
+                    stored = stored,
+                    engine = engine,
+                    afterSequence = restored,
+                    throughSequence = replayTarget,
+                    initialLocalInputEpoch = localInputEpoch,
+                )
+                restored = progress.restoredThrough
+                localInputEpoch = progress.localInputEpoch
+
+                val currentTail = latestAuthoritativeSessionTail(session)
+                    ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_NOT_READY)
+                if (tailReplayHasBoundedRealtimeSuffix(restored, currentTail)) break
+                if (currentTail <= restored) {
+                    throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+                }
+                // Output outran the realtime replay window while the prefix was
+                // being restored. Cache and render only the next newly durable
+                // range, then re-read authority again. There is no total event
+                // or elapsed-time limit.
             }
+
+            val persisted = historyRepository.putAckCursor(
+                sessionId = session.id,
+                direction = LIVE_OUTPUT_ACK_DIRECTION,
+                rendererGeneration = activeRendererGeneration,
+                sequence = restored,
+            )
+            check(persisted == restored) { "Streamed history ACK was not persisted" }
+            RestoredLiveHistory(
+                rendererState = RendererBootstrapState.FullPrefix(
+                    sequence = restored.toLong(),
+                    rendererGeneration = activeRendererGeneration,
+                ),
+                localInputEpoch = localInputEpoch,
+                durableAcknowledgement = restored,
+                bootstrapSource = ProductBootstrapSource.LEGACY_REPLAY,
+            )
         } catch (error: CancellationException) {
+            resetRendererAndCursor()
             throw error
         } catch (error: SessionOpenException) {
+            resetRendererAndCursor()
             throw error
         } catch (error: Exception) {
-            val reset = resetRendererAndCursor()
-            if (BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME) {
-                throw classifySessionOpenException(error, SessionFailureStage.HISTORY_REPLAY)
-            }
-            reset
+            resetRendererAndCursor()
+            throw classifySessionOpenException(error, SessionFailureStage.HISTORY_REPLAY)
         }
     }
 
@@ -4694,8 +5079,8 @@ internal class ProductionProductRepository(
                             activeGap,
                         )
                         appendActivity(
-                            "History gap recovered",
-                            "Encrypted replay restored through ACK $recovered",
+                            activity.getString(R.string.activity_history_gap_recovered),
+                            activity.getString(R.string.activity_history_gap_recovered_detail, recovered),
                             Severity.SUCCESS,
                         )
                         return
@@ -5010,7 +5395,127 @@ internal fun boundedChunkHistoryItems(response: JsonObject): List<JsonObject> =
         }) { "Chunk history selector returned a non-chunk object" }
     }
 
+internal data class StreamedHistoryCatalogPage<Candidate>(
+    val items: List<Candidate>,
+    val hasMore: Boolean,
+    val nextCursor: String?,
+)
+
+/**
+ * Waits for a durable catalog head without imposing an event, elapsed-time, or
+ * progress-stall limit. A producer can remain healthy while a slow encrypted
+ * batch is being persisted and committed; cancellation is the only local stop
+ * condition until the requested durable prefix becomes visible.
+ */
+internal suspend fun <Page> awaitStreamedHistoryCatalogHead(
+    minimumTarget: ULong,
+    loadPage: suspend () -> Page,
+    newestEndSequence: (Page) -> ULong?,
+    pollMillis: Long = TERMINAL_STREAMED_REPLAY_READINESS_POLL_MILLIS,
+    pause: suspend (Long) -> Unit = { delay(it) },
+): Page {
+    require(minimumTarget > 0uL) { "Streamed history target must be positive" }
+    require(pollMillis >= 0L) { "Streamed history poll delay must not be negative" }
+
+    while (true) {
+        currentCoroutineContext().ensureActive()
+        val page = loadPage()
+        val newestEnd = newestEndSequence(page)
+        if (newestEnd != null && newestEnd >= minimumTarget) return page
+        pause(pollMillis)
+    }
+}
+
+private fun JsonObject.toStreamedHistoryCatalogPage(): StreamedHistoryCatalogPage<JsonObject> =
+    StreamedHistoryCatalogPage(
+        items = boundedChunkHistoryItems(this),
+        hasMore = getValue("has_more").jsonPrimitive.booleanOrNull
+            ?: error("Chunk history has_more must be a boolean"),
+        nextCursor = this["next_cursor"]?.jsonPrimitive?.contentOrNull,
+    )
+
+/**
+ * Walks one immutable newest-to-oldest catalog revision and persists every
+ * candidate needed to reach [stopAfterSequence]. The algorithm retains only
+ * the current bounded page and candidate; neither the number of pages nor the
+ * total event count is a failure condition.
+ */
+internal suspend fun <Candidate> cacheContiguousHistoryRange(
+    minimumTarget: ULong,
+    stopAfterSequence: ULong,
+    firstPage: StreamedHistoryCatalogPage<Candidate>,
+    loadNextPage: suspend (String) -> StreamedHistoryCatalogPage<Candidate>,
+    sequenceRange: (Candidate) -> HistorySequenceRange?,
+    cacheCandidate: suspend (Candidate) -> Unit,
+): ULong {
+    require(minimumTarget > stopAfterSequence) { "Streamed history target must advance" }
+    var page = firstPage
+    var previousCursor: String? = null
+    var target: ULong? = null
+    var expectedEnd: ULong? = null
+
+    while (true) {
+        currentCoroutineContext().ensureActive()
+        if (page.items.isEmpty()) throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+        for (candidate in page.items) {
+            currentCoroutineContext().ensureActive()
+            val range = sequenceRange(candidate)
+                ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+            if (range.start == 0uL || range.endInclusive < range.start) {
+                throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+            }
+            if (target == null) {
+                if (range.endInclusive < minimumTarget) {
+                    throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+                }
+                target = range.endInclusive
+                expectedEnd = range.endInclusive
+            }
+            val expected = requireNotNull(expectedEnd)
+            if (expected <= stopAfterSequence) break
+            if (range.endInclusive != expected || range.start <= stopAfterSequence) {
+                throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+            }
+            cacheCandidate(candidate)
+            expectedEnd = range.start - 1uL
+            if (expectedEnd == stopAfterSequence) break
+        }
+        if (expectedEnd == stopAfterSequence) return requireNotNull(target)
+        if (!page.hasMore) throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+        val next = page.nextCursor?.takeIf(String::isNotBlank)
+            ?: error("Chunk history page omitted its continuation cursor")
+        if (next == previousCursor) error("Chunk history cursor did not advance")
+        previousCursor = next
+        page = loadNextPage(next)
+        yield()
+    }
+}
+
 internal data class HistorySequenceRange(val start: ULong, val endInclusive: ULong)
+
+internal data class BoundedEventReplayCatalogObservation<Candidate>(
+    val authoritativeTail: ULong,
+    val candidates: List<Candidate>,
+)
+
+internal data class BoundedEventReplayCatalogResult<Candidate>(
+    val target: ULong,
+    val candidates: List<Candidate>,
+    val readiness: BoundedEventReplayReadiness,
+)
+
+internal data class BoundedTailReplaySelection<Candidate>(
+    val target: ULong,
+    val start: ULong? = null,
+    val candidates: List<Candidate> = emptyList(),
+    val eventCount: Int = 0,
+    val readiness: BoundedEventReplayReadiness,
+)
+
+internal data class BoundedTailReplayCatalogObservation<Candidate>(
+    val authoritativeTail: ULong,
+    val candidates: List<Candidate>,
+)
 
 internal enum class BoundedEventReplayReadiness {
     READY,
@@ -5023,6 +5528,147 @@ private fun HistoryEntry.historySequenceRange(): HistorySequenceRange? {
     val start = historyObject.startSequence ?: return null
     val end = historyObject.endSequence ?: return null
     return HistorySequenceRange(start, end)
+}
+
+/**
+ * Selects a whole-Chunk suffix ending exactly at [authoritativeTail]. Older
+ * chunks are added only while the resulting window remains bounded. A gap or
+ * overlap inside the selected suffix is rejected; history before its start is
+ * deliberately outside the TailWindow contract.
+ */
+internal fun <Candidate> boundedTailReplaySelection(
+    candidates: List<Candidate>,
+    authoritativeTail: ULong,
+    sequenceRange: (Candidate) -> HistorySequenceRange?,
+    maximumEvents: Int = TERMINAL_BOUNDED_REPLAY_MAX_EVENTS,
+): BoundedTailReplaySelection<Candidate> {
+    require(authoritativeTail > 0uL) { "Tail replay target must be positive" }
+    require(maximumEvents > 0) { "Tail replay event limit must be positive" }
+    if (candidates.isEmpty()) {
+        return BoundedTailReplaySelection(
+            target = authoritativeTail,
+            readiness = BoundedEventReplayReadiness.NOT_YET_COMPLETE,
+        )
+    }
+    val ranged = candidates.map { candidate ->
+        val range = sequenceRange(candidate) ?: return BoundedTailReplaySelection(
+            target = authoritativeTail,
+            readiness = BoundedEventReplayReadiness.GAP,
+        )
+        if (range.start == 0uL || range.endInclusive < range.start) {
+            return BoundedTailReplaySelection(
+                target = authoritativeTail,
+                readiness = BoundedEventReplayReadiness.GAP,
+            )
+        }
+        candidate to range
+    }.sortedWith(
+        compareBy<Pair<Candidate, HistorySequenceRange>> { it.second.start }
+            .thenBy { it.second.endInclusive },
+    )
+    val newest = ranged.last()
+    if (newest.second.endInclusive != authoritativeTail) {
+        // The independently published directory may trail the session row, or
+        // the row may have advanced while this catalog page was in flight.
+        return BoundedTailReplaySelection(
+            target = authoritativeTail,
+            readiness = BoundedEventReplayReadiness.NOT_YET_COMPLETE,
+        )
+    }
+
+    fun eventCount(range: HistorySequenceRange): ULong =
+        range.endInclusive - range.start + 1uL
+
+    var selectedIndex = ranged.lastIndex
+    var selectedCount = eventCount(newest.second)
+    if (selectedCount > maximumEvents.toULong()) {
+        return BoundedTailReplaySelection(
+            target = authoritativeTail,
+            readiness = BoundedEventReplayReadiness.LIMIT_EXCEEDED,
+        )
+    }
+    while (selectedIndex > 0) {
+        val older = ranged[selectedIndex - 1].second
+        val current = ranged[selectedIndex].second
+        val olderCount = eventCount(older)
+        // An overlap reaches into the window we already selected and is
+        // ambiguous even when the older object would exceed the size budget.
+        if (older.endInclusive >= current.start) {
+            return BoundedTailReplaySelection(
+                target = authoritativeTail,
+                readiness = BoundedEventReplayReadiness.GAP,
+            )
+        }
+        if (olderCount > maximumEvents.toULong() - selectedCount) break
+        if (older.endInclusive == ULong.MAX_VALUE || older.endInclusive + 1uL != current.start) {
+            return BoundedTailReplaySelection(
+                target = authoritativeTail,
+                readiness = BoundedEventReplayReadiness.GAP,
+            )
+        }
+        selectedCount += olderCount
+        selectedIndex--
+    }
+    val selected = ranged.subList(selectedIndex, ranged.size)
+    return BoundedTailReplaySelection(
+        target = authoritativeTail,
+        start = selected.first().second.start,
+        candidates = selected.map { it.first },
+        eventCount = selectedCount.toInt(),
+        readiness = BoundedEventReplayReadiness.READY,
+    )
+}
+
+/**
+ * Waits for the newest Chunk directory to catch the authoritative session
+ * watermark. Cancellation remains caller-owned; transient metadata errors and
+ * temporary publication gaps are retried only inside the supplied deadline.
+ */
+internal suspend fun <Candidate> awaitBoundedTailReplayCatalog(
+    initialTarget: ULong,
+    latestObservation: suspend () -> BoundedTailReplayCatalogObservation<Candidate>,
+    sequenceRange: (Candidate) -> HistorySequenceRange?,
+    retryDelaysMillis: List<Long>,
+    timeoutMillis: Long,
+    maximumEvents: Int = TERMINAL_BOUNDED_REPLAY_MAX_EVENTS,
+    pause: suspend (Long) -> Unit = { delay(it) },
+    onObservationFailure: (Exception) -> Unit = {},
+): BoundedTailReplaySelection<Candidate> {
+    require(initialTarget > 0uL) { "Tail replay target must be positive" }
+    require(retryDelaysMillis.all { it >= 0L }) { "Tail readiness delays must not be negative" }
+    require(timeoutMillis > 0L) { "Tail readiness timeout must be positive" }
+
+    var result = BoundedTailReplaySelection<Candidate>(
+        target = initialTarget,
+        readiness = BoundedEventReplayReadiness.NOT_YET_COMPLETE,
+    )
+    val settled = withTimeoutOrNull(timeoutMillis) {
+        for (attempt in 0..retryDelaysMillis.size) {
+            val observation = try {
+                latestObservation()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                onObservationFailure(error)
+                null
+            }
+            if (observation != null) {
+                val target = maxOf(result.target, observation.authoritativeTail)
+                result = boundedTailReplaySelection(
+                    observation.candidates,
+                    target,
+                    sequenceRange,
+                    maximumEvents,
+                )
+                if (result.readiness == BoundedEventReplayReadiness.READY ||
+                    result.readiness == BoundedEventReplayReadiness.LIMIT_EXCEEDED
+                ) return@withTimeoutOrNull result
+            }
+            if (attempt < retryDelaysMillis.size) pause(retryDelaysMillis[attempt])
+        }
+        null
+    }
+    return settled ?: result
 }
 
 /**
@@ -5069,9 +5715,130 @@ internal fun boundedEventReplayReadiness(
     }
 }
 
+/**
+ * Polls the independently published Chunk catalog until it proves a complete
+ * prefix through the latest tail observed before that catalog read. A caller
+ * may supply a shorter timeout to share one absolute bootstrap deadline with
+ * Snapshot readiness. Metadata failures remain retryable inside that window;
+ * caller cancellation is never converted into a readiness result.
+ */
+internal suspend fun <Candidate> awaitBoundedEventReplayCatalog(
+    initialTarget: ULong,
+    initialCandidates: List<Candidate>,
+    sequenceRange: (Candidate) -> HistorySequenceRange?,
+    latestObservation: suspend () -> BoundedEventReplayCatalogObservation<Candidate>,
+    retryDelaysMillis: List<Long>,
+    timeoutMillis: Long,
+    pause: suspend (Long) -> Unit = { delay(it) },
+    onObservationFailure: (Exception) -> Unit = {},
+): BoundedEventReplayCatalogResult<Candidate> {
+    require(initialTarget > 0uL) { "Bounded replay target must be positive" }
+    require(retryDelaysMillis.all { it >= 0L }) { "Chunk readiness delays must not be negative" }
+    require(timeoutMillis > 0L) { "Chunk readiness timeout must be positive" }
+
+    var result = BoundedEventReplayCatalogResult(
+        target = initialTarget,
+        candidates = initialCandidates,
+        readiness = boundedEventReplayReadiness(initialCandidates.mapNotNull(sequenceRange), initialTarget),
+    )
+    if (result.readiness == BoundedEventReplayReadiness.READY ||
+        result.readiness == BoundedEventReplayReadiness.LIMIT_EXCEEDED
+    ) return result
+
+    val settled = withTimeoutOrNull(timeoutMillis) {
+        for (attempt in 0..retryDelaysMillis.size) {
+            val observation = try {
+                latestObservation()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                onObservationFailure(error)
+                null
+            }
+            if (observation != null) {
+                val target = maxOf(result.target, observation.authoritativeTail)
+                val readiness = boundedEventReplayReadiness(
+                    observation.candidates.mapNotNull(sequenceRange),
+                    target,
+                )
+                result = BoundedEventReplayCatalogResult(target, observation.candidates, readiness)
+                if (readiness == BoundedEventReplayReadiness.READY ||
+                    readiness == BoundedEventReplayReadiness.LIMIT_EXCEEDED
+                ) {
+                    return@withTimeoutOrNull result
+                }
+            }
+            if (attempt < retryDelaysMillis.size) pause(retryDelaysMillis[attempt])
+        }
+        null
+    }
+    return settled ?: result
+}
+
+/** True only when realtime can continuously replay the suffix after a full prefix restore. */
+internal fun fullPrefixHasBoundedRealtimeSuffix(
+    restoredThroughSequence: ULong,
+    authoritativeTail: ULong,
+    maximumSuffixEvents: Int = TERMINAL_SNAPSHOT_MAX_LIVE_SUFFIX_EVENTS,
+): Boolean {
+    require(maximumSuffixEvents > 0) { "Realtime suffix limit must be positive" }
+    return restoredThroughSequence > 0uL &&
+        restoredThroughSequence <= authoritativeTail &&
+        authoritativeTail - restoredThroughSequence <= maximumSuffixEvents.toULong()
+}
+
+internal enum class FullPrefixRealtimeSuffixValidation {
+    READY,
+    UNAVAILABLE,
+    OUTSIDE_WINDOW,
+}
+
+/** Re-reads the tail after replay so validation cannot accidentally use its old target. */
+internal suspend fun validateFullPrefixRealtimeSuffix(
+    restoredThroughSequence: ULong,
+    latestAuthoritativeTail: suspend () -> ULong?,
+): FullPrefixRealtimeSuffixValidation {
+    val authoritativeTail = latestAuthoritativeTail()
+        ?: return FullPrefixRealtimeSuffixValidation.UNAVAILABLE
+    return if (fullPrefixHasBoundedRealtimeSuffix(restoredThroughSequence, authoritativeTail)) {
+        FullPrefixRealtimeSuffixValidation.READY
+    } else {
+        FullPrefixRealtimeSuffixValidation.OUTSIDE_WINDOW
+    }
+}
+
+internal fun tailReplayHasBoundedRealtimeSuffix(
+    restoredThroughSequence: ULong,
+    authoritativeTail: ULong,
+    maximumSuffixEvents: Int = TERMINAL_BOUNDED_REPLAY_MAX_EVENTS,
+): Boolean {
+    require(maximumSuffixEvents > 0) { "Realtime suffix limit must be positive" }
+    return restoredThroughSequence > 0uL &&
+        restoredThroughSequence <= authoritativeTail &&
+        authoritativeTail - restoredThroughSequence <= maximumSuffixEvents.toULong()
+}
+
+/** Re-reads the authority after TailWindow rendering and before its first ACK. */
+internal suspend fun validateTailReplayRealtimeSuffix(
+    restoredThroughSequence: ULong,
+    latestAuthoritativeTail: suspend () -> ULong?,
+): FullPrefixRealtimeSuffixValidation {
+    val authoritativeTail = latestAuthoritativeTail()
+        ?: return FullPrefixRealtimeSuffixValidation.UNAVAILABLE
+    return if (tailReplayHasBoundedRealtimeSuffix(restoredThroughSequence, authoritativeTail)) {
+        FullPrefixRealtimeSuffixValidation.READY
+    } else {
+        FullPrefixRealtimeSuffixValidation.OUTSIDE_WINDOW
+    }
+}
+
 internal const val TERMINAL_BOUNDED_REPLAY_MAX_EVENTS = 4096
 internal const val TERMINAL_BOUNDED_REPLAY_MAX_CATALOG_PAGES =
     TERMINAL_BOUNDED_REPLAY_MAX_EVENTS / SESSION_CHUNK_HISTORY_PAGE_LIMIT + 2
+internal const val TERMINAL_TAIL_REPLAY_MAX_CATALOG_PAGES = 2
+internal const val TERMINAL_TAIL_REPLAY_READINESS_TIMEOUT_MILLIS = 15_000L
+internal const val TERMINAL_STREAMED_REPLAY_READINESS_TIMEOUT_MILLIS = 15_000L
+internal const val TERMINAL_STREAMED_REPLAY_READINESS_POLL_MILLIS = 250L
 
 internal fun transcriptHistoryRequestPath(
     sessionId: UUID,
@@ -5223,6 +5990,37 @@ internal fun mergeTranscriptPage(
     )
 }
 
+/**
+ * Moves a detached transcript to a newer authenticated Snapshot only after the
+ * live renderer has durably acknowledged that Snapshot. This closes the race
+ * where tail-first opened S while the Agent replaced S with S+N before S's
+ * bulk transcript pages finished publishing.
+ */
+internal fun rebasePendingTranscriptViewport(
+    viewport: TranscriptViewportState,
+    newSnapshotSequence: ULong,
+    newInitialBeforeLineId: ULong,
+    durableLiveAcknowledgement: ULong,
+): TranscriptViewportState? {
+    if (newSnapshotSequence <= viewport.snapshotAnchorSequence ||
+        newSnapshotSequence > durableLiveAcknowledgement ||
+        newInitialBeforeLineId == 0uL
+    ) return null
+    return viewport.copy(
+        snapshotAnchorSequence = newSnapshotSequence,
+        initialBeforeLineId = newInitialBeforeLineId,
+        nextBeforeLineId = newInitialBeforeLineId,
+        nextCursor = null,
+        pages = emptyList(),
+        loadedObjectIds = emptySet(),
+        consumedCursors = emptySet(),
+        loading = false,
+        error = null,
+        hasMoreBefore = true,
+        viewportGeneration = Math.addExact(viewport.viewportGeneration, 1L),
+    )
+}
+
 private fun <T> boundedTranscriptIdentitySet(existing: Set<T>, value: T): Set<T> {
     val bounded = LinkedHashSet<T>(minOf(existing.size + 1, MAX_TRANSCRIPT_VIEWPORT_IDENTITIES))
     existing.forEach(bounded::add)
@@ -5257,17 +6055,21 @@ internal suspend fun <Key> awaitCoalescedTranscriptLoad(
  */
 internal suspend fun <Page> awaitExpectedTranscriptPage(
     retryDelaysMillis: List<Long> = TRANSCRIPT_PUBLICATION_RETRY_DELAYS_MILLIS,
+    readinessTimeoutMillis: Long = TRANSCRIPT_PUBLICATION_READINESS_TIMEOUT_MILLIS,
     pause: suspend (Long) -> Unit = { delay(it) },
     fetch: suspend () -> TranscriptSelection<Page>,
 ): TranscriptSelection<Page> {
     require(retryDelaysMillis.all { it >= 0L }) { "Transcript retry delays must not be negative" }
-    val attempts = retryDelaysMillis.size + 1
-    repeat(attempts) { attempt ->
-        val selected = fetch()
-        if (selected !== TranscriptSelection.Pending) return selected
-        if (attempt < attempts - 1) pause(retryDelaysMillis[attempt])
+    require(readinessTimeoutMillis > 0L) { "Transcript readiness timeout must be positive" }
+    val settled = withTimeoutOrNull(readinessTimeoutMillis) {
+        for (attempt in 0..retryDelaysMillis.size) {
+            val selected = fetch()
+            if (selected !== TranscriptSelection.Pending) return@withTimeoutOrNull selected
+            if (attempt < retryDelaysMillis.size) pause(retryDelaysMillis[attempt])
+        }
+        TranscriptSelection.Pending
     }
-    return TranscriptSelection.Pending
+    return settled ?: TranscriptSelection.Pending
 }
 
 internal fun validateTranscriptDescriptorNotLoaded(
@@ -5405,6 +6207,12 @@ internal fun snapshotHasBoundedLiveSuffix(
     snapshotSequence <= currentSessionSequence &&
     currentSessionSequence - snapshotSequence <= TERMINAL_SNAPSHOT_MAX_LIVE_SUFFIX_EVENTS.toULong()
 
+internal fun terminalSnapshotRuntimeNegotiated(
+    localRuntimeEnabled: Boolean,
+    pcCapabilities: Set<String>,
+): Boolean = localRuntimeEnabled &&
+    dev.termlink.model.PcCapabilityIds.TERMINAL_SNAPSHOT_V1 in pcCapabilities
+
 /** Sequence zero is safe only when neither endpoint has historical output. */
 internal fun canSafelySubscribeFromZeroWithoutSnapshot(
     currentSessionSequence: ULong,
@@ -5420,11 +6228,18 @@ internal fun canFreshSessionReplayFromZero(
 ): Boolean = durableAcknowledgement == 0uL &&
     currentSessionSequence <= TERMINAL_SNAPSHOT_MAX_LIVE_SUFFIX_EVENTS.toULong()
 
-/** A permanent producer rejection cannot become ready by polling the same prefix. */
+/**
+ * A permanent unsupported decision settles Snapshot polling immediately. The
+ * caller then spends the remainder of the same bounded readiness deadline
+ * polling the independent Chunk catalog instead of blindly waiting here.
+ */
 internal fun snapshotReadinessIsSettled(
     snapshotAvailable: Boolean,
     failure: SessionOpenFailure?,
-): Boolean = snapshotAvailable || failure?.code == SessionOpenFailureCode.SNAPSHOT_UNSUPPORTED
+): Boolean {
+    if (failure?.code == SessionOpenFailureCode.SNAPSHOT_UNSUPPORTED) return true
+    return snapshotAvailable
+}
 
 internal const val SESSION_BOOTSTRAP_IN_PROGRESS_REASON = "snapshot bootstrap in progress"
 internal const val SESSION_BOOTSTRAP_FAILED_REASON = "snapshot bootstrap failed"
@@ -5453,7 +6268,17 @@ internal val TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS =
     )
 internal const val TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS = 30_000L
 internal const val TERMINAL_SNAPSHOT_READINESS_REQUEST_TIMEOUT_MILLIS = 1_000L
-internal val TRANSCRIPT_PUBLICATION_RETRY_DELAYS_MILLIS = listOf(100L, 200L, 400L, 800L, 1_000L, 1_500L)
+internal const val TRANSCRIPT_PUBLICATION_READINESS_TIMEOUT_MILLIS =
+    TERMINAL_STREAMED_REPLAY_READINESS_TIMEOUT_MILLIS
+// The schedule deliberately extends beyond the absolute deadline. This keeps
+// polling until the full readiness window expires without allowing a slow
+// selector request or an unexpectedly fast test pause to make the wait unbounded.
+internal val TRANSCRIPT_PUBLICATION_RETRY_DELAYS_MILLIS = listOf(
+    100L, 200L, 400L, 800L, 1_000L,
+    1_500L, 1_500L, 1_500L, 1_500L, 1_500L,
+    1_500L, 1_500L, 1_500L, 1_500L,
+)
+internal const val MAX_TRANSCRIPT_ANCHOR_REBASES = 8
 // Matches one Windows realtime flow-control window. This lets an active
 // terminal advance during Snapshot publication without permitting a large
 // historical replay to delay or disconnect Android first-open.

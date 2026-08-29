@@ -93,11 +93,18 @@ func (r *Runner) runAndLog(ctx context.Context) {
 	result, err := r.RunOnce(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
-			r.logger.Error("file-operation cleanup failed", "error", err)
+			logCleanupFailure(r.logger, result, err)
 		}
 		return
 	}
 	if result.Expired > 0 || result.Deleted > 0 {
 		r.logger.Info("file-operation cleanup completed", "expired", result.Expired, "deleted", result.Deleted)
 	}
+}
+
+func logCleanupFailure(logger *slog.Logger, result store.FileOperationCleanupResult, _ error) {
+	logger.Error("file-operation cleanup failed",
+		"error_class", "file_operation_cleanup_failed",
+		"expired", result.Expired,
+		"deleted", result.Deleted)
 }

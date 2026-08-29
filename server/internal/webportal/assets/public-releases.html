@@ -1,0 +1,25 @@
+{{template "public-page-start" .}}
+<section class="public-intro" aria-labelledby="public-title">
+  <p class="eyebrow">RELEASE NOTES</p>
+  <h1 id="public-title">版本记录</h1>
+  <p>{{.Description}}内容直接读取自 AppShip，不在页面中写死。</p>
+</section>
+
+<section class="release-list" aria-label="当前稳定版本" data-release-list>
+  {{range .Releases}}
+  <article class="public-card release-note-card" data-platform-card="{{.Target.Platform}}">
+    <div class="card-heading-row">
+      <div><p class="eyebrow">{{.Target.DisplayName}} · STABLE</p><h2>{{if .Available}}v{{.Release.Version}}{{else}}{{.Target.DisplayName}}{{end}}</h2></div>
+      {{if .Available}}<span class="build-pill">Build {{.Release.Build}}</span>{{else}}<span class="state-pill state-unavailable">暂不可用</span>{{end}}
+    </div>
+    {{if .Available}}
+      <p class="release-date">{{.PublishedDate}} 发布</p>
+      <p class="release-notes">{{.Release.ReleaseNotes}}</p>
+      <div class="release-note-footer"><code>{{.Release.SHA256}}</code><a class="text-link" href="/downloads">前往下载 <span aria-hidden="true">→</span></a></div>
+    {{else}}
+      <div class="unavailable-panel"><strong>暂不可用</strong><p>发布源响应未通过完整校验，没有展示缓存或推测的版本信息。</p></div>
+    {{end}}
+  </article>
+  {{end}}
+</section>
+{{template "public-page-end" .}}

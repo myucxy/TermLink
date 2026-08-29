@@ -69,7 +69,7 @@ func NewHTTPServer(cfg config.Config, handler http.Handler) *http.Server {
 		Handler:           mux,
 		ReadHeaderTimeout: defaultReadHeaderTimeout,
 		IdleTimeout:       defaultIdleTimeout,
-		MaxHeaderBytes:    1 << 20,
+		MaxHeaderBytes:    128 << 10,
 	}
 }
 

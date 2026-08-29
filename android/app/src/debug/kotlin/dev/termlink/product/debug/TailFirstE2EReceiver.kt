@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteException
 import android.util.AtomicFile
 import dev.termlink.product.TailFirstE2EProductBridge
 import java.io.File
@@ -17,6 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -41,32 +43,33 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
 
         val requestId = intent.getStringExtra(EXTRA_REQUEST_ID)
         if (requestId == null || !REQUEST_ID.matches(requestId)) return
+        val request = parseRequest(intent, requestId)
+        val operation = safeOperation(intent.getStringExtra(EXTRA_OPERATION))
+        val applicationContext = context.applicationContext
 
-        val pendingResult = goAsync()
-        receiverScope.launch {
-            try {
-                operationMutex.withLock {
-                    val request = parseRequest(intent, requestId)
-                    val response = if (request == null) {
-                        failureResponse(
-                            requestId = requestId,
-                            operation = safeOperation(intent.getStringExtra(EXTRA_OPERATION)),
-                            failureCode = FAILURE_REQUEST_INVALID,
-                        )
-                    } else {
-                        runCatching { executeAgainstProduct(context, request) }
-                            .getOrElse {
-                                failureResponse(
-                                    requestId = request.requestId,
-                                    operation = request.operation,
-                                    failureCode = refinedFailureCode(request, FAILURE_OPERATION_FAILED),
-                                )
-                            }
-                    }
-                    runCatching { writeResponseAtomically(context, response) }
+        // The runner keeps ProductActivity in the foreground while it polls the
+        // atomic response file. Do not retain a BroadcastReceiver PendingResult:
+        // an arbitrary history restore can legitimately outlive Android's
+        // broadcast deadline and would put an ANR window in front of the terminal.
+        receiverScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            operationMutex.withLock {
+                val response = if (request == null) {
+                    failureResponse(
+                        requestId = requestId,
+                        operation = operation,
+                        failureCode = FAILURE_REQUEST_INVALID,
+                    )
+                } else {
+                    runCatching { executeAgainstProduct(applicationContext, request) }
+                        .getOrElse {
+                            failureResponse(
+                                requestId = request.requestId,
+                                operation = request.operation,
+                                failureCode = refinedFailureCode(request, FAILURE_OPERATION_FAILED),
+                            )
+                        }
                 }
-            } finally {
-                pendingResult.finish()
+                runCatching { writeResponseAtomically(applicationContext, response) }
             }
         }
     }
@@ -106,10 +109,18 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
         val markerStem = "TLTF_${runId.replace('-', '_').replace('.', '_')}"
         return when (operation) {
             OPERATION_PROBE, OPERATION_SHOW_IME -> arguments.isEmpty()
-            OPERATION_OPEN_SESSION ->
-                arguments[EXTRA_FIRST_MARKER] == "${markerStem}_0001" &&
-                    arguments[EXTRA_LAST_MARKER] == "${markerStem}_1000" &&
-                    arguments[EXTRA_MARKER_COUNT] == "1000"
+            OPERATION_OPEN_SESSION -> {
+                val markerCount = arguments[EXTRA_MARKER_COUNT]?.toIntOrNull()
+                val minimumTail = arguments[EXTRA_MINIMUM_TAIL]?.toULongOrNull()
+                markerCount in ALLOWED_MARKER_COUNTS &&
+                    arguments[EXTRA_FIRST_MARKER] == "${markerStem}_0001" &&
+                    arguments[EXTRA_LAST_MARKER] == "%s_%04d".format(markerStem, markerCount) &&
+                    minimumTail == if (markerCount == STREAMED_PREFIX_MARKER_COUNT) {
+                        STREAMED_PREFIX_MINIMUM_TAIL
+                    } else {
+                        0uL
+                    }
+            }
             OPERATION_PAGE_UP ->
                 arguments[EXTRA_FIRST_MARKER] == "${markerStem}_0001" &&
                     arguments[EXTRA_LAST_MARKER] == "${markerStem}_1000" &&
@@ -127,29 +138,29 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
 
     private suspend fun executeAgainstProduct(context: Context, request: TailFirstE2ERequest): JsonObject {
         val executeBridge: suspend () -> JsonObject = {
-            withTimeout(BRIDGE_TIMEOUT_MILLIS) {
-                TailFirstE2EProductBridge.execute(
-                    operation = request.operation,
-                    requestId = request.requestId,
-                    arguments = request.arguments,
-                )
-            }
+            TailFirstE2EProductBridge.execute(
+                operation = request.operation,
+                requestId = request.requestId,
+                arguments = request.arguments,
+            )
         }
         val productResponse = if (request.operation == OPERATION_OPEN_SESSION) {
             coroutineScope {
                 // UNDISPATCHED reaches awaitNewTailFirstSession's first suspension before
                 // control returns here. Its existing-session set is therefore fixed before
-                // the runner is told that it may start SessionHost.
+                // the runner is told that it may start SessionHost. An arbitrary
+                // history length must not inherit the short-operation timeout;
+                // runner/emulator cancellation still cancels this process.
                 val pending = async(start = CoroutineStart.UNDISPATCHED) { executeBridge() }
                 writeSessionArmAtomically(
                     context = context,
                     request = request,
-                    baselineSessionIds = readBaselineSessionIds(context),
+                    baselineSessionIds = awaitBaselineSessionIds(context),
                 )
                 pending.await()
             }
         } else {
-            executeBridge()
+            withTimeout(BRIDGE_TIMEOUT_MILLIS) { executeBridge() }
         }
         return sanitizeProductResponse(request, productResponse)
     }
@@ -387,25 +398,47 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
         }
     }
 
-    private fun readBaselineSessionIds(context: Context): List<String> {
-        val databaseFile = context.getDatabasePath(HISTORY_DATABASE_NAME)
-        if (!databaseFile.isFile) return emptyList()
-        return SQLiteDatabase.openDatabase(
-            databaseFile.absolutePath,
-            null,
-            SQLiteDatabase.OPEN_READONLY,
-        ).use { database ->
-            database.rawQuery("SELECT id FROM sessions ORDER BY id ASC", emptyArray()).use { cursor ->
-                buildList {
-                    while (cursor.moveToNext()) {
-                        val id = cursor.getString(0)
-                        check(runCatching { UUID.fromString(id) }.getOrNull()?.let { it != EMPTY_UUID } == true)
-                        add(id)
+    /**
+     * The runner deliberately removes Room's history database immediately
+     * before a cold launch. The Activity can therefore be account-ready while
+     * Room is still creating the database file and its sessions table. Keep
+     * SessionHost fenced until that short schema-publication race settles.
+     */
+    private suspend fun awaitBaselineSessionIds(context: Context): List<String> =
+        withTimeout(BASELINE_READINESS_TIMEOUT_MILLIS) {
+            while (true) {
+                val databaseFile = context.getDatabasePath(HISTORY_DATABASE_NAME)
+                if (databaseFile.isFile) {
+                    try {
+                        return@withTimeout SQLiteDatabase.openDatabase(
+                            databaseFile.absolutePath,
+                            null,
+                            SQLiteDatabase.OPEN_READONLY,
+                        ).use { database ->
+                            database.rawQuery("SELECT id FROM sessions ORDER BY id ASC", emptyArray()).use { cursor ->
+                                buildList {
+                                    while (cursor.moveToNext()) {
+                                        val id = cursor.getString(0)
+                                        check(
+                                            runCatching { UUID.fromString(id) }.getOrNull()
+                                                ?.let { it != EMPTY_UUID } == true,
+                                        )
+                                        add(id)
+                                    }
+                                }
+                            }
+                        }
+                    } catch (error: SQLiteException) {
+                        val message = error.message.orEmpty()
+                        if (!message.contains("no such table: sessions") &&
+                            !message.contains("database is locked")
+                        ) throw error
                     }
                 }
+                delay(BASELINE_READINESS_POLL_MILLIS)
             }
+            error("unreachable")
         }
-    }
 
     private data class TailFirstE2ERequest(
         val operation: String,
@@ -429,6 +462,7 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
         const val EXTRA_LAST_MARKER = "last_marker"
         const val EXTRA_LIVE_MARKER = "live_marker"
         const val EXTRA_MARKER_COUNT = "marker_count"
+        const val EXTRA_MINIMUM_TAIL = "minimum_tail"
         const val EXTRA_PAGE_SIZE = "page_size"
         const val EXTRA_PAGE_NUMBER = "page_number"
         const val EXTRA_EXPECTED_RESULT = "expected_result"
@@ -450,7 +484,12 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
         const val FAILURE_TRANSCRIPT_LOAD_FAILED = "TRANSCRIPT_LOAD_FAILED"
         const val MAX_PAGE_SIZE = 200
         const val MAX_PAGE_NUMBER = 10
-        const val BRIDGE_TIMEOUT_MILLIS = 55_000L
+        const val BRIDGE_TIMEOUT_MILLIS = 180_000L
+        const val BASELINE_READINESS_TIMEOUT_MILLIS = 10_000L
+        const val BASELINE_READINESS_POLL_MILLIS = 50L
+        const val SNAPSHOT_MARKER_COUNT = 1000
+        const val STREAMED_PREFIX_MARKER_COUNT = 5200
+        val STREAMED_PREFIX_MINIMUM_TAIL = 4097uL
 
         val REQUEST_ID = Regex("^[0-9a-f]{32}$")
         val RUN_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -472,6 +511,7 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
             "live_marker_visible",
         )
         val DIAGNOSTIC_NAME_FIELDS = listOf(
+            "bootstrap_source",
             "realtime_socket_phase",
             "realtime_socket_state",
             "realtime_transport_state",
@@ -508,7 +548,12 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
         )
         val OPERATION_EXTRAS = mapOf(
             OPERATION_PROBE to emptySet(),
-            OPERATION_OPEN_SESSION to setOf(EXTRA_FIRST_MARKER, EXTRA_LAST_MARKER, EXTRA_MARKER_COUNT),
+            OPERATION_OPEN_SESSION to setOf(
+                EXTRA_FIRST_MARKER,
+                EXTRA_LAST_MARKER,
+                EXTRA_MARKER_COUNT,
+                EXTRA_MINIMUM_TAIL,
+            ),
             OPERATION_INSPECT to setOf(EXTRA_LIVE_MARKER),
             OPERATION_PAGE_UP to setOf(
                 EXTRA_FIRST_MARKER,
@@ -521,6 +566,7 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
             OPERATION_CLOSE_HISTORY to setOf(EXTRA_LIVE_MARKER),
             OPERATION_SHOW_IME to emptySet(),
         )
+        val ALLOWED_MARKER_COUNTS = setOf(SNAPSHOT_MARKER_COUNT, STREAMED_PREFIX_MARKER_COUNT)
         val JSON = Json { explicitNulls = false }
         val receiverScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val operationMutex = Mutex()

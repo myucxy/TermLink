@@ -167,6 +167,46 @@ namespace TermLink.Tray
             return IsChinese ? chinese : english;
         }
 
+        public static string PublicError(Exception error)
+        {
+            if (error is AggregateException aggregate && aggregate.InnerExceptions.Count == 1)
+                error = aggregate.InnerExceptions[0];
+            if (error is OperationCanceledException)
+                return Pick("操作已取消。", "The operation was cancelled.");
+            if (error is TimeoutException)
+                return Pick("操作超时，请稍后重试。", "The operation timed out. Try again later.");
+            if (error is UnauthorizedAccessException)
+                return Pick("权限不足，无法完成操作。", "TermLink does not have permission to complete the operation.");
+            if (error is IOException)
+                return Pick("本机通信或文件操作失败，请稍后重试。", "Local communication or file access failed. Try again later.");
+            if (error is ArgumentException || error is FormatException)
+                return Pick("输入或配置无效，请检查后重试。", "The input or configuration is invalid. Check it and try again.");
+            return PublicError(error == null ? null : error.Message);
+        }
+
+        public static string PublicError(string diagnostic)
+        {
+            var code = StableErrorCode(diagnostic);
+            var message = Pick(
+                "操作失败，请重试；若问题持续，请查看本机 TermLink 日志。",
+                "The operation failed. Try again; if it persists, check the local TermLink logs.");
+            return code == null ? message : message + " [" + code + "]";
+        }
+
+        private static string StableErrorCode(string value)
+        {
+            value = (value ?? string.Empty).Trim();
+            if (value.Length == 0 || value.Length > 64) return null;
+            for (var index = 0; index < value.Length; index++)
+            {
+                var character = value[index];
+                if (!(character >= 'A' && character <= 'Z') &&
+                    !(character >= '0' && character <= '9') &&
+                    character != '_' && character != '-') return null;
+            }
+            return value;
+        }
+
         public static string LanguageName(TrayLanguage language)
         {
             switch (language)
@@ -730,7 +770,7 @@ namespace TermLink.Tray
             signOutItem.Visible = false;
             signOutItem.Enabled = false;
             if (mainWindow != null && !mainWindow.IsDisposed) mainWindow.ApplyUnavailable(error);
-            if (showFailure) ShowFailure(error.Message);
+            if (showFailure) ShowFailure(TrayText.PublicError(error));
         }
 
         // Retained as a small compatibility shim for callers in older integrations.
@@ -768,7 +808,7 @@ namespace TermLink.Tray
             }
             catch (Exception error)
             {
-                ShowFailure(error.Message);
+                ShowFailure(TrayText.PublicError(error));
             }
         }
 
@@ -792,7 +832,7 @@ namespace TermLink.Tray
                 }
                 catch (Exception error)
                 {
-                    ShowFailure(error.Message);
+                    ShowFailure(TrayText.PublicError(error));
                 }
             }
         }
@@ -812,7 +852,7 @@ namespace TermLink.Tray
                 }
                 catch (Exception error)
                 {
-                    ShowFailure(error.Message);
+                    ShowFailure(TrayText.PublicError(error));
                 }
             }
         }
@@ -836,7 +876,7 @@ namespace TermLink.Tray
             }
             catch (Exception error)
             {
-                ShowFailure(error.Message);
+                ShowFailure(TrayText.PublicError(error));
             }
         }
 
@@ -850,7 +890,7 @@ namespace TermLink.Tray
             }
             catch (Exception error)
             {
-                ShowFailure(error.Message);
+                ShowFailure(TrayText.PublicError(error));
             }
         }
 
@@ -864,7 +904,7 @@ namespace TermLink.Tray
             }
             catch (Exception error)
             {
-                ShowFailure(error.Message);
+                ShowFailure(TrayText.PublicError(error));
             }
         }
 
@@ -895,7 +935,7 @@ namespace TermLink.Tray
             }
             catch (Exception error)
             {
-                ShowFailure(error.Message);
+                ShowFailure(TrayText.PublicError(error));
                 await RefreshStateAsync(false);
             }
         }
@@ -956,8 +996,8 @@ namespace TermLink.Tray
                 refreshTimer.Start();
                 MessageBox.Show(
                     TrayText.Pick(
-                        "完全退出失败，控制界面将保持运行。\n\n" + error.Message,
-                        "TermLink could not exit completely. The control UI will remain open.\n\n" + error.Message),
+                        "完全退出失败，控制界面将保持运行。\n\n" + TrayText.PublicError(error),
+                        "TermLink could not exit completely. The control UI will remain open.\n\n" + TrayText.PublicError(error)),
                     "TermLink",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -2400,10 +2440,12 @@ namespace TermLink.Tray
             accountIdentityLabel.Text = TrayText.Pick("账户状态不可用", "Account status unavailable");
             shellStatusLabel.Text = error == null
                 ? TrayText.Pick("未连接", "Not connected")
-                : TrayText.Pick("TermLink 后台不可用 · " + error.Message, "TermLink background unavailable · " + error.Message);
+                : TrayText.Pick("TermLink 后台不可用 · ", "TermLink background unavailable · ") +
+                    TrayText.PublicError(error);
             if (remoteStatusLabel != null) remoteStatusLabel.Text = TrayText.Pick("Agent 不可用", "Agent unavailable");
             if (activitySummaryLabel != null) activitySummaryLabel.Text = TrayText.Pick("○ 本地运行时不可用", "○ Local runtime unavailable");
-            if (diagnosticsSummaryLabel != null) diagnosticsSummaryLabel.Text = error == null ? string.Empty : error.Message;
+            if (diagnosticsSummaryLabel != null)
+                diagnosticsSummaryLabel.Text = error == null ? string.Empty : TrayText.PublicError(error);
             if (connectionRetryButton != null) connectionRetryButton.Enabled = true;
         }
 
@@ -2897,8 +2939,8 @@ namespace TermLink.Tray
             catch (Exception error)
             {
                 terminalCommandsStatusLabel.Text = TrayText.Pick(
-                    "命令已保存，但 Agent 重启失败：" + error.Message,
-                    "Commands were saved, but the Agent restart failed: " + error.Message);
+                    "命令已保存，但 Agent 重启失败：" + TrayText.PublicError(error),
+                    "Commands were saved, but the Agent restart failed: " + TrayText.PublicError(error));
                 MessageBox.Show(this, terminalCommandsStatusLabel.Text, "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
@@ -2943,8 +2985,8 @@ namespace TermLink.Tray
             catch (Exception error)
             {
                 terminalIntegrationStatusLabel.Text = TrayText.Pick(
-                    "重新配置失败：" + error.Message,
-                    "Reconfiguration failed: " + error.Message);
+                    "重新配置失败：" + TrayText.PublicError(error),
+                    "Reconfiguration failed: " + TrayText.PublicError(error));
                 MessageBox.Show(
                     terminalIntegrationStatusLabel.Text,
                     "TermLink",
@@ -3008,7 +3050,7 @@ namespace TermLink.Tray
             {
                 reconnectSettingsStatusLabel.Text = TrayText.Pick(
                     "保存或重启失败：",
-                    "Save or restart failed: ") + error.Message;
+                    "Save or restart failed: ") + TrayText.PublicError(error);
             }
             finally
             {
@@ -3194,7 +3236,8 @@ namespace TermLink.Tray
             }
             catch (Exception error)
             {
-                updateStatusLabel.Text = TrayText.Pick("检查更新失败 · " + error.Message, "Update check failed · " + error.Message);
+                updateStatusLabel.Text = TrayText.Pick("检查更新失败 · ", "Update check failed · ") +
+                    TrayText.PublicError(error);
             }
             finally
             {
@@ -3263,7 +3306,7 @@ namespace TermLink.Tray
                 }
                 catch (Exception error)
                 {
-                    MessageBox.Show(TrayText.Pick("账户登录失败：", "Account sign-in failed: ") + error.Message, "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show(TrayText.Pick("账户登录失败：", "Account sign-in failed: ") + TrayText.PublicError(error), "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
                 finally { SetBusy(false); }
             }
@@ -3285,7 +3328,7 @@ namespace TermLink.Tray
                 }
                 catch (Exception error)
                 {
-                    MessageBox.Show(TrayText.Pick("账户创建失败：", "Account creation failed: ") + error.Message, "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show(TrayText.Pick("账户创建失败：", "Account creation failed: ") + TrayText.PublicError(error), "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
                 finally { SetBusy(false); }
             }
@@ -3320,7 +3363,7 @@ namespace TermLink.Tray
             catch (Exception error)
             {
                 MessageBox.Show(
-                    TrayText.Pick("退出登录失败：", "Sign-out failed: ") + error.Message,
+                    TrayText.Pick("退出登录失败：", "Sign-out failed: ") + TrayText.PublicError(error),
                     "TermLink",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);

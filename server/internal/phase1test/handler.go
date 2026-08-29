@@ -60,13 +60,15 @@ func (handler Handler) ServeHTTP(response http.ResponseWriter, request *http.Req
 
 	bundle, err := lanreplay.LoadBundle(handler.BundleRoot, caseName)
 	if err != nil {
-		handler.logger().Warn("phase 1 fixture rejected", "case", caseName, "error", err)
+		logFixtureFailure(handler.logger(), slog.LevelWarn, "phase 1 fixture rejected",
+			"phase1_fixture_rejected", caseName, err)
 		http.Error(response, "test fixture unavailable", http.StatusNotFound)
 		return
 	}
 	frames, err := fixtureFrames(bundle, scenario)
 	if err != nil {
-		handler.logger().Error("phase 1 fixture conversion failed", "case", caseName, "error", err)
+		logFixtureFailure(handler.logger(), slog.LevelError, "phase 1 fixture conversion failed",
+			"phase1_fixture_conversion_failed", caseName, err)
 		http.Error(response, "test fixture unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -130,6 +132,12 @@ func (handler Handler) ServeHTTP(response http.ResponseWriter, request *http.Req
 	case <-peer.done:
 	case <-request.Context().Done():
 	}
+}
+
+func logFixtureFailure(logger *slog.Logger, level slog.Level, message, errorClass, caseName string, _ error) {
+	logger.LogAttrs(nil, level, message,
+		slog.String("error_class", errorClass),
+		slog.String("case", caseName))
 }
 
 type peer struct {

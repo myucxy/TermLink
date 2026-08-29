@@ -1,12 +1,25 @@
 package fileoperationcleanup
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/termlink/termlink/server/internal/store"
 )
+
+type sensitiveLogError struct {
+	text  string
+	calls int
+}
+
+func (e *sensitiveLogError) Error() string {
+	e.calls++
+	return e.text
+}
 
 type recordingStore struct {
 	now, terminalBefore time.Time
@@ -41,5 +54,22 @@ func TestNewRejectsOversizedBatch(t *testing.T) {
 	runner := New(repository, Options{BatchSize: store.MaxFileOperationCleanupBatch + 1})
 	if runner.batchSize != DefaultBatchSize {
 		t.Fatalf("oversized batch was retained: %d", runner.batchSize)
+	}
+}
+
+func TestCleanupFailureLogDoesNotFormatError(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, nil))
+	sensitiveErr := &sensitiveLogError{text: "access_key=secret-file-operation-key"}
+
+	logCleanupFailure(logger, store.FileOperationCleanupResult{Expired: 4, Deleted: 2}, sensitiveErr)
+
+	logged := output.String()
+	if sensitiveErr.calls != 0 || strings.Contains(logged, "secret-file-operation-key") {
+		t.Fatalf("cleanup log formatted or exposed the error: calls=%d log=%s", sensitiveErr.calls, logged)
+	}
+	if !strings.Contains(logged, `"error_class":"file_operation_cleanup_failed"`) ||
+		!strings.Contains(logged, `"expired":4`) || !strings.Contains(logged, `"deleted":2`) {
+		t.Fatalf("cleanup log is missing stable fields: %s", logged)
 	}
 }

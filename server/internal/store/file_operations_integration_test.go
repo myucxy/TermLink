@@ -368,8 +368,9 @@ func insertFileOperationFixture(t *testing.T, ctx context.Context, repository *P
 		insertDevice(extraRequesterID, "ANDROID", "Other requester", seed+2, &agentID)
 	}
 	if _, err := repository.Pool.Exec(ctx, `
-		INSERT INTO pcs(id,owner_user_id,device_id,name,agent_version,key_epoch,supported_shells,terminal_commands)
-		VALUES($1,$2,$3,'PC','test',1,ARRAY['command-prompt','windows-powershell']::text[],
+		INSERT INTO pcs(id,owner_user_id,device_id,name,agent_version,key_epoch,capabilities,supported_shells,terminal_commands)
+		VALUES($1,$2,$3,'PC','test',1,ARRAY['file_operations_v1','terminal_commands_v1']::text[],
+		       ARRAY['command-prompt','windows-powershell']::text[],
 		       '[{"id":"custom-project","display_name":"Project CLI","shell_type":"custom","source":"manual"}]'::jsonb)`,
 		pcID, accountID, agentID); err != nil {
 		t.Fatal(err)

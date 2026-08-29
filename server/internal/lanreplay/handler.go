@@ -36,7 +36,8 @@ func (handler Handler) ServeHTTP(response http.ResponseWriter, request *http.Req
 
 	bundle, err := LoadBundle(handler.BundleRoot, caseName)
 	if err != nil {
-		handler.logger().Warn("LAN replay bundle rejected", "case", caseName, "error", err)
+		logReplayFailure(handler.logger(), slog.LevelWarn, "LAN replay bundle rejected",
+			"lan_replay_bundle_rejected", caseName, err)
 		http.Error(response, "replay fixture unavailable", http.StatusNotFound)
 		return
 	}
@@ -64,7 +65,8 @@ func (handler Handler) ServeHTTP(response http.ResponseWriter, request *http.Req
 		}
 		frame, err := bundle.Frame(event)
 		if err != nil {
-			handler.logger().Error("encode LAN replay frame", "case", caseName, "error", err)
+			logReplayFailure(handler.logger(), slog.LevelError, "encode LAN replay frame",
+				"lan_replay_frame_encode_failed", caseName, err)
 			return
 		}
 		if err := connection.WriteMessage(websocket.BinaryMessage, frame); err != nil {
@@ -77,6 +79,12 @@ func (handler Handler) ServeHTTP(response http.ResponseWriter, request *http.Req
 		websocket.FormatCloseMessage(websocket.CloseNormalClosure, "replay complete"),
 		time.Now().Add(time.Second),
 	)
+}
+
+func logReplayFailure(logger *slog.Logger, level slog.Level, message, errorClass, caseName string, _ error) {
+	logger.LogAttrs(nil, level, message,
+		slog.String("error_class", errorClass),
+		slog.String("case", caseName))
 }
 
 func (handler Handler) authorized(request *http.Request) bool {

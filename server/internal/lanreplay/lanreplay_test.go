@@ -1,11 +1,13 @@
 package lanreplay
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -15,7 +17,35 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+type sensitiveLogError struct {
+	text  string
+	calls int
+}
+
+func (e *sensitiveLogError) Error() string {
+	e.calls++
+	return e.text
+}
+
 const testCaseName = "smoke-powershell-v1"
+
+func TestReplayFailureLogDoesNotFormatError(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, nil))
+	sensitiveErr := &sensitiveLogError{text: "fixture-content=terminal-secret"}
+
+	logReplayFailure(logger, slog.LevelWarn, "LAN replay bundle rejected",
+		"lan_replay_bundle_rejected", testCaseName, sensitiveErr)
+
+	logged := output.String()
+	if sensitiveErr.calls != 0 || strings.Contains(logged, "terminal-secret") {
+		t.Fatalf("replay log formatted or exposed the error: calls=%d log=%s", sensitiveErr.calls, logged)
+	}
+	if !strings.Contains(logged, `"error_class":"lan_replay_bundle_rejected"`) ||
+		!strings.Contains(logged, `"case":"`+testCaseName+`"`) {
+		t.Fatalf("replay log is missing stable fields: %s", logged)
+	}
+}
 
 func TestLoadRepositoryBundle(t *testing.T) {
 	bundle := loadTestBundle(t)

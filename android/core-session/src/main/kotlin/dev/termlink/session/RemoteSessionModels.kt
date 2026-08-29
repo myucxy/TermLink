@@ -6,8 +6,9 @@ import java.util.UUID
 
 /**
  * Declares the cursor and generation installed before realtime starts.
- * Every non-empty state proves the renderer contains the corresponding prefix.
- * A renderer must never be anchored past content it did not install.
+ * Every non-empty state proves the renderer has installed content through its cursor.
+ * Exact checkpoints and full prefixes preserve complete state; a bounded tail window is an
+ * explicit availability fallback when the producer cannot represent an exact checkpoint.
  */
 sealed interface RendererBootstrapState {
     val sequence: Long
@@ -30,6 +31,23 @@ sealed interface RendererBootstrapState {
     ) : RendererBootstrapState {
         init {
             require(sequence > 0) { "full renderer prefix must be non-empty" }
+            require(rendererGeneration > 0) { "renderer generation must be positive" }
+        }
+    }
+
+    /**
+     * Created after a contiguous recent event window ending at [sequence] has been rendered.
+     * Events before [startSequence] are deliberately omitted, so this state is suitable for
+     * realtime continuation but is not an exact historical terminal checkpoint.
+     */
+    data class TailWindow(
+        val startSequence: Long,
+        override val sequence: Long,
+        override val rendererGeneration: Long,
+    ) : RendererBootstrapState {
+        init {
+            require(startSequence > 0) { "tail renderer start must be positive" }
+            require(sequence >= startSequence) { "tail renderer cursor precedes its start" }
             require(rendererGeneration > 0) { "renderer generation must be positive" }
         }
     }

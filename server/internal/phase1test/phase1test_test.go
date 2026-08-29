@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,34 @@ const (
 	testCase  = "smoke-powershell-v1"
 	testToken = "phase1-test-token"
 )
+
+type sensitiveLogError struct {
+	text  string
+	calls int
+}
+
+func (e *sensitiveLogError) Error() string {
+	e.calls++
+	return e.text
+}
+
+func TestFixtureFailureLogDoesNotFormatError(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, nil))
+	sensitiveErr := &sensitiveLogError{text: "frame-payload=terminal-secret"}
+
+	logFixtureFailure(logger, slog.LevelError, "phase 1 fixture conversion failed",
+		"phase1_fixture_conversion_failed", testCase, sensitiveErr)
+
+	logged := output.String()
+	if sensitiveErr.calls != 0 || strings.Contains(logged, "terminal-secret") {
+		t.Fatalf("fixture log formatted or exposed the error: calls=%d log=%s", sensitiveErr.calls, logged)
+	}
+	if !strings.Contains(logged, `"error_class":"phase1_fixture_conversion_failed"`) ||
+		!strings.Contains(logged, `"case":"`+testCase+`"`) {
+		t.Fatalf("fixture log is missing stable fields: %s", logged)
+	}
+}
 
 func TestProtocolRoundTripAndRejectsWrongMagic(t *testing.T) {
 	want := Frame{Type: FrameOutput, Sequence: 42, ACK: 17, Payload: []byte{0, 1, 2, 255}}

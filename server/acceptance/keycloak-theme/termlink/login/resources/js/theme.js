@@ -5,19 +5,20 @@
   const TRANSFER_PARAMETER = "termlink_theme";
   const LIGHT = "light";
   const DARK = "dark";
+  const SYSTEM = "system";
   const root = document.documentElement;
   const systemPreference = window.matchMedia
     ? window.matchMedia("(prefers-color-scheme: dark)")
     : { matches: false };
 
-  function isTheme(value) {
-    return value === LIGHT || value === DARK;
+  function isPreference(value) {
+    return value === SYSTEM || value === LIGHT || value === DARK;
   }
 
   function readStoredTheme() {
     try {
       const value = window.localStorage.getItem(STORAGE_KEY);
-      if (isTheme(value)) return value;
+      if (isPreference(value)) return value;
       if (value !== null) window.localStorage.removeItem(STORAGE_KEY);
     } catch (_) {
       // Storage can be unavailable in private browsing or with strict policies.
@@ -29,24 +30,36 @@
     return systemPreference.matches ? DARK : LIGHT;
   }
 
-  function labelsFor(theme) {
+  function resolvedTheme(preference) {
+    return preference === SYSTEM ? preferredTheme() : preference;
+  }
+
+  function nextPreference(preference) {
+    if (preference === SYSTEM) return LIGHT;
+    if (preference === LIGHT) return DARK;
+    return SYSTEM;
+  }
+
+  function labelsFor(preference) {
     const isChinese = /^zh(?:-|$)/i.test(root.lang || "");
-    const nextTheme = theme === DARK ? LIGHT : DARK;
+    const next = nextPreference(preference);
     if (isChinese) {
       return {
-        label: nextTheme === LIGHT ? "明亮主题" : "深色主题",
-        aria: `切换到${nextTheme === LIGHT ? "明亮" : "深色"}主题`,
+        label: preference === SYSTEM ? "跟随系统" : (preference === LIGHT ? "明亮" : "深色"),
+        aria: `当前${preference === SYSTEM ? "跟随系统" : (preference === LIGHT ? "明亮主题" : "深色主题")}，切换到${next === SYSTEM ? "跟随系统" : (next === LIGHT ? "明亮主题" : "深色主题")}`,
       };
     }
     return {
-      label: nextTheme === LIGHT ? "Light theme" : "Dark theme",
-      aria: `Switch to ${nextTheme} theme`,
+      label: preference === SYSTEM ? "System" : (preference === LIGHT ? "Light" : "Dark"),
+      aria: `Current: ${preference}. Switch to ${next}`,
     };
   }
 
-  function render(theme) {
+  function render(preference) {
+    const theme = resolvedTheme(preference);
     root.dataset.theme = theme;
-    const labels = labelsFor(theme);
+    root.dataset.themePreference = preference;
+    const labels = labelsFor(preference);
     document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
       const label = button.querySelector(".theme-toggle-label");
       if (label) label.textContent = labels.label;
@@ -54,6 +67,7 @@
       button.setAttribute("title", labels.aria);
       button.removeAttribute("aria-pressed");
       button.dataset.theme = theme;
+      button.dataset.themePreference = preference;
     });
     document.querySelectorAll("a[data-theme-transfer]").forEach((link) => {
       const base = link.dataset.themeTransferBase || link.getAttribute("href");
@@ -61,7 +75,7 @@
       link.dataset.themeTransferBase = base;
       try {
         const target = new URL(base, window.location.href);
-        target.searchParams.set(TRANSFER_PARAMETER, theme);
+        target.searchParams.set(TRANSFER_PARAMETER, preference);
         link.href = target.href;
       } catch (_) {
         // Keep the server-rendered validated client target.
@@ -78,21 +92,21 @@
   }
 
   function toggleTheme() {
-    const current = root.dataset.theme === DARK ? DARK : LIGHT;
-    const next = current === DARK ? LIGHT : DARK;
+    const current = isPreference(root.dataset.themePreference) ? root.dataset.themePreference : SYSTEM;
+    const next = nextPreference(current);
     persist(next);
     render(next);
   }
 
   function applyStoredOrSystemTheme() {
-    render(readStoredTheme() || preferredTheme());
+    render(readStoredTheme() || SYSTEM);
   }
 
   document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
     button.addEventListener("click", toggleTheme);
   });
   const handleSystemChange = () => {
-    if (!readStoredTheme()) render(preferredTheme());
+    if ((readStoredTheme() || SYSTEM) === SYSTEM) render(SYSTEM);
   };
   if (systemPreference.addEventListener) systemPreference.addEventListener("change", handleSystemChange);
   else systemPreference.addListener?.(handleSystemChange);

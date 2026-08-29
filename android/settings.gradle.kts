@@ -18,6 +18,7 @@ dependencyResolutionManagement {
 rootProject.name = "TermLinkAndroid"
 include(":app")
 include(":terminal-engine-api")
+include(":terminal-engine-native")
 include(":terminal-engine-replay")
 include(":terminal-engine-termux")
 include(":core-session")

@@ -31,6 +31,7 @@ import dev.termlink.session.RemoteLifecycle
 import dev.termlink.session.RendererBootstrapState
 import dev.termlink.session.RemoteSessionEvent
 import dev.termlink.session.RemoteSessionOutbound
+import dev.termlink.session.RemoteSessionOrderedEventObserver
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.session.RemoteTerminalSession
 import dev.termlink.terminal.api.TerminalEngine
@@ -158,6 +159,8 @@ class ProductionRealtimeSessionClient(
     private val terminationReadinessTimeoutMillis: Long = 15_000,
     leaseRenewalIntervalMillis: Long = 10_000,
     disposeEngineOnClose: Boolean = true,
+    orderedEventObserver: RemoteSessionOrderedEventObserver? = null,
+    orderedEventObserverCapacity: Int = 64,
 ) : RemoteSessionOutbound, Closeable {
     private val scopeJob = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + scopeJob)
@@ -169,6 +172,7 @@ class ProductionRealtimeSessionClient(
     private val nextMetadataRefreshAtMillis = AtomicLong(0)
     private val sendMutex = Mutex()
     private val incomingProcessingMutex = Mutex()
+    private val controlRequestMutex = Mutex()
     private val controlArbitrationMutex = Mutex()
     private val materialLock = Any()
     private val observedLocalInputEpoch = AtomicLong(initialObservedLocalInputEpoch)
@@ -179,6 +183,7 @@ class ProductionRealtimeSessionClient(
     private var previousMaterialRetirementJob: Job? = null
     private var reconnectAttempt = 0
     private var controlGeneration = 0L
+    private var restoreControlAfterReconnect = false
     private val mutableTransportState = MutableStateFlow<ProductionTransportState>(ProductionTransportState.Connecting)
     private val noncePrefix = config.noncePrefix.copyOf()
     private var currentMaterial = SessionKeyMaterial(
@@ -236,6 +241,8 @@ class ProductionRealtimeSessionClient(
             initialRendererState = initialRendererState,
             leaseRenewalIntervalMillis = leaseRenewalIntervalMillis,
             disposeEngineOnClose = disposeEngineOnClose,
+            orderedEventObserver = orderedEventObserver,
+            orderedEventObserverCapacity = orderedEventObserverCapacity,
         )
         this.session = session
         incomingJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
@@ -319,7 +326,7 @@ class ProductionRealtimeSessionClient(
         transport.connect()
     }
 
-    suspend fun requestControl() {
+    suspend fun requestControl() = controlRequestMutex.withLock {
         check(!closed.get()) { "production session client is closed" }
         val requestGeneration = controlArbitrationMutex.withLock { controlGeneration }
         val lease = withContext(Dispatchers.IO) {
@@ -335,6 +342,7 @@ class ProductionRealtimeSessionClient(
                 false
             } else {
                 session.grantControl(lease.leaseId, lease.expiresAtEpochMillis, lease.version)
+                restoreControlAfterReconnect = true
                 true
             }
         }
@@ -380,6 +388,7 @@ class ProductionRealtimeSessionClient(
     suspend fun releaseControl() {
         val current = controlArbitrationMutex.withLock {
             controlGeneration++
+            restoreControlAfterReconnect = false
             session.state.value as? RemoteSessionState.Controlling
         } ?: return
         withContext(Dispatchers.IO) {
@@ -1010,6 +1019,7 @@ class ProductionRealtimeSessionClient(
                         requireApplied(acceptance)
                         if (acceptance is EventAcceptance.Applied) {
                             session.grantControl(leaseId, payload.expiresAtMs, payload.version)
+                            restoreControlAfterReconnect = true
                         }
                     }
                 }
@@ -1025,6 +1035,7 @@ class ProductionRealtimeSessionClient(
                         requireApplied(acceptance)
                         if (acceptance is EventAcceptance.Applied) {
                             controlGeneration++
+                            restoreControlAfterReconnect = false
                             if (payload.localInputEpoch > 0) {
                                 observedLocalInputEpoch.accumulateAndGet(payload.localInputEpoch, ::maxOf)
                             }
@@ -1128,6 +1139,7 @@ class ProductionRealtimeSessionClient(
                         subscriberReady.value = true
                         sendFlowControl(force = true)
                         startSubscriberRefresh()
+                        restoreDesiredControlIfNeeded()
                     }
                 } catch (error: CancellationException) {
                     throw error
@@ -1191,6 +1203,7 @@ class ProductionRealtimeSessionClient(
                 try {
                     resume(session.state.value.lastAckedSequence)
                     sendFlowControl(force = true)
+                    restoreDesiredControlIfNeeded()
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Exception) {
@@ -1198,6 +1211,33 @@ class ProductionRealtimeSessionClient(
                     break
                 }
             }
+        }
+    }
+
+    /**
+     * A transport generation change invalidates the local lease presentation,
+     * but it must not silently discard an explicit user control intent. The
+     * REST arbitration generation still fences a concurrent release or remote
+     * revoke, while the request mutex prevents duplicate restore POSTs.
+     */
+    private suspend fun restoreDesiredControlIfNeeded(): Boolean {
+        val shouldRestore = controlArbitrationMutex.withLock {
+            restoreControlAfterReconnect &&
+                session.state.value !is RemoteSessionState.Controlling &&
+                session.state.value !is RemoteSessionState.Exited &&
+                session.state.value !is RemoteSessionState.HistoryGap
+        }
+        if (!shouldRestore) return true
+        return try {
+            requestControl()
+            true
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            // Subscription remains usable in read-only mode. The periodic
+            // subscriber refresh retries the desired lease without tearing
+            // down an otherwise healthy realtime transport.
+            false
         }
     }
 

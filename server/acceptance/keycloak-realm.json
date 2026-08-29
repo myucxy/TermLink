@@ -2,15 +2,15 @@
   "realm": "termlink",
   "enabled": true,
   "displayName": "TermLink",
-  "loginTheme": "termlink-01b-v17",
-  "accountTheme": "termlink-01b-v17",
+  "loginTheme": "termlink-01b-v18",
+  "accountTheme": "termlink-01b-v18",
   "internationalizationEnabled": true,
   "supportedLocales": ["zh-CN", "en"],
   "defaultLocale": "zh-CN",
   "sslRequired": "external",
   "registrationAllowed": false,
   "verifyEmail": false,
-  "resetPasswordAllowed": true,
+  "resetPasswordAllowed": false,
   "rememberMe": true,
   "accessTokenLifespan": 300,
   "accessTokenLifespanForImplicitFlow": 300,
@@ -20,6 +20,7 @@
   "refreshTokenMaxReuse": 0,
   "loginWithEmailAllowed": true,
   "duplicateEmailsAllowed": false,
+  "editUsernameAllowed": false,
   "bruteForceProtected": true,
   "roles": {
     "realm": [
@@ -29,6 +30,43 @@
       {"name": "USER", "description": "TermLink product user"}
     ]
   },
+  "authenticationFlows": [
+    {
+      "id": "6b9eea40-95d4-45ca-8dde-f2913e86c525",
+      "alias": "termlink-native-browser",
+      "description": "Password-only browser fallback for Android and Windows; Web uses the realm browser flow with conditional OTP.",
+      "providerId": "basic-flow",
+      "topLevel": true,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {"authenticator": "auth-cookie", "requirement": "ALTERNATIVE", "priority": 10, "userSetupAllowed": false},
+        {"flowAlias": "termlink-native-forms", "requirement": "ALTERNATIVE", "priority": 20, "userSetupAllowed": false}
+      ]
+    },
+    {
+      "id": "f82a8acc-6a71-46c9-8ccb-a40bb0b41870",
+      "alias": "termlink-native-forms",
+      "description": "Username or e-mail plus password without Web TOTP.",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {"authenticator": "auth-username-password-form", "requirement": "REQUIRED", "priority": 10, "userSetupAllowed": false}
+      ]
+    },
+    {
+      "id": "7d363d14-940c-4d4c-971f-8fcb8a9e8035",
+      "alias": "termlink-web-mfa-step-up",
+      "description": "Same-account Web high-risk verification: existing SSO identity followed directly by OTP.",
+      "providerId": "basic-flow",
+      "topLevel": true,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {"authenticator": "auth-cookie", "requirement": "REQUIRED", "priority": 10, "userSetupAllowed": false},
+        {"authenticator": "auth-otp-form", "requirement": "REQUIRED", "priority": 20, "userSetupAllowed": false}
+      ]
+    }
+  ],
   "clients": [
     {
       "clientId": "termlink-server",
@@ -52,6 +90,7 @@
       "attributes": {
         "pkce.code.challenge.method": "S256"
       },
+      "authenticationFlowBindingOverrides": {"browser": "6b9eea40-95d4-45ca-8dde-f2913e86c525"},
       "protocol": "openid-connect",
       "protocolMappers": [
         {
@@ -101,6 +140,7 @@
       "attributes": {
         "pkce.code.challenge.method": "S256"
       },
+      "authenticationFlowBindingOverrides": {"browser": "6b9eea40-95d4-45ca-8dde-f2913e86c525"},
       "defaultClientScopes": ["web-origins", "acr", "roles", "profile", "basic", "email"],
       "optionalClientScopes": ["offline_access"],
       "protocol": "openid-connect",
@@ -151,6 +191,71 @@
             "id.token.claim": "true",
             "access.token.claim": "true",
             "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "termlink-web-nickname",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "nickname",
+            "claim.name": "nickname",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "termlink-web-amr",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "amr",
+            "claim.value": "[\"pwd\"]",
+            "jsonType.label": "JSON",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false",
+            "access.tokenResponse.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "termlink-web-step-up",
+      "name": "TermLink 高风险操作 MFA 验证",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": false,
+      "rootUrl": "https://termlink.kget.cc:8910",
+      "baseUrl": "https://termlink.kget.cc:8910/account",
+      "redirectUris": ["https://termlink.kget.cc:8910/auth/callback"],
+      "webOrigins": ["https://termlink.kget.cc:8910"],
+      "attributes": {"pkce.code.challenge.method": "S256"},
+      "authenticationFlowBindingOverrides": {"browser": "7d363d14-940c-4d4c-971f-8fcb8a9e8035"},
+      "defaultClientScopes": ["web-origins", "acr", "profile", "basic", "email"],
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "name": "termlink-web-step-up-amr",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "amr",
+            "claim.value": "[\"otp\"]",
+            "jsonType.label": "JSON",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false",
+            "access.tokenResponse.claim": "false"
           }
         }
       ]

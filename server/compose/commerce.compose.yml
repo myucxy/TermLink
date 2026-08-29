@@ -1,0 +1,11 @@
+services:
+  server:
+    environment:
+      TERMLINK_PAYMENT_SECRETS_DIR: /run/secrets/payment
+    volumes:
+      - type: bind
+        source: ${TERMLINK_PAYMENT_SECRETS_HOST_DIR:?TERMLINK_PAYMENT_SECRETS_HOST_DIR is required for commerce}
+        target: /run/secrets/payment
+        read_only: true
+        bind:
+          create_host_path: false

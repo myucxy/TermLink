@@ -4,21 +4,42 @@
 package config
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
-	defaultListenAddr = ":8080"
-	defaultLogLevel   = "info"
+	defaultListenAddr            = ":8080"
+	defaultLogLevel              = "info"
+	defaultKeycloakAdminClientID = "termlink-registration-recovery"
+
+	defaultPostgresMaxConns          = int32(20)
+	defaultPostgresMinConns          = int32(2)
+	defaultPostgresMaxConnLifetime   = 30 * time.Minute
+	defaultPostgresMaxConnIdleTime   = 5 * time.Minute
+	defaultPostgresHealthCheckPeriod = time.Minute
+	defaultPostgresConnectTimeout    = 5 * time.Second
+
+	defaultRedisPoolSize     = 20
+	defaultRedisMinIdleConns = 2
+	defaultRedisDialTimeout  = 5 * time.Second
+	defaultRedisReadTimeout  = 3 * time.Second
+	defaultRedisWriteTimeout = 3 * time.Second
+	defaultRedisPoolTimeout  = 4 * time.Second
 )
 
 var (
@@ -61,19 +82,24 @@ type Config struct {
 	WindowsRegistrationOIDCParties []string
 	WindowsOIDCRedirectURI         string
 	WebOIDCClientID                string
+	WebOIDCStepUpClientID          string
 	WebOIDCRedirectURI             string
 
-	OIDCClientSecret Secret
-	DatabaseURL      Secret
-	RedisURL         Secret
-	TokenSigningKey  Secret
+	OIDCClientSecret           Secret
+	KeycloakAdminClientSecret  Secret
+	AccountDeletionIdentityKey Secret
+	DatabaseURL                Secret
+	RedisURL                   Secret
+	TokenSigningKey            Secret
 
 	// Secret file paths are retained for diagnostics and dependency wiring, but
 	// are omitted from String because deployment paths can be sensitive too.
-	OIDCClientSecretFile string
-	DatabaseURLFile      string
-	RedisURLFile         string
-	TokenSigningKeyFile  string
+	OIDCClientSecretFile           string
+	KeycloakAdminClientSecretFile  string
+	AccountDeletionIdentityKeyFile string
+	DatabaseURLFile                string
+	RedisURLFile                   string
+	TokenSigningKeyFile            string
 
 	// S3Endpoint is the server-side endpoint used for bucket and object
 	// verification/deletion. S3PublicEndpoint is used only in presigned URLs
@@ -87,6 +113,31 @@ type Config struct {
 	S3AccessKeyFile  string
 	S3SecretKeyFile  string
 
+	// Pool and timeout values are non-secret, validated runtime controls. The
+	// defaults preserve the previous PostgreSQL settings and make go-redis's
+	// formerly implicit timeout behavior stable across CPU counts.
+	PostgresMaxConns          int32
+	PostgresMinConns          int32
+	PostgresMaxConnLifetime   time.Duration
+	PostgresMaxConnIdleTime   time.Duration
+	PostgresHealthCheckPeriod time.Duration
+	PostgresConnectTimeout    time.Duration
+	RedisPoolSize             int
+	RedisMinIdleConns         int
+	RedisDialTimeout          time.Duration
+	RedisReadTimeout          time.Duration
+	RedisWriteTimeout         time.Duration
+	RedisPoolTimeout          time.Duration
+	// PaymentSecretsDir is the trusted base directory used by payment-provider
+	// secret references. Config only validates and stores this path; it never
+	// enumerates or loads payment secret values.
+	PaymentSecretsDir                 string
+	RegistrationRecoveryEnabled       bool
+	KeycloakAdminClientID             string
+	KeycloakAdminBaseURL              string
+	AccountDeletionEnabled            bool
+	AccountDeletionIdentityKeyVersion int16
+
 	LogLevel          string
 	HistoryEnabled    bool
 	ListenAddr        string
@@ -97,7 +148,7 @@ type Config struct {
 // secret paths as well as secret values, because paths can contain identifying
 // deployment information and are not needed in normal startup diagnostics.
 func (c Config) String() string {
-	return fmt.Sprintf("Config{PublicURL:%q OIDCIssuer:%q OIDCClientID:%q OIDCAllowedParties:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q WindowsOIDCClientID:%q WindowsRegistrationOIDCParties:%q WindowsOIDCRedirectURI:%q WebOIDCClientID:%q WebOIDCRedirectURI:%q OIDCClientSecret:%s DatabaseURL:%s RedisURL:%s TokenSigningKey:%s S3Endpoint:%q S3PublicEndpoint:%q S3Bucket:%q S3Region:%q S3AccessKey:%s S3SecretKey:%s LogLevel:%q HistoryEnabled:%t ListenAddr:%q MetricsListenAddr:%q}",
+	return fmt.Sprintf("Config{PublicURL:%q OIDCIssuer:%q OIDCClientID:%q OIDCAllowedParties:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q WindowsOIDCClientID:%q WindowsRegistrationOIDCParties:%q WindowsOIDCRedirectURI:%q WebOIDCClientID:%q WebOIDCStepUpClientID:%q WebOIDCRedirectURI:%q OIDCClientSecret:%s KeycloakAdminClientSecret:%s KeycloakAdminClientID:%q KeycloakAdminBaseURL:%q RegistrationRecoveryEnabled:%t AccountDeletionEnabled:%t AccountDeletionIdentityKeyVersion:%d DatabaseURL:%s RedisURL:%s TokenSigningKey:%s S3Endpoint:%q S3PublicEndpoint:%q S3Bucket:%q S3Region:%q S3AccessKey:%s S3SecretKey:%s PostgresMaxConns:%d PostgresMinConns:%d PostgresMaxConnLifetime:%s PostgresMaxConnIdleTime:%s PostgresHealthCheckPeriod:%s PostgresConnectTimeout:%s RedisPoolSize:%d RedisMinIdleConns:%d RedisDialTimeout:%s RedisReadTimeout:%s RedisWriteTimeout:%s RedisPoolTimeout:%s LogLevel:%q HistoryEnabled:%t ListenAddr:%q MetricsListenAddr:%q}",
 		c.PublicURL,
 		c.OIDCIssuer,
 		c.OIDCClientID,
@@ -108,8 +159,15 @@ func (c Config) String() string {
 		c.WindowsRegistrationOIDCParties,
 		c.WindowsOIDCRedirectURI,
 		c.WebOIDCClientID,
+		c.WebOIDCStepUpClientID,
 		c.WebOIDCRedirectURI,
 		c.OIDCClientSecret,
+		c.KeycloakAdminClientSecret,
+		c.KeycloakAdminClientID,
+		c.KeycloakAdminBaseURL,
+		c.RegistrationRecoveryEnabled,
+		c.AccountDeletionEnabled,
+		c.AccountDeletionIdentityKeyVersion,
 		c.DatabaseURL,
 		c.RedisURL,
 		c.TokenSigningKey,
@@ -119,6 +177,18 @@ func (c Config) String() string {
 		c.S3Region,
 		c.S3AccessKey,
 		c.S3SecretKey,
+		c.PostgresMaxConns,
+		c.PostgresMinConns,
+		c.PostgresMaxConnLifetime,
+		c.PostgresMaxConnIdleTime,
+		c.PostgresHealthCheckPeriod,
+		c.PostgresConnectTimeout,
+		c.RedisPoolSize,
+		c.RedisMinIdleConns,
+		c.RedisDialTimeout,
+		c.RedisReadTimeout,
+		c.RedisWriteTimeout,
+		c.RedisPoolTimeout,
 		c.LogLevel,
 		c.HistoryEnabled,
 		c.ListenAddr,
@@ -136,6 +206,96 @@ func (c Config) Validate() error {
 	return err
 }
 
+// AccountDeletionIdentityKeyBytes decodes the dedicated AES-256 identity
+// handle key. The encoded value is kept inside Secret so diagnostics cannot
+// accidentally disclose either the text representation or the key bytes.
+func (c Config) AccountDeletionIdentityKeyBytes() ([]byte, error) {
+	keys, err := c.AccountDeletionIdentityKeys()
+	if err != nil {
+		return nil, err
+	}
+	key, ok := keys[c.AccountDeletionIdentityKeyVersion]
+	for version, candidate := range keys {
+		if version != c.AccountDeletionIdentityKeyVersion {
+			clear(candidate)
+		}
+	}
+	if !ok {
+		return nil, fmt.Errorf("%w: TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE", ErrSecret)
+	}
+	return key, nil
+}
+
+type accountDeletionIdentityKeyEntry struct {
+	Version int16  `json:"version"`
+	Key     string `json:"key"`
+}
+
+// AccountDeletionIdentityKeys accepts either a single encoded current key or
+// a bounded JSON key ring. The latter keeps older scheduled deletions
+// decryptable during rotation without making any key observable in Config
+// diagnostics.
+func (c Config) AccountDeletionIdentityKeys() (map[int16][]byte, error) {
+	if c.AccountDeletionIdentityKey.Empty() || c.AccountDeletionIdentityKeyVersion < 1 {
+		return nil, fmt.Errorf("%w: TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE", ErrSecret)
+	}
+	encoded := c.AccountDeletionIdentityKey.Value()
+	if key, ok := decodeAccountDeletionIdentityKey(encoded); ok {
+		return map[int16][]byte{c.AccountDeletionIdentityKeyVersion: key}, nil
+	}
+	decoder := json.NewDecoder(bytes.NewBufferString(encoded))
+	decoder.DisallowUnknownFields()
+	var entries []accountDeletionIdentityKeyEntry
+	if err := decoder.Decode(&entries); err != nil || len(entries) == 0 || len(entries) > 32 {
+		return nil, fmt.Errorf("%w: TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE", ErrSecret)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%w: TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE", ErrSecret)
+	}
+	keys := make(map[int16][]byte, len(entries))
+	for _, entry := range entries {
+		key, ok := decodeAccountDeletionIdentityKey(entry.Key)
+		if !ok || entry.Version < 1 {
+			clearAccountDeletionIdentityKeys(keys)
+			return nil, fmt.Errorf("%w: TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE", ErrSecret)
+		}
+		if _, duplicate := keys[entry.Version]; duplicate {
+			clear(key)
+			clearAccountDeletionIdentityKeys(keys)
+			return nil, fmt.Errorf("%w: TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE", ErrSecret)
+		}
+		keys[entry.Version] = key
+	}
+	if _, ok := keys[c.AccountDeletionIdentityKeyVersion]; !ok {
+		clearAccountDeletionIdentityKeys(keys)
+		return nil, fmt.Errorf("%w: TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE", ErrSecret)
+	}
+	return keys, nil
+}
+
+func decodeAccountDeletionIdentityKey(encoded string) ([]byte, bool) {
+	encodings := []*base64.Encoding{
+		base64.RawURLEncoding,
+		base64.URLEncoding,
+		base64.RawStdEncoding,
+		base64.StdEncoding,
+	}
+	for _, encoding := range encodings {
+		decoded, err := encoding.DecodeString(encoded)
+		if err == nil && len(decoded) == 32 {
+			return decoded, true
+		}
+		clear(decoded)
+	}
+	return nil, false
+}
+
+func clearAccountDeletionIdentityKeys(keys map[int16][]byte) {
+	for _, key := range keys {
+		clear(key)
+	}
+}
+
 // Input is the explicit-construction form used by tests and by embedders that
 // obtain secrets from a managed secret provider instead of files. Production
 // startup should use Load, which enforces file permissions.
@@ -150,12 +310,15 @@ type Input struct {
 	WindowsRegistrationOIDCParties []string
 	WindowsOIDCRedirectURI         string
 	WebOIDCClientID                string
+	WebOIDCStepUpClientID          string
 	WebOIDCRedirectURI             string
 
-	OIDCClientSecret string
-	DatabaseURL      string
-	RedisURL         string
-	TokenSigningKey  string
+	OIDCClientSecret           string
+	KeycloakAdminClientSecret  string
+	AccountDeletionIdentityKey string
+	DatabaseURL                string
+	RedisURL                   string
+	TokenSigningKey            string
 
 	S3Endpoint       string
 	S3PublicEndpoint string
@@ -163,6 +326,25 @@ type Input struct {
 	S3Region         string
 	S3AccessKey      string
 	S3SecretKey      string
+
+	PostgresMaxConns                  int32
+	PostgresMinConns                  int32
+	PostgresMaxConnLifetime           time.Duration
+	PostgresMaxConnIdleTime           time.Duration
+	PostgresHealthCheckPeriod         time.Duration
+	PostgresConnectTimeout            time.Duration
+	RedisPoolSize                     int
+	RedisMinIdleConns                 int
+	RedisDialTimeout                  time.Duration
+	RedisReadTimeout                  time.Duration
+	RedisWriteTimeout                 time.Duration
+	RedisPoolTimeout                  time.Duration
+	PaymentSecretsDir                 string
+	RegistrationRecoveryEnabled       bool
+	KeycloakAdminClientID             string
+	KeycloakAdminBaseURL              string
+	AccountDeletionEnabled            bool
+	AccountDeletionIdentityKeyVersion int16
 
 	LogLevel          string
 	HistoryEnabled    bool
@@ -174,31 +356,52 @@ type Input struct {
 // it does not read environment variables or secret files.
 func New(input Input) (Config, error) {
 	return validate(Config{
-		PublicURL:                      strings.TrimSpace(input.PublicURL),
-		OIDCIssuer:                     strings.TrimSpace(input.OIDCIssuer),
-		OIDCClientID:                   strings.TrimSpace(input.OIDCClientID),
-		OIDCAllowedParties:             append([]string(nil), input.OIDCAllowedParties...),
-		AndroidOIDCClientID:            strings.TrimSpace(input.AndroidOIDCClientID),
-		AndroidOIDCRedirectURI:         strings.TrimSpace(input.AndroidOIDCRedirectURI),
-		WindowsOIDCClientID:            strings.TrimSpace(input.WindowsOIDCClientID),
-		WindowsRegistrationOIDCParties: append([]string(nil), input.WindowsRegistrationOIDCParties...),
-		WindowsOIDCRedirectURI:         strings.TrimSpace(input.WindowsOIDCRedirectURI),
-		WebOIDCClientID:                strings.TrimSpace(input.WebOIDCClientID),
-		WebOIDCRedirectURI:             strings.TrimSpace(input.WebOIDCRedirectURI),
-		OIDCClientSecret:               Secret(strings.TrimSpace(input.OIDCClientSecret)),
-		DatabaseURL:                    Secret(strings.TrimSpace(input.DatabaseURL)),
-		RedisURL:                       Secret(strings.TrimSpace(input.RedisURL)),
-		TokenSigningKey:                Secret(strings.TrimSpace(input.TokenSigningKey)),
-		S3Endpoint:                     strings.TrimSpace(input.S3Endpoint),
-		S3PublicEndpoint:               strings.TrimSpace(input.S3PublicEndpoint),
-		S3Bucket:                       strings.TrimSpace(input.S3Bucket),
-		S3Region:                       strings.TrimSpace(input.S3Region),
-		S3AccessKey:                    Secret(strings.TrimSpace(input.S3AccessKey)),
-		S3SecretKey:                    Secret(strings.TrimSpace(input.S3SecretKey)),
-		LogLevel:                       input.LogLevel,
-		HistoryEnabled:                 input.HistoryEnabled,
-		ListenAddr:                     input.ListenAddr,
-		MetricsListenAddr:              input.MetricsListenAddr,
+		PublicURL:                         strings.TrimSpace(input.PublicURL),
+		OIDCIssuer:                        strings.TrimSpace(input.OIDCIssuer),
+		OIDCClientID:                      strings.TrimSpace(input.OIDCClientID),
+		OIDCAllowedParties:                append([]string(nil), input.OIDCAllowedParties...),
+		AndroidOIDCClientID:               strings.TrimSpace(input.AndroidOIDCClientID),
+		AndroidOIDCRedirectURI:            strings.TrimSpace(input.AndroidOIDCRedirectURI),
+		WindowsOIDCClientID:               strings.TrimSpace(input.WindowsOIDCClientID),
+		WindowsRegistrationOIDCParties:    append([]string(nil), input.WindowsRegistrationOIDCParties...),
+		WindowsOIDCRedirectURI:            strings.TrimSpace(input.WindowsOIDCRedirectURI),
+		WebOIDCClientID:                   strings.TrimSpace(input.WebOIDCClientID),
+		WebOIDCStepUpClientID:             strings.TrimSpace(input.WebOIDCStepUpClientID),
+		WebOIDCRedirectURI:                strings.TrimSpace(input.WebOIDCRedirectURI),
+		OIDCClientSecret:                  Secret(strings.TrimSpace(input.OIDCClientSecret)),
+		KeycloakAdminClientSecret:         Secret(strings.TrimSpace(input.KeycloakAdminClientSecret)),
+		KeycloakAdminClientID:             strings.TrimSpace(input.KeycloakAdminClientID),
+		KeycloakAdminBaseURL:              strings.TrimSpace(input.KeycloakAdminBaseURL),
+		RegistrationRecoveryEnabled:       input.RegistrationRecoveryEnabled,
+		AccountDeletionEnabled:            input.AccountDeletionEnabled,
+		AccountDeletionIdentityKey:        Secret(strings.TrimSpace(input.AccountDeletionIdentityKey)),
+		AccountDeletionIdentityKeyVersion: input.AccountDeletionIdentityKeyVersion,
+		DatabaseURL:                       Secret(strings.TrimSpace(input.DatabaseURL)),
+		RedisURL:                          Secret(strings.TrimSpace(input.RedisURL)),
+		TokenSigningKey:                   Secret(strings.TrimSpace(input.TokenSigningKey)),
+		S3Endpoint:                        strings.TrimSpace(input.S3Endpoint),
+		S3PublicEndpoint:                  strings.TrimSpace(input.S3PublicEndpoint),
+		S3Bucket:                          strings.TrimSpace(input.S3Bucket),
+		S3Region:                          strings.TrimSpace(input.S3Region),
+		S3AccessKey:                       Secret(strings.TrimSpace(input.S3AccessKey)),
+		S3SecretKey:                       Secret(strings.TrimSpace(input.S3SecretKey)),
+		PostgresMaxConns:                  input.PostgresMaxConns,
+		PostgresMinConns:                  input.PostgresMinConns,
+		PostgresMaxConnLifetime:           input.PostgresMaxConnLifetime,
+		PostgresMaxConnIdleTime:           input.PostgresMaxConnIdleTime,
+		PostgresHealthCheckPeriod:         input.PostgresHealthCheckPeriod,
+		PostgresConnectTimeout:            input.PostgresConnectTimeout,
+		RedisPoolSize:                     input.RedisPoolSize,
+		RedisMinIdleConns:                 input.RedisMinIdleConns,
+		RedisDialTimeout:                  input.RedisDialTimeout,
+		RedisReadTimeout:                  input.RedisReadTimeout,
+		RedisWriteTimeout:                 input.RedisWriteTimeout,
+		RedisPoolTimeout:                  input.RedisPoolTimeout,
+		PaymentSecretsDir:                 strings.TrimSpace(input.PaymentSecretsDir),
+		LogLevel:                          input.LogLevel,
+		HistoryEnabled:                    input.HistoryEnabled,
+		ListenAddr:                        input.ListenAddr,
+		MetricsListenAddr:                 input.MetricsListenAddr,
 	})
 }
 
@@ -314,7 +517,27 @@ func LoadSource(source Source) (Config, error) {
 	), ",")
 	windowsOIDCRedirectURI := lookupOptional("TERMLINK_WINDOWS_OIDC_REDIRECT_URI", "http://127.0.0.1:43971/oauth2/callback")
 	webOIDCClientID := lookupOptional("TERMLINK_WEB_OIDC_CLIENT_ID", "termlink-web")
+	webOIDCStepUpClientID := lookupOptional("TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID", "termlink-web-step-up")
 	webOIDCRedirectURI := lookupOptional("TERMLINK_WEB_OIDC_REDIRECT_URI", strings.TrimRight(publicURL, "/")+"/auth/callback")
+	registrationRecoveryEnabled, err := parseBool("TERMLINK_REGISTRATION_RECOVERY_ENABLED", lookupOptional("TERMLINK_REGISTRATION_RECOVERY_ENABLED", "false"))
+	if err != nil {
+		return Config{}, err
+	}
+	accountDeletionEnabled, err := parseBool("TERMLINK_ACCOUNT_DELETION_ENABLED", lookupOptional("TERMLINK_ACCOUNT_DELETION_ENABLED", "false"))
+	if err != nil {
+		return Config{}, err
+	}
+	accountDeletionIdentityKeyVersion, err := parseIntRange(
+		"TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION",
+		lookupOptional("TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION", "1"),
+		1,
+		32767,
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	keycloakAdminClientID := lookupOptional("TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID", defaultKeycloakAdminClientID)
+	keycloakAdminBaseURL := lookupOptional("TERMLINK_KEYCLOAK_ADMIN_BASE_URL", "")
 	logLevel := lookupOptional("TERMLINK_LOG_LEVEL", defaultLogLevel)
 	historyEnabled, err := parseBool("TERMLINK_HISTORY_ENABLED", lookupOptional("TERMLINK_HISTORY_ENABLED", "false"))
 	if err != nil {
@@ -322,6 +545,55 @@ func LoadSource(source Source) (Config, error) {
 	}
 	listenAddr := lookupOptional("TERMLINK_LISTEN_ADDR", defaultListenAddr)
 	metricsListenAddr := lookupOptional("TERMLINK_METRICS_LISTEN_ADDR", "")
+	paymentSecretsDir := lookupOptional("TERMLINK_PAYMENT_SECRETS_DIR", "/run/secrets")
+	postgresMaxConns, err := parseIntRange("TERMLINK_POSTGRES_MAX_CONNS", lookupOptional("TERMLINK_POSTGRES_MAX_CONNS", strconv.Itoa(int(defaultPostgresMaxConns))), 1, 1000)
+	if err != nil {
+		return Config{}, err
+	}
+	postgresMinConns, err := parseIntRange("TERMLINK_POSTGRES_MIN_CONNS", lookupOptional("TERMLINK_POSTGRES_MIN_CONNS", strconv.Itoa(int(defaultPostgresMinConns))), 0, postgresMaxConns)
+	if err != nil {
+		return Config{}, err
+	}
+	postgresMaxConnLifetime, err := parseDurationRange("TERMLINK_POSTGRES_MAX_CONN_LIFETIME", lookupOptional("TERMLINK_POSTGRES_MAX_CONN_LIFETIME", defaultPostgresMaxConnLifetime.String()), time.Minute, 24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+	postgresMaxConnIdleTime, err := parseDurationRange("TERMLINK_POSTGRES_MAX_CONN_IDLE_TIME", lookupOptional("TERMLINK_POSTGRES_MAX_CONN_IDLE_TIME", defaultPostgresMaxConnIdleTime.String()), time.Minute, 24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+	postgresHealthCheckPeriod, err := parseDurationRange("TERMLINK_POSTGRES_HEALTH_CHECK_PERIOD", lookupOptional("TERMLINK_POSTGRES_HEALTH_CHECK_PERIOD", defaultPostgresHealthCheckPeriod.String()), 5*time.Second, 10*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	postgresConnectTimeout, err := parseDurationRange("TERMLINK_POSTGRES_CONNECT_TIMEOUT", lookupOptional("TERMLINK_POSTGRES_CONNECT_TIMEOUT", defaultPostgresConnectTimeout.String()), 100*time.Millisecond, 2*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	redisPoolSize, err := parseIntRange("TERMLINK_REDIS_POOL_SIZE", lookupOptional("TERMLINK_REDIS_POOL_SIZE", strconv.Itoa(defaultRedisPoolSize)), 1, 1000)
+	if err != nil {
+		return Config{}, err
+	}
+	redisMinIdleConns, err := parseIntRange("TERMLINK_REDIS_MIN_IDLE_CONNS", lookupOptional("TERMLINK_REDIS_MIN_IDLE_CONNS", strconv.Itoa(defaultRedisMinIdleConns)), 0, redisPoolSize)
+	if err != nil {
+		return Config{}, err
+	}
+	redisDialTimeout, err := parseDurationRange("TERMLINK_REDIS_DIAL_TIMEOUT", lookupOptional("TERMLINK_REDIS_DIAL_TIMEOUT", defaultRedisDialTimeout.String()), 100*time.Millisecond, 2*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	redisReadTimeout, err := parseDurationRange("TERMLINK_REDIS_READ_TIMEOUT", lookupOptional("TERMLINK_REDIS_READ_TIMEOUT", defaultRedisReadTimeout.String()), 100*time.Millisecond, 2*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	redisWriteTimeout, err := parseDurationRange("TERMLINK_REDIS_WRITE_TIMEOUT", lookupOptional("TERMLINK_REDIS_WRITE_TIMEOUT", defaultRedisWriteTimeout.String()), 100*time.Millisecond, 2*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	redisPoolTimeout, err := parseDurationRange("TERMLINK_REDIS_POOL_TIMEOUT", lookupOptional("TERMLINK_REDIS_POOL_TIMEOUT", defaultRedisPoolTimeout.String()), 100*time.Millisecond, 2*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
 
 	oidcSecret, err := readSecret(source, "TERMLINK_OIDC_CLIENT_SECRET_FILE")
 	if err != nil {
@@ -338,6 +610,20 @@ func LoadSource(source Source) (Config, error) {
 	tokenSigningKey, err := readSecret(source, "TERMLINK_TOKEN_SIGNING_KEY_FILE")
 	if err != nil {
 		return Config{}, err
+	}
+	var keycloakAdminClientSecret Secret
+	if registrationRecoveryEnabled || accountDeletionEnabled {
+		keycloakAdminClientSecret, err = readSecret(source, "TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE")
+		if err != nil {
+			return Config{}, err
+		}
+	}
+	var accountDeletionIdentityKey Secret
+	if accountDeletionEnabled {
+		accountDeletionIdentityKey, err = readSecret(source, "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE")
+		if err != nil {
+			return Config{}, err
+		}
 	}
 
 	s3Endpoint := lookupOptional("TERMLINK_S3_ENDPOINT", "")
@@ -360,37 +646,60 @@ func LoadSource(source Source) (Config, error) {
 	}
 
 	return validate(Config{
-		PublicURL:                      publicURL,
-		OIDCIssuer:                     oidcIssuer,
-		OIDCClientID:                   oidcClientID,
-		OIDCAllowedParties:             oidcAllowedParties,
-		AndroidOIDCClientID:            androidOIDCClientID,
-		AndroidOIDCRedirectURI:         androidOIDCRedirectURI,
-		WindowsOIDCClientID:            windowsOIDCClientID,
-		WindowsRegistrationOIDCParties: windowsRegistrationOIDCParties,
-		WindowsOIDCRedirectURI:         windowsOIDCRedirectURI,
-		WebOIDCClientID:                webOIDCClientID,
-		WebOIDCRedirectURI:             webOIDCRedirectURI,
-		OIDCClientSecret:               oidcSecret,
-		DatabaseURL:                    databaseURL,
-		RedisURL:                       redisURL,
-		TokenSigningKey:                tokenSigningKey,
-		OIDCClientSecretFile:           envPath(source, "TERMLINK_OIDC_CLIENT_SECRET_FILE"),
-		DatabaseURLFile:                envPath(source, "TERMLINK_DATABASE_URL_FILE"),
-		RedisURLFile:                   envPath(source, "TERMLINK_REDIS_URL_FILE"),
-		TokenSigningKeyFile:            envPath(source, "TERMLINK_TOKEN_SIGNING_KEY_FILE"),
-		S3Endpoint:                     s3Endpoint,
-		S3PublicEndpoint:               s3PublicEndpoint,
-		S3Bucket:                       s3Bucket,
-		S3Region:                       s3Region,
-		S3AccessKey:                    s3AccessKey,
-		S3SecretKey:                    s3SecretKey,
-		S3AccessKeyFile:                envPath(source, "TERMLINK_S3_ACCESS_KEY_FILE"),
-		S3SecretKeyFile:                envPath(source, "TERMLINK_S3_SECRET_KEY_FILE"),
-		LogLevel:                       logLevel,
-		HistoryEnabled:                 historyEnabled,
-		ListenAddr:                     listenAddr,
-		MetricsListenAddr:              metricsListenAddr,
+		PublicURL:                         publicURL,
+		OIDCIssuer:                        oidcIssuer,
+		OIDCClientID:                      oidcClientID,
+		OIDCAllowedParties:                oidcAllowedParties,
+		AndroidOIDCClientID:               androidOIDCClientID,
+		AndroidOIDCRedirectURI:            androidOIDCRedirectURI,
+		WindowsOIDCClientID:               windowsOIDCClientID,
+		WindowsRegistrationOIDCParties:    windowsRegistrationOIDCParties,
+		WindowsOIDCRedirectURI:            windowsOIDCRedirectURI,
+		WebOIDCClientID:                   webOIDCClientID,
+		WebOIDCStepUpClientID:             webOIDCStepUpClientID,
+		WebOIDCRedirectURI:                webOIDCRedirectURI,
+		OIDCClientSecret:                  oidcSecret,
+		KeycloakAdminClientSecret:         keycloakAdminClientSecret,
+		KeycloakAdminClientID:             keycloakAdminClientID,
+		KeycloakAdminBaseURL:              keycloakAdminBaseURL,
+		RegistrationRecoveryEnabled:       registrationRecoveryEnabled,
+		AccountDeletionEnabled:            accountDeletionEnabled,
+		AccountDeletionIdentityKey:        accountDeletionIdentityKey,
+		AccountDeletionIdentityKeyVersion: int16(accountDeletionIdentityKeyVersion),
+		DatabaseURL:                       databaseURL,
+		RedisURL:                          redisURL,
+		TokenSigningKey:                   tokenSigningKey,
+		OIDCClientSecretFile:              envPath(source, "TERMLINK_OIDC_CLIENT_SECRET_FILE"),
+		KeycloakAdminClientSecretFile:     envPath(source, "TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE"),
+		AccountDeletionIdentityKeyFile:    envPath(source, "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE"),
+		DatabaseURLFile:                   envPath(source, "TERMLINK_DATABASE_URL_FILE"),
+		RedisURLFile:                      envPath(source, "TERMLINK_REDIS_URL_FILE"),
+		TokenSigningKeyFile:               envPath(source, "TERMLINK_TOKEN_SIGNING_KEY_FILE"),
+		S3Endpoint:                        s3Endpoint,
+		S3PublicEndpoint:                  s3PublicEndpoint,
+		S3Bucket:                          s3Bucket,
+		S3Region:                          s3Region,
+		S3AccessKey:                       s3AccessKey,
+		S3SecretKey:                       s3SecretKey,
+		S3AccessKeyFile:                   envPath(source, "TERMLINK_S3_ACCESS_KEY_FILE"),
+		S3SecretKeyFile:                   envPath(source, "TERMLINK_S3_SECRET_KEY_FILE"),
+		PostgresMaxConns:                  int32(postgresMaxConns),
+		PostgresMinConns:                  int32(postgresMinConns),
+		PostgresMaxConnLifetime:           postgresMaxConnLifetime,
+		PostgresMaxConnIdleTime:           postgresMaxConnIdleTime,
+		PostgresHealthCheckPeriod:         postgresHealthCheckPeriod,
+		PostgresConnectTimeout:            postgresConnectTimeout,
+		RedisPoolSize:                     redisPoolSize,
+		RedisMinIdleConns:                 redisMinIdleConns,
+		RedisDialTimeout:                  redisDialTimeout,
+		RedisReadTimeout:                  redisReadTimeout,
+		RedisWriteTimeout:                 redisWriteTimeout,
+		RedisPoolTimeout:                  redisPoolTimeout,
+		PaymentSecretsDir:                 paymentSecretsDir,
+		LogLevel:                          logLevel,
+		HistoryEnabled:                    historyEnabled,
+		ListenAddr:                        listenAddr,
+		MetricsListenAddr:                 metricsListenAddr,
 	})
 }
 
@@ -439,7 +748,31 @@ func parseBool(name, value string) (bool, error) {
 	return parsed, nil
 }
 
+func parseIntRange(name, value string, minimum, maximum int) (int, error) {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || parsed < minimum || parsed > maximum {
+		return 0, fmt.Errorf("%w: %s", ErrInvalid, name)
+	}
+	return parsed, nil
+}
+
+func parseDurationRange(name, value string, minimum, maximum time.Duration) (time.Duration, error) {
+	parsed, err := time.ParseDuration(strings.TrimSpace(value))
+	if err != nil || parsed < minimum || parsed > maximum {
+		return 0, fmt.Errorf("%w: %s", ErrInvalid, name)
+	}
+	return parsed, nil
+}
+
 func validate(c Config) (Config, error) {
+	if strings.TrimSpace(c.PaymentSecretsDir) == "" {
+		c.PaymentSecretsDir = "/run/secrets"
+	}
+	paymentSecretsDir, err := normalizeAbsoluteDirectory("TERMLINK_PAYMENT_SECRETS_DIR", c.PaymentSecretsDir)
+	if err != nil {
+		return Config{}, err
+	}
+	c.PaymentSecretsDir = paymentSecretsDir
 	if strings.TrimSpace(c.S3Bucket) == "" {
 		c.S3Bucket = "termlink-history"
 	}
@@ -530,8 +863,47 @@ func validate(c Config) (Config, error) {
 	if c.OIDCClientSecret.Empty() {
 		return Config{}, fmt.Errorf("%w: TERMLINK_OIDC_CLIENT_SECRET_FILE", ErrSecret)
 	}
+	if strings.TrimSpace(c.KeycloakAdminClientID) == "" {
+		c.KeycloakAdminClientID = defaultKeycloakAdminClientID
+	}
+	adminIdentityRequired := c.RegistrationRecoveryEnabled || c.AccountDeletionEnabled
+	if adminIdentityRequired {
+		if len(c.KeycloakAdminClientID) > 128 || strings.ContainsAny(c.KeycloakAdminClientID, " \t\r\n") {
+			return Config{}, fmt.Errorf("%w: TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID", ErrInvalid)
+		}
+		if c.KeycloakAdminClientSecret.Empty() {
+			return Config{}, fmt.Errorf("%w: TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE", ErrSecret)
+		}
+		if c.KeycloakAdminBaseURL != "" {
+			if err := validateKeycloakAdminBaseURL(c.KeycloakAdminBaseURL); err != nil {
+				return Config{}, err
+			}
+		}
+	}
+	if c.AccountDeletionIdentityKeyVersion == 0 && !c.AccountDeletionEnabled {
+		c.AccountDeletionIdentityKeyVersion = 1
+	}
+	if c.AccountDeletionEnabled {
+		if !c.HistoryEnabled {
+			return Config{}, fmt.Errorf("%w: TERMLINK_ACCOUNT_DELETION_ENABLED requires TERMLINK_HISTORY_ENABLED", ErrInvalid)
+		}
+		if c.AccountDeletionIdentityKeyVersion < 1 {
+			return Config{}, fmt.Errorf("%w: TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION", ErrInvalid)
+		}
+		keys, err := c.AccountDeletionIdentityKeys()
+		if err != nil {
+			return Config{}, err
+		}
+		clearAccountDeletionIdentityKeys(keys)
+	}
 	if strings.TrimSpace(c.WebOIDCClientID) == "" {
 		c.WebOIDCClientID = "termlink-web"
+	}
+	if strings.TrimSpace(c.WebOIDCStepUpClientID) == "" {
+		c.WebOIDCStepUpClientID = "termlink-web-step-up"
+	}
+	if c.WebOIDCStepUpClientID == c.WebOIDCClientID {
+		return Config{}, fmt.Errorf("%w: TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID must differ from TERMLINK_WEB_OIDC_CLIENT_ID", ErrInvalid)
 	}
 	if strings.TrimSpace(c.WebOIDCRedirectURI) == "" {
 		c.WebOIDCRedirectURI = strings.TrimRight(c.PublicURL, "/") + "/auth/callback"
@@ -579,12 +951,91 @@ func validate(c Config) (Config, error) {
 			return Config{}, fmt.Errorf("%w: TERMLINK_S3_BUCKET", ErrInvalid)
 		}
 	}
+	postgresPoolUnspecified := c.PostgresMaxConns == 0 && c.PostgresMinConns == 0 &&
+		c.PostgresMaxConnLifetime == 0 && c.PostgresMaxConnIdleTime == 0 &&
+		c.PostgresHealthCheckPeriod == 0 && c.PostgresConnectTimeout == 0
+	if c.PostgresMaxConns == 0 {
+		c.PostgresMaxConns = defaultPostgresMaxConns
+	}
+	if postgresPoolUnspecified {
+		c.PostgresMinConns = defaultPostgresMinConns
+	}
+	if c.PostgresMaxConnLifetime == 0 {
+		c.PostgresMaxConnLifetime = defaultPostgresMaxConnLifetime
+	}
+	if c.PostgresMaxConnIdleTime == 0 {
+		c.PostgresMaxConnIdleTime = defaultPostgresMaxConnIdleTime
+	}
+	if c.PostgresHealthCheckPeriod == 0 {
+		c.PostgresHealthCheckPeriod = defaultPostgresHealthCheckPeriod
+	}
+	if c.PostgresConnectTimeout == 0 {
+		c.PostgresConnectTimeout = defaultPostgresConnectTimeout
+	}
+	if c.PostgresMaxConns < 1 || c.PostgresMaxConns > 1000 {
+		return Config{}, fmt.Errorf("%w: TERMLINK_POSTGRES_MAX_CONNS", ErrInvalid)
+	}
+	if c.PostgresMinConns < 0 || c.PostgresMinConns > c.PostgresMaxConns {
+		return Config{}, fmt.Errorf("%w: TERMLINK_POSTGRES_MIN_CONNS", ErrInvalid)
+	}
+	if c.PostgresMaxConnLifetime < time.Minute || c.PostgresMaxConnLifetime > 24*time.Hour {
+		return Config{}, fmt.Errorf("%w: TERMLINK_POSTGRES_MAX_CONN_LIFETIME", ErrInvalid)
+	}
+	if c.PostgresMaxConnIdleTime < time.Minute || c.PostgresMaxConnIdleTime > 24*time.Hour {
+		return Config{}, fmt.Errorf("%w: TERMLINK_POSTGRES_MAX_CONN_IDLE_TIME", ErrInvalid)
+	}
+	if c.PostgresHealthCheckPeriod < 5*time.Second || c.PostgresHealthCheckPeriod > 10*time.Minute {
+		return Config{}, fmt.Errorf("%w: TERMLINK_POSTGRES_HEALTH_CHECK_PERIOD", ErrInvalid)
+	}
+	if c.PostgresConnectTimeout < 100*time.Millisecond || c.PostgresConnectTimeout > 2*time.Minute {
+		return Config{}, fmt.Errorf("%w: TERMLINK_POSTGRES_CONNECT_TIMEOUT", ErrInvalid)
+	}
+
+	redisPoolUnspecified := c.RedisPoolSize == 0 && c.RedisMinIdleConns == 0 &&
+		c.RedisDialTimeout == 0 && c.RedisReadTimeout == 0 &&
+		c.RedisWriteTimeout == 0 && c.RedisPoolTimeout == 0
+	if c.RedisPoolSize == 0 {
+		c.RedisPoolSize = defaultRedisPoolSize
+	}
+	if redisPoolUnspecified {
+		c.RedisMinIdleConns = defaultRedisMinIdleConns
+	}
+	if c.RedisDialTimeout == 0 {
+		c.RedisDialTimeout = defaultRedisDialTimeout
+	}
+	if c.RedisReadTimeout == 0 {
+		c.RedisReadTimeout = defaultRedisReadTimeout
+	}
+	if c.RedisWriteTimeout == 0 {
+		c.RedisWriteTimeout = defaultRedisWriteTimeout
+	}
+	if c.RedisPoolTimeout == 0 {
+		c.RedisPoolTimeout = defaultRedisPoolTimeout
+	}
+	if c.RedisPoolSize < 1 || c.RedisPoolSize > 1000 {
+		return Config{}, fmt.Errorf("%w: TERMLINK_REDIS_POOL_SIZE", ErrInvalid)
+	}
+	if c.RedisMinIdleConns < 0 || c.RedisMinIdleConns > c.RedisPoolSize {
+		return Config{}, fmt.Errorf("%w: TERMLINK_REDIS_MIN_IDLE_CONNS", ErrInvalid)
+	}
+	if c.RedisDialTimeout < 100*time.Millisecond || c.RedisDialTimeout > 2*time.Minute {
+		return Config{}, fmt.Errorf("%w: TERMLINK_REDIS_DIAL_TIMEOUT", ErrInvalid)
+	}
+	if c.RedisReadTimeout < 100*time.Millisecond || c.RedisReadTimeout > 2*time.Minute {
+		return Config{}, fmt.Errorf("%w: TERMLINK_REDIS_READ_TIMEOUT", ErrInvalid)
+	}
+	if c.RedisWriteTimeout < 100*time.Millisecond || c.RedisWriteTimeout > 2*time.Minute {
+		return Config{}, fmt.Errorf("%w: TERMLINK_REDIS_WRITE_TIMEOUT", ErrInvalid)
+	}
+	if c.RedisPoolTimeout < 100*time.Millisecond || c.RedisPoolTimeout > 2*time.Minute {
+		return Config{}, fmt.Errorf("%w: TERMLINK_REDIS_POOL_TIMEOUT", ErrInvalid)
+	}
 	level := strings.ToLower(strings.TrimSpace(c.LogLevel))
 	if level == "" {
 		level = defaultLogLevel
 	}
 	switch level {
-	case "info", "warn", "error":
+	case "debug", "info", "warn", "error":
 		c.LogLevel = level
 	default:
 		return Config{}, fmt.Errorf("%w: TERMLINK_LOG_LEVEL", ErrInvalid)
@@ -602,6 +1053,23 @@ func validate(c Config) (Config, error) {
 		}
 	}
 	return c, nil
+}
+
+func normalizeAbsoluteDirectory(name, value string) (string, error) {
+	value = strings.TrimSpace(value)
+	cleaned := filepath.Clean(value)
+	// Production runs in a Linux container even when Compose is rendered or
+	// tests run on Windows, so recognize and preserve an absolute POSIX path.
+	if path.IsAbs(value) {
+		cleaned = path.Clean(value)
+	}
+	if !path.IsAbs(cleaned) && !filepath.IsAbs(cleaned) {
+		return "", fmt.Errorf("%w: %s", ErrInvalid, name)
+	}
+	if cleaned == "/" || cleaned == `\` || filepath.Dir(cleaned) == cleaned {
+		return "", fmt.Errorf("%w: %s", ErrInvalid, name)
+	}
+	return cleaned, nil
 }
 
 func validateListenAddr(name, value string) error {
@@ -666,4 +1134,50 @@ func validateS3Endpoint(name, value string) error {
 		return fmt.Errorf("%w: %s", ErrInvalid, name)
 	}
 	return nil
+}
+
+func validateKeycloakAdminBaseURL(value string) error {
+	const name = "TERMLINK_KEYCLOAK_ADMIN_BASE_URL"
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed == nil || parsed.Opaque != "" || parsed.Host == "" || parsed.User != nil ||
+		parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" ||
+		(parsed.Scheme != "https" && parsed.Scheme != "http") || strings.Contains(parsed.Path, "\\") ||
+		strings.Contains(parsed.Path, "//") {
+		return fmt.Errorf("%w: %s", ErrInvalid, name)
+	}
+	for _, segment := range strings.Split(strings.Trim(parsed.Path, "/"), "/") {
+		if segment == "." || segment == ".." {
+			return fmt.Errorf("%w: %s", ErrInvalid, name)
+		}
+	}
+	hostname := parsed.Hostname()
+	if parsed.Scheme == "http" {
+		if parsed.Port() == "" || !isLoopbackOrSingleLabelHost(hostname) {
+			return fmt.Errorf("%w: %s", ErrInvalid, name)
+		}
+	} else if ip := net.ParseIP(hostname); ip != nil &&
+		(ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
+		return fmt.Errorf("%w: %s", ErrInvalid, name)
+	}
+	return nil
+}
+
+func isLoopbackOrSingleLabelHost(hostname string) bool {
+	if strings.EqualFold(hostname, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(hostname); ip != nil {
+		return ip.IsLoopback()
+	}
+	if len(hostname) == 0 || len(hostname) > 63 || strings.Contains(hostname, ".") ||
+		hostname[0] == '-' || hostname[len(hostname)-1] == '-' {
+		return false
+	}
+	for _, char := range hostname {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
+			(char < '0' || char > '9') && char != '-' {
+			return false
+		}
+	}
+	return true
 }

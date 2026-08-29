@@ -1,0 +1,19 @@
+services:
+  server:
+    environment:
+      TERMLINK_REGISTRATION_RECOVERY_ENABLED: "true"
+      TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID: ${TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID:-termlink-registration-recovery}
+      # Empty means derive the admin API origin from the Keycloak realm issuer.
+      # A custom value is validated by both the binary and deployment policy.
+      TERMLINK_KEYCLOAK_ADMIN_BASE_URL: ${TERMLINK_KEYCLOAK_ADMIN_BASE_URL:-}
+      TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE: /run/secrets/keycloak_admin_client_secret
+    secrets:
+      - source: keycloak_admin_client_secret
+        target: keycloak_admin_client_secret
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+
+secrets:
+  keycloak_admin_client_secret:
+    file: ${TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE:?TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE is required}
