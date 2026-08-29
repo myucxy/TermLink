@@ -45,12 +45,14 @@ var (
 const UnlimitedQuota = -1
 
 const (
-	HistoryFormatBoundedEventReplay       = "BOUNDED_EVENT_REPLAY"
-	HistoryFormatTerminalSnapshot         = "TERMLINK_TERMINAL_SNAPSHOT"
-	HistoryFormatTerminalTranscript       = "TERMLINK_TERMINAL_TRANSCRIPT"
-	MaxSnapshotCiphertextBytes      int64 = 2 << 20
-	MaxTranscriptCiphertextBytes    int64 = 512 << 10
-	MaxTranscriptPublicationPages         = 100_000
+	HistoryFormatBoundedEventReplay              = "BOUNDED_EVENT_REPLAY"
+	HistoryFormatTerminalSnapshot                = "TERMLINK_TERMINAL_SNAPSHOT"
+	HistoryFormatTerminalCoreSnapshot            = "TERMLINK_TERMINAL_CORE_SNAPSHOT"
+	HistoryFormatTerminalTranscript              = "TERMLINK_TERMINAL_TRANSCRIPT"
+	MaxSnapshotCiphertextBytes             int64 = 2 << 20
+	MaxTerminalCoreSnapshotCiphertextBytes int64 = 64 << 20
+	MaxTranscriptCiphertextBytes           int64 = 512 << 10
+	MaxTranscriptPublicationPages                = 100_000
 )
 
 // sessionOnlineWindow is the server-authoritative reachability window. A
@@ -1391,6 +1393,8 @@ func ParseHistoryRecipientKeyID(kind, formatName, keyID string) (uuid.UUID, int6
 		prefix = "history-v1"
 	case kind == "SNAPSHOT" && formatName == HistoryFormatTerminalSnapshot:
 		prefix = "snapshot-v1"
+	case kind == "SNAPSHOT" && formatName == HistoryFormatTerminalCoreSnapshot:
+		prefix = "terminal-core-snapshot-v2"
 	case kind == "TRANSCRIPT" && formatName == HistoryFormatTerminalTranscript:
 		prefix = "transcript-v1"
 	default:
@@ -1417,7 +1421,7 @@ func ParseHistoryRecipientKeyID(kind, formatName, keyID string) (uuid.UUID, int6
 	}
 	epoch, err := strconv.ParseInt(parts[2], 10, 64)
 	if err != nil || epoch < 1 || fmt.Sprintf("%08d", epoch) != parts[2] ||
-		((prefix == "snapshot-v1" || prefix == "transcript-v1") && len(parts[2]) != 8) {
+		((prefix == "snapshot-v1" || prefix == "terminal-core-snapshot-v2" || prefix == "transcript-v1") && len(parts[2]) != 8) {
 		return uuid.Nil, 0, ErrInvalidHistoryRecipient
 	}
 	return recipient, epoch, nil
@@ -1435,17 +1439,29 @@ func validateHistoryUploadRecipient(item HistoryUploadRecord) error {
 	return nil
 }
 
+func isTerminalTranscriptAnchorFormat(formatName string, formatVersion int) bool {
+	return formatName == HistoryFormatTerminalSnapshot && formatVersion == 1 ||
+		formatName == HistoryFormatTerminalCoreSnapshot && formatVersion == 2
+}
+
 func ValidateHistorySnapshotMetadata(sequence, sizeBytes int64, rows, columns int, formatName string, formatVersion int) error {
-	if sequence < 0 || sizeBytes < 1 || sizeBytes > MaxSnapshotCiphertextBytes || rows < 1 || rows > 256 ||
-		columns < 1 || columns > 512 || formatVersion != 1 {
+	if sequence < 0 || sizeBytes < 1 || rows < 1 || rows > 256 || columns < 1 || columns > 512 {
 		return ErrInvalidHistorySnapshot
 	}
 	switch formatName {
 	case HistoryFormatBoundedEventReplay:
+		if formatVersion != 1 || sizeBytes > MaxSnapshotCiphertextBytes {
+			return ErrInvalidHistorySnapshot
+		}
 		// Legacy bounded replay may describe the initial state at sequence zero.
 		return nil
 	case HistoryFormatTerminalSnapshot:
-		if sequence == 0 {
+		if sequence == 0 || formatVersion != 1 || sizeBytes > MaxSnapshotCiphertextBytes {
+			return ErrInvalidHistorySnapshot
+		}
+		return nil
+	case HistoryFormatTerminalCoreSnapshot:
+		if sequence == 0 || formatVersion != 2 || sizeBytes > MaxTerminalCoreSnapshotCiphertextBytes {
 			return ErrInvalidHistorySnapshot
 		}
 		return nil
@@ -1464,7 +1480,7 @@ func validateHistorySnapshotUpload(item HistoryUploadRecord) error {
 	if publicationMetadataPresent && (item.TranscriptInitialBeforeLineID == nil || item.TranscriptPageCount == nil ||
 		*item.TranscriptInitialBeforeLineID < 1 || *item.TranscriptPageCount < 0 ||
 		*item.TranscriptPageCount > MaxTranscriptPublicationPages ||
-		*item.FormatName != HistoryFormatTerminalSnapshot) {
+		!isTerminalTranscriptAnchorFormat(*item.FormatName, *item.FormatVersion)) {
 		return ErrInvalidHistorySnapshot
 	}
 	return ValidateHistorySnapshotMetadata(*item.SnapshotSequence, item.SizeBytes, *item.Rows, *item.Columns, *item.FormatName, *item.FormatVersion)
@@ -1590,7 +1606,8 @@ func requireHistoryTranscriptAnchor(
 		SELECT true
 		FROM snapshots
 		WHERE session_id=$1 AND recipient_device_id=$2 AND snapshot_seq=$3
-		  AND format_name='TERMLINK_TERMINAL_SNAPSHOT' AND format_version=1
+		  AND ((format_name='TERMLINK_TERMINAL_SNAPSHOT' AND format_version=1)
+		    OR (format_name='TERMLINK_TERMINAL_CORE_SNAPSHOT' AND format_version=2))
 		  AND deleted_at IS NULL AND ($4::bigint IS NULL OR history_revision<=$4)`,
 		sessionID, recipientID, asOfSnapshotSequence, maxRevision).Scan(&found)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1740,7 +1757,8 @@ func (s *Postgres) CommitHistoryUpload(ctx context.Context, userID, actorID, ses
 	if err := s.requireHistoryRecipientAuthority(ctx, tx, userID, actorID, sessionID, upload.RecipientDeviceID, upload.RecipientKeyEpoch); err != nil {
 		return HistoryItem{}, err
 	}
-	if upload.Kind == "SNAPSHOT" && upload.FormatName != nil && *upload.FormatName == HistoryFormatTerminalSnapshot &&
+	if upload.Kind == "SNAPSHOT" && upload.FormatName != nil && upload.FormatVersion != nil &&
+		isTerminalTranscriptAnchorFormat(*upload.FormatName, *upload.FormatVersion) &&
 		upload.SnapshotSequence != nil && *upload.SnapshotSequence > lastOutputSequence {
 		return HistoryItem{}, ErrInvalidHistorySnapshot
 	}
@@ -1791,7 +1809,8 @@ func (s *Postgres) CommitHistoryUpload(ctx context.Context, userID, actorID, ses
 	if err != nil {
 		return HistoryItem{}, err
 	}
-	if upload.Kind == "SNAPSHOT" && upload.FormatName != nil && *upload.FormatName == HistoryFormatTerminalSnapshot {
+	if upload.Kind == "SNAPSHOT" && upload.FormatName != nil && upload.FormatVersion != nil &&
+		isTerminalTranscriptAnchorFormat(*upload.FormatName, *upload.FormatVersion) {
 		if err := ensureTranscriptPublication(ctx, tx, sessionID, upload); err != nil {
 			return HistoryItem{}, err
 		}
@@ -1904,10 +1923,13 @@ func finalizeTranscriptPublication(
 
 	var snapshotRevision int64
 	err = tx.QueryRow(ctx, `
-		SELECT history_revision
+		SELECT max(history_revision)
 		FROM snapshots
 		WHERE session_id=$1 AND recipient_device_id=$2 AND snapshot_seq=$3
-		  AND format_name='TERMLINK_TERMINAL_SNAPSHOT' AND format_version=1 AND deleted_at IS NULL`,
+		  AND ((format_name='TERMLINK_TERMINAL_SNAPSHOT' AND format_version=1)
+		    OR (format_name='TERMLINK_TERMINAL_CORE_SNAPSHOT' AND format_version=2))
+		  AND deleted_at IS NULL
+		HAVING count(*)>0`,
 		sessionID, recipientID, asOfSnapshotSequence,
 	).Scan(&snapshotRevision)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -2416,7 +2438,9 @@ func (s *Postgres) ListHistoryPage(ctx context.Context, userID, deviceID, sessio
 	if request.Limit < 1 || request.Limit > 100 ||
 		(request.Kind != HistoryKindAll && request.Kind != HistoryKindChunk && request.Kind != HistoryKindSnapshot) ||
 		(request.FormatName != "" && (request.Kind != HistoryKindSnapshot ||
-			(request.FormatName != HistoryFormatBoundedEventReplay && request.FormatName != HistoryFormatTerminalSnapshot))) ||
+			(request.FormatName != HistoryFormatBoundedEventReplay &&
+				request.FormatName != HistoryFormatTerminalSnapshot &&
+				request.FormatName != HistoryFormatTerminalCoreSnapshot))) ||
 		(request.AsOfRevision != nil && *request.AsOfRevision < 0) {
 		return HistoryPage{}, ErrInvalidHistoryPage
 	}
@@ -2492,7 +2516,8 @@ func (s *Postgres) ListHistoryPage(ctx context.Context, userID, deviceID, sessio
 			  AND ($6='all' OR $6='snapshot')
 			  AND ($7 OR recipient_device_id=$8)
 			  AND ($9='' OR format_name=$9)
-			  AND (format_name<>'TERMLINK_TERMINAL_SNAPSHOT' OR snapshot_seq<=$11)
+			  AND (format_name NOT IN ('TERMLINK_TERMINAL_SNAPSHOT','TERMLINK_TERMINAL_CORE_SNAPSHOT')
+			    OR snapshot_seq<=$11)
 			  AND ($3::bigint IS NULL OR snapshot_seq<$3 OR
 			       (snapshot_seq=$3 AND (2<$4 OR (2=$4 AND id<$5))))
 		)

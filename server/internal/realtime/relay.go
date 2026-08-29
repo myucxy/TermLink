@@ -53,6 +53,7 @@ var requiredCapabilities = []string{"cumulative_ack", "e2ee_x25519_chacha20poly1
 var optionalCapabilities = []string{
 	"bounded_event_replay_v1",
 	"terminal_snapshot_v1",
+	"terminal_snapshot_v2",
 	"terminal_presentation_metadata_v1",
 	"terminal_typed_input_v1",
 }

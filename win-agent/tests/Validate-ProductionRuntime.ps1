@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
 $env:DOTNET_NOLOGO = '1'
-$terminalSnapshotEnvironmentName = 'TERMLINK_ENABLE_TERMINAL_SNAPSHOT_V1'
+$terminalSnapshotEnvironmentName = 'TERMLINK_ENABLE_TERMINAL_SNAPSHOT_V2'
 $terminalSnapshotEnvironmentBefore = [Environment]::GetEnvironmentVariable(
     $terminalSnapshotEnvironmentName,
     [EnvironmentVariableTarget]::Process)

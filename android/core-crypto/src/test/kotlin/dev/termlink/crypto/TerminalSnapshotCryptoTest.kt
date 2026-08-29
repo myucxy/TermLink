@@ -5,6 +5,7 @@ import dev.termlink.protocol.realtime.v1.SnapshotCompressionV1
 import dev.termlink.protocol.realtime.v1.SnapshotParserStateV1
 import dev.termlink.protocol.realtime.v1.TerminalCellRunV1
 import dev.termlink.protocol.realtime.v1.TerminalCharsetV1
+import dev.termlink.protocol.realtime.v1.TerminalCoreSnapshotCiphertextV2
 import dev.termlink.protocol.realtime.v1.TerminalCursorStyleV1
 import dev.termlink.protocol.realtime.v1.TerminalLifecycleV1
 import dev.termlink.protocol.realtime.v1.TerminalRowV1
@@ -26,6 +27,133 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertNotEquals
 
 class TerminalSnapshotCryptoTest {
+    @Test
+    fun terminalCoreSnapshotV2RoundTripsAuthenticatedCheckpointAndProjection() {
+        val checkpoint = ByteArray(4097) { index -> (index * 31).toByte() }
+        val nonce = ByteArray(12) { index -> (index + 1).toByte() }
+        val sealed = TerminalSnapshotCrypto.sealTerminalCoreSnapshot(
+            pairwiseKey = PAIRWISE_KEY,
+            sessionId = SESSION_ID,
+            pcDeviceId = PC_ID,
+            recipientDeviceId = RECIPIENT_ID,
+            keyEpoch = KEY_EPOCH,
+            snapshotSequence = SNAPSHOT_SEQUENCE,
+            columns = COLUMNS,
+            rows = ROWS,
+            initialTranscriptBeforeLineId = INITIAL_BEFORE_LINE,
+            observedLocalInputEpoch = 9u,
+            checkpoint = checkpoint,
+            nonce = nonce,
+        )
+        val container = TerminalCoreSnapshotCiphertextV2.parseFrom(sealed)
+        assertEquals(TerminalSnapshotCrypto.TERMINAL_CORE_SNAPSHOT_FORMAT_NAME, container.formatName)
+        assertEquals(TerminalSnapshotCrypto.TERMINAL_CORE_SNAPSHOT_FORMAT_VERSION, container.formatVersion)
+        val opened = TerminalSnapshotCrypto.openTerminalCoreSnapshot(
+            pairwiseKey = PAIRWISE_KEY,
+            sealedObject = sealed,
+            expectedSessionId = SESSION_ID,
+            expectedPcDeviceId = PC_ID,
+            expectedRecipientDeviceId = RECIPIENT_ID,
+            expectedKeyEpoch = KEY_EPOCH,
+            expectedKeyId = TerminalSnapshotCrypto.terminalCoreSnapshotKeyId(RECIPIENT_ID, KEY_EPOCH),
+            expectedSnapshotSequence = SNAPSHOT_SEQUENCE,
+            expectedColumns = COLUMNS,
+            expectedRows = ROWS,
+        )
+        try {
+            assertContentEquals(checkpoint, opened.checkpoint)
+            assertEquals(INITIAL_BEFORE_LINE, opened.initialTranscriptBeforeLineId)
+            assertEquals(9uL, opened.observedLocalInputEpoch)
+        } finally {
+            opened.checkpoint.fill(0)
+        }
+
+        val tampered = container.toBuilder()
+            .setObservedLocalInputEpoch(10)
+            .build()
+            .toByteArray()
+        assertFails {
+            TerminalSnapshotCrypto.openTerminalCoreSnapshot(
+                PAIRWISE_KEY,
+                tampered,
+                SESSION_ID,
+                PC_ID,
+                RECIPIENT_ID,
+                KEY_EPOCH,
+                TerminalSnapshotCrypto.terminalCoreSnapshotKeyId(RECIPIENT_ID, KEY_EPOCH),
+                SNAPSHOT_SEQUENCE,
+                COLUMNS,
+                ROWS,
+            )
+        }
+    }
+
+    @Test
+    fun opensAndReproducesSharedCSharpTerminalCoreSnapshotV2Vector() {
+        val snapshotSequence = terminalCoreVectorText("snapshot_sequence").toULong()
+        val columns = terminalCoreVectorText("columns").toInt()
+        val rows = terminalCoreVectorText("rows").toInt()
+        val initialTranscriptBeforeLineId = terminalCoreVectorText("initial_transcript_before_line_id").toULong()
+        val observedLocalInputEpoch = terminalCoreVectorText("observed_local_input_epoch").toULong()
+        val keyId = terminalCoreVectorText("key_id")
+        val checkpoint = terminalCoreVectorBytes("checkpoint")
+        val nonce = terminalCoreVectorBytes("nonce")
+        val sealed = TerminalSnapshotCrypto.sealTerminalCoreSnapshot(
+            pairwiseKey = terminalCoreVectorBytes("pairwise_key"),
+            sessionId = UUID.fromString(terminalCoreVectorText("session_id")),
+            pcDeviceId = UUID.fromString(terminalCoreVectorText("pc_device_id")),
+            recipientDeviceId = UUID.fromString(terminalCoreVectorText("android_device_id")),
+            keyEpoch = terminalCoreVectorText("key_epoch").toLong(),
+            snapshotSequence = snapshotSequence,
+            columns = columns,
+            rows = rows,
+            initialTranscriptBeforeLineId = initialTranscriptBeforeLineId,
+            observedLocalInputEpoch = observedLocalInputEpoch,
+            checkpoint = checkpoint,
+            nonce = nonce,
+        )
+        assertEquals(
+            keyId,
+            TerminalSnapshotCrypto.terminalCoreSnapshotKeyId(RECIPIENT_ID, KEY_EPOCH),
+        )
+        assertContentEquals(
+            terminalCoreVectorBytes("key"),
+            TerminalSnapshotCrypto.deriveTerminalCoreSnapshotKey(
+                PAIRWISE_KEY,
+                SESSION_ID,
+                RECIPIENT_ID,
+                KEY_EPOCH,
+                keyId,
+            ),
+        )
+        assertContentEquals(terminalCoreVectorBytes("sealed_object"), sealed)
+        assertContentEquals(
+            terminalCoreVectorBytes("associated_data"),
+            TerminalSnapshotCrypto.terminalCoreSnapshotAssociatedData(
+                TerminalCoreSnapshotCiphertextV2.parseFrom(sealed),
+            ),
+        )
+        val opened = TerminalSnapshotCrypto.openTerminalCoreSnapshot(
+            PAIRWISE_KEY,
+            terminalCoreVectorBytes("sealed_object"),
+            SESSION_ID,
+            PC_ID,
+            RECIPIENT_ID,
+            KEY_EPOCH,
+            keyId,
+            snapshotSequence,
+            columns,
+            rows,
+        )
+        try {
+            assertContentEquals(checkpoint, opened.checkpoint)
+            assertEquals(initialTranscriptBeforeLineId, opened.initialTranscriptBeforeLineId)
+            assertEquals(observedLocalInputEpoch, opened.observedLocalInputEpoch)
+        } finally {
+            opened.checkpoint.fill(0)
+        }
+    }
+
     @Test
     fun opensAndReproducesSharedCSharpFixedVectors() {
         val snapshotPlaintext = vectorBytes("snapshot_plaintext")
@@ -577,17 +705,26 @@ class TerminalSnapshotCryptoTest {
         get() = TerminalTranscriptPageV1.parseFrom(vectorBytes("transcript_plaintext"))
 
     private val vector by lazy {
-        Json.parseToJsonElement(resolveVectorFile().readText(Charsets.UTF_8)).jsonObject
+        Json.parseToJsonElement(resolveVectorFile("terminal-snapshot-v1.json").readText(Charsets.UTF_8)).jsonObject
+    }
+
+    private val terminalCoreVector by lazy {
+        Json.parseToJsonElement(
+            resolveVectorFile("terminal-core-snapshot-v2.json").readText(Charsets.UTF_8),
+        ).jsonObject
     }
 
     private fun vectorText(name: String): String = vector.getValue(name).jsonPrimitive.content
     private fun vectorBytes(name: String): ByteArray = decodeHex(vectorText(name))
+    private fun terminalCoreVectorText(name: String): String =
+        terminalCoreVector.getValue(name).jsonPrimitive.content
+    private fun terminalCoreVectorBytes(name: String): ByteArray = decodeHex(terminalCoreVectorText(name))
 
-    private fun resolveVectorFile(): File {
+    private fun resolveVectorFile(fileName: String): File {
         val candidates = generateSequence(File(System.getProperty("user.dir") ?: ".").absoluteFile) { it.parentFile }
-            .map { File(it, "protocol/test-vectors/terminal-snapshot-v1.json") }
+            .map { File(it, "protocol/test-vectors/$fileName") }
         return candidates.firstOrNull(File::isFile)
-            ?: error("Unable to locate protocol/test-vectors/terminal-snapshot-v1.json")
+            ?: error("Unable to locate protocol/test-vectors/$fileName")
     }
 
     private fun decodeHex(value: String): ByteArray {

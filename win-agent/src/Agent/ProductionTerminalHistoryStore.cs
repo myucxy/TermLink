@@ -10,6 +10,7 @@ using Google.Protobuf;
 using TermLink.LocalIpc;
 using TermLink.Protocol;
 using TermLink.Protocol.Realtime.V1;
+using TermLink.TerminalCore;
 
 namespace TermLink.Agent
 {
@@ -26,6 +27,7 @@ namespace TermLink.Agent
         public int UploadOrder { get; set; }
         public ulong SnapshotSequence { get; set; }
         public ulong InitialTranscriptBeforeLineId { get; set; }
+        public ulong ObservedLocalInputEpoch { get; set; }
         public int TranscriptPageCount { get; set; }
         public int Columns { get; set; }
         public int Rows { get; set; }
@@ -47,6 +49,7 @@ namespace TermLink.Agent
                 UploadOrder = UploadOrder,
                 SnapshotSequence = SnapshotSequence,
                 InitialTranscriptBeforeLineId = InitialTranscriptBeforeLineId,
+                ObservedLocalInputEpoch = ObservedLocalInputEpoch,
                 TranscriptPageCount = TranscriptPageCount,
                 Columns = Columns,
                 Rows = Rows,
@@ -535,15 +538,15 @@ namespace TermLink.Agent
             {
                 if (artifact == null || string.IsNullOrWhiteSpace(artifact.ArtifactId) || !ids.Add(artifact.ArtifactId) ||
                     artifact.SnapshotSequence != value.SnapshotSequence || artifact.UploadOrder <= previousOrder ||
-                    artifact.Plaintext == null || artifact.Plaintext.Length == 0 || string.IsNullOrWhiteSpace(artifact.FormatName) ||
-                    artifact.FormatVersion != 1)
+                    artifact.Plaintext == null || artifact.Plaintext.Length == 0 || string.IsNullOrWhiteSpace(artifact.FormatName))
                     throw new InvalidDataException("Terminal history outbox artifact is invalid.");
                 if (artifact.Kind == ProductionTerminalHistoryArtifactKind.Snapshot)
                 {
                     snapshotCount++;
                     snapshotArtifact = artifact;
                     if (artifact.InitialTranscriptBeforeLineId == 0 || artifact.TranscriptPageCount < 0 ||
-                        artifact.TranscriptPageCount > MaximumTranscriptPublicationPageCount)
+                        artifact.TranscriptPageCount > MaximumTranscriptPublicationPageCount ||
+                        !IsSupportedSnapshotFormat(artifact.FormatName, artifact.FormatVersion))
                         throw new InvalidDataException("Terminal snapshot publication metadata is invalid.");
                 }
                 else if (artifact.Kind == ProductionTerminalHistoryArtifactKind.Transcript)
@@ -551,7 +554,10 @@ namespace TermLink.Agent
                     transcriptCount++;
                     if (artifact.FirstLineId == 0 || artifact.LastLineId < artifact.FirstLineId ||
                         artifact.ExclusiveBeforeLineId <= artifact.LastLineId ||
-                        artifact.InitialTranscriptBeforeLineId != 0 || artifact.TranscriptPageCount != 0)
+                        artifact.InitialTranscriptBeforeLineId != 0 || artifact.ObservedLocalInputEpoch != 0 ||
+                        artifact.TranscriptPageCount != 0 ||
+                        artifact.FormatName != SnapshotCrypto.TranscriptFormatName ||
+                        artifact.FormatVersion != SnapshotCrypto.FormatVersion)
                         throw new InvalidDataException("Terminal transcript outbox cursor is invalid.");
                 }
                 else
@@ -562,20 +568,7 @@ namespace TermLink.Agent
                 throw new InvalidDataException("Terminal history outbox must start with one snapshot.");
             if (snapshotArtifact.TranscriptPageCount != transcriptCount)
                 throw new InvalidDataException("Terminal snapshot transcript page count is inconsistent with its outbox.");
-            TerminalSnapshotV1 snapshot;
-            try { snapshot = TerminalSnapshotV1.Parser.ParseFrom(snapshotArtifact.Plaintext); }
-            catch (InvalidProtocolBufferException error)
-            {
-                throw new InvalidDataException("Terminal snapshot outbox plaintext is invalid protobuf.", error);
-            }
-            SnapshotCrypto.ValidateSnapshotForProducer(snapshot);
-            if (snapshot.SnapshotSeq != value.SnapshotSequence ||
-                checked((int)snapshot.Columns) != snapshotArtifact.Columns ||
-                checked((int)snapshot.Rows) != snapshotArtifact.Rows ||
-                SnapshotCrypto.InitialTranscriptBeforeLineId(snapshot) != snapshotArtifact.InitialTranscriptBeforeLineId)
-            {
-                throw new InvalidDataException("Terminal snapshot publication metadata does not match its plaintext.");
-            }
+            ValidateSnapshotPlaintext(value, snapshotArtifact);
             foreach (var delivery in value.Deliveries)
             {
                 if (delivery.Value == null || delivery.Key != DeliveryKey(delivery.Value.RecipientDeviceId, delivery.Value.KeyEpoch) ||
@@ -583,6 +576,65 @@ namespace TermLink.Agent
                     delivery.Value.SealedObjects.Keys.Any(id => !ids.Contains(id)) ||
                     delivery.Value.UploadedArtifactIds.Any(id => !delivery.Value.SealedObjects.ContainsKey(id)))
                     throw new InvalidDataException("Terminal history delivery state is invalid.");
+            }
+        }
+
+        private static bool IsSupportedSnapshotFormat(string formatName, int formatVersion) =>
+            formatName == SnapshotCrypto.SnapshotFormatName &&
+                formatVersion == SnapshotCrypto.FormatVersion ||
+            formatName == SnapshotCrypto.TerminalCoreSnapshotFormatName &&
+                formatVersion == SnapshotCrypto.TerminalCoreSnapshotFormatVersion;
+
+        private static void ValidateSnapshotPlaintext(
+            ProductionTerminalHistoryOutbox outbox,
+            ProductionTerminalHistoryArtifact artifact)
+        {
+            if (artifact.FormatName == SnapshotCrypto.TerminalCoreSnapshotFormatName)
+            {
+                if (artifact.Plaintext.Length > SnapshotCrypto.MaxTerminalCoreSnapshotPlaintextBytes ||
+                    artifact.ObservedLocalInputEpoch > long.MaxValue)
+                    throw new InvalidDataException("Terminal-core snapshot outbox plaintext is out of bounds.");
+                try
+                {
+                    using var terminal = NativeTerminalCoreV2.ImportSnapshot(artifact.Plaintext);
+                    var presentation = terminal.GetPresentationInfo();
+                    if (presentation.NextSourceSequence != checked(outbox.SnapshotSequence + 1))
+                        throw new InvalidDataException(
+                            "Terminal-core snapshot source sequence does not match its outbox.");
+                    using var checkpoint = terminal.CaptureCheckpoint();
+                    var frameBytes = checkpoint.ExportRenderFrameV3();
+                    try
+                    {
+                        var frame = NativeTerminalRenderFrameV3Decoder.Decode(frameBytes);
+                        if (frame.Columns != artifact.Columns || frame.Rows != artifact.Rows)
+                            throw new InvalidDataException(
+                                "Terminal-core snapshot dimensions do not match its outbox.");
+                    }
+                    finally { CryptographicOperations.ZeroMemory(frameBytes); }
+                }
+                catch (InvalidDataException) { throw; }
+                catch (Exception error)
+                {
+                    throw new InvalidDataException(
+                        "Terminal-core snapshot outbox plaintext cannot be imported.",
+                        error);
+                }
+                return;
+            }
+
+            TerminalSnapshotV1 snapshot;
+            try { snapshot = TerminalSnapshotV1.Parser.ParseFrom(artifact.Plaintext); }
+            catch (InvalidProtocolBufferException error)
+            {
+                throw new InvalidDataException("Terminal snapshot outbox plaintext is invalid protobuf.", error);
+            }
+            SnapshotCrypto.ValidateSnapshotForProducer(snapshot);
+            if (snapshot.SnapshotSeq != outbox.SnapshotSequence ||
+                checked((int)snapshot.Columns) != artifact.Columns ||
+                checked((int)snapshot.Rows) != artifact.Rows ||
+                SnapshotCrypto.InitialTranscriptBeforeLineId(snapshot) != artifact.InitialTranscriptBeforeLineId)
+            {
+                throw new InvalidDataException("Terminal snapshot publication metadata does not match its plaintext.");
             }
         }
 
@@ -598,6 +650,7 @@ namespace TermLink.Agent
                 if (a.ArtifactId != b.ArtifactId || a.Kind != b.Kind || a.UploadOrder != b.UploadOrder ||
                     a.SnapshotSequence != b.SnapshotSequence ||
                     a.InitialTranscriptBeforeLineId != b.InitialTranscriptBeforeLineId ||
+                    a.ObservedLocalInputEpoch != b.ObservedLocalInputEpoch ||
                     a.TranscriptPageCount != b.TranscriptPageCount ||
                     a.Columns != b.Columns || a.Rows != b.Rows ||
                     a.FirstLineId != b.FirstLineId || a.LastLineId != b.LastLineId ||

@@ -52,7 +52,7 @@ using (var enabledHello = JsonDocument.Parse(ProductionAgentRuntime.BuildHelloPa
         .EnumerateArray().Select(item => item.GetString()).ToArray();
     if (!capabilities.Contains(TerminalCapabilities.PresentationMetadataV1) ||
         !capabilities.Contains(TerminalCapabilities.TypedInputV1) ||
-        !capabilities.Contains("terminal_snapshot_v1"))
+        !capabilities.Contains("terminal_snapshot_v2"))
         throw new InvalidOperationException("enabled capability set is incomplete");
 }
 using (var rollbackHello = JsonDocument.Parse(ProductionAgentRuntime.BuildHelloPayloadWithFeatures(false, false)))
@@ -60,7 +60,7 @@ using (var rollbackHello = JsonDocument.Parse(ProductionAgentRuntime.BuildHelloP
     var capabilities = rollbackHello.RootElement.GetProperty("capabilities")
         .EnumerateArray().Select(item => item.GetString()).ToArray();
     if (capabilities.Contains(TerminalCapabilities.TypedInputV1) ||
-        capabilities.Contains("terminal_snapshot_v1"))
+        capabilities.Contains("terminal_snapshot_v2"))
         throw new InvalidOperationException("rollback capability set still advertises disabled features");
 }
 

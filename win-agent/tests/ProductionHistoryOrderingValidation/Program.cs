@@ -171,7 +171,7 @@ internal static class Program
         // a clean developer shell cannot silently take the generic history
         // path and complete before the Snapshot barrier is reached.
         Environment.SetEnvironmentVariable(
-            "TERMLINK_ENABLE_TERMINAL_SNAPSHOT_V1",
+            "TERMLINK_ENABLE_TERMINAL_SNAPSHOT_V2",
             "1",
             EnvironmentVariableTarget.Process);
         var root = Path.Combine(Path.GetTempPath(), "termlink-history-ordering-" + Guid.NewGuid().ToString("N"));
@@ -332,6 +332,40 @@ internal static class Program
             events.Add(buildEvent.Invoke(null, new[] { resize }));
             events.Add(buildEvent.Invoke(null, new[] { output }));
             var uploadHistory = Method(runtimeType, "UploadHistoryAsync");
+            var pendingOnlySession = Guid.Parse("40000000-0000-4000-8000-000000000006");
+            var pendingOnlyResize = frameConstructor.Invoke(new[]
+            {
+                Enum.Parse(localFrameKindType, "Resize"),
+                pendingOnlySession,
+                1UL,
+                (object)resizePayload
+            });
+            append.Invoke(producer, new[] { pendingOnlyResize });
+            var pendingOnlyProduction = Method(
+                producerType,
+                "ProcessSession",
+                publicOnly: true,
+                parameterCount: 1).Invoke(producer, new object[] { pendingOnlySession });
+            var pendingOnlyEvents = (IList)Activator.CreateInstance(
+                typeof(List<>).MakeGenericType(buildEvent.ReturnType));
+            pendingOnlyEvents.Add(buildEvent.Invoke(null, new[] { pendingOnlyResize }));
+            var operationCountBeforePending = handler.Operations.Count;
+            var pendingOnlyDurable = await InvokeBooleanTask(
+                uploadHistory,
+                runtime,
+                new object[]
+                {
+                    pendingOnlySession,
+                    pendingOnlyEvents,
+                    pendingOnlyProduction,
+                    CancellationToken.None
+                });
+            Require(!pendingOnlyDurable &&
+                !handler.Operations.Skip(operationCountBeforePending).Any(value =>
+                    value == "CHUNK" || value == "SNAPSHOT" || value == "TRANSCRIPT"),
+                "A pending first Snapshot allowed generic CHUNK publication: " +
+                string.Join(", ", handler.Operations));
+
             var validationDeadline = Stopwatch.StartNew();
             var firstAttempt = InvokeBooleanTask(
                 uploadHistory,

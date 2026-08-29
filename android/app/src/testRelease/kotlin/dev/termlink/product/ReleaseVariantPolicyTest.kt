@@ -10,7 +10,7 @@ class ReleaseVariantPolicyTest {
     fun releaseUsesThePublicSecureSnapshotPolicyAndExpectedVersion() {
         assertTrue(BuildConfig.TERMLINK_SERVER_URL == "https://termlink.kget.cc:8910")
         assertFalse(BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST)
-        assertFalse(BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME)
+        assertTrue(BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME)
         // Release orchestration supplies these values per publication. The
         // policy test must validate their shape instead of pinning the prior
         // AppShip release and breaking every legitimate version increment.

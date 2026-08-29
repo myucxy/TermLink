@@ -1632,7 +1632,7 @@ func (a *API) createHistoryUpload(w http.ResponseWriter, r *http.Request) {
 			input.AsOfSnapshotSequence != nil || input.FirstLineID != nil || input.LastLineID != nil ||
 			validateHistorySnapshotMetadata(*input.SnapshotSequence, input.SizeBytes, *input.Rows, *input.Columns,
 				*input.FormatName, *input.FormatVersion) != nil ||
-			validateSnapshotTranscriptPublicationMetadata(*input.FormatName, transcriptInitialBeforeLineID, input.TranscriptPageCount) != nil {
+			validateSnapshotTranscriptPublicationMetadata(*input.FormatName, *input.FormatVersion, transcriptInitialBeforeLineID, input.TranscriptPageCount) != nil {
 			writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_SNAPSHOT", errors.New("unsupported snapshot metadata"))
 			return
 		}
@@ -1705,11 +1705,13 @@ func validateHistoryTranscriptMetadata(asOfSnapshotSequence, firstLineID, lastLi
 		sizeBytes, formatName, formatVersion)
 }
 
-func validateSnapshotTranscriptPublicationMetadata(formatName string, initialBeforeLineID *int64, pageCount *int) error {
+func validateSnapshotTranscriptPublicationMetadata(formatName string, formatVersion int, initialBeforeLineID *int64, pageCount *int) error {
 	if initialBeforeLineID == nil && pageCount == nil {
 		return nil
 	}
-	if initialBeforeLineID == nil || pageCount == nil || formatName != terminalSnapshotFormat ||
+	validFormat := formatName == terminalSnapshotFormat && formatVersion == 1 ||
+		formatName == store.HistoryFormatTerminalCoreSnapshot && formatVersion == 2
+	if initialBeforeLineID == nil || pageCount == nil || !validFormat ||
 		*initialBeforeLineID < 1 || *pageCount < 0 || *pageCount > maxTranscriptPublicationPageCount {
 		return store.ErrInvalidHistorySnapshot
 	}
@@ -1750,7 +1752,7 @@ func (a *API) commitHistoryUpload(w http.ResponseWriter, r *http.Request) {
 		upload.AsOfSnapshotSequence != nil || upload.FirstLineID != nil || upload.LastLineID != nil ||
 		validateHistorySnapshotMetadata(uint64(*upload.SnapshotSequence), upload.SizeBytes, *upload.Rows, *upload.Columns,
 			*upload.FormatName, *upload.FormatVersion) != nil ||
-		validateSnapshotTranscriptPublicationMetadata(*upload.FormatName, upload.TranscriptInitialBeforeLineID, upload.TranscriptPageCount) != nil) {
+		validateSnapshotTranscriptPublicationMetadata(*upload.FormatName, *upload.FormatVersion, upload.TranscriptInitialBeforeLineID, upload.TranscriptPageCount) != nil) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_SNAPSHOT", store.ErrInvalidHistorySnapshot)
 		return
 	}
@@ -2077,7 +2079,9 @@ func (a *API) parseHistoryPageRequest(r *http.Request, userID, deviceID, session
 		return store.HistoryPageRequest{}, false, formatErr
 	} else if present {
 		if kind != store.HistoryKindSnapshot ||
-			raw != store.HistoryFormatBoundedEventReplay && raw != store.HistoryFormatTerminalSnapshot {
+			raw != store.HistoryFormatBoundedEventReplay &&
+				raw != store.HistoryFormatTerminalSnapshot &&
+				raw != store.HistoryFormatTerminalCoreSnapshot {
 			return store.HistoryPageRequest{}, false, &historyPageQueryError{Code: "INVALID_HISTORY_FORMAT"}
 		}
 		formatName = raw
@@ -2214,7 +2218,9 @@ func (a *API) decodeHistoryCursor(token string, userID, deviceID, sessionID uuid
 	validKind := payload.Kind == store.HistoryKindAll || payload.Kind == store.HistoryKindChunk || payload.Kind == store.HistoryKindSnapshot
 	validBeforeKind := payload.BeforeKind == store.HistoryKindChunk || payload.BeforeKind == store.HistoryKindSnapshot
 	validFormat := payload.FormatName == "" || payload.Kind == store.HistoryKindSnapshot &&
-		(payload.FormatName == store.HistoryFormatBoundedEventReplay || payload.FormatName == store.HistoryFormatTerminalSnapshot)
+		(payload.FormatName == store.HistoryFormatBoundedEventReplay ||
+			payload.FormatName == store.HistoryFormatTerminalSnapshot ||
+			payload.FormatName == store.HistoryFormatTerminalCoreSnapshot)
 	if payload.Version != 1 || payload.Purpose != "history-cursor" || payload.UserID != userID.String() || payload.DeviceID != deviceID.String() ||
 		payload.SessionID != sessionID.String() || payload.Revision < 0 || payload.Sequence < 0 || !validKind ||
 		!validBeforeKind || !validFormat || (payload.Kind != store.HistoryKindAll && payload.Kind != payload.BeforeKind) {

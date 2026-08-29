@@ -11,6 +11,7 @@ import dev.termlink.product.TailFirstE2EProductBridge
 import java.io.File
 import java.io.FileOutputStream
 import java.net.URI
+import java.security.MessageDigest
 import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -35,6 +36,23 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.putJsonObject
 import kotlinx.serialization.json.put
+
+internal fun tailFirstLiveMarker(runId: String): String {
+    val digest = MessageDigest.getInstance("SHA-256").digest(runId.encodeToByteArray())
+    return buildString(LIVE_MARKER_PREFIX.length + LIVE_MARKER_DIGEST_HEX_LENGTH) {
+        append(LIVE_MARKER_PREFIX)
+        repeat(LIVE_MARKER_DIGEST_BYTES) { index ->
+            val value = digest[index].toInt() and 0xff
+            append(LOWERCASE_HEX[value ushr 4])
+            append(LOWERCASE_HEX[value and 0x0f])
+        }
+    }
+}
+
+private const val LIVE_MARKER_PREFIX = "TLTF_LIVE_"
+private const val LIVE_MARKER_DIGEST_BYTES = 8
+private const val LIVE_MARKER_DIGEST_HEX_LENGTH = LIVE_MARKER_DIGEST_BYTES * 2
+private const val LOWERCASE_HEX = "0123456789abcdef"
 
 /** Debug-only entry point used by the real tail-first acceptance runner. */
 class TailFirstE2EReceiver : BroadcastReceiver() {
@@ -131,7 +149,7 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
                 arguments[EXTRA_FIRST_MARKER] == "${markerStem}_0001" &&
                     arguments[EXTRA_LAST_MARKER] == "${markerStem}_1000"
             OPERATION_INSPECT, OPERATION_CLOSE_HISTORY ->
-                arguments[EXTRA_LIVE_MARKER] == "${markerStem}_LIVE_AFTER_OVERLAY"
+                arguments[EXTRA_LIVE_MARKER] == tailFirstLiveMarker(runId)
             else -> false
         }
     }

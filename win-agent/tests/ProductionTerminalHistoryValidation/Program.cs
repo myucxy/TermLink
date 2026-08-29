@@ -16,6 +16,7 @@ using TermLink.Agent;
 using TermLink.LocalIpc;
 using TermLink.Protocol;
 using TermLink.Protocol.Realtime.V1;
+using TermLink.TerminalCore;
 
 namespace TermLink.ProductionTerminalHistory.Validation
 {
@@ -148,6 +149,8 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 ValidateTerminalCoreShadow(root, pcDeviceId);
                 ValidateTerminalCoreShadowDispatcherBoundaries();
                 ValidateTerminalHistoryLifecycleGate(root, pcDeviceId);
+                ValidateNoOutputSnapshotEligibility(root, pcDeviceId);
+                ValidateTerminalCoreSnapshotV2(root, pcDeviceId);
                 ValidateTerminalCoreShadowGoldenStreams(root, pcDeviceId);
                 var store = new ProductionTerminalHistoryStore(root, pcDeviceId);
                 var producer = new ProductionTerminalHistoryProducer(store, pcDeviceId);
@@ -258,12 +261,12 @@ namespace TermLink.ProductionTerminalHistory.Validation
             CryptographicOperations.ZeroMemory(retainedFour);
             CryptographicOperations.ZeroMemory(replayedFour);
 
-            Require(!(bool)parseFlag.Invoke(null, new object[] { null }) &&
+            Require((bool)parseFlag.Invoke(null, new object[] { null }) &&
                 (bool)parseFlag.Invoke(null, new object[] { "1" }) &&
                 (bool)parseFlag.Invoke(null, new object[] { "true" }) &&
                 !(bool)parseFlag.Invoke(null, new object[] { "0" }) &&
-                !(bool)parseFlag.Invoke(null, new object[] { " 1" }) &&
-                !(bool)parseFlag.Invoke(null, new object[] { "invalid" }),
+                !(bool)parseFlag.Invoke(null, new object[] { "false" }) &&
+                (bool)parseFlag.Invoke(null, new object[] { "invalid" }),
                 "Terminal snapshot runtime must fail closed unless it receives an exact explicit opt-in.");
             Require((bool)parseTerminalCoreShadow.Invoke(null, new object[] { null }) &&
                 (bool)parseTerminalCoreShadow.Invoke(null, new object[] { "1" }) &&
@@ -281,9 +284,9 @@ namespace TermLink.ProductionTerminalHistory.Validation
                     .EnumerateArray().Select(value => value.GetString()).ToList();
                 var enabledCapabilities = enabledHello.RootElement.GetProperty("capabilities")
                     .EnumerateArray().Select(value => value.GetString()).ToList();
-                Require(!disabledCapabilities.Contains("terminal_snapshot_v1") &&
-                    enabledCapabilities.Count(value => value == "terminal_snapshot_v1") == 1,
-                    "HELLO terminal_snapshot_v1 capability is not controlled by the runtime flag.");
+                Require(!disabledCapabilities.Contains("terminal_snapshot_v2") &&
+                    enabledCapabilities.Count(value => value == "terminal_snapshot_v2") == 1,
+                    "HELLO terminal_snapshot_v2 capability is not controlled by the runtime flag.");
             }
 
             var disabledResult = process.Invoke(null, new object[] { false, null, Guid.NewGuid() });
@@ -1061,6 +1064,132 @@ namespace TermLink.ProductionTerminalHistory.Validation
             {
                 if (stateLockHeld) Monitor.Exit(stateSync);
                 producer.Dispose();
+            }
+        }
+
+        private static void ValidateNoOutputSnapshotEligibility(string root, Guid pcDeviceId)
+        {
+            var producer = new ProductionTerminalHistoryProducer(
+                new ProductionTerminalHistoryStore(
+                    Path.Combine(root, "no-output-snapshot-eligibility"),
+                    pcDeviceId),
+                pcDeviceId);
+            var activeSession = Guid.Parse("aaaaaaaa-0000-4000-8000-00000000007e");
+            var pending = producer.ProcessSession(
+                activeSession,
+                new[]
+                {
+                    new LocalFrame(
+                        LocalFrameType.Resize,
+                        activeSession,
+                        1,
+                        LocalPayloadCodec.Resize(80, 24))
+                });
+            Require(!pending.SnapshotEligible && !pending.PermanentlyIneligible &&
+                pending.IneligibilityCode == "NO_OUTPUT_FRAME",
+                "A live terminal without its first Output was not kept snapshot-pending.");
+
+            var terminalSession = Guid.Parse("aaaaaaaa-0000-4000-8000-00000000007f");
+            var unsupported = producer.ProcessSession(
+                terminalSession,
+                new[]
+                {
+                    new LocalFrame(
+                        LocalFrameType.Resize,
+                        terminalSession,
+                        1,
+                        LocalPayloadCodec.Resize(80, 24)),
+                    new LocalFrame(
+                        LocalFrameType.Lifecycle,
+                        terminalSession,
+                        2,
+                        LocalPayloadCodec.Lifecycle(LocalLifecycleState.Ended, 0))
+                });
+            Require(!unsupported.SnapshotEligible && unsupported.PermanentlyIneligible &&
+                unsupported.IneligibilityCode == "NO_OUTPUT_FRAME",
+                "A terminal that ended without Output did not permit permanent CHUNK fallback.");
+            producer.Dispose();
+        }
+
+        private static void ValidateTerminalCoreSnapshotV2(string root, Guid pcDeviceId)
+        {
+            var store = new ProductionTerminalHistoryStore(
+                Path.Combine(root, "terminal-core-snapshot-v2"),
+                pcDeviceId);
+            using var producer = new ProductionTerminalHistoryProducer(
+                store,
+                pcDeviceId,
+                terminalCoreShadowEnabled: false,
+                terminalCoreSnapshotAuthorityEnabled: true,
+                terminalCoreShadowObserver: null);
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000080");
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Resize,
+                sessionId,
+                1,
+                LocalPayloadCodec.Resize(80, 24)));
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.LocalInputObserved,
+                sessionId,
+                2,
+                LocalPayloadCodec.LocalInputEpoch(7)));
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                sessionId,
+                3,
+                Encoding.UTF8.GetBytes("native-v2-anchor\r\n")));
+
+            var result = producer.ProcessSession(sessionId);
+            Require(result.SnapshotEligible && result.LastSequence == 3,
+                "terminal-core Snapshot V2 production was not eligible.");
+            var outbox = producer.LoadOutbox(sessionId);
+            var artifact = outbox.Artifacts.Single(value =>
+                value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot);
+            Require(
+                artifact.FormatName == SnapshotCrypto.TerminalCoreSnapshotFormatName &&
+                artifact.FormatVersion == SnapshotCrypto.TerminalCoreSnapshotFormatVersion &&
+                artifact.ObservedLocalInputEpoch == 7,
+                "terminal-core Snapshot V2 outbox metadata is invalid.");
+
+            var recipient = new ProductionHistoryRecipient
+            {
+                DeviceId = Guid.Parse("bbbbbbbb-cccc-4ddd-8eee-000000000080"),
+                PairwiseKey = Enumerable.Range(1, 32).Select(value => (byte)value).ToArray(),
+                KeyEpoch = 7
+            };
+            var prepared = producer.PrepareNextUpload(sessionId, recipient);
+            try
+            {
+                Require(prepared != null && prepared.Artifact.ArtifactId == artifact.ArtifactId,
+                    "terminal-core Snapshot V2 was not the first prepared artifact.");
+                var opened = SnapshotCrypto.OpenTerminalCoreSnapshot(
+                    recipient.PairwiseKey,
+                    prepared.SealedObject,
+                    sessionId,
+                    pcDeviceId,
+                    recipient.DeviceId,
+                    recipient.KeyEpoch,
+                    SnapshotCrypto.TerminalCoreSnapshotKeyId(recipient.DeviceId, recipient.KeyEpoch),
+                    artifact.SnapshotSequence,
+                    checked((uint)artifact.Columns),
+                    checked((uint)artifact.Rows),
+                    artifact.InitialTranscriptBeforeLineId,
+                    out var observedInputEpoch);
+                try
+                {
+                    using var terminal = NativeTerminalCoreV2.ImportSnapshot(opened);
+                    Require(
+                        terminal.GetPresentationInfo().NextSourceSequence == 4 &&
+                        observedInputEpoch == 7,
+                        "terminal-core Snapshot V2 did not round-trip its authority cursor.");
+                }
+                finally { CryptographicOperations.ZeroMemory(opened); }
+            }
+            finally
+            {
+                if (prepared?.SealedObject != null)
+                    CryptographicOperations.ZeroMemory(prepared.SealedObject);
+                CryptographicOperations.ZeroMemory(recipient.PairwiseKey);
             }
         }
 

@@ -21,19 +21,24 @@ func TestValidateHistorySnapshotMetadata(t *testing.T) {
 		sizeBytes     int64
 		rows, columns int
 		format        string
+		version       int
 		wantError     bool
 	}{
-		{name: "portable", sequence: 1, sizeBytes: MaxSnapshotCiphertextBytes, rows: 256, columns: 512, format: HistoryFormatTerminalSnapshot},
-		{name: "legacy-zero", sequence: 0, sizeBytes: 1, rows: 1, columns: 1, format: HistoryFormatBoundedEventReplay},
-		{name: "portable-zero", sequence: 0, sizeBytes: 1, rows: 24, columns: 80, format: HistoryFormatTerminalSnapshot, wantError: true},
-		{name: "negative-sequence", sequence: -1, sizeBytes: 1, rows: 24, columns: 80, format: HistoryFormatBoundedEventReplay, wantError: true},
-		{name: "too-large", sequence: 1, sizeBytes: MaxSnapshotCiphertextBytes + 1, rows: 24, columns: 80, format: HistoryFormatTerminalSnapshot, wantError: true},
-		{name: "too-tall", sequence: 1, sizeBytes: 1, rows: 257, columns: 80, format: HistoryFormatTerminalSnapshot, wantError: true},
-		{name: "too-wide", sequence: 1, sizeBytes: 1, rows: 24, columns: 513, format: HistoryFormatTerminalSnapshot, wantError: true},
+		{name: "portable", sequence: 1, sizeBytes: MaxSnapshotCiphertextBytes, rows: 256, columns: 512, format: HistoryFormatTerminalSnapshot, version: 1},
+		{name: "terminal-core", sequence: 5200, sizeBytes: MaxTerminalCoreSnapshotCiphertextBytes, rows: 256, columns: 512, format: HistoryFormatTerminalCoreSnapshot, version: 2},
+		{name: "legacy-zero", sequence: 0, sizeBytes: 1, rows: 1, columns: 1, format: HistoryFormatBoundedEventReplay, version: 1},
+		{name: "terminal-core-zero", sequence: 0, sizeBytes: 1, rows: 24, columns: 80, format: HistoryFormatTerminalCoreSnapshot, version: 2, wantError: true},
+		{name: "terminal-core-too-large", sequence: 1, sizeBytes: MaxTerminalCoreSnapshotCiphertextBytes + 1, rows: 24, columns: 80, format: HistoryFormatTerminalCoreSnapshot, version: 2, wantError: true},
+		{name: "terminal-core-wrong-version", sequence: 1, sizeBytes: 1, rows: 24, columns: 80, format: HistoryFormatTerminalCoreSnapshot, version: 1, wantError: true},
+		{name: "portable-zero", sequence: 0, sizeBytes: 1, rows: 24, columns: 80, format: HistoryFormatTerminalSnapshot, version: 1, wantError: true},
+		{name: "negative-sequence", sequence: -1, sizeBytes: 1, rows: 24, columns: 80, format: HistoryFormatBoundedEventReplay, version: 1, wantError: true},
+		{name: "too-large", sequence: 1, sizeBytes: MaxSnapshotCiphertextBytes + 1, rows: 24, columns: 80, format: HistoryFormatTerminalSnapshot, version: 1, wantError: true},
+		{name: "too-tall", sequence: 1, sizeBytes: 1, rows: 257, columns: 80, format: HistoryFormatTerminalSnapshot, version: 1, wantError: true},
+		{name: "too-wide", sequence: 1, sizeBytes: 1, rows: 24, columns: 513, format: HistoryFormatTerminalSnapshot, version: 1, wantError: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := ValidateHistorySnapshotMetadata(test.sequence, test.sizeBytes, test.rows, test.columns, test.format, 1)
+			err := ValidateHistorySnapshotMetadata(test.sequence, test.sizeBytes, test.rows, test.columns, test.format, test.version)
 			if (err != nil) != test.wantError {
 				t.Fatalf("validation error=%v, wantError=%t", err, test.wantError)
 			}
@@ -50,6 +55,7 @@ func TestParseHistoryRecipientKeyIDIsCanonicalAndFormatBound(t *testing.T) {
 		{kind: "CHUNK", key: "history-v1:" + recipientN + ":00000007"},
 		{kind: "SNAPSHOT", format: HistoryFormatBoundedEventReplay, key: "history-v1:" + recipientN + ":00000007"},
 		{kind: "SNAPSHOT", format: HistoryFormatTerminalSnapshot, key: "snapshot-v1:" + recipientN + ":00000007"},
+		{kind: "SNAPSHOT", format: HistoryFormatTerminalCoreSnapshot, key: "terminal-core-snapshot-v2:" + recipientN + ":00000007"},
 	} {
 		gotRecipient, gotEpoch, err := ParseHistoryRecipientKeyID(test.kind, test.format, test.key)
 		if err != nil || gotRecipient != recipient || gotEpoch != 7 {

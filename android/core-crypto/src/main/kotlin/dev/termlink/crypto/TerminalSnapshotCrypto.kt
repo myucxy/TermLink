@@ -7,6 +7,7 @@ import dev.termlink.protocol.realtime.v1.SnapshotParserStateV1
 import dev.termlink.protocol.realtime.v1.TerminalCharsetStateV1
 import dev.termlink.protocol.realtime.v1.TerminalCharsetV1
 import dev.termlink.protocol.realtime.v1.TerminalColorRefV1
+import dev.termlink.protocol.realtime.v1.TerminalCoreSnapshotCiphertextV2
 import dev.termlink.protocol.realtime.v1.TerminalCursorStateV1
 import dev.termlink.protocol.realtime.v1.TerminalCursorStyleV1
 import dev.termlink.protocol.realtime.v1.TerminalHyperlinkV1
@@ -45,6 +46,12 @@ object TerminalSnapshotCrypto {
     const val MAX_TRANSCRIPT_PLAINTEXT_BYTES: Int = 2 * 1024 * 1024
     const val SNAPSHOT_FORMAT_NAME: String = "TERMLINK_TERMINAL_SNAPSHOT"
     const val TRANSCRIPT_FORMAT_NAME: String = "TERMLINK_TERMINAL_TRANSCRIPT"
+    const val TERMINAL_CORE_SNAPSHOT_CONTAINER_VERSION: Int = 2
+    const val TERMINAL_CORE_SNAPSHOT_FORMAT_VERSION: Int = 2
+    const val MAX_TERMINAL_CORE_SNAPSHOT_OBJECT_BYTES: Int = 64 * 1024 * 1024
+    const val MAX_TERMINAL_CORE_SNAPSHOT_PLAINTEXT_BYTES: Int =
+        MAX_TERMINAL_CORE_SNAPSHOT_OBJECT_BYTES - 4 * 1024
+    const val TERMINAL_CORE_SNAPSHOT_FORMAT_NAME: String = "TERMLINK_TERMINAL_CORE_SNAPSHOT"
 
     private const val MAX_COLUMNS = 512
     private const val MAX_ROWS = 256
@@ -64,12 +71,25 @@ object TerminalSnapshotCrypto {
     private val transcriptKeyPrefix = "TERMLINK-TERMINAL-TRANSCRIPT-KEY-V1\u0000".encodeToByteArray()
     private val snapshotAadPrefix = "TERMLINK-TERMINAL-SNAPSHOT-OBJECT-V1\u0000".encodeToByteArray()
     private val transcriptAadPrefix = "TERMLINK-TERMINAL-TRANSCRIPT-OBJECT-V1\u0000".encodeToByteArray()
+    private val terminalCoreSnapshotKeyPrefix =
+        "TERMLINK-TERMINAL-CORE-SNAPSHOT-KEY-V2\u0000".encodeToByteArray()
+    private val terminalCoreSnapshotAadPrefix =
+        "TERMLINK-TERMINAL-CORE-SNAPSHOT-OBJECT-V2\u0000".encodeToByteArray()
+
+    data class OpenedTerminalCoreSnapshot(
+        val checkpoint: ByteArray,
+        val initialTranscriptBeforeLineId: ULong,
+        val observedLocalInputEpoch: ULong,
+    )
 
     fun snapshotKeyId(recipientDeviceId: UUID, keyEpoch: Long): String =
         keyId("snapshot-v1:", recipientDeviceId, keyEpoch)
 
     fun transcriptKeyId(recipientDeviceId: UUID, keyEpoch: Long): String =
         keyId("transcript-v1:", recipientDeviceId, keyEpoch)
+
+    fun terminalCoreSnapshotKeyId(recipientDeviceId: UUID, keyEpoch: Long): String =
+        keyId("terminal-core-snapshot-v2:", recipientDeviceId, keyEpoch)
 
     fun sealSnapshot(
         pairwiseKey: ByteArray,
@@ -174,6 +194,163 @@ object TerminalSnapshotCrypto {
                     snapshot.columns == container.columns && snapshot.rows == container.rows,
             ) { "Snapshot plaintext does not match authenticated metadata" }
             normalizeSnapshotForImport(snapshot)
+        } finally {
+            plaintext.fill(0)
+        }
+    }
+
+    fun sealTerminalCoreSnapshot(
+        pairwiseKey: ByteArray,
+        sessionId: UUID,
+        pcDeviceId: UUID,
+        recipientDeviceId: UUID,
+        keyEpoch: Long,
+        snapshotSequence: ULong,
+        columns: Int,
+        rows: Int,
+        initialTranscriptBeforeLineId: ULong,
+        observedLocalInputEpoch: ULong,
+        checkpoint: ByteArray,
+        nonce: ByteArray = randomNonce(),
+    ): ByteArray {
+        validatePairwiseAndIdentity(pairwiseKey, sessionId, pcDeviceId, recipientDeviceId, keyEpoch)
+        validateTerminalCoreSnapshotMetadata(
+            snapshotSequence,
+            columns,
+            rows,
+            initialTranscriptBeforeLineId,
+            observedLocalInputEpoch,
+            checkpoint,
+        )
+        val nonceBytes = nonce.copyOf()
+        try {
+            require(nonceBytes.size == 12) { "Terminal-core snapshot nonce must be 12 bytes" }
+            val keyId = terminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch)
+            val container = TerminalCoreSnapshotCiphertextV2.newBuilder()
+                .setContainerVersion(TERMINAL_CORE_SNAPSHOT_CONTAINER_VERSION)
+                .setSessionId(ByteString.copyFrom(SessionCrypto.uuidBytes(sessionId)))
+                .setPcDeviceId(ByteString.copyFrom(SessionCrypto.uuidBytes(pcDeviceId)))
+                .setRecipientDeviceId(ByteString.copyFrom(SessionCrypto.uuidBytes(recipientDeviceId)))
+                .setKeyEpoch(keyEpoch)
+                .setKeyId(keyId)
+                .setSnapshotSeq(snapshotSequence.toLong())
+                .setColumns(columns)
+                .setRows(rows)
+                .setFormatName(TERMINAL_CORE_SNAPSHOT_FORMAT_NAME)
+                .setFormatVersion(TERMINAL_CORE_SNAPSHOT_FORMAT_VERSION)
+                .setCompression(SnapshotCompressionV1.SNAPSHOT_COMPRESSION_V1_NONE)
+                .setUncompressedBytes(checkpoint.size.toLong())
+                .setNonce(ByteString.copyFrom(nonceBytes))
+                .setInitialTranscriptBeforeLineId(initialTranscriptBeforeLineId.toLong())
+                .setObservedLocalInputEpoch(observedLocalInputEpoch.toLong())
+                .build()
+            val key = deriveTerminalCoreSnapshotKey(
+                pairwiseKey,
+                sessionId,
+                recipientDeviceId,
+                keyEpoch,
+                keyId,
+            )
+            val aad = terminalCoreSnapshotAssociatedData(container)
+            return try {
+                val ciphertext = SessionCrypto.encrypt(key, nonceBytes, aad, checkpoint)
+                try {
+                    container.toBuilder()
+                        .setCiphertext(ByteString.copyFrom(ciphertext))
+                        .build()
+                        .toByteArray()
+                        .also {
+                            require(it.size <= MAX_TERMINAL_CORE_SNAPSHOT_OBJECT_BYTES) {
+                                "Sealed terminal-core snapshot exceeds the production bound"
+                            }
+                        }
+                } finally {
+                    ciphertext.fill(0)
+                }
+            } finally {
+                key.fill(0)
+                aad.fill(0)
+            }
+        } finally {
+            nonceBytes.fill(0)
+        }
+    }
+
+    fun openTerminalCoreSnapshot(
+        pairwiseKey: ByteArray,
+        sealedObject: ByteArray,
+        expectedSessionId: UUID,
+        expectedPcDeviceId: UUID,
+        expectedRecipientDeviceId: UUID,
+        expectedKeyEpoch: Long,
+        expectedKeyId: String,
+        expectedSnapshotSequence: ULong,
+        expectedColumns: Int,
+        expectedRows: Int,
+    ): OpenedTerminalCoreSnapshot {
+        validatePairwiseAndIdentity(
+            pairwiseKey,
+            expectedSessionId,
+            expectedPcDeviceId,
+            expectedRecipientDeviceId,
+            expectedKeyEpoch,
+        )
+        require(
+            sealedObject.isNotEmpty() &&
+                sealedObject.size <= MAX_TERMINAL_CORE_SNAPSHOT_OBJECT_BYTES,
+        ) { "Sealed terminal-core snapshot size is invalid" }
+        val container = try {
+            TerminalCoreSnapshotCiphertextV2.parseFrom(sealedObject)
+        } catch (error: InvalidProtocolBufferException) {
+            throw IllegalArgumentException("Terminal-core snapshot container is invalid protobuf", error)
+        }
+        validateTerminalCoreSnapshotContainer(
+            container,
+            expectedSessionId,
+            expectedPcDeviceId,
+            expectedRecipientDeviceId,
+            expectedKeyEpoch,
+            expectedKeyId,
+            expectedSnapshotSequence,
+            expectedColumns,
+            expectedRows,
+        )
+        val key = deriveTerminalCoreSnapshotKey(
+            pairwiseKey,
+            expectedSessionId,
+            expectedRecipientDeviceId,
+            expectedKeyEpoch,
+            expectedKeyId,
+        )
+        val aad = terminalCoreSnapshotAssociatedData(container)
+        val plaintext = try {
+            SessionCrypto.decrypt(
+                key,
+                container.nonce.toByteArray(),
+                aad,
+                container.ciphertext.toByteArray(),
+            )
+        } finally {
+            key.fill(0)
+            aad.fill(0)
+        }
+        try {
+            require(plaintext.size.toULong() == container.uncompressedBytes.toULong()) {
+                "Terminal-core snapshot plaintext size does not match authenticated metadata"
+            }
+            validateTerminalCoreSnapshotMetadata(
+                container.snapshotSeq.toULong(),
+                container.columns,
+                container.rows,
+                container.initialTranscriptBeforeLineId.toULong(),
+                container.observedLocalInputEpoch.toULong(),
+                plaintext,
+            )
+            return OpenedTerminalCoreSnapshot(
+                checkpoint = plaintext.copyOf(),
+                initialTranscriptBeforeLineId = container.initialTranscriptBeforeLineId.toULong(),
+                observedLocalInputEpoch = container.observedLocalInputEpoch.toULong(),
+            )
         } finally {
             plaintext.fill(0)
         }
@@ -321,6 +498,22 @@ object TerminalSnapshotCrypto {
         transcriptKeyId(recipientDeviceId, keyEpoch),
     )
 
+    fun deriveTerminalCoreSnapshotKey(
+        pairwiseKey: ByteArray,
+        sessionId: UUID,
+        recipientDeviceId: UUID,
+        keyEpoch: Long,
+        keyId: String,
+    ): ByteArray = deriveObjectKey(
+        pairwiseKey,
+        sessionId,
+        recipientDeviceId,
+        keyEpoch,
+        keyId,
+        terminalCoreSnapshotKeyPrefix,
+        terminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch),
+    )
+
     fun snapshotAssociatedData(value: TerminalSnapshotCiphertextV1): ByteArray {
         validateCommonContainerMetadata(
             value.sessionId,
@@ -395,6 +588,88 @@ object TerminalSnapshotCrypto {
             output.write(value.nonce.toByteArray())
             output.toByteArray()
         }
+    }
+
+    fun terminalCoreSnapshotAssociatedData(value: TerminalCoreSnapshotCiphertextV2): ByteArray {
+        validateTerminalCoreSnapshotCryptographicMetadata(value)
+        return ByteArrayOutputStream().use { output ->
+            output.write(terminalCoreSnapshotAadPrefix)
+            output.write(uintBytes(value.containerVersion))
+            output.write(value.sessionId.toByteArray())
+            output.write(value.pcDeviceId.toByteArray())
+            output.write(value.recipientDeviceId.toByteArray())
+            output.write(longBytes(value.keyEpoch))
+            writeString(output, value.keyId, "terminal-core snapshot key ID")
+            output.write(ulongBytes(value.snapshotSeq.toULong()))
+            output.write(uintBytes(value.columns))
+            output.write(uintBytes(value.rows))
+            writeString(output, value.formatName, "terminal-core snapshot format name")
+            output.write(uintBytes(value.formatVersion))
+            output.write(uintBytes(value.compressionValue))
+            output.write(ulongBytes(value.uncompressedBytes.toULong()))
+            output.write(ulongBytes(value.initialTranscriptBeforeLineId.toULong()))
+            output.write(ulongBytes(value.observedLocalInputEpoch.toULong()))
+            output.write(value.nonce.toByteArray())
+            output.toByteArray()
+        }
+    }
+
+    private fun validateTerminalCoreSnapshotContainer(
+        value: TerminalCoreSnapshotCiphertextV2,
+        sessionId: UUID,
+        pcDeviceId: UUID,
+        recipientDeviceId: UUID,
+        keyEpoch: Long,
+        keyId: String,
+        sequence: ULong,
+        columns: Int,
+        rows: Int,
+    ) {
+        validateTerminalCoreSnapshotCryptographicMetadata(value)
+        require(
+            value.sessionId.toByteArray().contentEquals(SessionCrypto.uuidBytes(sessionId)) &&
+                value.pcDeviceId.toByteArray().contentEquals(SessionCrypto.uuidBytes(pcDeviceId)) &&
+                value.recipientDeviceId.toByteArray().contentEquals(SessionCrypto.uuidBytes(recipientDeviceId)) &&
+                value.keyEpoch == keyEpoch && value.keyId == keyId &&
+                value.keyId == terminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch) &&
+                value.snapshotSeq.toULong() == sequence && value.columns == columns && value.rows == rows &&
+                value.ciphertext.size() in 16..MAX_TERMINAL_CORE_SNAPSHOT_OBJECT_BYTES,
+        ) { "Terminal-core snapshot object metadata does not match the requested object" }
+    }
+
+    private fun validateTerminalCoreSnapshotCryptographicMetadata(
+        value: TerminalCoreSnapshotCiphertextV2,
+    ) {
+        require(
+            value.containerVersion == TERMINAL_CORE_SNAPSHOT_CONTAINER_VERSION &&
+                value.sessionId.size() == 16 && value.pcDeviceId.size() == 16 &&
+                value.recipientDeviceId.size() == 16 && value.keyEpoch > 0 &&
+                utf8Length(value.keyId, "terminal-core snapshot key ID") in 8..128 &&
+                value.nonce.size() == 12 &&
+                value.formatVersion == TERMINAL_CORE_SNAPSHOT_FORMAT_VERSION &&
+                value.formatName == TERMINAL_CORE_SNAPSHOT_FORMAT_NAME &&
+                value.compression == SnapshotCompressionV1.SNAPSHOT_COMPRESSION_V1_NONE &&
+                value.uncompressedBytes > 0L &&
+                value.uncompressedBytes.toULong() <= MAX_TERMINAL_CORE_SNAPSHOT_PLAINTEXT_BYTES.toULong() &&
+                value.snapshotSeq > 0L && value.columns in 1..MAX_COLUMNS && value.rows in 1..MAX_ROWS &&
+                value.initialTranscriptBeforeLineId > 0L && value.observedLocalInputEpoch >= 0L,
+        ) { "Terminal-core snapshot cryptographic metadata is invalid or unsupported" }
+    }
+
+    private fun validateTerminalCoreSnapshotMetadata(
+        snapshotSequence: ULong,
+        columns: Int,
+        rows: Int,
+        initialTranscriptBeforeLineId: ULong,
+        observedLocalInputEpoch: ULong,
+        checkpoint: ByteArray,
+    ) {
+        require(
+            snapshotSequence in 1uL..MAX_SUPPORTED_UINT64 && columns in 1..MAX_COLUMNS &&
+                rows in 1..MAX_ROWS && initialTranscriptBeforeLineId in 1uL..MAX_SUPPORTED_UINT64 &&
+                observedLocalInputEpoch <= MAX_SUPPORTED_UINT64 && checkpoint.isNotEmpty() &&
+                checkpoint.size <= MAX_TERMINAL_CORE_SNAPSHOT_PLAINTEXT_BYTES,
+        ) { "Terminal-core snapshot metadata is invalid or unsupported" }
     }
 
     fun validateSnapshot(value: TerminalSnapshotV1) {

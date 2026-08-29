@@ -177,7 +177,7 @@ namespace TermLink.Agent
             // Keep the terminal-object gate at the transport boundary as well
             // as in ProductionAgentRuntime. Legacy callers therefore remain
             // CHUNK-only unless the runtime explicitly passes its advertised
-            // terminal_snapshot_v1 flag into this uploader instance.
+            // terminal_snapshot_v2 flag into this uploader instance.
             if (!terminalSnapshotEnabled || sessionId == Guid.Empty || recipient == null ||
                 recipient.PairwiseKey == null || recipient.PairwiseKey.Length != 32 || recipient.KeyEpoch < 1 ||
                 upload == null || upload.Artifact == null || upload.SealedObject == null || upload.SealedObject.Length == 0 ||
@@ -189,7 +189,9 @@ namespace TermLink.Agent
                 var artifact = upload.Artifact;
                 var expectedKeyId = artifact.Kind == ProductionTerminalHistoryArtifactKind.Transcript
                     ? SnapshotCrypto.TranscriptKeyId(recipient.DeviceId, recipient.KeyEpoch)
-                    : SnapshotCrypto.SnapshotKeyId(recipient.DeviceId, recipient.KeyEpoch);
+                    : artifact.FormatName == SnapshotCrypto.TerminalCoreSnapshotFormatName
+                        ? SnapshotCrypto.TerminalCoreSnapshotKeyId(recipient.DeviceId, recipient.KeyEpoch)
+                        : SnapshotCrypto.SnapshotKeyId(recipient.DeviceId, recipient.KeyEpoch);
                 ValidateTerminalArtifact(sessionId, recipient, artifact, upload.SealedObject, expectedKeyId);
                 var gateKey = sessionId.ToString("N") + ":" + expectedKeyId + ":" + artifact.ArtifactId;
                 var uploadGate = uploadGates.GetOrAdd(gateKey, _ => new SemaphoreSlim(1, 1));
@@ -423,11 +425,10 @@ namespace TermLink.Agent
             byte[] sealedObject,
             string expectedKeyId)
         {
-            if (artifact.FormatVersion != checked((int)SnapshotCrypto.FormatVersion))
-                throw new InvalidDataException("Terminal history format version is unsupported.");
             if (artifact.Kind == ProductionTerminalHistoryArtifactKind.Transcript)
             {
-                if (artifact.FormatName != SnapshotCrypto.TranscriptFormatName || artifact.FirstLineId == 0 ||
+                if (artifact.FormatName != SnapshotCrypto.TranscriptFormatName ||
+                    artifact.FormatVersion != SnapshotCrypto.FormatVersion || artifact.FirstLineId == 0 ||
                     artifact.LastLineId < artifact.FirstLineId || artifact.ExclusiveBeforeLineId <= artifact.LastLineId ||
                     artifact.InitialTranscriptBeforeLineId != 0 || artifact.TranscriptPageCount != 0)
                     throw new InvalidDataException("Terminal transcript upload metadata is invalid.");
@@ -447,10 +448,38 @@ namespace TermLink.Agent
             }
             if (artifact.Kind == ProductionTerminalHistoryArtifactKind.Snapshot)
             {
-                if (artifact.FormatName != SnapshotCrypto.SnapshotFormatName || artifact.Columns < 1 || artifact.Rows < 1 ||
+                if (artifact.Columns < 1 || artifact.Rows < 1 ||
                     artifact.InitialTranscriptBeforeLineId == 0 || artifact.TranscriptPageCount < 0 ||
                     artifact.TranscriptPageCount > MaximumTranscriptPublicationPageCount)
                     throw new InvalidDataException("Terminal snapshot upload metadata is invalid.");
+                if (artifact.FormatName == SnapshotCrypto.TerminalCoreSnapshotFormatName &&
+                    artifact.FormatVersion == SnapshotCrypto.TerminalCoreSnapshotFormatVersion)
+                {
+                    var checkpoint = SnapshotCrypto.OpenTerminalCoreSnapshot(
+                        recipient.PairwiseKey,
+                        sealedObject,
+                        sessionId,
+                        pcDeviceId,
+                        recipient.DeviceId,
+                        recipient.KeyEpoch,
+                        expectedKeyId,
+                        artifact.SnapshotSequence,
+                        checked((uint)artifact.Columns),
+                        checked((uint)artifact.Rows),
+                        artifact.InitialTranscriptBeforeLineId,
+                        out var observedLocalInputEpoch);
+                    try
+                    {
+                        if (observedLocalInputEpoch != artifact.ObservedLocalInputEpoch)
+                            throw new InvalidDataException(
+                                "Terminal-core snapshot input epoch does not match its ciphertext.");
+                    }
+                    finally { CryptographicOperations.ZeroMemory(checkpoint); }
+                    return;
+                }
+                if (artifact.FormatName != SnapshotCrypto.SnapshotFormatName ||
+                    artifact.FormatVersion != SnapshotCrypto.FormatVersion)
+                    throw new InvalidDataException("Terminal snapshot format is unsupported.");
                 var snapshot = SnapshotCrypto.OpenSnapshot(
                     recipient.PairwiseKey,
                     sealedObject,

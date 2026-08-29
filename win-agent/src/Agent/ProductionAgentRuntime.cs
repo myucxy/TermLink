@@ -65,7 +65,8 @@ namespace TermLink.Agent
         private static readonly TimeSpan RealtimeSendTimeout = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan PersistedHistoryIdleDelay = TimeSpan.FromSeconds(5);
         private const int MaxRememberedTerminationRequests = 4096;
-        private const string TerminalSnapshotEnvironment = "TERMLINK_ENABLE_TERMINAL_SNAPSHOT_V1";
+        private const string TerminalSnapshotEnvironment = "TERMLINK_ENABLE_TERMINAL_SNAPSHOT_V2";
+        private const string LegacyTerminalSnapshotEnvironment = "TERMLINK_ENABLE_TERMINAL_SNAPSHOT_V1";
         private const string TypedInputEnvironment = "TERMLINK_ENABLE_TYPED_INPUT_V1";
         private const string TerminalCoreShadowEnvironment = "TERMLINK_ENABLE_TERMINAL_CORE_SHADOW";
         private sealed class CommittedEvent { public ManagedShellType ShellType; public LocalFrame Frame; }
@@ -243,7 +244,8 @@ namespace TermLink.Agent
             // short REST metadata timeout.
             fileUploadHttp.Timeout = Timeout.InfiniteTimeSpan;
             terminalSnapshotEnabled = IsTerminalSnapshotRuntimeEnabled(
-                Environment.GetEnvironmentVariable(TerminalSnapshotEnvironment));
+                Environment.GetEnvironmentVariable(TerminalSnapshotEnvironment) ??
+                Environment.GetEnvironmentVariable(LegacyTerminalSnapshotEnvironment));
             typedInputEnabled = IsTypedInputRuntimeEnabled(
                 Environment.GetEnvironmentVariable(TypedInputEnvironment));
             terminalCoreShadowEnabled = IsTerminalCoreShadowRuntimeEnabled(
@@ -255,6 +257,7 @@ namespace TermLink.Agent
                 terminalHistoryStore,
                 credentials.DeviceId,
                 terminalCoreShadowEnabled,
+                terminalSnapshotEnabled,
                 ObserveTerminalCoreShadow);
         }
 
@@ -267,13 +270,12 @@ namespace TermLink.Agent
                 pcId.ToString("N"));
         }
 
-        // Snapshot restore remains an experimental capability until the native
-        // TerminalCore exporter and the cross-renderer equivalence gates pass.
-        // Missing, malformed, or casually inherited environment values must
-        // therefore fail closed instead of advertising an incomplete runtime.
+        // Canonical terminal-core Snapshot V2 is the production authority.
+        // Operators retain an explicit local rollback switch; an unset value
+        // enables the production path.
         internal static bool IsTerminalSnapshotRuntimeEnabled(string value) =>
-            string.Equals(value, "1", StringComparison.Ordinal) ||
-            string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+            !string.Equals(value, "0", StringComparison.Ordinal) &&
+            !string.Equals(value, "false", StringComparison.OrdinalIgnoreCase);
 
         internal static bool IsTypedInputRuntimeEnabled(string value) =>
             !string.Equals(value, "0", StringComparison.Ordinal);
@@ -317,7 +319,7 @@ namespace TermLink.Agent
                 "terminal_presentation_metadata_v1",
                 "remote_agent_update_v1"
             };
-            if (terminalSnapshotEnabled) capabilities.Add("terminal_snapshot_v1");
+            if (terminalSnapshotEnabled) capabilities.Add("terminal_snapshot_v2");
             if (typedInputEnabled) capabilities.Add("terminal_typed_input_v1");
             return JsonSerializer.SerializeToUtf8Bytes(new
             {
@@ -941,7 +943,7 @@ namespace TermLink.Agent
                 "terminal_commands_v1",
                 "remote_agent_update_v1"
             };
-            if (terminalSnapshotCapable) capabilities.Insert(1, "terminal_snapshot_v1");
+            if (terminalSnapshotCapable) capabilities.Insert(1, "terminal_snapshot_v2");
             var normalizedCommands = terminalCommands.Select(command => new
             {
                 id = command.Id,
@@ -3290,11 +3292,14 @@ namespace TermLink.Agent
                         durable = false;
                         continue;
                     }
-                    else if (terminalOutbox == null &&
-                        production != null && production.SnapshotEligible)
+                    else if (terminalOutbox == null && terminalSnapshotEnabled &&
+                        (production == null || !production.PermanentlyIneligible))
                     {
-                        // Never let the generic CHUNK path overtake a snapshot
-                        // that should exist but was not durably materialized.
+                        // Snapshot mode starts before the first Output frame.
+                        // Keep the generic CHUNK path behind that pending
+                        // anchor as well as behind an eligible anchor whose
+                        // outbox was not durably materialized. Only a proven
+                        // permanent incompatibility may use CHUNK fallback.
                         durable = false;
                         continue;
                     }

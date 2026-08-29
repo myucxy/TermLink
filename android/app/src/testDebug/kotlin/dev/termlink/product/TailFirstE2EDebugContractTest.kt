@@ -1,6 +1,7 @@
 package dev.termlink.product
 
 import dev.termlink.harness.BuildConfig
+import dev.termlink.product.debug.tailFirstLiveMarker
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
@@ -16,6 +17,17 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TailFirstE2EDebugContractTest {
+    @Test
+    fun liveMarkerIsUniqueAndCannotHardWrapAtTheMinimumTerminalWidth() {
+        val runId = "post-upgrade-0.1.37-streamed-20260829-r13-frame-capture-visible"
+        val marker = tailFirstLiveMarker(runId)
+
+        assertEquals("TLTF_LIVE_b16944a3f41ea46b", marker)
+        assertTrue(marker.length < MINIMUM_TERMINAL_COLUMNS)
+        assertTrue(marker.all { it in 'a'..'f' || it in '0'..'9' || it == '_' || it in 'A'..'Z' })
+        assertFalse(marker == tailFirstLiveMarker("$runId-different"))
+    }
+
     @Test
     fun generatedDebugAssetMatchesTheRunnerContractAndBuildConfig() {
         val appRoot = locateAppRoot()
@@ -76,6 +88,7 @@ class TailFirstE2EDebugContractTest {
         const val PACKAGE_NAME = "dev.termlink.harness"
         const val RECEIVER_CLASS = "dev.termlink.product.debug.TailFirstE2EReceiver"
         const val ACTION = "dev.termlink.product.debug.TAIL_FIRST_E2E"
+        const val MINIMUM_TERMINAL_COLUMNS = 80
         val OPERATIONS = listOf(
             "probe",
             "open_session",

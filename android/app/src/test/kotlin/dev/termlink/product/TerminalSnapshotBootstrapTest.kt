@@ -13,10 +13,21 @@ import org.junit.Test
 class TerminalSnapshotBootstrapTest {
     @Test
     fun snapshotRuntimeRequiresBothLocalOptInAndPcCapability() {
-        val capability = dev.termlink.model.PcCapabilityIds.TERMINAL_SNAPSHOT_V1
+        val capability = dev.termlink.model.PcCapabilityIds.TERMINAL_SNAPSHOT_V2
         assertFalse(terminalSnapshotRuntimeNegotiated(false, setOf(capability)))
         assertFalse(terminalSnapshotRuntimeNegotiated(true, emptySet()))
         assertTrue(terminalSnapshotRuntimeNegotiated(true, setOf(capability)))
+    }
+
+    @Test
+    fun missingV2CapabilitySkipsRemoteSnapshotReadinessWait() = runBlocking {
+        var invoked = false
+        val result = awaitRemoteSnapshotWhenNegotiated<String>(negotiated = false) {
+            invoked = true
+            "unexpected"
+        }
+        assertFalse(invoked)
+        assertNull(result)
     }
 
     @Test

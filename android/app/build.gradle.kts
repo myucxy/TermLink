@@ -151,7 +151,7 @@ android {
         manifestPlaceholders["appAuthRedirectScheme"] = "dev.termlink"
         buildConfigField("String", "TERMLINK_SERVER_URL", buildConfigString(publicTermLinkServerUrl))
         buildConfigField("boolean", "TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST", "false")
-        buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", "false")
+        buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", "true")
     }
 
     buildFeatures {
@@ -174,7 +174,7 @@ android {
             // Release intentionally ignores all local Debug injection inputs.
             buildConfigField("String", "TERMLINK_SERVER_URL", buildConfigString(publicTermLinkServerUrl))
             buildConfigField("boolean", "TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST", "false")
-            buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", "false")
+            buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", "true")
         }
     }
 

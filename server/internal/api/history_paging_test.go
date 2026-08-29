@@ -207,6 +207,11 @@ func TestHistorySnapshotMetadataSupportsPortableSnapshotAndLegacyReplay(t *testi
 	}{
 		{name: "portable-minimum", sequence: 1, sizeBytes: 1, rows: 1, columns: 1, format: terminalSnapshotFormat, version: 1},
 		{name: "portable-maximum", sequence: 99, sizeBytes: maxTerminalSnapshotCiphertextBytes, rows: 256, columns: 512, format: terminalSnapshotFormat, version: 1},
+		{name: "terminal-core-minimum", sequence: 1, sizeBytes: 1, rows: 1, columns: 1, format: store.HistoryFormatTerminalCoreSnapshot, version: 2},
+		{name: "terminal-core-maximum", sequence: 5200, sizeBytes: store.MaxTerminalCoreSnapshotCiphertextBytes, rows: 256, columns: 512, format: store.HistoryFormatTerminalCoreSnapshot, version: 2},
+		{name: "terminal-core-sequence-zero", sequence: 0, sizeBytes: 1, rows: 24, columns: 80, format: store.HistoryFormatTerminalCoreSnapshot, version: 2, wantError: true},
+		{name: "terminal-core-too-large", sequence: 1, sizeBytes: store.MaxTerminalCoreSnapshotCiphertextBytes + 1, rows: 24, columns: 80, format: store.HistoryFormatTerminalCoreSnapshot, version: 2, wantError: true},
+		{name: "terminal-core-wrong-version", sequence: 1, sizeBytes: 1, rows: 24, columns: 80, format: store.HistoryFormatTerminalCoreSnapshot, version: 1, wantError: true},
 		{name: "legacy-sequence-zero", sequence: 0, sizeBytes: maxTerminalSnapshotCiphertextBytes, rows: 256, columns: 512, format: boundedEventReplayFormat, version: 1},
 		{name: "legacy-too-large", sequence: 0, sizeBytes: maxTerminalSnapshotCiphertextBytes + 1, rows: 24, columns: 80, format: boundedEventReplayFormat, version: 1, wantError: true},
 		{name: "portable-sequence-zero", sequence: 0, sizeBytes: 1, rows: 24, columns: 80, format: terminalSnapshotFormat, version: 1, wantError: true},
@@ -220,6 +225,30 @@ func TestHistorySnapshotMetadataSupportsPortableSnapshotAndLegacyReplay(t *testi
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			err := validateHistorySnapshotMetadata(test.sequence, test.sizeBytes, test.rows, test.columns, test.format, test.version)
+			if (err != nil) != test.wantError {
+				t.Fatalf("validation error=%v, wantError=%t", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestSnapshotTranscriptPublicationAcceptsOnlyCanonicalSnapshotFormats(t *testing.T) {
+	beforeLineID, pageCount := int64(4097), 27
+	for _, test := range []struct {
+		name      string
+		format    string
+		version   int
+		wantError bool
+	}{
+		{name: "portable-v1", format: terminalSnapshotFormat, version: 1},
+		{name: "terminal-core-v2", format: store.HistoryFormatTerminalCoreSnapshot, version: 2},
+		{name: "terminal-core-v1", format: store.HistoryFormatTerminalCoreSnapshot, version: 1, wantError: true},
+		{name: "portable-v2", format: terminalSnapshotFormat, version: 2, wantError: true},
+		{name: "private", format: "PRIVATE_ENGINE_DUMP", version: 2, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateSnapshotTranscriptPublicationMetadata(
+				test.format, test.version, &beforeLineID, &pageCount)
 			if (err != nil) != test.wantError {
 				t.Fatalf("validation error=%v, wantError=%t", err, test.wantError)
 			}

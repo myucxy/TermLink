@@ -387,11 +387,17 @@ foreach ($receiverProof in @(
     'writeSessionArmAtomically',
     'EXPECTED_PAGE_RESULT_TRANSCRIPT_LOAD_FAILED',
     'FAILURE_TRANSCRIPT_LOAD_FAILED',
+    'tailFirstLiveMarker(runId)',
     'next_before_line_id'
 )) {
     Assert-True ($receiverSource.Contains($receiverProof)) `
         "The Debug receiver lacks required tail-first proof '$receiverProof'."
 }
+Assert-True ($source.Contains('[Security.Cryptography.SHA256]::HashData(') -and
+    $source.Contains("`$liveMarker = 'TLTF_LIVE_'")) `
+    'The live marker is not a short run-unique value that remains contiguous below 80 columns.'
+Assert-True (-not $source.Contains('"${markerStem}_LIVE_AFTER_OVERLAY"')) `
+    'The runner still uses an ArtifactRunId-sized live marker that ConPTY may hard-wrap.'
 $fallbackRestoreIndex = $source.IndexOf(
     'if ($script:airplaneModeEnabled -and $null -ne $script:adbPath)',
     [StringComparison]::Ordinal)

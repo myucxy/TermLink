@@ -1318,7 +1318,14 @@ try {
         'The Windows marker set is not unique.'
     $firstMarker = $markers[0]
     $lastMarker = $markers[-1]
-    $liveMarker = "${markerStem}_LIVE_AFTER_OVERLAY"
+    # Keep the live marker unique without letting a long ArtifactRunId exceed the
+    # authoritative terminal width. ConPTY is allowed to hard-wrap an echoed
+    # input line, which would make a long contiguous-string assertion a false
+    # negative even though every output byte reached Android.
+    $liveMarkerDigest = [Security.Cryptography.SHA256]::HashData(
+        [Text.Encoding]::UTF8.GetBytes($ArtifactRunId))
+    $liveMarker = 'TLTF_LIVE_' +
+        [Convert]::ToHexString($liveMarkerDigest, 0, 8).ToLowerInvariant()
     $childScript = if ($HistoryBootstrapMode -ceq 'StreamedChunkPrefix') {
         @'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)

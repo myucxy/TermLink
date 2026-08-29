@@ -3300,7 +3300,9 @@ internal class ProductionProductRepository(
                     transcriptViewports = product.transcriptViewports + (
                         key.sessionId to current!!.copy(
                             loading = false,
-                            error = "Unable to load older terminal output",
+                            // ProductActivity maps this stable diagnostic to
+                            // localized terminal_history_unavailable text.
+                            error = TRANSCRIPT_PAGE_LOAD_FAILED_CODE,
                         )
                     ),
                 )
@@ -3416,8 +3418,8 @@ internal class ProductionProductRepository(
         val metadata = descriptor.metadata
         val sequence = requireNotNull(metadata.snapshotSequence)
         require(metadata.kind == HistoryObject.Kind.SNAPSHOT)
-        require(metadata.formatName == HistoryRepository.TERMINAL_SNAPSHOT_FORMAT && metadata.formatVersion == 1)
-        val keyEpoch = requireNotNull(snapshotKeyEpoch(stored.deviceId, metadata.keyId))
+        require(metadata.formatName == HistoryRepository.TERMINAL_CORE_SNAPSHOT_FORMAT && metadata.formatVersion == 2)
+        val keyEpoch = requireNotNull(terminalCoreSnapshotKeyEpoch(stored.deviceId, metadata.keyId))
         require(keyEpoch <= pc.keyEpoch)
         val pairwise = SessionCrypto.derivePairwiseKey(
             stored.identity.exchange.privateKey,
@@ -3427,7 +3429,7 @@ internal class ProductionProductRepository(
             keyEpoch,
         )
         try {
-            val wire = TerminalSnapshotCrypto.openSnapshot(
+            val opened = TerminalSnapshotCrypto.openTerminalCoreSnapshot(
                 pairwiseKey = pairwise,
                 sealedObject = sealedObject,
                 expectedSessionId = session.id,
@@ -3439,10 +3441,11 @@ internal class ProductionProductRepository(
                 expectedColumns = descriptor.columns,
                 expectedRows = descriptor.rows,
             )
-            val beforeLineId = TerminalSnapshotCrypto.initialTranscriptBeforeLineId(wire)
-            val decoded = TerminalSnapshotDomainDecoder.decode(wire)
-            require(decoded.sequence.toULong() == sequence)
-            TranscriptAnchor(sequence, beforeLineId)
+            try {
+                TranscriptAnchor(sequence, opened.initialTranscriptBeforeLineId)
+            } finally {
+                opened.checkpoint.fill(0)
+            }
         } finally {
             pairwise.fill(0)
         }
@@ -3527,7 +3530,7 @@ internal class ProductionProductRepository(
             identity = stored.identity,
             parentScope = scope,
             additionalCapabilities = if (BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME) {
-                setOf(dev.termlink.model.PcCapabilityIds.TERMINAL_SNAPSHOT_V1)
+                setOf(dev.termlink.model.PcCapabilityIds.TERMINAL_SNAPSHOT_V2)
             } else {
                 emptySet()
             },
@@ -3942,14 +3945,14 @@ internal class ProductionProductRepository(
         require(rows in 1..HistoryRepository.MAX_TERMINAL_SNAPSHOT_ROWS) { "Snapshot rows are out of bounds" }
         require(columns in 1..HistoryRepository.MAX_TERMINAL_SNAPSHOT_COLUMNS) { "Snapshot columns are out of bounds" }
         val sizeBytes = getValue("size_bytes").jsonPrimitive.long
-        require(sizeBytes in 1..HistoryRepository.MAX_TERMINAL_SNAPSHOT_BYTES) { "Snapshot size is out of bounds" }
+        require(sizeBytes in 1..HistoryRepository.MAX_TERMINAL_CORE_SNAPSHOT_BYTES) { "Snapshot size is out of bounds" }
         val formatName = requiredString("format_name")
         val formatVersion = getValue("format_version").jsonPrimitive.int
-        require(formatName == HistoryRepository.TERMINAL_SNAPSHOT_FORMAT && formatVersion == 1) {
+        require(formatName == HistoryRepository.TERMINAL_CORE_SNAPSHOT_FORMAT && formatVersion == 2) {
             "Snapshot format is unsupported"
         }
         val keyId = requiredString("key_id")
-        val keyEpoch = requireNotNull(snapshotKeyEpoch(recipientDeviceId, keyId)) {
+        val keyEpoch = requireNotNull(terminalCoreSnapshotKeyEpoch(recipientDeviceId, keyId)) {
             "Snapshot key ID is not for this device"
         }
         require(keyEpoch <= authoritativeKeyEpoch) { "Snapshot key epoch is newer than the authoritative PC epoch" }
@@ -4100,6 +4103,218 @@ internal class ProductionProductRepository(
             expectedRendererGeneration,
         )
         RestoredLiveHistory(RendererBootstrapState.Empty(reset.rendererGeneration))
+    }
+
+    private suspend fun openNativeTerminalSnapshot(
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        metadata: HistoryObject,
+        rows: Int,
+        columns: Int,
+        sealedObject: ByteArray,
+    ): TerminalSnapshotCrypto.OpenedTerminalCoreSnapshot = withContext(Dispatchers.Default) {
+        val sequence = requireNotNull(metadata.snapshotSequence) { "Snapshot sequence is missing" }
+        if (metadata.kind != HistoryObject.Kind.SNAPSHOT ||
+            metadata.formatName != HistoryRepository.TERMINAL_CORE_SNAPSHOT_FORMAT ||
+            metadata.formatVersion != 2
+        ) {
+            throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_FORMAT)
+        }
+        val keyEpoch = terminalCoreSnapshotKeyEpoch(stored.deviceId, metadata.keyId)
+            ?: throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_RECIPIENT)
+        if (keyEpoch > pc.keyEpoch) throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
+        val pairwise = SessionCrypto.derivePairwiseKey(
+            stored.identity.exchange.privateKey,
+            pcDevice.exchangePublicKey,
+            pc.deviceId,
+            stored.deviceId,
+            keyEpoch,
+        )
+        try {
+            TerminalSnapshotCrypto.openTerminalCoreSnapshot(
+                pairwiseKey = pairwise,
+                sealedObject = sealedObject,
+                expectedSessionId = session.id,
+                expectedPcDeviceId = pc.deviceId,
+                expectedRecipientDeviceId = stored.deviceId,
+                expectedKeyEpoch = keyEpoch,
+                expectedKeyId = metadata.keyId,
+                expectedSnapshotSequence = sequence,
+                expectedColumns = columns,
+                expectedRows = rows,
+            )
+        } catch (error: Exception) {
+            throw classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_PREPARE)
+        } finally {
+            pairwise.fill(0)
+        }
+    }
+
+    private suspend fun restoreBoundNativeTerminalCheckpoint(
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        engine: NativeTerminalEngine,
+    ): RestoredLiveHistory? {
+        val bound = try {
+            historyRepository.rendererCheckpointState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            throw sessionOpenException(SessionOpenFailureCode.LOCAL_CHECKPOINT, error)
+        } ?: return null
+        if (bound.snapshot.metadata.formatName != HistoryRepository.TERMINAL_CORE_SNAPSHOT_FORMAT ||
+            bound.snapshot.metadata.formatVersion != 2
+        ) return null
+        val tail = latestAuthoritativeSessionTail(session) ?: return null
+        if (!snapshotHasBoundedLiveSuffix(bound.snapshotSequence, tail)) return null
+        val opened = openNativeTerminalSnapshot(
+            session,
+            pc,
+            pcDevice,
+            stored,
+            bound.snapshot.metadata,
+            bound.snapshotRows,
+            bound.snapshotColumns,
+            bound.snapshot.ciphertext,
+        )
+        try {
+            val confirmedTail = latestAuthoritativeSessionTail(session) ?: return null
+            if (!snapshotHasBoundedLiveSuffix(bound.snapshotSequence, confirmedTail)) return null
+            return withContext(NonCancellable) {
+                val rebound = if (bound.durableAcknowledgement > bound.snapshotSequence) {
+                    historyRepository.bindRendererCheckpoint(
+                        sessionId = session.id,
+                        direction = LIVE_OUTPUT_ACK_DIRECTION,
+                        expectedRendererGeneration = bound.rendererGeneration,
+                        snapshotId = bound.snapshot.metadata.id,
+                        snapshotSequence = bound.snapshotSequence,
+                        ciphertextSha256 = bound.snapshot.metadata.ciphertextSha256,
+                    )
+                } else {
+                    bound
+                }
+                try {
+                    val installed = engine.installCheckpoint(opened.checkpoint)
+                    check(installed.sequence.toULong() == rebound.snapshotSequence &&
+                        installed.size == TerminalSize(rebound.snapshotColumns, rebound.snapshotRows)
+                    ) { "Installed native checkpoint does not match its durable binding" }
+                    RestoredLiveHistory(
+                        rendererState = RendererBootstrapState.ExactCheckpoint(
+                            sequence = installed.sequence,
+                            rendererGeneration = rebound.rendererGeneration,
+                            snapshotId = rebound.snapshot.metadata.id,
+                            ciphertextSha256 = rebound.snapshot.metadata.ciphertextSha256,
+                        ),
+                        localInputEpoch = opened.observedLocalInputEpoch.toLong(),
+                        transcriptAnchor = TranscriptAnchor(
+                            rebound.snapshotSequence,
+                            opened.initialTranscriptBeforeLineId,
+                        ),
+                        durableAcknowledgement = rebound.snapshotSequence,
+                        bootstrapSource = ProductBootstrapSource.BOUND_SNAPSHOT,
+                    )
+                } catch (error: Exception) {
+                    resetLiveRendererAndCursor(session, engine, rebound.rendererGeneration)
+                    throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_INSTALL, error)
+                }
+            }
+        } finally {
+            opened.checkpoint.fill(0)
+            bound.snapshot.ciphertext.fill(0)
+        }
+    }
+
+    private suspend fun restoreRemoteNativeTerminalSnapshot(
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        engine: NativeTerminalEngine,
+        expectedRendererGeneration: Long,
+        descriptor: SnapshotDownloadDescriptor,
+    ): RestoredLiveHistory? {
+        val metadata = descriptor.metadata
+        val sequence = requireNotNull(metadata.snapshotSequence)
+        val cached = historyRepository.getHistoryObject(metadata.id)?.takeIf { value ->
+            value.metadata.kind == HistoryObject.Kind.SNAPSHOT &&
+                MessageDigest.isEqual(value.metadata.ciphertextSha256, metadata.ciphertextSha256)
+        }
+        val sealedObject = cached?.ciphertext ?: withContext(Dispatchers.IO) {
+            downloadHistory(descriptor.download, metadata)
+        }
+        try {
+            if (cached == null) {
+                historyRepository.putSnapshot(
+                    sessionId = session.id,
+                    snapshotSequence = sequence,
+                    rows = descriptor.rows,
+                    columns = descriptor.columns,
+                    objectKey = metadata.objectKey,
+                    keyId = metadata.keyId,
+                    formatName = requireNotNull(metadata.formatName),
+                    formatVersion = requireNotNull(metadata.formatVersion),
+                    ciphertext = sealedObject,
+                    id = metadata.id,
+                    ciphertextSha256 = metadata.ciphertextSha256,
+                )
+            }
+            val opened = openNativeTerminalSnapshot(
+                session,
+                pc,
+                pcDevice,
+                stored,
+                metadata,
+                descriptor.rows,
+                descriptor.columns,
+                sealedObject,
+            )
+            try {
+                val confirmedTail = latestAuthoritativeSessionTail(session) ?: return null
+                if (!snapshotHasBoundedLiveSuffix(sequence, confirmedTail)) return null
+                return withContext(NonCancellable) {
+                    val bound = historyRepository.bindRendererCheckpoint(
+                        sessionId = session.id,
+                        direction = LIVE_OUTPUT_ACK_DIRECTION,
+                        expectedRendererGeneration = expectedRendererGeneration,
+                        snapshotId = metadata.id,
+                        snapshotSequence = sequence,
+                        ciphertextSha256 = metadata.ciphertextSha256,
+                    )
+                    try {
+                        val installed = engine.installCheckpoint(opened.checkpoint)
+                        check(installed.sequence.toULong() == bound.snapshotSequence &&
+                            installed.size == TerminalSize(bound.snapshotColumns, bound.snapshotRows)
+                        ) { "Installed native checkpoint does not match the bound snapshot" }
+                        RestoredLiveHistory(
+                            rendererState = RendererBootstrapState.ExactCheckpoint(
+                                sequence = installed.sequence,
+                                rendererGeneration = bound.rendererGeneration,
+                                snapshotId = metadata.id,
+                                ciphertextSha256 = metadata.ciphertextSha256,
+                            ),
+                            localInputEpoch = opened.observedLocalInputEpoch.toLong(),
+                            transcriptAnchor = TranscriptAnchor(
+                                sequence,
+                                opened.initialTranscriptBeforeLineId,
+                            ),
+                            durableAcknowledgement = bound.durableAcknowledgement,
+                            bootstrapSource = ProductBootstrapSource.REMOTE_SNAPSHOT,
+                        )
+                    } catch (error: Exception) {
+                        resetLiveRendererAndCursor(session, engine, bound.rendererGeneration)
+                        throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_INSTALL, error)
+                    }
+                }
+            } finally {
+                opened.checkpoint.fill(0)
+            }
+        } finally {
+            sealedObject.fill(0)
+        }
     }
 
     private suspend fun prepareTerminalSnapshot(
@@ -4272,7 +4487,7 @@ internal class ProductionProductRepository(
                 try {
                     val response = api.get(
                         "/v1/sessions/${session.id}/history" +
-                            "?kind=snapshot&format_name=${HistoryRepository.TERMINAL_SNAPSHOT_FORMAT}&limit=1",
+                            "?kind=snapshot&format_name=${HistoryRepository.TERMINAL_CORE_SNAPSHOT_FORMAT}&limit=1",
                     ).jsonObject
                     val items = ProductResponseParser.itemObjects(response)
                     require(items.size <= 1) { "Latest snapshot selector returned more than one object" }
@@ -4788,10 +5003,48 @@ internal class ProductionProductRepository(
                 return RestoredLiveHistory(RendererBootstrapState.Empty(cursor.rendererGeneration))
             }
         }
-        // Portable Snapshot V1 belongs to the legacy Termux projection and is not binary-compatible
-        // with terminal-core's canonical Snapshot V2. Production native authority therefore
-        // rebuilds from encrypted CHUNK pages only. Pages and decrypted chunks remain bounded, but
-        // the number of pages and total session length are intentionally unbounded (TL-H115).
+        val terminalSnapshotNegotiated = terminalSnapshotRuntimeNegotiated(
+            BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME,
+            pc.capabilities,
+        )
+        if (terminalSnapshotNegotiated) {
+            restoreBoundNativeTerminalCheckpoint(session, pc, pcDevice, stored, engine)?.let { return it }
+        }
+
+        // Prefer terminal-core's canonical Snapshot V2 and wait through the
+        // normal Agent -> object store -> catalog publication window.  CHUNK
+        // replay remains the compatibility/availability fallback and stays
+        // unbounded in total session length (TL-H115).
+        val remoteSnapshot = awaitRemoteSnapshotWhenNegotiated(
+            terminalSnapshotNegotiated,
+        ) {
+            withTimeoutOrNull(TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS) {
+                var lastObservation: TerminalSnapshotReadinessObservation? = null
+                for (pauseMillis in TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS) {
+                    currentCoroutineContext().ensureActive()
+                    val observation = latestTerminalSnapshot(session, stored, pc.keyEpoch)
+                    lastObservation = observation
+                    if (observation?.snapshot != null ||
+                        observation?.lastOutputSequence == 0uL ||
+                        observation?.failure?.code == SessionOpenFailureCode.SNAPSHOT_UNSUPPORTED
+                    ) break
+                    delay(pauseMillis)
+                }
+                lastObservation?.snapshot
+            }
+        }
+        if (remoteSnapshot != null) {
+            restoreRemoteNativeTerminalSnapshot(
+                session = session,
+                pc = pc,
+                pcDevice = pcDevice,
+                stored = stored,
+                engine = engine,
+                expectedRendererGeneration = cursor.rendererGeneration,
+                descriptor = remoteSnapshot,
+            )?.let { return it }
+        }
+
         val latestAuthoritativeTail = try {
             latestAuthoritativeSessionTail(session)
         } catch (error: CancellationException) {
@@ -5169,6 +5422,15 @@ internal class ProductionProductRepository(
         if (encoded.length != 8 || encoded.any { !it.isDigit() }) return null
         val epoch = encoded.toLongOrNull()?.takeIf { it > 0 } ?: return null
         return epoch.takeIf { TerminalSnapshotCrypto.snapshotKeyId(recipientDeviceId, it) == keyId }
+    }
+
+    private fun terminalCoreSnapshotKeyEpoch(recipientDeviceId: UUID, keyId: String): Long? {
+        val prefix = "terminal-core-snapshot-v2:${recipientDeviceId.toString().replace("-", "")}:"
+        if (!keyId.startsWith(prefix)) return null
+        val encoded = keyId.removePrefix(prefix)
+        if (encoded.length != 8 || encoded.any { !it.isDigit() }) return null
+        val epoch = encoded.toLongOrNull()?.takeIf { it > 0 } ?: return null
+        return epoch.takeIf { TerminalSnapshotCrypto.terminalCoreSnapshotKeyId(recipientDeviceId, it) == keyId }
     }
 
     private fun transcriptKeyEpoch(recipientDeviceId: UUID, keyId: String): Long? {
@@ -6123,7 +6385,12 @@ internal fun terminalSnapshotRuntimeNegotiated(
     localRuntimeEnabled: Boolean,
     pcCapabilities: Set<String>,
 ): Boolean = localRuntimeEnabled &&
-    dev.termlink.model.PcCapabilityIds.TERMINAL_SNAPSHOT_V1 in pcCapabilities
+    dev.termlink.model.PcCapabilityIds.TERMINAL_SNAPSHOT_V2 in pcCapabilities
+
+internal suspend fun <T> awaitRemoteSnapshotWhenNegotiated(
+    negotiated: Boolean,
+    awaitRemoteSnapshot: suspend () -> T?,
+): T? = if (negotiated) awaitRemoteSnapshot() else null
 
 /** Sequence zero is safe only when neither endpoint has historical output. */
 internal fun canSafelySubscribeFromZeroWithoutSnapshot(
@@ -6180,6 +6447,7 @@ internal val TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS =
     )
 internal const val TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS = 30_000L
 internal const val TERMINAL_SNAPSHOT_READINESS_REQUEST_TIMEOUT_MILLIS = 1_000L
+internal const val TRANSCRIPT_PAGE_LOAD_FAILED_CODE = "TRANSCRIPT_PAGE_LOAD_FAILED"
 internal const val TRANSCRIPT_PUBLICATION_READINESS_TIMEOUT_MILLIS =
     TERMINAL_STREAMED_REPLAY_READINESS_TIMEOUT_MILLIS
 // The schedule deliberately extends beyond the absolute deadline. This keeps

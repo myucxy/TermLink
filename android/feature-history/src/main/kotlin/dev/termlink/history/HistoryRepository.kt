@@ -706,10 +706,18 @@ class HistoryRepository(
             }
             require(snapshot.sessionId == safeSessionId) { "renderer checkpoint snapshot belongs to another session" }
             require(snapshot.snapshotSequence == sequence) { "renderer checkpoint snapshot sequence mismatch" }
-            require(snapshot.formatName == TERMINAL_SNAPSHOT_FORMAT && snapshot.formatVersion == 1) {
+            require(
+                snapshot.formatName == TERMINAL_SNAPSHOT_FORMAT && snapshot.formatVersion == 1 ||
+                    snapshot.formatName == TERMINAL_CORE_SNAPSHOT_FORMAT && snapshot.formatVersion == 2,
+            ) {
                 "renderer checkpoint uses an unsupported snapshot format"
             }
-            require(snapshot.sizeBytes in 1..MAX_TERMINAL_SNAPSHOT_BYTES) {
+            val maximumSnapshotBytes = if (snapshot.formatName == TERMINAL_CORE_SNAPSHOT_FORMAT) {
+                MAX_TERMINAL_CORE_SNAPSHOT_BYTES
+            } else {
+                MAX_TERMINAL_SNAPSHOT_BYTES
+            }
+            require(snapshot.sizeBytes in 1..maximumSnapshotBytes) {
                 "renderer checkpoint snapshot size is out of bounds"
             }
             require(snapshot.rows in 1..MAX_TERMINAL_SNAPSHOT_ROWS) {
@@ -1306,8 +1314,10 @@ class HistoryRepository(
     companion object {
         const val BOUNDED_EVENT_REPLAY_FORMAT = "BOUNDED_EVENT_REPLAY"
         const val TERMINAL_SNAPSHOT_FORMAT = "TERMLINK_TERMINAL_SNAPSHOT"
+        const val TERMINAL_CORE_SNAPSHOT_FORMAT = "TERMLINK_TERMINAL_CORE_SNAPSHOT"
         const val TERMINAL_TRANSCRIPT_FORMAT = "TERMLINK_TERMINAL_TRANSCRIPT"
         const val MAX_TERMINAL_SNAPSHOT_BYTES = 2L * 1024 * 1024
+        const val MAX_TERMINAL_CORE_SNAPSHOT_BYTES = 64L * 1024 * 1024
         const val MAX_TERMINAL_TRANSCRIPT_BYTES = 512L * 1024
         const val MAX_TERMINAL_SNAPSHOT_ROWS = 256
         const val MAX_TERMINAL_SNAPSHOT_COLUMNS = 512

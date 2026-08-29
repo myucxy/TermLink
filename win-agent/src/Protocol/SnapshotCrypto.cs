@@ -23,6 +23,12 @@ public static class SnapshotCrypto
     public const int MaxTranscriptPlaintextBytes = 2 * 1024 * 1024;
     public const string SnapshotFormatName = "TERMLINK_TERMINAL_SNAPSHOT";
     public const string TranscriptFormatName = "TERMLINK_TERMINAL_TRANSCRIPT";
+    public const uint TerminalCoreSnapshotContainerVersion = 2;
+    public const uint TerminalCoreSnapshotFormatVersion = 2;
+    public const int MaxTerminalCoreSnapshotObjectBytes = 64 * 1024 * 1024;
+    public const int MaxTerminalCoreSnapshotPlaintextBytes =
+        MaxTerminalCoreSnapshotObjectBytes - 4 * 1024;
+    public const string TerminalCoreSnapshotFormatName = "TERMLINK_TERMINAL_CORE_SNAPSHOT";
 
     private const int MaxColumns = 512;
     private const int MaxRows = 256;
@@ -43,12 +49,19 @@ public static class SnapshotCrypto
     private static readonly byte[] TranscriptKeyPrefix = "TERMLINK-TERMINAL-TRANSCRIPT-KEY-V1\0"u8.ToArray();
     private static readonly byte[] SnapshotAadPrefix = "TERMLINK-TERMINAL-SNAPSHOT-OBJECT-V1\0"u8.ToArray();
     private static readonly byte[] TranscriptAadPrefix = "TERMLINK-TERMINAL-TRANSCRIPT-OBJECT-V1\0"u8.ToArray();
+    private static readonly byte[] TerminalCoreSnapshotKeyPrefix =
+        "TERMLINK-TERMINAL-CORE-SNAPSHOT-KEY-V2\0"u8.ToArray();
+    private static readonly byte[] TerminalCoreSnapshotAadPrefix =
+        "TERMLINK-TERMINAL-CORE-SNAPSHOT-OBJECT-V2\0"u8.ToArray();
 
     public static string SnapshotKeyId(Guid recipientDeviceId, long keyEpoch) =>
         KeyId("snapshot-v1:", recipientDeviceId, keyEpoch);
 
     public static string TranscriptKeyId(Guid recipientDeviceId, long keyEpoch) =>
         KeyId("transcript-v1:", recipientDeviceId, keyEpoch);
+
+    public static string TerminalCoreSnapshotKeyId(Guid recipientDeviceId, long keyEpoch) =>
+        KeyId("terminal-core-snapshot-v2:", recipientDeviceId, keyEpoch);
 
     public static byte[] SealSnapshot(
         byte[] pairwiseKey,
@@ -141,6 +154,154 @@ public static class SnapshotCrypto
             if (snapshot.SnapshotSeq != container.SnapshotSeq || snapshot.Columns != container.Columns || snapshot.Rows != container.Rows)
                 throw new InvalidDataException("Snapshot plaintext does not match authenticated metadata.");
             return NormalizeSnapshotForImport(snapshot);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(key);
+            CryptographicOperations.ZeroMemory(aad);
+            if (plaintext is not null) CryptographicOperations.ZeroMemory(plaintext);
+        }
+    }
+
+    public static byte[] SealTerminalCoreSnapshot(
+        byte[] pairwiseKey,
+        Guid sessionId,
+        Guid pcDeviceId,
+        Guid recipientDeviceId,
+        long keyEpoch,
+        ulong snapshotSequence,
+        uint columns,
+        uint rows,
+        ulong initialTranscriptBeforeLineId,
+        ulong observedLocalInputEpoch,
+        byte[] checkpoint,
+        byte[] nonce = null)
+    {
+        ValidatePairwiseAndIdentity(pairwiseKey, sessionId, pcDeviceId, recipientDeviceId, keyEpoch);
+        ValidateTerminalCoreSnapshotMetadata(
+            snapshotSequence,
+            columns,
+            rows,
+            initialTranscriptBeforeLineId,
+            observedLocalInputEpoch,
+            checkpoint);
+        var nonceBytes = CopyNonce(nonce);
+        try
+        {
+            var keyId = TerminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch);
+            var container = new TerminalCoreSnapshotCiphertextV2
+            {
+                ContainerVersion = TerminalCoreSnapshotContainerVersion,
+                SessionId = ByteString.CopyFrom(UuidBytes(sessionId)),
+                PcDeviceId = ByteString.CopyFrom(UuidBytes(pcDeviceId)),
+                RecipientDeviceId = ByteString.CopyFrom(UuidBytes(recipientDeviceId)),
+                KeyEpoch = keyEpoch,
+                KeyId = keyId,
+                SnapshotSeq = snapshotSequence,
+                Columns = columns,
+                Rows = rows,
+                FormatName = TerminalCoreSnapshotFormatName,
+                FormatVersion = TerminalCoreSnapshotFormatVersion,
+                Compression = SnapshotCompressionV1.None,
+                UncompressedBytes = checked((ulong)checkpoint.LongLength),
+                Nonce = ByteString.CopyFrom(nonceBytes),
+                InitialTranscriptBeforeLineId = initialTranscriptBeforeLineId,
+                ObservedLocalInputEpoch = observedLocalInputEpoch
+            };
+            var key = DeriveTerminalCoreSnapshotKey(
+                pairwiseKey,
+                sessionId,
+                recipientDeviceId,
+                keyEpoch,
+                keyId);
+            var aad = TerminalCoreSnapshotAssociatedData(container);
+            try
+            {
+                container.Ciphertext = ByteString.CopyFrom(
+                    SessionCrypto.Encrypt(key, nonceBytes, aad, checkpoint));
+                var result = container.ToByteArray();
+                if (result.Length > MaxTerminalCoreSnapshotObjectBytes)
+                    throw new InvalidDataException("Sealed terminal-core snapshot exceeds the production bound.");
+                return result;
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(key);
+                CryptographicOperations.ZeroMemory(aad);
+            }
+        }
+        finally { CryptographicOperations.ZeroMemory(nonceBytes); }
+    }
+
+    public static byte[] OpenTerminalCoreSnapshot(
+        byte[] pairwiseKey,
+        byte[] sealedObject,
+        Guid expectedSessionId,
+        Guid expectedPcDeviceId,
+        Guid expectedRecipientDeviceId,
+        long expectedKeyEpoch,
+        string expectedKeyId,
+        ulong expectedSnapshotSequence,
+        uint expectedColumns,
+        uint expectedRows,
+        ulong expectedInitialTranscriptBeforeLineId,
+        out ulong observedLocalInputEpoch)
+    {
+        ValidatePairwiseAndIdentity(
+            pairwiseKey,
+            expectedSessionId,
+            expectedPcDeviceId,
+            expectedRecipientDeviceId,
+            expectedKeyEpoch);
+        if (sealedObject is null || sealedObject.Length == 0 ||
+            sealedObject.Length > MaxTerminalCoreSnapshotObjectBytes)
+            throw new InvalidDataException("Sealed terminal-core snapshot size is invalid.");
+        TerminalCoreSnapshotCiphertextV2 container;
+        try { container = TerminalCoreSnapshotCiphertextV2.Parser.ParseFrom(sealedObject); }
+        catch (InvalidProtocolBufferException error)
+        {
+            throw new InvalidDataException("Terminal-core snapshot container is invalid protobuf.", error);
+        }
+        ValidateTerminalCoreSnapshotContainer(
+            container,
+            expectedSessionId,
+            expectedPcDeviceId,
+            expectedRecipientDeviceId,
+            expectedKeyEpoch,
+            expectedKeyId,
+            expectedSnapshotSequence,
+            expectedColumns,
+            expectedRows,
+            expectedInitialTranscriptBeforeLineId);
+        var key = DeriveTerminalCoreSnapshotKey(
+            pairwiseKey,
+            expectedSessionId,
+            expectedRecipientDeviceId,
+            expectedKeyEpoch,
+            expectedKeyId);
+        var aad = TerminalCoreSnapshotAssociatedData(container);
+        byte[] plaintext = null;
+        try
+        {
+            plaintext = SessionCrypto.Decrypt(
+                key,
+                container.Nonce.ToByteArray(),
+                aad,
+                container.Ciphertext.ToByteArray());
+            if ((ulong)plaintext.LongLength != container.UncompressedBytes)
+                throw new InvalidDataException(
+                    "Terminal-core snapshot plaintext size does not match authenticated metadata.");
+            ValidateTerminalCoreSnapshotMetadata(
+                container.SnapshotSeq,
+                container.Columns,
+                container.Rows,
+                container.InitialTranscriptBeforeLineId,
+                container.ObservedLocalInputEpoch,
+                plaintext);
+            observedLocalInputEpoch = container.ObservedLocalInputEpoch;
+            var result = plaintext;
+            plaintext = null;
+            return result;
         }
         finally
         {
@@ -259,6 +420,21 @@ public static class SnapshotCrypto
     public static byte[] DeriveTranscriptKey(byte[] pairwiseKey, Guid sessionId, Guid recipientDeviceId, long keyEpoch, string keyId) =>
         DeriveObjectKey(pairwiseKey, sessionId, recipientDeviceId, keyEpoch, keyId, TranscriptKeyPrefix, TranscriptKeyId(recipientDeviceId, keyEpoch));
 
+    public static byte[] DeriveTerminalCoreSnapshotKey(
+        byte[] pairwiseKey,
+        Guid sessionId,
+        Guid recipientDeviceId,
+        long keyEpoch,
+        string keyId) =>
+        DeriveObjectKey(
+            pairwiseKey,
+            sessionId,
+            recipientDeviceId,
+            keyEpoch,
+            keyId,
+            TerminalCoreSnapshotKeyPrefix,
+            TerminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch));
+
     public static byte[] SnapshotAssociatedData(TerminalSnapshotCiphertextV1 value)
     {
         ArgumentNullException.ThrowIfNull(value);
@@ -312,6 +488,101 @@ public static class SnapshotCrypto
         WriteUInt64(stream, value.UncompressedBytes);
         stream.Write(value.Nonce.Span);
         return stream.ToArray();
+    }
+
+    public static byte[] TerminalCoreSnapshotAssociatedData(
+        TerminalCoreSnapshotCiphertextV2 value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        ValidateTerminalCoreSnapshotCryptographicMetadata(value);
+        using var stream = new MemoryStream();
+        stream.Write(TerminalCoreSnapshotAadPrefix);
+        WriteUInt32(stream, value.ContainerVersion);
+        stream.Write(value.SessionId.Span);
+        stream.Write(value.PcDeviceId.Span);
+        stream.Write(value.RecipientDeviceId.Span);
+        WriteInt64(stream, value.KeyEpoch);
+        WriteString(stream, value.KeyId, "terminal-core snapshot key ID");
+        WriteUInt64(stream, value.SnapshotSeq);
+        WriteUInt32(stream, value.Columns);
+        WriteUInt32(stream, value.Rows);
+        WriteString(stream, value.FormatName, "terminal-core snapshot format name");
+        WriteUInt32(stream, value.FormatVersion);
+        WriteUInt32(stream, checked((uint)value.Compression));
+        WriteUInt64(stream, value.UncompressedBytes);
+        WriteUInt64(stream, value.InitialTranscriptBeforeLineId);
+        WriteUInt64(stream, value.ObservedLocalInputEpoch);
+        stream.Write(value.Nonce.Span);
+        return stream.ToArray();
+    }
+
+    private static void ValidateTerminalCoreSnapshotContainer(
+        TerminalCoreSnapshotCiphertextV2 value,
+        Guid sessionId,
+        Guid pcDeviceId,
+        Guid recipientDeviceId,
+        long keyEpoch,
+        string keyId,
+        ulong sequence,
+        uint columns,
+        uint rows,
+        ulong initialTranscriptBeforeLineId)
+    {
+        ValidateTerminalCoreSnapshotCryptographicMetadata(value);
+        if (!value.SessionId.Span.SequenceEqual(UuidBytes(sessionId)) ||
+            !value.PcDeviceId.Span.SequenceEqual(UuidBytes(pcDeviceId)) ||
+            !value.RecipientDeviceId.Span.SequenceEqual(UuidBytes(recipientDeviceId)) ||
+            value.KeyEpoch != keyEpoch || value.KeyId != keyId ||
+            value.KeyId != TerminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch) ||
+            value.SnapshotSeq != sequence || value.Columns != columns || value.Rows != rows ||
+            value.InitialTranscriptBeforeLineId != initialTranscriptBeforeLineId ||
+            value.Ciphertext.Length < 16 ||
+            value.Ciphertext.Length > MaxTerminalCoreSnapshotObjectBytes)
+        {
+            throw new InvalidDataException(
+                "Terminal-core snapshot object metadata does not match the requested object.");
+        }
+    }
+
+    private static void ValidateTerminalCoreSnapshotCryptographicMetadata(
+        TerminalCoreSnapshotCiphertextV2 value)
+    {
+        if (value.ContainerVersion != TerminalCoreSnapshotContainerVersion ||
+            value.SessionId.Length != 16 || value.PcDeviceId.Length != 16 ||
+            value.RecipientDeviceId.Length != 16 || value.KeyEpoch < 1 ||
+            Utf8Length(value.KeyId, "terminal-core snapshot key ID") is < 8 or > 128 ||
+            value.Nonce.Length != 12 ||
+            value.FormatVersion != TerminalCoreSnapshotFormatVersion ||
+            value.FormatName != TerminalCoreSnapshotFormatName ||
+            value.Compression != SnapshotCompressionV1.None ||
+            value.UncompressedBytes is 0 or > MaxTerminalCoreSnapshotPlaintextBytes ||
+            value.SnapshotSeq is 0 or > MaxSupportedUInt64 ||
+            value.Columns is < 1 or > MaxColumns || value.Rows is < 1 or > MaxRows ||
+            value.InitialTranscriptBeforeLineId is 0 or > MaxSupportedUInt64 ||
+            value.ObservedLocalInputEpoch > MaxSupportedUInt64)
+        {
+            throw new InvalidDataException(
+                "Terminal-core snapshot cryptographic metadata is invalid or unsupported.");
+        }
+    }
+
+    private static void ValidateTerminalCoreSnapshotMetadata(
+        ulong snapshotSequence,
+        uint columns,
+        uint rows,
+        ulong initialTranscriptBeforeLineId,
+        ulong observedLocalInputEpoch,
+        byte[] checkpoint)
+    {
+        if (snapshotSequence is 0 or > MaxSupportedUInt64 ||
+            columns is < 1 or > MaxColumns || rows is < 1 or > MaxRows ||
+            initialTranscriptBeforeLineId is 0 or > MaxSupportedUInt64 ||
+            observedLocalInputEpoch > MaxSupportedUInt64 || checkpoint is null ||
+            checkpoint.Length is 0 or > MaxTerminalCoreSnapshotPlaintextBytes)
+        {
+            throw new InvalidDataException(
+                "Terminal-core snapshot metadata is invalid or unsupported.");
+        }
     }
 
     public static void ValidateSnapshot(TerminalSnapshotV1 value)

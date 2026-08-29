@@ -64,6 +64,54 @@ class NativeTerminalEngine(
     override val title: StateFlow<String> = mutableTitle.asStateFlow()
     internal val frames: StateFlow<TerminalRenderFrameV3> = mutableFrame.asStateFlow()
 
+    data class InstalledCheckpoint(
+        val sequence: Long,
+        val size: TerminalSize,
+    )
+
+    /** Atomically replaces the live parser with an authenticated canonical Snapshot V2. */
+    fun installCheckpoint(checkpoint: ByteArray): InstalledCheckpoint {
+        require(checkpoint.isNotEmpty()) { "Native terminal checkpoint must not be empty" }
+        val replacement = NativeTerminalHandle.importCheckpoint(bridge, checkpoint, limits)
+        val frame = try {
+            replacement.renderV3().renderFrame
+        } catch (error: Throwable) {
+            runCatching(replacement::close).exceptionOrNull()?.let(error::addSuppressed)
+            throw error
+        }
+        val nextSourceSequence = replacement.nextSourceSequence
+        require(nextSourceSequence > FIRST_SOURCE_SEQUENCE) {
+            "Native terminal checkpoint must follow at least one ordered source event"
+        }
+        val previous = try {
+            synchronized(lock) {
+                checkActive()
+                val owned = terminal
+                terminal = replacement
+                failedClosed = false
+                readOnly = true
+                owned
+            }
+        } catch (error: Throwable) {
+            runCatching(replacement::close).exceptionOrNull()?.let(error::addSuppressed)
+            throw error
+        }
+        try {
+            previous.close()
+        } catch (error: Throwable) {
+            synchronized(lock) {
+                failedClosed = true
+                readOnly = true
+            }
+            throw error
+        }
+        publishFrame(frame, notify = true)
+        return InstalledCheckpoint(
+            sequence = nextSourceSequence - 1L,
+            size = frame.size,
+        )
+    }
+
     override suspend fun feed(seq: Long, bytes: ByteBuffer) {
         require(seq > 0) { "Terminal sequence must be positive" }
         val owned = ByteArray(bytes.remaining())

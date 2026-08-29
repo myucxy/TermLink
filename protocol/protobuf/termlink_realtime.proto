@@ -484,6 +484,32 @@ message TerminalSnapshotCiphertextV1 {
   bytes ciphertext = 15;
 }
 
+// Authenticated container for terminal-core's canonical Snapshot V2 family.
+// The encrypted plaintext is the exact binary returned by
+// tl_terminal_checkpoint_export_snapshot and can be imported directly by
+// tl_terminal_import_snapshot on another supported platform.  Transcript and
+// input-epoch metadata live in the authenticated outer container because they
+// are product/session projections rather than terminal parser state.
+message TerminalCoreSnapshotCiphertextV2 {
+  uint32 container_version = 1;
+  bytes session_id = 2;
+  bytes pc_device_id = 3;
+  bytes recipient_device_id = 4;
+  int64 key_epoch = 5;
+  string key_id = 6;
+  uint64 snapshot_seq = 7;
+  uint32 columns = 8;
+  uint32 rows = 9;
+  string format_name = 10;
+  uint32 format_version = 11;
+  SnapshotCompressionV1 compression = 12;
+  uint64 uncompressed_bytes = 13;
+  bytes nonce = 14;
+  bytes ciphertext = 15;
+  uint64 initial_transcript_before_line_id = 16;
+  uint64 observed_local_input_epoch = 17;
+}
+
 // Transcript pages are an independent, read-only row projection. They never
 // advance the live ACK and their rows must never be prepended to a live VT
 // parser. Each page is sealed into TerminalTranscriptCiphertextV1 for REST.

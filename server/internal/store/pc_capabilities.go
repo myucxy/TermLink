@@ -14,6 +14,7 @@ const (
 
 	PCCapabilityRealtimeTerminalV1  = "realtime_terminal_v1"
 	PCCapabilityTerminalSnapshotV1  = "terminal_snapshot_v1"
+	PCCapabilityTerminalSnapshotV2  = "terminal_snapshot_v2"
 	PCCapabilityFileOperationsV1    = "file_operations_v1"
 	PCCapabilityTerminalCommandsV1  = "terminal_commands_v1"
 	PCCapabilityRemoteAgentUpdateV1 = "remote_agent_update_v1"

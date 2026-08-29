@@ -14,6 +14,12 @@ if (args.Contains("--print-snapshot-vector", StringComparer.Ordinal))
     return;
 }
 
+if (args.Contains("--print-terminal-core-snapshot-vector", StringComparer.Ordinal))
+{
+    Console.WriteLine(TerminalCoreSnapshotVectorValidation.CreateVectorJson());
+    return;
+}
+
 byte[] session = Enumerable.Repeat((byte)0x11, 16).ToArray();
 byte[] sender = Enumerable.Repeat((byte)0x22, 16).ToArray();
 var envelope = new Envelope
@@ -251,6 +257,8 @@ ExpectFailure(() => SessionTitleCrypto.Seal(maximumTitle, vectorSessionId, vecto
 
 SnapshotVectorValidation.Run();
 Console.WriteLine("TermLink terminal snapshot/transcript vector validation passed.");
+TerminalCoreSnapshotVectorValidation.Run();
+Console.WriteLine("TermLink terminal-core snapshot V2 vector validation passed.");
 
 static bool LegacySessionUpsertCanIgnoreTitle(byte[] bytes)
 {
