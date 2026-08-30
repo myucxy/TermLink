@@ -201,6 +201,241 @@ foreach (var part in new[] { "\u001b]11;rgb:ffff/", "eeee/dddd\u001b", "\\" })
 Require(suppressor.PendingCount == 0,
     "an OSC ST reply split across reads did not consume its expectation");
 
+using (var reorderedReplies = new OuterTerminalReplySuppressor())
+{
+    reorderedReplies.Expect(Encoding.ASCII.GetBytes("\u001b]10;rgb:ffff/ffff/ffff\u001b\\"));
+    reorderedReplies.Expect(Encoding.ASCII.GetBytes("\u001b]11;rgb:0000/0000/0000\u001b\\"));
+    var backgroundFirst = Encoding.ASCII.GetBytes("\u001b]11;rgb:0000/2b2b/3636\u001b\\");
+    var foregroundSecond = Encoding.ASCII.GetBytes("\u001b]10;rgb:8383/9494/9696\u0007user");
+    Require(reorderedReplies.Filter(backgroundFirst, backgroundFirst.Length).Length == 0 &&
+        Encoding.ASCII.GetString(reorderedReplies.Filter(foregroundSecond, foregroundSecond.Length)) == "user" &&
+        reorderedReplies.PendingCount == 0,
+        "out-of-order foreground/background replies were blocked by the expectation queue head");
+}
+
+using (var missingEarlierReply = new OuterTerminalReplySuppressor())
+{
+    missingEarlierReply.Expect(Encoding.ASCII.GetBytes("\u001b[?1;2c"));
+    missingEarlierReply.Expect(Encoding.ASCII.GetBytes("\u001b]10;rgb:ffff/ffff/ffff\u001b\\"));
+    var laterColor = Encoding.ASCII.GetBytes("\u001b]10;rgb:8383/9494/9696\u001b\\");
+    Require(missingEarlierReply.Filter(laterColor, laterColor.Length).Length == 0 &&
+        missingEarlierReply.PendingCount == 1,
+        "a missing earlier reply blocked a later independent semantic expectation");
+    var deviceAttributes = Encoding.ASCII.GetBytes("\u001b[?1;0c");
+    Require(missingEarlierReply.Filter(deviceAttributes, deviceAttributes.Length).Length == 0 &&
+        missingEarlierReply.PendingCount == 0,
+        "the earlier expectation was not retained after an out-of-order match");
+}
+
+using (var strictColorGrammar = new OuterTerminalReplySuppressor())
+{
+    strictColorGrammar.Expect(Encoding.ASCII.GetBytes("\u001b]10;rgb:ffff/ffff/ffff\u001b\\"));
+    var ordinarySetter = Encoding.ASCII.GetBytes("\u001b]10;red\u0007");
+    Require(strictColorGrammar.Filter(ordinarySetter, ordinarySetter.Length).SequenceEqual(ordinarySetter) &&
+        strictColorGrammar.PendingCount == 1,
+        "an ordinary OSC color setter consumed a color-query reply token");
+    var validReply = Encoding.ASCII.GetBytes("\u001b]10;rgb:83/949/9696\u0007");
+    Require(strictColorGrammar.Filter(validReply, validReply.Length).Length == 0 &&
+        strictColorGrammar.PendingCount == 0,
+        "a bounded standards-compatible rgb reply was not recognized");
+}
+
+var forwardedTerminalReplies = new List<byte[]>();
+using (var colorReplyRouter = new OuterTerminalReplySuppressor(
+    terminalReplyPassThrough: bytes => forwardedTerminalReplies.Add(bytes.ToArray())))
+{
+    foreach (var part in new[] { "\u001b]10;", "?\u001b", "\\\u001b]11;?\u0007" })
+    {
+        var bytes = Encoding.ASCII.GetBytes(part);
+        colorReplyRouter.ObserveOutput(bytes, bytes.Length);
+    }
+    var foregroundReply = Encoding.ASCII.GetBytes("\u001b]10;rgb:8383/9494/9696\u001b\\");
+    var backgroundReply = Encoding.ASCII.GetBytes("\u001b]11;rgb:0000/2b2b/3636\u001b\\");
+    Require(colorReplyRouter.Filter(foregroundReply, foregroundReply.Length).Length == 0,
+        "an expected outer foreground-color reply escaped protocol routing");
+    Require(colorReplyRouter.Filter(backgroundReply, backgroundReply.Length).Length == 0,
+        "an expected outer background-color reply escaped protocol routing");
+    Require(forwardedTerminalReplies.Count == 2 &&
+        forwardedTerminalReplies[0].SequenceEqual(foregroundReply) &&
+        forwardedTerminalReplies[1].SequenceEqual(backgroundReply) &&
+        colorReplyRouter.PendingCount == 0,
+        "outer color replies were not forwarded to ConPTY in query order");
+
+    var pastedWithoutQuery = Encoding.ASCII.GetBytes("\u001b]10;rgb:1111/2222/3333\u001b\\");
+    Require(colorReplyRouter.Filter(pastedWithoutQuery, pastedWithoutQuery.Length)
+            .SequenceEqual(pastedWithoutQuery) && forwardedTerminalReplies.Count == 2,
+        "unprompted OSC input was misclassified as an outer-terminal reply");
+}
+
+forwardedTerminalReplies.Clear();
+using (var mixedColorRouter = new OuterTerminalReplySuppressor(
+    terminalReplyPassThrough: bytes => forwardedTerminalReplies.Add(bytes.ToArray())))
+{
+    const ulong sourceSequence = 41;
+    var mixedQueries = Encoding.ASCII.GetBytes("\u001b]4;1;?;2;#ff0000;2;?\u001b\\");
+    mixedColorRouter.RegisterAuthorityReply(
+        Encoding.ASCII.GetBytes("\u001b]4;2;rgb:ffff/0000/0000\u001b\\"),
+        sourceSequence,
+        checked((uint)mixedQueries.Length),
+        0);
+    Require(mixedColorRouter.ProjectOutput(
+        mixedQueries, mixedQueries.Length, sourceSequence, () => true),
+        "the mixed palette query was not projected");
+
+    var externallyOwned = Encoding.ASCII.GetBytes("\u001b]4;1;rgb:1111/2222/3333\u001b\\");
+    var authoritativeDuplicate = Encoding.ASCII.GetBytes("\u001b]4;2;rgb:aaaa/bbbb/cccc\u001b\\");
+    Require(mixedColorRouter.Filter(externallyOwned, externallyOwned.Length).Length == 0 &&
+        forwardedTerminalReplies.Count == 1 && forwardedTerminalReplies[0].SequenceEqual(externallyOwned),
+        "a palette query without an authority baseline was not forwarded");
+    Require(mixedColorRouter.Filter(authoritativeDuplicate, authoritativeDuplicate.Length).Length == 0 &&
+        forwardedTerminalReplies.Count == 1 && mixedColorRouter.PendingCount == 0,
+        "an authority-owned palette reply was forwarded or matched the wrong palette index");
+}
+
+forwardedTerminalReplies.Clear();
+using (var repeatedPaletteRouter = new OuterTerminalReplySuppressor(
+    terminalReplyPassThrough: bytes => forwardedTerminalReplies.Add(bytes.ToArray())))
+{
+    const ulong sourceSequence = 42;
+    var repeatedQueries = Encoding.ASCII.GetBytes("\u001b]4;7;?;7;#123456;7;?\u001b\\");
+    repeatedPaletteRouter.RegisterAuthorityReply(
+        Encoding.ASCII.GetBytes("\u001b]4;7;rgb:1212/3434/5656\u001b\\"),
+        sourceSequence,
+        checked((uint)repeatedQueries.Length),
+        0);
+    Require(repeatedPaletteRouter.ProjectOutput(
+        repeatedQueries, repeatedQueries.Length, sourceSequence, () => true),
+        "the repeated palette query was not projected");
+    var firstExternal = Encoding.ASCII.GetBytes("\u001b]4;7;rgb:aaaa/bbbb/cccc\u001b\\");
+    var secondDuplicate = Encoding.ASCII.GetBytes("\u001b]4;7;rgb:1111/2222/3333\u001b\\");
+    Require(repeatedPaletteRouter.Filter(firstExternal, firstExternal.Length).Length == 0 &&
+        forwardedTerminalReplies.Count == 1 && forwardedTerminalReplies[0].SequenceEqual(firstExternal),
+        "a newer authority reply stole an older same-index external palette query");
+    Require(repeatedPaletteRouter.Filter(secondDuplicate, secondDuplicate.Length).Length == 0 &&
+        forwardedTerminalReplies.Count == 1 && repeatedPaletteRouter.PendingCount == 0,
+        "the current same-index authoritative palette reply was not suppressed exactly once");
+}
+
+forwardedTerminalReplies.Clear();
+using (var authoritativeColorRouter = new OuterTerminalReplySuppressor(
+    terminalReplyPassThrough: bytes => forwardedTerminalReplies.Add(bytes.ToArray())))
+{
+    const ulong sourceSequence = 43;
+    var query = Encoding.ASCII.GetBytes("\u001b]10;#eeeeee\u001b\\\u001b]10;?\u001b\\");
+    authoritativeColorRouter.RegisterAuthorityReply(
+        Encoding.ASCII.GetBytes("\u001b]10;rgb:eeee/eeee/eeee\u001b\\"),
+        sourceSequence,
+        checked((uint)query.Length),
+        0);
+    Require(authoritativeColorRouter.ProjectOutput(
+        query, query.Length, sourceSequence, () => true),
+        "the authority-owned default color query was not projected");
+    var outerDuplicate = Encoding.ASCII.GetBytes("\u001b]10;rgb:8383/9494/9696\u001b\\");
+    Require(authoritativeColorRouter.Filter(outerDuplicate, outerDuplicate.Length).Length == 0 &&
+        forwardedTerminalReplies.Count == 0 && authoritativeColorRouter.PendingCount == 0,
+        "an outer color reply duplicated terminal-core's authoritative PTY reply");
+}
+
+forwardedTerminalReplies.Clear();
+using (var resolvedThenUnresolved = new OuterTerminalReplySuppressor(
+    terminalReplyPassThrough: bytes => forwardedTerminalReplies.Add(bytes.ToArray())))
+{
+    var set = Encoding.ASCII.GetBytes("\u001b]10;#123456\u001b\\");
+    Require(resolvedThenUnresolved.ProjectOutput(set, set.Length, 50, () => true),
+        "the default-color setup output was not projected");
+    var firstQuery = Encoding.ASCII.GetBytes("\u001b]10;?\u001b\\");
+    var reset = Encoding.ASCII.GetBytes("\u001b]110\u001b\\");
+    var batch = firstQuery.Concat(reset).Concat(firstQuery).ToArray();
+    resolvedThenUnresolved.RegisterAuthorityReply(
+        Encoding.ASCII.GetBytes("\u001b]10;rgb:1212/3434/5656\u001b\\"),
+        51,
+        checked((uint)firstQuery.Length),
+        0);
+    Require(resolvedThenUnresolved.ProjectOutput(batch, batch.Length, 51, () => true),
+        "the resolved-to-unresolved query batch was not projected");
+    var firstDuplicate = Encoding.ASCII.GetBytes("\u001b]10;rgb:aaaa/bbbb/cccc\u001b\\");
+    var secondFallback = Encoding.ASCII.GetBytes("\u001b]10;rgb:1111/2222/3333\u001b\\");
+    Require(resolvedThenUnresolved.Filter(firstDuplicate, firstDuplicate.Length).Length == 0 &&
+        forwardedTerminalReplies.Count == 0,
+        "the resolved query's outer duplicate was forwarded");
+    Require(resolvedThenUnresolved.Filter(secondFallback, secondFallback.Length).Length == 0 &&
+        forwardedTerminalReplies.Count == 1 && forwardedTerminalReplies[0].SequenceEqual(secondFallback),
+        "the later unresolved same-selector query was suppressed");
+}
+
+forwardedTerminalReplies.Clear();
+using (var unresolvedThenResolved = new OuterTerminalReplySuppressor(
+    terminalReplyPassThrough: bytes => forwardedTerminalReplies.Add(bytes.ToArray())))
+{
+    var firstQuery = Encoding.ASCII.GetBytes("\u001b]10;?\u001b\\");
+    var set = Encoding.ASCII.GetBytes("\u001b]10;#654321\u001b\\");
+    var batch = firstQuery.Concat(set).Concat(firstQuery).ToArray();
+    unresolvedThenResolved.RegisterAuthorityReply(
+        Encoding.ASCII.GetBytes("\u001b]10;rgb:6565/4343/2121\u001b\\"),
+        52,
+        checked((uint)batch.Length),
+        0);
+    Require(unresolvedThenResolved.ProjectOutput(batch, batch.Length, 52, () => true),
+        "the unresolved-to-resolved query batch was not projected");
+    var firstFallback = Encoding.ASCII.GetBytes("\u001b]10;rgb:aaaa/bbbb/cccc\u001b\\");
+    var secondDuplicate = Encoding.ASCII.GetBytes("\u001b]10;rgb:1111/2222/3333\u001b\\");
+    Require(unresolvedThenResolved.Filter(firstFallback, firstFallback.Length).Length == 0 &&
+        forwardedTerminalReplies.Count == 1 && forwardedTerminalReplies[0].SequenceEqual(firstFallback),
+        "the first unresolved same-selector query was suppressed");
+    Require(unresolvedThenResolved.Filter(secondDuplicate, secondDuplicate.Length).Length == 0 &&
+        forwardedTerminalReplies.Count == 1,
+        "the later resolved same-selector duplicate was forwarded");
+}
+
+forwardedTerminalReplies.Clear();
+using (var causallyFencedRouter = new OuterTerminalReplySuppressor(
+    terminalReplyPassThrough: bytes => forwardedTerminalReplies.Add(bytes.ToArray())))
+{
+    causallyFencedRouter.Expect(Encoding.ASCII.GetBytes("\u001b[?1;2c"));
+    var escape = new byte[] { 0x1b };
+    Require(causallyFencedRouter.Filter(escape, escape.Length).Length == 0,
+        "a candidate prefix was not retained for the causal-fence test");
+    var laterQuery = Encoding.ASCII.GetBytes("\u001b]10;?\u001b\\");
+    causallyFencedRouter.ObserveOutput(laterQuery, laterQuery.Length);
+    var remainder = Encoding.ASCII.GetBytes("]10;rgb:1111/2222/3333\u001b\\");
+    var released = causallyFencedRouter.Filter(remainder, remainder.Length);
+    Require(released.SequenceEqual(Encoding.ASCII.GetBytes("\u001b]10;rgb:1111/2222/3333\u001b\\")) &&
+        forwardedTerminalReplies.Count == 0 && causallyFencedRouter.PendingCount == 2,
+        "a reply expectation created after candidate input began consumed earlier user input");
+}
+
+using (var deferredAuthorityRouter = new OuterTerminalReplySuppressor())
+{
+    var query = Encoding.ASCII.GetBytes("\u001b]10;#abcdef\u001b\\\u001b]10;?\u001b\\");
+    var duplicate = Encoding.ASCII.GetBytes("\u001b]10;rgb:abab/cdcd/efef\u001b\\");
+    deferredAuthorityRouter.RegisterAuthorityReply(
+        duplicate,
+        60,
+        checked((uint)query.Length),
+        0);
+    Require(deferredAuthorityRouter.Filter(duplicate, duplicate.Length).SequenceEqual(duplicate) &&
+        deferredAuthorityRouter.PendingCount == 0,
+        "an authority expectation became active before its query was projected");
+    Require(deferredAuthorityRouter.ProjectOutput(query, query.Length, 60, () => true) &&
+        deferredAuthorityRouter.Filter(duplicate, duplicate.Length).Length == 0,
+        "an authority expectation was not activated by successful projection");
+}
+
+using (var failedProjectionRouter = new OuterTerminalReplySuppressor())
+{
+    var query = Encoding.ASCII.GetBytes("\u001b]10;#abcdef\u001b\\\u001b]10;?\u001b\\");
+    var duplicate = Encoding.ASCII.GetBytes("\u001b]10;rgb:abab/cdcd/efef\u001b\\");
+    failedProjectionRouter.RegisterAuthorityReply(
+        duplicate,
+        61,
+        checked((uint)query.Length),
+        0);
+    Require(!failedProjectionRouter.ProjectOutput(query, query.Length, 61, () => false) &&
+        failedProjectionRouter.PendingCount == 0 &&
+        failedProjectionRouter.Filter(duplicate, duplicate.Length).SequenceEqual(duplicate),
+        "a failed projection left an active terminal-reply expectation");
+}
+
 suppressor.Expect(Encoding.ASCII.GetBytes("\u001bP1$r0m\u001b\\"));
 foreach (var part in new[] { "\u001bP1$", "r1m\u001b", "\\" })
 {
@@ -299,7 +534,7 @@ using (var authority = new TerminalCoreAuthority(
     80,
     24,
     bytes => ptyReplies.Add((byte[])bytes.Clone()),
-    bytes => outerExpectations.Add((byte[])bytes.Clone())))
+    (bytes, _, _, _) => outerExpectations.Add((byte[])bytes.Clone())))
 {
     var authoritySession = Guid.NewGuid();
     authority.ApplyDurable(new LocalFrame(
@@ -377,7 +612,49 @@ using (var authority = new TerminalCoreAuthority(
         "DEC 9001 did not preserve the complete Win32 key record");
 }
 
-using (var gapAuthority = new TerminalCoreAuthority(80, 24, _ => { }, _ => { }))
+var integratedForwardedReplies = new List<byte[]>();
+using (var integratedRouter = new OuterTerminalReplySuppressor(
+    terminalReplyPassThrough: bytes => integratedForwardedReplies.Add(bytes.ToArray())))
+using (var integratedAuthority = new TerminalCoreAuthority(
+    80,
+    24,
+    _ => { },
+    integratedRouter.RegisterAuthorityReply))
+{
+    var sessionId = Guid.NewGuid();
+    integratedAuthority.ApplyDurable(new LocalFrame(
+        LocalFrameType.Lifecycle,
+        sessionId,
+        1,
+        LocalPayloadCodec.Lifecycle(LocalLifecycleState.Running, 0)));
+    var resolvedQuery = Encoding.ASCII.GetBytes("\u001b]10;#123456\u001b\\\u001b]10;?\u001b\\");
+    integratedAuthority.ApplyDurable(new LocalFrame(
+        LocalFrameType.Output,
+        sessionId,
+        2,
+        resolvedQuery));
+    Require(integratedRouter.ProjectOutput(resolvedQuery, resolvedQuery.Length, 2, () => true),
+        "the integrated authority color query was not projected");
+    var duplicate = Encoding.ASCII.GetBytes("\u001b]10;rgb:aaaa/bbbb/cccc\u001b\\");
+    Require(integratedRouter.Filter(duplicate, duplicate.Length).Length == 0 &&
+        integratedForwardedReplies.Count == 0,
+        "the integrated source coordinate did not suppress an authority-owned color reply");
+
+    var unresolvedQuery = Encoding.ASCII.GetBytes("\u001b]110\u001b\\\u001b]10;?\u001b\\");
+    integratedAuthority.ApplyDurable(new LocalFrame(
+        LocalFrameType.Output,
+        sessionId,
+        3,
+        unresolvedQuery));
+    Require(integratedRouter.ProjectOutput(unresolvedQuery, unresolvedQuery.Length, 3, () => true),
+        "the integrated unresolved color query was not projected");
+    var fallback = Encoding.ASCII.GetBytes("\u001b]10;rgb:1111/2222/3333\u001b\\");
+    Require(integratedRouter.Filter(fallback, fallback.Length).Length == 0 &&
+        integratedForwardedReplies.Count == 1 && integratedForwardedReplies[0].SequenceEqual(fallback),
+        "the integrated unresolved color reply was not forwarded as protocol input");
+}
+
+using (var gapAuthority = new TerminalCoreAuthority(80, 24, _ => { }, (_, _, _, _) => { }))
 {
     var gapSession = Guid.NewGuid();
     RequireThrowsInvalidData(

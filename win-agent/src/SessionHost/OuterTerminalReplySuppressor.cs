@@ -6,9 +6,11 @@ using System.Threading;
 namespace TermLink.SessionHost
 {
     /// <summary>
-    /// Suppresses only bounded terminal-generated replies for which terminal-core has already
-    /// emitted the authoritative PTY reply. Ordinary key input and unmatched escape sequences
-    /// pass through unchanged. A reply candidate may span multiple input reads.
+    /// Suppresses bounded terminal-generated replies for which terminal-core has already emitted
+    /// the authoritative PTY reply. If terminal-core has no configured OSC color baseline, the
+    /// outer terminal's expected color reply is forwarded to ConPTY as protocol input without
+    /// being classified as a local key press. Ordinary key input and unmatched escape sequences
+    /// pass through unchanged. A query or reply may span multiple reads.
     /// </summary>
     internal sealed class OuterTerminalReplySuppressor : IDisposable
     {
@@ -16,40 +18,163 @@ namespace TermLink.SessionHost
         private static readonly TimeSpan CandidateLifetime = TimeSpan.FromMilliseconds(250);
         private const int MaximumCsiReplyBytes = 1024;
         private const int MaximumReplyBytes = 64 * 1024;
+        private const int MaximumPaletteOperations = 256;
 
         private readonly object sync = new object();
-        private readonly Queue<ExpectedReply> expected = new Queue<ExpectedReply>();
+        private readonly List<ExpectedReply> expected = new List<ExpectedReply>();
+        private readonly List<AuthorityReply> pendingAuthority = new List<AuthorityReply>();
         private readonly List<PendingByte> candidate = new List<PendingByte>(128);
         private readonly MemoryStream deferredPassThrough = new MemoryStream();
         private readonly Action<byte[]> expiredRawPassThrough;
+        private readonly Action<byte[]> terminalReplyPassThrough;
         private readonly Timer expiryTimer;
-        private ExpectedReply candidateExpectation;
+        private readonly List<byte> observedOscSelector = new List<byte>(4);
+        private readonly List<byte> observedOscPayload = new List<byte>(256);
+        private readonly bool[] observedPaletteKnown = new bool[256];
+        private readonly bool[] observedDefaultColorKnown = new bool[3];
         private DateTime candidateExpiresUtc;
+        private long nextExpectationId;
+        private long candidateMaximumExpectationId;
+        private long nextProjectionId;
+        private List<AuthorityReply> projectingAuthority;
+        private OutputParseState outputParseState;
         private bool disposed;
 
-        public OuterTerminalReplySuppressor(Action<byte[]> expiredRawPassThrough = null)
+        public OuterTerminalReplySuppressor(
+            Action<byte[]> expiredRawPassThrough = null,
+            Action<byte[]> terminalReplyPassThrough = null)
         {
             this.expiredRawPassThrough = expiredRawPassThrough;
+            this.terminalReplyPassThrough = terminalReplyPassThrough;
             expiryTimer = new Timer(OnExpiryTimer, null, Timeout.Infinite, Timeout.Infinite);
         }
 
         public void Expect(byte[] authoritativeReply)
         {
-            if (authoritativeReply == null || authoritativeReply.Length == 0 ||
-                authoritativeReply.Length > MaximumReplyBytes)
-            {
-                throw new ArgumentException("A bounded terminal reply is required.", nameof(authoritativeReply));
-            }
+            ValidateReply(authoritativeReply, nameof(authoritativeReply));
             lock (sync)
             {
                 ThrowIfDisposed();
                 var now = DateTime.UtcNow;
                 PurgeExpired(now);
-                expected.Enqueue(new ExpectedReply(
-                    ReplyKindOf(authoritativeReply),
+                int qualifier;
+                var kind = ReplyKindOf(authoritativeReply, 0, authoritativeReply.Length, out qualifier);
+                expected.Add(new ExpectedReply(
+                    NextExpectationId(),
+                    kind,
+                    qualifier,
                     (byte[])authoritativeReply.Clone(),
-                    now + ExpectationLifetime));
+                    ExpectationDisposition.Suppress,
+                    now + ExpectationLifetime,
+                    projectionId: 0,
+                    sourceSequence: 0,
+                    sourceOffsetEnd: 0,
+                    sourceOrdinal: 0,
+                    hasSourceCoordinate: false));
                 ScheduleExpiryTimer(now);
+            }
+        }
+
+        public void RegisterAuthorityReply(
+            byte[] authoritativeReply,
+            ulong sourceSequence,
+            uint sourceOffsetEnd,
+            uint sourceOrdinal)
+        {
+            ValidateReply(authoritativeReply, nameof(authoritativeReply));
+            if (sourceSequence == 0) throw new ArgumentOutOfRangeException(nameof(sourceSequence));
+            if (sourceOffsetEnd == 0) throw new ArgumentOutOfRangeException(nameof(sourceOffsetEnd));
+            lock (sync)
+            {
+                ThrowIfDisposed();
+                int qualifier;
+                var kind = ReplyKindOf(authoritativeReply, 0, authoritativeReply.Length, out qualifier);
+                pendingAuthority.Add(new AuthorityReply(
+                    kind,
+                    qualifier,
+                    (byte[])authoritativeReply.Clone(),
+                    sourceSequence,
+                    sourceOffsetEnd,
+                    sourceOrdinal));
+            }
+        }
+
+        /// <summary>
+        /// Observes the exact ConPTY output before it is projected to Windows Terminal. Only
+        /// syntactically bounded OSC 4/10/11/12 color queries create expectations. This lets an
+        /// outer-terminal reply be distinguished from human input even when terminal-core has no
+        /// color baseline from which to mint an authoritative reply.
+        /// </summary>
+        public void ObserveOutput(byte[] output, int length)
+        {
+            ProjectOutput(output, length, 0, () => true);
+        }
+
+        public bool ProjectOutput(
+            byte[] output,
+            int length,
+            ulong sourceSequence,
+            Func<bool> projection)
+        {
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            if (length < 0 || length > output.Length) throw new ArgumentOutOfRangeException(nameof(length));
+            if (projection == null) throw new ArgumentNullException(nameof(projection));
+
+            lock (sync)
+            {
+                ThrowIfDisposed();
+                var now = DateTime.UtcNow;
+                PurgeExpired(now);
+                var projectionId = NextProjectionId();
+                projectingAuthority = TakeAuthorityReplies(sourceSequence);
+                try
+                {
+                    if (terminalReplyPassThrough != null)
+                    {
+                        for (var offset = 0; offset < length; offset++)
+                        {
+                            ObserveOutputByte(
+                                output[offset],
+                                now,
+                                sourceSequence,
+                                checked((uint)offset + 1),
+                                projectionId);
+                        }
+                    }
+                    ActivateRemainingAuthorityReplies(projectionId, now);
+                    bool projected;
+                    try
+                    {
+                        projected = projection();
+                    }
+                    catch
+                    {
+                        CancelProjection(projectionId);
+                        throw;
+                    }
+                    if (projected)
+                    {
+                        var projectedAt = DateTime.UtcNow;
+                        RefreshProjectionExpiry(projectionId, projectedAt + ExpectationLifetime);
+                        ScheduleExpiryTimer(projectedAt);
+                    }
+                    else
+                    {
+                        CancelProjection(projectionId);
+                        ScheduleExpiryTimer(DateTime.UtcNow);
+                    }
+                    return projected;
+                }
+                catch
+                {
+                    ClearProjectingAuthority();
+                    CancelProjection(projectionId);
+                    throw;
+                }
+                finally
+                {
+                    projectingAuthority = null;
+                }
             }
         }
 
@@ -137,10 +262,8 @@ namespace TermLink.SessionHost
                     return;
                 }
                 candidate.Add(new PendingByte(value, fragment));
-                candidateExpectation = expected.Peek();
-                candidateExpiresUtc = Earlier(
-                    now + CandidateLifetime,
-                    candidateExpectation.ExpiresUtc);
+                candidateExpiresUtc = now + CandidateLifetime;
+                candidateMaximumExpectationId = nextExpectationId;
                 return;
             }
 
@@ -153,15 +276,18 @@ namespace TermLink.SessionHost
                     var bytes = new byte[candidate.Count];
                     for (var index = 0; index < candidate.Count; index++)
                         bytes[index] = candidate[index].Value;
-                    if (candidateExpectation == expected.Peek() &&
-                        Matches(candidateExpectation, bytes, 0, bytes.Length))
+                    var matchIndex = MatchingExpectationIndex(bytes, 0, bytes.Length);
+                    if (matchIndex >= 0)
                     {
-                        var matched = expected.Dequeue();
+                        var matched = expected[matchIndex];
+                        expected.RemoveAt(matchIndex);
+                        var forward = matched.Disposition == ExpectationDisposition.Forward;
                         ClearExpectation(matched);
                         ResolveCandidate(suppressed: true, output, retainTrailingEscape: false);
                         candidate.Clear();
-                        candidateExpectation = null;
                         candidateExpiresUtc = default;
+                        candidateMaximumExpectationId = 0;
+                        if (forward) terminalReplyPassThrough(bytes);
                     }
                     else
                     {
@@ -184,15 +310,13 @@ namespace TermLink.SessionHost
 
             var trailing = retainTrailingEscape ? candidate[candidate.Count - 1] : null;
             candidate.Clear();
-            candidateExpectation = null;
             candidateExpiresUtc = default;
+            candidateMaximumExpectationId = 0;
             if (retainTrailingEscape && expected.Count != 0)
             {
                 candidate.Add(trailing);
-                candidateExpectation = expected.Peek();
-                candidateExpiresUtc = Earlier(
-                    DateTime.UtcNow + CandidateLifetime,
-                    candidateExpectation.ExpiresUtc);
+                candidateExpiresUtc = DateTime.UtcNow + CandidateLifetime;
+                candidateMaximumExpectationId = nextExpectationId;
             }
         }
 
@@ -212,21 +336,11 @@ namespace TermLink.SessionHost
 
         private void PurgeExpired(DateTime now)
         {
-            while (expected.Count != 0 && expected.Peek().ExpiresUtc <= now)
+            for (var index = expected.Count - 1; index >= 0; index--)
             {
-                var expired = expected.Dequeue();
-                if (ReferenceEquals(candidateExpectation, expired))
-                {
-                    for (var index = 0; index < candidate.Count; index++)
-                    {
-                        var item = candidate[index];
-                        if (item.Fragment == null) deferredPassThrough.WriteByte(item.Value);
-                        else item.Fragment.Resolve(suppressed: false);
-                    }
-                    candidate.Clear();
-                    candidateExpectation = null;
-                    candidateExpiresUtc = default;
-                }
+                if (expected[index].ExpiresUtc > now) continue;
+                var expired = expected[index];
+                expected.RemoveAt(index);
                 ClearExpectation(expired);
             }
         }
@@ -241,8 +355,8 @@ namespace TermLink.SessionHost
                 else item.Fragment.Resolve(suppressed: false);
             }
             candidate.Clear();
-            candidateExpectation = null;
             candidateExpiresUtc = default;
+            candidateMaximumExpectationId = 0;
         }
 
         private void OnExpiryTimer(object state)
@@ -269,9 +383,11 @@ namespace TermLink.SessionHost
             if (disposed) return;
             DateTime? deadline = null;
             if (candidate.Count != 0) deadline = candidateExpiresUtc;
-            if (expected.Count != 0 &&
-                (!deadline.HasValue || expected.Peek().ExpiresUtc < deadline.Value))
-                deadline = expected.Peek().ExpiresUtc;
+            foreach (var expectation in expected)
+            {
+                if (!deadline.HasValue || expectation.ExpiresUtc < deadline.Value)
+                    deadline = expectation.ExpiresUtc;
+            }
             if (!deadline.HasValue)
             {
                 expiryTimer.Change(Timeout.Infinite, Timeout.Infinite);
@@ -282,9 +398,6 @@ namespace TermLink.SessionHost
                 : Math.Max(1, (int)Math.Ceiling((deadline.Value - now).TotalMilliseconds));
             expiryTimer.Change(delay, Timeout.Infinite);
         }
-
-        private static DateTime Earlier(DateTime left, DateTime right) =>
-            left <= right ? left : right;
 
         private void ThrowIfDisposed()
         {
@@ -302,7 +415,360 @@ namespace TermLink.SessionHost
 
         private static void ClearExpectation(ExpectedReply expectation)
         {
-            Array.Clear(expectation.ExactBytes, 0, expectation.ExactBytes.Length);
+            if (expectation.ExactBytes != null)
+                Array.Clear(expectation.ExactBytes, 0, expectation.ExactBytes.Length);
+        }
+
+        private void ObserveOutputByte(
+            byte value,
+            DateTime now,
+            ulong sourceSequence,
+            uint sourceOffsetEnd,
+            long projectionId)
+        {
+            switch (outputParseState)
+            {
+                case OutputParseState.Normal:
+                    if (value == 0x1b) outputParseState = OutputParseState.Escape;
+                    return;
+                case OutputParseState.Escape:
+                    if (value == (byte)']')
+                    {
+                        observedOscSelector.Clear();
+                        observedOscPayload.Clear();
+                        outputParseState = OutputParseState.OscSelector;
+                    }
+                    else
+                    {
+                        outputParseState = value == 0x1b
+                            ? OutputParseState.Escape
+                            : OutputParseState.Normal;
+                    }
+                    return;
+                case OutputParseState.OscSelector:
+                    if (value == (byte)';')
+                    {
+                        outputParseState = OutputParseState.OscPayload;
+                    }
+                    else if (value == 0x07)
+                    {
+                        CompleteObservedOsc(
+                            now,
+                            sourceSequence,
+                            sourceOffsetEnd,
+                            projectionId);
+                    }
+                    else if (value == 0x1b)
+                    {
+                        outputParseState = OutputParseState.OscSelectorEscape;
+                    }
+                    else if (observedOscSelector.Count < 4 && value >= (byte)'0' && value <= (byte)'9')
+                    {
+                        observedOscSelector.Add(value);
+                    }
+                    else
+                    {
+                        outputParseState = OutputParseState.IgnoreOsc;
+                    }
+                    return;
+                case OutputParseState.OscSelectorEscape:
+                    if (value == (byte)'\\')
+                    {
+                        CompleteObservedOsc(
+                            now,
+                            sourceSequence,
+                            sourceOffsetEnd,
+                            projectionId);
+                    }
+                    else
+                    {
+                        outputParseState = value == 0x1b
+                            ? OutputParseState.IgnoreOscEscape
+                            : OutputParseState.IgnoreOsc;
+                    }
+                    return;
+                case OutputParseState.OscPayload:
+                    if (value == 0x07)
+                    {
+                        CompleteObservedOsc(
+                            now,
+                            sourceSequence,
+                            sourceOffsetEnd,
+                            projectionId);
+                    }
+                    else if (value == 0x1b)
+                    {
+                        outputParseState = OutputParseState.OscEscape;
+                    }
+                    else if (observedOscPayload.Count < MaximumReplyBytes)
+                    {
+                        observedOscPayload.Add(value);
+                    }
+                    else
+                    {
+                        outputParseState = OutputParseState.IgnoreOsc;
+                    }
+                    return;
+                case OutputParseState.OscEscape:
+                    if (value == (byte)'\\')
+                    {
+                        CompleteObservedOsc(
+                            now,
+                            sourceSequence,
+                            sourceOffsetEnd,
+                            projectionId);
+                    }
+                    else if (observedOscPayload.Count + 2 <= MaximumReplyBytes)
+                    {
+                        observedOscPayload.Add(0x1b);
+                        observedOscPayload.Add(value);
+                        outputParseState = OutputParseState.OscPayload;
+                    }
+                    else
+                    {
+                        outputParseState = OutputParseState.IgnoreOsc;
+                    }
+                    return;
+                case OutputParseState.IgnoreOsc:
+                    if (value == 0x07) ResetObservedOsc();
+                    else if (value == 0x1b) outputParseState = OutputParseState.IgnoreOscEscape;
+                    return;
+                case OutputParseState.IgnoreOscEscape:
+                    if (value == (byte)'\\') ResetObservedOsc();
+                    else outputParseState = value == 0x1b
+                        ? OutputParseState.IgnoreOscEscape
+                        : OutputParseState.IgnoreOsc;
+                    return;
+                default:
+                    throw new InvalidOperationException("Unknown terminal output parser state.");
+            }
+        }
+
+        private void CompleteObservedOsc(
+            DateTime now,
+            ulong sourceSequence,
+            uint sourceOffsetEnd,
+            long projectionId)
+        {
+            try
+            {
+                int selector;
+                if (!TryParseDecimal(observedOscSelector, 0, observedOscSelector.Count, ushort.MaxValue, out selector))
+                    return;
+                if (selector >= 10 && selector <= 12)
+                {
+                    var slot = selector - 10;
+                    var kind = selector == 10
+                        ? ReplyKind.DefaultForeground
+                        : selector == 11
+                            ? ReplyKind.DefaultBackground
+                            : ReplyKind.DefaultCursor;
+                    if (observedOscPayload.Count == 1 && observedOscPayload[0] == (byte)'?')
+                    {
+                        if (sourceSequence != 0 && observedDefaultColorKnown[slot])
+                        {
+                            ReconcileAuthorityExpectation(
+                                kind,
+                                -1,
+                                now,
+                                sourceSequence,
+                                sourceOffsetEnd,
+                                projectionId);
+                        }
+                        else
+                        {
+                            EnqueueExternalExpectation(
+                                kind,
+                                -1,
+                                now,
+                                sourceSequence,
+                                sourceOffsetEnd,
+                                projectionId);
+                        }
+                    }
+                    else if (sourceSequence != 0)
+                    {
+                        observedDefaultColorKnown[slot] = !IsExactAscii(observedOscPayload, "default");
+                    }
+                    return;
+                }
+                if (selector == 4)
+                {
+                    ObservePaletteQueries(
+                        now,
+                        sourceSequence,
+                        sourceOffsetEnd,
+                        projectionId);
+                }
+                else if (selector == 104 && sourceSequence != 0)
+                {
+                    ResetObservedPaletteKnowledge();
+                }
+                else if (selector >= 110 && selector <= 112 && sourceSequence != 0)
+                {
+                    observedDefaultColorKnown[selector - 110] = false;
+                }
+            }
+            finally
+            {
+                ResetObservedOsc();
+            }
+        }
+
+        private void ObservePaletteQueries(
+            DateTime now,
+            ulong sourceSequence,
+            uint sourceOffsetEnd,
+            long projectionId)
+        {
+            var fields = new List<Field>(MaximumPaletteOperations * 2);
+            var start = 0;
+            for (var index = 0; index <= observedOscPayload.Count; index++)
+            {
+                if (index != observedOscPayload.Count && observedOscPayload[index] != (byte)';') continue;
+                if (fields.Count >= MaximumPaletteOperations * 2) return;
+                fields.Add(new Field(start, index - start));
+                start = index + 1;
+            }
+            if (fields.Count == 0 || (fields.Count & 1) != 0) return;
+
+            for (var fieldIndex = 0; fieldIndex < fields.Count; fieldIndex += 2)
+            {
+                var indexField = fields[fieldIndex];
+                int paletteIndex;
+                if (!TryParseDecimal(
+                    observedOscPayload,
+                    indexField.Offset,
+                    indexField.Length,
+                    byte.MaxValue,
+                    out paletteIndex))
+                {
+                    return;
+                }
+                var valueField = fields[fieldIndex + 1];
+                if (valueField.Length == 1 &&
+                    observedOscPayload[valueField.Offset] == (byte)'?')
+                {
+                    if (sourceSequence != 0 && observedPaletteKnown[paletteIndex])
+                    {
+                        ReconcileAuthorityExpectation(
+                            ReplyKind.PaletteColor,
+                            paletteIndex,
+                            now,
+                            sourceSequence,
+                            sourceOffsetEnd,
+                            projectionId);
+                    }
+                    else
+                    {
+                        EnqueueExternalExpectation(
+                            ReplyKind.PaletteColor,
+                            paletteIndex,
+                            now,
+                            sourceSequence,
+                            sourceOffsetEnd,
+                            projectionId);
+                    }
+                }
+                else if (sourceSequence != 0)
+                {
+                    observedPaletteKnown[paletteIndex] = true;
+                }
+            }
+        }
+
+        private void ResetObservedPaletteKnowledge()
+        {
+            if (observedOscPayload.Count == 0)
+            {
+                Array.Clear(observedPaletteKnown, 0, observedPaletteKnown.Length);
+                return;
+            }
+            var fieldStart = 0;
+            for (var index = 0; index <= observedOscPayload.Count; index++)
+            {
+                if (index != observedOscPayload.Count && observedOscPayload[index] != (byte)';') continue;
+                int paletteIndex;
+                if (!TryParseDecimal(
+                    observedOscPayload,
+                    fieldStart,
+                    index - fieldStart,
+                    byte.MaxValue,
+                    out paletteIndex)) return;
+                observedPaletteKnown[paletteIndex] = false;
+                fieldStart = index + 1;
+            }
+        }
+
+        private static bool IsExactAscii(IList<byte> bytes, string value)
+        {
+            if (bytes.Count != value.Length) return false;
+            for (var index = 0; index < value.Length; index++)
+                if (bytes[index] != (byte)value[index]) return false;
+            return true;
+        }
+
+        private void EnqueueExternalExpectation(
+            ReplyKind kind,
+            int qualifier,
+            DateTime now,
+            ulong sourceSequence,
+            uint sourceOffsetEnd,
+            long projectionId)
+        {
+            expected.Add(new ExpectedReply(
+                NextExpectationId(),
+                kind,
+                qualifier,
+                null,
+                ExpectationDisposition.Forward,
+                now + ExpectationLifetime,
+                projectionId,
+                sourceSequence,
+                sourceOffsetEnd,
+                sourceOrdinal: 0,
+                hasSourceCoordinate: sourceSequence != 0));
+        }
+
+        private void ReconcileAuthorityExpectation(
+            ReplyKind kind,
+            int qualifier,
+            DateTime now,
+            ulong sourceSequence,
+            uint sourceOffsetEnd,
+            long projectionId)
+        {
+            if (projectingAuthority == null)
+                throw new InvalidOperationException("No terminal output projection is active.");
+            for (var index = 0; index < projectingAuthority.Count; index++)
+            {
+                var authority = projectingAuthority[index];
+                if (
+                    authority.SourceSequence == sourceSequence &&
+                    authority.SourceOffsetEnd == sourceOffsetEnd &&
+                    authority.Kind == kind && authority.Qualifier == qualifier)
+                {
+                    projectingAuthority.RemoveAt(index);
+                    expected.Add(NewAuthorityExpectation(
+                        authority,
+                        projectionId,
+                        now + ExpectationLifetime));
+                    authority.ReleaseOwnership();
+                    return;
+                }
+            }
+            throw new InvalidDataException(
+                "terminal-core color reply did not match its projected output query coordinate " +
+                "(kind=" + kind + ", sequence=" + sourceSequence +
+                ", offset=" + sourceOffsetEnd +
+                ", pending=" + projectingAuthority.Count + ").");
+        }
+
+        private void ResetObservedOsc()
+        {
+            observedOscSelector.Clear();
+            observedOscPayload.Clear();
+            outputParseState = OutputParseState.Normal;
         }
 
         private static CandidateStatus CandidateStatusOf(List<PendingByte> bytes)
@@ -362,19 +828,126 @@ namespace TermLink.SessionHost
             int offset,
             int length)
         {
-            var candidateKind = ReplyKindOf(candidateBytes, offset, length);
-            if (expectation.Kind != ReplyKind.Exact && expectation.Kind == candidateKind)
+            int candidateQualifier;
+            var candidateKind = ReplyKindOf(candidateBytes, offset, length, out candidateQualifier);
+            if (expectation.Kind != ReplyKind.Exact && expectation.Kind == candidateKind &&
+                expectation.Qualifier == candidateQualifier)
                 return true;
+            if (expectation.ExactBytes == null) return false;
             if (expectation.ExactBytes.Length != length) return false;
             for (var index = 0; index < length; index++)
                 if (expectation.ExactBytes[index] != candidateBytes[offset + index]) return false;
             return true;
         }
 
-        private static ReplyKind ReplyKindOf(byte[] bytes) => ReplyKindOf(bytes, 0, bytes.Length);
-
-        private static ReplyKind ReplyKindOf(byte[] bytes, int offset, int length)
+        private int MatchingExpectationIndex(byte[] bytes, int offset, int length)
         {
+            for (var index = 0; index < expected.Count; index++)
+            {
+                if (expected[index].Id <= candidateMaximumExpectationId &&
+                    Matches(expected[index], bytes, offset, length)) return index;
+            }
+            return -1;
+        }
+
+        private long NextExpectationId()
+        {
+            if (nextExpectationId == long.MaxValue)
+                throw new InvalidOperationException("Terminal reply expectation sequence is exhausted.");
+            return ++nextExpectationId;
+        }
+
+        private long NextProjectionId()
+        {
+            if (nextProjectionId == long.MaxValue)
+                throw new InvalidOperationException("Terminal output projection sequence is exhausted.");
+            return ++nextProjectionId;
+        }
+
+        private List<AuthorityReply> TakeAuthorityReplies(ulong sourceSequence)
+        {
+            var result = new List<AuthorityReply>();
+            if (sourceSequence == 0) return result;
+            for (var index = 0; index < pendingAuthority.Count;)
+            {
+                var authority = pendingAuthority[index];
+                if (authority.SourceSequence != sourceSequence)
+                {
+                    index++;
+                    continue;
+                }
+                pendingAuthority.RemoveAt(index);
+                result.Add(authority);
+            }
+            return result;
+        }
+
+        private void ActivateRemainingAuthorityReplies(long projectionId, DateTime now)
+        {
+            if (projectingAuthority == null) return;
+            foreach (var authority in projectingAuthority)
+            {
+                expected.Add(NewAuthorityExpectation(
+                    authority,
+                    projectionId,
+                    now + ExpectationLifetime));
+                authority.ReleaseOwnership();
+            }
+            projectingAuthority.Clear();
+        }
+
+        private ExpectedReply NewAuthorityExpectation(
+            AuthorityReply authority,
+            long projectionId,
+            DateTime expiresUtc)
+        {
+            return new ExpectedReply(
+                NextExpectationId(),
+                authority.Kind,
+                authority.Qualifier,
+                authority.ExactBytes,
+                ExpectationDisposition.Suppress,
+                expiresUtc,
+                projectionId,
+                authority.SourceSequence,
+                authority.SourceOffsetEnd,
+                authority.SourceOrdinal,
+                hasSourceCoordinate: true);
+        }
+
+        private void ClearProjectingAuthority()
+        {
+            if (projectingAuthority == null) return;
+            foreach (var authority in projectingAuthority) authority.Clear();
+            projectingAuthority.Clear();
+        }
+
+        private void CancelProjection(long projectionId)
+        {
+            for (var index = expected.Count - 1; index >= 0; index--)
+            {
+                if (expected[index].ProjectionId != projectionId) continue;
+                var canceled = expected[index];
+                expected.RemoveAt(index);
+                ClearExpectation(canceled);
+            }
+        }
+
+        private void RefreshProjectionExpiry(long projectionId, DateTime expiresUtc)
+        {
+            foreach (var expectation in expected)
+                if (expectation.ProjectionId == projectionId) expectation.ExpiresUtc = expiresUtc;
+        }
+
+        private static void ValidateReply(byte[] reply, string parameterName)
+        {
+            if (reply == null || reply.Length == 0 || reply.Length > MaximumReplyBytes)
+                throw new ArgumentException("A bounded terminal reply is required.", parameterName);
+        }
+
+        private static ReplyKind ReplyKindOf(byte[] bytes, int offset, int length, out int qualifier)
+        {
+            qualifier = -1;
             if (length < 3 || bytes[offset] != 0x1b) return ReplyKind.Exact;
             var end = offset + length;
             if (bytes[offset + 1] == (byte)'[')
@@ -405,10 +978,37 @@ namespace TermLink.SessionHost
             {
                 var selectorEnd = Array.IndexOf(bytes, (byte)';', offset + 2, length - 2);
                 if (selectorEnd < 0) return ReplyKind.Exact;
+                var contentEnd = bytes[end - 1] == 0x07 ? end - 1 : end - 2;
+                if (contentEnd <= selectorEnd + 1) return ReplyKind.Exact;
                 var selectorLength = selectorEnd - offset - 2;
-                if (selectorLength == 1 && bytes[offset + 2] == (byte)'4') return ReplyKind.PaletteColor;
+                if (selectorLength == 1 && bytes[offset + 2] == (byte)'4')
+                {
+                    var indexEnd = Array.IndexOf(
+                        bytes,
+                        (byte)';',
+                        selectorEnd + 1,
+                        contentEnd - selectorEnd - 1);
+                    if (indexEnd < 0 || !TryParseDecimal(
+                        bytes,
+                        selectorEnd + 1,
+                        indexEnd - selectorEnd - 1,
+                        byte.MaxValue,
+                        out qualifier) || !IsRgbColorPayload(
+                            bytes,
+                            indexEnd + 1,
+                            contentEnd - indexEnd - 1))
+                    {
+                        qualifier = -1;
+                        return ReplyKind.Exact;
+                    }
+                    return ReplyKind.PaletteColor;
+                }
                 if (selectorLength == 2 && bytes[offset + 2] == (byte)'1')
                 {
+                    if (!IsRgbColorPayload(
+                        bytes,
+                        selectorEnd + 1,
+                        contentEnd - selectorEnd - 1)) return ReplyKind.Exact;
                     if (bytes[offset + 3] == (byte)'0') return ReplyKind.DefaultForeground;
                     if (bytes[offset + 3] == (byte)'1') return ReplyKind.DefaultBackground;
                     if (bytes[offset + 3] == (byte)'2') return ReplyKind.DefaultCursor;
@@ -417,18 +1017,141 @@ namespace TermLink.SessionHost
             return ReplyKind.Exact;
         }
 
+        private static bool IsRgbColorPayload(IList<byte> bytes, int offset, int length)
+        {
+            if (length < 9 || offset < 0 || offset > bytes.Count - length) return false;
+            if (bytes[offset] != (byte)'r' || bytes[offset + 1] != (byte)'g' ||
+                bytes[offset + 2] != (byte)'b' || bytes[offset + 3] != (byte)':') return false;
+            var componentStart = offset + 4;
+            var componentCount = 0;
+            var end = offset + length;
+            for (var index = componentStart; index <= end; index++)
+            {
+                if (index != end && bytes[index] != (byte)'/') continue;
+                var componentLength = index - componentStart;
+                if (componentLength < 1 || componentLength > 4) return false;
+                for (var digitIndex = componentStart; digitIndex < index; digitIndex++)
+                {
+                    var digit = bytes[digitIndex];
+                    var hexadecimal = digit >= (byte)'0' && digit <= (byte)'9' ||
+                        digit >= (byte)'a' && digit <= (byte)'f' ||
+                        digit >= (byte)'A' && digit <= (byte)'F';
+                    if (!hexadecimal) return false;
+                }
+                componentCount++;
+                componentStart = index + 1;
+            }
+            return componentCount == 3;
+        }
+
+        private static bool TryParseDecimal(
+            IList<byte> bytes,
+            int offset,
+            int length,
+            int maximum,
+            out int value)
+        {
+            value = 0;
+            if (length <= 0 || offset < 0 || offset > bytes.Count - length) return false;
+            for (var index = 0; index < length; index++)
+            {
+                var digit = bytes[offset + index];
+                if (digit < (byte)'0' || digit > (byte)'9') return false;
+                var next = (long)value * 10 + digit - (byte)'0';
+                if (next > maximum) return false;
+                value = (int)next;
+            }
+            return true;
+        }
+
         private sealed class ExpectedReply
         {
-            internal ExpectedReply(ReplyKind kind, byte[] exactBytes, DateTime expiresUtc)
+            internal ExpectedReply(
+                long id,
+                ReplyKind kind,
+                int qualifier,
+                byte[] exactBytes,
+                ExpectationDisposition disposition,
+                DateTime expiresUtc,
+                long projectionId,
+                ulong sourceSequence,
+                uint sourceOffsetEnd,
+                uint sourceOrdinal,
+                bool hasSourceCoordinate)
+            {
+                Id = id;
+                Kind = kind;
+                Qualifier = qualifier;
+                ExactBytes = exactBytes;
+                Disposition = disposition;
+                ExpiresUtc = expiresUtc;
+                ProjectionId = projectionId;
+                SourceSequence = sourceSequence;
+                SourceOffsetEnd = sourceOffsetEnd;
+                SourceOrdinal = sourceOrdinal;
+                HasSourceCoordinate = hasSourceCoordinate;
+            }
+
+            internal long Id { get; }
+            internal ReplyKind Kind { get; }
+            internal int Qualifier { get; }
+            internal byte[] ExactBytes { get; set; }
+            internal ExpectationDisposition Disposition { get; set; }
+            internal DateTime ExpiresUtc { get; set; }
+            internal long ProjectionId { get; }
+            internal ulong SourceSequence { get; }
+            internal uint SourceOffsetEnd { get; }
+            internal uint SourceOrdinal { get; }
+            internal bool HasSourceCoordinate { get; }
+        }
+
+        private sealed class AuthorityReply
+        {
+            internal AuthorityReply(
+                ReplyKind kind,
+                int qualifier,
+                byte[] exactBytes,
+                ulong sourceSequence,
+                uint sourceOffsetEnd,
+                uint sourceOrdinal)
             {
                 Kind = kind;
+                Qualifier = qualifier;
                 ExactBytes = exactBytes;
-                ExpiresUtc = expiresUtc;
+                SourceSequence = sourceSequence;
+                SourceOffsetEnd = sourceOffsetEnd;
+                SourceOrdinal = sourceOrdinal;
             }
 
             internal ReplyKind Kind { get; }
-            internal byte[] ExactBytes { get; }
-            internal DateTime ExpiresUtc { get; }
+            internal int Qualifier { get; }
+            internal byte[] ExactBytes { get; private set; }
+            internal ulong SourceSequence { get; }
+            internal uint SourceOffsetEnd { get; }
+            internal uint SourceOrdinal { get; }
+
+            internal void ReleaseOwnership()
+            {
+                ExactBytes = null;
+            }
+
+            internal void Clear()
+            {
+                if (ExactBytes != null) Array.Clear(ExactBytes, 0, ExactBytes.Length);
+                ExactBytes = null;
+            }
+        }
+
+        private readonly struct Field
+        {
+            internal Field(int offset, int length)
+            {
+                Offset = offset;
+                Length = length;
+            }
+
+            internal int Offset { get; }
+            internal int Length { get; }
         }
 
         private sealed class PendingByte
@@ -471,6 +1194,24 @@ namespace TermLink.SessionHost
             Invalid
         }
 
+        private enum ExpectationDisposition
+        {
+            Suppress,
+            Forward
+        }
+
+        private enum OutputParseState
+        {
+            Normal,
+            Escape,
+            OscSelector,
+            OscSelectorEscape,
+            OscPayload,
+            OscEscape,
+            IgnoreOsc,
+            IgnoreOscEscape
+        }
+
         private enum ReplyKind
         {
             Exact,
@@ -499,10 +1240,19 @@ namespace TermLink.SessionHost
                 expiryTimer.Change(Timeout.Infinite, Timeout.Infinite);
                 foreach (var expectation in expected) ClearExpectation(expectation);
                 expected.Clear();
+                foreach (var authority in pendingAuthority) authority.Clear();
+                pendingAuthority.Clear();
+                ClearProjectingAuthority();
+                projectingAuthority = null;
                 candidate.Clear();
-                candidateExpectation = null;
                 candidateExpiresUtc = default;
+                candidateMaximumExpectationId = 0;
                 deferredPassThrough.SetLength(0);
+                observedOscSelector.Clear();
+                observedOscPayload.Clear();
+                Array.Clear(observedPaletteKnown, 0, observedPaletteKnown.Length);
+                Array.Clear(observedDefaultColorKnown, 0, observedDefaultColorKnown.Length);
+                outputParseState = OutputParseState.Normal;
             }
             expiryTimer.Dispose();
         }

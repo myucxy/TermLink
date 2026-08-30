@@ -406,7 +406,9 @@ namespace TermLink.SessionHost
         public ConPtySessionHost(SessionHostOptions options)
         {
             this.options = options;
-            outerReplySuppressor = new OuterTerminalReplySuppressor(WriteExpiredRawInput);
+            outerReplySuppressor = new OuterTerminalReplySuppressor(
+                WriteExpiredRawInput,
+                WriteOuterTerminalReply);
         }
 
         public int Run()
@@ -424,7 +426,7 @@ namespace TermLink.SessionHost
                     size.X,
                     size.Y,
                     WriteAuthorityPtyReply,
-                    outerReplySuppressor.Expect);
+                    outerReplySuppressor.RegisterAuthorityReply);
             }
             StartChildSuspended();
 
@@ -646,6 +648,13 @@ namespace TermLink.SessionHost
                 stopInput = true;
                 CloseInput();
             }
+        }
+
+        private void WriteOuterTerminalReply(byte[] bytes)
+        {
+            if (bytes == null || bytes.Length == 0 || stopInput) return;
+            if (!WriteInput(bytes, bytes.Length))
+                throw new IOException("ConPTY input is closed for an outer-terminal reply.");
         }
 
         internal static bool ShouldAbortUnregisteredSession(
@@ -1230,7 +1239,32 @@ namespace TermLink.SessionHost
                     break;
                 }
                 titleTracker.Process(agentBytes, PublishTitleIfChanged);
-                if (!WriteAll(outerOutput, buffer, total))
+                // Activate reply routing while holding the same lock that projects the query.
+                // This prevents pre-projection user input from matching a future reply. The
+                // terminal-core source coordinate selects the exact query occurrence whose
+                // outer-terminal duplicate must be suppressed.
+                bool projected;
+                try
+                {
+                    projected = outerReplySuppressor.ProjectOutput(
+                        agentBytes,
+                        agentBytes.Length,
+                        outputSequence,
+                        () => WriteAll(outerOutput, buffer, total));
+                }
+                catch (Exception error)
+                {
+                    if (options.Diagnostics)
+                    {
+                        Console.Error.WriteLine(
+                            "__OUTER_TERMINAL_PROJECTION_FAILURE__:sequence=" + outputSequence +
+                            ";error=" + error.GetType().Name +
+                            ";message=" + error.Message.Replace('\r', ' ').Replace('\n', ' '));
+                    }
+                    outputDisconnected = true;
+                    break;
+                }
+                if (!projected)
                 {
                     outputDisconnected = true;
                     break;

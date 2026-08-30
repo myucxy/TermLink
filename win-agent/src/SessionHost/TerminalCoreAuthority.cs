@@ -19,7 +19,7 @@ namespace TermLink.SessionHost
 
         private readonly object sync = new object();
         private readonly Action<byte[]> ptyReplyWriter;
-        private readonly Action<byte[]> outerReplyExpectation;
+        private readonly Action<byte[], ulong, uint, uint> outerReplyExpectation;
         private NativeTerminal terminal;
         private WindowsConsoleInputEncoder consoleInputEncoder;
         private ulong lastAppliedSequence;
@@ -30,7 +30,7 @@ namespace TermLink.SessionHost
             int columns,
             int rows,
             Action<byte[]> ptyReplyWriter,
-            Action<byte[]> outerReplyExpectation)
+            Action<byte[], ulong, uint, uint> outerReplyExpectation)
         {
             if (columns < 1 || rows < 1) throw new ArgumentOutOfRangeException(nameof(columns));
             this.ptyReplyWriter = ptyReplyWriter ?? throw new ArgumentNullException(nameof(ptyReplyWriter));
@@ -185,7 +185,11 @@ namespace TermLink.SessionHost
                 // Register before writing the authoritative reply.  When the same query is
                 // projected to the outer Windows Terminal, its generated compatibility response
                 // is suppressed instead of being delivered to ConPTY a second time.
-                outerReplyExpectation(payload);
+                outerReplyExpectation(
+                    payload,
+                    effect.SourceSequence,
+                    effect.SourceOffsetEnd,
+                    effect.Ordinal);
                 ptyReplyWriter(payload);
                 Array.Clear(payload, 0, payload.Length);
             }
