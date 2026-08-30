@@ -122,6 +122,13 @@ namespace TermLink.TerminalCore
             0x1b, 0x5b, 0x3f, 0x30, 0x6e
         };
 
+        private static readonly byte[] XtVersionReply =
+        {
+            0x1b, 0x50, 0x3e, 0x7c,
+            0x54, 0x65, 0x72, 0x6d, 0x4c, 0x69, 0x6e, 0x6b,
+            0x28, 0x31, 0x29, 0x1b, 0x5c
+        };
+
         public static NativeTerminalHostEffectFrameV2 Decode(byte[] bytes)
         {
             if (bytes == null) throw new ArgumentNullException(nameof(bytes));
@@ -303,6 +310,7 @@ namespace TermLink.TerminalCore
                 if (IsCanonicalV1Reply(payload) ||
                     IsCanonicalDecrpm(payload) ||
                     IsCanonicalDecrqss(payload) ||
+                    payload.SequenceEqual(XtVersionReply) ||
                     IsCanonicalXtgettcap(payload) ||
                     IsCanonicalOscColor(payload))
                 {

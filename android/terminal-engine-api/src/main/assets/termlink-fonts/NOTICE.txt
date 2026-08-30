@@ -1,0 +1,14 @@
+CaskaydiaCove Nerd Font Mono Regular
+
+Bundled version: Nerd Fonts v3.5.1
+Upstream: https://github.com/ryanoasis/nerd-fonts
+Pinned source:
+https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/patched-fonts/CascadiaCode/CaskaydiaCoveNerdFontMono-Regular.ttf
+Size: 2931984 bytes
+SHA-256: 4e1e371b188bca589ec1ee7df494ca7bbb187c1c38228c059e5705f4029a9dc0
+
+Copyright (c) 2019 - Present, Microsoft Corporation,
+with Reserved Font Name Cascadia Code.
+
+The font is distributed under the SIL Open Font License 1.1. The complete
+license is included beside this notice as LICENSE.txt.

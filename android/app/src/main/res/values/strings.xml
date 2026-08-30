@@ -268,7 +268,7 @@
     <string name="settings_appearance_title">Appearance</string>
     <string name="settings_appearance_copy">Choose the app chrome theme. Terminal ANSI colors stay unchanged.</string>
     <string name="settings_terminal_title">Terminal display</string>
-    <string name="settings_terminal_copy">Adjust the preferred command-line font size, line spacing, and colors.</string>
+    <string name="settings_terminal_copy">Choose a terminal font scheme, size, line spacing, and colors.</string>
     <string name="settings_terminal_font_size">Preferred font size %1$.0fsp</string>
     <string name="settings_terminal_line_spacing">Line spacing %1$.1fx</string>
     <string name="settings_terminal_foreground">Foreground color</string>
@@ -494,4 +494,22 @@
     <string name="agent_update_phase_starting_agent">Starting the target Agent</string>
     <string name="agent_update_phase_verifying_connection">Verifying Relay and Server connectivity</string>
     <string name="agent_update_phase_rolling_back">Restoring the previous Agent</string>
+    <string name="settings_terminal_font_scheme">Font scheme</string>
+    <string name="settings_terminal_font_bundled">Built-in Nerd Font</string>
+    <string name="settings_terminal_font_system">System monospace</string>
+    <string name="settings_terminal_font_custom">Custom font</string>
+    <string name="settings_terminal_font_active">Current: %1$s</string>
+    <string name="settings_terminal_font_active_custom">Current: %1$s</string>
+    <string name="settings_terminal_font_import">Import font</string>
+    <string name="settings_terminal_font_replace">Replace font</string>
+    <string name="settings_terminal_font_remove">Remove</string>
+    <string name="settings_terminal_font_remove_failed">The custom font could not be removed.</string>
+    <string name="settings_terminal_font_local_copy">Custom TTF or OTF files stay in this app on this device and are never uploaded.</string>
+    <string name="settings_terminal_font_preview">  main   TermLink 中文 123  </string>
+    <string name="settings_terminal_font_imported">Using imported font: %1$s</string>
+    <string name="settings_terminal_font_error_empty">The selected font file is empty.</string>
+    <string name="settings_terminal_font_error_too_large">The selected font is larger than the 16 MB limit.</string>
+    <string name="settings_terminal_font_error_unsupported">Choose a supported TTF or OTF font file.</string>
+    <string name="settings_terminal_font_error_invalid">Android could not load this font. The previous font was kept.</string>
+    <string name="settings_terminal_font_error_unreadable">The selected font could not be read. The previous font was kept.</string>
 </resources>

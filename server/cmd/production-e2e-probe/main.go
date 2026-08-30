@@ -845,9 +845,10 @@ func (p *probe) verifyPublicEndpoints() error {
 }
 
 // verifyAnonymousRegistration exercises only browser-safe GET requests. It
-// proves the public portal, OIDC login page, registration link, custom theme,
-// and real Keycloak registration form are connected without creating an
-// account or loading any managed acceptance credential.
+// proves the public portal, OIDC login page, hosted registration form, and
+// localized client-side failures are connected without creating an account or
+// loading any managed acceptance credential. Keycloak native self-registration
+// must stay absent so it cannot bypass TermLink registration policy.
 func (p *probe) verifyAnonymousRegistration() error {
 	issuer, err := url.Parse(p.issuer)
 	if err != nil || !strings.EqualFold(issuer.Scheme, "https") || issuer.Host == "" || issuer.User != nil ||
@@ -891,34 +892,48 @@ func (p *probe) verifyAnonymousRegistration() error {
 	if !bytes.Contains(identityPage, []byte("identity-form-shell")) {
 		return errors.New("anonymous OIDC login page did not use the TermLink theme")
 	}
-	registrationURL, ok := registrationURLFromHTML(identityPage, authorizationURL)
-	if !ok || validateRegistrationURL(registrationURL, issuer, publicOrigin) != nil {
-		return errors.New("anonymous OIDC login page has no usable same-origin registration link")
+	if _, ok := registrationURLFromHTML(identityPage, authorizationURL); ok {
+		return errors.New("anonymous OIDC login page exposes native provider registration")
 	}
 
-	registrationResponse, err := browser.Get(registrationURL.String())
+	registrationResponse, err := browser.Get(publicOrigin.String() + "/register")
 	if err != nil {
-		return fmt.Errorf("anonymous OIDC registration page: %w", err)
+		return fmt.Errorf("anonymous hosted registration page: %w", err)
 	}
 	registrationPage, err := readBoundedHTML(registrationResponse)
 	if err != nil {
-		return fmt.Errorf("anonymous OIDC registration page: %w", err)
+		return fmt.Errorf("anonymous hosted registration page: %w", err)
 	}
 	if registrationResponse.StatusCode != http.StatusOK {
-		return fmt.Errorf("anonymous OIDC registration page returned HTTP %d", registrationResponse.StatusCode)
+		return fmt.Errorf("anonymous hosted registration page returned HTTP %d", registrationResponse.StatusCode)
 	}
 	if !bytes.Contains(registrationPage, []byte("identity-form-shell")) ||
-		!hasHTMLAttribute(registrationPage, "form", "id", "kc-register-form") {
-		return errors.New("anonymous OIDC registration page is not the themed Keycloak registration form")
+		!hasHTMLAttribute(registrationPage, "form", "id", "registration-form") {
+		return errors.New("anonymous hosted registration page is not the TermLink registration form")
 	}
-	for _, field := range []string{"username", "email", "password", "password-confirm"} {
+	for _, field := range []string{"username", "email", "password", "password_confirm"} {
 		if !hasHTMLAttribute(registrationPage, "input", "name", field) {
-			return fmt.Errorf("anonymous OIDC registration form is missing the %s field", field)
+			return fmt.Errorf("anonymous hosted registration form is missing the %s field", field)
 		}
 	}
-	if !hasHTMLAttribute(registrationPage, "input", "name", "nickname") &&
-		!hasHTMLAttribute(registrationPage, "input", "name", "user.attributes.nickname") {
-		return errors.New("anonymous OIDC registration form is missing the nickname field")
+	if !hasHTMLAttribute(registrationPage, "input", "name", "nickname") {
+		return errors.New("anonymous hosted registration form is missing the nickname field")
+	}
+
+	registrationScriptResponse, err := browser.Get(publicOrigin.String() + "/assets/register.js")
+	if err != nil {
+		return fmt.Errorf("anonymous hosted registration script: %w", err)
+	}
+	registrationScript, err := readBoundedHTML(registrationScriptResponse)
+	if err != nil {
+		return fmt.Errorf("anonymous hosted registration script: %w", err)
+	}
+	if registrationScriptResponse.StatusCode != http.StatusOK {
+		return fmt.Errorf("anonymous hosted registration script returned HTTP %d", registrationScriptResponse.StatusCode)
+	}
+	if !bytes.Contains(registrationScript, []byte("注册服务暂时不可用")) ||
+		!bytes.Contains(registrationScript, []byte("Registration is temporarily unavailable")) {
+		return errors.New("anonymous hosted registration failures are not localized in Chinese and English")
 	}
 	return nil
 }
@@ -970,14 +985,6 @@ func registrationURLFromHTML(page []byte, base *url.URL) (*url.URL, bool) {
 		}
 	}
 	return nil, false
-}
-
-func validateRegistrationURL(candidate, issuer, publicOrigin *url.URL) error {
-	if !sameHTTPSOrigin(candidate, publicOrigin) || candidate.User != nil || candidate.Fragment != "" ||
-		candidate.Path != strings.TrimRight(issuer.Path, "/")+"/login-actions/registration" {
-		return errors.New("OIDC registration URL violates the origin policy")
-	}
-	return nil
 }
 
 func sameHTTPSOrigin(candidate, expected *url.URL) bool {

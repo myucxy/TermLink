@@ -22,6 +22,7 @@ import dev.termlink.terminal.api.TerminalSessionProjectionSnapshotV1
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalSnapshotV1
 import dev.termlink.terminal.api.TerminalThemeV1
+import dev.termlink.terminal.api.TerminalTypefaceResolver
 import dev.termlink.terminal.api.TerminalViewportEngine
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -258,10 +259,13 @@ class TermuxTerminalEngine(
     }
 
     override fun applyTheme(theme: TerminalThemeV1) {
+        var fontChanged = false
         mutateSynchronously {
+            fontChanged = currentTheme?.fontFamilyHint != theme.fontFamilyHint
             currentTheme = theme
             applyThemeToEmulator(theme)
         }
+        if (fontChanged) applyTypefaceToAttachedView(theme)
     }
 
     override fun setReadOnly(readOnly: Boolean) {
@@ -324,9 +328,11 @@ class TermuxTerminalEngine(
             .roundToInt()
             .coerceAtLeast(1)
         val boundedLineSpacing = lineSpacingMultiplier.coerceIn(0.8f, 1.8f)
+        val fontFamilyHint = synchronized(lock) { currentTheme?.fontFamilyHint }
         return TerminalView(context, null).also { view ->
             view.setTextSize(textSizePx)
             view.setLineSpacing(boundedLineSpacing)
+            view.setTypeface(TerminalTypefaceResolver.resolve(context, fontFamilyHint))
             view.setTerminalViewClient(
                 TermuxTerminalViewClient(
                     view = view,
@@ -655,6 +661,7 @@ class TermuxTerminalEngine(
                 preferredTextSizePixels = effectivePreferred,
                 minimumReadableTextSizePixels = userSize ?: minimumReadableTextSizePixels(view.context),
                 lineSpacingMultiplier = attachedLineSpacingMultiplier,
+                typeface = TerminalTypefaceResolver.resolve(view.context, currentTheme?.fontFamilyHint),
             )
             if (fitted == appliedTextSizePixels) return
             fittingAttachedView = true
@@ -684,6 +691,15 @@ class TermuxTerminalEngine(
         emulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_FOREGROUND] = theme.foreground.value
         emulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_BACKGROUND] = theme.background.value
         emulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] = theme.cursor.value
+    }
+
+    private fun applyTypefaceToAttachedView(theme: TerminalThemeV1) {
+        val view = synchronized(lock) { if (disposed) null else viewReference?.get() } ?: return
+        val apply = {
+            view.setTypeface(TerminalTypefaceResolver.resolve(view.context, theme.fontFamilyHint))
+            view.invalidate()
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) apply() else view.post(apply)
     }
 
     private fun normalizeStyle(encoded: Long): TermuxCellStyle {
@@ -1013,13 +1029,14 @@ internal fun fittedTerminalTextSizePx(
     preferredTextSizePixels: Int,
     lineSpacingMultiplier: Float,
     minimumReadableTextSizePixels: Int = 1,
+    typeface: Typeface? = Typeface.MONOSPACE,
 ): Int {
     require(viewWidthPixels > 0 && viewHeightPixels > 0) { "view dimensions must be positive" }
     require(preferredTextSizePixels > 0) { "preferred text size must be positive" }
     require(minimumReadableTextSizePixels > 0) { "minimum readable text size must be positive" }
     // Keep validation for the persisted preference even though height no longer drives font size.
     lineSpacingMultiplier.coerceIn(0.8f, 1.8f)
-    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.MONOSPACE }
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { this.typeface = typeface }
     fun fits(textSize: Int): Boolean {
         paint.textSize = textSize.toFloat()
         val measuredCellWidth = paint.measureText("X")

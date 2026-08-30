@@ -17,12 +17,12 @@ import (
 	"github.com/termlink/termlink/server/internal/store"
 )
 
-// TestProductionRelaySlowConsumerIsolation exercises the same protobuf
-// Envelope path used by authenticated Agent connections. A bounded target
-// queue is intentionally left undrained; once its enqueue deadline expires,
-// only that target receives CloseTryAgainLater (1013). The source can still
-// route a later production frame to another Android subscriber.
-func TestProductionRelaySlowConsumerIsolation(t *testing.T) {
+// TestProductionRelaySlowConsumerForcesDurableReplay exercises the same
+// protobuf Envelope path used by authenticated Agent connections. If the
+// target queue cannot accept a frame, neither the route high-water nor the PC
+// connection may continue: reconnect makes the Agent replay from Android's
+// last durable cumulative ACK.
+func TestProductionRelaySlowConsumerForcesDurableReplay(t *testing.T) {
 	metrics := observability.New(nil)
 	hub := NewHubWithObserver(nil, nil, nil, metrics)
 
@@ -30,11 +30,9 @@ func TestProductionRelaySlowConsumerIsolation(t *testing.T) {
 	sessionID := uuid.New()
 	sourceID := uuid.New()
 	slowID := uuid.New()
-	healthyID := uuid.New()
 
 	sourceServer, sourceClient := newRelayWebSocketPair(t)
 	slowServer, slowClient := newRelayWebSocketPair(t)
-	healthyServer, _ := newRelayWebSocketPair(t)
 
 	source := testPeer(hub, sourceID)
 	source.socket = sourceServer
@@ -48,17 +46,10 @@ func TestProductionRelaySlowConsumerIsolation(t *testing.T) {
 	slow.send = make(chan []byte, 1)
 	slow.send <- []byte("already queued")
 
-	healthy := testPeer(hub, healthyID)
-	healthy.socket = healthyServer
-	healthy.role = "android"
-	healthy.principal.UserID = userID
-	healthy.send = make(chan []byte, 1)
-
-	if !hub.add(source) || !hub.add(slow) || !hub.add(healthy) {
+	if !hub.add(source) || !hub.add(slow) {
 		t.Fatal("failed to register test peers")
 	}
 	hub.subscribe(slow, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: sourceID})
-	hub.subscribe(healthy, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: sourceID})
 
 	go source.readLoop()
 
@@ -72,30 +63,14 @@ func TestProductionRelaySlowConsumerIsolation(t *testing.T) {
 		t.Fatalf("slow consumer close = %v, want websocket close code %d", err, websocket.CloseTryAgainLater)
 	}
 
-	// The source remains live and can route subsequent output to a healthy
-	// subscriber after the slow target was retired.
-	writeProductionEnvelope(t, sourceClient, productionOutputFrame(t, sourceID, healthyID, sessionID, 2))
-	select {
-	case frame := <-healthy.send:
-		envelope, err := realtimewire.Unmarshal(frame)
-		if err != nil {
-			t.Fatalf("healthy subscriber received invalid production envelope: %v", err)
-		}
-		if envelope.Sequence != 2 || !bytes.Equal(envelope.RecipientDeviceID, healthyID[:]) {
-			t.Fatalf("healthy subscriber envelope = sequence %d recipient %x, want sequence 2 recipient %x", envelope.Sequence, envelope.RecipientDeviceID, healthyID[:])
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("healthy subscriber did not receive output after slow consumer close")
+	waitPeerClosed(t, source.done)
+	if got := pcRouteHighWater(source, sessionID, slowID); got != 0 {
+		t.Fatalf("failed slow-consumer route high-water = %d, want 0", got)
 	}
-	select {
-	case <-source.done:
-		t.Fatal("source connection was closed with slow consumer")
-	default:
-	}
-	select {
-	case <-healthy.done:
-		t.Fatal("healthy subscriber was closed with slow consumer")
-	default:
+	sourceClient.SetReadDeadline(time.Now().Add(time.Second))
+	_, _, err = sourceClient.ReadMessage()
+	if !errors.As(err, &closeErr) || closeErr.Code != websocket.ClosePolicyViolation {
+		t.Fatalf("source close = %v, want websocket close code %d", err, websocket.ClosePolicyViolation)
 	}
 
 	body := scrapeRealtimeMetrics(t, metrics)
@@ -249,10 +224,15 @@ func TestProductionRelayReplaysSubscriptionWhenPCReconnects(t *testing.T) {
 	}
 	defer android.close(websocket.CloseNormalClosure, "test complete")
 	go android.writeLoop()
-	hub.subscribe(android, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
 	subscribeFrame := productionSubscribeFrame(t, androidID, pcID, sessionID, 1, 17)
-	if !hub.rememberSubscriptionFrame(android, sessionID, 17, subscribeFrame) {
-		t.Fatal("authorized Android subscription was not retained")
+	if err := hub.activateSubscription(
+		android,
+		sessionID,
+		store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID},
+		17,
+		subscribeFrame,
+	); err != nil {
+		t.Fatalf("cache subscription while PC absent: %v", err)
 	}
 
 	oldPC := testPeer(hub, pcID)
@@ -279,7 +259,7 @@ func TestProductionRelayReplaysSubscriptionWhenPCReconnects(t *testing.T) {
 	}
 
 	go replacement.readLoop()
-	outputFrame := productionOutputFrame(t, pcID, androidID, sessionID, 1)
+	outputFrame := productionOutputFrame(t, pcID, androidID, sessionID, 18)
 	writeProductionEnvelope(t, replacementClient, outputFrame)
 	if received := readProductionEnvelope(t, androidClient); !bytes.Equal(received, outputFrame) {
 		t.Fatal("replacement PC output did not reach the existing Android subscription")

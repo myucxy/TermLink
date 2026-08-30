@@ -193,6 +193,8 @@ enum PrivateMode {
     LeftRightMargin,
     FocusReporting,
     BracketedPaste,
+    GraphemeClustering,
+    ColorSchemeReporting,
     Win32Input,
     MouseTracking(MouseTracking),
     MouseEncoding(MouseEncoding),
@@ -217,6 +219,8 @@ impl PrivateMode {
             69 => Some(Self::LeftRightMargin),
             1004 => Some(Self::FocusReporting),
             2004 => Some(Self::BracketedPaste),
+            2027 => Some(Self::GraphemeClustering),
+            2031 => Some(Self::ColorSchemeReporting),
             9001 => Some(Self::Win32Input),
             _ => None,
         }
@@ -236,6 +240,8 @@ pub(crate) struct ModeState {
     pub(crate) keypad_application: bool,
     pub(crate) bracketed_paste: bool,
     pub(crate) focus_reporting: bool,
+    pub(crate) grapheme_clustering: bool,
+    pub(crate) color_scheme_reporting: bool,
     pub(crate) win32_input_mode: bool,
     pub(crate) left_right_margin: bool,
     pub(crate) mouse_tracking: MouseTracking,
@@ -257,6 +263,8 @@ impl Default for ModeState {
             keypad_application: false,
             bracketed_paste: false,
             focus_reporting: false,
+            grapheme_clustering: false,
+            color_scheme_reporting: false,
             win32_input_mode: false,
             left_right_margin: false,
             mouse_tracking: MouseTracking::None,
@@ -312,6 +320,8 @@ impl ModeState {
             PrivateMode::LeftRightMargin => self.left_right_margin = enabled,
             PrivateMode::FocusReporting => self.focus_reporting = enabled,
             PrivateMode::BracketedPaste => self.bracketed_paste = enabled,
+            PrivateMode::GraphemeClustering => self.grapheme_clustering = enabled,
+            PrivateMode::ColorSchemeReporting => self.color_scheme_reporting = enabled,
             PrivateMode::Win32Input => self.win32_input_mode = enabled,
             PrivateMode::MouseTracking(tracking) => {
                 if enabled {
@@ -349,6 +359,8 @@ impl ModeState {
             PrivateMode::LeftRightMargin => self.left_right_margin,
             PrivateMode::FocusReporting => self.focus_reporting,
             PrivateMode::BracketedPaste => self.bracketed_paste,
+            PrivateMode::GraphemeClustering => self.grapheme_clustering,
+            PrivateMode::ColorSchemeReporting => self.color_scheme_reporting,
             PrivateMode::Win32Input => self.win32_input_mode,
             PrivateMode::MouseTracking(tracking) => self.mouse_tracking == tracking,
             PrivateMode::MouseEncoding(encoding) => self.mouse_encoding == encoding,
@@ -554,6 +566,8 @@ mod tests {
                 keypad_application: false,
                 bracketed_paste: false,
                 focus_reporting: false,
+                grapheme_clustering: false,
+                color_scheme_reporting: false,
                 win32_input_mode: false,
                 left_right_margin: false,
                 mouse_tracking: MouseTracking::None,
@@ -590,7 +604,7 @@ mod tests {
         let mut modes = ModeState::default();
         assert!(modes.set_ansi_mode(4, true));
         assert!(modes.set_ansi_mode(20, true));
-        for parameter in [1, 5, 6, 42, 66, 69, 1004, 2004, 9001] {
+        for parameter in [1, 5, 6, 42, 66, 69, 1004, 2004, 2027, 2031, 9001] {
             assert!(modes.set_private_mode(parameter, true));
         }
         assert!(modes.insert_mode);
@@ -603,6 +617,8 @@ mod tests {
         assert!(modes.left_right_margin);
         assert!(modes.focus_reporting);
         assert!(modes.bracketed_paste);
+        assert!(modes.grapheme_clustering);
+        assert!(modes.color_scheme_reporting);
         assert!(modes.win32_input_mode);
 
         assert!(modes.set_private_mode(7, false));
@@ -624,7 +640,7 @@ mod tests {
             assert_eq!(modes.query_ansi_mode(parameter), Some(false));
         }
 
-        for parameter in [1, 5, 6, 7, 42, 66, 69, 1004, 2004, 9001] {
+        for parameter in [1, 5, 6, 7, 42, 66, 69, 1004, 2004, 2027, 2031, 9001] {
             assert!(modes.set_private_mode(parameter, true));
             assert_eq!(modes.query_private_mode(parameter), Some(true));
             assert!(modes.set_private_mode(parameter, false));

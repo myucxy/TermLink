@@ -341,14 +341,28 @@ class NativeTerminalEngine(
             check(!failedClosed) { "Native terminal renderer is failed closed" }
             try {
                 apply(terminal)
-                terminal.renderV3().renderFrame
+                try {
+                    terminal.renderV3().renderFrame
+                } catch (error: NativeTerminalException) {
+                    if (error.status == NativeTerminalStatus.SNAPSHOT_NOT_ELIGIBLE ||
+                        error.status == NativeTerminalStatus.PRESENTATION_DEFERRED
+                    ) {
+                        // The source event is already committed, but an incomplete parser token or
+                        // synchronized output intentionally withholds presentation. Keep the last
+                        // immutable frame visible and continue accepting the ordered stream; a
+                        // later event will complete the token/update and publish the new frame.
+                        null
+                    } else {
+                        throw error
+                    }
+                }
             } catch (error: Throwable) {
                 failedClosed = true
                 readOnly = true
                 throw error
             }
         }
-        publishFrame(frame, notify = true)
+        if (frame != null) publishFrame(frame, notify = true)
     }
 
     private fun replaceTerminal(size: TerminalSize) {

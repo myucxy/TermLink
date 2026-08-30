@@ -55,8 +55,8 @@ public static class PresentationText
     public static string MacDevice => Pick("Mac", "Mac");
     public static string UnknownDevice => Pick("设备", "Device");
     public static string AccountPrivacy => Pick(
-        "登录、注册和退出均由独立 Agent 处理；凭据不会写入 UI 日志。",
-        "The independent Agent handles sign-in, registration, and sign-out; credentials are never written to UI logs.");
+        "登录和注册在服务端托管网页中完成；客户端不接收密码、邀请码或验证码。",
+        "Sign-in and registration use a server-hosted page; the client never receives passwords, invitation codes, or verification codes.");
     public static string PcName => Pick("PC 名称", "PC name");
     public static string Username => Pick("用户名", "Username");
     public static string Nickname => Pick("昵称", "Nickname");
@@ -74,6 +74,17 @@ public static class PresentationText
         "The account credential expired or was revoked. Sign in again and the Agent will reconnect automatically.");
     public static string SignInAgain => Pick("立即重新登录", "Sign in again now");
     public static string SignInDetail => Pick("登录同一账户后，Android 可以发现并访问这台终端。", "Sign in with the same account so Android can discover this terminal.");
+    public static string BrowserAccountAuthorization => Pick("使用网页登录或注册", "Sign in or register on the web");
+    public static string BrowserAccountAuthorizationDetail => Pick(
+        "TermLink 将打开系统浏览器并通过安全回调完成授权。注册策略、邀请码和邮箱验证码均由服务端页面处理。",
+        "TermLink opens your system browser and completes authorization through a secure callback. Registration policy, invitation codes, and email verification stay on the server-hosted page.");
+    public static string BrowserAuthorizationStarted => Pick("正在等待网页授权", "Waiting for web authorization");
+    public static string BrowserAuthorizationStartedDetail => Pick(
+        "正在连接身份服务；连接成功后浏览器将自动打开，请在 5 分钟内完成登录或注册。",
+        "Connecting to the identity service. Your browser will open automatically; complete sign-in or registration within 5 minutes.");
+    public static string BrowserAuthorizationSucceeded => Pick(
+        "网页授权成功，Agent 正在重新建立连接。",
+        "Web authorization succeeded; the Agent is reconnecting.");
     public static string SignInInputRequired => Pick("请输入登录信息", "Enter sign-in details");
     public static string LoginMode => Pick("登录", "Sign in");
     public static string RegisterMode => Pick("创建账户", "Create account");
@@ -99,6 +110,7 @@ public static class PresentationText
         "更新由保留的已签名组件执行；关闭控制 UI 不会关闭 Agent。",
         "Updates run through the retained signed component; closing the control UI does not stop the Agent.");
     public static string RepairTerminal => Pick("修复 Terminal 集成", "Repair Terminal integration");
+    public static string Configure => Pick("配置", "Configure");
     public static string CheckUpdates => Pick("检查更新", "Check for updates");
     public static string StartUpdate => Pick("开始更新", "Start update");
     public static string AccountLoading => Pick("正在读取账户…", "Loading account…");
@@ -118,7 +130,26 @@ public static class PresentationText
     public static string FollowSystem => Pick("跟随系统", "System");
     public static string LightTheme => Pick("浅色", "Light");
     public static string DarkTheme => Pick("深色", "Dark");
-    public static string TerminalIntegrationDetail => Pick("验证并修复 TermLink 管理的 Terminal Profile。", "Verify and repair TermLink-managed Terminal profiles.");
+    public static string TerminalIntegrationDetail => Pick(
+        "配置 PowerShell 启动参数，并验证或修复 TermLink 管理的 Terminal Profile。",
+        "Configure PowerShell startup flags and verify or repair TermLink-managed Terminal profiles.");
+    public static string TerminalIntegrationOptions => Pick(
+        "Windows Terminal 配置",
+        "Windows Terminal configuration");
+    public static string TerminalIntegrationOptionsDetail => Pick(
+        "这些选项只修改 TermLink 自己的 PowerShell Profile。默认添加 -NoLogo，不添加 -NoProfile。",
+        "These options only change TermLink's PowerShell profiles. By default, -NoLogo is added and -NoProfile is not.");
+    public static string AddNoLogo => Pick("添加 -NoLogo", "Add -NoLogo");
+    public static string AddNoLogoDetail => Pick(
+        "隐藏 PowerShell 启动横幅；默认开启。",
+        "Hide the PowerShell startup banner; enabled by default.");
+    public static string AddNoProfile => Pick("添加 -NoProfile", "Add -NoProfile");
+    public static string AddNoProfileDetail => Pick(
+        "不加载 $PROFILE。开启后 Oh My Posh、别名、模块和用户启动脚本可能不会初始化。",
+        "Do not load $PROFILE. Oh My Posh, aliases, modules, and user startup scripts may not initialize.");
+    public static string PackageManagedTerminalIntegration => Pick(
+        "当前 Profile 来自签名 MSIX 包，只能查看这些默认值；更改需随应用更新发布。",
+        "These profiles come from the signed MSIX package. Defaults are read-only and changes require an app update.");
     public static string DiagnosticsDetail => Pick("仅在排查连接或兼容问题时需要这些信息。", "Use these details when troubleshooting connectivity or compatibility.");
     public static string Revision => Pick("状态修订号", "State revision");
     public static string ObservedAt => Pick("采样时间", "Observed at");
@@ -140,6 +171,27 @@ public static class PresentationText
     public static string TimeoutDetail => Pick("操作等待超时，请检查 Agent 和服务器连接后重试。", "The operation timed out. Check the Agent and server connection, then retry.");
     public static string ConnectionFailedDetail => Pick("暂时无法连接 Agent 或服务器，请稍后重试。", "The Agent or server is temporarily unavailable.");
     public static string UnexpectedFailureDetail => Pick("发生未预期错误。可在诊断页面查看原始错误信息。", "An unexpected error occurred. Open Diagnostics for the original detail.");
+    public static string AgentMissingDetail => Pick(
+        "未找到后台 Agent 程序，请重新安装或修复 TermLink。",
+        "The background Agent is missing. Reinstall or repair TermLink.");
+    public static string AgentStartFailedDetail => Pick(
+        "后台 Agent 无法启动，请查看诊断日志后重试。",
+        "The background Agent could not start. Check Diagnostics and try again.");
+    public static string AgentStartingTimeoutDetail => Pick(
+        "已有后台 Agent 正在启动，但未能及时就绪；TermLink 没有重复创建 Agent。请稍后重试。",
+        "The existing background Agent is still starting and did not become ready in time. TermLink did not create a duplicate Agent. Try again shortly.");
+    public static string AgentRestartTimeoutDetail => Pick(
+        "旧的后台 Agent 尚未完成退出；为避免重复进程，TermLink 已取消本次重启。请稍后重试。",
+        "The previous background Agent has not finished stopping. TermLink cancelled this restart to avoid a duplicate process. Try again shortly.");
+    public static string AgentExitedDetail => Pick(
+        "后台 Agent 启动后意外退出，请查看诊断日志后重试。",
+        "The background Agent exited unexpectedly during startup. Check Diagnostics and try again.");
+    public static string AgentExitingDetail => Pick(
+        "TermLink 正在完全退出，当前操作已取消。",
+        "TermLink is exiting completely, so the current action was cancelled.");
+    public static string AgentProcessesStillRunningDetail => Pick(
+        "部分 Agent 或命令行会话仍在运行，请稍后重试完全退出。",
+        "Some Agent or command-line session processes are still running. Try the full exit again shortly.");
     public static string RemoteAccessUpdated => Pick("远程访问设置已更新。", "Remote access was updated.");
     public static string RetryRequested => Pick("已请求立即重连。", "An immediate reconnect was requested.");
 
@@ -191,6 +243,9 @@ public static class PresentationText
     public static string UnsupportedDesktopOperation => Pick("当前平台不支持此桌面操作。", "This desktop operation is unsupported on the current platform.");
     public static string CurrentAccount => Pick("当前账户：", "Current account: ");
     public static string SessionCount(int count) => Pick($"{count} 个会话", count == 1 ? "1 session" : $"{count} sessions");
+    public static string DeviceHeaderSummary(string remoteAccessStatus, int activeSessionCount) => Pick(
+        $"{remoteAccessStatus} · {activeSessionCount} 个活动会话",
+        $"{remoteAccessStatus} · {activeSessionCount} active {(activeSessionCount == 1 ? "session" : "sessions")}");
     public static string AutoDetected => Pick("自动检测：", "Auto-detected: ");
     public static string SessionStarting => Pick("正在建立", "Starting");
     public static string SessionConnected => Pick("运行中", "Running");
@@ -200,13 +255,13 @@ public static class PresentationText
     public static string SessionFaulted => Pick("异常", "Faulted");
     public static string Viewers(int count) => Pick($"{count} 个查看者", $"{count} viewers");
     public static string LastActive(string value) => Pick($"最后活动 {value}", $"Last active {value}");
-    public static string RelayNotConfigured => Pick("尚未配置", "Not configured");
-    public static string RelayConnecting => Pick("正在建立连接", "Connecting");
-    public static string RelayConnected => Pick("Relay 已连接", "Relay connected");
-    public static string RelayReconnecting => Pick("正在重新连接", "Reconnecting");
+    public static string RelayNotConfigured => Pick("服务器未连接", "Server disconnected");
+    public static string RelayConnecting => Pick("正在连接服务器", "Connecting to server");
+    public static string RelayConnected => Pick("服务器已连接", "Server connected");
+    public static string RelayReconnecting => Pick("正在重连服务器", "Reconnecting to server");
     public static string RelaySignInRequired => Pick("需要重新登录", "Sign-in required");
-    public static string RelayOffline => Pick("当前离线", "Offline");
-    public static string RelayFaulted => Pick("Agent 异常", "Agent fault");
+    public static string RelayOffline => Pick("服务器已断开", "Server disconnected");
+    public static string RelayFaulted => Pick("服务器连接失败", "Server connection failed");
     public static string ConfirmAction => Pick("确认操作", "Confirm action");
     public static string ConfirmStopRemoteTitle => Pick("停止远程访问？", "Stop remote access?");
     public static string ConfirmStopRemoteDetail => Pick("Android 将无法新建或控制会话，但本地终端不会关闭。", "Android will no longer create or control sessions. Local terminals stay open.");
@@ -215,7 +270,9 @@ public static class PresentationText
     public static string ConfirmRevokeDeviceTitle => Pick("撤销此设备？", "Revoke this device?");
     public static string ConfirmRevokeDeviceDetail(string name) => Pick($"“{name}”需要重新登录才能再次访问这台终端。", $"“{name}” must sign in again before accessing this terminal.");
     public static string ConfirmSignOutTitle => Pick("退出 TermLink 账户？", "Sign out of TermLink?");
-    public static string ConfirmSignOutDetail => Pick("此 PC 将停止向同账户设备发布状态，现有本地终端不会关闭。", "This PC will stop publishing to account devices. Local terminals stay open.");
+    public static string ConfirmSignOutDetail => Pick(
+        "此 PC 将停止向当前账户同步；本地终端保持运行，登录其他账户后会继续同步。",
+        "This PC will stop syncing to the current account. Local terminals stay open and resume syncing after another account signs in.");
     public static string ConfirmFullExitTitle => Pick("完全退出 TermLink？", "Exit TermLink completely?");
     public static string ConfirmFullExitDetail => Pick(
         "这将停止后台 Agent、断开所有远程连接，并结束 TermLink 管理的命令行会话。未保存的会话工作可能丢失；本机登录信息会保留。",

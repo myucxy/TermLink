@@ -441,21 +441,35 @@ func (c *KeycloakAdminClient) updateUser(ctx context.Context, userID string, mut
 }
 
 func (c *KeycloakAdminClient) RegisterVerifiedEmail(ctx context.Context, input DirectRegistrationInput) error {
-	return c.registerVerifiedEmail(ctx, uuid.Nil, input)
+	return c.registerAccount(ctx, uuid.Nil, input, true)
 }
 
 func (c *KeycloakAdminClient) RegisterVerifiedEmailAttempt(ctx context.Context, attemptID uuid.UUID, input DirectRegistrationInput) error {
 	if attemptID == uuid.Nil {
 		return ErrKeycloakAdminRejected
 	}
-	return c.registerVerifiedEmail(ctx, attemptID, input)
+	return c.registerAccount(ctx, attemptID, input, true)
 }
 
-// registerVerifiedEmail is used only after TermLink has consumed a valid
-// registration e-mail challenge. Creating through the bounded Keycloak Admin
-// endpoint lets the identity start with emailVerified=true, avoiding a second
-// provider e-mail flow while retaining the existing invitation recovery proof.
-func (c *KeycloakAdminClient) registerVerifiedEmail(ctx context.Context, attemptID uuid.UUID, input DirectRegistrationInput) error {
+// Register creates an identity only after the TermLink API has enforced the
+// current registration, invitation, verification, and rate-limit policies.
+func (c *KeycloakAdminClient) Register(ctx context.Context, input DirectRegistrationInput) error {
+	return c.registerAccount(ctx, uuid.Nil, input, false)
+}
+
+// RegisterAttempt retains the invitation-recovery proof on the created
+// identity so a provider-committed but locally interrupted saga can reconcile.
+func (c *KeycloakAdminClient) RegisterAttempt(ctx context.Context, attemptID uuid.UUID, input DirectRegistrationInput) error {
+	if attemptID == uuid.Nil {
+		return ErrKeycloakAdminRejected
+	}
+	return c.registerAccount(ctx, attemptID, input, false)
+}
+
+// registerAccount is the single identity-creation boundary. Verified e-mail
+// registration reaches it only after TermLink has consumed a valid challenge,
+// allowing the identity to start verified without a second provider mail flow.
+func (c *KeycloakAdminClient) registerAccount(ctx context.Context, attemptID uuid.UUID, input DirectRegistrationInput, emailVerified bool) error {
 	if c == nil {
 		return ErrKeycloakAdminUnavailable
 	}
@@ -476,7 +490,7 @@ func (c *KeycloakAdminClient) registerVerifiedEmail(ctx context.Context, attempt
 	}
 	payload, err := json.Marshal(map[string]any{
 		"username": strings.TrimSpace(input.Username), "email": strings.TrimSpace(input.Email),
-		"emailVerified": true, "enabled": true, "attributes": attributes,
+		"emailVerified": emailVerified, "enabled": true, "attributes": attributes,
 		"credentials": []map[string]any{{"type": "password", "value": input.Password, "temporary": false}},
 	})
 	if err != nil || len(payload) > maxKeycloakAdminBody {
@@ -484,7 +498,10 @@ func (c *KeycloakAdminClient) registerVerifiedEmail(ctx context.Context, attempt
 	}
 	response, err := c.authorizedJSONRequest(ctx, http.MethodPost, c.usersURL, payload)
 	if err != nil {
-		return ErrRegistrationOutcomeUnknown
+		if errors.Is(err, ErrRegistrationOutcomeUnknown) {
+			return err
+		}
+		return ErrKeycloakAdminUnavailable
 	}
 	defer response.Body.Close()
 	switch response.StatusCode {
@@ -526,6 +543,11 @@ func (c *KeycloakAdminClient) authorizedJSONRequest(ctx context.Context, method,
 		response, err := c.http.Do(request)
 		if err != nil {
 			cancel()
+			if method == http.MethodPost && target == c.usersURL {
+				// Once account creation reaches the transport, a timeout or
+				// disconnect cannot prove whether Keycloak committed the user.
+				return nil, ErrRegistrationOutcomeUnknown
+			}
 			return nil, ErrKeycloakAdminUnavailable
 		}
 		response.Body = &cancelOnCloseReadCloser{ReadCloser: response.Body, cancel: cancel}

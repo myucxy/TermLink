@@ -59,6 +59,9 @@ func TestLoadFromEnvReadsSecretsAndRedactsDiagnostics(t *testing.T) {
 		c.KeycloakAdminBaseURL != "" || !c.KeycloakAdminClientSecret.Empty() {
 		t.Fatalf("registration recovery defaults not applied: %#v", c)
 	}
+	if c.HumanVerificationProvider != "" || c.HumanVerificationSiteKey != "" || !c.HumanVerificationSecret.Empty() {
+		t.Fatalf("human verification must default to disabled: %#v", c)
+	}
 	output := c.String()
 	for _, secret := range []string{"oidc-secret", "postgres://termlink:password@postgres/termlink", "redis://:password@valkey:6379/0", "01234567890123456789012345678901"} {
 		if strings.Contains(output, secret) {
@@ -70,6 +73,50 @@ func TestLoadFromEnvReadsSecretsAndRedactsDiagnostics(t *testing.T) {
 	}
 	if got := fmt.Sprintf("%#v", c); strings.Contains(got, "oidc-secret") {
 		t.Fatalf("GoString() leaked secret: %s", got)
+	}
+}
+
+func TestLoadTurnstileUsesDedicatedSecretAndFailsClosed(t *testing.T) {
+	files := writeSecrets(t, map[string]string{
+		"oidc": "oidc-secret", "human": "turnstile-secret", "db": "db-secret", "redis": "redis-secret",
+		"sign": "01234567890123456789012345678901",
+	})
+	env := baseEnv(files)
+	env["TERMLINK_HUMAN_VERIFICATION_PROVIDER"] = "turnstile"
+	env["TERMLINK_HUMAN_VERIFICATION_SITE_KEY"] = "0x4AAAA-test-site-key"
+	if _, err := LoadFromEnv(env); err == nil || !errors.Is(err, ErrMissing) ||
+		!strings.Contains(err.Error(), "TERMLINK_HUMAN_VERIFICATION_SECRET_FILE") {
+		t.Fatalf("missing Turnstile secret error = %v", err)
+	}
+	env["TERMLINK_HUMAN_VERIFICATION_SECRET_FILE"] = files["human"]
+	c, err := LoadFromEnv(env)
+	if err != nil {
+		t.Fatalf("LoadFromEnv(Turnstile) error = %v", err)
+	}
+	if c.HumanVerificationProvider != "turnstile" || c.HumanVerificationSiteKey != "0x4AAAA-test-site-key" ||
+		c.HumanVerificationSecret.Value() != "turnstile-secret" || c.HumanVerificationSecretFile != files["human"] {
+		t.Fatalf("Turnstile config not loaded: %#v", c)
+	}
+	if output := c.String(); strings.Contains(output, "turnstile-secret") || strings.Contains(output, files["human"]) {
+		t.Fatalf("String() leaked Turnstile secret material: %s", output)
+	}
+
+	for name, value := range map[string]string{
+		"provider": "unknown-provider",
+		"site key": "invalid site key",
+	} {
+		candidate := make(map[string]string, len(env))
+		for key, item := range env {
+			candidate[key] = item
+		}
+		field := "TERMLINK_HUMAN_VERIFICATION_SITE_KEY"
+		if name == "provider" {
+			field = "TERMLINK_HUMAN_VERIFICATION_PROVIDER"
+		}
+		candidate[field] = value
+		if _, err := LoadFromEnv(candidate); err == nil || !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), field) {
+			t.Fatalf("invalid Turnstile %s error = %v", name, err)
+		}
 	}
 }
 

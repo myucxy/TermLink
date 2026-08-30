@@ -125,6 +125,10 @@ TermLink 不是远程桌面，也不抓取 Windows Terminal 的图像。它传�
 
 - 按 PC 分组展示运行中、已退出和已归档会话；
 - 会话页支持 ANSI 颜色、256 色、True Color、光标、清屏、滚动区域和常见 TUI；
+- 移动端内置许可证允许随 APK 分发的 CaskaydiaCove Nerd Font Mono，并提供内置 Nerd Font、
+  系统等宽字体和本地自定义 TTF/OTF 三种方案；字体选择、校验、App 私有存储和两级失败回退已
+  接入 native、Termux 兼容及历史 View。Powerline、Private Use Area 图标和 cell 宽度/对齐仍需
+  arm64 真机及多套 Oh My Posh 主题回归，完成前不得声明整体视觉效果已完整兼容；
 - 支持横竖屏、字号调整、软键盘辅助栏和保持屏幕常亮；
 - 新能力启用时按 `select -> download -> prepare -> cache -> bind -> install -> subscribe(S)`
   从终端状态快照进入，随后只应用 S+1 及之后的增量事件；任一步失败都不得用不完整状态推进 ACK；

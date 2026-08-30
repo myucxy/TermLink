@@ -344,6 +344,23 @@ class ProductUiLogicTest {
     }
 
     @Test
+    fun completedEmptyTranscriptDismissesOnlyTheBlankOverlay() {
+        val idle = transcriptState()
+        val complete = idle.copy(nextBeforeLineId = null, hasMoreBefore = false)
+
+        assertTrue(shouldDismissEmptyTranscriptOverlay(complete))
+        assertFalse(shouldDismissEmptyTranscriptOverlay(null))
+        assertFalse(shouldDismissEmptyTranscriptOverlay(idle))
+        assertFalse(shouldDismissEmptyTranscriptOverlay(complete.copy(loading = true)))
+        assertFalse(shouldDismissEmptyTranscriptOverlay(complete.copy(error = "unavailable")))
+        assertFalse(
+            shouldDismissEmptyTranscriptOverlay(
+                complete.copy(pages = listOf(transcriptPage())),
+            ),
+        )
+    }
+
+    @Test
     fun transcriptLoadingGuardAllowsOnlyOneOutstandingRequest() {
         val ready = transcriptState()
 

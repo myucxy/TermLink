@@ -14,6 +14,7 @@ import com.termux.terminal.TextStyle
 import com.termux.view.TerminalSessionPort
 import com.termux.view.TerminalView
 import dev.termlink.terminal.api.TerminalThemeV1
+import dev.termlink.terminal.api.TerminalTypefaceResolver
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
 import java.lang.ref.WeakReference
 import kotlin.math.roundToInt
@@ -145,11 +146,16 @@ class TermuxTranscriptViewport(
     }
 
     fun applyTheme(theme: TerminalThemeV1) {
+        var fontChanged = false
         val attachedView = synchronized(lock) {
             checkActive()
+            fontChanged = currentTheme?.fontFamilyHint != theme.fontFamilyHint
             currentTheme = theme
             applyThemeTo(emulator)
             viewReference?.get()
+        }
+        if (fontChanged) {
+            attachedView?.setTypeface(TerminalTypefaceResolver.resolve(attachedView.context, theme.fontFamilyHint))
         }
         attachedView?.invalidate()
     }
@@ -178,9 +184,11 @@ class TermuxTranscriptViewport(
             context.resources.displayMetrics,
         ).roundToInt().coerceAtLeast(1)
         val boundedLineSpacing = lineSpacingMultiplier.coerceIn(0.8f, 1.8f)
+        val fontFamilyHint = synchronized(lock) { currentTheme?.fontFamilyHint }
         return TerminalView(context, null).also { view ->
             view.setTextSize(textSizePx)
             view.setLineSpacing(boundedLineSpacing)
+            view.setTypeface(TerminalTypefaceResolver.resolve(context, fontFamilyHint))
             view.setTerminalViewClient(
                 TermuxTerminalViewClient(
                     view = view,
@@ -226,6 +234,7 @@ class TermuxTranscriptViewport(
         TermuxTranscriptViewportDebugState(
             visibleText = visibleText(view?.topRow ?: 0),
             snapshotAnchorSequence = current?.snapshotAnchorSequence,
+            topRow = view?.topRow ?: 0,
             firstVisibleLineId = view?.topVisibleLineId?.takeIf { it > 0 }
                 ?: current?.lineIds?.getOrNull((current.rows.size - rows).coerceAtLeast(0)),
             pageCount = pages.size,
@@ -235,6 +244,19 @@ class TermuxTranscriptViewport(
             emulatorRows = emulator.mRows,
             sizeUpdateRequests = sizeUpdateRequests,
         )
+    }
+
+    /** Selects an authenticated rendered line without invoking the pagination boundary callback. */
+    fun scrollToLineId(lineId: Long): Boolean {
+        require(lineId > 0) { "transcript line ID must be positive" }
+        val view = synchronized(lock) {
+            checkActive()
+            viewReference?.get()
+        } ?: return false
+        require(Looper.myLooper() == Looper.getMainLooper()) {
+            "An attached transcript viewport must be scrolled on the main thread"
+        }
+        return view.scrollToLineId(lineId)
     }
 
     /** Drives one top-boundary gesture through the attached read-only TerminalView. */
@@ -333,6 +355,7 @@ class TermuxTranscriptViewport(
                 columns = emulator.mColumns,
                 preferredTextSizePixels = effectivePreferred,
                 minimumReadableTextSizePixels = userSize ?: minimumReadableTextSizePixels(view.context),
+                typeface = TerminalTypefaceResolver.resolve(view.context, currentTheme?.fontFamilyHint),
             )
             if (fitted == appliedTextSizePixels) return
             fittingAttachedView = true
@@ -423,6 +446,7 @@ class TermuxTranscriptViewport(
 data class TermuxTranscriptViewportDebugState(
     val visibleText: String,
     val snapshotAnchorSequence: Long?,
+    val topRow: Int,
     val firstVisibleLineId: Long?,
     val pageCount: Int,
     val rowCount: Int,
@@ -438,12 +462,13 @@ internal fun fittedTranscriptTextSizeForColumnsPx(
     columns: Int,
     preferredTextSizePixels: Int,
     minimumReadableTextSizePixels: Int = 1,
+    typeface: Typeface? = Typeface.MONOSPACE,
 ): Int {
     require(viewWidthPixels > 0) { "view width must be positive" }
     require(columns > 0) { "terminal columns must be positive" }
     require(preferredTextSizePixels > 0) { "preferred text size must be positive" }
     require(minimumReadableTextSizePixels > 0) { "minimum readable text size must be positive" }
-    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.MONOSPACE }
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { this.typeface = typeface }
     fun fits(textSize: Int): Boolean {
         paint.textSize = textSize.toFloat()
         val measured = paint.measureText("X")

@@ -31,6 +31,7 @@ const MINOR_V2_5: u16 = 5;
 const MINOR_V2_6: u16 = 6;
 const MINOR_V2_7: u16 = 7;
 const MINOR_V2_8: u16 = 8;
+const MINOR_V2_9: u16 = 9;
 const HEADER_SIZE: usize = 104;
 const DIRECTORY_ENTRY_SIZE: usize = 32;
 const SECTION_COUNT: usize = 12;
@@ -46,6 +47,7 @@ const WIN32_INPUT_MODE_FEATURE: u128 = 0x2_0000;
 const KEYBOARD_PROTOCOL_STATE_FEATURE: u128 = 0x4_0000;
 const NATIONAL_REPLACEMENT_CHARSET_FEATURE: u128 = 0x8_0000;
 const STANDALONE_C1_OUTPUT_PROFILE_FEATURE: u128 = 0x10_0000;
+const MODERN_PRIVATE_MODES_FEATURE: u128 = 0x20_0000;
 const OPTIONAL_FEATURES_V2_5: u128 =
     HISTORY_ANCHORS_FEATURE | REP_SOURCE_FEATURE | CURSOR_STYLE_FEATURE | EXTENDED_SGR_FEATURE;
 const REQUIRED_FEATURES_V2_5: u128 = REQUIRED_FEATURES_V2_0 | WIN32_INPUT_MODE_FEATURE;
@@ -70,6 +72,15 @@ const OPTIONAL_FEATURES_V2_8: u128 = HISTORY_ANCHORS_FEATURE
     | KEYBOARD_PROTOCOL_STATE_FEATURE
     | NATIONAL_REPLACEMENT_CHARSET_FEATURE;
 const REQUIRED_FEATURES_V2_8: u128 = REQUIRED_FEATURES_V2_0 | STANDALONE_C1_OUTPUT_PROFILE_FEATURE;
+const OPTIONAL_FEATURES_V2_9: u128 = HISTORY_ANCHORS_FEATURE
+    | REP_SOURCE_FEATURE
+    | CURSOR_STYLE_FEATURE
+    | EXTENDED_SGR_FEATURE
+    | WIN32_INPUT_MODE_FEATURE
+    | KEYBOARD_PROTOCOL_STATE_FEATURE
+    | NATIONAL_REPLACEMENT_CHARSET_FEATURE
+    | STANDALONE_C1_OUTPUT_PROFILE_FEATURE;
+const REQUIRED_FEATURES_V2_9: u128 = REQUIRED_FEATURES_V2_0 | MODERN_PRIVATE_MODES_FEATURE;
 const REQUIRED_FEATURES_V2_1: u128 = REQUIRED_FEATURES_V2_0 | HISTORY_ANCHORS_FEATURE;
 const REQUIRED_FEATURES_V2_2: u128 = REQUIRED_FEATURES_V2_0 | REP_SOURCE_FEATURE;
 const REQUIRED_FEATURES_V2_2_HISTORY: u128 = REQUIRED_FEATURES_V2_1 | REP_SOURCE_FEATURE;
@@ -106,7 +117,7 @@ const MAX_ROWS_SECTION_BYTES: usize = 8 + MAX_ROWS as usize * 24 + MAX_CELLS * 1
 // pre-section alignment per directory entry and one final alignment.
 const MAX_CANONICAL_SNAPSHOT_BYTES: usize = ENVELOPE_BYTES
     + 32 // core
-    + 136 // at most sixteen mode records
+    + 152 // at most eighteen mode records
     + 24 // margins
     + 72 // tab stops
     + 24 // two bounded Kitty keyboard-protocol stacks
@@ -240,6 +251,16 @@ enum SnapshotVersion {
         keyboard_protocol: bool,
         national_replacement: bool,
     },
+    V2_9 {
+        history: bool,
+        repeat: bool,
+        cursor: bool,
+        extended_sgr: bool,
+        win32_input: bool,
+        keyboard_protocol: bool,
+        national_replacement: bool,
+        standalone_c1: bool,
+    },
 }
 
 impl SnapshotVersion {
@@ -254,7 +275,18 @@ impl SnapshotVersion {
             || charset_has_national_replacement(terminal.charset)
             || charset_has_national_replacement(terminal.main_saved_charset)
             || charset_has_national_replacement(terminal.alternate_saved_charset);
-        if terminal.output_profile == OutputProfile::Utf8WithStandaloneC1 {
+        if terminal.modes.grapheme_clustering || terminal.modes.color_scheme_reporting {
+            Self::V2_9 {
+                history,
+                repeat,
+                cursor: cursor_style,
+                extended_sgr,
+                win32_input: terminal.modes.win32_input_mode,
+                keyboard_protocol,
+                national_replacement,
+                standalone_c1: terminal.output_profile == OutputProfile::Utf8WithStandaloneC1,
+            }
+        } else if terminal.output_profile == OutputProfile::Utf8WithStandaloneC1 {
             Self::V2_8 {
                 history,
                 repeat,
@@ -316,6 +348,7 @@ impl SnapshotVersion {
                 | Self::V2_6 { history: true, .. }
                 | Self::V2_7 { history: true, .. }
                 | Self::V2_8 { history: true, .. }
+                | Self::V2_9 { history: true, .. }
         )
     }
 
@@ -329,6 +362,7 @@ impl SnapshotVersion {
                 | Self::V2_6 { repeat: true, .. }
                 | Self::V2_7 { repeat: true, .. }
                 | Self::V2_8 { repeat: true, .. }
+                | Self::V2_9 { repeat: true, .. }
         )
     }
 
@@ -341,6 +375,7 @@ impl SnapshotVersion {
                 | Self::V2_6 { cursor: true, .. }
                 | Self::V2_7 { cursor: true, .. }
                 | Self::V2_8 { cursor: true, .. }
+                | Self::V2_9 { cursor: true, .. }
         )
     }
 
@@ -364,6 +399,10 @@ impl SnapshotVersion {
                     extended_sgr: true,
                     ..
                 }
+                | Self::V2_9 {
+                    extended_sgr: true,
+                    ..
+                }
         )
     }
 
@@ -383,6 +422,10 @@ impl SnapshotVersion {
                     win32_input: true,
                     ..
                 }
+                | Self::V2_9 {
+                    win32_input: true,
+                    ..
+                }
         )
     }
 
@@ -398,6 +441,10 @@ impl SnapshotVersion {
                     keyboard_protocol: true,
                     ..
                 }
+                | Self::V2_9 {
+                    keyboard_protocol: true,
+                    ..
+                }
         )
     }
 
@@ -409,11 +456,26 @@ impl SnapshotVersion {
                     national_replacement: true,
                     ..
                 }
+                | Self::V2_9 {
+                    national_replacement: true,
+                    ..
+                }
         )
     }
 
     fn has_standalone_c1_output_profile(self) -> bool {
-        matches!(self, Self::V2_8 { .. })
+        matches!(
+            self,
+            Self::V2_8 { .. }
+                | Self::V2_9 {
+                    standalone_c1: true,
+                    ..
+                }
+        )
+    }
+
+    fn has_modern_private_modes(self) -> bool {
+        matches!(self, Self::V2_9 { .. })
     }
 
     fn v2_5_from_features(features: u128) -> Option<Self> {
@@ -470,6 +532,22 @@ impl SnapshotVersion {
         })
     }
 
+    fn v2_9_from_features(features: u128) -> Option<Self> {
+        if features & !OPTIONAL_FEATURES_V2_9 != REQUIRED_FEATURES_V2_9 {
+            return None;
+        }
+        Some(Self::V2_9 {
+            history: features & HISTORY_ANCHORS_FEATURE != 0,
+            repeat: features & REP_SOURCE_FEATURE != 0,
+            cursor: features & CURSOR_STYLE_FEATURE != 0,
+            extended_sgr: features & EXTENDED_SGR_FEATURE != 0,
+            win32_input: features & WIN32_INPUT_MODE_FEATURE != 0,
+            keyboard_protocol: features & KEYBOARD_PROTOCOL_STATE_FEATURE != 0,
+            national_replacement: features & NATIONAL_REPLACEMENT_CHARSET_FEATURE != 0,
+            standalone_c1: features & STANDALONE_C1_OUTPUT_PROFILE_FEATURE != 0,
+        })
+    }
+
     fn minor(self) -> u16 {
         match self {
             Self::V2_0 => MINOR_V2_0,
@@ -481,6 +559,7 @@ impl SnapshotVersion {
             Self::V2_6 { .. } => MINOR_V2_6,
             Self::V2_7 { .. } => MINOR_V2_7,
             Self::V2_8 { .. } => MINOR_V2_8,
+            Self::V2_9 { .. } => MINOR_V2_9,
         }
     }
 
@@ -625,6 +704,46 @@ impl SnapshotVersion {
                         0
                     }
             }
+            Self::V2_9 {
+                history,
+                repeat,
+                cursor,
+                extended_sgr,
+                win32_input,
+                keyboard_protocol,
+                national_replacement,
+                standalone_c1,
+            } => {
+                REQUIRED_FEATURES_V2_9
+                    | if history { HISTORY_ANCHORS_FEATURE } else { 0 }
+                    | if repeat { REP_SOURCE_FEATURE } else { 0 }
+                    | if cursor { CURSOR_STYLE_FEATURE } else { 0 }
+                    | if extended_sgr {
+                        EXTENDED_SGR_FEATURE
+                    } else {
+                        0
+                    }
+                    | if win32_input {
+                        WIN32_INPUT_MODE_FEATURE
+                    } else {
+                        0
+                    }
+                    | if keyboard_protocol {
+                        KEYBOARD_PROTOCOL_STATE_FEATURE
+                    } else {
+                        0
+                    }
+                    | if national_replacement {
+                        NATIONAL_REPLACEMENT_CHARSET_FEATURE
+                    } else {
+                        0
+                    }
+                    | if standalone_c1 {
+                        STANDALONE_C1_OUTPUT_PROFILE_FEATURE
+                    } else {
+                        0
+                    }
+            }
             Self::V2_6 {
                 history,
                 repeat,
@@ -667,7 +786,9 @@ impl SnapshotVersion {
     }
 
     fn section_version(self, tag: u32) -> u16 {
-        if self.has_national_replacement_charset() && tag == MODE_BANK {
+        if self.has_modern_private_modes() && tag == MODE_BANK {
+            4
+        } else if self.has_national_replacement_charset() && tag == MODE_BANK {
             3
         } else if (self.has_national_replacement_charset() && tag == CHARSET_STATE)
             || (self.has_win32_input_mode() && tag == MODE_BANK)
@@ -1110,6 +1231,8 @@ fn encode_modes(writer: &mut Writer, modes: ModeState) -> u32 {
         (1, 69, modes.left_right_margin),
         (1, 1004, modes.focus_reporting),
         (1, 2004, modes.bracketed_paste),
+        (1, 2027, modes.grapheme_clustering),
+        (1, 2031, modes.color_scheme_reporting),
         (1, 9001, modes.win32_input_mode),
         (
             1,
@@ -1616,6 +1739,7 @@ fn preflight_a(bytes: &[u8]) -> Result<Preflight, TerminalError> {
                 | MINOR_V2_6
                 | MINOR_V2_7
                 | MINOR_V2_8
+                | MINOR_V2_9
         )
     {
         return Err(TerminalError::IncompatibleSnapshot);
@@ -1712,6 +1836,8 @@ fn preflight_a(bytes: &[u8]) -> Result<Preflight, TerminalError> {
         (MINOR_V2_7, features) => SnapshotVersion::v2_7_from_features(features)
             .ok_or(TerminalError::IncompatibleSnapshot)?,
         (MINOR_V2_8, features) => SnapshotVersion::v2_8_from_features(features)
+            .ok_or(TerminalError::IncompatibleSnapshot)?,
+        (MINOR_V2_9, features) => SnapshotVersion::v2_9_from_features(features)
             .ok_or(TerminalError::IncompatibleSnapshot)?,
         _ => return Err(TerminalError::IncompatibleSnapshot),
     };
@@ -2041,6 +2167,11 @@ fn decode_modes(bytes: &[u8], version: SnapshotVersion) -> Result<ModeState, Ter
         previous = Some(key);
     }
     if result.win32_input_mode != version.has_win32_input_mode() {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    if (result.grapheme_clustering || result.color_scheme_reporting)
+        != version.has_modern_private_modes()
+    {
         return Err(TerminalError::MalformedSnapshot);
     }
     if result.national_replacement_character_set_mode && !version.has_national_replacement_charset()
@@ -3708,6 +3839,41 @@ mod tests {
             assert_eq!(restored, terminal);
             assert_eq!(export(&restored).expect("V2.5 profile closure"), snapshot);
         }
+    }
+
+    #[test]
+    fn color_scheme_reporting_mode_selects_v2_9_roundtrips_and_downgrades() {
+        let mut terminal = Terminal::new(8, 2).expect("terminal");
+        assert!(terminal.modes.set_private_mode(2031, true));
+
+        let snapshot = export(&terminal).expect("mode 2031 snapshot");
+        assert_eq!(u16_at(&snapshot, 10), MINOR_V2_9);
+        assert_eq!(u16_at(&snapshot, 12), MINOR_V2_9);
+        assert_eq!(u64_at(&snapshot, 64), REQUIRED_FEATURES_V2_9 as u64);
+        assert_eq!(u16_at(&snapshot, HEADER_SIZE + DIRECTORY_ENTRY_SIZE + 6), 4);
+
+        let mode_section = directory_value(&snapshot, 1, 8) as usize;
+        let count = u32_at(&snapshot, mode_section) as usize;
+        let color_scheme_record = (0..count)
+            .map(|index| mode_section + 8 + index * 8)
+            .find(|&record| u16_at(&snapshot, record) == 2031 && snapshot[record + 2] == 1)
+            .expect("canonical 2031 mode record");
+        assert_eq!(snapshot[color_scheme_record + 3], 1);
+
+        let mut restored = import(&snapshot).expect("mode 2031 restore");
+        assert!(restored.modes.color_scheme_reporting);
+        assert_eq!(export(&restored).expect("canonical re-export"), snapshot);
+
+        assert!(restored.modes.set_private_mode(2031, false));
+        let downgraded = export(&restored).expect("mode 2031 reset snapshot");
+        assert_eq!(u16_at(&downgraded, 10), MINOR_V2_0);
+
+        assert!(restored.modes.set_private_mode(2027, true));
+        let grapheme_snapshot = export(&restored).expect("mode 2027 snapshot");
+        assert_eq!(u16_at(&grapheme_snapshot, 10), MINOR_V2_9);
+        let grapheme_restored = import(&grapheme_snapshot).expect("mode 2027 restore");
+        assert!(grapheme_restored.modes.grapheme_clustering);
+        assert!(!grapheme_restored.modes.color_scheme_reporting);
     }
 
     #[test]
@@ -5465,7 +5631,7 @@ mod tests {
     fn maximum_capacity_formula_and_preflight_scratch_are_bounded() {
         let payloads = [
             32,
-            136,
+            152,
             24,
             72,
             24,
@@ -5490,10 +5656,10 @@ mod tests {
             })
             .expect("capacity formula does not overflow usize");
         assert_eq!(checked_bound, MAX_CANONICAL_SNAPSHOT_BYTES);
-        assert_eq!(MAX_CANONICAL_SNAPSHOT_BYTES, 44_568_090);
+        assert_eq!(MAX_CANONICAL_SNAPSHOT_BYTES, 44_568_106);
         assert_eq!(
             MAX_SNAPSHOT_BYTES - MAX_CANONICAL_SNAPSHOT_BYTES,
-            22_540_774
+            22_540_758
         );
 
         assert_eq!(

@@ -117,6 +117,11 @@ val termLinkVersionName = providers.gradleProperty("termlinkVersionName")
     .trim()
     .takeIf { it.isNotEmpty() }
     ?: throw GradleException("termlinkVersionName must not be blank")
+val debugApplicationIdSuffix = providers.gradleProperty("termlinkDebugApplicationIdSuffix")
+    .orNull
+    ?.trim()
+    ?.takeIf { it.isNotEmpty() }
+    ?.let { if (it.startsWith('.')) it else ".$it" }
 
 android {
     namespace = "dev.termlink.harness"
@@ -165,6 +170,7 @@ android {
 
     buildTypes {
         getByName("debug") {
+            debugApplicationIdSuffix?.let { applicationIdSuffix = it }
             buildConfigField("String", "TERMLINK_SERVER_URL", buildConfigString(debugServerUrl))
             buildConfigField("boolean", "TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST", debugAllowsCleartextLocalTest.toString())
             buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", debugTerminalSnapshotRuntime.toString())

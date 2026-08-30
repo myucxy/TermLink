@@ -148,6 +148,9 @@ enum class ProductThemePreference(val wireValue: String) {
  * surrounding product shell follows the system theme.
  */
 data class TerminalDisplayPreferences(
+    val fontScheme: TerminalFontScheme = TerminalFontScheme.BUNDLED_NERD_FONT,
+    val customFontDisplayName: String? = null,
+    val customFontSha256: String? = null,
     val fontSizeSp: Float = 14f,
     val lineSpacingMultiplier: Float = 1f,
     /** Packed opaque ARGB values; the settings UI edits the RGB channels. */
@@ -156,11 +159,27 @@ data class TerminalDisplayPreferences(
 ) {
     val normalized: TerminalDisplayPreferences
         get() = copy(
+            customFontDisplayName = customFontDisplayName?.trim()?.take(96)?.takeIf(String::isNotEmpty),
+            customFontSha256 = customFontSha256
+                ?.lowercase()
+                ?.takeIf { it.matches(Regex("[0-9a-f]{64}")) },
             fontSizeSp = fontSizeSp.coerceIn(10f, 24f),
             lineSpacingMultiplier = lineSpacingMultiplier.coerceIn(0.8f, 1.8f),
             foregroundArgb = foregroundArgb or 0xFF000000.toInt(),
             backgroundArgb = backgroundArgb or 0xFF000000.toInt(),
         )
+}
+
+enum class TerminalFontScheme(val wireValue: String) {
+    BUNDLED_NERD_FONT("bundled-nerd-font"),
+    SYSTEM_MONOSPACE("system-monospace"),
+    CUSTOM("custom"),
+    ;
+
+    companion object {
+        fun fromWireValue(value: String?): TerminalFontScheme =
+            entries.firstOrNull { it.wireValue == value } ?: BUNDLED_NERD_FONT
+    }
 }
 
 fun ProductDestination.primaryDestination(): ProductPrimaryDestination = when (this) {

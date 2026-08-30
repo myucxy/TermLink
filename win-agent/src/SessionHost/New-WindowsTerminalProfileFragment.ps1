@@ -33,7 +33,7 @@ $profiles = @(
     [ordered]@{
         guid = '{b2025574-4cc8-5264-b577-7c6532eff95a}'
         name = 'TermLink Windows PowerShell'
-        commandline = New-ProfileCommandLine -ChildCommand 'powershell.exe -NoLogo -NoProfile' -ManagedShell 'windows-powershell'
+        commandline = New-ProfileCommandLine -ChildCommand 'powershell.exe -NoLogo' -ManagedShell 'windows-powershell'
         startingDirectory = '%USERPROFILE%'
         hidden = $false
     }
@@ -44,7 +44,7 @@ if ($pwsh) {
     $profiles += [ordered]@{
         guid = '{7cf2d180-c8be-5b08-99a0-268bd2dc1d6f}'
         name = 'TermLink PowerShell 7'
-        commandline = New-ProfileCommandLine -ChildCommand ('"{0}" -NoLogo -NoProfile' -f $pwsh.Source) -ManagedShell 'powershell-7'
+        commandline = New-ProfileCommandLine -ChildCommand ('"{0}" -NoLogo' -f $pwsh.Source) -ManagedShell 'powershell-7'
         startingDirectory = '%USERPROFILE%'
         hidden = $false
     }
@@ -61,7 +61,11 @@ if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
     }
 }
 
-$document = [ordered]@{ profiles = $profiles }
+$document = [ordered]@{
+    termlinkAddNoLogo = $true
+    termlinkAddNoProfile = $false
+    profiles = $profiles
+}
 $destination = [IO.Path]::GetFullPath($OutputPath)
 $directory = Split-Path -Parent $destination
 [IO.Directory]::CreateDirectory($directory) | Out-Null

@@ -70,7 +70,8 @@ services:
       TERMLINK_WEB_OIDC_REDIRECT_URI: ${TERMLINK_WEB_OIDC_REDIRECT_URI:-}
       TERMLINK_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
       # Migrations share this environment anchor but never need identity-admin
-      # authority. The Keycloak recovery overlay enables it only on the server.
+      # authority. The Keycloak registration/recovery overlay enables the
+      # bounded account-creation client only on the server.
       TERMLINK_REGISTRATION_RECOVERY_ENABLED: "false"
       TERMLINK_ACCOUNT_DELETION_ENABLED: "false"
       TERMLINK_DATABASE_URL_FILE: /run/secrets/database_url

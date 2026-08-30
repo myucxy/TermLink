@@ -34,6 +34,7 @@ import dev.termlink.terminal.api.TerminalRenderFrameV3
 import dev.termlink.terminal.api.TerminalRenderRenditionV3
 import dev.termlink.terminal.api.TerminalRenderUnderlineStyleV3
 import dev.termlink.terminal.api.TerminalThemeV1
+import dev.termlink.terminal.api.TerminalTypefaceResolver
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.max
@@ -70,9 +71,17 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private var selectionExtent: CellPoint? = null
     private var selectionActionMode: ActionMode? = null
     private var detached = false
+    private var baseTypeface: Typeface = Typeface.MONOSPACE
+    private var appliedFontFamilyHint: String? = null
+    private var fontFamilyInitialized = false
 
     private val gestures = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
         override fun onDown(event: MotionEvent): Boolean = true
+
+        override fun onSingleTapUp(event: MotionEvent): Boolean {
+            performClick()
+            return true
+        }
 
         override fun onScroll(
             first: MotionEvent?,
@@ -150,12 +159,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
         isFocusableInTouchMode = true
         isClickable = true
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
-        textPaint.typeface = Typeface.MONOSPACE
-        updateCellMetrics()
-        setOnClickListener {
-            requestFocus()
-            showKeyboard()
-        }
+        refreshTypeface(force = true)
     }
 
     override fun onAttachedToWindow() {
@@ -180,6 +184,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     internal fun onFrameChanged() {
         if (detached) return
+        refreshTypeface()
         clampViewport()
         invalidate()
     }
@@ -224,6 +229,14 @@ internal class NativeTerminalView @JvmOverloads constructor(
         val owner = engine ?: return
         val frame = owner.frames.value
         val theme = owner.theme()
+        drawFrame(canvas, frame, theme)
+    }
+
+    internal fun drawFrame(
+        canvas: Canvas,
+        frame: TerminalRenderFrameV3,
+        theme: TerminalThemeV1,
+    ) {
         shapePaint.style = Paint.Style.FILL
         shapePaint.color = effectiveDefaultBackground(frame, theme)
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), shapePaint)
@@ -248,12 +261,27 @@ internal class NativeTerminalView @JvmOverloads constructor(
                     colors.background
                 }
                 canvas.drawRect(left, top, left + cellWidth, top + cellHeight, shapePaint)
+            }
+        }
+
+        // Draw every cell background before drawing any text. A width-two grapheme is painted by
+        // its lead cell across both columns; painting the continuation background afterwards would
+        // erase the right half of CJK, full-width, and other wide glyphs.
+        for (rowIndex in firstRow..lastRow) {
+            val row = frame.rows[rowIndex]
+            val top = contentPadding + rowIndex * cellHeight - viewportY
+            for (column in 0 until frame.size.columns) {
+                val cell = row.cells[column]
                 if (cell.wideContinuation) continue
                 val grapheme = frame.graphemes.getOrNull(cell.graphemeId - 1) ?: continue
+                val rendition = frame.renditions[cell.renditionId]
                 if (rendition.conceal || grapheme.text.isEmpty()) continue
+                val left = contentPadding + column * cellWidth - viewportX
+                val allottedWidth = cellWidth * grapheme.displayWidth
+                if (left + allottedWidth < 0f || left > width) continue
+                val colors = effectiveColors(frame, rendition, theme)
                 configureTextPaint(rendition, colors.foreground)
                 val textWidth = textPaint.measureText(grapheme.text)
-                val allottedWidth = cellWidth * grapheme.displayWidth
                 val x = left + ((allottedWidth - textWidth) / 2f).coerceAtLeast(0f)
                 val baseline = top + baselineOffset
                 canvas.drawText(grapheme.text, x, baseline, textPaint)
@@ -353,6 +381,17 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     override fun onCheckIsTextEditor(): Boolean = true
 
+    override fun performClick(): Boolean {
+        super.performClick()
+        if (!hasFocus()) requestFocus()
+        // ViewRoot commits focus ownership after the touch callback. Posting
+        // prevents IMEs from rejecting this view as not yet served.
+        post {
+            if (!detached && isAttachedToWindow && hasFocus()) showKeyboard()
+        }
+        return true
+    }
+
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
         outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
             InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
@@ -415,7 +454,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     private fun updateCellMetrics() {
         textPaint.textSize = textSizePixels
-        textPaint.typeface = Typeface.MONOSPACE
+        textPaint.typeface = baseTypeface
         val metrics = textPaint.fontMetrics
         cellWidth = max(textPaint.measureText("M"), textSizePixels * 0.55f)
         val fontHeight = metrics.descent - metrics.ascent
@@ -506,11 +545,21 @@ internal class NativeTerminalView @JvmOverloads constructor(
         textPaint.color = color
         textPaint.alpha = if (rendition.faint) 166 else 255
         textPaint.typeface = when {
-            rendition.bold && rendition.italic -> Typeface.create(Typeface.MONOSPACE, Typeface.BOLD_ITALIC)
-            rendition.bold -> Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-            rendition.italic -> Typeface.create(Typeface.MONOSPACE, Typeface.ITALIC)
-            else -> Typeface.MONOSPACE
+            rendition.bold && rendition.italic -> Typeface.create(baseTypeface, Typeface.BOLD_ITALIC)
+            rendition.bold -> Typeface.create(baseTypeface, Typeface.BOLD)
+            rendition.italic -> Typeface.create(baseTypeface, Typeface.ITALIC)
+            else -> baseTypeface
         }
+    }
+
+    private fun refreshTypeface(force: Boolean = false) {
+        val hint = engine?.theme()?.fontFamilyHint
+        if (!force && fontFamilyInitialized && hint == appliedFontFamilyHint) return
+        baseTypeface = TerminalTypefaceResolver.resolve(context, hint)
+        appliedFontFamilyHint = hint
+        fontFamilyInitialized = true
+        updateCellMetrics()
+        if (isAttachedToWindow) requestLayout()
     }
 
     private fun drawDecorations(

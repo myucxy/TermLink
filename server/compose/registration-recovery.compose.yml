@@ -1,6 +1,8 @@
 services:
   server:
     environment:
+      # This bounded Keycloak service account is the only production account-
+      # creation path and also enables crash-safe invitation reconciliation.
       TERMLINK_REGISTRATION_RECOVERY_ENABLED: "true"
       TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID: ${TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID:-termlink-registration-recovery}
       # Empty means derive the admin API origin from the Keycloak realm issuer.

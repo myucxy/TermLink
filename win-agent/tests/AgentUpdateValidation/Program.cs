@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -19,6 +20,7 @@ namespace TermLink.AgentUpdate.Validation
         {
             try
             {
+                ValidateBrowserAuthorizationLaunch();
                 var pcId = Guid.NewGuid();
                 var updateId = Guid.NewGuid();
                 var mutations = new List<(string Path, string Key, byte[] Body)>();
@@ -89,6 +91,23 @@ namespace TermLink.AgentUpdate.Validation
                 Console.Error.WriteLine(error);
                 return 1;
             }
+        }
+
+        private static void ValidateBrowserAuthorizationLaunch()
+        {
+            const string authorizationUrl = "https://identity.example.test/authorize?client_id=termlink-windows";
+            var start = ProductionEnrollment.CreateBrowserStartInfo(authorizationUrl);
+            Assert(start.FileName == authorizationUrl && start.ArgumentList.Count == 0,
+                "browser authorization URL changed or was passed to an executable as a file-system argument");
+            Assert(start.UseShellExecute && start.Verb == "open",
+                "browser authorization no longer uses the registered HTTPS handler");
+            Assert(start.WindowStyle == ProcessWindowStyle.Normal,
+                "browser authorization inherited the hidden Agent window state");
+            Assert(!start.CreateNoWindow,
+                "browser authorization was configured as a no-window process");
+            AssertThrows<ArgumentException>(
+                () => ProductionEnrollment.CreateBrowserStartInfo("http://identity.example.test/authorize"),
+                "browser authorization accepted a non-HTTPS URL");
         }
 
         private static void ValidateSupervisorRecoveryDecisions()

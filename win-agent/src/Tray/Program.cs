@@ -441,89 +441,58 @@ namespace TermLink.Tray
         }
 
         /// <summary>
-        /// Ends the in-memory account session before removing the two known
-        /// production account files, then starts a fresh unconfigured Agent.
-        /// This is deliberately separate from tray exit, which preserves the
-        /// local account for the next launch.
+        /// Stops old-account synchronization and removes the two known account
+        /// files without restarting the Agent or interrupting local sessions.
         /// </summary>
-        public RegistryResponse ForgetLocalAccountAndRestart()
+        public RegistryResponse ForgetLocalAccount()
         {
-            lock (lifecycleSync)
-            {
-                ShutdownAndWaitCore();
-                Exception forgetError = null;
-                try
-                {
-                    ProductionEnrollment.ForgetLocalAccount();
-                }
-                catch (Exception error)
-                {
-                    forgetError = error;
-                }
-
-                RegistryResponse response = null;
-                Exception restartError = null;
-                try
-                {
-                    response = EnsureAgentCore();
-                    if (response == null || !response.Success ||
-                        (response.Production != null &&
-                            (response.Production.Configured || response.Production.AccountLinked)))
-                    {
-                        throw new InvalidOperationException("The restarted Agent is not in a signed-out state.");
-                    }
-                }
-                catch (Exception error)
-                {
-                    restartError = error;
-                }
-                if (forgetError != null || restartError != null)
-                {
-                    var errors = new List<Exception>();
-                    if (forgetError != null) errors.Add(forgetError);
-                    if (restartError != null) errors.Add(restartError);
-                    throw new AggregateException(
-                        "The local TermLink account could not be forgotten and restarted safely.",
-                        errors);
-                }
-                return response;
-            }
+            return Send(RegistryCommand.SignOutAccount);
         }
 
-        public void LinkAccount(string pcName)
+        public RegistryResponse LinkAccount(string pcName)
         {
             if (!TrayInputValidation.TryNormalizePcName(pcName, out var normalizedPcName))
                 throw new ArgumentException("A valid PC name is required.", nameof(pcName));
-            lock (lifecycleSync)
+            return SendRequest(new RegistryRequest
             {
-                ProductionEnrollment.LinkAccount(options.ServerUrl, normalizedPcName);
-            }
+                Command = RegistryCommand.BeginAccountAuthorization,
+                PcName = normalizedPcName
+            });
         }
 
-        public void LinkAccount(string serverUrl, string pcName)
+        public RegistryResponse LinkAccount(string serverUrl, string pcName)
         {
             if (!TrayInputValidation.TryNormalizeServerOrigin(serverUrl, out var serverOrigin) ||
                 !string.Equals(serverOrigin, options.ServerUrl, StringComparison.OrdinalIgnoreCase))
             {
                 throw new ArgumentException("The account-link server must match the Tray server URL.", nameof(serverUrl));
             }
-            LinkAccount(pcName);
+            return LinkAccount(pcName);
         }
 
-        public void LoginAccount(string username, string password, string pcName)
+        public RegistryResponse LoginAccount(string username, string password, string pcName)
         {
-            lock (lifecycleSync)
+            return SendRequest(new RegistryRequest
             {
-                ProductionEnrollment.LoginDirect(options.ServerUrl, pcName, username, password);
-            }
+                Command = RegistryCommand.LoginAccount,
+                AccountUsername = username,
+                AccountPassword = password,
+                PcName = pcName
+            });
         }
 
-        public void RegisterAccount(string username, string email, string password, string confirm, string pcName)
+        public RegistryResponse RegisterAccount(string username, string email, string password, string confirm, string pcName)
         {
-            lock (lifecycleSync)
+            return SendRequest(new RegistryRequest
             {
-                ProductionEnrollment.RegisterDirect(options.ServerUrl, pcName, username, email, password, confirm);
-            }
+                Command = RegistryCommand.RegisterAccount,
+                AccountUsername = username,
+                AccountNickname = username,
+                AccountEmail = email,
+                AccountPassword = password,
+                AccountPasswordConfirmation = confirm,
+                PcName = pcName
+            });
         }
 
         private void ThrowIfDisposed()

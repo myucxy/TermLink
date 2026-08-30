@@ -824,8 +824,7 @@ namespace TermLink.Tray
                 if (dialog.ShowDialog() != DialogResult.OK) return;
                 try
                 {
-                    await Task.Run(() => controller.LoginAccount(dialog.Username, dialog.Password, dialog.PcName));
-                    var response = await Task.Run(() => controller.RestartAgent());
+                    var response = await Task.Run(() => controller.LoginAccount(dialog.Username, dialog.Password, dialog.PcName));
                     if (!response.Success) throw new InvalidOperationException(response.Code);
                     notifyIcon.ShowBalloonTip(4000, "TermLink", TrayText.Pick("账户已登录。", "Account signed in."), ToolTipIcon.Info);
                     await RefreshStateAsync(false);
@@ -844,8 +843,7 @@ namespace TermLink.Tray
                 if (dialog.ShowDialog() != DialogResult.OK) return;
                 try
                 {
-                    await Task.Run(() => controller.RegisterAccount(dialog.Username, dialog.Email, dialog.Password, dialog.Confirm, dialog.PcName));
-                    var response = await Task.Run(() => controller.RestartAgent());
+                    var response = await Task.Run(() => controller.RegisterAccount(dialog.Username, dialog.Email, dialog.Password, dialog.Confirm, dialog.PcName));
                     if (!response.Success) throw new InvalidOperationException(response.Code);
                     notifyIcon.ShowBalloonTip(4000, "TermLink", TrayText.Pick("账户已创建并登录。", "Account created and signed in."), ToolTipIcon.Info);
                     await RefreshStateAsync(false);
@@ -912,8 +910,8 @@ namespace TermLink.Tray
         {
             if (MessageBox.Show(
                 TrayText.Pick(
-                    "退出此 PC 上的 TermLink 账号？\n\n这会停止当前远程连接，并仅从本机清除登录凭据和账号配置；不会删除服务器账号。",
-                    "Sign out of TermLink on this PC?\n\nThis stops current remote connections and removes only the local credentials and account configuration. It does not delete the server account."),
+                    "退出此 PC 上的 TermLink 账号？\n\n这会停止向当前账户同步，并仅从本机清除登录信息；本地终端保持运行，登录其他账户后会继续同步。不会删除服务器账号。",
+                    "Sign out of TermLink on this PC?\n\nThis stops syncing to the current account and removes only local sign-in data. Local terminals stay open and resume syncing after another account signs in. The server account is not deleted."),
                 "TermLink",
                 MessageBoxButtons.OKCancel,
                 MessageBoxIcon.Warning,
@@ -924,7 +922,7 @@ namespace TermLink.Tray
             signOutItem.Enabled = false;
             try
             {
-                var response = await Task.Run(() => controller.ForgetLocalAccountAndRestart());
+                var response = await Task.Run(() => controller.ForgetLocalAccount());
                 if (response == null || !response.Success) throw new InvalidOperationException(response == null ? "NO_RESPONSE" : response.Code);
                 ApplyState(response);
                 notifyIcon.ShowBalloonTip(
@@ -3298,8 +3296,7 @@ namespace TermLink.Tray
                 SetBusy(true);
                 try
                 {
-                    await Task.Run(() => controller.LoginAccount(dialog.Username, dialog.Password, dialog.PcName));
-                    var response = await Task.Run(() => controller.RestartAgent());
+                    var response = await Task.Run(() => controller.LoginAccount(dialog.Username, dialog.Password, dialog.PcName));
                     if (!response.Success) throw new InvalidOperationException(response.Code);
                     Apply(response);
                     MessageBox.Show(TrayText.Pick("账户登录成功，服务器连接正在建立。", "Signed in successfully. Connecting to the server."), "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -3320,8 +3317,7 @@ namespace TermLink.Tray
                 SetBusy(true);
                 try
                 {
-                    await Task.Run(() => controller.RegisterAccount(dialog.Username, dialog.Email, dialog.Password, dialog.Confirm, dialog.PcName));
-                    var response = await Task.Run(() => controller.RestartAgent());
+                    var response = await Task.Run(() => controller.RegisterAccount(dialog.Username, dialog.Email, dialog.Password, dialog.Confirm, dialog.PcName));
                     if (!response.Success) throw new InvalidOperationException(response.Code);
                     Apply(response);
                     MessageBox.Show(TrayText.Pick("账户创建成功，服务器连接正在建立。", "Account created successfully. Connecting to the server."), "TermLink", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -3338,8 +3334,8 @@ namespace TermLink.Tray
         {
             if (MessageBox.Show(
                 TrayText.Pick(
-                    "退出此 PC 上的 TermLink 账号？\n\n这会停止当前远程连接，并仅从本机清除登录凭据和账号配置；不会删除服务器账号。",
-                    "Sign out of TermLink on this PC?\n\nThis stops current remote connections and removes only the local credentials and account configuration. It does not delete the server account."),
+                    "退出此 PC 上的 TermLink 账号？\n\n这会停止向当前账户同步，并仅从本机清除登录信息；本地终端保持运行，登录其他账户后会继续同步。不会删除服务器账号。",
+                    "Sign out of TermLink on this PC?\n\nThis stops syncing to the current account and removes only local sign-in data. Local terminals stay open and resume syncing after another account signs in. The server account is not deleted."),
                 "TermLink",
                 MessageBoxButtons.OKCancel,
                 MessageBoxIcon.Warning,
@@ -3351,7 +3347,7 @@ namespace TermLink.Tray
             accountSignOutButton.Enabled = false;
             try
             {
-                var response = await Task.Run(() => controller.ForgetLocalAccountAndRestart());
+                var response = await Task.Run(() => controller.ForgetLocalAccount());
                 if (response == null || !response.Success) throw new InvalidOperationException(response == null ? "NO_RESPONSE" : response.Code);
                 Apply(response);
                 MessageBox.Show(

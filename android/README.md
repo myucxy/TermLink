@@ -126,6 +126,26 @@ Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当�
 的自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏、真实计费 Provider
 或生产发布已经验证。
 
+### 移动端字体方案
+
+ANSI 16/256 色与 24 位 True Color 已进入 terminal-core、Render Frame V3 和 Android Canvas
+渲染路径。当前字体实现包括：
+
+- APK 内置 Nerd Fonts v3.5.1 的 `CaskaydiaCoveNerdFontMono-Regular.ttf`，同时打包来源、
+  SHA-256 和 SIL OFL 1.1 许可证；字体由 APK ZIP 自动压缩，不需要首次启动释放；
+- 设置页提供“内置 Nerd Font”“系统等宽字体”和“自定义字体”，系统项明确使用
+  `Typeface.MONOSPACE`；
+- 自定义字体通过系统文档选择器导入 TTF/OTF，限制为 16 MiB，校验 OpenType 头与 Android
+  `Typeface` 可加载性，然后原子替换到 App 私有目录，不申请通用存储权限、不上传服务端；
+- `TerminalThemeV1.fontFamilyHint` 已驱动 native View、Termux 兼容 View 与只读历史 View；
+  字体切换会重建 View 和 cell 度量，自定义字体损坏或丢失时回退内置 Nerd Font，内置字体
+  加载失败时再回退 `Typeface.MONOSPACE`；
+- 设置页提供 Powerline、Nerd Font、中文和数字混合预览。
+
+尚未完成的是 Powerline 分隔符、全部 Nerd Font Private Use Area 图标、复杂组合字形及 cell
+宽度/对齐的 arm64 真机和多套 Oh My Posh 主题回归。因此可以声明字体方案与图标资源已实现，
+但完整视觉兼容仍以真机验收为准。
+
 ## 使用 Android 手机测试 Docker
 
 1. 让手机和 PC 连接同一个允许设备互访的 Wi-Fi；不要使用启用了客户端隔离的访客网络。

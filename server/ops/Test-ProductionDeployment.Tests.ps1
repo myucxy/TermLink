@@ -245,6 +245,7 @@ try {
         's3-secret-key' = 'S3Secret_Test_8xL2qV6mN9pK4rJ7'
         'grafana-admin-password' = 'Grafana_Test_2pV7mQ9xK4nR8sL6'
         'keycloak-admin-client-secret' = 'Keycloak_Test_4nR8vM2qL7pX5sK9'
+        'human-verification-secret' = 'Turnstile_Test_5qN9vK3mR8xL2pW7'
         'account-deletion-identity-key' = $identityKey
     }
     foreach ($fixture in $secretFixtures.GetEnumerator()) {
@@ -289,6 +290,8 @@ receivers:
         "TERMLINK_GRAFANA_ADMIN_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'grafana-admin-password'))",
         "TERMLINK_ALERTMANAGER_CONFIG_FILE=$(ConvertTo-ComposeHostPath $alertmanagerConfig)",
         "TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'keycloak-admin-client-secret'))",
+        'TERMLINK_HUMAN_VERIFICATION_SITE_KEY=0x4AAAA-production-test-site-key',
+        "TERMLINK_HUMAN_VERIFICATION_SECRET_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'human-verification-secret'))",
         "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'account-deletion-identity-key'))",
         'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION=1',
         "TERMLINK_PAYMENT_SECRETS_HOST_DIR=$(ConvertTo-ComposeHostPath $paymentSecretRoot)"
@@ -301,6 +304,7 @@ receivers:
     $externalServices = Join-Path $composeRoot 'external-services.compose.yml'
     $commerce = Join-Path $composeRoot 'commerce.compose.yml'
     $registrationRecovery = Join-Path $composeRoot 'registration-recovery.compose.yml'
+    $humanVerification = Join-Path $composeRoot 'human-verification.compose.yml'
     $accountDeletion = Join-Path $composeRoot 'account-deletion.compose.yml'
     $acceptance = Join-Path $composeRoot 'acceptance.compose.yml'
 
@@ -313,11 +317,12 @@ receivers:
     )
     $matrixCount = 0
     foreach ($historyChoice in $historyChoices) {
-        for ($flags = 0; $flags -lt 8; $flags++) {
+        for ($flags = 0; $flags -lt 16; $flags++) {
             $featureFiles = @($core) + @($historyChoice.Files)
             if (($flags -band 1) -ne 0) { $featureFiles += $commerce }
             if (($flags -band 2) -ne 0) { $featureFiles += $observability }
             if (($flags -band 4) -ne 0) { $featureFiles += $registrationRecovery }
+            if (($flags -band 8) -ne 0) { $featureFiles += $humanVerification }
             $deletionOptions = if ($historyChoice.AllowsDeletion) { @($false, $true) } else { @($false) }
             foreach ($withDeletion in $deletionOptions) {
                 $files = @($featureFiles)
@@ -329,7 +334,7 @@ receivers:
             }
         }
     }
-    if ($matrixCount -ne 80) {
+    if ($matrixCount -ne 160) {
         throw "Unexpected Compose matrix size: $matrixCount"
     }
 
@@ -340,12 +345,13 @@ receivers:
         @{ Name = 'core plus observability'; Files = @($core, $observability); Edge = $true },
         @{ Name = 'core plus commerce'; Files = @($core, $commerce); Edge = $true },
         @{ Name = 'core plus registration recovery'; Files = @($core, $registrationRecovery); Edge = $true },
+        @{ Name = 'core plus human verification'; Files = @($core, $humanVerification); Edge = $true },
         @{ Name = 'local history plus account deletion'; Files = @($core, $history, $accountDeletion); Edge = $true },
         @{ Name = 'local history plus both recovery paths'; Files = @($core, $history, $registrationRecovery, $accountDeletion); Edge = $false },
         @{ Name = 'default full stack'; Files = @($core, $history, $observability); Edge = $true },
         @{ Name = 'external S3'; Files = @($core, $externalServices); Edge = $true },
         @{ Name = 'external S3 plus observability'; Files = @($core, $externalServices, $observability); Edge = $true },
-        @{ Name = 'external full feature stack'; Files = @($core, $externalServices, $commerce, $observability, $registrationRecovery, $accountDeletion); Edge = $true }
+        @{ Name = 'external full feature stack'; Files = @($core, $externalServices, $commerce, $observability, $registrationRecovery, $humanVerification, $accountDeletion); Edge = $true }
     )
     foreach ($case in $cases) {
         Write-Host "Validating $($case.Name)..."
@@ -373,6 +379,8 @@ receivers:
         @{ Name = 'observability receiver config'; Files = @($core, $observability); Remove = @('TERMLINK_ALERTMANAGER_CONFIG_FILE='); Pattern = 'TERMLINK_ALERTMANAGER_CONFIG_FILE' },
         @{ Name = 'observability admin secret'; Files = @($core, $observability); Remove = @('TERMLINK_GRAFANA_ADMIN_PASSWORD_FILE='); Pattern = 'TERMLINK_GRAFANA_ADMIN_PASSWORD_FILE' },
         @{ Name = 'registration recovery secret'; Files = @($core, $registrationRecovery); Remove = @('TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE='); Pattern = 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE' },
+        @{ Name = 'human verification site key'; Files = @($core, $humanVerification); Remove = @('TERMLINK_HUMAN_VERIFICATION_SITE_KEY='); Pattern = 'TERMLINK_HUMAN_VERIFICATION_SITE_KEY' },
+        @{ Name = 'human verification secret'; Files = @($core, $humanVerification); Remove = @('TERMLINK_HUMAN_VERIFICATION_SECRET_FILE='); Pattern = 'TERMLINK_HUMAN_VERIFICATION_SECRET_FILE' },
         @{ Name = 'account deletion identity key'; Files = @($core, $history, $accountDeletion); Remove = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE='); Pattern = 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE' },
         @{ Name = 'account deletion key version'; Files = @($core, $history, $accountDeletion); Remove = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION='); Pattern = 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION' }
     )

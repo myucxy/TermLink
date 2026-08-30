@@ -210,6 +210,7 @@ $observabilityComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\
 $externalServicesComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\external-services.compose.yml'))
 $commerceComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\commerce.compose.yml'))
 $registrationRecoveryComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\registration-recovery.compose.yml'))
+$humanVerificationComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\human-verification.compose.yml'))
 $accountDeletionComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\account-deletion.compose.yml'))
 $reviewedComposePaths = @(
     $coreComposePath,
@@ -218,6 +219,7 @@ $reviewedComposePaths = @(
     $externalServicesComposePath,
     $commerceComposePath,
     $registrationRecoveryComposePath,
+    $humanVerificationComposePath,
     $accountDeletionComposePath
 )
 foreach ($composeFile in $composeFiles) {
@@ -231,6 +233,7 @@ $observabilityOverlayRequested = $composeFiles -contains $observabilityComposePa
 $externalServicesOverlayRequested = $composeFiles -contains $externalServicesComposePath
 $commerceOverlayRequested = $composeFiles -contains $commerceComposePath
 $registrationRecoveryOverlayRequested = $composeFiles -contains $registrationRecoveryComposePath
+$humanVerificationOverlayRequested = $composeFiles -contains $humanVerificationComposePath
 $accountDeletionOverlayRequested = $composeFiles -contains $accountDeletionComposePath
 Assert-Production ($composeFiles -contains $coreComposePath) `
     'Production validation requires the reviewed core.compose.yml foundation.'
@@ -303,7 +306,7 @@ $allowedEnvironment = @{
         'TERMLINK_OIDC_ISSUER', 'TERMLINK_PUBLIC_URL', 'TERMLINK_REDIS_URL_FILE',
         'TERMLINK_REGISTRATION_RECOVERY_ENABLED', 'TERMLINK_TOKEN_SIGNING_KEY_FILE',
         'TERMLINK_WINDOWS_OIDC_CLIENT_ID', 'TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES', 'TERMLINK_WINDOWS_OIDC_REDIRECT_URI',
-        'TERMLINK_WEB_OIDC_CLIENT_ID', 'TERMLINK_WEB_OIDC_REDIRECT_URI')
+        'TERMLINK_WEB_OIDC_CLIENT_ID', 'TERMLINK_WEB_OIDC_REDIRECT_URI', 'TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID')
     # The server receives the same public OIDC settings as migrate, plus its
     # metrics and optional history settings.  Secret values must remain
     # file-backed; the validation below enforces /run/secrets paths.
@@ -311,6 +314,7 @@ $allowedEnvironment = @{
         'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION', 'TERMLINK_ANDROID_OIDC_CLIENT_ID', 'TERMLINK_ANDROID_OIDC_REDIRECT_URI',
         'TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS', 'TERMLINK_APPSHIP_BASE_URL',
         'TERMLINK_DATABASE_URL_FILE', 'TERMLINK_HISTORY_ENABLED', 'TERMLINK_LISTEN_ADDR',
+        'TERMLINK_HUMAN_VERIFICATION_PROVIDER', 'TERMLINK_HUMAN_VERIFICATION_SECRET_FILE', 'TERMLINK_HUMAN_VERIFICATION_SITE_KEY',
         'TERMLINK_KEYCLOAK_ADMIN_BASE_URL', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE',
         'TERMLINK_LOG_LEVEL', 'TERMLINK_METRICS_LISTEN_ADDR', 'TERMLINK_OIDC_ALLOWED_PARTIES', 'TERMLINK_OIDC_CLIENT_ID',
         'TERMLINK_OIDC_CLIENT_SECRET_FILE', 'TERMLINK_OIDC_ISSUER', 'TERMLINK_PUBLIC_URL',
@@ -319,7 +323,7 @@ $allowedEnvironment = @{
         'TERMLINK_S3_ENDPOINT', 'TERMLINK_S3_PUBLIC_ENDPOINT', 'TERMLINK_S3_REGION',
         'TERMLINK_S3_SECRET_KEY_FILE', 'TERMLINK_TOKEN_SIGNING_KEY_FILE',
         'TERMLINK_WINDOWS_OIDC_CLIENT_ID', 'TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES', 'TERMLINK_WINDOWS_OIDC_REDIRECT_URI',
-        'TERMLINK_WEB_OIDC_CLIENT_ID', 'TERMLINK_WEB_OIDC_REDIRECT_URI')
+        'TERMLINK_WEB_OIDC_CLIENT_ID', 'TERMLINK_WEB_OIDC_REDIRECT_URI', 'TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID')
     postgres = @('POSTGRES_DB', 'POSTGRES_PASSWORD_FILE', 'POSTGRES_USER')
     valkey = @('TERMLINK_VALKEY_MAXMEMORY')
     minio = @('MINIO_ROOT_PASSWORD_FILE', 'MINIO_ROOT_USER_FILE')
@@ -338,7 +342,7 @@ $allowedSecretEnvironment = @{
     edge = @()
     migrate = @('TERMLINK_DATABASE_URL_FILE', 'TERMLINK_OIDC_CLIENT_SECRET_FILE',
         'TERMLINK_REDIS_URL_FILE', 'TERMLINK_TOKEN_SIGNING_KEY_FILE')
-    server = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE', 'TERMLINK_DATABASE_URL_FILE', 'TERMLINK_OIDC_CLIENT_SECRET_FILE',
+    server = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE', 'TERMLINK_DATABASE_URL_FILE', 'TERMLINK_HUMAN_VERIFICATION_SECRET_FILE', 'TERMLINK_OIDC_CLIENT_SECRET_FILE',
         'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE', 'TERMLINK_REDIS_URL_FILE', 'TERMLINK_S3_ACCESS_KEY_FILE',
         'TERMLINK_S3_SECRET_KEY_FILE', 'TERMLINK_TOKEN_SIGNING_KEY_FILE')
     postgres = @('POSTGRES_PASSWORD_FILE')
@@ -417,6 +421,10 @@ if ($historyOverlayRequested -or $externalServicesOverlayRequested) {
 if ($registrationRecoveryOverlayRequested) {
     $expectedSecretMounts.server = @($expectedSecretMounts.server +
         'keycloak_admin_client_secret:keycloak_admin_client_secret:65532:65532:0400' | Sort-Object)
+}
+if ($humanVerificationOverlayRequested) {
+    $expectedSecretMounts.server = @($expectedSecretMounts.server +
+        'human_verification_secret:human_verification_secret:65532:65532:0400' | Sort-Object)
 }
 if ($accountDeletionOverlayRequested) {
     $expectedSecretMounts.server = @($expectedSecretMounts.server +
@@ -716,6 +724,8 @@ Assert-Production ([string](Get-PropertyValue $migrationEnvironment 'TERMLINK_AC
     'The migration job must never enable account deletion processing.'
 foreach ($name in @(
     'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE', 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION',
+    'TERMLINK_HUMAN_VERIFICATION_PROVIDER', 'TERMLINK_HUMAN_VERIFICATION_SECRET_FILE',
+    'TERMLINK_HUMAN_VERIFICATION_SITE_KEY',
     'TERMLINK_KEYCLOAK_ADMIN_BASE_URL', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID',
     'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE'
 )) {
@@ -728,6 +738,26 @@ Assert-Production ($recoveryEnabled -eq $registrationRecoveryOverlayRequested) `
 $accountDeletionEnabled = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_ACCOUNT_DELETION_ENABLED') -ceq 'true'
 Assert-Production ($accountDeletionEnabled -eq $accountDeletionOverlayRequested) `
     'TERMLINK_ACCOUNT_DELETION_ENABLED must exactly match account-deletion.compose.yml.'
+$humanVerificationProvider = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_HUMAN_VERIFICATION_PROVIDER')
+$humanVerificationEnabled = $humanVerificationProvider -ceq 'turnstile'
+Assert-Production ($humanVerificationEnabled -eq $humanVerificationOverlayRequested) `
+    'TERMLINK_HUMAN_VERIFICATION_PROVIDER must exactly match human-verification.compose.yml.'
+if ($humanVerificationEnabled) {
+    $humanVerificationSiteKey = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_HUMAN_VERIFICATION_SITE_KEY')
+    Assert-Production ($humanVerificationSiteKey -cmatch '^\S{1,256}$') `
+        'Turnstile requires a bounded non-empty public site key.'
+    Assert-Production ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_HUMAN_VERIFICATION_SECRET_FILE') -ceq
+        '/run/secrets/human_verification_secret') `
+        'Turnstile must use only its reviewed file-backed secret.'
+} else {
+    foreach ($name in @(
+        'TERMLINK_HUMAN_VERIFICATION_PROVIDER', 'TERMLINK_HUMAN_VERIFICATION_SECRET_FILE',
+        'TERMLINK_HUMAN_VERIFICATION_SITE_KEY'
+    )) {
+        Assert-Production ($null -eq (Get-PropertyValue $serverEnvironment $name)) `
+            "Core deployment unexpectedly includes human verification setting '$name'."
+    }
+}
 $keycloakAdminRequested = $recoveryEnabled -or $accountDeletionEnabled
 if ($keycloakAdminRequested) {
     Assert-Production ($oidcIssuerUri.AbsolutePath -match '^/realms/[^/]+/?$' -and
@@ -962,6 +992,7 @@ if ($observabilityOverlayRequested) { $expectedSecretNames += 'grafana_admin_pas
 if ($registrationRecoveryOverlayRequested -or $accountDeletionOverlayRequested) {
     $expectedSecretNames += 'keycloak_admin_client_secret'
 }
+if ($humanVerificationOverlayRequested) { $expectedSecretNames += 'human_verification_secret' }
 if ($accountDeletionOverlayRequested) { $expectedSecretNames += 'account_deletion_identity_key' }
 $actualSecretNames = @($config.secrets.PSObject.Properties.Name | Sort-Object)
 Assert-Production (@(Compare-Object ($expectedSecretNames | Sort-Object) $actualSecretNames).Count -eq 0) `

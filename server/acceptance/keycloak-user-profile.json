@@ -31,7 +31,7 @@
       "name": "termlink_registration_attempt_id",
       "displayName": "Registration correlation",
       "validations": {"length": {"min": 36, "max": 36}},
-      "permissions": {"view": ["admin"], "edit": ["admin", "user"]},
+      "permissions": {"view": ["admin"], "edit": ["admin"]},
       "selector": {"scopes": ["termlink-registration-attempt"]},
       "multivalued": false
     },
@@ -39,7 +39,7 @@
       "name": "termlink_registration_attempt_proof",
       "displayName": "Registration proof",
       "validations": {"length": {"min": 43, "max": 43}},
-      "permissions": {"view": ["admin"], "edit": ["admin", "user"]},
+      "permissions": {"view": ["admin"], "edit": ["admin"]},
       "selector": {"scopes": ["termlink-registration-attempt"]},
       "multivalued": false
     }

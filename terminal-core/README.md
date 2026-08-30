@@ -18,6 +18,14 @@ stated separately below.
 - [`UNIMPLEMENTED_CAPABILITIES.md`](UNIMPLEMENTED_CAPABILITIES.md): explicit
   DRCS, SIXEL/Kitty graphics, History Page, and Delta gaps, dependencies, and
   completion criteria.
+- [`DEVELOPMENT_ROADMAP.md`](DEVELOPMENT_ROADMAP.md): prioritized, resumable
+  plan for evolving the core into a broadly compatible CLI/TUI production
+  runtime, including cross-platform and release gates.
+
+Status note (2026-08-30): Windows and Android now use the native core in their
+production authority/render paths. Later passages that still describe Windows
+shadow mode or Android integration as future work are historical phase notes;
+their cleanup is tracked as W0 in `DEVELOPMENT_ROADMAP.md`.
 
 Every public C structure carries `abi_version` and `struct_size`; callers set
 these fields and may query every public structure size. ABI v1 accepts a known

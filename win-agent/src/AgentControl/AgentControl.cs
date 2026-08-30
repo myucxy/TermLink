@@ -332,7 +332,8 @@ namespace TermLink.Agent
         LoginAccount = 13,
         RegisterAccount = 14,
         SignOutAccount = 15,
-        SaveTerminalCommands = 16
+        SaveTerminalCommands = 16,
+        BeginAccountAuthorization = 17
     }
 
     public sealed class RegistryRequest
@@ -480,7 +481,7 @@ namespace TermLink.Agent
 
     public static class RegistryControlCodec
     {
-        public const byte CurrentVersion = 10;
+        public const byte CurrentVersion = 11;
         private const byte MinimumSupportedVersion = 5;
         private const int MaximumBytes = 64 * 1024;
 
@@ -496,6 +497,8 @@ namespace TermLink.Agent
             ValidateVersion(version, "control");
             if (version < 8 && request.Command >= RegistryCommand.LoginAccount)
                 throw new InvalidDataException("Registry account and command settings require control V8.");
+            if (version < 11 && request.Command == RegistryCommand.BeginAccountAuthorization)
+                throw new InvalidDataException("Browser account authorization requires control V11.");
             request.ProtocolVersion = version;
             using (var body = new MemoryStream())
             using (var writer = new BinaryWriter(body, Encoding.UTF8))
@@ -626,6 +629,9 @@ namespace TermLink.Agent
                     WriteString(writer, request.AccountPasswordConfirmation ?? string.Empty);
                     WriteString(writer, request.PcName ?? string.Empty);
                     break;
+                case RegistryCommand.BeginAccountAuthorization:
+                    WriteString(writer, request.PcName ?? string.Empty);
+                    break;
                 case RegistryCommand.SaveTerminalCommands:
                     var commands = request.TerminalCommands ?? new List<ProductionTerminalCommandSummary>();
                     var maximumCommands = version >= 9 ? 24 : 20;
@@ -656,6 +662,8 @@ namespace TermLink.Agent
             if (!Enum.IsDefined(typeof(RegistryCommand), commandValue))
                 throw new InvalidDataException("Unknown Registry command.");
             var request = new RegistryRequest { Command = (RegistryCommand)commandValue };
+            if (version < 11 && request.Command == RegistryCommand.BeginAccountAuthorization)
+                throw new InvalidDataException("Browser account authorization requires control V11.");
             switch (request.Command)
             {
                 case RegistryCommand.Register:
@@ -694,6 +702,9 @@ namespace TermLink.Agent
                     if (version >= 10) request.AccountNickname = ReadString(reader);
                     request.AccountPassword = ReadString(reader);
                     request.AccountPasswordConfirmation = ReadString(reader);
+                    request.PcName = ReadString(reader);
+                    break;
+                case RegistryCommand.BeginAccountAuthorization:
                     request.PcName = ReadString(reader);
                     break;
                 case RegistryCommand.SaveTerminalCommands:
@@ -1159,6 +1170,8 @@ namespace TermLink.Agent
 
     public static class RegistryControlClient
     {
+        public const int MaximumTimeoutMilliseconds = 300000;
+
         public static RegistryResponse Send(string pipeName, RegistryRequest request, int timeoutMilliseconds)
         {
             if (string.IsNullOrWhiteSpace(pipeName) || pipeName.Length > 200 ||
@@ -1167,7 +1180,7 @@ namespace TermLink.Agent
                 throw new ArgumentException("control pipe name is invalid", "pipeName");
             }
             if (request == null) throw new ArgumentNullException("request");
-            if (timeoutMilliseconds < 1 || timeoutMilliseconds > 300000)
+            if (timeoutMilliseconds < 1 || timeoutMilliseconds > MaximumTimeoutMilliseconds)
             {
                 throw new ArgumentOutOfRangeException("timeoutMilliseconds");
             }

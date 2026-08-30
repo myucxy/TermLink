@@ -32,6 +32,7 @@ import (
 	"github.com/termlink/termlink/server/internal/billing"
 	"github.com/termlink/termlink/server/internal/commerce"
 	"github.com/termlink/termlink/server/internal/history"
+	"github.com/termlink/termlink/server/internal/humanverification"
 	"github.com/termlink/termlink/server/internal/kv"
 	"github.com/termlink/termlink/server/internal/serviceemail"
 	"github.com/termlink/termlink/server/internal/store"
@@ -72,9 +73,15 @@ type API struct {
 	Billing                  *billing.Registry
 	Commerce                 *commerce.Service
 	ReconciliationOperations ReconciliationOperations
-	Registration             *auth.DirectRegistrationService
-	ServiceEmail             *serviceemail.Service
-	VerifiedRegistration     interface {
+	Registration             interface {
+		Register(context.Context, auth.DirectRegistrationInput) error
+		RegisterAttempt(context.Context, uuid.UUID, auth.DirectRegistrationInput) error
+	}
+	ServiceEmail      *serviceemail.Service
+	HumanVerification interface {
+		Verify(context.Context, string, string) error
+	}
+	VerifiedRegistration interface {
 		RegisterVerifiedEmail(context.Context, auth.DirectRegistrationInput) error
 		RegisterVerifiedEmailAttempt(context.Context, uuid.UUID, auth.DirectRegistrationInput) error
 	}
@@ -293,10 +300,12 @@ type registerAccountRequest struct {
 	InvitationCode  string `json:"invitation_code"`
 	VerificationID  string `json:"email_verification_id"`
 	EmailCode       string `json:"email_code"`
+	HumanToken      string `json:"human_verification_token"`
 }
 
 type registrationEmailCodeRequest struct {
-	Email string `json:"email"`
+	Email      string `json:"email"`
+	HumanToken string `json:"human_verification_token"`
 }
 
 func (a *API) sendRegistrationEmailCode(w http.ResponseWriter, r *http.Request) {
@@ -318,6 +327,9 @@ func (a *API) sendRegistrationEmailCode(w http.ResponseWriter, r *http.Request) 
 	var input registrationEmailCodeRequest
 	if err := decodeJSON(r, &input); err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err)
+		return
+	}
+	if !a.verifyRegistrationHuman(w, r, input.HumanToken) {
 		return
 	}
 	challenge, err := a.ServiceEmail.RequestRegistrationCode(r.Context(), input.Email)
@@ -343,7 +355,7 @@ func (a *API) sendRegistrationEmailCode(w http.ResponseWriter, r *http.Request) 
 
 func (a *API) registerAccount(w http.ResponseWriter, r *http.Request) {
 	if a.Registration == nil {
-		writeError(w, r, http.StatusServiceUnavailable, "REGISTRATION_UNAVAILABLE", errors.New("direct registration is unavailable"))
+		writeError(w, r, http.StatusServiceUnavailable, "REGISTRATION_UNAVAILABLE", errors.New("account registration backend is unavailable"))
 		return
 	}
 	var input registerAccountRequest
@@ -377,6 +389,9 @@ func (a *API) registerAccount(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, http.StatusTooManyRequests, "REGISTRATION_RATE_LIMITED", errors.New("registration rate limit reached"))
 			return
 		}
+	}
+	if !a.verifyRegistrationHuman(w, r, input.HumanToken) {
+		return
 	}
 	verifiedEmailRegistration := false
 	var verificationID uuid.UUID
@@ -465,6 +480,10 @@ func (a *API) registerAccount(w http.ResponseWriter, r *http.Request) {
 					slog.String("registration_attempt_id", attemptID.String()))
 			}
 		}
+		if errors.Is(err, auth.ErrKeycloakAdminUnavailable) {
+			writeError(w, r, http.StatusServiceUnavailable, "REGISTRATION_UNAVAILABLE", err)
+			return
+		}
 		writeError(w, r, http.StatusUnprocessableEntity, "REGISTRATION_REJECTED", err)
 		return
 	}
@@ -487,6 +506,24 @@ func (a *API) registerAccount(w http.ResponseWriter, r *http.Request) {
 		response["invitation_link_status"] = "PROVIDER_ACCEPTED"
 	}
 	writeJSON(w, http.StatusCreated, response)
+}
+
+func (a *API) verifyRegistrationHuman(w http.ResponseWriter, r *http.Request, token string) bool {
+	if a.HumanVerification == nil {
+		return true
+	}
+	err := a.HumanVerification.Verify(r.Context(), token, accountRegistrationClientIP(r))
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, humanverification.ErrRequired):
+		writeError(w, r, http.StatusUnprocessableEntity, "HUMAN_VERIFICATION_REQUIRED", err)
+	case errors.Is(err, humanverification.ErrRejected):
+		writeError(w, r, http.StatusUnprocessableEntity, "HUMAN_VERIFICATION_FAILED", err)
+	default:
+		writeError(w, r, http.StatusServiceUnavailable, "HUMAN_VERIFICATION_UNAVAILABLE", humanverification.ErrUnavailable)
+	}
+	return false
 }
 
 func (a *API) getClientConfiguration(w http.ResponseWriter, r *http.Request) {

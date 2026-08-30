@@ -57,6 +57,13 @@ Harness 都是测试夹具，不是生产协议；Android 历史客户端只接�
 Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-7
 的本地自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏或外部生产发布已经验证。
 
+移动客户端已内置固定版本和校验值的 CaskaydiaCove Nerd Font Mono，并在“设置 → 终端显示”
+提供内置 Nerd Font、系统 `Typeface.MONOSPACE` 与本机自定义 TTF/OTF 三种字体方案。自定义字体
+经大小、OpenType 头和 Android `Typeface` 校验后原子复制到 App 私有目录，不上传服务端；加载失败
+自动回退到内置字体，再回退到系统等宽字体。Native、Termux 兼容视图和历史视图均使用同一选择。
+Oh My Posh 的颜色、Powerline 与 Nerd Font 字形已具备实现路径；复杂组合字形、所有 PUA 图标和
+cell 宽度/对齐仍需 arm64 真机及多个实际主题回归后才能声明完整兼容。
+
 ## 商业模式
 
 - 同一账号可注册不限数量的 Windows PC，并同时订阅不限数量的实时会话；

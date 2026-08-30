@@ -115,6 +115,36 @@ namespace TermLink.Agent
         public List<byte[]> TranscriptPlaintexts { get; set; } = new List<byte[]>();
     }
 
+    internal sealed class ProductionTerminalTranscriptArchivePage
+    {
+        public Guid SessionId { get; set; }
+        public ulong FirstLineId { get; set; }
+        public ulong LastLineId { get; set; }
+        public List<ProductionTerminalTranscriptArchiveRow> Rows { get; set; } =
+            new List<ProductionTerminalTranscriptArchiveRow>();
+    }
+
+    internal sealed class ProductionTerminalTranscriptArchiveRow
+    {
+        public ulong LineId { get; set; }
+        public ulong SealedAtSequence { get; set; }
+        public bool Wrapped { get; set; }
+        public List<ProductionTerminalTranscriptArchiveCell> Cells { get; set; } =
+            new List<ProductionTerminalTranscriptArchiveCell>();
+    }
+
+    internal sealed class ProductionTerminalTranscriptArchiveCell
+    {
+        public int Repeat { get; set; }
+        public string Character { get; set; }
+        public int Foreground { get; set; }
+        public int Background { get; set; }
+        public ushort Attributes { get; set; }
+        public int HyperlinkIndexPlusOne { get; set; }
+        public int DisplayWidth { get; set; }
+        public bool WideContinuation { get; set; }
+    }
+
     internal sealed class ProductionTerminalHistoryPreparedUpload
     {
         public Guid SessionId { get; set; }
@@ -137,6 +167,8 @@ namespace TermLink.Agent
         private const string CheckpointFileName = "checkpoint.dpapi";
         private const string OutboxFileName = "outbox.dpapi";
         private const string ChunkOutboxFileName = "chunk-outbox.dpapi";
+        private const string TranscriptArchiveDirectoryName = "transcript-archive";
+        private const string TranscriptArchiveExtension = ".transcript.dpapi";
         private readonly string root;
         private readonly Guid pcDeviceId;
         private readonly ConcurrentDictionary<Guid, object> sessionLocks = new ConcurrentDictionary<Guid, object>();
@@ -250,6 +282,64 @@ namespace TermLink.Agent
             }
             result.Sort();
             return result;
+        }
+
+        public void AppendTranscriptArchivePage(
+            Guid sessionId,
+            IReadOnlyList<PortableTerminalRowV1> rows)
+        {
+            ValidateSessionId(sessionId);
+            if (rows == null || rows.Count != PortableTerminalModelV1.TranscriptArchivePageRows)
+                throw new InvalidDataException("A terminal transcript archive page has the wrong row count.");
+            var page = ToArchivePage(sessionId, rows);
+            ValidateTranscriptArchivePage(page, sessionId);
+            lock (SessionLock(sessionId))
+            {
+                var directory = TranscriptArchiveDirectory(sessionId);
+                Directory.CreateDirectory(directory);
+                var path = Path.Combine(
+                    directory,
+                    page.FirstLineId.ToString("D20") + "-" + page.LastLineId.ToString("D20") +
+                    TranscriptArchiveExtension);
+                if (File.Exists(path))
+                {
+                    var existing = ReadJson<ProductionTerminalTranscriptArchivePage>(
+                        path,
+                        sessionId,
+                        "transcript-archive");
+                    ValidateTranscriptArchivePage(existing, sessionId);
+                    if (!TranscriptArchivePagesEqual(existing, page))
+                        throw new InvalidDataException("A terminal transcript archive range changed after sealing.");
+                    return;
+                }
+                WriteJson(path, sessionId, "transcript-archive", page);
+            }
+        }
+
+        public IList<IReadOnlyList<PortableTerminalRowV1>> ReadTranscriptArchivePages(Guid sessionId)
+        {
+            ValidateSessionId(sessionId);
+            lock (SessionLock(sessionId))
+            {
+                var directory = TranscriptArchiveDirectory(sessionId);
+                var result = new List<IReadOnlyList<PortableTerminalRowV1>>();
+                if (!Directory.Exists(directory)) return result;
+                ulong previousLast = 0;
+                foreach (var path in Directory.GetFiles(directory, "*" + TranscriptArchiveExtension)
+                    .OrderBy(value => Path.GetFileName(value), StringComparer.Ordinal))
+                {
+                    var page = ReadJson<ProductionTerminalTranscriptArchivePage>(
+                        path,
+                        sessionId,
+                        "transcript-archive");
+                    ValidateTranscriptArchivePage(page, sessionId);
+                    if (previousLast != 0 && page.FirstLineId != checked(previousLast + 1))
+                        throw new InvalidDataException("Terminal transcript archive pages are not contiguous.");
+                    result.Add(FromArchivePage(page));
+                    previousLast = page.LastLineId;
+                }
+                return result;
+            }
         }
 
         public void SaveCheckpoint(ProductionTerminalHistoryCheckpoint checkpoint)
@@ -508,9 +598,147 @@ namespace TermLink.Agent
 
         private string WalDirectory(Guid sessionId) => Path.Combine(SessionDirectory(sessionId), "wal");
 
+        private string TranscriptArchiveDirectory(Guid sessionId) =>
+            Path.Combine(SessionDirectory(sessionId), TranscriptArchiveDirectoryName);
+
         private static void ValidateSessionId(Guid sessionId)
         {
             if (sessionId == Guid.Empty) throw new ArgumentException("Session ID is required.", nameof(sessionId));
+        }
+
+        private static ProductionTerminalTranscriptArchivePage ToArchivePage(
+            Guid sessionId,
+            IReadOnlyList<PortableTerminalRowV1> rows)
+        {
+            var page = new ProductionTerminalTranscriptArchivePage
+            {
+                SessionId = sessionId,
+                FirstLineId = rows[0].LineId,
+                LastLineId = rows[^1].LineId
+            };
+            foreach (var row in rows)
+            {
+                var archived = new ProductionTerminalTranscriptArchiveRow
+                {
+                    LineId = row.LineId,
+                    SealedAtSequence = row.SealedAtSequence,
+                    Wrapped = row.Wrapped
+                };
+                foreach (var cell in row.Cells)
+                {
+                    var candidate = new ProductionTerminalTranscriptArchiveCell
+                    {
+                        Repeat = 1,
+                        Character = cell.Character,
+                        Foreground = cell.Style.Foreground,
+                        Background = cell.Style.Background,
+                        Attributes = (ushort)cell.Style.Attributes,
+                        HyperlinkIndexPlusOne = cell.Style.HyperlinkIndexPlusOne,
+                        DisplayWidth = cell.DisplayWidth,
+                        WideContinuation = cell.WideContinuation
+                    };
+                    if (archived.Cells.Count > 0 &&
+                        ArchiveCellPresentationEquals(archived.Cells[^1], candidate))
+                    {
+                        archived.Cells[^1].Repeat++;
+                    }
+                    else
+                    {
+                        archived.Cells.Add(candidate);
+                    }
+                }
+                page.Rows.Add(archived);
+            }
+            return page;
+        }
+
+        private static IReadOnlyList<PortableTerminalRowV1> FromArchivePage(
+            ProductionTerminalTranscriptArchivePage page)
+        {
+            var result = new List<PortableTerminalRowV1>(page.Rows.Count);
+            foreach (var row in page.Rows)
+            {
+                var cells = ExpandArchiveCells(row.Cells);
+                result.Add(new PortableTerminalRowV1(
+                    cells,
+                    row.Wrapped,
+                    row.LineId,
+                    row.SealedAtSequence));
+            }
+            return result;
+        }
+
+        private static void ValidateTranscriptArchivePage(
+            ProductionTerminalTranscriptArchivePage page,
+            Guid sessionId)
+        {
+            if (page == null || page.SessionId != sessionId || page.FirstLineId == 0 ||
+                page.LastLineId < page.FirstLineId ||
+                page.Rows == null || page.Rows.Count != PortableTerminalModelV1.TranscriptArchivePageRows ||
+                page.Rows[0]?.LineId != page.FirstLineId || page.Rows[^1]?.LineId != page.LastLineId)
+                throw new InvalidDataException("Terminal transcript archive page metadata is invalid.");
+            ulong previous = 0;
+            foreach (var row in page.Rows)
+            {
+                if (row == null || row.LineId == 0 || row.LineId <= previous || row.SealedAtSequence == 0 ||
+                    row.Cells == null || row.Cells.Count == 0)
+                    throw new InvalidDataException("Terminal transcript archive row is invalid.");
+                _ = new PortableTerminalRowV1(
+                    ExpandArchiveCells(row.Cells),
+                    row.Wrapped,
+                    row.LineId,
+                    row.SealedAtSequence);
+                previous = row.LineId;
+            }
+        }
+
+        private static bool TranscriptArchivePagesEqual(
+            ProductionTerminalTranscriptArchivePage left,
+            ProductionTerminalTranscriptArchivePage right)
+        {
+            var leftBytes = JsonSerializer.SerializeToUtf8Bytes(left, JsonOptions);
+            var rightBytes = JsonSerializer.SerializeToUtf8Bytes(right, JsonOptions);
+            try { return CryptographicOperations.FixedTimeEquals(leftBytes, rightBytes); }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(leftBytes);
+                CryptographicOperations.ZeroMemory(rightBytes);
+            }
+        }
+
+        private static IEnumerable<PortableTerminalCellV1> ExpandArchiveCells(
+            IEnumerable<ProductionTerminalTranscriptArchiveCell> runs)
+        {
+            var expanded = 0;
+            foreach (var run in runs)
+            {
+                if (run == null || run.Repeat < 1 || run.Repeat > 512 || expanded > 512 - run.Repeat)
+                    throw new InvalidDataException("Terminal transcript archive cell run is invalid.");
+                var style = new PortableTerminalStyleV1(
+                    run.Foreground,
+                    run.Background,
+                    (PortableTerminalAttributesV1)run.Attributes,
+                    run.HyperlinkIndexPlusOne);
+                for (var index = 0; index < run.Repeat; index++)
+                    yield return new PortableTerminalCellV1(
+                        run.Character,
+                        style,
+                        run.DisplayWidth,
+                        run.WideContinuation);
+                expanded += run.Repeat;
+            }
+        }
+
+        private static bool ArchiveCellPresentationEquals(
+            ProductionTerminalTranscriptArchiveCell left,
+            ProductionTerminalTranscriptArchiveCell right)
+        {
+            return left.Character == right.Character &&
+                left.Foreground == right.Foreground && left.Background == right.Background &&
+                left.Attributes == right.Attributes &&
+                left.HyperlinkIndexPlusOne == right.HyperlinkIndexPlusOne &&
+                left.DisplayWidth == right.DisplayWidth &&
+                left.WideContinuation == right.WideContinuation;
         }
 
         private static void ValidateCheckpoint(ProductionTerminalHistoryCheckpoint value)

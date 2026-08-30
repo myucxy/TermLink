@@ -53,6 +53,10 @@ public sealed class PortableAgentClient : IAgentClient, IAsyncDisposable
     public ValueTask RevokeDeviceAsync(Guid deviceId, CancellationToken cancellationToken) =>
         SendEmptyAsync(LocalAgentCommand.RevokeDevice, new DevicePayload(deviceId), cancellationToken);
 
+    public ValueTask BeginAccountAuthorizationAsync(string pcName, CancellationToken cancellationToken) =>
+        ValueTask.FromException(new PlatformNotSupportedException(
+            "Browser account authorization is currently available through the Windows Agent."));
+
     public ValueTask LoginAsync(string username, string password, string pcName, CancellationToken cancellationToken) =>
         SendEmptyAsync(LocalAgentCommand.Login, new LoginPayload(username, password, pcName), cancellationToken);
 

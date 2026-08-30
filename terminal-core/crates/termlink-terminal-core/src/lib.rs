@@ -1624,6 +1624,9 @@ impl Terminal {
             b'c' if matches!(csi.parameters(), [] | [0] | [PARAM_MISSING]) => {
                 Self::emit_host_reply(effect, b"\x1b[>0;0;0c")
             }
+            b'q' if matches!(csi.parameters(), [] | [0] | [PARAM_MISSING]) => {
+                Self::emit_host_reply_v2(effect, b"\x1bP>|TermLink(1)\x1b\\")
+            }
             _ => Err(TerminalError::Unsupported("private CSI prefix")),
         }
     }
@@ -2063,6 +2066,14 @@ impl Terminal {
 
     fn dispatch_window_manipulation(&mut self, csi: &CsiSequence) -> Result<(), TerminalError> {
         require_max_parameters(csi, 3, "window manipulation parameters")?;
+        // XTVERSION-capable TUIs commonly probe `CSI 14 t` for the text-area
+        // pixel dimensions. TermLink's durable cross-device model owns cell
+        // dimensions only; pixel geometry belongs to each renderer and is not
+        // carried by an output event. Recognize the exact query without
+        // fabricating a reply so the application can use its bounded fallback.
+        if csi.parameters() == [14] {
+            return Ok(());
+        }
         let save = match csi.parameter(0, 0) {
             22 => true,
             23 => false,

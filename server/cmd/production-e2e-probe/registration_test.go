@@ -11,6 +11,7 @@ import (
 
 func TestVerifyAnonymousRegistrationUsesOnlyThemedGETFlow(t *testing.T) {
 	var registrationGets atomic.Int32
+	var registrationScriptGets atomic.Int32
 	var mutationRequests atomic.Int32
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -33,14 +34,13 @@ func TestVerifyAnonymousRegistrationUsesOnlyThemedGETFlow(t *testing.T) {
 			http.Redirect(w, r, "/realms/termlink/protocol/openid-connect/auth?"+query.Encode(), http.StatusFound)
 		case "/realms/termlink/protocol/openid-connect/auth":
 			http.SetCookie(w, &http.Cookie{Name: "AUTH_SESSION_ID", Value: "opaque-session", Path: "/realms/termlink", Secure: true, HttpOnly: true})
-			_, _ = fmt.Fprint(w, `<!doctype html><div class="identity-form-shell"><a href="/realms/termlink/login-actions/registration?session_code=opaque&amp;client_id=termlink-web">Create account</a></div>`)
-		case "/realms/termlink/login-actions/registration":
-			if _, err := r.Cookie("AUTH_SESSION_ID"); err != nil {
-				http.Error(w, "missing browser session", http.StatusUnauthorized)
-				return
-			}
+			_, _ = fmt.Fprint(w, `<!doctype html><div class="identity-form-shell"><form id="kc-form-login"></form></div>`)
+		case "/register":
 			registrationGets.Add(1)
-			_, _ = fmt.Fprint(w, `<!doctype html><div class="identity-form-shell"><form id="kc-register-form" method="post"><input name="username"><input name="email" type="email"><input name="user.attributes.nickname"><input name="password" type="password"><input name="password-confirm" type="password"></form></div>`)
+			_, _ = fmt.Fprint(w, `<!doctype html><div class="identity-form-shell"><form id="registration-form"><input name="username"><input name="email" type="email"><input name="nickname"><input name="password" type="password"><input name="password_confirm" type="password"></form></div>`)
+		case "/assets/register.js":
+			registrationScriptGets.Add(1)
+			_, _ = fmt.Fprint(w, `const zh = "注册服务暂时不可用"; const en = "Registration is temporarily unavailable";`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -55,8 +55,37 @@ func TestVerifyAnonymousRegistrationUsesOnlyThemedGETFlow(t *testing.T) {
 	if registrationGets.Load() != 1 {
 		t.Fatalf("registration GET count=%d, want 1", registrationGets.Load())
 	}
+	if registrationScriptGets.Load() != 1 {
+		t.Fatalf("registration script GET count=%d, want 1", registrationScriptGets.Load())
+	}
 	if mutationRequests.Load() != 0 {
 		t.Fatalf("anonymous registration probe sent %d mutation requests", mutationRequests.Load())
+	}
+}
+
+func TestVerifyAnonymousRegistrationRejectsNativeProviderRegistration(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login":
+			query := url.Values{
+				"client_id": {"termlink-web"}, "response_type": {"code"},
+				"redirect_uri": {"https://" + r.Host + "/auth/callback"}, "scope": {"openid"},
+				"state": {"opaque-state"}, "nonce": {"opaque-nonce"},
+				"code_challenge": {"opaque-pkce-challenge"}, "code_challenge_method": {"S256"},
+			}
+			http.Redirect(w, r, "/realms/termlink/protocol/openid-connect/auth?"+query.Encode(), http.StatusFound)
+		case "/realms/termlink/protocol/openid-connect/auth":
+			_, _ = fmt.Fprint(w, `<!doctype html><div class="identity-form-shell"><a href="/realms/termlink/login-actions/registration?session_code=opaque">Create account</a></div>`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	server := httptest.NewTLSServer(handler)
+	defer server.Close()
+
+	p := &probe{issuer: server.URL + "/realms/termlink", http: server.Client()}
+	if err := p.verifyAnonymousRegistration(); err == nil {
+		t.Fatal("anonymous registration probe accepted native provider registration")
 	}
 }
 
@@ -73,8 +102,8 @@ func TestVerifyAnonymousRegistrationRejectsCrossOriginAuthorization(t *testing.T
 }
 
 func TestRegistrationFormFieldContract(t *testing.T) {
-	page := []byte(`<form id='kc-register-form'><input name='username'><input name='email'><input name='user.attributes.nickname'><input name='password'><input name='password-confirm'></form>`)
-	for _, field := range []string{"username", "email", "user.attributes.nickname", "password", "password-confirm"} {
+	page := []byte(`<form id='registration-form'><input name='username'><input name='email'><input name='nickname'><input name='password'><input name='password_confirm'></form>`)
+	for _, field := range []string{"username", "email", "nickname", "password", "password_confirm"} {
 		if !hasHTMLAttribute(page, "input", "name", field) {
 			t.Fatalf("field %q was not detected", field)
 		}

@@ -266,6 +266,9 @@ class ProductStateTest {
     @Test
     fun terminalDisplayPreferencesStayWithinRendererSafeBounds() {
         val normalized = TerminalDisplayPreferences(
+            fontScheme = TerminalFontScheme.CUSTOM,
+            customFontDisplayName = "  My Font.ttf  ",
+            customFontSha256 = "A".repeat(64),
             fontSizeSp = 2f,
             lineSpacingMultiplier = 4f,
             foregroundArgb = 0x00112233,
@@ -273,9 +276,24 @@ class ProductStateTest {
         ).normalized
 
         assertEquals(10f, normalized.fontSizeSp)
+        assertEquals(TerminalFontScheme.CUSTOM, normalized.fontScheme)
+        assertEquals("My Font.ttf", normalized.customFontDisplayName)
+        assertEquals("a".repeat(64), normalized.customFontSha256)
         assertEquals(1.8f, normalized.lineSpacingMultiplier)
         assertEquals(0xFF112233.toInt(), normalized.foregroundArgb)
         assertEquals(0xFF445566.toInt(), normalized.backgroundArgb)
+    }
+
+    @Test
+    fun terminalFontSchemeUnknownValuesFallBackToBundledNerdFont() {
+        assertEquals(
+            TerminalFontScheme.BUNDLED_NERD_FONT,
+            TerminalFontScheme.fromWireValue("future-font"),
+        )
+        assertEquals(
+            TerminalFontScheme.SYSTEM_MONOSPACE,
+            TerminalFontScheme.fromWireValue("system-monospace"),
+        )
     }
 
     @Test

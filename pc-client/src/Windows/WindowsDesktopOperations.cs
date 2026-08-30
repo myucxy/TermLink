@@ -109,6 +109,41 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
         return ValueTask.FromResult("已打开诊断日志目录。");
     }
 
+    public ValueTask<DesktopTerminalIntegrationSettings> GetTerminalIntegrationSettingsAsync(
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var packageManaged = WindowsTerminalIntegration.IsCurrentProcessPackaged();
+        var fragmentPath = packageManaged
+            ? Path.Combine(installationRoot, "Terminal", "Fragments", WindowsTerminalIntegration.FragmentFileName)
+            : WindowsTerminalIntegration.DefaultFragmentPath;
+        var settings = WindowsTerminalIntegration.ReadPowerShellSettings(fragmentPath);
+        return ValueTask.FromResult(new DesktopTerminalIntegrationSettings(
+            settings.AddNoLogo,
+            settings.AddNoProfile,
+            CanConfigure: !packageManaged));
+    }
+
+    public ValueTask<string> ConfigureTerminalIntegrationAsync(
+        bool addNoLogo,
+        bool addNoProfile,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (WindowsTerminalIntegration.IsCurrentProcessPackaged())
+        {
+            throw new NotSupportedException(
+                "MSIX 安装的 Windows Terminal Profile 由签名包管理，当前版本不能在运行时修改参数。");
+        }
+        var result = WindowsTerminalIntegration.Reconfigure(
+            installationRoot,
+            WindowsTerminalIntegration.DefaultFragmentPath,
+            addNoLogo,
+            addNoProfile);
+        WindowsTerminalIntegration.TryRefreshInstallMarker(installationRoot, result);
+        return ValueTask.FromResult("Windows Terminal 启动参数已保存。");
+    }
+
     public ValueTask<string> RepairTerminalIntegrationAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();

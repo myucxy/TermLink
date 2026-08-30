@@ -16,7 +16,9 @@ import dev.termlink.protocol.realtime.v1.SessionTerminateRequestPayload
 import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
 import dev.termlink.protocol.realtime.v1.SubscribePayload
 import dev.termlink.session.DurableAckCommit
+import dev.termlink.session.InputSubmission
 import dev.termlink.session.RemoteLifecycle
+import dev.termlink.session.RendererBootstrapState
 import dev.termlink.session.RemoteSessionEvent
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.TerminalEngine
@@ -28,6 +30,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -36,10 +39,14 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -166,6 +173,208 @@ class ProductionRealtimeSessionClientTest {
         )
         multiplexers += multiplexer
         return multiplexer.register(sessionId)
+    }
+
+    @Test
+    fun fatalFrameRejectsQueuedSuccessorUntilNewGenerationReplaysContiguousHistory(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val keyId = "epoch-00000007".encodeToByteArray()
+        val transport = QueuedSessionTransport()
+        val outputs = CopyOnWriteArrayList<ByteArray>()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(outputs),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+                keyId = keyId.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(30_000),
+            initialRendererState = RendererBootstrapState.FullPrefix(
+                sequence = 305,
+                rendererGeneration = 1,
+            ),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+        val replayOne = incomingOutputEnvelope(
+            sessionId, pcId, androidId, pcIdentity, androidIdentity, keyId, 306, byteArrayOf(6),
+        )
+        val replayTwo = incomingOutputEnvelope(
+            sessionId, pcId, androidId, pcIdentity, androidIdentity, keyId, 307, byteArrayOf(7),
+        )
+        val corruptedCiphertext = replayOne.ciphertext.toByteArray().also {
+            it[it.lastIndex] = (it.last().toInt() xor 1).toByte()
+        }
+        val corruptOne = replayOne.toBuilder()
+            .setCiphertext(ByteString.copyFrom(corruptedCiphertext))
+            .build()
+        corruptedCiphertext.fill(0)
+
+        try {
+            client.start()
+            withTimeout(2_000) { client.sessionState.first { it is RemoteSessionState.Live } }
+
+            // Both frames are queued before the collector can complete the
+            // fatal decrypt. Sequence 2 must never reach RemoteTerminalSession.
+            transport.deliver(corruptOne, generation = 1)
+            transport.deliver(replayTwo, generation = 1)
+            withTimeout(2_000) {
+                client.transportState.first { it is ProductionTransportState.Reconnecting }
+            }
+            withTimeout(2_000) {
+                while (transport.releasedReservations < 2) kotlinx.coroutines.yield()
+            }
+            assertTrue(outputs.isEmpty())
+            assertTrue(client.sessionState.value !is RemoteSessionState.HistoryGap)
+            assertEquals(0L, client.diagnostics().lastHandledSequence)
+
+            transport.emitConnected()
+            withTimeout(2_000) { client.sessionState.first { it is RemoteSessionState.Live } }
+            transport.deliver(replayOne, generation = 2)
+            transport.deliver(replayTwo, generation = 2)
+
+            withTimeout(2_000) { client.sessionState.first { it.lastAckedSequence == 307L } }
+            assertEquals(listOf(6, 7), outputs.map { it.single().toInt() })
+            assertEquals(307L, client.diagnostics().lastHandledSequence)
+        } finally {
+            client.close()
+            keyId.fill(0)
+            outputs.forEach { it.fill(0) }
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun pcHeartbeatIsFatalSemanticAndFencesSameGenerationSuccessor(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val keyId = "epoch-00000007".encodeToByteArray()
+        val transport = QueuedSessionTransport()
+        val outputs = CopyOnWriteArrayList<ByteArray>()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(outputs),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+                keyId = keyId.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(30_000),
+            initialRendererState = RendererBootstrapState.FullPrefix(305, 1),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+        val heartbeat = incomingHeartbeatEnvelope(
+            sessionId, pcId, androidId, pcIdentity, androidIdentity, keyId, 306,
+        )
+        val successor = incomingOutputEnvelope(
+            sessionId, pcId, androidId, pcIdentity, androidIdentity, keyId, 307, byteArrayOf(7),
+        )
+        try {
+            client.start()
+            withTimeout(2_000) { client.sessionState.first { it is RemoteSessionState.Live } }
+            transport.deliver(heartbeat, generation = 1)
+            transport.deliver(successor, generation = 1)
+
+            withTimeout(2_000) {
+                client.transportState.first { it is ProductionTransportState.Reconnecting }
+            }
+            withTimeout(2_000) {
+                while (transport.releasedReservations < 2) kotlinx.coroutines.yield()
+            }
+            assertTrue(outputs.isEmpty())
+            assertTrue(client.sessionState.value !is RemoteSessionState.HistoryGap)
+            assertTrue(transport.disconnectReasons.single().endsWith("semantic"))
+            assertEquals(0L, client.diagnostics().lastHandledSequence)
+        } finally {
+            client.close()
+            keyId.fill(0)
+            outputs.forEach { it.fill(0) }
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun oldGenerationSuccessorCannotCrossNewGenerationFence(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val keyId = "epoch-00000007".encodeToByteArray()
+        val transport = QueuedSessionTransport()
+        val outputs = CopyOnWriteArrayList<ByteArray>()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(outputs),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+                keyId = keyId.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+        val first = incomingOutputEnvelope(
+            sessionId, pcId, androidId, pcIdentity, androidIdentity, keyId, 1, byteArrayOf(1),
+        )
+        val second = incomingOutputEnvelope(
+            sessionId, pcId, androidId, pcIdentity, androidIdentity, keyId, 2, byteArrayOf(2),
+        )
+        try {
+            client.start()
+            withTimeout(2_000) { client.sessionState.first { it is RemoteSessionState.Live } }
+
+            transport.deliver(first, generation = 2)
+            transport.deliver(second, generation = 1)
+            withTimeout(2_000) { client.sessionState.first { it.lastAckedSequence == 1L } }
+            withTimeout(2_000) {
+                while (transport.releasedReservations < 2) kotlinx.coroutines.yield()
+            }
+            assertEquals(listOf(1), outputs.map { it.single().toInt() })
+            assertTrue(client.sessionState.value !is RemoteSessionState.HistoryGap)
+
+            transport.deliver(second, generation = 2)
+            withTimeout(2_000) { client.sessionState.first { it.lastAckedSequence == 2L } }
+            assertEquals(listOf(1, 2), outputs.map { it.single().toInt() })
+        } finally {
+            client.close()
+            keyId.fill(0)
+            outputs.forEach { it.fill(0) }
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
     }
 
     @Test
@@ -2064,6 +2273,50 @@ class ProductionRealtimeSessionClientTest {
         }
     }
 
+    @Test
+    fun inputAcceptanceTimeoutDoesNotDisconnectHealthyTransportOrLease(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = RecordingSessionTransport(sendResult = true)
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "http://127.0.0.1:1/",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            inputAcceptanceTimeoutMillis = 25,
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            client.remoteSession.onConnected()
+            client.remoteSession.grantControl("lease", Long.MAX_VALUE, leaseVersion = 1)
+
+            val result = client.remoteSession.submitInput("dock-shortcut".encodeToByteArray())
+
+            assertIs<InputSubmission.DeliveryUnknown>(result)
+            assertTrue(transport.sent.any { it.messageType == MessageType.INPUT_EVENT })
+            assertTrue(transport.disconnectReasons.isEmpty())
+            assertIs<RemoteSessionState.Controlling>(client.sessionState.value)
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
     private fun assertCumulativeCursor(values: List<Long>, expectedFinal: Long) {
         val snapshot = values.toList()
         assertTrue(snapshot.isNotEmpty())
@@ -2085,6 +2338,178 @@ class ProductionRealtimeSessionClientTest {
 
     private suspend fun resetAcknowledgement(generation: Long): DurableAckCommit =
         DurableAckCommit(sequence = 0L, rendererGeneration = generation + 1L)
+
+    private fun incomingHeartbeatEnvelope(
+        sessionId: UUID,
+        pcId: UUID,
+        androidId: UUID,
+        pcIdentity: DeviceIdentity,
+        androidIdentity: DeviceIdentity,
+        keyId: ByteArray,
+        sequence: Long,
+    ): Envelope {
+        val pairwise = SessionCrypto.derivePairwiseKey(
+            pcIdentity.exchange.privateKey,
+            androidIdentity.exchange.publicKey,
+            pcId,
+            androidId,
+            7,
+        )
+        val sessionKey = SessionCrypto.deriveSessionKey(
+            pairwise,
+            sessionId,
+            CryptoDirection.PC_TO_ANDROID,
+            keyId,
+        )
+        val nonce = SessionCrypto.nonce(byteArrayOf(1, 2, 3, 4), sequence.toULong())
+        return try {
+            ProductionRealtimeClient.encryptedEnvelope(
+                sessionId = sessionId,
+                senderId = pcId,
+                messageType = MessageType.HEARTBEAT,
+                direction = CryptoDirection.PC_TO_ANDROID,
+                sequence = sequence,
+                acknowledgement = 0,
+                keyId = keyId,
+                nonce = nonce,
+                sessionKey = sessionKey,
+                plaintext = ByteArray(0),
+                recipientId = androidId,
+            )
+        } finally {
+            nonce.fill(0)
+            sessionKey.fill(0)
+            pairwise.fill(0)
+        }
+    }
+
+    private fun incomingOutputEnvelope(
+        sessionId: UUID,
+        pcId: UUID,
+        androidId: UUID,
+        pcIdentity: DeviceIdentity,
+        androidIdentity: DeviceIdentity,
+        keyId: ByteArray,
+        sequence: Long,
+        output: ByteArray,
+    ): Envelope {
+        val pairwise = SessionCrypto.derivePairwiseKey(
+            pcIdentity.exchange.privateKey,
+            androidIdentity.exchange.publicKey,
+            pcId,
+            androidId,
+            7,
+        )
+        val sessionKey = SessionCrypto.deriveSessionKey(
+            pairwise,
+            sessionId,
+            CryptoDirection.PC_TO_ANDROID,
+            keyId,
+        )
+        val nonce = SessionCrypto.nonce(byteArrayOf(1, 2, 3, 4), sequence.toULong())
+        val plaintext = OutputChunkPayload.newBuilder()
+            .setOutput(ByteString.copyFrom(output))
+            .setSourceEventSeq(sequence)
+            .setPresentationRevision(sequence)
+            .build()
+            .toByteArray()
+        return try {
+            ProductionRealtimeClient.encryptedEnvelope(
+                sessionId = sessionId,
+                senderId = pcId,
+                messageType = MessageType.OUTPUT_CHUNK,
+                direction = CryptoDirection.PC_TO_ANDROID,
+                sequence = sequence,
+                acknowledgement = 0,
+                keyId = keyId,
+                nonce = nonce,
+                sessionKey = sessionKey,
+                plaintext = plaintext,
+                recipientId = androidId,
+            )
+        } finally {
+            plaintext.fill(0)
+            nonce.fill(0)
+            sessionKey.fill(0)
+            pairwise.fill(0)
+        }
+    }
+
+    private class QueuedSessionTransport : ProductionRealtimeSessionTransport {
+        private val incoming = Channel<ProductionReceivedEnvelope>(
+            capacity = Channel.UNLIMITED,
+            onUndeliveredElement = ProductionReceivedEnvelope::close,
+        )
+        private val mutablePressure = MutableStateFlow(ProductionReceivePressure(0, false, 0, 0))
+        private val mutableState = MutableSharedFlow<RealtimeState>(replay = 1, extraBufferCapacity = 4)
+        private val releaseCount = AtomicInteger(0)
+        val sent = CopyOnWriteArrayList<Envelope>()
+        val disconnectReasons = CopyOnWriteArrayList<String>()
+
+        override val receivedEnvelopes: Flow<ProductionReceivedEnvelope> = incoming.receiveAsFlow()
+        override val receivePressure = mutablePressure
+        override val state = mutableState
+
+        val releasedReservations: Int
+            get() = releaseCount.get()
+
+        override fun connect() {
+            check(mutableState.tryEmit(RealtimeState.Connected))
+        }
+
+        override fun send(envelope: Envelope): Boolean {
+            sent += envelope
+            return true
+        }
+
+        override fun disconnect(reason: String) {
+            disconnectReasons += reason
+        }
+
+        override fun close() {
+            incoming.close()
+        }
+
+        fun emitConnected() {
+            check(mutableState.tryEmit(RealtimeState.Connected))
+        }
+
+        fun deliver(envelope: Envelope, generation: Int) {
+            check(
+                incoming.trySend(
+                    ProductionReceivedEnvelope(
+                        envelope = envelope,
+                        wireBytes = envelope.serializedSize,
+                        generation = generation,
+                        releaseReservation = { releaseCount.incrementAndGet() },
+                    ),
+                ).isSuccess,
+            )
+        }
+    }
+
+    private class RecordingSessionTransport(
+        private val sendResult: Boolean,
+    ) : ProductionRealtimeSessionTransport {
+        override val receivedEnvelopes: Flow<ProductionReceivedEnvelope> = emptyFlow()
+        override val receivePressure = MutableStateFlow(ProductionReceivePressure(0, false, 0, 0))
+        override val state = MutableSharedFlow<RealtimeState>(extraBufferCapacity = 1)
+        val sent = CopyOnWriteArrayList<Envelope>()
+        val disconnectReasons = CopyOnWriteArrayList<String>()
+
+        override fun connect() = Unit
+
+        override fun send(envelope: Envelope): Boolean {
+            sent += envelope
+            return sendResult
+        }
+
+        override fun disconnect(reason: String) {
+            disconnectReasons += reason
+        }
+
+        override fun close() = Unit
+    }
 
     private class RecordingEngine(
         private val outputs: MutableList<ByteArray>,

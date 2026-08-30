@@ -127,6 +127,11 @@ public sealed record DesktopUpdateStatus(
     string? ReleaseNotes,
     string? Message);
 
+public sealed record DesktopTerminalIntegrationSettings(
+    bool AddNoLogo,
+    bool AddNoProfile,
+    bool CanConfigure);
+
 /// <summary>
 /// Desktop-shell operations which are intentionally kept outside Presentation.
 /// Implementations may open an operating-system surface, but must never take
@@ -136,6 +141,12 @@ public interface IDesktopOperations
 {
     ValueTask<DesktopUpdateStatus> CheckForUpdatesAsync(bool interactive, CancellationToken cancellationToken);
     ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken);
+    ValueTask<DesktopTerminalIntegrationSettings> GetTerminalIntegrationSettingsAsync(
+        CancellationToken cancellationToken);
+    ValueTask<string> ConfigureTerminalIntegrationAsync(
+        bool addNoLogo,
+        bool addNoProfile,
+        CancellationToken cancellationToken);
     ValueTask<string> RepairTerminalIntegrationAsync(CancellationToken cancellationToken);
 }
 

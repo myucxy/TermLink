@@ -1,4 +1,6 @@
 {
+  "termlinkAddNoLogo": true,
+  "termlinkAddNoProfile": false,
   "profiles": [
     {
       "guid": "{cb3ce4a8-86da-5aa1-a77d-abe62f8b55b2}",
@@ -11,7 +13,7 @@
     {
       "guid": "{b2025574-4cc8-5264-b577-7c6532eff95a}",
       "name": "TermLink Windows PowerShell",
-      "commandline": "termlink-session.exe --command-base64 cG93ZXJzaGVsbC5leGUgLU5vTG9nbyAtTm9Qcm9maWxl --managed-shell windows-powershell",
+      "commandline": "termlink-session.exe --command-base64 cG93ZXJzaGVsbC5leGUgLU5vTG9nbw== --managed-shell windows-powershell",
       "startingDirectory": "%USERPROFILE%",
       "closeOnExit": "always",
       "hidden": false
@@ -19,7 +21,7 @@
     {
       "guid": "{7cf2d180-c8be-5b08-99a0-268bd2dc1d6f}",
       "name": "TermLink PowerShell 7",
-      "commandline": "termlink-session.exe --command-base64 cHdzaC5leGUgLU5vTG9nbyAtTm9Qcm9maWxl --managed-shell powershell-7",
+      "commandline": "termlink-session.exe --command-base64 cHdzaC5leGUgLU5vTG9nbw== --managed-shell powershell-7",
       "startingDirectory": "%USERPROFILE%",
       "closeOnExit": "always",
       "hidden": false

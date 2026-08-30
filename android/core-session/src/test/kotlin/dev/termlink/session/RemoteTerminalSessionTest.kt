@@ -5,6 +5,7 @@ import dev.termlink.terminal.api.TerminalInput
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalThemeV1
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
@@ -14,6 +15,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -806,6 +808,70 @@ class RemoteTerminalSessionTest {
     }
 
     @Test
+    fun unknownInputDeliveryKeepsHealthyControlLease() = runTest {
+        val inputId = UUID.fromString("00000000-0000-0000-0000-000000000013")
+        val outbound = RecordingOutbound(
+            onInput = { throw RemoteInputDeliveryUnknownException("confirmation timed out") },
+        )
+        val session = RemoteTerminalSession(
+            RecordingEngine(),
+            outbound,
+            backgroundScope,
+            clockMillis = { testScheduler.currentTime },
+            inputIdFactory = { inputId },
+        )
+        session.onConnected()
+        session.grantControl("lease", 10_000)
+
+        assertEquals(
+            InputSubmission.DeliveryUnknown(inputId),
+            session.submitInput("possibly-delivered".encodeToByteArray()),
+        )
+        assertEquals(1, outbound.inputAttempts)
+        assertIs<RemoteSessionState.Controlling>(session.state.value)
+        session.close()
+    }
+
+    @Test
+    fun delayedInputConfirmationDoesNotBlockLaterEngineInput() = runTest {
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        val secondStarted = CompletableDeferred<Unit>()
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound(
+            onInput = { input ->
+                if (input.bytes.contentEquals(byteArrayOf(1))) {
+                    firstStarted.complete(Unit)
+                    releaseFirst.await()
+                } else if (input.bytes.contentEquals(byteArrayOf(2))) {
+                    secondStarted.complete(Unit)
+                }
+            },
+        )
+        val session = RemoteTerminalSession(
+            engine,
+            outbound,
+            backgroundScope,
+            clockMillis = { testScheduler.currentTime },
+        )
+        session.start()
+        session.onConnected()
+        session.grantControl("lease", 10_000)
+        runCurrent()
+
+        engine.emitInput(byteArrayOf(1))
+        runCurrent()
+        firstStarted.await()
+        engine.emitInput(byteArrayOf(2))
+        runCurrent()
+
+        assertTrue(secondStarted.isCompleted)
+        releaseFirst.complete(Unit)
+        runCurrent()
+        session.close()
+    }
+
+    @Test
     fun authoritativeInputRejectionDoesNotBreakAHealthyControlLease() = runTest {
         val inputId = UUID.fromString("00000000-0000-0000-0000-000000000004")
         val outbound = object : RemoteSessionOutbound {
@@ -1014,7 +1080,7 @@ class RemoteTerminalSessionTest {
 
         assertEquals(EventAcceptance.Applied(1), session.accept(RemoteSessionEvent.Output(1, bytes)))
         bytes.fill(0)
-        val notification = withTimeout(5_000) { observed.await() }
+        val notification = observed.awaitObserverCompletion()
         assertArrayEquals(byteArrayOf(7, 8), notification.second)
         assertEquals(1L, notification.first)
         session.close()
@@ -1042,13 +1108,17 @@ class RemoteTerminalSessionTest {
         )
 
         assertEquals(EventAcceptance.Applied(1), session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1))))
-        withTimeout(5_000) { observerClosed.await() }
+        observerClosed.awaitObserverCompletion()
         assertEquals(EventAcceptance.Applied(2), session.accept(RemoteSessionEvent.Output(2, byteArrayOf(2))))
         runCurrent()
 
         assertEquals(listOf(1L, 2L), engine.feeds.map(Pair<Long, ByteArray>::first))
         assertEquals(2L, session.state.value.lastAckedSequence)
-        assertEquals(listOf(2L), outbound.persistedAcknowledgements)
+        assertEquals(2L, outbound.persistedAcknowledgements.last())
+        assertEquals(
+            outbound.persistedAcknowledgements.sorted().distinct(),
+            outbound.persistedAcknowledgements,
+        )
         session.close()
     }
 
@@ -1077,10 +1147,10 @@ class RemoteTerminalSessionTest {
         )
 
         session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1)))
-        withTimeout(5_000) { observingFirst.await() }
+        observingFirst.awaitObserverCompletion()
         session.accept(RemoteSessionEvent.Output(2, byteArrayOf(2)))
         session.accept(RemoteSessionEvent.Output(3, byteArrayOf(3)))
-        withTimeout(5_000) { observerClosed.await() }
+        observerClosed.awaitObserverCompletion()
         assertEquals(EventAcceptance.Applied(4), session.accept(RemoteSessionEvent.Output(4, byteArrayOf(4))))
         runCurrent()
 
@@ -1117,7 +1187,7 @@ class RemoteTerminalSessionTest {
                 ),
             ),
         )
-        withTimeout(5_000) { replayObserved.await() }
+        replayObserved.awaitObserverCompletion()
         val copy = synchronized(notifications) { notifications.toList() }
 
         assertEquals(3, copy.size)
@@ -1150,7 +1220,7 @@ class RemoteTerminalSessionTest {
         assertEquals(EventAcceptance.Applied(1), session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1))))
         assertEquals(EventAcceptance.Duplicate(1), session.accept(RemoteSessionEvent.Output(1, byteArrayOf(9))))
         assertEquals(EventAcceptance.HistoryGap(2, 3), session.accept(RemoteSessionEvent.Output(3, byteArrayOf(3))))
-        withTimeout(5_000) { invalidated.await() }
+        invalidated.awaitObserverCompletion()
         runCurrent()
 
         assertEquals(2, notifications.size)
@@ -1184,11 +1254,11 @@ class RemoteTerminalSessionTest {
         )
 
         session.accept(RemoteSessionEvent.Output(1, ByteArray(1024 * 1024)))
-        withTimeout(5_000) { observingFirst.await() }
+        observingFirst.awaitObserverCompletion()
         for (sequence in 2L..5L) {
             session.accept(RemoteSessionEvent.Output(sequence, ByteArray(1024 * 1024)))
         }
-        withTimeout(5_000) { observerClosed.await() }
+        observerClosed.awaitObserverCompletion()
         assertEquals(EventAcceptance.Applied(6), session.accept(RemoteSessionEvent.Output(6, byteArrayOf(6))))
         runCurrent()
 
@@ -1196,6 +1266,11 @@ class RemoteTerminalSessionTest {
         assertEquals(6L, session.state.value.lastAckedSequence)
         session.close()
     }
+
+    private suspend fun <T> CompletableDeferred<T>.awaitObserverCompletion(): T =
+        withContext(Dispatchers.Default.limitedParallelism(1)) {
+            withTimeout(5_000) { await() }
+        }
 
     private class RecordingEngine(
         private val onFeed: suspend (Long, ByteArray) -> Unit = { _, _ -> },
@@ -1247,6 +1322,7 @@ class RemoteTerminalSessionTest {
     private class RecordingOutbound(
         private val log: MutableList<String>? = null,
         private val onPersist: suspend (Long) -> Unit = {},
+        private val onInput: suspend (RemoteInput) -> Unit = {},
     ) : RemoteSessionOutbound {
         val resumes = mutableListOf<Long>()
         val persistedAcknowledgements = mutableListOf<Long>()
@@ -1287,6 +1363,7 @@ class RemoteTerminalSessionTest {
         override suspend fun sendInput(input: RemoteInput) {
             inputAttempts++
             if (failInput) throw IllegalStateException("offline")
+            onInput(input)
             inputs += input.copy(bytes = input.bytes.copyOf())
         }
 

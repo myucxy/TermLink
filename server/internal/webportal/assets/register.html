@@ -7,52 +7,140 @@
   <meta name="robots" content="noindex,nofollow">
   <title>创建账号 · TermLink</title>
   <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
-  <script src="/assets/theme-init.js?v=registration-v2"></script>
-  <link rel="stylesheet" href="/assets/site.css?v=registration-v3">
-  <script src="/assets/theme.js?v=registration-v2" defer></script>
-  <script src="/assets/register.js?v=registration-v2" defer></script>
+  <script src="/assets/theme-init.js?v=identity-v1"></script>
+  <link rel="stylesheet" href="/assets/identity.css?v=identity-v1">
+  <script src="/assets/theme.js?v=identity-v1" defer></script>
+  {{if and .RegistrationOpen .HumanVerificationRequired}}<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" defer></script>{{end}}
+  <script src="/assets/register.js?v=identity-v1" defer></script>
 </head>
-<body class="error-body registration-body">
-  <main class="error-card registration-card">
-    <div class="error-card-header">
-      <a class="brand" href="/" aria-label="TermLink 首页">
-        <img class="brand-mark" src="/assets/termlink-app-icon.svg" alt="">
-        <span><strong>TermLink</strong><small>Account registration</small></span>
+<body class="tl-page tl-page-action registration-page" data-page-id="termlink-register">
+  <header class="identity-titlebar">
+    <a class="identity-brand" href="/" data-theme-transfer aria-label="TermLink 首页">
+      <img src="/assets/termlink-app-icon.svg" alt="">
+      <span><strong>TermLink</strong><small>Account Center</small></span>
+    </a>
+    <div class="identity-title-actions">
+      <span class="identity-secure-origin"><span class="lock-icon" aria-hidden="true"></span>安全身份入口</span>
+      <a class="identity-account-link" href="{{.LoginURL}}" data-theme-transfer>
+        <span class="identity-account-link-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M19 12H5m6-6-6 6 6 6"></path></svg></span>
+        <span>返回登录</span>
       </a>
-      <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题">
-        <span class="theme-toggle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path class="theme-icon-moon" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/><g class="theme-icon-sun"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></g></svg></span>
+      <button class="theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题">
+        <span class="theme-toggle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path class="theme-icon-moon" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path><g class="theme-icon-sun"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"></path></g></svg></span>
         <span class="theme-toggle-label">主题</span>
       </button>
     </div>
-    <p class="eyebrow">REGISTRATION · {{.Mode}}</p>
-    {{if .RegistrationOpen}}
-    <h1>创建 TermLink 账号</h1>
-    <p>{{if .InvitationRequired}}当前注册需要有效邀请码。邀请码只用于注册准入，套餐赠送请登录后使用兑换码。{{else}}当前允许直接创建账号。{{end}}</p>
-    <form id="registration-form" class="registration-form" novalidate>
-      <label><span>用户名</span><input name="username" autocomplete="username" minlength="3" maxlength="128" required><small>创建后不可修改，可用于登录。</small></label>
-      <label><span>昵称</span><input name="nickname" autocomplete="nickname" minlength="1" maxlength="64" required><small>用于页面展示，可以与其他用户重复。</small></label>
-      <label><span>邮箱</span><input name="email" type="email" autocomplete="email" maxlength="320" required></label>
-      {{if .EmailVerificationRequired}}
-      <div class="registration-code-row">
-        <label><span>邮箱验证码</span><input name="email_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" minlength="6" maxlength="6" required></label>
-        <button id="send-email-code" class="button button-quiet" type="button">发送验证码</button>
+  </header>
+
+  <main class="identity-layout">
+    <section class="identity-context" aria-labelledby="identity-context-title">
+      <div class="identity-context-copy">
+        <p class="overline">SELF-HOSTED IDENTITY</p>
+        <h1 id="identity-context-title">一个账号，连接你的所有终端。</h1>
+        <p>账号由 TermLink 注册策略统一创建，随后通过标准 OIDC 安全登录 PC、Android 与 Web。</p>
       </div>
-      <input name="email_verification_id" type="hidden" required>
-      {{end}}
-      {{if .InvitationRequired}}<label><span>邀请码</span><input name="invitation_code" autocomplete="off" spellcheck="false" maxlength="80" placeholder="TLI-XXXX-XXXX-XXXX" required></label>{{end}}
-      <label><span>密码</span><input name="password" type="password" autocomplete="new-password" minlength="8" maxlength="1024" required></label>
-      <label><span>确认密码</span><input name="password_confirm" type="password" autocomplete="new-password" minlength="8" maxlength="1024" required></label>
-      <div id="registration-message" class="registration-message" role="status" aria-live="polite"></div>
-      <button class="button button-primary" type="submit">创建账号</button>
-    </form>
-    {{else}}
-    <h1>注册暂未开放</h1>
-    <p>TermLink 当前暂停新账号注册。已有账号仍可正常登录和使用。</p>
-    {{end}}
-    <div class="final-cta-actions">
-      <a class="button button-quiet" href="/login?return_to=/account" data-theme-transfer>已有账号，去登录</a>
-      <a class="button button-quiet" href="/">返回首页</a>
-    </div>
+
+      <dl class="identity-trust-list">
+        <div>
+          <span class="trust-icon shield-icon" aria-hidden="true"></span>
+          <dt>身份服务</dt>
+          <dd>Keycloak · 受控创建</dd>
+        </div>
+        <div>
+          <span class="trust-icon users-icon" aria-hidden="true"></span>
+          <dt>注册策略</dt>
+          <dd>{{if not .RegistrationOpen}}注册暂未开放{{else if .InvitationRequired}}需要有效邀请码{{else}}当前允许直接注册{{end}}</dd>
+        </div>
+        <div>
+          <span class="trust-icon lock-icon" aria-hidden="true"></span>
+          <dt>邮箱验证</dt>
+          <dd>{{if .EmailVerificationRequired}}创建前验证邮箱{{else}}按当前服务策略执行{{end}}</dd>
+        </div>
+      </dl>
+
+      <div class="bootstrap-summary">
+        <span class="bootstrap-icon shield-icon" aria-hidden="true"></span>
+        <span><strong>统一注册入口</strong><small>邀请码、验证码、限流与账号策略均由 TermLink 服务端校验。</small></span>
+      </div>
+    </section>
+
+    <section class="identity-auth-pane" aria-labelledby="registration-title">
+      <div class="identity-form-shell">
+        <header class="identity-form-heading">
+          <p class="overline">TERMLINK ACCOUNT</p>
+          <h2 id="registration-title">{{if .RegistrationOpen}}创建账号{{else}}注册暂未开放{{end}}</h2>
+          <p>{{if not .RegistrationOpen}}TermLink 当前暂停新账号注册，已有账号仍可正常登录。{{else if .InvitationRequired}}填写账号信息和有效邀请码，完成后将返回原登录流程。{{else}}填写账号信息，完成后将返回原登录流程。{{end}}</p>
+        </header>
+
+        <div class="auth-mode-switch" role="tablist" aria-label="账号操作">
+          <a href="{{.LoginURL}}" data-theme-transfer role="tab" aria-selected="false">登录</a>
+          <span class="is-active" role="tab" aria-selected="true">创建账号</span>
+        </div>
+
+        {{if .RegistrationOpen}}
+        <form id="registration-form" class="tl-form registration-form" data-registration-mode="{{.Mode}}" data-registration-continue="{{.ContinueURL}}" data-human-verification-required="{{.HumanVerificationRequired}}" novalidate>
+          <div class="tl-form-group">
+            <label class="tl-label" for="registration-username">用户名</label>
+            <div class="tl-input-group"><span class="field-icon users-icon" aria-hidden="true"></span><input id="registration-username" class="tl-input" name="username" autocomplete="username" minlength="3" maxlength="128" required></div>
+            <small class="tl-field-help">创建后不可修改，可用于登录。</small>
+          </div>
+          <div class="tl-form-group">
+            <label class="tl-label" for="registration-nickname">昵称</label>
+            <div class="tl-input-group"><span class="field-icon users-icon" aria-hidden="true"></span><input id="registration-nickname" class="tl-input" name="nickname" autocomplete="nickname" minlength="1" maxlength="64" required></div>
+            <small class="tl-field-help">用于页面展示，可以与其他用户重复。</small>
+          </div>
+          <div class="tl-form-group">
+            <label class="tl-label" for="registration-email">邮箱</label>
+            <div class="tl-input-group"><span class="field-icon mail-icon" aria-hidden="true"></span><input id="registration-email" class="tl-input" name="email" type="email" autocomplete="email" maxlength="320" required></div>
+          </div>
+          {{if .EmailVerificationRequired}}
+          <div class="registration-code-row">
+            <div class="tl-form-group">
+              <label class="tl-label" for="registration-email-code">邮箱验证码</label>
+              <div class="tl-input-group"><span class="field-icon shield-icon" aria-hidden="true"></span><input id="registration-email-code" class="tl-input" name="email_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" minlength="6" maxlength="6" required></div>
+            </div>
+            <button id="send-email-code" class="tl-button registration-code-button" type="button">发送验证码</button>
+          </div>
+          <input name="email_verification_id" type="hidden" required>
+          {{end}}
+          {{if .InvitationRequired}}
+          <div class="tl-form-group">
+            <label class="tl-label" for="registration-invitation">邀请码</label>
+            <div class="tl-input-group"><span class="field-icon shield-icon" aria-hidden="true"></span><input id="registration-invitation" class="tl-input" name="invitation_code" autocomplete="off" spellcheck="false" maxlength="80" placeholder="TLI-XXXX-XXXX-XXXX" required></div>
+          </div>
+          {{end}}
+          <div class="tl-form-group">
+            <label class="tl-label" for="registration-password">密码</label>
+            <div class="tl-input-group"><span class="field-icon lock-icon" aria-hidden="true"></span><input id="registration-password" class="tl-input" name="password" type="password" autocomplete="new-password" minlength="8" maxlength="1024" required></div>
+          </div>
+          <div class="tl-form-group">
+            <label class="tl-label" for="registration-password-confirm">确认密码</label>
+            <div class="tl-input-group"><span class="field-icon lock-icon" aria-hidden="true"></span><input id="registration-password-confirm" class="tl-input" name="password_confirm" type="password" autocomplete="new-password" minlength="8" maxlength="1024" required></div>
+          </div>
+          {{if .HumanVerificationRequired}}
+          <div class="tl-form-group registration-human-group">
+            <span class="tl-label">人机验证</span>
+            <div class="registration-human-verification" tabindex="-1" role="group" aria-label="人机验证">
+              <div
+                id="human-verification"
+                class="registration-human-widget"
+                data-site-key="{{.HumanVerificationSiteKey}}"
+                data-action="registration"></div>
+              <span id="human-verification-status" class="registration-human-loading">正在加载安全验证…</span>
+            </div>
+          </div>
+          {{end}}
+          <div id="registration-message" class="registration-message" role="status" aria-live="polite"></div>
+          <button class="tl-button tl-button-primary tl-button-block identity-submit" type="submit">创建账号</button>
+        </form>
+        {{else}}
+        <div class="tl-alert tl-alert-warning" role="status"><span class="tl-alert-mark" aria-hidden="true"></span><span class="tl-alert-title">注册开放后，此页面会显示统一的账号创建表单。</span></div>
+        <a class="tl-button tl-button-primary tl-button-block" href="{{.LoginURL}}" data-theme-transfer>已有账号，前往登录</a>
+        {{end}}
+
+        <p class="identity-footnote"><span class="lock-icon" aria-hidden="true"></span><span>请确认当前地址属于 TermLink。密码只会提交到受保护的注册接口。</span></p>
+      </div>
+    </section>
   </main>
 </body>
 </html>

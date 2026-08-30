@@ -1,10 +1,14 @@
 package dev.termlink.network.production
 
+import android.util.Log
 import dev.termlink.crypto.DeviceIdentity
 import dev.termlink.protocol.realtime.v1.Envelope
 import java.io.Closeable
+import java.util.LinkedHashMap
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
@@ -29,7 +33,37 @@ data class ProductionRealtimeMultiplexerDiagnostics(
     val phase: String,
     val endpointCount: Int,
     val socket: ProductionRealtimeSocketDiagnostics,
+    val routeDecisions: ProductionRealtimeRouteDecisionCounters = ProductionRealtimeRouteDecisionCounters(),
 )
+
+data class ProductionRealtimeRouteDecisionCounters(
+    val noEndpoint: Long = 0,
+    val endpointClosed: Long = 0,
+    val rejectedGeneration: Long = 0,
+    val overflow: Long = 0,
+)
+
+internal enum class ProductionRealtimeRouteDecision {
+    DELIVERED,
+    NO_ENDPOINT,
+    ENDPOINT_CLOSED,
+    REJECTED_GENERATION,
+    OVERFLOW,
+}
+
+/** A side-effect-free classifier keeps every non-delivery decision testable. */
+internal fun classifyProductionRealtimeRoute(
+    endpointPresent: Boolean,
+    endpointClosed: Boolean = false,
+    generationRejected: Boolean = false,
+    overflow: Boolean = false,
+): ProductionRealtimeRouteDecision = when {
+    !endpointPresent -> ProductionRealtimeRouteDecision.NO_ENDPOINT
+    endpointClosed -> ProductionRealtimeRouteDecision.ENDPOINT_CLOSED
+    generationRejected -> ProductionRealtimeRouteDecision.REJECTED_GENERATION
+    overflow -> ProductionRealtimeRouteDecision.OVERFLOW
+    else -> ProductionRealtimeRouteDecision.DELIVERED
+}
 
 /**
  * One session-scoped view over the device WebSocket. Closing this endpoint only
@@ -93,6 +127,15 @@ class ProductionRealtimeMultiplexer private constructor(
     private val connectionLock = Any()
     private val endpointLock = Any()
     private val endpoints = mutableMapOf<UUID, Endpoint>()
+    private val closedEndpointIncarnations = LinkedHashMap<UUID, Int>()
+    /** Socket-global fence; it intentionally survives endpoint replacement. */
+    private val rejectedThroughGeneration = AtomicInteger(0)
+    /** Highest socket generation observed by any endpoint incarnation. */
+    private val highestObservedGeneration = AtomicInteger(0)
+    private val noEndpointCount = AtomicLong(0)
+    private val endpointClosedCount = AtomicLong(0)
+    private val rejectedGenerationCount = AtomicLong(0)
+    private val overflowCount = AtomicLong(0)
     private var socketPhase = SocketPhase.IDLE
     private var authenticationRecoveryUsed = false
     private var authenticationRecoveryJob: Job? = null
@@ -139,7 +182,11 @@ class ProductionRealtimeMultiplexer private constructor(
     fun register(sessionId: UUID): ProductionRealtimeSessionTransport = synchronized(endpointLock) {
         check(!closed.get()) { "production realtime multiplexer is closed" }
         check(sessionId !in endpoints) { "production session is already registered" }
-        Endpoint(sessionId).also { endpoints[sessionId] = it }
+        Endpoint(sessionId, nextEndpointIncarnation()).also { endpoint ->
+            closedEndpointIncarnations.remove(sessionId)
+            endpoints[sessionId] = endpoint
+            logEndpointLifecycle("endpoint_register", endpoint)
+        }
     }
 
     override fun close() {
@@ -147,7 +194,10 @@ class ProductionRealtimeMultiplexer private constructor(
         val removed = synchronized(endpointLock) {
             endpoints.values.toList().also { endpoints.clear() }
         }
-        removed.forEach(Endpoint::closeFromOwner)
+        removed.forEach { endpoint ->
+            logEndpointLifecycle("endpoint_unregister", endpoint)
+            endpoint.closeFromOwner()
+        }
         synchronized(connectionLock) { socketPhase = SocketPhase.CLOSED }
         authenticationRecoveryJob?.cancel()
         authenticationRecoveryJob = null
@@ -265,21 +315,106 @@ class ProductionRealtimeMultiplexer private constructor(
     }
 
     private fun route(received: ProductionReceivedEnvelope) {
+        val generation = received.generation
+        val highestGeneration = highestObservedGeneration.accumulateAndGet(generation, ::maxOf)
+        if (generation < highestGeneration || generation <= rejectedThroughGeneration.get()) {
+            rejectRoute(
+                received = received,
+                decision = ProductionRealtimeRouteDecision.REJECTED_GENERATION,
+                incarnation = 0,
+                disconnect = false,
+            )
+            return
+        }
+
         val sessionId = ProductionRealtimeClient.uuidFromBytes(received.envelope.sessionId.toByteArray())
-        val endpoint = synchronized(endpointLock) { sessionId?.let(endpoints::get) }
-        if (endpoint == null || !endpoint.deliver(received)) received.close()
+        val target = synchronized(endpointLock) {
+            RouteTarget(
+                endpoint = sessionId?.let(endpoints::get),
+                closedIncarnation = sessionId?.let(closedEndpointIncarnations::get),
+            )
+        }
+        val endpoint = target.endpoint
+        val decision = when {
+            endpoint != null -> endpoint.deliver(received)
+            target.closedIncarnation != null -> classifyProductionRealtimeRoute(
+                endpointPresent = true,
+                endpointClosed = true,
+            )
+            else -> classifyProductionRealtimeRoute(endpointPresent = false)
+        }
+        if (decision == ProductionRealtimeRouteDecision.DELIVERED) return
+
+        val fatalGeneration = decision == ProductionRealtimeRouteDecision.NO_ENDPOINT ||
+            decision == ProductionRealtimeRouteDecision.ENDPOINT_CLOSED ||
+            decision == ProductionRealtimeRouteDecision.OVERFLOW
+        if (fatalGeneration) rejectedThroughGeneration.accumulateAndGet(generation, ::maxOf)
+        rejectRoute(
+            received = received,
+            decision = decision,
+            incarnation = endpoint?.incarnation ?: target.closedIncarnation ?: 0,
+            disconnect = fatalGeneration,
+        )
     }
 
-    private fun unregister(endpoint: Endpoint) {
-        synchronized(endpointLock) {
-            if (endpoints[endpoint.sessionId] === endpoint) endpoints.remove(endpoint.sessionId)
+    private fun rejectRoute(
+        received: ProductionReceivedEnvelope,
+        decision: ProductionRealtimeRouteDecision,
+        incarnation: Int,
+        disconnect: Boolean,
+    ) {
+        val generation = received.generation
+        val sequence = received.envelope.seq
+        received.close()
+        recordRouteDecision(decision)
+        Log.w(
+            REALTIME_LOG_TAG,
+            "route_${decision.name.lowercase()} generation=$generation " +
+                "seq=$sequence incarnation=$incarnation",
+        )
+        if (disconnect) {
+            disconnectSocket(
+                when (decision) {
+                    ProductionRealtimeRouteDecision.NO_ENDPOINT -> "session endpoint is not registered"
+                    ProductionRealtimeRouteDecision.ENDPOINT_CLOSED -> "session endpoint is closed"
+                    ProductionRealtimeRouteDecision.OVERFLOW -> "bounded session receive queue exceeded"
+                    else -> "realtime route rejected"
+                },
+            )
         }
+    }
+
+    private fun unregister(endpoint: Endpoint, droppedThroughGeneration: Int) {
+        val removed = synchronized(endpointLock) {
+            if (endpoints[endpoint.sessionId] === endpoint) {
+                if (droppedThroughGeneration > 0) {
+                    rejectedThroughGeneration.accumulateAndGet(droppedThroughGeneration, ::maxOf)
+                }
+                endpoints.remove(endpoint.sessionId)
+                closedEndpointIncarnations[endpoint.sessionId] = endpoint.incarnation
+                while (closedEndpointIncarnations.size > MAX_CLOSED_ENDPOINT_TOMBSTONES) {
+                    val eldest = closedEndpointIncarnations.entries.iterator()
+                    if (eldest.hasNext()) {
+                        eldest.next()
+                        eldest.remove()
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        }
+        if (removed) logEndpointLifecycle("endpoint_unregister", endpoint)
     }
 
     private inner class Endpoint(
         val sessionId: UUID,
+        val incarnation: Int,
     ) : ProductionRealtimeSessionTransport {
         private val endpointClosed = AtomicBoolean(false)
+        private val admissionLock = Any()
+        /** Guarded by [admissionLock]; includes queued and in-flight frames. */
+        private val outstandingGenerations = mutableMapOf<Int, Int>()
         private val incoming = Channel<ProductionReceivedEnvelope>(
             capacity = ProductionRealtimeClient.MAX_BUFFERED_EVENTS,
             onUndeliveredElement = ProductionReceivedEnvelope::close,
@@ -312,17 +447,119 @@ class ProductionRealtimeMultiplexer private constructor(
             this@ProductionRealtimeMultiplexer.diagnostics()
 
         override fun close() {
-            if (!endpointClosed.compareAndSet(false, true)) return
-            unregister(this)
-            incoming.close()
+            closeEndpoint(ownerClosing = false)
         }
 
         fun closeFromOwner() {
-            if (endpointClosed.compareAndSet(false, true)) incoming.close()
+            closeEndpoint(ownerClosing = true)
         }
 
-        fun deliver(received: ProductionReceivedEnvelope): Boolean =
-            !endpointClosed.get() && incoming.trySend(received).isSuccess
+        fun deliver(received: ProductionReceivedEnvelope): ProductionRealtimeRouteDecision {
+            synchronized(admissionLock) {
+                if (endpointClosed.get()) {
+                    return classifyProductionRealtimeRoute(endpointPresent = true, endpointClosed = true)
+                }
+                return synchronized(endpointLock) {
+                    // Revalidate both the selected incarnation and socket-wide
+                    // generation immediately before admission. Holding the map
+                    // lock through trySend prevents close/register from exposing
+                    // a replacement in the gap between this check and enqueue.
+                    if (endpointClosed.get() || endpoints[sessionId] !== this) {
+                        return@synchronized classifyProductionRealtimeRoute(
+                            endpointPresent = true,
+                            endpointClosed = true,
+                        )
+                    }
+                    if (received.generation < highestObservedGeneration.get() ||
+                        received.generation <= rejectedThroughGeneration.get()
+                    ) {
+                        return@synchronized classifyProductionRealtimeRoute(
+                            endpointPresent = true,
+                            generationRejected = true,
+                        )
+                    }
+                    outstandingGenerations[received.generation] =
+                        (outstandingGenerations[received.generation] ?: 0) + 1
+                    val observed = received.withCloseObserver {
+                        releaseOutstanding(received.generation)
+                    }
+                    val admission = incoming.trySend(observed)
+                    if (admission.isSuccess) {
+                        return@synchronized classifyProductionRealtimeRoute(endpointPresent = true)
+                    }
+                    observed.close()
+                    if (admission.isClosed) {
+                        return@synchronized classifyProductionRealtimeRoute(
+                            endpointPresent = true,
+                            endpointClosed = true,
+                        )
+                    }
+                    classifyProductionRealtimeRoute(endpointPresent = true, overflow = true)
+                }
+            }
+        }
+
+        private fun closeEndpoint(ownerClosing: Boolean) {
+            val droppedThroughGeneration = synchronized(admissionLock) {
+                if (!endpointClosed.compareAndSet(false, true)) return
+                outstandingGenerations.keys.maxOrNull() ?: 0
+            }
+
+            // Publish the fence while the endpoint still occupies its map slot.
+            // register() uses the same lock, so a replacement incarnation can
+            // never become visible before the dropped generation is fenced.
+            if (ownerClosing) {
+                if (droppedThroughGeneration > 0) {
+                    rejectedThroughGeneration.accumulateAndGet(droppedThroughGeneration, ::maxOf)
+                }
+            } else {
+                unregister(this, droppedThroughGeneration)
+            }
+            incoming.cancel()
+
+            if (droppedThroughGeneration > 0) {
+                Log.w(
+                    REALTIME_LOG_TAG,
+                    "endpoint_outstanding_cancelled generation=$droppedThroughGeneration " +
+                        "seq=0 incarnation=$incarnation",
+                )
+                if (!ownerClosing) disconnectSocket("session endpoint closed with outstanding events")
+            }
+        }
+
+        private fun releaseOutstanding(generation: Int) {
+            synchronized(admissionLock) {
+                val remaining = (outstandingGenerations[generation] ?: 1) - 1
+                if (remaining <= 0) {
+                    outstandingGenerations.remove(generation)
+                } else {
+                    outstandingGenerations[generation] = remaining
+                }
+            }
+        }
+    }
+
+    private data class RouteTarget(
+        val endpoint: Endpoint?,
+        val closedIncarnation: Int?,
+    )
+
+    private fun recordRouteDecision(decision: ProductionRealtimeRouteDecision) {
+        when (decision) {
+            ProductionRealtimeRouteDecision.DELIVERED -> Unit
+            ProductionRealtimeRouteDecision.NO_ENDPOINT -> noEndpointCount.incrementAndGet()
+            ProductionRealtimeRouteDecision.ENDPOINT_CLOSED -> endpointClosedCount.incrementAndGet()
+            ProductionRealtimeRouteDecision.REJECTED_GENERATION -> rejectedGenerationCount.incrementAndGet()
+            ProductionRealtimeRouteDecision.OVERFLOW -> overflowCount.incrementAndGet()
+        }
+    }
+
+    private fun logEndpointLifecycle(event: String, endpoint: Endpoint) {
+        Log.d(
+            REALTIME_LOG_TAG,
+            "$event generation=${socket.diagnostics().generation} seq=0 " +
+                "incarnation=${endpoint.incarnation}",
+        )
     }
 
     private enum class SocketPhase {
@@ -340,9 +577,23 @@ class ProductionRealtimeMultiplexer private constructor(
             phase = synchronized(connectionLock) { socketPhase.name },
             endpointCount = synchronized(endpointLock) { endpoints.size },
             socket = socket.diagnostics(),
+            routeDecisions = ProductionRealtimeRouteDecisionCounters(
+                noEndpoint = noEndpointCount.get(),
+                endpointClosed = endpointClosedCount.get(),
+                rejectedGeneration = rejectedGenerationCount.get(),
+                overflow = overflowCount.get(),
+            ),
         )
 
     internal companion object {
+        private const val REALTIME_LOG_TAG = "TermLinkRealtime"
+        private const val MAX_CLOSED_ENDPOINT_TOMBSTONES = 256
+        private val endpointIncarnation = AtomicInteger(0)
+
+        private fun nextEndpointIncarnation(): Int = endpointIncarnation.updateAndGet { current ->
+            if (current == Int.MAX_VALUE) 1 else current + 1
+        }
+
         fun forTest(
             socket: ProductionRealtimeSocket,
             parentScope: CoroutineScope,

@@ -6,8 +6,8 @@
   <#elseif section == "form">
     <div class="auth-mode-switch" role="tablist" aria-label="${msg('termlinkAccountMode')}">
       <a class="is-active" href="${url.loginUrl}" role="tab" aria-selected="true">${msg("doLogIn")}</a>
-      <#if realm.registrationAllowed && !registrationDisabled??>
-        <a href="${url.registrationUrl}" role="tab" aria-selected="false">${msg("termlinkCreateAccount")}</a>
+      <#if termlinkRegisterUrl?has_content>
+        <a href="${termlinkRegisterUrl}?continue=${url.loginUrl?url}" role="tab" aria-selected="false">${msg("termlinkCreateAccount")}</a>
       <#else>
         <span role="tab" aria-selected="false" aria-disabled="true" title="${msg('termlinkInviteOnlyHint')}">${msg("termlinkCreateAccount")}</span>
       </#if>

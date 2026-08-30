@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"github.com/termlink/termlink/server/internal/config"
 	"github.com/termlink/termlink/server/internal/fileoperationcleanup"
 	"github.com/termlink/termlink/server/internal/history"
+	"github.com/termlink/termlink/server/internal/humanverification"
 	"github.com/termlink/termlink/server/internal/kv"
 	"github.com/termlink/termlink/server/internal/migrate"
 	"github.com/termlink/termlink/server/internal/observability"
@@ -95,6 +97,21 @@ func runProduction() error {
 		return fmt.Errorf("load production config: %w", err)
 	}
 	configureLogging(cfg.LogLevel)
+	var humanVerifier *humanverification.Turnstile
+	if cfg.HumanVerificationProvider == humanverification.ProviderTurnstile {
+		publicOrigin, parseErr := url.Parse(cfg.PublicURL)
+		if parseErr != nil || publicOrigin.Hostname() == "" {
+			return errors.New("initialize human verification: public URL hostname is invalid")
+		}
+		humanVerifier, err = humanverification.NewTurnstile(humanverification.TurnstileConfig{
+			SiteKey:          cfg.HumanVerificationSiteKey,
+			Secret:           cfg.HumanVerificationSecret.Value(),
+			ExpectedHostname: publicOrigin.Hostname(),
+		})
+		if err != nil {
+			return fmt.Errorf("initialize human verification: %w", err)
+		}
+	}
 	repository, err := store.OpenWithOptions(ctx, cfg.DatabaseURL.Value(), store.OpenOptions{
 		MaxConns: cfg.PostgresMaxConns, MinConns: cfg.PostgresMinConns,
 		MaxConnLifetime: cfg.PostgresMaxConnLifetime, MaxConnIdleTime: cfg.PostgresMaxConnIdleTime,
@@ -150,13 +167,6 @@ func runProduction() error {
 		return fmt.Errorf("initialize commerce service: %w", err)
 	}
 	authentication := auth.Middleware{Tokens: verifier, Devices: repository, Nonces: valkey, SubjectKey: subjectKey}
-	registration, err := auth.NewDirectRegistrationService(auth.DirectRegistrationConfig{
-		Issuer: cfg.OIDCIssuer, ClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI,
-		RegistrationProofKey: registrationProofKey,
-	})
-	if err != nil {
-		return fmt.Errorf("initialize direct registration: %w", err)
-	}
 	var keycloakAdmin *auth.KeycloakAdminClient
 	if cfg.RegistrationRecoveryEnabled || cfg.AccountDeletionEnabled || !cfg.KeycloakAdminClientSecret.Empty() {
 		var adminErr error
@@ -269,10 +279,10 @@ func runProduction() error {
 		webPrivacyExportDownloader = privacyExportService
 	}
 	productionAPI := &api.API{
-		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication, Registration: registration,
-		ServiceEmail:         serviceEmail,
-		VerifiedRegistration: keycloakAdmin,
-		SubjectKey:           subjectKey, TokenKey: tokenKey, CommerceKey: commerceCodeKey, History: optionalHistoryStore(historyStore),
+		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication,
+		ServiceEmail:      serviceEmail,
+		HumanVerification: humanVerifier,
+		SubjectKey:        subjectKey, TokenKey: tokenKey, CommerceKey: commerceCodeKey, History: optionalHistoryStore(historyStore),
 		Commerce: commerceService, DataExportDownloader: privacyExportDownloader, ReconciliationOperations: reconciliationOperations,
 		AccountDeletionBinder: accountDeletionBinder, AgentUpdateCatalog: updateCatalog,
 		ClientConfig: api.ClientConfiguration{
@@ -281,6 +291,13 @@ func runProduction() error {
 			WindowsRedirectURI: cfg.WindowsOIDCRedirectURI,
 			WebClientID:        cfg.WebOIDCClientID, WebRedirectURI: cfg.WebOIDCRedirectURI,
 		},
+	}
+	if keycloakAdmin != nil {
+		// All public account creation goes through the bounded service account.
+		// A missing credential leaves registration unavailable rather than
+		// falling back to Keycloak's native self-registration form.
+		productionAPI.Registration = keycloakAdmin
+		productionAPI.VerifiedRegistration = keycloakAdmin
 	}
 	var metrics *observability.Metrics
 	var observer realtime.Observer
@@ -295,26 +312,29 @@ func runProduction() error {
 		_ = hub.Close(shutdown)
 	}()
 	portal, err := webportal.New(ctx, webportal.Config{
-		PublicURL:                cfg.PublicURL,
-		Issuer:                   cfg.OIDCIssuer,
-		ClientID:                 cfg.WebOIDCClientID,
-		StepUpClientID:           cfg.WebOIDCStepUpClientID,
-		RedirectURI:              cfg.WebOIDCRedirectURI,
-		CookieKey:                cookieKey,
-		SubjectKey:               subjectKey,
-		AppShipBaseURL:           appShipBaseURL,
-		AppShipAllowedPrivateIPs: os.Getenv("TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS"),
-		BuildInfo:                buildinfo.Current(),
-		CommerceKey:              commerceCodeKey,
-		Commerce:                 commerceService,
-		DataExportDownloader:     webPrivacyExportDownloader,
-		Reconciliation:           reconciliationOperations,
-		AccountDeletionBinder:    accountDeletionBinder,
-		ServiceEmail:             serviceEmail,
-		AdminRoutes:              adminRoutes,
-		IdentityProfiles:         keycloakAdmin,
-		IdentityMFAStatus:        keycloakAdmin,
-		Repository:               repository,
+		PublicURL:                 cfg.PublicURL,
+		Issuer:                    cfg.OIDCIssuer,
+		ClientID:                  cfg.WebOIDCClientID,
+		WindowsClientID:           cfg.WindowsOIDCClientID,
+		StepUpClientID:            cfg.WebOIDCStepUpClientID,
+		RedirectURI:               cfg.WebOIDCRedirectURI,
+		HumanVerificationProvider: cfg.HumanVerificationProvider,
+		HumanVerificationSiteKey:  cfg.HumanVerificationSiteKey,
+		CookieKey:                 cookieKey,
+		SubjectKey:                subjectKey,
+		AppShipBaseURL:            appShipBaseURL,
+		AppShipAllowedPrivateIPs:  os.Getenv("TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS"),
+		BuildInfo:                 buildinfo.Current(),
+		CommerceKey:               commerceCodeKey,
+		Commerce:                  commerceService,
+		DataExportDownloader:      webPrivacyExportDownloader,
+		Reconciliation:            reconciliationOperations,
+		AccountDeletionBinder:     accountDeletionBinder,
+		ServiceEmail:              serviceEmail,
+		AdminRoutes:               adminRoutes,
+		IdentityProfiles:          keycloakAdmin,
+		IdentityMFAStatus:         keycloakAdmin,
+		Repository:                repository,
 		AccountStatusChanged: func(ctx context.Context, accountID uuid.UUID, status string) error {
 			return valkey.Client.Publish(ctx, "account-status-changed", accountID.String()).Err()
 		},

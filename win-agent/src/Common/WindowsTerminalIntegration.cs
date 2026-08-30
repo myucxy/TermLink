@@ -32,6 +32,18 @@ namespace TermLink.WindowsIntegration
         public bool PackageManaged { get; }
     }
 
+    internal sealed class WindowsTerminalPowerShellSettings
+    {
+        internal WindowsTerminalPowerShellSettings(bool addNoLogo, bool addNoProfile)
+        {
+            AddNoLogo = addNoLogo;
+            AddNoProfile = addNoProfile;
+        }
+
+        public bool AddNoLogo { get; }
+        public bool AddNoProfile { get; }
+    }
+
     /// <summary>
     /// Owns only TermLink's dedicated Windows Terminal Fragment. Rebuilding it
     /// never opens settings.json and never changes profiles from other apps.
@@ -52,11 +64,18 @@ namespace TermLink.WindowsIntegration
         internal static WindowsTerminalIntegrationResult Reconfigure(string installRoot)
         {
             var root = Path.GetFullPath(installRoot);
+            var looseFragmentPath = DefaultFragmentPath;
+            var packageManaged = IsCurrentProcessPackaged();
+            var packagedFragmentPath = Path.Combine(root, "Terminal", "Fragments", FragmentFileName);
+            if (packageManaged) return InspectPackagedFragment(packagedFragmentPath);
+            var settings = ReadPowerShellSettings(looseFragmentPath);
             return ReconfigureForProcess(
                 root,
-                DefaultFragmentPath,
-                IsCurrentProcessPackaged(),
-                Path.Combine(root, "Terminal", "Fragments", FragmentFileName));
+                looseFragmentPath,
+                false,
+                packagedFragmentPath,
+                settings.AddNoLogo,
+                settings.AddNoProfile);
         }
 
         internal static WindowsTerminalIntegrationResult ReconfigureForProcess(
@@ -65,9 +84,28 @@ namespace TermLink.WindowsIntegration
             bool packageManaged,
             string packagedFragmentPath)
         {
+            if (packageManaged) return InspectPackagedFragment(packagedFragmentPath);
+            var settings = ReadPowerShellSettings(looseFragmentPath);
+            return ReconfigureForProcess(
+                installRoot,
+                looseFragmentPath,
+                false,
+                packagedFragmentPath,
+                settings.AddNoLogo,
+                settings.AddNoProfile);
+        }
+
+        internal static WindowsTerminalIntegrationResult ReconfigureForProcess(
+            string installRoot,
+            string looseFragmentPath,
+            bool packageManaged,
+            string packagedFragmentPath,
+            bool addNoLogo,
+            bool addNoProfile)
+        {
             return packageManaged
                 ? InspectPackagedFragment(packagedFragmentPath)
-                : Reconfigure(installRoot, looseFragmentPath);
+                : Reconfigure(installRoot, looseFragmentPath, addNoLogo, addNoProfile);
         }
 
         /// <summary>
@@ -144,6 +182,16 @@ namespace TermLink.WindowsIntegration
             string installRoot,
             string fragmentPath)
         {
+            var settings = ReadPowerShellSettings(fragmentPath);
+            return Reconfigure(installRoot, fragmentPath, settings.AddNoLogo, settings.AddNoProfile);
+        }
+
+        internal static WindowsTerminalIntegrationResult Reconfigure(
+            string installRoot,
+            string fragmentPath,
+            bool addNoLogo,
+            bool addNoProfile)
+        {
             if (string.IsNullOrWhiteSpace(installRoot))
                 throw new ArgumentException("TermLink install directory is required.", nameof(installRoot));
             if (string.IsNullOrWhiteSpace(fragmentPath))
@@ -162,11 +210,19 @@ namespace TermLink.WindowsIntegration
             var profiles = new List<Dictionary<string, object>>
             {
                 CreateProfile("{cb3ce4a8-86da-5aa1-a77d-abe62f8b55b2}", "TermLink CMD", "cmd.exe", "command-prompt"),
-                CreateProfile("{b2025574-4cc8-5264-b577-7c6532eff95a}", "TermLink Windows PowerShell", "powershell.exe -NoLogo -NoProfile", "windows-powershell")
+                CreateProfile(
+                    "{b2025574-4cc8-5264-b577-7c6532eff95a}",
+                    "TermLink Windows PowerShell",
+                    PowerShellCommand("powershell.exe", addNoLogo, addNoProfile),
+                    "windows-powershell")
             };
             if (FindExecutableOnPath("pwsh.exe") != null)
             {
-                profiles.Add(CreateProfile("{7cf2d180-c8be-5b08-99a0-268bd2dc1d6f}", "TermLink PowerShell 7", "pwsh.exe -NoLogo -NoProfile", "powershell-7"));
+                profiles.Add(CreateProfile(
+                    "{7cf2d180-c8be-5b08-99a0-268bd2dc1d6f}",
+                    "TermLink PowerShell 7",
+                    PowerShellCommand("pwsh.exe", addNoLogo, addNoProfile),
+                    "powershell-7"));
             }
             if (FindExecutableOnPath("wsl.exe") != null)
             {
@@ -184,7 +240,12 @@ namespace TermLink.WindowsIntegration
             }
 
             var json = JsonSerializer.Serialize(
-                new Dictionary<string, object> { ["profiles"] = profiles },
+                new Dictionary<string, object>
+                {
+                    ["termlinkAddNoLogo"] = addNoLogo,
+                    ["termlinkAddNoProfile"] = addNoProfile,
+                    ["profiles"] = profiles
+                },
                 new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine;
             var directory = Path.GetDirectoryName(path);
             if (string.IsNullOrWhiteSpace(directory))
@@ -207,6 +268,57 @@ namespace TermLink.WindowsIntegration
             finally
             {
                 if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+            }
+        }
+
+        /// <summary>
+        /// Reads the effective preference from TermLink's own Fragment. Keeping
+        /// the preference beside the generated profiles lets a repair or loose
+        /// installer upgrade preserve it without introducing another mutable
+        /// machine-wide settings file.
+        /// </summary>
+        internal static WindowsTerminalPowerShellSettings ReadPowerShellSettings(string fragmentPath)
+        {
+            if (string.IsNullOrWhiteSpace(fragmentPath)) return DefaultPowerShellSettings();
+            try
+            {
+                var path = Path.GetFullPath(fragmentPath);
+                if (!File.Exists(path)) return DefaultPowerShellSettings();
+                using var document = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8));
+                var root = document.RootElement;
+                var addNoLogo = ReadBoolean(root, "termlinkAddNoLogo");
+                var addNoProfile = ReadBoolean(root, "termlinkAddNoProfile");
+                if (addNoLogo.HasValue || addNoProfile.HasValue)
+                {
+                    return new WindowsTerminalPowerShellSettings(
+                        addNoLogo ?? true,
+                        addNoProfile ?? false);
+                }
+                // Preserve the short-lived load-profile marker if a Preview
+                // build generated it before the two switches were separated.
+                var loadProfile = ReadBoolean(root, "termlinkLoadPowerShellProfile");
+                if (loadProfile.HasValue)
+                {
+                    return new WindowsTerminalPowerShellSettings(
+                        addNoLogo: true,
+                        addNoProfile: !loadProfile.Value);
+                }
+                // Older fragments always used both flags but contained no user
+                // preference. Migrate them to the new defaults on next repair:
+                // -NoLogo enabled and -NoProfile disabled.
+                return DefaultPowerShellSettings();
+            }
+            catch (Exception error) when (
+                error is IOException ||
+                error is UnauthorizedAccessException ||
+                error is SecurityException ||
+                error is JsonException ||
+                error is FormatException ||
+                error is ArgumentException ||
+                error is NotSupportedException ||
+                error is PathTooLongException)
+            {
+                return DefaultPowerShellSettings();
             }
         }
 
@@ -285,6 +397,30 @@ namespace TermLink.WindowsIntegration
                 ["__child"] = childCommand,
                 ["__shell"] = shell
             };
+        }
+
+        private static WindowsTerminalPowerShellSettings DefaultPowerShellSettings() =>
+            new WindowsTerminalPowerShellSettings(addNoLogo: true, addNoProfile: false);
+
+        private static bool? ReadBoolean(JsonElement root, string propertyName)
+        {
+            if (!root.TryGetProperty(propertyName, out var value) ||
+                (value.ValueKind != JsonValueKind.True && value.ValueKind != JsonValueKind.False))
+            {
+                return null;
+            }
+            return value.GetBoolean();
+        }
+
+        private static string PowerShellCommand(
+            string executable,
+            bool addNoLogo,
+            bool addNoProfile)
+        {
+            var command = executable;
+            if (addNoLogo) command += " -NoLogo";
+            if (addNoProfile) command += " -NoProfile";
+            return command;
         }
 
         private static string FindExecutableOnPath(string fileName)

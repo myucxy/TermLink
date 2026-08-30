@@ -68,6 +68,31 @@ class TermuxTranscriptViewportTest {
     }
 
     @Test
+    fun authenticatedRenderedLineCanBeSelectedWithoutCrossingPaginationBoundary() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        var boundaryCalls = 0
+        val viewport = TermuxTranscriptViewport(initialRows = 4)
+        viewport.replacePages(
+            listOf(
+                page(81L..100L, hasMoreBefore = false),
+                page(101L..130L, hasMoreBefore = true),
+            ),
+        )
+        val view = viewport.createView(
+            context,
+            onScrollPastTop = { boundaryCalls += 1 },
+            onScrollPastBottom = {},
+        ) as TerminalView
+        view.replaceEmulatorFromSession()
+
+        assertTrue(viewport.scrollToLineId(81L))
+        assertEquals(81L, viewport.debugState().firstVisibleLineId)
+        assertEquals(0, boundaryCalls)
+        assertFalse(viewport.scrollToLineId(80L))
+        viewport.close()
+    }
+
+    @Test
     fun overlappingOrOutOfOrderPagesAreRejected() {
         val viewport = TermuxTranscriptViewport(initialRows = 4)
         assertFailsWith<IllegalArgumentException> {

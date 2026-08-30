@@ -351,8 +351,13 @@ fn is_canonical_reply_v2(payload: &[u8]) -> bool {
         || is_canonical_keyboard_reply(payload)
         || is_canonical_decrpm(payload)
         || is_canonical_decrqss(payload)
+        || is_canonical_xtversion(payload)
         || is_canonical_xtgettcap(payload)
         || is_canonical_osc_color(payload)
+}
+
+fn is_canonical_xtversion(payload: &[u8]) -> bool {
+    payload == b"\x1bP>|TermLink(1)\x1b\\"
 }
 
 fn is_canonical_keyboard_reply(payload: &[u8]) -> bool {
@@ -794,6 +799,7 @@ mod tests {
             b"\x1bP1$r6 q\x1b\\",
             b"\x1bP1$r2\"q\x1b\\",
             b"\x1bP1$r2*x\x1b\\",
+            b"\x1bP>|TermLink(1)\x1b\\",
             b"\x1bP1+r436f=323536\x1b\\",
             b"\x1bP1+r436f=323536;524742=382f382f38\x1b\\",
             b"\x1bP0+r\x1b\\",
@@ -810,6 +816,8 @@ mod tests {
             b"\x1b[?025;1$y",
             b"\x1b[?25;5$y",
             b"\x1bP1$rarbitrary\x1b\\",
+            b"\x1bP>|TermLink(01)\x1b\\",
+            b"\x1bP>|Other(1)\x1b\\",
             b"\x1bP1$r0;2;1m\x1b\\",
             b"\x1bP1+r436F=323536\x1b\\",
             b"\x1bP1+r436f=323536;\x1b\\",

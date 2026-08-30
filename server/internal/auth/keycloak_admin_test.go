@@ -70,6 +70,136 @@ func tokenResponse(w http.ResponseWriter, token string) {
 	})
 }
 
+func TestKeycloakAdminCreatesAccountsThroughBoundedAdminEndpoint(t *testing.T) {
+	tests := []struct {
+		name          string
+		emailVerified bool
+		attemptID     uuid.UUID
+		register      func(*KeycloakAdminClient, DirectRegistrationInput) error
+	}{
+		{
+			name: "ordinary registration",
+			register: func(client *KeycloakAdminClient, input DirectRegistrationInput) error {
+				return client.Register(context.Background(), input)
+			},
+		},
+		{
+			name: "verified email registration", emailVerified: true,
+			register: func(client *KeycloakAdminClient, input DirectRegistrationInput) error {
+				return client.RegisterVerifiedEmail(context.Background(), input)
+			},
+		},
+		{
+			name: "invitation registration", attemptID: keycloakTestAttempt,
+			register: func(client *KeycloakAdminClient, input DirectRegistrationInput) error {
+				return client.RegisterAttempt(context.Background(), keycloakTestAttempt, input)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var payload map[string]any
+			client, server := newKeycloakAdminTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/auth/realms/termlink/protocol/openid-connect/token":
+					tokenResponse(w, "registration-token")
+				case "/auth/admin/realms/termlink/users":
+					if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer registration-token" {
+						t.Fatalf("unexpected account creation request: %s authorization=%q", r.Method, r.Header.Get("Authorization"))
+					}
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Fatal(err)
+					}
+					w.WriteHeader(http.StatusCreated)
+				default:
+					http.NotFound(w, r)
+				}
+			}), 0)
+			defer server.Close()
+
+			input := DirectRegistrationInput{
+				Username: "new-user", Nickname: "新用户", Email: "new-user@example.test",
+				Password: "correct horse battery staple", Confirm: "correct horse battery staple",
+			}
+			if err := tt.register(client, input); err != nil {
+				t.Fatalf("registration error = %v", err)
+			}
+			if payload["username"] != input.Username || payload["email"] != input.Email ||
+				payload["emailVerified"] != tt.emailVerified || payload["enabled"] != true {
+				t.Fatalf("unexpected account payload: %#v", payload)
+			}
+			attributes, ok := payload["attributes"].(map[string]any)
+			if !ok || firstJSONText(attributes["nickname"]) != input.Nickname {
+				t.Fatalf("nickname attributes = %#v", payload["attributes"])
+			}
+			if tt.attemptID == uuid.Nil {
+				if _, exists := attributes[RegistrationAttemptIDAttribute]; exists {
+					t.Fatal("ordinary account unexpectedly contains an invitation correlation")
+				}
+			} else {
+				proof, err := registrationAttemptProof(keycloakTestProofKey, tt.attemptID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if firstJSONText(attributes[RegistrationAttemptIDAttribute]) != tt.attemptID.String() ||
+					firstJSONText(attributes[RegistrationAttemptProofAttribute]) != proof {
+					t.Fatalf("invitation recovery attributes = %#v", attributes)
+				}
+			}
+			credentials, ok := payload["credentials"].([]any)
+			if !ok || len(credentials) != 1 {
+				t.Fatalf("password credentials = %#v", payload["credentials"])
+			}
+			credential, ok := credentials[0].(map[string]any)
+			if !ok || credential["type"] != "password" || credential["value"] != input.Password || credential["temporary"] != false {
+				t.Fatalf("password credential = %#v", credentials[0])
+			}
+		})
+	}
+}
+
+func TestKeycloakAdminRegistrationRejectsNilInvitationAttempt(t *testing.T) {
+	client, server := newKeycloakAdminTestClient(t, http.NotFoundHandler(), 0)
+	defer server.Close()
+	input := DirectRegistrationInput{
+		Username: "new-user", Nickname: "New user", Email: "new-user@example.test",
+		Password: "correct horse battery staple", Confirm: "correct horse battery staple",
+	}
+	if err := client.RegisterAttempt(context.Background(), uuid.Nil, input); !errors.Is(err, ErrKeycloakAdminRejected) {
+		t.Fatalf("nil registration attempt error = %v", err)
+	}
+}
+
+func TestKeycloakAdminRegistrationDistinguishesUnavailableFromUnknownOutcome(t *testing.T) {
+	input := DirectRegistrationInput{
+		Username: "new-user", Nickname: "New user", Email: "new-user@example.test",
+		Password: "correct horse battery staple", Confirm: "correct horse battery staple",
+	}
+	t.Run("token unavailable before create", func(t *testing.T) {
+		client, server := newKeycloakAdminTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}), 0)
+		defer server.Close()
+		if err := client.Register(context.Background(), input); !errors.Is(err, ErrKeycloakAdminUnavailable) {
+			t.Fatalf("pre-create identity failure = %v", err)
+		}
+	})
+	t.Run("transport timeout after create starts", func(t *testing.T) {
+		client, server := newKeycloakAdminTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/token") {
+				tokenResponse(w, "registration-token")
+				return
+			}
+			time.Sleep(250 * time.Millisecond)
+			w.WriteHeader(http.StatusCreated)
+		}), 100*time.Millisecond)
+		defer server.Close()
+		if err := client.Register(context.Background(), input); !errors.Is(err, ErrRegistrationOutcomeUnknown) {
+			t.Fatalf("post-create transport failure = %v", err)
+		}
+	})
+}
+
 func TestKeycloakAdminReadsOnlyConfiguredOTPStatusForExactSubject(t *testing.T) {
 	for _, configured := range []bool{false, true} {
 		t.Run(fmt.Sprintf("configured-%t", configured), func(t *testing.T) {

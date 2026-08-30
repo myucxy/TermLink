@@ -270,6 +270,18 @@ Registry API 读取 index、manifest、config blob 和 attestation descriptor。
 不要传 `-Reset`，不要执行 `docker compose down --volumes`。脚本会拉取固定镜像、运行 migration、重建
 server，并复用 PostgreSQL、Valkey、MinIO、Keycloak 和 secret volumes。
 
+当发布要求明确限定为本机构建、禁止 Git 流水线和 Registry push 时，先使用固定版本、revision、created
+与 `SOURCE_DATE_EPOCH` 构建 `linux/amd64` 镜像，再通过独立参数执行同一套迁移、健康检查和生产探针：
+
+```powershell
+& .\server\ops\Start-ProductionAcceptance.ps1 `
+  -LocalServerImage 'myucxy/termlink:<version>-local-production'
+```
+
+`-LocalServerImage` 不会 pull 或 push；它只接受 `myucxy/termlink:x.y.z-local-production`，并要求镜像已经
+存在、平台为 `linux/amd64`、标签版本与 OCI version 完全一致，且 revision/source/created 元数据通过与
+远端生产镜像相同的门禁。它与 `-ServerImage` 互斥，也不能配合 `-Reset` 绕过无损升级边界。
+
 升级后必须独立确认：
 
 - `server`、`lucky-upstream`、`keycloak`、`edge`、`valkey`、`minio`、`postgres` 共 7 个服务均为

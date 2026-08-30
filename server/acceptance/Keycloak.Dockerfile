@@ -4,6 +4,9 @@ FROM ${KEYCLOAK_BASE_IMAGE} AS builder
 ENV KC_DB=dev-file \
     KC_HEALTH_ENABLED=true
 COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v18/
+COPY internal/webportal/assets/identity.css /opt/keycloak/themes/termlink-01b-v18/login/resources/css/identity.css
+COPY internal/webportal/assets/termlink-app-icon.svg /opt/keycloak/themes/termlink-01b-v18/login/resources/img/termlink-mark.svg
+COPY internal/webportal/assets/termlink-favicon.svg /opt/keycloak/themes/termlink-01b-v18/login/resources/img/termlink-favicon.svg
 RUN /opt/keycloak/bin/kc.sh build
 
 FROM ${KEYCLOAK_BASE_IMAGE}

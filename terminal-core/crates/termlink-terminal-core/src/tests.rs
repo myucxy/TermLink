@@ -3535,6 +3535,96 @@ fn host_effect_v2_captures_mode_and_dcs_queries_without_weakening_v1() {
 }
 
 #[test]
+fn color_scheme_reporting_mode_sets_queries_resets_and_is_split_safe() {
+    let bytes = b"\x1b[?2031h\x1b[?2031$p\x1b[?2031l\x1b[?2031$p";
+    let mut expected = Terminal::new(8, 2).expect("terminal");
+    let prepared = expected
+        .prepare_event_with_host_effects_v2(Event::Output {
+            source_sequence: 0,
+            bytes,
+        })
+        .expect("mode 2031 set, query, reset, and query");
+    assert_eq!(
+        host_effect_payloads(prepared.host_effect_frame_v2()),
+        [b"\x1b[?2031;1$y".as_slice(), b"\x1b[?2031;2$y".as_slice(),]
+    );
+    prepared
+        .commit_with(|_| Ok::<(), ()>(()))
+        .expect("publish and commit mode 2031 replies");
+    assert!(!expected.modes.color_scheme_reporting);
+
+    for split in 0..=bytes.len() {
+        let mut actual = Terminal::new(8, 2).expect("terminal");
+        output(&mut actual, 0, &bytes[..split]).expect("mode 2031 prefix");
+        output(&mut actual, 1, &bytes[split..]).expect("mode 2031 suffix");
+        assert_eq!(actual.modes, expected.modes, "split {split}");
+        assert_eq!(actual.next_source_sequence(), 2, "split {split}");
+    }
+}
+
+#[test]
+fn xtversion_query_has_one_canonical_v2_reply_and_strict_parameters() {
+    let mut terminal = Terminal::new(8, 2).expect("terminal");
+    let prepared = terminal
+        .prepare_event_with_host_effects_v2(Event::Output {
+            source_sequence: 0,
+            bytes: b"\x1b[>0q",
+        })
+        .expect("XTVERSION query");
+    assert_eq!(
+        host_effect_payloads(prepared.host_effect_frame_v2()),
+        [b"\x1bP>|TermLink(1)\x1b\\".as_slice()]
+    );
+    prepared
+        .commit_with(|_| Ok::<(), ()>(()))
+        .expect("publish and commit XTVERSION reply");
+
+    for malformed in [&b"\x1b[>1q"[..], b"\x1b[>0;0q", b"\x1b[?0q", b"\x1b[0q"] {
+        let mut malformed_terminal = Terminal::new(8, 2).expect("terminal");
+        assert!(matches!(
+            malformed_terminal.prepare_event_with_host_effects_v2(Event::Output {
+                source_sequence: 0,
+                bytes: malformed,
+            }),
+            Err(TerminalError::Unsupported(_))
+        ));
+        assert_eq!(
+            malformed_terminal.next_source_sequence(),
+            0,
+            "malformed XTVERSION {malformed:?}"
+        );
+    }
+}
+
+#[test]
+fn text_area_pixel_query_is_an_exact_no_reply_probe() {
+    let mut terminal = Terminal::new(8, 2).expect("terminal");
+    let prepared = terminal
+        .prepare_event_with_host_effects_v2(Event::Output {
+            source_sequence: 0,
+            bytes: b"\x1b[14t",
+        })
+        .expect("text-area pixel query");
+    assert!(host_effect_payloads(prepared.host_effect_frame_v2()).is_empty());
+    prepared
+        .commit_with(|_| Ok::<(), ()>(()))
+        .expect("commit no-reply pixel query");
+    assert_eq!(terminal.next_source_sequence(), 1);
+
+    for malformed in [&b"\x1b[14;0t"[..], b"\x1b[13t"] {
+        let mut malformed_terminal = Terminal::new(8, 2).expect("terminal");
+        assert!(matches!(
+            malformed_terminal.prepare_event_with_host_effects_v2(Event::Output {
+                source_sequence: 0,
+                bytes: malformed,
+            }),
+            Err(TerminalError::Unsupported(_))
+        ));
+        assert_eq!(malformed_terminal.next_source_sequence(), 0);
+    }
+}
+
+#[test]
 fn osc_color_queries_preserve_text_order_duplicates_and_v2_ordinals() {
     let baseline = OscBaseline {
         palette: [None; 256],

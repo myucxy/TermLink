@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using TermLink.Agent;
 using TermLink.Pc.Contracts;
 using TermLink.Platform;
@@ -7,6 +8,8 @@ using TermLink.Platform.Windows;
 
 if (args.Length != 1 || !File.Exists(args[0]))
     throw new ArgumentException("Usage: WindowsAdapterValidation <TermLink.Agent.exe>");
+Require(RegistryControlClient.MaximumTimeoutMilliseconds == 300_000,
+    "The Windows adapter and Agent control timeout contract diverged.");
 
 var appShipStatus = WindowsDesktopOperations.ParseUpdateStatus("""
     {
@@ -43,8 +46,30 @@ try
         RuntimeInformation.RuntimeIdentifier,
         false);
     var options = new WindowsAgentClientOptions(pipe, buffer, Path.GetFullPath(args[0]), descriptor);
+    var agentStart = WindowsAgentClient.CreateAgentStartInfo(options);
+    Require(!agentStart.UseShellExecute && agentStart.CreateNoWindow &&
+            agentStart.RedirectStandardError && agentStart.RedirectStandardOutput,
+        "The independent Agent startup path does not preserve bounded failure diagnostics.");
+    Require(agentStart.ArgumentList.SequenceEqual(new[]
+        {
+            "--registry", "--control-pipe", pipe, "--buffer-root", Path.GetFullPath(buffer)
+        }),
+        "The independent Agent startup arguments changed unexpectedly.");
+    var safeDiagnostic = WindowsAgentClient.NormalizeAgentDiagnostic(
+        "Agent failed at https://identity.example/authorize?code=secret&state=private\r\nretry later");
+    Require(!safeDiagnostic.Contains("secret", StringComparison.Ordinal) &&
+            !safeDiagnostic.Contains("private", StringComparison.Ordinal) &&
+            safeDiagnostic.Length <= 512,
+        "Agent startup diagnostics exposed a URL query or exceeded the display bound.");
+    Require(WindowsAgentClient.IsSingleInstanceDiagnostic(
+            "TermLink Agent failed: Another TermLink background runtime already owns this account control pipe."),
+        "The duplicate-Agent lifecycle diagnostic is no longer recognized.");
+    Require(!WindowsAgentClient.IsAgentInstanceActive(pipe),
+        "An unrelated installed Agent was mistaken for this isolated control pipe.");
     await using var client = new WindowsAgentClient(options);
     var first = await client.GetStatusAsync(false, CancellationToken.None);
+    Require(WindowsAgentClient.IsAgentInstanceActive(pipe),
+        "The isolated Agent did not retain its control-pipe instance marker.");
     Require(first.Identity.PcId != Guid.Empty, "The Windows adapter did not provide a stable PC identity.");
     Require(first.ConnectionState == AgentConnectionState.NotConfigured,
         "An isolated unconfigured Agent did not map to NotConfigured.");
@@ -75,10 +100,44 @@ try
     Require(parallel.Select(snapshot => snapshot.Revision).Distinct().Count() == 1,
         "Unchanged concurrent snapshots produced different revisions.");
 
+    var preservedSessionId = Guid.NewGuid();
+    var preservedSessionToken = new byte[SessionRegistration.HandshakeTokenBytes];
+    RandomNumberGenerator.Fill(preservedSessionToken);
+    var registeredSession = RegistryControlClient.Send(
+        pipe,
+        new RegistryRequest
+        {
+            Command = RegistryCommand.Register,
+            Registration = new SessionRegistration(
+                preservedSessionId,
+                "termlink-windows-adapter-session-" + preservedSessionId.ToString("N"),
+                preservedSessionToken,
+                Environment.ProcessId,
+                ManagedShellType.PowerShell7)
+        },
+        5_000);
+    Require(registeredSession.Success,
+        "The local-session preservation fixture could not register.");
+    var agentProcessIdBeforeSignOut = FindAgentProcessId(options.AgentExecutablePath);
+    Require(agentProcessIdBeforeSignOut.HasValue,
+        "The isolated Agent process was unavailable before sign-out.");
+    var signOutTimer = Stopwatch.StartNew();
     await client.SignOutAsync(CancellationToken.None);
+    signOutTimer.Stop();
     var signedOut = await client.GetStatusAsync(false, CancellationToken.None);
+    var agentProcessIdAfterSignOut = FindAgentProcessId(options.AgentExecutablePath);
+    var sessionsAfterSignOut = RegistryControlClient.Send(
+        pipe,
+        new RegistryRequest { Command = RegistryCommand.List },
+        5_000).Summaries;
     Require(!signedOut.AccountLinked && signedOut.ConnectionState == AgentConnectionState.NotConfigured,
-        "The isolated sign-out flow did not restart into an unconfigured state.");
+        "The isolated sign-out flow did not immediately publish an unconfigured state.");
+    Require(agentProcessIdAfterSignOut == agentProcessIdBeforeSignOut,
+        "Account sign-out restarted the Agent instead of preserving local sessions.");
+    Require(sessionsAfterSignOut.Any(session => session.SessionId == preservedSessionId),
+        "Account sign-out removed a still-running local session from the live registry.");
+    Require(signOutTimer.Elapsed < TimeSpan.FromSeconds(5),
+        "Account sign-out waited for Agent or network teardown.");
 
     await client.ShutdownCompletelyAsync(CancellationToken.None);
     var afterShutdown = await client.GetStatusAsync(false, CancellationToken.None);
@@ -103,8 +162,8 @@ try
         }
     }), "Complete shutdown left the isolated Agent process running.");
     Console.WriteLine(
-        "Windows Avalonia adapter validation passed: authenticated V10 status/actions, stable revisions, " +
-        "isolated command settings, sign-out restart, and complete shutdown without restart.");
+        "Windows Avalonia adapter validation passed: authenticated V11 status/actions, stable revisions, " +
+        "isolated command settings, in-place sign-out, and complete shutdown without restart.");
 }
 finally
 {
@@ -124,4 +183,28 @@ finally
 static void Require(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+static int? FindAgentProcessId(string executablePath)
+{
+    var expected = Path.GetFullPath(executablePath);
+    foreach (var process in Process.GetProcessesByName("TermLink.Agent"))
+    {
+        using (process)
+        {
+            try
+            {
+                if (string.Equals(
+                    Path.GetFullPath(process.MainModule?.FileName ?? string.Empty),
+                    expected,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    return process.Id;
+                }
+            }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+        }
+    }
+    return null;
 }

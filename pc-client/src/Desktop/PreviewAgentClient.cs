@@ -48,6 +48,9 @@ public sealed class PreviewAgentClient : IAgentClient
     public ValueTask RevokeDeviceAsync(Guid deviceId, CancellationToken cancellationToken) =>
         Unsupported(cancellationToken);
 
+    public ValueTask BeginAccountAuthorizationAsync(string pcName, CancellationToken cancellationToken) =>
+        Unsupported(cancellationToken);
+
     public ValueTask LoginAsync(string username, string password, string pcName, CancellationToken cancellationToken) =>
         Unsupported(cancellationToken);
 

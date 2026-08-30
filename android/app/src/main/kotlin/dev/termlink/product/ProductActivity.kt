@@ -11,7 +11,9 @@ import android.view.View
 import android.view.KeyEvent as AndroidKeyEvent
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
+import android.widget.TextView
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -179,7 +181,9 @@ import dev.termlink.session.RemoteSessionState
 import dev.termlink.network.production.TermLinkApiException
 import dev.termlink.terminal.api.ArgbColor
 import dev.termlink.terminal.api.TerminalSize
+import dev.termlink.terminal.api.TerminalFontFamilyHintV1
 import dev.termlink.terminal.api.TerminalThemeV1
+import dev.termlink.terminal.api.TerminalTypefaceResolver
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
 import dev.termlink.terminal.api.TerminalViewportEngine
 import dev.termlink.terminal.termux.TermuxTerminalEngine
@@ -303,6 +307,9 @@ private const val PRODUCT_SELECTED_SESSION_ID_KEY = "selected_session_id"
 private const val PRODUCT_OPENED_SESSION_IDS_KEY = "opened_session_ids_v1"
 private const val PRODUCT_EXPANDED_PC_IDS_KEY = "expanded_pc_ids_v1"
 private const val TERMINAL_FONT_SIZE_KEY = "terminal_font_size_sp"
+private const val TERMINAL_FONT_SCHEME_KEY = "terminal_font_scheme_v1"
+private const val TERMINAL_CUSTOM_FONT_NAME_KEY = "terminal_custom_font_name_v1"
+private const val TERMINAL_CUSTOM_FONT_SHA256_KEY = "terminal_custom_font_sha256_v1"
 private const val TERMINAL_LINE_SPACING_KEY = "terminal_line_spacing"
 private const val TERMINAL_FOREGROUND_KEY = "terminal_foreground_argb"
 private const val TERMINAL_BACKGROUND_KEY = "terminal_background_argb"
@@ -352,6 +359,10 @@ internal fun shouldShowTranscriptOverlay(
 ): Boolean = overlayRequested || state?.let {
     it.loading || it.error != null || it.pages.isNotEmpty()
 } == true
+
+/** A completed empty selector must reveal the live renderer instead of leaving a black overlay. */
+internal fun shouldDismissEmptyTranscriptOverlay(state: TranscriptViewportState?): Boolean =
+    state != null && !state.loading && state.error == null && state.pages.isEmpty() && !state.hasMoreBefore
 
 internal data class TerminalInputResumeEffect(
     val scrollToLatest: Boolean,
@@ -621,6 +632,11 @@ private data class TailFirstSurfaceObservation(
     val visibleText: String,
     val liveText: String,
     val viewportSignature: String,
+    val firstVisibleLineId: Long? = null,
+    val visibleTextSha256: String,
+    val transcriptTopRow: Int = 0,
+    val transcriptPageCount: Int = 0,
+    val transcriptRowCount: Int = 0,
     val displayBounds: TailFirstPixelBounds? = null,
     val terminalBounds: TailFirstPixelBounds? = null,
     val bottomBarBounds: TailFirstPixelBounds? = null,
@@ -644,7 +660,7 @@ private const val TAIL_FIRST_E2E_LOG_TAG = "TermLinkTailFirst"
 
 private interface TailFirstTerminalSurfaceController {
     fun observe(): TailFirstSurfaceObservation
-    fun pageUp()
+    fun scrollHistoryToLine(lineId: Long): Boolean
     /** Returns true only when this call crossed the live terminal's top boundary. */
     fun openHistory(): Boolean
     fun closeHistory()
@@ -2044,13 +2060,11 @@ private suspend fun executeTailFirstProductOperation(
                 )
                 val surface = awaitTailFirstSurface(sessionId)
                 val before = repository.snapshot.value.transcriptViewports[sessionId]
-                val beforePages = before?.pages?.size ?: 0
-                val beforeRows = transcriptRowCount(repository.snapshot.value, sessionId)
                 val existingPageRanges = before?.pages
                     ?.mapTo(mutableSetOf()) { it.firstLineId to it.lastLineId }
                     .orEmpty()
                 val historyLoadTriggered = withContext(Dispatchers.Main.immediate) { surface.openHistory() }
-                if (historyLoadTriggered) awaitTranscriptChange(repository, sessionId, beforeRows)
+                if (historyLoadTriggered) awaitTranscriptChange(repository, sessionId, before)
                 awaitTailFirstSurface(sessionId) { it.observe().historyOverlay }
                 val after = repository.snapshot.value.transcriptViewports[sessionId]
                 val loadedPage = after?.pages?.singleOrNull {
@@ -2062,10 +2076,11 @@ private suspend fun executeTailFirstProductOperation(
                     requestId,
                     operation,
                     extras = mapOf(
-                        "pages_moved" to ((after?.pages?.size ?: 0) - beforePages).coerceAtLeast(0),
-                        "rows_loaded" to (
-                            (after?.pages?.sumOf { it.rows.size } ?: 0) - beforeRows
-                            ).coerceAtLeast(0),
+                        // A bounded renderer window evicts newer pages after enough
+                        // prepends. Report the authenticated page accepted by this
+                        // operation, not the net window delta after eviction.
+                        "pages_moved" to if (loadedPage == null) 0 else 1,
+                        "rows_loaded" to (loadedPage?.rows?.size ?: 0),
                     ),
                     loadedTranscriptPage = loadedPage?.let { page ->
                         TailFirstLoadedTranscriptPage(
@@ -2084,8 +2099,6 @@ private suspend fun executeTailFirstProductOperation(
                     "SESSION_UNAVAILABLE",
                 )
                 val before = repository.snapshot.value.transcriptViewports[sessionId]
-                val beforePages = before?.pages?.size ?: 0
-                val beforeRows = before?.pages?.sumOf { it.rows.size } ?: 0
                 val existingPageRanges = before?.pages
                     ?.mapTo(mutableSetOf()) { it.firstLineId to it.lastLineId }
                     .orEmpty()
@@ -2098,7 +2111,7 @@ private suspend fun executeTailFirstProductOperation(
                 // directly so a Compose frame cannot swallow the request between a
                 // StateFlow update and AndroidView attachment.
                 repository.loadTranscriptBefore(sessionId)
-                awaitTranscriptChange(repository, sessionId, beforeRows)
+                awaitTranscriptChange(repository, sessionId, before)
                 val after = repository.snapshot.value.transcriptViewports[sessionId]
                 if (after?.error != null) {
                     return tailFirstFailure(requestId, operation, "TRANSCRIPT_LOAD_FAILED")
@@ -2106,9 +2119,21 @@ private suspend fun executeTailFirstProductOperation(
                 val loadedPage = after?.pages?.singleOrNull {
                     (it.firstLineId to it.lastLineId) !in existingPageRanges
                 }
+                    ?: return tailFirstFailure(requestId, operation, "TRANSCRIPT_PAGE_NOT_RENDERED")
+                // A bounded prepend preserves the user's stable visible line. Once the
+                // 1,000-row window starts evicting newer pages, repository state can
+                // advance without changing that visible line. Wait until Compose has
+                // installed this exact authenticated page, then select its first line
+                // through the read-only history viewport. This makes every acceptance
+                // page visibly provable without invoking another pagination callback.
+                awaitTailFirstSurface(sessionId) {
+                    it.observe().historyOverlay && it.scrollHistoryToLine(loadedPage.firstLineId)
+                }
                 awaitTailFirstSurface(sessionId) {
                     val observation = it.observe()
-                    observation.historyOverlay && observation.viewportSignature != beforeViewport
+                    observation.historyOverlay &&
+                        observation.firstVisibleLineId == loadedPage.firstLineId &&
+                        observation.viewportSignature != beforeViewport
                 }
                 tailFirstStateResponse(
                     repository,
@@ -2116,12 +2141,12 @@ private suspend fun executeTailFirstProductOperation(
                     requestId,
                     operation,
                     extras = mapOf(
-                        "pages_moved" to ((after?.pages?.size ?: 0) - beforePages).coerceAtLeast(0),
-                        "rows_loaded" to (
-                            (after?.pages?.sumOf { it.rows.size } ?: 0) - beforeRows
-                            ).coerceAtLeast(0),
+                        // Keep acceptance evidence stable once the bounded
+                        // viewport begins evicting its newer rendered pages.
+                        "pages_moved" to 1,
+                        "rows_loaded" to loadedPage.rows.size,
                     ),
-                    loadedTranscriptPage = loadedPage?.let { page ->
+                    loadedTranscriptPage = loadedPage.let { page ->
                         TailFirstLoadedTranscriptPage(
                             requestBeforeLineId = Math.addExact(page.lastLineId, 1L),
                             firstLineId = page.firstLineId,
@@ -2316,6 +2341,12 @@ private suspend fun tailFirstStateResponse(
         put("last_marker_visible", markers.second?.let(displayText::contains) == true)
         put("live_marker_visible", markers.third?.let(observation.liveText::contains) == true)
         put("viewport_signature", observation.viewportSignature)
+        put("first_visible_line_id", observation.firstVisibleLineId ?: 0L)
+        put("visible_text_sha256", observation.visibleTextSha256)
+        put("next_before_line_id", (viewport?.nextBeforeLineId ?: 0u).toLong())
+        put("transcript_top_row", observation.transcriptTopRow)
+        put("transcript_page_count", observation.transcriptPageCount)
+        put("transcript_row_count", observation.transcriptRowCount)
         extras.forEach { (name, value) -> put(name, value) }
         loadedTranscriptPage?.let { page ->
             put("request_before_line_id", page.requestBeforeLineId)
@@ -2445,23 +2476,23 @@ private suspend fun awaitTailFirstUiFrame() = withContext(Dispatchers.Main.immed
 private suspend fun awaitTranscriptChange(
     repository: ProductRepository,
     sessionId: java.util.UUID,
-    previousRowCount: Int,
+    previous: TranscriptViewportState?,
 ) = withTimeout(45_000) {
-    var observedLoading = false
+    val previousPageRanges = previous?.pages?.map { it.firstLineId to it.lastLineId }.orEmpty()
     while (true) {
         val state = repository.snapshot.value.transcriptViewports[sessionId]
-        observedLoading = observedLoading || state?.loading == true
-        val rowCount = state?.pages?.sumOf { it.rows.size } ?: 0
-        if (state != null && !state.loading && (
-                rowCount > previousRowCount || state.error != null || observedLoading && !state.hasMoreBefore
-                )
-        ) return@withTimeout
+        val pageRanges = state?.pages?.map { it.firstLineId to it.lastLineId }.orEmpty()
+        val changed = previous == null || state == null ||
+            state.snapshotAnchorSequence != previous.snapshotAnchorSequence ||
+            state.viewportGeneration != previous.viewportGeneration ||
+            state.nextBeforeLineId != previous.nextBeforeLineId ||
+            state.nextCursor != previous.nextCursor ||
+            pageRanges != previousPageRanges ||
+            state.error != previous.error
+        if (state != null && !state.loading && changed) return@withTimeout
         delay(50)
     }
 }
-
-private fun transcriptRowCount(snapshot: ProductSnapshot, sessionId: java.util.UUID): Int =
-    snapshot.transcriptViewports[sessionId]?.pages?.sumOf { it.rows.size } ?: 0
 
 private fun tailFirstViewBounds(view: View): TailFirstPixelBounds {
     val location = IntArray(2)
@@ -2495,14 +2526,24 @@ private fun tailFirstViewportSignature(
         .joinToString("") { byte -> "%02x".format(Locale.ROOT, byte.toInt() and 0xff) }
 }
 
+private fun tailFirstTextSha256(text: String): String = MessageDigest.getInstance("SHA-256")
+    .digest(text.encodeToByteArray())
+    .joinToString("") { byte -> "%02x".format(Locale.ROOT, byte.toInt() and 0xff) }
+
 private fun loadTerminalDisplayPreferences(context: android.content.Context): TerminalDisplayPreferences {
     val preferences = context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
-    return TerminalDisplayPreferences(
+    val loaded = TerminalDisplayPreferences(
+        fontScheme = TerminalFontScheme.fromWireValue(preferences.getString(TERMINAL_FONT_SCHEME_KEY, null)),
+        customFontDisplayName = preferences.getString(TERMINAL_CUSTOM_FONT_NAME_KEY, null),
+        customFontSha256 = preferences.getString(TERMINAL_CUSTOM_FONT_SHA256_KEY, null),
         fontSizeSp = preferences.getFloat(TERMINAL_FONT_SIZE_KEY, 14f),
         lineSpacingMultiplier = preferences.getFloat(TERMINAL_LINE_SPACING_KEY, 1f),
         foregroundArgb = preferences.getInt(TERMINAL_FOREGROUND_KEY, 0xFFE9EEF5.toInt()),
         backgroundArgb = preferences.getInt(TERMINAL_BACKGROUND_KEY, 0xFF080B10.toInt()),
     ).normalized
+    return if (loaded.fontScheme == TerminalFontScheme.CUSTOM && !TerminalFontStore.hasCustomFont(context)) {
+        loaded.copy(fontScheme = TerminalFontScheme.BUNDLED_NERD_FONT)
+    } else loaded
 }
 
 private fun saveTerminalDisplayPreferences(
@@ -2512,6 +2553,9 @@ private fun saveTerminalDisplayPreferences(
     val normalized = value.normalized
     context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
         .edit()
+        .putString(TERMINAL_FONT_SCHEME_KEY, normalized.fontScheme.wireValue)
+        .putString(TERMINAL_CUSTOM_FONT_NAME_KEY, normalized.customFontDisplayName)
+        .putString(TERMINAL_CUSTOM_FONT_SHA256_KEY, normalized.customFontSha256)
         .putFloat(TERMINAL_FONT_SIZE_KEY, normalized.fontSizeSp)
         .putFloat(TERMINAL_LINE_SPACING_KEY, normalized.lineSpacingMultiplier)
         .putInt(TERMINAL_FOREGROUND_KEY, normalized.foregroundArgb)
@@ -4201,32 +4245,36 @@ private fun SessionDetail(
                     maxLines = 1,
                 )
             }
-            sessionOpenFailure?.let { failure ->
-                SessionOpenFailureCard(
-                    failure = failure,
-                    onRetry = onRetryOpen,
-                    testTag = "session-open-retry:${session.id}",
-                )
-            }
-            TerminalSurface(
-                session = session,
-                engine = engine,
-                remoteState = remoteState,
-                terminalPreferences = terminalPreferences,
-                shortcutPreferences = shortcutPreferences,
-                onTerminalAction = { onTerminalAction(session.id, it) },
-                onTerminalCustomShortcut = { onTerminalCustomShortcut(session.id, it) },
-                onPasteRequested = { onPasteRequested(session.id) },
-                terminalInputResumeRegistry = terminalInputResumeRegistry,
-                transcriptState = transcriptState,
-                liveAcknowledgement = liveAcknowledgement,
-                bootstrapSource = bootstrapSource,
-                onLoadTranscript = onLoadTranscript,
-                onClearTranscript = onClearTranscript,
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f),
-            )
+            ) {
+                TerminalSurface(
+                    session = session,
+                    engine = engine,
+                    remoteState = remoteState,
+                    terminalPreferences = terminalPreferences,
+                    shortcutPreferences = shortcutPreferences,
+                    onTerminalAction = { onTerminalAction(session.id, it) },
+                    onTerminalCustomShortcut = { onTerminalCustomShortcut(session.id, it) },
+                    onPasteRequested = { onPasteRequested(session.id) },
+                    terminalInputResumeRegistry = terminalInputResumeRegistry,
+                    transcriptState = transcriptState,
+                    liveAcknowledgement = liveAcknowledgement,
+                    bootstrapSource = bootstrapSource,
+                    onLoadTranscript = onLoadTranscript,
+                    onClearTranscript = onClearTranscript,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                sessionOpenFailure?.let { failure ->
+                    SessionOpenFailureCard(
+                        failure = failure,
+                        onRetry = onRetryOpen,
+                        testTag = "session-open-retry:${session.id}",
+                    )
+                }
+            }
         }
     }
 }
@@ -4720,6 +4768,11 @@ private fun TerminalSurface(
                         firstVisibleLineId = history?.firstVisibleLineId,
                         visibleText = visibleText,
                     ),
+                    firstVisibleLineId = history?.firstVisibleLineId,
+                    visibleTextSha256 = tailFirstTextSha256(visibleText),
+                    transcriptTopRow = history?.topRow ?: 0,
+                    transcriptPageCount = history?.pageCount ?: 0,
+                    transcriptRowCount = history?.rowCount ?: 0,
                     displayBounds = displayBounds,
                     terminalBounds = terminalBounds,
                     bottomBarBounds = dockBounds,
@@ -4728,15 +4781,8 @@ private fun TerminalSurface(
                 )
             }
 
-            override fun pageUp() {
-                // The acceptance bridge can arrive in the frame between the overlay state
-                // becoming visible and AndroidView attaching its TerminalView.  Drive the
-                // same bounded loader directly in that narrow debug-only path so the result
-                // still proves one cursor page, without turning a missing weak view into a
-                // 45-second false timeout.
-                if (overlayVisible) requestOlderRows()
-                else activeEngine.scrollPastTopBoundary()
-            }
+            override fun scrollHistoryToLine(lineId: Long): Boolean =
+                overlayVisible && transcriptViewport.scrollToLineId(lineId)
 
             override fun openHistory(): Boolean {
                 if (overlayVisible) return false
@@ -4789,8 +4835,14 @@ private fun TerminalSurface(
     LaunchedEffect(transcriptState?.loading) {
         if (transcriptState?.loading == false) localLoadingGuard = false
     }
-    LaunchedEffect(transcriptState?.viewportGeneration) {
-        if (transcriptState?.pages.isNullOrEmpty() && transcriptState?.loading != true) {
+    LaunchedEffect(
+        transcriptState?.viewportGeneration,
+        transcriptState?.loading,
+        transcriptState?.error,
+        transcriptState?.pages?.isEmpty(),
+        transcriptState?.hasMoreBefore,
+    ) {
+        if (shouldDismissEmptyTranscriptOverlay(transcriptState)) {
             overlayRequested = false
         }
     }
@@ -4810,7 +4862,13 @@ private fun TerminalSurface(
                 .fillMaxWidth()
                 .weight(1f),
         ) {
-            key(activeEngine, terminalPreferences.fontSizeSp, terminalPreferences.lineSpacingMultiplier) {
+            key(
+                activeEngine,
+                terminalPreferences.fontScheme,
+                terminalPreferences.customFontSha256,
+                terminalPreferences.fontSizeSp,
+                terminalPreferences.lineSpacingMultiplier,
+            ) {
                 AndroidView(
                     factory = { context ->
                         activeEngine.createView(
@@ -4835,6 +4893,8 @@ private fun TerminalSurface(
                     if (!transcriptState?.pages.isNullOrEmpty()) {
                         key(
                             transcriptViewport,
+                            terminalPreferences.fontScheme,
+                            terminalPreferences.customFontSha256,
                             terminalPreferences.fontSizeSp,
                             terminalPreferences.lineSpacingMultiplier,
                         ) {
@@ -5130,7 +5190,13 @@ private fun HistoryTerminalSurface(
         activeEngine.setReadOnly(true)
     }
     DisposableEffect(placeholder) { onDispose { placeholder.dispose() } }
-    key(activeEngine, terminalPreferences.fontSizeSp, terminalPreferences.lineSpacingMultiplier) {
+    key(
+        activeEngine,
+        terminalPreferences.fontScheme,
+        terminalPreferences.customFontSha256,
+        terminalPreferences.fontSizeSp,
+        terminalPreferences.lineSpacingMultiplier,
+    ) {
         AndroidView(
             factory = { context ->
                 activeEngine.createView(
@@ -5416,6 +5482,48 @@ private fun TerminalDisplaySettings(
     onPreferencesChanged: (TerminalDisplayPreferences) -> Unit,
 ) {
     val value = preferences.normalized
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val customFontAvailable = TerminalFontStore.hasCustomFont(context)
+    val fontImporter = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            scope.launch {
+                try {
+                    val imported = withContext(Dispatchers.IO) { TerminalFontStore.importFont(context, uri) }
+                    onPreferencesChanged(
+                        value.copy(
+                            fontScheme = TerminalFontScheme.CUSTOM,
+                            customFontDisplayName = imported.displayName,
+                            customFontSha256 = imported.sha256,
+                        ),
+                    )
+                    Toast.makeText(
+                        context,
+                        context.getString(R.string.settings_terminal_font_imported, imported.displayName),
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: TerminalFontImportException) {
+                    val message = when (error.failure) {
+                        TerminalFontImportFailure.EMPTY -> R.string.settings_terminal_font_error_empty
+                        TerminalFontImportFailure.TOO_LARGE -> R.string.settings_terminal_font_error_too_large
+                        TerminalFontImportFailure.UNSUPPORTED_FORMAT ->
+                            R.string.settings_terminal_font_error_unsupported
+                        TerminalFontImportFailure.INVALID_FONT -> R.string.settings_terminal_font_error_invalid
+                        TerminalFontImportFailure.UNREADABLE -> R.string.settings_terminal_font_error_unreadable
+                    }
+                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                } catch (_: Exception) {
+                    Toast.makeText(
+                        context,
+                        R.string.settings_terminal_font_error_unreadable,
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }
+    }
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = ProductShape,
@@ -5423,6 +5531,110 @@ private fun TerminalDisplaySettings(
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
     ) {
         Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text(
+                stringResource(R.string.settings_terminal_font_scheme),
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                TerminalFontScheme.entries.forEach { scheme ->
+                    FilterChip(
+                        selected = value.fontScheme == scheme,
+                        onClick = {
+                            if (scheme == TerminalFontScheme.CUSTOM && !customFontAvailable) {
+                                fontImporter.launch(TerminalFontStore.acceptedMimeTypes)
+                            } else {
+                                onPreferencesChanged(value.copy(fontScheme = scheme))
+                            }
+                        },
+                        label = { Text(scheme.displayLabel()) },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    )
+                }
+            }
+            Text(
+                when (value.fontScheme) {
+                    TerminalFontScheme.CUSTOM -> stringResource(
+                        R.string.settings_terminal_font_active_custom,
+                        value.customFontDisplayName ?: stringResource(R.string.settings_terminal_font_custom),
+                    )
+                    else -> stringResource(
+                        R.string.settings_terminal_font_active,
+                        value.fontScheme.displayLabel(),
+                    )
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = { fontImporter.launch(TerminalFontStore.acceptedMimeTypes) },
+                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                ) {
+                    Text(
+                        stringResource(
+                            if (customFontAvailable) R.string.settings_terminal_font_replace
+                            else R.string.settings_terminal_font_import,
+                        ),
+                    )
+                }
+                if (customFontAvailable) {
+                    TextButton(
+                        onClick = {
+                            if (TerminalFontStore.removeCustomFont(context)) {
+                                onPreferencesChanged(
+                                    value.copy(
+                                        fontScheme = TerminalFontScheme.BUNDLED_NERD_FONT,
+                                        customFontDisplayName = null,
+                                        customFontSha256 = null,
+                                    ),
+                                )
+                            } else {
+                                Toast.makeText(
+                                    context,
+                                    R.string.settings_terminal_font_remove_failed,
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            }
+                        },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
+                        Text(stringResource(R.string.settings_terminal_font_remove))
+                    }
+                }
+            }
+            Text(
+                stringResource(R.string.settings_terminal_font_local_copy),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            key(value.fontScheme, value.customFontSha256) {
+                AndroidView(
+                    factory = { previewContext ->
+                        TextView(previewContext).apply {
+                            textSize = 16f
+                            setPadding(16, 14, 16, 14)
+                        }
+                    },
+                    update = { preview ->
+                        preview.text = context.getString(R.string.settings_terminal_font_preview)
+                        preview.typeface = TerminalTypefaceResolver.resolve(
+                            context,
+                            terminalFontFamilyHint(value.fontScheme),
+                        )
+                        preview.setTextColor(value.foregroundArgb)
+                        preview.setBackgroundColor(value.backgroundArgb)
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp)),
+                )
+            }
             Text(
                 stringResource(R.string.settings_terminal_font_size, value.fontSizeSp),
                 style = MaterialTheme.typography.titleSmall,
@@ -6301,6 +6513,13 @@ private fun safeOperationMessage(
     else -> fallback
 }
 
+@Composable
+private fun TerminalFontScheme.displayLabel(): String = when (this) {
+    TerminalFontScheme.BUNDLED_NERD_FONT -> stringResource(R.string.settings_terminal_font_bundled)
+    TerminalFontScheme.SYSTEM_MONOSPACE -> stringResource(R.string.settings_terminal_font_system)
+    TerminalFontScheme.CUSTOM -> stringResource(R.string.settings_terminal_font_custom)
+}
+
 private fun productTerminalTheme(preferences: TerminalDisplayPreferences): TerminalThemeV1 {
     val normalized = preferences.normalized
     return TerminalThemeV1(
@@ -6317,8 +6536,14 @@ private fun productTerminalTheme(preferences: TerminalDisplayPreferences): Termi
             0xFFB9C7FF, 0xFFDDB8F2, 0xFF8DE7E9, 0xFFFFFFFF,
         ).map { ArgbColor(it.toInt()) },
         boldAsBright = true,
-        fontFamilyHint = "Cascadia Mono",
+        fontFamilyHint = terminalFontFamilyHint(normalized.fontScheme),
     )
+}
+
+private fun terminalFontFamilyHint(scheme: TerminalFontScheme): String = when (scheme) {
+    TerminalFontScheme.BUNDLED_NERD_FONT -> TerminalFontFamilyHintV1.BUNDLED_NERD_FONT
+    TerminalFontScheme.SYSTEM_MONOSPACE -> TerminalFontFamilyHintV1.SYSTEM_MONOSPACE
+    TerminalFontScheme.CUSTOM -> TerminalFontFamilyHintV1.CUSTOM_APP_FONT
 }
 
 /** A small compatibility wrapper keeps the app free of a lifecycle-compose dependency. */

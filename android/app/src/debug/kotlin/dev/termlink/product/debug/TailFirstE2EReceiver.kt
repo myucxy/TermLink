@@ -130,10 +130,12 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
             OPERATION_OPEN_SESSION -> {
                 val markerCount = arguments[EXTRA_MARKER_COUNT]?.toIntOrNull()
                 val minimumTail = arguments[EXTRA_MINIMUM_TAIL]?.toULongOrNull()
+                val bootstrapMode = arguments[EXTRA_HISTORY_BOOTSTRAP_MODE]
                 markerCount in ALLOWED_MARKER_COUNTS &&
                     arguments[EXTRA_FIRST_MARKER] == "${markerStem}_0001" &&
                     arguments[EXTRA_LAST_MARKER] == "%s_%04d".format(markerStem, markerCount) &&
-                    minimumTail == if (markerCount == STREAMED_PREFIX_MARKER_COUNT) {
+                    bootstrapMode in HISTORY_BOOTSTRAP_MODES &&
+                    minimumTail == if (bootstrapMode == HISTORY_BOOTSTRAP_STREAMED_PREFIX) {
                         STREAMED_PREFIX_MINIMUM_TAIL
                     } else {
                         0uL
@@ -141,13 +143,13 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
             }
             OPERATION_PAGE_UP ->
                 arguments[EXTRA_FIRST_MARKER] == "${markerStem}_0001" &&
-                    arguments[EXTRA_LAST_MARKER] == "${markerStem}_1000" &&
+                    arguments[EXTRA_LAST_MARKER] == "${markerStem}_5200" &&
                     arguments[EXTRA_PAGE_SIZE]?.toIntOrNull()?.let { it in 1..MAX_PAGE_SIZE } == true &&
                     arguments[EXTRA_PAGE_NUMBER]?.toIntOrNull()?.let { it in 1..MAX_PAGE_NUMBER } == true &&
                     arguments[EXTRA_EXPECTED_RESULT] in EXPECTED_PAGE_RESULTS
             OPERATION_OPEN_HISTORY ->
                 arguments[EXTRA_FIRST_MARKER] == "${markerStem}_0001" &&
-                    arguments[EXTRA_LAST_MARKER] == "${markerStem}_1000"
+                    arguments[EXTRA_LAST_MARKER] == "${markerStem}_5200"
             OPERATION_INSPECT, OPERATION_CLOSE_HISTORY ->
                 arguments[EXTRA_LIVE_MARKER] == tailFirstLiveMarker(runId)
             else -> false
@@ -251,6 +253,12 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
         DIAGNOSTIC_UNSIGNED_FIELDS.forEach { put(it, source.nonNegativeUnsignedJsonNumber(it)) }
         DIAGNOSTIC_BOOLEAN_FIELDS.forEach { put(it, source.requiredBoolean(it)) }
         put("viewport_signature", source.safeViewportSignature())
+        put("first_visible_line_id", source.nonNegativeUnsignedJsonNumber("first_visible_line_id"))
+        put("visible_text_sha256", source.safeSha256("visible_text_sha256"))
+        put("next_before_line_id", source.nonNegativeUnsignedJsonNumber("next_before_line_id"))
+        put("transcript_top_row", source.signedInt("transcript_top_row"))
+        put("transcript_page_count", source.nonNegativeInt("transcript_page_count"))
+        put("transcript_row_count", source.nonNegativeInt("transcript_row_count"))
     }
 
     private fun kotlinx.serialization.json.JsonObjectBuilder.putBounds(name: String, source: JsonObject) {
@@ -314,6 +322,10 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
             ?.takeIf { it >= 0 }
             ?: error("Invalid integer")
 
+    private fun JsonObject.signedInt(name: String): Int =
+        get(name)?.jsonPrimitive?.takeUnless { it.isString }?.intOrNull
+            ?: error("Invalid signed integer")
+
     private fun JsonObject.positiveInt(name: String): Int =
         nonNegativeInt(name).takeIf { it > 0 } ?: error("Invalid positive integer")
 
@@ -334,6 +346,11 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
         get("viewport_signature")?.jsonPrimitive?.takeIf { it.isString }?.content
             ?.takeIf(VIEWPORT_SIGNATURE::matches)
             ?: error("Invalid viewport signature")
+
+    private fun JsonObject.safeSha256(name: String): String =
+        get(name)?.jsonPrimitive?.takeIf { it.isString }?.content
+            ?.takeIf(SHA256::matches)
+            ?: error("Invalid SHA-256")
 
     private fun JsonObject.safeDiagnosticName(name: String): String =
         get(name)?.jsonPrimitive?.takeIf { it.isString }?.content
@@ -481,6 +498,7 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
         const val EXTRA_LIVE_MARKER = "live_marker"
         const val EXTRA_MARKER_COUNT = "marker_count"
         const val EXTRA_MINIMUM_TAIL = "minimum_tail"
+        const val EXTRA_HISTORY_BOOTSTRAP_MODE = "history_bootstrap_mode"
         const val EXTRA_PAGE_SIZE = "page_size"
         const val EXTRA_PAGE_NUMBER = "page_number"
         const val EXTRA_EXPECTED_RESULT = "expected_result"
@@ -501,12 +519,14 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
         const val FAILURE_OPERATION_FAILED = "OPERATION_FAILED"
         const val FAILURE_TRANSCRIPT_LOAD_FAILED = "TRANSCRIPT_LOAD_FAILED"
         const val MAX_PAGE_SIZE = 200
-        const val MAX_PAGE_NUMBER = 10
+        const val MAX_PAGE_NUMBER = 25
         const val BRIDGE_TIMEOUT_MILLIS = 180_000L
         const val BASELINE_READINESS_TIMEOUT_MILLIS = 10_000L
         const val BASELINE_READINESS_POLL_MILLIS = 50L
-        const val SNAPSHOT_MARKER_COUNT = 1000
+        const val SNAPSHOT_MARKER_COUNT = 5200
         const val STREAMED_PREFIX_MARKER_COUNT = 5200
+        const val HISTORY_BOOTSTRAP_SNAPSHOT_TRANSCRIPT = "SnapshotTranscript"
+        const val HISTORY_BOOTSTRAP_STREAMED_PREFIX = "StreamedChunkPrefix"
         val STREAMED_PREFIX_MINIMUM_TAIL = 4097uL
 
         val REQUEST_ID = Regex("^[0-9a-f]{32}$")
@@ -514,6 +534,7 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
         val UNSIGNED_INTEGER = Regex("^(0|[1-9][0-9]{0,19})$")
         val FAILURE_CODE = Regex("^[A-Z0-9_]{1,64}$")
         val VIEWPORT_SIGNATURE = Regex("^[A-Za-z0-9:_-]{1,128}$")
+        val SHA256 = Regex("^[0-9a-f]{64}$")
         val DIAGNOSTIC_NAME = Regex("^[A-Z_]{2,32}$")
         val EMPTY_UUID: UUID = UUID(0, 0)
         val EXPECTED_PAGE_RESULTS = setOf(
@@ -571,6 +592,7 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
                 EXTRA_LAST_MARKER,
                 EXTRA_MARKER_COUNT,
                 EXTRA_MINIMUM_TAIL,
+                EXTRA_HISTORY_BOOTSTRAP_MODE,
             ),
             OPERATION_INSPECT to setOf(EXTRA_LIVE_MARKER),
             OPERATION_PAGE_UP to setOf(
@@ -585,6 +607,10 @@ class TailFirstE2EReceiver : BroadcastReceiver() {
             OPERATION_SHOW_IME to emptySet(),
         )
         val ALLOWED_MARKER_COUNTS = setOf(SNAPSHOT_MARKER_COUNT, STREAMED_PREFIX_MARKER_COUNT)
+        val HISTORY_BOOTSTRAP_MODES = setOf(
+            HISTORY_BOOTSTRAP_SNAPSHOT_TRANSCRIPT,
+            HISTORY_BOOTSTRAP_STREAMED_PREFIX,
+        )
         val JSON = Json { explicitNulls = false }
         val receiverScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val operationMutex = Mutex()

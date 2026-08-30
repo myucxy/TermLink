@@ -553,6 +553,8 @@ static void ValidateTerminalLaunch(string testRoot)
         "terminal launcher did not preserve the allocated session ID");
     Require(starts.Starts.Count == 2 && starts.Starts[0].FileName == stub && starts.Starts[1].FileName == stub,
         "terminal launcher did not fall back after Windows Terminal launch failure");
+    Require(starts.Starts[0].ArgumentList.Contains("--elevate"),
+        "an administrator-enabled command did not retain the explicit Windows Terminal elevation path");
     var direct = starts.Starts[1];
     Require(string.Equals(direct.WorkingDirectory, Path.GetFullPath(testRoot), StringComparison.OrdinalIgnoreCase),
         "terminal launcher did not preserve the exact working directory");
@@ -567,15 +569,17 @@ static void ValidateTerminalLaunch(string testRoot)
         "terminal launcher did not preserve the extended registration window");
     var commandIndex = direct.ArgumentList.IndexOf("--command-base64");
     var decodedCommand = Encoding.UTF8.GetString(Convert.FromBase64String(direct.ArgumentList[commandIndex + 1]));
-    Require(decodedCommand.Contains("-NoLogo -NoProfile", StringComparison.Ordinal),
-        "Windows PowerShell launch omitted the required clean startup flags");
+    Require(decodedCommand.Contains("-NoLogo", StringComparison.Ordinal) &&
+        !decodedCommand.Contains("-NoProfile", StringComparison.Ordinal),
+        "Windows PowerShell launch did not use the profile-loading default");
     launcher.Launch("powershell-7", testRoot);
     var powerShell7Start = starts.Starts.Last();
     var powerShell7CommandIndex = powerShell7Start.ArgumentList.IndexOf("--command-base64");
     var powerShell7Command = Encoding.UTF8.GetString(
         Convert.FromBase64String(powerShell7Start.ArgumentList[powerShell7CommandIndex + 1]));
-    Require(powerShell7Command.Contains("-NoLogo -NoProfile", StringComparison.Ordinal),
-        "PowerShell 7 launch omitted the required clean startup flags");
+    Require(powerShell7Command.Contains("-NoLogo", StringComparison.Ordinal) &&
+        !powerShell7Command.Contains("-NoProfile", StringComparison.Ordinal),
+        "PowerShell 7 launch did not use the profile-loading default");
     launcher.Launch("wsl", testRoot);
     var wslStart = starts.Starts.Last();
     var wslCommandIndex = wslStart.ArgumentList.IndexOf("--command-base64");
@@ -607,7 +611,16 @@ static void ValidateTerminalLaunch(string testRoot)
         Require(customCommand.Contains("--project alpha --interactive", StringComparison.Ordinal) &&
             customStart.ArgumentList[managedShellIndex + 1] == "custom" &&
             string.IsNullOrEmpty(customStart.Verb),
-            "custom terminal command was not resolved, launched, and advertised as a managed custom shell");
+            "custom terminal command was not resolved, launched without an elevation request, and advertised as a managed custom shell");
+
+        var customFallbackStarts = new RecordingProcessStarter { FailFirst = true };
+        var customFallbackLauncher = new ManagedTerminalLauncher(
+            new WindowsPathService(), customFallbackStarts, () => stub, stub, stub, stub, stub, stub);
+        customFallbackLauncher.Launch(custom.Id, testRoot);
+        Require(customFallbackStarts.Starts.Count == 2 &&
+                !customFallbackStarts.Starts[0].ArgumentList.Contains("--elevate") &&
+                string.IsNullOrEmpty(customFallbackStarts.Starts[1].Verb),
+            "a non-administrator command requested elevation for Windows Terminal or SessionHost fallback");
 
         var detectedOverride = TerminalCommandProfileStore.CreateConfiguredProfile(
             "windows-powershell", "PowerShell hidden", stub, "-NoLogo", "windows-powershell",
@@ -914,6 +927,11 @@ sealed class RecordingProcessStarter : IProcessStarter
     internal List<System.Diagnostics.ProcessStartInfo> Starts { get; } = new();
 
     public bool TryStart(System.Diagnostics.ProcessStartInfo startInfo)
+    {
+        return Record(startInfo);
+    }
+
+    private bool Record(System.Diagnostics.ProcessStartInfo startInfo)
     {
         Starts.Add(startInfo);
         if (FailFirst && Starts.Count == 1) return false;

@@ -1,5 +1,6 @@
 package dev.termlink.network.production
 
+import android.util.Log
 import com.google.protobuf.ByteString
 import dev.termlink.crypto.CryptoDirection
 import dev.termlink.crypto.DeviceIdentity
@@ -45,6 +46,7 @@ import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -220,6 +222,9 @@ class ProductionRealtimeSessionClient(
     private val flowControlSendCount = AtomicLong(0)
     private val lastReceivedSequence = AtomicLong(0)
     private val lastHandledSequence = AtomicLong(0)
+    private val rejectedThroughGeneration = AtomicInteger(0)
+    /** Guarded by [incomingProcessingMutex]. */
+    private var activeIncomingGeneration = 0
     private val flowControlMutex = Mutex()
     private var lastFlowControlGeneration = Int.MIN_VALUE
     private var lastFlowControlPaused: Boolean? = null
@@ -248,30 +253,34 @@ class ProductionRealtimeSessionClient(
         incomingJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
             transport.receivedEnvelopes.collect { received ->
                 try {
-                    incomingProcessingMutex.withLock { handleIncoming(received.envelope) }
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (error: Exception) {
-                    val now = System.currentTimeMillis()
-                    if (error is UnknownKeyMaterialException &&
-                        now >= nextMetadataRefreshAtMillis.get() &&
-                        metadataRefreshInFlight.compareAndSet(false, true)
-                    ) {
-                        nextMetadataRefreshAtMillis.set(now + metadataRefreshCooldownMillis)
-                        scope.launch {
-                            try {
-                                authoritativeMetadataRefreshObserver()
-                            } catch (error: CancellationException) {
-                                throw error
-                            } catch (_: Exception) {
-                                // The transport reconnect loop remains the
-                                // fallback; metadata refresh is best effort.
-                            } finally {
-                                metadataRefreshInFlight.set(false)
-                            }
+                    val failure: IncomingFailure? = incomingProcessingMutex.withLock {
+                        val generation = received.generation
+                        val envelope = received.envelope
+                        val rejectedGeneration = rejectedThroughGeneration.get()
+                        if (generation <= rejectedGeneration || generation < activeIncomingGeneration) {
+                            Log.w(
+                                REALTIME_LOG_TAG,
+                                "session_generation_rejected generation=$generation " +
+                                    "active_generation=$activeIncomingGeneration " +
+                                    "rejected_through_generation=$rejectedGeneration " +
+                                    "seq=${envelope.seq} type=${envelope.messageType.name}",
+                            )
+                            return@withLock null
+                        }
+                        if (generation > activeIncomingGeneration) activeIncomingGeneration = generation
+
+                        val context = IncomingProcessingContext(generation, envelope)
+                        try {
+                            handleIncoming(context)
+                            null
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Exception) {
+                            rejectedThroughGeneration.accumulateAndGet(generation, ::maxOf)
+                            IncomingFailure(context, error)
                         }
                     }
-                    failTransport(error.message ?: "invalid production Envelope")
+                    if (failure != null) handleIncomingFailure(failure)
                 } finally {
                     received.close()
                 }
@@ -620,12 +629,10 @@ class ProductionRealtimeSessionClient(
             sendEncrypted(MessageType.INPUT_EVENT, plaintext)
             withTimeout(inputAcceptanceTimeoutMillis) { pending.await() }
         } catch (_: TimeoutCancellationException) {
-            failTransport("input acceptance timed out")
             throw RemoteInputDeliveryUnknownException("input acceptance timed out")
         } catch (error: RemoteInputRejectedException) {
             throw error
         } catch (error: RemoteInputDeliveryUnknownException) {
-            failTransport(error.message ?: "input delivery is unknown")
             throw error
         } catch (error: CancellationException) {
             throw error
@@ -859,10 +866,53 @@ class ProductionRealtimeSessionClient(
         }
     }
 
-    private suspend fun handleIncoming(envelope: Envelope) {
+    private fun handleIncomingFailure(failure: IncomingFailure) {
+        val context = failure.context
+        val error = failure.error
+        Log.e(
+            REALTIME_LOG_TAG,
+            "session_frame_fatal stage=${context.stage.diagnosticName} " +
+                "generation=${context.generation} seq=${context.envelope.seq} " +
+                "type=${context.envelope.messageType.name} " +
+                "exception=${error::class.java.simpleName}",
+        )
+        val now = System.currentTimeMillis()
+        if (error is UnknownKeyMaterialException &&
+            now >= nextMetadataRefreshAtMillis.get() &&
+            metadataRefreshInFlight.compareAndSet(false, true)
+        ) {
+            nextMetadataRefreshAtMillis.set(now + metadataRefreshCooldownMillis)
+            scope.launch {
+                try {
+                    authoritativeMetadataRefreshObserver()
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    // The transport reconnect loop remains the fallback;
+                    // metadata refresh is best effort.
+                } finally {
+                    metadataRefreshInFlight.set(false)
+                }
+            }
+        }
+        failTransport("invalid production Envelope at ${context.stage.diagnosticName}")
+    }
+
+    private inline fun <T> parseIncomingPayload(
+        context: IncomingProcessingContext,
+        parse: () -> T,
+    ): T {
+        context.stage = IncomingFailureStage.PARSE
+        return parse().also { context.stage = IncomingFailureStage.SEMANTIC }
+    }
+
+    private suspend fun handleIncoming(context: IncomingProcessingContext) {
+        val envelope = context.envelope
         check(!closed.get()) { "production session client is closed" }
         lastReceivedSequence.accumulateAndGet(envelope.seq, ::maxOf)
+        context.stage = IncomingFailureStage.VALIDATE
         validateEnvelope(envelope)
+        context.stage = IncomingFailureStage.KEY_LOOKUP
         val incomingKeyId = envelope.keyId.toByteArray()
         val (key, usedCurrentMaterial) = try {
             synchronized(materialLock) {
@@ -881,6 +931,7 @@ class ProductionRealtimeSessionClient(
         } finally {
             incomingKeyId.fill(0)
         }
+        context.stage = IncomingFailureStage.DECRYPT
         val plaintext = try {
             ProductionRealtimeClient.decryptEnvelope(envelope, key)
         } finally {
@@ -900,9 +951,10 @@ class ProductionRealtimeSessionClient(
             }
         }
         try {
+            context.stage = IncomingFailureStage.SEMANTIC
             when (envelope.messageType) {
                 MessageType.OUTPUT_CHUNK -> {
-                    val payload = OutputChunkPayload.parseFrom(plaintext)
+                    val payload = parseIncomingPayload(context) { OutputChunkPayload.parseFrom(plaintext) }
                     require(payload.output.size() > 0) { "output chunk is empty" }
                     val sourceEventSequence = payload.sourceEventSeq.takeIf { it > 0 } ?: envelope.seq
                     val presentationRevision = payload.presentationRevision.takeIf { it > 0 }
@@ -911,7 +963,9 @@ class ProductionRealtimeSessionClient(
                         "output source event sequence does not match Envelope.seq"
                     }
                     requireApplied(
-                        session.accept(
+                        acceptOrdered(
+                            context,
+                            envelope,
                             RemoteSessionEvent.Output(
                                 sequence = envelope.seq,
                                 bytes = payload.output.toByteArray(),
@@ -922,15 +976,17 @@ class ProductionRealtimeSessionClient(
                     )
                 }
                 MessageType.RESIZE_APPLIED -> {
-                    val payload = ResizePayload.parseFrom(plaintext)
+                    val payload = parseIncomingPayload(context) { ResizePayload.parseFrom(plaintext) }
                     requireApplied(
-                        session.accept(
+                        acceptOrdered(
+                            context,
+                            envelope,
                             RemoteSessionEvent.Resize(envelope.seq, TerminalSize(payload.columns, payload.rows)),
                         ),
                     )
                 }
                 MessageType.GAP -> {
-                    val payload = GapPayload.parseFrom(plaintext)
+                    val payload = parseIncomingPayload(context) { GapPayload.parseFrom(plaintext) }
                     require(payload.start > 0 && payload.end >= payload.start) { "invalid history gap" }
                     // Older Windows runtime builds used gap_end as the
                     // envelope sequence; the production contract uses the
@@ -941,28 +997,42 @@ class ProductionRealtimeSessionClient(
                         payload.end == envelope.seq -> envelope.seq + 1L
                         else -> error("history gap sequence does not match Envelope.seq")
                     }
-                    val acceptance = session.accept(RemoteSessionEvent.Gap(eventSequence, payload.start, payload.end))
+                    val acceptance = acceptOrdered(
+                        context,
+                        envelope,
+                        RemoteSessionEvent.Gap(eventSequence, payload.start, payload.end),
+                    )
                     requireApplied(acceptance)
                 }
                 MessageType.SESSION_UPSERT -> {
-                    val payload = SessionUpsertPayload.parseFrom(plaintext)
+                    val payload = parseIncomingPayload(context) { SessionUpsertPayload.parseFrom(plaintext) }
                     // One Envelope sequence represents exactly one ordered
                     // event. A title-bearing upsert is therefore applied as a
                     // Title event only; lifecycle transitions continue to use
                     // their dedicated SESSION_* messages or a legacy upsert
                     // without field 9.
-                    requireApplied(session.accept(sessionUpsertEvent(envelope.seq, payload)))
+                    requireApplied(acceptOrdered(context, envelope, sessionUpsertEvent(envelope.seq, payload)))
                 }
                 MessageType.SESSION_STARTED -> requireApplied(
-                    session.accept(RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.RUNNING)),
+                    acceptOrdered(
+                        context,
+                        envelope,
+                        RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.RUNNING),
+                    ),
                 )
                 MessageType.SESSION_INTERRUPTED -> requireApplied(
-                    session.accept(RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.INTERRUPTED)),
+                    acceptOrdered(
+                        context,
+                        envelope,
+                        RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.INTERRUPTED),
+                    ),
                 )
                 MessageType.SESSION_ENDED -> {
-                    val payload = SessionUpsertPayload.parseFrom(plaintext)
+                    val payload = parseIncomingPayload(context) { SessionUpsertPayload.parseFrom(plaintext) }
                     requireApplied(
-                        session.accept(
+                        acceptOrdered(
+                            context,
+                            envelope,
                             RemoteSessionEvent.Lifecycle(
                                 envelope.seq,
                                 RemoteLifecycle.ENDED,
@@ -972,10 +1042,14 @@ class ProductionRealtimeSessionClient(
                     )
                 }
                 MessageType.SESSION_REMOVED -> requireApplied(
-                    session.accept(RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.ENDED)),
+                    acceptOrdered(
+                        context,
+                        envelope,
+                        RemoteSessionEvent.Lifecycle(envelope.seq, RemoteLifecycle.ENDED),
+                    ),
                 )
                 MessageType.INPUT_ACCEPTED, MessageType.INPUT_REJECTED -> {
-                    val result = InputResultPayload.parseFrom(plaintext)
+                    val result = parseIncomingPayload(context) { InputResultPayload.parseFrom(plaintext) }
                     val inputId = ProductionRealtimeClient.uuidFromBytes(result.inputId.toByteArray())
                         ?: error("InputResult input ID must be 16 bytes")
                     require(
@@ -984,7 +1058,9 @@ class ProductionRealtimeSessionClient(
                     val pending = pendingInputs.remove(inputId)
                     try {
                         val accepted = requireApplied(
-                            session.accept(
+                            acceptOrdered(
+                                context,
+                                envelope,
                                 RemoteSessionEvent.InputResult(
                                     sequence = envelope.seq,
                                     inputId = inputId,
@@ -1012,10 +1088,14 @@ class ProductionRealtimeSessionClient(
                     }
                 }
                 MessageType.LEASE_GRANTED -> {
-                    val payload = LeasePayload.parseFrom(plaintext)
+                    val payload = parseIncomingPayload(context) { LeasePayload.parseFrom(plaintext) }
                     val leaseId = decodeLeaseId(payload.leaseId.toByteArray())
                     controlArbitrationMutex.withLock {
-                        val acceptance = session.accept(RemoteSessionEvent.ControlGranted(envelope.seq))
+                        val acceptance = acceptOrdered(
+                            context,
+                            envelope,
+                            RemoteSessionEvent.ControlGranted(envelope.seq),
+                        )
                         requireApplied(acceptance)
                         if (acceptance is EventAcceptance.Applied) {
                             session.grantControl(leaseId, payload.expiresAtMs, payload.version)
@@ -1024,9 +1104,11 @@ class ProductionRealtimeSessionClient(
                     }
                 }
                 MessageType.LEASE_DENIED, MessageType.LEASE_REVOKED -> {
-                    val payload = LeasePayload.parseFrom(plaintext)
+                    val payload = parseIncomingPayload(context) { LeasePayload.parseFrom(plaintext) }
                     controlArbitrationMutex.withLock {
-                        val acceptance = session.accept(
+                        val acceptance = acceptOrdered(
+                            context,
+                            envelope,
                             RemoteSessionEvent.ControlRevoked(
                                 sequence = envelope.seq,
                                 reason = payload.reasonCode.ifBlank { "control lease denied" },
@@ -1042,16 +1124,50 @@ class ProductionRealtimeSessionClient(
                         }
                     }
                 }
-                MessageType.OUTPUT_ACK, MessageType.HEARTBEAT -> Unit
+                MessageType.HEARTBEAT -> error("PC-to-Android heartbeat is unsupported")
+                MessageType.OUTPUT_ACK -> error("PC-to-Android output acknowledgement is unsupported")
                 else -> error("unsupported production message type ${envelope.messageType}")
             }
-            lastHandledSequence.accumulateAndGet(envelope.seq, ::maxOf)
+            if (envelope.seq > 0L) lastHandledSequence.accumulateAndGet(envelope.seq, ::maxOf)
         } finally {
             plaintext.fill(0)
         }
     }
 
+    private suspend fun acceptOrdered(
+        context: IncomingProcessingContext,
+        envelope: Envelope,
+        event: RemoteSessionEvent,
+    ): EventAcceptance {
+        context.stage = IncomingFailureStage.ENGINE_ACCEPT
+        val stateBefore = session.state.value
+        val acceptance = session.accept(event)
+        if (acceptance is EventAcceptance.HistoryGap && stateBefore !is RemoteSessionState.HistoryGap) {
+            val output = event as? RemoteSessionEvent.Output
+            val cause = when {
+                event is RemoteSessionEvent.Gap -> "peer_gap"
+                event.sequence != acceptance.expectedSequence -> "sequence_discontinuity"
+                output != null && output.sourceEventSequence != output.sequence -> "source_sequence_mismatch"
+                output != null -> "presentation_revision_not_advanced"
+                else -> "ordered_event_rejected"
+            }
+            Log.w(
+                REALTIME_LOG_TAG,
+                "history_gap cause=$cause message_type=${envelope.messageType.name} " +
+                    "envelope_seq=${envelope.seq} event_seq=${event.sequence} " +
+                    "expected=${acceptance.expectedSequence} received=${acceptance.receivedSequence} " +
+                    "ack_before=${stateBefore.lastAckedSequence} " +
+                    "source_seq=${output?.sourceEventSequence ?: 0} " +
+                    "presentation_revision=${output?.presentationRevision ?: 0} " +
+                    "last_received=${lastReceivedSequence.get()} last_handled=${lastHandledSequence.get()}",
+            )
+        }
+        return acceptance
+    }
+
     internal companion object {
+        private const val REALTIME_LOG_TAG = "TermLinkRealtime"
+
         internal fun sessionUpsertEvent(
             sequence: Long,
             payload: SessionUpsertPayload,
@@ -1089,7 +1205,7 @@ class ProductionRealtimeSessionClient(
             "Envelope recipient mismatch"
         }
         require(envelope.keyId.size() in 1..128) { "Envelope key ID is invalid" }
-        require(envelope.seq > 0 && envelope.nonce.size() == 12 && envelope.ciphertext.size() >= 16) {
+        require(envelope.seq > 0L && envelope.nonce.size() == 12 && envelope.ciphertext.size() >= 16) {
             "Envelope cryptographic metadata is invalid"
         }
     }
@@ -1303,6 +1419,26 @@ class ProductionRealtimeSessionClient(
 
     private class ProductionTransportException(message: String) : IllegalStateException(message)
     private class UnknownKeyMaterialException(message: String) : IllegalStateException(message)
+
+    private enum class IncomingFailureStage(val diagnosticName: String) {
+        VALIDATE("validate"),
+        KEY_LOOKUP("key_lookup"),
+        DECRYPT("decrypt"),
+        PARSE("parse"),
+        SEMANTIC("semantic"),
+        ENGINE_ACCEPT("engine_accept"),
+    }
+
+    private data class IncomingProcessingContext(
+        val generation: Int,
+        val envelope: Envelope,
+        var stage: IncomingFailureStage = IncomingFailureStage.VALIDATE,
+    )
+
+    private data class IncomingFailure(
+        val context: IncomingProcessingContext,
+        val error: Exception,
+    )
 
     private class SessionKeyMaterial(
         val epoch: Long,

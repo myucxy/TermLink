@@ -18,11 +18,14 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+
+private const val MAX_IN_FLIGHT_INPUTS = 32
 
 class RemoteTerminalSession(
     private val engine: TerminalEngine,
@@ -42,6 +45,7 @@ class RemoteTerminalSession(
     private val scope = CoroutineScope(parentScope.coroutineContext + sessionJob)
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val mutex = Mutex()
+    private val inputSubmissionPermits = Semaphore(MAX_IN_FLIGHT_INPUTS)
     private val acknowledgementCommitMutex = Mutex()
     private val started = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
@@ -87,7 +91,18 @@ class RemoteTerminalSession(
         check(started.compareAndSet(false, true)) { "RemoteTerminalSession is already started" }
         scope.launch {
             engine.inputEvents.collect { bytes ->
-                submitInput(bytes)
+                // InputAccepted is correlated per input ID, so one delayed
+                // confirmation must not block later keyboard or Dock input.
+                // UNDISPATCHED preserves engine emission order through the
+                // transport's serialized send path before awaiting each ACK.
+                inputSubmissionPermits.acquire()
+                scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                    try {
+                        submitInput(bytes)
+                    } finally {
+                        inputSubmissionPermits.release()
+                    }
+                }
             }
         }
     }
@@ -633,6 +648,10 @@ class RemoteTerminalSession(
             InputSubmission.Sent(input.inputId)
         } catch (error: RemoteInputRejectedException) {
             InputSubmission.RejectedByRemote(input.inputId, error.reasonCode)
+        } catch (_: RemoteInputDeliveryUnknownException) {
+            // The frame may already have reached the PC. Keep the healthy
+            // transport and lease intact and never retry ambiguous input.
+            InputSubmission.DeliveryUnknown(input.inputId)
         } catch (error: CancellationException) {
             throw error
         } catch (_: Exception) {

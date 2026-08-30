@@ -141,8 +141,14 @@ Assert-True ($observationTimeoutDefault -ge 300) `
 Assert-True ($source.Contains("Get-ManifestTool 'android-sdk'")) 'The runner does not select ADB through D:\Dev.'
 Assert-True ($source.Contains("Get-ManifestTool 'dotnet'")) 'The runner does not preflight the D:\Dev .NET SDK.'
 Assert-True ($source.Contains("Get-ManifestTool 'go'")) 'The runner does not preflight the D:\Dev Go toolchain.'
-Assert-True ($source.Contains('$snapshotMarkerCount = 1000')) `
-    'The Snapshot/Transcript runner does not retain its exact 1000-marker fixture.'
+Assert-True ($source.Contains('$snapshotMarkerCount = 5200')) `
+    'The Snapshot/Transcript runner does not cross the TL-H115 4096-line boundary.'
+Assert-True ($source.Contains('$snapshotTranscriptPageCount = 26')) `
+    'The Snapshot/Transcript runner does not require the complete 26-page chain.'
+Assert-True ($source.Contains('$snapshotTailFirstBeforeLineId = [uint64]5177')) `
+    'The Snapshot/Transcript runner does not pin the exact 24-row live tail.'
+Assert-True ($source.Contains('$tlH115BoundaryLineIds = [uint64[]]@(4095, 4096, 4097, 5200)')) `
+    'The Snapshot/Transcript runner does not name all TL-H115 boundary lines.'
 Assert-True ($source.Contains('$streamedPrefixMarkerCount = 5200')) `
     'The streamed Chunk-prefix runner does not emit enough independently flushed events.'
 Assert-True ($source.Contains('$streamedPrefixMinimumTail = [uint64]4097')) `
@@ -161,13 +167,12 @@ foreach ($streamedProof in @(
         "The streamed Chunk-prefix scenario lacks proof $streamedProof."
 }
 foreach ($rangeProof in @(
-    'request_before = [uint64]977; first = [uint64]801; last = [uint64]976',
-    'request_before = [uint64]801; first = [uint64]601; last = [uint64]800',
-    'request_before = [uint64]601; first = [uint64]401; last = [uint64]600',
-    'request_before = [uint64]401; first = [uint64]201; last = [uint64]400',
-    'request_before = [uint64]201; first = [uint64]1; last = [uint64]200'
+    '$requestBeforeLineId = $snapshotTailFirstBeforeLineId',
+    '$lastLineId = $requestBeforeLineId - 1',
+    '$lastLineId - (($lastLineId - 1) % [uint64]$HistoryPageSize)',
+    '$requestBeforeLineId = $firstLineId'
 )) {
-    Assert-True ($source.Contains($rangeProof)) "The runner lacks exact transcript range '$rangeProof'."
+    Assert-True ($source.Contains($rangeProof)) "The runner lacks generated transcript geometry '$rangeProof'."
 }
 Assert-True ($source.Contains("'artifacts\tail-first-e2e'")) 'The runner does not anchor state below artifacts/tail-first-e2e.'
 Assert-True ($source.Contains("'-no-snapshot-load'")) 'The runner does not require a cold emulator boot.'
@@ -345,8 +350,13 @@ foreach ($failureProof in @(
     "'history-offline-baseline'",
     "'offline-baseline-observed-network-loss'",
     "'offline-baseline-history-objects'",
+    "realtime_remote_state -in @('READ_ONLY', 'RECONNECTING')",
+    '$offlineStableViewportSamples -ge 2',
     "'failure-retains-history-objects'",
     "'failure-retains-viewport'",
+    "'failure-retains-first-visible-line-id'",
+    "'failure-retains-visible-text-hash'",
+    "'failure-retains-transcript-top-row'",
     "'failure-retains-grid-columns'",
     "'failure-retains-grid-rows'",
     "'02a-failed-page-retained.png'",
@@ -372,7 +382,7 @@ Assert-True ($finalRetryIndex -gt $failureRetentionStart -and $finalRetryIndex -
     'The final transcript page is not retried online before the live-flow stage.'
 foreach ($recoveryProof in @(
     "expected_result = 'success'",
-    "'history-complete-five-distinct-pages'",
+    "'history-complete-all-distinct-pages'",
     "'02b-complete-history.png'"
 )) {
     Assert-True ($source.Substring($finalRetryIndex, $liveFlowStart - $finalRetryIndex).Contains($recoveryProof)) `
@@ -598,9 +608,9 @@ $message = Get-FailureMessage { & $scriptPath @common -HistoryPageSize 201 }
 Assert-True ($message -match 'HistoryPageSize') 'HistoryPageSize accepted a value greater than 200.'
 $message = Get-FailureMessage { & $scriptPath @common -HistoryPageSize 199 }
 Assert-True ($message -match 'HistoryPageSize') 'HistoryPageSize accepted a value other than the fixed 200-row contract.'
-$message = Get-FailureMessage { & $scriptPath @common -HistoryPageCount 3 }
-Assert-True ($message -match 'HistoryPageCount') 'HistoryPageCount accepted fewer than the fixed five-page chain.'
-$message = Get-FailureMessage { & $scriptPath @common -HistoryPageCount 5 }
+$message = Get-FailureMessage { & $scriptPath @common -HistoryPageCount 24 }
+Assert-True ($message -match 'HistoryPageCount') 'HistoryPageCount accepted an incomplete 5200-line chain.'
+$message = Get-FailureMessage { & $scriptPath @common -HistoryPageCount 26 }
 Assert-True ($message -match 'HistoryPageCount') 'HistoryPageCount accepted an exhausted-cursor offline probe.'
 $message = Get-FailureMessage { & $scriptPath @common -EmulatorPort 5555 }
 Assert-True ($message -match 'EmulatorPort') 'The runner accepted an odd emulator console port.'

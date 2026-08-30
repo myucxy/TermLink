@@ -892,6 +892,19 @@ impl OscState {
         if payload == b"?" {
             return Ok(OscEffect::Query(OscQuery::DefaultColor(slot)));
         }
+        // OpenTUI restores xterm's default foreground/background/cursor
+        // colors through OSC 10/11/12 with the exact `default` keyword.
+        // Treat that spelling as the baseline-reset alias while keeping all
+        // other non-color payloads fail-closed.
+        if payload == b"default" {
+            let baseline = match slot {
+                DefaultColorSlot::Foreground => self.baseline.foreground,
+                DefaultColorSlot::Background => self.baseline.background,
+                DefaultColorSlot::Cursor => self.baseline.cursor,
+            };
+            *self.default_color_mut(slot) = baseline;
+            return Ok(OscEffect::DefaultColorReset { slot });
+        }
         let color = parse_color(payload)?;
         *self.default_color_mut(slot) = Some(color);
         Ok(OscEffect::DefaultColorSet { slot })
@@ -2479,6 +2492,49 @@ mod tests {
         assert_eq!(state.foreground(), Some(BLUE));
         assert_eq!(state.background(), Some(GREEN));
         assert_eq!(state.cursor_color(), Some(RED));
+    }
+
+    #[test]
+    fn exact_default_color_keyword_restores_each_baseline() {
+        let baseline = OscBaseline {
+            foreground: Some(BLUE),
+            background: Some(GREEN),
+            cursor: Some(RED),
+            ..OscBaseline::default()
+        };
+        let mut state = OscState::new(baseline);
+        state.apply(10, b"#fff").expect("foreground override");
+        state.apply(11, b"#fff").expect("background override");
+        state.apply(12, b"#fff").expect("cursor override");
+
+        for (selector, slot) in [
+            (10, DefaultColorSlot::Foreground),
+            (11, DefaultColorSlot::Background),
+            (12, DefaultColorSlot::Cursor),
+        ] {
+            assert_eq!(
+                state.apply(selector, b"default"),
+                Ok(OscEffect::DefaultColorReset { slot })
+            );
+        }
+        assert_eq!(state.foreground(), Some(BLUE));
+        assert_eq!(state.background(), Some(GREEN));
+        assert_eq!(state.cursor_color(), Some(RED));
+    }
+
+    #[test]
+    fn default_color_keyword_compatibility_remains_strict() {
+        for payload in [
+            b"Default".as_slice(),
+            b"DEFAULT".as_slice(),
+            b"default ".as_slice(),
+            b" default".as_slice(),
+            b"defaults".as_slice(),
+        ] {
+            let mut state = OscState::default();
+            assert_eq!(state.apply(12, payload), Err(OscError::InvalidColor));
+            assert_eq!(state, OscState::default());
+        }
     }
 
     #[test]

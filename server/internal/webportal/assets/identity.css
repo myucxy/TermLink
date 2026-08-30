@@ -904,6 +904,96 @@ html[data-theme="dark"] .theme-icon-sun { display: inline; }
   list-style: none;
 }
 
+/* Hosted registration uses the same identity shell as Keycloak login. */
+.registration-page .identity-layout {
+  min-height: 660px;
+}
+
+.registration-page .identity-auth-pane {
+  padding-block: 34px;
+}
+
+.registration-page .identity-form-shell {
+  width: min(100%, 420px);
+}
+
+.registration-form {
+  gap: 13px;
+}
+
+.registration-code-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.registration-code-button {
+  min-width: 112px;
+  white-space: nowrap;
+}
+
+.tl-field-help {
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.registration-message {
+  min-height: 0;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.registration-message:empty {
+  display: none;
+}
+
+.registration-message[data-state="error"] {
+  color: var(--danger);
+}
+
+.registration-message[data-state="success"] {
+  color: var(--success);
+}
+
+.tl-button:disabled {
+  cursor: wait;
+  opacity: 0.66;
+}
+
+.mail-icon {
+  position: relative;
+  width: 16px;
+  height: 12px;
+  display: inline-block;
+  border: 1.5px solid currentColor;
+  border-radius: 3px;
+}
+
+.mail-icon::before,
+.mail-icon::after {
+  position: absolute;
+  top: 2px;
+  width: 8px;
+  height: 1.5px;
+  content: "";
+  background: currentColor;
+}
+
+.mail-icon::before {
+  left: 1px;
+  transform: rotate(32deg);
+}
+
+.mail-icon::after {
+  right: 1px;
+  transform: rotate(-32deg);
+}
+
 @media (max-height: 764px) {
   html {
     min-height: 744px;
@@ -1054,6 +1144,64 @@ html[data-theme="dark"] .theme-icon-sun { display: inline; }
 
   .identity-form-shell {
     width: min(100%, 420px);
+  }
+
+  .registration-page .identity-auth-pane {
+    padding-top: 34px;
+  }
+}
+
+@media (max-width: 430px) {
+  .registration-code-row {
+    grid-template-columns: 1fr;
+  }
+
+  .registration-code-button {
+    width: 100%;
+  }
+}
+
+.registration-human-group {
+  gap: 8px;
+}
+
+.registration-human-verification {
+  width: 100%;
+  min-height: 65px;
+  overflow: hidden;
+  border-radius: 8px;
+  outline: none;
+}
+
+.registration-human-widget {
+  width: 100%;
+}
+
+.registration-human-verification:focus-visible {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
+.registration-human-loading {
+  display: grid;
+  min-height: 65px;
+  place-items: center;
+  padding: 12px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  color: var(--text-2);
+  font-size: 13px;
+  text-align: center;
+}
+
+.registration-human-verification[data-state="error"] .registration-human-loading,
+.registration-human-verification[data-state="expired"] .registration-human-loading {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  color: var(--danger);
+}
+
+@media (max-width: 340px) {
+  .registration-human-verification {
+    overflow-x: auto;
   }
 }
 

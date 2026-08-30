@@ -1,0 +1,17 @@
+services:
+  server:
+    environment:
+      TERMLINK_HUMAN_VERIFICATION_PROVIDER: turnstile
+      # The site key is public and may be rendered into the registration page.
+      TERMLINK_HUMAN_VERIFICATION_SITE_KEY: ${TERMLINK_HUMAN_VERIFICATION_SITE_KEY:?TERMLINK_HUMAN_VERIFICATION_SITE_KEY is required}
+      TERMLINK_HUMAN_VERIFICATION_SECRET_FILE: /run/secrets/human_verification_secret
+    secrets:
+      - source: human_verification_secret
+        target: human_verification_secret
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+
+secrets:
+  human_verification_secret:
+    file: ${TERMLINK_HUMAN_VERIFICATION_SECRET_FILE:?TERMLINK_HUMAN_VERIFICATION_SECRET_FILE is required}

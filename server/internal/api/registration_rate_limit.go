@@ -45,6 +45,15 @@ func accountRegistrationClientIdentity(r *http.Request) string {
 	return "ip:" + peer.String()
 }
 
+func accountRegistrationClientIP(r *http.Request) string {
+	value := strings.TrimPrefix(accountRegistrationClientIdentity(r), "ip:")
+	address, err := netip.ParseAddr(value)
+	if err != nil {
+		return ""
+	}
+	return address.Unmap().String()
+}
+
 func remoteAddress(value string) (netip.Addr, bool) {
 	value = strings.TrimSpace(value)
 	host, _, err := net.SplitHostPort(value)

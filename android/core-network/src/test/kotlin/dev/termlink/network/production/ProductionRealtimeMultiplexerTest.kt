@@ -16,6 +16,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -33,6 +34,7 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -303,11 +305,274 @@ class ProductionRealtimeMultiplexerTest {
         socket.deliver(socket.received(sessionA, 3))
         runCurrent()
         assertEquals(5, socket.releasedReservations.get())
+        assertEquals(1, socket.disconnectCount)
 
         endpointB.close()
         assertEquals(0, socket.closeCount)
         multiplexer.close()
         assertEquals(1, socket.closeCount)
+    }
+
+    @Test
+    fun endpointOverflowClosesSocketAndRejectsRemainderOfGeneration(): Unit = runTest {
+        val sessionId = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpoint = multiplexer.register(sessionId)
+
+        endpoint.connect()
+        repeat(ProductionRealtimeClient.MAX_BUFFERED_EVENTS + 2) { index ->
+            socket.deliver(socket.received(sessionId, index.toLong() + 1, generation = 1))
+        }
+        runCurrent()
+
+        assertEquals(1, socket.disconnectCount)
+        assertEquals(2, socket.releasedReservations.get())
+        assertEquals(1L, endpoint.diagnostics().routeDecisions.overflow)
+        assertEquals(1L, endpoint.diagnostics().routeDecisions.rejectedGeneration)
+        val admitted = async {
+            endpoint.receivedEnvelopes
+                .take(ProductionRealtimeClient.MAX_BUFFERED_EVENTS)
+                .map { it.use { item -> item.envelope.seq } }
+                .toList()
+        }
+        runCurrent()
+        assertEquals(
+            (1L..ProductionRealtimeClient.MAX_BUFFERED_EVENTS.toLong()).toList(),
+            admitted.await(),
+        )
+
+        val nextGeneration = async {
+            endpoint.receivedEnvelopes.take(1).map { it.use { item -> item.envelope.seq } }.toList()
+        }
+        socket.deliver(socket.received(sessionId, 129, generation = 2))
+        runCurrent()
+        assertEquals(listOf(129L), nextGeneration.await())
+        assertEquals(ProductionRealtimeClient.MAX_BUFFERED_EVENTS + 3, socket.releasedReservations.get())
+
+        multiplexer.close()
+    }
+
+    @Test
+    fun routeDecisionsExposeNoTargetClosedAndRejectedGenerationWithoutSessionIdentifiers(): Unit = runTest {
+        assertEquals(
+            ProductionRealtimeRouteDecision.NO_ENDPOINT,
+            classifyProductionRealtimeRoute(endpointPresent = false),
+        )
+        assertEquals(
+            ProductionRealtimeRouteDecision.ENDPOINT_CLOSED,
+            classifyProductionRealtimeRoute(endpointPresent = true, endpointClosed = true),
+        )
+        assertEquals(
+            ProductionRealtimeRouteDecision.REJECTED_GENERATION,
+            classifyProductionRealtimeRoute(endpointPresent = true, generationRejected = true),
+        )
+        assertEquals(
+            ProductionRealtimeRouteDecision.OVERFLOW,
+            classifyProductionRealtimeRoute(endpointPresent = true, overflow = true),
+        )
+
+        val sessionId = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+
+        socket.deliver(socket.received(sessionId, 306, generation = 1))
+        runCurrent()
+        val endpoint = multiplexer.register(sessionId)
+        socket.deliver(socket.received(sessionId, 307, generation = 1))
+        runCurrent()
+
+        val admitted = async {
+            endpoint.receivedEnvelopes.take(2).map { it.use { item -> item.envelope.seq } }.toList()
+        }
+        socket.deliver(socket.received(sessionId, 306, generation = 2))
+        socket.deliver(socket.received(sessionId, 307, generation = 2))
+        runCurrent()
+        assertEquals(listOf(306L, 307L), admitted.await())
+        assertEquals(1L, endpoint.diagnostics().routeDecisions.noEndpoint)
+        assertEquals(1L, endpoint.diagnostics().routeDecisions.rejectedGeneration)
+        assertEquals(1, socket.disconnectCount)
+        assertEquals(4, socket.releasedReservations.get())
+        multiplexer.close()
+    }
+
+    @Test
+    fun closedEndpointFenceSurvivesReplacementIncarnationUntilNewSocketGeneration(): Unit = runTest {
+        val sessionId = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val oldEndpoint = multiplexer.register(sessionId)
+        oldEndpoint.close()
+
+        socket.deliver(socket.received(sessionId, 306, generation = 1))
+        runCurrent()
+        val replacement = multiplexer.register(sessionId)
+        socket.deliver(socket.received(sessionId, 307, generation = 1))
+        runCurrent()
+
+        val replay = async {
+            replacement.receivedEnvelopes.take(2).map { it.use { item -> item.envelope.seq } }.toList()
+        }
+        socket.deliver(socket.received(sessionId, 306, generation = 2))
+        socket.deliver(socket.received(sessionId, 307, generation = 2))
+        runCurrent()
+
+        assertEquals(listOf(306L, 307L), replay.await())
+        assertEquals(1L, replacement.diagnostics().routeDecisions.endpointClosed)
+        assertEquals(1L, replacement.diagnostics().routeDecisions.rejectedGeneration)
+        assertEquals(1, socket.disconnectCount)
+        assertEquals(4, socket.releasedReservations.get())
+        multiplexer.close()
+    }
+
+    @Test
+    fun closingBufferedEndpointFencesGenerationBeforeReplacementBecomesVisible(): Unit = runTest {
+        val sessionId = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val oldEndpoint = multiplexer.register(sessionId)
+
+        socket.deliver(socket.received(sessionId, 306, generation = 2))
+        runCurrent()
+        assertEquals(0, socket.releasedReservations.get())
+
+        // The queued 306 is cancelled. Its generation must be fenced before
+        // register() can expose the replacement endpoint.
+        oldEndpoint.close()
+        assertEquals(1, socket.releasedReservations.get())
+        assertEquals(1, socket.disconnectCount)
+
+        val replacement = multiplexer.register(sessionId)
+        socket.deliver(socket.received(sessionId, 307, generation = 2))
+        runCurrent()
+
+        val replay = async {
+            replacement.receivedEnvelopes.take(2).map { it.use { item -> item.envelope.seq } }.toList()
+        }
+        socket.deliver(socket.received(sessionId, 306, generation = 3))
+        socket.deliver(socket.received(sessionId, 307, generation = 3))
+        runCurrent()
+
+        assertEquals(listOf(306L, 307L), replay.await())
+        assertEquals(1L, replacement.diagnostics().routeDecisions.rejectedGeneration)
+        assertEquals(4, socket.releasedReservations.get())
+        multiplexer.close()
+    }
+
+    @Test
+    fun closingEndpointFencesFrameAlreadyCollectedButNotYetReleased(): Unit = runTest {
+        val sessionId = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val oldEndpoint = multiplexer.register(sessionId)
+        val collected = CompletableDeferred<ProductionReceivedEnvelope>()
+        val allowRelease = CompletableDeferred<Unit>()
+        val collector = backgroundScope.launch {
+            oldEndpoint.receivedEnvelopes.take(1).collect { received ->
+                collected.complete(received)
+                allowRelease.await()
+                received.close()
+            }
+        }
+
+        socket.deliver(socket.received(sessionId, 306, generation = 2))
+        val inFlight = withTimeout(2_000) { collected.await() }
+        assertEquals(306L, inFlight.envelope.seq)
+        assertEquals(0, socket.releasedReservations.get())
+
+        // The channel is empty, but the frame remains outstanding until the
+        // SessionClient finally block calls close(). Closing the endpoint must
+        // therefore still fence generation 2 and disconnect the socket.
+        oldEndpoint.close()
+        assertEquals(1, socket.disconnectCount)
+        assertEquals(0, socket.releasedReservations.get())
+
+        val replacement = multiplexer.register(sessionId)
+        socket.deliver(socket.received(sessionId, 307, generation = 2))
+        runCurrent()
+        allowRelease.complete(Unit)
+        collector.join()
+
+        val replay = async {
+            replacement.receivedEnvelopes.take(2).map { it.use { item -> item.envelope.seq } }.toList()
+        }
+        socket.deliver(socket.received(sessionId, 306, generation = 3))
+        socket.deliver(socket.received(sessionId, 307, generation = 3))
+        runCurrent()
+
+        assertEquals(listOf(306L, 307L), replay.await())
+        assertEquals(1L, replacement.diagnostics().routeDecisions.rejectedGeneration)
+        assertEquals(4, socket.releasedReservations.get())
+        multiplexer.close()
+    }
+
+    @Test
+    fun highestObservedGenerationIsSharedAcrossEndpointsAndIncarnations(): Unit = runTest {
+        val sessionA = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        val sessionB = UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpointA = multiplexer.register(sessionA)
+        val oldEndpointB = multiplexer.register(sessionB)
+        oldEndpointB.close()
+        val replacementB = multiplexer.register(sessionB)
+
+        val receivedA = async {
+            endpointA.receivedEnvelopes.take(1).map { it.use { item -> item.envelope.seq } }.toList()
+        }
+        socket.deliver(socket.received(sessionA, 306, generation = 2))
+        runCurrent()
+        assertEquals(listOf(306L), receivedA.await())
+
+        // A frame from an older socket generation cannot regain admission by
+        // targeting a different endpoint or a freshly registered incarnation.
+        socket.deliver(socket.received(sessionB, 305, generation = 1))
+        runCurrent()
+        val receivedB = async {
+            replacementB.receivedEnvelopes.take(1).map { it.use { item -> item.envelope.seq } }.toList()
+        }
+        socket.deliver(socket.received(sessionB, 306, generation = 2))
+        runCurrent()
+
+        assertEquals(listOf(306L), receivedB.await())
+        assertEquals(1L, replacementB.diagnostics().routeDecisions.rejectedGeneration)
+        assertEquals(3, socket.releasedReservations.get())
+        multiplexer.close()
+    }
+
+    @Test
+    fun closingEndpointOrOwnerReleasesEveryBufferedReservation(): Unit = runTest {
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpointA = multiplexer.register(UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
+        val endpointB = multiplexer.register(UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"))
+
+        repeat(3) { index ->
+            socket.deliver(
+                socket.received(
+                    UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+                    index.toLong() + 1,
+                    generation = 1,
+                ),
+            )
+        }
+        repeat(4) { index ->
+            socket.deliver(
+                socket.received(
+                    UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+                    index.toLong() + 11,
+                    generation = 1,
+                ),
+            )
+        }
+        runCurrent()
+        assertEquals(0, socket.releasedReservations.get())
+
+        endpointA.close()
+        assertEquals(3, socket.releasedReservations.get())
+        endpointB.diagnostics()
+        multiplexer.close()
+        assertEquals(7, socket.releasedReservations.get())
     }
 
     @Test
@@ -418,14 +683,18 @@ class ProductionRealtimeMultiplexerTest {
         check(incoming.trySend(received).isSuccess)
     }
 
-    private fun FakeSocket.received(sessionId: UUID, sequence: Long): ProductionReceivedEnvelope =
+    private fun FakeSocket.received(
+        sessionId: UUID,
+        sequence: Long,
+        generation: Int = 1,
+    ): ProductionReceivedEnvelope =
         ProductionReceivedEnvelope(
             envelope = Envelope.newBuilder()
                 .setSessionId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(sessionId)))
                 .setSeq(sequence)
                 .build(),
             wireBytes = 64,
-            generation = 1,
+            generation = generation,
             releaseReservation = { releasedReservations.incrementAndGet() },
         )
 

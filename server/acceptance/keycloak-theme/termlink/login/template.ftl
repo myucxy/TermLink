@@ -1,9 +1,13 @@
 <#macro registrationLayout bodyClass="" displayInfo=false displayMessage=true displayRequiredFields=false>
 <#assign termlinkAccountUrl = "">
 <#assign termlinkHomeUrl = "">
+<#assign termlinkRegisterUrl = "">
 <#if client?? && client.clientId == "termlink-web" && client.baseUrl?has_content>
   <#assign termlinkAccountUrl = client.baseUrl>
   <#assign termlinkHomeUrl = client.baseUrl?remove_ending("/")?remove_ending("/account") + "/">
+  <#assign termlinkRegisterUrl = termlinkHomeUrl + "register">
+<#elseif client?? && client.clientId == "termlink-windows" && client.baseUrl?has_content>
+  <#assign termlinkRegisterUrl = client.baseUrl?remove_ending("/") + "/register">
 </#if>
 <!doctype html>
 <html lang="${lang}"<#if realm.internationalizationEnabled> dir="${(locale.rtl)?then('rtl','ltr')}"</#if>>
@@ -85,7 +89,7 @@
         <div>
           <span class="trust-icon users-icon" aria-hidden="true"></span>
           <dt>${msg("termlinkRegistrationPolicy")}</dt>
-          <dd><#if realm.registrationAllowed>${msg("termlinkOpenRegistration")}<#else>${msg("termlinkInviteRegistration")}</#if></dd>
+          <dd>${msg("termlinkServerRegistration")}</dd>
         </div>
         <div>
           <span class="trust-icon lock-icon" aria-hidden="true"></span>

@@ -5,6 +5,11 @@
 本文记录 `terminal-core` 当前明确未实现的能力、没有采用“半实现”的原因、实现依赖和完成标准。
 它是工程路线记录，不表示这些能力已经进入产品，也不能替代对应协议的测试和验收证据。
 
+> 状态说明（2026-08-30）：Windows 与 Android 的生产 authority/render 主链已经接入 native core。
+> 本文尾部仍存在 Windows-first/shadow 阶段的历史平台描述，统一清理工作已记录在
+> [`DEVELOPMENT_ROADMAP.md`](DEVELOPMENT_ROADMAP.md) 的 W0；本文所列 History Page、Delta、
+> DRCS、SIXEL 和 Kitty graphics 技术缺口仍然有效。
+
 ## 基本原则
 
 - 完全使用 TermLink 自研代码，不复制、链接或构建依赖 Windows Terminal、termForward、Termux

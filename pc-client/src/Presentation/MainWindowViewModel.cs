@@ -98,30 +98,13 @@ public sealed class DevicesPageViewModel : PageViewModel
     public ObservableCollection<DeviceListItemViewModel> Items { get; } = new();
 }
 
-public enum AccountFormMode
-{
-    Login = 0,
-    Register = 1,
-}
-
 public sealed class AccountPageViewModel : ObservableObject
 {
-    private string username = string.Empty;
-    private string nickname = string.Empty;
-    private string email = string.Empty;
-    private string password = string.Empty;
-    private string passwordConfirmation = string.Empty;
     private string pcName = Environment.MachineName;
     private bool accountLinked;
     private string currentUsername = string.Empty;
     private string currentNickname = string.Empty;
-    private AccountFormMode formMode;
 
-    public string Username { get => username; set => SetProperty(ref username, value); }
-    public string Nickname { get => nickname; set => SetProperty(ref nickname, value); }
-    public string Email { get => email; set => SetProperty(ref email, value); }
-    public string Password { get => password; set => SetProperty(ref password, value); }
-    public string PasswordConfirmation { get => passwordConfirmation; set => SetProperty(ref passwordConfirmation, value); }
     public string PcName { get => pcName; set => SetProperty(ref pcName, value); }
     public bool AccountLinked { get => accountLinked; internal set => SetProperty(ref accountLinked, value); }
     public string CurrentUsername
@@ -153,8 +136,6 @@ public sealed class AccountPageViewModel : ObservableObject
             return initial.Length == 1 ? initial.ToUpperInvariant() : initial;
         }
     }
-    public AccountFormMode FormMode { get => formMode; internal set => SetProperty(ref formMode, value); }
-
     private void RaiseAccountIdentityProperties()
     {
         RaisePropertyChanged(nameof(AccountDisplayName));
@@ -180,6 +161,10 @@ public sealed class SettingsPageViewModel : PageViewModel
     private string releaseNotes = string.Empty;
     private string releaseNotesTitle = PresentationText.AppShipReleaseNotes;
     private string updateStatusText = PresentationText.UpdateNotChecked;
+    private bool terminalIntegrationEditorOpen;
+    private bool terminalAddNoLogo = true;
+    private bool terminalAddNoProfile;
+    private bool canConfigureTerminalIntegration = true;
 
     public SettingsPageViewModel() : base("settings", PresentationText.Settings) { }
     public string Platform { get => platform; internal set => SetProperty(ref platform, value); }
@@ -201,6 +186,26 @@ public sealed class SettingsPageViewModel : PageViewModel
     public string ReleaseNotesTitle { get => releaseNotesTitle; internal set => SetProperty(ref releaseNotesTitle, value); }
     public string UpdateStatusText { get => updateStatusText; internal set => SetProperty(ref updateStatusText, value); }
     public bool HasReleaseNotes => !string.IsNullOrWhiteSpace(ReleaseNotes);
+    public bool TerminalIntegrationEditorOpen
+    {
+        get => terminalIntegrationEditorOpen;
+        internal set => SetProperty(ref terminalIntegrationEditorOpen, value);
+    }
+    public bool TerminalAddNoLogo
+    {
+        get => terminalAddNoLogo;
+        set => SetProperty(ref terminalAddNoLogo, value);
+    }
+    public bool TerminalAddNoProfile
+    {
+        get => terminalAddNoProfile;
+        set => SetProperty(ref terminalAddNoProfile, value);
+    }
+    public bool CanConfigureTerminalIntegration
+    {
+        get => canConfigureTerminalIntegration;
+        internal set => SetProperty(ref canConfigureTerminalIntegration, value);
+    }
     public string? EditingCommandId { get => editingCommandId; internal set => SetProperty(ref editingCommandId, value); }
     public bool CommandEditorOpen { get => commandEditorOpen; internal set => SetProperty(ref commandEditorOpen, value); }
     public bool HasUnsavedCommands { get => hasUnsavedCommands; internal set => SetProperty(ref hasUnsavedCommands, value); }
@@ -237,6 +242,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private readonly CancellationTokenSource lifetimeCancellation = new();
     private readonly SemaphoreSlim updateCheckLock = new(1, 1);
     private readonly TimeSpan updateCheckInterval;
+    private readonly TimeSpan noticeAutoDismissDelay;
     private readonly Dictionary<string, PageViewModel> pages;
     private PageViewModel currentPage;
     private string settingsSection = "general";
@@ -247,6 +253,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private string noticeTitle = string.Empty;
     private string noticeDetail = string.Empty;
     private string noticeCode = string.Empty;
+    private long noticeVersion;
     private bool confirmationVisible;
     private string confirmationTitle = string.Empty;
     private string confirmationDetail = string.Empty;
@@ -267,7 +274,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         IAppearanceController? appearanceController = null,
         string applicationVersion = "1.0.0.0",
         string author = "清风惹尘丶",
-        TimeSpan? updateCheckInterval = null)
+        TimeSpan? updateCheckInterval = null,
+        TimeSpan? noticeAutoDismissDelay = null)
     {
         this.stateStore = stateStore ?? throw new ArgumentNullException(nameof(stateStore));
         this.client = client ?? throw new ArgumentNullException(nameof(client));
@@ -278,6 +286,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         this.updateCheckInterval = updateCheckInterval ?? TimeSpan.FromHours(6);
         if (this.updateCheckInterval <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(updateCheckInterval));
+        this.noticeAutoDismissDelay = noticeAutoDismissDelay ?? TimeSpan.FromSeconds(5);
+        if (this.noticeAutoDismissDelay <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(noticeAutoDismissDelay));
         appearancePreference = appearanceController?.Current ?? AppearancePreference.System;
         ArgumentNullException.ThrowIfNull(descriptor);
 
@@ -321,8 +332,6 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             Navigate("settings");
             SelectSettingsSection("account");
-            Account.FormMode = AccountFormMode.Login;
-            RaiseAccountStateProperties();
             return Task.CompletedTask;
         });
         OpenAboutUpdatesCommand = new AsyncCommand((_, _) =>
@@ -339,16 +348,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 : Task.CompletedTask);
         RevokeDeviceCommand = new AsyncCommand((parameter, cancellationToken) =>
             parameter is Guid deviceId ? RevokeDeviceAsync(deviceId, cancellationToken) : Task.CompletedTask);
-        SetAccountFormModeCommand = new AsyncCommand((parameter, _) =>
-        {
-            Account.FormMode = string.Equals(parameter as string, "register", StringComparison.OrdinalIgnoreCase)
-                ? AccountFormMode.Register
-                : AccountFormMode.Login;
-            RaiseAccountStateProperties();
-            return Task.CompletedTask;
-        });
-        LoginCommand = new AsyncCommand((_, cancellationToken) => LoginAsync(cancellationToken));
-        RegisterCommand = new AsyncCommand((_, cancellationToken) => RegisterAsync(cancellationToken));
+        BeginAccountAuthorizationCommand = new AsyncCommand((_, cancellationToken) =>
+            BeginAccountAuthorizationAsync(cancellationToken));
         SignOutCommand = new AsyncCommand((_, cancellationToken) => SignOutAsync(cancellationToken));
         OpenTerminalCommandEditorCommand = new AsyncCommand((parameter, _) =>
         {
@@ -379,6 +380,15 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             RunDesktopOperationAsync(token => RequireDesktopOperations().OpenDiagnosticsDirectoryAsync(token), cancellationToken));
         RepairTerminalIntegrationCommand = new AsyncCommand((_, cancellationToken) =>
             RunDesktopOperationAsync(token => RequireDesktopOperations().RepairTerminalIntegrationAsync(token), cancellationToken));
+        OpenTerminalIntegrationSettingsCommand = new AsyncCommand((_, cancellationToken) =>
+            OpenTerminalIntegrationSettingsAsync(cancellationToken));
+        SaveTerminalIntegrationSettingsCommand = new AsyncCommand((_, cancellationToken) =>
+            SaveTerminalIntegrationSettingsAsync(cancellationToken));
+        CancelTerminalIntegrationSettingsCommand = new AsyncCommand((_, _) =>
+        {
+            Settings.TerminalIntegrationEditorOpen = false;
+            return Task.CompletedTask;
+        });
         DismissNoticeCommand = new AsyncCommand((_, _) =>
         {
             ClearNotice();
@@ -414,9 +424,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand StopSessionCommand { get; }
     public AsyncCommand GrantDeviceCommand { get; }
     public AsyncCommand RevokeDeviceCommand { get; }
-    public AsyncCommand SetAccountFormModeCommand { get; }
-    public AsyncCommand LoginCommand { get; }
-    public AsyncCommand RegisterCommand { get; }
+    public AsyncCommand BeginAccountAuthorizationCommand { get; }
     public AsyncCommand SignOutCommand { get; }
     public AsyncCommand OpenTerminalCommandEditorCommand { get; }
     public AsyncCommand AddTerminalCommandCommand { get; }
@@ -427,6 +435,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand UpdateActionCommand { get; }
     public AsyncCommand OpenDiagnosticsDirectoryCommand { get; }
     public AsyncCommand RepairTerminalIntegrationCommand { get; }
+    public AsyncCommand OpenTerminalIntegrationSettingsCommand { get; }
+    public AsyncCommand SaveTerminalIntegrationSettingsCommand { get; }
+    public AsyncCommand CancelTerminalIntegrationSettingsCommand { get; }
     public AsyncCommand DismissNoticeCommand { get; }
     public AsyncCommand ConfirmPendingActionCommand { get; }
     public AsyncCommand CancelPendingActionCommand { get; }
@@ -445,6 +456,22 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public bool IsIntegrationSettingsSelected => settingsSection == "integration";
     public bool IsDiagnosticsSettingsSelected => settingsSection == "diagnostics";
     public bool IsAboutSettingsSelected => settingsSection == "about";
+    public string CurrentSettingsSectionTitle => settingsSection switch
+    {
+        "account" => PresentationText.Account,
+        "commands" => PresentationText.Commands,
+        "integration" => PresentationText.Integration,
+        "diagnostics" => PresentationText.Diagnostics,
+        "about" => PresentationText.About,
+        _ => PresentationText.General,
+    };
+    public string CurrentPageSubtitle => CurrentPage.Key switch
+    {
+        "devices" => PresentationText.DeviceHeaderSummary(RemoteAccessStatusText, ActiveSessionCount),
+        "sessions" => SessionCountText,
+        "settings" => CurrentSettingsSectionTitle,
+        _ => PresentationText.Console,
+    };
     public string AgentName { get => agentName; private set => SetProperty(ref agentName, value); }
     public string StatusText { get => statusText; private set => SetProperty(ref statusText, value); }
     public string OperationMessage { get => operationMessage; private set => SetProperty(ref operationMessage, value); }
@@ -466,6 +493,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public bool IsDarkAppearance => AppearancePreference == AppearancePreference.Dark;
     public bool IsConnected => Connection.State == AgentConnectionState.Connected;
     public bool IsConnectionBusy => Connection.State is AgentConnectionState.Connecting or AgentConnectionState.Reconnecting;
+    public bool IsServerDisconnected => !IsConnected && !IsConnectionBusy;
+    public string ServerConnectionToolTip => string.IsNullOrWhiteSpace(Connection.Detail)
+        ? StatusText
+        : $"{StatusText} · {Connection.Detail}";
     public bool CanRetryConnection => Connection.State is AgentConnectionState.Offline or AgentConnectionState.Faulted;
     public bool CanEnableRemoteAccess => !Connection.RemoteAccessEnabled && Account.AccountLinked && IsConnected;
     public bool CanDisableRemoteAccess => Connection.RemoteAccessEnabled && !RequiresReauthentication;
@@ -482,15 +513,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public bool IsAccountStateLoading => !IsAccountStateKnown;
     public bool IsAccountLinked => IsAccountStateKnown && Account.AccountLinked && !RequiresReauthentication;
     public bool IsAccountSignedOut => IsAccountStateKnown && !IsAccountLinked;
-    public bool CanRegisterAccount => !RequiresReauthentication;
     public string AccountStateTitle => RequiresReauthentication
         ? PresentationText.AuthenticationExpired
         : PresentationText.AccountSignedOut;
     public string AccountStateDetail => RequiresReauthentication
         ? PresentationText.AuthenticationExpiredDetail
         : PresentationText.SignInDetail;
-    public bool IsLoginMode => Account.FormMode == AccountFormMode.Login;
-    public bool IsRegisterMode => Account.FormMode == AccountFormMode.Register;
     public string AccountActionText => RequiresReauthentication ? PresentationText.SignInAgain : PresentationText.Login;
     public bool HasAvailableUpdate
     {
@@ -544,6 +572,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         RaisePropertyChanged(nameof(IsAboutSettingsSelected));
         RaisePropertyChanged(nameof(IsAccountPageSelected));
         RaisePropertyChanged(nameof(IsDiagnosticsPageSelected));
+        RaisePropertyChanged(nameof(CurrentSettingsSectionTitle));
+        RaisePropertyChanged(nameof(CurrentPageSubtitle));
     }
 
     private void SetAppearance(AppearancePreference preference)
@@ -573,8 +603,6 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Account.CurrentUsername = snapshot.AccountUsername;
         Account.CurrentNickname = snapshot.AccountNickname;
         accountStateKnown = true;
-        if (snapshot.ConnectionState == AgentConnectionState.ReauthenticationRequired)
-            Account.FormMode = AccountFormMode.Login;
         if (string.IsNullOrWhiteSpace(Account.PcName)) Account.PcName = snapshot.Identity.Name;
         ObservableCollectionDiff.Apply(Sessions.Sessions, snapshot.Sessions, item => item.SessionId);
         ObservableCollectionDiff.Apply(Devices.Devices, snapshot.Devices, item => item.DeviceId);
@@ -593,7 +621,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             : string.Join(", ", snapshot.Capabilities.Order(StringComparer.Ordinal));
         Diagnostics.LastError = string.IsNullOrWhiteSpace(snapshot.LastErrorCode)
             ? PresentationText.Pick("无", "None")
-            : snapshot.LastErrorCode + ": " + snapshot.LastErrorDetail;
+            : snapshot.LastErrorCode + ": " +
+                LocalizeFailure(snapshot.LastErrorCode, snapshot.LastErrorDetail).Detail;
         RaiseStatusProperties();
         RaiseAccountStateProperties();
     }
@@ -655,44 +684,27 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             cancellationToken).ConfigureAwait(false);
     }
 
-    private Task LoginAsync(CancellationToken cancellationToken)
+    private async Task BeginAccountAuthorizationAsync(CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(Account.Username) || string.IsNullOrWhiteSpace(Account.Password))
+        try
         {
-            ShowNotice(UiNoticeSeverity.Warning, PresentationText.SignInInputRequired,
-                PresentationText.Pick("请输入用户名和密码。", "Enter a username and password."));
-            return Task.CompletedTask;
+            ShowNotice(
+                UiNoticeSeverity.Info,
+                PresentationText.BrowserAuthorizationStarted,
+                PresentationText.BrowserAuthorizationStartedDetail);
+            await client.BeginAccountAuthorizationAsync(Account.PcName, cancellationToken).ConfigureAwait(false);
+            await stateStore.RefreshAsync(true, cancellationToken).ConfigureAwait(false);
+            await dispatcher.InvokeAsync(
+                () => ShowNotice(
+                    UiNoticeSeverity.Success,
+                    PresentationText.BrowserAuthorizationSucceeded,
+                    string.Empty),
+                cancellationToken);
         }
-        return MutateAsync(
-            token => client.LoginAsync(Account.Username.Trim(), Account.Password, Account.PcName.Trim(), token),
-            PresentationText.LoginSucceeded,
-            cancellationToken,
-            clearPasswords: true);
-    }
-
-    private Task RegisterAsync(CancellationToken cancellationToken)
-    {
-        if (string.IsNullOrWhiteSpace(Account.Username) || string.IsNullOrWhiteSpace(Account.Nickname) ||
-            string.IsNullOrWhiteSpace(Account.Email) ||
-            string.IsNullOrWhiteSpace(Account.Password) || Account.Password != Account.PasswordConfirmation)
+        catch (Exception error) when (error is not OperationCanceledException)
         {
-            ShowNotice(UiNoticeSeverity.Warning,
-                PresentationText.Pick("请检查注册信息", "Check registration details"),
-                PresentationText.Pick("用户名、昵称、邮箱和密码不能为空，两次密码必须一致。", "Username, nickname, email, and password are required, and passwords must match."));
-            return Task.CompletedTask;
+            await ShowFailureAsync(error);
         }
-        return MutateAsync(
-            token => client.RegisterAsync(
-                Account.Username.Trim(),
-                Account.Nickname.Trim(),
-                Account.Email.Trim(),
-                Account.Password,
-                Account.PasswordConfirmation,
-                Account.PcName.Trim(),
-                token),
-            PresentationText.RegistrationSucceeded,
-            cancellationToken,
-            clearPasswords: true);
     }
 
     private async Task SignOutAsync(CancellationToken cancellationToken)
@@ -702,7 +714,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 PresentationText.ConfirmSignOutTitle,
                 PresentationText.ConfirmSignOutDetail,
                 cancellationToken)) return;
-        await MutateAsync(client.SignOutAsync, PresentationText.SignedOut, cancellationToken, clearPasswords: true)
+        await MutateAsync(client.SignOutAsync, PresentationText.SignedOut, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -724,6 +736,44 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         catch (Exception error) when (error is not OperationCanceledException)
         {
             await ShowFailureAsync(error);
+        }
+    }
+
+    private async Task OpenTerminalIntegrationSettingsAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var settings = await RequireDesktopOperations()
+                .GetTerminalIntegrationSettingsAsync(cancellationToken)
+                .ConfigureAwait(false);
+            await dispatcher.InvokeAsync(() =>
+            {
+                Settings.TerminalAddNoLogo = settings.AddNoLogo;
+                Settings.TerminalAddNoProfile = settings.AddNoProfile;
+                Settings.CanConfigureTerminalIntegration = settings.CanConfigure;
+                Settings.TerminalIntegrationEditorOpen = true;
+            }, cancellationToken);
+        }
+        catch (Exception error) when (error is not OperationCanceledException)
+        {
+            await ShowFailureAsync(error);
+        }
+    }
+
+    private async Task SaveTerminalIntegrationSettingsAsync(CancellationToken cancellationToken)
+    {
+        if (!Settings.CanConfigureTerminalIntegration) return;
+        await RunDesktopOperationAsync(
+            token => RequireDesktopOperations().ConfigureTerminalIntegrationAsync(
+                Settings.TerminalAddNoLogo,
+                Settings.TerminalAddNoProfile,
+                token),
+            cancellationToken).ConfigureAwait(false);
+        if (NoticeSeverity == UiNoticeSeverity.Success)
+        {
+            await dispatcher.InvokeAsync(
+                () => Settings.TerminalIntegrationEditorOpen = false,
+                cancellationToken);
         }
     }
 
@@ -759,7 +809,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 ShowNotice(
                     severity,
                     PresentationText.UpdateStatus(status),
-                    status.Message ?? string.Empty);
+                    string.Empty);
             }, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -834,21 +884,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private async Task MutateAsync(
         Func<CancellationToken, ValueTask> mutation,
         string successMessage,
-        CancellationToken cancellationToken,
-        bool clearPasswords = false)
+        CancellationToken cancellationToken)
     {
         try
         {
             ShowNotice(UiNoticeSeverity.Info, PresentationText.Processing, string.Empty);
             await mutation(cancellationToken).ConfigureAwait(false);
-            if (clearPasswords)
-            {
-                await dispatcher.InvokeAsync(() =>
-                {
-                    Account.Password = string.Empty;
-                    Account.PasswordConfirmation = string.Empty;
-                }, cancellationToken);
-            }
             await stateStore.RefreshAsync(true, cancellationToken).ConfigureAwait(false);
             await dispatcher.InvokeAsync(
                 () => ShowNotice(UiNoticeSeverity.Success, successMessage, string.Empty),
@@ -1003,16 +1044,34 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         NoticeCode = code;
         OperationMessage = string.IsNullOrWhiteSpace(detail) ? title : $"{title}: {detail}";
         RaiseNoticeProperties();
+        var version = Interlocked.Increment(ref noticeVersion);
+        _ = DismissNoticeAfterDelayAsync(version);
     }
 
     private void ClearNotice()
     {
+        Interlocked.Increment(ref noticeVersion);
         NoticeSeverity = UiNoticeSeverity.None;
         NoticeTitle = string.Empty;
         NoticeDetail = string.Empty;
         NoticeCode = string.Empty;
         OperationMessage = string.Empty;
         RaiseNoticeProperties();
+    }
+
+    private async Task DismissNoticeAfterDelayAsync(long version)
+    {
+        try
+        {
+            await Task.Delay(noticeAutoDismissDelay, lifetimeCancellation.Token).ConfigureAwait(false);
+            await dispatcher.InvokeAsync(() =>
+            {
+                if (Volatile.Read(ref noticeVersion) == version) ClearNotice();
+            }, lifetimeCancellation.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (lifetimeCancellation.IsCancellationRequested)
+        {
+        }
     }
 
     private void RaiseNoticeProperties()
@@ -1032,12 +1091,15 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         RaisePropertyChanged(nameof(IsSettingsPageSelected));
         RaisePropertyChanged(nameof(IsAccountPageSelected));
         RaisePropertyChanged(nameof(IsDiagnosticsPageSelected));
+        RaisePropertyChanged(nameof(CurrentPageSubtitle));
     }
 
     private void RaiseStatusProperties()
     {
         RaisePropertyChanged(nameof(IsConnected));
         RaisePropertyChanged(nameof(IsConnectionBusy));
+        RaisePropertyChanged(nameof(IsServerDisconnected));
+        RaisePropertyChanged(nameof(ServerConnectionToolTip));
         RaisePropertyChanged(nameof(CanRetryConnection));
         RaisePropertyChanged(nameof(RequiresReauthentication));
         RaisePropertyChanged(nameof(CanEnableRemoteAccess));
@@ -1051,6 +1113,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         RaisePropertyChanged(nameof(HasDevices));
         RaisePropertyChanged(nameof(HasNoDevices));
         RaisePropertyChanged(nameof(AccountActionText));
+        RaisePropertyChanged(nameof(CurrentPageSubtitle));
     }
 
     private void RaiseAccountStateProperties()
@@ -1059,11 +1122,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         RaisePropertyChanged(nameof(IsAccountStateLoading));
         RaisePropertyChanged(nameof(IsAccountLinked));
         RaisePropertyChanged(nameof(IsAccountSignedOut));
-        RaisePropertyChanged(nameof(CanRegisterAccount));
         RaisePropertyChanged(nameof(AccountStateTitle));
         RaisePropertyChanged(nameof(AccountStateDetail));
-        RaisePropertyChanged(nameof(IsLoginMode));
-        RaisePropertyChanged(nameof(IsRegisterMode));
         RaisePropertyChanged(nameof(AccountActionText));
         RaisePropertyChanged(nameof(CanEnableRemoteAccess));
     }
@@ -1129,11 +1189,24 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     private static string ErrorCode(Exception error)
     {
+        if (error is AgentClientOperationException agentError) return agentError.Code;
+        if (error is FileNotFoundException) return "PC_AGENT_MISSING";
         if (error is UnauthorizedAccessException) return "ACCESS_DENIED";
         if (error is TimeoutException) return "TIMEOUT";
         if (error is IOException) return "CONNECTION_FAILED";
         var text = error.Message ?? string.Empty;
-        foreach (var code in new[] { "INVALID_REQUEST", "ACCESS_DENIED", "UNAUTHORIZED", "TIMEOUT", "CONNECTION_FAILED", "RELAY_DISCONNECTED" })
+        foreach (var code in new[]
+        {
+            "PRODUCTION_REQUEST_FAILED",
+            "PRODUCTION_REQUEST_CANCELLED",
+            "OPERATION_TIMEOUT",
+            "INVALID_REQUEST",
+            "ACCESS_DENIED",
+            "UNAUTHORIZED",
+            "TIMEOUT",
+            "CONNECTION_FAILED",
+            "RELAY_DISCONNECTED"
+        })
             if (text.Contains(code, StringComparison.OrdinalIgnoreCase)) return code;
         return error.GetType().Name;
     }
@@ -1146,19 +1219,23 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             "INVALID_REQUEST" => PresentationText.InvalidRequestDetail,
             "ACCESS_DENIED" or "UNAUTHORIZED" => PresentationText.AccessDeniedDetail,
-            "TIMEOUT" or "TIMEOUTEXCEPTION" or "TASKCANCELEDEXCEPTION" => PresentationText.TimeoutDetail,
-            "CONNECTION_FAILED" or "RELAY_DISCONNECTED" or "IOEXCEPTION" => PresentationText.ConnectionFailedDetail,
-            _ when !string.IsNullOrWhiteSpace(rawDetail) && !LooksLikeRawCode(rawDetail) => rawDetail.Trim(),
+            "TIMEOUT" or "TIMEOUTEXCEPTION" or "TASKCANCELEDEXCEPTION" or
+                "PRODUCTION_REQUEST_CANCELLED" or "OPERATION_TIMEOUT" => PresentationText.TimeoutDetail,
+            "CONNECTION_FAILED" or "RELAY_DISCONNECTED" or "IOEXCEPTION" or
+                "PRODUCTION_REQUEST_FAILED" => PresentationText.ConnectionFailedDetail,
+            "PC_AGENT_MISSING" or "PC-AGENT-MISSING" => PresentationText.AgentMissingDetail,
+            "PC_AGENT_START_FAILED" => PresentationText.AgentStartFailedDetail,
+            "PC_AGENT_STARTING_TIMEOUT" => PresentationText.AgentStartingTimeoutDetail,
+            "PC_AGENT_RESTART_TIMEOUT" => PresentationText.AgentRestartTimeoutDetail,
+            "PC_AGENT_EXITED" => PresentationText.AgentExitedDetail,
+            "PC_AGENT_EXITING" => PresentationText.AgentExitingDetail,
+            "PC_AGENT_PROCESSES_STILL_RUNNING" => PresentationText.AgentProcessesStillRunningDetail,
+            "PC-AGENT-IPC-UNAVAILABLE" or "PC-AGENT-IPC-AUTHENTICATION" or
+                "PC-AGENT-CREDENTIAL-ERROR" or "PC-AGENT-ACCESS-DENIED" or
+                "PC-AGENT-TIMEOUT" or "PC-AGENT-UNAVAILABLE" => PresentationText.ConnectionFailedDetail,
             _ => PresentationText.UnexpectedFailureDetail,
         };
         return (string.IsNullOrWhiteSpace(code) ? "UNEXPECTED" : code, detail);
-    }
-
-    private static bool LooksLikeRawCode(string value)
-    {
-        var trimmed = value.Trim();
-        return trimmed.Length > 2 && trimmed.All(character =>
-            char.IsUpper(character) || char.IsDigit(character) || character is '_' or '-' or ':' or ' ');
     }
 
     public async ValueTask DisposeAsync()

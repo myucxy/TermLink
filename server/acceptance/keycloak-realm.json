@@ -135,6 +135,7 @@
       "publicClient": true,
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": true,
+      "baseUrl": "https://termlink.kget.cc:8910",
       "redirectUris": ["http://127.0.0.1:43971/oauth2/callback"],
       "webOrigins": [],
       "attributes": {

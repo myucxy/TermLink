@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/kv"
 	"github.com/termlink/termlink/server/internal/realtimewire"
@@ -191,6 +192,33 @@ func TestAndroidControlMessagePermissionPolicy(t *testing.T) {
 	}
 }
 
+func TestExpectedControlRouteDenialsDoNotCloseAuthenticatedPeer(t *testing.T) {
+	for _, class := range []string{
+		"control_lease_inactive",
+		"control_lease_holder_mismatch",
+		"pc_connection_unavailable",
+	} {
+		t.Run(class, func(t *testing.T) {
+			if routeDenialIsFatal(denyRoute(class, store.ErrDenied)) {
+				t.Fatalf("route denial %q unexpectedly closes the device connection", class)
+			}
+		})
+	}
+}
+
+func TestProtocolAndAuthorizationRouteDenialsRemainFatal(t *testing.T) {
+	for _, err := range []error{
+		denyRoute("recipient_mismatch", store.ErrDenied),
+		denyRoute("route_permission_denied", store.ErrDenied),
+		denyRoute("sender_connection_replaced", store.ErrDenied),
+		store.ErrDenied,
+	} {
+		if !routeDenialIsFatal(err) {
+			t.Fatalf("security-sensitive route denial %q did not close the connection", routeDenialClass(err))
+		}
+	}
+}
+
 func TestReplacedPeerCannotRemoveReplacementSubscription(t *testing.T) {
 	observer := &subscriptionObserver{}
 	hub := NewHubWithObserver(nil, nil, nil, observer)
@@ -241,6 +269,7 @@ func TestPCPeerRejectsSameSequenceCiphertextReplacement(t *testing.T) {
 	peer.role = "pc"
 	sessionID := uuid.New()
 	recipientID := uuid.New()
+	peer.beginPCReplayEpoch(sessionID, recipientID, 41)
 	first := []byte("opaque-frame-a")
 	if !peer.acceptPCSequence(sessionID, recipientID, 42, first) {
 		t.Fatal("initial PC frame was rejected")
@@ -251,7 +280,9 @@ func TestPCPeerRejectsSameSequenceCiphertextReplacement(t *testing.T) {
 	if peer.acceptPCSequence(sessionID, recipientID, 42, []byte("opaque-frame-b")) {
 		t.Fatal("same-sequence ciphertext replacement was accepted")
 	}
-	if !peer.acceptPCSequence(sessionID, uuid.New(), 42, []byte("opaque-frame-b")) {
+	independentRecipient := uuid.New()
+	peer.beginPCReplayEpoch(sessionID, independentRecipient, 41)
+	if !peer.acceptPCSequence(sessionID, independentRecipient, 42, []byte("opaque-frame-b")) {
 		t.Fatal("same logical sequence for an independent recipient was rejected")
 	}
 }
@@ -268,6 +299,7 @@ func TestPCPeerAcceptsOrderedReplayBeyondDigestWindowAfterVisibleSubscribeACK(t 
 	android.principal.UserID = userID
 	hub.peers[pcID] = pc
 	hub.peers[androidID] = android
+	hub.subscribe(android, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
 
 	for sequence := uint64(1); sequence <= maxPCReplayFrames+256; sequence++ {
 		if !pc.acceptPCSequence(sessionID, androidID, sequence, replayTestFrame(sequence)) {
@@ -321,6 +353,7 @@ func TestPCReplayDigestEvictionIsIsolatedByRecipientAndSession(t *testing.T) {
 		{name: "session", sessionID: otherSession, recipientID: busyRecipient, frame: []byte("session-frame")},
 	}
 	for _, route := range protected {
+		pc.beginPCReplayEpoch(route.sessionID, route.recipientID, 6)
 		if !pc.acceptPCSequence(route.sessionID, route.recipientID, 7, route.frame) {
 			t.Fatalf("initial %s route frame was rejected", route.name)
 		}
@@ -350,6 +383,24 @@ func TestPCReplayDigestEvictionIsIsolatedByRecipientAndSession(t *testing.T) {
 
 func replayTestFrame(sequence uint64) []byte {
 	return []byte(fmt.Sprintf("opaque-frame-%d", sequence))
+}
+
+func pcRouteHighWater(pc *peer, sessionID, recipientID uuid.UUID) uint64 {
+	pc.pcReplayMu.Lock()
+	defer pc.pcReplayMu.Unlock()
+	state := pc.pcReplayRoutes[pcRouteKey{sessionID: sessionID, recipientID: recipientID}]
+	if state == nil {
+		return 0
+	}
+	return state.highWater
+}
+
+func liveReservationOwner(hub *Hub, identity *peer, sessionID uuid.UUID) *peer {
+	key := reservationKey(identity, sessionID)
+	shard := hub.reservationShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	return shard.owners[key]
 }
 
 func TestAndroidPeerRejectsReplayedInputSequence(t *testing.T) {
@@ -405,6 +456,959 @@ func TestPCOutputUsesValidatedSubscriptionWithoutAuthorityQuery(t *testing.T) {
 		}
 	default:
 		t.Fatal("validated subscriber did not receive PC output")
+	}
+}
+
+func TestPCRouteDoesNotCommitWhenSubscriberIsUnavailable(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	pc := testPeer(hub, pcID)
+	pc.role = "pc"
+	pc.principal.UserID = userID
+	hub.peers[pcID] = pc
+	pc.beginPCReplayEpoch(sessionID, androidID, 305)
+
+	envelope := realtimewire.Envelope{
+		RecipientDeviceID: androidID[:],
+		MessageType:       realtimewire.OutputChunk,
+		Sequence:          306,
+	}
+	err := pc.routePCFrame(envelope, sessionID, androidID, []byte("output-306"))
+	if got := routeDenialClass(err); got != "subscriber_unavailable" {
+		t.Fatalf("route denial = %q (%v), want subscriber_unavailable", got, err)
+	}
+	if got := pcRouteHighWater(pc, sessionID, androidID); got != 305 {
+		t.Fatalf("failed route high-water = %d, want 305", got)
+	}
+}
+
+func TestPCRouteCommitsOnlyAfterCurrentSubscriberEnqueue(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+	hub.subscribe(android, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
+	pc.beginPCReplayEpoch(sessionID, androidID, 305)
+
+	envelope := realtimewire.Envelope{
+		RecipientDeviceID: androidID[:],
+		MessageType:       realtimewire.OutputChunk,
+		Sequence:          306,
+	}
+	frame := []byte("output-306")
+	if err := pc.routePCFrame(envelope, sessionID, androidID, frame); err != nil {
+		t.Fatalf("route current subscriber: %v", err)
+	}
+	if got := pcRouteHighWater(pc, sessionID, androidID); got != 306 {
+		t.Fatalf("successful route high-water = %d, want 306", got)
+	}
+	select {
+	case received := <-android.send:
+		if string(received) != string(frame) {
+			t.Fatalf("queued frame = %q, want %q", received, frame)
+		}
+	default:
+		t.Fatal("success was recorded before the frame entered the subscriber queue")
+	}
+}
+
+func TestPCRouteDoesNotCommitForClosedOrReplacedSubscriber(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		prepare func(*Hub, *peer, uuid.UUID)
+		want    string
+	}{
+		{
+			name: "closed enqueue",
+			prepare: func(_ *Hub, android *peer, _ uuid.UUID) {
+				android.close(websocket.CloseNormalClosure, "test target closed")
+			},
+			want: "subscriber_enqueue_failed",
+		},
+		{
+			name: "android replacement",
+			prepare: func(hub *Hub, _ *peer, androidID uuid.UUID) {
+				replacement := testPeer(hub, androidID)
+				replacement.role = "android"
+				hub.peers[androidID] = replacement
+			},
+			want: "subscriber_replaced",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hub := NewHubWithObserver(nil, nil, nil, nil)
+			userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+			android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+			hub.subscribe(android, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
+			pc.beginPCReplayEpoch(sessionID, androidID, 305)
+			test.prepare(hub, android, androidID)
+
+			envelope := realtimewire.Envelope{
+				RecipientDeviceID: androidID[:],
+				MessageType:       realtimewire.OutputChunk,
+				Sequence:          306,
+			}
+			err := pc.routePCFrame(envelope, sessionID, androidID, []byte("output-306"))
+			if got := routeDenialClass(err); got != test.want {
+				t.Fatalf("route denial = %q (%v), want %q", got, err, test.want)
+			}
+			if got := pcRouteHighWater(pc, sessionID, androidID); got != 305 {
+				t.Fatalf("failed route high-water = %d, want 305", got)
+			}
+		})
+	}
+}
+
+func TestReplacementPCAppliesACKAndRequiresContinuousOutput(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	android, replacement := activeRoutePeers(hub, userID, androidID, pcID)
+	hub.subscribe(android, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
+	replacement.beginPCReplayEpoch(sessionID, androidID, 305)
+
+	envelope := realtimewire.Envelope{RecipientDeviceID: androidID[:], MessageType: realtimewire.OutputChunk, Sequence: 307}
+	if err := replacement.routePCFrame(envelope, sessionID, androidID, []byte("output-307")); !errors.Is(err, errPCSequenceRejected) {
+		t.Fatalf("ACK+2 route error = %v, want sequence rejection", err)
+	}
+	if got := pcRouteHighWater(replacement, sessionID, androidID); got != 305 {
+		t.Fatalf("ACK+2 changed high-water to %d, want 305", got)
+	}
+
+	envelope.Sequence = 306
+	if err := replacement.routePCFrame(envelope, sessionID, androidID, []byte("output-306")); err != nil {
+		t.Fatalf("ACK+1 route: %v", err)
+	}
+	envelope.Sequence = 307
+	if err := replacement.routePCFrame(envelope, sessionID, androidID, []byte("output-307")); err != nil {
+		t.Fatalf("continuous ACK+2 route: %v", err)
+	}
+	if got := pcRouteHighWater(replacement, sessionID, androidID); got != 307 {
+		t.Fatalf("continuous route high-water = %d, want 307", got)
+	}
+	for _, want := range []string{"output-306", "output-307"} {
+		select {
+		case received := <-android.send:
+			if string(received) != want {
+				t.Fatalf("queued frame = %q, want %q", received, want)
+			}
+		default:
+			t.Fatalf("missing queued frame %q", want)
+		}
+	}
+}
+
+func TestExplicitGapIsOnlyForwardSequenceJumpException(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+	hub.subscribe(android, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
+	pc.beginPCReplayEpoch(sessionID, androidID, 305)
+
+	envelope := realtimewire.Envelope{RecipientDeviceID: androidID[:], MessageType: realtimewire.OutputChunk, Sequence: 309}
+	if err := pc.routePCFrame(envelope, sessionID, androidID, []byte("skipped-output")); !errors.Is(err, errPCSequenceRejected) {
+		t.Fatalf("ordinary sequence jump error = %v, want sequence rejection", err)
+	}
+	envelope.MessageType = realtimewire.Gap
+	if err := pc.routePCFrame(envelope, sessionID, androidID, []byte("explicit-gap")); err != nil {
+		t.Fatalf("explicit Gap route: %v", err)
+	}
+	if got := pcRouteHighWater(pc, sessionID, androidID); got != 309 {
+		t.Fatalf("Gap route high-water = %d, want 309", got)
+	}
+}
+
+func TestGapCannotReplaceAcceptedCiphertextAtSameSequence(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+	hub.subscribe(android, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
+
+	envelope := realtimewire.Envelope{RecipientDeviceID: androidID[:], MessageType: realtimewire.OutputChunk, Sequence: 1}
+	if err := pc.routePCFrame(envelope, sessionID, androidID, []byte("original-output")); err != nil {
+		t.Fatalf("original route: %v", err)
+	}
+	<-android.send
+	pc.beginPCReplayEpoch(sessionID, androidID, 0)
+	envelope.MessageType = realtimewire.Gap
+	if err := pc.routePCFrame(envelope, sessionID, androidID, []byte("different-gap-ciphertext")); !errors.Is(err, errPCSequenceRejected) {
+		t.Fatalf("same-sequence Gap replacement error = %v, want sequence rejection", err)
+	}
+	if got := pcRouteHighWater(pc, sessionID, androidID); got != 1 {
+		t.Fatalf("rejected Gap changed high-water to %d, want 1", got)
+	}
+}
+
+func TestSubscriptionActivationFencesConcurrentACKPlusTwo(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+	pc.send = make(chan []byte, 1)
+	prefill := []byte("queued-before-subscribe")
+	if !pc.enqueue(prefill) {
+		t.Fatal("failed to prefill PC queue")
+	}
+	pc.pcReplayMu.Lock()
+	pc.pcReplayRoute(pcRouteKey{sessionID: sessionID, recipientID: androidID}).highWater = 306
+	pc.pcReplayMu.Unlock()
+
+	subscribeFrame := []byte("subscribe-ack-305")
+	activationDone := make(chan error, 1)
+	go func() {
+		activationDone <- hub.activateSubscription(
+			android,
+			sessionID,
+			store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID},
+			305,
+			subscribeFrame,
+		)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		hub.mu.RLock()
+		published := hub.subscriptions[sessionID][androidID] == android && android.subscriptionACKs[sessionID] == 305
+		hub.mu.RUnlock()
+		if published && pc.queuedBytes.Load() >= int64(len(prefill)+len(subscribeFrame)) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("subscription activation did not reach its blocked enqueue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	routeDone := make(chan error, 1)
+	go func() {
+		envelope := realtimewire.Envelope{RecipientDeviceID: androidID[:], MessageType: realtimewire.OutputChunk, Sequence: 307}
+		routeDone <- pc.routePCFrame(envelope, sessionID, androidID, []byte("output-307"))
+	}()
+	queued := <-pc.send
+	pc.releaseQueueBytes(int64(len(queued)))
+	if string(queued) != string(prefill) {
+		t.Fatalf("prefill frame = %q, want %q", queued, prefill)
+	}
+	if err := <-activationDone; err != nil {
+		t.Fatalf("activate subscription: %v", err)
+	}
+	if err := <-routeDone; !errors.Is(err, errPCSequenceRejected) {
+		t.Fatalf("concurrent ACK+2 route error = %v, want sequence rejection", err)
+	}
+	if got := pcRouteHighWater(pc, sessionID, androidID); got != 306 {
+		t.Fatalf("concurrent ACK+2 changed high-water to %d, want 306", got)
+	}
+	queued = <-pc.send
+	pc.releaseQueueBytes(int64(len(queued)))
+	if string(queued) != string(subscribeFrame) {
+		t.Fatalf("queued subscription = %q, want %q", queued, subscribeFrame)
+	}
+}
+
+func TestPCRouteDoesNotCommitWhenSenderIsReplacedDuringEnqueue(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+	android.send = make(chan []byte, 1)
+	hub.subscribe(android, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
+	pc.beginPCReplayEpoch(sessionID, androidID, 305)
+	prefill := []byte("queued-before-output")
+	if !android.enqueue(prefill) {
+		t.Fatal("failed to prefill Android queue")
+	}
+	frame := []byte("output-306")
+	routeDone := make(chan error, 1)
+	go func() {
+		envelope := realtimewire.Envelope{RecipientDeviceID: androidID[:], MessageType: realtimewire.OutputChunk, Sequence: 306}
+		routeDone <- pc.routePCFrame(envelope, sessionID, androidID, frame)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for pcBytes := int64(len(prefill) + len(frame)); android.queuedBytes.Load() < pcBytes; {
+		if time.Now().After(deadline) {
+			t.Fatal("PC route did not block in subscriber enqueue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	replacement := testPeer(hub, pcID)
+	replacement.role = "pc"
+	replacement.principal.UserID = userID
+	if !hub.add(replacement) {
+		t.Fatal("failed to install replacement PC")
+	}
+	queued := <-android.send
+	android.releaseQueueBytes(int64(len(queued)))
+	if string(queued) != string(prefill) {
+		t.Fatalf("prefill frame = %q, want %q", queued, prefill)
+	}
+	err := <-routeDone
+	if got := routeDenialClass(err); got != "subscriber_replaced" {
+		t.Fatalf("old PC route denial = %q (%v), want subscriber_replaced", got, err)
+	}
+	if got := pcRouteHighWater(pc, sessionID, androidID); got != 305 {
+		t.Fatalf("replaced PC committed high-water %d, want 305", got)
+	}
+	queued = <-android.send
+	android.releaseQueueBytes(int64(len(queued)))
+	if string(queued) != string(frame) {
+		t.Fatalf("enqueued output = %q, want %q", queued, frame)
+	}
+}
+
+func TestOldSubscribeCleanupCannotReleaseReplacementReservation(t *testing.T) {
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.leases = leasing
+	userID, deviceID, pcID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	oldAndroid := testPeer(hub, deviceID)
+	oldAndroid.role = "android"
+	oldAndroid.principal.UserID = userID
+	if !hub.add(oldAndroid) {
+		t.Fatal("failed to add old Android")
+	}
+	if err := hub.reserveLiveSession(context.Background(), oldAndroid, sessionID); err != nil {
+		t.Fatalf("old reserve: %v", err)
+	}
+
+	replacement := testPeer(hub, deviceID)
+	replacement.role = "android"
+	replacement.principal.UserID = userID
+	if !hub.add(replacement) {
+		t.Fatal("failed to add replacement Android")
+	}
+	if err := hub.reserveLiveSession(context.Background(), replacement, sessionID); err != nil {
+		t.Fatalf("replacement reserve: %v", err)
+	}
+	route := store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID}
+	if err := hub.activateSubscription(replacement, sessionID, route, 305, []byte("replacement-subscribe")); err != nil {
+		t.Fatalf("replacement activate: %v", err)
+	}
+
+	if err := hub.activateSubscription(oldAndroid, sessionID, route, 305, []byte("old-subscribe")); routeDenialClass(err) != "subscription_reservation_replaced" {
+		t.Fatalf("old activation error = %v, want reservation generation rejection", err)
+	}
+	// This is the failed SUBSCRIBE cleanup path in route(). It must not call
+	// the identity-scoped backend release after ownership moved to replacement.
+	hub.releaseLiveSession(context.Background(), oldAndroid, sessionID)
+	if !leasing.reservationActive(userID, sessionID, deviceID) {
+		t.Fatal("old cleanup deleted replacement reservation")
+	}
+	if got := leasing.releaseCalls(); got != 0 {
+		t.Fatalf("backend releases = %d, want 0", got)
+	}
+}
+
+func TestStaleSingleReserveCannotTouchReplacementReservation(t *testing.T) {
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.leases = leasing
+	userID, deviceID, sessionID := uuid.New(), uuid.New(), uuid.New()
+	oldAndroid := testPeer(hub, deviceID)
+	oldAndroid.role = "android"
+	oldAndroid.principal.UserID = userID
+	if !hub.add(oldAndroid) {
+		t.Fatal("failed to add old Android")
+	}
+	replacement := testPeer(hub, deviceID)
+	replacement.role = "android"
+	replacement.principal.UserID = userID
+	if !hub.add(replacement) {
+		t.Fatal("failed to add replacement Android")
+	}
+	if err := hub.reserveLiveSession(context.Background(), replacement, sessionID); err != nil {
+		t.Fatalf("replacement reserve: %v", err)
+	}
+	reservesBefore, releasesBefore := leasing.reserveCalls(), leasing.releaseCalls()
+
+	if err := hub.reserveLiveSession(context.Background(), oldAndroid, sessionID); !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("stale reserve error = %v, want ErrDenied", err)
+	}
+	if got := leasing.reserveCalls(); got != reservesBefore {
+		t.Fatalf("stale peer called backend reserve: got %d, want %d", got, reservesBefore)
+	}
+	if got := leasing.releaseCalls(); got != releasesBefore {
+		t.Fatalf("stale peer called backend release: got %d, want %d", got, releasesBefore)
+	}
+	if !leasing.reservationActive(userID, sessionID, deviceID) {
+		t.Fatal("stale reserve deleted replacement reservation")
+	}
+}
+
+func TestStaleBatchReserveCannotTouchReplacementReservations(t *testing.T) {
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.leases = leasing
+	userID, deviceID := uuid.New(), uuid.New()
+	sessionIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+	oldAndroid := testPeer(hub, deviceID)
+	oldAndroid.role = "android"
+	oldAndroid.principal.UserID = userID
+	if !hub.add(oldAndroid) {
+		t.Fatal("failed to add old Android")
+	}
+	replacement := testPeer(hub, deviceID)
+	replacement.role = "android"
+	replacement.principal.UserID = userID
+	if !hub.add(replacement) {
+		t.Fatal("failed to add replacement Android")
+	}
+	if err := hub.reserveLiveSessions(context.Background(), replacement, sessionIDs, leasing); err != nil {
+		t.Fatalf("replacement batch reserve: %v", err)
+	}
+	reservesBefore, batchesBefore, releasesBefore := leasing.reserveCalls(), leasing.reserveBatchCalls(), leasing.releaseCalls()
+
+	if err := hub.reserveLiveSessions(context.Background(), oldAndroid, sessionIDs, leasing); !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("stale batch reserve error = %v, want ErrDenied", err)
+	}
+	if got := leasing.reserveCalls(); got != reservesBefore {
+		t.Fatalf("stale peer changed backend reserve count: got %d, want %d", got, reservesBefore)
+	}
+	if got := leasing.reserveBatchCalls(); got != batchesBefore {
+		t.Fatalf("stale peer called backend batch reserve: got %d, want %d", got, batchesBefore)
+	}
+	if got := leasing.releaseCalls(); got != releasesBefore {
+		t.Fatalf("stale peer called backend release: got %d, want %d", got, releasesBefore)
+	}
+	for _, sessionID := range sessionIDs {
+		if !leasing.reservationActive(userID, sessionID, deviceID) {
+			t.Fatalf("stale batch deleted replacement reservation for session %s", sessionID)
+		}
+	}
+}
+
+func TestSingleReserveReplacementDuringIOClearsOnlyStaleOwner(t *testing.T) {
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.leases = leasing
+	userID, deviceID, pcID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	oldAndroid := testPeer(hub, deviceID)
+	oldAndroid.role = "android"
+	oldAndroid.principal.UserID = userID
+	if !hub.add(oldAndroid) {
+		t.Fatal("failed to add old Android")
+	}
+	if err := hub.reserveLiveSession(context.Background(), oldAndroid, sessionID); err != nil {
+		t.Fatalf("initial old reserve: %v", err)
+	}
+	hub.subscribe(oldAndroid, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
+
+	reserveStarted, resumeReserve := leasing.blockNextReserve()
+	reserveDone := make(chan error, 1)
+	go func() {
+		reserveDone <- hub.reserveLiveSession(context.Background(), oldAndroid, sessionID)
+	}()
+	select {
+	case <-reserveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("old reserve did not enter backend")
+	}
+	replacement := testPeer(hub, deviceID)
+	replacement.role = "android"
+	replacement.principal.UserID = userID
+	if !hub.add(replacement) {
+		t.Fatal("failed to add replacement Android during reserve I/O")
+	}
+	close(resumeReserve)
+	if err := <-reserveDone; !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("old post-check error = %v, want ErrDenied", err)
+	}
+	leasing.clearReserveBlock()
+
+	if leasing.reservationActive(userID, sessionID, deviceID) {
+		t.Fatal("stale post-check left backend member active")
+	}
+	if owner := liveReservationOwner(hub, oldAndroid, sessionID); owner != nil {
+		t.Fatalf("stale post-check retained owner %p, want nil", owner)
+	}
+	if got := leasing.releaseCalls(); got != 1 {
+		t.Fatalf("stale post-check releases = %d, want 1", got)
+	}
+
+	if err := hub.reserveLiveSession(context.Background(), replacement, sessionID); err != nil {
+		t.Fatalf("replacement reserve after cleanup: %v", err)
+	}
+	if err := hub.activateSubscription(
+		replacement,
+		sessionID,
+		store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID},
+		0,
+		[]byte("replacement-subscribe"),
+	); err != nil {
+		t.Fatalf("replacement activation after cleanup: %v", err)
+	}
+	if owner := liveReservationOwner(hub, replacement, sessionID); owner != replacement {
+		t.Fatalf("replacement owner = %p, want %p", owner, replacement)
+	}
+	hub.remove(oldAndroid)
+	if got := leasing.releaseCalls(); got != 1 {
+		t.Fatalf("old remove repeated backend release: got %d, want 1", got)
+	}
+	if !leasing.reservationActive(userID, sessionID, deviceID) {
+		t.Fatal("old remove deleted replacement backend member")
+	}
+}
+
+func TestBatchReserveReplacementDuringIOClearsOnlyStaleOwners(t *testing.T) {
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.leases = leasing
+	userID, deviceID, pcID := uuid.New(), uuid.New(), uuid.New()
+	sessionIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+	oldAndroid := testPeer(hub, deviceID)
+	oldAndroid.role = "android"
+	oldAndroid.principal.UserID = userID
+	if !hub.add(oldAndroid) {
+		t.Fatal("failed to add old Android")
+	}
+	if err := hub.reserveLiveSessions(context.Background(), oldAndroid, sessionIDs, leasing); err != nil {
+		t.Fatalf("initial old batch reserve: %v", err)
+	}
+	for _, sessionID := range sessionIDs {
+		hub.subscribe(oldAndroid, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
+	}
+
+	reserveStarted, resumeReserve := leasing.blockNextReserve()
+	reserveDone := make(chan error, 1)
+	go func() {
+		reserveDone <- hub.reserveLiveSessions(context.Background(), oldAndroid, sessionIDs, leasing)
+	}()
+	select {
+	case <-reserveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("old batch reserve did not enter backend")
+	}
+	replacement := testPeer(hub, deviceID)
+	replacement.role = "android"
+	replacement.principal.UserID = userID
+	if !hub.add(replacement) {
+		t.Fatal("failed to add replacement Android during batch I/O")
+	}
+	close(resumeReserve)
+	if err := <-reserveDone; !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("old batch post-check error = %v, want ErrDenied", err)
+	}
+	leasing.clearReserveBlock()
+
+	if got := leasing.releaseCalls(); got != len(sessionIDs) {
+		t.Fatalf("batch post-check releases = %d, want %d", got, len(sessionIDs))
+	}
+	for _, sessionID := range sessionIDs {
+		if leasing.reservationActive(userID, sessionID, deviceID) {
+			t.Fatalf("batch post-check left backend member active for %s", sessionID)
+		}
+		if owner := liveReservationOwner(hub, oldAndroid, sessionID); owner != nil {
+			t.Fatalf("batch post-check retained owner %p for %s", owner, sessionID)
+		}
+	}
+
+	if err := hub.reserveLiveSessions(context.Background(), replacement, sessionIDs, leasing); err != nil {
+		t.Fatalf("replacement batch reserve after cleanup: %v", err)
+	}
+	for _, sessionID := range sessionIDs {
+		if err := hub.activateSubscription(
+			replacement,
+			sessionID,
+			store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID},
+			0,
+			[]byte("replacement-subscribe"),
+		); err != nil {
+			t.Fatalf("replacement activation for %s: %v", sessionID, err)
+		}
+		if owner := liveReservationOwner(hub, replacement, sessionID); owner != replacement {
+			t.Fatalf("replacement owner = %p, want %p for %s", owner, replacement, sessionID)
+		}
+	}
+	hub.remove(oldAndroid)
+	if got := leasing.releaseCalls(); got != len(sessionIDs) {
+		t.Fatalf("old remove repeated batch releases: got %d, want %d", got, len(sessionIDs))
+	}
+	for _, sessionID := range sessionIDs {
+		if !leasing.reservationActive(userID, sessionID, deviceID) {
+			t.Fatalf("old remove deleted replacement member for %s", sessionID)
+		}
+	}
+}
+
+func TestThreeGenerationSingleReserveClearsOriginalOwner(t *testing.T) {
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.leases = leasing
+	userID, deviceID, pcID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	oldOwner := testPeer(hub, deviceID)
+	oldOwner.role = "android"
+	oldOwner.principal.UserID = userID
+	if !hub.add(oldOwner) {
+		t.Fatal("failed to add original owner O")
+	}
+	if err := hub.reserveLiveSession(context.Background(), oldOwner, sessionID); err != nil {
+		t.Fatalf("original owner reserve: %v", err)
+	}
+	hub.subscribe(oldOwner, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
+
+	reserving := testPeer(hub, deviceID)
+	reserving.role = "android"
+	reserving.principal.UserID = userID
+	if !hub.add(reserving) {
+		t.Fatal("failed to replace O with reserving generation R")
+	}
+	reserveStarted, resumeReserve := leasing.blockNextReserve()
+	reserveDone := make(chan error, 1)
+	go func() {
+		reserveDone <- hub.reserveLiveSession(context.Background(), reserving, sessionID)
+	}()
+	select {
+	case <-reserveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("R did not enter backend reserve")
+	}
+	latest := testPeer(hub, deviceID)
+	latest.role = "android"
+	latest.principal.UserID = userID
+	if !hub.add(latest) {
+		t.Fatal("failed to replace R with latest generation Q")
+	}
+	close(resumeReserve)
+	if err := <-reserveDone; !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("R post-check error = %v, want ErrDenied", err)
+	}
+	leasing.clearReserveBlock()
+
+	if leasing.reservationActive(userID, sessionID, deviceID) {
+		t.Fatal("R rollback left backend member active")
+	}
+	if owner := liveReservationOwner(hub, oldOwner, sessionID); owner != nil {
+		t.Fatalf("R rollback retained stale O owner %p", owner)
+	}
+	if got := leasing.releaseCalls(); got != 1 {
+		t.Fatalf("R rollback releases = %d, want 1", got)
+	}
+
+	if err := hub.reserveLiveSession(context.Background(), latest, sessionID); err != nil {
+		t.Fatalf("Q reserve after R rollback: %v", err)
+	}
+	if err := hub.activateSubscription(
+		latest,
+		sessionID,
+		store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID},
+		0,
+		[]byte("q-subscribe"),
+	); err != nil {
+		t.Fatalf("Q activation: %v", err)
+	}
+	hub.releaseLiveSession(context.Background(), oldOwner, sessionID)
+	hub.releaseLiveSession(context.Background(), reserving, sessionID)
+	hub.remove(oldOwner)
+	hub.remove(reserving)
+	if got := leasing.releaseCalls(); got != 1 {
+		t.Fatalf("O/R cleanup released Q member: got %d releases, want 1", got)
+	}
+	if !leasing.reservationActive(userID, sessionID, deviceID) {
+		t.Fatal("O/R cleanup deleted Q backend member")
+	}
+	if owner := liveReservationOwner(hub, latest, sessionID); owner != latest {
+		t.Fatalf("owner after O/R cleanup = %p, want Q %p", owner, latest)
+	}
+}
+
+func TestThreeGenerationBatchReserveClearsOriginalOwners(t *testing.T) {
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.leases = leasing
+	userID, deviceID, pcID := uuid.New(), uuid.New(), uuid.New()
+	sessionIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+	oldOwner := testPeer(hub, deviceID)
+	oldOwner.role = "android"
+	oldOwner.principal.UserID = userID
+	if !hub.add(oldOwner) {
+		t.Fatal("failed to add original owner O")
+	}
+	if err := hub.reserveLiveSessions(context.Background(), oldOwner, sessionIDs, leasing); err != nil {
+		t.Fatalf("original owner batch reserve: %v", err)
+	}
+	for _, sessionID := range sessionIDs {
+		hub.subscribe(oldOwner, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
+	}
+
+	reserving := testPeer(hub, deviceID)
+	reserving.role = "android"
+	reserving.principal.UserID = userID
+	if !hub.add(reserving) {
+		t.Fatal("failed to replace O with reserving generation R")
+	}
+	reserveStarted, resumeReserve := leasing.blockNextReserve()
+	reserveDone := make(chan error, 1)
+	go func() {
+		reserveDone <- hub.reserveLiveSessions(context.Background(), reserving, sessionIDs, leasing)
+	}()
+	select {
+	case <-reserveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("R did not enter backend batch reserve")
+	}
+	latest := testPeer(hub, deviceID)
+	latest.role = "android"
+	latest.principal.UserID = userID
+	if !hub.add(latest) {
+		t.Fatal("failed to replace R with latest generation Q")
+	}
+	close(resumeReserve)
+	if err := <-reserveDone; !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("R batch post-check error = %v, want ErrDenied", err)
+	}
+	leasing.clearReserveBlock()
+
+	if got := leasing.releaseCalls(); got != len(sessionIDs) {
+		t.Fatalf("R batch rollback releases = %d, want %d", got, len(sessionIDs))
+	}
+	for _, sessionID := range sessionIDs {
+		if leasing.reservationActive(userID, sessionID, deviceID) {
+			t.Fatalf("R rollback left backend member active for %s", sessionID)
+		}
+		if owner := liveReservationOwner(hub, oldOwner, sessionID); owner != nil {
+			t.Fatalf("R rollback retained stale O owner %p for %s", owner, sessionID)
+		}
+	}
+
+	if err := hub.reserveLiveSessions(context.Background(), latest, sessionIDs, leasing); err != nil {
+		t.Fatalf("Q batch reserve after R rollback: %v", err)
+	}
+	for _, sessionID := range sessionIDs {
+		if err := hub.activateSubscription(
+			latest,
+			sessionID,
+			store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID},
+			0,
+			[]byte("q-subscribe"),
+		); err != nil {
+			t.Fatalf("Q activation for %s: %v", sessionID, err)
+		}
+		hub.releaseLiveSession(context.Background(), oldOwner, sessionID)
+		hub.releaseLiveSession(context.Background(), reserving, sessionID)
+	}
+	hub.remove(oldOwner)
+	hub.remove(reserving)
+	if got := leasing.releaseCalls(); got != len(sessionIDs) {
+		t.Fatalf("O/R cleanup released Q members: got %d, want %d", got, len(sessionIDs))
+	}
+	for _, sessionID := range sessionIDs {
+		if !leasing.reservationActive(userID, sessionID, deviceID) {
+			t.Fatalf("O/R cleanup deleted Q member for %s", sessionID)
+		}
+		if owner := liveReservationOwner(hub, latest, sessionID); owner != latest {
+			t.Fatalf("owner after O/R cleanup = %p, want Q %p for %s", owner, latest, sessionID)
+		}
+	}
+}
+
+func TestOldRemoveCannotRaceReplacementReserveAndReleaseIt(t *testing.T) {
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.leases = leasing
+	userID, deviceID, pcID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	oldAndroid := testPeer(hub, deviceID)
+	oldAndroid.role = "android"
+	oldAndroid.principal.UserID = userID
+	if !hub.add(oldAndroid) {
+		t.Fatal("failed to add old Android")
+	}
+	if err := hub.reserveLiveSession(context.Background(), oldAndroid, sessionID); err != nil {
+		t.Fatalf("old reserve: %v", err)
+	}
+	hub.subscribe(oldAndroid, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
+
+	replacement := testPeer(hub, deviceID)
+	replacement.role = "android"
+	replacement.principal.UserID = userID
+	if !hub.add(replacement) {
+		t.Fatal("failed to add replacement Android")
+	}
+	reserveStarted, resumeReserve := leasing.blockNextReserve()
+	reserveDone := make(chan error, 1)
+	go func() {
+		reserveDone <- hub.reserveLiveSession(context.Background(), replacement, sessionID)
+	}()
+	select {
+	case <-reserveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("replacement reserve did not enter backend")
+	}
+
+	removeDone := make(chan struct{})
+	go func() {
+		hub.remove(oldAndroid)
+		close(removeDone)
+	}()
+	close(resumeReserve)
+	if err := <-reserveDone; err != nil {
+		t.Fatalf("replacement reserve: %v", err)
+	}
+	leasing.clearReserveBlock()
+	select {
+	case <-removeDone:
+	case <-time.After(time.Second):
+		t.Fatal("old remove did not finish")
+	}
+	if err := hub.activateSubscription(
+		replacement,
+		sessionID,
+		store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID},
+		305,
+		[]byte("replacement-subscribe"),
+	); err != nil {
+		t.Fatalf("replacement activate: %v", err)
+	}
+	if !leasing.reservationActive(userID, sessionID, deviceID) {
+		t.Fatal("old remove deleted replacement reservation")
+	}
+	if got := leasing.releaseCalls(); got != 0 {
+		t.Fatalf("backend releases = %d, want 0", got)
+	}
+}
+
+func TestCurrentUnsubscribeAndFinalRemoveReleaseReservation(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		release func(*Hub, *peer, uuid.UUID, uuid.UUID)
+	}{
+		{
+			name: "unsubscribe",
+			release: func(hub *Hub, android *peer, sessionID, pcID uuid.UUID) {
+				if err := android.route(androidRouteEnvelope(realtimewire.Unsubscribe, pcID), sessionID, []byte("unsubscribe")); err != nil {
+					t.Fatalf("unsubscribe route: %v", err)
+				}
+			},
+		},
+		{
+			name: "final disconnect",
+			release: func(hub *Hub, android *peer, _, _ uuid.UUID) {
+				hub.remove(android)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			leasing := &fakeLiveSessionStore{}
+			hub := NewHubWithObserver(nil, nil, nil, nil)
+			hub.leases = leasing
+			userID, deviceID, pcID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+			android := testPeer(hub, deviceID)
+			android.role = "android"
+			android.principal.UserID = userID
+			if !hub.add(android) {
+				t.Fatal("failed to add Android")
+			}
+			if err := hub.reserveLiveSession(context.Background(), android, sessionID); err != nil {
+				t.Fatalf("reserve: %v", err)
+			}
+			if err := hub.activateSubscription(
+				android,
+				sessionID,
+				store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID},
+				0,
+				[]byte("subscribe"),
+			); err != nil {
+				t.Fatalf("activate: %v", err)
+			}
+			test.release(hub, android, sessionID, pcID)
+			if leasing.reservationActive(userID, sessionID, deviceID) {
+				t.Fatal("current owner release left reservation active")
+			}
+			if got := leasing.releaseCalls(); got != 1 {
+				t.Fatalf("backend releases = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestExpiredPCRouteReleasesReplayLockBeforeReservationCleanup(t *testing.T) {
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.leases = leasing
+	userID, deviceID, pcID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	oldAndroid := testPeer(hub, deviceID)
+	oldAndroid.role = "android"
+	oldAndroid.principal.UserID = userID
+	pc := testPeer(hub, pcID)
+	pc.role = "pc"
+	pc.principal.UserID = userID
+	if !hub.add(oldAndroid) || !hub.add(pc) {
+		t.Fatal("failed to add initial peers")
+	}
+	if err := hub.reserveLiveSession(context.Background(), oldAndroid, sessionID); err != nil {
+		t.Fatalf("old reserve: %v", err)
+	}
+	expiredAt := time.Now().Add(-time.Second)
+	hub.subscribe(oldAndroid, sessionID, store.SessionRouteAuthorization{
+		Permission:     "VIEW",
+		PCDeviceID:     pcID,
+		GrantExpiresAt: &expiredAt,
+	})
+
+	replacement := testPeer(hub, deviceID)
+	replacement.role = "android"
+	replacement.principal.UserID = userID
+	if !hub.add(replacement) {
+		t.Fatal("failed to add replacement Android")
+	}
+	if err := hub.reserveLiveSession(context.Background(), replacement, sessionID); err != nil {
+		t.Fatalf("replacement reserve: %v", err)
+	}
+
+	expiredReached := make(chan struct{})
+	allowCleanup := make(chan struct{})
+	hub.beforeExpiredReservationCleanup = func() {
+		close(expiredReached)
+		<-allowCleanup
+	}
+	routeDone := make(chan error, 1)
+	go func() {
+		envelope := realtimewire.Envelope{RecipientDeviceID: deviceID[:], MessageType: realtimewire.OutputChunk, Sequence: 1}
+		routeDone <- pc.routePCFrame(envelope, sessionID, deviceID, []byte("expired-output"))
+	}()
+	select {
+	case <-expiredReached:
+	case <-time.After(time.Second):
+		t.Fatal("PC route did not reach expired cleanup seam")
+	}
+
+	activationDone := make(chan error, 1)
+	go func() {
+		activationDone <- hub.activateSubscription(
+			replacement,
+			sessionID,
+			store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID},
+			0,
+			[]byte("replacement-subscribe"),
+		)
+	}()
+	shard := hub.reservationShard(reservationKey(replacement, sessionID))
+	deadline := time.Now().Add(time.Second)
+	for {
+		if !shard.mu.TryLock() {
+			break
+		}
+		shard.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("replacement activation did not acquire reservation shard")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(allowCleanup)
+
+	select {
+	case err := <-routeDone:
+		if got := routeDenialClass(err); got != "subscription_authority_expired" {
+			t.Fatalf("expired route denial = %q (%v)", got, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expired route deadlocked replay lock against reservation shard")
+	}
+	select {
+	case err := <-activationDone:
+		if err != nil {
+			t.Fatalf("replacement activation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement activation deadlocked reservation shard against replay lock")
+	}
+	if !leasing.reservationActive(userID, sessionID, deviceID) {
+		t.Fatal("expired old route cleanup deleted replacement reservation")
 	}
 }
 
@@ -1280,32 +2284,72 @@ func (s *countingRouteAuthority) callsFor(userID, deviceID, sessionID uuid.UUID)
 }
 
 type fakeLiveSessionStore struct {
-	mu             sync.Mutex
-	releases       int
-	reserves       int
-	reserveBatches int
-	reserveErr     error
-	leases         map[uuid.UUID]kv.Lease
+	mu              sync.Mutex
+	releases        int
+	reserves        int
+	reserveBatches  int
+	reserveErr      error
+	leases          map[uuid.UUID]kv.Lease
+	reservations    map[liveReservationKey]bool
+	reserveStarted  chan struct{}
+	reserveContinue chan struct{}
 }
 
-func (s *fakeLiveSessionStore) ReserveLiveSession(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, ...int) (bool, error) {
+func (s *fakeLiveSessionStore) ReserveLiveSession(_ context.Context, userID, sessionID, deviceID uuid.UUID, _ ...int) (bool, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.reserves++
-	return s.reserveErr == nil, s.reserveErr
+	err := s.reserveErr
+	if err == nil {
+		if s.reservations == nil {
+			s.reservations = map[liveReservationKey]bool{}
+		}
+		s.reservations[liveReservationKey{userID: userID, sessionID: sessionID, deviceID: deviceID}] = true
+	}
+	started, resume := s.reserveStarted, s.reserveContinue
+	s.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if resume != nil {
+		<-resume
+	}
+	return err == nil, err
 }
 
-func (s *fakeLiveSessionStore) ReserveLiveSessions(_ context.Context, _ uuid.UUID, sessionIDs []uuid.UUID, _ uuid.UUID) error {
+func (s *fakeLiveSessionStore) ReserveLiveSessions(_ context.Context, userID uuid.UUID, sessionIDs []uuid.UUID, deviceID uuid.UUID) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.reserveBatches++
 	s.reserves += len(sessionIDs)
-	return s.reserveErr
+	if s.reserveErr == nil {
+		if s.reservations == nil {
+			s.reservations = map[liveReservationKey]bool{}
+		}
+		for _, sessionID := range sessionIDs {
+			s.reservations[liveReservationKey{userID: userID, sessionID: sessionID, deviceID: deviceID}] = true
+		}
+	}
+	err := s.reserveErr
+	started, resume := s.reserveStarted, s.reserveContinue
+	s.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if resume != nil {
+		<-resume
+	}
+	return err
 }
 
-func (s *fakeLiveSessionStore) ReleaseLiveSession(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error {
+func (s *fakeLiveSessionStore) ReleaseLiveSession(_ context.Context, userID, sessionID, deviceID uuid.UUID) error {
 	s.mu.Lock()
 	s.releases++
+	delete(s.reservations, liveReservationKey{userID: userID, sessionID: sessionID, deviceID: deviceID})
 	s.mu.Unlock()
 	return nil
 }
@@ -1336,6 +2380,29 @@ func (s *fakeLiveSessionStore) reserveBatchCalls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.reserveBatches
+}
+
+func (s *fakeLiveSessionStore) reservationActive(userID, sessionID, deviceID uuid.UUID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reservations[liveReservationKey{userID: userID, sessionID: sessionID, deviceID: deviceID}]
+}
+
+func (s *fakeLiveSessionStore) blockNextReserve() (<-chan struct{}, chan<- struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	started := make(chan struct{}, 1)
+	resume := make(chan struct{})
+	s.reserveStarted = started
+	s.reserveContinue = resume
+	return started, resume
+}
+
+func (s *fakeLiveSessionStore) clearReserveBlock() {
+	s.mu.Lock()
+	s.reserveStarted = nil
+	s.reserveContinue = nil
+	s.mu.Unlock()
 }
 
 func (s *fakeLiveSessionStore) setLease(sessionID, holderID uuid.UUID) kv.Lease {

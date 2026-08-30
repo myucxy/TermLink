@@ -270,11 +270,15 @@ try {
         Assert-True (Test-Path -LiteralPath $terminalFragmentPath -PathType Leaf) `
             'The packaged Windows Terminal fragment is missing.'
         $terminalFragment = Get-Content -Raw -LiteralPath $terminalFragmentPath | ConvertFrom-Json
+        Assert-True ($terminalFragment.termlinkAddNoLogo -eq $true) `
+            'The packaged Terminal fragment must add -NoLogo by default.'
+        Assert-True ($terminalFragment.termlinkAddNoProfile -eq $false) `
+            'The packaged Terminal fragment must load the PowerShell profile by default.'
         $terminalProfiles = @($terminalFragment.profiles)
         $expectedTerminalProfiles = @{
             '{cb3ce4a8-86da-5aa1-a77d-abe62f8b55b2}' = @('TermLink CMD', 'command-prompt', 'cmd.exe')
-            '{b2025574-4cc8-5264-b577-7c6532eff95a}' = @('TermLink Windows PowerShell', 'windows-powershell', 'powershell.exe -NoLogo -NoProfile')
-            '{7cf2d180-c8be-5b08-99a0-268bd2dc1d6f}' = @('TermLink PowerShell 7', 'powershell-7', 'pwsh.exe -NoLogo -NoProfile')
+            '{b2025574-4cc8-5264-b577-7c6532eff95a}' = @('TermLink Windows PowerShell', 'windows-powershell', 'powershell.exe -NoLogo')
+            '{7cf2d180-c8be-5b08-99a0-268bd2dc1d6f}' = @('TermLink PowerShell 7', 'powershell-7', 'pwsh.exe -NoLogo')
             '{f5652f1d-a6da-5199-b595-3a1255ce04b4}' = @('TermLink WSL', 'wsl', 'wsl.exe')
         }
         Assert-True ($terminalProfiles.Count -eq $expectedTerminalProfiles.Count) `

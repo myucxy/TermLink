@@ -14,6 +14,7 @@ public interface IAgentClient
     ValueTask StopSessionAsync(Guid sessionId, CancellationToken cancellationToken);
     ValueTask GrantDeviceAsync(Guid deviceId, string permission, CancellationToken cancellationToken);
     ValueTask RevokeDeviceAsync(Guid deviceId, CancellationToken cancellationToken);
+    ValueTask BeginAccountAuthorizationAsync(string pcName, CancellationToken cancellationToken);
     ValueTask LoginAsync(string username, string password, string pcName, CancellationToken cancellationToken);
     ValueTask RegisterAsync(
         string username,
@@ -28,6 +29,26 @@ public interface IAgentClient
         IReadOnlyList<TerminalCommandCapability> commands,
         CancellationToken cancellationToken);
 }
+
+public sealed class AgentClientOperationException : InvalidOperationException
+{
+    public AgentClientOperationException(
+        string code,
+        string? diagnostic = null,
+        int? processExitCode = null,
+        Exception? innerException = null)
+        : base(string.IsNullOrWhiteSpace(code) ? "PC_AGENT_OPERATION_FAILED" : code.Trim(), innerException)
+    {
+        Code = string.IsNullOrWhiteSpace(code) ? "PC_AGENT_OPERATION_FAILED" : code.Trim();
+        Diagnostic = string.IsNullOrWhiteSpace(diagnostic) ? null : diagnostic.Trim();
+        ProcessExitCode = processExitCode;
+    }
+
+    public string Code { get; }
+    public string? Diagnostic { get; }
+    public int? ProcessExitCode { get; }
+}
+
 public interface IUiDispatcher
 {
     bool CheckAccess();

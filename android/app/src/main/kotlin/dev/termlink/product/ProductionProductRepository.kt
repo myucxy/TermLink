@@ -3180,7 +3180,7 @@ internal class ProductionProductRepository(
             val selection = awaitExpectedTranscriptPage {
                 latestTranscriptPage(key, session, stored.deviceId, pc.keyEpoch)
             }
-            if (selection === TranscriptSelection.Pending) {
+            if (selection === TranscriptSelection.Pending || selection === TranscriptSelection.Complete) {
                 val liveAck = mutableSnapshot.value.liveAcknowledgements[key.sessionId] ?: 0u
                 val newerAnchor = if (remainingAnchorRebases > 0) {
                     latestPublishedTranscriptAnchor(
@@ -3195,7 +3195,7 @@ internal class ProductionProductRepository(
                     null
                 }
                 val rebased = newerAnchor?.let { anchor ->
-                    rebasePendingTranscriptViewport(
+                    rebaseTranscriptViewportToNewerAnchor(
                         viewport = selected,
                         newSnapshotSequence = anchor.snapshotSequence,
                         newInitialBeforeLineId = anchor.beforeLineId,
@@ -3227,11 +3227,11 @@ internal class ProductionProductRepository(
                         return
                     }
                 }
+                if (selection === TranscriptSelection.Complete) {
+                    finishEmptyTranscriptPage(key)
+                    return
+                }
                 error("The expected terminal transcript page is not available yet")
-            }
-            if (selection === TranscriptSelection.Complete) {
-                finishEmptyTranscriptPage(key)
-                return
             }
             val ready = selection as TranscriptSelection.ReadyPage<TranscriptDownloadDescriptor>
             validateTranscriptDescriptorNotLoaded(selected, ready.value.metadata)
@@ -6170,7 +6170,7 @@ internal fun mergeTranscriptPage(
  * where tail-first opened S while the Agent replaced S with S+N before S's
  * bulk transcript pages finished publishing.
  */
-internal fun rebasePendingTranscriptViewport(
+internal fun rebaseTranscriptViewportToNewerAnchor(
     viewport: TranscriptViewportState,
     newSnapshotSequence: ULong,
     newInitialBeforeLineId: ULong,
@@ -6224,8 +6224,9 @@ internal suspend fun <Key> awaitCoalescedTranscriptLoad(
 /**
  * A committed Snapshot is intentionally published before its bulk Transcript.
  * Retry only an explicit server/compatibility [TranscriptSelection.Pending].
- * A ready empty response is authoritative completion even when its line cursor
- * is greater than one.
+ * A ready empty response is authoritative completion for its fixed Snapshot
+ * anchor even when its line cursor is greater than one. The caller may still
+ * move to a newer durably acknowledged Snapshot before ending pagination.
  */
 internal suspend fun <Page> awaitExpectedTranscriptPage(
     retryDelaysMillis: List<Long> = TRANSCRIPT_PUBLICATION_RETRY_DELAYS_MILLIS,

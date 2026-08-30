@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Globalization;
+using System.Linq;
 using System.Text;
 
 namespace TermLink.Agent
@@ -566,6 +567,7 @@ namespace TermLink.Agent
     {
         private const int MaximumCsiBytes = 64;
         private const int MaximumScrollbackRows = 2000;
+        internal const int TranscriptArchivePageRows = 200;
         private const int MaximumOscCharacters = 8192;
 
         private enum ParserState : byte
@@ -581,6 +583,7 @@ namespace TermLink.Agent
         }
 
         private readonly List<RowState> scrollback = new List<RowState>();
+        private readonly Action<IReadOnlyList<PortableTerminalRowV1>> transcriptArchiveSink;
         private List<RowState> screen = new List<RowState>();
         private List<RowState> inactiveScreen = new List<RowState>();
         private readonly StringBuilder csi = new StringBuilder();
@@ -668,10 +671,19 @@ namespace TermLink.Agent
         }
 
         public PortableTerminalModelV1(int columns, int rows)
+            : this(columns, rows, null)
+        {
+        }
+
+        internal PortableTerminalModelV1(
+            int columns,
+            int rows,
+            Action<IReadOnlyList<PortableTerminalRowV1>> transcriptArchiveSink)
         {
             PortableTerminalSnapshotV1.ValidateSize(columns, rows);
             this.columns = columns;
             this.rows = rows;
+            this.transcriptArchiveSink = transcriptArchiveSink;
             scrollBottomExclusive = rows;
             configuredScrollBottomExclusive = rows;
             tabStops = CreateDefaultTabStops(columns);
@@ -785,7 +797,7 @@ namespace TermLink.Agent
                 false);
 
             var primaryViewportStart = PrimaryViewportStart(primary, newRows);
-            if (primaryViewportStart > MaximumScrollbackRows)
+            if (primaryViewportStart > MaximumScrollbackRows && transcriptArchiveSink == null)
             {
                 if (restoreAlternate)
                 {
@@ -800,6 +812,7 @@ namespace TermLink.Agent
             columns = newColumns;
             rows = newRows;
             InstallReflowedPrimary(primary, newRows, primaryViewportStart, sequence);
+            ArchiveSealedScrollbackPrefix();
             InstallReflowedAlternate(alternate, newRows);
             if (hadFullHeightMargins || oldScrollTop >= rows - 1)
             {
@@ -2623,7 +2636,7 @@ namespace TermLink.Agent
             if (count <= 0) return;
             if (appendScrollback)
             {
-                if (scrollback.Count > MaximumScrollbackRows - count)
+                if (scrollback.Count > MaximumScrollbackRows - count && transcriptArchiveSink == null)
                 {
                     Reject("SCROLLBACK_LIMIT_EXCEEDED", sequence);
                     return;
@@ -2634,6 +2647,7 @@ namespace TermLink.Agent
                     sealedRow.SealedAtSequence = sequence;
                     scrollback.Add(sealedRow);
                 }
+                ArchiveSealedScrollbackPrefix();
                 screen.RemoveRange(top, count);
                 for (var offset = 0; offset < count; offset++) screen.Add(NewBlankRow(StandardEraseStyle()));
                 return;
@@ -3028,6 +3042,21 @@ namespace TermLink.Agent
             while (screen.Count < newRows) screen.Add(NewBlankRowForCurrentWidth(true));
             cursorRow = Math.Max(0, Math.Min(newRows - 1, result.CursorRow - viewportStart));
             cursorColumn = Math.Max(0, Math.Min(columns - 1, result.CursorColumn));
+        }
+
+        private void ArchiveSealedScrollbackPrefix()
+        {
+            if (transcriptArchiveSink == null) return;
+            while (scrollback.Count > MaximumScrollbackRows)
+            {
+                var archiveCount = Math.Min(
+                    TranscriptArchivePageRows,
+                    scrollback.Count - MaximumScrollbackRows);
+                if (archiveCount < TranscriptArchivePageRows) return;
+                var page = SnapshotRows(scrollback.GetRange(0, archiveCount)).ToArray();
+                transcriptArchiveSink(page);
+                scrollback.RemoveRange(0, archiveCount);
+            }
         }
 
         private void InstallReflowedAlternate(ReflowResult result, int newRows)

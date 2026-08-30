@@ -84,9 +84,12 @@ type Config struct {
 	WebOIDCClientID                string
 	WebOIDCStepUpClientID          string
 	WebOIDCRedirectURI             string
+	HumanVerificationProvider      string
+	HumanVerificationSiteKey       string
 
 	OIDCClientSecret           Secret
 	KeycloakAdminClientSecret  Secret
+	HumanVerificationSecret    Secret
 	AccountDeletionIdentityKey Secret
 	DatabaseURL                Secret
 	RedisURL                   Secret
@@ -96,6 +99,7 @@ type Config struct {
 	// are omitted from String because deployment paths can be sensitive too.
 	OIDCClientSecretFile           string
 	KeycloakAdminClientSecretFile  string
+	HumanVerificationSecretFile    string
 	AccountDeletionIdentityKeyFile string
 	DatabaseURLFile                string
 	RedisURLFile                   string
@@ -148,7 +152,7 @@ type Config struct {
 // secret paths as well as secret values, because paths can contain identifying
 // deployment information and are not needed in normal startup diagnostics.
 func (c Config) String() string {
-	return fmt.Sprintf("Config{PublicURL:%q OIDCIssuer:%q OIDCClientID:%q OIDCAllowedParties:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q WindowsOIDCClientID:%q WindowsRegistrationOIDCParties:%q WindowsOIDCRedirectURI:%q WebOIDCClientID:%q WebOIDCStepUpClientID:%q WebOIDCRedirectURI:%q OIDCClientSecret:%s KeycloakAdminClientSecret:%s KeycloakAdminClientID:%q KeycloakAdminBaseURL:%q RegistrationRecoveryEnabled:%t AccountDeletionEnabled:%t AccountDeletionIdentityKeyVersion:%d DatabaseURL:%s RedisURL:%s TokenSigningKey:%s S3Endpoint:%q S3PublicEndpoint:%q S3Bucket:%q S3Region:%q S3AccessKey:%s S3SecretKey:%s PostgresMaxConns:%d PostgresMinConns:%d PostgresMaxConnLifetime:%s PostgresMaxConnIdleTime:%s PostgresHealthCheckPeriod:%s PostgresConnectTimeout:%s RedisPoolSize:%d RedisMinIdleConns:%d RedisDialTimeout:%s RedisReadTimeout:%s RedisWriteTimeout:%s RedisPoolTimeout:%s LogLevel:%q HistoryEnabled:%t ListenAddr:%q MetricsListenAddr:%q}",
+	return fmt.Sprintf("Config{PublicURL:%q OIDCIssuer:%q OIDCClientID:%q OIDCAllowedParties:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q WindowsOIDCClientID:%q WindowsRegistrationOIDCParties:%q WindowsOIDCRedirectURI:%q WebOIDCClientID:%q WebOIDCStepUpClientID:%q WebOIDCRedirectURI:%q HumanVerificationProvider:%q HumanVerificationSiteKey:%q HumanVerificationSecret:%s OIDCClientSecret:%s KeycloakAdminClientSecret:%s KeycloakAdminClientID:%q KeycloakAdminBaseURL:%q RegistrationRecoveryEnabled:%t AccountDeletionEnabled:%t AccountDeletionIdentityKeyVersion:%d DatabaseURL:%s RedisURL:%s TokenSigningKey:%s S3Endpoint:%q S3PublicEndpoint:%q S3Bucket:%q S3Region:%q S3AccessKey:%s S3SecretKey:%s PostgresMaxConns:%d PostgresMinConns:%d PostgresMaxConnLifetime:%s PostgresMaxConnIdleTime:%s PostgresHealthCheckPeriod:%s PostgresConnectTimeout:%s RedisPoolSize:%d RedisMinIdleConns:%d RedisDialTimeout:%s RedisReadTimeout:%s RedisWriteTimeout:%s RedisPoolTimeout:%s LogLevel:%q HistoryEnabled:%t ListenAddr:%q MetricsListenAddr:%q}",
 		c.PublicURL,
 		c.OIDCIssuer,
 		c.OIDCClientID,
@@ -161,6 +165,9 @@ func (c Config) String() string {
 		c.WebOIDCClientID,
 		c.WebOIDCStepUpClientID,
 		c.WebOIDCRedirectURI,
+		c.HumanVerificationProvider,
+		c.HumanVerificationSiteKey,
+		c.HumanVerificationSecret,
 		c.OIDCClientSecret,
 		c.KeycloakAdminClientSecret,
 		c.KeycloakAdminClientID,
@@ -312,9 +319,12 @@ type Input struct {
 	WebOIDCClientID                string
 	WebOIDCStepUpClientID          string
 	WebOIDCRedirectURI             string
+	HumanVerificationProvider      string
+	HumanVerificationSiteKey       string
 
 	OIDCClientSecret           string
 	KeycloakAdminClientSecret  string
+	HumanVerificationSecret    string
 	AccountDeletionIdentityKey string
 	DatabaseURL                string
 	RedisURL                   string
@@ -368,6 +378,9 @@ func New(input Input) (Config, error) {
 		WebOIDCClientID:                   strings.TrimSpace(input.WebOIDCClientID),
 		WebOIDCStepUpClientID:             strings.TrimSpace(input.WebOIDCStepUpClientID),
 		WebOIDCRedirectURI:                strings.TrimSpace(input.WebOIDCRedirectURI),
+		HumanVerificationProvider:         strings.ToLower(strings.TrimSpace(input.HumanVerificationProvider)),
+		HumanVerificationSiteKey:          strings.TrimSpace(input.HumanVerificationSiteKey),
+		HumanVerificationSecret:           Secret(strings.TrimSpace(input.HumanVerificationSecret)),
 		OIDCClientSecret:                  Secret(strings.TrimSpace(input.OIDCClientSecret)),
 		KeycloakAdminClientSecret:         Secret(strings.TrimSpace(input.KeycloakAdminClientSecret)),
 		KeycloakAdminClientID:             strings.TrimSpace(input.KeycloakAdminClientID),
@@ -519,6 +532,11 @@ func LoadSource(source Source) (Config, error) {
 	webOIDCClientID := lookupOptional("TERMLINK_WEB_OIDC_CLIENT_ID", "termlink-web")
 	webOIDCStepUpClientID := lookupOptional("TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID", "termlink-web-step-up")
 	webOIDCRedirectURI := lookupOptional("TERMLINK_WEB_OIDC_REDIRECT_URI", strings.TrimRight(publicURL, "/")+"/auth/callback")
+	humanVerificationProvider := strings.ToLower(lookupOptional("TERMLINK_HUMAN_VERIFICATION_PROVIDER", ""))
+	if humanVerificationProvider != "" && humanVerificationProvider != "turnstile" {
+		return Config{}, fmt.Errorf("%w: TERMLINK_HUMAN_VERIFICATION_PROVIDER", ErrInvalid)
+	}
+	humanVerificationSiteKey := lookupOptional("TERMLINK_HUMAN_VERIFICATION_SITE_KEY", "")
 	registrationRecoveryEnabled, err := parseBool("TERMLINK_REGISTRATION_RECOVERY_ENABLED", lookupOptional("TERMLINK_REGISTRATION_RECOVERY_ENABLED", "false"))
 	if err != nil {
 		return Config{}, err
@@ -618,6 +636,13 @@ func LoadSource(source Source) (Config, error) {
 			return Config{}, err
 		}
 	}
+	var humanVerificationSecret Secret
+	if humanVerificationProvider == "turnstile" {
+		humanVerificationSecret, err = readSecret(source, "TERMLINK_HUMAN_VERIFICATION_SECRET_FILE")
+		if err != nil {
+			return Config{}, err
+		}
+	}
 	var accountDeletionIdentityKey Secret
 	if accountDeletionEnabled {
 		accountDeletionIdentityKey, err = readSecret(source, "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE")
@@ -658,6 +683,9 @@ func LoadSource(source Source) (Config, error) {
 		WebOIDCClientID:                   webOIDCClientID,
 		WebOIDCStepUpClientID:             webOIDCStepUpClientID,
 		WebOIDCRedirectURI:                webOIDCRedirectURI,
+		HumanVerificationProvider:         humanVerificationProvider,
+		HumanVerificationSiteKey:          humanVerificationSiteKey,
+		HumanVerificationSecret:           humanVerificationSecret,
 		OIDCClientSecret:                  oidcSecret,
 		KeycloakAdminClientSecret:         keycloakAdminClientSecret,
 		KeycloakAdminClientID:             keycloakAdminClientID,
@@ -671,6 +699,7 @@ func LoadSource(source Source) (Config, error) {
 		TokenSigningKey:                   tokenSigningKey,
 		OIDCClientSecretFile:              envPath(source, "TERMLINK_OIDC_CLIENT_SECRET_FILE"),
 		KeycloakAdminClientSecretFile:     envPath(source, "TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE"),
+		HumanVerificationSecretFile:       envPath(source, "TERMLINK_HUMAN_VERIFICATION_SECRET_FILE"),
 		AccountDeletionIdentityKeyFile:    envPath(source, "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE"),
 		DatabaseURLFile:                   envPath(source, "TERMLINK_DATABASE_URL_FILE"),
 		RedisURLFile:                      envPath(source, "TERMLINK_REDIS_URL_FILE"),
@@ -787,6 +816,23 @@ func validate(c Config) (Config, error) {
 	}
 	if err := validateHTTPSURL("TERMLINK_OIDC_ISSUER", c.OIDCIssuer); err != nil {
 		return Config{}, err
+	}
+	c.HumanVerificationProvider = strings.ToLower(strings.TrimSpace(c.HumanVerificationProvider))
+	c.HumanVerificationSiteKey = strings.TrimSpace(c.HumanVerificationSiteKey)
+	if c.HumanVerificationProvider == "" {
+		if c.HumanVerificationSiteKey != "" || !c.HumanVerificationSecret.Empty() {
+			return Config{}, fmt.Errorf("%w: TERMLINK_HUMAN_VERIFICATION_PROVIDER", ErrInvalid)
+		}
+	} else if c.HumanVerificationProvider != "turnstile" {
+		return Config{}, fmt.Errorf("%w: TERMLINK_HUMAN_VERIFICATION_PROVIDER", ErrInvalid)
+	} else {
+		if c.HumanVerificationSiteKey == "" || len(c.HumanVerificationSiteKey) > 256 ||
+			strings.ContainsAny(c.HumanVerificationSiteKey, " \t\r\n") {
+			return Config{}, fmt.Errorf("%w: TERMLINK_HUMAN_VERIFICATION_SITE_KEY", ErrInvalid)
+		}
+		if c.HumanVerificationSecret.Empty() {
+			return Config{}, fmt.Errorf("%w: TERMLINK_HUMAN_VERIFICATION_SECRET_FILE", ErrSecret)
+		}
 	}
 	if strings.TrimSpace(c.OIDCClientID) == "" {
 		return Config{}, fmt.Errorf("%w: TERMLINK_OIDC_CLIENT_ID", ErrMissing)

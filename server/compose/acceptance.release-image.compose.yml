@@ -1,5 +1,6 @@
-# Use only an already-published immutable server image while keeping the
-# acceptance stack's reviewed identity, data, and edge services unchanged.
+# Use either an already-published immutable server image or the explicitly
+# reviewed local-production image selected by Start-ProductionAcceptance.ps1,
+# while keeping the stack's identity, data, and edge services unchanged.
 services:
   migrate:
     image: ${TERMLINK_ACCEPTANCE_SERVER_IMAGE:?immutable Docker Hub server image is required}

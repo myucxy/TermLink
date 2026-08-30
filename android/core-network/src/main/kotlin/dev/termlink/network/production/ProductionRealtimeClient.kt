@@ -1,5 +1,6 @@
 package dev.termlink.network.production
 
+import android.util.Log
 import com.google.protobuf.ByteString
 import dev.termlink.crypto.CryptoDirection
 import dev.termlink.crypto.DeviceIdentity
@@ -95,6 +96,20 @@ class ProductionReceivedEnvelope internal constructor(
     override fun close() {
         if (released.compareAndSet(false, true)) releaseReservation(wireBytes)
     }
+
+    /**
+     * Transfers ownership to a close-observed view without copying opaque
+     * ciphertext. The observer runs exactly once when downstream processing
+     * releases the frame, including channel cancellation paths.
+     */
+    internal fun withCloseObserver(observer: () -> Unit): ProductionReceivedEnvelope =
+        ProductionReceivedEnvelope(envelope, wireBytes, generation) {
+            try {
+                this.close()
+            } finally {
+                observer()
+            }
+        }
 }
 
 /**
@@ -318,7 +333,14 @@ class ProductionRealtimeClient(
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: OkioByteString) {
-            if (!isCurrent(webSocket) || !acceptingBinary) return
+            if (!isCurrent(webSocket)) {
+                logBinaryDrop("socket_binary_stale", bytes)
+                return
+            }
+            if (!acceptingBinary) {
+                logBinaryDrop("socket_binary_gated", bytes)
+                return
+            }
             if (!welcomed) {
                 acceptingBinary = false
                 webSocket.close(1002, "welcome required before binary frames")
@@ -345,6 +367,11 @@ class ProductionRealtimeClient(
                 return
             }
             if (!reserveIncoming(raw.size, listenerGeneration)) {
+                logEnvelopeAdmission(
+                    decision = "socket_reservation_rejected",
+                    envelope = envelope,
+                    wireBytes = raw.size,
+                )
                 acceptingBinary = false
                 webSocket.close(1013, "bounded receive byte budget exceeded")
                 return
@@ -355,7 +382,17 @@ class ProductionRealtimeClient(
                 generation = listenerGeneration,
                 releaseReservation = ::releaseIncoming,
             )
-            if (incomingChannel.trySend(received).isFailure) {
+            val admission = incomingChannel.trySend(received)
+            if (admission.isFailure) {
+                logEnvelopeAdmission(
+                    decision = if (admission.isClosed) {
+                        "socket_channel_closed"
+                    } else {
+                        "socket_channel_full"
+                    },
+                    envelope = envelope,
+                    wireBytes = raw.size,
+                )
                 received.close()
                 // close() is asynchronous. Without this generation-local gate,
                 // later callbacks can enter the queue after the first rejected
@@ -365,6 +402,46 @@ class ProductionRealtimeClient(
                 acceptingBinary = false
                 webSocket.close(1013, "bounded receive queue exceeded")
             }
+        }
+
+        /**
+         * Parse only a bounded rejected frame and expose metadata, never the
+         * ciphertext or identifiers. This locates a missing sequence without
+         * turning diagnostics into another payload channel.
+         */
+        private fun logBinaryDrop(decision: String, bytes: OkioByteString) {
+            val envelope = if (bytes.size <= MAX_FRAME_BYTES) {
+                runCatching { Envelope.parseFrom(bytes.toByteArray()) }.getOrNull()
+            } else {
+                null
+            }
+            if (envelope == null) {
+                Log.w(
+                    REALTIME_LOG_TAG,
+                    "$decision generation=$listenerGeneration " +
+                        "current_generation=${generation.get()} " +
+                        "connected_generation=$connectedGeneration",
+                )
+                return
+            }
+            logEnvelopeAdmission(decision, envelope, bytes.size)
+        }
+
+        private fun logEnvelopeAdmission(
+            decision: String,
+            envelope: Envelope,
+            wireBytes: Int,
+        ) {
+            Log.w(
+                REALTIME_LOG_TAG,
+                "$decision generation=$listenerGeneration " +
+                    "current_generation=${generation.get()} " +
+                    "connected_generation=$connectedGeneration " +
+                    "seq=${envelope.seq} type=${envelope.messageType.name} " +
+                    "queue_events=${bufferedIncomingEvents.get()} " +
+                    "queue_wire_bytes=${bufferedIncomingWireBytes.get()} " +
+                    "wire_bytes=$wireBytes",
+            )
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -518,6 +595,7 @@ class ProductionRealtimeClient(
     }
 
     companion object {
+        private const val REALTIME_LOG_TAG = "TermLinkRealtime"
         const val MAX_FRAME_BYTES: Int = 1 shl 20
         const val MAX_BUFFERED_EVENTS: Int = 128
         const val OPEN_WINDOW_EVENTS: Int = 128

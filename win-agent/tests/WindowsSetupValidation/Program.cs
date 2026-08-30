@@ -984,6 +984,9 @@ namespace TermLink.Setup.Validation
                 "Terminal repair retained the obsolete install directory.");
             using (var document = System.Text.Json.JsonDocument.Parse(repaired))
             {
+                Assert(document.RootElement.GetProperty("termlinkAddNoLogo").GetBoolean() &&
+                        !document.RootElement.GetProperty("termlinkAddNoProfile").GetBoolean(),
+                    "Terminal repair did not migrate an old Fragment to the new PowerShell defaults.");
                 var expectedHost = Path.Combine(installRoot, "TermLink.SessionHost.exe");
                 var profiles = document.RootElement.GetProperty("profiles").EnumerateArray().ToArray();
                 Assert(profiles.Length == result.ProfileCount && profiles.All(profile =>
@@ -997,6 +1000,40 @@ namespace TermLink.Setup.Validation
                             StringComparison.Ordinal)),
                     "Terminal repair did not configure TermLink tabs to close with their SessionHost.");
             }
+            var defaults = WindowsTerminalIntegration.ReadPowerShellSettings(fragmentPath);
+            Assert(defaults.AddNoLogo && !defaults.AddNoProfile,
+                "Terminal integration defaults did not add -NoLogo while omitting -NoProfile.");
+
+            result = WindowsTerminalIntegration.Reconfigure(
+                installRoot,
+                fragmentPath,
+                addNoLogo: false,
+                addNoProfile: true);
+            var configured = WindowsTerminalIntegration.ReadPowerShellSettings(fragmentPath);
+            Assert(!configured.AddNoLogo && configured.AddNoProfile,
+                "Terminal integration did not persist the two independent PowerShell switches.");
+            var configuredCommand = DecodeTerminalChildCommand(
+                fragmentPath,
+                "TermLink Windows PowerShell");
+            Assert(!configuredCommand.Contains("-NoLogo", StringComparison.Ordinal) &&
+                    configuredCommand.Contains("-NoProfile", StringComparison.Ordinal),
+                "Terminal integration switches did not change the generated PowerShell command.");
+            result = WindowsTerminalIntegration.Reconfigure(installRoot, fragmentPath);
+            var preserved = WindowsTerminalIntegration.ReadPowerShellSettings(fragmentPath);
+            Assert(!preserved.AddNoLogo && preserved.AddNoProfile,
+                "Terminal repair did not preserve the configured PowerShell switches.");
+
+            result = WindowsTerminalIntegration.Reconfigure(
+                installRoot,
+                fragmentPath,
+                addNoLogo: true,
+                addNoProfile: false);
+            var defaultCommand = DecodeTerminalChildCommand(
+                fragmentPath,
+                "TermLink Windows PowerShell");
+            Assert(defaultCommand.Contains("-NoLogo", StringComparison.Ordinal) &&
+                    !defaultCommand.Contains("-NoProfile", StringComparison.Ordinal),
+                "Terminal integration did not restore the requested default PowerShell command.");
             Assert(result.ProfileCount >= 2 && string.Equals(result.Sha256, Sha256(fragmentPath), StringComparison.Ordinal),
                 "Terminal repair did not return the rebuilt Fragment ownership metadata.");
 
@@ -1040,6 +1077,22 @@ namespace TermLink.Setup.Validation
                 "Inspecting an MSIX Terminal Fragment modified a loose Fragment.");
             Assert(!WindowsTerminalIntegration.TryRefreshInstallMarker(root, result),
                 "A package-managed Fragment unexpectedly claimed loose installer marker ownership.");
+        }
+
+        private static string DecodeTerminalChildCommand(string fragmentPath, string profileName)
+        {
+            using var document = System.Text.Json.JsonDocument.Parse(
+                File.ReadAllText(fragmentPath, Encoding.UTF8));
+            var profile = document.RootElement.GetProperty("profiles").EnumerateArray().Single(item =>
+                string.Equals(item.GetProperty("name").GetString(), profileName, StringComparison.Ordinal));
+            var commandLine = profile.GetProperty("commandline").GetString()!;
+            const string prefix = "--command-base64 ";
+            var start = commandLine.IndexOf(prefix, StringComparison.Ordinal);
+            Assert(start >= 0, "Terminal Fragment command omitted --command-base64.");
+            start += prefix.Length;
+            var end = commandLine.IndexOf(' ', start);
+            if (end < 0) end = commandLine.Length;
+            return Encoding.UTF8.GetString(Convert.FromBase64String(commandLine[start..end]));
         }
 
         private static void ValidateRuntimePurgeBoundary(string temporaryRoot)

@@ -415,6 +415,7 @@ services:
           -s implicitFlowEnabled=false \
           -s serviceAccountsEnabled=false \
           -s fullScopeAllowed=false \
+          -s baseUrl=${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910} \
           -s 'redirectUris=["http://127.0.0.1:43971/oauth2/callback"]' \
           -s "authenticationFlowBindingOverrides={\"browser\":\"$$native_flow_id\"}" \
           -s 'attributes={"pkce.code.challenge.method":"S256"}' >/dev/null
@@ -780,9 +781,6 @@ services:
             --config /tmp/kcadm.config -r termlink \
             --uid "$$user_id" --rolename USER >/dev/null
         done
-        /opt/keycloak/bin/kcadm.sh update realms/termlink \
-          --config /tmp/kcadm.config \
-          -s registrationAllowed=true >/dev/null
     networks: ["frontend"]
     volumes:
       - acceptance-keycloak-init-secrets:/run/secrets:ro

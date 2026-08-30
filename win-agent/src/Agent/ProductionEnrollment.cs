@@ -164,8 +164,9 @@ namespace TermLink.Agent
 
         /// <summary>
         /// Forgets only the local production account session. The caller must
-        /// stop the running Agent first so in-memory credentials cannot continue
-        /// a Relay session or race with file removal.
+        /// first deactivate the current account runtime so in-memory credentials
+        /// cannot continue a Relay session or race with file removal. Local
+        /// terminal/session workers may remain alive for the next account.
         /// </summary>
         public static void ForgetLocalAccount()
         {
@@ -353,12 +354,7 @@ namespace TermLink.Agent
                 ["code_challenge"] = challenge,
                 ["code_challenge_method"] = "S256"
             }).ConfigureAwait(false);
-            using var browser = Process.Start(new ProcessStartInfo
-            {
-                FileName = authorizationUrl,
-                UseShellExecute = true
-            });
-            if (browser == null) throw new InvalidOperationException("The system browser could not be opened.");
+            OpenSystemBrowser(authorizationUrl);
 
             string code;
             using (var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
@@ -417,6 +413,32 @@ namespace TermLink.Agent
         private static bool IsHttps(string value)
         {
             return Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttps;
+        }
+
+        internal static ProcessStartInfo CreateBrowserStartInfo(string authorizationUrl)
+        {
+            if (!IsHttps(authorizationUrl))
+                throw new ArgumentException("The browser authorization URL must use HTTPS.", nameof(authorizationUrl));
+            return new ProcessStartInfo
+            {
+                FileName = authorizationUrl,
+                UseShellExecute = true,
+                Verb = "open",
+                CreateNoWindow = false,
+                WindowStyle = ProcessWindowStyle.Normal
+            };
+        }
+
+        private static void OpenSystemBrowser(string authorizationUrl)
+        {
+            try
+            {
+                using var browser = Process.Start(CreateBrowserStartInfo(authorizationUrl));
+            }
+            catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception)
+            {
+                throw new InvalidOperationException("The system browser could not be opened.", error);
+            }
         }
 
         private static async Task<T> GetJsonAsync<T>(HttpClient http, string url, CancellationToken token)

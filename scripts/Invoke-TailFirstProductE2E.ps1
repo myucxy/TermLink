@@ -23,12 +23,12 @@ param(
     [ValidatePattern('^[^\\/]{1,200}$')]
     [string]$AgentControlPipe,
 
-    # The fixture has five transcript pages: the initial tail page plus four
-    # authenticated continuations. The final continuation is first attempted
-    # offline, then retried online so failure retention and the full chain are
-    # both proven in one run.
-    [ValidateSet(4)]
-    [int]$HistoryPageCount = 4,
+    # The 5200-line fixture has 26 transcript pages: the initial partial tail
+    # page plus 25 authenticated continuations. The final continuation is first
+    # attempted offline, then retried online so failure retention and the full
+    # unbounded chain are both proven in one run.
+    [ValidateSet(25)]
+    [int]$HistoryPageCount = 25,
     [ValidateSet(200)]
     [int]$HistoryPageSize = 200,
     [ValidateRange(5554, 5682)]
@@ -79,7 +79,9 @@ $hookSessionArmPath = 'no_backup/tail-first-e2e/session-arm.json'
 $requiredHookOperations = @(
     'probe', 'open_session', 'inspect', 'page_up', 'open_history', 'close_history', 'show_ime'
 )
-$snapshotMarkerCount = 1000
+$snapshotMarkerCount = 5200
+$snapshotTranscriptPageCount = 26
+$snapshotTailFirstBeforeLineId = [uint64]5177
 $streamedPrefixMarkerCount = 5200
 $streamedPrefixMinimumTail = [uint64]4097
 $markerCount = if ($HistoryBootstrapMode -ceq 'StreamedChunkPrefix') {
@@ -93,15 +95,27 @@ $minimumOpenTail = if ($HistoryBootstrapMode -ceq 'StreamedChunkPrefix') {
     [uint64]0
 }
 # Opening history preserves the 24 marker rows already visible in the live
-# viewport (977..1000) and requests only the older prefix. This makes every
-# continuation contiguous without downloading or rendering duplicate rows.
-$expectedTranscriptPages = @(
-    [pscustomobject]@{ request_before = [uint64]977; first = [uint64]801; last = [uint64]976; has_more = $true },
-    [pscustomobject]@{ request_before = [uint64]801; first = [uint64]601; last = [uint64]800; has_more = $true },
-    [pscustomobject]@{ request_before = [uint64]601; first = [uint64]401; last = [uint64]600; has_more = $true },
-    [pscustomobject]@{ request_before = [uint64]401; first = [uint64]201; last = [uint64]400; has_more = $true },
-    [pscustomobject]@{ request_before = [uint64]201; first = [uint64]1; last = [uint64]200; has_more = $false }
-)
+# viewport (5177..5200) and requests only the older prefix. Generate the entire
+# immutable 26-page chain. Transcript pages are sealed forward from line 1,
+# making the newest page the expected 176-row partial page (5001..5176).
+$expectedTranscriptPages = [Collections.Generic.List[object]]::new()
+$requestBeforeLineId = $snapshotTailFirstBeforeLineId
+while ($requestBeforeLineId -gt 1) {
+    $lastLineId = $requestBeforeLineId - 1
+    $firstLineId = [uint64]($lastLineId - (($lastLineId - 1) % [uint64]$HistoryPageSize))
+    $expectedTranscriptPages.Add([pscustomobject]@{
+        request_before = $requestBeforeLineId
+        first = $firstLineId
+        last = $lastLineId
+        has_more = $firstLineId -gt 1
+    })
+    $requestBeforeLineId = $firstLineId
+}
+if ($expectedTranscriptPages.Count -ne $snapshotTranscriptPageCount -or
+    $HistoryPageCount -ne $snapshotTranscriptPageCount - 1) {
+    throw 'Snapshot/Transcript fixture page geometry is inconsistent.'
+}
+$tlH115BoundaryLineIds = [uint64[]]@(4095, 4096, 4097, 5200)
 $serial = "emulator-$EmulatorPort"
 
 function Stop-TailFirstE2E {
@@ -884,7 +898,9 @@ function Get-StateObservation {
         'session_id', 'snapshot_count', 'transcript_count', 'chunk_count',
         'snapshot_sequence_s', 'live_ack', 'bootstrap_source', 'history_overlay',
         'first_marker_visible', 'last_marker_visible', 'live_marker_visible',
-        'viewport_signature', 'terminal_columns', 'terminal_rows',
+        'viewport_signature', 'first_visible_line_id', 'visible_text_sha256',
+        'next_before_line_id', 'transcript_top_row', 'transcript_page_count',
+        'transcript_row_count', 'terminal_columns', 'terminal_rows',
         'realtime_socket_phase', 'realtime_socket_state', 'realtime_transport_state',
         'realtime_remote_state', 'realtime_socket_generation', 'realtime_connected_generation',
         'realtime_endpoint_count', 'realtime_reconnect_attempt', 'realtime_subscribe_send_count',
@@ -938,6 +954,29 @@ function Get-StateObservation {
     }
     Assert-E2E ([string]$Response.viewport_signature -match '^[A-Za-z0-9:_-]{1,128}$') `
         'E2E_HOOK_RESPONSE_INVALID' "Debug hook state for '$Phase' has an invalid viewport signature."
+    Assert-E2E ([string]$Response.visible_text_sha256 -cmatch '^[0-9a-f]{64}$') `
+        'E2E_HOOK_RESPONSE_INVALID' "Debug hook state for '$Phase' has an invalid visible-text hash."
+    foreach ($field in @(
+        'first_visible_line_id', 'next_before_line_id', 'transcript_page_count', 'transcript_row_count'
+    )) {
+        Assert-E2E (Test-JsonInteger $Response.$field ([decimal][uint64]::MaxValue)) `
+            'E2E_HOOK_RESPONSE_INVALID' "Debug hook state for '$Phase' has an invalid $field."
+    }
+    $transcriptTopRowValid = $false
+    if ($null -ne $Response.transcript_top_row -and
+        $Response.transcript_top_row -isnot [string] -and
+        $Response.transcript_top_row -isnot [bool]) {
+        try {
+            $transcriptTopRowNumber = [decimal]$Response.transcript_top_row
+            $transcriptTopRowValid =
+                $transcriptTopRowNumber -ge [int]::MinValue -and
+                $transcriptTopRowNumber -le [int]::MaxValue -and
+                [decimal]::Truncate($transcriptTopRowNumber) -eq $transcriptTopRowNumber
+        }
+        catch { $transcriptTopRowValid = $false }
+    }
+    Assert-E2E $transcriptTopRowValid `
+        'E2E_HOOK_RESPONSE_INVALID' "Debug hook state for '$Phase' has an invalid transcript_top_row."
     return [pscustomobject][ordered]@{
         phase = $Phase
         observed_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -953,6 +992,12 @@ function Get-StateObservation {
         last_marker_visible = [bool]$Response.last_marker_visible
         live_marker_visible = [bool]$Response.live_marker_visible
         viewport_signature = [string]$Response.viewport_signature
+        first_visible_line_id = [uint64]$Response.first_visible_line_id
+        visible_text_sha256 = [string]$Response.visible_text_sha256
+        next_before_line_id = [uint64]$Response.next_before_line_id
+        transcript_top_row = [int]$Response.transcript_top_row
+        transcript_page_count = [int]$Response.transcript_page_count
+        transcript_row_count = [int]$Response.transcript_row_count
         terminal_columns = [int]$Response.terminal_columns
         terminal_rows = [int]$Response.terminal_rows
         realtime_socket_phase = [string]$Response.realtime_socket_phase
@@ -1011,7 +1056,8 @@ function Get-PaginationObservation {
     $observation | Add-Member -NotePropertyName loaded_first_line_id -NotePropertyValue ([uint64]$Response.loaded_first_line_id)
     $observation | Add-Member -NotePropertyName loaded_last_line_id -NotePropertyValue ([uint64]$Response.loaded_last_line_id)
     $observation | Add-Member -NotePropertyName loaded_has_more_before -NotePropertyValue ([bool]$Response.loaded_has_more_before)
-    $observation | Add-Member -NotePropertyName next_before_line_id -NotePropertyValue ([uint64]$Response.next_before_line_id)
+    $observation | Add-Member -NotePropertyName next_before_line_id `
+        -NotePropertyValue ([uint64]$Response.next_before_line_id) -Force
     $script:evidence.observations += $observation
     Add-Assertion "page-$PageNumber-session-fixed" $ExpectedSessionId $observation.session_id `
         ($observation.session_id -ceq $ExpectedSessionId)
@@ -1352,13 +1398,14 @@ while ($true) {
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 $stem = '__MARKER_STEM__'
-1..1000 | ForEach-Object { [Console]::WriteLine(('{0}_{1:D4}' -f $stem, $_)) }
+1..__MARKER_COUNT__ | ForEach-Object { [Console]::WriteLine(('{0}_{1:D4}' -f $stem, $_)) }
 while ($true) {
     $line = [Console]::ReadLine()
     if ($null -eq $line -or $line -eq '__TERMLINK_TAIL_FIRST_EXIT__') { break }
     [Console]::WriteLine($line)
 }
-'@.Replace('__MARKER_STEM__', $markerStem)
+'@.Replace('__MARKER_STEM__', $markerStem).
+            Replace('__MARKER_COUNT__', [string]$markerCount)
     }
     $encodedChildScript = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
     $childCommand = '"{0}" -NoLogo -NoProfile -NonInteractive -EncodedCommand {1}' -f (Join-Path $PSHOME 'pwsh.exe'), $encodedChildScript
@@ -1384,6 +1431,7 @@ while ($true) {
         last_marker = $lastMarker
         marker_count = [string]$markerCount
         minimum_tail = [string]$minimumOpenTail
+        history_bootstrap_mode = $HistoryBootstrapMode
     }
     $sessionArm = Wait-SessionArm $openSessionRequest
     $sessionArm | Add-Member -NotePropertyName session_host_started_at_utc -NotePropertyValue ([DateTime]::UtcNow.ToString('o'))
@@ -1490,6 +1538,8 @@ while ($true) {
         ($initialObservation.live_ack -ge $initialObservation.snapshot_sequence_s)
     Add-Assertion 'initial-history-overlay-hidden' 'false' $initialObservation.history_overlay (-not $initialObservation.history_overlay)
     Add-Assertion 'tail-last-marker-visible' 'true' $initialObservation.last_marker_visible $initialObservation.last_marker_visible
+    Add-Assertion 'tl-h115-line-5200-visible' 'true' $initialObservation.last_marker_visible `
+        $initialObservation.last_marker_visible
     Add-Assertion 'tail-first-marker-not-visible' 'false' $initialObservation.first_marker_visible (-not $initialObservation.first_marker_visible)
     $script:evidence.screenshots += Save-Screenshot '01-initial-tail.png'
 
@@ -1525,7 +1575,8 @@ while ($true) {
     $overlayObservation | Add-Member -NotePropertyName loaded_first_line_id -NotePropertyValue ([uint64]$overlay.loaded_first_line_id)
     $overlayObservation | Add-Member -NotePropertyName loaded_last_line_id -NotePropertyValue ([uint64]$overlay.loaded_last_line_id)
     $overlayObservation | Add-Member -NotePropertyName loaded_has_more_before -NotePropertyValue ([bool]$overlay.loaded_has_more_before)
-    $overlayObservation | Add-Member -NotePropertyName next_before_line_id -NotePropertyValue ([uint64]$overlay.next_before_line_id)
+    $overlayObservation | Add-Member -NotePropertyName next_before_line_id `
+        -NotePropertyValue ([uint64]$overlay.next_before_line_id) -Force
     $script:evidence.observations += $overlayObservation
     Add-Assertion 'history-initial-load-session-fixed' $fixedSessionId $overlayObservation.session_id `
         ($overlayObservation.session_id -ceq $fixedSessionId)
@@ -1610,8 +1661,9 @@ while ($true) {
     Add-Assertion 'offline-probe-request-cursor' ([string]$offlineExpectedPage.request_before) `
         $previousPageObservation.next_before_line_id `
         ($previousPageObservation.next_before_line_id -eq $offlineExpectedPage.request_before)
-    Add-Assertion 'offline-probe-before-final-page-count' '4' $previousPageObservation.transcript_count `
-        ($previousPageObservation.transcript_count -eq 4)
+    Add-Assertion 'offline-probe-before-final-page-count' ([string]$HistoryPageCount) `
+        $previousPageObservation.transcript_count `
+        ($previousPageObservation.transcript_count -eq $HistoryPageCount)
     try {
         Set-AndroidAirplaneMode $true
         $script:evidence.cleanup.network_failure_injected = $true
@@ -1620,15 +1672,28 @@ while ($true) {
         # surface. Capture the failure-retention baseline after that transition
         # and immediately before the rejected page request, so the assertion
         # proves the request itself does not move or replace the viewport.
-        $offlineBaselineDeadline = [DateTime]::UtcNow.AddSeconds(20)
+        $offlineBaselineDeadline = [DateTime]::UtcNow.AddSeconds(30)
         $offlineBaselineObservation = $null
+        $offlinePreviousViewportSignature = $null
+        $offlineStableViewportSamples = 0
         do {
             $offlineBaselineResponse = Invoke-HookOperation 'inspect' @{ live_marker = $liveMarker }
             $offlineBaselineObservation = Get-StateObservation 'history-offline-baseline' $offlineBaselineResponse
-            $appObservedNetworkLoss =
+            $networkLossSettled =
                 $offlineBaselineObservation.realtime_network_lost_count -gt
                     $previousPageObservation.realtime_network_lost_count -and
                 $offlineBaselineObservation.realtime_remote_state -in @('READ_ONLY', 'RECONNECTING')
+            if ($networkLossSettled) {
+                $offlineStableViewportSamples = if (
+                    $offlineBaselineObservation.viewport_signature -ceq $offlinePreviousViewportSignature
+                ) { $offlineStableViewportSamples + 1 } else { 1 }
+                $offlinePreviousViewportSignature = $offlineBaselineObservation.viewport_signature
+            }
+            else {
+                $offlineStableViewportSamples = 0
+                $offlinePreviousViewportSignature = $null
+            }
+            $appObservedNetworkLoss = $networkLossSettled -and $offlineStableViewportSamples -ge 2
             if (-not $appObservedNetworkLoss) { Start-Sleep -Milliseconds 250 }
         } while (-not $appObservedNetworkLoss -and [DateTime]::UtcNow -lt $offlineBaselineDeadline)
         Add-Assertion 'offline-baseline-observed-network-loss' 'true' $appObservedNetworkLoss `
@@ -1681,6 +1746,16 @@ while ($true) {
         Add-Assertion 'failure-retains-viewport' $offlineBaselineObservation.viewport_signature `
             $retainedObservation.viewport_signature `
             ($retainedObservation.viewport_signature -ceq $offlineBaselineObservation.viewport_signature)
+        Add-Assertion 'failure-retains-first-visible-line-id' `
+            ([string]$offlineBaselineObservation.first_visible_line_id) `
+            $retainedObservation.first_visible_line_id `
+            ($retainedObservation.first_visible_line_id -eq $offlineBaselineObservation.first_visible_line_id)
+        Add-Assertion 'failure-retains-visible-text-hash' $offlineBaselineObservation.visible_text_sha256 `
+            $retainedObservation.visible_text_sha256 `
+            ($retainedObservation.visible_text_sha256 -ceq $offlineBaselineObservation.visible_text_sha256)
+        Add-Assertion 'failure-retains-transcript-top-row' `
+            ([string]$offlineBaselineObservation.transcript_top_row) $retainedObservation.transcript_top_row `
+            ($retainedObservation.transcript_top_row -eq $offlineBaselineObservation.transcript_top_row)
         Add-Assertion 'failure-retains-grid-columns' ([string]$fixedColumns) $retainedObservation.terminal_columns `
             ($retainedObservation.terminal_columns -eq $fixedColumns)
         Add-Assertion 'failure-retains-grid-rows' ([string]$fixedRows) $retainedObservation.terminal_rows `
@@ -1746,8 +1821,22 @@ while ($true) {
         -ExpectedRows $fixedRows `
         -ExpectedPage $expectedTranscriptPages[$HistoryPageCount] `
         -SeenViewportSignatures $seenViewportSignatures
-    Add-Assertion 'history-complete-five-distinct-pages' '5' $previousPageObservation.transcript_count `
-        ($previousPageObservation.transcript_count -eq 5)
+    Add-Assertion 'history-complete-all-distinct-pages' ([string]$snapshotTranscriptPageCount) `
+        $previousPageObservation.transcript_count `
+        ($previousPageObservation.transcript_count -eq $snapshotTranscriptPageCount)
+    foreach ($boundary in $tlH115BoundaryLineIds | Where-Object { $_ -lt $snapshotMarkerCount }) {
+        $boundaryPageIndex = -1
+        for ($index = 0; $index -lt $expectedTranscriptPages.Count; $index++) {
+            $candidatePage = $expectedTranscriptPages[$index]
+            if ($boundary -ge $candidatePage.first -and $boundary -le $candidatePage.last) {
+                $boundaryPageIndex = $index
+                break
+            }
+        }
+        Add-Assertion "tl-h115-line-$boundary-loaded" 'authenticated transcript page loaded' `
+            $boundaryPageIndex `
+            ($boundaryPageIndex -ge 0 -and $previousPageObservation.transcript_count -gt $boundaryPageIndex)
+    }
     $script:evidence.screenshots += Save-Screenshot '02b-complete-history.png'
 
     $script:stage = 'history-overlay-live-flow'

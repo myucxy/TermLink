@@ -189,6 +189,7 @@ namespace TermLink.Agent
         private readonly bool terminalSnapshotEnabled;
         private readonly bool typedInputEnabled;
         private readonly bool terminalCoreShadowEnabled;
+        private readonly string registryControlPipeName;
         private readonly ConcurrentDictionary<Guid, string> terminalCoreShadowStates =
             new ConcurrentDictionary<Guid, string>();
         private static readonly TermLink.TerminalCore.VtTerminalInputEncoder TypedInputEncoder =
@@ -215,6 +216,7 @@ namespace TermLink.Agent
         private Task statusRefreshWorker;
         private string tokenEndpoint;
         private int disposed;
+        private int cleanupStarted;
         private int reauthenticationRequired;
         private long successfulConnectionGeneration;
         private long lastLiveHistoryActivityTick = Environment.TickCount64;
@@ -222,19 +224,23 @@ namespace TermLink.Agent
         private Guid persistedHistoryCancellationSessionId;
 
         private ProductionAgentRuntime(ProductionAgentConfig config, ProductionCredentials credentials)
-            : this(config, credentials, new ProductionReconnectPreferences())
+            : this(config, credentials, new ProductionReconnectPreferences(), null)
         {
         }
 
         private ProductionAgentRuntime(
             ProductionAgentConfig config,
             ProductionCredentials credentials,
-            ProductionReconnectPreferences reconnectPreferences)
+            ProductionReconnectPreferences reconnectPreferences,
+            string registryControlPipeName)
         {
             this.config = config;
             this.credentials = credentials;
             this.reconnectPreferences = reconnectPreferences ??
                 throw new ArgumentNullException(nameof(reconnectPreferences));
+            this.registryControlPipeName = string.IsNullOrWhiteSpace(registryControlPipeName)
+                ? TermLinkControlPipe.DefaultName()
+                : registryControlPipeName.Trim();
             this.reconnectPreferences.Validate();
             http = ProductionTls.CreateHttpClient(config.ServerUrl);
             http.Timeout = TimeSpan.FromSeconds(15);
@@ -345,7 +351,7 @@ namespace TermLink.Agent
             return producer.ProcessSession(sessionId);
         }
 
-        public static ProductionAgentRuntime TryCreate()
+        public static ProductionAgentRuntime TryCreate(string registryControlPipeName = null)
         {
             var config = ProductionAgentConfig.TryLoad(); if (config == null) return null;
             var runtimeVersion = typeof(ProductionAgentRuntime).Assembly
@@ -362,7 +368,8 @@ namespace TermLink.Agent
             return new ProductionAgentRuntime(
                 config,
                 credentials,
-                ProductionReconnectPreferences.Load());
+                ProductionReconnectPreferences.Load(),
+                registryControlPipeName);
         }
 
         public void Attach(SessionRegistry registry)
@@ -385,7 +392,7 @@ namespace TermLink.Agent
                     new ProductionFileOperationApi(config.PcId, fileUploadHttp, SendAsync),
                     new DirectoryListingService(),
                     new FileTransferPreparer(),
-                    new ManagedTerminalLauncher(),
+                    new ManagedTerminalLauncher(registryControlPipeName),
                     cancellation.Token,
                     () => registry.RemoteAccessEnabled,
                     sessionId => registry.ContainsSession(sessionId),
@@ -4475,7 +4482,12 @@ namespace TermLink.Agent
         private static byte[] GuidBytes(Guid value) { return Convert.FromHexString(value.ToString("N")); }
         private static Guid GuidFromBytes(ReadOnlySpan<byte> value) { if (value.Length != 16) throw new InvalidDataException("UUID must contain 16 bytes."); return Guid.ParseExact(Convert.ToHexString(value), "N"); }
 
-        public void Dispose()
+        /// <summary>
+        /// Immediately prevents this runtime from publishing any more account data.
+        /// The potentially slow worker joins remain in Dispose so account switching
+        /// can acknowledge the new local state without waiting on network teardown.
+        /// </summary>
+        internal void StopAccountSynchronization()
         {
             if (Interlocked.Exchange(ref disposed, 1) != 0) return;
             SetRelayState(ProductionRelayState.Stopped, string.Empty);
@@ -4484,7 +4496,18 @@ namespace TermLink.Agent
 
             ClientWebSocket active;
             lock (lifecycleSync) active = socket;
-            if (active != null) active.Dispose();
+            if (active != null)
+            {
+                try { active.Abort(); }
+                catch (ObjectDisposedException) { }
+                active.Dispose();
+            }
+        }
+
+        public void Dispose()
+        {
+            StopAccountSynchronization();
+            if (Interlocked.Exchange(ref cleanupStarted, 1) != 0) return;
 
             Task activeWorker;
             Task activeHistoryWorker;

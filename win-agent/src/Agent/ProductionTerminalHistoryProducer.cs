@@ -67,9 +67,14 @@ namespace TermLink.Agent
             public NativeTerminal TerminalCore;
             public string TerminalCoreFailureCode = string.Empty;
 
-            public ProductionState(bool terminalCoreSnapshotAuthorityEnabled)
+            public ProductionState(
+                bool terminalCoreSnapshotAuthorityEnabled,
+                Action<IReadOnlyList<PortableTerminalRowV1>> transcriptArchiveSink)
             {
-                Model = new PortableTerminalModelV1(DefaultColumns, DefaultRows);
+                Model = new PortableTerminalModelV1(
+                    DefaultColumns,
+                    DefaultRows,
+                    transcriptArchiveSink);
                 if (!terminalCoreSnapshotAuthorityEnabled) return;
                 try
                 {
@@ -173,7 +178,7 @@ namespace TermLink.Agent
                 if (releasedSessions.ContainsKey(sessionId)) return ReleasedResult(sessionId);
                 var state = states.GetOrAdd(
                     sessionId,
-                    _ => new ProductionState(terminalCoreSnapshotAuthorityEnabled));
+                    _ => CreateProductionState(sessionId));
                 ProductionTerminalHistoryProductionResult result;
                 ShadowDispatchRequest shadowDispatch;
                 lock (state.Sync)
@@ -234,7 +239,7 @@ namespace TermLink.Agent
                 if (releasedSessions.ContainsKey(sessionId)) return ReleasedResult(sessionId);
                 var state = states.GetOrAdd(
                     sessionId,
-                    _ => new ProductionState(terminalCoreSnapshotAuthorityEnabled));
+                    _ => CreateProductionState(sessionId));
                 ProductionTerminalHistoryProductionResult result;
                 ShadowDispatchRequest shadowDispatch;
                 lock (state.Sync)
@@ -437,7 +442,8 @@ namespace TermLink.Agent
             {
                 return RejectCheckpoint(result, "SNAPSHOT_CONTRACT_VALIDATION_FAILED");
             }
-            var pages = BuildTranscriptPages(portable, styleTable, palette).ToList();
+            var archivedPages = store.ReadTranscriptArchivePages(sessionId);
+            var pages = BuildTranscriptPages(portable, archivedPages, palette).ToList();
             try
             {
                 for (var index = 0; index < pages.Count; index++)
@@ -568,6 +574,13 @@ namespace TermLink.Agent
                 releasedSessions.Clear();
             }
             finally { lifecycleGate.ExitWriteLock(); }
+        }
+
+        private ProductionState CreateProductionState(Guid sessionId)
+        {
+            return new ProductionState(
+                terminalCoreSnapshotAuthorityEnabled,
+                rows => store.AppendTranscriptArchivePage(sessionId, rows));
         }
 
         internal void ReleaseSession(Guid sessionId)
@@ -1316,29 +1329,53 @@ namespace TermLink.Agent
 
         private static IEnumerable<TerminalTranscriptPageV1> BuildTranscriptPages(
             PortableTerminalSnapshotV1 source,
-            IList<PortableTerminalStyleV1> styles,
+            IList<IReadOnlyList<PortableTerminalRowV1>> archivedPages,
             TerminalPaletteV1 palette)
         {
+            if (archivedPages == null) throw new ArgumentNullException(nameof(archivedPages));
+            var pageRows = new List<IReadOnlyList<PortableTerminalRowV1>>(archivedPages.Count +
+                (source.ScrollbackRows.Count + MaximumTranscriptRowsPerPage - 1) /
+                MaximumTranscriptRowsPerPage);
+            pageRows.AddRange(archivedPages);
             for (var offset = 0; offset < source.ScrollbackRows.Count; offset += MaximumTranscriptRowsPerPage)
             {
                 var count = Math.Min(MaximumTranscriptRowsPerPage, source.ScrollbackRows.Count - offset);
-                var first = source.ScrollbackRows[offset];
-                var last = source.ScrollbackRows[offset + count - 1];
+                pageRows.Add(source.ScrollbackRows.Skip(offset).Take(count).ToArray());
+            }
+            for (var pageIndex = 0; pageIndex < pageRows.Count; pageIndex++)
+            {
+                var rows = pageRows[pageIndex];
+                if (rows.Count == 0 || rows.Count > MaximumTranscriptRowsPerPage)
+                    throw new InvalidDataException("A transcript archive page has an invalid row count.");
+                var styles = BuildStyleTable(rows);
+                if (styles.Count > MaximumTermuxStyles)
+                    throw new InvalidDataException("A transcript archive page exceeds the style-table limit.");
+                var first = rows[0];
+                var last = rows[^1];
                 var page = new TerminalTranscriptPageV1
                 {
                     FormatVersion = SnapshotCrypto.FormatVersion,
                     AsOfSnapshotSeq = source.Sequence,
                     FirstLineId = first.LineId,
                     LastLineId = last.LineId,
-                    HasMoreBefore = offset > 0,
-                    NextBeforeLineId = offset > 0 ? first.LineId : 0,
+                    HasMoreBefore = pageIndex > 0,
+                    NextBeforeLineId = pageIndex > 0 ? first.LineId : 0,
                     Palette = palette.Clone()
                 };
                 foreach (var style in styles) page.StyleTable.Add(ToWireStyle(style));
-                for (var index = 0; index < count; index++)
-                    page.Rows.Add(ToWireRow(source.ScrollbackRows[offset + index], styles));
+                foreach (var row in rows) page.Rows.Add(ToWireRow(row, styles));
                 yield return page;
             }
+        }
+
+        private static List<PortableTerminalStyleV1> BuildStyleTable(
+            IEnumerable<PortableTerminalRowV1> rows)
+        {
+            var result = new List<PortableTerminalStyleV1>();
+            AddStyle(result, PortableTerminalStyleV1.Default);
+            foreach (var row in rows)
+                foreach (var cell in row.Cells) AddStyle(result, cell.Style);
+            return result;
         }
 
         private static TerminalRowV1 ToWireRow(

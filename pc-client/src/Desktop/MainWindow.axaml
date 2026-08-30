@@ -60,9 +60,11 @@
         </StackPanel>
 
         <StackPanel x:Name="SidebarIdentityPanel" Grid.Row="3" Spacing="8">
-          <Border Classes="subtle-card" Padding="11">
-            <Grid ColumnDefinitions="24,*" ColumnSpacing="9">
-              <PathIcon Data="{DynamicResource TermLinkDevicesIcon}" Width="18" Height="18" VerticalAlignment="Center" />
+          <Border x:Name="SidebarComputerCard" Classes="subtle-card" Padding="10">
+            <Grid ColumnDefinitions="36,*" ColumnSpacing="10">
+              <Grid Width="36" Height="36">
+                <PathIcon Data="{DynamicResource TermLinkDevicesIcon}" Width="18" Height="18" HorizontalAlignment="Center" VerticalAlignment="Center" />
+              </Grid>
               <TextBlock x:Name="SidebarComputerNameText" Grid.Column="1"
                          Text="{Binding AgentName}"
                          ToolTip.Tip="{Binding AgentName}"
@@ -73,8 +75,13 @@
             </Grid>
           </Border>
 
-          <Border x:Name="SidebarAccountLoading" Classes="subtle-card" Padding="11" IsVisible="{Binding IsAccountStateLoading}">
-            <TextBlock Text="{x:Static text:PresentationText.AccountLoading}" Classes="muted" FontSize="12" />
+          <Border x:Name="SidebarAccountLoading" Classes="subtle-card" Padding="10" MinHeight="52" IsVisible="{Binding IsAccountStateLoading}">
+            <Grid ColumnDefinitions="36,*" ColumnSpacing="10">
+              <Grid Width="36" Height="36">
+                <PathIcon Data="{DynamicResource TermLinkAccountIcon}" Foreground="{DynamicResource TermLinkMutedBrush}" Width="18" Height="18" HorizontalAlignment="Center" VerticalAlignment="Center" />
+              </Grid>
+              <TextBlock Grid.Column="1" Text="{x:Static text:PresentationText.AccountLoading}" Classes="muted" FontSize="12" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+            </Grid>
           </Border>
 
           <Button x:Name="SidebarAccountButton"
@@ -120,8 +127,10 @@
                   IsVisible="{Binding HasAvailableUpdate}"
                   Command="{Binding OpenAboutUpdatesCommand}"
                   AutomationProperties.Name="打开 TermLink 更新">
-            <Grid ColumnDefinitions="24,*" ColumnSpacing="9">
-              <PathIcon Data="{DynamicResource TermLinkRefreshIcon}" Width="18" Height="18" VerticalAlignment="Center" />
+            <Grid ColumnDefinitions="36,*" ColumnSpacing="10">
+              <Grid Width="36" Height="36">
+                <PathIcon Data="{DynamicResource TermLinkRefreshIcon}" Width="18" Height="18" HorizontalAlignment="Center" VerticalAlignment="Center" />
+              </Grid>
               <TextBlock Grid.Column="1"
                          Text="{Binding AvailableUpdateText}"
                          ToolTip.Tip="{Binding AvailableUpdateText}"
@@ -136,16 +145,28 @@
       </Grid>
     </Border>
 
-    <Grid Grid.Column="1" RowDefinitions="72,Auto,*">
+    <Grid Grid.Column="1" RowDefinitions="72,*">
       <Border Grid.Row="0" BorderBrush="{DynamicResource TermLinkOutlineBrush}" BorderThickness="0,0,0,1" Padding="28,14">
         <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="12">
           <StackPanel VerticalAlignment="Center">
-            <TextBlock Text="{Binding CurrentPage.Title}" FontSize="18" FontWeight="SemiBold" />
-            <TextBlock Text="{x:Static text:PresentationText.Console}" Classes="muted" FontSize="12" />
+            <TextBlock x:Name="CurrentPageTitleText" Text="{Binding CurrentPage.Title}" FontSize="18" FontWeight="SemiBold" />
+            <TextBlock x:Name="CurrentPageSubtitleText" Text="{Binding CurrentPageSubtitle}" Classes="muted" FontSize="12" />
           </StackPanel>
-          <Border Grid.Column="1" Classes="status-pill" Classes.positive="{Binding IsConnected}" VerticalAlignment="Center">
+          <Border x:Name="ServerStatusPill"
+                  Grid.Column="1"
+                  Classes="status-pill"
+                  Classes.positive="{Binding IsConnected}"
+                  Classes.warning="{Binding IsConnectionBusy}"
+                  Classes.error="{Binding IsServerDisconnected}"
+                  ToolTip.Tip="{Binding ServerConnectionToolTip}"
+                  VerticalAlignment="Center">
             <Grid ColumnDefinitions="Auto,Auto" ColumnSpacing="7">
-              <Border Classes="status-dot" Classes.online="{Binding IsConnected}" VerticalAlignment="Center" />
+              <Border x:Name="ServerStatusDot"
+                      Classes="status-dot"
+                      Classes.online="{Binding IsConnected}"
+                      Classes.warning="{Binding IsConnectionBusy}"
+                      Classes.error="{Binding IsServerDisconnected}"
+                      VerticalAlignment="Center" />
               <TextBlock Grid.Column="1" Text="{Binding StatusText}" FontSize="12" FontWeight="SemiBold" />
             </Grid>
           </Border>
@@ -155,7 +176,14 @@
         </Grid>
       </Border>
 
-      <Grid Grid.Row="1" Margin="28,14,28,0" IsVisible="{Binding HasNotice}">
+      <Grid x:Name="NoticeOverlay"
+            Grid.Row="1"
+            Panel.ZIndex="10"
+            Width="520"
+            Margin="28,0,28,26"
+            HorizontalAlignment="Right"
+            VerticalAlignment="Bottom"
+            IsVisible="{Binding HasNotice}">
         <Border Classes="notice" IsVisible="{Binding IsInfoNotice}">
           <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
             <StackPanel>
@@ -189,23 +217,17 @@
         </Border>
       </Grid>
 
-      <Grid Grid.Row="2" Margin="28,20,28,26">
+      <Grid Grid.Row="1" Margin="28,20,28,26">
         <ScrollViewer x:Name="DevicesPageRoot" IsVisible="{Binding IsDevicesPageSelected}" HorizontalScrollBarVisibility="Disabled" AllowAutoHide="False">
           <StackPanel x:Name="DevicesContentRoot" MaxWidth="{DynamicResource TermLinkContentMaxWidth}" HorizontalAlignment="Stretch" Spacing="18" Margin="0,0,16,0">
-            <StackPanel>
-              <TextBlock Classes="eyebrow" Text="{x:Static text:PresentationText.ThisDevice}" />
-              <TextBlock Classes="page-title" Text="{Binding AgentName}" Margin="0,2,0,0" />
-              <TextBlock Classes="muted" Text="{x:Static text:PresentationText.ThisDeviceDetail}" Margin="0,4,0,0" />
-            </StackPanel>
-
             <Border x:Name="ConnectionPageRoot" Classes="card">
               <StackPanel Spacing="16">
                 <Grid ColumnDefinitions="*,Auto" ColumnSpacing="20">
                   <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12">
                     <Border Classes="status-dot" Classes.online="{Binding IsConnected}" VerticalAlignment="Center" />
                     <StackPanel Grid.Column="1">
-                      <TextBlock Text="{Binding Connection.Summary}" FontSize="18" FontWeight="SemiBold" />
-                      <TextBlock Text="{Binding Connection.Detail}" Classes="muted" TextWrapping="Wrap" Margin="0,2,0,0" />
+                      <TextBlock Text="{x:Static text:PresentationText.RemoteAccess}" FontSize="18" FontWeight="SemiBold" />
+                      <TextBlock Text="{x:Static text:PresentationText.RemoteAccessDetail}" Classes="muted" TextWrapping="Wrap" Margin="0,2,0,0" />
                     </StackPanel>
                   </Grid>
                   <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
@@ -223,40 +245,21 @@
                             Command="{Binding RetryConnectionCommand}" />
                   </StackPanel>
                 </Grid>
-                <Grid ColumnDefinitions="*,*,*" ColumnSpacing="10">
-                  <Border Classes="subtle-card">
-                    <StackPanel><TextBlock Text="{x:Static text:PresentationText.RemoteAccess}" Classes="muted" FontSize="12" /><TextBlock Text="{Binding RemoteAccessStatusText}" FontWeight="SemiBold" Margin="0,3,0,0" /></StackPanel>
-                  </Border>
-                  <Border Grid.Column="1" Classes="subtle-card">
-                    <StackPanel><TextBlock Text="{x:Static text:PresentationText.ActiveSessions}" Classes="muted" FontSize="12" /><TextBlock Text="{Binding ActiveSessionCount}" FontSize="20" FontWeight="SemiBold" /></StackPanel>
-                  </Border>
-                  <Border Grid.Column="2" Classes="subtle-card">
-                    <StackPanel><TextBlock Text="{x:Static text:PresentationText.AgentVersion}" Classes="muted" FontSize="12" /><TextBlock Text="{Binding Settings.Version}" FontWeight="SemiBold" Margin="0,3,0,0" /></StackPanel>
-                  </Border>
-                </Grid>
               </StackPanel>
             </Border>
           </StackPanel>
         </ScrollViewer>
 
-        <Grid x:Name="SessionsPageRoot" IsVisible="{Binding IsSessionsPageSelected}" RowDefinitions="Auto,*" MaxWidth="{DynamicResource TermLinkContentMaxWidth}" HorizontalAlignment="Stretch">
-          <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,18">
-            <StackPanel>
-              <TextBlock Classes="eyebrow" Text="{x:Static text:PresentationText.ActiveSessions}" />
-              <TextBlock Classes="page-title" Text="{x:Static text:PresentationText.Sessions}" Margin="0,2,0,0" />
-            </StackPanel>
-            <Border Grid.Column="1" Classes="status-pill" VerticalAlignment="Center">
-              <TextBlock Text="{Binding SessionCountText}" />
-            </Border>
-          </Grid>
-
-          <Grid Grid.Row="1">
-            <Border Classes="card" IsVisible="{Binding HasNoSessions}" VerticalAlignment="Stretch">
-              <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8" Margin="24">
-                <PathIcon Data="{DynamicResource TermLinkTerminalIcon}" Width="48" Height="48" Foreground="{DynamicResource TermLinkMutedBrush}" />
-                <TextBlock Text="{x:Static text:PresentationText.NoSessions}" FontSize="20" FontWeight="SemiBold" HorizontalAlignment="Center" />
-                <TextBlock Text="{x:Static text:PresentationText.NoSessionsDetail}" Classes="muted" TextWrapping="Wrap" TextAlignment="Center" MaxWidth="480" />
-              </StackPanel>
+        <Grid x:Name="SessionsPageRoot" IsVisible="{Binding IsSessionsPageSelected}" MaxWidth="{DynamicResource TermLinkContentMaxWidth}" HorizontalAlignment="Stretch">
+          <Grid>
+            <Border Classes="card" IsVisible="{Binding HasNoSessions}" VerticalAlignment="Top">
+              <Grid ColumnDefinitions="Auto,*" ColumnSpacing="14" Margin="4">
+                <PathIcon Data="{DynamicResource TermLinkTerminalIcon}" Width="32" Height="32" Foreground="{DynamicResource TermLinkMutedBrush}" VerticalAlignment="Center" />
+                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                  <TextBlock Text="{x:Static text:PresentationText.NoSessions}" FontSize="18" FontWeight="SemiBold" />
+                  <TextBlock Text="{x:Static text:PresentationText.NoSessionsDetail}" Classes="muted" TextWrapping="Wrap" Margin="0,2,0,0" />
+                </StackPanel>
+              </Grid>
             </Border>
             <ListBox x:Name="SessionList" Classes="clean" ItemsSource="{Binding Sessions.Items}" IsVisible="{Binding HasSessions}" ScrollViewer.AllowAutoHide="False">
               <ListBox.ItemsPanel><ItemsPanelTemplate><VirtualizingStackPanel /></ItemsPanelTemplate></ListBox.ItemsPanel>
@@ -291,9 +294,7 @@
         </Grid>
 
         <Grid x:Name="SettingsPageRoot" IsVisible="{Binding IsSettingsPageSelected}" RowDefinitions="Auto,*" MaxWidth="{DynamicResource TermLinkContentMaxWidth}" HorizontalAlignment="Stretch">
-          <StackPanel Margin="0,0,0,18">
-            <TextBlock Classes="eyebrow" Text="TermLink" />
-            <TextBlock Classes="page-title" Text="{x:Static text:PresentationText.Settings}" Margin="0,2,0,12" />
+          <StackPanel Margin="0,0,0,14">
             <WrapPanel>
               <Button Classes="section-nav" Classes.selected="{Binding IsGeneralSettingsSelected}" Content="{x:Static text:PresentationText.General}" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="general" />
               <Button Classes="section-nav" Classes.selected="{Binding IsAccountSettingsSelected}" Content="{x:Static text:PresentationText.Account}" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="account" />
@@ -348,26 +349,23 @@
                 <Border x:Name="AccountSignInCard" Classes="card" IsVisible="{Binding IsAccountSignedOut}">
                   <StackPanel Spacing="16" MaxWidth="560" HorizontalAlignment="Left">
                     <StackPanel><TextBlock Classes="section-title" Text="{Binding AccountStateTitle}" /><TextBlock Classes="muted" Text="{Binding AccountStateDetail}" TextWrapping="Wrap" /></StackPanel>
-                    <WrapPanel>
-                      <Button Classes="section-nav" Classes.selected="{Binding IsLoginMode}" Content="{x:Static text:PresentationText.LoginMode}" Command="{Binding SetAccountFormModeCommand}" CommandParameter="login" />
-                      <Button Classes="section-nav" Classes.selected="{Binding IsRegisterMode}" Content="{x:Static text:PresentationText.RegisterMode}" Command="{Binding SetAccountFormModeCommand}" CommandParameter="register" IsVisible="{Binding CanRegisterAccount}" />
-                    </WrapPanel>
-                    <Grid ColumnDefinitions="130,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto" RowSpacing="10">
-                      <TextBlock Text="{x:Static text:PresentationText.PcName}" VerticalAlignment="Center" />
-                      <TextBox Grid.Column="1" Text="{Binding Account.PcName}" AutomationProperties.Name="PC 名称" />
-                      <TextBlock Grid.Row="1" Text="{x:Static text:PresentationText.Username}" VerticalAlignment="Center" />
-                      <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding Account.Username}" AutomationProperties.Name="用户名" />
-                      <TextBlock Grid.Row="2" Text="{x:Static text:PresentationText.Nickname}" VerticalAlignment="Center" IsVisible="{Binding IsRegisterMode}" />
-                      <TextBox x:Name="AccountNicknameInput" Grid.Row="2" Grid.Column="1" Text="{Binding Account.Nickname}" AutomationProperties.Name="昵称" IsVisible="{Binding IsRegisterMode}" />
-                      <TextBlock Grid.Row="3" Text="{x:Static text:PresentationText.RegistrationEmail}" VerticalAlignment="Center" IsVisible="{Binding IsRegisterMode}" />
-                      <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding Account.Email}" AutomationProperties.Name="注册邮箱" IsVisible="{Binding IsRegisterMode}" />
-                      <TextBlock Grid.Row="4" Text="{x:Static text:PresentationText.Password}" VerticalAlignment="Center" />
-                      <TextBox Grid.Row="4" Grid.Column="1" PasswordChar="●" Text="{Binding Account.Password}" AutomationProperties.Name="密码" />
-                      <TextBlock Grid.Row="5" Text="{x:Static text:PresentationText.ConfirmPassword}" VerticalAlignment="Center" IsVisible="{Binding IsRegisterMode}" />
-                      <TextBox Grid.Row="5" Grid.Column="1" PasswordChar="●" Text="{Binding Account.PasswordConfirmation}" AutomationProperties.Name="确认密码" IsVisible="{Binding IsRegisterMode}" />
-                    </Grid>
-                    <Button Classes="primary" Content="{x:Static text:PresentationText.Login}" Command="{Binding LoginCommand}" IsVisible="{Binding IsLoginMode}" HorizontalAlignment="Left" />
-                    <Button Classes="primary" Content="{x:Static text:PresentationText.Register}" Command="{Binding RegisterCommand}" IsVisible="{Binding IsRegisterMode}" HorizontalAlignment="Left" />
+                    <Border Classes="subtle-card">
+                      <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12">
+                        <Border Classes="account-avatar muted" Width="36" Height="36" VerticalAlignment="Top">
+                          <PathIcon Data="{DynamicResource TermLinkAccountIcon}" Foreground="{DynamicResource TermLinkMutedBrush}" Width="20" Height="20" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <TextBlock Grid.Column="1" Text="{x:Static text:PresentationText.BrowserAccountAuthorizationDetail}" Classes="muted" TextWrapping="Wrap" VerticalAlignment="Center" />
+                      </Grid>
+                    </Border>
+                    <Border x:Name="BrowserAuthorizationProgress" Classes="notice" IsVisible="{Binding BeginAccountAuthorizationCommand.IsRunning}">
+                      <TextBlock Text="{x:Static text:PresentationText.BrowserAuthorizationStartedDetail}" TextWrapping="Wrap" />
+                    </Border>
+                    <Button x:Name="BrowserAccountAuthorizationButton"
+                            Classes="primary"
+                            Content="{x:Static text:PresentationText.BrowserAccountAuthorization}"
+                            Command="{Binding BeginAccountAuthorizationCommand}"
+                            IsEnabled="{Binding !BeginAccountAuthorizationCommand.IsRunning}"
+                            HorizontalAlignment="Left" />
                   </StackPanel>
                 </Border>
               </StackPanel>
@@ -411,7 +409,10 @@
                 <Border Classes="card">
                   <Grid ColumnDefinitions="*,Auto" ColumnSpacing="18">
                     <StackPanel><TextBlock Classes="section-title" Text="Windows Terminal" /><TextBlock Text="{x:Static text:PresentationText.TerminalIntegrationDetail}" Classes="muted" /></StackPanel>
-                    <Button Grid.Column="1" Classes="subtle" Content="{x:Static text:PresentationText.RepairTerminal}" AutomationProperties.Name="修复 Windows Terminal 集成" Command="{Binding RepairTerminalIntegrationCommand}" VerticalAlignment="Center" />
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                      <Button x:Name="ConfigureTerminalIntegrationButton" Classes="subtle" Content="{x:Static text:PresentationText.Configure}" AutomationProperties.Name="配置 Windows Terminal 集成" Command="{Binding OpenTerminalIntegrationSettingsCommand}" />
+                      <Button Classes="subtle" Content="{x:Static text:PresentationText.RepairTerminal}" AutomationProperties.Name="修复 Windows Terminal 集成" Command="{Binding RepairTerminalIntegrationCommand}" />
+                    </StackPanel>
                   </Grid>
                 </Border>
               </StackPanel>
@@ -480,6 +481,34 @@
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
             <Button Classes="subtle" Content="{x:Static text:PresentationText.Cancel}" Command="{Binding CancelPendingActionCommand}" />
             <Button Classes="danger" Content="{x:Static text:PresentationText.ConfirmAction}" Command="{Binding ConfirmPendingActionCommand}" />
+          </StackPanel>
+        </StackPanel>
+      </Border>
+    </Border>
+
+    <Border x:Name="TerminalIntegrationEditor" Grid.ColumnSpan="2" Background="{DynamicResource TermLinkScrimBrush}" IsVisible="{Binding Settings.TerminalIntegrationEditorOpen}" ZIndex="95">
+      <Border Classes="card" Width="560" HorizontalAlignment="Center" VerticalAlignment="Center" Padding="24">
+        <StackPanel Spacing="16">
+          <StackPanel Spacing="6">
+            <TextBlock Text="{x:Static text:PresentationText.TerminalIntegrationOptions}" FontSize="20" FontWeight="SemiBold" />
+            <TextBlock Text="{x:Static text:PresentationText.TerminalIntegrationOptionsDetail}" Classes="muted" TextWrapping="Wrap" />
+            <TextBlock Text="{x:Static text:PresentationText.PackageManagedTerminalIntegration}" Classes="muted" TextWrapping="Wrap" IsVisible="{Binding !Settings.CanConfigureTerminalIntegration}" />
+          </StackPanel>
+          <CheckBox x:Name="TerminalAddNoLogoCheckBox" IsChecked="{Binding Settings.TerminalAddNoLogo}" IsEnabled="{Binding Settings.CanConfigureTerminalIntegration}" AutomationProperties.Name="添加 -NoLogo">
+            <StackPanel>
+              <TextBlock Text="{x:Static text:PresentationText.AddNoLogo}" FontWeight="SemiBold" />
+              <TextBlock Text="{x:Static text:PresentationText.AddNoLogoDetail}" Classes="muted" FontSize="12" TextWrapping="Wrap" />
+            </StackPanel>
+          </CheckBox>
+          <CheckBox x:Name="TerminalAddNoProfileCheckBox" IsChecked="{Binding Settings.TerminalAddNoProfile}" IsEnabled="{Binding Settings.CanConfigureTerminalIntegration}" AutomationProperties.Name="添加 -NoProfile">
+            <StackPanel>
+              <TextBlock Text="{x:Static text:PresentationText.AddNoProfile}" FontWeight="SemiBold" />
+              <TextBlock Text="{x:Static text:PresentationText.AddNoProfileDetail}" Classes="muted" FontSize="12" TextWrapping="Wrap" />
+            </StackPanel>
+          </CheckBox>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+            <Button Classes="subtle" Content="{x:Static text:PresentationText.Cancel}" Command="{Binding CancelTerminalIntegrationSettingsCommand}" />
+            <Button x:Name="SaveTerminalIntegrationButton" Classes="primary" Content="{x:Static text:PresentationText.Save}" Command="{Binding SaveTerminalIntegrationSettingsCommand}" IsEnabled="{Binding Settings.CanConfigureTerminalIntegration}" />
           </StackPanel>
         </StackPanel>
       </Border>

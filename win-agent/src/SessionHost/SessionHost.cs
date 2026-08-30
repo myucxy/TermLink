@@ -595,8 +595,17 @@ namespace TermLink.SessionHost
             {
                 terminalAuthority.ApplyDurable(frame);
             }
-            catch
+            catch (Exception error)
             {
+                if (options.Diagnostics)
+                {
+                    Console.Error.WriteLine(
+                        "__TERMINAL_AUTHORITY_FAILURE__:sequence=" + frame.Sequence +
+                        ";type=" + frame.Type +
+                        ";error=" + error.GetType().Name +
+                        ";message=" + error.Message.Replace('\r', ' ').Replace('\n', ' ') +
+                        ";payload_bytes=" + frame.Payload.Length);
+                }
                 authorityFailed = true;
                 outputDisconnected = true;
                 CloseInput();

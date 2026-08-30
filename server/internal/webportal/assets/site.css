@@ -877,91 +877,6 @@ html[data-theme="dark"] .theme-icon-sun { display: inline; }
   color: var(--text-3);
 }
 
-.registration-card {
-  width: min(100%, 640px);
-}
-
-.registration-card .error-card-header {
-  margin-bottom: 34px;
-}
-
-.registration-form {
-  display: grid;
-  gap: 15px;
-}
-
-.registration-form label {
-  min-width: 0;
-  display: grid;
-  gap: 7px;
-  color: var(--text-2);
-  font-size: 13px;
-  font-weight: 650;
-}
-
-.registration-form input {
-  width: 100%;
-  min-width: 0;
-  min-height: 46px;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  outline: 0;
-  background: var(--surface-raised);
-  color: var(--text);
-  font: inherit;
-}
-
-.registration-form input:focus-visible {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
-}
-
-.registration-name-row {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
-}
-
-.registration-code-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 12px;
-  align-items: end;
-}
-
-.registration-code-row .button {
-  min-height: 44px;
-  white-space: nowrap;
-}
-
-.registration-message {
-  min-height: 0;
-  color: var(--text-2);
-  font-size: 13px;
-}
-
-.registration-message:empty {
-  display: none;
-}
-
-.registration-message[data-state="error"] {
-  color: var(--danger);
-}
-
-.registration-message[data-state="success"] {
-  color: var(--success);
-}
-
-.registration-form > .button {
-  justify-self: start;
-}
-
-.registration-card .final-cta-actions {
-  margin-top: 22px;
-}
-
 @media (max-width: 1280px) {
   .hero {
     display: block;
@@ -1064,13 +979,6 @@ html[data-theme="dark"] .theme-icon-sun { display: inline; }
   .account-actions article { align-items: flex-start; flex-direction: column; }
   .account-footer-actions { align-items: flex-start; flex-direction: column; }
   .error-card { padding: 34px 24px; }
-  .registration-body { padding: 14px; }
-  .registration-card { width: 100%; }
-  .registration-name-row,
-  .registration-code-row { grid-template-columns: 1fr; }
-  .registration-form > .button { width: 100%; }
-  .registration-card .final-cta-actions { display: grid; grid-template-columns: 1fr; }
-  .registration-card .final-cta-actions .button { width: 100%; }
 }
 
 @media (prefers-reduced-motion: reduce) {

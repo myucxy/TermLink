@@ -186,10 +186,10 @@ class TranscriptViewportStateTest {
             page = page(41, 640, 839, hasMore = true, next = 640),
         ).copy(error = "pending old anchor")
 
-        assertEquals(null, rebasePendingTranscriptViewport(consumed, 50u, 977u, 49u))
-        assertEquals(null, rebasePendingTranscriptViewport(consumed, 41u, 977u, 50u))
+        assertEquals(null, rebaseTranscriptViewportToNewerAnchor(consumed, 50u, 977u, 49u))
+        assertEquals(null, rebaseTranscriptViewportToNewerAnchor(consumed, 41u, 977u, 50u))
         val rebased = requireNotNull(
-            rebasePendingTranscriptViewport(consumed, 50u, 977u, 50u),
+            rebaseTranscriptViewportToNewerAnchor(consumed, 50u, 977u, 50u),
         )
 
         assertEquals(50uL, rebased.snapshotAnchorSequence)

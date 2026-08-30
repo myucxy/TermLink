@@ -48,11 +48,21 @@ docker compose --env-file .env `
   -f compose\external-services.compose.yml `
   --profile edge up --detach --wait
 
-# Add crash-safe invitation recovery for a Keycloak realm.
+# Enable controlled account creation and crash-safe invitation recovery for a Keycloak realm.
 $env:TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE = 'D:\TermLink\secrets\keycloak-registration-recovery-secret'
 docker compose --env-file .env `
   -f compose\core.compose.yml `
   -f compose\registration-recovery.compose.yml `
+  --profile edge up --detach --wait
+
+# Require Cloudflare Turnstile for both registration e-mail codes and account
+# creation. Combine this with registration-recovery for Keycloak registration.
+$env:TERMLINK_HUMAN_VERIFICATION_SITE_KEY = '0x4AAAA-public-site-key'
+$env:TERMLINK_HUMAN_VERIFICATION_SECRET_FILE = 'D:\TermLink\secrets\human-verification-secret'
+docker compose --env-file .env `
+  -f compose\core.compose.yml `
+  -f compose\registration-recovery.compose.yml `
+  -f compose\human-verification.compose.yml `
   --profile edge up --detach --wait
 
 # Add the final account-deletion processor. One History/S3 provider is
@@ -76,8 +86,12 @@ docker compose --env-file .env `
 
 `history.compose.yml` and `external-services.compose.yml` are mutually
 exclusive history choices. `observability.compose.yml` is independent and
-optional. `registration-recovery.compose.yml` is only for Keycloak realms and
-can be combined with either history choice. `account-deletion.compose.yml`
+optional. `registration-recovery.compose.yml` is required when a Keycloak-backed
+deployment offers account registration; it supplies the bounded account-creation
+and recovery authority and can be combined with either history choice. Keycloak
+native self-registration must remain disabled. `human-verification.compose.yml`
+optionally protects both registration stages with Cloudflare Turnstile and can
+be combined with any registration deployment. `account-deletion.compose.yml`
 requires either local history or external S3 and a Keycloak service account.
 Files named `acceptance`,
 `integration`, or `lan-test` are disposable test stacks and must not be
@@ -95,7 +109,8 @@ The supported production layers are intentionally small:
 | `history` | MinIO and isolated object networks | history host plus S3 credentials | Only for locally managed encrypted objects |
 | `external-services` | none | external HTTPS S3 origin and credentials | Instead of local `history` |
 | `observability` | Prometheus, Blackbox, Alertmanager, Grafana | Grafana secret and explicit reviewed Alertmanager receiver configuration | Only when not supplied by platform monitoring |
-| `registration-recovery` | none; enables a bounded server runner | Keycloak service-account secret | Only for Keycloak direct-registration recovery |
+| `registration-recovery` | none; enables controlled registration and a bounded recovery runner | Keycloak service-account secret | Whenever a Keycloak-backed deployment offers registration |
+| `human-verification` | none; enables Turnstile on the unified registration page and API | public site key and file-backed provider secret | When public registration needs anti-automation protection |
 | `account-deletion` | none; enables the final deletion processor | History/S3, Keycloak secret, versioned AES identity key | Only when final account deletion is offered |
 
 Do not add every overlay by default. A headless core behind an existing ingress
@@ -173,20 +188,23 @@ commerce overlay and must be an absolute, cleaned, non-root directory.
 Configuration stores this base path but does not enumerate or load
 payment-provider secrets.
 
-Registration recovery is disabled by default in the binary so deployments
-using a non-Keycloak issuer remain compatible. The recovery overlay enables it
-only for the server process and mounts the file named by
+Keycloak identity administration is disabled by default in the binary so
+deployments using a non-Keycloak issuer remain compatible. The recovery overlay
+enables the bounded client only for the server process and mounts the file named by
 `TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE` as a mode-0400 Docker secret. The
 client ID defaults to `termlink-registration-recovery` and can be changed with
 `TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID`. Configure that Keycloak client as a
 confidential service account with only the realm-management permissions needed
-to query and delete users (`query-users` and `manage-users`); never supply a
+to create, query, update, and delete users (`query-users` and `manage-users`).
+Add `manage-realm` only when the same bounded client is used to reconcile realm
+mail settings; never supply a
 realm administrator password. The issuer must be the realm URL ending in
 `/realms/<realm>`.
 
 The server derives a dedicated registration-attempt proof key from the token
-key master and supplies it to both direct registration and the recovery admin
-client. Recovery accepts only identities carrying a matching HMAC-backed
+key master and supplies it to the bounded identity administration client.
+All account creation passes through the TermLink registration API; Keycloak's
+native registration endpoint stays closed. Recovery accepts only identities carrying a matching HMAC-backed
 attempt attribute, and its bounded runner starts only when the overlay is
 enabled. Its client secret remains file-backed and is redacted from
 diagnostics. Payment reconciliation starts in every server process but remains
@@ -194,6 +212,22 @@ idle until PostgreSQL contains a pending run. It uses the same real, versioned
 payment-channel resolver as live commerce and the provider-reference digest
 domain required to compare existing local hashes; provider keys continue to
 come only from `TERMLINK_PAYMENT_SECRETS_DIR`.
+
+Human verification is disabled by default. Selecting
+`human-verification.compose.yml` sets
+`TERMLINK_HUMAN_VERIFICATION_PROVIDER=turnstile`, publishes only
+`TERMLINK_HUMAN_VERIFICATION_SITE_KEY` to the registration page, and mounts the
+file named by `TERMLINK_HUMAN_VERIFICATION_SECRET_FILE` as a mode-0400 Docker
+secret. The secret is never returned through HTML, JavaScript, API responses,
+or diagnostics. Once enabled, both `POST /v1/auth/register/email-code` and
+`POST /v1/auth/register` fail closed unless their single-use challenge token is
+valid for the configured public hostname and the fixed `registration` action.
+The browser resets the challenge after either request, so a token accepted for
+an e-mail code cannot be reused to create the account. Both the server and end
+users' browsers must be able to reach `https://challenges.cloudflare.com`.
+Provider outages return a temporary-unavailable result; they never bypass the
+challenge. Enabling or disabling this deployment-level setting currently
+requires a server restart.
 
 Payment provider secrets are opt-in and do not belong in the Compose
 environment or database. Put each private key, public key/certificate, or API

@@ -1,7 +1,9 @@
 using System.Diagnostics;
+using System.Globalization;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Headless;
+using Avalonia.LogicalTree;
 using Avalonia.Threading;
 using TermLink.Desktop;
 using TermLink.Pc.Contracts;
@@ -75,7 +77,8 @@ public static class Program
             new ImmediateUiDispatcher(),
             new PlatformDescriptor(PcPlatform.Windows, PcArchitecture.X64, "Windows headless", "win-x64", false),
             telemetry,
-            desktopOperations);
+            desktopOperations,
+            noticeAutoDismissDelay: TimeSpan.FromMilliseconds(250));
         var window = new MainWindow { DataContext = viewModel };
         window.Show();
         await stateStore.RefreshAsync();
@@ -94,6 +97,12 @@ public static class Program
         var devicesContentRoot = RequireControl<StackPanel>(window, "DevicesContentRoot");
         var settingsContentScroll = RequireControl<ScrollViewer>(window, "SettingsContentScroll");
         var settingsContentRoot = RequireControl<Grid>(window, "SettingsContentRoot");
+        var noticeOverlay = RequireControl<Grid>(window, "NoticeOverlay");
+        var currentPageTitle = RequireControl<TextBlock>(window, "CurrentPageTitleText");
+        var currentPageSubtitle = RequireControl<TextBlock>(window, "CurrentPageSubtitleText");
+        var serverStatusPill = RequireControl<Border>(window, "ServerStatusPill");
+        var serverStatusDot = RequireControl<Border>(window, "ServerStatusDot");
+        var sidebarComputerCard = RequireControl<Border>(window, "SidebarComputerCard");
         var sidebarAccountButton = RequireControl<Button>(window, "SidebarAccountButton");
         var sidebarLoginButton = RequireControl<Button>(window, "SidebarLoginButton");
         var sidebarUpdateButton = RequireControl<Button>(window, "SidebarUpdateButton");
@@ -102,6 +111,10 @@ public static class Program
         var sidebarUsername = RequireControl<TextBlock>(window, "SidebarUsernameText");
         var sidebarAvatarInitial = RequireControl<TextBlock>(window, "SidebarAvatarInitialText");
         var aboutUpdateAction = RequireControl<Button>(window, "AboutUpdateActionButton");
+        var configureTerminalIntegration = RequireControl<Button>(window, "ConfigureTerminalIntegrationButton");
+        var terminalIntegrationEditor = RequireControl<Control>(window, "TerminalIntegrationEditor");
+        var terminalAddNoLogo = RequireControl<CheckBox>(window, "TerminalAddNoLogoCheckBox");
+        var terminalAddNoProfile = RequireControl<CheckBox>(window, "TerminalAddNoProfileCheckBox");
         Require(viewModel.Sessions.Sessions.Count == 100, "The 100-session snapshot was not applied.");
         Require(viewModel.Devices.Devices.Count == 100, "The 100-device snapshot was not applied.");
         Require(viewModel.Settings.TerminalCommands.Count == 2, "Terminal commands were not applied.");
@@ -112,6 +125,21 @@ public static class Program
             "Theme-safe session and device detail text was not composed by the presentation layer.");
         Require(viewModel.CurrentPage.Key == "devices" && viewModel.Pages.Count == 3,
             "The Android-aligned three-destination desktop shell was not selected by default.");
+        Require(viewModel.IsConnected && !viewModel.IsConnectionBusy && !viewModel.IsServerDisconnected &&
+                viewModel.StatusText == PresentationText.RelayConnected &&
+                serverStatusPill.Classes.Contains("positive") &&
+                serverStatusDot.Classes.Contains("online") &&
+                !serverStatusDot.Classes.Contains("warning") &&
+                !serverStatusDot.Classes.Contains("error"),
+            "The top-right server indicator did not show green only for a connected server.");
+        Require(currentPageTitle.Text == PresentationText.Devices &&
+                currentPageSubtitle.Text == PresentationText.DeviceHeaderSummary(
+                    viewModel.RemoteAccessStatusText,
+                    viewModel.ActiveSessionCount) &&
+                !devicesContentRoot.GetLogicalDescendants().OfType<TextBlock>()
+                    .Any(text => text.Text == identity.Name ||
+                                 (text.Text?.Contains("Relay", StringComparison.OrdinalIgnoreCase) ?? false)),
+            "The device page did not move its summary into the shared header or still repeated the PC name/Relay state.");
         Require(sidebarAccountButton.IsVisible && !sidebarLoginButton.IsVisible &&
                 sidebarNickname.Text == snapshot.AccountNickname &&
                 sidebarUsername.Text == $"@{snapshot.AccountUsername}" &&
@@ -122,6 +150,30 @@ public static class Program
                 sidebarUsername.TextTrimming.ToString() == "CharacterEllipsis" &&
                 sidebarComputerName.TextWrapping.ToString() == "NoWrap",
             "Long sidebar identity labels are not constrained to one ellipsized line.");
+        var navigationButtons = window.GetLogicalDescendants()
+            .OfType<Button>()
+            .Where(button => button.Classes.Contains("nav"))
+            .ToArray();
+        var computerNameOrigin = sidebarComputerName.TranslatePoint(new Point(0, 0), window);
+        var nicknameOrigin = sidebarNickname.TranslatePoint(new Point(0, 0), window);
+        Require(navigationButtons.Length == 3 &&
+                navigationButtons.All(button =>
+                    button.HorizontalAlignment == Avalonia.Layout.HorizontalAlignment.Stretch &&
+                    Math.Abs(button.Bounds.Width - sidebarComputerCard.Bounds.Width) < 0.5),
+            "The primary navigation selection area does not fill the available sidebar width.");
+        Require(sidebarAccountButton.HorizontalAlignment == Avalonia.Layout.HorizontalAlignment.Stretch &&
+                Math.Abs(sidebarComputerCard.Bounds.Width - sidebarAccountButton.Bounds.Width) < 0.5 &&
+                computerNameOrigin.HasValue && nicknameOrigin.HasValue &&
+                Math.Abs(computerNameOrigin.Value.X - nicknameOrigin.Value.X) < 0.5,
+            "The sidebar computer and account cards do not share the same width and text baseline. " +
+            $"computerWidth={sidebarComputerCard.Bounds.Width}, " +
+            $"accountWidth={sidebarAccountButton.Bounds.Width}, " +
+            $"computerX={computerNameOrigin?.X}, nicknameX={nicknameOrigin?.X}, " +
+            $"accountAlignment={sidebarAccountButton.HorizontalAlignment}");
+        Require(noticeOverlay.HorizontalAlignment == Avalonia.Layout.HorizontalAlignment.Right &&
+                noticeOverlay.VerticalAlignment == Avalonia.Layout.VerticalAlignment.Bottom &&
+                Grid.GetRow(noticeOverlay) == 1 && noticeOverlay.GetValue(Panel.ZIndexProperty) > 0,
+            "Notices are not rendered as a bottom-right overlay above page content.");
         Require(devicesContentRoot.Margin.Right >= 16 &&
                 settingsContentRoot.Margin.Right >= 16 &&
                 !settingsContentScroll.AllowAutoHide &&
@@ -130,10 +182,16 @@ public static class Program
 
         viewModel.Navigate("sessions");
         Dispatcher.UIThread.RunJobs();
+        Require(currentPageTitle.Text == PresentationText.Sessions &&
+                currentPageSubtitle.Text == viewModel.SessionCountText,
+            "The session page did not move its count into the shared header.");
         Require(sessionList.ItemsPanelRoot is VirtualizingStackPanel, "The session list is not virtualized.");
         viewModel.Navigate("settings");
         viewModel.SelectSettingsSection("commands");
         Dispatcher.UIThread.RunJobs();
+        Require(currentPageTitle.Text == PresentationText.Settings &&
+                currentPageSubtitle.Text == PresentationText.Commands,
+            "The settings page did not move its selected section into the shared header.");
         Require(commandList.ItemsPanelRoot is VirtualizingStackPanel, "The command list is not virtualized.");
 
         viewModel.OpenTerminalCommandEditorCommand.Execute(null);
@@ -207,6 +265,22 @@ public static class Program
         Dispatcher.UIThread.RunJobs();
         Require(viewModel.IsIntegrationSettingsSelected && integrationRoot.IsVisible,
             "The update action was not separated from the integration section.");
+        configureTerminalIntegration.Command!.Execute(null);
+        await DrainCommandAsync(viewModel.OpenTerminalIntegrationSettingsCommand);
+        Dispatcher.UIThread.RunJobs();
+        Require(terminalIntegrationEditor.IsVisible && terminalAddNoLogo.IsChecked == true &&
+                terminalAddNoProfile.IsChecked == false,
+            "The Terminal integration editor did not expose the requested parameter defaults.");
+        viewModel.Settings.TerminalAddNoLogo = false;
+        viewModel.Settings.TerminalAddNoProfile = true;
+        viewModel.SaveTerminalIntegrationSettingsCommand.Execute(null);
+        await DrainCommandAsync(viewModel.SaveTerminalIntegrationSettingsCommand);
+        Dispatcher.UIThread.RunJobs();
+        Require(!terminalIntegrationEditor.IsVisible &&
+                desktopOperations.ConfiguredTerminalSettings == (false, true),
+            "The Terminal integration editor did not save the two independent parameter switches. " +
+            $"visible={terminalIntegrationEditor.IsVisible}, " +
+            $"saved={desktopOperations.ConfiguredTerminalSettings}");
 
         viewModel.Navigate("sessions");
         var firstSessionId = viewModel.Sessions.Items[0].SessionId;
@@ -221,14 +295,48 @@ public static class Program
         desktopOperations.FailUpdateChecks = true;
         viewModel.CheckForUpdatesCommand.Execute(null);
         await DrainCommandAsync(viewModel.CheckForUpdatesCommand);
-        Require(viewModel.OperationMessage.Contains("operation fixture", StringComparison.Ordinal) &&
+        Require(viewModel.OperationMessage.Contains(PresentationText.UnexpectedFailureDetail, StringComparison.Ordinal) &&
                 !viewModel.Settings.HasReleaseNotes &&
                 viewModel.Settings.UpdateStatusText.Contains("AppShip", StringComparison.Ordinal),
-            "An AppShip failure was not isolated from previously loaded release notes.");
+            "An AppShip failure was not localized or isolated from previously loaded release notes.");
         viewModel.OpenDiagnosticsDirectoryCommand.Execute(null);
         await DrainCommandAsync(viewModel.OpenDiagnosticsDirectoryCommand);
         Require(viewModel.NoticeCode == "ACCESS_DENIED" && viewModel.NoticeDetail == PresentationText.AccessDeniedDetail,
             "A path-access failure was not classified as ACCESS_DENIED.");
+        await viewModel.ReportFailureAsync(new InvalidOperationException("PRODUCTION_REQUEST_FAILED"));
+        Require(viewModel.NoticeCode == "PRODUCTION_REQUEST_FAILED" &&
+                viewModel.NoticeDetail == PresentationText.ConnectionFailedDetail,
+            "An unavailable production identity service was not shown as a connection failure.");
+        var originalUiCulture = CultureInfo.CurrentUICulture;
+        try
+        {
+            CultureInfo.CurrentUICulture = CultureInfo.GetCultureInfo("zh-CN");
+            await viewModel.ReportFailureAsync(new AgentClientOperationException(
+                "PC_AGENT_EXITED",
+                "TermLink Agent failed: raw English diagnostic",
+                125));
+            Require(viewModel.NoticeCode == "PC_AGENT_EXITED" &&
+                    viewModel.NoticeDetail == PresentationText.AgentExitedDetail &&
+                    !viewModel.NoticeDetail.Contains("raw English", StringComparison.Ordinal),
+                "A Chinese Agent failure exposed the raw English diagnostic.");
+            CultureInfo.CurrentUICulture = CultureInfo.GetCultureInfo("en-US");
+            await viewModel.ReportFailureAsync(new AgentClientOperationException("PC_AGENT_RESTART_TIMEOUT"));
+            Require(viewModel.NoticeCode == "PC_AGENT_RESTART_TIMEOUT" &&
+                    viewModel.NoticeDetail == PresentationText.AgentRestartTimeoutDetail,
+                "The English Agent restart failure was not localized.");
+        }
+        finally
+        {
+            CultureInfo.CurrentUICulture = originalUiCulture;
+        }
+        Thread.Sleep(150);
+        await viewModel.ReportFailureAsync(new TimeoutException("notice timer reset fixture"));
+        Thread.Sleep(150);
+        Dispatcher.UIThread.RunJobs();
+        Require(viewModel.HasNotice && viewModel.NoticeCode == "TIMEOUT",
+            "A newer notice did not reset the five-second auto-dismiss countdown.");
+        await WaitForAsync(() => !viewModel.HasNotice,
+            "A notice did not close automatically after its configured display duration.");
 
         var reauthenticationSnapshot = snapshot with
         {
@@ -258,20 +366,30 @@ public static class Program
                 !reauthenticationViewModel.CanRetryConnection &&
                 !reauthenticationViewModel.CanDisableRemoteAccess,
             "Expired Windows credentials still appeared as a usable signed-in account.");
+        var accountSignInCard = RequireControl<Control>(reauthenticationWindow, "AccountSignInCard");
+        var browserAuthorizationButton = RequireControl<Button>(reauthenticationWindow, "BrowserAccountAuthorizationButton");
         Require(!RequireControl<Control>(reauthenticationWindow, "LinkedAccountCard").IsVisible &&
-                RequireControl<Control>(reauthenticationWindow, "AccountSignInCard").IsVisible &&
+                accountSignInCard.IsVisible &&
                 !RequireControl<Button>(reauthenticationWindow, "SidebarAccountButton").IsVisible &&
                 RequireControl<Button>(reauthenticationWindow, "SidebarLoginButton").IsVisible &&
                 reauthenticationViewModel.AccountActionText == PresentationText.SignInAgain &&
                 reauthenticationViewModel.AccountStateTitle == PresentationText.AuthenticationExpired,
-            "The account page did not replace Sign out with the reauthentication form.");
+            "The account page did not replace Sign out with the web reauthorization entry.");
+        Require(!accountSignInCard.GetLogicalDescendants().OfType<TextBox>().Any() &&
+                browserAuthorizationButton.IsVisible &&
+                Equals(browserAuthorizationButton.Content, PresentationText.BrowserAccountAuthorization),
+            "The account page still exposed native credential fields or omitted the web authorization action.");
+        browserAuthorizationButton.Command!.Execute(null);
+        await DrainCommandAsync(reauthenticationViewModel.BeginAccountAuthorizationCommand);
+        Require(reauthenticationClient.BeginAccountAuthorizationCalled &&
+                reauthenticationClient.AuthorizedPcName == reauthenticationViewModel.Account.PcName,
+            "The web authorization action did not send the current PC name to the Agent.");
         reauthenticationViewModel.Navigate("devices");
         reauthenticationViewModel.OpenAccountSettingsCommand.Execute(null);
         await DrainCommandAsync(reauthenticationViewModel.OpenAccountSettingsCommand);
         Require(reauthenticationViewModel.IsSettingsPageSelected &&
-                reauthenticationViewModel.IsAccountSettingsSelected &&
-                reauthenticationViewModel.IsLoginMode,
-            "The sign-in-expired action did not navigate directly to account login.");
+                reauthenticationViewModel.IsAccountSettingsSelected,
+            "The sign-in-expired action did not navigate directly to web account authorization.");
         reauthenticationWindow.Close();
 
         var durations = new List<double>(300);
@@ -357,16 +475,17 @@ public static class Program
         Require(!command.IsRunning, "An async UI command did not complete.");
     }
 
-    private static async Task WaitForAsync(Func<bool> condition, string message)
+    private static Task WaitForAsync(Func<bool> condition, string message)
     {
         var deadline = DateTime.UtcNow.AddSeconds(5);
         while (!condition() && DateTime.UtcNow < deadline)
         {
             Dispatcher.UIThread.RunJobs();
-            await Task.Delay(1);
+            Thread.Sleep(1);
         }
         Dispatcher.UIThread.RunJobs();
         Require(condition(), message);
+        return Task.CompletedTask;
     }
 
     private static void VerifySingleInstanceActivation()
@@ -404,6 +523,8 @@ public static class Program
     private sealed class StaticAgentClient(AgentStatusSnapshot snapshot) : IAgentClient
     {
         public bool StopSessionCalled { get; private set; }
+        public bool BeginAccountAuthorizationCalled { get; private set; }
+        public string AuthorizedPcName { get; private set; } = string.Empty;
         public IReadOnlyList<TerminalCommandCapability> SavedTerminalCommands { get; private set; } = Array.Empty<TerminalCommandCapability>();
         public ValueTask<AgentStatusSnapshot> GetStatusAsync(bool forceRefresh, CancellationToken cancellationToken) =>
             ValueTask.FromResult(snapshot);
@@ -419,6 +540,12 @@ public static class Program
         }
         public ValueTask GrantDeviceAsync(Guid deviceId, string permission, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask RevokeDeviceAsync(Guid deviceId, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask BeginAccountAuthorizationAsync(string pcName, CancellationToken cancellationToken)
+        {
+            BeginAccountAuthorizationCalled = true;
+            AuthorizedPcName = pcName;
+            return ValueTask.CompletedTask;
+        }
         public ValueTask LoginAsync(string username, string password, string pcName, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask RegisterAsync(string username, string nickname, string email, string password, string passwordConfirmation, string pcName, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask SignOutAsync(CancellationToken cancellationToken) => ValueTask.CompletedTask;
@@ -440,6 +567,7 @@ public static class Program
         public bool FailUpdateChecks { get; set; }
         private int checkCount;
         public int CheckCount => Volatile.Read(ref checkCount);
+        public (bool AddNoLogo, bool AddNoProfile)? ConfiguredTerminalSettings { get; private set; }
         public DesktopUpdateStatus Status { get; set; } = new(
             DesktopUpdateDecision.NoUpdate,
             "0.2.4",
@@ -458,6 +586,20 @@ public static class Program
         }
         public ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken) =>
             ValueTask.FromException<string>(new UnauthorizedAccessException("Access to path is denied"));
+        public ValueTask<DesktopTerminalIntegrationSettings> GetTerminalIntegrationSettingsAsync(
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult(new DesktopTerminalIntegrationSettings(
+                AddNoLogo: true,
+                AddNoProfile: false,
+                CanConfigure: true));
+        public ValueTask<string> ConfigureTerminalIntegrationAsync(
+            bool addNoLogo,
+            bool addNoProfile,
+            CancellationToken cancellationToken)
+        {
+            ConfiguredTerminalSettings = (addNoLogo, addNoProfile);
+            return ValueTask.FromResult("configured");
+        }
         public ValueTask<string> RepairTerminalIntegrationAsync(CancellationToken cancellationToken) =>
             ValueTask.FromResult("repaired");
     }

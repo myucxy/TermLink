@@ -1,8 +1,8 @@
 {
   "format": "termlink.phase0-session-host-validation",
   "format_version": 1,
-  "generated_at": "2026-08-06T01:39:47.8384615+00:00",
-  "executable_sha256": "585719e1627928698c7b94b605aae83a0c427d7bb86eff5d57be90b2e35db3e9",
+  "generated_at": "2026-08-29T19:57:38.6519797+00:00",
+  "executable_sha256": "f6f962d87f6349e1a099ee0bcf0d943d3f4daaad9bd4d794f811c1fe39e65b09",
   "environment": {
     "os_version": "10.0.19045.0",
     "process_architecture": "X64"
@@ -21,8 +21,8 @@
   },
   "normal_exit": {
     "reason": "exited",
-    "handles_start": 254,
-    "handles_end": 250
+    "handles_start": 223,
+    "handles_end": 218
   },
   "unicode_input": {
     "path": "agent-stdin-pipe-to-pwsh7-inner-conpty",
@@ -31,8 +31,8 @@
     "round_trip": true,
     "lifecycle": {
       "reason": "exited",
-      "handles_start": 302,
-      "handles_end": 298
+      "handles_start": 285,
+      "handles_end": 279
     }
   },
   "control_input": {
@@ -41,23 +41,23 @@
     "up_arrow": true,
     "lifecycle": {
       "reason": "exited",
-      "handles_start": 254,
-      "handles_end": 250
+      "handles_start": 222,
+      "handles_end": 217
     }
   },
   "input_disconnect": {
     "reason": "exited",
-    "handles_start": 262,
-    "handles_end": 258
+    "handles_start": 233,
+    "handles_end": 227
   },
   "timeout": {
     "reason": "timeout",
-    "handles_start": 254,
-    "handles_end": 250
+    "handles_start": 222,
+    "handles_end": 217
   },
   "force_termination": {
     "probe_timed_out": true,
-    "inner_pid_stopped": 35928
+    "inner_pid_stopped": 21216
   },
   "resize": {
     "columns": 100,
@@ -76,17 +76,17 @@
   "throughput": {
     "payload_bytes": 2097152,
     "captured_payload_bytes": 2097152,
-    "elapsed_ms": 1303
+    "elapsed_ms": 1228
   },
   "soak": {
     "requested_seconds": 10,
-    "elapsed_ms": 10386,
+    "elapsed_ms": 10401,
     "completed": true
   },
   "leak_loop": {
     "iterations": 20,
-    "parent_handles_before": 251,
-    "parent_handles_after": 256,
+    "parent_handles_before": 260,
+    "parent_handles_after": 265,
     "delta": 5,
     "probe": "isolated-csharp-process-launcher"
   }

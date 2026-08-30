@@ -1352,7 +1352,8 @@ namespace TermLink.Agent
         private readonly RegistryServiceOptions options;
         private readonly SessionRegistry registry;
 #if TERMLINK_PRODUCTION_RUNTIME
-        private readonly ProductionAgentRuntime productionRuntime;
+        private ProductionAgentRuntime productionRuntime;
+        private readonly object productionRuntimeMutationSync = new object();
 #else
         // The legacy csc validation build intentionally excludes production sources.
         private readonly IDisposable productionRuntime;
@@ -1372,7 +1373,7 @@ namespace TermLink.Agent
             this.options = options;
             controlSecret = RegistryControlSecretStore.GetOrCreateDefault();
 #if TERMLINK_PRODUCTION_RUNTIME
-            var runtime = ProductionAgentRuntime.TryCreate();
+            var runtime = ProductionAgentRuntime.TryCreate(options.ControlPipeName);
             try
             {
                 registry = new SessionRegistry(
@@ -1380,9 +1381,12 @@ namespace TermLink.Agent
                     options.DisconnectedTimeoutMilliseconds,
                     options.MaximumBufferBytes,
                     options.MaximumSessions,
-                    runtime == null ? null : runtime.OnCommitted);
-                if (runtime != null) runtime.Attach(registry);
-                productionRuntime = runtime;
+                    ForwardCommittedFrame);
+                if (runtime != null)
+                {
+                    runtime.Attach(registry);
+                    Volatile.Write(ref productionRuntime, runtime);
+                }
             }
             catch
             {
@@ -1491,8 +1495,9 @@ namespace TermLink.Agent
                         {
                             response = Response(false, "INVALID_REQUEST", 0);
                         }
-                        catch (InvalidOperationException)
+                        catch (InvalidOperationException error)
                         {
+                            ObserveControlRequestFailure(controlRequest, error);
                             response = Response(false, "OPERATION_FAILED", 0);
                         }
                         catch (TimeoutException)
@@ -1515,6 +1520,15 @@ namespace TermLink.Agent
                         catch (OperationCanceledException)
                         {
                             response = Response(false, "PRODUCTION_REQUEST_CANCELLED", 0);
+                        }
+                        catch (Exception error)
+                        {
+                            // A browser callback, token exchange, DPAPI write,
+                            // or runtime replacement failure is scoped to this
+                            // authenticated request. It must fail closed without
+                            // terminating every local session and the Agent.
+                            ObserveControlRequestFailure(controlRequest, error);
+                            response = Response(false, "OPERATION_FAILED", 0);
                         }
 #endif
                         if (responseVersion >= 7 && controlRequest != null)
@@ -1550,6 +1564,53 @@ namespace TermLink.Agent
             {
                 try { pipe.Dispose(); }
                 catch (ObjectDisposedException) { }
+            }
+        }
+
+        private void ObserveControlRequestFailure(RegistryRequest request, Exception error)
+        {
+            var line = string.Empty;
+            try
+            {
+                var command = request == null ? "unknown" : request.Command.ToString();
+                var frame = new StackTrace(error, true).GetFrame(0);
+                var method = frame?.GetMethod();
+                var failureSite = method == null
+                    ? "unknown"
+                    : (method.DeclaringType?.Name ?? "unknown") + "." + method.Name;
+                var sourceLine = frame == null ? 0 : frame.GetFileLineNumber();
+                line = DateTime.UtcNow.ToString("O") +
+                    " control-request command=" + command +
+                    " failure=" + error.GetType().Name +
+                    " site=" + failureSite +
+                    (sourceLine > 0 ? " line=" + sourceLine : string.Empty) +
+                    Environment.NewLine;
+                var root = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "TermLink",
+                    "logs");
+                Directory.CreateDirectory(root);
+                File.AppendAllText(
+                    Path.Combine(root, "TermLink-control-runtime.log"),
+                    line,
+                    new UTF8Encoding(false));
+                if (options.Diagnostics) Console.Error.Write(line);
+            }
+            catch
+            {
+                // A bounded diagnostic containing only type and source location
+                // must never affect control flow or record credentials/messages.
+                try
+                {
+                    if (!string.IsNullOrEmpty(line))
+                        File.AppendAllText(
+                            Path.Combine(options.BufferRoot, "control-runtime.log"),
+                            line,
+                            new UTF8Encoding(false));
+                }
+                catch
+                {
+                }
             }
         }
 
@@ -1593,6 +1654,76 @@ namespace TermLink.Agent
             if (shutdownRequested) DisposeOtherControlPipes(null);
             return response;
         }
+
+#if TERMLINK_PRODUCTION_RUNTIME
+        private void ForwardCommittedFrame(ManagedShellType shellType, LocalFrame frame)
+        {
+            var runtime = Volatile.Read(ref productionRuntime);
+            if (runtime != null) runtime.OnCommitted(shellType, frame);
+        }
+
+        private ProductionAgentRuntime CurrentProductionRuntime()
+        {
+            return Volatile.Read(ref productionRuntime);
+        }
+
+        private void ReplaceProductionAccount(Action enrollment)
+        {
+            if (enrollment == null) throw new ArgumentNullException(nameof(enrollment));
+            lock (productionRuntimeMutationSync)
+            {
+                enrollment();
+                ReplaceProductionRuntimeLocked(ProductionAgentRuntime.TryCreate(options.ControlPipeName));
+            }
+        }
+
+        private void ForgetProductionAccount()
+        {
+            lock (productionRuntimeMutationSync)
+            {
+                // First remove the live runtime from the publication route and
+                // cancel its Relay/HTTP work. Durable account removal follows
+                // only after old-account synchronization is already stopped.
+                var previous = Interlocked.Exchange(ref productionRuntime, null);
+                RetireProductionRuntime(previous);
+                ProductionEnrollment.ForgetLocalAccount();
+            }
+        }
+
+        private void ReplaceProductionRuntimeLocked(ProductionAgentRuntime next)
+        {
+            var previous = Interlocked.Exchange(ref productionRuntime, null);
+            RetireProductionRuntime(previous);
+            if (next == null) return;
+            try
+            {
+                // SessionRegistry remains alive across account changes. Attach
+                // queues every still-running session for replay, while its
+                // durable local buffers cover frames committed during the swap.
+                next.Attach(registry);
+                Volatile.Write(ref productionRuntime, next);
+            }
+            catch
+            {
+                RetireProductionRuntime(next);
+                throw;
+            }
+        }
+
+        private static void RetireProductionRuntime(ProductionAgentRuntime runtime)
+        {
+            if (runtime == null) return;
+            // Stop old-account publication before returning a new account state.
+            // Worker joins and HTTP disposal are deliberately off the control
+            // request so a slow network cannot hold the sign-out button open.
+            runtime.StopAccountSynchronization();
+            Task.Run(delegate
+            {
+                try { runtime.Dispose(); }
+                catch (Exception) { }
+            });
+        }
+#endif
 
         private RegistryResponse Handle(RegistryRequest request)
         {
@@ -1640,8 +1771,9 @@ namespace TermLink.Agent
                     shutdownRequested = true;
                     var shutdown = registry.Shutdown();
 #if TERMLINK_PRODUCTION_RUNTIME
-                    if (productionRuntime != null)
-                        productionRuntime.DrainTerminalPublications(TimeSpan.FromSeconds(10));
+                    var shutdownRuntime = CurrentProductionRuntime();
+                    if (shutdownRuntime != null)
+                        shutdownRuntime.DrainTerminalPublications(TimeSpan.FromSeconds(10));
 #endif
                     return StopResponse(
                         shutdown,
@@ -1656,10 +1788,11 @@ namespace TermLink.Agent
                         "AGENT_RESTART_WITH_TIMEOUTS");
                 case RegistryCommand.RefreshProductionStatus:
 #if TERMLINK_PRODUCTION_RUNTIME
-                    if (productionRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+                    var refreshRuntime = CurrentProductionRuntime();
+                    if (refreshRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
                     try
                     {
-                        productionRuntime.GetStatus(true);
+                        refreshRuntime.GetStatus(true);
                     }
                     catch (ProductionReauthenticationRequiredException)
                     {
@@ -1671,75 +1804,87 @@ namespace TermLink.Agent
 #endif
                 case RegistryCommand.RetryProductionConnection:
 #if TERMLINK_PRODUCTION_RUNTIME
-                    if (productionRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
-                    productionRuntime.RequestReconnect();
+                    var retryRuntime = CurrentProductionRuntime();
+                    if (retryRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+                    retryRuntime.RequestReconnect();
                     return Response(true, "PRODUCTION_RECONNECT_REQUESTED", 0);
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
 #endif
                 case RegistryCommand.CreatePairingChallenge:
 #if TERMLINK_PRODUCTION_RUNTIME
-                    if (productionRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
-                    productionRuntime.CreatePairingChallenge(request.DeviceId, request.PairingPermission);
+                    var pairingRuntime = CurrentProductionRuntime();
+                    if (pairingRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+                    pairingRuntime.CreatePairingChallenge(request.DeviceId, request.PairingPermission);
                     return Response(true, "PAIRING_CHALLENGE_CREATED", 0);
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
 #endif
                 case RegistryCommand.GrantDevice:
 #if TERMLINK_PRODUCTION_RUNTIME
-                    if (productionRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
-                    productionRuntime.GrantDevice(request.DeviceId, request.GrantPermission);
+                    var grantRuntime = CurrentProductionRuntime();
+                    if (grantRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+                    grantRuntime.GrantDevice(request.DeviceId, request.GrantPermission);
                     return Response(true, "DEVICE_GRANT_UPDATED", 0);
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
 #endif
                 case RegistryCommand.RevokeDevice:
 #if TERMLINK_PRODUCTION_RUNTIME
-                    if (productionRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
-                    productionRuntime.RevokeDevice(request.DeviceId);
+                    var revokeRuntime = CurrentProductionRuntime();
+                    if (revokeRuntime == null) return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+                    revokeRuntime.RevokeDevice(request.DeviceId);
                     return Response(true, "DEVICE_REVOKED", 0);
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
 #endif
                 case RegistryCommand.LoginAccount:
 #if TERMLINK_PRODUCTION_RUNTIME
-                    ProductionEnrollment.LoginDirect(
-                        ProductionEnrollment.PublicServerUrl,
-                        request.PcName,
-                        request.AccountUsername,
-                        request.AccountPassword);
-                    return PrepareAccountRestart("ACCOUNT_LOGIN_ACCEPTED");
+                    ReplaceProductionAccount(delegate
+                    {
+                        ProductionEnrollment.LoginDirect(
+                            ProductionEnrollment.PublicServerUrl,
+                            request.PcName,
+                            request.AccountUsername,
+                            request.AccountPassword);
+                    });
+                    return Response(true, "ACCOUNT_LOGIN_ACCEPTED", 0);
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
 #endif
                 case RegistryCommand.RegisterAccount:
 #if TERMLINK_PRODUCTION_RUNTIME
-                    ProductionEnrollment.RegisterDirect(
-                        ProductionEnrollment.PublicServerUrl,
-                        request.PcName,
-                        request.AccountUsername,
-                        request.AccountNickname,
-                        request.AccountEmail,
-                        request.AccountPassword,
-                        request.AccountPasswordConfirmation);
-                    return PrepareAccountRestart("ACCOUNT_REGISTRATION_ACCEPTED");
+                    ReplaceProductionAccount(delegate
+                    {
+                        ProductionEnrollment.RegisterDirect(
+                            ProductionEnrollment.PublicServerUrl,
+                            request.PcName,
+                            request.AccountUsername,
+                            request.AccountNickname,
+                            request.AccountEmail,
+                            request.AccountPassword,
+                            request.AccountPasswordConfirmation);
+                    });
+                    return Response(true, "ACCOUNT_REGISTRATION_ACCEPTED", 0);
+#else
+                    return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+#endif
+                case RegistryCommand.BeginAccountAuthorization:
+#if TERMLINK_PRODUCTION_RUNTIME
+                    ReplaceProductionAccount(delegate
+                    {
+                        ProductionEnrollment.LinkAccount(
+                            ProductionEnrollment.PublicServerUrl,
+                            request.PcName);
+                    });
+                    return Response(true, "ACCOUNT_AUTHORIZATION_ACCEPTED", 0);
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
 #endif
                 case RegistryCommand.SignOutAccount:
 #if TERMLINK_PRODUCTION_RUNTIME
-                    shutdownRequested = true;
-                    var signOut = registry.ShutdownForRestart();
-                    if (productionRuntime != null)
-                    {
-                        productionRuntime.DrainTerminalPublications(TimeSpan.FromSeconds(10));
-                        productionRuntime.Dispose();
-                    }
-                    ProductionEnrollment.ForgetLocalAccount();
-                    return BareStopResponse(
-                        signOut,
-                        "ACCOUNT_SIGNED_OUT",
-                        "ACCOUNT_SIGNED_OUT_WITH_TIMEOUTS");
+                    ForgetProductionAccount();
+                    return Response(true, "ACCOUNT_SIGNED_OUT", 0);
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
 #endif
@@ -1768,7 +1913,8 @@ namespace TermLink.Agent
                             !submittedIds.Contains(command.Id));
                     TerminalCommandProfileStore.SaveConfiguredProfiles(
                         configuredCommands.Concat(retainedDisabledDetected));
-                    if (productionRuntime != null) productionRuntime.RequestReconnect();
+                    var commandRuntime = CurrentProductionRuntime();
+                    if (commandRuntime != null) commandRuntime.RequestReconnect();
                     return Response(true, "TERMINAL_COMMANDS_SAVED", configuredCommands.Length);
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
@@ -1777,22 +1923,6 @@ namespace TermLink.Agent
                     return Response(false, "UNKNOWN_COMMAND", 0);
             }
         }
-
-#if TERMLINK_PRODUCTION_RUNTIME
-        private RegistryResponse PrepareAccountRestart(string successCode)
-        {
-            shutdownRequested = true;
-            var restart = registry.ShutdownForRestart();
-            if (productionRuntime != null)
-            {
-                productionRuntime.DrainTerminalPublications(TimeSpan.FromSeconds(10));
-            }
-            return BareStopResponse(
-                restart,
-                successCode,
-                successCode + "_WITH_TIMEOUTS");
-        }
-#endif
 
         private RegistryResponse Response(bool success, string code, int affected)
         {
@@ -1822,38 +1952,11 @@ namespace TermLink.Agent
             };
         }
 
-        private static RegistryResponse BareStopResponse(
-            SessionStopResult result,
-            string successCode,
-            string timeoutCode)
-        {
-            return new RegistryResponse
-            {
-                Success = result.Success,
-                Code = result.Success ? successCode : timeoutCode,
-                RemoteAccessEnabled = false,
-                Summaries = new List<SessionSummary>(),
-                AffectedSessions = result.RequestedSessions,
-                TimedOutSessions = result.TimedOutSessions,
-                Production = new ProductionStatus
-                {
-                    Configured = false,
-                    AccountLinked = false,
-                    ServerOrigin = string.Empty,
-                    AgentVersion = string.Empty,
-                    TerminalSnapshotEnabled = false,
-                    RelayState = ProductionRelayState.Stopped,
-                    Devices = new List<ProductionDeviceSummary>(),
-                    Sessions = new List<ProductionSessionSummary>(),
-                    TerminalCommands = new List<ProductionTerminalCommandSummary>()
-                }
-            };
-        }
-
         private ProductionStatus ProductionSnapshot(bool forceRefresh)
         {
 #if TERMLINK_PRODUCTION_RUNTIME
-            if (productionRuntime != null) return productionRuntime.GetStatus(forceRefresh);
+            var runtime = CurrentProductionRuntime();
+            if (runtime != null) return runtime.GetStatus(forceRefresh);
 #endif
             return new ProductionStatus
             {
@@ -1910,10 +2013,13 @@ namespace TermLink.Agent
             }
             registry.Shutdown();
 #if TERMLINK_PRODUCTION_RUNTIME
-            if (productionRuntime != null)
+            ProductionAgentRuntime runtime;
+            lock (productionRuntimeMutationSync)
+                runtime = Interlocked.Exchange(ref productionRuntime, null);
+            if (runtime != null)
             {
-                productionRuntime.DrainTerminalPublications(TimeSpan.FromSeconds(10));
-                productionRuntime.Dispose();
+                runtime.DrainTerminalPublications(TimeSpan.FromSeconds(10));
+                runtime.Dispose();
             }
 #else
             if (productionRuntime != null) productionRuntime.Dispose();

@@ -13,6 +13,8 @@ if (args.Length > 0)
 }
 
 var sessionId = Guid.Parse("00112233-4455-6677-8899-aabbccddeeff");
+Require(RegistryControlClient.MaximumTimeoutMilliseconds == 300_000,
+    "Registry control timeout limit changed unexpectedly.");
 var defaultControlPipe = TermLinkControlPipe.DefaultName();
 Require(defaultControlPipe.StartsWith("termlink-agent-control-v2-", StringComparison.Ordinal) &&
     defaultControlPipe.Length == "termlink-agent-control-v2-".Length + 16,
@@ -113,6 +115,29 @@ var registerRequest = RoundTripRequest(new RegistryRequest
 });
 Require(registerRequest.AccountNickname == "New User" && registerRequest.AccountEmail == "new@example.test" &&
     registerRequest.AccountPasswordConfirmation == "new-password", "Registration request changed.");
+var browserAuthorizationRequest = RoundTripRequest(new RegistryRequest
+{
+    Command = RegistryCommand.BeginAccountAuthorization,
+    PcName = "Codec PC"
+});
+Require(browserAuthorizationRequest.Command == RegistryCommand.BeginAccountAuthorization &&
+    browserAuthorizationRequest.PcName == "Codec PC",
+    "Browser account authorization request changed.");
+var browserAuthorizationAcceptedByV10 = false;
+try
+{
+    using var legacyBrowserAuthorization = new MemoryStream();
+    RegistryControlCodec.WriteRequest(
+        legacyBrowserAuthorization,
+        new RegistryRequest { Command = RegistryCommand.BeginAccountAuthorization, PcName = "Codec PC" },
+        10);
+    browserAuthorizationAcceptedByV10 = true;
+}
+catch (InvalidDataException)
+{
+}
+Require(!browserAuthorizationAcceptedByV10,
+    "Pipe V10 accepted the V11 browser account authorization command.");
 var commandSettingsRequest = RoundTripRequest(new RegistryRequest
 {
     Command = RegistryCommand.SaveTerminalCommands,
@@ -335,7 +360,7 @@ using (var legacyV9ResponseStream = new MemoryStream())
         "Pipe V9 response synthesized an account nickname.");
 }
 
-Console.WriteLine("TermLink Agent control Pipe V10 account identity and V9/V8/V7/V6/V5 compatibility validation passed.");
+Console.WriteLine("TermLink Agent control Pipe V11 browser authorization, V10 account identity, and V9/V8/V7/V6/V5 compatibility validation passed.");
 
 static RegistryRequest RoundTripRequest(RegistryRequest request)
 {

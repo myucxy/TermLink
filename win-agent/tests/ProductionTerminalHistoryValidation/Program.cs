@@ -181,6 +181,7 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 ValidateLegacyOutboxOrderingMigration(store, producer, sessionId);
                 ValidateCrashRecovery(root, pcDeviceId, sessionId);
                 ValidateFivePagePublication(root, pcDeviceId);
+                ValidateTlH115UnboundedTranscriptPublication(root, pcDeviceId);
                 await ValidateZeroPagePublicationAsync(root, pcDeviceId);
                 ValidateNewSnapshotSupersedesIncompleteTranscript(root, pcDeviceId);
                 ValidateOlderOutboxRecoveryAfterNewRejection(root, pcDeviceId);
@@ -1406,6 +1407,93 @@ namespace TermLink.ProductionTerminalHistory.Validation
             transcriptClaim.Artifacts[1].InitialTranscriptBeforeLineId = 1;
             Expect<InvalidDataException>(() => store.SaveOutbox(transcriptClaim),
                 "Outbox persistence accepted Snapshot-only publication metadata on a Transcript.");
+        }
+
+        private static void ValidateTlH115UnboundedTranscriptPublication(
+            string root,
+            Guid pcDeviceId)
+        {
+            const int markerCount = 5200;
+            const int visibleRows = 24;
+            const int expectedTranscriptRows = markerCount - visibleRows;
+            const int expectedPages = 26;
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000075");
+            var store = new ProductionTerminalHistoryStore(root, pcDeviceId);
+            using (var producer = new ProductionTerminalHistoryProducer(store, pcDeviceId))
+            {
+                producer.AppendCommittedFrame(new LocalFrame(
+                    LocalFrameType.Resize,
+                    sessionId,
+                    1,
+                    LocalPayloadCodec.Resize(80, visibleRows)));
+                var output = new StringBuilder();
+                for (var line = 1; line <= markerCount; line++)
+                {
+                    if (line > 1) output.Append("\r\n");
+                    output.Append("TLH115_").Append(line.ToString("D4"));
+                }
+                producer.AppendCommittedFrame(new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    2,
+                    Encoding.UTF8.GetBytes(output.ToString())));
+
+                var result = producer.ProcessSession(sessionId);
+                ValidateTlH115Outbox(
+                    producer.LoadOutbox(sessionId),
+                    result,
+                    expectedTranscriptRows,
+                    expectedPages);
+            }
+
+            // A fresh producer replays the durable WAL and idempotently
+            // reconstructs the same sealed archive pages. No process-lifetime
+            // scrollback prefix is required for recovery.
+            using var restarted = new ProductionTerminalHistoryProducer(
+                new ProductionTerminalHistoryStore(root, pcDeviceId),
+                pcDeviceId);
+            var restartedResult = restarted.ProcessSession(sessionId);
+            ValidateTlH115Outbox(
+                restarted.LoadOutbox(sessionId),
+                restartedResult,
+                expectedTranscriptRows,
+                expectedPages);
+        }
+
+        private static void ValidateTlH115Outbox(
+            ProductionTerminalHistoryOutbox outbox,
+            ProductionTerminalHistoryProductionResult result,
+            int expectedTranscriptRows,
+            int expectedPages)
+        {
+            Require(outbox != null, "TL-H115 did not create a terminal history outbox.");
+            var snapshot = outbox.Artifacts.Single(value =>
+                value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot);
+            var transcripts = outbox.Artifacts
+                .Where(value => value.Kind == ProductionTerminalHistoryArtifactKind.Transcript)
+                .OrderBy(value => value.UploadOrder)
+                .ToList();
+            var pages = transcripts.Select(value =>
+                TerminalTranscriptPageV1.Parser.ParseFrom(value.Plaintext)).ToList();
+            var rangesContiguous = transcripts.Zip(
+                transcripts.Skip(1),
+                (left, right) => left.LastLineId + 1 == right.FirstLineId).All(value => value);
+            var boundaries = new ulong[] { 4095, 4096, 4097 };
+            Require(result.SnapshotEligible && result.TranscriptPageCount == expectedPages &&
+                snapshot.TranscriptPageCount == expectedPages && transcripts.Count == expectedPages &&
+                pages.Sum(value => value.Rows.Count) == expectedTranscriptRows &&
+                transcripts[0].FirstLineId == 1 &&
+                transcripts[^1].LastLineId == (ulong)expectedTranscriptRows &&
+                snapshot.InitialTranscriptBeforeLineId == (ulong)expectedTranscriptRows + 1 &&
+                transcripts.All(value => value.LastLineId < value.ExclusiveBeforeLineId) &&
+                rangesContiguous && boundaries.All(boundary => transcripts.Any(value =>
+                    value.FirstLineId <= boundary && value.LastLineId >= boundary)),
+                "TL-H115 did not preserve the exact 1..5176 transcript across the 4096 boundary: " +
+                "eligible=" + result.SnapshotEligible +
+                ", pages=" + transcripts.Count +
+                ", rows=" + pages.Sum(value => value.Rows.Count) +
+                ", ranges=" + string.Join(",", transcripts.Select(value =>
+                    value.FirstLineId + "-" + value.LastLineId)) + ".");
         }
 
         private static async Task ValidateZeroPagePublicationAsync(string root, Guid pcDeviceId)

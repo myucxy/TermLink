@@ -31,7 +31,7 @@ type acceptanceRealmClient struct {
 	} `json:"protocolMappers"`
 }
 
-func TestAcceptanceRealmUsesGatedRegistrationAndNativeClientLogin(t *testing.T) {
+func TestAcceptanceRealmDisablesNativeRegistrationAndUsesNativeClientLogin(t *testing.T) {
 	data, err := os.ReadFile("../../acceptance/keycloak-realm.json")
 	if err != nil {
 		t.Fatal(err)
@@ -61,8 +61,8 @@ func TestAcceptanceRealmUsesGatedRegistrationAndNativeClientLogin(t *testing.T) 
 	if err := json.Unmarshal(data, &realm); err != nil {
 		t.Fatal(err)
 	}
-	// Imports fail closed. The idempotent initializer opens registration only
-	// after it has created or verified the managed bootstrap administrator.
+	// Realm imports and reconciliation keep provider self-registration closed;
+	// TermLink's hosted registration API is the only public creation boundary.
 	if realm.LoginTheme != "termlink-01b-v18" || realm.AccountTheme != "termlink-01b-v18" ||
 		realm.RegistrationAllowed || realm.VerifyEmail || realm.ResetPasswordAllowed || !realm.BruteForceProtected ||
 		realm.AccessTokenLifespan <= 0 || realm.AccessTokenLifespan > 300 ||
@@ -114,6 +114,7 @@ func TestAcceptanceRealmUsesGatedRegistrationAndNativeClientLogin(t *testing.T) 
 		t.Fatal("termlink-windows client flow policy is unsafe")
 	}
 	if windows.Attributes["pkce.code.challenge.method"] != "S256" ||
+		windows.BaseURL != "https://termlink.kget.cc:8910" ||
 		!containsString(windows.RedirectURIs, "http://127.0.0.1:43971/oauth2/callback") {
 		t.Fatal("termlink-windows browser fallback policy is incomplete")
 	}
@@ -290,9 +291,11 @@ func TestAcceptanceIdentityRecoveryUsesBoundedServiceAccountSecret(t *testing.T)
 	compose := string(data)
 	clientStart := strings.Index(compose, "recovery_client_id=$$(/opt/keycloak/bin/kcadm.sh get clients")
 	secretWrite := strings.Index(compose, `printf '%s' "$$recovery_secret" > /target/server-secrets/keycloak_admin_client_secret`)
-	registrationOpen := strings.LastIndex(compose, "-s registrationAllowed=true")
-	if clientStart < 0 || secretWrite < 0 || registrationOpen < 0 || !(clientStart < secretWrite && secretWrite < registrationOpen) {
-		t.Fatal("acceptance identity recovery client must be provisioned before public registration opens")
+	if clientStart < 0 || secretWrite < 0 || clientStart > secretWrite {
+		t.Fatal("acceptance identity service account must be provisioned before its secret is published")
+	}
+	if strings.Contains(compose, "-s registrationAllowed=true") {
+		t.Fatal("Keycloak native self-registration must stay disabled")
 	}
 	for _, contract := range []string{
 		"clientId=termlink-registration-recovery",
@@ -333,6 +336,19 @@ func TestAcceptanceIdentityRecoveryUsesBoundedServiceAccountSecret(t *testing.T)
 	}
 	if strings.Contains(compose, "-s resetPasswordAllowed=true") {
 		t.Fatal("password reset must remain disabled until a tested service-email configuration enables it")
+	}
+}
+
+func TestProductionRegistrationUsesOnlyBoundedKeycloakAdmin(t *testing.T) {
+	data, err := os.ReadFile("../../cmd/termlink-server/main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainSource := string(data)
+	if strings.Contains(mainSource, "NewDirectRegistrationService") ||
+		!strings.Contains(mainSource, "productionAPI.Registration = keycloakAdmin") ||
+		!strings.Contains(mainSource, "productionAPI.VerifiedRegistration = keycloakAdmin") {
+		t.Fatal("production registration must use only the bounded Keycloak administration client")
 	}
 }
 
@@ -391,7 +407,7 @@ func TestAcceptanceRegistrationRecoveryUserProfileIsControlled(t *testing.T) {
 			continue
 		}
 		if !equalStrings(attribute.Permissions["view"], []string{"admin"}) ||
-			!equalStrings(attribute.Permissions["edit"], []string{"admin", "user"}) ||
+			!equalStrings(attribute.Permissions["edit"], []string{"admin"}) ||
 			!equalStrings(attribute.Selector.Scopes, []string{RegistrationAttemptScope}) ||
 			attribute.Multivalued || attribute.Validations["length"] == nil {
 			t.Fatalf("controlled registration attribute %q has unsafe profile permissions", attribute.Name)
@@ -411,12 +427,11 @@ func TestAcceptanceRegistrationRecoveryUserProfileIsControlled(t *testing.T) {
 	}
 	compose := string(composeData)
 	profileUpdate := strings.Index(compose, "update realms/termlink/users/profile")
-	openRegistration := strings.LastIndex(compose, "-s registrationAllowed=true")
-	if profileUpdate < 0 || openRegistration < 0 || profileUpdate > openRegistration ||
+	if profileUpdate < 0 || strings.Contains(compose, "-s registrationAllowed=true") ||
 		!strings.Contains(compose, `"include.in.token.scope":"false"`) ||
 		!strings.Contains(compose, `optional-client-scopes/$$registration_scope_id`) ||
 		!strings.Contains(compose, `default-client-scopes/$$registration_scope_id`) {
-		t.Fatal("acceptance bootstrap does not reconcile the registration-only User Profile scope before opening registration")
+		t.Fatal("acceptance bootstrap does not keep controlled registration attributes private while native registration remains closed")
 	}
 }
 
@@ -441,7 +456,7 @@ func containsString(values []string, target string) bool {
 	return false
 }
 
-func TestAcceptanceBootstrapFailsClosedBeforeOpeningRegistration(t *testing.T) {
+func TestAcceptanceBootstrapKeepsNativeRegistrationClosed(t *testing.T) {
 	data, err := os.ReadFile("../../compose/acceptance.compose.yml")
 	if err != nil {
 		t.Fatal(err)
@@ -450,10 +465,10 @@ func TestAcceptanceBootstrapFailsClosedBeforeOpeningRegistration(t *testing.T) {
 	disableRegistration := strings.Index(compose, "-s registrationAllowed=false")
 	managedMarker := strings.Index(compose, "--rolename TERMLINK_BOOTSTRAP_MANAGED_V1")
 	unmanagedAdminFailure := strings.Index(compose, "Refusing to grant SUPER_ADMIN to an unmanaged existing admin account.")
-	openRegistration := strings.LastIndex(compose, "-s registrationAllowed=true")
-	if disableRegistration < 0 || managedMarker < 0 || unmanagedAdminFailure < 0 || openRegistration < 0 ||
-		!(disableRegistration < managedMarker && managedMarker < unmanagedAdminFailure && unmanagedAdminFailure < openRegistration) {
-		t.Fatal("acceptance identity bootstrap must fail closed before opening registration")
+	if disableRegistration < 0 || managedMarker < 0 || unmanagedAdminFailure < 0 ||
+		!(disableRegistration < managedMarker && managedMarker < unmanagedAdminFailure) ||
+		strings.Contains(compose, "-s registrationAllowed=true") {
+		t.Fatal("acceptance identity bootstrap must keep provider self-registration closed")
 	}
 	const publicIngressGate = "lucky-upstream:\n"
 	luckyStart := strings.Index(compose, publicIngressGate)
@@ -514,6 +529,7 @@ func TestAcceptanceBootstrapReconcilesWindowsNativeLogin(t *testing.T) {
 		`-s implicitFlowEnabled=false`,
 		`-s serviceAccountsEnabled=false`,
 		`-s fullScopeAllowed=false`,
+		`-s baseUrl=${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}`,
 		`-s 'redirectUris=["http://127.0.0.1:43971/oauth2/callback"]'`,
 		`-s 'attributes={"pkce.code.challenge.method":"S256"}'`,
 	} {
@@ -534,7 +550,9 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 	}
 
 	loginTemplate := read("../../acceptance/keycloak-theme/termlink/login/template.ftl")
-	loginCSS := read("../../acceptance/keycloak-theme/termlink/login/resources/css/login.css")
+	loginForm := read("../../acceptance/keycloak-theme/termlink/login/login.ftl")
+	loginCSS := read("../../internal/webportal/assets/identity.css")
+	loginThemeProperties := read("../../acceptance/keycloak-theme/termlink/login/theme.properties")
 	loginThemeInit := read("../../acceptance/keycloak-theme/termlink/login/resources/js/theme-init.js")
 	zhMessages := read("../../acceptance/keycloak-theme/termlink/login/messages/messages_zh_CN.properties")
 	enMessages := read("../../acceptance/keycloak-theme/termlink/login/messages/messages_en.properties")
@@ -549,12 +567,16 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 
 	for name, content := range map[string]string{
 		"login template account target":         `termlinkAccountUrl = client.baseUrl`,
+		"login template hosted registration":    `client.clientId == "termlink-windows" && client.baseUrl?has_content`,
+		"login form authorization continuation": `?continue=${url.loginUrl?url}`,
+		"login server registration policy":      `msg("termlinkServerRegistration")`,
 		"login template accessible label":       `msg('termlinkBackToPersonalCenter')`,
 		"login template theme transfer":         `data-theme-transfer`,
 		"login pre-paint theme script":          `src="${url.resourcesPath}/js/theme-init.js"`,
 		"login pre-paint stored theme":          `const storageKey = "termlink-theme"`,
 		"login pre-paint transferred theme":     `searchParams.get(transferParameter)`,
 		"login theme responsive account action": ".identity-account-link",
+		"login shared identity stylesheet":      "styles=css/identity.css",
 		"login SVG theme control":               `class="theme-icon-moon"`,
 		"login SVG account return":              `<span class="identity-account-link-icon" aria-hidden="true"><svg`,
 		"Chinese personal-center copy":          "termlinkBackToPersonalCenter=返回个人中心",
@@ -590,16 +612,23 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 		"account SVG theme control":             `class="theme-icon-moon"`,
 		"account SVG return control":            `tl-account-return-icon`,
 		"production image account theme":        `COPY acceptance/keycloak-theme/termlink/ /opt/keycloak/themes/termlink-01b-v18/`,
+		"production shared identity styles":     `COPY internal/webportal/assets/identity.css /opt/keycloak/themes/termlink-01b-v18/login/resources/css/identity.css`,
+		"production shared identity mark":       `COPY internal/webportal/assets/termlink-app-icon.svg /opt/keycloak/themes/termlink-01b-v18/login/resources/img/termlink-mark.svg`,
+		"production shared identity favicon":    `COPY internal/webportal/assets/termlink-favicon.svg /opt/keycloak/themes/termlink-01b-v18/login/resources/img/termlink-favicon.svg`,
 		"production runtime account theme":      `-s accountTheme=termlink-01b-v18`,
 	} {
 		var source string
 		switch name {
-		case "login template account target", "login template accessible label", "login template theme transfer", "login pre-paint theme script", "login SVG theme control", "login SVG account return":
+		case "login template account target", "login template hosted registration", "login template accessible label", "login template theme transfer", "login pre-paint theme script", "login SVG theme control", "login SVG account return", "login server registration policy":
 			source = loginTemplate
+		case "login form authorization continuation":
+			source = loginForm
 		case "login pre-paint stored theme", "login pre-paint transferred theme":
 			source = loginThemeInit
 		case "login theme responsive account action":
 			source = loginCSS
+		case "login shared identity stylesheet":
+			source = loginThemeProperties
 		case "Chinese personal-center copy":
 			source = zhMessages
 		case "English personal-center copy":
@@ -616,7 +645,7 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 			source = accountZhMessages
 		case "account theme return styling", "account native user menu styling", "account admin-aligned sidebar", "account content-sized workspace", "account opaque workspace surface":
 			source = accountCSS
-		case "production image account theme":
+		case "production image account theme", "production shared identity styles", "production shared identity mark", "production shared identity favicon":
 			source = keycloakDockerfile
 		case "production runtime account theme":
 			source = acceptanceCompose
@@ -624,6 +653,9 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 		if !strings.Contains(source, content) {
 			t.Errorf("%s contract is missing", name)
 		}
+	}
+	if strings.Contains(loginForm, "url.registrationUrl") {
+		t.Fatal("identity login still exposes the provider registration URL and can bypass TermLink registration policy")
 	}
 	if strings.Contains(acceptanceCompose, "../acceptance/keycloak-theme/termlink:/opt/keycloak/themes/") {
 		t.Error("production acceptance must exercise the identity theme baked into the Keycloak image")

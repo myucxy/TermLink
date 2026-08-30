@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/termlink/termlink/server/internal/adminroute"
+	"github.com/termlink/termlink/server/internal/humanverification"
 	"github.com/termlink/termlink/server/internal/serviceemail"
 	"github.com/termlink/termlink/server/internal/store"
 	"golang.org/x/oauth2"
@@ -262,6 +264,33 @@ func TestValidateConfigRejectsPublicURLWithPath(t *testing.T) {
 	}
 }
 
+func TestValidateConfigRejectsInvalidHumanVerificationPair(t *testing.T) {
+	base := Config{
+		PublicURL:   "https://" + testPublicHost,
+		Issuer:      "https://identity.example/realms/termlink",
+		ClientID:    "termlink-web",
+		RedirectURI: "https://" + testPublicHost + "/auth/callback",
+		CookieKey:   []byte("0123456789abcdef0123456789abcdef"),
+		SubjectKey:  []byte("abcdef0123456789abcdef0123456789"),
+		Repository:  newTestPortalRepository(),
+	}
+	for _, mutate := range []func(*Config){
+		func(config *Config) { config.HumanVerificationSiteKey = "site-key-without-provider" },
+		func(config *Config) { config.HumanVerificationProvider = "unsupported" },
+		func(config *Config) { config.HumanVerificationProvider = humanverification.ProviderTurnstile },
+		func(config *Config) {
+			config.HumanVerificationProvider = humanverification.ProviderTurnstile
+			config.HumanVerificationSiteKey = "invalid site key"
+		},
+	} {
+		candidate := base
+		mutate(&candidate)
+		if _, err := validateConfig(candidate); err == nil {
+			t.Fatalf("validateConfig accepted invalid human verification config: %+v", candidate)
+		}
+	}
+}
+
 func TestCustomAdminRouteHidesDefaultAndTranslatesPortalLinks(t *testing.T) {
 	flow := &testOIDCFlow{}
 	portal := newTestPortal(t, flow)
@@ -450,6 +479,12 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 	if css.Code != http.StatusOK || !strings.HasPrefix(css.Header().Get("Content-Type"), "text/css") || css.Body.Len() < 1000 {
 		t.Fatalf("embedded stylesheet response is incomplete: status=%d bytes=%d", css.Code, css.Body.Len())
 	}
+	identityCSS := performRequest(portal.Handler(), http.MethodGet, "/assets/identity.css", nil)
+	if identityCSS.Code != http.StatusOK || !strings.HasPrefix(identityCSS.Header().Get("Content-Type"), "text/css") ||
+		!strings.Contains(identityCSS.Body.String(), ".identity-layout") ||
+		!strings.Contains(identityCSS.Body.String(), ".registration-code-row") {
+		t.Fatalf("shared identity stylesheet response is incomplete: status=%d bytes=%d", identityCSS.Code, identityCSS.Body.Len())
+	}
 	themeInit := performRequest(portal.Handler(), http.MethodGet, "/assets/theme-init.js", nil)
 	if themeInit.Code != http.StatusOK || !strings.HasPrefix(themeInit.Header().Get("Content-Type"), "text/javascript") ||
 		!strings.Contains(themeInit.Body.String(), "termlink-theme") {
@@ -468,6 +503,9 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 		!strings.Contains(registerScript.Body.String(), "注册服务暂时不可用") ||
 		!strings.Contains(registerScript.Body.String(), "Registration is temporarily unavailable") ||
 		!strings.Contains(registerScript.Body.String(), "PublicRegistrationError") ||
+		!strings.Contains(registerScript.Body.String(), "human_verification_token") ||
+		strings.Count(registerScript.Body.String(), "resetHumanVerification();") < 2 ||
+		!strings.Contains(registerScript.Body.String(), "result.error.code") ||
 		strings.Contains(registerScript.Body.String(), "error instanceof Error ? error.message") {
 		t.Fatalf("registration prompts must be safely localized in Chinese and English: status=%d", registerScript.Code)
 	}
@@ -516,6 +554,101 @@ func TestRegistrationPageFailsClosedWhenRequiredEmailDeliveryIsUnavailable(t *te
 	}
 }
 
+func TestRegistrationPagePreservesOnlyTrustedOIDCContinuation(t *testing.T) {
+	portal := newTestPortal(t, &testOIDCFlow{})
+	portal.config.WindowsClientID = "termlink-windows"
+	portal.config.Repository = &testRegistrationAdminRepository{
+		testPortalRepository: newTestPortalRepository(),
+		policy:               store.RegistrationPolicy{Mode: store.RegistrationInviteRequired, Version: 1},
+	}
+	continuation := "https://identity.example/realms/termlink/login-actions/authenticate?" +
+		"client_id=termlink-windows&execution=fixture&session_code=secret&tab_id=tab"
+	response := performRequest(
+		portal.Handler(),
+		http.MethodGet,
+		"/register?continue="+url.QueryEscape(continuation),
+		nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("trusted continuation registration response = %d", response.Code)
+	}
+	escaped := html.EscapeString(continuation)
+	body := response.Body.String()
+	if !strings.Contains(body, `data-registration-continue="`+escaped+`"`) ||
+		!strings.Contains(body, `href="`+escaped+`"`) ||
+		!strings.Contains(body, "需要有效邀请码") ||
+		!strings.Contains(body, `/assets/identity.css`) ||
+		strings.Contains(body, `/assets/site.css`) {
+		t.Fatalf("trusted Windows OIDC continuation was not preserved through registration: %q", body)
+	}
+
+	for _, untrusted := range []string{
+		"https://evil.example/realms/termlink/login-actions/authenticate?client_id=termlink-windows",
+		"https://identity.example/realms/termlink/account?client_id=termlink-windows",
+		"https://identity.example/realms/termlink/login-actions/authenticate?client_id=unknown-client",
+		"https://identity.example/realms/termlink/login-actions/authenticate?client_id=termlink-windows&client_id=termlink-web",
+	} {
+		response = performRequest(
+			portal.Handler(),
+			http.MethodGet,
+			"/register?continue="+url.QueryEscape(untrusted),
+			nil)
+		body = response.Body.String()
+		if response.Code != http.StatusOK || strings.Contains(body, html.EscapeString(untrusted)) ||
+			!strings.Contains(body, `href="/login?return_to=/account"`) {
+			t.Fatalf("untrusted registration continuation was accepted: %q", untrusted)
+		}
+	}
+}
+
+func TestRegistrationPageEnablesTurnstileWithoutWeakeningOtherPages(t *testing.T) {
+	portal := newTestPortal(t, &testOIDCFlow{})
+	portal.config.Repository = &testRegistrationAdminRepository{
+		testPortalRepository: newTestPortalRepository(),
+		policy:               store.RegistrationPolicy{Mode: store.RegistrationOpen, Version: 1},
+	}
+	portal.config.HumanVerificationProvider = humanverification.ProviderTurnstile
+	portal.config.HumanVerificationSiteKey = "0x4AAAA-public-test-site-key"
+
+	response := performRequest(portal.Handler(), http.MethodGet, "/register", nil)
+	body := response.Body.String()
+	if response.Code != http.StatusOK ||
+		!strings.Contains(body, `id="human-verification"`) ||
+		!strings.Contains(body, `data-site-key="0x4AAAA-public-test-site-key"`) ||
+		!strings.Contains(body, `data-human-verification-required="true"`) ||
+		!strings.Contains(body, humanverification.TurnstileScriptOrigin+`/turnstile/v0/api.js?render=explicit`) ||
+		strings.Contains(body, "turnstile-secret-material") {
+		t.Fatalf("Turnstile registration page is incomplete or leaked secret material: status=%d body=%q", response.Code, body)
+	}
+	policy := response.Header().Get("Content-Security-Policy")
+	for _, directive := range []string{
+		"script-src 'self' " + humanverification.TurnstileScriptOrigin,
+		"connect-src 'self' " + humanverification.TurnstileScriptOrigin,
+		"frame-src 'self' " + humanverification.TurnstileScriptOrigin,
+	} {
+		if !strings.Contains(policy, directive) {
+			t.Fatalf("Turnstile registration CSP %q omitted %q", policy, directive)
+		}
+	}
+
+	home := performRequest(portal.Handler(), http.MethodGet, "/", nil)
+	if strings.Contains(home.Body.String(), humanverification.TurnstileScriptOrigin) ||
+		strings.Contains(home.Header().Get("Content-Security-Policy"), humanverification.TurnstileScriptOrigin) {
+		t.Fatal("Turnstile must not be loaded or allowed by CSP on ordinary portal pages")
+	}
+
+	disabled := newTestPortal(t, &testOIDCFlow{})
+	disabled.config.Repository = &testRegistrationAdminRepository{
+		testPortalRepository: newTestPortalRepository(),
+		policy:               store.RegistrationPolicy{Mode: store.RegistrationOpen, Version: 1},
+	}
+	disabledResponse := performRequest(disabled.Handler(), http.MethodGet, "/register", nil)
+	if strings.Contains(disabledResponse.Body.String(), humanverification.TurnstileScriptOrigin) ||
+		strings.Contains(disabledResponse.Body.String(), `id="human-verification"`) ||
+		strings.Contains(disabledResponse.Header().Get("Content-Security-Policy"), humanverification.TurnstileScriptOrigin) {
+		t.Fatal("disabled human verification must preserve the existing registration page and CSP")
+	}
+}
+
 func TestPortalTemplatesApplyThemeBeforeStyles(t *testing.T) {
 	for _, name := range []string{"home.html", "account.html", "admin.html", "error.html"} {
 		data, err := portalAssets.ReadFile("assets/" + name)
@@ -528,6 +661,14 @@ func TestPortalTemplatesApplyThemeBeforeStyles(t *testing.T) {
 		if initIndex < 0 || styleIndex < 0 || initIndex > styleIndex {
 			t.Errorf("%s must restore the selected theme before loading product styles", name)
 		}
+	}
+	data, err := portalAssets.ReadFile("assets/register.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	registrationHTML := string(data)
+	if initIndex, styleIndex := strings.Index(registrationHTML, `/assets/theme-init.js`), strings.Index(registrationHTML, `/assets/identity.css`); initIndex < 0 || styleIndex < 0 || initIndex > styleIndex {
+		t.Error("register.html must restore the selected theme before loading shared identity styles")
 	}
 }
 
@@ -551,10 +692,18 @@ func TestPortalAccountResponsiveAndSVGControlContract(t *testing.T) {
 		"long identity wrapping":          `overflow-wrap: anywhere;`,
 		"long display-name wrapping":      `.profile-panel strong`,
 		"accessible tertiary text":        `--text-3: #606b7d;`,
-		"registration field stacking":     `.registration-form label`,
-		"registration mobile code row":    `.registration-code-row { grid-template-columns: 1fr; }`,
 	} {
 		if !strings.Contains(siteCSS, contract) {
+			t.Errorf("%s is missing", name)
+		}
+	}
+	identityCSS := readAsset("identity.css")
+	for name, contract := range map[string]string{
+		"registration identity layout": `.registration-page .identity-layout`,
+		"registration mobile code row": `.registration-code-row {`,
+		"registration status message":  `.registration-message[data-state="error"]`,
+	} {
+		if !strings.Contains(identityCSS, contract) {
 			t.Errorf("%s is missing", name)
 		}
 	}

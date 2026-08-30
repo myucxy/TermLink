@@ -31,6 +31,7 @@ import (
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/buildinfo"
 	commercecontrol "github.com/termlink/termlink/server/internal/commerce"
+	"github.com/termlink/termlink/server/internal/humanverification"
 	"github.com/termlink/termlink/server/internal/serviceemail"
 	"github.com/termlink/termlink/server/internal/store"
 	"golang.org/x/oauth2"
@@ -57,30 +58,33 @@ var portalAssets embed.FS
 
 // Config contains only the public OIDC metadata and the server-held cookie key.
 type Config struct {
-	PublicURL                string
-	Issuer                   string
-	ClientID                 string
-	StepUpClientID           string
-	RedirectURI              string
-	CookieKey                []byte
-	SubjectKey               []byte
-	AppShipBaseURL           string
-	AppShipAllowedPrivateIPs string
-	AppShipHTTPClient        *http.Client
-	ReleaseSource            PublicReleaseSource
-	BuildInfo                buildinfo.Info
-	CommerceKey              []byte
-	Commerce                 commercePortalService
-	DataExportDownloader     PrivacyExportDownloader
-	AccountDeletionBinder    accountdeletion.RequestBinder
-	ServiceEmail             *serviceemail.Service
-	AdminRoutes              *adminroute.Service
-	IdentityProfiles         identityProfileService
-	IdentityMFAStatus        identityMFAStatusService
-	Reconciliation           ReconciliationOperations
-	Repository               portalRepository
-	AccountStatusChanged     func(context.Context, uuid.UUID, string) error
-	Clock                    func() time.Time
+	PublicURL                 string
+	Issuer                    string
+	ClientID                  string
+	WindowsClientID           string
+	StepUpClientID            string
+	RedirectURI               string
+	HumanVerificationProvider string
+	HumanVerificationSiteKey  string
+	CookieKey                 []byte
+	SubjectKey                []byte
+	AppShipBaseURL            string
+	AppShipAllowedPrivateIPs  string
+	AppShipHTTPClient         *http.Client
+	ReleaseSource             PublicReleaseSource
+	BuildInfo                 buildinfo.Info
+	CommerceKey               []byte
+	Commerce                  commercePortalService
+	DataExportDownloader      PrivacyExportDownloader
+	AccountDeletionBinder     accountdeletion.RequestBinder
+	ServiceEmail              *serviceemail.Service
+	AdminRoutes               *adminroute.Service
+	IdentityProfiles          identityProfileService
+	IdentityMFAStatus         identityMFAStatusService
+	Reconciliation            ReconciliationOperations
+	Repository                portalRepository
+	AccountStatusChanged      func(context.Context, uuid.UUID, string) error
+	Clock                     func() time.Time
 }
 
 type commercePortalService interface {
@@ -202,6 +206,7 @@ type Portal struct {
 	sessionCodec   cookieCodec
 	templates      *template.Template
 	styles         []byte
+	identityStyles []byte
 	adminStyles    []byte
 	commerceStyles []byte
 	publicStyles   []byte
@@ -238,6 +243,10 @@ type registerPageData struct {
 	RegistrationOpen          bool
 	InvitationRequired        bool
 	EmailVerificationRequired bool
+	HumanVerificationRequired bool
+	HumanVerificationSiteKey  string
+	ContinueURL               string
+	LoginURL                  string
 }
 
 type accountPageData struct {
@@ -294,6 +303,8 @@ func New(ctx context.Context, config Config) (*Portal, error) {
 	if strings.TrimSpace(config.StepUpClientID) == "" {
 		config.StepUpClientID = strings.TrimSpace(config.ClientID) + "-step-up"
 	}
+	config.HumanVerificationProvider = strings.ToLower(strings.TrimSpace(config.HumanVerificationProvider))
+	config.HumanVerificationSiteKey = strings.TrimSpace(config.HumanVerificationSiteKey)
 	publicOrigin, err := validateConfig(config)
 	if err != nil {
 		return nil, err
@@ -376,6 +387,10 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 	if err != nil {
 		return nil, fmt.Errorf("read web portal styles: %w", err)
 	}
+	identityStyles, err := portalAssets.ReadFile("assets/identity.css")
+	if err != nil {
+		return nil, fmt.Errorf("read shared identity styles: %w", err)
+	}
 	adminStyles, err := portalAssets.ReadFile("assets/admin.css")
 	if err != nil {
 		return nil, fmt.Errorf("read web portal admin styles: %w", err)
@@ -428,6 +443,7 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 		sessionCodec:   sessionCodec,
 		templates:      parsed,
 		styles:         styles,
+		identityStyles: identityStyles,
 		adminStyles:    adminStyles,
 		commerceStyles: commerceStyles,
 		publicStyles:   publicStyles,
@@ -462,6 +478,19 @@ func validateConfig(config Config) (*url.URL, error) {
 	}
 	if strings.TrimSpace(config.ClientID) == "" {
 		return nil, errors.New("web portal OIDC client ID is required")
+	}
+	switch strings.ToLower(strings.TrimSpace(config.HumanVerificationProvider)) {
+	case "":
+		if strings.TrimSpace(config.HumanVerificationSiteKey) != "" {
+			return nil, errors.New("web portal human verification provider is required when a site key is configured")
+		}
+	case humanverification.ProviderTurnstile:
+		siteKey := strings.TrimSpace(config.HumanVerificationSiteKey)
+		if siteKey == "" || len(siteKey) > 256 || strings.ContainsAny(siteKey, " \t\r\n") {
+			return nil, errors.New("web portal Turnstile site key is invalid")
+		}
+	default:
+		return nil, errors.New("web portal human verification provider is unsupported")
 	}
 	if strings.TrimSpace(config.StepUpClientID) == "" {
 		config.StepUpClientID = strings.TrimSpace(config.ClientID) + "-step-up"
@@ -544,6 +573,7 @@ func (p *Portal) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", p.home)
 	mux.HandleFunc("GET /assets/site.css", p.siteCSS)
+	mux.HandleFunc("GET /assets/identity.css", p.identityCSS)
 	mux.HandleFunc("GET /assets/admin.css", p.adminCSS)
 	mux.HandleFunc("GET /assets/commerce-portal.css", p.commerceCSS)
 	mux.HandleFunc("GET /assets/public-pages.css", p.publicCSS)
@@ -674,6 +704,10 @@ func (p *Portal) siteCSS(w http.ResponseWriter, _ *http.Request) {
 	p.staticAsset(w, "text/css; charset=utf-8", p.styles)
 }
 
+func (p *Portal) identityCSS(w http.ResponseWriter, _ *http.Request) {
+	p.staticAsset(w, "text/css; charset=utf-8", p.identityStyles)
+}
+
 func (p *Portal) adminCSS(w http.ResponseWriter, _ *http.Request) {
 	p.staticAsset(w, "text/css; charset=utf-8", p.adminStyles)
 }
@@ -701,8 +735,13 @@ func (p *Portal) registerJS(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (p *Portal) registerPage(w http.ResponseWriter, r *http.Request) {
+	continueURL := normalizeRegistrationContinueURL(p.config, r.URL.Query().Get("continue"))
 	if !p.usesPublicHost(r) {
-		http.Redirect(w, r, strings.TrimRight(p.config.PublicURL, "/")+"/register", http.StatusSeeOther)
+		target := strings.TrimRight(p.config.PublicURL, "/") + "/register"
+		if continueURL != "" {
+			target += "?continue=" + url.QueryEscape(continueURL)
+		}
+		http.Redirect(w, r, target, http.StatusSeeOther)
 		return
 	}
 	repository, ok := p.config.Repository.(registrationPortalRepository)
@@ -727,10 +766,18 @@ func (p *Portal) registerPage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	loginURL := "/login?return_to=/account"
+	if continueURL != "" {
+		loginURL = continueURL
+	}
 	p.render(w, http.StatusOK, "register.html", registerPageData{
 		Mode: policy.Mode, RegistrationOpen: policy.Mode != store.RegistrationClosed,
 		InvitationRequired:        policy.Mode == store.RegistrationInviteRequired,
 		EmailVerificationRequired: emailVerificationRequired,
+		HumanVerificationRequired: p.config.HumanVerificationProvider == humanverification.ProviderTurnstile,
+		HumanVerificationSiteKey:  p.config.HumanVerificationSiteKey,
+		ContinueURL:               continueURL,
+		LoginURL:                  loginURL,
 	})
 }
 
@@ -1320,7 +1367,14 @@ func (p *Portal) internalError(w http.ResponseWriter, err error) {
 
 func (p *Portal) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		policy := "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+		if r.URL.Path == "/register" && p.config.HumanVerificationProvider == humanverification.ProviderTurnstile {
+			policy = "default-src 'none'; script-src 'self' " + humanverification.TurnstileScriptOrigin +
+				"; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self' " + humanverification.TurnstileScriptOrigin +
+				"; frame-src 'self' " + humanverification.TurnstileScriptOrigin +
+				"; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+		}
+		w.Header().Set("Content-Security-Policy", policy)
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -1556,6 +1610,42 @@ func normalizePortalReturnTo(value string) string {
 	default:
 		return "/account"
 	}
+}
+
+func normalizeRegistrationContinueURL(config Config, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 4096 {
+		return ""
+	}
+	target, err := url.Parse(value)
+	if err != nil || target.User != nil || target.RawPath != "" || target.Fragment != "" {
+		return ""
+	}
+	issuer, err := url.Parse(strings.TrimRight(strings.TrimSpace(config.Issuer), "/"))
+	if err != nil || !strings.EqualFold(target.Scheme, issuer.Scheme) ||
+		!strings.EqualFold(target.Host, issuer.Host) {
+		return ""
+	}
+	expectedPath := strings.TrimRight(issuer.Path, "/") + "/login-actions/authenticate"
+	if target.Path != expectedPath {
+		return ""
+	}
+	query, err := url.ParseQuery(target.RawQuery)
+	if err != nil {
+		return ""
+	}
+	windowsClientID := strings.TrimSpace(config.WindowsClientID)
+	if windowsClientID == "" {
+		windowsClientID = "termlink-windows"
+	}
+	if len(query["client_id"]) != 1 {
+		return ""
+	}
+	clientID := strings.TrimSpace(query.Get("client_id"))
+	if clientID == "" || (clientID != windowsClientID && clientID != strings.TrimSpace(config.ClientID)) {
+		return ""
+	}
+	return target.String()
 }
 
 func identityReturnPath(action string) string {

@@ -744,6 +744,7 @@ namespace TermLink.Agent
         private readonly string windowsPowerShellPath;
         private readonly string powerShell7Path;
         private readonly string wslPath;
+        private readonly string registryControlPipeName;
 
         internal ManagedTerminalLauncher()
             : this(
@@ -762,7 +763,30 @@ namespace TermLink.Agent
                     "pwsh.exe"),
                 ResolvePreferredExecutable(
                     Path.Combine(Environment.SystemDirectory, "wsl.exe"),
-                    "wsl.exe"))
+                    "wsl.exe"),
+                null)
+        {
+        }
+
+        internal ManagedTerminalLauncher(string registryControlPipeName)
+            : this(
+                new WindowsPathService(),
+                new SystemProcessStarter(),
+                ResolveWindowsTerminal,
+                Path.Combine(AppContext.BaseDirectory, "TermLink.SessionHost.exe"),
+                Path.Combine(Environment.SystemDirectory, "cmd.exe"),
+                Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                    "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+                ResolvePreferredExecutable(
+                    Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                        "PowerShell", "7", "pwsh.exe"),
+                    "pwsh.exe"),
+                ResolvePreferredExecutable(
+                    Path.Combine(Environment.SystemDirectory, "wsl.exe"),
+                    "wsl.exe"),
+                registryControlPipeName)
         {
         }
 
@@ -774,7 +798,8 @@ namespace TermLink.Agent
             string commandPromptPath,
             string windowsPowerShellPath,
             string powerShell7Path = null,
-            string wslPath = null)
+            string wslPath = null,
+            string registryControlPipeName = null)
         {
             this.paths = paths ?? throw new ArgumentNullException(nameof(paths));
             this.processes = processes ?? throw new ArgumentNullException(nameof(processes));
@@ -784,6 +809,14 @@ namespace TermLink.Agent
             this.windowsPowerShellPath = Path.GetFullPath(windowsPowerShellPath ?? throw new ArgumentNullException(nameof(windowsPowerShellPath)));
             this.powerShell7Path = NormalizeOptionalExecutablePath(powerShell7Path);
             this.wslPath = NormalizeOptionalExecutablePath(wslPath);
+            this.registryControlPipeName = string.IsNullOrWhiteSpace(registryControlPipeName)
+                ? TermLinkControlPipe.DefaultName()
+                : registryControlPipeName.Trim();
+            if (this.registryControlPipeName.Length > 200 ||
+                this.registryControlPipeName.IndexOfAny(new[] { '\\', '/' }) >= 0)
+            {
+                throw new ArgumentException("registry control pipe name is invalid.", nameof(registryControlPipeName));
+            }
         }
 
         internal Guid Launch(string shellType, string workingDirectory, Guid? requestedSessionId = null)
@@ -798,7 +831,11 @@ namespace TermLink.Agent
             var sessionId = requestedSessionId.GetValueOrDefault(Guid.NewGuid());
             if (sessionId == Guid.Empty)
                 throw new FileOperationException("SESSION_ID_INVALID", "A non-empty managed session ID is required.");
-            var arguments = BuildSessionHostArgumentsForProfile(profile, directory, sessionId);
+            var arguments = BuildSessionHostArgumentsForProfile(
+                profile,
+                directory,
+                sessionId,
+                registryControlPipeName);
             var windowsTerminal = windowsTerminalResolver();
             if (!string.IsNullOrWhiteSpace(windowsTerminal))
             {
@@ -819,7 +856,8 @@ namespace TermLink.Agent
                 foreach (var argument in arguments) terminalStart.ArgumentList.Add(argument);
                 try
                 {
-                    if (processes.TryStart(terminalStart)) return sessionId;
+                    var started = processes.TryStart(terminalStart);
+                    if (started) return sessionId;
                 }
                 catch (Exception error) when (
                     error is IOException ||
@@ -842,7 +880,8 @@ namespace TermLink.Agent
             foreach (var argument in arguments) directStart.ArgumentList.Add(argument);
             try
             {
-                if (!processes.TryStart(directStart))
+                var started = processes.TryStart(directStart);
+                if (!started)
                     throw new FileOperationException("TERMINAL_LAUNCH_FAILED", "The terminal process could not be started.");
                 return sessionId;
             }
@@ -935,7 +974,7 @@ namespace TermLink.Agent
             var commandLine = QuoteWindowsArgument(shellPath) +
                 (string.Equals(shellType, WindowsPowerShellShellType, StringComparison.Ordinal) ||
                  string.Equals(shellType, PowerShell7ShellType, StringComparison.Ordinal)
-                    ? " -NoLogo -NoProfile"
+                    ? " -NoLogo"
                     : string.Empty);
             return new[]
             {
@@ -951,13 +990,14 @@ namespace TermLink.Agent
         internal static string[] BuildSessionHostArgumentsForProfile(
             TerminalCommandProfile profile,
             string workingDirectory,
-            Guid sessionId)
+            Guid sessionId,
+            string registryControlPipeName = null)
         {
             if (profile == null) throw new ArgumentNullException(nameof(profile));
             ValidateManagedShellType(profile.ManagedShell);
             if (sessionId == Guid.Empty) throw new ArgumentException("Session ID is required.", nameof(sessionId));
             var commandLine = BuildCommandLine(profile);
-            return new[]
+            var arguments = new List<string>
             {
                 "--command-base64", Convert.ToBase64String(Encoding.UTF8.GetBytes(commandLine)),
                 "--managed-shell", profile.ManagedShell,
@@ -966,6 +1006,15 @@ namespace TermLink.Agent
                 "--registration-timeout-ms", DefaultRegistrationTimeoutMilliseconds.ToString(
                     System.Globalization.CultureInfo.InvariantCulture)
             };
+            if (!string.IsNullOrWhiteSpace(registryControlPipeName))
+            {
+                var normalizedPipe = registryControlPipeName.Trim();
+                if (normalizedPipe.Length > 200 || normalizedPipe.IndexOfAny(new[] { '\\', '/' }) >= 0)
+                    throw new ArgumentException("registry control pipe name is invalid.", nameof(registryControlPipeName));
+                arguments.Add("--registry-pipe");
+                arguments.Add(normalizedPipe);
+            }
+            return arguments.ToArray();
         }
 
         internal static void ValidateShellType(string shellType)
@@ -1012,8 +1061,8 @@ namespace TermLink.Agent
                 .ToDictionary(profile => profile.Id, StringComparer.Ordinal);
             var result = new List<TerminalCommandProfile>(24);
             AddBuiltIn(result, overrides, CommandPromptShellType, "Command Prompt", commandPromptPath, string.Empty);
-            AddBuiltIn(result, overrides, WindowsPowerShellShellType, "Windows PowerShell", windowsPowerShellPath, "-NoLogo -NoProfile");
-            AddBuiltIn(result, overrides, PowerShell7ShellType, "PowerShell 7", powerShell7Path, "-NoLogo -NoProfile");
+            AddBuiltIn(result, overrides, WindowsPowerShellShellType, "Windows PowerShell", windowsPowerShellPath, "-NoLogo");
+            AddBuiltIn(result, overrides, PowerShell7ShellType, "PowerShell 7", powerShell7Path, "-NoLogo");
             AddBuiltIn(result, overrides, WslShellType, "WSL", wslPath, string.Empty);
             foreach (var profile in configured.Where(profile =>
                 string.Equals(profile.Source, "manual", StringComparison.Ordinal)))

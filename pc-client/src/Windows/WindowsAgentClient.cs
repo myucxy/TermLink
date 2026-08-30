@@ -29,6 +29,8 @@ public sealed record WindowsAgentClientOptions(
 
 public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
 {
+    private static readonly TimeSpan AgentStartupTimeout = TimeSpan.FromSeconds(65);
+    private const int MaximumAgentDiagnosticCharacters = 512;
     private readonly WindowsAgentClientOptions options;
     private readonly SemaphoreSlim lifecycle = new(1, 1);
     private readonly object revisionSync = new();
@@ -133,20 +135,30 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
         }, 30_000, cancellationToken).ConfigureAwait(false);
     }
 
+    public async ValueTask BeginAccountAuthorizationAsync(
+        string pcName,
+        CancellationToken cancellationToken)
+    {
+        await SendAccountMutationAsync(new RegistryRequest
+        {
+            Command = RegistryCommand.BeginAccountAuthorization,
+            PcName = string.IsNullOrWhiteSpace(pcName) ? Environment.MachineName : pcName.Trim()
+        }, RegistryControlClient.MaximumTimeoutMilliseconds, cancellationToken).ConfigureAwait(false);
+    }
+
     public async ValueTask LoginAsync(
         string username,
         string password,
         string pcName,
         CancellationToken cancellationToken)
     {
-        await SendRequiredAsync(new RegistryRequest
+        await SendAccountMutationAsync(new RegistryRequest
         {
             Command = RegistryCommand.LoginAccount,
             AccountUsername = username,
             AccountPassword = password,
             PcName = pcName
         }, 60_000, cancellationToken).ConfigureAwait(false);
-        await RestartAfterMutationAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask RegisterAsync(
@@ -158,7 +170,7 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
         string pcName,
         CancellationToken cancellationToken)
     {
-        await SendRequiredAsync(new RegistryRequest
+        await SendAccountMutationAsync(new RegistryRequest
         {
             Command = RegistryCommand.RegisterAccount,
             AccountUsername = username,
@@ -168,16 +180,14 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
             AccountPasswordConfirmation = passwordConfirmation,
             PcName = pcName
         }, 60_000, cancellationToken).ConfigureAwait(false);
-        await RestartAfterMutationAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask SignOutAsync(CancellationToken cancellationToken)
     {
-        await SendRequiredAsync(
+        await SendAccountMutationAsync(
             new RegistryRequest { Command = RegistryCommand.SignOutAccount },
             30_000,
             cancellationToken).ConfigureAwait(false);
-        await RestartAfterMutationAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -219,7 +229,7 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
             await WaitForOwnedProcessesAsync(DateTime.UtcNow.AddSeconds(5), cancellationToken)
                 .ConfigureAwait(false);
             if (HasOwnedProcesses())
-                throw new InvalidOperationException("TermLink Agent or SessionHost processes are still running.");
+                throw new AgentClientOperationException("PC_AGENT_PROCESSES_STILL_RUNNING");
         }
         catch
         {
@@ -272,43 +282,11 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
     private async Task EnsureAgentAsync(CancellationToken cancellationToken)
     {
         if (Volatile.Read(ref fullShutdownRequested) != 0)
-            throw new InvalidOperationException("TermLink is exiting completely; the Agent will not be restarted.");
+            throw new AgentClientOperationException("PC_AGENT_EXITING");
         await lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            ThrowIfDisposed();
-            if (Volatile.Read(ref fullShutdownRequested) != 0)
-                throw new InvalidOperationException("TermLink is exiting completely; the Agent will not be restarted.");
-            if (await TryListAsync(750, cancellationToken).ConfigureAwait(false) is not null) return;
-            var agentPath = Path.GetFullPath(options.AgentExecutablePath);
-            if (!File.Exists(agentPath))
-                throw new FileNotFoundException("The independent TermLink Agent executable is missing.", agentPath);
-            Directory.CreateDirectory(Path.GetFullPath(options.BufferRoot));
-            var start = new ProcessStartInfo
-            {
-                FileName = agentPath,
-                WorkingDirectory = Path.GetDirectoryName(agentPath),
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden
-            };
-            start.ArgumentList.Add("--registry");
-            start.ArgumentList.Add("--control-pipe");
-            start.ArgumentList.Add(options.ControlPipeName);
-            start.ArgumentList.Add("--buffer-root");
-            start.ArgumentList.Add(Path.GetFullPath(options.BufferRoot));
-            using var process = Process.Start(start) ??
-                throw new InvalidOperationException("The independent TermLink Agent did not start.");
-            var deadline = DateTime.UtcNow.AddSeconds(65);
-            while (DateTime.UtcNow < deadline)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (await TryListAsync(1000, cancellationToken).ConfigureAwait(false) is not null) return;
-                if (process.HasExited)
-                    throw new InvalidOperationException($"The independent TermLink Agent exited with code {process.ExitCode}.");
-                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
-            }
-            throw new TimeoutException("The independent TermLink Agent did not become ready within 65 seconds.");
+            await EnsureAgentLockedAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -316,16 +294,222 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
         }
     }
 
-    private async Task RestartAfterMutationAsync(CancellationToken cancellationToken)
+    private async Task EnsureAgentLockedAsync(CancellationToken cancellationToken)
     {
-        var deadline = DateTime.UtcNow.AddSeconds(20);
+        ThrowIfDisposed();
+        if (Volatile.Read(ref fullShutdownRequested) != 0)
+            throw new AgentClientOperationException("PC_AGENT_EXITING");
+        if (await TryListAsync(750, cancellationToken).ConfigureAwait(false) is not null) return;
+
+        var deadline = DateTime.UtcNow.Add(AgentStartupTimeout);
         while (DateTime.UtcNow < deadline)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (await TryListAsync(250, cancellationToken).ConfigureAwait(false) is null) break;
-            await Task.Delay(75, cancellationToken).ConfigureAwait(false);
+            if (!IsAgentInstanceActive(options.ControlPipeName)) break;
+            if (await TryListAsync(1000, cancellationToken).ConfigureAwait(false) is not null) return;
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
         }
-        await EnsureAgentAsync(cancellationToken).ConfigureAwait(false);
+        if (IsAgentInstanceActive(options.ControlPipeName))
+            throw new AgentClientOperationException("PC_AGENT_STARTING_TIMEOUT");
+
+        var agentPath = Path.GetFullPath(options.AgentExecutablePath);
+        if (!File.Exists(agentPath))
+            throw new FileNotFoundException("PC_AGENT_MISSING", agentPath);
+        Directory.CreateDirectory(Path.GetFullPath(options.BufferRoot));
+        var start = CreateAgentStartInfo(options);
+        var process = Process.Start(start) ??
+            throw new AgentClientOperationException("PC_AGENT_START_FAILED");
+        var standardError = ReadBoundedAsync(process.StandardError, MaximumAgentDiagnosticCharacters);
+        var standardOutput = ReadBoundedAsync(process.StandardOutput, MaximumAgentDiagnosticCharacters);
+        var observingProcess = false;
+        deadline = DateTime.UtcNow.Add(AgentStartupTimeout);
+        try
+        {
+            while (DateTime.UtcNow < deadline)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (await TryListAsync(1000, cancellationToken).ConfigureAwait(false) is not null)
+                {
+                    observingProcess = true;
+                    _ = ObserveStartedProcessAsync(process, standardOutput, standardError);
+                    return;
+                }
+                if (process.HasExited)
+                {
+                    await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+                    var diagnostic = NormalizeAgentDiagnostic(await standardError.ConfigureAwait(false));
+                    await standardOutput.ConfigureAwait(false);
+                    var exitCode = process.ExitCode;
+                    process.Dispose();
+                    observingProcess = true;
+                    if (exitCode == 125 && IsSingleInstanceDiagnostic(diagnostic))
+                    {
+                        while (DateTime.UtcNow < deadline)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            if (await TryListAsync(1000, cancellationToken).ConfigureAwait(false) is not null) return;
+                            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+                        }
+                    }
+                    throw new AgentClientOperationException(
+                        "PC_AGENT_EXITED",
+                        diagnostic,
+                        exitCode);
+                }
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+            }
+            observingProcess = true;
+            _ = ObserveStartedProcessAsync(process, standardOutput, standardError);
+            throw new AgentClientOperationException("PC_AGENT_STARTING_TIMEOUT");
+        }
+        finally
+        {
+            if (!observingProcess)
+                _ = ObserveStartedProcessAsync(process, standardOutput, standardError);
+        }
+    }
+
+    private async Task SendAccountMutationAsync(
+        RegistryRequest request,
+        int timeoutMilliseconds,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        await lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await EnsureAgentLockedAsync(cancellationToken).ConfigureAwait(false);
+            var response = await SendAsync(request, timeoutMilliseconds, cancellationToken).ConfigureAwait(false);
+            if (!response.Success) throw new InvalidOperationException(response.Code ?? "AGENT_COMMAND_FAILED");
+        }
+        finally
+        {
+            lifecycle.Release();
+        }
+    }
+
+    internal static ProcessStartInfo CreateAgentStartInfo(WindowsAgentClientOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        var agentPath = Path.GetFullPath(options.AgentExecutablePath);
+        var start = new ProcessStartInfo
+        {
+            FileName = agentPath,
+            WorkingDirectory = Path.GetDirectoryName(agentPath),
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+            RedirectStandardError = true,
+            RedirectStandardOutput = true
+        };
+        start.ArgumentList.Add("--registry");
+        start.ArgumentList.Add("--control-pipe");
+        start.ArgumentList.Add(options.ControlPipeName);
+        start.ArgumentList.Add("--buffer-root");
+        start.ArgumentList.Add(Path.GetFullPath(options.BufferRoot));
+        return start;
+    }
+
+    internal static string NormalizeAgentDiagnostic(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+        var builder = new StringBuilder(Math.Min(value.Length, MaximumAgentDiagnosticCharacters));
+        var redactingQuery = false;
+        var previousWhitespace = false;
+        foreach (var character in value)
+        {
+            if (builder.Length >= MaximumAgentDiagnosticCharacters) break;
+            if (redactingQuery)
+            {
+                if (!char.IsWhiteSpace(character)) continue;
+                redactingQuery = false;
+            }
+            if (character == '?')
+            {
+                builder.Append("?…");
+                redactingQuery = true;
+                previousWhitespace = false;
+                continue;
+            }
+            if (char.IsWhiteSpace(character) || char.IsControl(character))
+            {
+                if (!previousWhitespace && builder.Length != 0) builder.Append(' ');
+                previousWhitespace = true;
+                continue;
+            }
+            builder.Append(character);
+            previousWhitespace = false;
+        }
+        return builder.ToString().Trim();
+    }
+
+    internal static bool IsSingleInstanceDiagnostic(string? diagnostic) =>
+        !string.IsNullOrWhiteSpace(diagnostic) &&
+        diagnostic.Contains(
+            "Another TermLink background runtime already owns this account control pipe",
+            StringComparison.Ordinal);
+
+    internal static bool IsAgentInstanceActive(string controlPipeName)
+    {
+        if (string.IsNullOrWhiteSpace(controlPipeName))
+            throw new ArgumentException("The Agent control pipe is required.", nameof(controlPipeName));
+        using var mutex = new Mutex(false, "Local\\" + controlPipeName + "-agent");
+        var ownsMutex = false;
+        try
+        {
+            try
+            {
+                ownsMutex = mutex.WaitOne(0, false);
+            }
+            catch (AbandonedMutexException)
+            {
+                ownsMutex = true;
+            }
+            return !ownsMutex;
+        }
+        finally
+        {
+            if (ownsMutex) mutex.ReleaseMutex();
+        }
+    }
+
+    private static async Task<string> ReadBoundedAsync(TextReader reader, int maximumCharacters)
+    {
+        var result = new StringBuilder(Math.Min(maximumCharacters, 256));
+        var buffer = new char[256];
+        while (true)
+        {
+            var count = await reader.ReadAsync(buffer.AsMemory(), CancellationToken.None).ConfigureAwait(false);
+            if (count == 0) return result.ToString();
+            var retained = Math.Min(count, maximumCharacters - result.Length);
+            if (retained > 0) result.Append(buffer, 0, retained);
+        }
+    }
+
+    private static async Task ObserveStartedProcessAsync(
+        Process process,
+        Task<string> standardOutput,
+        Task<string> standardError)
+    {
+        try
+        {
+            await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+            await Task.WhenAll(standardOutput, standardError).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException)
+        {
+            // The process exited while ownership of its diagnostics was moving
+            // from the startup path to this background observer.
+        }
+        catch (IOException)
+        {
+            // Closing TermLink can close redirected streams before the child
+            // process has completed its final diagnostic write.
+        }
+        finally
+        {
+            process.Dispose();
+        }
     }
 
     private async Task<RegistryResponse?> TryListAsync(
@@ -365,7 +549,7 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
             if (await TryListAsync(250, cancellationToken).ConfigureAwait(false) is null) return;
             await Task.Delay(75, cancellationToken).ConfigureAwait(false);
         }
-        throw new TimeoutException("The independent TermLink Agent did not release its control pipe.");
+        throw new AgentClientOperationException("PC_AGENT_RESTART_TIMEOUT");
     }
 
     private async Task WaitForOwnedProcessesAsync(DateTime deadlineUtc, CancellationToken cancellationToken)
@@ -410,14 +594,17 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
         }
     }
 
-    private List<Process> GetOwnedProcesses()
+    private List<Process> GetOwnedProcesses(params string[]? processNames)
     {
         var result = new List<Process>();
         var installRoot = Path.GetDirectoryName(Path.GetFullPath(options.AgentExecutablePath));
         if (string.IsNullOrWhiteSpace(installRoot)) return result;
         var installPrefix = installRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
             Path.DirectorySeparatorChar;
-        foreach (var name in new[] { "TermLink.Agent", "TermLink.SessionHost" })
+        var names = processNames is { Length: > 0 }
+            ? processNames
+            : new[] { "TermLink.Agent", "TermLink.SessionHost" };
+        foreach (var name in names)
         {
             foreach (var process in Process.GetProcessesByName(name))
             {
@@ -602,7 +789,9 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
     private static string? ConnectionDetail(ProductionStatus status)
     {
         if (string.IsNullOrWhiteSpace(status.LastErrorCode)) return null;
-        return $"Relay state: {status.RelayState}";
+        return PresentationText.Pick(
+            $"服务器连接异常（{status.LastErrorCode}）",
+            $"Server connection error ({status.LastErrorCode})");
     }
 
     private static bool IsConnectionFailure(Exception error) =>
@@ -610,6 +799,7 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
 
     private static string ClassifyError(Exception error) => error switch
     {
+        AgentClientOperationException agentError => agentError.Code,
         FileNotFoundException => "PC-AGENT-MISSING",
         UnauthorizedAccessException => "PC-AGENT-ACCESS-DENIED",
         CryptographicException => "PC-AGENT-CREDENTIAL-ERROR",

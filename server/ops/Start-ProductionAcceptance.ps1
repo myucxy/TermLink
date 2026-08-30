@@ -8,7 +8,9 @@ param(
     [string]$AppShipBaseUrl = 'https://appship.kget.cc:8910',
     [string]$AppShipAllowedPrivateIPs = '192.168.9.250',
     [ValidatePattern('^docker\.io/myucxy/termlink:[A-Za-z0-9_.-]+@sha256:[0-9a-f]{64}$')]
-    [string]$ServerImage
+    [string]$ServerImage,
+    [ValidatePattern('^(?:docker\.io/)?myucxy/termlink:[0-9]+\.[0-9]+\.[0-9]+-local-production$')]
+    [string]$LocalServerImage
 )
 
 $ErrorActionPreference = 'Stop'
@@ -205,30 +207,60 @@ function Wait-ProductionAcceptanceStack {
     throw "The production acceptance stack did not become ready within $TimeoutSeconds seconds: $summary."
 }
 
+if (-not [string]::IsNullOrWhiteSpace($ServerImage) -and
+    -not [string]::IsNullOrWhiteSpace($LocalServerImage)) {
+    throw '只能指定 ServerImage 或 LocalServerImage 其中一个。 / Specify only one of ServerImage or LocalServerImage.'
+}
+if ($Reset -and -not [string]::IsNullOrWhiteSpace($LocalServerImage)) {
+    throw '本地生产镜像无损升级不允许使用 Reset。 / Reset is not allowed when upgrading with a local production image.'
+}
 $endpoints = Set-AcceptanceEndpointEnvironment `
     -Address $LanAddress `
     -PublicUpstreamBindAddress $LuckyBindAddress `
     -PublicUpstreamPort $LuckyPort
 $paths = Get-TermLinkAcceptancePaths
 $composeFiles = @($paths.ComposeFile)
-if (-not [string]::IsNullOrWhiteSpace($ServerImage)) {
+$selectedServerImage = if (-not [string]::IsNullOrWhiteSpace($ServerImage)) {
+    $ServerImage
+}
+else {
+    $LocalServerImage
+}
+if (-not [string]::IsNullOrWhiteSpace($selectedServerImage)) {
     $releaseImageComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.release-image.compose.yml'
     if (-not (Test-Path -LiteralPath $releaseImageComposeFile -PathType Leaf)) {
         throw "Published-image Compose overlay not found: $releaseImageComposeFile"
     }
-    $env:TERMLINK_ACCEPTANCE_SERVER_IMAGE = $ServerImage
-    & docker pull $ServerImage
-    if ($LASTEXITCODE -ne 0) { throw 'Could not pull the immutable production server image.' }
-    $imageMetadataJson = & docker image inspect $ServerImage --format '{{json .Config.Labels}}'
+    $env:TERMLINK_ACCEPTANCE_SERVER_IMAGE = $selectedServerImage
+    if (-not [string]::IsNullOrWhiteSpace($ServerImage)) {
+        & docker pull $ServerImage
+        if ($LASTEXITCODE -ne 0) { throw 'Could not pull the immutable production server image.' }
+    }
+    else {
+        $localPlatform = (& docker image inspect $LocalServerImage --format '{{.Os}}/{{.Architecture}}').Trim()
+        if ($LASTEXITCODE -ne 0 -or $localPlatform -cne 'linux/amd64') {
+            throw '本地生产镜像必须已存在且平台为 linux/amd64。 / The local production image must exist and target linux/amd64.'
+        }
+    }
+    $imageMetadataJson = & docker image inspect $selectedServerImage --format '{{json .Config.Labels}}'
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($imageMetadataJson)) {
-        throw 'Could not inspect the immutable production server image.'
+        throw '无法检查选定的生产服务端镜像。 / Could not inspect the selected production server image.'
     }
     $imageMetadata = $imageMetadataJson | ConvertFrom-Json
     if ([string]$imageMetadata.'org.opencontainers.image.revision' -notmatch '^[0-9a-f]{40}$' -or
         [string]$imageMetadata.'org.opencontainers.image.version' -notmatch '^v?[0-9]+\.[0-9]+\.[0-9]+(?:\+[0-9]+)?$' -or
         [string]$imageMetadata.'org.opencontainers.image.created' -eq 'unknown' -or
         [string]$imageMetadata.'org.opencontainers.image.source' -cne 'https://github.com/myucxy/TermLink') {
-        throw 'Published server image OCI source metadata is missing or inconsistent.'
+        throw '选定的服务端镜像 OCI 源元数据缺失或不一致。 / Selected server image OCI source metadata is missing or inconsistent.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($LocalServerImage)) {
+        $localTagVersion = [regex]::Match(
+            $LocalServerImage,
+            '(?:^|/)myucxy/termlink:(?<version>[0-9]+\.[0-9]+\.[0-9]+)-local-production$'
+        ).Groups['version'].Value
+        if ([string]$imageMetadata.'org.opencontainers.image.version' -cne $localTagVersion) {
+            throw '本地生产镜像标签与 OCI 版本不一致。 / The local production tag does not match its OCI version.'
+        }
     }
     $composeFiles += $releaseImageComposeFile
 }
