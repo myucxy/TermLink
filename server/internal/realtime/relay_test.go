@@ -459,7 +459,7 @@ func TestPCOutputUsesValidatedSubscriptionWithoutAuthorityQuery(t *testing.T) {
 	}
 }
 
-func TestPCRouteDoesNotCommitWhenSubscriberIsUnavailable(t *testing.T) {
+func TestPCRouteCommitsWhileSubscriberIsTemporarilyUnavailable(t *testing.T) {
 	hub := NewHubWithObserver(nil, nil, nil, nil)
 	userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	pc := testPeer(hub, pcID)
@@ -474,11 +474,20 @@ func TestPCRouteDoesNotCommitWhenSubscriberIsUnavailable(t *testing.T) {
 		Sequence:          306,
 	}
 	err := pc.routePCFrame(envelope, sessionID, androidID, []byte("output-306"))
-	if got := routeDenialClass(err); got != "subscriber_unavailable" {
-		t.Fatalf("route denial = %q (%v), want subscriber_unavailable", got, err)
+	if err != nil {
+		t.Fatalf("temporarily unavailable subscriber rejected PC output: %v", err)
 	}
-	if got := pcRouteHighWater(pc, sessionID, androidID); got != 305 {
-		t.Fatalf("failed route high-water = %d, want 305", got)
+	if got := pcRouteHighWater(pc, sessionID, androidID); got != 306 {
+		t.Fatalf("offline route high-water = %d, want 306", got)
+	}
+	// Advancing the high-water mark keeps later live output continuous. The
+	// next Android SUBSCRIBE/ACK opens a replay epoch across these frames.
+	envelope.Sequence = 307
+	if err := pc.routePCFrame(envelope, sessionID, androidID, []byte("output-307")); err != nil {
+		t.Fatalf("continuous offline PC output was rejected: %v", err)
+	}
+	if got := pcRouteHighWater(pc, sessionID, androidID); got != 307 {
+		t.Fatalf("continuous offline route high-water = %d, want 307", got)
 	}
 }
 
@@ -511,18 +520,16 @@ func TestPCRouteCommitsOnlyAfterCurrentSubscriberEnqueue(t *testing.T) {
 	}
 }
 
-func TestPCRouteDoesNotCommitForClosedOrReplacedSubscriber(t *testing.T) {
+func TestPCRouteCommitsForClosedOrReplacedSubscriber(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		prepare func(*Hub, *peer, uuid.UUID)
-		want    string
 	}{
 		{
 			name: "closed enqueue",
 			prepare: func(_ *Hub, android *peer, _ uuid.UUID) {
 				android.close(websocket.CloseNormalClosure, "test target closed")
 			},
-			want: "subscriber_enqueue_failed",
 		},
 		{
 			name: "android replacement",
@@ -531,7 +538,6 @@ func TestPCRouteDoesNotCommitForClosedOrReplacedSubscriber(t *testing.T) {
 				replacement.role = "android"
 				hub.peers[androidID] = replacement
 			},
-			want: "subscriber_replaced",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -548,11 +554,11 @@ func TestPCRouteDoesNotCommitForClosedOrReplacedSubscriber(t *testing.T) {
 				Sequence:          306,
 			}
 			err := pc.routePCFrame(envelope, sessionID, androidID, []byte("output-306"))
-			if got := routeDenialClass(err); got != test.want {
-				t.Fatalf("route denial = %q (%v), want %q", got, err, test.want)
+			if err != nil {
+				t.Fatalf("transient subscriber transition rejected PC output: %v", err)
 			}
-			if got := pcRouteHighWater(pc, sessionID, androidID); got != 305 {
-				t.Fatalf("failed route high-water = %d, want 305", got)
+			if got := pcRouteHighWater(pc, sessionID, androidID); got != 306 {
+				t.Fatalf("transient route high-water = %d, want 306", got)
 			}
 		})
 	}

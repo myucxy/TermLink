@@ -527,7 +527,9 @@ class ProductionRealtimeClient(
             bufferedIncomingWireBytes.addAndGet(-wireBytes.toLong())
             return false
         }
-        if (bytes >= HIGH_BUFFERED_WIRE_BYTES && receivePressurePaused.compareAndSet(false, true)) {
+        if (shouldPauseReceive(events, bytes) &&
+            receivePressurePaused.compareAndSet(false, true)
+        ) {
             publishReceivePressure(pressureGeneration)
         }
         return true
@@ -536,7 +538,9 @@ class ProductionRealtimeClient(
     private fun releaseIncoming(wireBytes: Int) {
         val events = bufferedIncomingEvents.updateAndGet { (it - 1).coerceAtLeast(0) }
         val bytes = bufferedIncomingWireBytes.updateAndGet { (it - wireBytes).coerceAtLeast(0) }
-        if (bytes <= LOW_BUFFERED_WIRE_BYTES && receivePressurePaused.compareAndSet(true, false)) {
+        if (shouldResumeReceive(events, bytes) &&
+            receivePressurePaused.compareAndSet(true, false)
+        ) {
             publishReceivePressure(generation.get(), events, bytes)
         }
     }
@@ -598,12 +602,20 @@ class ProductionRealtimeClient(
         private const val REALTIME_LOG_TAG = "TermLinkRealtime"
         const val MAX_FRAME_BYTES: Int = 1 shl 20
         const val MAX_BUFFERED_EVENTS: Int = 128
+        const val LOW_BUFFERED_EVENTS: Int = 32
+        const val HIGH_BUFFERED_EVENTS: Int = 64
         const val OPEN_WINDOW_EVENTS: Int = 128
         const val OPEN_WINDOW_WIRE_BYTES: Long = 3L shl 20
         const val LOW_BUFFERED_WIRE_BYTES: Long = 1L shl 20
         const val HIGH_BUFFERED_WIRE_BYTES: Long = 4L shl 20
         const val HARD_BUFFERED_WIRE_BYTES: Long = 8L shl 20
         private const val MAX_HELLO_BYTES: Int = 16 shl 10
+
+        internal fun shouldPauseReceive(events: Int, wireBytes: Long): Boolean =
+            events >= HIGH_BUFFERED_EVENTS || wireBytes >= HIGH_BUFFERED_WIRE_BYTES
+
+        internal fun shouldResumeReceive(events: Int, wireBytes: Long): Boolean =
+            events <= LOW_BUFFERED_EVENTS && wireBytes <= LOW_BUFFERED_WIRE_BYTES
 
         internal val defaultHttpClient: OkHttpClient = OkHttpClient.Builder()
             .readTimeout(0, TimeUnit.MILLISECONDS)

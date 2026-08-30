@@ -147,6 +147,7 @@ class ProductionRealtimeSessionClient(
     private val httpClient: OkHttpClient = ProductionRealtimeClient.defaultHttpClient,
     allowCleartextForLocalTest: Boolean = false,
     private val reconnectDelaysMillis: List<Long> = listOf(250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000),
+    private val reconnectStabilityMillis: Long = 10_000,
     private val inputAcceptanceTimeoutMillis: Long = 5_000,
     private val inputSequenceProvider: InputSequenceProvider = InMemoryInputSequenceProvider(),
     private val envelopeSequenceProvider: InputSequenceProvider = InMemoryInputSequenceProvider(),
@@ -181,6 +182,7 @@ class ProductionRealtimeSessionClient(
     private val pendingInputs = ConcurrentHashMap<UUID, CompletableDeferred<Unit>>()
     private val reconnectMutex = Mutex()
     private var reconnectJob: Job? = null
+    private var reconnectStabilityJob: Job? = null
     private var subscriberRefreshJob: Job? = null
     private var previousMaterialRetirementJob: Job? = null
     private var reconnectAttempt = 0
@@ -232,6 +234,9 @@ class ProductionRealtimeSessionClient(
     init {
         require(reconnectDelaysMillis.isNotEmpty() && reconnectDelaysMillis.all { it in 0..30_000 }) {
             "reconnect delays must be non-empty and capped at 30 seconds"
+        }
+        require(reconnectStabilityMillis in 0..60_000) {
+            "reconnect stability window must be 0..60000 milliseconds"
         }
         require(inputAcceptanceTimeoutMillis > 0) { "input acceptance timeout must be positive" }
         require(initialObservedLocalInputEpoch >= 0) { "initialObservedLocalInputEpoch must not be negative" }
@@ -725,6 +730,8 @@ class ProductionRealtimeSessionClient(
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         reconnectJob?.cancel()
+        reconnectStabilityJob?.cancel()
+        reconnectStabilityJob = null
         subscriberRefreshJob?.cancel()
         previousMaterialRetirementJob?.cancel()
         pendingInputs.values.forEach {
@@ -1240,13 +1247,13 @@ class ProductionRealtimeSessionClient(
         if (closed.get()) return
         when (state) {
             RealtimeState.Connecting -> {
+                cancelReconnectAttemptReset()
                 subscriberReady.value = false
                 mutableTransportState.value = ProductionTransportState.Connecting
             }
             RealtimeState.Connected -> {
                 reconnectJob?.cancel()
                 reconnectJob = null
-                reconnectAttempt = 0
                 mutableTransportState.value = ProductionTransportState.Connected
                 try {
                     if (!session.onConnected()) {
@@ -1256,6 +1263,7 @@ class ProductionRealtimeSessionClient(
                         sendFlowControl(force = true)
                         startSubscriberRefresh()
                         restoreDesiredControlIfNeeded()
+                        scheduleReconnectAttemptReset()
                     }
                 } catch (error: CancellationException) {
                     throw error
@@ -1264,6 +1272,7 @@ class ProductionRealtimeSessionClient(
                 }
             }
             is RealtimeState.Failed -> {
+                cancelReconnectAttemptReset()
                 subscriberRefreshJob?.cancel()
                 subscriberRefreshJob = null
                 subscriberReady.value = false
@@ -1279,6 +1288,7 @@ class ProductionRealtimeSessionClient(
                 scheduleReconnect(reconnectReason)
             }
             is RealtimeState.AuthenticationRejected -> {
+                cancelReconnectAttemptReset()
                 subscriberRefreshJob?.cancel()
                 subscriberRefreshJob = null
                 subscriberReady.value = false
@@ -1287,6 +1297,7 @@ class ProductionRealtimeSessionClient(
                 mutableTransportState.value = ProductionTransportState.Reconnecting(0, state.reason)
             }
             is RealtimeState.AuthenticationFailed -> {
+                cancelReconnectAttemptReset()
                 subscriberRefreshJob?.cancel()
                 subscriberRefreshJob = null
                 subscriberReady.value = false
@@ -1296,6 +1307,7 @@ class ProductionRealtimeSessionClient(
             }
             is RealtimeState.Reconnecting -> Unit
             RealtimeState.Closed -> {
+                cancelReconnectAttemptReset()
                 subscriberRefreshJob?.cancel()
                 subscriberRefreshJob = null
                 subscriberReady.value = false
@@ -1373,6 +1385,32 @@ class ProductionRealtimeSessionClient(
                 reconnectMutex.withLock { reconnectJob = null }
                 if (!closed.get()) transport.connect()
             }
+        }
+    }
+
+    /**
+     * A socket is not healthy merely because its WebSocket handshake finished.
+     * Preserve the backoff attempt across short-lived reconnects and reset it
+     * only after the session subscribed and remained usable for the stability
+     * window.
+     */
+    private suspend fun scheduleReconnectAttemptReset() {
+        reconnectMutex.withLock {
+            reconnectStabilityJob?.cancel()
+            reconnectStabilityJob = scope.launch {
+                delay(reconnectStabilityMillis)
+                reconnectMutex.withLock {
+                    reconnectAttempt = 0
+                    reconnectStabilityJob = null
+                }
+            }
+        }
+    }
+
+    private suspend fun cancelReconnectAttemptReset() {
+        reconnectMutex.withLock {
+            reconnectStabilityJob?.cancel()
+            reconnectStabilityJob = null
         }
     }
 

@@ -258,6 +258,73 @@ class ProductionRealtimeSessionClientTest {
     }
 
     @Test
+    fun shortLivedConnectionsKeepIncreasingReconnectBackoffUntilStable(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = QueuedSessionTransport()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(10, 20, 40),
+            reconnectStabilityMillis = 500,
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+
+        try {
+            client.start()
+            withTimeout(2_000) { client.transportState.first { it is ProductionTransportState.Connected } }
+            assertEquals(1, transport.connectCount)
+
+            transport.emitFailed("first short connection")
+            withTimeout(2_000) {
+                client.transportState.first {
+                    it is ProductionTransportState.Reconnecting && it.attempt == 1
+                }
+            }
+            withTimeout(2_000) {
+                while (transport.connectCount < 2) kotlinx.coroutines.yield()
+            }
+            withTimeout(2_000) { client.transportState.first { it is ProductionTransportState.Connected } }
+
+            transport.emitFailed("second short connection")
+            withTimeout(2_000) {
+                client.transportState.first {
+                    it is ProductionTransportState.Reconnecting && it.attempt == 2
+                }
+            }
+            withTimeout(2_000) {
+                while (transport.connectCount < 3) kotlinx.coroutines.yield()
+            }
+            withTimeout(2_000) { client.transportState.first { it is ProductionTransportState.Connected } }
+            assertEquals(2, client.diagnostics().reconnectAttempt)
+
+            withTimeout(2_000) {
+                while (client.diagnostics().reconnectAttempt != 0) delay(10)
+            }
+            assertEquals(0, client.diagnostics().reconnectAttempt)
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
     fun pcHeartbeatIsFatalSemanticAndFencesSameGenerationSuccessor(): Unit = runBlocking {
         val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
         val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
@@ -2443,6 +2510,7 @@ class ProductionRealtimeSessionClientTest {
         private val mutablePressure = MutableStateFlow(ProductionReceivePressure(0, false, 0, 0))
         private val mutableState = MutableSharedFlow<RealtimeState>(replay = 1, extraBufferCapacity = 4)
         private val releaseCount = AtomicInteger(0)
+        private val connectionCount = AtomicInteger(0)
         val sent = CopyOnWriteArrayList<Envelope>()
         val disconnectReasons = CopyOnWriteArrayList<String>()
 
@@ -2453,7 +2521,11 @@ class ProductionRealtimeSessionClientTest {
         val releasedReservations: Int
             get() = releaseCount.get()
 
+        val connectCount: Int
+            get() = connectionCount.get()
+
         override fun connect() {
+            connectionCount.incrementAndGet()
             check(mutableState.tryEmit(RealtimeState.Connected))
         }
 
@@ -2472,6 +2544,10 @@ class ProductionRealtimeSessionClientTest {
 
         fun emitConnected() {
             check(mutableState.tryEmit(RealtimeState.Connected))
+        }
+
+        fun emitFailed(reason: String) {
+            check(mutableState.tryEmit(RealtimeState.Failed(reason)))
         }
 
         fun deliver(envelope: Envelope, generation: Int) {

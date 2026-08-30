@@ -17,12 +17,12 @@ import (
 	"github.com/termlink/termlink/server/internal/store"
 )
 
-// TestProductionRelaySlowConsumerForcesDurableReplay exercises the same
-// protobuf Envelope path used by authenticated Agent connections. If the
-// target queue cannot accept a frame, neither the route high-water nor the PC
-// connection may continue: reconnect makes the Agent replay from Android's
-// last durable cumulative ACK.
-func TestProductionRelaySlowConsumerForcesDurableReplay(t *testing.T) {
+// TestProductionRelaySlowConsumerKeepsAgentForDurableReplay exercises the same
+// protobuf Envelope path used by authenticated Agent connections. A saturated
+// Android queue closes only that subscriber. The PC route still advances so a
+// replacement Android subscriber can request replay from its durable ACK
+// without forcing the Agent into a reconnect loop.
+func TestProductionRelaySlowConsumerKeepsAgentForDurableReplay(t *testing.T) {
 	metrics := observability.New(nil)
 	hub := NewHubWithObserver(nil, nil, nil, metrics)
 
@@ -63,14 +63,13 @@ func TestProductionRelaySlowConsumerForcesDurableReplay(t *testing.T) {
 		t.Fatalf("slow consumer close = %v, want websocket close code %d", err, websocket.CloseTryAgainLater)
 	}
 
-	waitPeerClosed(t, source.done)
-	if got := pcRouteHighWater(source, sessionID, slowID); got != 0 {
-		t.Fatalf("failed slow-consumer route high-water = %d, want 0", got)
+	if got := pcRouteHighWater(source, sessionID, slowID); got != 1 {
+		t.Fatalf("offline slow-consumer route high-water = %d, want 1", got)
 	}
-	sourceClient.SetReadDeadline(time.Now().Add(time.Second))
-	_, _, err = sourceClient.ReadMessage()
-	if !errors.As(err, &closeErr) || closeErr.Code != websocket.ClosePolicyViolation {
-		t.Fatalf("source close = %v, want websocket close code %d", err, websocket.ClosePolicyViolation)
+	select {
+	case <-source.done:
+		t.Fatal("slow Android subscriber unexpectedly closed the PC Agent")
+	case <-time.After(100 * time.Millisecond):
 	}
 
 	body := scrapeRealtimeMetrics(t, metrics)

@@ -601,11 +601,11 @@ func (p *peer) acceptPCSequence(sessionID, recipientID uuid.UUID, sequence uint6
 	return ok
 }
 
-// routePCFrame keeps sequence validation, subscriber enqueue and replay-state
-// commit in one route-local critical section. A frame that misses the current
-// Android queue therefore cannot advance the PC high-water mark and make a
-// later sequence appear valid; closing the PC connection asks the Agent to
-// replay from Android's durable cumulative ACK.
+// routePCFrame keeps sequence validation, transient subscriber delivery and
+// replay-state commit in one route-local critical section. An unavailable or
+// replaced Android subscriber is an offline delivery window, so the PC route
+// still advances its high-water mark. Android's next durable cumulative ACK
+// opens the replay epoch that asks the Agent for the missed ordered frames.
 func (p *peer) routePCFrame(envelope realtimewire.Envelope, sessionID, recipientID uuid.UUID, frame []byte) error {
 	p.pcReplayMu.Lock()
 	state := p.pcReplayRoute(pcRouteKey{sessionID: sessionID, recipientID: recipientID})
@@ -1344,7 +1344,12 @@ func (h *Hub) routeToSubscriber(sender *peer, sessionID, recipient uuid.UUID, fr
 	}
 	h.mu.RUnlock()
 	if target == nil {
-		return denyRoute("subscriber_unavailable", store.ErrDenied)
+		// Android can disappear after the Agent snapshots its recipients. Treat
+		// that as a normal offline delivery window: committing the PC high-water
+		// mark lets the next SUBSCRIBE open a replay epoch from Android's durable
+		// ACK. Closing the authenticated PC here would make it reconnect and
+		// resend the same unavailable frame forever.
+		return nil
 	}
 	if target.principal.UserID != sender.principal.UserID {
 		return denyRoute("subscriber_account_mismatch", store.ErrDenied)
@@ -1361,16 +1366,28 @@ func (h *Hub) routeToSubscriber(sender *peer, sessionID, recipient uuid.UUID, fr
 		}
 		return denyRoute("subscription_authority_expired", store.ErrDenied)
 	}
-	if !h.subscriberRouteCurrent(sender, target, sessionID, recipient) {
+	if !h.senderConnectionCurrent(sender) {
 		return denyRoute("subscriber_replaced", store.ErrDenied)
+	}
+	if !h.subscriberRouteCurrent(sender, target, sessionID, recipient) {
+		return nil
 	}
 	if !target.enqueue(frame) {
-		return denyRoute("subscriber_enqueue_failed", store.ErrDenied)
+		return nil
 	}
-	if !h.subscriberRouteCurrent(sender, target, sessionID, recipient) || !target.open() {
+	if !h.senderConnectionCurrent(sender) {
 		return denyRoute("subscriber_replaced", store.ErrDenied)
 	}
+	if !h.subscriberRouteCurrent(sender, target, sessionID, recipient) || !target.open() {
+		return nil
+	}
 	return nil
+}
+
+func (h *Hub) senderConnectionCurrent(sender *peer) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.peers[sender.principal.Device.ID] == sender && sender.open()
 }
 
 func (h *Hub) subscriberRouteCurrent(sender, target *peer, sessionID, recipient uuid.UUID) bool {

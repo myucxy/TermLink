@@ -169,6 +169,36 @@ class ProductionNetworkTest {
     }
 
     @Test
+    fun smallFrameCountTriggersReceivePressureBeforeHardQueueLimit() {
+        assertTrue(ProductionRealtimeClient.HIGH_BUFFERED_EVENTS < ProductionRealtimeClient.MAX_BUFFERED_EVENTS)
+        assertTrue(ProductionRealtimeClient.LOW_BUFFERED_EVENTS < ProductionRealtimeClient.HIGH_BUFFERED_EVENTS)
+        assertTrue(
+            ProductionRealtimeClient.shouldPauseReceive(
+                ProductionRealtimeClient.HIGH_BUFFERED_EVENTS,
+                1,
+            ),
+        )
+        assertTrue(
+            !ProductionRealtimeClient.shouldPauseReceive(
+                ProductionRealtimeClient.HIGH_BUFFERED_EVENTS - 1,
+                1,
+            ),
+        )
+        assertTrue(
+            !ProductionRealtimeClient.shouldResumeReceive(
+                ProductionRealtimeClient.LOW_BUFFERED_EVENTS + 1,
+                1,
+            ),
+        )
+        assertTrue(
+            ProductionRealtimeClient.shouldResumeReceive(
+                ProductionRealtimeClient.LOW_BUFFERED_EVENTS,
+                1,
+            ),
+        )
+    }
+
+    @Test
     fun apiRequestCarriesValidOidcAndDeviceProof() {
         val server = MockWebServer()
         server.enqueue(MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody("{\"items\":[]}"))
