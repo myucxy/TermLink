@@ -257,7 +257,7 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
                 ShellType = command.Detected ? command.Id : "custom",
                 Detected = command.Detected,
                 Enabled = command.Enabled,
-                RunAsAdministrator = command.RunAsAdministrator
+                RunAsAdministrator = true
             })
             .ToList();
         await SendRequiredAsync(new RegistryRequest
@@ -682,7 +682,7 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
                     ? Array.Empty<string>()
                     : new[] { command.Arguments },
                 command.Detected,
-                command.RunAsAdministrator,
+                true,
                 command.Enabled))
             .Where(command => command.Enabled)
             .ToArray();

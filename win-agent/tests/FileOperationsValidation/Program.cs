@@ -555,6 +555,21 @@ static void ValidateTerminalLaunch(string testRoot)
         "terminal launcher did not fall back after Windows Terminal launch failure");
     Require(starts.Starts[0].ArgumentList.Contains("--elevate"),
         "an administrator-enabled command did not retain the explicit Windows Terminal elevation path");
+    var inheritedColorEnvironment = new System.Diagnostics.ProcessStartInfo();
+    inheritedColorEnvironment.Environment["NO_COLOR"] = "1";
+    inheritedColorEnvironment.Environment["TERM"] = "dumb";
+    inheritedColorEnvironment.Environment["COLORTERM"] = string.Empty;
+    ManagedTerminalLauncher.SanitizeTerminalEnvironment(inheritedColorEnvironment);
+    Require(!inheritedColorEnvironment.Environment.ContainsKey("NO_COLOR") &&
+        !inheritedColorEnvironment.Environment.ContainsKey("TERM") &&
+        !inheritedColorEnvironment.Environment.ContainsKey("COLORTERM"),
+        "managed terminal launch retained inherited color-suppression variables");
+    inheritedColorEnvironment.Environment["TERM"] = "xterm-256color";
+    inheritedColorEnvironment.Environment["COLORTERM"] = "truecolor";
+    ManagedTerminalLauncher.SanitizeTerminalEnvironment(inheritedColorEnvironment);
+    Require(inheritedColorEnvironment.Environment["TERM"] == "xterm-256color" &&
+        inheritedColorEnvironment.Environment["COLORTERM"] == "truecolor",
+        "managed terminal launch removed valid color capability declarations");
     var direct = starts.Starts[1];
     Require(string.Equals(direct.WorkingDirectory, Path.GetFullPath(testRoot), StringComparison.OrdinalIgnoreCase),
         "terminal launcher did not preserve the exact working directory");
@@ -597,8 +612,8 @@ static void ValidateTerminalLaunch(string testRoot)
         var roundTrip = TerminalCommandProfileStore.LoadManualProfiles().Single();
         Require(roundTrip.Id == custom.Id && roundTrip.DisplayName == "Project CLI" &&
             roundTrip.Arguments == "--project alpha --interactive" &&
-            !roundTrip.RunAsAdministrator,
-            "manual terminal command settings did not round-trip");
+            roundTrip.RunAsAdministrator,
+            "manual terminal command settings did not enforce administrator launch");
         var customStarts = new RecordingProcessStarter();
         var customLauncher = new ManagedTerminalLauncher(
             new WindowsPathService(), customStarts, () => null, stub, stub, stub, stub, stub);
@@ -610,17 +625,17 @@ static void ValidateTerminalLaunch(string testRoot)
         var managedShellIndex = customStart.ArgumentList.IndexOf("--managed-shell");
         Require(customCommand.Contains("--project alpha --interactive", StringComparison.Ordinal) &&
             customStart.ArgumentList[managedShellIndex + 1] == "custom" &&
-            string.IsNullOrEmpty(customStart.Verb),
-            "custom terminal command was not resolved, launched without an elevation request, and advertised as a managed custom shell");
+            customStart.Verb == "runas",
+            "custom terminal command was not resolved, elevated, and advertised as a managed custom shell");
 
         var customFallbackStarts = new RecordingProcessStarter { FailFirst = true };
         var customFallbackLauncher = new ManagedTerminalLauncher(
             new WindowsPathService(), customFallbackStarts, () => stub, stub, stub, stub, stub, stub);
         customFallbackLauncher.Launch(custom.Id, testRoot);
         Require(customFallbackStarts.Starts.Count == 2 &&
-                !customFallbackStarts.Starts[0].ArgumentList.Contains("--elevate") &&
-                string.IsNullOrEmpty(customFallbackStarts.Starts[1].Verb),
-            "a non-administrator command requested elevation for Windows Terminal or SessionHost fallback");
+                customFallbackStarts.Starts[0].ArgumentList.Contains("--elevate") &&
+                customFallbackStarts.Starts[1].Verb == "runas",
+            "a custom command did not enforce elevation for Windows Terminal and SessionHost fallback");
 
         var detectedOverride = TerminalCommandProfileStore.CreateConfiguredProfile(
             "windows-powershell", "PowerShell hidden", stub, "-NoLogo", "windows-powershell",
@@ -628,8 +643,9 @@ static void ValidateTerminalLaunch(string testRoot)
         TerminalCommandProfileStore.SaveConfiguredProfiles(new[] { custom, detectedOverride });
         var configuredRoundTrip = TerminalCommandProfileStore.LoadConfiguredProfiles();
         Require(configuredRoundTrip.Count == 2 &&
-            configuredRoundTrip.Single(profile => profile.Id == "windows-powershell").Enabled == false,
-            "a deleted auto-detected command override was not persisted");
+            configuredRoundTrip.Single(profile => profile.Id == "windows-powershell").Enabled == false &&
+            configuredRoundTrip.All(profile => profile.RunAsAdministrator),
+            "a command override was not persisted with the fixed administrator policy");
         var overriddenLauncher = new ManagedTerminalLauncher(
             new WindowsPathService(), new RecordingProcessStarter(), () => null, stub, stub, stub, stub, stub);
         RequireFileOperationCode(

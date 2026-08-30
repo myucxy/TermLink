@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -332,6 +333,7 @@ namespace TermLink.SessionHost
     {
         private const uint ExtendedStartupInfoPresent = 0x00080000;
         private const uint CreateSuspended = 0x00000004;
+        private const uint CreateUnicodeEnvironment = 0x00000400;
         private const int StartfUseStdHandles = 0x00000100;
         private const uint ProcThreadAttributePseudoConsole = 0x00020016;
         private const uint WaitObject0 = 0;
@@ -710,25 +712,62 @@ namespace TermLink.SessionHost
             startup.StartupInfo.hStdError = IntPtr.Zero;
             startup.lpAttributeList = attributeList;
             var commandLine = new StringBuilder(options.CommandLine);
-            CheckWin32(
-                CreateProcess(
-                    null,
-                    commandLine,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    false,
-                    ExtendedStartupInfoPresent | CreateSuspended,
-                    IntPtr.Zero,
-                    options.WorkingDirectory,
-                    ref startup,
-                    out processInfo),
-                "CreateProcessW");
+            var environmentBlock = Marshal.StringToHGlobalUni(BuildSanitizedChildEnvironmentBlock(
+                Environment.GetEnvironmentVariables()));
+            try
+            {
+                CheckWin32(
+                    CreateProcess(
+                        null,
+                        commandLine,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        false,
+                        ExtendedStartupInfoPresent | CreateSuspended | CreateUnicodeEnvironment,
+                        environmentBlock,
+                        options.WorkingDirectory,
+                        ref startup,
+                        out processInfo),
+                    "CreateProcessW");
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(environmentBlock);
+            }
             CheckWin32(AssignProcessToJobObject(job, processInfo.hProcess), "AssignProcessToJobObject");
             if (ResumeThread(processInfo.hThread) == uint.MaxValue)
             {
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread failed.");
             }
             CloseIfValid(ref processInfo.hThread);
+        }
+
+        internal static string BuildSanitizedChildEnvironmentBlock(IDictionary environment)
+        {
+            if (environment == null) throw new ArgumentNullException(nameof(environment));
+            var variables = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (DictionaryEntry entry in environment)
+            {
+                var name = entry.Key as string;
+                if (string.IsNullOrEmpty(name)) continue;
+                var value = entry.Value as string ?? string.Empty;
+                if (string.Equals(name, "NO_COLOR", StringComparison.OrdinalIgnoreCase)) continue;
+                if (string.Equals(name, "TERM", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(value.Trim(), "dumb", StringComparison.OrdinalIgnoreCase)) continue;
+                if (string.Equals(name, "COLORTERM", StringComparison.OrdinalIgnoreCase) &&
+                    string.IsNullOrWhiteSpace(value)) continue;
+                variables[name] = value;
+            }
+
+            var block = new StringBuilder();
+            foreach (var variable in variables)
+            {
+                if (block.Length > 0) block.Append('\0');
+                block.Append(variable.Key).Append('=').Append(variable.Value);
+            }
+            // StringToHGlobalUni contributes the second terminating NUL required
+            // by CreateProcessW's Unicode environment block contract.
+            return block.Append('\0').ToString();
         }
 
         private bool ConfigureOuterInput(IntPtr outerInput)

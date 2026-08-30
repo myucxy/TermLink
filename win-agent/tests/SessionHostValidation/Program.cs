@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -54,6 +55,26 @@ Require((outerInputMode & (processedInput | lineInput | echoInput | mouseInput))
     (outerInputMode & (windowInput | extendedFlags | quickEdit | virtualTerminalInput)) ==
         (windowInput | extendedFlags | quickEdit | virtualTerminalInput),
     "SessionHost outer input mode still captures mouse actions or drops existing Terminal flags");
+var suppressedColorEnvironment = new Hashtable(StringComparer.OrdinalIgnoreCase)
+{
+    ["NO_COLOR"] = "1",
+    ["TERM"] = "dumb",
+    ["COLORTERM"] = string.Empty,
+    ["PATH"] = @"C:\Windows\System32"
+};
+var sanitizedColorBlock = ConPtySessionHost.BuildSanitizedChildEnvironmentBlock(suppressedColorEnvironment);
+var sanitizedColorEntries = sanitizedColorBlock.Split('\0', StringSplitOptions.RemoveEmptyEntries);
+Require(sanitizedColorEntries.SequenceEqual(new[] { @"PATH=C:\Windows\System32" }),
+    "SessionHost propagated inherited color-suppression variables into its ConPTY child");
+var capableColorEnvironment = new Hashtable(StringComparer.OrdinalIgnoreCase)
+{
+    ["TERM"] = "xterm-256color",
+    ["COLORTERM"] = "truecolor"
+};
+var capableColorBlock = ConPtySessionHost.BuildSanitizedChildEnvironmentBlock(capableColorEnvironment);
+Require(capableColorBlock.Contains("TERM=xterm-256color", StringComparison.Ordinal) &&
+    capableColorBlock.Contains("COLORTERM=truecolor", StringComparison.Ordinal),
+    "SessionHost removed valid terminal color capability declarations");
 RequireThrows(() => SessionHostOptions.Parse(new[]
 {
     "--command-base64", encodedCommand,

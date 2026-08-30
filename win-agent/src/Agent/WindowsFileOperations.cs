@@ -846,10 +846,11 @@ namespace TermLink.Agent
                     UseShellExecute = false,
                     CreateNoWindow = false
                 };
+                SanitizeTerminalEnvironment(terminalStart);
                 terminalStart.ArgumentList.Add("-w");
                 terminalStart.ArgumentList.Add("new");
                 terminalStart.ArgumentList.Add("new-tab");
-                if (profile.RunAsAdministrator) terminalStart.ArgumentList.Add("--elevate");
+                terminalStart.ArgumentList.Add("--elevate");
                 terminalStart.ArgumentList.Add("-d");
                 terminalStart.ArgumentList.Add(directory);
                 terminalStart.ArgumentList.Add(sessionHostPath);
@@ -874,9 +875,9 @@ namespace TermLink.Agent
             {
                 FileName = sessionHostPath,
                 WorkingDirectory = directory,
-                UseShellExecute = true
+                UseShellExecute = true,
+                Verb = "runas"
             };
-            if (profile.RunAsAdministrator) directStart.Verb = "runas";
             foreach (var argument in arguments) directStart.ArgumentList.Add(argument);
             try
             {
@@ -898,6 +899,28 @@ namespace TermLink.Agent
 
         internal string NormalizeWorkingDirectory(string workingDirectory) =>
             paths.NormalizeExistingDirectory(workingDirectory);
+
+        /// <summary>
+        /// The desktop process may itself have been started from a non-interactive
+        /// PowerShell host that advertises TERM=dumb and NO_COLOR. Those values
+        /// describe that parent host, not the ConPTY created for a managed TermLink
+        /// session. Do not let them disable color in Windows Terminal or Oh My Posh.
+        /// </summary>
+        internal static void SanitizeTerminalEnvironment(ProcessStartInfo startInfo)
+        {
+            if (startInfo == null) throw new ArgumentNullException(nameof(startInfo));
+            startInfo.Environment.Remove("NO_COLOR");
+            if (startInfo.Environment.TryGetValue("TERM", out var term) &&
+                string.Equals(term?.Trim(), "dumb", StringComparison.OrdinalIgnoreCase))
+            {
+                startInfo.Environment.Remove("TERM");
+            }
+            if (startInfo.Environment.TryGetValue("COLORTERM", out var colorTerm) &&
+                string.IsNullOrWhiteSpace(colorTerm))
+            {
+                startInfo.Environment.Remove("COLORTERM");
+            }
+        }
 
         internal string ManagedShellTypeFor(string commandId) => ResolveCommand(commandId).ManagedShell;
 

@@ -150,7 +150,7 @@ namespace TermLink.Agent
                 ManagedShell = ManagedTerminalLauncher.CustomShellType,
                 Source = "manual",
                 Enabled = enabled,
-                RunAsAdministrator = runAsAdministrator
+                RunAsAdministrator = true
             }, requireExecutable: true);
         }
 
@@ -174,7 +174,7 @@ namespace TermLink.Agent
                 ManagedShell = managedShell,
                 Source = detected ? "detected" : "manual",
                 Enabled = enabled,
-                RunAsAdministrator = runAsAdministrator
+                RunAsAdministrator = true
             }, requireExecutable: true);
         }
 
@@ -266,7 +266,10 @@ namespace TermLink.Agent
                 ManagedShell = managedShell,
                 Source = detected ? "detected" : "manual",
                 Enabled = profile.Enabled,
-                RunAsAdministrator = profile.RunAsAdministrator
+                // Administrator launch is a product invariant. Keep the serialized
+                // field for compatibility with older clients, but ignore a legacy
+                // false value when loading or saving command configuration.
+                RunAsAdministrator = true
             };
         }
 

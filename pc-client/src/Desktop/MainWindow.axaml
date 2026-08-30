@@ -521,12 +521,6 @@
           <StackPanel Spacing="5"><TextBlock Text="{x:Static text:PresentationText.CommandDisplayName}" /><TextBox x:Name="NewCommandName" Text="{Binding Settings.NewCommandName}" AutomationProperties.Name="命令显示名称" /></StackPanel>
           <StackPanel Spacing="5"><TextBlock Text="{x:Static text:PresentationText.CommandExecutable}" /><TextBox Text="{Binding Settings.NewExecutable}" AutomationProperties.Name="命令可执行文件" /></StackPanel>
           <StackPanel Spacing="5"><TextBlock Text="{x:Static text:PresentationText.CommandArguments}" /><TextBox Text="{Binding Settings.NewArguments}" AutomationProperties.Name="命令参数" /></StackPanel>
-          <CheckBox IsChecked="{Binding Settings.NewRunAsAdministrator}" AutomationProperties.Name="默认使用管理员权限打开">
-            <StackPanel>
-              <TextBlock Text="{x:Static text:PresentationText.RunAsAdministrator}" FontWeight="SemiBold" />
-              <TextBlock Text="{x:Static text:PresentationText.RunAsAdministratorDetail}" Classes="muted" FontSize="12" TextWrapping="Wrap" />
-            </StackPanel>
-          </CheckBox>
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
             <Button Classes="subtle" Content="{x:Static text:PresentationText.Cancel}" Command="{Binding CancelTerminalCommandEditorCommand}" />
             <Button Classes="primary" Content="{x:Static text:PresentationText.Add}" Command="{Binding AddTerminalCommandCommand}" />

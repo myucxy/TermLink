@@ -197,8 +197,6 @@ public static class Program
         viewModel.OpenTerminalCommandEditorCommand.Execute(null);
         await DrainCommandAsync(viewModel.OpenTerminalCommandEditorCommand);
         Require(viewModel.Settings.CommandEditorOpen, "The custom-command editor did not open explicitly.");
-        Require(viewModel.Settings.NewRunAsAdministrator,
-            "New terminal commands did not default to administrator launch.");
         viewModel.Settings.NewCommandName = "Custom shell";
         viewModel.Settings.NewExecutable = "custom-shell.exe";
         viewModel.Settings.NewArguments = "--login";
@@ -208,6 +206,8 @@ public static class Program
         Require(viewModel.Settings.HasUnsavedCommands && !viewModel.Settings.CommandEditorOpen,
             "A custom command did not enter the explicit unsaved state.");
         var added = viewModel.Settings.TerminalCommands.Single(command => command.DisplayName == "Custom shell");
+        Require(added.RunAsAdministrator,
+            "A custom command did not enforce administrator launch after the UI option was removed.");
         viewModel.RemoveTerminalCommandCommand.Execute(added);
         await DrainCommandAsync(viewModel.RemoveTerminalCommandCommand);
         Require(viewModel.Settings.TerminalCommands.Count == 2, "A manual command was not removed.");

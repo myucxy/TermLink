@@ -94,8 +94,6 @@ public static class PresentationText
     public static string CommandDisplayName => Pick("手机端显示名称", "Mobile display name");
     public static string CommandExecutable => Pick("可执行文件或绝对路径", "Executable or absolute path");
     public static string CommandArguments => Pick("参数组合", "Arguments");
-    public static string RunAsAdministrator => Pick("默认使用管理员权限打开", "Open as administrator by default");
-    public static string RunAsAdministratorDetail => Pick("启动时由 Windows 显示 UAC 确认；TermLink 不会绕过系统授权。", "Windows shows a UAC prompt at launch; TermLink never bypasses system authorization.");
     public static string Add => Pick("添加", "Add");
     public static string Save => Pick("保存", "Save");
     public static string AddCustomCommand => Pick("添加自定义命令", "Add custom command");

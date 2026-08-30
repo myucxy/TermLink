@@ -154,7 +154,6 @@ public sealed class SettingsPageViewModel : PageViewModel
     private string newCommandName = string.Empty;
     private string newExecutable = string.Empty;
     private string newArguments = string.Empty;
-    private bool newRunAsAdministrator = true;
     private string? editingCommandId;
     private bool commandEditorOpen;
     private bool hasUnsavedCommands;
@@ -172,7 +171,6 @@ public sealed class SettingsPageViewModel : PageViewModel
     public string NewCommandName { get => newCommandName; set => SetProperty(ref newCommandName, value); }
     public string NewExecutable { get => newExecutable; set => SetProperty(ref newExecutable, value); }
     public string NewArguments { get => newArguments; set => SetProperty(ref newArguments, value); }
-    public bool NewRunAsAdministrator { get => newRunAsAdministrator; set => SetProperty(ref newRunAsAdministrator, value); }
     public string ApplicationVersion { get; internal set; } = "1.0.0.0";
     public string Author { get; internal set; } = "清风惹尘丶";
     public string ReleaseNotes
@@ -611,7 +609,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         var deviceItems = snapshot.Devices.Select(CreateDeviceItem).ToArray();
         ObservableCollectionDiff.Apply(Devices.Items, deviceItems, item => item.DeviceId);
         if (!Settings.HasUnsavedCommands && !Settings.CommandEditorOpen)
-            ObservableCollectionDiff.Apply(Settings.TerminalCommands, snapshot.TerminalCommands, item => item.Id);
+            ObservableCollectionDiff.Apply(
+                Settings.TerminalCommands,
+                snapshot.TerminalCommands.Select(command => command with { RunAsAdministrator = true }).ToArray(),
+                item => item.Id);
         Diagnostics.PcId = snapshot.Identity.PcId.ToString("D");
         Diagnostics.Revision = snapshot.Revision.ToString(System.Globalization.CultureInfo.InvariantCulture);
         Diagnostics.ObservedAt = snapshot.ObservedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss zzz");
@@ -907,7 +908,6 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Settings.NewCommandName = command?.DisplayName ?? string.Empty;
         Settings.NewExecutable = command?.Executable ?? string.Empty;
         Settings.NewArguments = command is null ? string.Empty : string.Join(' ', command.Arguments);
-        Settings.NewRunAsAdministrator = command?.RunAsAdministrator ?? true;
         Settings.CommandEditorOpen = true;
     }
 
@@ -932,7 +932,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 DisplayName = name,
                 Executable = executable,
                 Arguments = arguments,
-                RunAsAdministrator = Settings.NewRunAsAdministrator,
+                RunAsAdministrator = true,
             };
             ShowNotice(UiNoticeSeverity.Info, PresentationText.CommandUpdated, string.Empty);
         }
@@ -944,7 +944,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 executable,
                 arguments,
                 false,
-                Settings.NewRunAsAdministrator));
+                true));
             ShowNotice(UiNoticeSeverity.Info, PresentationText.CommandAdded, string.Empty);
         }
         Settings.HasUnsavedCommands = true;
@@ -990,7 +990,6 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Settings.NewCommandName = string.Empty;
         Settings.NewExecutable = string.Empty;
         Settings.NewArguments = string.Empty;
-        Settings.NewRunAsAdministrator = true;
         Settings.CommandEditorOpen = false;
     }
 
