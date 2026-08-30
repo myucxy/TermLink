@@ -95,6 +95,48 @@ class NativeTerminalViewTest {
         }
     }
 
+    @Test
+    fun verticalDragBrowsesLocalHistoryInBothDirections() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val bridge = FakeNativeBridge().apply {
+            forcedScrollbackAvailableRows = 12
+            forcedScrollbackGenerationRows = 12
+        }
+        val engine = NativeTerminalEngine(
+            initialSize = TerminalSize(80, 24),
+            bridge = bridge,
+        )
+        try {
+            val view = engine.createView(controller.get()) as NativeTerminalView
+            controller.get().setContentView(view)
+            view.layout(0, 0, 400, 600)
+
+            dispatchDrag(view, fromY = 120f, toY = 520f)
+            assertTrue("downward drag should reveal older rows", engine.historyOffsetRowsForTest() > 0)
+
+            dispatchDrag(view, fromY = 520f, toY = 20f)
+            assertEquals(0L, engine.historyOffsetRowsForTest())
+        } finally {
+            engine.dispose()
+            controller.destroy()
+        }
+    }
+
+    private fun dispatchDrag(view: NativeTerminalView, fromY: Float, toY: Float) {
+        val down = MotionEvent.obtain(0, 0, MotionEvent.ACTION_DOWN, 100f, fromY, 0)
+        val move = MotionEvent.obtain(0, 100, MotionEvent.ACTION_MOVE, 100f, toY, 0)
+        val up = MotionEvent.obtain(0, 120, MotionEvent.ACTION_UP, 100f, toY, 0)
+        try {
+            assertTrue(view.dispatchTouchEvent(down))
+            assertTrue(view.dispatchTouchEvent(move))
+            assertTrue(view.dispatchTouchEvent(up))
+        } finally {
+            down.recycle()
+            move.recycle()
+            up.recycle()
+        }
+    }
+
     private fun wideChineseFrame(): TerminalRenderFrameV3 = TerminalRenderFrameV3(
         presentationRevision = 1,
         nextSourceSequence = 1,

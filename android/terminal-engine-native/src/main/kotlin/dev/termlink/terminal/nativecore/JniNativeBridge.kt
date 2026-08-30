@@ -85,6 +85,31 @@ object JniNativeBridge : NativeBridge {
         JniNativeMethods.renderV3(handle.value, request.maxPayloadBytes.toLong(), output)
     }.mapPayload(::NativeBridgeRenderFrame)
 
+    override fun renderV3AtScrollback(
+        handle: NativeBridgeHandle,
+        offsetRows: Long,
+        request: NativeRenderRequest,
+    ): NativeBridgeResult<NativeBridgeScrollbackFrame> {
+        val info = LongArray(3)
+        val output = arrayOfNulls<ByteArray>(1)
+        return statusResult(
+            JniNativeMethods.renderV3AtScrollback(
+                handle.value,
+                offsetRows,
+                request.maxPayloadBytes.toLong(),
+                info,
+                output,
+            ),
+        ) {
+            NativeBridgeScrollbackFrame(
+                payload = output.requirePayload("renderV3AtScrollback"),
+                availableRows = info[0],
+                generationRows = info[1],
+                appliedOffsetRows = info[2],
+            )
+        }
+    }
+
     override fun encodeInputV1(
         handle: NativeBridgeHandle,
         input: NativeTerminalInputV1,

@@ -264,27 +264,74 @@ class NativeTerminalHandle private constructor(
         }
         val request = NativeRenderRequest(maxPayloadBytes = maxPayloadBytes)
         val raw = invokeBridge("renderV3") { bridge.renderV3(current.handle, request) }
-        if (raw.payload.size > maxPayloadBytes || raw.payload.size > limits.maxRenderFrameBytes) {
+        NativeRenderFrameV3(decodeRenderFrameV3("renderV3", current, raw.payload, maxPayloadBytes))
+    }
+
+    /** Exports a local-history V3 projection and its immutable scrollback metadata. */
+    fun renderV3AtScrollback(
+        offsetRows: Long,
+        maxPayloadBytes: Int = limits.maxRenderFrameBytes,
+    ): NativeScrollbackFrameV3 = synchronized(lock) {
+        val current = requireUsable()
+        require(offsetRows in 0..UNSIGNED_INT_MAX) {
+            "scrollback offset rows must be in 0..$UNSIGNED_INT_MAX"
+        }
+        require(maxPayloadBytes in 1..limits.maxRenderFrameBytes) {
+            "render payload limit must be in 1..${limits.maxRenderFrameBytes}"
+        }
+        val request = NativeRenderRequest(maxPayloadBytes = maxPayloadBytes)
+        val raw = invokeBridge("renderV3AtScrollback") {
+            bridge.renderV3AtScrollback(current.handle, offsetRows, request)
+        }
+        if (raw.availableRows !in 0..UNSIGNED_INT_MAX || raw.generationRows < 0 ||
+            raw.appliedOffsetRows !in 0..raw.availableRows ||
+            raw.appliedOffsetRows != offsetRows.coerceAtMost(raw.availableRows)
+        ) {
             throw NativeTerminalContractException(
-                "renderV3",
+                "renderV3AtScrollback",
+                "bridge returned inconsistent scrollback metadata",
+            )
+        }
+        NativeScrollbackFrameV3(
+            renderFrame = decodeRenderFrameV3(
+                "renderV3AtScrollback",
+                current,
+                raw.payload,
+                maxPayloadBytes,
+            ),
+            availableRows = raw.availableRows,
+            generationRows = raw.generationRows,
+            appliedOffsetRows = raw.appliedOffsetRows,
+        )
+    }
+
+    private fun decodeRenderFrameV3(
+        operation: String,
+        current: NativeBridgeTerminal,
+        payload: ByteArray,
+        maxPayloadBytes: Int,
+    ) = run {
+        if (payload.size > maxPayloadBytes || payload.size > limits.maxRenderFrameBytes) {
+            throw NativeTerminalContractException(
+                operation,
                 "frame payload exceeds the requested bound",
             )
         }
         val decoded = try {
-            RenderFrameV3Decoder.decode(raw.payload)
+            RenderFrameV3Decoder.decode(payload)
         } catch (error: RenderFrameV3DecodeException) {
-            throw NativeTerminalContractException("renderV3", error.message ?: "malformed frame")
+            throw NativeTerminalContractException(operation, error.message ?: "malformed frame")
         }
         if (decoded.nextSourceSequence != current.nextSourceSequence) {
             throw NativeTerminalContractException(
-                "renderV3",
+                operation,
                 "expected next source sequence ${current.nextSourceSequence}, " +
                     "received ${decoded.nextSourceSequence}",
             )
         }
         if (decoded.presentationRevision != current.presentationRevision) {
             throw NativeTerminalContractException(
-                "renderV3",
+                operation,
                 "expected presentation revision ${current.presentationRevision}, " +
                     "received ${decoded.presentationRevision}",
             )
@@ -293,11 +340,11 @@ class NativeTerminalHandle private constructor(
             limits.validateSize(decoded.size, "render frame v3")
         } catch (error: IllegalArgumentException) {
             throw NativeTerminalContractException(
-                "renderV3",
+                operation,
                 error.message ?: "invalid frame size",
             )
         }
-        NativeRenderFrameV3(decoded)
+        decoded
     }
 
     /** Encodes one mode-aware semantic key through terminal-core Input V1. */

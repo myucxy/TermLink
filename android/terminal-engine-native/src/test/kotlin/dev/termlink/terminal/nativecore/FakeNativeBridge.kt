@@ -44,6 +44,9 @@ internal class FakeNativeBridge : NativeBridge {
     var forcedCheckpointFailure: NativeBridgeResult.Failure? = null
     var forcedRenderFrame: NativeBridgeRenderFrame? = null
     var forcedRenderFrameV3: NativeBridgeRenderFrame? = null
+    var forcedScrollbackAvailableRows: Long = 0
+    var forcedScrollbackGenerationRows: Long = 0
+    val forcedScrollbackFrames: MutableMap<Long, NativeBridgeRenderFrame> = mutableMapOf()
     var forcedInputV1Failure: NativeBridgeResult.Failure? = null
     var forcedInputV1EncodedInput: NativeBridgeEncodedInput? = null
     var forcedMouseEncodedInput: NativeBridgeEncodedInput? = null
@@ -360,6 +363,40 @@ internal class FakeNativeBridge : NativeBridge {
             return NativeBridgeResult.Failure(NativeTerminalStatus.LIMIT_EXCEEDED.code)
         }
         NativeBridgeResult.Success(NativeBridgeRenderFrame(payload))
+    }
+
+    override fun renderV3AtScrollback(
+        handle: NativeBridgeHandle,
+        offsetRows: Long,
+        request: NativeRenderRequest,
+    ): NativeBridgeResult<NativeBridgeScrollbackFrame> = synchronized(this) {
+        forcedRenderFailure?.let { return it }
+        val state = states[handle]
+            ?: return NativeBridgeResult.Failure(NativeTerminalStatus.NULL_POINTER.code)
+        if (offsetRows < 0 || forcedScrollbackAvailableRows < 0 ||
+            forcedScrollbackGenerationRows < 0
+        ) {
+            return NativeBridgeResult.Failure(NativeTerminalStatus.INVALID_ARGUMENT.code)
+        }
+        val appliedOffset = offsetRows.coerceAtMost(forcedScrollbackAvailableRows)
+        val payload = forcedScrollbackFrames[appliedOffset]?.payload?.copyOf()
+            ?: forcedRenderFrameV3?.payload?.copyOf()
+            ?: fakeRenderFrameV3(
+                nextSourceSequence = state.nextSourceSequence,
+                presentationRevision = state.presentationRevision,
+                size = state.size,
+            )
+        if (payload.size > request.maxPayloadBytes) {
+            return NativeBridgeResult.Failure(NativeTerminalStatus.LIMIT_EXCEEDED.code)
+        }
+        NativeBridgeResult.Success(
+            NativeBridgeScrollbackFrame(
+                payload = payload,
+                availableRows = forcedScrollbackAvailableRows,
+                generationRows = forcedScrollbackGenerationRows,
+                appliedOffsetRows = appliedOffset,
+            ),
+        )
     }
 
     override fun encodeInputV1(

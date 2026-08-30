@@ -164,6 +164,31 @@ class JniNativeBridgeInstrumentedTest {
     }
 
     @Test
+    fun nativeScrollbackProjectionReturnsOlderRowsWithoutChangingLiveTail() {
+        NativeTerminalHandle.create(
+            bridge = JniNativeBridge,
+            size = TerminalSize(8, 2),
+            initialNextSourceSequence = 1,
+            outputProfile = TerminalOutputProfile.UTF8,
+            historyCapacityRows = 4,
+        ).use { terminal ->
+            terminal.feed(1, "A\r\nB\r\nC".encodeToByteArray())
+
+            val live = terminal.renderV3AtScrollback(0)
+            assertEquals(1L, live.availableRows)
+            assertEquals(1L, live.generationRows)
+            assertEquals(0L, live.appliedOffsetRows)
+            assertEquals("B", firstCellText(live.renderFrame))
+
+            val history = terminal.renderV3AtScrollback(1)
+            assertEquals(1L, history.appliedOffsetRows)
+            assertEquals("A", firstCellText(history.renderFrame))
+            assertTrue(!history.renderFrame.cursor.visible)
+            assertEquals("B", firstCellText(terminal.renderV3AtScrollback(0).renderFrame))
+        }
+    }
+
+    @Test
     fun productionEngineUsesNativeAuthorityForOrderedStateAndSemanticInput() = kotlinx.coroutines.runBlocking {
         val engine = NativeTerminalEngine(TerminalSize(8, 2))
         try {
@@ -207,5 +232,10 @@ class JniNativeBridgeInstrumentedTest {
             listOf(NativeTerminalStatus.OK.code, NativeTerminalStatus.INVALID_ARGUMENT.code),
             statuses.sorted(),
         )
+    }
+
+    private fun firstCellText(frame: dev.termlink.terminal.api.TerminalRenderFrameV3): String {
+        val graphemeId = frame.rows.first().cells.first().graphemeId
+        return frame.graphemes[graphemeId - 1].text
     }
 }

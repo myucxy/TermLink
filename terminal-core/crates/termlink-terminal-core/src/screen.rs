@@ -39,6 +39,11 @@ pub(super) struct Screen {
     pub(super) meaningful_end: Vec<u32>,
     pub(super) row_metadata: Vec<RowMetadata>,
     pub(super) next_logical_line_id: u64,
+    // Runtime-only monotonic count of full-viewport rows captured into primary
+    // scrollback. It is deliberately excluded from snapshots and semantic
+    // equality; renderers use it only to keep a history viewport anchored
+    // while new output arrives.
+    pub(super) scrollback_generation_rows: u64,
     pub(super) storage: StoragePolicy,
     pub(super) cursor_row: u32,
     pub(super) cursor_column: u32,
@@ -323,6 +328,7 @@ impl Screen {
             meaningful_end,
             row_metadata,
             next_logical_line_id,
+            scrollback_generation_rows: 0,
             storage,
             cursor_row: 0,
             cursor_column: 0,
@@ -348,6 +354,48 @@ impl Screen {
 
     pub(super) fn requested_history_rows(&self) -> u32 {
         self.storage.requested_history_rows
+    }
+
+    pub(super) fn scrollback_generation_rows(&self) -> u64 {
+        self.scrollback_generation_rows
+    }
+
+    /// Creates one renderer-only window `offset_rows` above the live tail.
+    /// The returned screen owns exactly the visible row count and contains no
+    /// mutable history prefix of its own.
+    pub(super) fn render_window(&self, offset_rows: u32) -> Self {
+        let offset_rows = offset_rows.min(self.viewport_top());
+        let first_row = self.viewport_top() - offset_rows;
+        let end_row = first_row + self.rows;
+        let first_cell = cell_index(self.columns, first_row, 0);
+        let end_cell = cell_index(self.columns, end_row, 0);
+        let first_row = usize::try_from(first_row).expect("bounded render-window row");
+        let end_row = usize::try_from(end_row).expect("bounded render-window row");
+
+        let mut window = Self::new(self.columns, self.rows);
+        window
+            .cells
+            .clone_from_slice(&self.cells[first_cell..end_cell]);
+        window
+            .soft_wrapped
+            .clone_from_slice(&self.soft_wrapped[first_row..end_row]);
+        window
+            .meaningful_end
+            .clone_from_slice(&self.meaningful_end[first_row..end_row]);
+        window
+            .row_metadata
+            .clone_from_slice(&self.row_metadata[first_row..end_row]);
+        window.next_logical_line_id = self.next_logical_line_id;
+        window.scrollback_generation_rows = self.scrollback_generation_rows;
+        if offset_rows == 0 {
+            window.cursor_row = self.cursor_row;
+            window.cursor_column = self.cursor_column;
+            window.wrap_pending = self.wrap_pending;
+            window.attributes = self.attributes;
+            window.protected = self.protected;
+            window.saved = self.saved;
+        }
+        window
     }
 
     pub(super) fn visible_stored_row(&self, row: u32) -> u32 {
@@ -2130,6 +2178,9 @@ impl Screen {
             usize::try_from(count).expect("bounded row count"),
         ));
         self.row_metadata.extend(blank_metadata);
+        self.scrollback_generation_rows = self
+            .scrollback_generation_rows
+            .saturating_add(u64::from(count));
         debug_assert_eq!(self.viewport_top(), retained_history);
         debug_assert!(self.cells.len() <= self.storage_policy().cell_cap);
         true

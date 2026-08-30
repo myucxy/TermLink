@@ -73,6 +73,44 @@ fn configured_main_scrollback_captures_output_and_keeps_public_cells_viewport_re
 }
 
 #[test]
+fn renderer_scrollback_window_and_generation_follow_output_without_changing_live_cells() {
+    let mut terminal = Terminal::new_with_options(
+        3,
+        2,
+        0,
+        TerminalOptions {
+            history_capacity_rows: 2,
+        },
+    )
+    .expect("history terminal");
+
+    output(&mut terminal, 0, b"A\r\nB\r\nC").expect("first captured row");
+    assert_eq!(terminal.scrollback_info(), (1, 1));
+    let first_window = terminal.main.render_window(1);
+    assert_eq!(first_window.visible_cells()[0].character, 'A');
+    assert_eq!(first_window.visible_cells()[3].character, 'B');
+    assert_eq!(terminal.cell(0, 0).expect("live B").character, 'B');
+    assert_eq!(terminal.cell(1, 0).expect("live C").character, 'C');
+
+    output(&mut terminal, 1, b"\r\nD\r\nE").expect("history reaches capacity");
+    assert_eq!(terminal.scrollback_info(), (2, 3));
+    let oldest = terminal.main.render_window(u32::MAX);
+    assert_eq!(oldest.visible_cells()[0].character, 'B');
+    assert_eq!(oldest.visible_cells()[3].character, 'C');
+
+    let history_frame = terminal
+        .export_render_frame_v3_at_scrollback(2)
+        .expect("history render frame");
+    assert_eq!(
+        u32_at(&history_frame, 56) & 1,
+        0,
+        "history cursor is hidden"
+    );
+    assert_eq!(terminal.cell(0, 0).expect("live D").character, 'D');
+    assert_eq!(terminal.cell(1, 0).expect("live E").character, 'E');
+}
+
+#[test]
 fn erase_display_three_clears_only_scrollback_and_keeps_history_policy() {
     let mut terminal = Terminal::new_with_options(
         3,

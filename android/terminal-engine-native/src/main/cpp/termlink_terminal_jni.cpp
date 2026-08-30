@@ -1,5 +1,6 @@
 #include <jni.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <limits>
@@ -565,6 +566,51 @@ Java_dev_termlink_terminal_nativecore_JniNativeMethods_renderV3(
 }
 
 extern "C" JNIEXPORT jint JNICALL
+Java_dev_termlink_terminal_nativecore_JniNativeMethods_renderV3AtScrollback(
+    JNIEnv* env, jobject, jlong token, jlong offset_rows, jlong maximum,
+    jlongArray output_info, jobjectArray output) {
+    return safe_status([&]() -> uint32_t {
+        if (offset_rows < 0 || maximum <= 0 || !minimum_length(env, output_info, 3) ||
+            !minimum_length(env, output, 1) ||
+            static_cast<uint64_t>(offset_rows) > std::numeric_limits<uint32_t>::max()) {
+            return TL_STATUS_INVALID_ARGUMENT;
+        }
+        BufferOwner buffer;
+        uint32_t available_rows = 0;
+        uint64_t generation_rows = 0;
+        uint32_t applied_offset = 0;
+        const uint32_t status = with_terminal(token, [&](TlTerminal* terminal) {
+            CheckpointOwner checkpoint;
+            uint32_t inner = checkpoint_for(terminal, &checkpoint, nullptr);
+            if (inner == TL_STATUS_OK) {
+                inner = tl_terminal_checkpoint_get_scrollback_info_v1(
+                    checkpoint.get(), &available_rows, &generation_rows);
+            }
+            if (inner == TL_STATUS_OK) {
+                applied_offset = std::min(static_cast<uint32_t>(offset_rows), available_rows);
+                inner = tl_terminal_checkpoint_export_render_frame_v3_at_scrollback(
+                    checkpoint.get(), applied_offset, static_cast<uint64_t>(maximum),
+                    buffer.out());
+            }
+            return inner;
+        });
+        if (status != TL_STATUS_OK) {
+            return status;
+        }
+        if (generation_rows > static_cast<uint64_t>(std::numeric_limits<jlong>::max())) {
+            return TL_STATUS_LIMIT_EXCEEDED;
+        }
+        const std::vector<jlong> values{
+            static_cast<jlong>(available_rows), static_cast<jlong>(generation_rows),
+            static_cast<jlong>(applied_offset)};
+        if (!write_longs(env, output_info, values)) {
+            return TL_STATUS_PANIC;
+        }
+        return publish_buffer(env, output, &buffer, static_cast<uint64_t>(maximum));
+    });
+}
+
+extern "C" JNIEXPORT jint JNICALL
 Java_dev_termlink_terminal_nativecore_JniNativeMethods_encodeInputV1(
     JNIEnv* env, jobject, jlong token, jlongArray raw_input, jbyteArray raw_data,
     jobjectArray output) {
@@ -820,6 +866,8 @@ extern "C" __attribute__((visibility("default"))) jint JNICALL JNI_OnLoad(JavaVM
          reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_render)},
         {const_cast<char*>("renderV3"), const_cast<char*>("(JJ[[B)I"),
          reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_renderV3)},
+        {const_cast<char*>("renderV3AtScrollback"), const_cast<char*>("(JJJ[J[[B)I"),
+         reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_renderV3AtScrollback)},
         {const_cast<char*>("encodeInputV1"), const_cast<char*>("(J[J[B[[B)I"),
          reinterpret_cast<void*>(Java_dev_termlink_terminal_nativecore_JniNativeMethods_encodeInputV1)},
         {const_cast<char*>("encodeMouse"), const_cast<char*>("(J[J[[B)I"),

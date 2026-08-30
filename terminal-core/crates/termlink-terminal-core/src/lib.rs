@@ -886,6 +886,39 @@ impl Terminal {
         render_frame::export_v3(self)
     }
 
+    /// Returns the retained active-screen scrollback row count and a
+    /// runtime-only monotonic count of rows captured into primary scrollback.
+    /// Alternate-screen applications intentionally expose no local history.
+    #[must_use]
+    pub fn scrollback_info(&self) -> (u32, u64) {
+        if self.active_alternate {
+            (0, self.main.scrollback_generation_rows())
+        } else {
+            (
+                self.main.viewport_top(),
+                self.main.scrollback_generation_rows(),
+            )
+        }
+    }
+
+    /// Exports a renderer-only V3 window `offset_rows` above the live tail.
+    /// Requests beyond the oldest retained row are clamped to that boundary.
+    pub fn export_render_frame_v3_at_scrollback(
+        &self,
+        offset_rows: u32,
+    ) -> Result<Vec<u8>, TerminalError> {
+        let (available_rows, _) = self.scrollback_info();
+        let offset_rows = offset_rows.min(available_rows);
+        if offset_rows == 0 {
+            return render_frame::export_v3(self);
+        }
+        self.ensure_presentation_eligible()?;
+        let mut projection = self.clone();
+        projection.cursor_visible = false;
+        *projection.active_screen_mut() = self.active_screen().render_window(offset_rows);
+        render_frame::export_v3(&projection)
+    }
+
     /// Encodes one semantic keyboard or paste event using the terminal's
     /// current input modes. This operation does not mutate terminal state.
     pub fn encode_input(&self, event: InputEvent<'_>) -> Result<Vec<u8>, InputEncodeError> {

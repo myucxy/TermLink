@@ -625,6 +625,14 @@ data class NativeBridgeRenderFrame(
     val payload: ByteArray,
 )
 
+/** Render Frame V3 plus the immutable checkpoint's local scrollback metadata. */
+data class NativeBridgeScrollbackFrame(
+    val payload: ByteArray,
+    val availableRows: Long,
+    val generationRows: Long,
+    val appliedOffsetRows: Long,
+)
+
 /**
  * Raw bridge result. [payload] ownership transfers to the caller on return; the bridge must never
  * mutate it afterward. The handle wrapper validates and copies every field before exposing it.
@@ -661,6 +669,14 @@ class NativeRenderFrameV3 internal constructor(
     val size: TerminalSize
         get() = renderFrame.size
 }
+
+/** Immutable local-history projection returned by the production native boundary. */
+class NativeScrollbackFrameV3 internal constructor(
+    val renderFrame: TerminalRenderFrameV3,
+    val availableRows: Long,
+    val generationRows: Long,
+    val appliedOffsetRows: Long,
+)
 
 class NativeCheckpoint internal constructor(
     val nextSourceSequence: Long,
@@ -746,6 +762,13 @@ interface NativeBridge {
         handle: NativeBridgeHandle,
         request: NativeRenderRequest,
     ): NativeBridgeResult<NativeBridgeRenderFrame>
+
+    /** Exports V3 at a retained row offset above the live tail. */
+    fun renderV3AtScrollback(
+        handle: NativeBridgeHandle,
+        offsetRows: Long,
+        request: NativeRenderRequest,
+    ): NativeBridgeResult<NativeBridgeScrollbackFrame>
 
     /** Maps directly to the mode-aware `tl_terminal_encode_input_v1` C ABI call. */
     fun encodeInputV1(

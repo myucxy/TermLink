@@ -32,6 +32,13 @@ internal object JniNativeMethods {
     ): Int
     external fun render(token: Long, maxBytes: Long, outFrame: Array<ByteArray?>): Int
     external fun renderV3(token: Long, maxBytes: Long, outFrame: Array<ByteArray?>): Int
+    external fun renderV3AtScrollback(
+        token: Long,
+        offsetRows: Long,
+        maxBytes: Long,
+        outInfo: LongArray,
+        outFrame: Array<ByteArray?>,
+    ): Int
     external fun encodeInputV1(
         token: Long,
         input: LongArray,

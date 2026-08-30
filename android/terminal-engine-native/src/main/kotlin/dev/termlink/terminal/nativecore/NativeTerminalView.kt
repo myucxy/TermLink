@@ -39,6 +39,7 @@ import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.roundToInt
+import kotlin.math.sign
 
 /** Canvas terminal surface for immutable terminal-core Render Frame V3 projections. */
 internal class NativeTerminalView @JvmOverloads constructor(
@@ -66,6 +67,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private var baselineOffset = 1f
     private var viewportX = 0f
     private var viewportY = 0f
+    private var historyDragPixels = 0f
     private var mouseCaptured = false
     private var selectionAnchor: CellPoint? = null
     private var selectionExtent: CellPoint? = null
@@ -76,7 +78,10 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private var fontFamilyInitialized = false
 
     private val gestures = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
-        override fun onDown(event: MotionEvent): Boolean = true
+        override fun onDown(event: MotionEvent): Boolean {
+            historyDragPixels = 0f
+            return true
+        }
 
         override fun onSingleTapUp(event: MotionEvent): Boolean {
             performClick()
@@ -89,6 +94,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
             distanceX: Float,
             distanceY: Float,
         ): Boolean {
+            val owner = engine ?: return false
             if (mouseCaptured) return true
             val extent = selectionExtent
             if (extent != null) {
@@ -96,14 +102,8 @@ internal class NativeTerminalView @JvmOverloads constructor(
                 invalidate()
                 return true
             }
-            val beforeY = viewportY
-            viewportX += distanceX
-            viewportY += distanceY
-            clampViewport()
-            if (beforeY == 0f && viewportY == 0f && distanceY < 0f) onScrollPastTop?.invoke()
-            if (beforeY == maxViewportY() && viewportY == maxViewportY() && distanceY > 0f) {
-                onScrollPastBottom?.invoke()
-            }
+            viewportX = (viewportX + distanceX).coerceIn(0f, maxViewportX())
+            scrollVertically(owner, distanceY)
             invalidate()
             return true
         }
@@ -348,8 +348,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
                         ),
                     )
                 ) return true
-                viewportY -= vertical * cellHeight * 3f
-                clampViewport()
+                scrollVertically(owner, -vertical * cellHeight * 3f)
                 invalidate()
                 return true
             }
@@ -479,6 +478,32 @@ internal class NativeTerminalView @JvmOverloads constructor(
         if (engine == null || width <= 0 || height <= 0) return
         viewportX = viewportX.coerceIn(0f, maxViewportX())
         viewportY = viewportY.coerceIn(0f, maxViewportY())
+    }
+
+    private fun handleHistoryScrollResult(result: NativeHistoryScrollResult) {
+        when (result) {
+            NativeHistoryScrollResult.MOVED, NativeHistoryScrollResult.UNCHANGED -> Unit
+            NativeHistoryScrollResult.OLDEST_BOUNDARY -> onScrollPastTop?.invoke()
+            NativeHistoryScrollResult.LIVE_BOUNDARY -> onScrollPastBottom?.invoke()
+        }
+    }
+
+    private fun scrollVertically(owner: NativeTerminalEngine, distanceY: Float) {
+        val beforeY = viewportY
+        viewportY = (viewportY + distanceY).coerceIn(0f, maxViewportY())
+        val overscrollPixels = distanceY - (viewportY - beforeY)
+        if (overscrollPixels == 0f) {
+            historyDragPixels = 0f
+            return
+        }
+        if (historyDragPixels != 0f && historyDragPixels.sign != (-overscrollPixels).sign) {
+            historyDragPixels = 0f
+        }
+        historyDragPixels -= overscrollPixels
+        val historyRows = (historyDragPixels / cellHeight).toInt()
+        if (historyRows == 0) return
+        historyDragPixels -= historyRows * cellHeight
+        handleHistoryScrollResult(owner.scrollHistoryRows(historyRows))
     }
 
     private fun cellAt(x: Float, y: Float): CellPoint {

@@ -681,6 +681,14 @@ TL_TERMINAL_API void tl_terminal_checkpoint_destroy(
 TL_TERMINAL_API TlTerminalStatus tl_terminal_checkpoint_get_info(
     const TlTerminalCheckpoint *checkpoint,
     TlTerminalCheckpointInfo *out_info);
+/*
+ * Returns retained active-screen scrollback and a runtime-only monotonic row
+ * generation. Alternate-screen applications report zero retained rows.
+ */
+TL_TERMINAL_API TlTerminalStatus tl_terminal_checkpoint_get_scrollback_info_v1(
+    const TlTerminalCheckpoint *checkpoint,
+    uint32_t *out_available_rows,
+    uint64_t *out_generation_rows);
 TL_TERMINAL_API TlTerminalStatus tl_terminal_checkpoint_export_snapshot(
     const TlTerminalCheckpoint *checkpoint,
     TlTerminalBuffer *out_snapshot);
@@ -714,6 +722,15 @@ TL_TERMINAL_API TlTerminalStatus tl_terminal_checkpoint_export_render_frame_v2(
  */
 TL_TERMINAL_API TlTerminalStatus tl_terminal_checkpoint_export_render_frame_v3(
     const TlTerminalCheckpoint *checkpoint,
+    uint64_t max_frame_bytes,
+    TlTerminalBuffer *out_frame);
+/*
+ * Exports V3 at offset_rows above the live tail. Requests older than retained
+ * history clamp to the oldest available row.
+ */
+TL_TERMINAL_API TlTerminalStatus tl_terminal_checkpoint_export_render_frame_v3_at_scrollback(
+    const TlTerminalCheckpoint *checkpoint,
+    uint32_t offset_rows,
     uint64_t max_frame_bytes,
     TlTerminalBuffer *out_frame);
 

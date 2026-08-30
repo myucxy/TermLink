@@ -1133,6 +1133,34 @@ pub unsafe extern "C" fn tl_terminal_checkpoint_get_info(
     })
 }
 
+/// Writes the retained active-screen scrollback row count and the runtime
+/// monotonic row-capture generation for an immutable checkpoint.
+///
+/// # Safety
+///
+/// `checkpoint` must remain live. Both output pointers must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_checkpoint_get_scrollback_info_v1(
+    checkpoint: *const TlTerminalCheckpoint,
+    out_available_rows: *mut u32,
+    out_generation_rows: *mut u64,
+) -> u32 {
+    catch_status(|| {
+        if checkpoint.is_null() || out_available_rows.is_null() || out_generation_rows.is_null() {
+            return STATUS_NULL_POINTER;
+        }
+        // SAFETY: The C contract requires the checkpoint to remain live and
+        // both scalar outputs to be writable for this call.
+        let checkpoint = unsafe { &*checkpoint };
+        let (available_rows, generation_rows) = checkpoint.frozen_terminal.scrollback_info();
+        unsafe {
+            ptr::write_unaligned(out_available_rows, available_rows);
+            ptr::write_unaligned(out_generation_rows, generation_rows);
+        }
+        STATUS_OK
+    })
+}
+
 /// Exports an owned canonical Snapshot V2 from an immutable checkpoint.
 ///
 /// # Safety
@@ -1298,6 +1326,59 @@ pub unsafe extern "C" fn tl_terminal_checkpoint_export_render_frame_v3(
         // SAFETY: The C contract requires the checkpoint to remain live.
         let checkpoint = unsafe { &*checkpoint };
         let frame = match checkpoint.frozen_terminal.export_render_frame_v3() {
+            Ok(frame) => frame,
+            Err(error) => return status_for_error(&error),
+        };
+        #[cfg(test)]
+        checkpoint
+            .render_frame_v3_export_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if frame.len() > requested {
+            return STATUS_LIMIT_EXCEEDED;
+        }
+        let buffer = match owned_buffer_with_limit(frame, capacity, MAX_RENDER_FRAME_V3_BYTES) {
+            Ok(buffer) => buffer,
+            Err(status) => return status,
+        };
+        // SAFETY: The capacity check established writable known fields.
+        unsafe { ptr::write_unaligned(out_frame, buffer) };
+        STATUS_OK
+    })
+}
+
+/// Exports one owned renderer-only Render Frame V3 at a retained scrollback
+/// offset. Offsets beyond the oldest retained row clamp to that boundary.
+///
+/// # Safety
+///
+/// `checkpoint` must remain live. `out_frame` must be a versioned, writable,
+/// empty buffer. `max_frame_bytes` must be in 1..=the library hard maximum.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_checkpoint_export_render_frame_v3_at_scrollback(
+    checkpoint: *const TlTerminalCheckpoint,
+    offset_rows: u32,
+    max_frame_bytes: u64,
+    out_frame: *mut TlTerminalBuffer,
+) -> u32 {
+    catch_status(|| {
+        if checkpoint.is_null() || out_frame.is_null() {
+            return STATUS_NULL_POINTER;
+        }
+        let requested = match checked_length(max_frame_bytes, MAX_RENDER_FRAME_V3_BYTES) {
+            Ok(0) | Err(_) => return STATUS_INVALID_ARGUMENT,
+            Ok(requested) => requested,
+        };
+        // SAFETY: The C contract requires a readable and writable empty output.
+        let capacity = match unsafe { empty_buffer_capacity(out_frame) } {
+            Ok(capacity) => capacity,
+            Err(status) => return status,
+        };
+        // SAFETY: The C contract requires the checkpoint to remain live.
+        let checkpoint = unsafe { &*checkpoint };
+        let frame = match checkpoint
+            .frozen_terminal
+            .export_render_frame_v3_at_scrollback(offset_rows)
+        {
             Ok(frame) => frame,
             Err(error) => return status_for_error(&error),
         };
@@ -4777,6 +4858,62 @@ mod tests {
     }
 
     #[test]
+    fn scrollback_info_and_offset_render_are_checkpoint_stable_and_bounded() {
+        let mut terminal = ptr::null_mut();
+        let valid = config_v2(3, 2, 1, 2);
+        // SAFETY: Test provides an exact readable V2 config and empty output.
+        assert_eq!(
+            unsafe { tl_terminal_create_v2(&valid, &mut terminal) },
+            STATUS_OK
+        );
+        // SAFETY: Event and payload remain readable for the call.
+        assert_eq!(
+            unsafe { tl_terminal_apply_event(terminal, &output(1, b"A\r\nB\r\nC")) },
+            STATUS_OK
+        );
+        // SAFETY: Test owns the terminal and resulting checkpoint.
+        let frozen = unsafe { checkpoint(terminal) };
+        let mut available_rows = 0_u32;
+        let mut generation_rows = 0_u64;
+        assert_eq!(
+            unsafe {
+                tl_terminal_checkpoint_get_scrollback_info_v1(
+                    frozen,
+                    &mut available_rows,
+                    &mut generation_rows,
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!((available_rows, generation_rows), (1, 1));
+
+        let mut history = empty_buffer();
+        // SAFETY: Checkpoint remains live and output is empty.
+        assert_eq!(
+            unsafe {
+                tl_terminal_checkpoint_export_render_frame_v3_at_scrollback(
+                    frozen,
+                    u32::MAX,
+                    MAX_RENDER_FRAME_V3_BYTES as u64,
+                    &mut history,
+                )
+            },
+            STATUS_OK
+        );
+        let bytes = unsafe { copy_and_free(history) };
+        assert_eq!(
+            u32::from_le_bytes(bytes[56..60].try_into().expect("cursor flags")) & 1,
+            0
+        );
+
+        // SAFETY: Release each live owner exactly once.
+        unsafe {
+            tl_terminal_checkpoint_destroy(frozen);
+            tl_terminal_destroy(terminal);
+        }
+    }
+
+    #[test]
     fn config_v3_selects_the_output_profile_and_accepts_standalone_c1() {
         let valid = config_v3(3, 2, 7, 2, OUTPUT_PROFILE_UTF8_WITH_STANDALONE_C1);
         let mut terminal = ptr::null_mut();
@@ -6494,6 +6631,8 @@ mod tests {
         assert!(header.contains("tl_terminal_checkpoint_export_render_frame_v1"));
         assert!(header.contains("tl_terminal_checkpoint_export_render_frame_v2"));
         assert!(header.contains("tl_terminal_checkpoint_export_render_frame_v3"));
+        assert!(header.contains("tl_terminal_checkpoint_get_scrollback_info_v1"));
+        assert!(header.contains("tl_terminal_checkpoint_export_render_frame_v3_at_scrollback"));
         assert!(header.contains("#define TL_STATUS_PRESENTATION_DEFERRED UINT32_C(13)"));
         assert!(header.contains("#define TL_STATUS_HOST_EFFECT_VERSION_REQUIRED UINT32_C(14)"));
         assert!(header.contains("typedef struct TlTerminalPresentationInfoV1"));

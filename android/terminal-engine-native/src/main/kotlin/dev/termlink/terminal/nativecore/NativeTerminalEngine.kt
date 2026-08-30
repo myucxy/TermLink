@@ -29,6 +29,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 
+internal enum class NativeHistoryScrollResult {
+    MOVED,
+    UNCHANGED,
+    OLDEST_BOUNDARY,
+    LIVE_BOUNDARY,
+}
+
 /** Production Android terminal whose parser, render frame, and input modes are terminal-core. */
 class NativeTerminalEngine(
     initialSize: TerminalSize = TerminalSize(DEFAULT_COLUMNS, DEFAULT_ROWS),
@@ -44,6 +51,9 @@ class NativeTerminalEngine(
     private val mutableFrame: MutableStateFlow<TerminalRenderFrameV3>
     private val mainHandler = Handler(Looper.getMainLooper())
     private var terminal = createTerminal(initialSize)
+    private var scrollbackOffsetRows = 0L
+    private var scrollbackAvailableRows = 0L
+    private var scrollbackGenerationRows = 0L
     private var currentTheme = DEFAULT_THEME
     private var readOnly = true
     private var disposed = false
@@ -53,9 +63,10 @@ class NativeTerminalEngine(
     private var listenerGeneration = 0L
 
     init {
-        val firstFrame = terminal.renderV3().renderFrame
-        mutableFrame = MutableStateFlow(firstFrame)
-        publishFrame(firstFrame, notify = false)
+        val firstFrame = terminal.renderV3AtScrollback(0)
+        acceptScrollbackFrame(firstFrame)
+        mutableFrame = MutableStateFlow(firstFrame.renderFrame)
+        publishFrame(firstFrame.renderFrame, notify = false)
     }
 
     override val inputEvents: Flow<ByteArray> = inputChannel.receiveAsFlow()
@@ -74,7 +85,7 @@ class NativeTerminalEngine(
         require(checkpoint.isNotEmpty()) { "Native terminal checkpoint must not be empty" }
         val replacement = NativeTerminalHandle.importCheckpoint(bridge, checkpoint, limits)
         val frame = try {
-            replacement.renderV3().renderFrame
+            replacement.renderV3AtScrollback(0)
         } catch (error: Throwable) {
             runCatching(replacement::close).exceptionOrNull()?.let(error::addSuppressed)
             throw error
@@ -105,10 +116,11 @@ class NativeTerminalEngine(
             }
             throw error
         }
-        publishFrame(frame, notify = true)
+        synchronized(lock) { acceptScrollbackFrame(frame) }
+        publishFrame(frame.renderFrame, notify = true)
         return InstalledCheckpoint(
             sequence = nextSourceSequence - 1L,
-            size = frame.size,
+            size = frame.renderFrame.size,
         )
     }
 
@@ -237,8 +249,23 @@ class NativeTerminalEngine(
     }
 
     override fun scrollToLatest() {
-        val view = synchronized(lock) { checkActive(); viewReference?.get() } ?: return
-        view.post(view::scrollToCursor)
+        val result = synchronized(lock) {
+            checkActive()
+            val frame = if (scrollbackOffsetRows == 0L) {
+                null
+            } else {
+                try {
+                    terminal.renderV3AtScrollback(0).also(::acceptScrollbackFrame)
+                } catch (error: NativeTerminalException) {
+                    if (!error.isTemporaryPresentationFailure()) throw error
+                    scrollbackOffsetRows = 0L
+                    null
+                }
+            }
+            frame to viewReference?.get()
+        }
+        result.first?.let { publishFrame(it.renderFrame, notify = true) }
+        result.second?.let { view -> view.post(view::scrollToCursor) }
     }
 
     override fun scrollPastTopBoundary() {
@@ -327,6 +354,36 @@ class NativeTerminalEngine(
         return emitPayloads(listOf(payload))
     }
 
+    internal fun scrollHistoryRows(deltaRows: Int): NativeHistoryScrollResult {
+        if (deltaRows == 0) return NativeHistoryScrollResult.MOVED
+        val frame = synchronized(lock) {
+            checkActive()
+            val requested = if (deltaRows > 0) {
+                saturatedAdd(scrollbackOffsetRows, deltaRows.toLong())
+                    .coerceAtMost(scrollbackAvailableRows)
+            } else {
+                (scrollbackOffsetRows + deltaRows.toLong()).coerceAtLeast(0L)
+            }
+            if (requested == scrollbackOffsetRows) {
+                return if (deltaRows > 0) {
+                    NativeHistoryScrollResult.OLDEST_BOUNDARY
+                } else {
+                    NativeHistoryScrollResult.LIVE_BOUNDARY
+                }
+            }
+            try {
+                terminal.renderV3AtScrollback(requested).also(::acceptScrollbackFrame)
+            } catch (error: NativeTerminalException) {
+                if (!error.isTemporaryPresentationFailure()) throw error
+                return NativeHistoryScrollResult.UNCHANGED
+            }
+        }
+        publishFrame(frame.renderFrame, notify = true)
+        return NativeHistoryScrollResult.MOVED
+    }
+
+    internal fun historyOffsetRowsForTest(): Long = synchronized(lock) { scrollbackOffsetRows }
+
     internal fun theme(): TerminalThemeV1 = synchronized(lock) { currentTheme }
 
     internal fun detachView(view: NativeTerminalView) {
@@ -342,11 +399,27 @@ class NativeTerminalEngine(
             try {
                 apply(terminal)
                 try {
-                    terminal.renderV3().renderFrame
+                    val live = terminal.renderV3AtScrollback(0)
+                    val generationDelta = if (live.generationRows >= scrollbackGenerationRows) {
+                        live.generationRows - scrollbackGenerationRows
+                    } else {
+                        0L
+                    }
+                    val anchoredOffset = if (scrollbackOffsetRows == 0L) {
+                        0L
+                    } else {
+                        saturatedAdd(scrollbackOffsetRows, generationDelta)
+                            .coerceAtMost(live.availableRows)
+                    }
+                    val visible = if (anchoredOffset == 0L) {
+                        live
+                    } else {
+                        terminal.renderV3AtScrollback(anchoredOffset)
+                    }
+                    acceptScrollbackFrame(visible)
+                    visible.renderFrame
                 } catch (error: NativeTerminalException) {
-                    if (error.status == NativeTerminalStatus.SNAPSHOT_NOT_ELIGIBLE ||
-                        error.status == NativeTerminalStatus.PRESENTATION_DEFERRED
-                    ) {
+                    if (error.isTemporaryPresentationFailure()) {
                         // The source event is already committed, but an incomplete parser token or
                         // synchronized output intentionally withholds presentation. Keep the last
                         // immutable frame visible and continue accepting the ordered stream; a
@@ -369,12 +442,13 @@ class NativeTerminalEngine(
         val previous = terminal
         val replacement = createTerminal(size)
         val frame = try {
-            replacement.renderV3().renderFrame
+            replacement.renderV3AtScrollback(0)
         } catch (error: Throwable) {
             runCatching(replacement::close).exceptionOrNull()?.let(error::addSuppressed)
             throw error
         }
         terminal = replacement
+        acceptScrollbackFrame(frame)
         try {
             previous.close()
         } catch (error: Throwable) {
@@ -382,7 +456,7 @@ class NativeTerminalEngine(
             readOnly = true
             throw error
         }
-        publishFrame(frame, notify = true)
+        publishFrame(frame.renderFrame, notify = true)
     }
 
     private fun createTerminal(size: TerminalSize): NativeTerminalHandle = NativeTerminalHandle.create(
@@ -399,6 +473,12 @@ class NativeTerminalEngine(
         mutableSize.value = frame.size
         mutableTitle.value = frame.title.take(MAX_TITLE_CHARACTERS)
         if (notify) notifyView()
+    }
+
+    private fun acceptScrollbackFrame(frame: NativeScrollbackFrameV3) {
+        scrollbackAvailableRows = frame.availableRows
+        scrollbackGenerationRows = frame.generationRows
+        scrollbackOffsetRows = frame.appliedOffsetRows
     }
 
     private fun notifyView() {
@@ -418,7 +498,10 @@ class NativeTerminalEngine(
             }
             emitted = true
         }
-        if (emitted && notifyAccepted) notifyAcceptedInput()
+        if (emitted && notifyAccepted) {
+            scrollToLatest()
+            notifyAcceptedInput()
+        }
         return true
     }
 
@@ -443,7 +526,7 @@ class NativeTerminalEngine(
     private companion object {
         const val DEFAULT_COLUMNS = 80
         const val DEFAULT_ROWS = 24
-        const val DEFAULT_HISTORY_CAPACITY_ROWS = 0L
+        const val DEFAULT_HISTORY_CAPACITY_ROWS = 2_000L
         const val FIRST_SOURCE_SEQUENCE = 1L
         const val MAX_TITLE_CHARACTERS = 4_096
         const val TERMINAL_KEYMOD_ALT = Int.MIN_VALUE
@@ -468,6 +551,15 @@ class NativeTerminalEngine(
         )
     }
 }
+
+private fun saturatedAdd(value: Long, increment: Long): Long {
+    require(value >= 0 && increment >= 0) { "saturated addition requires non-negative values" }
+    return if (Long.MAX_VALUE - value < increment) Long.MAX_VALUE else value + increment
+}
+
+private fun NativeTerminalException.isTemporaryPresentationFailure(): Boolean =
+    status == NativeTerminalStatus.SNAPSHOT_NOT_ELIGIBLE ||
+        status == NativeTerminalStatus.PRESENTATION_DEFERRED
 
 private fun androidTerminalKey(keyCode: Int): TerminalKey? = when (keyCode) {
     KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> TerminalKey.ENTER

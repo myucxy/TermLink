@@ -300,7 +300,10 @@ from all frame tables, row metadata, and cells.
 Scrollback is opt-in through `TerminalOptions.history_capacity_rows` or C/.NET
 Config V2. Stored rows are represented as `[history prefix][visible suffix]`,
 with `viewport_top` equal to the current history-row count. Public `cell()`
-coordinates and all three Render Frame versions remain viewport-relative.
+coordinates and the ordinary Render Frame exports remain live-viewport-relative.
+The additive `scrollback_info` and Render Frame V3-at-scrollback APIs provide a
+read-only renderer window at a retained row offset; each returned frame is still
+viewport-sized and contains no hidden prefix.
 
 Only upward scrolling of the full primary viewport caused while applying an
 output event is captured. This includes ordinary line feed/autowrap and a
@@ -315,9 +318,10 @@ same revision. Failed atomic batches roll back the history, seals, and logical
 ID frontier together with the rest of terminal state.
 
 Resize/crop/reflow preserves the history/viewport boundary and visible cursor,
-saved-cursor, and logical anchors within the configured limits. This is runtime
-storage only: no public History Page wire/API exists yet, and a checkpoint does
-not freeze the hidden history prefix.
+saved-cursor, and logical anchors within the configured limits. This remains
+bounded runtime storage, not a public paged History Page wire/API. Portable
+Snapshot and ordinary Render Frame bytes keep their existing semantics; the
+offset renderer reads only the history frozen inside its local checkpoint.
 
 ## Phase-one behavior
 

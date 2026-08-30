@@ -3024,6 +3024,7 @@ fn decode_screen(
         meaningful_end,
         row_metadata,
         next_logical_line_id,
+        scrollback_generation_rows: 0,
         storage: StoragePolicy::new(requested_history_rows, MAX_CELLS),
         cursor_row: meta.cursor_row,
         cursor_column: meta.cursor_column,

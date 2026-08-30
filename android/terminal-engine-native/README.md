@@ -34,6 +34,12 @@ The adapter does not parse VT. Source events are passed to the native core in st
 bounded batches; render frames and checkpoints are treated as validated binary products of that
 core.
 
+Production Android engines retain up to 2,000 primary-screen rows (further bounded by the core cell
+limit). The JNI adapter can render an immutable V3 window at a retained row offset. Touch scrolling
+first moves within an oversized live grid, then browses this local history; new output keeps a
+history reader anchored, while accepted local input returns to the live cursor. At the oldest local
+row the existing product callback may request older authenticated server transcript pages.
+
 `initialNextSourceSequence` and every reported `nextSourceSequence` are journal positions supplied
 by the authoritative session journal. The adapter does not invent or renumber them. Each output,
 resize, advance, or gap event consumes exactly one continuous sequence value, and a checkpoint
