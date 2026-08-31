@@ -783,6 +783,11 @@ fun ProductSnapshot.canApprovePendingDevice(): Boolean =
 interface ProductRepository : Closeable {
     val snapshot: StateFlow<ProductSnapshot>
 
+    /** Records the earliest monotonic instant at which the app left foreground. */
+    fun onAppBackgrounded(elapsedRealtimeMillis: Long) = Unit
+    /** Reconciles realtime once per monotonic foreground generation. */
+    fun onAppForegrounded(generation: Long, elapsedRealtimeMillis: Long) = Unit
+
     suspend fun refresh()
     /** Native username/password login. Password is transient and must be cleared by the caller. */
     suspend fun signIn(username: String, password: CharArray): Unit = signIn()

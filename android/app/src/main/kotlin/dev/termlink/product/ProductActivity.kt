@@ -796,6 +796,7 @@ class ProductActivity : ComponentActivity() {
 
     override fun onStop() {
         productForeground = false
+        repository.onAppBackgrounded(android.os.SystemClock.elapsedRealtime())
         // Keep this device's short-lived control lease while the Activity is
         // merely backgrounded. Releasing it here raced a fast process/activity
         // restart and could delete the freshly resumed lease. The realtime
@@ -813,6 +814,10 @@ class ProductActivity : ComponentActivity() {
         productForegroundGeneration = nextForegroundGeneration(productForegroundGeneration)
         productForeground = true
         if (::repository.isInitialized) {
+            repository.onAppForegrounded(
+                generation = productForegroundGeneration,
+                elapsedRealtimeMillis = android.os.SystemClock.elapsedRealtime(),
+            )
             lifecycleScope.launch {
                 // Match NuanYa's startup/foreground check: the repository
                 // throttles this to one request per minute and reuses an

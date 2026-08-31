@@ -660,11 +660,9 @@ class HistoryRepository(
             check(persisted.rendererGeneration == rendererGeneration) {
                 "ACK renderer generation changed during commit"
             }
-            // Keep the last verified snapshot binding even after the live ACK
-            // advances beyond it. On the next process start the product first
-            // restores this exact snapshot, then atomically re-anchors the ACK
-            // generation to its sequence before advertising a resume cursor.
-            // Deleting the binding here forced a full prefix replay from 1.
+            // Keep the last verified snapshot binding after the live ACK advances.
+            // A restart may use it only after verifying and replaying the contiguous
+            // suffix through this durable cursor; ACKs are cumulative and never regress.
             persisted.highestContiguousSequence.toULongChecked("ACK sequence")
         }
     }
@@ -735,24 +733,11 @@ class HistoryRepository(
                 "ACK cursor must be initialized before binding a renderer checkpoint"
             }
             require(cursor.rendererGeneration == expectedRendererGeneration) { "ACK renderer generation is stale" }
-            val updatedAt = clockMillis()
-            val bindingGeneration = if (cursor.highestContiguousSequence <= sequence) {
-                expectedRendererGeneration
-            } else {
-                require(expectedRendererGeneration < Long.MAX_VALUE - 1) {
-                    "renderer generation is exhausted"
-                }
-                // Re-anchoring to an older, already verified snapshot must be
-                // one Room transaction: fence the live renderer, lower its ACK
-                // to zero, then bind the prepared snapshot. Any failure rolls
-                // the complete transaction back to the original durable ACK.
-                acks.reset(
-                    safeSessionId,
-                    safeDirection,
-                    expectedRendererGeneration,
-                    updatedAt,
-                ).rendererGeneration
+            require(cursor.highestContiguousSequence <= sequence) {
+                "renderer checkpoint cannot regress the durable ACK cursor"
             }
+            val updatedAt = clockMillis()
+            val bindingGeneration = expectedRendererGeneration
             check(
                 acks.installRendererCheckpoint(
                     safeSessionId,

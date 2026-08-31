@@ -459,6 +459,160 @@ func TestPCOutputUsesValidatedSubscriptionWithoutAuthorityQuery(t *testing.T) {
 	}
 }
 
+func TestConnectedAndroidWithoutSessionSubscriptionReceivesNoPCOutput(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID, pcID, androidID := uuid.New(), uuid.New(), uuid.New()
+	subscribedSessionID, unsubscribedSessionID := uuid.New(), uuid.New()
+	android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+	hub.subscribe(android, subscribedSessionID, store.SessionRouteAuthorization{
+		Permission: "VIEW",
+		PCDeviceID: pcID,
+	})
+
+	frame := []byte("output-for-unsubscribed-session")
+	envelope := realtimewire.Envelope{
+		RecipientDeviceID: androidID[:],
+		MessageType:       realtimewire.OutputChunk,
+		Sequence:          1,
+	}
+	if err := pc.routePCFrame(envelope, unsubscribedSessionID, androidID, frame); err != nil {
+		t.Fatalf("unsubscribed PC output was rejected: %v", err)
+	}
+	select {
+	case received := <-android.send:
+		t.Fatalf("unsubscribed session delivered PC output %q", received)
+	default:
+	}
+	if _, ok := hub.subscriptions[unsubscribedSessionID]; ok {
+		t.Fatal("PC output created a subscription for the unsubscribed session")
+	}
+}
+
+func TestFlowControlAloneCannotEstablishSubscriptionOrRoute(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+
+	envelope := realtimewire.Envelope{
+		RecipientDeviceID: pcID[:],
+		MessageType:       realtimewire.FlowControl,
+		ACK:               7,
+	}
+	err := android.route(envelope, sessionID, []byte("flow-control-without-subscribe"))
+	if !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("FLOW_CONTROL without SUBSCRIBE error = %v, want ErrDenied", err)
+	}
+	if got := subscriptionCountForPeer(hub, android); got != 0 {
+		t.Fatalf("FLOW_CONTROL created %d subscription(s), want 0", got)
+	}
+	if _, ok := hub.subscriptions[sessionID]; ok {
+		t.Fatal("FLOW_CONTROL created a session route")
+	}
+	select {
+	case received := <-pc.send:
+		t.Fatalf("FLOW_CONTROL without subscription reached PC as %q", received)
+	default:
+	}
+}
+
+func TestAuthorizedSubscribeACKFencesTailFirstReplayAtSPlusOne(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	authority := newCountingRouteAuthority()
+	hub.store = authority
+	userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+	route := store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID}
+	authority.set(userID, androidID, sessionID, route, nil)
+
+	const ack uint64 = 40
+	for sequence := uint64(1); sequence <= ack+2; sequence++ {
+		envelope := realtimewire.Envelope{
+			RecipientDeviceID: androidID[:],
+			MessageType:       realtimewire.OutputChunk,
+			Sequence:          sequence,
+		}
+		if err := pc.routePCFrame(envelope, sessionID, androidID, replayTestFrame(sequence)); err != nil {
+			t.Fatalf("pre-subscription sequence %d: %v", sequence, err)
+		}
+	}
+	if got := pcRouteHighWater(pc, sessionID, androidID); got != ack+2 {
+		t.Fatalf("pre-subscription high-water = %d, want %d", got, ack+2)
+	}
+	select {
+	case received := <-android.send:
+		t.Fatalf("pre-subscription replay reached Android as %q", received)
+	default:
+	}
+
+	subscribeFrame := []byte("authorized-subscribe-ack-40")
+	subscribe := realtimewire.Envelope{
+		RecipientDeviceID: pcID[:],
+		MessageType:       realtimewire.Subscribe,
+		ACK:               ack,
+	}
+	if err := android.route(subscribe, sessionID, subscribeFrame); err != nil {
+		t.Fatalf("authorized SUBSCRIBE: %v", err)
+	}
+	hub.mu.RLock()
+	gotACK, ackPresent := android.subscriptionACKs[sessionID]
+	_, subscribed := hub.subscriptions[sessionID][androidID]
+	hub.mu.RUnlock()
+	if !subscribed || !ackPresent || gotACK != ack {
+		t.Fatalf("subscription state = subscribed:%v ack:%d present:%v, want subscribed with ACK %d", subscribed, gotACK, ackPresent, ack)
+	}
+	select {
+	case received := <-pc.send:
+		if string(received) != string(subscribeFrame) {
+			t.Fatalf("visible SUBSCRIBE frame = %q, want %q", received, subscribeFrame)
+		}
+	default:
+		t.Fatal("authorized SUBSCRIBE was not made visible to PC")
+	}
+
+	outOfOrder := realtimewire.Envelope{
+		RecipientDeviceID: androidID[:],
+		MessageType:       realtimewire.OutputChunk,
+		Sequence:          ack + 2,
+	}
+	if err := pc.routePCFrame(outOfOrder, sessionID, androidID, replayTestFrame(ack+2)); !errors.Is(err, errPCSequenceRejected) {
+		t.Fatalf("out-of-order S+2 replay error = %v, want sequence rejection", err)
+	}
+	select {
+	case received := <-android.send:
+		t.Fatalf("out-of-order replay reached Android as %q", received)
+	default:
+	}
+
+	for _, sequence := range []uint64{ack + 1, ack + 2} {
+		envelope := realtimewire.Envelope{
+			RecipientDeviceID: androidID[:],
+			MessageType:       realtimewire.OutputChunk,
+			Sequence:          sequence,
+		}
+		if err := pc.routePCFrame(envelope, sessionID, androidID, replayTestFrame(sequence)); err != nil {
+			t.Fatalf("ordered replay S+%d: %v", sequence-ack, err)
+		}
+		select {
+		case received := <-android.send:
+			want := replayTestFrame(sequence)
+			if string(received) != string(want) {
+				t.Fatalf("ordered replay S+%d frame = %q, want %q", sequence-ack, received, want)
+			}
+		default:
+			t.Fatalf("ordered replay S+%d did not reach Android", sequence-ack)
+		}
+	}
+
+	tampered := realtimewire.Envelope{
+		RecipientDeviceID: androidID[:],
+		MessageType:       realtimewire.OutputChunk,
+		Sequence:          ack + 1,
+	}
+	if err := pc.routePCFrame(tampered, sessionID, androidID, []byte("tampered-S-plus-1")); !errors.Is(err, errPCSequenceRejected) {
+		t.Fatalf("tampered S+1 replay error = %v, want sequence rejection", err)
+	}
+}
+
 func TestPCRouteCommitsWhileSubscriberIsTemporarilyUnavailable(t *testing.T) {
 	hub := NewHubWithObserver(nil, nil, nil, nil)
 	userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()

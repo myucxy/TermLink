@@ -139,27 +139,23 @@ class RendererCheckpointRepositoryTest {
         assertTrue(invalidReanchor is IllegalArgumentException)
         assertEquals(45uL, repository.ackCursorState(sessionId, direction)?.sequence)
 
-        val reanchored = repository.bindRendererCheckpoint(
-            sessionId,
-            direction,
-            bound.rendererGeneration,
-            snapshotId,
-            40u,
-            digest,
-        )
-        assertEquals(4L, reanchored.rendererGeneration)
-        assertEquals(40uL, reanchored.snapshotSequence)
-        assertEquals(40uL, reanchored.durableAcknowledgement)
+        val regressionFailure = runCatching {
+            repository.bindRendererCheckpoint(
+                sessionId,
+                direction,
+                bound.rendererGeneration,
+                snapshotId,
+                40u,
+                digest,
+            )
+        }.exceptionOrNull()
+        assertTrue(regressionFailure is IllegalArgumentException)
         assertEquals(
-            AckCursorState(sequence = 40u, rendererGeneration = 4L),
+            AckCursorState(sequence = 45u, rendererGeneration = bound.rendererGeneration),
             repository.ackCursorState(sessionId, direction),
         )
         assertEquals(40uL, repository.rendererCheckpointState(sessionId, direction)?.snapshotSequence)
-        assertTrue(
-            runCatching {
-                repository.putAckCursor(sessionId, direction, bound.rendererGeneration, 46u)
-            }.exceptionOrNull() is IllegalStateException,
-        )
+        assertEquals(46uL, repository.putAckCursor(sessionId, direction, bound.rendererGeneration, 46u))
     }
 
     @Test

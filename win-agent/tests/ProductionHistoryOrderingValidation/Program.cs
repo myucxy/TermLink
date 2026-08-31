@@ -27,7 +27,7 @@ internal static class Program
         internal readonly List<string> Operations = new();
         internal ulong ConfirmedLastOutputSequence;
         internal bool FailFirstSnapshot;
-        internal bool FailFirstTranscript;
+        internal bool FailFirstHistoryCursor;
         internal bool PauseFirstSnapshot;
         internal readonly TaskCompletionSource SnapshotCreateEntered =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -35,7 +35,7 @@ internal static class Program
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal readonly Dictionary<string, ulong> DurableSnapshotSequences = new(StringComparer.Ordinal);
         private bool snapshotFailed;
-        private bool transcriptFailed;
+        private bool historyCursorFailed;
         private bool snapshotPaused;
 
         internal OrderingHandler(
@@ -81,12 +81,32 @@ internal static class Program
             if (request.Method == HttpMethod.Get && path.EndsWith("/history", StringComparison.Ordinal))
             {
                 Operations.Add("CURSOR");
+                lock (sync)
+                {
+                    if (FailFirstHistoryCursor && !historyCursorFailed)
+                    {
+                        historyCursorFailed = true;
+                        return Json(HttpStatusCode.ServiceUnavailable, "{}"u8.ToArray());
+                    }
+                }
                 return Json(HttpStatusCode.OK, "{\"items\":[]}"u8.ToArray());
             }
             if (request.Method == HttpMethod.Post && path.EndsWith("/history/uploads", StringComparison.Ordinal))
             {
                 using var document = JsonDocument.Parse(body);
                 var kind = document.RootElement.GetProperty("kind").GetString();
+                if (kind == "SNAPSHOT")
+                {
+                    var formatName = document.RootElement.GetProperty("format_name").GetString();
+                    var formatVersion = document.RootElement.GetProperty("format_version").GetUInt32();
+                    if (formatName != SnapshotCrypto.TerminalCoreSnapshotFormatName ||
+                        formatVersion != SnapshotCrypto.TerminalCoreSnapshotFormatVersion)
+                    {
+                        throw new InvalidOperationException(
+                            "Snapshot create metadata did not use terminal-core V2: " +
+                            $"format_name={formatName}, format_version={formatVersion}.");
+                    }
+                }
                 var sequence = kind == "SNAPSHOT"
                     ? document.RootElement.GetProperty("snapshot_seq").GetUInt64()
                     : document.RootElement.TryGetProperty("as_of_snapshot_seq", out var anchor)
@@ -113,11 +133,6 @@ internal static class Program
                     if (kind == "SNAPSHOT" && FailFirstSnapshot && !snapshotFailed)
                     {
                         snapshotFailed = true;
-                        return Json(HttpStatusCode.ServiceUnavailable, "{}"u8.ToArray());
-                    }
-                    if (kind == "TRANSCRIPT" && FailFirstTranscript && !transcriptFailed)
-                    {
-                        transcriptFailed = true;
                         return Json(HttpStatusCode.ServiceUnavailable, "{}"u8.ToArray());
                     }
                 }
@@ -269,7 +284,7 @@ internal static class Program
             }, keyEpoch)
             {
                 FailFirstSnapshot = true,
-                FailFirstTranscript = true,
+                FailFirstHistoryCursor = true,
                 PauseFirstSnapshot = true
             };
             var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(5) };
@@ -278,7 +293,12 @@ internal static class Program
             httpField.SetValue(runtime, http);
 
             var store = Activator.CreateInstance(storeType, root, pcDeviceId);
-            var producer = Activator.CreateInstance(producerType, store, pcDeviceId);
+            var producer = Activator.CreateInstance(
+                producerType,
+                BindingFlags.Instance | BindingFlags.NonPublic,
+                binder: null,
+                args: new object[] { store, pcDeviceId, false, true, null },
+                culture: null);
             Field(runtimeType, "terminalHistoryStore").SetValue(runtime, store);
             Field(runtimeType, "terminalHistoryProducer").SetValue(runtime, producer);
             var sendType = typeof(Func<HttpMethod, string, byte[], bool, string, CancellationToken, Task<HttpResponseMessage>>);
@@ -442,7 +462,7 @@ internal static class Program
                 runtime,
                 new object[] { sessionId, events, production, CancellationToken.None });
             Require(!backgroundAttemptDurable,
-                "A failed background transcript was incorrectly reported as fully durable.");
+                "A failed background history cursor was incorrectly reported as fully durable.");
             var lastSnapshotIndex = handler.Operations.FindLastIndex(value => value == "SNAPSHOT");
             var firstBulkIndex = handler.Operations.FindIndex(
                 value => value == "CHUNK" || value == "TRANSCRIPT");
@@ -459,8 +479,8 @@ internal static class Program
                 new object[] { sessionId, events, production, CancellationToken.None });
             Require(retryDurable && handler.Operations.Count(value => value == "SNAPSHOT") == 3 &&
                 handler.Operations.Count(value => value == "CHUNK") == 2 &&
-                handler.Operations.Count(value => value == "TRANSCRIPT") >= 5,
-                "Multi-recipient retry duplicated durable Snapshot/CHUNK work or lost transcript progress: " +
+                !handler.Operations.Any(value => value == "TRANSCRIPT"),
+                "Multi-recipient retry duplicated durable Snapshot/CHUNK work or published retired transcript artifacts: " +
                 string.Join(", ", handler.Operations));
             Require(validationDeadline.Elapsed < TimeSpan.FromSeconds(10) &&
                 handler.DurableSnapshotSequences.Count == 2 &&

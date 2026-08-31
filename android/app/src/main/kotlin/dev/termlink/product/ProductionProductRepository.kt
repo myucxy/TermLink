@@ -391,6 +391,56 @@ internal fun <NetworkToken> realtimeNetworkObservationTransition(
     else -> RealtimeNetworkObservationTransition.UNCHANGED
 }
 
+internal data class RealtimeAppLifecycleState(
+    val earliestBackgroundAtMillis: Long? = null,
+    val lastForegroundGeneration: Long = 0,
+    val lastForegroundAtMillis: Long = 0,
+)
+
+internal data class RealtimeForegroundObservation(
+    val state: RealtimeAppLifecycleState,
+    val backgroundDurationMillis: Long?,
+    val accepted: Boolean,
+)
+
+/** Retains the earliest stop callback until one newer foreground consumes it. */
+internal fun recordRealtimeAppBackground(
+    state: RealtimeAppLifecycleState,
+    elapsedRealtimeMillis: Long,
+): RealtimeAppLifecycleState {
+    require(elapsedRealtimeMillis >= 0) { "elapsed realtime must not be negative" }
+    if (elapsedRealtimeMillis < state.lastForegroundAtMillis) return state
+    return state.copy(
+        earliestBackgroundAtMillis = minOf(
+            state.earliestBackgroundAtMillis ?: elapsedRealtimeMillis,
+            elapsedRealtimeMillis,
+        ),
+    )
+}
+
+/** Deduplicates foreground callbacks and returns null duration on first start. */
+internal fun observeRealtimeAppForeground(
+    state: RealtimeAppLifecycleState,
+    generation: Long,
+    elapsedRealtimeMillis: Long,
+): RealtimeForegroundObservation {
+    require(generation > 0) { "foreground generation must be positive" }
+    require(elapsedRealtimeMillis >= 0) { "elapsed realtime must not be negative" }
+    if (generation <= state.lastForegroundGeneration || elapsedRealtimeMillis < state.lastForegroundAtMillis) {
+        return RealtimeForegroundObservation(state, null, accepted = false)
+    }
+    val backgroundAt = state.earliestBackgroundAtMillis
+    return RealtimeForegroundObservation(
+        state = RealtimeAppLifecycleState(
+            earliestBackgroundAtMillis = null,
+            lastForegroundGeneration = generation,
+            lastForegroundAtMillis = elapsedRealtimeMillis,
+        ),
+        backgroundDurationMillis = backgroundAt?.let { (elapsedRealtimeMillis - it).coerceAtLeast(0) },
+        accepted = true,
+    )
+}
+
 private const val REMOTE_FILE_OPERATION_LIST = "LIST"
 private const val REMOTE_FILE_OPERATION_DOWNLOAD = "DOWNLOAD"
 private const val REMOTE_FILE_OPERATION_OPEN_TERMINAL = "OPEN_TERMINAL"
@@ -440,13 +490,30 @@ internal class ProductionProductRepository(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val connectivityManager = activity.getSystemService(ConnectivityManager::class.java)
     private val realtimeNetworkLock = Any()
+    private val realtimeLifecycleLock = Any()
     private var realtimeNetwork: Network? = null
     private var hasObservedRealtimeNetwork = false
     private var realtimeNetworkCallbackRegistered = false
     private val realtimeNetworkAvailableCount = AtomicInteger(0)
     private val realtimeNetworkLostCount = AtomicInteger(0)
     private val realtimeNetworkReconnectCount = AtomicInteger(0)
+    private var realtimeLifecycleState = RealtimeAppLifecycleState()
+    /** Foreground was observed while the default network was not yet validated. */
+    private var pendingRealtimeForegroundReconcile = false
+
+    private fun isRealtimeNetworkUsable(network: Network? = connectivityManager.activeNetwork): Boolean {
+        if (network == null) return false
+        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) &&
+            (Build.VERSION.SDK_INT < Build.VERSION_CODES.P ||
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_SUSPENDED))
+    }
+
     private fun observeRealtimeNetworkAvailable(network: Network) {
+        // onAvailable may precede validation. Do not consume the token until a
+        // later capability callback proves the default network is usable.
+        if (!isRealtimeNetworkUsable(network)) return
         val transition = synchronized(realtimeNetworkLock) {
             realtimeNetworkObservationTransition(
                 hasObservedNetwork = hasObservedRealtimeNetwork,
@@ -459,9 +526,15 @@ internal class ProductionProductRepository(
                 }
             }
         }
-        if (transition == RealtimeNetworkObservationTransition.UNCHANGED) return
-        realtimeNetworkAvailableCount.incrementAndGet()
-        if (transition == RealtimeNetworkObservationTransition.RECONNECTED) {
+        val consumePendingForeground = synchronized(realtimeLifecycleLock) {
+            pendingRealtimeForegroundReconcile.also {
+                pendingRealtimeForegroundReconcile = false
+            }
+        }
+        if (transition != RealtimeNetworkObservationTransition.UNCHANGED) {
+            realtimeNetworkAvailableCount.incrementAndGet()
+        }
+        if (transition == RealtimeNetworkObservationTransition.RECONNECTED || consumePendingForeground) {
             realtimeNetworkReconnectCount.incrementAndGet()
             scope.launch {
                 realtimeMultiplexer?.onNetworkAvailable()
@@ -573,6 +646,45 @@ internal class ProductionProductRepository(
         ),
     )
     override val snapshot: StateFlow<ProductSnapshot> = mutableSnapshot.asStateFlow()
+
+    override fun onAppBackgrounded(elapsedRealtimeMillis: Long) {
+        if (closed) return
+        synchronized(realtimeLifecycleLock) {
+            realtimeLifecycleState = recordRealtimeAppBackground(
+                realtimeLifecycleState,
+                elapsedRealtimeMillis,
+            )
+        }
+    }
+
+    override fun onAppForegrounded(generation: Long, elapsedRealtimeMillis: Long) {
+        if (closed) return
+        val observation = synchronized(realtimeLifecycleLock) {
+            observeRealtimeAppForeground(
+                realtimeLifecycleState,
+                generation,
+                elapsedRealtimeMillis,
+            ).also { realtimeLifecycleState = it.state }
+        }
+        if (!observation.accepted) return
+        val backgroundDurationMillis = observation.backgroundDurationMillis ?: return
+        if (!isRealtimeNetworkUsable()) {
+            synchronized(realtimeLifecycleLock) {
+                pendingRealtimeForegroundReconcile = true
+            }
+            // Close the race where capabilities became usable after the first
+            // query but before the pending bit was published. Either this path
+            // or the capability callback consumes the bit, never neither.
+            val consumeNow = isRealtimeNetworkUsable() && synchronized(realtimeLifecycleLock) {
+                pendingRealtimeForegroundReconcile.also {
+                    pendingRealtimeForegroundReconcile = false
+                }
+            }
+            if (consumeNow) realtimeMultiplexer?.onNetworkAvailable()
+            return
+        }
+        realtimeMultiplexer?.onAppForegrounded(backgroundDurationMillis, networkUsable = true)
+    }
     private val billingStateJob = scope.launch {
         billing.snapshot.collect { state ->
             mutableSnapshot.value = mutableSnapshot.value.copy(billing = state)
@@ -1286,6 +1398,10 @@ internal class ProductionProductRepository(
         val engine = NativeTerminalEngine(
             initialSize = TerminalSize(summary.columns.coerceAtLeast(1), summary.rows.coerceAtLeast(1)),
         )
+        // Start only the device-scoped handshake while REST chooses/restores a
+        // checkpoint. The bounded session endpoint is still registered after
+        // bootstrap so realtime ciphertext cannot overflow an unconsumed queue.
+        deviceRealtimeMultiplexer(stored).warmConnect()
         val restoredHistory = try {
             restoreLiveHistory(
                 session = summary,
@@ -1358,6 +1474,16 @@ internal class ProductionProductRepository(
                     if (sessionId in deletedSessionIds) {
                         DurableAckCommit(0, expectedGeneration + 1)
                     } else {
+                        val current = historyRepository.ackCursorState(
+                            sessionId,
+                            LIVE_OUTPUT_ACK_DIRECTION,
+                        ) ?: error("ACK cursor is unavailable during renderer reset")
+                        check(current.rendererGeneration == expectedGeneration) {
+                            "ACK renderer generation changed before renderer reset"
+                        }
+                        check(current.sequence == 0uL) {
+                            "A durable cumulative ACK cannot be reset to zero"
+                        }
                         val reset = historyRepository.resetAckCursor(
                             sessionId,
                             LIVE_OUTPUT_ACK_DIRECTION,
@@ -3615,18 +3741,23 @@ internal class ProductionProductRepository(
         suspend fun closeAndJoin() {
             val caller = currentCoroutineContext()[Job]
             val jobs = listOfNotNull(stateJob, tokenRefreshJob, recoveryJob)
-            close()
+            cancelJobs()
+            client.closeGracefully()
             jobs.filterNot { it === caller }.forEach { it.join() }
         }
 
         override fun close() {
+            cancelJobs()
+            client.close()
+        }
+
+        private fun cancelJobs() {
             stateJob?.cancel()
             stateJob = null
             tokenRefreshJob?.cancel()
             tokenRefreshJob = null
             recoveryJob?.cancel()
             recoveryJob = null
-            client.close()
         }
     }
 
@@ -4021,21 +4152,6 @@ internal class ProductionProductRepository(
         }
     }
 
-    private suspend fun resetLiveRendererAndCursor(
-        session: SessionSummary,
-        engine: TerminalEngine,
-        expectedRendererGeneration: Long,
-    ): RestoredLiveHistory = withContext(NonCancellable) {
-        engine.clear()
-        engine.resize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1))
-        val reset = historyRepository.resetAckCursor(
-            session.id,
-            LIVE_OUTPUT_ACK_DIRECTION,
-            expectedRendererGeneration,
-        )
-        RestoredLiveHistory(RendererBootstrapState.Empty(reset.rendererGeneration))
-    }
-
     private suspend fun openNativeTerminalSnapshot(
         session: SessionSummary,
         pc: PcSummary,
@@ -4099,64 +4215,185 @@ internal class ProductionProductRepository(
         } ?: return null
         if (bound.snapshot.metadata.formatName != HistoryRepository.TERMINAL_CORE_SNAPSHOT_FORMAT ||
             bound.snapshot.metadata.formatVersion != 2
-        ) return null
-        val tail = latestAuthoritativeSessionTail(session) ?: return null
-        if (!snapshotHasBoundedLiveSuffix(bound.snapshotSequence, tail)) return null
-        val opened = openNativeTerminalSnapshot(
-            session,
-            pc,
-            pcDevice,
-            stored,
-            bound.snapshot.metadata,
-            bound.snapshotRows,
-            bound.snapshotColumns,
-            bound.snapshot.ciphertext,
-        )
-        try {
-            val confirmedTail = latestAuthoritativeSessionTail(session) ?: return null
-            if (!snapshotHasBoundedLiveSuffix(bound.snapshotSequence, confirmedTail)) return null
-            return withContext(NonCancellable) {
-                val rebound = if (bound.durableAcknowledgement > bound.snapshotSequence) {
-                    historyRepository.bindRendererCheckpoint(
+        ) {
+            bound.snapshot.ciphertext.fill(0)
+            return null
+        }
+        if (!snapshotCanResumeThroughDurableAcknowledgement(
+                snapshotSequence = bound.snapshotSequence,
+                durableAcknowledgement = bound.durableAcknowledgement,
+            )
+        ) {
+            bound.snapshot.ciphertext.fill(0)
+            return null
+        }
+        val tail = latestAuthoritativeSessionTail(session)
+        if (tail == null) {
+            bound.snapshot.ciphertext.fill(0)
+            return null
+        }
+        if (tail < bound.durableAcknowledgement) {
+            bound.snapshot.ciphertext.fill(0)
+            throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+        }
+        if (!snapshotSuffixRestoreIsBounded(
+                snapshotSequence = bound.snapshotSequence,
+                durableAcknowledgement = bound.durableAcknowledgement,
+                authoritativeTail = tail,
+            )
+        ) {
+            bound.snapshot.ciphertext.fill(0)
+            return null
+        }
+        return try {
+            val opened = openNativeTerminalSnapshot(
+                session,
+                pc,
+                pcDevice,
+                stored,
+                bound.snapshot.metadata,
+                bound.snapshotRows,
+                bound.snapshotColumns,
+                bound.snapshot.ciphertext,
+            )
+            try {
+                val installed = try {
+                    engine.installCheckpoint(opened.checkpoint)
+                } catch (error: Exception) {
+                    throw classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_INSTALL)
+                }
+                    check(installed.sequence.toULong() == bound.snapshotSequence &&
+                        installed.size == TerminalSize(bound.snapshotColumns, bound.snapshotRows)
+                    ) { "Installed native checkpoint does not match its durable binding" }
+                    var restored = bound.snapshotSequence
+                    var localInputEpoch = opened.observedLocalInputEpoch.toLong()
+                    var currentTail = latestAuthoritativeSessionTail(session)
+                        ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_NOT_READY)
+                    if (currentTail < bound.durableAcknowledgement) {
+                        throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+                    }
+                    if (!snapshotSuffixRestoreIsBounded(
+                            snapshotSequence = bound.snapshotSequence,
+                            durableAcknowledgement = bound.durableAcknowledgement,
+                            authoritativeTail = currentTail,
+                        )
+                    ) {
+                        resetAbandonedSnapshotRenderer(session, engine)
+                        return null
+                    }
+                    while (!snapshotSuffixRestoreReady(
+                            restoredThroughSequence = restored,
+                            durableAcknowledgement = bound.durableAcknowledgement,
+                            authoritativeTail = currentTail,
+                        )
+                    ) {
+                        if (currentTail <= restored) {
+                            throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+                        }
+                        val requiredTarget = maxOf(
+                            restored + 1uL,
+                            bound.durableAcknowledgement,
+                        )
+                        val replayTarget = try {
+                            cacheStreamedHistoryRange(
+                                session = session,
+                                pc = pc,
+                                stored = stored,
+                                minimumTarget = requiredTarget,
+                                stopAfterSequence = restored,
+                                validateTargetBeforeCaching = { target ->
+                                    if (!snapshotSuffixReplayTargetIsBounded(
+                                            snapshotSequence = bound.snapshotSequence,
+                                            replayTarget = target,
+                                        )
+                                    ) throw SnapshotSuffixReplayLimitExceededException()
+                                },
+                            )
+                        } catch (_: SnapshotSuffixReplayLimitExceededException) {
+                            resetAbandonedSnapshotRenderer(session, engine)
+                            return null
+                        }
+                        if (!snapshotSuffixReplayTargetIsBounded(
+                                snapshotSequence = bound.snapshotSequence,
+                                replayTarget = replayTarget,
+                            )
+                        ) {
+                            resetAbandonedSnapshotRenderer(session, engine)
+                            return null
+                        }
+                        if (replayTarget > Long.MAX_VALUE.toULong()) {
+                            throw sessionOpenException(SessionOpenFailureCode.HISTORY_REPLAY)
+                        }
+                        val progress = replayCachedHistoryRange(
+                            session = session,
+                            pc = pc,
+                            pcDevice = pcDevice,
+                            stored = stored,
+                            engine = engine,
+                            afterSequence = restored,
+                            throughSequence = replayTarget,
+                            initialLocalInputEpoch = localInputEpoch,
+                        )
+                        restored = progress.restoredThrough
+                        localInputEpoch = progress.localInputEpoch
+                        currentTail = latestAuthoritativeSessionTail(session)
+                            ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_NOT_READY)
+                        if (currentTail < bound.durableAcknowledgement) {
+                            throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+                        }
+                        if (!snapshotSuffixRestoreIsBounded(
+                                snapshotSequence = bound.snapshotSequence,
+                                durableAcknowledgement = bound.durableAcknowledgement,
+                                authoritativeTail = currentTail,
+                            )
+                        ) {
+                            resetAbandonedSnapshotRenderer(session, engine)
+                            return null
+                        }
+                    }
+                    val persisted = historyRepository.putAckCursor(
                         sessionId = session.id,
                         direction = LIVE_OUTPUT_ACK_DIRECTION,
-                        expectedRendererGeneration = bound.rendererGeneration,
-                        snapshotId = bound.snapshot.metadata.id,
-                        snapshotSequence = bound.snapshotSequence,
-                        ciphertextSha256 = bound.snapshot.metadata.ciphertextSha256,
+                        rendererGeneration = bound.rendererGeneration,
+                        sequence = restored,
                     )
-                } else {
-                    bound
-                }
-                try {
-                    val installed = engine.installCheckpoint(opened.checkpoint)
-                    check(installed.sequence.toULong() == rebound.snapshotSequence &&
-                        installed.size == TerminalSize(rebound.snapshotColumns, rebound.snapshotRows)
-                    ) { "Installed native checkpoint does not match its durable binding" }
+                    check(persisted == restored) {
+                        "Snapshot suffix ACK was not persisted monotonically"
+                    }
                     RestoredLiveHistory(
                         rendererState = RendererBootstrapState.ExactCheckpoint(
-                            sequence = installed.sequence,
-                            rendererGeneration = rebound.rendererGeneration,
-                            snapshotId = rebound.snapshot.metadata.id,
-                            ciphertextSha256 = rebound.snapshot.metadata.ciphertextSha256,
+                            sequence = restored.toLong(),
+                            rendererGeneration = bound.rendererGeneration,
+                            snapshotId = bound.snapshot.metadata.id,
+                            ciphertextSha256 = bound.snapshot.metadata.ciphertextSha256,
+                            snapshotSequence = bound.snapshotSequence.toLong(),
                         ),
-                        localInputEpoch = opened.observedLocalInputEpoch.toLong(),
+                        localInputEpoch = localInputEpoch,
                         transcriptAnchor = TranscriptAnchor(
-                            rebound.snapshotSequence,
+                            bound.snapshotSequence,
                             opened.initialTranscriptBeforeLineId,
                         ),
-                        durableAcknowledgement = rebound.snapshotSequence,
+                        durableAcknowledgement = restored,
                         bootstrapSource = ProductBootstrapSource.BOUND_SNAPSHOT,
                     )
-                } catch (error: Exception) {
-                    resetLiveRendererAndCursor(session, engine, rebound.rendererGeneration)
-                    throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_INSTALL, error)
-                }
+            } finally {
+                opened.checkpoint.fill(0)
             }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: SessionOpenException) {
+            throw error
+        } catch (error: Exception) {
+            throw classifySessionOpenException(error, SessionFailureStage.HISTORY_REPLAY)
         } finally {
-            opened.checkpoint.fill(0)
             bound.snapshot.ciphertext.fill(0)
         }
+    }
+
+    /** Prevents a rejected local Snapshot/suffix from contaminating a later bootstrap strategy. */
+    private fun resetAbandonedSnapshotRenderer(session: SessionSummary, engine: TerminalEngine) {
+        engine.clear()
+        engine.resize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1))
     }
 
     private suspend fun restoreRemoteNativeTerminalSnapshot(
@@ -4236,7 +4473,6 @@ internal class ProductionProductRepository(
                             bootstrapSource = ProductBootstrapSource.REMOTE_SNAPSHOT,
                         )
                     } catch (error: Exception) {
-                        resetLiveRendererAndCursor(session, engine, bound.rendererGeneration)
                         throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_INSTALL, error)
                     }
                 }
@@ -4334,6 +4570,14 @@ internal class ProductionProductRepository(
             // the durable cursor and trigger a replay from sequence zero.
             throw sessionOpenException(SessionOpenFailureCode.LOCAL_CHECKPOINT, error)
         } ?: return null
+        if (!snapshotMatchesDurableAcknowledgement(
+                snapshotSequence = checkpoint.snapshotSequence,
+                durableAcknowledgement = checkpoint.durableAcknowledgement,
+            )
+        ) {
+            checkpoint.snapshot.ciphertext.fill(0)
+            return null
+        }
         val currentTail = try {
             latestAuthoritativeSessionTail(session)
         } catch (error: CancellationException) {
@@ -4356,22 +4600,7 @@ internal class ProductionProductRepository(
         val confirmedTail = latestAuthoritativeSessionTail(session) ?: return null
         if (!snapshotHasBoundedLiveSuffix(checkpoint.snapshotSequence, confirmedTail)) return null
         return withContext(NonCancellable) {
-            val bound = if (checkpoint.durableAcknowledgement > checkpoint.snapshotSequence) {
-                try {
-                    historyRepository.bindRendererCheckpoint(
-                        sessionId = session.id,
-                        direction = LIVE_OUTPUT_ACK_DIRECTION,
-                        expectedRendererGeneration = checkpoint.rendererGeneration,
-                        snapshotId = checkpoint.snapshot.metadata.id,
-                        snapshotSequence = checkpoint.snapshotSequence,
-                        ciphertextSha256 = checkpoint.snapshot.metadata.ciphertextSha256,
-                    )
-                } catch (error: Exception) {
-                    throw sessionOpenException(SessionOpenFailureCode.LOCAL_CHECKPOINT, error)
-                }
-            } else {
-                checkpoint
-            }
+            val bound = checkpoint
             try {
                 val installed = engine.installPrepared(prepared.checkpoint)
                 check(installed.sequence.toULong() == bound.snapshotSequence &&
@@ -4390,7 +4619,6 @@ internal class ProductionProductRepository(
                     bootstrapSource = ProductBootstrapSource.BOUND_SNAPSHOT,
                 )
             } catch (error: Exception) {
-                resetLiveRendererAndCursor(session, engine, bound.rendererGeneration)
                 throw classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_INSTALL)
             }
         }
@@ -4400,6 +4628,7 @@ internal class ProductionProductRepository(
         initialSession: SessionSummary,
         stored: DeviceKeyVault.StoredIdentity,
         authoritativeKeyEpoch: Long,
+        minimumSnapshotSequence: ULong = 0uL,
     ): TerminalSnapshotReadinessObservation? {
         return withApi(terminalSnapshotReadinessHttp) { api ->
             // The session list can become visible before its final snapshot is
@@ -4432,8 +4661,10 @@ internal class ProductionProductRepository(
                         // fills only its small bounded suffix. A genuinely old
                         // Snapshot is rejected so opening can never degrade to
                         // an unbounded prefix replay.
-                        val current = snapshotHasBoundedLiveSuffix(
-                            snapshotSequence = requireNotNull(value.metadata.snapshotSequence),
+                        val candidateSequence = requireNotNull(value.metadata.snapshotSequence)
+                        val current = candidateSequence >= minimumSnapshotSequence &&
+                            candidateSequence <= session.lastOutputSequence && snapshotHasBoundedLiveSuffix(
+                            snapshotSequence = candidateSequence,
                             currentSessionSequence = session.lastOutputSequence,
                         )
                         if (!current) observedFailure = SessionOpenFailure(SessionOpenFailureCode.SNAPSHOT_STALE)
@@ -4572,6 +4803,7 @@ internal class ProductionProductRepository(
         stored: DeviceKeyVault.StoredIdentity,
         minimumTarget: ULong,
         stopAfterSequence: ULong,
+        validateTargetBeforeCaching: (ULong) -> Unit = {},
     ): ULong = withApi(terminalSnapshotReadinessHttp) { api ->
         require(minimumTarget > stopAfterSequence) { "Streamed history target must advance" }
 
@@ -4601,6 +4833,7 @@ internal class ProductionProductRepository(
                 val end = metadata.endSequence
                 if (start == null || end == null) null else HistorySequenceRange(start, end)
             },
+            validateTargetBeforeCaching = validateTargetBeforeCaching,
             cacheCandidate = { item ->
                 val metadata = item.toHistoryObject(session.id)
                 val historyEpoch = historyKeyEpoch(stored.deviceId, metadata.keyId)
@@ -4661,6 +4894,8 @@ internal class ProductionProductRepository(
         val restoredThrough: ULong,
         val localInputEpoch: Long,
     )
+
+    private class SnapshotSuffixReplayLimitExceededException : RuntimeException()
 
     /** Replays cached ciphertext one immutable CHUNK at a time. */
     private suspend fun replayCachedHistoryRange(
@@ -4888,10 +5123,6 @@ internal class ProductionProductRepository(
                     bootstrapSource = ProductBootstrapSource.REMOTE_SNAPSHOT,
                 )
             },
-            resetAfterInstallFailure = { bound ->
-                resetLiveRendererAndCursor(session, engine, bound.rendererGeneration)
-                throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_INSTALL)
-            },
             onLoadFailure = { error ->
                 onFailure(classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_DOWNLOAD).failure)
             },
@@ -4953,7 +5184,12 @@ internal class ProductionProductRepository(
                 var lastObservation: TerminalSnapshotReadinessObservation? = null
                 for (pauseMillis in TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS) {
                     currentCoroutineContext().ensureActive()
-                    val observation = latestTerminalSnapshot(session, stored, pc.keyEpoch)
+                    val observation = latestTerminalSnapshot(
+                        session,
+                        stored,
+                        pc.keyEpoch,
+                        minimumSnapshotSequence = cursor.sequence,
+                    )
                     lastObservation = observation
                     if (observation?.snapshot != null ||
                         observation?.lastOutputSequence == 0uL ||
@@ -4994,20 +5230,17 @@ internal class ProductionProductRepository(
         ) {
             return RestoredLiveHistory(RendererBootstrapState.Empty(cursor.rendererGeneration))
         }
-        var activeRendererGeneration = cursor.rendererGeneration
-        suspend fun resetRendererAndCursor(): RestoredLiveHistory =
-            resetLiveRendererAndCursor(session, engine, activeRendererGeneration).also { reset ->
-                activeRendererGeneration = reset.rendererState.rendererGeneration
-            }
+        if (!fullPrefixReplayCanPreserveDurableAcknowledgement(cursor.sequence)) {
+            throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+        }
+        val activeRendererGeneration = cursor.rendererGeneration
         val initialTail = latestAuthoritativeTail
         if (initialTail == 0uL) {
             if (cursor.sequence == 0uL) {
                 return RestoredLiveHistory(RendererBootstrapState.Empty(cursor.rendererGeneration))
             }
-            resetRendererAndCursor()
             throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
         }
-        resetRendererAndCursor()
         var restored = 0uL
         var localInputEpoch = 0L
         return try {
@@ -5068,13 +5301,10 @@ internal class ProductionProductRepository(
                 bootstrapSource = ProductBootstrapSource.NATIVE_FULL_PREFIX,
             )
         } catch (error: CancellationException) {
-            resetRendererAndCursor()
             throw error
         } catch (error: SessionOpenException) {
-            resetRendererAndCursor()
             throw error
         } catch (error: Exception) {
-            resetRendererAndCursor()
             throw classifySessionOpenException(error, SessionFailureStage.HISTORY_REPLAY)
         }
     }
@@ -5162,6 +5392,34 @@ internal class ProductionProductRepository(
                         it.trustState == DeviceTrustState.TRUSTED
                 } ?: return
                 val activeGap = live.client.sessionState.value as? RemoteSessionState.HistoryGap ?: return
+                if (!fullPrefixReplayCanPreserveDurableAcknowledgement(
+                        activeGap.lastAckedSequence.toULong(),
+                    )
+                ) {
+                    // A raw prefix rebuild would either regress the durable ACK
+                    // or advertise a cursor whose renderer has been cleared.
+                    // Fence this incarnation and reopen through the normal
+                    // Snapshot + bounded suffix bootstrap instead.
+                    val removed = synchronized(liveSessionLock) {
+                        liveSessions.remove(sessionId, live)
+                    }
+                    if (removed) {
+                        scope.launch {
+                            try {
+                                // Teardown is a same-session durable-write barrier:
+                                // the retired ACK worker must finish before the new
+                                // Snapshot bootstrap reads and reuses its cursor generation.
+                                live.closeAndJoin()
+                                openSession(sessionId)
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: Throwable) {
+                                publishFailure(error)
+                            }
+                        }
+                    }
+                    return
+                }
                 val missingEnd = activeGap.receivedSequence - 1
                 val recovery = if (missingEnd > 0) {
                     loadLiveHistoryEvents(session, pc, pcDevice, identity(), missingEnd)
@@ -5551,6 +5809,7 @@ internal suspend fun <Candidate> cacheContiguousHistoryRange(
     firstPage: StreamedHistoryCatalogPage<Candidate>,
     loadNextPage: suspend (String) -> StreamedHistoryCatalogPage<Candidate>,
     sequenceRange: (Candidate) -> HistorySequenceRange?,
+    validateTargetBeforeCaching: (ULong) -> Unit = {},
     cacheCandidate: suspend (Candidate) -> Unit,
 ): ULong {
     require(minimumTarget > stopAfterSequence) { "Streamed history target must advance" }
@@ -5573,6 +5832,10 @@ internal suspend fun <Candidate> cacheContiguousHistoryRange(
                 if (range.endInclusive < minimumTarget) {
                     throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
                 }
+                // A bounded Snapshot suffix supplies its immutable-catalog
+                // ceiling here. Rejecting before the first cache callback keeps
+                // both network work and Room writes inside the advertised cap.
+                validateTargetBeforeCaching(range.endInclusive)
                 target = range.endInclusive
                 expectedEnd = range.endInclusive
             }
@@ -6313,6 +6576,51 @@ internal fun snapshotHasBoundedLiveSuffix(
     snapshotSequence <= currentSessionSequence &&
     currentSessionSequence - snapshotSequence <= TERMINAL_SNAPSHOT_MAX_LIVE_SUFFIX_EVENTS.toULong()
 
+internal fun snapshotCanResumeThroughDurableAcknowledgement(
+    snapshotSequence: ULong,
+    durableAcknowledgement: ULong,
+): Boolean = snapshotSequence <= durableAcknowledgement
+
+internal fun snapshotMatchesDurableAcknowledgement(
+    snapshotSequence: ULong,
+    durableAcknowledgement: ULong,
+): Boolean = snapshotSequence == durableAcknowledgement
+
+internal fun snapshotSuffixRestoreReady(
+    restoredThroughSequence: ULong,
+    durableAcknowledgement: ULong,
+    authoritativeTail: ULong,
+): Boolean = restoredThroughSequence >= durableAcknowledgement &&
+    tailReplayHasBoundedRealtimeSuffix(restoredThroughSequence, authoritativeTail)
+
+internal fun snapshotSuffixRestoreIsBounded(
+    snapshotSequence: ULong,
+    durableAcknowledgement: ULong,
+    authoritativeTail: ULong,
+    maximumEvents: Int = TERMINAL_BOUNDED_REPLAY_MAX_EVENTS,
+): Boolean {
+    require(maximumEvents > 0) { "Snapshot suffix limit must be positive" }
+    return snapshotSequence > 0uL &&
+        snapshotSequence <= durableAcknowledgement &&
+        durableAcknowledgement <= authoritativeTail &&
+        authoritativeTail - snapshotSequence <= maximumEvents.toULong()
+}
+
+internal fun snapshotSuffixReplayTargetIsBounded(
+    snapshotSequence: ULong,
+    replayTarget: ULong,
+    maximumEvents: Int = TERMINAL_BOUNDED_REPLAY_MAX_EVENTS,
+): Boolean {
+    require(maximumEvents > 0) { "Snapshot suffix limit must be positive" }
+    return snapshotSequence > 0uL &&
+        replayTarget >= snapshotSequence &&
+        replayTarget - snapshotSequence <= maximumEvents.toULong()
+}
+
+internal fun fullPrefixReplayCanPreserveDurableAcknowledgement(
+    durableAcknowledgement: ULong,
+): Boolean = durableAcknowledgement == 0uL
+
 internal fun terminalSnapshotRuntimeNegotiated(
     localRuntimeEnabled: Boolean,
     pcCapabilities: Set<String>,
@@ -6397,8 +6705,10 @@ internal const val MAX_TRANSCRIPT_ANCHOR_REBASES = 8
 internal const val TERMINAL_SNAPSHOT_MAX_LIVE_SUFFIX_EVENTS = 128
 
 /**
- * Separates the reversible snapshot work from the durable ACK/checkpoint bind.
- * Once [bind] succeeds, failures must reset that exact generation or propagate.
+ * Separates reversible Snapshot work from the durable ACK/checkpoint bind.
+ * Once [bind] succeeds its cursor is monotonic: an installation failure is
+ * propagated so no socket can subscribe until a later open retries the same
+ * durable binding successfully.
  */
 internal suspend fun <Loaded, Prepared, Bound, Restored> prepareBindInstallSnapshot(
     loadAndCache: suspend () -> Loaded,
@@ -6406,7 +6716,6 @@ internal suspend fun <Loaded, Prepared, Bound, Restored> prepareBindInstallSnaps
     preparedIsCurrent: suspend (Prepared) -> Boolean = { true },
     bind: suspend () -> Bound,
     installAndMap: suspend (Prepared, Bound) -> Restored,
-    resetAfterInstallFailure: suspend (Bound) -> Restored,
     onLoadFailure: (Exception) -> Unit = {},
     onPrepareFailure: (Exception) -> Unit = {},
 ): Restored? {
@@ -6429,11 +6738,7 @@ internal suspend fun <Loaded, Prepared, Bound, Restored> prepareBindInstallSnaps
     if (!preparedIsCurrent(prepared)) return null
     return withContext(NonCancellable) {
         val bound = bind()
-        try {
-            installAndMap(prepared, bound)
-        } catch (_: Exception) {
-            resetAfterInstallFailure(bound)
-        }
+        installAndMap(prepared, bound)
     }
 }
 

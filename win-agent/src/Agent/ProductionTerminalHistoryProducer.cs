@@ -71,11 +71,14 @@ namespace TermLink.Agent
                 bool terminalCoreSnapshotAuthorityEnabled,
                 Action<IReadOnlyList<PortableTerminalRowV1>> transcriptArchiveSink)
             {
-                Model = new PortableTerminalModelV1(
-                    DefaultColumns,
-                    DefaultRows,
-                    transcriptArchiveSink);
-                if (!terminalCoreSnapshotAuthorityEnabled) return;
+                if (!terminalCoreSnapshotAuthorityEnabled)
+                {
+                    Model = new PortableTerminalModelV1(
+                        DefaultColumns,
+                        DefaultRows,
+                        transcriptArchiveSink);
+                    return;
+                }
                 try
                 {
                     TerminalCore = NativeTerminalCoreV2.Create(
@@ -148,9 +151,12 @@ namespace TermLink.Agent
             this.store = store ?? throw new ArgumentNullException(nameof(store));
             if (pcDeviceId == Guid.Empty) throw new ArgumentException("PC device ID is required.", nameof(pcDeviceId));
             this.pcDeviceId = pcDeviceId;
-            this.terminalCoreShadowEnabled = terminalCoreShadowEnabled;
+            // Once terminal-core is the production authority, a second native shadow adds
+            // another parser without providing an independent implementation to compare.
+            this.terminalCoreShadowEnabled =
+                terminalCoreShadowEnabled && !terminalCoreSnapshotAuthorityEnabled;
             this.terminalCoreSnapshotAuthorityEnabled = terminalCoreSnapshotAuthorityEnabled;
-            if (terminalCoreShadowEnabled)
+            if (this.terminalCoreShadowEnabled)
             {
                 terminalCoreShadowDispatcher = new ProductionTerminalCoreShadowDispatcher(
                     terminalCoreShadowObserver);
@@ -339,7 +345,7 @@ namespace TermLink.Agent
                 if (shouldYield?.Invoke() == true) return null;
                 var frame = state.PendingFrames[sequence];
                 if (terminalCoreSnapshotAuthorityEnabled) ApplyTerminalCoreFrame(state, frame);
-                ApplyFrame(state.Model, frame);
+                else ApplyFrame(state.Model, frame);
                 shadowFrames?.Add(frame);
                 ApplyProjection(
                     frame,
@@ -378,7 +384,8 @@ namespace TermLink.Agent
                 // Resize/Title/Lifecycle at S+1 is replayed as a normal suffix.
                 LastSequence = state.AppliedSequence
             };
-            if (state.Model.Columns > MaximumWireColumns || state.Model.Rows > MaximumWireRows)
+            if (!terminalCoreSnapshotAuthorityEnabled &&
+                (state.Model.Columns > MaximumWireColumns || state.Model.Rows > MaximumWireRows))
             {
                 shadowDispatch = CreateShadowDispatchRequest(
                     sessionId,
@@ -391,7 +398,9 @@ namespace TermLink.Agent
                 if (persistLegacyArtifacts) SaveRejectedCheckpoint(result);
                 return result;
             }
-            if (!state.Model.TryCreateSnapshot(out var portable))
+            PortableTerminalSnapshotV1 portable = null;
+            if (!terminalCoreSnapshotAuthorityEnabled &&
+                !state.Model.TryCreateSnapshot(out portable))
             {
                 result.PermanentlyIneligible = !string.IsNullOrWhiteSpace(
                     state.Model.PermanentRejectionCode);
@@ -421,6 +430,9 @@ namespace TermLink.Agent
                 result.IneligibilityCode = "LEGACY_PUBLICATION_DISABLED";
                 return result;
             }
+
+            if (terminalCoreSnapshotAuthorityEnabled)
+                return ProduceTerminalCoreCheckpoint(sessionId, state, result);
 
             var styleTable = BuildStyleTable(portable);
             var profileError = ValidateTermuxProfile(portable, styleTable);
@@ -460,65 +472,12 @@ namespace TermLink.Agent
             }
 
             byte[] snapshotBytes;
-            if (terminalCoreSnapshotAuthorityEnabled)
-            {
-                if (state.TerminalCore == null)
-                {
-                    result.PermanentlyIneligible = true;
-                    return RejectCheckpoint(
-                        result,
-                        string.IsNullOrWhiteSpace(state.TerminalCoreFailureCode)
-                            ? "NATIVE_UNAVAILABLE"
-                            : state.TerminalCoreFailureCode,
-                        permanentlyIneligible: true);
-                }
-                try
-                {
-                    if (!state.TerminalCore.TryCaptureCheckpoint(out var checkpoint, out var status))
-                    {
-                        return RejectCheckpoint(
-                            result,
-                            "NATIVE_" + status.ToString().ToUpperInvariant());
-                    }
-                    using (checkpoint)
-                    {
-                        if (checkpoint.Info.NextSourceSequence != checked(snapshot.SnapshotSeq + 1))
-                            throw new InvalidDataException(
-                                "terminal-core checkpoint source sequence does not match the durable anchor.");
-                        var frameBytes = checkpoint.ExportRenderFrameV3();
-                        try
-                        {
-                            var frame = NativeTerminalRenderFrameV3Decoder.Decode(frameBytes);
-                            if (frame.NextSourceSequence != checkpoint.Info.NextSourceSequence ||
-                                frame.Columns != snapshot.Columns || frame.Rows != snapshot.Rows)
-                            {
-                                throw new InvalidDataException(
-                                    "terminal-core checkpoint dimensions do not match the durable projection.");
-                            }
-                        }
-                        finally { CryptographicOperations.ZeroMemory(frameBytes); }
-                        snapshotBytes = checkpoint.ExportSnapshot();
-                    }
-                }
-                catch (Exception error)
-                {
-                    state.TerminalCoreFailureCode = NativeFailureCode(error);
-                    state.Dispose();
-                    return RejectCheckpoint(
-                        result,
-                        state.TerminalCoreFailureCode,
-                        permanentlyIneligible: true);
-                }
-            }
-            else
-            {
-                snapshotBytes = snapshot.ToByteArray();
-            }
+            snapshotBytes = snapshot.ToByteArray();
             var pageBytes = pages.Select(value => value.ToByteArray()).ToList();
             var sizeError = ValidateArtifactSizes(
                 snapshotBytes,
                 pageBytes,
-                terminalCoreSnapshotAuthorityEnabled);
+                terminalCoreSnapshot: false);
             if (sizeError != null)
             {
                 CryptographicOperations.ZeroMemory(snapshotBytes);
@@ -527,22 +486,24 @@ namespace TermLink.Agent
             }
             try
             {
-                store.SaveCheckpoint(new ProductionTerminalHistoryCheckpoint
+                var checkpoint = new ProductionTerminalHistoryCheckpoint
                 {
                     SessionId = sessionId,
                     LastSequence = portable.Sequence,
+                    AuthorityVersion = 1,
                     SnapshotEligible = true,
                     IneligibilityCode = string.Empty,
                     SnapshotPlaintext = snapshotBytes,
                     TranscriptPlaintexts = pageBytes
-                });
-                store.SaveOutbox(BuildOutbox(
+                };
+                var outbox = BuildOutbox(
                     sessionId,
                     snapshot,
                     pages,
                     snapshotBytes,
                     pageBytes,
-                    terminalCoreSnapshotAuthorityEnabled));
+                    terminalCoreSnapshot: false);
+                store.SaveProduction(checkpoint, outbox);
             }
             finally
             {
@@ -551,6 +512,111 @@ namespace TermLink.Agent
             }
             result.SnapshotEligible = true;
             result.TranscriptPageCount = pages.Count;
+            result.IneligibilityCode = string.Empty;
+            return result;
+        }
+
+        private ProductionTerminalHistoryProductionResult ProduceTerminalCoreCheckpoint(
+            Guid sessionId,
+            ProductionState state,
+            ProductionTerminalHistoryProductionResult result)
+        {
+            if (state.TerminalCore == null)
+            {
+                result.PermanentlyIneligible = true;
+                return RejectCheckpoint(
+                    result,
+                    string.IsNullOrWhiteSpace(state.TerminalCoreFailureCode)
+                        ? "NATIVE_UNAVAILABLE"
+                        : state.TerminalCoreFailureCode,
+                    permanentlyIneligible: true);
+            }
+
+            byte[] snapshotBytes = null;
+            int snapshotColumns;
+            int snapshotRows;
+            try
+            {
+                if (!state.TerminalCore.TryCaptureCheckpoint(out var checkpoint, out var status))
+                    return RejectCheckpoint(result, "NATIVE_" + status.ToString().ToUpperInvariant());
+                using (checkpoint)
+                {
+                    if (checkpoint.Info.NextSourceSequence != checked(state.AppliedSequence + 1))
+                        throw new InvalidDataException(
+                            "terminal-core checkpoint source sequence does not match the durable anchor.");
+                    var frameBytes = checkpoint.ExportRenderFrameV3();
+                    NativeTerminalRenderFrameV3 frame;
+                    try
+                    {
+                        frame = NativeTerminalRenderFrameV3Decoder.Decode(frameBytes);
+                        if (frame.NextSourceSequence != checkpoint.Info.NextSourceSequence ||
+                            frame.Columns < 1 || frame.Columns > MaximumWireColumns ||
+                            frame.Rows < 1 || frame.Rows > MaximumWireRows)
+                        {
+                            throw new InvalidDataException(
+                                "terminal-core checkpoint presentation metadata is invalid.");
+                        }
+                    }
+                    finally { CryptographicOperations.ZeroMemory(frameBytes); }
+
+                    snapshotColumns = frame.Columns;
+                    snapshotRows = frame.Rows;
+                    snapshotBytes = checkpoint.ExportSnapshot();
+                }
+            }
+            catch (Exception error)
+            {
+                state.TerminalCoreFailureCode = NativeFailureCode(error);
+                state.Dispose();
+                return RejectCheckpoint(
+                    result,
+                    state.TerminalCoreFailureCode,
+                    permanentlyIneligible: true);
+            }
+
+            try
+            {
+                var sizeError = ValidateArtifactSizes(
+                    snapshotBytes,
+                    Array.Empty<byte[]>(),
+                    terminalCoreSnapshot: true);
+                if (sizeError != null) return RejectCheckpoint(result, sizeError);
+
+                // The canonical native checkpoint owns the bounded scrollback restored by
+                // Android. Legacy transcript pages are a compatibility artifact of the
+                // retired Portable projection and must not gate or describe native state.
+                // Line ID 1 is the protocol's non-zero sentinel for an empty external
+                // transcript prefix; Android restores the checkpoint and its live suffix.
+                const ulong initialTranscriptBeforeLineId = 1;
+                var productionCheckpoint = new ProductionTerminalHistoryCheckpoint
+                {
+                    SessionId = sessionId,
+                    LastSequence = state.AppliedSequence,
+                    // V2 marks the terminal-core-only authority whose canonical
+                    // checkpoint includes bounded native scrollback.
+                    AuthorityVersion = 2,
+                    SnapshotEligible = true,
+                    IneligibilityCode = string.Empty,
+                    SnapshotPlaintext = snapshotBytes,
+                    TranscriptPlaintexts = new List<byte[]>()
+                };
+                var productionOutbox = BuildTerminalCoreOutbox(
+                    sessionId,
+                    state.AppliedSequence,
+                    snapshotColumns,
+                    snapshotRows,
+                    initialTranscriptBeforeLineId,
+                    state.LocalInputEpoch,
+                    snapshotBytes);
+                store.SaveProduction(productionCheckpoint, productionOutbox);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(snapshotBytes);
+            }
+
+            result.SnapshotEligible = true;
+            result.TranscriptPageCount = 0;
             result.IneligibilityCode = string.Empty;
             return result;
         }
@@ -742,6 +808,7 @@ namespace TermLink.Agent
             {
                 SessionId = result.SessionId,
                 LastSequence = result.LastSequence,
+                AuthorityVersion = terminalCoreSnapshotAuthorityEnabled ? 2 : 1,
                 SnapshotEligible = false,
                 IneligibilityCode = result.IneligibilityCode,
                 SnapshotPlaintext = null,
@@ -1544,6 +1611,40 @@ namespace TermLink.Agent
                 });
             }
             return outbox;
+        }
+
+        private static ProductionTerminalHistoryOutbox BuildTerminalCoreOutbox(
+            Guid sessionId,
+            ulong snapshotSequence,
+            int columns,
+            int rows,
+            ulong initialTranscriptBeforeLineId,
+            ulong observedLocalInputEpoch,
+            byte[] snapshotBytes)
+        {
+            return new ProductionTerminalHistoryOutbox
+            {
+                SessionId = sessionId,
+                SnapshotSequence = snapshotSequence,
+                Artifacts = new List<ProductionTerminalHistoryArtifact>
+                {
+                    new ProductionTerminalHistoryArtifact
+                    {
+                        ArtifactId = "snapshot-" + snapshotSequence.ToString("D20"),
+                        Kind = ProductionTerminalHistoryArtifactKind.Snapshot,
+                        UploadOrder = 0,
+                        SnapshotSequence = snapshotSequence,
+                        InitialTranscriptBeforeLineId = initialTranscriptBeforeLineId,
+                        ObservedLocalInputEpoch = observedLocalInputEpoch,
+                        TranscriptPageCount = 0,
+                        Columns = columns,
+                        Rows = rows,
+                        FormatName = SnapshotCrypto.TerminalCoreSnapshotFormatName,
+                        FormatVersion = checked((int)SnapshotCrypto.TerminalCoreSnapshotFormatVersion),
+                        Plaintext = (byte[])snapshotBytes.Clone()
+                    }
+                }
+            };
         }
 
         private byte[] SealArtifact(

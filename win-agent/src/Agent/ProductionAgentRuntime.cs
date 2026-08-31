@@ -1925,6 +1925,7 @@ namespace TermLink.Agent
             var checkpoint = terminalHistoryProducer.LoadCheckpoint(sessionId);
             var outbox = terminalHistoryProducer.LoadOutbox(sessionId);
             if (checkpoint == null || outbox == null || !checkpoint.SnapshotEligible ||
+                checkpoint.AuthorityVersion < 2 ||
                 checkpoint.LastSequence == 0 || outbox.SnapshotSequence != checkpoint.LastSequence)
             {
                 return null;
@@ -1938,7 +1939,12 @@ namespace TermLink.Agent
             var snapshots = outbox.Artifacts
                 .Where(value => value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot)
                 .ToList();
-            if (snapshots.Count != 1 || snapshots[0].SnapshotSequence != checkpoint.LastSequence)
+            if (snapshots.Count != 1 || snapshots[0].SnapshotSequence != checkpoint.LastSequence ||
+                snapshots[0].FormatName != SnapshotCrypto.TerminalCoreSnapshotFormatName ||
+                snapshots[0].FormatVersion != SnapshotCrypto.TerminalCoreSnapshotFormatVersion ||
+                !CryptographicOperations.FixedTimeEquals(
+                    checkpoint.SnapshotPlaintext,
+                    snapshots[0].Plaintext))
                 return null;
             return new ProductionTerminalHistoryProductionResult
             {

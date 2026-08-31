@@ -30,6 +30,66 @@ import org.junit.Test
 
 class ProductContractsTest {
     @Test
+    fun realtimeForegroundLifecycleKeepsEarliestBackgroundAndDeduplicatesGeneration() {
+        val initial = observeRealtimeAppForeground(RealtimeAppLifecycleState(), 1, 1_000)
+        assertTrue(initial.accepted)
+        assertEquals(null, initial.backgroundDurationMillis)
+
+        val firstStop = recordRealtimeAppBackground(initial.state, 2_000)
+        val duplicateStop = recordRealtimeAppBackground(firstStop, 5_000)
+        assertEquals(2_000L, duplicateStop.earliestBackgroundAtMillis)
+
+        val resumed = observeRealtimeAppForeground(duplicateStop, 2, 18_250)
+        assertTrue(resumed.accepted)
+        assertEquals(16_250L, resumed.backgroundDurationMillis)
+        assertEquals(null, resumed.state.earliestBackgroundAtMillis)
+
+        val duplicateForeground = observeRealtimeAppForeground(resumed.state, 2, 19_000)
+        assertFalse(duplicateForeground.accepted)
+        assertEquals(resumed.state, duplicateForeground.state)
+    }
+
+    @Test
+    fun delayedBackgroundCannotMoveLifecycleBehindLatestForeground() {
+        val foreground = observeRealtimeAppForeground(RealtimeAppLifecycleState(), 4, 10_000).state
+        assertEquals(foreground, recordRealtimeAppBackground(foreground, 9_999))
+    }
+
+    @Test
+    fun nativeCheckpointCanResumeBehindAckOnlyByReplayingItsSuffix() {
+        assertTrue(snapshotCanResumeThroughDurableAcknowledgement(42uL, 42uL))
+        assertTrue(snapshotCanResumeThroughDurableAcknowledgement(41uL, 42uL))
+        assertFalse(snapshotCanResumeThroughDurableAcknowledgement(43uL, 42uL))
+        assertTrue(snapshotMatchesDurableAcknowledgement(42uL, 42uL))
+        assertFalse(snapshotMatchesDurableAcknowledgement(41uL, 42uL))
+    }
+
+    @Test
+    fun snapshotSuffixMustReachOriginalAckBeforeRealtimeSubscribe() {
+        assertFalse(snapshotSuffixRestoreReady(8_999uL, 9_000uL, 10_000uL))
+        assertTrue(snapshotSuffixRestoreReady(9_000uL, 9_000uL, 10_000uL))
+        assertTrue(snapshotSuffixRestoreReady(9_001uL, 9_000uL, 10_000uL))
+        assertFalse(snapshotSuffixRestoreReady(6_000uL, 9_000uL, 10_000uL))
+        assertFalse(snapshotSuffixRestoreReady(9_000uL, 9_000uL, 20_000uL))
+        assertTrue(snapshotSuffixRestoreReady(15_904uL, 9_000uL, 20_000uL))
+        assertFalse(snapshotSuffixRestoreReady(15_903uL, 9_000uL, 20_000uL))
+        assertTrue(snapshotSuffixRestoreIsBounded(5_904uL, 9_000uL, 10_000uL))
+        assertFalse(snapshotSuffixRestoreIsBounded(5_903uL, 9_000uL, 10_000uL))
+        assertFalse(snapshotSuffixRestoreIsBounded(9_001uL, 9_000uL, 10_000uL))
+        assertFalse(snapshotSuffixRestoreIsBounded(9_000uL, 10_001uL, 10_000uL))
+        assertTrue(fullPrefixReplayCanPreserveDurableAcknowledgement(0uL))
+        assertFalse(fullPrefixReplayCanPreserveDurableAcknowledgement(1uL))
+    }
+
+    @Test
+    fun snapshotSuffixBoundIsRecheckedAgainstMovingAuthorityAndReplayTargets() {
+        assertTrue(snapshotSuffixRestoreIsBounded(100uL, 200uL, 4_100uL))
+        assertFalse(snapshotSuffixRestoreIsBounded(100uL, 200uL, 6_000uL))
+        assertTrue(snapshotSuffixReplayTargetIsBounded(100uL, 4_196uL))
+        assertFalse(snapshotSuffixReplayTargetIsBounded(100uL, 4_197uL))
+    }
+
+    @Test
     fun realtimeNetworkCapabilityFallbackDeduplicatesAndReconnectsAfterLoss() {
         assertEquals(
             RealtimeNetworkObservationTransition.INITIAL,
@@ -262,6 +322,97 @@ class ProductContractsTest {
 
         assertEquals(SessionOpenFailureCode.HISTORY_GAP, error.failure.code)
         assertEquals(listOf(HistorySequenceRange(91uL, 100uL)), cached)
+    }
+
+    @Test
+    fun snapshotSuffixCachesExactlyFromAnchorThroughDurableAck() = runBlocking {
+        val cached = mutableListOf<HistorySequenceRange>()
+
+        val restoredThrough = cacheContiguousHistoryRange(
+            minimumTarget = 600uL,
+            stopAfterSequence = 500uL,
+            firstPage = StreamedHistoryCatalogPage(
+                items = listOf(
+                    HistorySequenceRange(576uL, 600uL),
+                    HistorySequenceRange(551uL, 575uL),
+                    HistorySequenceRange(526uL, 550uL),
+                    HistorySequenceRange(501uL, 525uL),
+                ),
+                hasMore = false,
+                nextCursor = null,
+            ),
+            loadNextPage = { error("snapshot suffix fits one page") },
+            sequenceRange = { it },
+            cacheCandidate = { cached += it },
+        )
+
+        assertEquals(600uL, restoredThrough)
+        assertEquals(
+            listOf(
+                HistorySequenceRange(576uL, 600uL),
+                HistorySequenceRange(551uL, 575uL),
+                HistorySequenceRange(526uL, 550uL),
+                HistorySequenceRange(501uL, 525uL),
+            ),
+            cached,
+        )
+        assertTrue(snapshotSuffixRestoreReady(restoredThrough, 600uL, 700uL))
+    }
+
+    @Test
+    fun snapshotSuffixTargetCeilingRejectsBeforeAnyCandidateIsCached() {
+        val cached = mutableListOf<HistorySequenceRange>()
+        val error = assertThrows(IllegalStateException::class.java) {
+            runBlocking {
+                cacheContiguousHistoryRange(
+                    minimumTarget = 200uL,
+                    stopAfterSequence = 100uL,
+                    firstPage = StreamedHistoryCatalogPage(
+                        items = listOf(HistorySequenceRange(4_176uL, 4_200uL)),
+                        hasMore = true,
+                        nextCursor = "page-2",
+                    ),
+                    loadNextPage = { error("target admission must stop catalog paging") },
+                    sequenceRange = { it },
+                    validateTargetBeforeCaching = { target ->
+                        check(target <= 4_196uL) { "snapshot suffix exceeds its hard limit" }
+                    },
+                    cacheCandidate = { cached += it },
+                )
+            }
+        }
+
+        assertEquals("snapshot suffix exceeds its hard limit", error.message)
+        assertTrue(cached.isEmpty())
+    }
+
+    @Test
+    fun snapshotSuffixGapFailsBeforeDurableAckCanBeAdvertised() {
+        val cached = mutableListOf<HistorySequenceRange>()
+        val error = assertThrows(SessionOpenException::class.java) {
+            runBlocking {
+                cacheContiguousHistoryRange(
+                    minimumTarget = 600uL,
+                    stopAfterSequence = 500uL,
+                    firstPage = StreamedHistoryCatalogPage(
+                        items = listOf(
+                            HistorySequenceRange(576uL, 600uL),
+                            HistorySequenceRange(526uL, 550uL),
+                            HistorySequenceRange(501uL, 525uL),
+                        ),
+                        hasMore = false,
+                        nextCursor = null,
+                    ),
+                    loadNextPage = { error("a terminal page must not load another page") },
+                    sequenceRange = { it },
+                    cacheCandidate = { cached += it },
+                )
+            }
+        }
+
+        assertEquals(SessionOpenFailureCode.HISTORY_GAP, error.failure.code)
+        assertEquals(listOf(HistorySequenceRange(576uL, 600uL)), cached)
+        assertFalse(snapshotSuffixRestoreReady(550uL, 600uL, 700uL))
     }
 
     @Test

@@ -120,6 +120,120 @@ fn renderer_scrollback_window_and_generation_follow_output_without_changing_live
 }
 
 #[test]
+fn snapshot_restores_canonical_scrollback_after_unicode_reflow_and_alternate_screen() {
+    let mut terminal = Terminal::new_with_options(
+        8,
+        3,
+        0,
+        TerminalOptions {
+            history_capacity_rows: 24,
+        },
+    )
+    .expect("history terminal");
+    output(
+        &mut terminal,
+        0,
+        "\u{1b}]8;;https://history.test\u{1b}\\\u{1b}[38;5;81mA\u{e0b0}e\u{301}\u{754c}\u{1b}[0m\u{1b}]8;;\u{1b}\\\r\nsecond\r\nthird\r\nfourth\r\nfifth\r\nsixth"
+            .as_bytes(),
+    )
+    .expect("unicode scrollback output");
+    terminal
+        .apply_event(Event::Resize {
+            source_sequence: 1,
+            columns: 5,
+            rows: 3,
+        })
+        .expect("history reflow");
+    output(&mut terminal, 2, b"\r\nseventh\r\neighth").expect("post-reflow output");
+
+    let (available, generation) = terminal.scrollback_info();
+    assert!(available > 0);
+    assert!(generation > 0);
+    let history_cells = usize::try_from(available * terminal.columns).expect("bounded history");
+    assert!(
+        terminal.main.cells[..history_cells]
+            .iter()
+            .any(|cell| cell.character == '\u{e0b0}')
+    );
+    assert!(
+        terminal.main.cells[..history_cells]
+            .iter()
+            .any(|cell| cell.character == '\u{754c}')
+    );
+    assert!(
+        terminal.main.cells[..history_cells]
+            .iter()
+            .any(|cell| cell.text() == "e\u{301}")
+    );
+    assert!(
+        terminal.main.cells[..history_cells]
+            .iter()
+            .any(|cell| cell.hyperlink.is_some())
+    );
+
+    let snapshot = terminal.export_snapshot_v2().expect("history checkpoint");
+    let restored = Terminal::import_snapshot_v2(&snapshot).expect("history restore");
+    assert_eq!(restored.scrollback_info(), terminal.scrollback_info());
+    assert_eq!(restored.main.cells, terminal.main.cells);
+    assert_eq!(restored.main.soft_wrapped, terminal.main.soft_wrapped);
+    assert_eq!(restored.main.meaningful_end, terminal.main.meaningful_end);
+    assert_eq!(restored.main.row_metadata, terminal.main.row_metadata);
+    assert_eq!(
+        restored.export_snapshot_v2().expect("canonical re-export"),
+        snapshot
+    );
+    for offset in 0..=available {
+        assert_eq!(
+            restored.export_render_frame_v3_at_scrollback(offset),
+            terminal.export_render_frame_v3_at_scrollback(offset),
+            "offset {offset}"
+        );
+    }
+    assert_eq!(
+        restored
+            .export_render_frame_v3_at_scrollback(available)
+            .expect("restored oldest frame"),
+        terminal
+            .export_render_frame_v3_at_scrollback(available)
+            .expect("original oldest frame")
+    );
+
+    output(&mut terminal, 3, b"\x1b[?1049hALT").expect("enter alternate screen");
+    let alternate_snapshot = terminal
+        .export_snapshot_v2()
+        .expect("alternate-active checkpoint");
+    let mut alternate_restored =
+        Terminal::import_snapshot_v2(&alternate_snapshot).expect("restore alternate screen");
+    assert!(alternate_restored.active_alternate);
+    assert_eq!(
+        alternate_restored.scrollback_info(),
+        terminal.scrollback_info()
+    );
+    assert_eq!(
+        alternate_restored
+            .export_render_frame_v3()
+            .expect("restored alternate frame"),
+        terminal
+            .export_render_frame_v3()
+            .expect("original alternate frame")
+    );
+    output(&mut alternate_restored, 4, b"\x1b[?1049l").expect("leave restored alternate");
+    output(&mut terminal, 4, b"\x1b[?1049l").expect("leave original alternate");
+    assert_eq!(
+        alternate_restored.scrollback_info(),
+        terminal.scrollback_info()
+    );
+    assert_eq!(
+        alternate_restored
+            .export_render_frame_v3_at_scrollback(available)
+            .expect("restored oldest frame"),
+        terminal
+            .export_render_frame_v3_at_scrollback(available)
+            .expect("original oldest frame")
+    );
+}
+
+#[test]
 fn erase_display_three_clears_only_scrollback_and_keeps_history_policy() {
     let mut terminal = Terminal::new_with_options(
         3,

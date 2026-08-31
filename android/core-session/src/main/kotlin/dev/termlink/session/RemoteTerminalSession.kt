@@ -535,26 +535,25 @@ class RemoteTerminalSession(
                             RemoteSessionState.Reconnecting(lastAckedSequence, "history recovery publication failed")
                         }
                     } else {
-                        var resetFailure: Throwable? = null
-                        try {
-                            installResetCommit(outbound.resetAcknowledgement(rendererGeneration))
-                        } catch (resetError: Throwable) {
-                            resetFailure = resetError
-                        }
+                        // The renderer was rebuilt off a verified prefix, but no new
+                        // cursor became durable. Preserve the previous cumulative ACK:
+                        // lowering it to zero can make a later SUBSCRIBE regress behind
+                        // the PC route's acknowledgement high-water. The empty renderer
+                        // remains fenced in HistoryGap and can only be rebuilt again; it
+                        // is never allowed to resume from this preserved cursor.
+                        val durableBeforeRecovery = lastAckedSequence
                         lastAppliedSequence = 0
-                        lastAckedSequence = 0
                         lastPresentationRevision = 0
-                        acknowledgementHighWater.set(0)
+                        acknowledgementHighWater.set(durableBeforeRecovery)
                         mutableTitle.value = null
                         runCatching { engine.clear() }.exceptionOrNull()?.let(error::addSuppressed)
                         orderedEventDispatcher?.offerInvalidated(rendererGeneration)
                         mutableState.value = RemoteSessionState.HistoryGap(
-                            lastAckedSequence = 0,
+                            lastAckedSequence = durableBeforeRecovery,
                             expectedSequence = 1,
                             receivedSequence = expectedGap.receivedSequence,
                             generation = expectedGap.generation,
                         )
-                        resetFailure?.let(error::addSuppressed)
                     }
                     runCatching { engine.setReadOnly(true) }.exceptionOrNull()?.let(error::addSuppressed)
                     throw error
@@ -785,6 +784,14 @@ class RemoteTerminalSession(
                 }
             }
         }
+    }
+
+    /**
+     * Waits until the cumulative ACK writer can no longer reach durable storage.
+     * The owning transport must cancel or close this session before awaiting it.
+     */
+    suspend fun awaitAcknowledgementWriterStopped() {
+        acknowledgementJob.join()
     }
 
     private fun closeEngine() {

@@ -109,6 +109,7 @@ namespace TermLink.Agent
     {
         public Guid SessionId { get; set; }
         public ulong LastSequence { get; set; }
+        public int AuthorityVersion { get; set; }
         public bool SnapshotEligible { get; set; }
         public string IneligibilityCode { get; set; }
         public byte[] SnapshotPlaintext { get; set; }
@@ -370,27 +371,129 @@ namespace TermLink.Agent
             ValidateOutbox(outbox);
             lock (SessionLock(outbox.SessionId))
             {
-                var path = Path.Combine(SessionDirectory(outbox.SessionId), OutboxFileName);
-                var existing = File.Exists(path)
-                    ? ReadPersistedOutbox(path, outbox.SessionId)
+                SaveOutboxLocked(outbox);
+            }
+        }
+
+        public void SaveProduction(
+            ProductionTerminalHistoryCheckpoint checkpoint,
+            ProductionTerminalHistoryOutbox outbox)
+        {
+            ValidateCheckpoint(checkpoint);
+            ValidateOutbox(outbox);
+            if (!checkpoint.SnapshotEligible || checkpoint.SessionId != outbox.SessionId ||
+                checkpoint.LastSequence != outbox.SnapshotSequence)
+            {
+                throw new InvalidDataException(
+                    "Terminal checkpoint and outbox production are inconsistent.");
+            }
+            var snapshot = outbox.Artifacts.Single(
+                value => value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot);
+            var expectedAuthorityVersion =
+                snapshot.FormatName == SnapshotCrypto.TerminalCoreSnapshotFormatName &&
+                snapshot.FormatVersion == SnapshotCrypto.TerminalCoreSnapshotFormatVersion
+                    ? 2
+                    : snapshot.FormatName == SnapshotCrypto.SnapshotFormatName &&
+                        snapshot.FormatVersion == SnapshotCrypto.FormatVersion
+                        ? 1
+                        : 0;
+            if (checkpoint.AuthorityVersion != expectedAuthorityVersion ||
+                !CryptographicOperations.FixedTimeEquals(
+                    checkpoint.SnapshotPlaintext,
+                    snapshot.Plaintext))
+            {
+                throw new InvalidDataException(
+                    "Terminal checkpoint authority does not match its outbox snapshot.");
+            }
+            lock (SessionLock(checkpoint.SessionId))
+            {
+                var checkpointPath = Path.Combine(
+                    SessionDirectory(checkpoint.SessionId),
+                    CheckpointFileName);
+                var existingCheckpoint = File.Exists(checkpointPath)
+                    ? ReadJson<ProductionTerminalHistoryCheckpoint>(
+                        checkpointPath,
+                        checkpoint.SessionId,
+                        "checkpoint")
                     : null;
-                if (existing != null)
+                if (existingCheckpoint != null) ValidateCheckpoint(existingCheckpoint);
+                var allowAuthorityUpgrade = existingCheckpoint != null &&
+                    existingCheckpoint.SessionId == checkpoint.SessionId &&
+                    existingCheckpoint.LastSequence == checkpoint.LastSequence &&
+                    existingCheckpoint.AuthorityVersion < 2 &&
+                    checkpoint.AuthorityVersion == 2;
+                // Publish the retryable outbox first. A crash before the checkpoint write
+                // leaves a detectable mismatch that the next WAL pass rebuilds; the reverse
+                // order could expose a new checkpoint with stale delivery artifacts.
+                if (!SaveOutboxLocked(outbox, allowAuthorityUpgrade))
+                    throw new InvalidOperationException(
+                        "A newer terminal history production already exists.");
+                WriteJson(
+                    checkpointPath,
+                    checkpoint.SessionId,
+                    "checkpoint",
+                    checkpoint);
+            }
+        }
+
+        private bool SaveOutboxLocked(
+            ProductionTerminalHistoryOutbox outbox,
+            bool allowAuthorityUpgrade = false)
+        {
+            var path = Path.Combine(SessionDirectory(outbox.SessionId), OutboxFileName);
+            var existing = File.Exists(path)
+                ? ReadPersistedOutbox(path, outbox.SessionId)
+                : null;
+            if (existing != null)
+            {
+                if (existing.SnapshotSequence > outbox.SnapshotSequence) return false;
+                // A newer checkpoint contains a newer visible screen and a freshly generated
+                // transcript index. It supersedes incomplete older delivery state.
+                if (existing.SnapshotSequence == outbox.SnapshotSequence)
                 {
-                    if (existing.SnapshotSequence > outbox.SnapshotSequence) return;
-                    // A newer checkpoint contains a newer visible screen and
-                    // a freshly generated transcript index. It supersedes an
-                    // incomplete older transcript delivery: retaining the old
-                    // outbox would force fresh Snapshot S+N to wait behind the
-                    // entire S backlog and defeats tail-first opening.
-                    if (existing.SnapshotSequence == outbox.SnapshotSequence)
+                    if (ArtifactsEqual(existing.Artifacts, outbox.Artifacts))
                     {
-                        if (!ArtifactsEqual(existing.Artifacts, outbox.Artifacts))
-                            throw new InvalidDataException("A terminal outbox anchor changed its plaintext artifacts.");
                         outbox.Deliveries = existing.Deliveries;
                     }
+                    else if (!IsTerminalCoreAuthorityUpgrade(
+                        existing,
+                        outbox,
+                        allowAuthorityUpgrade))
+                    {
+                        throw new InvalidDataException(
+                            "A terminal outbox anchor changed its plaintext artifacts.");
+                    }
                 }
-                WriteJson(path, outbox.SessionId, "outbox", outbox);
             }
+            WriteJson(path, outbox.SessionId, "outbox", outbox);
+            return true;
+        }
+
+        private static bool IsTerminalCoreAuthorityUpgrade(
+            ProductionTerminalHistoryOutbox existing,
+            ProductionTerminalHistoryOutbox replacement,
+            bool allowAuthorityUpgrade)
+        {
+            var oldSnapshot = existing.Artifacts.SingleOrDefault(
+                value => value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot);
+            var newSnapshot = replacement.Artifacts.SingleOrDefault(
+                value => value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot);
+            var oldIsPortable = oldSnapshot != null &&
+                oldSnapshot.FormatName == SnapshotCrypto.SnapshotFormatName &&
+                oldSnapshot.FormatVersion == SnapshotCrypto.FormatVersion;
+            var oldIsHybridCore = oldSnapshot != null &&
+                oldSnapshot.FormatName == SnapshotCrypto.TerminalCoreSnapshotFormatName &&
+                oldSnapshot.FormatVersion == SnapshotCrypto.TerminalCoreSnapshotFormatVersion &&
+                existing.Artifacts.Any(
+                    value => value.Kind == ProductionTerminalHistoryArtifactKind.Transcript);
+            return allowAuthorityUpgrade && oldSnapshot != null && newSnapshot != null &&
+                (oldIsPortable || oldIsHybridCore) &&
+                newSnapshot.FormatName == SnapshotCrypto.TerminalCoreSnapshotFormatName &&
+                newSnapshot.FormatVersion == SnapshotCrypto.TerminalCoreSnapshotFormatVersion &&
+                oldSnapshot.SnapshotSequence == newSnapshot.SnapshotSequence &&
+                replacement.Artifacts.Count == 1 &&
+                newSnapshot.TranscriptPageCount == 0 &&
+                replacement.Deliveries.Count == 0;
         }
 
         public ProductionTerminalHistoryOutbox LoadOutbox(Guid sessionId)
@@ -744,7 +847,9 @@ namespace TermLink.Agent
         private static void ValidateCheckpoint(ProductionTerminalHistoryCheckpoint value)
         {
             if (value == null || value.SessionId == Guid.Empty || value.LastSequence == 0 ||
+                value.AuthorityVersion < 0 || value.AuthorityVersion > 2 ||
                 value.TranscriptPlaintexts == null ||
+                (value.AuthorityVersion == 2 && value.TranscriptPlaintexts.Count != 0) ||
                 (value.SnapshotEligible && (value.SnapshotPlaintext == null || value.SnapshotPlaintext.Length == 0)) ||
                 (!value.SnapshotEligible && string.IsNullOrWhiteSpace(value.IneligibilityCode)))
             {

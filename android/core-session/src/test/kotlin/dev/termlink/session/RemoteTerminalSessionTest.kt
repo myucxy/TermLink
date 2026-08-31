@@ -7,6 +7,7 @@ import dev.termlink.terminal.api.TerminalThemeV1
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.awaitCancellation
@@ -229,6 +230,35 @@ class RemoteTerminalSessionTest {
         assertEquals(listOf(1L), engine.feeds.map { it.first })
         assertEquals(1L, session.state.value.lastAckedSequence)
         session.close()
+    }
+
+    @Test
+    fun acknowledgementShutdownWaitsUntilANonCancellableDurableWriterStops() = runTest {
+        val commitStarted = CompletableDeferred<Unit>()
+        val releaseCommit = CompletableDeferred<Unit>()
+        val commitFinished = CompletableDeferred<Unit>()
+        val outbound = RecordingOutbound(
+            onPersist = {
+                withContext(NonCancellable) {
+                    commitStarted.complete(Unit)
+                    releaseCommit.await()
+                    commitFinished.complete(Unit)
+                }
+            },
+        )
+        val session = RemoteTerminalSession(RecordingEngine(), outbound, backgroundScope)
+
+        session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1)))
+        runCurrent()
+        commitStarted.await()
+        session.close()
+        val stopped = async { session.awaitAcknowledgementWriterStopped() }
+        runCurrent()
+
+        assertFalse(stopped.isCompleted)
+        releaseCommit.complete(Unit)
+        stopped.await()
+        assertTrue(commitFinished.isCompleted)
     }
 
     @Test
@@ -542,11 +572,12 @@ class RemoteTerminalSessionTest {
             )
         }
         val failed = assertIs<RemoteSessionState.HistoryGap>(session.state.value)
-        assertEquals(0L, failed.lastAckedSequence)
+        assertEquals(1L, failed.lastAckedSequence)
         assertEquals(1L, failed.expectedSequence)
         assertEquals(4L, failed.receivedSequence)
         assertTrue(engine.feeds.isEmpty())
         assertTrue(engine.readOnlyState)
+        assertEquals(0, outbound.resetCount)
 
         val commits = mutableListOf<Long>()
         assertEquals(
@@ -1334,6 +1365,7 @@ class RemoteTerminalSessionTest {
         var failInput = false
         var failPersist = false
         var failAck = false
+        var resetCount = 0
 
         override suspend fun resume(lastAckedSequence: Long) {
             resumes += lastAckedSequence
@@ -1350,6 +1382,7 @@ class RemoteTerminalSessionTest {
         }
 
         override suspend fun resetAcknowledgement(expectedRendererGeneration: Long): DurableAckCommit {
+            resetCount++
             persistedAcknowledgements.clear()
             return DurableAckCommit(0, expectedRendererGeneration + 1)
         }

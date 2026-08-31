@@ -169,6 +169,7 @@ class ProductionRealtimeSessionClient(
     private val scope = CoroutineScope(parentScope.coroutineContext + scopeJob)
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val closed = AtomicBoolean(false)
+    private val closing = AtomicBoolean(false)
     private val started = AtomicBoolean(false)
     private val metadataRefreshInFlight = AtomicBoolean(false)
     private val historyRecoveryInProgress = AtomicBoolean(false)
@@ -335,7 +336,7 @@ class ProductionRealtimeSessionClient(
         check(started.compareAndSet(false, true)) { "production session client is already started" }
         session.start()
         transportStateJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
-            transport.state.collect(::handleTransportState)
+            transport.connectionEvents.collect(::handleTransportState)
         }
         transport.connect()
     }
@@ -727,7 +728,59 @@ class ProductionRealtimeSessionClient(
             )
         }
 
+    /**
+     * Removes the PC subscriber route on the existing encrypted stream before
+     * unregistering the local endpoint. Product-level suspend teardown should
+     * prefer this API; the timeout keeps cancellation and owner shutdown bounded.
+     */
+    suspend fun closeGracefully() {
+        if (closed.get() || !closing.compareAndSet(false, true)) return
+        withContext(NonCancellable) {
+            var unsubscribeSent = false
+            try {
+                subscriberReady.value = false
+                subscriberRefreshJob?.cancel()
+                subscriberRefreshJob = null
+                if (started.get() && mutableTransportState.value is ProductionTransportState.Connected) {
+                    withTimeout(GRACEFUL_UNSUBSCRIBE_TIMEOUT_MILLIS) {
+                        sendEncrypted(
+                            messageType = MessageType.UNSUBSCRIBE,
+                            plaintext = ByteArray(0),
+                            allowWhileClosing = true,
+                        )
+                    }
+                    unsubscribeSent = true
+                }
+            } catch (_: Exception) {
+                // A dead socket cannot acknowledge route teardown. Immediate
+                // endpoint close remains the bounded fallback.
+            } finally {
+                var transportClosed = false
+                try {
+                    if (unsubscribeSent) {
+                        transport.closeAfterUnsubscribe()
+                        transportClosed = true
+                    }
+                } finally {
+                    try {
+                        closeInternal(transportAlreadyClosed = transportClosed)
+                    } finally {
+                        // A replacement renderer may reuse the same durable cursor
+                        // generation. Do not let an ACK transaction from this retired
+                        // incarnation complete after its caller starts that bootstrap.
+                        session.awaitAcknowledgementWriterStopped()
+                    }
+                }
+            }
+        }
+    }
+
     override fun close() {
+        closing.set(true)
+        closeInternal(transportAlreadyClosed = false)
+    }
+
+    private fun closeInternal(transportAlreadyClosed: Boolean) {
         if (!closed.compareAndSet(false, true)) return
         reconnectJob?.cancel()
         reconnectStabilityJob?.cancel()
@@ -738,7 +791,7 @@ class ProductionRealtimeSessionClient(
             it.completeExceptionally(RemoteInputDeliveryUnknownException("production session closed"))
         }
         pendingInputs.clear()
-        transport.close()
+        if (!transportAlreadyClosed) transport.close()
         api.close()
         incomingJob.cancel()
         transportStateJob?.cancel()
@@ -826,10 +879,13 @@ class ProductionRealtimeSessionClient(
         messageType: MessageType,
         plaintext: ByteArray,
         acknowledgement: Long = 0,
+        allowWhileClosing: Boolean = false,
     ) {
         try {
             sendMutex.withLock {
-                check(!closed.get()) { "production session client is closed" }
+                check(!closed.get() && (allowWhileClosing || !closing.get())) {
+                    "production session client is closed"
+                }
                 val sequence = envelopeSequenceProvider.next()
                 require(sequence > 0) { "envelope sequence provider returned a non-positive value" }
                 val (nonce, key, keyIdSnapshot) = synchronized(materialLock) {
@@ -1174,6 +1230,7 @@ class ProductionRealtimeSessionClient(
 
     internal companion object {
         private const val REALTIME_LOG_TAG = "TermLinkRealtime"
+        private const val GRACEFUL_UNSUBSCRIBE_TIMEOUT_MILLIS = 1_000L
 
         internal fun sessionUpsertEvent(
             sequence: Long,
@@ -1243,21 +1300,34 @@ class ProductionRealtimeSessionClient(
         is RemoteSessionState.HistoryGap -> "HISTORY_GAP"
     }
 
-    private suspend fun handleTransportState(state: RealtimeState) {
-        if (closed.get()) return
+    private suspend fun handleTransportState(event: ProductionRealtimeSessionConnectionEvent) {
+        if (closed.get() || closing.get()) return
+        val state = event.state
         when (state) {
             RealtimeState.Connecting -> {
+                // A device-scoped foreground/network reconcile or warm connect
+                // already owns this physical generation. Retire any delayed
+                // session retry so it cannot start a second socket afterward.
+                cancelPendingReconnect()
                 cancelReconnectAttemptReset()
                 subscriberReady.value = false
                 mutableTransportState.value = ProductionTransportState.Connecting
             }
             RealtimeState.Connected -> {
-                reconnectJob?.cancel()
-                reconnectJob = null
+                val connectedGeneration = event.connectedGeneration
+                if (connectedGeneration <= 0 ||
+                    transport.currentConnectedGeneration() != connectedGeneration
+                ) {
+                    // This Connected may already be queued when a device-scoped
+                    // lifecycle/network replacement retires its socket. Only the
+                    // event for the still-current generation may publish SUBSCRIBE.
+                    return
+                }
+                cancelPendingReconnect()
                 mutableTransportState.value = ProductionTransportState.Connected
                 try {
                     if (!session.onConnected()) {
-                        failTransport("initial session subscribe failed")
+                        failConnectedGeneration("initial session subscribe failed", connectedGeneration)
                     } else if (session.state.value !is RemoteSessionState.HistoryGap) {
                         subscriberReady.value = true
                         sendFlowControl(force = true)
@@ -1268,7 +1338,10 @@ class ProductionRealtimeSessionClient(
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Exception) {
-                    failTransport(error.message ?: "realtime subscribe failed")
+                    failConnectedGeneration(
+                        error.message ?: "realtime subscribe failed",
+                        connectedGeneration,
+                    )
                 }
             }
             is RealtimeState.Failed -> {
@@ -1305,7 +1378,18 @@ class ProductionRealtimeSessionClient(
                 session.onDisconnected(state.reason)
                 mutableTransportState.value = ProductionTransportState.Failed(state.reason)
             }
-            is RealtimeState.Reconnecting -> Unit
+            is RealtimeState.Reconnecting -> {
+                if (state.attempt == ProductionRealtimeMultiplexer.EXTERNAL_RECONNECT_ATTEMPT) {
+                    cancelPendingReconnect()
+                    cancelReconnectAttemptReset()
+                    subscriberRefreshJob?.cancel()
+                    subscriberRefreshJob = null
+                    subscriberReady.value = false
+                    failPendingInputs(state.reason ?: "realtime socket is reconnecting")
+                    session.onDisconnected(state.reason)
+                    mutableTransportState.value = ProductionTransportState.Reconnecting(0, state.reason)
+                }
+            }
             RealtimeState.Closed -> {
                 cancelReconnectAttemptReset()
                 subscriberRefreshJob?.cancel()
@@ -1371,7 +1455,7 @@ class ProductionRealtimeSessionClient(
 
     private suspend fun scheduleReconnect(reason: String?) {
         reconnectMutex.withLock {
-            if (closed.get() || session.state.value is RemoteSessionState.Exited) return
+            if (closed.get() || closing.get() || session.state.value is RemoteSessionState.Exited) return
             if (reconnectJob?.isActive == true) return
             reconnectAttempt++
             mutableTransportState.value = ProductionTransportState.Reconnecting(reconnectAttempt, reason)
@@ -1382,9 +1466,18 @@ class ProductionRealtimeSessionClient(
                 // offline failure can call back from newWebSocket while this
                 // coroutine is still active; leaving it installed would make
                 // scheduleReconnect discard the next retry.
-                reconnectMutex.withLock { reconnectJob = null }
-                if (!closed.get()) transport.connect()
+                reconnectMutex.withLock {
+                    reconnectJob = null
+                    if (!closed.get() && !closing.get()) transport.connect()
+                }
             }
+        }
+    }
+
+    private suspend fun cancelPendingReconnect() {
+        reconnectMutex.withLock {
+            reconnectJob?.cancel()
+            reconnectJob = null
         }
     }
 
@@ -1422,6 +1515,23 @@ class ProductionRealtimeSessionClient(
     private fun failTransport(reason: String) {
         if (closed.get()) return
         transport.disconnect(reason)
+        publishTransportFailure(reason)
+    }
+
+    private fun failConnectedGeneration(reason: String, connectedGeneration: Int) {
+        if (closed.get()) return
+        if (!transport.disconnectIfCurrentGeneration(connectedGeneration, reason)) {
+            // A replacement generation already owns the physical socket. Leave it
+            // intact and wait for its ordered Reconnecting/Connecting/Connected
+            // events instead of scheduling a competing session reconnect.
+            subscriberReady.value = false
+            mutableTransportState.value = ProductionTransportState.Connecting
+            return
+        }
+        publishTransportFailure(reason)
+    }
+
+    private fun publishTransportFailure(reason: String) {
         mutableTransportState.value = ProductionTransportState.Failed(reason)
         failPendingInputs(reason)
         scope.launch {

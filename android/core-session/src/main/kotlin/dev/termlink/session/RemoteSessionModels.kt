@@ -52,17 +52,26 @@ sealed interface RendererBootstrapState {
         }
     }
 
-    /** Created only after the exact durable checkpoint has been installed into the renderer. */
+    /**
+     * Created after the exact durable checkpoint at [snapshotSequence] has
+     * been installed and, when needed, its contiguous suffix through
+     * [sequence] has also been rendered. The live cursor may therefore be
+     * newer than the immutable Snapshot anchor but can never precede it.
+     */
     class ExactCheckpoint(
         override val sequence: Long,
         override val rendererGeneration: Long,
         val snapshotId: UUID,
         ciphertextSha256: ByteArray,
+        val snapshotSequence: Long = sequence,
     ) : RendererBootstrapState {
         val ciphertextSha256: ByteArray = ciphertextSha256.copyOf()
 
         init {
             require(sequence > 0) { "checkpoint sequence must be positive" }
+            require(snapshotSequence > 0 && snapshotSequence <= sequence) {
+                "checkpoint anchor must not exceed its rendered cursor"
+            }
             require(rendererGeneration > 0) { "renderer generation must be positive" }
             require(ciphertextSha256.size == 32) { "checkpoint digest must be SHA-256" }
         }

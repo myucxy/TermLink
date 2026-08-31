@@ -39,10 +39,10 @@ pub(super) struct Screen {
     pub(super) meaningful_end: Vec<u32>,
     pub(super) row_metadata: Vec<RowMetadata>,
     pub(super) next_logical_line_id: u64,
-    // Runtime-only monotonic count of full-viewport rows captured into primary
-    // scrollback. It is deliberately excluded from snapshots and semantic
-    // equality; renderers use it only to keep a history viewport anchored
-    // while new output arrives.
+    // Monotonic count of full-viewport rows captured into primary scrollback.
+    // Snapshot V2.10 persists it with a retained primary prefix; legacy snapshot
+    // profiles and semantic equality omit it. Renderers use it only to keep a
+    // history viewport anchored while new output arrives.
     pub(super) scrollback_generation_rows: u64,
     pub(super) storage: StoragePolicy,
     pub(super) cursor_row: u32,

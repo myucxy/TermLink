@@ -6,6 +6,7 @@ import dev.termlink.protocol.realtime.v1.Direction
 import dev.termlink.protocol.realtime.v1.Envelope
 import dev.termlink.protocol.realtime.v1.MessageType
 import dev.termlink.session.DurableAckCommit
+import dev.termlink.session.RendererBootstrapState
 import dev.termlink.terminal.api.TerminalEngine
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalThemeV1
@@ -34,6 +35,7 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runCurrent
@@ -50,6 +52,393 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ProductionRealtimeMultiplexerTest {
+    @Test
+    fun foregroundReconcileDuringRetryRunsOneFollowUpAfterTheOwnerSettles(): Unit = runTest {
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpoint = multiplexer.register(UUID.randomUUID())
+        val observedStates = CopyOnWriteArrayList<RealtimeState>()
+        backgroundScope.launch { endpoint.state.collect(observedStates::add) }
+        endpoint.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+
+        socket.emitState(RealtimeState.Failed("offline"))
+        runCurrent()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        socket.blockNextConnect(entered, release)
+        val retry = async(Dispatchers.Default) { endpoint.connect() }
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+        val foreground = async(Dispatchers.Default) {
+            multiplexer.onAppForegrounded(20_000, networkUsable = true)
+        }
+
+        release.countDown()
+        retry.await()
+        foreground.await()
+        observedStates.clear()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+
+        assertEquals(3, socket.connectCount)
+        assertEquals(1, socket.disconnectCount)
+        assertTrue(observedStates.none { it == RealtimeState.Connected })
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        assertEquals(RealtimeState.Connected, observedStates.last())
+        multiplexer.close()
+    }
+
+    @Test
+    fun subscribeSendAndGenerationRotateShareOneAtomicGate(): Unit = runTest {
+        val socket = FakeSocket()
+        val sessionId = UUID.randomUUID()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpoint = multiplexer.register(sessionId)
+        endpoint.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        socket.blockNextSend(entered, release)
+        val subscribe = async(Dispatchers.Default) { endpoint.sendSubscribe(sessionId, ack = 17) }
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+        val rotate = async(Dispatchers.Default) {
+            multiplexer.onAppForegrounded(20_000, networkUsable = true)
+        }
+
+        release.countDown()
+        subscribe.await()
+        rotate.await()
+        socket.deliver(socket.received(sessionId, 18, generation = 1))
+        socket.deliver(socket.received(sessionId, 18, generation = 3))
+        runCurrent()
+
+        assertEquals(1L, endpoint.diagnostics().routeDecisions.rejectedGeneration)
+        assertEquals(1L, endpoint.diagnostics().routeDecisions.endpointNotSubscribed)
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        endpoint.sendSubscribe(sessionId, ack = 17)
+        val received = async {
+            endpoint.receivedEnvelopes.take(1).map { it.use { item -> item.envelope.seq } }.toList()
+        }
+        socket.deliver(socket.received(sessionId, 18, generation = 3))
+        runCurrent()
+        assertEquals(listOf(18L), received.await())
+        multiplexer.close()
+    }
+
+    @Test
+    fun lastEndpointCloseLinearizesAgainstClaimedConnectAndPreventsRevival(): Unit = runTest {
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpoint = multiplexer.register(UUID.randomUUID())
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        socket.blockNextConnect(entered, release)
+        val connect = async(Dispatchers.Default) { endpoint.connect() }
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+        val close = async(Dispatchers.Default) { endpoint.close() }
+
+        release.countDown()
+        connect.await()
+        close.await()
+        multiplexer.onNetworkAvailable()
+
+        assertEquals(1, socket.connectCount)
+        assertEquals(0, endpoint.diagnostics().endpointCount)
+        multiplexer.close()
+    }
+
+    @Test
+    fun ownerCloseLinearizesAgainstClaimedConnectAndClosedNeverRevives(): Unit = runTest {
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpoint = multiplexer.register(UUID.randomUUID())
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        socket.blockNextConnect(entered, release)
+        val connect = async(Dispatchers.Default) { endpoint.connect() }
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+        val close = async(Dispatchers.Default) { multiplexer.close() }
+
+        release.countDown()
+        connect.await()
+        close.await()
+        multiplexer.onNetworkAvailable()
+        multiplexer.onAppForegrounded(20_000, networkUsable = true)
+
+        assertEquals(1, socket.connectCount)
+        assertEquals(1, socket.closeCount)
+        assertEquals("CLOSED", endpoint.diagnostics().phase)
+    }
+
+    @Test
+    fun gracefulReplacementDropsOldRouteUntilFreshSubscribeWithoutDisturbingPeer(): Unit = runTest {
+        val socket = FakeSocket()
+        val sessionA = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        val sessionB = UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val oldA = multiplexer.register(sessionA)
+        val endpointB = multiplexer.register(sessionB)
+        oldA.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        oldA.sendSubscribe(sessionA, ack = 5)
+        endpointB.sendSubscribe(sessionB, ack = 9)
+        oldA.sendUnsubscribe(sessionA)
+        oldA.closeAfterUnsubscribe()
+
+        socket.deliver(socket.received(sessionA, 1, generation = 1))
+        runCurrent()
+        val replacementA = multiplexer.register(sessionA)
+        assertEquals(1, socket.disconnectCount)
+        assertEquals(2, socket.connectCount)
+        socket.deliver(socket.received(sessionA, 2, generation = 1))
+        socket.deliver(socket.received(sessionA, 3, generation = 3))
+        socket.deliver(socket.received(sessionB, 10, generation = 3))
+        runCurrent()
+
+        assertEquals(1L, replacementA.diagnostics().routeDecisions.endpointClosed)
+        assertEquals(1L, replacementA.diagnostics().routeDecisions.rejectedGeneration)
+        assertEquals(2L, replacementA.diagnostics().routeDecisions.endpointNotSubscribed)
+
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        replacementA.sendSubscribe(sessionA, ack = 5)
+        endpointB.sendSubscribe(sessionB, ack = 9)
+        val fresh = async {
+            replacementA.receivedEnvelopes.take(1).map { it.use { item -> item.envelope.seq } }.toList()
+        }
+        val peer = async {
+            endpointB.receivedEnvelopes.take(1).map { it.use { item -> item.envelope.seq } }.toList()
+        }
+        socket.deliver(socket.received(sessionA, 4, generation = 3))
+        socket.deliver(socket.received(sessionB, 11, generation = 3))
+        runCurrent()
+        assertEquals(listOf(4L), fresh.await())
+        assertEquals(listOf(11L), peer.await())
+        assertEquals(listOf(5L, 9L, 5L, 9L), socket.sentEnvelopes
+            .filter { it.messageType == MessageType.SUBSCRIBE }
+            .map(Envelope::getAck))
+        multiplexer.close()
+    }
+
+    @Test
+    fun gracefulTombstoneOnlyToleratesFramesFromItsRetiredGeneration(): Unit = runTest {
+        val socket = FakeSocket()
+        val sessionA = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        val sessionB = UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpointA = multiplexer.register(sessionA)
+        val endpointB = multiplexer.register(sessionB)
+        endpointA.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        endpointA.sendSubscribe(sessionA)
+        endpointB.sendSubscribe(sessionB)
+        endpointA.sendUnsubscribe(sessionA)
+        endpointA.closeAfterUnsubscribe()
+
+        socket.deliver(socket.received(sessionA, sequence = 1, generation = 1))
+        runCurrent()
+        assertEquals(0, socket.disconnectCount)
+
+        socket.activateGeneration(2)
+        socket.deliver(socket.received(sessionA, sequence = 2, generation = 2))
+        runCurrent()
+
+        assertEquals(1, socket.disconnectCount)
+        assertEquals(2L, endpointB.diagnostics().routeDecisions.endpointClosed)
+        multiplexer.close()
+    }
+
+    @Test
+    fun sharedGenerationRotateResubscribesEverySessionFromItsOwnDurableAck(): Unit = runTest {
+        val socket = FakeSocket()
+        val androidId = UUID.fromString("10000000-0000-0000-0000-000000000000")
+        val pcId = UUID.fromString("20000000-0000-0000-0000-000000000000")
+        val sessionA = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        val sessionB = UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        fun client(sessionId: UUID, ack: Long) = ProductionRealtimeSessionClient(
+            engine = NoOpEngine(),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 1,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey,
+            ),
+            identity = androidIdentity,
+            parentScope = backgroundScope,
+            transport = multiplexer.register(sessionId),
+            initialRendererState = RendererBootstrapState.FullPrefix(ack, 1),
+            acknowledgementObserver = { generation, sequence -> DurableAckCommit(sequence, generation) },
+            acknowledgementResetObserver = { generation -> DurableAckCommit(0, generation + 1) },
+        )
+        val clientA = client(sessionA, 5)
+        val clientB = client(sessionB, 9)
+        try {
+            clientA.start()
+            clientB.start()
+            socket.emitState(RealtimeState.Connected)
+            withTimeout(2_000) {
+                while (clientA.diagnostics().subscribeSendCount < 1 ||
+                    clientB.diagnostics().subscribeSendCount < 1
+                ) kotlinx.coroutines.yield()
+            }
+
+            multiplexer.onNetworkAvailable()
+            runCurrent()
+            assertEquals(5L, clientA.sessionState.value.lastAckedSequence)
+            assertEquals(9L, clientB.sessionState.value.lastAckedSequence)
+            socket.emitState(RealtimeState.Connected)
+            withTimeout(2_000) {
+                while (clientA.diagnostics().subscribeSendCount < 2 ||
+                    clientB.diagnostics().subscribeSendCount < 2
+                ) kotlinx.coroutines.yield()
+            }
+
+            assertEquals(listOf(5L, 5L, 9L, 9L), socket.sentEnvelopes
+                .filter { it.messageType == MessageType.SUBSCRIBE }
+                .map(Envelope::getAck)
+                .sorted())
+            assertEquals(5L, clientA.sessionState.value.lastAckedSequence)
+            assertEquals(9L, clientB.sessionState.value.lastAckedSequence)
+        } finally {
+            clientA.close()
+            clientB.close()
+            multiplexer.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun shortForegroundKeepsHealthySharedSocketButLongForegroundReplacesOnce(): Unit = runTest {
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpointA = multiplexer.register(UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
+        multiplexer.register(UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"))
+        endpointA.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+
+        multiplexer.onAppForegrounded(14_999, networkUsable = true)
+        assertEquals(1, socket.connectCount)
+        assertEquals(0, socket.disconnectCount)
+
+        multiplexer.onAppForegrounded(15_000, networkUsable = true)
+        multiplexer.onNetworkAvailable()
+        multiplexer.onAppForegrounded(30_000, networkUsable = true)
+        runCurrent()
+
+        assertEquals(2, socket.connectCount)
+        assertEquals(1, socket.disconnectCount)
+        assertEquals(2, endpointA.diagnostics().endpointCount)
+        multiplexer.close()
+    }
+
+    @Test
+    fun concurrentNetworkAndForegroundSignalsShareOneReplacementGate(): Unit = runTest {
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpoint = multiplexer.register(UUID.randomUUID())
+        endpoint.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+
+        List(16) { index ->
+            async(Dispatchers.Default) {
+                if (index % 2 == 0) multiplexer.onNetworkAvailable()
+                else multiplexer.onAppForegrounded(20_000, networkUsable = true)
+            }
+        }.awaitAll()
+        runCurrent()
+
+        assertEquals(1, socket.disconnectCount)
+        assertEquals(2, socket.connectCount)
+        multiplexer.close()
+    }
+
+    @Test
+    fun foregroundDoesNotReviveWithoutEndpointOrUsableNetwork(): Unit = runTest {
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+
+        multiplexer.onAppForegrounded(30_000, networkUsable = true)
+        assertEquals(0, socket.connectCount)
+
+        val endpoint = multiplexer.register(UUID.randomUUID())
+        multiplexer.onAppForegrounded(30_000, networkUsable = false)
+        assertEquals(0, socket.connectCount)
+        assertEquals(0, socket.disconnectCount)
+        endpoint.close()
+        multiplexer.close()
+    }
+
+    @Test
+    fun warmConnectAllocatesNoEndpointAndCoalescesUntilSocketSettles(): Unit = runTest {
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+
+        multiplexer.warmConnect()
+        multiplexer.warmConnect()
+        assertEquals(1, socket.connectCount)
+        val endpoint = multiplexer.register(UUID.randomUUID())
+        assertEquals(1, endpoint.diagnostics().endpointCount)
+
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        multiplexer.warmConnect()
+        assertEquals(1, socket.connectCount)
+        assertEquals(1, endpoint.diagnostics().endpointCount)
+        multiplexer.close()
+    }
+
+    @Test
+    fun shortForegroundReplacesStructurallyStaleConnectedSocket(): Unit = runTest {
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpoint = multiplexer.register(UUID.randomUUID())
+        endpoint.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        socket.structurallyStale = true
+
+        multiplexer.onAppForegrounded(1_000, networkUsable = true)
+
+        assertEquals(1, socket.disconnectCount)
+        assertEquals(2, socket.connectCount)
+        multiplexer.close()
+    }
+
+    @Test
+    fun foregroundReplacementFencesLateFramesFromOldGeneration(): Unit = runTest {
+        val socket = FakeSocket()
+        val sessionId = UUID.randomUUID()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpoint = multiplexer.register(sessionId)
+        endpoint.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        endpoint.sendSubscribe(sessionId)
+
+        multiplexer.onAppForegrounded(15_000, networkUsable = true)
+        socket.deliver(socket.received(sessionId, sequence = 10, generation = 1))
+        runCurrent()
+
+        assertEquals(1, socket.releasedReservations.get())
+        assertEquals(1, endpoint.diagnostics().routeDecisions.rejectedGeneration)
+        multiplexer.close()
+    }
+
     @Test
     fun oidcRejectionRefreshesOnceAtDeviceBoundaryAndReconnectsWithLatestToken(): Unit = runBlocking {
         val androidId = UUID.fromString("10000000-0000-0000-0000-000000000000")
@@ -223,6 +612,9 @@ class ProductionRealtimeMultiplexerTest {
 
                     override fun onMessage(webSocket: WebSocket, text: String) {
                         check(webSocket.send("{\"type\":\"welcome\",\"protocol_version\":1}"))
+                    }
+
+                    override fun onMessage(webSocket: WebSocket, bytes: OkioByteString) {
                         listOf(
                             incomingEnvelope(sessionA, pcId, androidId, 1),
                             incomingEnvelope(sessionB, pcId, androidId, 11),
@@ -259,6 +651,9 @@ class ProductionRealtimeMultiplexerTest {
             }
             endpointA.connect()
             endpointB.connect()
+            withTimeout(5_000) { endpointA.state.first { it == RealtimeState.Connected } }
+            endpointA.sendSubscribe(sessionA, senderId = androidId)
+            endpointB.sendSubscribe(sessionB, senderId = androidId)
 
             assertEquals(listOf(1L, 2L), withTimeout(5_000) { receivedA.await() })
             assertEquals(listOf(11L, 12L), withTimeout(5_000) { receivedB.await() })
@@ -288,6 +683,10 @@ class ProductionRealtimeMultiplexerTest {
 
         endpointA.connect()
         endpointB.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        endpointA.sendSubscribe(sessionA)
+        endpointB.sendSubscribe(sessionB)
         assertEquals(1, socket.connectCount)
 
         socket.deliver(socket.received(sessionA, 1))
@@ -321,6 +720,9 @@ class ProductionRealtimeMultiplexerTest {
         val endpoint = multiplexer.register(sessionId)
 
         endpoint.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        endpoint.sendSubscribe(sessionId)
         repeat(ProductionRealtimeClient.MAX_BUFFERED_EVENTS + 2) { index ->
             socket.deliver(socket.received(sessionId, index.toLong() + 1, generation = 1))
         }
@@ -345,6 +747,8 @@ class ProductionRealtimeMultiplexerTest {
         val nextGeneration = async {
             endpoint.receivedEnvelopes.take(1).map { it.use { item -> item.envelope.seq } }.toList()
         }
+        socket.activateGeneration(2)
+        endpoint.sendSubscribe(sessionId)
         socket.deliver(socket.received(sessionId, 129, generation = 2))
         runCurrent()
         assertEquals(listOf(129L), nextGeneration.await())
@@ -378,7 +782,9 @@ class ProductionRealtimeMultiplexerTest {
 
         socket.deliver(socket.received(sessionId, 306, generation = 1))
         runCurrent()
+        socket.activateGeneration(2)
         val endpoint = multiplexer.register(sessionId)
+        endpoint.sendSubscribe(sessionId)
         socket.deliver(socket.received(sessionId, 307, generation = 1))
         runCurrent()
 
@@ -407,6 +813,8 @@ class ProductionRealtimeMultiplexerTest {
         socket.deliver(socket.received(sessionId, 306, generation = 1))
         runCurrent()
         val replacement = multiplexer.register(sessionId)
+        socket.activateGeneration(2)
+        replacement.sendSubscribe(sessionId)
         socket.deliver(socket.received(sessionId, 307, generation = 1))
         runCurrent()
 
@@ -431,6 +839,8 @@ class ProductionRealtimeMultiplexerTest {
         val socket = FakeSocket()
         val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
         val oldEndpoint = multiplexer.register(sessionId)
+        socket.activateGeneration(2)
+        oldEndpoint.sendSubscribe(sessionId)
 
         socket.deliver(socket.received(sessionId, 306, generation = 2))
         runCurrent()
@@ -443,6 +853,8 @@ class ProductionRealtimeMultiplexerTest {
         assertEquals(1, socket.disconnectCount)
 
         val replacement = multiplexer.register(sessionId)
+        socket.activateGeneration(3)
+        replacement.sendSubscribe(sessionId)
         socket.deliver(socket.received(sessionId, 307, generation = 2))
         runCurrent()
 
@@ -465,6 +877,8 @@ class ProductionRealtimeMultiplexerTest {
         val socket = FakeSocket()
         val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
         val oldEndpoint = multiplexer.register(sessionId)
+        socket.activateGeneration(2)
+        oldEndpoint.sendSubscribe(sessionId)
         val collected = CompletableDeferred<ProductionReceivedEnvelope>()
         val allowRelease = CompletableDeferred<Unit>()
         val collector = backgroundScope.launch {
@@ -488,6 +902,8 @@ class ProductionRealtimeMultiplexerTest {
         assertEquals(0, socket.releasedReservations.get())
 
         val replacement = multiplexer.register(sessionId)
+        socket.activateGeneration(3)
+        replacement.sendSubscribe(sessionId)
         socket.deliver(socket.received(sessionId, 307, generation = 2))
         runCurrent()
         allowRelease.complete(Unit)
@@ -516,6 +932,9 @@ class ProductionRealtimeMultiplexerTest {
         val oldEndpointB = multiplexer.register(sessionB)
         oldEndpointB.close()
         val replacementB = multiplexer.register(sessionB)
+        socket.activateGeneration(2)
+        endpointA.sendSubscribe(sessionA)
+        replacementB.sendSubscribe(sessionB)
 
         val receivedA = async {
             endpointA.receivedEnvelopes.take(1).map { it.use { item -> item.envelope.seq } }.toList()
@@ -546,6 +965,9 @@ class ProductionRealtimeMultiplexerTest {
         val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
         val endpointA = multiplexer.register(UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
         val endpointB = multiplexer.register(UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"))
+        socket.activateGeneration(1)
+        endpointA.sendSubscribe(UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
+        endpointB.sendSubscribe(UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"))
 
         repeat(3) { index ->
             socket.deliver(
@@ -576,7 +998,7 @@ class ProductionRealtimeMultiplexerTest {
     }
 
     @Test
-    fun networkAvailableForcesOneReconnectFromEveryActiveSocketPhase(): Unit = runTest {
+    fun networkAvailableReplacesSettledSocketButCoalescesConnectingOwner(): Unit = runTest {
         val phases = listOf(
             RealtimeState.Connecting,
             RealtimeState.Connected,
@@ -595,8 +1017,16 @@ class ProductionRealtimeMultiplexerTest {
             multiplexer.onNetworkAvailable()
             runCurrent()
 
-            assertEquals("phase=$phase", 1, socket.disconnectCount)
-            assertEquals("phase=$phase", 2, socket.connectCount)
+            assertEquals(
+                "phase=$phase",
+                if (phase == RealtimeState.Connected) 1 else 0,
+                socket.disconnectCount,
+            )
+            assertEquals(
+                "phase=$phase",
+                if (phase == RealtimeState.Connecting) 1 else 2,
+                socket.connectCount,
+            )
             multiplexer.close()
         }
     }
@@ -683,6 +1113,36 @@ class ProductionRealtimeMultiplexerTest {
         check(incoming.trySend(received).isSuccess)
     }
 
+    private fun ProductionRealtimeSessionTransport.sendSubscribe(
+        sessionId: UUID,
+        ack: Long = 0,
+        senderId: UUID = UUID(0, 0),
+    ) {
+        assertTrue(
+            send(
+                Envelope.newBuilder()
+                    .setProtocolVersion(1)
+                    .setSessionId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(sessionId)))
+                    .setSenderDeviceId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(senderId)))
+                    .setDirection(Direction.ANDROID_TO_PC)
+                    .setMessageType(MessageType.SUBSCRIBE)
+                    .setAck(ack)
+                    .build(),
+            ),
+        )
+    }
+
+    private fun ProductionRealtimeSessionTransport.sendUnsubscribe(sessionId: UUID) {
+        assertTrue(
+            send(
+                Envelope.newBuilder()
+                    .setSessionId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(sessionId)))
+                    .setMessageType(MessageType.UNSUBSCRIBE)
+                    .build(),
+            ),
+        )
+    }
+
     private fun FakeSocket.received(
         sessionId: UUID,
         sequence: Long,
@@ -721,9 +1181,20 @@ class ProductionRealtimeMultiplexerTest {
         val releasedReservations = AtomicInteger(0)
         private val mutableState = MutableSharedFlow<RealtimeState>(extraBufferCapacity = 8)
         private val mutablePressure = MutableStateFlow(ProductionReceivePressure(0, false, 0, 0))
-        var connectCount = 0
-        var disconnectCount = 0
-        var closeCount = 0
+        private val connects = AtomicInteger(0)
+        private val disconnects = AtomicInteger(0)
+        private val closes = AtomicInteger(0)
+        val connectCount: Int get() = connects.get()
+        val disconnectCount: Int get() = disconnects.get()
+        val closeCount: Int get() = closes.get()
+        @Volatile var structurallyStale = false
+        @Volatile private var diagnosticsGeneration = 0
+        @Volatile private var diagnosticsConnectedGeneration = 0
+        @Volatile private var diagnosticsState = "IDLE"
+        @Volatile private var connectEntered: CountDownLatch? = null
+        @Volatile private var connectRelease: CountDownLatch? = null
+        @Volatile private var sendEntered: CountDownLatch? = null
+        @Volatile private var sendRelease: CountDownLatch? = null
         val sentEnvelopes = CopyOnWriteArrayList<Envelope>()
 
         override val receivedEnvelopes = incoming.receiveAsFlow()
@@ -731,28 +1202,85 @@ class ProductionRealtimeMultiplexerTest {
         override val state: SharedFlow<RealtimeState> = mutableState
 
         override fun connect() {
-            connectCount++
+            diagnosticsGeneration++
+            diagnosticsConnectedGeneration = 0
+            diagnosticsState = "CONNECTING"
+            connects.incrementAndGet()
+            connectEntered?.also {
+                connectEntered = null
+                it.countDown()
+                connectRelease?.await(2, TimeUnit.SECONDS)
+                connectRelease = null
+            }
             mutableState.tryEmit(RealtimeState.Connecting)
         }
 
+        fun blockNextConnect(entered: CountDownLatch, release: CountDownLatch) {
+            connectEntered = entered
+            connectRelease = release
+        }
+
+        fun blockNextSend(entered: CountDownLatch, release: CountDownLatch) {
+            sendEntered = entered
+            sendRelease = release
+        }
+
+        fun activateGeneration(generation: Int) {
+            diagnosticsGeneration = generation
+            diagnosticsConnectedGeneration = generation
+            diagnosticsState = "CONNECTED"
+        }
+
         override fun send(envelope: Envelope): Boolean {
+            sendEntered?.also {
+                sendEntered = null
+                it.countDown()
+                sendRelease?.await(2, TimeUnit.SECONDS)
+                sendRelease = null
+            }
             sentEnvelopes += envelope
             return true
         }
 
         override fun disconnect(reason: String) {
-            disconnectCount++
+            diagnosticsGeneration++
+            diagnosticsConnectedGeneration = 0
+            diagnosticsState = "FAILED"
+            disconnects.incrementAndGet()
             mutableState.tryEmit(RealtimeState.Failed(reason))
         }
 
         override fun close() {
-            closeCount++
+            closes.incrementAndGet()
+            diagnosticsState = "CLOSED"
             incoming.close()
         }
 
         fun emitState(state: RealtimeState) {
+            diagnosticsState = when (state) {
+                RealtimeState.Connecting -> "CONNECTING"
+                RealtimeState.Connected -> {
+                    diagnosticsConnectedGeneration = diagnosticsGeneration
+                    "CONNECTED"
+                }
+                is RealtimeState.Failed -> "FAILED"
+                is RealtimeState.AuthenticationFailed -> "AUTHENTICATION_FAILED"
+                is RealtimeState.AuthenticationRejected -> "AUTHENTICATION_REJECTED"
+                is RealtimeState.Reconnecting -> "RECONNECTING"
+                RealtimeState.Closed -> "CLOSED"
+            }
             check(mutableState.tryEmit(state))
         }
+
+        override fun diagnostics(): ProductionRealtimeSocketDiagnostics = ProductionRealtimeSocketDiagnostics(
+            generation = diagnosticsGeneration,
+            connectedGeneration = diagnosticsConnectedGeneration,
+            socketPresent = diagnosticsState == "CONNECTING" ||
+                (diagnosticsState == "CONNECTED" && !structurallyStale),
+            state = diagnosticsState,
+            bufferedEvents = 0,
+            bufferedWireBytes = 0,
+        )
     }
 
     private class NoOpEngine : TerminalEngine {

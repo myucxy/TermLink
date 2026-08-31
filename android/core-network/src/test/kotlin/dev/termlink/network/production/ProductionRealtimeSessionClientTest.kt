@@ -325,6 +325,196 @@ class ProductionRealtimeSessionClientTest {
     }
 
     @Test
+    fun staleConnectedCannotSubscribeOrDisconnectReplacementGeneration(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = GenerationRaceSessionTransport()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(30_000),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+
+        try {
+            client.start()
+            withTimeout(2_000) {
+                while (transport.subscribeCount != 1) kotlinx.coroutines.yield()
+            }
+
+            // First cover replacement after the old Connected handler has
+            // validated G1 but before its SUBSCRIBE reaches the socket.
+            val blocked = transport.blockNextSubscribe()
+            val generationOne = transport.currentConnectedGeneration()
+            transport.emitConnectedEvent(generationOne)
+            assertTrue(blocked.entered.await(2, TimeUnit.SECONDS))
+            val generationTwo = transport.replaceGeneration()
+            blocked.release.countDown()
+            withTimeout(2_000) {
+                while (transport.conditionalDisconnectAttempts < 1) kotlinx.coroutines.yield()
+            }
+            assertEquals(1, transport.subscribeCount)
+            assertTrue(transport.disconnectReasons.isEmpty())
+
+            transport.emitConnectedEvent(generationTwo)
+            withTimeout(2_000) {
+                while (transport.subscribeCount != 2) kotlinx.coroutines.yield()
+            }
+
+            // Then cover a G2 Connected event that was queued before replacement
+            // but is not consumed until G3 already owns the physical socket.
+            val readsBeforeStaleEvent = transport.connectedGenerationReads
+            val generationThree = transport.replaceGeneration()
+            transport.emitConnectedEvent(generationTwo)
+            withTimeout(2_000) {
+                while (transport.connectedGenerationReads == readsBeforeStaleEvent) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+            assertEquals(2, transport.subscribeCount)
+            assertTrue(transport.disconnectReasons.isEmpty())
+
+            transport.emitConnectedEvent(generationThree)
+            withTimeout(2_000) {
+                while (transport.subscribeCount != 3) kotlinx.coroutines.yield()
+            }
+            assertIs<ProductionTransportState.Connected>(client.transportState.value)
+            assertTrue(transport.disconnectReasons.isEmpty())
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun externallyOwnedReconnectCancelsPendingBackoffWithoutResettingAckOrConnectingAgain(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = QueuedSessionTransport()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(30_000),
+            initialRendererState = RendererBootstrapState.FullPrefix(25, 3),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+
+        try {
+            client.start()
+            withTimeout(2_000) { client.transportState.first { it is ProductionTransportState.Connected } }
+            assertEquals(25L, client.sessionState.value.lastAckedSequence)
+            assertEquals(1, transport.connectCount)
+
+            transport.emitFailed("offline")
+            withTimeout(2_000) {
+                client.transportState.first { it is ProductionTransportState.Reconnecting && it.attempt == 1 }
+            }
+            assertTrue(client.diagnostics().reconnectActive)
+
+            transport.emitState(
+                RealtimeState.Reconnecting(
+                    ProductionRealtimeMultiplexer.EXTERNAL_RECONNECT_ATTEMPT,
+                    "foreground reconcile",
+                ),
+            )
+            withTimeout(2_000) {
+                while (client.diagnostics().reconnectActive) kotlinx.coroutines.yield()
+            }
+            transport.emitState(RealtimeState.Connecting)
+            delay(50)
+
+            assertEquals(1, transport.connectCount)
+            assertEquals(25L, client.sessionState.value.lastAckedSequence)
+            assertEquals(25L, client.diagnostics().lastSubscribeCursor)
+
+            transport.emitConnected()
+            withTimeout(2_000) { client.transportState.first { it is ProductionTransportState.Connected } }
+            assertEquals(25L, client.sessionState.value.lastAckedSequence)
+            assertEquals(1, transport.connectCount)
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun gracefulCloseSendsEncryptedUnsubscribeBeforeEndpointRemoval(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = QueuedSessionTransport()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+
+        try {
+            client.start()
+            withTimeout(2_000) { client.transportState.first { it is ProductionTransportState.Connected } }
+
+            client.closeGracefully()
+
+            val unsubscribe = transport.sent.last()
+            assertEquals(MessageType.UNSUBSCRIBE, unsubscribe.messageType)
+            assertTrue(unsubscribe.ciphertext.size() >= 16)
+            assertEquals(1, transport.gracefulCloseCount)
+            assertEquals(0, transport.immediateCloseCount)
+            assertIs<ProductionTransportState.Closed>(client.transportState.value)
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
     fun pcHeartbeatIsFatalSemanticAndFencesSameGenerationSuccessor(): Unit = runBlocking {
         val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
         val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
@@ -1035,7 +1225,7 @@ class ProductionRealtimeSessionClientTest {
     }
 
     @Test
-    fun recoverFromHistoryFeedFailureResetsRendererWithoutAckAndCanRetry(): Unit = runBlocking {
+    fun recoverFromHistoryFeedFailureResetsRendererWithoutRegressingAckAndCanRetry(): Unit = runBlocking {
         val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
         val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
         val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
@@ -1200,7 +1390,7 @@ class ProductionRealtimeSessionClientTest {
             assertTrue(outputs.isEmpty())
             assertEquals(durableBeforeFailure, durableAcks.toList())
             assertEquals(wireBeforeFailure, wireAcks.toList())
-            assertEquals(listOf(DurableAckCommit(sequence = 0L, rendererGeneration = 2L)), durableResets)
+            assertTrue(durableResets.isEmpty())
 
             assertEquals(
                 3L,
@@ -1217,7 +1407,7 @@ class ProductionRealtimeSessionClientTest {
                 }
             }
             assertEquals(listOf(0L, 3L), resumes.take(2))
-            assertDurableCursor(durableAcks, expectedFinal = 3L, expectedGeneration = 2L)
+            assertDurableCursor(durableAcks, expectedFinal = 3L, expectedGeneration = 1L)
             assertCumulativeCursor(wireAcks, expectedFinal = 3L)
             assertEquals(listOf(1, 2, 3), outputs.map { it.single().toInt() })
         } finally {
@@ -2502,6 +2692,121 @@ class ProductionRealtimeSessionClientTest {
         }
     }
 
+    private class GenerationRaceSessionTransport : ProductionRealtimeSessionTransport {
+        data class BlockedSubscribe(
+            val entered: CountDownLatch = CountDownLatch(1),
+            val release: CountDownLatch = CountDownLatch(1),
+        )
+
+        private val lock = Any()
+        private val incoming = Channel<ProductionReceivedEnvelope>(Channel.UNLIMITED)
+        private val mutablePressure = MutableStateFlow(ProductionReceivePressure(0, false, 0, 0))
+        private val mutableState = MutableSharedFlow<RealtimeState>(replay = 1, extraBufferCapacity = 4)
+        private val mutableConnectionEvents =
+            MutableSharedFlow<ProductionRealtimeSessionConnectionEvent>(replay = 1, extraBufferCapacity = 4)
+        private val blockedSubscribe = AtomicReference<BlockedSubscribe?>()
+        private val generationReads = AtomicInteger(0)
+        private val conditionalDisconnects = AtomicInteger(0)
+        private var connectedGeneration = 0
+        val sent = CopyOnWriteArrayList<Envelope>()
+        val disconnectReasons = CopyOnWriteArrayList<String>()
+
+        override val receivedEnvelopes: Flow<ProductionReceivedEnvelope> = incoming.receiveAsFlow()
+        override val receivePressure = mutablePressure
+        override val state = mutableState
+        override val connectionEvents: Flow<ProductionRealtimeSessionConnectionEvent> =
+            mutableConnectionEvents
+
+        val subscribeCount: Int
+            get() = sent.count { it.messageType == MessageType.SUBSCRIBE }
+
+        val connectedGenerationReads: Int
+            get() = generationReads.get()
+
+        val conditionalDisconnectAttempts: Int
+            get() = conditionalDisconnects.get()
+
+        override fun connect() {
+            val generation = synchronized(lock) {
+                connectedGeneration = if (connectedGeneration <= 0) 1 else connectedGeneration + 1
+                connectedGeneration
+            }
+            emitConnectedEvent(generation)
+        }
+
+        override fun send(envelope: Envelope): Boolean {
+            val generationAtSend = synchronized(lock) { connectedGeneration }
+            val blocked = if (envelope.messageType == MessageType.SUBSCRIBE) {
+                blockedSubscribe.getAndSet(null)
+            } else {
+                null
+            }
+            if (blocked != null) {
+                blocked.entered.countDown()
+                check(blocked.release.await(2, TimeUnit.SECONDS)) { "timed out releasing blocked SUBSCRIBE" }
+            }
+            return synchronized(lock) {
+                if (generationAtSend <= 0 || connectedGeneration != generationAtSend) {
+                    false
+                } else {
+                    sent += envelope
+                    true
+                }
+            }
+        }
+
+        override fun disconnect(reason: String) {
+            synchronized(lock) { connectedGeneration = 0 }
+            disconnectReasons += reason
+        }
+
+        override fun currentConnectedGeneration(): Int {
+            generationReads.incrementAndGet()
+            return synchronized(lock) { connectedGeneration }
+        }
+
+        override fun disconnectIfCurrentGeneration(
+            expectedGeneration: Int,
+            reason: String,
+        ): Boolean {
+            conditionalDisconnects.incrementAndGet()
+            return synchronized(lock) {
+                if (expectedGeneration <= 0 || connectedGeneration != expectedGeneration) {
+                    false
+                } else {
+                    connectedGeneration = 0
+                    disconnectReasons += reason
+                    true
+                }
+            }
+        }
+
+        override fun close() {
+            synchronized(lock) { connectedGeneration = 0 }
+            incoming.close()
+        }
+
+        fun blockNextSubscribe(): BlockedSubscribe = BlockedSubscribe().also { blocked ->
+            check(blockedSubscribe.compareAndSet(null, blocked))
+        }
+
+        fun replaceGeneration(): Int = synchronized(lock) {
+            check(connectedGeneration > 0)
+            connectedGeneration++
+            connectedGeneration
+        }
+
+        fun emitConnectedEvent(generation: Int) {
+            check(generation > 0)
+            check(
+                mutableConnectionEvents.tryEmit(
+                    ProductionRealtimeSessionConnectionEvent(RealtimeState.Connected, generation),
+                ),
+            )
+            check(mutableState.tryEmit(RealtimeState.Connected))
+        }
+    }
+
     private class QueuedSessionTransport : ProductionRealtimeSessionTransport {
         private val incoming = Channel<ProductionReceivedEnvelope>(
             capacity = Channel.UNLIMITED,
@@ -2511,6 +2816,9 @@ class ProductionRealtimeSessionClientTest {
         private val mutableState = MutableSharedFlow<RealtimeState>(replay = 1, extraBufferCapacity = 4)
         private val releaseCount = AtomicInteger(0)
         private val connectionCount = AtomicInteger(0)
+        private val connectedGeneration = AtomicInteger(0)
+        private val gracefulCloses = AtomicInteger(0)
+        private val immediateCloses = AtomicInteger(0)
         val sent = CopyOnWriteArrayList<Envelope>()
         val disconnectReasons = CopyOnWriteArrayList<String>()
 
@@ -2524,8 +2832,15 @@ class ProductionRealtimeSessionClientTest {
         val connectCount: Int
             get() = connectionCount.get()
 
+        val gracefulCloseCount: Int
+            get() = gracefulCloses.get()
+
+        val immediateCloseCount: Int
+            get() = immediateCloses.get()
+
         override fun connect() {
             connectionCount.incrementAndGet()
+            connectedGeneration.incrementAndGet()
             check(mutableState.tryEmit(RealtimeState.Connected))
         }
 
@@ -2535,19 +2850,54 @@ class ProductionRealtimeSessionClientTest {
         }
 
         override fun disconnect(reason: String) {
+            connectedGeneration.set(0)
             disconnectReasons += reason
         }
 
+        override fun currentConnectedGeneration(): Int = connectedGeneration.get()
+
+        override fun disconnectIfCurrentGeneration(expectedGeneration: Int, reason: String): Boolean =
+            synchronized(this) {
+                if (expectedGeneration <= 0 || connectedGeneration.get() != expectedGeneration) {
+                    false
+                } else {
+                    connectedGeneration.set(0)
+                    disconnectReasons += reason
+                    true
+                }
+            }
+
         override fun close() {
+            immediateCloses.incrementAndGet()
+            incoming.close()
+        }
+
+        override fun closeAfterUnsubscribe() {
+            gracefulCloses.incrementAndGet()
             incoming.close()
         }
 
         fun emitConnected() {
+            connectedGeneration.incrementAndGet()
             check(mutableState.tryEmit(RealtimeState.Connected))
         }
 
         fun emitFailed(reason: String) {
+            connectedGeneration.set(0)
             check(mutableState.tryEmit(RealtimeState.Failed(reason)))
+        }
+
+        fun emitState(state: RealtimeState) {
+            if (state is RealtimeState.Connected) {
+                connectedGeneration.incrementAndGet()
+            } else if (state is RealtimeState.Connecting || state is RealtimeState.Reconnecting ||
+                state is RealtimeState.AuthenticationRejected ||
+                state is RealtimeState.AuthenticationFailed || state is RealtimeState.Failed ||
+                state is RealtimeState.Closed
+            ) {
+                connectedGeneration.set(0)
+            }
+            check(mutableState.tryEmit(state))
         }
 
         fun deliver(envelope: Envelope, generation: Int) {
@@ -2582,6 +2932,14 @@ class ProductionRealtimeSessionClientTest {
 
         override fun disconnect(reason: String) {
             disconnectReasons += reason
+        }
+
+        override fun currentConnectedGeneration(): Int = 1
+
+        override fun disconnectIfCurrentGeneration(expectedGeneration: Int, reason: String): Boolean {
+            if (expectedGeneration != 1) return false
+            disconnectReasons += reason
+            return true
         }
 
         override fun close() = Unit

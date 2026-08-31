@@ -12,7 +12,7 @@ stated separately below.
 ## Workspace
 
 - `termlink-terminal-core`: deterministic terminal state, event application,
-  VT subset, bounded runtime scrollback, and Snapshot V2.0 through V2.8.
+  VT subset, bounded runtime scrollback, and Snapshot V2.0 through V2.10.
 - `termlink-terminal-ffi`: panic-contained C ABI and owned-buffer boundary.
 - `include/termlink_terminal.h`: public C declarations.
 - [`UNIMPLEMENTED_CAPABILITIES.md`](UNIMPLEMENTED_CAPABILITIES.md): explicit
@@ -251,22 +251,35 @@ same byte interpretation and RIS does not change the profile. The default UTF-8
 profile continues to select the lowest V2.0..V2.7 profile that preserves its
 state.
 
+When the primary screen has a non-empty retained history prefix, export selects
+Snapshot V2.10 and required feature `0x40_0000` in addition to the existing
+history feature. V2.10 composes with REP, cursor style, extended SGR, Win32
+input, Kitty keyboard state, NRC, standalone C1, and modern private modes. Its
+`PRIMARY_META` and `PRIMARY_ROWS` sections use version 3. `stored_rows` covers
+the complete bounded `[history prefix][visible suffix]`, and `viewport_top` is
+exactly `stored_rows - visible_rows`. Primary row records preserve logical-line
+anchors, head truncation, sealed revision, presentation cells, and the runtime
+scrollback generation. Alternate rows remain visible-only and cannot acquire a
+history prefix. A history policy with no retained prefix continues to select
+the lowest byte-identical V2.1..V2.9 profile. Those legacy profiles have no
+scrollback-generation field, so import starts a fresh generation at zero.
+
 The format minor and minimum-reader minor must match exactly. This reader
-strictly accepts only the eight legacy profiles, eight V2.4 profiles, 16 V2.5
-profiles, 32 V2.6 profiles, 64 V2.7 profiles, and 128 V2.8 profiles described
-above, and rejects feature,
+strictly accepts the legacy V2.0..V2.9 profiles plus V2.10 retained-scrollback
+profiles, and rejects feature,
 core/screen/rendition/mode-section-version, rendition enum, color/reserved
 bits, reference, UTF-8, width, and canonical-table mismatches.
 Import followed by export without an event is byte-identical for every accepted
 profile. The exact current source-derived maximum canonical Snapshot encoding
-is 44,568,090 bytes; import retains the independent 64 MiB hard limit.
+is 44,892,210 bytes; import retains the independent 64 MiB hard limit.
 
-All history-enabled profiles deliberately project only the two visible screens:
-hidden scrollback cells, their sealed revisions, and history-only
-grapheme/rendition entries are not included. The separately bounded OSC state
-remains part of the snapshot. Import therefore restores an empty history prefix
-while preserving the capacity policy and visible logical anchors for
-subsequent output.
+V2.1..V2.9 history-enabled profiles deliberately project only the two visible
+screens so their existing bytes and import behavior remain frozen. V2.10 is
+selected as soon as hidden primary rows exist and includes every retained
+primary cell plus all referenced grapheme, rendition, hyperlink, and extended
+SGR table entries. Import therefore restores the same bounded history prefix;
+legacy imports still restore an empty prefix while preserving the capacity
+policy and visible logical anchors for subsequent output.
 
 The C ABI freezes an opaque immutable checkpoint before exporting its bytes or
 metadata. Import constructs and validates a separate terminal before publishing
@@ -320,8 +333,9 @@ ID frontier together with the rest of terminal state.
 Resize/crop/reflow preserves the history/viewport boundary and visible cursor,
 saved-cursor, and logical anchors within the configured limits. This remains
 bounded runtime storage, not a public paged History Page wire/API. Portable
-Snapshot and ordinary Render Frame bytes keep their existing semantics; the
-offset renderer reads only the history frozen inside its local checkpoint.
+Snapshot V2.10 freezes this bounded history, while ordinary Render Frame bytes
+keep their visible-window semantics; the offset renderer reads only the history
+frozen inside its local checkpoint.
 
 ## Phase-one behavior
 
@@ -506,10 +520,11 @@ Current deliberate boundaries:
   SS3, DCS, SOS, CSI, ST, OSC, PM, and APC. Other C1 controls fail closed, and
   a UTF-8-encoded C1 scalar is not reinterpreted as standalone C1. The input
   paste encoder independently strips raw and UTF-8-encoded C1 controls.
-- Runtime history capture is implemented, but immutable History Page V1 tokens,
-  bounded sealed-logical-line pagination, durable transcript projection, and a
-  public history FFI are not. All history-enabled Snapshot profiles and all
-  three Render Frame versions intentionally exclude hidden history cells.
+- Runtime history capture and V2.10 checkpoint persistence are implemented, but
+  immutable History Page V1 tokens, bounded sealed-logical-line pagination,
+  durable transcript projection, and a public history FFI are not. Legacy
+  V2.1..V2.9 snapshots and ordinary Render Frame versions exclude hidden cells;
+  V2.10 retains the bounded primary prefix.
 - Tab stops default to every eight columns and are dynamically changed by
   HTS/TBC; the full bounded tab bitset survives resize and Snapshot V2.
 - Primary resize normally reflows soft-wrapped logical lines. While DECLRMM is

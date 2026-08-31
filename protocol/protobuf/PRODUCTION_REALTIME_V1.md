@@ -149,10 +149,25 @@ replay serialization prevents a concurrent live event from overtaking replay.
 If S+1 is unavailable, the PC sends an explicit Gap and the client does not
 advance its ACK.
 
-Phase 1 snapshots contain both visible terminal buffers but an empty snapshot
-scrollback. Older rows are separate, bounded `TerminalTranscriptPageV1`
-objects fetched only on upward scroll. Transcript browsing never changes the
-live ACK and transcript data is never prepended to a live VT parser.
+The client may establish and authenticate the device WebSocket before this
+REST work, but it MUST keep the recovering session unsubscribed until the
+renderer binding is durable. The unsubscribed connection is the only atomic
+V1 pause before replay starts. `SUBSCRIBE(A)` followed by
+`FLOW_CONTROL(paused=true)` is not equivalent: output may be routed between
+those two frames, and the Relay cannot inspect their encrypted payloads. After
+Snapshot S is installed, the client MAY restore a locally cached, authenticated
+and contiguous suffix S+1 through R before connecting the live stream. It MUST
+persist cumulative ACK R without regressing an older durable ACK, then set both
+`Envelope.ack` and the decrypted `SubscribePayload.resume_from_seq` to R. The
+first ordinary replay frame is exactly R+1. With no restored suffix, R equals S.
+
+Legacy Phase 1 Termux Snapshot V1 objects contain both visible terminal buffers
+but an empty snapshot scrollback. Terminal-core Snapshot V2.10 instead retains
+its bounded primary scrollback inside the canonical checkpoint; older V2.x
+profiles remain visible-only. Any separately published older rows are bounded
+`TerminalTranscriptPageV1` objects fetched only on upward scroll. Transcript
+browsing never changes the live ACK, and transcript data is never prepended to
+a live VT parser.
 
 ## Lifecycle results
 

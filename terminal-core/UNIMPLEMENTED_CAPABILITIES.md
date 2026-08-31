@@ -24,7 +24,7 @@
 
 | 能力 | 当前已有基础 | 仍缺少的完整能力 | 当前行为 |
 |---|---|---|---|
-| History Page | 有界 runtime scrollback、行 ID/revision、Snapshot 可见双屏投影 | immutable capture、分页 token、anchor、sealed logical line、截断和 stale 语义 | 无对外分页历史 API |
+| History Page | 有界 runtime scrollback、行 ID/revision、Snapshot V2.10 retained primary scrollback | immutable capture、分页 token、anchor、sealed logical line、截断和 stale 语义 | 检查点可恢复历史，但无对外分页历史 API |
 | Delta | 有 presentation revision、Snapshot 和 Render Frame | dirty journal、稳定资源 ID、tombstone、base/target revision、gap/resync | 预留入口返回 unsupported |
 | DRCS | DCS 分派、G0–G3、NRC/charset 状态、Snapshot | DECDLD/DRCS 解析、字形仓库、映射、持久化、跨平台 glyph 渲染 | 已知有状态序列 fail closed |
 | SIXEL | DCS 边界、流式 parser 基础、Host Effect 通道 | SIXEL rasterizer、颜色寄存器、画布、图片资源和合成 | SIXEL dispatch fail closed |
@@ -34,9 +34,10 @@
 
 ### 为什么当前 scrollback 不等于 History Page
 
-当前 scrollback 是终端运行时内部状态。Snapshot V2 为保持有界、canonical 和恢复确定性，只投影
-可见双屏，不冻结隐藏历史 cells，也不提供 durable transcript。直接把内部数组分页会在 reflow、淘汰、
-宽字符修复和并发输出时产生不稳定结果。
+当前 scrollback 是终端运行时内部状态。Snapshot V2.10 会有界、canonical 地冻结 retained primary
+scrollback，用于检查点恢复；旧 V2.1..V2.9 仍保持 visible-only 字节语义。但 Snapshot 不是可分页的
+durable transcript。直接把内部数组作为在线分页 API 仍会在 reflow、淘汰、宽字符修复和并发输出时
+产生不稳定结果。
 
 ### 需要实现
 

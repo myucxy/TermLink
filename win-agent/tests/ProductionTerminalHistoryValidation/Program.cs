@@ -151,6 +151,7 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 ValidateTerminalHistoryLifecycleGate(root, pcDeviceId);
                 ValidateNoOutputSnapshotEligibility(root, pcDeviceId);
                 ValidateTerminalCoreSnapshotV2(root, pcDeviceId);
+                ValidateTerminalCoreAuthorityMigration(root, pcDeviceId);
                 ValidateTerminalCoreShadowGoldenStreams(root, pcDeviceId);
                 var store = new ProductionTerminalHistoryStore(root, pcDeviceId);
                 var producer = new ProductionTerminalHistoryProducer(store, pcDeviceId);
@@ -1138,7 +1139,10 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 LocalFrameType.Output,
                 sessionId,
                 3,
-                Encoding.UTF8.GetBytes("native-v2-anchor\r\n")));
+                // Nerd Font private-use glyphs are valid terminal data for terminal-core.
+                // Portable V1 rejects them as UNICODE_WIDTH_UNSUPPORTED; production must not
+                // consult that retired authority before creating this checkpoint.
+                Encoding.UTF8.GetBytes("native-v2-anchor \uE0B0\r\n")));
 
             var result = producer.ProcessSession(sessionId);
             Require(result.SnapshotEligible && result.LastSequence == 3,
@@ -1149,7 +1153,9 @@ namespace TermLink.ProductionTerminalHistory.Validation
             Require(
                 artifact.FormatName == SnapshotCrypto.TerminalCoreSnapshotFormatName &&
                 artifact.FormatVersion == SnapshotCrypto.TerminalCoreSnapshotFormatVersion &&
-                artifact.ObservedLocalInputEpoch == 7,
+                artifact.ObservedLocalInputEpoch == 7 &&
+                artifact.TranscriptPageCount == 0 &&
+                outbox.Artifacts.Count == 1,
                 "terminal-core Snapshot V2 outbox metadata is invalid.");
 
             var recipient = new ProductionHistoryRecipient
@@ -1192,6 +1198,275 @@ namespace TermLink.ProductionTerminalHistory.Validation
                     CryptographicOperations.ZeroMemory(prepared.SealedObject);
                 CryptographicOperations.ZeroMemory(recipient.PairwiseKey);
             }
+        }
+
+        private static void ValidateTerminalCoreAuthorityMigration(string root, Guid pcDeviceId)
+        {
+            var store = new ProductionTerminalHistoryStore(
+                Path.Combine(root, "terminal-core-authority-migration"),
+                pcDeviceId);
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000081");
+            var recipient = new ProductionHistoryRecipient
+            {
+                DeviceId = Guid.Parse("bbbbbbbb-cccc-4ddd-8eee-000000000081"),
+                PairwiseKey = Enumerable.Range(33, 32).Select(value => (byte)value).ToArray(),
+                KeyEpoch = 9
+            };
+            ProductionTerminalHistoryPreparedUpload legacyPrepared;
+            using (var legacy = new ProductionTerminalHistoryProducer(store, pcDeviceId))
+            {
+                legacy.AppendCommittedFrame(new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    1,
+                    Encoding.UTF8.GetBytes("legacy-compatible\r\n")));
+                var oldResult = legacy.ProcessSession(sessionId);
+                Require(oldResult.SnapshotEligible &&
+                    legacy.LoadOutbox(sessionId).Artifacts.Single(value =>
+                        value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot).FormatName ==
+                        SnapshotCrypto.SnapshotFormatName,
+                    "Legacy authority did not create the migration fixture.");
+                legacyPrepared = legacy.PrepareNextUpload(sessionId, recipient);
+                Require(legacyPrepared?.Artifact.Kind ==
+                    ProductionTerminalHistoryArtifactKind.Snapshot,
+                    "Legacy authority migration fixture did not persist recipient ciphertext.");
+            }
+
+            // The same durable sequence must be rebuilt from WAL and may replace the V1
+            // outbox only in the forward authority direction. Recipient delivery state is
+            // deliberately reset because the authenticated object domain changed.
+            using (var native = new ProductionTerminalHistoryProducer(
+                store,
+                pcDeviceId,
+                terminalCoreShadowEnabled: false,
+                terminalCoreSnapshotAuthorityEnabled: true,
+                terminalCoreShadowObserver: null))
+            {
+                var migrated = native.ProcessSession(sessionId);
+                var checkpoint = native.LoadCheckpoint(sessionId);
+                var outbox = native.LoadOutbox(sessionId);
+                var snapshot = outbox.Artifacts.Single(value =>
+                    value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot);
+                Require(migrated.SnapshotEligible && migrated.LastSequence == 1 &&
+                    checkpoint.SnapshotEligible && checkpoint.AuthorityVersion == 2 &&
+                    snapshot.FormatName == SnapshotCrypto.TerminalCoreSnapshotFormatName &&
+                    snapshot.FormatVersion == SnapshotCrypto.TerminalCoreSnapshotFormatVersion &&
+                    outbox.Deliveries.Count == 0,
+                    "Legacy V1 production was not replaced by terminal-core V2 at the same anchor.");
+                Expect<InvalidOperationException>(
+                    () => native.MarkUploaded(legacyPrepared),
+                    "A superseded V1 delivery remained valid after the authority upgrade.");
+            }
+            CryptographicOperations.ZeroMemory(legacyPrepared.SealedObject);
+            CryptographicOperations.ZeroMemory(recipient.PairwiseKey);
+
+            var rejectedStore = new ProductionTerminalHistoryStore(
+                Path.Combine(root, "terminal-core-rejected-migration"),
+                pcDeviceId);
+            var rejectedSession = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000082");
+            using (var legacy = new ProductionTerminalHistoryProducer(rejectedStore, pcDeviceId))
+            {
+                legacy.AppendCommittedFrame(new LocalFrame(
+                    LocalFrameType.Output,
+                    rejectedSession,
+                    1,
+                    Encoding.UTF8.GetBytes("portable-reject \uE0B0\r\n")));
+                var rejected = legacy.ProcessSession(rejectedSession);
+                Require(!rejected.SnapshotEligible && rejected.PermanentlyIneligible &&
+                    rejected.IneligibilityCode == "UNICODE_WIDTH_UNSUPPORTED" &&
+                    legacy.LoadOutbox(rejectedSession) == null,
+                    "Portable rejection migration fixture was not durable.");
+            }
+            using (var native = new ProductionTerminalHistoryProducer(
+                rejectedStore,
+                pcDeviceId,
+                terminalCoreShadowEnabled: false,
+                terminalCoreSnapshotAuthorityEnabled: true,
+                terminalCoreShadowObserver: null))
+            {
+                var migrated = native.ProcessSession(rejectedSession);
+                Require(migrated.SnapshotEligible &&
+                    native.LoadCheckpoint(rejectedSession).AuthorityVersion == 2 &&
+                    native.LoadOutbox(rejectedSession).Artifacts.Single(value =>
+                        value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot).FormatName ==
+                        SnapshotCrypto.TerminalCoreSnapshotFormatName,
+                    "A legacy Unicode rejection was not rebuilt by terminal-core from WAL.");
+            }
+
+            ValidateLegacyHybridTerminalCoreAuthorityMigration(root, pcDeviceId);
+        }
+
+        private static void ValidateLegacyHybridTerminalCoreAuthorityMigration(
+            string root,
+            Guid pcDeviceId)
+        {
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000083");
+            var frames = new[]
+            {
+                new LocalFrame(
+                    LocalFrameType.Resize,
+                    sessionId,
+                    1,
+                    LocalPayloadCodec.Resize(8, 3)),
+                new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    2,
+                    Encoding.UTF8.GetBytes(string.Concat(
+                        Enumerable.Range(0, 40).Select(value => $"old-{value:D2}\r\n"))))
+            };
+
+            ProductionTerminalHistoryCheckpoint portableCheckpoint;
+            ProductionTerminalHistoryOutbox portableOutbox;
+            using (var portable = new ProductionTerminalHistoryProducer(
+                new ProductionTerminalHistoryStore(
+                    Path.Combine(root, "terminal-core-hybrid-portable-source"),
+                    pcDeviceId),
+                pcDeviceId))
+            {
+                var result = portable.ProcessSession(sessionId, frames);
+                portableCheckpoint = portable.LoadCheckpoint(sessionId);
+                portableOutbox = portable.LoadOutbox(sessionId);
+                Require(result.SnapshotEligible && portableOutbox.Artifacts.Any(value =>
+                    value.Kind == ProductionTerminalHistoryArtifactKind.Transcript),
+                    "Legacy hybrid fixture did not contain Portable transcript pages.");
+            }
+
+            ProductionTerminalHistoryCheckpoint coreCheckpoint;
+            ProductionTerminalHistoryOutbox coreOutbox;
+            using (var core = new ProductionTerminalHistoryProducer(
+                new ProductionTerminalHistoryStore(
+                    Path.Combine(root, "terminal-core-hybrid-native-source"),
+                    pcDeviceId),
+                pcDeviceId,
+                terminalCoreShadowEnabled: false,
+                terminalCoreSnapshotAuthorityEnabled: true,
+                terminalCoreShadowObserver: null))
+            {
+                var result = core.ProcessSession(sessionId, frames);
+                coreCheckpoint = core.LoadCheckpoint(sessionId);
+                coreOutbox = core.LoadOutbox(sessionId);
+                Require(result.SnapshotEligible && coreCheckpoint.AuthorityVersion == 2,
+                    "Legacy hybrid fixture did not produce its terminal-core source.");
+            }
+
+            var coreOnlyStore = new ProductionTerminalHistoryStore(
+                Path.Combine(root, "terminal-core-authority-zero-core-only"),
+                pcDeviceId);
+            coreOnlyStore.SaveCheckpoint(new ProductionTerminalHistoryCheckpoint
+            {
+                SessionId = sessionId,
+                LastSequence = coreCheckpoint.LastSequence,
+                AuthorityVersion = 0,
+                SnapshotEligible = true,
+                IneligibilityCode = string.Empty,
+                SnapshotPlaintext = (byte[])coreCheckpoint.SnapshotPlaintext.Clone(),
+                TranscriptPlaintexts = new List<byte[]>()
+            });
+            coreOnlyStore.SaveOutbox(coreOutbox.Clone());
+            var changedPlaintext = (byte[])coreCheckpoint.SnapshotPlaintext.Clone();
+            changedPlaintext[changedPlaintext.Length - 1] ^= 0x01;
+            var changedOutbox = coreOutbox.Clone();
+            changedOutbox.Artifacts.Single(value =>
+                value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot).Plaintext =
+                (byte[])changedPlaintext.Clone();
+            var changedCheckpoint = new ProductionTerminalHistoryCheckpoint
+            {
+                SessionId = sessionId,
+                LastSequence = coreCheckpoint.LastSequence,
+                AuthorityVersion = 2,
+                SnapshotEligible = true,
+                IneligibilityCode = string.Empty,
+                SnapshotPlaintext = (byte[])changedPlaintext.Clone(),
+                TranscriptPlaintexts = new List<byte[]>()
+            };
+            Expect<InvalidDataException>(
+                () => coreOnlyStore.SaveProduction(changedCheckpoint, changedOutbox),
+                "A core-only legacy checkpoint accepted changed same-format plaintext as an authority upgrade.");
+            Require(coreOnlyStore.LoadOutbox(sessionId).Artifacts.Single(value =>
+                    value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot).Plaintext
+                    .SequenceEqual(coreCheckpoint.SnapshotPlaintext),
+                "Rejected same-format plaintext replacement changed the durable outbox.");
+            CryptographicOperations.ZeroMemory(changedPlaintext);
+            CryptographicOperations.ZeroMemory(changedCheckpoint.SnapshotPlaintext);
+            CryptographicOperations.ZeroMemory(changedOutbox.Artifacts.Single(value =>
+                value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot).Plaintext);
+
+            var legacyHybridOutbox = portableOutbox.Clone();
+            var portableSnapshotIndex = legacyHybridOutbox.Artifacts.FindIndex(value =>
+                value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot);
+            var portableSnapshot = legacyHybridOutbox.Artifacts[portableSnapshotIndex];
+            var coreSnapshot = coreOutbox.Artifacts.Single(value =>
+                value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot).Clone();
+            coreSnapshot.ArtifactId = portableSnapshot.ArtifactId;
+            coreSnapshot.UploadOrder = portableSnapshot.UploadOrder;
+            coreSnapshot.InitialTranscriptBeforeLineId =
+                portableSnapshot.InitialTranscriptBeforeLineId;
+            coreSnapshot.TranscriptPageCount = legacyHybridOutbox.Artifacts.Count(value =>
+                value.Kind == ProductionTerminalHistoryArtifactKind.Transcript);
+            legacyHybridOutbox.Artifacts[portableSnapshotIndex] = coreSnapshot;
+
+            var targetStore = new ProductionTerminalHistoryStore(
+                Path.Combine(root, "terminal-core-hybrid-migration"),
+                pcDeviceId);
+            using (var walWriter = new ProductionTerminalHistoryProducer(targetStore, pcDeviceId))
+            {
+                foreach (var frame in frames) walWriter.AppendCommittedFrame(frame);
+            }
+            targetStore.SaveCheckpoint(new ProductionTerminalHistoryCheckpoint
+            {
+                SessionId = sessionId,
+                LastSequence = coreCheckpoint.LastSequence,
+                // Pre-authority-version builds deserialize this missing field as zero.
+                AuthorityVersion = 0,
+                SnapshotEligible = true,
+                IneligibilityCode = string.Empty,
+                SnapshotPlaintext = (byte[])coreCheckpoint.SnapshotPlaintext.Clone(),
+                TranscriptPlaintexts = portableCheckpoint.TranscriptPlaintexts
+                    .Select(value => (byte[])value.Clone())
+                    .ToList()
+            });
+            targetStore.SaveOutbox(legacyHybridOutbox);
+
+            var recipient = new ProductionHistoryRecipient
+            {
+                DeviceId = Guid.Parse("bbbbbbbb-cccc-4ddd-8eee-000000000083"),
+                PairwiseKey = Enumerable.Range(97, 32).Select(value => (byte)value).ToArray(),
+                KeyEpoch = 11
+            };
+            ProductionTerminalHistoryPreparedUpload oldPrepared;
+            using (var legacyReader = new ProductionTerminalHistoryProducer(targetStore, pcDeviceId))
+            {
+                oldPrepared = legacyReader.PrepareNextUpload(sessionId, recipient);
+                Require(oldPrepared?.Artifact.Kind ==
+                    ProductionTerminalHistoryArtifactKind.Snapshot,
+                    "Legacy hybrid fixture did not persist recipient ciphertext.");
+            }
+
+            using (var native = new ProductionTerminalHistoryProducer(
+                targetStore,
+                pcDeviceId,
+                terminalCoreShadowEnabled: false,
+                terminalCoreSnapshotAuthorityEnabled: true,
+                terminalCoreShadowObserver: null))
+            {
+                var migrated = native.ProcessSession(sessionId);
+                var checkpoint = native.LoadCheckpoint(sessionId);
+                var outbox = native.LoadOutbox(sessionId);
+                Require(migrated.SnapshotEligible && checkpoint.AuthorityVersion == 2 &&
+                    checkpoint.TranscriptPlaintexts.Count == 0 &&
+                    outbox.Artifacts.Count == 1 &&
+                    outbox.Artifacts[0].FormatName ==
+                        SnapshotCrypto.TerminalCoreSnapshotFormatName &&
+                    outbox.Deliveries.Count == 0,
+                    "Legacy core-V2 plus Portable transcript production was not upgraded.");
+                Expect<InvalidOperationException>(
+                    () => native.MarkUploaded(oldPrepared),
+                    "Legacy hybrid recipient ciphertext survived the authority upgrade.");
+            }
+
+            CryptographicOperations.ZeroMemory(oldPrepared.SealedObject);
+            CryptographicOperations.ZeroMemory(recipient.PairwiseKey);
         }
 
         private static void ValidateTerminalCoreShadowGoldenStreams(string root, Guid pcDeviceId)

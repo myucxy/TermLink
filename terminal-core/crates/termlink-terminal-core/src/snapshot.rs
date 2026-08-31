@@ -32,6 +32,7 @@ const MINOR_V2_6: u16 = 6;
 const MINOR_V2_7: u16 = 7;
 const MINOR_V2_8: u16 = 8;
 const MINOR_V2_9: u16 = 9;
+const MINOR_V2_10: u16 = 10;
 const HEADER_SIZE: usize = 104;
 const DIRECTORY_ENTRY_SIZE: usize = 32;
 const SECTION_COUNT: usize = 12;
@@ -48,6 +49,7 @@ const KEYBOARD_PROTOCOL_STATE_FEATURE: u128 = 0x4_0000;
 const NATIONAL_REPLACEMENT_CHARSET_FEATURE: u128 = 0x8_0000;
 const STANDALONE_C1_OUTPUT_PROFILE_FEATURE: u128 = 0x10_0000;
 const MODERN_PRIVATE_MODES_FEATURE: u128 = 0x20_0000;
+const RETAINED_PRIMARY_SCROLLBACK_FEATURE: u128 = 0x40_0000;
 const OPTIONAL_FEATURES_V2_5: u128 =
     HISTORY_ANCHORS_FEATURE | REP_SOURCE_FEATURE | CURSOR_STYLE_FEATURE | EXTENDED_SGR_FEATURE;
 const REQUIRED_FEATURES_V2_5: u128 = REQUIRED_FEATURES_V2_0 | WIN32_INPUT_MODE_FEATURE;
@@ -81,6 +83,15 @@ const OPTIONAL_FEATURES_V2_9: u128 = HISTORY_ANCHORS_FEATURE
     | NATIONAL_REPLACEMENT_CHARSET_FEATURE
     | STANDALONE_C1_OUTPUT_PROFILE_FEATURE;
 const REQUIRED_FEATURES_V2_9: u128 = REQUIRED_FEATURES_V2_0 | MODERN_PRIVATE_MODES_FEATURE;
+const OPTIONAL_FEATURES_V2_10: u128 = REP_SOURCE_FEATURE
+    | CURSOR_STYLE_FEATURE
+    | EXTENDED_SGR_FEATURE
+    | WIN32_INPUT_MODE_FEATURE
+    | KEYBOARD_PROTOCOL_STATE_FEATURE
+    | NATIONAL_REPLACEMENT_CHARSET_FEATURE
+    | STANDALONE_C1_OUTPUT_PROFILE_FEATURE
+    | MODERN_PRIVATE_MODES_FEATURE;
+const REQUIRED_FEATURES_V2_10: u128 = REQUIRED_FEATURES_V2_1 | RETAINED_PRIMARY_SCROLLBACK_FEATURE;
 const REQUIRED_FEATURES_V2_1: u128 = REQUIRED_FEATURES_V2_0 | HISTORY_ANCHORS_FEATURE;
 const REQUIRED_FEATURES_V2_2: u128 = REQUIRED_FEATURES_V2_0 | REP_SOURCE_FEATURE;
 const REQUIRED_FEATURES_V2_2_HISTORY: u128 = REQUIRED_FEATURES_V2_1 | REP_SOURCE_FEATURE;
@@ -108,10 +119,13 @@ const REQUIRED_FEATURES_V2_4_HISTORY_REPEAT_CURSOR: u128 =
 const MAX_GRAPHEME_TABLE_ENTRIES: usize = 2 * MAX_CELLS + 2;
 const MAX_RENDITION_TABLE_ENTRIES: usize = 2 * MAX_CELLS + 5;
 const GRAPHEME_WIDTH_WORDS: usize = MAX_GRAPHEME_TABLE_ENTRIES.div_ceil(u64::BITS as usize);
+const RENDITION_USE_WORDS: usize = MAX_RENDITION_TABLE_ENTRIES.div_ceil(u64::BITS as usize);
 const ENVELOPE_BYTES: usize = HEADER_SIZE + SECTION_COUNT_V2_6 * DIRECTORY_ENTRY_SIZE;
 const MAX_GRAPHEME_SECTION_BYTES: usize = 16 + (MAX_GRAPHEME_TABLE_ENTRIES - 1) * 20;
 const MAX_RENDITION_SECTION_BYTES: usize = 8 + MAX_RENDITION_TABLE_ENTRIES * 48;
-const MAX_ROWS_SECTION_BYTES: usize = 8 + MAX_ROWS as usize * 24 + MAX_CELLS * 16;
+const MAX_LEGACY_ROWS_SECTION_BYTES: usize = 8 + MAX_ROWS as usize * 24 + MAX_CELLS * 16;
+const MAX_PRIMARY_ROWS_SECTION_BYTES: usize =
+    16 + (MAX_ROWS as usize + MAX_HISTORY_ROWS as usize) * 32 + MAX_CELLS * 16;
 
 // Every payload bound below is independent and conservative. There is one
 // pre-section alignment per directory entry and one final alignment.
@@ -126,9 +140,9 @@ const MAX_CANONICAL_SNAPSHOT_BYTES: usize = ENVELOPE_BYTES
     + MAX_GRAPHEME_SECTION_BYTES
     + MAX_RENDITION_SECTION_BYTES
     + 64 // primary metadata
-    + MAX_ROWS_SECTION_BYTES
+    + MAX_PRIMARY_ROWS_SECTION_BYTES
     + 64 // alternate metadata
-    + MAX_ROWS_SECTION_BYTES
+    + MAX_LEGACY_ROWS_SECTION_BYTES
     + (SECTION_COUNT_V2_6 + 1) * 7;
 const _: () = assert!(MAX_CANONICAL_SNAPSHOT_BYTES <= MAX_SNAPSHOT_BYTES);
 
@@ -261,6 +275,16 @@ enum SnapshotVersion {
         national_replacement: bool,
         standalone_c1: bool,
     },
+    V2_10 {
+        repeat: bool,
+        cursor: bool,
+        extended_sgr: bool,
+        win32_input: bool,
+        keyboard_protocol: bool,
+        national_replacement: bool,
+        standalone_c1: bool,
+        modern_private_modes: bool,
+    },
 }
 
 impl SnapshotVersion {
@@ -275,7 +299,20 @@ impl SnapshotVersion {
             || charset_has_national_replacement(terminal.charset)
             || charset_has_national_replacement(terminal.main_saved_charset)
             || charset_has_national_replacement(terminal.alternate_saved_charset);
-        if terminal.modes.grapheme_clustering || terminal.modes.color_scheme_reporting {
+        let modern_private_modes =
+            terminal.modes.grapheme_clustering || terminal.modes.color_scheme_reporting;
+        if history && terminal.main.viewport_top() != 0 {
+            Self::V2_10 {
+                repeat,
+                cursor: cursor_style,
+                extended_sgr,
+                win32_input: terminal.modes.win32_input_mode,
+                keyboard_protocol,
+                national_replacement,
+                standalone_c1: terminal.output_profile == OutputProfile::Utf8WithStandaloneC1,
+                modern_private_modes,
+            }
+        } else if modern_private_modes {
             Self::V2_9 {
                 history,
                 repeat,
@@ -349,6 +386,7 @@ impl SnapshotVersion {
                 | Self::V2_7 { history: true, .. }
                 | Self::V2_8 { history: true, .. }
                 | Self::V2_9 { history: true, .. }
+                | Self::V2_10 { .. }
         )
     }
 
@@ -363,6 +401,7 @@ impl SnapshotVersion {
                 | Self::V2_7 { repeat: true, .. }
                 | Self::V2_8 { repeat: true, .. }
                 | Self::V2_9 { repeat: true, .. }
+                | Self::V2_10 { repeat: true, .. }
         )
     }
 
@@ -376,6 +415,7 @@ impl SnapshotVersion {
                 | Self::V2_7 { cursor: true, .. }
                 | Self::V2_8 { cursor: true, .. }
                 | Self::V2_9 { cursor: true, .. }
+                | Self::V2_10 { cursor: true, .. }
         )
     }
 
@@ -403,6 +443,10 @@ impl SnapshotVersion {
                     extended_sgr: true,
                     ..
                 }
+                | Self::V2_10 {
+                    extended_sgr: true,
+                    ..
+                }
         )
     }
 
@@ -426,6 +470,10 @@ impl SnapshotVersion {
                     win32_input: true,
                     ..
                 }
+                | Self::V2_10 {
+                    win32_input: true,
+                    ..
+                }
         )
     }
 
@@ -445,6 +493,10 @@ impl SnapshotVersion {
                     keyboard_protocol: true,
                     ..
                 }
+                | Self::V2_10 {
+                    keyboard_protocol: true,
+                    ..
+                }
         )
     }
 
@@ -460,6 +512,10 @@ impl SnapshotVersion {
                     national_replacement: true,
                     ..
                 }
+                | Self::V2_10 {
+                    national_replacement: true,
+                    ..
+                }
         )
     }
 
@@ -471,11 +527,26 @@ impl SnapshotVersion {
                     standalone_c1: true,
                     ..
                 }
+                | Self::V2_10 {
+                    standalone_c1: true,
+                    ..
+                }
         )
     }
 
     fn has_modern_private_modes(self) -> bool {
-        matches!(self, Self::V2_9 { .. })
+        matches!(
+            self,
+            Self::V2_9 { .. }
+                | Self::V2_10 {
+                    modern_private_modes: true,
+                    ..
+                }
+        )
+    }
+
+    fn has_retained_primary_scrollback(self) -> bool {
+        matches!(self, Self::V2_10 { .. })
     }
 
     fn v2_5_from_features(features: u128) -> Option<Self> {
@@ -548,6 +619,22 @@ impl SnapshotVersion {
         })
     }
 
+    fn v2_10_from_features(features: u128) -> Option<Self> {
+        if features & !OPTIONAL_FEATURES_V2_10 != REQUIRED_FEATURES_V2_10 {
+            return None;
+        }
+        Some(Self::V2_10 {
+            repeat: features & REP_SOURCE_FEATURE != 0,
+            cursor: features & CURSOR_STYLE_FEATURE != 0,
+            extended_sgr: features & EXTENDED_SGR_FEATURE != 0,
+            win32_input: features & WIN32_INPUT_MODE_FEATURE != 0,
+            keyboard_protocol: features & KEYBOARD_PROTOCOL_STATE_FEATURE != 0,
+            national_replacement: features & NATIONAL_REPLACEMENT_CHARSET_FEATURE != 0,
+            standalone_c1: features & STANDALONE_C1_OUTPUT_PROFILE_FEATURE != 0,
+            modern_private_modes: features & MODERN_PRIVATE_MODES_FEATURE != 0,
+        })
+    }
+
     fn minor(self) -> u16 {
         match self {
             Self::V2_0 => MINOR_V2_0,
@@ -560,6 +647,7 @@ impl SnapshotVersion {
             Self::V2_7 { .. } => MINOR_V2_7,
             Self::V2_8 { .. } => MINOR_V2_8,
             Self::V2_9 { .. } => MINOR_V2_9,
+            Self::V2_10 { .. } => MINOR_V2_10,
         }
     }
 
@@ -744,6 +832,50 @@ impl SnapshotVersion {
                         0
                     }
             }
+            Self::V2_10 {
+                repeat,
+                cursor,
+                extended_sgr,
+                win32_input,
+                keyboard_protocol,
+                national_replacement,
+                standalone_c1,
+                modern_private_modes,
+            } => {
+                REQUIRED_FEATURES_V2_10
+                    | if repeat { REP_SOURCE_FEATURE } else { 0 }
+                    | if cursor { CURSOR_STYLE_FEATURE } else { 0 }
+                    | if extended_sgr {
+                        EXTENDED_SGR_FEATURE
+                    } else {
+                        0
+                    }
+                    | if win32_input {
+                        WIN32_INPUT_MODE_FEATURE
+                    } else {
+                        0
+                    }
+                    | if keyboard_protocol {
+                        KEYBOARD_PROTOCOL_STATE_FEATURE
+                    } else {
+                        0
+                    }
+                    | if national_replacement {
+                        NATIONAL_REPLACEMENT_CHARSET_FEATURE
+                    } else {
+                        0
+                    }
+                    | if standalone_c1 {
+                        STANDALONE_C1_OUTPUT_PROFILE_FEATURE
+                    } else {
+                        0
+                    }
+                    | if modern_private_modes {
+                        MODERN_PRIVATE_MODES_FEATURE
+                    } else {
+                        0
+                    }
+            }
             Self::V2_6 {
                 history,
                 repeat,
@@ -786,7 +918,9 @@ impl SnapshotVersion {
     }
 
     fn section_version(self, tag: u32) -> u16 {
-        if self.has_modern_private_modes() && tag == MODE_BANK {
+        if self.has_retained_primary_scrollback() && matches!(tag, PRIMARY_META | PRIMARY_ROWS) {
+            3
+        } else if self.has_modern_private_modes() && tag == MODE_BANK {
             4
         } else if self.has_national_replacement_charset() && tag == MODE_BANK {
             3
@@ -848,7 +982,7 @@ fn terminal_has_extended_sgr(terminal: &Terminal) -> bool {
     .chain(
         terminal
             .main
-            .visible_cells()
+            .cells
             .iter()
             .chain(terminal.alternate.visible_cells())
             .map(|cell| cell.attributes),
@@ -886,6 +1020,15 @@ pub(super) fn export(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
     terminal.ensure_presentation_eligible()?;
     terminal.main.validate()?;
     terminal.alternate.validate()?;
+    if terminal.main.viewport_top() != 0
+        && terminal
+            .main
+            .row_metadata
+            .iter()
+            .any(|metadata| metadata.sealed_revision > terminal.next_source_sequence)
+    {
+        return Err(TerminalError::MalformedSnapshot);
+    }
     if !terminal.margins.validate(terminal.columns, terminal.rows) {
         return Err(TerminalError::MalformedSnapshot);
     }
@@ -910,7 +1053,7 @@ pub(super) fn export(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
     }
     if terminal
         .main
-        .visible_cells()
+        .cells
         .iter()
         .chain(terminal.alternate.visible_cells())
         .filter_map(|cell| cell.hyperlink)
@@ -949,7 +1092,7 @@ fn encode_terminal(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
     }
     let version = SnapshotVersion::for_terminal(terminal);
     let section_count = version.section_count();
-    let graphemes = collect_graphemes(terminal)?;
+    let graphemes = collect_graphemes(terminal, version)?;
     let renditions = collect_renditions(terminal, version)?;
     let osc = terminal
         .osc
@@ -1025,6 +1168,7 @@ fn encode_terminal(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
             &graphemes,
             &renditions,
             version,
+            true,
         )
     );
     section!(ALTERNATE_META, {
@@ -1045,6 +1189,7 @@ fn encode_terminal(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
             &graphemes,
             &renditions,
             version,
+            false,
         )
     );
     debug_assert_eq!(index, section_count);
@@ -1084,10 +1229,16 @@ fn encode_terminal(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
     writer.finish()
 }
 
-fn collect_graphemes(terminal: &Terminal) -> Result<Vec<GraphemeRef<'_>>, TerminalError> {
-    let capacity = terminal
-        .main
-        .visible_cells()
+fn collect_graphemes(
+    terminal: &Terminal,
+    version: SnapshotVersion,
+) -> Result<Vec<GraphemeRef<'_>>, TerminalError> {
+    let main_cells = if version.has_retained_primary_scrollback() {
+        terminal.main.cells.as_slice()
+    } else {
+        terminal.main.visible_cells()
+    };
+    let capacity = main_cells
         .len()
         .checked_add(terminal.alternate.visible_cells().len())
         .and_then(|v| v.checked_add(1 + usize::from(terminal.repeat_source.is_some())))
@@ -1108,12 +1259,7 @@ fn collect_graphemes(terminal: &Terminal) -> Result<Vec<GraphemeRef<'_>>, Termin
             width: source.width,
         });
     }
-    for cell in terminal
-        .main
-        .visible_cells()
-        .iter()
-        .chain(terminal.alternate.visible_cells())
-    {
+    for cell in main_cells.iter().chain(terminal.alternate.visible_cells()) {
         if !cell.continuation {
             values.push(GraphemeRef {
                 character: cell.character,
@@ -1131,9 +1277,12 @@ fn collect_renditions(
     terminal: &Terminal,
     version: SnapshotVersion,
 ) -> Result<Vec<Attributes>, TerminalError> {
-    let capacity = terminal
-        .main
-        .visible_cells()
+    let main_cells = if version.has_retained_primary_scrollback() {
+        terminal.main.cells.as_slice()
+    } else {
+        terminal.main.visible_cells()
+    };
+    let capacity = main_cells
         .len()
         .checked_add(terminal.alternate.visible_cells().len())
         .and_then(|v| v.checked_add(5))
@@ -1149,12 +1298,7 @@ fn collect_renditions(
         terminal.alternate.attributes,
         terminal.alternate.saved.attributes,
     ]);
-    for cell in terminal
-        .main
-        .visible_cells()
-        .iter()
-        .chain(terminal.alternate.visible_cells())
-    {
+    for cell in main_cells.iter().chain(terminal.alternate.visible_cells()) {
         values.push(cell.attributes);
     }
     values.sort_unstable_by_key(|a| rendition_bytes(*a, version));
@@ -1461,10 +1605,19 @@ fn encode_screen_meta(
     version: SnapshotVersion,
     primary: bool,
 ) {
+    let retained_primary = primary && version.has_retained_primary_scrollback();
     writer.u32(screen.columns);
     writer.u32(screen.rows);
-    writer.u32(screen.rows);
-    writer.u32(0);
+    writer.u32(if retained_primary {
+        screen.stored_rows()
+    } else {
+        screen.rows
+    });
+    writer.u32(if retained_primary {
+        screen.viewport_top()
+    } else {
+        0
+    });
     writer.u32(screen.cursor_row);
     writer.u32(screen.cursor_column);
     writer.u32(u32::from(screen.wrap_pending) | (u32::from(screen.protected) << 1));
@@ -1497,9 +1650,13 @@ fn encode_rows(
     graphemes: &[GraphemeRef<'_>],
     renditions: &[Attributes],
     version: SnapshotVersion,
+    primary: bool,
 ) -> u32 {
     let width = screen.columns as usize;
-    let (available, visible_start, cells) = if version.has_history() {
+    let retained_primary = primary && version.has_retained_primary_scrollback();
+    let (available, stored_start, cells) = if retained_primary {
+        (screen.stored_rows() as usize, 0, screen.cells.as_slice())
+    } else if version.has_history() {
         (
             screen.rows as usize,
             screen.viewport_top() as usize,
@@ -1516,8 +1673,11 @@ fn encode_rows(
     };
     writer.u32(available as u32);
     writer.u32(0);
+    if retained_primary {
+        writer.u64(screen.scrollback_generation_rows());
+    }
     for row in 0..available {
-        let stored_row = visible_start + row;
+        let stored_row = stored_start + row;
         let metadata = if version.has_history() {
             screen.row_metadata[stored_row]
         } else {
@@ -1526,7 +1686,7 @@ fn encode_rows(
         let head_truncated = version.has_history()
             && row == 0
             && (metadata.is_head_truncated()
-                || screen.row_metadata[..visible_start]
+                || screen.row_metadata[..stored_start]
                     .iter()
                     .any(|candidate| candidate.logical_line_id == metadata.logical_line_id));
         writer.u64(if version.has_history() {
@@ -1549,6 +1709,9 @@ fn encode_rows(
                 },
         );
         writer.u32(count_runs(cells, width, row) as u32);
+        if retained_primary {
+            writer.u64(metadata.sealed_revision);
+        }
         let mut column = 0;
         while column < width {
             let cell = &cells[row * width + column];
@@ -1667,18 +1830,39 @@ struct GraphemeUses {
     used: [u64; GRAPHEME_WIDTH_WORDS],
 }
 
+struct RenditionUses {
+    used: [u64; RENDITION_USE_WORDS],
+}
+
 struct RowScanTables<'a> {
     grapheme_count: usize,
     rendition_count: usize,
     hyperlink_count: usize,
     widths: &'a GraphemeWidths,
     grapheme_uses: &'a mut GraphemeUses,
+    rendition_uses: &'a mut RenditionUses,
 }
 
 impl GraphemeUses {
     fn new() -> Self {
         Self {
             used: [0; GRAPHEME_WIDTH_WORDS],
+        }
+    }
+
+    fn set(&mut self, index: usize) {
+        self.used[index / u64::BITS as usize] |= 1 << (index % u64::BITS as usize);
+    }
+
+    fn get(&self, index: usize) -> bool {
+        self.used[index / u64::BITS as usize] & (1 << (index % u64::BITS as usize)) != 0
+    }
+}
+
+impl RenditionUses {
+    fn new() -> Self {
+        Self {
+            used: [0; RENDITION_USE_WORDS],
         }
     }
 
@@ -1740,6 +1924,7 @@ fn preflight_a(bytes: &[u8]) -> Result<Preflight, TerminalError> {
                 | MINOR_V2_7
                 | MINOR_V2_8
                 | MINOR_V2_9
+                | MINOR_V2_10
         )
     {
         return Err(TerminalError::IncompatibleSnapshot);
@@ -1838,6 +2023,8 @@ fn preflight_a(bytes: &[u8]) -> Result<Preflight, TerminalError> {
         (MINOR_V2_8, features) => SnapshotVersion::v2_8_from_features(features)
             .ok_or(TerminalError::IncompatibleSnapshot)?,
         (MINOR_V2_9, features) => SnapshotVersion::v2_9_from_features(features)
+            .ok_or(TerminalError::IncompatibleSnapshot)?,
+        (MINOR_V2_10, features) => SnapshotVersion::v2_10_from_features(features)
             .ok_or(TerminalError::IncompatibleSnapshot)?,
         _ => return Err(TerminalError::IncompatibleSnapshot),
     };
@@ -1992,6 +2179,7 @@ fn preflight_b(bytes: &[u8], preflight: &Preflight) -> Result<(), TerminalError>
         section(bytes, preflight, RENDITION_TABLE)?,
         preflight.version,
     )?;
+    let mut rendition_uses = RenditionUses::new();
     if grapheme_count as u32 != logical_count(preflight, GRAPHEME_TABLE)?
         || rendition_count as u32 != logical_count(preflight, RENDITION_TABLE)?
     {
@@ -2009,18 +2197,31 @@ fn preflight_b(bytes: &[u8], preflight: &Preflight) -> Result<(), TerminalError>
         preflight.version,
         false,
     )?;
+    if preflight.version.has_retained_primary_scrollback() {
+        for id in [
+            primary.attributes_id,
+            primary.saved_attributes_id,
+            alternate.attributes_id,
+            alternate.saved_attributes_id,
+        ] {
+            rendition_uses.set(id as usize);
+        }
+    }
     let mut row_tables = RowScanTables {
         grapheme_count,
         rendition_count,
         hyperlink_count,
         widths: &widths,
         grapheme_uses: &mut grapheme_uses,
+        rendition_uses: &mut rendition_uses,
     };
     scan_rows(
         section(bytes, preflight, PRIMARY_ROWS)?,
         primary,
         &mut row_tables,
         preflight.version,
+        true,
+        core.sequence,
     )?;
     if primary.stored_rows != logical_count(preflight, PRIMARY_ROWS)?
         || alternate.stored_rows != logical_count(preflight, ALTERNATE_ROWS)?
@@ -2032,6 +2233,8 @@ fn preflight_b(bytes: &[u8], preflight: &Preflight) -> Result<(), TerminalError>
         alternate,
         &mut row_tables,
         preflight.version,
+        false,
+        core.sequence,
     )?;
     if alternate.columns != columns
         || alternate.visible_rows != rows
@@ -2048,8 +2251,15 @@ fn preflight_b(bytes: &[u8], preflight: &Preflight) -> Result<(), TerminalError>
         modes,
         margins,
     )?;
-    if (preflight.version.has_repeat_source() || preflight.version.has_cursor_style())
+    if (preflight.version.has_retained_primary_scrollback()
+        || preflight.version.has_repeat_source()
+        || preflight.version.has_cursor_style())
         && (1..grapheme_count).any(|id| !grapheme_uses.get(id))
+    {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    if preflight.version.has_retained_primary_scrollback()
+        && (1..rendition_count).any(|id| !rendition_uses.get(id))
     {
         return Err(TerminalError::MalformedSnapshot);
     }
@@ -2632,8 +2842,15 @@ fn scan_meta(
     let cells = (meta.stored_rows as usize)
         .checked_mul(meta.columns as usize)
         .ok_or(TerminalError::MalformedSnapshot)?;
-    if meta.stored_rows != meta.visible_rows
-        || meta.viewport_top != 0
+    let retained_primary = primary && version.has_retained_primary_scrollback();
+    let geometry_is_invalid = if retained_primary {
+        meta.stored_rows <= meta.visible_rows
+            || meta.viewport_top != meta.stored_rows - meta.visible_rows
+            || u64::from(meta.viewport_top) > meta.requested_history_rows
+    } else {
+        meta.stored_rows != meta.visible_rows || meta.viewport_top != 0
+    };
+    if geometry_is_invalid
         || cells > MAX_CELLS
         || meta.cursor_row >= meta.visible_rows
         || meta.saved_row >= meta.visible_rows
@@ -2664,23 +2881,29 @@ fn scan_rows(
     meta: ScreenMeta,
     tables: &mut RowScanTables<'_>,
     version: SnapshotVersion,
+    primary: bool,
+    checkpoint_sequence: u64,
 ) -> Result<(), TerminalError> {
     let mut r = Reader::new(bytes);
+    let retained_primary = primary && version.has_retained_primary_scrollback();
     let rows = r.u32()?;
     require_zero(r.u32()?)?;
+    let _scrollback_generation_rows = if retained_primary { r.u64()? } else { 0 };
     if rows != meta.stored_rows {
         return Err(TerminalError::MalformedSnapshot);
     }
-    let mut previous_anchor: Option<(u64, u32, u32, bool)> = None;
+    let mut previous_anchor: Option<(u64, u32, u32, bool, u64)> = None;
     for row in 0..rows {
         let logical_line_id = r.u64()?;
         let logical_cell_offset = r.u32()?;
         let meaningful = r.u32()?;
         let flags = r.u32()?;
         let runs = r.u32()?;
+        let sealed_revision = if retained_primary { r.u64()? } else { 0 };
         let soft_wrapped = flags & 1 != 0;
         let head_truncated = flags & 2 != 0;
-        if meaningful > meta.columns
+        if sealed_revision > checkpoint_sequence
+            || meaningful > meta.columns
             || (row + 1 == rows && soft_wrapped)
             || if version.has_history() {
                 flags & !3 != 0
@@ -2688,12 +2911,19 @@ fn scan_rows(
                     || (row != 0 && head_truncated)
                     || match previous_anchor {
                         None => logical_cell_offset != 0 && !head_truncated,
-                        Some((previous_id, previous_offset, previous_meaningful, true)) => {
+                        Some((
+                            previous_id,
+                            previous_offset,
+                            previous_meaningful,
+                            true,
+                            previous_sealed_revision,
+                        )) => {
                             logical_line_id != previous_id
                                 || Some(logical_cell_offset)
                                     != previous_offset.checked_add(previous_meaningful)
+                                || sealed_revision != previous_sealed_revision
                         }
-                        Some((_, _, _, false)) => logical_cell_offset != 0,
+                        Some((_, _, _, false, _)) => logical_cell_offset != 0,
                     }
             } else {
                 logical_line_id != 0 || logical_cell_offset != 0 || flags & !1 != 0
@@ -2706,6 +2936,7 @@ fn scan_rows(
             logical_cell_offset,
             meaningful,
             soft_wrapped,
+            sealed_revision,
         ));
         let mut physical = 0_u64;
         let mut previous = None;
@@ -2725,6 +2956,7 @@ fn scan_rows(
                 return Err(TerminalError::MalformedSnapshot);
             }
             tables.grapheme_uses.set(gid as usize);
+            tables.rendition_uses.set(rid as usize);
             let start = physical;
             let cell_width = tables.widths.get(gid as usize);
             physical = physical
@@ -2745,7 +2977,7 @@ fn scan_rows(
                     (meta.saved_row, meta.saved_column, meta.saved_flags & 1 != 0),
                 ] {
                     let target = u64::from(target_column);
-                    if target_row == row
+                    if meta.viewport_top + target_row == row
                         && target >= start
                         && target < physical
                         && (target - start) % 2 == 1
@@ -2810,6 +3042,14 @@ fn decode_terminal(bytes: &[u8], p: &Preflight) -> Result<Terminal, TerminalErro
         p.version,
         false,
     )?;
+    if main
+        .row_metadata
+        .iter()
+        .chain(&alternate.row_metadata)
+        .any(|metadata| metadata.sealed_revision > core.sequence)
+    {
+        return Err(TerminalError::MalformedSnapshot);
+    }
     main.validate()?;
     alternate.validate()?;
     if core.active_alternate && !modes.left_right_margin {
@@ -2953,18 +3193,22 @@ fn decode_screen(
         .map_err(|_| TerminalError::LimitExceeded)?;
     let mut r = Reader::new(rows_bytes);
     let rows = r.u32()?;
-    r.u32()?;
+    require_zero(r.u32()?)?;
+    let retained_primary = primary && version.has_retained_primary_scrollback();
+    let scrollback_generation_rows = if retained_primary { r.u64()? } else { 0 };
     for _ in 0..rows {
         let logical_line_id = r.u64()?;
         let logical_cell_offset = r.u32()?;
         meaningful_end.push(r.u32()?);
         let flags = r.u32()?;
+        let runs = r.u32()?;
+        let sealed_revision = if retained_primary { r.u64()? } else { 0 };
         soft_wrapped.push(flags & 1 != 0);
         if version.has_history() {
             row_metadata.push(RowMetadata {
                 logical_line_id,
                 logical_cell_offset,
-                sealed_revision: 0,
+                sealed_revision,
                 flags: if flags & 2 != 0 {
                     ROW_FLAG_HEAD_TRUNCATED
                 } else {
@@ -2972,7 +3216,6 @@ fn decode_screen(
                 },
             });
         }
-        let runs = r.u32()?;
         for _ in 0..runs {
             let grapheme = &graphemes[r.u32()? as usize];
             let attributes = renditions[r.u32()? as usize];
@@ -3024,7 +3267,7 @@ fn decode_screen(
         meaningful_end,
         row_metadata,
         next_logical_line_id,
-        scrollback_generation_rows: 0,
+        scrollback_generation_rows,
         storage: StoragePolicy::new(requested_history_rows, MAX_CELLS),
         cursor_row: meta.cursor_row,
         cursor_column: meta.cursor_column,
@@ -3273,13 +3516,18 @@ mod tests {
 
     fn row_record_offsets(bytes: &[u8], directory_index: usize) -> Vec<usize> {
         let section = directory_value(bytes, directory_index, 8) as usize;
+        let section_version = u16_at(
+            bytes,
+            HEADER_SIZE + directory_index * DIRECTORY_ENTRY_SIZE + 6,
+        );
+        let retained_primary = section_version == 3;
         let rows = u32_at(bytes, section) as usize;
-        let mut offset = section + 8;
+        let mut offset = section + if retained_primary { 16 } else { 8 };
         let mut result = Vec::with_capacity(rows);
         for _ in 0..rows {
             result.push(offset);
             let runs = u32_at(bytes, offset + 20) as usize;
-            offset += 24 + runs * 16;
+            offset += if retained_primary { 32 } else { 24 } + runs * 16;
         }
         assert_eq!(
             offset,
@@ -3306,26 +3554,6 @@ mod tests {
             .expect("wrapped output");
         assert_eq!(terminal.main.viewport_top(), 1);
         terminal
-    }
-
-    fn remove_projected_history(terminal: &mut Terminal) {
-        let history_rows = terminal.main.viewport_top() as usize;
-        let history_cells = history_rows * terminal.main.columns as usize;
-        let first_visible_id = terminal.main.row_metadata[history_rows].logical_line_id;
-        let truncated_head = terminal.main.row_metadata[..history_rows]
-            .iter()
-            .any(|metadata| metadata.logical_line_id == first_visible_id);
-        terminal.main.cells.drain(..history_cells);
-        terminal.main.soft_wrapped.drain(..history_rows);
-        terminal.main.meaningful_end.drain(..history_rows);
-        terminal.main.row_metadata.drain(..history_rows);
-        if truncated_head {
-            terminal.main.row_metadata[0].flags |= ROW_FLAG_HEAD_TRUNCATED;
-        }
-        terminal
-            .main
-            .validate()
-            .expect("visible-only projection is valid");
     }
 
     fn next_unique_narrow_scalar(next: &mut u32) -> char {
@@ -3421,18 +3649,19 @@ mod tests {
     }
 
     #[test]
-    fn history_capacity_selects_v2_1_and_roundtrips_visible_anchors_canonically() {
+    fn retained_history_selects_v2_10_and_roundtrips_all_rows_canonically() {
         let terminal = wrapped_history_terminal();
-        let visible_start = terminal.main.viewport_top() as usize;
-        let visible_metadata = terminal.main.row_metadata[visible_start..].to_vec();
-        let visible_cells = terminal.main.visible_cells().to_vec();
-        let snapshot = export(&terminal).expect("V2.1 snapshot");
+        let snapshot = export(&terminal).expect("V2.10 snapshot");
 
-        assert_eq!(u16_at(&snapshot, 10), MINOR_V2_1);
-        assert_eq!(u16_at(&snapshot, 12), MINOR_V2_1);
-        assert_eq!(u64_at(&snapshot, 64), REQUIRED_FEATURES_V2_1 as u64);
+        assert_eq!(u16_at(&snapshot, 10), MINOR_V2_10);
+        assert_eq!(u16_at(&snapshot, 12), MINOR_V2_10);
+        assert_eq!(u64_at(&snapshot, 64), REQUIRED_FEATURES_V2_10 as u64);
         for index in 0..SECTION_COUNT {
-            let expected = if matches!(index, 8..=11) { 2 } else { 1 };
+            let expected = match index {
+                8 | 9 => 3,
+                10 | 11 => 2,
+                _ => 1,
+            };
             assert_eq!(
                 u16_at(&snapshot, HEADER_SIZE + index * DIRECTORY_ENTRY_SIZE + 6),
                 expected,
@@ -3452,33 +3681,24 @@ mod tests {
             terminal.alternate.next_logical_line_id
         );
         assert_eq!(u64_at(&snapshot, alternate_meta + 56), 0);
-        assert_eq!(directory_value(&snapshot, 9, 24), 2);
+        assert_eq!(u32_at(&snapshot, primary_meta + 8), 3);
+        assert_eq!(u32_at(&snapshot, primary_meta + 12), 1);
+        assert_eq!(directory_value(&snapshot, 9, 24), 3);
         assert_eq!(directory_value(&snapshot, 11, 24), 2);
 
-        let restored = import(&snapshot).expect("V2.1 restore");
-        assert_eq!(restored.main.viewport_top(), 0);
-        assert_eq!(restored.main.stored_rows(), restored.main.rows);
+        let restored = import(&snapshot).expect("V2.10 restore");
+        assert_eq!(restored.main.viewport_top(), terminal.main.viewport_top());
+        assert_eq!(restored.main.stored_rows(), terminal.main.stored_rows());
         assert_eq!(restored.main.requested_history_rows(), 4);
-        assert_eq!(restored.main.cells, visible_cells);
+        assert_eq!(restored.main.cells, terminal.main.cells);
         assert_eq!(
             restored.main.next_logical_line_id,
             terminal.main.next_logical_line_id
         );
+        assert_eq!(restored.main.row_metadata, terminal.main.row_metadata);
+        assert_eq!(restored.scrollback_info(), terminal.scrollback_info());
         assert_eq!(
-            restored
-                .main
-                .row_metadata
-                .iter()
-                .map(|metadata| (metadata.logical_line_id, metadata.logical_cell_offset))
-                .collect::<Vec<_>>(),
-            visible_metadata
-                .iter()
-                .map(|metadata| (metadata.logical_line_id, metadata.logical_cell_offset))
-                .collect::<Vec<_>>()
-        );
-        assert!(restored.main.row_metadata[0].is_head_truncated());
-        assert_eq!(
-            export(&restored).expect("canonical V2.1 re-export"),
+            export(&restored).expect("canonical V2.10 re-export"),
             snapshot
         );
 
@@ -3491,6 +3711,35 @@ mod tests {
             .expect("restored capacity captures later output");
         assert!(continued.main.viewport_top() > 0);
         assert!(continued.main.viewport_top() <= 4);
+    }
+
+    #[test]
+    fn v2_10_preserves_a_partially_evicted_soft_wrapped_head() {
+        let mut terminal = Terminal::new_with_options(
+            4,
+            2,
+            0,
+            crate::TerminalOptions {
+                history_capacity_rows: 1,
+            },
+        )
+        .expect("history terminal");
+        terminal
+            .apply_event(crate::Event::Output {
+                source_sequence: 0,
+                bytes: b"abcdefghijklm",
+            })
+            .expect("evict wrapped logical head");
+        assert_eq!(terminal.main.viewport_top(), 1);
+        assert!(terminal.main.row_metadata[0].is_head_truncated());
+        assert!(terminal.main.row_metadata[0].logical_cell_offset > 0);
+
+        let snapshot = export(&terminal).expect("V2.10 truncated-head snapshot");
+        let restored = import(&snapshot).expect("restore truncated head");
+        assert_eq!(restored.main.row_metadata, terminal.main.row_metadata);
+        assert_eq!(restored.main.cells, terminal.main.cells);
+        assert_eq!(restored.scrollback_info(), terminal.scrollback_info());
+        assert_eq!(export(&restored).expect("canonical re-export"), snapshot);
     }
 
     #[test]
@@ -4017,11 +4266,11 @@ mod tests {
         let mut hidden = wrapped_history_terminal();
         assert!(hidden.main.viewport_top() > 0);
         hidden.main.cells[0].attributes.faint = true;
-        let snapshot = export(&hidden).expect("hidden history is projected out");
-        assert_eq!(u16_at(&snapshot, 10), MINOR_V2_1);
+        let snapshot = export(&hidden).expect("hidden history is retained");
+        assert_eq!(u16_at(&snapshot, 10), MINOR_V2_10);
         assert_eq!(
             u16_at(&snapshot, HEADER_SIZE + 7 * DIRECTORY_ENTRY_SIZE + 6),
-            1
+            2
         );
     }
 
@@ -4471,7 +4720,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_1_projects_only_visible_cells_tables_and_head_truncation() {
+    fn v2_10_retains_hidden_cells_tables_and_row_metadata() {
         let mut terminal = wrapped_history_terminal();
         let history_rows = terminal.main.viewport_top() as usize;
         assert!(history_rows > 0);
@@ -4484,7 +4733,6 @@ mod tests {
         terminal.main.cells[0].character = hidden_character;
         terminal.main.cells[0].attributes = hidden_attributes;
         terminal.main.cells[0].protected = true;
-        terminal.main.cells[0].hyperlink = Some(HyperlinkRef::new(777));
         terminal
             .main
             .validate()
@@ -4495,11 +4743,10 @@ mod tests {
                 .visible_cells()
                 .iter()
                 .all(|cell| cell.character != hidden_character
-                    && cell.attributes != hidden_attributes
-                    && cell.hyperlink != Some(HyperlinkRef::new(777)))
+                    && cell.attributes != hidden_attributes)
         );
 
-        let snapshot = export(&terminal).expect("visible-only snapshot");
+        let snapshot = export(&terminal).expect("retained-history snapshot");
         let preflight = preflight_a(&snapshot).expect("preflight");
         let graphemes = decode_graphemes(
             section(&snapshot, &preflight, GRAPHEME_TABLE).expect("grapheme section"),
@@ -4513,25 +4760,33 @@ mod tests {
         assert!(
             graphemes
                 .iter()
-                .all(|grapheme| grapheme.character != hidden_character)
+                .any(|grapheme| grapheme.character == hidden_character)
         );
-        assert!(!renditions.contains(&hidden_attributes));
-        assert_eq!(directory_value(&snapshot, 9, 24), terminal.main.rows as u64);
+        assert!(renditions.contains(&hidden_attributes));
+        assert_eq!(
+            directory_value(&snapshot, 9, 24),
+            terminal.main.stored_rows() as u64
+        );
 
         let records = row_record_offsets(&snapshot, 9);
-        let first_visible = &terminal.main.row_metadata[history_rows];
-        assert_eq!(u64_at(&snapshot, records[0]), first_visible.logical_line_id);
+        let first_stored = &terminal.main.row_metadata[0];
+        assert_eq!(u64_at(&snapshot, records[0]), first_stored.logical_line_id);
         assert_eq!(
             u32_at(&snapshot, records[0] + 8),
-            first_visible.logical_cell_offset
+            first_stored.logical_cell_offset
         );
-        assert_eq!(u32_at(&snapshot, records[0] + 16) & 2, 2);
+        assert_eq!(
+            u64_at(&snapshot, records[0] + 24),
+            first_stored.sealed_revision
+        );
+        assert_eq!(u32_at(&snapshot, records[0] + 16) & 2, 0);
         assert_eq!(u32_at(&snapshot, records[1] + 16) & 2, 0);
 
-        let mut projected = terminal.clone();
-        remove_projected_history(&mut projected);
-        let projected_snapshot = export(&projected).expect("explicit visible projection");
-        assert_eq!(snapshot, projected_snapshot);
+        let restored = import(&snapshot).expect("restore retained history");
+        assert_eq!(restored.main.cells, terminal.main.cells);
+        assert_eq!(restored.main.row_metadata, terminal.main.row_metadata);
+        assert_eq!(restored.scrollback_info(), terminal.scrollback_info());
+        assert_eq!(export(&restored).expect("canonical re-export"), snapshot);
         assert!(snapshot.len() <= MAX_CANONICAL_SNAPSHOT_BYTES);
     }
 
@@ -4604,9 +4859,9 @@ mod tests {
     #[test]
     fn version_feature_and_screen_section_version_mixes_are_rejected() {
         let v2_0 = export(&Terminal::new(8, 2).expect("terminal")).expect("V2.0 snapshot");
-        let v2_1 = export(&wrapped_history_terminal()).expect("V2.1 snapshot");
+        let v2_10 = export(&wrapped_history_terminal()).expect("V2.10 snapshot");
 
-        let mut minor_without_reader = v2_1.clone();
+        let mut minor_without_reader = v2_10.clone();
         minor_without_reader[12..14].copy_from_slice(&MINOR_V2_0.to_le_bytes());
         refresh_crc(&mut minor_without_reader);
         assert_eq!(
@@ -4622,12 +4877,12 @@ mod tests {
             Err(TerminalError::IncompatibleSnapshot)
         );
 
-        let mut v2_1_without_feature = v2_1.clone();
-        v2_1_without_feature[64..72]
+        let mut v2_10_without_feature = v2_10.clone();
+        v2_10_without_feature[64..72]
             .copy_from_slice(&(REQUIRED_FEATURES_V2_0 as u64).to_le_bytes());
-        refresh_crc(&mut v2_1_without_feature);
+        refresh_crc(&mut v2_10_without_feature);
         assert_eq!(
-            import(&v2_1_without_feature),
+            import(&v2_10_without_feature),
             Err(TerminalError::IncompatibleSnapshot)
         );
 
@@ -4640,7 +4895,7 @@ mod tests {
         );
 
         for index in [8, 9, 10, 11] {
-            let mut legacy_screen_section = v2_1.clone();
+            let mut legacy_screen_section = v2_10.clone();
             set_directory_u16(&mut legacy_screen_section, index, 6, 1);
             refresh_crc(&mut legacy_screen_section);
             assert_eq!(
@@ -4659,7 +4914,7 @@ mod tests {
             );
         }
 
-        let mut upgraded_core = v2_1;
+        let mut upgraded_core = v2_10;
         set_directory_u16(&mut upgraded_core, 0, 6, 2);
         refresh_crc(&mut upgraded_core);
         assert_eq!(
@@ -4669,7 +4924,61 @@ mod tests {
     }
 
     #[test]
-    fn v2_0_reserved_anchors_and_v2_1_malicious_anchors_flags_and_capacity_are_rejected() {
+    fn v2_10_rejects_unreferenced_tables_without_narrowing_legacy_imports() {
+        let mut legacy = Terminal::new_with_options(
+            8,
+            2,
+            0,
+            crate::TerminalOptions {
+                history_capacity_rows: 4,
+            },
+        )
+        .expect("legacy history terminal");
+        legacy
+            .apply_event(crate::Event::Output {
+                source_sequence: 0,
+                bytes: b"A\x07",
+            })
+            .expect("legacy visible cell");
+        legacy.main.cells[0].protected = true;
+        let mut legacy_unused = export(&legacy).expect("V2.1 snapshot");
+        assert_eq!(u16_at(&legacy_unused, 10), MINOR_V2_1);
+        let legacy_record = row_record_offsets(&legacy_unused, 9)[0];
+        assert_ne!(u32_at(&legacy_unused, legacy_record + 24), 0);
+        legacy_unused[legacy_record + 24..legacy_record + 28].copy_from_slice(&0_u32.to_le_bytes());
+        refresh_crc(&mut legacy_unused);
+        import(&legacy_unused).expect("legacy acceptance remains unchanged");
+
+        let v2_10 = export(&wrapped_history_terminal()).expect("base V2.10 snapshot");
+        assert_eq!(u64_at(&v2_10, 64), REQUIRED_FEATURES_V2_10 as u64);
+        let first_record = row_record_offsets(&v2_10, 9)[0];
+        let mut unused_grapheme = v2_10;
+        assert_ne!(u32_at(&unused_grapheme, first_record + 32), 0);
+        unused_grapheme[first_record + 32..first_record + 36].copy_from_slice(&0_u32.to_le_bytes());
+        refresh_crc(&mut unused_grapheme);
+        let preflight = preflight_a(&unused_grapheme).expect("valid mutated envelope");
+        assert_eq!(
+            preflight_b(&unused_grapheme, &preflight),
+            Err(TerminalError::MalformedSnapshot)
+        );
+
+        let mut styled = wrapped_history_terminal();
+        styled.main.cells[0].attributes.faint = true;
+        let mut unused_rendition = export(&styled).expect("extended V2.10 snapshot");
+        let first_record = row_record_offsets(&unused_rendition, 9)[0];
+        assert_ne!(u32_at(&unused_rendition, first_record + 36), 0);
+        unused_rendition[first_record + 36..first_record + 40]
+            .copy_from_slice(&0_u32.to_le_bytes());
+        refresh_crc(&mut unused_rendition);
+        let preflight = preflight_a(&unused_rendition).expect("valid mutated envelope");
+        assert_eq!(
+            preflight_b(&unused_rendition, &preflight),
+            Err(TerminalError::MalformedSnapshot)
+        );
+    }
+
+    #[test]
+    fn v2_0_reserved_anchors_and_v2_10_malicious_history_are_rejected() {
         let v2_0 = export(&Terminal::new(8, 2).expect("terminal")).expect("V2.0 snapshot");
         let v2_0_meta = directory_value(&v2_0, 8, 8) as usize;
         let v2_0_records = row_record_offsets(&v2_0, 9);
@@ -4694,13 +5003,13 @@ mod tests {
             );
         }
 
-        let v2_1 = export(&wrapped_history_terminal()).expect("V2.1 snapshot");
-        let primary_meta = directory_value(&v2_1, 8, 8) as usize;
-        let alternate_meta = directory_value(&v2_1, 10, 8) as usize;
-        let records = row_record_offsets(&v2_1, 9);
+        let v2_10 = export(&wrapped_history_terminal()).expect("V2.10 snapshot");
+        let primary_meta = directory_value(&v2_10, 8, 8) as usize;
+        let alternate_meta = directory_value(&v2_10, 10, 8) as usize;
+        let records = row_record_offsets(&v2_10, 9);
 
         for capacity in [0_u64, u64::from(MAX_HISTORY_ROWS) + 1] {
-            let mut corrupted = v2_1.clone();
+            let mut corrupted = v2_10.clone();
             corrupted[primary_meta + 56..primary_meta + 64]
                 .copy_from_slice(&capacity.to_le_bytes());
             refresh_crc(&mut corrupted);
@@ -4711,7 +5020,7 @@ mod tests {
             );
         }
 
-        let mut alternate_capacity = v2_1.clone();
+        let mut alternate_capacity = v2_10.clone();
         alternate_capacity[alternate_meta + 56..alternate_meta + 64]
             .copy_from_slice(&1_u64.to_le_bytes());
         refresh_crc(&mut alternate_capacity);
@@ -4720,12 +5029,12 @@ mod tests {
             Err(TerminalError::MalformedSnapshot)
         );
 
-        let mut zero_next_id = v2_1.clone();
+        let mut zero_next_id = v2_10.clone();
         zero_next_id[primary_meta + 48..primary_meta + 56].copy_from_slice(&0_u64.to_le_bytes());
         refresh_crc(&mut zero_next_id);
         assert_eq!(import(&zero_next_id), Err(TerminalError::MalformedSnapshot));
 
-        let mut reserved_flag = v2_1.clone();
+        let mut reserved_flag = v2_10.clone();
         reserved_flag[records[0] + 16..records[0] + 20].copy_from_slice(&7_u32.to_le_bytes());
         refresh_crc(&mut reserved_flag);
         assert_eq!(
@@ -4733,17 +5042,46 @@ mod tests {
             Err(TerminalError::MalformedSnapshot)
         );
 
-        let mut later_head = v2_1.clone();
+        let mut later_head = v2_10.clone();
         let second_flags = u32_at(&later_head, records[1] + 16) | 2;
         later_head[records[1] + 16..records[1] + 20].copy_from_slice(&second_flags.to_le_bytes());
         refresh_crc(&mut later_head);
         assert_eq!(import(&later_head), Err(TerminalError::MalformedSnapshot));
 
-        let mut wrong_offset = v2_1;
+        let mut wrong_offset = v2_10.clone();
         let second_offset = u32_at(&wrong_offset, records[1] + 8).wrapping_add(1);
         wrong_offset[records[1] + 8..records[1] + 12].copy_from_slice(&second_offset.to_le_bytes());
         refresh_crc(&mut wrong_offset);
         assert_eq!(import(&wrong_offset), Err(TerminalError::MalformedSnapshot));
+
+        for (name, offset, value) in [
+            ("stored rows omit history", primary_meta + 8, 2_u32),
+            ("wrong viewport top", primary_meta + 12, 0_u32),
+        ] {
+            let mut corrupted = v2_10.clone();
+            corrupted[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            refresh_crc(&mut corrupted);
+            assert_eq!(
+                import(&corrupted),
+                Err(TerminalError::MalformedSnapshot),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_10_future_seal_is_rejected_by_allocation_free_preflight() {
+        let mut future_seal = export(&wrapped_history_terminal()).expect("V2.10 snapshot");
+        let first_record = row_record_offsets(&future_seal, 9)[0];
+        future_seal[first_record + 24..first_record + 32].copy_from_slice(&u64::MAX.to_le_bytes());
+        refresh_crc(&mut future_seal);
+
+        let preflight = preflight_a(&future_seal).expect("valid future-seal envelope");
+        assert_eq!(
+            preflight_b(&future_seal, &preflight),
+            Err(TerminalError::MalformedSnapshot)
+        );
+        assert_eq!(import(&future_seal), Err(TerminalError::MalformedSnapshot));
     }
 
     #[test]
@@ -5641,9 +5979,9 @@ mod tests {
             MAX_GRAPHEME_SECTION_BYTES,
             MAX_RENDITION_SECTION_BYTES,
             64,
-            MAX_ROWS_SECTION_BYTES,
+            MAX_PRIMARY_ROWS_SECTION_BYTES,
             64,
-            MAX_ROWS_SECTION_BYTES,
+            MAX_LEGACY_ROWS_SECTION_BYTES,
         ];
         let payload_total = payloads
             .into_iter()
@@ -5657,10 +5995,10 @@ mod tests {
             })
             .expect("capacity formula does not overflow usize");
         assert_eq!(checked_bound, MAX_CANONICAL_SNAPSHOT_BYTES);
-        assert_eq!(MAX_CANONICAL_SNAPSHOT_BYTES, 44_568_106);
+        assert_eq!(MAX_CANONICAL_SNAPSHOT_BYTES, 44_892_210);
         assert_eq!(
             MAX_SNAPSHOT_BYTES - MAX_CANONICAL_SNAPSHOT_BYTES,
-            22_540_758
+            22_216_654
         );
 
         assert_eq!(
@@ -5668,9 +6006,21 @@ mod tests {
             GRAPHEME_WIDTH_WORDS * std::mem::size_of::<u64>()
         );
         assert_eq!(std::mem::size_of::<GraphemeWidths>(), 65_544);
-        assert!(
-            std::mem::size_of::<GraphemeWidths>() + std::mem::size_of::<Preflight>() < 70 * 1024
+        assert_eq!(
+            std::mem::size_of::<GraphemeUses>(),
+            GRAPHEME_WIDTH_WORDS * std::mem::size_of::<u64>()
         );
+        assert_eq!(std::mem::size_of::<GraphemeUses>(), 65_544);
+        assert_eq!(
+            std::mem::size_of::<RenditionUses>(),
+            RENDITION_USE_WORDS * std::mem::size_of::<u64>()
+        );
+        assert_eq!(std::mem::size_of::<RenditionUses>(), 65_544);
+        let table_scratch = std::mem::size_of::<GraphemeWidths>()
+            + std::mem::size_of::<GraphemeUses>()
+            + std::mem::size_of::<RenditionUses>();
+        assert_eq!(table_scratch, 196_632);
+        assert!(table_scratch + std::mem::size_of::<Preflight>() < 200 * 1024);
     }
 
     #[test]

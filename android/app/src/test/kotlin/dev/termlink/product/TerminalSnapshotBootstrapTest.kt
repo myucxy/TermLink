@@ -539,7 +539,6 @@ class TerminalSnapshotBootstrapTest {
             },
             bind = { events += "bind"; "bound" },
             installAndMap = { _, _ -> events += "install"; "exact" },
-            resetAfterInstallFailure = { events += "reset"; "empty" },
         )
         if (restored != null) socketStarted = true
 
@@ -669,7 +668,6 @@ class TerminalSnapshotBootstrapTest {
                 events += "install:$prepared:$bound"
                 "exact"
             },
-            resetAfterInstallFailure = { error("reset must not run") },
         )
 
         assertEquals("exact", restored)
@@ -685,7 +683,6 @@ class TerminalSnapshotBootstrapTest {
             prepare = { error("prepare must not run") },
             bind = { error("bind must not run") },
             installAndMap = { _, _ -> error("install must not run") },
-            resetAfterInstallFailure = { error("reset must not run") },
             onLoadFailure = { failures += "load:${it.message}" },
             onPrepareFailure = { failures += "prepare:${it.message}" },
         )
@@ -694,7 +691,6 @@ class TerminalSnapshotBootstrapTest {
             prepare = { error("decode") },
             bind = { error("bind must not run") },
             installAndMap = { _, _ -> error("install must not run") },
-            resetAfterInstallFailure = { error("reset must not run") },
             onLoadFailure = { failures += "load:${it.message}" },
             onPrepareFailure = { failures += "prepare:${it.message}" },
         )
@@ -705,39 +701,22 @@ class TerminalSnapshotBootstrapTest {
     }
 
     @Test
-    fun installFailureAfterBindResetsAndReturnsEmpty() = runBlocking {
+    fun installFailureAfterBindPropagatesAndPreservesDurableBinding() {
         val events = mutableListOf<String>()
 
-        val restored = prepareBindInstallSnapshot(
-            loadAndCache = { events += "cache"; Unit },
-            prepare = { events += "prepare"; Unit },
-            bind = { events += "bind"; 7L },
-            installAndMap = { _, _ -> events += "install"; error("install failed") },
-            resetAfterInstallFailure = { generation -> events += "reset:$generation"; "empty" },
-        )
-
-        assertEquals("empty", restored)
-        assertEquals(listOf("cache", "prepare", "bind", "install", "reset:7"), events)
-    }
-
-    @Test
-    fun resetFailurePropagatesBeforeSocketCreation() {
-        var socketStarted = false
-
-        assertThrows(IllegalStateException::class.java) {
+        val thrown = assertThrows(IllegalStateException::class.java) {
             runBlocking {
                 prepareBindInstallSnapshot(
-                    loadAndCache = { Unit },
-                    prepare = { Unit },
-                    bind = { 8L },
-                    installAndMap = { _, _ -> error("install failed") },
-                    resetAfterInstallFailure = { error("reset failed") },
+                    loadAndCache = { events += "cache"; Unit },
+                    prepare = { events += "prepare"; Unit },
+                    bind = { events += "bind"; 7L },
+                    installAndMap = { _, _ -> events += "install"; error("install failed") },
                 )
-                socketStarted = true
             }
         }
 
-        assertFalse(socketStarted)
+        assertEquals("install failed", thrown.message)
+        assertEquals(listOf("cache", "prepare", "bind", "install"), events)
     }
 
     @Test
@@ -751,7 +730,6 @@ class TerminalSnapshotBootstrapTest {
                     prepare = { events += "prepare"; Unit },
                     bind = { events += "bind"; error("bind failed") },
                     installAndMap = { _, _ -> events += "install"; "exact" },
-                    resetAfterInstallFailure = { events += "reset"; "empty" },
                 )
             }
         }
