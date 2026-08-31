@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
@@ -39,12 +40,23 @@ func (a *API) getRegistrationPolicy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	humanVerificationRequired := a.HumanVerification != nil
+	if policySource, ok := a.HumanVerification.(interface {
+		Required(context.Context) (bool, error)
+	}); ok {
+		humanVerificationRequired, err = policySource.Required(r.Context())
+		if err != nil {
+			writeError(w, r, http.StatusServiceUnavailable, "HUMAN_VERIFICATION_UNAVAILABLE", err)
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"mode":                        policy.Mode,
 		"invitation_needed":           policy.Mode == store.RegistrationInviteRequired,
 		"registration_open":           policy.Mode != store.RegistrationClosed,
 		"version":                     policy.Version,
 		"email_verification_required": emailVerificationRequired,
+		"human_verification_required": humanVerificationRequired,
 	})
 }
 

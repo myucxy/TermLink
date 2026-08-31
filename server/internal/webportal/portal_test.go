@@ -1,6 +1,7 @@
 package webportal
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -55,6 +56,8 @@ type testPortalRepository struct {
 	webSettings      store.WebPortalSettings
 	lastAssertion    store.PortalIdentityAssertion
 	identityProfile  store.AccountIdentityProfile
+	humanSettings    store.HumanVerificationSettings
+	humanSaved       store.HumanVerificationSettingsInput
 }
 
 type unavailableRegistrationEmailRepository struct {
@@ -100,7 +103,21 @@ func newTestPortalRepository() *testPortalRepository {
 	return &testPortalRepository{account: store.PortalAccount{
 		ID: uuid.MustParse("11111111-1111-4111-8111-111111111111"), Role: store.RoleUser, Status: "ACTIVE",
 		CreatedAt: time.Date(2026, time.August, 4, 9, 0, 0, 0, time.UTC),
-	}, idempotencyKeys: make(map[string][32]byte), idempotencyDone: make(map[string]int), webSettings: store.WebPortalSettings{Version: 1}}
+	}, idempotencyKeys: make(map[string][32]byte), idempotencyDone: make(map[string]int), webSettings: store.WebPortalSettings{Version: 1},
+		humanSettings: store.HumanVerificationSettings{Version: 1}}
+}
+
+func (r *testPortalRepository) GetHumanVerificationSettings(context.Context) (store.HumanVerificationSettings, error) {
+	return r.humanSettings, nil
+}
+
+func (r *testPortalRepository) SaveHumanVerificationSettings(_ context.Context, _ uuid.UUID, input store.HumanVerificationSettingsInput) (store.HumanVerificationSettings, error) {
+	r.humanSaved = input
+	r.humanSettings = store.HumanVerificationSettings{
+		Enabled: input.Enabled, SiteKey: input.SiteKey, SecretCiphertext: append([]byte(nil), input.SecretCiphertext...),
+		Version: input.ExpectedVersion + 1, UpdatedAt: time.Date(2026, time.August, 4, 10, 1, 0, 0, time.UTC),
+	}
+	return r.humanSettings, nil
 }
 
 func (r *testPortalRepository) SyncPortalIdentity(_ context.Context, _ [32]byte, assertion store.PortalIdentityAssertion, _ string) (store.PortalAccount, error) {
@@ -681,6 +698,83 @@ func TestRegistrationPageEnablesTurnstileWithoutWeakeningOtherPages(t *testing.T
 		strings.Contains(disabledResponse.Body.String(), `id="human-verification"`) ||
 		strings.Contains(disabledResponse.Header().Get("Content-Security-Policy"), humanverification.TurnstileScriptOrigin) {
 		t.Fatal("disabled human verification must preserve the existing registration page and CSP")
+	}
+}
+
+func TestManagedHumanVerificationSettingsApplyImmediatelyAndKeepSecretWriteOnly(t *testing.T) {
+	flow := &testOIDCFlow{identity: accountIdentity{
+		Subject: "human-settings-admin", Username: "human-settings-admin", Roles: []string{"SUPER_ADMIN"}, MFA: true,
+	}}
+	portal := newTestPortal(t, flow)
+	flow.identity.AuthenticatedAt = portal.now().Add(-time.Minute)
+	repository := newTestPortalRepository()
+	repository.account.Role = store.RoleSuperAdmin
+	portal.config.Repository = &testRegistrationAdminRepository{
+		testPortalRepository: repository,
+		policy:               store.RegistrationPolicy{Mode: store.RegistrationOpen, Version: 1},
+	}
+	manager, err := humanverification.NewManager(humanverification.ManagerConfig{
+		Repository: repository, EncryptionKey: []byte("human-settings-portal-key-0123456789"), ExpectedHostname: "termlink.example",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	portal.config.HumanVerification = manager
+	cookie, session := completeLoginAt(t, portal, flow, "/admin")
+
+	settingsPage := performRequest(portal.Handler(), http.MethodGet, "/admin?section=settings", nil, cookie)
+	if settingsPage.Code != http.StatusOK || !strings.Contains(settingsPage.Body.String(), "注册人机验证") ||
+		!strings.Contains(settingsPage.Body.String(), `name="site_key"`) || !strings.Contains(settingsPage.Body.String(), `name="secret"`) {
+		t.Fatalf("human-verification settings page = %d %q", settingsPage.Code, settingsPage.Body.String())
+	}
+
+	values := url.Values{
+		"csrf": {session.CSRF}, "expected_version": {"1"}, "idempotency_key": {"human-verification-enable-0001"},
+		"reason": {"系统自动记录"}, "enabled": {"on"}, "site_key": {"managed-site-key"}, "secret": {"managed-secret-value"},
+	}
+	request := httptest.NewRequest(http.MethodPost, "https://"+testPublicHost+"/admin/settings/human-verification", strings.NewReader(values.Encode()))
+	request.Host = testPublicHost
+	request.Header.Set("Origin", "https://"+testPublicHost)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	recorder := httptest.NewRecorder()
+	portal.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/admin?section=settings&notice=human-verification-updated" {
+		t.Fatalf("human-verification update = %d location=%q body=%q", recorder.Code, recorder.Header().Get("Location"), recorder.Body.String())
+	}
+	if len(repository.humanSaved.SecretCiphertext) == 0 || bytes.Contains(repository.humanSaved.SecretCiphertext, []byte("managed-secret-value")) {
+		t.Fatal("human-verification Secret was not encrypted before storage")
+	}
+	registration := performRequest(portal.Handler(), http.MethodGet, "/register", nil)
+	if registration.Code != http.StatusOK || !strings.Contains(registration.Body.String(), `data-site-key="managed-site-key"`) ||
+		!strings.Contains(registration.Body.String(), `data-human-verification-required="true"`) ||
+		!strings.Contains(registration.Header().Get("Content-Security-Policy"), humanverification.TurnstileScriptOrigin) ||
+		strings.Contains(registration.Body.String(), "managed-secret-value") {
+		t.Fatalf("managed registration page = %d headers=%v body=%q", registration.Code, registration.Header(), registration.Body.String())
+	}
+	updatedSettings := performRequest(portal.Handler(), http.MethodGet, "/admin?section=settings", nil, cookie)
+	if strings.Contains(updatedSettings.Body.String(), "managed-secret-value") || !strings.Contains(updatedSettings.Body.String(), "留空沿用已保存 Secret") {
+		t.Fatal("administrator page exposed or failed to mask the managed Secret")
+	}
+
+	values = url.Values{
+		"csrf": {session.CSRF}, "expected_version": {"2"}, "idempotency_key": {"human-verification-disable-0002"},
+		"reason": {"系统自动记录"}, "site_key": {"managed-site-key"}, "clear_secret": {"on"},
+	}
+	request = httptest.NewRequest(http.MethodPost, "https://"+testPublicHost+"/admin/settings/human-verification", strings.NewReader(values.Encode()))
+	request.Host = testPublicHost
+	request.Header.Set("Origin", "https://"+testPublicHost)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	recorder = httptest.NewRecorder()
+	portal.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusSeeOther || len(repository.humanSaved.SecretCiphertext) != 0 {
+		t.Fatalf("human-verification disable = %d saved=%+v body=%q", recorder.Code, repository.humanSaved, recorder.Body.String())
+	}
+	disabled := performRequest(portal.Handler(), http.MethodGet, "/register", nil)
+	if strings.Contains(disabled.Body.String(), `id="human-verification"`) ||
+		strings.Contains(disabled.Header().Get("Content-Security-Policy"), humanverification.TurnstileScriptOrigin) {
+		t.Fatal("disabled managed human verification remained active")
 	}
 }
 
@@ -1704,6 +1798,30 @@ func TestPortalFormOriginAllowsOnlySameOriginProxyFallback(t *testing.T) {
 	if portal.usesTrustedFormOrigin(request) {
 		t.Fatal("request for an unexpected host was accepted")
 	}
+
+	alias := httptest.NewRequest(http.MethodPost, "https://portal.example/logout", nil)
+	alias.Host = "portal.example"
+	alias.Header.Set("Origin", "https://portal.example")
+	if !portal.usesTrustedFormOrigin(alias) {
+		t.Fatal("same-origin request through an alternate public entry was rejected")
+	}
+
+	forwarded := httptest.NewRequest(http.MethodPost, "http://server:8080/logout", nil)
+	forwarded.Host = "server:8080"
+	forwarded.Header.Set("Origin", "https://portal.example")
+	forwarded.Header.Set("X-Forwarded-Host", "portal.example")
+	if !portal.usesTrustedFormOrigin(forwarded) {
+		t.Fatal("same-origin request with a proxy-rewritten Host was rejected")
+	}
+	forwarded.Header.Set("Origin", "https://attacker.example")
+	if portal.usesTrustedFormOrigin(forwarded) {
+		t.Fatal("forwarded Host mismatch accepted an attacker Origin")
+	}
+	forwarded.Header.Set("Origin", "https://portal.example")
+	forwarded.Header.Set("X-Forwarded-Host", "attacker.example, portal.example")
+	if portal.usesTrustedFormOrigin(forwarded) {
+		t.Fatal("ambiguous forwarded Host chain was accepted")
+	}
 }
 
 func assertIdentityLoginRedirect(t *testing.T, response *httptest.ResponseRecorder, wantHost, wantTheme string) {
@@ -1916,22 +2034,48 @@ func TestPortalCallbackFallsBackForUnknownSealedReturnTarget(t *testing.T) {
 	}
 }
 
-func TestPortalIdentityCanonicalRedirectPreservesAllowlistedTargetAndTheme(t *testing.T) {
-	for _, target := range []string{
-		"/login?return_to=%2Faccount%2Fidentity&termlink_theme=DARK",
-		"/account/identity?termlink_theme=DARK",
-	} {
-		t.Run(target, func(t *testing.T) {
-			portal := newTestPortal(t, &testOIDCFlow{})
-			response := performRequestOnHost(portal.Handler(), http.MethodGet, "lucky-upstream:8080", target, nil)
-			assertIdentityLoginRedirect(t, response, testPublicHost, "dark")
-			location, err := url.Parse(response.Header().Get("Location"))
-			if err != nil {
-				t.Fatalf("parse canonical identity redirect: %v", err)
+func TestPortalInternalNavigationDoesNotCanonicalizeRequestHost(t *testing.T) {
+	portal := newTestPortal(t, &testOIDCFlow{})
+	portal.config.Repository = &testRegistrationAdminRepository{
+		testPortalRepository: newTestPortalRepository(),
+		policy:               store.RegistrationPolicy{Mode: store.RegistrationOpen, Version: 1},
+	}
+	tests := []struct {
+		path       string
+		wantStatus int
+		wantPath   string
+	}{
+		{path: "/register", wantStatus: http.StatusOK},
+		{path: "/account", wantStatus: http.StatusSeeOther, wantPath: "/login?return_to=/account"},
+		{path: "/admin", wantStatus: http.StatusSeeOther, wantPath: "/login?return_to=/admin"},
+		{path: "/account/identity?termlink_theme=DARK", wantStatus: http.StatusSeeOther, wantPath: "/login?return_to=%2Faccount%2Fidentity&termlink_theme=dark"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			response := performRequestOnHost(portal.Handler(), http.MethodGet, "lucky-upstream:8080", tt.path, nil)
+			if response.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; location=%q", response.Code, tt.wantStatus, response.Header().Get("Location"))
 			}
-			if location.Scheme != "https" {
-				t.Fatalf("canonical identity redirect scheme = %q, want https", location.Scheme)
+			location := response.Header().Get("Location")
+			if tt.wantPath != "" && location != tt.wantPath {
+				t.Fatalf("location = %q, want relative %q", location, tt.wantPath)
+			}
+			if strings.Contains(location, testPublicHost) {
+				t.Fatalf("internal navigation leaked configured absolute origin: %q", location)
 			}
 		})
+	}
+}
+
+func TestPortalLoginOnRewrittenHostUsesOnlyProtocolRequiredAbsoluteRedirect(t *testing.T) {
+	flow := &testOIDCFlow{}
+	portal := newTestPortal(t, flow)
+	response := performRequestOnHost(portal.Handler(), http.MethodGet, "lucky-upstream:8080", "/login?return_to=/account&termlink_theme=DARK", nil)
+	if response.Code != http.StatusFound {
+		t.Fatalf("login status = %d, want 302; location=%q", response.Code, response.Header().Get("Location"))
+	}
+	location, err := url.Parse(response.Header().Get("Location"))
+	if err != nil || location.Scheme != "https" || location.Host != "identity.example" || flow.theme != "dark" {
+		t.Fatalf("OIDC redirect location=%q theme=%q err=%v", response.Header().Get("Location"), flow.theme, err)
 	}
 }

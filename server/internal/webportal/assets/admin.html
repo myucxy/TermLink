@@ -283,6 +283,21 @@
         </form>
         <div class="security-callout"><strong>防止锁死</strong><p>修改前请把新入口保存在受信任的密码管理器。若地址丢失，只能在服务器本机执行 <code>termlink-server admin-route-reset</code> 恢复默认入口；公网不提供找回接口。</p></div>
       </section>
+      {{if gt .HumanVerification.Version 0}}
+      <section class="admin-panel" aria-labelledby="human-verification-heading">
+        <div class="panel-heading"><div><p class="eyebrow">ANTI-AUTOMATION</p><h2 id="human-verification-heading">注册人机验证</h2><p>管理 Cloudflare Turnstile 的 Site Key 与 Secret。Secret 只写不读，页面永不回显原文。</p></div>{{if .HumanVerification.Enabled}}<span class="state-pill state-VERIFIED">已启用</span>{{else}}<span class="state-pill state-DRAFT">未启用</span>{{end}}</div>
+        <form class="admin-settings-form" action="/admin/settings/human-verification" method="post">
+          <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="expected_version" value="{{.HumanVerification.Version}}"><input type="hidden" name="idempotency_key" value="{{actionKey .ActionNonce "human-verification-update"}}">
+          <label><span>Turnstile Site Key</span><input name="site_key" value="{{.HumanVerification.SiteKey}}" maxlength="256" autocomplete="off" placeholder="0x4AAAA..."></label>
+          <label><span>Turnstile Secret</span><input name="secret" type="password" autocomplete="new-password" maxlength="512" placeholder="{{if .HumanVerification.SecretConfigured}}留空沿用已保存 Secret{{else}}输入 Turnstile Secret{{end}}"></label>
+          <fieldset class="admin-toggle-group"><legend>功能开关</legend><label><input name="enabled" type="checkbox"{{if .HumanVerification.Enabled}} checked{{end}}> 注册与注册邮箱验证码必须完成人机验证</label>{{if .HumanVerification.SecretConfigured}}<label><input name="clear_secret" type="checkbox"> 清除已保存 Secret（必须同时停用）</label>{{end}}</fieldset>
+          <input type="hidden" name="reason" value="系统自动记录">
+          <button class="button button-primary" type="submit">保存并立即生效</button>
+        </form>
+        <p class="muted-note">配置版本 v{{.HumanVerification.Version}} · Secret {{if .HumanVerification.SecretConfigured}}已配置{{else}}未配置{{end}}{{if eq .HumanVerification.Source "DEPLOYMENT"}} · 当前沿用部署环境配置，首次保存后转为管理页面配置{{end}}。</p>
+        <div class="security-callout"><strong>凭据保护</strong><p>Secret 使用服务端主密钥派生的独立 AES-GCM 密钥加密保存，不写入页面、响应或审计元数据。启用时 Site Key 与 Secret 必须同时有效。</p></div>
+      </section>
+      {{end}}
       <section class="admin-panel" aria-labelledby="service-email-heading">
         <div class="panel-heading"><div><p class="eyebrow">VERIFIED DELIVERY</p><h2 id="service-email-heading">服务邮箱</h2><p>保存时必须成功发送测试邮件；密码只写不读，页面不会回显 Secret。</p></div><span class="state-pill state-{{.ServiceEmail.Status}}">{{.ServiceEmail.Status}}</span></div>
         <form class="admin-settings-form" action="/admin/settings/service-email" method="post">

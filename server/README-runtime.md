@@ -55,8 +55,9 @@ docker compose --env-file .env `
   -f compose\registration-recovery.compose.yml `
   --profile edge up --detach --wait
 
-# Require Cloudflare Turnstile for both registration e-mail codes and account
-# creation. Combine this with registration-recovery for Keycloak registration.
+# Optionally bootstrap Cloudflare Turnstile for both registration e-mail codes
+# and account creation. SUPER_ADMIN can later replace or disable these values
+# from the management page without restarting the server.
 $env:TERMLINK_HUMAN_VERIFICATION_SITE_KEY = '0x4AAAA-public-site-key'
 $env:TERMLINK_HUMAN_VERIFICATION_SECRET_FILE = 'D:\TermLink\secrets\human-verification-secret'
 docker compose --env-file .env `
@@ -90,8 +91,10 @@ optional. `registration-recovery.compose.yml` is required when a Keycloak-backed
 deployment offers account registration; it supplies the bounded account-creation
 and recovery authority and can be combined with either history choice. Keycloak
 native self-registration must remain disabled. `human-verification.compose.yml`
-optionally protects both registration stages with Cloudflare Turnstile and can
-be combined with any registration deployment. `account-deletion.compose.yml`
+optionally bootstraps Cloudflare Turnstile for both registration stages and can
+be combined with any registration deployment. After the first management-page
+save, the encrypted database settings become the runtime source.
+`account-deletion.compose.yml`
 requires either local history or external S3 and a Keycloak service account.
 Files named `acceptance`,
 `integration`, or `lan-test` are disposable test stacks and must not be
@@ -110,7 +113,7 @@ The supported production layers are intentionally small:
 | `external-services` | none | external HTTPS S3 origin and credentials | Instead of local `history` |
 | `observability` | Prometheus, Blackbox, Alertmanager, Grafana | Grafana secret and explicit reviewed Alertmanager receiver configuration | Only when not supplied by platform monitoring |
 | `registration-recovery` | none; enables controlled registration and a bounded recovery runner | Keycloak service-account secret | Whenever a Keycloak-backed deployment offers registration |
-| `human-verification` | none; enables Turnstile on the unified registration page and API | public site key and file-backed provider secret | When public registration needs anti-automation protection |
+| `human-verification` | none; bootstraps Turnstile on the unified registration page and API | public site key and file-backed provider secret | Optional compatibility/bootstrap source before the first management-page save |
 | `account-deletion` | none; enables the final deletion processor | History/S3, Keycloak secret, versioned AES identity key | Only when final account deletion is offered |
 
 Do not add every overlay by default. A headless core behind an existing ingress
@@ -119,6 +122,15 @@ removed. Commerce, recovery, and account deletion reuse the server process and
 do not justify extra worker containers. Choose exactly one history provider,
 and omit the bundled observability stack when the hosting platform already
 provides equivalent private metrics, alerts, and dashboards.
+
+The Web portal uses origin-relative paths for all navigation within TermLink.
+It does not turn a proxy-rewritten request Host into an absolute
+`TERMLINK_PUBLIC_URL` redirect, so an ingress or alternate entry does not cause
+the browser to bounce between addresses. `TERMLINK_PUBLIC_URL` remains the
+security authority for the configured OIDC callback and provider-bound checks;
+OIDC/Keycloak, payment-provider, Turnstile, and artifact-download URLs are
+intentionally absolute because those protocols cross origins. Reverse proxies
+should preserve the browser Host or set one unambiguous `X-Forwarded-Host`.
 
 When observability is selected, `TERMLINK_ALERTMANAGER_CONFIG_FILE` must point
 to an explicit, permission-restricted production receiver configuration and
@@ -213,21 +225,27 @@ payment-channel resolver as live commerce and the provider-reference digest
 domain required to compare existing local hashes; provider keys continue to
 come only from `TERMLINK_PAYMENT_SECRETS_DIR`.
 
-Human verification is disabled by default. Selecting
-`human-verification.compose.yml` sets
-`TERMLINK_HUMAN_VERIFICATION_PROVIDER=turnstile`, publishes only
-`TERMLINK_HUMAN_VERIFICATION_SITE_KEY` to the registration page, and mounts the
-file named by `TERMLINK_HUMAN_VERIFICATION_SECRET_FILE` as a mode-0400 Docker
-secret. The secret is never returned through HTML, JavaScript, API responses,
-or diagnostics. Once enabled, both `POST /v1/auth/register/email-code` and
+Human verification is disabled by default. A `SUPER_ADMIN` can configure the
+Cloudflare Turnstile Site Key, write-only Secret, and enable switch on the
+management page. Saving takes effect immediately without restarting the server.
+The Secret is AES-GCM encrypted with a dedicated key derived from the server
+master key and is never returned through HTML, JavaScript, API responses,
+diagnostics, or audit metadata. The `human-verification.compose.yml` overlay is
+retained as a compatibility/bootstrap source: it sets
+`TERMLINK_HUMAN_VERIFICATION_PROVIDER=turnstile`, provides the public Site Key,
+and mounts the file named by `TERMLINK_HUMAN_VERIFICATION_SECRET_FILE` as a
+mode-0400 Docker secret. Those deployment values remain effective only while
+the database row is still at its untouched initial state; the first successful
+management-page save makes the encrypted database configuration authoritative.
+
+Once enabled, both `POST /v1/auth/register/email-code` and
 `POST /v1/auth/register` fail closed unless their single-use challenge token is
 valid for the configured public hostname and the fixed `registration` action.
 The browser resets the challenge after either request, so a token accepted for
 an e-mail code cannot be reused to create the account. Both the server and end
 users' browsers must be able to reach `https://challenges.cloudflare.com`.
-Provider outages return a temporary-unavailable result; they never bypass the
-challenge. Enabling or disabling this deployment-level setting currently
-requires a server restart.
+Provider or settings-store outages return a temporary-unavailable result; they
+never bypass the challenge.
 
 Payment provider secrets are opt-in and do not belong in the Compose
 environment or database. Put each private key, public key/certificate, or API

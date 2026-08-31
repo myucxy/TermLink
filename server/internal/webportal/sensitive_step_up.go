@@ -3,8 +3,6 @@ package webportal
 import (
 	"encoding/json"
 	"net/http"
-	"net/url"
-	"strings"
 
 	"github.com/termlink/termlink/server/internal/store"
 )
@@ -25,14 +23,6 @@ type sensitiveStepUpStatusResponse struct {
 // signed identity. The callback is bound to the encrypted OAuth state and the
 // already authenticated TermLink browser session.
 func (p *Portal) sensitiveStepUp(w http.ResponseWriter, r *http.Request) {
-	if !p.usesPublicHost(r) {
-		target := strings.TrimRight(p.config.PublicURL, "/") + "/auth/step-up"
-		if theme := normalizeTheme(r.URL.Query().Get(themeQueryParameter)); theme != "" {
-			target += "?" + themeQueryParameter + "=" + url.QueryEscape(theme)
-		}
-		http.Redirect(w, r, target, http.StatusSeeOther)
-		return
-	}
 	session, err := p.readSession(r)
 	if err != nil {
 		p.clearCookie(w, sessionCookieName)

@@ -97,21 +97,6 @@ func runProduction() error {
 		return fmt.Errorf("load production config: %w", err)
 	}
 	configureLogging(cfg.LogLevel)
-	var humanVerifier *humanverification.Turnstile
-	if cfg.HumanVerificationProvider == humanverification.ProviderTurnstile {
-		publicOrigin, parseErr := url.Parse(cfg.PublicURL)
-		if parseErr != nil || publicOrigin.Hostname() == "" {
-			return errors.New("initialize human verification: public URL hostname is invalid")
-		}
-		humanVerifier, err = humanverification.NewTurnstile(humanverification.TurnstileConfig{
-			SiteKey:          cfg.HumanVerificationSiteKey,
-			Secret:           cfg.HumanVerificationSecret.Value(),
-			ExpectedHostname: publicOrigin.Hostname(),
-		})
-		if err != nil {
-			return fmt.Errorf("initialize human verification: %w", err)
-		}
-	}
 	repository, err := store.OpenWithOptions(ctx, cfg.DatabaseURL.Value(), store.OpenOptions{
 		MaxConns: cfg.PostgresMaxConns, MinConns: cfg.PostgresMinConns,
 		MaxConnLifetime: cfg.PostgresMaxConnLifetime, MaxConnIdleTime: cfg.PostgresMaxConnIdleTime,
@@ -151,6 +136,7 @@ func runProduction() error {
 	privacyExportKey := deriveServerKey(keyMaster, "privacy-export-artifact-encryption")
 	serviceEmailKey := deriveServerKey(keyMaster, "service-email-encryption-and-challenges")
 	adminRouteKey := deriveServerKey(keyMaster, "web-admin-route-encryption")
+	humanVerificationKey := deriveServerKey(keyMaster, "human-verification-settings-encryption")
 	gatewayResolver, err := commerce.NewChannelGatewayResolver(commerce.GatewayResolverConfig{
 		Repository: repository,
 		SecretRoot: cfg.PaymentSecretsDir,
@@ -185,6 +171,17 @@ func runProduction() error {
 	serviceEmail, err := serviceemail.New(repository, serviceEmailKey, nil, realmEmail)
 	if err != nil {
 		return fmt.Errorf("initialize service email: %w", err)
+	}
+	publicOrigin, parseErr := url.Parse(cfg.PublicURL)
+	if parseErr != nil || publicOrigin.Hostname() == "" {
+		return errors.New("initialize human verification: public URL hostname is invalid")
+	}
+	humanVerificationManager, err := humanverification.NewManager(humanverification.ManagerConfig{
+		Repository: repository, EncryptionKey: humanVerificationKey, ExpectedHostname: publicOrigin.Hostname(),
+		FallbackSiteKey: cfg.HumanVerificationSiteKey, FallbackSecret: cfg.HumanVerificationSecret.Value(),
+	})
+	if err != nil {
+		return fmt.Errorf("initialize human verification settings: %w", err)
 	}
 	adminRoutes, err := adminroute.New(repository, adminRouteKey)
 	if err != nil {
@@ -281,7 +278,7 @@ func runProduction() error {
 	productionAPI := &api.API{
 		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication,
 		ServiceEmail:      serviceEmail,
-		HumanVerification: humanVerifier,
+		HumanVerification: humanVerificationManager,
 		SubjectKey:        subjectKey, TokenKey: tokenKey, CommerceKey: commerceCodeKey, History: optionalHistoryStore(historyStore),
 		Commerce: commerceService, DataExportDownloader: privacyExportDownloader, ReconciliationOperations: reconciliationOperations,
 		AccountDeletionBinder: accountDeletionBinder, AgentUpdateCatalog: updateCatalog,
@@ -320,6 +317,7 @@ func runProduction() error {
 		RedirectURI:               cfg.WebOIDCRedirectURI,
 		HumanVerificationProvider: cfg.HumanVerificationProvider,
 		HumanVerificationSiteKey:  cfg.HumanVerificationSiteKey,
+		HumanVerification:         humanVerificationManager,
 		CookieKey:                 cookieKey,
 		SubjectKey:                subjectKey,
 		AppShipBaseURL:            appShipBaseURL,

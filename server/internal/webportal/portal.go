@@ -66,6 +66,7 @@ type Config struct {
 	RedirectURI               string
 	HumanVerificationProvider string
 	HumanVerificationSiteKey  string
+	HumanVerification         *humanverification.Manager
 	CookieKey                 []byte
 	SubjectKey                []byte
 	AppShipBaseURL            string
@@ -283,6 +284,7 @@ type adminPageData struct {
 	Announcements          []store.WebAnnouncement
 	CanManageAnnouncements bool
 	ServiceEmail           serviceemail.AdminView
+	HumanVerification      humanverification.AdminView
 	AdminRoute             adminroute.View
 	CanConfigureSystem     bool
 	CommerceNavigation     bool
@@ -669,6 +671,7 @@ func (p *Portal) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/announcements/{id}", p.sensitiveAction("announcement.update", p.adminUpdateAnnouncement))
 	mux.HandleFunc("POST /admin/announcements/{id}/transition", p.sensitiveAction("announcement.transition", p.adminTransitionAnnouncement))
 	mux.HandleFunc("POST /admin/settings/service-email", p.sensitiveAction("admin.service_email.update", p.adminUpdateServiceEmail))
+	mux.HandleFunc("POST /admin/settings/human-verification", p.sensitiveAction("admin.human_verification.update", p.adminUpdateHumanVerification))
 	mux.HandleFunc("POST /admin/settings/admin-route", p.sensitiveAction("admin.route.update", p.adminUpdateRoute))
 	mux.HandleFunc("POST /logout", p.logout)
 	mux.HandleFunc("/", p.notFound)
@@ -741,14 +744,6 @@ func (p *Portal) commerceAdminJS(w http.ResponseWriter, _ *http.Request) {
 
 func (p *Portal) registerPage(w http.ResponseWriter, r *http.Request) {
 	continueURL := normalizeRegistrationContinueURL(p.config, r.URL.Query().Get("continue"))
-	if !p.usesPublicHost(r) {
-		target := strings.TrimRight(p.config.PublicURL, "/") + "/register"
-		if continueURL != "" {
-			target += "?continue=" + url.QueryEscape(continueURL)
-		}
-		http.Redirect(w, r, target, http.StatusSeeOther)
-		return
-	}
 	repository, ok := p.config.Repository.(registrationPortalRepository)
 	if !ok {
 		p.renderError(w, http.StatusServiceUnavailable, "注册暂不可用", "服务端尚未启用注册策略。")
@@ -771,6 +766,11 @@ func (p *Portal) registerPage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	humanRuntime, err := p.humanVerificationRuntime(r.Context())
+	if err != nil {
+		p.renderError(w, http.StatusServiceUnavailable, "人机验证暂不可用", "服务端暂时无法读取人机验证设置，请稍后重试。")
+		return
+	}
 	loginURL := "/login"
 	if continueURL != "" {
 		loginURL = continueURL
@@ -779,8 +779,8 @@ func (p *Portal) registerPage(w http.ResponseWriter, r *http.Request) {
 		Mode: policy.Mode, RegistrationOpen: policy.Mode != store.RegistrationClosed,
 		InvitationRequired:        policy.Mode == store.RegistrationInviteRequired,
 		EmailVerificationRequired: emailVerificationRequired,
-		HumanVerificationRequired: p.config.HumanVerificationProvider == humanverification.ProviderTurnstile,
-		HumanVerificationSiteKey:  p.config.HumanVerificationSiteKey,
+		HumanVerificationRequired: humanRuntime.Enabled,
+		HumanVerificationSiteKey:  humanRuntime.SiteKey,
 		ContinueURL:               continueURL,
 		LoginURL:                  loginURL,
 	})
@@ -803,21 +803,6 @@ func (p *Portal) svgAsset(contents []byte) http.HandlerFunc {
 }
 
 func (p *Portal) login(w http.ResponseWriter, r *http.Request) {
-	if !p.usesPublicHost(r) {
-		target := strings.TrimRight(p.config.PublicURL, "/") + "/login"
-		query := url.Values{}
-		if returnTo := normalizePortalReturnTo(r.URL.Query().Get("return_to")); returnTo != "/" {
-			query.Set("return_to", returnTo)
-		}
-		if theme := normalizeTheme(r.URL.Query().Get(themeQueryParameter)); theme != "" {
-			query.Set(themeQueryParameter, theme)
-		}
-		if encoded := query.Encode(); encoded != "" {
-			target += "?" + encoded
-		}
-		http.Redirect(w, r, target, http.StatusSeeOther)
-		return
-	}
 	p.beginOIDC(w, r, normalizePortalReturnTo(r.URL.Query().Get("return_to")), normalizeTheme(r.URL.Query().Get(themeQueryParameter)), "", "")
 }
 
@@ -865,10 +850,6 @@ func (p *Portal) beginOIDC(w http.ResponseWriter, r *http.Request, returnTo, the
 func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 	loginTraceID := uuid.NewString()
 	p.clearCookie(w, oauthCookieName)
-	if !p.usesPublicHost(r) {
-		p.renderError(w, http.StatusBadRequest, "授权地址不匹配", "请从 TermLink 公开 HTTPS 首页重新登录。")
-		return
-	}
 	cookie, err := r.Cookie(oauthCookieName)
 	if err != nil {
 		p.renderError(w, http.StatusBadRequest, "登录已过期", "授权状态已失效，请返回首页重新登录。")
@@ -999,18 +980,11 @@ func (p *Portal) identity(w http.ResponseWriter, r *http.Request) {
 	if theme := normalizeTheme(r.URL.Query().Get(themeQueryParameter)); theme != "" {
 		target += "&" + themeQueryParameter + "=" + url.QueryEscape(theme)
 	}
-	if !p.usesPublicHost(r) {
-		target = strings.TrimRight(p.config.PublicURL, "/") + target
-	}
 	w.Header().Set("Cache-Control", "no-store")
 	http.Redirect(w, r, target, http.StatusSeeOther)
 }
 
 func (p *Portal) account(w http.ResponseWriter, r *http.Request) {
-	if !p.usesPublicHost(r) {
-		http.Redirect(w, r, strings.TrimRight(p.config.PublicURL, "/")+"/account", http.StatusSeeOther)
-		return
-	}
 	if _, commerceOK := p.config.Repository.(commerceAccountRepository); commerceOK {
 		if _, portalOK := p.config.Repository.(userPortalRepository); portalOK {
 			p.commerceDashboard(w, r)
@@ -1046,10 +1020,6 @@ func (p *Portal) account(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
-	if !p.usesPublicHost(r) {
-		http.Redirect(w, r, strings.TrimRight(p.config.PublicURL, "/")+"/admin", http.StatusSeeOther)
-		return
-	}
 	session, account, ok := p.requireConsole(w, r)
 	if !ok {
 		return
@@ -1095,6 +1065,14 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	var humanVerificationSettings humanverification.AdminView
+	if section == "settings" && p.config.HumanVerification != nil {
+		humanVerificationSettings, err = p.config.HumanVerification.Admin(r.Context())
+		if err != nil {
+			p.internalError(w, err)
+			return
+		}
+	}
 	adminRoute := adminroute.View{BasePath: adminroute.DefaultBasePath, Version: 1}
 	if p.config.AdminRoutes != nil {
 		adminRoute, err = p.config.AdminRoutes.Current(r.Context())
@@ -1131,6 +1109,7 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 		Announcements:          announcements,
 		CanManageAnnouncements: account.Role.IsAdministrator(),
 		ServiceEmail:           serviceEmailSettings,
+		HumanVerification:      humanVerificationSettings,
 		AdminRoute:             adminRoute,
 		CanConfigureSystem:     account.Role == store.RoleSuperAdmin,
 	})
@@ -1177,6 +1156,41 @@ func (p *Portal) adminUpdateServiceEmail(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	http.Redirect(w, r, "/admin?section=settings&notice=service-email-updated", http.StatusSeeOther)
+}
+
+func (p *Portal) adminUpdateHumanVerification(w http.ResponseWriter, r *http.Request) {
+	session, account, ok := p.requireSuperAdminAction(w, r)
+	if !ok {
+		return
+	}
+	if p.config.HumanVerification == nil || r.ParseForm() != nil || !p.usesTrustedFormOrigin(r) ||
+		!constantTextEqual(session.CSRF, r.Form.Get("csrf")) {
+		p.renderError(w, http.StatusServiceUnavailable, "人机验证设置不可用", "当前服务端无法安全地管理人机验证设置。")
+		return
+	}
+	version, err := strconv.ParseInt(r.Form.Get("expected_version"), 10, 64)
+	if err != nil {
+		p.renderError(w, http.StatusBadRequest, "人机验证设置无效", "配置版本无效，请刷新页面后重试。")
+		return
+	}
+	_, err = p.config.HumanVerification.Update(r.Context(), account.ID, humanverification.UpdateInput{
+		Enabled: r.Form.Get("enabled") == "on", SiteKey: r.Form.Get("site_key"), Secret: r.Form.Get("secret"),
+		ClearSecret: r.Form.Get("clear_secret") == "on", ExpectedVersion: version,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, humanverification.ErrInvalidSettings), errors.Is(err, store.ErrInvalidHumanVerificationSettings):
+			p.renderError(w, http.StatusBadRequest, "人机验证设置无效", "请检查启用状态、Site Key 和 Secret；启用时两项凭据必须完整。")
+		case errors.Is(err, store.ErrConflict):
+			p.renderError(w, http.StatusConflict, "配置已经变化", "其他管理员刚刚修改了人机验证设置，请刷新后重试。")
+		case errors.Is(err, store.ErrDenied):
+			p.renderError(w, http.StatusForbidden, "人机验证设置被拒绝", "只有活动的 SUPER_ADMIN 可以修改此设置。")
+		default:
+			p.internalError(w, err)
+		}
+		return
+	}
+	http.Redirect(w, r, "/admin?section=settings&notice=human-verification-updated", http.StatusSeeOther)
 }
 
 func (p *Portal) adminUpdateRoute(w http.ResponseWriter, r *http.Request) {
@@ -1381,11 +1395,14 @@ func (p *Portal) internalError(w http.ResponseWriter, err error) {
 func (p *Portal) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		policy := "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
-		if r.URL.Path == "/register" && p.config.HumanVerificationProvider == humanverification.ProviderTurnstile {
-			policy = "default-src 'none'; script-src 'self' " + humanverification.TurnstileScriptOrigin +
-				"; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self' " + humanverification.TurnstileScriptOrigin +
-				"; frame-src 'self' " + humanverification.TurnstileScriptOrigin +
-				"; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+		if r.URL.Path == "/register" {
+			humanRuntime, humanErr := p.humanVerificationRuntime(r.Context())
+			if humanErr != nil || humanRuntime.Enabled {
+				policy = "default-src 'none'; script-src 'self' " + humanverification.TurnstileScriptOrigin +
+					"; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self' " + humanverification.TurnstileScriptOrigin +
+					"; frame-src 'self' " + humanverification.TurnstileScriptOrigin +
+					"; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+			}
 		}
 		w.Header().Set("Content-Security-Policy", policy)
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
@@ -1396,6 +1413,16 @@ func (p *Portal) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (p *Portal) humanVerificationRuntime(ctx context.Context) (humanverification.Runtime, error) {
+	if p.config.HumanVerification != nil {
+		return p.config.HumanVerification.Runtime(ctx)
+	}
+	return humanverification.Runtime{
+		Enabled: p.config.HumanVerificationProvider == humanverification.ProviderTurnstile,
+		SiteKey: p.config.HumanVerificationSiteKey,
+	}, nil
 }
 
 func (p *Portal) setCookie(w http.ResponseWriter, name, value string, expires time.Time) {
@@ -1424,10 +1451,6 @@ func (p *Portal) clearCookie(w http.ResponseWriter, name string) {
 	})
 }
 
-func (p *Portal) usesPublicHost(r *http.Request) bool {
-	return strings.EqualFold(r.Host, p.publicOrigin.Host)
-}
-
 func (p *Portal) usesPublicOrigin(value string) bool {
 	origin, err := url.Parse(strings.TrimSpace(value))
 	if err != nil || origin.User != nil || origin.RawQuery != "" || origin.Fragment != "" ||
@@ -1439,14 +1462,51 @@ func (p *Portal) usesPublicOrigin(value string) bool {
 }
 
 func (p *Portal) usesTrustedFormOrigin(r *http.Request) bool {
-	if !p.usesPublicHost(r) {
-		return false
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return p.requestUsesConfiguredPublicHost(r)
 	}
-	origin := r.Header.Get("Origin")
-	if origin == "" || p.usesPublicOrigin(origin) {
+	if p.usesPublicOrigin(origin) || originUsesRequestHost(origin, r) {
 		return true
 	}
-	return strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "same-origin")
+	return p.requestUsesConfiguredPublicHost(r) &&
+		strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "same-origin")
+}
+
+func (p *Portal) requestUsesConfiguredPublicHost(r *http.Request) bool {
+	if strings.EqualFold(strings.TrimSpace(r.Host), p.publicOrigin.Host) {
+		return true
+	}
+	host, ok := forwardedRequestHost(r)
+	return ok && strings.EqualFold(host, p.publicOrigin.Host)
+}
+
+func originUsesRequestHost(value string, r *http.Request) bool {
+	origin, err := url.Parse(value)
+	if err != nil || !strings.EqualFold(origin.Scheme, "https") || origin.Host == "" || origin.User != nil ||
+		origin.RawPath != "" || (origin.Path != "" && origin.Path != "/") || origin.RawQuery != "" || origin.Fragment != "" {
+		return false
+	}
+	if strings.EqualFold(origin.Host, strings.TrimSpace(r.Host)) {
+		return true
+	}
+	host, ok := forwardedRequestHost(r)
+	return ok && strings.EqualFold(origin.Host, host)
+}
+
+func forwardedRequestHost(r *http.Request) (string, bool) {
+	values := r.Header.Values("X-Forwarded-Host")
+	if len(values) != 1 || strings.Contains(values[0], ",") {
+		return "", false
+	}
+	for _, value := range values {
+		host := strings.TrimSpace(value)
+		if host == "" || strings.ContainsAny(host, " /\\\t\r\n@") {
+			return "", false
+		}
+		return host, true
+	}
+	return "", false
 }
 
 func (p *Portal) now() time.Time { return p.config.Clock().UTC() }
@@ -1838,6 +1898,8 @@ func adminNotice(value string) string {
 		return bilingualPortalNotice("账号状态已更新，并已写入安全审计。", "The account status was updated and recorded in the security audit.")
 	case "service-email-updated":
 		return bilingualPortalNotice("测试邮件已发送，服务邮箱配置和功能开关已发布。", "The test email was sent, and the service email settings are now active.")
+	case "human-verification-updated":
+		return bilingualPortalNotice("注册人机验证设置已更新并立即生效。", "Registration human-verification settings were updated and are active immediately.")
 	case "admin-route-updated":
 		return bilingualPortalNotice("管理中心安全入口已经更新，旧入口已立即失效。请将新地址保存在受信任的密码管理器中。", "The secure admin route was updated and the old route is no longer valid. Store the new address in a trusted password manager.")
 	case "announcement-created":

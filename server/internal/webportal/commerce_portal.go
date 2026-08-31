@@ -2205,10 +2205,6 @@ func (p *Portal) adminCommerceDisablePaymentChannel(w http.ResponseWriter, r *ht
 }
 
 func (p *Portal) requireCommerceAccount(w http.ResponseWriter, r *http.Request) (webSession, store.PortalAccount, bool) {
-	if !p.usesPublicHost(r) {
-		http.Redirect(w, r, strings.TrimRight(p.config.PublicURL, "/")+r.URL.Path, http.StatusSeeOther)
-		return webSession{}, store.PortalAccount{}, false
-	}
 	session, err := p.readSession(r)
 	if err != nil {
 		p.clearCookie(w, sessionCookieName)
