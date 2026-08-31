@@ -21,6 +21,8 @@ import dev.termlink.terminal.api.TerminalThemeV1
 import dev.termlink.terminal.api.TerminalViewportEngine
 import java.lang.ref.WeakReference
 import java.nio.ByteBuffer
+import java.util.LinkedHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -32,6 +34,7 @@ import kotlinx.coroutines.flow.receiveAsFlow
 internal enum class NativeHistoryScrollResult {
     MOVED,
     UNCHANGED,
+    CANCELLED,
     OLDEST_BOUNDARY,
     LIVE_BOUNDARY,
 }
@@ -58,6 +61,16 @@ class NativeTerminalEngine(
     private var readOnly = true
     private var disposed = false
     private var failedClosed = false
+    private val historyNavigationGeneration = AtomicLong()
+    private val historyFrameCache = object : LinkedHashMap<Long, NativeScrollbackFrameV3>(
+        HISTORY_FRAME_CACHE_SIZE,
+        0.75f,
+        true,
+    ) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<Long, NativeScrollbackFrameV3>,
+        ): Boolean = size > HISTORY_FRAME_CACHE_SIZE
+    }
     private var viewReference: WeakReference<NativeTerminalView>? = null
     private var acceptedInputListener: (() -> Unit)? = null
     private var listenerGeneration = 0L
@@ -99,6 +112,7 @@ class NativeTerminalEngine(
                 checkActive()
                 val owned = terminal
                 terminal = replacement
+                historyNavigationGeneration.incrementAndGet()
                 failedClosed = false
                 readOnly = true
                 owned
@@ -116,7 +130,11 @@ class NativeTerminalEngine(
             }
             throw error
         }
-        synchronized(lock) { acceptScrollbackFrame(frame) }
+        synchronized(lock) {
+            historyFrameCache.clear()
+            acceptScrollbackFrame(frame)
+            cacheHistoryFrame(frame)
+        }
         publishFrame(frame.renderFrame, notify = true)
         return InstalledCheckpoint(
             sequence = nextSourceSequence - 1L,
@@ -198,7 +216,9 @@ class NativeTerminalEngine(
             if (disposed) return
             disposed = true
             listenerGeneration = Math.addExact(listenerGeneration, 1)
+            historyNavigationGeneration.incrementAndGet()
             acceptedInputListener = null
+            historyFrameCache.clear()
             viewReference?.get()?.detachEngine()
             viewReference = null
             terminal
@@ -249,13 +269,17 @@ class NativeTerminalEngine(
     }
 
     override fun scrollToLatest() {
+        historyNavigationGeneration.incrementAndGet()
         val result = synchronized(lock) {
             checkActive()
             val frame = if (scrollbackOffsetRows == 0L) {
                 null
             } else {
                 try {
-                    terminal.renderV3AtScrollback(0).also(::acceptScrollbackFrame)
+                    terminal.renderV3AtScrollback(0).also {
+                        acceptScrollbackFrame(it)
+                        cacheHistoryFrame(it)
+                    }
                 } catch (error: NativeTerminalException) {
                     if (!error.isTemporaryPresentationFailure()) throw error
                     scrollbackOffsetRows = 0L
@@ -355,9 +379,25 @@ class NativeTerminalEngine(
     }
 
     internal fun scrollHistoryRows(deltaRows: Int): NativeHistoryScrollResult {
+        val generation = historyNavigationGeneration.get()
+        return scrollHistoryRows(deltaRows, generation)
+    }
+
+    internal fun beginHistoryNavigation(): Long = historyNavigationGeneration.incrementAndGet()
+
+    internal fun scrollHistoryRows(
+        deltaRows: Int,
+        navigationGeneration: Long,
+    ): NativeHistoryScrollResult {
         if (deltaRows == 0) return NativeHistoryScrollResult.MOVED
+        if (navigationGeneration != historyNavigationGeneration.get()) {
+            return NativeHistoryScrollResult.CANCELLED
+        }
         val frame = synchronized(lock) {
             checkActive()
+            if (navigationGeneration != historyNavigationGeneration.get()) {
+                return NativeHistoryScrollResult.CANCELLED
+            }
             val requested = if (deltaRows > 0) {
                 saturatedAdd(scrollbackOffsetRows, deltaRows.toLong())
                     .coerceAtMost(scrollbackAvailableRows)
@@ -372,7 +412,13 @@ class NativeTerminalEngine(
                 }
             }
             try {
-                terminal.renderV3AtScrollback(requested).also(::acceptScrollbackFrame)
+                val projected = cachedHistoryFrame(requested)
+                    ?: terminal.renderV3AtScrollback(requested)
+                if (navigationGeneration != historyNavigationGeneration.get()) {
+                    return NativeHistoryScrollResult.CANCELLED
+                }
+                cacheHistoryFrame(projected)
+                projected.also(::acceptScrollbackFrame)
             } catch (error: NativeTerminalException) {
                 if (!error.isTemporaryPresentationFailure()) throw error
                 return NativeHistoryScrollResult.UNCHANGED
@@ -380,6 +426,29 @@ class NativeTerminalEngine(
         }
         publishFrame(frame.renderFrame, notify = true)
         return NativeHistoryScrollResult.MOVED
+    }
+
+    internal fun prefetchHistoryRows(deltaRows: Int, navigationGeneration: Long) {
+        if (deltaRows == 0) return
+        synchronized(lock) {
+            checkActive()
+            if (navigationGeneration != historyNavigationGeneration.get()) return
+            val distance = kotlin.math.abs(deltaRows.toLong())
+            val requested = if (deltaRows > 0) {
+                saturatedAdd(scrollbackOffsetRows, distance).coerceAtMost(scrollbackAvailableRows)
+            } else {
+                (scrollbackOffsetRows - distance).coerceAtLeast(0L)
+            }
+            if (requested == scrollbackOffsetRows || cachedHistoryFrame(requested) != null) return
+            try {
+                val frame = terminal.renderV3AtScrollback(requested)
+                if (navigationGeneration == historyNavigationGeneration.get()) {
+                    cacheHistoryFrame(frame)
+                }
+            } catch (error: NativeTerminalException) {
+                if (!error.isTemporaryPresentationFailure()) throw error
+            }
+        }
     }
 
     internal fun historyOffsetRowsForTest(): Long = synchronized(lock) { scrollbackOffsetRows }
@@ -392,12 +461,21 @@ class NativeTerminalEngine(
         }
     }
 
+    internal fun attachView(view: NativeTerminalView): Boolean = synchronized(lock) {
+        if (disposed) return false
+        val attached = viewReference?.get()
+        if (attached != null && attached !== view) return false
+        viewReference = WeakReference(view)
+        true
+    }
+
     private fun applyOrdered(apply: (NativeTerminalHandle) -> Unit) {
         val frame = synchronized(lock) {
             checkActive()
             check(!failedClosed) { "Native terminal renderer is failed closed" }
             try {
                 apply(terminal)
+                historyFrameCache.clear()
                 try {
                     val live = terminal.renderV3AtScrollback(0)
                     val generationDelta = if (live.generationRows >= scrollbackGenerationRows) {
@@ -417,6 +495,7 @@ class NativeTerminalEngine(
                         terminal.renderV3AtScrollback(anchoredOffset)
                     }
                     acceptScrollbackFrame(visible)
+                    cacheHistoryFrame(visible)
                     visible.renderFrame
                 } catch (error: NativeTerminalException) {
                     if (error.isTemporaryPresentationFailure()) {
@@ -448,7 +527,10 @@ class NativeTerminalEngine(
             throw error
         }
         terminal = replacement
+        historyNavigationGeneration.incrementAndGet()
+        historyFrameCache.clear()
         acceptScrollbackFrame(frame)
+        cacheHistoryFrame(frame)
         try {
             previous.close()
         } catch (error: Throwable) {
@@ -480,6 +562,17 @@ class NativeTerminalEngine(
         scrollbackGenerationRows = frame.generationRows
         scrollbackOffsetRows = frame.appliedOffsetRows
     }
+
+    private fun cacheHistoryFrame(frame: NativeScrollbackFrameV3) {
+        historyFrameCache[frame.appliedOffsetRows] = frame
+    }
+
+    private fun cachedHistoryFrame(offsetRows: Long): NativeScrollbackFrameV3? =
+        historyFrameCache[offsetRows]?.takeIf { frame ->
+            frame.availableRows == scrollbackAvailableRows &&
+                frame.generationRows == scrollbackGenerationRows &&
+                frame.renderFrame.presentationRevision == terminal.presentationRevision
+        }
 
     private fun notifyView() {
         val view = synchronized(lock) { if (disposed) null else viewReference?.get() } ?: return
@@ -527,6 +620,7 @@ class NativeTerminalEngine(
         const val DEFAULT_COLUMNS = 80
         const val DEFAULT_ROWS = 24
         const val DEFAULT_HISTORY_CAPACITY_ROWS = 2_000L
+        const val HISTORY_FRAME_CACHE_SIZE = 8
         const val FIRST_SOURCE_SEQUENCE = 1L
         const val MAX_TITLE_CHARACTERS = 4_096
         const val TERMINAL_KEYMOD_ALT = Int.MIN_VALUE

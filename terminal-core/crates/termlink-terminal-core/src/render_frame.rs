@@ -119,6 +119,25 @@ pub(crate) fn export_v3(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
     Ok(bytes)
 }
 
+pub(crate) fn export_v3_at_scrollback(
+    terminal: &Terminal,
+    offset_rows: u32,
+) -> Result<Vec<u8>, TerminalError> {
+    terminal.ensure_presentation_eligible()?;
+    crate::validate_dimensions(terminal.columns, terminal.rows)?;
+
+    let screen = terminal.active_screen();
+    if screen.columns != terminal.columns || screen.rows != terminal.rows {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+
+    let window = screen.render_window(offset_rows);
+    window.validate()?;
+    let bytes = export_version_with_screen(terminal, &window, false, FrameVersion::V3)?;
+    validate_v3_header(&bytes)?;
+    Ok(bytes)
+}
+
 fn export_version(terminal: &Terminal, version: FrameVersion) -> Result<Vec<u8>, TerminalError> {
     terminal.ensure_presentation_eligible()?;
     crate::validate_dimensions(terminal.columns, terminal.rows)?;
@@ -129,6 +148,15 @@ fn export_version(terminal: &Terminal, version: FrameVersion) -> Result<Vec<u8>,
     }
     screen.validate()?;
 
+    export_version_with_screen(terminal, screen, terminal.cursor_visible, version)
+}
+
+fn export_version_with_screen(
+    terminal: &Terminal,
+    screen: &Screen,
+    cursor_visible: bool,
+    version: FrameVersion,
+) -> Result<Vec<u8>, TerminalError> {
     let graphemes = collect_graphemes(screen)?;
     let renditions = collect_renditions(screen, version)?;
     let hyperlinks = collect_visible_hyperlinks(terminal, screen)?;
@@ -138,6 +166,7 @@ fn export_version(terminal: &Terminal, version: FrameVersion) -> Result<Vec<u8>,
         &graphemes,
         &renditions,
         &hyperlinks,
+        cursor_visible,
         version,
     )
 }
@@ -217,6 +246,7 @@ fn encode_frame(
     graphemes: &[GraphemeRef<'_>],
     renditions: &[[u8; RENDITION_RECORD_BYTES]],
     hyperlinks: &[u32],
+    cursor_visible: bool,
     version: FrameVersion,
 ) -> Result<Vec<u8>, TerminalError> {
     let grapheme_blob_bytes = graphemes.iter().try_fold(0_usize, |length, grapheme| {
@@ -328,7 +358,7 @@ fn encode_frame(
     patch_bytes(&mut bytes, descs[5].offset as usize, title);
 
     encode_directory(&mut bytes, &descs, version);
-    encode_header(&mut bytes, terminal, screen, total, version)?;
+    encode_header(&mut bytes, terminal, screen, total, cursor_visible, version)?;
     Ok(bytes)
 }
 
@@ -494,6 +524,7 @@ fn encode_header(
     terminal: &Terminal,
     screen: &Screen,
     total: usize,
+    cursor_visible: bool,
     version: FrameVersion,
 ) -> Result<(), TerminalError> {
     let (magic, major, required_features) = match version {
@@ -520,7 +551,7 @@ fn encode_header(
     patch_u32(
         bytes,
         56,
-        u32::from(terminal.cursor_visible) | (u32::from(screen.wrap_pending) << 1),
+        u32::from(cursor_visible) | (u32::from(screen.wrap_pending) << 1),
     );
     patch_u32(bytes, 60, WIDTH_PROFILE_V1);
     patch_u32(bytes, 64, HEADER_BYTES as u32);

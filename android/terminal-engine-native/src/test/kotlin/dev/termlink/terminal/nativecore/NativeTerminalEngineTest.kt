@@ -2,6 +2,9 @@ package dev.termlink.terminal.nativecore
 
 import dev.termlink.terminal.api.TerminalSize
 import java.nio.ByteBuffer
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -13,6 +16,77 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [26])
 class NativeTerminalEngineTest {
+    @Test
+    fun cancelledNavigationCannotPublishAnOlderFrameAfterReturningLive() {
+        val enteredRender = CountDownLatch(1)
+        val releaseRender = CountDownLatch(1)
+        val bridge = FakeNativeBridge().apply {
+            forcedScrollbackAvailableRows = 8
+            forcedScrollbackGenerationRows = 8
+        }
+        val engine = NativeTerminalEngine(
+            initialSize = TerminalSize(80, 24),
+            bridge = bridge,
+        )
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            bridge.beforeScrollbackRender = { offsetRows ->
+                if (offsetRows > 0) {
+                    enteredRender.countDown()
+                    assertTrue(releaseRender.await(5, TimeUnit.SECONDS))
+                }
+            }
+            val navigation = engine.beginHistoryNavigation()
+            val staleRequest = executor.submit<NativeHistoryScrollResult> {
+                engine.scrollHistoryRows(3, navigation)
+            }
+            assertTrue(enteredRender.await(5, TimeUnit.SECONDS))
+
+            engine.beginHistoryNavigation()
+            releaseRender.countDown()
+
+            assertEquals(NativeHistoryScrollResult.CANCELLED, staleRequest.get(5, TimeUnit.SECONDS))
+            assertEquals(0L, engine.historyOffsetRowsForTest())
+        } finally {
+            releaseRender.countDown()
+            executor.shutdownNow()
+            engine.dispose()
+        }
+    }
+
+    @Test
+    fun prefetchedHistoryFrameIsReusedByTheNextScrollStep() = runBlocking {
+        val bridge = FakeNativeBridge().apply {
+            forcedScrollbackAvailableRows = 4
+            forcedScrollbackGenerationRows = 4
+        }
+        val engine = NativeTerminalEngine(
+            initialSize = TerminalSize(80, 24),
+            bridge = bridge,
+        )
+        try {
+            bridge.scrollbackRenderThreads.clear()
+            val navigation = engine.beginHistoryNavigation()
+
+            assertEquals(
+                NativeHistoryScrollResult.MOVED,
+                engine.scrollHistoryRows(1, navigation),
+            )
+            engine.prefetchHistoryRows(1, navigation)
+            val rendersAfterPrefetch = bridge.scrollbackRenderThreads.size
+
+            assertEquals(
+                NativeHistoryScrollResult.MOVED,
+                engine.scrollHistoryRows(1, navigation),
+            )
+
+            assertEquals(2L, engine.historyOffsetRowsForTest())
+            assertEquals(rendersAfterPrefetch, bridge.scrollbackRenderThreads.size)
+        } finally {
+            engine.dispose()
+        }
+    }
+
     @Test
     fun localHistoryScrollAnchorsAcrossOutputAndInputReturnsToLiveTail() = runBlocking {
         val bridge = FakeNativeBridge()

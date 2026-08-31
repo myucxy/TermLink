@@ -1,7 +1,10 @@
 package dev.termlink.terminal.nativecore
 
+import android.graphics.Canvas
+import android.graphics.Paint
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
+import android.view.MotionEvent
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.termlink.terminal.api.TerminalKittyKey
@@ -15,16 +18,108 @@ import dev.termlink.terminal.api.TerminalOutputProfile
 import dev.termlink.terminal.api.TerminalSize
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.nio.ByteBuffer
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import kotlinx.coroutines.flow.first
 
 @RunWith(AndroidJUnit4::class)
 class JniNativeBridgeInstrumentedTest {
+    @Test
+    fun deviceFontMetricsBatchAnAsciiTerminalRowIntoOneTextDraw() = kotlinx.coroutines.runBlocking {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val engine = NativeTerminalEngine(TerminalSize(20, 2))
+        try {
+            engine.feed(1, ByteBuffer.wrap("TermLink".encodeToByteArray()))
+            val canvas = TextRecordingCanvas()
+            instrumentation.runOnMainSync {
+                val view = NativeTerminalView(
+                    context = instrumentation.targetContext,
+                    engine = null,
+                    textSizeSp = 14f,
+                    lineSpacingMultiplier = 1f,
+                )
+                view.layout(0, 0, 500, 100)
+                view.drawFrame(canvas, engine.frames.value, engine.theme())
+            }
+
+            assertTrue(
+                "the device font should draw adjacent ASCII cells as one safe run: ${canvas.texts}",
+                canvas.texts.any { it.startsWith("TermLink") },
+            )
+        } finally {
+            engine.dispose()
+        }
+    }
+
+    @Test
+    fun historyDragUsesTheWorkerAndLeavesTheInstrumentationThreadResponsive() =
+        kotlinx.coroutines.runBlocking {
+            val instrumentation = InstrumentationRegistry.getInstrumentation()
+            val engine = NativeTerminalEngine(TerminalSize(40, 10))
+            try {
+                val output = buildString {
+                    repeat(100) { index -> append("line-").append(index).append("\r\n") }
+                }
+                engine.feed(1, ByteBuffer.wrap(output.encodeToByteArray()))
+                lateinit var view: NativeTerminalView
+
+                instrumentation.runOnMainSync {
+                    view = engine.createView(instrumentation.targetContext) as NativeTerminalView
+                    view.layout(0, 0, 360, 240)
+                    val down = MotionEvent.obtain(0, 0, MotionEvent.ACTION_DOWN, 100f, 40f, 0)
+                    val move = MotionEvent.obtain(0, 80, MotionEvent.ACTION_MOVE, 100f, 420f, 0)
+                    val up = MotionEvent.obtain(0, 100, MotionEvent.ACTION_UP, 100f, 420f, 0)
+                    try {
+                        assertTrue(view.dispatchTouchEvent(down))
+                        assertTrue(view.dispatchTouchEvent(move))
+                        assertTrue(view.dispatchTouchEvent(up))
+                    } finally {
+                        down.recycle()
+                        move.recycle()
+                        up.recycle()
+                    }
+                }
+
+                view.awaitHistoryRequestsForTest()
+
+                assertTrue(engine.historyOffsetRowsForTest() > 0L)
+                assertFalse(view.isFollowingCursorForTest())
+                assertEquals("TermLink-NativeHistory", view.historyWorkerThreadNameForTest())
+            } finally {
+                engine.dispose()
+            }
+        }
+
+    @Test
+    fun liveCursorRemainsVisibleWhenAndroidShrinksTerminalViewport() = kotlinx.coroutines.runBlocking {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val engine = NativeTerminalEngine(TerminalSize(80, 24))
+        try {
+            engine.feed(1, ByteBuffer.wrap(("\r\n".repeat(23) + "x".repeat(79)).encodeToByteArray()))
+            assertEquals(23, engine.frames.value.cursor.row)
+            assertEquals(79, engine.frames.value.cursor.column)
+
+            instrumentation.runOnMainSync {
+                val view = engine.createView(instrumentation.targetContext) as NativeTerminalView
+                view.layout(0, 0, 1080, 1200)
+                view.layout(0, 0, 360, 360)
+
+                assertTrue(view.isFollowingCursorForTest())
+                assertTrue("the complete cursor cell must remain in the resized viewport", view.isCursorFullyVisibleForTest())
+                assertTrue("the viewport must move upward when its bottom is covered", view.viewportYForTest() > 0f)
+                assertTrue("the viewport must move sideways when its right edge is covered", view.viewportXForTest() > 0f)
+            }
+        } finally {
+            engine.dispose()
+        }
+    }
+
     @Test
     fun nativeViewInputConnectionOwnsNonRecursiveEditableBuffer() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
@@ -237,5 +332,15 @@ class JniNativeBridgeInstrumentedTest {
     private fun firstCellText(frame: dev.termlink.terminal.api.TerminalRenderFrameV3): String {
         val graphemeId = frame.rows.first().cells.first().graphemeId
         return frame.graphemes[graphemeId - 1].text
+    }
+
+    private class TextRecordingCanvas : Canvas() {
+        val texts = mutableListOf<String>()
+
+        override fun drawText(text: String, x: Float, y: Float, paint: Paint) {
+            texts += text
+        }
+
+        override fun drawRect(left: Float, top: Float, right: Float, bottom: Float, paint: Paint) = Unit
     }
 }

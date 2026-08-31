@@ -912,11 +912,7 @@ impl Terminal {
         if offset_rows == 0 {
             return render_frame::export_v3(self);
         }
-        self.ensure_presentation_eligible()?;
-        let mut projection = self.clone();
-        projection.cursor_visible = false;
-        *projection.active_screen_mut() = self.active_screen().render_window(offset_rows);
-        render_frame::export_v3(&projection)
+        render_frame::export_v3_at_scrollback(self, offset_rows)
     }
 
     /// Encodes one semantic keyboard or paste event using the terminal's

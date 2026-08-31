@@ -101,6 +101,15 @@ fn renderer_scrollback_window_and_generation_follow_output_without_changing_live
     let history_frame = terminal
         .export_render_frame_v3_at_scrollback(2)
         .expect("history render frame");
+    let expected_history_frame = {
+        let mut projection = terminal.clone();
+        projection.cursor_visible = false;
+        *projection.active_screen_mut() = terminal.main.render_window(2);
+        projection
+            .export_render_frame_v3()
+            .expect("cloned history projection")
+    };
+    assert_eq!(history_frame, expected_history_frame);
     assert_eq!(
         u32_at(&history_frame, 56) & 1,
         0,

@@ -23,6 +23,7 @@ import android.view.View
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
+import android.widget.OverScroller
 import dev.termlink.terminal.api.TerminalInputModifiers
 import dev.termlink.terminal.api.TerminalMouseButton
 import dev.termlink.terminal.api.TerminalMouseButtons
@@ -31,10 +32,16 @@ import dev.termlink.terminal.api.TerminalMouseWheelDirection
 import dev.termlink.terminal.api.TerminalRenderColorV1
 import dev.termlink.terminal.api.TerminalRenderCursorShapeV2
 import dev.termlink.terminal.api.TerminalRenderFrameV3
+import dev.termlink.terminal.api.TerminalRenderGraphemeV1
 import dev.termlink.terminal.api.TerminalRenderRenditionV3
 import dev.termlink.terminal.api.TerminalRenderUnderlineStyleV3
 import dev.termlink.terminal.api.TerminalThemeV1
 import dev.termlink.terminal.api.TerminalTypefaceResolver
+import java.util.LinkedHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.max
@@ -67,19 +74,51 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private var baselineOffset = 1f
     private var viewportX = 0f
     private var viewportY = 0f
+    private var followCursor = true
     private var historyDragPixels = 0f
+    private var scrollAxis = ScrollAxis.UNDECIDED
+    private var flingAxis = ScrollAxis.UNDECIDED
+    private val scroller = OverScroller(context)
+    private var lastFlingX = 0
+    private var lastFlingY = 0
+    private val historyQueueLock = Any()
+    private var historyExecutor: ExecutorService? = null
+    private var pendingHistoryRows = 0
+    private var historyWorkerScheduled = false
+    private var historyWorkerGeneration = 0L
+    private var historyRequestGeneration = 0L
+    @Volatile
+    private var historyNavigationGeneration = 0L
+    @Volatile
+    private var lastHistoryWorkerThreadName: String? = null
     private var mouseCaptured = false
     private var selectionAnchor: CellPoint? = null
     private var selectionExtent: CellPoint? = null
     private var selectionActionMode: ActionMode? = null
     private var detached = false
     private var baseTypeface: Typeface = Typeface.MONOSPACE
+    private var boldTypeface: Typeface = Typeface.DEFAULT_BOLD
+    private var italicTypeface: Typeface = Typeface.create(Typeface.MONOSPACE, Typeface.ITALIC)
+    private var boldItalicTypeface: Typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD_ITALIC)
+    private var textRunWidthMatchOverrideForTest: Boolean? = null
+    private val textWidthCache = object : LinkedHashMap<TextMeasureKey, Float>(
+        TEXT_WIDTH_CACHE_SIZE,
+        0.75f,
+        true,
+    ) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<TextMeasureKey, Float>): Boolean =
+            size > TEXT_WIDTH_CACHE_SIZE
+    }
     private var appliedFontFamilyHint: String? = null
     private var fontFamilyInitialized = false
 
     private val gestures = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
         override fun onDown(event: MotionEvent): Boolean {
+            scroller.forceFinished(true)
+            scrollAxis = ScrollAxis.UNDECIDED
             historyDragPixels = 0f
+            cancelQueuedHistoryRequests()
+            engine?.let { historyNavigationGeneration = it.beginHistoryNavigation() }
             return true
         }
 
@@ -99,12 +138,39 @@ internal class NativeTerminalView @JvmOverloads constructor(
             val extent = selectionExtent
             if (extent != null) {
                 selectionExtent = cellAt(current.x, current.y)
-                invalidate()
+                postInvalidateOnAnimation()
                 return true
             }
-            viewportX = (viewportX + distanceX).coerceIn(0f, maxViewportX())
-            scrollVertically(owner, distanceY)
-            invalidate()
+            if (scrollAxis == ScrollAxis.UNDECIDED) {
+                val totalX = abs(current.x - (first?.x ?: current.x))
+                val totalY = abs(current.y - (first?.y ?: current.y))
+                scrollAxis = if (totalX >= totalY) ScrollAxis.HORIZONTAL else ScrollAxis.VERTICAL
+            }
+            followCursor = false
+            when (scrollAxis) {
+                ScrollAxis.HORIZONTAL -> {
+                    viewportX = (viewportX + distanceX).coerceIn(0f, maxViewportX())
+                }
+                ScrollAxis.VERTICAL -> scrollVertically(owner, distanceY)
+                ScrollAxis.UNDECIDED -> Unit
+            }
+            postInvalidateOnAnimation()
+            return true
+        }
+
+        override fun onFling(
+            first: MotionEvent?,
+            current: MotionEvent,
+            velocityX: Float,
+            velocityY: Float,
+        ): Boolean {
+            if (mouseCaptured) return false
+            val axis = if (scrollAxis == ScrollAxis.UNDECIDED) {
+                if (abs(velocityX) >= abs(velocityY)) ScrollAxis.HORIZONTAL else ScrollAxis.VERTICAL
+            } else {
+                scrollAxis
+            }
+            startFling(axis, velocityX, velocityY)
             return true
         }
 
@@ -164,11 +230,16 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        detached = false
-        onFrameChanged()
+        val owner = engine
+        detached = owner == null || !owner.attachView(this)
+        if (!detached) onFrameChanged()
     }
 
     override fun onDetachedFromWindow() {
+        detached = true
+        scroller.forceFinished(true)
+        engine?.beginHistoryNavigation()
+        shutdownHistoryExecutor()
         selectionActionMode?.finish()
         selectionActionMode = null
         engine?.detachView(this)
@@ -177,6 +248,9 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     internal fun detachEngine() {
         detached = true
+        scroller.forceFinished(true)
+        engine?.beginHistoryNavigation()
+        shutdownHistoryExecutor()
         engine = null
         selectionActionMode?.finish()
         selectionActionMode = null
@@ -185,21 +259,38 @@ internal class NativeTerminalView @JvmOverloads constructor(
     internal fun onFrameChanged() {
         if (detached) return
         refreshTypeface()
-        clampViewport()
-        invalidate()
+        if (followCursor) ensureCursorVisible() else clampViewport()
+        postInvalidateOnAnimation()
     }
 
     internal fun scrollToCursor() {
+        scroller.forceFinished(true)
+        cancelQueuedHistoryRequests()
+        historyNavigationGeneration = 0L
+        followCursor = true
+        historyDragPixels = 0f
+        ensureCursorVisible()
+        postInvalidateOnAnimation()
+    }
+
+    private fun ensureCursorVisible() {
+        if (engine == null || width <= 0 || height <= 0) return
         val frame = currentFrame()
+        val cursorLeft = contentPadding + frame.cursor.column * cellWidth
+        val cursorRight = cursorLeft + cellWidth
         val cursorTop = contentPadding + frame.cursor.row * cellHeight
         val cursorBottom = cursorTop + cellHeight
+        viewportX = when {
+            cursorLeft < viewportX -> cursorLeft
+            cursorRight > viewportX + width -> cursorRight - width
+            else -> viewportX
+        }
         viewportY = when {
             cursorTop < viewportY -> cursorTop
             cursorBottom > viewportY + height -> cursorBottom - height
             else -> viewportY
         }
         clampViewport()
-        invalidate()
     }
 
     internal fun signalScrollPastTop() {
@@ -221,7 +312,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
         super.onSizeChanged(width, height, oldWidth, oldHeight)
-        clampViewport()
+        if (followCursor) ensureCursorVisible() else clampViewport()
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -245,48 +336,48 @@ internal class NativeTerminalView @JvmOverloads constructor(
         val lastRow = ceil((viewportY + height - contentPadding) / cellHeight).toInt()
             .coerceAtMost(frame.size.rows - 1)
         if (lastRow < firstRow) return
+        val firstColumn = floor((viewportX - contentPadding) / cellWidth).toInt().coerceAtLeast(0)
+        val lastColumn = ceil((viewportX + width - contentPadding) / cellWidth).toInt()
+            .coerceAtMost(frame.size.columns - 1)
+        if (lastColumn < firstColumn) return
+        val colorsByRendition = Array(frame.renditions.size) { index ->
+            effectiveColors(frame, frame.renditions[index], theme)
+        }
 
         for (rowIndex in firstRow..lastRow) {
             val row = frame.rows[rowIndex]
             val top = contentPadding + rowIndex * cellHeight - viewportY
-            for (column in 0 until frame.size.columns) {
-                val left = contentPadding + column * cellWidth - viewportX
-                if (left + cellWidth < 0f || left > width) continue
+            var runStart = firstColumn
+            var runColor: Int? = null
+            for (column in firstColumn..lastColumn) {
                 val cell = row.cells[column]
-                val rendition = frame.renditions[cell.renditionId]
-                val colors = effectiveColors(frame, rendition, theme)
-                shapePaint.color = if (isSelected(column, rowIndex)) {
+                val color = if (isSelected(column, rowIndex, frame)) {
                     theme.selectionBackground.value
                 } else {
-                    colors.background
+                    colorsByRendition[cell.renditionId].background
                 }
-                canvas.drawRect(left, top, left + cellWidth, top + cellHeight, shapePaint)
+                if (runColor != null && color != runColor) {
+                    drawBackgroundRun(canvas, runStart, column, top, runColor)
+                    runStart = column
+                }
+                runColor = color
             }
+            runColor?.let { drawBackgroundRun(canvas, runStart, lastColumn + 1, top, it) }
         }
 
         // Draw every cell background before drawing any text. A width-two grapheme is painted by
         // its lead cell across both columns; painting the continuation background afterwards would
         // erase the right half of CJK, full-width, and other wide glyphs.
+        val firstTextColumn = (firstColumn - 1).coerceAtLeast(0)
         for (rowIndex in firstRow..lastRow) {
-            val row = frame.rows[rowIndex]
-            val top = contentPadding + rowIndex * cellHeight - viewportY
-            for (column in 0 until frame.size.columns) {
-                val cell = row.cells[column]
-                if (cell.wideContinuation) continue
-                val grapheme = frame.graphemes.getOrNull(cell.graphemeId - 1) ?: continue
-                val rendition = frame.renditions[cell.renditionId]
-                if (rendition.conceal || grapheme.text.isEmpty()) continue
-                val left = contentPadding + column * cellWidth - viewportX
-                val allottedWidth = cellWidth * grapheme.displayWidth
-                if (left + allottedWidth < 0f || left > width) continue
-                val colors = effectiveColors(frame, rendition, theme)
-                configureTextPaint(rendition, colors.foreground)
-                val textWidth = textPaint.measureText(grapheme.text)
-                val x = left + ((allottedWidth - textWidth) / 2f).coerceAtLeast(0f)
-                val baseline = top + baselineOffset
-                canvas.drawText(grapheme.text, x, baseline, textPaint)
-                drawDecorations(canvas, left, top, allottedWidth, rendition, colors.foreground)
-            }
+            drawTextRow(
+                canvas = canvas,
+                frame = frame,
+                rowIndex = rowIndex,
+                firstColumn = firstTextColumn,
+                lastColumn = lastColumn,
+                colorsByRendition = colorsByRendition,
+            )
         }
         drawCursor(canvas, frame, theme)
     }
@@ -327,7 +418,36 @@ internal class NativeTerminalView @JvmOverloads constructor(
                 mouseCaptured = false
             }
         }
-        return if (mouseCaptured) true else gestures.onTouchEvent(event) || super.onTouchEvent(event)
+        val handled = if (mouseCaptured) true else gestures.onTouchEvent(event) || super.onTouchEvent(event)
+        if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
+            scrollAxis = ScrollAxis.UNDECIDED
+        }
+        return handled
+    }
+
+    override fun computeScroll() {
+        if (!scroller.computeScrollOffset()) return
+        val owner = engine
+        if (owner == null) {
+            scroller.forceFinished(true)
+            return
+        }
+        val nextX = scroller.currX
+        val nextY = scroller.currY
+        val deltaX = nextX - lastFlingX
+        val deltaY = nextY - lastFlingY
+        lastFlingX = nextX
+        lastFlingY = nextY
+        when (flingAxis) {
+            ScrollAxis.HORIZONTAL -> {
+                val before = viewportX
+                viewportX = (viewportX + deltaX).coerceIn(0f, maxViewportX())
+                if (viewportX == before && deltaX != 0) scroller.forceFinished(true)
+            }
+            ScrollAxis.VERTICAL -> scrollVertically(owner, deltaY.toFloat())
+            ScrollAxis.UNDECIDED -> scroller.forceFinished(true)
+        }
+        postInvalidateOnAnimation()
     }
 
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
@@ -348,8 +468,11 @@ internal class NativeTerminalView @JvmOverloads constructor(
                         ),
                     )
                 ) return true
+                if (historyNavigationGeneration == 0L) {
+                    historyNavigationGeneration = owner.beginHistoryNavigation()
+                }
                 scrollVertically(owner, -vertical * cellHeight * 3f)
-                invalidate()
+                postInvalidateOnAnimation()
                 return true
             }
         }
@@ -454,6 +577,11 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private fun updateCellMetrics() {
         textPaint.textSize = textSizePixels
         textPaint.typeface = baseTypeface
+        textPaint.fontFeatureSettings = "liga=0,clig=0,calt=0,kern=0"
+        boldTypeface = Typeface.create(baseTypeface, Typeface.BOLD)
+        italicTypeface = Typeface.create(baseTypeface, Typeface.ITALIC)
+        boldItalicTypeface = Typeface.create(baseTypeface, Typeface.BOLD_ITALIC)
+        textWidthCache.clear()
         val metrics = textPaint.fontMetrics
         cellWidth = max(textPaint.measureText("M"), textSizePixels * 0.55f)
         val fontHeight = metrics.descent - metrics.ascent
@@ -482,13 +610,25 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     private fun handleHistoryScrollResult(result: NativeHistoryScrollResult) {
         when (result) {
-            NativeHistoryScrollResult.MOVED, NativeHistoryScrollResult.UNCHANGED -> Unit
-            NativeHistoryScrollResult.OLDEST_BOUNDARY -> onScrollPastTop?.invoke()
-            NativeHistoryScrollResult.LIVE_BOUNDARY -> onScrollPastBottom?.invoke()
+            NativeHistoryScrollResult.MOVED,
+            NativeHistoryScrollResult.UNCHANGED,
+            NativeHistoryScrollResult.CANCELLED -> Unit
+            NativeHistoryScrollResult.OLDEST_BOUNDARY -> {
+                scroller.forceFinished(true)
+                onScrollPastTop?.invoke()
+            }
+            NativeHistoryScrollResult.LIVE_BOUNDARY -> {
+                scroller.forceFinished(true)
+                followCursor = true
+                historyDragPixels = 0f
+                ensureCursorVisible()
+                onScrollPastBottom?.invoke()
+            }
         }
     }
 
     private fun scrollVertically(owner: NativeTerminalEngine, distanceY: Float) {
+        if (distanceY != 0f) followCursor = false
         val beforeY = viewportY
         viewportY = (viewportY + distanceY).coerceIn(0f, maxViewportY())
         val overscrollPixels = distanceY - (viewportY - beforeY)
@@ -503,7 +643,172 @@ internal class NativeTerminalView @JvmOverloads constructor(
         val historyRows = (historyDragPixels / cellHeight).toInt()
         if (historyRows == 0) return
         historyDragPixels -= historyRows * cellHeight
-        handleHistoryScrollResult(owner.scrollHistoryRows(historyRows))
+        enqueueHistoryScroll(owner, historyRows)
+    }
+
+    private fun enqueueHistoryScroll(owner: NativeTerminalEngine, historyRows: Int) {
+        val dispatch = synchronized(historyQueueLock) {
+            pendingHistoryRows = (pendingHistoryRows.toLong() + historyRows.toLong())
+                .coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong())
+                .toInt()
+            if (historyWorkerScheduled) return
+            historyWorkerScheduled = true
+            HistoryWorkerDispatch(
+                executor = historyExecutor ?: createHistoryExecutor().also { historyExecutor = it },
+                workerGeneration = historyWorkerGeneration,
+            )
+        }
+        runCatching {
+            dispatch.executor.execute {
+                drainHistoryRequests(owner, dispatch.workerGeneration)
+            }
+        }.onFailure {
+            synchronized(historyQueueLock) {
+                if (dispatch.workerGeneration == historyWorkerGeneration) {
+                    historyWorkerScheduled = false
+                }
+            }
+        }
+    }
+
+    private fun drainHistoryRequests(owner: NativeTerminalEngine, workerGeneration: Long) {
+        lastHistoryWorkerThreadName = Thread.currentThread().name
+        while (true) {
+            val request = synchronized(historyQueueLock) {
+                if (workerGeneration != historyWorkerGeneration) {
+                    return
+                } else if (pendingHistoryRows == 0) {
+                    historyWorkerScheduled = false
+                    null
+                } else {
+                    HistoryRequest(
+                        rows = pendingHistoryRows.also { pendingHistoryRows = 0 },
+                        requestGeneration = historyRequestGeneration,
+                        navigationGeneration = historyNavigationGeneration,
+                    )
+                }
+            } ?: return
+            val result = runCatching {
+                owner.scrollHistoryRows(request.rows, request.navigationGeneration)
+            }.getOrElse {
+                synchronized(historyQueueLock) {
+                    if (workerGeneration == historyWorkerGeneration) {
+                        historyWorkerScheduled = false
+                    }
+                }
+                return
+            }
+            post {
+                if (!detached && engine === owner &&
+                    request.requestGeneration == historyRequestGeneration
+                ) {
+                    handleHistoryScrollResult(result)
+                }
+            }
+            val shouldPrefetch = synchronized(historyQueueLock) {
+                workerGeneration == historyWorkerGeneration &&
+                    pendingHistoryRows == 0 &&
+                    request.requestGeneration == historyRequestGeneration
+            }
+            if (shouldPrefetch && result == NativeHistoryScrollResult.MOVED) {
+                runCatching {
+                    owner.prefetchHistoryRows(
+                        if (request.rows > 0) 1 else -1,
+                        request.navigationGeneration,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun cancelQueuedHistoryRequests() {
+        synchronized(historyQueueLock) {
+            historyRequestGeneration = Math.addExact(historyRequestGeneration, 1L)
+            pendingHistoryRows = 0
+        }
+    }
+
+    private fun shutdownHistoryExecutor() {
+        val executor = synchronized(historyQueueLock) {
+            historyRequestGeneration = Math.addExact(historyRequestGeneration, 1L)
+            historyWorkerGeneration = Math.addExact(historyWorkerGeneration, 1L)
+            pendingHistoryRows = 0
+            historyWorkerScheduled = false
+            historyExecutor.also { historyExecutor = null }
+        }
+        executor?.shutdownNow()
+    }
+
+    private fun createHistoryExecutor(): ExecutorService =
+        Executors.newSingleThreadExecutor { task ->
+            Thread(task, "TermLink-NativeHistory").apply { isDaemon = true }
+        }
+
+    private fun startFling(axis: ScrollAxis, velocityX: Float, velocityY: Float) {
+        if (axis == ScrollAxis.UNDECIDED) return
+        followCursor = false
+        flingAxis = axis
+        lastFlingX = 0
+        lastFlingY = 0
+        scroller.fling(
+            0,
+            0,
+            if (axis == ScrollAxis.HORIZONTAL) -velocityX.roundToInt() else 0,
+            if (axis == ScrollAxis.VERTICAL) -velocityY.roundToInt() else 0,
+            -MAX_FLING_DISTANCE,
+            MAX_FLING_DISTANCE,
+            -MAX_FLING_DISTANCE,
+            MAX_FLING_DISTANCE,
+        )
+        postInvalidateOnAnimation()
+    }
+
+    internal fun awaitHistoryRequestsForTest() {
+        val executor = synchronized(historyQueueLock) { historyExecutor } ?: return
+        executor.submit {}.get(5, TimeUnit.SECONDS)
+    }
+
+    private data class HistoryRequest(
+        val rows: Int,
+        val requestGeneration: Long,
+        val navigationGeneration: Long,
+    )
+
+    private data class HistoryWorkerDispatch(
+        val executor: ExecutorService,
+        val workerGeneration: Long,
+    )
+
+    internal fun viewportYForTest(): Float = viewportY
+
+    internal fun viewportXForTest(): Float = viewportX
+
+    internal fun positionViewportForTest(column: Int, fraction: Float) {
+        viewportX = contentPadding + (column + fraction) * cellWidth
+    }
+
+    internal fun isFollowingCursorForTest(): Boolean = followCursor
+
+    internal fun hasActiveFlingForTest(): Boolean = !scroller.isFinished
+
+    internal fun historyWorkerThreadNameForTest(): String? = lastHistoryWorkerThreadName
+
+    internal fun hasHistoryExecutorForTest(): Boolean =
+        synchronized(historyQueueLock) { historyExecutor != null }
+
+    internal fun forceTextRunWidthMatchForTest(matches: Boolean) {
+        textRunWidthMatchOverrideForTest = matches
+    }
+
+    internal fun isCursorFullyVisibleForTest(): Boolean {
+        if (engine == null || width <= 0 || height <= 0) return false
+        val cursor = currentFrame().cursor
+        val cursorLeft = contentPadding + cursor.column * cellWidth
+        val cursorRight = cursorLeft + cellWidth
+        val cursorTop = contentPadding + cursor.row * cellHeight
+        val cursorBottom = cursorTop + cellHeight
+        return cursorLeft >= viewportX && cursorRight <= viewportX + width &&
+            cursorTop >= viewportY && cursorBottom <= viewportY + height
     }
 
     private fun cellAt(x: Float, y: Float): CellPoint {
@@ -531,12 +836,12 @@ internal class NativeTerminalView @JvmOverloads constructor(
         meta = event.metaState and KeyEvent.META_META_ON != 0,
     )
 
-    private fun isSelected(column: Int, row: Int): Boolean {
+    private fun isSelected(column: Int, row: Int, frame: TerminalRenderFrameV3): Boolean {
         val anchor = selectionAnchor ?: return false
         val extent = selectionExtent ?: return false
-        val first = minOf(anchor.linear(currentFrame()), extent.linear(currentFrame()))
-        val last = maxOf(anchor.linear(currentFrame()), extent.linear(currentFrame()))
-        val value = row * currentFrame().size.columns + column
+        val first = minOf(anchor.linear(frame), extent.linear(frame))
+        val last = maxOf(anchor.linear(frame), extent.linear(frame))
+        val value = row * frame.size.columns + column
         return value in first..last
     }
 
@@ -570,11 +875,154 @@ internal class NativeTerminalView @JvmOverloads constructor(
         textPaint.color = color
         textPaint.alpha = if (rendition.faint) 166 else 255
         textPaint.typeface = when {
-            rendition.bold && rendition.italic -> Typeface.create(baseTypeface, Typeface.BOLD_ITALIC)
-            rendition.bold -> Typeface.create(baseTypeface, Typeface.BOLD)
-            rendition.italic -> Typeface.create(baseTypeface, Typeface.ITALIC)
+            rendition.bold && rendition.italic -> boldItalicTypeface
+            rendition.bold -> boldTypeface
+            rendition.italic -> italicTypeface
             else -> baseTypeface
         }
+    }
+
+    private fun measuredTextWidth(text: String, rendition: TerminalRenderRenditionV3): Float {
+        val style = when {
+            rendition.bold && rendition.italic -> Typeface.BOLD_ITALIC
+            rendition.bold -> Typeface.BOLD
+            rendition.italic -> Typeface.ITALIC
+            else -> Typeface.NORMAL
+        }
+        val key = TextMeasureKey(text, style)
+        return textWidthCache[key] ?: textPaint.measureText(text).also { textWidthCache[key] = it }
+    }
+
+    private fun drawTextRow(
+        canvas: Canvas,
+        frame: TerminalRenderFrameV3,
+        rowIndex: Int,
+        firstColumn: Int,
+        lastColumn: Int,
+        colorsByRendition: Array<EffectiveColors>,
+    ) {
+        val row = frame.rows[rowIndex]
+        val top = contentPadding + rowIndex * cellHeight - viewportY
+        var column = firstColumn
+        while (column <= lastColumn) {
+            val cell = row.cells[column]
+            val grapheme = if (cell.wideContinuation) {
+                null
+            } else {
+                frame.graphemes.getOrNull(cell.graphemeId - 1)
+            }
+            val rendition = frame.renditions[cell.renditionId]
+            if (grapheme == null || rendition.conceal || grapheme.text.isEmpty()) {
+                column++
+                continue
+            }
+            if (!grapheme.isBatchableAscii()) {
+                drawSingleGrapheme(
+                    canvas,
+                    column,
+                    top,
+                    grapheme.text,
+                    grapheme.displayWidth,
+                    rendition,
+                    colorsByRendition[cell.renditionId],
+                )
+                column++
+                continue
+            }
+
+            val runStart = column
+            val renditionId = cell.renditionId
+            val runText = StringBuilder()
+            while (column <= lastColumn) {
+                val runCell = row.cells[column]
+                if (runCell.wideContinuation || runCell.renditionId != renditionId) break
+                val runGrapheme = frame.graphemes.getOrNull(runCell.graphemeId - 1) ?: break
+                if (!runGrapheme.isBatchableAscii()) break
+                runText.append(runGrapheme.text)
+                column++
+            }
+
+            val text = runText.toString()
+            val colors = colorsByRendition[renditionId]
+            configureTextPaint(rendition, colors.foreground)
+            val textWidth = if (text.length >= MIN_BATCHED_TEXT_CELLS) matchingTextRunWidth(text) else null
+            if (textWidth != null) {
+                drawTextRun(canvas, runStart, top, text, textWidth, rendition, colors.foreground)
+            } else {
+                for (fallbackColumn in runStart until column) {
+                    val fallbackCell = row.cells[fallbackColumn]
+                    val fallbackGrapheme = frame.graphemes[fallbackCell.graphemeId - 1]
+                    drawSingleGrapheme(
+                        canvas,
+                        fallbackColumn,
+                        top,
+                        fallbackGrapheme.text,
+                        fallbackGrapheme.displayWidth,
+                        rendition,
+                        colors,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun drawTextRun(
+        canvas: Canvas,
+        startColumn: Int,
+        top: Float,
+        text: String,
+        textWidth: Float,
+        rendition: TerminalRenderRenditionV3,
+        color: Int,
+    ) {
+        val left = contentPadding + startColumn * cellWidth - viewportX
+        val allottedWidth = cellWidth * text.length
+        if (left + allottedWidth < 0f || left > width) return
+        val x = left + ((allottedWidth - textWidth) / 2f).coerceAtLeast(0f)
+        canvas.drawText(text, x, top + baselineOffset, textPaint)
+        drawDecorations(canvas, left, top, allottedWidth, rendition, color)
+    }
+
+    private fun drawSingleGrapheme(
+        canvas: Canvas,
+        column: Int,
+        top: Float,
+        text: String,
+        displayWidth: Int,
+        rendition: TerminalRenderRenditionV3,
+        colors: EffectiveColors,
+    ) {
+        val left = contentPadding + column * cellWidth - viewportX
+        val allottedWidth = cellWidth * displayWidth
+        if (left + allottedWidth < 0f || left > width) return
+        configureTextPaint(rendition, colors.foreground)
+        val textWidth = measuredTextWidth(text, rendition)
+        val x = left + ((allottedWidth - textWidth) / 2f).coerceAtLeast(0f)
+        canvas.drawText(text, x, top + baselineOffset, textPaint)
+        drawDecorations(canvas, left, top, allottedWidth, rendition, colors.foreground)
+    }
+
+    private fun matchingTextRunWidth(text: String): Float? {
+        textRunWidthMatchOverrideForTest?.let { matches ->
+            return if (matches) cellWidth * text.length else null
+        }
+        val expectedWidth = cellWidth * text.length
+        val measuredWidth = textPaint.measureText(text)
+        val runTolerance = max(TEXT_RUN_WIDTH_TOLERANCE_PX, expectedWidth * TEXT_RUN_WIDTH_TOLERANCE_RATIO)
+        return measuredWidth.takeIf { abs(it - expectedWidth) <= runTolerance }
+    }
+
+    private fun drawBackgroundRun(
+        canvas: Canvas,
+        startColumn: Int,
+        endColumn: Int,
+        top: Float,
+        color: Int,
+    ) {
+        val left = contentPadding + startColumn * cellWidth - viewportX
+        val right = contentPadding + endColumn * cellWidth - viewportX
+        shapePaint.color = color
+        canvas.drawRect(left, top, right, top + cellHeight, shapePaint)
     }
 
     private fun refreshTypeface(force: Boolean = false) {
@@ -661,7 +1109,22 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private data class CellPoint(val column: Int, val row: Int) {
         fun linear(frame: TerminalRenderFrameV3): Int = row * frame.size.columns + column
     }
+
+    private data class TextMeasureKey(val text: String, val style: Int)
+
+    private companion object {
+        const val MAX_FLING_DISTANCE = 1_000_000
+        const val TEXT_WIDTH_CACHE_SIZE = 512
+        const val MIN_BATCHED_TEXT_CELLS = 2
+        const val TEXT_RUN_WIDTH_TOLERANCE_PX = 0.5f
+        const val TEXT_RUN_WIDTH_TOLERANCE_RATIO = 0.001f
+    }
 }
+
+private fun TerminalRenderGraphemeV1.isBatchableAscii(): Boolean =
+    displayWidth == 1 && text.length == 1 && text[0] in ' '..'~'
+
+private enum class ScrollAxis { UNDECIDED, HORIZONTAL, VERTICAL }
 
 private data class EffectiveColors(val foreground: Int, val background: Int)
 

@@ -11,6 +11,7 @@ import java.nio.ByteOrder
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
+import java.util.Collections
 import java.util.zip.CRC32C
 
 /**
@@ -47,6 +48,8 @@ internal class FakeNativeBridge : NativeBridge {
     var forcedScrollbackAvailableRows: Long = 0
     var forcedScrollbackGenerationRows: Long = 0
     val forcedScrollbackFrames: MutableMap<Long, NativeBridgeRenderFrame> = mutableMapOf()
+    val scrollbackRenderThreads: MutableList<Thread> = Collections.synchronizedList(mutableListOf())
+    var beforeScrollbackRender: ((Long) -> Unit)? = null
     var forcedInputV1Failure: NativeBridgeResult.Failure? = null
     var forcedInputV1EncodedInput: NativeBridgeEncodedInput? = null
     var forcedMouseEncodedInput: NativeBridgeEncodedInput? = null
@@ -370,6 +373,8 @@ internal class FakeNativeBridge : NativeBridge {
         offsetRows: Long,
         request: NativeRenderRequest,
     ): NativeBridgeResult<NativeBridgeScrollbackFrame> = synchronized(this) {
+        scrollbackRenderThreads += Thread.currentThread()
+        beforeScrollbackRender?.invoke(offsetRows)
         forcedRenderFailure?.let { return it }
         val state = states[handle]
             ?: return NativeBridgeResult.Failure(NativeTerminalStatus.NULL_POINTER.code)
@@ -1238,6 +1243,8 @@ internal fun fakeRenderFrameV3(
     nextSourceSequence: Long,
     presentationRevision: Long = nextSourceSequence,
     size: TerminalSize,
+    cursorRow: Int = 0,
+    cursorColumn: Int = 0,
 ): ByteArray = fakeRenderFrameV1(
     nextSourceSequence = nextSourceSequence,
     presentationRevision = presentationRevision,
@@ -1246,6 +1253,8 @@ internal fun fakeRenderFrameV3(
     frame[6] = '3'.code.toByte()
     val writer = ByteBuffer.wrap(frame).order(ByteOrder.LITTLE_ENDIAN)
     writer.putShort(8, 3.toShort())
+    writer.putInt(48, cursorRow)
+    writer.putInt(52, cursorColumn)
     writer.putLong(72, 0x7f)
     val renditionDirectory = FAKE_RENDER_HEADER_BYTES + FAKE_RENDER_DIRECTORY_ENTRY_BYTES
     writer.putShort(renditionDirectory + 4, 2.toShort())
