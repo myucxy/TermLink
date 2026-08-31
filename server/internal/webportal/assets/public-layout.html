@@ -20,6 +20,7 @@
       <span><strong>TermLink</strong><small>Remote terminal, locally alive.</small></span>
     </a>
     <nav class="public-nav" aria-label="公开页面导航" data-desktop-nav>
+      <a href="/downloads" {{if eq .ActivePage "downloads"}}aria-current="page"{{end}}>下载</a>
       <a href="/security" {{if eq .ActivePage "security"}}aria-current="page"{{end}}>安全</a>
     </nav>
     <div class="site-header-actions public-header-actions">
@@ -30,6 +31,7 @@
       {{if .SignedIn}}<a class="button button-primary" href="{{.AccountURL}}">个人中心</a>{{else}}<a class="button button-primary" href="{{.LoginURL}}" data-theme-transfer>登录</a>{{end}}
     </div>
     <nav class="public-mobile-nav" aria-label="移动端公开页面导航" data-mobile-nav>
+      <a href="/downloads" {{if eq .ActivePage "downloads"}}aria-current="page"{{end}}>下载</a>
       <a href="/security" {{if eq .ActivePage "security"}}aria-current="page"{{end}}>安全</a>
     </nav>
   </header>

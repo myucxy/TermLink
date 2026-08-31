@@ -236,6 +236,7 @@ type productionOIDCFlow struct {
 
 type homePageData struct {
 	LoginURL string
+	SignedIn bool
 }
 
 type registerPageData struct {
@@ -678,8 +679,7 @@ func (p *Portal) home(w http.ResponseWriter, r *http.Request) {
 	data := homePageData{LoginURL: "/login"}
 	if session, err := p.readSession(r); err == nil {
 		if _, accountErr := p.currentAccount(r.Context(), session); accountErr == nil {
-			http.Redirect(w, r, "/account", http.StatusSeeOther)
-			return
+			data.SignedIn = true
 		}
 	}
 	p.render(w, http.StatusOK, "home.html", data)
@@ -771,7 +771,7 @@ func (p *Portal) registerPage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	loginURL := "/login?return_to=/account"
+	loginURL := "/login"
 	if continueURL != "" {
 		loginURL = continueURL
 	}
@@ -806,7 +806,7 @@ func (p *Portal) login(w http.ResponseWriter, r *http.Request) {
 	if !p.usesPublicHost(r) {
 		target := strings.TrimRight(p.config.PublicURL, "/") + "/login"
 		query := url.Values{}
-		if returnTo := normalizePortalReturnTo(r.URL.Query().Get("return_to")); returnTo != "/account" {
+		if returnTo := normalizePortalReturnTo(r.URL.Query().Get("return_to")); returnTo != "/" {
 			query.Set("return_to", returnTo)
 		}
 		if theme := normalizeTheme(r.URL.Query().Get(themeQueryParameter)); theme != "" {
@@ -971,8 +971,10 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 	}
 	p.setCookie(w, sessionCookieName, sessionCookie, p.now().Add(webSessionTTL))
 	p.clearCookie(w, legacySessionCookie)
-	returnTo := "/account"
+	returnTo := "/"
 	switch normalizePortalReturnTo(pending.ReturnTo) {
+	case "/account":
+		returnTo = "/account"
 	case "/admin":
 		if account.Role.CanOpenConsole() {
 			returnTo, err = p.adminBasePath(r.Context())
@@ -1614,12 +1616,16 @@ func normalizeTheme(value string) string {
 
 func normalizePortalReturnTo(value string) string {
 	switch strings.TrimSpace(value) {
+	case "/":
+		return "/"
+	case "/account":
+		return "/account"
 	case "/admin":
 		return "/admin"
 	case "/account/identity", "/account/identity/password", "/account/identity/mfa", "/account/identity/sessions":
 		return strings.TrimSpace(value)
 	default:
-		return "/account"
+		return "/"
 	}
 }
 

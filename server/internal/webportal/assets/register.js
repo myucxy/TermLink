@@ -2,7 +2,7 @@
   "use strict";
   const form = document.getElementById("registration-form");
   if (!form) return;
-  const continuationURL = form.dataset.registrationContinue || "/login?return_to=/account";
+  const continuationURL = form.dataset.registrationContinue || "/login";
   const humanVerificationRequired = form.dataset.humanVerificationRequired === "true";
   const humanContainer = document.getElementById("human-verification");
   const humanWrapper = humanContainer instanceof HTMLElement ? humanContainer.closest(".registration-human-verification") : null;

@@ -15,7 +15,7 @@
     {{if .Available}}
       <p class="release-date">{{.PublishedDate}} 发布</p>
       <p class="release-notes">{{.Release.ReleaseNotes}}</p>
-      <div class="release-note-footer"><code>{{.Release.SHA256}}</code></div>
+      <div class="release-note-footer"><code>{{.Release.SHA256}}</code><a class="text-link" href="/downloads">前往下载 <span aria-hidden="true">→</span></a></div>
     {{else}}
       <div class="unavailable-panel"><strong>暂不可用</strong><p>发布源响应未通过完整校验，没有展示缓存或推测的版本信息。</p></div>
     {{end}}

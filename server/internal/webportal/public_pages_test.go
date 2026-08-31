@@ -444,9 +444,9 @@ func TestPublicPagesExposeResponsiveThemeDOMContract(t *testing.T) {
 	}
 }
 
-func TestPublicNavigationHidesDistributionCatalogAndStatusEntriesButKeepsRoutes(t *testing.T) {
+func TestPublicNavigationKeepsDownloadsAndHidesReleaseCatalogAndStatusEntries(t *testing.T) {
 	portal := newTestPortal(t, &testOIDCFlow{})
-	hiddenEntries := []string{`href="/downloads"`, `href="/releases"`, `href="/plans"`, `href="/status"`}
+	hiddenEntries := []string{`href="/releases"`, `href="/plans"`, `href="/status"`}
 	pages := map[string]string{
 		"/downloads": "下载 TermLink",
 		"/releases":  "版本记录",
@@ -462,6 +462,9 @@ func TestPublicNavigationHidesDistributionCatalogAndStatusEntriesButKeepsRoutes(
 		body := response.Body.String()
 		if !strings.Contains(body, expectedContent) {
 			t.Errorf("GET %s omitted retained page content %q", target, expectedContent)
+		}
+		if !strings.Contains(body, `href="/downloads"`) {
+			t.Errorf("GET %s omitted the retained download entry", target)
 		}
 		for _, hiddenEntry := range hiddenEntries {
 			if strings.Contains(body, hiddenEntry) {

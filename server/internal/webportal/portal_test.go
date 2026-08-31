@@ -365,7 +365,7 @@ func startLogin(t *testing.T, portal *Portal, flow *testOIDCFlow) (*http.Cookie,
 func startLoginAt(t *testing.T, portal *Portal, flow *testOIDCFlow, returnTo string) (*http.Cookie, oauthState) {
 	t.Helper()
 	target := "/login"
-	if returnTo != "/account" {
+	if returnTo != "/" {
 		target += "?return_to=" + url.QueryEscape(returnTo)
 	}
 	recorder := performRequest(portal.Handler(), http.MethodGet, target, nil)
@@ -469,7 +469,10 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 	if strings.Count(body, `href="/register"`) != 1 {
 		t.Fatal("home must link directly to registration")
 	}
-	for _, hiddenEntry := range []string{`href="/downloads"`, `href="/releases"`, `href="/plans"`, `href="/security"`, `href="/status"`} {
+	if strings.Count(body, `href="/downloads"`) != 2 {
+		t.Fatal("home must retain the download navigation and primary download action")
+	}
+	for _, hiddenEntry := range []string{`href="/releases"`, `href="/plans"`, `href="/security"`, `href="/status"`} {
 		if strings.Contains(body, hiddenEntry) {
 			t.Fatalf("home exposed hidden public entry %s", hiddenEntry)
 		}
@@ -536,6 +539,17 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 			!strings.Contains(icon.Body.String(), "TermLink") {
 			t.Fatalf("embedded brand asset %q is incomplete: status=%d bytes=%d", asset, icon.Code, icon.Body.Len())
 		}
+	}
+}
+
+func TestPortalDefaultLoginReturnsToAccessibleSignedInHome(t *testing.T) {
+	flow := &testOIDCFlow{identity: accountIdentity{Subject: "home-subject", Username: "home-user"}}
+	portal := newTestPortal(t, flow)
+	sessionCookie, _ := completeLoginAt(t, portal, flow, "/")
+	home := performRequest(portal.Handler(), http.MethodGet, "/", nil, sessionCookie)
+	if home.Code != http.StatusOK || !strings.Contains(home.Body.String(), `href="/account">进入个人中心</a>`) ||
+		strings.Contains(home.Body.String(), "使用 TermLink 账号登录") {
+		t.Fatalf("default login did not return to the signed-in home: status=%d body=%q", home.Code, home.Body.String())
 	}
 }
 
@@ -615,7 +629,7 @@ func TestRegistrationPagePreservesOnlyTrustedOIDCContinuation(t *testing.T) {
 			nil)
 		body = response.Body.String()
 		if response.Code != http.StatusOK || strings.Contains(body, html.EscapeString(untrusted)) ||
-			!strings.Contains(body, `href="/login?return_to=/account"`) {
+			!strings.Contains(body, `href="/login"`) {
 			t.Fatalf("untrusted registration continuation was accepted: %q", untrusted)
 		}
 	}
@@ -853,8 +867,9 @@ func TestPortalSeparatesUserAndAdministratorDestinations(t *testing.T) {
 		t.Fatalf("admin account page = %d %q", accountPage.Code, accountPage.Body.String())
 	}
 	home := performRequest(adminPortal.Handler(), http.MethodGet, "/", nil, accountCookie)
-	if home.Code != http.StatusSeeOther || home.Header().Get("Location") != "/account" {
-		t.Fatal("signed-in administrator home must redirect directly to the account center")
+	if home.Code != http.StatusOK || !strings.Contains(home.Body.String(), `href="/account">进入个人中心</a>`) ||
+		strings.Contains(home.Body.String(), "使用 TermLink 账号登录") || strings.Contains(home.Body.String(), `href="/register"`) {
+		t.Fatal("signed-in home must remain accessible and expose the account center without guest actions")
 	}
 	adminCookie, session := completeLoginAt(t, adminPortal, adminFlow, "/admin")
 	if session.Role != string(store.RoleSuperAdmin) {
@@ -1768,14 +1783,15 @@ func TestPortalLoginAllowlistSealsIdentityReturnAndNormalizedTheme(t *testing.T)
 		input     string
 		wantTheme string
 	}{
+		{name: "home", returnTo: "/", wantTo: "/", input: "system", wantTheme: "system"},
 		{name: "account", returnTo: "/account", wantTo: "/account", input: "DARK", wantTheme: "dark"},
 		{name: "admin", returnTo: "/admin", wantTo: "/admin", input: "light", wantTheme: "light"},
 		{name: "identity", returnTo: "/account/identity", wantTo: "/account/identity", input: "dark", wantTheme: "dark"},
 		{name: "identity password", returnTo: "/account/identity/password", wantTo: "/account/identity/password", input: "dark", wantTheme: "dark"},
 		{name: "identity mfa", returnTo: "/account/identity/mfa", wantTo: "/account/identity/mfa", input: "light", wantTheme: "light"},
 		{name: "identity sessions", returnTo: "/account/identity/sessions", wantTo: "/account/identity/sessions", input: "system", wantTheme: "system"},
-		{name: "unknown target", returnTo: "https://attacker.example/callback", wantTo: "/account", input: "dark", wantTheme: "dark"},
-		{name: "nested target", returnTo: "/account/identity?next=/admin", wantTo: "/account", input: "attacker", wantTheme: ""},
+		{name: "unknown target", returnTo: "https://attacker.example/callback", wantTo: "/", input: "dark", wantTheme: "dark"},
+		{name: "nested target", returnTo: "/account/identity?next=/admin", wantTo: "/", input: "attacker", wantTheme: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1851,12 +1867,12 @@ func TestPortalCallbackPreservesIdentityThemeAndRejectsUnknownReturnTarget(t *te
 	unknownFlow := &testOIDCFlow{identity: accountIdentity{Subject: "unknown-target-subject", Username: "unknown-target-user"}}
 	unknownPortal := newTestPortal(t, unknownFlow)
 	unknownCookie, unknownState := startLoginWithParams(t, unknownPortal, unknownFlow, "/admin?next=/attacker", "dark")
-	if unknownState.ReturnTo != "/account" {
-		t.Fatalf("unknown return_to was sealed as %q, want /account", unknownState.ReturnTo)
+	if unknownState.ReturnTo != "/" {
+		t.Fatalf("unknown return_to was sealed as %q, want /", unknownState.ReturnTo)
 	}
 	unknownCallback := performRequest(unknownPortal.Handler(), http.MethodGet, "/auth/callback?code=production-code&state="+url.QueryEscape(unknownState.State), nil, unknownCookie)
-	if unknownCallback.Code != http.StatusSeeOther || unknownCallback.Header().Get("Location") != "/account" {
-		t.Fatalf("unknown return_to callback = %d %q, want 303 /account", unknownCallback.Code, unknownCallback.Header().Get("Location"))
+	if unknownCallback.Code != http.StatusSeeOther || unknownCallback.Header().Get("Location") != "/" {
+		t.Fatalf("unknown return_to callback = %d %q, want 303 /", unknownCallback.Code, unknownCallback.Header().Get("Location"))
 	}
 }
 
@@ -1895,8 +1911,8 @@ func TestPortalCallbackFallsBackForUnknownSealedReturnTarget(t *testing.T) {
 	}
 	cookie := &http.Cookie{Name: oauthCookieName, Value: encoded}
 	callback := performRequest(portal.Handler(), http.MethodGet, "/auth/callback?code=production-code&state="+url.QueryEscape(pending.State), nil, cookie)
-	if callback.Code != http.StatusSeeOther || callback.Header().Get("Location") != "/account" {
-		t.Fatalf("unknown sealed return_to callback = %d %q, want 303 /account", callback.Code, callback.Header().Get("Location"))
+	if callback.Code != http.StatusSeeOther || callback.Header().Get("Location") != "/" {
+		t.Fatalf("unknown sealed return_to callback = %d %q, want 303 /", callback.Code, callback.Header().Get("Location"))
 	}
 }
 
