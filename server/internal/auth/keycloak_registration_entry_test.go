@@ -22,9 +22,10 @@ func TestLoginThemeRegistrationEntryUsesTermLinkRegisterPage(t *testing.T) {
 			t.Fatalf("login theme does not derive the register URL for %s", clientID)
 		}
 	}
-	if !strings.Contains(loginText, `href="${termlinkRegisterUrl}"`) ||
+	if !strings.Contains(loginText, `href="${layout.termlinkRegisterUrl}"`) ||
+		!strings.Contains(loginText, `layout.termlinkRegisterUrl?has_content`) ||
 		strings.Contains(loginText, "aria-disabled") || strings.Contains(loginText, "?continue=") {
-		t.Fatal("login create-account entry must be a direct, enabled TermLink /register link")
+		t.Fatal("login create-account entry must read the layout namespace and link directly to TermLink /register")
 	}
 
 	realmData, err := os.ReadFile("../../acceptance/keycloak-realm.json")

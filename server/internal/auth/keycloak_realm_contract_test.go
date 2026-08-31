@@ -568,7 +568,7 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 	for name, content := range map[string]string{
 		"login template account target":         `termlinkAccountUrl = client.baseUrl`,
 		"login template hosted registration":    `client.clientId == "termlink-windows" || client.clientId == "termlink-android"`,
-		"login form direct registration":        `href="${termlinkRegisterUrl}"`,
+		"login form direct registration":        `href="${layout.termlinkRegisterUrl}"`,
 		"login server registration policy":      `msg("termlinkServerRegistration")`,
 		"login template accessible label":       `msg('termlinkBackToPersonalCenter')`,
 		"login template theme transfer":         `data-theme-transfer`,

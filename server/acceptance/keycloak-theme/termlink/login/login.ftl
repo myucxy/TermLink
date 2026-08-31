@@ -6,8 +6,8 @@
   <#elseif section == "form">
     <div class="auth-mode-switch" role="tablist" aria-label="${msg('termlinkAccountMode')}">
       <a class="is-active" href="${url.loginUrl}" role="tab" aria-selected="true">${msg("doLogIn")}</a>
-      <#if termlinkRegisterUrl?has_content>
-        <a href="${termlinkRegisterUrl}" role="tab" aria-selected="false">${msg("termlinkCreateAccount")}</a>
+      <#if layout.termlinkRegisterUrl?has_content>
+        <a href="${layout.termlinkRegisterUrl}" role="tab" aria-selected="false">${msg("termlinkCreateAccount")}</a>
       </#if>
     </div>
 
