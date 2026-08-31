@@ -566,13 +566,25 @@ class ProductionRealtimeSessionClient(
     }
 
     override suspend fun resume(lastAckedSequence: Long) {
+        val connectedGeneration = transport.currentConnectedGeneration()
+        check(connectedGeneration > 0) { "realtime socket is not connected" }
+        resumeForGeneration(lastAckedSequence, connectedGeneration)
+    }
+
+    private suspend fun resumeForGeneration(lastAckedSequence: Long, connectedGeneration: Int) {
         require(lastAckedSequence >= 0)
+        require(connectedGeneration > 0)
         val payload = SubscribePayload.newBuilder()
             .setResumeFromSeq(lastAckedSequence)
             .setSubscriberExchangePublicKey(ByteString.copyFrom(identity.exchange.publicKey))
             .build()
             .toByteArray()
-        sendEncrypted(MessageType.SUBSCRIBE, payload, acknowledgement = lastAckedSequence)
+        sendEncrypted(
+            MessageType.SUBSCRIBE,
+            payload,
+            acknowledgement = lastAckedSequence,
+            expectedConnectedGeneration = connectedGeneration,
+        )
         lastSubscribeCursor.set(lastAckedSequence)
         subscribeSendCount.incrementAndGet()
     }
@@ -879,6 +891,7 @@ class ProductionRealtimeSessionClient(
         messageType: MessageType,
         plaintext: ByteArray,
         acknowledgement: Long = 0,
+        expectedConnectedGeneration: Int? = null,
         allowWhileClosing: Boolean = false,
     ) {
         try {
@@ -915,7 +928,12 @@ class ProductionRealtimeSessionClient(
                         plaintext = plaintext,
                         recipientId = config.pcDeviceId,
                     )
-                    if (!transport.send(envelope)) {
+                    val sent = if (expectedConnectedGeneration != null) {
+                        transport.sendForConnectedGeneration(envelope, expectedConnectedGeneration)
+                    } else {
+                        transport.send(envelope)
+                    }
+                    if (!sent) {
                         throw ProductionTransportException("realtime socket is not connected")
                     }
                 } finally {
@@ -1326,7 +1344,10 @@ class ProductionRealtimeSessionClient(
                 cancelPendingReconnect()
                 mutableTransportState.value = ProductionTransportState.Connected
                 try {
-                    if (!session.onConnected()) {
+                    val subscribed = session.onConnected { cursor ->
+                        resumeForGeneration(cursor, connectedGeneration)
+                    }
+                    if (!subscribed) {
                         failConnectedGeneration("initial session subscribe failed", connectedGeneration)
                     } else if (session.state.value !is RemoteSessionState.HistoryGap) {
                         subscriberReady.value = true

@@ -2735,7 +2735,20 @@ class ProductionRealtimeSessionClientTest {
         }
 
         override fun send(envelope: Envelope): Boolean {
-            val generationAtSend = synchronized(lock) { connectedGeneration }
+            return synchronized(lock) {
+                if (connectedGeneration <= 0) {
+                    false
+                } else {
+                    sent += envelope
+                    true
+                }
+            }
+        }
+
+        override fun sendForConnectedGeneration(
+            envelope: Envelope,
+            expectedGeneration: Int,
+        ): Boolean {
             val blocked = if (envelope.messageType == MessageType.SUBSCRIBE) {
                 blockedSubscribe.getAndSet(null)
             } else {
@@ -2746,7 +2759,7 @@ class ProductionRealtimeSessionClientTest {
                 check(blocked.release.await(2, TimeUnit.SECONDS)) { "timed out releasing blocked SUBSCRIBE" }
             }
             return synchronized(lock) {
-                if (generationAtSend <= 0 || connectedGeneration != generationAtSend) {
+                if (expectedGeneration <= 0 || connectedGeneration != expectedGeneration) {
                     false
                 } else {
                     sent += envelope

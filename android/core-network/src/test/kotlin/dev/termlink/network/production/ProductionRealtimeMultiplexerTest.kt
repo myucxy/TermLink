@@ -130,6 +130,35 @@ class ProductionRealtimeMultiplexerTest {
     }
 
     @Test
+    fun generationBoundSubscribeCannotAttachAnOldHandlerToItsSuccessor(): Unit = runTest {
+        val socket = FakeSocket()
+        val sessionId = UUID.randomUUID()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpoint = multiplexer.register(sessionId)
+        val subscribe = Envelope.newBuilder()
+            .setProtocolVersion(1)
+            .setSessionId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(sessionId)))
+            .setDirection(Direction.ANDROID_TO_PC)
+            .setMessageType(MessageType.SUBSCRIBE)
+            .build()
+
+        endpoint.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        assertTrue(endpoint.sendForConnectedGeneration(subscribe, expectedGeneration = 1))
+
+        socket.activateGeneration(2)
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        val sentBeforeStaleAttempt = socket.sentEnvelopes.size
+
+        assertTrue(!endpoint.sendForConnectedGeneration(subscribe, expectedGeneration = 1))
+        assertEquals(sentBeforeStaleAttempt, socket.sentEnvelopes.size)
+        assertTrue(endpoint.sendForConnectedGeneration(subscribe, expectedGeneration = 2))
+        multiplexer.close()
+    }
+
+    @Test
     fun lastEndpointCloseLinearizesAgainstClaimedConnectAndPreventsRevival(): Unit = runTest {
         val socket = FakeSocket()
         val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)

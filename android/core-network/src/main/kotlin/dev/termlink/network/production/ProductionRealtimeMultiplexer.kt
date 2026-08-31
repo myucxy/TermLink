@@ -90,6 +90,10 @@ interface ProductionRealtimeSessionTransport : Closeable {
 
     fun connect()
     fun send(envelope: Envelope): Boolean
+    fun sendForConnectedGeneration(envelope: Envelope, expectedGeneration: Int): Boolean {
+        if (expectedGeneration <= 0 || currentConnectedGeneration() != expectedGeneration) return false
+        return send(envelope)
+    }
     fun disconnect(reason: String)
     fun currentConnectedGeneration(): Int
     fun disconnectIfCurrentGeneration(expectedGeneration: Int, reason: String): Boolean
@@ -775,20 +779,40 @@ class ProductionRealtimeMultiplexer private constructor(
             subscribedGeneration.set(0)
         }
 
-        override fun send(envelope: Envelope): Boolean {
+        override fun send(envelope: Envelope): Boolean = sendInternal(envelope, expectedGeneration = null)
+
+        override fun sendForConnectedGeneration(
+            envelope: Envelope,
+            expectedGeneration: Int,
+        ): Boolean = sendInternal(envelope, expectedGeneration)
+
+        private fun sendInternal(envelope: Envelope, expectedGeneration: Int?): Boolean {
             require(
                 ProductionRealtimeClient.uuidFromBytes(envelope.sessionId.toByteArray()) == sessionId,
             ) { "Envelope session does not match the registered endpoint" }
+            if (expectedGeneration != null) {
+                require(envelope.messageType == dev.termlink.protocol.realtime.v1.MessageType.SUBSCRIBE) {
+                    "generation-bound send is reserved for SUBSCRIBE"
+                }
+                require(expectedGeneration > 0) { "expectedGeneration must be positive" }
+            }
             return synchronized(connectionLock) {
                 synchronized(admissionLock) {
                     check(!closed.get() && !endpointClosed.get()) { "production session transport is closed" }
                     when (envelope.messageType) {
                         dev.termlink.protocol.realtime.v1.MessageType.SUBSCRIBE -> {
                             val generation = socket.diagnostics().connectedGeneration
-                            check(generation > 0) { "SUBSCRIBE requires a connected socket generation" }
-                            subscribedGeneration.set(0)
-                            socket.send(envelope).also { sent ->
-                                if (sent) subscribedGeneration.set(generation)
+                            if (expectedGeneration != null &&
+                                (socketPhase != SocketPhase.CONNECTED || activeConnectOwner != null ||
+                                    generation != expectedGeneration)
+                            ) {
+                                false
+                            } else {
+                                check(generation > 0) { "SUBSCRIBE requires a connected socket generation" }
+                                subscribedGeneration.set(0)
+                                socket.send(envelope).also { sent ->
+                                    if (sent) subscribedGeneration.set(generation)
+                                }
                             }
                         }
                         dev.termlink.protocol.realtime.v1.MessageType.UNSUBSCRIBE -> {

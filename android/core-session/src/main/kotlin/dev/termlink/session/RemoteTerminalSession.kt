@@ -107,7 +107,9 @@ class RemoteTerminalSession(
         }
     }
 
-    suspend fun onConnected(): Boolean {
+    suspend fun onConnected(): Boolean = onConnected(outbound::resume)
+
+    suspend fun onConnected(resumeFrom: suspend (Long) -> Unit): Boolean {
         var historyRecoveryRequired = false
         var durableCursor = 0L
         mutex.withLock {
@@ -124,7 +126,7 @@ class RemoteTerminalSession(
         // recovery will publish a fresh SUBSCRIBE after that commit.
         if (historyRecoveryRequired) return true
         return try {
-            outbound.resume(durableCursor)
+            resumeFrom(durableCursor)
             true
         } catch (error: CancellationException) {
             throw error
