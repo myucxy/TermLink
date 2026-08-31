@@ -415,7 +415,8 @@ func (a *API) registerAccount(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	attemptID, reservedInvitation, err := a.reserveRegistrationInvitation(r, input.InvitationCode, registration.Email)
+	attemptID, reservedInvitation, err := a.reserveRegistrationInvitation(
+		r, input.InvitationCode, registration.Username, registration.Nickname, registration.Email)
 	if err != nil {
 		if writeRegistrationAdmissionError(w, r, err) {
 			return

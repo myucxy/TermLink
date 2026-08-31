@@ -11,9 +11,10 @@
 </script>
   <link rel="stylesheet" href="/assets/site.css?v=step-up-v2">
 <link rel="stylesheet" href="/assets/admin.css?v=01b-v17">
-<link rel="stylesheet" href="/assets/commerce-portal.css?v=01b-v6">
+<link rel="stylesheet" href="/assets/commerce-portal.css?v=01b-v7">
 <script src="/assets/theme.js?v=step-up-v2" defer>
 </script>
+<script src="/assets/commerce-admin.js?v=registration-v1" defer></script>
 </head>
 <body class="admin-body commerce-admin-body">
   <div class="admin-shell">
@@ -61,13 +62,25 @@
 <div>
 <p class="eyebrow">ONE-TIME DISPLAY</p>
 <h2 id="generated-title">立即保存这些明文代码</h2>
-<p>离开或刷新本页后，只能查看不可兑换的短前缀，不能恢复完整代码。</p>
+<p>完整代码仅在本次安全回执中提供。离开或刷新后只能查看短前缀，不能恢复原码。</p>
 </div>
 <span class="commerce-state state-PENDING_PAYMENT">一次性显示</span>
 </div>
-<textarea readonly rows="12" aria-label="本次生成的完整代码">{{range .GeneratedCodes}}{{.}}
-{{end}}</textarea>
-<a class="button button-primary" href="/admin/commerce?section={{.Section}}&id={{.SelectedID}}">我已安全保存</a>
+<dl class="generated-code-facts">
+<div><dt>批次</dt><dd>{{if .GeneratedBatchName}}{{.GeneratedBatchName}}{{else}}{{shortID .SelectedID}}{{end}}</dd></div>
+<div><dt>数量</dt><dd>{{len .GeneratedCodes}} 个</dd></div>
+<div><dt>生成时间</dt><dd>{{formatTime .GeneratedAt}}</dd></div>
+</dl>
+<div class="generated-code-toolbar" role="group" aria-label="邀请码保存操作">
+<button class="button button-primary" type="button" data-copy-all-codes>复制全部</button>
+<button class="button button-quiet" type="button" data-download-codes="txt">下载 TXT</button>
+<button class="button button-quiet" type="button" data-download-codes="csv">下载 CSV</button>
+<span class="generated-code-status" role="status" aria-live="polite" data-generated-code-status></span>
+</div>
+<div class="generated-code-list" aria-label="本次生成的完整邀请码">{{range .GeneratedCodes}}
+<div class="generated-code-row"><code data-generated-code>{{.}}</code><button class="small-action" type="button" data-copy-code>复制</button></div>
+{{end}}</div>
+<a class="button button-primary generated-code-ack" data-generated-code-ack href="/admin/commerce?section={{.Section}}&id={{.SelectedID}}">我已安全保存</a>
 </section>{{end}}
 
       {{if not .GeneratedCodes}}
@@ -345,13 +358,13 @@
 <td>{{if .GiftPlanKey}}{{.GiftPlanKey}} · {{.GiftDurationDays}} 天{{else}}—{{end}}</td>
 <td>
 <div class="table-actions">
-<a href="/admin/commerce?section=registration&id={{.ID}}">查看代码</a>{{if $.CanOperate}}<form action="/admin/commerce/invitations/batches/{{.ID}}/codes" method="post">
+<a href="/admin/commerce?section=registration&id={{.ID}}">查看代码</a>{{if and $.CanOperate (eq .Status "ACTIVE")}}<form class="code-generate-form" action="/admin/commerce/invitations/batches/{{.ID}}/codes" method="post">
 <input type="hidden" name="csrf" value="{{$.CSRF}}">
 <input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-codes:%s" .ID)}}">
 <input type="hidden" name="reason" value="生成邀请码">
-<input type="hidden" name="count" value="10">
+<label><span>数量</span><input name="count" type="number" min="1" max="200" value="10" required></label>
 <input type="hidden" name="max_uses" value="{{.DefaultMaxUses}}">
-<button type="submit">生成 10 个</button>
+<button type="submit">生成</button>
 </form>
 <form action="/admin/commerce/invitations/batches/{{.ID}}/status" method="post">
 <input type="hidden" name="csrf" value="{{$.CSRF}}">
@@ -397,7 +410,16 @@
 </tr>{{end}}</tbody>
 </table>
 </div>{{end}}
-        <h3 class="subtable-title">最近邀请码使用明细</h3><div class="commerce-table-wrap"><table class="commerce-table"><thead><tr><th>记录</th><th>代码</th><th>账号</th><th>状态</th><th>预约截止</th><th>完成 / 释放</th></tr></thead><tbody>{{range .InvitationRedemptions}}<tr><td>{{shortID .ID}}</td><td>{{shortID .CodeID}}</td><td>{{if .HasUser}}{{shortID .UserID}}{{else}}尚未绑定{{end}}</td><td><span class="commerce-state state-{{.State}}">{{commerceStatusLabel .State}}</span></td><td>{{formatTime .ReservedUntil}}</td><td>核销 {{formatOptionalCommerceTime .RedeemedAt}}<small>释放 {{formatOptionalCommerceTime .ReleasedAt}}</small></td></tr>{{else}}<tr><td colspan="6" class="empty-cell">暂无邀请码使用记录。</td></tr>{{end}}</tbody></table></div>
+        <h3 class="subtable-title">最近邀请码使用明细</h3>
+<div class="commerce-table-wrap"><table class="commerce-table invitation-usage-table">
+<thead><tr><th>记录</th><th>邀请码</th><th>注册账号</th><th>状态</th><th>时间线</th></tr></thead>
+<tbody>{{range .InvitationRedemptions}}<tr>
+<td><code>{{.RecordReference}}</code></td>
+<td><strong>{{.BatchName}}</strong><small><code>{{.CodePrefix}}…</code></small></td>
+<td class="invitation-account-cell">{{if .HasIdentityProfile}}<strong>{{if .Nickname}}{{.Nickname}}{{else}}{{.Username}}{{end}}</strong>{{if .Username}}<small>@{{.Username}}</small>{{end}}{{if .EmailMasked}}<small>{{.EmailMasked}}</small>{{end}}{{if .HasUser}}<small>{{.AccountReference}} · 已同步账号</small>{{else}}<small>注册资料 · 尚未首次登录</small>{{end}}{{else}}<strong>{{if .HasUser}}{{.AccountReference}}{{else}}尚未绑定账号{{end}}</strong><small>资料将在账号完成网页登录后同步</small>{{end}}</td>
+<td><span class="commerce-state state-{{.State}}">{{commerceStatusLabel .State}}</span><small>预约截止 {{formatTime .ReservedUntil}}</small></td>
+<td class="invitation-timeline"><span>注册 {{formatTime .CreatedAt}}</span><span>身份 {{formatOptionalCommerceTime .ProviderAcceptedAt}}</span><span>绑定 {{formatOptionalCommerceTime .RedeemedAt}}</span>{{if .ReleasedAt}}<span>释放 {{formatOptionalCommerceTime .ReleasedAt}}</span>{{end}}</td>
+</tr>{{else}}<tr><td colspan="5" class="empty-cell">暂无邀请码使用记录。</td></tr>{{end}}</tbody></table></div>
       </section>{{end}}
 
       {{if eq .Section "redemptions"}}

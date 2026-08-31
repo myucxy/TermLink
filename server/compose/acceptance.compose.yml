@@ -329,6 +329,7 @@ services:
           -s implicitFlowEnabled=false \
           -s serviceAccountsEnabled=false \
           -s fullScopeAllowed=false \
+          -s baseUrl=${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910} \
           -s 'redirectUris=["dev.termlink:/oauth2redirect"]' \
           -s "authenticationFlowBindingOverrides={\"browser\":\"$$native_flow_id\"}" \
           -s 'attributes={"pkce.code.challenge.method":"S256"}' >/dev/null

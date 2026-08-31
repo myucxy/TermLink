@@ -20,8 +20,6 @@
     <nav class="site-nav" aria-label="首页导航">
       <a href="/downloads">下载</a>
       <a href="/releases">版本</a>
-      <a href="/plans">套餐</a>
-      <a href="/security">安全</a>
     </nav>
     <div class="site-header-actions">
       <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题">
@@ -40,7 +38,7 @@
         <p class="hero-lead">在 Windows Terminal 的真实 PowerShell 中运行 Codex 或其他 AI CLI。手机断线不影响本地进程，重新连接后从确认位置继续观看和控制。</p>
         <div class="hero-actions">
           <a class="button button-primary" href="{{.LoginURL}}" data-theme-transfer>使用 TermLink 账号登录</a>
-          {{if .RegistrationOpen}}<a class="button button-quiet" href="{{.RegisterURL}}">创建账号</a>{{end}}
+          <a class="button button-quiet" href="/register">创建账号</a>
           <a class="text-link" href="#product">了解工作方式 <span aria-hidden="true">→</span></a>
         </div>
         <ul class="trust-list" aria-label="核心安全能力">

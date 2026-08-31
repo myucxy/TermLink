@@ -54,6 +54,7 @@ type testPortalRepository struct {
 	duplicateClaim   bool
 	webSettings      store.WebPortalSettings
 	lastAssertion    store.PortalIdentityAssertion
+	identityProfile  store.AccountIdentityProfile
 }
 
 type unavailableRegistrationEmailRepository struct {
@@ -111,6 +112,11 @@ func (r *testPortalRepository) SyncPortalIdentity(_ context.Context, _ [32]byte,
 		r.account.Role = store.RoleSuperAdmin
 	}
 	return r.account, nil
+}
+
+func (r *testPortalRepository) SyncAccountIdentityProfile(_ context.Context, _ uuid.UUID, profile store.AccountIdentityProfile) error {
+	r.identityProfile = profile
+	return nil
 }
 
 func (r *testPortalRepository) RecordPortalLoginFailure(_ context.Context, _ string, reason string) error {
@@ -460,6 +466,9 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 	if strings.Count(body, `href="/login"`) != 1 || strings.Contains(body, "打开管理台") || strings.Contains(body, "进入 Server Console") {
 		t.Fatal("public home must expose one account entry and no management destination")
 	}
+	if strings.Count(body, `href="/register"`) != 1 || strings.Contains(body, `href="/plans"`) || strings.Contains(body, `href="/security"`) {
+		t.Fatal("home must link directly to registration without plan or security navigation entries")
+	}
 	for name, want := range map[string]string{
 		"Content-Security-Policy":   "default-src 'none'",
 		"Strict-Transport-Security": "max-age=31536000",
@@ -508,6 +517,13 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 		!strings.Contains(registerScript.Body.String(), "result.error.code") ||
 		strings.Contains(registerScript.Body.String(), "error instanceof Error ? error.message") {
 		t.Fatalf("registration prompts must be safely localized in Chinese and English: status=%d", registerScript.Code)
+	}
+	commerceScript := performRequest(portal.Handler(), http.MethodGet, "/assets/commerce-admin.js", nil)
+	if commerceScript.Code != http.StatusOK ||
+		!strings.Contains(commerceScript.Body.String(), "data-copy-all-codes") ||
+		!strings.Contains(commerceScript.Body.String(), "beforeunload") ||
+		!strings.Contains(commerceScript.Body.String(), "Invitation code copied") {
+		t.Fatalf("commerce invitation receipt script is incomplete: status=%d", commerceScript.Code)
 	}
 	for _, asset := range []string{"/assets/termlink-app-icon.svg", "/assets/termlink-favicon.svg"} {
 		icon := performRequest(portal.Handler(), http.MethodGet, asset, nil)
@@ -757,9 +773,9 @@ func TestPortalAccountResponsiveAndSVGControlContract(t *testing.T) {
 		strings.Contains(adminCSS, `var(--text-1)`) ||
 		!strings.Contains(commerceCSS, `.account-menu-panel`) ||
 		!strings.Contains(commerceCSS, `background: var(--surface);`) ||
-		!strings.Contains(portalDashboardHTML, `/assets/commerce-portal.css?v=01b-v6`) ||
+		!strings.Contains(portalDashboardHTML, `/assets/commerce-portal.css?v=01b-v7`) ||
 		!strings.Contains(commerceAdminHTML, `/assets/admin.css?v=01b-v17`) ||
-		!strings.Contains(commerceAdminHTML, `/assets/commerce-portal.css?v=01b-v6`) {
+		!strings.Contains(commerceAdminHTML, `/assets/commerce-portal.css?v=01b-v7`) {
 		t.Error("account menus must use defined theme surfaces and versioned opaque panel styles")
 	}
 	for _, contract := range []string{

@@ -97,6 +97,7 @@ var userPortalAccountDeletionRedactCommerceStatements = []string{
 }
 
 var userPortalAccountDeletionPurgePrivateStatements = []string{
+	`DELETE FROM account_identity_profiles WHERE user_id=$1`,
 	`DELETE FROM redemption_claims WHERE account_id=$1`,
 	`DELETE FROM entitlement_grants WHERE account_id=$1`,
 	`DELETE FROM subscriptions WHERE account_id=$1`,

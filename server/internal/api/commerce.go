@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -101,7 +102,7 @@ func (a *API) validateInvitation(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *API) reserveRegistrationInvitation(r *http.Request, rawCode, rawEmail string) (uuid.UUID, bool, error) {
+func (a *API) reserveRegistrationInvitation(r *http.Request, rawCode, username, nickname, rawEmail string) (uuid.UUID, bool, error) {
 	// Focused legacy unit tests construct the registration boundary without a
 	// repository. Production startup always supplies Store and verifies schema.
 	if a.Store == nil {
@@ -139,6 +140,15 @@ func (a *API) reserveRegistrationInvitation(r *http.Request, rawCode, rawEmail s
 		domain, invitationReservationTTL,
 	)
 	if err != nil {
+		return uuid.Nil, false, err
+	}
+	profile := store.NewAccountIdentityProfile(username, nickname, email)
+	if err = a.Store.RecordInvitationRegistrationProfile(r.Context(), attemptID, profile); err != nil {
+		if releaseErr := a.Store.ReleaseInvitation(r.Context(), attemptID); releaseErr != nil {
+			logAPIFailure(r.Context(), slog.LevelError, "registration profile rejected but invitation release failed",
+				"registration_profile_compensation_failed", releaseErr,
+				slog.String("registration_attempt_id", attemptID.String()))
+		}
 		return uuid.Nil, false, err
 	}
 	return attemptID, true, nil

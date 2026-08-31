@@ -567,8 +567,8 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 
 	for name, content := range map[string]string{
 		"login template account target":         `termlinkAccountUrl = client.baseUrl`,
-		"login template hosted registration":    `client.clientId == "termlink-windows" && client.baseUrl?has_content`,
-		"login form authorization continuation": `?continue=${url.loginUrl?url}`,
+		"login template hosted registration":    `client.clientId == "termlink-windows" || client.clientId == "termlink-android"`,
+		"login form direct registration":        `href="${termlinkRegisterUrl}"`,
 		"login server registration policy":      `msg("termlinkServerRegistration")`,
 		"login template accessible label":       `msg('termlinkBackToPersonalCenter')`,
 		"login template theme transfer":         `data-theme-transfer`,
@@ -621,7 +621,7 @@ func TestAcceptanceIdentityThemesAlwaysReturnToPersonalCenter(t *testing.T) {
 		switch name {
 		case "login template account target", "login template hosted registration", "login template accessible label", "login template theme transfer", "login pre-paint theme script", "login SVG theme control", "login SVG account return", "login server registration policy":
 			source = loginTemplate
-		case "login form authorization continuation":
+		case "login form direct registration":
 			source = loginForm
 		case "login pre-paint stored theme", "login pre-paint transferred theme":
 			source = loginThemeInit

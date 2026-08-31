@@ -637,6 +637,30 @@ func (s *Postgres) ReserveInvitation(ctx context.Context, attemptID uuid.UUID, c
 	return r, tx.Commit(ctx)
 }
 
+// RecordInvitationRegistrationProfile stores only the bounded display fields
+// needed while an invited identity is waiting for its first OIDC login.
+func (s *Postgres) RecordInvitationRegistrationProfile(ctx context.Context, attemptID uuid.UUID, profile AccountIdentityProfile) error {
+	profile = normalizeIdentityProfileProjection(profile)
+	if attemptID == uuid.Nil || profile.empty() {
+		return ErrInvitationInvalid
+	}
+	command, err := s.Pool.Exec(ctx, `
+		INSERT INTO invitation_registration_profiles(redemption_id,username,nickname,email_masked)
+		SELECT id,$2,$3,$4 FROM invitation_redemptions
+		WHERE registration_attempt_id=$1 AND state IN ('RESERVED','PROVIDER_ACCEPTED')
+		ON CONFLICT(redemption_id) DO UPDATE SET
+			username=excluded.username,nickname=excluded.nickname,
+			email_masked=excluded.email_masked,updated_at=now()`,
+		attemptID, profile.Username, profile.Nickname, profile.EmailMasked)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrInvitationInvalid
+	}
+	return nil
+}
+
 func (s *Postgres) MarkInvitationProviderAccepted(ctx context.Context, attemptID uuid.UUID) error {
 	cmd, err := s.Pool.Exec(ctx, `UPDATE invitation_redemptions SET state='PROVIDER_ACCEPTED',provider_accepted_at=coalesce(provider_accepted_at,now()),updated_at=now() WHERE registration_attempt_id=$1 AND state IN ('RESERVED','PROVIDER_ACCEPTED') AND (state='PROVIDER_ACCEPTED' OR reserved_until>now())`, attemptID)
 	if err != nil {
@@ -688,6 +712,9 @@ func (s *Postgres) ReleaseInvitation(ctx context.Context, attemptID uuid.UUID) e
 	if command.RowsAffected() != 1 {
 		return ErrConflict
 	}
+	if _, err = tx.Exec(ctx, `DELETE FROM invitation_registration_profiles WHERE redemption_id IN (SELECT id FROM invitation_redemptions WHERE registration_attempt_id=$1)`, attemptID); err != nil {
+		return err
+	}
 	if _, err = tx.Exec(ctx, `UPDATE invitation_codes SET used_count=greatest(used_count-1,0),updated_at=now() WHERE id=$1`, codeID); err != nil {
 		return err
 	}
@@ -733,6 +760,9 @@ func (s *Postgres) ConfirmInvitation(ctx context.Context, attemptID, userID uuid
 				return Entitlement{}, err
 			}
 		}
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM invitation_registration_profiles WHERE redemption_id=$1`, redemptionID); err != nil {
+		return Entitlement{}, err
 	}
 	e, err := recomputeEntitlement(ctx, tx, userID)
 	if err != nil {
@@ -805,6 +835,9 @@ func (s *Postgres) ConfirmPendingInvitationForEmail(ctx context.Context, userID 
 	}
 	if command.RowsAffected() != 1 {
 		return Entitlement{}, ErrConflict
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM invitation_registration_profiles WHERE redemption_id=$1`, redemptionID); err != nil {
+		return Entitlement{}, err
 	}
 	if gift != "" {
 		var catalogVersion int64

@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -71,6 +74,94 @@ type PortalAccount struct {
 	Role      Role
 	Status    string
 	CreatedAt time.Time
+}
+
+// AccountIdentityProfile is a bounded display projection. It deliberately
+// excludes raw OIDC subjects, raw e-mail addresses, credentials and tokens.
+type AccountIdentityProfile struct {
+	Username    string
+	Nickname    string
+	EmailMasked string
+}
+
+func NewAccountIdentityProfile(username, nickname, email string) AccountIdentityProfile {
+	return AccountIdentityProfile{
+		Username:    normalizeIdentityProfileText(username, 128),
+		Nickname:    normalizeIdentityProfileText(nickname, 128),
+		EmailMasked: maskIdentityProfileEmail(email),
+	}
+}
+
+func (profile AccountIdentityProfile) empty() bool {
+	return profile.Username == "" && profile.Nickname == "" && profile.EmailMasked == ""
+}
+
+func normalizeIdentityProfileProjection(profile AccountIdentityProfile) AccountIdentityProfile {
+	profile.Username = normalizeIdentityProfileText(profile.Username, 128)
+	profile.Nickname = normalizeIdentityProfileText(profile.Nickname, 128)
+	profile.EmailMasked = normalizeIdentityProfileText(profile.EmailMasked, 320)
+	local, domain, found := strings.Cut(profile.EmailMasked, "@")
+	if profile.EmailMasked != "" && (!found || domain == "" || !strings.Contains(local, "*") || strings.Contains(domain, "@")) {
+		profile.EmailMasked = ""
+	}
+	return profile
+}
+
+func normalizeIdentityProfileText(value string, maximum int) string {
+	value = strings.TrimSpace(value)
+	if value == "" || !utf8.ValidString(value) || utf8.RuneCountInString(value) > maximum {
+		return ""
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return ""
+		}
+	}
+	return value
+}
+
+func maskIdentityProfileEmail(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" || !utf8.ValidString(value) || utf8.RuneCountInString(value) > 320 {
+		return ""
+	}
+	local, domain, found := strings.Cut(value, "@")
+	if !found || local == "" || domain == "" || strings.Contains(domain, "@") {
+		return ""
+	}
+	localRunes := []rune(local)
+	switch len(localRunes) {
+	case 1:
+		local = "*"
+	case 2:
+		local = string(localRunes[0]) + "*"
+	default:
+		local = string(localRunes[0]) + "***" + string(localRunes[len(localRunes)-1])
+	}
+	return local + "@" + domain
+}
+
+// SyncAccountIdentityProfile updates the server-owned display projection from
+// a verified identity or a successful identity-profile mutation.
+func (s *Postgres) SyncAccountIdentityProfile(ctx context.Context, userID uuid.UUID, profile AccountIdentityProfile) error {
+	profile = normalizeIdentityProfileProjection(profile)
+	if userID == uuid.Nil || profile.empty() {
+		return ErrDenied
+	}
+	command, err := s.Pool.Exec(ctx, `
+		INSERT INTO account_identity_profiles(user_id,username,nickname,email_masked)
+		SELECT id,$2,$3,$4 FROM users WHERE id=$1 AND status='ACTIVE'
+		ON CONFLICT(user_id) DO UPDATE SET
+			username=excluded.username,nickname=excluded.nickname,
+			email_masked=excluded.email_masked,synced_at=now()`,
+		userID, profile.Username, profile.Nickname, profile.EmailMasked)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrDenied
+	}
+	return nil
 }
 
 type PortalAdminAccount struct {

@@ -140,6 +140,7 @@ type oidcPortalClaims struct {
 
 type portalRepository interface {
 	SyncPortalIdentity(context.Context, [32]byte, store.PortalIdentityAssertion, string) (store.PortalAccount, error)
+	SyncAccountIdentityProfile(context.Context, uuid.UUID, store.AccountIdentityProfile) error
 	RecordPortalLoginFailure(context.Context, string, string) error
 	GetPortalAccount(context.Context, [32]byte) (store.PortalAccount, error)
 	PortalAdminDashboard(context.Context, uuid.UUID) (store.PortalAdminDashboard, error)
@@ -213,6 +214,7 @@ type Portal struct {
 	themeInit      []byte
 	themeScript    []byte
 	registerScript []byte
+	commerceScript []byte
 	appIcon        []byte
 	favicon        []byte
 	releaseSource  PublicReleaseSource
@@ -233,9 +235,7 @@ type productionOIDCFlow struct {
 }
 
 type homePageData struct {
-	LoginURL         string
-	RegisterURL      string
-	RegistrationOpen bool
+	LoginURL string
 }
 
 type registerPageData struct {
@@ -415,6 +415,10 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 	if err != nil {
 		return nil, fmt.Errorf("read web portal registration script: %w", err)
 	}
+	commerceScript, err := portalAssets.ReadFile("assets/commerce-admin.js")
+	if err != nil {
+		return nil, fmt.Errorf("read web portal commerce admin script: %w", err)
+	}
 	appIcon, err := portalAssets.ReadFile("assets/termlink-app-icon.svg")
 	if err != nil {
 		return nil, fmt.Errorf("read web portal app icon: %w", err)
@@ -450,6 +454,7 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 		themeInit:      themeInit,
 		themeScript:    themeScript,
 		registerScript: registerScript,
+		commerceScript: commerceScript,
 		appIcon:        appIcon,
 		favicon:        favicon,
 		releaseSource:  config.ReleaseSource,
@@ -580,6 +585,7 @@ func (p *Portal) Handler() http.Handler {
 	mux.HandleFunc("GET /assets/theme-init.js", p.themeInitJS)
 	mux.HandleFunc("GET /assets/theme.js", p.themeJS)
 	mux.HandleFunc("GET /assets/register.js", p.registerJS)
+	mux.HandleFunc("GET /assets/commerce-admin.js", p.commerceAdminJS)
 	mux.HandleFunc("GET /assets/termlink-app-icon.svg", p.svgAsset(p.appIcon))
 	mux.HandleFunc("GET /assets/termlink-favicon.svg", p.svgAsset(p.favicon))
 	mux.HandleFunc("GET /login", p.login)
@@ -669,12 +675,7 @@ func (p *Portal) Handler() http.Handler {
 }
 
 func (p *Portal) home(w http.ResponseWriter, r *http.Request) {
-	data := homePageData{LoginURL: "/login", RegisterURL: "/register"}
-	if repository, ok := p.config.Repository.(registrationPortalRepository); ok {
-		if policy, err := repository.GetRegistrationPolicy(r.Context()); err == nil {
-			data.RegistrationOpen = policy.Mode != store.RegistrationClosed
-		}
-	}
+	data := homePageData{LoginURL: "/login"}
 	if session, err := p.readSession(r); err == nil {
 		if _, accountErr := p.currentAccount(r.Context(), session); accountErr == nil {
 			http.Redirect(w, r, "/account", http.StatusSeeOther)
@@ -732,6 +733,10 @@ func (p *Portal) themeInitJS(w http.ResponseWriter, _ *http.Request) {
 
 func (p *Portal) registerJS(w http.ResponseWriter, _ *http.Request) {
 	p.staticAsset(w, "text/javascript; charset=utf-8", p.registerScript)
+}
+
+func (p *Portal) commerceAdminJS(w http.ResponseWriter, _ *http.Request) {
+	p.staticAsset(w, "text/javascript; charset=utf-8", p.commerceScript)
 }
 
 func (p *Portal) registerPage(w http.ResponseWriter, r *http.Request) {
@@ -930,6 +935,12 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 			"oidc_account_authorization_failed", loginTraceID, err)
 		p.renderError(w, http.StatusForbidden, "账号不可用", "账号未启用或授权状态无效，请联系 TermLink 管理员。")
 		return
+	}
+	profile := store.NewAccountIdentityProfile(username, nickname, identity.Email)
+	if profileErr := p.config.Repository.SyncAccountIdentityProfile(r.Context(), account.ID, profile); profileErr != nil {
+		logPortalFailure(r.Context(), slog.LevelWarn, "synchronize account identity display profile",
+			"account_identity_profile_sync_failed", loginTraceID, profileErr,
+			slog.String("account_id", account.ID.String()))
 	}
 	if identity.Email != "" && len(p.config.CommerceKey) >= 32 {
 		if repository, ok := p.config.Repository.(registrationPortalRepository); ok {

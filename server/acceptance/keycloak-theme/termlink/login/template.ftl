@@ -6,7 +6,7 @@
   <#assign termlinkAccountUrl = client.baseUrl>
   <#assign termlinkHomeUrl = client.baseUrl?remove_ending("/")?remove_ending("/account") + "/">
   <#assign termlinkRegisterUrl = termlinkHomeUrl + "register">
-<#elseif client?? && client.clientId == "termlink-windows" && client.baseUrl?has_content>
+<#elseif client?? && (client.clientId == "termlink-windows" || client.clientId == "termlink-android") && client.baseUrl?has_content>
   <#assign termlinkRegisterUrl = client.baseUrl?remove_ending("/") + "/register">
 </#if>
 <!doctype html>

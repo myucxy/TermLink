@@ -163,9 +163,14 @@ type adminCommerceOrderView struct {
 }
 
 type invitationRedemptionView struct {
-	ID                 uuid.UUID
-	CodeID             uuid.UUID
-	UserID             uuid.UUID
+	RecordReference    string
+	CodePrefix         string
+	BatchName          string
+	AccountReference   string
+	Username           string
+	Nickname           string
+	EmailMasked        string
+	HasIdentityProfile bool
 	HasUser            bool
 	State              string
 	ReservedUntil      time.Time
@@ -368,6 +373,8 @@ type adminCommercePageData struct {
 	ChannelVersions         []commercePaymentVersionView
 	SelectedID              uuid.UUID
 	GeneratedCodes          []string
+	GeneratedBatchName      string
+	GeneratedAt             time.Time
 	Notice                  string
 	ActionNonce             string
 	CatalogDraft            commerceCatalogDraftView
@@ -911,12 +918,28 @@ func invitationRedemptionViews(items []store.InvitationRedemption) []invitationR
 			userID = *item.UserID
 		}
 		views = append(views, invitationRedemptionView{
-			ID: item.ID, CodeID: item.CodeID, UserID: userID, HasUser: item.UserID != nil, State: item.State,
+			RecordReference:    commerceReference("reg", item.ID),
+			CodePrefix:         item.CodePrefix,
+			BatchName:          item.BatchName,
+			AccountReference:   commerceReference("acct", userID),
+			Username:           item.Username,
+			Nickname:           item.Nickname,
+			EmailMasked:        item.EmailMasked,
+			HasIdentityProfile: item.Username != "" || item.Nickname != "" || item.EmailMasked != "",
+			HasUser:            item.UserID != nil, State: item.State,
 			ReservedUntil: item.ReservedUntil, ProviderAcceptedAt: item.ProviderAcceptedAt,
 			RedeemedAt: item.RedeemedAt, ReleasedAt: item.ReleasedAt, CreatedAt: item.CreatedAt,
 		})
 	}
 	return views
+}
+
+func commerceReference(prefix string, value uuid.UUID) string {
+	if value == uuid.Nil {
+		return ""
+	}
+	compact := strings.ReplaceAll(value.String(), "-", "")
+	return prefix + "_" + compact[:8]
 }
 
 func redemptionClaimViews(items []store.AccountRedemption) []redemptionClaimView {
@@ -1498,6 +1521,15 @@ func (p *Portal) adminCommerceGenerateInvitationCodes(w http.ResponseWriter, r *
 		p.renderError(w, http.StatusBadRequest, "邀请码生成请求无效", "批次、数量、使用次数或商业化密钥无效。")
 		return
 	}
+	batchName := ""
+	if batches, listErr := repository.ListInvitationBatches(r.Context(), account.ID, commercePageLimit); listErr == nil {
+		for _, batch := range batches {
+			if batch.ID == batchID {
+				batchName = batch.Name
+				break
+			}
+		}
+	}
 	raw, records, err := p.generateCommerceCodes("TLI", "invitation-code", count, maxUses)
 	traceID, traceErr := randomText(12)
 	if err == nil {
@@ -1510,7 +1542,7 @@ func (p *Portal) adminCommerceGenerateInvitationCodes(w http.ResponseWriter, r *
 		p.handleCommerceMutationError(w, err)
 		return
 	}
-	p.renderGeneratedAdminCodes(w, session, account, "registration", batchID, raw)
+	p.renderGeneratedAdminCodes(w, session, account, "registration", batchID, batchName, raw)
 }
 
 func (p *Portal) adminCommerceInvitationBatchStatus(w http.ResponseWriter, r *http.Request) {
@@ -1592,7 +1624,7 @@ func (p *Portal) adminCommerceGenerateRedemptionCodes(w http.ResponseWriter, r *
 		p.handleCommerceMutationError(w, err)
 		return
 	}
-	p.renderGeneratedAdminCodes(w, session, account, "redemptions", batchID, raw)
+	p.renderGeneratedAdminCodes(w, session, account, "redemptions", batchID, "", raw)
 }
 
 func (p *Portal) adminCommerceRedemptionBatchStatus(w http.ResponseWriter, r *http.Request) {
@@ -2307,7 +2339,7 @@ func validPortalCommerceCode(code, prefix string) bool {
 	return true
 }
 
-func (p *Portal) renderGeneratedAdminCodes(w http.ResponseWriter, session webSession, account store.PortalAccount, section string, selectedID uuid.UUID, raw []string) {
+func (p *Portal) renderGeneratedAdminCodes(w http.ResponseWriter, session webSession, account store.PortalAccount, section string, selectedID uuid.UUID, batchName string, raw []string) {
 	actionNonce, err := randomText(24)
 	if err != nil {
 		p.internalError(w, err)
@@ -2323,6 +2355,7 @@ func (p *Portal) renderGeneratedAdminCodes(w http.ResponseWriter, session webSes
 		CanConfigureSystem: account.Role == store.RoleSuperAdmin,
 		CommerceNavigation: true,
 		SelectedID:         selectedID, GeneratedCodes: raw,
+		GeneratedBatchName: batchName, GeneratedAt: p.now().UTC(),
 		ActionNonce: actionNonce,
 		Notice: bilingualPortalNotice(
 			"明文代码仅在本页显示一次。请立即保存到受控位置，离开后无法恢复。",
@@ -2512,6 +2545,7 @@ func commerceStatusLabel(status string) string {
 		"CREATED": "已创建", "PENDING_PAYMENT": "待支付", "PAID": "已支付", "FULFILLING": "履约中",
 		"FULFILLED": "已履约", "CLOSED": "已关闭", "FAILED": "失败", "REFUNDING": "退款中", "REFUNDED": "已退款",
 		"APPROVAL_PENDING": "等待二次确认", "REVOKED": "已撤销",
+		"RESERVED": "注册处理中", "PROVIDER_ACCEPTED": "身份已创建", "REDEEMED": "已绑定账号", "RELEASED": "已释放",
 		"SUCCEEDED": "成功", "PENDING": "处理中", "VALIDATED": "已验证", "RETIRED": "已退役", "HEALTHY": "健康",
 	}
 	if label := labels[strings.ToUpper(status)]; label != "" {

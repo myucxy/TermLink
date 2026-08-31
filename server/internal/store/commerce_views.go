@@ -160,6 +160,12 @@ func (s *Postgres) ListAccountEntitlementGrants(ctx context.Context, accountID u
 type InvitationRedemption struct {
 	ID, CodeID, AttemptID uuid.UUID
 	UserID                *uuid.UUID
+	CodePrefix            string
+	BatchName             string
+	Username              string
+	Nickname              string
+	EmailMasked           string
+	ProfileSource         string
 	State                 string
 	ReservedUntil         time.Time
 	ProviderAcceptedAt    *time.Time
@@ -175,9 +181,24 @@ func (s *Postgres) ListInvitationRedemptions(ctx context.Context, actorID uuid.U
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	rows, err := tx.Query(ctx, `
-		SELECT id,code_id,registration_attempt_id,user_id,state,reserved_until,
-		       provider_accepted_at,redeemed_at,released_at,created_at
-		FROM invitation_redemptions ORDER BY created_at DESC,id DESC LIMIT $1`, normalizePage(limit))
+		SELECT redemption.id,redemption.code_id,redemption.registration_attempt_id,redemption.user_id,
+		       code.code_prefix,batch.name,
+		       coalesce(nullif(account_profile.username,''),registration_profile.username,''),
+		       coalesce(nullif(account_profile.nickname,''),registration_profile.nickname,''),
+		       coalesce(nullif(account_profile.email_masked,''),registration_profile.email_masked,''),
+		       CASE
+		           WHEN account_profile.user_id IS NOT NULL THEN 'ACCOUNT'
+		           WHEN registration_profile.redemption_id IS NOT NULL THEN 'REGISTRATION'
+		           ELSE ''
+		       END,
+		       redemption.state,redemption.reserved_until,redemption.provider_accepted_at,
+		       redemption.redeemed_at,redemption.released_at,redemption.created_at
+		FROM invitation_redemptions redemption
+		JOIN invitation_codes code ON code.id=redemption.code_id
+		JOIN invitation_batches batch ON batch.id=code.batch_id
+		LEFT JOIN account_identity_profiles account_profile ON account_profile.user_id=redemption.user_id
+		LEFT JOIN invitation_registration_profiles registration_profile ON registration_profile.redemption_id=redemption.id
+		ORDER BY redemption.created_at DESC,redemption.id DESC LIMIT $1`, normalizePage(limit))
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +207,8 @@ func (s *Postgres) ListInvitationRedemptions(ctx context.Context, actorID uuid.U
 	for rows.Next() {
 		var item InvitationRedemption
 		if err := rows.Scan(&item.ID, &item.CodeID, &item.AttemptID, &item.UserID,
-			&item.State, &item.ReservedUntil, &item.ProviderAcceptedAt,
+			&item.CodePrefix, &item.BatchName, &item.Username, &item.Nickname,
+			&item.EmailMasked, &item.ProfileSource, &item.State, &item.ReservedUntil, &item.ProviderAcceptedAt,
 			&item.RedeemedAt, &item.ReleasedAt, &item.CreatedAt); err != nil {
 			return nil, err
 		}

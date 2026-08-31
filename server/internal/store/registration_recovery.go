@@ -154,6 +154,9 @@ func (s *Postgres) ReleaseAbsentRegistration(ctx context.Context, attemptID uuid
 		if _, err = tx.Exec(ctx, `UPDATE invitation_redemptions SET state='RELEASED',released_at=coalesce(released_at,now()),updated_at=now() WHERE registration_attempt_id=$1 AND state='RESERVED'`, attemptID); err != nil {
 			return "", err
 		}
+		if _, err = tx.Exec(ctx, `DELETE FROM invitation_registration_profiles WHERE redemption_id IN (SELECT id FROM invitation_redemptions WHERE registration_attempt_id=$1)`, attemptID); err != nil {
+			return "", err
+		}
 		if _, err = tx.Exec(ctx, `UPDATE invitation_codes SET used_count=greatest(used_count-1,0),updated_at=now() WHERE id=$1`, codeID); err != nil {
 			return "", err
 		}

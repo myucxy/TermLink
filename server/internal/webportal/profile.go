@@ -2,6 +2,7 @@ package webportal
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -13,7 +14,7 @@ import (
 )
 
 func (p *Portal) accountUpdateNickname(w http.ResponseWriter, r *http.Request) {
-	session, _, ok := p.requireCommerceAccountAction(w, r)
+	session, account, ok := p.requireCommerceAccountAction(w, r)
 	if !ok {
 		return
 	}
@@ -35,6 +36,12 @@ func (p *Portal) accountUpdateNickname(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	session.Nickname = nickname
+	if profileErr := p.config.Repository.SyncAccountIdentityProfile(r.Context(), account.ID,
+		store.NewAccountIdentityProfile(session.Username, session.Nickname, session.Email)); profileErr != nil {
+		logPortalFailure(r.Context(), slog.LevelWarn, "synchronize nickname display profile",
+			"account_identity_profile_sync_failed", uuid.NewString(), profileErr,
+			slog.String("account_id", account.ID.String()))
+	}
 	if err := p.refreshSessionCookie(w, session); err != nil {
 		p.internalError(w, err)
 		return
@@ -107,6 +114,12 @@ func (p *Portal) accountConfirmEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	session.Email = newEmail
+	if profileErr := p.config.Repository.SyncAccountIdentityProfile(r.Context(), account.ID,
+		store.NewAccountIdentityProfile(session.Username, session.Nickname, session.Email)); profileErr != nil {
+		logPortalFailure(r.Context(), slog.LevelWarn, "synchronize e-mail display profile",
+			"account_identity_profile_sync_failed", uuid.NewString(), profileErr,
+			slog.String("account_id", account.ID.String()))
+	}
 	if err = p.refreshSessionCookie(w, session); err != nil {
 		p.internalError(w, err)
 		return

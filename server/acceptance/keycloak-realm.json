@@ -85,6 +85,7 @@
       "implicitFlowEnabled": false,
       "serviceAccountsEnabled": false,
       "fullScopeAllowed": false,
+      "baseUrl": "https://termlink.kget.cc:8910",
       "redirectUris": ["dev.termlink:/oauth2redirect"],
       "webOrigins": [],
       "attributes": {

@@ -126,6 +126,8 @@ type testRegistrationAdminRepository struct {
 	updatedActor uuid.UUID
 	batches      []store.InvitationBatch
 	redemptions  []store.InvitationRedemption
+	addedBatchID uuid.UUID
+	addedCodes   []store.CodeDigestRecord
 }
 
 type testRedemptionAdminRepository struct {
@@ -179,7 +181,9 @@ func (r *testRegistrationAdminRepository) CreateInvitationBatch(context.Context,
 	return store.InvitationBatch{}, nil
 }
 
-func (r *testRegistrationAdminRepository) AddInvitationCodes(context.Context, uuid.UUID, uuid.UUID, []store.CodeDigestRecord, string) ([]store.InvitationCode, error) {
+func (r *testRegistrationAdminRepository) AddInvitationCodes(_ context.Context, _ uuid.UUID, batchID uuid.UUID, codes []store.CodeDigestRecord, _ string) ([]store.InvitationCode, error) {
+	r.addedBatchID = batchID
+	r.addedCodes = append([]store.CodeDigestRecord(nil), codes...)
 	return nil, nil
 }
 
@@ -866,8 +870,10 @@ func TestAdminCommerceUsageDetailsRenderOnlySafeViews(t *testing.T) {
 			ID: uuid.New(), Name: "受控邀请", Status: "ACTIVE", EmailHash: []byte("EMAIL-DIGEST-MUST-NOT-RENDER"),
 		}},
 		redemptions: []store.InvitationRedemption{{
-			ID:     uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
-			CodeID: uuid.MustParse("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"), UserID: &userID,
+			ID: uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), CodeID: uuid.MustParse("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+			AttemptID: uuid.MustParse("cccccccc-cccc-4ccc-8ccc-cccccccccccc"), UserID: &userID,
+			CodePrefix: "TLI-ABCD", BatchName: "受控邀请", Username: "alice", Nickname: "爱丽丝",
+			EmailMasked: "a***e@example.test", ProfileSource: "ACCOUNT",
 			State: "REDEEMED", ReservedUntil: portal.now(), CreatedAt: portal.now(),
 		}},
 	}
@@ -877,6 +883,16 @@ func TestAdminCommerceUsageDetailsRenderOnlySafeViews(t *testing.T) {
 	response := performRequest(portal.Handler(), http.MethodGet, "/admin/commerce?section=registration", nil, cookie)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "最近邀请码使用明细") || !strings.Contains(response.Body.String(), "受控邀请") {
 		t.Fatalf("invitation usage page status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, expected := range []string{"TLI-ABCD", "爱丽丝", "@alice", "a***e@example.test", "acct_99999999", "已绑定账号"} {
+		if !strings.Contains(response.Body.String(), expected) {
+			t.Errorf("invitation usage page omitted %q", expected)
+		}
+	}
+	for _, forbidden := range []string{"cccccccc", "bbbbbbbb", "alice@example.test"} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Errorf("invitation usage page exposed internal or raw identity value %q", forbidden)
+		}
 	}
 	if strings.Contains(response.Body.String(), "EMAIL-DIGEST-MUST-NOT-RENDER") {
 		t.Fatal("invitation batch email digest crossed the HTML boundary")
@@ -904,6 +920,47 @@ func TestAdminCommerceUsageDetailsRenderOnlySafeViews(t *testing.T) {
 	for _, forbidden := range []string{"emailhash", "email_hash", "providerrefhash", "provider_ref_hash", "attemptid", "attempt_id"} {
 		if strings.Contains(lower, forbidden) {
 			t.Fatalf("admin commerce template references sensitive usage-detail field %q", forbidden)
+		}
+	}
+}
+
+func TestAdminInvitationGenerationReturnsOneTimeSaveReceipt(t *testing.T) {
+	portal := newTestPortal(t, &testOIDCFlow{})
+	batchID := uuid.MustParse("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+	repository := &testRegistrationAdminRepository{
+		testPortalRepository: newTestPortalRepository(),
+		policy:               store.RegistrationPolicy{Mode: store.RegistrationInviteRequired, Version: 1},
+		batches: []store.InvitationBatch{{
+			ID: batchID, Name: "九月邀请", Status: "ACTIVE", DefaultMaxUses: 1,
+		}},
+	}
+	repository.account.Role = store.RoleAdmin
+	portal.config.Repository = repository
+	portal.config.CommerceKey = []byte("0123456789abcdef0123456789abcdef")
+	cookie := commerceSessionCookie(t, portal, store.RoleAdmin, "csrf-admin", time.Minute)
+
+	response := performCommerceForm(portal.Handler(), "/admin/commerce/invitations/batches/"+batchID.String()+"/codes", url.Values{
+		"csrf":            {"csrf-admin"},
+		"reason":          {"生成三枚测试邀请码"},
+		"idempotency_key": {"invitation-generate-receipt-0001"},
+		"count":           {"3"},
+		"max_uses":        {"1"},
+	}, cookie)
+	if response.Code != http.StatusCreated || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("generation receipt status=%d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+	}
+	body := response.Body.String()
+	if repository.addedBatchID != batchID || len(repository.addedCodes) != 3 || strings.Count(body, "<code data-generated-code>") != 3 {
+		t.Fatalf("generated receipt mismatch: batch=%s records=%d body=%s", repository.addedBatchID, len(repository.addedCodes), body)
+	}
+	for _, expected := range []string{"九月邀请", "复制全部", "下载 TXT", "下载 CSV", "我已安全保存", "3 个"} {
+		if !strings.Contains(body, expected) {
+			t.Errorf("generated receipt omitted %q", expected)
+		}
+	}
+	for _, record := range repository.addedCodes {
+		if record.Prefix == "" || !strings.Contains(strings.ReplaceAll(body, "-", ""), record.Prefix) {
+			t.Errorf("generated receipt omitted a code matching persisted prefix %q", record.Prefix)
 		}
 	}
 }
