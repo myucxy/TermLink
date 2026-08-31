@@ -21,13 +21,73 @@ class TerminalSnapshotBootstrapTest {
 
     @Test
     fun missingV2CapabilitySkipsRemoteSnapshotReadinessWait() = runBlocking {
-        var invoked = false
-        val result = awaitRemoteSnapshotWhenNegotiated<String>(negotiated = false) {
-            invoked = true
-            "unexpected"
-        }
-        assertFalse(invoked)
+        val events = mutableListOf<String>()
+        val result = restoreReplaceableBoundOrRemoteCheckpoint(
+            negotiated = false,
+            restoreBound = { events += "bound"; "unexpected" },
+            abandonRenderer = { events += "abandon" },
+            restoreRemote = { events += "remote"; "unexpected" },
+        )
+
         assertNull(result)
+        assertEquals(emptyList<String>(), events)
+    }
+
+    @Test
+    fun bcf7BoundSnapshotGapResetsRendererAndRestoresTheRemoteDurableAck() = runBlocking {
+        val events = mutableListOf<String>()
+        var rendererGeneration = 2L
+        var rendererSnapshotSequence = 7uL
+        var durableAcknowledgement = 1629uL
+
+        val restored = restoreReplaceableBoundOrRemoteCheckpoint(
+            negotiated = true,
+            restoreBound = {
+                events += "bound:$rendererSnapshotSequence:$durableAcknowledgement:$rendererGeneration"
+                throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+            },
+            abandonRenderer = {
+                rendererSnapshotSequence = 0uL
+                events += "abandon"
+            },
+            restoreRemote = {
+                val remoteSnapshotSequence = 1629uL
+                check(remoteSnapshotSequence >= durableAcknowledgement)
+                rendererSnapshotSequence = remoteSnapshotSequence
+                durableAcknowledgement = maxOf(durableAcknowledgement, remoteSnapshotSequence)
+                rendererGeneration += 1L
+                events += "remote:$remoteSnapshotSequence:$rendererGeneration"
+                "controlling"
+            },
+        )
+
+        assertEquals("controlling", restored)
+        assertEquals(1629uL, rendererSnapshotSequence)
+        assertEquals(1629uL, durableAcknowledgement)
+        assertEquals(3L, rendererGeneration)
+        assertEquals(
+            listOf("bound:7:1629:2", "abandon", "remote:1629:3"),
+            events,
+        )
+    }
+
+    @Test
+    fun boundSnapshotIntegrityFailureRemainsFailClosed() {
+        var abandoned = false
+
+        val failure = assertThrows(SessionOpenException::class.java) {
+            runBlocking {
+                restoreReplaceableBoundCheckpoint<String>(
+                    restoreBound = {
+                        throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_INTEGRITY)
+                    },
+                    abandonRenderer = { abandoned = true },
+                )
+            }
+        }
+
+        assertEquals(SessionOpenFailureCode.SNAPSHOT_INTEGRITY, failure.failure.code)
+        assertFalse(abandoned)
     }
 
     @Test

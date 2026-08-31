@@ -113,6 +113,52 @@ class EventChunkRepositoryTest {
         assertOriginalUnchanged(original)
     }
 
+    @Test
+    fun replayLookupFindsTheChunkContainingASnapshotSuffixBoundary() = runBlocking {
+        val sessionId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        repository.putEventChunk(
+            sessionId,
+            1u,
+            8u,
+            "chunks/one-through-eight",
+            "history-v1:recipient:00000001",
+            byteArrayOf(1, 2, 3),
+            UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f"),
+        )
+
+        val chunk = requireNotNull(repository.eventChunkContaining(sessionId, 8u))
+
+        assertEquals(1uL, chunk.metadata.startSequence)
+        assertEquals(8uL, chunk.metadata.endSequence)
+    }
+
+    @Test
+    fun replayLookupRejectsOverlappingChunksAtItsCursor() = runBlocking {
+        val sessionId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        repository.putEventChunk(
+            sessionId,
+            1u,
+            8u,
+            "chunks/first",
+            "history-v1:recipient:00000001",
+            byteArrayOf(1),
+            UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f"),
+        )
+        repository.putEventChunk(
+            sessionId,
+            8u,
+            9u,
+            "chunks/second",
+            "history-v1:recipient:00000001",
+            byteArrayOf(2),
+            UUID.fromString("20314253-6475-8697-a8b9-cadbeced0f10"),
+        )
+
+        val failure = runCatching { repository.eventChunkContaining(sessionId, 8u) }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+    }
+
     private suspend fun putOriginal(): OriginalChunk {
         val original = OriginalChunk(
             id = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f"),

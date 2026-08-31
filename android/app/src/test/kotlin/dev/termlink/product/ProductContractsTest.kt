@@ -360,6 +360,171 @@ class ProductContractsTest {
     }
 
     @Test
+    fun snapshotSuffixAcceptsAChunkStraddlingItsAnchor() = runBlocking {
+        val cached = mutableListOf<HistorySequenceRange>()
+
+        val restoredThrough = cacheContiguousHistoryRange(
+            minimumTarget = 1629uL,
+            stopAfterSequence = 7uL,
+            firstPage = StreamedHistoryCatalogPage(
+                items = listOf(
+                    HistorySequenceRange(1626uL, 1629uL),
+                    HistorySequenceRange(1187uL, 1625uL),
+                    HistorySequenceRange(675uL, 1186uL),
+                    HistorySequenceRange(163uL, 674uL),
+                    HistorySequenceRange(10uL, 162uL),
+                    HistorySequenceRange(9uL, 9uL),
+                    HistorySequenceRange(1uL, 8uL),
+                ),
+                hasMore = false,
+                nextCursor = null,
+            ),
+            loadNextPage = { error("complete suffix fits one page") },
+            sequenceRange = { it },
+            cacheCandidate = { cached += it },
+        )
+
+        assertEquals(1629uL, restoredThrough)
+        assertEquals(HistorySequenceRange(1uL, 8uL), cached.last())
+        assertEquals(7, cached.size)
+    }
+
+    @Test
+    fun snapshotSuffixRejectsTwoChunksStraddlingItsAnchorOnOnePage() {
+        val cached = mutableListOf<HistorySequenceRange>()
+        val failure = assertThrows(SessionOpenException::class.java) {
+            runBlocking {
+                cacheContiguousHistoryRange(
+                    minimumTarget = 8uL,
+                    stopAfterSequence = 7uL,
+                    firstPage = StreamedHistoryCatalogPage(
+                        items = listOf(
+                            HistorySequenceRange(5uL, 8uL),
+                            HistorySequenceRange(1uL, 8uL),
+                        ),
+                        hasMore = false,
+                        nextCursor = null,
+                    ),
+                    loadNextPage = { error("a terminal page must not load another page") },
+                    sequenceRange = { it },
+                    cacheCandidate = { cached += it },
+                )
+            }
+        }
+
+        assertEquals(SessionOpenFailureCode.HISTORY_GAP, failure.failure.code)
+        assertEquals(listOf(HistorySequenceRange(5uL, 8uL)), cached)
+    }
+
+    @Test
+    fun snapshotSuffixRejectsASecondAnchorOverlapOnTheNextPage() {
+        val cached = mutableListOf<HistorySequenceRange>()
+        val requestedCursors = mutableListOf<String>()
+        val failure = assertThrows(SessionOpenException::class.java) {
+            runBlocking {
+                cacheContiguousHistoryRange(
+                    minimumTarget = 8uL,
+                    stopAfterSequence = 7uL,
+                    firstPage = StreamedHistoryCatalogPage(
+                        items = listOf(HistorySequenceRange(5uL, 8uL)),
+                        hasMore = true,
+                        nextCursor = "anchor-check",
+                    ),
+                    loadNextPage = { cursor ->
+                        requestedCursors += cursor
+                        StreamedHistoryCatalogPage(
+                            items = listOf(HistorySequenceRange(1uL, 8uL)),
+                            hasMore = false,
+                            nextCursor = null,
+                        )
+                    },
+                    sequenceRange = { it },
+                    cacheCandidate = { cached += it },
+                )
+            }
+        }
+
+        assertEquals(SessionOpenFailureCode.HISTORY_GAP, failure.failure.code)
+        assertEquals(listOf("anchor-check"), requestedCursors)
+        assertEquals(listOf(HistorySequenceRange(5uL, 8uL)), cached)
+    }
+
+    @Test
+    fun snapshotSuffixAcceptsAnOlderSentinelOnTheNextPageWithoutCachingIt() = runBlocking {
+        val cached = mutableListOf<HistorySequenceRange>()
+        val requestedCursors = mutableListOf<String>()
+
+        val restoredThrough = cacheContiguousHistoryRange(
+            minimumTarget = 8uL,
+            stopAfterSequence = 7uL,
+            firstPage = StreamedHistoryCatalogPage(
+                items = listOf(HistorySequenceRange(5uL, 8uL)),
+                hasMore = true,
+                nextCursor = "anchor-check",
+            ),
+            loadNextPage = { cursor ->
+                requestedCursors += cursor
+                StreamedHistoryCatalogPage(
+                    items = listOf(HistorySequenceRange(1uL, 7uL)),
+                    hasMore = false,
+                    nextCursor = null,
+                )
+            },
+            sequenceRange = { it },
+            cacheCandidate = { cached += it },
+        )
+
+        assertEquals(8uL, restoredThrough)
+        assertEquals(listOf("anchor-check"), requestedCursors)
+        assertEquals(listOf(HistorySequenceRange(5uL, 8uL)), cached)
+    }
+
+    @Test
+    fun snapshotSuffixValidatesTheBoundaryChunkButAppliesOnlyNewEvents() = runBlocking {
+        val applied = mutableListOf<ULong>()
+
+        val localInputEpoch = applyContiguousHistoryChunkSuffix(
+            startSequence = 1uL,
+            endSequence = 8uL,
+            nextSequence = 8uL,
+            events = (1uL..8uL).toList(),
+            eventSequence = { it },
+            initialLocalInputEpoch = 3L,
+            applyEvent = { sequence ->
+                applied += sequence
+                11L
+            },
+        )
+
+        assertEquals(listOf(8uL), applied)
+        assertEquals(11L, localInputEpoch)
+    }
+
+    @Test
+    fun snapshotSuffixRejectsACorruptSkippedPrefixBeforeApplyingAnything() {
+        val applied = mutableListOf<ULong>()
+        val failure = assertThrows(SessionOpenException::class.java) {
+            runBlocking {
+                applyContiguousHistoryChunkSuffix(
+                    startSequence = 1uL,
+                    endSequence = 8uL,
+                    nextSequence = 8uL,
+                    events = listOf(1uL, 2uL, 4uL, 5uL, 6uL, 7uL, 8uL),
+                    eventSequence = { it },
+                    initialLocalInputEpoch = 3L,
+                    applyEvent = { sequence ->
+                        applied += sequence
+                        11L
+                    },
+                )
+            }
+        }
+
+        assertEquals(SessionOpenFailureCode.HISTORY_GAP, failure.failure.code)
+        assertTrue(applied.isEmpty())
+    }
+
+    @Test
     fun snapshotSuffixTargetCeilingRejectsBeforeAnyCandidateIsCached() {
         val cached = mutableListOf<HistorySequenceRange>()
         val error = assertThrows(IllegalStateException::class.java) {

@@ -4913,12 +4913,20 @@ internal class ProductionProductRepository(
         var localInputEpoch = initialLocalInputEpoch
         while (expected <= throughSequence) {
             currentCoroutineContext().ensureActive()
-            val encrypted = historyRepository.eventChunkStartingAt(session.id, expected)
+            val encrypted = historyRepository.eventChunkContaining(session.id, expected)
                 ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
             val metadata = encrypted.metadata
+            val start = metadata.startSequence
+                ?: run {
+                    encrypted.ciphertext.fill(0)
+                    throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+                }
             val end = metadata.endSequence
-                ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
-            if (metadata.startSequence != expected || end < expected || end > throughSequence) {
+                ?: run {
+                    encrypted.ciphertext.fill(0)
+                    throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+                }
+            if (start > expected || end < expected || end > throughSequence) {
                 encrypted.ciphertext.fill(0)
                 throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
             }
@@ -4927,16 +4935,16 @@ internal class ProductionProductRepository(
             } finally {
                 encrypted.ciphertext.fill(0)
             }
-            if (chunk.eventsCount == 0) throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
-            for (event in chunk.eventsList) {
-                val sequence = event.seq.toULong()
-                if (sequence != expected || sequence > throughSequence) {
-                    throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
-                }
-                localInputEpoch = maxOf(localInputEpoch, applyHistoryEvent(engine, event))
-                expected++
-            }
-            if (expected - 1uL != end) throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+            localInputEpoch = applyContiguousHistoryChunkSuffix(
+                startSequence = start,
+                endSequence = end,
+                nextSequence = expected,
+                events = chunk.eventsList,
+                eventSequence = { it.seq.toULong() },
+                initialLocalInputEpoch = localInputEpoch,
+                applyEvent = { event -> applyHistoryEvent(engine, event) },
+            )
+            expected = end + 1uL
             yield()
         }
         return StreamedReplayProgress(throughSequence, localInputEpoch)
@@ -5169,48 +5177,49 @@ internal class ProductionProductRepository(
             BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME,
             pc.capabilities,
         )
-        if (terminalSnapshotNegotiated) {
-            restoreBoundNativeTerminalCheckpoint(session, pc, pcDevice, stored, engine)?.let { return it }
-        }
-
         // Prefer terminal-core's canonical Snapshot V2 and wait through the
         // normal Agent -> object store -> catalog publication window.  CHUNK
         // replay remains the compatibility/availability fallback and stays
         // unbounded in total session length (TL-H115).
-        val remoteSnapshot = awaitRemoteSnapshotWhenNegotiated(
-            terminalSnapshotNegotiated,
-        ) {
-            withTimeoutOrNull(TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS) {
-                var lastObservation: TerminalSnapshotReadinessObservation? = null
-                for (pauseMillis in TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS) {
-                    currentCoroutineContext().ensureActive()
-                    val observation = latestTerminalSnapshot(
-                        session,
-                        stored,
-                        pc.keyEpoch,
-                        minimumSnapshotSequence = cursor.sequence,
-                    )
-                    lastObservation = observation
-                    if (observation?.snapshot != null ||
-                        observation?.lastOutputSequence == 0uL ||
-                        observation?.failure?.code == SessionOpenFailureCode.SNAPSHOT_UNSUPPORTED
-                    ) break
-                    delay(pauseMillis)
+        restoreReplaceableBoundOrRemoteCheckpoint(
+            negotiated = terminalSnapshotNegotiated,
+            restoreBound = {
+                restoreBoundNativeTerminalCheckpoint(session, pc, pcDevice, stored, engine)
+            },
+            abandonRenderer = { resetAbandonedSnapshotRenderer(session, engine) },
+            restoreRemote = {
+                val remoteSnapshot = withTimeoutOrNull(TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS) {
+                    var lastObservation: TerminalSnapshotReadinessObservation? = null
+                    for (pauseMillis in TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS) {
+                        currentCoroutineContext().ensureActive()
+                        val observation = latestTerminalSnapshot(
+                            session,
+                            stored,
+                            pc.keyEpoch,
+                            minimumSnapshotSequence = cursor.sequence,
+                        )
+                        lastObservation = observation
+                        if (observation?.snapshot != null ||
+                            observation?.lastOutputSequence == 0uL ||
+                            observation?.failure?.code == SessionOpenFailureCode.SNAPSHOT_UNSUPPORTED
+                        ) break
+                        delay(pauseMillis)
+                    }
+                    lastObservation?.snapshot
                 }
-                lastObservation?.snapshot
-            }
-        }
-        if (remoteSnapshot != null) {
-            restoreRemoteNativeTerminalSnapshot(
-                session = session,
-                pc = pc,
-                pcDevice = pcDevice,
-                stored = stored,
-                engine = engine,
-                expectedRendererGeneration = cursor.rendererGeneration,
-                descriptor = remoteSnapshot,
-            )?.let { return it }
-        }
+                remoteSnapshot?.let { descriptor ->
+                    restoreRemoteNativeTerminalSnapshot(
+                        session = session,
+                        pc = pc,
+                        pcDevice = pcDevice,
+                        stored = stored,
+                        engine = engine,
+                        expectedRendererGeneration = cursor.rendererGeneration,
+                        descriptor = descriptor,
+                    )
+                }
+            },
+        )?.let { return it }
 
         val latestAuthoritativeTail = try {
             latestAuthoritativeSessionTail(session)
@@ -5840,15 +5849,29 @@ internal suspend fun <Candidate> cacheContiguousHistoryRange(
                 expectedEnd = range.endInclusive
             }
             val expected = requireNotNull(expectedEnd)
-            if (expected <= stopAfterSequence) break
-            if (range.endInclusive != expected || range.start <= stopAfterSequence) {
+            if (expected <= stopAfterSequence) {
+                // The catalog is newest-to-oldest. Reaching the Snapshot
+                // boundary is not enough to return yet: another item on this
+                // page (or the first item on the next page) could overlap the
+                // same boundary. Accept only after observing an item wholly at
+                // or before the anchor, or the immutable catalog ending.
+                if (range.endInclusive > stopAfterSequence) {
+                    throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+                }
+                return requireNotNull(target)
+            }
+            val requiredBoundary = stopAfterSequence + 1uL
+            if (range.endInclusive != expected) {
                 throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
             }
             cacheCandidate(candidate)
-            expectedEnd = range.start - 1uL
-            if (expectedEnd == stopAfterSequence) break
+            expectedEnd = if (range.start <= requiredBoundary) {
+                stopAfterSequence
+            } else {
+                range.start - 1uL
+            }
         }
-        if (expectedEnd == stopAfterSequence) return requireNotNull(target)
+        if (expectedEnd == stopAfterSequence && !page.hasMore) return requireNotNull(target)
         if (!page.hasMore) throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
         val next = page.nextCursor?.takeIf(String::isNotBlank)
             ?: error("Chunk history page omitted its continuation cursor")
@@ -5860,6 +5883,44 @@ internal suspend fun <Candidate> cacheContiguousHistoryRange(
 }
 
 internal data class HistorySequenceRange(val start: ULong, val endInclusive: ULong)
+
+/**
+ * Validates the complete immutable Chunk while applying only the suffix after
+ * an already-installed Snapshot. Validating the skipped prefix preserves the
+ * catalog's fail-closed integrity guarantee without rendering any event twice.
+ */
+internal suspend fun <Event> applyContiguousHistoryChunkSuffix(
+    startSequence: ULong,
+    endSequence: ULong,
+    nextSequence: ULong,
+    events: List<Event>,
+    eventSequence: (Event) -> ULong,
+    initialLocalInputEpoch: Long,
+    applyEvent: suspend (Event) -> Long,
+): Long {
+    if (events.isEmpty() ||
+        startSequence == 0uL ||
+        startSequence > nextSequence ||
+        nextSequence > endSequence
+    ) throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+
+    var expected = startSequence
+    var localInputEpoch = initialLocalInputEpoch
+    for (event in events) {
+        val sequence = eventSequence(event)
+        if (sequence != expected || sequence > endSequence) {
+            throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+        }
+        if (sequence >= nextSequence) {
+            localInputEpoch = maxOf(localInputEpoch, applyEvent(event))
+        }
+        expected++
+    }
+    if (expected - 1uL != endSequence) {
+        throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
+    }
+    return localInputEpoch
+}
 
 internal data class BoundedEventReplayCatalogObservation<Candidate>(
     val authoritativeTail: ULong,
@@ -6627,10 +6688,35 @@ internal fun terminalSnapshotRuntimeNegotiated(
 ): Boolean = localRuntimeEnabled &&
     dev.termlink.model.PcCapabilityIds.TERMINAL_SNAPSHOT_V2 in pcCapabilities
 
-internal suspend fun <T> awaitRemoteSnapshotWhenNegotiated(
+/**
+ * A durable local binding is only one recovery candidate. If the encrypted
+ * Chunk suffix behind that binding has been compacted or was never cached, a
+ * newer remote Snapshot can still restore the same durable ACK without losing
+ * state. Only the explicit catalog-gap result is replaceable; integrity,
+ * crypto, key, storage, and renderer failures remain fail-closed.
+ */
+internal suspend fun <T> restoreReplaceableBoundCheckpoint(
+    restoreBound: suspend () -> T?,
+    abandonRenderer: () -> Unit,
+): T? = try {
+    restoreBound()
+} catch (error: SessionOpenException) {
+    if (error.failure.code != SessionOpenFailureCode.HISTORY_GAP) throw error
+    abandonRenderer()
+    null
+}
+
+/** Encodes the production ordering: local binding, reset on H114, then remote V2. */
+internal suspend fun <T> restoreReplaceableBoundOrRemoteCheckpoint(
     negotiated: Boolean,
-    awaitRemoteSnapshot: suspend () -> T?,
-): T? = if (negotiated) awaitRemoteSnapshot() else null
+    restoreBound: suspend () -> T?,
+    abandonRenderer: () -> Unit,
+    restoreRemote: suspend () -> T?,
+): T? {
+    if (!negotiated) return null
+    restoreReplaceableBoundCheckpoint(restoreBound, abandonRenderer)?.let { return it }
+    return restoreRemote()
+}
 
 /** Sequence zero is safe only when neither endpoint has historical output. */
 internal fun canSafelySubscribeFromZeroWithoutSnapshot(

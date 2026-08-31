@@ -94,17 +94,19 @@ interface EventChunkDao {
     ): List<EventChunkEntity>
 
     /**
-     * Returns the immutable chunk(s) beginning at one exact replay cursor.
-     * The repository rejects more than one result as an overlapping catalog;
-     * limiting this query keeps arbitrary-length replay memory independent of
-     * the total number of cached chunks.
+     * Returns the immutable chunk(s) containing one exact replay cursor.
+     * A Snapshot can be anchored in the middle of a previously published
+     * Chunk, so suffix replay must accept that boundary Chunk while still
+     * rejecting an overlapping catalog. Limiting this query keeps
+     * arbitrary-length replay memory independent of the total number of
+     * cached chunks.
      */
     @Query(
         "SELECT * FROM event_chunks WHERE sessionId = :sessionId " +
-            "AND startSequence = :startSequence " +
-            "ORDER BY endSequence ASC, id ASC LIMIT 2",
+            "AND startSequence <= :sequence AND endSequence >= :sequence " +
+            "ORDER BY startSequence DESC, endSequence ASC, id ASC LIMIT 2",
     )
-    suspend fun listStartingAt(sessionId: String, startSequence: Long): List<EventChunkEntity>
+    suspend fun listContaining(sessionId: String, sequence: Long): List<EventChunkEntity>
 
     @Query("SELECT * FROM event_chunks WHERE sessionId = :sessionId ORDER BY startSequence ASC, endSequence ASC, id ASC")
     suspend fun listForSession(sessionId: String): List<EventChunkEntity>
