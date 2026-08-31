@@ -516,7 +516,8 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 	identityCSS := performRequest(portal.Handler(), http.MethodGet, "/assets/identity.css", nil)
 	if identityCSS.Code != http.StatusOK || !strings.HasPrefix(identityCSS.Header().Get("Content-Type"), "text/css") ||
 		!strings.Contains(identityCSS.Body.String(), ".identity-layout") ||
-		!strings.Contains(identityCSS.Body.String(), ".registration-code-row") {
+		!strings.Contains(identityCSS.Body.String(), ".registration-code-row") ||
+		!strings.Contains(identityCSS.Body.String(), ".registration-human-loading[hidden]") {
 		t.Fatalf("shared identity stylesheet response is incomplete: status=%d bytes=%d", identityCSS.Code, identityCSS.Body.Len())
 	}
 	themeInit := performRequest(portal.Handler(), http.MethodGet, "/assets/theme-init.js", nil)
@@ -538,8 +539,11 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 		!strings.Contains(registerScript.Body.String(), "Registration is temporarily unavailable") ||
 		!strings.Contains(registerScript.Body.String(), "PublicRegistrationError") ||
 		!strings.Contains(registerScript.Body.String(), "human_verification_token") ||
+		!strings.Contains(registerScript.Body.String(), `"response-field": false`) ||
+		!strings.Contains(registerScript.Body.String(), "const payload = {};") ||
 		strings.Count(registerScript.Body.String(), "resetHumanVerification();") < 2 ||
 		!strings.Contains(registerScript.Body.String(), "result.error.code") ||
+		strings.Contains(registerScript.Body.String(), "Object.fromEntries(values.entries())") ||
 		strings.Contains(registerScript.Body.String(), "error instanceof Error ? error.message") {
 		t.Fatalf("registration prompts must be safely localized in Chinese and English: status=%d", registerScript.Code)
 	}

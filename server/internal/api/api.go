@@ -301,6 +301,10 @@ type registerAccountRequest struct {
 	VerificationID  string `json:"email_verification_id"`
 	EmailCode       string `json:"email_code"`
 	HumanToken      string `json:"human_verification_token"`
+	// Turnstile injects this standard field into forms by default. Accept it
+	// for cached registration pages while the TermLink-owned field remains the
+	// canonical API contract.
+	TurnstileToken string `json:"cf-turnstile-response"`
 }
 
 type registrationEmailCodeRequest struct {
@@ -390,7 +394,16 @@ func (a *API) registerAccount(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if !a.verifyRegistrationHuman(w, r, input.HumanToken) {
+	humanToken := strings.TrimSpace(input.HumanToken)
+	turnstileToken := strings.TrimSpace(input.TurnstileToken)
+	if humanToken != "" && turnstileToken != "" && humanToken != turnstileToken {
+		writeError(w, r, http.StatusUnprocessableEntity, "HUMAN_VERIFICATION_FAILED", humanverification.ErrRejected)
+		return
+	}
+	if humanToken == "" {
+		humanToken = turnstileToken
+	}
+	if !a.verifyRegistrationHuman(w, r, humanToken) {
 		return
 	}
 	verifiedEmailRegistration := false

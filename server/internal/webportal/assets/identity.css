@@ -1193,6 +1193,10 @@ html[data-theme="dark"] .theme-icon-sun { display: inline; }
   text-align: center;
 }
 
+.registration-human-loading[hidden] {
+  display: none;
+}
+
 .registration-human-verification[data-state="error"] .registration-human-loading,
 .registration-human-verification[data-state="expired"] .registration-human-loading {
   border-color: color-mix(in srgb, var(--danger) 45%, var(--border));

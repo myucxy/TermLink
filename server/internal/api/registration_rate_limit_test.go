@@ -165,6 +165,41 @@ func TestRegistrationHumanVerificationFailsClosedBeforeAccountCreation(t *testin
 	}
 }
 
+func TestRegistrationAcceptsCachedTurnstileResponseField(t *testing.T) {
+	registration := &recordingAccountRegistration{}
+	verifier := &recordingHumanVerifier{}
+	handler := (&API{Registration: registration, HumanVerification: verifier}).Handler()
+	body := `{"username":"cached-widget-user","nickname":"Cached widget","email":"cached-widget@example.test",` +
+		`"password":"correct horse battery staple","password_confirm":"correct horse battery staple",` +
+		`"human_verification_token":"cached-token","cf-turnstile-response":"cached-token"}`
+	request := httptest.NewRequest(http.MethodPost, "/v1/auth/register", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || registration.calls != 1 || verifier.calls != 1 || verifier.token != "cached-token" {
+		t.Fatalf("cached Turnstile field status/register/verify/token = %d/%d/%d/%q; body=%q",
+			response.Code, registration.calls, verifier.calls, verifier.token, response.Body.String())
+	}
+}
+
+func TestRegistrationRejectsConflictingTurnstileResponseFields(t *testing.T) {
+	registration := &recordingAccountRegistration{}
+	verifier := &recordingHumanVerifier{}
+	handler := (&API{Registration: registration, HumanVerification: verifier}).Handler()
+	body := `{"username":"conflicting-widget-user","nickname":"Conflicting widget","email":"conflicting-widget@example.test",` +
+		`"password":"correct horse battery staple","password_confirm":"correct horse battery staple",` +
+		`"human_verification_token":"canonical-token","cf-turnstile-response":"different-token"}`
+	request := httptest.NewRequest(http.MethodPost, "/v1/auth/register", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnprocessableEntity || registration.calls != 0 || verifier.calls != 0 ||
+		!strings.Contains(response.Body.String(), `"code":"HUMAN_VERIFICATION_FAILED"`) {
+		t.Fatalf("conflicting Turnstile fields status/register/verify/body = %d/%d/%d/%q",
+			response.Code, registration.calls, verifier.calls, response.Body.String())
+	}
+}
+
 func TestRegistrationEmailCodeVerifiesHumanBeforeMailService(t *testing.T) {
 	repository := &humanVerificationEmailProbe{}
 	emailService, err := serviceemail.New(repository, []byte("human-verification-email-key-0123456789"), nil, nil)

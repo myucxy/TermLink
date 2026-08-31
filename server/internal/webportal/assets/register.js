@@ -142,6 +142,7 @@
       humanWidgetID = window.turnstile.render(humanContainer, {
         sitekey: siteKey,
         action,
+        "response-field": false,
         callback: (token) => {
           humanToken = String(token || "");
           setHumanState(humanToken ? "ready" : "error");
@@ -214,7 +215,14 @@
     event.preventDefault();
     if (!form.reportValidity()) return;
     const values = new FormData(form);
-    const payload = Object.fromEntries(values.entries());
+    const payload = {};
+    for (const name of [
+      "username", "nickname", "email", "password", "password_confirm",
+      "invitation_code", "email_verification_id", "email_code"
+    ]) {
+      const value = values.get(name);
+      if (typeof value === "string") payload[name] = value;
+    }
     if (payload.password !== payload.password_confirm) {
       showMessage(copy.passwordMismatch, "error");
       return;
