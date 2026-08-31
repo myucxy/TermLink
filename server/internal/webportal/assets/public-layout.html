@@ -20,11 +20,7 @@
       <span><strong>TermLink</strong><small>Remote terminal, locally alive.</small></span>
     </a>
     <nav class="public-nav" aria-label="公开页面导航" data-desktop-nav>
-      <a href="/downloads" {{if eq .ActivePage "downloads"}}aria-current="page"{{end}}>下载</a>
-      <a href="/releases" {{if eq .ActivePage "releases"}}aria-current="page"{{end}}>版本</a>
-      <a href="/plans" {{if eq .ActivePage "plans"}}aria-current="page"{{end}}>套餐</a>
       <a href="/security" {{if eq .ActivePage "security"}}aria-current="page"{{end}}>安全</a>
-      <a href="/status" {{if eq .ActivePage "status"}}aria-current="page"{{end}}>状态</a>
     </nav>
     <div class="site-header-actions public-header-actions">
       <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题">
@@ -34,11 +30,7 @@
       {{if .SignedIn}}<a class="button button-primary" href="{{.AccountURL}}">个人中心</a>{{else}}<a class="button button-primary" href="{{.LoginURL}}" data-theme-transfer>登录</a>{{end}}
     </div>
     <nav class="public-mobile-nav" aria-label="移动端公开页面导航" data-mobile-nav>
-      <a href="/downloads" {{if eq .ActivePage "downloads"}}aria-current="page"{{end}}>下载</a>
-      <a href="/releases" {{if eq .ActivePage "releases"}}aria-current="page"{{end}}>版本</a>
-      <a href="/plans" {{if eq .ActivePage "plans"}}aria-current="page"{{end}}>套餐</a>
       <a href="/security" {{if eq .ActivePage "security"}}aria-current="page"{{end}}>安全</a>
-      <a href="/status" {{if eq .ActivePage "status"}}aria-current="page"{{end}}>状态</a>
     </nav>
   </header>
   <main class="public-main" data-public-main>
@@ -49,7 +41,7 @@
   <footer class="site-footer public-footer">
     <span>© TermLink · 清风惹尘丶</span>
     <span>终端正文不进入 Web 管理台</span>
-    <nav aria-label="页脚导航"><a href="/security">安全</a><a href="/status">服务状态</a></nav>
+    <nav aria-label="页脚导航"><a href="/security">安全</a></nav>
   </footer>
 </body>
 </html>

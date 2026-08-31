@@ -444,6 +444,33 @@ func TestPublicPagesExposeResponsiveThemeDOMContract(t *testing.T) {
 	}
 }
 
+func TestPublicNavigationHidesDistributionCatalogAndStatusEntriesButKeepsRoutes(t *testing.T) {
+	portal := newTestPortal(t, &testOIDCFlow{})
+	hiddenEntries := []string{`href="/downloads"`, `href="/releases"`, `href="/plans"`, `href="/status"`}
+	pages := map[string]string{
+		"/downloads": "下载 TermLink",
+		"/releases":  "版本记录",
+		"/plans":     "套餐",
+		"/status":    "服务状态",
+		"/security":  "安全说明",
+	}
+	for target, expectedContent := range pages {
+		response := performRequest(portal.Handler(), http.MethodGet, target, nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET %s status=%d, want 200", target, response.Code)
+		}
+		body := response.Body.String()
+		if !strings.Contains(body, expectedContent) {
+			t.Errorf("GET %s omitted retained page content %q", target, expectedContent)
+		}
+		for _, hiddenEntry := range hiddenEntries {
+			if strings.Contains(body, hiddenEntry) {
+				t.Errorf("GET %s exposed hidden public entry %s", target, hiddenEntry)
+			}
+		}
+	}
+}
+
 func TestPublicFailuresShowUnavailableWithoutLeakingDiagnosticsOrStaleData(t *testing.T) {
 	portal := newTestPortal(t, &testOIDCFlow{})
 	portal.releaseSource = publicReleaseSourceFunc(func(context.Context, PublicReleaseTarget) (PublicRelease, error) {

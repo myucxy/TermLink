@@ -466,8 +466,13 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 	if strings.Count(body, `href="/login"`) != 1 || strings.Contains(body, "打开管理台") || strings.Contains(body, "进入 Server Console") {
 		t.Fatal("public home must expose one account entry and no management destination")
 	}
-	if strings.Count(body, `href="/register"`) != 1 || strings.Contains(body, `href="/plans"`) || strings.Contains(body, `href="/security"`) {
-		t.Fatal("home must link directly to registration without plan or security navigation entries")
+	if strings.Count(body, `href="/register"`) != 1 {
+		t.Fatal("home must link directly to registration")
+	}
+	for _, hiddenEntry := range []string{`href="/downloads"`, `href="/releases"`, `href="/plans"`, `href="/security"`, `href="/status"`} {
+		if strings.Contains(body, hiddenEntry) {
+			t.Fatalf("home exposed hidden public entry %s", hiddenEntry)
+		}
 	}
 	for name, want := range map[string]string{
 		"Content-Security-Policy":   "default-src 'none'",
