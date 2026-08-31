@@ -57,6 +57,10 @@
     <string name="sign_in_password_label">Password</string>
     <string name="sign_in_working">Signing in…</string>
     <string name="sign_in_register">Create account</string>
+    <string name="registration_opening">Opening…</string>
+    <string name="embedded_identity_title">TermLink account</string>
+    <string name="embedded_identity_load_failed">页面加载失败，请检查网络后重试。 / The secure account page could not load. Check the network and try again.</string>
+    <string name="embedded_identity_navigation_blocked">已阻止离开 TermLink 的页面。 / Navigation outside TermLink was blocked.</string>
     <string name="sign_in_account_setup_required">This account requires an additional identity action that is not available in the native app yet.</string>
     <string name="registration_title">Create your TermLink account</string>
     <string name="registration_copy">Create an account directly in this app. Your password is sent only to the fixed TermLink service over HTTPS.</string>

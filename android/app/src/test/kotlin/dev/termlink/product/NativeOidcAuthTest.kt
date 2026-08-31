@@ -35,10 +35,9 @@ class NativeOidcAuthTest {
     }
 
     @Test
-    fun registrationUsesOidcCreatePromptInsteadOfCustomAction() {
-        assertEquals("create", BrowserAuthPolicy.REGISTRATION_PROMPT)
-        assertNotEquals("register", BrowserAuthPolicy.REGISTRATION_PROMPT)
-        assertEquals("login", BrowserAuthPolicy.ACCOUNT_SETUP_PROMPT)
+    fun embeddedIdentityUsesLoginPromptAfterHostedRegistration() {
+        assertEquals("login", EmbeddedAuthPolicy.LOGIN_PROMPT)
+        assertNotEquals("create", EmbeddedAuthPolicy.LOGIN_PROMPT)
     }
 
     @Test

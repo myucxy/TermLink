@@ -943,7 +943,6 @@ fun ProductApp(
     var pendingDeleteSessionId by remember { mutableStateOf<java.util.UUID?>(null) }
     var refreshInFlight by remember { mutableStateOf(false) }
     var signOutConfirmation by remember { mutableStateOf(false) }
-    var registrationOpen by remember { mutableStateOf(false) }
     var agentUpdateDialog by remember { mutableStateOf<AgentUpdateDialogState?>(null) }
     var agentUpdateJob by remember { mutableStateOf<Job?>(null) }
     var checkedAgentUpdatePcIds by remember(remoteDirectoryFavoriteScope) {
@@ -1225,54 +1224,10 @@ fun ProductApp(
                     password.fill('\u0000')
                     runOperation({ repository.signIn(username, submittedPassword) }, onComplete)
                 },
-                onRegister = { registrationOpen = true },
-                modifier = Modifier.padding(innerPadding),
-            )
-        }
-        if (registrationOpen) {
-            val registrationFailureMessage = stringResource(R.string.registration_failure)
-            RegistrationDialog(
-                onDismiss = { registrationOpen = false },
-                onSubmit = { username, email, firstName, lastName, password, confirm, onComplete ->
-                    scope.launch {
-                        try {
-                            val result = try {
-                                submitAccountRegistration {
-                                    repository.register(
-                                        username = username,
-                                        email = email,
-                                        firstName = firstName,
-                                        lastName = lastName,
-                                        password = password,
-                                        confirm = confirm,
-                                    )
-                                }
-                            } finally {
-                                // The repository also owns a wipe, but this boundary must
-                                // remain safe for fakes and alternate implementations.
-                                password.fill('\u0000')
-                                confirm.fill('\u0000')
-                            }
-                            when (result) {
-                                AccountRegistrationResult.Success -> {
-                                    onComplete(null)
-                                    registrationOpen = false
-                                    snackbarHostState.showSnackbar(
-                                        context.getString(R.string.registration_success),
-                                    )
-                                }
-                                is AccountRegistrationResult.Failure -> {
-                                    onComplete(registrationFailureMessage)
-                                }
-                            }
-                        } catch (error: CancellationException) {
-                            // Restore the dialog affordances if cancellation happens while
-                            // this composable remains present, then preserve cancellation.
-                            onComplete(registrationFailureMessage)
-                            throw error
-                        }
-                    }
+                onRegister = { onComplete ->
+                    runOperation(repository::beginEmbeddedRegistration, onComplete)
                 },
+                modifier = Modifier.padding(innerPadding),
             )
         }
         ProductUpdateDialog(
@@ -1712,12 +1667,13 @@ fun ProductApp(
 private fun ProductSignInPage(
     snapshot: ProductSnapshot,
     onSignIn: (String, CharArray, () -> Unit) -> Unit,
-    onRegister: () -> Unit,
+    onRegister: (() -> Unit) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var submitting by remember { mutableStateOf(false) }
+    var registrationLaunching by remember { mutableStateOf(false) }
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -1871,10 +1827,20 @@ private fun ProductSignInPage(
             }
             Spacer(Modifier.height(10.dp))
             OutlinedButton(
-                onClick = onRegister,
-                enabled = !submitting,
+                onClick = {
+                    if (submitting || registrationLaunching) return@OutlinedButton
+                    registrationLaunching = true
+                    onRegister { registrationLaunching = false }
+                },
+                enabled = !submitting && !registrationLaunching,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-            ) { Text(stringResource(R.string.sign_in_register)) }
+            ) {
+                Text(
+                    stringResource(
+                        if (registrationLaunching) R.string.registration_opening else R.string.sign_in_register,
+                    ),
+                )
+            }
 
             Spacer(Modifier.height(18.dp))
             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
@@ -2735,145 +2701,6 @@ internal fun saveTerminalShortcutPreferences(
         .putString(TERMINAL_CUSTOM_SHORTCUTS_KEY, customShortcuts.toString())
         .putString(TERMINAL_UNIFIED_SHORTCUT_ORDER_KEY, normalized.shortcutOrder.joinToString(","))
         .apply()
-}
-
-@Composable
-private fun RegistrationDialog(
-    onDismiss: () -> Unit,
-    onSubmit: (String, String, String, String, CharArray, CharArray, (String?) -> Unit) -> Unit,
-) {
-    var username by rememberSaveable { mutableStateOf("") }
-    var email by rememberSaveable { mutableStateOf("") }
-    var firstName by rememberSaveable { mutableStateOf("") }
-    var lastName by rememberSaveable { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
-    var confirm by remember { mutableStateOf("") }
-    var submitting by remember { mutableStateOf(false) }
-    var submissionError by remember { mutableStateOf<String?>(null) }
-    val valid = username.trim().length in 3..128 && email.trim().length in 3..320 &&
-        email.trim().contains("@") && firstName.trim().length in 1..128 &&
-        lastName.trim().length in 1..128 &&
-        password.length in 8..1024 && password == confirm
-    AlertDialog(
-        onDismissRequest = { if (!submitting) onDismiss() },
-        icon = { Icon(Icons.Filled.AccountCircle, contentDescription = null) },
-        title = { Text(stringResource(R.string.registration_title)) },
-        text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 520.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Text(
-                    stringResource(R.string.registration_copy),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                OutlinedTextField(
-                    value = username,
-                    onValueChange = { username = it },
-                    enabled = !submitting,
-                    singleLine = true,
-                    label = { Text(stringResource(R.string.registration_username_label)) },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = email,
-                    onValueChange = { email = it },
-                    enabled = !submitting,
-                    singleLine = true,
-                    label = { Text(stringResource(R.string.registration_email_label)) },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = firstName,
-                    onValueChange = { firstName = it },
-                    enabled = !submitting,
-                    singleLine = true,
-                    label = { Text(stringResource(R.string.registration_first_name_label)) },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = lastName,
-                    onValueChange = { lastName = it },
-                    enabled = !submitting,
-                    singleLine = true,
-                    label = { Text(stringResource(R.string.registration_last_name_label)) },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = { password = it },
-                    enabled = !submitting,
-                    singleLine = true,
-                    label = { Text(stringResource(R.string.registration_password_label)) },
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = confirm,
-                    onValueChange = { confirm = it },
-                    enabled = !submitting,
-                    singleLine = true,
-                    label = { Text(stringResource(R.string.registration_confirm_label)) },
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                if (confirm.isNotEmpty() && password != confirm) {
-                    Text(
-                        stringResource(R.string.registration_password_mismatch),
-                        color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-                submissionError?.let { message ->
-                    Text(
-                        message,
-                        color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = {
-                    if (!valid || submitting) return@Button
-                    submitting = true
-                    submissionError = null
-                    val nextPassword = password.toCharArray()
-                    val nextConfirm = confirm.toCharArray()
-                    password = ""
-                    confirm = ""
-                    onSubmit(
-                        username.trim(),
-                        email.trim(),
-                        firstName.trim(),
-                        lastName.trim(),
-                        nextPassword,
-                        nextConfirm,
-                    ) { error ->
-                        submitting = false
-                        submissionError = error
-                    }
-                },
-                enabled = valid && !submitting,
-                modifier = Modifier.heightIn(min = 48.dp),
-            ) {
-                Text(if (submitting) stringResource(R.string.registration_working) else stringResource(R.string.registration_action))
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss, enabled = !submitting, modifier = Modifier.heightIn(min = 48.dp)) {
-                Text(stringResource(R.string.action_cancel))
-            }
-        },
-    )
 }
 
 @Composable

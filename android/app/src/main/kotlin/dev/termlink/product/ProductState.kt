@@ -251,7 +251,7 @@ internal fun sameAccountDeviceAction(trustState: dev.termlink.model.DeviceTrustS
 enum class ProductAuthenticationState {
     SIGNED_OUT,
     NATIVE_CREDENTIALS,
-    BROWSER_SETUP_REQUIRED,
+    EMBEDDED_SETUP_REQUIRED,
     AUTHENTICATED,
 }
 
@@ -740,22 +740,6 @@ data class ProductSnapshot(
     val lastSyncedAt: Instant? = null,
 )
 
-internal sealed interface AccountRegistrationResult {
-    data object Success : AccountRegistrationResult
-    data class Failure(val error: Throwable) : AccountRegistrationResult
-}
-
-/** Keeps registration success/failure semantics independent from Compose dialog lifetime. */
-internal suspend fun submitAccountRegistration(operation: suspend () -> Unit): AccountRegistrationResult =
-    try {
-        operation()
-        AccountRegistrationResult.Success
-    } catch (error: kotlinx.coroutines.CancellationException) {
-        throw error
-    } catch (error: Throwable) {
-        AccountRegistrationResult.Failure(error)
-    }
-
 /** Prepends a local event while retaining a bounded device-local activity window. */
 fun ProductSnapshot.withLocalActivity(entry: ActivityEntry): ProductSnapshot = copy(
     activity = (listOf(entry.copy(source = ActivitySource.DEVICE_LOCAL)) + activity)
@@ -804,33 +788,15 @@ interface ProductRepository : Closeable {
     suspend fun signIn(username: String, password: CharArray): Unit = signIn()
     /** Legacy no-argument entry point retained for settings/fakes; it never opens a browser. */
     suspend fun signIn(): Unit = error("Enter a username and password to sign in")
-    /** Creates an account through the server's direct registration boundary. */
-    suspend fun register(
-        username: String,
-        email: String,
-        firstName: String,
-        lastName: String,
-        password: CharArray,
-        confirm: CharArray,
-    ): Unit = try {
-        error("Direct account registration is unavailable")
-    } finally {
-        password.fill('\u0000')
-        confirm.fill('\u0000')
-    }
     /** Checks the public AppShip update decision without an account token. */
     suspend fun checkForUpdate(force: Boolean = true): ProductUpdateStatus = ProductUpdateStatus()
     /** Downloads and verifies the APK selected by [checkForUpdate]. */
     suspend fun downloadUpdate() = Unit
     /** Hides the current update prompt without discarding its verified download state. */
     fun dismissUpdate() = Unit
-    /**
-     * Direct registration is intentionally not part of this contract yet:
-     * the current service exposes registration only through its browser/PKCE
-     * flow.  The product shell displays a TODO instead of launching that flow.
-     */
-    suspend fun beginBrowserRegistration()
-    suspend fun beginBrowserAccountSetup()
+    /** Opens the policy-driven hosted registration page inside the app-owned OIDC surface. */
+    suspend fun beginEmbeddedRegistration()
+    suspend fun beginEmbeddedAccountSetup()
     suspend fun confirmEnrollment()
     suspend fun cancelEnrollment()
     suspend fun configureServer(url: String)
@@ -908,25 +874,12 @@ class UnavailableProductRepository : ProductRepository {
 
     override suspend fun refresh() = unavailable()
     override suspend fun signIn(username: String, password: CharArray) = unavailable()
-    override suspend fun register(
-        username: String,
-        email: String,
-        firstName: String,
-        lastName: String,
-        password: CharArray,
-        confirm: CharArray,
-    ) = try {
-        unavailable()
-    } finally {
-        password.fill('\u0000')
-        confirm.fill('\u0000')
-    }
     override suspend fun checkForUpdate(force: Boolean): ProductUpdateStatus = ProductUpdateStatus(
         decision = ProductUpdateDecision.NOT_CONFIGURED,
         message = "Update service is not configured",
     )
-    override suspend fun beginBrowserRegistration() = unavailable()
-    override suspend fun beginBrowserAccountSetup() = unavailable()
+    override suspend fun beginEmbeddedRegistration() = unavailable()
+    override suspend fun beginEmbeddedAccountSetup() = unavailable()
     override suspend fun confirmEnrollment() = unavailable()
     override suspend fun cancelEnrollment() = unavailable()
     override suspend fun configureServer(url: String) = unavailable()

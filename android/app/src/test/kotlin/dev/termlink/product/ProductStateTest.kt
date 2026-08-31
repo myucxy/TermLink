@@ -137,39 +137,6 @@ class ProductStateTest {
     }
 
     @Test
-    fun registrationResultClosesOnlyAfterSuccess() = runBlocking {
-        var successfulCalls = 0
-        val success = submitAccountRegistration { successfulCalls += 1 }
-        val failure = submitAccountRegistration { error("registration rejected") }
-
-        assertEquals(1, successfulCalls)
-        assertTrue(success is AccountRegistrationResult.Success)
-        assertTrue(failure is AccountRegistrationResult.Failure)
-        assertEquals("registration rejected", (failure as AccountRegistrationResult.Failure).error.message)
-    }
-
-    @Test
-    fun unavailableRegistrationClearsItsPasswordArguments() = runBlocking {
-        val password = "password123".toCharArray()
-        val confirm = "password123".toCharArray()
-
-        val failure = runCatching {
-            UnavailableProductRepository().register(
-                username = "alice",
-                email = "alice@example.test",
-                firstName = "Alice",
-                lastName = "Example",
-                password = password,
-                confirm = confirm,
-            )
-        }
-
-        assertTrue(failure.isFailure)
-        assertTrue(password.all { it == '\u0000' })
-        assertTrue(confirm.all { it == '\u0000' })
-    }
-
-    @Test
     fun themePreferenceDefaultsToSystemForUnknownStoredValue() {
         assertEquals(ProductThemePreference.SYSTEM, ProductThemePreference.fromWireValue(null))
         assertEquals(ProductThemePreference.SYSTEM, ProductThemePreference.fromWireValue("unexpected"))

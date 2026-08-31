@@ -153,7 +153,10 @@ android {
         targetSdk = 36
         versionCode = termLinkVersionCode
         versionName = termLinkVersionName
-        manifestPlaceholders["appAuthRedirectScheme"] = "dev.termlink"
+        // AppAuth declares an optional browser receiver in its library manifest.
+        // The app-owned embedded flow removes that component at merge time, but
+        // the library placeholder must still have a non-routable value.
+        manifestPlaceholders["appAuthRedirectScheme"] = "dev.termlink.disabled"
         buildConfigField("String", "TERMLINK_SERVER_URL", buildConfigString(publicTermLinkServerUrl))
         buildConfigField("boolean", "TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST", "false")
         buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", "true")

@@ -29,14 +29,13 @@ internal enum class NativeOidcFailure {
     NETWORK,
 }
 
-internal object BrowserAuthPolicy {
-    const val REGISTRATION_PROMPT = "create"
-    const val ACCOUNT_SETUP_PROMPT = "login"
+internal object EmbeddedAuthPolicy {
+    const val LOGIN_PROMPT = "login"
 }
 
 internal class NativeOidcException(
     val reason: NativeOidcFailure,
-    val browserFallbackAvailable: Boolean = reason == NativeOidcFailure.ACCOUNT_SETUP_REQUIRED,
+    val interactiveFallbackAvailable: Boolean = reason == NativeOidcFailure.ACCOUNT_SETUP_REQUIRED,
     cause: Throwable? = null,
 ) : Exception("OIDC authentication failed", cause)
 
@@ -101,7 +100,7 @@ internal object OidcJwtClaims {
 
     /**
      * Reads a non-sensitive display identifier from a JWT payload. This is
-     * only a UI fallback for browser-authenticated sessions; authorization
+     * only a UI fallback for interactive OIDC sessions; authorization
      * remains based on the validated subject above and never on this value.
      */
     fun displayIdentifier(token: String): String? {
@@ -133,7 +132,7 @@ internal object OidcJwtClaims {
     private const val SERVER_AUDIENCE = "termlink-server"
 }
 
-/** OIDC endpoint checks shared by native direct grant and AppAuth browser fallback. */
+/** OIDC endpoint checks shared by native direct grant and the embedded AppAuth fallback. */
 internal object OidcEndpointPolicy {
     fun canonicalIssuer(raw: String): String = try {
         val uri = URI(raw.trim())

@@ -68,8 +68,11 @@ class TailFirstImeStabilityTest {
         assertTrue(imeRequest.contains("showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)"))
 
         val manifest = Files.newBufferedReader(appRoot.resolve("src/main/AndroidManifest.xml")).use { it.readText() }
-        assertTrue(manifest.contains("android:windowSoftInputMode=\"adjustNothing\""))
-        assertFalse(manifest.contains("android:windowSoftInputMode=\"adjustResize\""))
+        val productActivity = manifest
+            .substringAfter("android:name=\"dev.termlink.product.ProductActivity\"")
+            .substringBefore("</activity>")
+        assertTrue(productActivity.contains("android:windowSoftInputMode=\"adjustNothing\""))
+        assertFalse(productActivity.contains("android:windowSoftInputMode=\"adjustResize\""))
     }
 
     @Test

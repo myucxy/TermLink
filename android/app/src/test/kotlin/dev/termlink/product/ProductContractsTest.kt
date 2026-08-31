@@ -296,67 +296,6 @@ class ProductContractsTest {
     }
 
     @Test
-    fun directRegistrationPayloadIncludesTheIdentityProfile() = runBlocking {
-        val password = "password123".toCharArray()
-        val confirm = "password123".toCharArray()
-
-        val payload = withClearedRegistrationSecrets(password, confirm) {
-            accountRegistrationRequestBody(
-                username = "  alice  ",
-                email = "  alice@example.test  ",
-                firstName = "  Alice  ",
-                lastName = "  Example  ",
-                password = password,
-                confirm = confirm,
-            )
-        }
-        val json = Json.parseToJsonElement(payload).jsonObject
-
-        assertEquals("alice", json.getValue("username").jsonPrimitive.content)
-        assertEquals("alice@example.test", json.getValue("email").jsonPrimitive.content)
-        assertEquals("Alice", json.getValue("first_name").jsonPrimitive.content)
-        assertEquals("Example", json.getValue("last_name").jsonPrimitive.content)
-        assertEquals("password123", json.getValue("password").jsonPrimitive.content)
-        assertEquals("password123", json.getValue("password_confirm").jsonPrimitive.content)
-        assertArrayEquals(CharArray(password.size), password)
-        assertArrayEquals(CharArray(confirm.size), confirm)
-    }
-
-    @Test
-    fun directRegistrationSecretsAreClearedAfterLocalValidationFailure() = runBlocking {
-        val password = "password123".toCharArray()
-        val confirm = "password123".toCharArray()
-
-        val failure = runCatching {
-            withClearedRegistrationSecrets(password, confirm) {
-                accountRegistrationRequestBody(
-                    username = "alice",
-                    email = "alice@example.test",
-                    firstName = "",
-                    lastName = "Example",
-                    password = password,
-                    confirm = confirm,
-                )
-            }
-        }
-
-        assertTrue(failure.exceptionOrNull() is IllegalArgumentException)
-        assertArrayEquals(CharArray(password.size), password)
-        assertArrayEquals(CharArray(confirm.size), confirm)
-
-        val remotePassword = "password456".toCharArray()
-        val remoteConfirm = "password456".toCharArray()
-        val remoteFailure = runCatching {
-            withClearedRegistrationSecrets(remotePassword, remoteConfirm) {
-                error("registration rejected")
-            }
-        }
-        assertEquals("registration rejected", remoteFailure.exceptionOrNull()?.message)
-        assertArrayEquals(CharArray(remotePassword.size), remotePassword)
-        assertArrayEquals(CharArray(remoteConfirm.size), remoteConfirm)
-    }
-
-    @Test
     fun commandSubmissionIsOneOrderedInputEndingInCarriageReturn() {
         assertEquals("ni TLFINAL123\r", commandInputBytes("ni TLFINAL123").decodeToString())
         assertEquals(null, commandSubmissionFailure(InputSubmission.Sent(UUID.randomUUID())))

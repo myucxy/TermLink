@@ -140,46 +140,6 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.concurrent.thread
 
-internal suspend fun <T> withClearedRegistrationSecrets(
-    password: CharArray,
-    confirm: CharArray,
-    operation: suspend () -> T,
-): T = try {
-    operation()
-} finally {
-    password.fill('\u0000')
-    confirm.fill('\u0000')
-}
-
-internal fun accountRegistrationRequestBody(
-    username: String,
-    email: String,
-    firstName: String,
-    lastName: String,
-    password: CharArray,
-    confirm: CharArray,
-): String {
-    val normalizedUsername = username.trim()
-    val normalizedEmail = email.trim()
-    val normalizedFirstName = firstName.trim()
-    val normalizedLastName = lastName.trim()
-    require(normalizedUsername.length in 3..128 && username.none { it == '\r' || it == '\n' }) { "Username is invalid" }
-    require(normalizedEmail.length in 3..320 && normalizedEmail.contains("@") && email.none { it == '\r' || it == '\n' }) {
-        "Email is invalid"
-    }
-    require(normalizedFirstName.length in 1..128 && firstName.none { it == '\r' || it == '\n' }) { "First name is invalid" }
-    require(normalizedLastName.length in 1..128 && lastName.none { it == '\r' || it == '\n' }) { "Last name is invalid" }
-    require(password.size in 8..1024 && password.contentEquals(confirm)) { "Password is invalid" }
-    return buildJsonObject {
-        put("username", normalizedUsername)
-        put("email", normalizedEmail)
-        put("first_name", normalizedFirstName)
-        put("last_name", normalizedLastName)
-        put("password", String(password))
-        put("password_confirm", String(confirm))
-    }.toString()
-}
-
 /** Thread-visible token handoff shared by every long-lived realtime client. */
 internal class RealtimeAccessTokenSource {
     private val current = AtomicReference<String?>(null)
@@ -550,7 +510,7 @@ internal class ProductionProductRepository(
     private val keyMetadataRefreshLock = Mutex()
     private val realtimeAccessToken = RealtimeAccessTokenSource()
     private val authenticationLifecycle = AuthenticationLifecycleFence()
-    private var pendingBrowserAuthenticationGeneration: Long? = null
+    private var pendingInteractiveAuthenticationGeneration: Long? = null
     private val tokenRefresh = TokenRefreshCoordinator(::requestFreshAccessToken)
     // The first production client is intentionally pinned to the public service.
     // Migrate older installs that may still have a locally edited endpoint.
@@ -718,9 +678,9 @@ internal class ProductionProductRepository(
             bootstrapAuthenticatedSession()
         } catch (error: NativeOidcException) {
             if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration)) publishFailure(error)
-            if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration) && error.browserFallbackAvailable) {
+            if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration) && error.interactiveFallbackAvailable) {
                 mutableSnapshot.value = mutableSnapshot.value.copy(
-                    authenticationState = ProductAuthenticationState.BROWSER_SETUP_REQUIRED,
+                    authenticationState = ProductAuthenticationState.EMBEDDED_SETUP_REQUIRED,
                     connectionState = ProductConnectionState.ERROR,
                     connectionError = null,
                 )
@@ -731,36 +691,6 @@ internal class ProductionProductRepository(
             throw error
         } finally {
             password.fill('\u0000')
-        }
-    }
-
-    override suspend fun register(
-        username: String,
-        email: String,
-        firstName: String,
-        lastName: String,
-        password: CharArray,
-        confirm: CharArray,
-    ) = withClearedRegistrationSecrets(password, confirm) {
-        check(!closed) { "Repository is closed" }
-        val body = accountRegistrationRequestBody(
-            username = username,
-            email = email,
-            firstName = firstName,
-            lastName = lastName,
-            password = password,
-            confirm = confirm,
-        )
-        val root = PRODUCT_PUBLIC_SERVER_URL
-        val request = Request.Builder()
-            .url("$root/v1/auth/register")
-            .post(body.toRequestBody("application/json; charset=utf-8".toMediaType()))
-            .header("Cache-Control", "no-store")
-            .build()
-        withContext(Dispatchers.IO) {
-            nativeAuthHttp.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) throw IllegalStateException("Account registration was rejected")
-            }
         }
     }
 
@@ -920,40 +850,41 @@ internal class ProductionProductRepository(
         }
     }
 
-    override suspend fun beginBrowserRegistration() = beginBrowserAuth(BrowserAuthFlow.REGISTRATION)
+    override suspend fun beginEmbeddedRegistration() = beginEmbeddedAuth(EmbeddedAuthFlow.REGISTRATION)
 
-    override suspend fun beginBrowserAccountSetup() = beginBrowserAuth(BrowserAuthFlow.ACCOUNT_SETUP)
+    override suspend fun beginEmbeddedAccountSetup() = beginEmbeddedAuth(EmbeddedAuthFlow.ACCOUNT_SETUP)
 
-    private suspend fun beginBrowserAuth(flow: BrowserAuthFlow) {
+    private suspend fun beginEmbeddedAuth(flow: EmbeddedAuthFlow) {
         check(!closed) { "Repository is closed" }
         val authenticationGeneration = authenticationLifecycle.invalidate()
         try {
             val configuration = loadOidcConfiguration()
             requireCurrentAuthentication(authenticationGeneration)
-            mutableSnapshot.value = mutableSnapshot.value.copy(authenticationState = ProductAuthenticationState.BROWSER_SETUP_REQUIRED)
+            mutableSnapshot.value = mutableSnapshot.value.copy(authenticationState = ProductAuthenticationState.EMBEDDED_SETUP_REQUIRED)
             authState = AuthState(configuration.serviceConfiguration)
-            pendingBrowserAuthenticationGeneration = authenticationGeneration
+            pendingInteractiveAuthenticationGeneration = authenticationGeneration
             val requestBuilder = AuthorizationRequest.Builder(
                 configuration.serviceConfiguration,
                 configuration.clientId,
                 ResponseTypeValues.CODE,
                 configuration.redirectUri,
             ).setScope("openid profile offline_access")
-            if (flow == BrowserAuthFlow.REGISTRATION) {
-                // OIDC prompt=create is the interoperable Keycloak
-                // registration surface; credentials stay in the browser.
-                requestBuilder.setPrompt(BrowserAuthPolicy.REGISTRATION_PROMPT)
-            } else {
-                // A normal forced browser login lets Keycloak execute whichever
-                // Required Actions are actually pending (temporary password,
-                // MFA, passkey, profile, or email) instead of guessing one.
-                requestBuilder.setPrompt(BrowserAuthPolicy.ACCOUNT_SETUP_PROMPT)
-            }
+            // The hosted registration page owns policy-driven account creation.
+            // Keycloak is entered only for login/required actions afterwards.
+            requestBuilder.setPrompt(EmbeddedAuthPolicy.LOGIN_PROMPT)
             val request = requestBuilder.build()
-            launchAuthorization(authService.getAuthorizationRequestIntent(request))
+            val registrationFlow = flow == EmbeddedAuthFlow.REGISTRATION
+            val initialUri = if (registrationFlow) {
+                EmbeddedOidcContract.registrationUri(PRODUCT_PUBLIC_SERVER_URL)
+            } else {
+                request.toUri()
+            }
+            launchAuthorization(
+                EmbeddedOidcContract.createIntent(activity, request, initialUri, registrationFlow),
+            )
         } catch (error: Throwable) {
-            if (pendingBrowserAuthenticationGeneration == authenticationGeneration) {
-                pendingBrowserAuthenticationGeneration = null
+            if (pendingInteractiveAuthenticationGeneration == authenticationGeneration) {
+                pendingInteractiveAuthenticationGeneration = null
             }
             if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration)) publishFailure(error)
             throw error
@@ -961,8 +892,8 @@ internal class ProductionProductRepository(
     }
 
     fun handleAuthorizationResult(data: Intent?) {
-        val authenticationGeneration = pendingBrowserAuthenticationGeneration ?: return
-        pendingBrowserAuthenticationGeneration = null
+        val authenticationGeneration = pendingInteractiveAuthenticationGeneration ?: return
+        pendingInteractiveAuthenticationGeneration = null
         if (data == null) {
             if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration) && authState != null) {
                 publishFailure(IllegalStateException("OIDC sign-in was canceled"))
@@ -2603,7 +2534,7 @@ internal class ProductionProductRepository(
         // Persisted AuthState intentionally omits AuthorizationResponse and all
         // original token-request credentials.  AppAuth's refresh helper relies
         // on that discarded request metadata, so every flow (native login and
-        // browser PKCE fallback) refreshes through the same bounded, no-cookie
+        // embedded PKCE fallback) refreshes through the same bounded, no-cookie
         // token transport instead.
         scope.launch {
             try {
@@ -3626,7 +3557,7 @@ internal class ProductionProductRepository(
         }
     }
 
-    private enum class BrowserAuthFlow { REGISTRATION, ACCOUNT_SETUP }
+    private enum class EmbeddedAuthFlow { REGISTRATION, ACCOUNT_SETUP }
 
     private data class ClientConfiguration(val issuer: Uri, val clientId: String, val redirectUri: Uri)
 
