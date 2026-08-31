@@ -535,7 +535,7 @@ try {
         throw 'OUTPUT metadata upsert cadence is missing or too stale.'
     }
 
-    $withoutConfig = $tryCreate.Invoke($null, [object[]]@())
+    $withoutConfig = $tryCreate.Invoke($null, [object[]]@($null))
     if ($null -ne $withoutConfig) {
         throw 'Production runtime was enabled without production configuration or credentials.'
     }
@@ -545,7 +545,7 @@ try {
         ConvertTo-Json | Set-Content -LiteralPath $configPath -Encoding utf8
     $invalidRejected = $false
     try {
-        $tryCreate.Invoke($null, [object[]]@()) | Out-Null
+        $tryCreate.Invoke($null, [object[]]@($null)) | Out-Null
     }
     catch {
         $invalidRejected = $true

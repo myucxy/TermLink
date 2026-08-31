@@ -476,12 +476,36 @@ namespace TermLink.Agent
             value.Length <= maximum ? value : value.Substring(0, maximum);
     }
 
+    internal sealed class FileOperationWorkerDiagnostic
+    {
+        internal FileOperationWorkerDiagnostic(
+            string code,
+            string messageZh,
+            string messageEn,
+            Exception error,
+            int restartCount)
+        {
+            Code = code ?? throw new ArgumentNullException(nameof(code));
+            MessageZh = messageZh ?? throw new ArgumentNullException(nameof(messageZh));
+            MessageEn = messageEn ?? throw new ArgumentNullException(nameof(messageEn));
+            Error = error;
+            RestartCount = restartCount;
+        }
+
+        internal string Code { get; }
+        internal string MessageZh { get; }
+        internal string MessageEn { get; }
+        internal Exception Error { get; }
+        internal int RestartCount { get; }
+    }
+
     internal sealed class ProductionFileOperationWorker : IDisposable
     {
         private static readonly TimeSpan IdlePollInterval = TimeSpan.FromMilliseconds(750);
         private static readonly TimeSpan RemoteAccessPollInterval = TimeSpan.FromMilliseconds(100);
         private static readonly TimeSpan DefaultLeaseRenewInterval = TimeSpan.FromSeconds(5);
         private static readonly TimeSpan DefaultRegistrationWait = TimeSpan.FromSeconds(32);
+        private static readonly TimeSpan DefaultSupervisorRestartDelay = TimeSpan.FromSeconds(1);
         private static readonly TimeSpan FallbackLeaseDuration = TimeSpan.FromHours(1);
         private readonly IFileOperationApi api;
         private readonly DirectoryListingService listings;
@@ -490,11 +514,16 @@ namespace TermLink.Agent
         private readonly Func<bool> remoteAccessEnabled;
         private readonly Func<Guid, bool> sessionVisible;
         private readonly Func<Guid, bool> terminateSession;
+        private readonly Action<FileOperationWorkerDiagnostic> diagnostic;
         private readonly TimeSpan leaseRenewInterval;
         private readonly TimeSpan registrationWait;
+        private readonly TimeSpan supervisorRestartDelay;
         private readonly CancellationTokenSource cancellation;
         private readonly object lifecycleSync = new object();
         private Task worker;
+        private int recoveryPending;
+        private int restartCount;
+        private long nextSupervisorRestartDelayTicks;
         private int disposed;
 
         internal ProductionFileOperationWorker(
@@ -507,7 +536,9 @@ namespace TermLink.Agent
             Func<Guid, bool> sessionVisible = null,
             Func<Guid, bool> terminateSession = null,
             TimeSpan? leaseRenewInterval = null,
-            TimeSpan? registrationWait = null)
+            TimeSpan? registrationWait = null,
+            TimeSpan? supervisorRestartDelay = null,
+            Action<FileOperationWorkerDiagnostic> diagnostic = null)
         {
             this.api = api ?? throw new ArgumentNullException(nameof(api));
             this.listings = listings ?? throw new ArgumentNullException(nameof(listings));
@@ -518,11 +549,27 @@ namespace TermLink.Agent
             this.terminateSession = terminateSession ?? (_ => false);
             this.leaseRenewInterval = leaseRenewInterval ?? DefaultLeaseRenewInterval;
             this.registrationWait = registrationWait ?? DefaultRegistrationWait;
+            this.supervisorRestartDelay = supervisorRestartDelay ?? DefaultSupervisorRestartDelay;
+            this.diagnostic = diagnostic;
             if (this.leaseRenewInterval <= TimeSpan.Zero)
                 throw new ArgumentOutOfRangeException(nameof(leaseRenewInterval));
             if (this.registrationWait <= TimeSpan.Zero)
                 throw new ArgumentOutOfRangeException(nameof(registrationWait));
+            if (this.supervisorRestartDelay <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(supervisorRestartDelay));
+            nextSupervisorRestartDelayTicks = this.supervisorRestartDelay.Ticks;
             cancellation = CancellationTokenSource.CreateLinkedTokenSource(parentToken);
+        }
+
+        internal int RestartCount => Volatile.Read(ref restartCount);
+
+        internal bool IsRunning
+        {
+            get
+            {
+                lock (lifecycleSync)
+                    return worker != null && !worker.IsCompleted && Volatile.Read(ref disposed) == 0;
+            }
         }
 
         internal void Start()
@@ -532,7 +579,41 @@ namespace TermLink.Agent
                 if (Volatile.Read(ref disposed) != 0)
                     throw new ObjectDisposedException(nameof(ProductionFileOperationWorker));
                 if (worker != null) throw new InvalidOperationException("File-operation worker is already started.");
-                worker = Task.Run(() => RunAsync(cancellation.Token));
+                worker = Task.Run(() => SuperviseAsync(cancellation.Token));
+            }
+        }
+
+        private async Task SuperviseAsync(CancellationToken token)
+        {
+            while (true)
+            {
+                try
+                {
+                    await RunAsync(token).ConfigureAwait(false);
+                    return;
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception error)
+                {
+                    var currentRestart = Interlocked.Increment(ref restartCount);
+                    if (Interlocked.CompareExchange(ref recoveryPending, 1, 0) == 0)
+                    {
+                        ReportDiagnostic(
+                            "FILE_OPERATION_WORKER_RESTARTING",
+                            "目录与文件任务线程发生异常，正在独立恢复，不会重启整个 Agent。",
+                            "The directory and file-operation worker failed and is recovering independently without restarting the Agent.",
+                            error,
+                            currentRestart);
+                    }
+                    var delay = TimeSpan.FromTicks(Interlocked.Read(ref nextSupervisorRestartDelayTicks));
+                    await Task.Delay(delay, token).ConfigureAwait(false);
+                    Interlocked.Exchange(
+                        ref nextSupervisorRestartDelayTicks,
+                        NextRetryDelay(delay).Ticks);
+                }
             }
         }
 
@@ -551,6 +632,7 @@ namespace TermLink.Agent
                         continue;
                     }
                     var operation = await api.ClaimAsync(token).ConfigureAwait(false);
+                    MarkRecovered();
                     if (operation == null)
                     {
                         retryDelay = TimeSpan.FromSeconds(1);
@@ -564,26 +646,114 @@ namespace TermLink.Agent
                 {
                     return;
                 }
-                catch (FileOperationRemoteException)
+                catch (OperationCanceledException error)
                 {
+                    MarkDegraded(
+                        "FILE_OPERATION_REQUEST_TIMEOUT",
+                        "目录与文件任务请求超时，Worker 将继续重试。",
+                        "The directory and file-operation request timed out; the worker will keep retrying.",
+                        error);
                     await Task.Delay(retryDelay, token).ConfigureAwait(false);
-                    retryDelay = TimeSpan.FromSeconds(Math.Min(15, retryDelay.TotalSeconds * 2));
+                    retryDelay = NextRetryDelay(retryDelay);
                 }
-                catch (HttpRequestException)
+                catch (TimeoutException error)
                 {
+                    MarkDegraded(
+                        "FILE_OPERATION_REQUEST_TIMEOUT",
+                        "目录与文件任务请求超时，Worker 将继续重试。",
+                        "The directory and file-operation request timed out; the worker will keep retrying.",
+                        error);
                     await Task.Delay(retryDelay, token).ConfigureAwait(false);
-                    retryDelay = TimeSpan.FromSeconds(Math.Min(15, retryDelay.TotalSeconds * 2));
+                    retryDelay = NextRetryDelay(retryDelay);
                 }
-                catch (ProductionReauthenticationRequiredException)
+                catch (FileOperationRemoteException error)
                 {
+                    MarkDegraded(
+                        "FILE_OPERATION_REMOTE_UNAVAILABLE",
+                        "目录与文件服务暂时不可用，Worker 将继续重试。",
+                        "The directory and file-operation service is temporarily unavailable; the worker will keep retrying.",
+                        error);
                     await Task.Delay(retryDelay, token).ConfigureAwait(false);
-                    retryDelay = TimeSpan.FromSeconds(Math.Min(15, retryDelay.TotalSeconds * 2));
+                    retryDelay = NextRetryDelay(retryDelay);
                 }
-                catch (JsonException)
+                catch (HttpRequestException error)
                 {
+                    MarkDegraded(
+                        "FILE_OPERATION_REMOTE_UNAVAILABLE",
+                        "目录与文件服务暂时不可用，Worker 将继续重试。",
+                        "The directory and file-operation service is temporarily unavailable; the worker will keep retrying.",
+                        error);
                     await Task.Delay(retryDelay, token).ConfigureAwait(false);
-                    retryDelay = TimeSpan.FromSeconds(Math.Min(15, retryDelay.TotalSeconds * 2));
+                    retryDelay = NextRetryDelay(retryDelay);
                 }
+                catch (ProductionReauthenticationRequiredException error)
+                {
+                    MarkDegraded(
+                        "FILE_OPERATION_ACCOUNT_REAUTH_REQUIRED",
+                        "账户授权需要刷新，目录与文件 Worker 将等待重新登录。",
+                        "Account authorization must be renewed; the directory and file-operation worker will wait for sign-in.",
+                        error);
+                    await Task.Delay(retryDelay, token).ConfigureAwait(false);
+                    retryDelay = NextRetryDelay(retryDelay);
+                }
+                catch (JsonException error)
+                {
+                    MarkDegraded(
+                        "FILE_OPERATION_RESPONSE_INVALID",
+                        "目录与文件服务返回了无效响应，Worker 将继续重试。",
+                        "The directory and file-operation service returned an invalid response; the worker will keep retrying.",
+                        error);
+                    await Task.Delay(retryDelay, token).ConfigureAwait(false);
+                    retryDelay = NextRetryDelay(retryDelay);
+                }
+            }
+        }
+
+        private static TimeSpan NextRetryDelay(TimeSpan current) =>
+            TimeSpan.FromSeconds(Math.Min(15, current.TotalSeconds * 2));
+
+        private void MarkDegraded(
+            string code,
+            string messageZh,
+            string messageEn,
+            Exception error)
+        {
+            if (Interlocked.CompareExchange(ref recoveryPending, 1, 0) != 0) return;
+            ReportDiagnostic(code, messageZh, messageEn, error, Volatile.Read(ref restartCount));
+        }
+
+        private void MarkRecovered()
+        {
+            if (Interlocked.Exchange(ref recoveryPending, 0) == 0) return;
+            Interlocked.Exchange(ref nextSupervisorRestartDelayTicks, supervisorRestartDelay.Ticks);
+            ReportDiagnostic(
+                "FILE_OPERATION_WORKER_RECOVERED",
+                "目录与文件任务 Worker 已恢复。",
+                "The directory and file-operation worker has recovered.",
+                null,
+                Volatile.Read(ref restartCount));
+        }
+
+        private void ReportDiagnostic(
+            string code,
+            string messageZh,
+            string messageEn,
+            Exception error,
+            int currentRestartCount)
+        {
+            if (diagnostic == null) return;
+            try
+            {
+                diagnostic(new FileOperationWorkerDiagnostic(
+                    code,
+                    messageZh,
+                    messageEn,
+                    error,
+                    currentRestartCount));
+            }
+            catch
+            {
+                // Diagnostics must never become part of file-operation authority.
             }
         }
 

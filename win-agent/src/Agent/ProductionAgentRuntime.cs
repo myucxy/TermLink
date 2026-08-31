@@ -396,7 +396,8 @@ namespace TermLink.Agent
                     cancellation.Token,
                     () => registry.RemoteAccessEnabled,
                     sessionId => registry.ContainsSession(sessionId),
-                    sessionId => registry.TerminateSession(sessionId));
+                    sessionId => registry.TerminateSession(sessionId),
+                    diagnostic: ObserveFileOperationWorkerDiagnostic);
                 fileOperationWorker.Start();
                 agentUpdateWorker = new ProductionAgentUpdateWorker(
                     new ProductionAgentUpdateApi(config.PcId, SendAsync),
@@ -2165,6 +2166,42 @@ namespace TermLink.Agent
             catch
             {
                 // A diagnostic path must never become part of terminal or history authority.
+            }
+        }
+
+        private static void ObserveFileOperationWorkerDiagnostic(
+            FileOperationWorkerDiagnostic diagnostic)
+        {
+            if (diagnostic == null) return;
+            try
+            {
+                var root = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "TermLink",
+                    "logs");
+                Directory.CreateDirectory(root);
+                var error = diagnostic.Error;
+                var line = JsonSerializer.Serialize(new
+                {
+                    timestamp_utc = DateTime.UtcNow.ToString("O"),
+                    component = "windows-file-operation-worker",
+                    event_code = diagnostic.Code,
+                    message_zh = diagnostic.MessageZh,
+                    message_en = diagnostic.MessageEn,
+                    failure_type = error?.GetType().FullName,
+                    failure_site = error?.TargetSite == null
+                        ? null
+                        : (error.TargetSite.DeclaringType?.FullName ?? "unknown") + "." + error.TargetSite.Name,
+                    restart_count = diagnostic.RestartCount
+                });
+                File.AppendAllText(
+                    Path.Combine(root, "TermLink-file-operations.jsonl"),
+                    line + Environment.NewLine,
+                    new UTF8Encoding(false));
+            }
+            catch
+            {
+                // Bounded local diagnostics must never affect task delivery.
             }
         }
 

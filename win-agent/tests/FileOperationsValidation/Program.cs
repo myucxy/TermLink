@@ -18,6 +18,7 @@ try
 {
     await ValidatePathsAndListingsAsync(testRoot);
     await ValidateArchiveAndHashAsync(testRoot);
+    await ValidateWorkerFaultRecoveryAsync(testRoot);
     await ValidateStreamingWorkerAndCancellationAsync(testRoot);
     await ValidateLeaseCancellationAndRemoteAccessAsync(testRoot);
     await ValidateTerminalRegistrationTimeoutAsync(testRoot);
@@ -34,6 +35,47 @@ finally
     try { Directory.Delete(testRoot, true); }
     catch (IOException) { }
     catch (UnauthorizedAccessException) { }
+}
+
+static async Task ValidateWorkerFaultRecoveryAsync(string testRoot)
+{
+    var stub = Path.Combine(testRoot, "recovery-stub.exe");
+    File.WriteAllBytes(stub, new byte[] { 0x4d, 0x5a });
+
+    async Task<IReadOnlyList<FileOperationWorkerDiagnostic>> RunScenarioAsync(Exception firstFailure)
+    {
+        var api = new RecoveringClaimApi(firstFailure, testRoot);
+        var diagnostics = new List<FileOperationWorkerDiagnostic>();
+        var sync = new object();
+        using var worker = new ProductionFileOperationWorker(
+            api,
+            new DirectoryListingService(),
+            new FileTransferPreparer(new WindowsPathService(), Path.Combine(testRoot, "recovery-artifacts-" + Guid.NewGuid().ToString("N"))),
+            new ManagedTerminalLauncher(new WindowsPathService(), new RecordingProcessStarter(), () => null, stub, stub, stub),
+            CancellationToken.None,
+            supervisorRestartDelay: TimeSpan.FromMilliseconds(25),
+            diagnostic: value => { lock (sync) diagnostics.Add(value); });
+        worker.Start();
+        await api.Completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await api.ClaimWaiting.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Require(worker.IsRunning, "file-operation worker stopped after recovering from a claim failure");
+        worker.Dispose();
+        lock (sync) return diagnostics.ToArray();
+    }
+
+    var timeoutDiagnostics = await RunScenarioAsync(new TaskCanceledException("simulated HTTP timeout"));
+    Require(timeoutDiagnostics.Any(value => value.Code == "FILE_OPERATION_REQUEST_TIMEOUT") &&
+        timeoutDiagnostics.Any(value => value.Code == "FILE_OPERATION_WORKER_RECOVERED") &&
+        timeoutDiagnostics.All(value => !string.IsNullOrWhiteSpace(value.MessageZh) &&
+            !string.IsNullOrWhiteSpace(value.MessageEn)),
+        "HTTP timeout recovery did not emit bounded bilingual degraded/recovered diagnostics");
+
+    var unexpectedDiagnostics = await RunScenarioAsync(new InvalidOperationException("simulated unexpected worker failure"));
+    Require(unexpectedDiagnostics.Any(value => value.Code == "FILE_OPERATION_WORKER_RESTARTING" &&
+            value.RestartCount == 1 && value.Error is InvalidOperationException) &&
+        unexpectedDiagnostics.Any(value => value.Code == "FILE_OPERATION_WORKER_RECOVERED" &&
+            value.RestartCount == 1),
+        "unexpected worker failure was not independently supervised and recovered");
 }
 
 static Task ValidatePathsAndListingsAsync(string testRoot)
@@ -1111,6 +1153,67 @@ sealed class ControlledOperationApi : IFileOperationApi
         TerminalOutcome.TrySetResult(true);
         return Task.CompletedTask;
     }
+}
+
+sealed class RecoveringClaimApi : IFileOperationApi
+{
+    private Exception firstFailure;
+    private ClaimedFileOperation operation;
+
+    internal RecoveringClaimApi(Exception firstFailure, string path)
+    {
+        this.firstFailure = firstFailure;
+        operation = new ClaimedFileOperation
+        {
+            Id = Guid.NewGuid(),
+            Operation = "LIST",
+            Path = path,
+            LeaseToken = "recovery-lease",
+            LeaseExpiresAt = DateTimeOffset.UtcNow.AddHours(1)
+        };
+    }
+
+    internal TaskCompletionSource<bool> Completed { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    internal TaskCompletionSource<bool> ClaimWaiting { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public async Task<ClaimedFileOperation> ClaimAsync(CancellationToken token)
+    {
+        var failure = Interlocked.Exchange(ref firstFailure, null);
+        if (failure != null) throw failure;
+        var claimed = Interlocked.Exchange(ref operation, null);
+        if (claimed != null) return claimed;
+        ClaimWaiting.TrySetResult(true);
+        await Task.Delay(Timeout.InfiniteTimeSpan, token);
+        return null;
+    }
+
+    public Task<FileOperationUploadTarget> CreateUploadAsync(
+        ClaimedFileOperation operation,
+        FileTransferArtifact artifact,
+        CancellationToken token) => throw new NotSupportedException();
+
+    public Task UploadAsync(
+        FileOperationUploadTarget target,
+        Stream content,
+        long sizeBytes,
+        CancellationToken token) => throw new NotSupportedException();
+
+    public Task<DateTimeOffset?> RenewAsync(ClaimedFileOperation operation, CancellationToken token) =>
+        Task.FromResult<DateTimeOffset?>(DateTimeOffset.UtcNow.AddHours(1));
+
+    public Task CompleteAsync(ClaimedFileOperation operation, JsonElement? result, CancellationToken token)
+    {
+        Completed.TrySetResult(true);
+        return Task.CompletedTask;
+    }
+
+    public Task FailAsync(
+        ClaimedFileOperation operation,
+        string errorCode,
+        string errorMessage,
+        CancellationToken token) => throw new InvalidOperationException(errorCode + ": " + errorMessage);
 }
 
 sealed class RecordingApi : IFileOperationApi

@@ -117,6 +117,7 @@ stateDiagram-v2
 - 任务有效期：创建后 24 小时。
 - claim 租约：1 小时，且 `lease_expires_at` 永不超过任务 `expires_at`。Windows 处理任务时默认每 5 秒续租。
 - Agent 空闲 claim 间隔和 Android 状态轮询间隔：均为 750 ms；瞬态连接错误采用最高 15 秒的退避。
+- Windows 的目录与文件 Worker 独立于 Agent 心跳和实时会话运行。HTTP 超时不会结束 Worker；未分类异常由内部监督循环按最高 15 秒退避重新启动该 Worker，不重启 Agent，也不停止现有本地会话。每个故障周期只记录一次中英双语降级事件，恢复后记录一次恢复事件，诊断位于 `%LOCALAPPDATA%\TermLink\logs\TermLink-file-operations.jsonl`。
 - 只有持有当前 32 字节 Base64URL 租约的 Windows Agent 能上传元数据、续租或完成。
 - 多 Agent poller 通过 PostgreSQL `FOR UPDATE SKIP LOCKED` 原子领取；租约丢失后当前 ZIP/上传/启动工作会被取消，任务可按服务端状态决定是否重领。
 - 所有修改状态的 API 请求携带 `Idempotency-Key`。Android 对一次 create 尝试保持同一 key；Windows 对结果不明确的 claim 重试复用 key，upload/renew/complete 的 key 绑定 operation、动作和租约摘要。任务 UUID 是后续轮询、取消和结果去重的唯一标识。
@@ -400,7 +401,7 @@ PostgreSQL 保存任务和 outbox，Valkey 支撑当前认证/实时协调，OID
 ### 已验证的自动化覆盖
 
 - Server：Go 全量测试与 `go vet` 已通过；文件操作 API、角色边界、零字节、5 GiB 边界、SHA-256 元数据、严格 Shell 结果、幂等完成、租约轮换、取消/到期、延迟对象删除，以及真实 PostgreSQL Migration 17/18 与任务集成均有测试覆盖。
-- Windows：Release `FileOperationsValidation` 和完整 `Build-Windows.ps1` 已通过；覆盖目录排序/分页/UTF-8 字节预算、ZIP 空目录、reparse point、临时文件清理、流式上传、取消、续租丢失、remote access 关闭、Shell allowlist、cwd/session 参数和 SessionHost 注册超时。
+- Windows：Release `FileOperationsValidation` 和完整 `Build-Windows.ps1` 已通过；覆盖目录排序/分页/UTF-8 字节预算、ZIP 空目录、reparse point、临时文件清理、流式上传、取消、续租丢失、remote access 关闭、HTTP 超时继续领取、未分类异常独立恢复、中英双语诊断、Shell allowlist、cwd/session 参数和 SessionHost 注册超时。
 - Android：`:app:testDebugUnitTest`、`assembleDebug` 和 `lintDebug` 已通过；覆盖文件协议解析、5 GiB 边界、零字节/截断/SHA 错误、浏览竞态和分页去重、SAF 清理、下载元数据恢复、进程重启转失败、重试前状态以及“删记录不删文件”。
 - Docker/入口：生产配置检查覆盖独立 file-transfer matcher 和 5 GiB request-body 限制；Compose 配置可以分别生成自托管对象存储与外部 OIDC/S3 拓扑。
 
