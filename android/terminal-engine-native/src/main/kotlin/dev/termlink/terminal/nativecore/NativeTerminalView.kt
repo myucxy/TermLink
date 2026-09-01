@@ -20,6 +20,7 @@ import android.view.Menu
 import android.view.MenuItem
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
@@ -44,6 +45,7 @@ import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.math.sign
@@ -95,6 +97,11 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private var selectionAnchor: CellPoint? = null
     private var selectionExtent: CellPoint? = null
     private var selectionActionMode: ActionMode? = null
+    private var selectionDragActive = false
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
+    private var touchDownX = 0f
+    private var touchDownY = 0f
+    private var selectionLongPressEligible = false
     private var detached = false
     private var baseTypeface: Typeface = Typeface.MONOSPACE
     private var boldTypeface: Typeface = Typeface.DEFAULT_BOLD
@@ -116,6 +123,12 @@ internal class NativeTerminalView @JvmOverloads constructor(
         override fun onDown(event: MotionEvent): Boolean {
             scroller.forceFinished(true)
             scrollAxis = ScrollAxis.UNDECIDED
+            // Selection may only be extended by the same pointer gesture that
+            // activated it. A later swipe remains terminal navigation.
+            selectionDragActive = false
+            touchDownX = event.x
+            touchDownY = event.y
+            selectionLongPressEligible = true
             historyDragPixels = 0f
             cancelQueuedHistoryRequests()
             engine?.let { historyNavigationGeneration = it.beginHistoryNavigation() }
@@ -123,6 +136,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
         }
 
         override fun onSingleTapUp(event: MotionEvent): Boolean {
+            if (dismissSelection()) return true
             performClick()
             return true
         }
@@ -135,8 +149,12 @@ internal class NativeTerminalView @JvmOverloads constructor(
         ): Boolean {
             val owner = engine ?: return false
             if (mouseCaptured) return true
+            // A selection belongs to the gesture that created it. If the user
+            // starts a new swipe, close the old action mode first so the swipe
+            // can browse history instead of extending a stale highlight.
+            if (!selectionDragActive && hasSelectionState()) dismissSelection()
             val extent = selectionExtent
-            if (extent != null) {
+            if (selectionDragActive && extent != null) {
                 selectionExtent = cellAt(current.x, current.y)
                 postInvalidateOnAnimation()
                 return true
@@ -165,6 +183,8 @@ internal class NativeTerminalView @JvmOverloads constructor(
             velocityY: Float,
         ): Boolean {
             if (mouseCaptured) return false
+            if (selectionDragActive) return true
+            if (hasSelectionState()) dismissSelection()
             val axis = if (scrollAxis == ScrollAxis.UNDECIDED) {
                 if (abs(velocityX) >= abs(velocityY)) ScrollAxis.HORIZONTAL else ScrollAxis.VERTICAL
             } else {
@@ -175,12 +195,18 @@ internal class NativeTerminalView @JvmOverloads constructor(
         }
 
         override fun onLongPress(event: MotionEvent) {
-            if (mouseCaptured) return
-            val cell = cellAt(event.x, event.y)
+            if (mouseCaptured || !selectionLongPressEligible || scrollAxis != ScrollAxis.UNDECIDED) return
+            dismissSelection()
+            val cell = selectableCellAt(event.x, event.y) ?: return
             selectionAnchor = cell
             selectionExtent = cell
-            selectionActionMode?.finish()
-            selectionActionMode = startActionMode(selectionCallback, ActionMode.TYPE_FLOATING)
+            selectionDragActive = true
+            val mode = startActionMode(selectionCallback, ActionMode.TYPE_FLOATING)
+            if (mode == null) {
+                clearSelectionState()
+                return
+            }
+            selectionActionMode = mode
             invalidate()
         }
     })
@@ -213,10 +239,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
         }
 
         override fun onDestroyActionMode(mode: ActionMode) {
-            if (selectionActionMode === mode) selectionActionMode = null
-            selectionAnchor = null
-            selectionExtent = null
-            invalidate()
+            if (selectionActionMode === mode) clearSelectionState()
         }
     }
 
@@ -242,6 +265,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
         shutdownHistoryExecutor()
         selectionActionMode?.finish()
         selectionActionMode = null
+        clearSelectionState()
         engine?.detachView(this)
         super.onDetachedFromWindow()
     }
@@ -254,6 +278,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
         engine = null
         selectionActionMode?.finish()
         selectionActionMode = null
+        clearSelectionState()
     }
 
     internal fun onFrameChanged() {
@@ -280,9 +305,19 @@ internal class NativeTerminalView @JvmOverloads constructor(
         val cursorRight = cursorLeft + cellWidth
         val cursorTop = contentPadding + frame.cursor.row * cellHeight
         val cursorBottom = cursorTop + cellHeight
+        // Keep a small horizontal safety area around the cursor. This avoids
+        // placing the insertion point flush against an edge after an IME
+        // resize or when a command advances to the first/last visible column.
+        // On narrow windows the margin is reduced so the cursor can still fit.
+        val horizontalBreathingRoom = minOf(
+            cellWidth * CURSOR_EDGE_MARGIN_CELLS,
+            max(0f, (width - cellWidth) / 2f),
+        )
         viewportX = when {
-            cursorLeft < viewportX -> cursorLeft
-            cursorRight > viewportX + width -> cursorRight - width
+            cursorLeft < viewportX + horizontalBreathingRoom ->
+                cursorLeft - horizontalBreathingRoom
+            cursorRight > viewportX + width - horizontalBreathingRoom ->
+                cursorRight - width + horizontalBreathingRoom
             else -> viewportX
         }
         viewportY = when {
@@ -384,6 +419,13 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val owner = engine ?: return false
+        if (event.actionMasked == MotionEvent.ACTION_MOVE && !selectionDragActive) {
+            val travel = hypot(event.x - touchDownX, event.y - touchDownY)
+            if (travel > touchSlop) {
+                selectionLongPressEligible = false
+                if (hasSelectionState()) dismissSelection()
+            }
+        }
         val position = mousePosition(event.x, event.y)
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -421,6 +463,8 @@ internal class NativeTerminalView @JvmOverloads constructor(
         val handled = if (mouseCaptured) true else gestures.onTouchEvent(event) || super.onTouchEvent(event)
         if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
             scrollAxis = ScrollAxis.UNDECIDED
+            selectionDragActive = false
+            selectionLongPressEligible = false
         }
         return handled
     }
@@ -502,6 +546,13 @@ internal class NativeTerminalView @JvmOverloads constructor(
     }
 
     override fun onCheckIsTextEditor(): Boolean = true
+
+    override fun onKeyPreIme(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP && dismissSelection()) {
+            return true
+        }
+        return super.onKeyPreIme(keyCode, event)
+    }
 
     override fun performClick(): Boolean {
         super.performClick()
@@ -796,6 +847,15 @@ internal class NativeTerminalView @JvmOverloads constructor(
     internal fun hasHistoryExecutorForTest(): Boolean =
         synchronized(historyQueueLock) { historyExecutor != null }
 
+    internal fun hasSelectionForTest(): Boolean =
+        selectionAnchor != null || selectionExtent != null
+
+    internal fun seedSelectionForTest() {
+        selectionAnchor = CellPoint(0, 0)
+        selectionExtent = CellPoint(0, 0)
+        selectionDragActive = true
+    }
+
     internal fun forceTextRunWidthMatchForTest(matches: Boolean) {
         textRunWidthMatchOverrideForTest = matches
     }
@@ -811,6 +871,21 @@ internal class NativeTerminalView @JvmOverloads constructor(
             cursorTop >= viewportY && cursorBottom <= viewportY + height
     }
 
+    internal fun cursorHorizontalBreathingRoomForTest(): Float = minOf(
+        cellWidth * CURSOR_EDGE_MARGIN_CELLS,
+        max(0f, (width - cellWidth) / 2f),
+    )
+
+    internal fun isCursorComfortablyVisibleForTest(): Boolean {
+        if (engine == null || width <= 0 || height <= 0) return false
+        val cursor = currentFrame().cursor
+        val margin = cursorHorizontalBreathingRoomForTest()
+        val cursorLeft = contentPadding + cursor.column * cellWidth
+        val cursorRight = cursorLeft + cellWidth
+        return cursorLeft >= viewportX + margin &&
+            cursorRight <= viewportX + width - margin
+    }
+
     private fun cellAt(x: Float, y: Float): CellPoint {
         val frame = currentFrame()
         val column = floor((x + viewportX - contentPadding) / cellWidth).toInt()
@@ -818,6 +893,27 @@ internal class NativeTerminalView @JvmOverloads constructor(
         val row = floor((y + viewportY - contentPadding) / cellHeight).toInt()
             .coerceIn(0, frame.size.rows - 1)
         return CellPoint(column, row)
+    }
+
+    private fun selectableCellAt(x: Float, y: Float): CellPoint? {
+        val frame = currentFrame()
+        val gridX = x + viewportX - contentPadding
+        val gridY = y + viewportY - contentPadding
+        if (gridX < 0f || gridY < 0f) return null
+        var column = floor(gridX / cellWidth).toInt()
+        val row = floor(gridY / cellHeight).toInt()
+        if (column !in 0 until frame.size.columns || row !in 0 until frame.size.rows) return null
+
+        var cell = frame.rows[row].cells[column]
+        // The second half of a wide glyph is still a visible text hit. Resolve
+        // it back to the lead cell instead of treating half the glyph as blank.
+        if (cell.wideContinuation) {
+            if (column == 0) return null
+            column -= 1
+            cell = frame.rows[row].cells[column]
+        }
+        val text = frame.graphemes.getOrNull(cell.graphemeId - 1)?.text ?: return null
+        return CellPoint(column, row).takeIf { text.isNotBlank() }
     }
 
     private fun mousePosition(x: Float, y: Float) = cellAt(x, y).let { cell ->
@@ -869,6 +965,31 @@ internal class NativeTerminalView @JvmOverloads constructor(
         context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(
             ClipData.newPlainText("Terminal", selected),
         )
+    }
+
+    private fun dismissSelection(): Boolean {
+        val hadSelection = hasSelectionState()
+        val mode = selectionActionMode
+        if (mode != null) {
+            mode.finish()
+            // Some platform implementations dispatch destruction later. The
+            // terminal surface must still leave selection immediately.
+            if (selectionActionMode === mode) clearSelectionState()
+        } else if (hadSelection) {
+            clearSelectionState()
+        }
+        return hadSelection
+    }
+
+    private fun hasSelectionState(): Boolean = selectionActionMode != null ||
+        selectionAnchor != null || selectionExtent != null
+
+    private fun clearSelectionState() {
+        selectionActionMode = null
+        selectionAnchor = null
+        selectionExtent = null
+        selectionDragActive = false
+        invalidate()
     }
 
     private fun configureTextPaint(rendition: TerminalRenderRenditionV3, color: Int) {
@@ -1118,6 +1239,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
         const val MIN_BATCHED_TEXT_CELLS = 2
         const val TEXT_RUN_WIDTH_TOLERANCE_PX = 0.5f
         const val TEXT_RUN_WIDTH_TOLERANCE_RATIO = 0.001f
+        const val CURSOR_EDGE_MARGIN_CELLS = 2f
     }
 }
 

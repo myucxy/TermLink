@@ -8,6 +8,8 @@ import android.provider.Settings
 import android.util.Log
 import android.view.Choreographer
 import android.view.View
+import android.view.Window
+import android.view.WindowManager
 import android.view.KeyEvent as AndroidKeyEvent
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
@@ -78,6 +80,7 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.LaptopWindows
+import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Replay
@@ -116,6 +119,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
@@ -302,6 +306,7 @@ private val productLightColors = lightColorScheme(
 
 private const val PRODUCT_PREFERENCES = "termlink_product_preferences"
 private const val PRODUCT_THEME_KEY = "theme_preference"
+private const val PRODUCT_KEEP_SCREEN_ON_KEY = "keep_screen_on"
 private const val PRODUCT_PRIMARY_DESTINATION_KEY = "primary_destination"
 private const val PRODUCT_SELECTED_SESSION_ID_KEY = "selected_session_id"
 private const val PRODUCT_OPENED_SESSION_IDS_KEY = "opened_session_ids_v1"
@@ -697,6 +702,26 @@ private fun saveThemePreference(context: android.content.Context, preference: Pr
         .apply()
 }
 
+internal fun loadKeepScreenOnPreference(context: android.content.Context): Boolean =
+    context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
+        .getBoolean(PRODUCT_KEEP_SCREEN_ON_KEY, false)
+
+internal fun saveKeepScreenOnPreference(context: android.content.Context, enabled: Boolean) {
+    context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
+        .edit()
+        .putBoolean(PRODUCT_KEEP_SCREEN_ON_KEY, enabled)
+        .apply()
+}
+
+internal fun applyKeepScreenOn(window: Window, enabled: Boolean) {
+    window.decorView.keepScreenOn = enabled
+    if (enabled) {
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    } else {
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+}
+
 class ProductActivity : ComponentActivity() {
     private lateinit var repository: ProductionProductRepository
     private var productForeground by mutableStateOf(false)
@@ -750,9 +775,12 @@ class ProductActivity : ComponentActivity() {
         repository = ProductionProductRepository(this, authorizationLauncher::launch)
         pendingRemoteDownloadSelection = savedInstanceState?.remoteDownloadSelection()
         enableEdgeToEdge()
+        val initialKeepScreenOn = loadKeepScreenOnPreference(this)
+        applyKeepScreenOn(window, initialKeepScreenOn)
         setContent {
             val context = LocalContext.current
             var themePreference by rememberSaveable { mutableStateOf(loadThemePreference(context)) }
+            var keepScreenOn by remember { mutableStateOf(initialKeepScreenOn) }
             var terminalPreferences by remember { mutableStateOf(loadTerminalDisplayPreferences(context)) }
             var shortcutPreferences by remember { mutableStateOf(loadTerminalShortcutPreferences(context)) }
             val systemDark = isSystemInDarkTheme()
@@ -766,6 +794,7 @@ class ProductActivity : ComponentActivity() {
                 val controller = WindowCompat.getInsetsController(window, window.decorView)
                 controller.isAppearanceLightStatusBars = !dark
                 controller.isAppearanceLightNavigationBars = !dark
+                applyKeepScreenOn(window, keepScreenOn)
             }
             MaterialTheme(colorScheme = colors) {
                 ProductApp(
@@ -776,6 +805,12 @@ class ProductActivity : ComponentActivity() {
                     onThemePreferenceChanged = {
                         themePreference = it
                         saveThemePreference(context, it)
+                    },
+                    keepScreenOn = keepScreenOn,
+                    onKeepScreenOnChanged = {
+                        keepScreenOn = it
+                        applyKeepScreenOn(window, it)
+                        saveKeepScreenOnPreference(context, it)
                     },
                     terminalPreferences = terminalPreferences,
                     onTerminalPreferencesChanged = {
@@ -902,6 +937,8 @@ fun ProductApp(
     foregroundGeneration: Long = if (foreground) 1L else 0L,
     themePreference: ProductThemePreference = ProductThemePreference.SYSTEM,
     onThemePreferenceChanged: (ProductThemePreference) -> Unit = {},
+    keepScreenOn: Boolean = false,
+    onKeepScreenOnChanged: (Boolean) -> Unit = {},
     terminalPreferences: TerminalDisplayPreferences = TerminalDisplayPreferences(),
     onTerminalPreferencesChanged: (TerminalDisplayPreferences) -> Unit = {},
     shortcutPreferences: TerminalShortcutPreferences = TerminalShortcutPreferences(),
@@ -1502,6 +1539,8 @@ fun ProductApp(
                     onOpenCommandSearch = { commandSearchOpen = true },
                     themePreference = themePreference,
                     onThemePreferenceChanged = onThemePreferenceChanged,
+                    keepScreenOn = keepScreenOn,
+                    onKeepScreenOnChanged = onKeepScreenOnChanged,
                     onSignIn = { runOperation(repository::signIn) },
                     onSignOut = { signOutConfirmation = true },
                     onCheckForUpdate = { runOperation { repository.checkForUpdate(force = true) } },
@@ -2895,6 +2934,8 @@ private fun ProductContent(
     onOpenCommandSearch: () -> Unit,
     themePreference: ProductThemePreference,
     onThemePreferenceChanged: (ProductThemePreference) -> Unit,
+    keepScreenOn: Boolean,
+    onKeepScreenOnChanged: (Boolean) -> Unit,
     terminalPreferences: TerminalDisplayPreferences,
     onTerminalPreferencesChanged: (TerminalDisplayPreferences) -> Unit,
     shortcutPreferences: TerminalShortcutPreferences,
@@ -3061,6 +3102,8 @@ private fun ProductContent(
                 onCheckForUpdate = onCheckForUpdate,
                 themePreference = themePreference,
                 onThemePreferenceChanged = onThemePreferenceChanged,
+                keepScreenOn = keepScreenOn,
+                onKeepScreenOnChanged = onKeepScreenOnChanged,
                 terminalPreferences = terminalPreferences,
                 onTerminalPreferencesChanged = onTerminalPreferencesChanged,
                 shortcutPreferences = shortcutPreferences,
@@ -5054,6 +5097,8 @@ private fun SettingsPage(
     onCheckForUpdate: () -> Unit,
     themePreference: ProductThemePreference,
     onThemePreferenceChanged: (ProductThemePreference) -> Unit,
+    keepScreenOn: Boolean,
+    onKeepScreenOnChanged: (Boolean) -> Unit,
     terminalPreferences: TerminalDisplayPreferences,
     onTerminalPreferencesChanged: (TerminalDisplayPreferences) -> Unit,
     shortcutPreferences: TerminalShortcutPreferences,
@@ -5162,6 +5207,47 @@ private fun SettingsPage(
                     modifier = Modifier.heightIn(min = 48.dp),
                 )
             }
+        }
+    }
+
+    SettingsSectionHeader(
+        title = stringResource(R.string.settings_screen_title),
+        subtitle = stringResource(R.string.settings_screen_copy),
+        icon = Icons.Filled.LightMode,
+    )
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = ProductShape,
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onKeepScreenOnChanged(!keepScreenOn) }
+                .padding(14.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(
+                    stringResource(R.string.settings_keep_screen_on),
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    stringResource(R.string.settings_keep_screen_on_copy),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = keepScreenOn,
+                onCheckedChange = onKeepScreenOnChanged,
+            )
         }
     }
 

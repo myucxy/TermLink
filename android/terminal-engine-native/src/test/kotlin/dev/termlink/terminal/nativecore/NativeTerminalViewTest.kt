@@ -236,6 +236,117 @@ class NativeTerminalViewTest {
     }
 
     @Test
+    fun singleTapCancelsSelectionWithoutActivatingTerminalClick() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val engine = NativeTerminalEngine(
+            initialSize = TerminalSize(80, 24),
+            bridge = FakeNativeBridge(),
+        )
+        try {
+            engine.setReadOnly(false)
+            val view = engine.createView(controller.get()) as NativeTerminalView
+            var clickCount = 0
+            view.setOnClickListener { clickCount++ }
+            controller.get().setContentView(view)
+            view.layout(0, 0, 400, 600)
+            view.seedSelectionForTest()
+            assertTrue(view.hasSelectionForTest())
+
+            val down = MotionEvent.obtain(0, 0, MotionEvent.ACTION_DOWN, 16f, 16f, 0)
+            val up = MotionEvent.obtain(0, 20, MotionEvent.ACTION_UP, 16f, 16f, 0)
+            try {
+                assertTrue(view.dispatchTouchEvent(down))
+                assertTrue(view.dispatchTouchEvent(up))
+            } finally {
+                down.recycle()
+                up.recycle()
+            }
+
+            assertFalse("a tap should close the native selection", view.hasSelectionForTest())
+            assertEquals("the tap used to dismiss selection must be consumed", 0, clickCount)
+        } finally {
+            engine.dispose()
+            controller.destroy()
+        }
+    }
+
+    @Test
+    fun newVerticalSwipeClearsSelectionBeforeBrowsingHistory() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val bridge = FakeNativeBridge().apply {
+            forcedScrollbackAvailableRows = 12
+            forcedScrollbackGenerationRows = 12
+        }
+        val engine = NativeTerminalEngine(
+            initialSize = TerminalSize(80, 24),
+            bridge = bridge,
+        )
+        try {
+            val view = engine.createView(controller.get()) as NativeTerminalView
+            controller.get().setContentView(view)
+            view.layout(0, 0, 400, 600)
+            view.seedSelectionForTest()
+
+            dispatchDrag(view, fromY = 120f, toY = 520f)
+            awaitHistory(view)
+
+            assertFalse("a new swipe must leave selection mode", view.hasSelectionForTest())
+            assertTrue("the same swipe must remain available for history", engine.historyOffsetRowsForTest() > 0)
+        } finally {
+            engine.dispose()
+            controller.destroy()
+        }
+    }
+
+    @Test
+    fun cursorKeepsHorizontalBreathingRoomAtBothViewportEdges() = runBlocking {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val size = TerminalSize(80, 24)
+        val bridge = FakeNativeBridge().apply {
+            forcedRenderFrameV3 = cursorFrame(
+                size = size,
+                cursorRow = 0,
+                cursorColumn = 60,
+                nextSourceSequence = 1,
+            )
+        }
+        val engine = NativeTerminalEngine(initialSize = size, bridge = bridge)
+        try {
+            val view = engine.createView(controller.get()) as NativeTerminalView
+            controller.get().setContentView(view)
+            view.layout(0, 0, 200, 200)
+
+            // The exact cell width is intentionally an implementation detail;
+            // assert the invariant through the view's own cursor visibility
+            // helper and a non-zero edge reservation.
+            assertTrue(view.cursorHorizontalBreathingRoomForTest() > 0f)
+            assertTrue(view.isCursorFullyVisibleForTest())
+            assertTrue(view.isCursorComfortablyVisibleForTest())
+            assertTrue("the viewport should move toward an interior cursor", view.viewportXForTest() > 0f)
+
+            val rightEdgeViewport = view.viewportXForTest()
+            bridge.forcedRenderFrameV3 = cursorFrame(
+                size = size,
+                cursorRow = 0,
+                cursorColumn = 20,
+                nextSourceSequence = 2,
+            )
+            engine.feed(1, ByteBuffer.wrap(byteArrayOf(1)))
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertTrue(view.isCursorFullyVisibleForTest())
+            assertTrue(view.isCursorComfortablyVisibleForTest())
+            assertTrue(
+                "moving toward the left edge should retain an interior margin",
+                view.viewportXForTest() < rightEdgeViewport,
+            )
+        } finally {
+            engine.dispose()
+            controller.destroy()
+        }
+    }
+
+    @Test
     fun verticalDragBrowsesLocalHistoryInBothDirections() {
         val controller = Robolectric.buildActivity(Activity::class.java).setup()
         val bridge = FakeNativeBridge().apply {
