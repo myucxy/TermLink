@@ -510,6 +510,10 @@ enum CommandV4 {
         entered: SyncSender<()>,
         completion: SyncSender<u32>,
     },
+    #[cfg(test)]
+    PanicForTest {
+        entered: SyncSender<()>,
+    },
 }
 
 struct RetainedV4 {
@@ -1051,6 +1055,11 @@ fn worker_loop_v4(
                     .err()
                     .unwrap_or(0);
                     let _ = completion.send(reason);
+                }
+                #[cfg(test)]
+                CommandV4::PanicForTest { entered } => {
+                    let _ = entered.send(());
+                    panic!("intentional Direct V4 worker panic test");
                 }
                 CommandV4::Cancel(value) | CommandV4::NetworkChanged(value) => {
                     if retained
@@ -3515,6 +3524,144 @@ mod tests {
         let started = Instant::now();
         // SAFETY: this consumes the live handle exactly once.
         unsafe { termlink_direct_destroy_v4(handle) };
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(worker_exited.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn idle_destroy_joins_worker_without_waiting_for_network_timeout() {
+        let bridge = NativeBridgeV4::create(TermLinkDirectCreateV4 {
+            abi_version: ABI_VERSION_V4,
+            struct_size: size_of::<TermLinkDirectCreateV4>() as u32,
+            enabled: 1,
+            queue_capacity: 8,
+            platform: PLATFORM_WINDOWS_V4,
+            reserved: [0; 3],
+        })
+        .unwrap();
+        let worker_exited = Arc::clone(&bridge.worker_exited);
+
+        let started = Instant::now();
+        drop(bridge);
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(worker_exited.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn worker_panic_sets_exit_fence_and_destroy_still_joins() {
+        let bridge = NativeBridgeV4::create(TermLinkDirectCreateV4 {
+            abi_version: ABI_VERSION_V4,
+            struct_size: size_of::<TermLinkDirectCreateV4>() as u32,
+            enabled: 1,
+            queue_capacity: 8,
+            platform: PLATFORM_WINDOWS_V4,
+            reserved: [0; 3],
+        })
+        .unwrap();
+        let worker_exited = Arc::clone(&bridge.worker_exited);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            bridge.submit(
+                CommandV4::PanicForTest {
+                    entered: entered_tx,
+                },
+                0,
+                [0; 16],
+            ),
+            0
+        );
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let started = Instant::now();
+        drop(bridge);
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(worker_exited.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn destroy_preempts_active_check_pump_and_joins_worker() {
+        let ip = active_ip();
+        let blackhole = UdpSocket::bind(SocketAddr::new(ip, 0)).unwrap();
+        let bridge = NativeBridgeV4::create(TermLinkDirectCreateV4 {
+            abi_version: ABI_VERSION_V4,
+            struct_size: size_of::<TermLinkDirectCreateV4>() as u32,
+            enabled: 1,
+            queue_capacity: 16,
+            platform: PLATFORM_WINDOWS_V4,
+            reserved: [0; 3],
+        })
+        .unwrap();
+        let worker_exited = Arc::clone(&bridge.worker_exited);
+        let expected = OwnerV4 {
+            epoch: 7,
+            attempt_id: [9; 16],
+        };
+        let encoded = encode_socket(SocketAddr::new(ip, 0));
+        assert_eq!(
+            bridge.accept_gather(TermLinkDirectGatherV4 {
+                abi_version: ABI_VERSION_V4,
+                struct_size: size_of::<TermLinkDirectGatherV4>() as u32,
+                epoch: expected.epoch,
+                attempt_id: expected.attempt_id,
+                local_bind: encoded,
+                advertised_local_ip: encoded.ip,
+                advertised_local_ip_length: if ip.is_ipv4() { 4 } else { 16 },
+                gather_timeout_ms: 100,
+                candidate_expires_at_ms: 1_900_000_110_000,
+                ..TermLinkDirectGatherV4::default()
+            }),
+            0
+        );
+
+        let gather_deadline = Instant::now() + Duration::from_secs(2);
+        let local_candidate = loop {
+            if let Some(event) = bridge.events.poll()
+                && event.kind == EVENT_CANDIDATE_BATCH_V4
+            {
+                // SAFETY: Candidate-batch events initialize this union member.
+                let batch = unsafe { event.payload.candidate_batch };
+                if batch.candidate_count != 0 {
+                    break batch.candidates[0];
+                }
+            }
+            assert!(
+                Instant::now() < gather_deadline,
+                "Gather did not publish its HOST candidate"
+            );
+            thread::yield_now();
+        };
+        let mut remote_candidate = test_candidate(blackhole.local_addr().unwrap(), 0x77);
+        remote_candidate.expires_at_ms = 1_900_000_110_000;
+        let pair = test_pair(local_candidate, remote_candidate, 1);
+        let begin = ticket_vector_begin(ROLE_INITIATOR_V4, pair);
+        assert_eq!(
+            bridge.submit(
+                CommandV4::Begin(Box::new(begin)),
+                expected.epoch,
+                expected.attempt_id,
+            ),
+            0
+        );
+
+        let checking_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if bridge.events.poll().is_some_and(|event| {
+                event.kind == EVENT_STATE_CHANGED_V4 && event.state == STATE_CHECKING_V4
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < checking_deadline,
+                "native worker did not enter the active check pump"
+            );
+            thread::yield_now();
+        }
+
+        let started = Instant::now();
+        drop(bridge);
+
         assert!(started.elapsed() < Duration::from_millis(500));
         assert!(worker_exited.load(Ordering::Acquire));
     }
