@@ -24,6 +24,24 @@ The script generates random credentials under the ignored
 disposable public CA certificate, and runs a cross-container probe. The current
 product acceptance contract is:
 
+To add the isolated Direct signaling/NAT-discovery lane for cross-client shadow
+tests, opt in explicitly:
+
+```powershell
+.\server\ops\Start-ProductionAcceptance.ps1 -EnableDirectTransportShadow
+```
+
+This creates a separate Direct Valkey and separate generated credential, warms
+that service before the TermLink Server starts, and includes it in the health
+gate. A network-isolated one-shot initializer stages the Direct Valkey password
+into its own private named volume as mode `0400`, owned by UID `999` and GID
+`1000`; Direct Valkey cannot start unless that initializer succeeds. The
+acceptance-only overlay separately stages the Direct URL into the server's
+existing private `/run/secrets` volume; it does not create a nested mount below
+that read-only volume. Relay remains the authoritative connection and startup
+path, and Direct still cannot carry terminal input, output, ACK, History,
+Snapshot, or Session lifecycle traffic.
+
 1. register a Windows PC device and an Android device with access tokens carrying the same OIDC subject;
 2. let Android discover the PC and its managed session immediately, without pairing, self-trust confirmation, or a per-PC Grant;
 3. open both Realtime roles, route opaque production Protobuf Envelopes, and acquire a short-lived control lease before sending input;
@@ -54,13 +72,16 @@ one-shot container copies each credential into a service-private named volume,
 sets the exact runtime owner, and applies mode `0400`. The start script then
 checks the metadata seen inside Keycloak, PostgreSQL, Valkey, and MinIO and
 fails the deployment if any credential is group- or world-readable. Secret
-contents are never included in that check or its output. After all dependency
-conditions have succeeded, the start script removes the four completed
-one-shot containers (`runtime-secrets-init`, `keycloak-init`,
-`server-secrets-init`, and `migrate`). Caddy provisioning already creates the
-local CA before `edge` becomes healthy, and `server-secrets-init` fails closed
-unless it can copy that CA; the former standalone CA polling container was
-therefore redundant. Cleanup does not delete named volumes, images, or data.
+contents are never included in that check or its output. When Direct shadow is
+enabled, the same gate additionally requires its password to be exactly
+`400:999:1000` inside Direct Valkey. After all dependency conditions have
+succeeded, the start script removes the four base completed one-shot containers
+(`runtime-secrets-init`, `keycloak-init`, `server-secrets-init`, and `migrate`)
+plus `direct-valkey-secrets-init` when Direct is enabled. Caddy provisioning
+already creates the local CA before `edge` becomes healthy, and
+`server-secrets-init` fails closed unless it can copy that CA; the former
+standalone CA polling container was therefore redundant. This post-probe job
+cleanup does not delete named volumes, images, or data.
 
 The steady-state acceptance services are `edge`, `lucky-upstream`, `keycloak`,
 `postgres`, `valkey`, `minio`, and `server`. PostgreSQL and Valkey are required
@@ -386,6 +407,11 @@ Remove the disposable volumes:
 .\server\ops\Stop-ProductionAcceptance.ps1 -RemoveVolumes
 ```
 
+Stop always composes the Direct overlays after an opt-in run, so its Direct
+container, initializer, and isolated network are removed with the base stack.
+`-RemoveVolumes` additionally removes both the Direct data volume and its
+private password volume; a reset always performs that full volume cleanup.
+
 For a first-version clean-room deployment test, reset only the managed
 `termlink-production-acceptance` project, regenerate its disposable secrets,
 rebuild, and run the production protocol probe:
@@ -395,5 +421,8 @@ rebuild, and run the production protocol probe:
 ```
 
 The reset path checks the acceptance marker before deleting its ignored secret
-directory and runs Compose only with `server/compose/acceptance.compose.yml`.
-It does not remove containers or volumes owned by other Docker projects.
+directory. The next run still enables the Direct topology only when
+`-EnableDirectTransportShadow` is present, but the cleanup model always includes
+the Direct overlays so a previous opt-in run cannot leave its isolated Direct
+Valkey volume behind. It does not remove containers or volumes owned by other
+Docker projects.

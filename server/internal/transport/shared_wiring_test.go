@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -16,6 +17,15 @@ type sharedStateStub struct {
 	finalized   map[connectionKey]uint64
 	finalizeErr error
 	aborts      int
+}
+
+type invalidSubscriberState struct {
+	*sharedStateStub
+	count int64
+}
+
+func (s *invalidSubscriberState) AuthorizeAndPublish(context.Context, DirectSignalPublishRequest) (DirectSignalPublishResult, error) {
+	return DirectSignalPublishResult{Status: DirectSignalPublishAccepted, SubscriberCount: s.count}, nil
 }
 
 func newSharedStateStub() *sharedStateStub {
@@ -82,7 +92,7 @@ func (*sharedStateStub) ConsumeSignalBudget(context.Context, DirectSignalBudgetR
 	return DirectSignalBudgetAccepted, nil
 }
 func (*sharedStateStub) AuthorizeAndPublish(context.Context, DirectSignalPublishRequest) (DirectSignalPublishResult, error) {
-	return DirectSignalPublishResult{Status: DirectSignalPublishAccepted}, nil
+	return DirectSignalPublishResult{Status: DirectSignalPublishAccepted, SubscriberCount: 1}, nil
 }
 
 func TestSharedTicketServicesFenceConcurrentConnectionAcrossInstances(t *testing.T) {
@@ -147,4 +157,34 @@ func TestSharedTicketFinalizeFailureAbortsAndReturnsNoTicket(t *testing.T) {
 	}
 }
 
+func TestSharedSignalAcceptedWithInvalidSubscriberCountFailsClosed(t *testing.T) {
+	for _, count := range []int64{0, 2} {
+		t.Run(fmt.Sprintf("subscriber count %d", count), func(t *testing.T) {
+			account, pc, android := uuid.New(), uuid.New(), uuid.New()
+			authority := &memoryDeviceResolver{devices: map[uuid.UUID]map[uuid.UUID]store.DeviceRecord{account: {
+				pc: {ID: pc, Type: "PC_AGENT", TrustState: "TRUSTED"}, android: {ID: android, Type: "ANDROID", TrustState: "TRUSTED"},
+			}}}
+			state := &invalidSubscriberState{sharedStateStub: newSharedStateStub(), count: count}
+			service, err := NewSharedRouteTicketService(authority, state, make([]byte, 32))
+			if err != nil {
+				t.Fatal(err)
+			}
+			principal := testPrincipal(account, pc, "PC_AGENT")
+			presence := DirectPresence{
+				AccountID: account, DeviceID: pc,
+				Mailbox: DirectMailbox{InstanceID: uuid.New(), Generation: uuid.New()}, PeerGeneration: uuid.New(),
+			}
+			frame := testSignalFrame(uuid.New(), pc, android, 1, 1, SignalPathOffer, 32)
+			envelope, err := UnmarshalSignal(frame)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.AuthorizeAndPublishSignal(context.Background(), principal, presence, envelope, frame); !errors.Is(err, ErrDirectStateUnavailable) {
+				t.Fatalf("accepted publish with subscriber count %d error=%v, want state unavailable", count, err)
+			}
+		})
+	}
+}
+
 var _ DirectStateStore = (*sharedStateStub)(nil)
+var _ DirectStateStore = (*invalidSubscriberState)(nil)

@@ -120,18 +120,9 @@ func TestSharedMailboxNeverDeliversMultipairToUnsupportedRecipient(t *testing.T)
 			peer.multipair = test.supported
 			peer.presence.PeerGeneration = generation
 			hub.peers[recipientID] = peer
-			subscription := &singleMailboxDelivery{
-				delivery: DirectMailboxDelivery{
-					RecipientID: recipientID, PeerGeneration: generation, Frame: frame,
-				},
-				secondCall: make(chan struct{}),
-			}
-			hub.subscription = subscription
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			hub.wg.Add(1)
-			go hub.mailboxLoop(ctx)
-			<-subscription.secondCall
+			hub.deliverSharedSignal(DirectMailboxDelivery{
+				RecipientID: recipientID, PeerGeneration: generation, Frame: frame,
+			})
 
 			select {
 			case got := <-peer.send:
@@ -143,8 +134,6 @@ func TestSharedMailboxNeverDeliversMultipairToUnsupportedRecipient(t *testing.T)
 					t.Fatal("mailbox dropped multipair for a supported recipient")
 				}
 			}
-			cancel()
-			hub.wg.Wait()
 		})
 	}
 }

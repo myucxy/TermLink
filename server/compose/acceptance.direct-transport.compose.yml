@@ -1,0 +1,45 @@
+# Acceptance already mounts one private, read-only volume at /run/secrets in
+# the distroless server. A second Docker-secret mount beneath that parent cannot
+# be created on Docker Desktop. The server initializer therefore stages the
+# optional Direct URL into the existing server volume. Direct Valkey uses a
+# separate private volume because Docker Desktop ignores uid/gid/mode on the
+# file-backed password supplied to its one-shot staging service.
+services:
+  server:
+    secrets: !reset []
+
+  server-secrets-init:
+    secrets:
+      - direct_redis_url
+
+  direct-valkey-secrets-init:
+    image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        rm -f /target/direct_valkey_password
+        cp /run/secrets/direct_valkey_password /target/direct_valkey_password
+        chmod 0400 /target/direct_valkey_password
+        chown 999:1000 /target/direct_valkey_password
+        test "$$(stat -c '%a:%u:%g' /target/direct_valkey_password)" = "400:999:1000"
+    secrets:
+      - direct_valkey_password
+    volumes:
+      - acceptance-direct-valkey-secrets:/target
+    network_mode: "none"
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  direct-valkey:
+    secrets: !reset []
+    volumes:
+      - acceptance-direct-valkey-secrets:/run/secrets:ro
+    depends_on:
+      direct-valkey-secrets-init:
+        condition: service_completed_successfully
+
+volumes:
+  acceptance-direct-valkey-secrets:

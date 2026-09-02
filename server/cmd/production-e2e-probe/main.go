@@ -28,14 +28,18 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/termlink/termlink/server/internal/realtimewire"
+	transportwire "github.com/termlink/termlink/server/internal/transport"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 const (
-	deviceProofDomain = "TERMLINK-DEVICE-PROOF-V1"
-	registerDomain    = "TERMLINK-DEVICE-REGISTER-V1"
-	initialKeyEpoch   = int64(1)
-	maxHistoryBytes   = 64 << 20
-	maxHTMLBytes      = 2 << 20
+	deviceProofDomain          = "TERMLINK-DEVICE-PROOF-V1"
+	registerDomain             = "TERMLINK-DEVICE-REGISTER-V1"
+	transportSignalProofDomain = "TERMLINK-TRANSPORT-SIGNAL-PROOF-V1"
+	transportSignalSubprotocol = "termlink.transport.v1"
+	initialKeyEpoch            = int64(1)
+	maxHistoryBytes            = 64 << 20
+	maxHTMLBytes               = 2 << 20
 )
 
 var anchorHrefPattern = regexp.MustCompile(`(?is)<a\b[^>]*\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*>`)
@@ -79,10 +83,37 @@ func main() {
 	fmt.Println("Production OIDC/TLS/API/Realtime acceptance probe passed.")
 }
 
-func writeProbeFailure(writer io.Writer, _ error) {
+func writeProbeFailure(writer io.Writer, err error) {
 	// Probe errors can wrap callback URLs, presigned query credentials, OIDC
 	// responses, and local secret paths. Keep process stderr stable and
 	// non-sensitive; detailed diagnosis belongs in the bounded test assertions.
+	for _, diagnostic := range []struct {
+		match string
+		stage string
+	}{
+		{"Direct signalling WebSocket upgrade failed", "direct-signal-upgrade"},
+		{"Direct signalling subprotocol negotiation failed", "direct-signal-subprotocol"},
+		{"Direct signalling hello failed", "direct-signal-hello"},
+		{"Direct signalling welcome closed with code 1008", "direct-signal-welcome-policy"},
+		{"Direct signalling welcome closed with code 1013", "direct-signal-welcome-unavailable"},
+		{"Direct signalling welcome closed with code", "direct-signal-welcome-close"},
+		{"Direct signalling welcome read failed", "direct-signal-welcome-read"},
+		{"Direct signalling welcome is invalid", "direct-signal-welcome-read"},
+		{"Direct signalling welcome contract is invalid", "direct-signal-welcome-contract"},
+		{"Direct transport config", "direct-config"},
+		{"Direct transport multipair", "direct-config"},
+		{"Direct transport shared state", "direct-ticket"},
+		{"Direct transport ticket", "direct-ticket"},
+		{"verify PC to Android Direct signalling", "direct-signal-pc-to-android"},
+		{"verify Android to PC Direct signalling", "direct-signal-android-to-pc"},
+		{"verify PC Direct signalling", "direct-signal-pc"},
+		{"verify Android Direct signalling", "direct-signal-android"},
+	} {
+		if strings.Contains(err.Error(), diagnostic.match) {
+			_, _ = fmt.Fprintf(writer, "production acceptance probe failed (stage=%s; details redacted)\n", diagnostic.stage)
+			return
+		}
+	}
 	_, _ = fmt.Fprintln(writer, "production acceptance probe failed (details redacted)")
 }
 
@@ -190,6 +221,11 @@ func run() error {
 	}
 	if err := p.register(android, "ANDROID", "Acceptance Android"); err != nil {
 		return err
+	}
+	if os.Getenv("TERMLINK_ACCEPTANCE_REQUIRE_DIRECT_TRANSPORT") == "1" {
+		if err := p.verifyDirectTransport(pc, android); err != nil {
+			return err
+		}
 	}
 	pcsDirect, err := p.signedJSON(android, http.MethodGet, "/v1/pcs", nil, "", http.StatusOK)
 	if err != nil {
@@ -309,6 +345,300 @@ func run() error {
 		return fmt.Errorf("wait for deleted history object: %w", err)
 	}
 	return nil
+}
+
+func (p *probe) verifyDirectTransport(source, target *identity) error {
+	config, err := p.signedJSON(source, http.MethodGet, "/v1/transport/config", nil, "", http.StatusOK)
+	if err != nil {
+		return fmt.Errorf("verify Direct transport config: %w", err)
+	}
+	protocol, ok := positiveInt64Field(config, "protocol_version")
+	if !ok || protocol != 1 || config["direct_routing_permitted"] != false {
+		return errors.New("Direct transport config is not fail-closed protocol v1")
+	}
+	capabilities, ok := config["capabilities"].([]any)
+	if !ok || !containsString(capabilities, "direct_transport_shadow_multipair_v2") {
+		return errors.New("Direct transport multipair capability is unavailable")
+	}
+	connectionID := uuid.New()
+	ticket, err := p.signedJSON(source, http.MethodPost, "/v1/transport/tickets", map[string]any{
+		"target_device_id":   target.id.String(),
+		"connection_id":      connectionID.String(),
+		"requested_carriers": []string{"UDP_QUIC"},
+	}, "", http.StatusCreated)
+	if err != nil {
+		return fmt.Errorf("verify Direct transport shared state: %w", err)
+	}
+	ticketProtocol, ok := positiveInt64Field(ticket, "protocol_version")
+	encodedTicket, ticketOK := ticket["ticket_protobuf"].(string)
+	pathEpoch, epochErr := directTicketPathEpoch(encodedTicket)
+	if !ok || ticketProtocol != 1 || !ticketOK || epochErr != nil {
+		return errors.New("Direct transport ticket response is invalid")
+	}
+	pcSignals, err := p.connectDirectSignals(source, "pc")
+	if err != nil {
+		return fmt.Errorf("verify PC Direct signalling: %w", err)
+	}
+	defer closeWebSocket(pcSignals)
+	androidSignals, err := p.connectDirectSignals(target, "android")
+	if err != nil {
+		return fmt.Errorf("verify Android Direct signalling: %w", err)
+	}
+	defer closeWebSocket(androidSignals)
+	pcOffer, err := directAcceptanceSignal(source.id, target.id, connectionID, pathEpoch, 1, transportwire.SignalPathOffer)
+	if err != nil {
+		return errors.New("Direct PC signal fixture is invalid")
+	}
+	defer clear(pcOffer)
+	if err := routeDirectAndMatch(pcSignals, androidSignals, pcOffer); err != nil {
+		return fmt.Errorf("verify PC to Android Direct signalling: %w", err)
+	}
+	androidAnswer, err := directAcceptanceSignal(target.id, source.id, connectionID, pathEpoch, 1, transportwire.SignalPathAnswer)
+	if err != nil {
+		return errors.New("Direct Android signal fixture is invalid")
+	}
+	defer clear(androidAnswer)
+	if err := routeDirectAndMatch(androidSignals, pcSignals, androidAnswer); err != nil {
+		return fmt.Errorf("verify Android to PC Direct signalling: %w", err)
+	}
+	return nil
+}
+
+func directTicketPathEpoch(encoded string) (uint64, error) {
+	if len(encoded) < 32 || len(encoded) > 4096 {
+		return 0, errors.New("Direct ticket encoding is out of bounds")
+	}
+	wire, err := base64.RawURLEncoding.Strict().DecodeString(encoded)
+	if err != nil || len(wire) < 128 || len(wire) > 2048 || base64.RawURLEncoding.EncodeToString(wire) != encoded {
+		clear(wire)
+		return 0, errors.New("Direct ticket encoding is invalid")
+	}
+	defer clear(wire)
+	var epoch uint64
+	seenEpoch := false
+	for len(wire) > 0 {
+		number, kind, consumed := protowire.ConsumeTag(wire)
+		if consumed < 0 || number < 1 || number > 13 {
+			return 0, errors.New("Direct ticket protobuf is invalid")
+		}
+		wire = wire[consumed:]
+		switch kind {
+		case protowire.VarintType:
+			value, size := protowire.ConsumeVarint(wire)
+			if size < 0 {
+				return 0, errors.New("Direct ticket varint is invalid")
+			}
+			if number == 7 {
+				if seenEpoch || value == 0 || value > uint64(^uint64(0)>>1) {
+					return 0, errors.New("Direct ticket epoch is invalid")
+				}
+				epoch, seenEpoch = value, true
+			}
+			wire = wire[size:]
+		case protowire.BytesType:
+			_, size := protowire.ConsumeBytes(wire)
+			if size < 0 {
+				return 0, errors.New("Direct ticket bytes are invalid")
+			}
+			wire = wire[size:]
+		default:
+			return 0, errors.New("Direct ticket wire type is invalid")
+		}
+	}
+	if !seenEpoch {
+		return 0, errors.New("Direct ticket epoch is missing")
+	}
+	return epoch, nil
+}
+
+func directAcceptanceSignal(sender, recipient, connection uuid.UUID, pathEpoch, sequence uint64, signalType transportwire.SignalType) ([]byte, error) {
+	nonce := make([]byte, 12)
+	ciphertext := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	if _, err := rand.Read(ciphertext); err != nil {
+		clear(nonce)
+		return nil, err
+	}
+	defer clear(nonce)
+	defer clear(ciphertext)
+	frame := make([]byte, 0, 160)
+	frame = appendProbeVarint(frame, 1, 1)
+	frame = appendProbeVarint(frame, 2, uint64(signalType))
+	frame = appendProbeBytes(frame, 3, connection[:])
+	frame = appendProbeBytes(frame, 4, sender[:])
+	frame = appendProbeBytes(frame, 5, recipient[:])
+	frame = appendProbeVarint(frame, 6, pathEpoch)
+	frame = appendProbeVarint(frame, 7, sequence)
+	frame = appendProbeVarint(frame, 9, uint64(time.Now().UnixMilli()))
+	frame = appendProbeBytes(frame, 10, []byte("acceptance-signal-key"))
+	frame = appendProbeBytes(frame, 11, nonce)
+	frame = appendProbeBytes(frame, 12, ciphertext)
+	if _, err := transportwire.UnmarshalSignal(frame); err != nil {
+		clear(frame)
+		return nil, err
+	}
+	return frame, nil
+}
+
+func appendProbeVarint(dst []byte, number protowire.Number, value uint64) []byte {
+	dst = protowire.AppendTag(dst, number, protowire.VarintType)
+	return protowire.AppendVarint(dst, value)
+}
+
+func appendProbeBytes(dst []byte, number protowire.Number, value []byte) []byte {
+	dst = protowire.AppendTag(dst, number, protowire.BytesType)
+	return protowire.AppendBytes(dst, value)
+}
+
+func routeDirectAndMatch(sender, recipient *websocket.Conn, frame []byte) error {
+	_ = sender.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := sender.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+		return errors.New("Direct signal write failed")
+	}
+	_ = recipient.SetReadDeadline(time.Now().Add(5 * time.Second))
+	messageType, received, err := recipient.ReadMessage()
+	if err != nil {
+		return errors.New("Direct signal read failed")
+	}
+	defer clear(received)
+	if messageType != websocket.BinaryMessage || !bytes.Equal(received, frame) {
+		return errors.New("Direct signalling changed or misrouted an opaque frame")
+	}
+	_ = recipient.SetReadDeadline(time.Time{})
+	_ = sender.SetWriteDeadline(time.Time{})
+	return nil
+}
+
+func (p *probe) connectDirectSignals(device *identity, role string) (*websocket.Conn, error) {
+	const target = "/v1/transport/signals"
+	headers := http.Header{}
+	token, err := p.tokenFor(device)
+	if err != nil {
+		return nil, err
+	}
+	headers.Set("Authorization", "Bearer "+token)
+	if err := addTransportSignalProof(headers, device); err != nil {
+		return nil, err
+	}
+	dialer := p.dialer
+	dialer.Subprotocols = []string{transportSignalSubprotocol}
+	websocketURL := "wss" + strings.TrimPrefix(p.root, "https") + target
+	connection, response, err := dialer.Dial(websocketURL, headers)
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
+	if err != nil {
+		return nil, errors.New("Direct signalling WebSocket upgrade failed")
+	}
+	if connection.Subprotocol() != transportSignalSubprotocol {
+		closeWebSocket(connection)
+		return nil, errors.New("Direct signalling subprotocol negotiation failed")
+	}
+	_ = connection.SetWriteDeadline(time.Now().Add(15 * time.Second))
+	hello, err := json.Marshal(map[string]any{
+		"type":              "CLIENT_HELLO",
+		"role":              role,
+		"protocol_versions": []int{1},
+		"capabilities": []string{
+			"direct_transport_v1",
+			"direct_transport_shadow_multipair_v2",
+		},
+	})
+	if err != nil {
+		closeWebSocket(connection)
+		return nil, err
+	}
+	defer clear(hello)
+	if err := connection.WriteMessage(websocket.TextMessage, hello); err != nil {
+		closeWebSocket(connection)
+		return nil, errors.New("Direct signalling hello failed")
+	}
+	_ = connection.SetReadDeadline(time.Now().Add(15 * time.Second))
+	messageType, welcomeBytes, err := connection.ReadMessage()
+	if err != nil {
+		closeWebSocket(connection)
+		var closeError *websocket.CloseError
+		if errors.As(err, &closeError) {
+			return nil, fmt.Errorf("Direct signalling welcome closed with code %d", closeError.Code)
+		}
+		return nil, errors.New("Direct signalling welcome read failed")
+	}
+	if messageType != websocket.TextMessage || len(welcomeBytes) > 4<<10 {
+		closeWebSocket(connection)
+		return nil, errors.New("Direct signalling welcome is invalid")
+	}
+	defer clear(welcomeBytes)
+	if err := validateDirectSignalWelcome(welcomeBytes); err != nil {
+		closeWebSocket(connection)
+		return nil, err
+	}
+	_ = connection.SetReadDeadline(time.Time{})
+	_ = connection.SetWriteDeadline(time.Time{})
+	return connection, nil
+}
+
+func validateDirectSignalWelcome(welcomeBytes []byte) error {
+	var welcome struct {
+		Type                string   `json:"type"`
+		ProtocolVersion     int      `json:"protocol_version"`
+		Capabilities        []string `json:"capabilities"`
+		HeartbeatIntervalMS int64    `json:"heartbeat_interval_ms"`
+		MaxSignalFrameBytes int64    `json:"max_signal_frame_bytes"`
+	}
+	if err := json.Unmarshal(welcomeBytes, &welcome); err != nil ||
+		welcome.Type != "SERVER_WELCOME" ||
+		welcome.ProtocolVersion != 1 ||
+		welcome.HeartbeatIntervalMS < 1_000 ||
+		welcome.HeartbeatIntervalMS > 45_000 ||
+		welcome.MaxSignalFrameBytes != 65536 ||
+		len(welcome.Capabilities) != 2 ||
+		welcome.Capabilities[0] != "direct_transport_shadow_v1" ||
+		welcome.Capabilities[1] != "direct_transport_shadow_multipair_v2" {
+		return errors.New("Direct signalling welcome contract is invalid")
+	}
+	return nil
+}
+
+func addTransportSignalProof(headers http.Header, device *identity) error {
+	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	nonce, err := randomBase64(16)
+	if err != nil {
+		return err
+	}
+	bodyHash := sha256.Sum256(nil)
+	canonical := strings.Join([]string{
+		transportSignalProofDomain,
+		http.MethodGet,
+		"/v1/transport/signals",
+		timestamp,
+		nonce,
+		hex.EncodeToString(bodyHash[:]),
+	}, "\n")
+	headers.Set("X-TermLink-Device", device.id.String())
+	headers.Set("X-TermLink-Timestamp", timestamp)
+	headers.Set("X-TermLink-Nonce", nonce)
+	headers.Set("X-TermLink-Signature", base64.RawURLEncoding.EncodeToString(ed25519.Sign(device.private, []byte(canonical))))
+	return nil
+}
+
+func closeWebSocket(connection *websocket.Conn) {
+	if connection == nil {
+		return
+	}
+	deadline := time.Now().Add(time.Second)
+	_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+	_ = connection.Close()
+}
+
+func containsString(values []any, expected string) bool {
+	for _, value := range values {
+		if text, ok := value.(string); ok && text == expected {
+			return true
+		}
+	}
+	return false
 }
 
 // A persisted probe identity deliberately reuses its PC UUID across runs, but

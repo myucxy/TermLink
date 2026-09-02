@@ -91,12 +91,25 @@ function Get-TermLinkAcceptancePaths {
         OidcClientSecret = Join-Path $secretRoot 'oidc-client-secret'
         DatabaseUrl = Join-Path $secretRoot 'database-url'
         RedisUrl = Join-Path $secretRoot 'redis-url'
+        DirectValkeyPassword = Join-Path $secretRoot 'direct-valkey-password'
+        DirectRedisUrl = Join-Path $secretRoot 'direct-redis-url'
         TokenSigningKey = Join-Path $secretRoot 'token-signing-key'
         S3AccessKey = Join-Path $secretRoot 's3-access-key'
         S3SecretKey = Join-Path $secretRoot 's3-secret-key'
         RootCa = Join-Path $secretRoot 'acceptance-root-ca.crt'
         ProbeIdentity = Join-Path $secretRoot 'production-probe-pc.json'
     }
+}
+
+function Set-TermLinkAcceptanceDirectComposeEnvironment {
+    param(
+        [Parameter(Mandatory)]$Paths,
+        [Parameter(Mandatory)][string]$STUNServers
+    )
+
+    $env:TERMLINK_DIRECT_REDIS_URL_FILE = $Paths.DirectRedisUrl
+    $env:TERMLINK_DIRECT_VALKEY_PASSWORD_FILE = $Paths.DirectValkeyPassword
+    $env:TERMLINK_DIRECT_STUN_SERVERS = $STUNServers
 }
 
 function Set-TermLinkAcceptanceComposeEnvironment {
@@ -115,4 +128,4 @@ function Set-TermLinkAcceptanceComposeEnvironment {
     $env:TERMLINK_ACCEPTANCE_S3_SECRET_KEY_FILE = $Paths.S3SecretKey
 }
 
-Export-ModuleMember -Function Get-TermLinkAcceptancePaths, Set-TermLinkAcceptanceComposeEnvironment, Protect-TermLinkAcceptanceSecretTree
+Export-ModuleMember -Function Get-TermLinkAcceptancePaths, Set-TermLinkAcceptanceComposeEnvironment, Set-TermLinkAcceptanceDirectComposeEnvironment, Protect-TermLinkAcceptanceSecretTree

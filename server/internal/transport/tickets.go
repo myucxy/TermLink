@@ -382,6 +382,9 @@ func (s *RouteTicketService) AuthorizeAndPublishSignal(ctx context.Context, prin
 	}
 	switch result.Status {
 	case DirectSignalPublishAccepted:
+		if result.SubscriberCount != 1 {
+			return ErrDirectStateUnavailable
+		}
 		return nil
 	case DirectSignalPublishReplay:
 		return ErrTransportReplay

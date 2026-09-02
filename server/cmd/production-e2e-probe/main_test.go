@@ -133,6 +133,29 @@ func TestPositiveInt64FieldAcceptsIntegerDecodedWithUseNumber(t *testing.T) {
 	}
 }
 
+func TestValidateDirectSignalWelcomeMatchesProductionMultipairContract(t *testing.T) {
+	valid := []byte(`{"type":"SERVER_WELCOME","protocol_version":1,"capabilities":["direct_transport_shadow_v1","direct_transport_shadow_multipair_v2"],"heartbeat_interval_ms":15000,"max_signal_frame_bytes":65536}`)
+	if err := validateDirectSignalWelcome(valid); err != nil {
+		t.Fatalf("valid Direct signal welcome rejected: %v", err)
+	}
+
+	invalid := map[string][]byte{
+		"heartbeat too low":    []byte(`{"type":"SERVER_WELCOME","protocol_version":1,"capabilities":["direct_transport_shadow_v1","direct_transport_shadow_multipair_v2"],"heartbeat_interval_ms":999,"max_signal_frame_bytes":65536}`),
+		"heartbeat too high":   []byte(`{"type":"SERVER_WELCOME","protocol_version":1,"capabilities":["direct_transport_shadow_v1","direct_transport_shadow_multipair_v2"],"heartbeat_interval_ms":45001,"max_signal_frame_bytes":65536}`),
+		"capability missing":   []byte(`{"type":"SERVER_WELCOME","protocol_version":1,"capabilities":["direct_transport_shadow_v1"],"heartbeat_interval_ms":15000,"max_signal_frame_bytes":65536}`),
+		"capability reordered": []byte(`{"type":"SERVER_WELCOME","protocol_version":1,"capabilities":["direct_transport_shadow_multipair_v2","direct_transport_shadow_v1"],"heartbeat_interval_ms":15000,"max_signal_frame_bytes":65536}`),
+		"capability extra":     []byte(`{"type":"SERVER_WELCOME","protocol_version":1,"capabilities":["direct_transport_shadow_v1","direct_transport_shadow_multipair_v2","unexpected"],"heartbeat_interval_ms":15000,"max_signal_frame_bytes":65536}`),
+		"frame size changed":   []byte(`{"type":"SERVER_WELCOME","protocol_version":1,"capabilities":["direct_transport_shadow_v1","direct_transport_shadow_multipair_v2"],"heartbeat_interval_ms":15000,"max_signal_frame_bytes":65535}`),
+	}
+	for name, value := range invalid {
+		t.Run(name, func(t *testing.T) {
+			if err := validateDirectSignalWelcome(value); err == nil {
+				t.Fatal("invalid Direct signal welcome accepted")
+			}
+		})
+	}
+}
+
 func TestProbeRunIdempotencyKeyIsFresh(t *testing.T) {
 	first := newProbeRunIdempotencyKey("pc-presence")
 	second := newProbeRunIdempotencyKey("pc-presence")

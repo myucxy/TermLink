@@ -436,10 +436,6 @@ local recipientMultipair=redis.call('HGET',KEYS[4],'multipair_v2')
 if signalType>10 and recipientAccount and
    (redis.call('HGET',KEYS[4],'schema')~='2' or recipientMultipair~='1') then return {2,0,now} end
 
-redis.call('HSET',KEYS[1],lastField,ARGV[9],nonceField,'1')
-redis.call('HINCRBY',KEYS[1],signalField,1)
-if candidate then redis.call('HINCRBY',KEYS[1],candidateField,1) end
-
 local subscribers=0
 if recipientAccount and recipientInstance and recipientMailbox and recipientPeer and
    redis.call('GET',ARGV[15]..recipientInstance)==recipientMailbox then
@@ -447,6 +443,11 @@ if recipientAccount and recipientInstance and recipientMailbox and recipientPeer
   local message='DTS1'..ARGV[4]..recipientPeer..ARGV[13]
   subscribers=redis.call('PUBLISH',channel,message)
 end
+if subscribers~=1 then return {2,subscribers,now} end
+
+redis.call('HSET',KEYS[1],lastField,ARGV[9],nonceField,'1')
+redis.call('HINCRBY',KEYS[1],signalField,1)
+if candidate then redis.call('HINCRBY',KEYS[1],candidateField,1) end
 return {1,subscribers,now}`)
 
 func (s *DirectTransportState) AuthorizeAndPublish(ctx context.Context, request transport.DirectSignalPublishRequest) (transport.DirectSignalPublishResult, error) {

@@ -355,7 +355,7 @@ func runProduction() error {
 						Tokens: verifier, Devices: directRepository, Nonces: directValkey, SubjectKey: subjectKey,
 					}
 					startCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-					err = directHub.Start(startCtx)
+					err = directHub.Start(startCtx, ctx)
 					cancel()
 				}
 			}
@@ -379,13 +379,13 @@ func runProduction() error {
 		}
 	}
 	if directHub != nil {
+		defer directRepository.Close()
+		defer directValkey.Close()
 		defer func() {
 			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_ = directHub.Close(shutdown)
 		}()
-		defer directRepository.Close()
-		defer directValkey.Close()
 	}
 	portal, err := webportal.New(ctx, webportal.Config{
 		PublicURL:                 cfg.PublicURL,

@@ -52,9 +52,10 @@ func TestAcceptanceRealmDisablesNativeRegistrationAndUsesNativeClientLogin(t *te
 			Alias                    string `json:"alias"`
 			TopLevel                 bool   `json:"topLevel"`
 			AuthenticationExecutions []struct {
-				Authenticator string `json:"authenticator"`
-				FlowAlias     string `json:"flowAlias"`
-				Requirement   string `json:"requirement"`
+				Authenticator     string `json:"authenticator"`
+				AuthenticatorFlow bool   `json:"authenticatorFlow"`
+				FlowAlias         string `json:"flowAlias"`
+				Requirement       string `json:"requirement"`
 			} `json:"authenticationExecutions"`
 		} `json:"authenticationFlows"`
 	}
@@ -164,10 +165,17 @@ func TestAcceptanceRealmDisablesNativeRegistrationAndUsesNativeClientLogin(t *te
 		if !flow.TopLevel || nativeFlowID == "" {
 			t.Fatal("native browser flow must be a stable top-level flow")
 		}
+		foundNativeForms := false
 		for _, execution := range flow.AuthenticationExecutions {
 			if execution.Authenticator == "auth-otp-form" || strings.Contains(strings.ToLower(execution.FlowAlias), "otp") {
 				t.Fatal("native browser flow must not contain Web OTP")
 			}
+			if execution.FlowAlias == "termlink-native-forms" {
+				foundNativeForms = execution.AuthenticatorFlow && execution.Requirement == "ALTERNATIVE"
+			}
+		}
+		if !foundNativeForms {
+			t.Fatal("native browser flow must import native forms as an authentication sub-flow")
 		}
 	}
 	if nativeFlowID == "" || android.AuthenticationFlowBindingOverrides["browser"] != nativeFlowID ||

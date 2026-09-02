@@ -883,6 +883,12 @@ services:
           chmod 0400 "/target/$$name";
           chown 65532:65532 "/target/$$name";
         done;
+        rm -f /target/direct_redis_url;
+        if [ -f /run/secrets/direct_redis_url ]; then
+          cp /run/secrets/direct_redis_url /target/direct_redis_url;
+          chmod 0400 /target/direct_redis_url;
+          chown 65532:65532 /target/direct_redis_url;
+        fi;
         rm -f /target/acceptance-root-ca.crt;
         cp /data/caddy/pki/authorities/local/root.crt /target/acceptance-root-ca.crt;
         chmod 0400 /target/acceptance-root-ca.crt;

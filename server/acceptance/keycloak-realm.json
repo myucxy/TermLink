@@ -40,7 +40,7 @@
       "builtIn": false,
       "authenticationExecutions": [
         {"authenticator": "auth-cookie", "requirement": "ALTERNATIVE", "priority": 10, "userSetupAllowed": false},
-        {"flowAlias": "termlink-native-forms", "requirement": "ALTERNATIVE", "priority": 20, "userSetupAllowed": false}
+        {"flowAlias": "termlink-native-forms", "authenticatorFlow": true, "requirement": "ALTERNATIVE", "priority": 20, "userSetupAllowed": false}
       ]
     },
     {

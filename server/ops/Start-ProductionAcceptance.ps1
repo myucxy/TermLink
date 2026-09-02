@@ -7,6 +7,9 @@ param(
     [ValidatePattern('^https://[^/?#]+(?::[0-9]{1,5})?$')]
     [string]$AppShipBaseUrl = 'https://appship.kget.cc:8910',
     [string]$AppShipAllowedPrivateIPs = '192.168.9.250',
+    [switch]$EnableDirectTransportShadow,
+    [ValidateNotNullOrEmpty()]
+    [string]$DirectStunServers = 'stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302',
     [ValidatePattern('^docker\.io/myucxy/termlink:[A-Za-z0-9_.-]+@sha256:[0-9a-f]{64}$')]
     [string]$ServerImage,
     [ValidatePattern('^(?:docker\.io/)?myucxy/termlink:[0-9]+\.[0-9]+\.[0-9]+-local-production$')]
@@ -133,16 +136,19 @@ function Write-SecretFile {
 function Wait-ProductionAcceptanceStack {
     param(
         [Parameter(Mandatory)][string[]]$ComposeFile,
+        [string[]]$AdditionalHealthyServices = @(),
+        [string[]]$AdditionalCompletedServices = @(),
         [ValidateRange(30, 900)][int]$TimeoutSeconds = 300
     )
 
     $composeFileArguments = @($ComposeFile | ForEach-Object { '-f'; $_ })
 
-    $healthyServices = @('edge', 'lucky-upstream', 'postgres', 'valkey', 'minio', 'server', 'keycloak')
+    $healthyServices = @('edge', 'lucky-upstream', 'postgres', 'valkey', 'minio', 'server', 'keycloak') +
+        $AdditionalHealthyServices
     $runningServices = @()
     $completedServices = @(
         'runtime-secrets-init', 'keycloak-init', 'server-secrets-init', 'migrate'
-    )
+    ) + $AdditionalCompletedServices
     $expectedServices = @($healthyServices + $runningServices + $completedServices)
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $lastState = @{}
@@ -220,6 +226,23 @@ $endpoints = Set-AcceptanceEndpointEnvironment `
     -PublicUpstreamPort $LuckyPort
 $paths = Get-TermLinkAcceptancePaths
 $composeFiles = @($paths.ComposeFile)
+$directTransportComposeFile = Join-Path $paths.ServerRoot 'compose\direct-transport.compose.yml'
+$acceptanceDirectTransportComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.direct-transport.compose.yml'
+$additionalHealthyServices = @()
+$additionalCompletedServices = @()
+if ($EnableDirectTransportShadow) {
+    if (-not (Test-Path -LiteralPath $directTransportComposeFile -PathType Leaf)) {
+        throw "Direct transport Compose overlay not found: $directTransportComposeFile"
+    }
+    if (-not (Test-Path -LiteralPath $acceptanceDirectTransportComposeFile -PathType Leaf)) {
+        throw "Acceptance Direct transport Compose overlay not found: $acceptanceDirectTransportComposeFile"
+    }
+    Set-TermLinkAcceptanceDirectComposeEnvironment -Paths $paths -STUNServers $DirectStunServers
+    $composeFiles += $directTransportComposeFile
+    $composeFiles += $acceptanceDirectTransportComposeFile
+    $additionalHealthyServices += 'direct-valkey'
+    $additionalCompletedServices += 'direct-valkey-secrets-init'
+}
 $selectedServerImage = if (-not [string]::IsNullOrWhiteSpace($ServerImage)) {
     $ServerImage
 }
@@ -273,13 +296,31 @@ if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container)) 
     if (-not (Test-Path -LiteralPath $paths.InitialAdminPassword -PathType Leaf)) {
         $env:TERMLINK_ACCEPTANCE_ADMIN_INITIAL_PASSWORD_FILE = $paths.AdminPassword
     }
-    & docker compose @composeFileArguments down --volumes --remove-orphans
+    # Cleanup must describe every volume that a previous opt-in topology may
+    # have created. Keep this separate from $composeFiles so omitting the
+    # Direct switch still starts a Relay-only successor after the reset.
+    foreach ($directComposeFile in @($directTransportComposeFile, $acceptanceDirectTransportComposeFile)) {
+        if (-not (Test-Path -LiteralPath $directComposeFile -PathType Leaf)) {
+            throw "Direct transport Compose cleanup overlay not found: $directComposeFile"
+        }
+    }
+    Set-TermLinkAcceptanceDirectComposeEnvironment -Paths $paths -STUNServers $DirectStunServers
+    $resetComposeFiles = @($composeFiles)
+    if ($directTransportComposeFile -notin $resetComposeFiles) {
+        $resetComposeFiles += $directTransportComposeFile
+    }
+    if ($acceptanceDirectTransportComposeFile -notin $resetComposeFiles) {
+        $resetComposeFiles += $acceptanceDirectTransportComposeFile
+    }
+    $resetComposeFileArguments = @($resetComposeFiles | ForEach-Object { '-f'; $_ })
+    & docker compose @resetComposeFileArguments down --volumes --remove-orphans
     if ($LASTEXITCODE -ne 0) { throw 'Could not reset the production acceptance stack.' }
     $productionPolicyEnvironment = Join-Path $paths.SecretRoot 'production-policy.env'
     foreach ($file in @(
         $paths.AdminPassword, $paths.InitialAdminPassword, $paths.InitialAdminClaimed,
         $paths.InitialAdminReady, $paths.InitialAdminLock, $paths.UserPassword, $paths.PostgresPassword,
         $paths.ValkeyPassword, $paths.OidcClientSecret, $paths.DatabaseUrl, $paths.RedisUrl,
+        $paths.DirectValkeyPassword, $paths.DirectRedisUrl,
         $paths.S3AccessKey, $paths.S3SecretKey,
         $paths.TokenSigningKey, $paths.RootCa, $paths.ProbeIdentity,
         $productionPolicyEnvironment
@@ -342,6 +383,25 @@ try {
 finally {
     $valkeyPassword = $null
 }
+if ($EnableDirectTransportShadow) {
+    $directValkeyPassword = if (Test-Path -LiteralPath $paths.DirectValkeyPassword -PathType Leaf) {
+        [IO.File]::ReadAllText($paths.DirectValkeyPassword).Trim()
+    } else {
+        $generated = New-RandomText 32
+        Write-SecretFile $paths.DirectValkeyPassword $generated
+        $generated
+    }
+    if ($directValkeyPassword -notmatch '^[A-Za-z0-9_-]{16,128}$') {
+        $directValkeyPassword = $null
+        throw 'The managed acceptance Direct Valkey password file is empty or has an invalid format.'
+    }
+    try {
+        Write-SecretFile $paths.DirectRedisUrl "redis://termlink-direct:$directValkeyPassword@direct-valkey:6379/0" -Force
+    }
+    finally {
+        $directValkeyPassword = $null
+    }
+}
 Write-SecretFile $paths.OidcClientSecret (New-RandomText 32)
 Write-SecretFile $paths.TokenSigningKey (New-RandomText 48)
 Write-SecretFile $paths.S3AccessKey (New-RandomText 24)
@@ -364,6 +424,15 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not close the public acceptance upstream
 # rerun so rotations reach their service-private volumes.
 & docker compose @composeFileArguments rm --stop --force runtime-secrets-init server-secrets-init keycloak-init
 if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the Keycloak policy initializer.' }
+if ($EnableDirectTransportShadow) {
+    & docker compose @composeFileArguments rm --stop --force direct-valkey-secrets-init
+    if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the Direct Valkey secret initializer.' }
+    # The Direct lane is deliberately not a server startup dependency. Prewarm
+    # its isolated state only for this explicit acceptance run so the server can
+    # enable shadow signaling without weakening Relay startup semantics.
+    & docker compose @composeFileArguments up --detach --wait direct-valkey
+    if ($LASTEXITCODE -ne 0) { throw 'Could not prewarm the Direct transport acceptance state.' }
+}
 # Recreate/build the project once. A second `compose up --wait` can restart the
 # completed initializer jobs and race Compose's own container replacement on
 # Docker Desktop, leaving the waiter bound to a removed container ID. Poll the
@@ -371,7 +440,9 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the Keycloak policy initiali
 # check to reach its production-ready terminal state.
 & docker compose @composeFileArguments up --build --detach --remove-orphans
 if ($LASTEXITCODE -ne 0) { throw 'Could not build or recreate the production acceptance stack.' }
-Wait-ProductionAcceptanceStack -ComposeFile $composeFiles -TimeoutSeconds 300
+Wait-ProductionAcceptanceStack -ComposeFile $composeFiles `
+    -AdditionalHealthyServices $additionalHealthyServices `
+    -AdditionalCompletedServices $additionalCompletedServices -TimeoutSeconds 300
 
 function Assert-RuntimeSecretMetadata {
     param(
@@ -390,6 +461,12 @@ Assert-RuntimeSecretMetadata -Service postgres -Path /run/secrets/postgres_passw
 Assert-RuntimeSecretMetadata -Service valkey -Path /run/secrets/valkey_password -Expected '400:999:1000'
 Assert-RuntimeSecretMetadata -Service minio -Path /run/secrets/s3_access_key -Expected '400:0:0'
 Assert-RuntimeSecretMetadata -Service minio -Path /run/secrets/s3_secret_key -Expected '400:0:0'
+if ($EnableDirectTransportShadow) {
+    Assert-RuntimeSecretMetadata `
+        -Service direct-valkey `
+        -Path /run/secrets/direct_valkey_password `
+        -Expected '400:999:1000'
+}
 
 if (Test-Path -LiteralPath $paths.RootCa -PathType Leaf) {
     Remove-Item -LiteralPath $paths.RootCa -Force
@@ -405,6 +482,7 @@ $env:TERMLINK_ACCEPTANCE_HISTORY_ORIGIN = $endpoints.HistoryOrigin
 $env:TERMLINK_ACCEPTANCE_CA_FILE = $paths.RootCa
 $env:TERMLINK_ACCEPTANCE_USER_NAME = 'acceptance-probe'
 $env:TERMLINK_ACCEPTANCE_PROBE_IDENTITY_FILE = $paths.ProbeIdentity
+$env:TERMLINK_ACCEPTANCE_REQUIRE_DIRECT_TRANSPORT = if ($EnableDirectTransportShadow) { '1' } else { '0' }
 $go = if (Test-Path -LiteralPath 'D:\Dev\Env\Go\bin\go.exe' -PathType Leaf) {
     'D:\Dev\Env\Go\bin\go.exe'
 } else {
@@ -431,6 +509,9 @@ Protect-TermLinkAcceptanceSecretTree -SecretRoot $paths.SecretRoot
 $oneShotServices = @(
     'runtime-secrets-init', 'keycloak-init', 'server-secrets-init', 'migrate'
 )
+if ($EnableDirectTransportShadow) {
+    $oneShotServices += 'direct-valkey-secrets-init'
+}
 & docker compose @composeFileArguments rm --force @oneShotServices
 if ($LASTEXITCODE -ne 0) { throw 'Could not remove completed production acceptance jobs.' }
 

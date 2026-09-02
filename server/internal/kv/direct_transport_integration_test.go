@@ -214,8 +214,74 @@ func TestDirectTransportStatePublishesByteIdenticallyAcrossStores(t *testing.T) 
 	}
 	request.SignalSequence = 2
 	request.Nonce[0] = 1
-	if next, err := second.AuthorizeAndPublish(ctx, request); err != nil || next.Status != transport.DirectSignalPublishAccepted {
+	if next, err := second.AuthorizeAndPublish(ctx, request); err != nil || next.Status != transport.DirectSignalPublishAccepted || next.SubscriberCount != 1 {
 		t.Fatalf("contiguous sequence result=%+v error=%v", next, err)
+	}
+	if err := subscription.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitDirectMailboxSubscriberCount(t, ctx, first, recipientMailbox, 0)
+
+	request.SignalSequence = 3
+	request.Nonce[0] = 2
+	if missing, err := first.AuthorizeAndPublish(ctx, request); err != nil || missing.Status != transport.DirectSignalPublishDenied || missing.SubscriberCount != 0 {
+		t.Fatalf("no-subscriber result=%+v error=%v, want denied without consuming sequence", missing, err)
+	}
+	recovered, err := second.SubscribeMailbox(ctx, recipientMailbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	if retried, err := first.AuthorizeAndPublish(ctx, request); err != nil || retried.Status != transport.DirectSignalPublishAccepted || retried.SubscriberCount != 1 {
+		t.Fatalf("same signal after subscriber recovery result=%+v error=%v, want accepted", retried, err)
+	}
+	if _, err := recovered.Receive(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	duplicate, err := second.SubscribeMailbox(ctx, recipientMailbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitDirectMailboxSubscriberCount(t, ctx, first, recipientMailbox, 2)
+	request.SignalSequence = 4
+	request.Nonce[0] = 3
+	if ambiguous, err := first.AuthorizeAndPublish(ctx, request); err != nil || ambiguous.Status != transport.DirectSignalPublishDenied || ambiguous.SubscriberCount != 2 {
+		t.Fatalf("multiple-subscriber result=%+v error=%v, want denied without consuming sequence", ambiguous, err)
+	}
+	if err := duplicate.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitDirectMailboxSubscriberCount(t, ctx, first, recipientMailbox, 1)
+	if retried, err := first.AuthorizeAndPublish(ctx, request); err != nil || retried.Status != transport.DirectSignalPublishAccepted || retried.SubscriberCount != 1 {
+		t.Fatalf("same signal after duplicate subscriber retired result=%+v error=%v, want accepted", retried, err)
+	}
+}
+
+func waitDirectMailboxSubscriberCount(
+	t *testing.T,
+	ctx context.Context,
+	state *DirectTransportState,
+	mailbox transport.DirectMailbox,
+	want int64,
+) {
+	t.Helper()
+	channel := state.mailboxChannel(mailbox)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		counts, err := state.client.PubSubNumSub(ctx, channel).Result()
+		if err != nil {
+			t.Fatalf("query Direct mailbox subscriber count: %v", err)
+		}
+		if counts[channel] == want {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("Direct mailbox subscriber count=%d, want %d: %v", counts[channel], want, ctx.Err())
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -366,13 +432,28 @@ func TestDirectTransportValkeySequenceMatchesLocalPolicy(t *testing.T) {
 		t.Fatalf("FinalizeTicket() status=%v error=%v", status, err)
 	}
 	mailbox := transport.DirectMailbox{InstanceID: uuid.New(), Generation: uuid.New()}
+	recipientMailbox := transport.DirectMailbox{InstanceID: uuid.New(), Generation: uuid.New()}
+	subscription, err := store.SubscribeMailbox(ctx, recipientMailbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscription.Close()
 	if _, err := store.RegisterMailbox(ctx, mailbox); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RegisterMailbox(ctx, recipientMailbox); err != nil {
 		t.Fatal(err)
 	}
 	sender := transport.DirectPresence{
 		AccountID: accountID, DeviceID: senderID, Mailbox: mailbox, PeerGeneration: uuid.New(),
 	}
+	recipient := transport.DirectPresence{
+		AccountID: accountID, DeviceID: recipientID, Mailbox: recipientMailbox, PeerGeneration: uuid.New(),
+	}
 	if _, err := store.RegisterPresence(ctx, sender); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RegisterPresence(ctx, recipient); err != nil {
 		t.Fatal(err)
 	}
 
