@@ -28,6 +28,7 @@ namespace TermLink.ProductionDirectTransport.Validation
             {
                 ValidateRelayFallbackAndFoundationBoundary();
                 ValidateFeatureAdvertisementDefaultsOff();
+                DirectTransportDiagnosticsValidation.Validate();
                 ValidateEpochRateAndFailureCooldown();
                 ValidatePeerIsolationAndStaleGenerationCallbacks();
                 ValidateCandidateFilteringAndSocketLease();

@@ -313,7 +313,8 @@ namespace TermLink.Agent
                             GetDirectShadowAccessTokenAsync,
                             enabled: true,
                             multipairV2Enabled: true),
-                        peerProvider: SnapshotDirectPeerAuthorizationsAsync);
+                        peerProvider: SnapshotDirectPeerAuthorizationsAsync,
+                        diagnostics: ProductionDirectTransportDiagnostics.CreateForProcess());
                 }
                 catch (Exception error) when (error is not OutOfMemoryException)
                 {
@@ -516,7 +517,12 @@ namespace TermLink.Agent
         private void ObserveDirectRelayConnectedSafely(bool connected)
         {
             if (directShadowRuntime == null) return;
-            try { directShadowRuntime.ObserveRelayConnected(connected); }
+            try
+            {
+                directShadowRuntime.ObserveRelayConnected(
+                    connected,
+                    connectionSupervisor.Snapshot().PhysicalGeneration);
+            }
             catch (Exception error) when (error is not OutOfMemoryException) { }
         }
 

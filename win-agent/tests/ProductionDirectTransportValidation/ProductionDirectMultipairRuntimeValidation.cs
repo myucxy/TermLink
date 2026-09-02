@@ -2,11 +2,14 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -39,6 +42,10 @@ namespace TermLink.ProductionDirectTransport.Validation
                 new ProductionReconnectPreferences(), nextJitterMilliseconds: () => 0,
                 utcNow: () => now.UtcDateTime);
             var relayGeneration = relay.MarkPhysicalConnected();
+            var diagnosticRoot = Path.Combine(Path.GetTempPath(),
+                "TermLink-direct-runtime-diagnostics-" + Guid.NewGuid().ToString("N"));
+            using var diagnostics = ProductionDirectTransportDiagnostics.CreateForValidation(
+                "1", diagnosticRoot, () => now.UtcDateTime);
             await using var runtime = new ProductionDirectMultipairShadowRuntime(
                 true, pc, ProductionAgentRuntime.DeviceKeyId(pc), pcIdentity, directSupervisor, () => signaling,
                 _ => Task.FromResult<IReadOnlyList<ProductionDirectPeerAuthorization>>(new[]
@@ -50,9 +57,10 @@ namespace TermLink.ProductionDirectTransport.Validation
                 platform: new FakePlatform(),
                 delay: ShortDelay,
                 clockMilliseconds: () => now.ToUnixTimeMilliseconds(),
-                nativeCapability: () => true);
+                nativeCapability: () => true,
+                diagnostics: diagnostics);
             Require(runtime.Start(), "The ABI v4 multipair runtime did not start.");
-            runtime.ObserveRelayConnected(true);
+            runtime.ObserveRelayConnected(true, relayGeneration);
             var drive = DriveAndroidAsync(runtime, signaling, native, ticket, android, pc, pairwise,
                 now.ToUnixTimeMilliseconds());
             try { await drive.WaitAsync(TimeSpan.FromSeconds(8)).ConfigureAwait(false); }
@@ -70,6 +78,17 @@ namespace TermLink.ProductionDirectTransport.Validation
                     relay.Snapshot().PhysicalConnected && relay.Snapshot().PhysicalGeneration == relayGeneration &&
                     relay.Snapshot().ScheduledReconnects == 0,
                 "Windows v4 responder did not complete the exact fifth-pair shadow flow.");
+            Require(diagnostics.WaitForIdleForValidation(TimeSpan.FromSeconds(5)),
+                "The shadow-ready runtime diagnostic did not drain asynchronously.");
+            ValidateRuntimeDiagnostic(
+                diagnostics.Path,
+                "SHADOW_READY_NOT_ROUTED",
+                relayGeneration,
+                0,
+                ticket.PathEpoch,
+                5,
+                "SRFLX",
+                "SRFLX");
 
             native.InjectFailure();
             await WaitUntilAsync(() => runtime.Snapshot.State == ProductionDirectShadowState.RelayOnly &&
@@ -78,13 +97,68 @@ namespace TermLink.ProductionDirectTransport.Validation
                     relay.Snapshot().ScheduledReconnects == 0 && directSupervisor.Snapshot().RelayConnected &&
                     native.DisposeCalls == 1,
                 "An ABI v4 Direct fault recreated or disconnected the authoritative Relay.");
+            runtime.NotifyNetworkChanged();
+            Require(diagnostics.WaitForIdleForValidation(TimeSpan.FromSeconds(5)),
+                "The Relay-only runtime diagnostic did not drain asynchronously.");
+            ValidateRuntimeDiagnostic(
+                diagnostics.Path,
+                "RELAY_ONLY",
+                relayGeneration,
+                1,
+                0,
+                0,
+                "NONE",
+                "NONE",
+                "NETWORK_CHANGED");
+            await runtime.DisposeAsync().ConfigureAwait(false);
+            diagnostics.Dispose();
+            Require(diagnostics.WaitForCompletionForValidation(TimeSpan.FromSeconds(5)),
+                "The runtime diagnostic writer did not finish before cleanup.");
+            try { Directory.Delete(diagnosticRoot, true); }
+            catch { }
             await ValidatePrematureFinalPlanFailsClosedAsync(
                 pcIdentity, androidIdentity, serverIdentity, pairwise, now).ConfigureAwait(false);
             CryptographicOperations.ZeroMemory(pairwise);
 
             await ValidateUnavailableNativeFailsClosedAsync(pc, pcIdentity).ConfigureAwait(false);
+            await ValidateBlockingDiagnosticsCannotBlockRuntimeAsync(pc, pcIdentity).ConfigureAwait(false);
             await ValidateUnsupportedCapabilityFailsClosedAsync(pc, pcIdentity, android,
                 androidIdentity, serverIdentity, now).ConfigureAwait(false);
+        }
+
+        private static void ValidateRuntimeDiagnostic(
+            string path,
+            string state,
+            long relayGeneration,
+            long networkGeneration,
+            ulong pathEpoch,
+            uint selectedPairRank,
+            string localCandidateType,
+            string remoteCandidateType,
+            string reasonCode = "NONE")
+        {
+            var records = File.ReadAllLines(path)
+                .Select(value => JsonDocument.Parse(value))
+                .ToArray();
+            try
+            {
+                var record = records.Select(value => value.RootElement)
+                    .LastOrDefault(value => value.GetProperty("state").GetString() == state &&
+                        value.GetProperty("reason_code").GetString() == reasonCode);
+                Require(record.ValueKind == JsonValueKind.Object &&
+                        record.GetProperty("relay_generation").GetInt64() == relayGeneration &&
+                        record.GetProperty("network_generation").GetInt64() == networkGeneration &&
+                        record.GetProperty("path_epoch").GetUInt64() == pathEpoch &&
+                        record.GetProperty("selected_pair_rank").GetUInt32() == selectedPairRank &&
+                        record.GetProperty("local_candidate_type").GetString() == localCandidateType &&
+                        record.GetProperty("remote_candidate_type").GetString() == remoteCandidateType &&
+                        !record.GetProperty("direct_routing_permitted").GetBoolean(),
+                    "The multipair runtime emitted incomplete or incorrectly directed Direct evidence.");
+            }
+            finally
+            {
+                foreach (var record in records) record.Dispose();
+            }
         }
 
         private static async Task ValidateUnavailableNativeFailsClosedAsync(
@@ -94,6 +168,11 @@ namespace TermLink.ProductionDirectTransport.Validation
             var nativeCalls = 0;
             var peerCalls = 0;
             var supervisor = new ProductionDirectTransportSupervisor();
+            var blockedDiagnosticRoot = Path.Combine(Path.GetTempPath(),
+                "TermLink-direct-blocked-diagnostics-" + Guid.NewGuid().ToString("N"));
+            File.WriteAllText(blockedDiagnosticRoot, "not a directory");
+            using var failingDiagnostics = ProductionDirectTransportDiagnostics.CreateForValidation(
+                "1", blockedDiagnosticRoot);
             await using var runtime = new ProductionDirectMultipairShadowRuntime(
                 true, pc, ProductionAgentRuntime.DeviceKeyId(pc), pcIdentity, supervisor,
                 () => { signalingCalls++; throw new InvalidOperationException(); },
@@ -101,7 +180,8 @@ namespace TermLink.ProductionDirectTransport.Validation
                     Array.Empty<ProductionDirectPeerAuthorization>()); },
                 nativeFactory: () => { nativeCalls++; throw new InvalidOperationException(); },
                 delay: ShortDelay,
-                nativeCapability: () => false);
+                nativeCapability: () => false,
+                diagnostics: failingDiagnostics);
             runtime.Start();
             runtime.ObserveRelayConnected(true);
             await WaitUntilAsync(() => runtime.Snapshot.ReasonCode == "DIRECT_ABI_V4_UNAVAILABLE",
@@ -109,6 +189,113 @@ namespace TermLink.ProductionDirectTransport.Validation
             Require(signalingCalls == 0 && nativeCalls == 0 && peerCalls == 0 &&
                     !runtime.Snapshot.DirectRoutingPermitted,
                 "An unusable ABI v4 library advertised multipair or started Direct work.");
+            await runtime.DisposeAsync().ConfigureAwait(false);
+            failingDiagnostics.Dispose();
+            Require(failingDiagnostics.WaitForCompletionForValidation(TimeSpan.FromSeconds(5)),
+                "The failed diagnostic writer did not finish before its fixture was deleted.");
+            File.Delete(blockedDiagnosticRoot);
+        }
+
+        private static async Task ValidateBlockingDiagnosticsCannotBlockRuntimeAsync(
+            Guid pc, DeviceIdentity pcIdentity)
+        {
+            var root = Path.Combine(Path.GetTempPath(),
+                "TermLink-direct-blocking-writer-" + Guid.NewGuid().ToString("N"));
+            using var blockingWriter = new BlockingDiagnosticsWriter();
+            using var diagnostics = ProductionDirectTransportDiagnostics.CreateForValidation(
+                "1", root, writer: blockingWriter, pendingLineCapacity: 8);
+            var supervisor = new ProductionDirectTransportSupervisor();
+            await using var runtime = new ProductionDirectMultipairShadowRuntime(
+                true, pc, ProductionAgentRuntime.DeviceKeyId(pc), pcIdentity, supervisor,
+                () => throw new InvalidOperationException("Signaling must remain disabled."),
+                _ => Task.FromResult<IReadOnlyList<ProductionDirectPeerAuthorization>>(
+                    Array.Empty<ProductionDirectPeerAuthorization>()),
+                nativeFactory: () => throw new InvalidOperationException("Native must remain disabled."),
+                delay: ShortDelay,
+                nativeCapability: () => false,
+                diagnostics: diagnostics);
+            try
+            {
+                Require(runtime.Start(), "The blocking-diagnostics runtime fixture did not start.");
+                runtime.ObserveRelayConnected(true, 71);
+                Require(blockingWriter.WaitUntilBlocked(TimeSpan.FromSeconds(5)),
+                    "The injected diagnostic writer did not enter its blocking filesystem call.");
+
+                var timer = Stopwatch.StartNew();
+                Require(diagnostics.Observe(
+                        "GATHERING", "NONE", 71, 0, 1, 0, "NONE", "NONE"),
+                    "Observe did not admit evidence while its writer was blocked.");
+                timer.Stop();
+                Require(timer.Elapsed < TimeSpan.FromMilliseconds(250),
+                    "Observe waited for the blocked diagnostic writer.");
+
+                timer.Restart();
+                runtime.ObserveRelayConnected(false, 72);
+                runtime.ObserveRelayConnected(true, 73);
+                runtime.NotifyNetworkChanged();
+                timer.Stop();
+                Require(timer.Elapsed < TimeSpan.FromMilliseconds(250),
+                    "Relay generation or reconnect callbacks waited for the blocked diagnostic writer.");
+
+                timer.Restart();
+                await runtime.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(1))
+                    .ConfigureAwait(false);
+                timer.Stop();
+                Require(timer.Elapsed < TimeSpan.FromSeconds(1) &&
+                        runtime.Snapshot.State == ProductionDirectShadowState.Stopped &&
+                        supervisor.Snapshot().RelayConnected,
+                    "Blocking diagnostics delayed runtime disposal or changed Relay authority.");
+
+                timer.Restart();
+                var droppedOnPressure = false;
+                for (var generation = 2; generation <= 32; generation++)
+                {
+                    if (diagnostics.Observe(
+                            "NEGOTIATING", "NONE", 73, generation, 0, 0, "NONE", "NONE"))
+                        continue;
+                    droppedOnPressure = true;
+                    break;
+                }
+                timer.Stop();
+                Require(droppedOnPressure && timer.Elapsed < TimeSpan.FromMilliseconds(250),
+                    "The blocked diagnostic writer did not apply bounded non-blocking pressure.");
+
+                var disposeTimer = Stopwatch.StartNew();
+                diagnostics.Dispose();
+                disposeTimer.Stop();
+                Require(disposeTimer.Elapsed < TimeSpan.FromMilliseconds(250),
+                    "Diagnostics disposal waited for the blocked writer.");
+            }
+            finally
+            {
+                blockingWriter.Release();
+                diagnostics.Dispose();
+            }
+
+            Require(diagnostics.WaitForCompletionForValidation(TimeSpan.FromSeconds(5)),
+                "The released diagnostic writer did not finish before cleanup.");
+            ValidateRuntimeDiagnostic(
+                diagnostics.Path,
+                "WAITING_FOR_RELAY",
+                72,
+                0,
+                0,
+                0,
+                "NONE",
+                "NONE",
+                "RELAY_UNAVAILABLE");
+            ValidateRuntimeDiagnostic(
+                diagnostics.Path,
+                "STOPPED",
+                73,
+                1,
+                0,
+                0,
+                "NONE",
+                "NONE",
+                "STOPPED");
+            try { Directory.Delete(root, true); }
+            catch { }
         }
 
         private static async Task ValidatePrematureFinalPlanFailsClosedAsync(
@@ -431,6 +618,35 @@ namespace TermLink.ProductionDirectTransport.Validation
             ? Task.Delay(TimeSpan.FromMilliseconds(1), token) : Task.Delay(Timeout.InfiniteTimeSpan, token);
         private static byte[] GuidBytes(Guid value) => Convert.FromHexString(value.ToString("N"));
         private static void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); }
+
+        private sealed class BlockingDiagnosticsWriter :
+            IProductionDirectTransportDiagnosticsWriter, IDisposable
+        {
+            private readonly ManualResetEventSlim entered = new(false);
+            private readonly ManualResetEventSlim release = new(false);
+            private int blocked;
+
+            public void Append(string path, byte[] bytes, long maximumFileBytes)
+            {
+                if (Interlocked.Exchange(ref blocked, 1) == 0)
+                {
+                    entered.Set();
+                    release.Wait();
+                }
+                ProductionDirectTransportDiagnosticsFileWriter.Instance.Append(
+                    path, bytes, maximumFileBytes);
+            }
+
+            public bool WaitUntilBlocked(TimeSpan timeout) => entered.Wait(timeout);
+            public void Release() => release.Set();
+
+            public void Dispose()
+            {
+                release.Set();
+                entered.Dispose();
+                release.Dispose();
+            }
+        }
 
         private sealed class FakePlatform : IProductionDirectShadowPlatform
         {

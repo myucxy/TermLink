@@ -37,6 +37,7 @@ namespace TermLink.Agent
         private readonly IProductionDirectShadowPlatform platform;
         private readonly Func<TimeSpan, CancellationToken, Task> delay;
         private readonly Func<long> clockMilliseconds;
+        private readonly ProductionDirectTransportDiagnostics diagnostics;
         private readonly object sync = new();
         private readonly CancellationTokenSource lifetime = new();
         private readonly SemaphoreSlim wake = new(0, 1);
@@ -45,6 +46,8 @@ namespace TermLink.Agent
         private Task worker;
         private Attempt active;
         private bool relayConnected;
+        private long relayGeneration;
+        private long networkGeneration;
         private int disposed;
         private ProductionDirectShadowSnapshot snapshot;
 
@@ -60,7 +63,8 @@ namespace TermLink.Agent
             IProductionDirectShadowPlatform platform = null,
             Func<TimeSpan, CancellationToken, Task> delay = null,
             Func<long> clockMilliseconds = null,
-            Func<bool> nativeCapability = null)
+            Func<bool> nativeCapability = null,
+            ProductionDirectTransportDiagnostics diagnostics = null)
         {
             if (localDeviceId == Guid.Empty) throw new ArgumentException("A local device is required.");
             if (!ProductionDirectTransportSignalingClient.ValidKeyId(signalKeyId))
@@ -77,6 +81,7 @@ namespace TermLink.Agent
             this.platform = platform ?? new ProductionWindowsDirectShadowPlatform();
             this.delay = delay ?? Task.Delay;
             this.clockMilliseconds = clockMilliseconds ?? (() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            this.diagnostics = diagnostics;
             snapshot = new ProductionDirectShadowSnapshot
             {
                 State = enabled ? ProductionDirectShadowState.WaitingForRelay : ProductionDirectShadowState.Disabled,
@@ -100,9 +105,15 @@ namespace TermLink.Agent
 
         public void ObserveRelayConnected(bool connected)
         {
+            ObserveRelayConnected(connected, relayGeneration);
+        }
+
+        public void ObserveRelayConnected(bool connected, long generation)
+        {
             Attempt current = null;
             lock (sync)
             {
+                relayGeneration = Math.Max(0, generation);
                 relayConnected = connected;
                 supervisor.ObserveRelayConnected(connected);
                 if (!connected) current = active;
@@ -116,7 +127,13 @@ namespace TermLink.Agent
         public void NotifyNetworkChanged()
         {
             Attempt current;
-            lock (sync) current = active;
+            lock (sync)
+            {
+                networkGeneration = checked(networkGeneration + 1);
+                current = active;
+                if (current == null)
+                    ObserveDiagnosticsLocked(snapshot.State, "NETWORK_CHANGED", null);
+            }
             if (current != null) Retire(current, "NETWORK_CHANGED", true);
         }
 
@@ -990,12 +1007,37 @@ namespace TermLink.Agent
         private bool RelayConnected() { lock (sync) return relayConnected; }
         private void Publish(ProductionDirectShadowState state, string reason, Attempt attempt)
         { lock (sync) PublishLocked(state, reason, attempt); }
-        private void PublishLocked(ProductionDirectShadowState state, string reason, Attempt attempt) =>
+        private void PublishLocked(ProductionDirectShadowState state, string reason, Attempt attempt)
+        {
             snapshot = new ProductionDirectShadowSnapshot
             {
                 State = state, ReasonCode = reason ?? string.Empty, Epoch = attempt?.Epoch ?? 0,
                 AttemptId = attempt?.AttemptId ?? Guid.Empty, PeerDeviceId = attempt?.Peer?.DeviceId ?? Guid.Empty
             };
+            ObserveDiagnosticsLocked(state, reason, attempt);
+        }
+
+        private void ObserveDiagnosticsLocked(
+            ProductionDirectShadowState state,
+            string reason,
+            Attempt attempt)
+        {
+            if (diagnostics?.Enabled != true) return;
+            var selected = attempt?.SelectedPair;
+            diagnostics.Observe(
+                ProductionDirectTransportDiagnostics.StateCode(state),
+                reason,
+                relayGeneration,
+                networkGeneration,
+                attempt?.Epoch ?? 0,
+                selected?.Rank ?? 0,
+                selected == null
+                    ? "NONE"
+                    : ProductionDirectTransportDiagnostics.CandidateType(selected.Responder.Kind),
+                selected == null
+                    ? "NONE"
+                    : ProductionDirectTransportDiagnostics.CandidateType(selected.Initiator.Kind));
+        }
         private void Wake() { try { wake.Release(); } catch (SemaphoreFullException) { } catch (ObjectDisposedException) { } }
 
         public async ValueTask DisposeAsync()
@@ -1004,11 +1046,11 @@ namespace TermLink.Agent
             lifetime.Cancel(); Attempt current; Task running; SignalingLane currentLane;
             lock (sync) { current = active; running = worker; currentLane = lane; lane = null; }
             if (current != null) Retire(current, "STOPPED", false);
-            lock (sync) snapshot = new ProductionDirectShadowSnapshot
-            { State = ProductionDirectShadowState.Stopped, ReasonCode = "STOPPED" };
+            lock (sync) PublishLocked(ProductionDirectShadowState.Stopped, "STOPPED", null);
             if (currentLane != null) await currentLane.DisposeAsync().ConfigureAwait(false);
             if (running != null) { try { await running.ConfigureAwait(false); } catch (OperationCanceledException) { } }
             CryptographicOperations.ZeroMemory(signalKeyId);
+            diagnostics?.Dispose();
             lifetime.Dispose(); wake.Dispose();
         }
 
