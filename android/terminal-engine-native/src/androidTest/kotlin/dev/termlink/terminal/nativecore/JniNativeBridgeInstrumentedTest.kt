@@ -240,6 +240,7 @@ class JniNativeBridgeInstrumentedTest {
                         "\u001b[?25\$p" +
                         "\u001bP\$qm\u001b\\" +
                         "\u001bP+q436f;524742\u001b\\" +
+                        "\u001b[>q" +
                         "\u001b[=7u\u001b[?u" +
                         "\u001b]10;?\u001b\\" +
                         "\u001b]11;?\u001b\\"

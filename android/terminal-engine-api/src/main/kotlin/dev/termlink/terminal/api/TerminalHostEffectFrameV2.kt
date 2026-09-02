@@ -115,6 +115,7 @@ private fun isCanonicalHostEffectReplyV2(payload: ByteArray): Boolean {
         isCanonicalKittyReply(payload) ||
         isCanonicalDecrpm(payload) ||
         isCanonicalDecrqss(payload) ||
+        isCanonicalXtversion(payload) ||
         isCanonicalXtgettcap(payload) ||
         isCanonicalOscColor(payload)
 }
@@ -164,6 +165,9 @@ private fun isCanonicalDecrqss(payload: ByteArray): Boolean {
         status.contentEqualsAny("1 q", "2 q", "3 q", "4 q", "5 q", "6 q") ||
         status.contentEqualsAny("1\"q", "2\"q", "1*x", "2*x")
 }
+
+private fun isCanonicalXtversion(payload: ByteArray): Boolean =
+    payload.contentEquals(ascii("\u001bP>|TermLink(1)\u001b\\"))
 
 private fun canonicalSgrStatus(status: ByteArray): Boolean {
     if (status.contentEquals(ascii("0m"))) return true

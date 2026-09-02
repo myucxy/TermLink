@@ -320,9 +320,12 @@ class NativeInputV3HostEffectV2BridgeTest {
             hostEffectFrame = ByteArray(64),
         )
 
-        assertFailsWith<NativeTerminalContractException> {
+        val frameFailure = assertFailsWith<NativeTerminalContractException> {
             frameTerminal.feedWithHostEffectsV2(1, byteArrayOf(1))
         }
+        assertEquals("applyBatchWithHostEffectsV2.frameDecode", frameFailure.terminalOperation)
+        assertEquals("MALFORMED_BRIDGE_RESULT", frameFailure.terminalStatusName)
+        assertEquals(257, frameFailure.terminalStatusCode)
         assertFailsWith<IllegalStateException> { frameTerminal.render() }
         frameTerminal.close()
     }

@@ -175,6 +175,23 @@ class NativeTerminalHandleTest {
     }
 
     @Test
+    fun malformedScrollbackFrameExposesContentFreeFailureDiagnostics() {
+        val bridge = FakeNativeBridge().apply {
+            forcedRenderFrameV3 = NativeBridgeRenderFrame(byteArrayOf())
+        }
+        val terminal = NativeTerminalHandle.create(bridge, TerminalSize(8, 2), 1)
+
+        val failure = assertFailsWith<NativeTerminalContractException> {
+            terminal.renderV3AtScrollback(0)
+        }
+
+        assertEquals("renderV3AtScrollback.frameDecode", failure.terminalOperation)
+        assertEquals("MALFORMED_BRIDGE_RESULT", failure.terminalStatusName)
+        assertEquals(257, failure.terminalStatusCode)
+        terminal.close()
+    }
+
+    @Test
     fun checkpointRoundTripsWithoutExposingMutableStorage() {
         val bridge = FakeNativeBridge()
         val original = NativeTerminalHandle.create(bridge, TerminalSize(12, 4), 1)

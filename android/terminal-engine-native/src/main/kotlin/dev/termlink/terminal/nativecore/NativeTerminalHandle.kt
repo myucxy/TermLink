@@ -95,17 +95,17 @@ class NativeTerminalHandle private constructor(
                 TERMLINK_HOST_EFFECT_FRAME_V2_MAX_BYTES
             ) {
                 failMalformed(
-                    "applyBatchWithHostEffectsV2",
+                    "applyBatchWithHostEffectsV2.frameBounds",
                     "host-effect frame is outside the supported byte range",
                 )
             }
             try {
                 val decoded = try {
                     HostEffectFrameV2Decoder.decode(raw.copyHostEffectFrame())
-                } catch (error: RuntimeException) {
+                } catch (_: RuntimeException) {
                     failMalformed(
-                        "applyBatchWithHostEffectsV2",
-                        error.message ?: "host-effect frame is malformed",
+                        "applyBatchWithHostEffectsV2.frameDecode",
+                        "host-effect frame is malformed",
                     )
                 }
                 allocation = current.copy(
@@ -288,7 +288,7 @@ class NativeTerminalHandle private constructor(
             raw.appliedOffsetRows != offsetRows.coerceAtMost(raw.availableRows)
         ) {
             throw NativeTerminalContractException(
-                "renderV3AtScrollback",
+                "renderV3AtScrollback.metadata",
                 "bridge returned inconsistent scrollback metadata",
             )
         }
@@ -313,25 +313,28 @@ class NativeTerminalHandle private constructor(
     ) = run {
         if (payload.size > maxPayloadBytes || payload.size > limits.maxRenderFrameBytes) {
             throw NativeTerminalContractException(
-                operation,
+                "$operation.frameBounds",
                 "frame payload exceeds the requested bound",
             )
         }
         val decoded = try {
             RenderFrameV3Decoder.decode(payload)
         } catch (error: RenderFrameV3DecodeException) {
-            throw NativeTerminalContractException(operation, error.message ?: "malformed frame")
+            throw NativeTerminalContractException(
+                "$operation.frameDecode",
+                error.message ?: "malformed frame",
+            )
         }
         if (decoded.nextSourceSequence != current.nextSourceSequence) {
             throw NativeTerminalContractException(
-                operation,
+                "$operation.sourceSequence",
                 "expected next source sequence ${current.nextSourceSequence}, " +
                     "received ${decoded.nextSourceSequence}",
             )
         }
         if (decoded.presentationRevision != current.presentationRevision) {
             throw NativeTerminalContractException(
-                operation,
+                "$operation.presentationRevision",
                 "expected presentation revision ${current.presentationRevision}, " +
                     "received ${decoded.presentationRevision}",
             )
@@ -340,7 +343,7 @@ class NativeTerminalHandle private constructor(
             limits.validateSize(decoded.size, "render frame v3")
         } catch (error: IllegalArgumentException) {
             throw NativeTerminalContractException(
-                operation,
+                "$operation.dimensions",
                 error.message ?: "invalid frame size",
             )
         }

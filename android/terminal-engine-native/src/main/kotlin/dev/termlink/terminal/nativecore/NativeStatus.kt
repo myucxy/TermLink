@@ -79,7 +79,16 @@ class NativeTerminalException(
 class NativeTerminalContractException(
     val operation: String,
     message: String,
-) : IllegalStateException("Malformed result from native terminal '$operation': $message")
+) : IllegalStateException(
+    "Malformed result from native terminal '$operation': $message",
+), TerminalEngineFailureDiagnostics {
+    override val terminalOperation: String
+        get() = operation
+    override val terminalStatusName: String
+        get() = NativeTerminalStatus.MALFORMED_BRIDGE_RESULT.name
+    override val terminalStatusCode: Int
+        get() = NativeTerminalStatus.MALFORMED_BRIDGE_RESULT.code
+}
 
 sealed interface NativeBridgeResult<out T : Any> {
     data class Success<T : Any>(val value: T) : NativeBridgeResult<T>
