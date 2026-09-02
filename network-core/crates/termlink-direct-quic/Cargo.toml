@@ -1,0 +1,21 @@
+[package]
+name = "termlink-direct-quic"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+termlink-direct-nat = { path = "../termlink-direct-nat" }
+quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = "=0.13.2"
+ring = { version = "=0.17.14", default-features = false, features = ["std"] }
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
+tokio = { version = "=1.53.1", features = ["io-util", "rt", "sync", "time"] }
+
+[dev-dependencies]
+termlink-direct-wire = { path = "../termlink-direct-wire" }
+serde_json = "=1.0.151"
+
+[lints]
+workspace = true

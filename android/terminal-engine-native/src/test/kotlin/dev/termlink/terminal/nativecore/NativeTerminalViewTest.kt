@@ -4,6 +4,7 @@ import android.app.Activity
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.os.Looper
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import dev.termlink.terminal.api.ArgbColor
@@ -347,6 +348,42 @@ class NativeTerminalViewTest {
     }
 
     @Test
+    fun visibleCenteredTuiCursorDoesNotMoveTheViewportOnDirectionInput() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val size = TerminalSize(100, 24)
+        val bridge = FakeNativeBridge().apply {
+            forcedRenderFrameV3 = cursorFrame(
+                size = size,
+                cursorRow = 5,
+                cursorColumn = 40,
+                nextSourceSequence = 1,
+            )
+        }
+        val engine = NativeTerminalEngine(initialSize = size, bridge = bridge)
+        try {
+            val view = engine.createView(controller.get()) as NativeTerminalView
+            controller.get().setContentView(view)
+            view.layout(0, 0, 400, 300)
+            // Model a full-screen TUI such as OpenCode: its real input cursor is
+            // intentionally inside a centered prompt rather than at column zero.
+            view.positionViewportForTest(column = 20, fraction = 0f)
+            assertTrue(view.isCursorComfortablyVisibleForTest())
+            val viewportXBefore = view.viewportXForTest()
+            val viewportYBefore = view.viewportYForTest()
+
+            engine.setReadOnly(false)
+            assertTrue(engine.submitKeyCode(KeyEvent.KEYCODE_DPAD_DOWN))
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertEquals(viewportXBefore, view.viewportXForTest(), 0.01f)
+            assertEquals(viewportYBefore, view.viewportYForTest(), 0.01f)
+        } finally {
+            engine.dispose()
+            controller.destroy()
+        }
+    }
+
+    @Test
     fun verticalDragBrowsesLocalHistoryInBothDirections() {
         val controller = Robolectric.buildActivity(Activity::class.java).setup()
         val bridge = FakeNativeBridge().apply {
@@ -385,6 +422,66 @@ class NativeTerminalViewTest {
         } finally {
             engine.dispose()
             controller.destroy()
+        }
+    }
+
+    @Test
+    fun hiddenCursorArrowInputKeepsTheBrowsedViewportWhileStillEncodingInput() {
+        val size = TerminalSize(80, 24)
+        val bridge = FakeNativeBridge().apply {
+            forcedScrollbackAvailableRows = 12
+            forcedScrollbackGenerationRows = 12
+            forcedScrollbackFrames[3] = cursorFrame(
+                size = size,
+                cursorRow = 23,
+                nextSourceSequence = 1,
+                cursorVisible = false,
+            )
+        }
+        val engine = NativeTerminalEngine(initialSize = size, bridge = bridge)
+        try {
+            val navigation = engine.beginHistoryNavigation()
+            assertEquals(NativeHistoryScrollResult.MOVED, engine.scrollHistoryRows(3, navigation))
+            assertFalse(engine.frames.value.cursor.visible)
+            val encodedBefore = bridge.inputV1Calls + bridge.inputV2Calls + bridge.inputV3Calls
+
+            engine.setReadOnly(false)
+            assertTrue(engine.submitKeyCode(KeyEvent.KEYCODE_DPAD_UP))
+
+            assertEquals(3L, engine.historyOffsetRowsForTest())
+            assertTrue(
+                "the direction key must still reach terminal-core",
+                bridge.inputV1Calls + bridge.inputV2Calls + bridge.inputV3Calls > encodedBefore,
+            )
+        } finally {
+            engine.dispose()
+        }
+    }
+
+    @Test
+    fun visibleCursorInputStillReturnsTheNativeViewportToLiveOutput() {
+        val size = TerminalSize(80, 24)
+        val bridge = FakeNativeBridge().apply {
+            forcedScrollbackAvailableRows = 12
+            forcedScrollbackGenerationRows = 12
+            forcedScrollbackFrames[3] = cursorFrame(
+                size = size,
+                cursorRow = 23,
+                nextSourceSequence = 1,
+                cursorVisible = true,
+            )
+        }
+        val engine = NativeTerminalEngine(initialSize = size, bridge = bridge)
+        try {
+            val navigation = engine.beginHistoryNavigation()
+            assertEquals(NativeHistoryScrollResult.MOVED, engine.scrollHistoryRows(3, navigation))
+
+            engine.setReadOnly(false)
+            assertTrue(engine.submitKeyCode(KeyEvent.KEYCODE_DPAD_UP))
+
+            assertEquals(0L, engine.historyOffsetRowsForTest())
+        } finally {
+            engine.dispose()
         }
     }
 
@@ -571,12 +668,14 @@ class NativeTerminalViewTest {
         cursorRow: Int,
         cursorColumn: Int = 0,
         nextSourceSequence: Long,
+        cursorVisible: Boolean = true,
     ): NativeBridgeRenderFrame = NativeBridgeRenderFrame(
         payload = fakeRenderFrameV3(
             nextSourceSequence = nextSourceSequence,
             size = size,
             cursorRow = cursorRow,
             cursorColumn = cursorColumn,
+            cursorVisible = cursorVisible,
         ),
     )
 

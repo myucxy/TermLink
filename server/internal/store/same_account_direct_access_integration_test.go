@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -118,6 +119,12 @@ func TestSameAccountDirectAccess(t *testing.T) {
 	recipient := recipients[0]
 	if recipient.DeviceID != android.ID || recipient.DeviceType != "ANDROID" || recipient.Permission != "MANAGE" || recipient.ExpiresAt != nil {
 		t.Fatalf("implicit recipient=%+v, want same-account Android MANAGE without expiry", recipient)
+	}
+	expectedAndroidSigning := sha256.Sum256([]byte("same-account-signing:" + android.ID.String()))
+	expectedAndroidExchange := sha256.Sum256([]byte("same-account-exchange:" + android.ID.String()))
+	if len(recipient.SigningPublicKey) != 32 || !bytes.Equal(recipient.SigningPublicKey, expectedAndroidSigning[:]) ||
+		len(recipient.ExchangePublicKey) != 32 || !bytes.Equal(recipient.ExchangePublicKey, expectedAndroidExchange[:]) {
+		t.Fatalf("implicit recipient public keys do not match device %s", android.ID)
 	}
 	discoveredPCs, err := repository.ListPCs(ctx, userID, android.ID)
 	if err != nil || len(discoveredPCs) != 1 || discoveredPCs[0].ID != pcID {
@@ -316,6 +323,12 @@ func TestSameAccountDirectAccess(t *testing.T) {
 	}
 	if gotEpoch != epochAfterRevoke || len(recipients) != 1 || recipients[0].DeviceID != managerAndroid.ID || recipients[0].Permission != "MANAGE" {
 		t.Fatalf("post-revoke recipient snapshot epoch/items=%d/%+v", gotEpoch, recipients)
+	}
+	expectedManagerSigning := sha256.Sum256([]byte("same-account-signing:" + managerAndroid.ID.String()))
+	expectedManagerExchange := sha256.Sum256([]byte("same-account-exchange:" + managerAndroid.ID.String()))
+	if len(recipients[0].SigningPublicKey) != 32 || !bytes.Equal(recipients[0].SigningPublicKey, expectedManagerSigning[:]) ||
+		len(recipients[0].ExchangePublicKey) != 32 || !bytes.Equal(recipients[0].ExchangePublicKey, expectedManagerExchange[:]) {
+		t.Fatalf("post-revoke recipient public keys do not match remaining device %s", managerAndroid.ID)
 	}
 	if _, err := repository.SessionRoute(ctx, userID, android.ID, sessionID); !errors.Is(err, ErrDenied) {
 		t.Fatalf("revoked device route err=%v, want ErrDenied", err)

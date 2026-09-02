@@ -385,6 +385,19 @@ impl Screen {
         window
             .row_metadata
             .clone_from_slice(&self.row_metadata[first_row..end_row]);
+        // A renderer projection owns no rows outside its selected window. If
+        // the first selected row continues a logical line whose head lives in
+        // the discarded prefix, make that boundary explicit so validation and
+        // frame export do not mistake the projection for a corrupt Screen.
+        if window.row_metadata[0].logical_cell_offset != 0 {
+            window.row_metadata[0].mark_head_truncated();
+        }
+        // Likewise, a historical projection can end in the middle of a logical
+        // line. The next row is outside this immutable renderer window, so its
+        // final row must be a local hard boundary.
+        if let Some(last) = window.soft_wrapped.last_mut() {
+            *last = false;
+        }
         window.next_logical_line_id = self.next_logical_line_id;
         window.scrollback_generation_rows = self.scrollback_generation_rows;
         if offset_rows == 0 {
@@ -1705,6 +1718,13 @@ impl Screen {
         {
             return Err(TerminalError::MalformedSnapshot);
         }
+        let cursor = self.visible_cell_index(self.cursor_row, self.cursor_column);
+        let saved = self.visible_cell_index(self.saved.row, self.saved.column);
+        if (!self.wrap_pending && self.cells[cursor].continuation)
+            || (!self.saved.wrap_pending && self.cells[saved].continuation)
+        {
+            return Err(TerminalError::MalformedSnapshot);
+        }
         for row in 0..self.stored_rows() {
             let row_index = usize::try_from(row).expect("bounded row");
             let meaningful_end = self.meaningful_end[row_index];
@@ -2049,7 +2069,19 @@ impl Screen {
         let stored_bottom = self.visible_stored_boundary(bottom);
         let source_row = usize::try_from(stored_top + count).expect("bounded source row");
         let source_was_continuation = source_row > 0 && self.soft_wrapped[source_row - 1];
+        let outside_row = usize::try_from(stored_bottom).expect("bounded outside row");
+        let outside_was_continuation = outside_row < self.row_metadata.len()
+            && outside_row > 0
+            && self.soft_wrapped[outside_row - 1];
         let split_line_id = if stored_top > 0 && source_was_continuation {
+            let Some(logical_line_id) = self.allocate_logical_line_id() else {
+                return false;
+            };
+            Some(logical_line_id)
+        } else {
+            None
+        };
+        let outside_split_line_id = if outside_was_continuation {
             let Some(logical_line_id) = self.allocate_logical_line_id() else {
                 return false;
             };
@@ -2087,6 +2119,9 @@ impl Screen {
         } else if source_was_continuation {
             self.row_metadata[top].mark_head_truncated();
         }
+        if let Some(logical_line_id) = outside_split_line_id {
+            self.row_metadata[bottom] = RowMetadata::line_head(logical_line_id);
+        }
         self.normalize_row_metadata();
         true
     }
@@ -2102,7 +2137,19 @@ impl Screen {
         let stored_bottom = self.visible_stored_boundary(bottom);
         let top_index = usize::try_from(stored_top).expect("bounded top row");
         let source_was_continuation = top_index > 0 && self.soft_wrapped[top_index - 1];
+        let outside_row = usize::try_from(stored_bottom).expect("bounded outside row");
+        let outside_was_continuation = outside_row < self.row_metadata.len()
+            && outside_row > 0
+            && self.soft_wrapped[outside_row - 1];
         let split_line_id = if source_was_continuation {
+            let Some(logical_line_id) = self.allocate_logical_line_id() else {
+                return false;
+            };
+            Some(logical_line_id)
+        } else {
+            None
+        };
+        let outside_split_line_id = if outside_was_continuation {
             let Some(logical_line_id) = self.allocate_logical_line_id() else {
                 return false;
             };
@@ -2136,6 +2183,9 @@ impl Screen {
         self.soft_wrapped[bottom - 1] = false;
         if let Some(logical_line_id) = split_line_id {
             self.row_metadata[top + count] = RowMetadata::line_head(logical_line_id);
+        }
+        if let Some(logical_line_id) = outside_split_line_id {
+            self.row_metadata[bottom] = RowMetadata::line_head(logical_line_id);
         }
         self.normalize_row_metadata();
         true
@@ -2241,9 +2291,19 @@ impl Screen {
             self.meaningful_end[row],
         );
         let previous_soft_wrap = self.soft_wrapped[row];
+        let scrolls_region =
+            self.cursor_row + 1 == bottom && self.cursor_row >= top && bottom <= self.rows;
+        let split_line = if !soft_wrap && previous_soft_wrap && self.cursor_row + 1 < self.rows {
+            let Some(logical_line_id) = self.allocate_logical_line_id() else {
+                return false;
+            };
+            Some((row + 1, logical_line_id))
+        } else {
+            None
+        };
         self.soft_wrapped[row] = soft_wrap;
         self.wrap_pending = false;
-        if self.cursor_row + 1 == bottom && self.cursor_row >= top && bottom <= self.rows {
+        if scrolls_region {
             let shifted = if cause.output_revision().is_some()
                 && top == 0
                 && bottom == self.rows
@@ -2261,7 +2321,9 @@ impl Screen {
             self.cursor_row += 1;
         }
         let cursor_row = self.visible_row_index(self.cursor_row);
-        if soft_wrap && cursor_row > 0 && self.soft_wrapped[cursor_row - 1] {
+        if let Some((split_row, logical_line_id)) = split_line {
+            self.row_metadata[split_row] = RowMetadata::line_head(logical_line_id);
+        } else if soft_wrap && cursor_row > 0 && self.soft_wrapped[cursor_row - 1] {
             *self.visible_row_metadata_mut(self.cursor_row) = continuation;
         }
         self.normalize_row_metadata_from(self.viewport_top());
@@ -2293,6 +2355,16 @@ impl Screen {
             self.visible_row_metadata(self.cursor_row),
             self.meaningful_end[source_row],
         );
+        let previous_soft_wrap = self.soft_wrapped[source_row];
+        let split_line_id =
+            if !soft_wrap && previous_soft_wrap && source_row + 1 < self.row_metadata.len() {
+                let Some(logical_line_id) = self.allocate_logical_line_id() else {
+                    return false;
+                };
+                Some(logical_line_id)
+            } else {
+                None
+            };
         self.wrap_pending = false;
         let inside_rectangle = self.cursor_row >= rectangle.top
             && self.cursor_row < rectangle.bottom
@@ -2314,6 +2386,9 @@ impl Screen {
             }
         } else {
             self.soft_wrapped[source_row] = false;
+        }
+        if let Some(logical_line_id) = split_line_id {
+            self.row_metadata[source_row + 1] = RowMetadata::line_head(logical_line_id);
         }
         self.normalize_row_metadata_from(self.viewport_top());
         true
@@ -2591,6 +2666,18 @@ impl Screen {
         if self.cells[index].continuation {
             self.saved.column -= 1;
             self.saved.wrap_pending = false;
+        }
+    }
+
+    pub(super) fn canonicalize_cursor_cells(&mut self) {
+        if !self.wrap_pending {
+            self.snap_cursor_from_continuation();
+        }
+        if !self.saved.wrap_pending {
+            let index = self.visible_cell_index(self.saved.row, self.saved.column);
+            if self.cells[index].continuation {
+                self.saved.column -= 1;
+            }
         }
     }
 
@@ -3056,6 +3143,78 @@ mod tests {
         screen
             .validate()
             .expect("truncated reflow head is canonical");
+    }
+
+    #[test]
+    fn render_window_canonicalizes_logical_lines_cut_at_both_boundaries() {
+        let mut screen = text_screen(3, 3, "ABCDEFGHI");
+        screen.rows = 2;
+        screen.storage = StoragePolicy::new(4, MAX_CELLS);
+        screen.cursor_row = 1;
+        screen.saved.row = 1;
+        assert_eq!(screen.viewport_top(), 1);
+        screen.validate().expect("source scrollback is canonical");
+
+        let live = screen.render_window(0);
+        assert_eq!(live.row_metadata[0].logical_cell_offset, 3);
+        assert!(live.row_metadata[0].is_head_truncated());
+        live.validate()
+            .expect("live projection marks its discarded logical head");
+
+        let history = screen.render_window(1);
+        assert!(screen.soft_wrapped[1]);
+        assert!(!history.soft_wrapped[1]);
+        history
+            .validate()
+            .expect("history projection terminates its discarded logical tail");
+    }
+
+    #[test]
+    fn partial_rectangle_hard_line_feed_detaches_a_wrapped_suffix() {
+        for bottom in [1, 3] {
+            let mut screen = text_screen(4, 3, "ABCDE");
+            let original_line_id = screen.row_metadata[0].logical_line_id;
+            assert!(screen.soft_wrapped[0]);
+            assert_eq!(screen.row_metadata[1].logical_line_id, original_line_id);
+            assert_eq!(screen.row_metadata[1].logical_cell_offset, 4);
+
+            screen.position_cursor(0, 1);
+            assert!(screen.line_feed_in_rectangle_with_wrap(
+                false,
+                0,
+                bottom,
+                1,
+                3,
+                ScrollCause::Output(1),
+            ));
+
+            assert!(!screen.soft_wrapped[0]);
+            assert_ne!(screen.row_metadata[1].logical_line_id, original_line_id);
+            assert_eq!(screen.row_metadata[1].logical_cell_offset, 0);
+            screen
+                .validate()
+                .expect("partial rectangle hard LF leaves canonical logical rows");
+        }
+    }
+
+    #[test]
+    fn full_width_partial_scroll_hard_line_feed_detaches_the_outside_wrapped_suffix() {
+        let mut screen = text_screen(4, 3, "ABCDE");
+        let original_line_id = screen.row_metadata[0].logical_line_id;
+        assert!(screen.soft_wrapped[0]);
+        assert_eq!(screen.row_metadata[1].logical_line_id, original_line_id);
+        assert_eq!(screen.row_metadata[1].logical_cell_offset, 4);
+
+        screen.position_cursor(0, 0);
+        assert!(
+            screen.line_feed_in_rectangle_with_wrap(false, 0, 1, 0, 4, ScrollCause::Output(1),)
+        );
+
+        assert_ne!(screen.row_metadata[1].logical_line_id, original_line_id);
+        assert_eq!(screen.row_metadata[1].logical_cell_offset, 0);
+        screen
+            .validate()
+            .expect("partial scroll boundary remains canonical");
     }
 
     #[test]
@@ -3882,6 +4041,33 @@ mod tests {
         assert_eq!(row_signature(&reflow, 0), ["A", "B", "C", "D", " "]);
         assert_eq!(row_signature(&reflow, 1), [" ", " ", " ", " ", " "]);
         assert_eq!(row_signature(&reflow, 2), ["E", "F", " ", " ", " "]);
+    }
+
+    #[test]
+    fn row_shifts_detach_soft_wrapped_suffixes_below_partial_regions() {
+        let wrapped = || text_screen(4, 4, "ABCDEFGHIJKLM");
+
+        let mut up = wrapped();
+        let outside_id_before_up = up.row_metadata[2].logical_line_id;
+        assert!(up.soft_wrapped[1]);
+        up.scroll_up_region(1, 0, 2);
+        assert_ne!(up.row_metadata[2].logical_line_id, outside_id_before_up);
+        assert_eq!(up.row_metadata[2].logical_cell_offset, 0);
+        assert_eq!(
+            up.row_metadata[3].logical_line_id,
+            up.row_metadata[2].logical_line_id
+        );
+        up.validate()
+            .expect("scroll-up detaches the outside logical suffix");
+
+        let mut down = wrapped();
+        let outside_id_before_down = down.row_metadata[3].logical_line_id;
+        assert!(down.soft_wrapped[2]);
+        down.scroll_down_region(1, 1, 3);
+        assert_ne!(down.row_metadata[3].logical_line_id, outside_id_before_down);
+        assert_eq!(down.row_metadata[3].logical_cell_offset, 0);
+        down.validate()
+            .expect("scroll-down detaches the outside logical suffix");
     }
 
     #[test]

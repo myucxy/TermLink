@@ -232,11 +232,11 @@ class ProductUiLogicTest {
     @Test
     fun acceptedActionBarInputResumesLiveAndClosesAnActiveOverlay() {
         assertEquals(
-            TerminalInputResumeEffect(scrollToLatest = true, closeDetachedOverlay = true),
+            TerminalInputResumeEffect(resumeViewportAfterLocalInput = true, closeDetachedOverlay = true),
             terminalInputResumeEffect(accepted = true, detachedOverlayActive = true),
         )
         assertEquals(
-            TerminalInputResumeEffect(scrollToLatest = false, closeDetachedOverlay = false),
+            TerminalInputResumeEffect(resumeViewportAfterLocalInput = false, closeDetachedOverlay = false),
             terminalInputResumeEffect(accepted = false, detachedOverlayActive = true),
         )
     }
@@ -244,15 +244,15 @@ class ProductUiLogicTest {
     @Test
     fun acceptedImeInputClosesAnActiveOverlayAndRejectedImePreservesIt() {
         assertEquals(
-            TerminalInputResumeEffect(scrollToLatest = true, closeDetachedOverlay = true),
+            TerminalInputResumeEffect(resumeViewportAfterLocalInput = true, closeDetachedOverlay = true),
             terminalInputResumeEffect(accepted = true, detachedOverlayActive = true),
         )
         assertEquals(
-            TerminalInputResumeEffect(scrollToLatest = false, closeDetachedOverlay = false),
+            TerminalInputResumeEffect(resumeViewportAfterLocalInput = false, closeDetachedOverlay = false),
             terminalInputResumeEffect(accepted = false, detachedOverlayActive = true),
         )
         assertEquals(
-            TerminalInputResumeEffect(scrollToLatest = true, closeDetachedOverlay = false),
+            TerminalInputResumeEffect(resumeViewportAfterLocalInput = true, closeDetachedOverlay = false),
             terminalInputResumeEffect(accepted = true, detachedOverlayActive = false),
         )
     }

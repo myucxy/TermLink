@@ -2,6 +2,7 @@ package realtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -68,6 +69,7 @@ func TestPeerQueueByteBudgetIsHardBound(t *testing.T) {
 func TestNegotiatedCapabilitiesAreBoundedAndOrdered(t *testing.T) {
 	offered := []string{
 		"terminal_typed_input_v1",
+		"liveness_probe_v1",
 		"unknown_future_capability",
 		"lease_v1",
 		"cumulative_ack",
@@ -83,9 +85,128 @@ func TestNegotiatedCapabilitiesAreBoundedAndOrdered(t *testing.T) {
 		"lease_v1",
 		"terminal_presentation_metadata_v1",
 		"terminal_typed_input_v1",
+		"liveness_probe_v1",
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("negotiated capabilities = %v, want %v", got, want)
+	}
+}
+
+func TestNegotiatedLivenessProbeRoundTripsThroughSingleWriter(t *testing.T) {
+	serverSocket, clientSocket := newRelayWebSocketPair(t)
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	deviceID := uuid.New()
+	p := &peer{
+		hub:          hub,
+		socket:       serverSocket,
+		principal:    auth.Principal{Device: auth.Device{ID: deviceID}},
+		role:         "android",
+		send:         make(chan []byte, peerQueueFrames),
+		controlSend:  make(chan []byte, 4),
+		done:         make(chan struct{}),
+		capabilities: map[string]bool{"liveness_probe_v1": true},
+	}
+	hub.peers[deviceID] = p
+	go p.writeLoop()
+	go p.readLoop()
+	t.Cleanup(func() { p.close(websocket.CloseNormalClosure, "test complete") })
+
+	probeID := uuid.NewString()
+	request, err := json.Marshal(livenessControl{Type: "ping", ProbeID: probeID})
+	if err != nil {
+		t.Fatalf("marshal liveness request: %v", err)
+	}
+	if err := clientSocket.WriteMessage(websocket.TextMessage, request); err != nil {
+		t.Fatalf("write liveness request: %v", err)
+	}
+	_ = clientSocket.SetReadDeadline(time.Now().Add(time.Second))
+	messageType, response, err := clientSocket.ReadMessage()
+	if err != nil {
+		t.Fatalf("read liveness response: %v", err)
+	}
+	if messageType != websocket.TextMessage {
+		t.Fatalf("liveness response type = %d, want text", messageType)
+	}
+	var pong livenessControl
+	if err := json.Unmarshal(response, &pong); err != nil {
+		t.Fatalf("decode liveness response: %v", err)
+	}
+	if pong.Type != "pong" || pong.ProbeID != probeID {
+		t.Fatalf("liveness response = %#v, want matching pong", pong)
+	}
+}
+
+func TestMalformedApplicationFrameDoesNotCloseHealthyRealtimeSocket(t *testing.T) {
+	serverSocket, clientSocket := newRelayWebSocketPair(t)
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	deviceID := uuid.New()
+	p := &peer{
+		hub: hub, socket: serverSocket,
+		principal: auth.Principal{Device: auth.Device{ID: deviceID}},
+		role:      "android", send: make(chan []byte, peerQueueFrames),
+		controlSend: make(chan []byte, 4), done: make(chan struct{}),
+		capabilities: map[string]bool{"liveness_probe_v1": true},
+	}
+	hub.peers[deviceID] = p
+	go p.writeLoop()
+	go p.readLoop()
+	t.Cleanup(func() { p.close(websocket.CloseNormalClosure, "test complete") })
+
+	// Field tag zero is not a valid protobuf Envelope. The next authenticated
+	// liveness exchange must still use this exact socket generation.
+	if err := clientSocket.WriteMessage(websocket.BinaryMessage, []byte{0}); err != nil {
+		t.Fatalf("write malformed application frame: %v", err)
+	}
+	probeID := uuid.NewString()
+	request, err := json.Marshal(livenessControl{Type: "ping", ProbeID: probeID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clientSocket.WriteMessage(websocket.TextMessage, request); err != nil {
+		t.Fatalf("write liveness request after malformed frame: %v", err)
+	}
+	_ = clientSocket.SetReadDeadline(time.Now().Add(time.Second))
+	messageType, response, err := clientSocket.ReadMessage()
+	if err != nil {
+		t.Fatalf("healthy socket closed after malformed application frame: %v", err)
+	}
+	if messageType != websocket.TextMessage {
+		t.Fatalf("liveness response type = %d, want text", messageType)
+	}
+	var pong livenessControl
+	if err := json.Unmarshal(response, &pong); err != nil {
+		t.Fatalf("decode liveness response: %v", err)
+	}
+	if pong.Type != "pong" || pong.ProbeID != probeID {
+		t.Fatalf("liveness response = %#v, want matching pong", pong)
+	}
+}
+
+func TestLivenessControlRequiresNegotiatedCapabilityAndCanonicalID(t *testing.T) {
+	p := &peer{done: make(chan struct{}), controlSend: make(chan []byte, 4)}
+	valid, err := json.Marshal(livenessControl{Type: "ping", ProbeID: uuid.NewString()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.handleLivenessControl(valid) {
+		t.Fatal("unnegotiated liveness control was accepted")
+	}
+	p.capabilities = map[string]bool{"liveness_probe_v1": true}
+	invalid, err := json.Marshal(livenessControl{Type: "ping", ProbeID: "NOT-A-UUID"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.handleLivenessControl(invalid) {
+		t.Fatal("non-canonical probe ID was accepted")
+	}
+	extraField, err := json.Marshal(map[string]string{
+		"type": "ping", "probe_id": uuid.NewString(), "session_id": uuid.NewString(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.handleLivenessControl(extraField) {
+		t.Fatal("liveness control with an extra field was accepted")
 	}
 }
 
@@ -1655,6 +1776,176 @@ func TestReplacementPCImmediatelyReceivesExistingAndroidSubscriptions(t *testing
 	}
 }
 
+func TestReplacementPCReceivesLatestSubscriberControlWithoutACKRegression(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	authority := newCountingRouteAuthority()
+	hub.store = authority
+	userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	authority.set(userID, androidID, sessionID, store.SessionRouteAuthorization{
+		Permission: "VIEW",
+		PCDeviceID: pcID,
+	}, nil)
+	android, oldPC := activeRoutePeers(hub, userID, androidID, pcID)
+
+	subscribeFrame := []byte("signed-subscribe-ack-0")
+	subscribe := androidRouteEnvelope(realtimewire.Subscribe, pcID)
+	subscribe.ACK = 0
+	if err := android.route(subscribe, sessionID, subscribeFrame); err != nil {
+		t.Fatalf("initial subscribe: %v", err)
+	}
+	if got := <-oldPC.send; string(got) != string(subscribeFrame) {
+		t.Fatalf("initial subscription frame = %q, want %q", got, subscribeFrame)
+	}
+
+	outputACKFrame := []byte("signed-output-ack-100")
+	outputACK := androidRouteEnvelope(realtimewire.OutputACK, pcID)
+	outputACK.ACK = 100
+	if err := android.route(outputACK, sessionID, outputACKFrame); err != nil {
+		t.Fatalf("output ACK 100: %v", err)
+	}
+	if got := <-oldPC.send; string(got) != string(outputACKFrame) {
+		t.Fatalf("live output ACK frame = %q, want %q", got, outputACKFrame)
+	}
+
+	flowFrame := []byte("signed-flow-control-ack-100-new-epoch")
+	wantFlowFrame := append([]byte(nil), flowFrame...)
+	flow := androidRouteEnvelope(realtimewire.FlowControl, pcID)
+	flow.ACK = 100
+	if err := android.route(flow, sessionID, flowFrame); err != nil {
+		t.Fatalf("flow control ACK 100: %v", err)
+	}
+	if got := <-oldPC.send; string(got) != string(wantFlowFrame) {
+		t.Fatalf("live flow-control frame = %q, want %q", got, wantFlowFrame)
+	}
+	flowFrame[0] = 'X'
+
+	regressive := androidRouteEnvelope(realtimewire.OutputACK, pcID)
+	regressive.ACK = 99
+	if err := android.route(regressive, sessionID, []byte("signed-output-ack-99")); !errors.Is(err, errCumulativeACKRegressed) {
+		t.Fatalf("regressive ACK error = %v, want errCumulativeACKRegressed", err)
+	}
+	select {
+	case frame := <-oldPC.send:
+		t.Fatalf("regressive ACK reached PC: %q", frame)
+	default:
+	}
+
+	replacement := testPeer(hub, pcID)
+	replacement.role = "pc"
+	replacement.principal.UserID = userID
+	replacement.subscriptionReplayReady = false
+	if !hub.add(replacement) {
+		t.Fatal("failed to install replacement PC")
+	}
+	hub.replaySubscriptionsToPC(replacement)
+
+	if got := <-replacement.send; string(got) != string(subscribeFrame) {
+		t.Fatalf("replacement first frame = %q, want original SUBSCRIBE %q", got, subscribeFrame)
+	}
+	if got := <-replacement.send; string(got) != string(wantFlowFrame) {
+		t.Fatalf("replacement latest control = %q, want byte-identical %q", got, wantFlowFrame)
+	}
+	select {
+	case frame := <-replacement.send:
+		t.Fatalf("replacement received stale or regressive control: %q", frame)
+	default:
+	}
+	if got := pcRouteHighWater(replacement, sessionID, androidID); got != 100 {
+		t.Fatalf("replacement replay high-water = %d, want latest visible ACK 100", got)
+	}
+}
+
+func TestReplacementPCSerializesConcurrentReplayAndSubscriberControl(t *testing.T) {
+	for iteration := 0; iteration < 50; iteration++ {
+		hub := NewHubWithObserver(nil, nil, nil, nil)
+		authority := newCountingRouteAuthority()
+		hub.store = authority
+		userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+		authority.set(userID, androidID, sessionID, store.SessionRouteAuthorization{
+			Permission: "VIEW",
+			PCDeviceID: pcID,
+		}, nil)
+		android, oldPC := activeRoutePeers(hub, userID, androidID, pcID)
+
+		subscribeFrame := []byte("signed-subscribe-ack-0")
+		subscribe := androidRouteEnvelope(realtimewire.Subscribe, pcID)
+		if err := android.route(subscribe, sessionID, subscribeFrame); err != nil {
+			t.Fatalf("iteration %d initial subscribe: %v", iteration, err)
+		}
+		<-oldPC.send
+
+		replacement := testPeer(hub, pcID)
+		replacement.role = "pc"
+		replacement.principal.UserID = userID
+		replacement.subscriptionReplayReady = false
+		if !hub.add(replacement) {
+			t.Fatalf("iteration %d failed to install replacement PC", iteration)
+		}
+
+		controlFrame := []byte("signed-flow-control-ack-128")
+		control := androidRouteEnvelope(realtimewire.FlowControl, pcID)
+		control.ACK = 128
+		replayDone := make(chan struct{})
+		controlResult := make(chan error, 1)
+
+		// Hold the common serialization gate until both operations are ready.
+		// Either may win after release; both orders must produce exactly one
+		// SUBSCRIBE followed by exactly one latest control frame.
+		replacement.pcReplayMu.Lock()
+		go func() {
+			hub.replaySubscriptionsToPC(replacement)
+			close(replayDone)
+		}()
+		go func() {
+			controlResult <- android.route(control, sessionID, controlFrame)
+		}()
+		replacement.pcReplayMu.Unlock()
+
+		if err := <-controlResult; err != nil {
+			t.Fatalf("iteration %d concurrent control: %v", iteration, err)
+		}
+		<-replayDone
+		if got := <-replacement.send; string(got) != string(subscribeFrame) {
+			t.Fatalf("iteration %d first frame = %q, want SUBSCRIBE %q", iteration, got, subscribeFrame)
+		}
+		if got := <-replacement.send; string(got) != string(controlFrame) {
+			t.Fatalf("iteration %d second frame = %q, want control %q", iteration, got, controlFrame)
+		}
+		select {
+		case frame := <-replacement.send:
+			t.Fatalf("iteration %d received duplicate replay frame: %q", iteration, frame)
+		default:
+		}
+		if got := pcRouteHighWater(replacement, sessionID, androidID); got != 128 {
+			t.Fatalf("iteration %d replay high-water = %d, want 128", iteration, got)
+		}
+	}
+}
+
+func TestLiveSubscriberACKAdvancesFenceWithoutOpeningReplayEpoch(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	pc := testPeer(hub, uuid.New())
+	sessionID, androidID := uuid.New(), uuid.New()
+	state := pc.pcReplayRoute(pcRouteKey{sessionID: sessionID, recipientID: androidID})
+	state.highWater = 200
+
+	pc.advancePCVisibleACKLocked(sessionID, androidID, 128)
+	if state.highWater != 200 {
+		t.Fatalf("lagging live ACK lowered high-water to %d, want 200", state.highWater)
+	}
+	if state.epoch != nil {
+		t.Fatal("lagging live ACK unexpectedly opened a replay epoch")
+	}
+
+	pc.advancePCVisibleACKLocked(sessionID, androidID, 250)
+	if state.highWater != 250 {
+		t.Fatalf("advanced live ACK high-water = %d, want 250", state.highWater)
+	}
+	if state.epoch != nil {
+		t.Fatal("advanced live ACK unexpectedly opened a replay epoch")
+	}
+}
+
 func TestUnsubscribeRemovesCachedSubscriptionReplay(t *testing.T) {
 	hub := NewHubWithObserver(nil, nil, nil, nil)
 	userID := uuid.New()
@@ -2584,17 +2875,19 @@ func (s *fakeLiveSessionStore) deleteLease(sessionID uuid.UUID) {
 
 func testPeer(hub *Hub, deviceID uuid.UUID) *peer {
 	return &peer{
-		hub:                hub,
-		principal:          auth.Principal{Device: auth.Device{ID: deviceID}},
-		send:               make(chan []byte, 4),
-		done:               make(chan struct{}),
-		lastSequences:      map[uuid.UUID]uint64{},
-		subscriptions:      map[uuid.UUID]bool{},
-		subscriptionRoutes: map[uuid.UUID]cachedSessionRoute{},
-		subscriptionFrames: map[uuid.UUID][]byte{},
-		subscriptionACKs:   map[uuid.UUID]uint64{},
-		controlPolicies:    map[uuid.UUID]cachedControlPolicy{},
-		pcReplayRoutes:     map[pcRouteKey]*pcReplayRoute{},
+		hub:                     hub,
+		principal:               auth.Principal{Device: auth.Device{ID: deviceID}},
+		send:                    make(chan []byte, 4),
+		done:                    make(chan struct{}),
+		lastSequences:           map[uuid.UUID]uint64{},
+		subscriptionReplayReady: true,
+		subscriptions:           map[uuid.UUID]bool{},
+		subscriptionRoutes:      map[uuid.UUID]cachedSessionRoute{},
+		subscriptionFrames:      map[uuid.UUID][]byte{},
+		subscriptionACKs:        map[uuid.UUID]uint64{},
+		subscriptionControls:    map[uuid.UUID]retainedSubscriberControl{},
+		controlPolicies:         map[uuid.UUID]cachedControlPolicy{},
+		pcReplayRoutes:          map[pcRouteKey]*pcReplayRoute{},
 	}
 }
 

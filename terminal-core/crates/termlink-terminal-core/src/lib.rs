@@ -847,7 +847,16 @@ impl Terminal {
                 Event::Gap { .. } => unreachable!("gap handled before transaction"),
             };
             match result {
-                Ok(()) => candidate.next_source_sequence += 1,
+                Ok(()) => {
+                    // Cursor coordinates are durable state, while row edits,
+                    // scrolling, and reflow can move a wide-cell continuation
+                    // underneath a previously saved coordinate. Canonicalize
+                    // both screens at every event boundary so any immediately
+                    // exported checkpoint is accepted by the strict reader.
+                    candidate.main.canonicalize_cursor_cells();
+                    candidate.alternate.canonicalize_cursor_cells();
+                    candidate.next_source_sequence += 1;
+                }
                 Err(error @ TerminalError::Unsupported(_)) => return Err((error, true)),
                 Err(error @ TerminalError::HostEffectVersionRequired) => {
                     return Err((error, false));

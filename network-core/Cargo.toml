@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/termlink-direct-wire",
+    "crates/termlink-direct-nat",
+    "crates/termlink-direct-quic",
+    "crates/termlink-direct-path",
+    "crates/termlink-direct-ffi",
+]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.97"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

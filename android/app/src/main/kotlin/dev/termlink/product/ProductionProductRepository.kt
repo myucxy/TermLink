@@ -1,6 +1,7 @@
 package dev.termlink.product
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
@@ -39,11 +40,14 @@ import dev.termlink.model.PcSummary
 import dev.termlink.model.SessionState
 import dev.termlink.model.SessionSummary
 import dev.termlink.model.TerminalCommandCapability
+import dev.termlink.network.direct.ProductionDirectAuthorizedPeer
+import dev.termlink.network.direct.ProductionDirectShadowRuntime
 import dev.termlink.network.production.AccessTokenProvider
 import dev.termlink.network.production.InputSequenceProvider
 import dev.termlink.network.production.ProductionApiClient
 import dev.termlink.network.production.ProductionRealtimeMultiplexer
 import dev.termlink.network.production.ProductionRealtimeSessionClient
+import dev.termlink.network.production.ProductionRendererFatalFailure
 import dev.termlink.network.production.ProductionRealtimeSessionConfig
 import dev.termlink.network.production.TermLinkApiException
 import dev.termlink.protocol.realtime.v1.GapPayload
@@ -64,11 +68,13 @@ import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalInput
 import dev.termlink.terminal.api.TerminalEngine
+import dev.termlink.terminal.api.TerminalEngineFailureDiagnostics
 import dev.termlink.terminal.api.PreparedTerminalCheckpoint
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
 import dev.termlink.terminal.api.TerminalViewportEngine
 import dev.termlink.terminal.nativecore.NativeTerminalEngine
 import dev.termlink.terminal.termux.TermuxTerminalEngine
+import java.io.IOException
 import java.time.Instant
 import java.net.URI
 import java.net.URLEncoder
@@ -81,11 +87,11 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -107,7 +113,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
@@ -136,8 +141,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 import kotlin.concurrent.thread
 
 /** Thread-visible token handoff shared by every long-lived realtime client. */
@@ -157,15 +160,113 @@ internal class RealtimeAccessTokenSource {
     }
 }
 
-/** Invalidates any asynchronous token result captured by an older auth lifecycle. */
+/**
+ * Invalidates any asynchronous token result captured by an older auth lifecycle.
+ *
+ * The pinned Termux sources intentionally exclude OIDC, WebSocket authentication,
+ * and remote-session ownership.  TermLink therefore owns this boundary; Termux's
+ * generation checks are only a lifecycle-behaviour reference, not reusable code.
+ */
 internal class AuthenticationLifecycleFence {
-    private val generation = AtomicLong(0)
+    private val lock = Any()
+    private var generation = 0L
 
-    fun capture(): Long = generation.get()
+    fun capture(): Long = synchronized(lock) { generation }
 
-    fun invalidate(): Long = generation.incrementAndGet()
+    /** Captures generation and caller-owned state in one transaction. */
+    fun <T> capture(action: (Long) -> T): T = synchronized(lock) { action(generation) }
 
-    fun isCurrent(captured: Long): Boolean = generation.get() == captured
+    fun invalidate(action: () -> Unit = {}): Long = synchronized(lock) {
+        nextGeneration().also {
+            generation = it
+            action()
+        }
+    }
+
+    fun isCurrent(captured: Long): Boolean = synchronized(lock) { generation == captured }
+
+    /**
+     * Performs a short, non-suspending commit only while the captured auth
+     * lifecycle and its caller-owned state are still authoritative. Starting a
+     * successor authentication waits for this commit, so a stale async result
+     * cannot pass a check and then overwrite the successor outside the fence.
+     */
+    fun runIfCurrent(
+        captured: Long,
+        predicate: () -> Boolean = { true },
+        action: () -> Unit,
+    ): Boolean = synchronized(lock) {
+        if (generation != captured || !predicate()) return@synchronized false
+        action()
+        true
+    }
+
+    /** Atomically claims and retires one exact authentication lifecycle. */
+    fun invalidateIfCurrent(
+        captured: Long,
+        predicate: () -> Boolean = { true },
+        action: () -> Unit,
+    ): Boolean = synchronized(lock) {
+        if (generation != captured || !predicate()) return@synchronized false
+        generation = nextGeneration()
+        action()
+        true
+    }
+
+    private fun nextGeneration(): Long {
+        check(generation < Long.MAX_VALUE) { "authentication generation exhausted" }
+        return generation + 1L
+    }
+}
+
+/**
+ * Serializes exact-runtime retirement without depending on a cancellable owner
+ * scope. Registration happens while the authentication CAS is held; a later
+ * transition observes the completion even when it raced with an earlier empty
+ * check. Each claim also waits for its predecessor, so detached runtimes are
+ * closed in authentication-generation order.
+ */
+internal class AuthenticationRetirementBarrier {
+    internal data class Claim(
+        val predecessor: Deferred<Unit>?,
+        val completion: CompletableDeferred<Unit>,
+    )
+
+    private val lock = Any()
+    private var tail: CompletableDeferred<Unit>? = null
+
+    fun register(): Claim = synchronized(lock) {
+        Claim(
+            predecessor = tail,
+            completion = CompletableDeferred<Unit>().also { tail = it },
+        )
+    }
+
+    fun complete(claim: Claim) {
+        claim.completion.complete(Unit)
+        synchronized(lock) {
+            if (tail === claim.completion) tail = null
+        }
+    }
+
+    suspend fun awaitQuiescence() {
+        while (true) {
+            val pending = synchronized(lock) { tail } ?: return
+            pending.await()
+        }
+    }
+}
+
+/** Exact-owner check shared by callback admission and runtime retirement. */
+internal fun authenticationRuntimeClaimMatches(
+    currentOwner: Any?,
+    currentOwnerGeneration: Long?,
+    expectedOwner: Any?,
+    expectedGeneration: Long,
+): Boolean = if (expectedOwner == null) {
+    currentOwnerGeneration == null || currentOwnerGeneration == expectedGeneration
+} else {
+    currentOwnerGeneration == expectedGeneration && currentOwner === expectedOwner
 }
 
 internal fun authenticationExpiredSnapshot(
@@ -403,6 +504,81 @@ internal data class RealtimeForegroundObservation(
     val accepted: Boolean,
 )
 
+/**
+ * Serializes lifecycle mutations for one logical session without making an
+ * unrelated session wait behind Snapshot download, history replay, JNI, or
+ * graceful ACK-writer retirement.  A reference is retained before waiting for
+ * the lane, so the registry cannot remove and recreate a second mutex while a
+ * waiter still targets the first one.
+ */
+internal class SessionLifecycleLanes<K : Any> {
+    private class Lane {
+        val mutex = Mutex()
+        var references = 0
+    }
+
+    private val registryLock = Any()
+    private val lanes = mutableMapOf<K, Lane>()
+
+    suspend fun <T> withLock(key: K, action: suspend () -> T): T {
+        val lane = synchronized(registryLock) {
+            lanes.getOrPut(key, ::Lane).also { it.references++ }
+        }
+        return try {
+            lane.mutex.withLock { action() }
+        } finally {
+            synchronized(registryLock) {
+                check(lane.references > 0) { "Session lifecycle lane reference underflow" }
+                lane.references--
+                if (lane.references == 0) {
+                    check(lanes[key] === lane) { "Session lifecycle lane identity changed" }
+                    lanes.remove(key)
+                }
+            }
+        }
+    }
+
+    internal fun activeLaneCount(): Int = synchronized(registryLock) { lanes.size }
+
+    internal fun activeReferenceCount(key: K): Int = synchronized(registryLock) {
+        lanes[key]?.references ?: 0
+    }
+}
+
+internal enum class RendererFatalIncarnationDecision {
+    STALE,
+    RECOVER,
+    FAIL_CLOSED,
+}
+
+/** A poison sequence is inherited only by the exact recovery successor. */
+internal fun rendererFatalIncarnationDecision(
+    expectedIsCurrent: Boolean,
+    inheritedFatalSequence: Long?,
+    failureSequence: Long,
+): RendererFatalIncarnationDecision = when {
+    !expectedIsCurrent -> RendererFatalIncarnationDecision.STALE
+    inheritedFatalSequence == failureSequence -> RendererFatalIncarnationDecision.FAIL_CLOSED
+    else -> RendererFatalIncarnationDecision.RECOVER
+}
+
+/**
+ * Removes exactly one incarnation, waits for its durable writers to stop, and
+ * only then permits a replacement.  A stale callback returns without touching
+ * the current map entry.
+ */
+internal suspend fun <T : Any> retireExactIncarnationAndThen(
+    expected: T,
+    removeExact: (T) -> Boolean,
+    closeAndJoin: suspend (T) -> Unit,
+    afterRetired: suspend () -> Unit = {},
+): Boolean {
+    if (!removeExact(expected)) return false
+    closeAndJoin(expected)
+    afterRetired()
+    return true
+}
+
 /** Retains the earliest stop callback until one newer foreground consumes it. */
 internal fun recordRealtimeAppBackground(
     state: RealtimeAppLifecycleState,
@@ -458,17 +634,18 @@ private const val REMOTE_FILE_LIST_PAGE_MAX_ENTRIES = 500
 private const val AGENT_UPDATE_POLL_INTERVAL_MILLIS = 1_000L
 
 internal class ProductionProductRepository(
-    private val activity: Activity,
+    private val context: Context,
+    private val activityProvider: () -> Activity?,
     private val launchAuthorization: (Intent) -> Unit,
 ) : ProductRepository {
-    private val sessionStore = OidcSessionStore(activity)
-    private val keyVault = DeviceKeyVault(activity)
-    private val database = TermLinkDatabase.open(activity)
+    private val sessionStore = OidcSessionStore(context)
+    private val keyVault = DeviceKeyVault(context)
+    private val database = TermLinkDatabase.open(context)
     private val historyRepository = HistoryRepository(database)
-    private val authService = AuthorizationService(activity)
+    private val authService = AuthorizationService(context)
     private val http = OkHttpClient()
     private val remoteDownloadStore: RemoteDownloadRecordStore =
-        SharedPreferencesRemoteDownloadRecordStore(activity)
+        SharedPreferencesRemoteDownloadRecordStore(context)
     private val storedRemoteDownloads = remoteDownloadStore.load()
     private val interruptedRemoteDownloads = storedRemoteDownloads
         .filter { it.status.isActive }
@@ -476,19 +653,25 @@ internal class ProductionProductRepository(
         remoteDownloadStore.save(it)
     }
     private val remoteFileDownloader = RemoteFileDownloader(
-        contentResolver = activity.contentResolver,
+        contentResolver = context.contentResolver,
         client = http,
         allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
     )
     private val terminalSnapshotReadinessHttp = http.newBuilder()
         .callTimeout(TERMINAL_SNAPSHOT_READINESS_REQUEST_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
         .build()
-    private val updatePreferences = activity.getSharedPreferences(UPDATE_PREFERENCES, android.content.Context.MODE_PRIVATE)
+    private val updatePreferences = context.getSharedPreferences(UPDATE_PREFERENCES, Context.MODE_PRIVATE)
     private val nativeAuthHttp = secureNativeHttpClient()
     private val nativeOidc = NativeOidcClient(nativeAuthHttp, Json { ignoreUnknownKeys = true })
     private val json = Json { ignoreUnknownKeys = true }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val connectivityManager = activity.getSystemService(ConnectivityManager::class.java)
+    // The device WebSocket router, liveness probe and authentication recovery
+    // must keep progressing even if Compose or a large terminal projection
+    // occupies Main. Session renderers have their own per-session lanes.
+    private val realtimeRuntimeScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.Default.limitedParallelism(1),
+    )
+    private val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
     private val realtimeNetworkLock = Any()
     private val realtimeLifecycleLock = Any()
     private var realtimeNetwork: Network? = null
@@ -536,10 +719,11 @@ internal class ProductionProductRepository(
         }
         if (transition == RealtimeNetworkObservationTransition.RECONNECTED || consumePendingForeground) {
             realtimeNetworkReconnectCount.incrementAndGet()
-            scope.launch {
+            realtimeRuntimeScope.launch {
                 realtimeMultiplexer?.onNetworkAvailable()
             }
         }
+        observeDirectShadowNetwork(network)
     }
     private val realtimeNetworkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -558,14 +742,34 @@ internal class ProductionProductRepository(
 
         override fun onLost(network: Network) {
             realtimeNetworkLostCount.incrementAndGet()
-            synchronized(realtimeNetworkLock) {
+            val removed = synchronized(realtimeNetworkLock) {
                 hasObservedRealtimeNetwork = true
-                if (realtimeNetwork == network) realtimeNetwork = null
+                if (realtimeNetwork == network) {
+                    realtimeNetwork = null
+                    true
+                } else {
+                    false
+                }
             }
+            if (removed) observeDirectShadowNetwork(null)
         }
     }
+
+    private fun observeDirectShadowNetwork(network: Network?) {
+        val owned = synchronized(liveSessionLock) {
+            val owner = realtimeMultiplexerOwner
+            val runtime = directShadowRuntime
+            if (owner == null || runtime == null) null else owner.authenticationGeneration to runtime
+        } ?: return
+        owned.second.observeNetwork(owned.first, network)
+    }
+
     private val liveSessions = ConcurrentHashMap<UUID, LiveProductSession>()
+    /** Fail-closed until a serialized catalog refresh publishes replacement authority. */
+    private val sessionAuthorityTransitionFences = ConcurrentHashMap.newKeySet<UUID>()
     @Volatile private var realtimeMultiplexer: ProductionRealtimeMultiplexer? = null
+    @Volatile private var realtimeMultiplexerOwner: RealtimeAuthenticationOwner? = null
+    @Volatile private var directShadowRuntime: ProductionDirectShadowRuntime? = null
     private val historyEngines = ConcurrentHashMap<UUID, TermuxTerminalEngine>()
     private val historyDownloads = ConcurrentHashMap<UUID, HistoryDownloadRequest>()
     private val transcriptLoads = ConcurrentHashMap<TranscriptLoadKey, Deferred<Unit>>()
@@ -577,21 +781,31 @@ internal class ProductionProductRepository(
     private val liveSessionLock = Any()
     private val accessStateLock = Mutex()
     private val refreshStateLock = Mutex()
-    private val sessionLifecycleLock = Mutex()
+    private val sessionLifecycleLanes = SessionLifecycleLanes<UUID>()
     private val updateCheckLock = Mutex()
     private val updateDownloadLock = Mutex()
     private val keyMetadataRefreshLock = Mutex()
+    private val authenticationAccountScopeLock = Mutex()
+    /** Serializes auth transitions with local publication of an authenticated refresh. */
+    private val authenticationStateMutationLock = Mutex()
+    /** Keeps a successor transition behind exact old-runtime closeAndJoin. */
+    private val authenticationTransitionLock = Mutex()
+    // Authentication lock order is transition -> state mutation -> auth fence
+    // -> liveSessionLock. No code holding liveSessionLock may enter the fence.
+    private val authenticationRetirementBarrier = AuthenticationRetirementBarrier()
     private val realtimeAccessToken = RealtimeAccessTokenSource()
     private val authenticationLifecycle = AuthenticationLifecycleFence()
     private var pendingInteractiveAuthenticationGeneration: Long? = null
-    private val tokenRefresh = TokenRefreshCoordinator(::requestFreshAccessToken)
+    private val tokenRefresh = TokenRefreshCoordinator { force ->
+        requestFreshAccessToken(force, expectedRuntimeOwner = null)
+    }
     // The first production client is intentionally pinned to the public service.
     // Migrate older installs that may still have a locally edited endpoint.
     private val initialServerUrl = PRODUCT_PUBLIC_SERVER_URL.also {
         if (sessionStore.serverUrl != it) sessionStore.serverUrl = it
     }
     private val billing = BillingCoordinator(
-        adapter = PlayBillingAdapter(activity, activity),
+        adapter = PlayBillingAdapter(context, activityProvider),
         gateway = object : BillingServerGateway {
             override suspend fun verifyGooglePurchase(productId: String, purchaseToken: String): Boolean = withApi { api ->
                 api.post(
@@ -610,15 +824,15 @@ internal class ProductionProductRepository(
         },
         scope = scope,
     )
-    private var authState: AuthState? = sessionStore.loadAuthState()
+    @Volatile private var authState: AuthState? = sessionStore.loadAuthState()
     private var storedIdentity: DeviceKeyVault.StoredIdentity? = null
-    private var accountScope: String? = sessionStore.accountScope
+    @Volatile private var accountScope: String? = sessionStore.accountScope
     private var oidcConfiguration: NativeOidcConfiguration? = null
-    private var closed = false
+    @Volatile private var closed = false
     private val updateArchitecture = Build.SUPPORTED_ABIS.firstOrNull()?.takeIf { it.isNotBlank() } ?: "universal"
     private val updateRequestKey = "$PRODUCT_APPSHIP_SLUG|android|$updateArchitecture|stable|${BuildConfig.VERSION_CODE}"
     private val updateDownloader = ProductUpdateDownloader(
-        context = activity,
+        context = context,
         client = http,
         currentBuild = BuildConfig.VERSION_CODE.toLong(),
     )
@@ -680,10 +894,16 @@ internal class ProductionProductRepository(
                     pendingRealtimeForegroundReconcile = false
                 }
             }
-            if (consumeNow) realtimeMultiplexer?.onNetworkAvailable()
+            if (consumeNow) {
+                realtimeRuntimeScope.launch {
+                    realtimeMultiplexer?.onNetworkAvailable()
+                }
+            }
             return
         }
-        realtimeMultiplexer?.onAppForegrounded(backgroundDurationMillis, networkUsable = true)
+        realtimeRuntimeScope.launch {
+            realtimeMultiplexer?.onAppForegrounded(backgroundDurationMillis, networkUsable = true)
+        }
     }
     private val billingStateJob = scope.launch {
         billing.snapshot.collect { state ->
@@ -697,7 +917,7 @@ internal class ProductionProductRepository(
                 mutableSnapshot.value.enrollmentState == ProductEnrollmentState.REVOKED
             ) continue
             try {
-                withApi { api -> pollSessionCatalogWithApi(api) }
+                withAuthenticatedApi { api, generation -> pollSessionCatalogWithApi(api, generation) }
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Throwable) {
@@ -744,40 +964,52 @@ internal class ProductionProductRepository(
     override suspend fun configureServer(url: String) {
         val normalized = PRODUCT_PUBLIC_SERVER_URL
         val changed = normalized != sessionStore.serverUrl
+        var authenticationGeneration = authenticationLifecycle.capture()
         if (changed) {
             cancelRemoteDownloadsAndJoin(clearMetadata = true)
-            closeLiveSessions()
-            closeHistoryEngines()
-            clearRoomCache()
-            authenticationLifecycle.invalidate()
-            authState = null
-            realtimeAccessToken.clear()
-            sessionStore.clearAuthState()
-            sessionStore.accountLogin = null
-            storedIdentity?.identity?.destroy()
-            storedIdentity = null
-            accountScope = null
-            sessionStore.accountScope = null
-            oidcConfiguration = null
+            val generation = beginAuthenticationTransition()
+            authenticationGeneration = generation
+            var retiredIdentity: DeviceKeyVault.StoredIdentity? = null
+            authenticationStateMutationLock.withLock {
+                if (authenticationLifecycle.isCurrent(generation) && !closed) {
+                    closeHistoryEngines()
+                    clearRoomCache()
+                    authenticationLifecycle.runIfCurrent(generation, predicate = { !closed }) {
+                        retiredIdentity = storedIdentity
+                        storedIdentity = null
+                        accountScope = null
+                        sessionStore.accountScope = null
+                        oidcConfiguration = null
+                    }
+                }
+            }
+            retiredIdentity?.identity?.destroy()
         }
         sessionStore.serverUrl = normalized
-        billing.reset()
-        mutableSnapshot.value = ProductSnapshot(
-            configured = true,
-            authenticationState = ProductAuthenticationState.SIGNED_OUT,
-            connectionState = ProductConnectionState.CONFIGURED,
-            serverUrl = normalized,
-        )
+        val publishConfigured = {
+            billing.reset()
+            mutableSnapshot.value = ProductSnapshot(
+                configured = true,
+                authenticationState = ProductAuthenticationState.SIGNED_OUT,
+                connectionState = ProductConnectionState.CONFIGURED,
+                serverUrl = normalized,
+            )
+        }
+        authenticationLifecycle.runIfCurrent(authenticationGeneration, predicate = { !closed }) {
+            publishConfigured()
+        }
     }
 
     override suspend fun signIn(username: String, password: CharArray) {
         check(!closed) { "Repository is closed" }
-        val authenticationGeneration = authenticationLifecycle.invalidate()
-        mutableSnapshot.value = mutableSnapshot.value.copy(
-            authenticationState = ProductAuthenticationState.NATIVE_CREDENTIALS,
-            connectionState = ProductConnectionState.CONFIGURED,
-            connectionError = null,
-        )
+        val authenticationGeneration = beginAuthenticationTransition()
+        check(authenticationLifecycle.runIfCurrent(authenticationGeneration) {
+            mutableSnapshot.value = mutableSnapshot.value.copy(
+                authenticationState = ProductAuthenticationState.NATIVE_CREDENTIALS,
+                connectionState = ProductConnectionState.CONFIGURED,
+                connectionError = null,
+            )
+        }) { "Authentication lifecycle changed" }
         try {
             val configuration = loadOidcConfiguration()
             val payload = withContext(Dispatchers.IO) {
@@ -785,21 +1017,24 @@ internal class ProductionProductRepository(
             }
             requireCurrentAuthentication(authenticationGeneration)
             val subject = OidcJwtClaims.accessTokenSubject(payload.accessToken, configuration.issuer, configuration.clientId)
-            activateAccount(configuration, subject, payload, authenticationGeneration)
-            sessionStore.accountLogin = username
-            bootstrapAuthenticatedSession()
+            activateAccount(configuration, subject, payload, username, authenticationGeneration)
+            bootstrapAuthenticatedSession(authenticationGeneration)
         } catch (error: NativeOidcException) {
-            if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration)) publishFailure(error)
-            if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration) && error.interactiveFallbackAvailable) {
-                mutableSnapshot.value = mutableSnapshot.value.copy(
-                    authenticationState = ProductAuthenticationState.EMBEDDED_SETUP_REQUIRED,
-                    connectionState = ProductConnectionState.ERROR,
-                    connectionError = null,
-                )
+            authenticationLifecycle.runIfCurrent(authenticationGeneration, predicate = { !closed }) {
+                publishFailure(error)
+                if (error.interactiveFallbackAvailable) {
+                    mutableSnapshot.value = mutableSnapshot.value.copy(
+                        authenticationState = ProductAuthenticationState.EMBEDDED_SETUP_REQUIRED,
+                        connectionState = ProductConnectionState.ERROR,
+                        connectionError = null,
+                    )
+                }
             }
             throw error
         } catch (error: Throwable) {
-            if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration)) publishFailure(error)
+            authenticationLifecycle.runIfCurrent(authenticationGeneration, predicate = { !closed }) {
+                publishFailure(error)
+            }
             throw error
         } finally {
             password.fill('\u0000')
@@ -968,13 +1203,20 @@ internal class ProductionProductRepository(
 
     private suspend fun beginEmbeddedAuth(flow: EmbeddedAuthFlow) {
         check(!closed) { "Repository is closed" }
-        val authenticationGeneration = authenticationLifecycle.invalidate()
+        val authenticationGeneration = beginAuthenticationTransition()
         try {
             val configuration = loadOidcConfiguration()
-            requireCurrentAuthentication(authenticationGeneration)
-            mutableSnapshot.value = mutableSnapshot.value.copy(authenticationState = ProductAuthenticationState.EMBEDDED_SETUP_REQUIRED)
-            authState = AuthState(configuration.serviceConfiguration)
-            pendingInteractiveAuthenticationGeneration = authenticationGeneration
+            val initialized = authenticationLifecycle.runIfCurrent(
+                authenticationGeneration,
+                predicate = { !closed && authState == null },
+            ) {
+                mutableSnapshot.value = mutableSnapshot.value.copy(
+                    authenticationState = ProductAuthenticationState.EMBEDDED_SETUP_REQUIRED,
+                )
+                authState = AuthState(configuration.serviceConfiguration)
+                pendingInteractiveAuthenticationGeneration = authenticationGeneration
+            }
+            check(initialized) { "Authentication lifecycle changed" }
             val requestBuilder = AuthorizationRequest.Builder(
                 configuration.serviceConfiguration,
                 configuration.clientId,
@@ -992,82 +1234,134 @@ internal class ProductionProductRepository(
                 request.toUri()
             }
             launchAuthorization(
-                EmbeddedOidcContract.createIntent(activity, request, initialUri, registrationFlow),
+                EmbeddedOidcContract.createIntent(context, request, initialUri, registrationFlow),
             )
         } catch (error: Throwable) {
-            if (pendingInteractiveAuthenticationGeneration == authenticationGeneration) {
-                pendingInteractiveAuthenticationGeneration = null
+            authenticationLifecycle.runIfCurrent(authenticationGeneration, predicate = { !closed }) {
+                if (pendingInteractiveAuthenticationGeneration == authenticationGeneration) {
+                    pendingInteractiveAuthenticationGeneration = null
+                }
+                publishFailure(error)
             }
-            if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration)) publishFailure(error)
             throw error
         }
     }
 
     fun handleAuthorizationResult(data: Intent?) {
-        val authenticationGeneration = pendingInteractiveAuthenticationGeneration ?: return
-        pendingInteractiveAuthenticationGeneration = null
+        val claim = authenticationLifecycle.capture { currentGeneration ->
+            val state = authState
+            if (closed || pendingInteractiveAuthenticationGeneration != currentGeneration || state == null) {
+                null
+            } else {
+                pendingInteractiveAuthenticationGeneration = null
+                InteractiveAuthorizationClaim(currentGeneration, state)
+            }
+        } ?: return
+        val authenticationGeneration = claim.authenticationGeneration
+        val state = claim.authState
         if (data == null) {
-            if (!closed && authenticationLifecycle.isCurrent(authenticationGeneration) && authState != null) {
+            authenticationLifecycle.runIfCurrent(
+                authenticationGeneration,
+                predicate = { !closed && authState === state },
+            ) {
                 publishFailure(IllegalStateException("OIDC sign-in was canceled"))
             }
             return
         }
         val response = AuthorizationResponse.fromIntent(data)
         val exception = AuthorizationException.fromIntent(data)
-        if (closed || !authenticationLifecycle.isCurrent(authenticationGeneration)) return
-        val state = authState ?: return
-        state.update(response, exception)
-        authState = state
+        val responseAccepted = authenticationLifecycle.runIfCurrent(
+            authenticationGeneration,
+            predicate = { !closed && authState === state },
+        ) {
+            state.update(response, exception)
+        }
+        if (!responseAccepted) return
         if (response == null) {
-            publishFailure(exception ?: IllegalStateException("OIDC authorization failed"))
+            authenticationLifecycle.runIfCurrent(
+                authenticationGeneration,
+                predicate = { !closed && authState === state },
+            ) {
+                publishFailure(exception ?: IllegalStateException("OIDC authorization failed"))
+            }
             return
         }
         authService.performTokenRequest(response.createTokenExchangeRequest()) { tokenResponse, tokenException ->
-            state.update(tokenResponse, tokenException)
-            if (!isCurrentAuthentication(authenticationGeneration, state)) return@performTokenRequest
+            val tokenAccepted = authenticationLifecycle.runIfCurrent(
+                authenticationGeneration,
+                predicate = { !closed && authState === state },
+            ) {
+                state.update(tokenResponse, tokenException)
+            }
+            if (!tokenAccepted) return@performTokenRequest
             if (tokenResponse == null) {
-                publishFailure(tokenException ?: IllegalStateException("OIDC token exchange failed"))
+                authenticationLifecycle.runIfCurrent(
+                    authenticationGeneration,
+                    predicate = { !closed && authState === state },
+                ) {
+                    publishFailure(tokenException ?: IllegalStateException("OIDC token exchange failed"))
+                }
                 return@performTokenRequest
             }
             val configuration = oidcConfiguration
             val accessToken = tokenResponse.accessToken
             if (configuration == null || accessToken.isNullOrBlank()) {
-                publishFailure(IllegalStateException("OIDC access token is unavailable"))
+                authenticationLifecycle.runIfCurrent(
+                    authenticationGeneration,
+                    predicate = { !closed && authState === state },
+                ) {
+                    publishFailure(IllegalStateException("OIDC access token is unavailable"))
+                }
                 return@performTokenRequest
             }
             val subject = try {
                 OidcJwtClaims.accessTokenSubject(accessToken, configuration.issuer, configuration.clientId)
             } catch (error: Throwable) {
-                publishFailure(error)
+                authenticationLifecycle.runIfCurrent(
+                    authenticationGeneration,
+                    predicate = { !closed && authState === state },
+                ) {
+                    publishFailure(error)
+                }
                 return@performTokenRequest
             }
             val cleanState = CredentialFreeAuthState.sanitize(state)
             scope.launch {
                 runCatching {
                     requireCurrentAuthentication(authenticationGeneration, state)
-                    if (sessionStore.accountLogin == null) {
-                        sessionStore.accountLogin = OidcJwtClaims.displayIdentifier(tokenResponse.idToken ?: accessToken)
-                    }
                     // Persist the issuer+subject scope first. If the process is
                     // killed after AuthState is saved, startup must never see
                     // an authorized session without an account-scoped key.
-                    establishAccountScope(AccountScope.canonical(configuration.issuer, subject)) {
-                        requireCurrentAuthentication(authenticationGeneration, state)
-                    }
-                    requireCurrentAuthentication(authenticationGeneration, state)
-                    authState = cleanState
-                    sessionStore.saveAuthState(cleanState)
-                    mutableSnapshot.value = mutableSnapshot.value.copy(
-                        signedIn = true,
-                        configured = true,
-                        authenticationState = ProductAuthenticationState.AUTHENTICATED,
-                        connectionState = ProductConnectionState.CONNECTING,
-                        connectionError = null,
-                        lastSyncedAt = null,
+                    establishAccountScope(
+                        nextScope = AccountScope.canonical(configuration.issuer, subject),
+                        authenticationGeneration = authenticationGeneration,
                     )
-                    bootstrapAuthenticatedSession()
+                    val committed = authenticationLifecycle.runIfCurrent(
+                        authenticationGeneration,
+                        predicate = { !closed && authState === state },
+                    ) {
+                        if (sessionStore.accountLogin == null) {
+                            sessionStore.accountLogin = OidcJwtClaims.displayIdentifier(
+                                tokenResponse.idToken ?: accessToken,
+                            )
+                        }
+                        authState = cleanState
+                        sessionStore.saveAuthState(cleanState)
+                        mutableSnapshot.value = mutableSnapshot.value.copy(
+                            signedIn = true,
+                            configured = true,
+                            authenticationState = ProductAuthenticationState.AUTHENTICATED,
+                            connectionState = ProductConnectionState.CONNECTING,
+                            connectionError = null,
+                            lastSyncedAt = null,
+                        )
+                    }
+                    check(committed) { "Authentication lifecycle changed" }
+                    bootstrapAuthenticatedSession(authenticationGeneration)
                 }.onFailure { error ->
-                    if (isCurrentAuthentication(authenticationGeneration, state)) publishFailure(error)
+                    authenticationLifecycle.runIfCurrent(authenticationGeneration, predicate = { !closed }) {
+                        publishFailure(error)
+                    }
                 }
             }
         }
@@ -1075,34 +1369,89 @@ internal class ProductionProductRepository(
 
     override suspend fun signOut() {
         cancelRemoteDownloadsAndJoin(clearMetadata = true)
-        authenticationLifecycle.invalidate()
-        authState = null
-        realtimeAccessToken.clear()
-        sessionStore.clearAuthState()
-        sessionStore.accountLogin = null
-        closeLiveSessions()
-        closeHistoryEngines()
-        clearRoomCache()
-        storedIdentity?.identity?.destroy()
-        storedIdentity = null
-        accountScope = null
-        sessionStore.accountScope = null
-        oidcConfiguration = null
-        billing.reset()
-        mutableSnapshot.value = ProductSnapshot(
-            configured = true,
-            authenticationState = ProductAuthenticationState.SIGNED_OUT,
-            connectionState = ProductConnectionState.CONFIGURED,
-            enrollmentState = ProductEnrollmentState.UNKNOWN,
-            serverUrl = PRODUCT_PUBLIC_SERVER_URL,
-        )
+        val authenticationGeneration = beginAuthenticationTransition()
+        var retiredIdentity: DeviceKeyVault.StoredIdentity? = null
+        val committed = authenticationStateMutationLock.withLock {
+            if (!authenticationLifecycle.isCurrent(authenticationGeneration) || closed) {
+                false
+            } else {
+                closeHistoryEngines()
+                clearRoomCache()
+                authenticationLifecycle.runIfCurrent(authenticationGeneration, predicate = { !closed }) {
+                    retiredIdentity = storedIdentity
+                    storedIdentity = null
+                    accountScope = null
+                    sessionStore.accountScope = null
+                    oidcConfiguration = null
+                    billing.reset()
+                    mutableSnapshot.value = ProductSnapshot(
+                        configured = true,
+                        authenticationState = ProductAuthenticationState.SIGNED_OUT,
+                        connectionState = ProductConnectionState.CONFIGURED,
+                        enrollmentState = ProductEnrollmentState.UNKNOWN,
+                        serverUrl = PRODUCT_PUBLIC_SERVER_URL,
+                    )
+                }
+            }
+        }
+        retiredIdentity?.identity?.destroy()
+        if (!committed) return
+    }
+
+    /**
+     * Starts a new authentication lifecycle without ever pairing its generation
+     * with the previous AuthState. Any old realtime runtime is retired by exact
+     * owner generation after the auth fence has advanced; a concurrently newer
+     * runtime is never touched.
+     */
+    private suspend fun beginAuthenticationTransition(): Long {
+        return authenticationTransitionLock.withLock {
+            authenticationRetirementBarrier.awaitQuiescence()
+            val transition = authenticationStateMutationLock.withLock {
+                val generation = authenticationLifecycle.invalidate {
+                    authState = null
+                    pendingInteractiveAuthenticationGeneration = null
+                    realtimeAccessToken.clear()
+                    runCatching { sessionStore.clearAuthState() }
+                    runCatching { sessionStore.accountLogin = null }
+                    mutableSnapshot.update { snapshot ->
+                        snapshot.copy(
+                            signedIn = false,
+                            accountLabel = null,
+                            sessionStates = emptyMap(),
+                            sessionOpenFailures = emptyMap(),
+                            sessionTitles = emptyMap(),
+                        )
+                    }
+                }
+                val retired = synchronized(liveSessionLock) {
+                    val owner = realtimeMultiplexerOwner
+                    if (realtimeMultiplexer != null &&
+                        (owner == null || owner.authenticationGeneration < generation)
+                    ) {
+                        detachRealtimeRuntimeLocked()
+                    } else {
+                        null
+                    }
+                }
+                AuthenticationTransition(generation, retired)
+            }
+            if (transition.retiredRuntime != null) {
+                closeRetiredRealtimeRuntimeAndJoin(transition.retiredRuntime)
+            }
+            // An expiry callback can register a retirement after the first
+            // quiescence check but before this transition advances the auth
+            // fence. Re-check after the CAS so the successor cannot overtake it.
+            authenticationRetirementBarrier.awaitQuiescence()
+            transition.authenticationGeneration
+        }
     }
 
     override suspend fun confirmEnrollment() {
         check(mutableSnapshot.value.enrollmentState == ProductEnrollmentState.PENDING_CONFIRMATION) {
             "No pending enrollment confirmation is available"
         }
-        withApi { api ->
+        withAuthenticatedApi { api, authenticationGeneration ->
             api.post("/v1/devices/self/trust", buildJsonObject { })
             val self = ProductResponseParser.self(api.get("/v1/devices/self").jsonObject)
             if (self.trustState == DeviceTrustState.REVOKED) {
@@ -1111,7 +1460,7 @@ internal class ProductionProductRepository(
                     enrollmentConfirmationRequired = false,
                     devices = listOf(self),
                 )
-                return@withApi
+                return@withAuthenticatedApi
             }
             check(self.trustState == DeviceTrustState.TRUSTED) { "The server did not trust this device" }
             mutableSnapshot.value = mutableSnapshot.value.copy(
@@ -1120,7 +1469,7 @@ internal class ProductionProductRepository(
                 accountLabel = accountDisplayLabel(),
                 devices = listOf(self),
             )
-            refreshWithApiPublished(api)
+            refreshWithApiPublished(api, authenticationGeneration)
         }
     }
 
@@ -1163,17 +1512,21 @@ internal class ProductionProductRepository(
             ),
         )
         appendActivity(
-            activity.getString(R.string.activity_pairing_challenge_created),
-            activity.getString(
+            context.getString(R.string.activity_pairing_challenge_created),
+            context.getString(
                 R.string.activity_pairing_challenge_detail,
-                challenge.targetName ?: activity.getString(R.string.activity_target_device),
-                challenge.expiresAt?.toString() ?: activity.getString(R.string.time_soon),
+                challenge.targetName ?: context.getString(R.string.activity_target_device),
+                challenge.expiresAt?.toString() ?: context.getString(R.string.time_soon),
             ),
             Severity.WARNING,
         )
     }
 
-    override suspend fun completePairing(challengeId: String, code: String, challengeNonce: String) = withApi { api ->
+    override suspend fun completePairing(
+        challengeId: String,
+        code: String,
+        challengeNonce: String,
+    ) = withAuthenticatedApi { api, authenticationGeneration ->
         val input = PairingInputParser.parse(challengeId, code, challengeNonce)
         api.post(
             "/v1/pairing/challenges/${input.challengeId}/complete",
@@ -1184,11 +1537,11 @@ internal class ProductionProductRepository(
         )
         mutableSnapshot.value = mutableSnapshot.value.copy(pairingChallenge = null)
         appendActivity(
-            activity.getString(R.string.activity_device_pairing_completed),
-            activity.getString(R.string.activity_device_pairing_completed_detail),
+            context.getString(R.string.activity_device_pairing_completed),
+            context.getString(R.string.activity_device_pairing_completed_detail),
             Severity.SUCCESS,
         )
-        refreshWithApiPublished(api)
+        refreshWithApiPublished(api, authenticationGeneration)
     }
 
     override suspend fun purchaseProduct(productId: String) {
@@ -1199,9 +1552,9 @@ internal class ProductionProductRepository(
         billing.restore()
     }
 
-    override suspend fun revokeDevice(deviceId: UUID) = withApi { api ->
+    override suspend fun revokeDevice(deviceId: UUID) = withAuthenticatedApi { api, authenticationGeneration ->
         api.post("/v1/devices/$deviceId/revoke", buildJsonObject { })
-        refreshWithApiPublished(api)
+        refreshWithApiPublished(api, authenticationGeneration)
     }
 
     override suspend fun agentUpdateEligibility(pcId: UUID): AgentUpdateEligibility {
@@ -1276,8 +1629,8 @@ internal class ProductionProductRepository(
                 )
             }
             if (acquired) appendActivity(
-                activity.getString(R.string.activity_control_granted),
-                activity.getString(R.string.activity_session_detail, sessionId),
+                context.getString(R.string.activity_control_granted),
+                context.getString(R.string.activity_session_detail, sessionId),
                 Severity.SUCCESS,
             )
             clearSessionOpenFailure(sessionId)
@@ -1299,8 +1652,8 @@ internal class ProductionProductRepository(
         freshAccessToken()
         live.client.releaseControl()
         appendActivity(
-            activity.getString(R.string.activity_control_released),
-            activity.getString(R.string.activity_session_detail, sessionId),
+            context.getString(R.string.activity_control_released),
+            context.getString(R.string.activity_session_detail, sessionId),
             Severity.INFO,
         )
     }
@@ -1338,34 +1691,51 @@ internal class ProductionProductRepository(
             publishFailure(firstFailure!!)
         } else {
             appendActivity(
-                activity.getString(R.string.activity_control_leases_released),
-                activity.getString(R.string.activity_device_backgrounded),
+                context.getString(R.string.activity_control_leases_released),
+                context.getString(R.string.activity_device_backgrounded),
                 Severity.INFO,
             )
         }
     }
 
-    override suspend fun openSession(sessionId: UUID): Unit = sessionLifecycleLock.withLock {
+    override suspend fun openSession(sessionId: UUID): Unit = sessionLifecycleLanes.withLock(sessionId) {
+        openSessionLocked(sessionId)
+    }
+
+    private suspend fun openSessionLocked(
+        sessionId: UUID,
+        inheritedRendererFatalSequence: Long? = null,
+    ) {
+        if (sessionId in sessionAuthorityTransitionFences) {
+            throw sessionOpenException(SessionOpenFailureCode.PC_NOT_TRUSTED)
+        }
         liveSessions[sessionId]?.let { existing ->
             if (!shouldReplaceLiveSessionForOpen(
                     liveSessionExists = true,
                     remoteState = mutableSnapshot.value.sessionStates[sessionId],
                 )
-            ) return@withLock
+            ) return
 
             // A failed bootstrap can leave an installed renderer/client behind
             // while the UI exposes retry. Reusing it makes retry a no-op. Fence
             // that exact instance, close it, and rebuild under the lifecycle
             // mutex so no second client can register the same session UUID.
-            val removed = synchronized(liveSessionLock) {
-                liveSessions.remove(sessionId, existing)
-            }
-            if (removed) existing.close()
-            if (liveSessions.containsKey(sessionId)) return@withLock
+            val retired = retireExactIncarnationAndThen(
+                expected = existing,
+                removeExact = { expected ->
+                    synchronized(liveSessionLock) {
+                        liveSessions.remove(sessionId, expected)
+                    }
+                },
+                closeAndJoin = LiveProductSession::closeAndJoin,
+            )
+            if (!retired || liveSessions.containsKey(sessionId)) return
         }
         // Keep every opened session alive. The Android pager is a viewer over
         // multiple concurrent terminals; switching pages must not terminate
         // another session's realtime stream.
+        val authentication = captureAuthenticationState()
+        val authenticationGeneration = authentication.authenticationGeneration
         val product = mutableSnapshot.value
         val summary = product.sessions.firstOrNull { it.id == sessionId }
             ?: throw sessionOpenException(SessionOpenFailureCode.SESSION_UNAVAILABLE)
@@ -1381,62 +1751,104 @@ internal class ProductionProductRepository(
         if (pcDevice.exchangePublicKey.size != 32) {
             throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
         }
-        freshAccessToken()
-        mutableSnapshot.update { current ->
-            current.copy(
-                sessionOpenFailures = current.sessionOpenFailures - sessionId,
-                sessionStates = current.sessionStates + (
-                    sessionId to RemoteSessionState.Reconnecting(
-                        lastAckedSequence = current.liveAcknowledgements[sessionId]?.toLong() ?: 0L,
-                        reason = SESSION_BOOTSTRAP_IN_PROGRESS_REASON,
-                    )
-                ),
-            )
+        freshAccessToken(expectedGeneration = authenticationGeneration)
+        val bootstrapStarted = authenticationLifecycle.runIfCurrent(
+            authenticationGeneration,
+            predicate = { !closed && authState != null && accountScope == authentication.accountScope },
+        ) {
+            mutableSnapshot.update { current ->
+                current.copy(
+                    sessionOpenFailures = current.sessionOpenFailures - sessionId,
+                    sessionStates = current.sessionStates + (
+                        sessionId to RemoteSessionState.Reconnecting(
+                            lastAckedSequence = current.liveAcknowledgements[sessionId]?.toLong() ?: 0L,
+                            reason = SESSION_BOOTSTRAP_IN_PROGRESS_REASON,
+                        )
+                    ),
+                )
+            }
         }
+        check(bootstrapStarted) { "Authentication lifecycle changed" }
         val root = PRODUCT_PUBLIC_SERVER_URL
-        val stored = identity()
+        val stored = authenticationLifecycle.capture { currentGeneration ->
+            check(
+                !closed &&
+                    currentGeneration == authenticationGeneration &&
+                    accountScope == authentication.accountScope &&
+                    authState != null
+            ) { "Authentication lifecycle changed" }
+            identity(authentication.accountScope)
+        }
         val engine = NativeTerminalEngine(
             initialSize = TerminalSize(summary.columns.coerceAtLeast(1), summary.rows.coerceAtLeast(1)),
         )
+        // One lane owns every ordered renderer mutation for this incarnation,
+        // including the initial Snapshot/history replay and later realtime
+        // delivery. This keeps JNI and protobuf work off Main without allowing
+        // bootstrap and live frames to race each other.
+        val sessionDispatcher = Dispatchers.Default.limitedParallelism(1)
         // Start only the device-scoped handshake while REST chooses/restores a
         // checkpoint. The bounded session endpoint is still registered after
         // bootstrap so realtime ciphertext cannot overflow an unconsumed queue.
-        deviceRealtimeMultiplexer(stored).warmConnect()
+        val realtime = deviceRealtimeRuntime(stored, authenticationGeneration)
+        realtime.multiplexer.warmConnect()
         val restoredHistory = try {
-            restoreLiveHistory(
-                session = summary,
-                pc = pc,
-                pcDevice = pcDevice,
-                stored = stored,
-                engine = engine,
-                allowFreshReplayFromZero = sessionId in newlyLaunchedSessionIds,
-            )
+            withContext(sessionDispatcher) {
+                restoreLiveHistory(
+                    session = summary,
+                    pc = pc,
+                    pcDevice = pcDevice,
+                    stored = stored,
+                    engine = engine,
+                    allowFreshReplayFromZero = sessionId in newlyLaunchedSessionIds,
+                )
+            }
         } catch (error: CancellationException) {
             engine.dispose()
             throw error
         } catch (error: Throwable) {
             engine.dispose()
             val classified = classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_PREPARE)
-            observeBootstrapFailure(sessionId, classified.failure)
+            if (!observeBootstrapFailureIfCurrent(
+                    sessionId,
+                    classified.failure,
+                    authenticationGeneration,
+                    realtime,
+                    stored,
+                )
+            ) {
+                throw IllegalStateException("Authentication lifecycle changed", error)
+            }
             throw classified
         }
         val transport = try {
-            deviceRealtimeMultiplexer(stored).register(sessionId)
+            check(isCurrentRealtimeOwner(realtime.owner)) { "Authentication lifecycle changed" }
+            realtime.multiplexer.register(sessionId)
         } catch (error: CancellationException) {
             engine.dispose()
             throw error
         } catch (error: Throwable) {
             engine.dispose()
             val classified = classifySessionOpenException(error, SessionFailureStage.REALTIME)
-            observeBootstrapFailure(sessionId, classified.failure)
+            if (!observeBootstrapFailureIfCurrent(
+                    sessionId,
+                    classified.failure,
+                    authenticationGeneration,
+                    realtime,
+                    stored,
+                )
+            ) {
+                throw IllegalStateException("Authentication lifecycle changed", error)
+            }
             throw classified
         }
+        val liveReference = AtomicReference<LiveProductSession?>(null)
         val client = try {
             ProductionRealtimeSessionClient(
                 engine = engine,
                 config = ProductionRealtimeSessionConfig(
                     rootUrl = root,
-                    tokenProvider = AccessTokenProvider(realtimeAccessToken::requireCurrent),
+                    tokenProvider = AccessTokenProvider { requireRealtimeAccessToken(realtime.owner) },
                     androidDeviceId = stored.deviceId,
                     pcDeviceId = pc.deviceId,
                     sessionId = sessionId,
@@ -1457,6 +1869,7 @@ internal class ProductionProductRepository(
                 initialRendererState = restoredHistory.rendererState,
                 initialObservedLocalInputEpoch = restoredHistory.localInputEpoch,
                 acknowledgementObserver = { expectedGeneration, sequence ->
+                    check(isCurrentRealtimeOwner(realtime.owner)) { "Authentication lifecycle changed" }
                     if (sessionId in deletedSessionIds) {
                         DurableAckCommit(sequence, expectedGeneration)
                     } else {
@@ -1471,6 +1884,7 @@ internal class ProductionProductRepository(
                     }
                 },
                 acknowledgementResetObserver = { expectedGeneration ->
+                    check(isCurrentRealtimeOwner(realtime.owner)) { "Authentication lifecycle changed" }
                     if (sessionId in deletedSessionIds) {
                         DurableAckCommit(0, expectedGeneration + 1)
                     } else {
@@ -1493,7 +1907,17 @@ internal class ProductionProductRepository(
                         DurableAckCommit(reset.sequence.toLong(), reset.rendererGeneration)
                     }
                 },
-                authoritativeMetadataRefreshObserver = { refreshLiveKeyMetadata() },
+                authoritativeMetadataRefreshObserver = {
+                    if (isCurrentRealtimeOwner(realtime.owner)) refreshLiveKeyMetadata()
+                },
+                rendererFatalObserver = { failure ->
+                    liveReference.get()?.let { failedIncarnation ->
+                        realtimeRuntimeScope.launch {
+                            recoverRendererFatal(sessionId, failedIncarnation, failure)
+                        }
+                    }
+                },
+                sessionDispatcher = sessionDispatcher,
             )
         } catch (error: CancellationException) {
             transport.close()
@@ -1503,98 +1927,185 @@ internal class ProductionProductRepository(
             transport.close()
             engine.dispose()
             val classified = classifySessionOpenException(error, SessionFailureStage.REALTIME)
-            observeBootstrapFailure(sessionId, classified.failure)
+            if (!observeBootstrapFailureIfCurrent(
+                    sessionId,
+                    classified.failure,
+                    authenticationGeneration,
+                    realtime,
+                    stored,
+                )
+            ) {
+                throw IllegalStateException("Authentication lifecycle changed", error)
+            }
             throw classified
         }
-        val live = LiveProductSession(engine, client)
-        val installed = synchronized(liveSessionLock) {
-            if (liveSessions.containsKey(sessionId)) false
-            else {
-                liveSessions[sessionId] = live
-                true
-            }
-        }
-        if (!installed) {
-            client.close()
-            return@withLock
-        }
-        observeBootstrap(sessionId, restoredHistory)
-        live.stateJob = scope.launch {
-            combine(
-                client.sessionState,
-                engine.authoritativeSize,
-                client.sessionTitle,
-                engine.title,
-            ) { state, size, publishedTitle, rendererTitle ->
-                // Console-title polling and OSC parsing are complementary.
-                // Prefer the ordered E2EE metadata event and retain the
-                // renderer title as compatibility fallback for older Agents.
-                RuntimeSessionProjection(
-                    state,
-                    size,
-                    liveSessionTitleOverride(publishedTitle, rendererTitle),
-                )
-            }.collect { runtime ->
-                mutableSnapshot.update { product ->
-                    val index = product.sessions.indexOfFirst { it.id == sessionId }
-                    if (index < 0) return@update product
-                    val projected = projectLiveSessionSummary(
-                        product.sessions[index],
-                        runtime.state,
-                        runtime.size,
+        val live = LiveProductSession(
+            engine = engine,
+            client = client,
+            parentScope = scope,
+            authenticationOwner = realtime.owner,
+            inheritedRendererFatalSequence = inheritedRendererFatalSequence,
+        )
+        check(liveReference.compareAndSet(null, live)) { "Live session incarnation was already installed" }
+        live.installBackgroundJobs(
+            stateJob = scope.launch(start = CoroutineStart.LAZY) {
+                combine(
+                    client.sessionState,
+                    engine.authoritativeSize,
+                    client.sessionTitle,
+                    engine.title,
+                ) { state, size, publishedTitle, rendererTitle ->
+                    // Console-title polling and OSC parsing are complementary.
+                    // Prefer the ordered E2EE metadata event and retain the
+                    // renderer title as compatibility fallback for older Agents.
+                    RuntimeSessionProjection(
+                        state,
+                        size,
+                        liveSessionTitleOverride(publishedTitle, rendererTitle),
                     )
-                    val sessions = product.sessions.toMutableList().also { it[index] = projected }
-                    product.copy(
-                        sessions = sessions,
-                        sessionStates = product.sessionStates + (sessionId to runtime.state),
-                        sessionTitles = when {
-                            runtime.titleOverride == null -> product.sessionTitles
-                            runtime.titleOverride.isBlank() -> product.sessionTitles - sessionId
-                            else -> product.sessionTitles + (sessionId to runtime.titleOverride)
+                }.collect { runtime ->
+                    val accepted = authenticationLifecycle.runIfCurrent(
+                        authenticationGeneration,
+                        predicate = {
+                            !closed &&
+                                realtimeMultiplexerOwner === realtime.owner &&
+                                realtimeMultiplexer === realtime.multiplexer &&
+                                storedIdentity === stored &&
+                                liveSessions[sessionId] === live
                         },
-                    )
-                }
-                val state = runtime.state
-                if (state is RemoteSessionState.HistoryGap && live.recoveryJob?.isActive != true) {
-                    live.recoveryJob = scope.launch {
-                        recoverLiveHistoryGap(sessionId, live)
-                    }
-                }
-            }
-        }
-        live.tokenRefreshJob = scope.launch {
-            while (isActive && mutableSnapshot.value.signedIn) {
-                delay(LIVE_TOKEN_REFRESH_INTERVAL_MILLIS)
-                runCatching { freshAccessToken() }
-                    .onFailure { error ->
-                        if (isActive && mutableSnapshot.value.signedIn) {
-                            publishFailure(error)
-                            delay(LIVE_TOKEN_REFRESH_RETRY_MILLIS)
+                    ) {
+                        mutableSnapshot.update { product ->
+                            val index = product.sessions.indexOfFirst { it.id == sessionId }
+                            if (index < 0) return@update product
+                            val projected = projectLiveSessionSummary(
+                                product.sessions[index],
+                                runtime.state,
+                                runtime.size,
+                            )
+                            val sessions = product.sessions.toMutableList().also { it[index] = projected }
+                            product.copy(
+                                sessions = sessions,
+                                sessionStates = product.sessionStates + (sessionId to runtime.state),
+                                sessionOpenFailures = sessionFailuresAfterRuntimeState(
+                                    product.sessionOpenFailures,
+                                    sessionId,
+                                    runtime.state,
+                                ),
+                                sessionTitles = when {
+                                    runtime.titleOverride == null -> product.sessionTitles
+                                    runtime.titleOverride.isBlank() -> product.sessionTitles - sessionId
+                                    else -> product.sessionTitles + (sessionId to runtime.titleOverride)
+                                },
+                            )
                         }
                     }
+                    if (!accepted) return@collect
+                    if (runtime.state is RemoteSessionState.HistoryGap) {
+                        live.launchRecovery { recoverLiveHistoryGap(sessionId, live) }
+                    }
+                }
+            },
+            tokenRefreshJob = scope.launch(start = CoroutineStart.LAZY) {
+                while (isActive && isCurrentRealtimeOwner(realtime.owner)) {
+                    delay(LIVE_TOKEN_REFRESH_INTERVAL_MILLIS)
+                    runCatching { freshAccessToken(force = false, expectedRuntimeOwner = realtime.owner) }
+                        .onFailure { error ->
+                            if (isActive && isCurrentRealtimeOwner(realtime.owner)) {
+                                publishFailure(error)
+                                delay(LIVE_TOKEN_REFRESH_RETRY_MILLIS)
+                            }
+                        }
+                }
+            },
+        )
+        var exactRuntime = true
+        var duplicateSession = false
+        var installed = false
+        val installationCurrent = authenticationLifecycle.runIfCurrent(
+            authenticationGeneration,
+            predicate = {
+                !closed &&
+                    authState != null &&
+                    accountScope == realtime.owner.accountScope &&
+                    storedIdentity === stored
+            },
+        ) {
+            installed = synchronized(liveSessionLock) {
+                when {
+                    realtimeMultiplexerOwner !== realtime.owner ||
+                        realtimeMultiplexer !== realtime.multiplexer -> {
+                        exactRuntime = false
+                        false
+                    }
+                    liveSessions.containsKey(sessionId) -> {
+                        duplicateSession = true
+                        false
+                    }
+                    else -> {
+                        liveSessions[sessionId] = live
+                        true
+                    }
+                }
             }
         }
+        if (!installationCurrent || !exactRuntime || !installed) {
+            live.closeAndJoin()
+            if (!installationCurrent || !exactRuntime) {
+                throw IllegalStateException("Authentication lifecycle changed")
+            }
+            check(duplicateSession)
+            return
+        }
+        val bootstrapPublished = authenticationLifecycle.runIfCurrent(
+            authenticationGeneration,
+            predicate = {
+                !closed &&
+                    realtimeMultiplexerOwner === realtime.owner &&
+                    realtimeMultiplexer === realtime.multiplexer &&
+                    storedIdentity === stored &&
+                    liveSessions[sessionId] === live
+            },
+        ) {
+            observeBootstrap(sessionId, restoredHistory)
+        }
+        if (!bootstrapPublished) {
+            val removed = synchronized(liveSessionLock) { liveSessions.remove(sessionId, live) }
+            if (removed) live.closeAndJoin()
+            throw IllegalStateException("Authentication lifecycle changed")
+        }
         try {
-            client.start()
+            check(live.start()) { "Live session was retired before startup" }
             newlyLaunchedSessionIds.remove(sessionId)
         } catch (error: CancellationException) {
-            synchronized(liveSessionLock) {
-                liveSessions.remove(sessionId, live)
-            }
-            live.close()
+            val removed = synchronized(liveSessionLock) { liveSessions.remove(sessionId, live) }
+            if (removed) withContext(NonCancellable) { live.closeAndJoin() }
             throw error
         } catch (error: Throwable) {
-            synchronized(liveSessionLock) {
-                liveSessions.remove(sessionId, live)
+            val removed = synchronized(liveSessionLock) { liveSessions.remove(sessionId, live) }
+            if (removed) {
+                live.closeAndJoin()
+            } else {
+                // An authentication transition owns exact retirement now. Do
+                // not publish its expected startup cancellation as a failure
+                // into the successor account snapshot.
+                throw IllegalStateException("Authentication lifecycle changed", error)
             }
-            live.close()
             val classified = classifySessionOpenException(error, SessionFailureStage.REALTIME)
-            observeBootstrapFailure(sessionId, classified.failure)
+            if (!observeBootstrapFailureIfCurrent(
+                    sessionId,
+                    classified.failure,
+                    authenticationGeneration,
+                    realtime,
+                    stored,
+                )
+            ) {
+                throw IllegalStateException("Authentication lifecycle changed", error)
+            }
             throw classified
         }
     }
 
-    override suspend fun closeSessionView(sessionId: UUID): Unit = sessionLifecycleLock.withLock {
+    override suspend fun closeSessionView(sessionId: UUID): Unit = sessionLifecycleLanes.withLock(sessionId) {
         check(!closed) { "Repository is closed" }
         newlyLaunchedSessionIds.remove(sessionId)
         val live = synchronized(liveSessionLock) { liveSessions.remove(sessionId) }
@@ -1629,7 +2140,7 @@ internal class ProductionProductRepository(
             viewportGeneration = viewport.viewportGeneration,
         )
         awaitCoalescedTranscriptLoad(scope, transcriptLoads, key) {
-            sessionLifecycleLock.withLock { loadTranscriptPage(key) }
+            sessionLifecycleLanes.withLock(key.sessionId) { loadTranscriptPage(key) }
         }
     }
 
@@ -1707,7 +2218,7 @@ internal class ProductionProductRepository(
         // remove the renderer, Room history, and directory row together.
         withApi { api ->
             refreshStateLock.withLock {
-                sessionLifecycleLock.withLock {
+                sessionLifecycleLanes.withLock(sessionId) {
                     deleteClosedSessionAfterTermination(
                         deleteRemote = { api.delete("/v1/sessions/$sessionId") },
                         deleteLocal = { deleteLocalSession(sessionId) },
@@ -1716,8 +2227,8 @@ internal class ProductionProductRepository(
             }
         }
         appendActivity(
-            activity.getString(R.string.activity_session_closed),
-            activity.getString(R.string.activity_session_closed_detail),
+            context.getString(R.string.activity_session_closed),
+            context.getString(R.string.activity_session_closed_detail),
             Severity.INFO,
         )
     }
@@ -1730,7 +2241,7 @@ internal class ProductionProductRepository(
             // lifecycle lock also prevents an open/replay from installing a
             // new client or history engine between server success and cleanup.
             refreshStateLock.withLock {
-                sessionLifecycleLock.withLock {
+                sessionLifecycleLanes.withLock(sessionId) {
                     deleteSessionAfterRemoteSuccess(
                         deleteRemote = { api.delete("/v1/sessions/$sessionId") },
                         deleteLocal = { deleteLocalSession(sessionId) },
@@ -1815,7 +2326,7 @@ internal class ProductionProductRepository(
         check(accepted) { "Request control before sending input" }
     }
 
-    override suspend fun replayHistory(entry: HistoryEntry): Unit = sessionLifecycleLock.withLock {
+    override suspend fun replayHistory(entry: HistoryEntry): Unit = sessionLifecycleLanes.withLock(entry.sessionId) {
         require(entry.historyObject.kind == HistoryObject.Kind.CHUNK) { "This history object cannot be replayed by this client" }
         val download = historyDownloads[entry.historyObject.id] ?: error("Refresh history before replaying this object")
         val product = mutableSnapshot.value
@@ -1841,7 +2352,7 @@ internal class ProductionProductRepository(
         mutableSnapshot.value = mutableSnapshot.value.copy(
             replayedHistoryObjectIds = mutableSnapshot.value.replayedHistoryObjectIds + entry.historyObject.id,
         )
-        appendActivity(activity.getString(R.string.activity_history_replayed), entry.sessionLabel, Severity.SUCCESS)
+        appendActivity(context.getString(R.string.activity_history_replayed), entry.sessionLabel, Severity.SUCCESS)
     }
 
     override suspend fun browseRemoteDirectory(
@@ -2022,7 +2533,7 @@ internal class ProductionProductRepository(
             }
             val ready = withTimeoutOrNull(REMOTE_SHELL_CATALOG_TIMEOUT_MILLIS) {
                 while (true) {
-                    withApi { api -> pollSessionCatalogWithApi(api) }
+                    withAuthenticatedApi { api, generation -> pollSessionCatalogWithApi(api, generation) }
                     if (mutableSnapshot.value.sessions.any { it.id == sessionId && it.online }) break
                     delay(REMOTE_FILE_OPERATION_POLL_INTERVAL_MILLIS)
                 }
@@ -2332,9 +2843,9 @@ internal class ProductionProductRepository(
         "/v1/pcs/$pcId/file-operations" + (operationId?.let { "/$it" } ?: "")
 
     private fun remoteFileErrorMessage(error: Throwable): String = when (error) {
-        is TermLinkApiException -> activity.getString(R.string.remote_file_error_server, error.status)
-        is java.io.IOException -> activity.getString(R.string.remote_file_error_connection)
-        else -> activity.getString(R.string.remote_file_error_generic)
+        is TermLinkApiException -> context.getString(R.string.remote_file_error_server, error.status)
+        is java.io.IOException -> context.getString(R.string.remote_file_error_connection)
+        else -> context.getString(R.string.remote_file_error_generic)
     }
 
     private suspend fun deleteLocalSession(sessionId: UUID) {
@@ -2357,30 +2868,44 @@ internal class ProductionProductRepository(
 
     override suspend fun refresh() {
         check(!closed) { "Repository is closed" }
-        mutableSnapshot.value = mutableSnapshot.value.copy(
-            connectionState = if (mutableSnapshot.value.signedIn) {
-                ProductConnectionState.CONNECTING
-            } else if (mutableSnapshot.value.configured) {
-                ProductConnectionState.CONFIGURED
-            } else {
-                ProductConnectionState.SIGNED_OUT
-            },
-            connectionError = null,
-        )
+        val authenticationGeneration = authenticationLifecycle.capture()
+        authenticationLifecycle.runIfCurrent(authenticationGeneration, predicate = { !closed }) {
+            mutableSnapshot.value = mutableSnapshot.value.copy(
+                connectionState = if (mutableSnapshot.value.signedIn) {
+                    ProductConnectionState.CONNECTING
+                } else if (mutableSnapshot.value.configured) {
+                    ProductConnectionState.CONFIGURED
+                } else {
+                    ProductConnectionState.SIGNED_OUT
+                },
+                connectionError = null,
+            )
+        }
         try {
-            withApi { api -> refreshWithApi(api) }
+            withAuthenticatedApi(expectedGeneration = authenticationGeneration) { api, generation ->
+                refreshWithApi(api, generation)
+            }
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
-            publishFailure(error)
+            authenticationLifecycle.runIfCurrent(authenticationGeneration, predicate = { !closed }) {
+                publishFailure(error)
+            }
             throw error
         }
     }
 
-    private suspend fun refreshWithApi(api: ProductionApiClient): Unit = refreshStateLock.withLock {
+    private suspend fun refreshWithApi(
+        api: ProductionApiClient,
+        authenticationGeneration: Long,
+    ): Unit = refreshStateLock.withLock {
+        requireCurrentAuthentication(authenticationGeneration)
         val self = resolveSameAccountDevice(api, ProductResponseParser.self(api.get("/v1/devices/self").jsonObject))
         if (sameAccountDeviceAction(self.trustState) == SameAccountDeviceAction.BLOCK_REVOKED) {
-            clearAccessControlledState(self)
+            authenticationStateMutationLock.withLock {
+                requireCurrentAuthentication(authenticationGeneration)
+                clearAccessControlledState(self, authenticationGeneration)
+            }
             return
         }
         val devices = ProductResponseParser.itemObjects(api.get("/v1/devices").jsonObject).map { it.toDevice() }
@@ -2394,6 +2919,8 @@ internal class ProductionProductRepository(
         val catalogPlans = ProductResponseParser.catalogPlanObjects(api.get("/v1/billing/plans").jsonObject)
             .map { it.toCatalogPlan() }
         val catalog = catalogPlans.firstOrNull { it.key == entitlement.planKey }
+        authenticationStateMutationLock.withLock {
+            requireCurrentAuthentication(authenticationGeneration)
         // Reject an epoch rollback or same-epoch public-key substitution before
         // any untrusted metadata reaches Room. Refreshes are serialized so a
         // slower response cannot overwrite a newer validated snapshot.
@@ -2450,52 +2977,72 @@ internal class ProductionProductRepository(
             } ?: session
         }
         val retainedSessionIds = sessions.mapTo(mutableSetOf(), SessionSummary::id)
-        mutableSnapshot.update { current ->
-            current.copy(
-                signedIn = true,
-                configured = true,
-                connectionState = ProductConnectionState.CONNECTED,
-                connectionError = null,
-                enrollmentState = ProductEnrollmentState.TRUSTED,
-                enrollmentConfirmationRequired = false,
-                accountLabel = accountDisplayLabel(),
-                devices = devices,
-                pcs = pcs,
-                sessions = runtimeSessions,
-                sessionStates = current.sessionStates.filterKeys(retainedSessionIds::contains),
-                sessionOpenFailures = current.sessionOpenFailures.filterKeys(retainedSessionIds::contains),
-                sessionTitles = reconcileSessionDirectoryTitles(
-                    current.sessionTitles,
-                    runtimeSessions,
-                    directoryTitles,
-                    currentLiveSessionTitles(),
-                ),
-                history = historyEntries,
-                replayedHistoryObjectIds = current.replayedHistoryObjectIds.intersect(
-                    historyEntries.mapTo(mutableSetOf()) { it.historyObject.id },
-                ),
-                transcriptViewports = current.transcriptViewports.filterKeys(retainedSessionIds::contains),
-                liveAcknowledgements = current.liveAcknowledgements.filterKeys(retainedSessionIds::contains),
-                bootstrapSources = current.bootstrapSources.filterKeys(retainedSessionIds::contains),
-                catalogPlans = catalogPlans,
-                entitlement = entitlement,
-                catalogPlan = catalog,
-                lastSyncedAt = Instant.now(),
-            )
+        val published = authenticationLifecycle.runIfCurrent(
+            authenticationGeneration,
+            predicate = { !closed && authState != null },
+        ) {
+            mutableSnapshot.update { current ->
+                current.copy(
+                    signedIn = true,
+                    configured = true,
+                    connectionState = ProductConnectionState.CONNECTED,
+                    connectionError = null,
+                    enrollmentState = ProductEnrollmentState.TRUSTED,
+                    enrollmentConfirmationRequired = false,
+                    accountLabel = accountDisplayLabel(),
+                    devices = devices,
+                    pcs = pcs,
+                    sessions = runtimeSessions,
+                    sessionStates = current.sessionStates.filterKeys(retainedSessionIds::contains),
+                    sessionOpenFailures = current.sessionOpenFailures.filterKeys(retainedSessionIds::contains),
+                    sessionTitles = reconcileSessionDirectoryTitles(
+                        current.sessionTitles,
+                        runtimeSessions,
+                        directoryTitles,
+                        currentLiveSessionTitles(),
+                    ),
+                    history = historyEntries,
+                    replayedHistoryObjectIds = current.replayedHistoryObjectIds.intersect(
+                        historyEntries.mapTo(mutableSetOf()) { it.historyObject.id },
+                    ),
+                    transcriptViewports = current.transcriptViewports.filterKeys(retainedSessionIds::contains),
+                    liveAcknowledgements = current.liveAcknowledgements.filterKeys(retainedSessionIds::contains),
+                    bootstrapSources = current.bootstrapSources.filterKeys(retainedSessionIds::contains),
+                    catalogPlans = catalogPlans,
+                    entitlement = entitlement,
+                    catalogPlan = catalog,
+                    lastSyncedAt = Instant.now(),
+                )
+            }
+            // refreshStateLock still excludes narrow key refresh here, so this
+            // cannot erase a newer transition fence.
+            sessionAuthorityTransitionFences.clear()
         }
-        scope.launch { billing.syncCatalog(catalogPlans) }
+        check(published) { "Authentication lifecycle changed" }
+            refreshDirectAuthorizedPeers(authenticationGeneration, storedIdentity, devices, pcs)
+            scope.launch { billing.syncCatalog(catalogPlans) }
+        }
     }
 
-    private suspend fun refreshWithApiPublished(api: ProductionApiClient) {
+    private suspend fun refreshWithApiPublished(
+        api: ProductionApiClient,
+        authenticationGeneration: Long,
+    ) {
         try {
-            refreshWithApi(api)
+            refreshWithApi(api, authenticationGeneration)
         } catch (error: Throwable) {
-            publishFailure(error)
+            authenticationLifecycle.runIfCurrent(authenticationGeneration, predicate = { !closed }) {
+                publishFailure(error)
+            }
             throw error
         }
     }
 
-    private suspend fun pollSessionCatalogWithApi(api: ProductionApiClient): Unit = refreshStateLock.withLock {
+    private suspend fun pollSessionCatalogWithApi(
+        api: ProductionApiClient,
+        authenticationGeneration: Long,
+    ): Unit = refreshStateLock.withLock {
+        requireCurrentAuthentication(authenticationGeneration)
         val devices = ProductResponseParser.itemObjects(api.get("/v1/devices").jsonObject).map { it.toDevice() }
         val pcs = ProductResponseParser.itemObjects(api.get("/v1/pcs").jsonObject).map { it.toPc() }
         val catalogSessions = pcs.flatMap { pc ->
@@ -2503,6 +3050,8 @@ internal class ProductionProductRepository(
                 api.get("/v1/pcs/${pc.id}/sessions?include_ended=true").jsonObject,
             ).map { it.toSession() }
         }.filterNot { it.id in deletedSessionIds }
+        authenticationStateMutationLock.withLock {
+            requireCurrentAuthentication(authenticationGeneration)
         closeLiveSessionsForChangedPcIdentities(pcs, catalogSessions)
         validateAuthoritativeSessionKeys(devices, pcs, catalogSessions)
         historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
@@ -2528,32 +3077,50 @@ internal class ProductionProductRepository(
                 projectLiveSessionSummary(session, live.client.sessionState.value, live.engine.authoritativeSize.value)
             } ?: session
         }
-        mutableSnapshot.update { current ->
-            val reconciled = reconcileSessionCatalog(
-                current = current.copy(devices = devices),
-                pcs = pcs,
-                sessions = runtimeSessions,
-                deletedSessionIds = deletedSessionIds,
-            )
-            reconciled.copy(
-                sessionTitles = reconcileSessionDirectoryTitles(
-                    reconciled.sessionTitles,
-                    runtimeSessions,
-                    directoryTitles,
-                    currentLiveSessionTitles(),
-                ),
-                lastSyncedAt = Instant.now(),
-            )
+        val published = authenticationLifecycle.runIfCurrent(
+            authenticationGeneration,
+            predicate = { !closed && authState != null },
+        ) {
+            mutableSnapshot.update { current ->
+                val reconciled = reconcileSessionCatalog(
+                    current = current.copy(devices = devices),
+                    pcs = pcs,
+                    sessions = runtimeSessions,
+                    deletedSessionIds = deletedSessionIds,
+                )
+                reconciled.copy(
+                    sessionTitles = reconcileSessionDirectoryTitles(
+                        reconciled.sessionTitles,
+                        runtimeSessions,
+                        directoryTitles,
+                        currentLiveSessionTitles(),
+                    ),
+                    lastSyncedAt = Instant.now(),
+                )
+            }
+            sessionAuthorityTransitionFences.clear()
+        }
+            check(published) { "Authentication lifecycle changed" }
+            refreshDirectAuthorizedPeers(authenticationGeneration, identity(), devices, pcs)
         }
     }
 
     private suspend fun <T> withApi(
         httpClient: OkHttpClient = http,
         block: suspend (ProductionApiClient) -> T,
+    ): T = withAuthenticatedApi(httpClient = httpClient) { api, _ -> block(api) }
+
+    private suspend fun <T> withAuthenticatedApi(
+        httpClient: OkHttpClient = http,
+        expectedGeneration: Long? = null,
+        block: suspend (ProductionApiClient, Long) -> T,
     ): T = withContext(Dispatchers.IO) {
         val root = PRODUCT_PUBLIC_SERVER_URL
-        val token = freshAccessToken()
-        val identity = identity()
+        val initial = captureAuthenticationState(expectedGeneration = expectedGeneration)
+        val token = freshAccessToken(expectedGeneration = initial.authenticationGeneration)
+        val refreshed = captureAuthenticationState(expectedGeneration = initial.authenticationGeneration)
+        check(refreshed.accountScope == initial.accountScope) { "Authentication account scope changed" }
+        val identity = identity(initial.accountScope)
         ProductionApiClient(
             root,
             AccessTokenProvider { token },
@@ -2563,7 +3130,10 @@ internal class ProductionProductRepository(
             allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
         ).use { api ->
             ensureRegistered(api, identity)
-            block(api)
+            requireCurrentAuthentication(initial.authenticationGeneration)
+            block(api, initial.authenticationGeneration).also {
+                requireCurrentAuthentication(initial.authenticationGeneration)
+            }
         }
     }
 
@@ -2639,78 +3209,115 @@ internal class ProductionProductRepository(
         }
     }
 
-    private fun identity(): DeviceKeyVault.StoredIdentity {
+    private fun identity(expectedScope: String? = null): DeviceKeyVault.StoredIdentity {
         val scope = accountScope ?: error("OIDC account scope is unavailable")
+        check(expectedScope == null || scope == expectedScope) { "Authentication account scope changed" }
         return storedIdentity ?: keyVault.loadOrCreate(scope).also { storedIdentity = it }
     }
 
-    private suspend fun freshAccessToken(force: Boolean = false): String =
+    private suspend fun freshAccessToken(
+        force: Boolean = false,
+        expectedRuntimeOwner: RealtimeAuthenticationOwner? = null,
+        expectedGeneration: Long? = null,
+    ): String = if (expectedRuntimeOwner == null && expectedGeneration == null) {
         tokenRefresh.freshAccessToken(force)
+    } else {
+        tokenRefresh.serially {
+            requestFreshAccessToken(force, expectedRuntimeOwner, expectedGeneration).also { value ->
+                require(value.isNotBlank()) { "OIDC access token is unavailable" }
+            }
+        }
+    }
 
-    private suspend fun requestFreshAccessToken(force: Boolean): String = suspendCancellableCoroutine { continuation ->
-        val generation = authenticationLifecycle.capture()
-        val state = authState ?: run {
-            continuation.resumeWithException(IllegalStateException("Sign in first"))
-            return@suspendCancellableCoroutine
-        }
-        if (closed || !authenticationLifecycle.isCurrent(generation)) {
-            continuation.resumeWithException(IllegalStateException("Authentication lifecycle changed"))
-            return@suspendCancellableCoroutine
-        }
+    private suspend fun requestFreshAccessToken(
+        force: Boolean,
+        expectedRuntimeOwner: RealtimeAuthenticationOwner? = null,
+        expectedGeneration: Long? = null,
+    ): String {
+        val captured = captureAuthenticationState(
+            expectedGeneration = expectedRuntimeOwner?.authenticationGeneration ?: expectedGeneration,
+            expectedRuntimeOwner = expectedRuntimeOwner,
+        )
+        val generation = captured.authenticationGeneration
+        val state = captured.authState
+        val expectedAccountScope = captured.accountScope
         // Persisted AuthState intentionally omits AuthorizationResponse and all
         // original token-request credentials.  AppAuth's refresh helper relies
         // on that discarded request metadata, so every flow (native login and
         // embedded PKCE fallback) refreshes through the same bounded, no-cookie
         // token transport instead.
-        scope.launch {
-            try {
-                val configuration = ensureOidcConfiguration()
-                val current = state.accessToken
-                if (!force && !state.needsTokenRefresh && !current.isNullOrBlank()) {
-                    requireCurrentAuthentication(generation, state)
+        try {
+            val configuration = ensureOidcConfiguration()
+            val current = state.accessToken
+            if (!force && !state.needsTokenRefresh && !current.isNullOrBlank()) {
+                val published = authenticationLifecycle.runIfCurrent(
+                    captured = generation,
+                    predicate = {
+                        !closed &&
+                            authState === state &&
+                            accountScope == expectedAccountScope &&
+                            (expectedRuntimeOwner == null || realtimeMultiplexerOwner === expectedRuntimeOwner)
+                    },
+                ) {
                     realtimeAccessToken.publish(current)
-                    if (continuation.isActive) continuation.resume(current)
-                    return@launch
                 }
-                val refreshToken = state.refreshToken ?: throw IllegalStateException("OIDC refresh token is unavailable")
-                val payload = withContext(Dispatchers.IO) { nativeOidc.refresh(configuration, refreshToken) }
-                val refreshedSubject = OidcJwtClaims.accessTokenSubject(
-                    payload.accessToken,
-                    configuration.issuer,
-                    configuration.clientId,
-                )
-                check(accountScope == AccountScope.canonical(configuration.issuer, refreshedSubject)) {
-                    "OIDC refresh changed account identity"
-                }
-                val request = TokenRequest.Builder(configuration.serviceConfiguration, configuration.clientId)
-                    // Metadata only. A real refresh request here would require
-                    // duplicating the live refresh token inside TokenRequest.
-                    .setGrantType(CredentialFreeAuthState.SANITIZED_REQUEST_GRANT_TYPE)
-                    .setScope(payload.scope ?: state.scope)
-                    .build()
-                val tokenResponse = TokenResponse.Builder(request)
-                    .setTokenType(payload.tokenType)
-                    .setAccessToken(payload.accessToken)
-                    .setAccessTokenExpiresIn(payload.expiresInSeconds)
-                    .setRefreshToken(payload.refreshToken ?: refreshToken)
-                    .setIdToken(payload.idToken ?: state.idToken)
-                    .setScope(payload.scope ?: state.scope)
-                    .setAdditionalParameters(emptyMap())
-                    .build()
-                val updated = AuthState(configuration.serviceConfiguration)
-                updated.update(tokenResponse, null)
-                requireCurrentAuthentication(generation, state)
-                val clean = CredentialFreeAuthState.sanitize(updated)
+                check(published) { "Authentication lifecycle changed" }
+                return current
+            }
+            val refreshToken = state.refreshToken ?: error("OIDC refresh token is unavailable")
+            val payload = withContext(Dispatchers.IO) { nativeOidc.refresh(configuration, refreshToken) }
+            val refreshedSubject = OidcJwtClaims.accessTokenSubject(
+                payload.accessToken,
+                configuration.issuer,
+                configuration.clientId,
+            )
+            check(expectedAccountScope == AccountScope.canonical(configuration.issuer, refreshedSubject)) {
+                "OIDC refresh changed account identity"
+            }
+            val request = TokenRequest.Builder(configuration.serviceConfiguration, configuration.clientId)
+                // Metadata only. A real refresh request here would require
+                // duplicating the live refresh token inside TokenRequest.
+                .setGrantType(CredentialFreeAuthState.SANITIZED_REQUEST_GRANT_TYPE)
+                .setScope(payload.scope ?: state.scope)
+                .build()
+            val tokenResponse = TokenResponse.Builder(request)
+                .setTokenType(payload.tokenType)
+                .setAccessToken(payload.accessToken)
+                .setAccessTokenExpiresIn(payload.expiresInSeconds)
+                .setRefreshToken(payload.refreshToken ?: refreshToken)
+                .setIdToken(payload.idToken ?: state.idToken)
+                .setScope(payload.scope ?: state.scope)
+                .setAdditionalParameters(emptyMap())
+                .build()
+            val updated = AuthState(configuration.serviceConfiguration)
+            updated.update(tokenResponse, null)
+            val clean = CredentialFreeAuthState.sanitize(updated)
+            val committed = authenticationLifecycle.runIfCurrent(
+                captured = generation,
+                predicate = {
+                    !closed &&
+                        authState === state &&
+                        accountScope == expectedAccountScope &&
+                        (expectedRuntimeOwner == null || realtimeMultiplexerOwner === expectedRuntimeOwner)
+                },
+            ) {
                 authState = clean
                 sessionStore.saveAuthState(clean)
                 realtimeAccessToken.publish(payload.accessToken)
-                if (continuation.isActive) continuation.resume(payload.accessToken)
-            } catch (error: Throwable) {
-                if (isAuthenticationRefreshRejection(error) && isCurrentAuthentication(generation, state)) {
-                    invalidateAuthentication(error)
-                }
-                if (continuation.isActive) continuation.resumeWithException(error)
             }
+            check(committed) { "Authentication lifecycle changed" }
+            return payload.accessToken
+        } catch (error: Throwable) {
+            if (isAuthenticationRefreshRejection(error) &&
+                isCurrentAuthentication(generation, state, expectedRuntimeOwner)
+            ) {
+                invalidateAuthentication(
+                    authenticationGeneration = generation,
+                    expectedAuthState = state,
+                    expectedRuntimeOwner = expectedRuntimeOwner,
+                )
+            }
+            throw error
         }
     }
 
@@ -2729,6 +3336,30 @@ internal class ProductionProductRepository(
     private fun isCurrentAuthentication(generation: Long, state: AuthState): Boolean =
         !closed && authenticationLifecycle.isCurrent(generation) && authState === state
 
+    private fun isCurrentAuthentication(
+        generation: Long,
+        state: AuthState,
+        expectedRuntimeOwner: RealtimeAuthenticationOwner?,
+    ): Boolean = isCurrentAuthentication(generation, state) &&
+        (expectedRuntimeOwner == null || realtimeMultiplexerOwner === expectedRuntimeOwner)
+
+    private fun captureAuthenticationState(
+        expectedGeneration: Long? = null,
+        expectedRuntimeOwner: RealtimeAuthenticationOwner? = null,
+    ): AuthenticationStateCapture = authenticationLifecycle.capture { currentGeneration ->
+        check(!closed && (expectedGeneration == null || currentGeneration == expectedGeneration)) {
+            "Authentication lifecycle changed"
+        }
+        check(expectedRuntimeOwner == null || realtimeMultiplexerOwner === expectedRuntimeOwner) {
+            "Realtime authentication owner changed"
+        }
+        AuthenticationStateCapture(
+            authenticationGeneration = currentGeneration,
+            authState = authState ?: error("Sign in first"),
+            accountScope = accountScope,
+        )
+    }
+
     private suspend fun ensureOidcConfiguration(): NativeOidcConfiguration {
         oidcConfiguration?.let { return it }
         val root = PRODUCT_PUBLIC_SERVER_URL
@@ -2744,14 +3375,12 @@ internal class ProductionProductRepository(
         configuration: NativeOidcConfiguration,
         subject: String,
         payload: NativeTokenPayload,
+        accountLogin: String,
         authenticationGeneration: Long,
     ) {
         requireCurrentAuthentication(authenticationGeneration)
         val nextScope = AccountScope.canonical(configuration.issuer, subject)
-        establishAccountScope(nextScope) {
-            requireCurrentAuthentication(authenticationGeneration)
-        }
-        requireCurrentAuthentication(authenticationGeneration)
+        establishAccountScope(nextScope, authenticationGeneration)
         val request = TokenRequest.Builder(configuration.serviceConfiguration, configuration.clientId)
             .setGrantType(TokenRequest.GRANT_TYPE_PASSWORD)
             .setScope(payload.scope ?: "openid profile offline_access")
@@ -2767,23 +3396,47 @@ internal class ProductionProductRepository(
             .build()
         val clean = AuthState(configuration.serviceConfiguration)
         clean.update(tokenResponse, null)
-        authState = CredentialFreeAuthState.sanitize(clean)
-        sessionStore.saveAuthState(authState ?: clean)
+        val sanitized = CredentialFreeAuthState.sanitize(clean)
+        val committed = authenticationLifecycle.runIfCurrent(
+            authenticationGeneration,
+            predicate = { !closed && authState == null && accountScope == nextScope },
+        ) {
+            authState = sanitized
+            sessionStore.saveAuthState(sanitized)
+            sessionStore.accountLogin = accountLogin
+            mutableSnapshot.value = mutableSnapshot.value.copy(
+                signedIn = true,
+                configured = true,
+                accountLabel = accountLogin,
+                authenticationState = ProductAuthenticationState.AUTHENTICATED,
+                connectionState = ProductConnectionState.CONNECTING,
+                connectionError = null,
+                lastSyncedAt = null,
+            )
+        }
+        check(committed) { "Authentication lifecycle changed" }
     }
 
-    private suspend fun bootstrapAuthenticatedSession() {
+    private suspend fun bootstrapAuthenticatedSession(authenticationGeneration: Long) {
+        val captured = captureAuthenticationState(expectedGeneration = authenticationGeneration)
         val configuration = ensureOidcConfiguration()
-        val accessToken = authState?.accessToken ?: error("OIDC access token is unavailable")
+        val accessToken = captured.authState.accessToken ?: error("OIDC access token is unavailable")
         val subject = OidcJwtClaims.accessTokenSubject(accessToken, configuration.issuer, configuration.clientId)
-        if (sessionStore.accountLogin == null) {
-            sessionStore.accountLogin = OidcJwtClaims.displayIdentifier(accessToken)
+        val nextScope = AccountScope.canonical(configuration.issuer, subject)
+        authenticationLifecycle.runIfCurrent(
+            authenticationGeneration,
+            predicate = { !closed && authState === captured.authState },
+        ) {
+            if (sessionStore.accountLogin == null) {
+                sessionStore.accountLogin = OidcJwtClaims.displayIdentifier(accessToken)
+            }
         }
-        establishAccountScope(AccountScope.canonical(configuration.issuer, subject))
-        withApi { api ->
+        establishAccountScope(nextScope, authenticationGeneration)
+        withAuthenticatedApi(expectedGeneration = authenticationGeneration) { api, generation ->
             // withApi registers this account-scoped key first. Continue directly
             // into the authoritative refresh; no enrollment confirmation step is
             // part of the same-account Android flow.
-            refreshWithApi(api)
+            refreshWithApi(api, generation)
         }
     }
 
@@ -2805,23 +3458,38 @@ internal class ProductionProductRepository(
 
     private suspend fun establishAccountScope(
         nextScope: String,
-        beforeCommit: () -> Unit = {},
-    ) {
-        beforeCommit()
-        if (accountScope != null && accountScope != nextScope) {
-            closeLiveSessions()
-            closeHistoryEngines()
-            clearRoomCache()
-            beforeCommit()
-            billing.reset()
+        authenticationGeneration: Long,
+    ) = authenticationStateMutationLock.withLock {
+        authenticationAccountScopeLock.withLock {
+            val previousScope = authenticationLifecycle.capture { currentGeneration ->
+                check(!closed && currentGeneration == authenticationGeneration) {
+                    "Authentication lifecycle changed"
+                }
+                accountScope
+            }
+            val accountChanged = previousScope != null && previousScope != nextScope
+            if (accountChanged) {
+                requireCurrentAuthentication(authenticationGeneration)
+                closeHistoryEngines()
+                clearRoomCache()
+                requireCurrentAuthentication(authenticationGeneration)
+                billing.reset()
+            }
+            var retiredIdentity: DeviceKeyVault.StoredIdentity? = null
+            val committed = authenticationLifecycle.runIfCurrent(
+                authenticationGeneration,
+                predicate = { !closed && (accountScope == previousScope || accountScope == nextScope) },
+            ) {
+                if (accountScope != nextScope) {
+                    retiredIdentity = storedIdentity
+                    storedIdentity = null
+                }
+                accountScope = nextScope
+                sessionStore.accountScope = nextScope
+            }
+            retiredIdentity?.identity?.destroy()
+            check(committed) { "Authentication lifecycle changed" }
         }
-        beforeCommit()
-        if (accountScope != nextScope) {
-            storedIdentity?.identity?.destroy()
-            storedIdentity = null
-        }
-        accountScope = nextScope
-        sessionStore.accountScope = nextScope
     }
 
     private suspend fun fetchClientConfiguration(root: String): ClientConfiguration = withContext(Dispatchers.IO) {
@@ -2849,42 +3517,58 @@ internal class ProductionProductRepository(
      */
     private suspend fun clearAccessControlledState(
         self: DeviceSummary,
+        authenticationGeneration: Long,
     ) = accessStateLock.withLock {
-        closeLiveSessions()
+        val retired = synchronized(liveSessionLock) {
+            val owner = realtimeMultiplexerOwner
+            if (owner?.authenticationGeneration == authenticationGeneration) {
+                detachRealtimeRuntimeLocked()
+            } else {
+                null
+            }
+        }
+        if (retired != null) closeRetiredRealtimeRuntimeAndJoin(retired)
+        requireCurrentAuthentication(authenticationGeneration)
         closeHistoryEngines()
         billing.reset()
         clearRoomCache()
-        val current = mutableSnapshot.value
-        mutableSnapshot.value = current.copy(
-            signedIn = true,
-            configured = true,
-            connectionState = ProductConnectionState.CONNECTED,
-            connectionError = null,
-            enrollmentState = when (self.trustState) {
-                DeviceTrustState.PENDING -> ProductEnrollmentState.PENDING_CONFIRMATION
-                DeviceTrustState.REVOKED -> ProductEnrollmentState.REVOKED
-                DeviceTrustState.TRUSTED -> ProductEnrollmentState.TRUSTED
-            },
-            enrollmentConfirmationRequired = false,
-            accountLabel = accountDisplayLabel(),
-            devices = listOf(self),
-            pcs = emptyList(),
-            sessions = emptyList(),
-            sessionStates = emptyMap(),
-            sessionOpenFailures = emptyMap(),
-            sessionTitles = emptyMap(),
-            pairingChallenge = null,
-            history = emptyList(),
-            replayedHistoryObjectIds = emptySet(),
-            transcriptViewports = emptyMap(),
-            liveAcknowledgements = emptyMap(),
-            bootstrapSources = emptyMap(),
-            catalogPlans = emptyList(),
-            entitlement = null,
-            catalogPlan = null,
-            billing = BillingSnapshot(),
-            lastSyncedAt = Instant.now(),
-        )
+        val published = authenticationLifecycle.runIfCurrent(
+            authenticationGeneration,
+            predicate = { !closed && authState != null },
+        ) {
+            val current = mutableSnapshot.value
+            mutableSnapshot.value = current.copy(
+                signedIn = true,
+                configured = true,
+                connectionState = ProductConnectionState.CONNECTED,
+                connectionError = null,
+                enrollmentState = when (self.trustState) {
+                    DeviceTrustState.PENDING -> ProductEnrollmentState.PENDING_CONFIRMATION
+                    DeviceTrustState.REVOKED -> ProductEnrollmentState.REVOKED
+                    DeviceTrustState.TRUSTED -> ProductEnrollmentState.TRUSTED
+                },
+                enrollmentConfirmationRequired = false,
+                accountLabel = accountDisplayLabel(),
+                devices = listOf(self),
+                pcs = emptyList(),
+                sessions = emptyList(),
+                sessionStates = emptyMap(),
+                sessionOpenFailures = emptyMap(),
+                sessionTitles = emptyMap(),
+                pairingChallenge = null,
+                history = emptyList(),
+                replayedHistoryObjectIds = emptySet(),
+                transcriptViewports = emptyMap(),
+                liveAcknowledgements = emptyMap(),
+                bootstrapSources = emptyMap(),
+                catalogPlans = emptyList(),
+                entitlement = null,
+                catalogPlan = null,
+                billing = BillingSnapshot(),
+                lastSyncedAt = Instant.now(),
+            )
+        }
+        check(published) { "Authentication lifecycle changed" }
     }
 
     private suspend fun clearRoomCache() {
@@ -2983,36 +3667,51 @@ internal class ProductionProductRepository(
     }
 
     private fun publishFailure(error: Throwable) {
-        val expiredMessage = activity.getString(R.string.failure_authentication_expired)
+        val expiredMessage = context.getString(R.string.failure_authentication_expired)
         if (shouldPreserveAuthenticationExpiredFailure(mutableSnapshot.value, expiredMessage)) return
         val message = safeFailureMessage(error)
         mutableSnapshot.value = mutableSnapshot.value.copy(
             connectionState = ProductConnectionState.ERROR,
             connectionError = message,
         )
-        appendActivity(activity.getString(R.string.activity_connection_failed), message, Severity.ERROR)
+        appendActivity(context.getString(R.string.activity_connection_failed), message, Severity.ERROR)
     }
 
     private fun safeFailureMessage(error: Throwable): String = when (error) {
         is NativeOidcException -> when (error.reason) {
-            NativeOidcFailure.INVALID_CREDENTIALS -> activity.getString(R.string.failure_invalid_credentials)
-            NativeOidcFailure.ACCOUNT_SETUP_REQUIRED -> activity.getString(R.string.sign_in_account_setup_required)
+            NativeOidcFailure.INVALID_CREDENTIALS -> context.getString(R.string.failure_invalid_credentials)
+            NativeOidcFailure.ACCOUNT_SETUP_REQUIRED -> context.getString(R.string.sign_in_account_setup_required)
             NativeOidcFailure.DISCOVERY_FAILED,
-            NativeOidcFailure.NETWORK -> activity.getString(R.string.failure_identity_network)
-            NativeOidcFailure.INVALID_CONFIGURATION -> activity.getString(R.string.failure_identity_configuration)
-            NativeOidcFailure.TOKEN_REQUEST_FAILED -> activity.getString(R.string.failure_identity_rejected)
+            NativeOidcFailure.NETWORK -> context.getString(R.string.failure_identity_network)
+            NativeOidcFailure.INVALID_CONFIGURATION -> context.getString(R.string.failure_identity_configuration)
+            NativeOidcFailure.TOKEN_REQUEST_FAILED -> context.getString(R.string.failure_identity_rejected)
         }
-        is TermLinkApiException -> activity.getString(R.string.failure_server_http, error.status)
-        else -> activity.getString(R.string.failure_server_request)
+        is TermLinkApiException -> context.getString(R.string.failure_server_http, error.status)
+        else -> context.getString(R.string.failure_server_request)
     }
 
     private fun sanitizeActivityDetail(value: String): String =
         sensitiveIdentifierPattern.replace(value, "session")
 
-    private fun closeLiveSessionsExcept(retained: Set<UUID>) {
-        synchronized(liveSessionLock) {
-            liveSessions.keys.filterNot(retained::contains).forEach { sessionId ->
-                liveSessions.remove(sessionId)?.close()
+    private suspend fun closeLiveSessionsExcept(retained: Set<UUID>) {
+        val candidates = liveSessions.toMap().filterKeys { it !in retained }
+        sessionAuthorityTransitionFences.addAll(
+            mutableSnapshot.value.sessions.asSequence()
+                .map(SessionSummary::id)
+                .filterNot(retained::contains)
+                .toSet() + candidates.keys,
+        )
+        candidates.forEach { (sessionId, expected) ->
+            sessionLifecycleLanes.withLock(sessionId) {
+                retireExactIncarnationAndThen(
+                    expected = expected,
+                    removeExact = { incarnation ->
+                        synchronized(liveSessionLock) {
+                            liveSessions.remove(sessionId, incarnation)
+                        }
+                    },
+                    closeAndJoin = LiveProductSession::closeAndJoin,
+                )
             }
         }
         mutableSnapshot.value = mutableSnapshot.value.copy(
@@ -3038,17 +3737,28 @@ internal class ProductionProductRepository(
             sessions = mutableSnapshot.value.sessions + incomingSessions,
         )
         if (affected.isEmpty()) return
-        sessionLifecycleLock.withLock {
-            val retired = synchronized(liveSessionLock) {
-                affected.mapNotNull { sessionId -> liveSessions.remove(sessionId) }
-            }
-            retired.forEach { it.closeAndJoin() }
-            mutableSnapshot.update { snapshot ->
-                snapshot.copy(
-                    sessionStates = snapshot.sessionStates - affected,
-                    sessionOpenFailures = snapshot.sessionOpenFailures - affected,
-                    sessionTitles = snapshot.sessionTitles - affected,
-                )
+        sessionAuthorityTransitionFences.addAll(affected)
+        affected.forEach { sessionId ->
+            sessionLifecycleLanes.withLock(sessionId) {
+                val expected = liveSessions[sessionId]
+                if (expected != null) {
+                    retireExactIncarnationAndThen(
+                        expected = expected,
+                        removeExact = { incarnation ->
+                            synchronized(liveSessionLock) {
+                                liveSessions.remove(sessionId, incarnation)
+                            }
+                        },
+                        closeAndJoin = LiveProductSession::closeAndJoin,
+                    )
+                }
+                mutableSnapshot.update { snapshot ->
+                    snapshot.copy(
+                        sessionStates = snapshot.sessionStates - sessionId,
+                        sessionOpenFailures = snapshot.sessionOpenFailures - sessionId,
+                        sessionTitles = snapshot.sessionTitles - sessionId,
+                    )
+                }
             }
         }
     }
@@ -3071,6 +3781,61 @@ internal class ProductionProductRepository(
     }
 
     /**
+     * Publishes only trusted, online PC metadata to the optional Direct sibling. Pairwise secrets
+     * are freshly derived, copied by the runtime, and zeroed here before returning.
+     */
+    private fun refreshDirectAuthorizedPeers(
+        authenticationGeneration: Long,
+        stored: DeviceKeyVault.StoredIdentity,
+        devices: List<DeviceSummary>,
+        pcs: List<PcSummary>,
+    ) {
+        val runtime = synchronized(liveSessionLock) {
+            val owner = realtimeMultiplexerOwner
+            directShadowRuntime.takeIf {
+                owner?.authenticationGeneration == authenticationGeneration &&
+                    owner.storedIdentity === stored
+            }
+        } ?: return
+        val devicesById = devices.associateBy(DeviceSummary::id)
+        val replacements = pcs.asSequence()
+            .filter(PcSummary::online)
+            .sortedBy(PcSummary::deviceId)
+            .mapNotNull { pc ->
+                val device = devicesById[pc.deviceId]?.takeIf {
+                    it.type.isPcAgent() && it.trustState == DeviceTrustState.TRUSTED &&
+                        it.exchangePublicKey.size == 32 && it.signingPublicKey.size == 32
+                } ?: return@mapNotNull null
+                val pairwise = runCatching {
+                    SessionCrypto.derivePairwiseKey(
+                        stored.identity.exchange.privateKey,
+                        device.exchangePublicKey,
+                        pc.deviceId,
+                        stored.deviceId,
+                        pc.keyEpoch,
+                    )
+                }.getOrNull() ?: return@mapNotNull null
+                try {
+                    ProductionDirectAuthorizedPeer(
+                        deviceId = pc.deviceId,
+                        keyEpoch = pc.keyEpoch,
+                        keyId = device.keyId,
+                        pairwiseKey = pairwise,
+                        signingPublicKey = device.signingPublicKey,
+                    )
+                } finally {
+                    pairwise.fill(0)
+                }
+            }
+            .toList()
+        try {
+            runtime.replaceAuthorizedPeers(authenticationGeneration, replacements)
+        } finally {
+            replacements.forEach(ProductionDirectAuthorizedPeer::close)
+        }
+    }
+
+    /**
      * Unknown realtime key IDs trigger this narrow authoritative refresh. It
      * intentionally avoids account, billing, and history endpoints so an
      * unavailable history object store cannot block an epoch transition.
@@ -3080,33 +3845,37 @@ internal class ProductionProductRepository(
             val devices = ProductResponseParser.itemObjects(api.get("/v1/devices").jsonObject).map { it.toDevice() }
             val pcs = ProductResponseParser.itemObjects(api.get("/v1/pcs").jsonObject).map { it.toPc() }
             val sessions = mutableSnapshot.value.sessions
-            closeLiveSessionsForChangedPcIdentities(pcs, sessions)
-            liveSessions.toMap().forEach { (sessionId, live) ->
-                val session = sessions.firstOrNull { it.id == sessionId } ?: return@forEach
-                val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@forEach
-                val device = devices.firstOrNull {
-                    it.id == pc.deviceId &&
-                        it.type.isPcAgent() &&
-                        it.trustState == DeviceTrustState.TRUSTED
-                } ?: return@forEach
-                live.client.validateKeyMaterialUpdate(pc.keyEpoch, device.exchangePublicKey)
-            }
-            // Persist the authoritative epoch/public-key pair before any live
-            // session can start encrypting or decrypting with the new epoch.
-            historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
-            rotateLiveSessionKeys(devices, pcs, sessions)
-            val trustedPcIds = pcs.asSequence()
-                .filter { pc ->
-                    devices.any { device ->
-                        device.id == pc.deviceId &&
-                            device.type.isPcAgent() &&
-                            device.trustState == DeviceTrustState.TRUSTED
-                    }
+            // Lock order is keyMetadata -> refreshState -> one session lane.
+            // No session lane is held while acquiring either outer lock.
+            refreshStateLock.withLock {
+                closeLiveSessionsForChangedPcIdentities(pcs, sessions)
+                liveSessions.toMap().forEach { (sessionId, live) ->
+                    val session = sessions.firstOrNull { it.id == sessionId } ?: return@forEach
+                    val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@forEach
+                    val device = devices.firstOrNull {
+                        it.id == pc.deviceId &&
+                            it.type.isPcAgent() &&
+                            it.trustState == DeviceTrustState.TRUSTED
+                    } ?: return@forEach
+                    live.client.validateKeyMaterialUpdate(pc.keyEpoch, device.exchangePublicKey)
                 }
-                .mapTo(mutableSetOf(), PcSummary::id)
-            closeLiveSessionsExcept(
-                retainedLiveSessionIds(sessions, trustedPcIds),
-            )
+                // Persist the authoritative epoch/public-key pair before any live
+                // session can start encrypting or decrypting with the new epoch.
+                historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
+                rotateLiveSessionKeys(devices, pcs, sessions)
+                val trustedPcIds = pcs.asSequence()
+                    .filter { pc ->
+                        devices.any { device ->
+                            device.id == pc.deviceId &&
+                                device.type.isPcAgent() &&
+                                device.trustState == DeviceTrustState.TRUSTED
+                        }
+                    }
+                    .mapTo(mutableSetOf(), PcSummary::id)
+                closeLiveSessionsExcept(
+                    retainedLiveSessionIds(sessions, trustedPcIds),
+                )
+            }
         }
     }
 
@@ -3181,6 +3950,24 @@ internal class ProductionProductRepository(
 
     private fun observeBootstrapFailure(sessionId: UUID, failure: SessionOpenFailure) =
         observeSessionOpenFailure(sessionId, failure, reconnect = true)
+
+    private fun observeBootstrapFailureIfCurrent(
+        sessionId: UUID,
+        failure: SessionOpenFailure,
+        authenticationGeneration: Long,
+        realtime: RealtimeRuntimeClaim,
+        stored: DeviceKeyVault.StoredIdentity,
+    ): Boolean = authenticationLifecycle.runIfCurrent(
+        authenticationGeneration,
+        predicate = {
+            !closed &&
+                realtimeMultiplexerOwner === realtime.owner &&
+                realtimeMultiplexer === realtime.multiplexer &&
+                storedIdentity === stored
+        },
+    ) {
+        observeBootstrapFailure(sessionId, failure)
+    }
 
     private fun observeBootstrap(sessionId: UUID, restored: RestoredLiveHistory) {
         mutableSnapshot.update { product ->
@@ -3559,10 +4346,7 @@ internal class ProductionProductRepository(
 
     private fun detachRealtimeRuntime(): RetiredRealtimeRuntime {
         val retired = synchronized(liveSessionLock) {
-            RetiredRealtimeRuntime(
-                sessions = liveSessions.values.toList().also { liveSessions.clear() },
-                multiplexer = realtimeMultiplexer.also { realtimeMultiplexer = null },
-            )
+            detachRealtimeRuntimeLocked()
         }
         mutableSnapshot.value = mutableSnapshot.value.copy(
             sessionStates = emptyMap(),
@@ -3572,53 +4356,291 @@ internal class ProductionProductRepository(
         return retired
     }
 
+    /** Caller must hold [liveSessionLock]. */
+    private fun detachRealtimeRuntimeLocked(): RetiredRealtimeRuntime {
+        realtimeMultiplexerOwner = null
+        return RetiredRealtimeRuntime(
+            sessions = liveSessions.values.toList().also { liveSessions.clear() },
+            directShadow = directShadowRuntime.also { directShadowRuntime = null },
+            multiplexer = realtimeMultiplexer.also { realtimeMultiplexer = null },
+        )
+    }
+
     private fun closeRetiredRealtimeRuntime(retired: RetiredRealtimeRuntime) {
+        retired.directShadow?.close()
         retired.sessions.forEach(LiveProductSession::close)
         retired.multiplexer?.close()
     }
 
-    private fun deviceRealtimeMultiplexer(
-        stored: DeviceKeyVault.StoredIdentity,
-    ): ProductionRealtimeMultiplexer = synchronized(liveSessionLock) {
-        realtimeMultiplexer ?: ProductionRealtimeMultiplexer(
-            rootUrl = PRODUCT_PUBLIC_SERVER_URL,
-            tokenProvider = AccessTokenProvider(realtimeAccessToken::requireCurrent),
-            deviceId = stored.deviceId,
-            identity = stored.identity,
-            parentScope = scope,
-            additionalCapabilities = if (BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME) {
-                setOf(dev.termlink.model.PcCapabilityIds.TERMINAL_SNAPSHOT_V2)
-            } else {
-                emptySet()
-            },
-            httpClient = http,
-            allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
-            authenticationRefresher = dev.termlink.network.production.RealtimeAuthenticationRefresher {
-                freshAccessToken(force = true)
-            },
-            authenticationFailureObserver = ::invalidateAuthentication,
-        ).also { realtimeMultiplexer = it }
+    private suspend fun closeRetiredRealtimeRuntimeAndJoin(retired: RetiredRealtimeRuntime) {
+        withContext(NonCancellable) {
+            var firstFailure: Throwable? = null
+            try {
+                retired.directShadow?.closeAndJoin()
+            } catch (error: Throwable) {
+                firstFailure = firstFailure ?: error
+            }
+            retired.sessions.forEach { session ->
+                try {
+                    session.closeAndJoin()
+                } catch (error: Throwable) {
+                    firstFailure = firstFailure ?: error
+                }
+            }
+            try {
+                retired.multiplexer?.close()
+            } catch (error: Throwable) {
+                firstFailure = firstFailure ?: error
+            }
+            firstFailure?.let { throw it }
+        }
     }
 
-    private fun invalidateAuthentication(error: Throwable) {
-        if (closed || !mutableSnapshot.value.signedIn) return
-        authenticationLifecycle.invalidate()
-        authState = null
-        realtimeAccessToken.clear()
-        runCatching { sessionStore.clearAuthState() }
-        runCatching { sessionStore.accountLogin = null }
-        val message = activity.getString(R.string.failure_authentication_expired)
-        mutableSnapshot.value = authenticationExpiredSnapshot(mutableSnapshot.value, message)
-        appendActivity(activity.getString(R.string.activity_authentication_expired), message, Severity.ERROR)
-        val retired = detachRealtimeRuntime()
-        // This observer can run inside the multiplexer state collector. Yield
-        // to the Repository parent scope before closing the captured old
-        // multiplexer. The live map and owner slot are already detached, so a
-        // later re-login cannot be closed by this cleanup job.
-        scope.launch {
-            kotlinx.coroutines.yield()
-            closeRetiredRealtimeRuntime(retired)
+    private fun detachRealtimeRuntimeIfOwner(
+        expectedOwner: RealtimeAuthenticationOwner,
+    ): RetiredRealtimeRuntime? = synchronized(liveSessionLock) {
+        if (realtimeMultiplexerOwner !== expectedOwner) null else detachRealtimeRuntimeLocked()
+    }
+
+    private fun isCurrentRealtimeOwner(owner: RealtimeAuthenticationOwner): Boolean =
+        authenticationLifecycle.runIfCurrent(
+            owner.authenticationGeneration,
+            predicate = {
+                !closed &&
+                    authState != null &&
+                    accountScope == owner.accountScope &&
+                    storedIdentity === owner.storedIdentity &&
+                    realtimeMultiplexer != null &&
+                    authenticationRuntimeClaimMatches(
+                        currentOwner = realtimeMultiplexerOwner,
+                        currentOwnerGeneration = realtimeMultiplexerOwner?.authenticationGeneration,
+                        expectedOwner = owner,
+                        expectedGeneration = owner.authenticationGeneration,
+                    )
+            },
+        ) { }
+
+    private fun requireRealtimeAccessToken(owner: RealtimeAuthenticationOwner): String {
+        var token: String? = null
+        val accepted = authenticationLifecycle.runIfCurrent(
+            owner.authenticationGeneration,
+            predicate = {
+                !closed &&
+                    authState != null &&
+                    accountScope == owner.accountScope &&
+                    storedIdentity === owner.storedIdentity &&
+                    realtimeMultiplexer != null &&
+                    authenticationRuntimeClaimMatches(
+                        currentOwner = realtimeMultiplexerOwner,
+                        currentOwnerGeneration = realtimeMultiplexerOwner?.authenticationGeneration,
+                        expectedOwner = owner,
+                        expectedGeneration = owner.authenticationGeneration,
+                    )
+            },
+        ) {
+            token = realtimeAccessToken.requireCurrent()
         }
+        check(accepted) { "Realtime authentication owner changed" }
+        return requireNotNull(token)
+    }
+
+    private suspend fun deviceRealtimeRuntime(
+        stored: DeviceKeyVault.StoredIdentity,
+        expectedAuthenticationGeneration: Long,
+    ): RealtimeRuntimeClaim {
+        while (true) {
+            val authentication = captureAuthenticationState(expectedGeneration = expectedAuthenticationGeneration)
+            val expectedAccountScope = requireNotNull(authentication.accountScope) {
+                "OIDC account scope is unavailable"
+            }
+            check(storedIdentity === stored && accountScope == expectedAccountScope) {
+                "Authentication identity changed"
+            }
+            var selectedOwner: RealtimeAuthenticationOwner? = null
+            var selectedRuntime: ProductionRealtimeMultiplexer? = null
+            val retired = synchronized(liveSessionLock) {
+                val existing = realtimeMultiplexer
+                val owner = realtimeMultiplexerOwner
+                when {
+                    existing == null -> null
+                    owner != null &&
+                        owner.authenticationGeneration == authentication.authenticationGeneration &&
+                        owner.accountScope == expectedAccountScope &&
+                        owner.storedIdentity === stored -> {
+                        selectedOwner = owner
+                        selectedRuntime = existing
+                        null
+                    }
+                    else -> detachRealtimeRuntimeLocked()
+                }
+            }
+            if (retired != null) {
+                closeRetiredRealtimeRuntimeAndJoin(retired)
+                continue
+            }
+            selectedRuntime?.let { existing ->
+                val owner = requireNotNull(selectedOwner)
+                if (isCurrentRealtimeOwner(owner)) return RealtimeRuntimeClaim(owner, existing)
+                detachRealtimeRuntimeIfOwner(owner)?.let { closeRetiredRealtimeRuntimeAndJoin(it) }
+                throw IllegalStateException("Authentication lifecycle changed")
+            }
+
+            val owner = RealtimeAuthenticationOwner(
+                authenticationGeneration = authentication.authenticationGeneration,
+                accountScope = expectedAccountScope,
+                storedIdentity = stored,
+            )
+            val candidate = ProductionRealtimeMultiplexer(
+                rootUrl = PRODUCT_PUBLIC_SERVER_URL,
+                tokenProvider = AccessTokenProvider { requireRealtimeAccessToken(owner) },
+                deviceId = stored.deviceId,
+                identity = stored.identity,
+                parentScope = realtimeRuntimeScope,
+                additionalCapabilities = if (BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME) {
+                    setOf(dev.termlink.model.PcCapabilityIds.TERMINAL_SNAPSHOT_V2)
+                } else {
+                    emptySet()
+                },
+                httpClient = http,
+                allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
+                authenticationRefresher = dev.termlink.network.production.RealtimeAuthenticationRefresher {
+                    freshAccessToken(force = true, expectedRuntimeOwner = owner)
+                },
+                authenticationFailureObserver = {
+                    invalidateAuthentication(
+                        authenticationGeneration = owner.authenticationGeneration,
+                        expectedAuthState = null,
+                        expectedRuntimeOwner = owner,
+                    )
+                },
+            )
+            val directCandidate = if (BuildConfig.TERMLINK_DIRECT_TRANSPORT_SHADOW) {
+                ProductionDirectShadowRuntime(
+                    enabled = true,
+                    authenticationGeneration = owner.authenticationGeneration,
+                    rootUrl = PRODUCT_PUBLIC_SERVER_URL,
+                    tokenProvider = AccessTokenProvider { requireRealtimeAccessToken(owner) },
+                    localDeviceId = stored.deviceId,
+                    identity = stored.identity,
+                    relayEvents = candidate.directRelayConnectionEvents,
+                    connectivityManager = connectivityManager,
+                    parentScope = realtimeRuntimeScope,
+                    httpClient = http,
+                    allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
+                )
+            } else {
+                null
+            }
+            var installed = false
+            val installationCurrent = authenticationLifecycle.runIfCurrent(
+                owner.authenticationGeneration,
+                predicate = {
+                    !closed &&
+                        authState != null &&
+                        accountScope == owner.accountScope &&
+                        storedIdentity === owner.storedIdentity
+                },
+            ) {
+                installed = synchronized(liveSessionLock) {
+                    if (realtimeMultiplexer != null || directShadowRuntime != null) {
+                        false
+                    } else {
+                        realtimeMultiplexerOwner = owner
+                        realtimeMultiplexer = candidate
+                        directShadowRuntime = directCandidate
+                        true
+                    }
+                }
+            }
+            if (!installationCurrent || !installed) {
+                directCandidate?.close()
+                candidate.close()
+                if (!installationCurrent) throw IllegalStateException("Authentication lifecycle changed")
+                continue
+            }
+            if (isCurrentRealtimeOwner(owner)) {
+                directCandidate?.let { direct ->
+                    refreshDirectAuthorizedPeers(
+                        authenticationGeneration = owner.authenticationGeneration,
+                        stored = stored,
+                        devices = mutableSnapshot.value.devices,
+                        pcs = mutableSnapshot.value.pcs,
+                    )
+                    synchronized(realtimeNetworkLock) { realtimeNetwork }
+                        ?.let { network -> direct.observeNetwork(owner.authenticationGeneration, network) }
+                    direct.start()
+                }
+                return RealtimeRuntimeClaim(owner, candidate)
+            }
+            detachRealtimeRuntimeIfOwner(owner)?.let { closeRetiredRealtimeRuntimeAndJoin(it) }
+            throw IllegalStateException("Authentication lifecycle changed")
+        }
+    }
+
+    private fun invalidateAuthentication(
+        authenticationGeneration: Long,
+        expectedAuthState: AuthState?,
+        expectedRuntimeOwner: RealtimeAuthenticationOwner?,
+    ) {
+        val message = context.getString(R.string.failure_authentication_expired)
+        val invalidated = authenticationLifecycle.invalidateIfCurrent(
+            captured = authenticationGeneration,
+            predicate = {
+                !closed &&
+                    (expectedAuthState == null || authState === expectedAuthState) &&
+                    authenticationRuntimeClaimMatches(
+                        currentOwner = realtimeMultiplexerOwner,
+                        currentOwnerGeneration = realtimeMultiplexerOwner?.authenticationGeneration,
+                        expectedOwner = expectedRuntimeOwner,
+                        expectedGeneration = authenticationGeneration,
+                    ) &&
+                    mutableSnapshot.value.signedIn
+            },
+        ) {
+            authState = null
+            pendingInteractiveAuthenticationGeneration = null
+            realtimeAccessToken.clear()
+            runCatching { sessionStore.clearAuthState() }
+            runCatching { sessionStore.accountLogin = null }
+            mutableSnapshot.value = authenticationExpiredSnapshot(mutableSnapshot.value, message).copy(
+                sessionStates = emptyMap(),
+                sessionOpenFailures = emptyMap(),
+                sessionTitles = emptyMap(),
+            )
+            appendActivity(
+                context.getString(R.string.activity_authentication_expired),
+                message,
+                Severity.ERROR,
+            )
+            val retired = synchronized(liveSessionLock) {
+                val owner = realtimeMultiplexerOwner
+                val exactOwner = authenticationRuntimeClaimMatches(
+                    currentOwner = owner,
+                    currentOwnerGeneration = owner?.authenticationGeneration,
+                    expectedOwner = expectedRuntimeOwner,
+                    expectedGeneration = authenticationGeneration,
+                )
+                if (exactOwner) detachRealtimeRuntimeLocked() else null
+            }
+            if (retired != null) {
+                val retirement = authenticationRetirementBarrier.register()
+                // UNDISPATCHED enters the NonCancellable body before this auth
+                // CAS can be released. Repository close therefore cannot cancel
+                // a detached runtime before its closeAndJoin has actually begun.
+                realtimeRuntimeScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                    try {
+                        withContext(NonCancellable) {
+                            retirement.predecessor?.await()
+                            yield()
+                            closeRetiredRealtimeRuntimeAndJoin(retired)
+                        }
+                    } finally {
+                        authenticationRetirementBarrier.complete(retirement)
+                    }
+                }
+            }
+        }
+        if (!invalidated) return
     }
 
     private fun closeHistoryEnginesExcept(retained: Set<UUID>) {
@@ -3642,6 +4664,7 @@ internal class ProductionProductRepository(
             realtimeNetworkCallbackRegistered = false
         }
         closeLiveSessions()
+        realtimeRuntimeScope.cancel()
         closeHistoryEngines()
         val closingDownloadJobs = remoteDownloadJobs.values.toList()
         val closingRecoveryJob = remoteDownloadRecoveryJob
@@ -3732,38 +4755,156 @@ internal class ProductionProductRepository(
     private class LiveProductSession(
         val engine: NativeTerminalEngine,
         val client: ProductionRealtimeSessionClient,
+        private val parentScope: CoroutineScope,
+        val authenticationOwner: RealtimeAuthenticationOwner,
+        /** Fatal sequence inherited only from the incarnation rebuilt after it. */
+        val inheritedRendererFatalSequence: Long? = null,
     ) : AutoCloseable {
+        private enum class Lifecycle { NEW, STARTING, STARTED, CLOSING, CLOSED }
+
+        private val lifecycleLock = Any()
+        private val startCompleted = CompletableDeferred<Unit>()
+        private var lifecycle = Lifecycle.NEW
+        private var startInFlight = false
         val controlRequestLock = Mutex()
-        var stateJob: Job? = null
-        var tokenRefreshJob: Job? = null
-        var recoveryJob: Job? = null
+        private var stateJob: Job? = null
+        private var tokenRefreshJob: Job? = null
+        private var recoveryJob: Job? = null
+
+        fun installBackgroundJobs(stateJob: Job, tokenRefreshJob: Job) {
+            synchronized(lifecycleLock) {
+                check(lifecycle == Lifecycle.NEW && this.stateJob == null && this.tokenRefreshJob == null) {
+                    "Live session background jobs were already installed"
+                }
+                this.stateJob = stateJob
+                this.tokenRefreshJob = tokenRefreshJob
+            }
+        }
+
+        /**
+         * Starts the client only after the fully initialized incarnation has
+         * been published. A concurrent exact retirement changes the lifecycle
+         * to CLOSING and waits for this startup before closing the client.
+         */
+        suspend fun start(): Boolean {
+            val admitted = synchronized(lifecycleLock) {
+                if (lifecycle != Lifecycle.NEW) {
+                    false
+                } else {
+                    lifecycle = Lifecycle.STARTING
+                    startInFlight = true
+                    true
+                }
+            }
+            if (!admitted) return false
+            try {
+                client.start()
+                return synchronized(lifecycleLock) {
+                    if (lifecycle != Lifecycle.STARTING) {
+                        false
+                    } else {
+                        lifecycle = Lifecycle.STARTED
+                        stateJob?.start()
+                        tokenRefreshJob?.start()
+                        true
+                    }
+                }
+            } finally {
+                synchronized(lifecycleLock) { startInFlight = false }
+                startCompleted.complete(Unit)
+            }
+        }
+
+        fun launchRecovery(block: suspend () -> Unit): Boolean {
+            lateinit var candidate: Job
+            candidate = parentScope.launch(start = CoroutineStart.LAZY) {
+                try {
+                    block()
+                } finally {
+                    synchronized(lifecycleLock) {
+                        if (recoveryJob === candidate) recoveryJob = null
+                    }
+                }
+            }
+            val accepted = synchronized(lifecycleLock) {
+                if (lifecycle != Lifecycle.STARTED || recoveryJob?.isActive == true) {
+                    false
+                } else {
+                    recoveryJob = candidate
+                    true
+                }
+            }
+            if (!accepted) {
+                candidate.cancel()
+                return false
+            }
+            candidate.start()
+            return true
+        }
 
         suspend fun closeAndJoin() {
             val caller = currentCoroutineContext()[Job]
-            val jobs = listOfNotNull(stateJob, tokenRefreshJob, recoveryJob)
-            cancelJobs()
+            var waitForStart = false
+            val jobs = synchronized(lifecycleLock) {
+                if (lifecycle == Lifecycle.CLOSED) return
+                waitForStart = startInFlight
+                lifecycle = Lifecycle.CLOSING
+                listOfNotNull(stateJob, tokenRefreshJob, recoveryJob).also { closingJobs ->
+                    closingJobs.forEach(Job::cancel)
+                }
+            }
+            if (waitForStart) startCompleted.await()
             client.closeGracefully()
             jobs.filterNot { it === caller }.forEach { it.join() }
+            synchronized(lifecycleLock) {
+                stateJob = null
+                tokenRefreshJob = null
+                recoveryJob = null
+                lifecycle = Lifecycle.CLOSED
+            }
         }
 
         override fun close() {
-            cancelJobs()
+            synchronized(lifecycleLock) {
+                if (lifecycle == Lifecycle.CLOSED) return
+                lifecycle = Lifecycle.CLOSING
+                listOfNotNull(stateJob, tokenRefreshJob, recoveryJob).forEach(Job::cancel)
+            }
             client.close()
-        }
-
-        private fun cancelJobs() {
-            stateJob?.cancel()
-            stateJob = null
-            tokenRefreshJob?.cancel()
-            tokenRefreshJob = null
-            recoveryJob?.cancel()
-            recoveryJob = null
         }
     }
 
     private data class RetiredRealtimeRuntime(
         val sessions: List<LiveProductSession>,
+        val directShadow: ProductionDirectShadowRuntime?,
         val multiplexer: ProductionRealtimeMultiplexer?,
+    )
+
+    private class RealtimeAuthenticationOwner(
+        val authenticationGeneration: Long,
+        val accountScope: String,
+        val storedIdentity: DeviceKeyVault.StoredIdentity,
+    )
+
+    private data class RealtimeRuntimeClaim(
+        val owner: RealtimeAuthenticationOwner,
+        val multiplexer: ProductionRealtimeMultiplexer,
+    )
+
+    private data class AuthenticationStateCapture(
+        val authenticationGeneration: Long,
+        val authState: AuthState,
+        val accountScope: String?,
+    )
+
+    private data class AuthenticationTransition(
+        val authenticationGeneration: Long,
+        val retiredRuntime: RetiredRealtimeRuntime?,
+    )
+
+    private data class InteractiveAuthorizationClaim(
+        val authenticationGeneration: Long,
+        val authState: AuthState,
     )
 
     internal class ReservedInputSequenceProvider(
@@ -3802,6 +4943,9 @@ internal class ProductionProductRepository(
         keyId = requiredString("key_id"),
         exchangePublicKey = java.util.Base64.getDecoder().decode(requiredString("exchange_public_key")).also {
             require(it.size == 32) { "Device exchange public key must be 32 bytes" }
+        },
+        signingPublicKey = java.util.Base64.getDecoder().decode(requiredString("signing_public_key")).also {
+            require(it.size == 32) { "Device signing public key must be 32 bytes" }
         },
         trustState = DeviceTrustState.valueOf(requiredString("trust_state")),
         createdAt = instant("created_at"),
@@ -5386,6 +6530,7 @@ internal class ProductionProductRepository(
         var retry = 0
         while (
             scope.isActive &&
+            isCurrentRealtimeOwner(live.authenticationOwner) &&
             liveSessions[sessionId] === live &&
             live.client.sessionState.value is RemoteSessionState.HistoryGap
         ) {
@@ -5409,21 +6554,30 @@ internal class ProductionProductRepository(
                     // or advertise a cursor whose renderer has been cleared.
                     // Fence this incarnation and reopen through the normal
                     // Snapshot + bounded suffix bootstrap instead.
-                    val removed = synchronized(liveSessionLock) {
-                        liveSessions.remove(sessionId, live)
-                    }
-                    if (removed) {
-                        scope.launch {
+                    scope.launch {
+                        sessionLifecycleLanes.withLock(sessionId) {
                             try {
                                 // Teardown is a same-session durable-write barrier:
                                 // the retired ACK worker must finish before the new
                                 // Snapshot bootstrap reads and reuses its cursor generation.
-                                live.closeAndJoin()
-                                openSession(sessionId)
+                                retireExactIncarnationAndThen(
+                                    expected = live,
+                                    removeExact = { expected ->
+                                        synchronized(liveSessionLock) {
+                                            liveSessions.remove(sessionId, expected)
+                                        }
+                                    },
+                                    closeAndJoin = LiveProductSession::closeAndJoin,
+                                    afterRetired = { openSessionLocked(sessionId) },
+                                )
                             } catch (error: CancellationException) {
                                 throw error
                             } catch (error: Throwable) {
-                                publishFailure(error)
+                                val classified = classifySessionOpenException(
+                                    error,
+                                    SessionFailureStage.HISTORY_REPLAY,
+                                )
+                                observeBootstrapFailure(sessionId, classified.failure)
                             }
                         }
                     }
@@ -5431,7 +6585,13 @@ internal class ProductionProductRepository(
                 }
                 val missingEnd = activeGap.receivedSequence - 1
                 val recovery = if (missingEnd > 0) {
-                    loadLiveHistoryEvents(session, pc, pcDevice, identity(), missingEnd)
+                    loadLiveHistoryEvents(
+                        session,
+                        pc,
+                        pcDevice,
+                        live.authenticationOwner.storedIdentity,
+                        missingEnd,
+                    )
                 } else {
                     null
                 }
@@ -5443,8 +6603,8 @@ internal class ProductionProductRepository(
                             activeGap,
                         )
                         appendActivity(
-                            activity.getString(R.string.activity_history_gap_recovered),
-                            activity.getString(R.string.activity_history_gap_recovered_detail, recovered),
+                            context.getString(R.string.activity_history_gap_recovered),
+                            context.getString(R.string.activity_history_gap_recovered_detail, recovered),
                             Severity.SUCCESS,
                         )
                         return
@@ -5465,13 +6625,69 @@ internal class ProductionProductRepository(
         }
     }
 
+    private suspend fun recoverRendererFatal(
+        sessionId: UUID,
+        expectedLive: LiveProductSession,
+        failure: ProductionRendererFatalFailure,
+    ) = sessionLifecycleLanes.withLock(sessionId) {
+        if (closed || failure.sessionId != sessionId) return@withLock
+        val expectedIsCurrent = liveSessions[sessionId] === expectedLive
+        when (rendererFatalIncarnationDecision(
+            expectedIsCurrent = expectedIsCurrent,
+            inheritedFatalSequence = expectedLive.inheritedRendererFatalSequence,
+            failureSequence = failure.sequence,
+        )) {
+            RendererFatalIncarnationDecision.STALE -> return@withLock
+            RendererFatalIncarnationDecision.FAIL_CLOSED -> {
+                val retired = retireExactIncarnationAndThen(
+                    expected = expectedLive,
+                    removeExact = { expected ->
+                        synchronized(liveSessionLock) {
+                            liveSessions.remove(sessionId, expected)
+                        }
+                    },
+                    closeAndJoin = LiveProductSession::closeAndJoin,
+                )
+                if (!retired) return@withLock
+                val classified = sessionOpenException(
+                    SessionOpenFailureCode.NATIVE_RENDERER_FAILED_CLOSED,
+                )
+                observeBootstrapFailure(sessionId, classified.failure)
+            }
+            RendererFatalIncarnationDecision.RECOVER -> {
+                try {
+                    retireExactIncarnationAndThen(
+                        expected = expectedLive,
+                        removeExact = { expected ->
+                            synchronized(liveSessionLock) {
+                                liveSessions.remove(sessionId, expected)
+                            }
+                        },
+                        closeAndJoin = LiveProductSession::closeAndJoin,
+                        afterRetired = {
+                            openSessionLocked(
+                                sessionId = sessionId,
+                                inheritedRendererFatalSequence = failure.sequence,
+                            )
+                        },
+                    )
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Throwable) {
+                    val classified = classifySessionOpenException(error, SessionFailureStage.HISTORY_REPLAY)
+                    observeBootstrapFailure(sessionId, classified.failure)
+                }
+            }
+        }
+    }
+
     private suspend fun loadLiveHistoryEvents(
         session: SessionSummary,
         pc: PcSummary,
         pcDevice: DeviceSummary,
         stored: DeviceKeyVault.StoredIdentity,
         throughSequence: Long,
-    ): LoadedLiveHistory? {
+    ): LoadedLiveHistory? = withContext(Dispatchers.Default) {
         require(throughSequence > 0) { "History recovery sequence must be positive" }
         val through = throughSequence.toULong()
         val candidates = mutableSnapshot.value.history
@@ -5494,12 +6710,12 @@ internal class ProductionProductRepository(
                 val entry = candidates.firstOrNull { it.historyObject.startSequence == expected }
                 if (entry == null) {
                     wipeHistoryEvents(events)
-                    return null
+                    return@withContext null
                 }
                 val download = historyDownloads[entry.historyObject.id]
                 if (download == null) {
                     wipeHistoryEvents(events)
-                    return null
+                    return@withContext null
                 }
                 val chunk = openHistoryChunk(entry, pc, pcDevice, stored, download)
                 for (event in chunk.eventsList) {
@@ -5513,14 +6729,14 @@ internal class ProductionProductRepository(
                 }
                 if (expected <= through && expected <= requireNotNull(entry.historyObject.endSequence)) {
                     wipeHistoryEvents(events)
-                    return null
+                    return@withContext null
                 }
             }
         } catch (error: Exception) {
             wipeHistoryEvents(events)
             throw error
         }
-        return LoadedLiveHistory(events, localInputEpoch)
+        LoadedLiveHistory(events, localInputEpoch)
     }
 
     private fun decodeHistoryEvent(event: HistoryEventV1): DecodedHistoryEvent {
@@ -5673,6 +6889,19 @@ internal class ProductionProductRepository(
                 is RemoteSessionEvent.Gap -> error("Decoded history unexpectedly retained a gap")
             }
             decoded.localInputEpoch
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            val diagnostics = error as? TerminalEngineFailureDiagnostics
+            Log.e(
+                HISTORY_REPLAY_LOG_TAG,
+                "history_renderer_fatal seq=${event.seq} type=${event.messageType.name} " +
+                    "exception=${error::class.java.simpleName.take(MAX_HISTORY_FAILURE_CLASS_CHARS)} " +
+                    "terminal_operation=${diagnostics?.terminalOperation.orEmpty()} " +
+                    "terminal_status=${diagnostics?.terminalStatusName.orEmpty()} " +
+                    "terminal_status_code=${diagnostics?.terminalStatusCode ?: 0}",
+            )
+            throw error
         } finally {
             if (decoded.event is RemoteSessionEvent.Output) decoded.event.bytes.fill(0)
         }
@@ -5697,6 +6926,8 @@ internal class ProductionProductRepository(
     )
 
     private companion object {
+        private const val HISTORY_REPLAY_LOG_TAG = "TermLinkHistoryReplay"
+        private const val MAX_HISTORY_FAILURE_CLASS_CHARS = 128
         const val UPDATE_PREFERENCES = "update_service"
         const val UPDATE_CHANNEL = "stable"
         const val UPDATE_REQUEST_KEY = "cache_request"
@@ -6829,6 +8060,21 @@ internal suspend fun <Loaded, Prepared, Bound, Restored> prepareBindInstallSnaps
 }
 
 internal val CONTROL_LEASE_HELD_RETRY_DELAYS_MILLIS = listOf(1_000L, 2_000L, 4_000L, 8_000L, 15_000L, 5_000L)
+internal val CONTROL_LEASE_TRANSIENT_RETRY_DELAYS_MILLIS = listOf(500L, 1_000L, 2_000L)
+
+internal fun sessionFailuresAfterRuntimeState(
+    failures: Map<UUID, SessionOpenFailure>,
+    sessionId: UUID,
+    state: RemoteSessionState,
+): Map<UUID, SessionOpenFailure> =
+    if (state is RemoteSessionState.Controlling) failures - sessionId else failures
+
+private fun retryableTransientControlFailure(error: Throwable): Boolean = when (error) {
+    is IOException -> true
+    is TermLinkApiException -> error.status == 408 || error.status == 425 || error.status == 429 ||
+        error.status in 500..599
+    else -> false
+}
 
 internal fun commandInputBytes(text: String): ByteArray {
     require(text.isNotEmpty()) { "Command text is empty" }
@@ -6853,20 +8099,29 @@ internal suspend fun acquireControlLeaseWithRetry(
     remoteState: () -> RemoteSessionState,
     request: suspend () -> Unit,
     retryDelaysMillis: List<Long> = CONTROL_LEASE_HELD_RETRY_DELAYS_MILLIS,
+    transientRetryDelaysMillis: List<Long> = CONTROL_LEASE_TRANSIENT_RETRY_DELAYS_MILLIS,
     pause: suspend (Long) -> Unit = { delay(it) },
 ): Boolean {
     if (remoteState() is RemoteSessionState.Controlling) return false
 
-    var retryIndex = 0
+    var heldRetryIndex = 0
+    var transientRetryIndex = 0
     while (true) {
-        try {
+        val retryDelay = try {
             request()
             return true
-        } catch (error: TermLinkApiException) {
-            val retryable = error.status == 409 && error.code == "LEASE_HELD"
-            if (!retryable || retryIndex >= retryDelaysMillis.size) throw error
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            when {
+                error is TermLinkApiException && error.status == 409 && error.code == "LEASE_HELD" ->
+                    retryDelaysMillis.getOrNull(heldRetryIndex++) ?: throw error
+                retryableTransientControlFailure(error) ->
+                    transientRetryDelaysMillis.getOrNull(transientRetryIndex++) ?: throw error
+                else -> throw error
+            }
         }
-        pause(retryDelaysMillis[retryIndex++])
+        pause(retryDelay)
         if (remoteState() is RemoteSessionState.Controlling) return false
     }
 }

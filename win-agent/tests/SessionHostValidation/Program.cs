@@ -240,6 +240,56 @@ using (var strictColorGrammar = new OuterTerminalReplySuppressor())
         "a bounded standards-compatible rgb reply was not recognized");
 }
 
+var pixelReplyPassThrough = new List<byte[]>();
+using (var textAreaPixelRouter = new OuterTerminalReplySuppressor(
+    terminalReplyPassThrough: bytes => pixelReplyPassThrough.Add(bytes.ToArray())))
+{
+    foreach (var part in new[] { "\u001b[1", "4", "t" })
+    {
+        var bytes = Encoding.ASCII.GetBytes(part);
+        textAreaPixelRouter.ObserveOutput(bytes, bytes.Length);
+    }
+    Require(textAreaPixelRouter.PendingCount == 1,
+        "a projected CSI 14 t query did not create a renderer-local reply expectation");
+
+    var ordinaryArrowDisposition = new List<bool>();
+    var ordinaryArrowBytes = Encoding.ASCII.GetBytes("\u001b[A");
+    textAreaPixelRouter.FilterFragment(
+        ordinaryArrowBytes,
+        ordinaryArrowBytes.Length,
+        passed => ordinaryArrowDisposition.Add(passed));
+    Require(ordinaryArrowDisposition.SequenceEqual(new[] { true }) &&
+        textAreaPixelRouter.PendingCount == 1,
+        "ordinary keyboard input consumed a text-area pixel reply expectation");
+
+    var pixelReplyDispositions = new List<bool>();
+    foreach (var value in Encoding.ASCII.GetBytes("\u001b[4;684;936t"))
+    {
+        textAreaPixelRouter.FilterFragment(
+            new[] { value },
+            1,
+            passed => pixelReplyDispositions.Add(passed));
+    }
+    Require(pixelReplyDispositions.Count == 12 && pixelReplyDispositions.All(passed => !passed) &&
+        textAreaPixelRouter.PendingCount == 0 && pixelReplyPassThrough.Count == 0,
+        "the 12-key Windows Terminal pixel report escaped as local keyboard input");
+
+    var unpromptedPixelReply = Encoding.ASCII.GetBytes("\u001b[4;720;1280t");
+    Require(textAreaPixelRouter.Filter(unpromptedPixelReply, unpromptedPixelReply.Length)
+            .SequenceEqual(unpromptedPixelReply),
+        "an unprompted pixel report was suppressed without a projected CSI 14 t query");
+}
+
+using (var standalonePixelSuppressor = new OuterTerminalReplySuppressor())
+{
+    var query = Encoding.ASCII.GetBytes("\u001b[14t");
+    standalonePixelSuppressor.ObserveOutput(query, query.Length);
+    var reply = Encoding.ASCII.GetBytes("\u001b[4;684;936t");
+    Require(standalonePixelSuppressor.Filter(reply, reply.Length).Length == 0 &&
+        standalonePixelSuppressor.PendingCount == 0,
+        "CSI 14 t suppression incorrectly depended on an OSC reply-forwarding callback");
+}
+
 var forwardedTerminalReplies = new List<byte[]>();
 using (var colorReplyRouter = new OuterTerminalReplySuppressor(
     terminalReplyPassThrough: bytes => forwardedTerminalReplies.Add(bytes.ToArray())))
@@ -652,6 +702,85 @@ using (var integratedAuthority = new TerminalCoreAuthority(
     Require(integratedRouter.Filter(fallback, fallback.Length).Length == 0 &&
         integratedForwardedReplies.Count == 1 && integratedForwardedReplies[0].SequenceEqual(fallback),
         "the integrated unresolved color reply was not forwarded as protocol input");
+}
+
+var openCodePtyReplies = new List<byte[]>();
+var openCodeForwardedReplies = new List<byte[]>();
+using (var openCodeRouter = new OuterTerminalReplySuppressor(
+    terminalReplyPassThrough: bytes => openCodeForwardedReplies.Add(bytes.ToArray())))
+using (var openCodeAuthority = new TerminalCoreAuthority(
+    120,
+    36,
+    bytes => openCodePtyReplies.Add(bytes.ToArray()),
+    openCodeRouter.RegisterAuthorityReply))
+{
+    var sessionId = Guid.NewGuid();
+    openCodeAuthority.ApplyDurable(new LocalFrame(
+        LocalFrameType.Lifecycle,
+        sessionId,
+        1,
+        LocalPayloadCodec.Lifecycle(LocalLifecycleState.Running, 0)));
+    var capabilityQueries = Encoding.ASCII.GetBytes(
+        "\u001b[?2031h" +
+        "\u001b]10;?\u0007\u001b]11;?\u0007" +
+        "\u001b[>0q" +
+        "\u001b[?1016$p\u001b[?2027$p\u001b[?2031$p" +
+        "\u001b[?1004$p\u001b[?2004$p\u001b[?2026$p" +
+        "\u001b[?u" +
+        "\u001b]99;i=opentui-notifications:p=?;\u001b\\" +
+        "\u001b]1337;Capabilities\u001b\\");
+    openCodeAuthority.ApplyDurable(new LocalFrame(
+        LocalFrameType.Output,
+        sessionId,
+        2,
+        capabilityQueries));
+    Require(openCodeRouter.ProjectOutput(
+            capabilityQueries,
+            capabilityQueries.Length,
+            2,
+            () => true),
+        "the OpenCode capability query batch was not projected");
+
+    var rendererQueries = Encoding.ASCII.GetBytes(
+        "\u001b[>4;1m\u001b[?2027h\u001b[?2004h" +
+        "\u001b[14t\u001b]4;0;?\u0007");
+    openCodeAuthority.ApplyDurable(new LocalFrame(
+        LocalFrameType.Output,
+        sessionId,
+        3,
+        rendererQueries));
+    Require(openCodeRouter.ProjectOutput(
+            rendererQueries,
+            rendererQueries.Length,
+            3,
+            () => true),
+        "the OpenCode renderer query batch was not projected");
+
+    foreach (var duplicate in openCodePtyReplies.ToArray())
+    {
+        Require(openCodeRouter.Filter(duplicate, duplicate.Length).Length == 0,
+            "an authority-owned OpenCode terminal reply escaped duplicate suppression");
+    }
+    var openCodeForeground = Encoding.ASCII.GetBytes("\u001b]10;rgb:8383/9494/9696\u001b\\");
+    var openCodeBackground = Encoding.ASCII.GetBytes("\u001b]11;rgb:0000/2b2b/3636\u001b\\");
+    var openCodePalette = Encoding.ASCII.GetBytes("\u001b]4;0;rgb:0000/0000/0000\u001b\\");
+    foreach (var externalReply in new[] { openCodeForeground, openCodeBackground, openCodePalette })
+    {
+        Require(openCodeRouter.Filter(externalReply, externalReply.Length).Length == 0,
+            "an OpenCode outer-terminal color reply escaped protocol routing");
+    }
+
+    var localInputDecisions = new List<bool>();
+    foreach (var value in Encoding.ASCII.GetBytes("\u001b[4;684;936t"))
+    {
+        openCodeRouter.FilterFragment(
+            new[] { value },
+            1,
+            passed => localInputDecisions.Add(passed));
+    }
+    Require(localInputDecisions.Count == 12 && localInputDecisions.All(passed => !passed) &&
+        openCodeForwardedReplies.Count == 3 && openCodeRouter.PendingCount == 0,
+        "the complete OpenCode query/reply exchange produced false local input");
 }
 
 using (var gapAuthority = new TerminalCoreAuthority(80, 24, _ => { }, (_, _, _, _) => { }))

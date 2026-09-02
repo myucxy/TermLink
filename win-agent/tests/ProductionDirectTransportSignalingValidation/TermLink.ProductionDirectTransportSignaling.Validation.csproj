@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyName>TermLink.ProductionDirectTransportSignaling.Validation</AssemblyName>
+    <RootNamespace>TermLink.ProductionDirectTransportSignaling.Validation</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Agent\TermLink.Agent.csproj" />
+    <ProjectReference Include="..\..\src\Protocol\TermLink.Protocol.csproj" />
+    <None Include="..\..\..\protocol\test-vectors\direct-transport-ticket-v1.json"
+          Link="direct-transport-ticket-v1.json"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

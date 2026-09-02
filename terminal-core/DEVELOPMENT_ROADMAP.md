@@ -59,6 +59,20 @@
 
 这些改动目前位于 `host_effect.rs`、`lib.rs`、`modes.rs`、`osc.rs`、`snapshot.rs`、`tests.rs`。在完成审查和完整测试前，不得写成已发布能力。
 
+### 2026-09-01 OpenCode resize/reflow 稳定性批次
+
+- `[x]` 修复 hard LF 切断已有 soft-wrap 后，后续 visual row 仍沿用旧 logical line ID 的元数据损坏。
+- `[x]` 同步修复 partial horizontal rectangle 中相同的 hard-boundary 状态转换。
+- `[x]` renderer window 在截断 logical line 首尾时输出 canonical 本地边界。
+- `[x]` 保持 `Screen.validate()` 严格拒绝非法状态，没有用放宽校验掩盖生产者缺陷。
+- `[x]` 最小 `4x3` 回归、partial rectangle 两分支、459 个单元测试和 10 个 golden tests 通过。
+- `[x]` 真实 OpenCode 生产 WAL 逐帧回放 50/50 成功；原失败 `seq=34` 可导出 Snapshot 和 Render Frame。
+- `[ ]` 固化 Windows/Android 连续 resize 三轮的跨端 E2E，并纳入发布门禁。
+
+本次事故还确认了平台错误域要求：core 拒绝一帧只能退休准确的 renderer incarnation；网络连接、
+其他会话、Windows Agent、SessionHost 和 Shell 必须继续运行。连接层方案见
+[`../docs/NETWORK_CONNECTION_AND_DIRECT_TRANSPORT.md`](../docs/NETWORK_CONNECTION_AND_DIRECT_TRANSPORT.md)。
+
 ## 4. 当前接续点
 
 下次打开仓库时，从工作项 `W0` 开始：

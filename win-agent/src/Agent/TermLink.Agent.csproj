@@ -18,11 +18,28 @@
     <InternalsVisibleTo Include="TermLink.FileOperations.Validation" />
     <InternalsVisibleTo Include="TermLink.TerminalCore.Validation" />
     <InternalsVisibleTo Include="TermLink.AgentUpdate.Validation" />
+    <InternalsVisibleTo Include="TermLink.ProductionConnectionSupervisor.Validation" />
+    <InternalsVisibleTo Include="TermLink.ProductionDirectTransport.Validation" />
+    <InternalsVisibleTo Include="TermLink.ProductionDirectNative.Validation" />
+    <InternalsVisibleTo Include="TermLink.ProductionDirectTransportSignaling.Validation" />
+    <InternalsVisibleTo Include="TermLink.ProductionSessionFaultIsolation.Validation" />
     <InternalsVisibleTo Include="TermLink" />
   </ItemGroup>
   <ItemGroup Condition="Exists('..\..\..\terminal-core\target\x86_64-pc-windows-msvc\release\termlink_terminal_ffi.dll')">
     <None Include="..\..\..\terminal-core\target\x86_64-pc-windows-msvc\release\termlink_terminal_ffi.dll"
           Link="termlink_terminal_ffi.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup Condition="Exists('..\..\..\network-core\target\x86_64-pc-windows-msvc\release\termlink_direct_ffi.dll')">
+    <None Include="..\..\..\network-core\target\x86_64-pc-windows-msvc\release\termlink_direct_ffi.dll"
+          Link="termlink_direct_ffi.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup Condition="!Exists('..\..\..\network-core\target\x86_64-pc-windows-msvc\release\termlink_direct_ffi.dll') And Exists('..\..\..\network-core\target\release\termlink_direct_ffi.dll')">
+    <None Include="..\..\..\network-core\target\release\termlink_direct_ffi.dll"
+          Link="termlink_direct_ffi.dll"
           CopyToOutputDirectory="PreserveNewest"
           CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>

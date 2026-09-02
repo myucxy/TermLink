@@ -153,7 +153,7 @@ class TermuxTerminalEngine(
                 accepted = inputEnqueueRevision != before
             }
             if (accepted && text.isNotEmpty()) {
-                scrollToLatest()
+                resumeViewportAfterLocalInput()
                 notifyAcceptedLocalUserInput()
             }
         }
@@ -420,6 +420,14 @@ class TermuxTerminalEngine(
         }
     }
 
+    override fun resumeViewportAfterLocalInput() {
+        val cursorVisible = synchronized(lock) {
+            checkActive()
+            emulator.isCursorEnabled
+        }
+        if (cursorVisible) scrollToLatest()
+    }
+
     /** Returns an attached live view to its cursor-following tail without changing transport state. */
     override fun scrollToLatest() {
         val view = synchronized(lock) {
@@ -454,7 +462,7 @@ class TermuxTerminalEngine(
             accepted = emitInput(String(Character.toChars(normalized)).encodeToByteArray()) || accepted
         }
         if (accepted) {
-            scrollToLatest()
+            resumeViewportAfterLocalInput()
             notifyAcceptedLocalUserInput()
         }
         return true
@@ -468,7 +476,7 @@ class TermuxTerminalEngine(
         val encoded = String(Character.toChars(transformed)).encodeToByteArray()
         val accepted = emitInput(if (altDown) byteArrayOf(ESCAPE) + encoded else encoded)
         if (accepted) {
-            scrollToLatest()
+            resumeViewportAfterLocalInput()
             notifyAcceptedLocalUserInput()
         }
         return true
@@ -487,7 +495,7 @@ class TermuxTerminalEngine(
             )
         } ?: return false
         if (emitInput(encoded.encodeToByteArray())) {
-            scrollToLatest()
+            resumeViewportAfterLocalInput()
             notifyAcceptedLocalUserInput()
         }
         return true
@@ -517,7 +525,7 @@ class TermuxTerminalEngine(
             accepted = inputEnqueueRevision != before
         }
         if (accepted && text.isNotEmpty()) {
-            scrollToLatest()
+            resumeViewportAfterLocalInput()
             notifyAcceptedLocalUserInput()
         }
         return true
@@ -949,7 +957,7 @@ class TermuxTerminalEngine(
             changed
         }
         if (accepted) {
-            scrollToLatest()
+            resumeViewportAfterLocalInput()
             notifyAcceptedLocalUserInput()
         }
     }

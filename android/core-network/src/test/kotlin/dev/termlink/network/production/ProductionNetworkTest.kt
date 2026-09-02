@@ -11,6 +11,7 @@ import java.util.UUID
 import java.util.concurrent.AbstractExecutorService
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
@@ -87,6 +88,138 @@ class ProductionNetworkTest {
             }
             client.connect()
             assertEquals(RealtimeState.Connected, withTimeout(5_000) { connected.await() })
+        } finally {
+            client.close()
+            identity.destroy()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun negotiatedLivenessProbeCompletesOnMatchingPongWithoutChangingGeneration(): Unit = runBlocking {
+        val server = MockWebServer()
+        val identity = DeviceIdentity.generate()
+        val probeSeen = CompletableDeferred<String>()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    private var welcomed = false
+
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        if (!welcomed) {
+                            welcomed = true
+                            assertTrue(text.contains("\"liveness_probe_v1\""))
+                            check(
+                                webSocket.send(
+                                    "{\"type\":\"welcome\",\"protocol_version\":1," +
+                                        "\"capabilities\":[\"liveness_probe_v1\"]}",
+                                ),
+                            )
+                            return
+                        }
+                        val match = Regex("\\\"probe_id\\\":\\\"([^\\\"]+)\\\"").find(text)
+                        val probeId = match?.groupValues?.get(1)
+                            ?: error("liveness probe did not carry a probe_id")
+                        assertTrue(text.contains("\"type\":\"ping\""))
+                        probeSeen.complete(probeId)
+                        check(webSocket.send("{\"type\":\"pong\",\"probe_id\":\"$probeId\"}"))
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, reason)
+                    }
+                },
+            ),
+        )
+        server.start()
+        val client = ProductionRealtimeClient(
+            rootUrl = server.url("/").toString(),
+            tokenProvider = AccessTokenProvider { "oidc-token" },
+            deviceId = UUID.randomUUID(),
+            identity = identity,
+            role = "android",
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            val connected = async(start = CoroutineStart.UNDISPATCHED) {
+                client.state.first { it == RealtimeState.Connected }
+            }
+            client.connect()
+            withTimeout(5_000) { connected.await() }
+            val generation = client.diagnostics().connectedGeneration
+            assertTrue(client.supportsLivenessProbe(generation))
+            assertTrue(client.probeLiveness(generation, 1_000))
+            assertTrue(runCatching { UUID.fromString(withTimeout(1_000) { probeSeen.await() }) }.isSuccess)
+            assertEquals(generation, client.diagnostics().connectedGeneration)
+        } finally {
+            client.close()
+            identity.destroy()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun cancelledLivenessProbeReleasesGenerationGateForSuccessorProbe(): Unit = runBlocking {
+        val server = MockWebServer()
+        val identity = DeviceIdentity.generate()
+        val probesSeen = AtomicInteger(0)
+        val firstProbeSeen = CompletableDeferred<Unit>()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    private var welcomed = false
+
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        if (!welcomed) {
+                            welcomed = true
+                            check(
+                                webSocket.send(
+                                    "{\"type\":\"welcome\",\"protocol_version\":1," +
+                                        "\"capabilities\":[\"liveness_probe_v1\"]}",
+                                ),
+                            )
+                            return
+                        }
+                        val probeId = Regex("\\\"probe_id\\\":\\\"([^\\\"]+)\\\"")
+                            .find(text)?.groupValues?.get(1)
+                            ?: error("liveness probe did not carry a probe_id")
+                        if (probesSeen.incrementAndGet() == 1) {
+                            firstProbeSeen.complete(Unit)
+                        } else {
+                            check(webSocket.send("{\"type\":\"pong\",\"probe_id\":\"$probeId\"}"))
+                        }
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, reason)
+                    }
+                },
+            ),
+        )
+        server.start()
+        val client = ProductionRealtimeClient(
+            rootUrl = server.url("/").toString(),
+            tokenProvider = AccessTokenProvider { "oidc-token" },
+            deviceId = UUID.randomUUID(),
+            identity = identity,
+            role = "android",
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            val connected = async(start = CoroutineStart.UNDISPATCHED) {
+                client.state.first { it == RealtimeState.Connected }
+            }
+            client.connect()
+            withTimeout(5_000) { connected.await() }
+            val generation = client.diagnostics().connectedGeneration
+
+            val cancelled = async { client.probeLiveness(generation, 10_000) }
+            withTimeout(1_000) { firstProbeSeen.await() }
+            cancelled.cancelAndJoin()
+
+            assertTrue(client.probeLiveness(generation, 1_000))
+            assertEquals(2, probesSeen.get())
+            assertEquals(generation, client.diagnostics().connectedGeneration)
         } finally {
             client.close()
             identity.destroy()
@@ -292,7 +425,7 @@ class ProductionNetworkTest {
     }
 
     @Test
-    fun receiveOverflowKeepsOneContiguousPrefixForAckResume(): Unit = runBlocking {
+    fun receiveOverflowDropsOnlyApplicationFramesAndKeepsPhysicalGeneration(): Unit = runBlocking {
         val server = MockWebServer()
         val identity = DeviceIdentity.generate()
         val androidId = UUID.randomUUID()
@@ -335,18 +468,32 @@ class ProductionNetworkTest {
                 }
             }
         }
-        val failed = async(start = CoroutineStart.UNDISPATCHED) {
-            client.state.first { it is RealtimeState.Failed }
-        }
         try {
             client.connect()
             withTimeout(5_000) { firstReceived.await() }
-            withTimeout(5_000) { failed.await() }
+            // MockWebServer.send() only confirms local enqueue. Wait until the
+            // client callback has actually metadata-admitted every frame and
+            // rejected at least one on its bounded application queue.
+            withTimeout(5_000) {
+                while (client.diagnostics().observedApplicationFrames < 300L ||
+                    client.diagnostics().droppedApplicationFrames == 0L
+                ) {
+                    delay(10)
+                }
+            }
+            val overflow = client.diagnostics()
+            assertEquals(300L, overflow.observedApplicationFrames)
+            assertTrue(overflow.droppedApplicationFrames > 0L)
+            assertEquals("CONNECTED", overflow.state)
+            assertEquals(1, overflow.generation)
+            assertEquals(1, overflow.connectedGeneration)
+            val acceptedFrames = (overflow.observedApplicationFrames - overflow.droppedApplicationFrames).toInt()
+            assertTrue(acceptedFrames in 2 until 300)
             releaseCollector.complete(Unit)
             withTimeout(5_000) {
-                while (received.size < 2) delay(10)
-                delay(100)
+                while (received.size < acceptedFrames) delay(10)
             }
+            assertEquals(acceptedFrames, received.size)
             assertTrue("overflow must stop before all frames", received.last() < 300L)
             assertTrue(
                 "overflow must retain one contiguous prefix: $received",
@@ -355,6 +502,57 @@ class ProductionNetworkTest {
         } finally {
             releaseCollector.complete(Unit)
             collector.cancelAndJoin()
+            client.close()
+            identity.destroy()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun malformedEnvelopeIsDroppedWithoutReplacingPhysicalGeneration(): Unit = runBlocking {
+        val server = MockWebServer()
+        val identity = DeviceIdentity.generate()
+        val androidId = UUID.randomUUID()
+        val pcId = UUID.randomUUID()
+        val sessionId = UUID.randomUUID()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        check(webSocket.send("{\"type\":\"welcome\",\"protocol_version\":1}"))
+                        check(webSocket.send(OkioByteString.of(0.toByte())))
+                        check(
+                            webSocket.send(
+                                OkioByteString.of(*testEnvelope(sessionId, pcId, androidId, 1).toByteArray()),
+                            ),
+                        )
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, reason)
+                    }
+                },
+            ),
+        )
+        server.start()
+        val client = ProductionRealtimeClient(
+            rootUrl = server.url("/").toString(),
+            tokenProvider = AccessTokenProvider { "oidc-token" },
+            deviceId = androidId,
+            identity = identity,
+            role = "android",
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            val received = async(start = CoroutineStart.UNDISPATCHED) {
+                client.incoming.first()
+            }
+            client.connect()
+            assertEquals(1L, withTimeout(5_000) { received.await() }.seq)
+            assertEquals("CONNECTED", client.diagnostics().state)
+            assertEquals(1, client.diagnostics().generation)
+            assertEquals(1, client.diagnostics().connectedGeneration)
+        } finally {
             client.close()
             identity.destroy()
             server.shutdown()

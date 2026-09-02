@@ -1,0 +1,16 @@
+[package]
+name = "termlink-direct-wire"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ring = { version = "=0.17.14", default-features = false, features = ["std"] }
+subtle = "=2.6.1"
+
+[dev-dependencies]
+serde_json = "=1.0.151"
+
+[lints]
+workspace = true

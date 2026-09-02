@@ -68,3 +68,13 @@ interface TerminalEngine {
 
     fun dispose()
 }
+
+/**
+ * Content-free diagnostics exposed by a terminal implementation when an ordered apply fails.
+ * Transport logging may record these fields, but must never log terminal input or output bytes.
+ */
+interface TerminalEngineFailureDiagnostics {
+    val terminalOperation: String
+    val terminalStatusName: String
+    val terminalStatusCode: Int
+}

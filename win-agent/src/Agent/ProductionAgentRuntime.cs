@@ -8,6 +8,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
@@ -69,6 +70,8 @@ namespace TermLink.Agent
         private const string LegacyTerminalSnapshotEnvironment = "TERMLINK_ENABLE_TERMINAL_SNAPSHOT_V1";
         private const string TypedInputEnvironment = "TERMLINK_ENABLE_TYPED_INPUT_V1";
         private const string TerminalCoreShadowEnvironment = "TERMLINK_ENABLE_TERMINAL_CORE_SHADOW";
+        private const string DirectTransportShadowEnvironment =
+            "TERMLINK_ENABLE_DIRECT_TRANSPORT_SHADOW";
         private sealed class CommittedEvent { public ManagedShellType ShellType; public LocalFrame Frame; }
         private sealed class PendingSession { public ManagedShellType ShellType; }
         private sealed class SessionPublicationState
@@ -117,6 +120,7 @@ namespace TermLink.Agent
             public readonly object Sync = new object();
             public Guid DeviceId;
             public byte[] ExchangePublicKey;
+            public byte[] SigningPublicKey;
             public byte[] PairwiseKey;
             public long KeyEpoch;
             public DateTime LastActivityUtc;
@@ -127,10 +131,39 @@ namespace TermLink.Agent
             public ulong FlowWindowWireBytes = DefaultFlowWindowWireBytes;
             public ulong FlowControlEpoch;
             public ulong InFlightWireBytes;
+            // SentFrames is the connection-scoped byte-identical ciphertext
+            // cache. GenerationInFlightSequences is the independently bounded
+            // set advertised to the current SUBSCRIBE generation. A reconnect
+            // must retain the former while resetting the latter, otherwise a
+            // completely full old window can never retransmit its first frame.
+            public readonly HashSet<ulong> GenerationInFlightSequences = new HashSet<ulong>();
             public readonly SortedDictionary<ulong, byte[]> SentFrames = new SortedDictionary<ulong, byte[]>();
             public bool DrainRequested;
             public bool ReplayInProgress;
             public bool Removed;
+        }
+        private sealed class AuthorizedRecipientKeyMaterial : IDisposable
+        {
+            public AuthorizedRecipientKeyMaterial(byte[] exchangePublicKey, byte[] signingPublicKey)
+            {
+                ExchangePublicKey = exchangePublicKey ??
+                    throw new ArgumentNullException(nameof(exchangePublicKey));
+                SigningPublicKey = signingPublicKey ??
+                    throw new ArgumentNullException(nameof(signingPublicKey));
+            }
+
+            public byte[] ExchangePublicKey { get; private set; }
+            public byte[] SigningPublicKey { get; private set; }
+
+            public void Dispose()
+            {
+                if (ExchangePublicKey != null)
+                    CryptographicOperations.ZeroMemory(ExchangePublicKey);
+                if (SigningPublicKey != null)
+                    CryptographicOperations.ZeroMemory(SigningPublicKey);
+                ExchangePublicKey = null;
+                SigningPublicKey = null;
+            }
         }
         private sealed class LeaseStatus
         {
@@ -142,7 +175,9 @@ namespace TermLink.Agent
         }
         private readonly ProductionAgentConfig config;
         private readonly ProductionCredentials credentials;
-        private readonly ProductionReconnectPreferences reconnectPreferences;
+        private readonly ProductionRealtimeConnectionSupervisor connectionSupervisor;
+        private readonly ProductionDirectTransportSupervisor directTransportSupervisor;
+        private readonly ProductionDirectMultipairShadowRuntime directShadowRuntime;
         private readonly HttpClient http;
         private readonly HttpClient fileUploadHttp;
         // Frames are durably committed to each SessionAgent DPAPI buffer before
@@ -177,7 +212,6 @@ namespace TermLink.Agent
         private readonly SemaphoreSlim authorizedRecipientGate = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim statusRefreshGate = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim tokenRefreshGate = new SemaphoreSlim(1, 1);
-        private readonly SemaphoreSlim reconnectSignal = new SemaphoreSlim(0, 1);
         private readonly object persistedHistoryCancellationSync = new object();
         private readonly ConcurrentDictionary<Guid, LeaseStatus> leaseStatuses = new ConcurrentDictionary<Guid, LeaseStatus>();
         private readonly ConcurrentDictionary<Guid, ulong> localInputEpochs = new ConcurrentDictionary<Guid, ulong>();
@@ -189,6 +223,7 @@ namespace TermLink.Agent
         private readonly bool terminalSnapshotEnabled;
         private readonly bool typedInputEnabled;
         private readonly bool terminalCoreShadowEnabled;
+        private readonly bool directTransportShadowEnabled;
         private readonly string registryControlPipeName;
         private readonly ConcurrentDictionary<Guid, string> terminalCoreShadowStates =
             new ConcurrentDictionary<Guid, string>();
@@ -218,7 +253,9 @@ namespace TermLink.Agent
         private int disposed;
         private int cleanupStarted;
         private int reauthenticationRequired;
-        private long successfulConnectionGeneration;
+        private NetworkAvailabilityChangedEventHandler networkAvailabilityHandler;
+        private NetworkAddressChangedEventHandler networkAddressHandler;
+        private Task directShadowCleanupTask;
         private long lastLiveHistoryActivityTick = Environment.TickCount64;
         private CancellationTokenSource persistedHistoryCancellation;
         private Guid persistedHistoryCancellationSessionId;
@@ -236,12 +273,12 @@ namespace TermLink.Agent
         {
             this.config = config;
             this.credentials = credentials;
-            this.reconnectPreferences = reconnectPreferences ??
-                throw new ArgumentNullException(nameof(reconnectPreferences));
+            connectionSupervisor = new ProductionRealtimeConnectionSupervisor(
+                reconnectPreferences ?? throw new ArgumentNullException(nameof(reconnectPreferences)));
+            directTransportSupervisor = new ProductionDirectTransportSupervisor();
             this.registryControlPipeName = string.IsNullOrWhiteSpace(registryControlPipeName)
                 ? TermLinkControlPipe.DefaultName()
                 : registryControlPipeName.Trim();
-            this.reconnectPreferences.Validate();
             http = ProductionTls.CreateHttpClient(config.ServerUrl);
             http.Timeout = TimeSpan.FromSeconds(15);
             fileUploadHttp = ProductionTls.CreateHttpClient(config.ServerUrl);
@@ -256,6 +293,34 @@ namespace TermLink.Agent
                 Environment.GetEnvironmentVariable(TypedInputEnvironment));
             terminalCoreShadowEnabled = IsTerminalCoreShadowRuntimeEnabled(
                 Environment.GetEnvironmentVariable(TerminalCoreShadowEnvironment));
+            directTransportShadowEnabled = IsDirectTransportShadowRuntimeEnabled(
+                Environment.GetEnvironmentVariable(DirectTransportShadowEnvironment));
+            if (directTransportShadowEnabled)
+            {
+                try
+                {
+                    var serverOrigin = NormalizeServerOrigin(config.ServerUrl);
+                    directShadowRuntime = new ProductionDirectMultipairShadowRuntime(
+                        enabled: true,
+                        localDeviceId: credentials.DeviceId,
+                        signalKeyId: DeviceKeyId(credentials.DeviceId),
+                        identity: credentials.Identity,
+                        supervisor: directTransportSupervisor,
+                        signalingFactory: () => new ProductionDirectTransportSignalingClient(
+                            serverOrigin,
+                            credentials.DeviceId,
+                            credentials.Identity,
+                            GetDirectShadowAccessTokenAsync,
+                            enabled: true,
+                            multipairV2Enabled: true),
+                        peerProvider: SnapshotDirectPeerAuthorizationsAsync);
+                }
+                catch (Exception error) when (error is not OutOfMemoryException)
+                {
+                    // Direct is optional shadow evidence. Initialization failure
+                    // must never prevent the authoritative Relay runtime from starting.
+                }
+            }
             terminalHistoryStore = new ProductionTerminalHistoryStore(
                 ProductionTerminalHistoryRoot(config.PcId),
                 credentials.DeviceId);
@@ -294,6 +359,13 @@ namespace TermLink.Agent
             var normalized = value?.Trim();
             return !string.Equals(normalized, "0", StringComparison.Ordinal) &&
                 !string.Equals(normalized, "false", StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static bool IsDirectTransportShadowRuntimeEnabled(string value)
+        {
+            var normalized = value?.Trim();
+            return string.Equals(normalized, "1", StringComparison.Ordinal) ||
+                string.Equals(normalized, "true", StringComparison.OrdinalIgnoreCase);
         }
 
         internal static string NormalizeServerOrigin(string serverUrl)
@@ -419,8 +491,76 @@ namespace TermLink.Agent
                 // in-progress legacy replay can never delay a new Snapshot.
                 priorityHistoryWorker = Task.Run(() => HistoryUploadLoopAsync(allowPersistedBacklog: false));
                 metadataWorker = Task.Run(MetadataUpsertLoopAsync);
+                networkAvailabilityHandler = (_, network) =>
+                {
+                    DispatchNetworkAvailabilityChange(
+                        network.IsAvailable,
+                        connectionSupervisor.NotifyNetworkAvailable,
+                        NotifyDirectNetworkChangedSafely);
+                };
+                networkAddressHandler = (_, _) => NotifyDirectNetworkChangedSafely();
+                NetworkChange.NetworkAvailabilityChanged += networkAvailabilityHandler;
+                NetworkChange.NetworkAddressChanged += networkAddressHandler;
                 worker = Task.Run(RunAsync);
+                StartDirectShadowSafely();
             }
+        }
+
+        private void StartDirectShadowSafely()
+        {
+            if (directShadowRuntime == null) return;
+            try { directShadowRuntime.Start(); }
+            catch (Exception error) when (error is not OutOfMemoryException) { }
+        }
+
+        private void ObserveDirectRelayConnectedSafely(bool connected)
+        {
+            if (directShadowRuntime == null) return;
+            try { directShadowRuntime.ObserveRelayConnected(connected); }
+            catch (Exception error) when (error is not OutOfMemoryException) { }
+        }
+
+        private void NotifyDirectNetworkChangedSafely()
+        {
+            if (directShadowRuntime == null) return;
+            try { directShadowRuntime.NotifyNetworkChanged(); }
+            catch (Exception error) when (error is not OutOfMemoryException) { }
+        }
+
+        internal static void DispatchNetworkAvailabilityChange(
+            bool isAvailable,
+            Action notifyRelayNetworkAvailable,
+            Action notifyDirectNetworkChanged)
+        {
+            if (notifyRelayNetworkAvailable == null)
+                throw new ArgumentNullException(nameof(notifyRelayNetworkAvailable));
+            if (notifyDirectNetworkChanged == null)
+                throw new ArgumentNullException(nameof(notifyDirectNetworkChanged));
+
+            // Relay remains the authoritative, always-available recovery lane.
+            // Wake it before optional Direct work, which may be slow or fail.
+            if (isAvailable) notifyRelayNetworkAvailable();
+            try { notifyDirectNetworkChanged(); }
+            catch (Exception error) when (error is not OutOfMemoryException) { }
+        }
+
+        private async Task DisposeDirectShadowSafelyAsync()
+        {
+            if (directShadowRuntime == null) return;
+            try { await directShadowRuntime.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception error) when (error is not OutOfMemoryException) { }
+        }
+
+        private Task<string> GetDirectShadowAccessTokenAsync(CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            if (IsReauthenticationRequired)
+                throw new ProductionReauthenticationRequiredException();
+            // Optional Direct activity must not initiate shared refresh-token
+            // failure handling, because that path is allowed to abort Relay.
+            // The Relay lane remains the authority for credential renewal;
+            // Direct takes a read-only snapshot of the current access token.
+            return Task.FromResult(credentials.GetAccessToken());
         }
 
         private void QueuePersistedHistoryForReplay()
@@ -593,12 +733,10 @@ namespace TermLink.Agent
         public void RequestReconnect()
         {
             if (Volatile.Read(ref disposed) != 0 || IsReauthenticationRequired) return;
+            connectionSupervisor.RequestManualRetry();
             ClientWebSocket active;
             lock (lifecycleSync) active = socket;
             try { active?.Abort(); }
-            catch (ObjectDisposedException) { }
-            try { reconnectSignal.Release(); }
-            catch (SemaphoreFullException) { }
             catch (ObjectDisposedException) { }
             SetRelayState(ProductionRelayState.Connecting, string.Empty);
         }
@@ -695,17 +833,13 @@ namespace TermLink.Agent
 
         private async Task RunAsync()
         {
-            var consecutiveFailures = 0;
             while (!cancellation.IsCancellationRequested)
             {
-                var connectionGenerationBeforeAttempt =
-                    Interlocked.Read(ref successfulConnectionGeneration);
                 try
                 {
                     SetRelayState(ProductionRelayState.Connecting, string.Empty);
                     await EnsureRegisteredAsync(cancellation.Token).ConfigureAwait(false);
                     await ConnectAndPumpAsync(cancellation.Token).ConfigureAwait(false);
-                    consecutiveFailures = 0;
                 }
                 catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return; }
                 catch (ProductionReauthenticationRequiredException)
@@ -715,41 +849,16 @@ namespace TermLink.Agent
                     // periodic socket retries. Keep the actionable authentication
                     // state stable until the user explicitly retries or the login
                     // workflow replaces the runtime with fresh credentials.
-                    await reconnectSignal.WaitAsync(cancellation.Token).ConfigureAwait(false);
-                    consecutiveFailures = 0;
+                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellation.Token).ConfigureAwait(false);
                 }
                 catch (Exception error)
                 {
-                    if (Interlocked.Read(ref successfulConnectionGeneration) !=
-                        connectionGenerationBeforeAttempt)
-                    {
-                        // A healthy socket generation resets the backoff even if
-                        // it later disconnects by throwing from the pump.
-                        consecutiveFailures = 0;
-                    }
-                    consecutiveFailures = checked(consecutiveFailures + 1);
                     SetRelayState(ProductionRelayState.Reconnecting, ConnectionFailureCode(error));
-                    var jitterMilliseconds = RandomNumberGenerator.GetInt32(0, 500);
-                    var manuallyRetried = await WaitForRetryOrReconnectAsync(
-                        reconnectPreferences.DelayAfterFailure(consecutiveFailures) +
-                            TimeSpan.FromMilliseconds(jitterMilliseconds),
+                    var reconnect = connectionSupervisor.SchedulePhysicalFailure();
+                    await connectionSupervisor.WaitForRetryOrResumeAsync(
+                        reconnect.Delay,
                         cancellation.Token).ConfigureAwait(false);
-                    if (manuallyRetried) consecutiveFailures = 0;
                 }
-            }
-        }
-
-        private async Task<bool> WaitForRetryOrReconnectAsync(TimeSpan delay, CancellationToken token)
-        {
-            var deadline = DateTime.UtcNow.Add(delay);
-            while (true)
-            {
-                var remaining = deadline - DateTime.UtcNow;
-                if (remaining <= TimeSpan.Zero) return false;
-                var slice = remaining > TimeSpan.FromMilliseconds(250)
-                    ? TimeSpan.FromMilliseconds(250)
-                    : remaining;
-                if (await reconnectSignal.WaitAsync(slice, token).ConfigureAwait(false)) return true;
             }
         }
 
@@ -830,7 +939,7 @@ namespace TermLink.Agent
             {
                 ["id"] = credentials.DeviceId, ["type"] = deviceType, ["name"] = config.PcName,
                 ["signing_public_key"] = Base64Url(credentials.Identity.SigningPublicKey), ["exchange_public_key"] = Base64Url(credentials.Identity.Exchange.PublicKey),
-                ["key_id"] = "device-key-" + credentials.DeviceId.ToString("D")
+                ["key_id"] = DeviceKeyId(credentials.DeviceId)
             };
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(); var nonce = RandomNonce();
             var canonical = string.Join("\n", "TERMLINK-DEVICE-REGISTER-V1", credentials.DeviceId.ToString("D"), deviceType, config.PcName,
@@ -1162,6 +1271,8 @@ namespace TermLink.Agent
                             "Production Relay connection or welcome timed out.");
                     }
                 }
+                var connectionGeneration = connectionSupervisor.MarkPhysicalConnected();
+                ObserveDirectRelayConnectedSafely(true);
                 SetRelayState(ProductionRelayState.Connected, string.Empty);
                 // A coalesced signal may have been consumed by the previous
                 // sender just before its socket failed. Re-enumerate every local
@@ -1173,6 +1284,9 @@ namespace TermLink.Agent
                 {
                     var receiver = ReceiveLoopAsync(active, pumpCancellation.Token);
                     var sender = PublishLoopAsync(active, pumpCancellation.Token);
+                    var stableConnection = MarkConnectionStableAfterDelayAsync(
+                        connectionGeneration,
+                        pumpCancellation.Token);
                     try
                     {
                         await Task.WhenAny(receiver, sender).ConfigureAwait(false);
@@ -1180,7 +1294,7 @@ namespace TermLink.Agent
                     finally
                     {
                         pumpCancellation.Cancel();
-                        try { await Task.WhenAll(receiver, sender).ConfigureAwait(false); }
+                        try { await Task.WhenAll(receiver, sender, stableConnection).ConfigureAwait(false); }
                         catch (OperationCanceledException) when (token.IsCancellationRequested || pumpCancellation.IsCancellationRequested) { }
                     }
                 }
@@ -1212,9 +1326,21 @@ namespace TermLink.Agent
                     if (ReferenceEquals(socket, active)) socket = null;
                 }
                 active.Dispose();
+                connectionSupervisor.MarkPhysicalDisconnected();
+                ObserveDirectRelayConnectedSafely(false);
                 ClearRealtimeConnectionState();
                 if (!token.IsCancellationRequested) SetRelayState(ProductionRelayState.Reconnecting, "RELAY_DISCONNECTED");
             }
+        }
+
+        private async Task MarkConnectionStableAfterDelayAsync(
+            long connectionGeneration,
+            CancellationToken token)
+        {
+            await Task.Delay(
+                ProductionRealtimeConnectionSupervisor.DefaultStableConnectionDuration,
+                token).ConfigureAwait(false);
+            connectionSupervisor.TryMarkPhysicalGenerationStable(connectionGeneration);
         }
 
         private async Task RefreshStatusAsync(CancellationToken token)
@@ -1374,16 +1500,13 @@ namespace TermLink.Agent
                 state = ProductionRelayState.Failed;
                 errorCode = "ACCOUNT_REAUTH_REQUIRED";
             }
-            var connected = false;
             lock (statusSync)
             {
-                connected = state == ProductionRelayState.Connected && relayState != ProductionRelayState.Connected;
                 relayState = state;
                 relayErrorCode = errorCode ?? string.Empty;
                 if (state == ProductionRelayState.Connected) lastConnectedAtUtc = DateTime.UtcNow;
             }
-            if (!connected) return;
-            Interlocked.Increment(ref successfulConnectionGeneration);
+            if (state != ProductionRelayState.Connected) return;
             // Re-publish every encrypted directory title after a successful
             // Relay generation. The Server row is durable, but this heals
             // cleanup/failover races and ensures a quiet session does not need
@@ -1409,6 +1532,8 @@ namespace TermLink.Agent
                 await Task.Delay(TimeSpan.FromMilliseconds(10), token).ConfigureAwait(false);
                 foreach (var pending in pendingSessions)
                 {
+                    try
+                    {
                     var terminalPublished = false;
                     ulong resumeFrom;
                     publishedSequences.TryGetValue(pending.Key, out resumeFrom);
@@ -1472,6 +1597,12 @@ namespace TermLink.Agent
                         try { eventSignal.Release(); }
                         catch (SemaphoreFullException) { }
                         catch (ObjectDisposedException) { }
+                    }
+                    }
+                    catch (Exception error) when (
+                        ProductionSessionRouteFaultBoundary.IsSessionLocal(error, token))
+                    {
+                        HandleSessionPublicationFault(pending.Key, pending.Value);
                     }
                 }
             }
@@ -2145,10 +2276,16 @@ namespace TermLink.Agent
                 string.Equals(previous, state, StringComparison.Ordinal))
                 return;
             terminalCoreShadowStates[sessionId] = state;
+            if (string.Equals(result.Status, "SHADOW_RETIRED", StringComparison.Ordinal))
+            {
+                // terminal-core is a session renderer concern. Recording it as
+                // a soft failure must never mutate the physical Relay lifetime.
+                connectionSupervisor.ObserveSessionSoftFailure();
+            }
             try
             {
                 var root = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    ProductionAccountStorage.ResolveLocalApplicationDataRoot(),
                     "TermLink",
                     "logs");
                 Directory.CreateDirectory(root);
@@ -2725,27 +2862,74 @@ namespace TermLink.Agent
 
         private async Task ReceiveLoopAsync(ClientWebSocket active, CancellationToken token)
         {
-            var buffer = new byte[1024 * 1024];
+            // The physical socket pump owns only WebSocket I/O. A malformed,
+            // oversized or non-binary application frame is drained and retired
+            // locally; it must not replace an otherwise healthy Relay
+            // generation. Keeping the fragment buffer small also prevents one
+            // rejected frame from reserving the full envelope limit forever.
+            var buffer = new byte[64 * 1024];
             while (active.State == WebSocketState.Open)
             {
-                using var stream = new MemoryStream(); WebSocketReceiveResult part;
-                do { part = await active.ReceiveAsync(buffer, token).ConfigureAwait(false); if (part.MessageType == WebSocketMessageType.Close) return; stream.Write(buffer, 0, part.Count); if (stream.Length > buffer.Length) throw new InvalidDataException("Relay frame exceeds limit."); } while (!part.EndOfMessage);
-                if (part.MessageType != WebSocketMessageType.Binary) throw new InvalidDataException("Binary Envelope required.");
-                var envelope = Envelope.Parser.ParseFrom(stream.ToArray());
-                await HandleIncomingAsync(active, envelope, token).ConfigureAwait(false);
+                using var stream = new MemoryStream();
+                WebSocketReceiveResult part;
+                WebSocketMessageType? messageType = null;
+                var rejected = false;
+                do
+                {
+                    // Exceptions and Close frames here are physical Relay
+                    // failures. Payload validation starts only after this read.
+                    part = await active.ReceiveAsync(buffer, token).ConfigureAwait(false);
+                    if (part.MessageType == WebSocketMessageType.Close) return;
+                    messageType ??= part.MessageType;
+                    if (part.MessageType != messageType || part.MessageType != WebSocketMessageType.Binary)
+                    {
+                        rejected = true;
+                    }
+                    if (!rejected && stream.Length + part.Count <= MaxRealtimeEnvelopeBytes)
+                    {
+                        stream.Write(buffer, 0, part.Count);
+                    }
+                    else
+                    {
+                        rejected = true;
+                    }
+                }
+                while (!part.EndOfMessage);
+
+                if (rejected || stream.Length == 0)
+                {
+                    connectionSupervisor.ObserveSessionSoftFailure();
+                    continue;
+                }
+                try
+                {
+                    var envelope = Envelope.Parser.ParseFrom(stream.ToArray());
+                    await HandleIncomingAsync(active, envelope, token).ConfigureAwait(false);
+                }
+                catch (Exception error) when (
+                    ProductionSessionRouteFaultBoundary.IsSessionLocal(error, token))
+                {
+                    // The protobuf may be too damaged to locate a session. It is
+                    // still application data, not evidence that WSS I/O failed.
+                    connectionSupervisor.ObserveSessionSoftFailure();
+                }
             }
         }
 
         private async Task HandleIncomingAsync(ClientWebSocket active, Envelope envelope, CancellationToken token)
         {
-            if (envelope.ProtocolVersion != 1 || envelope.Direction != Direction.AndroidToPc ||
-                envelope.Seq == 0 || envelope.Nonce.Length != 12 || envelope.Ciphertext.Length < 16)
-            {
-                throw new InvalidDataException("Envelope metadata is invalid.");
-            }
-            if (!GuidFromBytes(envelope.RecipientDeviceId.Span).Equals(credentials.DeviceId)) throw new InvalidDataException("Envelope recipient mismatch.");
             var senderId = GuidFromBytes(envelope.SenderDeviceId.Span); var sessionId = GuidFromBytes(envelope.SessionId.Span);
-            Subscriber subscriber;
+            if (senderId == Guid.Empty || sessionId == Guid.Empty)
+                throw new InvalidDataException("Envelope route identity is invalid.");
+            Subscriber subscriber = null;
+            await ProductionSessionRouteFaultBoundary.ExecuteAsync(async () =>
+            {
+            if (envelope.ProtocolVersion != 1 || envelope.Direction != Direction.AndroidToPc)
+                throw new InvalidDataException("Envelope metadata is invalid.");
+            if (!GuidFromBytes(envelope.RecipientDeviceId.Span).Equals(credentials.DeviceId))
+                throw new InvalidDataException("Envelope recipient mismatch.");
+            if (envelope.Seq == 0 || envelope.Nonce.Length != 12 || envelope.Ciphertext.Length < 16)
+                throw new InvalidDataException("Located session Envelope metadata is invalid.");
             if (envelope.MessageType == MessageType.Subscribe)
             {
                 subscriber = await GetSubscriberAsync(sessionId, senderId, token, true).ConfigureAwait(false);
@@ -2807,6 +2991,7 @@ namespace TermLink.Agent
                         sessionId,
                         subscriber,
                         subscribe.ResumeFromSeq,
+                        beginSubscribeGeneration: true,
                         token).ConfigureAwait(false);
                     return;
                 }
@@ -2827,7 +3012,13 @@ namespace TermLink.Agent
                     }
                     if (TakeSubscriberDrainRequest(subscriber))
                     {
-                        await ReplaySubscriberAsync(active, sessionId, subscriber, acknowledgement.HighestContiguousSeq, token).ConfigureAwait(false);
+                        await ReplaySubscriberAsync(
+                            active,
+                            sessionId,
+                            subscriber,
+                            acknowledgement.HighestContiguousSeq,
+                            beginSubscribeGeneration: false,
+                            token).ConfigureAwait(false);
                     }
                     return;
                 }
@@ -2844,7 +3035,13 @@ namespace TermLink.Agent
                     }
                     if (TakeSubscriberDrainRequest(subscriber))
                     {
-                        await ReplaySubscriberAsync(active, sessionId, subscriber, flow.HighestContiguousSeq, token).ConfigureAwait(false);
+                        await ReplaySubscriberAsync(
+                            active,
+                            sessionId,
+                            subscriber,
+                            flow.HighestContiguousSeq,
+                            beginSubscribeGeneration: false,
+                            token).ConfigureAwait(false);
                     }
                     return;
                 }
@@ -2929,6 +3126,8 @@ namespace TermLink.Agent
                 CryptographicOperations.ZeroMemory(sessionKey);
                 if (plaintext != null) CryptographicOperations.ZeroMemory(plaintext);
             }
+            }, error => HandleLocatedSessionFault(sessionId, senderId, subscriber), token)
+                .ConfigureAwait(false);
         }
 
         internal static bool TryParseSessionTerminateRequest(byte[] plaintext, out Guid requestId)
@@ -3479,11 +3678,12 @@ namespace TermLink.Agent
                     foreach (var item in authorizedKeys)
                     {
                         retained.Add(item.Key);
-                        var candidate = CreateAuthorizedSubscriber(
+                        var candidate = CreateAuthorizedSubscriberWithSigningKey(
                             credentials.Identity.Exchange,
                             credentials.DeviceId,
                             item.Key,
-                            item.Value,
+                            item.Value.ExchangePublicKey,
+                            item.Value.SigningPublicKey,
                             keyEpoch);
                         if (authorizedRecipients.TryGetValue(item.Key, out var existing) &&
                             SubscriberAuthorityMatches(existing, candidate))
@@ -3510,7 +3710,7 @@ namespace TermLink.Agent
                 }
                 finally
                 {
-                    foreach (var publicKey in authorizedKeys.Values) CryptographicOperations.ZeroMemory(publicKey);
+                    foreach (var keyMaterial in authorizedKeys.Values) keyMaterial.Dispose();
                 }
                 if (historyAuthorityChanged)
                 {
@@ -3535,7 +3735,7 @@ namespace TermLink.Agent
             catch (ObjectDisposedException) { }
         }
 
-        private static Dictionary<Guid, byte[]> ParseAuthorizedRecipientKeys(
+        private static Dictionary<Guid, AuthorizedRecipientKeyMaterial> ParseAuthorizedRecipientKeys(
             JsonElement root,
             long minimumKeyEpoch,
             out long keyEpoch)
@@ -3553,30 +3753,45 @@ namespace TermLink.Agent
             // production automatic-account mode these entries are the Server's
             // complete authorized recipient set. Permission/grant provenance is
             // deliberately not a client-side subscription gate.
-            var authorizedKeys = new Dictionary<Guid, byte[]>();
+            var authorizedKeys = new Dictionary<Guid, AuthorizedRecipientKeyMaterial>();
             try
             {
                 foreach (var item in items.EnumerateArray())
                 {
                     if (!string.Equals(item.GetProperty("device_type").GetString(), "ANDROID", StringComparison.Ordinal)) continue;
                     var deviceId = item.GetProperty("device_id").GetGuid();
-                    byte[] publicKey;
+                    byte[] exchangePublicKey = null;
+                    byte[] signingPublicKey = null;
                     try
                     {
-                        publicKey = Convert.FromBase64String(item.GetProperty("exchange_public_key").GetString());
+                        exchangePublicKey = Convert.FromBase64String(
+                            item.GetProperty("exchange_public_key").GetString());
+                        signingPublicKey = Convert.FromBase64String(
+                            item.GetProperty("signing_public_key").GetString());
                     }
-                    catch (Exception error) when (error is FormatException || error is ArgumentNullException)
+                    catch (Exception error) when (
+                        error is FormatException or ArgumentNullException or
+                            KeyNotFoundException or InvalidOperationException)
                     {
-                        throw new InvalidDataException("PC recipient exchange key is invalid.", error);
+                        if (exchangePublicKey != null)
+                            CryptographicOperations.ZeroMemory(exchangePublicKey);
+                        if (signingPublicKey != null)
+                            CryptographicOperations.ZeroMemory(signingPublicKey);
+                        throw new InvalidDataException("PC recipient authorization keys are invalid.", error);
                     }
-                    if (publicKey.Length != 32 || deviceId == Guid.Empty)
+                    if (exchangePublicKey.Length != 32 || signingPublicKey.Length != 32 ||
+                        deviceId == Guid.Empty)
                     {
-                        CryptographicOperations.ZeroMemory(publicKey);
-                        throw new InvalidDataException("PC recipient exchange key is invalid.");
+                        CryptographicOperations.ZeroMemory(exchangePublicKey);
+                        CryptographicOperations.ZeroMemory(signingPublicKey);
+                        throw new InvalidDataException("PC recipient authorization keys are invalid.");
                     }
-                    if (!authorizedKeys.TryAdd(deviceId, publicKey))
+                    var keyMaterial = new AuthorizedRecipientKeyMaterial(
+                        exchangePublicKey,
+                        signingPublicKey);
+                    if (!authorizedKeys.TryAdd(deviceId, keyMaterial))
                     {
-                        CryptographicOperations.ZeroMemory(publicKey);
+                        keyMaterial.Dispose();
                         throw new InvalidDataException("PC recipient snapshot contains a duplicate device.");
                     }
                 }
@@ -3584,9 +3799,50 @@ namespace TermLink.Agent
             }
             catch
             {
-                foreach (var publicKey in authorizedKeys.Values) CryptographicOperations.ZeroMemory(publicKey);
+                foreach (var keyMaterial in authorizedKeys.Values) keyMaterial.Dispose();
                 throw;
             }
+        }
+
+        private Task<IReadOnlyList<ProductionDirectPeerAuthorization>>
+            SnapshotDirectPeerAuthorizationsAsync(CancellationToken token)
+        {
+            if (token.IsCancellationRequested)
+                return Task.FromCanceled<IReadOnlyList<ProductionDirectPeerAuthorization>>(token);
+            var result = new List<ProductionDirectPeerAuthorization>();
+            try
+            {
+                foreach (var item in authorizedRecipients.OrderBy(value => value.Key))
+                {
+                    lock (item.Value.Sync)
+                    {
+                        if (item.Value.Removed || item.Value.PairwiseKey?.Length != 32 ||
+                            item.Value.SigningPublicKey?.Length != 32 ||
+                            item.Value.KeyEpoch != config.KeyEpoch)
+                        {
+                            continue;
+                        }
+                        result.Add(new ProductionDirectPeerAuthorization(
+                            item.Value.DeviceId,
+                            item.Value.PairwiseKey,
+                            item.Value.SigningPublicKey,
+                            item.Value.KeyEpoch));
+                    }
+                }
+                return Task.FromResult<IReadOnlyList<ProductionDirectPeerAuthorization>>(
+                    result.AsReadOnly());
+            }
+            catch
+            {
+                foreach (var value in result) value.Dispose();
+                throw;
+            }
+        }
+
+        internal static string DeviceKeyId(Guid deviceId)
+        {
+            if (deviceId == Guid.Empty) throw new ArgumentException("Device ID is required.", nameof(deviceId));
+            return "device-key-" + deviceId.ToString("D");
         }
 
         private static Subscriber CreateAuthorizedSubscriber(
@@ -3596,19 +3852,41 @@ namespace TermLink.Agent
             byte[] exchangePublicKey,
             long keyEpoch)
         {
+            return CreateAuthorizedSubscriberWithSigningKey(
+                localExchange,
+                pcDeviceId,
+                recipientDeviceId,
+                exchangePublicKey,
+                signingPublicKey: null,
+                keyEpoch);
+        }
+
+        private static Subscriber CreateAuthorizedSubscriberWithSigningKey(
+            DeviceExchangeKeyPair localExchange,
+            Guid pcDeviceId,
+            Guid recipientDeviceId,
+            byte[] exchangePublicKey,
+            byte[] signingPublicKey,
+            long keyEpoch)
+        {
             if (localExchange == null) throw new ArgumentNullException(nameof(localExchange));
             if (pcDeviceId == Guid.Empty || recipientDeviceId == Guid.Empty || pcDeviceId == recipientDeviceId)
                 throw new InvalidDataException("PC recipient identity is invalid.");
-            if (exchangePublicKey == null || exchangePublicKey.Length != 32 || keyEpoch < 1)
+            if (exchangePublicKey == null || exchangePublicKey.Length != 32 ||
+                (signingPublicKey != null && signingPublicKey.Length != 32) || keyEpoch < 1)
                 throw new InvalidDataException("PC recipient authorization key is invalid.");
 
             var retainedPublicKey = (byte[])exchangePublicKey.Clone();
+            var retainedSigningPublicKey = signingPublicKey == null
+                ? null
+                : (byte[])signingPublicKey.Clone();
             try
             {
                 return new Subscriber
                 {
                     DeviceId = recipientDeviceId,
                     ExchangePublicKey = retainedPublicKey,
+                    SigningPublicKey = retainedSigningPublicKey,
                     PairwiseKey = SessionCrypto.DerivePairwiseKey(
                         localExchange,
                         retainedPublicKey,
@@ -3622,6 +3900,8 @@ namespace TermLink.Agent
             catch
             {
                 CryptographicOperations.ZeroMemory(retainedPublicKey);
+                if (retainedSigningPublicKey != null)
+                    CryptographicOperations.ZeroMemory(retainedSigningPublicKey);
                 throw;
             }
         }
@@ -3631,6 +3911,7 @@ namespace TermLink.Agent
             Guid sessionId,
             Subscriber subscriber,
             ulong resumeFromSequence,
+            bool beginSubscribeGeneration,
             CancellationToken token)
         {
             // Publish a lightweight replay barrier while holding the socket
@@ -3643,18 +3924,17 @@ namespace TermLink.Agent
             try
             {
                 subscriber = RememberSubscriber(sessionId, subscriber);
-                if (!ResetSubscriberCursor(subscriber, resumeFromSequence))
-                    throw new InvalidDataException("Subscribe cursor regressed below the durable acknowledgement.");
-                lock (subscriber.Sync)
+                if (!TryPrepareSubscriberReplay(
+                    subscriber,
+                    resumeFromSequence,
+                    beginSubscribeGeneration,
+                    out maximumEvents,
+                    out maximumStoredBytes))
                 {
-                    if (subscriber.Removed) throw new InvalidDataException("Subscriber is no longer active.");
-                    subscriber.ReplayInProgress = true;
-                    var remainingEvents = subscriber.FlowWindowEvents - subscriber.SentFrames.Count;
-                    var remainingBytes = subscriber.FlowWindowWireBytes > subscriber.InFlightWireBytes
-                        ? subscriber.FlowWindowWireBytes - subscriber.InFlightWireBytes
-                        : 0;
-                    maximumEvents = Math.Max(1, remainingEvents);
-                    maximumStoredBytes = checked((long)Math.Max(1UL, remainingBytes));
+                    throw new InvalidDataException(
+                        beginSubscribeGeneration
+                            ? "Subscribe cursor regressed below the durable acknowledgement."
+                            : "Subscriber replay cursor does not match the current acknowledgement.");
                 }
             }
             finally { socketSendGate.Release(); }
@@ -3795,6 +4075,35 @@ namespace TermLink.Agent
             out bool alreadyDelivered,
             out bool canEncrypt)
         {
+            return GetSubscriberFrameOrState(
+                subscriber,
+                sequence,
+                reserveForCurrentGeneration: false,
+                out alreadyDelivered,
+                out canEncrypt);
+        }
+
+        private static byte[] PrepareCachedSubscriberFrameForSend(
+            Subscriber subscriber,
+            ulong sequence,
+            out bool alreadyDelivered,
+            out bool canEncrypt)
+        {
+            return GetSubscriberFrameOrState(
+                subscriber,
+                sequence,
+                reserveForCurrentGeneration: true,
+                out alreadyDelivered,
+                out canEncrypt);
+        }
+
+        private static byte[] GetSubscriberFrameOrState(
+            Subscriber subscriber,
+            ulong sequence,
+            bool reserveForCurrentGeneration,
+            out bool alreadyDelivered,
+            out bool canEncrypt)
+        {
             alreadyDelivered = false;
             canEncrypt = false;
             if (subscriber == null) return null;
@@ -3807,18 +4116,37 @@ namespace TermLink.Agent
                     alreadyDelivered = true;
                     return null;
                 }
-                if (subscriber.ReplayInProgress || subscriber.FlowPaused ||
-                    subscriber.SentFrames.Count >= subscriber.FlowWindowEvents ||
-                    subscriber.InFlightWireBytes >= subscriber.FlowWindowWireBytes)
+                if (!reserveForCurrentGeneration &&
+                    subscriber.SentFrames.TryGetValue(sequence, out var inspected))
                 {
-                    // A frame that would exceed the absolute window remains
-                    // in the durable Registry buffer for a later drain.
+                    return (byte[])inspected.Clone();
+                }
+                if (subscriber.ReplayInProgress || subscriber.FlowPaused)
+                {
                     subscriber.DrainRequested = true;
                     alreadyDelivered = false;
                     return null;
                 }
                 if (subscriber.SentFrames.TryGetValue(sequence, out var existing))
+                {
+                    if (!TryReserveSubscriberGenerationFrameLocked(
+                        subscriber,
+                        sequence,
+                        checked((ulong)existing.Length)))
+                    {
+                        subscriber.DrainRequested = true;
+                        return null;
+                    }
                     return (byte[])existing.Clone();
+                }
+                if (!SubscriberGenerationHasCapacityLocked(subscriber, 0))
+                {
+                    // A new frame that would exceed the current generation's
+                    // absolute window remains in the durable Registry buffer.
+                    subscriber.DrainRequested = true;
+                    alreadyDelivered = false;
+                    return null;
+                }
                 canEncrypt = true;
                 return null;
             }
@@ -3832,9 +4160,7 @@ namespace TermLink.Agent
                 if (subscriber.Removed) return null;
                 PruneSubscriberFramesLocked(subscriber);
                 if (sequence <= subscriber.HighestAck) return null;
-                if (subscriber.FlowPaused ||
-                    subscriber.SentFrames.Count >= subscriber.FlowWindowEvents ||
-                    subscriber.InFlightWireBytes + (ulong)serialized.Length > subscriber.FlowWindowWireBytes)
+                if (subscriber.FlowPaused)
                 {
                     subscriber.DrainRequested = true;
                     return null;
@@ -3843,13 +4169,53 @@ namespace TermLink.Agent
                 {
                     if (!CryptographicOperations.FixedTimeEquals(existing, serialized))
                         throw new InvalidDataException("same sequence produced different ciphertext");
+                    if (!TryReserveSubscriberGenerationFrameLocked(
+                        subscriber,
+                        sequence,
+                        checked((ulong)existing.Length)))
+                    {
+                        subscriber.DrainRequested = true;
+                        return null;
+                    }
                     return (byte[])existing.Clone();
+                }
+                if (!TryReserveSubscriberGenerationFrameLocked(
+                    subscriber,
+                    sequence,
+                    checked((ulong)serialized.Length)))
+                {
+                    subscriber.DrainRequested = true;
+                    return null;
                 }
                 var retained = (byte[])serialized.Clone();
                 subscriber.SentFrames.Add(sequence, retained);
-                subscriber.InFlightWireBytes += (ulong)retained.Length;
                 return (byte[])serialized.Clone();
             }
+        }
+
+        private static bool SubscriberGenerationHasCapacityLocked(
+            Subscriber subscriber,
+            ulong additionalWireBytes)
+        {
+            if (subscriber.GenerationInFlightSequences.Count >= subscriber.FlowWindowEvents ||
+                subscriber.InFlightWireBytes >= subscriber.FlowWindowWireBytes)
+            {
+                return false;
+            }
+            return additionalWireBytes <=
+                subscriber.FlowWindowWireBytes - subscriber.InFlightWireBytes;
+        }
+
+        private static bool TryReserveSubscriberGenerationFrameLocked(
+            Subscriber subscriber,
+            ulong sequence,
+            ulong wireBytes)
+        {
+            if (subscriber.GenerationInFlightSequences.Contains(sequence)) return true;
+            if (!SubscriberGenerationHasCapacityLocked(subscriber, wireBytes)) return false;
+            subscriber.GenerationInFlightSequences.Add(sequence);
+            subscriber.InFlightWireBytes = checked(subscriber.InFlightWireBytes + wireBytes);
+            return true;
         }
 
         private static void PruneSubscriberFramesLocked(Subscriber subscriber)
@@ -3859,9 +4225,12 @@ namespace TermLink.Agent
                 var first = subscriber.SentFrames.First();
                 if (first.Key > subscriber.HighestAck) break;
                 subscriber.SentFrames.Remove(first.Key);
-                subscriber.InFlightWireBytes = subscriber.InFlightWireBytes >= (ulong)first.Value.Length
-                    ? subscriber.InFlightWireBytes - (ulong)first.Value.Length
-                    : 0;
+                if (subscriber.GenerationInFlightSequences.Remove(first.Key))
+                {
+                    subscriber.InFlightWireBytes = subscriber.InFlightWireBytes >= (ulong)first.Value.Length
+                        ? subscriber.InFlightWireBytes - (ulong)first.Value.Length
+                        : 0;
+                }
                 CryptographicOperations.ZeroMemory(first.Value);
             }
         }
@@ -3886,7 +4255,11 @@ namespace TermLink.Agent
 
         private async Task<bool> SendEncryptedCoreAsync(ClientWebSocket active, Guid sessionId, Subscriber subscriber, MessageType type, Direction direction, ulong sequence, byte[] plaintext, CancellationToken token)
         {
-            var cached = GetCachedSubscriberFrameOrState(subscriber, sequence, out var alreadyDelivered, out var canEncrypt);
+            var cached = PrepareCachedSubscriberFrameForSend(
+                subscriber,
+                sequence,
+                out var alreadyDelivered,
+                out var canEncrypt);
             if (alreadyDelivered) return true;
             if (!canEncrypt && cached == null) return false;
             if (cached != null)
@@ -3989,9 +4362,23 @@ namespace TermLink.Agent
             }
             catch (OperationCanceledException) when (!token.IsCancellationRequested)
             {
-                throw new WebSocketException(
-                    WebSocketError.ConnectionClosedPrematurely,
-                    "Production Relay send timed out.");
+                throw new ProductionPhysicalRealtimeException(
+                    "Production Relay send timed out.",
+                    new WebSocketException(WebSocketError.ConnectionClosedPrematurely));
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception error) when (
+                error is not ProductionPhysicalRealtimeException &&
+                error is not OutOfMemoryException &&
+                error is not StackOverflowException &&
+                error is not AccessViolationException)
+            {
+                throw new ProductionPhysicalRealtimeException(
+                    "Production Relay send failed.",
+                    error);
             }
         }
 
@@ -4226,7 +4613,14 @@ namespace TermLink.Agent
             {
                 return !left.Removed && !right.Removed && left.KeyEpoch == right.KeyEpoch &&
                     left.ExchangePublicKey != null && right.ExchangePublicKey != null &&
-                    CryptographicOperations.FixedTimeEquals(left.ExchangePublicKey, right.ExchangePublicKey);
+                    CryptographicOperations.FixedTimeEquals(
+                        left.ExchangePublicKey,
+                        right.ExchangePublicKey) &&
+                    ((left.SigningPublicKey == null && right.SigningPublicKey == null) ||
+                        (left.SigningPublicKey != null && right.SigningPublicKey != null &&
+                            CryptographicOperations.FixedTimeEquals(
+                                left.SigningPublicKey,
+                                right.SigningPublicKey)));
             }
         }
 
@@ -4242,17 +4636,61 @@ namespace TermLink.Agent
         {
             lock (subscriber.Sync)
             {
-                if (subscriber.Removed || resumeFromSequence < subscriber.HighestAck) return false;
-                subscriber.HighestAck = resumeFromSequence;
-                PruneSubscriberFramesLocked(subscriber);
-                if (subscriber.LastSentSequence < resumeFromSequence)
-                    subscriber.LastSentSequence = resumeFromSequence;
-                // FLOW_CONTROL epochs are scoped to one authenticated
-                // SUBSCRIBE generation. Keep the retained pause/window state
-                // until the new generation explicitly supersedes it, while
-                // allowing that generation to restart at epoch 1.
-                subscriber.FlowControlEpoch = 0;
-                subscriber.LastActivityUtc = DateTime.UtcNow;
+                return ResetSubscriberCursorLocked(subscriber, resumeFromSequence);
+            }
+        }
+
+        private static bool ResetSubscriberCursorLocked(
+            Subscriber subscriber,
+            ulong resumeFromSequence)
+        {
+            if (subscriber.Removed || resumeFromSequence < subscriber.HighestAck) return false;
+            subscriber.HighestAck = resumeFromSequence;
+            PruneSubscriberFramesLocked(subscriber);
+            if (subscriber.LastSentSequence < resumeFromSequence)
+                subscriber.LastSentSequence = resumeFromSequence;
+            // FLOW_CONTROL epochs are scoped to one authenticated SUBSCRIBE
+            // generation. Retain byte-identical ciphertext until ACK, but reset
+            // the old generation's delivery budget and stop sends until a fresh
+            // FLOW_CONTROL explicitly opens a window.
+            subscriber.GenerationInFlightSequences.Clear();
+            subscriber.InFlightWireBytes = 0;
+            subscriber.FlowPaused = true;
+            subscriber.FlowWindowEvents = DefaultFlowWindowEvents;
+            subscriber.FlowWindowWireBytes = DefaultFlowWindowWireBytes;
+            subscriber.FlowControlEpoch = 0;
+            subscriber.LastActivityUtc = DateTime.UtcNow;
+            return true;
+        }
+
+        private static bool TryPrepareSubscriberReplay(
+            Subscriber subscriber,
+            ulong resumeFromSequence,
+            bool beginSubscribeGeneration,
+            out int maximumEvents,
+            out long maximumStoredBytes)
+        {
+            maximumEvents = 0;
+            maximumStoredBytes = 0;
+            if (subscriber == null) return false;
+            lock (subscriber.Sync)
+            {
+                if (beginSubscribeGeneration)
+                {
+                    if (!ResetSubscriberCursorLocked(subscriber, resumeFromSequence)) return false;
+                }
+                else if (subscriber.Removed || resumeFromSequence != subscriber.HighestAck)
+                {
+                    return false;
+                }
+                subscriber.ReplayInProgress = true;
+                var remainingEvents = subscriber.FlowWindowEvents -
+                    subscriber.GenerationInFlightSequences.Count;
+                var remainingBytes = subscriber.FlowWindowWireBytes > subscriber.InFlightWireBytes
+                    ? subscriber.FlowWindowWireBytes - subscriber.InFlightWireBytes
+                    : 0;
+                maximumEvents = Math.Max(1, remainingEvents);
+                maximumStoredBytes = checked((long)Math.Max(1UL, remainingBytes));
                 return true;
             }
         }
@@ -4311,7 +4749,7 @@ namespace TermLink.Agent
             lock (subscriber.Sync)
             {
                 if (subscriber.Removed || subscriber.FlowPaused || !subscriber.DrainRequested ||
-                    subscriber.SentFrames.Count >= subscriber.FlowWindowEvents ||
+                    subscriber.GenerationInFlightSequences.Count >= subscriber.FlowWindowEvents ||
                     subscriber.InFlightWireBytes >= subscriber.FlowWindowWireBytes)
                     return false;
                 subscriber.DrainRequested = false;
@@ -4338,6 +4776,62 @@ namespace TermLink.Agent
             return true;
         }
 
+        private void HandleLocatedSessionFault(
+            Guid sessionId,
+            Guid deviceId,
+            Subscriber expected)
+        {
+            connectionSupervisor.ObserveSessionSoftFailure();
+            RetireLocatedSessionRoute(sessionId, deviceId, expected);
+        }
+
+        private void RetireLocatedSessionRoute(
+            Guid sessionId,
+            Guid deviceId,
+            Subscriber expected)
+        {
+            var routeKey = SubscriberRouteKey(sessionId, deviceId);
+            var target = expected;
+            if (target == null && connectionSubscriberRoutes.TryGetValue(routeKey, out var routed))
+                target = routed;
+            if (target == null && subscribers.TryGetValue(sessionId, out var sessionSubscribers))
+                sessionSubscribers.TryGetValue(deviceId, out target);
+            if (target == null) return;
+
+            DetachSubscriber(sessionId, deviceId, target);
+            ((ICollection<KeyValuePair<string, Subscriber>>)connectionSubscriberRoutes).Remove(
+                new KeyValuePair<string, Subscriber>(routeKey, target));
+            RetireSubscriber(target);
+        }
+
+        private void HandleSessionPublicationFault(Guid sessionId, PendingSession expected)
+        {
+            connectionSupervisor.ObserveSessionSoftFailure();
+            if (TryRemovePending(sessionId, expected)) RemovePublishedSequence(sessionId);
+            RetireSessionRoutes(sessionId);
+        }
+
+        private void RetireSessionRoutes(Guid sessionId)
+        {
+            var retained = new HashSet<Subscriber>();
+            if (subscribers.TryRemove(sessionId, out var sessionSubscribers))
+            {
+                foreach (var subscriber in sessionSubscribers.Values)
+                    retained.Add(subscriber);
+                sessionSubscribers.Clear();
+            }
+            var routePrefix = sessionId.ToString("N") + ":";
+            foreach (var route in connectionSubscriberRoutes)
+            {
+                if (!route.Key.StartsWith(routePrefix, StringComparison.Ordinal) ||
+                    !((ICollection<KeyValuePair<string, Subscriber>>)connectionSubscriberRoutes)
+                        .Remove(route))
+                    continue;
+                retained.Add(route.Value);
+            }
+            foreach (var subscriber in retained) RetireSubscriber(subscriber);
+        }
+
         private void ClearSubscriberRoutesForDevice(Guid deviceId)
         {
             foreach (var route in connectionSubscriberRoutes)
@@ -4355,6 +4849,7 @@ namespace TermLink.Agent
         {
             if (subscriber == null) return;
             byte[] exchangePublicKey;
+            byte[] signingPublicKey;
             byte[] pairwiseKey;
             List<byte[]> sentFrames;
             lock (subscriber.Sync)
@@ -4362,14 +4857,18 @@ namespace TermLink.Agent
                 if (subscriber.Removed) return;
                 subscriber.Removed = true;
                 exchangePublicKey = subscriber.ExchangePublicKey;
+                signingPublicKey = subscriber.SigningPublicKey;
                 pairwiseKey = subscriber.PairwiseKey;
                 subscriber.ExchangePublicKey = null;
+                subscriber.SigningPublicKey = null;
                 subscriber.PairwiseKey = null;
                 sentFrames = subscriber.SentFrames.Values.ToList();
                 subscriber.SentFrames.Clear();
+                subscriber.GenerationInFlightSequences.Clear();
                 subscriber.InFlightWireBytes = 0;
             }
             if (exchangePublicKey != null) CryptographicOperations.ZeroMemory(exchangePublicKey);
+            if (signingPublicKey != null) CryptographicOperations.ZeroMemory(signingPublicKey);
             if (pairwiseKey != null) CryptographicOperations.ZeroMemory(pairwiseKey);
             foreach (var frame in sentFrames) CryptographicOperations.ZeroMemory(frame);
         }
@@ -4533,8 +5032,18 @@ namespace TermLink.Agent
         internal void StopAccountSynchronization()
         {
             if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+            var availabilityHandler = Interlocked.Exchange(ref networkAvailabilityHandler, null);
+            if (availabilityHandler != null)
+                NetworkChange.NetworkAvailabilityChanged -= availabilityHandler;
+            var addressHandler = Interlocked.Exchange(ref networkAddressHandler, null);
+            if (addressHandler != null)
+                NetworkChange.NetworkAddressChanged -= addressHandler;
             SetRelayState(ProductionRelayState.Stopped, string.Empty);
             cancellation.Cancel();
+            connectionSupervisor.MarkPhysicalDisconnected();
+            ObserveDirectRelayConnectedSafely(false);
+            if (directShadowRuntime != null)
+                directShadowCleanupTask = DisposeDirectShadowSafelyAsync();
             pendingSessions.Clear();
 
             ClientWebSocket active;
@@ -4557,6 +5066,7 @@ namespace TermLink.Agent
             Task activePriorityHistoryWorker;
             Task activeMetadataWorker;
             Task activeStatusRefresh;
+            Task activeDirectShadowCleanup;
             lock (lifecycleSync)
             {
                 activeWorker = worker;
@@ -4564,6 +5074,7 @@ namespace TermLink.Agent
                 activePriorityHistoryWorker = priorityHistoryWorker;
                 activeMetadataWorker = metadataWorker;
                 activeStatusRefresh = statusRefreshWorker;
+                activeDirectShadowCleanup = directShadowCleanupTask;
             }
             if (activeWorker != null)
             {
@@ -4598,6 +5109,12 @@ namespace TermLink.Agent
                 try { activeStatusRefresh.GetAwaiter().GetResult(); }
                 catch (AggregateException) { }
                 catch (ProductionReauthenticationRequiredException) { }
+                catch (OperationCanceledException) { }
+                catch (ObjectDisposedException) { }
+            }
+            if (activeDirectShadowCleanup != null)
+            {
+                try { activeDirectShadowCleanup.GetAwaiter().GetResult(); }
                 catch (OperationCanceledException) { }
                 catch (ObjectDisposedException) { }
             }
@@ -4638,7 +5155,7 @@ namespace TermLink.Agent
             authorizedRecipientGate.Dispose();
             statusRefreshGate.Dispose();
             tokenRefreshGate.Dispose();
-            reconnectSignal.Dispose();
+            connectionSupervisor.Dispose();
             cancellation.Dispose();
         }
     }

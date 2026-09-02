@@ -126,6 +126,32 @@ function Assert-ProductionHttpsUri {
     return $uri
 }
 
+function Assert-ProductionStunServers {
+    param([string]$Value)
+
+    Assert-Production ($Value.Length -ge 1 -and $Value.Length -le 512) `
+        'TERMLINK_DIRECT_STUN_SERVERS must contain one or two bounded STUN endpoints.'
+    $endpoints = @($Value.Split(',', [StringSplitOptions]::None))
+    Assert-Production ($endpoints.Count -ge 1 -and $endpoints.Count -le 2) `
+        'TERMLINK_DIRECT_STUN_SERVERS must contain one or two endpoints.'
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($endpoint in $endpoints) {
+        $match = [regex]::Match($endpoint,
+            '^stun:(?<host>[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?):(?<port>[1-9][0-9]{0,4})$')
+        Assert-Production $match.Success `
+            'TERMLINK_DIRECT_STUN_SERVERS endpoints must use stun:host:port with a production DNS host.'
+        $hostName = $match.Groups['host'].Value
+        $port = 0
+        Assert-Production ([int]::TryParse($match.Groups['port'].Value, [ref]$port) -and $port -le 65535) `
+            'TERMLINK_DIRECT_STUN_SERVERS contains an invalid UDP port.'
+        Assert-Production ($hostName.Contains('.') -and
+            $hostName -notmatch '(?i)(^localhost$|\.(localhost|invalid|test|example)$|(^|\.)example\.(com|net|org)$)') `
+            'TERMLINK_DIRECT_STUN_SERVERS must use production DNS hosts, not local or reserved names.'
+        Assert-Production ($seen.Add("$hostName`:$port")) `
+            'TERMLINK_DIRECT_STUN_SERVERS contains a duplicate endpoint.'
+    }
+}
+
 function Convert-ProductionSizeToBytes {
     param([string]$Value, [string]$Name)
     $match = [regex]::Match($Value, '^(?<count>[1-9][0-9]*)(?<unit>[kKmMgG])(?:[bB])?$')
@@ -212,6 +238,7 @@ $commerceComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compo
 $registrationRecoveryComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\registration-recovery.compose.yml'))
 $humanVerificationComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\human-verification.compose.yml'))
 $accountDeletionComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\account-deletion.compose.yml'))
+$directTransportComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\direct-transport.compose.yml'))
 $reviewedComposePaths = @(
     $coreComposePath,
     $historyComposePath,
@@ -220,7 +247,8 @@ $reviewedComposePaths = @(
     $commerceComposePath,
     $registrationRecoveryComposePath,
     $humanVerificationComposePath,
-    $accountDeletionComposePath
+    $accountDeletionComposePath,
+    $directTransportComposePath
 )
 foreach ($composeFile in $composeFiles) {
     Assert-Production ($reviewedComposePaths -contains $composeFile) `
@@ -235,6 +263,7 @@ $commerceOverlayRequested = $composeFiles -contains $commerceComposePath
 $registrationRecoveryOverlayRequested = $composeFiles -contains $registrationRecoveryComposePath
 $humanVerificationOverlayRequested = $composeFiles -contains $humanVerificationComposePath
 $accountDeletionOverlayRequested = $composeFiles -contains $accountDeletionComposePath
+$directTransportOverlayRequested = $composeFiles -contains $directTransportComposePath
 Assert-Production ($composeFiles -contains $coreComposePath) `
     'Production validation requires the reviewed core.compose.yml foundation.'
 Assert-Production (-not ($historyOverlayRequested -and $externalServicesOverlayRequested)) `
@@ -261,6 +290,7 @@ if ($historyOverlayRequested) { $requiredServices += 'minio' }
 if ($observabilityOverlayRequested) {
     $requiredServices += @('alertmanager', 'blackbox', 'grafana', 'prometheus')
 }
+if ($directTransportOverlayRequested) { $requiredServices += 'direct-valkey' }
 $requiredServices = @($requiredServices | Sort-Object)
 $actualServices = @($services.Name | Sort-Object)
 Assert-Production (@(Compare-Object $requiredServices $actualServices).Count -eq 0) `
@@ -269,6 +299,7 @@ $approvedImages = @{
     edge = 'caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c'
     postgres = 'postgres:17.5-alpine3.22@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa'
     valkey = 'valkey/valkey:8.1.1-alpine@sha256:6a57d58c0a37cf7acc3045ac0fd6dd91be339774106ab4d9ca088013a096a99f'
+    'direct-valkey' = 'valkey/valkey:8.1.1-alpine@sha256:6a57d58c0a37cf7acc3045ac0fd6dd91be339774106ab4d9ca088013a096a99f'
     minio = 'minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e'
     prometheus = 'prom/prometheus:v2.55.1@sha256:2659f4c2ebb718e7695cb9b25ffa7d6be64db013daba13e05c875451cf51b0d3'
     blackbox = 'prom/blackbox-exporter:v0.25.0@sha256:b04a9fef4fa086a02fc7fcd8dcdbc4b7b35cc30cdee860fdc6a19dd8b208d63e'
@@ -277,7 +308,7 @@ $approvedImages = @{
 }
 $expectedNetworks = @{
     edge = @('frontend', 'public'); migrate = @('backend'); server = @('backend', 'egress', 'frontend')
-    postgres = @('backend'); valkey = @('backend'); minio = @('object', 'object-control')
+    postgres = @('backend'); valkey = @('backend'); 'direct-valkey' = @('direct-state'); minio = @('object', 'object-control')
     # Metrics and readiness probes use frontend to reach the application's
     # internal listeners.  Alertmanager also needs egress for configured
     # receivers; no observability service needs backend access.
@@ -286,6 +317,9 @@ $expectedNetworks = @{
 if ($historyOverlayRequested) {
     $expectedNetworks.edge = @('frontend', 'object', 'public')
     $expectedNetworks.server = @('backend', 'egress', 'frontend', 'object-control')
+}
+if ($directTransportOverlayRequested) {
+    $expectedNetworks.server = @($expectedNetworks.server + 'direct-state' | Sort-Object -Unique)
 }
 $connectionEnvironment = @(
     'TERMLINK_POSTGRES_CONNECT_TIMEOUT', 'TERMLINK_POSTGRES_HEALTH_CHECK_PERIOD',
@@ -313,7 +347,8 @@ $allowedEnvironment = @{
     server = @('TERMLINK_ACCOUNT_DELETION_ENABLED', 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE',
         'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION', 'TERMLINK_ANDROID_OIDC_CLIENT_ID', 'TERMLINK_ANDROID_OIDC_REDIRECT_URI',
         'TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS', 'TERMLINK_APPSHIP_BASE_URL',
-        'TERMLINK_DATABASE_URL_FILE', 'TERMLINK_HISTORY_ENABLED', 'TERMLINK_LISTEN_ADDR',
+        'TERMLINK_DATABASE_URL_FILE', 'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_DIRECT_STUN_SERVERS',
+        'TERMLINK_DIRECT_TRANSPORT_ENABLED', 'TERMLINK_HISTORY_ENABLED', 'TERMLINK_LISTEN_ADDR',
         'TERMLINK_HUMAN_VERIFICATION_PROVIDER', 'TERMLINK_HUMAN_VERIFICATION_SECRET_FILE', 'TERMLINK_HUMAN_VERIFICATION_SITE_KEY',
         'TERMLINK_KEYCLOAK_ADMIN_BASE_URL', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE',
         'TERMLINK_LOG_LEVEL', 'TERMLINK_METRICS_LISTEN_ADDR', 'TERMLINK_OIDC_ALLOWED_PARTIES', 'TERMLINK_OIDC_CLIENT_ID',
@@ -326,6 +361,7 @@ $allowedEnvironment = @{
         'TERMLINK_WEB_OIDC_CLIENT_ID', 'TERMLINK_WEB_OIDC_REDIRECT_URI', 'TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID')
     postgres = @('POSTGRES_DB', 'POSTGRES_PASSWORD_FILE', 'POSTGRES_USER')
     valkey = @('TERMLINK_VALKEY_MAXMEMORY')
+    'direct-valkey' = @('TERMLINK_DIRECT_VALKEY_MAXMEMORY')
     minio = @('MINIO_ROOT_PASSWORD_FILE', 'MINIO_ROOT_USER_FILE')
     prometheus = @(); blackbox = @(); alertmanager = @()
     grafana = @('GF_AUTH_ANONYMOUS_ENABLED', 'GF_PATHS_DATA', 'GF_PATHS_LOGS', 'GF_PATHS_PLUGINS',
@@ -343,10 +379,11 @@ $allowedSecretEnvironment = @{
     migrate = @('TERMLINK_DATABASE_URL_FILE', 'TERMLINK_OIDC_CLIENT_SECRET_FILE',
         'TERMLINK_REDIS_URL_FILE', 'TERMLINK_TOKEN_SIGNING_KEY_FILE')
     server = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE', 'TERMLINK_DATABASE_URL_FILE', 'TERMLINK_HUMAN_VERIFICATION_SECRET_FILE', 'TERMLINK_OIDC_CLIENT_SECRET_FILE',
-        'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE', 'TERMLINK_REDIS_URL_FILE', 'TERMLINK_S3_ACCESS_KEY_FILE',
+        'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE', 'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_REDIS_URL_FILE', 'TERMLINK_S3_ACCESS_KEY_FILE',
         'TERMLINK_S3_SECRET_KEY_FILE', 'TERMLINK_TOKEN_SIGNING_KEY_FILE')
     postgres = @('POSTGRES_PASSWORD_FILE')
     valkey = @()
+    'direct-valkey' = @()
     minio = @('MINIO_ROOT_PASSWORD_FILE', 'MINIO_ROOT_USER_FILE')
     prometheus = @(); blackbox = @(); alertmanager = @()
     grafana = @('GF_SECURITY_ADMIN_PASSWORD__FILE')
@@ -366,7 +403,7 @@ foreach ($serviceName in $allowedEnvironment.Keys) {
 }
 $expectedCommands = @{
     edge = 'caddy|run|--config|/etc/caddy/Caddyfile|--adapter|caddyfile'; migrate = 'migrate'; server = ''
-    postgres = ''; valkey = '/bin/sh|-ec'; minio = 'server|/data|--console-address|:9001'
+    postgres = ''; valkey = '/bin/sh|-ec'; 'direct-valkey' = '/bin/sh|-ec'; minio = 'server|/data|--console-address|:9001'
     prometheus = '--config.file=/etc/prometheus/prometheus.yml|--storage.tsdb.path=/prometheus'
     blackbox = '--config.file=/etc/blackbox/blackbox.yml'
     alertmanager = '--config.file=/etc/alertmanager/alertmanager.yml|--storage.path=/alertmanager'; grafana = ''
@@ -376,6 +413,7 @@ $expectedHealthchecks = @{
     migrate = ''; server = 'CMD|/termlink-server|healthcheck'
     postgres = 'CMD-SHELL|pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}'
     valkey = 'CMD-SHELL|REDISCLI_AUTH="$$(cat /run/secrets/valkey_password)" valkey-cli --user default ping | grep -qx PONG'; minio = 'CMD|mc|ready|local'
+    'direct-valkey' = 'CMD-SHELL|REDISCLI_AUTH="$$(cat /run/secrets/direct_valkey_password)" valkey-cli --user termlink-direct ping | grep -qx PONG'
     prometheus = 'CMD|wget|-q|-O|/dev/null|http://127.0.0.1:9090/-/ready'
     blackbox = 'CMD|/bin/blackbox_exporter|--version'
     alertmanager = 'CMD|wget|-q|-O|/dev/null|http://127.0.0.1:9093/-/ready'
@@ -389,6 +427,18 @@ $expectedValkeyScriptLines = @(
     'case "$$maxmemory" in ''''|*[!0-9kKmMgGtTbB]*) exit 1;; esac',
     'umask 077',
     'printf ''user default on >%s ~* &* +@all\n'' "$$password" > /run/valkey/users.acl',
+    'unset password',
+    'exec valkey-server --appendonly yes --aclfile /run/valkey/users.acl \',
+    '--maxmemory "$$maxmemory" --maxmemory-policy noeviction'
+)
+$expectedDirectValkeyScriptLines = @(
+    'password="$$(cat /run/secrets/direct_valkey_password)"',
+    'test -n "$$password"',
+    'case "$$password" in *[!A-Za-z0-9_-]*) exit 1;; esac',
+    'maxmemory="$${TERMLINK_DIRECT_VALKEY_MAXMEMORY}"',
+    'case "$$maxmemory" in ''''|*[!0-9kKmMgGtTbB]*) exit 1;; esac',
+    'umask 077',
+    'printf ''user default off\nuser termlink-direct on >%s ~termlink:direct:v1:* ~proof:* &termlink:direct:v1:mailbox:* +hello +ping +client|setinfo +get +set +del +exists +incr +psetex +pexpire +pexpireat +hget +hset +hexists +hincrby +zadd +zcard +zrem +zremrangebyscore +time +publish +subscribe +unsubscribe +eval +evalsha\n'' "$$password" > /run/valkey/users.acl',
     'unset password',
     'exec valkey-server --appendonly yes --aclfile /run/valkey/users.acl \',
     '--maxmemory "$$maxmemory" --maxmemory-policy noeviction'
@@ -407,6 +457,7 @@ $expectedSecretMounts = @{
         'token_signing_key:token_signing_key:65532:65532:0400')
     postgres = @('postgres_password:postgres_password:::0400')
     valkey = @('valkey_password:valkey_password:999:1000:0400')
+    'direct-valkey' = @('direct_valkey_password:direct_valkey_password:999:1000:0400')
     minio = @('s3_access_key:/run/secrets/s3_access_key:::', 's3_secret_key:/run/secrets/s3_secret_key:::')
     prometheus = @(); blackbox = @(); alertmanager = @()
     grafana = @('grafana_admin_password:grafana_admin_password:472:472:0400')
@@ -434,6 +485,10 @@ if ($accountDeletionOverlayRequested) {
             'keycloak_admin_client_secret:keycloak_admin_client_secret:65532:65532:0400' | Sort-Object)
     }
 }
+if ($directTransportOverlayRequested) {
+    $expectedSecretMounts.server = @($expectedSecretMounts.server +
+        'direct_redis_url:direct_redis_url:65532:65532:0400' | Sort-Object)
+}
 $edgeCaddyfilePath = if ($historyOverlayRequested) {
     [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Caddyfile'))
 } else {
@@ -457,20 +512,22 @@ if ($commerceOverlayRequested) {
 }
 $allowedNamedVolumeTargets = @{
     edge = @('/config', '/data'); migrate = @(); server = @(); postgres = @('/var/lib/postgresql/data')
-    valkey = @('/data'); minio = @('/data'); prometheus = @('/prometheus'); blackbox = @()
+    valkey = @('/data'); 'direct-valkey' = @('/data'); minio = @('/data'); prometheus = @('/prometheus'); blackbox = @()
     alertmanager = @('/alertmanager'); grafana = @('/var/lib/grafana')
 }
-$readOnlyServices = @('alertmanager', 'blackbox', 'edge', 'grafana', 'migrate', 'minio', 'prometheus', 'server', 'valkey')
+$readOnlyServices = @('alertmanager', 'blackbox', 'direct-valkey', 'edge', 'grafana', 'migrate', 'minio', 'prometheus', 'server', 'valkey')
 $expectedUsers = @{
     migrate = '65532:65532'
     server = '65532:65532'
     valkey = '999:1000'
+    'direct-valkey' = '999:1000'
 }
 $expectedTmpfs = @{
     edge = @('/tmp:rw,noexec,nosuid,size=16m')
     migrate = @('/tmp:rw,noexec,nosuid,size=16m')
     server = @('/tmp:rw,noexec,nosuid,size=16m')
     valkey = @('/run/valkey:rw,noexec,nosuid,size=1m,uid=999,gid=1000,mode=0700')
+    'direct-valkey' = @('/run/valkey:rw,noexec,nosuid,size=1m,uid=999,gid=1000,mode=0700')
     minio = @('/root/.minio:rw,noexec,nosuid,size=16m', '/tmp:rw,noexec,nosuid,size=32m')
     prometheus = @('/tmp:rw,noexec,nosuid,size=16m')
     blackbox = @('/tmp:rw,noexec,nosuid,size=8m')
@@ -479,7 +536,7 @@ $expectedTmpfs = @{
 }
 $resourcePolicyServices = @(
     'alertmanager', 'blackbox', 'edge', 'grafana', 'migrate', 'minio',
-    'postgres', 'prometheus', 'server', 'valkey'
+    'postgres', 'prometheus', 'server', 'valkey', 'direct-valkey'
 )
 foreach ($serviceProperty in $services) {
     $name = $serviceProperty.Name
@@ -558,25 +615,31 @@ foreach ($serviceProperty in $services) {
                 $sharedMemory -ge 16MB -and $sharedMemory -le $memoryLimit) `
                 "Service 'postgres' shared memory must remain between 16 MiB and its memory limit."
         }
-        elseif ($name -eq 'valkey') {
+        elseif ($name -in @('valkey', 'direct-valkey')) {
             $valkeyEnvironment = Get-PropertyValue $service 'environment'
+            $maxMemoryVariable = if ($name -ceq 'direct-valkey') {
+                'TERMLINK_DIRECT_VALKEY_MAXMEMORY'
+            } else { 'TERMLINK_VALKEY_MAXMEMORY' }
             $valkeyMaxMemory = Convert-ProductionSizeToBytes `
-                -Value ([string](Get-PropertyValue $valkeyEnvironment 'TERMLINK_VALKEY_MAXMEMORY')) `
-                -Name 'TERMLINK_VALKEY_MAXMEMORY'
+                -Value ([string](Get-PropertyValue $valkeyEnvironment $maxMemoryVariable)) `
+                -Name $maxMemoryVariable
             Assert-Production ($valkeyMaxMemory -ge 16MB -and $valkeyMaxMemory -le $memoryLimit) `
-                'TERMLINK_VALKEY_MAXMEMORY must remain between 16 MiB and the Valkey container memory limit.'
+                "$maxMemoryVariable must remain between 16 MiB and the Valkey container memory limit."
         }
     }
 
     $command = @((Get-PropertyValue $service 'command') | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
     $commandText = $command -join '|'
-    if ($name -eq 'valkey') {
+    if ($name -in @('valkey', 'direct-valkey')) {
         $actualScriptLines = if ($command.Count -eq 3) {
             @($command[2] -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
         } else { @() }
+        $expectedScriptLines = if ($name -ceq 'direct-valkey') {
+            $expectedDirectValkeyScriptLines
+        } else { $expectedValkeyScriptLines }
         Assert-Production ($command.Count -eq 3 -and $command[0] -ceq '/bin/sh' -and $command[1] -ceq '-ec' -and
-            @(Compare-Object $expectedValkeyScriptLines $actualScriptLines).Count -eq 0) `
-            "Service 'valkey' command differs from the reviewed ACL bootstrap."
+            @(Compare-Object $expectedScriptLines $actualScriptLines).Count -eq 0) `
+            "Service '$name' command differs from the reviewed ACL bootstrap."
     }
     elseif ($name -eq 'prometheus') {
         Assert-Production ($command.Count -eq 3 -and
@@ -713,6 +776,27 @@ $valkeyCaps = @((Get-PropertyValue $valkeyService 'cap_drop'))
 Assert-Production ($valkeyCaps -contains 'ALL') 'Valkey must drop all Linux capabilities.'
 $valkeySecurity = @((Get-PropertyValue $valkeyService 'security_opt'))
 Assert-Production ($valkeySecurity -contains 'no-new-privileges:true') 'Valkey must set no-new-privileges.'
+$directValkeyService = Get-PropertyValue $config.services 'direct-valkey'
+if ($directTransportOverlayRequested) {
+    Assert-Production ($null -ne $directValkeyService) 'The Direct overlay must provide its independent Valkey service.'
+    Assert-Production ([bool](Get-PropertyValue $directValkeyService 'read_only')) `
+        'Direct Valkey root filesystem must be read-only.'
+    Assert-Production ([string](Get-PropertyValue $directValkeyService 'user') -ceq '999:1000') `
+        'Direct Valkey must run as its fixed non-root UID/GID.'
+    Assert-Production ([string](Get-PropertyValue $directValkeyService 'restart') -ceq 'unless-stopped') `
+        'Direct Valkey must use the reviewed restart policy.'
+    Assert-Production ($null -eq (Get-PropertyValue $directValkeyService 'container_name') -and
+        $null -eq (Get-PropertyValue $directValkeyService 'hostname')) `
+        'Direct Valkey must remain addressable by its shared Compose service name for multi-replica servers.'
+    Assert-Production ($null -eq (Get-PropertyValue $directValkeyService 'depends_on')) `
+        'Direct Valkey must not depend on the Relay data plane.'
+    $serverDependencies = Get-PropertyValue $server 'depends_on'
+    Assert-Production ($null -eq (Get-PropertyValue $serverDependencies 'direct-valkey')) `
+        'Direct Valkey health must never gate Relay server startup.'
+} else {
+    Assert-Production ($null -eq $directValkeyService) `
+        'Direct Valkey must appear only when direct-transport.compose.yml is selected.'
+}
 $serverEnvironment = Get-PropertyValue $server 'environment'
 $publicUri = Assert-ProductionHttpsUri -Value ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_PUBLIC_URL')) -Name 'TERMLINK_PUBLIC_URL'
 $oidcIssuerUri = Assert-ProductionHttpsUri -Value ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_OIDC_ISSUER')) -Name 'TERMLINK_OIDC_ISSUER'
@@ -727,10 +811,27 @@ foreach ($name in @(
     'TERMLINK_HUMAN_VERIFICATION_PROVIDER', 'TERMLINK_HUMAN_VERIFICATION_SECRET_FILE',
     'TERMLINK_HUMAN_VERIFICATION_SITE_KEY',
     'TERMLINK_KEYCLOAK_ADMIN_BASE_URL', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID',
-    'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE'
+    'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE',
+    'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_DIRECT_STUN_SERVERS', 'TERMLINK_DIRECT_TRANSPORT_ENABLED'
 )) {
     Assert-Production ($null -eq (Get-PropertyValue $migrationEnvironment $name)) `
         "The migration job must not receive recovery authority '$name'."
+}
+$directTransportEnabled = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_DIRECT_TRANSPORT_ENABLED') -ceq 'true'
+Assert-Production ($directTransportEnabled -eq $directTransportOverlayRequested) `
+    'TERMLINK_DIRECT_TRANSPORT_ENABLED must exactly match direct-transport.compose.yml.'
+if ($directTransportEnabled) {
+    Assert-Production ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_DIRECT_REDIS_URL_FILE') -ceq
+        '/run/secrets/direct_redis_url') `
+        'Direct transport must use only its reviewed file-backed independent Valkey URL.'
+    Assert-ProductionStunServers -Value ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_DIRECT_STUN_SERVERS'))
+} else {
+    foreach ($name in @(
+        'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_DIRECT_STUN_SERVERS', 'TERMLINK_DIRECT_TRANSPORT_ENABLED'
+    )) {
+        Assert-Production ($null -eq (Get-PropertyValue $serverEnvironment $name)) `
+            "Core deployment unexpectedly includes Direct transport setting '$name'."
+    }
 }
 $recoveryEnabled = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_REGISTRATION_RECOVERY_ENABLED') -ceq 'true'
 Assert-Production ($recoveryEnabled -eq $registrationRecoveryOverlayRequested) `
@@ -853,11 +954,13 @@ Assert-Production ($null -ne $backendNetwork -and [bool](Get-PropertyValue $back
 $expectedNetworkNames = @('backend', 'egress', 'frontend')
 if ($IncludeEdge) { $expectedNetworkNames += 'public' }
 if ($historyOverlayRequested) { $expectedNetworkNames += @('object', 'object-control') }
+if ($directTransportOverlayRequested) { $expectedNetworkNames += 'direct-state' }
 $actualNetworkNames = @($config.networks.PSObject.Properties.Name | Sort-Object)
 Assert-Production (@(Compare-Object ($expectedNetworkNames | Sort-Object) $actualNetworkNames).Count -eq 0) `
     "Production Compose networks differ from the selected reviewed topology: $($actualNetworkNames -join ', ')"
 $objectNetwork = Get-PropertyValue $config.networks 'object'
 $objectControlNetwork = Get-PropertyValue $config.networks 'object-control'
+$directStateNetwork = Get-PropertyValue $config.networks 'direct-state'
 if ($historyOverlayRequested) {
     Assert-Production ($null -ne $objectNetwork -and [bool](Get-PropertyValue $objectNetwork 'internal')) `
         'The edge/MinIO object network must remain internal.'
@@ -866,6 +969,13 @@ if ($historyOverlayRequested) {
 } else {
     Assert-Production ($null -eq $objectNetwork -and $null -eq $objectControlNetwork) `
         'Core and external-S3 deployments must not retain local object-store networks.'
+}
+if ($directTransportOverlayRequested) {
+    Assert-Production ($null -ne $directStateNetwork -and [bool](Get-PropertyValue $directStateNetwork 'internal')) `
+        'The server/Direct-Valkey state network must remain internal.'
+} else {
+    Assert-Production ($null -eq $directStateNetwork) `
+        'Core deployments must not retain the optional Direct state network.'
 }
 Assert-Production ($null -eq (Get-PropertyValue $config.networks 'private')) `
     'The legacy private network name must not remain in production Compose.'
@@ -957,7 +1067,9 @@ foreach ($acceptanceProxy in @(
 # object-control network with the server; it must never join backend.
 $edgeNetworks = if ($IncludeEdge) { @(Get-NetworkNames $edgeService) } else { @() }
 if ($IncludeEdge) {
-    foreach ($dataServiceName in @('postgres', 'valkey')) {
+    $edgeDataServices = @('postgres', 'valkey')
+    if ($directTransportOverlayRequested) { $edgeDataServices += 'direct-valkey' }
+    foreach ($dataServiceName in $edgeDataServices) {
         $dataService = Get-PropertyValue $config.services $dataServiceName
         $sharedNetworks = @((Get-NetworkNames $dataService) | Where-Object { $edgeNetworks -contains $_ })
         Assert-Production ($sharedNetworks.Count -eq 0) `
@@ -994,6 +1106,9 @@ if ($registrationRecoveryOverlayRequested -or $accountDeletionOverlayRequested) 
 }
 if ($humanVerificationOverlayRequested) { $expectedSecretNames += 'human_verification_secret' }
 if ($accountDeletionOverlayRequested) { $expectedSecretNames += 'account_deletion_identity_key' }
+if ($directTransportOverlayRequested) {
+    $expectedSecretNames += @('direct_redis_url', 'direct_valkey_password')
+}
 $actualSecretNames = @($config.secrets.PSObject.Properties.Name | Sort-Object)
 Assert-Production (@(Compare-Object ($expectedSecretNames | Sort-Object) $actualSecretNames).Count -eq 0) `
     "Production Compose secrets differ from the selected reviewed topology: $($actualSecretNames -join ', ')"
@@ -1043,6 +1158,28 @@ Assert-Production ($redisUriValid -and $redisUri.Scheme -ceq 'redis' -and $redis
     $redisUri.Fragment -eq '' -and $redisUri.UserInfo -ceq "default:$valkeyPassword") `
     'Redis URL must target the internal Valkey service and exactly match its file-backed ACL password.'
 $valkeyPassword = $null
+
+if ($directTransportOverlayRequested) {
+    $directValkeyPasswordSecret = @($secretValues | Where-Object { $_.Name -ceq 'direct_valkey_password' })
+    $directRedisUrlSecret = @($secretValues | Where-Object { $_.Name -ceq 'direct_redis_url' })
+    Assert-Production ($directValkeyPasswordSecret.Count -eq 1 -and $directRedisUrlSecret.Count -eq 1) `
+        'Direct transport must declare exactly one independent Valkey password and URL secret.'
+    $directValkeyPassword = [string]$directValkeyPasswordSecret[0].Value
+    Assert-Production ($directValkeyPassword -cmatch '^[A-Za-z0-9_-]{16,128}$') `
+        'Direct Valkey password must be a 16-128 character URL-safe random value.'
+    Assert-Production ($directValkeyPassword -cne [string]$valkeyPasswordSecret[0].Value) `
+        'Direct and Relay Valkey must not reuse the same ACL password.'
+    $directRedisUri = $null
+    $directRedisUriValid = [Uri]::TryCreate(
+        [string]$directRedisUrlSecret[0].Value, [UriKind]::Absolute, [ref]$directRedisUri)
+    Assert-Production ($directRedisUriValid -and $directRedisUri.Scheme -ceq 'redis' -and
+        $directRedisUri.Host -ceq 'direct-valkey' -and $directRedisUri.Port -eq 6379 -and
+        $directRedisUri.AbsolutePath -ceq '/0' -and $directRedisUri.Query -eq '' -and
+        $directRedisUri.Fragment -eq '' -and
+        $directRedisUri.UserInfo -ceq "termlink-direct:$directValkeyPassword") `
+        'Direct Redis URL must target the one shared Direct Valkey service and exactly match its bounded ACL user.'
+    $directValkeyPassword = $null
+}
 
 $stringLeaves = @(Get-StringLeaf -Value $config)
 foreach ($secret in $secretValues) {

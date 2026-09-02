@@ -151,6 +151,7 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 ValidateTerminalHistoryLifecycleGate(root, pcDeviceId);
                 ValidateNoOutputSnapshotEligibility(root, pcDeviceId);
                 ValidateTerminalCoreSnapshotV2(root, pcDeviceId);
+                ValidateTerminalCoreHostEffectV2Replay(root, pcDeviceId);
                 ValidateTerminalCoreAuthorityMigration(root, pcDeviceId);
                 ValidateTerminalCoreShadowGoldenStreams(root, pcDeviceId);
                 var store = new ProductionTerminalHistoryStore(root, pcDeviceId);
@@ -1197,6 +1198,75 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 if (prepared?.SealedObject != null)
                     CryptographicOperations.ZeroMemory(prepared.SealedObject);
                 CryptographicOperations.ZeroMemory(recipient.PairwiseKey);
+            }
+        }
+
+        private static void ValidateTerminalCoreHostEffectV2Replay(
+            string root,
+            Guid pcDeviceId)
+        {
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000084");
+            var queryPrefix = Encoding.UTF8.GetBytes("\x1b[4");
+            var querySuffix = Encoding.UTF8.GetBytes(
+                "$p" +
+                "\x1b[?25$p" +
+                "\x1bP$qm\x1b\\" +
+                "\x1bP+q436f;524742\x1b\\" +
+                "\x1b[=7u\x1b[?u" +
+                "\x1b]10;?\x1b\\" +
+                "\x1b]11;?\x1b\\");
+            var frames = new[]
+            {
+                new LocalFrame(LocalFrameType.Output, sessionId, 1, queryPrefix),
+                new LocalFrame(LocalFrameType.Output, sessionId, 2, querySuffix),
+                new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    3,
+                    Encoding.UTF8.GetBytes("query-replay-ok"))
+            };
+
+            var store = new ProductionTerminalHistoryStore(
+                Path.Combine(root, "terminal-core-host-effect-v2-replay"),
+                pcDeviceId);
+            using (var producer = new ProductionTerminalHistoryProducer(
+                store,
+                pcDeviceId,
+                terminalCoreShadowEnabled: false,
+                terminalCoreSnapshotAuthorityEnabled: true,
+                terminalCoreShadowObserver: null))
+            {
+                var result = producer.ProcessSession(sessionId, frames);
+                Require(result.SnapshotEligible && result.LastSequence == 3,
+                    "V2-only capability queries made terminal-core history ineligible.");
+                var checkpoint = producer.LoadCheckpoint(sessionId);
+                Require(checkpoint.AuthorityVersion == 2 &&
+                    checkpoint.SnapshotPlaintext?.Length > 0,
+                    "V2-only capability queries did not produce a native checkpoint.");
+                try
+                {
+                    using var restored = NativeTerminalCoreV2.ImportSnapshot(
+                        checkpoint.SnapshotPlaintext);
+                    Require(restored.GetPresentationInfo().NextSourceSequence == 4,
+                        "Discarded replay Host Effects changed the restored source cursor.");
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(checkpoint.SnapshotPlaintext);
+                }
+            }
+
+            using (var shadow = new ProductionTerminalCoreShadow(80, 24))
+            {
+                foreach (var frame in frames) shadow.Apply(frame);
+                var observed = shadow.ObserveCheckpoint(
+                    portable: null,
+                    expectedSequence: 3,
+                    portableReasonCode: "HOST_EFFECT_V2_REPLAY");
+                Require(observed.Status == "SHADOW_READY" &&
+                    observed.LastAppliedSequence == 3 &&
+                    observed.NextSourceSequence == 4,
+                    "V2-only capability queries retired or advanced the diagnostic shadow twice.");
             }
         }
 

@@ -1,0 +1,18 @@
+{
+  "format_version": 1,
+  "description": "Canonical packed repeated-enum DirectPathTicketV1 signed by the TermLink direct-ticket V1 domain.",
+  "server_public_key_base64url": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+  "server_signing_key_id": "direct-v1-vector",
+  "ticket_protobuf_base64url": "CAESEAARIjNEVUZ3iJmqu8zd7v8aEBAhMkNUZUdoiZqrvM3e7_AiECAxQlNkdUhpipusvc7f8AEqEDBBUmN0hUlqi5ytvs_g8QIyEEBRYnOElUprjJ2uv9Dh8gM4B0CA8MyGpjdIwJnUhqY3UgEBWhAAAQIDBAUGBwgJCgsMDQ4PYhBkaXJlY3QtdjEtdmVjdG9yakCwJTg3vrjJ8h6M6z4BR3XkogSgH3TQI4jp2mBhQTUyJWcO36MFe3MVh3Zxk-uAFShR9t2MynoQJEk4LrR53KkI",
+  "ticket_sha256": "92a306fb506241f2075beaeffb6e174eddf39a6381d38022de58145b63fa387a",
+  "ticket_id": "00112233-4455-4677-8899-aabbccddeeff",
+  "account_id": "10213243-5465-4768-899a-abbccddeeff0",
+  "initiator_device_id": "20314253-6475-4869-8a9b-acbdcedff001",
+  "responder_device_id": "30415263-7485-496a-8b9c-adbecfe0f102",
+  "connection_id": "40516273-8495-4a6b-8c9d-aebfd0e1f203",
+  "path_epoch": 7,
+  "issued_at_ms": 1900000000000,
+  "expires_at_ms": 1900000120000,
+  "server_nonce_hex": "000102030405060708090a0b0c0d0e0f",
+  "allowed_carriers": ["UDP_QUIC"]
+}

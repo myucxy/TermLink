@@ -12,7 +12,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -34,6 +36,7 @@ class RemoteTerminalSession(
     initialRendererState: RendererBootstrapState = RendererBootstrapState.Empty(),
     private val resizeDebounceMillis: Long = 150,
     private val leaseRenewalIntervalMillis: Long = 10_000,
+    private val leaseRenewalRetryIntervalMillis: Long = minOf(leaseRenewalIntervalMillis, 2_000),
     private val clockMillis: () -> Long = System::currentTimeMillis,
     private val inputIdFactory: () -> UUID = UUID::randomUUID,
     private val disposeEngineOnClose: Boolean = true,
@@ -79,6 +82,9 @@ class RemoteTerminalSession(
             "resizeDebounceMillis must be from 100 through 200"
         }
         require(leaseRenewalIntervalMillis > 0) { "leaseRenewalIntervalMillis must be positive" }
+        require(leaseRenewalRetryIntervalMillis > 0) {
+            "leaseRenewalRetryIntervalMillis must be positive"
+        }
         acknowledgementJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
             for (ignored in acknowledgementSignal) {
                 drainAcknowledgements()
@@ -178,8 +184,9 @@ class RemoteTerminalSession(
             engine.setReadOnly(false)
             scheduleLeaseExpiry(leaseId, expiresAtEpochMillis)
             leaseRenewalJob = scope.launch {
+                var nextDelayMillis = leaseRenewalIntervalMillis
                 while (true) {
-                    delay(leaseRenewalIntervalMillis)
+                    delay(nextDelayMillis)
                     val lease = mutex.withLock {
                         val current = mutableState.value
                         if (current is RemoteSessionState.Controlling && current.leaseId == leaseId &&
@@ -203,11 +210,18 @@ class RemoteTerminalSession(
                                 }
                             }
                         }
+                        nextDelayMillis = leaseRenewalIntervalMillis
                     } catch (error: CancellationException) {
                         throw error
-                    } catch (_: Exception) {
+                    } catch (_: RemoteControlLeaseLostException) {
                         markReadOnly("control lease renewal failed")
                         break
+                    } catch (_: Exception) {
+                        // A timeout, network switch, or transient 5xx does not
+                        // prove that authority revoked the lease. Keep control
+                        // until a later renewal succeeds or the local expiry
+                        // fence moves the session to read-only.
+                        nextDelayMillis = leaseRenewalRetryIntervalMillis
                     }
                 }
             }
@@ -272,32 +286,43 @@ class RemoteTerminalSession(
             return EventAcceptance.HistoryGap(expected, event.sequence)
         }
 
-        when (event) {
-            is RemoteSessionEvent.Output -> {
-                require(event.bytes.isNotEmpty()) { "output event is empty" }
-                applyOutput(event)
+        try {
+            when (event) {
+                is RemoteSessionEvent.Output -> {
+                    require(event.bytes.isNotEmpty()) { "output event is empty" }
+                    applyOutput(event)
+                }
+                is RemoteSessionEvent.Resize -> engine.resize(event.sequence, event.size.columns, event.size.rows)
+                is RemoteSessionEvent.Title -> {
+                    engine.advance(event.sequence)
+                    mutableTitle.value = event.value
+                }
+                is RemoteSessionEvent.InputResult -> engine.advance(event.sequence)
+                is RemoteSessionEvent.ControlGranted -> engine.advance(event.sequence)
+                is RemoteSessionEvent.ControlRevoked -> {
+                    engine.advance(event.sequence)
+                    leaseExpiryJob?.cancel()
+                    leaseExpiryJob = null
+                    leaseRenewalJob?.cancel()
+                    leaseRenewalJob = null
+                    engine.setReadOnly(true)
+                }
+                is RemoteSessionEvent.Lifecycle -> engine.advance(event.sequence)
+                is RemoteSessionEvent.Gap -> error("handled above")
             }
-            is RemoteSessionEvent.Resize -> engine.resize(event.sequence, event.size.columns, event.size.rows)
-            is RemoteSessionEvent.Title -> {
-                engine.advance(event.sequence)
-                mutableTitle.value = event.value
-            }
-            is RemoteSessionEvent.InputResult -> engine.advance(event.sequence)
-            is RemoteSessionEvent.ControlGranted -> engine.advance(event.sequence)
-            is RemoteSessionEvent.ControlRevoked -> {
-                engine.advance(event.sequence)
-                leaseExpiryJob?.cancel()
-                leaseExpiryJob = null
-                leaseRenewalJob?.cancel()
-                leaseRenewalJob = null
-                engine.setReadOnly(true)
-            }
-            is RemoteSessionEvent.Lifecycle -> engine.advance(event.sequence)
-            is RemoteSessionEvent.Gap -> error("handled above")
-        }
 
-        lastAppliedSequence = event.sequence
-        mutableState.value = stateAfterAppliedEvent(event)
+            lastAppliedSequence = event.sequence
+            mutableState.value = stateAfterAppliedEvent(event)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            // A renderer apply can commit native state before presentation or
+            // JVM publication fails. Fence the incarnation immediately and
+            // rebuild through authenticated history instead of reconnecting a
+            // failed-closed renderer at the same durable ACK forever.
+            enterRendererFailure(expected, Math.addExact(event.sequence, 1L), error)
+            throw error
+        }
         if (sendAcknowledgement) {
             requestAcknowledgement(lastAppliedSequence)
         }
@@ -370,6 +395,7 @@ class RemoteTerminalSession(
                         mutableState.value = RemoteSessionState.Live(lastAckedSequence)
                         orderedEventDispatcher?.offerReset(rendererGeneration)
                         for (event in events) {
+                            currentCoroutineContext().ensureActive()
                             when (event) {
                                 is RemoteSessionEvent.Output -> applyOutput(event)
                                 is RemoteSessionEvent.Resize -> engine.resize(
@@ -396,6 +422,7 @@ class RemoteTerminalSession(
                             if (acknowledgeEach) requestAcknowledgement(lastAppliedSequence)
                             orderedEventDispatcher?.offerApplied(rendererGeneration, event)
                         }
+                        currentCoroutineContext().ensureActive()
                         if (!acknowledgeEach) requestAcknowledgement(lastAppliedSequence)
                         lastAppliedSequence
                     } catch (error: Throwable) {
@@ -482,6 +509,7 @@ class RemoteTerminalSession(
                 var durable = false
                 try {
                     for (event in events) {
+                        currentCoroutineContext().ensureActive()
                         when (event) {
                             is RemoteSessionEvent.Output -> applyOutput(event)
                             is RemoteSessionEvent.Resize -> engine.resize(
@@ -518,6 +546,7 @@ class RemoteTerminalSession(
                         }
                         orderedEventDispatcher?.offerApplied(rendererGeneration, event)
                     }
+                    currentCoroutineContext().ensureActive()
                     val commit = persist(rendererGeneration, target)
                     require(commit.sequence == target && commit.rendererGeneration == rendererGeneration) {
                         "history recovery commit does not match the active renderer"
@@ -730,6 +759,22 @@ class RemoteTerminalSession(
         )
         orderedEventDispatcher?.offerInvalidated(rendererGeneration)
         rendererFailure?.let { throw it }
+    }
+
+    private fun enterRendererFailure(expected: Long, received: Long, cause: Throwable) {
+        leaseExpiryJob?.cancel()
+        leaseExpiryJob = null
+        leaseRenewalJob?.cancel()
+        leaseRenewalJob = null
+        runCatching { engine.setReadOnly(true) }.exceptionOrNull()?.let(cause::addSuppressed)
+        gapGeneration++
+        mutableState.value = RemoteSessionState.HistoryGap(
+            lastAckedSequence = lastAckedSequence,
+            expectedSequence = expected,
+            receivedSequence = received,
+            generation = gapGeneration,
+        )
+        orderedEventDispatcher?.offerInvalidated(rendererGeneration)
     }
 
     private suspend fun markReconnecting(reason: String?) {

@@ -28,7 +28,21 @@ The server checks a 60 second clock window and consumes the nonce once in
 Valkey. The first client message is a bounded JSON `ClientHello` control
 record containing `role`, `protocol_versions`, and `capabilities`. It contains
 no terminal content. The server answers with `ServerWelcome` and then accepts
-only binary protobuf `Envelope` messages.
+binary protobuf `Envelope` messages. If both sides negotiated
+`liveness_probe_v1`, the authenticated connection also accepts one bounded
+JSON control pair: the client sends `{"type":"ping","probe_id":"<uuid>"}`
+and the Relay returns the same canonical UUID in a `pong`. This control carries
+no terminal/session identifier or content, never consumes an `Envelope.seq`,
+and is used only to prove that a foregrounded Android client still has a live
+round trip before replacing its WebSocket generation. All other post-welcome
+text frames are protocol errors.
+
+The optional direct-transport signalling lane uses a separate authenticated
+WebSocket at `/v1/transport/signals`, subprotocol `termlink.transport.v1`, and
+device-proof domain/path `TERMLINK-TRANSPORT-SIGNAL-PROOF-V1` plus
+`/v1/transport/signals`. It never replaces or delays this realtime WebSocket.
+After its own bounded hello/welcome, that lane accepts only serialized
+`TransportSignalEnvelopeV1` from `termlink_transport.proto`.
 
 ## Envelope and E2EE
 
@@ -64,6 +78,71 @@ only to that approved device. Empty-recipient messages are limited to message
 types whose semantics explicitly allow account/session broadcast. Session
 output in V1 is recipient-specific; Relay never maps Key IDs to private keys.
 
+## Optional direct data path
+
+The WSS Relay is the permanent control and fallback path. A direct path is a
+make-before-break optimization between two currently approved devices. Its
+reliable QUIC stream carries `DirectPathFrameV1`; the
+`realtime_envelope` field is the exact received serialization of this existing
+`Envelope`. A sender must preserve all bytes, including unknown protobuf
+fields, and must not parse then reserialize an Envelope for path forwarding.
+Thus direction ACL, lease, Gap, replay, E2EE nonce uniqueness and application
+sequence semantics are identical on Relay and direct paths.
+
+Transport signalling has its own `connection_id`, monotonic `path_epoch`,
+`signal_seq`, `signal_ack`, key/nonce space and AEAD domain
+`TERMLINK-TRANSPORT-SIGNAL-AEAD-V1`. None is an alias for `Envelope.seq`,
+`Envelope.ack` or the terminal session key domain. Likewise,
+`DirectTransportReceiptV1` acknowledges only direct `frame_seq` bytes. Receipt
+of bytes must never commit, persist or advertise a terminal cumulative ACK;
+only successful application through the existing renderer/recovery state
+machine may do that.
+
+After mutual ticket/device/QUIC proof, each peer independently proposes a
+bounded list of per-session first-direct Envelope sequences for its own
+outbound direction. Below a barrier, Relay remains authoritative. The sender
+continues using Relay and buffers exact bytes from the barrier while proposal,
+accept, commit and commit echo converge. It then replays that bounded buffer
+and duplicates the exact Envelope bytes over Relay and direct QUIC for the
+agreed short grace window. Receivers deduplicate with the existing
+session/direction sequence rules. A half-completed or over-budget negotiation
+stays Relay-only; the opposite direction may switch independently.
+
+On timeout, malformed direct data, ticket expiry, address change, QUIC close,
+app background restriction or peer-proof failure, the affected route switches
+locally to Relay immediately. The sender retransmits every unreceipted direct
+Envelope data frame as the original Envelope bytes over WSS and continues with
+the next existing Envelope sequence. A transport receipt may release only the
+QUIC retransmission copy: the authoritative PC journal remains retained until
+the existing cumulative application ACK, and Android commands remain in their
+existing semantic outbox until the corresponding input/resize/lease result or
+idempotent retry rule completes. Fallback resumes those existing sources even
+when QUIC previously receipted the bytes. The socket, subscriptions,
+durable ACK and renderer are not reset. A fallback notice is best-effort
+convergence metadata; losing the signalling lane cannot delay local fallback.
+Old epochs are ignored after retirement, and a new direct attempt requires a
+higher server-ticketed epoch.
+
+The only V1 QUIC application record is the four-byte unsigned big-endian
+length-prefixed `DirectPathFrameV1`. In each direction frame 1 is
+`peer_proof`, frame 2 is `peer_proof_result`, and no ping, receipt, or
+`realtime_envelope` is accepted before both directions authenticate. A `TLPP1`
+or other platform-private proof record is not V1. Signalling carries only the
+SHA-256 fingerprint of each temporary QUIC leaf certificate's exact DER bytes;
+the raw certificate arrives through the TLS handshake and is pinned to that
+role-bound fingerprint.
+
+Transport-control protobuf is strict V1 wire: unknown fields, duplicate
+singular fields, unknown enums, non-minimal varints, and non-canonical field
+ordering retire only the current direct attempt. JSON negotiation/config may
+ignore bounded unknown properties. The opaque `realtime_envelope` bytes are
+the deliberate exception and preserve all Realtime protobuf unknown fields
+byte-for-byte across direct delivery, duplicate grace, and Relay fallback.
+
+Candidate, ticket, timeout, signature, state-machine and address validation
+bounds are normative in
+`../../docs/NETWORK_CONNECTION_AND_DIRECT_TRANSPORT.md`.
+
 ## Capabilities
 
 Version 1 requires `e2ee_x25519_chacha20poly1305`, `cumulative_ack`,
@@ -80,6 +159,22 @@ and `terminal_typed_input_v1`. The Relay returns the bounded intersection of
 recognized capabilities in `ServerWelcome.capabilities`; older peers may omit
 or ignore that field. Full normalized Snapshot/Delta/Resync delivery is a
 separate `terminal_presentation_v1` gate and is not implied by metadata support.
+
+`liveness_probe_v1` is optional and transport-scoped. A long Android
+background interval alone is not evidence that a negotiated connection is
+dead: the client probes the exact current generation, retains it on a matching
+bounded response, and replaces it only after timeout or structural failure.
+A probe from an older generation cannot retire its successor. When an older
+Relay does not negotiate this capability, the client retains the conservative
+foreground replacement behavior.
+
+`direct_transport_v1` is an independent, rollbackable capability. It may be
+advertised only when the client keeps `/v1/realtime` connected while gathering
+LAN host candidates, querying the configured STUN service and probing QUIC.
+TURN carrier and relay candidate values are reserved for a later
+`direct_transport_turn_v1` capability and must otherwise be rejected for the
+path attempt. A rejected or unknown transport capability never changes the
+Realtime V1 capability intersection.
 
 An `OUTPUT_CHUNK` from a metadata-capable producer sets `source_event_seq` to
 the authoritative SessionHost journal sequence and a monotonic

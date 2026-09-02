@@ -230,6 +230,11 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	if grants["key_epoch"] != float64(1) || len(grants["items"].([]any)) != 1 {
 		t.Fatalf("authorized PC Grant snapshot=%v", grants)
 	}
+	grant := grants["items"].([]any)[0].(map[string]any)
+	if grant["signing_public_key"] != base64.StdEncoding.EncodeToString(android.public) ||
+		grant["exchange_public_key"] != base64.StdEncoding.EncodeToString(android.exchange) {
+		t.Fatalf("authorized PC Grant public keys=%v, want Android signing and exchange keys", grant)
+	}
 	signedJSON(t, server.URL, android, http.MethodGet, "/v1/pcs/"+pcID.String()+"/grants", nil, "", http.StatusForbidden)
 	signedJSON(t, server.URL, pc, http.MethodPut, "/v1/sessions/"+sessionID.String(), map[string]any{"pc_id": pcID, "shell_type": "pwsh", "title_cipher": "", "state": "RUNNING", "columns": 100, "rows": 30, "last_output_seq": 0}, "upsert-session", http.StatusOK)
 	signedJSON(t, server.URL, pc, http.MethodPut, "/v1/sessions/"+historySessionID.String(), map[string]any{"pc_id": pcID, "shell_type": "pwsh", "title_cipher": "", "state": "RUNNING", "columns": 100, "rows": 30, "last_output_seq": 0}, "upsert-history-session", http.StatusOK)

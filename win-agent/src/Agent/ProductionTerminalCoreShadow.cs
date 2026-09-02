@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Security.Cryptography;
 using TermLink.LocalIpc;
 using TermLink.TerminalCore;
@@ -60,20 +61,23 @@ namespace TermLink.Agent
             if (disposed || terminal == null) return;
             try
             {
+                NativeTerminalHostEffectFrameV2 effects;
                 switch (frame.Type)
                 {
                     case LocalFrameType.Output:
-                        terminal.ApplyOutput(frame.Sequence, frame.Payload);
+                        effects = terminal.ApplyOutputWithHostEffectsV2(
+                            frame.Sequence,
+                            frame.Payload);
                         break;
                     case LocalFrameType.Resize:
                         LocalPayloadCodec.ParseResize(frame.Payload, out var columns, out var rows);
-                        terminal.ApplyResize(
+                        effects = terminal.ApplyResizeWithHostEffectsV2(
                             frame.Sequence,
                             checked((uint)columns),
                             checked((uint)rows));
                         break;
                     case LocalFrameType.Gap:
-                        terminal.ApplyGap(frame.Sequence);
+                        effects = terminal.ApplyGapWithHostEffectsV2(frame.Sequence);
                         break;
                     case LocalFrameType.Title:
                         // A structured Title frame is out-of-band REST metadata rather than VT
@@ -81,20 +85,46 @@ namespace TermLink.Agent
                         // comparison must not treat the native OSC title as its equivalent.
                         LocalPayloadCodec.ParseTitle(frame.Payload);
                         structuredTitleSeen = true;
-                        terminal.ApplyAdvance(frame.Sequence, 0);
+                        effects = terminal.ApplyAdvanceWithHostEffectsV2(frame.Sequence, 0);
                         break;
                     default:
                         // Title/lifecycle/input metadata consumes the same ordered source
                         // sequence but is not a VT mutation.  OSC title changes are already in
                         // Output; the dedicated Title frame remains the REST metadata authority.
-                        terminal.ApplyAdvance(frame.Sequence, 0);
+                        effects = terminal.ApplyAdvanceWithHostEffectsV2(frame.Sequence, 0);
                         break;
                 }
+                ValidateAndDiscardHostEffects(frame, effects);
                 lastAppliedSequence = frame.Sequence;
             }
             catch (Exception error)
             {
                 Retire(FailureCode(error));
+            }
+        }
+
+        private static void ValidateAndDiscardHostEffects(
+            LocalFrame frame,
+            NativeTerminalHostEffectFrameV2 effects)
+        {
+            if (effects == null)
+                throw new InvalidDataException("terminal-core returned no Host Effect V2 frame.");
+            foreach (var effect in effects.Records)
+            {
+                // The shadow mirrors already-durable output. SessionHost owns the one
+                // authoritative PTY response; accepting and discarding this validated record
+                // prevents capability queries from retiring the shadow without duplicating it.
+                if (frame.Type != LocalFrameType.Output ||
+                    effect.Kind != NativeTerminalHostEffectKindV2.PtyReply ||
+                    effect.SourceSequence != frame.Sequence ||
+                    effect.SourceOffsetEnd < 1 ||
+                    effect.SourceOffsetEnd > frame.Payload.Length ||
+                    effect.Payload == null ||
+                    effect.Payload.Count == 0)
+                {
+                    throw new InvalidDataException(
+                        "terminal-core returned an invalid shadow Host Effect V2 record.");
+                }
             }
         }
 

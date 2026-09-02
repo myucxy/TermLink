@@ -73,6 +73,169 @@ fn configured_main_scrollback_captures_output_and_keeps_public_cells_viewport_re
 }
 
 #[test]
+fn hard_line_feed_detaches_the_existing_soft_wrapped_suffix() {
+    let mut terminal = Terminal::new_with_options(
+        4,
+        3,
+        0,
+        TerminalOptions {
+            history_capacity_rows: 4,
+        },
+    )
+    .expect("history terminal");
+
+    output(&mut terminal, 0, b"ABCDE").expect("create one soft-wrapped suffix");
+    let original_line_id = terminal.main.row_metadata[0].logical_line_id;
+    assert!(terminal.main.soft_wrapped[0]);
+    assert_eq!(
+        terminal.main.row_metadata[1].logical_line_id,
+        original_line_id
+    );
+    assert_eq!(terminal.main.row_metadata[1].logical_cell_offset, 4);
+    terminal
+        .export_snapshot_v2()
+        .expect("soft-wrapped source is canonical");
+
+    output(&mut terminal, 1, b"\x1b[H\r\n")
+        .expect("hard LF crosses the existing soft-wrap boundary");
+
+    assert!(!terminal.main.soft_wrapped[0]);
+    assert_ne!(
+        terminal.main.row_metadata[1].logical_line_id,
+        original_line_id
+    );
+    assert_eq!(terminal.main.row_metadata[1].logical_cell_offset, 0);
+    terminal
+        .export_snapshot_v2()
+        .expect("hard LF result remains snapshot canonical");
+    terminal
+        .export_render_frame_v3()
+        .expect("hard LF result remains renderable");
+}
+
+#[test]
+fn event_boundary_snaps_saved_cursor_when_output_replaces_its_cell_with_a_wide_lead() {
+    let mut terminal = Terminal::new(10, 4).expect("terminal");
+    output(&mut terminal, 0, b"\x1b[2;2H\x1b7").expect("save the initial narrow cell");
+    assert_eq!(terminal.main.saved.column, 1);
+
+    output(&mut terminal, 1, b"\x1b[2;1H\xe7\x95\x8c")
+        .expect("write a wide cell across the saved coordinate");
+
+    assert_eq!(terminal.main.saved.column, 0);
+    let snapshot = terminal.export_snapshot_v2().expect("canonical checkpoint");
+    let restored = Terminal::import_snapshot_v2(&snapshot).expect("checkpoint roundtrip");
+    assert_eq!(restored.main.saved.column, 0);
+}
+
+#[test]
+fn wrapped_boundary_state_machine_remains_canonical_across_reflow_regions_and_retention() {
+    let mut terminal = Terminal::new_with_options(
+        7,
+        4,
+        0,
+        TerminalOptions {
+            history_capacity_rows: 7,
+        },
+    )
+    .expect("state-machine terminal");
+    let mut random = 0x7a6d_4c39_8f21_b5e3_u64;
+
+    for sequence in 0_u64..160 {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        let (columns, rows) = terminal.dimensions();
+        match random % 8 {
+            0 => {
+                let text = format!("W{sequence:03}-ABCDE界FGHIJ");
+                output(&mut terminal, sequence, text.as_bytes()).expect("wrapped text");
+            }
+            1 => {
+                let row = 1 + u32::try_from(random % u64::from(rows)).expect("bounded row");
+                let hard_lf = format!("\u{1b}[{row};1H\r\n");
+                output(&mut terminal, sequence, hard_lf.as_bytes()).expect("hard line feed");
+            }
+            2 if rows >= 3 => {
+                let region_bottom = rows - 1;
+                let partial_scroll =
+                    format!("\u{1b}[1;{region_bottom}r\u{1b}[{region_bottom};1H\r\n\u{1b}[r");
+                output(&mut terminal, sequence, partial_scroll.as_bytes())
+                    .expect("partial vertical scroll");
+            }
+            3 if rows >= 3 && columns >= 4 => {
+                let region_bottom = rows - 1;
+                let region_right = columns - 1;
+                let rectangle = format!(
+                    "\u{1b}[?69h\u{1b}[1;{region_bottom}r\u{1b}[2;{region_right}s\
+                     \u{1b}[{region_bottom};{region_right}HXY\r\n\u{1b}[?69l\u{1b}[r"
+                );
+                output(&mut terminal, sequence, rectangle.as_bytes())
+                    .expect("partial rectangle wrap and hard LF");
+            }
+            4 => {
+                let next_columns = 3 + u32::try_from((random >> 8) % 8).expect("bounded columns");
+                let next_rows = 2 + u32::try_from((random >> 16) % 5).expect("bounded rows");
+                terminal
+                    .apply_event(Event::Resize {
+                        source_sequence: sequence,
+                        columns: next_columns,
+                        rows: next_rows,
+                    })
+                    .expect("state-machine reflow");
+            }
+            5 if rows >= 3 => {
+                let region_bottom = rows - 1;
+                let row_edits =
+                    format!("\u{1b}[1;{region_bottom}r\u{1b}[1;1H\u{1b}[L\u{1b}[M\u{1b}[r");
+                output(&mut terminal, sequence, row_edits.as_bytes()).expect("bounded row shifts");
+            }
+            6 => {
+                let history = format!("\u{1b}[{rows};1H\r\nH{sequence:03}\r\nT{sequence:03}");
+                output(&mut terminal, sequence, history.as_bytes()).expect("history retention");
+            }
+            _ => {
+                output(&mut terminal, sequence, b"\x1b[HABCD\x1b[2K").expect("wrap cancellation");
+            }
+        }
+
+        terminal.main.validate().unwrap_or_else(|error| {
+            panic!("main screen is noncanonical after sequence {sequence}: {error}")
+        });
+        terminal.alternate.validate().unwrap_or_else(|error| {
+            panic!("alternate screen is noncanonical after sequence {sequence}: {error}")
+        });
+        let snapshot = terminal
+            .export_snapshot_v2()
+            .unwrap_or_else(|error| panic!("snapshot failed after sequence {sequence}: {error}"));
+        let restored = Terminal::import_snapshot_v2(&snapshot).unwrap_or_else(|error| {
+            panic!("snapshot restore failed after sequence {sequence}: {error}")
+        });
+        assert_eq!(
+            restored
+                .export_snapshot_v2()
+                .expect("canonical snapshot re-export"),
+            snapshot,
+            "snapshot bytes changed after sequence {sequence}"
+        );
+        assert_eq!(
+            restored.export_render_frame_v3(),
+            terminal.export_render_frame_v3(),
+            "live frame changed after sequence {sequence}"
+        );
+        let available = terminal.scrollback_info().0;
+        for offset in [0, available / 2, available] {
+            assert_eq!(
+                restored.export_render_frame_v3_at_scrollback(offset),
+                terminal.export_render_frame_v3_at_scrollback(offset),
+                "history frame changed at offset {offset} after sequence {sequence}"
+            );
+        }
+        terminal = restored;
+    }
+}
+
+#[test]
 fn renderer_scrollback_window_and_generation_follow_output_without_changing_live_cells() {
     let mut terminal = Terminal::new_with_options(
         3,

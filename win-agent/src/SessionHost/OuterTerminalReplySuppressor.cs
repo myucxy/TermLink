@@ -9,8 +9,9 @@ namespace TermLink.SessionHost
     /// Suppresses bounded terminal-generated replies for which terminal-core has already emitted
     /// the authoritative PTY reply. If terminal-core has no configured OSC color baseline, the
     /// outer terminal's expected color reply is forwarded to ConPTY as protocol input without
-    /// being classified as a local key press. Ordinary key input and unmatched escape sequences
-    /// pass through unchanged. A query or reply may span multiple reads.
+    /// being classified as a local key press. Renderer-local text-area pixel reports are consumed
+    /// because terminal-core deliberately leaves CSI 14 t unanswered. Ordinary key input and
+    /// unmatched escape sequences pass through unchanged. A query or reply may span multiple reads.
     /// </summary>
     internal sealed class OuterTerminalReplySuppressor : IDisposable
     {
@@ -30,6 +31,7 @@ namespace TermLink.SessionHost
         private readonly Timer expiryTimer;
         private readonly List<byte> observedOscSelector = new List<byte>(4);
         private readonly List<byte> observedOscPayload = new List<byte>(256);
+        private readonly List<byte> observedCsiBody = new List<byte>(32);
         private readonly bool[] observedPaletteKnown = new bool[256];
         private readonly bool[] observedDefaultColorKnown = new bool[3];
         private DateTime candidateExpiresUtc;
@@ -129,17 +131,14 @@ namespace TermLink.SessionHost
                 projectingAuthority = TakeAuthorityReplies(sourceSequence);
                 try
                 {
-                    if (terminalReplyPassThrough != null)
+                    for (var offset = 0; offset < length; offset++)
                     {
-                        for (var offset = 0; offset < length; offset++)
-                        {
-                            ObserveOutputByte(
-                                output[offset],
-                                now,
-                                sourceSequence,
-                                checked((uint)offset + 1),
-                                projectionId);
-                        }
+                        ObserveOutputByte(
+                            output[offset],
+                            now,
+                            sourceSequence,
+                            checked((uint)offset + 1),
+                            projectionId);
                     }
                     ActivateRemainingAuthorityReplies(projectionId, now);
                     bool projected;
@@ -429,10 +428,23 @@ namespace TermLink.SessionHost
             switch (outputParseState)
             {
                 case OutputParseState.Normal:
-                    if (value == 0x1b) outputParseState = OutputParseState.Escape;
+                    if (value == 0x1b)
+                    {
+                        outputParseState = OutputParseState.Escape;
+                    }
+                    else if (value == 0x9b)
+                    {
+                        observedCsiBody.Clear();
+                        outputParseState = OutputParseState.Csi;
+                    }
                     return;
                 case OutputParseState.Escape:
-                    if (value == (byte)']')
+                    if (value == (byte)'[')
+                    {
+                        observedCsiBody.Clear();
+                        outputParseState = OutputParseState.Csi;
+                    }
+                    else if (value == (byte)']')
                     {
                         observedOscSelector.Clear();
                         observedOscPayload.Clear();
@@ -443,6 +455,35 @@ namespace TermLink.SessionHost
                         outputParseState = value == 0x1b
                             ? OutputParseState.Escape
                             : OutputParseState.Normal;
+                    }
+                    return;
+                case OutputParseState.Csi:
+                    if (value >= 0x40 && value <= 0x7e)
+                    {
+                        CompleteObservedCsi(
+                            value,
+                            now,
+                            sourceSequence,
+                            sourceOffsetEnd,
+                            projectionId);
+                    }
+                    else if (value >= 0x20 && value <= 0x3f &&
+                        observedCsiBody.Count < MaximumCsiReplyBytes)
+                    {
+                        observedCsiBody.Add(value);
+                    }
+                    else if (value == 0x1b)
+                    {
+                        observedCsiBody.Clear();
+                        outputParseState = OutputParseState.Escape;
+                    }
+                    else if (value == 0x9b)
+                    {
+                        observedCsiBody.Clear();
+                    }
+                    else
+                    {
+                        ResetObservedCsi();
                     }
                     return;
                 case OutputParseState.OscSelector:
@@ -542,6 +583,43 @@ namespace TermLink.SessionHost
                 default:
                     throw new InvalidOperationException("Unknown terminal output parser state.");
             }
+        }
+
+        private void CompleteObservedCsi(
+            byte finalByte,
+            DateTime now,
+            ulong sourceSequence,
+            uint sourceOffsetEnd,
+            long projectionId)
+        {
+            try
+            {
+                // CSI 14 t asks for renderer-local text-area pixel geometry. terminal-core owns
+                // only durable cell geometry and intentionally emits no PTY reply. Windows
+                // Terminal still answers the projected query through the console input buffer;
+                // consume that compatibility reply so it cannot masquerade as a local key press.
+                if (finalByte == (byte)'t' && IsExactAscii(observedCsiBody, "14"))
+                {
+                    EnqueueProjectionExpectation(
+                        ReplyKind.TextAreaPixelSize,
+                        4,
+                        ExpectationDisposition.Suppress,
+                        now,
+                        sourceSequence,
+                        sourceOffsetEnd,
+                        projectionId);
+                }
+            }
+            finally
+            {
+                ResetObservedCsi();
+            }
+        }
+
+        private void ResetObservedCsi()
+        {
+            observedCsiBody.Clear();
+            outputParseState = OutputParseState.Normal;
         }
 
         private void CompleteObservedOsc(
@@ -716,12 +794,32 @@ namespace TermLink.SessionHost
             uint sourceOffsetEnd,
             long projectionId)
         {
+            if (terminalReplyPassThrough == null) return;
+            EnqueueProjectionExpectation(
+                kind,
+                qualifier,
+                ExpectationDisposition.Forward,
+                now,
+                sourceSequence,
+                sourceOffsetEnd,
+                projectionId);
+        }
+
+        private void EnqueueProjectionExpectation(
+            ReplyKind kind,
+            int qualifier,
+            ExpectationDisposition disposition,
+            DateTime now,
+            ulong sourceSequence,
+            uint sourceOffsetEnd,
+            long projectionId)
+        {
             expected.Add(new ExpectedReply(
                 NextExpectationId(),
                 kind,
                 qualifier,
                 null,
-                ExpectationDisposition.Forward,
+                disposition,
                 now + ExpectationLifetime,
                 projectionId,
                 sourceSequence,
@@ -964,6 +1062,11 @@ namespace TermLink.SessionHost
                 if (final == (byte)'u') return ReplyKind.KeyboardFlags;
                 if (final == (byte)'y' && length >= 5 && bytes[end - 2] == (byte)'$')
                     return ReplyKind.ModeReport;
+                if (final == (byte)'t' && IsTextAreaPixelSizeReply(bytes, offset, length))
+                {
+                    qualifier = 4;
+                    return ReplyKind.TextAreaPixelSize;
+                }
                 return ReplyKind.Exact;
             }
             if (bytes[offset + 1] == (byte)'P')
@@ -1015,6 +1118,47 @@ namespace TermLink.SessionHost
                 }
             }
             return ReplyKind.Exact;
+        }
+
+        private static bool IsTextAreaPixelSizeReply(byte[] bytes, int offset, int length)
+        {
+            // Xterm window-operation response: CSI 4 ; height ; width t.
+            if (length < 8 || bytes[offset] != 0x1b || bytes[offset + 1] != (byte)'[' ||
+                bytes[offset + length - 1] != (byte)'t') return false;
+            var end = offset + length - 1;
+            var firstSeparator = Array.IndexOf(bytes, (byte)';', offset + 2, end - offset - 2);
+            if (firstSeparator < 0) return false;
+            var secondSeparator = Array.IndexOf(
+                bytes,
+                (byte)';',
+                firstSeparator + 1,
+                end - firstSeparator - 1);
+            if (secondSeparator < 0 || Array.IndexOf(
+                bytes,
+                (byte)';',
+                secondSeparator + 1,
+                end - secondSeparator - 1) >= 0) return false;
+            int operation;
+            int height;
+            int width;
+            return TryParseDecimal(
+                    bytes,
+                    offset + 2,
+                    firstSeparator - offset - 2,
+                    4,
+                    out operation) && operation == 4 &&
+                TryParseDecimal(
+                    bytes,
+                    firstSeparator + 1,
+                    secondSeparator - firstSeparator - 1,
+                    int.MaxValue,
+                    out height) && height > 0 &&
+                TryParseDecimal(
+                    bytes,
+                    secondSeparator + 1,
+                    end - secondSeparator - 1,
+                    int.MaxValue,
+                    out width) && width > 0;
         }
 
         private static bool IsRgbColorPayload(IList<byte> bytes, int offset, int length)
@@ -1209,7 +1353,8 @@ namespace TermLink.SessionHost
             OscPayload,
             OscEscape,
             IgnoreOsc,
-            IgnoreOscEscape
+            IgnoreOscEscape,
+            Csi
         }
 
         private enum ReplyKind
@@ -1228,7 +1373,8 @@ namespace TermLink.SessionHost
             PaletteColor,
             DefaultForeground,
             DefaultBackground,
-            DefaultCursor
+            DefaultCursor,
+            TextAreaPixelSize
         }
 
         public void Dispose()

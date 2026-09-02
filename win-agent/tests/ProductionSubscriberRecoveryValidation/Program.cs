@@ -4,9 +4,11 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Net.WebSockets;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using TermLink.Protocol;
@@ -27,7 +29,10 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                 var runtimeType = Assembly.Load("TermLink.Agent").GetType(
                     "TermLink.Agent.ProductionAgentRuntime",
                     throwOnError: true);
-                ValidateSubscribeGenerationResetsFlowEpoch(runtimeType);
+                ValidateFullSubscriberWindowRecoversAcrossSubscribeGeneration(runtimeType);
+                ValidateAuthorizedRecipientSigningKeyContract(runtimeType);
+                ValidateDirectPeerProviderIsolation(runtimeType);
+                ValidateNetworkAvailabilityRelayFirst(runtimeType);
                 ValidateRetainedRouteSkipsForcedRefresh(runtimeType);
                 ValidateSharedAccountLeaseInput(runtimeType);
                 ValidateLeaseFencingAndAuthorization(runtimeType);
@@ -46,44 +51,528 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
             }
         }
 
-        private static void ValidateSubscribeGenerationResetsFlowEpoch(Type runtimeType)
+        private static void ValidateAuthorizedRecipientSigningKeyContract(Type runtimeType)
+        {
+            var parse = runtimeType.GetMethod("ParseAuthorizedRecipientKeys", StaticFlags);
+            Require(parse != null, "Authorized-recipient key parser is unavailable.");
+            var deviceId = Guid.NewGuid();
+            var exchange = new byte[32];
+            var signing = new byte[32];
+            for (var index = 0; index < 32; index++)
+            {
+                exchange[index] = checked((byte)(index + 1));
+                signing[index] = checked((byte)(0x80 + index));
+            }
+            var body = "{\"key_epoch\":7,\"items\":[{\"device_id\":\"" +
+                deviceId.ToString("D") +
+                "\",\"device_type\":\"ANDROID\",\"exchange_public_key\":\"" +
+                Convert.ToBase64String(exchange) +
+                "\",\"signing_public_key\":\"" +
+                Convert.ToBase64String(signing) + "\"}]}";
+            using (var document = JsonDocument.Parse(body))
+            {
+                var arguments = new object[] { document.RootElement, 7L, 0L };
+                var parsed = (IDictionary)parse.Invoke(null, arguments);
+                Require((long)arguments[2] == 7L && parsed.Count == 1 &&
+                        parsed.Contains(deviceId),
+                    "Authorized-recipient key epoch or device identity was not retained.");
+                var material = parsed[deviceId];
+                var materialType = material.GetType();
+                var retainedExchange = (byte[])materialType.GetProperty(
+                    "ExchangePublicKey", InstanceFlags).GetValue(material);
+                var retainedSigning = (byte[])materialType.GetProperty(
+                    "SigningPublicKey", InstanceFlags).GetValue(material);
+                Require(retainedExchange.AsSpan().SequenceEqual(exchange) &&
+                        retainedSigning.AsSpan().SequenceEqual(signing),
+                    "Authorized-recipient exchange/signing keys were not retained independently.");
+                ((IDisposable)material).Dispose();
+                Require(IsAllZero(retainedExchange) && IsAllZero(retainedSigning),
+                    "Authorized-recipient signing material was not zeroized on retirement.");
+            }
+
+            var missingSigning = "{\"key_epoch\":7,\"items\":[{\"device_id\":\"" +
+                deviceId.ToString("D") +
+                "\",\"device_type\":\"ANDROID\",\"exchange_public_key\":\"" +
+                Convert.ToBase64String(exchange) + "\"}]}";
+            using (var document = JsonDocument.Parse(missingSigning))
+            {
+                try
+                {
+                    parse.Invoke(null, new object[] { document.RootElement, 7L, 0L });
+                    throw new InvalidOperationException(
+                        "A recipient without a signing key crossed the Direct authorization boundary.");
+                }
+                catch (TargetInvocationException error) when (
+                    error.InnerException is InvalidDataException)
+                {
+                }
+            }
+        }
+
+        private static bool IsAllZero(byte[] value)
+        {
+            if (value == null) return false;
+            foreach (var item in value)
+                if (item != 0) return false;
+            return true;
+        }
+
+        private static void ValidateDirectPeerProviderIsolation(Type runtimeType)
+        {
+            var snapshotPeers = runtimeType.GetMethod(
+                "SnapshotDirectPeerAuthorizationsAsync",
+                InstanceFlags);
+            var createAuthorized = runtimeType.GetMethod(
+                "CreateAuthorizedSubscriberWithSigningKey",
+                StaticFlags);
+            var retireAuthorized = runtimeType.GetMethod("RetireSubscriber", StaticFlags);
+            var subscriberType = runtimeType.GetNestedType("Subscriber", BindingFlags.NonPublic);
+            var publicationStateType = runtimeType.GetNestedType(
+                "SessionPublicationState",
+                BindingFlags.NonPublic);
+            Require(snapshotPeers != null && createAuthorized != null && retireAuthorized != null &&
+                    subscriberType != null && publicationStateType != null,
+                "Direct peer-provider isolation hooks are unavailable.");
+
+            var configType = runtimeType.Assembly.GetType(
+                "TermLink.Agent.ProductionAgentConfig",
+                throwOnError: true);
+            var credentialsType = runtimeType.Assembly.GetType(
+                "TermLink.Agent.ProductionCredentials",
+                throwOnError: true);
+            var supervisorType = runtimeType.Assembly.GetType(
+                "TermLink.Agent.ProductionRealtimeConnectionSupervisor",
+                throwOnError: true);
+            var preferencesType = runtimeType.Assembly.GetType(
+                "TermLink.Agent.ProductionReconnectPreferences",
+                throwOnError: true);
+            var runtime = RuntimeHelpers.GetUninitializedObject(runtimeType);
+            var config = Activator.CreateInstance(configType, nonPublic: true);
+            var pcId = Guid.NewGuid();
+            var pcDeviceId = Guid.NewGuid();
+            var recipientDeviceId = Guid.NewGuid();
+            var sessionId = Guid.NewGuid();
+            var historySessionId = Guid.NewGuid();
+            SetProperty(configType, config, "ServerUrl", "https://unit.test");
+            SetProperty(configType, config, "PcId", pcId);
+            SetProperty(configType, config, "KeyEpoch", 7L);
+            SetProperty(configType, config, "OIDCIssuer", "https://oidc.unit.test");
+            SetProperty(configType, config, "OIDCClientId", "unit-test-client");
+
+            using var localIdentity = DeviceIdentity.Generate();
+            using var remoteIdentity = DeviceIdentity.Generate();
+            var credentials = RuntimeHelpers.GetUninitializedObject(credentialsType);
+            SetField(credentialsType, credentials, "tokenSync", new object());
+            SetProperty(credentialsType, credentials, "DeviceId", pcDeviceId);
+            SetProperty(credentialsType, credentials, "Identity", localIdentity);
+            SetProperty(credentialsType, credentials, "AccessToken", "unchanged-stale-token");
+            SetProperty(credentialsType, credentials, "RefreshToken", "must-not-refresh");
+            var accessTokenExpiry = DateTime.UtcNow.AddHours(-1);
+            SetProperty(
+                credentialsType,
+                credentials,
+                "AccessTokenExpiresAtUtc",
+                accessTokenExpiry);
+
+            var handler = new ScriptedHandler((request, token) =>
+                Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest)));
+            using var http = new HttpClient(handler);
+            using var socket = new ClientWebSocket();
+            var preferences = Activator.CreateInstance(preferencesType);
+            var supervisorConstructor = supervisorType.GetConstructors(InstanceFlags)[0];
+            var supervisor = supervisorConstructor.Invoke(new object[]
+            {
+                preferences,
+                (Func<int>)(() => 0),
+                null,
+                null
+            });
+            using var supervisorLifetime = (IDisposable)supervisor;
+            var markConnected = supervisorType.GetMethod("MarkPhysicalConnected", InstanceFlags);
+            var supervisorSnapshot = supervisorType.GetMethod("Snapshot", InstanceFlags);
+            Require(markConnected != null && supervisorSnapshot != null,
+                "Relay supervisor generation hooks are unavailable.");
+            var relayGeneration = (long)markConnected.Invoke(supervisor, Array.Empty<object>());
+            var relayBefore = supervisorSnapshot.Invoke(supervisor, Array.Empty<object>());
+
+            SetField(runtimeType, runtime, "config", config);
+            SetField(runtimeType, runtime, "credentials", credentials);
+            SetField(runtimeType, runtime, "http", http);
+            SetField(runtimeType, runtime, "tokenRefreshGate", new SemaphoreSlim(1, 1));
+            SetField(runtimeType, runtime, "authorizedRecipientGate", new SemaphoreSlim(1, 1));
+            SetField(runtimeType, runtime, "authorityExpiresUtc", DateTime.MinValue);
+            SetField(runtimeType, runtime, "tokenEndpoint", "https://oidc.unit.test/token");
+            SetField(runtimeType, runtime, "lifecycleSync", new object());
+            SetField(runtimeType, runtime, "statusSync", new object());
+            SetField(runtimeType, runtime, "connectionSupervisor", supervisor);
+            SetField(runtimeType, runtime, "socket", socket);
+            SetField(runtimeType, runtime, "relayErrorCode", "unchanged-relay-state");
+
+            var authorizedRecipients = NewRuntimeField(runtimeType, "authorizedRecipients");
+            var subscribers = NewRuntimeField(runtimeType, "subscribers");
+            var routes = NewRuntimeField(runtimeType, "connectionSubscriberRoutes");
+            var pendingHistory = NewRuntimeField(runtimeType, "pendingHistorySessions");
+            var terminalHistory = NewRuntimeField(runtimeType, "terminalHistorySessions");
+            var persistedHistoryBacklog = NewRuntimeField(runtimeType, "persistedHistoryBacklog");
+            var persistedHistorySessions = NewRuntimeField(
+                runtimeType,
+                "persistedHistoryBacklogSessions");
+            var historyReconcile = NewRuntimeField(runtimeType, "historyReconcileSessions");
+            var publicationStates = NewRuntimeField(runtimeType, "publicationStates");
+            var historySignal = new SemaphoreSlim(0, 1);
+            var metadataSignal = new SemaphoreSlim(0, 1);
+            SetField(runtimeType, runtime, "authorizedRecipients", authorizedRecipients);
+            SetField(runtimeType, runtime, "subscribers", subscribers);
+            SetField(runtimeType, runtime, "connectionSubscriberRoutes", routes);
+            SetField(runtimeType, runtime, "pendingHistorySessions", pendingHistory);
+            SetField(runtimeType, runtime, "terminalHistorySessions", terminalHistory);
+            SetField(runtimeType, runtime, "persistedHistoryBacklog", persistedHistoryBacklog);
+            SetField(
+                runtimeType,
+                runtime,
+                "persistedHistoryBacklogSessions",
+                persistedHistorySessions);
+            SetField(runtimeType, runtime, "historyReconcileSessions", historyReconcile);
+            SetField(runtimeType, runtime, "publicationStates", publicationStates);
+            SetField(runtimeType, runtime, "historySignal", historySignal);
+            SetField(runtimeType, runtime, "metadataSignal", metadataSignal);
+
+            var signingPublicKey = new byte[32];
+            for (var index = 0; index < signingPublicKey.Length; index++)
+                signingPublicKey[index] = checked((byte)(0xa0 + index));
+            var authorized = createAuthorized.Invoke(null, new object[]
+            {
+                localIdentity.Exchange,
+                pcDeviceId,
+                recipientDeviceId,
+                remoteIdentity.Exchange.PublicKey,
+                signingPublicKey,
+                7L
+            });
+            var invalidRecipient = Activator.CreateInstance(subscriberType, nonPublic: true);
+            SetField(subscriberType, invalidRecipient, "DeviceId", Guid.NewGuid());
+            SetField(subscriberType, invalidRecipient, "PairwiseKey", new byte[31]);
+            SetField(subscriberType, invalidRecipient, "SigningPublicKey", new byte[32]);
+            SetField(subscriberType, invalidRecipient, "KeyEpoch", 7L);
+            var staleRecipient = Activator.CreateInstance(subscriberType, nonPublic: true);
+            SetField(subscriberType, staleRecipient, "DeviceId", Guid.NewGuid());
+            SetField(subscriberType, staleRecipient, "PairwiseKey", new byte[32]);
+            SetField(subscriberType, staleRecipient, "SigningPublicKey", new byte[32]);
+            SetField(subscriberType, staleRecipient, "KeyEpoch", 6L);
+            Require(TryAdd(authorizedRecipients, recipientDeviceId, authorized) &&
+                    TryAdd(
+                        authorizedRecipients,
+                        GetField(subscriberType, invalidRecipient, "DeviceId"),
+                        invalidRecipient) &&
+                    TryAdd(
+                        authorizedRecipients,
+                        GetField(subscriberType, staleRecipient, "DeviceId"),
+                        staleRecipient),
+                "Direct peer-provider authorization fixture could not be arranged.");
+
+            SetField(subscriberType, authorized, "HighestAck", 51UL);
+            SetField(subscriberType, authorized, "LastSentSequence", 53UL);
+            SetField(subscriberType, authorized, "InFlightWireBytes", 6UL);
+            var sentFrames = (IDictionary)GetField(subscriberType, authorized, "SentFrames");
+            var sent52 = new byte[] { 1, 2, 3 };
+            var sent53 = new byte[] { 4, 5, 6 };
+            sentFrames.Add(52UL, sent52);
+            sentFrames.Add(53UL, sent53);
+            var generationFrames = GetField(
+                subscriberType,
+                authorized,
+                "GenerationInFlightSequences");
+            generationFrames.GetType().GetMethod("Add").Invoke(
+                generationFrames,
+                new object[] { 52UL });
+            generationFrames.GetType().GetMethod("Add").Invoke(
+                generationFrames,
+                new object[] { 53UL });
+
+            var subscriberMapType = subscribers.GetType().GetGenericArguments()[1];
+            var subscriberMap = Activator.CreateInstance(subscriberMapType);
+            Require(TryAdd(subscriberMap, recipientDeviceId, authorized) &&
+                    TryAdd(subscribers, sessionId, subscriberMap) &&
+                    TryAdd(routes, sessionId.ToString("D") + ":" + recipientDeviceId.ToString("D"), authorized),
+                "Direct peer-provider subscriber/route fixture could not be arranged.");
+            Require(TryAdd(pendingHistory, historySessionId, (byte)0) &&
+                    TryAdd(terminalHistory, historySessionId, (byte)0) &&
+                    TryAdd(persistedHistorySessions, historySessionId, (byte)0) &&
+                    TryAdd(historyReconcile, historySessionId, (byte)0),
+                "Direct peer-provider history fixture could not be arranged.");
+            persistedHistoryBacklog.GetType().GetMethod("Enqueue").Invoke(
+                persistedHistoryBacklog,
+                new object[] { historySessionId });
+            var publicationState = Activator.CreateInstance(publicationStateType, nonPublic: true);
+            SetField(publicationStateType, publicationState, "HasSize", true);
+            SetField(publicationStateType, publicationState, "RestDirty", false);
+            SetField(publicationStateType, publicationState, "RestRevision", 17UL);
+            SetField(publicationStateType, publicationState, "Title", "unchanged-title");
+            Require(TryAdd(publicationStates, sessionId, publicationState),
+                "Direct peer-provider title fixture could not be arranged.");
+
+            var storedPairwise = (byte[])GetField(subscriberType, authorized, "PairwiseKey");
+            var storedSigning = (byte[])GetField(subscriberType, authorized, "SigningPublicKey");
+            var expectedPairwise = (byte[])storedPairwise.Clone();
+            var expectedSigning = (byte[])storedSigning.Clone();
+            var initialSocketState = socket.State;
+            var initialBacklogCount = CollectionCount(persistedHistoryBacklog);
+
+            object directPeer = null;
+            try
+            {
+                var task = (Task)snapshotPeers.Invoke(
+                    runtime,
+                    new object[] { CancellationToken.None });
+                task.GetAwaiter().GetResult();
+                var peers = (IEnumerable)task.GetType().GetProperty("Result").GetValue(task);
+                var peerCount = 0;
+                foreach (var peer in peers)
+                {
+                    directPeer = peer;
+                    peerCount++;
+                }
+                Require(peerCount == 1 && directPeer != null,
+                    "Direct peer provider did not filter invalid published authorizations.");
+
+                Require(handler.RequestCount == 0,
+                    "Direct peer provider performed shared HTTP/token refresh work.");
+                Require((int)GetField(runtimeType, runtime, "reauthenticationRequired") == 0 &&
+                        string.Equals(
+                            (string)GetProperty(credentials, "AccessToken"),
+                            "unchanged-stale-token",
+                            StringComparison.Ordinal) &&
+                        string.Equals(
+                            (string)GetProperty(credentials, "RefreshToken"),
+                            "must-not-refresh",
+                            StringComparison.Ordinal) &&
+                        (DateTime)GetProperty(credentials, "AccessTokenExpiresAtUtc") == accessTokenExpiry,
+                    "Direct peer provider entered shared reauthentication/token mutation state.");
+                var relayAfter = supervisorSnapshot.Invoke(supervisor, Array.Empty<object>());
+                Require((long)GetProperty(relayBefore, "PhysicalGeneration") == relayGeneration &&
+                        (long)GetProperty(relayAfter, "PhysicalGeneration") == relayGeneration &&
+                        (bool)GetProperty(relayAfter, "PhysicalConnected") &&
+                        ReferenceEquals(GetField(runtimeType, runtime, "socket"), socket) &&
+                        socket.State == initialSocketState,
+                    "Direct peer provider aborted or replaced the authoritative Relay generation.");
+
+                Require(CollectionCount(authorizedRecipients) == 3 &&
+                        ReferenceEquals(DictionaryValue(authorizedRecipients, recipientDeviceId), authorized) &&
+                        CollectionCount(subscribers) == 1 &&
+                        ReferenceEquals(DictionaryValue(subscriberMap, recipientDeviceId), authorized) &&
+                        CollectionCount(routes) == 1 &&
+                        (ulong)GetField(subscriberType, authorized, "HighestAck") == 51UL &&
+                        (ulong)GetField(subscriberType, authorized, "LastSentSequence") == 53UL &&
+                        (ulong)GetField(subscriberType, authorized, "InFlightWireBytes") == 6UL &&
+                        sentFrames.Count == 2 &&
+                        ReferenceEquals(sentFrames[52UL], sent52) &&
+                        ReferenceEquals(sentFrames[53UL], sent53) &&
+                        CollectionCount(generationFrames) == 2 &&
+                        !(bool)GetField(subscriberType, authorized, "Removed"),
+                    "Direct peer provider mutated Relay subscriber delivery state.");
+                Require(CollectionCount(pendingHistory) == 1 &&
+                        CollectionCount(terminalHistory) == 1 &&
+                        CollectionCount(persistedHistorySessions) == 1 &&
+                        CollectionCount(historyReconcile) == 1 &&
+                        CollectionCount(persistedHistoryBacklog) == initialBacklogCount &&
+                        historySignal.CurrentCount == 0 && metadataSignal.CurrentCount == 0 &&
+                        !(bool)GetField(publicationStateType, publicationState, "RestDirty") &&
+                        (ulong)GetField(publicationStateType, publicationState, "RestRevision") == 17UL &&
+                        string.Equals(
+                            (string)GetField(publicationStateType, publicationState, "Title"),
+                            "unchanged-title",
+                            StringComparison.Ordinal),
+                    "Direct peer provider scheduled history replay or title republish.");
+
+                var peerPairwise = (byte[])GetProperty(directPeer, "PairwiseKey");
+                var peerSigning = (byte[])GetProperty(directPeer, "SigningPublicKey");
+                Require((Guid)GetProperty(directPeer, "DeviceId") == recipientDeviceId &&
+                        (long)GetProperty(directPeer, "KeyEpoch") == 7L &&
+                        !ReferenceEquals(peerPairwise, storedPairwise) &&
+                        !ReferenceEquals(peerSigning, storedSigning) &&
+                        peerPairwise.AsSpan().SequenceEqual(expectedPairwise) &&
+                        peerSigning.AsSpan().SequenceEqual(expectedSigning),
+                    "Direct peer provider did not return independently owned key copies.");
+                peerPairwise[0] ^= 0xff;
+                peerSigning[0] ^= 0xff;
+                Require(storedPairwise.AsSpan().SequenceEqual(expectedPairwise) &&
+                        storedSigning.AsSpan().SequenceEqual(expectedSigning),
+                    "Mutating Direct peer key copies changed stored Relay subscriber keys.");
+                ((IDisposable)directPeer).Dispose();
+                Require(IsAllZero(peerPairwise) && IsAllZero(peerSigning) &&
+                        GetProperty(directPeer, "PairwiseKey") == null &&
+                        GetProperty(directPeer, "SigningPublicKey") == null &&
+                        storedPairwise.AsSpan().SequenceEqual(expectedPairwise) &&
+                        storedSigning.AsSpan().SequenceEqual(expectedSigning),
+                    "Direct peer disposal did not zero only its independently owned key copies.");
+                directPeer = null;
+            }
+            finally
+            {
+                if (directPeer is IDisposable disposablePeer) disposablePeer.Dispose();
+                retireAuthorized.Invoke(null, new[] { authorized });
+                retireAuthorized.Invoke(null, new[] { invalidRecipient });
+                retireAuthorized.Invoke(null, new[] { staleRecipient });
+                historySignal.Dispose();
+                metadataSignal.Dispose();
+                ((SemaphoreSlim)GetField(runtimeType, runtime, "tokenRefreshGate")).Dispose();
+                ((SemaphoreSlim)GetField(runtimeType, runtime, "authorizedRecipientGate")).Dispose();
+            }
+
+            var emptyRuntime = RuntimeHelpers.GetUninitializedObject(runtimeType);
+            SetField(
+                runtimeType,
+                emptyRuntime,
+                "authorizedRecipients",
+                NewRuntimeField(runtimeType, "authorizedRecipients"));
+            var emptyTask = (Task)snapshotPeers.Invoke(
+                emptyRuntime,
+                new object[] { CancellationToken.None });
+            emptyTask.GetAwaiter().GetResult();
+            Require(CollectionCount(emptyTask.GetType().GetProperty("Result").GetValue(emptyTask)) == 0,
+                "An empty published authorization snapshot did not safely return no Direct peers.");
+        }
+
+        private static void ValidateNetworkAvailabilityRelayFirst(Type runtimeType)
+        {
+            var dispatch = runtimeType.GetMethod(
+                "DispatchNetworkAvailabilityChange",
+                StaticFlags);
+            Require(dispatch != null, "Network-availability isolation hook is unavailable.");
+
+            var throwingOrder = new ConcurrentQueue<string>();
+            dispatch.Invoke(null, new object[]
+            {
+                true,
+                (Action)(() => throwingOrder.Enqueue("relay")),
+                (Action)(() =>
+                {
+                    throwingOrder.Enqueue("direct");
+                    throw new InvalidOperationException("deterministic Direct failure");
+                })
+            });
+            Require(string.Join(",", throwingOrder.ToArray()) == "relay,direct",
+                "A throwing Direct callback escaped or ran before Relay network recovery.");
+
+            using var relayObserved = new ManualResetEventSlim(false);
+            using var directStarted = new ManualResetEventSlim(false);
+            using var releaseDirect = new ManualResetEventSlim(false);
+            var slowOrder = new ConcurrentQueue<string>();
+            var slowDispatch = Task.Run(() => dispatch.Invoke(null, new object[]
+            {
+                true,
+                (Action)(() =>
+                {
+                    slowOrder.Enqueue("relay");
+                    relayObserved.Set();
+                }),
+                (Action)(() =>
+                {
+                    slowOrder.Enqueue("direct");
+                    directStarted.Set();
+                    releaseDirect.Wait();
+                })
+            }));
+            var directWasStarted = directStarted.Wait(TimeSpan.FromSeconds(2));
+            try
+            {
+                Require(directWasStarted && relayObserved.IsSet,
+                    "Slow Direct work began before Relay received network availability.");
+                Require(!slowDispatch.IsCompleted,
+                    "Slow Direct ordering fixture did not retain its deterministic gate.");
+                Require(string.Join(",", slowOrder.ToArray()) == "relay,direct",
+                    "Slow Direct work was ordered ahead of Relay network recovery.");
+            }
+            finally
+            {
+                releaseDirect.Set();
+            }
+            slowDispatch.GetAwaiter().GetResult();
+
+            var unavailableRelayCalls = 0;
+            var unavailableDirectCalls = 0;
+            dispatch.Invoke(null, new object[]
+            {
+                false,
+                (Action)(() => unavailableRelayCalls++),
+                (Action)(() => unavailableDirectCalls++)
+            });
+            Require(unavailableRelayCalls == 0 && unavailableDirectCalls == 1,
+                "Network-unavailable notification changed the existing Direct-only behavior.");
+        }
+
+        private static void ValidateFullSubscriberWindowRecoversAcrossSubscribeGeneration(
+            Type runtimeType)
         {
             var subscriberType = runtimeType.GetNestedType("Subscriber", BindingFlags.NonPublic);
             var resetCursor = runtimeType.GetMethod("ResetSubscriberCursor", StaticFlags);
             var applyFlowControl = runtimeType.GetMethod("TryApplyFlowControl", StaticFlags);
             var takeDrainRequest = runtimeType.GetMethod("TakeSubscriberDrainRequest", StaticFlags);
+            var prepareFrame = runtimeType.GetMethod("PrepareNewSubscriberFrame", StaticFlags);
+            var prepareCachedFrame = runtimeType.GetMethod(
+                "PrepareCachedSubscriberFrameForSend",
+                StaticFlags);
+            var prepareReplay = runtimeType.GetMethod("TryPrepareSubscriberReplay", StaticFlags);
+            var advanceAck = runtimeType.GetMethod("TryAdvanceSubscriberAck", StaticFlags);
             Require(subscriberType != null && resetCursor != null && applyFlowControl != null &&
-                takeDrainRequest != null,
+                takeDrainRequest != null && prepareFrame != null && prepareCachedFrame != null &&
+                prepareReplay != null && advanceAck != null,
                 "Subscriber flow-control recovery hooks are unavailable.");
 
             var subscriber = Activator.CreateInstance(subscriberType, nonPublic: true);
             SetField(subscriberType, subscriber, "HighestAck", 51UL);
-            SetField(subscriberType, subscriber, "LastSentSequence", 57UL);
-            SetField(subscriberType, subscriber, "FlowPaused", true);
+            SetField(subscriberType, subscriber, "LastSentSequence", 179UL);
+            SetField(subscriberType, subscriber, "FlowPaused", false);
             SetField(subscriberType, subscriber, "FlowWindowEvents", 128);
-            SetField(subscriberType, subscriber, "FlowWindowWireBytes", 512UL * 1024UL);
+            SetField(subscriberType, subscriber, "FlowWindowWireBytes", 4_096UL);
             SetField(subscriberType, subscriber, "FlowControlEpoch", 5UL);
-            SetField(subscriberType, subscriber, "InFlightWireBytes", 48UL);
-            SetField(subscriberType, subscriber, "DrainRequested", true);
 
             var sentFrames = (IDictionary)GetField(subscriberType, subscriber, "SentFrames");
-            for (ulong sequence = 52; sequence <= 57; sequence++)
-                sentFrames.Add(sequence, new byte[8]);
+            var generationFrames = GetField(
+                subscriberType,
+                subscriber,
+                "GenerationInFlightSequences");
+            var originalFrames = new byte[128][];
+            for (ulong sequence = 52; sequence <= 179; sequence++)
+            {
+                var serialized = SubscriberFrameBytes(sequence, 32);
+                originalFrames[checked((int)(sequence - 52))] = serialized;
+                var retained = (byte[])prepareFrame.Invoke(
+                    null,
+                    new object[] { subscriber, sequence, serialized });
+                Require(retained != null &&
+                    StructuralComparisons.StructuralEqualityComparer.Equals(retained, serialized),
+                    "The initial subscriber generation did not retain its ciphertext frame.");
+            }
+            Require(sentFrames.Count == 128 && CollectionCount(generationFrames) == 128 &&
+                (ulong)GetField(subscriberType, subscriber, "InFlightWireBytes") == 4_096UL,
+                "The arranged subscriber did not exactly fill both event and byte windows.");
+            Require(prepareFrame.Invoke(
+                    null,
+                    new object[] { subscriber, 180UL, SubscriberFrameBytes(180, 32) }) == null,
+                "A 129th frame exceeded the exact full subscriber window.");
+            Require((bool)GetField(subscriberType, subscriber, "DrainRequested"),
+                "A full subscriber window did not retain a replay drain request.");
 
             Require((bool)resetCursor.Invoke(null, new[] { subscriber, (object)51UL }),
                 "A retained ACK 51 subscriber could not start a new SUBSCRIBE generation.");
             Require((ulong)GetField(subscriberType, subscriber, "HighestAck") == 51UL &&
-                sentFrames.Count == 6,
+                sentFrames.Count == 128,
                 "SUBSCRIBE reset discarded the retained ACK or unacknowledged frame cache.");
             Require((ulong)GetField(subscriberType, subscriber, "FlowControlEpoch") == 0UL,
                 "A new SUBSCRIBE generation retained stale flow-control epoch 5.");
             Require((bool)GetField(subscriberType, subscriber, "FlowPaused"),
-                "SUBSCRIBE reset cleared the retained paused state before FLOW_CONTROL.");
-            Require((int)GetField(subscriberType, subscriber, "FlowWindowEvents") == 128 &&
-                (ulong)GetField(subscriberType, subscriber, "FlowWindowWireBytes") == 512UL * 1024UL,
-                "SUBSCRIBE reset discarded the retained flow-control window.");
-            Require((ulong)GetField(subscriberType, subscriber, "LastSentSequence") == 57UL,
+                "A new SUBSCRIBE generation sent before fresh FLOW_CONTROL.");
+            Require(CollectionCount(generationFrames) == 0 &&
+                (ulong)GetField(subscriberType, subscriber, "InFlightWireBytes") == 0UL,
+                "SUBSCRIBE reset retained the prior generation's delivery budget.");
+            Require((ulong)GetField(subscriberType, subscriber, "LastSentSequence") == 179UL,
                 "SUBSCRIBE reset discarded the retained last-sent sequence.");
+
+            var pausedLookup = new object[] { subscriber, 52UL, false, false };
+            Require(prepareCachedFrame.Invoke(null, pausedLookup) == null &&
+                !(bool)pausedLookup[2] && !(bool)pausedLookup[3],
+                "Retained ciphertext replayed before fresh FLOW_CONTROL.");
 
             var freshFlow = new FlowControlPayload
             {
@@ -91,7 +580,7 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                 ControlEpoch = 1,
                 Paused = false,
                 MaxUnackedEvents = 128,
-                MaxUnackedWireBytes = 512UL * 1024UL
+                MaxUnackedWireBytes = 4_096UL
             };
             Require((bool)applyFlowControl.Invoke(null, new object[] { subscriber, freshFlow }),
                 "Fresh flow-control epoch 1 was rejected after SUBSCRIBE recovery.");
@@ -99,6 +588,55 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                 "Fresh FLOW_CONTROL did not unpause the retained subscriber.");
             Require((bool)takeDrainRequest.Invoke(null, new[] { subscriber }),
                 "Fresh FLOW_CONTROL did not release the retained replay drain.");
+            var replayPreparation = new object[] { subscriber, 51UL, false, 0, 0L };
+            Require((bool)prepareReplay.Invoke(null, replayPreparation) &&
+                (int)replayPreparation[3] == 128 && (long)replayPreparation[4] == 4_096L,
+                "Current-generation replay did not receive the fresh flow-control budget.");
+            Require(!(bool)GetField(subscriberType, subscriber, "FlowPaused") &&
+                (ulong)GetField(subscriberType, subscriber, "FlowControlEpoch") == 1UL,
+                "Current-generation replay reset the fresh flow-control state.");
+            SetField(subscriberType, subscriber, "ReplayInProgress", false);
+
+            var conflicting = (byte[])originalFrames[0].Clone();
+            conflicting[0] ^= 0x7f;
+            var mismatch = CaptureInvocationFailure(
+                prepareFrame,
+                subscriber,
+                52UL,
+                conflicting);
+            Require(mismatch is InvalidDataException &&
+                mismatch.Message == "same sequence produced different ciphertext",
+                "A retained sequence accepted different ciphertext in its new generation.");
+
+            for (ulong sequence = 52; sequence <= 179; sequence++)
+            {
+                var lookup = new object[] { subscriber, sequence, false, false };
+                var replayed = (byte[])prepareCachedFrame.Invoke(null, lookup);
+                Require(replayed != null && !(bool)lookup[2] && !(bool)lookup[3] &&
+                    StructuralComparisons.StructuralEqualityComparer.Equals(
+                        replayed,
+                        originalFrames[checked((int)(sequence - 52))]),
+                    "A retained frame was not replayed as byte-identical ciphertext.");
+            }
+            Require(CollectionCount(generationFrames) == 128 &&
+                (ulong)GetField(subscriberType, subscriber, "InFlightWireBytes") == 4_096UL,
+                "Ciphertext replay did not refill the new generation's exact window.");
+
+            var blockedLookup = new object[] { subscriber, 180UL, false, false };
+            Require(prepareCachedFrame.Invoke(null, blockedLookup) == null &&
+                !(bool)blockedLookup[2] && !(bool)blockedLookup[3],
+                "The new generation exceeded its full replay window.");
+            Require((bool)advanceAck.Invoke(null, new object[] { subscriber, 179UL }),
+                "The replayed full window acknowledgement was rejected.");
+            Require(sentFrames.Count == 0 && CollectionCount(generationFrames) == 0 &&
+                (ulong)GetField(subscriberType, subscriber, "InFlightWireBytes") == 0UL,
+                "ACK did not prune both retained ciphertext and generation delivery budget.");
+            Require((bool)takeDrainRequest.Invoke(null, new[] { subscriber }),
+                "ACK did not reopen a pending drain after the full replay window.");
+            Require(prepareFrame.Invoke(
+                    null,
+                    new object[] { subscriber, 180UL, SubscriberFrameBytes(180, 32) }) != null,
+                "ACK did not restore capacity for a new ciphertext frame.");
         }
 
         private static void ValidateRetainedRouteSkipsForcedRefresh(Type runtimeType)
@@ -618,7 +1156,9 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
             SetField(runtimeType, runtime, "authorizedRecipientGate", new SemaphoreSlim(1, 1));
             SetField(runtimeType, runtime, "authorityExpiresUtc", DateTime.UtcNow.AddMinutes(5));
 
-            var createAuthorized = runtimeType.GetMethod("CreateAuthorizedSubscriber", StaticFlags);
+            var createAuthorized = runtimeType.GetMethod(
+                "CreateAuthorizedSubscriberWithSigningKey",
+                StaticFlags);
             var retireAuthorized = runtimeType.GetMethod("RetireSubscriber", StaticFlags);
             var recipients = GetField(runtimeType, runtime, "authorizedRecipients");
             Require(createAuthorized != null && retireAuthorized != null,
@@ -632,6 +1172,7 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                     identity.Exchange,
                     pcDeviceId,
                     item.DeviceId,
+                    item.PublicKey,
                     item.PublicKey,
                     1L
                 });
@@ -692,6 +1233,8 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                 body.Append("{\"device_id\":\"")
                     .Append(recipients[index].DeviceId.ToString("D"))
                     .Append("\",\"device_type\":\"ANDROID\",\"exchange_public_key\":\"")
+                    .Append(Convert.ToBase64String(recipients[index].PublicKey))
+                    .Append("\",\"signing_public_key\":\"")
                     .Append(Convert.ToBase64String(recipients[index].PublicKey))
                     .Append("\"}");
             }
@@ -864,11 +1407,67 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
             };
         }
 
+        private static byte[] SubscriberFrameBytes(ulong sequence, int length)
+        {
+            if (length < sizeof(ulong)) throw new ArgumentOutOfRangeException(nameof(length));
+            var result = new byte[length];
+            for (var index = 0; index < result.Length; index++)
+                result[index] = checked((byte)((sequence + (ulong)index) & 0xff));
+            return result;
+        }
+
+        private static int CollectionCount(object collection)
+        {
+            Require(collection != null, "Subscriber collection is unavailable.");
+            var property = collection.GetType().GetProperty("Count", InstanceFlags);
+            Require(property != null, "Subscriber collection count is unavailable.");
+            return (int)property.GetValue(collection);
+        }
+
+        private static Exception CaptureInvocationFailure(
+            MethodInfo method,
+            params object[] arguments)
+        {
+            try
+            {
+                method.Invoke(null, arguments);
+                return null;
+            }
+            catch (TargetInvocationException error)
+            {
+                return error.InnerException ?? error;
+            }
+        }
+
         private static object GetField(Type type, object instance, string name)
         {
             var field = type.GetField(name, InstanceFlags);
             Require(field != null, "Missing subscriber field: " + name);
             return field.GetValue(instance);
+        }
+
+        private static object GetProperty(object instance, string name)
+        {
+            Require(instance != null, "Property owner is unavailable: " + name);
+            var property = instance.GetType().GetProperty(name, InstanceFlags);
+            Require(property != null, "Missing runtime property: " + name);
+            return property.GetValue(instance);
+        }
+
+        private static object DictionaryValue(object dictionary, object key)
+        {
+            Require(dictionary != null, "Dictionary is unavailable.");
+            var item = dictionary.GetType().GetProperty("Item", InstanceFlags);
+            Require(item != null, "Dictionary indexer is unavailable.");
+            return item.GetValue(dictionary, new[] { key });
+        }
+
+        private static bool TryAdd(object dictionary, object key, object value)
+        {
+            Require(dictionary != null, "Dictionary is unavailable.");
+            var tryAdd = dictionary.GetType().GetMethod("TryAdd", InstanceFlags);
+            Require(tryAdd != null, "Dictionary TryAdd is unavailable.");
+            return (bool)tryAdd.Invoke(dictionary, new[] { key, value });
         }
 
         private static void SetField(Type type, object instance, string name, object value)

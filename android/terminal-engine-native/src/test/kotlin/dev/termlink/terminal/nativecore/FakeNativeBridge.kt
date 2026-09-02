@@ -1245,6 +1245,7 @@ internal fun fakeRenderFrameV3(
     size: TerminalSize,
     cursorRow: Int = 0,
     cursorColumn: Int = 0,
+    cursorVisible: Boolean = true,
 ): ByteArray = fakeRenderFrameV1(
     nextSourceSequence = nextSourceSequence,
     presentationRevision = presentationRevision,
@@ -1255,6 +1256,7 @@ internal fun fakeRenderFrameV3(
     writer.putShort(8, 3.toShort())
     writer.putInt(48, cursorRow)
     writer.putInt(52, cursorColumn)
+    writer.putInt(56, if (cursorVisible) 1 else 0)
     writer.putLong(72, 0x7f)
     val renditionDirectory = FAKE_RENDER_HEADER_BYTES + FAKE_RENDER_DIRECTORY_ENTRY_BYTES
     writer.putShort(renditionDirectory + 4, 2.toShort())

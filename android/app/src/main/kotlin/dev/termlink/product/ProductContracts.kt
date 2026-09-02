@@ -110,6 +110,9 @@ internal object ProductResponseParser {
             exchangePublicKey = Base64.getDecoder().decode(requiredString("exchange_public_key")).also {
                 require(it.size == 32) { "The device exchange public key is invalid" }
             },
+            signingPublicKey = Base64.getDecoder().decode(requiredString("signing_public_key")).also {
+                require(it.size == 32) { "The device signing public key is invalid" }
+            },
             trustState = dev.termlink.model.DeviceTrustState.valueOf(requiredString("trust_state")),
             createdAt = Instant.parse(requiredString("created_at")),
         )
@@ -141,9 +144,17 @@ internal object ProductResponseParser {
 internal class TokenRefreshCoordinator(private val refresh: suspend (force: Boolean) -> String) {
     private val mutex = Mutex()
 
-    suspend fun freshAccessToken(force: Boolean = false): String = mutex.withLock {
+    suspend fun freshAccessToken(force: Boolean = false): String = serially {
         refresh(force).also { value ->
             require(value.isNotBlank()) { "OIDC access token is unavailable" }
         }
     }
+
+    /**
+     * Lets an owner-aware caller capture and validate its authentication claim
+     * only after entering the shared refresh lane. This prevents a request from
+     * waiting behind an old runtime and then accidentally refreshing whichever
+     * account happens to be current when the wait ends.
+     */
+    suspend fun <T> serially(action: suspend () -> T): T = mutex.withLock { action() }
 }

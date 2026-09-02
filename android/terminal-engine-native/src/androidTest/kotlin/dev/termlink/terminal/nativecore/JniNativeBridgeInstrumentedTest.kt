@@ -26,6 +26,9 @@ import org.junit.runner.RunWith
 import java.nio.ByteBuffer
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 
 @RunWith(AndroidJUnit4::class)
@@ -223,6 +226,37 @@ class JniNativeBridgeInstrumentedTest {
             assertEquals(2, terminal.render().nextSourceSequence)
         }
     }
+
+    @Test
+    fun productionMirrorAcceptsCapabilityQueriesWithoutEchoingHostRepliesAsInput() =
+        kotlinx.coroutines.runBlocking {
+            val engine = NativeTerminalEngine(TerminalSize(80, 24))
+            val unexpectedInput = async(start = CoroutineStart.UNDISPATCHED) {
+                engine.inputEvents.first()
+            }
+            try {
+                val queries = (
+                    "\u001b[4\$p" +
+                        "\u001b[?25\$p" +
+                        "\u001bP\$qm\u001b\\" +
+                        "\u001bP+q436f;524742\u001b\\" +
+                        "\u001b[=7u\u001b[?u" +
+                        "\u001b]10;?\u001b\\" +
+                        "\u001b]11;?\u001b\\"
+                    ).encodeToByteArray()
+
+                engine.feed(1, ByteBuffer.wrap(queries))
+
+                assertEquals(2, engine.frames.value.nextSourceSequence)
+                assertFalse(
+                    "a remote mirror must discard replies already emitted by SessionHost",
+                    unexpectedInput.isCompleted,
+                )
+            } finally {
+                unexpectedInput.cancelAndJoin()
+                engine.dispose()
+            }
+        }
 
     @Test
     fun inputV1AndRenderFrameV3AreProductionNativeContracts() {

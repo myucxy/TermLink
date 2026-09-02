@@ -550,6 +550,53 @@ class RemoteTerminalSessionTest {
     }
 
     @Test
+    fun liveRendererFailureEntersHistoryGapAndRecoveryIncludesTheFailedEvent() = runTest {
+        var failSecondFeed = true
+        val engine = RecordingEngine { sequence, _ ->
+            if (sequence == 2L && failSecondFeed) {
+                failSecondFeed = false
+                throw IllegalStateException("renderer feed failed")
+            }
+        }
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(engine, outbound, backgroundScope)
+        session.onConnected()
+
+        assertEquals(EventAcceptance.Applied(1), session.accept(RemoteSessionEvent.Output(1, byteArrayOf(1))))
+        runCurrent()
+        assertEquals(1L, session.state.value.lastAckedSequence)
+
+        assertFailsWith<IllegalStateException> {
+            session.accept(RemoteSessionEvent.Output(2, byteArrayOf(2)))
+        }
+
+        val gap = assertIs<RemoteSessionState.HistoryGap>(session.state.value)
+        assertEquals(1L, gap.lastAckedSequence)
+        assertEquals(2L, gap.expectedSequence)
+        assertEquals(3L, gap.receivedSequence)
+        assertTrue(engine.readOnlyState)
+        assertEquals(listOf(1L), engine.feeds.map { it.first })
+        assertEquals(listOf(1L), outbound.acknowledgements)
+
+        assertEquals(
+            2L,
+            session.recoverFromHistory(
+                events = listOf(
+                    RemoteSessionEvent.Output(1, byteArrayOf(1)),
+                    RemoteSessionEvent.Output(2, byteArrayOf(2)),
+                ),
+                expectedGap = gap,
+                persist = { generation, sequence -> DurableAckCommit(sequence, generation) },
+                publish = {},
+            ),
+        )
+        assertEquals(listOf(1L, 2L), engine.feeds.map { it.first })
+        assertEquals(2L, session.state.value.lastAckedSequence)
+        assertTrue(session.state.value !is RemoteSessionState.HistoryGap)
+        session.close()
+    }
+
+    @Test
     fun failedHistoryRecoveryKeepsOriginalGapAndCanRetryAtomically() = runTest {
         val engine = RecordingEngine()
         val outbound = RecordingOutbound()
@@ -810,6 +857,75 @@ class RemoteTerminalSessionTest {
         session.revokeControl()
         advanceTimeBy(2_000)
         runCurrent()
+        assertEquals(listOf("lease" to 7L), outbound.renewals)
+        session.close()
+    }
+
+    @Test
+    fun transientRenewalFailureKeepsControlAndALaterSuccessExtendsTheLease() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        var attempts = 0
+        outbound.onRenewLease = { leaseId, leaseVersion ->
+            attempts += 1
+            if (attempts == 1) throw IllegalStateException("temporary network loss")
+            RemoteControlLease(
+                leaseId = leaseId,
+                expiresAtEpochMillis = 20_000,
+                version = leaseVersion + 1,
+            )
+        }
+        val session = RemoteTerminalSession(
+            engine,
+            outbound,
+            backgroundScope,
+            clockMillis = { testScheduler.currentTime },
+            leaseRenewalIntervalMillis = 5_000,
+            leaseRenewalRetryIntervalMillis = 1_000,
+        )
+        session.onConnected()
+        session.grantControl("lease", 12_000, leaseVersion = 7)
+
+        advanceTimeBy(5_000)
+        runCurrent()
+        val afterFailure = assertIs<RemoteSessionState.Controlling>(session.state.value)
+        assertEquals(12_000L, afterFailure.expiresAtEpochMillis)
+        assertFalse(engine.readOnlyState)
+
+        advanceTimeBy(1_000)
+        runCurrent()
+        val renewed = assertIs<RemoteSessionState.Controlling>(session.state.value)
+        assertEquals(20_000L, renewed.expiresAtEpochMillis)
+        assertEquals(8L, renewed.leaseVersion)
+        assertEquals(listOf("lease" to 7L, "lease" to 7L), outbound.renewals)
+
+        advanceTimeBy(1_000)
+        runCurrent()
+        assertIs<RemoteSessionState.Controlling>(session.state.value)
+        session.close()
+    }
+
+    @Test
+    fun authoritativeRenewalRejectionMovesControlToReadOnlyImmediately() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound().apply {
+            onRenewLease = { _, _ -> throw RemoteControlLeaseLostException("LEASE_NOT_HELD") }
+        }
+        val session = RemoteTerminalSession(
+            engine,
+            outbound,
+            backgroundScope,
+            clockMillis = { testScheduler.currentTime },
+            leaseRenewalIntervalMillis = 1_000,
+        )
+        session.onConnected()
+        session.grantControl("lease", 10_000, leaseVersion = 7)
+
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        assertIs<RemoteSessionState.ReadOnly>(session.state.value)
+        assertTrue(engine.readOnlyState)
         assertEquals(listOf("lease" to 7L), outbound.renewals)
         session.close()
     }
@@ -1366,6 +1482,7 @@ class RemoteTerminalSessionTest {
         var failPersist = false
         var failAck = false
         var resetCount = 0
+        var onRenewLease: suspend (String, Long) -> RemoteControlLease? = { _, _ -> null }
 
         override suspend fun resume(lastAckedSequence: Long) {
             resumes += lastAckedSequence
@@ -1406,7 +1523,7 @@ class RemoteTerminalSessionTest {
 
         override suspend fun renewLease(leaseId: String, leaseVersion: Long): RemoteControlLease? {
             renewals += leaseId to leaseVersion
-            return null
+            return onRenewLease(leaseId, leaseVersion)
         }
     }
 }

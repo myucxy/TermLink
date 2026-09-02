@@ -105,6 +105,13 @@ val debugTerminalSnapshotRuntime = providers.gradleProperty("termlinkEnableTermi
     .get()
     .toBooleanStrictOrNull()
     ?: throw GradleException("termlinkEnableTerminalSnapshotRuntime must be true or false")
+val debugDirectTransportShadow = providers.gradleProperty("termlinkEnableDirectTransportShadow")
+    // Direct transport remains a shadow-only experiment until the cross-network
+    // failure matrix proves that it cannot perturb the Relay connection.
+    .orElse("false")
+    .get()
+    .toBooleanStrictOrNull()
+    ?: throw GradleException("termlinkEnableDirectTransportShadow must be true or false")
 val termLinkVersionCode = providers.gradleProperty("termlinkVersionCode")
     .orElse("32")
     .get()
@@ -160,6 +167,7 @@ android {
         buildConfigField("String", "TERMLINK_SERVER_URL", buildConfigString(publicTermLinkServerUrl))
         buildConfigField("boolean", "TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST", "false")
         buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", "true")
+        buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_SHADOW", "false")
     }
 
     buildFeatures {
@@ -177,6 +185,7 @@ android {
             buildConfigField("String", "TERMLINK_SERVER_URL", buildConfigString(debugServerUrl))
             buildConfigField("boolean", "TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST", debugAllowsCleartextLocalTest.toString())
             buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", debugTerminalSnapshotRuntime.toString())
+            buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_SHADOW", debugDirectTransportShadow.toString())
             manifestPlaceholders["termlinkUsesCleartextTraffic"] = debugAllowsCleartextLocalTest.toString()
         }
         getByName("release") {
@@ -184,6 +193,7 @@ android {
             buildConfigField("String", "TERMLINK_SERVER_URL", buildConfigString(publicTermLinkServerUrl))
             buildConfigField("boolean", "TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST", "false")
             buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", "true")
+            buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_SHADOW", "false")
         }
     }
 

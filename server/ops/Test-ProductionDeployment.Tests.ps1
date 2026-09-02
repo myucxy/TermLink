@@ -74,6 +74,22 @@ function Test-ComposeConfig {
     }
 }
 
+function Get-ComposeConfig {
+    param(
+        [Parameter(Mandatory)][string]$EnvironmentFile,
+        [Parameter(Mandatory)][string[]]$Files
+    )
+
+    $arguments = @('compose', '--env-file', $EnvironmentFile, '--project-name', 'termlink-topology-test')
+    foreach ($file in $Files) { $arguments += @('-f', $file) }
+    $arguments += @('config', '--format', 'json')
+    $output = @(& docker @arguments 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Compose topology render failed: $($output -join ' ')"
+    }
+    return (($output -join [Environment]::NewLine) | ConvertFrom-Json -Depth 100)
+}
+
 function Assert-ComposeConfigRejected {
     param(
         [Parameter(Mandatory)][string]$EnvironmentFile,
@@ -232,6 +248,7 @@ try {
     Set-TestSecretPermissions -Path $paymentSecretRoot -Directory $true
 
     $valkeyPassword = 'Valkey_Test_7Pz4mN8vQ2xK6cR9'
+    $directValkeyPassword = 'DirectValkey_Test_8Qm4xN7pR2vK6sL9'
     $identityKeyBytes = [byte[]](0..31)
     $identityKey = [Convert]::ToBase64String($identityKeyBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
     $secretFixtures = [ordered]@{
@@ -241,6 +258,8 @@ try {
         'token-signing-key' = 'Token_Test_6vN2qR9mX4pK8sJ3wL7cD5hF1aB0eGzY'
         'postgres-password' = 'Postgres_Test_9qL3vK7mX2pR8sN6'
         'valkey-password' = $valkeyPassword
+        'direct-redis-url' = "redis://termlink-direct:$directValkeyPassword@direct-valkey:6379/0"
+        'direct-valkey-password' = $directValkeyPassword
         's3-access-key' = 'S3Access_Test_5mQ8vN2xK7pR'
         's3-secret-key' = 'S3Secret_Test_8xL2qV6mN9pK4rJ7'
         'grafana-admin-password' = 'Grafana_Test_2pV7mQ9xK4nR8sL6'
@@ -285,6 +304,9 @@ receivers:
         "TERMLINK_TOKEN_SIGNING_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'token-signing-key'))",
         "TERMLINK_POSTGRES_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'postgres-password'))",
         "TERMLINK_VALKEY_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'valkey-password'))",
+        "TERMLINK_DIRECT_REDIS_URL_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'direct-redis-url'))",
+        "TERMLINK_DIRECT_VALKEY_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'direct-valkey-password'))",
+        'TERMLINK_DIRECT_STUN_SERVERS=stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302',
         "TERMLINK_S3_ACCESS_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 's3-access-key'))",
         "TERMLINK_S3_SECRET_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 's3-secret-key'))",
         "TERMLINK_GRAFANA_ADMIN_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'grafana-admin-password'))",
@@ -306,6 +328,7 @@ receivers:
     $registrationRecovery = Join-Path $composeRoot 'registration-recovery.compose.yml'
     $humanVerification = Join-Path $composeRoot 'human-verification.compose.yml'
     $accountDeletion = Join-Path $composeRoot 'account-deletion.compose.yml'
+    $directTransport = Join-Path $composeRoot 'direct-transport.compose.yml'
     $acceptance = Join-Path $composeRoot 'acceptance.compose.yml'
 
     # Render every valid overlay selection with and without edge. Account
@@ -317,12 +340,13 @@ receivers:
     )
     $matrixCount = 0
     foreach ($historyChoice in $historyChoices) {
-        for ($flags = 0; $flags -lt 16; $flags++) {
+        for ($flags = 0; $flags -lt 32; $flags++) {
             $featureFiles = @($core) + @($historyChoice.Files)
             if (($flags -band 1) -ne 0) { $featureFiles += $commerce }
             if (($flags -band 2) -ne 0) { $featureFiles += $observability }
             if (($flags -band 4) -ne 0) { $featureFiles += $registrationRecovery }
             if (($flags -band 8) -ne 0) { $featureFiles += $humanVerification }
+            if (($flags -band 16) -ne 0) { $featureFiles += $directTransport }
             $deletionOptions = if ($historyChoice.AllowsDeletion) { @($false, $true) } else { @($false) }
             foreach ($withDeletion in $deletionOptions) {
                 $files = @($featureFiles)
@@ -334,7 +358,7 @@ receivers:
             }
         }
     }
-    if ($matrixCount -ne 160) {
+    if ($matrixCount -ne 320) {
         throw "Unexpected Compose matrix size: $matrixCount"
     }
 
@@ -346,16 +370,55 @@ receivers:
         @{ Name = 'core plus commerce'; Files = @($core, $commerce); Edge = $true },
         @{ Name = 'core plus registration recovery'; Files = @($core, $registrationRecovery); Edge = $true },
         @{ Name = 'core plus human verification'; Files = @($core, $humanVerification); Edge = $true },
+        @{ Name = 'core plus Direct shared state'; Files = @($core, $directTransport); Edge = $true },
         @{ Name = 'local history plus account deletion'; Files = @($core, $history, $accountDeletion); Edge = $true },
         @{ Name = 'local history plus both recovery paths'; Files = @($core, $history, $registrationRecovery, $accountDeletion); Edge = $false },
         @{ Name = 'default full stack'; Files = @($core, $history, $observability); Edge = $true },
         @{ Name = 'external S3'; Files = @($core, $externalServices); Edge = $true },
         @{ Name = 'external S3 plus observability'; Files = @($core, $externalServices, $observability); Edge = $true },
-        @{ Name = 'external full feature stack'; Files = @($core, $externalServices, $commerce, $observability, $registrationRecovery, $humanVerification, $accountDeletion); Edge = $true }
+        @{ Name = 'external full feature stack'; Files = @($core, $externalServices, $commerce, $observability, $registrationRecovery, $humanVerification, $accountDeletion, $directTransport); Edge = $true }
     )
     foreach ($case in $cases) {
         Write-Host "Validating $($case.Name)..."
         & $policy -EnvFile $envFile -ComposeFile $case.Files -IncludeEdge:$case.Edge
+    }
+
+    # The Direct overlay is one shared state plane for any number of server
+    # replicas. Only server receives its network, enable switch, and URL
+    # secret; migrate remains on the Relay backend with only Relay secrets.
+    $directConfig = Get-ComposeConfig -EnvironmentFile $envFile -Files @($core, $directTransport)
+    $directServer = $directConfig.services.server
+    $directMigration = $directConfig.services.migrate
+    $directState = $directConfig.services.'direct-valkey'
+    $serverEnvironmentNames = @($directServer.environment.PSObject.Properties.Name)
+    $migrationEnvironmentNames = @($directMigration.environment.PSObject.Properties.Name)
+    foreach ($name in @(
+        'TERMLINK_DIRECT_TRANSPORT_ENABLED', 'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_DIRECT_STUN_SERVERS'
+    )) {
+        if ($serverEnvironmentNames -cnotcontains $name) {
+            throw "Direct server topology omitted $name."
+        }
+        if ($migrationEnvironmentNames -ccontains $name) {
+            throw "Migration unexpectedly received Direct authority $name."
+        }
+    }
+    $serverSecretSources = @($directServer.secrets | ForEach-Object { [string]$_.source })
+    $migrationSecretSources = @($directMigration.secrets | ForEach-Object { [string]$_.source })
+    if ($serverSecretSources -cnotcontains 'direct_redis_url' -or
+        $migrationSecretSources -ccontains 'direct_redis_url' -or
+        $migrationSecretSources -ccontains 'direct_valkey_password') {
+        throw 'Direct secret topology crossed the server/migration authority boundary.'
+    }
+    $serverNetworkNames = @($directServer.networks.PSObject.Properties.Name)
+    $migrationNetworkNames = @($directMigration.networks.PSObject.Properties.Name)
+    $directNetworkNames = @($directState.networks.PSObject.Properties.Name)
+    if ($serverNetworkNames -cnotcontains 'direct-state' -or
+        $directNetworkNames -cnotcontains 'direct-state' -or
+        $migrationNetworkNames -ccontains 'direct-state') {
+        throw 'Direct shared-state network is not isolated to server and direct-valkey.'
+    }
+    if ($directServer.depends_on.PSObject.Properties.Name -ccontains 'direct-valkey') {
+        throw 'Direct state health unexpectedly gates Relay server startup.'
     }
 
     Assert-PolicyRejected -Policy $policy -EnvironmentFile $envFile `
@@ -382,7 +445,10 @@ receivers:
         @{ Name = 'human verification site key'; Files = @($core, $humanVerification); Remove = @('TERMLINK_HUMAN_VERIFICATION_SITE_KEY='); Pattern = 'TERMLINK_HUMAN_VERIFICATION_SITE_KEY' },
         @{ Name = 'human verification secret'; Files = @($core, $humanVerification); Remove = @('TERMLINK_HUMAN_VERIFICATION_SECRET_FILE='); Pattern = 'TERMLINK_HUMAN_VERIFICATION_SECRET_FILE' },
         @{ Name = 'account deletion identity key'; Files = @($core, $history, $accountDeletion); Remove = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE='); Pattern = 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE' },
-        @{ Name = 'account deletion key version'; Files = @($core, $history, $accountDeletion); Remove = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION='); Pattern = 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION' }
+        @{ Name = 'account deletion key version'; Files = @($core, $history, $accountDeletion); Remove = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION='); Pattern = 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION' },
+        @{ Name = 'Direct Redis URL'; Files = @($core, $directTransport); Remove = @('TERMLINK_DIRECT_REDIS_URL_FILE='); Pattern = 'TERMLINK_DIRECT_REDIS_URL_FILE' },
+        @{ Name = 'Direct Valkey password'; Files = @($core, $directTransport); Remove = @('TERMLINK_DIRECT_VALKEY_PASSWORD_FILE='); Pattern = 'TERMLINK_DIRECT_VALKEY_PASSWORD_FILE' },
+        @{ Name = 'Direct STUN endpoints'; Files = @($core, $directTransport); Remove = @('TERMLINK_DIRECT_STUN_SERVERS='); Pattern = 'TERMLINK_DIRECT_STUN_SERVERS' }
     )
     foreach ($missingCase in $missingCases) {
         $missingEnv = New-FilteredEnvironmentFile -Source $envFile `
@@ -391,6 +457,31 @@ receivers:
         Assert-ComposeConfigRejected -EnvironmentFile $missingEnv -Files $missingCase.Files `
             -ExpectedPattern $missingCase.Pattern
     }
+
+    $wrongDirectUrlPath = New-ProtectedTestFile -Path (Join-Path $secretRoot 'wrong-direct-redis-url') `
+        -Value "redis://termlink-direct:$directValkeyPassword@valkey:6379/0"
+    $wrongDirectUrlEnv = New-EnvironmentOverrideFile -Source $envFile `
+        -Destination (Join-Path $testRoot 'wrong-direct-url.env') `
+        -Overrides @{ TERMLINK_DIRECT_REDIS_URL_FILE = (ConvertTo-ComposeHostPath $wrongDirectUrlPath) }
+    Assert-PolicyRejected -Policy $policy -EnvironmentFile $wrongDirectUrlEnv `
+        -Files @($core, $directTransport) -ExpectedPattern 'one shared Direct Valkey service'
+
+    $reusedDirectUrlPath = New-ProtectedTestFile -Path (Join-Path $secretRoot 'reused-direct-redis-url') `
+        -Value "redis://termlink-direct:$valkeyPassword@direct-valkey:6379/0"
+    $reusedDirectPasswordEnv = New-EnvironmentOverrideFile -Source $envFile `
+        -Destination (Join-Path $testRoot 'reused-direct-password.env') `
+        -Overrides @{
+            TERMLINK_DIRECT_REDIS_URL_FILE = (ConvertTo-ComposeHostPath $reusedDirectUrlPath)
+            TERMLINK_DIRECT_VALKEY_PASSWORD_FILE = (ConvertTo-ComposeHostPath (Join-Path $secretRoot 'valkey-password'))
+        }
+    Assert-PolicyRejected -Policy $policy -EnvironmentFile $reusedDirectPasswordEnv `
+        -Files @($core, $directTransport) -ExpectedPattern 'must not reuse the same ACL password'
+
+    $invalidStunEnv = New-EnvironmentOverrideFile -Source $envFile `
+        -Destination (Join-Path $testRoot 'invalid-direct-stun.env') `
+        -Overrides @{ TERMLINK_DIRECT_STUN_SERVERS = 'stun:localhost:3478' }
+    Assert-PolicyRejected -Policy $policy -EnvironmentFile $invalidStunEnv `
+        -Files @($core, $directTransport) -ExpectedPattern 'production DNS hosts'
 
     $placeholderAlertEnv = Join-Path $testRoot 'placeholder-alertmanager.env'
     $bundledAlertmanagerConfig = ConvertTo-ComposeHostPath (Join-Path $serverRoot 'observability/alertmanager/alertmanager.yml')

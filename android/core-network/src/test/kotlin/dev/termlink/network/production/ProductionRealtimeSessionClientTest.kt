@@ -18,6 +18,7 @@ import dev.termlink.protocol.realtime.v1.SubscribePayload
 import dev.termlink.session.DurableAckCommit
 import dev.termlink.session.InputSubmission
 import dev.termlink.session.RemoteLifecycle
+import dev.termlink.session.RemoteControlLeaseLostException
 import dev.termlink.session.RendererBootstrapState
 import dev.termlink.session.RemoteSessionEvent
 import dev.termlink.session.RemoteSessionState
@@ -33,6 +34,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -58,6 +60,7 @@ import okio.ByteString as OkioByteString
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -176,7 +179,7 @@ class ProductionRealtimeSessionClientTest {
     }
 
     @Test
-    fun fatalFrameRejectsQueuedSuccessorUntilNewGenerationReplaysContiguousHistory(): Unit = runBlocking {
+    fun fatalFrameRetiresOnlySessionEndpointAndFencesQueuedSuccessor(): Unit = runBlocking {
         val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
         val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
         val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
@@ -185,6 +188,7 @@ class ProductionRealtimeSessionClientTest {
         val keyId = "epoch-00000007".encodeToByteArray()
         val transport = QueuedSessionTransport()
         val outputs = CopyOnWriteArrayList<ByteArray>()
+        val failures = CopyOnWriteArrayList<ProductionRendererFatalFailure>()
         val client = ProductionRealtimeSessionClient(
             engine = RecordingEngine(outputs),
             config = ProductionRealtimeSessionConfig(
@@ -207,6 +211,7 @@ class ProductionRealtimeSessionClientTest {
             ),
             acknowledgementObserver = ::commitAcknowledgement,
             acknowledgementResetObserver = ::resetAcknowledgement,
+            rendererFatalObserver = failures::add,
         )
         val replayOne = incomingOutputEnvelope(
             sessionId, pcId, androidId, pcIdentity, androidIdentity, keyId, 306, byteArrayOf(6),
@@ -231,23 +236,29 @@ class ProductionRealtimeSessionClientTest {
             transport.deliver(corruptOne, generation = 1)
             transport.deliver(replayTwo, generation = 1)
             withTimeout(2_000) {
-                client.transportState.first { it is ProductionTransportState.Reconnecting }
+                while (failures.isEmpty()) kotlinx.coroutines.yield()
             }
             withTimeout(2_000) {
                 while (transport.releasedReservations < 2) kotlinx.coroutines.yield()
             }
+            withTimeout(2_000) {
+                while (transport.gracefulCloseCount == 0) kotlinx.coroutines.yield()
+            }
+            assertEquals(306L, failures.single().sequence)
+            assertEquals(MessageType.OUTPUT_CHUNK, failures.single().messageType)
             assertTrue(outputs.isEmpty())
             assertTrue(client.sessionState.value !is RemoteSessionState.HistoryGap)
+            assertIs<ProductionTransportState.Failed>(client.transportState.value)
+            assertFalse(client.diagnostics().reconnectActive)
+            assertTrue(transport.disconnectReasons.isEmpty())
             assertEquals(0L, client.diagnostics().lastHandledSequence)
 
+            // A session-incarnation failure must not reconnect the poisoned
+            // renderer or replace the physical socket shared by siblings.
             transport.emitConnected()
-            withTimeout(2_000) { client.sessionState.first { it is RemoteSessionState.Live } }
-            transport.deliver(replayOne, generation = 2)
-            transport.deliver(replayTwo, generation = 2)
-
-            withTimeout(2_000) { client.sessionState.first { it.lastAckedSequence == 307L } }
-            assertEquals(listOf(6, 7), outputs.map { it.single().toInt() })
-            assertEquals(307L, client.diagnostics().lastHandledSequence)
+            delay(50)
+            assertEquals(1, client.diagnostics().subscribeSendCount)
+            assertFalse(client.diagnostics().subscriberReady)
         } finally {
             client.close()
             keyId.fill(0)
@@ -365,16 +376,12 @@ class ProductionRealtimeSessionClientTest {
             assertTrue(blocked.entered.await(2, TimeUnit.SECONDS))
             val generationTwo = transport.replaceGeneration()
             blocked.release.countDown()
-            withTimeout(2_000) {
-                while (transport.conditionalDisconnectAttempts < 1) kotlinx.coroutines.yield()
-            }
-            assertEquals(1, transport.subscribeCount)
-            assertTrue(transport.disconnectReasons.isEmpty())
-
             transport.emitConnectedEvent(generationTwo)
             withTimeout(2_000) {
                 while (transport.subscribeCount != 2) kotlinx.coroutines.yield()
             }
+            assertEquals(0, transport.conditionalDisconnectAttempts)
+            assertTrue(transport.disconnectReasons.isEmpty())
 
             // Then cover a G2 Connected event that was queued before replacement
             // but is not consumed until G3 already owns the physical socket.
@@ -397,6 +404,428 @@ class ProductionRealtimeSessionClientTest {
             assertTrue(transport.disconnectReasons.isEmpty())
         } finally {
             client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun replacementAfterSubscribeFencesOldFlowControlAndPreservesSuccessorReadiness(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = GenerationRaceSessionTransport()
+        val blockedFlowControl = transport.blockNextGenerationSend(MessageType.FLOW_CONTROL)
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(30_000),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+
+        try {
+            client.start()
+            assertTrue(blockedFlowControl.entered.await(2, TimeUnit.SECONDS))
+            assertEquals(1, transport.subscribeCount)
+            val generationOne = transport.currentConnectedGeneration()
+
+            val generationTwo = transport.replaceGeneration()
+            transport.emitConnectedEvent(generationTwo)
+            blockedFlowControl.release.countDown()
+
+            withTimeout(2_000) {
+                while (transport.subscribeCount != 2 || !client.diagnostics().subscriberReady) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+            withTimeout(2_000) {
+                while (transport.generationBoundSends.none {
+                        it.first == MessageType.FLOW_CONTROL && it.second == generationTwo
+                    }
+                ) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+
+            assertEquals(
+                listOf(generationTwo),
+                transport.generationBoundSends
+                    .filter { it.first == MessageType.FLOW_CONTROL }
+                    .map { it.second },
+            )
+            assertTrue(generationTwo > generationOne)
+            assertTrue(client.diagnostics().subscriberReady)
+            assertTrue(transport.disconnectReasons.isEmpty())
+        } finally {
+            blockedFlowControl.release.countDown()
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun sameGenerationSubscribeFailureReconcilesWithoutReplacingPhysicalSocket(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = GenerationRaceSessionTransport()
+        transport.failNextGenerationSend(MessageType.SUBSCRIBE)
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(25),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+
+        try {
+            client.start()
+            withTimeout(2_000) {
+                client.transportState.first { it is ProductionTransportState.Reconnecting }
+            }
+            assertFalse(client.diagnostics().subscriberReady)
+
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady ||
+                    transport.generationBoundSends.none { it.first == MessageType.FLOW_CONTROL }
+                ) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+
+            val generation = transport.currentConnectedGeneration()
+            assertEquals(
+                listOf(generation, generation),
+                transport.generationSendAttempts
+                    .filter { it.first == MessageType.SUBSCRIBE }
+                    .map { it.second },
+            )
+            assertEquals(1, transport.connectCount)
+            assertEquals(0, transport.conditionalDisconnectAttempts)
+            assertTrue(transport.disconnectReasons.isEmpty())
+            withTimeout(2_000) {
+                client.transportState.first { it is ProductionTransportState.Connected }
+            }
+            assertIs<ProductionTransportState.Connected>(client.transportState.value)
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun sameGenerationFlowControlFailureRestoresDesiredControlWithoutReplacingSocket(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val firstLeaseId = UUID.fromString("01234567-89ab-cdef-0123-456789abcdef")
+        val restoredLeaseId = UUID.fromString("11234567-89ab-cdef-0123-456789abcdef")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = GenerationRaceSessionTransport()
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(
+                    """{"lease_id":"$firstLeaseId","expires_at":"2099-01-01T00:00:00Z","version":1}""",
+                ),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(
+                    """{"lease_id":"$restoredLeaseId","expires_at":"2099-01-01T00:00:00Z","version":2}""",
+                ),
+        )
+        server.start()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = server.url("/").toString(),
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(25),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+            allowCleartextForLocalTest = true,
+        )
+
+        try {
+            client.start()
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady) kotlinx.coroutines.yield()
+            }
+            client.requestControl()
+            assertEquals(
+                firstLeaseId.toString(),
+                assertIs<RemoteSessionState.Controlling>(client.sessionState.value).leaseId,
+            )
+
+            transport.failNextGenerationSend(MessageType.FLOW_CONTROL)
+            transport.emitPressure(paused = true)
+            withTimeout(2_000) {
+                client.transportState.first { it is ProductionTransportState.Reconnecting }
+            }
+            assertFalse(client.diagnostics().subscriberReady)
+
+            val restored = withTimeout(2_000) {
+                client.sessionState.first {
+                    it is RemoteSessionState.Controlling && it.leaseId == restoredLeaseId.toString()
+                }
+            }
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady ||
+                    transport.generationSendAttempts.count { it.first == MessageType.FLOW_CONTROL } < 3
+                ) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+
+            assertEquals(2L, assertIs<RemoteSessionState.Controlling>(restored).leaseVersion)
+            assertEquals(1, transport.connectCount)
+            assertEquals(0, transport.conditionalDisconnectAttempts)
+            assertTrue(transport.disconnectReasons.isEmpty())
+            assertEquals("/v1/sessions/$sessionId/lease", server.takeRequest(2, TimeUnit.SECONDS)?.path)
+            assertEquals("/v1/sessions/$sessionId/lease", server.takeRequest(2, TimeUnit.SECONDS)?.path)
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun generationChangeCancelsStaleSameGenerationReconcile(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = GenerationRaceSessionTransport()
+        transport.failNextGenerationSend(MessageType.SUBSCRIBE)
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(250),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+
+        try {
+            client.start()
+            withTimeout(2_000) {
+                client.transportState.first { it is ProductionTransportState.Reconnecting }
+            }
+            val generationOne = transport.currentConnectedGeneration()
+            val generationTwo = transport.replaceGeneration()
+            transport.emitConnectedEvent(generationTwo)
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady ||
+                    transport.generationBoundSends.none {
+                        it.first == MessageType.FLOW_CONTROL && it.second == generationTwo
+                    }
+                ) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+            delay(300)
+
+            assertEquals(
+                listOf(generationOne, generationTwo),
+                transport.generationSendAttempts
+                    .filter { it.first == MessageType.SUBSCRIBE }
+                    .map { it.second },
+            )
+            assertEquals(1, transport.connectCount)
+            assertEquals(0, transport.conditionalDisconnectAttempts)
+            assertTrue(transport.disconnectReasons.isEmpty())
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun closeCancelsPendingSameGenerationReconcile(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = GenerationRaceSessionTransport()
+        transport.failNextGenerationSend(MessageType.SUBSCRIBE)
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(250),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+
+        try {
+            client.start()
+            withTimeout(2_000) {
+                client.transportState.first { it is ProductionTransportState.Reconnecting }
+            }
+            val sendsBeforeClose = transport.generationSendAttempts.size
+            client.close()
+            delay(300)
+
+            assertEquals(sendsBeforeClose, transport.generationSendAttempts.size)
+            assertEquals(1, transport.connectCount)
+            assertEquals(0, transport.conditionalDisconnectAttempts)
+            assertTrue(transport.disconnectReasons.isEmpty())
+            assertFalse(client.diagnostics().reconnectActive)
+            assertIs<ProductionTransportState.Closed>(client.transportState.value)
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun blockedRendererLaneDoesNotDelaySameGenerationSessionReconcile(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val keyId = "epoch-00000007".encodeToByteArray()
+        val transport = GenerationRaceSessionTransport()
+        val feedStarted = CountDownLatch(1)
+        val releaseFeed = CountDownLatch(1)
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(
+                outputs = CopyOnWriteArrayList(),
+                onFeed = { sequence, _ ->
+                    if (sequence == 1L) {
+                        feedStarted.countDown()
+                        check(releaseFeed.await(2, TimeUnit.SECONDS)) {
+                            "timed out releasing blocked live feed"
+                        }
+                    }
+                },
+            ),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+                keyId = keyId.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(0),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+        val output = incomingOutputEnvelope(
+            sessionId,
+            pcId,
+            androidId,
+            pcIdentity,
+            androidIdentity,
+            keyId,
+            1,
+            byteArrayOf(1),
+        )
+
+        try {
+            client.start()
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady) kotlinx.coroutines.yield()
+            }
+            val generation = transport.currentConnectedGeneration()
+            transport.deliver(output, generation)
+            assertTrue(withContext(Dispatchers.IO) { feedStarted.await(2, TimeUnit.SECONDS) })
+
+            transport.failNextGenerationSend(MessageType.FLOW_CONTROL)
+            transport.emitPressure(paused = true)
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady ||
+                    transport.generationSendAttempts.count { it.first == MessageType.SUBSCRIBE } < 2 ||
+                    transport.generationBoundSends.count { it.first == MessageType.FLOW_CONTROL } < 2
+                ) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+
+            assertEquals(1L, releaseFeed.count)
+            assertEquals(1, transport.connectCount)
+            assertEquals(0, transport.conditionalDisconnectAttempts)
+            assertTrue(transport.disconnectReasons.isEmpty())
+            assertIs<ProductionTransportState.Connected>(client.transportState.value)
+        } finally {
+            releaseFeed.countDown()
+            client.close()
+            keyId.fill(0)
             androidIdentity.destroy()
             pcIdentity.destroy()
         }
@@ -515,6 +944,69 @@ class ProductionRealtimeSessionClientTest {
     }
 
     @Test
+    fun rendererFailureFencesTheClientAndNeverReconnectsThePoisonedEngine(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val keyId = "epoch-00000007".encodeToByteArray()
+        val transport = QueuedSessionTransport()
+        val failures = CopyOnWriteArrayList<ProductionRendererFatalFailure>()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList(), failOnFeedSequence = 306),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+                keyId = keyId.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(0),
+            initialRendererState = RendererBootstrapState.FullPrefix(305, 1),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+            rendererFatalObserver = failures::add,
+        )
+        val failed = incomingOutputEnvelope(
+            sessionId, pcId, androidId, pcIdentity, androidIdentity, keyId, 306, byteArrayOf(6),
+        )
+        try {
+            client.start()
+            withTimeout(2_000) { client.sessionState.first { it is RemoteSessionState.Live } }
+            transport.deliver(failed, generation = 1)
+            withTimeout(2_000) {
+                while (failures.isEmpty()) kotlinx.coroutines.yield()
+            }
+
+            assertEquals(306L, failures.single().sequence)
+            assertEquals(MessageType.OUTPUT_CHUNK, failures.single().messageType)
+            assertEquals(1, client.diagnostics().subscribeSendCount)
+            assertTrue(client.diagnostics().reconnectActive.not())
+            assertTrue(transport.disconnectReasons.isEmpty())
+            withTimeout(2_000) {
+                while (transport.gracefulCloseCount == 0) kotlinx.coroutines.yield()
+            }
+
+            transport.emitConnected()
+            delay(50)
+            assertEquals(1, client.diagnostics().subscribeSendCount)
+            assertTrue(client.diagnostics().subscriberReady.not())
+        } finally {
+            client.close()
+            keyId.fill(0)
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
     fun pcHeartbeatIsFatalSemanticAndFencesSameGenerationSuccessor(): Unit = runBlocking {
         val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
         val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
@@ -524,6 +1016,7 @@ class ProductionRealtimeSessionClientTest {
         val keyId = "epoch-00000007".encodeToByteArray()
         val transport = QueuedSessionTransport()
         val outputs = CopyOnWriteArrayList<ByteArray>()
+        val failures = CopyOnWriteArrayList<ProductionRendererFatalFailure>()
         val client = ProductionRealtimeSessionClient(
             engine = RecordingEngine(outputs),
             config = ProductionRealtimeSessionConfig(
@@ -543,6 +1036,7 @@ class ProductionRealtimeSessionClientTest {
             initialRendererState = RendererBootstrapState.FullPrefix(305, 1),
             acknowledgementObserver = ::commitAcknowledgement,
             acknowledgementResetObserver = ::resetAcknowledgement,
+            rendererFatalObserver = failures::add,
         )
         val heartbeat = incomingHeartbeatEnvelope(
             sessionId, pcId, androidId, pcIdentity, androidIdentity, keyId, 306,
@@ -557,15 +1051,27 @@ class ProductionRealtimeSessionClientTest {
             transport.deliver(successor, generation = 1)
 
             withTimeout(2_000) {
-                client.transportState.first { it is ProductionTransportState.Reconnecting }
+                while (failures.isEmpty()) kotlinx.coroutines.yield()
             }
             withTimeout(2_000) {
                 while (transport.releasedReservations < 2) kotlinx.coroutines.yield()
             }
+            withTimeout(2_000) {
+                while (transport.gracefulCloseCount == 0) kotlinx.coroutines.yield()
+            }
+            assertEquals(306L, failures.single().sequence)
+            assertEquals(MessageType.HEARTBEAT, failures.single().messageType)
             assertTrue(outputs.isEmpty())
             assertTrue(client.sessionState.value !is RemoteSessionState.HistoryGap)
-            assertTrue(transport.disconnectReasons.single().endsWith("semantic"))
+            assertIs<ProductionTransportState.Failed>(client.transportState.value)
+            assertFalse(client.diagnostics().reconnectActive)
+            assertTrue(transport.disconnectReasons.isEmpty())
             assertEquals(0L, client.diagnostics().lastHandledSequence)
+
+            transport.emitConnected()
+            delay(50)
+            assertEquals(1, client.diagnostics().subscribeSendCount)
+            assertFalse(client.diagnostics().subscriberReady)
         } finally {
             client.close()
             keyId.fill(0)
@@ -1762,6 +2268,384 @@ class ProductionRealtimeSessionClientTest {
     }
 
     @Test
+    fun mainLikeParentNeverRunsOrderedRendererWorkAndReplayRemainsSerial(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val keyId = "epoch-00000007".encodeToByteArray()
+        val transport = QueuedSessionTransport()
+        val outputs = CopyOnWriteArrayList<ByteArray>()
+        val feedObservations = CopyOnWriteArrayList<Pair<Long, Thread>>()
+        val replayMidpoint = CountDownLatch(1)
+        val releaseReplay = CountDownLatch(1)
+        val mainLikeExecutor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "TermLink-test-main").apply { isDaemon = true }
+        }
+        val mainLikeDispatcher = mainLikeExecutor.asCoroutineDispatcher()
+        val mainLikeScope = CoroutineScope(SupervisorJob() + mainLikeDispatcher)
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(
+                outputs = outputs,
+                onFeed = { sequence, thread ->
+                    feedObservations += sequence to thread
+                    if (sequence == 2_048L) {
+                        replayMidpoint.countDown()
+                        check(releaseReplay.await(2, TimeUnit.SECONDS)) {
+                            "timed out releasing the long-history replay"
+                        }
+                    }
+                },
+            ),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+                keyId = keyId.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = mainLikeScope,
+            transport = transport,
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+        val incoming = (1L..12L).map { sequence ->
+            incomingOutputEnvelope(
+                sessionId,
+                pcId,
+                androidId,
+                pcIdentity,
+                androidIdentity,
+                keyId,
+                sequence,
+                byteArrayOf(sequence.toByte()),
+            )
+        }
+        try {
+            withContext(mainLikeDispatcher) { client.start() }
+            withTimeout(2_000) {
+                client.transportState.first { it is ProductionTransportState.Connected }
+            }
+            withTimeout(2_000) { client.sessionState.first { it is RemoteSessionState.Live } }
+
+            val deliveryThread = withContext(mainLikeDispatcher) {
+                Thread.currentThread().also { caller ->
+                    incoming.forEach { envelope -> transport.deliver(envelope, generation = 1) }
+                    assertTrue(caller.name.startsWith("TermLink-test-main"))
+                }
+            }
+            withTimeout(2_000) { client.sessionState.first { it.lastAckedSequence == 12L } }
+            assertEquals((1L..12L).toList(), feedObservations.map { it.first })
+            assertTrue(feedObservations.none { it.second === deliveryThread })
+
+            // Rebuild a verified prefix from the same Main-like caller. The
+            // public suspend API must switch before clear/feed/JNI work begins.
+            withContext(mainLikeDispatcher) {
+                client.remoteSession.accept(RemoteSessionEvent.Gap(4_097, 13, 4_096))
+            }
+            val gap = assertIs<RemoteSessionState.HistoryGap>(client.sessionState.value)
+            feedObservations.clear()
+            val replay = (1L..4_096L).map { sequence ->
+                RemoteSessionEvent.Output(sequence, byteArrayOf(sequence.toByte()))
+            }
+            try {
+                val recovery = mainLikeScope.async {
+                    client.recoverFromHistory(replay, expectedGap = gap)
+                }
+                assertTrue(withContext(Dispatchers.IO) { replayMidpoint.await(2, TimeUnit.SECONDS) })
+                val heartbeatThread = withTimeout(2_000) {
+                    mainLikeScope.async { Thread.currentThread() }.await()
+                }
+                assertTrue(heartbeatThread.name.startsWith("TermLink-test-main"))
+                assertFalse(recovery.isCompleted)
+                releaseReplay.countDown()
+
+                assertEquals(4_096L, withTimeout(5_000) { recovery.await() })
+                assertEquals((1L..4_096L).toList(), feedObservations.map { it.first })
+                assertTrue(feedObservations.none { it.second === deliveryThread })
+            } finally {
+                releaseReplay.countDown()
+                replay.forEach { (it as RemoteSessionEvent.Output).bytes.fill(0) }
+            }
+
+            withContext(mainLikeDispatcher) { client.close() }
+            assertIs<ProductionTransportState.Closed>(client.transportState.value)
+        } finally {
+            client.close()
+            mainLikeScope.cancel()
+            mainLikeDispatcher.close()
+            keyId.fill(0)
+            outputs.forEach { it.fill(0) }
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun closeCancelsBlockedHistoryRecoveryBeforeFurtherFeedOrPublication(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = QueuedSessionTransport()
+        val feedStarted = CountDownLatch(1)
+        val releaseFeed = CountDownLatch(1)
+        val feedSequences = CopyOnWriteArrayList<Long>()
+        val disposed = CompletableDeferred<Unit>()
+        val durablePublishes = AtomicInteger(0)
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(
+                outputs = CopyOnWriteArrayList(),
+                onDispose = { disposed.complete(Unit) },
+                onFeed = { sequence, _ ->
+                    feedSequences += sequence
+                    if (sequence == 2L) {
+                        feedStarted.countDown()
+                        check(releaseFeed.await(2, TimeUnit.SECONDS)) {
+                            "timed out releasing blocked history feed"
+                        }
+                    }
+                },
+            ),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            acknowledgementObserver = { generation, sequence ->
+                if (sequence == 4L) durablePublishes.incrementAndGet()
+                DurableAckCommit(sequence, generation)
+            },
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+        val replay = (1L..4L).map { sequence ->
+            RemoteSessionEvent.Output(sequence, byteArrayOf(sequence.toByte()))
+        }
+
+        try {
+            client.start()
+            withTimeout(2_000) { client.sessionState.first { it is RemoteSessionState.Live } }
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady) kotlinx.coroutines.yield()
+            }
+            client.remoteSession.accept(RemoteSessionEvent.Gap(5, 1, 4))
+            val gap = assertIs<RemoteSessionState.HistoryGap>(client.sessionState.value)
+            val sentBeforeRecovery = transport.sent.size
+            val durableBeforeRecovery = durablePublishes.get()
+            val recovery = scope.async { client.recoverFromHistory(replay, expectedGap = gap) }
+            assertTrue(withContext(Dispatchers.IO) { feedStarted.await(2, TimeUnit.SECONDS) })
+
+            client.close()
+            releaseFeed.countDown()
+
+            val failure = runCatching { withTimeout(2_000) { recovery.await() } }.exceptionOrNull()
+            assertTrue(
+                "close returned an unrelated recovery failure: $failure",
+                failure is CancellationException ||
+                    (failure is IllegalStateException && failure.message?.contains("closed") == true),
+            )
+            withTimeout(2_000) { disposed.await() }
+            assertEquals(listOf(1L, 2L), feedSequences)
+            assertEquals(durableBeforeRecovery, durablePublishes.get())
+            assertEquals(sentBeforeRecovery, transport.sent.size)
+            assertIs<ProductionTransportState.Closed>(client.transportState.value)
+        } finally {
+            releaseFeed.countDown()
+            client.close()
+            replay.forEach { (it as RemoteSessionEvent.Output).bytes.fill(0) }
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun blockedRendererLaneDoesNotDelaySuccessorGenerationBootstrap(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val keyId = "epoch-00000007".encodeToByteArray()
+        val transport = GenerationRaceSessionTransport()
+        val feedStarted = CountDownLatch(1)
+        val releaseFeed = CountDownLatch(1)
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(
+                outputs = CopyOnWriteArrayList(),
+                onFeed = { sequence, _ ->
+                    if (sequence == 1L) {
+                        feedStarted.countDown()
+                        check(releaseFeed.await(2, TimeUnit.SECONDS)) {
+                            "timed out releasing blocked successor-generation feed"
+                        }
+                    }
+                },
+            ),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+                keyId = keyId.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(30_000),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+        val output = incomingOutputEnvelope(
+            sessionId,
+            pcId,
+            androidId,
+            pcIdentity,
+            androidIdentity,
+            keyId,
+            1,
+            byteArrayOf(1),
+        )
+
+        try {
+            client.start()
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady) kotlinx.coroutines.yield()
+            }
+            val generationOne = transport.currentConnectedGeneration()
+            transport.deliver(output, generationOne)
+            assertTrue(withContext(Dispatchers.IO) { feedStarted.await(2, TimeUnit.SECONDS) })
+
+            val generationTwo = transport.replaceGeneration()
+            transport.emitConnectedEvent(generationTwo)
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady ||
+                    transport.generationBoundSends.none {
+                        it.first == MessageType.SUBSCRIBE && it.second == generationTwo
+                    } ||
+                    transport.generationBoundSends.none {
+                        it.first == MessageType.FLOW_CONTROL && it.second == generationTwo
+                    }
+                ) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+
+            assertEquals(1L, releaseFeed.count)
+            assertTrue(generationTwo > generationOne)
+            assertEquals(1, transport.connectCount)
+            assertEquals(0, transport.conditionalDisconnectAttempts)
+            assertTrue(transport.disconnectReasons.isEmpty())
+            assertEquals(generationTwo, transport.currentConnectedGeneration())
+            assertIs<ProductionTransportState.Connected>(client.transportState.value)
+        } finally {
+            releaseFeed.countDown()
+            client.close()
+            keyId.fill(0)
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun blockedRendererLaneDoesNotDelayControlLaneReconnect(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val keyId = "epoch-00000007".encodeToByteArray()
+        val transport = QueuedSessionTransport()
+        val feedStarted = CountDownLatch(1)
+        val releaseFeed = CountDownLatch(1)
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(
+                outputs = CopyOnWriteArrayList(),
+                onFeed = { sequence, _ ->
+                    if (sequence == 1L) {
+                        feedStarted.countDown()
+                        check(releaseFeed.await(2, TimeUnit.SECONDS)) {
+                            "timed out releasing blocked live feed"
+                        }
+                    }
+                },
+            ),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+                keyId = keyId.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(0),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+        val output = incomingOutputEnvelope(
+            sessionId,
+            pcId,
+            androidId,
+            pcIdentity,
+            androidIdentity,
+            keyId,
+            1,
+            byteArrayOf(1),
+        )
+
+        try {
+            client.start()
+            withTimeout(2_000) { client.sessionState.first { it is RemoteSessionState.Live } }
+            transport.deliver(output, generation = 1)
+            assertTrue(withContext(Dispatchers.IO) { feedStarted.await(2, TimeUnit.SECONDS) })
+
+            transport.emitFailed("offline")
+            withTimeout(2_000) {
+                while (transport.connectCount < 2 ||
+                    client.transportState.value !is ProductionTransportState.Connected ||
+                    !client.diagnostics().subscriberReady ||
+                    transport.sent.count { it.messageType == MessageType.SUBSCRIBE } < 2 ||
+                    transport.sent.count { it.messageType == MessageType.FLOW_CONTROL } < 2
+                ) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+
+            assertEquals(1L, releaseFeed.count)
+            assertEquals(2, transport.connectCount)
+            assertEquals(2, transport.currentConnectedGeneration())
+            assertTrue(client.diagnostics().subscriberReady)
+            assertTrue(client.diagnostics().transportCollectorActive)
+        } finally {
+            releaseFeed.countDown()
+            client.close()
+            keyId.fill(0)
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
     fun closeDoesNotBlockSingleThreadDispatcherDuringSuspendedAck(): Unit = runBlocking {
         val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
         val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
@@ -1939,7 +2823,7 @@ class ProductionRealtimeSessionClientTest {
     }
 
     @Test
-    fun restoresExplicitControlIntentAfterNetworkGenerationReconnect(): Unit = runBlocking {
+    fun restoresExplicitControlIntentAfterPhysicalGenerationReconnect(): Unit = runBlocking {
         val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
         val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
         val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
@@ -1949,9 +2833,14 @@ class ProductionRealtimeSessionClientTest {
         val pcIdentity = DeviceIdentity.generate()
         val firstSubscribed = CompletableDeferred<Unit>()
         val restoredSubscribed = CompletableDeferred<Unit>()
+        val firstSocket = CompletableDeferred<WebSocket>()
 
-        fun realtime(subscribed: CompletableDeferred<Unit>) = object : WebSocketListener() {
+        fun realtime(
+            subscribed: CompletableDeferred<Unit>,
+            connected: CompletableDeferred<WebSocket>? = null,
+        ) = object : WebSocketListener() {
             override fun onMessage(webSocket: WebSocket, text: String) {
+                connected?.complete(webSocket)
                 check(webSocket.send("{\"type\":\"welcome\",\"protocol_version\":1}"))
             }
 
@@ -1966,7 +2855,7 @@ class ProductionRealtimeSessionClientTest {
             }
         }
 
-        server.enqueue(MockResponse().withWebSocketUpgrade(realtime(firstSubscribed)))
+        server.enqueue(MockResponse().withWebSocketUpgrade(realtime(firstSubscribed, firstSocket)))
         server.enqueue(
             MockResponse()
                 .setHeader("Content-Type", "application/json")
@@ -2022,7 +2911,7 @@ class ProductionRealtimeSessionClientTest {
             )
             assertEquals("/v1/sessions/$sessionId/lease", server.takeRequest(2, TimeUnit.SECONDS)?.path)
 
-            multiplexer.onNetworkAvailable()
+            firstSocket.await().close(1011, "physical relay failure")
 
             withTimeout(5_000) { restoredSubscribed.await() }
             val restored = withTimeout(5_000) {
@@ -2574,6 +3463,67 @@ class ProductionRealtimeSessionClientTest {
         }
     }
 
+    @Test
+    fun leaseRenewalDistinguishesAuthorityLossFromTransientServerFailure(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val leaseId = UUID.fromString("01234567-89ab-cdef-0123-456789abcdef")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        server.enqueue(MockResponse().setResponseCode(204))
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(409)
+                .setHeader("Content-Type", "application/json")
+                .setBody("""{"error":{"code":"LEASE_NOT_HELD"}}"""),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(503)
+                .setHeader("Content-Type", "application/json")
+                .setBody("""{"error":{"code":"LEASE_UNAVAILABLE"}}"""),
+        )
+        server.start()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = server.url("/").toString(),
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = RecordingSessionTransport(sendResult = true),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            val missing = assertFailsWith<RemoteControlLeaseLostException> {
+                client.renewLease(leaseId.toString(), 1)
+            }
+            assertEquals("LEASE_NOT_HELD", missing.reasonCode)
+            val replaced = assertFailsWith<RemoteControlLeaseLostException> {
+                client.renewLease(leaseId.toString(), 1)
+            }
+            assertEquals("LEASE_NOT_HELD", replaced.reasonCode)
+            val transient = assertFailsWith<TermLinkApiException> {
+                client.renewLease(leaseId.toString(), 1)
+            }
+            assertEquals(503, transient.status)
+            assertEquals("LEASE_UNAVAILABLE", transient.code)
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
     private fun assertCumulativeCursor(values: List<Long>, expectedFinal: Long) {
         val snapshot = values.toList()
         assertTrue(snapshot.isNotEmpty())
@@ -2693,7 +3643,8 @@ class ProductionRealtimeSessionClientTest {
     }
 
     private class GenerationRaceSessionTransport : ProductionRealtimeSessionTransport {
-        data class BlockedSubscribe(
+        data class BlockedGenerationSend(
+            val messageType: MessageType,
             val entered: CountDownLatch = CountDownLatch(1),
             val release: CountDownLatch = CountDownLatch(1),
         )
@@ -2704,11 +3655,15 @@ class ProductionRealtimeSessionClientTest {
         private val mutableState = MutableSharedFlow<RealtimeState>(replay = 1, extraBufferCapacity = 4)
         private val mutableConnectionEvents =
             MutableSharedFlow<ProductionRealtimeSessionConnectionEvent>(replay = 1, extraBufferCapacity = 4)
-        private val blockedSubscribe = AtomicReference<BlockedSubscribe?>()
+        private val blockedGenerationSend = AtomicReference<BlockedGenerationSend?>()
+        private val failedGenerationSend = AtomicReference<MessageType?>()
         private val generationReads = AtomicInteger(0)
         private val conditionalDisconnects = AtomicInteger(0)
+        private val connections = AtomicInteger(0)
         private var connectedGeneration = 0
         val sent = CopyOnWriteArrayList<Envelope>()
+        val generationBoundSends = CopyOnWriteArrayList<Pair<MessageType, Int>>()
+        val generationSendAttempts = CopyOnWriteArrayList<Pair<MessageType, Int>>()
         val disconnectReasons = CopyOnWriteArrayList<String>()
 
         override val receivedEnvelopes: Flow<ProductionReceivedEnvelope> = incoming.receiveAsFlow()
@@ -2726,7 +3681,11 @@ class ProductionRealtimeSessionClientTest {
         val conditionalDisconnectAttempts: Int
             get() = conditionalDisconnects.get()
 
+        val connectCount: Int
+            get() = connections.get()
+
         override fun connect() {
+            connections.incrementAndGet()
             val generation = synchronized(lock) {
                 connectedGeneration = if (connectedGeneration <= 0) 1 else connectedGeneration + 1
                 connectedGeneration
@@ -2749,11 +3708,9 @@ class ProductionRealtimeSessionClientTest {
             envelope: Envelope,
             expectedGeneration: Int,
         ): Boolean {
-            val blocked = if (envelope.messageType == MessageType.SUBSCRIBE) {
-                blockedSubscribe.getAndSet(null)
-            } else {
-                null
-            }
+            val candidate = blockedGenerationSend.get()
+            val blocked = candidate?.takeIf { it.messageType == envelope.messageType }
+                ?.takeIf { blockedGenerationSend.compareAndSet(candidate, null) }
             if (blocked != null) {
                 blocked.entered.countDown()
                 check(blocked.release.await(2, TimeUnit.SECONDS)) { "timed out releasing blocked SUBSCRIBE" }
@@ -2762,7 +3719,12 @@ class ProductionRealtimeSessionClientTest {
                 if (expectedGeneration <= 0 || connectedGeneration != expectedGeneration) {
                     false
                 } else {
+                    generationSendAttempts += envelope.messageType to expectedGeneration
+                    if (failedGenerationSend.compareAndSet(envelope.messageType, null)) {
+                        return@synchronized false
+                    }
                     sent += envelope
+                    generationBoundSends += envelope.messageType to expectedGeneration
                     true
                 }
             }
@@ -2799,8 +3761,16 @@ class ProductionRealtimeSessionClientTest {
             incoming.close()
         }
 
-        fun blockNextSubscribe(): BlockedSubscribe = BlockedSubscribe().also { blocked ->
-            check(blockedSubscribe.compareAndSet(null, blocked))
+        fun blockNextSubscribe(): BlockedGenerationSend =
+            blockNextGenerationSend(MessageType.SUBSCRIBE)
+
+        fun blockNextGenerationSend(messageType: MessageType): BlockedGenerationSend =
+            BlockedGenerationSend(messageType).also { blocked ->
+                check(blockedGenerationSend.compareAndSet(null, blocked))
+            }
+
+        fun failNextGenerationSend(messageType: MessageType) {
+            check(failedGenerationSend.compareAndSet(null, messageType))
         }
 
         fun replaceGeneration(): Int = synchronized(lock) {
@@ -2818,6 +3788,29 @@ class ProductionRealtimeSessionClientTest {
             )
             check(mutableState.tryEmit(RealtimeState.Connected))
         }
+
+        fun emitPressure(paused: Boolean) {
+            val generation = synchronized(lock) { connectedGeneration }
+            mutablePressure.value = ProductionReceivePressure(
+                generation = generation,
+                paused = paused,
+                bufferedEvents = if (paused) 1 else 0,
+                bufferedWireBytes = if (paused) 1 else 0,
+            )
+        }
+
+        fun deliver(envelope: Envelope, generation: Int) {
+            check(
+                incoming.trySend(
+                    ProductionReceivedEnvelope(
+                        envelope = envelope,
+                        wireBytes = envelope.serializedSize,
+                        generation = generation,
+                        releaseReservation = {},
+                    ),
+                ).isSuccess,
+            )
+        }
     }
 
     private class QueuedSessionTransport : ProductionRealtimeSessionTransport {
@@ -2829,6 +3822,7 @@ class ProductionRealtimeSessionClientTest {
         private val mutableState = MutableSharedFlow<RealtimeState>(replay = 1, extraBufferCapacity = 4)
         private val releaseCount = AtomicInteger(0)
         private val connectionCount = AtomicInteger(0)
+        private val generation = AtomicInteger(0)
         private val connectedGeneration = AtomicInteger(0)
         private val gracefulCloses = AtomicInteger(0)
         private val immediateCloses = AtomicInteger(0)
@@ -2853,7 +3847,7 @@ class ProductionRealtimeSessionClientTest {
 
         override fun connect() {
             connectionCount.incrementAndGet()
-            connectedGeneration.incrementAndGet()
+            connectedGeneration.set(generation.incrementAndGet())
             check(mutableState.tryEmit(RealtimeState.Connected))
         }
 
@@ -2891,7 +3885,7 @@ class ProductionRealtimeSessionClientTest {
         }
 
         fun emitConnected() {
-            connectedGeneration.incrementAndGet()
+            connectedGeneration.set(generation.incrementAndGet())
             check(mutableState.tryEmit(RealtimeState.Connected))
         }
 
@@ -2902,7 +3896,7 @@ class ProductionRealtimeSessionClientTest {
 
         fun emitState(state: RealtimeState) {
             if (state is RealtimeState.Connected) {
-                connectedGeneration.incrementAndGet()
+                connectedGeneration.set(generation.incrementAndGet())
             } else if (state is RealtimeState.Connecting || state is RealtimeState.Reconnecting ||
                 state is RealtimeState.AuthenticationRejected ||
                 state is RealtimeState.AuthenticationFailed || state is RealtimeState.Failed ||
@@ -2961,6 +3955,7 @@ class ProductionRealtimeSessionClientTest {
     private class RecordingEngine(
         private val outputs: MutableList<ByteArray>,
         private val onDispose: () -> Unit = {},
+        private val onFeed: (Long, Thread) -> Unit = { _, _ -> },
         failOnFeedSequence: Long? = null,
     ) : TerminalEngine {
         private val inputs = MutableSharedFlow<ByteArray>(extraBufferCapacity = 8)
@@ -2980,6 +3975,7 @@ class ProductionRealtimeSessionClientTest {
                 pendingFeedFailureSequence = null
                 throw IllegalStateException("deterministic feed failure at sequence $seq")
             }
+            onFeed(seq, Thread.currentThread())
             val value = ByteArray(bytes.remaining()).also(bytes::get)
             outputs += value
         }

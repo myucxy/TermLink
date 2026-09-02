@@ -39,7 +39,7 @@ internal static class Program
         private bool snapshotPaused;
 
         internal OrderingHandler(
-            IEnumerable<(Guid DeviceId, byte[] ExchangePublicKey)> recipients,
+            IEnumerable<(Guid DeviceId, byte[] ExchangePublicKey, byte[] SigningPublicKey)> recipients,
             long keyEpoch)
         {
             grants = JsonSerializer.SerializeToUtf8Bytes(new
@@ -49,7 +49,8 @@ internal static class Program
                     {
                         device_id = value.DeviceId,
                         device_type = "ANDROID",
-                        exchange_public_key = Convert.ToBase64String(value.ExchangePublicKey)
+                        exchange_public_key = Convert.ToBase64String(value.ExchangePublicKey),
+                        signing_public_key = Convert.ToBase64String(value.SigningPublicKey)
                     }).ToArray()
             });
         }
@@ -279,8 +280,10 @@ internal static class Program
             secondRemoteExchange = DeviceExchangeKeyPair.Generate();
             handler = new OrderingHandler(new[]
             {
-                (recipientDeviceId, remoteExchange.PublicKey),
-                (secondRecipientDeviceId, secondRemoteExchange.PublicKey)
+                (recipientDeviceId, remoteExchange.PublicKey, Enumerable.Range(1, 32)
+                    .Select(value => (byte)value).ToArray()),
+                (secondRecipientDeviceId, secondRemoteExchange.PublicKey, Enumerable.Range(33, 32)
+                    .Select(value => (byte)value).ToArray())
             }, keyEpoch)
             {
                 FailFirstSnapshot = true,

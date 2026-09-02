@@ -7,10 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -40,6 +44,7 @@ import (
 	"github.com/termlink/termlink/server/internal/serviceemail"
 	"github.com/termlink/termlink/server/internal/sessioncleanup"
 	"github.com/termlink/termlink/server/internal/store"
+	"github.com/termlink/termlink/server/internal/transport"
 	"github.com/termlink/termlink/server/internal/webportal"
 )
 
@@ -137,6 +142,7 @@ func runProduction() error {
 	serviceEmailKey := deriveServerKey(keyMaster, "service-email-encryption-and-challenges")
 	adminRouteKey := deriveServerKey(keyMaster, "web-admin-route-encryption")
 	humanVerificationKey := deriveServerKey(keyMaster, "human-verification-settings-encryption")
+	directTransportKey := deriveServerKey(keyMaster, "direct-transport-ticket-ed25519")
 	gatewayResolver, err := commerce.NewChannelGatewayResolver(commerce.GatewayResolverConfig{
 		Repository: repository,
 		SecretRoot: cfg.PaymentSecretsDir,
@@ -308,6 +314,79 @@ func runProduction() error {
 		defer cancel()
 		_ = hub.Close(shutdown)
 	}()
+	directTransportEnabled, err := optionalFeatureFlag("TERMLINK_DIRECT_TRANSPORT_ENABLED")
+	if err != nil {
+		return err
+	}
+	directSTUNServers, err := parseDirectSTUNServers(os.Getenv("TERMLINK_DIRECT_STUN_SERVERS"))
+	if err != nil {
+		return err
+	}
+	var directHub *transport.Hub
+	var directTickets *transport.RouteTicketService
+	var directRepository *store.Postgres
+	var directValkey *kv.Valkey
+	var directAuthentication auth.Middleware
+	if directTransportEnabled {
+		directRedisURL, directSecretErr := readOptionalSecretFile("TERMLINK_DIRECT_REDIS_URL_FILE")
+		if directSecretErr == nil {
+			directRepository, err = store.OpenWithOptions(ctx, cfg.DatabaseURL.Value(), store.OpenOptions{
+				MaxConns: 4, MinConns: 0, ConnectTimeout: 3 * time.Second,
+				MaxConnLifetime: 15 * time.Minute, MaxConnIdleTime: time.Minute,
+			})
+			if err == nil {
+				directRepository.AutoTrustDevices = true
+				directValkey, err = kv.OpenWithOptions(ctx, directRedisURL, kv.OpenOptions{
+					PoolSize: 8, MinIdleConns: 1, DialTimeout: 2 * time.Second,
+					ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second, PoolTimeout: 2 * time.Second,
+				})
+			}
+			if err == nil {
+				var directState *kv.DirectTransportState
+				directState, err = kv.NewDirectTransportState(directValkey.Client, "")
+				if err == nil {
+					directTickets, err = transport.NewSharedRouteTicketService(directRepository, directState, directTransportKey, directSTUNServers...)
+				}
+				if err == nil {
+					directHub, err = transport.NewSharedHub(directTickets, directState)
+				}
+				if err == nil {
+					directAuthentication = auth.Middleware{
+						Tokens: verifier, Devices: directRepository, Nonces: directValkey, SubjectKey: subjectKey,
+					}
+					startCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+					err = directHub.Start(startCtx)
+					cancel()
+				}
+			}
+		} else {
+			err = directSecretErr
+		}
+		if err != nil {
+			slog.Warn("direct transport degraded to Relay-only", "error_class", "direct_transport_unavailable")
+			if directHub != nil {
+				shutdown, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = directHub.Close(shutdown)
+				cancel()
+			}
+			if directValkey != nil {
+				_ = directValkey.Close()
+			}
+			if directRepository != nil {
+				directRepository.Close()
+			}
+			directHub, directTickets, directValkey, directRepository = nil, nil, nil, nil
+		}
+	}
+	if directHub != nil {
+		defer func() {
+			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = directHub.Close(shutdown)
+		}()
+		defer directRepository.Close()
+		defer directValkey.Close()
+	}
 	portal, err := webportal.New(ctx, webportal.Config{
 		PublicURL:                 cfg.PublicURL,
 		Issuer:                    cfg.OIDCIssuer,
@@ -343,6 +422,13 @@ func runProduction() error {
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/realtime", authentication.Authenticate(hub.Handler()))
+	if directHub != nil && directTickets != nil {
+		registerDirectTransportRoutes(mux,
+			directAuthentication.Authenticate(directTickets.ConfigHandler()),
+			directAuthentication.Authenticate(directTickets.TicketHandler()),
+			transport.AuthenticateSignals(directAuthentication, directHub.Handler()),
+		)
+	}
 	mux.Handle("/v1/", productionAPI.Handler())
 	mux.Handle("/v1", productionAPI.Handler())
 	mux.HandleFunc("GET /readyz", readinessHandler(repository, valkey))
@@ -372,7 +458,7 @@ func runProduction() error {
 	}
 	go fileoperationcleanup.New(repository, fileoperationcleanup.Options{Logger: slog.Default()}).Run(ctx)
 	go sessioncleanup.New(repository, sessioncleanup.Options{Logger: slog.Default()}).Run(ctx)
-	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "history_enabled", cfg.HistoryEnabled, "metrics_enabled", cfg.MetricsListenAddr != "")
+	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "history_enabled", cfg.HistoryEnabled, "metrics_enabled", cfg.MetricsListenAddr != "", "direct_transport_enabled", directHub != nil)
 	applicationHandler := http.Handler(mux)
 	if metrics != nil {
 		applicationHandler = metrics.HTTPMiddleware(applicationHandler)
@@ -434,6 +520,106 @@ func deriveServerKey(master, purpose string) []byte {
 	_, _ = mac.Write([]byte("TermLink server key V1\x00"))
 	_, _ = mac.Write([]byte(purpose))
 	return mac.Sum(nil)
+}
+
+func optionalFeatureFlag(name string) (bool, error) {
+	value, exists := os.LookupEnv(name)
+	if !exists || strings.TrimSpace(value) == "" {
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "1", "yes", "on":
+		return true, nil
+	case "false", "0", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid boolean value for %s", name)
+	}
+}
+
+func readOptionalSecretFile(name string) (string, error) {
+	path, exists := os.LookupEnv(name)
+	path = strings.TrimSpace(path)
+	if !exists || path == "" {
+		return "", fmt.Errorf("%s is required when direct transport is enabled", name)
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info == nil || info.IsDir() {
+		return "", fmt.Errorf("%s does not reference a readable secret file", name)
+	}
+	if runtime.GOOS != "windows" {
+		permissions := info.Mode().Perm()
+		if permissions&0o077 != 0 || permissions&0o400 == 0 {
+			return "", fmt.Errorf("%s secret file permissions are unsafe", name)
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", name, err)
+	}
+	value := strings.TrimSpace(string(data))
+	if value == "" {
+		return "", fmt.Errorf("%s is empty", name)
+	}
+	return value, nil
+}
+
+func parseDirectSTUNServers(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	items := strings.Split(raw, ",")
+	if len(items) > 2 {
+		return nil, errors.New("TERMLINK_DIRECT_STUN_SERVERS accepts at most two endpoints")
+	}
+	result := make([]string, 0, len(items))
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if !strings.HasPrefix(item, "stun:") || strings.ContainsAny(item, "?#/@") {
+			return nil, errors.New("TERMLINK_DIRECT_STUN_SERVERS must use stun:host:port")
+		}
+		host, portText, err := net.SplitHostPort(strings.TrimPrefix(item, "stun:"))
+		port, portErr := strconv.Atoi(portText)
+		if err != nil || portErr != nil || port < 1 || port > 65535 || strconv.Itoa(port) != portText || !validSTUNHost(host) {
+			return nil, errors.New("TERMLINK_DIRECT_STUN_SERVERS must use stun:host:port")
+		}
+		canonical := "stun:" + net.JoinHostPort(strings.ToLower(host), portText)
+		if _, duplicate := seen[canonical]; duplicate {
+			return nil, errors.New("TERMLINK_DIRECT_STUN_SERVERS contains a duplicate endpoint")
+		}
+		seen[canonical] = struct{}{}
+		result = append(result, canonical)
+	}
+	return result, nil
+}
+
+func validSTUNHost(host string) bool {
+	if host == "" || len(host) > 253 || strings.Contains(host, "%") {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func registerDirectTransportRoutes(mux *http.ServeMux, config, tickets, signals http.Handler) {
+	mux.Handle("/v1/transport/config", config)
+	mux.Handle("/v1/transport/tickets", tickets)
+	mux.Handle("/v1/transport/signals", signals)
 }
 
 func serveProduction(ctx context.Context, application *serverruntime.Runtime, metrics *observability.Metrics, metricsAddr string) error {

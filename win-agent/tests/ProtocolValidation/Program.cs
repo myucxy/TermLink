@@ -7,6 +7,7 @@ using Google.Protobuf;
 using TermLink.Protocol;
 using TermLink.Protocol.Validation;
 using TermLink.Protocol.Realtime.V1;
+using TermLink.Protocol.Transport.V1;
 
 if (args.Contains("--print-snapshot-vector", StringComparer.Ordinal))
 {
@@ -50,6 +51,30 @@ Require(SessionUpsertPayload.Parser.ParseFrom(endedSuccessfully.ToByteArray()).H
     "Session exit code 0 lost protobuf presence.");
 Require(!SessionUpsertPayload.Parser.ParseFrom(legacyEnded.ToByteArray()).HasExitCode,
     "Legacy Session lifecycle unexpectedly acquired an exit code.");
+
+var exactRelayEnvelopeBytes = ByteString.CopyFrom(Convert.FromHexString("080110141A03112233F80101"));
+var directFrame = new DirectPathFrameV1
+{
+    ProtocolVersion = 1,
+    ConnectionId = ByteString.CopyFrom(Enumerable.Repeat((byte)0xA5, 16).ToArray()),
+    PathEpoch = 7,
+    FrameSeq = 9,
+    RealtimeEnvelope = exactRelayEnvelopeBytes
+};
+var parsedDirectFrame = DirectPathFrameV1.Parser.ParseFrom(directFrame.ToByteArray());
+Require(parsedDirectFrame.BodyCase == DirectPathFrameV1.BodyOneofCase.RealtimeEnvelope &&
+    parsedDirectFrame.RealtimeEnvelope.Equals(exactRelayEnvelopeBytes),
+    "Direct transport did not preserve the byte-identical realtime Envelope.");
+var directionalBarrier = SessionCutoverBarrierV1.Parser.ParseFrom(
+    new SessionCutoverBarrierV1
+    {
+        SessionId = ByteString.CopyFrom(session),
+        PcToAndroidFirstDirectSeq = 43
+    }.ToByteArray());
+Require(directionalBarrier.HasPcToAndroidFirstDirectSeq &&
+    !directionalBarrier.HasAndroidToPcFirstDirectSeq &&
+    directionalBarrier.PcToAndroidFirstDirectSeq == 43,
+    "The direct cutover barrier lost per-direction presence semantics.");
 
 const string synchronizedTitle = "构建完成 — PowerShell 🚀";
 var titledSession = new SessionUpsertPayload

@@ -17,6 +17,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.Flow
@@ -28,6 +29,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -66,6 +68,10 @@ data class ProductionRealtimeSocketDiagnostics(
     val state: String,
     val bufferedEvents: Int,
     val bufferedWireBytes: Long,
+    /** Valid application frames whose local admission decision has completed. */
+    val observedApplicationFrames: Long = 0,
+    /** Observed application frames not admitted to the bounded local receive channel. */
+    val droppedApplicationFrames: Long = 0,
 )
 
 private val REALTIME_CAPABILITY_IDENTIFIER = Regex("[a-z][a-z0-9._-]{0,63}")
@@ -79,6 +85,7 @@ internal fun productionRealtimeCapabilities(additional: Set<String>): List<Strin
         "e2ee_x25519_chacha20poly1305",
         "flow_control_v1",
         "lease_v1",
+        "liveness_probe_v1",
         "bounded_event_replay_v1",
         "terminal_presentation_metadata_v1",
         "terminal_typed_input_v1",
@@ -124,6 +131,8 @@ internal interface ProductionRealtimeSocket : Closeable {
 
     fun connect()
     fun send(envelope: Envelope): Boolean
+    fun supportsLivenessProbe(expectedGeneration: Int): Boolean = false
+    suspend fun probeLiveness(expectedGeneration: Int, timeoutMillis: Long): Boolean = false
     fun disconnect(reason: String)
     fun diagnostics(): ProductionRealtimeSocketDiagnostics = ProductionRealtimeSocketDiagnostics(
         generation = 0,
@@ -157,6 +166,8 @@ class ProductionRealtimeClient(
     private val lastIncomingSequences = ConcurrentHashMap<IncomingCursor, java.util.concurrent.atomic.AtomicLong>()
     private val bufferedIncomingEvents = AtomicInteger(0)
     private val bufferedIncomingWireBytes = AtomicLong(0)
+    private val observedApplicationFrames = AtomicLong(0)
+    private val droppedApplicationFrames = AtomicLong(0)
     private val receivePressurePaused = AtomicBoolean(false)
     private val incomingChannel = Channel<ProductionReceivedEnvelope>(
         capacity = MAX_BUFFERED_EVENTS,
@@ -178,11 +189,14 @@ class ProductionRealtimeClient(
     private val sendLock = Any()
     @Volatile private var socket: WebSocket? = null
     @Volatile private var connectedGeneration: Int = 0
+    private var connectedCapabilities: Set<String> = emptySet()
+    private var pendingLivenessProbe: PendingLivenessProbe? = null
 
     private val incomingReceived: Flow<ProductionReceivedEnvelope> = incomingChannel.receiveAsFlow()
     // Compatibility view for transport-level callers that only need the
-    // immutable Envelope. The session bridge uses receivedEnvelopes so the
-    // byte reservation remains held until decrypt/parse/render completes.
+    // immutable Envelope. A device multiplexer may detach the physical-socket
+    // reservation after routing and replace it with an endpoint-local budget;
+    // direct consumers still release this reservation after processing.
     val incoming: Flow<Envelope> = incomingReceived.map { received ->
         try { received.envelope } finally { received.close() }
     }
@@ -199,9 +213,11 @@ class ProductionRealtimeClient(
         check(!closed.get()) { "realtime client is closed" }
         val nextGeneration = generation.incrementAndGet()
         synchronized(sendLock) {
+            cancelPendingLivenessProbeLocked()
             socket?.cancel()
             socket = null
             connectedGeneration = 0
+            connectedCapabilities = emptySet()
         }
         // A new socket can replay from the session ACK. Keep duplicate
         // rejection within one generation, while allowing a durable replay
@@ -260,12 +276,72 @@ class ProductionRealtimeClient(
         }
     }
 
+    override fun supportsLivenessProbe(expectedGeneration: Int): Boolean = synchronized(sendLock) {
+        !closed.get() && expectedGeneration > 0 && generation.get() == expectedGeneration &&
+            connectedGeneration == expectedGeneration && socket != null &&
+            LIVENESS_PROBE_CAPABILITY in connectedCapabilities
+    }
+
+    /**
+     * Proves application-level round-trip liveness on one authenticated socket
+     * generation. OkHttp's WebSocket ping interval detects dead transports but
+     * does not expose Pong completion, so foreground recovery uses this bounded
+     * negotiated control without touching terminal Envelope ordering.
+     */
+    override suspend fun probeLiveness(expectedGeneration: Int, timeoutMillis: Long): Boolean {
+        require(expectedGeneration > 0) { "expected generation must be positive" }
+        require(timeoutMillis > 0) { "liveness timeout must be positive" }
+        val probe = PendingLivenessProbe(
+            generation = expectedGeneration,
+            probeId = UUID.randomUUID().toString(),
+            completion = CompletableDeferred(),
+        )
+        val sent = synchronized(sendLock) {
+            val active = socket
+            if (closed.get() || active == null || generation.get() != expectedGeneration ||
+                connectedGeneration != expectedGeneration ||
+                LIVENESS_PROBE_CAPABILITY !in connectedCapabilities || pendingLivenessProbe != null
+            ) {
+                false
+            } else {
+                pendingLivenessProbe = probe
+                val control = buildJsonObject {
+                    put("type", "ping")
+                    put("probe_id", probe.probeId)
+                }
+                active.send(Json.encodeToString(JsonObject.serializer(), control)).also { accepted ->
+                    if (!accepted && pendingLivenessProbe === probe) pendingLivenessProbe = null
+                }
+            }
+        }
+        if (!sent) return false
+
+        val alive = try {
+            withTimeoutOrNull(timeoutMillis) { probe.completion.await() } == true &&
+                supportsLivenessProbe(expectedGeneration)
+        } finally {
+            // Endpoint removal, network replacement, and owner shutdown may
+            // cancel the supervisor coroutine before its timeout. Never leave
+            // that cancelled probe occupying the one-probe generation gate.
+            synchronized(sendLock) {
+                if (pendingLivenessProbe === probe) pendingLivenessProbe = null
+            }
+        }
+        Log.d(
+            REALTIME_LOG_TAG,
+            "socket_liveness_probe_result generation=$expectedGeneration alive=$alive",
+        )
+        return alive
+    }
+
     /** Closes only the current generation, allowing the owner to reconnect. */
     override fun disconnect(reason: String) {
         if (closed.get()) return
         val active = synchronized(sendLock) {
             generation.incrementAndGet()
+            cancelPendingLivenessProbeLocked()
             connectedGeneration = 0
+            connectedCapabilities = emptySet()
             val current = socket
             socket = null
             current
@@ -278,9 +354,11 @@ class ProductionRealtimeClient(
         if (!closed.compareAndSet(false, true)) return
         generation.incrementAndGet()
         synchronized(sendLock) {
+            cancelPendingLivenessProbeLocked()
             socket?.close(1000, "client closed")
             socket = null
             connectedGeneration = 0
+            connectedCapabilities = emptySet()
         }
         mutableState.tryEmit(RealtimeState.Closed)
         lastIncomingSequences.clear()
@@ -294,6 +372,8 @@ class ProductionRealtimeClient(
         state = mutableState.replayCache.lastOrNull().diagnosticName(),
         bufferedEvents = bufferedIncomingEvents.get(),
         bufferedWireBytes = bufferedIncomingWireBytes.get(),
+        observedApplicationFrames = observedApplicationFrames.get(),
+        droppedApplicationFrames = droppedApplicationFrames.get(),
     )
 
     private inner class Listener(private val listenerGeneration: Int) : WebSocketListener() {
@@ -321,15 +401,32 @@ class ProductionRealtimeClient(
                 webSocket.close(1009, "welcome control too large")
                 return
             }
-            val accepted = validateWelcome(text)
-            if (accepted && !welcomed) {
-                welcomed = true
-                connectedGeneration = listenerGeneration
-                mutableState.tryEmit(RealtimeState.Connected)
-            } else {
-                acceptingBinary = false
-                webSocket.close(1002, "invalid welcome control")
+            if (!welcomed) {
+                val negotiated = validateWelcome(text)
+                if (negotiated != null) {
+                    val accepted = synchronized(sendLock) {
+                        if (closed.get() || socket !== webSocket ||
+                            generation.get() != listenerGeneration
+                        ) {
+                            false
+                        } else {
+                            welcomed = true
+                            connectedGeneration = listenerGeneration
+                            connectedCapabilities = negotiated
+                            true
+                        }
+                    }
+                    if (accepted) mutableState.tryEmit(RealtimeState.Connected)
+                    return
+                }
+            } else if (handleLivenessPong(text)) {
+                return
             }
+            acceptingBinary = false
+            webSocket.close(
+                1002,
+                if (welcomed) "invalid realtime control" else "invalid welcome control",
+            )
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: OkioByteString) {
@@ -347,33 +444,32 @@ class ProductionRealtimeClient(
                 return
             }
             if (bytes.size > MAX_FRAME_BYTES) {
-                acceptingBinary = false
-                webSocket.close(1009, "frame too large")
+                logBinaryDrop("socket_binary_oversized", bytes)
                 return
             }
             val raw = bytes.toByteArray()
             val envelope = try {
                 runCatching { Envelope.parseFrom(raw) }.getOrElse {
-                    acceptingBinary = false
-                    webSocket.close(1002, "invalid Envelope")
+                    logBinaryDrop("socket_envelope_malformed", bytes)
                     return
                 }
             } finally {
                 raw.fill(0)
             }
             if (!validateIncoming(envelope)) {
-                acceptingBinary = false
-                webSocket.close(1008, "Envelope metadata rejected")
+                logEnvelopeAdmission("socket_envelope_metadata_rejected", envelope, bytes.size)
                 return
             }
             if (!reserveIncoming(raw.size, listenerGeneration)) {
+                droppedApplicationFrames.incrementAndGet()
+                // Publish observed last so it is also a completion watermark
+                // for the admission decision of this serial WebSocket callback.
+                observedApplicationFrames.incrementAndGet()
                 logEnvelopeAdmission(
                     decision = "socket_reservation_rejected",
                     envelope = envelope,
                     wireBytes = raw.size,
                 )
-                acceptingBinary = false
-                webSocket.close(1013, "bounded receive byte budget exceeded")
                 return
             }
             val received = ProductionReceivedEnvelope(
@@ -384,6 +480,7 @@ class ProductionRealtimeClient(
             )
             val admission = incomingChannel.trySend(received)
             if (admission.isFailure) {
+                droppedApplicationFrames.incrementAndGet()
                 logEnvelopeAdmission(
                     decision = if (admission.isClosed) {
                         "socket_channel_closed"
@@ -394,14 +491,12 @@ class ProductionRealtimeClient(
                     wireBytes = raw.size,
                 )
                 received.close()
-                // close() is asynchronous. Without this generation-local gate,
-                // later callbacks can enter the queue after the first rejected
-                // frame as the collector frees capacity, manufacturing a hole
-                // that looks like durable History Gap. Stop at one contiguous
-                // prefix and let the owner resume from its cumulative ACK.
-                acceptingBinary = false
-                webSocket.close(1013, "bounded receive queue exceeded")
+                // This is application backpressure, not physical WSS failure.
+                // Drop only this Envelope; a later admitted sequence creates a
+                // normal session-local History Gap while other sessions and the
+                // authenticated Relay generation remain healthy.
             }
+            observedApplicationFrames.incrementAndGet()
         }
 
         /**
@@ -450,6 +545,7 @@ class ProductionRealtimeClient(
                 return
             }
             acceptingBinary = false
+            synchronized(sendLock) { cancelPendingLivenessProbeLocked(listenerGeneration) }
             val status = response?.code
             val reason = t.message ?: "realtime failed"
             response?.close()
@@ -465,6 +561,7 @@ class ProductionRealtimeClient(
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             if (!isCurrent(webSocket) || closed.get()) return
             acceptingBinary = false
+            synchronized(sendLock) { cancelPendingLivenessProbeLocked(listenerGeneration) }
             mutableState.tryEmit(RealtimeState.Failed(reason.ifBlank { "socket closed ($code)" }))
         }
 
@@ -488,35 +585,74 @@ class ProductionRealtimeClient(
             }
         }
 
-        private fun validateWelcome(text: String): Boolean = runCatching {
-            val value = Json.parseToJsonElement(text) as? JsonObject ?: return@runCatching false
-            val type = value["type"] as? JsonPrimitive ?: return@runCatching false
+        private fun validateWelcome(text: String): Set<String>? = runCatching {
+            val value = Json.parseToJsonElement(text) as? JsonObject ?: return@runCatching null
+            val type = value["type"] as? JsonPrimitive ?: return@runCatching null
             val protocolVersion = value["protocol_version"] as? JsonPrimitive
-                ?: return@runCatching false
+                ?: return@runCatching null
             if (!type.isString || type.content != "welcome" ||
                 protocolVersion.isString || protocolVersion.content != "1"
-            ) return@runCatching false
+            ) return@runCatching null
 
             val capabilitiesElement = value["capabilities"]
             if (capabilitiesElement == null) {
                 // Older Relays did not echo negotiated capabilities. Keep that
                 // compatibility only when this client did not explicitly opt
                 // into an additional capability.
-                return@runCatching requiredWelcomeCapabilities.isEmpty()
+                return@runCatching if (requiredWelcomeCapabilities.isEmpty()) emptySet() else null
             }
-            val capabilities = capabilitiesElement as? JsonArray ?: return@runCatching false
+            val capabilities = capabilitiesElement as? JsonArray ?: return@runCatching null
             val negotiated = HashSet<String>(capabilities.size)
             for (element in capabilities) {
-                val primitive = element as? JsonPrimitive ?: return@runCatching false
-                if (!primitive.isString) return@runCatching false
+                val primitive = element as? JsonPrimitive ?: return@runCatching null
+                if (!primitive.isString) return@runCatching null
                 val capability = primitive.content
                 if (!REALTIME_CAPABILITY_IDENTIFIER.matches(capability) ||
                     !negotiated.add(capability)
-                ) return@runCatching false
+                ) return@runCatching null
             }
-            negotiated.containsAll(requiredWelcomeCapabilities)
+            if (negotiated.containsAll(requiredWelcomeCapabilities)) negotiated else null
+        }.getOrNull()
+
+        private fun handleLivenessPong(text: String): Boolean = runCatching {
+            val value = Json.parseToJsonElement(text) as? JsonObject ?: return@runCatching false
+            val type = value["type"] as? JsonPrimitive ?: return@runCatching false
+            val probeId = value["probe_id"] as? JsonPrimitive ?: return@runCatching false
+            if (!type.isString || type.content != "pong" || !probeId.isString ||
+                runCatching { UUID.fromString(probeId.content) }.getOrNull()?.toString() != probeId.content
+            ) return@runCatching false
+
+            val completion = synchronized(sendLock) {
+                if (generation.get() != listenerGeneration ||
+                    LIVENESS_PROBE_CAPABILITY !in connectedCapabilities
+                ) return@synchronized null
+                val pending = pendingLivenessProbe
+                if (pending?.generation == listenerGeneration && pending.probeId == probeId.content) {
+                    pendingLivenessProbe = null
+                    pending.completion
+                } else {
+                    null
+                }
+            }
+            // A syntactically valid late Pong is deliberately ignored. It may
+            // have raced the bounded timeout and must never poison a live socket.
+            completion?.complete(true)
+            true
         }.getOrDefault(false)
     }
+
+    private fun cancelPendingLivenessProbeLocked(expectedGeneration: Int? = null) {
+        val pending = pendingLivenessProbe ?: return
+        if (expectedGeneration != null && pending.generation != expectedGeneration) return
+        pendingLivenessProbe = null
+        pending.completion.complete(false)
+    }
+
+    private data class PendingLivenessProbe(
+        val generation: Int,
+        val probeId: String,
+        val completion: CompletableDeferred<Boolean>,
+    )
 
     private fun reserveIncoming(wireBytes: Int, pressureGeneration: Int): Boolean {
         if (wireBytes <= 0 || wireBytes > MAX_FRAME_BYTES) return false
@@ -600,6 +736,7 @@ class ProductionRealtimeClient(
 
     companion object {
         private const val REALTIME_LOG_TAG = "TermLinkRealtime"
+        internal const val LIVENESS_PROBE_CAPABILITY = "liveness_probe_v1"
         const val MAX_FRAME_BYTES: Int = 1 shl 20
         const val MAX_BUFFERED_EVENTS: Int = 128
         const val LOW_BUFFERED_EVENTS: Int = 32

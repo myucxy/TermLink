@@ -169,6 +169,30 @@ type DeviceRecord struct {
 // same account. The bootstrap/PENDING relationships remain for compatibility
 // tests and deployments that explicitly leave automatic account access off.
 func (s *Postgres) RegisterDevice(ctx context.Context, subjectHash [32]byte, input RegisterDeviceInput, traceID string) (uuid.UUID, DeviceRecord, bool, error) {
+	var (
+		userID    uuid.UUID
+		record    DeviceRecord
+		bootstrap bool
+		err       error
+	)
+	for attempt := 0; attempt < 5; attempt++ {
+		userID, record, bootstrap, err = s.registerDeviceOnce(ctx, subjectHash, input, traceID)
+		if !isPostgresRetryableTransactionError(err) {
+			return userID, record, bootstrap, err
+		}
+		if ctx.Err() != nil {
+			return uuid.Nil, DeviceRecord{}, false, ctx.Err()
+		}
+	}
+	return uuid.Nil, DeviceRecord{}, false, err
+}
+
+// registerDeviceOnce contains one serializable registration attempt. Android
+// startup can legitimately issue several independent API calls at once; each
+// first verifies the same idempotent device registration. PostgreSQL may abort
+// one waiter with 40001 after the account row lock is released, so the public
+// method retries the complete transaction instead of surfacing a spurious 500.
+func (s *Postgres) registerDeviceOnce(ctx context.Context, subjectHash [32]byte, input RegisterDeviceInput, traceID string) (uuid.UUID, DeviceRecord, bool, error) {
 	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return uuid.Nil, DeviceRecord{}, false, err
@@ -1171,6 +1195,7 @@ type PCGrantRecord struct {
 	DeviceID          uuid.UUID  `json:"device_id"`
 	DeviceType        string     `json:"device_type"`
 	DeviceName        string     `json:"device_name"`
+	SigningPublicKey  []byte     `json:"signing_public_key"`
 	ExchangePublicKey []byte     `json:"exchange_public_key"`
 	KeyID             string     `json:"key_id"`
 	Permission        string     `json:"permission"`
@@ -1207,7 +1232,7 @@ func (s *Postgres) ListPCGrants(ctx context.Context, userID, actorID, pcID uuid.
 		return 0, nil, err
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT d.id,d.device_type,d.name,d.exchange_public_key,d.key_id,
+		SELECT d.id,d.device_type,d.name,d.signing_public_key,d.exchange_public_key,d.key_id,
 		       CASE WHEN $3 AND d.device_type='ANDROID' THEN 'MANAGE' ELSE g.permission END,
 		       CASE WHEN $3 AND d.device_type='ANDROID' THEN NULL ELSE g.expires_at END
 		FROM devices d
@@ -1224,7 +1249,7 @@ func (s *Postgres) ListPCGrants(ctx context.Context, userID, actorID, pcID uuid.
 	items := make([]PCGrantRecord, 0)
 	for rows.Next() {
 		var item PCGrantRecord
-		if err := rows.Scan(&item.DeviceID, &item.DeviceType, &item.DeviceName, &item.ExchangePublicKey, &item.KeyID, &item.Permission, &item.ExpiresAt); err != nil {
+		if err := rows.Scan(&item.DeviceID, &item.DeviceType, &item.DeviceName, &item.SigningPublicKey, &item.ExchangePublicKey, &item.KeyID, &item.Permission, &item.ExpiresAt); err != nil {
 			return 0, nil, err
 		}
 		items = append(items, item)

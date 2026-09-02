@@ -1,0 +1,375 @@
+syntax = "proto3";
+
+package termlink.transport.v1;
+
+option csharp_namespace = "TermLink.Protocol.Transport.V1";
+option java_multiple_files = true;
+option java_package = "dev.termlink.protocol.transport.v1";
+
+// Transport signalling is carried by the independent, pairwise encrypted
+// /v1/transport/signals control lane. Its sequence and acknowledgement never
+// advance or replace termlink.realtime.v1.Envelope sequencing or durable ACK.
+message TransportSignalEnvelopeV1 {
+  uint32 protocol_version = 1;
+  TransportSignalTypeV1 signal_type = 2;
+  bytes connection_id = 3;
+  bytes sender_device_id = 4;
+  bytes recipient_device_id = 5;
+  uint64 path_epoch = 6;
+  uint64 signal_seq = 7;
+  uint64 signal_ack = 8;
+  int64 sent_at_ms = 9;
+  bytes key_id = 10;
+  bytes nonce = 11;
+  bytes ciphertext = 12;
+}
+
+enum TransportSignalTypeV1 {
+  TRANSPORT_SIGNAL_TYPE_V1_UNSPECIFIED = 0;
+  TRANSPORT_SIGNAL_TYPE_V1_PATH_OFFER = 1;
+  TRANSPORT_SIGNAL_TYPE_V1_PATH_ANSWER = 2;
+  TRANSPORT_SIGNAL_TYPE_V1_CANDIDATE_UPDATE = 3;
+  TRANSPORT_SIGNAL_TYPE_V1_NOMINATION = 4;
+  TRANSPORT_SIGNAL_TYPE_V1_NOMINATION_RESULT = 5;
+  TRANSPORT_SIGNAL_TYPE_V1_CUTOVER_PROPOSAL = 6;
+  TRANSPORT_SIGNAL_TYPE_V1_CUTOVER_ACCEPT = 7;
+  TRANSPORT_SIGNAL_TYPE_V1_CUTOVER_COMMIT = 8;
+  TRANSPORT_SIGNAL_TYPE_V1_FALLBACK = 9;
+  TRANSPORT_SIGNAL_TYPE_V1_PATH_CLOSE = 10;
+  // Negotiated only with direct_transport_shadow_multipair_v2. These values
+  // separate connectivity checks from the single committed nomination.
+  TRANSPORT_SIGNAL_TYPE_V1_CONNECTIVITY_CHECK_BATCH_V2 = 11;
+  TRANSPORT_SIGNAL_TYPE_V1_NOMINATION_V2 = 12;
+  TRANSPORT_SIGNAL_TYPE_V1_NOMINATION_ACK_V2 = 13;
+  TRANSPORT_SIGNAL_TYPE_V1_NOMINATION_RESULT_V2 = 14;
+}
+
+// Exactly one field must be present after decrypting TransportSignalEnvelopeV1,
+// and it must agree with the authenticated outer signal_type.
+message TransportSignalPayloadV1 {
+  uint32 format_version = 1;
+  oneof signal {
+    DirectPathOfferV1 path_offer = 10;
+    DirectPathAnswerV1 path_answer = 11;
+    DirectCandidateUpdateV1 candidate_update = 12;
+    DirectNominationV1 nomination = 13;
+    DirectNominationResultV1 nomination_result = 14;
+    DirectCutoverProposalV1 cutover_proposal = 15;
+    DirectCutoverAcceptV1 cutover_accept = 16;
+    DirectCutoverCommitV1 cutover_commit = 17;
+    DirectFallbackV1 fallback = 18;
+    DirectPathCloseV1 path_close = 19;
+    DirectConnectivityCheckBatchV2 connectivity_check_batch_v2 = 20;
+    DirectNominationV2 nomination_v2 = 21;
+    DirectNominationAckV2 nomination_ack_v2 = 22;
+    DirectNominationResultV2 nomination_result_v2 = 23;
+  }
+}
+
+enum DirectCarrierV1 {
+  DIRECT_CARRIER_V1_UNSPECIFIED = 0;
+  DIRECT_CARRIER_V1_UDP_QUIC = 1;
+  // Reserved until authenticated TURN allocation and credential rotation are
+  // implemented. A V1 peer must not advertise this carrier today.
+  DIRECT_CARRIER_V1_TURN_UDP_QUIC = 2;
+}
+
+enum DirectCandidateKindV1 {
+  DIRECT_CANDIDATE_KIND_V1_UNSPECIFIED = 0;
+  DIRECT_CANDIDATE_KIND_V1_HOST = 1;
+  DIRECT_CANDIDATE_KIND_V1_SERVER_REFLEXIVE = 2;
+  // Reserved; receiving it without the negotiated TURN capability is fatal to
+  // this path attempt only, never to the realtime Relay connection.
+  DIRECT_CANDIDATE_KIND_V1_RELAY = 3;
+}
+
+enum DirectPeerRoleV1 {
+  DIRECT_PEER_ROLE_V1_UNSPECIFIED = 0;
+  DIRECT_PEER_ROLE_V1_INITIATOR = 1;
+  DIRECT_PEER_ROLE_V1_RESPONDER = 2;
+}
+
+enum DirectPathResultV1 {
+  DIRECT_PATH_RESULT_V1_UNSPECIFIED = 0;
+  DIRECT_PATH_RESULT_V1_ACCEPTED = 1;
+  DIRECT_PATH_RESULT_V1_REJECTED = 2;
+  DIRECT_PATH_RESULT_V1_FAILED = 3;
+}
+
+enum DirectConnectivityDatagramKindV1 {
+  DIRECT_CONNECTIVITY_DATAGRAM_KIND_V1_UNSPECIFIED = 0;
+  DIRECT_CONNECTIVITY_DATAGRAM_KIND_V1_PROBE = 1;
+  DIRECT_CONNECTIVITY_DATAGRAM_KIND_V1_PROBE_ACK = 2;
+}
+
+// Server-issued, short-lived authorization for one exact device pair and path
+// epoch. server_signature authenticates the deterministic encoding of fields
+// 1 through 12 with the TERMLINK-DIRECT-TICKET-V1 domain separator.
+message DirectPathTicketV1 {
+  uint32 format_version = 1;
+  bytes ticket_id = 2;
+  bytes account_id = 3;
+  bytes initiator_device_id = 4;
+  bytes responder_device_id = 5;
+  bytes connection_id = 6;
+  uint64 path_epoch = 7;
+  int64 issued_at_ms = 8;
+  int64 expires_at_ms = 9;
+  repeated DirectCarrierV1 allowed_carriers = 10;
+  bytes server_nonce = 11;
+  bytes server_signing_key_id = 12;
+  bytes server_signature = 13;
+}
+
+// IP addresses are raw network-order IPv4 (4 bytes) or IPv6 (16 bytes).
+// Host names and URLs are deliberately not accepted as candidates.
+message DirectCandidateV1 {
+  bytes candidate_id = 1;
+  DirectCandidateKindV1 kind = 2;
+  DirectCarrierV1 carrier = 3;
+  bytes ip_address = 4;
+  uint32 port = 5;
+  uint32 priority = 6;
+  bytes related_candidate_id = 7;
+  uint32 network_cost = 8;
+  int64 expires_at_ms = 9;
+}
+
+message DirectPathOfferV1 {
+  DirectPathTicketV1 ticket = 1;
+  // SHA-256 of the exact DER bytes of the temporary QUIC leaf certificate.
+  // The certificate itself is presented only by the QUIC TLS handshake; raw
+  // certificate/private-key material must never enter signalling.
+  bytes quic_certificate_sha256 = 2;
+  repeated DirectCandidateV1 candidates = 3;
+  bool gathering_complete = 4;
+}
+
+message DirectPathAnswerV1 {
+  bytes ticket_id = 1;
+  // Same leaf-DER fingerprint contract as DirectPathOfferV1.
+  bytes quic_certificate_sha256 = 2;
+  repeated DirectCandidateV1 candidates = 3;
+  bool gathering_complete = 4;
+  DirectPathResultV1 result = 5;
+  string reason_code = 6;
+}
+
+// Trickle updates are additive within one connection_id/path_epoch. Reusing a
+// candidate_id with different fields retires the path attempt.
+message DirectCandidateUpdateV1 {
+  repeated DirectCandidateV1 candidates = 1;
+  bool gathering_complete = 2;
+}
+
+message DirectCandidatePairV1 {
+  bytes initiator_candidate_id = 1;
+  bytes responder_candidate_id = 2;
+}
+
+// Before QUIC starts, both peers send this authenticated UDP datagram from the
+// same socket/port represented by their nominated candidate. The wire datagram
+// is ASCII "TLD1\n" followed by exactly one serialized message. auth_tag is the
+// first 16 bytes of HMAC-SHA256 over the domain and fields 1 through 12.
+// A PROBE carries exactly 16 random anti_amplification_padding bytes and an
+// empty response_nonce. Its PROBE_ACK carries an empty padding field and a
+// 16-byte response_nonce, keeping the encoded response no larger than the
+// authenticated request.
+message DirectConnectivityDatagramV1 {
+  uint32 protocol_version = 1;
+  DirectConnectivityDatagramKindV1 kind = 2;
+  bytes connection_id = 3;
+  uint64 path_epoch = 4;
+  bytes ticket_id = 5;
+  bytes nomination_id = 6;
+  DirectCandidatePairV1 pair = 7;
+  bytes sender_device_id = 8;
+  bytes probe_nonce = 9;
+  bytes response_nonce = 10;
+  int64 sent_at_ms = 11;
+  bytes anti_amplification_padding = 12;
+  bytes auth_tag = 13;
+}
+
+message DirectNominationV1 {
+  bytes nomination_id = 1;
+  DirectCandidatePairV1 pair = 2;
+  bytes connectivity_nonce = 3;
+}
+
+message DirectNominationResultV1 {
+  bytes nomination_id = 1;
+  DirectCandidatePairV1 pair = 2;
+  DirectPathResultV1 result = 3;
+  string reason_code = 4;
+  bytes direct_path_binding = 5;
+}
+
+// Multipair V2 is enabled only when both peers negotiated
+// direct_transport_shadow_multipair_v2. The initiator is the sole authority
+// for pair order. Batches are additive, start at 1, and are strictly
+// contiguous; a round contains at most 32 unique pairs and a batch at most 8.
+message DirectConnectivityCheckBatchV2 {
+  bytes check_round_id = 1;
+  bytes connectivity_nonce = 2;
+  uint32 batch_seq = 3;
+  repeated DirectCandidatePairV1 pairs = 4;
+  bool plan_complete = 5;
+}
+
+// Sent only after the initiator native owner has authenticated both directions
+// for winning_pair. It does not authorize session or Envelope routing.
+message DirectNominationV2 {
+  bytes nomination_id = 1;
+  bytes check_round_id = 2;
+  DirectCandidatePairV1 winning_pair = 3;
+}
+
+// The responder acknowledges only a pair its own native owner also validated.
+// QUIC starts only after this acknowledgement is authenticated and accepted.
+message DirectNominationAckV2 {
+  bytes nomination_id = 1;
+  bytes check_round_id = 2;
+  DirectCandidatePairV1 winning_pair = 3;
+  DirectPathResultV1 result = 4;
+  string reason_code = 5;
+}
+
+// Exchanged after QUIC peer proof. Both peers require an identical path
+// binding before reporting shadow readiness; routing remains forbidden.
+message DirectNominationResultV2 {
+  bytes nomination_id = 1;
+  bytes check_round_id = 2;
+  DirectCandidatePairV1 winning_pair = 3;
+  DirectPathResultV1 result = 4;
+  string reason_code = 5;
+  bytes direct_path_binding = 6;
+}
+
+// UDP wire for multipair connectivity checks. The datagram prefix is ASCII
+// "TLD2\n". probe_nonce is deterministically derived per direction and pair
+// from connectivity_nonce; auth_tag uses the V2 HMAC/HKDF domains. A PROBE_ACK
+// repeats the received probe_nonce and carries a fresh 16-byte response_nonce.
+message DirectConnectivityDatagramV2 {
+  uint32 protocol_version = 1;
+  DirectConnectivityDatagramKindV1 kind = 2;
+  bytes connection_id = 3;
+  uint64 path_epoch = 4;
+  bytes ticket_id = 5;
+  bytes check_round_id = 6;
+  DirectCandidatePairV1 pair = 7;
+  bytes sender_device_id = 8;
+  bytes probe_nonce = 9;
+  bytes response_nonce = 10;
+  int64 sent_at_ms = 11;
+  bytes anti_amplification_padding = 12;
+  bytes auth_tag = 13;
+}
+
+// A direct device path may multiplex sessions. A V1 proposal switches only
+// the proposer's outbound direction, so exactly one optional field is present
+// in each barrier and it must match that device's authenticated role. The two
+// directions are committed independently; zero is never a valid first seq.
+message SessionCutoverBarrierV1 {
+  bytes session_id = 1;
+  optional uint64 pc_to_android_first_direct_seq = 2;
+  optional uint64 android_to_pc_first_direct_seq = 3;
+}
+
+message DirectCutoverProposalV1 {
+  bytes barrier_id = 1;
+  bytes direct_path_binding = 2;
+  repeated SessionCutoverBarrierV1 session_barriers = 3;
+  uint32 duplicate_grace_ms = 4;
+}
+
+message DirectCutoverAcceptV1 {
+  bytes barrier_id = 1;
+  bytes barrier_sha256 = 2;
+  DirectPathResultV1 result = 3;
+  string reason_code = 4;
+}
+
+message DirectCutoverCommitV1 {
+  bytes barrier_id = 1;
+  bytes barrier_sha256 = 2;
+}
+
+message DirectFallbackV1 {
+  bytes barrier_id = 1;
+  string reason_code = 2;
+  uint64 last_received_direct_frame_seq = 3;
+}
+
+message DirectPathCloseV1 {
+  string reason_code = 1;
+}
+
+// The first application records on a QUIC connection authenticate the server
+// ticket, the registered device key and the TLS exporter for this exact path.
+message DirectPeerProofV1 {
+  DirectPathTicketV1 ticket = 1;
+  DirectPeerRoleV1 role = 2;
+  bytes device_id = 3;
+  bytes peer_device_id = 4;
+  bytes proof_nonce = 5;
+  bytes tls_exporter_sha256 = 6;
+  bytes device_signature = 7;
+}
+
+message DirectPeerProofResultV1 {
+  DirectPathResultV1 result = 1;
+  string reason_code = 2;
+  // SHA-256 of the exact received and verified peer
+  // TERMLINK-DIRECT-PEER-PROOF-V1 transcript; it excludes the device
+  // signature and any stream/protobuf framing.
+  bytes peer_proof_sha256 = 3;
+}
+
+message DirectFrameRangeV1 {
+  uint64 start = 1;
+  uint64 end = 2;
+}
+
+// This receipt acknowledges the peer's opposite-direction
+// DirectPathFrameV1.frame_seq only. It proves that bytes reached a peer
+// transport and MUST NOT advance the durable terminal ACK or release an
+// application command from its semantic outbox.
+message DirectTransportReceiptV1 {
+  uint64 highest_contiguous_frame_seq = 1;
+  repeated DirectFrameRangeV1 missing = 2;
+}
+
+message DirectPingV1 {
+  bytes nonce = 1;
+  int64 sent_at_ms = 2;
+}
+
+message DirectPongV1 {
+  bytes nonce = 1;
+  int64 received_at_ms = 2;
+}
+
+// DirectPathFrameV1 is the only V1 QUIC application record. It uses a four-byte
+// unsigned big-endian length prefix on a reliable QUIC stream. A separate
+// TLPP1 or platform-private peer-proof record is not part of the V1 wire. Each
+// direction sends peer_proof at frame_seq 1 and peer_proof_result at frame_seq
+// 2 before any other body; application/control records continue monotonically
+// from frame_seq 3. The
+// realtime_envelope value is the byte-for-byte serialized existing
+// termlink.realtime.v1.Envelope, including unknown fields. Intermediaries must
+// not parse and reserialize it.
+message DirectPathFrameV1 {
+  uint32 protocol_version = 1;
+  bytes connection_id = 2;
+  uint64 path_epoch = 3;
+  uint64 frame_seq = 4;
+  oneof body {
+    DirectPeerProofV1 peer_proof = 10;
+    DirectPeerProofResultV1 peer_proof_result = 11;
+    bytes realtime_envelope = 12;
+    DirectTransportReceiptV1 transport_receipt = 13;
+    DirectPingV1 ping = 14;
+    DirectPongV1 pong = 15;
+  }
+}

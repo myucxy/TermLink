@@ -844,30 +844,61 @@ namespace TermLink.Agent
             if (state.TerminalCore == null) return;
             try
             {
+                NativeTerminalHostEffectFrameV2 effects;
                 switch (frame.Type)
                 {
                     case LocalFrameType.Output:
-                        state.TerminalCore.ApplyOutput(frame.Sequence, frame.Payload);
-                        return;
+                        effects = state.TerminalCore.ApplyOutputWithHostEffectsV2(
+                            frame.Sequence,
+                            frame.Payload);
+                        break;
                     case LocalFrameType.Resize:
                         LocalPayloadCodec.ParseResize(frame.Payload, out var columns, out var rows);
-                        state.TerminalCore.ApplyResize(
+                        effects = state.TerminalCore.ApplyResizeWithHostEffectsV2(
                             frame.Sequence,
                             checked((uint)columns),
                             checked((uint)rows));
-                        return;
+                        break;
                     case LocalFrameType.Gap:
-                        state.TerminalCore.ApplyGap(frame.Sequence);
-                        return;
+                        effects = state.TerminalCore.ApplyGapWithHostEffectsV2(frame.Sequence);
+                        break;
                     default:
-                        state.TerminalCore.ApplyAdvance(frame.Sequence, 0);
-                        return;
+                        effects = state.TerminalCore.ApplyAdvanceWithHostEffectsV2(
+                            frame.Sequence,
+                            0);
+                        break;
                 }
+                ValidateAndDiscardHostEffects(frame, effects);
             }
             catch (Exception error)
             {
                 state.TerminalCoreFailureCode = NativeFailureCode(error);
                 state.Dispose();
+            }
+        }
+
+        private static void ValidateAndDiscardHostEffects(
+            LocalFrame frame,
+            NativeTerminalHostEffectFrameV2 effects)
+        {
+            if (effects == null)
+                throw new InvalidDataException("terminal-core returned no Host Effect V2 frame.");
+            foreach (var effect in effects.Records)
+            {
+                // History reconstruction is a mirror. Query replies were already emitted by
+                // SessionHost when the source Output became durable, so replay validates the
+                // canonical V2 result but must never write or feed the reply back into the PTY.
+                if (frame.Type != LocalFrameType.Output ||
+                    effect.Kind != NativeTerminalHostEffectKindV2.PtyReply ||
+                    effect.SourceSequence != frame.Sequence ||
+                    effect.SourceOffsetEnd < 1 ||
+                    effect.SourceOffsetEnd > frame.Payload.Length ||
+                    effect.Payload == null ||
+                    effect.Payload.Count == 0)
+                {
+                    throw new InvalidDataException(
+                        "terminal-core returned an invalid history-replay Host Effect V2 record.");
+                }
             }
         }
 

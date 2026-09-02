@@ -5,8 +5,13 @@ import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -16,6 +21,72 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [26])
 class NativeTerminalEngineTest {
+    @Test
+    fun orderedRemoteEventsUseHostEffectV2AndNeverUseLegacyApply() = runBlocking {
+        val bridge = FakeNativeBridge()
+        val engine = NativeTerminalEngine(
+            initialSize = TerminalSize(80, 24),
+            bridge = bridge,
+        )
+        try {
+            engine.feed(1, ByteBuffer.wrap(byteArrayOf(1, 2)))
+            assertTrue(bridge.lastHostEffectV2Batch?.events?.single() is NativeSourceEvent.Output)
+
+            engine.resize(2, 100, 30)
+            assertTrue(bridge.lastHostEffectV2Batch?.events?.single() is NativeSourceEvent.Resize)
+
+            engine.advance(3)
+            assertTrue(bridge.lastHostEffectV2Batch?.events?.single() is NativeSourceEvent.Advance)
+
+            engine.reportGap(4)
+            assertTrue(bridge.lastHostEffectV2Batch?.events?.single() is NativeSourceEvent.Gap)
+
+            assertEquals(4, bridge.hostEffectV2Calls)
+            assertEquals(0, bridge.applyCalls)
+        } finally {
+            engine.dispose()
+        }
+    }
+
+    @Test
+    fun mirrorPtyReplyIsStrictlyDecodedAndDiscardedInsteadOfBecomingInput() = runBlocking {
+        val bridge = FakeNativeBridge().apply {
+            forcedHostEffectV2Result = NativeBridgeApplyWithHostEffectsV2(
+                receipt = NativeBridgeApplyReceipt(
+                    nextSourceSequence = 2,
+                    presentationRevision = 2,
+                ),
+                hostEffectFrame = fakeHostEffectFrameV2(
+                    records = listOf(
+                        FakeHostEffectV2Record(
+                            sourceSequence = 1,
+                            sourceOffsetEnd = 4,
+                            ordinal = 0,
+                            payload = "\u001b[?25;1\$y".toByteArray(Charsets.US_ASCII),
+                        ),
+                    ),
+                ),
+            )
+        }
+        val engine = NativeTerminalEngine(
+            initialSize = TerminalSize(80, 24),
+            bridge = bridge,
+        )
+        val unexpectedInput = async(start = CoroutineStart.UNDISPATCHED) {
+            engine.inputEvents.first()
+        }
+        try {
+            engine.feed(1, ByteBuffer.wrap("query".toByteArray(Charsets.US_ASCII)))
+
+            assertEquals(1, bridge.hostEffectV2Calls)
+            assertEquals(0, bridge.applyCalls)
+            assertFalse(unexpectedInput.isCompleted)
+        } finally {
+            unexpectedInput.cancelAndJoin()
+            engine.dispose()
+        }
+    }
+
     @Test
     fun cancelledNavigationCannotPublishAnOlderFrameAfterReturningLive() {
         val enteredRender = CountDownLatch(1)

@@ -21,6 +21,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.ViewModelProvider
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -370,7 +371,7 @@ internal fun shouldDismissEmptyTranscriptOverlay(state: TranscriptViewportState?
     state != null && !state.loading && state.error == null && state.pages.isEmpty() && !state.hasMoreBefore
 
 internal data class TerminalInputResumeEffect(
-    val scrollToLatest: Boolean,
+    val resumeViewportAfterLocalInput: Boolean,
     val closeDetachedOverlay: Boolean,
 )
 
@@ -383,7 +384,7 @@ internal fun terminalInputResumeEffect(
     accepted: Boolean,
     detachedOverlayActive: Boolean,
 ): TerminalInputResumeEffect = TerminalInputResumeEffect(
-    scrollToLatest = accepted,
+    resumeViewportAfterLocalInput = accepted,
     closeDetachedOverlay = accepted && detachedOverlayActive,
 )
 
@@ -723,13 +724,15 @@ internal fun applyKeepScreenOn(window: Window, enabled: Boolean) {
 }
 
 class ProductActivity : ComponentActivity() {
-    private lateinit var repository: ProductionProductRepository
+    private lateinit var repositoryOwner: ProductRepositoryViewModel
+    private lateinit var repository: ProductRepository
+    private var repositoryAttachment: java.io.Closeable? = null
     private var productForeground by mutableStateOf(false)
     private var productForegroundGeneration by mutableStateOf(0L)
     private var pendingUpdateApk: File? = null
     private var pendingRemoteDownloadSelection: RemoteFileDownloadSelection? = null
     private val authorizationLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        repository.handleAuthorizationResult(result.data)
+        repositoryOwner.handleAuthorizationResult(result.data)
     }
     private val installPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -772,7 +775,12 @@ class ProductActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        repository = ProductionProductRepository(this, authorizationLauncher::launch)
+        repositoryOwner = ViewModelProvider(
+            this,
+            ProductRepositoryViewModel.Factory(applicationContext),
+        )[ProductRepositoryViewModel::class.java]
+        repositoryAttachment = repositoryOwner.attach(this, authorizationLauncher::launch)
+        repository = repositoryOwner.repository
         pendingRemoteDownloadSelection = savedInstanceState?.remoteDownloadSelection()
         enableEdgeToEdge()
         val initialKeepScreenOn = loadKeepScreenOnPreference(this)
@@ -846,7 +854,11 @@ class ProductActivity : ComponentActivity() {
         // the next frame. The monotonic generation preserves every foreground
         // entry and therefore gives the selected session one fresh foreground
         // reconciliation opportunity.
-        productForegroundGeneration = nextForegroundGeneration(productForegroundGeneration)
+        // The repository and its lifecycle fence survive configuration changes
+        // in ProductRepositoryViewModel, so their generation source must have
+        // the same lifetime. An Activity-local counter would restart at one and
+        // make the first foreground edge after recreation look stale.
+        productForegroundGeneration = repositoryOwner.nextForegroundGeneration()
         productForeground = true
         if (::repository.isInitialized) {
             repository.onAppForegrounded(
@@ -863,7 +875,11 @@ class ProductActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        repository.close()
+        // The ViewModel owns the device-level runtime. Configuration changes
+        // detach only this Activity; a real finish clears the ViewModelStore and
+        // closes the repository, shared realtime socket, engines, and database.
+        repositoryAttachment?.close()
+        repositoryAttachment = null
         super.onDestroy()
     }
 
@@ -4580,7 +4596,7 @@ private fun TerminalSurface(
         latestClearTranscript.value()
     }
 
-    fun resumeLiveAfterAcceptedInput() {
+    fun resumeLiveAfterAcceptedInput(resumeViewport: Boolean = true) {
         val effect = terminalInputResumeEffect(
             accepted = true,
             // Read current mutable state rather than the last composed Boolean:
@@ -4590,7 +4606,9 @@ private fun TerminalSurface(
                 latestTranscriptState.value,
             ),
         )
-        if (effect.scrollToLatest) activeEngine.scrollToLatest()
+        if (resumeViewport && effect.resumeViewportAfterLocalInput) {
+            activeEngine.resumeViewportAfterLocalInput()
+        }
         if (effect.closeDetachedOverlay) {
             overlayRequested = false
             localLoadingGuard = false
@@ -4600,8 +4618,15 @@ private fun TerminalSurface(
     }
 
     DisposableEffect(session.id, activeEngine, terminalInputResumeRegistry) {
-        activeEngine.setOnAcceptedLocalUserInputListener(::resumeLiveAfterAcceptedInput)
-        val registration = terminalInputResumeRegistry.register(session.id, ::resumeLiveAfterAcceptedInput)
+        // The engine applies its cursor-visibility policy at the exact input
+        // acceptance point. This callback owns only the detached overlay so a
+        // later render frame cannot retroactively change that viewport choice.
+        activeEngine.setOnAcceptedLocalUserInputListener {
+            resumeLiveAfterAcceptedInput(resumeViewport = false)
+        }
+        val registration = terminalInputResumeRegistry.register(session.id) {
+            resumeLiveAfterAcceptedInput()
+        }
         onDispose {
             // The placeholder and this effect are siblings; disposal ordering
             // must not turn an already-disposed placeholder into a UI crash.

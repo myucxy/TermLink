@@ -15,15 +15,19 @@ data class DeviceSummary(
     val name: String,
     val keyId: String,
     val exchangePublicKey: ByteArray,
+    /** Server-approved Ed25519 identity used only to verify direct peer proof. */
+    val signingPublicKey: ByteArray = ByteArray(0),
     val trustState: DeviceTrustState,
     val createdAt: Instant,
 ) {
     override fun equals(other: Any?): Boolean =
         other is DeviceSummary && id == other.id && type == other.type && name == other.name &&
             keyId == other.keyId && exchangePublicKey.contentEquals(other.exchangePublicKey) &&
+            signingPublicKey.contentEquals(other.signingPublicKey) &&
             trustState == other.trustState && createdAt == other.createdAt
 
-    override fun hashCode(): Int = 31 * id.hashCode() + exchangePublicKey.contentHashCode()
+    override fun hashCode(): Int =
+        31 * (31 * id.hashCode() + exchangePublicKey.contentHashCode()) + signingPublicKey.contentHashCode()
 }
 
 data class PcSummary(

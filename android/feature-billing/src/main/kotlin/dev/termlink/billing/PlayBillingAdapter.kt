@@ -24,8 +24,10 @@ import kotlin.coroutines.resumeWithException
 /** Thin official Play Billing adapter. It contains no entitlement or account policy. */
 class PlayBillingAdapter(
     context: Context,
-    private val activity: Activity,
+    private val activityProvider: () -> Activity?,
 ) : BillingAdapter {
+    constructor(context: Context, activity: Activity) : this(context, { activity })
+
     private val mutableEvents = MutableSharedFlow<BillingEvent>(replay = 1, extraBufferCapacity = 16)
     private val connectionMutex = Mutex()
     private val detailsById = ConcurrentHashMap<String, ProductDetails>()
@@ -93,6 +95,10 @@ class PlayBillingAdapter(
     override fun launchPurchase(productId: String, offerToken: String?): BillingLaunchResult {
         if (closed || !client.isReady) return BillingLaunchResult.Failed("Google Play billing is not connected")
         val details = detailsById[productId] ?: return BillingLaunchResult.Failed("Google Play product details are unavailable")
+        val activity = activityProvider()
+            ?: return BillingLaunchResult.Failed(
+                "Google Play billing requires an active screen / Google Play 购买需要应用位于前台",
+            )
         val productParams = BillingFlowParams.ProductDetailsParams.newBuilder()
             .setProductDetails(details)
         if (!offerToken.isNullOrBlank()) productParams.setOfferToken(offerToken)

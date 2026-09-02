@@ -51,6 +51,26 @@ class TermuxTerminalViewportTest {
     }
 
     @Test
+    fun hiddenCursorArrowInputPreservesTwoAxisBrowseState() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val engine = TermuxTerminalEngine(TerminalSize(240, 20))
+        val view = engine.createView(context, textSizeSp = 18f) as TerminalView
+        layout(view, width = 120, height = 120)
+        engine.feed(1, bytes((1..40).joinToString("") { "line-$it\r\n" }))
+        engine.feed(2, bytes("\u001b[?25l"))
+        view.restorePresentationState(intArrayOf(-4, 30, 0, 0))
+
+        engine.setReadOnly(false)
+        assertTrue(engine.submitKeyCode(KeyEvent.KEYCODE_DPAD_UP))
+
+        assertEquals(-4, view.topRow)
+        assertEquals(30, view.leftColumn)
+        assertFalse(view.isFollowingOutput)
+        assertEquals("\u001b[A", engine.inputEvents.take(1).toList().single().decodeToString())
+        engine.dispose()
+    }
+
+    @Test
     fun rejectedTerminalViewInputDoesNotUnlockBrowseState() = runTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val engine = TermuxTerminalEngine(TerminalSize(240, 20))

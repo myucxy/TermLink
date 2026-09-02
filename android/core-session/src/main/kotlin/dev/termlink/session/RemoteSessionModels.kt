@@ -246,6 +246,11 @@ class RemoteInputRejectedException(
  */
 class RemoteInputDeliveryUnknownException(message: String) : IllegalStateException(message)
 
+/** The lease authority confirmed that this controller no longer owns the lease. */
+class RemoteControlLeaseLostException(
+    val reasonCode: String,
+) : IllegalStateException(reasonCode)
+
 sealed interface EventAcceptance {
     data class Applied(val sequence: Long) : EventAcceptance
     data class Duplicate(val sequence: Long) : EventAcceptance

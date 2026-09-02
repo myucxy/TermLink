@@ -36,6 +36,18 @@ docker compose --env-file .env `
   -f compose\core.compose.yml `
   --profile edge up --detach --wait
 
+# Optional shared Direct signaling state for one or more server replicas.
+# Relay remains the always-on path; this overlay does not make Direct routing
+# production-permitted and Direct Valkey health does not gate server startup.
+docker compose --env-file .env `
+  -f compose\core.compose.yml `
+  -f compose\direct-transport.compose.yml `
+  --profile edge config
+docker compose --env-file .env `
+  -f compose\core.compose.yml `
+  -f compose\direct-transport.compose.yml `
+  --profile edge up --detach --wait --scale server=2
+
 # Core + local encrypted-history storage and history HTTPS route.
 docker compose --env-file .env `
   -f compose\core.compose.yml `
@@ -96,6 +108,13 @@ be combined with any registration deployment. After the first management-page
 save, the encrypted database settings become the runtime source.
 `account-deletion.compose.yml`
 requires either local history or external S3 and a Keycloak service account.
+`direct-transport.compose.yml` is optional and supplies one isolated shared
+Valkey for Direct tickets, presence, signaling mailboxes, and Direct-auth nonce
+state across every server replica. It never replaces the Relay Valkey, never
+grants Direct credentials to `migrate`, and does not add a server startup
+dependency on Direct Valkey. The current production contract remains
+shadow-only/default-off with Direct routing permission false; omitting the
+overlay leaves no Direct service, network, secret, or environment setting.
 Files named `acceptance`,
 `integration`, or `lan-test` are disposable test stacks and must not be
 included in a production Compose command. After a successful startup, `docker
@@ -115,6 +134,7 @@ The supported production layers are intentionally small:
 | `registration-recovery` | none; enables controlled registration and a bounded recovery runner | Keycloak service-account secret | Whenever a Keycloak-backed deployment offers registration |
 | `human-verification` | none; bootstraps Turnstile on the unified registration page and API | public site key and file-backed provider secret | Optional compatibility/bootstrap source before the first management-page save |
 | `account-deletion` | none; enables the final deletion processor | History/S3, Keycloak secret, versioned AES identity key | Only when final account deletion is offered |
+| `direct-transport` | isolated Direct Valkey | independent Direct URL/password secrets and one or two STUN endpoints | Optional shadow signaling/NAT-discovery lane; Relay remains authoritative |
 
 Do not add every overlay by default. A headless core behind an existing ingress
 has three steady-state containers; `migrate` exits successfully and can then be
@@ -149,12 +169,17 @@ New-Item -ItemType Directory -Force secrets | Out-Null
 'postgres://termlink:local-password@postgres:5432/termlink?sslmode=disable' | Set-Content secrets\database-url -NoNewline
 'local-valkey-password' | Set-Content secrets\valkey-password -NoNewline
 'redis://default:local-valkey-password@valkey:6379/0' | Set-Content secrets\redis-url -NoNewline
+'local-direct-valkey-password' | Set-Content secrets\direct-valkey-password -NoNewline
+'redis://termlink-direct:local-direct-valkey-password@direct-valkey:6379/0' | Set-Content secrets\direct-redis-url -NoNewline
 'local-token-signing-key-at-least-32-bytes' | Set-Content secrets\token-signing-key -NoNewline
 'local-s3-access' | Set-Content secrets\s3-access-key -NoNewline
 'local-s3-secret' | Set-Content secrets\s3-secret-key -NoNewline
 'local-password' | Set-Content secrets\postgres-password -NoNewline
 
 docker compose --env-file .env -f compose\core.compose.yml config
+docker compose --env-file .env `
+  -f compose\core.compose.yml `
+  -f compose\direct-transport.compose.yml config
 ```
 
 On Unix hosts, run `chmod 700 secrets` and `chmod 600 secrets/*` (or `chmod
@@ -173,6 +198,16 @@ protected by that password. Keep the password in the separate
 `valkey-password` fixture and include the matching `default:<password>@` user
 info in the `redis-url` fixture; neither value belongs in `.env` or a rendered
 Compose environment.
+
+The Direct overlay uses a second password and URL fixture. Its named
+`termlink-direct` ACL user is limited to `termlink:direct:v1:*` and Direct-auth
+`proof:*` keys, the Direct mailbox channel prefix, and the exact commands used
+by the state implementation. The default user is disabled. The
+`direct-valkey` service has no published port and joins only the internal
+`direct-state` network with `server`; PostgreSQL, Relay Valkey, `migrate`, and
+the public edge do not join that network. Every scaled server replica mounts
+the same `direct_redis_url` secret, so ticket fencing and signaling presence
+are shared rather than process-local.
 
 Connection controls are non-secret and validated before startup. Existing
 deployments remain compatible because every setting has a default:
@@ -293,6 +328,10 @@ their overlays. `TERMLINK_POSTGRES_SHM_SIZE` defaults to `128m`,
 `TERMLINK_VALKEY_MAXMEMORY` to `384mb` with `noeviction`, and container logs
 rotate at `10m` x 5 via `TERMLINK_CONTAINER_LOG_MAX_SIZE` and
 `TERMLINK_CONTAINER_LOG_MAX_FILES`.
+The optional Direct Valkey defaults to a `128m` limit, `32m` reservation,
+`0.25` CPU, 128 PIDs, and `TERMLINK_DIRECT_VALKEY_MAXMEMORY=96mb` with
+`noeviction`. Override it only with the `TERMLINK_DIRECT_VALKEY_*` resource
+variables; do not reuse Relay Valkey credentials or its backend network.
 
 `TERMLINK_S3_ENDPOINT` is the server-side S3/MinIO endpoint used for bucket
 creation and object verification/deletion. `TERMLINK_S3_PUBLIC_ENDPOINT` is
@@ -404,6 +443,12 @@ third-party images, fixed network membership, approved environment keys,
 configuration. It also rejects unexpected ports, non-loopback management ports,
 missing or reparse-point secret paths, reserved test domains, and any ACME CA
 other than the production Let's Encrypt endpoint.
+When the Direct overlay is selected, the same allow-list additionally enforces
+the isolated service/network topology, fixed UID, read-only root, bounded
+resources, exact ACL bootstrap, one or two production STUN DNS endpoints, and
+distinct file-backed Direct credentials. It rejects Direct settings or secrets
+on `migrate`, a Direct URL that does not target the shared `direct-valkey`
+service, and reuse of the Relay Valkey password.
 
 Backups contain a PostgreSQL custom-format dump and an exact MinIO mirror with
 per-file sizes and SHA-256 values. Valkey is explicitly reconstructable state.

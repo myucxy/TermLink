@@ -8,6 +8,8 @@ import android.view.View
 import dev.termlink.terminal.api.ArgbColor
 import dev.termlink.terminal.api.TerminalCellPosition
 import dev.termlink.terminal.api.TerminalInputModifiers
+import dev.termlink.terminal.api.TerminalHostEffectFrameV2
+import dev.termlink.terminal.api.TerminalHostEffectKindV2
 import dev.termlink.terminal.api.TerminalKey
 import dev.termlink.terminal.api.TerminalMouseButton
 import dev.termlink.terminal.api.TerminalMouseButtons
@@ -147,16 +149,16 @@ class NativeTerminalEngine(
         val owned = ByteArray(bytes.remaining())
         bytes.get(owned)
         require(owned.isNotEmpty()) { "Terminal output must not be empty" }
-        applyOrdered { it.feed(seq, owned) }
+        applyOrdered { it.feedWithHostEffectsV2(seq, owned) }
     }
 
     override suspend fun advance(seq: Long) {
-        applyOrdered { it.advance(seq, 0) }
+        applyOrdered { it.advanceWithHostEffectsV2(seq, 0) }
     }
 
     override suspend fun resize(seq: Long, columns: Int, rows: Int) {
         val size = TerminalSize(columns, rows)
-        applyOrdered { it.resize(seq, size) }
+        applyOrdered { it.resizeWithHostEffectsV2(seq, size) }
     }
 
     override suspend fun reportGap(seq: Long) {
@@ -165,7 +167,7 @@ class NativeTerminalEngine(
             if (failedClosed) return
             failedClosed = true
             try {
-                terminal.reportGap(seq)
+                discardMirrorHostEffects(terminal.reportGapWithHostEffectsV2(seq))
             } catch (error: NativeTerminalException) {
                 if (error.status != NativeTerminalStatus.GAP) throw error
             } finally {
@@ -266,6 +268,14 @@ class NativeTerminalEngine(
             acceptedInputListener = listener
             listenerGeneration = Math.addExact(listenerGeneration, 1)
         }
+    }
+
+    override fun resumeViewportAfterLocalInput() {
+        val cursorVisible = synchronized(lock) {
+            checkActive()
+            mutableFrame.value.cursor.visible
+        }
+        if (cursorVisible) scrollToLatest()
     }
 
     override fun scrollToLatest() {
@@ -469,12 +479,12 @@ class NativeTerminalEngine(
         true
     }
 
-    private fun applyOrdered(apply: (NativeTerminalHandle) -> Unit) {
+    private fun applyOrdered(apply: (NativeTerminalHandle) -> TerminalHostEffectFrameV2) {
         val frame = synchronized(lock) {
             checkActive()
             check(!failedClosed) { "Native terminal renderer is failed closed" }
             try {
-                apply(terminal)
+                discardMirrorHostEffects(apply(terminal))
                 historyFrameCache.clear()
                 try {
                     val live = terminal.renderV3AtScrollback(0)
@@ -515,6 +525,13 @@ class NativeTerminalEngine(
             }
         }
         if (frame != null) publishFrame(frame, notify = true)
+    }
+
+    private fun discardMirrorHostEffects(hostEffects: TerminalHostEffectFrameV2) {
+        check(hostEffects.formatVersion == TerminalHostEffectFrameV2.FORMAT_VERSION)
+        check(hostEffects.effects.all { it.kind == TerminalHostEffectKindV2.PTY_REPLY })
+        // This engine mirrors a remote Windows PTY. Replies were already emitted by the host,
+        // so replaying them through inputEvents would duplicate terminal protocol responses.
     }
 
     private fun replaceTerminal(size: TerminalSize) {
@@ -592,7 +609,7 @@ class NativeTerminalEngine(
             emitted = true
         }
         if (emitted && notifyAccepted) {
-            scrollToLatest()
+            resumeViewportAfterLocalInput()
             notifyAcceptedInput()
         }
         return true

@@ -28,6 +28,15 @@ interface TerminalViewportEngine : TerminalEngine {
 
     fun setOnAcceptedLocalUserInputListener(listener: (() -> Unit)?)
 
+    /**
+     * Applies the viewport policy for accepted local input.
+     *
+     * Engines may keep the current viewport when a full-screen application has
+     * deliberately hidden its cursor. Explicit "return to live" actions must
+     * continue to use [scrollToLatest].
+     */
+    fun resumeViewportAfterLocalInput() = scrollToLatest()
+
     fun scrollToLatest()
 
     fun scrollPastTopBoundary()

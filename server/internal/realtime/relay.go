@@ -40,7 +40,8 @@ const (
 	// before classifying the peer as a slow consumer. This also propagates
 	// backpressure to the sender's read loop without allowing an unbounded
 	// Relay queue.
-	peerEnqueueTimeout = 500 * time.Millisecond
+	peerEnqueueTimeout      = 500 * time.Millisecond
+	maxLivenessControlBytes = 512
 	// subscriptionAuthorityTTL bounds how long an active Android subscription
 	// can reuse its last PostgreSQL authorization. Authority events invalidate
 	// immediately; this short fence covers session deletion and missed events
@@ -56,6 +57,7 @@ var optionalCapabilities = []string{
 	"terminal_snapshot_v2",
 	"terminal_presentation_metadata_v1",
 	"terminal_typed_input_v1",
+	"liveness_probe_v1",
 }
 
 type Hub struct {
@@ -179,19 +181,26 @@ type serverWelcome struct {
 	Capabilities     []string `json:"capabilities"`
 }
 
+type livenessControl struct {
+	Type    string `json:"type"`
+	ProbeID string `json:"probe_id"`
+}
+
 type peer struct {
-	hub            *Hub
-	socket         *websocket.Conn
-	principal      auth.Principal
-	role           string
-	send           chan []byte
-	done           chan struct{}
-	once           sync.Once
-	lastSequences  map[uuid.UUID]uint64
-	pcReplayMu     sync.Mutex
-	pcReplayRoutes map[pcRouteKey]*pcReplayRoute
-	subscriptions  map[uuid.UUID]bool
-	queuedBytes    atomic.Int64
+	hub                     *Hub
+	socket                  *websocket.Conn
+	principal               auth.Principal
+	role                    string
+	send                    chan []byte
+	controlSend             chan []byte
+	done                    chan struct{}
+	once                    sync.Once
+	lastSequences           map[uuid.UUID]uint64
+	pcReplayMu              sync.Mutex
+	pcReplayRoutes          map[pcRouteKey]*pcReplayRoute
+	subscriptionReplayReady bool
+	subscriptions           map[uuid.UUID]bool
+	queuedBytes             atomic.Int64
 	// subscriptionRoutes is protected by hub.mu together with subscriptions.
 	// It binds an authorized Android subscription to the owning Windows device
 	// and the exact Grant expiry used by the zero-database-query output path.
@@ -199,9 +208,16 @@ type peer struct {
 	// Retain the byte-identical signed SUBSCRIBE and its cumulative ACK only
 	// while this Android peer remains subscribed. A replacement PC connection
 	// can then restore replay state without forging an Android frame.
-	subscriptionFrames map[uuid.UUID][]byte
-	subscriptionACKs   map[uuid.UUID]uint64
-	controlPolicies    map[uuid.UUID]cachedControlPolicy
+	subscriptionFrames   map[uuid.UUID][]byte
+	subscriptionACKs     map[uuid.UUID]uint64
+	subscriptionControls map[uuid.UUID]retainedSubscriberControl
+	controlPolicies      map[uuid.UUID]cachedControlPolicy
+	capabilities         map[string]bool
+}
+
+type retainedSubscriberControl struct {
+	ack   uint64
+	frame []byte
 }
 
 type cachedSessionRoute struct {
@@ -329,7 +345,8 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		closeSocket(socket, websocket.ClosePolicyViolation, "role does not match device")
 		return
 	}
-	connection := &peer{hub: h, socket: socket, principal: principal, role: hello.Role, send: make(chan []byte, peerQueueFrames), done: make(chan struct{}), subscriptions: map[uuid.UUID]bool{}, subscriptionRoutes: map[uuid.UUID]cachedSessionRoute{}, subscriptionFrames: map[uuid.UUID][]byte{}, subscriptionACKs: map[uuid.UUID]uint64{}, controlPolicies: map[uuid.UUID]cachedControlPolicy{}, lastSequences: map[uuid.UUID]uint64{}, pcReplayRoutes: map[pcRouteKey]*pcReplayRoute{}}
+	negotiated := negotiatedCapabilities(hello.Capabilities)
+	connection := &peer{hub: h, socket: socket, principal: principal, role: hello.Role, send: make(chan []byte, peerQueueFrames), controlSend: make(chan []byte, 4), done: make(chan struct{}), subscriptions: map[uuid.UUID]bool{}, subscriptionRoutes: map[uuid.UUID]cachedSessionRoute{}, subscriptionFrames: map[uuid.UUID][]byte{}, subscriptionACKs: map[uuid.UUID]uint64{}, subscriptionControls: map[uuid.UUID]retainedSubscriberControl{}, controlPolicies: map[uuid.UUID]cachedControlPolicy{}, lastSequences: map[uuid.UUID]uint64{}, pcReplayRoutes: map[pcRouteKey]*pcReplayRoute{}, capabilities: capabilitySet(negotiated)}
 	if !h.add(connection) {
 		closeSocket(socket, websocket.CloseTryAgainLater, "relay shutting down")
 		return
@@ -342,7 +359,7 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	welcome := serverWelcome{
 		Type: "welcome", ProtocolVersion: 1,
 		HeartbeatSeconds: int(pingInterval.Seconds()), ConnectionID: uuid.NewString(),
-		Capabilities: negotiatedCapabilities(hello.Capabilities),
+		Capabilities: negotiated,
 	}
 	if err := socket.WriteJSON(welcome); err != nil {
 		return
@@ -398,6 +415,14 @@ func negotiatedCapabilities(offered []string) []string {
 	return result
 }
 
+func capabilitySet(capabilities []string) map[string]bool {
+	result := make(map[string]bool, len(capabilities))
+	for _, capability := range capabilities {
+		result[capability] = true
+	}
+	return result
+}
+
 func (h *Hub) add(p *peer) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -431,6 +456,7 @@ func (h *Hub) remove(p *peer) {
 		delete(p.subscriptionRoutes, sessionID)
 		delete(p.subscriptionFrames, sessionID)
 		delete(p.subscriptionACKs, sessionID)
+		delete(p.subscriptionControls, sessionID)
 		delete(p.controlPolicies, sessionID)
 	}
 	h.mu.Unlock()
@@ -451,51 +477,53 @@ func (p *peer) readLoop() {
 		if err != nil {
 			return
 		}
+		if messageType == websocket.TextMessage {
+			if !p.handleLivenessControl(frame) {
+				p.rejectApplicationFrame("unsupported_realtime_control", len(frame))
+			}
+			continue
+		}
 		if messageType != websocket.BinaryMessage {
-			p.close(websocket.CloseUnsupportedData, "binary Envelope required")
-			return
+			p.rejectApplicationFrame("binary_envelope_required", len(frame))
+			continue
 		}
 		envelope, err := realtimewire.Unmarshal(frame)
 		if err != nil {
-			p.close(websocket.CloseProtocolError, "invalid production Envelope")
-			return
+			p.rejectApplicationFrame("invalid_production_envelope", len(frame))
+			continue
 		}
 		if !bytes.Equal(envelope.SenderDeviceID, p.principal.Device.ID[:]) {
-			p.close(websocket.ClosePolicyViolation, "sender or sequence rejected")
-			return
+			p.rejectApplicationFrame("sender_rejected", len(frame))
+			continue
 		}
 		if p.role == "pc" && envelope.Direction != realtimewire.PCToAndroid || p.role == "android" && envelope.Direction != realtimewire.AndroidToPC {
-			p.close(websocket.ClosePolicyViolation, "direction rejected")
-			return
+			p.rejectApplicationFrame("direction_rejected", len(frame))
+			continue
 		}
 		if !allowedMessage(p.role, envelope.MessageType) || !validEnvelopeACK(envelope) {
-			p.close(websocket.ClosePolicyViolation, "message type or acknowledgement rejected")
-			return
+			p.rejectApplicationFrame("message_or_ack_rejected", len(frame))
+			continue
 		}
 		sessionID, err := uuid.FromBytes(envelope.SessionID)
 		if err != nil {
-			p.close(websocket.CloseProtocolError, "invalid session")
-			return
+			p.rejectApplicationFrame("session_rejected", len(frame))
+			continue
 		}
 		var pcRecipient uuid.UUID
 		if p.role == "pc" {
 			pcRecipient, err = uuid.FromBytes(envelope.RecipientDeviceID)
 			if err != nil {
-				p.close(websocket.ClosePolicyViolation, "sequence rejected")
-				return
+				p.rejectApplicationFrame("recipient_rejected", len(frame))
+				continue
 			}
 		} else if !p.acceptSequence(sessionID, envelope.Sequence) {
-			p.close(websocket.ClosePolicyViolation, "sequence rejected")
-			return
+			p.rejectApplicationFrame("sequence_rejected", len(frame))
+			continue
 		}
 		started := time.Now()
 		var routeErr error
 		if p.role == "pc" {
 			routeErr = p.routePCFrame(envelope, sessionID, pcRecipient, frame)
-			if errors.Is(routeErr, errPCSequenceRejected) {
-				p.close(websocket.ClosePolicyViolation, "sequence rejected")
-				return
-			}
 		} else {
 			routeErr = p.route(envelope, sessionID, frame)
 		}
@@ -506,12 +534,40 @@ func (p *peer) readLoop() {
 		p.hub.observer.EnvelopeRouted(metricDirection(p.role), strconv.FormatUint(uint64(envelope.MessageType), 10), result, len(frame), time.Since(started))
 		if routeErr != nil {
 			p.hub.logger.Warn("realtime route denied", "device", shortID(p.principal.Device.ID), "session", shortID(sessionID), "type", uint32(envelope.MessageType), "reason", routeDenialClass(routeErr))
-			if routeDenialIsFatal(routeErr) {
-				p.close(websocket.ClosePolicyViolation, "routing authorization denied")
-				return
-			}
 		}
 	}
+}
+
+// rejectApplicationFrame deliberately keeps the authenticated physical WSS
+// generation alive. A malformed or unauthorized Envelope is an application
+// fault; the sender's sequence/ACK rules and the receiver's History Gap recovery
+// fence its session impact. Socket read/write/close and liveness failures remain
+// the only transport events handled by the connection lifecycle.
+func (p *peer) rejectApplicationFrame(reason string, wireBytes int) {
+	p.hub.observer.EnvelopeRouted(metricDirection(p.role), "0", "rejected", wireBytes, 0)
+	p.hub.logger.Debug("realtime application frame rejected",
+		"device", shortID(p.principal.Device.ID), "reason", reason, "wire_bytes", wireBytes)
+}
+
+func (p *peer) handleLivenessControl(frame []byte) bool {
+	if !p.capabilities["liveness_probe_v1"] || len(frame) == 0 || len(frame) > maxLivenessControlBytes {
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(frame, &fields); err != nil || len(fields) != 2 ||
+		fields["type"] == nil || fields["probe_id"] == nil {
+		return false
+	}
+	var control livenessControl
+	if err := json.Unmarshal(frame, &control); err != nil || control.Type != "ping" {
+		return false
+	}
+	probeID, err := uuid.Parse(control.ProbeID)
+	if err != nil || probeID.String() != control.ProbeID {
+		return false
+	}
+	encoded, err := json.Marshal(livenessControl{Type: "pong", ProbeID: control.ProbeID})
+	return err == nil && p.enqueueControl(encoded)
 }
 
 func allowedMessage(role string, messageType realtimewire.MessageType) bool {
@@ -576,6 +632,8 @@ func (p *peer) acceptSequence(sessionID uuid.UUID, sequence uint64) bool {
 const maxPCReplayFrames = 4096
 
 var errPCSequenceRejected = errors.New("pc sequence rejected")
+
+var errCumulativeACKRegressed = errors.New("cumulative acknowledgement regressed")
 
 type pcSequenceCommit struct {
 	sequence uint64
@@ -730,6 +788,18 @@ func (p *peer) beginPCReplayEpochLocked(sessionID, recipientID uuid.UUID, ack ui
 	state.epoch = &pcReplayEpoch{next: ack + 1, target: state.highWater}
 }
 
+// advancePCVisibleACKLocked applies a live cumulative Android ACK to the
+// current PC generation without opening a replay epoch. A live ACK may lag
+// output that is already in flight, so only a cursor beyond the Relay's known
+// high-water advances the fence. Replay epochs are created exclusively by a
+// SUBSCRIBE or replacement-PC restoration boundary.
+func (p *peer) advancePCVisibleACKLocked(sessionID, recipientID uuid.UUID, ack uint64) {
+	state := p.pcReplayRoute(pcRouteKey{sessionID: sessionID, recipientID: recipientID})
+	if ack > state.highWater {
+		state.highWater = ack
+	}
+}
+
 func (p *peer) route(envelope realtimewire.Envelope, sessionID uuid.UUID, frame []byte) error {
 	if !p.hub.isCurrent(p) {
 		return denyRoute("sender_connection_replaced", store.ErrDenied)
@@ -763,6 +833,9 @@ func (p *peer) route(envelope realtimewire.Envelope, sessionID uuid.UUID, frame 
 	}
 	var route store.SessionRouteAuthorization
 	if envelope.MessageType == realtimewire.Subscribe {
+		if p.hub.subscriptionACKRegresses(p, sessionID, envelope.ACK) {
+			return denyRoute("cumulative_ack_regressed", errCumulativeACKRegressed)
+		}
 		route, err = p.hub.store.SessionRoute(ctx, p.principal.UserID, p.principal.Device.ID, sessionID)
 		if err != nil {
 			return denyRoute("subscription_authority_lookup", err)
@@ -800,6 +873,15 @@ func (p *peer) route(envelope realtimewire.Envelope, sessionID uuid.UUID, frame 
 	if envelope.MessageType == realtimewire.InputEvent || envelope.MessageType == realtimewire.ResizeRequest {
 		if !p.hub.sendControlToDevice(p, route.PCDeviceID, frame) {
 			return denyRoute("pc_connection_unavailable", store.ErrDenied)
+		}
+		return nil
+	}
+	if envelope.MessageType == realtimewire.OutputACK || envelope.MessageType == realtimewire.FlowControl {
+		if err := p.hub.routeSubscriberControlFrame(p, route.PCDeviceID, sessionID, envelope.ACK, frame); err != nil {
+			if errors.Is(err, errCumulativeACKRegressed) {
+				return denyRoute("cumulative_ack_regressed", err)
+			}
+			return denyRoute("subscription_inactive", err)
 		}
 		return nil
 	}
@@ -1091,6 +1173,7 @@ func (h *Hub) unsubscribe(p *peer, sessionID uuid.UUID) bool {
 			delete(p.subscriptionRoutes, sessionID)
 			delete(p.subscriptionFrames, sessionID)
 			delete(p.subscriptionACKs, sessionID)
+			delete(p.subscriptionControls, sessionID)
 			delete(p.controlPolicies, sessionID)
 			delete(subscribers, p.principal.Device.ID)
 			removed = true
@@ -1164,9 +1247,103 @@ func (h *Hub) rememberSubscriptionFrame(p *peer, sessionID uuid.UUID, ack uint64
 	if p.subscriptionACKs == nil {
 		p.subscriptionACKs = map[uuid.UUID]uint64{}
 	}
+	if latest, ok := latestVisibleSubscriptionACKLocked(p, sessionID); ok && ack < latest {
+		return false
+	}
 	p.subscriptionFrames[sessionID] = append([]byte(nil), frame...)
 	p.subscriptionACKs[sessionID] = ack
+	delete(p.subscriptionControls, sessionID)
 	return true
+}
+
+func (h *Hub) subscriptionACKRegresses(p *peer, sessionID uuid.UUID, ack uint64) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.subscriptions[sessionID][p.principal.Device.ID] != p {
+		return false
+	}
+	latest, ok := latestVisibleSubscriptionACKLocked(p, sessionID)
+	return ok && ack < latest
+}
+
+// rememberSubscriberControlFrame retains only the newest signed ACK-bearing
+// frame that followed the current SUBSCRIBE. The Relay compares the visible
+// cumulative cursor but never decrypts or rewrites the control payload. Equal
+// ACKs replace older controls so the PC replacement observes the most recent
+// flow-control epoch/window as byte-identical Android ciphertext.
+func rememberSubscriberControlFrameLocked(h *Hub, p *peer, sessionID uuid.UUID, ack uint64, frame []byte) error {
+	if h.subscriptions[sessionID][p.principal.Device.ID] != p {
+		return store.ErrDenied
+	}
+	if _, ok := p.subscriptionRoutes[sessionID]; !ok {
+		return store.ErrDenied
+	}
+	if latest, ok := latestVisibleSubscriptionACKLocked(p, sessionID); ok && ack < latest {
+		return errCumulativeACKRegressed
+	}
+	if p.subscriptionControls == nil {
+		p.subscriptionControls = map[uuid.UUID]retainedSubscriberControl{}
+	}
+	p.subscriptionControls[sessionID] = retainedSubscriberControl{
+		ack:   ack,
+		frame: append([]byte(nil), frame...),
+	}
+	return nil
+}
+
+// routeSubscriberControlFrame serializes a live ACK/control against the PC's
+// replacement-subscription replay. A newly installed PC is not sent control
+// until its retained SUBSCRIBE has been queued; if replay is still in progress,
+// the latest byte-identical frame remains cached for that replay to pick up.
+func (h *Hub) routeSubscriberControlFrame(sender *peer, deviceID, sessionID uuid.UUID, ack uint64, frame []byte) error {
+	for {
+		h.mu.RLock()
+		target := h.peers[deviceID]
+		h.mu.RUnlock()
+		if target == nil || target.role != "pc" || target.principal.UserID != sender.principal.UserID || !target.open() {
+			h.mu.Lock()
+			current := h.peers[deviceID]
+			if current != nil && current.role == "pc" && current.principal.UserID == sender.principal.UserID && current.open() {
+				h.mu.Unlock()
+				continue
+			}
+			err := rememberSubscriberControlFrameLocked(h, sender, sessionID, ack, frame)
+			h.mu.Unlock()
+			return err
+		}
+
+		target.pcReplayMu.Lock()
+		h.mu.Lock()
+		if err := rememberSubscriberControlFrameLocked(h, sender, sessionID, ack, frame); err != nil {
+			h.mu.Unlock()
+			target.pcReplayMu.Unlock()
+			return err
+		}
+		current := h.peers[deviceID] == target && target.open() && target.role == "pc" &&
+			target.principal.UserID == sender.principal.UserID
+		ready := current && target.subscriptionReplayReady
+		if current {
+			target.advancePCVisibleACKLocked(sessionID, sender.principal.Device.ID, ack)
+		}
+		h.mu.Unlock()
+		if !current {
+			target.pcReplayMu.Unlock()
+			continue
+		}
+		if ready {
+			_ = target.enqueue(frame)
+		}
+		target.pcReplayMu.Unlock()
+		return nil
+	}
+}
+
+func latestVisibleSubscriptionACKLocked(p *peer, sessionID uuid.UUID) (uint64, bool) {
+	ack, present := p.subscriptionACKs[sessionID]
+	if control, ok := p.subscriptionControls[sessionID]; ok && (!present || control.ack > ack) {
+		return control.ack, true
+	}
+	return ack, present
 }
 
 // activateSubscription publishes the Android target, its complete retained
@@ -1211,6 +1388,11 @@ func (h *Hub) activateSubscription(sender *peer, sessionID uuid.UUID, route stor
 				target.pcReplayMu.Unlock()
 				return denyRoute("sender_connection_replaced", store.ErrDenied)
 			}
+			if latest, ok := latestVisibleSubscriptionACKLocked(sender, sessionID); ok && ack < latest {
+				h.mu.Unlock()
+				target.pcReplayMu.Unlock()
+				return denyRoute("cumulative_ack_regressed", errCumulativeACKRegressed)
+			}
 			target.beginPCReplayEpochLocked(sessionID, sender.principal.Device.ID, ack)
 			added := h.activateSubscriptionLocked(sender, sessionID, route, ack, frame)
 			h.mu.Unlock()
@@ -1238,6 +1420,10 @@ func (h *Hub) activateSubscription(sender *peer, sessionID uuid.UUID, route stor
 			h.mu.Unlock()
 			return denyRoute("sender_connection_replaced", store.ErrDenied)
 		}
+		if latest, ok := latestVisibleSubscriptionACKLocked(sender, sessionID); ok && ack < latest {
+			h.mu.Unlock()
+			return denyRoute("cumulative_ack_regressed", errCumulativeACKRegressed)
+		}
 		added := h.activateSubscriptionLocked(sender, sessionID, route, ack, frame)
 		h.mu.Unlock()
 		if added {
@@ -1257,21 +1443,22 @@ func (h *Hub) activateSubscriptionLocked(sender *peer, sessionID uuid.UUID, rout
 	}
 	sender.subscriptionFrames[sessionID] = append([]byte(nil), frame...)
 	sender.subscriptionACKs[sessionID] = ack
+	delete(sender.subscriptionControls, sessionID)
 	return added
 }
 
 type replayedSubscription struct {
 	sessionID   uuid.UUID
 	recipientID uuid.UUID
-	ack         uint64
-	frame       []byte
 }
 
 // replaySubscriptionsToPC restores every still-live Android subscription that
-// is routed to this PC. Snapshotting under hub.mu keeps the route, ACK and frame
-// consistent; enqueueing after the lock avoids blocking unrelated Relay work
-// on the PC's bounded writer queue.
+// is routed to this PC. The first pass snapshots eligible route identities;
+// each retained SUBSCRIBE, ACK/control and route are revalidated together before
+// enqueueing outside hub.mu onto the PC's bounded writer queue.
 func (h *Hub) replaySubscriptionsToPC(target *peer) {
+	target.pcReplayMu.Lock()
+	defer target.pcReplayMu.Unlock()
 	h.mu.RLock()
 	if h.peers[target.principal.Device.ID] != target || target.role != "pc" {
 		h.mu.RUnlock()
@@ -1285,7 +1472,7 @@ func (h *Hub) replaySubscriptionsToPC(target *peer) {
 			}
 			cached, routePresent := subscriber.subscriptionRoutes[sessionID]
 			frame, framePresent := subscriber.subscriptionFrames[sessionID]
-			ack, ackPresent := subscriber.subscriptionACKs[sessionID]
+			_, ackPresent := subscriber.subscriptionACKs[sessionID]
 			if !routePresent || cached.authorization.PCDeviceID != target.principal.Device.ID ||
 				!routeAuthorizationLive(cached.authorization, time.Now()) || !framePresent || !ackPresent || len(frame) == 0 {
 				continue
@@ -1293,24 +1480,23 @@ func (h *Hub) replaySubscriptionsToPC(target *peer) {
 			replays = append(replays, replayedSubscription{
 				sessionID:   sessionID,
 				recipientID: recipientID,
-				ack:         ack,
-				frame:       append([]byte(nil), frame...),
 			})
 		}
 	}
 	h.mu.RUnlock()
 
 	for _, replay := range replays {
-		target.pcReplayMu.Lock()
 		h.mu.RLock()
 		subscriber := h.subscriptions[replay.sessionID][replay.recipientID]
 		cached, routePresent := cachedSessionRoute{}, false
 		frame, framePresent := []byte(nil), false
 		ack, ackPresent := uint64(0), false
+		control, controlSet := retainedSubscriberControl{}, false
 		if subscriber != nil {
 			cached, routePresent = subscriber.subscriptionRoutes[replay.sessionID]
 			frame, framePresent = subscriber.subscriptionFrames[replay.sessionID]
 			ack, ackPresent = subscriber.subscriptionACKs[replay.sessionID]
+			control, controlSet = subscriber.subscriptionControls[replay.sessionID]
 		}
 		valid := h.peers[target.principal.Device.ID] == target && target.role == "pc" && target.open() &&
 			subscriber != nil && h.peers[replay.recipientID] == subscriber && subscriber.open() &&
@@ -1319,19 +1505,27 @@ func (h *Hub) replaySubscriptionsToPC(target *peer) {
 			routeAuthorizationLive(cached.authorization, time.Now()) && framePresent && ackPresent && len(frame) > 0
 		if valid {
 			frame = append([]byte(nil), frame...)
-			target.beginPCReplayEpochLocked(replay.sessionID, replay.recipientID, ack)
+			control.frame = append([]byte(nil), control.frame...)
+			latestACK := ack
+			controlSet = controlSet && len(control.frame) > 0 && control.ack >= latestACK
+			if controlSet {
+				latestACK = control.ack
+			}
+			target.beginPCReplayEpochLocked(replay.sessionID, replay.recipientID, latestACK)
 		}
 		h.mu.RUnlock()
 		if !valid {
-			target.pcReplayMu.Unlock()
 			continue
 		}
 		queued := target.enqueue(frame)
-		target.pcReplayMu.Unlock()
+		if queued && controlSet {
+			queued = target.enqueue(control.frame)
+		}
 		if !queued {
 			return
 		}
 	}
+	target.subscriptionReplayReady = true
 }
 
 func (h *Hub) routeToSubscriber(sender *peer, sessionID, recipient uuid.UUID, frame []byte) error {
@@ -1497,6 +1691,24 @@ func (p *peer) enqueue(frame []byte) bool {
 	}
 }
 
+// enqueueControl keeps all data writes on writeLoop. Gorilla permits control
+// close frames concurrently, but Text/Binary data writers must remain unique.
+func (p *peer) enqueueControl(frame []byte) bool {
+	if !p.open() || len(frame) == 0 || len(frame) > maxLivenessControlBytes || p.controlSend == nil {
+		return false
+	}
+	copyFrame := append([]byte(nil), frame...)
+	select {
+	case p.controlSend <- copyFrame:
+		return true
+	case <-p.done:
+		return false
+	default:
+		p.close(websocket.CloseTryAgainLater, "realtime control queue exceeded")
+		return false
+	}
+}
+
 func (p *peer) reserveQueueBytes(size int64) bool {
 	if size <= 0 || size > peerQueueBytes {
 		return false
@@ -1530,6 +1742,12 @@ func (p *peer) writeLoop() {
 	defer ticker.Stop()
 	for {
 		select {
+		case control := <-p.controlSend:
+			_ = p.socket.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := p.socket.WriteMessage(websocket.TextMessage, control); err != nil {
+				p.close(websocket.CloseAbnormalClosure, "control write failed")
+				return
+			}
 		case frame := <-p.send:
 			p.releaseQueueBytes(int64(len(frame)))
 			_ = p.socket.SetWriteDeadline(time.Now().Add(10 * time.Second))

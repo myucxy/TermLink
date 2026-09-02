@@ -115,8 +115,19 @@ static void RunIsolatedWalValidation(string[] values)
         var store = new ProductionTerminalHistoryStore(isolatedRoot, pcDeviceId);
         var frames = store.ReadFrames(sessionId);
         var frameCount = frames.Count;
-        foreach (var frame in frames) Array.Clear(frame.Payload);
+        using (var shadow = new ProductionTerminalCoreShadow(80, 24))
+        {
+            foreach (var frame in frames) shadow.Apply(frame);
+            var observed = shadow.ObserveCheckpoint(
+                portable: null,
+                expectedSequence: frames.Last().Sequence,
+                portableReasonCode: "ISOLATED_WAL_VALIDATION");
+            if (observed.Status == "SHADOW_RETIRED")
+                throw new InvalidOperationException(
+                    $"terminal-core rejected the isolated WAL: {observed.ReasonCode}");
+        }
         var result = new ProductionTerminalHistoryProducer(store, pcDeviceId).ProcessSession(sessionId);
+        foreach (var frame in frames) Array.Clear(frame.Payload);
         Console.WriteLine(
             "Isolated encrypted WAL validation passed; " +
             $"frames={frameCount}; last_sequence={result.LastSequence}; " +

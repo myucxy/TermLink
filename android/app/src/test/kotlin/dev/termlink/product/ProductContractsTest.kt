@@ -9,6 +9,7 @@ import dev.termlink.session.InputSubmission
 import dev.termlink.session.RemoteLifecycle
 import dev.termlink.session.RemoteSessionEvent
 import dev.termlink.session.RemoteSessionState
+import java.io.IOException
 import java.net.URI
 import java.util.Base64
 import java.util.UUID
@@ -845,7 +846,7 @@ class ProductContractsTest {
     }
 
     @Test
-    fun leaseRetryRejectsOtherFailuresAndSkipsAnExistingLease() {
+    fun leaseRetryRejectsAuthorityFailuresAndSkipsAnExistingLease() {
         var requests = 0
         val failure = assertThrows(TermLinkApiException::class.java) {
             runBlocking {
@@ -853,14 +854,14 @@ class ProductContractsTest {
                     remoteState = { RemoteSessionState.Live(lastAckedSequence = 50) },
                     request = {
                         requests += 1
-                        throw TermLinkApiException(503, "LEASE_UNAVAILABLE", traceId = null)
+                        throw TermLinkApiException(403, "CONTROL_NOT_GRANTED", traceId = null)
                     },
                     retryDelaysMillis = listOf(1L),
                     pause = { error("must not retry") },
                 )
             }
         }
-        assertEquals("LEASE_UNAVAILABLE", failure.code)
+        assertEquals("CONTROL_NOT_GRANTED", failure.code)
         assertEquals(1, requests)
 
         val skipped = runBlocking {
@@ -876,6 +877,57 @@ class ProductContractsTest {
             )
         }
         assertFalse(skipped)
+    }
+
+    @Test
+    fun leaseRetryRecoversFromTransientHttpAndNetworkFailures() = runBlocking {
+        var requests = 0
+        val pauses = mutableListOf<Long>()
+
+        val acquired = acquireControlLeaseWithRetry(
+            remoteState = { RemoteSessionState.Live(lastAckedSequence = 50) },
+            request = {
+                requests += 1
+                when (requests) {
+                    1 -> throw TermLinkApiException(503, "LEASE_UNAVAILABLE", traceId = null)
+                    2 -> throw IOException("network switched")
+                }
+            },
+            retryDelaysMillis = emptyList(),
+            transientRetryDelaysMillis = listOf(5L, 10L),
+            pause = { pauses += it },
+        )
+
+        assertTrue(acquired)
+        assertEquals(3, requests)
+        assertEquals(listOf(5L, 10L), pauses)
+    }
+
+    @Test
+    fun controllingRuntimeStateClearsAStaleSessionFailure() {
+        val sessionId = UUID.randomUUID()
+        val failure = SessionOpenFailure(SessionOpenFailureCode.SERVER_REJECTED)
+        val failures = mapOf(sessionId to failure)
+
+        assertEquals(
+            failures,
+            sessionFailuresAfterRuntimeState(
+                failures,
+                sessionId,
+                RemoteSessionState.ReadOnly(lastAckedSequence = 1, reason = "lease expired"),
+            ),
+        )
+        assertTrue(
+            sessionFailuresAfterRuntimeState(
+                failures,
+                sessionId,
+                RemoteSessionState.Controlling(
+                    lastAckedSequence = 1,
+                    leaseId = UUID.randomUUID().toString(),
+                    expiresAtEpochMillis = Long.MAX_VALUE,
+                ),
+            ).isEmpty(),
+        )
     }
 
     @Test
@@ -1138,6 +1190,7 @@ class ProductContractsTest {
               "name":"Test phone",
               "key_id":"device-key",
               "exchange_public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+              "signing_public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
               "trust_state":"$trustState",
               "created_at":"2026-08-04T00:00:00Z"
             }

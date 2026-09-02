@@ -1,0 +1,12 @@
+[package]
+name = "termlink-direct-nat"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ring = { version = "=0.17.14", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

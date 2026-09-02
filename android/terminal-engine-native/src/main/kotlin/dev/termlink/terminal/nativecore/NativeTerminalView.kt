@@ -301,6 +301,10 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private fun ensureCursorVisible() {
         if (engine == null || width <= 0 || height <= 0) return
         val frame = currentFrame()
+        if (!frame.cursor.visible) {
+            clampViewport()
+            return
+        }
         val cursorLeft = contentPadding + frame.cursor.column * cellWidth
         val cursorRight = cursorLeft + cellWidth
         val cursorTop = contentPadding + frame.cursor.row * cellHeight

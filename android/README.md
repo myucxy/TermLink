@@ -34,6 +34,24 @@ Termux 源码固定到 `termux/termux-app` 提交
   -Destination "$env:TEMP\termlink-termux-sync-check"
 ```
 
+锁屏与前后台恢复设计还核对了上述固定提交中的 `TermuxActivity`、`TermuxService`，以及
+`termux/termux-app` issues
+[#3824](https://github.com/termux/termux-app/issues/3824)、
+[#4657](https://github.com/termux/termux-app/issues/4657) 和
+[#3694](https://github.com/termux/termux-app/issues/3694)。可复用的是“Activity 只附着 UI、
+长期会话由更长生命周期的 owner 持有”和用户显式选择 wake lock 的行为边界；Termux 的本地
+Service、PTY、Shell、Bootstrap、APT 与插件签名架构不能用于 TermLink。TermLink 的生产恢复
+仍由设备级 WebSocket generation、E2EE、控制租约、累计 ACK、History Gap、Snapshot 和 native
+`terminal-core` 共同裁决。固定版本没有“后台超过固定时长就重建网络”的逻辑，因此 TermLink
+回到前台时先探测当前协商过的连接，只有结构陈旧、探测失败或网络 generation 变化才换代。
+
+NAT/直连设计还只读复核了 `termux/termux-app` 当前上游
+`3b66f8799635a4dba4a206563048ff0e6792c487`（2026-08-24）。其应用代码没有
+`Network.getNetworkHandle()`、`Network.bindSocket()`、STUN、UDP hole punching 或 QUIC 工作流；
+`TermuxService` 的 wake lock 与本地会话所有权只能作为 Android 生命周期参考。因此 TermLink
+不会复制 Termux 的本地 socket/service 架构，active Android `Network` 的 handle、同一 UDP
+socket 的 STUN/Probe/QUIC 生命周期和 Relay 热备用均由独立 network-core 实现。
+
 `DiagnosticTerminalEngine` 仍保留为字节诊断工具，但 Harness 已不再使用它渲染终端。
 
 生产会话 Dock 默认包含 Backspace 与 Delete，两者分别发送终端退格和前向删除序列；软键盘的
@@ -73,6 +91,10 @@ TermLink 专用 keystore；未配置时 release 保持未签名，不能上传 A
 
 Wrapper 固定 Gradle 8.13 及其 SHA-256，不依赖 `D:\Dev` 中带全局初始化脚本的 Gradle
 发行目录。
+
+直连生产构建始终关闭。仅调试构建可显式传入
+`-PtermlinkEnableDirectTransportShadow=true` 运行不承载会话数据的 shadow 验证；该开关不能
+改变 Relay、durable ACK、renderer 或 SessionHost 生命周期，也不能授权 direct cutover。
 
 Debug APK 位于：
 

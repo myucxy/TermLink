@@ -1,5 +1,7 @@
 package dev.termlink.terminal.nativecore
 
+import dev.termlink.terminal.api.TerminalEngineFailureDiagnostics
+
 /**
  * Stable status values shared with the TermLink terminal C ABI.
  *
@@ -65,7 +67,14 @@ class NativeTerminalException(
         }
     },
     cause,
-)
+), TerminalEngineFailureDiagnostics {
+    override val terminalOperation: String
+        get() = operation
+    override val terminalStatusName: String
+        get() = status.name
+    override val terminalStatusCode: Int
+        get() = rawStatusCode
+}
 
 class NativeTerminalContractException(
     val operation: String,

@@ -16,6 +16,81 @@ using TermLink.TerminalCore;
 
 namespace TermLink.SessionHost
 {
+    internal sealed class ResizeSettlePolicy
+    {
+        private readonly long trailingSettleMilliseconds;
+        private readonly long maximumWaitMilliseconds;
+        private short appliedColumns;
+        private short appliedRows;
+        private short pendingColumns;
+        private short pendingRows;
+        private long pendingSinceMilliseconds;
+        private long lastChangeMilliseconds;
+        private bool hasPending;
+
+        public ResizeSettlePolicy(
+            short appliedColumns,
+            short appliedRows,
+            long trailingSettleMilliseconds,
+            long maximumWaitMilliseconds)
+        {
+            if (trailingSettleMilliseconds < 0)
+                throw new ArgumentOutOfRangeException(nameof(trailingSettleMilliseconds));
+            if (maximumWaitMilliseconds < trailingSettleMilliseconds)
+                throw new ArgumentOutOfRangeException(nameof(maximumWaitMilliseconds));
+            this.appliedColumns = appliedColumns;
+            this.appliedRows = appliedRows;
+            this.trailingSettleMilliseconds = trailingSettleMilliseconds;
+            this.maximumWaitMilliseconds = maximumWaitMilliseconds;
+        }
+
+        public void Observe(short columns, short rows, long nowMilliseconds)
+        {
+            if (columns == appliedColumns && rows == appliedRows)
+            {
+                hasPending = false;
+                return;
+            }
+            if (hasPending && columns == pendingColumns && rows == pendingRows) return;
+
+            pendingColumns = columns;
+            pendingRows = rows;
+            lastChangeMilliseconds = nowMilliseconds;
+            // Preserve the first observation across the burst so a stream of
+            // changing sizes cannot postpone ConPTY indefinitely.
+            if (hasPending) return;
+
+            pendingSinceMilliseconds = nowMilliseconds;
+            hasPending = true;
+        }
+
+        public bool TryGetDue(long nowMilliseconds, out short columns, out short rows)
+        {
+            columns = pendingColumns;
+            rows = pendingRows;
+            return hasPending &&
+                (nowMilliseconds - lastChangeMilliseconds >= trailingSettleMilliseconds ||
+                    nowMilliseconds - pendingSinceMilliseconds >= maximumWaitMilliseconds);
+        }
+
+        public long GetDelayUntilDue(long nowMilliseconds)
+        {
+            if (!hasPending) return long.MaxValue;
+            var trailingRemaining = trailingSettleMilliseconds -
+                (nowMilliseconds - lastChangeMilliseconds);
+            var maximumRemaining = maximumWaitMilliseconds -
+                (nowMilliseconds - pendingSinceMilliseconds);
+            return Math.Max(0, Math.Min(trailingRemaining, maximumRemaining));
+        }
+
+        public void MarkApplied(short columns, short rows)
+        {
+            appliedColumns = columns;
+            appliedRows = rows;
+            if (hasPending && columns == pendingColumns && rows == pendingRows) hasPending = false;
+        }
+    }
+
     internal static class Program
     {
         public static int Main(string[] args)
@@ -361,6 +436,9 @@ namespace TermLink.SessionHost
         private const uint ShiftPressed = 0x0010;
         private const int OutputBatchBytes = 64 * 1024;
         private const int OutputCoalesceMilliseconds = 2;
+        private const int ResizePollMilliseconds = 40;
+        private const int ResizeTrailingSettleMilliseconds = 140;
+        private const int ResizeMaximumWaitMilliseconds = 250;
 
         private readonly SessionHostOptions options;
         private readonly object inputSync = new object();
@@ -1274,15 +1352,35 @@ namespace TermLink.SessionHost
 
         private void PollResize(IntPtr outerOutput, COORD previous)
         {
+            var observed = previous;
+            var settle = new ResizeSettlePolicy(
+                previous.X,
+                previous.Y,
+                ResizeTrailingSettleMilliseconds,
+                ResizeMaximumWaitMilliseconds);
             while (!stopResize)
             {
-                var current = QueryOuterSize(outerOutput, previous.X, previous.Y);
-                if (current.X != previous.X || current.Y != previous.Y)
+                var nextPollDelayMilliseconds = ResizePollMilliseconds;
+                var current = QueryOuterSize(outerOutput, observed.X, observed.Y);
+                observed = current;
+                var nowMilliseconds = Environment.TickCount64;
+                settle.Observe(current.X, current.Y, nowMilliseconds);
+                if (!stopResize &&
+                    settle.TryGetDue(nowMilliseconds, out var columns, out var rows))
                 {
-                    if (ResizeInner(current)) previous = current;
+                    var next = new COORD { X = columns, Y = rows };
+                    if (ResizeInner(next)) settle.MarkApplied(columns, rows);
+                }
+                else
+                {
+                    // Wake at an exact settle/max-wait boundary when it is
+                    // sooner than the normal console-size polling interval.
+                    nextPollDelayMilliseconds = checked((int)Math.Min(
+                        ResizePollMilliseconds,
+                        settle.GetDelayUntilDue(nowMilliseconds)));
                 }
                 PublishCurrentConsoleTitle();
-                Thread.Sleep(40);
+                Thread.Sleep(nextPollDelayMilliseconds);
             }
         }
 
@@ -1313,6 +1411,7 @@ namespace TermLink.SessionHost
             lock (resizeSync)
             {
                 if (pseudoConsole == IntPtr.Zero) return false;
+                if (innerSize.X == size.X && innerSize.Y == size.Y) return false;
                 var result = ResizePseudoConsole(pseudoConsole, size);
                 if (result != 0) return false;
                 innerSize = size;
