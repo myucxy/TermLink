@@ -8,6 +8,7 @@ import dev.termlink.protocol.transport.v1.DirectPathTicketV1
 import dev.termlink.protocol.transport.v1.TransportSignalEnvelopeV1
 import dev.termlink.protocol.transport.v1.TransportSignalTypeV1
 import java.security.SecureRandom
+import java.io.IOException
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
@@ -22,7 +23,11 @@ import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
+import okhttp3.Call
+import okhttp3.EventListener
+import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -638,12 +643,161 @@ class DirectTransportSignalingClientTest {
         }
     }
 
+    @Test
+    fun cancellingConfigRequestCancelsTheExactOkHttpCall() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.NO_RESPONSE))
+        server.start()
+        val failed = CompletableDeferred<Unit>()
+        val http = OkHttpClient.Builder()
+            .eventListener(object : EventListener() {
+                override fun callFailed(call: Call, ioe: IOException) {
+                    failed.complete(Unit)
+                }
+            })
+            .build()
+        val fixture = fixture(server, enabled = true, httpClient = http)
+        try {
+            val request = async(start = CoroutineStart.UNDISPATCHED) {
+                fixture.client.fetchConfigCancellable()
+            }
+            withTimeout(2_000) {
+                while (server.requestCount == 0) delay(10)
+            }
+            request.cancelAndJoin()
+            withTimeout(2_000) { failed.await() }
+            assertTrue(request.isCancelled)
+            assertEquals(0, http.dispatcher.runningCallsCount())
+        } finally {
+            fixture.close()
+            http.dispatcher.executorService.shutdownNow()
+            http.connectionPool.evictAll()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun cancellableConfigAndTicketPreserveValidatedSuccess() = runBlocking {
+        val server = MockWebServer()
+        val signing = TicketSigningFixture()
+        val local = UUID.randomUUID()
+        val target = UUID.randomUUID()
+        val connection = UUID.randomUUID()
+        val ticket = signing.ticket(local, target, connection, now)
+        server.enqueue(MockResponse().setResponseCode(200).setBody(configJson(signing)))
+        server.enqueue(MockResponse().setResponseCode(201).setBody(ticketResponse(ticket)))
+        server.start()
+        val fixture = fixture(server, enabled = true, deviceId = local)
+        try {
+            val config = fixture.client.fetchConfigCancellable()
+            assertTrue(config is DirectSignalingCallResult.Success)
+            val issued = fixture.client.issueTicketCancellable(
+                target,
+                connection,
+                (config as DirectSignalingCallResult.Success).value,
+            )
+            assertTrue(issued is DirectSignalingCallResult.Success)
+            assertArrayEquals(ticket, (issued as DirectSignalingCallResult.Success).value.wireBytes)
+            assertEquals(2, server.requestCount)
+        } finally {
+            fixture.close()
+            server.shutdown()
+            signing.destroy()
+            ticket.fill(0)
+        }
+    }
+
+    @Test
+    fun cancellingConfigAfterHeadersCancelsAStalledResponseBody() = runBlocking {
+        val server = MockWebServer()
+        val signing = TicketSigningFixture()
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(configJson(signing) + " ".repeat(65_536))
+                .throttleBody(1, 1, TimeUnit.SECONDS),
+        )
+        server.start()
+        val headersStarted = CompletableDeferred<Unit>()
+        val failed = CompletableDeferred<Unit>()
+        val http = OkHttpClient.Builder()
+            .eventListener(object : EventListener() {
+                override fun responseHeadersStart(call: Call) {
+                    headersStarted.complete(Unit)
+                }
+
+                override fun callFailed(call: Call, ioe: IOException) {
+                    failed.complete(Unit)
+                }
+            })
+            .build()
+        val fixture = fixture(server, enabled = true, httpClient = http)
+        try {
+            val request = async(start = CoroutineStart.UNDISPATCHED) {
+                fixture.client.fetchConfigCancellable()
+            }
+            withTimeout(2_000) { headersStarted.await() }
+            request.cancelAndJoin()
+            withTimeout(2_000) { failed.await() }
+            assertTrue(request.isCancelled)
+            assertEquals(0, http.dispatcher.runningCallsCount())
+        } finally {
+            fixture.close()
+            http.dispatcher.executorService.shutdownNow()
+            http.connectionPool.evictAll()
+            server.shutdown()
+            signing.destroy()
+        }
+    }
+
+    @Test
+    fun cancellingTicketRequestCancelsTheExactOkHttpCall() = runBlocking {
+        val server = MockWebServer()
+        val signing = TicketSigningFixture()
+        val local = UUID.randomUUID()
+        val target = UUID.randomUUID()
+        val connection = UUID.randomUUID()
+        server.enqueue(MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.NO_RESPONSE))
+        server.start()
+        val failed = CompletableDeferred<Unit>()
+        val http = OkHttpClient.Builder()
+            .eventListener(object : EventListener() {
+                override fun callFailed(call: Call, ioe: IOException) {
+                    failed.complete(Unit)
+                }
+            })
+            .build()
+        val fixture = fixture(server, enabled = true, deviceId = local, httpClient = http)
+        try {
+            val request = async(start = CoroutineStart.UNDISPATCHED) {
+                fixture.client.issueTicketCancellable(target, connection, parsedConfig(signing))
+            }
+            withTimeout(2_000) {
+                while (server.requestCount == 0) {
+                    check(!request.isCompleted) { "ticket call completed before reaching HTTP" }
+                    delay(10)
+                }
+            }
+            request.cancelAndJoin()
+            withTimeout(2_000) { failed.await() }
+            assertTrue(request.isCancelled)
+            assertEquals(0, http.dispatcher.runningCallsCount())
+        } finally {
+            fixture.close()
+            http.dispatcher.executorService.shutdownNow()
+            http.connectionPool.evictAll()
+            server.shutdown()
+            signing.destroy()
+        }
+    }
+
     private fun fixture(
         server: MockWebServer,
         enabled: Boolean = false,
         deviceId: UUID = UUID.randomUUID(),
         retryDelay: DirectSignalingRetryDelay = DirectSignalingRetryDelay { },
         multipair: Boolean = false,
+        httpClient: OkHttpClient = OkHttpClient(),
     ): ClientFixture {
         val identity = DeviceIdentity.generate()
         val client = DirectTransportSignalingClient(
@@ -655,6 +809,7 @@ class DirectTransportSignalingClientTest {
             ticketSignatureVerifier = bouncyTicketVerifier(),
             feature = DirectTransportSignalingFeature(enabled),
             multipairV2Enabled = multipair,
+            httpClient = httpClient,
             clockMillis = { now },
             random = FixedSecureRandom(),
             retryDelay = retryDelay,

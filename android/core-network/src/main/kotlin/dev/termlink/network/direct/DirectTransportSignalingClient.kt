@@ -9,6 +9,7 @@ import dev.termlink.protocol.transport.v1.DirectPathTicketV1
 import dev.termlink.protocol.transport.v1.TransportSignalEnvelopeV1
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
+import java.io.IOException
 import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -35,6 +36,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -43,6 +45,8 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -50,6 +54,7 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString as OkioByteString
+import kotlin.coroutines.resume
 
 /**
  * Production direct-transport signalling control plane.
@@ -161,6 +166,34 @@ internal class DirectTransportSignalingClient(
         }
     }
 
+    suspend fun fetchConfigCancellable(): DirectSignalingCallResult<DirectTransportServerConfig> {
+        if (!feature.enabled) return DirectSignalingCallResult.Disabled
+        if (closed.get()) return closedFault()
+        multipairV2Configured.set(false)
+        val response = executeHttpBodyCancellable(
+            "GET",
+            CONFIG_PATH,
+            ByteArray(0),
+            MAX_CONFIG_RESPONSE_BYTES,
+        )
+            ?: return DirectSignalingCallResult.Fault(
+                DirectSignalingFault(DirectSignalingFaultCode.HTTP_UNAVAILABLE),
+            )
+        val failure = httpFailure(response)
+        if (failure != null) return DirectSignalingCallResult.Fault(failure)
+        val raw = response.body ?: return DirectSignalingCallResult.Fault(
+            DirectSignalingFault(DirectSignalingFaultCode.RESPONSE_TOO_LARGE),
+        )
+        val config = runCatching { parseConfig(raw) }.getOrNull()
+            ?: return DirectSignalingCallResult.Fault(
+                DirectSignalingFault(DirectSignalingFaultCode.INVALID_CONFIGURATION),
+            )
+        multipairV2Configured.set(
+            multipairV2Enabled && DIRECT_MULTIPAIR_CAPABILITY in config.capabilities,
+        )
+        return DirectSignalingCallResult.Success(config)
+    }
+
     fun issueTicket(
         targetDeviceId: UUID,
         connectionId: UUID,
@@ -206,6 +239,55 @@ internal class DirectTransportSignalingClient(
             )
             return DirectSignalingCallResult.Success(ticket)
         }
+    }
+
+    suspend fun issueTicketCancellable(
+        targetDeviceId: UUID,
+        connectionId: UUID,
+        config: DirectTransportServerConfig,
+    ): DirectSignalingCallResult<ValidatedDirectPathTicket> {
+        if (!feature.enabled) return DirectSignalingCallResult.Disabled
+        if (closed.get()) return closedFault()
+        if (targetDeviceId == NIL_UUID || targetDeviceId == deviceId || connectionId.version() != 4 ||
+            config.protocolVersion != PROTOCOL_VERSION ||
+            !validConfigCapabilities(config.capabilities) ||
+            config.directRoutingPermitted
+        ) {
+            return DirectSignalingCallResult.Fault(
+                DirectSignalingFault(DirectSignalingFaultCode.TICKET_REJECTED),
+            )
+        }
+        val jsonBody = buildJsonObject {
+            put("target_device_id", targetDeviceId.toString())
+            put("connection_id", connectionId.toString())
+            putJsonArray("requested_carriers") { add(JsonPrimitive("UDP_QUIC")) }
+        }
+        val body = JSON.encodeToString(JsonObject.serializer(), jsonBody).encodeToByteArray()
+        if (body.size > MAX_TICKET_REQUEST_BYTES) {
+            return DirectSignalingCallResult.Fault(
+                DirectSignalingFault(DirectSignalingFaultCode.TICKET_REJECTED),
+            )
+        }
+        val response = executeHttpBodyCancellable(
+            "POST",
+            TICKET_PATH,
+            body,
+            MAX_TICKET_RESPONSE_BYTES,
+        )
+            ?: return DirectSignalingCallResult.Fault(
+                DirectSignalingFault(DirectSignalingFaultCode.HTTP_UNAVAILABLE),
+            )
+        val failure = httpFailure(response)
+        if (failure != null) return DirectSignalingCallResult.Fault(failure)
+        val raw = response.body ?: return DirectSignalingCallResult.Fault(
+            DirectSignalingFault(DirectSignalingFaultCode.RESPONSE_TOO_LARGE),
+        )
+        val ticket = runCatching {
+            parseAndValidateTicket(raw, targetDeviceId, connectionId, config)
+        }.getOrNull() ?: return DirectSignalingCallResult.Fault(
+            DirectSignalingFault(DirectSignalingFaultCode.TICKET_REJECTED),
+        )
+        return DirectSignalingCallResult.Success(ticket)
     }
 
     /** Starts an independently retried signalling socket. Feature-off performs no network I/O. */
@@ -301,7 +383,7 @@ internal class DirectTransportSignalingClient(
         scope.cancel()
     }
 
-    private fun executeHttp(method: String, path: String, body: ByteArray): Response? = runCatching {
+    private fun createHttpCall(method: String, path: String, body: ByteArray): Call? = runCatching {
         val proof = DirectTransportSignalingProof.createDeviceProof(
             identity = identity,
             deviceId = deviceId.toString(),
@@ -320,8 +402,65 @@ internal class DirectTransportSignalingClient(
             "POST" -> builder.post(body.toRequestBody(JSON_MEDIA_TYPE))
             else -> error("unsupported direct HTTP method")
         }
-        restClient.newCall(builder.build()).execute()
+        restClient.newCall(builder.build())
     }.getOrNull()
+
+    private fun executeHttp(method: String, path: String, body: ByteArray): Response? =
+        runCatching { createHttpCall(method, path, body)?.execute() }.getOrNull()
+
+    /**
+     * Keeps the exact OkHttp [Call] cancellable until the bounded response body
+     * has been consumed. Returning a live [Response] would settle cancellation
+     * at headers and allow a stalled body to delay generation retirement.
+     */
+    private suspend fun executeHttpBodyCancellable(
+        method: String,
+        path: String,
+        body: ByteArray,
+        maximumResponseBytes: Int,
+    ): CancellableHttpResponse? {
+        val call = createHttpCall(method, path, body) ?: return null
+        return suspendCancellableCoroutine { continuation ->
+            val settled = AtomicBoolean(false)
+            continuation.invokeOnCancellation {
+                if (settled.compareAndSet(false, true)) call.cancel()
+            }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, error: IOException) {
+                    if (settled.compareAndSet(false, true)) continuation.resume(null)
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    val result = response.use { value ->
+                        try {
+                            CancellableHttpResponse(
+                                code = value.code,
+                                successful = value.isSuccessful,
+                                body = if (value.isSuccessful) {
+                                    readBoundedBody(value, maximumResponseBytes)
+                                } else {
+                                    ByteArray(0)
+                                },
+                            )
+                        } catch (_: IOException) {
+                            null
+                        }
+                    }
+                    if (settled.compareAndSet(false, true)) {
+                        continuation.resume(result) { _, value, _ -> value?.body?.fill(0) }
+                    } else {
+                        result?.body?.fill(0)
+                    }
+                }
+            })
+        }
+    }
+
+    private data class CancellableHttpResponse(
+        val code: Int,
+        val successful: Boolean,
+        val body: ByteArray?,
+    )
 
     private fun openSocket(attempt: Int) {
         if (closed.get() || !feature.enabled) return
@@ -842,6 +981,18 @@ internal class DirectTransportSignalingClient(
 
     private fun httpFailure(response: Response): DirectSignalingFault? {
         if (response.isSuccessful) return null
+        return DirectSignalingFault(
+            if (response.code == 401 || response.code == 403) {
+                DirectSignalingFaultCode.AUTHENTICATION_REJECTED
+            } else {
+                DirectSignalingFaultCode.HTTP_UNAVAILABLE
+            },
+            response.code,
+        )
+    }
+
+    private fun httpFailure(response: CancellableHttpResponse): DirectSignalingFault? {
+        if (response.successful) return null
         return DirectSignalingFault(
             if (response.code == 401 || response.code == 403) {
                 DirectSignalingFaultCode.AUTHENTICATION_REJECTED

@@ -93,7 +93,7 @@ class TerminalSnapshotBootstrapTest {
     @Test
     fun productionReadinessPolicyCoversSlowWindowsRegistrationWithShortRequests() {
         assertEquals(30_000L, TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS)
-        assertEquals(1_000L, TERMINAL_SNAPSHOT_READINESS_REQUEST_TIMEOUT_MILLIS)
+        assertEquals(5_000L, TERMINAL_SNAPSHOT_READINESS_REQUEST_TIMEOUT_MILLIS)
         assertEquals(128, TERMINAL_SNAPSHOT_MAX_LIVE_SUFFIX_EVENTS)
         assertEquals(
             listOf(
@@ -165,6 +165,279 @@ class TerminalSnapshotBootstrapTest {
             ),
         )
         assertFalse(snapshotReadinessIsSettled(snapshotAvailable = false, failure = null))
+    }
+
+    @Test
+    fun persistentMetadataTimeoutSurvivesTheAbsoluteReadinessDeadline() {
+        data class Observation(
+            val tail: ULong,
+            val snapshot: String?,
+            val failure: SessionOpenFailure?,
+        )
+        val expected = SessionOpenFailure(SessionOpenFailureCode.SERVICE_TIMEOUT)
+
+        val result = runBlocking {
+            awaitTerminalSnapshotReadiness(
+                latestObservation = { Observation(697uL, snapshot = null, failure = expected) },
+                snapshotOf = Observation::snapshot,
+                lastOutputSequenceOf = Observation::tail,
+                failureOf = Observation::failure,
+                retryDelaysMillis = listOf(10_000L),
+                timeoutMillis = 20L,
+                pause = { delay(it) },
+            )
+        }
+
+        assertNull(result.snapshot)
+        assertEquals(expected, result.failure)
+        val thrown = assertThrows(SessionOpenException::class.java) {
+            throwTerminalSnapshotReadinessFailureUnlessUnsupported(result.failure)
+        }
+        assertEquals(SessionOpenFailureCode.SERVICE_TIMEOUT, thrown.failure.code)
+    }
+
+    @Test
+    fun laterSnapshotClearsAnEarlierTransientMetadataFailure() = runBlocking {
+        data class Observation(
+            val tail: ULong,
+            val snapshot: String?,
+            val failure: SessionOpenFailure?,
+        )
+        var attempts = 0
+
+        val result = awaitTerminalSnapshotReadiness(
+            latestObservation = {
+                attempts += 1
+                if (attempts == 1) {
+                    Observation(
+                        tail = 740uL,
+                        snapshot = null,
+                        failure = SessionOpenFailure(SessionOpenFailureCode.SNAPSHOT_METADATA),
+                    )
+                } else {
+                    Observation(tail = 740uL, snapshot = "snapshot-v2", failure = null)
+                }
+            },
+            snapshotOf = Observation::snapshot,
+            lastOutputSequenceOf = Observation::tail,
+            failureOf = Observation::failure,
+            retryDelaysMillis = listOf(0L),
+            timeoutMillis = 1_000L,
+            pause = { },
+        )
+
+        assertEquals("snapshot-v2", result.snapshot)
+        assertNull(result.failure)
+        assertEquals(2, attempts)
+    }
+
+    @Test
+    fun recoveredEmptySnapshotObservationClearsAnEarlierFailure() = runBlocking {
+        data class Observation(
+            val tail: ULong,
+            val failure: SessionOpenFailure?,
+        )
+        var attempts = 0
+
+        val result = awaitTerminalSnapshotReadiness<Observation, String>(
+            latestObservation = {
+                attempts += 1
+                if (attempts == 1) {
+                    Observation(
+                        740uL,
+                        SessionOpenFailure(SessionOpenFailureCode.SERVICE_TIMEOUT),
+                    )
+                } else {
+                    Observation(740uL, failure = null)
+                }
+            },
+            snapshotOf = { null },
+            lastOutputSequenceOf = Observation::tail,
+            failureOf = Observation::failure,
+            retryDelaysMillis = listOf(0L),
+            timeoutMillis = 1_000L,
+            pause = { },
+        )
+
+        assertNull(result.snapshot)
+        assertNull(result.failure)
+        assertEquals(2, attempts)
+    }
+
+    @Test
+    fun thrownObservationFailureIsRetriedAndARecoveredSnapshotWins() = runBlocking {
+        data class Observation(val snapshot: String?)
+        var attempts = 0
+
+        val result = awaitTerminalSnapshotReadiness(
+            latestObservation = {
+                attempts += 1
+                if (attempts == 1) throw java.net.SocketTimeoutException("fixture")
+                Observation("snapshot-after-retry")
+            },
+            snapshotOf = Observation::snapshot,
+            lastOutputSequenceOf = { 740uL },
+            failureOf = { null },
+            retryDelaysMillis = listOf(0L),
+            timeoutMillis = 1_000L,
+            pause = { },
+            observationFailure = {
+                SessionOpenFailure(SessionOpenFailureCode.SERVICE_TIMEOUT)
+            },
+        )
+
+        assertEquals("snapshot-after-retry", result.snapshot)
+        assertNull(result.failure)
+        assertEquals(2, attempts)
+    }
+
+    @Test
+    fun snapshotFailureOnlyBlocksChunkFallbackAfterADurableAck() {
+        val timeout = SessionOpenFailure(SessionOpenFailureCode.SERVICE_TIMEOUT)
+        val unsupported = SessionOpenFailure(SessionOpenFailureCode.SNAPSHOT_UNSUPPORTED)
+
+        assertFalse(terminalSnapshotReadinessBlocksChunkFallback(0uL, timeout))
+        assertTrue(terminalSnapshotReadinessBlocksChunkFallback(1uL, timeout))
+        assertFalse(terminalSnapshotReadinessBlocksChunkFallback(1uL, unsupported))
+        assertFalse(terminalSnapshotReadinessBlocksChunkFallback(1uL, failure = null))
+    }
+
+    @Test
+    fun unsupportedSnapshotStillFallsBackWithoutThrowing() = runBlocking {
+        data class Observation(val tail: ULong, val failure: SessionOpenFailure?)
+        var attempts = 0
+        val unsupported = SessionOpenFailure(SessionOpenFailureCode.SNAPSHOT_UNSUPPORTED)
+
+        val result = awaitTerminalSnapshotReadiness<Observation, String>(
+            latestObservation = {
+                attempts += 1
+                Observation(tail = 46uL, failure = unsupported)
+            },
+            snapshotOf = { null },
+            lastOutputSequenceOf = Observation::tail,
+            failureOf = Observation::failure,
+            retryDelaysMillis = listOf(100L, 200L),
+            timeoutMillis = 1_000L,
+            pause = { error("unsupported readiness must not pause") },
+        )
+
+        assertNull(result.snapshot)
+        assertEquals(unsupported, result.failure)
+        assertEquals(1, attempts)
+        throwTerminalSnapshotReadinessFailureUnlessUnsupported(result.failure)
+    }
+
+    @Test
+    fun emptySessionSettlesReadinessWithoutReusingAnEarlierFailure() = runBlocking {
+        data class Observation(
+            val tail: ULong,
+            val failure: SessionOpenFailure?,
+        )
+        var attempts = 0
+
+        val result = awaitTerminalSnapshotReadiness<Observation, String>(
+            latestObservation = {
+                attempts += 1
+                if (attempts == 1) {
+                    Observation(52uL, SessionOpenFailure(SessionOpenFailureCode.SNAPSHOT_STALE))
+                } else {
+                    Observation(0uL, failure = null)
+                }
+            },
+            snapshotOf = { null },
+            lastOutputSequenceOf = Observation::tail,
+            failureOf = Observation::failure,
+            retryDelaysMillis = listOf(0L),
+            timeoutMillis = 1_000L,
+            pause = { },
+        )
+
+        assertNull(result.snapshot)
+        assertNull(result.failure)
+        assertEquals(2, attempts)
+    }
+
+    @Test
+    fun readinessExhaustionWithoutAFailureStillUsesTheExistingFallback() = runBlocking {
+        data class Observation(val tail: ULong)
+        var attempts = 0
+
+        val result = awaitTerminalSnapshotReadiness<Observation, String>(
+            latestObservation = {
+                attempts += 1
+                Observation(tail = 52uL)
+            },
+            snapshotOf = { null },
+            lastOutputSequenceOf = Observation::tail,
+            failureOf = { null },
+            retryDelaysMillis = listOf(0L),
+            timeoutMillis = 1_000L,
+            pause = { },
+        )
+
+        assertNull(result.snapshot)
+        assertNull(result.failure)
+        assertEquals(2, attempts)
+        throwTerminalSnapshotReadinessFailureUnlessUnsupported(result.failure)
+    }
+
+    @Test
+    fun callerCancellationPropagatesFromTerminalSnapshotReadiness() {
+        data class Observation(val tail: ULong)
+        val cancellation = CancellationException("terminal snapshot readiness cancelled")
+
+        val thrown = assertThrows(CancellationException::class.java) {
+            runBlocking {
+                awaitTerminalSnapshotReadiness<Observation, String>(
+                    latestObservation = { throw cancellation },
+                    snapshotOf = { null },
+                    lastOutputSequenceOf = Observation::tail,
+                    failureOf = { null },
+                    retryDelaysMillis = listOf(100L),
+                    timeoutMillis = 1_000L,
+                    pause = { error("cancelled readiness must not pause") },
+                )
+            }
+        }
+
+        assertEquals("terminal snapshot readiness cancelled", thrown.message)
+    }
+
+    @Test
+    fun authenticationGenerationChangeCannotBecomeARetryableSnapshotFailure() {
+        data class Observation(val tail: ULong)
+        val authentication = AuthenticationLifecycleFence()
+        val capturedGeneration = authentication.capture()
+        var attempts = 0
+
+        val thrown = assertThrows(IllegalStateException::class.java) {
+            runBlocking {
+                awaitTerminalSnapshotReadiness<Observation, String>(
+                    latestObservation = {
+                        attempts += 1
+                        authentication.invalidate()
+                        throw java.net.SocketTimeoutException("old account request retired")
+                    },
+                    snapshotOf = { null },
+                    lastOutputSequenceOf = Observation::tail,
+                    failureOf = { null },
+                    retryDelaysMillis = listOf(0L, 0L),
+                    timeoutMillis = 1_000L,
+                    pause = { error("a retired authentication generation must not retry") },
+                    ensureObservationContext = {
+                        check(authentication.isCurrent(capturedGeneration)) {
+                            "Authentication lifecycle changed"
+                        }
+                    },
+                    observationFailure = {
+                        SessionOpenFailure(SessionOpenFailureCode.SERVICE_TIMEOUT)
+                    },
+                )
+            }
+        }
+
+        assertEquals("Authentication lifecycle changed", thrown.message)
+        assertEquals(1, attempts)
     }
 
     @Test

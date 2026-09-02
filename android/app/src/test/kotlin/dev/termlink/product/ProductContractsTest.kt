@@ -25,11 +25,28 @@ import kotlinx.serialization.json.putJsonArray
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import okhttp3.OkHttpClient
 
 class ProductContractsTest {
+    @Test
+    fun directShadowUsesAnIndependentHttpResourceDomainFromRelay() {
+        val relay = OkHttpClient()
+        val direct = createIsolatedDirectShadowHttpClient(relay)
+        try {
+            assertNotSame(relay.dispatcher, direct.dispatcher)
+            assertNotSame(relay.connectionPool, direct.connectionPool)
+        } finally {
+            relay.dispatcher.executorService.shutdownNow()
+            relay.connectionPool.evictAll()
+            direct.dispatcher.executorService.shutdownNow()
+            direct.connectionPool.evictAll()
+        }
+    }
+
     @Test
     fun realtimeForegroundLifecycleKeepsEarliestBackgroundAndDeduplicatesGeneration() {
         val initial = observeRealtimeAppForeground(RealtimeAppLifecycleState(), 1, 1_000)

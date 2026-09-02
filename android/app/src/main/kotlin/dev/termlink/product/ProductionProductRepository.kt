@@ -633,6 +633,17 @@ private const val REMOTE_FILE_PATH_MAX_BYTES = 4_096
 private const val REMOTE_FILE_LIST_PAGE_MAX_ENTRIES = 500
 private const val AGENT_UPDATE_POLL_INTERVAL_MILLIS = 1_000L
 
+internal fun createIsolatedDirectShadowHttpClient(relayClient: OkHttpClient): OkHttpClient {
+    val directClient = OkHttpClient()
+    check(directClient.dispatcher !== relayClient.dispatcher) {
+        "Direct shadow must not share the Relay dispatcher"
+    }
+    check(directClient.connectionPool !== relayClient.connectionPool) {
+        "Direct shadow must not share the Relay connection pool"
+    }
+    return directClient
+}
+
 internal class ProductionProductRepository(
     private val context: Context,
     private val activityProvider: () -> Activity?,
@@ -644,6 +655,10 @@ internal class ProductionProductRepository(
     private val historyRepository = HistoryRepository(database)
     private val authService = AuthorizationService(context)
     private val http = OkHttpClient()
+    // Direct is an optional shadow path. Give its blocking REST calls and
+    // signalling WebSocket an independent dispatcher/connection pool so a
+    // black-holed STUN/signalling attempt cannot consume Relay's HTTP budget.
+    private val directShadowHttp = createIsolatedDirectShadowHttpClient(http)
     private val remoteDownloadStore: RemoteDownloadRecordStore =
         SharedPreferencesRemoteDownloadRecordStore(context)
     private val storedRemoteDownloads = remoteDownloadStore.load()
@@ -670,6 +685,11 @@ internal class ProductionProductRepository(
     // occupies Main. Session renderers have their own per-session lanes.
     private val realtimeRuntimeScope = CoroutineScope(
         SupervisorJob() + Dispatchers.Default.limitedParallelism(1),
+    )
+    // Direct performs bounded but blocking control-plane and native work. It
+    // must never occupy the single Relay/router permit above.
+    private val directShadowRuntimeScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO.limitedParallelism(1),
     )
     private val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
     private val realtimeNetworkLock = Any()
@@ -1800,6 +1820,7 @@ internal class ProductionProductRepository(
                     pcDevice = pcDevice,
                     stored = stored,
                     engine = engine,
+                    authenticationGeneration = authenticationGeneration,
                     allowFreshReplayFromZero = sessionId in newlyLaunchedSessionIds,
                 )
             }
@@ -4375,6 +4396,26 @@ internal class ProductionProductRepository(
     private suspend fun closeRetiredRealtimeRuntimeAndJoin(retired: RetiredRealtimeRuntime) {
         withContext(NonCancellable) {
             var firstFailure: Throwable? = null
+            // Signal every independent runtime before awaiting any one of them.
+            // A black-holed Direct control-plane request must not delay Relay
+            // socket closure or keep live sessions attached during auth switch.
+            try {
+                retired.directShadow?.close()
+            } catch (error: Throwable) {
+                firstFailure = firstFailure ?: error
+            }
+            retired.sessions.forEach { session ->
+                try {
+                    session.close()
+                } catch (error: Throwable) {
+                    firstFailure = firstFailure ?: error
+                }
+            }
+            try {
+                retired.multiplexer?.close()
+            } catch (error: Throwable) {
+                firstFailure = firstFailure ?: error
+            }
             try {
                 retired.directShadow?.closeAndJoin()
             } catch (error: Throwable) {
@@ -4386,11 +4427,6 @@ internal class ProductionProductRepository(
                 } catch (error: Throwable) {
                     firstFailure = firstFailure ?: error
                 }
-            }
-            try {
-                retired.multiplexer?.close()
-            } catch (error: Throwable) {
-                firstFailure = firstFailure ?: error
             }
             firstFailure?.let { throw it }
         }
@@ -4524,8 +4560,8 @@ internal class ProductionProductRepository(
                     identity = stored.identity,
                     relayEvents = candidate.directRelayConnectionEvents,
                     connectivityManager = connectivityManager,
-                    parentScope = realtimeRuntimeScope,
-                    httpClient = http,
+                    parentScope = directShadowRuntimeScope,
+                    httpClient = directShadowHttp,
                     allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
                 )
             } else {
@@ -4665,6 +4701,7 @@ internal class ProductionProductRepository(
         }
         closeLiveSessions()
         realtimeRuntimeScope.cancel()
+        directShadowRuntimeScope.cancel()
         closeHistoryEngines()
         val closingDownloadJobs = remoteDownloadJobs.values.toList()
         val closingRecoveryJob = remoteDownloadRecoveryJob
@@ -4692,17 +4729,22 @@ internal class ProductionProductRepository(
             storedIdentity = null
             authService.dispose()
             database.close()
-            http.dispatcher.cancelAll()
-            val executor = http.dispatcher.executorService
-            val connectionPool = http.connectionPool
-            thread(start = true, isDaemon = true, name = "TermLink-OkHttp-Close") {
-                try {
-                    connectionPool.evictAll()
-                } finally {
-                    executor.shutdown()
-                }
-            }
+            closeOkHttpClient(http, "TermLink-OkHttp-Close")
+            closeOkHttpClient(directShadowHttp, "TermLink-Direct-OkHttp-Close")
             scope.cancel()
+        }
+    }
+
+    private fun closeOkHttpClient(client: OkHttpClient, threadName: String) {
+        client.dispatcher.cancelAll()
+        val executor = client.dispatcher.executorService
+        val connectionPool = client.connectionPool
+        thread(start = true, isDaemon = true, name = threadName) {
+            try {
+                connectionPool.evictAll()
+            } finally {
+                executor.shutdown()
+            }
         }
     }
 
@@ -5349,6 +5391,7 @@ internal class ProductionProductRepository(
         pcDevice: DeviceSummary,
         stored: DeviceKeyVault.StoredIdentity,
         engine: NativeTerminalEngine,
+        authenticationGeneration: Long,
     ): RestoredLiveHistory? {
         val bound = try {
             historyRepository.rendererCheckpointState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
@@ -5371,7 +5414,7 @@ internal class ProductionProductRepository(
             bound.snapshot.ciphertext.fill(0)
             return null
         }
-        val tail = latestAuthoritativeSessionTail(session)
+        val tail = latestAuthoritativeSessionTail(session, authenticationGeneration)
         if (tail == null) {
             bound.snapshot.ciphertext.fill(0)
             return null
@@ -5411,7 +5454,7 @@ internal class ProductionProductRepository(
                     ) { "Installed native checkpoint does not match its durable binding" }
                     var restored = bound.snapshotSequence
                     var localInputEpoch = opened.observedLocalInputEpoch.toLong()
-                    var currentTail = latestAuthoritativeSessionTail(session)
+                    var currentTail = latestAuthoritativeSessionTail(session, authenticationGeneration)
                         ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_NOT_READY)
                     if (currentTail < bound.durableAcknowledgement) {
                         throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
@@ -5443,6 +5486,7 @@ internal class ProductionProductRepository(
                                 session = session,
                                 pc = pc,
                                 stored = stored,
+                                authenticationGeneration = authenticationGeneration,
                                 minimumTarget = requiredTarget,
                                 stopAfterSequence = restored,
                                 validateTargetBeforeCaching = { target ->
@@ -5480,7 +5524,7 @@ internal class ProductionProductRepository(
                         )
                         restored = progress.restoredThrough
                         localInputEpoch = progress.localInputEpoch
-                        currentTail = latestAuthoritativeSessionTail(session)
+                        currentTail = latestAuthoritativeSessionTail(session, authenticationGeneration)
                             ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_NOT_READY)
                         if (currentTail < bound.durableAcknowledgement) {
                             throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
@@ -5546,6 +5590,7 @@ internal class ProductionProductRepository(
         pcDevice: DeviceSummary,
         stored: DeviceKeyVault.StoredIdentity,
         engine: NativeTerminalEngine,
+        authenticationGeneration: Long,
         expectedRendererGeneration: Long,
         descriptor: SnapshotDownloadDescriptor,
     ): RestoredLiveHistory? {
@@ -5585,7 +5630,7 @@ internal class ProductionProductRepository(
                 sealedObject,
             )
             try {
-                val confirmedTail = latestAuthoritativeSessionTail(session) ?: return null
+                val confirmedTail = latestAuthoritativeSessionTail(session, authenticationGeneration) ?: return null
                 if (!snapshotHasBoundedLiveSuffix(sequence, confirmedTail)) return null
                 return withContext(NonCancellable) {
                     val bound = historyRepository.bindRendererCheckpoint(
@@ -5773,8 +5818,12 @@ internal class ProductionProductRepository(
         stored: DeviceKeyVault.StoredIdentity,
         authoritativeKeyEpoch: Long,
         minimumSnapshotSequence: ULong = 0uL,
+        expectedAuthenticationGeneration: Long? = null,
     ): TerminalSnapshotReadinessObservation? {
-        return withApi(terminalSnapshotReadinessHttp) { api ->
+        return withAuthenticatedApi(
+            httpClient = terminalSnapshotReadinessHttp,
+            expectedGeneration = expectedAuthenticationGeneration,
+        ) { api, _ ->
             // The session list can become visible before its final snapshot is
             // committed. Refresh only this PC's authoritative session metadata
             // on every bounded readiness attempt, including when the first
@@ -5859,8 +5908,13 @@ internal class ProductionProductRepository(
         }
     }
 
-    private suspend fun latestAuthoritativeSessionTail(initialSession: SessionSummary): ULong? =
-        withApi(terminalSnapshotReadinessHttp) { api ->
+    private suspend fun latestAuthoritativeSessionTail(
+        initialSession: SessionSummary,
+        expectedAuthenticationGeneration: Long? = null,
+    ): ULong? = withAuthenticatedApi(
+        httpClient = terminalSnapshotReadinessHttp,
+        expectedGeneration = expectedAuthenticationGeneration,
+    ) { api, _ ->
             ProductResponseParser.itemObjects(
                 api.get("/v1/pcs/${initialSession.pcId}/sessions").jsonObject,
             ).map { it.toSession() }
@@ -5945,10 +5999,14 @@ internal class ProductionProductRepository(
         session: SessionSummary,
         pc: PcSummary,
         stored: DeviceKeyVault.StoredIdentity,
+        authenticationGeneration: Long,
         minimumTarget: ULong,
         stopAfterSequence: ULong,
         validateTargetBeforeCaching: (ULong) -> Unit = {},
-    ): ULong = withApi(terminalSnapshotReadinessHttp) { api ->
+    ): ULong = withAuthenticatedApi(
+        httpClient = terminalSnapshotReadinessHttp,
+        expectedGeneration = authenticationGeneration,
+    ) { api, _ ->
         require(minimumTarget > stopAfterSequence) { "Streamed history target must advance" }
 
         val firstResponse = awaitStreamedHistoryCatalogHead(
@@ -6297,13 +6355,14 @@ internal class ProductionProductRepository(
         pcDevice: DeviceSummary,
         stored: DeviceKeyVault.StoredIdentity,
         engine: NativeTerminalEngine,
+        authenticationGeneration: Long,
         allowFreshReplayFromZero: Boolean = false,
     ): RestoredLiveHistory {
         val cursor = historyRepository.ackCursorState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
             ?: historyRepository.initializeAckCursor(session.id, LIVE_OUTPUT_ACK_DIRECTION)
         if (allowFreshReplayFromZero && cursor.sequence == 0uL) {
             val currentTail = try {
-                latestAuthoritativeSessionTail(session)
+                latestAuthoritativeSessionTail(session, authenticationGeneration)
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
@@ -6328,45 +6387,72 @@ internal class ProductionProductRepository(
         restoreReplaceableBoundOrRemoteCheckpoint(
             negotiated = terminalSnapshotNegotiated,
             restoreBound = {
-                restoreBoundNativeTerminalCheckpoint(session, pc, pcDevice, stored, engine)
+                restoreBoundNativeTerminalCheckpoint(
+                    session,
+                    pc,
+                    pcDevice,
+                    stored,
+                    engine,
+                    authenticationGeneration,
+                )
             },
             abandonRenderer = { resetAbandonedSnapshotRenderer(session, engine) },
             restoreRemote = {
-                val remoteSnapshot = withTimeoutOrNull(TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS) {
-                    var lastObservation: TerminalSnapshotReadinessObservation? = null
-                    for (pauseMillis in TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS) {
-                        currentCoroutineContext().ensureActive()
-                        val observation = latestTerminalSnapshot(
+                val readiness = awaitTerminalSnapshotReadiness(
+                    latestObservation = {
+                        latestTerminalSnapshot(
                             session,
                             stored,
                             pc.keyEpoch,
                             minimumSnapshotSequence = cursor.sequence,
+                            expectedAuthenticationGeneration = authenticationGeneration,
                         )
-                        lastObservation = observation
-                        if (observation?.snapshot != null ||
-                            observation?.lastOutputSequence == 0uL ||
-                            observation?.failure?.code == SessionOpenFailureCode.SNAPSHOT_UNSUPPORTED
-                        ) break
-                        delay(pauseMillis)
-                    }
-                    lastObservation?.snapshot
-                }
-                remoteSnapshot?.let { descriptor ->
+                    },
+                    snapshotOf = TerminalSnapshotReadinessObservation::snapshot,
+                    lastOutputSequenceOf = TerminalSnapshotReadinessObservation::lastOutputSequence,
+                    failureOf = TerminalSnapshotReadinessObservation::failure,
+                    retryDelaysMillis = TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS,
+                    timeoutMillis = TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS,
+                    ensureObservationContext = {
+                        requireCurrentAuthentication(authenticationGeneration)
+                    },
+                    observationFailure = { error ->
+                        classifySessionOpenException(
+                            error,
+                            SessionFailureStage.SNAPSHOT_METADATA,
+                        ).failure
+                    },
+                )
+                val descriptor = readiness.snapshot
+                if (descriptor != null) {
                     restoreRemoteNativeTerminalSnapshot(
                         session = session,
                         pc = pc,
                         pcDevice = pcDevice,
                         stored = stored,
                         engine = engine,
+                        authenticationGeneration = authenticationGeneration,
                         expectedRendererGeneration = cursor.rendererGeneration,
                         descriptor = descriptor,
                     )
+                } else {
+                    // ACK zero can still use the complete Chunk compatibility
+                    // path below. A positive durable ACK cannot safely rewind
+                    // to zero, so retain the latest actionable Snapshot error.
+                    if (terminalSnapshotReadinessBlocksChunkFallback(
+                            cursor.sequence,
+                            readiness.failure,
+                        )
+                    ) {
+                        throwTerminalSnapshotReadinessFailureUnlessUnsupported(readiness.failure)
+                    }
+                    null
                 }
             },
         )?.let { return it }
 
         val latestAuthoritativeTail = try {
-            latestAuthoritativeSessionTail(session)
+            latestAuthoritativeSessionTail(session, authenticationGeneration)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
@@ -6402,6 +6488,7 @@ internal class ProductionProductRepository(
                     session = session,
                     pc = pc,
                     stored = stored,
+                    authenticationGeneration = authenticationGeneration,
                     // Restore every newly durable prefix immediately instead
                     // of waiting for the catalog to catch the authoritative
                     // tail in one step. This keeps both memory and latency
@@ -6425,7 +6512,7 @@ internal class ProductionProductRepository(
                 restored = progress.restoredThrough
                 localInputEpoch = progress.localInputEpoch
 
-                val currentTail = latestAuthoritativeSessionTail(session)
+                val currentTail = latestAuthoritativeSessionTail(session, authenticationGeneration)
                     ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_NOT_READY)
                 if (tailReplayHasBoundedRealtimeSuffix(restored, currentTail)) break
                 if (currentTail <= restored) {
@@ -7977,6 +8064,99 @@ internal fun snapshotReadinessIsSettled(
     return snapshotAvailable
 }
 
+internal data class TerminalSnapshotReadinessResult<out Snapshot>(
+    val snapshot: Snapshot?,
+    val failure: SessionOpenFailure?,
+)
+
+/**
+ * Keeps the latest actionable metadata failure across the bounded publication
+ * wait while still allowing a later successful Snapshot to win. Caller
+ * cancellation is never converted into readiness exhaustion.
+ *
+ * Reference audit: termux/termux-app@3df69d1da197dd9bd71a3bafd902dffd720576b4
+ * has no remote Snapshot readiness path to reuse. Its local TerminalSession,
+ * network, and authentication architecture are explicitly out of scope here;
+ * only the boundary that transient peripheral failure must not corrupt or
+ * replace renderer state is used as behavioral guidance.
+ */
+internal suspend fun <Observation, Snapshot> awaitTerminalSnapshotReadiness(
+    latestObservation: suspend () -> Observation?,
+    snapshotOf: (Observation) -> Snapshot?,
+    lastOutputSequenceOf: (Observation) -> ULong,
+    failureOf: (Observation) -> SessionOpenFailure?,
+    retryDelaysMillis: List<Long>,
+    timeoutMillis: Long,
+    pause: suspend (Long) -> Unit = { delay(it) },
+    ensureObservationContext: () -> Unit = {},
+    observationFailure: ((Exception) -> SessionOpenFailure)? = null,
+): TerminalSnapshotReadinessResult<Snapshot> {
+    require(retryDelaysMillis.all { it >= 0L }) { "Snapshot readiness delays must not be negative" }
+    require(timeoutMillis > 0L) { "Snapshot readiness timeout must be positive" }
+
+    var settled: TerminalSnapshotReadinessResult<Snapshot>? = null
+    var lastFailure: SessionOpenFailure? = null
+    suspend fun poll() {
+        for (attempt in 0..retryDelaysMillis.size) {
+            currentCoroutineContext().ensureActive()
+            ensureObservationContext()
+            val observation = try {
+                latestObservation()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                // Do not downgrade an authentication/account generation switch
+                // into a retryable Snapshot metadata failure.
+                ensureObservationContext()
+                val classifier = observationFailure ?: throw error
+                lastFailure = classifier(error)
+                null
+            }
+            ensureObservationContext()
+            if (observation != null) {
+                val snapshot = snapshotOf(observation)
+                val failure = failureOf(observation)
+                when {
+                    snapshot != null -> {
+                        settled = TerminalSnapshotReadinessResult(snapshot, failure = null)
+                        return
+                    }
+                    lastOutputSequenceOf(observation) == 0uL -> {
+                        settled = TerminalSnapshotReadinessResult(snapshot = null, failure = null)
+                        return
+                    }
+                    failure?.code == SessionOpenFailureCode.SNAPSHOT_UNSUPPORTED -> {
+                        settled = TerminalSnapshotReadinessResult(snapshot = null, failure = failure)
+                        return
+                    }
+                    else -> lastFailure = failure
+                }
+            }
+            if (attempt < retryDelaysMillis.size) {
+                ensureObservationContext()
+                pause(retryDelaysMillis[attempt])
+                ensureObservationContext()
+            }
+        }
+    }
+
+    withTimeoutOrNull(timeoutMillis) { poll() }
+    return settled ?: TerminalSnapshotReadinessResult(snapshot = null, failure = lastFailure)
+}
+
+internal fun throwTerminalSnapshotReadinessFailureUnlessUnsupported(failure: SessionOpenFailure?) {
+    if (failure != null && failure.code != SessionOpenFailureCode.SNAPSHOT_UNSUPPORTED) {
+        throw SessionOpenException(failure)
+    }
+}
+
+internal fun terminalSnapshotReadinessBlocksChunkFallback(
+    durableAcknowledgement: ULong,
+    failure: SessionOpenFailure?,
+): Boolean = failure != null &&
+    failure.code != SessionOpenFailureCode.SNAPSHOT_UNSUPPORTED &&
+    !fullPrefixReplayCanPreserveDurableAcknowledgement(durableAcknowledgement)
+
 internal const val SESSION_BOOTSTRAP_IN_PROGRESS_REASON = "snapshot bootstrap in progress"
 internal const val SESSION_BOOTSTRAP_FAILED_REASON = "snapshot bootstrap failed"
 
@@ -8003,7 +8183,7 @@ internal val TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS =
         2_000L, 2_000L, 2_000L, 2_000L, 2_000L, 2_000L, 2_000L,
     )
 internal const val TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS = 30_000L
-internal const val TERMINAL_SNAPSHOT_READINESS_REQUEST_TIMEOUT_MILLIS = 1_000L
+internal const val TERMINAL_SNAPSHOT_READINESS_REQUEST_TIMEOUT_MILLIS = 5_000L
 internal const val TRANSCRIPT_PAGE_LOAD_FAILED_CODE = "TRANSCRIPT_PAGE_LOAD_FAILED"
 internal const val TRANSCRIPT_PUBLICATION_READINESS_TIMEOUT_MILLIS =
     TERMINAL_STREAMED_REPLAY_READINESS_TIMEOUT_MILLIS

@@ -79,6 +79,31 @@ class ProductionDirectMultipairV4RuntimeTest {
             assertEquals(runtime.snapshot.value.toString(), ProductionDirectShadowState.SHADOW_READY_NOT_ROUTED, runtime.snapshot.value.state)
             assertEquals(relayGeneration, runtime.snapshot.value.relayGeneration)
             assertFalse(runtime.snapshot.value.directRoutingPermitted)
+            val diagnostic = runtime.diagnostic.value
+            assertEquals(ProductionDirectShadowState.SHADOW_READY_NOT_ROUTED, diagnostic.state)
+            assertEquals(1, diagnostic.selectedPairRank)
+            assertEquals(
+                ProductionDirectShadowDiagnosticCandidateKind.HOST,
+                diagnostic.localCandidateKind,
+            )
+            assertEquals(
+                ProductionDirectShadowDiagnosticCandidateKind.HOST,
+                diagnostic.remoteCandidateKind,
+            )
+            assertFalse(diagnostic.directRoutingPermitted)
+            val diagnosticText = diagnostic.toString()
+            listOf(
+                androidId.toString(),
+                pcId.toString(),
+                runtime.snapshot.value.attemptId.toString(),
+                "192.168.1.10",
+                "192.168.1.20",
+                "50010",
+                androidKeyId,
+                pcKeyId,
+            ).forEach { sentinel ->
+                assertFalse("diagnostic leaked sentinel: $sentinel in $diagnosticText", diagnosticText.contains(sentinel))
+            }
             assertEquals(listOf(false), signaling.offerGatheringStates)
             assertTrue(signaling.candidateUpdates.last())
             assertTrue(native.beginBeforeGatherComplete)
@@ -108,6 +133,16 @@ class ProductionDirectMultipairV4RuntimeTest {
             assertTrue(native.submittedPairs.size >= 5)
             assertEquals(5, native.committedPair?.rank)
             assertEquals(92, runtime.snapshot.value.relayGeneration)
+            assertEquals(5, runtime.diagnostic.value.selectedPairRank)
+            assertEquals(
+                diagnosticKind(native.committedPair!!.initiator.kind),
+                runtime.diagnostic.value.localCandidateKind,
+            )
+            assertEquals(
+                diagnosticKind(native.committedPair!!.responder.kind),
+                runtime.diagnostic.value.remoteCandidateKind,
+            )
+            assertFalse(runtime.diagnostic.value.directRoutingPermitted)
             assertEquals(0, signaling.relayMutations)
         } finally {
             peer.close()
@@ -161,6 +196,9 @@ class ProductionDirectMultipairV4RuntimeTest {
             assertEquals(ProductionDirectShadowState.RELAY_ONLY, runtime.snapshot.value.state)
             assertEquals("DIRECT_V4_NOMINATION_ACK_REJECTED", runtime.snapshot.value.reasonCode)
             assertEquals(94, runtime.snapshot.value.relayGeneration)
+            assertEquals(ProductionDirectShadowState.RELAY_ONLY, runtime.diagnostic.value.state)
+            assertEquals("DIRECT_V4_NOMINATION_ACK_REJECTED", runtime.diagnostic.value.reasonCode)
+            assertFalse(runtime.diagnostic.value.directRoutingPermitted)
             assertEquals(0, signaling.relayMutations)
         } finally {
             peer.close()
@@ -258,6 +296,14 @@ class ProductionDirectMultipairV4RuntimeTest {
     private fun assertPairIds(pair: DirectNativeCandidatePairV4, initiator: Int, responder: Int) {
         assertEquals(initiator.toByte(), pair.initiator.candidateId.first())
         assertEquals(responder.toByte(), pair.responder.candidateId.first())
+    }
+
+    private fun diagnosticKind(
+        value: DirectNativeCandidateKindV4,
+    ): ProductionDirectShadowDiagnosticCandidateKind = when (value) {
+        DirectNativeCandidateKindV4.HOST -> ProductionDirectShadowDiagnosticCandidateKind.HOST
+        DirectNativeCandidateKindV4.SERVER_REFLEXIVE ->
+            ProductionDirectShadowDiagnosticCandidateKind.SRFLX
     }
 
     private fun runtime(
@@ -399,12 +445,12 @@ class ProductionDirectMultipairV4RuntimeTest {
         override val multipairV2Active: Boolean
             get() = nativeV4Available && multipairCapability
 
-        override fun fetchConfig(): DirectSignalingCallResult<DirectTransportServerConfig> =
+        override suspend fun fetchConfig(): DirectSignalingCallResult<DirectTransportServerConfig> =
             DirectSignalingCallResult.Success(config(multipairCapability))
 
         override fun start(): Boolean = true
 
-        override fun issueTicket(
+        override suspend fun issueTicket(
             targetDeviceId: UUID,
             connectionId: UUID,
             config: DirectTransportServerConfig,

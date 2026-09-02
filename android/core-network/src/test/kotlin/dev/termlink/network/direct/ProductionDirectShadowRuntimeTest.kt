@@ -21,12 +21,15 @@ import dev.termlink.protocol.transport.v1.DirectPathTicketV1
 import dev.termlink.protocol.transport.v1.TransportSignalEnvelopeV1
 import dev.termlink.protocol.transport.v1.TransportSignalPayloadV1
 import dev.termlink.protocol.transport.v1.TransportSignalTypeV1
+import java.lang.reflect.Modifier
 import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -74,6 +77,34 @@ class ProductionDirectShadowRuntimeTest {
             assertFalse(runtime.directRoutingPermitted)
             assertEquals(41, snapshot.relayGeneration)
             assertEquals(pcId, snapshot.peerDeviceId)
+            val diagnostic = runtime.diagnostic.value
+            assertEquals(ProductionDirectShadowState.SHADOW_READY_NOT_ROUTED, diagnostic.state)
+            assertEquals("NONE", diagnostic.reasonCode)
+            assertEquals(AUTH_GENERATION, diagnostic.authenticationGeneration)
+            assertEquals(41, diagnostic.relayGeneration)
+            assertEquals(1L, diagnostic.networkGeneration)
+            assertEquals(31L, diagnostic.pathEpoch)
+            assertEquals(1, diagnostic.selectedPairRank)
+            assertEquals(
+                ProductionDirectShadowDiagnosticCandidateKind.HOST,
+                diagnostic.localCandidateKind,
+            )
+            assertEquals(
+                ProductionDirectShadowDiagnosticCandidateKind.HOST,
+                diagnostic.remoteCandidateKind,
+            )
+            assertFalse(diagnostic.directRoutingPermitted)
+            assertDiagnosticExcludes(
+                diagnostic,
+                androidId.toString(),
+                pcId.toString(),
+                snapshot.attemptId.toString(),
+                "192.168.1.10",
+                "192.168.1.20",
+                "50001",
+                "pc-key-epoch-3",
+                "SENTINEL_TERMINAL_INPUT_OUTPUT",
+            )
             assertEquals(listOf("gather", "mark", "nominate", "sign"), native.actions)
             assertEquals(101L, native.gatherRequest?.networkHandle)
             assertEquals(101L, native.nominationNetworkHandle)
@@ -328,6 +359,8 @@ class ProductionDirectShadowRuntimeTest {
             )
 
             assertTrue(runtime.observeCapturedNetwork(AUTH_GENERATION, network(1, 202L)))
+            assertEquals("DIRECT_NETWORK_CHANGED", runtime.diagnostic.value.reasonCode)
+            assertFalse(runtime.diagnostic.value.directRoutingPermitted)
             advanceTimeBy(100)
             runCurrent()
             assertEquals(1, native.networkChangedCalls)
@@ -345,6 +378,10 @@ class ProductionDirectShadowRuntimeTest {
 
             assertTrue(runtime.observeRelayConnected(AUTH_GENERATION, 0))
             assertEquals(ProductionDirectShadowState.WAITING_FOR_RELAY, runtime.snapshot.value.state)
+            assertEquals(ProductionDirectShadowState.WAITING_FOR_RELAY, runtime.diagnostic.value.state)
+            assertEquals("RELAY_UNAVAILABLE", runtime.diagnostic.value.reasonCode)
+            assertEquals(0, runtime.diagnostic.value.relayGeneration)
+            assertFalse(runtime.diagnostic.value.directRoutingPermitted)
             relay.disconnectExternally()
             assertEquals(0, relay.disconnectCalls)
             assertEquals(0, relay.reconnectCalls)
@@ -355,6 +392,108 @@ class ProductionDirectShadowRuntimeTest {
             identity.destroy()
         }
         assertEquals(2, native.closeCalls)
+    }
+
+    @Test
+    fun positiveRelayGenerationReplacementRetiresAndRebuildsTheExactAttempt() = runTest {
+        val identity = DeviceIdentity.generate(FixedSecureRandom())
+        val firstNative = FakeNative(holdBeforeShadowReady = true)
+        val secondNative = FakeNative(holdBeforeShadowReady = true)
+        val signaling = FakeSignaling(now, androidId, pcId, pairwise)
+        var nativeCalls = 0
+        val runtime = ProductionDirectShadowRuntime(
+            enabled = true,
+            authenticationGeneration = AUTH_GENERATION,
+            localDeviceId = androidId,
+            identity = identity,
+            relayEvents = emptyFlow<ProductionRealtimeSessionConnectionEvent>(),
+            signalingFactory = { _ -> signaling },
+            nativeFactory = { if (nativeCalls++ == 0) firstNative else secondNative },
+            platform = FakePlatform(),
+            parentScope = this,
+            clockMillis = { now },
+            random = FixedSecureRandom(),
+            pollDelay = ProductionDirectShadowDelay { kotlinx.coroutines.delay(it) },
+            retryDelay = ProductionDirectShadowDelay { kotlinx.coroutines.awaitCancellation() },
+            uuidSource = DeterministicUuids(),
+        )
+        val callerPeer = peer()
+        try {
+            arm(runtime, callerPeer, relayGeneration = 77)
+            advanceTimeBy(100)
+            runCurrent()
+            assertTrue(firstNative.nominationNetworkHandle != 0L)
+
+            assertTrue(runtime.observeRelayConnected(AUTH_GENERATION, 78))
+            assertEquals(78, runtime.snapshot.value.relayGeneration)
+            assertEquals(0L, runtime.snapshot.value.pathEpoch)
+            assertEquals(null, runtime.snapshot.value.attemptId)
+            assertEquals(1, firstNative.cancelCalls)
+            assertEquals(1, firstNative.closeCalls)
+
+            advanceTimeBy(100)
+            runCurrent()
+            assertEquals(ProductionDirectShadowState.NEGOTIATING, runtime.snapshot.value.state)
+            assertEquals(78, runtime.snapshot.value.relayGeneration)
+            assertTrue(secondNative.nominationNetworkHandle != 0L)
+            assertEquals(2, nativeCalls)
+        } finally {
+            callerPeer.close()
+            runtime.closeAndJoin()
+            identity.destroy()
+        }
+    }
+
+    @Test
+    fun closeAndJoinCancelsAStalledPlatformPreparationAndClosesItsOwnedLane() = runTest {
+        val identity = DeviceIdentity.generate(FixedSecureRandom())
+        val signaling = FakeSignaling(now, androidId, pcId, pairwise)
+        val entered = CompletableDeferred<Unit>()
+        var platformCloseCalls = 0
+        val platform = object : ProductionDirectShadowPlatform {
+            override fun capture(network: android.net.Network): CapturedDirectNetwork? = null
+
+            override suspend fun prepare(
+                network: CapturedDirectNetwork,
+                stunServers: List<String>,
+            ): PreparedDirectGather {
+                entered.complete(Unit)
+                awaitCancellation()
+            }
+
+            override fun close() {
+                platformCloseCalls++
+            }
+        }
+        val runtime = ProductionDirectShadowRuntime(
+            enabled = true,
+            authenticationGeneration = AUTH_GENERATION,
+            localDeviceId = androidId,
+            identity = identity,
+            relayEvents = emptyFlow<ProductionRealtimeSessionConnectionEvent>(),
+            signalingFactory = { _ -> signaling },
+            nativeFactory = { FakeNative() },
+            platform = platform,
+            parentScope = this,
+            clockMillis = { now },
+            random = FixedSecureRandom(),
+            pollDelay = ProductionDirectShadowDelay { kotlinx.coroutines.delay(it) },
+            retryDelay = ProductionDirectShadowDelay { kotlinx.coroutines.awaitCancellation() },
+            uuidSource = DeterministicUuids(),
+        )
+        val callerPeer = peer()
+        try {
+            arm(runtime, callerPeer, relayGeneration = 91)
+            entered.await()
+            runtime.closeAndJoin()
+            assertEquals(1, platformCloseCalls)
+            assertEquals(ProductionDirectShadowState.STOPPED, runtime.snapshot.value.state)
+        } finally {
+            callerPeer.close()
+            runtime.closeAndJoin()
+            identity.destroy()
+        }
+        assertEquals(1, platformCloseCalls)
     }
 
     @Test
@@ -402,6 +541,137 @@ class ProductionDirectShadowRuntimeTest {
             command.destroy()
             command.request.localSendProbeHmacKey.fill(0)
             command.request.peerReceiveProbeHmacKey.fill(0)
+        }
+    }
+
+    @Test
+    fun timeoutAndFreeTextFailurePublishOnlyAllowlistedDiagnostics() = runTest {
+        val timeoutIdentity = DeviceIdentity.generate(FixedSecureRandom())
+        val timeoutNative = FakeNative(holdBeforeShadowReady = true)
+        val timeoutRuntime = runtime(
+            this,
+            timeoutIdentity,
+            FakeSignaling(now, androidId, pcId, pairwise),
+            timeoutNative,
+            FakePlatform(),
+        )
+        val timeoutPeer = peer()
+        try {
+            arm(timeoutRuntime, timeoutPeer, 101)
+            advanceTimeBy(12_100)
+            runCurrent()
+
+            val diagnostic = timeoutRuntime.diagnostic.value
+            assertEquals(ProductionDirectShadowState.RELAY_ONLY, diagnostic.state)
+            assertEquals("DIRECT_ATTEMPT_TIMEOUT", diagnostic.reasonCode)
+            assertFalse(diagnostic.directRoutingPermitted)
+        } finally {
+            timeoutPeer.close()
+            timeoutRuntime.closeAndJoin()
+            timeoutIdentity.destroy()
+        }
+
+        val exceptionSentinel =
+            "SENTINEL_ACCOUNT_DEVICE_ATTEMPT_198.51.100.77:54321_KEY_TOKEN_SIGNATURE_BODY"
+        val failureIdentity = DeviceIdentity.generate(FixedSecureRandom())
+        val failureRuntime = runtime(
+            this,
+            failureIdentity,
+            FakeSignaling(now, androidId, pcId, pairwise),
+            FakeNative(),
+            FakePlatform(exceptionSentinel),
+        )
+        val failurePeer = peer()
+        try {
+            arm(failureRuntime, failurePeer, 102)
+            advanceTimeBy(50)
+            runCurrent()
+
+            val diagnostic = failureRuntime.diagnostic.value
+            assertEquals(ProductionDirectShadowState.RELAY_ONLY, diagnostic.state)
+            assertEquals("DIRECT_SHADOW_FAILED", diagnostic.reasonCode)
+            assertDiagnosticExcludes(diagnostic, exceptionSentinel)
+            assertFalse(diagnostic.directRoutingPermitted)
+        } finally {
+            failurePeer.close()
+            failureRuntime.closeAndJoin()
+            failureIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun unknownDiagnosticReasonIsNormalizedToFixedFallback() {
+        val sentinel = "SENTINEL_FREE_TEXT_198.51.100.88:60000"
+        assertEquals(
+            DIRECT_SHADOW_DIAGNOSTIC_REASON_REDACTED,
+            normalizeProductionDirectShadowDiagnosticReason(sentinel),
+        )
+        assertEquals(
+            "DIRECT_NETWORK_CHANGED",
+            normalizeProductionDirectShadowDiagnosticReason("DIRECT_NETWORK_CHANGED"),
+        )
+        assertEquals("NONE", normalizeProductionDirectShadowDiagnosticReason(""))
+    }
+
+    @Test
+    fun diagnosticLogLineContainsOnlyTheRedactedPublicContract() {
+        val diagnostic = ProductionDirectShadowDiagnostic(
+            state = ProductionDirectShadowState.SHADOW_READY_NOT_ROUTED,
+            reasonCode = "NONE",
+            authenticationGeneration = 8,
+            relayGeneration = 5,
+            networkGeneration = 3,
+            pathEpoch = 42,
+            selectedPairRank = 2,
+            localCandidateKind = ProductionDirectShadowDiagnosticCandidateKind.HOST,
+            remoteCandidateKind = ProductionDirectShadowDiagnosticCandidateKind.SRFLX,
+        )
+
+        assertEquals(
+            "state=SHADOW_READY_NOT_ROUTED reason_code=NONE authentication_generation=8 " +
+                "relay_generation=5 network_generation=3 path_epoch=42 selected_pair_rank=2 " +
+                "local_candidate_type=HOST remote_candidate_type=SRFLX " +
+                "direct_routing_permitted=false",
+            diagnostic.toLogLine(),
+        )
+        assertDiagnosticExcludes(
+            diagnostic,
+            androidId.toString(),
+            pcId.toString(),
+            "192.168.1.10",
+            "50001",
+            "SENTINEL_TERMINAL_INPUT_OUTPUT",
+        )
+    }
+
+    @Test
+    fun diagnosticSchemaContainsOnlyReviewedRedactedFields() {
+        val fields = ProductionDirectShadowDiagnostic::class.java.declaredFields
+            .filterNot { it.isSynthetic || Modifier.isStatic(it.modifiers) }
+            .mapTo(sortedSetOf()) { it.name }
+        assertEquals(
+            sortedSetOf(
+                "state",
+                "reasonCode",
+                "authenticationGeneration",
+                "relayGeneration",
+                "networkGeneration",
+                "pathEpoch",
+                "selectedPairRank",
+                "localCandidateKind",
+                "remoteCandidateKind",
+            ),
+            fields,
+        )
+    }
+
+    private fun assertDiagnosticExcludes(
+        diagnostic: ProductionDirectShadowDiagnostic,
+        vararg sentinels: String,
+    ) {
+        val rendered = diagnostic.toString()
+        for (sentinel in sentinels) {
+            assertFalse("diagnostic leaked sentinel: $sentinel in $rendered", rendered.contains(sentinel))
         }
     }
 
@@ -534,7 +804,7 @@ class ProductionDirectShadowRuntimeTest {
 
         override val incoming: Flow<TransportSignalEnvelopeV1> = channel.receiveAsFlow()
         override val state: StateFlow<DirectTransportSignalingState> = mutableState
-        override fun fetchConfig(): DirectSignalingCallResult<DirectTransportServerConfig> =
+        override suspend fun fetchConfig(): DirectSignalingCallResult<DirectTransportServerConfig> =
             DirectSignalingCallResult.Success(config)
 
         override fun start(): Boolean {
@@ -542,7 +812,7 @@ class ProductionDirectShadowRuntimeTest {
             return true
         }
 
-        override fun issueTicket(
+        override suspend fun issueTicket(
             targetDeviceId: UUID,
             connectionId: UUID,
             config: DirectTransportServerConfig,
@@ -623,13 +893,16 @@ class ProductionDirectShadowRuntimeTest {
         }
     }
 
-    private class FakePlatform : ProductionDirectShadowPlatform {
+    private class FakePlatform(
+        private val failureMessage: String? = null,
+    ) : ProductionDirectShadowPlatform {
         override fun capture(network: android.net.Network): CapturedDirectNetwork? = null
 
         override suspend fun prepare(
             network: CapturedDirectNetwork,
             stunServers: List<String>,
         ): PreparedDirectGather {
+            failureMessage?.let { throw IllegalStateException(it) }
             assertTrue(network.handle > 0)
             assertEquals(listOf("stun:one.example:3478"), stunServers)
             return PreparedDirectGather(

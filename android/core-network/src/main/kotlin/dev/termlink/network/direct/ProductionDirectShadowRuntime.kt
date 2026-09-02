@@ -4,6 +4,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Build
+import android.util.Log
 import com.google.protobuf.ByteString
 import dev.termlink.crypto.DeviceIdentity
 import dev.termlink.crypto.DirectTransportCrypto
@@ -62,6 +63,11 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.security.Signature
 import java.util.UUID
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.Future
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -86,7 +92,10 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.suspendCancellableCoroutine
 import okhttp3.OkHttpClient
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /** Public state is diagnostic only. No state authorizes session or Envelope routing. */
 enum class ProductionDirectShadowState {
@@ -102,7 +111,7 @@ enum class ProductionDirectShadowState {
     STOPPED,
 }
 
-data class ProductionDirectShadowSnapshot(
+internal data class ProductionDirectShadowSnapshot(
     val state: ProductionDirectShadowState,
     val reasonCode: String = "",
     val authenticationGeneration: Long,
@@ -115,6 +124,145 @@ data class ProductionDirectShadowSnapshot(
     /** Shadow mode is deliberately incapable of changing the authoritative Relay route. */
     val directRoutingPermitted: Boolean
         get() = false
+}
+
+/** Coarse candidate kinds are the only path details allowed through the public diagnostic API. */
+enum class ProductionDirectShadowDiagnosticCandidateKind {
+    NONE,
+    HOST,
+    SRFLX,
+}
+
+/**
+ * Redacted, bounded Direct-shadow diagnostics that are safe to render or include in support logs.
+ *
+ * This contract deliberately contains no account, device, attempt, endpoint, key, token,
+ * signature, exception-message, signal-body, or terminal-content field. It is observational only:
+ * Direct shadow still cannot take ownership of Relay or route session traffic.
+ */
+@ConsistentCopyVisibility
+data class ProductionDirectShadowDiagnostic internal constructor(
+    val state: ProductionDirectShadowState,
+    val reasonCode: String,
+    val authenticationGeneration: Long,
+    val relayGeneration: Int,
+    val networkGeneration: Long,
+    val pathEpoch: Long,
+    val selectedPairRank: Int,
+    val localCandidateKind: ProductionDirectShadowDiagnosticCandidateKind,
+    val remoteCandidateKind: ProductionDirectShadowDiagnosticCandidateKind,
+) {
+    val directRoutingPermitted: Boolean
+        get() = false
+}
+
+internal const val DIRECT_SHADOW_DIAGNOSTIC_REASON_REDACTED = "DIRECT_REASON_REDACTED"
+
+private val SAFE_DIRECT_SHADOW_DIAGNOSTIC_REASONS = setOf(
+    "FEATURE_DISABLED",
+    "RELAY_UNAVAILABLE",
+    "STOPPED",
+    "DIRECT_ANSWER_REJECTED",
+    "DIRECT_ATTEMPT_RETIRED",
+    "DIRECT_ATTEMPT_TIMEOUT",
+    "DIRECT_AUTHORIZATION_CHANGED",
+    "DIRECT_CANDIDATE_COUNT_INVALID",
+    "DIRECT_CANDIDATE_EVENT_REJECTED",
+    "DIRECT_CANDIDATE_EXCHANGE_REJECTED",
+    "DIRECT_CANDIDATE_PAIR_UNAVAILABLE",
+    "DIRECT_CONFIG_REJECTED",
+    "DIRECT_IDENTITY_EVENT_REJECTED",
+    "DIRECT_NATIVE_EVENT_REJECTED",
+    "DIRECT_NATIVE_EVENT_STALE",
+    "DIRECT_NATIVE_FAILED",
+    "DIRECT_NATIVE_GATHER_FAILED",
+    "DIRECT_NATIVE_NOMINATION_FAILED",
+    "DIRECT_NATIVE_POLL_FAILED",
+    "DIRECT_NATIVE_UNAVAILABLE",
+    "DIRECT_NATIVE_V4_CHECK_PLAN_FAILED",
+    "DIRECT_NATIVE_V4_EVENT_OWNER_MISMATCH",
+    "DIRECT_NATIVE_V4_EVENT_REJECTED",
+    "DIRECT_NATIVE_V4_EVENT_STALE",
+    "DIRECT_NATIVE_V4_FAILED",
+    "DIRECT_NATIVE_V4_GATHER_FAILED",
+    "DIRECT_NATIVE_V4_NOMINATION_FAILED",
+    "DIRECT_NATIVE_V4_POLL_FAILED",
+    "DIRECT_NETWORK_CHANGED",
+    "DIRECT_NETWORK_OWNER_INVALID",
+    "DIRECT_NETWORK_UNAVAILABLE",
+    "DIRECT_NOMINATION_SEND_FAILED",
+    "DIRECT_OFFER_SEND_FAILED",
+    "DIRECT_RANDOM_SOURCE_INVALID",
+    "DIRECT_ROUTING_FORBIDDEN",
+    "DIRECT_SHADOW_FAILED",
+    "DIRECT_SHADOW_READY_REJECTED",
+    "DIRECT_SIGN_REQUEST_REJECTED",
+    "DIRECT_SIGNAL_CLOSED",
+    "DIRECT_SIGNAL_CURSOR_REJECTED",
+    "DIRECT_SIGNAL_FAILED",
+    "DIRECT_SIGNAL_QUEUE_OVERFLOW",
+    "DIRECT_SIGNAL_START_FAILED",
+    "DIRECT_SIGNATURE_REJECTED",
+    "DIRECT_STUN_CONFIG_INVALID",
+    "DIRECT_STUN_PORT_INVALID",
+    "DIRECT_TICKET_KEY_MISSING",
+    "DIRECT_TICKET_REJECTED",
+    "DIRECT_UUID_SOURCE_INVALID",
+    "DIRECT_V4_ANSWER_REJECTED",
+    "DIRECT_V4_CANDIDATE_BATCH_REJECTED",
+    "DIRECT_V4_CANDIDATE_EVENT_REJECTED",
+    "DIRECT_V4_CANDIDATE_KIND_REJECTED",
+    "DIRECT_V4_CANDIDATE_PAIR_UNAVAILABLE",
+    "DIRECT_V4_CANDIDATE_UPDATE_REJECTED",
+    "DIRECT_V4_CANDIDATE_UPDATE_SEND_FAILED",
+    "DIRECT_V4_CHECK_BATCH_SEND_FAILED",
+    "DIRECT_V4_CHECKS_EVENT_DUPLICATE",
+    "DIRECT_V4_CHECKS_EVENT_REJECTED",
+    "DIRECT_V4_IDENTITY_EVENT_REJECTED",
+    "DIRECT_V4_LOCAL_CANDIDATE_MISSING",
+    "DIRECT_V4_NOMINATION_ACK_REJECTED",
+    "DIRECT_V4_NOMINATION_EVENT_DUPLICATE",
+    "DIRECT_V4_NOMINATION_EVENT_REJECTED",
+    "DIRECT_V4_NOMINATION_SEND_FAILED",
+    "DIRECT_V4_OFFER_SEND_FAILED",
+    "DIRECT_V4_OFFER_STATE_REJECTED",
+    "DIRECT_V4_PAIR_BATCH_REJECTED",
+    "DIRECT_V4_PAIR_EVENT_DUPLICATE",
+    "DIRECT_V4_PAIR_EVENT_REJECTED",
+    "DIRECT_V4_PAIR_ORDER_CHANGED",
+    "DIRECT_V4_PAIR_RANK_REJECTED",
+    "DIRECT_V4_PATH_BINDING_MISMATCH",
+    "DIRECT_V4_REMOTE_CANDIDATE_REJECTED",
+    "DIRECT_V4_RESULT_DUPLICATE",
+    "DIRECT_V4_RESULT_REJECTED",
+    "DIRECT_V4_RESULT_SEND_FAILED",
+    "DIRECT_V4_SHADOW_READY_DUPLICATE",
+    "DIRECT_V4_SHADOW_READY_REJECTED",
+    "DIRECT_V4_SIGN_REQUEST_REJECTED",
+    "DIRECT_V4_SIGNAL_CURSOR_REJECTED",
+    "DIRECT_V4_SIGNAL_PAYLOAD_REJECTED",
+    "DIRECT_V4_SIGNAL_TYPE_REJECTED",
+    "DIRECT_V4_SIGNATURE_REJECTED",
+    "DIRECT_V4_WINNING_PAIR_MISSING",
+)
+
+internal fun normalizeProductionDirectShadowDiagnosticReason(reason: String): String = when {
+    reason.isEmpty() -> "NONE"
+    reason in SAFE_DIRECT_SHADOW_DIAGNOSTIC_REASONS -> reason
+    else -> DIRECT_SHADOW_DIAGNOSTIC_REASON_REDACTED
+}
+
+internal fun ProductionDirectShadowDiagnostic.toLogLine(): String = buildString(256) {
+    append("state=").append(state.name)
+    append(" reason_code=").append(reasonCode)
+    append(" authentication_generation=").append(authenticationGeneration)
+    append(" relay_generation=").append(relayGeneration)
+    append(" network_generation=").append(networkGeneration)
+    append(" path_epoch=").append(pathEpoch)
+    append(" selected_pair_rank=").append(selectedPairRank)
+    append(" local_candidate_type=").append(localCandidateKind.name)
+    append(" remote_candidate_type=").append(remoteCandidateKind.name)
+    append(" direct_routing_permitted=false")
 }
 
 /**
@@ -165,9 +313,9 @@ internal interface ProductionDirectShadowSignaling : Closeable {
     val state: StateFlow<DirectTransportSignalingState>
     val multipairV2Active: Boolean
         get() = false
-    fun fetchConfig(): DirectSignalingCallResult<DirectTransportServerConfig>
+    suspend fun fetchConfig(): DirectSignalingCallResult<DirectTransportServerConfig>
     fun start(): Boolean
-    fun issueTicket(
+    suspend fun issueTicket(
         targetDeviceId: UUID,
         connectionId: UUID,
         config: DirectTransportServerConfig,
@@ -181,13 +329,13 @@ private class ClientProductionDirectShadowSignaling(
     override val incoming: Flow<TransportSignalEnvelopeV1> = client.incoming
     override val state: StateFlow<DirectTransportSignalingState> = client.state
     override val multipairV2Active: Boolean get() = client.multipairV2Active
-    override fun fetchConfig() = client.fetchConfig()
+    override suspend fun fetchConfig() = client.fetchConfigCancellable()
     override fun start() = client.startSignaling()
-    override fun issueTicket(
+    override suspend fun issueTicket(
         targetDeviceId: UUID,
         connectionId: UUID,
         config: DirectTransportServerConfig,
-    ) = client.issueTicket(targetDeviceId, connectionId, config)
+    ) = client.issueTicketCancellable(targetDeviceId, connectionId, config)
     override fun send(envelope: TransportSignalEnvelopeV1) = client.send(envelope)
     override fun close() = client.close()
 }
@@ -333,12 +481,29 @@ internal interface ProductionDirectShadowPlatform {
         network: CapturedDirectNetwork,
         stunServers: List<String>,
     ): PreparedDirectGather
+
+    fun close() = Unit
 }
+
+private const val DIRECT_DNS_TIMEOUT_MILLIS = 2_000L
 
 /** Uses only the exact currently validated Android default Network. */
 private class AndroidProductionDirectShadowPlatform(
     private val connectivityManager: ConnectivityManager,
 ) : ProductionDirectShadowPlatform {
+    // Network#getAllByName is blocking and does not provide a cancellation API.
+    // Keep it out of the Direct coordinator so closeAndJoin/auth transitions do
+    // not wait for OEM DNS. One bounded daemon lane also prevents retry fan-out.
+    private val dnsExecutor = ThreadPoolExecutor(
+        1,
+        1,
+        0L,
+        TimeUnit.MILLISECONDS,
+        ArrayBlockingQueue(1),
+        { runnable -> Thread(runnable, "TermLink-Direct-DNS").apply { isDaemon = true } },
+        ThreadPoolExecutor.AbortPolicy(),
+    )
+
     override fun capture(network: Network): CapturedDirectNetwork? {
         if (connectivityManager.activeNetwork != network) return null
         val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return null
@@ -382,7 +547,9 @@ private class AndroidProductionDirectShadowPlatform(
             if (resolved.size >= 2) break
             val endpoint = parseStunEndpoint(value)
             if (endpoint.second < 1_024) throw IllegalArgumentException("DIRECT_STUN_PORT_INVALID")
-            val address = androidNetwork.getAllByName(endpoint.first)
+            val address = withTimeout(DIRECT_DNS_TIMEOUT_MILLIS) {
+                resolveOnOwnedLane(androidNetwork, endpoint.first)
+            }
                 .asSequence()
                 .filter { candidate -> sameFamily(candidate, current.advertisedAddress) }
                 .firstOrNull { candidate ->
@@ -398,6 +565,28 @@ private class AndroidProductionDirectShadowPlatform(
             advertisedAddress = current.advertisedAddress.address.copyOf(),
             stunServers = resolved,
         )
+    }
+
+    private suspend fun resolveOnOwnedLane(network: Network, host: String): Array<InetAddress> =
+        suspendCancellableCoroutine { continuation ->
+            val future = AtomicReference<Future<*>?>(null)
+            continuation.invokeOnCancellation { future.get()?.cancel(true) }
+            try {
+                val submitted = dnsExecutor.submit {
+                    val result = runCatching { network.getAllByName(host) }
+                    if (continuation.isActive) {
+                        result.fold(continuation::resume, continuation::resumeWithException)
+                    }
+                }
+                future.set(submitted)
+                if (!continuation.isActive) submitted.cancel(true)
+            } catch (rejected: RejectedExecutionException) {
+                if (continuation.isActive) continuation.resumeWithException(rejected)
+            }
+        }
+
+    override fun close() {
+        dnsExecutor.shutdownNow()
     }
 
     private fun parseStunEndpoint(value: String): Pair<String, Int> {
@@ -534,8 +723,12 @@ class ProductionDirectShadowRuntime internal constructor(
             authenticationGeneration = authenticationGeneration,
         ),
     )
+    private val mutableDiagnostic = MutableStateFlow(
+        diagnosticFor(mutableSnapshot.value, attempt = null),
+    )
 
-    val snapshot: StateFlow<ProductionDirectShadowSnapshot> = mutableSnapshot.asStateFlow()
+    internal val snapshot: StateFlow<ProductionDirectShadowSnapshot> = mutableSnapshot.asStateFlow()
+    val diagnostic: StateFlow<ProductionDirectShadowDiagnostic> = mutableDiagnostic.asStateFlow()
     val directRoutingPermitted: Boolean
         get() = false
 
@@ -576,6 +769,7 @@ class ProductionDirectShadowRuntime internal constructor(
         }
         val retired: List<ProductionDirectAuthorizedPeer>
         val current: Attempt?
+        val currentJob: Job?
         synchronized(lock) {
             if (closed.get()) {
                 owned.forEach(ProductionDirectAuthorizedPeer::close)
@@ -586,11 +780,13 @@ class ProductionDirectShadowRuntime internal constructor(
             peerGeneration = nextGeneration(peerGeneration)
             retryAttempt = 0
             current = active
+            active = null
+            currentJob = attemptJob
             publishGateStateLocked()
         }
         retired.forEach(ProductionDirectAuthorizedPeer::close)
         current?.retire("DIRECT_AUTHORIZATION_CHANGED", networkChanged = false)
-        attemptJob?.cancel()
+        currentJob?.cancel()
         wake.trySend(Unit)
         return true
     }
@@ -611,18 +807,21 @@ class ProductionDirectShadowRuntime internal constructor(
     ): Boolean {
         if (expectedAuthenticationGeneration != authenticationGeneration || closed.get()) return false
         val current: Attempt?
+        val currentJob: Job?
         synchronized(lock) {
             if (sameNetwork(network, captured)) return true
             network = captured
             networkGeneration = nextGeneration(networkGeneration)
             retryAttempt = 0
             current = active
+            active = null
+            currentJob = attemptJob
             publishGateStateLocked(
                 if (current != null) "DIRECT_NETWORK_CHANGED" else "",
             )
         }
         current?.retire("DIRECT_NETWORK_CHANGED", networkChanged = true)
-        attemptJob?.cancel()
+        currentJob?.cancel()
         wake.trySend(Unit)
         return true
     }
@@ -635,17 +834,23 @@ class ProductionDirectShadowRuntime internal constructor(
             closed.get()
         ) return false
         val current: Attempt?
+        val currentJob: Job?
         synchronized(lock) {
             if (relayGeneration == connectedGeneration) return true
             relayGeneration = connectedGeneration
             retryAttempt = 0
             current = active
+            active = null
+            currentJob = attemptJob
             publishGateStateLocked(if (connectedGeneration == 0) "RELAY_UNAVAILABLE" else "")
         }
-        if (connectedGeneration == 0) {
-            current?.retire("RELAY_UNAVAILABLE", networkChanged = false)
-            attemptJob?.cancel()
-        }
+        // Every Relay connection generation owns a distinct Direct attempt.
+        // This includes positive A -> B transitions after a Relay reconnect.
+        current?.retire(
+            if (connectedGeneration == 0) "RELAY_UNAVAILABLE" else "DIRECT_ATTEMPT_RETIRED",
+            networkChanged = false,
+        )
+        currentJob?.cancel()
         wake.trySend(Unit)
         return true
     }
@@ -670,9 +875,14 @@ class ProductionDirectShadowRuntime internal constructor(
             if (retry && !closed.get()) scheduleRetry()
         }
         job.invokeOnCompletion {
-            synchronized(lock) {
+            val shouldWake = synchronized(lock) {
                 if (attemptJob === job) attemptJob = null
+                !closed.get() && started && active == null && retryJob?.isActive != true
             }
+            // A gate transition may have been observed while this job was still
+            // active. Re-arm after exact completion so that conflated wake-up is
+            // not consumed by the old generation.
+            if (shouldWake) wake.trySend(Unit)
         }
         synchronized(lock) {
             if (closed.get() || !gateStillCurrentLocked(gate) || attemptJob?.isActive == true) {
@@ -1408,6 +1618,10 @@ class ProductionDirectShadowRuntime internal constructor(
         }
         attempt.nominationIdV4 = nominationId
         attempt.winningPairV4 = winner
+        attempt.selectedPairRank = winner.rank
+        attempt.localCandidateKind = diagnosticCandidateKind(winner.initiator.kind)
+        attempt.remoteCandidateKind = diagnosticCandidateKind(winner.responder.kind)
+        refreshDiagnosticIfCurrent(attempt)
         attempt.nominationV2Sent = true
     }
 
@@ -1954,6 +2168,10 @@ class ProductionDirectShadowRuntime internal constructor(
             attempt.localCandidates,
             answer.candidatesList,
         ).firstOrNull() ?: throw DirectAttemptFailure("DIRECT_CANDIDATE_PAIR_UNAVAILABLE")
+        attempt.selectedPairRank = 1
+        attempt.localCandidateKind = diagnosticCandidateKind(selectedPair.local.wire.kind)
+        attempt.remoteCandidateKind = diagnosticCandidateKind(selectedPair.remote.wire.kind)
+        refreshDiagnosticIfCurrent(attempt)
         val localCandidate = selectedPair.local.wire
         val remoteCandidate = selectedPair.remote.wire
         val nominationId = randomIdentifier()
@@ -2320,7 +2538,14 @@ class ProductionDirectShadowRuntime internal constructor(
     private fun publishAttempt(attempt: Attempt, state: ProductionDirectShadowState) {
         synchronized(lock) {
             if (active !== attempt || !gateStillCurrentLocked(attempt.gate) || closed.get()) return
-            mutableSnapshot.value = snapshotFor(state, "", attempt)
+            publishSnapshotLocked(snapshotFor(state, "", attempt), attempt)
+        }
+    }
+
+    private fun refreshDiagnosticIfCurrent(attempt: Attempt) {
+        synchronized(lock) {
+            if (active !== attempt || !gateStillCurrentLocked(attempt.gate) || closed.get()) return
+            publishDiagnosticLocked(diagnosticFor(mutableSnapshot.value, attempt))
         }
     }
 
@@ -2331,21 +2556,21 @@ class ProductionDirectShadowRuntime internal constructor(
     ) {
         synchronized(lock) {
             if (!gateStillCurrentLocked(gate) || closed.get()) return
-            mutableSnapshot.value = ProductionDirectShadowSnapshot(
+            publishSnapshotLocked(ProductionDirectShadowSnapshot(
                 state = state,
                 reasonCode = reason,
                 authenticationGeneration = authenticationGeneration,
                 relayGeneration = relayGeneration,
                 networkGeneration = networkGeneration,
                 peerDeviceId = gate.peer.deviceId,
-            )
+            ), attempt = null)
         }
     }
 
     private fun publishFailureIfCurrent(gate: Gate, reason: String) {
         synchronized(lock) {
             if (closed.get() || !gateStillCurrentLocked(gate)) return
-            mutableSnapshot.value = ProductionDirectShadowSnapshot(
+            publishSnapshotLocked(ProductionDirectShadowSnapshot(
                 state = if (relayGeneration > 0) ProductionDirectShadowState.RELAY_ONLY
                 else ProductionDirectShadowState.WAITING_FOR_RELAY,
                 reasonCode = reason,
@@ -2353,7 +2578,7 @@ class ProductionDirectShadowRuntime internal constructor(
                 relayGeneration = relayGeneration,
                 networkGeneration = networkGeneration,
                 peerDeviceId = gate.peer.deviceId,
-            )
+            ), attempt = null)
         }
     }
 
@@ -2363,12 +2588,12 @@ class ProductionDirectShadowRuntime internal constructor(
         synchronized(lock) {
             if (active === attempt) active = null
             if (!closed.get()) {
-                mutableSnapshot.value = snapshotFor(
+                publishSnapshotLocked(snapshotFor(
                     if (relayGeneration > 0) ProductionDirectShadowState.RELAY_ONLY
                     else ProductionDirectShadowState.WAITING_FOR_RELAY,
                     reason,
                     attempt,
-                )
+                ), attempt)
             }
         }
     }
@@ -2428,7 +2653,7 @@ class ProductionDirectShadowRuntime internal constructor(
             active == null -> ProductionDirectShadowState.RELAY_ONLY
             else -> mutableSnapshot.value.state
         }
-        mutableSnapshot.value = ProductionDirectShadowSnapshot(
+        publishSnapshotLocked(ProductionDirectShadowSnapshot(
             state = state,
             reasonCode = reason,
             authenticationGeneration = authenticationGeneration,
@@ -2437,7 +2662,7 @@ class ProductionDirectShadowRuntime internal constructor(
             pathEpoch = active?.ticket?.pathEpoch ?: 0,
             attemptId = active?.attemptId,
             peerDeviceId = active?.peer?.deviceId,
-        )
+        ), active)
     }
 
     private fun snapshotFor(
@@ -2455,6 +2680,79 @@ class ProductionDirectShadowRuntime internal constructor(
         peerDeviceId = attempt?.peer?.deviceId,
     )
 
+    /** Must be called while holding [lock] after construction has completed. */
+    private fun publishSnapshotLocked(
+        value: ProductionDirectShadowSnapshot,
+        attempt: Attempt?,
+    ) {
+        mutableSnapshot.value = value
+        publishDiagnosticLocked(diagnosticFor(value, attempt))
+    }
+
+    private fun publishDiagnosticLocked(value: ProductionDirectShadowDiagnostic) {
+        val changed = mutableDiagnostic.value != value
+        mutableDiagnostic.value = value
+        // VERBOSE is deliberately used as the opt-in gate because Android's
+        // default log threshold is INFO. Operators enable this explicitly with
+        // `adb shell setprop log.tag.TermLinkDirectShadow VERBOSE`; the emitted
+        // evidence remains an INFO record with the redacted schema above.
+        if (changed) {
+            try {
+                if (Log.isLoggable(DIRECT_SHADOW_DIAGNOSTIC_LOG_TAG, Log.VERBOSE)) {
+                    Log.i(DIRECT_SHADOW_DIAGNOSTIC_LOG_TAG, value.toLogLine())
+                }
+            } catch (_: RuntimeException) {
+                // Optional diagnostics can never retire Direct or affect Relay authority.
+            }
+        }
+    }
+
+    private fun diagnosticFor(
+        value: ProductionDirectShadowSnapshot,
+        attempt: Attempt?,
+    ): ProductionDirectShadowDiagnostic {
+        val rank = attempt?.selectedPairRank?.takeIf { it in 1..MAX_CANDIDATE_PAIRS } ?: 0
+        return ProductionDirectShadowDiagnostic(
+            state = value.state,
+            reasonCode = normalizeProductionDirectShadowDiagnosticReason(value.reasonCode),
+            authenticationGeneration = value.authenticationGeneration.coerceAtLeast(0),
+            relayGeneration = value.relayGeneration.coerceAtLeast(0),
+            networkGeneration = value.networkGeneration.coerceAtLeast(0),
+            pathEpoch = value.pathEpoch.coerceAtLeast(0),
+            selectedPairRank = rank,
+            localCandidateKind = if (rank == 0) {
+                ProductionDirectShadowDiagnosticCandidateKind.NONE
+            } else {
+                attempt?.localCandidateKind
+                    ?: ProductionDirectShadowDiagnosticCandidateKind.NONE
+            },
+            remoteCandidateKind = if (rank == 0) {
+                ProductionDirectShadowDiagnosticCandidateKind.NONE
+            } else {
+                attempt?.remoteCandidateKind
+                    ?: ProductionDirectShadowDiagnosticCandidateKind.NONE
+            },
+        )
+    }
+
+    private fun diagnosticCandidateKind(
+        value: DirectCandidateKindV1,
+    ): ProductionDirectShadowDiagnosticCandidateKind = when (value) {
+        DirectCandidateKindV1.DIRECT_CANDIDATE_KIND_V1_HOST ->
+            ProductionDirectShadowDiagnosticCandidateKind.HOST
+        DirectCandidateKindV1.DIRECT_CANDIDATE_KIND_V1_SERVER_REFLEXIVE ->
+            ProductionDirectShadowDiagnosticCandidateKind.SRFLX
+        else -> ProductionDirectShadowDiagnosticCandidateKind.NONE
+    }
+
+    private fun diagnosticCandidateKind(
+        value: DirectNativeCandidateKindV4,
+    ): ProductionDirectShadowDiagnosticCandidateKind = when (value) {
+        DirectNativeCandidateKindV4.HOST -> ProductionDirectShadowDiagnosticCandidateKind.HOST
+        DirectNativeCandidateKindV4.SERVER_REFLEXIVE ->
+            ProductionDirectShadowDiagnosticCandidateKind.SRFLX
+    }
+
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         val attempt: Attempt?
@@ -2464,11 +2762,11 @@ class ProductionDirectShadowRuntime internal constructor(
             active = null
             retiredPeers = peers
             peers = emptyList()
-            mutableSnapshot.value = ProductionDirectShadowSnapshot(
+            publishSnapshotLocked(ProductionDirectShadowSnapshot(
                 state = ProductionDirectShadowState.STOPPED,
                 reasonCode = "STOPPED",
                 authenticationGeneration = authenticationGeneration,
-            )
+            ), attempt = null)
         }
         attempt?.retire("STOPPED", networkChanged = false)
         retiredPeers.forEach(ProductionDirectAuthorizedPeer::close)
@@ -2478,6 +2776,7 @@ class ProductionDirectShadowRuntime internal constructor(
         relayJob.cancel()
         coordinator.cancel()
         scopeJob.cancel()
+        platform.close()
     }
 
     suspend fun closeAndJoin() {
@@ -2513,6 +2812,9 @@ class ProductionDirectShadowRuntime internal constructor(
         var lastRemoteSequence = 0L
         var lastRemoteAck = 0L
         var offerSequence = 0L
+        var selectedPairRank = 0
+        var localCandidateKind = ProductionDirectShadowDiagnosticCandidateKind.NONE
+        var remoteCandidateKind = ProductionDirectShadowDiagnosticCandidateKind.NONE
         var lastNativeGeneration = 0L
         var candidatesGeneration = 0L
         var localCertificateSha256 = ByteArray(0)
@@ -2568,12 +2870,12 @@ class ProductionDirectShadowRuntime internal constructor(
                 if (active === this) {
                     active = null
                     if (!closed.get()) {
-                        mutableSnapshot.value = snapshotFor(
+                        publishSnapshotLocked(snapshotFor(
                             if (relayGeneration > 0) ProductionDirectShadowState.RELAY_ONLY
                             else ProductionDirectShadowState.WAITING_FOR_RELAY,
                             reason,
                             this,
-                        )
+                        ), this)
                     }
                 }
             }
@@ -2697,6 +2999,7 @@ class ProductionDirectShadowRuntime internal constructor(
     }
 
     private companion object {
+        const val DIRECT_SHADOW_DIAGNOSTIC_LOG_TAG = "TermLinkDirectShadow"
         const val PROTOCOL_VERSION = 1
         const val GATHER_TIMEOUT_MILLIS = 1_000
         const val UNSAFE_HOST_PAIR_PREFERENCE = 4
