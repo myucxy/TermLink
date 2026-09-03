@@ -208,6 +208,7 @@ internal static class Program
             var initialCommands = detectTerminalCommands.Invoke(null, null);
             var buildTerminalCommandsBody = Method(runtimeType, "BuildPCUpsertBodyWithTerminalCommands");
             var buildPCAgentBody = Method(runtimeType, "BuildPCAgentUpsertBodyWithTerminalCommands");
+            var buildStablePCAgentBody = Method(runtimeType, "BuildStablePCAgentUpsertBodyWithTerminalCommands");
             var architecture = RuntimeInformation.OSArchitecture == Architecture.Arm64 ? "arm64" : "x64";
             var expectedBody = (byte[])buildPCAgentBody.Invoke(
                 null,
@@ -220,22 +221,26 @@ internal static class Program
                 });
             Require(initial.Method == HttpMethod.Put && initial.Body.SequenceEqual(expectedBody),
                 "Initial registration did not advertise detected PC capabilities.");
-            var pcUpsertKey = Method(runtimeType, "PCUpsertIdempotencyKey");
-            var sameKey = (string)pcUpsertKey.Invoke(null, new object[] { pcId, expectedBody });
+            var pcUpsertKey = Method(runtimeType, "DeviceScopedPCUpsertIdempotencyKey");
+            var deviceId = (Guid)credentialsType.GetProperty("DeviceId")?.GetValue(credentials);
+            var sameKey = (string)pcUpsertKey.Invoke(null, new object[] { pcId, deviceId, expectedBody });
             var changedBody = (byte[])buildBody.Invoke(
                 null,
                 new object[] { "Heartbeat Validation PC", "validation-2", 7L });
-            var changedBodyKey = (string)pcUpsertKey.Invoke(null, new object[] { pcId, changedBody });
+            var changedBodyKey = (string)pcUpsertKey.Invoke(null, new object[] { pcId, deviceId, changedBody });
             var changedPcKey = (string)pcUpsertKey.Invoke(
-                null,
-                new object[] { Guid.Parse("11111111-2222-4333-8444-555555555555"), expectedBody });
+                null, new object[] {
+                    Guid.Parse("11111111-2222-4333-8444-555555555555"), deviceId, expectedBody });
+            var changedDeviceKey = (string)pcUpsertKey.Invoke(
+                null, new object[] {
+                    pcId, Guid.Parse("99999999-2222-4333-8444-555555555555"), expectedBody });
             Require(initial.IdempotencyKey == sameKey &&
                 Regex.IsMatch(
                     initial.IdempotencyKey,
-                    "^pc-upsert-v2-" + pcId.ToString("N") + "-[0-9a-f]{32}$",
+                    "^pc-upsert-v3-" + pcId.ToString("N") + "-" + deviceId.ToString("N") + "-[0-9a-f]{32}$",
                     RegexOptions.CultureInvariant) &&
-                changedBodyKey != sameKey && changedPcKey != sameKey,
-                "PC upsert V2 key is not namespace-versioned, stable, and body/PC scoped.");
+                changedBodyKey != sameKey && changedPcKey != sameKey && changedDeviceKey != sameKey,
+                "PC upsert V3 key is not namespace-versioned, stable, and body/PC/device scoped.");
             using (var json = JsonDocument.Parse(initial.Body))
             {
                 Require(json.RootElement.GetProperty("session_heartbeat_capable").GetBoolean(),
@@ -257,6 +262,23 @@ internal static class Program
                     capabilities.Contains("terminal_commands_v1") &&
                     capabilities.Contains("remote_agent_update_v1"),
                     "PC upsert did not advertise the generic bounded capability set.");
+            }
+            var machineId = Convert.ToBase64String(
+                    Enumerable.Range(1, 32).Select(value => (byte)value).ToArray())
+                .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+            var stableBody = (byte[])buildStablePCAgentBody.Invoke(
+                null,
+                new[]
+                {
+                    (object)"Heartbeat Validation PC", "validation-1", 7L,
+                    RuntimeInformation.OSDescription, architecture,
+                    (bool)Field(runtimeType, "terminalSnapshotEnabled").GetValue(runtime),
+                    initialShells, initialCommands, machineId
+                });
+            using (var stableJson = JsonDocument.Parse(stableBody))
+            {
+                Require(stableJson.RootElement.GetProperty("machine_id").GetString() == machineId,
+                    "Stable PC upsert did not advertise the account-scoped machine identity.");
             }
 
             var capabilityRoot = Path.Combine(Path.GetTempPath(), "termlink-shell-capabilities-" + Guid.NewGuid().ToString("N"));
@@ -524,6 +546,23 @@ internal static class Program
                     !legacyMetadata.RootElement.TryGetProperty("capabilities", out _) &&
                     !legacyMetadata.RootElement.TryGetProperty("platform", out _),
                     "Legacy Server fallback did not preserve the pre-P5 PC metadata contract.");
+            }
+
+            Set(config, "MachineId", machineId);
+            var beforeStableRejection = handler.Requests.Count;
+            handler.RejectNextGenericPCUpsert = true;
+            var stableRejected = false;
+            try { await InvokeTask(ensureRegistered, runtime, CancellationToken.None); }
+            catch { stableRejected = true; }
+            var stableRequests = handler.Requests.Skip(beforeStableRejection).ToArray();
+            var stableUpserts = stableRequests.Where(value =>
+                value.Method == HttpMethod.Put && value.Path == "/v1/pcs/" + pcId.ToString("D")).ToArray();
+            Require(stableRejected && stableUpserts.Length == 1,
+                "A stable-machine Agent silently downgraded to metadata that could create a duplicate PC.");
+            using (var stableRejectedMetadata = JsonDocument.Parse(stableUpserts[0].Body))
+            {
+                Require(stableRejectedMetadata.RootElement.GetProperty("machine_id").GetString() == machineId,
+                    "The fail-closed stable-machine request omitted its correlation identity.");
             }
 
             Console.WriteLine("Production PC heartbeat validation passed.");

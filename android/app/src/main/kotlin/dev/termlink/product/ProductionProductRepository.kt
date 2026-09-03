@@ -425,9 +425,10 @@ internal fun reconcileSessionDirectoryTitles(
 }
 
 /**
- * An epoch and exchange key are scoped to one Windows device identity. A PC
- * record that moves to a new device identity starts a fresh epoch namespace;
- * only transitions within the same identity are monotonic and key-stable.
+ * The PC epoch is monotonic across Windows device-key replacement. A new
+ * device identity may introduce a new exchange key only while advancing that
+ * epoch; transitions within one device identity remain monotonic and
+ * key-stable.
  */
 internal fun validateAuthoritativePcKeyTransition(
     storedPc: PcSummary,
@@ -436,7 +437,21 @@ internal fun validateAuthoritativePcKeyTransition(
     incomingDevice: DeviceSummary?,
 ) {
     require(incomingPc.id == storedPc.id) { "PC key transition changed the PC identity" }
-    if (incomingPc.deviceId != storedPc.deviceId) return
+    if (incomingPc.deviceId != storedPc.deviceId) {
+        val replacement = requireNotNull(incomingDevice?.takeIf { it.id == incomingPc.deviceId }) {
+            "replacement PC identity is missing its device key"
+        }
+        require(replacement.type.isPcAgent() && replacement.trustState == DeviceTrustState.TRUSTED) {
+            "replacement PC identity is not a trusted PC device"
+        }
+        require(replacement.exchangePublicKey.size == 32 && replacement.exchangePublicKey.any { it.toInt() != 0 }) {
+            "replacement PC exchange key is invalid"
+        }
+        require(incomingPc.keyEpoch > storedPc.keyEpoch) {
+            "replacement PC identity must advance the key epoch"
+        }
+        return
+    }
     require(incomingPc.keyEpoch >= storedPc.keyEpoch) { "key epoch must not regress" }
     val storedKey = storedDevice?.takeIf { it.id == storedPc.deviceId }?.exchangePublicKey
     val incomingKey = incomingDevice?.takeIf { it.id == incomingPc.deviceId }?.exchangePublicKey
@@ -2952,8 +2967,9 @@ internal class ProductionProductRepository(
         // Reject an epoch rollback or same-epoch public-key substitution before
         // any untrusted metadata reaches Room. Refreshes are serialized so a
         // slower response cannot overwrite a newer validated snapshot.
+        validateAuthoritativePcKeyTransitions(devices, pcs)
         closeLiveSessionsForChangedPcIdentities(pcs, sessions)
-        validateAuthoritativeSessionKeys(devices, pcs, sessions)
+        validateLiveSessionKeys(devices, pcs, sessions)
         historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
         sessions.forEach { historyRepository.upsertSession(it) }
         val storedIdentity = identity()
@@ -3080,8 +3096,9 @@ internal class ProductionProductRepository(
         }.filterNot { it.id in deletedSessionIds }
         authenticationStateMutationLock.withLock {
             requireCurrentAuthentication(authenticationGeneration)
+        validateAuthoritativePcKeyTransitions(devices, pcs)
         closeLiveSessionsForChangedPcIdentities(pcs, catalogSessions)
-        validateAuthoritativeSessionKeys(devices, pcs, catalogSessions)
+        validateLiveSessionKeys(devices, pcs, catalogSessions)
         historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
         catalogSessions.forEach { historyRepository.upsertSession(it) }
         val directoryTitles = decryptSessionDirectoryTitles(devices, pcs, catalogSessions, identity())
@@ -3876,17 +3893,9 @@ internal class ProductionProductRepository(
             // Lock order is keyMetadata -> refreshState -> one session lane.
             // No session lane is held while acquiring either outer lock.
             refreshStateLock.withLock {
+                validateAuthoritativePcKeyTransitions(devices, pcs)
                 closeLiveSessionsForChangedPcIdentities(pcs, sessions)
-                liveSessions.toMap().forEach { (sessionId, live) ->
-                    val session = sessions.firstOrNull { it.id == sessionId } ?: return@forEach
-                    val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@forEach
-                    val device = devices.firstOrNull {
-                        it.id == pc.deviceId &&
-                            it.type.isPcAgent() &&
-                            it.trustState == DeviceTrustState.TRUSTED
-                    } ?: return@forEach
-                    live.client.validateKeyMaterialUpdate(pc.keyEpoch, device.exchangePublicKey)
-                }
+                validateLiveSessionKeys(devices, pcs, sessions)
                 // Persist the authoritative epoch/public-key pair before any live
                 // session can start encrypting or decrypting with the new epoch.
                 historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
@@ -3907,10 +3916,9 @@ internal class ProductionProductRepository(
         }
     }
 
-    private suspend fun validateAuthoritativeSessionKeys(
+    private suspend fun validateAuthoritativePcKeyTransitions(
         devices: List<DeviceSummary>,
         pcs: List<PcSummary>,
-        sessions: List<SessionSummary>,
     ) {
         val storedPcs = historyRepository.pcs().associateBy(PcSummary::id)
         val storedDevices = historyRepository.devices().associateBy(DeviceSummary::id)
@@ -3923,6 +3931,13 @@ internal class ProductionProductRepository(
                 incomingDevice = devices.firstOrNull { it.id == pc.deviceId },
             )
         }
+    }
+
+    private fun validateLiveSessionKeys(
+        devices: List<DeviceSummary>,
+        pcs: List<PcSummary>,
+        sessions: List<SessionSummary>,
+    ) {
         liveSessions.toMap().forEach { (sessionId, live) ->
             val session = sessions.firstOrNull { it.id == sessionId } ?: return@forEach
             val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@forEach

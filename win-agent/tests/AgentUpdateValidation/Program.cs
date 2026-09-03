@@ -12,6 +12,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using TermLink.Agent;
+using TermLink.Protocol;
 
 namespace TermLink.AgentUpdate.Validation
 {
@@ -23,6 +24,7 @@ namespace TermLink.AgentUpdate.Validation
             {
                 ValidateBrowserAuthorizationLaunch();
                 ValidateBrowserCallbackUsesDynamicPort();
+                ValidateRetainedMachineIdentity();
                 var pcId = Guid.NewGuid();
                 var updateId = Guid.NewGuid();
                 var mutations = new List<(string Path, string Key, byte[] Body)>();
@@ -297,6 +299,77 @@ namespace TermLink.AgentUpdate.Validation
             Assert(!fallback.UseShellExecute && fallback.FileName == @"C:\Browser\browser.exe" &&
                     fallback.ArgumentList.SequenceEqual(new[] { authorizationUrl }),
                 "browser fallback did not pass the validated HTTPS URL as one executable argument");
+        }
+
+        private static void ValidateRetainedMachineIdentity()
+        {
+            const string issuer = "https://identity.example.test";
+            var accountKey = "oidc-sha256:" + new string('a', 64);
+            var otherAccountKey = "oidc-sha256:" + new string('b', 64);
+            var machineId = ProductionMachineIdentity.Derive(
+                "00112233-4455-6677-8899-aabbccddeeff", issuer, accountKey);
+            var sameMachineId = ProductionMachineIdentity.Derive(
+                "{00112233-4455-6677-8899-AABBCCDDEEFF}", issuer + "/", accountKey);
+            Assert(ProductionMachineIdentity.IsValid(machineId) && machineId == sameMachineId,
+                "machine identity derivation is not canonical and stable");
+            Assert(ProductionMachineIdentity.Derive(
+                    "00112233-4455-6677-8899-aabbccddeeff", issuer, otherAccountKey) != machineId,
+                "machine identity was not isolated by OIDC account");
+            Assert(ProductionMachineIdentity.DeriveInitialPcId(machineId) ==
+                    ProductionMachineIdentity.DeriveInitialPcId(sameMachineId),
+                "initial PC ID derivation is not stable");
+
+            var root = Path.Combine(Path.GetTempPath(), "TermLink-retained-identity-" + Guid.NewGuid().ToString("N"));
+            var originalRoot = Environment.GetEnvironmentVariable("TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT");
+            var originalMarker = Environment.GetEnvironmentVariable("TERMLINK_ACCEPTANCE_CA_FILE");
+            Directory.CreateDirectory(root);
+            try
+            {
+                Environment.SetEnvironmentVariable("TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT", root);
+                Environment.SetEnvironmentVariable("TERMLINK_ACCEPTANCE_CA_FILE", Path.Combine(root, "acceptance.cer"));
+                using var identity = DeviceIdentity.Generate();
+                var deviceId = Guid.NewGuid();
+                var pcId = Guid.NewGuid();
+                var config = new ProductionAgentConfig
+                {
+                    ServerUrl = "https://server.example.test",
+                    PcId = pcId,
+                    PcName = "Identity Test PC",
+                    AccountKey = accountKey,
+                    AgentVersion = "test",
+                    KeyEpoch = 4,
+                    OIDCIssuer = issuer,
+                    OIDCClientId = "termlink-windows",
+                    MachineId = machineId
+                };
+                ProductionIdentityStore.Save(config, deviceId, identity, accountKey);
+                ProductionAccountStorage.ForgetLocalAccount(root);
+                Assert(File.Exists(ProductionAccountStorage.IdentityStorePath),
+                    "sign-out removed the token-free retained identity store");
+                using var restored = ProductionIdentityStore.TryLoad(accountKey, issuer, machineId);
+                Assert(restored != null && restored.DeviceId == deviceId && restored.PcId == pcId &&
+                        restored.PcName == config.PcName && restored.KeyEpoch == config.KeyEpoch,
+                    "retained identity did not round trip through DPAPI");
+                Assert(ProductionIdentityStore.TryLoad(otherAccountKey, issuer, machineId) == null,
+                    "retained identity crossed an OIDC account boundary");
+                Assert(!ProductionIdentityStore.TrySave(config, deviceId, identity, otherAccountKey),
+                    "a mismatched retained identity escaped the non-blocking account boundary");
+
+                File.WriteAllBytes(ProductionAccountStorage.IdentityStorePath, new byte[] { 1, 2, 3, 4 });
+                Assert(ProductionIdentityStore.TryLoad(accountKey, issuer, machineId) == null,
+                    "a corrupt retained identity store was treated as authenticated identity");
+                ProductionIdentityStore.Save(config, deviceId, identity, accountKey);
+                using var recoveredAfterCorruption = ProductionIdentityStore.TryLoad(accountKey, issuer, machineId);
+                Assert(recoveredAfterCorruption != null && recoveredAfterCorruption.DeviceId == deviceId &&
+                        recoveredAfterCorruption.PcId == pcId,
+                    "a corrupt retained identity store could not be replaced safely");
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT", originalRoot);
+                Environment.SetEnvironmentVariable("TERMLINK_ACCEPTANCE_CA_FILE", originalMarker);
+                if (Directory.Exists(root)) Directory.Delete(root, true);
+            }
         }
 
         private static void ValidateBrowserCallbackUsesDynamicPort()

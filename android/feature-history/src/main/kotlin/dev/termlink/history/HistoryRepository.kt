@@ -214,10 +214,14 @@ class HistoryRepository(
         database.withTransaction {
             val stored = pcs.get(summary.id.requireUuidString())
             if (stored != null) {
-                require(stored.deviceId == summary.deviceId.requireUuidString()) {
-                    "PC device identity must not change"
+                val incomingDeviceId = summary.deviceId.requireUuidString()
+                if (stored.deviceId == incomingDeviceId) {
+                    require(summary.keyEpoch >= stored.keyEpoch) { "key epoch must not regress" }
+                } else {
+                    require(summary.keyEpoch > stored.keyEpoch) {
+                        "replacement PC identity must advance the key epoch"
+                    }
                 }
-                require(summary.keyEpoch >= stored.keyEpoch) { "key epoch must not regress" }
             }
             pcs.upsert(pcEntity(summary))
         }
@@ -261,10 +265,18 @@ class HistoryRepository(
             }
             pcSummaries.forEach { summary ->
                 val storedPc = pcs.get(summary.id.requireUuidString()) ?: return@forEach
-                require(storedPc.deviceId == summary.deviceId.requireUuidString()) {
-                    "PC device identity must not change"
+                val incomingDeviceId = summary.deviceId.requireUuidString()
+                if (storedPc.deviceId == incomingDeviceId) {
+                    require(summary.keyEpoch >= storedPc.keyEpoch) { "key epoch must not regress" }
+                } else {
+                    // The Server keeps one monotonically increasing PC epoch
+                    // across device-key replacement. Requiring a strict
+                    // advance makes a delayed pre-rebind catalog unable to
+                    // restore the revoked device binding.
+                    require(summary.keyEpoch > storedPc.keyEpoch) {
+                        "replacement PC identity must advance the key epoch"
+                    }
                 }
-                require(summary.keyEpoch >= storedPc.keyEpoch) { "key epoch must not regress" }
             }
             devices.upsertAll(deviceSummaries.map(::deviceEntity))
             pcs.upsertAll(pcSummaries.map(::pcEntity))

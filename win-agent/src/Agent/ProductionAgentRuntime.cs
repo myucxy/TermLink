@@ -440,11 +440,23 @@ namespace TermLink.Agent
                 config.AgentVersion = runtimeVersion;
             }
             var credentials = ProductionCredentials.TryLoad(); if (credentials == null) return null;
+            TryRetainIdentity(config, credentials);
             return new ProductionAgentRuntime(
                 config,
                 credentials,
                 ProductionReconnectPreferences.Load(),
                 registryControlPipeName);
+        }
+
+        private static void TryRetainIdentity(
+            ProductionAgentConfig config,
+            ProductionCredentials credentials)
+        {
+            if (string.IsNullOrWhiteSpace(config?.MachineId) || credentials == null) return;
+            // Token-free retention is a recovery aid. A local storage failure
+            // must not prevent the authenticated runtime from serving sessions;
+            // server-side machine resolution remains available.
+            ProductionIdentityStore.TrySave(config, credentials);
         }
 
         public void Attach(SessionRegistry registry)
@@ -1073,6 +1085,29 @@ namespace TermLink.Agent
             string[] supportedShells,
             TerminalCommandCapability[] terminalCommands)
         {
+            return BuildStablePCAgentUpsertBodyWithTerminalCommands(
+                pcName,
+                agentVersion,
+                keyEpoch,
+                platformVersion,
+                architecture,
+                terminalSnapshotCapable,
+                supportedShells,
+                terminalCommands,
+                null);
+        }
+
+        internal static byte[] BuildStablePCAgentUpsertBodyWithTerminalCommands(
+            string pcName,
+            string agentVersion,
+            long keyEpoch,
+            string platformVersion,
+            string architecture,
+            bool terminalSnapshotCapable,
+            string[] supportedShells,
+            TerminalCommandCapability[] terminalCommands,
+            string machineId)
+        {
             if (string.IsNullOrWhiteSpace(platformVersion) || Encoding.UTF8.GetByteCount(platformVersion) > 160)
                 throw new ArgumentException("A bounded platform version is required.", nameof(platformVersion));
             if (architecture != "x64" && architecture != "arm64")
@@ -1095,6 +1130,26 @@ namespace TermLink.Agent
                 shell_type = command.ShellType,
                 source = command.Source
             }).ToArray();
+            if (!string.IsNullOrWhiteSpace(machineId) && !ProductionMachineIdentity.IsValid(machineId))
+                throw new ArgumentException("The PC machine identity is invalid.", nameof(machineId));
+            if (!string.IsNullOrWhiteSpace(machineId))
+            {
+                return JsonSerializer.SerializeToUtf8Bytes(new
+                {
+                    name = pcName,
+                    agent_version = agentVersion,
+                    key_epoch = keyEpoch,
+                    platform = "windows",
+                    architecture,
+                    platform_version = platformVersion,
+                    capabilities,
+                    session_heartbeat_capable = true,
+                    supported_shells = supportedShells.Distinct(StringComparer.Ordinal).ToArray(),
+                    terminal_commands = normalizedCommands,
+                    remote_agent_update_capable = true,
+                    machine_id = machineId
+                });
+            }
             return JsonSerializer.SerializeToUtf8Bytes(new
             {
                 name = pcName,
@@ -1119,7 +1174,7 @@ namespace TermLink.Agent
                 config.KeyEpoch,
                 ManagedTerminalLauncher.DetectSupportedShellTypes(),
                 ManagedTerminalLauncher.DetectTerminalCommandCapabilities());
-            var body = BuildPCAgentUpsertBodyWithTerminalCommands(
+            var body = BuildStablePCAgentUpsertBodyWithTerminalCommands(
                 config.PcName,
                 config.AgentVersion,
                 config.KeyEpoch,
@@ -1127,7 +1182,8 @@ namespace TermLink.Agent
                 PCAgentArchitecture(RuntimeInformation.OSArchitecture),
                 terminalSnapshotEnabled,
                 ManagedTerminalLauncher.DetectSupportedShellTypes(),
-                ManagedTerminalLauncher.DetectTerminalCommandCapabilities());
+                ManagedTerminalLauncher.DetectTerminalCommandCapabilities(),
+                config.MachineId);
             try
             {
                 var response = await SendAsync(
@@ -1135,12 +1191,13 @@ namespace TermLink.Agent
                     "/v1/pcs/" + config.PcId.ToString("D"),
                     body,
                     true,
-                    PCUpsertIdempotencyKey(config.PcId, body),
+                    DeviceScopedPCUpsertIdempotencyKey(config.PcId, credentials.DeviceId, body),
                     token).ConfigureAwait(false);
                 var errorCode = response.StatusCode == HttpStatusCode.BadRequest
                     ? await ReadServerErrorCodeAsync(response, token).ConfigureAwait(false)
                     : string.Empty;
-                if (response.StatusCode == HttpStatusCode.BadRequest && errorCode == "INVALID_REQUEST")
+                if (response.StatusCode == HttpStatusCode.BadRequest && errorCode == "INVALID_REQUEST" &&
+                    string.IsNullOrWhiteSpace(config.MachineId))
                 {
                     response.Dispose();
                     response = await SendAsync(
@@ -1148,16 +1205,47 @@ namespace TermLink.Agent
                         "/v1/pcs/" + config.PcId.ToString("D"),
                         legacyBody,
                         true,
-                        PCUpsertIdempotencyKey(config.PcId, legacyBody),
+                        DeviceScopedPCUpsertIdempotencyKey(config.PcId, credentials.DeviceId, legacyBody),
                         token).ConfigureAwait(false);
                 }
                 using (response)
+                {
                     await EnsureServerSuccessAsync(response, "PC_UPSERT", token).ConfigureAwait(false);
+                    await ApplyPCUpsertKeyEpochAsync(response, token).ConfigureAwait(false);
+                }
             }
             finally
             {
                 CryptographicOperations.ZeroMemory(body);
                 CryptographicOperations.ZeroMemory(legacyBody);
+            }
+        }
+
+        private async Task ApplyPCUpsertKeyEpochAsync(
+            HttpResponseMessage response,
+            CancellationToken token)
+        {
+            if (response?.Content == null) return;
+            try
+            {
+                using var document = JsonDocument.Parse(
+                    await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
+                if (!document.RootElement.TryGetProperty("key_epoch", out var value) ||
+                    !value.TryGetInt64(out var keyEpoch) || keyEpoch <= config.KeyEpoch)
+                    return;
+                var previousEpoch = config.KeyEpoch;
+                config.KeyEpoch = keyEpoch;
+                try { ProductionAgentConfig.Save(config); }
+                catch
+                {
+                    config.KeyEpoch = previousEpoch;
+                    throw;
+                }
+                TryRetainIdentity(config, credentials);
+            }
+            catch (JsonException)
+            {
+                // Older compatible Servers returned an empty success body.
             }
         }
 
@@ -1180,20 +1268,23 @@ namespace TermLink.Agent
                 (lastAttemptUtc == default || nowUtc - lastAttemptUtc >= PCHeartbeatInterval);
         }
 
-        private static string PCUpsertIdempotencyKey(Guid pcId, byte[] body)
+        internal static string DeviceScopedPCUpsertIdempotencyKey(
+            Guid pcId,
+            Guid deviceId,
+            byte[] body)
         {
             if (pcId == Guid.Empty) throw new ArgumentException("A PC ID is required.", nameof(pcId));
+            if (deviceId == Guid.Empty) throw new ArgumentException("A device ID is required.", nameof(deviceId));
             if (body == null || body.Length == 0) throw new ArgumentException("PC metadata is required.", nameof(body));
             var digest = SHA256.HashData(body);
             try
             {
-                // The upsert body can legitimately change after an Agent update,
-                // PC rename, or key rotation. Keep retries of the same body stable
-                // without replaying a prior 24-hour response for different metadata.
-                // V2 deliberately escapes any cached V1 response. In
-                // particular, deployments may still retain a 24-hour
-                // INVALID_REQUEST result for the pre-heartbeat body contract.
-                return "pc-upsert-v2-" + pcId.ToString("N") + "-" +
+                // A reinstalled Agent can legitimately bind a new device key
+                // to the same PC and send identical metadata. Include the
+                // authenticated device identity so the account-scoped Server
+                // cache cannot replay the old device's successful upsert.
+                return "pc-upsert-v3-" + pcId.ToString("N") + "-" +
+                    deviceId.ToString("N") + "-" +
                     Convert.ToHexString(digest, 0, 16).ToLowerInvariant();
             }
             finally { CryptographicOperations.ZeroMemory(digest); }
@@ -3751,12 +3842,16 @@ namespace TermLink.Agent
                     {
                         var previousEpoch = config.KeyEpoch;
                         config.KeyEpoch = keyEpoch;
-                        try { ProductionAgentConfig.Save(config); }
+                        try
+                        {
+                            ProductionAgentConfig.Save(config);
+                        }
                         catch
                         {
                             config.KeyEpoch = previousEpoch;
                             throw;
                         }
+                        TryRetainIdentity(config, credentials);
                         ClearSubscribers();
                         foreach (var previous in authorizedRecipients.Values) RetireSubscriber(previous);
                         authorizedRecipients.Clear();

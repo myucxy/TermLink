@@ -101,6 +101,61 @@ class HistoryRepositorySecurityTest {
     }
 
     @Test
+    fun authoritativeReplacementDeviceAdvancesPcAndRetainsOldPublicKey() = runBlocking {
+        val oldDeviceId = UUID.fromString("21112222-3333-4444-5555-666677778888")
+        val newDeviceId = UUID.fromString("31112222-3333-4444-5555-666677778888")
+        val pcId = UUID.fromString("4999aaaa-bbbb-cccc-dddd-eeeeffffffff")
+        val oldKey = ByteArray(32) { (it + 11).toByte() }
+        val newKey = ByteArray(32) { (it + 43).toByte() }
+        val oldDevice = deviceSummary(oldDeviceId, oldKey)
+        val newDevice = deviceSummary(newDeviceId, newKey)
+
+        repository.persistAuthoritativeKeyMetadata(
+            listOf(oldDevice),
+            listOf(pcSummary(pcId, oldDeviceId, 9)),
+        )
+        repository.persistAuthoritativeKeyMetadata(
+            listOf(oldDevice.copy(trustState = DeviceTrustState.REVOKED), newDevice),
+            listOf(pcSummary(pcId, newDeviceId, 10)),
+        )
+
+        val storedPc = database.pcs().get(pcId.toString())
+        assertEquals(newDeviceId.toString(), storedPc?.deviceId)
+        assertEquals(10L, storedPc?.keyEpoch)
+        assertArrayEquals(oldKey, database.devices().get(oldDeviceId.toString())?.exchangePublicKey)
+        assertArrayEquals(newKey, database.devices().get(newDeviceId.toString())?.exchangePublicKey)
+    }
+
+    @Test
+    fun replacementDeviceWithoutEpochAdvanceRollsBackAtomically() = runBlocking {
+        val oldDeviceId = UUID.fromString("51112222-3333-4444-5555-666677778888")
+        val newDeviceId = UUID.fromString("61112222-3333-4444-5555-666677778888")
+        val pcId = UUID.fromString("7999aaaa-bbbb-cccc-dddd-eeeeffffffff")
+        val oldKey = ByteArray(32) { (it + 17).toByte() }
+        val newKey = ByteArray(32) { (it + 49).toByte() }
+        val oldDevice = deviceSummary(oldDeviceId, oldKey)
+        repository.persistAuthoritativeKeyMetadata(
+            listOf(oldDevice),
+            listOf(pcSummary(pcId, oldDeviceId, 7)),
+        )
+
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                repository.persistAuthoritativeKeyMetadata(
+                    listOf(oldDevice, deviceSummary(newDeviceId, newKey)),
+                    listOf(pcSummary(pcId, newDeviceId, 7)),
+                )
+            }
+        }
+
+        val storedPc = database.pcs().get(pcId.toString())
+        assertEquals(oldDeviceId.toString(), storedPc?.deviceId)
+        assertEquals(7L, storedPc?.keyEpoch)
+        assertEquals(null, database.devices().get(newDeviceId.toString()))
+        assertArrayEquals(oldKey, database.devices().get(oldDeviceId.toString())?.exchangePublicKey)
+    }
+
+    @Test
     fun exitedSessionAndOutputCursorCannotBeRegressedByAnOlderSummary() = runBlocking {
         val sessionId = UUID.fromString("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         val pcId = UUID.fromString("bbbbbbbb-cccc-dddd-eeee-ffffffffffff")

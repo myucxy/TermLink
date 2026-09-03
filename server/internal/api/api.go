@@ -132,6 +132,7 @@ type HistoryObjectStore interface {
 func (a *API) Handler() http.Handler {
 	public := http.NewServeMux()
 	public.HandleFunc("POST /v1/devices/register", a.registerDevice)
+	public.HandleFunc("POST /v1/pcs/resolve-machine", a.resolvePCMachine)
 	public.HandleFunc("GET /v1/billing/plans", a.listPlans)
 	public.HandleFunc("GET /v1/client-config", a.getClientConfiguration)
 	public.HandleFunc("GET /v1/registration-policy", a.getRegistrationPolicy)
@@ -236,6 +237,7 @@ func (a *API) Handler() http.Handler {
 
 	root := http.NewServeMux()
 	root.Handle("/v1/devices/register", public)
+	root.Handle("/v1/pcs/resolve-machine", public)
 	root.Handle("/v1/billing/plans", public)
 	root.Handle("/v1/client-config", public)
 	root.Handle("/v1/registration-policy", public)
@@ -939,6 +941,56 @@ func (a *API) listPCs(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"items": items})
 }
+
+func (a *API) resolvePCMachine(w http.ResponseWriter, r *http.Request) {
+	identity, err := verifyBearer(r.Context(), a.Tokens, r.Header.Get("Authorization"))
+	if err != nil {
+		writeError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", err)
+		return
+	}
+	if !a.canRegisterDeviceType(store.DeviceTypePCAgent, identity.AuthorizedParty) {
+		writeError(w, r, http.StatusForbidden, "DEVICE_TYPE_NOT_ALLOWED", store.ErrDenied)
+		return
+	}
+	var input struct {
+		MachineID string `json:"machine_id"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err)
+		return
+	}
+	machineID, err := decodeMachineID(input.MachineID)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_MACHINE_ID", err)
+		return
+	}
+	subjectHash := auth.SubjectHash(a.SubjectKey, identity)
+	result, found, err := a.Store.ResolvePCMachine(r.Context(), subjectHash, machineID)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusOK, map[string]any{"found": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"found": true, "pc_id": result.ID, "pc_name": result.Name, "key_epoch": result.KeyEpoch,
+	})
+}
+
+func decodeMachineID(value string) ([]byte, error) {
+	if strings.TrimSpace(value) != value || len(value) != 43 {
+		return nil, errors.New("invalid machine identity")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil || len(decoded) != sha256.Size ||
+		base64.RawURLEncoding.EncodeToString(decoded) != value {
+		return nil, errors.New("invalid machine identity")
+	}
+	return decoded, nil
+}
+
 func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
 	id, err := uuid.Parse(r.PathValue("id"))
@@ -958,6 +1010,7 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 		RemoteAgentUpdateCapable bool                              `json:"remote_agent_update_capable"`
 		SupportedShells          []string                          `json:"supported_shells"`
 		TerminalCommands         []store.TerminalCommandCapability `json:"terminal_commands"`
+		MachineID                string                            `json:"machine_id"`
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		writeError(w, r, 400, "INVALID_REQUEST", err)
@@ -981,6 +1034,14 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 400, "INVALID_REQUEST", err)
 		return
 	}
+	var machineID []byte
+	if input.MachineID != "" {
+		machineID, err = decodeMachineID(input.MachineID)
+		if err != nil {
+			writeError(w, r, http.StatusBadRequest, "INVALID_MACHINE_ID", err)
+			return
+		}
+	}
 	platform, architecture, platformVersion, capabilities, err := normalizePCAgentMetadata(
 		p.Device.Type,
 		input.Platform,
@@ -996,7 +1057,7 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_PC_AGENT_METADATA", err)
 		return
 	}
-	if err := a.Store.UpsertPC(r.Context(), p.UserID, p.Device.ID, store.PCRecord{
+	result, err := a.Store.UpsertPCResolved(r.Context(), p.UserID, p.Device.ID, store.PCRecord{
 		ID: id, Name: input.Name, AgentVersion: input.AgentVersion, KeyEpoch: input.KeyEpoch,
 		Platform: platform, Architecture: architecture, PlatformVersion: platformVersion,
 		Capabilities:             capabilities,
@@ -1004,11 +1065,16 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 		RemoteAgentUpdateCapable: store.HasPCCapability(capabilities, store.PCCapabilityRemoteAgentUpdateV1),
 		SupportedShells:          supportedShells,
 		TerminalCommands:         terminalCommands,
-	}); err != nil {
+		MachineIDHash:            machineID,
+	}, traceID(r.Context()))
+	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"id": id})
+	if result.ReplacedDeviceID != nil && a.Valkey != nil {
+		_ = a.Valkey.Client.Publish(r.Context(), "device-revoked", result.ReplacedDeviceID.String()).Err()
+	}
+	writeJSON(w, 200, map[string]any{"id": result.ID, "key_epoch": result.KeyEpoch})
 }
 
 var terminalCommandIDPattern = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,63}$`)

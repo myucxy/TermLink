@@ -23,6 +23,9 @@ namespace TermLink.Agent
         public long KeyEpoch { get; set; }
         public string OIDCIssuer { get; set; }
         public string OIDCClientId { get; set; }
+        // A one-way, account-scoped correlation value derived locally from the
+        // Windows MachineGuid. It is not an authentication credential.
+        public string MachineId { get; set; }
 
         public static string DefaultPath
         {
@@ -49,6 +52,32 @@ namespace TermLink.Agent
                 }
                 config.OIDCIssuer = config.OIDCIssuer.TrimEnd('/');
             }
+            if (!string.IsNullOrWhiteSpace(config.MachineId) &&
+                !ProductionMachineIdentity.IsValid(config.MachineId))
+                throw new InvalidDataException("Production Agent machine identity is invalid.");
+            if (string.IsNullOrWhiteSpace(config.MachineId) &&
+                !string.IsNullOrWhiteSpace(config.AccountKey) &&
+                !string.IsNullOrWhiteSpace(config.OIDCIssuer))
+            {
+                try
+                {
+                    config.MachineId = ProductionMachineIdentity.DeriveForCurrentMachine(
+                        config.OIDCIssuer, config.AccountKey);
+                    try { Save(config); }
+                    catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
+                    {
+                        // Keep the derived value in memory. The Agent can bind
+                        // the existing PC on this run and retry persistence on
+                        // the next startup.
+                    }
+                }
+                catch (InvalidOperationException)
+                {
+                    // Existing installations remain usable if Windows denies a
+                    // registry read. New enrollment fails explicitly instead of
+                    // silently creating another stable identity.
+                }
+            }
             return config;
         }
 
@@ -59,7 +88,9 @@ namespace TermLink.Agent
                 !Uri.TryCreate(config.OIDCIssuer, UriKind.Absolute, out var issuer) || issuer.Scheme != Uri.UriSchemeHttps ||
                 config.PcId == Guid.Empty || string.IsNullOrWhiteSpace(config.PcName) ||
                 string.IsNullOrWhiteSpace(config.AgentVersion) || config.KeyEpoch < 1 ||
-                string.IsNullOrWhiteSpace(config.OIDCClientId))
+                string.IsNullOrWhiteSpace(config.OIDCClientId) ||
+                (!string.IsNullOrWhiteSpace(config.MachineId) &&
+                    !ProductionMachineIdentity.IsValid(config.MachineId)))
             {
                 throw new ArgumentException("Production Agent configuration is incomplete.", nameof(config));
             }
@@ -259,7 +290,7 @@ namespace TermLink.Agent
                 string.Equals(existingAccountKey, incomingAccountKey, StringComparison.Ordinal);
         }
 
-        private static string NormalizeIssuer(string value)
+        internal static string NormalizeIssuer(string value)
         {
             value = (value ?? string.Empty).Trim().TrimEnd('/');
             if (!Uri.TryCreate(value, UriKind.Absolute, out var issuer) ||
@@ -282,7 +313,7 @@ namespace TermLink.Agent
             return value;
         }
 
-        private static string NormalizeAccountKey(string value)
+        internal static string NormalizeAccountKey(string value)
         {
             value = (value ?? string.Empty).Trim();
             if (value.Length != 76 || !value.StartsWith("oidc-sha256:", StringComparison.Ordinal)) return null;
@@ -447,6 +478,7 @@ namespace TermLink.Agent
         private const string AcceptanceRootEnvironment = "TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT";
         private const string ConfigFileName = "production-config.json";
         private const string CredentialsFileName = "production-credentials.dpapi";
+        private const string IdentityStoreFileName = "production-identities.dpapi";
 
         internal static string ConfigPath
         {
@@ -456,6 +488,11 @@ namespace TermLink.Agent
         internal static string CredentialsPath
         {
             get { return GetKnownFilePath(ResolveLocalApplicationDataRoot(), CredentialsFileName); }
+        }
+
+        internal static string IdentityStorePath
+        {
+            get { return GetKnownFilePath(ResolveLocalApplicationDataRoot(), IdentityStoreFileName); }
         }
 
         internal static void ForgetLocalAccount()
@@ -495,7 +532,8 @@ namespace TermLink.Agent
 
         // The root parameter makes the path contract independently testable.
         // Every invocation still resolves only <root>\TermLink and the two exact
-        // known files; directories and unrelated TermLink data are never removed.
+        // account-session files; the token-free retained identity store,
+        // directories, and unrelated TermLink data are never removed.
         internal static void ForgetLocalAccount(string localApplicationDataRoot)
         {
             if (string.IsNullOrWhiteSpace(localApplicationDataRoot))

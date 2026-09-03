@@ -339,6 +339,10 @@ public static class Program
             Require(viewModel.NoticeCode == "ACCOUNT_AUTHORIZATION_FAILED" &&
                     viewModel.NoticeDetail == PresentationText.BrowserAuthorizationFailedDetail,
                 "A legacy Agent browser-authorization failure was not localized.");
+            await viewModel.ReportFailureAsync(new AgentClientOperationException("ACCOUNT_MACHINE_IDENTITY_UNAVAILABLE"));
+            Require(viewModel.NoticeCode == "ACCOUNT_MACHINE_IDENTITY_UNAVAILABLE" &&
+                    viewModel.NoticeDetail == PresentationText.MachineIdentityUnavailableDetail,
+                "A stable-machine Server compatibility failure was not localized.");
         }
         finally
         {

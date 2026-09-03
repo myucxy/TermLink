@@ -196,6 +196,9 @@ public static class PresentationText
     public static string AccessDeniedDetail => Pick("当前账户或系统权限不足，无法完成该操作。", "The current account or system permission is insufficient.");
     public static string TimeoutDetail => Pick("操作等待超时，请检查 Agent 和服务器连接后重试。", "The operation timed out. Check the Agent and server connection, then retry.");
     public static string ConnectionFailedDetail => Pick("暂时无法连接 Agent 或服务器，请稍后重试。", "The Agent or server is temporarily unavailable.");
+    public static string MachineIdentityUnavailableDetail => Pick(
+        "服务器版本不支持稳定机器标识。请先升级服务端，然后重试登录。",
+        "The Server does not support stable machine identity. Upgrade the Server, then sign in again.");
     public static string UnexpectedFailureDetail => Pick("发生未预期错误。可在诊断页面查看原始错误信息。", "An unexpected error occurred. Open Diagnostics for the original detail.");
     public static string AgentMissingDetail => Pick(
         "未找到后台 Agent 程序，请重新安装或修复 TermLink。",

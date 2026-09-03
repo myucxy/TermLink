@@ -3,6 +3,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/hmac"
@@ -693,6 +694,21 @@ type PCRecord struct {
 	TerminalCommands          []TerminalCommandCapability `json:"terminal_commands"`
 	Online                    bool                        `json:"online"`
 	LastSeenAt                *time.Time                  `json:"last_seen_at,omitempty"`
+	// MachineIDHash is a client-derived, account-scoped correlation value. It
+	// locates a PC across key rotation but never authorizes a request.
+	MachineIDHash []byte `json:"-"`
+}
+
+type PCMachineResolution struct {
+	ID       uuid.UUID
+	Name     string
+	KeyEpoch int64
+}
+
+type PCUpsertResult struct {
+	ID               uuid.UUID
+	KeyEpoch         int64
+	ReplacedDeviceID *uuid.UUID
 }
 
 type TerminalCommandCapability struct {
@@ -703,17 +719,77 @@ type TerminalCommandCapability struct {
 }
 
 func (s *Postgres) UpsertPC(ctx context.Context, userID, deviceID uuid.UUID, item PCRecord) error {
+	_, err := s.UpsertPCResolved(ctx, userID, deviceID, item, "")
+	return err
+}
+
+func (s *Postgres) ResolvePCMachine(
+	ctx context.Context,
+	subjectHash [32]byte,
+	machineIDHash []byte,
+) (PCMachineResolution, bool, error) {
+	if len(machineIDHash) != sha256.Size {
+		return PCMachineResolution{}, false, ErrDenied
+	}
+	var result PCMachineResolution
+	err := s.Pool.QueryRow(ctx, `
+		SELECT p.id,p.name,p.key_epoch
+		FROM pcs p
+		JOIN users u ON u.id=p.owner_user_id
+		WHERE u.oidc_subject_hash=$1 AND u.status='ACTIVE' AND p.machine_id_hash=$2`,
+		subjectHash[:], machineIDHash,
+	).Scan(&result.ID, &result.Name, &result.KeyEpoch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return PCMachineResolution{}, false, nil
+	}
+	return result, err == nil, err
+}
+
+func (s *Postgres) UpsertPCResolved(
+	ctx context.Context,
+	userID, deviceID uuid.UUID,
+	item PCRecord,
+	traceID string,
+) (PCUpsertResult, error) {
+	var (
+		result PCUpsertResult
+		err    error
+	)
+	for attempt := 0; attempt < 5; attempt++ {
+		result, err = s.upsertPCResolvedOnce(ctx, userID, deviceID, item, traceID)
+		if isStablePCMachineIdentityConflict(err) {
+			return PCUpsertResult{}, ErrConflict
+		}
+		if !isPostgresRetryableTransactionError(err) {
+			return result, err
+		}
+		if ctx.Err() != nil {
+			return PCUpsertResult{}, ctx.Err()
+		}
+	}
+	return PCUpsertResult{}, err
+}
+
+func (s *Postgres) upsertPCResolvedOnce(
+	ctx context.Context,
+	userID, deviceID uuid.UUID,
+	item PCRecord,
+	traceID string,
+) (PCUpsertResult, error) {
 	applyLegacyPCDefaults(&item)
+	if len(item.MachineIDHash) != 0 && len(item.MachineIDHash) != sha256.Size {
+		return PCUpsertResult{}, ErrDenied
+	}
 	if item.TerminalCommands == nil {
 		item.TerminalCommands = []TerminalCommandCapability{}
 	}
 	terminalCommands, err := json.Marshal(item.TerminalCommands)
 	if err != nil {
-		return fmt.Errorf("encode terminal command capabilities: %w", err)
+		return PCUpsertResult{}, fmt.Errorf("encode terminal command capabilities: %w", err)
 	}
 	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
-		return err
+		return PCUpsertResult{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	// PC routes are account-owned resources.  Entitlement rows still exist for
@@ -725,40 +801,142 @@ func (s *Postgres) UpsertPC(ctx context.Context, userID, deviceID uuid.UUID, ite
 		FROM devices d
 		WHERE d.id=$1 AND d.user_id=$2 AND d.device_type IN ('WINDOWS_PC','PC_AGENT') AND d.trust_state='TRUSTED'
 		FOR UPDATE`, deviceID, userID).Scan(&trustedDevice); errors.Is(err, pgx.ErrNoRows) {
-		return ErrDenied
+		return PCUpsertResult{}, ErrDenied
 	} else if err != nil {
-		return err
+		return PCUpsertResult{}, err
+	}
+	if len(item.MachineIDHash) == sha256.Size {
+		var machinePCID uuid.UUID
+		err = tx.QueryRow(ctx, `
+			SELECT id FROM pcs
+			WHERE owner_user_id=$1 AND machine_id_hash=$2
+			FOR UPDATE`, userID, item.MachineIDHash).Scan(&machinePCID)
+		if err == nil && machinePCID != item.ID {
+			return PCUpsertResult{}, ErrConflict
+		}
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return PCUpsertResult{}, err
+		}
 	}
 	var existingOwner, existingDevice uuid.UUID
-	err = tx.QueryRow(ctx, `SELECT owner_user_id,device_id FROM pcs WHERE id=$1 FOR UPDATE`, item.ID).Scan(&existingOwner, &existingDevice)
+	var existingMachineID []byte
+	var existingKeyEpoch int64
+	err = tx.QueryRow(ctx, `
+		SELECT owner_user_id,device_id,machine_id_hash,key_epoch
+		FROM pcs WHERE id=$1 FOR UPDATE`, item.ID,
+	).Scan(&existingOwner, &existingDevice, &existingMachineID, &existingKeyEpoch)
 	hasExisting := err == nil
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return err
+		return PCUpsertResult{}, err
 	}
-	if hasExisting && (existingOwner != userID || existingDevice != deviceID) {
-		return ErrDenied
+	if hasExisting && existingOwner != userID {
+		return PCUpsertResult{}, ErrDenied
 	}
-	_, err = tx.Exec(ctx, `
+	// The machine correlation value is required only when a different device
+	// key is taking over the existing PC row. The currently bound device is
+	// already authenticated by its signing key, so an older Agent may continue
+	// heartbeating without clearing or knowing the stored machine identity.
+	if hasExisting && existingDevice != deviceID &&
+		(len(existingMachineID) != sha256.Size || len(item.MachineIDHash) != sha256.Size ||
+			!bytes.Equal(existingMachineID, item.MachineIDHash)) {
+		return PCUpsertResult{}, ErrDenied
+	}
+	var replacedDeviceID *uuid.UUID
+	if hasExisting && existingDevice != deviceID {
+		// A PC can change security keys only after the account-authenticated
+		// resolve step selected the row by its stable machine correlation value.
+		// The resolved epoch is also a compare-and-swap token: if another new
+		// Agent already completed this replacement, a stale contender must not
+		// immediately revoke the winner.
+		if len(existingMachineID) != sha256.Size || !bytes.Equal(existingMachineID, item.MachineIDHash) {
+			return PCUpsertResult{}, ErrDenied
+		}
+		if item.KeyEpoch != existingKeyEpoch {
+			return PCUpsertResult{}, ErrConflict
+		}
+		var previousApprovedBy *uuid.UUID
+		if err := tx.QueryRow(ctx, `
+			SELECT approved_by FROM devices
+			WHERE id=$1 AND user_id=$2 AND device_type IN ('WINDOWS_PC','PC_AGENT')
+			FOR UPDATE`, existingDevice, userID).Scan(&previousApprovedBy); err != nil {
+			return PCUpsertResult{}, err
+		}
+		command, err := tx.Exec(ctx, `
+			UPDATE devices SET trust_state='REVOKED',revoked_at=COALESCE(revoked_at,now())
+			WHERE id=$1 AND user_id=$2 AND id<>$3`, existingDevice, userID, deviceID)
+		if err != nil || command.RowsAffected() != 1 {
+			if err != nil {
+				return PCUpsertResult{}, err
+			}
+			return PCUpsertResult{}, ErrDenied
+		}
+		if previousApprovedBy == nil {
+			if _, err := tx.Exec(ctx, `
+				UPDATE devices SET approved_by=NULL,approved_at=COALESCE(approved_at,now())
+				WHERE id=$1 AND user_id=$2 AND trust_state='TRUSTED'`, deviceID, userID); err != nil {
+				return PCUpsertResult{}, err
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE devices SET approved_by=$3
+				WHERE user_id=$2 AND approved_by=$1 AND id<>$3`, existingDevice, userID, deviceID); err != nil {
+				return PCUpsertResult{}, err
+			}
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO outbox(event_type,aggregate_id,payload)
+			VALUES('device.revoked',$1,jsonb_build_object('user_id',$2::uuid,'device_id',$1::uuid))`,
+			existingDevice, userID); err != nil {
+			return PCUpsertResult{}, err
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata)
+			VALUES($1,$2,'pc.machine_identity.rotate','pc',$3,'SUCCEEDED',NULLIF($4,''),
+			       jsonb_build_object('previous_device_id',$5::uuid))`,
+			userID, deviceID, item.ID, traceID, existingDevice); err != nil {
+			return PCUpsertResult{}, err
+		}
+		replaced := existingDevice
+		replacedDeviceID = &replaced
+	}
+	var resolvedKeyEpoch int64
+	err = tx.QueryRow(ctx, `
 		INSERT INTO pcs(
 			id,owner_user_id,device_id,name,agent_version,key_epoch,last_seen_at,
 			session_heartbeat_capable,session_heartbeat_enabled_at,supported_shells,
-			remote_agent_update_capable,terminal_commands,platform,architecture,platform_version,capabilities)
+			remote_agent_update_capable,terminal_commands,platform,architecture,platform_version,capabilities,
+			machine_id_hash)
 		VALUES($1,$2,$3,$4,$5,$6,now(),$7,CASE WHEN $7 THEN now() END,
-		       COALESCE($8::text[],ARRAY[]::text[]),$9,$10::jsonb,$11,$12,$13,COALESCE($14::text[],ARRAY[]::text[]))
-		ON CONFLICT(id) DO UPDATE SET name=excluded.name,agent_version=excluded.agent_version,
-		key_epoch=GREATEST(pcs.key_epoch,excluded.key_epoch),last_seen_at=now(),
+		       COALESCE($8::text[],ARRAY[]::text[]),$9,$10::jsonb,$11,$12,$13,COALESCE($14::text[],ARRAY[]::text[]),$15)
+		ON CONFLICT(id) DO UPDATE SET device_id=excluded.device_id,name=excluded.name,agent_version=excluded.agent_version,
+		key_epoch=CASE WHEN pcs.device_id<>excluded.device_id
+			THEN pcs.key_epoch+1
+			ELSE GREATEST(pcs.key_epoch,excluded.key_epoch) END,last_seen_at=now(),
 		session_heartbeat_capable=pcs.session_heartbeat_capable OR excluded.session_heartbeat_capable,
 		session_heartbeat_enabled_at=COALESCE(pcs.session_heartbeat_enabled_at,excluded.session_heartbeat_enabled_at),
 		supported_shells=excluded.supported_shells,
 		remote_agent_update_capable=excluded.remote_agent_update_capable,
 		terminal_commands=excluded.terminal_commands,
 		platform=excluded.platform,architecture=excluded.architecture,
-		platform_version=excluded.platform_version,capabilities=excluded.capabilities
-		WHERE pcs.owner_user_id=$2 AND pcs.device_id=$3`, item.ID, userID, deviceID, item.Name, item.AgentVersion, item.KeyEpoch, item.SessionHeartbeatCapable, item.SupportedShells, item.RemoteAgentUpdateCapable, terminalCommands, item.Platform, item.Architecture, item.PlatformVersion, item.Capabilities)
-	if err != nil {
-		return err
+		platform_version=excluded.platform_version,capabilities=excluded.capabilities,
+		machine_id_hash=COALESCE(pcs.machine_id_hash,excluded.machine_id_hash)
+		WHERE pcs.owner_user_id=$2 AND (pcs.device_id=$3 OR pcs.machine_id_hash=$15)
+		RETURNING key_epoch`, item.ID, userID, deviceID, item.Name, item.AgentVersion, item.KeyEpoch, item.SessionHeartbeatCapable, item.SupportedShells, item.RemoteAgentUpdateCapable, terminalCommands, item.Platform, item.Architecture, item.PlatformVersion, item.Capabilities, nullableBytes(item.MachineIDHash)).Scan(&resolvedKeyEpoch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return PCUpsertResult{}, ErrDenied
 	}
-	return tx.Commit(ctx)
+	if err != nil {
+		return PCUpsertResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return PCUpsertResult{}, err
+	}
+	return PCUpsertResult{ID: item.ID, KeyEpoch: resolvedKeyEpoch, ReplacedDeviceID: replacedDeviceID}, nil
+}
+
+func isStablePCMachineIdentityConflict(err error) bool {
+	var postgresError *pgconn.PgError
+	return errors.As(err, &postgresError) && postgresError.Code == "23505" &&
+		postgresError.ConstraintName == "pcs_owner_machine_identity_unique"
 }
 
 // TouchPCPresence is called by the authenticated production Realtime

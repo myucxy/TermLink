@@ -220,14 +220,31 @@ class SessionCatalogReconciliationTest {
         val storedPc = pc(online = true).copy(deviceId = oldDeviceId, keyEpoch = 9)
         val storedDevice = device(oldDeviceId, 1)
 
-        // A replacement Windows device has its own epoch namespace and key.
+        // A replacement Windows device can introduce a new key only while the
+        // PC-wide epoch advances.
         validateAuthoritativePcKeyTransition(
             storedPc,
             storedDevice,
-            storedPc.copy(deviceId = newDeviceId, keyEpoch = 1),
+            storedPc.copy(deviceId = newDeviceId, keyEpoch = 10),
             device(newDeviceId, 2),
         )
 
+        assertThrows(IllegalArgumentException::class.java) {
+            validateAuthoritativePcKeyTransition(
+                storedPc,
+                storedDevice,
+                storedPc.copy(deviceId = newDeviceId, keyEpoch = 9),
+                device(newDeviceId, 2),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            validateAuthoritativePcKeyTransition(
+                storedPc,
+                storedDevice,
+                storedPc.copy(deviceId = newDeviceId, keyEpoch = 10),
+                null,
+            )
+        }
         assertThrows(IllegalArgumentException::class.java) {
             validateAuthoritativePcKeyTransition(
                 storedPc,

@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Cryptography;
@@ -139,6 +140,21 @@ namespace TermLink.Agent
 
             [JsonPropertyName("expires_in")]
             public int ExpiresIn { get; set; }
+        }
+
+        private sealed class MachineResolutionResponse
+        {
+            [JsonPropertyName("found")]
+            public bool Found { get; set; }
+
+            [JsonPropertyName("pc_id")]
+            public string PcId { get; set; }
+
+            [JsonPropertyName("pc_name")]
+            public string PcName { get; set; }
+
+            [JsonPropertyName("key_epoch")]
+            public long KeyEpoch { get; set; }
         }
 
         internal static int Run(ProductionEnrollmentOptions options)
@@ -345,7 +361,7 @@ namespace TermLink.Agent
             var tokens = await ReadJsonAsync<TokenResponse>(tokenResponse, CancellationToken.None).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(tokens.AccessToken) || string.IsNullOrWhiteSpace(tokens.RefreshToken) || tokens.ExpiresIn < 30)
                 throw new InvalidDataException("OIDC token response is incomplete.");
-            PersistTokens(serverUrl.TrimEnd('/'), pcName, client, tokens);
+            await PersistTokensAsync(serverUrl.TrimEnd('/'), pcName, client, tokens, http).ConfigureAwait(false);
         }
 
         private static void ValidateClientConfigurationForDirect(ClientConfiguration client)
@@ -354,54 +370,141 @@ namespace TermLink.Agent
                 throw new InvalidDataException("TermLink client configuration is invalid.");
         }
 
-        private static void PersistTokens(string serverUrl, string pcName, ClientConfiguration client, TokenResponse tokens)
+        private static async Task PersistTokensAsync(
+            string serverUrl,
+            string pcName,
+            ClientConfiguration client,
+            TokenResponse tokens,
+            HttpClient http)
         {
             var existingConfig = ProductionAgentConfig.TryLoad();
-            if (existingConfig != null && !string.Equals(existingConfig.ServerUrl, serverUrl, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("The existing TermLink device is linked to a different server.");
             using var existingCredentials = ProductionCredentials.TryLoad();
             var account = ProductionCredentials.ReadAccountClaims(tokens.AccessToken);
             var accountKey = ProductionCredentials.ReadAccountKey(tokens.AccessToken, client.OIDCIssuer);
             if (string.IsNullOrWhiteSpace(accountKey))
                 throw new InvalidDataException("The OIDC access token does not identify a stable issuer and subject.");
+            var machineId = ProductionMachineIdentity.DeriveForCurrentMachine(client.OIDCIssuer, accountKey);
             var selection = SelectIdentity(
                 existingCredentials?.AccountKey,
                 existingCredentials == null ? Guid.Empty : existingCredentials.DeviceId,
                 existingConfig?.AccountKey,
                 existingConfig == null ? Guid.Empty : existingConfig.PcId,
                 accountKey);
+            var existingIssuerMatches = existingConfig == null ||
+                string.Equals(
+                    ProductionCredentials.NormalizeIssuer(existingConfig.OIDCIssuer),
+                    ProductionCredentials.NormalizeIssuer(client.OIDCIssuer),
+                    StringComparison.Ordinal);
+            if (existingConfig != null &&
+                !string.Equals(existingConfig.ServerUrl, serverUrl, StringComparison.OrdinalIgnoreCase) &&
+                (!selection.ReusePcIdentity || !existingIssuerMatches))
+            {
+                throw new InvalidOperationException("The existing TermLink device is linked to a different identity service.");
+            }
+
+            using var retained = selection.ReusePcIdentity
+                ? null
+                : ProductionIdentityStore.TryLoad(accountKey, client.OIDCIssuer, machineId);
+            var reuseRetainedDevice = !selection.ReuseDeviceIdentity && retained != null;
+            var reuseRetainedPc = !selection.ReusePcIdentity && retained != null;
+            MachineResolutionResponse recovered = null;
+            if (!selection.ReusePcIdentity && !reuseRetainedPc)
+            {
+                recovered = await ResolveMachineAsync(
+                    serverUrl,
+                    machineId,
+                    tokens.AccessToken,
+                    http).ConfigureAwait(false);
+            }
+
+            var deviceId = selection.ReuseDeviceIdentity
+                ? selection.DeviceId
+                : reuseRetainedDevice ? retained.DeviceId : Guid.NewGuid();
+            var resolvedPcId = selection.ReusePcIdentity
+                ? selection.PcId
+                : reuseRetainedPc ? retained.PcId
+                : recovered != null ? Guid.Parse(recovered.PcId)
+                : ProductionMachineIdentity.DeriveInitialPcId(machineId);
+            var resolvedPcName = selection.ReusePcIdentity && existingConfig != null
+                ? existingConfig.PcName
+                : reuseRetainedPc ? retained.PcName
+                : recovered != null && !string.IsNullOrWhiteSpace(recovered.PcName)
+                    ? NormalizePcName(recovered.PcName)
+                    : NormalizePcName(pcName);
+            var resolvedKeyEpoch = selection.ReusePcIdentity && existingConfig != null
+                ? existingConfig.KeyEpoch
+                : reuseRetainedPc ? retained.KeyEpoch
+                : recovered != null ? recovered.KeyEpoch
+                : 1;
             DeviceIdentity identity = null;
+            var ownsIdentity = false;
             try
             {
-                identity = selection.ReuseDeviceIdentity ? existingCredentials.Identity : DeviceIdentity.Generate();
+                if (selection.ReuseDeviceIdentity)
+                    identity = existingCredentials.Identity;
+                else if (reuseRetainedDevice)
+                    identity = retained.Identity;
+                else
+                {
+                    identity = DeviceIdentity.Generate();
+                    ownsIdentity = true;
+                }
                 ProductionCredentials.SaveWithRefreshToken(
-                    selection.DeviceId,
+                    deviceId,
                     identity,
                     accountKey,
                     tokens.AccessToken,
                     tokens.RefreshToken,
                     DateTime.UtcNow.AddSeconds(tokens.ExpiresIn));
-                ProductionAgentConfig.Save(new ProductionAgentConfig
+                var config = new ProductionAgentConfig
                 {
                     ServerUrl = serverUrl,
-                    PcId = selection.PcId,
-                    PcName = selection.ReusePcIdentity && existingConfig != null
-                        ? existingConfig.PcName
-                        : NormalizePcName(pcName),
+                    PcId = resolvedPcId,
+                    PcName = resolvedPcName,
                     AccountKey = accountKey,
                     AccountUsername = string.IsNullOrWhiteSpace(account.Username) && selection.ReusePcIdentity ? existingConfig?.AccountUsername : account.Username,
                     AccountNickname = string.IsNullOrWhiteSpace(account.Nickname) && selection.ReusePcIdentity ? existingConfig?.AccountNickname : account.Nickname,
                     AccountEmail = string.IsNullOrWhiteSpace(account.Email) && selection.ReusePcIdentity ? existingConfig?.AccountEmail : account.Email,
                     AgentVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown",
-                    KeyEpoch = selection.ReusePcIdentity && existingConfig != null ? existingConfig.KeyEpoch : 1,
+                    KeyEpoch = resolvedKeyEpoch,
                     OIDCIssuer = client.OIDCIssuer,
-                    OIDCClientId = client.ClientId
-                });
+                    OIDCClientId = client.ClientId,
+                    MachineId = machineId
+                };
+                ProductionAgentConfig.Save(config);
+                ProductionIdentityStore.TrySave(config, deviceId, identity, accountKey);
             }
             finally
             {
-                if (!selection.ReuseDeviceIdentity) identity?.Dispose();
+                if (ownsIdentity) identity?.Dispose();
             }
+        }
+
+        private static async Task<MachineResolutionResponse> ResolveMachineAsync(
+            string serverUrl,
+            string machineId,
+            string accessToken,
+            HttpClient http)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, serverUrl + "/v1/pcs/resolve-machine")
+            {
+                Content = new StringContent(
+                    JsonSerializer.Serialize(new { machine_id = machineId }),
+                    Encoding.UTF8,
+                    "application/json")
+            };
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+                throw new ProductionEnrollmentException(
+                    "ACCOUNT_MACHINE_IDENTITY_UNAVAILABLE",
+                    "The TermLink Server must support stable machine identity before this PC can be linked safely.");
+            var result = await ReadJsonAsync<MachineResolutionResponse>(response, CancellationToken.None).ConfigureAwait(false);
+            if (!result.Found) return null;
+            if (!Guid.TryParse(result.PcId, out var pcId) || pcId == Guid.Empty ||
+                string.IsNullOrWhiteSpace(result.PcName) || result.PcName.Length > 128 || result.KeyEpoch < 1)
+                throw new InvalidDataException("The TermLink machine identity response is invalid.");
+            return result;
         }
 
         private static string NormalizePcName(string pcName)
@@ -537,7 +640,7 @@ namespace TermLink.Agent
 
                 try
                 {
-                    PersistTokens(options.ServerUrl, options.PcName, client, tokens);
+                    await PersistTokensAsync(options.ServerUrl, options.PcName, client, tokens, http).ConfigureAwait(false);
                 }
                 finally
                 {
