@@ -54,6 +54,8 @@ namespace TermLink.Agent
         };
         private readonly Guid pcId;
         private readonly ProductionFileOperationApi.AuthenticatedSendAsync send;
+        private readonly ProductionClaimIdempotencyTracker claimIdempotency =
+            new ProductionClaimIdempotencyTracker();
 
         internal ProductionAgentUpdateApi(
             Guid pcId,
@@ -66,17 +68,39 @@ namespace TermLink.Agent
 
         internal async Task<ClaimedAgentUpdate> ClaimAsync(CancellationToken token)
         {
+            var idempotencyKey = claimIdempotency.BeginAttempt();
             using var response = await send(
                 HttpMethod.Post,
                 BasePath + "/claim",
                 Array.Empty<byte>(),
                 true,
-                Guid.NewGuid().ToString("D"),
+                idempotencyKey,
                 token).ConfigureAwait(false);
-            if (response.StatusCode == HttpStatusCode.NoContent) return null;
-            await EnsureSuccessAsync(response, "Agent update claim failed.", token).ConfigureAwait(false);
-            using var document = JsonDocument.Parse(
-                await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
+            if (response.StatusCode == HttpStatusCode.NoContent)
+            {
+                claimIdempotency.ObserveDefinitiveResponse(idempotencyKey);
+                return null;
+            }
+            if (response.StatusCode == HttpStatusCode.Conflict)
+            {
+                var errorBytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
+                if (HasErrorCode(errorBytes, "IDEMPOTENCY_IN_PROGRESS"))
+                {
+                    claimIdempotency.ObserveInProgress(idempotencyKey);
+                    throw new HttpRequestException(
+                        "Agent update claim idempotency is still in progress.",
+                        null,
+                        response.StatusCode);
+                }
+            }
+            if (!response.IsSuccessStatusCode)
+            {
+                claimIdempotency.ObserveDefinitiveResponse(idempotencyKey);
+                await EnsureSuccessAsync(response, "Agent update claim failed.", token).ConfigureAwait(false);
+            }
+            var responseBytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
+            claimIdempotency.ObserveDefinitiveResponse(idempotencyKey);
+            using var document = JsonDocument.Parse(responseBytes);
             if (!document.RootElement.TryGetProperty("agent_update", out var item) ||
                 item.ValueKind != JsonValueKind.Object ||
                 !document.RootElement.TryGetProperty("lease_token", out var lease) ||
@@ -86,6 +110,21 @@ namespace TermLink.Agent
             result.LeaseToken = lease.GetString();
             ValidateClaim(result);
             return result;
+        }
+
+        private static bool HasErrorCode(byte[] body, string expected)
+        {
+            if (body == null || body.Length == 0 || body.Length > 4096) return false;
+            try
+            {
+                using var document = JsonDocument.Parse(body);
+                return document.RootElement.TryGetProperty("error", out var error) &&
+                    error.ValueKind == JsonValueKind.Object &&
+                    error.TryGetProperty("code", out var code) &&
+                    code.ValueKind == JsonValueKind.String &&
+                    string.Equals(code.GetString(), expected, StringComparison.Ordinal);
+            }
+            catch (JsonException) { return false; }
         }
 
         internal Task ProgressAsync(

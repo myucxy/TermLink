@@ -240,6 +240,7 @@ namespace TermLink.Agent
         private ProductionHistoryUploader historyUploader;
         private ProductionFileOperationWorker fileOperationWorker;
         private ProductionAgentUpdateWorker agentUpdateWorker;
+        private PostRegistrationWorkerStartGate postRegistrationWorkerStartGate;
         private DateTime authorityExpiresUtc;
         private DateTime lastPCUpsertAttemptUtc;
         private DateTime statusExpiresUtc;
@@ -471,7 +472,6 @@ namespace TermLink.Agent
                     sessionId => registry.ContainsSession(sessionId),
                     sessionId => registry.TerminateSession(sessionId),
                     diagnostic: ObserveFileOperationWorkerDiagnostic);
-                fileOperationWorker.Start();
                 agentUpdateWorker = new ProductionAgentUpdateWorker(
                     new ProductionAgentUpdateApi(config.PcId, SendAsync),
                     config.PcId,
@@ -484,7 +484,9 @@ namespace TermLink.Agent
                     {
                         lock (statusSync) return relayState == ProductionRelayState.Connected;
                     });
-                agentUpdateWorker.Start();
+                postRegistrationWorkerStartGate = new PostRegistrationWorkerStartGate(
+                    fileOperationWorker.Start,
+                    agentUpdateWorker.Start);
                 historyWorker = Task.Run(() => HistoryUploadLoopAsync(allowPersistedBacklog: true));
                 // A persisted frame can contain a very large output payload and
                 // is only cooperatively preemptible between terminal parser
@@ -844,7 +846,9 @@ namespace TermLink.Agent
                 try
                 {
                     SetRelayState(ProductionRelayState.Connecting, string.Empty);
-                    await EnsureRegisteredAsync(cancellation.Token).ConfigureAwait(false);
+                    await postRegistrationWorkerStartGate.EnsureRegisteredThenStartAsync(
+                        EnsureRegisteredAsync,
+                        cancellation.Token).ConfigureAwait(false);
                     await ConnectAndPumpAsync(cancellation.Token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return; }
@@ -5038,6 +5042,7 @@ namespace TermLink.Agent
         internal void StopAccountSynchronization()
         {
             if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+            postRegistrationWorkerStartGate?.Retire();
             var availabilityHandler = Interlocked.Exchange(ref networkAvailabilityHandler, null);
             if (availabilityHandler != null)
                 NetworkChange.NetworkAvailabilityChanged -= availabilityHandler;

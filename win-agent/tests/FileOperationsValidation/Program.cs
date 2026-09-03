@@ -26,7 +26,10 @@ try
     await ValidateDeterministicServerRejectionsAsync(testRoot);
     await ValidateApiContractAsync();
     await ValidateClaimAmbiguityAsync();
+    await ValidateClaimBodyAmbiguityAsync();
     await ValidateClaimInProgressRecoveryAsync();
+    await ValidateClaimDefinitiveRejectionRecoveryAsync();
+    await ValidateClaimInvalidResponseRecoveryAsync();
     ValidateTerminalLaunch(testRoot);
     Console.WriteLine("Windows file-operation validation passed.");
 }
@@ -895,6 +898,39 @@ static async Task ValidateClaimAmbiguityAsync()
         "confirmed claim outcome did not advance to a fresh idempotency key");
 }
 
+static async Task ValidateClaimBodyAmbiguityAsync()
+{
+    var keys = new List<string>();
+    var attempt = 0;
+    Task<HttpResponseMessage> Send(
+        HttpMethod method,
+        string path,
+        byte[] body,
+        bool deviceProof,
+        string idempotencyKey,
+        CancellationToken token)
+    {
+        keys.Add(idempotencyKey);
+        if (Interlocked.Increment(ref attempt) == 1)
+        {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new FaultingHttpContent()
+            });
+        }
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+    }
+
+    using var uploadHttp = new HttpClient(new ContractHandler());
+    var api = new ProductionFileOperationApi(Guid.NewGuid(), uploadHttp, Send);
+    try { await api.ClaimAsync(CancellationToken.None); }
+    catch (HttpRequestException) { }
+    catch (IOException) { }
+    Require(await api.ClaimAsync(CancellationToken.None) == null &&
+        keys.Count == 2 && keys[0] == keys[1],
+        "a successful claim with an incomplete response body did not preserve its ambiguous idempotency key");
+}
+
 static async Task ValidateClaimInProgressRecoveryAsync()
 {
     var operationId = Guid.NewGuid();
@@ -948,6 +984,68 @@ static async Task ValidateClaimInProgressRecoveryAsync()
         "recovered claim did not advance to a fresh queue idempotency key");
 }
 
+static async Task ValidateClaimDefinitiveRejectionRecoveryAsync()
+{
+    var keys = new List<string>();
+    var attempt = 0;
+    Task<HttpResponseMessage> Send(
+        HttpMethod method,
+        string path,
+        byte[] body,
+        bool deviceProof,
+        string idempotencyKey,
+        CancellationToken token)
+    {
+        keys.Add(idempotencyKey);
+        if (Interlocked.Increment(ref attempt) == 1)
+        {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Forbidden)
+            {
+                Content = new StringContent(
+                    "{\"error\":{\"code\":\"PC_NOT_FOUND\"}}",
+                    Encoding.UTF8,
+                    "application/json")
+            });
+        }
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+    }
+
+    using var uploadHttp = new HttpClient(new ContractHandler());
+    var api = new ProductionFileOperationApi(Guid.NewGuid(), uploadHttp, Send);
+    try { await api.ClaimAsync(CancellationToken.None); }
+    catch (FileOperationRemoteException error) when (!error.Retryable) { }
+    Require(await api.ClaimAsync(CancellationToken.None) == null &&
+        keys.Count == 2 && keys[0] != keys[1],
+        "a definitive HTTP 403 claim rejection pinned the file worker to the cached idempotency result");
+}
+
+static async Task ValidateClaimInvalidResponseRecoveryAsync()
+{
+    var keys = new List<string>();
+    var attempt = 0;
+    Task<HttpResponseMessage> Send(
+        HttpMethod method,
+        string path,
+        byte[] body,
+        bool deviceProof,
+        string idempotencyKey,
+        CancellationToken token)
+    {
+        keys.Add(idempotencyKey);
+        if (Interlocked.Increment(ref attempt) == 1)
+            return Task.FromResult(JsonResponse("{}"));
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+    }
+
+    using var uploadHttp = new HttpClient(new ContractHandler());
+    var api = new ProductionFileOperationApi(Guid.NewGuid(), uploadHttp, Send);
+    try { await api.ClaimAsync(CancellationToken.None); }
+    catch (FileOperationRemoteException) { }
+    Require(await api.ClaimAsync(CancellationToken.None) == null &&
+        keys.Count == 2 && keys[0] != keys[1],
+        "a malformed successful claim response pinned the file worker to the cached response");
+}
+
 static async Task RequireRemoteNonRetryableAsync(Func<Task> action, string message)
 {
     try { await action(); }
@@ -994,6 +1092,18 @@ sealed class RecordingProcessStarter : IProcessStarter
         Starts.Add(startInfo);
         if (FailFirst && Starts.Count == 1) return false;
         return true;
+    }
+}
+
+sealed class FaultingHttpContent : HttpContent
+{
+    protected override Task SerializeToStreamAsync(Stream stream, TransportContext context) =>
+        Task.FromException(new IOException("simulated response body transport failure"));
+
+    protected override bool TryComputeLength(out long length)
+    {
+        length = 0;
+        return false;
     }
 }
 

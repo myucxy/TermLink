@@ -62,6 +62,8 @@ namespace TermLink.AgentUpdate.Validation
                     "an Agent with the wrong executing build accepted the claim");
                 ValidateSupervisorRecoveryDecisions();
                 await ValidateVerifiedDownloadPromotionAsync();
+                await ValidateClaimRecoveryAsync();
+                await ValidatePostRegistrationWorkerGateAsync();
 
                 await api.ProgressAsync(update, "PRECHECKING", 2, 0, CancellationToken.None);
                 await api.ProgressAsync(update, "DOWNLOADING", 5, null, CancellationToken.None);
@@ -93,6 +95,185 @@ namespace TermLink.AgentUpdate.Validation
                 Console.Error.WriteLine(error);
                 return 1;
             }
+        }
+
+        private static async Task ValidateClaimRecoveryAsync()
+        {
+            await ValidateAmbiguousClaimRecoveryAsync();
+            await ValidateAmbiguousClaimBodyRecoveryAsync();
+            await ValidateDefinitiveClaimRecoveryAsync();
+            await ValidateInProgressClaimRecoveryAsync();
+            await ValidateInvalidClaimRecoveryAsync();
+        }
+
+        private static async Task ValidateAmbiguousClaimRecoveryAsync()
+        {
+            var keys = new List<string>();
+            var attempt = 0;
+            ProductionFileOperationApi.AuthenticatedSendAsync send =
+                (method, path, body, deviceProof, idempotencyKey, token) =>
+                {
+                    keys.Add(idempotencyKey);
+                    if (Interlocked.Increment(ref attempt) == 1)
+                        throw new HttpRequestException("response lost after Server update claim");
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+                };
+            var api = new ProductionAgentUpdateApi(Guid.NewGuid(), send);
+            try { await api.ClaimAsync(CancellationToken.None); }
+            catch (HttpRequestException) { }
+            Assert(await api.ClaimAsync(CancellationToken.None) == null &&
+                keys.Count == 2 && keys[0] == keys[1],
+                "ambiguous Agent update claim retry changed its idempotency key");
+            Assert(await api.ClaimAsync(CancellationToken.None) == null && keys[2] != keys[1],
+                "confirmed Agent update claim did not advance to a fresh idempotency key");
+        }
+
+        private static async Task ValidateDefinitiveClaimRecoveryAsync()
+        {
+            var keys = new List<string>();
+            var attempt = 0;
+            ProductionFileOperationApi.AuthenticatedSendAsync send =
+                (method, path, body, deviceProof, idempotencyKey, token) =>
+                {
+                    keys.Add(idempotencyKey);
+                    if (Interlocked.Increment(ref attempt) == 1)
+                    {
+                        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Forbidden)
+                        {
+                            Content = new StringContent(
+                                "{\"error\":{\"code\":\"PC_NOT_FOUND\"}}",
+                                Encoding.UTF8,
+                                "application/json")
+                        });
+                    }
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+                };
+            var api = new ProductionAgentUpdateApi(Guid.NewGuid(), send);
+            try { await api.ClaimAsync(CancellationToken.None); }
+            catch (HttpRequestException error) when (error.StatusCode == HttpStatusCode.Forbidden) { }
+            Assert(await api.ClaimAsync(CancellationToken.None) == null &&
+                keys.Count == 2 && keys[0] != keys[1],
+                "a definitive HTTP 403 pinned Agent update polling to a cached idempotency result");
+        }
+
+        private static async Task ValidateAmbiguousClaimBodyRecoveryAsync()
+        {
+            var keys = new List<string>();
+            var attempt = 0;
+            ProductionFileOperationApi.AuthenticatedSendAsync send =
+                (method, path, body, deviceProof, idempotencyKey, token) =>
+                {
+                    keys.Add(idempotencyKey);
+                    if (Interlocked.Increment(ref attempt) == 1)
+                    {
+                        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                        {
+                            Content = new FaultingHttpContent()
+                        });
+                    }
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+                };
+            var api = new ProductionAgentUpdateApi(Guid.NewGuid(), send);
+            try { await api.ClaimAsync(CancellationToken.None); }
+            catch (HttpRequestException) { }
+            catch (IOException) { }
+            Assert(await api.ClaimAsync(CancellationToken.None) == null &&
+                keys.Count == 2 && keys[0] == keys[1],
+                "an Agent update claim with an incomplete response body did not preserve its ambiguous key");
+        }
+
+        private static async Task ValidateInProgressClaimRecoveryAsync()
+        {
+            var keys = new List<string>();
+            ProductionFileOperationApi.AuthenticatedSendAsync send =
+                (method, path, body, deviceProof, idempotencyKey, token) =>
+                {
+                    keys.Add(idempotencyKey);
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Conflict)
+                    {
+                        Content = new StringContent(
+                            "{\"error\":{\"code\":\"IDEMPOTENCY_IN_PROGRESS\"}}",
+                            Encoding.UTF8,
+                            "application/json")
+                    });
+                };
+            var api = new ProductionAgentUpdateApi(Guid.NewGuid(), send);
+            for (var index = 0; index < 5; index++)
+            {
+                try { await api.ClaimAsync(CancellationToken.None); }
+                catch (HttpRequestException error) when (error.StatusCode == HttpStatusCode.Conflict) { continue; }
+                throw new InvalidOperationException("Agent update IDEMPOTENCY_IN_PROGRESS was not retryable.");
+            }
+            Assert(keys.Take(4).Distinct(StringComparer.Ordinal).Count() == 1 &&
+                keys[4] != keys[3],
+                "Agent update claim did not bound in-progress retries before rotating its key");
+        }
+
+        private static async Task ValidateInvalidClaimRecoveryAsync()
+        {
+            var keys = new List<string>();
+            var attempt = 0;
+            ProductionFileOperationApi.AuthenticatedSendAsync send =
+                (method, path, body, deviceProof, idempotencyKey, token) =>
+                {
+                    keys.Add(idempotencyKey);
+                    if (Interlocked.Increment(ref attempt) == 1)
+                    {
+                        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                        {
+                            Content = new StringContent("{}", Encoding.UTF8, "application/json")
+                        });
+                    }
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+                };
+            var api = new ProductionAgentUpdateApi(Guid.NewGuid(), send);
+            try { await api.ClaimAsync(CancellationToken.None); }
+            catch (InvalidDataException) { }
+            Assert(await api.ClaimAsync(CancellationToken.None) == null &&
+                keys.Count == 2 && keys[0] != keys[1],
+                "an invalid successful Agent update response pinned polling to its cached response");
+        }
+
+        private static async Task ValidatePostRegistrationWorkerGateAsync()
+        {
+            var registrations = 0;
+            var fileStarts = 0;
+            var updateStarts = 0;
+            var rejectRegistration = true;
+            var gate = new PostRegistrationWorkerStartGate(
+                () => fileStarts++,
+                () => updateStarts++);
+            Task Register(CancellationToken token)
+            {
+                registrations++;
+                return rejectRegistration
+                    ? Task.FromException(new HttpRequestException("PC upsert rejected"))
+                    : Task.CompletedTask;
+            }
+
+            try { await gate.EnsureRegisteredThenStartAsync(Register, CancellationToken.None); }
+            catch (HttpRequestException) { }
+            Assert(registrations == 1 && fileStarts == 0 && updateStarts == 0,
+                "REST workers started before the PC registration transaction succeeded");
+
+            rejectRegistration = false;
+            await gate.EnsureRegisteredThenStartAsync(Register, CancellationToken.None);
+            await gate.EnsureRegisteredThenStartAsync(Register, CancellationToken.None);
+            Assert(registrations == 3 && fileStarts == 1 && updateStarts == 1,
+                "post-registration workers were not started exactly once across reconnect registration");
+
+            var retiredStarts = 0;
+            var retiredGate = new PostRegistrationWorkerStartGate(() => retiredStarts++);
+            var registrationRelease = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var inFlightRegistration = retiredGate.EnsureRegisteredThenStartAsync(
+                _ => registrationRelease.Task,
+                CancellationToken.None);
+            retiredGate.Retire();
+            registrationRelease.SetResult();
+            await inFlightRegistration;
+            Assert(retiredStarts == 0,
+                "a registration completing during shutdown started a retired worker");
         }
 
         private static void ValidateBrowserAuthorizationLaunch()
@@ -235,6 +416,18 @@ namespace TermLink.AgentUpdate.Validation
         private static void Assert(bool condition, string message)
         {
             if (!condition) throw new InvalidOperationException(message);
+        }
+
+        private sealed class FaultingHttpContent : HttpContent
+        {
+            protected override Task SerializeToStreamAsync(Stream stream, TransportContext context) =>
+                Task.FromException(new IOException("simulated response body transport failure"));
+
+            protected override bool TryComputeLength(out long length)
+            {
+                length = 0;
+                return false;
+            }
         }
     }
 }

@@ -107,13 +107,11 @@ namespace TermLink.Agent
             PropertyNameCaseInsensitive = true,
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
         };
-        private const int MaximumClaimInProgressRetries = 4;
         private readonly Guid pcId;
         private readonly HttpClient uploadHttp;
         private readonly AuthenticatedSendAsync send;
-        private readonly object claimSync = new object();
-        private string pendingClaimIdempotencyKey;
-        private int pendingClaimInProgressRetries;
+        private readonly ProductionClaimIdempotencyTracker claimIdempotency =
+            new ProductionClaimIdempotencyTracker();
         private long renewalSequence;
         private long uploadSequence;
 
@@ -130,11 +128,7 @@ namespace TermLink.Agent
 
         public async Task<ClaimedFileOperation> ClaimAsync(CancellationToken token)
         {
-            string idempotencyKey;
-            lock (claimSync)
-            {
-                idempotencyKey = pendingClaimIdempotencyKey ??= Guid.NewGuid().ToString("D");
-            }
+            var idempotencyKey = claimIdempotency.BeginAttempt();
             using var response = await send(
                 HttpMethod.Post,
                 BasePath + "/claim",
@@ -144,7 +138,7 @@ namespace TermLink.Agent
                 token).ConfigureAwait(false);
             if (response.StatusCode == HttpStatusCode.NoContent)
             {
-                ConfirmClaimAttempt(idempotencyKey);
+                claimIdempotency.ObserveDefinitiveResponse(idempotencyKey);
                 return null;
             }
             if (response.StatusCode == HttpStatusCode.Conflict)
@@ -152,14 +146,25 @@ namespace TermLink.Agent
                 var errorBytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
                 if (HasErrorCode(errorBytes, "IDEMPOTENCY_IN_PROGRESS"))
                 {
-                    RecordClaimInProgress(idempotencyKey);
+                    claimIdempotency.ObserveInProgress(idempotencyKey);
                     throw new FileOperationRemoteException(
                         "File-operation claim idempotency is still in progress.");
                 }
             }
-            await EnsureSuccessAsync(response, "File-operation claim failed.", token).ConfigureAwait(false);
-            using var document = JsonDocument.Parse(
-                await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
+            if (!response.IsSuccessStatusCode)
+            {
+                // The status is definitive and no lease can be stranded by
+                // rotating the key, even if the optional error body is broken.
+                claimIdempotency.ObserveDefinitiveResponse(idempotencyKey);
+                await EnsureSuccessAsync(response, "File-operation claim failed.", token).ConfigureAwait(false);
+            }
+
+            // Complete the body read before rotating a successful claim. A
+            // transport failure after response headers is still ambiguous and
+            // must replay the same key to recover the already-created lease.
+            var responseBytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
+            claimIdempotency.ObserveDefinitiveResponse(idempotencyKey);
+            using var document = JsonDocument.Parse(responseBytes);
             if (!document.RootElement.TryGetProperty("file_operation", out var operationElement) ||
                 operationElement.ValueKind != JsonValueKind.Object)
             {
@@ -174,37 +179,7 @@ namespace TermLink.Agent
             }
             operation.LeaseToken = leaseTokenElement.GetString();
             ValidateClaim(operation);
-            ConfirmClaimAttempt(idempotencyKey);
             return operation;
-        }
-
-        private void ConfirmClaimAttempt(string idempotencyKey)
-        {
-            lock (claimSync)
-            {
-                if (string.Equals(pendingClaimIdempotencyKey, idempotencyKey, StringComparison.Ordinal))
-                {
-                    pendingClaimIdempotencyKey = null;
-                    pendingClaimInProgressRetries = 0;
-                }
-            }
-        }
-
-        private void RecordClaimInProgress(string idempotencyKey)
-        {
-            lock (claimSync)
-            {
-                if (!string.Equals(pendingClaimIdempotencyKey, idempotencyKey, StringComparison.Ordinal)) return;
-                pendingClaimInProgressRetries++;
-                if (pendingClaimInProgressRetries < MaximumClaimInProgressRetries) return;
-                // A server crash after claiming the operation but before
-                // completing the idempotency record can otherwise pin this PC
-                // to the same 409 for the record's full lifetime. The already
-                // claimed operation remains protected by its lease; a fresh
-                // key safely lets the single worker continue the queue.
-                pendingClaimIdempotencyKey = null;
-                pendingClaimInProgressRetries = 0;
-            }
         }
 
         private static bool HasErrorCode(byte[] body, string expected)
