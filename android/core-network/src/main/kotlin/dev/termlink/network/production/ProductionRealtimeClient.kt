@@ -470,6 +470,7 @@ class ProductionRealtimeClient(
                     envelope = envelope,
                     wireBytes = raw.size,
                 )
+                failReceiveIntegrity(webSocket, "realtime receive reservation overflow")
                 return
             }
             val received = ProductionReceivedEnvelope(
@@ -491,12 +492,20 @@ class ProductionRealtimeClient(
                     wireBytes = raw.size,
                 )
                 received.close()
-                // This is application backpressure, not physical WSS failure.
-                // Drop only this Envelope; a later admitted sequence creates a
-                // normal session-local History Gap while other sessions and the
-                // authenticated Relay generation remain healthy.
+                if (!admission.isClosed) {
+                    failReceiveIntegrity(webSocket, "realtime receive channel overflow")
+                }
             }
             observedApplicationFrames.incrementAndGet()
+        }
+
+        private fun failReceiveIntegrity(webSocket: WebSocket, reason: String) {
+            if (!isCurrent(webSocket) || !acceptingBinary) return
+            acceptingBinary = false
+            // Selectively dropping authenticated frames would make the current
+            // generation look healthy while guaranteeing a later sequence gap.
+            // Retire it immediately; durable ACK replay restores every session.
+            this@ProductionRealtimeClient.disconnect(reason)
         }
 
         /**
@@ -741,7 +750,7 @@ class ProductionRealtimeClient(
         const val MAX_BUFFERED_EVENTS: Int = 128
         const val LOW_BUFFERED_EVENTS: Int = 32
         const val HIGH_BUFFERED_EVENTS: Int = 64
-        const val OPEN_WINDOW_EVENTS: Int = 128
+        const val OPEN_WINDOW_EVENTS: Int = 32
         const val OPEN_WINDOW_WIRE_BYTES: Long = 3L shl 20
         const val LOW_BUFFERED_WIRE_BYTES: Long = 1L shl 20
         const val HIGH_BUFFERED_WIRE_BYTES: Long = 4L shl 20

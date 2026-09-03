@@ -255,6 +255,7 @@ class ProductionRealtimeSessionClient(
     private lateinit var session: RemoteTerminalSession
     /** Zero means not subscribed; a positive value is the exact socket generation. */
     private val subscriberReady = MutableStateFlow(0)
+    private val bootstrapFlowHold = AtomicBoolean(true)
     private val semanticFlowHold = AtomicBoolean(false)
     private val flowControlEpoch = AtomicLong(0)
     private val subscribeSendCount = AtomicLong(0)
@@ -266,6 +267,7 @@ class ProductionRealtimeSessionClient(
     private val transportTransitionGeneration = AtomicLong(0)
     /** Guarded by [incomingProcessingMutex]. */
     private var activeIncomingGeneration = 0
+    private val subscriptionBootstrapMutex = Mutex()
     private val flowControlMutex = Mutex()
     private var lastFlowControlGeneration = Int.MIN_VALUE
     private var lastFlowControlPaused: Boolean? = null
@@ -516,13 +518,11 @@ class ProductionRealtimeSessionClient(
                         sendAcknowledgement(recovered)
                         val connectedGeneration = transport.currentConnectedGeneration()
                         check(connectedGeneration > 0) { "realtime socket is not connected" }
-                        resumeForGeneration(recovered, connectedGeneration)
-                        check(transport.currentConnectedGeneration() == connectedGeneration) {
-                            "realtime socket generation changed during history recovery"
-                        }
-                        subscriberReady.value = connectedGeneration
-                        semanticFlowHold.set(false)
-                        sendFlowControl(force = true)
+                        establishSubscriptionHeldThenOpen(
+                            lastAckedSequence = recovered,
+                            connectedGeneration = connectedGeneration,
+                            releaseHistoryHold = true,
+                        )
                     },
                 )
             }
@@ -658,6 +658,40 @@ class ProductionRealtimeSessionClient(
         )
         lastSubscribeCursor.set(lastAckedSequence)
         subscribeSendCount.incrementAndGet()
+    }
+
+    /**
+     * SUBSCRIBE installs a paused PC subscriber. Preserve that zero-window
+     * invariant until Android has explicitly published its bootstrap hold,
+     * then open a window that is safely below every local hard queue limit.
+     */
+    private suspend fun establishSubscriptionHeldThenOpen(
+        lastAckedSequence: Long,
+        connectedGeneration: Int,
+        releaseHistoryHold: Boolean = false,
+    ) = subscriptionBootstrapMutex.withLock {
+        bootstrapFlowHold.set(true)
+        try {
+            resumeForGeneration(lastAckedSequence, connectedGeneration)
+            check(transport.currentConnectedGeneration() == connectedGeneration) {
+                "realtime socket generation changed during subscriber bootstrap"
+            }
+            subscriberReady.value = connectedGeneration
+            sendFlowControl(force = true)
+            check(transport.currentConnectedGeneration() == connectedGeneration) {
+                "realtime socket generation changed during subscriber bootstrap"
+            }
+            if (releaseHistoryHold) semanticFlowHold.set(false)
+            bootstrapFlowHold.set(false)
+            sendFlowControl(force = true)
+            check(transport.currentConnectedGeneration() == connectedGeneration) {
+                "realtime socket generation changed while opening subscriber window"
+            }
+        } catch (error: Throwable) {
+            bootstrapFlowHold.set(true)
+            subscriberReady.compareAndSet(connectedGeneration, 0)
+            throw error
+        }
     }
 
     override suspend fun acknowledge(highestContiguousSequence: Long) {
@@ -941,7 +975,7 @@ class ProductionRealtimeSessionClient(
                 transport.currentConnectedGeneration() != readyGeneration
             ) return
             val pressure = transport.receivePressure.value
-            val paused = semanticFlowHold.get() || pressure.paused
+            val paused = bootstrapFlowHold.get() || semanticFlowHold.get() || pressure.paused
             if (!force &&
                 lastFlowControlGeneration == readyGeneration &&
                 lastFlowControlPaused == paused
@@ -956,6 +990,7 @@ class ProductionRealtimeSessionClient(
                 .setPaused(paused)
                 .setReasonCode(
                     when {
+                        bootstrapFlowHold.get() -> "ANDROID_SUBSCRIBER_BOOTSTRAP"
                         semanticFlowHold.get() -> "ANDROID_HISTORY_RECOVERY"
                         paused -> "ANDROID_RENDER_QUEUE_HIGH_WATER"
                         else -> "ANDROID_RENDER_QUEUE_AVAILABLE"
@@ -1563,14 +1598,11 @@ class ProductionRealtimeSessionClient(
                 if (sessionState is RemoteSessionState.Exited) return
                 if (sessionState !is RemoteSessionState.HistoryGap) {
                     try {
-                        resumeForGeneration(sessionState.lastAckedSequence, connectedGeneration)
+                        establishSubscriptionHeldThenOpen(
+                            sessionState.lastAckedSequence,
+                            connectedGeneration,
+                        )
                         if (!isCurrentTransportTransition(transition, connectedGeneration)) return
-                        subscriberReady.value = connectedGeneration
-                        sendFlowControl(force = true)
-                        if (!isCurrentTransportTransition(transition, connectedGeneration)) {
-                            subscriberReady.compareAndSet(connectedGeneration, 0)
-                            return
-                        }
                         startSubscriberRefresh()
                         scheduleReconnectAttemptReset()
                     } catch (error: CancellationException) {
@@ -1703,8 +1735,10 @@ class ProductionRealtimeSessionClient(
                     transport.currentConnectedGeneration() != connectedGeneration
                 ) break
                 try {
-                    resumeForGeneration(session.state.value.lastAckedSequence, connectedGeneration)
-                    sendFlowControl(force = true)
+                    establishSubscriptionHeldThenOpen(
+                        session.state.value.lastAckedSequence,
+                        connectedGeneration,
+                    )
                     restoreDesiredControlIfNeeded()
                 } catch (error: CancellationException) {
                     throw error
@@ -1823,14 +1857,11 @@ class ProductionRealtimeSessionClient(
             if (delayMillis == 0L) yield() else delay(delayMillis)
             if (!isCurrentSessionReconcile(reconcileEpoch, connectedGeneration)) return
             try {
-                resumeForGeneration(session.state.value.lastAckedSequence, connectedGeneration)
+                establishSubscriptionHeldThenOpen(
+                    session.state.value.lastAckedSequence,
+                    connectedGeneration,
+                )
                 if (!isCurrentSessionReconcile(reconcileEpoch, connectedGeneration)) return
-                subscriberReady.value = connectedGeneration
-                sendFlowControl(force = true)
-                if (!isCurrentSessionReconcile(reconcileEpoch, connectedGeneration)) {
-                    subscriberReady.compareAndSet(connectedGeneration, 0)
-                    return
-                }
                 mutableTransportState.value = ProductionTransportState.Connected
                 startSubscriberRefresh()
                 scheduleReconnectAttemptReset()

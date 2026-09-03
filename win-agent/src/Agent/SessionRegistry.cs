@@ -1581,10 +1581,11 @@ namespace TermLink.Agent
             {
                 var command = request == null ? "unknown" : request.Command.ToString();
                 var frame = new StackTrace(error, true).GetFrame(0);
-                var method = frame?.GetMethod();
+                var method = frame == null ? null : frame.GetMethod();
+                var declaringType = method == null ? null : method.DeclaringType;
                 var failureSite = method == null
                     ? "unknown"
-                    : (method.DeclaringType?.Name ?? "unknown") + "." + method.Name;
+                    : (declaringType == null ? "unknown" : declaringType.Name) + "." + method.Name;
                 var sourceLine = frame == null ? 0 : frame.GetFileLineNumber();
                 line = DateTime.UtcNow.ToString("O") +
                     " control-request command=" + command +
@@ -1709,9 +1710,11 @@ namespace TermLink.Agent
                 // durable local buffers cover frames committed during the swap.
                 next.Attach(registry);
                 Volatile.Write(ref productionRuntime, next);
+                next.ReconcileAttachedRegistryAfterPublication();
             }
             catch
             {
+                Interlocked.CompareExchange(ref productionRuntime, null, next);
                 RetireProductionRuntime(next);
                 throw;
             }

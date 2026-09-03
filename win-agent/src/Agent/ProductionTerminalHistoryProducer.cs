@@ -23,6 +23,32 @@ namespace TermLink.Agent
         public int TranscriptPageCount { get; set; }
     }
 
+    /// <summary>
+    /// The durable history projection observed a temporary hole before a later
+    /// frame. The caller must reconcile from the SessionAgent buffer/WAL and
+    /// retry; this is not a terminal-core capability failure.
+    /// </summary>
+    internal sealed class ProductionTerminalHistoryReconcileRequiredException : Exception
+    {
+        public ProductionTerminalHistoryReconcileRequiredException(
+            Guid sessionId,
+            ulong expectedSequence,
+            ulong actualSequence)
+            : base(
+                "Terminal history requires durable prefix reconciliation for session " +
+                sessionId.ToString("D") + ": expected sequence " + expectedSequence +
+                ", received " + actualSequence + ".")
+        {
+            SessionId = sessionId;
+            ExpectedSequence = expectedSequence;
+            ActualSequence = actualSequence;
+        }
+
+        public Guid SessionId { get; }
+        public ulong ExpectedSequence { get; }
+        public ulong ActualSequence { get; }
+    }
+
     internal sealed class ProductionTerminalHistoryProducer : IDisposable
     {
         private const int DefaultColumns = 80;
@@ -66,6 +92,7 @@ namespace TermLink.Agent
                 new SortedDictionary<ulong, LocalFrame>();
             public NativeTerminal TerminalCore;
             public string TerminalCoreFailureCode = string.Empty;
+            public bool TerminalCoreSequenceRebuildPending;
 
             public ProductionState(
                 bool terminalCoreSnapshotAuthorityEnabled,
@@ -79,6 +106,26 @@ namespace TermLink.Agent
                         transcriptArchiveSink);
                     return;
                 }
+                CreateTerminalCore();
+            }
+
+            public void ResetTerminalCoreForReconcile()
+            {
+                Dispose();
+                Lifecycle = TerminalLifecycleV1.Running;
+                HasExitCode = false;
+                ExitCode = 0;
+                LocalInputEpoch = 0;
+                AppliedSequence = 0;
+                HasOutput = false;
+                PendingFrames.Clear();
+                TerminalCoreFailureCode = string.Empty;
+                CreateTerminalCore();
+                TerminalCoreSequenceRebuildPending = true;
+            }
+
+            private void CreateTerminalCore()
+            {
                 try
                 {
                     TerminalCore = NativeTerminalCoreV2.Create(
@@ -336,6 +383,8 @@ namespace TermLink.Agent
             var shadowFrames = terminalCoreShadowEnabled
                 ? new List<LocalFrame>(applied.Length)
                 : null;
+            if (terminalCoreSnapshotAuthorityEnabled && state.TerminalCore != null)
+                ValidateTerminalCoreReplayPrefix(sessionId, state, applied);
             foreach (var sequence in applied)
             {
                 // Persisted backlog can contain years of terminal output. Keep
@@ -344,8 +393,18 @@ namespace TermLink.Agent
                 // A later pass ignores <= AppliedSequence and resumes exactly.
                 if (shouldYield?.Invoke() == true) return null;
                 var frame = state.PendingFrames[sequence];
-                if (terminalCoreSnapshotAuthorityEnabled) ApplyTerminalCoreFrame(state, frame);
-                else ApplyFrame(state.Model, frame);
+                if (terminalCoreSnapshotAuthorityEnabled)
+                {
+                    // Once native Snapshot production is retired, continue the
+                    // lightweight durable projection through the output anchor.
+                    // CHUNK publication must retain an advancing source cursor
+                    // and must not be blocked by the optional Snapshot parser.
+                    ApplyTerminalCoreFrame(sessionId, state, frame);
+                }
+                else
+                {
+                    ApplyFrame(state.Model, frame);
+                }
                 shadowFrames?.Add(frame);
                 ApplyProjection(
                     frame,
@@ -359,6 +418,8 @@ namespace TermLink.Agent
             }
 
             if (shouldYield?.Invoke() == true) return null;
+            if (terminalCoreSnapshotAuthorityEnabled && state.TerminalCore != null)
+                state.TerminalCoreSequenceRebuildPending = false;
 
             return ProduceCheckpoint(
                 sessionId,
@@ -839,9 +900,43 @@ namespace TermLink.Agent
             }
         }
 
-        private static void ApplyTerminalCoreFrame(ProductionState state, LocalFrame frame)
+        private static void ValidateTerminalCoreReplayPrefix(
+            Guid sessionId,
+            ProductionState state,
+            IEnumerable<ulong> sequences)
         {
-            if (state.TerminalCore == null) return;
+            var expected = checked(state.AppliedSequence + 1);
+            foreach (var sequence in sequences)
+            {
+                var frame = state.PendingFrames[sequence];
+                if (frame.Type == LocalFrameType.Gap)
+                {
+                    LocalPayloadCodec.ParseGap(frame.Payload, out var gapStart, out var gapEnd);
+                    if (gapStart == expected && gapEnd < ulong.MaxValue && gapEnd + 1 == sequence)
+                    {
+                        expected = checked(sequence + 1);
+                        continue;
+                    }
+                }
+                else if (sequence == expected)
+                {
+                    expected = checked(expected + 1);
+                    continue;
+                }
+
+                throw new ProductionTerminalHistoryReconcileRequiredException(
+                    sessionId,
+                    expected,
+                    sequence);
+            }
+        }
+
+        private static bool ApplyTerminalCoreFrame(
+            Guid sessionId,
+            ProductionState state,
+            LocalFrame frame)
+        {
+            if (state.TerminalCore == null) return false;
             try
             {
                 NativeTerminalHostEffectFrameV2 effects;
@@ -860,7 +955,8 @@ namespace TermLink.Agent
                             checked((uint)rows));
                         break;
                     case LocalFrameType.Gap:
-                        effects = state.TerminalCore.ApplyGapWithHostEffectsV2(frame.Sequence);
+                        LocalPayloadCodec.ParseGap(frame.Payload, out var gapStart, out _);
+                        effects = state.TerminalCore.ApplyGapWithHostEffectsV2(gapStart);
                         break;
                     default:
                         effects = state.TerminalCore.ApplyAdvanceWithHostEffectsV2(
@@ -869,11 +965,35 @@ namespace TermLink.Agent
                         break;
                 }
                 ValidateAndDiscardHostEffects(frame, effects);
+                return true;
+            }
+            catch (NativeTerminalException error)
+                when (error.Status == NativeTerminalStatus.SequenceMismatch)
+            {
+                if (!state.TerminalCoreSequenceRebuildPending)
+                {
+                    var expected = checked(state.AppliedSequence + 1);
+                    state.ResetTerminalCoreForReconcile();
+                    throw new ProductionTerminalHistoryReconcileRequiredException(
+                        sessionId,
+                        expected,
+                        frame.Sequence);
+                }
+
+                // The current core was already recreated and replayed from its
+                // complete durable prefix. A repeated mismatch is intrinsic to
+                // this stream/core pair, not another scheduling hole. Retire
+                // only Snapshot production so ordinary encrypted CHUNK history
+                // can still advance instead of entering a rebuild hot loop.
+                state.TerminalCoreFailureCode = NativeFailureCode(error);
+                state.Dispose();
+                return false;
             }
             catch (Exception error)
             {
                 state.TerminalCoreFailureCode = NativeFailureCode(error);
                 state.Dispose();
+                return false;
             }
         }
 

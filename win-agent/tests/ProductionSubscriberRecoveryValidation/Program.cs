@@ -295,7 +295,7 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                     TryAdd(subscribers, sessionId, subscriberMap) &&
                     TryAdd(routes, sessionId.ToString("D") + ":" + recipientDeviceId.ToString("D"), authorized),
                 "Direct peer-provider subscriber/route fixture could not be arranged.");
-            Require(TryAdd(pendingHistory, historySessionId, (byte)0) &&
+            Require(TryAdd(pendingHistory, historySessionId, 1L) &&
                     TryAdd(terminalHistory, historySessionId, (byte)0) &&
                     TryAdd(persistedHistorySessions, historySessionId, (byte)0) &&
                     TryAdd(historyReconcile, historySessionId, (byte)0),

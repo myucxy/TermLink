@@ -425,7 +425,7 @@ class ProductionNetworkTest {
     }
 
     @Test
-    fun receiveOverflowDropsOnlyApplicationFramesAndKeepsPhysicalGeneration(): Unit = runBlocking {
+    fun receiveOverflowRetiresPhysicalGenerationAndKeepsOnlyContiguousPrefix(): Unit = runBlocking {
         val server = MockWebServer()
         val identity = DeviceIdentity.generate()
         val androidId = UUID.randomUUID()
@@ -472,21 +472,21 @@ class ProductionNetworkTest {
             client.connect()
             withTimeout(5_000) { firstReceived.await() }
             // MockWebServer.send() only confirms local enqueue. Wait until the
-            // client callback has actually metadata-admitted every frame and
-            // rejected at least one on its bounded application queue.
+            // client callback has rejected the first frame beyond its bounded
+            // application queue and retired that incomplete generation.
             withTimeout(5_000) {
-                while (client.diagnostics().observedApplicationFrames < 300L ||
-                    client.diagnostics().droppedApplicationFrames == 0L
+                while (client.diagnostics().droppedApplicationFrames == 0L ||
+                    client.diagnostics().connectedGeneration != 0
                 ) {
                     delay(10)
                 }
             }
             val overflow = client.diagnostics()
-            assertEquals(300L, overflow.observedApplicationFrames)
-            assertTrue(overflow.droppedApplicationFrames > 0L)
-            assertEquals("CONNECTED", overflow.state)
-            assertEquals(1, overflow.generation)
-            assertEquals(1, overflow.connectedGeneration)
+            assertTrue(overflow.observedApplicationFrames in 2L..300L)
+            assertEquals(1L, overflow.droppedApplicationFrames)
+            assertEquals("FAILED", overflow.state)
+            assertTrue(overflow.generation > 1)
+            assertEquals(0, overflow.connectedGeneration)
             val acceptedFrames = (overflow.observedApplicationFrames - overflow.droppedApplicationFrames).toInt()
             assertTrue(acceptedFrames in 2 until 300)
             releaseCollector.complete(Unit)

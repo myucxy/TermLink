@@ -7,6 +7,7 @@ using System.Net;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Reflection;
+using System.Reflection.Emit;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -145,12 +146,15 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 var sessionId = Guid.Parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
                 ValidateUploaderConstructorCompatibility();
                 ValidateRuntimeCapabilityAndPublicationGate(root, pcDeviceId);
+                ValidateRuntimePublicationReconcileOrder();
+                await ValidateHistoryWorkerRetryWakeupSeamsAsync();
                 ValidateRecoveredTerminalHistoryClassification();
                 ValidateTerminalCoreShadow(root, pcDeviceId);
                 ValidateTerminalCoreShadowDispatcherBoundaries();
                 ValidateTerminalHistoryLifecycleGate(root, pcDeviceId);
                 ValidateNoOutputSnapshotEligibility(root, pcDeviceId);
                 ValidateTerminalCoreSnapshotV2(root, pcDeviceId);
+                ValidateTerminalCoreTransientPrefixReconciliation(root, pcDeviceId);
                 ValidateTerminalCoreHostEffectV2Replay(root, pcDeviceId);
                 ValidateTerminalCoreAuthorityMigration(root, pcDeviceId);
                 ValidateTerminalCoreShadowGoldenStreams(root, pcDeviceId);
@@ -335,6 +339,104 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 new object[] { sequences, sessionId, 8UL, true, true });
             Require(deliveredTerminal && sequences[sessionId] == 8,
                 "A delivered final lifecycle was not marked terminal after advancing the cursor.");
+        }
+
+        private static void ValidateRuntimePublicationReconcileOrder()
+        {
+            var agent = Assembly.Load("TermLink.Agent");
+            var runtimeType = agent.GetType(
+                "TermLink.Agent.ProductionAgentRuntime",
+                throwOnError: true);
+            var serviceType = agent.GetType(
+                "TermLink.Agent.SessionRegistryService",
+                throwOnError: true);
+            var replace = serviceType.GetMethod(
+                "ReplaceProductionRuntimeLocked",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            var reconcile = runtimeType.GetMethod(
+                "ReconcileAttachedRegistryAfterPublication",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            Require(replace != null && reconcile != null,
+                "Account runtime replacement no longer exposes its post-publication reconcile seam.");
+
+            var calls = ReadInvokedMethods(replace);
+            var attachIndex = calls.FindIndex(value =>
+                value.DeclaringType == runtimeType && value.Name == "Attach");
+            var publishIndex = calls.FindIndex(value =>
+                value.DeclaringType == typeof(Volatile) && value.Name == "Write");
+            var reconcileIndex = calls.FindIndex(value =>
+                value.DeclaringType == runtimeType &&
+                value.Name == "ReconcileAttachedRegistryAfterPublication");
+            Require(attachIndex >= 0 && publishIndex > attachIndex && reconcileIndex > publishIndex,
+                "Account runtime publication did not reconcile SessionRegistry after the callback route became visible.");
+
+            var reconcileCalls = ReadInvokedMethods(reconcile);
+            var queueRegisteredIndex = reconcileCalls.FindIndex(value =>
+                value.DeclaringType == runtimeType &&
+                value.Name == "QueueRegisteredSessionsForReplay");
+            var queueHistoryIndex = reconcileCalls.FindIndex(value =>
+                value.DeclaringType == runtimeType &&
+                value.Name == "QueuePersistedHistoryForReplay");
+            Require(queueRegisteredIndex >= 0 && queueHistoryIndex > queueRegisteredIndex,
+                "Post-publication reconciliation did not re-enumerate both realtime and history session authority.");
+        }
+
+        private static async Task ValidateHistoryWorkerRetryWakeupSeamsAsync()
+        {
+            var runtimeType = Assembly.Load("TermLink.Agent").GetType(
+                "TermLink.Agent.ProductionAgentRuntime",
+                throwOnError: true);
+            var wait = runtimeType.GetMethod(
+                "WaitForHistoryRetryOrSignalAsync",
+                BindingFlags.Static | BindingFlags.NonPublic);
+            var supersedingTicket = runtimeType.GetMethod(
+                "HasSupersedingHistoryTicket",
+                BindingFlags.Static | BindingFlags.NonPublic);
+            Require(wait != null && wait.ReturnType == typeof(Task<bool>) &&
+                supersedingTicket != null,
+                "History worker retry/wakeup seams are unavailable.");
+
+            Require(!(bool)supersedingTicket.Invoke(null, new object[] { 41L, 41L }) &&
+                (bool)supersedingTicket.Invoke(null, new object[] { 41L, 42L }),
+                "An internal retry ticket was mistaken for new work, or a newer callback ticket was lost.");
+
+            using var signal = new SemaphoreSlim(0, 1);
+            signal.Release();
+            var siblingConsumed = await InvokeHistoryWait(
+                wait,
+                signal,
+                TimeSpan.FromSeconds(30),
+                retryImmediately: false);
+            Require(siblingConsumed && signal.CurrentCount == 0,
+                "A capacity-one history signal was not consumed exactly once by the sibling worker.");
+
+            // pendingHistorySessions is authoritative after the sibling has
+            // consumed the sole signal. The worker's finally path converts
+            // that known queue state into retryImmediately=true.
+            var immediateStopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var immediate = await InvokeHistoryWait(
+                wait,
+                signal,
+                TimeSpan.FromSeconds(30),
+                retryImmediately: true);
+            immediateStopwatch.Stop();
+            Require(immediate && immediateStopwatch.Elapsed < TimeSpan.FromSeconds(2) &&
+                signal.CurrentCount == 0,
+                "Known history work could not bypass a capacity-one lost wakeup.");
+
+            // When a full authoritative reconciliation still cannot provide
+            // the missing prefix, the same seam must take a bounded retry
+            // interval instead of immediately rescanning the long WAL forever.
+            var backoffStopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var signaled = await InvokeHistoryWait(
+                wait,
+                signal,
+                TimeSpan.FromMilliseconds(75),
+                retryImmediately: false);
+            backoffStopwatch.Stop();
+            Require(!signaled && backoffStopwatch.Elapsed >= TimeSpan.FromMilliseconds(25) &&
+                signal.CurrentCount == 0,
+                "A still-incomplete full reconciliation entered an immediate history retry loop.");
         }
 
         private static void AppendSupportedSession(ProductionTerminalHistoryProducer producer, Guid sessionId)
@@ -1199,6 +1301,190 @@ namespace TermLink.ProductionTerminalHistory.Validation
                     CryptographicOperations.ZeroMemory(prepared.SealedObject);
                 CryptographicOperations.ZeroMemory(recipient.PairwiseKey);
             }
+        }
+
+        private static void ValidateTerminalCoreTransientPrefixReconciliation(
+            string root,
+            Guid pcDeviceId)
+        {
+            var store = new ProductionTerminalHistoryStore(
+                Path.Combine(root, "terminal-core-transient-prefix"),
+                pcDeviceId);
+            using var producer = new ProductionTerminalHistoryProducer(
+                store,
+                pcDeviceId,
+                terminalCoreShadowEnabled: false,
+                terminalCoreSnapshotAuthorityEnabled: true,
+                terminalCoreShadowObserver: null);
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000085");
+            var first = new LocalFrame(
+                LocalFrameType.Output,
+                sessionId,
+                1,
+                Encoding.UTF8.GetBytes("prefix"));
+            producer.AppendCommittedFrame(first);
+            var initial = producer.ProcessSession(sessionId, new[] { first });
+            Require(initial.SnapshotEligible && initial.LastSequence == 1,
+                "The transient-prefix fixture did not establish its initial native checkpoint.");
+
+            // Model the production-worker race: a later callback reaches the
+            // independent WAL before reconciliation copies the missing frame.
+            var future = new LocalFrame(
+                LocalFrameType.Output,
+                sessionId,
+                3,
+                Encoding.UTF8.GetBytes("-future"));
+            producer.AppendCommittedFrame(future);
+            try
+            {
+                producer.ProcessSession(sessionId, new[] { future });
+                throw new InvalidOperationException(
+                    "A transient durable-prefix hole was accepted by terminal-core.");
+            }
+            catch (ProductionTerminalHistoryReconcileRequiredException error)
+            {
+                Require(error.SessionId == sessionId &&
+                    error.ExpectedSequence == 2 && error.ActualSequence == 3,
+                    "Transient durable-prefix diagnostics lost their exact sequence boundary.");
+            }
+
+            var retained = producer.LoadCheckpoint(sessionId);
+            Require(retained.SnapshotEligible && retained.LastSequence == 1 &&
+                string.IsNullOrEmpty(retained.IneligibilityCode),
+                "A transient durable-prefix hole permanently rejected the last good checkpoint.");
+
+            var missing = new LocalFrame(
+                LocalFrameType.Title,
+                sessionId,
+                2,
+                LocalPayloadCodec.Title("reconciled"));
+            producer.AppendCommittedFrame(missing);
+            var reconciled = producer.ProcessSession(sessionId);
+            Require(reconciled.SnapshotEligible && reconciled.LastSequence == 3 &&
+                producer.LoadCheckpoint(sessionId).SnapshotEligible,
+                "Full reconciliation did not resume terminal-core from the contiguous prefix.");
+
+            var freshStore = new ProductionTerminalHistoryStore(
+                Path.Combine(root, "terminal-core-fresh-transient-prefix"),
+                pcDeviceId);
+            using var freshProducer = new ProductionTerminalHistoryProducer(
+                freshStore,
+                pcDeviceId,
+                terminalCoreShadowEnabled: false,
+                terminalCoreSnapshotAuthorityEnabled: true,
+                terminalCoreShadowObserver: null);
+            var freshSessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000086");
+            var freshFuture = new LocalFrame(
+                LocalFrameType.Output,
+                freshSessionId,
+                3,
+                Encoding.UTF8.GetBytes("future-first"));
+            freshProducer.AppendCommittedFrame(freshFuture);
+            try
+            {
+                freshProducer.ProcessSession(freshSessionId);
+                throw new InvalidOperationException(
+                    "A fresh producer accepted a WAL whose first frame was not sequence one.");
+            }
+            catch (ProductionTerminalHistoryReconcileRequiredException error)
+            {
+                Require(error.ExpectedSequence == 1 && error.ActualSequence == 3,
+                    "Fresh transient-prefix diagnostics lost their exact sequence boundary.");
+            }
+            Require(freshProducer.LoadCheckpoint(freshSessionId) == null,
+                "A fresh transient-prefix hole was persisted as an unsupported checkpoint.");
+            try
+            {
+                freshProducer.ProcessSession(freshSessionId);
+                throw new InvalidOperationException(
+                    "A full WAL reconciliation accepted the same incomplete prefix.");
+            }
+            catch (ProductionTerminalHistoryReconcileRequiredException error)
+            {
+                Require(error.ExpectedSequence == 1 && error.ActualSequence == 3 &&
+                    freshProducer.LoadCheckpoint(freshSessionId) == null,
+                    "A still-incomplete full reconciliation changed producer authority state.");
+            }
+            freshProducer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Resize,
+                freshSessionId,
+                1,
+                LocalPayloadCodec.Resize(80, 24)));
+            freshProducer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Title,
+                freshSessionId,
+                2,
+                LocalPayloadCodec.Title("fresh-reconciled")));
+            var freshReconciled = freshProducer.ProcessSession(freshSessionId);
+            Require(freshReconciled.SnapshotEligible && freshReconciled.LastSequence == 3,
+                "A fresh producer did not recover after its complete prefix arrived.");
+
+            var repeatStore = new ProductionTerminalHistoryStore(
+                Path.Combine(root, "terminal-core-repeat-sequence-mismatch"),
+                pcDeviceId);
+            using var repeatProducer = new ProductionTerminalHistoryProducer(
+                repeatStore,
+                pcDeviceId,
+                terminalCoreShadowEnabled: false,
+                terminalCoreSnapshotAuthorityEnabled: true,
+                terminalCoreShadowObserver: null);
+            var repeatSessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000087");
+            var repeatFirst = new LocalFrame(
+                LocalFrameType.Output,
+                repeatSessionId,
+                1,
+                Encoding.UTF8.GetBytes("first"));
+            repeatProducer.AppendCommittedFrame(repeatFirst);
+            Require(repeatProducer.ProcessSession(repeatSessionId).SnapshotEligible,
+                "Repeated native mismatch fixture did not create its initial checkpoint.");
+
+            // Deliberately advance only the private native projection. The
+            // durable producer cursor remains at one, so frame two exercises
+            // the exact native SequenceMismatch recovery branch.
+            GetTerminalCore(repeatProducer, repeatSessionId)
+                .ApplyAdvanceWithHostEffectsV2(2, 0);
+            var repeatSecond = new LocalFrame(
+                LocalFrameType.Output,
+                repeatSessionId,
+                2,
+                Encoding.UTF8.GetBytes("second"));
+            repeatProducer.AppendCommittedFrame(repeatSecond);
+            try
+            {
+                repeatProducer.ProcessSession(repeatSessionId, new[] { repeatSecond });
+                throw new InvalidOperationException(
+                    "The first intrinsic native mismatch did not request one full rebuild.");
+            }
+            catch (ProductionTerminalHistoryReconcileRequiredException)
+            {
+            }
+
+            // Corrupt the freshly rebuilt core once more. A complete WAL pass
+            // must now retire Snapshot production instead of throwing forever;
+            // the runtime can therefore continue with encrypted CHUNK history.
+            GetTerminalCore(repeatProducer, repeatSessionId)
+                .ApplyAdvanceWithHostEffectsV2(1, 0);
+            var repeated = repeatProducer.ProcessSession(repeatSessionId);
+            Require(!repeated.SnapshotEligible && repeated.PermanentlyIneligible &&
+                repeated.IneligibilityCode == "NATIVE_SEQUENCEMISMATCH",
+                "A repeated native sequence mismatch did not degrade after exactly one rebuild.");
+        }
+
+        private static NativeTerminal GetTerminalCore(
+            ProductionTerminalHistoryProducer producer,
+            Guid sessionId)
+        {
+            var states = typeof(ProductionTerminalHistoryProducer).GetField(
+                "states",
+                BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(producer);
+            var state = states?.GetType().GetProperty("Item")?.GetValue(
+                states,
+                new object[] { sessionId });
+            var terminal = state?.GetType().GetField(
+                "TerminalCore",
+                BindingFlags.Instance | BindingFlags.Public)?.GetValue(state) as NativeTerminal;
+            return terminal ?? throw new InvalidOperationException(
+                "The terminal-core sequence-mismatch fixture lost its native projection.");
         }
 
         private static void ValidateTerminalCoreHostEffectV2Replay(
@@ -2923,6 +3209,95 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 if (match) return true;
             }
             return false;
+        }
+
+        private static Task<bool> InvokeHistoryWait(
+            MethodInfo wait,
+            SemaphoreSlim signal,
+            TimeSpan retryDelay,
+            bool retryImmediately)
+        {
+            try
+            {
+                return (Task<bool>)wait.Invoke(
+                    null,
+                    new object[]
+                    {
+                        signal,
+                        retryDelay,
+                        retryImmediately,
+                        CancellationToken.None
+                    });
+            }
+            catch (TargetInvocationException error) when (error.InnerException != null)
+            {
+                throw error.InnerException;
+            }
+        }
+
+        private static List<MethodBase> ReadInvokedMethods(MethodInfo method)
+        {
+            var body = method.GetMethodBody();
+            var il = body?.GetILAsByteArray();
+            Require(il != null, "Account runtime replacement has no inspectable method body.");
+            var opcodes = typeof(OpCodes)
+                .GetFields(BindingFlags.Static | BindingFlags.Public)
+                .Where(value => value.FieldType == typeof(OpCode))
+                .Select(value => (OpCode)value.GetValue(null))
+                .ToDictionary(value => value.Value);
+            var calls = new List<MethodBase>();
+            var offset = 0;
+            while (offset < il.Length)
+            {
+                var first = il[offset++];
+                var opcodeValue = first == 0xfe
+                    ? unchecked((short)(0xfe00 | il[offset++]))
+                    : (short)first;
+                Require(opcodes.TryGetValue(opcodeValue, out var opcode),
+                    "Account runtime replacement contains an unknown IL opcode.");
+                if (opcode.OperandType == OperandType.InlineMethod)
+                {
+                    var token = BitConverter.ToInt32(il, offset);
+                    calls.Add(method.Module.ResolveMethod(
+                        token,
+                        method.DeclaringType?.GetGenericArguments(),
+                        method.GetGenericArguments()));
+                }
+                offset += OperandSize(opcode.OperandType, il, offset);
+            }
+            return calls;
+        }
+
+        private static int OperandSize(OperandType operandType, byte[] il, int offset)
+        {
+            switch (operandType)
+            {
+                case OperandType.InlineNone:
+                    return 0;
+                case OperandType.ShortInlineBrTarget:
+                case OperandType.ShortInlineI:
+                case OperandType.ShortInlineVar:
+                    return 1;
+                case OperandType.InlineVar:
+                    return 2;
+                case OperandType.InlineBrTarget:
+                case OperandType.InlineField:
+                case OperandType.InlineI:
+                case OperandType.InlineMethod:
+                case OperandType.InlineSig:
+                case OperandType.InlineString:
+                case OperandType.InlineTok:
+                case OperandType.ShortInlineR:
+                    return 4;
+                case OperandType.InlineI8:
+                case OperandType.InlineR:
+                    return 8;
+                case OperandType.InlineSwitch:
+                    return checked(4 + BitConverter.ToInt32(il, offset) * 4);
+                default:
+                    throw new InvalidOperationException(
+                        "Unsupported IL operand type: " + operandType + ".");
+            }
         }
 
         private static void Expect<T>(Action action, string message) where T : Exception

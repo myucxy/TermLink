@@ -266,6 +266,7 @@ class ProductionRealtimeMultiplexer private constructor(
         // The socket reservation protects only OkHttp callback -> device router.
         // Every route outcome, including successful hand-off to a slow endpoint,
         // returns that reservation before this collector accepts the next frame.
+        var integrityFailureGeneration = 0
         try {
             val generation = received.generation
             val highestGeneration = highestObservedGeneration.accumulateAndGet(generation, ::maxOf)
@@ -296,6 +297,10 @@ class ProductionRealtimeMultiplexer private constructor(
             }
             if (decision == ProductionRealtimeRouteDecision.DELIVERED) return
 
+            if (decision == ProductionRealtimeRouteDecision.OVERFLOW) {
+                integrityFailureGeneration = generation
+            }
+
             val gracefulRetiredGeneration = target.closedEndpoint?.let { closedEndpoint ->
                 closedEndpoint.graceful && closedEndpoint.retiredGeneration == generation
             } == true
@@ -307,6 +312,12 @@ class ProductionRealtimeMultiplexer private constructor(
             )
         } finally {
             received.close()
+        }
+        if (integrityFailureGeneration > 0) {
+            supervisor.replaceCurrentGenerationOnReceiveIntegrityFailure(
+                integrityFailureGeneration,
+                "realtime receive integrity overflow",
+            )
         }
     }
 
@@ -487,10 +498,13 @@ class ProductionRealtimeMultiplexer private constructor(
                         return@synchronized ProductionRealtimeRouteDecision.ENDPOINT_NOT_SUBSCRIBED
                     }
                     val endpointEnvelope = reserveEndpointEnvelopeLocked(received)
-                        ?: return@synchronized classifyProductionRealtimeRoute(
-                            endpointPresent = true,
-                            overflow = true,
-                        )
+                        ?: run {
+                            subscribedGeneration.compareAndSet(received.generation, 0)
+                            return@synchronized classifyProductionRealtimeRoute(
+                                endpointPresent = true,
+                                overflow = true,
+                            )
+                        }
                     val admission = incoming.trySend(endpointEnvelope)
                     if (admission.isSuccess) {
                         return@synchronized classifyProductionRealtimeRoute(endpointPresent = true)
@@ -502,6 +516,7 @@ class ProductionRealtimeMultiplexer private constructor(
                             endpointClosed = true,
                         )
                     }
+                    subscribedGeneration.compareAndSet(received.generation, 0)
                     classifyProductionRealtimeRoute(endpointPresent = true, overflow = true)
                 }
             }

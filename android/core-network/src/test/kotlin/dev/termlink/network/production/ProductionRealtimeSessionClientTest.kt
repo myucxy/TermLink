@@ -6,6 +6,7 @@ import dev.termlink.crypto.DeviceIdentity
 import dev.termlink.crypto.SessionCrypto
 import dev.termlink.protocol.realtime.v1.Direction
 import dev.termlink.protocol.realtime.v1.Envelope
+import dev.termlink.protocol.realtime.v1.FlowControlPayload
 import dev.termlink.protocol.realtime.v1.GapPayload
 import dev.termlink.protocol.realtime.v1.InputResultPayload
 import dev.termlink.protocol.realtime.v1.LeasePayload
@@ -176,6 +177,249 @@ class ProductionRealtimeSessionClientTest {
         )
         multiplexers += multiplexer
         return multiplexer.register(sessionId)
+    }
+
+    private fun Envelope.decryptFlowControl(sessionKey: ByteArray): FlowControlPayload {
+        val plaintext = ProductionRealtimeClient.decryptEnvelope(this, sessionKey)
+        return try {
+            FlowControlPayload.parseFrom(plaintext)
+        } finally {
+            plaintext.fill(0)
+        }
+    }
+
+    @Test
+    fun subscriberBootstrapPublishesZeroWindowBeforeBoundedOpenWindow(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val keyId = "epoch-00000007".encodeToByteArray()
+        val transport = GenerationRaceSessionTransport()
+        val pairwise = SessionCrypto.derivePairwiseKey(
+            privateKey = androidIdentity.exchange.privateKey,
+            peerPublicKey = pcIdentity.exchange.publicKey,
+            pcDeviceId = pcId,
+            androidDeviceId = androidId,
+            keyEpoch = 7,
+        )
+        val sessionKey = SessionCrypto.deriveSessionKey(
+            pairwise,
+            sessionId,
+            CryptoDirection.ANDROID_TO_PC,
+            keyId,
+        )
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+                keyId = keyId.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(30_000),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+
+        try {
+            client.start()
+            withTimeout(2_000) {
+                while (transport.sent.count { it.messageType == MessageType.FLOW_CONTROL } < 2) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+            val bootstrap = transport.sent.take(3)
+            assertEquals(
+                listOf(MessageType.SUBSCRIBE, MessageType.FLOW_CONTROL, MessageType.FLOW_CONTROL),
+                bootstrap.map(Envelope::getMessageType),
+            )
+            val controls = bootstrap.drop(1).map { envelope ->
+                val plaintext = ProductionRealtimeClient.decryptEnvelope(envelope, sessionKey)
+                try {
+                    FlowControlPayload.parseFrom(plaintext)
+                } finally {
+                    plaintext.fill(0)
+                }
+            }
+            assertTrue(controls[0].paused)
+            assertEquals(0, controls[0].maxUnackedEvents)
+            assertEquals(0L, controls[0].maxUnackedWireBytes)
+            assertFalse(controls[1].paused)
+            assertEquals(ProductionRealtimeClient.OPEN_WINDOW_EVENTS, controls[1].maxUnackedEvents)
+            assertTrue(ProductionRealtimeClient.OPEN_WINDOW_EVENTS < ProductionRealtimeClient.MAX_BUFFERED_EVENTS)
+        } finally {
+            client.close()
+            sessionKey.fill(0)
+            pairwise.fill(0)
+            keyId.fill(0)
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun subscriberBootstrapKeepsZeroWindowWhileReceiveQueueIsPausedThenOpensAfterLowWater(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val keyId = "epoch-00000007".encodeToByteArray()
+        val transport = GenerationRaceSessionTransport()
+        val pairwise = SessionCrypto.derivePairwiseKey(
+            privateKey = androidIdentity.exchange.privateKey,
+            peerPublicKey = pcIdentity.exchange.publicKey,
+            pcDeviceId = pcId,
+            androidDeviceId = androidId,
+            keyEpoch = 7,
+        )
+        val sessionKey = SessionCrypto.deriveSessionKey(
+            pairwise,
+            sessionId,
+            CryptoDirection.ANDROID_TO_PC,
+            keyId,
+        )
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+                keyId = keyId.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(30_000),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+
+        try {
+            transport.emitPressure(paused = true)
+            client.start()
+            withTimeout(2_000) {
+                while (transport.sent.count { it.messageType == MessageType.FLOW_CONTROL } < 2) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+
+            val heldControls = transport.sent
+                .filter { it.messageType == MessageType.FLOW_CONTROL }
+                .take(2)
+                .map { it.decryptFlowControl(sessionKey) }
+            assertTrue(heldControls.all(FlowControlPayload::getPaused))
+            assertTrue(heldControls.all { it.maxUnackedEvents == 0 })
+            assertEquals("ANDROID_SUBSCRIBER_BOOTSTRAP", heldControls[0].reasonCode)
+            assertEquals("ANDROID_RENDER_QUEUE_HIGH_WATER", heldControls[1].reasonCode)
+
+            transport.emitPressure(paused = false)
+            withTimeout(2_000) {
+                while (transport.sent.count { it.messageType == MessageType.FLOW_CONTROL } < 3) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+            val opened = transport.sent
+                .filter { it.messageType == MessageType.FLOW_CONTROL }
+                .last()
+                .decryptFlowControl(sessionKey)
+            assertFalse(opened.paused)
+            assertEquals(ProductionRealtimeClient.OPEN_WINDOW_EVENTS, opened.maxUnackedEvents)
+            assertEquals(ProductionRealtimeClient.OPEN_WINDOW_WIRE_BYTES, opened.maxUnackedWireBytes)
+        } finally {
+            client.close()
+            sessionKey.fill(0)
+            pairwise.fill(0)
+            keyId.fill(0)
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun generationReplacementWhileOpenWindowSendIsBlockedCannotOpenRetiredGeneration(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = GenerationRaceSessionTransport()
+        val blockedOpen = transport.blockNthGenerationSend(MessageType.FLOW_CONTROL, occurrence = 2)
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(30_000),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+        )
+
+        try {
+            client.start()
+            assertTrue(blockedOpen.entered.await(2, TimeUnit.SECONDS))
+            val generationOne = transport.currentConnectedGeneration()
+            assertEquals(
+                listOf(generationOne),
+                transport.generationBoundSends
+                    .filter { it.first == MessageType.FLOW_CONTROL }
+                    .map { it.second },
+            )
+
+            val generationTwo = transport.replaceGeneration()
+            blockedOpen.release.countDown()
+            transport.emitConnectedEvent(generationTwo)
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady ||
+                    transport.generationBoundSends.count {
+                        it.first == MessageType.FLOW_CONTROL && it.second == generationTwo
+                    } < 2
+                ) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+
+            assertEquals(
+                listOf(generationOne, generationTwo, generationTwo),
+                transport.generationBoundSends
+                    .filter { it.first == MessageType.FLOW_CONTROL }
+                    .map { it.second },
+            )
+            assertEquals(
+                listOf(generationOne, generationTwo),
+                transport.generationBoundSends
+                    .filter { it.first == MessageType.SUBSCRIBE }
+                    .map { it.second },
+            )
+            assertTrue(transport.disconnectReasons.isEmpty())
+        } finally {
+            blockedOpen.release.countDown()
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
     }
 
     @Test
@@ -462,7 +706,7 @@ class ProductionRealtimeSessionClientTest {
             }
 
             assertEquals(
-                listOf(generationTwo),
+                listOf(generationTwo, generationTwo),
                 transport.generationBoundSends
                     .filter { it.first == MessageType.FLOW_CONTROL }
                     .map { it.second },
@@ -811,7 +1055,8 @@ class ProductionRealtimeSessionClientTest {
             withTimeout(2_000) {
                 while (!client.diagnostics().subscriberReady ||
                     transport.generationSendAttempts.count { it.first == MessageType.SUBSCRIBE } < 2 ||
-                    transport.generationBoundSends.count { it.first == MessageType.FLOW_CONTROL } < 2
+                    transport.generationBoundSends.count { it.first == MessageType.FLOW_CONTROL } < 4 ||
+                    client.transportState.value !is ProductionTransportState.Connected
                 ) {
                     kotlinx.coroutines.yield()
                 }
@@ -1576,6 +1821,7 @@ class ProductionRealtimeSessionClientTest {
         val resumes = CopyOnWriteArrayList<Long>()
         val durableAcks = CopyOnWriteArrayList<DurableAckCommit>()
         val wireAcks = CopyOnWriteArrayList<Long>()
+        val wireOrder = CopyOnWriteArrayList<String>()
         val outputs = CopyOnWriteArrayList<ByteArray>()
 
         fun sendPcEnvelope(webSocket: WebSocket, type: MessageType, sequence: Long, payload: ByteArray) {
@@ -1641,6 +1887,7 @@ class ProductionRealtimeSessionClientTest {
                                 MessageType.SUBSCRIBE -> {
                                     val resume = SubscribePayload.parseFrom(plaintext).resumeFromSeq
                                     resumes += resume
+                                    wireOrder += "SUBSCRIBE:$resume"
                                     if (resumes.size == 1) {
                                         val output = OutputChunkPayload.newBuilder()
                                             .setOutput(ByteString.copyFrom(byteArrayOf(1)))
@@ -1665,6 +1912,11 @@ class ProductionRealtimeSessionClientTest {
                                     val ack = OutputAckPayload.parseFrom(plaintext).highestContiguousSeq
                                     assertEquals(ack, envelope.ack)
                                     wireAcks += ack
+                                    wireOrder += "ACK:$ack"
+                                }
+                                MessageType.FLOW_CONTROL -> {
+                                    val flow = FlowControlPayload.parseFrom(plaintext)
+                                    wireOrder += "FLOW:${flow.paused}:${flow.maxUnackedEvents}:${flow.reasonCode}"
                                 }
                                 else -> Unit
                             }
@@ -1715,9 +1967,39 @@ class ProductionRealtimeSessionClientTest {
             assertEquals(3L, client.recoverFromHistory(replay, recoveredLocalInputEpoch = 9))
             withTimeout(2_000) { client.sessionState.first { it.lastAckedSequence == 3L } }
             withTimeout(2_000) {
-                while (resumes.lastOrNull() != 3L || wireAcks.lastOrNull() != 3L) kotlinx.coroutines.yield()
+                while (true) {
+                    val recoveryIndex = wireOrder.indexOf("SUBSCRIBE:3")
+                    val openAfterRecovery = recoveryIndex >= 0 &&
+                        wireOrder.drop(recoveryIndex + 1).any {
+                            it == "FLOW:false:${ProductionRealtimeClient.OPEN_WINDOW_EVENTS}:" +
+                                "ANDROID_RENDER_QUEUE_AVAILABLE"
+                        }
+                    if (resumes.lastOrNull() == 3L && wireAcks.lastOrNull() == 3L && openAfterRecovery) break
+                    kotlinx.coroutines.yield()
+                }
             }
             assertEquals(listOf(0L, 3L), resumes.take(2))
+            val recoverySubscribeIndex = wireOrder.indexOf("SUBSCRIBE:3")
+            assertTrue(recoverySubscribeIndex >= 0)
+            val recoveryControls = wireOrder.drop(recoverySubscribeIndex + 1)
+                .filter { it.startsWith("FLOW:") }
+            assertTrue(recoveryControls.isNotEmpty())
+            assertTrue(recoveryControls.first().startsWith("FLOW:true:0:"))
+            val recoveryOpenIndex = recoveryControls.indexOfFirst {
+                it == "FLOW:false:${ProductionRealtimeClient.OPEN_WINDOW_EVENTS}:" +
+                    "ANDROID_RENDER_QUEUE_AVAILABLE"
+            }
+            assertTrue(recoveryOpenIndex > 0)
+            assertTrue(
+                recoveryControls.take(recoveryOpenIndex).contains(
+                    "FLOW:true:0:ANDROID_SUBSCRIBER_BOOTSTRAP",
+                ),
+            )
+            assertEquals(
+                "FLOW:false:${ProductionRealtimeClient.OPEN_WINDOW_EVENTS}:ANDROID_RENDER_QUEUE_AVAILABLE",
+                recoveryControls[recoveryOpenIndex],
+            )
+            assertTrue(recoveryControls.take(recoveryOpenIndex).all { it.startsWith("FLOW:true:0:") })
             assertDurableCursor(durableAcks, expectedFinal = 3L, expectedGeneration = 1L)
             assertCumulativeCursor(wireAcks, expectedFinal = 3L)
             assertEquals(listOf(1, 2, 3), outputs.map { it.single().toInt() })
@@ -3645,6 +3927,7 @@ class ProductionRealtimeSessionClientTest {
     private class GenerationRaceSessionTransport : ProductionRealtimeSessionTransport {
         data class BlockedGenerationSend(
             val messageType: MessageType,
+            val remainingMatches: AtomicInteger = AtomicInteger(1),
             val entered: CountDownLatch = CountDownLatch(1),
             val release: CountDownLatch = CountDownLatch(1),
         )
@@ -3710,6 +3993,7 @@ class ProductionRealtimeSessionClientTest {
         ): Boolean {
             val candidate = blockedGenerationSend.get()
             val blocked = candidate?.takeIf { it.messageType == envelope.messageType }
+                ?.takeIf { it.remainingMatches.decrementAndGet() == 0 }
                 ?.takeIf { blockedGenerationSend.compareAndSet(candidate, null) }
             if (blocked != null) {
                 blocked.entered.countDown()
@@ -3768,6 +4052,19 @@ class ProductionRealtimeSessionClientTest {
             BlockedGenerationSend(messageType).also { blocked ->
                 check(blockedGenerationSend.compareAndSet(null, blocked))
             }
+
+        fun blockNthGenerationSend(
+            messageType: MessageType,
+            occurrence: Int,
+        ): BlockedGenerationSend {
+            require(occurrence > 0) { "occurrence must be positive" }
+            return BlockedGenerationSend(
+                messageType = messageType,
+                remainingMatches = AtomicInteger(occurrence),
+            ).also { blocked ->
+                check(blockedGenerationSend.compareAndSet(null, blocked))
+            }
+        }
 
         fun failNextGenerationSend(messageType: MessageType) {
             check(failedGenerationSend.compareAndSet(null, messageType))

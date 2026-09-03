@@ -1034,7 +1034,7 @@ class ProductionRealtimeMultiplexerTest {
     }
 
     @Test
-    fun endpointHardWireLimitOverflowsLocallyAndCloseReleasesQuotaExactlyOnce(): Unit = runTest {
+    fun endpointHardWireLimitReplacesGenerationAndCloseReleasesQuotaExactlyOnce(): Unit = runTest {
         val sessionA = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
         val sessionB = UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
         val socket = FakeSocket()
@@ -1082,33 +1082,43 @@ class ProductionRealtimeMultiplexerTest {
         assertEquals(1L, endpointA.diagnostics().routeDecisions.overflow)
         assertEquals(9, socket.releasedReservations.get())
         assertEquals(ProductionReceivePressure(0, false, 0, 0), endpointB.receivePressure.value)
-        assertEquals(1, socket.connectCount)
-        assertEquals(0, socket.disconnectCount)
-        assertEquals(generation, socket.diagnostics().generation)
-        assertEquals(generation, socket.diagnostics().connectedGeneration)
+        assertEquals(2, socket.connectCount)
+        assertEquals(1, socket.disconnectCount)
+        assertTrue(socket.diagnostics().generation > generation)
+        assertEquals(0, socket.diagnostics().connectedGeneration)
 
+        socket.deliver(socket.received(sessionB, sequence = 900, generation = generation, wireBytes = 64))
+        runCurrent()
+        assertEquals(10, socket.releasedReservations.get())
+        assertTrue(endpointB.diagnostics().routeDecisions.rejectedGeneration >= 1L)
+
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        val successorGeneration = socket.diagnostics().connectedGeneration
+        endpointA.sendSubscribe(sessionA)
+        endpointB.sendSubscribe(sessionB)
         val peerFrame = async {
             endpointB.receivedEnvelopes.take(1).map { it.use { item -> item.envelope.seq } }.toList()
         }
-        socket.deliver(socket.received(sessionB, sequence = 900, generation = generation, wireBytes = 64))
+        socket.deliver(socket.received(sessionB, sequence = 901, generation = successorGeneration, wireBytes = 64))
         runCurrent()
-        assertEquals(listOf(900L), peerFrame.await())
-        assertEquals(10, socket.releasedReservations.get())
+        assertEquals(listOf(901L), peerFrame.await())
+        assertEquals(11, socket.releasedReservations.get())
         assertEquals(ProductionReceivePressure(generation, true, 8,
             ProductionRealtimeClient.HARD_BUFFERED_WIRE_BYTES), endpointA.receivePressure.value)
-        assertEquals(ProductionReceivePressure(generation, false, 0, 0), endpointB.receivePressure.value)
+        assertEquals(ProductionReceivePressure(successorGeneration, false, 0, 0), endpointB.receivePressure.value)
 
         endpointA.close()
         assertEquals(ProductionReceivePressure(generation, false, 0, 0), endpointA.receivePressure.value)
         endpointA.close()
         assertEquals(ProductionReceivePressure(generation, false, 0, 0), endpointA.receivePressure.value)
-        assertEquals(10, socket.releasedReservations.get())
+        assertEquals(11, socket.releasedReservations.get())
         multiplexer.close()
-        assertEquals(10, socket.releasedReservations.get())
+        assertEquals(11, socket.releasedReservations.get())
     }
 
     @Test
-    fun endpointOverflowDropsOnlyExcessFramesAndKeepsSharedSocket(): Unit = runTest {
+    fun endpointOverflowReplacesGenerationAndReplaysFromFreshSubscription(): Unit = runTest {
         val sessionId = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
         val peerSessionId = UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
         val socket = FakeSocket()
@@ -1126,16 +1136,14 @@ class ProductionRealtimeMultiplexerTest {
         }
         runCurrent()
 
-        assertEquals(0, socket.disconnectCount)
+        assertEquals(1, socket.disconnectCount)
+        assertEquals(2, socket.connectCount)
         assertEquals(ProductionRealtimeClient.MAX_BUFFERED_EVENTS + 2, socket.releasedReservations.get())
-        assertEquals(2L, endpoint.diagnostics().routeDecisions.overflow)
-        assertEquals(0L, endpoint.diagnostics().routeDecisions.rejectedGeneration)
-        val peerFrame = async {
-            peer.receivedEnvelopes.take(1).map { it.use { item -> item.envelope.seq } }.toList()
-        }
+        assertEquals(1L, endpoint.diagnostics().routeDecisions.overflow)
+        assertEquals(1L, endpoint.diagnostics().routeDecisions.rejectedGeneration)
         socket.deliver(socket.received(peerSessionId, 900, generation = 1))
         runCurrent()
-        assertEquals(listOf(900L), peerFrame.await())
+        assertTrue(endpoint.diagnostics().routeDecisions.rejectedGeneration >= 2L)
         val admitted = async {
             endpoint.receivedEnvelopes
                 .take(ProductionRealtimeClient.MAX_BUFFERED_EVENTS)
@@ -1148,17 +1156,23 @@ class ProductionRealtimeMultiplexerTest {
             admitted.await(),
         )
 
-        val nextGeneration = async {
-            endpoint.receivedEnvelopes.take(1).map { it.use { item -> item.envelope.seq } }.toList()
-        }
-        socket.activateGeneration(2)
         socket.emitState(RealtimeState.Connected)
         runCurrent()
         endpoint.sendSubscribe(sessionId)
-        socket.deliver(socket.received(sessionId, 129, generation = 2))
+        peer.sendSubscribe(peerSessionId)
+        val successorGeneration = socket.diagnostics().connectedGeneration
+        val nextGeneration = async {
+            endpoint.receivedEnvelopes.take(1).map { it.use { item -> item.envelope.seq } }.toList()
+        }
+        val peerFrame = async {
+            peer.receivedEnvelopes.take(1).map { it.use { item -> item.envelope.seq } }.toList()
+        }
+        socket.deliver(socket.received(sessionId, 129, generation = successorGeneration))
+        socket.deliver(socket.received(peerSessionId, 901, generation = successorGeneration))
         runCurrent()
         assertEquals(listOf(129L), nextGeneration.await())
-        assertEquals(ProductionRealtimeClient.MAX_BUFFERED_EVENTS + 4, socket.releasedReservations.get())
+        assertEquals(listOf(901L), peerFrame.await())
+        assertEquals(ProductionRealtimeClient.MAX_BUFFERED_EVENTS + 5, socket.releasedReservations.get())
 
         multiplexer.close()
     }

@@ -126,6 +126,36 @@ internal class ProductionDeviceConnectionSupervisor(
         }
     }
 
+    /**
+     * A bounded receive queue rejected authenticated ciphertext, so this socket
+     * generation can no longer prove a contiguous stream. Replace that exact
+     * generation once and recover every session from its durable ACK. Ordinary
+     * renderer/session failures must not use this device-wide boundary.
+     */
+    fun replaceCurrentGenerationOnReceiveIntegrityFailure(
+        expectedGeneration: Int,
+        reason: String,
+    ) {
+        require(expectedGeneration > 0) { "expected generation must be positive" }
+        val owner = synchronized(lock) {
+            val diagnostics = socket.diagnostics()
+            if (closed.get() || phase != Phase.CONNECTED || activeConnectOwner != null ||
+                diagnostics.connectedGeneration != expectedGeneration
+            ) {
+                null
+            } else {
+                retryJob?.cancel()
+                retryJob = null
+                claimConnectLocked(
+                    trigger = reason,
+                    action = ReconcileAction.REPLACE,
+                    requiresEndpoint = true,
+                )
+            }
+        }
+        owner?.let(::performOwnedSocketAction)
+    }
+
     fun send(envelope: dev.termlink.protocol.realtime.v1.Envelope): Boolean = synchronized(lock) {
         if (closed.get() || phase != Phase.CONNECTED || activeConnectOwner != null) return@synchronized false
         socket.send(envelope)
