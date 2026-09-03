@@ -1495,6 +1495,13 @@ namespace TermLink.Agent
                         {
                             response = Response(false, "INVALID_REQUEST", 0);
                         }
+#if TERMLINK_PRODUCTION_RUNTIME
+                        catch (ProductionEnrollmentException error)
+                        {
+                            ObserveControlRequestFailure(controlRequest, error);
+                            response = Response(false, error.Code, 0);
+                        }
+#endif
                         catch (InvalidOperationException error)
                         {
                             ObserveControlRequestFailure(controlRequest, error);
@@ -1871,6 +1878,15 @@ namespace TermLink.Agent
 #endif
                 case RegistryCommand.BeginAccountAuthorization:
 #if TERMLINK_PRODUCTION_RUNTIME
+                    if (ProductionEnrollment.TryContinueActiveBrowserAuthorization(
+                            ProductionEnrollment.PublicServerUrl))
+                    {
+                        // The owning request performs the runtime swap while
+                        // holding this lock. Do not acknowledge the joined
+                        // request until that new-account runtime is visible.
+                        lock (productionRuntimeMutationSync) { }
+                        return Response(true, "ACCOUNT_AUTHORIZATION_ACCEPTED", 0);
+                    }
                     ReplaceProductionAccount(delegate
                     {
                         ProductionEnrollment.LinkAccount(

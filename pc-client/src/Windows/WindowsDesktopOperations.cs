@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using TermLink.Presentation;
 using TermLink.WindowsIntegration;
 
 namespace TermLink.Platform.Windows;
@@ -101,12 +102,30 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
         cancellationToken.ThrowIfCancellationRequested();
         var directory = Path.Combine(localApplicationData, "TermLink", "logs");
         Directory.CreateDirectory(directory);
-        using var process = Process.Start(new ProcessStartInfo
+        OpenShellTarget(new ProcessStartInfo
         {
             FileName = directory,
             UseShellExecute = true,
-        }) ?? throw new InvalidOperationException("无法打开诊断日志目录。");
-        return ValueTask.FromResult("已打开诊断日志目录。");
+        });
+        return ValueTask.FromResult(PresentationText.DiagnosticsDirectoryOpened);
+    }
+
+    internal static void OpenShellTarget(
+        ProcessStartInfo startInfo,
+        Func<ProcessStartInfo, Process?>? startProcess = null)
+    {
+        ArgumentNullException.ThrowIfNull(startInfo);
+        try
+        {
+            // ShellExecute commonly returns no process handle after handing a
+            // directory or URL to an existing Explorer/browser instance. That
+            // is a successful dispatch and must not be reported as a failure.
+            using var process = (startProcess ?? Process.Start)(startInfo);
+        }
+        catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            throw new AgentClientOperationException("PC_SHELL_OPEN_FAILED", error.Message, innerException: error);
+        }
     }
 
     public ValueTask<DesktopTerminalIntegrationSettings> GetTerminalIntegrationSettingsAsync(

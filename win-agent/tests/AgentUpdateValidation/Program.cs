@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -21,6 +22,7 @@ namespace TermLink.AgentUpdate.Validation
             try
             {
                 ValidateBrowserAuthorizationLaunch();
+                ValidateBrowserCallbackPortFailure();
                 var pcId = Guid.NewGuid();
                 var updateId = Guid.NewGuid();
                 var mutations = new List<(string Path, string Key, byte[] Body)>();
@@ -108,6 +110,31 @@ namespace TermLink.AgentUpdate.Validation
             AssertThrows<ArgumentException>(
                 () => ProductionEnrollment.CreateBrowserStartInfo("http://identity.example.test/authorize"),
                 "browser authorization accepted a non-HTTPS URL");
+            var fallback = ProductionEnrollment.CreateBrowserExecutableStartInfo(
+                @"C:\Browser\browser.exe",
+                authorizationUrl);
+            Assert(!fallback.UseShellExecute && fallback.FileName == @"C:\Browser\browser.exe" &&
+                    fallback.ArgumentList.SequenceEqual(new[] { authorizationUrl }),
+                "browser fallback did not pass the validated HTTPS URL as one executable argument");
+        }
+
+        private static void ValidateBrowserCallbackPortFailure()
+        {
+            using var occupied = new TcpListener(IPAddress.Loopback, 0);
+            occupied.Server.ExclusiveAddressUse = true;
+            occupied.Start(1);
+            var port = ((IPEndPoint)occupied.LocalEndpoint).Port;
+            try
+            {
+                using var unexpected = ProductionEnrollment.StartCallbackListener(
+                    new Uri("http://127.0.0.1:" + port + "/oauth2/callback"));
+                throw new InvalidOperationException("browser callback accepted an occupied loopback port");
+            }
+            catch (ProductionEnrollmentException error)
+            {
+                Assert(error.Code == "ACCOUNT_CALLBACK_PORT_IN_USE",
+                    "browser callback port failure lost its stable error code");
+            }
         }
 
         private static void ValidateSupervisorRecoveryDecisions()

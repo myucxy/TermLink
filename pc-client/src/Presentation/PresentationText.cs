@@ -85,6 +85,30 @@ public static class PresentationText
     public static string BrowserAuthorizationSucceeded => Pick(
         "网页授权成功，Agent 正在重新建立连接。",
         "Web authorization succeeded; the Agent is reconnecting.");
+    public static string BrowserAuthorizationInProgressDetail => Pick(
+        "已有网页授权正在进行，TermLink 已重新打开授权页面，请在页面中继续。",
+        "A web authorization is already in progress. TermLink reopened the authorization page so you can continue.");
+    public static string BrowserCallbackPortInUseDetail => Pick(
+        "本机授权回调端口被其他程序占用。请关闭旧的 TermLink 授权流程后重试；本地会话不会受到影响。",
+        "Another program is using the local authorization callback port. Close the previous TermLink authorization flow and try again; local sessions are unaffected.");
+    public static string BrowserOpenFailedDetail => Pick(
+        "Windows 无法打开默认浏览器。请在系统设置中为 HTTP 和 HTTPS 选择默认浏览器后重试。",
+        "Windows could not open the default browser. Choose a default browser for HTTP and HTTPS in Windows Settings, then try again.");
+    public static string BrowserAuthorizationTimeoutDetail => Pick(
+        "网页授权已超时。请重新点击登录，并在 5 分钟内完成登录或注册。",
+        "Web authorization timed out. Start sign-in again and complete it within 5 minutes.");
+    public static string BrowserAuthorizationRejectedDetail => Pick(
+        "网页授权被取消或返回内容无效，请重新发起登录。",
+        "Web authorization was cancelled or returned an invalid response. Start sign-in again.");
+    public static string BrowserAuthorizationFailedDetail => Pick(
+        "Agent 未能启动网页授权。请检查默认浏览器，并确认没有旧的 TermLink 授权仍占用本机回调端口后重试；本地会话不会受到影响。",
+        "The Agent could not start web authorization. Check the default browser and make sure no previous TermLink authorization is using the local callback port, then try again; local sessions are unaffected.");
+    public static string IdentityServiceTimeoutDetail => Pick(
+        "身份服务响应超时。请检查服务器连接后重试。",
+        "The identity service timed out. Check the server connection and try again.");
+    public static string TokenExchangeFailedDetail => Pick(
+        "网页已返回，但登录凭据交换没有完成。请重新登录；若问题持续，请检查身份服务配置。",
+        "The browser returned, but the credential exchange did not complete. Sign in again; if it persists, check the identity service configuration.");
     public static string SignInInputRequired => Pick("请输入登录信息", "Enter sign-in details");
     public static string LoginMode => Pick("登录", "Sign in");
     public static string RegisterMode => Pick("创建账户", "Create account");
@@ -155,6 +179,10 @@ public static class PresentationText
     public static string LastError => Pick("最后错误", "Last error");
     public static string AdvancedDiagnostics => Pick("高级诊断", "Advanced diagnostics");
     public static string OpenLogs => Pick("打开日志目录", "Open log directory");
+    public static string DiagnosticsDirectoryOpened => Pick("已打开诊断日志目录。", "The diagnostics log directory is open.");
+    public static string ShellOpenFailedDetail => Pick(
+        "Windows 无法打开请求的页面或目录。请检查默认应用和资源管理器后重试。",
+        "Windows could not open the requested page or directory. Check default apps and File Explorer, then try again.");
     public static string RefreshStatus => Pick("刷新状态", "Refresh status");
     public static string OpenTermLink => Pick("打开 TermLink", "Open TermLink");
     public static string ExitControlUi => Pick("退出控制 UI（Agent 继续运行）", "Exit control UI (Agent keeps running)");

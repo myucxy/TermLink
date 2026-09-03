@@ -13,7 +13,7 @@ if (args.Length > 0)
 }
 
 var sessionId = Guid.Parse("00112233-4455-6677-8899-aabbccddeeff");
-Require(RegistryControlClient.MaximumTimeoutMilliseconds == 300_000,
+Require(RegistryControlClient.MaximumTimeoutMilliseconds == 360_000,
     "Registry control timeout limit changed unexpectedly.");
 var defaultControlPipe = TermLinkControlPipe.DefaultName();
 Require(defaultControlPipe.StartsWith("termlink-agent-control-v2-", StringComparison.Ordinal) &&

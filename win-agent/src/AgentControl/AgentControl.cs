@@ -1170,7 +1170,7 @@ namespace TermLink.Agent
 
     public static class RegistryControlClient
     {
-        public const int MaximumTimeoutMilliseconds = 300000;
+        public const int MaximumTimeoutMilliseconds = 360000;
 
         public static RegistryResponse Send(string pipeName, RegistryRequest request, int timeoutMilliseconds)
         {

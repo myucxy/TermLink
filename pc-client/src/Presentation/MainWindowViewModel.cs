@@ -1229,6 +1229,15 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             "PC_AGENT_EXITED" => PresentationText.AgentExitedDetail,
             "PC_AGENT_EXITING" => PresentationText.AgentExitingDetail,
             "PC_AGENT_PROCESSES_STILL_RUNNING" => PresentationText.AgentProcessesStillRunningDetail,
+            "ACCOUNT_AUTHORIZATION_IN_PROGRESS" => PresentationText.BrowserAuthorizationInProgressDetail,
+            "ACCOUNT_CALLBACK_PORT_IN_USE" => PresentationText.BrowserCallbackPortInUseDetail,
+            "ACCOUNT_BROWSER_OPEN_FAILED" => PresentationText.BrowserOpenFailedDetail,
+            "ACCOUNT_AUTHORIZATION_TIMEOUT" => PresentationText.BrowserAuthorizationTimeoutDetail,
+            "ACCOUNT_AUTHORIZATION_REJECTED" => PresentationText.BrowserAuthorizationRejectedDetail,
+            "ACCOUNT_AUTHORIZATION_FAILED" => PresentationText.BrowserAuthorizationFailedDetail,
+            "ACCOUNT_IDENTITY_SERVICE_TIMEOUT" => PresentationText.IdentityServiceTimeoutDetail,
+            "ACCOUNT_TOKEN_EXCHANGE_TIMEOUT" or "ACCOUNT_TOKEN_EXCHANGE_FAILED" => PresentationText.TokenExchangeFailedDetail,
+            "PC_SHELL_OPEN_FAILED" => PresentationText.ShellOpenFailedDetail,
             "PC-AGENT-IPC-UNAVAILABLE" or "PC-AGENT-IPC-AUTHENTICATION" or
                 "PC-AGENT-CREDENTIAL-ERROR" or "PC-AGENT-ACCESS-DENIED" or
                 "PC-AGENT-TIMEOUT" or "PC-AGENT-UNAVAILABLE" => PresentationText.ConnectionFailedDetail,

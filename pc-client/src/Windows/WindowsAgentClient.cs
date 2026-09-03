@@ -139,11 +139,26 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
         string pcName,
         CancellationToken cancellationToken)
     {
-        await SendAccountMutationAsync(new RegistryRequest
+        try
         {
-            Command = RegistryCommand.BeginAccountAuthorization,
-            PcName = string.IsNullOrWhiteSpace(pcName) ? Environment.MachineName : pcName.Trim()
-        }, RegistryControlClient.MaximumTimeoutMilliseconds, cancellationToken).ConfigureAwait(false);
+            await SendAccountMutationAsync(new RegistryRequest
+            {
+                Command = RegistryCommand.BeginAccountAuthorization,
+                PcName = string.IsNullOrWhiteSpace(pcName) ? Environment.MachineName : pcName.Trim()
+            }, RegistryControlClient.MaximumTimeoutMilliseconds, cancellationToken).ConfigureAwait(false);
+        }
+        catch (AgentClientOperationException error) when (
+            string.Equals(error.Code, "OPERATION_FAILED", StringComparison.OrdinalIgnoreCase))
+        {
+            // Agents predating the structured enrollment error contract return
+            // only OPERATION_FAILED. Keep this failure scoped to web sign-in so
+            // the UI does not collapse it into InvalidOperationException.
+            throw new AgentClientOperationException(
+                "ACCOUNT_AUTHORIZATION_FAILED",
+                error.Diagnostic,
+                error.ProcessExitCode,
+                error);
+        }
     }
 
     public async ValueTask LoginAsync(
@@ -380,7 +395,7 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
         {
             await EnsureAgentLockedAsync(cancellationToken).ConfigureAwait(false);
             var response = await SendAsync(request, timeoutMilliseconds, cancellationToken).ConfigureAwait(false);
-            if (!response.Success) throw new InvalidOperationException(response.Code ?? "AGENT_COMMAND_FAILED");
+            if (!response.Success) throw new AgentClientOperationException(response.Code ?? "AGENT_COMMAND_FAILED");
         }
         finally
         {

@@ -324,6 +324,18 @@ public static class Program
             Require(viewModel.NoticeCode == "PC_AGENT_RESTART_TIMEOUT" &&
                     viewModel.NoticeDetail == PresentationText.AgentRestartTimeoutDetail,
                 "The English Agent restart failure was not localized.");
+            await viewModel.ReportFailureAsync(new AgentClientOperationException("ACCOUNT_CALLBACK_PORT_IN_USE"));
+            Require(viewModel.NoticeCode == "ACCOUNT_CALLBACK_PORT_IN_USE" &&
+                    viewModel.NoticeDetail == PresentationText.BrowserCallbackPortInUseDetail,
+                "An occupied browser callback port was not localized.");
+            await viewModel.ReportFailureAsync(new AgentClientOperationException("ACCOUNT_BROWSER_OPEN_FAILED"));
+            Require(viewModel.NoticeCode == "ACCOUNT_BROWSER_OPEN_FAILED" &&
+                    viewModel.NoticeDetail == PresentationText.BrowserOpenFailedDetail,
+                "A browser launch failure was not localized.");
+            await viewModel.ReportFailureAsync(new AgentClientOperationException("ACCOUNT_AUTHORIZATION_FAILED"));
+            Require(viewModel.NoticeCode == "ACCOUNT_AUTHORIZATION_FAILED" &&
+                    viewModel.NoticeDetail == PresentationText.BrowserAuthorizationFailedDetail,
+                "A legacy Agent browser-authorization failure was not localized.");
         }
         finally
         {

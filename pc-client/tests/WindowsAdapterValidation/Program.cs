@@ -8,8 +8,24 @@ using TermLink.Platform.Windows;
 
 if (args.Length != 1 || !File.Exists(args[0]))
     throw new ArgumentException("Usage: WindowsAdapterValidation <TermLink.Agent.exe>");
-Require(RegistryControlClient.MaximumTimeoutMilliseconds == 300_000,
+Require(RegistryControlClient.MaximumTimeoutMilliseconds == 360_000,
     "The Windows adapter and Agent control timeout contract diverged.");
+
+var shellDispatchCalled = false;
+WindowsDesktopOperations.OpenShellTarget(
+    new ProcessStartInfo
+    {
+        FileName = Path.GetTempPath(),
+        UseShellExecute = true,
+    },
+    startInfo =>
+    {
+        shellDispatchCalled = startInfo.UseShellExecute &&
+            string.Equals(startInfo.FileName, Path.GetTempPath(), StringComparison.OrdinalIgnoreCase);
+        return null;
+    });
+Require(shellDispatchCalled,
+    "A successful ShellExecute dispatch without a process handle was reported as a failure.");
 
 var appShipStatus = WindowsDesktopOperations.ParseUpdateStatus("""
     {

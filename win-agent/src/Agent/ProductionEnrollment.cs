@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
@@ -78,10 +79,33 @@ namespace TermLink.Agent
         public Guid PcId { get; set; }
     }
 
+    internal sealed class ProductionEnrollmentException : Exception
+    {
+        public ProductionEnrollmentException(string code, string message, Exception innerException = null)
+            : base(message, innerException)
+        {
+            if (string.IsNullOrWhiteSpace(code))
+                throw new ArgumentException("An enrollment error code is required.", nameof(code));
+            Code = code;
+        }
+
+        public string Code { get; }
+    }
+
     public static class ProductionEnrollment
     {
         private const string AuthorizationScopes = "openid profile email offline_access";
         public const string PublicServerUrl = "https://termlink.kget.cc:8910";
+        private static readonly TimeSpan AuthorizationCallbackTimeout = TimeSpan.FromMinutes(5);
+        private static readonly object BrowserAuthorizationSync = new object();
+        private static BrowserAuthorizationAttempt activeBrowserAuthorization;
+
+        private sealed class BrowserAuthorizationAttempt
+        {
+            public ProductionEnrollmentOptions Options { get; set; }
+            public string AuthorizationUrl;
+            public Task Completion { get; set; }
+        }
 
         private sealed class ClientConfiguration
         {
@@ -119,7 +143,7 @@ namespace TermLink.Agent
         internal static int Run(ProductionEnrollmentOptions options)
         {
             if (options == null) throw new ArgumentNullException(nameof(options));
-            RunAsync(options).GetAwaiter().GetResult();
+            LinkAccount(options);
             Console.WriteLine("TermLink account linked.");
             return 0;
         }
@@ -137,7 +161,81 @@ namespace TermLink.Agent
                 "--server-url", serverUrl,
                 "--pc-name", pcName
             });
-            RunAsync(options).GetAwaiter().GetResult();
+            LinkAccount(options);
+        }
+
+        internal static bool TryContinueActiveBrowserAuthorization(string serverUrl)
+        {
+            BrowserAuthorizationAttempt attempt;
+            lock (BrowserAuthorizationSync)
+            {
+                attempt = activeBrowserAuthorization;
+                if (attempt == null || attempt.Completion == null || attempt.Completion.IsCompleted ||
+                    !string.Equals(attempt.Options.ServerUrl, serverUrl, StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+            }
+
+            var authorizationUrl = Volatile.Read(ref attempt.AuthorizationUrl);
+            if (!string.IsNullOrWhiteSpace(authorizationUrl)) OpenSystemBrowser(authorizationUrl);
+            try
+            {
+                attempt.Completion.GetAwaiter().GetResult();
+                return true;
+            }
+            finally
+            {
+                ClearCompletedBrowserAuthorization(attempt);
+            }
+        }
+
+        private static void LinkAccount(ProductionEnrollmentOptions options)
+        {
+            BrowserAuthorizationAttempt attempt;
+            var reopenExistingAttempt = false;
+            lock (BrowserAuthorizationSync)
+            {
+                attempt = activeBrowserAuthorization;
+                if (attempt != null && attempt.Completion != null && !attempt.Completion.IsCompleted)
+                {
+                    if (!string.Equals(attempt.Options.ServerUrl, options.ServerUrl, StringComparison.OrdinalIgnoreCase))
+                        throw new ProductionEnrollmentException(
+                            "ACCOUNT_AUTHORIZATION_IN_PROGRESS",
+                            "A browser authorization attempt for another server is already in progress.");
+                    reopenExistingAttempt = true;
+                }
+                else
+                {
+                    attempt = new BrowserAuthorizationAttempt { Options = options };
+                    activeBrowserAuthorization = attempt;
+                    attempt.Completion = RunAsync(options, attempt);
+                }
+            }
+
+            if (reopenExistingAttempt)
+            {
+                var authorizationUrl = Volatile.Read(ref attempt.AuthorizationUrl);
+                if (!string.IsNullOrWhiteSpace(authorizationUrl)) OpenSystemBrowser(authorizationUrl);
+            }
+
+            try
+            {
+                attempt.Completion.GetAwaiter().GetResult();
+            }
+            finally
+            {
+                ClearCompletedBrowserAuthorization(attempt);
+            }
+        }
+
+        private static void ClearCompletedBrowserAuthorization(BrowserAuthorizationAttempt attempt)
+        {
+            if (attempt == null || attempt.Completion == null || !attempt.Completion.IsCompleted) return;
+            lock (BrowserAuthorizationSync)
+            {
+                if (ReferenceEquals(activeBrowserAuthorization, attempt)) activeBrowserAuthorization = null;
+            }
         }
 
         public static void LoginDirect(string serverUrl, string pcName, string username, string password)
@@ -312,25 +410,48 @@ namespace TermLink.Agent
             return pcName;
         }
 
-        private static async Task RunAsync(ProductionEnrollmentOptions options)
+        private static async Task RunAsync(
+            ProductionEnrollmentOptions options,
+            BrowserAuthorizationAttempt attempt)
         {
             using var http = ProductionTls.CreateHttpClient(options.ServerUrl);
             http.Timeout = TimeSpan.FromSeconds(20);
-            var client = await GetJsonAsync<ClientConfiguration>(
-                http,
-                options.ServerUrl + "/v1/client-config",
-                CancellationToken.None).ConfigureAwait(false);
+            ClientConfiguration client;
+            try
+            {
+                client = await GetJsonAsync<ClientConfiguration>(
+                    http,
+                    options.ServerUrl + "/v1/client-config",
+                    CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException error)
+            {
+                throw new ProductionEnrollmentException(
+                    "ACCOUNT_IDENTITY_SERVICE_TIMEOUT",
+                    "The TermLink client configuration request timed out.",
+                    error);
+            }
             ValidateClientConfiguration(client);
-            var discovery = await GetJsonAsync<OIDCConfiguration>(
-                http,
-                client.OIDCIssuer.TrimEnd('/') + "/.well-known/openid-configuration",
-                CancellationToken.None).ConfigureAwait(false);
+            OIDCConfiguration discovery;
+            try
+            {
+                discovery = await GetJsonAsync<OIDCConfiguration>(
+                    http,
+                    client.OIDCIssuer.TrimEnd('/') + "/.well-known/openid-configuration",
+                    CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException error)
+            {
+                throw new ProductionEnrollmentException(
+                    "ACCOUNT_IDENTITY_SERVICE_TIMEOUT",
+                    "The OIDC discovery request timed out.",
+                    error);
+            }
             if (!IsHttps(discovery.AuthorizationEndpoint) || !IsHttps(discovery.TokenEndpoint))
                 throw new InvalidDataException("OIDC discovery endpoints are invalid.");
 
             var redirect = new Uri(client.RedirectUri);
-            using var listener = new TcpListener(IPAddress.Loopback, redirect.Port);
-            listener.Start(1);
+            using var listener = StartCallbackListener(redirect);
 
             var verifierBytes = new byte[32];
             var stateBytes = new byte[32];
@@ -354,17 +475,28 @@ namespace TermLink.Agent
                 ["code_challenge"] = challenge,
                 ["code_challenge_method"] = "S256"
             }).ConfigureAwait(false);
+            Volatile.Write(ref attempt.AuthorizationUrl, authorizationUrl);
             OpenSystemBrowser(authorizationUrl);
 
             string code;
-            using (var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
-            using (var connection = await listener.AcceptTcpClientAsync(timeout.Token).ConfigureAwait(false))
+            using (var timeout = new CancellationTokenSource(AuthorizationCallbackTimeout))
             {
-                code = await ReadAuthorizationResponseAsync(
-                    connection,
-                    redirect.AbsolutePath,
-                    state,
-                    timeout.Token).ConfigureAwait(false);
+                try
+                {
+                    using var connection = await listener.AcceptTcpClientAsync(timeout.Token).ConfigureAwait(false);
+                    code = await ReadAuthorizationResponseAsync(
+                        connection,
+                        redirect.AbsolutePath,
+                        state,
+                        timeout.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException error) when (timeout.IsCancellationRequested)
+                {
+                    throw new ProductionEnrollmentException(
+                        "ACCOUNT_AUTHORIZATION_TIMEOUT",
+                        "Browser authorization did not return before the callback timeout.",
+                        error);
+                }
             }
             listener.Stop();
 
@@ -379,22 +511,38 @@ namespace TermLink.Agent
                     ["code_verifier"] = verifier
                 })
             };
-            using var tokenResponse = await http.SendAsync(tokenRequest, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
-            if (!tokenResponse.IsSuccessStatusCode)
-                throw new InvalidOperationException("OIDC authorization code exchange failed.");
-            var tokens = await ReadJsonAsync<TokenResponse>(tokenResponse, CancellationToken.None).ConfigureAwait(false);
-            if (string.IsNullOrWhiteSpace(tokens.AccessToken) || string.IsNullOrWhiteSpace(tokens.RefreshToken) || tokens.ExpiresIn < 30)
-                throw new InvalidDataException("OIDC token response is incomplete.");
-
+            HttpResponseMessage tokenResponse;
             try
             {
-                PersistTokens(options.ServerUrl, options.PcName, client, tokens);
+                tokenResponse = await http.SendAsync(tokenRequest, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
             }
-            finally
+            catch (OperationCanceledException error)
             {
-                verifier = null;
-                state = null;
-                code = null;
+                throw new ProductionEnrollmentException(
+                    "ACCOUNT_TOKEN_EXCHANGE_TIMEOUT",
+                    "The OIDC authorization code exchange timed out.",
+                    error);
+            }
+            using (tokenResponse)
+            {
+                if (!tokenResponse.IsSuccessStatusCode)
+                    throw new ProductionEnrollmentException(
+                        "ACCOUNT_TOKEN_EXCHANGE_FAILED",
+                        "The OIDC authorization code exchange failed.");
+                var tokens = await ReadJsonAsync<TokenResponse>(tokenResponse, CancellationToken.None).ConfigureAwait(false);
+                if (string.IsNullOrWhiteSpace(tokens.AccessToken) || string.IsNullOrWhiteSpace(tokens.RefreshToken) || tokens.ExpiresIn < 30)
+                    throw new InvalidDataException("OIDC token response is incomplete.");
+
+                try
+                {
+                    PersistTokens(options.ServerUrl, options.PcName, client, tokens);
+                }
+                finally
+                {
+                    verifier = null;
+                    state = null;
+                    code = null;
+                }
             }
         }
 
@@ -429,15 +577,106 @@ namespace TermLink.Agent
             };
         }
 
+        internal static ProcessStartInfo CreateBrowserExecutableStartInfo(
+            string executablePath,
+            string authorizationUrl)
+        {
+            if (!IsHttps(authorizationUrl))
+                throw new ArgumentException("The browser authorization URL must use HTTPS.", nameof(authorizationUrl));
+            if (string.IsNullOrWhiteSpace(executablePath) || !Path.IsPathFullyQualified(executablePath) ||
+                !string.Equals(Path.GetExtension(executablePath), ".exe", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ArgumentException("The browser executable path is invalid.", nameof(executablePath));
+            }
+            var start = new ProcessStartInfo
+            {
+                FileName = Path.GetFullPath(executablePath),
+                UseShellExecute = false,
+                CreateNoWindow = false,
+                WindowStyle = ProcessWindowStyle.Normal
+            };
+            start.ArgumentList.Add(authorizationUrl);
+            return start;
+        }
+
         private static void OpenSystemBrowser(string authorizationUrl)
         {
+            Exception launchError = null;
             try
             {
                 using var browser = Process.Start(CreateBrowserStartInfo(authorizationUrl));
+                return;
             }
             catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception)
             {
-                throw new InvalidOperationException("The system browser could not be opened.", error);
+                launchError = error;
+            }
+
+            foreach (var executablePath in BrowserFallbackExecutablePaths())
+            {
+                if (!File.Exists(executablePath)) continue;
+                try
+                {
+                    using var browser = Process.Start(
+                        CreateBrowserExecutableStartInfo(executablePath, authorizationUrl));
+                    return;
+                }
+                catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception)
+                {
+                    launchError = error;
+                }
+            }
+
+            throw new ProductionEnrollmentException(
+                "ACCOUNT_BROWSER_OPEN_FAILED",
+                "The system browser could not be opened.",
+                launchError);
+        }
+
+        private static IEnumerable<string> BrowserFallbackExecutablePaths()
+        {
+            var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            var programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+            var localApplicationData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            return new[]
+            {
+                Path.Combine(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe"),
+                Path.Combine(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
+                Path.Combine(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+                Path.Combine(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
+                Path.Combine(localApplicationData, "Google", "Chrome", "Application", "chrome.exe"),
+                Path.Combine(programFiles, "Mozilla Firefox", "firefox.exe"),
+                Path.Combine(programFilesX86, "Mozilla Firefox", "firefox.exe")
+            }.Where(path => !string.IsNullOrWhiteSpace(path) && Path.IsPathFullyQualified(path))
+                .Distinct(StringComparer.OrdinalIgnoreCase);
+        }
+
+        internal static TcpListener StartCallbackListener(Uri redirect)
+        {
+            if (redirect == null) throw new ArgumentNullException(nameof(redirect));
+            if (redirect.Scheme != Uri.UriSchemeHttp || redirect.Host != "127.0.0.1" || redirect.Port < 1024)
+                throw new ArgumentException("The browser callback URI is invalid.", nameof(redirect));
+            var listener = new TcpListener(IPAddress.Loopback, redirect.Port);
+            listener.Server.ExclusiveAddressUse = true;
+            try
+            {
+                listener.Start(1);
+                return listener;
+            }
+            catch (SocketException error) when (
+                error.SocketErrorCode == SocketError.AddressAlreadyInUse ||
+                error.SocketErrorCode == SocketError.AccessDenied)
+            {
+                listener.Stop();
+                throw new ProductionEnrollmentException(
+                    "ACCOUNT_CALLBACK_PORT_IN_USE",
+                    "The local browser callback port is already in use.",
+                    error);
+            }
+            catch
+            {
+                listener.Stop();
+                throw;
             }
         }
 
@@ -495,7 +734,10 @@ namespace TermLink.Agent
                 "Content-Length: " + html.Length + "\r\n\r\n");
             await stream.WriteAsync(headers, token).ConfigureAwait(false);
             await stream.WriteAsync(html, token).ConfigureAwait(false);
-            if (!success) throw new InvalidOperationException("OIDC authorization response was rejected.");
+            if (!success)
+                throw new ProductionEnrollmentException(
+                    "ACCOUNT_AUTHORIZATION_REJECTED",
+                    "The OIDC authorization response was rejected.");
             return code;
         }
 
