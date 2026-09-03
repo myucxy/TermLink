@@ -1,5 +1,6 @@
 package dev.termlink.product
 
+import android.content.res.Configuration
 import dev.termlink.model.DeviceTrustState
 import dev.termlink.model.PcSummary
 import dev.termlink.harness.BuildConfig
@@ -13,6 +14,13 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProductStateTest {
+    @Test
+    fun productStatusBarOnlyHidesInLandscape() {
+        assertTrue(shouldHideProductStatusBar(Configuration.ORIENTATION_LANDSCAPE))
+        assertFalse(shouldHideProductStatusBar(Configuration.ORIENTATION_PORTRAIT))
+        assertFalse(shouldHideProductStatusBar(Configuration.ORIENTATION_UNDEFINED))
+    }
+
     @Test
     fun unavailableRepositoryStartsSignedOutAndUnconfigured() {
         val repository = UnavailableProductRepository()
@@ -273,8 +281,7 @@ class ProductStateTest {
         assertEquals("Esc", normalized.label(TerminalAction.ESCAPE))
         assertEquals("Next", normalized.label(TerminalAction.TAB))
         assertEquals("Ctrl+C", normalized.label(TerminalAction.CTRL_C))
-        assertEquals(TerminalAction.TAB, normalized.visibleActions.first())
-        assertEquals(TerminalAction.entries.toSet(), normalized.visibleActions.toSet())
+        assertEquals(fixedTerminalShortcutRows().flatten(), normalized.visibleActions)
     }
 
     @Test
@@ -304,6 +311,11 @@ class ProductStateTest {
             "Ctrl+plus",
             "Alt+Shift+plus",
             "Backspace",
+            "Home",
+            "Ctrl+End",
+            "Shift+PageUp",
+            "Alt+PageDown",
+            "Insert",
             "Ctrl+Shift+p",
             "Alt+Delete",
             "F12",
@@ -379,25 +391,19 @@ class ProductStateTest {
     }
 
     @Test
-    fun unifiedShortcutOrderInterleavesBuiltInAndCustomItemsAndRepairsMissingKeys() {
-        val custom = TerminalCustomShortcut(
-            id = "resume-codex",
-            label = "Codex",
-            value = "codex resume",
-            type = TerminalCustomShortcutType.QUICK_INPUT,
-        )
+    fun fixedBuiltInLayoutAndCustomRowsRepairLegacyOrder() {
+        val first = TerminalCustomShortcut("first", "First", "Home")
+        val second = TerminalCustomShortcut("second", "Second", "End")
+        val third = TerminalCustomShortcut("third", "Third", "PageUp")
         val preferences = TerminalShortcutPreferences(
-            visibleActions = listOf(
-                TerminalAction.DELETE,
-                TerminalAction.TAB,
-                TerminalAction.ENTER,
-            ),
-            customShortcuts = listOf(custom),
+            visibleActions = listOf(TerminalAction.DELETE),
+            customShortcuts = listOf(first, second, third),
             shortcutOrder = listOf(
                 terminalBuiltInShortcutOrderKey(TerminalAction.DELETE),
-                terminalCustomShortcutOrderKey(custom.id),
+                terminalCustomShortcutOrderKey(second.id),
                 "unknown:item",
-                terminalBuiltInShortcutOrderKey(TerminalAction.TAB),
+                terminalCustomShortcutOrderKey(first.id),
+                terminalCustomShortcutOrderKey(third.id),
             ),
         )
 
@@ -406,16 +412,66 @@ class ProductStateTest {
 
         assertEquals(
             listOf(
-                terminalBuiltInShortcutOrderKey(TerminalAction.DELETE),
-                terminalCustomShortcutOrderKey(custom.id),
-                terminalBuiltInShortcutOrderKey(TerminalAction.TAB),
+                listOf(second.id, third.id),
+                listOf(first.id),
             ),
-            normalized.shortcutOrder.take(3),
+            normalized.customShortcutRows,
         )
-        assertEquals(TerminalShortcutItem.BuiltIn(TerminalAction.DELETE), items[0])
-        assertEquals(TerminalShortcutItem.Custom(custom), items[1])
-        assertEquals(TerminalShortcutItem.BuiltIn(TerminalAction.TAB), items[2])
-        assertEquals(TerminalAction.entries.size + 1, items.size)
+        assertEquals(fixedTerminalShortcutRows().flatten(), normalized.visibleActions)
+        assertEquals(
+            fixedTerminalShortcutRows().flatten().map { TerminalShortcutItem.BuiltIn(it) },
+            items.take(TerminalAction.entries.size),
+        )
+        assertEquals(
+            listOf(
+                TerminalShortcutItem.Custom(second),
+                TerminalShortcutItem.Custom(first),
+                TerminalShortcutItem.Custom(third),
+            ),
+            items.drop(TerminalAction.entries.size),
+        )
         assertEquals(false, normalized.shortcutOrder.contains("unknown:item"))
+    }
+
+    @Test
+    fun customShortcutsMoveWithinAndBetweenStableRows() {
+        val first = TerminalCustomShortcut("first", "First", "Home")
+        val second = TerminalCustomShortcut("second", "Second", "End")
+        val third = TerminalCustomShortcut("third", "Third", "PageDown")
+        val preferences = TerminalShortcutPreferences(
+            customShortcuts = listOf(first, second, third),
+            customShortcutRows = listOf(
+                listOf(first.id, second.id),
+                listOf(third.id),
+            ),
+        ).normalized
+
+        val reordered = moveTerminalCustomShortcut(preferences, second.id, -1)
+        assertEquals(listOf(second.id, first.id), reordered.customShortcutRows[TERMINAL_SHORTCUT_TOP_ROW])
+        assertEquals(listOf(third.id), reordered.customShortcutRows[TERMINAL_SHORTCUT_BOTTOM_ROW])
+
+        val editedSecond = second.copy(label = "Second edited")
+        val editedInPlace = placeTerminalCustomShortcut(
+            reordered.copy(
+                customShortcuts = reordered.customShortcuts.map {
+                    if (it.id == editedSecond.id) editedSecond else it
+                },
+            ),
+            editedSecond.id,
+            TerminalShortcutDockRow.TOP,
+        )
+        assertEquals(listOf(second.id, first.id), editedInPlace.customShortcutRows[TERMINAL_SHORTCUT_TOP_ROW])
+        assertEquals("Second edited", editedInPlace.customShortcuts.first { it.id == second.id }.label)
+
+        val moved = placeTerminalCustomShortcut(reordered, first.id, TerminalShortcutDockRow.BOTTOM)
+        assertEquals(listOf(second.id), moved.customShortcutRows[TERMINAL_SHORTCUT_TOP_ROW])
+        assertEquals(listOf(third.id, first.id), moved.customShortcutRows[TERMINAL_SHORTCUT_BOTTOM_ROW])
+
+        val keptAtMatchingColumn = placeTerminalCustomShortcut(moved, second.id, TerminalShortcutDockRow.BOTTOM)
+        assertEquals(emptyList<String>(), keptAtMatchingColumn.customShortcutRows[TERMINAL_SHORTCUT_TOP_ROW])
+        assertEquals(
+            listOf(second.id, third.id, first.id),
+            keptAtMatchingColumn.customShortcutRows[TERMINAL_SHORTCUT_BOTTOM_ROW],
+        )
     }
 }

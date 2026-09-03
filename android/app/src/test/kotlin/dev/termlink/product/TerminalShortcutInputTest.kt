@@ -53,6 +53,13 @@ class TerminalShortcutInputTest {
         assertEquals("Shift+p", shifted?.canonical)
         assertEquals("Backspace", terminalCombinationFromAndroidKeyEvent(keyDown(KeyEvent.KEYCODE_DEL))?.canonical)
         assertEquals("Delete", terminalCombinationFromAndroidKeyEvent(keyDown(KeyEvent.KEYCODE_FORWARD_DEL))?.canonical)
+        assertEquals("Home", terminalCombinationFromAndroidKeyEvent(keyDown(KeyEvent.KEYCODE_MOVE_HOME))?.canonical)
+        assertEquals("Shift+PageUp", terminalCombinationFromAndroidKeyEvent(
+            keyDown(KeyEvent.KEYCODE_PAGE_UP, KeyEvent.META_SHIFT_ON),
+        )?.canonical)
+        assertEquals("Ctrl+F12", terminalCombinationFromAndroidKeyEvent(
+            keyDown(KeyEvent.KEYCODE_F12, KeyEvent.META_CTRL_ON),
+        )?.canonical)
         assertNull(
             terminalCombinationFromAndroidKeyEvent(
                 KeyEvent(0L, 0L, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_P, 0),
@@ -75,12 +82,9 @@ class TerminalShortcutInputTest {
                     TerminalCustomShortcutType.QUICK_INPUT,
                 ),
             ),
-            shortcutOrder = listOf(
-                terminalBuiltInShortcutOrderKey(TerminalAction.DELETE),
-                terminalCustomShortcutOrderKey("resume-codex"),
-                terminalBuiltInShortcutOrderKey(TerminalAction.ENTER),
-                terminalCustomShortcutOrderKey("literal-plus"),
-                terminalCustomShortcutOrderKey("control-plus"),
+            customShortcutRows = listOf(
+                listOf("resume-codex", "control-plus"),
+                listOf("literal-plus"),
             ),
         ).normalized
 
@@ -95,13 +99,11 @@ class TerminalShortcutInputTest {
         assertEquals(TerminalCustomShortcutType.QUICK_INPUT, restored.customShortcuts[2].type)
         assertEquals(quickCommand, restored.customShortcuts[2].quickInput)
         assertEquals("Codex", restored.customShortcuts[2].displayLabel)
+        assertEquals(listOf("resume-codex", "control-plus"), restored.customShortcutRows[0])
+        assertEquals(listOf("literal-plus"), restored.customShortcutRows[1])
         assertEquals(
-            listOf(
-                terminalBuiltInShortcutOrderKey(TerminalAction.DELETE),
-                terminalCustomShortcutOrderKey("resume-codex"),
-                terminalBuiltInShortcutOrderKey(TerminalAction.ENTER),
-            ),
-            restored.shortcutOrder.take(3),
+            fixedTerminalShortcutRows().flatten().map(::terminalBuiltInShortcutOrderKey),
+            restored.shortcutOrder.take(TerminalAction.entries.size),
         )
     }
 
@@ -120,6 +122,8 @@ class TerminalShortcutInputTest {
         assertEquals(1, restored.customShortcuts.size)
         assertEquals(TerminalCustomShortcutType.KEY_COMBINATION, restored.customShortcuts.single().type)
         assertEquals("Ctrl+Shift+p", restored.customShortcuts.single().value)
+        assertEquals(listOf("legacy"), restored.customShortcutRows[TERMINAL_SHORTCUT_TOP_ROW])
+        assertEquals(emptyList<String>(), restored.customShortcutRows[TERMINAL_SHORTCUT_BOTTOM_ROW])
 
         saveTerminalShortcutPreferences(context, restored)
         val stored = context.getSharedPreferences(PRODUCT_PREFERENCES_NAME, Context.MODE_PRIVATE)
@@ -128,6 +132,9 @@ class TerminalShortcutInputTest {
         assertEquals(TerminalCustomShortcutType.KEY_COMBINATION.name, item.getString("type"))
         assertEquals("Ctrl+Shift+p", item.getString("value"))
         assertEquals("Ctrl+Shift+p", item.getString("keyCombination"))
+        val storedRows = context.getSharedPreferences(PRODUCT_PREFERENCES_NAME, Context.MODE_PRIVATE)
+            .getString(CUSTOM_SHORTCUT_ROWS_KEY, null)
+        assertEquals("legacy", JSONArray(storedRows).getJSONArray(0).getString(0))
     }
 
     @Test
@@ -180,5 +187,6 @@ class TerminalShortcutInputTest {
     private companion object {
         const val PRODUCT_PREFERENCES_NAME = "termlink_product_preferences"
         const val CUSTOM_SHORTCUTS_KEY = "terminal_custom_shortcuts_v1"
+        const val CUSTOM_SHORTCUT_ROWS_KEY = "terminal_custom_shortcut_rows_v1"
     }
 }
