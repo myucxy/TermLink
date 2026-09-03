@@ -518,7 +518,7 @@ function Set-ValidExternalResponses {
                 oidc_client_id = 'termlink-android'
                 redirect_uri = 'dev.termlink:/oauth2redirect'
                 windows_oidc_client_id = 'termlink-windows'
-                windows_redirect_uri = 'http://127.0.0.1:43971/oauth2/callback'
+                windows_redirect_uri = 'http://127.0.0.1/oauth2/callback'
                 web_oidc_client_id = 'termlink-web'
                 web_redirect_uri = "$root/auth/callback"
                 protocol_versions = @(1)

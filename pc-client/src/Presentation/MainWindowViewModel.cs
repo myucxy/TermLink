@@ -230,6 +230,8 @@ public sealed class DiagnosticsPageViewModel : ObservableObject
 
 public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 {
+    public static TimeSpan DefaultUpdateCheckInterval => TimeSpan.FromMinutes(30);
+
     private static readonly string[] SettingsSections = ["general", "account", "commands", "integration", "diagnostics", "about"];
     private readonly AgentStateStore stateStore;
     private readonly IAgentClient client;
@@ -281,7 +283,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         this.navigationTelemetry = navigationTelemetry;
         this.desktopOperations = desktopOperations;
         this.appearanceController = appearanceController;
-        this.updateCheckInterval = updateCheckInterval ?? TimeSpan.FromHours(6);
+        this.updateCheckInterval = updateCheckInterval ?? DefaultUpdateCheckInterval;
         if (this.updateCheckInterval <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(updateCheckInterval));
         this.noticeAutoDismissDelay = noticeAutoDismissDelay ?? TimeSpan.FromSeconds(5);
@@ -1230,7 +1232,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             "PC_AGENT_EXITING" => PresentationText.AgentExitingDetail,
             "PC_AGENT_PROCESSES_STILL_RUNNING" => PresentationText.AgentProcessesStillRunningDetail,
             "ACCOUNT_AUTHORIZATION_IN_PROGRESS" => PresentationText.BrowserAuthorizationInProgressDetail,
-            "ACCOUNT_CALLBACK_PORT_IN_USE" => PresentationText.BrowserCallbackPortInUseDetail,
+            "ACCOUNT_CALLBACK_LISTENER_FAILED" => PresentationText.BrowserCallbackListenerFailedDetail,
             "ACCOUNT_BROWSER_OPEN_FAILED" => PresentationText.BrowserOpenFailedDetail,
             "ACCOUNT_AUTHORIZATION_TIMEOUT" => PresentationText.BrowserAuthorizationTimeoutDetail,
             "ACCOUNT_AUTHORIZATION_REJECTED" => PresentationText.BrowserAuthorizationRejectedDetail,

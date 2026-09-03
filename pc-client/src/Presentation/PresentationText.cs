@@ -88,9 +88,9 @@ public static class PresentationText
     public static string BrowserAuthorizationInProgressDetail => Pick(
         "已有网页授权正在进行，TermLink 已重新打开授权页面，请在页面中继续。",
         "A web authorization is already in progress. TermLink reopened the authorization page so you can continue.");
-    public static string BrowserCallbackPortInUseDetail => Pick(
-        "本机授权回调端口被其他程序占用。请关闭旧的 TermLink 授权流程后重试；本地会话不会受到影响。",
-        "Another program is using the local authorization callback port. Close the previous TermLink authorization flow and try again; local sessions are unaffected.");
+    public static string BrowserCallbackListenerFailedDetail => Pick(
+        "无法启动本机授权回调监听。请检查 Windows 网络权限后重试；本地会话不会受到影响。",
+        "The local authorization callback listener could not be started. Check Windows network permissions and try again; local sessions are unaffected.");
     public static string BrowserOpenFailedDetail => Pick(
         "Windows 无法打开默认浏览器。请在系统设置中为 HTTP 和 HTTPS 选择默认浏览器后重试。",
         "Windows could not open the default browser. Choose a default browser for HTTP and HTTPS in Windows Settings, then try again.");
@@ -101,8 +101,8 @@ public static class PresentationText
         "网页授权被取消或返回内容无效，请重新发起登录。",
         "Web authorization was cancelled or returned an invalid response. Start sign-in again.");
     public static string BrowserAuthorizationFailedDetail => Pick(
-        "Agent 未能启动网页授权。请检查默认浏览器，并确认没有旧的 TermLink 授权仍占用本机回调端口后重试；本地会话不会受到影响。",
-        "The Agent could not start web authorization. Check the default browser and make sure no previous TermLink authorization is using the local callback port, then try again; local sessions are unaffected.");
+        "Agent 未能启动网页授权。请检查默认浏览器和 Windows 网络权限后重试；本地会话不会受到影响。",
+        "The Agent could not start web authorization. Check the default browser and Windows network permissions, then try again; local sessions are unaffected.");
     public static string IdentityServiceTimeoutDetail => Pick(
         "身份服务响应超时。请检查服务器连接后重试。",
         "The identity service timed out. Check the server connection and try again.");

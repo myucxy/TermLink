@@ -544,7 +544,7 @@ func TestNewExplicitInputAppliesDefaultsAndValidates(t *testing.T) {
 	}
 	if c.WindowsOIDCClientID != "termlink-windows" ||
 		strings.Join(c.WindowsRegistrationOIDCParties, ",") != "termlink-windows" ||
-		c.WindowsOIDCRedirectURI != "http://127.0.0.1:43971/oauth2/callback" {
+		c.WindowsOIDCRedirectURI != "http://127.0.0.1/oauth2/callback" {
 		t.Fatalf("Windows OIDC defaults not applied: %#v", c)
 	}
 	if c.WebOIDCClientID != "termlink-web" || c.WebOIDCStepUpClientID != "termlink-web-step-up" ||
@@ -608,7 +608,7 @@ func TestOIDCAllowedPartiesAreExplicitAndClientBound(t *testing.T) {
 		AndroidOIDCClientID:    "termlink-android",
 		AndroidOIDCRedirectURI: "dev.termlink:/oauth2redirect",
 		WindowsOIDCClientID:    "termlink-windows",
-		WindowsOIDCRedirectURI: "http://127.0.0.1:43971/oauth2/callback",
+		WindowsOIDCRedirectURI: "http://127.0.0.1/oauth2/callback",
 		OIDCClientSecret:       "oidc",
 		DatabaseURL:            "postgres",
 		RedisURL:               "redis",
@@ -705,7 +705,7 @@ func TestWebOIDCRedirectMustUsePublicHTTPSOrigin(t *testing.T) {
 	}
 }
 
-func TestWindowsOIDCRedirectRequiresFixedLoopbackCallback(t *testing.T) {
+func TestWindowsOIDCRedirectRequiresPortlessLoopbackCallback(t *testing.T) {
 	base := Input{
 		PublicURL:        "https://termlink.example.test",
 		OIDCIssuer:       "https://issuer.example.test",
@@ -719,7 +719,12 @@ func TestWindowsOIDCRedirectRequiresFixedLoopbackCallback(t *testing.T) {
 		"https://127.0.0.1:43971/oauth2/callback",
 		"http://localhost:43971/oauth2/callback",
 		"http://127.0.0.1:43971/wrong",
-		"http://127.0.0.1/oauth2/callback",
+		"http://127.0.0.1:43971/oauth2/callback",
+		"http://127.0.0.1:80/oauth2/callback",
+		"http://user@127.0.0.1/oauth2/callback",
+		"http://127.0.0.1/oauth2/callback?code=leak",
+		"http://127.0.0.1/oauth2/callback#fragment",
+		"http://127.0.0.1/oauth2/%63allback",
 	} {
 		input := base
 		input.WindowsOIDCRedirectURI = redirect

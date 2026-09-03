@@ -22,7 +22,7 @@ namespace TermLink.AgentUpdate.Validation
             try
             {
                 ValidateBrowserAuthorizationLaunch();
-                ValidateBrowserCallbackPortFailure();
+                ValidateBrowserCallbackUsesDynamicPort();
                 var pcId = Guid.NewGuid();
                 var updateId = Guid.NewGuid();
                 var mutations = new List<(string Path, string Key, byte[] Body)>();
@@ -118,23 +118,39 @@ namespace TermLink.AgentUpdate.Validation
                 "browser fallback did not pass the validated HTTPS URL as one executable argument");
         }
 
-        private static void ValidateBrowserCallbackPortFailure()
+        private static void ValidateBrowserCallbackUsesDynamicPort()
         {
             using var occupied = new TcpListener(IPAddress.Loopback, 0);
             occupied.Server.ExclusiveAddressUse = true;
             occupied.Start(1);
-            var port = ((IPEndPoint)occupied.LocalEndpoint).Port;
-            try
-            {
-                using var unexpected = ProductionEnrollment.StartCallbackListener(
-                    new Uri("http://127.0.0.1:" + port + "/oauth2/callback"));
-                throw new InvalidOperationException("browser callback accepted an occupied loopback port");
-            }
-            catch (ProductionEnrollmentException error)
-            {
-                Assert(error.Code == "ACCOUNT_CALLBACK_PORT_IN_USE",
-                    "browser callback port failure lost its stable error code");
-            }
+            var occupiedPort = ((IPEndPoint)occupied.LocalEndpoint).Port;
+
+            using var first = ProductionEnrollment.StartCallbackListener(
+                new Uri("http://127.0.0.1/oauth2/callback"), out var firstRedirect);
+            using var second = ProductionEnrollment.StartCallbackListener(
+                new Uri("http://127.0.0.1/oauth2/callback"), out var secondRedirect);
+            var firstEndpoint = (IPEndPoint)first.LocalEndpoint;
+            var secondEndpoint = (IPEndPoint)second.LocalEndpoint;
+            Assert(firstEndpoint.Address.Equals(IPAddress.Loopback) && secondEndpoint.Address.Equals(IPAddress.Loopback),
+                "browser callback listener escaped the IPv4 loopback interface");
+            Assert(firstRedirect.Host == "127.0.0.1" && firstRedirect.AbsolutePath == "/oauth2/callback" &&
+                    firstRedirect.Port == firstEndpoint.Port,
+                "browser callback did not publish its assigned loopback port");
+            Assert(firstRedirect.Port != occupiedPort && secondRedirect.Port != occupiedPort &&
+                    firstRedirect.Port != secondRedirect.Port,
+                "browser callback reused an occupied or active port");
+            AssertThrows<ArgumentException>(
+                () => ProductionEnrollment.StartCallbackListener(
+                    new Uri("http://127.0.0.1:43971/oauth2/callback"), out _),
+                "browser callback accepted a fixed-port template");
+            AssertThrows<ArgumentException>(
+                () => ProductionEnrollment.StartCallbackListener(
+                    new Uri("http://127.0.0.1:80/oauth2/callback"), out _),
+                "browser callback accepted an explicit default port");
+            AssertThrows<ArgumentException>(
+                () => ProductionEnrollment.StartCallbackListener(
+                    new Uri("http://localhost/oauth2/callback"), out _),
+                "browser callback accepted a non-literal loopback host");
         }
 
         private static void ValidateSupervisorRecoveryDecisions()

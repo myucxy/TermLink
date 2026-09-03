@@ -95,6 +95,7 @@ namespace TermLink.Agent
     public static class ProductionEnrollment
     {
         private const string AuthorizationScopes = "openid profile email offline_access";
+        private const string BrowserCallbackTemplate = "http://127.0.0.1/oauth2/callback";
         public const string PublicServerUrl = "https://termlink.kget.cc:8910";
         private static readonly TimeSpan AuthorizationCallbackTimeout = TimeSpan.FromMinutes(5);
         private static readonly object BrowserAuthorizationSync = new object();
@@ -450,8 +451,9 @@ namespace TermLink.Agent
             if (!IsHttps(discovery.AuthorizationEndpoint) || !IsHttps(discovery.TokenEndpoint))
                 throw new InvalidDataException("OIDC discovery endpoints are invalid.");
 
-            var redirect = new Uri(client.RedirectUri);
-            using var listener = StartCallbackListener(redirect);
+            var redirectTemplate = new Uri(client.RedirectUri);
+            using var listener = StartCallbackListener(redirectTemplate, out var redirect);
+            var redirectUri = redirect.AbsoluteUri;
 
             var verifierBytes = new byte[32];
             var stateBytes = new byte[32];
@@ -469,7 +471,7 @@ namespace TermLink.Agent
             {
                 ["response_type"] = "code",
                 ["client_id"] = client.ClientId,
-                ["redirect_uri"] = client.RedirectUri,
+                ["redirect_uri"] = redirectUri,
                 ["scope"] = AuthorizationScopes,
                 ["state"] = state,
                 ["code_challenge"] = challenge,
@@ -506,7 +508,7 @@ namespace TermLink.Agent
                 {
                     ["grant_type"] = "authorization_code",
                     ["client_id"] = client.ClientId,
-                    ["redirect_uri"] = client.RedirectUri,
+                    ["redirect_uri"] = redirectUri,
                     ["code"] = code,
                     ["code_verifier"] = verifier
                 })
@@ -550,9 +552,7 @@ namespace TermLink.Agent
         {
             if (client == null || !IsHttps(client.OIDCIssuer) || string.IsNullOrWhiteSpace(client.ClientId) ||
                 !Uri.TryCreate(client.RedirectUri, UriKind.Absolute, out var redirect) ||
-                redirect.Scheme != Uri.UriSchemeHttp || redirect.Host != "127.0.0.1" ||
-                redirect.Port < 1024 || redirect.AbsolutePath != "/oauth2/callback" ||
-                !string.IsNullOrEmpty(redirect.Query) || !string.IsNullOrEmpty(redirect.Fragment))
+                !IsValidBrowserCallbackTemplate(redirect))
             {
                 throw new InvalidDataException("Windows OIDC client configuration is invalid.");
             }
@@ -651,26 +651,32 @@ namespace TermLink.Agent
                 .Distinct(StringComparer.OrdinalIgnoreCase);
         }
 
-        internal static TcpListener StartCallbackListener(Uri redirect)
+        internal static TcpListener StartCallbackListener(Uri redirectTemplate, out Uri redirect)
         {
-            if (redirect == null) throw new ArgumentNullException(nameof(redirect));
-            if (redirect.Scheme != Uri.UriSchemeHttp || redirect.Host != "127.0.0.1" || redirect.Port < 1024)
-                throw new ArgumentException("The browser callback URI is invalid.", nameof(redirect));
-            var listener = new TcpListener(IPAddress.Loopback, redirect.Port);
+            if (redirectTemplate == null) throw new ArgumentNullException(nameof(redirectTemplate));
+            if (!IsValidBrowserCallbackTemplate(redirectTemplate))
+            {
+                throw new ArgumentException("The browser callback URI template is invalid.", nameof(redirectTemplate));
+            }
+
+            redirect = null;
+            var listener = new TcpListener(IPAddress.Loopback, 0);
             listener.Server.ExclusiveAddressUse = true;
             try
             {
                 listener.Start(1);
+                var endpoint = listener.LocalEndpoint as IPEndPoint;
+                if (endpoint == null || !IPAddress.Loopback.Equals(endpoint.Address) || endpoint.Port < 1)
+                    throw new InvalidOperationException("Windows did not assign a valid loopback callback endpoint.");
+                redirect = new UriBuilder(redirectTemplate) { Port = endpoint.Port }.Uri;
                 return listener;
             }
-            catch (SocketException error) when (
-                error.SocketErrorCode == SocketError.AddressAlreadyInUse ||
-                error.SocketErrorCode == SocketError.AccessDenied)
+            catch (Exception error) when (error is SocketException or InvalidOperationException)
             {
                 listener.Stop();
                 throw new ProductionEnrollmentException(
-                    "ACCOUNT_CALLBACK_PORT_IN_USE",
-                    "The local browser callback port is already in use.",
+                    "ACCOUNT_CALLBACK_LISTENER_FAILED",
+                    "The local browser callback listener could not be started.",
                     error);
             }
             catch
@@ -678,6 +684,15 @@ namespace TermLink.Agent
                 listener.Stop();
                 throw;
             }
+        }
+
+        private static bool IsValidBrowserCallbackTemplate(Uri redirect)
+        {
+            return redirect != null &&
+                string.Equals(redirect.OriginalString, BrowserCallbackTemplate, StringComparison.Ordinal) &&
+                redirect.Scheme == Uri.UriSchemeHttp && redirect.Host == "127.0.0.1" && redirect.IsDefaultPort &&
+                redirect.AbsolutePath == "/oauth2/callback" && string.IsNullOrEmpty(redirect.UserInfo) &&
+                string.IsNullOrEmpty(redirect.Query) && string.IsNullOrEmpty(redirect.Fragment);
         }
 
         private static async Task<T> GetJsonAsync<T>(HttpClient http, string url, CancellationToken token)

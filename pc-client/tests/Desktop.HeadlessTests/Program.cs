@@ -21,6 +21,9 @@ public static class Program
             .UseHeadless(new AvaloniaHeadlessPlatformOptions())
             .SetupWithoutStarting();
 
+        Require(MainWindowViewModel.DefaultUpdateCheckInterval == TimeSpan.FromMinutes(30),
+            "The default update-check interval is not 30 minutes.");
+
         var identity = new PcAgentIdentity(
             Guid.Parse("f77bd947-015a-49b5-9f93-df8397983209"),
             "headless-pc-with-a-name-that-must-not-expand-the-sidebar",
@@ -324,10 +327,10 @@ public static class Program
             Require(viewModel.NoticeCode == "PC_AGENT_RESTART_TIMEOUT" &&
                     viewModel.NoticeDetail == PresentationText.AgentRestartTimeoutDetail,
                 "The English Agent restart failure was not localized.");
-            await viewModel.ReportFailureAsync(new AgentClientOperationException("ACCOUNT_CALLBACK_PORT_IN_USE"));
-            Require(viewModel.NoticeCode == "ACCOUNT_CALLBACK_PORT_IN_USE" &&
-                    viewModel.NoticeDetail == PresentationText.BrowserCallbackPortInUseDetail,
-                "An occupied browser callback port was not localized.");
+            await viewModel.ReportFailureAsync(new AgentClientOperationException("ACCOUNT_CALLBACK_LISTENER_FAILED"));
+            Require(viewModel.NoticeCode == "ACCOUNT_CALLBACK_LISTENER_FAILED" &&
+                    viewModel.NoticeDetail == PresentationText.BrowserCallbackListenerFailedDetail,
+                "A browser callback listener failure was not localized.");
             await viewModel.ReportFailureAsync(new AgentClientOperationException("ACCOUNT_BROWSER_OPEN_FAILED"));
             Require(viewModel.NoticeCode == "ACCOUNT_BROWSER_OPEN_FAILED" &&
                     viewModel.NoticeDetail == PresentationText.BrowserOpenFailedDetail,

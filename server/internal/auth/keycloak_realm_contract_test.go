@@ -116,7 +116,8 @@ func TestAcceptanceRealmDisablesNativeRegistrationAndUsesNativeClientLogin(t *te
 	}
 	if windows.Attributes["pkce.code.challenge.method"] != "S256" ||
 		windows.BaseURL != "https://termlink.kget.cc:8910" ||
-		!containsString(windows.RedirectURIs, "http://127.0.0.1:43971/oauth2/callback") {
+		len(windows.RedirectURIs) != 1 ||
+		!containsString(windows.RedirectURIs, "http://127.0.0.1/oauth2/callback") {
 		t.Fatal("termlink-windows browser fallback policy is incomplete")
 	}
 	foundWindowsNickname := false
@@ -538,7 +539,7 @@ func TestAcceptanceBootstrapReconcilesWindowsNativeLogin(t *testing.T) {
 		`-s serviceAccountsEnabled=false`,
 		`-s fullScopeAllowed=false`,
 		`-s baseUrl=${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}`,
-		`-s 'redirectUris=["http://127.0.0.1:43971/oauth2/callback"]'`,
+		`-s 'redirectUris=["http://127.0.0.1/oauth2/callback"]'`,
 		`-s 'attributes={"pkce.code.challenge.method":"S256"}'`,
 	} {
 		if !strings.Contains(windowsBlock, expected) {

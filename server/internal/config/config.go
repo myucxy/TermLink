@@ -528,7 +528,7 @@ func LoadSource(source Source) (Config, error) {
 		"TERMLINK_OIDC_ALLOWED_PARTIES",
 		androidOIDCClientID+","+windowsOIDCClientID,
 	), ",")
-	windowsOIDCRedirectURI := lookupOptional("TERMLINK_WINDOWS_OIDC_REDIRECT_URI", "http://127.0.0.1:43971/oauth2/callback")
+	windowsOIDCRedirectURI := lookupOptional("TERMLINK_WINDOWS_OIDC_REDIRECT_URI", "http://127.0.0.1/oauth2/callback")
 	webOIDCClientID := lookupOptional("TERMLINK_WEB_OIDC_CLIENT_ID", "termlink-web")
 	webOIDCStepUpClientID := lookupOptional("TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID", "termlink-web-step-up")
 	webOIDCRedirectURI := lookupOptional("TERMLINK_WEB_OIDC_REDIRECT_URI", strings.TrimRight(publicURL, "/")+"/auth/callback")
@@ -898,12 +898,13 @@ func validate(c Config) (Config, error) {
 	}
 	c.WindowsRegistrationOIDCParties = windowsRegistrationParties
 	if strings.TrimSpace(c.WindowsOIDCRedirectURI) == "" {
-		c.WindowsOIDCRedirectURI = "http://127.0.0.1:43971/oauth2/callback"
+		c.WindowsOIDCRedirectURI = "http://127.0.0.1/oauth2/callback"
 	}
 	windowsRedirect, err := url.Parse(c.WindowsOIDCRedirectURI)
-	if err != nil || windowsRedirect.Scheme != "http" || windowsRedirect.Hostname() != "127.0.0.1" ||
-		windowsRedirect.Port() == "" || windowsRedirect.Path != "/oauth2/callback" ||
-		windowsRedirect.RawQuery != "" || windowsRedirect.Fragment != "" || windowsRedirect.User != nil {
+	if err != nil || windowsRedirect.Scheme != "http" || windowsRedirect.Host != "127.0.0.1" ||
+		windowsRedirect.Path != "/oauth2/callback" || windowsRedirect.RawPath != "" ||
+		windowsRedirect.RawQuery != "" || windowsRedirect.ForceQuery || windowsRedirect.Fragment != "" ||
+		windowsRedirect.User != nil {
 		return Config{}, fmt.Errorf("%w: TERMLINK_WINDOWS_OIDC_REDIRECT_URI", ErrInvalid)
 	}
 	if c.OIDCClientSecret.Empty() {
