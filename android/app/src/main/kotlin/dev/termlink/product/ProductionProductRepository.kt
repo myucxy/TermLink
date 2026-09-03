@@ -43,6 +43,7 @@ import dev.termlink.model.TerminalCommandCapability
 import dev.termlink.network.direct.ProductionDirectAuthorizedPeer
 import dev.termlink.network.direct.ProductionDirectShadowRuntime
 import dev.termlink.network.production.AccessTokenProvider
+import dev.termlink.network.production.ControlRequestSupersededException
 import dev.termlink.network.production.InputSequenceProvider
 import dev.termlink.network.production.ProductionApiClient
 import dev.termlink.network.production.ProductionRealtimeMultiplexer
@@ -1656,6 +1657,12 @@ internal class ProductionProductRepository(
             clearSessionOpenFailure(sessionId)
         } catch (error: CancellationException) {
             throw error
+        } catch (_: ControlRequestSupersededException) {
+            // Windows local input is authoritative. A revoke that overtakes
+            // this request is a normal control-arbitration result: retain the
+            // live read-only session and remove any stale open error instead
+            // of presenting TL-N003 or rebuilding the transport.
+            clearSessionOpenFailure(sessionId)
         } catch (error: Throwable) {
             val classified = classifySessionOpenException(error, SessionFailureStage.CONTROL)
             observeSessionOpenFailure(

@@ -417,7 +417,7 @@ class ProductionRealtimeSessionClient(
             withContext(Dispatchers.IO) {
                 runCatching { api.delete("/v1/sessions/${config.sessionId}/lease/${lease.leaseId}") }
             }
-            throw ProductionTransportException("control request was superseded by a newer revoke")
+            throw ControlRequestSupersededException()
         }
     }
 

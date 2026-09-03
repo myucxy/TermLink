@@ -3334,7 +3334,7 @@ class ProductionRealtimeSessionClientTest {
                     it is RemoteSessionState.ReadOnly && it.reason == "LOCAL_INPUT_WON"
                 }
             }
-            assertFailsWith<IllegalStateException> { request.await() }
+            assertFailsWith<ControlRequestSupersededException> { request.await() }
             val staleLeaseRelease = withContext(Dispatchers.IO) {
                 requireNotNull(server.takeRequest(2, TimeUnit.SECONDS))
             }
