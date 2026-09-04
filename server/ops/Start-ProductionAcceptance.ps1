@@ -136,14 +136,16 @@ function Write-SecretFile {
 function Wait-ProductionAcceptanceStack {
     param(
         [Parameter(Mandatory)][string[]]$ComposeFile,
+        [string[]]$Profile = @(),
         [string[]]$AdditionalHealthyServices = @(),
         [string[]]$AdditionalCompletedServices = @(),
         [ValidateRange(30, 900)][int]$TimeoutSeconds = 300
     )
 
     $composeFileArguments = @($ComposeFile | ForEach-Object { '-f'; $_ })
+    $composeFileArguments += @($Profile | ForEach-Object { '--profile'; $_ })
 
-    $healthyServices = @('edge', 'lucky-upstream', 'postgres', 'valkey', 'minio', 'server', 'keycloak') +
+    $healthyServices = @('lucky-upstream', 'postgres', 'valkey', 'minio', 'server', 'keycloak') +
         $AdditionalHealthyServices
     $runningServices = @()
     $completedServices = @(
@@ -226,10 +228,22 @@ $endpoints = Set-AcceptanceEndpointEnvironment `
     -PublicUpstreamPort $LuckyPort
 $paths = Get-TermLinkAcceptancePaths
 $composeFiles = @($paths.ComposeFile)
+$composeProfiles = @()
 $directTransportComposeFile = Join-Path $paths.ServerRoot 'compose\direct-transport.compose.yml'
 $acceptanceDirectTransportComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.direct-transport.compose.yml'
 $additionalHealthyServices = @()
 $additionalCompletedServices = @()
+$localEdgeEnabled = -not [string]::IsNullOrWhiteSpace($LanAddress)
+if ($localEdgeEnabled) {
+    $localEdgeComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.local-edge.compose.yml'
+    if (-not (Test-Path -LiteralPath $localEdgeComposeFile -PathType Leaf)) {
+        throw "Local TLS edge Compose overlay not found: $localEdgeComposeFile"
+    }
+    $composeFiles += $localEdgeComposeFile
+    $composeProfiles += 'local-edge'
+    $additionalHealthyServices += 'edge'
+    $additionalCompletedServices += 'server-local-edge-ca-init'
+}
 if ($EnableDirectTransportShadow) {
     if (-not (Test-Path -LiteralPath $directTransportComposeFile -PathType Leaf)) {
         throw "Direct transport Compose overlay not found: $directTransportComposeFile"
@@ -288,6 +302,7 @@ if (-not [string]::IsNullOrWhiteSpace($selectedServerImage)) {
     $composeFiles += $releaseImageComposeFile
 }
 $composeFileArguments = @($composeFiles | ForEach-Object { '-f'; $_ })
+$composeFileArguments += @($composeProfiles | ForEach-Object { '--profile'; $_ })
 if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container)) {
     if (-not (Test-Path -LiteralPath $paths.Marker -PathType Leaf)) {
         throw "Refusing to reset an unmanaged directory: $($paths.SecretRoot)"
@@ -313,6 +328,7 @@ if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container)) 
         $resetComposeFiles += $acceptanceDirectTransportComposeFile
     }
     $resetComposeFileArguments = @($resetComposeFiles | ForEach-Object { '-f'; $_ })
+    $resetComposeFileArguments += @($composeProfiles | ForEach-Object { '--profile'; $_ })
     & docker compose @resetComposeFileArguments down --volumes --remove-orphans
     if ($LASTEXITCODE -ne 0) { throw 'Could not reset the production acceptance stack.' }
     $productionPolicyEnvironment = Join-Path $paths.SecretRoot 'production-policy.env'
@@ -441,6 +457,7 @@ if ($EnableDirectTransportShadow) {
 & docker compose @composeFileArguments up --build --detach --remove-orphans
 if ($LASTEXITCODE -ne 0) { throw 'Could not build or recreate the production acceptance stack.' }
 Wait-ProductionAcceptanceStack -ComposeFile $composeFiles `
+    -Profile $composeProfiles `
     -AdditionalHealthyServices $additionalHealthyServices `
     -AdditionalCompletedServices $additionalCompletedServices -TimeoutSeconds 300
 
@@ -468,18 +485,28 @@ if ($EnableDirectTransportShadow) {
         -Expected '400:999:1000'
 }
 
-if (Test-Path -LiteralPath $paths.RootCa -PathType Leaf) {
-    Remove-Item -LiteralPath $paths.RootCa -Force
+if ($localEdgeEnabled) {
+    if (Test-Path -LiteralPath $paths.RootCa -PathType Leaf) {
+        Remove-Item -LiteralPath $paths.RootCa -Force
+    }
+    & docker compose @composeFileArguments cp edge:/data/caddy/pki/authorities/local/root.crt $paths.RootCa
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $paths.RootCa -PathType Leaf)) {
+        throw 'Could not export the disposable acceptance CA certificate.'
+    }
 }
-& docker compose @composeFileArguments cp edge:/data/caddy/pki/authorities/local/root.crt $paths.RootCa
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $paths.RootCa -PathType Leaf)) {
-    throw 'Could not export the disposable acceptance CA certificate.'
+elseif (Test-Path -LiteralPath $paths.RootCa -PathType Leaf) {
+    Remove-Item -LiteralPath $paths.RootCa -Force
 }
 
 $env:TERMLINK_ACCEPTANCE_ROOT_URL = $endpoints.Root
 $env:TERMLINK_ACCEPTANCE_OIDC_ISSUER = "$($endpoints.PublicOrigin)/realms/termlink"
 $env:TERMLINK_ACCEPTANCE_HISTORY_ORIGIN = $endpoints.HistoryOrigin
-$env:TERMLINK_ACCEPTANCE_CA_FILE = $paths.RootCa
+if ($localEdgeEnabled) {
+    $env:TERMLINK_ACCEPTANCE_CA_FILE = $paths.RootCa
+}
+else {
+    Remove-Item Env:TERMLINK_ACCEPTANCE_CA_FILE -ErrorAction SilentlyContinue
+}
 $env:TERMLINK_ACCEPTANCE_USER_NAME = 'acceptance-probe'
 $env:TERMLINK_ACCEPTANCE_PROBE_IDENTITY_FILE = $paths.ProbeIdentity
 $env:TERMLINK_ACCEPTANCE_REQUIRE_DIRECT_TRANSPORT = if ($EnableDirectTransportShadow) { '1' } else { '0' }
@@ -512,13 +539,26 @@ $oneShotServices = @(
 if ($EnableDirectTransportShadow) {
     $oneShotServices += 'direct-valkey-secrets-init'
 }
+if ($localEdgeEnabled) {
+    $oneShotServices += 'server-local-edge-ca-init'
+}
 & docker compose @composeFileArguments rm --force @oneShotServices
 if ($LASTEXITCODE -ne 0) { throw 'Could not remove completed production acceptance jobs.' }
+
+# A previous LAN acceptance run may have left the profiled edge container in
+# this Compose project. Remove it after the public production probe succeeds;
+# named CA volumes remain available for the next explicit LAN run.
+if (-not $localEdgeEnabled) {
+    & docker compose @composeFileArguments rm --stop --force edge
+    if ($LASTEXITCODE -ne 0) { throw 'Could not remove the inactive local TLS edge service.' }
+}
 
 Write-Output 'TermLink production acceptance stack is running.'
 Write-Output "API: $($endpoints.Root)"
 Write-Output "Public API/OIDC: $($endpoints.PublicOrigin)"
-Write-Output "CA certificate: $($paths.RootCa)"
+if ($localEdgeEnabled) {
+    Write-Output "CA certificate: $($paths.RootCa)"
+}
 if (-not (Test-Path -LiteralPath $paths.InitialAdminClaimed -PathType Leaf)) {
     Write-Output 'Initial admin is ready. Retrieve its temporary password once with server\ops\Get-InitialAdminPassword.ps1.'
 }

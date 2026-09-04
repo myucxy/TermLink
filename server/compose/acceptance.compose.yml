@@ -32,6 +32,10 @@ services:
         condition: service_completed_successfully
 
   edge:
+    # The internal-CA TLS edge is a LAN/debug acceptance fixture. Public
+    # production traffic uses lucky-upstream and must not keep this service
+    # running unless the local-edge profile is explicitly enabled.
+    profiles: ["local-edge"]
     image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
     command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
     ports:
@@ -890,9 +894,6 @@ services:
           chown 65532:65532 /target/direct_redis_url;
         fi;
         rm -f /target/acceptance-root-ca.crt;
-        cp /data/caddy/pki/authorities/local/root.crt /target/acceptance-root-ca.crt;
-        chmod 0400 /target/acceptance-root-ca.crt;
-        chown 65532:65532 /target/acceptance-root-ca.crt;
         test -s /target/keycloak_admin_client_secret;
         chown 0:0 /target/keycloak_admin_client_secret;
         chmod 0400 /target/keycloak_admin_client_secret;
@@ -906,15 +907,12 @@ services:
       - s3_secret_key
     volumes:
       - acceptance-server-secrets:/target
-      - acceptance-caddy-data:/data:ro
     networks: ["frontend"]
     read_only: true
     cap_drop: ["ALL"]
     cap_add: ["CHOWN"]
     security_opt: ["no-new-privileges:true"]
     depends_on:
-      edge:
-        condition: service_healthy
       keycloak-init:
         condition: service_completed_successfully
     restart: "no"
@@ -974,7 +972,6 @@ services:
       dockerfile: server/Dockerfile
     environment:
       <<: *termlink_environment
-      SSL_CERT_FILE: /run/secrets/acceptance-root-ca.crt
       TERMLINK_APPSHIP_BASE_URL: ${TERMLINK_APPSHIP_BASE_URL:-https://appship.kget.cc:8910}
       TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS: ${TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS:-}
       TERMLINK_REGISTRATION_RECOVERY_ENABLED: "true"

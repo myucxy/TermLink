@@ -1022,9 +1022,9 @@ Assert-Production ($caddyfileText -match '(?m)^\s*respond 404\s*$') `
 Assert-Production ($caddyfileText -notmatch '(?m)^\s*log\s*(?:\{|$)') `
     'Caddy access logging must remain disabled so presigned query credentials are not emitted.'
 
-# Acceptance has both a private TLS object edge and a public Lucky HTTP hop.
-# Keep their file-transfer shape and 5 GiB limit aligned with the production
-# edge without weakening the independent 64 MiB session-history handlers.
+# Acceptance defines an opt-in private TLS object edge and a default public
+# Lucky HTTP hop. Keep both configurations aligned with the production edge
+# without weakening the independent 64 MiB session-history handlers.
 $acceptanceFileTransferMatcher = $fileTransferMatcher.Replace('file_transfer_path', 'file_transfer_object_path')
 foreach ($acceptanceProxy in @(
     (Join-Path $PSScriptRoot '..\acceptance\Caddyfile'),

@@ -20,9 +20,10 @@ Start and validate the complete stack from the repository root:
 ```
 
 The script generates random credentials under the ignored
-`server/secrets/acceptance` directory, starts the containers, exports only the
-disposable public CA certificate, and runs a cross-container probe. The current
-product acceptance contract is:
+`server/secrets/acceptance` directory, starts the containers, and runs a
+cross-container probe. It exports a disposable local CA only when
+`-LanAddress` explicitly enables the local TLS edge. The current product
+acceptance contract is:
 
 To add the isolated Direct signaling/NAT-discovery lane for cross-client shadow
 tests, opt in explicitly:
@@ -77,21 +78,19 @@ enabled, the same gate additionally requires its password to be exactly
 `400:999:1000` inside Direct Valkey. After all dependency conditions have
 succeeded, the start script removes the four base completed one-shot containers
 (`runtime-secrets-init`, `keycloak-init`, `server-secrets-init`, and `migrate`)
-plus `direct-valkey-secrets-init` when Direct is enabled. Caddy provisioning
-already creates the local CA before `edge` becomes healthy, and
-`server-secrets-init` fails closed unless it can copy that CA; the former
-standalone CA polling container was therefore redundant. This post-probe job
-cleanup does not delete named volumes, images, or data.
+plus `direct-valkey-secrets-init` when Direct is enabled. A private-LAN run
+additionally uses and removes `server-local-edge-ca-init`, which copies the
+disposable CA only after the profiled local TLS `edge` is healthy. This
+post-probe cleanup does not delete named volumes, images, or data.
 
-The steady-state acceptance services are `edge`, `lucky-upstream`, `keycloak`,
-`postgres`, `valkey`, `minio`, and `server`. PostgreSQL and Valkey are required
-for application state and realtime coordination; Keycloak and MinIO are
-required only because this self-contained acceptance stack supplies its own
-OIDC and S3 fixtures. The two Caddy services intentionally remain separate.
-`edge` must start early to mint the disposable local TLS CA, while
-`lucky-upstream` must remain stopped until `keycloak-init` has safely reconciled
-the realm and enabled registration. Combining them would expose the Lucky HTTP
-route before that identity-policy gate completes.
+The default public-production steady state contains `lucky-upstream`,
+`keycloak`, `postgres`, `valkey`, `minio`, and `server`. PostgreSQL and Valkey
+provide application state and realtime coordination; Keycloak and MinIO supply
+OIDC and object history/file storage. The internal-CA `edge` is not part of
+this public path and is not started by default. It is enabled only by
+`-LanAddress` through `acceptance.local-edge.compose.yml`. In both modes,
+`lucky-upstream` remains stopped until `keycloak-init` has safely reconciled the
+realm and enabled registration.
 
 On a clean deployment, `keycloak-init` also creates the product account
 `admin`, assigns the realm bootstrap role `SUPER_ADMIN`, and installs a random
@@ -117,11 +116,13 @@ the exact official platform manifest through the OCI registry API, verifies the
 manifest and every blob SHA-256, and loads it under an acceptance-only local
 tag. It never falls back to an unpinned image.
 
-The local endpoints are:
+The default public endpoints are:
 
-- API: `https://api.127.0.0.1.sslip.io:9443`
 - Public product home and account portal: `https://termlink.kget.cc:8910/`
 - Public API/OIDC through Lucky: `https://termlink.kget.cc:8910`
+
+The internal-CA endpoints such as `https://api.127.0.0.1.sslip.io:9443` exist
+only during an explicit private-LAN/local-edge acceptance run.
 
 ## Private-LAN product E2E / 私有局域网产品 E2E
 

@@ -77,11 +77,13 @@ function Test-ComposeConfig {
 function Get-ComposeConfig {
     param(
         [Parameter(Mandatory)][string]$EnvironmentFile,
-        [Parameter(Mandatory)][string[]]$Files
+        [Parameter(Mandatory)][string[]]$Files,
+        [string[]]$Profiles = @()
     )
 
     $arguments = @('compose', '--env-file', $EnvironmentFile, '--project-name', 'termlink-topology-test')
     foreach ($file in $Files) { $arguments += @('-f', $file) }
+    foreach ($profile in $Profiles) { $arguments += @('--profile', $profile) }
     $arguments += @('config', '--format', 'json')
     $output = @(& docker @arguments 2>&1)
     if ($LASTEXITCODE -ne 0) {
@@ -249,6 +251,9 @@ try {
     $identityKeyBytes = [byte[]](0..31)
     $identityKey = [Convert]::ToBase64String($identityKeyBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
     $secretFixtures = [ordered]@{
+        'keycloak-admin-password' = 'Keycloak_Admin_Test_8mP4qV7nR2xK'
+        'admin-initial-password' = 'Initial_Admin_Test_6qN2vK9mR4xP'
+        'acceptance-user-password' = 'Acceptance_User_Test_7pL3xV8mQ2nR'
         'oidc-client-secret' = 'Oidc_Test_3mJ8pQ6sV2wX9kL5'
         'database-url' = 'postgres://termlink:Db_Test_4xQ8mV2pL7nK@postgres:5432/termlink?sslmode=require'
         'redis-url' = "redis://default:$valkeyPassword@valkey:6379/0"
@@ -312,7 +317,18 @@ receivers:
         'TERMLINK_HUMAN_VERIFICATION_SITE_KEY=0x4AAAA-production-test-site-key',
         "TERMLINK_HUMAN_VERIFICATION_SECRET_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'human-verification-secret'))",
         "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'account-deletion-identity-key'))",
-        'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION=1'
+        'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION=1',
+        "TERMLINK_ACCEPTANCE_KEYCLOAK_ADMIN_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'keycloak-admin-password'))",
+        "TERMLINK_ACCEPTANCE_ADMIN_INITIAL_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'admin-initial-password'))",
+        "TERMLINK_ACCEPTANCE_USER_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'acceptance-user-password'))",
+        "TERMLINK_ACCEPTANCE_POSTGRES_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'postgres-password'))",
+        "TERMLINK_ACCEPTANCE_VALKEY_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'valkey-password'))",
+        "TERMLINK_ACCEPTANCE_OIDC_CLIENT_SECRET_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'oidc-client-secret'))",
+        "TERMLINK_ACCEPTANCE_DATABASE_URL_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'database-url'))",
+        "TERMLINK_ACCEPTANCE_REDIS_URL_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'redis-url'))",
+        "TERMLINK_ACCEPTANCE_TOKEN_SIGNING_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'token-signing-key'))",
+        "TERMLINK_ACCEPTANCE_S3_ACCESS_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 's3-access-key'))",
+        "TERMLINK_ACCEPTANCE_S3_SECRET_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 's3-secret-key'))"
     )
     [IO.File]::WriteAllLines($envFile, $environmentLines, [Text.UTF8Encoding]::new($false))
 
@@ -325,6 +341,29 @@ receivers:
     $accountDeletion = Join-Path $composeRoot 'account-deletion.compose.yml'
     $directTransport = Join-Path $composeRoot 'direct-transport.compose.yml'
     $acceptance = Join-Path $composeRoot 'acceptance.compose.yml'
+    $acceptanceLocalEdge = Join-Path $composeRoot 'acceptance.local-edge.compose.yml'
+
+    $publicAcceptance = Get-ComposeConfig -EnvironmentFile $envFile -Files @($acceptance)
+    $publicAcceptanceServices = @($publicAcceptance.services.PSObject.Properties.Name)
+    if ($publicAcceptanceServices -ccontains 'edge' -or
+        $publicAcceptanceServices -ccontains 'server-local-edge-ca-init') {
+        throw 'Default public acceptance topology unexpectedly includes the local TLS edge.'
+    }
+    if (@($publicAcceptance.services.server.environment.PSObject.Properties.Name) -ccontains 'SSL_CERT_FILE') {
+        throw 'Default public server unexpectedly trusts the disposable local acceptance CA.'
+    }
+    $localAcceptance = Get-ComposeConfig -EnvironmentFile $envFile `
+        -Files @($acceptance, $acceptanceLocalEdge) -Profiles @('local-edge')
+    $localAcceptanceServices = @($localAcceptance.services.PSObject.Properties.Name)
+    foreach ($required in @('edge', 'server-local-edge-ca-init')) {
+        if ($localAcceptanceServices -cnotcontains $required) {
+            throw "Private-LAN acceptance topology omitted $required."
+        }
+    }
+    if (@($localAcceptance.services.server.environment.PSObject.Properties.Name) -cnotcontains 'SSL_CERT_FILE' -or
+        @($localAcceptance.services.server.depends_on.PSObject.Properties.Name) -cnotcontains 'server-local-edge-ca-init') {
+        throw 'Private-LAN server is not gated on the local CA initializer.'
+    }
 
     # Render every valid overlay selection with and without edge. Account
     # deletion is intentionally absent from the no-history branch.

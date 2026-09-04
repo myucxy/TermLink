@@ -1,6 +1,7 @@
 # Use either an already-published immutable server image or the explicitly
 # reviewed local-production image selected by Start-ProductionAcceptance.ps1,
-# while keeping the stack's identity, data, and edge services unchanged.
+# while keeping the stack's identity and data services unchanged. The local
+# TLS edge remains an explicit private-LAN acceptance profile.
 services:
   migrate:
     image: ${TERMLINK_ACCEPTANCE_SERVER_IMAGE:?immutable Docker Hub server image is required}
