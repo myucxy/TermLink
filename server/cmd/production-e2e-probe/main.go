@@ -131,8 +131,8 @@ func run() error {
 	if username == "" {
 		username = "acceptance-probe"
 	}
-	if root == "" || issuer == "" || passwordPath == "" || caPath == "" || identityPath == "" {
-		return errors.New("acceptance root, issuer, password file, CA file, and probe identity file are required")
+	if root == "" || issuer == "" || passwordPath == "" || identityPath == "" {
+		return errors.New("acceptance root, issuer, password file, and probe identity file are required")
 	}
 	if len(username) > 128 || strings.ContainsAny(username, "\r\n\x00") {
 		return errors.New("acceptance username is invalid")
@@ -669,13 +669,19 @@ func (p *probe) waitForPresignedStatus(request presignedRequest, expected int, t
 }
 
 func loadRoots(path string) (*x509.CertPool, error) {
-	pem, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read acceptance CA: %w", err)
-	}
 	pool, err := x509.SystemCertPool()
 	if err != nil || pool == nil {
 		pool = x509.NewCertPool()
+	}
+	// Public production acceptance is terminated by the real public
+	// certificate and therefore relies on the host trust store. LAN acceptance
+	// supplies the private Caddy CA explicitly and appends it below.
+	if strings.TrimSpace(path) == "" {
+		return pool, nil
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read acceptance CA: %w", err)
 	}
 	if !pool.AppendCertsFromPEM(pem) {
 		return nil, errors.New("acceptance CA is invalid")

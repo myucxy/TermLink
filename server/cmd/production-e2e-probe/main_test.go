@@ -14,6 +14,22 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestLoadRootsUsesSystemTrustWhenCAFileIsNotConfigured(t *testing.T) {
+	pool, err := loadRoots("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pool == nil {
+		t.Fatal("system trust pool is nil")
+	}
+}
+
+func TestLoadRootsRejectsMissingConfiguredCAFile(t *testing.T) {
+	if _, err := loadRoots(filepath.Join(t.TempDir(), "missing-ca.crt")); err == nil {
+		t.Fatal("missing configured CA file was accepted")
+	}
+}
+
 func TestWaitForPresignedStatusAllowsAsynchronousObjectDeletion(t *testing.T) {
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {

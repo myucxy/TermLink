@@ -102,6 +102,12 @@
 
 	handle {
 		reverse_proxy server:8080 {
+			# Compose must start this router before Server because Server uses its
+			# private TLS listener for issuer discovery. Retry initial Docker DNS
+			# and dial failures so that this short bootstrap interval does not leak
+			# transient 502 responses to already-connected clients.
+			lb_try_duration 30s
+			lb_try_interval 250ms
 			header_up X-Forwarded-Proto {$TERMLINK_ACCEPTANCE_PUBLIC_SCHEME}
 			header_up X-Forwarded-Host {$TERMLINK_ACCEPTANCE_PUBLIC_HOST}:{$TERMLINK_ACCEPTANCE_PUBLIC_PORT}
 			header_up X-Forwarded-Port {$TERMLINK_ACCEPTANCE_PUBLIC_PORT}
