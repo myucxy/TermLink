@@ -22,7 +22,7 @@ Start and validate the complete stack from the repository root:
 The script generates random credentials under the ignored
 `server/secrets/acceptance` directory, starts the containers, and runs a
 cross-container probe. It exports a disposable local CA only when
-`-LanAddress` explicitly enables the local TLS edge. The current product
+`-LanAddress` explicitly exposes the private TLS listener. The current product
 acceptance contract is:
 
 To add the isolated Direct signaling/NAT-discovery lane for cross-client shadow
@@ -78,19 +78,20 @@ enabled, the same gate additionally requires its password to be exactly
 `400:999:1000` inside Direct Valkey. After all dependency conditions have
 succeeded, the start script removes the four base completed one-shot containers
 (`runtime-secrets-init`, `keycloak-init`, `server-secrets-init`, and `migrate`)
-plus `direct-valkey-secrets-init` when Direct is enabled. A private-LAN run
-additionally uses and removes `server-local-edge-ca-init`, which copies the
-disposable CA only after the profiled local TLS `edge` is healthy. This
-post-probe cleanup does not delete named volumes, images, or data.
+plus `direct-valkey-secrets-init` when Direct is enabled. The shared
+`server-secrets-init` copies the private OIDC-loopback CA only after
+`lucky-upstream` has created it. This post-probe cleanup does not delete named
+volumes, images, or data.
 
 The default public-production steady state contains `lucky-upstream`,
 `keycloak`, `postgres`, `valkey`, `minio`, and `server`. PostgreSQL and Valkey
 provide application state and realtime coordination; Keycloak and MinIO supply
-OIDC and object history/file storage. The internal-CA `edge` is not part of
-this public path and is not started by default. It is enabled only by
-`-LanAddress` through `acceptance.local-edge.compose.yml`. In both modes,
-`lucky-upstream` remains stopped until `keycloak-init` has safely reconciled the
-realm and enabled registration.
+OIDC and object history/file storage. `lucky-upstream` owns both the public HTTP
+upstream and a Docker-internal TLS listener used for issuer-exact OIDC
+discovery, eliminating the former second Caddy `edge` service. `-LanAddress`
+uses `acceptance.local-edge.compose.yml` only to expose that same TLS listener
+on host port 9443. In both modes, `lucky-upstream` remains stopped until
+`keycloak-init` has safely reconciled the realm and enabled registration.
 
 On a clean deployment, `keycloak-init` also creates the product account
 `admin`, assigns the realm bootstrap role `SUPER_ADMIN`, and installs a random
@@ -121,8 +122,8 @@ The default public endpoints are:
 - Public product home and account portal: `https://termlink.kget.cc:8910/`
 - Public API/OIDC through Lucky: `https://termlink.kget.cc:8910`
 
-The internal-CA endpoints such as `https://api.127.0.0.1.sslip.io:9443` exist
-only during an explicit private-LAN/local-edge acceptance run.
+The internal-CA product endpoint is exposed on port 9443 only during an
+explicit private-LAN acceptance run.
 
 ## Private-LAN product E2E / 私有局域网产品 E2E
 
@@ -140,18 +141,17 @@ From the repository root, run / 在仓库根目录运行：
 
 `-LanAddress` must be an IPv4 address assigned to the host. For a selected
 `<LAN-IP>`, the product, API, and OIDC origin is
-`https://termlink.<LAN-IP>.sslip.io:9443`, and the history origin is
-`https://history.<LAN-IP>.sslip.io:9443`. The example therefore uses
+`https://termlink.<LAN-IP>.sslip.io:9443`; signed history objects use that same
+origin. The example therefore uses
 `https://termlink.192.168.9.28.sslip.io:9443`.
 
 `-LanAddress` 必须是本机网卡实际拥有的 IPv4 地址。对于指定的 `<LAN-IP>`，产品、API
-和 OIDC Origin 为 `https://termlink.<LAN-IP>.sslip.io:9443`，历史对象 Origin 为
-`https://history.<LAN-IP>.sslip.io:9443`；上面的示例因此使用
+、OIDC 和历史对象 Origin 均为 `https://termlink.<LAN-IP>.sslip.io:9443`；上面的示例因此使用
 `https://termlink.192.168.9.28.sslip.io:9443`。
 
-The script binds the TLS edge to the LAN and exports its disposable CA to
+The script exposes Lucky's TLS listener to the LAN and exports its disposable CA to
 `server\secrets\acceptance\acceptance-root-ca.crt`. It also runs the production
-protocol probe automatically. 脚本会把 TLS Edge 暴露到局域网，把一次性 CA 导出到上述
+protocol probe automatically. 脚本会把 Lucky TLS 监听器暴露到局域网，把一次性 CA 导出到上述
 路径，并自动运行生产协议探测。
 
 ### 2. Configure TLS trust / 配置信任
@@ -382,11 +382,9 @@ port `8080` by default. Configure Lucky to forward the public
 `http://192.168.9.28:8080`); TLS continues to terminate at Lucky. Identity
 paths are routed to Keycloak, signed history-object paths are routed to MinIO,
 and all other paths are routed to the TermLink Server. History presigned URLs
-therefore use the same public origin rather than the private acceptance history
-host. The separate `history.<LAN-IP>.sslip.io:9443` origin remains available
-only in the `-LanAddress` local TLS E2E mode. Override the bind only when needed
-with `-LuckyBindAddress` and `-LuckyPort`; `-LanAddress` no longer changes the
-Lucky binding implicitly.
+therefore use the same product origin in both public and private-LAN modes.
+Override the HTTP upstream bind only when needed with `-LuckyBindAddress` and
+`-LuckyPort`; `-LanAddress` does not change that separate binding implicitly.
 
 The Caddy CA is disposable and is not a production trust anchor. Local browser
 or emulator testing must explicitly trust only the exported acceptance CA;

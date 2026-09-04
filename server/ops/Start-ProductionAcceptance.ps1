@@ -79,13 +79,12 @@ function Set-AcceptanceEndpointEnvironment {
     }
 
     $publicHost = "termlink.$normalizedAddress.sslip.io"
-    $historyHost = "history.$normalizedAddress.sslip.io"
     $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN = "https://${publicHost}:9443"
     $env:TERMLINK_ACCEPTANCE_PUBLIC_HOST = $publicHost
     $env:TERMLINK_ACCEPTANCE_PUBLIC_PORT = '9443'
     $env:TERMLINK_ACCEPTANCE_PUBLIC_SCHEME = 'https'
-    $env:TERMLINK_ACCEPTANCE_HISTORY_ORIGIN = "https://${historyHost}:9443"
-    $env:TERMLINK_ACCEPTANCE_HISTORY_HOST = $historyHost
+        $env:TERMLINK_ACCEPTANCE_HISTORY_ORIGIN = $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN
+        $env:TERMLINK_ACCEPTANCE_HISTORY_HOST = $publicHost
     $env:TERMLINK_ACCEPTANCE_EDGE_BIND_IP = '0.0.0.0'
     $parsedBindAddress = $null
     if (-not [Net.IPAddress]::TryParse($PublicUpstreamBindAddress.Trim(), [ref]$parsedBindAddress) -or
@@ -102,8 +101,8 @@ function Set-AcceptanceEndpointEnvironment {
         }
     }
     # Keep the compatibility Lucky listener configurable on the LAN path too.
-    # Public reverse proxies may already target this listener instead of the
-    # local TLS edge, so silently forcing loopback would break a healthy stack.
+    # Public reverse proxies may already target this listener, so silently
+    # forcing loopback would break a healthy stack.
     $env:TERMLINK_ACCEPTANCE_LUCKY_BIND_IP = $normalizedBindAddress
     $env:TERMLINK_ACCEPTANCE_LUCKY_PORT = $PublicUpstreamPort.ToString([Globalization.CultureInfo]::InvariantCulture)
     return [pscustomobject]@{
@@ -136,14 +135,12 @@ function Write-SecretFile {
 function Wait-ProductionAcceptanceStack {
     param(
         [Parameter(Mandatory)][string[]]$ComposeFile,
-        [string[]]$Profile = @(),
         [string[]]$AdditionalHealthyServices = @(),
         [string[]]$AdditionalCompletedServices = @(),
         [ValidateRange(30, 900)][int]$TimeoutSeconds = 300
     )
 
     $composeFileArguments = @($ComposeFile | ForEach-Object { '-f'; $_ })
-    $composeFileArguments += @($Profile | ForEach-Object { '--profile'; $_ })
 
     $healthyServices = @('lucky-upstream', 'postgres', 'valkey', 'minio', 'server', 'keycloak') +
         $AdditionalHealthyServices
@@ -228,7 +225,6 @@ $endpoints = Set-AcceptanceEndpointEnvironment `
     -PublicUpstreamPort $LuckyPort
 $paths = Get-TermLinkAcceptancePaths
 $composeFiles = @($paths.ComposeFile)
-$composeProfiles = @()
 $directTransportComposeFile = Join-Path $paths.ServerRoot 'compose\direct-transport.compose.yml'
 $acceptanceDirectTransportComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.direct-transport.compose.yml'
 $additionalHealthyServices = @()
@@ -237,12 +233,9 @@ $localEdgeEnabled = -not [string]::IsNullOrWhiteSpace($LanAddress)
 if ($localEdgeEnabled) {
     $localEdgeComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.local-edge.compose.yml'
     if (-not (Test-Path -LiteralPath $localEdgeComposeFile -PathType Leaf)) {
-        throw "Local TLS edge Compose overlay not found: $localEdgeComposeFile"
+        throw "Local TLS listener Compose overlay not found: $localEdgeComposeFile"
     }
     $composeFiles += $localEdgeComposeFile
-    $composeProfiles += 'local-edge'
-    $additionalHealthyServices += 'edge'
-    $additionalCompletedServices += 'server-local-edge-ca-init'
 }
 if ($EnableDirectTransportShadow) {
     if (-not (Test-Path -LiteralPath $directTransportComposeFile -PathType Leaf)) {
@@ -302,7 +295,6 @@ if (-not [string]::IsNullOrWhiteSpace($selectedServerImage)) {
     $composeFiles += $releaseImageComposeFile
 }
 $composeFileArguments = @($composeFiles | ForEach-Object { '-f'; $_ })
-$composeFileArguments += @($composeProfiles | ForEach-Object { '--profile'; $_ })
 if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container)) {
     if (-not (Test-Path -LiteralPath $paths.Marker -PathType Leaf)) {
         throw "Refusing to reset an unmanaged directory: $($paths.SecretRoot)"
@@ -328,7 +320,6 @@ if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container)) 
         $resetComposeFiles += $acceptanceDirectTransportComposeFile
     }
     $resetComposeFileArguments = @($resetComposeFiles | ForEach-Object { '-f'; $_ })
-    $resetComposeFileArguments += @($composeProfiles | ForEach-Object { '--profile'; $_ })
     & docker compose @resetComposeFileArguments down --volumes --remove-orphans
     if ($LASTEXITCODE -ne 0) { throw 'Could not reset the production acceptance stack.' }
     $productionPolicyEnvironment = Join-Path $paths.SecretRoot 'production-policy.env'
@@ -457,7 +448,6 @@ if ($EnableDirectTransportShadow) {
 & docker compose @composeFileArguments up --build --detach --remove-orphans
 if ($LASTEXITCODE -ne 0) { throw 'Could not build or recreate the production acceptance stack.' }
 Wait-ProductionAcceptanceStack -ComposeFile $composeFiles `
-    -Profile $composeProfiles `
     -AdditionalHealthyServices $additionalHealthyServices `
     -AdditionalCompletedServices $additionalCompletedServices -TimeoutSeconds 300
 
@@ -489,7 +479,7 @@ if ($localEdgeEnabled) {
     if (Test-Path -LiteralPath $paths.RootCa -PathType Leaf) {
         Remove-Item -LiteralPath $paths.RootCa -Force
     }
-    & docker compose @composeFileArguments cp edge:/data/caddy/pki/authorities/local/root.crt $paths.RootCa
+    & docker compose @composeFileArguments cp lucky-upstream:/data/caddy/pki/authorities/local/root.crt $paths.RootCa
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $paths.RootCa -PathType Leaf)) {
         throw 'Could not export the disposable acceptance CA certificate.'
     }
@@ -539,19 +529,8 @@ $oneShotServices = @(
 if ($EnableDirectTransportShadow) {
     $oneShotServices += 'direct-valkey-secrets-init'
 }
-if ($localEdgeEnabled) {
-    $oneShotServices += 'server-local-edge-ca-init'
-}
 & docker compose @composeFileArguments rm --force @oneShotServices
 if ($LASTEXITCODE -ne 0) { throw 'Could not remove completed production acceptance jobs.' }
-
-# A previous LAN acceptance run may have left the profiled edge container in
-# this Compose project. Remove it after the public production probe succeeds;
-# named CA volumes remain available for the next explicit LAN run.
-if (-not $localEdgeEnabled) {
-    & docker compose @composeFileArguments rm --stop --force edge
-    if ($LASTEXITCODE -ne 0) { throw 'Could not remove the inactive local TLS edge service.' }
-}
 
 Write-Output 'TermLink production acceptance stack is running.'
 Write-Output "API: $($endpoints.Root)"

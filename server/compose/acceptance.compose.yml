@@ -13,9 +13,13 @@ services:
     networks:
       public:
       frontend:
+        aliases:
+          - ${TERMLINK_ACCEPTANCE_PUBLIC_HOST:-termlink.kget.cc}
       object:
     volumes:
       - ../acceptance/LuckyUpstream.Caddyfile:/etc/caddy/Caddyfile:ro
+      - acceptance-caddy-data:/data
+      - acceptance-caddy-config:/config
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
@@ -30,45 +34,6 @@ services:
     depends_on:
       keycloak-init:
         condition: service_completed_successfully
-
-  edge:
-    # The internal-CA TLS edge is a LAN/debug acceptance fixture. Public
-    # production traffic uses lucky-upstream and must not keep this service
-    # running unless the local-edge profile is explicitly enabled.
-    profiles: ["local-edge"]
-    image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
-    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
-    ports:
-      - "${TERMLINK_ACCEPTANCE_EDGE_BIND_IP:-127.0.0.1}:9443:9443"
-    environment:
-      TERMLINK_ACCEPTANCE_PUBLIC_HOST: ${TERMLINK_ACCEPTANCE_PUBLIC_HOST:-termlink.kget.cc}
-      TERMLINK_ACCEPTANCE_PUBLIC_PORT: ${TERMLINK_ACCEPTANCE_PUBLIC_PORT:-8910}
-      TERMLINK_ACCEPTANCE_HISTORY_HOST: ${TERMLINK_ACCEPTANCE_HISTORY_HOST:-history.127.0.0.1.sslip.io}
-    networks:
-      public:
-      frontend:
-        aliases:
-          - api.127.0.0.1.sslip.io
-          - id.127.0.0.1.sslip.io
-          - ${TERMLINK_ACCEPTANCE_PUBLIC_HOST:-termlink.kget.cc}
-      object:
-        aliases:
-          - ${TERMLINK_ACCEPTANCE_HISTORY_HOST:-history.127.0.0.1.sslip.io}
-    volumes:
-      - ../acceptance/Caddyfile:/etc/caddy/Caddyfile:ro
-      - acceptance-caddy-data:/data
-      - acceptance-caddy-config:/config
-    read_only: true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=16m
-    cap_drop: ["ALL"]
-    cap_add: ["NET_BIND_SERVICE"]
-    security_opt: ["no-new-privileges:true"]
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9080/healthz"]
-      interval: 2s
-      timeout: 2s
-      retries: 30
 
   # Docker Desktop exposes file-backed Compose secrets with host-derived
   # permissions and ignores uid/gid/mode metadata. Copy them once into
@@ -894,6 +859,9 @@ services:
           chown 65532:65532 /target/direct_redis_url;
         fi;
         rm -f /target/acceptance-root-ca.crt;
+        cp /data/caddy/pki/authorities/local/root.crt /target/acceptance-root-ca.crt;
+        chmod 0400 /target/acceptance-root-ca.crt;
+        chown 65532:65532 /target/acceptance-root-ca.crt;
         test -s /target/keycloak_admin_client_secret;
         chown 0:0 /target/keycloak_admin_client_secret;
         chmod 0400 /target/keycloak_admin_client_secret;
@@ -907,12 +875,15 @@ services:
       - s3_secret_key
     volumes:
       - acceptance-server-secrets:/target
+      - acceptance-caddy-data:/data:ro
     networks: ["frontend"]
     read_only: true
     cap_drop: ["ALL"]
     cap_add: ["CHOWN"]
     security_opt: ["no-new-privileges:true"]
     depends_on:
+      lucky-upstream:
+        condition: service_healthy
       keycloak-init:
         condition: service_completed_successfully
     restart: "no"
@@ -972,6 +943,7 @@ services:
       dockerfile: server/Dockerfile
     environment:
       <<: *termlink_environment
+      SSL_CERT_FILE: /run/secrets/acceptance-root-ca.crt
       TERMLINK_APPSHIP_BASE_URL: ${TERMLINK_APPSHIP_BASE_URL:-https://appship.kget.cc:8910}
       TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS: ${TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS:-}
       TERMLINK_REGISTRATION_RECOVERY_ENABLED: "true"

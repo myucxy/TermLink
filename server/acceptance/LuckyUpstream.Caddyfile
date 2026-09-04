@@ -1,9 +1,10 @@
 {
 	admin off
-	auto_https off
+	auto_https disable_redirects
+	skip_install_trust
 }
 
-:8080 {
+(termlinkRoutes) {
 	@health path /__termlink_upstream_health
 	handle @health {
 		respond 200
@@ -106,4 +107,16 @@
 			header_up X-Forwarded-Port {$TERMLINK_ACCEPTANCE_PUBLIC_PORT}
 		}
 	}
+}
+
+# Lucky terminates public TLS outside Docker and forwards to the HTTP listener.
+# The internal-CA listener keeps OIDC discovery on the exact public issuer
+# while avoiding a second long-running Caddy container.
+http://:8080 {
+	import termlinkRoutes
+}
+
+https://{$TERMLINK_ACCEPTANCE_PUBLIC_HOST}:{$TERMLINK_ACCEPTANCE_PUBLIC_PORT} {
+	tls internal
+	import termlinkRoutes
 }

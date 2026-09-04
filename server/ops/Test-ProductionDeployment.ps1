@@ -1022,14 +1022,12 @@ Assert-Production ($caddyfileText -match '(?m)^\s*respond 404\s*$') `
 Assert-Production ($caddyfileText -notmatch '(?m)^\s*log\s*(?:\{|$)') `
     'Caddy access logging must remain disabled so presigned query credentials are not emitted.'
 
-# Acceptance defines an opt-in private TLS object edge and a default public
-# Lucky HTTP hop. Keep both configurations aligned with the production edge
+# Acceptance uses one Lucky router with a public HTTP upstream and a private
+# internal-CA listener. Keep its routes aligned with the production edge
 # without weakening the independent 64 MiB session-history handlers.
 $acceptanceFileTransferMatcher = $fileTransferMatcher.Replace('file_transfer_path', 'file_transfer_object_path')
-foreach ($acceptanceProxy in @(
-    (Join-Path $PSScriptRoot '..\acceptance\Caddyfile'),
-    (Join-Path $PSScriptRoot '..\acceptance\LuckyUpstream.Caddyfile')
-)) {
+$acceptanceProxy = Join-Path $PSScriptRoot '..\acceptance\LuckyUpstream.Caddyfile'
+foreach ($acceptanceProxy in @($acceptanceProxy)) {
     $acceptanceProxyText = [IO.File]::ReadAllText([IO.Path]::GetFullPath($acceptanceProxy))
     Assert-Production ($acceptanceProxyText.Contains($acceptanceFileTransferMatcher, [StringComparison]::Ordinal)) `
         "Acceptance proxy '$acceptanceProxy' must use the reviewed account/PC/operation file-transfer shape."

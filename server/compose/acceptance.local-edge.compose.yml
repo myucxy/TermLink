@@ -1,35 +1,7 @@
-# Opt-in local TLS overlay for private-LAN Android/Windows acceptance runs.
-# The public production path intentionally excludes this file and therefore
-# runs only the Lucky upstream router.
+# Opt-in host port for private-LAN Android/Windows TLS acceptance runs. The
+# default public deployment keeps Lucky's internal TLS loopback private while
+# exposing only its HTTP upstream to the host reverse proxy.
 services:
-  server-local-edge-ca-init:
-    profiles: ["local-edge"]
-    image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
-    entrypoint: ["/bin/sh", "-ec"]
-    command:
-      - >-
-        rm -f /target/acceptance-root-ca.crt;
-        cp /data/caddy/pki/authorities/local/root.crt /target/acceptance-root-ca.crt;
-        chmod 0400 /target/acceptance-root-ca.crt;
-        chown 65532:65532 /target/acceptance-root-ca.crt
-    volumes:
-      - acceptance-server-secrets:/target
-      - acceptance-caddy-data:/data:ro
-    network_mode: "none"
-    read_only: true
-    cap_drop: ["ALL"]
-    cap_add: ["CHOWN"]
-    security_opt: ["no-new-privileges:true"]
-    depends_on:
-      edge:
-        condition: service_healthy
-      server-secrets-init:
-        condition: service_completed_successfully
-    restart: "no"
-
-  server:
-    environment:
-      SSL_CERT_FILE: /run/secrets/acceptance-root-ca.crt
-    depends_on:
-      server-local-edge-ca-init:
-        condition: service_completed_successfully
+  lucky-upstream:
+    ports:
+      - "${TERMLINK_ACCEPTANCE_EDGE_BIND_IP:-127.0.0.1}:9443:9443"

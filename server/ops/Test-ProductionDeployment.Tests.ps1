@@ -77,13 +77,11 @@ function Test-ComposeConfig {
 function Get-ComposeConfig {
     param(
         [Parameter(Mandatory)][string]$EnvironmentFile,
-        [Parameter(Mandatory)][string[]]$Files,
-        [string[]]$Profiles = @()
+        [Parameter(Mandatory)][string[]]$Files
     )
 
     $arguments = @('compose', '--env-file', $EnvironmentFile, '--project-name', 'termlink-topology-test')
     foreach ($file in $Files) { $arguments += @('-f', $file) }
-    foreach ($profile in $Profiles) { $arguments += @('--profile', $profile) }
     $arguments += @('config', '--format', 'json')
     $output = @(& docker @arguments 2>&1)
     if ($LASTEXITCODE -ne 0) {
@@ -349,20 +347,21 @@ receivers:
         $publicAcceptanceServices -ccontains 'server-local-edge-ca-init') {
         throw 'Default public acceptance topology unexpectedly includes the local TLS edge.'
     }
-    if (@($publicAcceptance.services.server.environment.PSObject.Properties.Name) -ccontains 'SSL_CERT_FILE') {
-        throw 'Default public server unexpectedly trusts the disposable local acceptance CA.'
+    if (@($publicAcceptance.services.server.environment.PSObject.Properties.Name) -cnotcontains 'SSL_CERT_FILE' -or
+        @($publicAcceptance.services.'server-secrets-init'.depends_on.PSObject.Properties.Name) -cnotcontains 'lucky-upstream') {
+        throw 'Default public server is missing its internal OIDC loopback trust gate.'
     }
-    $localAcceptance = Get-ComposeConfig -EnvironmentFile $envFile `
-        -Files @($acceptance, $acceptanceLocalEdge) -Profiles @('local-edge')
+    $localAcceptance = Get-ComposeConfig -EnvironmentFile $envFile -Files @($acceptance, $acceptanceLocalEdge)
     $localAcceptanceServices = @($localAcceptance.services.PSObject.Properties.Name)
-    foreach ($required in @('edge', 'server-local-edge-ca-init')) {
-        if ($localAcceptanceServices -cnotcontains $required) {
-            throw "Private-LAN acceptance topology omitted $required."
-        }
+    if ($localAcceptanceServices -ccontains 'edge' -or
+        $localAcceptanceServices -ccontains 'server-local-edge-ca-init') {
+        throw 'Private-LAN acceptance unexpectedly restored the retired edge service.'
     }
-    if (@($localAcceptance.services.server.environment.PSObject.Properties.Name) -cnotcontains 'SSL_CERT_FILE' -or
-        @($localAcceptance.services.server.depends_on.PSObject.Properties.Name) -cnotcontains 'server-local-edge-ca-init') {
-        throw 'Private-LAN server is not gated on the local CA initializer.'
+    $localTLSListeners = @($localAcceptance.services.'lucky-upstream'.ports | Where-Object {
+        [int]$_.target -eq 9443 -and [int]$_.published -eq 9443
+    })
+    if ($localTLSListeners.Count -ne 1) {
+        throw 'Private-LAN acceptance did not expose Lucky internal TLS on port 9443.'
     }
 
     # Render every valid overlay selection with and without edge. Account

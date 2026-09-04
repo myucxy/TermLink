@@ -54,7 +54,7 @@ $completed = $false
 
 [IO.Directory]::CreateDirectory($destinationPath) | Out-Null
 try {
-    $stoppedServices = @(Stop-TermLinkServices -ComposeArguments $compose -Candidates @('edge', 'server'))
+    $stoppedServices = @(Stop-TermLinkServices -ComposeArguments $compose -Candidates @('lucky-upstream', 'server'))
     $postgresContainer = Get-TermLinkContainerId -ComposeArguments $compose -Service $PostgresService
     $minioContainer = Get-TermLinkContainerId -ComposeArguments $compose -Service $MinioService
 	Initialize-TermLinkMinioAlias -ContainerId $minioContainer -ConfigDir $minioConfigDir
