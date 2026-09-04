@@ -203,12 +203,6 @@ fun ProductPrimaryDestination.destination(): ProductDestination = when (this) {
     ProductPrimaryDestination.SETTINGS -> ProductDestination.SETTINGS
 }
 
-enum class DeviceFilter(val label: String) {
-    ALL("All"),
-    TRUSTED("Trusted"),
-    PENDING("Pending"),
-}
-
 /**
  * Truthful lifecycle for the account/server boundary.  In particular, an
  * endpoint being configured or an OIDC token being present does not mean the
@@ -465,9 +459,12 @@ data class TerminalShortcutPreferences(
     val labels: Map<TerminalAction, String> = defaultTerminalShortcutLabels(),
     val visibleActions: List<TerminalAction> = defaultTerminalShortcutActions(),
     val customShortcuts: List<TerminalCustomShortcut> = emptyList(),
+    val dockLayout: TerminalShortcutDockLayout = TerminalShortcutDockLayout.TWO_ROWS,
+    /** Stable custom shortcut IDs for the single-row Dock layout. */
+    val singleRowCustomShortcutOrder: List<String> = emptyList(),
     /** Stable custom shortcut IDs for the top and bottom Dock rows. */
     val customShortcutRows: List<List<String>> = emptyList(),
-    /** Legacy flattened order retained for migration to [customShortcutRows]. */
+    /** Legacy flattened order retained for migration and older stored preferences. */
     val shortcutOrder: List<String> = emptyList(),
 ) {
     fun label(action: TerminalAction): String = labels[action].orEmpty().ifBlank { defaultTerminalShortcutLabels()[action].orEmpty() }
@@ -503,19 +500,37 @@ data class TerminalShortcutPreferences(
                 }
             }
             val normalizedRows = rows.map { it.toList() }
-            val flattenedCustomOrder = interleaveTerminalShortcutRows(normalizedRows)
-                .map(::terminalCustomShortcutOrderKey)
+            val preferredSingleRowOrder = singleRowCustomShortcutOrder.ifEmpty {
+                shortcutOrder.mapNotNull(::terminalCustomShortcutIdFromOrderKey).ifEmpty {
+                    interleaveTerminalShortcutRows(normalizedRows)
+                }
+            }
+            val admittedSingleRowIds = linkedSetOf<String>()
+            val normalizedSingleRowOrder = buildList {
+                preferredSingleRowOrder.forEach { id ->
+                    if (id in validCustomIds && admittedSingleRowIds.add(id)) add(id)
+                }
+                normalizedCustomShortcuts.forEach { shortcut ->
+                    if (admittedSingleRowIds.add(shortcut.id)) add(shortcut.id)
+                }
+            }
             return copy(
                 labels = TerminalAction.entries.associateWith { action ->
                 label(action).trim().take(12).ifBlank { defaultTerminalShortcutLabels()[action].orEmpty() }
                 },
                 visibleActions = defaultTerminalShortcutActions(),
                 customShortcuts = normalizedCustomShortcuts,
+                singleRowCustomShortcutOrder = normalizedSingleRowOrder,
                 customShortcutRows = normalizedRows,
                 shortcutOrder = defaultTerminalShortcutActions().map(::terminalBuiltInShortcutOrderKey) +
-                    flattenedCustomOrder,
+                    normalizedSingleRowOrder.map(::terminalCustomShortcutOrderKey),
             )
         }
+}
+
+enum class TerminalShortcutDockLayout {
+    ONE_ROW,
+    TWO_ROWS,
 }
 
 enum class TerminalShortcutDockRow(val index: Int) {
@@ -559,12 +574,34 @@ internal fun fixedTerminalShortcutRows(): List<List<TerminalAction>> = listOf(
     ),
 )
 
+/** Built-in order used by the original single-row Dock before the two-row layout was introduced. */
+internal fun fixedSingleRowTerminalShortcutActions(): List<TerminalAction> = listOf(
+    TerminalAction.ESCAPE,
+    TerminalAction.TAB,
+    TerminalAction.ENTER,
+    TerminalAction.BACKSPACE,
+    TerminalAction.DELETE,
+    TerminalAction.ARROW_LEFT,
+    TerminalAction.ARROW_UP,
+    TerminalAction.ARROW_DOWN,
+    TerminalAction.ARROW_RIGHT,
+    TerminalAction.CTRL_C,
+)
+
 internal fun orderedTerminalCustomShortcutRows(
     preferences: TerminalShortcutPreferences,
 ): List<List<TerminalCustomShortcut>> {
     val normalized = preferences.normalized
     val shortcutsById = normalized.customShortcuts.associateBy(TerminalCustomShortcut::id)
     return normalized.customShortcutRows.map { row -> row.mapNotNull(shortcutsById::get) }
+}
+
+internal fun orderedTerminalCustomShortcuts(
+    preferences: TerminalShortcutPreferences,
+): List<TerminalCustomShortcut> {
+    val normalized = preferences.normalized
+    val shortcutsById = normalized.customShortcuts.associateBy(TerminalCustomShortcut::id)
+    return normalized.singleRowCustomShortcutOrder.mapNotNull(shortcutsById::get)
 }
 
 internal fun placeTerminalCustomShortcut(
@@ -590,6 +627,16 @@ internal fun moveTerminalCustomShortcut(
     delta: Int,
 ): TerminalShortcutPreferences {
     val normalized = preferences.normalized
+    if (normalized.dockLayout == TerminalShortcutDockLayout.ONE_ROW) {
+        val order = normalized.singleRowCustomShortcutOrder.toMutableList()
+        val sourceIndex = order.indexOf(shortcutId)
+        if (sourceIndex < 0) return normalized
+        val destinationIndex = sourceIndex + delta
+        if (destinationIndex !in order.indices) return normalized
+        order[sourceIndex] = order[destinationIndex]
+        order[destinationIndex] = shortcutId
+        return normalized.copy(singleRowCustomShortcutOrder = order).normalized
+    }
     val rows = normalized.customShortcutRows.map { it.toMutableList() }.toMutableList()
     val rowIndex = rows.indexOfFirst { shortcutId in it }
     if (rowIndex < 0) return normalized

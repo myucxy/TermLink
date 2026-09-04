@@ -161,21 +161,20 @@ Security note：固定 HTTPS OIDC 端点；需要交互时使用受控浏览器�
 ```text
 System status
 App Bar：问候 + 页面标题 + 账号
-Command Search：PC / Session / Action
 Ambient Summary：账号状态 · PC/Live Session 不限数量
 PC List
   ├─ OFFICE-PC：在线、延迟、2 个 Session
   └─ 添加更多 PC：安装/登录 Windows Agent 引导
-Bottom Navigation：设备 / 活动 / 设置
+Bottom Navigation：设备 / 会话 / 设置
 ```
 
 行为：
 
 - 点击 PC 进入 PC/Session 列表；原型直接进入第一个 Live Session；
 - “添加 PC”进入 Windows Agent 安装与同账号登录引导，不进入会员、配对或 Grant 流程；
-- 搜索按钮打开统一命令面板，可切 PC、Session 或设置；
 - 设备状态同时显示 Presence、延迟和最近在线时间；
-- 设备页右下角提供固定刷新按钮；刷新中显示进度且忽略重复点击，列表末尾预留空间，按钮不得覆盖最后一台 PC；
+- 设备列表支持下拉刷新；右下角同时保留透明背景的纯图标刷新入口，两者共享刷新状态并忽略重复请求；
+- 刷新中两个入口显示同一进度状态，列表末尾只为 48dp 触控区保留必要空间，不得覆盖最后一台 PC；
 - 会话只有在 `state != RUNNING` 或所属 PC Presence 已超时后才显示永久删除入口。客户端先确认，服务端再次权威校验；删除同时清理服务器密文历史且不可恢复。
 
 ### 5.3 实时 Terminal
@@ -185,7 +184,7 @@ Compact Header：PC 名 / Session 名 / 状态
 State Bar：Live · E2EE · 82×28 · 只读/控制中
 Terminal Surface：Termux Fork
 Jump Latest
-Extra Keys：Esc Tab Ctrl Alt ← ↑ ↓ →
+Extra Keys：可选一行 / 两行 Dock，内置按键固定，自定义按键可排序
 Control Bar：申请控制 / 释放控制
 ```
 
@@ -199,6 +198,15 @@ Control Bar：申请控制 / 释放控制
 当前 Android 实现把 PC 名与会话名放在紧凑双行标题中，长名称使用 marquee；快捷栏是 Terminal
 下方的独立布局区域而不是覆盖层，并可水平滚动。`adjustResize` 与会话页局部 IME inset 共同保证
 键盘弹出时最后一行、光标和快捷栏都位于输入法上方，并以 100～200ms 去抖同步 Resize。
+
+Dock 在设置中支持一行和两行切换，按钮继续使用相同的 30dp 高度与内容内边距，宽度不足时横向
+滑动。一行模式沿用双行改造前的 `Esc / Tab / Enter / 退格 / Del / ← / ↑ / ↓ / → / Ctrl+C`
+顺序排列内置键，
+自定义键只允许左右移动；两行模式保留固定内置矩阵，自定义键允许行内左右移动和上下换行。
+两种模式分别持久化自定义键顺序，切换模式不会用当前布局覆盖另一套布局。该行数行为参考
+`termux/termux-app` 固定提交 `3df69d1da197dd9bd71a3bafd902dffd720576b4` 的
+`ExtraKeysInfo.java` 二维矩阵和 `ExtraKeysView.java#reload()` 行数重建方式；仅参考行为，排序和持久化
+由 TermLink 自行实现，未复制 Termux GPL 代码，也未引入其本地 PTY/Shell 架构。
 
 手机端以左右拖动切换相邻会话。切换必须是明确手势：拖动距离严格超过页面宽度 65% 才切页，
 短而快速的甩动也不能绕过距离阈值，一次最多切换一页；切换完成后清除已滑出页面的 Terminal

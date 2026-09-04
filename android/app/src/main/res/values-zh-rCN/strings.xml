@@ -4,8 +4,8 @@
     <string name="product_title">TermLink</string>
     <string name="nav_devices">设备</string><string name="nav_activity">活动</string><string name="nav_settings">设置</string>
     <string name="nav_sessions">会话</string><string name="nav_history">历史</string><string name="nav_membership">会员</string>
-    <string name="nav_trusted_devices">可信设备</string><string name="nav_account">账号</string><string name="filter_all">全部</string><string name="filter_trusted">可信</string><string name="filter_pending">待批准</string>
-    <string name="home_greeting_morning">早上好</string><string name="home_greeting_afternoon">下午好</string><string name="home_greeting_evening">晚上好</string><string name="home_title">你的终端</string><string name="home_command_search">搜索 PC、会话或操作</string><string name="home_command_shortcut">搜索</string><string name="home_command_search_title">命令搜索</string><string name="home_command_search_copy">选择设备、会话、活动、历史或设置页面。</string><string name="home_quota_summary">%1$s · %2$s 台 PC · %3$s 个实时会话</string>
+    <string name="nav_trusted_devices">可信设备</string><string name="nav_account">账号</string>
+    <string name="home_greeting_morning">早上好</string><string name="home_greeting_afternoon">下午好</string><string name="home_greeting_evening">晚上好</string><string name="home_title">你的终端</string><string name="home_quota_summary">%1$s · %2$s 台 PC · %3$s 个实时会话</string>
     <string name="connection_error_title">服务器请求不可用</string><string name="connection_error_copy">服务器请求失败，请在公共服务可用时重试。</string><string name="device_type_windows_pc">Windows PC</string><string name="device_type_android">Android 设备</string>
     <string name="action_back">返回</string><string name="action_refresh">刷新服务器数据</string><string name="action_open_settings">打开设置</string>
     <string name="action_account_settings">账号设置</string><string name="action_configure_account">配置账号</string><string name="action_change_server">更改</string>
@@ -134,10 +134,10 @@
     <string name="settings_color_picker_hint">在色盘中点击或拖动选择颜色。</string>
     <string name="settings_color_picker_presets">终端常用色</string>
     <string name="settings_shortcuts_title">快捷键</string>
-    <string name="settings_shortcuts_copy">管理固定双行 Dock 布局和自定义终端快捷项。</string>
-    <string name="settings_shortcuts_direction_copy">内置按键位置固定；自定义快捷项可以在同行排序，也可以在两行之间移动。</string>
-    <string name="settings_shortcuts_summary">%1$d 个内置 · %2$d 个自定义 · 双行 Dock</string>
-    <string name="settings_shortcuts_manager_copy">在一个可滚动面板中添加、编辑、删除和排列快捷项。</string>
+    <string name="settings_shortcuts_copy">选择一行或两行 Dock 布局，并管理自定义终端快捷项。</string>
+    <string name="settings_shortcuts_direction_copy">内置按键位置固定；自定义排序跟随所选布局：一行时左右移动，两行时可在行内或跨行移动。</string>
+    <string name="settings_shortcuts_summary">%1$d 个内置 · %2$d 个自定义 · Dock：%3$s</string>
+    <string name="settings_shortcuts_manager_copy">在一个可滚动面板中选择 Dock 行数，并添加、编辑、删除或排列快捷项。</string>
     <string name="terminal_action_escape">退出键</string>
     <string name="terminal_action_tab">制表键</string>
     <string name="terminal_action_enter">回车键</string>
@@ -172,13 +172,20 @@
     <string name="shortcut_delete_custom_action">删除快捷项</string>
     <string name="shortcut_manage_action">管理</string>
     <string name="shortcut_manage_title">管理快捷键</string>
+    <string name="shortcut_dock_layout_label">Dock 行数</string>
+    <string name="shortcut_dock_layout_one_row">一行</string>
+    <string name="shortcut_dock_layout_two_rows">两行</string>
     <string name="shortcut_layout_preview_title">自定义 Dock 排序预览</string>
     <string name="shortcut_layout_preview_copy">左右滑动可查看更多；长按自定义按钮后可用方向键调整位置，内置按键始终固定在前。</string>
+    <string name="shortcut_layout_preview_copy_one_row">左右滑动可查看更多；长按自定义按钮后只能左右调整位置，内置按键始终固定在前。</string>
     <string name="shortcut_long_press_reorder">调整快捷键顺序</string>
     <string name="shortcut_reorder_selected">调整 %1$s 的位置</string>
     <string name="shortcut_row_top">第一行</string>
     <string name="shortcut_row_bottom">第二行</string>
+    <string name="shortcut_row_single">一行</string>
+    <string name="shortcut_custom_single_row_title">自定义快捷项（%1$d）</string>
     <string name="shortcut_custom_row_title">%1$s自定义快捷项（%2$d）</string>
+    <string name="shortcut_custom_empty">还没有自定义快捷项。</string>
     <string name="shortcut_row_empty">这一行还没有自定义快捷项。</string>
     <string name="shortcut_move_to_top">移到第一行</string>
     <string name="shortcut_move_to_bottom">移到第二行</string>

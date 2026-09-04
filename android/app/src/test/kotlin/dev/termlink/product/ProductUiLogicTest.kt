@@ -19,6 +19,14 @@ import org.junit.Test
 
 class ProductUiLogicTest {
     @Test
+    fun deviceRefreshUsesOneBusyGateForPullAndIconActions() {
+        assertFalse(deviceRefreshInProgress(false, ProductConnectionState.CONNECTED))
+        assertTrue(deviceRefreshInProgress(true, ProductConnectionState.CONNECTED))
+        assertTrue(deviceRefreshInProgress(false, ProductConnectionState.CONNECTING))
+        assertTrue(deviceRefreshInProgress(true, ProductConnectionState.CONNECTING))
+    }
+
+    @Test
     fun devicePageShowsOnlyServerOnlineWindowsPcs() {
         val onlineDeviceId = UUID.fromString("20000000-0000-0000-0000-000000000001")
         val offlineDeviceId = UUID.fromString("20000000-0000-0000-0000-000000000002")

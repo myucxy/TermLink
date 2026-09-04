@@ -91,7 +91,6 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Replay
-import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Terminal
@@ -109,7 +108,6 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -130,6 +128,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.material3.lightColorScheme
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -332,6 +331,8 @@ private const val TERMINAL_SHORTCUT_ORDER_KEY = "terminal_shortcut_order"
 private const val TERMINAL_CUSTOM_SHORTCUTS_KEY = "terminal_custom_shortcuts_v1"
 private const val TERMINAL_UNIFIED_SHORTCUT_ORDER_KEY = "terminal_shortcut_order_v2"
 private const val TERMINAL_CUSTOM_SHORTCUT_ROWS_KEY = "terminal_custom_shortcut_rows_v1"
+private const val TERMINAL_SHORTCUT_DOCK_LAYOUT_KEY = "terminal_shortcut_dock_layout_v1"
+private const val TERMINAL_CUSTOM_SHORTCUT_ONE_ROW_ORDER_KEY = "terminal_custom_shortcut_one_row_order_v1"
 private const val REMOTE_DOWNLOAD_PC_ID_KEY = "remote_download_pc_id"
 private const val REMOTE_DOWNLOAD_PC_NAME_KEY = "remote_download_pc_name"
 private const val REMOTE_DOWNLOAD_PATH_KEY = "remote_download_path"
@@ -1030,7 +1031,6 @@ fun ProductApp(
     var selectedHistoryId by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedRemotePcId by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedRemotePcName by rememberSaveable { mutableStateOf("") }
-    var commandSearchOpen by remember { mutableStateOf(false) }
     var pasteSessionId by remember { mutableStateOf<java.util.UUID?>(null) }
     val terminalInputResumeRegistry = remember { TerminalInputResumeRegistry() }
     var pendingStopSessionId by remember { mutableStateOf<java.util.UUID?>(null) }
@@ -1249,7 +1249,7 @@ fun ProductApp(
     fun runOperation(operation: suspend () -> Unit) = runOperation(operation, {})
 
     fun refresh() {
-        if (refreshInFlight || snapshot.connectionState == ProductConnectionState.CONNECTING) return
+        if (deviceRefreshInProgress(refreshInFlight, snapshot.connectionState)) return
         refreshInFlight = true
         runOperation(repository::refresh) { refreshInFlight = false }
     }
@@ -1380,26 +1380,27 @@ fun ProductApp(
             snackbarHost = { SnackbarHost(snackbarHostState) },
             floatingActionButton = {
                 if (destination == ProductDestination.DEVICES) {
-                    val refreshing = refreshInFlight ||
-                        snapshot.connectionState == ProductConnectionState.CONNECTING
-                    FloatingActionButton(
-                        onClick = { if (!refreshing) refresh() },
-                        containerColor = if (refreshing) {
-                            MaterialTheme.colorScheme.surfaceVariant
-                        } else {
-                            MaterialTheme.colorScheme.primary
-                        },
+                    val refreshing = deviceRefreshInProgress(refreshInFlight, snapshot.connectionState)
+                    val refreshDescription = stringResource(R.string.action_refresh)
+                    IconButton(
+                        onClick = ::refresh,
+                        enabled = !refreshing,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .testTag(DEVICE_REFRESH_ACTION_TEST_TAG)
+                            .semantics { contentDescription = refreshDescription },
                     ) {
                         if (refreshing) {
                             CircularProgressIndicator(
                                 modifier = Modifier.size(24.dp),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                color = MaterialTheme.colorScheme.primary,
                                 strokeWidth = 2.dp,
                             )
                         } else {
                             Icon(
                                 Icons.Filled.Refresh,
-                                contentDescription = stringResource(R.string.action_refresh),
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
                             )
                         }
                     }
@@ -1588,7 +1589,8 @@ fun ProductApp(
                         )
                     },
                     onDeleteRemoteDownloadRecord = repository::deleteRemoteDownloadRecord,
-                    onOpenCommandSearch = { commandSearchOpen = true },
+                    devicesRefreshing = deviceRefreshInProgress(refreshInFlight, snapshot.connectionState),
+                    onRefreshDevices = ::refresh,
                     themePreference = themePreference,
                     onThemePreferenceChanged = onThemePreferenceChanged,
                     keepScreenOn = keepScreenOn,
@@ -1669,15 +1671,6 @@ fun ProductApp(
         )
     }
 
-    if (commandSearchOpen) {
-        CommandSearchDialog(
-            onDismiss = { commandSearchOpen = false },
-            onNavigate = { next ->
-                commandSearchOpen = false
-                navigateTo(next)
-            },
-        )
-    }
     if (pasteSessionId != null) {
         PasteConfirmationDialog(
             onDismiss = { pasteSessionId = null },
@@ -2772,12 +2765,36 @@ internal fun loadTerminalShortcutPreferences(context: android.content.Context): 
     } else {
         emptyList()
     }
+    val dockLayout = runCatching {
+        TerminalShortcutDockLayout.valueOf(
+            preferences.getString(
+                TERMINAL_SHORTCUT_DOCK_LAYOUT_KEY,
+                TerminalShortcutDockLayout.TWO_ROWS.name,
+            ) ?: TerminalShortcutDockLayout.TWO_ROWS.name,
+        )
+    }.getOrDefault(TerminalShortcutDockLayout.TWO_ROWS)
+    val singleRowCustomShortcutOrder = if (preferences.contains(TERMINAL_CUSTOM_SHORTCUT_ONE_ROW_ORDER_KEY)) {
+        runCatching {
+            val order = JSONArray(
+                preferences.getString(TERMINAL_CUSTOM_SHORTCUT_ONE_ROW_ORDER_KEY, "[]") ?: "[]",
+            )
+            buildList {
+                for (index in 0 until order.length()) {
+                    order.optString(index).takeIf(String::isNotBlank)?.let(::add)
+                }
+            }
+        }.getOrDefault(emptyList())
+    } else {
+        emptyList()
+    }
     return TerminalShortcutPreferences(
         labels = TerminalAction.entries.associateWith { action ->
             preferences.getString(TERMINAL_SHORTCUT_PREFIX + action.name, defaults.label(action)) ?: defaults.label(action)
         },
         visibleActions = storedOrder,
         customShortcuts = customShortcuts,
+        dockLayout = dockLayout,
+        singleRowCustomShortcutOrder = singleRowCustomShortcutOrder,
         customShortcutRows = customShortcutRows,
         shortcutOrder = unifiedOrder,
     ).normalized
@@ -2816,47 +2833,12 @@ internal fun saveTerminalShortcutPreferences(
         .putString(TERMINAL_CUSTOM_SHORTCUTS_KEY, customShortcuts.toString())
         .putString(TERMINAL_UNIFIED_SHORTCUT_ORDER_KEY, normalized.shortcutOrder.joinToString(","))
         .putString(TERMINAL_CUSTOM_SHORTCUT_ROWS_KEY, customShortcutRows.toString())
+        .putString(TERMINAL_SHORTCUT_DOCK_LAYOUT_KEY, normalized.dockLayout.name)
+        .putString(
+            TERMINAL_CUSTOM_SHORTCUT_ONE_ROW_ORDER_KEY,
+            JSONArray(normalized.singleRowCustomShortcutOrder).toString(),
+        )
         .apply()
-}
-
-@Composable
-private fun CommandSearchDialog(
-    onDismiss: () -> Unit,
-    onNavigate: (ProductDestination) -> Unit,
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        icon = { Icon(Icons.Filled.Search, contentDescription = null) },
-        title = { Text(stringResource(R.string.home_command_search_title)) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(
-                    stringResource(R.string.home_command_search_copy),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                listOf(
-                    ProductDestination.DEVICES,
-                    ProductDestination.SESSIONS,
-                    ProductDestination.ACTIVITY,
-                    ProductDestination.HISTORY,
-                    ProductDestination.SETTINGS,
-                ).forEach { destination ->
-                    TextButton(
-                        onClick = { onNavigate(destination) },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 48.dp),
-                    ) {
-                        Text(destination.localizedLabel(), modifier = Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Start)
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text(stringResource(R.string.action_cancel)) }
-        },
-    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -2973,6 +2955,15 @@ private fun dev.termlink.model.HistoryObject.Kind.localizedLabel(): String = whe
     dev.termlink.model.HistoryObject.Kind.SNAPSHOT -> stringResource(R.string.history_snapshot)
 }
 
+internal const val DEVICE_PULL_TO_REFRESH_TEST_TAG = "device-pull-to-refresh"
+internal const val DEVICE_REFRESH_ACTION_TEST_TAG = "device-refresh-action"
+
+internal fun deviceRefreshInProgress(
+    refreshInFlight: Boolean,
+    connectionState: ProductConnectionState,
+): Boolean = refreshInFlight || connectionState == ProductConnectionState.CONNECTING
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ProductContent(
     modifier: Modifier,
@@ -3012,7 +3003,8 @@ private fun ProductContent(
     onCancelRemoteDownload: (java.util.UUID) -> Unit,
     onRetryRemoteDownload: (RemoteDownloadRecord) -> Unit,
     onDeleteRemoteDownloadRecord: (java.util.UUID) -> Unit,
-    onOpenCommandSearch: () -> Unit,
+    devicesRefreshing: Boolean,
+    onRefreshDevices: () -> Unit,
     themePreference: ProductThemePreference,
     onThemePreferenceChanged: (ProductThemePreference) -> Unit,
     keepScreenOn: Boolean,
@@ -3034,6 +3026,38 @@ private fun ProductContent(
 ) {
     val remotePcId = selectedRemotePcId?.let { value ->
         runCatching { java.util.UUID.fromString(value) }.getOrNull()
+    }
+    if (destination == ProductDestination.DEVICES) {
+        PullToRefreshBox(
+            isRefreshing = devicesRefreshing,
+            onRefresh = onRefreshDevices,
+            modifier = modifier
+                .fillMaxSize()
+                .testTag(DEVICE_PULL_TO_REFRESH_TEST_TAG),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                DevicesPage(
+                    snapshot = snapshot,
+                    expandedPcIds = expandedPcIds,
+                    onTogglePcExpanded = onTogglePcExpanded,
+                    onOpenSession = { sessionId ->
+                        if (onSessionSelected(sessionId)) onOpenSessions()
+                    },
+                    onOpenDownloads = onOpenDownloads,
+                    onBrowsePc = onBrowsePc,
+                    onAgentUpdateRequested = onAgentUpdateRequested,
+                    onStopSessionRequested = onStopSessionRequested,
+                    onDeleteSessionRequested = onDeleteSessionRequested,
+                )
+            }
+        }
+        return
     }
     if (destination == ProductDestination.FILES && remotePcId != null) {
         val remotePc = snapshot.pcs.firstOrNull { pc -> pc.id == remotePcId }
@@ -3136,20 +3160,7 @@ private fun ProductContent(
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         when (destination) {
-            ProductDestination.DEVICES -> DevicesPage(
-                snapshot = snapshot,
-                expandedPcIds = expandedPcIds,
-                onTogglePcExpanded = onTogglePcExpanded,
-                onOpenSession = { sessionId ->
-                    if (onSessionSelected(sessionId)) onOpenSessions()
-                },
-                onOpenDownloads = onOpenDownloads,
-                onBrowsePc = onBrowsePc,
-                onAgentUpdateRequested = onAgentUpdateRequested,
-                onOpenCommandSearch = onOpenCommandSearch,
-                onStopSessionRequested = onStopSessionRequested,
-                onDeleteSessionRequested = onDeleteSessionRequested,
-            )
+            ProductDestination.DEVICES -> Unit
             ProductDestination.SESSIONS -> Unit
             ProductDestination.FILES,
             ProductDestination.DOWNLOADS -> EmptyState(
@@ -3242,23 +3253,10 @@ private fun DevicesPage(
     onOpenDownloads: () -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
     onAgentUpdateRequested: (PcSummary) -> Unit,
-    onOpenCommandSearch: () -> Unit,
     onStopSessionRequested: (java.util.UUID) -> Unit,
     onDeleteSessionRequested: (java.util.UUID) -> Unit,
 ) {
     PrimaryHomeHeader(onOpenDownloads = onOpenDownloads)
-    OutlinedButton(
-        onClick = onOpenCommandSearch,
-        modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(min = 48.dp),
-        contentPadding = ButtonDefaults.ContentPadding,
-    ) {
-        Icon(Icons.Filled.Search, contentDescription = null, modifier = Modifier.size(18.dp))
-        Spacer(Modifier.width(8.dp))
-        Text(stringResource(R.string.home_command_search), modifier = Modifier.weight(1f), textAlign = androidx.compose.ui.text.style.TextAlign.Start)
-        Text(stringResource(R.string.home_command_shortcut), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    }
     val pcs = visibleOnlineWindowsPcs(snapshot)
     if (pcs.isEmpty()) {
         EmptyState(
@@ -3302,8 +3300,8 @@ private fun DevicesPage(
             }
         }
     }
-    // Keep the final device/session row clear of the home refresh FAB.
-    Spacer(Modifier.height(72.dp))
+    // Keep the final row clear of the transparent 48 dp refresh touch target.
+    Spacer(Modifier.height(56.dp))
 }
 
 @Composable
@@ -4289,7 +4287,8 @@ private fun TerminalActionBar(
     onExpandedChanged: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val customRows = orderedTerminalCustomShortcutRows(shortcutPreferences)
+    val value = shortcutPreferences.normalized
+    val customRows = orderedTerminalCustomShortcutRows(value)
     val shortcutScrollState = rememberScrollState()
     Column(
         modifier = modifier
@@ -4329,6 +4328,65 @@ private fun TerminalActionBar(
                         tint = color,
                         modifier = Modifier.size(17.dp),
                     )
+                }
+            }
+            return@Column
+        }
+        if (value.dockLayout == TerminalShortcutDockLayout.ONE_ROW) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TerminalDockButton(
+                    onClick = { onExpandedChanged(false) },
+                    modifier = Modifier
+                        .width(TerminalDockButtonSize)
+                        .testTag(terminalCommandTestTag("dock-toggle")),
+                ) {
+                    color -> Icon(
+                        Icons.Filled.KeyboardArrowDown,
+                        contentDescription = stringResource(R.string.terminal_dock_hide),
+                        tint = color,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+                TerminalDockButton(
+                    onClick = onPasteRequested,
+                    enabled = enabled,
+                    modifier = Modifier
+                        .width(TerminalDockButtonSize)
+                        .testTag(terminalCommandTestTag("paste")),
+                ) {
+                    color -> Icon(
+                        Icons.Filled.ContentPaste,
+                        contentDescription = stringResource(R.string.action_paste),
+                        tint = color,
+                        modifier = Modifier.size(17.dp),
+                    )
+                }
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .horizontalScroll(shortcutScrollState),
+                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    fixedSingleRowTerminalShortcutActions().forEach { action ->
+                        TerminalBuiltInDockKey(
+                            action = action,
+                            shortcutPreferences = value,
+                            enabled = enabled,
+                            onAction = onAction,
+                        )
+                    }
+                    orderedTerminalCustomShortcuts(value).forEach { shortcut ->
+                        TerminalCustomTextKey(
+                            shortcut = shortcut,
+                            enabled = enabled,
+                            onActivate = onCustomShortcut,
+                        )
+                    }
                 }
             }
             return@Column
@@ -4384,14 +4442,14 @@ private fun TerminalActionBar(
                     ) {
                         TerminalBuiltInDockKey(
                             action = fixedRows[TERMINAL_SHORTCUT_TOP_ROW][column],
-                            shortcutPreferences = shortcutPreferences,
+                            shortcutPreferences = value,
                             enabled = enabled,
                             onAction = onAction,
                             modifier = Modifier.fillMaxWidth(),
                         )
                         TerminalBuiltInDockKey(
                             action = fixedRows[TERMINAL_SHORTCUT_BOTTOM_ROW][column],
-                            shortcutPreferences = shortcutPreferences,
+                            shortcutPreferences = value,
                             enabled = enabled,
                             onAction = onAction,
                             modifier = Modifier.fillMaxWidth(),
@@ -6050,6 +6108,13 @@ private fun TerminalShortcutSettings(
                         R.string.settings_shortcuts_summary,
                         TerminalAction.entries.size,
                         value.customShortcuts.size,
+                        stringResource(
+                            if (value.dockLayout == TerminalShortcutDockLayout.ONE_ROW) {
+                                R.string.shortcut_dock_layout_one_row
+                            } else {
+                                R.string.shortcut_dock_layout_two_rows
+                            },
+                        ),
                     ),
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
@@ -6072,6 +6137,9 @@ private fun TerminalShortcutSettings(
         TerminalShortcutManagerDialog(
             preferences = value,
             onDismiss = { managerOpen = false },
+            onLayoutChanged = { layout ->
+                onPreferencesChanged(value.copy(dockLayout = layout).normalized)
+            },
             onAdd = {
                 editingShortcutId = null
                 val rows = orderedTerminalCustomShortcutRows(value)
@@ -6102,6 +6170,7 @@ private fun TerminalShortcutSettings(
         TerminalShortcutEditorDialog(
             initialShortcut = editingShortcut,
             initialRow = TerminalShortcutDockRow.valueOf(editorRowName),
+            showDockRow = value.dockLayout == TerminalShortcutDockLayout.TWO_ROWS,
             onDismiss = ::closeEditor,
             onConfirm = { label, type, shortcutValue, row ->
                 val shortcut = TerminalCustomShortcut(
@@ -6144,6 +6213,7 @@ private fun TerminalShortcutSettings(
 private fun TerminalShortcutManagerDialog(
     preferences: TerminalShortcutPreferences,
     onDismiss: () -> Unit,
+    onLayoutChanged: (TerminalShortcutDockLayout) -> Unit,
     onAdd: () -> Unit,
     onEdit: (TerminalCustomShortcut, TerminalShortcutDockRow) -> Unit,
     onMove: (TerminalCustomShortcut, Int) -> Unit,
@@ -6151,14 +6221,23 @@ private fun TerminalShortcutManagerDialog(
 ) {
     val value = preferences.normalized
     val customRows = orderedTerminalCustomShortcutRows(value)
+    val singleRowShortcuts = orderedTerminalCustomShortcuts(value)
     var selectedShortcutId by rememberSaveable { mutableStateOf<String?>(null) }
     val selectedRowIndex = customRows.indexOfFirst { row -> row.any { it.id == selectedShortcutId } }
-    val selectedColumnIndex = if (selectedRowIndex >= 0) {
-        customRows[selectedRowIndex].indexOfFirst { it.id == selectedShortcutId }
+    val selectedRow = TerminalShortcutDockRow.entries.getOrNull(selectedRowIndex)
+    val activeSelectedSequence = if (value.dockLayout == TerminalShortcutDockLayout.ONE_ROW) {
+        singleRowShortcuts
     } else {
-        -1
+        customRows.getOrNull(selectedRowIndex).orEmpty()
     }
-    val selectedShortcut = customRows.getOrNull(selectedRowIndex)?.getOrNull(selectedColumnIndex)
+    val selectedPosition = activeSelectedSequence.indexOfFirst { it.id == selectedShortcutId }
+    val selectedShortcut = activeSelectedSequence.getOrNull(selectedPosition)
+    val managerGroups: List<Pair<TerminalShortcutDockRow?, List<TerminalCustomShortcut>>> =
+        if (value.dockLayout == TerminalShortcutDockLayout.ONE_ROW) {
+            listOf(null to singleRowShortcuts)
+        } else {
+            TerminalShortcutDockRow.entries.map { row -> row to customRows[row.index] }
+        }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(stringResource(R.string.shortcut_manage_title)) },
@@ -6167,6 +6246,41 @@ private fun TerminalShortcutManagerDialog(
                 modifier = Modifier.fillMaxWidth().heightIn(max = 560.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                item(key = "dock-layout-selector") {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            stringResource(R.string.shortcut_dock_layout_label),
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            TerminalShortcutDockLayout.entries.forEach { layout ->
+                                FilterChip(
+                                    selected = value.dockLayout == layout,
+                                    onClick = {
+                                        selectedShortcutId = null
+                                        onLayoutChanged(layout)
+                                    },
+                                    label = {
+                                        Text(
+                                            stringResource(
+                                                if (layout == TerminalShortcutDockLayout.ONE_ROW) {
+                                                    R.string.shortcut_dock_layout_one_row
+                                                } else {
+                                                    R.string.shortcut_dock_layout_two_rows
+                                                },
+                                            ),
+                                        )
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                        }
+                    }
+                }
                 item {
                     Text(
                         stringResource(R.string.shortcut_layout_preview_title),
@@ -6184,9 +6298,10 @@ private fun TerminalShortcutManagerDialog(
                         if (selectedShortcut != null) {
                             TerminalShortcutPreviewControls(
                                 shortcut = selectedShortcut,
-                                row = TerminalShortcutDockRow.entries[selectedRowIndex],
-                                canMoveLeft = selectedColumnIndex > 0,
-                                canMoveRight = selectedColumnIndex < customRows[selectedRowIndex].lastIndex,
+                                layout = value.dockLayout,
+                                row = selectedRow,
+                                canMoveLeft = selectedPosition > 0,
+                                canMoveRight = selectedPosition < activeSelectedSequence.lastIndex,
                                 onMoveLeft = { onMove(selectedShortcut, -1) },
                                 onMoveRight = { onMove(selectedShortcut, 1) },
                                 onMoveUp = {
@@ -6201,7 +6316,13 @@ private fun TerminalShortcutManagerDialog(
                 }
                 item {
                     Text(
-                        stringResource(R.string.shortcut_layout_preview_copy),
+                        stringResource(
+                            if (value.dockLayout == TerminalShortcutDockLayout.ONE_ROW) {
+                                R.string.shortcut_layout_preview_copy_one_row
+                            } else {
+                                R.string.shortcut_layout_preview_copy
+                            },
+                        ),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -6210,55 +6331,65 @@ private fun TerminalShortcutManagerDialog(
                         color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f),
                     )
                 }
-                customRows.forEachIndexed { rowIndex, shortcuts ->
-                    val row = if (rowIndex == TERMINAL_SHORTCUT_TOP_ROW) {
-                        TerminalShortcutDockRow.TOP
-                    } else {
-                        TerminalShortcutDockRow.BOTTOM
-                    }
-                    item(key = "custom-heading-$rowIndex") {
+                managerGroups.forEach { (row, shortcuts) ->
+                    val rowKey = row?.name ?: "single"
+                    item(key = "custom-heading-$rowKey") {
                         Text(
-                            stringResource(
-                                R.string.shortcut_custom_row_title,
+                            if (row == null) {
+                                stringResource(R.string.shortcut_custom_single_row_title, shortcuts.size)
+                            } else {
                                 stringResource(
-                                    if (row == TerminalShortcutDockRow.TOP) R.string.shortcut_row_top
-                                    else R.string.shortcut_row_bottom,
-                                ),
-                                shortcuts.size,
-                            ),
+                                    R.string.shortcut_custom_row_title,
+                                    stringResource(
+                                        if (row == TerminalShortcutDockRow.TOP) R.string.shortcut_row_top
+                                        else R.string.shortcut_row_bottom,
+                                    ),
+                                    shortcuts.size,
+                                )
+                            },
                             style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.SemiBold,
                         )
                     }
                     if (shortcuts.isEmpty()) {
-                        item(key = "custom-empty-$rowIndex") {
+                        item(key = "custom-empty-$rowKey") {
                             Text(
-                                stringResource(R.string.shortcut_row_empty),
+                                stringResource(
+                                    if (row == null) R.string.shortcut_custom_empty
+                                    else R.string.shortcut_row_empty,
+                                ),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
                     } else {
                         itemsIndexed(shortcuts, key = { _, shortcut -> shortcut.id }) { index, shortcut ->
+                            val storedRowIndex = customRows.indexOfFirst { storedRow ->
+                                storedRow.any { it.id == shortcut.id }
+                            }
+                            val storedRow = TerminalShortcutDockRow.entries.getOrElse(storedRowIndex) {
+                                TerminalShortcutDockRow.TOP
+                            }
                             TerminalShortcutManagerRow(
                                 shortcut = shortcut,
-                                row = row,
-                                canMoveUp = index > 0,
-                                canMoveDown = index < shortcuts.lastIndex,
-                                onEdit = { onEdit(shortcut, row) },
-                                onMoveUp = { onMove(shortcut, -1) },
-                                onMoveDown = { onMove(shortcut, 1) },
+                                row = storedRow,
+                                allowRowChange = row != null,
+                                canMoveLeft = index > 0,
+                                canMoveRight = index < shortcuts.lastIndex,
+                                onEdit = { onEdit(shortcut, storedRow) },
+                                onMoveLeft = { onMove(shortcut, -1) },
+                                onMoveRight = { onMove(shortcut, 1) },
                                 onMoveToOtherRow = {
                                     onMoveToRow(
                                         shortcut,
-                                        if (row == TerminalShortcutDockRow.TOP) TerminalShortcutDockRow.BOTTOM
+                                        if (storedRow == TerminalShortcutDockRow.TOP) TerminalShortcutDockRow.BOTTOM
                                         else TerminalShortcutDockRow.TOP,
                                     )
                                 },
                             )
                         }
                     }
-                    item(key = "custom-divider-$rowIndex") {
+                    item(key = "custom-divider-$rowKey") {
                         HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.24f))
                     }
                 }
@@ -6282,11 +6413,12 @@ private fun TerminalShortcutManagerDialog(
 private fun TerminalShortcutManagerRow(
     shortcut: TerminalCustomShortcut,
     row: TerminalShortcutDockRow,
-    canMoveUp: Boolean,
-    canMoveDown: Boolean,
+    allowRowChange: Boolean,
+    canMoveLeft: Boolean,
+    canMoveRight: Boolean,
     onEdit: () -> Unit,
-    onMoveUp: () -> Unit,
-    onMoveDown: () -> Unit,
+    onMoveLeft: () -> Unit,
+    onMoveRight: () -> Unit,
     onMoveToOtherRow: () -> Unit,
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
@@ -6329,34 +6461,36 @@ private fun TerminalShortcutManagerRow(
                 )
                 DropdownMenuItem(
                     text = { Text(stringResource(R.string.shortcut_move_left)) },
-                    enabled = canMoveUp,
+                    enabled = canMoveLeft,
                     onClick = {
                         menuExpanded = false
-                        onMoveUp()
+                        onMoveLeft()
                     },
                 )
                 DropdownMenuItem(
                     text = { Text(stringResource(R.string.shortcut_move_right)) },
-                    enabled = canMoveDown,
+                    enabled = canMoveRight,
                     onClick = {
                         menuExpanded = false
-                        onMoveDown()
+                        onMoveRight()
                     },
                 )
-                DropdownMenuItem(
-                    text = {
-                        Text(
-                            stringResource(
-                                if (row == TerminalShortcutDockRow.TOP) R.string.shortcut_move_to_bottom
-                                else R.string.shortcut_move_to_top,
-                            ),
-                        )
-                    },
-                    onClick = {
-                        menuExpanded = false
-                        onMoveToOtherRow()
-                    },
-                )
+                if (allowRowChange) {
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                stringResource(
+                                    if (row == TerminalShortcutDockRow.TOP) R.string.shortcut_move_to_bottom
+                                    else R.string.shortcut_move_to_top,
+                                ),
+                            )
+                        },
+                        onClick = {
+                            menuExpanded = false
+                            onMoveToOtherRow()
+                        },
+                    )
+                }
             }
         }
     }
@@ -6368,8 +6502,18 @@ private fun TerminalShortcutDockLayoutPreview(
     selectedShortcutId: String?,
     onShortcutLongPressed: (TerminalCustomShortcut) -> Unit,
 ) {
-    val customRows = orderedTerminalCustomShortcutRows(preferences)
-    val customColumnCount = customRows.maxOfOrNull(List<TerminalCustomShortcut>::size) ?: 0
+    val value = preferences.normalized
+    val displayRows = if (value.dockLayout == TerminalShortcutDockLayout.ONE_ROW) {
+        listOf(orderedTerminalCustomShortcuts(value))
+    } else {
+        orderedTerminalCustomShortcutRows(value)
+    }
+    val rowLabels = if (value.dockLayout == TerminalShortcutDockLayout.ONE_ROW) {
+        listOf(R.string.shortcut_row_single)
+    } else {
+        listOf(R.string.shortcut_row_top, R.string.shortcut_row_bottom)
+    }
+    val customColumnCount = displayRows.maxOfOrNull(List<TerminalCustomShortcut>::size) ?: 0
     val scrollState = rememberScrollState()
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -6377,7 +6521,7 @@ private fun TerminalShortcutDockLayoutPreview(
         verticalAlignment = Alignment.Top,
     ) {
         Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-            listOf(R.string.shortcut_row_top, R.string.shortcut_row_bottom).forEach { label ->
+            rowLabels.forEach { label ->
                 Box(
                     modifier = Modifier.height(TerminalDockButtonSize),
                     contentAlignment = Alignment.CenterStart,
@@ -6402,8 +6546,8 @@ private fun TerminalShortcutDockLayoutPreview(
                         .widthIn(min = TerminalDockButtonSize),
                     verticalArrangement = Arrangement.spacedBy(3.dp),
                 ) {
-                    listOf(TERMINAL_SHORTCUT_TOP_ROW, TERMINAL_SHORTCUT_BOTTOM_ROW).forEach { row ->
-                        val shortcut = customRows[row].getOrNull(column)
+                    displayRows.indices.forEach { row ->
+                        val shortcut = displayRows[row].getOrNull(column)
                         if (shortcut == null) {
                             if (customColumnCount == 0) {
                                 TerminalShortcutPreviewButton(
@@ -6472,7 +6616,8 @@ private fun TerminalShortcutPreviewButton(
 @Composable
 private fun TerminalShortcutPreviewControls(
     shortcut: TerminalCustomShortcut,
-    row: TerminalShortcutDockRow,
+    layout: TerminalShortcutDockLayout,
+    row: TerminalShortcutDockRow?,
     canMoveLeft: Boolean,
     canMoveRight: Boolean,
     onMoveLeft: () -> Unit,
@@ -6507,17 +6652,19 @@ private fun TerminalShortcutPreviewControls(
                         contentDescription = stringResource(R.string.shortcut_move_left),
                     )
                 }
-                IconButton(onClick = onMoveUp, enabled = row == TerminalShortcutDockRow.BOTTOM) {
-                    Icon(
-                        Icons.Filled.KeyboardArrowUp,
-                        contentDescription = stringResource(R.string.shortcut_move_to_top),
-                    )
-                }
-                IconButton(onClick = onMoveDown, enabled = row == TerminalShortcutDockRow.TOP) {
-                    Icon(
-                        Icons.Filled.KeyboardArrowDown,
-                        contentDescription = stringResource(R.string.shortcut_move_to_bottom),
-                    )
+                if (layout == TerminalShortcutDockLayout.TWO_ROWS) {
+                    IconButton(onClick = onMoveUp, enabled = row == TerminalShortcutDockRow.BOTTOM) {
+                        Icon(
+                            Icons.Filled.KeyboardArrowUp,
+                            contentDescription = stringResource(R.string.shortcut_move_to_top),
+                        )
+                    }
+                    IconButton(onClick = onMoveDown, enabled = row == TerminalShortcutDockRow.TOP) {
+                        Icon(
+                            Icons.Filled.KeyboardArrowDown,
+                            contentDescription = stringResource(R.string.shortcut_move_to_bottom),
+                        )
+                    }
                 }
                 IconButton(onClick = onMoveRight, enabled = canMoveRight) {
                     Icon(
@@ -6534,6 +6681,7 @@ private fun TerminalShortcutPreviewControls(
 private fun TerminalShortcutEditorDialog(
     initialShortcut: TerminalCustomShortcut? = null,
     initialRow: TerminalShortcutDockRow,
+    showDockRow: Boolean,
     onDismiss: () -> Unit,
     onConfirm: (String, TerminalCustomShortcutType, String, TerminalShortcutDockRow) -> Unit,
     onDelete: (() -> Unit)? = null,
@@ -6615,25 +6763,27 @@ private fun TerminalShortcutEditorDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Text(stringResource(R.string.shortcut_dock_row_label), style = MaterialTheme.typography.labelLarge)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    TerminalShortcutDockRow.entries.forEach { row ->
-                        FilterChip(
-                            selected = dockRow == row,
-                            onClick = { dockRowName = row.name },
-                            label = {
-                                Text(
-                                    stringResource(
-                                        if (row == TerminalShortcutDockRow.TOP) R.string.shortcut_row_top
-                                        else R.string.shortcut_row_bottom,
-                                    ),
-                                )
-                            },
-                            modifier = Modifier.weight(1f),
-                        )
+                if (showDockRow) {
+                    Text(stringResource(R.string.shortcut_dock_row_label), style = MaterialTheme.typography.labelLarge)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        TerminalShortcutDockRow.entries.forEach { row ->
+                            FilterChip(
+                                selected = dockRow == row,
+                                onClick = { dockRowName = row.name },
+                                label = {
+                                    Text(
+                                        stringResource(
+                                            if (row == TerminalShortcutDockRow.TOP) R.string.shortcut_row_top
+                                            else R.string.shortcut_row_bottom,
+                                        ),
+                                    )
+                                },
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
                     }
                 }
                 when (shortcutType) {

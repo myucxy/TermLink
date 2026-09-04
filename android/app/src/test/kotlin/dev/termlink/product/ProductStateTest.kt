@@ -474,4 +474,72 @@ class ProductStateTest {
             keptAtMatchingColumn.customShortcutRows[TERMINAL_SHORTCUT_BOTTOM_ROW],
         )
     }
+
+    @Test
+    fun oneAndTwoRowShortcutOrdersMoveIndependently() {
+        val first = TerminalCustomShortcut("first", "First", "Home")
+        val second = TerminalCustomShortcut("second", "Second", "End")
+        val third = TerminalCustomShortcut("third", "Third", "PageDown")
+        val oneRow = TerminalShortcutPreferences(
+            customShortcuts = listOf(first, second, third),
+            dockLayout = TerminalShortcutDockLayout.ONE_ROW,
+            singleRowCustomShortcutOrder = listOf(third.id, first.id, second.id),
+            customShortcutRows = listOf(
+                listOf(first.id, second.id),
+                listOf(third.id),
+            ),
+        ).normalized
+
+        val oneRowReordered = moveTerminalCustomShortcut(oneRow, first.id, -1)
+        assertEquals(listOf(first.id, third.id, second.id), oneRowReordered.singleRowCustomShortcutOrder)
+        assertEquals(listOf(first.id, second.id), oneRowReordered.customShortcutRows[TERMINAL_SHORTCUT_TOP_ROW])
+        assertEquals(listOf(third.id), oneRowReordered.customShortcutRows[TERMINAL_SHORTCUT_BOTTOM_ROW])
+        assertEquals(listOf(first, third, second), orderedTerminalCustomShortcuts(oneRowReordered))
+
+        val twoRows = oneRowReordered.copy(dockLayout = TerminalShortcutDockLayout.TWO_ROWS).normalized
+        val twoRowsReordered = moveTerminalCustomShortcut(twoRows, second.id, -1)
+        assertEquals(listOf(second.id, first.id), twoRowsReordered.customShortcutRows[TERMINAL_SHORTCUT_TOP_ROW])
+        assertEquals(listOf(third.id), twoRowsReordered.customShortcutRows[TERMINAL_SHORTCUT_BOTTOM_ROW])
+        assertEquals(listOf(first.id, third.id, second.id), twoRowsReordered.singleRowCustomShortcutOrder)
+
+        val restoredOneRow = twoRowsReordered.copy(dockLayout = TerminalShortcutDockLayout.ONE_ROW).normalized
+        assertEquals(listOf(first, third, second), orderedTerminalCustomShortcuts(restoredOneRow))
+    }
+
+    @Test
+    fun singleRowBuiltInsRetainThePreTwoRowOrder() {
+        assertEquals(
+            listOf(
+                TerminalAction.ESCAPE,
+                TerminalAction.TAB,
+                TerminalAction.ENTER,
+                TerminalAction.BACKSPACE,
+                TerminalAction.DELETE,
+                TerminalAction.ARROW_LEFT,
+                TerminalAction.ARROW_UP,
+                TerminalAction.ARROW_DOWN,
+                TerminalAction.ARROW_RIGHT,
+                TerminalAction.CTRL_C,
+            ),
+            fixedSingleRowTerminalShortcutActions(),
+        )
+    }
+
+    @Test
+    fun shortcutNormalizationRepairsBothLayoutOrdersWithoutCrossOverwriting() {
+        val first = TerminalCustomShortcut("first", "First", "Home")
+        val second = TerminalCustomShortcut("second", "Second", "End")
+        val normalized = TerminalShortcutPreferences(
+            customShortcuts = listOf(first, second),
+            singleRowCustomShortcutOrder = listOf("missing", second.id, second.id),
+            customShortcutRows = listOf(
+                listOf(first.id, "missing"),
+                listOf(first.id),
+            ),
+        ).normalized
+
+        assertEquals(listOf(second.id, first.id), normalized.singleRowCustomShortcutOrder)
+        assertEquals(listOf(first.id), normalized.customShortcutRows[TERMINAL_SHORTCUT_TOP_ROW])
+        assertEquals(listOf(second.id), normalized.customShortcutRows[TERMINAL_SHORTCUT_BOTTOM_ROW])
+    }
 }

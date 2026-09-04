@@ -86,6 +86,8 @@ class TerminalShortcutInputTest {
                 listOf("resume-codex", "control-plus"),
                 listOf("literal-plus"),
             ),
+            dockLayout = TerminalShortcutDockLayout.ONE_ROW,
+            singleRowCustomShortcutOrder = listOf("literal-plus", "resume-codex", "control-plus"),
         ).normalized
 
         saveTerminalShortcutPreferences(context, value)
@@ -101,6 +103,11 @@ class TerminalShortcutInputTest {
         assertEquals("Codex", restored.customShortcuts[2].displayLabel)
         assertEquals(listOf("resume-codex", "control-plus"), restored.customShortcutRows[0])
         assertEquals(listOf("literal-plus"), restored.customShortcutRows[1])
+        assertEquals(TerminalShortcutDockLayout.ONE_ROW, restored.dockLayout)
+        assertEquals(
+            listOf("literal-plus", "resume-codex", "control-plus"),
+            restored.singleRowCustomShortcutOrder,
+        )
         assertEquals(
             fixedTerminalShortcutRows().flatten().map(::terminalBuiltInShortcutOrderKey),
             restored.shortcutOrder.take(TerminalAction.entries.size),
@@ -124,6 +131,8 @@ class TerminalShortcutInputTest {
         assertEquals("Ctrl+Shift+p", restored.customShortcuts.single().value)
         assertEquals(listOf("legacy"), restored.customShortcutRows[TERMINAL_SHORTCUT_TOP_ROW])
         assertEquals(emptyList<String>(), restored.customShortcutRows[TERMINAL_SHORTCUT_BOTTOM_ROW])
+        assertEquals(TerminalShortcutDockLayout.TWO_ROWS, restored.dockLayout)
+        assertEquals(listOf("legacy"), restored.singleRowCustomShortcutOrder)
 
         saveTerminalShortcutPreferences(context, restored)
         val stored = context.getSharedPreferences(PRODUCT_PREFERENCES_NAME, Context.MODE_PRIVATE)
