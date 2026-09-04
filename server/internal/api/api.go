@@ -29,8 +29,6 @@ import (
 	"github.com/termlink/termlink/server/internal/accountdeletion"
 	"github.com/termlink/termlink/server/internal/agentupdate"
 	"github.com/termlink/termlink/server/internal/auth"
-	"github.com/termlink/termlink/server/internal/billing"
-	"github.com/termlink/termlink/server/internal/commerce"
 	"github.com/termlink/termlink/server/internal/history"
 	"github.com/termlink/termlink/server/internal/humanverification"
 	"github.com/termlink/termlink/server/internal/kv"
@@ -60,20 +58,17 @@ const (
 const pairingCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 type API struct {
-	Store                    *store.Postgres
-	Valkey                   *kv.Valkey
-	Tokens                   auth.TokenVerifier
-	Auth                     auth.Middleware
-	SubjectKey               []byte
-	TokenKey                 []byte
-	CommerceKey              []byte
-	History                  HistoryObjectStore
-	DataExportDownloader     PrivacyExportDownloader
-	AccountDeletionBinder    accountdeletion.RequestBinder
-	Billing                  *billing.Registry
-	Commerce                 *commerce.Service
-	ReconciliationOperations ReconciliationOperations
-	Registration             interface {
+	Store                 *store.Postgres
+	Valkey                *kv.Valkey
+	Tokens                auth.TokenVerifier
+	Auth                  auth.Middleware
+	SubjectKey            []byte
+	TokenKey              []byte
+	RegistrationCodeKey   []byte
+	History               HistoryObjectStore
+	DataExportDownloader  PrivacyExportDownloader
+	AccountDeletionBinder accountdeletion.RequestBinder
+	Registration          interface {
 		Register(context.Context, auth.DirectRegistrationInput) error
 		RegisterAttempt(context.Context, uuid.UUID, auth.DirectRegistrationInput) error
 	}
@@ -93,8 +88,7 @@ type API struct {
 	fileOperations     fileOperationStore
 	agentUpdates       agentUpdateStore
 	AgentUpdateCatalog agentupdate.Catalog
-	commerceSecurity   commerceSecurityStore
-	commerceReporting  commerceReportingStore
+	operationSecurity  operationSecurityStore
 }
 
 type historyPageLister interface {
@@ -139,8 +133,6 @@ func (a *API) Handler() http.Handler {
 	public.HandleFunc("POST /v1/auth/invitations/validate", a.validateInvitation)
 	public.HandleFunc("POST /v1/auth/register/email-code", a.sendRegistrationEmailCode)
 	public.HandleFunc("POST /v1/auth/register", a.registerAccount)
-	public.HandleFunc("POST /v1/billing/webhooks/alipay", a.handleAlipayWebhook)
-	public.HandleFunc("POST /v1/billing/webhooks/wechat-pay", a.handleWeChatWebhook)
 	registered := http.NewServeMux()
 	registered.HandleFunc("POST /v1/pairing/challenges/{id}/complete", a.completePairingChallenge)
 	registered.HandleFunc("GET /v1/devices/self", a.getCurrentDevice)
@@ -184,18 +176,6 @@ func (a *API) Handler() http.Handler {
 	trusted.HandleFunc("POST /v1/sessions/{id}/history/uploads/{uploadId}/commit", a.commitHistoryUpload)
 	trusted.HandleFunc("GET /v1/audit-events", a.listAudit)
 	trusted.HandleFunc("GET /v1/account/entitlements", a.getEntitlement)
-	trusted.HandleFunc("POST /v1/billing/google/verify", a.verifyGooglePurchase)
-	trusted.HandleFunc("POST /v1/billing/restore", a.restorePurchase)
-	trusted.HandleFunc("POST /v1/billing/web/checkout", a.createWebCheckout)
-	trusted.HandleFunc("POST /v1/billing/redemptions/preview", a.previewRedemption)
-	trusted.HandleFunc("POST /v1/billing/redemptions/claim", a.claimRedemption)
-	trusted.HandleFunc("GET /v1/account/redemptions", a.listAccountRedemptions)
-	trusted.HandleFunc("POST /v1/billing/orders", a.createCommerceOrder)
-	trusted.HandleFunc("GET /v1/billing/orders", a.listCommerceOrders)
-	trusted.HandleFunc("GET /v1/billing/orders/{orderId}", a.getCommerceOrder)
-	trusted.HandleFunc("POST /v1/billing/orders/{orderId}/pay", a.payCommerceOrder)
-	trusted.HandleFunc("POST /v1/billing/orders/{orderId}/query", a.queryCommerceOrder)
-	trusted.HandleFunc("POST /v1/billing/orders/{orderId}/cancel", a.cancelCommerceOrder)
 	trusted.HandleFunc("GET /v1/admin/registration-policy", a.adminGetRegistrationPolicy)
 	trusted.HandleFunc("PATCH /v1/admin/registration-policy", a.adminUpdateRegistrationPolicy)
 	trusted.HandleFunc("GET /v1/admin/invitation-batches", a.listInvitationBatches)
@@ -204,36 +184,6 @@ func (a *API) Handler() http.Handler {
 	trusted.HandleFunc("GET /v1/admin/invitation-codes", a.listInvitationCodes)
 	trusted.HandleFunc("POST /v1/admin/invitation-codes/{codeId}/disable", a.disableInvitationCode)
 	trusted.HandleFunc("GET /v1/admin/invitation-redemptions", a.listInvitationRedemptions)
-	trusted.HandleFunc("GET /v1/admin/redemption-batches", a.listRedemptionBatches)
-	trusted.HandleFunc("POST /v1/admin/redemption-batches", a.createRedemptionBatch)
-	trusted.HandleFunc("POST /v1/admin/redemption-batches/{batchId}/disable", a.disableRedemptionBatch)
-	trusted.HandleFunc("GET /v1/admin/redemption-codes", a.listRedemptionCodes)
-	trusted.HandleFunc("POST /v1/admin/redemption-codes/{codeId}/disable", a.disableRedemptionCode)
-	trusted.HandleFunc("GET /v1/admin/redemption-claims", a.listAdminRedemptionClaims)
-	trusted.HandleFunc("GET /v1/admin/billing/orders", a.listAdminCommerceOrders)
-	trusted.HandleFunc("POST /v1/admin/billing/orders/{orderId}/query", a.queryAdminCommerceOrder)
-	trusted.HandleFunc("POST /v1/admin/billing/orders/{orderId}/retry-fulfillment", a.retryAdminOrderFulfillment)
-	trusted.HandleFunc("GET /v1/admin/billing/transactions", a.listAdminCommerceTransactions)
-	trusted.HandleFunc("POST /v1/admin/billing/orders/{orderId}/refunds", a.createCommerceRefund)
-	trusted.HandleFunc("POST /v1/admin/billing/refunds/{refundId}/confirm", a.confirmCommerceRefund)
-	trusted.HandleFunc("GET /v1/admin/billing/refunds", a.listCommerceRefunds)
-	trusted.HandleFunc("GET /v1/admin/billing/notifications", a.listPaymentNotifications)
-	trusted.HandleFunc("GET /v1/admin/billing/reconciliation-runs", a.listReconciliationRuns)
-	trusted.HandleFunc("POST /v1/admin/billing/reconciliation-runs", a.createReconciliationRun)
-	trusted.HandleFunc("GET /v1/admin/billing/catalog/draft", a.getCommerceCatalogDraft)
-	trusted.HandleFunc("GET /v1/admin/billing/order-report", a.listCommerceOrderReport)
-	trusted.HandleFunc("POST /v1/admin/billing/order-export", a.exportCommerceOrders)
-	trusted.HandleFunc("GET /v1/admin/billing/consistency", a.listCommerceConsistency)
-	trusted.HandleFunc("GET /v1/admin/payment-channels", a.listPaymentChannels)
-	trusted.HandleFunc("POST /v1/admin/payment-channels", a.createPaymentChannel)
-	trusted.HandleFunc("GET /v1/admin/payment-channels/{channelId}/versions", a.listPaymentChannelVersions)
-	trusted.HandleFunc("POST /v1/admin/payment-channels/{channelId}/versions", a.createPaymentChannelVersion)
-	trusted.HandleFunc("POST /v1/admin/payment-channels/{channelId}/validate", a.validatePaymentChannelVersion)
-	trusted.HandleFunc("POST /v1/admin/payment-channels/{channelId}/activate", a.activatePaymentChannelVersion)
-	trusted.HandleFunc("POST /v1/admin/payment-channels/{channelId}/disable", a.disablePaymentChannel)
-	trusted.Handle("POST /v1/admin/billing/plans", a.commerceHighRiskOperation("billing.plan.create.context", "catalog_draft", http.HandlerFunc(a.createPlanDraft)))
-	trusted.Handle("PUT /v1/admin/billing/plans/{id}", a.commerceHighRiskOperation("billing.plan.update.context", "catalog_draft", http.HandlerFunc(a.updatePlanDraft)))
-	trusted.HandleFunc("POST /v1/admin/billing/catalog/publish", a.publishCatalog)
 
 	root := http.NewServeMux()
 	root.Handle("/v1/devices/register", public)
@@ -244,8 +194,6 @@ func (a *API) Handler() http.Handler {
 	root.Handle("/v1/auth/invitations/validate", public)
 	root.Handle("/v1/auth/register/email-code", public)
 	root.Handle("/v1/auth/register", public)
-	root.Handle("/v1/billing/webhooks/alipay", public)
-	root.Handle("/v1/billing/webhooks/wechat-pay", public)
 	root.Handle("/v1/devices/self", a.Auth.AuthenticateRegistered(registered))
 	root.Handle("/v1/devices/self/trust", a.Auth.AuthenticateRegistered(a.idempotency(http.HandlerFunc(a.selfTrustAndroidDevice))))
 	// Register the exact create path as well as the completion subtree. Without
@@ -254,16 +202,9 @@ func (a *API) Handler() http.Handler {
 	// failure.
 	root.Handle("/v1/pairing/challenges", a.Auth.Authenticate(a.idempotency(http.HandlerFunc(a.createPairingChallenge))))
 	root.Handle("/v1/pairing/challenges/", a.Auth.AuthenticateRegistered(a.idempotency(registered)))
-	// Generated invitation and redemption codes are plaintext bearer secrets.
-	// Their successful response must never be replayed from the generic
-	// idempotency cache, so these two routes use a one-time response variant.
-	root.Handle("POST /v1/admin/invitation-batches/{batchId}/generate", a.Auth.Authenticate(a.oneTimeCommerceIdempotency(http.HandlerFunc(a.generateInvitationCodes))))
-	root.Handle("POST /v1/admin/redemption-batches/{batchId}/generate", a.Auth.Authenticate(a.oneTimeCommerceIdempotency(http.HandlerFunc(a.generateRedemptionCodes))))
-	root.Handle("POST /v1/admin/billing/orders/{orderId}/close", a.Auth.Authenticate(http.HandlerFunc(a.closeAdminCommerceOrder)))
-	// Reconciliation transitions own HMAC idempotency inside their database
-	// transaction and therefore must bypass the generic API idempotency layer.
-	root.Handle("GET /v1/admin/billing/reconciliation-discrepancies", a.Auth.Authenticate(http.HandlerFunc(a.listReconciliationDiscrepancies)))
-	root.Handle("POST /v1/admin/billing/reconciliation-discrepancies/{discrepancyId}/transition", a.Auth.Authenticate(http.HandlerFunc(a.transitionReconciliationDiscrepancy)))
+	// Generated invitation codes are plaintext bearer secrets. Their successful
+	// response must never be replayed from the generic idempotency cache.
+	root.Handle("POST /v1/admin/invitation-batches/{batchId}/generate", a.Auth.Authenticate(a.oneTimeSecretIdempotency(http.HandlerFunc(a.generateInvitationCodes))))
 	// User-portal mutations own their durable, account-scoped idempotency
 	// records inside the Store transaction. Keep these exact routes outside the
 	// generic API idempotency wrapper so one request never claims the same key
@@ -280,11 +221,6 @@ func (a *API) Handler() http.Handler {
 	root.Handle("POST /v1/account/deletion-requests", a.Auth.Authenticate(http.HandlerFunc(a.requestUserPortalAccountDeletion)))
 	root.Handle("GET /v1/account/deletion-requests/{requestId}", a.Auth.Authenticate(http.HandlerFunc(a.getUserPortalAccountDeletion)))
 	root.Handle("POST /v1/account/deletion-requests/{requestId}/cancel", a.Auth.Authenticate(http.HandlerFunc(a.cancelUserPortalAccountDeletion)))
-	// Manual entitlement mutations own actor-scoped idempotency in the same
-	// serializable transaction as the Grant and entitlement recomputation.
-	root.Handle("GET /v1/admin/manual-entitlements", a.Auth.Authenticate(http.HandlerFunc(a.adminListManualEntitlementGrants)))
-	root.Handle("POST /v1/admin/manual-entitlements", a.Auth.Authenticate(http.HandlerFunc(a.adminCreateManualEntitlementGrant)))
-	root.Handle("POST /v1/admin/manual-entitlements/{grantId}/revoke", a.Auth.Authenticate(http.HandlerFunc(a.adminRevokeManualEntitlementGrant)))
 	root.Handle("/v1/", a.Auth.Authenticate(a.idempotency(trusted)))
 	return traceMiddleware(root)
 }
@@ -386,12 +322,12 @@ func (a *API) registerAccount(w http.ResponseWriter, r *http.Request) {
 	if a.Valkey != nil {
 		allowed, err := a.Valkey.Consume(r.Context(), accountRegistrationRateLimitScope(r), "attempt", time.Minute)
 		if err != nil {
-			a.recordCommerceSecurityEvent(r, "commerce.registration.rate_limit.denied", "registration", "FAILED", json.RawMessage(`{"reason":"LIMITER_UNAVAILABLE"}`))
+			a.recordSecurityEvent(r, "registration.rate_limit.denied", "registration", "FAILED", json.RawMessage(`{"reason":"LIMITER_UNAVAILABLE"}`))
 			writeError(w, r, http.StatusServiceUnavailable, "REGISTRATION_UNAVAILABLE", err)
 			return
 		}
 		if !allowed {
-			a.recordCommerceSecurityEvent(r, "commerce.registration.rate_limit.denied", "registration", "DENIED", json.RawMessage(`{"reason":"LIMIT_EXCEEDED"}`))
+			a.recordSecurityEvent(r, "registration.rate_limit.denied", "registration", "DENIED", json.RawMessage(`{"reason":"LIMIT_EXCEEDED"}`))
 			writeError(w, r, http.StatusTooManyRequests, "REGISTRATION_RATE_LIMITED", errors.New("registration rate limit reached"))
 			return
 		}
@@ -2467,253 +2403,19 @@ func (a *API) historyResponseItems(ctx context.Context, items []store.HistoryIte
 	return responseItems, nil
 }
 func (a *API) listPlans(w http.ResponseWriter, r *http.Request) {
-	version, plans, err := a.Store.PublishedPlans(r.Context())
-	if err != nil {
-		writeStoreError(w, r, err)
-		return
-	}
-	writeJSON(w, 200, map[string]any{"catalog_version": version, "plans": plans})
+	// Older clients refresh this endpoint alongside account metadata. Keep the
+	// wire contract, but expose no commercial catalog.
+	writeJSON(w, http.StatusOK, map[string]any{"catalog_version": 0, "plans": []any{}})
 }
 func (a *API) getEntitlement(w http.ResponseWriter, r *http.Request) {
-	p := principal(r)
-	item, err := a.Store.GetEntitlement(r.Context(), p.UserID)
-	if err != nil {
-		writeStoreError(w, r, err)
-		return
-	}
-	writeJSON(w, 200, item)
-}
-
-type purchaseRequest struct {
-	ProductID     string `json:"product_id"`
-	PurchaseToken string `json:"purchase_token"`
-}
-
-func (a *API) verifyGooglePurchase(w http.ResponseWriter, r *http.Request) {
-	var input purchaseRequest
-	if err := decodeJSON(r, &input); err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err)
-		return
-	}
-	p := principal(r)
-	if err := validatePurchaseRequest(input); err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_PURCHASE", err)
-		return
-	}
-	if a.Billing == nil {
-		writeError(w, r, http.StatusServiceUnavailable, "BILLING_UNAVAILABLE", billing.ErrUnavailable)
-		return
-	}
-	verified, err := a.Billing.Verify(r.Context(), billing.ProviderGooglePlay, input.ProductID, input.PurchaseToken)
-	if err != nil {
-		writeBillingProviderError(w, r, err)
-		return
-	}
-	entitlement, err := a.Store.ApplyVerifiedPurchase(r.Context(), p.UserID, p.Device.ID, verified, traceID(r.Context()))
-	if err != nil {
-		writeBillingStoreError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"entitlement": entitlement, "verified": true})
-}
-
-type restoreRequest struct {
-	Provider      string `json:"provider"`
-	ProductID     string `json:"product_id"`
-	PurchaseToken string `json:"purchase_token"`
-}
-
-func (a *API) restorePurchase(w http.ResponseWriter, r *http.Request) {
-	var input restoreRequest
-	if err := decodeJSON(r, &input); err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err)
-		return
-	}
-	input.Provider = strings.ToUpper(strings.TrimSpace(input.Provider))
-	if input.Provider != billing.ProviderGooglePlay && input.Provider != billing.ProviderWeb {
-		writeError(w, r, http.StatusBadRequest, "INVALID_PURCHASE_PROVIDER", errors.New("unsupported provider"))
-		return
-	}
-	if err := validatePurchaseRequest(purchaseRequest{ProductID: input.ProductID, PurchaseToken: input.PurchaseToken}); err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_PURCHASE", err)
-		return
-	}
-	if a.Billing == nil {
-		writeError(w, r, http.StatusServiceUnavailable, "BILLING_UNAVAILABLE", billing.ErrUnavailable)
-		return
-	}
-	p := principal(r)
-	verified, err := a.Billing.Verify(r.Context(), input.Provider, input.ProductID, input.PurchaseToken)
-	if err != nil {
-		writeBillingProviderError(w, r, err)
-		return
-	}
-	entitlement, err := a.Store.ApplyVerifiedPurchase(r.Context(), p.UserID, p.Device.ID, verified, traceID(r.Context()))
-	if err != nil {
-		writeBillingStoreError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"entitlement": entitlement, "restored": true})
-}
-
-func (a *API) createWebCheckout(w http.ResponseWriter, r *http.Request) {
-	// Checkout creation is intentionally provider-owned. Until a signed Web
-	// provider is configured, fail closed rather than returning a client-owned
-	// session or accepting a forged plan/quota claim.
-	writeError(w, r, http.StatusServiceUnavailable, "BILLING_UNAVAILABLE", billing.ErrUnavailable)
-}
-
-func validatePurchaseRequest(input purchaseRequest) error {
-	if len(strings.TrimSpace(input.ProductID)) < 1 || len(strings.TrimSpace(input.ProductID)) > 256 || len(strings.TrimSpace(input.PurchaseToken)) < 1 || len(input.PurchaseToken) > 4096 {
-		return errors.New("invalid purchase fields")
-	}
-	return nil
-}
-
-func writeBillingProviderError(w http.ResponseWriter, r *http.Request, err error) {
-	switch {
-	case errors.Is(err, billing.ErrUnavailable):
-		writeError(w, r, http.StatusServiceUnavailable, "BILLING_UNAVAILABLE", err)
-	case errors.Is(err, billing.ErrInvalid), errors.Is(err, billing.ErrNotFound):
-		writeError(w, r, http.StatusUnprocessableEntity, "PURCHASE_NOT_VERIFIED", err)
-	default:
-		writeError(w, r, http.StatusBadGateway, "BILLING_PROVIDER_ERROR", err)
-	}
-}
-
-func writeBillingStoreError(w http.ResponseWriter, r *http.Request, err error) {
-	switch {
-	case errors.Is(err, store.ErrNotFound):
-		writeError(w, r, http.StatusUnprocessableEntity, "UNKNOWN_PRODUCT", err)
-	case errors.Is(err, store.ErrConflict):
-		writeError(w, r, http.StatusConflict, "PURCHASE_CONFLICT", err)
-	case errors.Is(err, store.ErrDenied):
-		writeError(w, r, http.StatusForbidden, "PURCHASE_DENIED", err)
-	default:
-		writeStoreError(w, r, err)
-	}
-}
-
-type planDraftRequest struct {
-	PlanID           string          `json:"plan_id"`
-	PlanKey          string          `json:"plan_key"`
-	DisplayName      string          `json:"display_name"`
-	Description      string          `json:"description"`
-	BillingPeriod    string          `json:"billing_period"`
-	MaxRemotePCs     int             `json:"max_remote_pcs"`
-	MaxLiveSessions  int             `json:"max_live_sessions"`
-	FeatureFlags     json.RawMessage `json:"feature_flags"`
-	ChannelProducts  json.RawMessage `json:"channel_products"`
-	SortOrder        int             `json:"sort_order"`
-	VisiblePlatforms []string        `json:"visible_platforms"`
-	AvailableFrom    *time.Time      `json:"available_from"`
-	AvailableUntil   *time.Time      `json:"available_until"`
-	FallbackPlanKey  string          `json:"fallback_plan_key"`
-	PriceMinor       int64           `json:"price_minor"`
-	Currency         string          `json:"currency"`
-}
-
-func (a *API) requireAdmin(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {
-	p := principal(r)
-	repository := a.securityStore()
-	if repository == nil {
-		writeError(w, r, http.StatusServiceUnavailable, "COMMERCE_UNAVAILABLE", errors.New("commerce store is unavailable"))
-		return auth.Principal{}, false
-	}
-	admin, err := repository.IsAdmin(r.Context(), p.UserID)
-	if err != nil || !admin {
-		_ = repository.Audit(r.Context(), p.UserID, p.Device.ID, "billing.admin.denied", "catalog", uuid.Nil, "DENIED", traceID(r.Context()), "{}")
-		writeError(w, r, http.StatusForbidden, "ADMIN_REQUIRED", store.ErrDenied)
-		return auth.Principal{}, false
-	}
-	return p, true
-}
-
-func (a *API) createPlanDraft(w http.ResponseWriter, r *http.Request) {
-	p, ok := a.requireAdmin(w, r)
-	if !ok {
-		return
-	}
-	var input planDraftRequest
-	if err := decodeJSON(r, &input); err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err)
-		return
-	}
-	plan, err := a.Store.CreatePlanDraft(r.Context(), p.UserID, p.Device.ID, input.storeInput(), traceID(r.Context()))
-	if err != nil {
-		writeStoreError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, plan)
-}
-
-func (a *API) updatePlanDraft(w http.ResponseWriter, r *http.Request) {
-	p, ok := a.requireAdmin(w, r)
-	if !ok {
-		return
-	}
-	planID, err := uuid.Parse(r.PathValue("id"))
-	if err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_PLAN_ID", err)
-		return
-	}
-	var input planDraftRequest
-	if err := decodeJSON(r, &input); err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err)
-		return
-	}
-	plan, err := a.Store.UpdatePlanDraft(r.Context(), p.UserID, p.Device.ID, planID, input.storeInput(), traceID(r.Context()))
-	if err != nil {
-		writeStoreError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, plan)
-}
-
-func (a *API) publishCatalog(w http.ResponseWriter, r *http.Request) {
-	p, ok := a.requireAdmin(w, r)
-	if !ok {
-		return
-	}
-	if !a.requireRecentStepUp(w, r, p.UserID) {
-		return
-	}
-	version, err := a.Store.PublishCatalog(r.Context(), p.UserID, p.Device.ID, traceID(r.Context()))
-	if err != nil {
-		writeStoreError(w, r, err)
-		return
-	}
-	a.auditCommerceOperationSuccess(r, p.UserID, "billing.catalog.publish.context", "catalog", uuid.Nil)
-	writeJSON(w, http.StatusOK, map[string]any{"catalog_version": version, "published": true})
-}
-
-func (input planDraftRequest) storeInput() store.PlanDraftInput {
-	planKey := strings.TrimSpace(input.PlanKey)
-	if strings.TrimSpace(input.PlanID) != "" {
-		planKey = strings.TrimSpace(input.PlanID)
-	}
-	period := strings.ToUpper(strings.TrimSpace(input.BillingPeriod))
-	if period == "MONTH" {
-		period = "MONTHLY"
-	} else if period == "YEAR" {
-		period = "YEARLY"
-	}
-	flags := input.FeatureFlags
-	if len(flags) == 0 {
-		flags = json.RawMessage(`{}`)
-	}
-	products := input.ChannelProducts
-	if len(products) == 0 {
-		products = json.RawMessage(`{}`)
-	}
-	platforms := input.VisiblePlatforms
-	if len(platforms) == 0 {
-		platforms = []string{"ANDROID", "WEB"}
-	}
-	return store.PlanDraftInput{PlanKey: planKey, DisplayName: input.DisplayName, Description: input.Description, BillingPeriod: period,
-		MaxRemotePCs: input.MaxRemotePCs, MaxLiveSessions: input.MaxLiveSessions, FeatureFlags: flags, ChannelProducts: products,
-		SortOrder: input.SortOrder, VisiblePlatforms: platforms, AvailableFrom: input.AvailableFrom, AvailableUntil: input.AvailableUntil, FallbackPlanKey: input.FallbackPlanKey,
-		PriceMinor: input.PriceMinor, Currency: input.Currency}
+	// Entitlements are no longer a server feature. This unlimited projection is
+	// retained only so released Android clients continue to refresh normally.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"plan_key": "community", "catalog_version": 1,
+		"max_remote_pcs": -1, "max_live_sessions": -1,
+		"feature_flags": map[string]any{}, "version": 1,
+		"effective_at": time.Unix(0, 0).UTC(), "expires_at": nil,
+	})
 }
 
 func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {
@@ -2795,8 +2497,6 @@ func writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, r, 409, "CONFLICT", err)
 	case errors.Is(err, store.ErrDenied):
 		writeError(w, r, 403, "FORBIDDEN", err)
-	case errors.Is(err, store.ErrEntitlement):
-		writeError(w, r, 409, "ENTITLEMENT_LIMIT_REACHED", err)
 	default:
 		logAPIFailure(r.Context(), slog.LevelError, "API storage operation failed", "storage_operation_failed", err)
 		writeError(w, r, 500, "INTERNAL", err)
@@ -2893,7 +2593,7 @@ func idempotencyRequestDigest(r *http.Request, body []byte) [32]byte {
 	material = append(material, r.URL.RequestURI()...)
 	material = append(material, '\n')
 	material = append(material, body...)
-	if reason := strings.TrimSpace(r.Header.Get(commerceOperationReasonHeader)); reason != "" {
+	if reason := strings.TrimSpace(r.Header.Get(operationReasonHeader)); reason != "" {
 		material = append(material, "\noperation-reason:"...)
 		material = append(material, reason...)
 	}

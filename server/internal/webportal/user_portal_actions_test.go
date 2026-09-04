@@ -16,7 +16,7 @@ import (
 )
 
 type testUserPortalActionRepository struct {
-	*testCommerceAccountRepository
+	*testAccountPortalRepository
 	devices              []store.UserPortalDevice
 	pcs                  []store.UserPortalPC
 	sessions             []store.UserPortalSession
@@ -40,6 +40,30 @@ type testUserPortalActionRepository struct {
 	cancelledRequestID   uuid.UUID
 	storeIdempotencyKeys []string
 	auditCalls           []userPortalAuditCall
+}
+
+type testAccountPortalRepository struct {
+	*testPortalRepository
+}
+
+func (r *testAccountPortalRepository) GetUserPortalAccountOverview(_ context.Context, accountID uuid.UUID) (store.UserPortalAccountOverview, error) {
+	return store.UserPortalAccountOverview{ID: accountID, Role: r.account.Role, Status: r.account.Status}, nil
+}
+
+func (r *testAccountPortalRepository) ListUserPortalDevices(context.Context, uuid.UUID, store.UserPortalPageRequest) ([]store.UserPortalDevice, error) {
+	return nil, nil
+}
+
+func (r *testAccountPortalRepository) ListUserPortalPCs(context.Context, uuid.UUID, store.UserPortalPageRequest) ([]store.UserPortalPC, error) {
+	return nil, nil
+}
+
+func (r *testAccountPortalRepository) ListUserPortalSessions(context.Context, uuid.UUID, store.UserPortalPageRequest) ([]store.UserPortalSession, error) {
+	return nil, nil
+}
+
+func (r *testAccountPortalRepository) ListUserPortalSecurityActivity(context.Context, uuid.UUID, store.UserPortalAuditPageRequest) ([]store.UserPortalSecurityActivity, error) {
+	return nil, nil
 }
 
 type userPortalAuditCall struct {
@@ -80,11 +104,11 @@ func (d *testWebPrivacyExportDownloader) Download(_ context.Context, accountID, 
 func newTestUserPortalActionRepository(now time.Time) *testUserPortalActionRepository {
 	base := newTestPortalRepository()
 	base.account.Role = store.RoleUser
-	commerce := &testCommerceAccountRepository{testPortalRepository: base}
+	accountPortal := &testAccountPortalRepository{testPortalRepository: base}
 	pcID := uuid.MustParse("77777777-7777-4777-8777-777777777777")
 	sessionID := uuid.MustParse("88888888-8888-4888-8888-888888888888")
 	return &testUserPortalActionRepository{
-		testCommerceAccountRepository: commerce,
+		testAccountPortalRepository: accountPortal,
 		devices: []store.UserPortalDevice{{
 			ID: uuid.MustParse("66666666-6666-4666-8666-666666666666"), Type: "ANDROID", Name: "Pixel",
 			TrustState: "TRUSTED", Online: true, CreatedAt: now.Add(-24 * time.Hour),
@@ -127,18 +151,6 @@ func (r *testUserPortalActionRepository) ListUserPortalPCs(context.Context, uuid
 
 func (r *testUserPortalActionRepository) ListUserPortalSessions(context.Context, uuid.UUID, store.UserPortalPageRequest) ([]store.UserPortalSession, error) {
 	return append([]store.UserPortalSession(nil), r.sessions...), r.actionErr
-}
-
-func (r *testUserPortalActionRepository) PreviewRedemption(context.Context, uuid.UUID, [32]byte) (store.RedemptionPreview, error) {
-	return store.RedemptionPreview{}, r.actionErr
-}
-
-func (r *testUserPortalActionRepository) ListAccountRedemptions(context.Context, uuid.UUID, int) ([]store.AccountRedemption, error) {
-	return nil, r.actionErr
-}
-
-func (r *testUserPortalActionRepository) ListAccountRefunds(context.Context, uuid.UUID, int) ([]store.Refund, error) {
-	return nil, r.actionErr
 }
 
 func (r *testUserPortalActionRepository) RevokeUserPortalDevice(_ context.Context, accountID, deviceID uuid.UUID, key, _ string) (store.UserPortalActionResult, error) {
@@ -226,7 +238,7 @@ func TestUserPortalPagesRenderScopedSensitiveActionsAndPrivacyStates(t *testing.
 	portal.config.DataExportDownloader = &testWebPrivacyExportDownloader{body: []byte(`{"account":{"status":"ACTIVE"}}`)}
 	binder := &testWebAccountDeletionBinder{repository: repository}
 	portal.config.AccountDeletionBinder = binder
-	cookie := commerceSessionCookie(t, portal, store.RoleUser, "user-page-csrf", time.Hour)
+	cookie := portalSessionCookie(t, portal, store.RoleUser, "user-page-csrf", time.Hour)
 
 	for _, fixture := range []struct {
 		target   string
@@ -259,10 +271,10 @@ func TestUserPortalDevicePolicyAndHistoryActionsRequireStrongOwnerContext(t *tes
 	repository := newTestUserPortalActionRepository(portal.now())
 	portal.config.Repository = repository
 	portal.config.DataExportDownloader = &testWebPrivacyExportDownloader{body: []byte(`{"account":{"status":"ACTIVE"}}`)}
-	cookie := commerceSessionCookie(t, portal, store.RoleUser, "user-action-csrf", time.Minute)
+	cookie := portalSessionCookie(t, portal, store.RoleUser, "user-action-csrf", time.Minute)
 
 	deviceID := repository.devices[0].ID
-	revoke := performCommerceForm(portal.Handler(), "/account/devices/"+deviceID.String()+"/revoke", url.Values{
+	revoke := performPortalForm(portal.Handler(), "/account/devices/"+deviceID.String()+"/revoke", url.Values{
 		"csrf": {"user-action-csrf"}, "reason": {"手机已经丢失"}, "idempotency_key": {"user-device-revoke-0001"},
 	}, cookie)
 	if revoke.Code != http.StatusSeeOther || repository.revokeAccountID != repository.account.ID || repository.revokedDeviceID != deviceID {
@@ -279,7 +291,7 @@ func TestUserPortalDevicePolicyAndHistoryActionsRequireStrongOwnerContext(t *tes
 	}
 
 	pcID := repository.policies[0].PCID
-	policy := performCommerceForm(portal.Handler(), "/account/pcs/"+pcID.String()+"/control-policy", url.Values{
+	policy := performPortalForm(portal.Handler(), "/account/pcs/"+pcID.String()+"/control-policy", url.Values{
 		"csrf": {"user-action-csrf"}, "reason": {"开启远程协同排障"}, "idempotency_key": {"user-pc-policy-0001"},
 		"remote_routing_enabled": {"true"}, "mode": {"COLLABORATIVE"}, "local_priority": {"true"}, "expected_version": {"4"},
 	}, cookie)
@@ -289,15 +301,15 @@ func TestUserPortalDevicePolicyAndHistoryActionsRequireStrongOwnerContext(t *tes
 	}
 
 	sessionID := repository.sessions[0].ID
-	history := performCommerceForm(portal.Handler(), "/account/sessions/"+sessionID.String()+"/history/delete", url.Values{
+	history := performPortalForm(portal.Handler(), "/account/sessions/"+sessionID.String()+"/history/delete", url.Values{
 		"csrf": {"user-action-csrf"}, "reason": {"清理已退出会话记录"}, "idempotency_key": {"user-history-delete-0001"},
 	}, cookie)
 	if history.Code != http.StatusSeeOther || repository.historyAccountID != repository.account.ID || repository.historySessionID != sessionID {
 		t.Fatalf("history response=%d account=%s session=%s", history.Code, repository.historyAccountID, repository.historySessionID)
 	}
 
-	stale := commerceSessionCookie(t, portal, store.RoleUser, "user-action-csrf", sensitiveActionTTL+time.Second)
-	denied := performCommerceForm(portal.Handler(), "/account/devices/"+deviceID.String()+"/revoke", url.Values{
+	stale := portalSessionCookie(t, portal, store.RoleUser, "user-action-csrf", sensitiveActionTTL+time.Second)
+	denied := performPortalForm(portal.Handler(), "/account/devices/"+deviceID.String()+"/revoke", url.Values{
 		"csrf": {"user-action-csrf"}, "reason": {"再次撤销设备"}, "idempotency_key": {"user-device-revoke-0002"},
 	}, stale)
 	if denied.Code != http.StatusForbidden || len(repository.storeIdempotencyKeys) != 3 {
@@ -311,9 +323,9 @@ func TestUserPortalReadyExportDownloadsThroughAccountScopedAuditedProxy(t *testi
 	downloader := &testWebPrivacyExportDownloader{body: []byte(`{"account":{"status":"ACTIVE"},"devices":[]}`)}
 	portal.config.Repository = repository
 	portal.config.DataExportDownloader = downloader
-	cookie := commerceSessionCookie(t, portal, store.RoleUser, "download-csrf", time.Minute)
+	cookie := portalSessionCookie(t, portal, store.RoleUser, "download-csrf", time.Minute)
 
-	response := performCommerceForm(portal.Handler(), "/account/privacy/exports/"+repository.export.ID.String()+"/download", url.Values{
+	response := performPortalForm(portal.Handler(), "/account/privacy/exports/"+repository.export.ID.String()+"/download", url.Values{
 		"csrf": {"download-csrf"}, "reason": {"下载我的账号数据备份"}, "idempotency_key": {"privacy-export-download-0001"},
 	}, cookie)
 	if response.Code != http.StatusOK || response.Body.String() != string(downloader.body) {
@@ -343,8 +355,8 @@ func TestUserPortalExportRequestWithoutDownloaderDoesNotCreateTask(t *testing.T)
 	portal := newTestPortal(t, &testOIDCFlow{})
 	repository := newTestUserPortalActionRepository(portal.now())
 	portal.config.Repository = repository
-	cookie := commerceSessionCookie(t, portal, store.RoleUser, "privacy-csrf", time.Minute)
-	response := performCommerceForm(portal.Handler(), "/account/privacy/exports", url.Values{
+	cookie := portalSessionCookie(t, portal, store.RoleUser, "privacy-csrf", time.Minute)
+	response := performPortalForm(portal.Handler(), "/account/privacy/exports", url.Values{
 		"csrf": {"privacy-csrf"}, "reason": {"导出我的账号元数据"}, "idempotency_key": {"privacy-export-unavailable"},
 	}, cookie)
 	if response.Code != http.StatusServiceUnavailable || repository.exportAccountID != uuid.Nil || len(repository.storeIdempotencyKeys) != 0 {
@@ -359,33 +371,33 @@ func TestUserPortalPrivacyWorkflowKeepsPendingAndUsesServerCoolingPolicy(t *test
 	portal.config.DataExportDownloader = &testWebPrivacyExportDownloader{body: []byte(`{"account":{"status":"ACTIVE"}}`)}
 	binder := &testWebAccountDeletionBinder{repository: repository}
 	portal.config.AccountDeletionBinder = binder
-	cookie := commerceSessionCookie(t, portal, store.RoleUser, "privacy-csrf", time.Minute)
+	cookie := portalSessionCookie(t, portal, store.RoleUser, "privacy-csrf", time.Minute)
 
-	exportResponse := performCommerceForm(portal.Handler(), "/account/privacy/exports", url.Values{
+	exportResponse := performPortalForm(portal.Handler(), "/account/privacy/exports", url.Values{
 		"csrf": {"privacy-csrf"}, "reason": {"导出我的账号元数据"}, "idempotency_key": {"privacy-export-0001"},
 	}, cookie)
 	if exportResponse.Code != http.StatusSeeOther || !strings.Contains(exportResponse.Header().Get("Location"), "export_id="+repository.export.ID.String()) || repository.exportAccountID != repository.account.ID {
 		t.Fatalf("export response=%d location=%q account=%s", exportResponse.Code, exportResponse.Header().Get("Location"), repository.exportAccountID)
 	}
 
-	wrongConfirmation := performCommerceForm(portal.Handler(), "/account/privacy/deletions", url.Values{
+	wrongConfirmation := performPortalForm(portal.Handler(), "/account/privacy/deletions", url.Values{
 		"csrf": {"privacy-csrf"}, "reason": {"准备注销账号"}, "idempotency_key": {"privacy-delete-incorrect"}, "confirmation": {"删除"},
 	}, cookie)
 	if wrongConfirmation.Code != http.StatusBadRequest || repository.deletionAccountID != uuid.Nil {
 		t.Fatalf("wrong confirmation status=%d account=%s", wrongConfirmation.Code, repository.deletionAccountID)
 	}
 
-	requestResponse := performCommerceForm(portal.Handler(), "/account/privacy/deletions", url.Values{
+	requestResponse := performPortalForm(portal.Handler(), "/account/privacy/deletions", url.Values{
 		"csrf": {"privacy-csrf"}, "reason": {"不再使用此服务"}, "idempotency_key": {"privacy-delete-request-0001"}, "confirmation": {userPortalDeletionConfirmation},
 	}, cookie)
 	if requestResponse.Code != http.StatusSeeOther || repository.deletionAccountID != repository.account.ID || !strings.Contains(requestResponse.Header().Get("Location"), "deletion_id="+repository.deletion.ID.String()) {
 		t.Fatalf("deletion request response=%d account=%s location=%q", requestResponse.Code, repository.deletionAccountID, requestResponse.Header().Get("Location"))
 	}
-	if binder.calls != 1 || binder.subject != "commerce-subject" {
+	if binder.calls != 1 || binder.subject != "portal-subject" {
 		t.Fatalf("web deletion binder calls/subject=%d/%q", binder.calls, binder.subject)
 	}
 
-	confirmResponse := performCommerceForm(portal.Handler(), "/account/privacy/deletions/"+repository.deletion.ID.String()+"/confirm", url.Values{
+	confirmResponse := performPortalForm(portal.Handler(), "/account/privacy/deletions/"+repository.deletion.ID.String()+"/confirm", url.Values{
 		"csrf": {"privacy-csrf"}, "reason": {"确认进入冷静期"}, "idempotency_key": {"privacy-delete-confirm-0001"}, "confirmation": {userPortalDeletionConfirmation},
 	}, cookie)
 	wantScheduled := repository.deletion.RequestedAt.UTC().Add(userPortalDeletionCoolingPeriod)
@@ -394,7 +406,7 @@ func TestUserPortalPrivacyWorkflowKeepsPendingAndUsesServerCoolingPolicy(t *test
 		t.Fatalf("confirm response=%d scheduled=%s retention=%s", confirmResponse.Code, repository.confirmedScheduled, repository.confirmedRetention)
 	}
 
-	cancelResponse := performCommerceForm(portal.Handler(), "/account/privacy/deletions/"+repository.deletion.ID.String()+"/cancel", url.Values{
+	cancelResponse := performPortalForm(portal.Handler(), "/account/privacy/deletions/"+repository.deletion.ID.String()+"/cancel", url.Values{
 		"csrf": {"privacy-csrf"}, "reason": {"决定保留账号"}, "idempotency_key": {"privacy-delete-cancel-0001"},
 	}, cookie)
 	if cancelResponse.Code != http.StatusSeeOther || repository.cancelledRequestID != repository.deletion.ID {
@@ -419,8 +431,8 @@ func TestWebAccountDeletionRequestFailsClosedWithoutIdentityBinding(t *testing.T
 			repository := newTestUserPortalActionRepository(portal.now())
 			portal.config.Repository = repository
 			portal.config.AccountDeletionBinder = binder
-			cookie := commerceSessionCookie(t, portal, store.RoleUser, "privacy-csrf", time.Minute)
-			response := performCommerceForm(portal.Handler(), "/account/privacy/deletions", url.Values{
+			cookie := portalSessionCookie(t, portal, store.RoleUser, "privacy-csrf", time.Minute)
+			response := performPortalForm(portal.Handler(), "/account/privacy/deletions", url.Values{
 				"csrf": {"privacy-csrf"}, "reason": {"不再使用此服务"},
 				"idempotency_key": {"privacy-delete-request-0001"},
 				"confirmation":    {userPortalDeletionConfirmation},
@@ -462,15 +474,15 @@ func TestUserPortalActionErrorsRemainNonOracular(t *testing.T) {
 	repository := newTestUserPortalActionRepository(portal.now())
 	repository.actionErr = store.ErrDenied
 	portal.config.Repository = repository
-	cookie := commerceSessionCookie(t, portal, store.RoleUser, "oracle-csrf", time.Minute)
-	response := performCommerceForm(portal.Handler(), "/account/devices/"+repository.devices[0].ID.String()+"/revoke", url.Values{
+	cookie := portalSessionCookie(t, portal, store.RoleUser, "oracle-csrf", time.Minute)
+	response := performPortalForm(portal.Handler(), "/account/devices/"+repository.devices[0].ID.String()+"/revoke", url.Values{
 		"csrf": {"oracle-csrf"}, "reason": {"撤销未知设备"}, "idempotency_key": {"oracle-device-0001"},
 	}, cookie)
 	if response.Code != http.StatusNotFound || strings.Contains(response.Body.String(), repository.devices[0].ID.String()) || !strings.Contains(response.Body.String(), "不存在、已变化或不属于当前账号") {
 		t.Fatalf("oracle response=%d body=%q", response.Code, response.Body.String())
 	}
 	repository.actionErr = store.ErrSessionActive
-	response = performCommerceForm(portal.Handler(), "/account/sessions/"+repository.sessions[0].ID.String()+"/history/delete", url.Values{
+	response = performPortalForm(portal.Handler(), "/account/sessions/"+repository.sessions[0].ID.String()+"/history/delete", url.Values{
 		"csrf": {"oracle-csrf"}, "reason": {"尝试删除活动会话"}, "idempotency_key": {"oracle-history-0001"},
 	}, cookie)
 	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "会话仍在运行") {

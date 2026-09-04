@@ -27,8 +27,7 @@ func TestUserPortalActionDTOsAreMinimal(t *testing.T) {
 	assertUserPortalActionFields(t, UserPortalPCControlPolicy{}, "PCID", "Name", "RemoteRoutingEnabled", "Mode", "LocalPriority", "PolicyVersion")
 	assertUserPortalActionFields(t, UserPortalDataExport{}, "ID", "Status", "RequestedAt", "ExpiresAt")
 	assertUserPortalActionFields(t, UserPortalAccountDeletionPreflight{},
-		"AccountID", "Status", "ActiveDevices", "LiveSessions", "OpenOrders",
-		"PendingRefunds", "ActiveSubscriptions", "Ready", "RequestSupported")
+		"AccountID", "Status", "ActiveDevices", "LiveSessions", "Ready", "RequestSupported")
 }
 
 func TestUserPortalActionSQLIsAccountScoped(t *testing.T) {
@@ -48,7 +47,7 @@ func TestUserPortalActionSQLIsAccountScoped(t *testing.T) {
 		"policy lookup":    {userPortalPCLookupSQL, "owner_user_id=$2"},
 		"policy update":    {userPortalPCPolicyUpdateSQL, "owner_user_id=$2"},
 		"history lookup":   {userPortalHistorySessionLookupSQL, "owner_user_id=$2"},
-		"delete preflight": {userPortalAccountDeletionPreflightSQL, "account_id=account.id"},
+		"delete preflight": {userPortalAccountDeletionPreflightSQL, "account.id=$1"},
 	} {
 		contract := contract
 		t.Run(name, func(t *testing.T) {

@@ -64,7 +64,7 @@ func TestPortalAnnouncementManagementRendersEscapedPlainTextAndMutatesSafely(t *
 		"title": {"服务维护"}, "body": {"今晚进行例行维护"}, "severity": {store.AnnouncementInfo},
 		"starts_at": {"2026-08-28T01:00"}, "ends_at": {"2026-08-28T02:00"}, "reason": {"发布维护提醒"},
 	}
-	response := performCommerceForm(portal.Handler(), "/admin/announcements", values, cookie)
+	response := performPortalForm(portal.Handler(), "/admin/announcements", values, cookie)
 	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/admin?section=announcements&notice=announcement-created" {
 		t.Fatalf("announcement create status=%d location=%q body=%q", response.Code, response.Header().Get("Location"), response.Body.String())
 	}

@@ -312,12 +312,12 @@
       },
       "targets": [
         {
-          "expr": "sum by (operation, result) (rate(termlink_commerce_http_operations_total[5m]))",
+          "expr": "sum by (operation, result) (rate(termlink_registration_http_operations_total[5m]))",
           "legendFormat": "{{operation}} / {{result}}",
           "refId": "A"
         }
       ],
-      "title": "Commerce operation rate",
+      "title": "Registration operation rate",
       "type": "timeseries"
     },
     {
@@ -352,130 +352,12 @@
       },
       "targets": [
         {
-          "expr": "sum by (operation) (rate(termlink_commerce_http_operations_total{result=\"error\"}[10m])) / clamp_min(sum by (operation) (rate(termlink_commerce_http_operations_total[10m])), 0.001)",
+          "expr": "sum by (operation) (rate(termlink_registration_http_operations_total{result=\"error\"}[10m])) / clamp_min(sum by (operation) (rate(termlink_registration_http_operations_total[10m])), 0.001)",
           "legendFormat": "{{operation}}",
           "refId": "A"
         }
       ],
-      "title": "Commerce server-error ratio",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "termlink-prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "min": 0
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 40
-      },
-      "id": 10,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "expr": "termlink_commerce_workflow_items > 0",
-          "legendFormat": "{{workflow}} / {{state}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Commerce workflow state",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "termlink-prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "min": 0
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 40
-      },
-      "id": 11,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "expr": "termlink_commerce_consistency_issues",
-          "legendFormat": "{{check}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Commerce consistency issues",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "termlink-prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "min": 0,
-          "max": 1
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 6,
-        "w": 24,
-        "x": 0,
-        "y": 48
-      },
-      "id": 12,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "expr": "termlink_commerce_snapshot_up",
-          "legendFormat": "commerce snapshot",
-          "refId": "A"
-        }
-      ],
-      "title": "Commerce snapshot health",
+      "title": "Registration server-error ratio",
       "type": "timeseries"
     }
   ],

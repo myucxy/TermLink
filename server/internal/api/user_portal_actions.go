@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -110,14 +112,13 @@ func (h userPortalActionHandlers) sensitiveActor(w http.ResponseWriter, r *http.
 	if !ok {
 		return uuid.Nil, "", false
 	}
-	key, err := commerceIdempotencyKey(r)
+	key, err := requestIdempotencyKey(r)
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "IDEMPOTENCY_KEY_REQUIRED", err)
 		return uuid.Nil, "", false
 	}
-	// This is the existing recent-MFA and bounded operation-reason boundary.
-	// Unlike requireCommerceStepUp, it intentionally performs no administrator
-	// role check: these actions belong to the authenticated account owner.
+	// These actions require recent MFA but no administrator role because they
+	// belong to the authenticated account owner.
 	if !h.api.requireRecentStepUp(w, r, accountID) {
 		return uuid.Nil, "", false
 	}
@@ -138,7 +139,7 @@ func (h userPortalActionHandlers) revokeDevice(w http.ResponseWriter, r *http.Re
 		writeUserPortalError(w, r, err)
 		return
 	}
-	h.api.auditCommerceOperationSuccess(r, accountID, "user_portal.device.revoke.context", "device", deviceID)
+	h.api.auditOperationSuccess(r, accountID, "user_portal.device.revoke.context", "device", deviceID)
 	writeJSON(w, http.StatusOK, map[string]any{"changed": result.Changed})
 }
 
@@ -187,7 +188,7 @@ func (h userPortalActionHandlers) setPCRemoteRouting(w http.ResponseWriter, r *h
 		writeUserPortalError(w, r, err)
 		return
 	}
-	h.api.auditCommerceOperationSuccess(r, accountID, "user_portal.pc.remote_routing.update.context", "pc", pcID)
+	h.api.auditOperationSuccess(r, accountID, "user_portal.pc.remote_routing.update.context", "pc", pcID)
 	writeJSON(w, http.StatusOK, map[string]any{"policy": userPortalPCControlPolicyView(policy)})
 }
 
@@ -223,7 +224,7 @@ func (h userPortalActionHandlers) setPCControlPolicy(w http.ResponseWriter, r *h
 		writeUserPortalError(w, r, err)
 		return
 	}
-	h.api.auditCommerceOperationSuccess(r, accountID, "user_portal.pc.control_policy.update.context", "pc", pcID)
+	h.api.auditOperationSuccess(r, accountID, "user_portal.pc.control_policy.update.context", "pc", pcID)
 	writeJSON(w, http.StatusOK, map[string]any{"policy": userPortalPCControlPolicyView(policy)})
 }
 
@@ -241,7 +242,7 @@ func (h userPortalActionHandlers) requestHistoryDeletion(w http.ResponseWriter, 
 		writeUserPortalError(w, r, err)
 		return
 	}
-	h.api.auditCommerceOperationSuccess(r, accountID, "user_portal.history.delete.context", "session", sessionID)
+	h.api.auditOperationSuccess(r, accountID, "user_portal.history.delete.context", "session", sessionID)
 	writeJSON(w, http.StatusOK, map[string]any{"changed": result.Changed})
 }
 
@@ -265,7 +266,7 @@ func (h userPortalActionHandlers) requestDataExport(w http.ResponseWriter, r *ht
 		writeUserPortalError(w, r, err)
 		return
 	}
-	h.api.auditCommerceOperationSuccess(r, accountID, "user_portal.data_export.request.context", "data_export", export.ID)
+	h.api.auditOperationSuccess(r, accountID, "user_portal.data_export.request.context", "data_export", export.ID)
 	writeJSON(w, http.StatusAccepted, map[string]any{"export": userPortalDataExportView(export)})
 }
 
@@ -321,7 +322,7 @@ func (h userPortalActionHandlers) requestAccountDeletion(w http.ResponseWriter, 
 		}
 		return
 	}
-	h.api.auditCommerceOperationSuccess(r, accountID, "user_portal.account_deletion.request.context", "account_deletion", deletion.ID)
+	h.api.auditOperationSuccess(r, accountID, "user_portal.account_deletion.request.context", "account_deletion", deletion.ID)
 	writeJSON(w, http.StatusAccepted, map[string]any{"deletion": userPortalAccountDeletionView(deletion)})
 }
 
@@ -356,12 +357,12 @@ func (h userPortalActionHandlers) cancelAccountDeletion(w http.ResponseWriter, r
 		writeUserPortalError(w, r, err)
 		return
 	}
-	h.api.auditCommerceOperationSuccess(r, accountID, "user_portal.account_deletion.cancel.context", "account_deletion", requestID)
+	h.api.auditOperationSuccess(r, accountID, "user_portal.account_deletion.cancel.context", "account_deletion", requestID)
 	writeJSON(w, http.StatusOK, map[string]any{"deletion": userPortalAccountDeletionView(deletion)})
 }
 
 func decodeEmptyUserPortalRequest(w http.ResponseWriter, r *http.Request) bool {
-	if err := decodeEmptyCommerceJSON(r); err != nil {
+	if err := decodeEmptyJSON(r); err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err)
 		return false
 	}
@@ -369,12 +370,37 @@ func decodeEmptyUserPortalRequest(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func userPortalPathUUID(w http.ResponseWriter, r *http.Request, name, errorCode string) (uuid.UUID, bool) {
-	id, err := commercePathUUID(r, name)
+	id, err := pathUUID(r, name)
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, errorCode, err)
 		return uuid.Nil, false
 	}
 	return id, true
+}
+
+func pathUUID(r *http.Request, name string) (uuid.UUID, error) {
+	value, err := uuid.Parse(r.PathValue(name))
+	if err != nil || value == uuid.Nil {
+		return uuid.Nil, errors.New("invalid UUID path value")
+	}
+	return value, nil
+}
+
+func decodeEmptyJSON(r *http.Request) error {
+	if r.Body == nil {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBody+1))
+	if err != nil || len(body) > maxJSONBody {
+		return errors.New("request body exceeds limit")
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil
+	}
+	clone := r.Clone(r.Context())
+	clone.Body = io.NopCloser(bytes.NewReader(body))
+	var input struct{}
+	return decodeJSON(clone, &input)
 }
 
 func userPortalLimit(r *http.Request) (int, error) {
@@ -433,9 +459,8 @@ func userPortalDataExportView(export store.UserPortalDataExport) map[string]any 
 func userPortalAccountDeletionPreflightView(preflight store.UserPortalAccountDeletionPreflight) map[string]any {
 	return map[string]any{
 		"status": preflight.Status, "active_devices": preflight.ActiveDevices,
-		"live_sessions": preflight.LiveSessions, "open_orders": preflight.OpenOrders,
-		"pending_refunds": preflight.PendingRefunds, "active_subscriptions": preflight.ActiveSubscriptions,
-		"ready": preflight.Ready, "request_supported": preflight.RequestSupported,
+		"live_sessions": preflight.LiveSessions,
+		"ready":         preflight.Ready, "request_supported": preflight.RequestSupported,
 	}
 }
 

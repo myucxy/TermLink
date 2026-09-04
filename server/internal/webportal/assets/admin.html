@@ -206,19 +206,6 @@
       </section>
       {{end}}
 
-      {{if eq .Section "billing"}}
-      <section class="admin-grid">
-        <article class="admin-panel"><div class="panel-heading"><div><p class="eyebrow">PUBLISHED CATALOG</p><h2>订阅目录</h2></div></div>
-          <div class="large-metric"><strong>{{.Dashboard.Plans}}</strong><span>套餐记录</span></div>
-          <p>套餐草稿、发布版本和渠道映射由受设备证明保护的管理 API 维护。客户端只读取已发布目录。</p>
-        </article>
-        <article class="admin-panel"><div class="panel-heading"><div><p class="eyebrow">ENTITLEMENTS</p><h2>有效订阅</h2></div></div>
-          <div class="large-metric"><strong>{{.Dashboard.ActiveSubscriptions}}</strong><span>ACTIVE / GRACE</span></div>
-          <p>会员到期只停止超出权益的远程能力；Windows 本地 Shell、密钥和已有加密历史不会被终止或删除。</p>
-        </article>
-      </section>
-      {{end}}
-
       {{if eq .Section "identity"}}
       <section class="admin-grid">
         <article class="admin-panel"><div class="panel-heading"><div><p class="eyebrow">OIDC AUTHORITY</p><h2>身份服务</h2></div></div>

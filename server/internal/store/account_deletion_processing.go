@@ -81,7 +81,10 @@ const userPortalAccountDeletionObjectsSQL = `
 	) objects
 	ORDER BY object_kind,object_key,source_id`
 
-var userPortalAccountDeletionRedactCommerceStatements = []string{
+// These statements are a retirement-only privacy boundary. They scrub or
+// remove account-linked rows left by releases that supported commercial
+// features; they do not expose or reactivate any commercial behavior.
+var userPortalAccountDeletionRedactLegacyCommercialStatements = []string{
 	`UPDATE orders SET idempotency_key='deleted-' || id::text,updated_at=now() WHERE account_id=$1`,
 	`UPDATE payment_transactions payment
 	 SET payment_payload='{}'::jsonb,updated_at=now()
@@ -213,7 +216,7 @@ func (s *Postgres) FinalizeUserPortalAccountDeletion(ctx context.Context, proces
 	if status != "LOCKED" || role != "USER" || isAdmin {
 		return ErrDenied
 	}
-	for _, statement := range userPortalAccountDeletionRedactCommerceStatements {
+	for _, statement := range userPortalAccountDeletionRedactLegacyCommercialStatements {
 		if _, err := tx.Exec(ctx, statement, accountID); err != nil {
 			return err
 		}

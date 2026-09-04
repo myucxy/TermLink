@@ -53,15 +53,12 @@ type UserPortalDataExport struct {
 }
 
 type UserPortalAccountDeletionPreflight struct {
-	AccountID           uuid.UUID `json:"account_id"`
-	Status              string    `json:"status"`
-	ActiveDevices       int       `json:"active_devices"`
-	LiveSessions        int       `json:"live_sessions"`
-	OpenOrders          int       `json:"open_orders"`
-	PendingRefunds      int       `json:"pending_refunds"`
-	ActiveSubscriptions int       `json:"active_subscriptions"`
-	Ready               bool      `json:"ready"`
-	RequestSupported    bool      `json:"request_supported"`
+	AccountID        uuid.UUID `json:"account_id"`
+	Status           string    `json:"status"`
+	ActiveDevices    int       `json:"active_devices"`
+	LiveSessions     int       `json:"live_sessions"`
+	Ready            bool      `json:"ready"`
+	RequestSupported bool      `json:"request_supported"`
 }
 
 const userPortalActionAccountSQL = `
@@ -178,12 +175,7 @@ const userPortalAccountDeletionPreflightSQL = `
 	SELECT account.id,account.status,
 	       (SELECT count(*) FROM devices WHERE user_id=account.id AND trust_state<>'REVOKED'),
 	       (SELECT count(*) FROM sessions session JOIN pcs pc ON pc.id=session.pc_id
-	         WHERE pc.owner_user_id=account.id AND session.state IN ('RUNNING','INTERRUPTED')),
-	       (SELECT count(*) FROM orders WHERE account_id=account.id
-	         AND status IN ('CREATED','PENDING_PAYMENT','PAID','FULFILLING','REFUNDING')),
-	       (SELECT count(*) FROM refunds refund JOIN orders orders_for_refund ON orders_for_refund.id=refund.order_id
-	         WHERE orders_for_refund.account_id=account.id AND refund.status IN ('APPROVAL_PENDING','CREATED','PENDING')),
-	       (SELECT count(*) FROM subscriptions WHERE account_id=account.id AND status IN ('ACTIVE','GRACE'))
+	         WHERE pc.owner_user_id=account.id AND session.state IN ('RUNNING','INTERRUPTED'))
 	FROM users account
 	WHERE account.id=$1 AND account.status='ACTIVE'`
 
@@ -477,7 +469,6 @@ func (s *Postgres) GetUserPortalAccountDeletionPreflight(ctx context.Context, ac
 	var result UserPortalAccountDeletionPreflight
 	err := s.Pool.QueryRow(ctx, userPortalAccountDeletionPreflightSQL, accountID).Scan(
 		&result.AccountID, &result.Status, &result.ActiveDevices, &result.LiveSessions,
-		&result.OpenOrders, &result.PendingRefunds, &result.ActiveSubscriptions,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return UserPortalAccountDeletionPreflight{}, ErrDenied
@@ -485,7 +476,7 @@ func (s *Postgres) GetUserPortalAccountDeletionPreflight(ctx context.Context, ac
 	if err != nil {
 		return UserPortalAccountDeletionPreflight{}, err
 	}
-	result.Ready = result.LiveSessions == 0 && result.OpenOrders == 0 && result.PendingRefunds == 0 && result.ActiveSubscriptions == 0
+	result.Ready = result.LiveSessions == 0
 	result.RequestSupported = true
 	return result, nil
 }

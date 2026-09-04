@@ -14,11 +14,11 @@ import (
 )
 
 func (p *Portal) accountUpdateNickname(w http.ResponseWriter, r *http.Request) {
-	session, account, ok := p.requireCommerceAccountAction(w, r)
+	session, account, ok := p.requireAccountAction(w, r)
 	if !ok {
 		return
 	}
-	if err := validateCommerceFormValues(r.Form, map[string]bool{"csrf": true, "nickname": true}); err != nil {
+	if err := validatePortalFormValues(r.Form, map[string]bool{"csrf": true, "nickname": true}); err != nil {
 		p.renderError(w, http.StatusBadRequest, "昵称请求无效", "请刷新个人设置后重试。")
 		return
 	}
@@ -50,11 +50,11 @@ func (p *Portal) accountUpdateNickname(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Portal) accountRequestEmailCode(w http.ResponseWriter, r *http.Request) {
-	session, account, ok := p.requireCommerceAccountAction(w, r)
+	session, account, ok := p.requireAccountAction(w, r)
 	if !ok {
 		return
 	}
-	if err := validateCommerceFormValues(r.Form, map[string]bool{"csrf": true, "new_email": true}); err != nil {
+	if err := validatePortalFormValues(r.Form, map[string]bool{"csrf": true, "new_email": true}); err != nil {
 		p.renderError(w, http.StatusBadRequest, "邮箱请求无效", "请刷新个人设置后重试。")
 		return
 	}
@@ -72,7 +72,7 @@ func (p *Portal) accountRequestEmailCode(w http.ResponseWriter, r *http.Request)
 		p.renderAccountEmailError(w, err)
 		return
 	}
-	data, err := p.loadCommerceUserSection(r.Context(), session, account, "settings", "验证码已经发送到新邮箱；完成验证前，当前邮箱和登录方式不会变化。")
+	data, err := p.loadUserPortalSection(r.Context(), session, account, "settings", "验证码已经发送到新邮箱；完成验证前，当前邮箱和登录方式不会变化。")
 	if err != nil {
 		p.internalError(w, err)
 		return
@@ -84,11 +84,11 @@ func (p *Portal) accountRequestEmailCode(w http.ResponseWriter, r *http.Request)
 }
 
 func (p *Portal) accountConfirmEmail(w http.ResponseWriter, r *http.Request) {
-	session, account, ok := p.requireCommerceAccountAction(w, r)
+	session, account, ok := p.requireAccountAction(w, r)
 	if !ok {
 		return
 	}
-	if err := validateCommerceFormValues(r.Form, map[string]bool{
+	if err := validatePortalFormValues(r.Form, map[string]bool{
 		"csrf": true, "new_email": true, "verification_id": true, "email_code": true,
 	}); err != nil {
 		p.renderError(w, http.StatusBadRequest, "邮箱验证无效", "请重新发送验证码后再试。")

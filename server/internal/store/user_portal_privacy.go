@@ -39,8 +39,8 @@ type UserPortalAccountDeletion struct {
 }
 
 const userPortalDataExportInsertSQL = `
-	INSERT INTO data_export_requests(id,account_id)
-	VALUES($1,$2)
+	INSERT INTO data_export_requests(id,account_id,scope)
+	VALUES($1,$2,ARRAY['ACCOUNT_PROFILE','DEVICE_METADATA','SESSION_METADATA']::text[])
 	ON CONFLICT (account_id) WHERE status IN ('REQUESTED','PROCESSING','READY') DO NOTHING
 	RETURNING id,status,requested_at,expires_at`
 
@@ -452,22 +452,14 @@ func (s *Postgres) CancelUserPortalAccountDeletion(ctx context.Context, accountI
 }
 
 func requireUserPortalDeletionReady(ctx context.Context, tx pgx.Tx, accountID uuid.UUID) error {
-	var liveSessions, openOrders, pendingRefunds, activeSubscriptions int
+	var liveSessions int
 	err := tx.QueryRow(ctx, `
-		SELECT
-		  (SELECT count(*) FROM sessions session JOIN pcs pc ON pc.id=session.pc_id
-		    WHERE pc.owner_user_id=$1 AND session.state IN ('RUNNING','INTERRUPTED')),
-		  (SELECT count(*) FROM orders WHERE account_id=$1
-		    AND status IN ('CREATED','PENDING_PAYMENT','PAID','FULFILLING','REFUNDING')),
-		  (SELECT count(*) FROM refunds refund JOIN orders orders_for_refund ON orders_for_refund.id=refund.order_id
-		    WHERE orders_for_refund.account_id=$1 AND refund.status IN ('APPROVAL_PENDING','CREATED','PENDING')),
-		  (SELECT count(*) FROM subscriptions WHERE account_id=$1 AND status IN ('ACTIVE','GRACE'))`, accountID).Scan(
-		&liveSessions, &openOrders, &pendingRefunds, &activeSubscriptions,
-	)
+		SELECT count(*) FROM sessions session JOIN pcs pc ON pc.id=session.pc_id
+		WHERE pc.owner_user_id=$1 AND session.state IN ('RUNNING','INTERRUPTED')`, accountID).Scan(&liveSessions)
 	if err != nil {
 		return err
 	}
-	if liveSessions != 0 || openOrders != 0 || pendingRefunds != 0 || activeSubscriptions != 0 {
+	if liveSessions != 0 {
 		return ErrConflict
 	}
 	return nil

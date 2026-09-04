@@ -63,3 +63,20 @@ func TestUserPortalExportSnapshotRejectsInvalidOrEmptyScopeBeforeDatabase(t *tes
 		}
 	}
 }
+
+func TestUserPortalExportSnapshotAcceptsAndIgnoresLegacyBillingScope(t *testing.T) {
+	selected, err := userPortalExportSelectedScopes([]string{"ACCOUNT_PROFILE", "BILLING_RECORDS"})
+	if err != nil {
+		t.Fatalf("legacy scope rejected: %v", err)
+	}
+	if !selected["ACCOUNT_PROFILE"] || selected["BILLING_RECORDS"] {
+		t.Fatalf("selected scopes = %#v, want account only", selected)
+	}
+	legacyOnly, err := userPortalExportSelectedScopes([]string{"BILLING_RECORDS"})
+	if err != nil || len(legacyOnly) != 0 {
+		t.Fatalf("legacy-only scope selection = %#v, %v; want empty successful selection", legacyOnly, err)
+	}
+	if _, err := userPortalExportSelectedScopes([]string{"BILLING_RECORDS", "UNKNOWN"}); !errors.Is(err, ErrDenied) {
+		t.Fatalf("unknown scope mixed with legacy scope error = %v, want ErrDenied", err)
+	}
+}

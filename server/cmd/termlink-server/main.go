@@ -26,8 +26,6 @@ import (
 	"github.com/termlink/termlink/server/internal/api"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/buildinfo"
-	"github.com/termlink/termlink/server/internal/commerce"
-	"github.com/termlink/termlink/server/internal/commercecleanup"
 	"github.com/termlink/termlink/server/internal/config"
 	"github.com/termlink/termlink/server/internal/fileoperationcleanup"
 	"github.com/termlink/termlink/server/internal/history"
@@ -38,7 +36,6 @@ import (
 	"github.com/termlink/termlink/server/internal/outbox"
 	"github.com/termlink/termlink/server/internal/privacyexport"
 	"github.com/termlink/termlink/server/internal/realtime"
-	"github.com/termlink/termlink/server/internal/reconciliation"
 	"github.com/termlink/termlink/server/internal/registrationrecovery"
 	serverruntime "github.com/termlink/termlink/server/internal/runtime"
 	"github.com/termlink/termlink/server/internal/serviceemail"
@@ -135,29 +132,15 @@ func runProduction() error {
 	subjectKey := deriveServerKey(keyMaster, "oidc-subject-hash")
 	tokenKey := deriveServerKey(keyMaster, "capability-token-signing")
 	cookieKey := deriveServerKey(keyMaster, "web-cookie-master")
-	commerceCodeKey := deriveServerKey(keyMaster, "commerce-code-digest")
-	commerceProviderKey := deriveServerKey(keyMaster, "commerce-provider-digest")
+	// Keep the established derivation label so previously issued invitation
+	// codes remain valid after the registration subsystem refactor.
+	registrationCodeKey := deriveServerKey(keyMaster, "commerce-code-digest")
 	registrationProofKey := deriveServerKey(keyMaster, "keycloak-registration-attempt-proof")
 	privacyExportKey := deriveServerKey(keyMaster, "privacy-export-artifact-encryption")
 	serviceEmailKey := deriveServerKey(keyMaster, "service-email-encryption-and-challenges")
 	adminRouteKey := deriveServerKey(keyMaster, "web-admin-route-encryption")
 	humanVerificationKey := deriveServerKey(keyMaster, "human-verification-settings-encryption")
 	directTransportKey := deriveServerKey(keyMaster, "direct-transport-ticket-ed25519")
-	gatewayResolver, err := commerce.NewChannelGatewayResolver(commerce.GatewayResolverConfig{
-		Repository: repository,
-		SecretRoot: cfg.PaymentSecretsDir,
-	})
-	if err != nil {
-		return fmt.Errorf("initialize payment gateway resolver: %w", err)
-	}
-	commerceService, err := commerce.NewService(commerce.Config{
-		Repository: repository,
-		Gateways:   gatewayResolver,
-		DigestKey:  commerceProviderKey,
-	})
-	if err != nil {
-		return fmt.Errorf("initialize commerce service: %w", err)
-	}
 	authentication := auth.Middleware{Tokens: verifier, Devices: repository, Nonces: valkey, SubjectKey: subjectKey}
 	var keycloakAdmin *auth.KeycloakAdminClient
 	if cfg.RegistrationRecoveryEnabled || cfg.AccountDeletionEnabled || !cfg.KeycloakAdminClientSecret.Empty() {
@@ -201,27 +184,6 @@ func runProduction() error {
 		if err != nil {
 			return fmt.Errorf("initialize registration recovery runner: %w", err)
 		}
-	}
-	reconciliationRepository, err := reconciliation.NewPostgresRepository(repository)
-	if err != nil {
-		return fmt.Errorf("initialize reconciliation repository: %w", err)
-	}
-	reconciliationProcessor, err := reconciliation.NewProcessor(reconciliationRepository, gatewayResolver, reconciliation.ProcessorOptions{
-		DigestKey: commerceProviderKey,
-	})
-	if err != nil {
-		return fmt.Errorf("initialize reconciliation processor: %w", err)
-	}
-	reconciliationRunner := reconciliation.NewRunner(reconciliationRepository, reconciliationProcessor, reconciliation.RunnerOptions{Logger: slog.Default()})
-	reconciliationOperationsRepository, err := reconciliation.NewPostgresOperationsRepository(repository)
-	if err != nil {
-		return fmt.Errorf("initialize reconciliation operations repository: %w", err)
-	}
-	reconciliationOperations, err := reconciliation.NewOperations(reconciliationOperationsRepository, reconciliation.OperationsOptions{
-		DigestKey: commerceProviderKey,
-	})
-	if err != nil {
-		return fmt.Errorf("initialize reconciliation operations: %w", err)
 	}
 	appShipBaseURL := os.Getenv("TERMLINK_APPSHIP_BASE_URL")
 	updateCatalog, err := agentupdate.NewAppShipCatalogWithAllowedPrivateIPs(
@@ -285,8 +247,8 @@ func runProduction() error {
 		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication,
 		ServiceEmail:      serviceEmail,
 		HumanVerification: humanVerificationManager,
-		SubjectKey:        subjectKey, TokenKey: tokenKey, CommerceKey: commerceCodeKey, History: optionalHistoryStore(historyStore),
-		Commerce: commerceService, DataExportDownloader: privacyExportDownloader, ReconciliationOperations: reconciliationOperations,
+		SubjectKey:        subjectKey, TokenKey: tokenKey, RegistrationCodeKey: registrationCodeKey, History: optionalHistoryStore(historyStore),
+		DataExportDownloader:  privacyExportDownloader,
 		AccountDeletionBinder: accountDeletionBinder, AgentUpdateCatalog: updateCatalog,
 		ClientConfig: api.ClientConfiguration{
 			OIDCIssuer: cfg.OIDCIssuer, OIDCClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI,
@@ -402,10 +364,8 @@ func runProduction() error {
 		AppShipBaseURL:            appShipBaseURL,
 		AppShipAllowedPrivateIPs:  os.Getenv("TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS"),
 		BuildInfo:                 buildinfo.Current(),
-		CommerceKey:               commerceCodeKey,
-		Commerce:                  commerceService,
+		RegistrationCodeKey:       registrationCodeKey,
 		DataExportDownloader:      webPrivacyExportDownloader,
-		Reconciliation:            reconciliationOperations,
 		AccountDeletionBinder:     accountDeletionBinder,
 		ServiceEmail:              serviceEmail,
 		AdminRoutes:               adminRoutes,
@@ -443,13 +403,9 @@ func runProduction() error {
 		return errors.New("realtime authority subscription did not become ready")
 	}
 	go (outbox.Dispatcher{Store: repository, Valkey: valkey, History: historyStore, Logger: slog.Default()}).Run(ctx)
-	go commercecleanup.New(repository, commercecleanup.Options{Logger: slog.Default()}).Run(ctx)
-	go commerce.NewRecoveryRunner(repository, commerceService, commerce.RecoveryOptions{Logger: slog.Default()}).Run(ctx)
 	if registrationRecoveryRunner != nil {
 		go registrationRecoveryRunner.Run(ctx)
 	}
-	go reconciliationRunner.Run(ctx)
-	go commerce.RunCertificateMaintenance(ctx, gatewayResolver, commerce.CertificateMaintenanceOptions{Logger: slog.Default(), Observer: metrics})
 	if privacyExportRunner != nil {
 		go privacyExportRunner.Run(ctx)
 	}
@@ -678,7 +634,6 @@ type authorityChangeTarget interface {
 	Revoke(uuid.UUID)
 	RefreshDevice(uuid.UUID)
 	DisableAccount(uuid.UUID)
-	RefreshAccount(uuid.UUID)
 	RefreshControlPolicy(uuid.UUID)
 }
 
@@ -687,7 +642,6 @@ func authorityChangeChannels() []string {
 		"device-revoked",
 		"device-authorization-changed",
 		"account-status-changed",
-		"account-entitlement-changed",
 		"pc-control-policy-changed",
 	}
 }
@@ -700,8 +654,6 @@ func applyAuthorityChange(target authorityChangeTarget, channel string, id uuid.
 		target.RefreshDevice(id)
 	case "account-status-changed":
 		target.DisableAccount(id)
-	case "account-entitlement-changed":
-		target.RefreshAccount(id)
 	case "pc-control-policy-changed":
 		target.RefreshControlPolicy(id)
 	}

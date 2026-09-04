@@ -167,10 +167,10 @@ func TestUserPortalActionHandlersBindEveryStoreCallToAuthenticatedAccount(t *tes
 		t.Run(test.name, func(t *testing.T) {
 			repository := &fakeUserPortalActionStore{now: now}
 			binder := &fakeAPIAccountDeletionBinder{repository: repository}
-			security := &memoryCommerceSecurityStore{}
+			security := &memoryOperationSecurityStore{}
 			service := &API{
-				Clock: func() time.Time { return now }, commerceSecurity: security,
-				CommerceKey:           []byte("portal-audit-key-0123456789abcdef"),
+				Clock: func() time.Time { return now }, operationSecurity: security,
+				RegistrationCodeKey:   []byte("portal-audit-key-0123456789abcdef"),
 				DataExportDownloader:  &fakePrivacyExportDownloader{body: []byte(`{"status":"ready"}`)},
 				AccountDeletionBinder: binder,
 			}
@@ -216,8 +216,8 @@ func TestAccountDeletionRequestFailsClosedWithoutConfiguredBinder(t *testing.T) 
 		t.Run(name, func(t *testing.T) {
 			repository := &fakeUserPortalActionStore{now: now}
 			service := &API{
-				Clock: func() time.Time { return now }, commerceSecurity: &memoryCommerceSecurityStore{},
-				CommerceKey: []byte("portal-audit-key-0123456789abcdef"), AccountDeletionBinder: binder,
+				Clock: func() time.Time { return now }, operationSecurity: &memoryOperationSecurityStore{},
+				RegistrationCodeKey: []byte("portal-audit-key-0123456789abcdef"), AccountDeletionBinder: binder,
 			}
 			actions := userPortalActionHandlers{api: service, repository: repository, binder: binder}
 			endpoint := userPortalAuthenticatedEndpoint(t, accountID, deviceID, now,
@@ -250,14 +250,14 @@ func TestUserPortalSensitiveActionsRequireKeyRecentMFAAndReason(t *testing.T) {
 	}{
 		{"idempotency key required", auth.Identity{MFA: true, AuthenticatedAt: now}, false, true, 400, "IDEMPOTENCY_KEY_REQUIRED"},
 		{"MFA required", auth.Identity{AuthenticatedAt: now}, true, true, 403, "STEP_UP_REQUIRED"},
-		{"recent authentication required", auth.Identity{MFA: true, AuthenticatedAt: now.Add(-commerceStepUpMaximumAge - time.Second)}, true, true, 403, "STEP_UP_REQUIRED"},
+		{"recent authentication required", auth.Identity{MFA: true, AuthenticatedAt: now.Add(-operationStepUpMaximumAge - time.Second)}, true, true, 403, "STEP_UP_REQUIRED"},
 		{"operation reason required", auth.Identity{MFA: true, AuthenticatedAt: now}, true, false, 400, "OPERATION_REASON_REQUIRED"},
 		{"complete high risk context accepted", auth.Identity{MFA: true, AuthenticatedAt: now}, true, true, 200, ""},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			repository := &fakeUserPortalActionStore{now: now}
-			service := &API{Clock: func() time.Time { return now }, commerceSecurity: &memoryCommerceSecurityStore{}}
+			service := &API{Clock: func() time.Time { return now }, operationSecurity: &memoryOperationSecurityStore{}}
 			actions := userPortalActionHandlers{api: service, repository: repository}
 			endpoint := userPortalAuthenticatedEndpoint(t, accountID, deviceID, now,
 				"PUT /v1/account/pcs/{pcId}/remote-routing", test.identity, actions.setPCRemoteRouting)
@@ -346,7 +346,7 @@ func (e userPortalTestEndpoint) request(t *testing.T, deviceID uuid.UUID, now ti
 		request.Header.Set("Idempotency-Key", "portal-idempotency-key")
 	}
 	if includeReason {
-		request.Header.Set(commerceOperationReasonHeader, "Portal owner action")
+		request.Header.Set(operationReasonHeader, "Portal owner action")
 	}
 	return request
 }
@@ -355,7 +355,7 @@ func TestUserPortalRejectsAccountAndSecretInjection(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0).UTC()
 	accountID, deviceID, pcID := uuid.New(), uuid.New(), uuid.New()
 	repository := &fakeUserPortalActionStore{now: now}
-	service := &API{Clock: func() time.Time { return now }, commerceSecurity: &memoryCommerceSecurityStore{}}
+	service := &API{Clock: func() time.Time { return now }, operationSecurity: &memoryOperationSecurityStore{}}
 	actions := userPortalActionHandlers{api: service, repository: repository}
 	endpoint := userPortalAuthenticatedEndpoint(t, accountID, deviceID, now,
 		"PUT /v1/account/pcs/{pcId}/remote-routing", auth.Identity{MFA: true, AuthenticatedAt: now}, actions.setPCRemoteRouting)

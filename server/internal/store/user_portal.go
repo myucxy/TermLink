@@ -46,28 +46,6 @@ type UserPortalAccountOverview struct {
 	ActiveSessions int       `json:"active_sessions"`
 }
 
-type UserPortalGrantRecovery struct {
-	PlanKey        string     `json:"plan_key"`
-	CatalogVersion int64      `json:"catalog_version"`
-	Source         string     `json:"source"`
-	RestoresAt     time.Time  `json:"restores_at"`
-	EndsAt         *time.Time `json:"ends_at,omitempty"`
-	GraceUntil     *time.Time `json:"grace_until,omitempty"`
-}
-
-type UserPortalEntitlement struct {
-	PlanKey         string                   `json:"plan_key"`
-	CatalogVersion  int64                    `json:"catalog_version"`
-	MaxRemotePCs    int                      `json:"max_remote_pcs"`
-	MaxLiveSessions int                      `json:"max_live_sessions"`
-	Version         int64                    `json:"version"`
-	EffectiveAt     time.Time                `json:"effective_at"`
-	ExpiresAt       *time.Time               `json:"expires_at,omitempty"`
-	GraceUntil      *time.Time               `json:"grace_until,omitempty"`
-	Source          string                   `json:"source"`
-	Recovery        *UserPortalGrantRecovery `json:"recovery,omitempty"`
-}
-
 type UserPortalDevice struct {
 	ID         uuid.UUID  `json:"id"`
 	Type       string     `json:"type"`
@@ -130,39 +108,6 @@ const userPortalAccountOverviewSQL = `
 	         WHERE p.owner_user_id=account.id AND session.state IN ('RUNNING','INTERRUPTED'))
 	FROM users account
 	WHERE account.id=$1 AND account.status='ACTIVE'`
-
-const userPortalEntitlementSQL = `
-	SELECT coalesce(entitlement.plan_key,free_plan.plan_key),
-	       coalesce(entitlement.catalog_version,free_plan.catalog_version),
-	       coalesce(entitlement.version,0),
-	       coalesce(entitlement.effective_at,account.created_at),
-	       entitlement.expires_at,entitlement.grace_until,
-	       coalesce(entitlement.source,'DEFAULT')
-	FROM users account
-	LEFT JOIN entitlements entitlement ON entitlement.account_id=account.id
-	LEFT JOIN LATERAL (
-		SELECT plan.plan_key,catalog.version AS catalog_version
-		FROM plans plan
-		JOIN catalog_versions catalog ON catalog.id=plan.catalog_version_id
-		WHERE catalog.status='PUBLISHED' AND plan.plan_key='free'
-		ORDER BY catalog.version DESC
-		LIMIT 1
-	) free_plan ON true
-	WHERE account.id=$1 AND account.status='ACTIVE'`
-
-const userPortalGrantRecoverySQL = `
-	SELECT entitlement_grant.plan_key,entitlement_grant.catalog_version,entitlement_grant.source_type,entitlement_grant.ends_at,entitlement_grant.grace_until
-	FROM entitlement_grants entitlement_grant
-	JOIN users account ON account.id=entitlement_grant.account_id AND account.id=$1 AND account.status='ACTIVE'
-	JOIN catalog_versions catalog ON catalog.version=entitlement_grant.catalog_version
-	JOIN plans plan ON plan.catalog_version_id=catalog.id AND plan.plan_key=entitlement_grant.plan_key
-	WHERE entitlement_grant.account_id=$1 AND entitlement_grant.status='ACTIVE'
-	  AND entitlement_grant.starts_at<=$2
-	  AND (entitlement_grant.ends_at IS NULL OR entitlement_grant.ends_at>$2)
-	ORDER BY plan.price_minor DESC,plan.sort_order DESC,
-	         (entitlement_grant.source_type='DEFAULT') ASC,entitlement_grant.ends_at DESC NULLS FIRST,
-	         entitlement_grant.created_at DESC,entitlement_grant.id DESC
-	LIMIT 1`
 
 const userPortalDevicesSQL = `
 	SELECT device.id,device.device_type,device.name,device.trust_state,
@@ -233,12 +178,6 @@ func normalizeUserPortalPage(request UserPortalPageRequest) (int, *time.Time, uu
 	return limit, &createdAt, request.Before.ID, nil
 }
 
-func userPortalEntitlementForAPI(result UserPortalEntitlement) UserPortalEntitlement {
-	result.MaxRemotePCs = UnlimitedQuota
-	result.MaxLiveSessions = UnlimitedQuota
-	return result
-}
-
 func (s *Postgres) requireUserPortalAccount(ctx context.Context, accountID uuid.UUID) error {
 	var status string
 	err := s.Pool.QueryRow(ctx, `SELECT status FROM users WHERE id=$1`, accountID).Scan(&status)
@@ -268,45 +207,6 @@ func (s *Postgres) GetUserPortalAccountOverview(ctx context.Context, accountID u
 		return UserPortalAccountOverview{}, ErrDenied
 	}
 	return result, err
-}
-
-// GetUserPortalEntitlement returns the materialized current entitlement and,
-// for a temporary current grant, the grant that is expected to take over at
-// its expiry. Quantity fields retain the public unlimited sentinel regardless
-// of legacy catalog values.
-func (s *Postgres) GetUserPortalEntitlement(ctx context.Context, accountID uuid.UUID) (UserPortalEntitlement, error) {
-	if err := s.requireUserPortalAccount(ctx, accountID); err != nil {
-		return UserPortalEntitlement{}, err
-	}
-	var result UserPortalEntitlement
-	err := s.Pool.QueryRow(ctx, userPortalEntitlementSQL, accountID).Scan(
-		&result.PlanKey, &result.CatalogVersion, &result.Version, &result.EffectiveAt,
-		&result.ExpiresAt, &result.GraceUntil, &result.Source,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return UserPortalEntitlement{}, ErrDenied
-	}
-	if err != nil {
-		return UserPortalEntitlement{}, err
-	}
-	result = userPortalEntitlementForAPI(result)
-	if result.ExpiresAt == nil || !result.ExpiresAt.After(time.Now().UTC()) {
-		return result, nil
-	}
-	var recovery UserPortalGrantRecovery
-	err = s.Pool.QueryRow(ctx, userPortalGrantRecoverySQL, accountID, *result.ExpiresAt).Scan(
-		&recovery.PlanKey, &recovery.CatalogVersion, &recovery.Source,
-		&recovery.EndsAt, &recovery.GraceUntil,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return result, nil
-	}
-	if err != nil {
-		return UserPortalEntitlement{}, err
-	}
-	recovery.RestoresAt = result.ExpiresAt.UTC()
-	result.Recovery = &recovery
-	return result, nil
 }
 
 func (s *Postgres) ListUserPortalDevices(ctx context.Context, accountID uuid.UUID, request UserPortalPageRequest) ([]UserPortalDevice, error) {

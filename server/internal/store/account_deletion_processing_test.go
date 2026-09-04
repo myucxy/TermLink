@@ -62,22 +62,22 @@ func TestAccountDeletionObjectDiscoveryIsAccountScoped(t *testing.T) {
 	}
 }
 
-func TestAccountDeletionFinalizationRetainsAndRedactsLegalRecords(t *testing.T) {
+func TestAccountDeletionFinalizationRedactsLegacyCommercialAndPurgesPrivateRecords(t *testing.T) {
 	t.Parallel()
-	redaction := normalizePrivacySQL(strings.Join(userPortalAccountDeletionRedactCommerceStatements, " "))
+	redaction := normalizePrivacySQL(strings.Join(userPortalAccountDeletionRedactLegacyCommercialStatements, " "))
 	for _, required := range []string{
 		"update orders", "idempotency_key='deleted-'", "update payment_transactions",
 		"payment_payload='{}'::jsonb", "update payment_notifications",
 		"payload_ciphertext=null", "update refunds", "reason='account_deleted'",
 	} {
 		if !strings.Contains(redaction, required) {
-			t.Fatalf("commerce redaction lacks %q: %s", required, redaction)
+			t.Fatalf("legacy commercial redaction lacks %q: %s", required, redaction)
 		}
 	}
 	purge := normalizePrivacySQL(strings.Join(userPortalAccountDeletionPurgePrivateStatements, " "))
 	for _, required := range []string{
 		"delete from redemption_claims", "delete from entitlement_grants",
-		"delete from subscriptions", "delete from entitlements",
+		"delete from subscriptions", "delete from entitlements", "delete from quota_selections",
 		"delete from invitation_redemptions", "delete from idempotency_keys",
 		"delete from data_export_requests", "delete from pcs", "delete from devices",
 	} {
@@ -87,7 +87,7 @@ func TestAccountDeletionFinalizationRetainsAndRedactsLegalRecords(t *testing.T) 
 	}
 	for _, retained := range []string{"delete from orders", "delete from payment_transactions", "delete from refunds", "delete from audit_events"} {
 		if strings.Contains(purge, retained) {
-			t.Fatalf("legal record is destructively removed by %q", retained)
+			t.Fatalf("retained legal record is destructively removed by %q", retained)
 		}
 	}
 	anonymize := normalizePrivacySQL(userPortalAccountDeletionAnonymizeUserSQL)

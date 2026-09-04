@@ -194,19 +194,17 @@ type PortalConnection struct {
 }
 
 type PortalAdminDashboard struct {
-	SchemaVersion       int64
-	Users               int
-	ConsoleAccounts     int
-	Devices             int
-	TrustedDevices      int
-	PCs                 int
-	RunningSessions     int
-	Sessions            int
-	Plans               int
-	ActiveSubscriptions int
-	Accounts            []PortalAdminAccount
-	Connections         []PortalConnection
-	AuditEvents         []PortalAuditEvent
+	SchemaVersion   int64
+	Users           int
+	ConsoleAccounts int
+	Devices         int
+	TrustedDevices  int
+	PCs             int
+	RunningSessions int
+	Sessions        int
+	Accounts        []PortalAdminAccount
+	Connections     []PortalConnection
+	AuditEvents     []PortalAuditEvent
 }
 
 // PortalAdminSection loads only the bounded data required by one console
@@ -238,12 +236,9 @@ func (s *Postgres) PortalAdminSection(ctx context.Context, actorID uuid.UUID, se
 				(SELECT count(*) FROM devices WHERE trust_state='TRUSTED'),
 				(SELECT count(*) FROM pcs),
 				(SELECT count(*) FROM sessions WHERE state <> 'DELETED'),
-				(SELECT count(*) FROM sessions WHERE state='RUNNING'),
-				(SELECT count(*) FROM plans),
-				(SELECT count(*) FROM subscriptions WHERE status IN ('ACTIVE','GRACE'))`).
+				(SELECT count(*) FROM sessions WHERE state='RUNNING')`).
 			Scan(&result.SchemaVersion, &result.Users, &result.ConsoleAccounts, &result.Devices,
-				&result.TrustedDevices, &result.PCs, &result.Sessions, &result.RunningSessions,
-				&result.Plans, &result.ActiveSubscriptions); err != nil {
+				&result.TrustedDevices, &result.PCs, &result.Sessions, &result.RunningSessions); err != nil {
 			return PortalAdminDashboard{}, err
 		}
 		rows, err := s.Pool.Query(ctx, `
@@ -319,12 +314,6 @@ func (s *Postgres) PortalAdminSection(ctx context.Context, actorID uuid.UUID, se
 			result.AuditEvents = append(result.AuditEvents, item)
 		}
 		return result, rows.Err()
-	case "billing":
-		if err := s.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM plans),(SELECT count(*) FROM subscriptions WHERE status IN ('ACTIVE','GRACE'))`).
-			Scan(&result.Plans, &result.ActiveSubscriptions); err != nil {
-			return PortalAdminDashboard{}, err
-		}
-		return result, nil
 	case "deployment":
 		if err := s.Pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&result.SchemaVersion); err != nil {
 			return PortalAdminDashboard{}, err
@@ -525,13 +514,6 @@ func (s *Postgres) PortalAdminDashboard(ctx context.Context, actorID uuid.UUID) 
 		Scan(&result.Sessions, &result.RunningSessions); err != nil {
 		return PortalAdminDashboard{}, err
 	}
-	if err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM plans`).Scan(&result.Plans); err != nil {
-		return PortalAdminDashboard{}, err
-	}
-	if err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM subscriptions WHERE status IN ('ACTIVE','GRACE')`).Scan(&result.ActiveSubscriptions); err != nil {
-		return PortalAdminDashboard{}, err
-	}
-
 	accountRows, err := s.Pool.Query(ctx, `
 		SELECT u.id,u.role,u.status,u.created_at,count(d.id)
 		FROM users u LEFT JOIN devices d ON d.user_id=u.id

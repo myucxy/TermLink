@@ -51,8 +51,6 @@ func TestNormalizeUserPortalPageRejectsPartialCursor(t *testing.T) {
 func TestUserPortalDTOsExposeOnlyContractFields(t *testing.T) {
 	t.Parallel()
 	assertFields(t, UserPortalAccountOverview{}, "ID", "Role", "Status", "CreatedAt", "AndroidDevices", "PCDevices", "PCs", "OnlinePCs", "Sessions", "ActiveSessions")
-	assertFields(t, UserPortalEntitlement{}, "PlanKey", "CatalogVersion", "MaxRemotePCs", "MaxLiveSessions", "Version", "EffectiveAt", "ExpiresAt", "GraceUntil", "Source", "Recovery")
-	assertFields(t, UserPortalGrantRecovery{}, "PlanKey", "CatalogVersion", "Source", "RestoresAt", "EndsAt", "GraceUntil")
 	assertFields(t, UserPortalDevice{}, "ID", "Type", "Name", "TrustState", "Online", "LastSeenAt", "CreatedAt", "RevokedAt")
 	assertFields(t, UserPortalPC{}, "ID", "DeviceID", "Name", "AgentVersion", "Platform", "Architecture", "PlatformVersion", "RemoteRoutingEnabled", "Online", "LastSeenAt", "CreatedAt")
 	assertFields(t, UserPortalSession{}, "ID", "PCID", "PCName", "State", "Online", "CreatedAt", "EndedAt")
@@ -62,13 +60,11 @@ func TestUserPortalDTOsExposeOnlyContractFields(t *testing.T) {
 func TestUserPortalSQLIsAccountScopedAndOmitsSensitiveColumns(t *testing.T) {
 	t.Parallel()
 	queries := map[string]string{
-		"overview":    userPortalAccountOverviewSQL,
-		"entitlement": userPortalEntitlementSQL,
-		"recovery":    userPortalGrantRecoverySQL,
-		"devices":     userPortalDevicesSQL,
-		"pcs":         userPortalPCsSQL,
-		"sessions":    userPortalSessionsSQL,
-		"activity":    userPortalSecurityActivitySQL,
+		"overview": userPortalAccountOverviewSQL,
+		"devices":  userPortalDevicesSQL,
+		"pcs":      userPortalPCsSQL,
+		"sessions": userPortalSessionsSQL,
+		"activity": userPortalSecurityActivitySQL,
 	}
 	for name, query := range queries {
 		query := strings.ToLower(query)
@@ -113,18 +109,6 @@ func TestUserPortalListSQLUsesBoundedStableKeysetOrdering(t *testing.T) {
 	activity := strings.ToLower(userPortalSecurityActivitySQL)
 	if !strings.Contains(activity, "audit.id<$2") || !strings.Contains(activity, "order by audit.id desc") || !strings.Contains(activity, "limit $3") {
 		t.Fatalf("activity query is not a bounded ID keyset query: %s", activity)
-	}
-}
-
-func TestUserPortalEntitlementKeepsUnlimitedCompatibility(t *testing.T) {
-	t.Parallel()
-	if UnlimitedQuota != -1 {
-		t.Fatalf("UnlimitedQuota=%d, want -1", UnlimitedQuota)
-	}
-	got := userPortalEntitlementForAPI(UserPortalEntitlement{MaxRemotePCs: 2, MaxLiveSessions: 3})
-	if got.MaxRemotePCs != UnlimitedQuota || got.MaxLiveSessions != UnlimitedQuota {
-		t.Fatalf("portal quotas=%d/%d, want unlimited %d/%d",
-			got.MaxRemotePCs, got.MaxLiveSessions, UnlimitedQuota, UnlimitedQuota)
 	}
 }
 

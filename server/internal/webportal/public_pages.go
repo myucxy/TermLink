@@ -20,8 +20,6 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
-
-	"github.com/termlink/termlink/server/internal/store"
 )
 
 const (
@@ -30,7 +28,6 @@ const (
 	publicReleaseArtifactLimit  = int64(2 * 1024 * 1024 * 1024)
 	publicReleaseRequestTimeout = 5 * time.Second
 	publicReleaseCacheTTL       = 45 * time.Second
-	publicPlanRequestTimeout    = 4 * time.Second
 )
 
 var ErrPublicReleaseUnavailable = errors.New("public release is unavailable")
@@ -166,13 +163,6 @@ type publicReleasePageData struct {
 	Releases []publicReleaseCard
 }
 
-type publicPlansPageData struct {
-	publicPageData
-	CatalogAvailable bool
-	CatalogVersion   int64
-	Plans            []store.Plan
-}
-
 type publicServiceStatus struct {
 	Name        string
 	State       string
@@ -184,10 +174,6 @@ type publicStatusPageData struct {
 	publicPageData
 	CheckedAt string
 	Services  []publicServiceStatus
-}
-
-type publicPlanRepository interface {
-	PublishedPlans(context.Context) (int64, []store.Plan, error)
 }
 
 type publicReleaseResult struct {
@@ -632,22 +618,6 @@ func (p *Portal) publicReleases(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (p *Portal) publicPlans(w http.ResponseWriter, r *http.Request) {
-	data := publicPlansPageData{publicPageData: p.publicPage(r, "套餐", "套餐、价格和周期以当前已发布目录为准。", "plans")}
-	repository, ok := p.config.Repository.(publicPlanRepository)
-	if ok {
-		ctx, cancel := context.WithTimeout(r.Context(), publicPlanRequestTimeout)
-		defer cancel()
-		version, plans, err := repository.PublishedPlans(ctx)
-		if err == nil && version > 0 {
-			data.CatalogAvailable = true
-			data.CatalogVersion = version
-			data.Plans = plans
-		}
-	}
-	p.render(w, http.StatusOK, "public-plans.html", data)
-}
-
 func (p *Portal) publicSecurity(w http.ResponseWriter, r *http.Request) {
 	p.render(w, http.StatusOK, "public-security.html", p.publicPage(r, "安全说明", "了解 TermLink 的加密边界、设备隔离与本地优先策略。", "security"))
 }
@@ -673,7 +643,6 @@ func (p *Portal) publicStatus(w http.ResponseWriter, r *http.Request) {
 			{Name: "Web 门户", State: "正常", StateClass: "operational", Description: "公开页面当前可访问。"},
 			{Name: "账号与身份", State: "未公开", StateClass: "unknown", Description: "详细依赖状态不在公开页面披露。"},
 			{Name: "实时连接", State: "未公开", StateClass: "unknown", Description: "连接拓扑与路由信息保持私有。"},
-			{Name: "支付服务", State: "未公开", StateClass: "unknown", Description: "可用渠道以创建订单时的服务端结果为准。"},
 			distribution,
 		},
 	}

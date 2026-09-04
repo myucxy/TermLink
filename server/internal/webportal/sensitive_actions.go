@@ -109,7 +109,7 @@ func (p *Portal) strongAccountAction(action string, next http.HandlerFunc) http.
 }
 
 func (p *Portal) requireStrongAccountAction(w http.ResponseWriter, r *http.Request) (webSession, store.PortalAccount, bool) {
-	session, account, ok := p.requireCommerceAccount(w, r)
+	session, account, ok := p.requireAccount(w, r)
 	if !ok {
 		return webSession{}, store.PortalAccount{}, false
 	}

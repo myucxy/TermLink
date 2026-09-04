@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -30,7 +29,6 @@ import (
 	"github.com/termlink/termlink/server/internal/adminroute"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/buildinfo"
-	commercecontrol "github.com/termlink/termlink/server/internal/commerce"
 	"github.com/termlink/termlink/server/internal/humanverification"
 	"github.com/termlink/termlink/server/internal/serviceemail"
 	"github.com/termlink/termlink/server/internal/store"
@@ -74,28 +72,16 @@ type Config struct {
 	AppShipHTTPClient         *http.Client
 	ReleaseSource             PublicReleaseSource
 	BuildInfo                 buildinfo.Info
-	CommerceKey               []byte
-	Commerce                  commercePortalService
+	RegistrationCodeKey       []byte
 	DataExportDownloader      PrivacyExportDownloader
 	AccountDeletionBinder     accountdeletion.RequestBinder
 	ServiceEmail              *serviceemail.Service
 	AdminRoutes               *adminroute.Service
 	IdentityProfiles          identityProfileService
 	IdentityMFAStatus         identityMFAStatusService
-	Reconciliation            ReconciliationOperations
 	Repository                portalRepository
 	AccountStatusChanged      func(context.Context, uuid.UUID, string) error
 	Clock                     func() time.Time
-}
-
-type commercePortalService interface {
-	CreateOrder(context.Context, commercecontrol.CreateOrderRequest) (store.Order, error)
-	StartPayment(context.Context, uuid.UUID, uuid.UUID) (commercecontrol.PaymentInstruction, error)
-	QueryAndFulfill(context.Context, uuid.UUID, uuid.UUID) (commercecontrol.PaymentOutcome, error)
-	ValidatePaymentChannelVersion(context.Context, store.PaymentChannel, store.PaymentChannelVersion) error
-	ProbePaymentChannelVersion(context.Context, store.PaymentChannel, store.PaymentChannelVersion) error
-	CreateRefund(context.Context, commercecontrol.CreateRefundRequest) (commercecontrol.RefundOutcome, error)
-	ConfirmRefund(context.Context, commercecontrol.ConfirmRefundRequest) (commercecontrol.RefundOutcome, error)
 }
 
 type identityProfileService interface {
@@ -151,7 +137,7 @@ type portalRepository interface {
 
 type registrationPortalRepository interface {
 	GetRegistrationPolicy(context.Context) (store.RegistrationPolicy, error)
-	ConfirmPendingInvitationForEmail(context.Context, uuid.UUID, [32]byte) (store.Entitlement, error)
+	ConfirmPendingInvitationForEmail(context.Context, uuid.UUID, [32]byte) error
 }
 
 type sectionPortalRepository interface {
@@ -200,27 +186,27 @@ type cookieCodec struct {
 
 // Portal is the production web handler.
 type Portal struct {
-	config         Config
-	publicOrigin   *url.URL
-	identityURL    string
-	flow           oidcFlow
-	oauthCodec     cookieCodec
-	sessionCodec   cookieCodec
-	templates      *template.Template
-	styles         []byte
-	identityStyles []byte
-	adminStyles    []byte
-	commerceStyles []byte
-	publicStyles   []byte
-	themeInit      []byte
-	themeScript    []byte
-	registerScript []byte
-	commerceScript []byte
-	appIcon        []byte
-	favicon        []byte
-	releaseSource  PublicReleaseSource
-	releaseCache   *publicReleaseCache
-	systemVersions *SystemVersionsService
+	config             Config
+	publicOrigin       *url.URL
+	identityURL        string
+	flow               oidcFlow
+	oauthCodec         cookieCodec
+	sessionCodec       cookieCodec
+	templates          *template.Template
+	styles             []byte
+	identityStyles     []byte
+	adminStyles        []byte
+	portalStyles       []byte
+	publicStyles       []byte
+	themeInit          []byte
+	themeScript        []byte
+	registerScript     []byte
+	registrationScript []byte
+	appIcon            []byte
+	favicon            []byte
+	releaseSource      PublicReleaseSource
+	releaseCache       *publicReleaseCache
+	systemVersions     *SystemVersionsService
 }
 
 type productionOIDCFlow struct {
@@ -287,7 +273,7 @@ type adminPageData struct {
 	HumanVerification      humanverification.AdminView
 	AdminRoute             adminroute.View
 	CanConfigureSystem     bool
-	CommerceNavigation     bool
+	RegistrationNavigation bool
 }
 
 type errorPageData struct {
@@ -364,24 +350,19 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 		return nil, err
 	}
 	parsed, err := template.New("portal").Funcs(template.FuncMap{
-		"formatTime":                       formatPortalTime,
-		"formatOptionalTime":               formatOptionalPortalTime,
-		"shortID":                          shortID,
-		"roleLabel":                        roleLabel,
-		"statusLabel":                      statusLabel,
-		"formatMoney":                      formatCommerceMoney,
-		"commerceStatusLabel":              commerceStatusLabel,
-		"commerceConsistencyCategoryLabel": commerceConsistencyCategoryLabel,
-		"commerceConsistencyActionLabel":   commerceConsistencyActionLabel,
-		"commerceQuotaLabel":               commerceQuotaLabel,
-		"formatOptionalCommerceTime":       formatOptionalCommerceTime,
-		"userPortalControlModeLabel":       userPortalControlModeLabel,
-		"userPortalDeletionCanConfirm":     userPortalDeletionCanConfirm,
-		"userPortalDeletionCanCancel":      userPortalDeletionCanCancel,
-		"actionKey":                        sensitiveActionKey,
-		"formatAnnouncementTimeInput":      formatAnnouncementTimeInput,
-		"announcementSeverityLabel":        announcementSeverityLabel,
-		"announcementStatusLabel":          announcementStatusLabel,
+		"formatTime":                   formatPortalTime,
+		"formatOptionalTime":           formatOptionalPortalTime,
+		"shortID":                      shortID,
+		"roleLabel":                    roleLabel,
+		"statusLabel":                  statusLabel,
+		"formatOptionalPortalTime":     formatOptionalPortalTime,
+		"userPortalControlModeLabel":   userPortalControlModeLabel,
+		"userPortalDeletionCanConfirm": userPortalDeletionCanConfirm,
+		"userPortalDeletionCanCancel":  userPortalDeletionCanCancel,
+		"actionKey":                    sensitiveActionKey,
+		"formatAnnouncementTimeInput":  formatAnnouncementTimeInput,
+		"announcementSeverityLabel":    announcementSeverityLabel,
+		"announcementStatusLabel":      announcementStatusLabel,
 	}).ParseFS(portalAssets, "assets/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("parse web portal templates: %w", err)
@@ -398,9 +379,9 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 	if err != nil {
 		return nil, fmt.Errorf("read web portal admin styles: %w", err)
 	}
-	commerceStyles, err := portalAssets.ReadFile("assets/commerce-portal.css")
+	portalStyles, err := portalAssets.ReadFile("assets/portal.css")
 	if err != nil {
-		return nil, fmt.Errorf("read web portal commerce styles: %w", err)
+		return nil, fmt.Errorf("read web portal portal styles: %w", err)
 	}
 	publicStyles, err := portalAssets.ReadFile("assets/public-pages.css")
 	if err != nil {
@@ -418,9 +399,9 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 	if err != nil {
 		return nil, fmt.Errorf("read web portal registration script: %w", err)
 	}
-	commerceScript, err := portalAssets.ReadFile("assets/commerce-admin.js")
+	registrationScript, err := portalAssets.ReadFile("assets/registration-admin.js")
 	if err != nil {
-		return nil, fmt.Errorf("read web portal commerce admin script: %w", err)
+		return nil, fmt.Errorf("read web portal registration admin script: %w", err)
 	}
 	appIcon, err := portalAssets.ReadFile("assets/termlink-app-icon.svg")
 	if err != nil {
@@ -442,26 +423,26 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 		config.Clock = time.Now
 	}
 	return &Portal{
-		config:         config,
-		publicOrigin:   publicOrigin,
-		identityURL:    identityURL,
-		flow:           flow,
-		oauthCodec:     oauthCodec,
-		sessionCodec:   sessionCodec,
-		templates:      parsed,
-		styles:         styles,
-		identityStyles: identityStyles,
-		adminStyles:    adminStyles,
-		commerceStyles: commerceStyles,
-		publicStyles:   publicStyles,
-		themeInit:      themeInit,
-		themeScript:    themeScript,
-		registerScript: registerScript,
-		commerceScript: commerceScript,
-		appIcon:        appIcon,
-		favicon:        favicon,
-		releaseSource:  config.ReleaseSource,
-		releaseCache:   newPublicReleaseCache(publicReleaseCacheTTL, config.Clock),
+		config:             config,
+		publicOrigin:       publicOrigin,
+		identityURL:        identityURL,
+		flow:               flow,
+		oauthCodec:         oauthCodec,
+		sessionCodec:       sessionCodec,
+		templates:          parsed,
+		styles:             styles,
+		identityStyles:     identityStyles,
+		adminStyles:        adminStyles,
+		portalStyles:       portalStyles,
+		publicStyles:       publicStyles,
+		themeInit:          themeInit,
+		themeScript:        themeScript,
+		registerScript:     registerScript,
+		registrationScript: registrationScript,
+		appIcon:            appIcon,
+		favicon:            favicon,
+		releaseSource:      config.ReleaseSource,
+		releaseCache:       newPublicReleaseCache(publicReleaseCacheTTL, config.Clock),
 		systemVersions: NewSystemVersionsService(SystemVersionsOptions{
 			Server: config.BuildInfo, ReleaseSource: config.ReleaseSource, Clock: config.Clock,
 		}),
@@ -583,19 +564,18 @@ func (p *Portal) Handler() http.Handler {
 	mux.HandleFunc("GET /assets/site.css", p.siteCSS)
 	mux.HandleFunc("GET /assets/identity.css", p.identityCSS)
 	mux.HandleFunc("GET /assets/admin.css", p.adminCSS)
-	mux.HandleFunc("GET /assets/commerce-portal.css", p.commerceCSS)
+	mux.HandleFunc("GET /assets/portal-dashboard.css", p.portalDashboardCSS)
 	mux.HandleFunc("GET /assets/public-pages.css", p.publicCSS)
 	mux.HandleFunc("GET /assets/theme-init.js", p.themeInitJS)
 	mux.HandleFunc("GET /assets/theme.js", p.themeJS)
 	mux.HandleFunc("GET /assets/register.js", p.registerJS)
-	mux.HandleFunc("GET /assets/commerce-admin.js", p.commerceAdminJS)
+	mux.HandleFunc("GET /assets/registration-admin.js", p.registrationAdminJS)
 	mux.HandleFunc("GET /assets/termlink-app-icon.svg", p.svgAsset(p.appIcon))
 	mux.HandleFunc("GET /assets/termlink-favicon.svg", p.svgAsset(p.favicon))
 	mux.HandleFunc("GET /login", p.login)
 	mux.HandleFunc("GET /register", p.registerPage)
 	mux.HandleFunc("GET /downloads", p.publicDownloads)
 	mux.HandleFunc("GET /releases", p.publicReleases)
-	mux.HandleFunc("GET /plans", p.publicPlans)
 	mux.HandleFunc("GET /security", p.publicSecurity)
 	mux.HandleFunc("GET /status", p.publicStatus)
 	mux.HandleFunc("GET /auth/callback", p.callback)
@@ -603,12 +583,6 @@ func (p *Portal) Handler() http.Handler {
 	mux.HandleFunc("GET /auth/step-up/status", p.sensitiveStepUpStatus)
 	mux.HandleFunc("GET /auth/step-up/result", p.sensitiveStepUpResult)
 	mux.HandleFunc("GET /account", p.account)
-	mux.HandleFunc("POST /account/redemptions/preview", p.commercePreviewRedemption)
-	mux.HandleFunc("POST /account/redemptions", p.commerceClaimRedemption)
-	mux.HandleFunc("POST /account/orders", p.commerceCreateOrder)
-	mux.HandleFunc("POST /account/orders/{id}/pay", p.commerceStartPayment)
-	mux.HandleFunc("POST /account/orders/{id}/query", p.commerceQueryPayment)
-	mux.HandleFunc("POST /account/orders/{id}/cancel", p.commerceCancelOrder)
 	mux.HandleFunc("POST /account/devices/{id}/revoke", p.strongAccountAction("user.device.revoke", p.userPortalRevokeDevice))
 	mux.HandleFunc("POST /account/pcs/{id}/control-policy", p.strongAccountAction("user.pc.control_policy.update", p.userPortalUpdatePCControlPolicy))
 	mux.HandleFunc("POST /account/sessions/{id}/history/delete", p.strongAccountAction("user.session_history.delete", p.userPortalDeleteSessionHistory))
@@ -620,51 +594,15 @@ func (p *Portal) Handler() http.Handler {
 	mux.HandleFunc("POST /account/profile/nickname", p.accountUpdateNickname)
 	mux.HandleFunc("POST /account/profile/email-code", p.accountRequestEmailCode)
 	mux.HandleFunc("POST /account/profile/email", p.accountConfirmEmail)
-	mux.HandleFunc("GET /commerce", p.legacyCommerce)
-	mux.HandleFunc("POST /commerce/redemptions/preview", p.commercePreviewRedemption)
-	mux.HandleFunc("POST /commerce/redemptions", p.commerceClaimRedemption)
-	mux.HandleFunc("POST /commerce/orders", p.commerceCreateOrder)
-	mux.HandleFunc("POST /commerce/orders/{id}/pay", p.commerceStartPayment)
-	mux.HandleFunc("POST /commerce/orders/{id}/query", p.commerceQueryPayment)
-	mux.HandleFunc("POST /commerce/orders/{id}/cancel", p.commerceCancelOrder)
-	mux.HandleFunc("POST /commerce/devices/{id}/revoke", p.strongAccountAction("user.device.revoke", p.userPortalRevokeDevice))
-	mux.HandleFunc("POST /commerce/pcs/{id}/control-policy", p.strongAccountAction("user.pc.control_policy.update", p.userPortalUpdatePCControlPolicy))
-	mux.HandleFunc("POST /commerce/sessions/{id}/history/delete", p.strongAccountAction("user.session_history.delete", p.userPortalDeleteSessionHistory))
-	mux.HandleFunc("POST /commerce/privacy/exports", p.strongAccountAction("user.data_export.request", p.userPortalRequestDataExport))
-	mux.HandleFunc("POST /commerce/privacy/exports/{id}/download", p.sensitiveAction("user.data_export.download", p.userPortalDownloadDataExport))
-	mux.HandleFunc("POST /commerce/privacy/deletions", p.strongAccountAction("user.account_deletion.request", p.userPortalRequestAccountDeletion))
-	mux.HandleFunc("POST /commerce/privacy/deletions/{id}/confirm", p.strongAccountAction("user.account_deletion.confirm", p.userPortalConfirmAccountDeletion))
-	mux.HandleFunc("POST /commerce/privacy/deletions/{id}/cancel", p.strongAccountAction("user.account_deletion.cancel", p.userPortalCancelAccountDeletion))
 	mux.HandleFunc("GET /account/identity", p.identity)
 	mux.HandleFunc("GET /account/identity/{action}", p.identity)
 	mux.HandleFunc("GET /admin", p.admin)
-	mux.HandleFunc("GET /admin/commerce", p.adminCommerceDashboard)
-	mux.HandleFunc("POST /admin/commerce/orders/export.csv", p.sensitiveAction("commerce.orders.export", p.adminCommerceExportOrders))
-	mux.HandleFunc("POST /admin/commerce/orders/{id}/query", p.sensitiveAction("commerce.order.query", p.adminCommerceQueryOrder))
-	mux.HandleFunc("POST /admin/commerce/orders/{id}/retry-fulfillment", p.sensitiveAction("commerce.order.fulfillment.retry", p.adminCommerceRetryOrderFulfillment))
-	mux.HandleFunc("POST /admin/commerce/catalog/plans", p.sensitiveAction("commerce.catalog.plan.create", p.adminCommerceCreatePlanDraft))
-	mux.HandleFunc("POST /admin/commerce/catalog/plans/{id}", p.sensitiveAction("commerce.catalog.plan.update", p.adminCommerceUpdatePlanDraft))
-	mux.HandleFunc("POST /admin/commerce/catalog/publish", p.sensitiveAction("commerce.catalog.publish", p.adminCommercePublishCatalog))
-	mux.HandleFunc("POST /admin/commerce/manual-entitlements", p.sensitiveAction("commerce.manual_entitlement.create", p.adminCommerceCreateManualEntitlement))
-	mux.HandleFunc("POST /admin/commerce/manual-entitlements/{id}/revoke", p.sensitiveAction("commerce.manual_entitlement.revoke", p.adminCommerceRevokeManualEntitlement))
-	mux.HandleFunc("POST /admin/commerce/registration-policy", p.sensitiveAction("commerce.registration_policy.update", p.adminCommerceRegistrationPolicy))
-	mux.HandleFunc("POST /admin/commerce/invitations/batches", p.sensitiveAction("commerce.invitation_batch.create", p.adminCommerceCreateInvitationBatch))
-	mux.HandleFunc("POST /admin/commerce/invitations/batches/{id}/codes", p.sensitiveAction("commerce.invitation_codes.generate", p.adminCommerceGenerateInvitationCodes))
-	mux.HandleFunc("POST /admin/commerce/invitations/batches/{id}/status", p.sensitiveAction("commerce.invitation_batch.status", p.adminCommerceInvitationBatchStatus))
-	mux.HandleFunc("POST /admin/commerce/invitations/codes/{id}/status", p.sensitiveAction("commerce.invitation_code.status", p.adminCommerceInvitationCodeStatus))
-	mux.HandleFunc("POST /admin/commerce/redemptions/batches", p.sensitiveAction("commerce.redemption_batch.create", p.adminCommerceCreateRedemptionBatch))
-	mux.HandleFunc("POST /admin/commerce/redemptions/batches/{id}/codes", p.sensitiveAction("commerce.redemption_codes.generate", p.adminCommerceGenerateRedemptionCodes))
-	mux.HandleFunc("POST /admin/commerce/redemptions/batches/{id}/status", p.sensitiveAction("commerce.redemption_batch.status", p.adminCommerceRedemptionBatchStatus))
-	mux.HandleFunc("POST /admin/commerce/redemptions/codes/{id}/status", p.sensitiveAction("commerce.redemption_code.status", p.adminCommerceRedemptionCodeStatus))
-	mux.HandleFunc("POST /admin/commerce/refunds", p.sensitiveAction("commerce.refund.create", p.adminCommerceCreateRefund))
-	mux.HandleFunc("POST /admin/commerce/refunds/{id}/confirm", p.sensitiveAction("commerce.refund.confirm", p.adminCommerceConfirmRefund))
-	mux.HandleFunc("POST /admin/commerce/orders/{id}/close", p.sensitiveAction("commerce.order.close", p.adminCommerceCloseOrder))
-	mux.HandleFunc("POST /admin/commerce/reconciliation", p.sensitiveAction("commerce.reconciliation.create", p.adminCommerceCreateReconciliation))
-	mux.HandleFunc("POST /admin/commerce/reconciliation/discrepancies/{id}/transition", p.strongConsoleAction("commerce.reconciliation.discrepancy.transition", p.adminReconciliationTransition))
-	mux.HandleFunc("POST /admin/commerce/payment-channels", p.sensitiveAction("commerce.payment_channel.ensure", p.adminCommerceEnsurePaymentChannel))
-	mux.HandleFunc("POST /admin/commerce/payment-channels/{id}/versions", p.sensitiveAction("commerce.payment_version.create", p.adminCommerceCreatePaymentVersion))
-	mux.HandleFunc("POST /admin/commerce/payment-channels/{id}/activate", p.sensitiveAction("commerce.payment_version.activate", p.adminCommerceActivatePaymentVersion))
-	mux.HandleFunc("POST /admin/commerce/payment-channels/{id}/disable", p.sensitiveAction("commerce.payment_channel.disable", p.adminCommerceDisablePaymentChannel))
+	mux.HandleFunc("GET /admin/registration", p.adminRegistrationDashboard)
+	mux.HandleFunc("POST /admin/registration/policy", p.sensitiveAction("registration.policy.update", p.adminUpdateRegistrationPolicy))
+	mux.HandleFunc("POST /admin/registration/invitations/batches", p.sensitiveAction("registration.invitation_batch.create", p.adminCreateInvitationBatch))
+	mux.HandleFunc("POST /admin/registration/invitations/batches/{id}/codes", p.sensitiveAction("registration.invitation_codes.generate", p.adminGenerateInvitationCodes))
+	mux.HandleFunc("POST /admin/registration/invitations/batches/{id}/status", p.sensitiveAction("registration.invitation_batch.status", p.adminSetInvitationBatchStatus))
+	mux.HandleFunc("POST /admin/registration/invitations/codes/{id}/status", p.sensitiveAction("registration.invitation_code.status", p.adminSetInvitationCodeStatus))
 	mux.HandleFunc("POST /admin/accounts/{id}/role", p.sensitiveAction("admin.account.role.update", p.adminUpdateRole))
 	mux.HandleFunc("POST /admin/accounts/{id}/status", p.sensitiveAction("admin.account.status.update", p.adminUpdateStatus))
 	mux.HandleFunc("POST /admin/announcements", p.sensitiveAction("announcement.create", p.adminCreateAnnouncement))
@@ -688,22 +626,6 @@ func (p *Portal) home(w http.ResponseWriter, r *http.Request) {
 	p.render(w, http.StatusOK, "home.html", data)
 }
 
-// legacyCommerce keeps old bookmarks valid for one compatibility cycle while
-// ensuring users never remain on an implementation-named portal URL.
-func (p *Portal) legacyCommerce(w http.ResponseWriter, r *http.Request) {
-	query := url.Values{}
-	for _, name := range []string{"section", "notice", "export_id", "deletion_id"} {
-		if value := strings.TrimSpace(r.URL.Query().Get(name)); value != "" {
-			query.Set(name, value)
-		}
-	}
-	target := "/account"
-	if encoded := query.Encode(); encoded != "" {
-		target += "?" + encoded
-	}
-	http.Redirect(w, r, target, http.StatusPermanentRedirect)
-}
-
 func (p *Portal) siteCSS(w http.ResponseWriter, _ *http.Request) {
 	p.staticAsset(w, "text/css; charset=utf-8", p.styles)
 }
@@ -716,10 +638,10 @@ func (p *Portal) adminCSS(w http.ResponseWriter, _ *http.Request) {
 	p.staticAsset(w, "text/css; charset=utf-8", p.adminStyles)
 }
 
-func (p *Portal) commerceCSS(w http.ResponseWriter, _ *http.Request) {
+func (p *Portal) portalDashboardCSS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/css; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
-	_, _ = w.Write(p.commerceStyles)
+	_, _ = w.Write(p.portalStyles)
 }
 
 func (p *Portal) publicCSS(w http.ResponseWriter, _ *http.Request) {
@@ -738,8 +660,8 @@ func (p *Portal) registerJS(w http.ResponseWriter, _ *http.Request) {
 	p.staticAsset(w, "text/javascript; charset=utf-8", p.registerScript)
 }
 
-func (p *Portal) commerceAdminJS(w http.ResponseWriter, _ *http.Request) {
-	p.staticAsset(w, "text/javascript; charset=utf-8", p.commerceScript)
+func (p *Portal) registrationAdminJS(w http.ResponseWriter, _ *http.Request) {
+	p.staticAsset(w, "text/javascript; charset=utf-8", p.registrationScript)
 }
 
 func (p *Portal) registerPage(w http.ResponseWriter, r *http.Request) {
@@ -923,11 +845,11 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 			"account_identity_profile_sync_failed", loginTraceID, profileErr,
 			slog.String("account_id", account.ID.String()))
 	}
-	if identity.Email != "" && len(p.config.CommerceKey) >= 32 {
+	if identity.Email != "" && len(p.config.RegistrationCodeKey) >= 32 {
 		if repository, ok := p.config.Repository.(registrationPortalRepository); ok {
 			email := strings.ToLower(strings.TrimSpace(identity.Email))
-			digest := commerceDigest(p.config.CommerceKey, "registration-email", email)
-			if _, linkErr := repository.ConfirmPendingInvitationForEmail(r.Context(), account.ID, digest); linkErr != nil && !errors.Is(linkErr, store.ErrNotFound) {
+			digest := invitationCodeDigest(p.config.RegistrationCodeKey, "registration-email", email)
+			if linkErr := repository.ConfirmPendingInvitationForEmail(r.Context(), account.ID, digest); linkErr != nil && !errors.Is(linkErr, store.ErrNotFound) {
 				logPortalFailure(r.Context(), slog.LevelWarn, "link registration invitation after OIDC login",
 					"registration_invitation_link_failed", loginTraceID, linkErr,
 					slog.String("account_id", account.ID.String()))
@@ -985,11 +907,9 @@ func (p *Portal) identity(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Portal) account(w http.ResponseWriter, r *http.Request) {
-	if _, commerceOK := p.config.Repository.(commerceAccountRepository); commerceOK {
-		if _, portalOK := p.config.Repository.(userPortalRepository); portalOK {
-			p.commerceDashboard(w, r)
-			return
-		}
+	if _, portalOK := p.config.Repository.(userPortalRepository); portalOK {
+		p.accountDashboard(w, r)
+		return
 	}
 	session, err := p.readSession(r)
 	if err != nil {
@@ -1872,7 +1792,7 @@ func (p *Portal) handleAdminMutationError(w http.ResponseWriter, err error) {
 
 func normalizeAdminSection(value string) string {
 	switch value {
-	case "overview", "connections", "deployment", "versions", "announcements", "audit", "billing", "identity", "accounts", "redemptions", "settings":
+	case "overview", "connections", "deployment", "versions", "announcements", "audit", "identity", "accounts", "settings":
 		return value
 	default:
 		return "overview"
@@ -1884,8 +1804,8 @@ func adminSectionTitle(section string) string {
 		"overview": "运行概览", "connections": "连接与路由", "deployment": "Docker 部署",
 		"versions":      "系统版本",
 		"announcements": "公告管理",
-		"audit":         "安全审计", "billing": "订阅与权益", "identity": "身份与安全",
-		"accounts": "账号与角色", "redemptions": "兑换码管理",
+		"audit":         "安全审计", "identity": "身份与安全",
+		"accounts": "账号与角色",
 		"settings": "系统设置",
 	}[normalizeAdminSection(section)]
 }
@@ -1971,15 +1891,4 @@ func clear(value []byte) {
 	for index := range value {
 		value[index] = 0
 	}
-}
-
-func commerceDigest(key []byte, purpose, value string) [32]byte {
-	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write([]byte("TermLink commerce v1\x00"))
-	_, _ = mac.Write([]byte(purpose))
-	_, _ = mac.Write([]byte{0})
-	_, _ = mac.Write([]byte(value))
-	var result [32]byte
-	copy(result[:], mac.Sum(nil))
-	return result
 }

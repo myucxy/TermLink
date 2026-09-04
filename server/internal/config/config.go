@@ -120,22 +120,18 @@ type Config struct {
 	// Pool and timeout values are non-secret, validated runtime controls. The
 	// defaults preserve the previous PostgreSQL settings and make go-redis's
 	// formerly implicit timeout behavior stable across CPU counts.
-	PostgresMaxConns          int32
-	PostgresMinConns          int32
-	PostgresMaxConnLifetime   time.Duration
-	PostgresMaxConnIdleTime   time.Duration
-	PostgresHealthCheckPeriod time.Duration
-	PostgresConnectTimeout    time.Duration
-	RedisPoolSize             int
-	RedisMinIdleConns         int
-	RedisDialTimeout          time.Duration
-	RedisReadTimeout          time.Duration
-	RedisWriteTimeout         time.Duration
-	RedisPoolTimeout          time.Duration
-	// PaymentSecretsDir is the trusted base directory used by payment-provider
-	// secret references. Config only validates and stores this path; it never
-	// enumerates or loads payment secret values.
-	PaymentSecretsDir                 string
+	PostgresMaxConns                  int32
+	PostgresMinConns                  int32
+	PostgresMaxConnLifetime           time.Duration
+	PostgresMaxConnIdleTime           time.Duration
+	PostgresHealthCheckPeriod         time.Duration
+	PostgresConnectTimeout            time.Duration
+	RedisPoolSize                     int
+	RedisMinIdleConns                 int
+	RedisDialTimeout                  time.Duration
+	RedisReadTimeout                  time.Duration
+	RedisWriteTimeout                 time.Duration
+	RedisPoolTimeout                  time.Duration
 	RegistrationRecoveryEnabled       bool
 	KeycloakAdminClientID             string
 	KeycloakAdminBaseURL              string
@@ -349,7 +345,6 @@ type Input struct {
 	RedisReadTimeout                  time.Duration
 	RedisWriteTimeout                 time.Duration
 	RedisPoolTimeout                  time.Duration
-	PaymentSecretsDir                 string
 	RegistrationRecoveryEnabled       bool
 	KeycloakAdminClientID             string
 	KeycloakAdminBaseURL              string
@@ -410,7 +405,6 @@ func New(input Input) (Config, error) {
 		RedisReadTimeout:                  input.RedisReadTimeout,
 		RedisWriteTimeout:                 input.RedisWriteTimeout,
 		RedisPoolTimeout:                  input.RedisPoolTimeout,
-		PaymentSecretsDir:                 strings.TrimSpace(input.PaymentSecretsDir),
 		LogLevel:                          input.LogLevel,
 		HistoryEnabled:                    input.HistoryEnabled,
 		ListenAddr:                        input.ListenAddr,
@@ -563,7 +557,6 @@ func LoadSource(source Source) (Config, error) {
 	}
 	listenAddr := lookupOptional("TERMLINK_LISTEN_ADDR", defaultListenAddr)
 	metricsListenAddr := lookupOptional("TERMLINK_METRICS_LISTEN_ADDR", "")
-	paymentSecretsDir := lookupOptional("TERMLINK_PAYMENT_SECRETS_DIR", "/run/secrets")
 	postgresMaxConns, err := parseIntRange("TERMLINK_POSTGRES_MAX_CONNS", lookupOptional("TERMLINK_POSTGRES_MAX_CONNS", strconv.Itoa(int(defaultPostgresMaxConns))), 1, 1000)
 	if err != nil {
 		return Config{}, err
@@ -724,7 +717,6 @@ func LoadSource(source Source) (Config, error) {
 		RedisReadTimeout:                  redisReadTimeout,
 		RedisWriteTimeout:                 redisWriteTimeout,
 		RedisPoolTimeout:                  redisPoolTimeout,
-		PaymentSecretsDir:                 paymentSecretsDir,
 		LogLevel:                          logLevel,
 		HistoryEnabled:                    historyEnabled,
 		ListenAddr:                        listenAddr,
@@ -794,14 +786,6 @@ func parseDurationRange(name, value string, minimum, maximum time.Duration) (tim
 }
 
 func validate(c Config) (Config, error) {
-	if strings.TrimSpace(c.PaymentSecretsDir) == "" {
-		c.PaymentSecretsDir = "/run/secrets"
-	}
-	paymentSecretsDir, err := normalizeAbsoluteDirectory("TERMLINK_PAYMENT_SECRETS_DIR", c.PaymentSecretsDir)
-	if err != nil {
-		return Config{}, err
-	}
-	c.PaymentSecretsDir = paymentSecretsDir
 	if strings.TrimSpace(c.S3Bucket) == "" {
 		c.S3Bucket = "termlink-history"
 	}

@@ -137,8 +137,7 @@ func TestDownloadClassifiesRepositoryFailuresWithoutLeakingDetails(t *testing.T)
 func stableSnapshot() store.UserPortalExportSnapshot {
 	return store.UserPortalExportSnapshot{
 		SchemaVersion: 1, Account: json.RawMessage(`{"id":"account"}`), Devices: json.RawMessage(`[]`),
-		PCs: json.RawMessage(`[]`), Sessions: json.RawMessage(`[]`), Entitlements: json.RawMessage(`[]`),
-		Grants: json.RawMessage(`[]`), Orders: json.RawMessage(`[]`), Redemptions: json.RawMessage(`[]`), Security: json.RawMessage(`[]`),
+		PCs: json.RawMessage(`[]`), Sessions: json.RawMessage(`[]`), Security: json.RawMessage(`[]`),
 	}
 }
 

@@ -104,10 +104,6 @@ func (d Dispatcher) deliver(ctx context.Context, event store.OutboxEvent) error 
 		return d.publishAggregate(ctx, "device-authorization-changed", event.AggregateID)
 	case "account.status.changed":
 		return d.publishAggregate(ctx, "account-status-changed", event.AggregateID)
-	case "entitlement.changed":
-		return d.publishAggregate(ctx, "account-entitlement-changed", event.AggregateID)
-	case "refund.approval.changed":
-		return d.publishAggregate(ctx, "refund-approval-changed", event.AggregateID)
 	case "history.object.delete":
 		var payload struct {
 			ObjectKey string `json:"object_key"`

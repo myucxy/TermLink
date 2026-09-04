@@ -31,10 +31,9 @@ func TestDeriveServerKeySeparatesSecurityDomains(t *testing.T) {
 	subject := deriveServerKey(master, "oidc-subject-hash")
 	token := deriveServerKey(master, "capability-token-signing")
 	cookie := deriveServerKey(master, "web-cookie-master")
-	commerceCode := deriveServerKey(master, "commerce-code-digest")
-	commerceProvider := deriveServerKey(master, "commerce-provider-digest")
+	registrationCode := deriveServerKey(master, "commerce-code-digest")
 	registrationProof := deriveServerKey(master, "keycloak-registration-attempt-proof")
-	keys := [][]byte{subject, token, cookie, commerceCode, commerceProvider, registrationProof}
+	keys := [][]byte{subject, token, cookie, registrationCode, registrationProof}
 	for index, key := range keys {
 		if len(key) != 32 {
 			t.Fatalf("derived key %d length = %d, want 32", index, len(key))
@@ -68,9 +67,6 @@ func (target *recordingAuthorityTarget) RefreshDevice(id uuid.UUID) {
 func (target *recordingAuthorityTarget) DisableAccount(id uuid.UUID) {
 	target.record("disable-account", id)
 }
-func (target *recordingAuthorityTarget) RefreshAccount(id uuid.UUID) {
-	target.record("refresh-account", id)
-}
 func (target *recordingAuthorityTarget) RefreshControlPolicy(id uuid.UUID) {
 	target.record("refresh-control-policy", id)
 }
@@ -80,7 +76,6 @@ func TestAuthorityChangeChannelsAndDispatch(t *testing.T) {
 		"device-revoked",
 		"device-authorization-changed",
 		"account-status-changed",
-		"account-entitlement-changed",
 		"pc-control-policy-changed",
 	}
 	if got := authorityChangeChannels(); !reflect.DeepEqual(got, wantChannels) {
@@ -92,7 +87,6 @@ func TestAuthorityChangeChannelsAndDispatch(t *testing.T) {
 		"device-revoked":               "revoke",
 		"device-authorization-changed": "refresh-device",
 		"account-status-changed":       "disable-account",
-		"account-entitlement-changed":  "refresh-account",
 		"pc-control-policy-changed":    "refresh-control-policy",
 	}
 	for channel, wantEvent := range tests {

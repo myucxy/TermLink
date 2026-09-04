@@ -234,7 +234,6 @@ $coreComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\c
 $historyComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\history.compose.yml'))
 $observabilityComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\observability.compose.yml'))
 $externalServicesComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\external-services.compose.yml'))
-$commerceComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\commerce.compose.yml'))
 $registrationRecoveryComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\registration-recovery.compose.yml'))
 $humanVerificationComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\human-verification.compose.yml'))
 $accountDeletionComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\account-deletion.compose.yml'))
@@ -244,7 +243,6 @@ $reviewedComposePaths = @(
     $historyComposePath,
     $observabilityComposePath,
     $externalServicesComposePath,
-    $commerceComposePath,
     $registrationRecoveryComposePath,
     $humanVerificationComposePath,
     $accountDeletionComposePath,
@@ -259,7 +257,6 @@ Assert-Production (@($composeFiles | Sort-Object -Unique).Count -eq $composeFile
 $historyOverlayRequested = $composeFiles -contains $historyComposePath
 $observabilityOverlayRequested = $composeFiles -contains $observabilityComposePath
 $externalServicesOverlayRequested = $composeFiles -contains $externalServicesComposePath
-$commerceOverlayRequested = $composeFiles -contains $commerceComposePath
 $registrationRecoveryOverlayRequested = $composeFiles -contains $registrationRecoveryComposePath
 $humanVerificationOverlayRequested = $composeFiles -contains $humanVerificationComposePath
 $accountDeletionOverlayRequested = $composeFiles -contains $accountDeletionComposePath
@@ -353,7 +350,7 @@ $allowedEnvironment = @{
         'TERMLINK_KEYCLOAK_ADMIN_BASE_URL', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE',
         'TERMLINK_LOG_LEVEL', 'TERMLINK_METRICS_LISTEN_ADDR', 'TERMLINK_OIDC_ALLOWED_PARTIES', 'TERMLINK_OIDC_CLIENT_ID',
         'TERMLINK_OIDC_CLIENT_SECRET_FILE', 'TERMLINK_OIDC_ISSUER', 'TERMLINK_PUBLIC_URL',
-        'TERMLINK_PAYMENT_SECRETS_DIR', 'TERMLINK_REDIS_URL_FILE', 'TERMLINK_REGISTRATION_RECOVERY_ENABLED',
+        'TERMLINK_REDIS_URL_FILE', 'TERMLINK_REGISTRATION_RECOVERY_ENABLED',
         'TERMLINK_S3_ACCESS_KEY_FILE', 'TERMLINK_S3_BUCKET',
         'TERMLINK_S3_ENDPOINT', 'TERMLINK_S3_PUBLIC_ENDPOINT', 'TERMLINK_S3_REGION',
         'TERMLINK_S3_SECRET_KEY_FILE', 'TERMLINK_TOKEN_SIGNING_KEY_FILE',
@@ -389,7 +386,7 @@ $allowedSecretEnvironment = @{
     grafana = @('GF_SECURITY_ADMIN_PASSWORD__FILE')
 }
 $credentialNamePattern = '(?i)(password|secret|token|identity_key_file|database_url|redis_url|s3_access_key|s3_secret_key)'
-$nonCredentialSecretEnvironment = @('TERMLINK_PAYMENT_SECRETS_DIR')
+$nonCredentialSecretEnvironment = @()
 foreach ($serviceName in $allowedEnvironment.Keys) {
     $declaredSecrets = @($allowedSecretEnvironment[$serviceName] | Sort-Object)
     $secretLikeNames = @($allowedEnvironment[$serviceName] |
@@ -506,9 +503,6 @@ $expectedBindSources = @{
         '/etc/grafana/provisioning' = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\observability\grafana\provisioning'))
         '/var/lib/grafana/dashboards' = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\observability\grafana\dashboards'))
     }
-}
-if ($commerceOverlayRequested) {
-    $expectedBindSources.server = @{ '/run/secrets/payment' = $null }
 }
 $allowedNamedVolumeTargets = @{
     edge = @('/config', '/data'); migrate = @(); server = @(); postgres = @('/var/lib/postgresql/data')
@@ -708,14 +702,6 @@ foreach ($serviceProperty in $services) {
                 Assert-SecretPathPermissions -Path $resolvedSource -Directory $false `
                     -DisplayName 'Alertmanager production configuration'
             }
-            if ($name -eq 'server' -and $target -eq '/run/secrets/payment') {
-                Assert-Production (Test-Path -LiteralPath $resolvedSource -PathType Container) `
-                    'Payment secret bind source must be an existing directory.'
-                Assert-SecretPathPermissions -Path $resolvedSource -Directory $true -DisplayName 'Payment secret directory'
-                $bindOptions = Get-PropertyValue $volume 'bind'
-                Assert-Production ($null -ne $bindOptions -and -not [bool](Get-PropertyValue $bindOptions 'create_host_path')) `
-                    'Payment secret bind must disable automatic host-path creation.'
-            }
         }
         else { throw "Service '$name' uses an unapproved mount type: $type" }
     }
@@ -748,10 +734,6 @@ foreach ($serviceProperty in $services) {
                 $nonCredentialSecretEnvironment -cnotcontains $entry.Name -and
                 $entry.Name -notmatch '(?i)(_FILE|__FILE)$') {
                 throw "Service '$name' places secret-like configuration in environment variable '$($entry.Name)'."
-            }
-            if ($entry.Name -ceq 'TERMLINK_PAYMENT_SECRETS_DIR') {
-                Assert-Production ([string]$entry.Value -ceq '/run/secrets/payment') `
-                    "Service '$name' payment secret directory must remain /run/secrets/payment."
             }
             if ($entry.Name -match '(?i)(_FILE|__FILE)$') {
                 Assert-Production ([string]$entry.Value -match '^/run/secrets/[a-z0-9][a-z0-9_-]{0,62}$') `
@@ -902,9 +884,6 @@ if ($accountDeletionEnabled) {
             "Core deployment unexpectedly includes account-deletion setting '$name'."
     }
 }
-$paymentSecretsDirectory = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_PAYMENT_SECRETS_DIR')
-Assert-Production (($paymentSecretsDirectory -ceq '/run/secrets/payment') -eq $commerceOverlayRequested) `
-    'TERMLINK_PAYMENT_SECRETS_DIR must be present only when commerce.compose.yml is selected.'
 $historyExpected = $historyOverlayRequested -or $externalServicesOverlayRequested
 $historyEnabled = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_HISTORY_ENABLED') -ceq 'true'
 Assert-Production ($historyEnabled -eq $historyExpected) `

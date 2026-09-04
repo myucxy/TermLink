@@ -56,10 +56,10 @@ func TestUserPortalPrivacyStateMachinesIntegration(t *testing.T) {
 
 	repository := &Postgres{Pool: pool}
 	accountA, accountB, pcA := seedUserPortalPrivacyAccounts(t, ctx, pool)
-	legalRecords := seedUserPortalAccountDeletionLegalRecords(t, ctx, pool, accountA)
+	legacyRecords := seedUserPortalAccountDeletionLegacyCommercialRecords(t, ctx, pool, accountA)
 	testUserPortalDataExportStateMachine(t, ctx, repository, pool, accountA, accountB)
 	testUserPortalPCPolicyStateMachine(t, ctx, repository, accountA, accountB, pcA)
-	testUserPortalAccountDeletionStateMachine(t, ctx, repository, pool, accountA, accountB, legalRecords)
+	testUserPortalAccountDeletionStateMachine(t, ctx, repository, pool, accountA, accountB, legacyRecords)
 }
 
 func applyUserPortalPrivacyMigrations(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
@@ -118,18 +118,18 @@ func seedUserPortalPrivacyAccounts(t *testing.T, ctx context.Context, pool *pgxp
 	return accountA, accountB, pcA
 }
 
-type userPortalAccountDeletionLegalRecords struct {
+type userPortalAccountDeletionLegacyCommercialRecords struct {
 	orderID       uuid.UUID
 	transactionID uuid.UUID
 	refundID      uuid.UUID
 	orderNumber   string
 }
 
-func seedUserPortalAccountDeletionLegalRecords(t *testing.T, ctx context.Context, pool *pgxpool.Pool, accountID uuid.UUID) userPortalAccountDeletionLegalRecords {
+func seedUserPortalAccountDeletionLegacyCommercialRecords(t *testing.T, ctx context.Context, pool *pgxpool.Pool, accountID uuid.UUID) userPortalAccountDeletionLegacyCommercialRecords {
 	t.Helper()
-	fixture := userPortalAccountDeletionLegalRecords{
+	fixture := userPortalAccountDeletionLegacyCommercialRecords{
 		orderID: uuid.New(), transactionID: uuid.New(), refundID: uuid.New(),
-		orderNumber: "TL-DELETE-LEGAL-0001",
+		orderNumber: "TL-DELETE-LEGACY-0001",
 	}
 	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
 	if _, err := pool.Exec(ctx, `
@@ -160,7 +160,7 @@ func seedUserPortalAccountDeletionLegalRecords(t *testing.T, ctx context.Context
 		INSERT INTO refunds(
 			id,refund_no,order_id,transaction_id,amount_minor,reason,status,requested_by,
 			requested_at,completed_at,updated_at,approved_by,approved_at
-		) VALUES($1,'RF-DELETE-LEGAL-0001',$2,$3,50,'customer private reason','CLOSED',
+		) VALUES($1,'RF-DELETE-LEGACY-0001',$2,$3,50,'customer private reason','CLOSED',
 		         $4,$5,$5,$5,$4,$5)`,
 		fixture.refundID, fixture.orderID, fixture.transactionID, accountID, created); err != nil {
 		t.Fatal(err)
@@ -175,6 +175,13 @@ func seedUserPortalAccountDeletionLegalRecords(t *testing.T, ctx context.Context
 
 func testUserPortalDataExportStateMachine(t *testing.T, ctx context.Context, repository *Postgres, pool *pgxpool.Pool, accountA, accountB uuid.UUID) {
 	t.Helper()
+	legacyOnly, err := repository.UserPortalDataExportSnapshot(ctx, accountA, []string{"BILLING_RECORDS"})
+	if err != nil {
+		t.Fatalf("legacy billing-only export snapshot: %v", err)
+	}
+	if legacyOnly.SchemaVersion != 1 || legacyOnly.Account != nil || legacyOnly.Devices != nil || legacyOnly.PCs != nil || legacyOnly.Sessions != nil || legacyOnly.Security != nil {
+		t.Fatalf("legacy billing-only export leaked active sections: %+v", legacyOnly)
+	}
 	requested, err := repository.RequestUserPortalDataExport(ctx, accountA, "export-request-1", "trace-export-request")
 	if err != nil {
 		t.Fatal(err)
@@ -269,7 +276,7 @@ func testUserPortalPCPolicyStateMachine(t *testing.T, ctx context.Context, repos
 	}
 }
 
-func testUserPortalAccountDeletionStateMachine(t *testing.T, ctx context.Context, repository *Postgres, pool *pgxpool.Pool, accountA, accountB uuid.UUID, legal userPortalAccountDeletionLegalRecords) {
+func testUserPortalAccountDeletionStateMachine(t *testing.T, ctx context.Context, repository *Postgres, pool *pgxpool.Pool, accountA, accountB uuid.UUID, legacy userPortalAccountDeletionLegacyCommercialRecords) {
 	t.Helper()
 	requested, err := repository.RequestUserPortalAccountDeletionState(ctx, accountA, "delete-request-1", "trace-delete-request")
 	if err != nil {
@@ -395,10 +402,10 @@ func testUserPortalAccountDeletionStateMachine(t *testing.T, ctx context.Context
 	if accountStatus != "DELETED" || requestStatus != "COMPLETED" {
 		t.Fatalf("final deletion states=%s/%s, want DELETED/COMPLETED", accountStatus, requestStatus)
 	}
-	assertUserPortalAccountDeletionRetention(t, ctx, pool, accountA, finalRequest.ID, legal)
+	assertUserPortalAccountDeletionRetention(t, ctx, pool, accountA, finalRequest.ID, legacy)
 }
 
-func assertUserPortalAccountDeletionRetention(t *testing.T, ctx context.Context, pool *pgxpool.Pool, accountID, requestID uuid.UUID, legal userPortalAccountDeletionLegalRecords) {
+func assertUserPortalAccountDeletionRetention(t *testing.T, ctx context.Context, pool *pgxpool.Pool, accountID, requestID uuid.UUID, legacy userPortalAccountDeletionLegacyCommercialRecords) {
 	t.Helper()
 	tombstone := userPortalDeletedIdentityDigest(accountID, requestID)
 	var orderRetained, orderAnonymized, paymentRedacted, notificationRedacted bool
@@ -417,7 +424,7 @@ func assertUserPortalAccountDeletionRetention(t *testing.T, ctx context.Context,
 			AND NOT EXISTS(SELECT 1 FROM data_export_requests WHERE account_id=$1)
 			AND NOT EXISTS(SELECT 1 FROM subscriptions WHERE account_id=$1)
 			AND NOT EXISTS(SELECT 1 FROM entitlements WHERE account_id=$1)`,
-		accountID, legal.orderID, legal.transactionID, legal.refundID, legal.orderNumber, tombstone[:],
+		accountID, legacy.orderID, legacy.transactionID, legacy.refundID, legacy.orderNumber, tombstone[:],
 	).Scan(
 		&orderRetained, &orderAnonymized, &paymentRedacted, &notificationRedacted,
 		&refundRedacted, &auditRetained, &identityAnonymized, &privateRowsGone,
@@ -427,7 +434,7 @@ func assertUserPortalAccountDeletionRetention(t *testing.T, ctx context.Context,
 	}
 	if !orderRetained || !orderAnonymized || !paymentRedacted || !notificationRedacted ||
 		!refundRedacted || !auditRetained || !identityAnonymized || !privateRowsGone {
-		t.Fatalf("retention/anonymization failed order=%t/%t payment=%t notification=%t refund=%t audit=%t identity=%t privateGone=%t",
+		t.Fatalf("legacy retention/anonymization failed order=%t/%t payment=%t notification=%t refund=%t audit=%t identity=%t privateGone=%t",
 			orderRetained, orderAnonymized, paymentRedacted, notificationRedacted,
 			refundRedacted, auditRetained, identityAnonymized, privateRowsGone)
 	}

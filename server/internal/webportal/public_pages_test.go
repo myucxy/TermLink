@@ -14,8 +14,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/termlink/termlink/server/internal/store"
 )
 
 type publicReleaseSourceFunc func(context.Context, PublicReleaseTarget) (PublicRelease, error)
@@ -28,17 +26,6 @@ type testPublicReleaseResolverFunc func(context.Context, string) ([]net.IPAddr, 
 
 func (resolver testPublicReleaseResolverFunc) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
 	return resolver(ctx, host)
-}
-
-type publicPlansRepository struct {
-	*testPortalRepository
-	version int64
-	plans   []store.Plan
-	err     error
-}
-
-func (r *publicPlansRepository) PublishedPlans(context.Context) (int64, []store.Plan, error) {
-	return r.version, r.plans, r.err
 }
 
 func TestPublicDownloadsAndReleasesUseValidatedAppShipData(t *testing.T) {
@@ -380,38 +367,6 @@ func TestPublicReleaseCacheDeduplicatesAndNeverServesExpiredData(t *testing.T) {
 	}
 }
 
-func TestPublicPlansUseOnlyPublishedCatalog(t *testing.T) {
-	portal := newTestPortal(t, &testOIDCFlow{})
-	portal.config.Repository = &publicPlansRepository{
-		testPortalRepository: newTestPortalRepository(),
-		version:              73,
-		plans: []store.Plan{{
-			Key: "dynamic-pro", DisplayName: `<img src=x onerror=alert(1)> 动态专业版`,
-			Description: "仅来自 PublishedPlans", BillingPeriod: "MONTHLY", PriceMinor: 1234, Currency: "CNY",
-		}},
-	}
-	response := performRequest(portal.Handler(), http.MethodGet, "/plans", nil)
-	if response.Code != http.StatusOK {
-		t.Fatalf("plans status=%d", response.Code)
-	}
-	body := response.Body.String()
-	for _, expected := range []string{"当前目录 v73", "动态专业版", "仅来自 PublishedPlans", "¥12.34"} {
-		if !strings.Contains(body, expected) {
-			t.Errorf("plans page omitted %q", expected)
-		}
-	}
-	if strings.Contains(body, `<img src=x onerror=alert(1)>`) || !strings.Contains(body, `&lt;img src=x onerror=alert(1)&gt;`) {
-		t.Fatal("plans page did not HTML-escape catalog content")
-	}
-
-	portal.config.Repository = &publicPlansRepository{testPortalRepository: newTestPortalRepository(), err: errors.New("postgresql://secret@db.internal")}
-	response = performRequest(portal.Handler(), http.MethodGet, "/plans", nil)
-	body = response.Body.String()
-	if !strings.Contains(body, "套餐暂不可用") || strings.Contains(body, "secret") || strings.Contains(body, "db.internal") {
-		t.Fatalf("plans failure was not safely degraded: %s", body)
-	}
-}
-
 func TestPublicPagesExposeResponsiveThemeDOMContract(t *testing.T) {
 	portal := newTestPortal(t, &testOIDCFlow{})
 	response := performRequest(portal.Handler(), http.MethodGet, "/security", nil)
@@ -450,7 +405,6 @@ func TestPublicNavigationKeepsDownloadsAndHidesReleaseCatalogAndStatusEntries(t 
 	pages := map[string]string{
 		"/downloads": "下载 TermLink",
 		"/releases":  "版本记录",
-		"/plans":     "套餐",
 		"/status":    "服务状态",
 		"/security":  "安全说明",
 	}
@@ -472,6 +426,10 @@ func TestPublicNavigationKeepsDownloadsAndHidesReleaseCatalogAndStatusEntries(t 
 			}
 		}
 	}
+	response := performRequest(portal.Handler(), http.MethodGet, "/plans", nil)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("GET /plans status=%d, want 404", response.Code)
+	}
 }
 
 func TestPublicFailuresShowUnavailableWithoutLeakingDiagnosticsOrStaleData(t *testing.T) {
@@ -491,7 +449,7 @@ func TestPublicFailuresShowUnavailableWithoutLeakingDiagnosticsOrStaleData(t *te
 			t.Errorf("status page leaked %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"Web 门户", "账号与身份", "实时连接", "支付服务", "客户端版本分发", "暂不可用"} {
+	for _, expected := range []string{"Web 门户", "账号与身份", "实时连接", "客户端版本分发", "暂不可用"} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("status page omitted coarse status %q", expected)
 		}

@@ -1894,11 +1894,6 @@ func (h *Hub) DisableAccount(userID uuid.UUID) {
 	h.closeAccount(userID, "account disabled")
 }
 
-// RefreshAccount is retained for the entitlement-change pub/sub event. Quota
-// and billing metadata changes do not alter routing authority, so active
-// transports and subscriptions remain connected.
-func (h *Hub) RefreshAccount(_ uuid.UUID) {}
-
 func (h *Hub) closeAccount(userID uuid.UUID, reason string) {
 	h.mu.RLock()
 	peers := make([]*peer, 0)

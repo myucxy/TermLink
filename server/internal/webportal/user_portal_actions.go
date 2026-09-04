@@ -47,9 +47,13 @@ type userPortalActionRepository interface {
 	CancelUserPortalAccountDeletion(context.Context, uuid.UUID, uuid.UUID, string, string) (store.UserPortalAccountDeletion, error)
 }
 
-func (p *Portal) loadUserPortalPrivacySelection(ctx context.Context, repository userPortalActionRepository, accountID uuid.UUID, values url.Values, data *commerceAccountPageData) error {
+type portalAuditRepository interface {
+	Audit(context.Context, uuid.UUID, uuid.UUID, string, string, uuid.UUID, string, string, string) error
+}
+
+func (p *Portal) loadUserPortalPrivacySelection(ctx context.Context, repository userPortalActionRepository, accountID uuid.UUID, values url.Values, data *userPortalPageData) error {
 	allowed := map[string]bool{"section": true, "notice": true, "export_id": true, "deletion_id": true}
-	if data == nil || values.Get("section") != "privacy" || validateCommerceFormValues(values, allowed) != nil {
+	if data == nil || values.Get("section") != "privacy" || validatePortalFormValues(values, allowed) != nil {
 		return errUserPortalRequest
 	}
 	if exportText := strings.TrimSpace(values.Get("export_id")); exportText != "" {
@@ -441,7 +445,7 @@ func (p *Portal) auditUserPortalActionSuccess(r *http.Request, accountID uuid.UU
 }
 
 func (p *Portal) recordUserPortalActionAudit(r *http.Request, accountID uuid.UUID, action, targetType string, targetID uuid.UUID) error {
-	repository, ok := p.config.Repository.(commerceExportAuditRepository)
+	repository, ok := p.config.Repository.(portalAuditRepository)
 	if !ok {
 		return errors.New("web portal audit repository unavailable")
 	}

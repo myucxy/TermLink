@@ -233,8 +233,6 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("termlink-production-policy-{0
 $secretRoot = Join-Path $testRoot 'secrets'
 [void][IO.Directory]::CreateDirectory($testRoot)
 [void][IO.Directory]::CreateDirectory($secretRoot)
-$paymentSecretRoot = Join-Path $testRoot 'payment-secrets'
-[void][IO.Directory]::CreateDirectory($paymentSecretRoot)
 $identityKeyBytes = $null
 $identityKey = $null
 $rotatedIdentityKeyBytes = $null
@@ -245,7 +243,6 @@ $thirdIdentityKey = $null
 try {
     Set-TestSecretPermissions -Path $testRoot -Directory $true
     Set-TestSecretPermissions -Path $secretRoot -Directory $true
-    Set-TestSecretPermissions -Path $paymentSecretRoot -Directory $true
 
     $valkeyPassword = 'Valkey_Test_7Pz4mN8vQ2xK6cR9'
     $directValkeyPassword = 'DirectValkey_Test_8Qm4xN7pR2vK6sL9'
@@ -315,8 +312,7 @@ receivers:
         'TERMLINK_HUMAN_VERIFICATION_SITE_KEY=0x4AAAA-production-test-site-key',
         "TERMLINK_HUMAN_VERIFICATION_SECRET_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'human-verification-secret'))",
         "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'account-deletion-identity-key'))",
-        'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION=1',
-        "TERMLINK_PAYMENT_SECRETS_HOST_DIR=$(ConvertTo-ComposeHostPath $paymentSecretRoot)"
+        'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION=1'
     )
     [IO.File]::WriteAllLines($envFile, $environmentLines, [Text.UTF8Encoding]::new($false))
 
@@ -324,7 +320,6 @@ receivers:
     $history = Join-Path $composeRoot 'history.compose.yml'
     $observability = Join-Path $composeRoot 'observability.compose.yml'
     $externalServices = Join-Path $composeRoot 'external-services.compose.yml'
-    $commerce = Join-Path $composeRoot 'commerce.compose.yml'
     $registrationRecovery = Join-Path $composeRoot 'registration-recovery.compose.yml'
     $humanVerification = Join-Path $composeRoot 'human-verification.compose.yml'
     $accountDeletion = Join-Path $composeRoot 'account-deletion.compose.yml'
@@ -340,13 +335,12 @@ receivers:
     )
     $matrixCount = 0
     foreach ($historyChoice in $historyChoices) {
-        for ($flags = 0; $flags -lt 32; $flags++) {
+        for ($flags = 0; $flags -lt 16; $flags++) {
             $featureFiles = @($core) + @($historyChoice.Files)
-            if (($flags -band 1) -ne 0) { $featureFiles += $commerce }
-            if (($flags -band 2) -ne 0) { $featureFiles += $observability }
-            if (($flags -band 4) -ne 0) { $featureFiles += $registrationRecovery }
-            if (($flags -band 8) -ne 0) { $featureFiles += $humanVerification }
-            if (($flags -band 16) -ne 0) { $featureFiles += $directTransport }
+            if (($flags -band 1) -ne 0) { $featureFiles += $observability }
+            if (($flags -band 2) -ne 0) { $featureFiles += $registrationRecovery }
+            if (($flags -band 4) -ne 0) { $featureFiles += $humanVerification }
+            if (($flags -band 8) -ne 0) { $featureFiles += $directTransport }
             $deletionOptions = if ($historyChoice.AllowsDeletion) { @($false, $true) } else { @($false) }
             foreach ($withDeletion in $deletionOptions) {
                 $files = @($featureFiles)
@@ -358,7 +352,7 @@ receivers:
             }
         }
     }
-    if ($matrixCount -ne 320) {
+    if ($matrixCount -ne 160) {
         throw "Unexpected Compose matrix size: $matrixCount"
     }
 
@@ -367,7 +361,6 @@ receivers:
         @{ Name = 'core without edge'; Files = @($core); Edge = $false },
         @{ Name = 'core plus local history'; Files = @($core, $history); Edge = $true },
         @{ Name = 'core plus observability'; Files = @($core, $observability); Edge = $true },
-        @{ Name = 'core plus commerce'; Files = @($core, $commerce); Edge = $true },
         @{ Name = 'core plus registration recovery'; Files = @($core, $registrationRecovery); Edge = $true },
         @{ Name = 'core plus human verification'; Files = @($core, $humanVerification); Edge = $true },
         @{ Name = 'core plus Direct shared state'; Files = @($core, $directTransport); Edge = $true },
@@ -376,7 +369,7 @@ receivers:
         @{ Name = 'default full stack'; Files = @($core, $history, $observability); Edge = $true },
         @{ Name = 'external S3'; Files = @($core, $externalServices); Edge = $true },
         @{ Name = 'external S3 plus observability'; Files = @($core, $externalServices, $observability); Edge = $true },
-        @{ Name = 'external full feature stack'; Files = @($core, $externalServices, $commerce, $observability, $registrationRecovery, $humanVerification, $accountDeletion, $directTransport); Edge = $true }
+        @{ Name = 'external full feature stack'; Files = @($core, $externalServices, $observability, $registrationRecovery, $humanVerification, $accountDeletion, $directTransport); Edge = $true }
     )
     foreach ($case in $cases) {
         Write-Host "Validating $($case.Name)..."
@@ -435,7 +428,6 @@ receivers:
         -IncludeEdge:$true -ExpectedPattern 'syntactically valid ACME contact email'
 
     $missingCases = @(
-        @{ Name = 'commerce directory'; Files = @($core, $commerce); Remove = @('TERMLINK_PAYMENT_SECRETS_HOST_DIR='); Pattern = 'TERMLINK_PAYMENT_SECRETS_HOST_DIR' },
         @{ Name = 'history public host'; Files = @($core, $history); Remove = @('TERMLINK_HISTORY_PUBLIC_HOST='); Pattern = 'TERMLINK_HISTORY_PUBLIC_HOST' },
         @{ Name = 'history access key'; Files = @($core, $history); Remove = @('TERMLINK_S3_ACCESS_KEY_FILE='); Pattern = 'TERMLINK_S3_ACCESS_KEY_FILE' },
         @{ Name = 'external S3 endpoint'; Files = @($core, $externalServices); Remove = @('TERMLINK_S3_ENDPOINT='); Pattern = 'TERMLINK_S3_ENDPOINT' },

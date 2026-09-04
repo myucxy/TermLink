@@ -322,7 +322,7 @@ func TestCustomAdminRouteHidesDefaultAndTranslatesPortalLinks(t *testing.T) {
 	portal.config.Repository = repository
 	const segment = "4hPzK8mQvX2sN7aB"
 	enableTestAdminRoute(t, portal, repository, segment)
-	cookie := commerceSessionCookie(t, portal, store.RoleSuperAdmin, "admin-route-csrf", time.Minute)
+	cookie := portalSessionCookie(t, portal, store.RoleSuperAdmin, "admin-route-csrf", time.Minute)
 
 	hidden := performRequest(portal.Handler(), http.MethodGet, "/admin", nil, cookie)
 	if hidden.Code != http.StatusNotFound || strings.Contains(hidden.Body.String(), segment) {
@@ -547,12 +547,12 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 		strings.Contains(registerScript.Body.String(), "error instanceof Error ? error.message") {
 		t.Fatalf("registration prompts must be safely localized in Chinese and English: status=%d", registerScript.Code)
 	}
-	commerceScript := performRequest(portal.Handler(), http.MethodGet, "/assets/commerce-admin.js", nil)
-	if commerceScript.Code != http.StatusOK ||
-		!strings.Contains(commerceScript.Body.String(), "data-copy-all-codes") ||
-		!strings.Contains(commerceScript.Body.String(), "beforeunload") ||
-		!strings.Contains(commerceScript.Body.String(), "Invitation code copied") {
-		t.Fatalf("commerce invitation receipt script is incomplete: status=%d", commerceScript.Code)
+	registrationScript := performRequest(portal.Handler(), http.MethodGet, "/assets/registration-admin.js", nil)
+	if registrationScript.Code != http.StatusOK ||
+		!strings.Contains(registrationScript.Body.String(), "data-copy-all-codes") ||
+		!strings.Contains(registrationScript.Body.String(), "beforeunload") ||
+		!strings.Contains(registrationScript.Body.String(), "Invitation code copied") {
+		t.Fatalf("registration invitation receipt script is incomplete: status=%d", registrationScript.Code)
 	}
 	for _, asset := range []string{"/assets/termlink-app-icon.svg", "/assets/termlink-favicon.svg"} {
 		icon := performRequest(portal.Handler(), http.MethodGet, asset, nil)
@@ -576,12 +576,12 @@ func TestPortalDefaultLoginReturnsToAccessibleSignedInHome(t *testing.T) {
 
 func TestPortalOperationNoticesIncludeChineseAndEnglish(t *testing.T) {
 	for name, notice := range map[string]string{
-		"admin":          adminNotice("role-updated"),
-		"account":        commerceNotice("device-revoked"),
-		"commerce admin": commerceAdminNotice("order-closed"),
+		"admin":        adminNotice("role-updated"),
+		"account":      userPortalNotice("device-revoked"),
+		"registration": registrationAdminNotice("status-updated"),
 	} {
 		if !strings.Contains(notice, " / ") ||
-			!strings.ContainsAny(notice, "账号设备订单") ||
+			!strings.ContainsAny(notice, "账号设备邀请") ||
 			!strings.ContainsAny(notice, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz") {
 			t.Errorf("%s notice is not bilingual: %q", name, notice)
 		}
@@ -880,19 +880,19 @@ func TestPortalAccountResponsiveAndSVGControlContract(t *testing.T) {
 		!strings.Contains(readAsset("theme.js"), `details.admin-account-menu, details.account-menu`) {
 		t.Error("administrator account menu must have an opaque elevated surface and dismissible interaction")
 	}
-	commerceCSS := readAsset("commerce-portal.css")
+	portalCSS := readAsset("portal.css")
 	portalDashboardHTML := readAsset("portal-dashboard.html")
-	commerceAdminHTML := readAsset("commerce-admin.html")
-	if strings.Contains(commerceCSS, `var(--surface-1)`) ||
-		strings.Contains(commerceCSS, `var(--surface-2)`) ||
-		strings.Contains(commerceCSS, `var(--text-1)`) ||
+	registrationAdminHTML := readAsset("registration-admin.html")
+	if strings.Contains(portalCSS, `var(--surface-1)`) ||
+		strings.Contains(portalCSS, `var(--surface-2)`) ||
+		strings.Contains(portalCSS, `var(--text-1)`) ||
 		strings.Contains(adminCSS, `var(--surface-1)`) ||
 		strings.Contains(adminCSS, `var(--text-1)`) ||
-		!strings.Contains(commerceCSS, `.account-menu-panel`) ||
-		!strings.Contains(commerceCSS, `background: var(--surface);`) ||
-		!strings.Contains(portalDashboardHTML, `/assets/commerce-portal.css?v=01b-v7`) ||
-		!strings.Contains(commerceAdminHTML, `/assets/admin.css?v=01b-v17`) ||
-		!strings.Contains(commerceAdminHTML, `/assets/commerce-portal.css?v=01b-v7`) {
+		!strings.Contains(portalCSS, `.account-menu-panel`) ||
+		!strings.Contains(portalCSS, `background: var(--surface);`) ||
+		!strings.Contains(portalDashboardHTML, `/assets/portal-dashboard.css?v=registration-v2`) ||
+		!strings.Contains(registrationAdminHTML, `/assets/admin.css?v=01b-v17`) ||
+		!strings.Contains(registrationAdminHTML, `/assets/portal-dashboard.css?v=registration-v2`) {
 		t.Error("account menus must use defined theme surfaces and versioned opaque panel styles")
 	}
 	for _, contract := range []string{
@@ -903,8 +903,8 @@ func TestPortalAccountResponsiveAndSVGControlContract(t *testing.T) {
 			t.Errorf("in-page identity security dialog omitted %q", contract)
 		}
 	}
-	if !strings.Contains(commerceCSS, `.identity-security-dialog::backdrop`) ||
-		!strings.Contains(commerceCSS, `.identity-security-dialog iframe`) ||
+	if !strings.Contains(portalCSS, `.identity-security-dialog::backdrop`) ||
+		!strings.Contains(portalCSS, `.identity-security-dialog iframe`) ||
 		!strings.Contains(readAsset("theme.js"), "const actionURL = `${baseURL.replace(/\\/$/, \"\")}/${action}`;") {
 		t.Error("identity security actions must open their allowlisted Keycloak section in the same-page dialog")
 	}
@@ -1671,12 +1671,12 @@ func TestSensitiveAdminActionRequiresStrongVerificationReasonAndIdempotency(t *t
 	}
 
 	withoutAuthTime := seal(time.UnixMilli(0), true)
-	response := performCommerceForm(portal.Handler(), target, validValues, withoutAuthTime)
+	response := performPortalForm(portal.Handler(), target, validValues, withoutAuthTime)
 	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "需要安全验证") {
 		t.Fatalf("missing auth_time response=%d %q", response.Code, response.Body.String())
 	}
 	withoutMFA := seal(portal.now().Add(-time.Minute), false)
-	response = performCommerceForm(portal.Handler(), target, validValues, withoutMFA)
+	response = performPortalForm(portal.Handler(), target, validValues, withoutMFA)
 	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "未绑定时重新验证一次登录密码") {
 		t.Fatalf("missing MFA response=%d %q", response.Code, response.Body.String())
 	}
@@ -1694,19 +1694,19 @@ func TestSensitiveAdminActionRequiresStrongVerificationReasonAndIdempotency(t *t
 		"csrf": {"sensitive-csrf"}, "role": {"USER"}, "reason": {"密码二次验证后执行"},
 		"idempotency_key": {"account-role-password-0001"},
 	}
-	response = performCommerceForm(portal.Handler(), target, passwordFallback,
+	response = performPortalForm(portal.Handler(), target, passwordFallback,
 		&http.Cookie{Name: sessionCookieName, Value: passwordValue, Path: "/"})
 	if response.Code != http.StatusConflict {
 		t.Fatalf("password fallback did not authorize sensitive action: %d %q", response.Code, response.Body.String())
 	}
 	strong := seal(portal.now().Add(-time.Minute), true)
 	missingReason := url.Values{"csrf": {"sensitive-csrf"}, "role": {"USER"}, "idempotency_key": {"account-role-sensitive-0002"}}
-	response = performCommerceForm(portal.Handler(), target, missingReason, strong)
+	response = performPortalForm(portal.Handler(), target, missingReason, strong)
 	if response.Code != http.StatusConflict {
 		t.Fatalf("automatic reason response=%d body=%q", response.Code, response.Body.String())
 	}
 	missingKey := url.Values{"csrf": {"sensitive-csrf"}, "role": {"USER"}, "reason": {"权限复核后降级账号"}}
-	response = performCommerceForm(portal.Handler(), target, missingKey, strong)
+	response = performPortalForm(portal.Handler(), target, missingKey, strong)
 	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "请求标识无效") {
 		t.Fatalf("missing idempotency key response=%d %q", response.Code, response.Body.String())
 	}
@@ -1720,7 +1720,7 @@ func TestSensitiveAdminActionRequiresStrongVerificationReasonAndIdempotency(t *t
 		}
 	}
 
-	response = performCommerceForm(portal.Handler(), target, validValues, strong)
+	response = performPortalForm(portal.Handler(), target, validValues, strong)
 	if response.Code != http.StatusConflict {
 		t.Fatalf("complete strong request response=%d %q", response.Code, response.Body.String())
 	}
@@ -1732,7 +1732,7 @@ func TestSensitiveAdminActionRequiresStrongVerificationReasonAndIdempotency(t *t
 		"csrf": {"sensitive-csrf"}, "role": {"USER"}, "reason": {"权限复核后降级账号"},
 		"idempotency_key": {"account-role-sensitive-0003"},
 	}
-	response = performCommerceForm(portal.Handler(), target, duplicate, strong)
+	response = performPortalForm(portal.Handler(), target, duplicate, strong)
 	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "请求已提交") {
 		t.Fatalf("duplicate sensitive request response=%d %q", response.Code, response.Body.String())
 	}
@@ -1740,7 +1740,7 @@ func TestSensitiveAdminActionRequiresStrongVerificationReasonAndIdempotency(t *t
 
 func TestEverySensitiveAdminFormCarriesRequiredFields(t *testing.T) {
 	formPattern := regexp.MustCompile(`(?s)<form[^>]+action="/admin[^>]*>.*?</form>`)
-	for _, name := range []string{"admin.html", "commerce-admin.html"} {
+	for _, name := range []string{"admin.html", "registration-admin.html"} {
 		contents, err := portalAssets.ReadFile("assets/" + name)
 		if err != nil {
 			t.Fatal(err)

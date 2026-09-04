@@ -154,7 +154,7 @@ func TestPrivacyExportRequestWithoutDownloaderDoesNotCreateTask(t *testing.T) {
 	now := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
 	accountID, deviceID := uuid.New(), uuid.New()
 	repository := &fakeUserPortalActionStore{now: now}
-	service := &API{Clock: func() time.Time { return now }, commerceSecurity: &memoryCommerceSecurityStore{}}
+	service := &API{Clock: func() time.Time { return now }, operationSecurity: &memoryOperationSecurityStore{}}
 	actions := userPortalActionHandlers{api: service, repository: repository}
 	endpoint := userPortalAuthenticatedEndpoint(t, accountID, deviceID, now,
 		"POST /v1/account/data-exports", auth.Identity{MFA: true, AuthenticatedAt: now}, actions.requestDataExport)

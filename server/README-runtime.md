@@ -127,7 +127,6 @@ The supported production layers are intentionally small:
 | --- | --- | --- | --- |
 | `core` | `server`, PostgreSQL, Valkey; one-shot `migrate` | OIDC, database/Valkey/token secrets | Always |
 | `edge` profile | Caddy | public host, production ACME email | Only when TermLink terminates public TLS itself |
-| `commerce` | none; read-only payment-secret mount | protected existing host directory | Only for locally configured Alipay/WeChat channels |
 | `history` | MinIO and isolated object networks | history host plus S3 credentials | Only for locally managed encrypted objects |
 | `external-services` | none | external HTTPS S3 origin and credentials | Instead of local `history` |
 | `observability` | Prometheus, Blackbox, Alertmanager, Grafana | Grafana secret and explicit reviewed Alertmanager receiver configuration | Only when not supplied by platform monitoring |
@@ -138,8 +137,8 @@ The supported production layers are intentionally small:
 
 Do not add every overlay by default. A headless core behind an existing ingress
 has three steady-state containers; `migrate` exits successfully and can then be
-removed. Commerce, recovery, and account deletion reuse the server process and
-do not justify extra worker containers. Choose exactly one history provider,
+removed. Recovery and account deletion reuse the server process and do not
+justify extra worker containers. Choose exactly one history provider,
 and omit the bundled observability stack when the hosting platform already
 provides equivalent private metrics, alerts, and dashboards.
 
@@ -148,7 +147,7 @@ It does not turn a proxy-rewritten request Host into an absolute
 `TERMLINK_PUBLIC_URL` redirect, so an ingress or alternate entry does not cause
 the browser to bounce between addresses. `TERMLINK_PUBLIC_URL` remains the
 security authority for the configured OIDC callback and provider-bound checks;
-OIDC/Keycloak, payment-provider, Turnstile, and artifact-download URLs are
+OIDC/Keycloak, Turnstile, and artifact-download URLs are
 intentionally absolute because those protocols cross origins. Reverse proxies
 should preserve the browser Host or set one unambiguous `X-Forwarded-Host`.
 
@@ -229,11 +228,7 @@ deployments remain compatible because every setting has a default:
 
 Durations use Go duration syntax, such as `500ms`, `5s`, or `30m`. Invalid
 values fail with the environment field name only; connection URLs, passwords,
-and secret contents are never echoed. `TERMLINK_PAYMENT_SECRETS_DIR` defaults
-to `/run/secrets` in the binary. It is set to `/run/secrets/payment` only by the
-commerce overlay and must be an absolute, cleaned, non-root directory.
-Configuration stores this base path but does not enumerate or load
-payment-provider secrets.
+and secret contents are never echoed.
 
 Keycloak identity administration is disabled by default in the binary so
 deployments using a non-Keycloak issuer remain compatible. The recovery overlay
@@ -254,11 +249,7 @@ All account creation passes through the TermLink registration API; Keycloak's
 native registration endpoint stays closed. Recovery accepts only identities carrying a matching HMAC-backed
 attempt attribute, and its bounded runner starts only when the overlay is
 enabled. Its client secret remains file-backed and is redacted from
-diagnostics. Payment reconciliation starts in every server process but remains
-idle until PostgreSQL contains a pending run. It uses the same real, versioned
-payment-channel resolver as live commerce and the provider-reference digest
-domain required to compare existing local hashes; provider keys continue to
-come only from `TERMLINK_PAYMENT_SECRETS_DIR`.
+diagnostics.
 
 Human verification is disabled by default. A `SUPER_ADMIN` can configure the
 Cloudflare Turnstile Site Key, write-only Secret, and enable switch on the
@@ -281,27 +272,6 @@ an e-mail code cannot be reused to create the account. Both the server and end
 users' browsers must be able to reach `https://challenges.cloudflare.com`.
 Provider or settings-store outages return a temporary-unavailable result; they
 never bypass the challenge.
-
-Payment provider secrets are opt-in and do not belong in the Compose
-environment or database. Put each private key, public key/certificate, or API
-v3 key in a locked-down host directory, then add the commerce overlay:
-
-```powershell
-$env:TERMLINK_PAYMENT_SECRETS_HOST_DIR = 'D:\TermLink\payment-secrets'
-docker compose --env-file .env.production `
-  -f compose/core.compose.yml -f compose/commerce.compose.yml `
-  --profile edge up -d
-```
-
-The overlay bind-mounts that existing directory read-only at
-`/run/secrets/payment`; `create_host_path: false` prevents a misspelled path
-from silently creating an empty directory. Payment channel versions store only
-references such as `docker-secret://alipay-merchant-private-key`. The service
-loads the referenced file only for local validation or a payment operation,
-and never returns its contents through API or Web pages. Selecting the overlay
-does not invent or activate a payment channel: absent channel records or absent
-referenced files remain `payment unavailable`, rather than a false healthy
-provider.
 
 Final account deletion is also opt-in. The identity-key file must contain
 standard base64 or base64url encoding of exactly 32 random bytes (an AES-256
@@ -379,7 +349,7 @@ The Go config package fails fast for missing, empty, or over-permissive secret
 files. Its `Secret` values redact themselves in ordinary and `%#v` formatting;
 startup errors identify only the configuration field, never the secret value.
 
-## 开发项 1-7 完成矩阵
+## 核心功能完成矩阵
 
 | 开发项 | 范围 | 状态 | 验证与边界 |
 | --- | --- | --- | --- |
@@ -387,22 +357,18 @@ startup errors identify only the configuration field, never the secret value.
 | 2 | 生产 Protobuf 实时协议、X25519 + ChaCha20-Poly1305、Relay | **已实现并验证** | `protocol/protobuf/termlink_realtime.proto`、Go `realtimewire`/Relay、Android `core-network`、Windows `src/Protocol`；向量、协议和 Relay 测试通过。 |
 | 3 | Windows ConPTY 到 Android 真实输入输出、ACK/Gap/重连、租约与本地输入优先 | **已实现并验证** | Windows `ProductionAgentRuntime`、Android 生产 Session Client、服务端租约/撤销；生产路径自动化覆盖有界重放、ACK/Gap、输入去重、租约和本地输入 epoch。 |
 | 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
-| 5 | 服务端 Catalog、计费验证边界、权益与配额 | **核心已实现并验证（Provider 待配置）** | Go `billing`/Catalog/entitlement API、可注入 verified-purchase 契约与 Android `feature-billing` 已测试；真实 Google/Web verifier 未配置时生产入口返回 `BILLING_UNAVAILABLE`。 |
-| 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |
-| 7 | 生产 TLS/受信发布证书真实安装更新、备份恢复演练、镜像签名、监控告警、生产 CA/发布加固 | **已实现并本地验证（外部发布待验收）** | Caddy/ACME、内部 Prometheus、Alertmanager/Grafana、真实 PostgreSQL+MinIO 恢复演练、摘要固定、SBOM/provenance/Cosign workflow 与部署策略已验证；生产域名签发、告警接收器和 GitHub OIDC release tag 仍需外部执行。 |
+| 5 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |
+| 6 | 生产 TLS/受信发布证书真实安装更新、备份恢复演练、镜像签名、监控告警、生产 CA/发布加固 | **已实现并本地验证（外部发布待验收）** | Caddy/ACME、内部 Prometheus、Alertmanager/Grafana、真实 PostgreSQL+MinIO 恢复演练、摘要固定、SBOM/provenance/Cosign workflow 与部署策略已验证；生产域名签发、告警接收器和 GitHub OIDC release tag 仍需外部执行。 |
 
 统一边界：`LAN Replay V1`、`TLT1`（Phase 1 Test Session V1）和 Android Compose
 Harness 都是测试夹具，不是生产协议；Android 历史客户端只接受 HTTPS。Integration
-Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-7
+Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-6
 的本地自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏或外部生产发布已经验证。
 
 首版运行时以 OIDC issuer + subject 对应的账号作为发现和路由边界：Windows Agent 与 Android
 登录同一账号后直接使用该账号的受管 PC/Session，不要求配对、自授信或逐 PC Grant。每台设备
 仍生成独立密钥并证明私钥持有，跨账号请求必须拒绝；远程输入仍要求短时 Lease，本地输入优先；
 显式设备撤销会断开连接并停止新 Key Epoch 分发。普通客户端退出登录不是服务端设备撤销或解绑。
-
-运行时配置仍要求真实 OIDC/Google/Web Billing Provider 在部署前注入；本地默认配置只验证
-契约和 `BILLING_UNAVAILABLE` 失败边界，不冒充线上购买或公网部署结果。
 
 ## TLS, observability, backup, and release checks
 

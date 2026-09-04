@@ -52,9 +52,6 @@ func TestLoadFromEnvReadsSecretsAndRedactsDiagnostics(t *testing.T) {
 		c.RedisWriteTimeout != 3*time.Second || c.RedisPoolTimeout != 4*time.Second {
 		t.Fatalf("Valkey defaults not applied: %#v", c)
 	}
-	if c.PaymentSecretsDir != "/run/secrets" {
-		t.Fatalf("PaymentSecretsDir = %q, want /run/secrets", c.PaymentSecretsDir)
-	}
 	if c.RegistrationRecoveryEnabled || c.KeycloakAdminClientID != "termlink-registration-recovery" ||
 		c.KeycloakAdminBaseURL != "" || !c.KeycloakAdminClientSecret.Empty() {
 		t.Fatalf("registration recovery defaults not applied: %#v", c)
@@ -282,7 +279,6 @@ func TestLoadConnectionPoolAndTimeoutOverrides(t *testing.T) {
 	env["TERMLINK_REDIS_READ_TIMEOUT"] = "4s"
 	env["TERMLINK_REDIS_WRITE_TIMEOUT"] = "5s"
 	env["TERMLINK_REDIS_POOL_TIMEOUT"] = "6s"
-	env["TERMLINK_PAYMENT_SECRETS_DIR"] = filepath.Join(t.TempDir(), "payment-secrets")
 	env["TERMLINK_LOG_LEVEL"] = "DEBUG"
 
 	c, err := LoadFromEnv(env)
@@ -301,9 +297,6 @@ func TestLoadConnectionPoolAndTimeoutOverrides(t *testing.T) {
 	}
 	if c.LogLevel != "debug" {
 		t.Fatalf("LogLevel = %q, want normalized debug", c.LogLevel)
-	}
-	if c.PaymentSecretsDir != env["TERMLINK_PAYMENT_SECRETS_DIR"] {
-		t.Fatalf("PaymentSecretsDir = %q, want %q", c.PaymentSecretsDir, env["TERMLINK_PAYMENT_SECRETS_DIR"])
 	}
 }
 
@@ -343,30 +336,6 @@ func TestLoadRejectsInvalidConnectionControlsWithoutEchoingValues(t *testing.T) 
 				t.Fatalf("error echoed configuration value %q: %v", test.value, err)
 			}
 		})
-	}
-}
-
-func TestPaymentSecretsDirectoryIsAbsoluteCleanAndNonRoot(t *testing.T) {
-	input := Input{
-		PublicURL: "https://termlink.example.test", OIDCIssuer: "https://issuer.example.test",
-		OIDCClientID: "client", OIDCClientSecret: "oidc", DatabaseURL: "postgres",
-		RedisURL: "redis", TokenSigningKey: "01234567890123456789012345678901",
-		PaymentSecretsDir: filepath.Join(t.TempDir(), "payment", "..", "provider-secrets"),
-	}
-	c, err := New(input)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	if c.PaymentSecretsDir != filepath.Clean(input.PaymentSecretsDir) {
-		t.Fatalf("PaymentSecretsDir = %q, want clean %q", c.PaymentSecretsDir, filepath.Clean(input.PaymentSecretsDir))
-	}
-
-	for _, invalid := range []string{"relative/secrets", "/"} {
-		input.PaymentSecretsDir = invalid
-		_, err := New(input)
-		if err == nil || !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "TERMLINK_PAYMENT_SECRETS_DIR") {
-			t.Fatalf("New(PaymentSecretsDir=%q) error = %v, want ErrInvalid", invalid, err)
-		}
 	}
 }
 

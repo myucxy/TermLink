@@ -30,19 +30,19 @@ func (p *testIdentityProfiles) UpdateVerifiedEmail(_ context.Context, subject, e
 
 func TestAccountNicknameUpdateUsesIdentityAuthorityAndRefreshesSession(t *testing.T) {
 	portal := newTestPortal(t, &testOIDCFlow{})
-	repository := &testCommerceAccountRepository{testPortalRepository: newTestPortalRepository()}
+	repository := &testAccountPortalRepository{testPortalRepository: newTestPortalRepository()}
 	profiles := &testIdentityProfiles{}
 	portal.config.Repository = repository
 	portal.config.IdentityProfiles = profiles
-	cookie := commerceSessionCookie(t, portal, store.RoleUser, "nickname-csrf", time.Minute)
+	cookie := portalSessionCookie(t, portal, store.RoleUser, "nickname-csrf", time.Minute)
 
-	response := performCommerceForm(portal.Handler(), "/account/profile/nickname", url.Values{
+	response := performPortalForm(portal.Handler(), "/account/profile/nickname", url.Values{
 		"csrf": {"nickname-csrf"}, "nickname": {"清风惹尘丶"},
 	}, cookie)
 	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/account?section=settings&notice=nickname-updated" {
 		t.Fatalf("nickname response=%d location=%q body=%s", response.Code, response.Header().Get("Location"), response.Body.String())
 	}
-	if profiles.subject != "commerce-subject" || profiles.nickname != "清风惹尘丶" {
+	if profiles.subject != "portal-subject" || profiles.nickname != "清风惹尘丶" {
 		t.Fatalf("identity profile update=%q/%q", profiles.subject, profiles.nickname)
 	}
 	updated := response.Result().Cookies()

@@ -33,7 +33,7 @@ func TestRegisterAccountInvitationSagaProviderOutcomes(t *testing.T) {
 	defer cleanup()
 
 	proofKey := bytes.Repeat([]byte{0x51}, 32)
-	commerceKey := bytes.Repeat([]byte{0x61}, 32)
+	registrationCodeKey := bytes.Repeat([]byte{0x61}, 32)
 	var posted sync.Map
 	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -78,7 +78,7 @@ func TestRegisterAccountInvitationSagaProviderOutcomes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := (&API{Store: repository, Registration: registration, CommerceKey: commerceKey}).Handler()
+	service := (&API{Store: repository, Registration: registration, RegistrationCodeKey: registrationCodeKey}).Handler()
 
 	tests := []struct {
 		name          string
@@ -100,7 +100,7 @@ func TestRegisterAccountInvitationSagaProviderOutcomes(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			codeID := seedRegistrationSagaInvitation(t, ctx, repository.Pool, adminID, commerceKey, test.code)
+			codeID := seedRegistrationSagaInvitation(t, ctx, repository.Pool, adminID, registrationCodeKey, test.code)
 			body, _ := json.Marshal(registerAccountRequest{
 				Username: test.username, Nickname: test.username, Email: test.email,
 				Password: "correct horse battery staple", Confirm: "correct horse battery staple",
@@ -219,14 +219,14 @@ func newRegistrationSagaRepository(t *testing.T, ctx context.Context, databaseUR
 	return &store.Postgres{Pool: pool}, cleanup
 }
 
-func seedRegistrationSagaInvitation(t *testing.T, ctx context.Context, pool *pgxpool.Pool, adminID uuid.UUID, commerceKey []byte, displayCode string) uuid.UUID {
+func seedRegistrationSagaInvitation(t *testing.T, ctx context.Context, pool *pgxpool.Pool, adminID uuid.UUID, registrationCodeKey []byte, displayCode string) uuid.UUID {
 	t.Helper()
 	batchID, codeID := uuid.New(), uuid.New()
 	if _, err := pool.Exec(ctx, `INSERT INTO invitation_batches(id,name,status,default_max_uses,created_by) VALUES($1,$2,'ACTIVE',1,$3)`, batchID, "registration-saga-"+codeID.String(), adminID); err != nil {
 		t.Fatal(err)
 	}
-	normalized := normalizeCommerceCode(displayCode)
-	digest := keyedCommerceDigest(commerceKey, "invitation-code", normalized)
+	normalized := normalizeRegistrationCode(displayCode)
+	digest := keyedRegistrationDigest(registrationCodeKey, "invitation-code", normalized)
 	if _, err := pool.Exec(ctx, `INSERT INTO invitation_codes(id,batch_id,code_hash,code_prefix,max_uses,used_count) VALUES($1,$2,$3,$4,1,0)`, codeID, batchID, digest[:], normalized[:8]); err != nil {
 		t.Fatal(err)
 	}

@@ -1,12 +1,9 @@
 package observability
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -63,204 +60,47 @@ func TestRealtimeMetricsHaveBoundedLabels(t *testing.T) {
 	}
 }
 
-func TestCommerceHTTPMetricsUseBoundedOperations(t *testing.T) {
+func TestRegistrationHTTPMetricsUseBoundedOperations(t *testing.T) {
 	metrics := New(nil)
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/billing/orders", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("POST /v1/auth/register", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "denied", http.StatusConflict)
 	})
-	request := httptest.NewRequest(http.MethodPost, "/v1/billing/orders", nil)
+	request := httptest.NewRequest(http.MethodPost, "/v1/auth/register", nil)
 	response := httptest.NewRecorder()
 	metrics.HTTPMiddleware(mux).ServeHTTP(response, request)
 
 	body := scrape(t, metrics)
-	if !strings.Contains(body, `termlink_commerce_http_operations_total{operation="order_create",result="denied"} 1`) {
-		t.Fatalf("bounded commerce operation counter missing: %s", body)
+	if !strings.Contains(body, `termlink_registration_http_operations_total{operation="registration",result="denied"} 1`) {
+		t.Fatalf("bounded registration operation counter missing: %s", body)
 	}
-	if boundedCommerceOperation("POST /v1/billing/orders/attacker-controlled") != "" {
-		t.Fatal("attacker-controlled route unexpectedly created a commerce label")
+	if boundedRegistrationOperation("POST /v1/auth/register/attacker-controlled") != "" {
+		t.Fatal("attacker-controlled route unexpectedly created a registration label")
 	}
 }
 
-func TestCommerceRouteOperationsCoverLifecycleWithFixedLabels(t *testing.T) {
+func TestRegistrationRouteOperationsUseFixedLabels(t *testing.T) {
 	tests := map[string]string{
-		"POST /v1/auth/register":                                    "registration",
-		"POST /v1/auth/invitations/validate":                        "invitation_validation",
-		"POST /v1/billing/redemptions/claim":                        "redemption_claim",
-		"POST /v1/billing/orders":                                   "order_create",
-		"POST /v1/billing/orders/{orderId}/pay":                     "payment_start",
-		"POST /v1/billing/webhooks/alipay":                          "webhook_alipay",
-		"POST /v1/admin/billing/orders/{orderId}/refunds":           "refund_create",
-		"POST /v1/admin/billing/orders/{orderId}/retry-fulfillment": "fulfillment_recovery",
-		"POST /v1/billing/orders/{orderId}/query":                   "payment_recovery",
-		"POST /v1/admin/billing/reconciliation-runs":                "reconciliation_create",
-		"GET /v1/account/entitlements":                              "entitlement_read",
+		"POST /v1/auth/register":                               "registration",
+		"POST /v1/auth/invitations/validate":                   "invitation_validation",
+		"PATCH /v1/admin/registration-policy":                  "registration_policy_admin",
+		"POST /v1/admin/invitation-batches/{batchId}/generate": "invitation_generate",
 	}
 	for route, want := range tests {
-		if got := boundedCommerceOperation(route); got != want {
-			t.Fatalf("boundedCommerceOperation(%q) = %q, want %q", route, got, want)
+		if got := boundedRegistrationOperation(route); got != want {
+			t.Fatalf("boundedRegistrationOperation(%q) = %q, want %q", route, got, want)
 		}
 	}
-	for route, operation := range commerceRouteOperations {
+	for route, operation := range registrationRouteOperations {
 		if len(route) > 160 || strings.ContainsAny(route, "\r\n") || operation == "" || len(operation) > 40 {
-			t.Fatalf("unbounded commerce route mapping %q -> %q", route, operation)
+			t.Fatalf("unbounded registration route mapping %q -> %q", route, operation)
 		}
 		for _, character := range operation {
 			if character != '_' && (character < 'a' || character > 'z') {
-				t.Fatalf("commerce operation has unsafe label character: %q", operation)
+				t.Fatalf("registration operation has unsafe label character: %q", operation)
 			}
 		}
 	}
-}
-
-func TestCommerceMetricsNeverUseRequestValuesAsLabels(t *testing.T) {
-	metrics := New(nil)
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/billing/orders/{orderId}/query", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-	})
-	secretValues := []string{
-		"ec18c575-8289-41e0-a646-a246d73c463e",
-		"user-sensitive@example.test",
-		"TLR-SENSITIVE-CODE-VALUE",
-		"external-provider-trade-number",
-		"docker-secret://merchant-private-key",
-	}
-	target := "/v1/billing/orders/" + secretValues[0] + "/query?email=" + secretValues[1] + "&code=" + secretValues[2]
-	request := httptest.NewRequest(http.MethodPost, target, strings.NewReader(strings.Join(secretValues, "\n")))
-	request.Header.Set("X-Provider-Trade-No", secretValues[3])
-	response := httptest.NewRecorder()
-	metrics.HTTPMiddleware(mux).ServeHTTP(response, request)
-
-	body := scrape(t, metrics)
-	for _, secret := range secretValues {
-		if strings.Contains(body, secret) {
-			t.Fatalf("metrics leaked request-controlled or secret value %q", secret)
-		}
-	}
-	if !strings.Contains(body, `termlink_commerce_http_operations_total{operation="payment_recovery",result="error"} 1`) {
-		t.Fatalf("payment recovery metric missing: %s", body)
-	}
-}
-
-func TestCommerceSnapshotLabelsAndQueriesAreBounded(t *testing.T) {
-	metrics := New(nil)
-	body := scrape(t, metrics)
-	for workflow, states := range commerceWorkflowStates {
-		for _, state := range states {
-			expected := `termlink_commerce_workflow_items{state="` + state + `",workflow="` + workflow + `"} 0`
-			if !strings.Contains(body, expected) {
-				t.Fatalf("initialized workflow metric missing %q", expected)
-			}
-			if !validCommerceWorkflowState(workflow, state) {
-				t.Fatalf("declared workflow state rejected: %s/%s", workflow, state)
-			}
-		}
-	}
-	if validCommerceWorkflowState("order", "attacker-state") || validCommerceConsistencyCheck("account-uuid") {
-		t.Fatal("unbounded commercial snapshot label was accepted")
-	}
-	for _, check := range commerceConsistencyChecks {
-		expected := `termlink_commerce_consistency_issues{check="` + check + `"} 0`
-		if !strings.Contains(body, expected) {
-			t.Fatalf("initialized consistency metric missing %q", expected)
-		}
-	}
-	queries := strings.ToLower(commerceWorkflowSnapshotSQL + commerceConsistencySnapshotSQL)
-	for _, forbidden := range []string{"email_hash", "code_hash", "secret_refs", "payment_payload", "provider_trade_no_hash", "notification_id_hash", "metadata"} {
-		if strings.Contains(queries, forbidden) {
-			t.Fatalf("commerce snapshot query reads sensitive column %q", forbidden)
-		}
-	}
-}
-
-func TestCommerceAlertAndDashboardContracts(t *testing.T) {
-	root := filepath.Join("..", "..", "observability")
-	rules, err := os.ReadFile(filepath.Join(root, "prometheus", "rules", "termlink.rules.yml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ruleText := string(rules)
-	for _, expected := range []string{
-		"TermlinkCommerceSnapshotUnavailable",
-		"TermlinkCommerceOperationErrorRatioHigh",
-		"TermlinkRegistrationFailureRatioHigh",
-		"TermlinkInvitationValidationDenialsHigh",
-		"TermlinkRedemptionFailuresHigh",
-		"TermlinkPaymentWebhookErrors",
-		"TermlinkPaymentOrOrderErrors",
-		"TermlinkRefundOrReconciliationErrors",
-		"TermlinkWebhookRetryBacklog",
-		"TermlinkRefundBacklog",
-		"TermlinkReconciliationBacklog",
-		"TermlinkCommerceConsistencyIssue",
-	} {
-		if !strings.Contains(ruleText, "alert: "+expected) {
-			t.Fatalf("commerce alert %q missing", expected)
-		}
-	}
-	for _, metric := range []string{
-		"termlink_commerce_http_operations_total",
-		"termlink_commerce_workflow_items",
-		"termlink_commerce_consistency_issues",
-		"termlink_commerce_snapshot_up",
-	} {
-		if !strings.Contains(ruleText, metric) {
-			t.Fatalf("commerce alert rules do not reference %q", metric)
-		}
-	}
-	for _, forbidden := range []string{"email_hash", "code_hash", "secret_refs", "payment_payload", "provider_trade_no", "notification_id", "order_no", "account_id"} {
-		if strings.Contains(strings.ToLower(ruleText), forbidden) {
-			t.Fatalf("alert rules contain sensitive or high-cardinality field %q", forbidden)
-		}
-	}
-
-	dashboardBytes, err := os.ReadFile(filepath.Join(root, "grafana", "dashboards", "termlink-overview.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var dashboard struct {
-		Panels []struct {
-			Title   string `json:"title"`
-			Targets []struct {
-				Expression string `json:"expr"`
-			} `json:"targets"`
-		} `json:"panels"`
-	}
-	if err := json.Unmarshal(dashboardBytes, &dashboard); err != nil {
-		t.Fatalf("dashboard is not valid JSON: %v", err)
-	}
-	panels := make(map[string]string)
-	for _, panel := range dashboard.Panels {
-		for _, target := range panel.Targets {
-			panels[panel.Title] += target.Expression
-		}
-	}
-	for _, title := range []string{
-		"Commerce operation rate",
-		"Commerce server-error ratio",
-		"Commerce workflow state",
-		"Commerce consistency issues",
-		"Commerce snapshot health",
-	} {
-		if panels[title] == "" {
-			t.Fatalf("dashboard panel %q missing or has no query", title)
-		}
-	}
-	joinedQueries := strings.ToLower(strings.Join(mapValues(panels), "\n"))
-	for _, forbidden := range []string{"email", "code_hash", "secret", "uuid", "trade_no", "order_no", "account_id"} {
-		if strings.Contains(joinedQueries, forbidden) {
-			t.Fatalf("dashboard query contains sensitive or high-cardinality field %q", forbidden)
-		}
-	}
-}
-
-func mapValues(values map[string]string) []string {
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		result = append(result, value)
-	}
-	return result
 }
 
 func TestMetricsHandlerPublishesOnlyMetricsPath(t *testing.T) {

@@ -87,7 +87,7 @@ func (p *Portal) adminTransitionAnnouncement(w http.ResponseWriter, r *http.Requ
 	announcementID, idErr := uuid.Parse(r.PathValue("id"))
 	expectedVersion, versionErr := strconv.ParseInt(strings.TrimSpace(r.Form.Get("expected_version")), 10, 64)
 	targetStatus := strings.ToUpper(strings.TrimSpace(r.Form.Get("target_status")))
-	formErr := validateCommerceFormValues(r.Form, map[string]bool{
+	formErr := validatePortalFormValues(r.Form, map[string]bool{
 		"csrf": true, "idempotency_key": true, "reason": true, "expected_version": true, "target_status": true,
 	})
 	if !available {
@@ -125,7 +125,7 @@ func parseWebAnnouncementInput(r *http.Request) (store.WebAnnouncementInput, err
 		"csrf": true, "idempotency_key": true, "reason": true, "expected_version": true,
 		"title": true, "body": true, "severity": true, "starts_at": true, "ends_at": true,
 	}
-	if validateCommerceFormValues(r.Form, allowed) != nil {
+	if validatePortalFormValues(r.Form, allowed) != nil {
 		return store.WebAnnouncementInput{}, errors.New("announcement form contains unsupported fields")
 	}
 	startsAt, err := parseOptionalAnnouncementTime(r.Form.Get("starts_at"))

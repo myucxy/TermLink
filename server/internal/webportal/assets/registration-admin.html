@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="robots" content="noindex,nofollow">
+  <title>注册与邀请码 · TermLink</title>
+  <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
+  <script src="/assets/theme-init.js?v=01b-v11"></script>
+  <link rel="stylesheet" href="/assets/site.css?v=01b-v12">
+  <link rel="stylesheet" href="/assets/admin.css?v=01b-v17">
+  <link rel="stylesheet" href="/assets/portal-dashboard.css?v=registration-v2">
+  <script src="/assets/theme.js?v=01b-v11" defer></script>
+  <script src="/assets/registration-admin.js?v=registration-v2" defer></script>
+</head>
+<body class="admin-body portal-admin-body">
+  <header class="admin-topbar">
+    <a class="admin-brand" href="/admin">
+      <img src="/assets/termlink-app-icon.svg" alt="">
+      <span><strong>TermLink</strong><small>Server Console</small></span>
+    </a>
+    <div class="admin-topbar-actions">
+      <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题">
+        <span class="theme-toggle-label">主题</span>
+      </button>
+      <span class="admin-user"><strong>{{.Username}}</strong><small>{{.RoleLabel}}</small></span>
+      <a class="button button-quiet" href="/account">个人中心</a>
+      <form action="/logout" method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="button button-danger" type="submit">退出</button></form>
+    </div>
+  </header>
+
+  <div class="admin-layout">
+    <aside class="admin-sidebar">
+      <div class="admin-sidebar-heading"><small>管理中心</small><strong>{{.SectionTitle}}</strong></div>
+      {{template "admin-navigation" .}}
+    </aside>
+
+    <main class="admin-main portal-admin-main">
+      <section class="admin-page-heading">
+        <div><p class="eyebrow">REGISTRATION ACCESS</p><h1>注册与邀请码</h1><p>配置账号注册准入，生成邀请码，并查看邀请码绑定的注册账号。</p></div>
+      </section>
+      {{if .Notice}}<div class="portal-notice" role="status">{{.Notice}}</div>{{end}}
+
+      {{if .GeneratedCodes}}
+      <section class="portal-card generated-code-receipt" aria-labelledby="generated-code-title">
+        <div class="portal-card-heading"><div><p class="eyebrow">ONE-TIME RECEIPT</p><h2 id="generated-code-title">新邀请码</h2><p>邀请码仅在本页完整显示一次。离开前请复制或下载并妥善保管。</p></div><span class="count-pill">{{len .GeneratedCodes}} 个</span></div>
+        <dl class="portal-detail-grid"><div><dt>批次</dt><dd>{{if .GeneratedBatchName}}{{.GeneratedBatchName}}{{else}}{{shortID .SelectedID}}{{end}}</dd></div><div><dt>生成时间</dt><dd>{{formatTime .GeneratedAt}}</dd></div></dl>
+        <div class="generated-code-actions"><button class="button button-primary" type="button" data-copy-all-codes>复制全部</button><button class="button button-quiet" type="button" data-download-codes="txt">下载 TXT</button><button class="button button-quiet" type="button" data-download-codes="csv">下载 CSV</button><span data-generated-code-status aria-live="polite"></span></div>
+        <div class="generated-code-list">{{range .GeneratedCodes}}<div class="generated-code-row"><code data-generated-code>{{.}}</code><button type="button" data-copy-code>复制</button></div>{{end}}</div>
+        <a class="button button-primary" href="/admin/registration?id={{.SelectedID}}" data-generated-code-ack>我已保存，返回批次</a>
+      </section>
+      {{else}}
+      <section class="portal-card">
+        <div class="portal-card-heading"><div><p class="eyebrow">ADMISSION POLICY</p><h2>全局注册策略</h2></div><span class="portal-state state-{{.Policy.Mode}}">{{.Policy.Mode}}</span></div>
+        <dl class="portal-detail-grid"><div><dt>当前模式</dt><dd>{{.Policy.Mode}}</dd></div><div><dt>配置版本</dt><dd>v{{.Policy.Version}}</dd></div><div><dt>更新时间</dt><dd>{{formatTime .Policy.UpdatedAt}}</dd></div></dl>
+        {{if .CanConfigureSystem}}<form class="portal-form compact-form" action="/admin/registration/policy" method="post">
+          <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey .ActionNonce "registration-policy"}}"><input type="hidden" name="version" value="{{.Policy.Version}}">
+          <label><span>注册模式</span><select name="mode"><option value="OPEN"{{if eq .Policy.Mode "OPEN"}} selected{{end}}>OPEN · 开放注册</option><option value="INVITE_REQUIRED"{{if eq .Policy.Mode "INVITE_REQUIRED"}} selected{{end}}>INVITE_REQUIRED · 必须邀请码</option><option value="CLOSED"{{if eq .Policy.Mode "CLOSED"}} selected{{end}}>CLOSED · 暂停注册</option></select></label>
+          <label><span>操作原因</span><input name="reason" minlength="3" maxlength="500" required></label><button class="button button-primary" type="submit">更新策略</button>
+        </form>{{else}}<p class="portal-muted">当前角色可查看策略；修改注册准入需要 SUPER_ADMIN 完成安全验证。</p>{{end}}
+      </section>
+
+      {{if .CanOperate}}<section class="portal-card">
+        <div class="portal-card-heading"><div><p class="eyebrow">INVITATION BATCH</p><h2>创建邀请码批次</h2></div></div>
+        <form class="portal-form form-grid" action="/admin/registration/invitations/batches" method="post">
+          <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey .ActionNonce "invitation-batch-create"}}">
+          <label><span>批次名称</span><input name="name" maxlength="128" required></label><label><span>默认使用次数</span><input name="max_uses" type="number" min="1" max="1000000" value="1" required></label>
+          <label><span>限制邮箱域（可选）</span><input name="email_domain" maxlength="255" placeholder="example.com"></label><label><span>有效期（可选）</span><input name="valid_until" type="date"></label>
+          <label class="form-span"><span>备注</span><textarea name="note" maxlength="1000" rows="2"></textarea></label><label class="form-span"><span>操作原因</span><input name="reason" minlength="3" maxlength="500" required></label>
+          <button class="button button-primary" type="submit">创建批次</button>
+        </form>
+      </section>{{end}}
+
+      <section class="portal-card">
+        <div class="portal-card-heading"><div><p class="eyebrow">INVITATION INVENTORY</p><h2>邀请码批次与库存</h2></div><span class="count-pill">{{len .InvitationBatches}} 个批次</span></div>
+        <div class="portal-table-wrap"><table class="portal-table"><thead><tr><th>批次</th><th>状态</th><th>默认次数</th><th>邮箱范围</th><th>有效期</th><th>操作</th></tr></thead><tbody>
+          {{range .InvitationBatches}}<tr><td><strong>{{.Name}}</strong><small>{{shortID .ID}}</small></td><td><span class="portal-state state-{{.Status}}">{{.Status}}</span></td><td>{{.DefaultMaxUses}}</td><td>{{if .EmailDomain}}{{.EmailDomain}}{{else}}不限{{end}}</td><td>{{if .ValidUntil}}{{formatTime .ValidUntil}}{{else}}长期{{end}}</td><td><div class="table-actions"><a href="/admin/registration?id={{.ID}}">查看代码</a>
+            {{if and $.CanOperate (eq .Status "ACTIVE")}}<form class="code-generate-form" action="/admin/registration/invitations/batches/{{.ID}}/codes" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-codes:%s" .ID)}}"><input type="hidden" name="reason" value="生成邀请码"><label><span>数量</span><input name="count" type="number" min="1" max="200" value="10" required></label><input type="hidden" name="max_uses" value="{{.DefaultMaxUses}}"><button type="submit">生成</button></form>
+            <form action="/admin/registration/invitations/batches/{{.ID}}/status" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-batch-status:%s" .ID)}}"><input type="hidden" name="reason" value="停用邀请码批次"><input type="hidden" name="status" value="DISABLED"><button class="danger-outline" type="submit">停用</button></form>{{else if and $.CanOperate (eq .Status "DISABLED")}}
+            <form action="/admin/registration/invitations/batches/{{.ID}}/status" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-batch-enable:%s" .ID)}}"><input type="hidden" name="reason" value="启用邀请码批次"><input type="hidden" name="status" value="ACTIVE"><button type="submit">启用</button></form>{{end}}</div></td></tr>
+          {{else}}<tr><td colspan="6" class="empty-cell">暂无邀请码批次。</td></tr>{{end}}
+        </tbody></table></div>
+
+        {{if .SelectedID}}<h3 class="subtable-title">所选批次代码（只显示前缀）</h3><div class="portal-table-wrap"><table class="portal-table"><thead><tr><th>前缀</th><th>状态</th><th>已用 / 总数</th><th>有效期</th><th>创建时间</th><th>操作</th></tr></thead><tbody>
+          {{range .InvitationCodes}}<tr><td><code>{{.Prefix}}…</code></td><td>{{.Status}}</td><td>{{.UsedCount}} / {{.MaxUses}}</td><td>{{if .ValidUntil}}{{formatTime .ValidUntil}}{{else}}跟随批次{{end}}</td><td>{{formatTime .CreatedAt}}</td><td>{{if and $.CanOperate (eq .Status "ACTIVE")}}<form action="/admin/registration/invitations/codes/{{.ID}}/status" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-code-status:%s" .ID)}}"><input type="hidden" name="reason" value="停用邀请码"><input type="hidden" name="status" value="DISABLED"><button class="danger-outline" type="submit">停用</button></form>{{else if and $.CanOperate (eq .Status "DISABLED")}}<form action="/admin/registration/invitations/codes/{{.ID}}/status" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-code-enable:%s" .ID)}}"><input type="hidden" name="reason" value="启用邀请码"><input type="hidden" name="status" value="ACTIVE"><button type="submit">启用</button></form>{{else}}—{{end}}</td></tr>
+          {{else}}<tr><td colspan="6" class="empty-cell">所选批次暂无代码。</td></tr>{{end}}
+        </tbody></table></div>{{end}}
+      </section>
+
+      <section class="portal-card">
+        <div class="portal-card-heading"><div><p class="eyebrow">REGISTRATION HISTORY</p><h2>最近邀请码使用明细</h2><p>显示邀请码对应的注册资料和已绑定账号，不显示完整邀请码。</p></div><span class="count-pill">最近 {{len .InvitationUses}} 条</span></div>
+        <div class="portal-table-wrap"><table class="portal-table invitation-usage-table"><thead><tr><th>记录</th><th>邀请码</th><th>注册账号</th><th>状态</th><th>时间线</th></tr></thead><tbody>
+          {{range .InvitationUses}}<tr><td><code>{{.Reference}}</code></td><td><strong>{{.BatchName}}</strong><small><code>{{.CodePrefix}}…</code></small></td><td class="invitation-account-cell">{{if .HasIdentityProfile}}<strong>{{if .Nickname}}{{.Nickname}}{{else}}{{.Username}}{{end}}</strong>{{if .Username}}<small>@{{.Username}}</small>{{end}}{{if .EmailMasked}}<small>{{.EmailMasked}}</small>{{end}}{{if .HasUser}}<small>{{.AccountReference}} · 已同步账号</small>{{else}}<small>注册资料 · 尚未首次登录</small>{{end}}{{else}}<strong>{{if .HasUser}}{{.AccountReference}}{{else}}尚未绑定账号{{end}}</strong><small>资料将在账号完成网页登录后同步</small>{{end}}</td><td><span class="portal-state state-{{.State}}">{{.State}}</span><small>预约截止 {{formatTime .ReservedUntil}}</small></td><td class="invitation-timeline"><span>发起 {{formatTime .CreatedAt}}</span><span>身份创建 {{formatOptionalPortalTime .ProviderAcceptedAt}}</span><span>账号绑定 {{formatOptionalPortalTime .RegisteredAt}}</span>{{if .ReleasedAt}}<span>释放 {{formatOptionalPortalTime .ReleasedAt}}</span>{{end}}</td></tr>
+          {{else}}<tr><td colspan="5" class="empty-cell">暂无邀请码使用记录。</td></tr>{{end}}
+        </tbody></table></div>
+      </section>
+      {{end}}
+      <footer class="admin-footer"><span>邀请码只用于注册准入；完整代码仅在生成回执中显示一次。</span><a href="/admin">返回运行管理台</a></footer>
+    </main>
+  </div>
+</body>
+</html>
