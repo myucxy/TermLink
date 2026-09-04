@@ -1035,8 +1035,12 @@ foreach ($acceptanceProxy in @($acceptanceProxy)) {
         "Acceptance proxy '$acceptanceProxy' must retain the independent 64 MiB history limit."
     Assert-Production ($acceptanceProxyText -match '(?ms)handle @fileTransferObject\s*\{.*?max_size 5368709120.*?reverse_proxy minio:9000') `
         "Acceptance proxy '$acceptanceProxy' must use the independent exact 5 GiB file-transfer limit."
-    Assert-Production ($acceptanceProxyText -match '(?ms)handle\s*\{\s*reverse_proxy server:8080\s*\{.*?health_uri /readyz.*?health_interval 1s.*?health_timeout 500ms.*?health_fails 1.*?health_passes 1.*?lb_try_duration 30s.*?lb_try_interval 250ms') `
-        "Acceptance proxy '$acceptanceProxy' must absorb the Server bootstrap DNS/dial interval."
+    Assert-Production ($acceptanceProxyText -match '(?ms)@serverMutation not method GET HEAD OPTIONS.*?forward_auth @serverMutation server:8080\s*\{\s*uri /readyz\s*lb_try_duration 30s\s*lb_try_interval 250ms') `
+        "Acceptance proxy '$acceptanceProxy' must gate mutations through a body-safe readiness request."
+    Assert-Production ($acceptanceProxyText -match '(?ms)@serverRead method GET HEAD OPTIONS.*?reverse_proxy @serverRead server:8080\s*\{\s*lb_try_duration 30s\s*lb_try_interval 250ms') `
+        "Acceptance proxy '$acceptanceProxy' must safely retry read-only requests during Server bootstrap."
+    Assert-Production ($acceptanceProxyText -match '(?ms)request body untouched.*?reverse_proxy server:8080\s*\{(?!.*?lb_try_duration).*?header_up X-Forwarded-Proto') `
+        "Acceptance proxy '$acceptanceProxy' must not replay mutating requests after readiness succeeds."
 }
 }
 

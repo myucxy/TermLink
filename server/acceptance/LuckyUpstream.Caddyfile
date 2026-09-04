@@ -101,19 +101,31 @@
 	}
 
 	handle {
-		reverse_proxy server:8080 {
-			# Compose must start this router before Server because Server uses its
-			# private TLS listener for issuer discovery. Mark Server unavailable
-			# before accepting a proxy attempt, then keep the incoming request
-			# untouched until /readyz succeeds. This matters for POST bodies, which
-			# Caddy 2.10 cannot replay after an initial Docker DNS/dial failure.
-			health_uri /readyz
-			health_interval 1s
-			health_timeout 500ms
-			health_fails 1
-			health_passes 1
+		# Compose must start this router before Server because Server uses its
+		# private TLS listener for issuer discovery. A read-only subrequest waits
+		# for readiness before any mutating request is proxied, leaving the real
+		# request body untouched during the Docker DNS/bootstrap interval.
+		@serverMutation not method GET HEAD OPTIONS
+		forward_auth @serverMutation server:8080 {
+			uri /readyz
 			lb_try_duration 30s
 			lb_try_interval 250ms
+		}
+
+		# GET, HEAD, and OPTIONS are safe to retry directly. In particular this
+		# keeps WebSocket upgrades connected across the same bootstrap window.
+		@serverRead method GET HEAD OPTIONS
+		reverse_proxy @serverRead server:8080 {
+			lb_try_duration 30s
+			lb_try_interval 250ms
+			header_up X-Forwarded-Proto {$TERMLINK_ACCEPTANCE_PUBLIC_SCHEME}
+			header_up X-Forwarded-Host {$TERMLINK_ACCEPTANCE_PUBLIC_HOST}:{$TERMLINK_ACCEPTANCE_PUBLIC_PORT}
+			header_up X-Forwarded-Port {$TERMLINK_ACCEPTANCE_PUBLIC_PORT}
+		}
+
+		# The mutation preflight above has already proved Server ready. Avoid
+		# replaying a non-idempotent request if Server fails after that point.
+		reverse_proxy server:8080 {
 			header_up X-Forwarded-Proto {$TERMLINK_ACCEPTANCE_PUBLIC_SCHEME}
 			header_up X-Forwarded-Host {$TERMLINK_ACCEPTANCE_PUBLIC_HOST}:{$TERMLINK_ACCEPTANCE_PUBLIC_PORT}
 			header_up X-Forwarded-Port {$TERMLINK_ACCEPTANCE_PUBLIC_PORT}
