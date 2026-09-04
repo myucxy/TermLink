@@ -1035,7 +1035,7 @@ foreach ($acceptanceProxy in @($acceptanceProxy)) {
         "Acceptance proxy '$acceptanceProxy' must retain the independent 64 MiB history limit."
     Assert-Production ($acceptanceProxyText -match '(?ms)handle @fileTransferObject\s*\{.*?max_size 5368709120.*?reverse_proxy minio:9000') `
         "Acceptance proxy '$acceptanceProxy' must use the independent exact 5 GiB file-transfer limit."
-    Assert-Production ($acceptanceProxyText -match '(?ms)handle\s*\{\s*reverse_proxy server:8080\s*\{.*?lb_try_duration 30s.*?lb_try_interval 250ms') `
+    Assert-Production ($acceptanceProxyText -match '(?ms)handle\s*\{\s*reverse_proxy server:8080\s*\{.*?health_uri /readyz.*?health_interval 1s.*?health_timeout 500ms.*?health_fails 1.*?health_passes 1.*?lb_try_duration 30s.*?lb_try_interval 250ms') `
         "Acceptance proxy '$acceptanceProxy' must absorb the Server bootstrap DNS/dial interval."
 }
 }

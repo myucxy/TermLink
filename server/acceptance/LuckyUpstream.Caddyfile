@@ -103,9 +103,15 @@
 	handle {
 		reverse_proxy server:8080 {
 			# Compose must start this router before Server because Server uses its
-			# private TLS listener for issuer discovery. Retry initial Docker DNS
-			# and dial failures so that this short bootstrap interval does not leak
-			# transient 502 responses to already-connected clients.
+			# private TLS listener for issuer discovery. Mark Server unavailable
+			# before accepting a proxy attempt, then keep the incoming request
+			# untouched until /readyz succeeds. This matters for POST bodies, which
+			# Caddy 2.10 cannot replay after an initial Docker DNS/dial failure.
+			health_uri /readyz
+			health_interval 1s
+			health_timeout 500ms
+			health_fails 1
+			health_passes 1
 			lb_try_duration 30s
 			lb_try_interval 250ms
 			header_up X-Forwarded-Proto {$TERMLINK_ACCEPTANCE_PUBLIC_SCHEME}
