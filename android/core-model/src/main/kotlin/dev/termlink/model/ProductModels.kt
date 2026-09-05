@@ -60,6 +60,7 @@ object PcCapabilityIds {
     const val FILE_OPERATIONS_V1 = "file_operations_v1"
     const val TERMINAL_COMMANDS_V1 = "terminal_commands_v1"
     const val REMOTE_AGENT_UPDATE_V1 = "remote_agent_update_v1"
+    const val HOST_HISTORY_V1 = "host_history_v1"
 }
 
 data class TerminalCommandCapability(

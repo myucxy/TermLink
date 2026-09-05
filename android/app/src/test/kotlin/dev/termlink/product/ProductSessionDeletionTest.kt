@@ -4,17 +4,114 @@ import dev.termlink.model.HistoryObject
 import dev.termlink.model.SessionState
 import dev.termlink.model.SessionSummary
 import dev.termlink.network.production.TermLinkApiException
+import dev.termlink.network.production.ProductionHostHistoryNotReadyException
 import dev.termlink.session.RemoteSessionState
 import java.io.IOException
 import java.time.Instant
 import java.util.UUID
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProductSessionDeletionTest {
+    @Test
+    fun hostHistoryDeleteRunsAgentAckThenRestThenLocalCleanup() = runBlocking {
+        val calls = mutableListOf<String>()
+
+        deleteHostHistorySessionAfterTermination(
+            terminateRemote = { calls += "agent-ack" },
+            deleteRemote = { calls += "rest-delete" },
+            deleteLocal = { calls += "local-cleanup" },
+        )
+
+        assertEquals(listOf("agent-ack", "rest-delete", "local-cleanup"), calls)
+    }
+
+    @Test
+    fun rejectedOrTimedOutHostTerminationPreservesRestAndLocalState() {
+        listOf(
+            IllegalStateException("Agent rejected termination"),
+            IOException("termination acknowledgement timed out"),
+        ).forEach { failure ->
+            val calls = mutableListOf<String>()
+            val thrown = assertThrows(failure.javaClass) {
+                runBlocking {
+                    deleteHostHistorySessionAfterTermination(
+                        terminateRemote = {
+                            calls += "terminate"
+                            throw failure
+                        },
+                        deleteRemote = { calls += "rest" },
+                        deleteLocal = { calls += "local" },
+                    )
+                }
+            }
+            assertSame(failure, thrown)
+            assertEquals(listOf("terminate"), calls)
+        }
+    }
+
+    @Test
+    fun hostHistoryRestFailurePreservesLocalState() {
+        val failure = IOException("server unavailable")
+        val calls = mutableListOf<String>()
+        val thrown = assertThrows(IOException::class.java) {
+            runBlocking {
+                deleteHostHistorySessionAfterTermination(
+                    terminateRemote = { calls += "agent-ack" },
+                    deleteRemote = {
+                        calls += "rest-delete"
+                        throw failure
+                    },
+                    deleteLocal = { calls += "local-cleanup" },
+                )
+            }
+        }
+
+        assertSame(failure, thrown)
+        assertEquals(listOf("agent-ack", "rest-delete"), calls)
+    }
+
+    @Test
+    fun hostHistoryNotReadyRetriesWithoutSwallowingTerminalFailure() = runBlocking {
+        val pauses = mutableListOf<Long>()
+        var attempts = 0
+        val result = awaitHostHistoryReady(
+            retryDelaysMillis = listOf(10L, 20L),
+            pause = { pauses += it },
+        ) {
+            attempts += 1
+            if (attempts < 3) throw ProductionHostHistoryNotReadyException("NOT_READY")
+            "ready"
+        }
+        assertEquals("ready", result)
+        assertEquals(3, attempts)
+        assertEquals(listOf(10L, 20L), pauses)
+
+        var terminalAttempts = 0
+        assertThrows(IllegalStateException::class.java) {
+            runBlocking {
+                awaitHostHistoryReady(retryDelaysMillis = listOf(0L), pause = {}) {
+                    terminalAttempts += 1
+                    throw IllegalStateException("integrity failure")
+                }
+            }
+        }
+        assertEquals(1, terminalAttempts)
+    }
+
+    @Test
+    fun legacyHistoryRefreshTreatsOnlyRemovedOrUnavailableCatalogAsEmpty() {
+        assertTrue(legacyHistoryCatalogUnavailable(TermLinkApiException(426, "UPGRADE_REQUIRED", null)))
+        assertFalse(legacyHistoryCatalogUnavailable(TermLinkApiException(503, "UNAVAILABLE", null)))
+        assertFalse(legacyHistoryCatalogUnavailable(TermLinkApiException(401, "UNAUTHORIZED", null)))
+        assertFalse(legacyHistoryCatalogUnavailable(TermLinkApiException(500, "FAILED", null)))
+    }
+
     @Test
     fun successfulRemoteDeleteCleansOnlyTheSelectedSessionState() = runBlocking {
         val target = session()

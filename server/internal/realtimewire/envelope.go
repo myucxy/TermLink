@@ -26,34 +26,38 @@ const (
 type MessageType uint32
 
 const (
-	MessageUnspecified      MessageType = 0
-	Heartbeat               MessageType = 1
-	Goodbye                 MessageType = 2
-	SessionUpsert           MessageType = 10
-	SessionRemoved          MessageType = 11
-	Subscribe               MessageType = 12
-	Unsubscribe             MessageType = 13
-	OutputChunk             MessageType = 20
-	OutputACK               MessageType = 21
-	FlowControl             MessageType = 22
-	Gap                     MessageType = 23
-	InputEvent              MessageType = 30
-	InputAccepted           MessageType = 31
-	InputRejected           MessageType = 32
-	ResizeRequest           MessageType = 40
-	ResizeApplied           MessageType = 41
-	SnapshotOffer           MessageType = 50
-	SnapshotChunk           MessageType = 51
-	ResumeRequest           MessageType = 52
-	LeaseRequest            MessageType = 60
-	LeaseGranted            MessageType = 61
-	LeaseDenied             MessageType = 62
-	LeaseRevoked            MessageType = 63
-	ThemeChanged            MessageType = 70
-	SessionStarted          MessageType = 80
-	SessionInterrupted      MessageType = 81
-	SessionEnded            MessageType = 82
-	SessionTerminateRequest MessageType = 83
+	MessageUnspecified       MessageType = 0
+	Heartbeat                MessageType = 1
+	Goodbye                  MessageType = 2
+	SessionUpsert            MessageType = 10
+	SessionRemoved           MessageType = 11
+	Subscribe                MessageType = 12
+	Unsubscribe              MessageType = 13
+	OutputChunk              MessageType = 20
+	OutputACK                MessageType = 21
+	FlowControl              MessageType = 22
+	Gap                      MessageType = 23
+	InputEvent               MessageType = 30
+	InputAccepted            MessageType = 31
+	InputRejected            MessageType = 32
+	ResizeRequest            MessageType = 40
+	ResizeApplied            MessageType = 41
+	SnapshotOffer            MessageType = 50
+	SnapshotChunk            MessageType = 51
+	ResumeRequest            MessageType = 52
+	LeaseRequest             MessageType = 60
+	LeaseGranted             MessageType = 61
+	LeaseDenied              MessageType = 62
+	LeaseRevoked             MessageType = 63
+	ThemeChanged             MessageType = 70
+	SessionStarted           MessageType = 80
+	SessionInterrupted       MessageType = 81
+	SessionEnded             MessageType = 82
+	SessionTerminateRequest  MessageType = 83
+	HostHistoryRequest       MessageType = 84
+	HostHistoryResponse      MessageType = 85
+	HostHistoryControl       MessageType = 86
+	SessionTerminateResponse MessageType = 87
 )
 
 var ErrInvalidEnvelope = errors.New("invalid production envelope")
@@ -237,7 +241,8 @@ func knownMessage(value MessageType) bool {
 		InputRejected, ResizeRequest, ResizeApplied, SnapshotOffer, SnapshotChunk,
 		ResumeRequest, LeaseRequest, LeaseGranted, LeaseDenied, LeaseRevoked,
 		ThemeChanged, SessionStarted, SessionInterrupted, SessionEnded,
-		SessionTerminateRequest:
+		SessionTerminateRequest, HostHistoryRequest, HostHistoryResponse, HostHistoryControl,
+		SessionTerminateResponse:
 		return true
 	default:
 		return false

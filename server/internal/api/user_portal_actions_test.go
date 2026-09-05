@@ -82,21 +82,6 @@ func (f *fakeUserPortalActionStore) SetUserPortalPCControlPolicy(_ context.Conte
 	return f.policy(pcID), f.err
 }
 
-func (f *fakeUserPortalActionStore) RequestUserPortalHistoryDeletion(_ context.Context, accountID, sessionID uuid.UUID, key, trace string) (store.UserPortalActionResult, error) {
-	f.record("delete-history", accountID, sessionID, key, trace)
-	return store.UserPortalActionResult{Changed: true}, f.err
-}
-
-func (f *fakeUserPortalActionStore) RequestUserPortalDataExport(_ context.Context, accountID uuid.UUID, key, trace string) (store.UserPortalDataExport, error) {
-	f.record("request-export", accountID, uuid.Nil, key, trace)
-	return f.dataExport(uuid.MustParse("20000000-0000-0000-0000-000000000002")), f.err
-}
-
-func (f *fakeUserPortalActionStore) GetUserPortalDataExport(_ context.Context, accountID, exportID uuid.UUID) (store.UserPortalDataExport, error) {
-	f.record("get-export", accountID, exportID, "", "")
-	return f.dataExport(exportID), f.err
-}
-
 func (f *fakeUserPortalActionStore) GetUserPortalAccountDeletionPreflight(_ context.Context, accountID uuid.UUID) (store.UserPortalAccountDeletionPreflight, error) {
 	f.record("deletion-preflight", accountID, uuid.Nil, "", "")
 	return store.UserPortalAccountDeletionPreflight{
@@ -129,11 +114,6 @@ func (f *fakeUserPortalActionStore) policy(pcID uuid.UUID) store.UserPortalPCCon
 	}
 }
 
-func (f *fakeUserPortalActionStore) dataExport(exportID uuid.UUID) store.UserPortalDataExport {
-	expires := f.now.Add(time.Hour)
-	return store.UserPortalDataExport{ID: exportID, Status: "REQUESTED", RequestedAt: f.now, ExpiresAt: &expires}
-}
-
 func (f *fakeUserPortalActionStore) deletion(requestID uuid.UUID) store.UserPortalAccountDeletion {
 	return store.UserPortalAccountDeletion{
 		ID: requestID, Status: "REQUESTED", Version: 1, RequestedAt: f.now,
@@ -155,9 +135,6 @@ func TestUserPortalActionHandlersBindEveryStoreCallToAuthenticatedAccount(t *tes
 		{"list control policies", "GET /v1/account/pcs/control-policies", http.MethodGet, "/v1/account/pcs/control-policies?limit=25", "", "list-policies", 200, false, userPortalActionHandlers.listPCControlPolicies},
 		{"set remote routing", "PUT /v1/account/pcs/{pcId}/remote-routing", http.MethodPut, "/v1/account/pcs/" + targetID.String() + "/remote-routing", `{"enabled":true}`, "set-routing", 200, true, userPortalActionHandlers.setPCRemoteRouting},
 		{"set control policy", "PUT /v1/account/pcs/{pcId}/control-policy", http.MethodPut, "/v1/account/pcs/" + targetID.String() + "/control-policy", `{"remote_routing_enabled":true,"mode":"COLLABORATIVE","local_priority":true,"expected_version":4}`, "set-policy", 200, true, userPortalActionHandlers.setPCControlPolicy},
-		{"delete history", "DELETE /v1/account/sessions/{sessionId}/history", http.MethodDelete, "/v1/account/sessions/" + targetID.String() + "/history", `{}`, "delete-history", 200, true, userPortalActionHandlers.requestHistoryDeletion},
-		{"request export", "POST /v1/account/data-exports", http.MethodPost, "/v1/account/data-exports", `{}`, "request-export", 202, true, userPortalActionHandlers.requestDataExport},
-		{"get export", "GET /v1/account/data-exports/{exportId}", http.MethodGet, "/v1/account/data-exports/" + targetID.String(), "", "get-export", 200, false, userPortalActionHandlers.getDataExport},
 		{"deletion preflight", "GET /v1/account/deletion-preflight", http.MethodGet, "/v1/account/deletion-preflight", "", "deletion-preflight", 200, false, userPortalActionHandlers.getAccountDeletionPreflight},
 		{"request deletion", "POST /v1/account/deletion-requests", http.MethodPost, "/v1/account/deletion-requests", `{}`, "request-deletion", 202, true, userPortalActionHandlers.requestAccountDeletion},
 		{"get deletion", "GET /v1/account/deletion-requests/{requestId}", http.MethodGet, "/v1/account/deletion-requests/" + targetID.String(), "", "get-deletion", 200, false, userPortalActionHandlers.getAccountDeletion},
@@ -171,7 +148,6 @@ func TestUserPortalActionHandlersBindEveryStoreCallToAuthenticatedAccount(t *tes
 			service := &API{
 				Clock: func() time.Time { return now }, operationSecurity: security,
 				RegistrationCodeKey:   []byte("portal-audit-key-0123456789abcdef"),
-				DataExportDownloader:  &fakePrivacyExportDownloader{body: []byte(`{"status":"ready"}`)},
 				AccountDeletionBinder: binder,
 			}
 			actions := userPortalActionHandlers{api: service, repository: repository, binder: binder}
@@ -280,7 +256,7 @@ func TestUserPortalSensitiveActionsRequireKeyRecentMFAAndReason(t *testing.T) {
 
 func TestUserPortalResourceErrorsAreNonOracular(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0).UTC()
-	accountID, deviceID, exportID := uuid.New(), uuid.New(), uuid.New()
+	accountID, deviceID, requestID := uuid.New(), uuid.New(), uuid.New()
 	trace := uuid.NewString()
 	responses := make([]*httptest.ResponseRecorder, 0, 2)
 	for _, repositoryError := range []error{store.ErrDenied, store.ErrNotFound} {
@@ -288,9 +264,9 @@ func TestUserPortalResourceErrorsAreNonOracular(t *testing.T) {
 		service := &API{Clock: func() time.Time { return now }}
 		actions := userPortalActionHandlers{api: service, repository: repository}
 		endpoint := userPortalAuthenticatedEndpoint(t, accountID, deviceID, now,
-			"GET /v1/account/data-exports/{exportId}", auth.Identity{MFA: true, AuthenticatedAt: now}, actions.getDataExport)
+			"GET /v1/account/deletion-requests/{requestId}", auth.Identity{MFA: true, AuthenticatedAt: now}, actions.getAccountDeletion)
 		request := endpoint.request(t, deviceID, now, http.MethodGet,
-			"/v1/account/data-exports/"+exportID.String(), "", false, false)
+			"/v1/account/deletion-requests/"+requestID.String(), "", false, false)
 		request.Header.Set("X-Trace-ID", trace)
 		response := httptest.NewRecorder()
 		endpoint.handler.ServeHTTP(response, request)
@@ -299,13 +275,12 @@ func TestUserPortalResourceErrorsAreNonOracular(t *testing.T) {
 	if responses[0].Code != http.StatusNotFound || responses[1].Code != http.StatusNotFound || responses[0].Body.String() != responses[1].Body.String() {
 		t.Fatalf("denied/not-found responses differ: %d %s / %d %s", responses[0].Code, responses[0].Body.String(), responses[1].Code, responses[1].Body.String())
 	}
-	if strings.Contains(responses[0].Body.String(), exportID.String()) {
+	if strings.Contains(responses[0].Body.String(), requestID.String()) {
 		t.Fatal("resource error reflected a caller-supplied identifier")
 	}
 }
 
 func TestUserPortalResponsesAreExplicitMetadataOnlyViews(t *testing.T) {
-	now := time.Unix(1_800_000_000, 0).UTC()
 	accountID := uuid.New()
 	preflight := userPortalAccountDeletionPreflightView(store.UserPortalAccountDeletionPreflight{
 		AccountID: accountID, Status: "ACTIVE", Ready: true, RequestSupported: true,
@@ -313,8 +288,7 @@ func TestUserPortalResponsesAreExplicitMetadataOnlyViews(t *testing.T) {
 	if _, exposed := preflight["account_id"]; exposed {
 		t.Fatal("preflight response redundantly exposed the authenticated account ID")
 	}
-	export := userPortalDataExportView(store.UserPortalDataExport{ID: uuid.New(), Status: "READY", RequestedAt: now})
-	encoded, err := json.Marshal(map[string]any{"preflight": preflight, "export": export})
+	encoded, err := json.Marshal(map[string]any{"preflight": preflight})
 	if err != nil {
 		t.Fatal(err)
 	}

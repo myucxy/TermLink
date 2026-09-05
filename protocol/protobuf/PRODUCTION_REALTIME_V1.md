@@ -149,10 +149,11 @@ Version 1 requires `e2ee_x25519_chacha20poly1305`, `cumulative_ack`,
 `flow_control_v1`, and `lease_v1`. `bounded_event_replay_v1` is supported for
 recovery. The additive Phase 1 `TerminalSnapshotV1` and
 `TerminalTranscriptPageV1` object field allocations are frozen in
-`../test-vectors/TERMINAL_SNAPSHOT_V1.md`. The recipient-bound REST
-`terminal_snapshot_v1` path may be advertised after producer/importer
-equivalence and cross-language E2EE gates pass; it remains independently
-rollbackable. This does not enable normalized realtime presentation deltas.
+`../test-vectors/TERMINAL_SNAPSHOT_V1.md`. A peer that implements the
+Windows-owned data plane advertises `host_history_v1`; snapshot, transcript and
+event-range objects then travel over the active recipient-bound E2EE session
+route instead of REST/object storage. This does not enable normalized realtime
+presentation deltas.
 
 Additive implementations may advertise `terminal_presentation_metadata_v1`
 and `terminal_typed_input_v1`. The Relay returns the bounded intersection of
@@ -189,15 +190,15 @@ applies this allowlist before looking up a route:
 
 | Direction | Message types |
 | --- | --- |
-| Android → PC | `SUBSCRIBE`, `UNSUBSCRIBE`, `OUTPUT_ACK`, `FLOW_CONTROL`, `INPUT_EVENT`, `RESIZE_REQUEST`, `RESUME_REQUEST`, `LEASE_REQUEST`, `SESSION_TERMINATE_REQUEST`, `GOODBYE`, `HEARTBEAT` |
-| PC → Android | `SESSION_UPSERT`, `SESSION_REMOVED`, `OUTPUT_CHUNK`, `GAP`, `INPUT_ACCEPTED`, `INPUT_REJECTED`, `RESIZE_APPLIED`, `SNAPSHOT_OFFER`, `SNAPSHOT_CHUNK`, `LEASE_GRANTED`, `LEASE_DENIED`, `LEASE_REVOKED`, `THEME_CHANGED`, `SESSION_STARTED`, `SESSION_INTERRUPTED`, `SESSION_ENDED`, `GOODBYE`, `HEARTBEAT` |
+| Android → PC | `SUBSCRIBE`, `UNSUBSCRIBE`, `OUTPUT_ACK`, `FLOW_CONTROL`, `INPUT_EVENT`, `RESIZE_REQUEST`, `RESUME_REQUEST`, `LEASE_REQUEST`, `SESSION_TERMINATE_REQUEST`, `HOST_HISTORY_REQUEST`, `HOST_HISTORY_CONTROL`, `GOODBYE`, `HEARTBEAT` |
+| PC → Android | `SESSION_UPSERT`, `SESSION_REMOVED`, `OUTPUT_CHUNK`, `GAP`, `INPUT_ACCEPTED`, `INPUT_REJECTED`, `RESIZE_APPLIED`, `SNAPSHOT_OFFER`, `SNAPSHOT_CHUNK`, `LEASE_GRANTED`, `LEASE_DENIED`, `LEASE_REVOKED`, `THEME_CHANGED`, `SESSION_STARTED`, `SESSION_INTERRUPTED`, `SESSION_ENDED`, `HOST_HISTORY_RESPONSE`, `SESSION_TERMINATE_RESPONSE`, `GOODBYE`, `HEARTBEAT` |
 
 `SNAPSHOT_OFFER` and `SNAPSHOT_CHUNK` retain their existing numbers and ACL
 positions for wire compatibility, but are reserved and unused by
 `terminal_snapshot_v1`. A Phase 1 terminal snapshot is a pairwise E2EE history
-object delivered over REST. It anchors the existing terminal sequence at S,
-does not consume an `Envelope.seq`, and is never inserted into the realtime
-event stream.
+object selected by the authoritative Windows Agent. It anchors the existing
+terminal sequence at S, does not consume an ordered terminal `Envelope.seq`,
+and is never inserted into the realtime event stream.
 
 `FLOW_CONTROL` is Android → PC only in V1. It is encrypted and contains the
 same `highest_contiguous_seq` as `Envelope.ack`, absolute finite limits for
@@ -230,31 +231,41 @@ The ordered `LEASE_REVOKED` payload carries the new monotonic
 `local_input_epoch`. Subsequent Android input echoes the latest observed epoch,
 so a stale lease or in-flight input cannot cross a local-input boundary.
 
-## Experimental REST snapshot bootstrap
+## Host-owned history bootstrap
 
 The normative object schema, validation bounds, E2EE domains, atomic restore
 state machine, transcript cursor, compatibility behavior, and enablement gate
 are defined in `../test-vectors/TERMINAL_SNAPSHOT_V1.md`.
 
-At a high level, an enabled client reads durable ACK A, asks authenticated REST
-metadata for at most one eligible pairwise snapshot S where
-`A <= S <= last_output_seq`, verifies and restores it off-screen, atomically
-binds the checkpoint and ACK S, and only then sends `SUBSCRIBE(S)`. Existing
-replay serialization prevents a concurrent live event from overtaking replay.
-If S+1 is unavailable, the PC sends an explicit Gap and the client does not
-advance its ACK.
+At a high level, an enabled client reads durable ACK A, creates a temporary
+zero-window session endpoint, and asks the authoritative Windows Agent for at
+most one eligible pairwise snapshot S where `A <= S <= last_output_seq`. It
+verifies and restores the snapshot off-screen, requests any contiguous missing
+event ranges through R, atomically binds the checkpoint and ACK R, closes the
+temporary endpoint, and only then sends `SUBSCRIBE(R)` on the live endpoint.
+If any required event is unavailable, the PC returns a host-history Gap and the
+client does not advance its ACK.
 
-The client may establish and authenticate the device WebSocket before this
-REST work, but it MUST keep the recovering session unsubscribed until the
-renderer binding is durable. The unsubscribed connection is the only atomic
-V1 pause before replay starts. `SUBSCRIBE(A)` followed by
+The client may establish and authenticate the device transport before this
+history work, but it MUST keep the recovering session at a zero terminal replay
+window until the renderer binding is durable. `SUBSCRIBE(A)` followed by
 `FLOW_CONTROL(paused=true)` is not equivalent: output may be routed between
 those two frames, and the Relay cannot inspect their encrypted payloads. After
-Snapshot S is installed, the client MAY restore a locally cached, authenticated
-and contiguous suffix S+1 through R before connecting the live stream. It MUST
+Snapshot S is installed, the client MUST request an authenticated and
+contiguous suffix S+1 through R from Windows before connecting the live stream.
+It MUST
 persist cumulative ACK R without regressing an older durable ACK, then set both
 `Envelope.ack` and the decrypted `SubscribePayload.resume_from_seq` to R. The
 first ordinary replay frame is exactly R+1. With no restored suffix, R equals S.
+
+`HOST_HISTORY_REQUEST` and `HOST_HISTORY_RESPONSE` are correlated by a 16-byte
+request ID. Each response repeats bounded authenticated selection metadata and
+is divided into chunks smaller than the Relay frame limit. Android sends a
+`HOST_HISTORY_CONTROL(CHUNK_ACK)` after accepting each chunk; Windows sends no
+next chunk for that request until the acknowledgement arrives. Timeout,
+endpoint close, unsubscribe, or explicit cancellation sends/acts as
+`HOST_HISTORY_CONTROL(CANCEL)`. These messages are request-scoped and never
+advance the ordered terminal replay high-water mark.
 
 Legacy Phase 1 Termux Snapshot V1 objects contain both visible terminal buffers
 but an empty snapshot scrollback. Terminal-core Snapshot V2.10 instead retains
@@ -277,5 +288,9 @@ encrypted payload carries a 16-byte request ID and the fixed reason
 `USER_REQUESTED`. The Relay authorizes and routes the opaque frame but cannot
 read it. The Windows Agent validates the request, terminates only the
 registered SessionHost identity and its child Shell tree, and then publishes
-the normal lifecycle/removal events. Permanent deletion of offline history
-remains a separate REST operation.
+the normal lifecycle/removal events. It durably marks and removes the local
+session history, then returns `SESSION_TERMINATE_RESPONSE` for the same request
+ID. Android removes server session metadata and local renderer/cache state only
+after this acknowledgement. An ended session with retained local history uses
+the same operation without requiring a live Shell. If Windows is offline the
+operation fails; Android must not claim that authoritative history was deleted.

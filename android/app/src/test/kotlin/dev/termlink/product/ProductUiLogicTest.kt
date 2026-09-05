@@ -4,6 +4,7 @@ import dev.termlink.model.DeviceSummary
 import dev.termlink.model.DeviceTrustState
 import dev.termlink.model.DeviceType
 import dev.termlink.model.PcSummary
+import dev.termlink.model.PcCapabilityIds
 import dev.termlink.model.SessionState
 import dev.termlink.model.SessionSummary
 import dev.termlink.session.RemoteSessionState
@@ -102,13 +103,21 @@ class ProductUiLogicTest {
     }
 
     @Test
-    fun sessionTabsOpenOnlyForOnlineNonExitedCatalogEntries() {
+    fun sessionTabsOpenLiveOrOnlineHostOwnedEndedHistoryOnly() {
         val id = UUID.fromString("00000000-0000-0000-0000-000000000031")
         val online = session(id, SessionState.RUNNING, Instant.EPOCH, online = true)
+        val pcId = online.pcId
+        val onlineHost = pc(pcId, UUID.randomUUID(), online = true).copy(
+            capabilities = setOf(PcCapabilityIds.HOST_HISTORY_V1),
+        )
+        val ended = online.copy(state = SessionState.EXITED, online = false)
 
         assertTrue(isSessionTabOpenable(online))
         assertFalse(isSessionTabOpenable(online.copy(online = false)))
-        assertFalse(isSessionTabOpenable(online.copy(state = SessionState.EXITED, online = true)))
+        assertTrue(isSessionTabOpenable(ended, onlineHost))
+        assertFalse(isSessionTabOpenable(ended, onlineHost.copy(online = false)))
+        assertFalse(isSessionTabOpenable(ended, onlineHost.copy(capabilities = emptySet())))
+        assertTrue(isSessionTabOpenable(ended, onlineHost.copy(online = false), hasReadOnlyRenderer = true))
         assertFalse(isSessionTabOpenable(null))
     }
 
@@ -202,6 +211,16 @@ class ProductUiLogicTest {
                 sessionStates = emptyMap(),
                 selectedHasEngine = true,
             ).isEmpty(),
+        )
+        assertEquals(
+            listOf(selected.id),
+            liveSessionPageSessions(
+                sessions = listOf(selected.copy(state = SessionState.EXITED, online = false)),
+                selectedId = selected.id,
+                sessionStates = emptyMap(),
+                selectedHasEngine = true,
+                readOnlyOpenableSessionIds = setOf(selected.id),
+            ).map(SessionSummary::id),
         )
         assertTrue(
             liveSessionPageSessions(

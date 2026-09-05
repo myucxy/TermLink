@@ -846,6 +846,47 @@ namespace TermLink.Agent
                 artifact => SealArtifact(sessionId, recipient, artifact));
         }
 
+        internal ProductionTerminalHistoryPreparedUpload PrepareLatestSnapshot(
+            Guid sessionId,
+            ProductionHistoryRecipient recipient)
+        {
+            ValidateRecipient(recipient);
+            return store.PrepareArtifact(
+                sessionId,
+                recipient.DeviceId,
+                recipient.KeyEpoch,
+                artifact => artifact.Kind == ProductionTerminalHistoryArtifactKind.Snapshot,
+                artifact => SealArtifact(sessionId, recipient, artifact));
+        }
+
+        internal ProductionTerminalHistoryPreparedUpload PrepareTranscriptPage(
+            Guid sessionId,
+            ProductionHistoryRecipient recipient,
+            ulong snapshotSequence,
+            ulong beforeLineId)
+        {
+            ValidateRecipient(recipient);
+            if (snapshotSequence == 0 || beforeLineId == 0)
+                throw new ArgumentOutOfRangeException(nameof(beforeLineId));
+            return store.PrepareArtifact(
+                sessionId,
+                recipient.DeviceId,
+                recipient.KeyEpoch,
+                artifact => artifact.Kind == ProductionTerminalHistoryArtifactKind.Transcript &&
+                    artifact.SnapshotSequence == snapshotSequence &&
+                    artifact.ExclusiveBeforeLineId == beforeLineId,
+                artifact => SealArtifact(sessionId, recipient, artifact));
+        }
+
+        private static void ValidateRecipient(ProductionHistoryRecipient recipient)
+        {
+            if (recipient == null || recipient.PairwiseKey == null || recipient.PairwiseKey.Length != 32 ||
+                recipient.DeviceId == Guid.Empty || recipient.KeyEpoch < 1)
+            {
+                throw new ArgumentException("A valid terminal history recipient is required.", nameof(recipient));
+            }
+        }
+
         public void MarkUploaded(ProductionTerminalHistoryPreparedUpload upload) => store.MarkUploaded(upload);
 
         public bool AreAllUploaded(Guid sessionId, ulong snapshotSequence, ProductionHistoryRecipient recipient)

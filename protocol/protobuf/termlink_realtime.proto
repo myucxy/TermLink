@@ -60,6 +60,12 @@ enum MessageType {
   // Android asks the authoritative Windows PC to terminate the registered
   // SessionHost and its child Shell process tree.
   SESSION_TERMINATE_REQUEST = 83;
+  // Host-owned history stays on the authoritative PC. Requests and chunked
+  // responses use the same E2EE session route for Relay and Direct transports.
+  HOST_HISTORY_REQUEST = 84;
+  HOST_HISTORY_RESPONSE = 85;
+  HOST_HISTORY_CONTROL = 86;
+  SESSION_TERMINATE_RESPONSE = 87;
 }
 
 // These payloads are serialized and encrypted into Envelope.ciphertext. The
@@ -121,6 +127,92 @@ message SessionUpsertPayload {
 message SessionTerminateRequestPayload {
   bytes request_id = 1;
   string reason_code = 2;
+}
+
+message SessionTerminateResponsePayload {
+  bytes request_id = 1;
+  bool accepted = 2;
+  string error_code = 3;
+}
+
+enum HostHistoryRequestKindV1 {
+  HOST_HISTORY_REQUEST_KIND_V1_UNSPECIFIED = 0;
+  HOST_HISTORY_REQUEST_KIND_V1_LATEST_SNAPSHOT = 1;
+  HOST_HISTORY_REQUEST_KIND_V1_TRANSCRIPT_PAGE = 2;
+  HOST_HISTORY_REQUEST_KIND_V1_EVENT_RANGE = 3;
+}
+
+message HostHistoryRequestPayload {
+  bytes request_id = 1;
+  HostHistoryRequestKindV1 kind = 2;
+  uint64 snapshot_seq = 3;
+  uint64 before_line_id = 4;
+  uint64 after_seq = 5;
+  uint64 through_seq = 6;
+  uint32 max_events = 7;
+}
+
+enum HostHistoryResponseStatusV1 {
+  HOST_HISTORY_RESPONSE_STATUS_V1_UNSPECIFIED = 0;
+  HOST_HISTORY_RESPONSE_STATUS_V1_OK = 1;
+  HOST_HISTORY_RESPONSE_STATUS_V1_NOT_READY = 2;
+  HOST_HISTORY_RESPONSE_STATUS_V1_NOT_FOUND = 3;
+  HOST_HISTORY_RESPONSE_STATUS_V1_GAP = 4;
+  HOST_HISTORY_RESPONSE_STATUS_V1_REJECTED = 5;
+}
+
+enum HostHistoryObjectKindV1 {
+  HOST_HISTORY_OBJECT_KIND_V1_UNSPECIFIED = 0;
+  HOST_HISTORY_OBJECT_KIND_V1_SNAPSHOT = 1;
+  HOST_HISTORY_OBJECT_KIND_V1_TRANSCRIPT = 2;
+  HOST_HISTORY_OBJECT_KIND_V1_EVENT_CHUNK = 3;
+}
+
+// Each response chunk repeats authenticated selection metadata. The opaque
+// object is already recipient-bound and remains encrypted while cached by the
+// Android client. object_chunk is bounded so the enclosing Envelope stays
+// below the Relay's exclusive 1 MiB limit.
+message HostHistoryResponsePayload {
+  bytes request_id = 1;
+  HostHistoryResponseStatusV1 status = 2;
+  HostHistoryObjectKindV1 kind = 3;
+  bytes object_id = 4;
+  uint64 snapshot_seq = 5;
+  uint32 columns = 6;
+  uint32 rows = 7;
+  uint64 initial_transcript_before_line_id = 8;
+  uint64 request_before_line_id = 9;
+  uint64 first_line_id = 10;
+  uint64 last_line_id = 11;
+  bool has_more_before = 12;
+  uint64 next_before_line_id = 13;
+  uint64 start_seq = 14;
+  uint64 end_seq = 15;
+  bool has_more_events = 16;
+  string key_id = 17;
+  string format_name = 18;
+  uint32 format_version = 19;
+  bytes object_sha256 = 20;
+  uint64 object_bytes = 21;
+  uint32 chunk_index = 22;
+  uint32 chunk_count = 23;
+  bytes object_chunk = 24;
+  string error_code = 25;
+}
+
+enum HostHistoryControlActionV1 {
+  HOST_HISTORY_CONTROL_ACTION_V1_UNSPECIFIED = 0;
+  HOST_HISTORY_CONTROL_ACTION_V1_CHUNK_ACK = 1;
+  HOST_HISTORY_CONTROL_ACTION_V1_CANCEL = 2;
+}
+
+// Host-history flow control is request-scoped and intentionally independent
+// from the cumulative terminal event ACK/window.
+message HostHistoryControlPayload {
+  bytes request_id = 1;
+  HostHistoryControlActionV1 action = 2;
+  bytes object_id = 3;
+  uint32 chunk_index = 4;
 }
 message SubscribePayload { uint64 resume_from_seq = 1; bytes subscriber_exchange_public_key = 2; }
 message LeasePayload { bytes lease_id = 1; int64 version = 2; int64 expires_at_ms = 3; string reason_code = 4; uint64 local_input_epoch = 5; }

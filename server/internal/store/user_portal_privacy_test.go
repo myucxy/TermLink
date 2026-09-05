@@ -15,8 +15,6 @@ func TestUserPortalPrivacyQueriesAreAccountScoped(t *testing.T) {
 		query string
 		scope string
 	}{
-		"export active":            {userPortalDataExportActiveSQL, "account_id=$1"},
-		"export lookup":            {userPortalDataExportByAccountSQL, "account_id=$2"},
 		"deletion active":          {userPortalAccountDeletionActiveSQL, "account_id=$1"},
 		"deletion expiration":      {userPortalAccountDeletionExpireSQL, "account_id=$1"},
 		"deletion lookup":          {userPortalAccountDeletionByAccountSQL, "account_id=$2"},
@@ -91,7 +89,6 @@ func TestUserPortalPCPolicyUsesOptimisticVersioning(t *testing.T) {
 func TestUserPortalPrivacyClaimsAreLeasedAndFenced(t *testing.T) {
 	t.Parallel()
 	for name, query := range map[string]string{
-		"data export":      userPortalDataExportClaimSQL,
 		"account deletion": userPortalAccountDeletionClaimSQL,
 	} {
 		query := normalizePrivacySQL(query)
@@ -115,8 +112,6 @@ func TestUserPortalPrivacyClaimsAreLeasedAndFenced(t *testing.T) {
 func TestUserPortalPrivacyProcessorWritesRequireCurrentLeaseAndFence(t *testing.T) {
 	t.Parallel()
 	for name, query := range map[string]string{
-		"export complete":   userPortalDataExportCompleteSQL,
-		"export fail":       userPortalDataExportFailSQL,
 		"deletion complete": userPortalAccountDeletionCompleteSQL,
 		"deletion fail":     userPortalAccountDeletionFailSQL,
 	} {
@@ -133,8 +128,6 @@ func TestUserPortalPrivacyProcessorWritesRequireCurrentLeaseAndFence(t *testing.
 	}
 
 	for name, query := range map[string]string{
-		"export complete replay":   userPortalDataExportCompleteReplaySQL,
-		"export fail replay":       userPortalDataExportFailReplaySQL,
 		"deletion complete replay": userPortalAccountDeletionCompleteReplaySQL,
 		"deletion fail replay":     userPortalAccountDeletionFailReplaySQL,
 	} {
@@ -169,61 +162,22 @@ func TestUserPortalPrivacyValidationBounds(t *testing.T) {
 	}
 }
 
-func TestUserPortalDataExportArtifactValidation(t *testing.T) {
-	t.Parallel()
-	valid := UserPortalDataExportCompletion{
-		ArtifactObjectKey: "privacy/account/request.json",
-		ArtifactSHA256:    make([]byte, userPortalSHA256DigestSize),
-		ArtifactSizeBytes: 0,
-		ExpiresAt:         time.Now().Add(time.Hour),
-	}
-	if !validUserPortalArtifact(valid) {
-		t.Fatal("valid controlled object key was rejected")
-	}
-
-	invalidKeys := []string{
-		"", "/privacy/export.json", ".hidden/export.json", "privacy\\export.json",
-		"privacy/../export.json", "privacy//export.json", "privacy/导出.json",
-	}
-	for _, key := range invalidKeys {
-		candidate := valid
-		candidate.ArtifactObjectKey = key
-		if validUserPortalArtifact(candidate) {
-			t.Fatalf("unsafe object key accepted: %q", key)
-		}
-	}
-	badDigest := valid
-	badDigest.ArtifactSHA256 = make([]byte, userPortalSHA256DigestSize-1)
-	if validUserPortalArtifact(badDigest) {
-		t.Fatal("artifact with malformed SHA-256 digest was accepted")
-	}
-	pastExpiry := valid
-	pastExpiry.ExpiresAt = time.Now().Add(-time.Second)
-	if validUserPortalArtifact(pastExpiry) {
-		t.Fatal("artifact with expired retention deadline was accepted")
-	}
-}
-
 func TestUserPortalPrivacyAuditAndOutboxContracts(t *testing.T) {
 	t.Parallel()
 	for _, query := range []string{
-		userPortalDataExportAuditSQL,
 		userPortalAccountDeletionRequestAuditSQL,
 		userPortalAccountDeletionCancelAuditSQL,
 		userPortalAccountDeletionExpireAuditSQL,
 		userPortalAccountDeletionIdentityAuditSQL,
 		userPortalAccountDeletionConfirmAuditSQL,
 		userPortalFullPCPolicyAuditSQL,
-		userPortalDataExportProcessorAuditSQL,
 		userPortalAccountDeletionProcessorAuditSQL,
 	} {
 		assertUserPortalActionContains(t, query, "insert into audit_events", "trace_id")
 	}
 	for _, query := range []string{
-		userPortalDataExportOutboxSQL,
 		userPortalAccountDeletionOutboxSQL,
 		userPortalFullPCPolicyOutboxSQL,
-		userPortalDataExportProcessorOutboxSQL,
 	} {
 		assertUserPortalActionContains(t, query, "insert into outbox", "aggregate_id", "payload")
 	}
@@ -232,10 +186,8 @@ func TestUserPortalPrivacyAuditAndOutboxContracts(t *testing.T) {
 func TestUserPortalPrivacyDTOsExcludeSensitiveMaterial(t *testing.T) {
 	t.Parallel()
 	values := []any{
-		UserPortalDataExport{},
 		UserPortalAccountDeletion{},
 		UserPortalPCControlPolicy{},
-		UserPortalDataExportJob{},
 		UserPortalAccountDeletionJob{},
 	}
 	for _, value := range values {

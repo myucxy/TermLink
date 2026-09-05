@@ -83,6 +83,29 @@ public static class SessionCrypto
             keyId));
     }
 
+    public static byte[] DeriveFileTransferKey(
+        byte[] pairwiseKey,
+        Guid transferId,
+        CryptoDirection direction,
+        long keyEpoch,
+        byte[] keyId)
+    {
+        if (pairwiseKey is null || pairwiseKey.Length != 32)
+            throw new ArgumentException("Pairwise key must be 32 bytes.", nameof(pairwiseKey));
+        if (transferId == Guid.Empty)
+            throw new ArgumentException("Transfer ID is required.", nameof(transferId));
+        if (keyEpoch < 1) throw new ArgumentOutOfRangeException(nameof(keyEpoch));
+        if (keyId is null || keyId.Length is < 8 or > 128)
+            throw new ArgumentException("Key ID length is invalid.", nameof(keyId));
+        return Hkdf(pairwiseKey, Concat(
+            "TERMLINK-FILE-TRANSFER-KEY-V2"u8.ToArray(),
+            new byte[] { 0 },
+            UuidBytes(transferId),
+            new[] { (byte)direction },
+            LongBytes(keyEpoch),
+            keyId));
+    }
+
     public static byte[] Nonce(byte[] prefix, ulong sequence)
     {
         if (prefix is null || prefix.Length != 4 || sequence == 0) throw new ArgumentException("Nonce requires a four-byte prefix and non-zero sequence.");

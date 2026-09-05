@@ -63,7 +63,7 @@ const notes = {
     items: [
       "语言支持跟随系统、简体中文和 English。",
       "退出当前设备不删除账号。",
-      "删除账号与云端数据需要重新认证和二次确认。",
+      "删除账号需要重新认证和二次确认。",
     ],
   },
   "windows-tray": {
@@ -144,7 +144,7 @@ const notes = {
     items: [
       "筛选围绕安全域，不围绕内容。",
       "事件包含 Trace ID 便于关联。",
-      "删除动作记录密文对象数量和证明 ID。",
+      "会话关闭记录主机确认和不含正文的审计元数据。",
     ],
   },
   "server-billing": {
@@ -257,7 +257,7 @@ const english = Object.freeze({
   "账号、服务器、语言、主题、可信设备和数据删除集中在设置页。": "Account, server, language, theme, trusted devices, and data deletion live in Settings.",
   "语言支持跟随系统、简体中文和 English。": "Language supports system default, Simplified Chinese, and English.",
   "退出当前设备不删除账号。": "Signing out this device does not delete the account.",
-  "删除账号与云端数据需要重新认证和二次确认。": "Deleting the account and cloud data requires reauthentication and confirmation.",
+  "删除账号需要重新认证和二次确认。": "Deleting the account requires reauthentication and confirmation.",
   "连接正常 · 支持开放注册": "Connected · Open registration supported",
   "更改": "Change",
   "账号操作": "Account action",
@@ -283,7 +283,7 @@ const english = Object.freeze({
   "登录与安全": "Sign-in & security",
   "密码、MFA、活跃登录": "Password, MFA, active sessions",
   "退出当前设备": "Sign out this device",
-  "删除账号与云端数据": "Delete account and cloud data",
+  "删除账号": "Delete account",
   "本地控制平面": "Local control plane",
   "托盘负责即时状态与紧急操作，完整窗口负责会话、访问和设置。": "The tray handles immediate status and emergency actions; the full window manages sessions, access, and settings.",
   "托盘弹层": "Tray panel",
@@ -565,7 +565,6 @@ const supplementalEnglish = Object.freeze({
   "活动时间": "Last activity",
   "计费周期": "Billing period",
   "计费状态": "Billing status",
-  "加密历史对象": "Encrypted history objects",
   "加密事件块已保存": "Encrypted event block saved",
   "价格在购买页显示": "Price shown at checkout",
   "检测到本地键盘输入后立即撤销租约": "Revoke the lease immediately when local keyboard input is detected",
@@ -750,7 +749,7 @@ const supplementalEnglish = Object.freeze({
   "Server Console 概览导航": "Server Console overview navigation",
   "Server Console 连接导航": "Server Console connection navigation",
   "Server Console 账号导航": "Server Console account navigation",
-  "Session se_16…4d 的 18 个加密对象已删除": "18 encrypted objects for Session se_16…4d were deleted",
+  "Session se_16…4d 已关闭，主机确认本地历史已销毁": "Session se_16…4d was closed and the host confirmed local history destruction",
   "Session se_72…c1 向 device_8c…29 授予输入租约": "Session se_72…c1 granted an input lease to device_8c…29",
   "TermLink 账号门户": "TermLink account portal",
   "termlink.kget.cc:8910 · TLS 正常": "termlink.kget.cc:8910 · TLS healthy",
@@ -804,7 +803,7 @@ const supplementalEnglish = Object.freeze({
   "权限以管理、控制、只读三档显示。": "Permissions are displayed as manage, control, or read only.",
   "容器、版本、备份和安全基线集中在部署页，支持运维人员快速判断是否可升级。": "Containers, versions, backups, and security baseline share the deployment page for quick upgrade decisions.",
   "筛选围绕安全域，不围绕内容。": "Filters follow security domains, not content.",
-  "删除动作记录密文对象数量和证明 ID。": "Deletion records ciphertext object counts and proof IDs.",
+  "会话关闭记录主机确认和不含正文的审计元数据。": "Session closure records the host confirmation and content-free audit metadata.",
   "设备权限、密钥指纹和最后活动时间集中呈现，撤销动作进入二次确认。": "Device permissions, key fingerprints, and last activity are grouped together, with revocation requiring confirmation.",
   "设置不影响本地 Shell 权限。": "Settings never change local shell privileges.",
   "审计时间线按动作和结果组织，不记录终端正文、命令、Token 或完整网络标识。": "The audit timeline is organized by action and result and never records terminal content, commands, tokens, or full network identifiers.",
@@ -1729,7 +1728,7 @@ function handleAction(action, target, event) {
       showDialog({ eyebrow: "退出当前设备", title: "退出 Pixel 10 Pro？", content: '<p>将删除本机登录 Token 并断开远程连接，但不会删除账号、可信设备记录或云端权益。</p>', confirmText: "退出设备", danger: true, onConfirm: () => { activateScreen(workspace, "android-account"); showToast("当前设备已退出", "本地密钥保留到设备撤销或重新登录。", "success"); } });
       break;
     case "delete-account":
-      showDialog({ eyebrow: "不可撤销操作", title: "删除账号与云端数据？", content: '<div class="warning-callout">需要重新认证并等待 7 天冷静期。期间可撤销删除；到期后删除账号、设备授权、订阅关联和服务器密文对象，安全审计仅保留法规要求的不可逆元数据。</div><div class="field-stack"><label>输入 DELETE 确认<input autocomplete="off" placeholder="DELETE"></label></div>', confirmText: "开始 7 天删除流程", danger: true, onConfirm: () => showToast("账号删除请求已建立", "重新认证后进入 7 天冷静期。", "warning") });
+      showDialog({ eyebrow: "不可撤销操作", title: "删除账号？", content: '<div class="warning-callout">需要重新认证并等待 7 天冷静期。期间可撤销删除；到期后删除账号、设备授权、订阅关联和服务端账号元数据，安全审计仅保留法规要求的不可逆元数据。Windows 主机上的运行中会话和本地历史由主机生命周期单独管理。</div><div class="field-stack"><label>输入 DELETE 确认<input autocomplete="off" placeholder="DELETE"></label></div>', confirmText: "开始 7 天删除流程", danger: true, onConfirm: () => showToast("账号删除请求已建立", "重新认证后进入 7 天冷静期。", "warning") });
       break;
     case "windows-web-auth":
       showAuthorizationHandoff("windows");
@@ -1965,13 +1964,13 @@ function handleAction(action, target, event) {
       break;
     }
     case "create-backup":
-      showDialog({ eyebrow: "Docker 部署", title: "创建加密备份？", content: '<p>将创建 PostgreSQL 一致性快照并验证对象存储生命周期。Secret 与终端正文不会进入操作日志。</p>', confirmText: "开始备份", onConfirm: () => showToast("备份任务已排队", "任务 backup_…7f · 等待生产运维 API", "success") });
+      showDialog({ eyebrow: "Docker 部署", title: "创建加密备份？", content: '<p>将创建 PostgreSQL 一致性快照并校验备份清单。Secret 与终端正文不会进入操作日志。</p>', confirmText: "开始备份", onConfirm: () => showToast("备份任务已排队", "任务 backup_…7f · 等待生产运维 API", "success") });
       break;
     case "show-compose":
       showDialog({ eyebrow: "只读配置", title: "Compose 安全摘要", content: '<pre class="code-panel">services:\n  relay:\n    image: termlink/server@sha256:…\n    read_only: true\n    user: 65532:65532\n    cap_drop: [ALL]\n    secrets: [REDACTED]</pre><div class="security-callout">控制台永不回显 Secret 值；生产部署必须固定镜像 Digest。</div>', confirmText: "关闭", hideCancel: true });
       break;
     case "restore-drill":
-      showDialog({ eyebrow: "恢复演练", title: "启动隔离恢复演练？", content: '<p>在隔离网络中恢复最近备份并验证数据库、对象索引和签名，不切换生产流量。</p>', confirmText: "启动演练", onConfirm: () => showToast("恢复演练已启动", "隔离任务 restore_…91", "success") });
+      showDialog({ eyebrow: "恢复演练", title: "启动隔离恢复演练？", content: '<p>在隔离网络中恢复最近 PostgreSQL 备份并验证清单和签名，不切换生产流量。</p>', confirmText: "启动演练", onConfirm: () => showToast("恢复演练已启动", "隔离任务 restore_…91", "success") });
       break;
     case "audit-filter": {
       const label = normalizedText(target);

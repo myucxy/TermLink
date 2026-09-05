@@ -42,6 +42,7 @@ func TestTranscriptMigrationPreservesGeneratedHistoryConstraintNames(t *testing.
 }
 
 func TestTranscriptMigrationReplacesOnlyLegacyShapeConstraint(t *testing.T) {
+	t.Skip("legacy server terminal-history tables were retired by migration 39")
 	databaseURL := os.Getenv("TERMLINK_INTEGRATION_DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("TERMLINK_INTEGRATION_DATABASE_URL is required for the migration integration test")
@@ -91,6 +92,7 @@ func TestTranscriptMigrationReplacesOnlyLegacyShapeConstraint(t *testing.T) {
 }
 
 func TestTranscriptMigrationDownFailsClosedWithPendingDeletion(t *testing.T) {
+	t.Skip("legacy server terminal-history tables were retired by migration 39")
 	databaseURL := os.Getenv("TERMLINK_INTEGRATION_DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("TERMLINK_INTEGRATION_DATABASE_URL is required for the migration integration test")

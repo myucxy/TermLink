@@ -8,12 +8,19 @@ import dev.termlink.protocol.realtime.v1.Direction
 import dev.termlink.protocol.realtime.v1.Envelope
 import dev.termlink.protocol.realtime.v1.FlowControlPayload
 import dev.termlink.protocol.realtime.v1.GapPayload
+import dev.termlink.protocol.realtime.v1.HostHistoryObjectKindV1
+import dev.termlink.protocol.realtime.v1.HostHistoryControlActionV1
+import dev.termlink.protocol.realtime.v1.HostHistoryControlPayload
+import dev.termlink.protocol.realtime.v1.HostHistoryRequestPayload
+import dev.termlink.protocol.realtime.v1.HostHistoryResponsePayload
+import dev.termlink.protocol.realtime.v1.HostHistoryResponseStatusV1
 import dev.termlink.protocol.realtime.v1.InputResultPayload
 import dev.termlink.protocol.realtime.v1.LeasePayload
 import dev.termlink.protocol.realtime.v1.MessageType
 import dev.termlink.protocol.realtime.v1.OutputAckPayload
 import dev.termlink.protocol.realtime.v1.OutputChunkPayload
 import dev.termlink.protocol.realtime.v1.SessionTerminateRequestPayload
+import dev.termlink.protocol.realtime.v1.SessionTerminateResponsePayload
 import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
 import dev.termlink.protocol.realtime.v1.SubscribePayload
 import dev.termlink.session.DurableAckCommit
@@ -22,11 +29,14 @@ import dev.termlink.session.RemoteLifecycle
 import dev.termlink.session.RemoteControlLeaseLostException
 import dev.termlink.session.RendererBootstrapState
 import dev.termlink.session.RemoteSessionEvent
+import dev.termlink.session.RemoteSessionOrderedEventObserver
+import dev.termlink.session.OrderedRemoteSessionNotification
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.TerminalEngine
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalThemeV1
 import java.nio.ByteBuffer
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
@@ -69,6 +79,10 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 
 class ProductionRealtimeSessionClientTest {
+    private companion object {
+        const val TEST_HOST_HISTORY_CHUNK_BYTES = 512 * 1024
+    }
+
     private lateinit var server: MockWebServer
     private lateinit var scope: CoroutineScope
     private val multiplexers = CopyOnWriteArrayList<ProductionRealtimeMultiplexer>()
@@ -3806,6 +3820,413 @@ class ProductionRealtimeSessionClientTest {
         }
     }
 
+    @Test
+    fun hostHistoryAggregatesOutOfOrderChunksAndIgnoresIdenticalReplay(): Unit = runBlocking {
+        val harness = createHostHistoryHarness()
+        val objectBytes = ByteArray(TEST_HOST_HISTORY_CHUNK_BYTES * 2 + 1) { index -> index.toByte() }
+        try {
+            harness.startAndAwaitReady()
+            val pending = harness.requestLatestHostSnapshotAsync()
+            val request = harness.awaitHostHistoryRequest()
+            assertEquals(
+                dev.termlink.protocol.realtime.v1.HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_LATEST_SNAPSHOT,
+                request.kind,
+            )
+            val chunks = hostHistoryChunks(request.requestId, objectBytes)
+
+            // The accumulator must be independent of delivery order and accept
+            // an exact replay of an already stored chunk.
+            harness.deliverHostHistoryResponse(chunks[2], sequence = 102)
+            harness.deliverHostHistoryResponse(chunks[0], sequence = 100)
+            harness.deliverHostHistoryResponse(chunks[0], sequence = 103)
+            harness.deliverHostHistoryResponse(chunks[1], sequence = 101)
+
+            val result = requireNotNull(withTimeout(2_000) { pending.await() })
+            try {
+                assertEquals(HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_SNAPSHOT, result.kind)
+                assertEquals(UUID.fromString("01234567-89ab-cdef-0123-456789abcdef"), result.objectId)
+                assertEquals(42uL, result.snapshotSequence)
+                assertArrayEquals(objectBytes, result.sealedObject)
+                assertEquals(objectBytes.size, result.sealedObject.size)
+            } finally {
+                result.destroy()
+            }
+            val controls = harness.awaitHostHistoryControls(4)
+            assertTrue(controls.all {
+                it.action == HostHistoryControlActionV1.HOST_HISTORY_CONTROL_ACTION_V1_CHUNK_ACK
+            })
+            assertEquals(listOf(2, 0, 0, 1), controls.map(HostHistoryControlPayload::getChunkIndex))
+            assertTrue(controls.all { it.requestId == request.requestId })
+            assertTrue(controls.all { it.objectId == chunks.first().objectId })
+            assertFalse(controls.any {
+                it.action == HostHistoryControlActionV1.HOST_HISTORY_CONTROL_ACTION_V1_CANCEL
+            })
+        } finally {
+            objectBytes.fill(0)
+            harness.close()
+        }
+    }
+
+    @Test
+    fun hostHistoryTimeoutSendsRequestScopedCancel(): Unit = runBlocking {
+        val harness = createHostHistoryHarness(hostHistoryRequestTimeoutMillis = 50)
+        try {
+            harness.startAndAwaitReady()
+            val pending = harness.requestLatestHostSnapshotAsync()
+            val request = harness.awaitHostHistoryRequest()
+
+            val failure = assertFailsWith<IllegalStateException> {
+                withTimeout(2_000) { pending.await() }
+            }
+            assertTrue(failure.message.orEmpty().contains("timed out"))
+            val control = harness.awaitHostHistoryControls(1).single()
+            assertEquals(request.requestId, control.requestId)
+            assertEquals(
+                HostHistoryControlActionV1.HOST_HISTORY_CONTROL_ACTION_V1_CANCEL,
+                control.action,
+            )
+            assertTrue(control.objectId.isEmpty)
+            assertEquals(0, control.chunkIndex)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun gracefulCloseUnsubscribesAndFailsPendingHostHistoryRequest(): Unit = runBlocking {
+        val harness = createHostHistoryHarness()
+        try {
+            harness.startAndAwaitReady()
+            val pending = harness.requestLatestHostSnapshotAsync()
+            harness.awaitHostHistoryRequest()
+
+            harness.client.closeGracefully()
+
+            val failure = assertFailsWith<IllegalStateException> {
+                withTimeout(2_000) { pending.await() }
+            }
+            assertTrue(failure.message.orEmpty().contains("closed during host history request"))
+            assertTrue(harness.transport.sent.any { it.messageType == MessageType.UNSUBSCRIBE })
+            assertEquals(1, harness.transport.gracefulCloseCount)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun terminationAcknowledgementAcceptsOnlyTheMatchingRequest(): Unit = runBlocking {
+        val harness = createHostHistoryHarness()
+        try {
+            harness.startAndAwaitReady()
+            val pending = harness.requestTerminationAsync()
+            val request = harness.awaitTerminationRequest()
+
+            harness.deliverTerminationResponse(
+                requestId = ProductionRealtimeClient.uuidBytes(UUID.randomUUID()),
+                accepted = true,
+                sequence = 500,
+            )
+            kotlinx.coroutines.yield()
+            assertFalse(pending.isCompleted)
+
+            harness.deliverTerminationResponse(request.requestId.toByteArray(), accepted = true, sequence = 501)
+            assertArrayEquals(
+                request.requestId.toByteArray(),
+                ProductionRealtimeClient.uuidBytes(withTimeout(2_000) { pending.await() }),
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun rejectedOrTimedOutTerminationNeverReportsAcknowledgement(): Unit = runBlocking {
+        val rejectedHarness = createHostHistoryHarness()
+        try {
+            rejectedHarness.startAndAwaitReady()
+            val pending = rejectedHarness.requestTerminationAsync()
+            val request = rejectedHarness.awaitTerminationRequest()
+            rejectedHarness.deliverTerminationResponse(
+                requestId = request.requestId.toByteArray(),
+                accepted = false,
+                errorCode = "SESSION_NOT_FOUND",
+                sequence = 510,
+            )
+            val rejected = assertFailsWith<IllegalStateException> {
+                withTimeout(2_000) { pending.await() }
+            }
+            assertTrue(rejected.message.orEmpty().contains("SESSION_NOT_FOUND"))
+        } finally {
+            rejectedHarness.close()
+        }
+
+        val timeoutHarness = createHostHistoryHarness(terminationReadinessTimeoutMillis = 50)
+        try {
+            timeoutHarness.startAndAwaitReady()
+            val pending = timeoutHarness.requestTerminationAsync()
+            timeoutHarness.awaitTerminationRequest()
+            val timeout = assertFailsWith<IllegalStateException> {
+                withTimeout(2_000) { pending.await() }
+            }
+            assertTrue(timeout.message.orEmpty().contains("acknowledgement timed out"))
+        } finally {
+            timeoutHarness.close()
+        }
+    }
+
+    @Test
+    fun hostHistoryRejectsChangedDuplicateChunkAndDigestLengthOrMetadataTampering(): Unit = runBlocking {
+        val tamperCases = listOf("duplicate", "digest", "length", "metadata")
+        tamperCases.forEachIndexed { caseIndex, tamperCase ->
+            val harness = createHostHistoryHarness()
+            val objectBytes = ByteArray(TEST_HOST_HISTORY_CHUNK_BYTES + 2) { index -> (index + 11).toByte() }
+            try {
+                harness.startAndAwaitReady()
+                val pending = harness.requestLatestHostSnapshotAsync()
+                val request = harness.awaitHostHistoryRequest()
+                val chunks = hostHistoryChunks(request.requestId, objectBytes)
+                val responses = when (tamperCase) {
+                    "duplicate" -> listOf(
+                        chunks[0],
+                        chunks[0].toBuilder().setObjectChunk(
+                            ByteString.copyFrom(
+                                chunks[0].objectChunk.toByteArray().also {
+                                    it[0] = (it[0].toInt() xor 0x7f).toByte()
+                                },
+                            ),
+                        ).build(),
+                        chunks[1],
+                    )
+                    "digest" -> {
+                        val digest = chunks[0].objectSha256.toByteArray()
+                        digest[0] = (digest[0].toInt() xor 1).toByte()
+                        chunks.map { it.toBuilder().setObjectSha256(ByteString.copyFrom(digest)).build() }
+                    }
+                    "length" -> chunks.map {
+                        it.toBuilder().setObjectBytes(objectBytes.size.toLong() + 1L).build()
+                    }
+                    "metadata" -> listOf(
+                        chunks[0],
+                        chunks[1].toBuilder().setFormatName("tampered-format").build(),
+                    )
+                    else -> error("unknown host history tamper case")
+                }
+                responses.forEachIndexed { index, response ->
+                    harness.deliverHostHistoryResponse(response, sequence = 200L + caseIndex * 10 + index)
+                }
+
+                val failure = assertFailsWith<IllegalArgumentException> {
+                    withTimeout(2_000) { pending.await() }
+                }
+                assertTrue(failure.message.orEmpty().contains("Host history"))
+            } finally {
+                objectBytes.fill(0)
+                harness.close()
+            }
+        }
+    }
+
+    @Test
+    fun hostHistoryErrorStatusesCompleteOnlyTheirPendingRequest(): Unit = runBlocking {
+        val statuses = listOf(
+            HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_NOT_READY,
+            HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_NOT_FOUND,
+            HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_GAP,
+            HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_REJECTED,
+        )
+        statuses.forEachIndexed { index, status ->
+            val harness = createHostHistoryHarness()
+            try {
+                harness.startAndAwaitReady()
+                val pending = harness.requestLatestHostSnapshotAsync()
+                val request = harness.awaitHostHistoryRequest()
+                val response = HostHistoryResponsePayload.newBuilder()
+                    .setRequestId(request.requestId)
+                    .setStatus(status)
+                    .setErrorCode("TEST_${status.name}")
+                    .build()
+                harness.deliverHostHistoryResponse(response, sequence = 300L + index)
+                when (status) {
+                    HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_NOT_READY -> {
+                        val failure = assertFailsWith<ProductionHostHistoryNotReadyException> {
+                            withTimeout(2_000) { pending.await() }
+                        }
+                        assertTrue(failure.message.orEmpty().contains("TEST_"))
+                    }
+                    HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_NOT_FOUND ->
+                        assertEquals(null, withTimeout(2_000) { pending.await() })
+                    HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_GAP -> {
+                        val failure = assertFailsWith<ProductionHostHistoryGapException> {
+                            withTimeout(2_000) { pending.await() }
+                        }
+                        assertTrue(failure.message.orEmpty().contains("TEST_"))
+                    }
+                    HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_REJECTED -> {
+                        val failure = assertFailsWith<IllegalStateException> {
+                            withTimeout(2_000) { pending.await() }
+                        }
+                        assertEquals(IllegalStateException::class, failure::class)
+                        assertTrue(failure.message.orEmpty().contains("TEST_"))
+                    }
+                    else -> error("unknown host history response status")
+                }
+            } finally {
+                harness.close()
+            }
+        }
+    }
+
+    @Test
+    fun closeCompletesAndCleansPendingHostHistoryRequest(): Unit = runBlocking {
+        val harness = createHostHistoryHarness()
+        try {
+            harness.startAndAwaitReady()
+            val pending = harness.requestLatestHostSnapshotAsync()
+            harness.awaitHostHistoryRequest()
+            harness.client.close()
+            val failure = assertFailsWith<IllegalStateException> {
+                withTimeout(2_000) { pending.await() }
+            }
+            assertTrue(failure.message.orEmpty().contains("closed during host history request"))
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun hostHistoryResponseDoesNotChangeTerminalAckOrOrderedEventState(): Unit = runBlocking {
+        val ordered = CopyOnWriteArrayList<RemoteSessionEvent>()
+        val observer = object : RemoteSessionOrderedEventObserver {
+            override suspend fun observe(notification: OrderedRemoteSessionNotification) {
+                if (notification is OrderedRemoteSessionNotification.Applied) {
+                    ordered += notification.event
+                }
+            }
+        }
+        val harness = createHostHistoryHarness(orderedEventObserver = observer)
+        val output = byteArrayOf(7)
+        try {
+            harness.startAndAwaitReady()
+            harness.transport.deliver(
+                incomingOutputEnvelope(
+                    harness.sessionId,
+                    harness.pcId,
+                    harness.androidId,
+                    harness.pcIdentity,
+                    harness.androidIdentity,
+                    harness.keyId,
+                    sequence = 1,
+                    output = output,
+                ),
+                generation = 1,
+            )
+            withTimeout(2_000) {
+                harness.client.sessionState.first { it.lastAckedSequence == 1L }
+            }
+            withTimeout(2_000) {
+                while (ordered.size < 1) kotlinx.coroutines.yield()
+            }
+            val stateBefore = harness.client.sessionState.value
+            val outputAcksBefore = harness.transport.sent.count { it.messageType == MessageType.OUTPUT_ACK }
+            val pending = harness.requestLatestHostSnapshotAsync()
+            val request = harness.awaitHostHistoryRequest()
+            val chunks = hostHistoryChunks(request.requestId, byteArrayOf(21, 22))
+            chunks.forEachIndexed { index, response ->
+                harness.deliverHostHistoryResponse(response, sequence = 400L + index)
+            }
+            val history = requireNotNull(withTimeout(2_000) { pending.await() })
+            history.destroy()
+
+            val stateAfter = harness.client.sessionState.value
+            assertEquals(stateBefore, stateAfter)
+            assertEquals(outputAcksBefore, harness.transport.sent.count { it.messageType == MessageType.OUTPUT_ACK })
+            assertEquals(1, ordered.count { it is RemoteSessionEvent.Output })
+        } finally {
+            output.fill(0)
+            harness.close()
+        }
+    }
+
+    @Test
+    fun holdingLiveReplayForHostHistoryKeepsSubscriberAtZeroWindow(): Unit = runBlocking {
+        val harness = createHostHistoryHarness(holdLiveReplayForHostHistory = true)
+        try {
+            harness.client.start()
+            withTimeout(2_000) {
+                while (harness.transport.sent.count { it.messageType == MessageType.FLOW_CONTROL } < 2) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+            val flows = harness.transport.sent
+                .filter { it.messageType == MessageType.FLOW_CONTROL }
+                .take(2)
+                .map { it.decryptFlowControl(harness.outboundSessionKey()) }
+            assertEquals(2, flows.size)
+            assertTrue(flows.all { it.paused })
+            assertTrue(flows.all { it.maxUnackedEvents == 0 })
+            assertTrue(flows.all { it.maxUnackedWireBytes == 0L })
+            assertEquals("ANDROID_SUBSCRIBER_BOOTSTRAP", flows[0].reasonCode)
+            assertEquals("ANDROID_HISTORY_RECOVERY", flows[1].reasonCode)
+            assertTrue(harness.transport.sent
+                .filter { it.messageType == MessageType.FLOW_CONTROL }
+                .take(2)
+                .all { it.decryptFlowControl(harness.outboundSessionKey()).paused })
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun hostHistoryOnlyEndpointKeepsZeroWindowAndNeverProjectsLiveOutputOrControl(): Unit = runBlocking {
+        val harness = createHostHistoryHarness(hostHistoryOnlyMode = true)
+        val output = byteArrayOf(9, 8, 7)
+        try {
+            harness.startAndAwaitReady()
+            assertTrue(harness.engine.isReadOnly)
+            harness.transport.deliver(
+                incomingOutputEnvelope(
+                    harness.sessionId,
+                    harness.pcId,
+                    harness.androidId,
+                    harness.pcIdentity,
+                    harness.androidIdentity,
+                    harness.keyId,
+                    sequence = 1,
+                    output = output,
+                ),
+                generation = 1,
+            )
+            withTimeout(2_000) {
+                while (harness.transport.releasedReservations < 1) kotlinx.coroutines.yield()
+            }
+            assertEquals(0, harness.engine.renderedOutputCount)
+            assertFailsWith<IllegalStateException> { harness.client.requestControl() }
+
+            val pending = harness.requestLatestHostSnapshotAsync()
+            val request = harness.awaitHostHistoryRequest()
+            harness.deliverHostHistoryResponse(
+                hostHistoryChunks(request.requestId, byteArrayOf(1, 2, 3)).single(),
+                sequence = 2,
+            )
+            requireNotNull(withTimeout(2_000) { pending.await() }).destroy()
+            val flows = harness.transport.sent
+                .filter { it.messageType == MessageType.FLOW_CONTROL }
+                .map { envelope ->
+                    val key = harness.outboundSessionKey()
+                    try {
+                        envelope.decryptFlowControl(key)
+                    } finally {
+                        key.fill(0)
+                    }
+                }
+            assertTrue(flows.isNotEmpty())
+            assertTrue(flows.all { it.paused && it.maxUnackedEvents == 0 && it.maxUnackedWireBytes == 0L })
+        } finally {
+            output.fill(0)
+            harness.close()
+        }
+    }
+
     private fun assertCumulativeCursor(values: List<Long>, expectedFinal: Long) {
         val snapshot = values.toList()
         assertTrue(snapshot.isNotEmpty())
@@ -3827,6 +4248,303 @@ class ProductionRealtimeSessionClientTest {
 
     private suspend fun resetAcknowledgement(generation: Long): DurableAckCommit =
         DurableAckCommit(sequence = 0L, rendererGeneration = generation + 1L)
+
+    private fun createHostHistoryHarness(
+        holdLiveReplayForHostHistory: Boolean = false,
+        orderedEventObserver: RemoteSessionOrderedEventObserver? = null,
+        hostHistoryRequestTimeoutMillis: Long = 30_000,
+        terminationReadinessTimeoutMillis: Long = 15_000,
+        hostHistoryOnlyMode: Boolean = false,
+    ): HostHistoryHarness {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val keyId = "epoch-00000007".encodeToByteArray()
+        val transport = QueuedSessionTransport()
+        val engine = RecordingEngine(CopyOnWriteArrayList())
+        val client = ProductionRealtimeSessionClient(
+            engine = engine,
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "https://example.test",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+                keyId = keyId.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            reconnectDelaysMillis = listOf(30_000),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+            holdLiveReplayForHostHistory = holdLiveReplayForHostHistory || hostHistoryOnlyMode,
+            hostHistoryRequestTimeoutMillis = hostHistoryRequestTimeoutMillis,
+            terminationReadinessTimeoutMillis = terminationReadinessTimeoutMillis,
+            hostHistoryOnlyMode = hostHistoryOnlyMode,
+            orderedEventObserver = orderedEventObserver,
+        )
+        return HostHistoryHarness(
+            androidId = androidId,
+            pcId = pcId,
+            sessionId = sessionId,
+            androidIdentity = androidIdentity,
+            pcIdentity = pcIdentity,
+            keyId = keyId,
+            transport = transport,
+            client = client,
+            engine = engine,
+        )
+    }
+
+    private fun hostHistoryChunks(
+        requestId: ByteString,
+        objectBytes: ByteArray,
+        chunkSize: Int = TEST_HOST_HISTORY_CHUNK_BYTES,
+    ): List<HostHistoryResponsePayload> {
+        require(objectBytes.isNotEmpty())
+        require(chunkSize == TEST_HOST_HISTORY_CHUNK_BYTES)
+        val objectId = ProductionRealtimeClient.uuidBytes(
+            UUID.fromString("01234567-89ab-cdef-0123-456789abcdef"),
+        )
+        val digest = MessageDigest.getInstance("SHA-256").digest(objectBytes)
+        val chunkCount = (objectBytes.size + chunkSize - 1) / chunkSize
+        return try {
+            (0 until chunkCount).map { index ->
+                val start = index * chunkSize
+                val end = minOf(objectBytes.size, start + chunkSize)
+                HostHistoryResponsePayload.newBuilder()
+                    .setRequestId(requestId)
+                    .setStatus(HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_OK)
+                    .setKind(HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_SNAPSHOT)
+                    .setObjectId(ByteString.copyFrom(objectId))
+                    .setSnapshotSeq(42)
+                    .setColumns(80)
+                    .setRows(24)
+                    .setInitialTranscriptBeforeLineId(40)
+                    .setRequestBeforeLineId(40)
+                    .setFirstLineId(41)
+                    .setLastLineId(42)
+                    .setHasMoreBefore(false)
+                    .setNextBeforeLineId(0)
+                    .setStartSeq(1)
+                    .setEndSeq(42)
+                    .setHasMoreEvents(false)
+                    .setKeyId("epoch-00000007")
+                    .setFormatName("termlink.snapshot")
+                    .setFormatVersion(1)
+                    .setObjectSha256(ByteString.copyFrom(digest))
+                    .setObjectBytes(objectBytes.size.toLong())
+                    .setChunkIndex(index)
+                    .setChunkCount(chunkCount)
+                    .setObjectChunk(ByteString.copyFrom(objectBytes, start, end - start))
+                    .build()
+            }
+        } finally {
+            objectId.fill(0)
+            digest.fill(0)
+        }
+    }
+
+    private class HostHistoryHarness(
+        val androidId: UUID,
+        val pcId: UUID,
+        val sessionId: UUID,
+        val androidIdentity: DeviceIdentity,
+        val pcIdentity: DeviceIdentity,
+        val keyId: ByteArray,
+        val transport: QueuedSessionTransport,
+        val client: ProductionRealtimeSessionClient,
+        val engine: RecordingEngine,
+    ) {
+        private val requestScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        fun requestLatestHostSnapshotAsync() = requestScope.async {
+            client.requestLatestHostSnapshot()
+        }
+
+        fun requestTerminationAsync() = requestScope.async {
+            client.requestTermination(awaitAcknowledgement = true)
+        }
+
+        suspend fun startAndAwaitReady() {
+            client.start()
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady) kotlinx.coroutines.yield()
+            }
+        }
+
+        suspend fun awaitHostHistoryRequest(): HostHistoryRequestPayload {
+            withTimeout(2_000) {
+                while (transport.sent.none { it.messageType == MessageType.HOST_HISTORY_REQUEST }) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+            val envelope = transport.sent.last { it.messageType == MessageType.HOST_HISTORY_REQUEST }
+            val pairwise = SessionCrypto.derivePairwiseKey(
+                androidIdentity.exchange.privateKey,
+                pcIdentity.exchange.publicKey,
+                pcId,
+                androidId,
+                7,
+            )
+            val sessionKey = SessionCrypto.deriveSessionKey(
+                pairwise,
+                sessionId,
+                CryptoDirection.ANDROID_TO_PC,
+                keyId,
+            )
+            val plaintext = ProductionRealtimeClient.decryptEnvelope(envelope, sessionKey)
+            return try {
+                HostHistoryRequestPayload.parseFrom(plaintext)
+            } finally {
+                plaintext.fill(0)
+                sessionKey.fill(0)
+                pairwise.fill(0)
+            }
+        }
+
+        suspend fun awaitTerminationRequest(): SessionTerminateRequestPayload {
+            withTimeout(2_000) {
+                while (transport.sent.none { it.messageType == MessageType.SESSION_TERMINATE_REQUEST }) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+            val envelope = transport.sent.last { it.messageType == MessageType.SESSION_TERMINATE_REQUEST }
+            return decryptOutbound(envelope) { SessionTerminateRequestPayload.parseFrom(it) }
+        }
+
+        suspend fun awaitHostHistoryControls(count: Int): List<HostHistoryControlPayload> {
+            withTimeout(2_000) {
+                while (transport.sent.count { it.messageType == MessageType.HOST_HISTORY_CONTROL } < count) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+            return transport.sent.filter { it.messageType == MessageType.HOST_HISTORY_CONTROL }
+                .takeLast(count)
+                .map { envelope -> decryptOutbound(envelope) { HostHistoryControlPayload.parseFrom(it) } }
+        }
+
+        fun deliverHostHistoryResponse(response: HostHistoryResponsePayload, sequence: Long) {
+            transport.deliver(
+                responseEnvelope(response, sequence),
+                generation = 1,
+            )
+        }
+
+        fun deliverTerminationResponse(
+            requestId: ByteArray,
+            accepted: Boolean,
+            errorCode: String = "",
+            sequence: Long,
+        ) {
+            val response = SessionTerminateResponsePayload.newBuilder()
+                .setRequestId(ByteString.copyFrom(requestId))
+                .setAccepted(accepted)
+                .setErrorCode(errorCode)
+                .build()
+            transport.deliver(
+                incomingEnvelope(MessageType.SESSION_TERMINATE_RESPONSE, response.toByteArray(), sequence),
+                generation = 1,
+            )
+        }
+
+        private fun <T> decryptOutbound(envelope: Envelope, parse: (ByteArray) -> T): T {
+            val pairwise = SessionCrypto.derivePairwiseKey(
+                androidIdentity.exchange.privateKey,
+                pcIdentity.exchange.publicKey,
+                pcId,
+                androidId,
+                7,
+            )
+            val sessionKey = SessionCrypto.deriveSessionKey(
+                pairwise,
+                sessionId,
+                CryptoDirection.ANDROID_TO_PC,
+                keyId,
+            )
+            val plaintext = ProductionRealtimeClient.decryptEnvelope(envelope, sessionKey)
+            return try {
+                parse(plaintext)
+            } finally {
+                plaintext.fill(0)
+                sessionKey.fill(0)
+                pairwise.fill(0)
+            }
+        }
+
+        private fun responseEnvelope(response: HostHistoryResponsePayload, sequence: Long): Envelope =
+            incomingEnvelope(MessageType.HOST_HISTORY_RESPONSE, response.toByteArray(), sequence)
+
+        private fun incomingEnvelope(messageType: MessageType, payload: ByteArray, sequence: Long): Envelope {
+            val pairwise = SessionCrypto.derivePairwiseKey(
+                pcIdentity.exchange.privateKey,
+                androidIdentity.exchange.publicKey,
+                pcId,
+                androidId,
+                7,
+            )
+            val sessionKey = SessionCrypto.deriveSessionKey(
+                pairwise,
+                sessionId,
+                CryptoDirection.PC_TO_ANDROID,
+                keyId,
+            )
+            val nonce = SessionCrypto.nonce(byteArrayOf(7, 6, 5, 4), sequence.toULong())
+            return try {
+                ProductionRealtimeClient.encryptedEnvelope(
+                    sessionId = sessionId,
+                    senderId = pcId,
+                    messageType = messageType,
+                    direction = CryptoDirection.PC_TO_ANDROID,
+                    sequence = sequence,
+                    acknowledgement = 0,
+                    keyId = keyId,
+                    nonce = nonce,
+                    sessionKey = sessionKey,
+                    plaintext = payload,
+                    recipientId = androidId,
+                )
+            } finally {
+                payload.fill(0)
+                nonce.fill(0)
+                sessionKey.fill(0)
+                pairwise.fill(0)
+            }
+        }
+
+        fun outboundSessionKey(): ByteArray {
+            val pairwise = SessionCrypto.derivePairwiseKey(
+                androidIdentity.exchange.privateKey,
+                pcIdentity.exchange.publicKey,
+                pcId,
+                androidId,
+                7,
+            )
+            return try {
+                SessionCrypto.deriveSessionKey(
+                    pairwise,
+                    sessionId,
+                    CryptoDirection.ANDROID_TO_PC,
+                    keyId,
+                )
+            } finally {
+                pairwise.fill(0)
+            }
+        }
+
+        fun close() {
+            requestScope.cancel()
+            client.close()
+            keyId.fill(0)
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
 
     private fun incomingHeartbeatEnvelope(
         sessionId: UUID,
@@ -4266,6 +4984,9 @@ class ProductionRealtimeSessionClientTest {
 
         val isReadOnly: Boolean
             get() = readOnly
+
+        val renderedOutputCount: Int
+            get() = outputs.size
 
         override suspend fun feed(seq: Long, bytes: ByteBuffer) {
             if (pendingFeedFailureSequence == seq) {

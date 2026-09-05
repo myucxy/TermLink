@@ -315,6 +315,7 @@ namespace TermLink.Agent
     {
         private readonly Stream stream;
         private readonly string temporaryPath;
+        private readonly bool preserveTemporaryPath;
         private int opened;
         private int disposed;
 
@@ -324,7 +325,8 @@ namespace TermLink.Agent
             long sizeBytes,
             byte[] sha256,
             Stream stream,
-            string temporaryPath)
+            string temporaryPath,
+            bool preserveTemporaryPath = false)
         {
             Filename = filename;
             DirectoryZip = directoryZip;
@@ -332,6 +334,7 @@ namespace TermLink.Agent
             Sha256 = sha256;
             this.stream = stream ?? throw new ArgumentNullException(nameof(stream));
             this.temporaryPath = temporaryPath;
+            this.preserveTemporaryPath = preserveTemporaryPath;
         }
 
         internal string Filename { get; }
@@ -355,10 +358,17 @@ namespace TermLink.Agent
         {
             if (Interlocked.Exchange(ref disposed, 1) != 0) return;
             await stream.DisposeAsync().ConfigureAwait(false);
-            if (string.IsNullOrEmpty(temporaryPath)) return;
+            if (string.IsNullOrEmpty(temporaryPath) || preserveTemporaryPath) return;
             try { File.Delete(temporaryPath); }
             catch (FileNotFoundException) { }
             catch (DirectoryNotFoundException) { }
+            try
+            {
+                var parent = Path.GetDirectoryName(temporaryPath);
+                if (!string.IsNullOrEmpty(parent)) Directory.Delete(parent, false);
+            }
+            catch (DirectoryNotFoundException) { }
+            catch (IOException) { }
         }
     }
 
@@ -469,6 +479,8 @@ namespace TermLink.Agent
     internal sealed class FileTransferPreparer
     {
         internal const long MaximumTransferBytes = 5L * 1024 * 1024 * 1024;
+        internal const string CacheDirectoryName = "FileTransfers";
+        internal static readonly TimeSpan OrphanRetention = TimeSpan.FromHours(26);
         private static readonly DateTimeOffset MinimumZipTimestamp =
             new DateTimeOffset(1980, 1, 1, 0, 0, 0, TimeSpan.Zero);
         private static readonly DateTimeOffset MaximumZipTimestamp =
@@ -480,8 +492,13 @@ namespace TermLink.Agent
         internal FileTransferPreparer()
             : this(
                 new WindowsPathService(),
-                Path.Combine(Path.GetTempPath(), "TermLink", "file-operations"))
+                Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "TermLink",
+                    "Cache",
+                    CacheDirectoryName))
         {
+            CleanupExpired(DateTime.UtcNow - OrphanRetention);
         }
 
         internal FileTransferPreparer(
@@ -501,8 +518,86 @@ namespace TermLink.Agent
         internal async Task<FileTransferArtifact> PrepareAsync(string requestedPath, CancellationToken token)
         {
             var path = paths.NormalizeExistingFileOrDirectory(requestedPath);
-            if (Directory.Exists(path)) return await PrepareDirectoryAsync(path, token).ConfigureAwait(false);
+            if (Directory.Exists(path))
+                return await PrepareDirectoryAsync(path, Guid.NewGuid(), false, token).ConfigureAwait(false);
             return await PrepareFileAsync(path, token).ConfigureAwait(false);
+        }
+
+        internal async Task<FileTransferArtifact> PrepareAsync(
+            string requestedPath,
+            Guid transferId,
+            CancellationToken token)
+        {
+            if (transferId == Guid.Empty)
+                throw new ArgumentException("A transfer ID is required.", nameof(transferId));
+            var path = paths.NormalizeExistingFileOrDirectory(requestedPath);
+            if (Directory.Exists(path))
+                return await PrepareDirectoryAsync(path, transferId, true, token).ConfigureAwait(false);
+            return await PrepareFileAsync(path, token).ConfigureAwait(false);
+        }
+
+        internal string TransferDirectory(Guid transferId)
+        {
+            if (transferId == Guid.Empty)
+                throw new ArgumentException("A transfer ID is required.", nameof(transferId));
+            var candidate = Path.GetFullPath(Path.Combine(temporaryRoot, transferId.ToString("N")));
+            EnsureWithinCache(candidate);
+            return candidate;
+        }
+
+        internal void Cleanup(Guid transferId)
+        {
+            var directory = TransferDirectory(transferId);
+            if (!Directory.Exists(directory)) return;
+            EnsureOrdinaryDirectory(directory);
+            foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos())
+            {
+                if ((entry.Attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
+                    (!string.Equals(entry.Name, "payload.zip", StringComparison.OrdinalIgnoreCase) &&
+                     !string.Equals(entry.Name, "payload.zip.tmp", StringComparison.OrdinalIgnoreCase)))
+                {
+                    throw new InvalidOperationException(
+                        "File-transfer cache contains an unexpected or unsafe entry.");
+                }
+                entry.Delete();
+            }
+            Directory.Delete(directory, false);
+        }
+
+        internal void CleanupExpired(DateTime notModifiedSinceUtc)
+        {
+            if (notModifiedSinceUtc.Kind != DateTimeKind.Utc)
+                throw new ArgumentException("Cache cleanup cutoff must be UTC.", nameof(notModifiedSinceUtc));
+            if (!Directory.Exists(temporaryRoot)) return;
+            EnsureOrdinaryDirectory(temporaryRoot);
+            foreach (var candidate in new DirectoryInfo(temporaryRoot).EnumerateDirectories())
+            {
+                if (!Guid.TryParseExact(candidate.Name, "N", out var transferId) ||
+                    (candidate.Attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    continue;
+                }
+                DateTime newestWrite;
+                try
+                {
+                    newestWrite = candidate.EnumerateFileSystemInfos()
+                        .Select(entry => entry.LastWriteTimeUtc)
+                        .Append(candidate.LastWriteTimeUtc)
+                        .Max();
+                }
+                catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
+                {
+                    continue;
+                }
+                if (newestWrite > notModifiedSinceUtc) continue;
+                try { Cleanup(transferId); }
+                catch (Exception error) when (
+                    error is IOException || error is UnauthorizedAccessException || error is InvalidOperationException)
+                {
+                    // An unexpected or concurrently active entry is never
+                    // recursively removed by orphan collection.
+                }
+            }
         }
 
         private async Task<FileTransferArtifact> PrepareFileAsync(string path, CancellationToken token)
@@ -547,7 +642,11 @@ namespace TermLink.Agent
             }
         }
 
-        private async Task<FileTransferArtifact> PrepareDirectoryAsync(string path, CancellationToken token)
+        private async Task<FileTransferArtifact> PrepareDirectoryAsync(
+            string path,
+            Guid transferId,
+            bool preserveForResume,
+            CancellationToken token)
         {
             var rootAttributes = File.GetAttributes(path);
             if ((rootAttributes & FileAttributes.ReparsePoint) != 0)
@@ -555,18 +654,28 @@ namespace TermLink.Agent
                     "REPARSE_DIRECTORY_UNSUPPORTED",
                     "A reparse-point directory cannot be downloaded as an archive.");
 
-            Directory.CreateDirectory(temporaryRoot);
-            var temporaryPath = Path.Combine(temporaryRoot, Guid.NewGuid().ToString("N") + ".zip");
+            var transferDirectory = TransferDirectory(transferId);
+            Directory.CreateDirectory(transferDirectory);
+            EnsureOrdinaryDirectory(transferDirectory);
+            var temporaryPath = Path.Combine(transferDirectory, "payload.zip");
+            var stagingPath = Path.Combine(transferDirectory, "payload.zip.tmp");
             try
             {
-                await WriteDirectoryZipAsync(path, temporaryPath, token).ConfigureAwait(false);
+                if (!File.Exists(temporaryPath))
+                {
+                    try { File.Delete(stagingPath); }
+                    catch (FileNotFoundException) { }
+                    await WriteDirectoryZipAsync(path, stagingPath, token).ConfigureAwait(false);
+                    File.Move(stagingPath, temporaryPath, false);
+                }
+                EnsureOrdinaryFile(temporaryPath);
                 var stream = new FileStream(
                     temporaryPath,
                     FileMode.Open,
                     FileAccess.Read,
                     FileShare.Read,
                     128 * 1024,
-                    FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.DeleteOnClose);
+                    FileOptions.Asynchronous | FileOptions.SequentialScan);
                 try
                 {
                     ValidateSize(stream.Length);
@@ -578,7 +687,8 @@ namespace TermLink.Agent
                         stream.Length,
                         hash,
                         stream,
-                        temporaryPath);
+                        temporaryPath,
+                        preserveForResume);
                 }
                 catch
                 {
@@ -588,10 +698,44 @@ namespace TermLink.Agent
             }
             catch
             {
-                try { File.Delete(temporaryPath); }
+                try { File.Delete(stagingPath); }
                 catch (FileNotFoundException) { }
                 catch (DirectoryNotFoundException) { }
+                if (!preserveForResume)
+                {
+                    try { Cleanup(transferId); }
+                    catch (DirectoryNotFoundException) { }
+                }
                 throw;
+            }
+        }
+
+        private void EnsureWithinCache(string candidate)
+        {
+            var root = temporaryRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
+                Path.DirectorySeparatorChar;
+            if (!candidate.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("File-transfer cache path escaped its configured root.");
+        }
+
+        private static void EnsureOrdinaryDirectory(string path)
+        {
+            var attributes = File.GetAttributes(path);
+            if ((attributes & FileAttributes.Directory) == 0 ||
+                (attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                throw new InvalidOperationException(
+                    "File-transfer cache directory is not an ordinary directory.");
+            }
+        }
+
+        private static void EnsureOrdinaryFile(string path)
+        {
+            var attributes = File.GetAttributes(path);
+            if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+            {
+                throw new InvalidOperationException(
+                    "File-transfer cache payload is not an ordinary file.");
             }
         }
 

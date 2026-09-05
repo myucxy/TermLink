@@ -7,13 +7,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/termlink/termlink/server/internal/privacyexport"
 	"github.com/termlink/termlink/server/internal/store"
 )
 
@@ -21,25 +19,14 @@ const (
 	userPortalDeletionCoolingPeriod = 7 * 24 * time.Hour
 	userPortalDeletionRetention     = 30 * 24 * time.Hour
 	userPortalDeletionConfirmation  = "删除我的账号"
-	maximumWebPrivacyExportBytes    = 16 << 20
 )
 
 var errUserPortalRequest = errors.New("invalid user portal request")
-
-// PrivacyExportDownloader is the only object-storage capability available to
-// the browser portal. It returns account-scoped, decrypted JSON and has no API
-// for exposing an object key or a presigned storage URL.
-type PrivacyExportDownloader interface {
-	Download(context.Context, uuid.UUID, uuid.UUID) ([]byte, error)
-}
 
 type userPortalActionRepository interface {
 	RevokeUserPortalDevice(context.Context, uuid.UUID, uuid.UUID, string, string) (store.UserPortalActionResult, error)
 	ListUserPortalPCControlPolicies(context.Context, uuid.UUID, int) ([]store.UserPortalPCControlPolicy, error)
 	SetUserPortalPCControlPolicy(context.Context, uuid.UUID, uuid.UUID, store.UserPortalPCControlPolicyInput, string, string) (store.UserPortalPCControlPolicy, error)
-	RequestUserPortalHistoryDeletion(context.Context, uuid.UUID, uuid.UUID, string, string) (store.UserPortalActionResult, error)
-	RequestUserPortalDataExport(context.Context, uuid.UUID, string, string) (store.UserPortalDataExport, error)
-	GetUserPortalDataExport(context.Context, uuid.UUID, uuid.UUID) (store.UserPortalDataExport, error)
 	GetUserPortalAccountDeletionPreflight(context.Context, uuid.UUID) (store.UserPortalAccountDeletionPreflight, error)
 	RequestUserPortalAccountDeletionState(context.Context, uuid.UUID, string, string) (store.UserPortalAccountDeletion, error)
 	GetUserPortalAccountDeletion(context.Context, uuid.UUID, uuid.UUID) (store.UserPortalAccountDeletion, error)
@@ -52,20 +39,9 @@ type portalAuditRepository interface {
 }
 
 func (p *Portal) loadUserPortalPrivacySelection(ctx context.Context, repository userPortalActionRepository, accountID uuid.UUID, values url.Values, data *userPortalPageData) error {
-	allowed := map[string]bool{"section": true, "notice": true, "export_id": true, "deletion_id": true}
+	allowed := map[string]bool{"section": true, "notice": true, "deletion_id": true}
 	if data == nil || values.Get("section") != "privacy" || validatePortalFormValues(values, allowed) != nil {
 		return errUserPortalRequest
-	}
-	if exportText := strings.TrimSpace(values.Get("export_id")); exportText != "" {
-		exportID, err := parseCanonicalPortalUUID(exportText)
-		if err != nil {
-			return err
-		}
-		item, err := repository.GetUserPortalDataExport(ctx, accountID, exportID)
-		if err != nil {
-			return err
-		}
-		data.DataExport = &item
 	}
 	if deletionText := strings.TrimSpace(values.Get("deletion_id")); deletionText != "" {
 		deletionID, err := parseCanonicalPortalUUID(deletionText)
@@ -130,145 +106,6 @@ func (p *Portal) userPortalUpdatePCControlPolicy(w http.ResponseWriter, r *http.
 	}
 	p.auditUserPortalActionSuccess(r, account.ID, "web.user.pc.control_policy.update.context", "pc", pcID)
 	p.redirectUserPortal(w, r, "pcs", "pc-policy-updated", url.Values{})
-}
-
-func (p *Portal) userPortalDeleteSessionHistory(w http.ResponseWriter, r *http.Request) {
-	_, account, repository, ok := p.requireUserPortalAction(w, r)
-	if !ok {
-		return
-	}
-	sessionID, err := parseCanonicalPortalUUID(r.PathValue("id"))
-	if err != nil {
-		p.renderError(w, http.StatusBadRequest, "会话标识无效", "请刷新会话页面后重试。")
-		return
-	}
-	traceID, err := randomText(12)
-	if err == nil {
-		_, err = repository.RequestUserPortalHistoryDeletion(r.Context(), account.ID, sessionID, strings.TrimSpace(r.Form.Get("idempotency_key")), traceID)
-	}
-	if err != nil {
-		p.handleUserPortalActionError(w, err)
-		return
-	}
-	p.auditUserPortalActionSuccess(r, account.ID, "web.user.session_history.delete.context", "session", sessionID)
-	p.redirectUserPortal(w, r, "sessions", "history-deleted", url.Values{})
-}
-
-func (p *Portal) userPortalRequestDataExport(w http.ResponseWriter, r *http.Request) {
-	_, account, repository, ok := p.requireUserPortalAction(w, r)
-	if !ok {
-		return
-	}
-	if !dataExportDownloaderAvailable(p.config.DataExportDownloader) {
-		p.renderError(w, http.StatusServiceUnavailable, "数据导出暂不可用", "服务端尚未配置安全的导出生成与领取能力，本次没有创建导出任务。")
-		return
-	}
-	traceID, err := randomText(12)
-	var item store.UserPortalDataExport
-	if err == nil {
-		item, err = repository.RequestUserPortalDataExport(r.Context(), account.ID, strings.TrimSpace(r.Form.Get("idempotency_key")), traceID)
-	}
-	if err != nil {
-		p.handleUserPortalActionError(w, err)
-		return
-	}
-	p.auditUserPortalActionSuccess(r, account.ID, "web.user.data_export.request.context", "data_export", item.ID)
-	p.redirectUserPortal(w, r, "privacy", "export-requested", url.Values{"export_id": {item.ID.String()}})
-}
-
-func (p *Portal) userPortalDownloadDataExport(w http.ResponseWriter, r *http.Request) {
-	_, account, ok := p.requireIdempotentStrongAccountRead(w, r)
-	if !ok {
-		return
-	}
-	exportID, err := parseCanonicalPortalUUID(r.PathValue("id"))
-	if err != nil {
-		p.renderError(w, http.StatusNotFound, "数据导出不存在", "该导出不存在、尚未就绪、已过期或不属于当前账号。")
-		return
-	}
-	downloader := p.config.DataExportDownloader
-	if !dataExportDownloaderAvailable(downloader) {
-		p.renderError(w, http.StatusServiceUnavailable, "数据导出暂不可用", "服务端尚未配置安全的导出领取能力，请稍后重试。")
-		return
-	}
-	body, err := downloader.Download(r.Context(), account.ID, exportID)
-	if err != nil {
-		if errors.Is(err, privacyexport.ErrExportUnavailable) {
-			p.renderError(w, http.StatusNotFound, "数据导出不存在", "该导出不存在、尚未就绪、已过期或不属于当前账号。")
-			return
-		}
-		traceID := uuid.NewString()
-		logPortalFailure(r.Context(), slog.LevelError, "download web privacy export",
-			"web_privacy_export_download_failed", traceID, err)
-		p.renderError(w, http.StatusServiceUnavailable, "数据导出暂不可用", "导出完整性校验或安全存储读取失败，请稍后重试。")
-		return
-	}
-	defer clear(body)
-	if len(body) == 0 || len(body) > maximumWebPrivacyExportBytes || !json.Valid(body) {
-		traceID := uuid.NewString()
-		logPortalFailure(r.Context(), slog.LevelError, "validate web privacy export",
-			"web_privacy_export_invalid", traceID, privacyexport.ErrExportIntegrity)
-		p.renderError(w, http.StatusServiceUnavailable, "数据导出暂不可用", "导出完整性校验失败，请稍后重试。")
-		return
-	}
-	if err := p.recordUserPortalActionAudit(r, account.ID, "web.user.data_export.download", "data_export", exportID); err != nil {
-		traceID := uuid.NewString()
-		logPortalFailure(r.Context(), slog.LevelError, "record privacy export download audit",
-			"web_privacy_export_audit_failed", traceID, err)
-		p.renderError(w, http.StatusServiceUnavailable, "数据导出暂不可用", "安全审计暂不可用，为保护账号数据，本次未发送导出内容。")
-		return
-	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Content-Disposition", `attachment; filename="termlink-data-export.json"`)
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
-}
-
-// requireIdempotentStrongAccountRead adds portal idempotency only for a
-// high-risk read capability. Store-backed user mutations use
-// requireStrongAccountAction directly because they own their atomic
-// idempotency transaction; the export downloader is deliberately read-only
-// and therefore has no Store mutation in which to claim the key.
-func (p *Portal) requireIdempotentStrongAccountRead(w http.ResponseWriter, r *http.Request) (webSession, store.PortalAccount, bool) {
-	session, account, ok := p.requireStrongAccountAction(w, r)
-	if !ok {
-		return webSession{}, store.PortalAccount{}, false
-	}
-	slot, slotOK := r.Context().Value(sensitiveActionContextKey{}).(*sensitiveActionSlot)
-	repository, repositoryOK := p.config.Repository.(sensitiveActionRepository)
-	if !slotOK || slot == nil || slot.action == "" || !repositoryOK {
-		p.rejectSensitiveAction(w, r, account, http.StatusServiceUnavailable, "idempotency_unavailable", "数据导出暂不可用", "安全审计或幂等保护暂不可用，请稍后重试。")
-		return webSession{}, store.PortalAccount{}, false
-	}
-	key := strings.TrimSpace(r.Form.Get("idempotency_key"))
-	requestHash := sensitiveRequestHash(slot.action, r.Form)
-	claim, err := repository.ClaimIdempotency(r.Context(), account.ID, key, requestHash)
-	if err != nil {
-		p.rejectSensitiveAction(w, r, account, http.StatusServiceUnavailable, "idempotency_unavailable", "数据导出暂不可用", "安全审计或幂等保护暂不可用，请稍后重试。")
-		return webSession{}, store.PortalAccount{}, false
-	}
-	if !claim.Claimed {
-		p.rejectSensitiveAction(w, r, account, http.StatusConflict, "duplicate_request", "下载请求已提交", "该下载请求已处理或正在处理，请刷新隐私页面后重新领取。")
-		return webSession{}, store.PortalAccount{}, false
-	}
-	slot.claim = &sensitiveActionClaim{repository: repository, accountID: account.ID, key: key, requestHash: requestHash}
-	return session, account, true
-}
-
-func dataExportDownloaderAvailable(downloader PrivacyExportDownloader) bool {
-	if downloader == nil {
-		return false
-	}
-	value := reflect.ValueOf(downloader)
-	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return !value.IsNil()
-	default:
-		return true
-	}
 }
 
 func (p *Portal) userPortalRequestAccountDeletion(w http.ResponseWriter, r *http.Request) {
@@ -392,7 +229,7 @@ func (p *Portal) handleUserPortalActionError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrDenied), errors.Is(err, store.ErrNotFound):
 		p.renderError(w, http.StatusNotFound, "账号资源不存在", "目标资源不存在、已变化或不属于当前账号。")
 	case errors.Is(err, store.ErrSessionActive):
-		p.renderError(w, http.StatusConflict, "会话仍在运行", "只有已经退出的会话才能永久删除服务端历史。")
+		p.renderError(w, http.StatusConflict, "会话仍在运行", "请先结束或手动关闭仍在运行的会话，再继续账号操作。")
 	case errors.Is(err, store.ErrConflict):
 		p.renderError(w, http.StatusConflict, "账号状态已变化", "请刷新用户中心并确认最新状态后重试。")
 	case errors.Is(err, store.ErrUserPortalActionUnsupported):

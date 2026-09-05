@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/termlink/termlink/server/internal/history"
 	"github.com/termlink/termlink/server/internal/store"
 )
 
@@ -321,13 +320,13 @@ func (s *recordingHistoryPageLister) ListHistoryPage(_ context.Context, _, _, _ 
 	return s.page, nil
 }
 
-func (s *recordingHistoryObjectStore) PresignPut(context.Context, string, int64, []byte, time.Duration) (history.PresignedRequest, error) {
-	return history.PresignedRequest{}, nil
+func (s *recordingHistoryObjectStore) PresignPut(context.Context, string, int64, []byte, time.Duration) (PresignedRequest, error) {
+	return PresignedRequest{}, nil
 }
 
-func (s *recordingHistoryObjectStore) PresignGet(_ context.Context, key string, _ time.Duration) (history.PresignedRequest, error) {
+func (s *recordingHistoryObjectStore) PresignGet(_ context.Context, key string, _ time.Duration) (PresignedRequest, error) {
 	s.gets = append(s.gets, key)
-	return history.PresignedRequest{URL: "https://history.invalid/" + key, Method: http.MethodGet}, nil
+	return PresignedRequest{URL: "https://history.invalid/" + key, Method: http.MethodGet}, nil
 }
 
 func (s *recordingHistoryObjectStore) VerifyCiphertext(context.Context, string, int64, []byte) error {

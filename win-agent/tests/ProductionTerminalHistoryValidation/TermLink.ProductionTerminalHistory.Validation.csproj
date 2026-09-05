@@ -11,10 +11,14 @@
     <Compile Include="..\..\src\Agent\PortableTerminalModelV1.cs" Link="PortableTerminalModelV1.cs" />
     <Compile Include="..\..\src\Agent\ProductionTerminalHistoryStore.cs" Link="ProductionTerminalHistoryStore.cs" />
     <Compile Include="..\..\src\Agent\ProductionTerminalHistoryProducer.cs" Link="ProductionTerminalHistoryProducer.cs" />
+    <Compile Include="..\..\src\Agent\ProductionHostHistoryService.cs" Link="ProductionHostHistoryService.cs" />
+    <Compile Include="..\..\src\Agent\ProductionHostHistoryRequestState.cs" Link="ProductionHostHistoryRequestState.cs" />
+    <Compile Include="..\..\src\Agent\ProductionHostHistoryResponseBuilder.cs" Link="ProductionHostHistoryResponseBuilder.cs" />
     <Compile Include="..\..\src\Agent\ProductionTerminalCoreShadow.cs" Link="ProductionTerminalCoreShadow.cs" />
     <Compile Include="..\..\src\Agent\ProductionTerminalCoreShadowDispatcher.cs" Link="ProductionTerminalCoreShadowDispatcher.cs" />
     <Compile Include="..\..\src\Agent\ProductionHistoryUploader.cs" Link="ProductionHistoryUploader.cs" />
     <Compile Include="Program.cs" />
+    <Compile Include="ProductionAgentRuntimeHistoryTestShim.cs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\Agent\TermLink.Agent.csproj" />

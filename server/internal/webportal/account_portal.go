@@ -21,37 +21,35 @@ type userPortalRepository interface {
 }
 
 type userPortalPageData struct {
-	AccountID                   uuid.UUID
-	Username                    string
-	Nickname                    string
-	Email                       string
-	Role                        store.Role
-	RoleLabel                   string
-	CanOpenConsole              bool
-	ConsoleURL                  string
-	IdentityAccountURL          string
-	CSRF                        string
-	Section                     string
-	SectionTitle                string
-	Overview                    store.UserPortalAccountOverview
-	Devices                     []store.UserPortalDevice
-	PCs                         []store.UserPortalPC
-	Sessions                    []store.UserPortalSession
-	SecurityActivities          []store.UserPortalSecurityActivity
-	IdempotencyKey              string
-	Notice                      string
-	SensitiveActionsAvailable   bool
-	PCPolicies                  []store.UserPortalPCControlPolicy
-	PrivacyPreflight            store.UserPortalAccountDeletionPreflight
-	DataExport                  *store.UserPortalDataExport
-	DataExportDownloadAvailable bool
-	AccountDeletion             *store.UserPortalAccountDeletion
-	ProfileChangeAvailable      bool
-	EmailChangeAvailable        bool
-	PendingEmail                string
-	EmailChallengeID            uuid.UUID
-	EmailChallengeExpiresAt     time.Time
-	Announcements               []store.WebAnnouncement
+	AccountID                 uuid.UUID
+	Username                  string
+	Nickname                  string
+	Email                     string
+	Role                      store.Role
+	RoleLabel                 string
+	CanOpenConsole            bool
+	ConsoleURL                string
+	IdentityAccountURL        string
+	CSRF                      string
+	Section                   string
+	SectionTitle              string
+	Overview                  store.UserPortalAccountOverview
+	Devices                   []store.UserPortalDevice
+	PCs                       []store.UserPortalPC
+	Sessions                  []store.UserPortalSession
+	SecurityActivities        []store.UserPortalSecurityActivity
+	IdempotencyKey            string
+	Notice                    string
+	SensitiveActionsAvailable bool
+	PCPolicies                []store.UserPortalPCControlPolicy
+	PrivacyPreflight          store.UserPortalAccountDeletionPreflight
+	AccountDeletion           *store.UserPortalAccountDeletion
+	ProfileChangeAvailable    bool
+	EmailChangeAvailable      bool
+	PendingEmail              string
+	EmailChallengeID          uuid.UUID
+	EmailChallengeExpiresAt   time.Time
+	Announcements             []store.WebAnnouncement
 }
 
 func (p *Portal) accountDashboard(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +114,6 @@ func (p *Portal) loadUserPortalPage(ctx context.Context, repository userPortalRe
 			return userPortalPageData{}, err
 		}
 	}
-	data.DataExportDownloadAvailable = dataExportDownloaderAvailable(p.config.DataExportDownloader)
 	data.ProfileChangeAvailable = p.config.IdentityProfiles != nil
 	if p.config.ServiceEmail != nil {
 		data.EmailChangeAvailable = data.ProfileChangeAvailable && p.config.ServiceEmail.Runtime(ctx).ServiceAvailable
@@ -166,8 +163,6 @@ func userPortalNotice(value string) string {
 	return map[string]string{
 		"device-revoked":     bilingualPortalNotice("设备已撤销；相关授权、控制租约和后续密钥分发已停止。", "The device was revoked. Its grants, control leases, and future key distribution were stopped."),
 		"pc-policy-updated":  bilingualPortalNotice("PC 远程路由和控制策略已更新。", "The PC remote route and control policy were updated."),
-		"history-deleted":    bilingualPortalNotice("已退出会话的服务端加密历史已永久删除。", "The encrypted server history for the exited session was permanently deleted."),
-		"export-requested":   bilingualPortalNotice("数据导出申请已进入队列，请刷新状态查看处理结果。", "The data export was queued. Refresh its status to see the result."),
 		"deletion-requested": bilingualPortalNotice("账号注销申请已创建，仍需在确认时限内完成二次确认。", "The account deletion request was created and still requires confirmation before the deadline."),
 		"deletion-confirmed": bilingualPortalNotice("账号注销已确认并进入 7 天冷静期；当前仍未删除，可在允许状态下取消。", "Account deletion was confirmed and entered the 7-day cooling-off period. Nothing has been deleted yet, and cancellation remains available when permitted."),
 		"deletion-cancelled": bilingualPortalNotice("账号注销申请已取消，账号数据没有被删除。", "The account deletion request was cancelled. Account data was not deleted."),

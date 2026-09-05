@@ -260,8 +260,6 @@ try {
         'valkey-password' = $valkeyPassword
         'direct-redis-url' = "redis://termlink-direct:$directValkeyPassword@direct-valkey:6379/0"
         'direct-valkey-password' = $directValkeyPassword
-        's3-access-key' = 'S3Access_Test_5mQ8vN2xK7pR'
-        's3-secret-key' = 'S3Secret_Test_8xL2qV6mN9pK4rJ7'
         'grafana-admin-password' = 'Grafana_Test_2pV7mQ9xK4nR8sL6'
         'keycloak-admin-client-secret' = 'Keycloak_Test_4nR8vM2qL7pX5sK9'
         'human-verification-secret' = 'Turnstile_Test_5qN9vK3mR8xL2pW7'
@@ -291,13 +289,10 @@ receivers:
         'TERMLINK_IMAGE=docker.io/myucxy/termlink:policy-test@sha256:1111111111111111111111111111111111111111111111111111111111111111',
         'TERMLINK_PUBLIC_URL=https://app.termlink.prod',
         'TERMLINK_PUBLIC_HOST=app.termlink.prod',
-        'TERMLINK_HISTORY_PUBLIC_HOST=history.termlink.prod',
         'TERMLINK_ACME_CA=https://acme-v02.api.letsencrypt.org/directory',
         'TERMLINK_ACME_EMAIL=operations@termlink.prod',
         'TERMLINK_OIDC_ISSUER=https://identity.termlink.prod/realms/termlink',
         'TERMLINK_OIDC_CLIENT_ID=termlink-server',
-        'TERMLINK_S3_ENDPOINT=https://storage.termlink.prod',
-        'TERMLINK_S3_PUBLIC_ENDPOINT=https://history.termlink.prod',
         "TERMLINK_OIDC_CLIENT_SECRET_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'oidc-client-secret'))",
         "TERMLINK_DATABASE_URL_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'database-url'))",
         "TERMLINK_REDIS_URL_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'redis-url'))",
@@ -307,8 +302,6 @@ receivers:
         "TERMLINK_DIRECT_REDIS_URL_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'direct-redis-url'))",
         "TERMLINK_DIRECT_VALKEY_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'direct-valkey-password'))",
         'TERMLINK_DIRECT_STUN_SERVERS=stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302',
-        "TERMLINK_S3_ACCESS_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 's3-access-key'))",
-        "TERMLINK_S3_SECRET_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 's3-secret-key'))",
         "TERMLINK_GRAFANA_ADMIN_PASSWORD_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'grafana-admin-password'))",
         "TERMLINK_ALERTMANAGER_CONFIG_FILE=$(ConvertTo-ComposeHostPath $alertmanagerConfig)",
         "TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'keycloak-admin-client-secret'))",
@@ -324,14 +317,11 @@ receivers:
         "TERMLINK_ACCEPTANCE_OIDC_CLIENT_SECRET_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'oidc-client-secret'))",
         "TERMLINK_ACCEPTANCE_DATABASE_URL_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'database-url'))",
         "TERMLINK_ACCEPTANCE_REDIS_URL_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'redis-url'))",
-        "TERMLINK_ACCEPTANCE_TOKEN_SIGNING_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'token-signing-key'))",
-        "TERMLINK_ACCEPTANCE_S3_ACCESS_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 's3-access-key'))",
-        "TERMLINK_ACCEPTANCE_S3_SECRET_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 's3-secret-key'))"
+        "TERMLINK_ACCEPTANCE_TOKEN_SIGNING_KEY_FILE=$(ConvertTo-ComposeHostPath (Join-Path $secretRoot 'token-signing-key'))"
     )
     [IO.File]::WriteAllLines($envFile, $environmentLines, [Text.UTF8Encoding]::new($false))
 
     $core = Join-Path $composeRoot 'core.compose.yml'
-    $history = Join-Path $composeRoot 'history.compose.yml'
     $observability = Join-Path $composeRoot 'observability.compose.yml'
     $externalServices = Join-Path $composeRoot 'external-services.compose.yml'
     $registrationRecovery = Join-Path $composeRoot 'registration-recovery.compose.yml'
@@ -364,50 +354,37 @@ receivers:
         throw 'Private-LAN acceptance did not expose Lucky internal TLS on port 9443.'
     }
 
-    # Render every valid overlay selection with and without edge. Account
-    # deletion is intentionally absent from the no-history branch.
-    $historyChoices = @(
-        [pscustomobject]@{ Name = 'no-history'; Files = @(); AllowsDeletion = $false },
-        [pscustomobject]@{ Name = 'local-history'; Files = @($history); AllowsDeletion = $true },
-        [pscustomobject]@{ Name = 'external-s3'; Files = @($externalServices); AllowsDeletion = $true }
-    )
+    # Render every valid feature selection with and without edge. Account
+    # deletion is independent from the retired object-storage subsystem.
     $matrixCount = 0
-    foreach ($historyChoice in $historyChoices) {
-        for ($flags = 0; $flags -lt 16; $flags++) {
-            $featureFiles = @($core) + @($historyChoice.Files)
-            if (($flags -band 1) -ne 0) { $featureFiles += $observability }
-            if (($flags -band 2) -ne 0) { $featureFiles += $registrationRecovery }
-            if (($flags -band 4) -ne 0) { $featureFiles += $humanVerification }
-            if (($flags -band 8) -ne 0) { $featureFiles += $directTransport }
-            $deletionOptions = if ($historyChoice.AllowsDeletion) { @($false, $true) } else { @($false) }
-            foreach ($withDeletion in $deletionOptions) {
-                $files = @($featureFiles)
-                if ($withDeletion) { $files += $accountDeletion }
-                foreach ($withEdge in @($false, $true)) {
-                    Test-ComposeConfig -EnvironmentFile $envFile -Files $files -IncludeEdge:$withEdge
-                    $matrixCount++
-                }
-            }
+    for ($flags = 0; $flags -lt 32; $flags++) {
+        $files = @($core)
+        if (($flags -band 1) -ne 0) { $files += $observability }
+        if (($flags -band 2) -ne 0) { $files += $registrationRecovery }
+        if (($flags -band 4) -ne 0) { $files += $humanVerification }
+        if (($flags -band 8) -ne 0) { $files += $directTransport }
+        if (($flags -band 16) -ne 0) { $files += $accountDeletion }
+        foreach ($withEdge in @($false, $true)) {
+            Test-ComposeConfig -EnvironmentFile $envFile -Files $files -IncludeEdge:$withEdge
+            $matrixCount++
         }
     }
-    if ($matrixCount -ne 160) {
+    if ($matrixCount -ne 64) {
         throw "Unexpected Compose matrix size: $matrixCount"
     }
 
     $cases = @(
         @{ Name = 'core with edge'; Files = @($core); Edge = $true },
         @{ Name = 'core without edge'; Files = @($core); Edge = $false },
-        @{ Name = 'core plus local history'; Files = @($core, $history); Edge = $true },
         @{ Name = 'core plus observability'; Files = @($core, $observability); Edge = $true },
         @{ Name = 'core plus registration recovery'; Files = @($core, $registrationRecovery); Edge = $true },
         @{ Name = 'core plus human verification'; Files = @($core, $humanVerification); Edge = $true },
         @{ Name = 'core plus Direct shared state'; Files = @($core, $directTransport); Edge = $true },
-        @{ Name = 'local history plus account deletion'; Files = @($core, $history, $accountDeletion); Edge = $true },
-        @{ Name = 'local history plus both recovery paths'; Files = @($core, $history, $registrationRecovery, $accountDeletion); Edge = $false },
-        @{ Name = 'default full stack'; Files = @($core, $history, $observability); Edge = $true },
-        @{ Name = 'external S3'; Files = @($core, $externalServices); Edge = $true },
-        @{ Name = 'external S3 plus observability'; Files = @($core, $externalServices, $observability); Edge = $true },
-        @{ Name = 'external full feature stack'; Files = @($core, $externalServices, $observability, $registrationRecovery, $humanVerification, $accountDeletion, $directTransport); Edge = $true }
+        @{ Name = 'core plus account deletion'; Files = @($core, $accountDeletion); Edge = $true },
+        @{ Name = 'core plus both recovery paths'; Files = @($core, $registrationRecovery, $accountDeletion); Edge = $false },
+        @{ Name = 'default full stack'; Files = @($core, $observability, $registrationRecovery, $humanVerification, $accountDeletion, $directTransport); Edge = $true },
+        @{ Name = 'external OIDC overlay'; Files = @($core, $externalServices); Edge = $true },
+        @{ Name = 'external OIDC plus observability'; Files = @($core, $externalServices, $observability); Edge = $true }
     )
     foreach ($case in $cases) {
         Write-Host "Validating $($case.Name)..."
@@ -453,10 +430,6 @@ receivers:
     }
 
     Assert-PolicyRejected -Policy $policy -EnvironmentFile $envFile `
-        -Files @($core, $history, $externalServices) -ExpectedPattern 'mutually exclusive'
-    Assert-PolicyRejected -Policy $policy -EnvironmentFile $envFile `
-        -Files @($core, $accountDeletion) -ExpectedPattern 'requires one reviewed History/S3 provider'
-    Assert-PolicyRejected -Policy $policy -EnvironmentFile $envFile `
         -Files @($core, $acceptance) -ExpectedPattern 'not part of the reviewed production matrix'
 
     $noAcmeEnv = New-FilteredEnvironmentFile -Source $envFile -Destination (Join-Path $testRoot 'no-acme.env') `
@@ -466,16 +439,13 @@ receivers:
         -IncludeEdge:$true -ExpectedPattern 'syntactically valid ACME contact email'
 
     $missingCases = @(
-        @{ Name = 'history public host'; Files = @($core, $history); Remove = @('TERMLINK_HISTORY_PUBLIC_HOST='); Pattern = 'TERMLINK_HISTORY_PUBLIC_HOST' },
-        @{ Name = 'history access key'; Files = @($core, $history); Remove = @('TERMLINK_S3_ACCESS_KEY_FILE='); Pattern = 'TERMLINK_S3_ACCESS_KEY_FILE' },
-        @{ Name = 'external S3 endpoint'; Files = @($core, $externalServices); Remove = @('TERMLINK_S3_ENDPOINT='); Pattern = 'TERMLINK_S3_ENDPOINT' },
         @{ Name = 'observability receiver config'; Files = @($core, $observability); Remove = @('TERMLINK_ALERTMANAGER_CONFIG_FILE='); Pattern = 'TERMLINK_ALERTMANAGER_CONFIG_FILE' },
         @{ Name = 'observability admin secret'; Files = @($core, $observability); Remove = @('TERMLINK_GRAFANA_ADMIN_PASSWORD_FILE='); Pattern = 'TERMLINK_GRAFANA_ADMIN_PASSWORD_FILE' },
         @{ Name = 'registration recovery secret'; Files = @($core, $registrationRecovery); Remove = @('TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE='); Pattern = 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE' },
         @{ Name = 'human verification site key'; Files = @($core, $humanVerification); Remove = @('TERMLINK_HUMAN_VERIFICATION_SITE_KEY='); Pattern = 'TERMLINK_HUMAN_VERIFICATION_SITE_KEY' },
         @{ Name = 'human verification secret'; Files = @($core, $humanVerification); Remove = @('TERMLINK_HUMAN_VERIFICATION_SECRET_FILE='); Pattern = 'TERMLINK_HUMAN_VERIFICATION_SECRET_FILE' },
-        @{ Name = 'account deletion identity key'; Files = @($core, $history, $accountDeletion); Remove = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE='); Pattern = 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE' },
-        @{ Name = 'account deletion key version'; Files = @($core, $history, $accountDeletion); Remove = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION='); Pattern = 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION' },
+        @{ Name = 'account deletion identity key'; Files = @($core, $accountDeletion); Remove = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE='); Pattern = 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE' },
+        @{ Name = 'account deletion key version'; Files = @($core, $accountDeletion); Remove = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION='); Pattern = 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION' },
         @{ Name = 'Direct Redis URL'; Files = @($core, $directTransport); Remove = @('TERMLINK_DIRECT_REDIS_URL_FILE='); Pattern = 'TERMLINK_DIRECT_REDIS_URL_FILE' },
         @{ Name = 'Direct Valkey password'; Files = @($core, $directTransport); Remove = @('TERMLINK_DIRECT_VALKEY_PASSWORD_FILE='); Pattern = 'TERMLINK_DIRECT_VALKEY_PASSWORD_FILE' },
         @{ Name = 'Direct STUN endpoints'; Files = @($core, $directTransport); Remove = @('TERMLINK_DIRECT_STUN_SERVERS='); Pattern = 'TERMLINK_DIRECT_STUN_SERVERS' }
@@ -535,7 +505,7 @@ receivers:
     }
     [IO.File]::WriteAllLines($invalidKeyEnv, @($invalidKeyLines), [Text.UTF8Encoding]::new($false))
     Assert-PolicyRejected -Policy $policy -EnvironmentFile $invalidKeyEnv `
-        -Files @($core, $history, $accountDeletion) -ExpectedPattern 'one AES-256 key or a bounded versioned keyring' `
+        -Files @($core, $accountDeletion) -ExpectedPattern 'one AES-256 key or a bounded versioned keyring' `
         -ForbiddenText @('not-a-32-byte-base64-key')
 
     $invalidVersionEnv = Join-Path $testRoot 'invalid-account-key-version.env'
@@ -546,7 +516,7 @@ receivers:
     }
     [IO.File]::WriteAllLines($invalidVersionEnv, @($invalidVersionLines), [Text.UTF8Encoding]::new($false))
     Assert-PolicyRejected -Policy $policy -EnvironmentFile $invalidVersionEnv `
-        -Files @($core, $history, $accountDeletion) -ExpectedPattern 'must be a positive integer'
+        -Files @($core, $accountDeletion) -ExpectedPattern 'must be a positive integer'
 
     $rotatedIdentityKeyBytes = [byte[]](32..63)
     $rotatedIdentityKey = [Convert]::ToBase64String($rotatedIdentityKeyBytes)
@@ -562,7 +532,7 @@ receivers:
             TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE = (ConvertTo-ComposeHostPath $validKeyringPath)
             TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION = '7'
         }
-    & $policy -EnvFile $validKeyringEnv -ComposeFile @($core, $history, $accountDeletion) -IncludeEdge:$false | Out-Null
+    & $policy -EnvFile $validKeyringEnv -ComposeFile @($core, $accountDeletion) -IncludeEdge:$false | Out-Null
 
     $unknownSecret = 'KEYRING_UNKNOWN_FIELD_MUST_NOT_BE_LOGGED'
     $keyringCases = @(
@@ -616,7 +586,7 @@ receivers:
                 TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION = [string]$keyringCase.Current
             }
         Assert-PolicyRejected -Policy $policy -EnvironmentFile $keyringEnv `
-            -Files @($core, $history, $accountDeletion) -ExpectedPattern ([string]$keyringCase.Pattern) `
+            -Files @($core, $accountDeletion) -ExpectedPattern ([string]$keyringCase.Pattern) `
             -ForbiddenText @($keyringCase.Forbidden)
     }
 

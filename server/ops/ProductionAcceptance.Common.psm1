@@ -94,8 +94,6 @@ function Get-TermLinkAcceptancePaths {
         DirectValkeyPassword = Join-Path $secretRoot 'direct-valkey-password'
         DirectRedisUrl = Join-Path $secretRoot 'direct-redis-url'
         TokenSigningKey = Join-Path $secretRoot 'token-signing-key'
-        S3AccessKey = Join-Path $secretRoot 's3-access-key'
-        S3SecretKey = Join-Path $secretRoot 's3-secret-key'
         RootCa = Join-Path $secretRoot 'acceptance-root-ca.crt'
         ProbeIdentity = Join-Path $secretRoot 'production-probe-pc.json'
     }
@@ -124,8 +122,6 @@ function Set-TermLinkAcceptanceComposeEnvironment {
     $env:TERMLINK_ACCEPTANCE_DATABASE_URL_FILE = $Paths.DatabaseUrl
     $env:TERMLINK_ACCEPTANCE_REDIS_URL_FILE = $Paths.RedisUrl
     $env:TERMLINK_ACCEPTANCE_TOKEN_SIGNING_KEY_FILE = $Paths.TokenSigningKey
-    $env:TERMLINK_ACCEPTANCE_S3_ACCESS_KEY_FILE = $Paths.S3AccessKey
-    $env:TERMLINK_ACCEPTANCE_S3_SECRET_KEY_FILE = $Paths.S3SecretKey
 }
 
 Export-ModuleMember -Function Get-TermLinkAcceptancePaths, Set-TermLinkAcceptanceComposeEnvironment, Set-TermLinkAcceptanceDirectComposeEnvironment, Protect-TermLinkAcceptanceSecretTree

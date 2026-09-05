@@ -22,8 +22,8 @@ var (
 
 type Repository interface {
 	ClaimUserPortalAccountDeletions(context.Context, uuid.UUID, time.Duration, int) ([]store.UserPortalAccountDeletionJob, error)
-	PrepareUserPortalAccountDeletion(context.Context, uuid.UUID, uuid.UUID, int64) ([]store.UserPortalAccountDeletionObject, error)
-	FinalizeUserPortalAccountDeletion(context.Context, uuid.UUID, uuid.UUID, int64, []store.UserPortalAccountDeletionObject, string) error
+	PrepareUserPortalAccountDeletion(context.Context, uuid.UUID, uuid.UUID, int64) error
+	FinalizeUserPortalAccountDeletion(context.Context, uuid.UUID, uuid.UUID, int64, string) error
 	FailUserPortalAccountDeletion(context.Context, uuid.UUID, uuid.UUID, int64, string, string) error
 }
 
@@ -35,38 +35,29 @@ type IdentityDisabler interface {
 	DisableAccountIdentity(context.Context, uuid.UUID, uuid.UUID, int16, []byte) error
 }
 
-// ObjectStore deletion methods must be idempotent: a missing object is a
-// successful deletion. Implementations must never include the object key in
-// logs, metrics, audit records, or returned error text.
-type ObjectStore interface {
-	Delete(context.Context, string) error
-	DeletePrivacyExport(context.Context, string) error
-}
-
 type Service struct {
 	repository  Repository
 	identity    IdentityDisabler
-	objects     ObjectStore
 	processorID uuid.UUID
 	lease       time.Duration
 }
 
-func New(repository Repository, identity IdentityDisabler, objects ObjectStore, processorID uuid.UUID) (*Service, error) {
-	if repository == nil || identity == nil || objects == nil || processorID == uuid.Nil {
+func New(repository Repository, identity IdentityDisabler, processorID uuid.UUID) (*Service, error) {
+	if repository == nil || identity == nil || processorID == uuid.Nil {
 		return nil, ErrInvalidConfiguration
 	}
 	return &Service{
-		repository: repository, identity: identity, objects: objects,
+		repository: repository, identity: identity,
 		processorID: processorID, lease: DefaultLease,
 	}, nil
 }
 
 // ProcessOnce claims a bounded batch. Each job must pass every gate in order:
-// lock and snapshot capabilities, disable identity, erase objects, then run a
+// lock the account, disable its external identity, then run a
 // fenced transactional finalization. Individual failures are persisted using
-// stable low-cardinality codes; sensitive provider/object errors never escape.
+// stable low-cardinality codes; sensitive provider errors never escape.
 func (s *Service) ProcessOnce(ctx context.Context, limit int) (int, error) {
-	if s == nil || s.repository == nil || s.identity == nil || s.objects == nil || s.processorID == uuid.Nil {
+	if s == nil || s.repository == nil || s.identity == nil || s.processorID == uuid.Nil {
 		return 0, ErrInvalidConfiguration
 	}
 	jobs, err := s.repository.ClaimUserPortalAccountDeletions(ctx, s.processorID, s.lease, limit)
@@ -105,8 +96,7 @@ func (s *Service) process(ctx context.Context, job store.UserPortalAccountDeleti
 	if len(job.IdentityHandle) != IdentityHandleCiphertextSize || job.IdentityHandleKeyVersion < 1 {
 		return "IDENTITY_HANDLE_UNAVAILABLE"
 	}
-	objects, err := s.repository.PrepareUserPortalAccountDeletion(ctx, s.processorID, job.ID, job.ProcessingFence)
-	if err != nil {
+	if err := s.repository.PrepareUserPortalAccountDeletion(ctx, s.processorID, job.ID, job.ProcessingFence); err != nil {
 		return "DELETION_PREPARE_FAILED"
 	}
 	if err := s.identity.DisableAccountIdentity(
@@ -114,21 +104,8 @@ func (s *Service) process(ctx context.Context, job store.UserPortalAccountDeleti
 	); err != nil {
 		return "IDENTITY_DISABLE_FAILED"
 	}
-	for _, object := range objects {
-		switch object.Kind {
-		case store.UserPortalAccountDeletionStoredObject:
-			err = s.objects.Delete(ctx, object.ObjectKey)
-		case store.UserPortalAccountDeletionPrivacyExport:
-			err = s.objects.DeletePrivacyExport(ctx, object.ObjectKey)
-		default:
-			return "OBJECT_CAPABILITY_INVALID"
-		}
-		if err != nil {
-			return "OBJECT_DELETE_FAILED"
-		}
-	}
 	if err := s.repository.FinalizeUserPortalAccountDeletion(
-		ctx, s.processorID, job.ID, job.ProcessingFence, objects, processorTrace(job.ID),
+		ctx, s.processorID, job.ID, job.ProcessingFence, processorTrace(job.ID),
 	); err != nil {
 		return "DELETION_FINALIZE_FAILED"
 	}

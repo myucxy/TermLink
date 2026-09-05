@@ -20,3 +20,29 @@ func TestCreateHistoryUploadReturnsUnavailableWhenObjectStoreIsDisabled(t *testi
 		t.Fatalf("response did not contain stable history error: %s", response.Body.String())
 	}
 }
+
+func TestRetiredTerminalHistoryRequiresHostHistoryUpgrade(t *testing.T) {
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodGet, path: "/v1/sessions/session/history"},
+		{method: http.MethodPost, path: "/v1/sessions/session/history/uploads"},
+		{method: http.MethodPost, path: "/v1/sessions/session/history/uploads/upload/commit"},
+	} {
+		request := httptest.NewRequest(test.method, test.path, nil)
+		response := httptest.NewRecorder()
+
+		retiredTerminalHistory(response, request)
+
+		if response.Code != http.StatusUpgradeRequired {
+			t.Fatalf("%s %s status = %d, want %d", test.method, test.path, response.Code, http.StatusUpgradeRequired)
+		}
+		if response.Header().Get("Upgrade") != "host_history_v1" {
+			t.Fatalf("%s %s Upgrade = %q", test.method, test.path, response.Header().Get("Upgrade"))
+		}
+		if !strings.Contains(response.Body.String(), `"code":"CLIENT_UPGRADE_REQUIRED"`) {
+			t.Fatalf("%s %s response did not contain the upgrade error: %s", test.method, test.path, response.Body.String())
+		}
+	}
+}

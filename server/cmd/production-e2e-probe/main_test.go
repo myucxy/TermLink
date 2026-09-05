@@ -3,13 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -27,29 +23,6 @@ func TestLoadRootsUsesSystemTrustWhenCAFileIsNotConfigured(t *testing.T) {
 func TestLoadRootsRejectsMissingConfiguredCAFile(t *testing.T) {
 	if _, err := loadRoots(filepath.Join(t.TempDir(), "missing-ca.crt")); err == nil {
 		t.Fatal("missing configured CA file was accepted")
-	}
-}
-
-func TestWaitForPresignedStatusAllowsAsynchronousObjectDeletion(t *testing.T) {
-	var attempts atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		if attempts.Add(1) < 3 {
-			writer.WriteHeader(http.StatusOK)
-			return
-		}
-		writer.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	p := &probe{http: server.Client()}
-	err := p.waitForPresignedStatus(presignedRequest{
-		URL: server.URL, Method: http.MethodGet, Headers: map[string][]string{},
-	}, http.StatusNotFound, 2*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if attempts.Load() != 3 {
-		t.Fatalf("attempts = %d, want 3", attempts.Load())
 	}
 }
 
@@ -94,13 +67,6 @@ func TestValidateDiscoveredListItemRejectsWrongOwner(t *testing.T) {
 	}}
 	if err := validateDiscoveredListItem(response, itemID, "pc_id", uuid.New()); err == nil {
 		t.Fatal("target item with the wrong owner was accepted")
-	}
-}
-
-func TestHistoryRecipientKeyIDUsesCanonicalRecipientAndEpoch(t *testing.T) {
-	recipientID := uuid.MustParse("12345678-90ab-cdef-1234-567890abcdef")
-	if got, want := historyRecipientKeyID(recipientID, 7), "history-v1:1234567890abcdef1234567890abcdef:00000007"; got != want {
-		t.Fatalf("historyRecipientKeyID() = %q, want %q", got, want)
 	}
 }
 

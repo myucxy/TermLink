@@ -20,12 +20,6 @@ func (e *processSensitiveLogError) Error() string {
 	return e.text
 }
 
-func TestOptionalHistoryStoreDoesNotWrapTypedNil(t *testing.T) {
-	if optionalHistoryStore(nil) != nil {
-		t.Fatal("disabled history store became a non-nil interface")
-	}
-}
-
 func TestDeriveServerKeySeparatesSecurityDomains(t *testing.T) {
 	master := "0123456789abcdef0123456789abcdef"
 	subject := deriveServerKey(master, "oidc-subject-hash")

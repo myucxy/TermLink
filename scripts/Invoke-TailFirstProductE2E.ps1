@@ -423,8 +423,6 @@ function Get-AcceptanceStackState {
         TERMLINK_ACCEPTANCE_DATABASE_URL_FILE = (Join-Path $secretRoot 'database-url')
         TERMLINK_ACCEPTANCE_REDIS_URL_FILE = (Join-Path $secretRoot 'redis-url')
         TERMLINK_ACCEPTANCE_TOKEN_SIGNING_KEY_FILE = (Join-Path $secretRoot 'token-signing-key')
-        TERMLINK_ACCEPTANCE_S3_ACCESS_KEY_FILE = (Join-Path $secretRoot 's3-access-key')
-        TERMLINK_ACCEPTANCE_S3_SECRET_KEY_FILE = (Join-Path $secretRoot 's3-secret-key')
     }
     $savedEnvironment = @{}
     try {
@@ -447,7 +445,7 @@ function Get-AcceptanceStackState {
         catch { Stop-TailFirstE2E 'ACCEPTANCE_STACK_STATUS_INVALID' 'Docker returned invalid acceptance service status.' }
         foreach ($item in $items) { $byService[[string]$item.Service] = $item }
     }
-    $healthy = @('edge', 'lucky-upstream', 'postgres', 'valkey', 'minio', 'server')
+    $healthy = @('lucky-upstream', 'postgres', 'valkey', 'server')
     $running = @('keycloak')
     $completed = @('runtime-secrets-init', 'oidc-ca-ready', 'keycloak-init', 'server-secrets-init', 'migrate')
     foreach ($name in $healthy) {

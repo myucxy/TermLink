@@ -27,14 +27,13 @@
 | 1 | 生产账号/OIDC/设备注册与配对 | **已实现并验证** | Go `auth`、设备注册/配对 API、Android OIDC/API 客户端、Windows 配对流程；Go/Android/.NET 自动化验收通过。 |
 | 2 | 生产 Protobuf 实时协议、X25519 + ChaCha20-Poly1305、Relay | **已实现并验证** | `protocol/protobuf/termlink_realtime.proto`、Go `realtimewire`/Relay、Android `core-network`、Windows `src/Protocol`；向量、协议和 Relay 测试通过。 |
 | 3 | Windows ConPTY 到 Android 真实输入输出、ACK/Gap/重连、租约与本地输入优先 | **已实现并验证** | Windows `ProductionAgentRuntime`、Android 生产 Session Client、服务端租约/撤销；生产路径自动化覆盖有界重放、ACK/Gap、输入去重、租约和本地输入 epoch。 |
-| 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
+| 4 | Windows 主机本地持有的逐设备加密历史、Snapshot/ACK 冷恢复与关闭销毁 | **已实现并验证** | Windows 本地 WAL/checkpoint、Android `core-crypto`/`feature-history` 与 `host_history_v1` 实时请求；服务端不保存终端历史对象。 |
 | 5 | 服务端 Catalog、计费验证边界、权益与配额 | **核心已实现并验证（Provider 待配置）** | Go `billing`/Catalog/entitlement API、可注入 verified-purchase 契约与 Android `feature-billing` 已测试；真实 Google/Web verifier 未配置时生产入口返回 `BILLING_UNAVAILABLE`。 |
-| 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |
+| 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、实时文件传输与当前生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |
 | 7 | 生产 TLS/受信发布证书真实安装更新、备份恢复演练、镜像签名、监控告警、生产 CA/发布加固 | **未开始** | 仅有开发证书/故障注入和本地 Compose 验证；真实证书链、系统级安装更新、灾备演练、镜像签名与生产运维尚未验收。 |
 
 统一边界：`LAN Replay V1`、`TLT1`（Phase 1 Test Session V1）和 Android Compose
-Harness 都是测试夹具，不是生产协议；Android 历史客户端只接受 HTTPS。Integration
-Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-6
+Harness 都是测试夹具，不是生产协议；终端历史和文件正文均不落服务端对象存储。1-6
 的自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏或生产发布已经验证。
 
 真实 OIDC/Google/Web Billing Provider 仍需在部署前注入；本地默认配置只验证契约和
@@ -60,8 +59,8 @@ Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当�
    按会话回退引擎。
 6. 服务端使用 Go，MVP 将 REST API、WebSocket Relay、租约协调和后台任务放入一个
    二进制；官方支持 Docker Image 和 Docker Compose。
-7. PostgreSQL 保存权威元数据，Redis/Valkey 保存在线状态、短时配额占用和输入租约，
-   S3 兼容存储保存可选的端到端加密历史块。
+7. PostgreSQL 保存权威元数据，Redis/Valkey 保存在线状态、短时配额占用和输入租约；
+   终端历史由 Windows 主机本地保存并通过认证实时链路按需提供。
 8. Relay 只能看到路由元数据与密文大小，不能读取命令、输出、快照或历史正文。
 9. 本地用户优先级始终最高；远端输入必须经过设备授权与短时输入租约。
 10. 产品不集成模型推理、终端内容解释或摘要、自然语言导航和命令生成功能。
@@ -83,7 +82,7 @@ Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当�
 - Go；
 - PostgreSQL；
 - Redis 或 Valkey；
-- 可选 S3/MinIO；
+- 文件传输与主机历史使用实时路由，服务端不保存内容对象；
 - WebSocket + Protobuf 二进制帧；
 - Docker Compose 默认只向外暴露 HTTPS 443，数据库和内部端口不公开。
 
@@ -496,7 +495,7 @@ D:\Dev\Env\Go\bin\go.exe test ./...
 D:\Dev\Env\Go\bin\go.exe vet ./...
 .\Validate-Phase1TestRelay.ps1
 
-# 生产 Compose 配置/集成（需要 Docker、临时 secrets 和 loopback MinIO）
+# 生产 Compose 配置/集成（需要 Docker 和临时 secrets）
 docker compose --env-file .env -f compose\core.compose.yml config
 docker compose -f compose\integration.compose.yml up --build --abort-on-container-exit --exit-code-from server
 docker compose -f compose\integration.compose.yml down -v

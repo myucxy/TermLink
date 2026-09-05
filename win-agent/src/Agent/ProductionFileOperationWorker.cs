@@ -41,13 +41,28 @@ namespace TermLink.Agent
 
         [JsonPropertyName("lease_expires_at")]
         public DateTimeOffset? LeaseExpiresAt { get; set; }
+
+        [JsonPropertyName("requester_device_id")]
+        public Guid RequesterDeviceId { get; set; }
     }
 
     internal sealed class FileOperationUploadTarget
     {
-        internal Uri Url { get; set; }
-        internal HttpMethod Method { get; set; }
-        internal IReadOnlyDictionary<string, IReadOnlyList<string>> Headers { get; set; }
+        internal Guid TransferId { get; set; }
+        internal Guid RequesterDeviceId { get; set; }
+        internal string Protocol { get; set; }
+        internal string Filename { get; set; }
+        internal bool DirectoryZip { get; set; }
+        internal long SizeBytes { get; set; }
+        internal byte[] Sha256 { get; set; }
+    }
+
+    internal interface IFileTransferSender
+    {
+        Task SendAsync(
+            FileOperationUploadTarget target,
+            Stream content,
+            CancellationToken token);
     }
 
     internal interface IFileOperationApi
@@ -84,6 +99,8 @@ namespace TermLink.Agent
         }
         internal FileOperationRemoteException(string message, Exception innerException)
             : base(message, innerException) { Retryable = true; }
+        internal FileOperationRemoteException(string message, Exception innerException, bool retryable)
+            : base(message, innerException) { Retryable = retryable; }
         internal bool Retryable { get; }
     }
 
@@ -108,7 +125,7 @@ namespace TermLink.Agent
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
         };
         private readonly Guid pcId;
-        private readonly HttpClient uploadHttp;
+        private readonly IFileTransferSender transferSender;
         private readonly AuthenticatedSendAsync send;
         private readonly ProductionClaimIdempotencyTracker claimIdempotency =
             new ProductionClaimIdempotencyTracker();
@@ -118,12 +135,14 @@ namespace TermLink.Agent
         internal ProductionFileOperationApi(
             Guid pcId,
             HttpClient uploadHttp,
-            AuthenticatedSendAsync send)
+            AuthenticatedSendAsync send,
+            IFileTransferSender transferSender = null)
         {
             if (pcId == Guid.Empty) throw new ArgumentException("PC ID is required.", nameof(pcId));
             this.pcId = pcId;
-            this.uploadHttp = uploadHttp ?? throw new ArgumentNullException(nameof(uploadHttp));
+            _ = uploadHttp ?? throw new ArgumentNullException(nameof(uploadHttp));
             this.send = send ?? throw new ArgumentNullException(nameof(send));
+            this.transferSender = transferSender;
         }
 
         public async Task<ClaimedFileOperation> ClaimAsync(CancellationToken token)
@@ -224,55 +243,29 @@ namespace TermLink.Agent
             await EnsureSuccessAsync(response, "File-operation upload allocation failed.", token).ConfigureAwait(false);
             using var document = JsonDocument.Parse(
                 await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
-            if (!document.RootElement.TryGetProperty("upload", out var upload) ||
-                upload.ValueKind != JsonValueKind.Object ||
-                !upload.TryGetProperty("url", out var urlElement) ||
-                !Uri.TryCreate(urlElement.GetString(), UriKind.Absolute, out var url) ||
-                !upload.TryGetProperty("method", out var methodElement))
+            if (!document.RootElement.TryGetProperty("transfer", out var transfer) ||
+                transfer.ValueKind != JsonValueKind.Object ||
+                !transfer.TryGetProperty("protocol", out var protocolElement) ||
+                !string.Equals(protocolElement.GetString(), "REALTIME_V2", StringComparison.Ordinal) ||
+                !transfer.TryGetProperty("transfer_id", out var transferIdElement) ||
+                !transferIdElement.TryGetGuid(out var transferId) ||
+                transferId != operation.Id ||
+                !transfer.TryGetProperty("requester_device_id", out var requesterElement) ||
+                !requesterElement.TryGetGuid(out var requesterDeviceId) ||
+                requesterDeviceId == Guid.Empty ||
+                requesterDeviceId != operation.RequesterDeviceId)
             {
-                throw new FileOperationRemoteException("File-operation upload response is incomplete.");
-            }
-            var methodText = methodElement.GetString();
-            if (!string.Equals(methodText, "PUT", StringComparison.OrdinalIgnoreCase))
-                throw new FileOperationRemoteException("File-operation upload method is unsupported.");
-            if (url.Scheme != Uri.UriSchemeHttps && url.Scheme != Uri.UriSchemeHttp)
-                throw new FileOperationRemoteException("File-operation upload URL is invalid.");
-            var headers = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
-            if (upload.TryGetProperty("headers", out var headerElement) &&
-                headerElement.ValueKind != JsonValueKind.Null)
-            {
-                if (headerElement.ValueKind != JsonValueKind.Object)
-                    throw new FileOperationRemoteException("File-operation upload headers are invalid.");
-                foreach (var property in headerElement.EnumerateObject())
-                {
-                    if (string.IsNullOrWhiteSpace(property.Name))
-                    {
-                        throw new FileOperationRemoteException("File-operation upload headers are invalid.");
-                    }
-                    if (property.Value.ValueKind == JsonValueKind.String)
-                    {
-                        headers[property.Name] = new[] { property.Value.GetString() };
-                        continue;
-                    }
-                    if (property.Value.ValueKind != JsonValueKind.Array)
-                        throw new FileOperationRemoteException("File-operation upload headers are invalid.");
-                    var values = new List<string>();
-                    foreach (var value in property.Value.EnumerateArray())
-                    {
-                        if (value.ValueKind != JsonValueKind.String)
-                            throw new FileOperationRemoteException("File-operation upload headers are invalid.");
-                        values.Add(value.GetString());
-                    }
-                    if (values.Count == 0)
-                        throw new FileOperationRemoteException("File-operation upload headers are invalid.");
-                    headers[property.Name] = values;
-                }
+                throw new FileOperationRemoteException("File-operation realtime transfer response is incomplete.");
             }
             return new FileOperationUploadTarget
             {
-                Url = url,
-                Method = HttpMethod.Put,
-                Headers = headers
+                TransferId = transferId,
+                RequesterDeviceId = requesterDeviceId,
+                Protocol = "REALTIME_V2",
+                Filename = artifact.Filename,
+                DirectoryZip = artifact.DirectoryZip,
+                SizeBytes = artifact.SizeBytes,
+                Sha256 = (byte[])artifact.Sha256.Clone()
             };
         }
 
@@ -282,27 +275,16 @@ namespace TermLink.Agent
             long sizeBytes,
             CancellationToken token)
         {
-            if (target == null || target.Url == null || target.Method == null)
-                throw new ArgumentException("Upload target is incomplete.", nameof(target));
+            if (target == null || target.TransferId == Guid.Empty || target.RequesterDeviceId == Guid.Empty ||
+                !string.Equals(target.Protocol, "REALTIME_V2", StringComparison.Ordinal) ||
+                target.SizeBytes != sizeBytes || target.Sha256 == null || target.Sha256.Length != 32)
+                throw new ArgumentException("Realtime transfer target is incomplete.", nameof(target));
             if (content == null || !content.CanRead) throw new ArgumentException("Upload content is unreadable.", nameof(content));
-            using var request = new HttpRequestMessage(target.Method, target.Url);
-            request.Content = new StreamContent(content, 128 * 1024);
-            request.Content.Headers.ContentLength = sizeBytes;
-            foreach (var header in target.Headers ??
-                new Dictionary<string, IReadOnlyList<string>>())
-            {
-                if (string.Equals(header.Key, "Content-Length", StringComparison.OrdinalIgnoreCase)) continue;
-                if (!request.Headers.TryAddWithoutValidation(header.Key, header.Value) &&
-                    !request.Content.Headers.TryAddWithoutValidation(header.Key, header.Value))
-                {
-                    throw new FileOperationRemoteException("File-operation upload contains an unsupported header.");
-                }
-            }
-            using var response = await uploadHttp.SendAsync(
-                request,
-                HttpCompletionOption.ResponseHeadersRead,
-                token).ConfigureAwait(false);
-            await EnsureSuccessAsync(response, "File-operation content upload failed.", token).ConfigureAwait(false);
+            if (transferSender == null)
+                throw new FileOperationRemoteException(
+                    "Realtime file-transfer sender is unavailable / 实时文件传输发送器不可用。",
+                    false);
+            await transferSender.SendAsync(target, content, token).ConfigureAwait(false);
         }
 
         public async Task<DateTimeOffset?> RenewAsync(
@@ -412,6 +394,13 @@ namespace TermLink.Agent
                 !string.Equals(operation.Operation, "OPEN_TERMINAL", StringComparison.Ordinal))
             {
                 throw new FileOperationRemoteException("File-operation claim contains an unsupported operation.");
+            }
+            if (string.Equals(operation.Operation, "DOWNLOAD", StringComparison.Ordinal) &&
+                operation.RequesterDeviceId == Guid.Empty)
+            {
+                throw new FileOperationRemoteException(
+                    "File-operation requester identity is missing / 文件任务缺少请求设备身份。",
+                    false);
             }
         }
 
@@ -870,41 +859,75 @@ namespace TermLink.Agent
                 {
                     TerminateCurrentOperationTerminal();
                 }
+                if (string.Equals(operation.Operation, "DOWNLOAD", StringComparison.Ordinal) &&
+                    execution.Reason != OperationStopReason.None)
+                {
+                    TryCleanupTransferCache(operation.Id);
+                }
             }
         }
 
         private async Task ExecuteDownloadAsync(ClaimedFileOperation operation, CancellationToken token)
         {
-            await using var artifact = await transfers.PrepareAsync(operation.Path, token).ConfigureAwait(false);
-            var stream = artifact.OpenRead();
-            var delay = TimeSpan.FromSeconds(1);
-            while (true)
+            try
             {
-                token.ThrowIfCancellationRequested();
+                await using var artifact = await transfers.PrepareAsync(
+                    operation.Path,
+                    operation.Id,
+                    token).ConfigureAwait(false);
+                var stream = artifact.OpenRead();
+                var delay = TimeSpan.FromSeconds(1);
                 try
                 {
-                    var upload = await api.CreateUploadAsync(operation, artifact, token).ConfigureAwait(false);
-                    if (stream.CanSeek) stream.Position = 0;
-                    await api.UploadAsync(upload, stream, artifact.SizeBytes, token).ConfigureAwait(false);
-                    return;
+                    while (true)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        try
+                        {
+                            var upload = await api.CreateUploadAsync(operation, artifact, token).ConfigureAwait(false);
+                            if (stream.CanSeek) stream.Position = 0;
+                            await api.UploadAsync(upload, stream, artifact.SizeBytes, token).ConfigureAwait(false);
+                            await artifact.DisposeAsync().ConfigureAwait(false);
+                            TryCleanupTransferCache(operation.Id);
+                            return;
+                        }
+                        catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+                        catch (FileOperationRemoteException error) when (error.Retryable)
+                        {
+                            await Task.Delay(delay, token).ConfigureAwait(false);
+                            delay = TimeSpan.FromSeconds(Math.Min(15, delay.TotalSeconds * 2));
+                        }
+                        catch (HttpRequestException error) when (error is not FileOperationRemoteException)
+                        {
+                            await Task.Delay(delay, token).ConfigureAwait(false);
+                            delay = TimeSpan.FromSeconds(Math.Min(15, delay.TotalSeconds * 2));
+                        }
+                        catch (ProductionReauthenticationRequiredException)
+                        {
+                            await Task.Delay(delay, token).ConfigureAwait(false);
+                            delay = TimeSpan.FromSeconds(Math.Min(15, delay.TotalSeconds * 2));
+                        }
+                    }
                 }
-                catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
-                catch (FileOperationRemoteException error) when (error.Retryable)
+                catch (OperationCanceledException) { throw; }
+                catch
                 {
-                    await Task.Delay(delay, token).ConfigureAwait(false);
-                    delay = TimeSpan.FromSeconds(Math.Min(15, delay.TotalSeconds * 2));
-                }
-                catch (HttpRequestException error) when (error is not FileOperationRemoteException)
-                {
-                    await Task.Delay(delay, token).ConfigureAwait(false);
-                    delay = TimeSpan.FromSeconds(Math.Min(15, delay.TotalSeconds * 2));
-                }
-                catch (ProductionReauthenticationRequiredException)
-                {
-                    await Task.Delay(delay, token).ConfigureAwait(false);
-                    delay = TimeSpan.FromSeconds(Math.Min(15, delay.TotalSeconds * 2));
+                    TryCleanupTransferCache(operation.Id);
+                    throw;
                 }
             }
+            catch
+            {
+                TryCleanupTransferCache(operation.Id);
+                throw;
+            }
+        }
+
+        private void TryCleanupTransferCache(Guid transferId)
+        {
+            try { transfers.Cleanup(transferId); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
         }
 
         private async Task<JsonElement> ExecuteOpenTerminalAsync(

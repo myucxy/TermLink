@@ -15,7 +15,6 @@ services:
       frontend:
         aliases:
           - ${TERMLINK_ACCEPTANCE_PUBLIC_HOST:-termlink.kget.cc}
-      object:
     volumes:
       - ../acceptance/LuckyUpstream.Caddyfile:/etc/caddy/Caddyfile:ro
       - acceptance-caddy-data:/data
@@ -59,8 +58,6 @@ services:
         copy_secret acceptance_user_password /target/keycloak-init/acceptance_user_password 1000:0
         copy_secret postgres_password /target/postgres/postgres_password 70:70
         copy_secret valkey_password /target/valkey/valkey_password 999:1000
-        copy_secret s3_access_key /target/minio/s3_access_key 0:0
-        copy_secret s3_secret_key /target/minio/s3_secret_key 0:0
         rm -f /target/server/keycloak_admin_client_secret
         : > /target/server/keycloak_admin_client_secret
         chmod 0600 /target/server/keycloak_admin_client_secret
@@ -71,14 +68,11 @@ services:
       - acceptance_user_password
       - postgres_password
       - valkey_password
-      - s3_access_key
-      - s3_secret_key
     volumes:
       - acceptance-keycloak-runtime-secrets:/target/keycloak-runtime
       - acceptance-keycloak-init-secrets:/target/keycloak-init
       - acceptance-postgres-secrets:/target/postgres
       - acceptance-valkey-secrets:/target/valkey
-      - acceptance-minio-secrets:/target/minio
       - acceptance-server-secrets:/target/server
     network_mode: "none"
     read_only: true
@@ -819,34 +813,12 @@ services:
       runtime-secrets-init:
         condition: service_completed_successfully
 
-  minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
-    command: ["server", "/data", "--console-address", ":9001"]
-    environment:
-      MINIO_ROOT_USER_FILE: /run/secrets/s3_access_key
-      MINIO_ROOT_PASSWORD_FILE: /run/secrets/s3_secret_key
-    networks:
-      - object-control
-      - object
-    volumes:
-      - acceptance-minio-data:/data
-      - acceptance-minio-secrets:/run/secrets:ro
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 2s
-      timeout: 2s
-      retries: 45
-    restart: unless-stopped
-    depends_on:
-      runtime-secrets-init:
-        condition: service_completed_successfully
-
   server-secrets-init:
     image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - >-
-        for name in oidc_client_secret database_url redis_url token_signing_key s3_access_key s3_secret_key; do
+        for name in oidc_client_secret database_url redis_url token_signing_key; do
           rm -f "/target/$$name";
           cp "/run/secrets/$$name" "/target/$$name";
           chmod 0400 "/target/$$name";
@@ -871,8 +843,6 @@ services:
       - database_url
       - redis_url
       - token_signing_key
-      - s3_access_key
-      - s3_secret_key
     volumes:
       - acceptance-server-secrets:/target
       - acceptance-caddy-data:/data:ro
@@ -911,13 +881,6 @@ services:
       TERMLINK_DATABASE_URL_FILE: /run/secrets/database_url
       TERMLINK_REDIS_URL_FILE: /run/secrets/redis_url
       TERMLINK_TOKEN_SIGNING_KEY_FILE: /run/secrets/token_signing_key
-      TERMLINK_HISTORY_ENABLED: "true"
-      TERMLINK_S3_ENDPOINT: http://minio:9000
-      TERMLINK_S3_PUBLIC_ENDPOINT: ${TERMLINK_ACCEPTANCE_HISTORY_ORIGIN:-https://history.127.0.0.1.sslip.io:9443}
-      TERMLINK_S3_BUCKET: termlink-history
-      TERMLINK_S3_REGION: us-east-1
-      TERMLINK_S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
-      TERMLINK_S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
       TERMLINK_LISTEN_ADDR: :8080
       TERMLINK_LOG_LEVEL: info
     volumes:
@@ -955,7 +918,6 @@ services:
     networks:
       - frontend
       - backend
-      - object-control
       - egress
     volumes:
       - acceptance-server-secrets:/run/secrets:ro
@@ -979,8 +941,6 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
-      minio:
-        condition: service_healthy
 
 secrets:
   keycloak_admin_password:
@@ -1001,10 +961,6 @@ secrets:
     file: ${TERMLINK_ACCEPTANCE_REDIS_URL_FILE:?required}
   token_signing_key:
     file: ${TERMLINK_ACCEPTANCE_TOKEN_SIGNING_KEY_FILE:?required}
-  s3_access_key:
-    file: ${TERMLINK_ACCEPTANCE_S3_ACCESS_KEY_FILE:?required}
-  s3_secret_key:
-    file: ${TERMLINK_ACCEPTANCE_S3_SECRET_KEY_FILE:?required}
 
 volumes:
   acceptance-caddy-data:
@@ -1017,17 +973,11 @@ volumes:
   acceptance-server-secrets:
   acceptance-valkey-data:
   acceptance-valkey-secrets:
-  acceptance-minio-data:
-  acceptance-minio-secrets:
 
 networks:
   public:
   frontend:
     internal: true
   backend:
-    internal: true
-  object:
-    internal: true
-  object-control:
     internal: true
   egress:

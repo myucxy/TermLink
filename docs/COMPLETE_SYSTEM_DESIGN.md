@@ -2,7 +2,7 @@
 
 文档版本：1.0
 状态：开发基线
-更新日期：2026-08-22
+更新日期：2026-09-05
 适用范围：Windows Agent、Docker 服务端、Android 客户端、终端引擎与 UI/UX
 
 ## 1. 文档目的与最终决策
@@ -16,7 +16,7 @@
 3. Android 不移植完整 Windows Terminal。默认使用 Termux `terminal-emulator` + `terminal-view` 派生 Fork，xterm.js 离线 WebView 作为兼容性对照与运行时回退。
 4. terminal-main 异步通道目标是产生有序的终端输入输出事件；PC 与 Android 的目标载荷带明确编码版本，不传屏幕截图，也不在 Relay 中转换成字符串。当前生产载荷仍是隐式 UTF-8，编码扩展待完成。
 5. Windows Agent 与 Android 登录同一 OIDC 账号后直接发现和使用该账号下的 PC/受管 Session，不需要用户配对、自授信或逐 PC Grant；远程输入仍需要短时会话输入租约。
-6. 服务端采用 Go，可用 Docker Image 和 Docker Compose 部署；PostgreSQL 保存元数据，Redis/Valkey 保存在线状态与租约，S3 兼容存储保存可选的端到端加密历史块。
+6. 服务端采用 Go，可用 Docker Image 和 Docker Compose 部署；PostgreSQL 保存目录与任务元数据，Redis/Valkey 保存在线状态与租约。终端历史由 Windows 主机本地保存并按需通过认证实时链路提供。
 7. 服务端只路由密文。终端正文、输入和快照在 PC 与同账号、未撤销且持有独立设备私钥的 Android 之间端到端加密。
 8. UI 采用“Quiet Focus / 安静专注”设计语言：低干扰、内容优先、上下文操作、清晰状态和渐进披露，不以炫光、渐变或大量卡片代替可用性。
 9. 服务端保留可配置套餐目录和购买验证接口；同一账号的 Windows PC 与实时 Session 数量不限，历史额度字段以 `-1` 表示 unlimited，套餐名称、周期、功能标记、渠道映射和上下架状态均不硬编码在客户端。
@@ -64,7 +64,7 @@ TermLink 是远程终端系统，不是：
 - ANSI 16 色、256 色、True Color、常见 TUI、鼠标、IME 和组合键；
 - 同账号设备直接发现、账号隔离、输入租约、设备撤销和逐设备 E2EE；
 - Windows Terminal Scheme 配色同步；
-- Docker Compose 单机部署和外部 S3/OIDC 接入。
+- Docker Compose 单机部署和外部 OIDC 接入。
 - Free 方案和月付会员的购买、恢复、续费、宽限与功能状态同步；PC/Session 数量不设配额。
 
 暂不纳入：
@@ -86,7 +86,7 @@ TermLink 是远程终端系统，不是：
 | 持续输出能力 | 单会话 2 MB/s 持续 10 分钟无 OOM |
 | 断线恢复 | 断线 30 秒后从 ACK/快照恢复，不重复输入 |
 | 终端网格兼容 | Golden Stream 最终网格正确率 ≥ 99% |
-| 数据保密 | Relay、数据库、对象存储与日志均无终端明文 |
+| 数据保密 | Relay、数据库与日志均无终端明文；服务端不保存终端历史或文件正文 |
 | 本地可用性 | Relay 停止时 Windows 本地终端继续运行 |
 
 ## 3. 需求目录
@@ -127,10 +127,10 @@ TermLink 是远程终端系统，不是：
 | SRV-002 | 管理 OIDC 账号映射、设备归属、公钥、撤销状态、PC 在线状态、会话索引和审计元数据；兼容授权记录不得改变首版账号级直连主流程。 |
 | SRV-003 | 支持输出 ACK、续传、去重、限流、背压、心跳和输入租约。 |
 | SRV-004 | 终端载荷保持 E2EE，服务端不得持有正文解密密钥。 |
-| SRV-005 | 历史开启时只保存加密 Event Chunk、Terminal Snapshot 与 Terminal Transcript Page 对象。 |
+| SRV-005 | 服务端不保存终端历史正文；在线 Windows 主机从本地 WAL/checkpoint 提供逐设备密封的 Snapshot 和有界事件。 |
 | SRV-006 | 官方发布多架构 Docker Image，支持 Docker Compose 单机部署。 |
 | SRV-007 | 容器以非 root 用户运行，提供健康检查、只读根文件系统和外部 Secret 注入。 |
-| SRV-008 | PostgreSQL、Redis/Valkey 和对象存储支持内置 Compose 或外部托管服务。 |
+| SRV-008 | PostgreSQL 和 Redis/Valkey 支持内置 Compose 或外部托管服务。 |
 | SRV-009 | 支持数据库迁移、备份、恢复、审计与版本回滚兼容。 |
 | SRV-010 | 日志、指标和 Trace 不包含终端正文、Token、私钥或完整 IP。 |
 
@@ -207,10 +207,8 @@ flowchart LR
         API[API + Realtime Relay]
         PG[(PostgreSQL)]
         REDIS[(Redis / Valkey)]
-        S3[(S3 Encrypted Blobs)]
         API --- PG
         API --- REDIS
-        API --- S3
     end
 
     subgraph PHONE[Android · 用户信任域]
@@ -350,16 +348,15 @@ UI 最终只取该映射中的非空 projected title，否则显示目录记录�
 
 ### 4.4 断线恢复原则
 
-`TerminalSnapshotV1` 是锚定已有输出序号 S 的 REST 历史对象，不是 Realtime
-`Envelope`。它不分配或消耗新的 `Envelope.seq`，也不由 Agent 通过 WebSocket
-直接发送。启用 `terminal_snapshot_v1` 后，完整恢复时序固定如下：
+终端快照是锚定已有序号 S 的 Windows 主机历史对象，不分配或消耗新的实时
+`Envelope.seq`。Android 通过会话专用的 `host_history_v1` 请求取得逐设备密封对象，
+服务端只转发帧，不建立历史索引或保存对象。完整恢复时序固定如下：
 
 ```mermaid
 sequenceDiagram
     participant D as Android Durable State
     participant M as Android Bootstrap
-    participant H as History REST Selector
-    participant O as Object Storage
+    participant H as Windows Host History
     participant C as Crypto and Validator
     participant P as Detached Termux Engine
     participant L as Live Renderer
@@ -367,17 +364,18 @@ sequenceDiagram
     participant A as PC Agent
 
     M->>D: read durable cumulative ACK A
-    M->>H: request one eligible snapshot for A
-    H->>H: select at most one S where A <= S <= last output seq
-    H-->>M: snapshot metadata S and signed download URL
-    M->>O: download sealed snapshot object
-    O-->>M: TerminalSnapshotCiphertextV1
+    M->>R: open authenticated session endpoint
+    R->>A: route latest snapshot request after A
+    A->>H: select local checkpoint at S
+    H-->>A: recipient-bound sealed snapshot S
+    A->>R: bounded host-history response
+    R-->>M: sealed snapshot S
     M->>C: verify digest, identity, epoch, AAD and AEAD
     C->>C: decode and fully validate TerminalSnapshotV1 at S
     C-->>M: validated snapshot S
     M->>P: prepare snapshot in a detached renderer
     P-->>M: prepared candidate at S
-    M->>D: durably cache the sealed object
+    M->>D: durably cache the sealed snapshot
     M->>D: atomically bind checkpoint identity and ACK S
     D-->>M: bound renderer generation at S
     M->>L: install prepared candidate
@@ -388,7 +386,7 @@ sequenceDiagram
     M->>L: apply event S+1
     M->>D: commit cumulative ACK S+1 after apply
 
-    Note over A,R: Snapshot bytes never travel as realtime Envelope data
+    Note over A,R: Relay forwards opaque bounded history responses and does not persist them
     Note over M,L: Before atomic bind, failure may fall back; after bind, restore or reset must complete before opening the socket
 ```
 
@@ -604,8 +602,8 @@ MVP 将 REST API、WebSocket Relay、租约协调和后台清理任务编译成�
 | API | 账号归属、设备、PC、会话索引、撤销和审计 API；兼容授权/配对端点 | 否 |
 | Realtime Relay | WebSocket 认证、路由、ACK、背压和心跳 | 只见 Envelope |
 | Lease Coordinator | 输入租约申请、续约、释放和抢占 | 否 |
-| History Indexer | 加密 Event Chunk/Snapshot/Transcript 索引和过期删除 | 只见密文 Blob |
-| Worker | 撤销传播、过期、审计保留和删除任务 | 否 |
+| File Transfer Router | 为 Windows 与 Android 的分块传输绑定短时路由；不落文件正文 | 只见密文帧 |
+| Worker | 撤销传播、过期任务和审计保留 | 否 |
 
 ### 6.2 Docker Compose 拓扑
 
@@ -615,7 +613,6 @@ flowchart TB
     EDGE --> APP[termlink-server :8080]
     APP --> PG[(PostgreSQL)]
     APP --> KV[(Redis / Valkey)]
-    APP --> OBJ[(MinIO profile or External S3)]
     APP --> OIDC[External OIDC Issuer]
 
     subgraph public[public network]
@@ -625,11 +622,10 @@ flowchart TB
         APP
         PG
         KV
-        OBJ
     end
 ```
 
-默认只暴露 443。PostgreSQL、Redis/Valkey、MinIO 和应用的 8080 端口仅在 Docker private network 可见。已有 Nginx、Traefik 或 Cloudflare Tunnel 的部署可关闭 Caddy Profile。
+默认只暴露 443。PostgreSQL、Redis/Valkey 和应用的 8080 端口仅在 Docker private network 可见。已有 Nginx、Traefik 或 Cloudflare Tunnel 的部署可关闭 Caddy Profile。
 
 ### 6.3 镜像设计
 
@@ -656,10 +652,9 @@ ghcr.io/termlink/termlink-server:<semver>
 | --- | --- | --- |
 | `core` | TermLink Server、PostgreSQL、Redis/Valkey | 最小自托管 |
 | `edge` | Core + Caddy | 无现有反向代理的公网部署 |
-| `history` | Core + MinIO + 独立 internal `object` 网络 | 本地保存 E2EE 历史；客户端预签名 GET/PUT 经 TLS Edge 进入 MinIO，Edge 不加入数据库 `backend`，且只放行规范密文对象路径 |
 | `observability` | Prometheus、Grafana、Loki/OTel Collector | 运维诊断，可选 |
 
-生产部署必须固定镜像版本和 Digest，不使用 `latest`。数据库、对象存储使用 Named Volume 或宿主机受管目录，应用容器本身保持无状态。
+生产部署必须固定镜像版本和 Digest，不使用 `latest`。数据库使用 Named Volume 或宿主机受管目录，应用容器本身保持无状态。
 
 ### 6.5 关键配置
 
@@ -671,12 +666,8 @@ ghcr.io/termlink/termlink-server:<semver>
 | `TERMLINK_OIDC_CLIENT_SECRET_FILE` | OIDC Secret 文件路径 | 是 |
 | `TERMLINK_DATABASE_URL_FILE` | PostgreSQL DSN 文件路径 | 是 |
 | `TERMLINK_REDIS_URL_FILE` | Redis/Valkey DSN 文件路径 | 是 |
-| `TERMLINK_S3_ENDPOINT` | S3/MinIO Endpoint | 否 |
-| `TERMLINK_S3_ACCESS_KEY_FILE` | 对象存储 Access Key | 是 |
-| `TERMLINK_S3_SECRET_KEY_FILE` | 对象存储 Secret | 是 |
 | `TERMLINK_TOKEN_SIGNING_KEY_FILE` | 服务端 Token 签名私钥 | 是 |
 | `TERMLINK_LOG_LEVEL` | `info`/`warn`/`error` | 否 |
-| `TERMLINK_HISTORY_ENABLED` | 是否允许云历史 | 否 |
 
 Secret 优先使用 Docker Secret 文件；环境变量只保存非敏感值。配置加载失败时进程必须 Fail Fast，不静默使用不安全默认值。
 
@@ -690,9 +681,8 @@ no sibling repository is required.
    `.\server\ops\Start-ProductionAcceptance.ps1 -LanAddress 192.168.9.28`。
    Run the same command from the repository root; `-LanAddress` must be an IPv4
    address assigned to this host.
-2. 地址 `<LAN-IP>` 对应的产品、API 和 OIDC Origin 是
-   `https://termlink.<LAN-IP>.sslip.io:9443`，历史对象 Origin 是
-   `https://history.<LAN-IP>.sslip.io:9443`。脚本导出一次性 CA 到
+2. 地址 `<LAN-IP>` 对应的产品、API、Realtime 和 OIDC Origin 是
+   `https://termlink.<LAN-IP>.sslip.io:9443`。脚本导出一次性 CA 到
    `server\secrets\acceptance\acceptance-root-ca.crt`。The script exports that
    disposable CA at the same path.
 3. 在 `android` 目录构建 Debug APK 时传入
@@ -709,7 +699,7 @@ no sibling repository is required.
    both clients with the same OIDC account, create a TermLink-managed session on
    Windows, discover it on Android, then acquire a lease before sending input.
 
-该脚本自动完成的是服务端生产 REST/Realtime/Lease/History 协议探测，不代替真实 Android
+该脚本自动完成的是服务端生产 REST/Realtime/Lease 协议探测，不代替真实 Android
 与 Windows 产品链路的人工 E2E。手机和 PC 必须能解析 `sslip.io` 并访问主机 TCP 9443；
 宿主机防火墙规则由操作者按局域网范围配置。一次性 CA 只用于 Debug/E2E，不是生产信任锚。
 Android Release 和 Windows 默认配置不会继承 LAN 覆盖，仍固定使用公开 Origin
@@ -850,8 +840,7 @@ is recorded in this evidence.
 | `device_grants` | 兼容层：`device_id`, `pc_id`, `permission`, `approved_by`, `expires_at`；账号级直连不依赖该表 |
 | `sessions` | `id`, `pc_id`, `shell_type`, opaque `title_cipher`, `state`, `created_at`, `ended_at`；标题密文合同见 4.3.1 |
 | `control_leases` | `session_id`, `holder_device_id`, `lease_id`, `expires_at`, `version` |
-| `event_chunks` | `session_id`, `start_seq`, `end_seq`, `object_key`, `size`, `expires_at` |
-| `snapshots` | `session_id`, `snapshot_seq`, `rows`, `columns`, `object_key`, `format_version`；`snapshot_seq` 锚定已有事件，不是新 Envelope 序号 |
+| `pc_file_operations` | 文件操作元数据、协议、状态和过期时间；不含对象键或文件正文 |
 | `audit_events` | `actor_device_id`, `action`, `target_type`, `target_id`, `result`, `ip_hash`, `created_at` |
 | `subscriptions` | `account_id`, `provider`, `product_id`, `provider_ref_hash`, `status`, `renews_at`, `grace_until` |
 | `entitlements` | `account_id`, `plan`, `max_remote_pcs`, `max_live_sessions`, `version`, `effective_at`, `expires_at` |
@@ -861,11 +850,10 @@ is recorded in this evidence.
 增加明文标题列。Agent 没有可用 recipient 或 recipient directory 暂时不可用时保留旧
 `title_cipher`；Android 解密失败时忽略标题并继续使用目录，而不是把未认证值投影到 UI。
 
-`TerminalSnapshotCiphertextV1` 与 `TerminalTranscriptCiphertextV1` 都属于 REST
-历史对象。最终工作树已包含 Snapshot/Transcript 上传提交、recipient-bound 选择与固定 S
-Transcript 分页；Windows runtime 也已接线 durable producer/outbox，Android 产品代码已接线
-独立分页 viewport。上述实现仍需主代理在最终工作树完成构建、故障注入和真实产品 E2E，且
-`terminal_snapshot_v1` 仍未被 Agent/Android 宣告，不能把代码存在理解为生产能力已启用。
+Snapshot、Event Range 与 Transcript 都由 Windows 本地 durable producer/WAL 物化，按请求
+Android 设备进行 recipient-bound 密封，再通过 `host_history_v1` 实时响应返回。Android 使用
+独立分页 viewport 和本地 renderer checkpoint；服务端不保存或选择这些对象。主机离线时不提供
+历史，显式关闭会话后 Windows 销毁对应历史目录。
 
 ### 6.9 租约一致性
 
@@ -883,8 +871,8 @@ Transcript 分页；Windows runtime 也已接线 durable producer/outbox，Andro
 - 多实例：Presence/Lease 放 Redis，连接路由使用节点登记 + Pub/Sub/NATS；
 - PostgreSQL 每日全量备份 + WAL/PITR，定期执行恢复演练；
 - Redis 只保存可重建状态，不作为唯一历史来源；
-- S3 开启版本生命周期与服务端磁盘加密，但正文保密仍依赖客户端 E2EE；
-- 删除流程先禁用索引，再异步删除对象，记录不含正文的删除证明事件。
+- Windows 历史目录属于会话生命周期；显式关闭成功后删除本地 WAL/checkpoint；
+- 文件传输临时分块统一进入两端私有缓存，完成、取消或过期后清理。
 
 ### 6.11 可观测性
 
@@ -1065,9 +1053,9 @@ message Envelope {
 | 主题 | `theme_changed` |
 | 生命周期 | `session_started`, `session_interrupted`, `session_ended` |
 
-`SNAPSHOT_OFFER` 与 `SNAPSHOT_CHUNK` 的枚举值和方向 ACL 仅为 wire 兼容保留，
-Phase 1 不使用它们传输 `TerminalSnapshotV1`。Snapshot/Transcript 只经认证 REST
-元数据与对象存储 URL 获取。
+`SNAPSHOT_OFFER` 与 `SNAPSHOT_CHUNK` 的枚举值和方向 ACL 仅为 wire 兼容保留。
+当前 Snapshot/Event Range/Transcript 使用会话专用 `host_history_v1` 请求响应，
+经 Relay 透明转发，不经 REST 元数据或对象 URL。
 
 ### 8.3 顺序、ACK 与背压
 
@@ -1185,15 +1173,15 @@ PC Agent 只提取 Windows Terminal Scheme 与安全的显示字段，不上传�
 
 ## 10. 会话记录、历史与回放
 
-### 10.1 有序事件与 REST 历史对象
+### 10.1 有序事件与主机历史对象
 
 | 类型 | 内容 | 默认持久化 |
 | --- | --- | --- |
 | `output` | terminal-main 异步通道输出（UTF-16 code unit，按版本编码后传输） | PC 本地是 |
 | `input` | 本地或远端输入 | 否 |
 | `resize` | Columns/Rows 和像素单元信息 | 是 |
-| `terminal_snapshot_v1` | 锚定已有序号 S 的规范化终端 checkpoint；REST 历史对象，不消耗 `Envelope.seq` | Runtime 关闭 |
-| `terminal_transcript_page_v1` | 固定 S 的只读主屏历史行分页；REST 历史对象，不进入 parser | Runtime 关闭 |
+| `terminal_snapshot_v1` | 锚定已有序号 S 的 terminal-core checkpoint；由在线 Windows 主机提供，不消耗 live `Envelope.seq` | PC 本地是 |
+| `terminal_transcript_page_v1` | 固定 S 的只读主屏历史行分页；由在线 Windows 主机按需提供，不进入 parser | PC 本地是 |
 | `title` | 标题变化 | 可配置，敏感 |
 | `lifecycle` | 创建、中断、恢复、退出码 | 是 |
 | `control` | 租约变化 | 仅元数据 |
@@ -1203,8 +1191,8 @@ PC Agent 只提取 Windows Terminal Scheme 与安全的显示字段，不上传�
 - 按 1～4 MiB 或 5～15 秒切块，以先到条件为准；
 - 块内先编码与压缩，再整体 AEAD 加密；
 - Header 包含 Session、Start/End Seq、时间范围、Compression、Key ID、Hash 和格式版本；
-- 上传采用幂等 Object Key 和校验 Hash；
-- 默认 PC 本地保留 7 天；云历史默认关闭；
+- Windows 使用会话 ID 和序号范围建立幂等本地记录并校验 Hash；
+- 运行中会话历史保存在 PC 本地；显式关闭会话后销毁；
 - 输入正文不进入 Event Chunk，除非用户明确开启并接受风险。
 
 ### 10.3 最后一屏与上滑分页
@@ -1600,9 +1588,9 @@ stateDiagram-v2
 - 丢包、乱序、重复、慢消费者、Wi-Fi/蜂窝切换和 30 秒离线；
 - 同一 `input_id` 重复 100 次仍只调用 terminal-main 异步通道一次；
 - 多 Android 争抢租约、租约过期、PC 本地抢占；
-- Docker 首次启动、迁移、滚动升级、数据库恢复和对象删除；
+- Docker 首次启动、迁移、滚动升级和 PostgreSQL 恢复；
 - 单账号多 PC × 多 Session，持续 2 MB/s 压测；
-- Relay 日志、DB、Redis、S3 和监控全链路明文扫描。
+- Relay 日志、DB、Redis 和监控全链路明文扫描；确认服务端没有历史或文件正文。
 - 同账号第二台及更多 PC、第四个及更多实时 Session 均可成功注册/订阅；
 - Google Play/Web 购买验证、重复 Webhook、乱序续费、取消、退款、Grace Period 和恢复购买；
 - 客户端篡改 `isPro`、过期缓存或重放 Purchase Token 均不能提升 Entitlement。
@@ -1696,7 +1684,7 @@ Android 仍未宣告 `terminal_snapshot_v1`；这些并行改动必须由主代�
 ### 阶段 4：稳定与规模化
 
 - Termux 上游同步自动化、Golden Regression 和性能优化；
-- 多 Relay 实例、外部 S3、OIDC 和更完整的自托管文档。
+- 多 Relay 实例、外部 OIDC 和更完整的自托管文档。
 
 ## 16. 推荐仓库结构
 

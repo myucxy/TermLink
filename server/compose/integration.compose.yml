@@ -1,14 +1,6 @@
 name: termlink-integration
 
 services:
-  # Applied when this file is layered with core/history. The server keeps
-  # using http://minio:9000 internally; only client presigned URLs use the
-  # host-loopback address exposed below.
-  server:
-    image: ${TERMLINK_IMAGE:-ghcr.io/termlink/termlink-server:0.1.0}
-    environment:
-      TERMLINK_S3_PUBLIC_ENDPOINT: http://127.0.0.1:59000
-
   postgres:
     image: postgres:17.5-alpine3.22@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
     environment:
@@ -27,21 +19,6 @@ services:
     ports: ["127.0.0.1:56379:6379"]
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
-      interval: 2s
-      timeout: 2s
-      retries: 30
-
-  minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
-    command: ["server", "/data", "--console-address", ":9001"]
-    environment:
-      # These credentials are disposable integration-test fixtures only.
-      MINIO_ROOT_USER: integration-access
-      MINIO_ROOT_PASSWORD: integration-only-password
-    ports:
-      - "127.0.0.1:59000:9000"
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
       interval: 2s
       timeout: 2s
       retries: 30

@@ -159,6 +159,70 @@ class RendererCheckpointRepositoryTest {
     }
 
     @Test
+    fun olderHostSnapshotBindsWithoutRewindingAckWhenNoCheckpointExists() = runBlocking {
+        val sessionId = UUID.fromString("11223344-5566-7788-99aa-bbccddeeff")
+        val snapshotId = UUID.fromString("22334455-6677-8899-aabb-ccddeeff00aa")
+        val direction = "PC_TO_ANDROID"
+        val ciphertext = byteArrayOf(4, 5, 6, 7)
+        val initial = repository.initializeAckCursor(sessionId, direction)
+        assertEquals(0uL, initial.sequence)
+        assertNull(repository.rendererCheckpointState(sessionId, direction))
+        assertEquals(46uL, repository.putAckCursor(sessionId, direction, initial.rendererGeneration, 46uL))
+        assertEquals(46uL, repository.ackCursorState(sessionId, direction)?.sequence)
+        assertNull(repository.rendererCheckpointState(sessionId, direction))
+
+        repository.putSnapshot(
+            sessionId = sessionId,
+            snapshotSequence = 45u,
+            rows = 24,
+            columns = 80,
+            objectKey = "snapshots/$sessionId/45",
+            keyId = "terminal-core-snapshot-v2:recipient:00000001",
+            formatName = HistoryRepository.TERMINAL_CORE_SNAPSHOT_FORMAT,
+            formatVersion = 2,
+            ciphertext = ciphertext,
+            id = snapshotId,
+        )
+
+        val cursorRegression = runCatching {
+            repository.bindHostRendererCheckpoint(
+                sessionId = sessionId,
+                direction = direction,
+                expectedRendererGeneration = initial.rendererGeneration,
+                snapshotId = snapshotId,
+                snapshotSequence = 45u,
+                renderedThroughSequence = 45u,
+                ciphertextSha256 = HistoryRepository.sha256(ciphertext),
+            )
+        }.exceptionOrNull()
+        assertTrue(cursorRegression is IllegalArgumentException)
+        assertEquals(46uL, repository.ackCursorState(sessionId, direction)?.sequence)
+        assertNull(repository.rendererCheckpointState(sessionId, direction))
+
+        val bound = repository.bindHostRendererCheckpoint(
+            sessionId = sessionId,
+            direction = direction,
+            expectedRendererGeneration = initial.rendererGeneration,
+            snapshotId = snapshotId,
+            snapshotSequence = 45u,
+            renderedThroughSequence = 46u,
+            ciphertextSha256 = HistoryRepository.sha256(ciphertext),
+        )
+
+        assertEquals(2L, bound.rendererGeneration)
+        assertEquals(45uL, bound.snapshotSequence)
+        assertEquals(46uL, bound.durableAcknowledgement)
+        assertEquals(
+            AckCursorState(sequence = 46uL, rendererGeneration = 2L),
+            repository.ackCursorState(sessionId, direction),
+        )
+        val persisted = requireNotNull(repository.rendererCheckpointState(sessionId, direction))
+        assertEquals(45uL, persisted.snapshotSequence)
+        assertEquals(46uL, persisted.durableAcknowledgement)
+        assertEquals(2L, persisted.rendererGeneration)
+    }
+
+    @Test
     fun rendererResetDeletesCheckpointInTheSameTransaction() = runBlocking {
         val sessionId = UUID.fromString("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         val snapshotId = UUID.fromString("bbbbbbbb-cccc-dddd-eeee-ffffffffffff")

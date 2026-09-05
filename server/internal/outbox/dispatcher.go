@@ -15,14 +15,9 @@ import (
 )
 
 type Dispatcher struct {
-	Store   *store.Postgres
-	Valkey  *kv.Valkey
-	History HistoryObjectStore
-	Logger  *slog.Logger
-}
-
-type HistoryObjectStore interface {
-	Delete(context.Context, string) error
+	Store  *store.Postgres
+	Valkey *kv.Valkey
+	Logger *slog.Logger
 }
 
 func (d Dispatcher) Run(ctx context.Context) {
@@ -104,17 +99,6 @@ func (d Dispatcher) deliver(ctx context.Context, event store.OutboxEvent) error 
 		return d.publishAggregate(ctx, "device-authorization-changed", event.AggregateID)
 	case "account.status.changed":
 		return d.publishAggregate(ctx, "account-status-changed", event.AggregateID)
-	case "history.object.delete":
-		var payload struct {
-			ObjectKey string `json:"object_key"`
-		}
-		if err := json.Unmarshal(event.Payload, &payload); err != nil || payload.ObjectKey == "" {
-			return errors.New("invalid history object deletion payload")
-		}
-		if d.History == nil {
-			return errors.New("history object store is unavailable")
-		}
-		return d.History.Delete(ctx, payload.ObjectKey)
 	default:
 		return errors.New("unsupported authority outbox event")
 	}

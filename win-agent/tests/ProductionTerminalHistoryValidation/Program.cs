@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Globalization;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -136,8 +137,16 @@ namespace TermLink.ProductionTerminalHistory.Validation
             }
         }
 
-        public static async Task<int> Main()
+        public static async Task<int> Main(string[] args)
         {
+            if ((args.Length == 4 || args.Length == 5) &&
+                string.Equals(args[0], "--inspect-host-history", StringComparison.Ordinal))
+            {
+                var throughSequence = args.Length == 5
+                    ? ulong.Parse(args[4], NumberStyles.None, CultureInfo.InvariantCulture)
+                    : (ulong?)null;
+                return InspectHostHistory(args[1], Guid.Parse(args[2]), Guid.Parse(args[3]), throughSequence);
+            }
             var root = Path.Combine(Path.GetTempPath(), "termlink-production-terminal-history-" + Guid.NewGuid().ToString("N"));
             try
             {
@@ -145,6 +154,8 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 var pcDeviceId = Guid.Parse("12345678-abcd-4321-abcd-1234567890ab");
                 var sessionId = Guid.Parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
                 ValidateUploaderConstructorCompatibility();
+                await ValidateHostHistoryRequestStateAsync();
+                ValidateEmptyHostHistoryResponseContract();
                 ValidateRuntimeCapabilityAndPublicationGate(root, pcDeviceId);
                 ValidateRuntimePublicationReconcileOrder();
                 await ValidateHistoryWorkerRetryWakeupSeamsAsync();
@@ -196,6 +207,12 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 await ValidateChunkYieldAndResumeAsync(root, pcDeviceId);
                 await ValidateConcurrentUploaderDisposeAsync(pcDeviceId);
                 await ValidateRecipientSealingAndUploaderAsync(root, pcDeviceId, sessionId);
+                ValidateHostHistoryEventRangeRetry(root, pcDeviceId);
+                ValidateHostHistorySnapshotSuffixEvents(root, pcDeviceId);
+                ValidateExplicitCloseHistoryDeletion(root, pcDeviceId);
+                ValidateDeletionMarkerFailure(root, pcDeviceId);
+                ValidateHistorySurvivesShellExitDisconnectAndRestart(root, pcDeviceId);
+                ValidateLegacyHistoryDirectoryMigration();
                 Console.WriteLine("Production terminal history WAL/producer/outbox/uploader validation passed.");
                 return 0;
             }
@@ -210,12 +227,692 @@ namespace TermLink.ProductionTerminalHistory.Validation
             }
         }
 
+        private static int InspectHostHistory(
+            string root,
+            Guid pcDeviceId,
+            Guid sessionId,
+            ulong? requestedThroughSequence)
+        {
+            var store = new ProductionTerminalHistoryStore(root, pcDeviceId);
+            using var producer = new ProductionTerminalHistoryProducer(store, pcDeviceId);
+            var checkpoint = store.LoadCheckpoint(sessionId);
+            var outbox = store.LoadOutbox(sessionId);
+            var frames = store.ReadFrames(sessionId);
+            var recipient = new ProductionHistoryRecipient
+            {
+                DeviceId = Guid.Parse("bbbbbbbb-0000-4000-8000-000000000299"),
+                KeyEpoch = 1,
+                PairwiseKey = Enumerable.Range(1, 32).Select(value => (byte)value).ToArray()
+            };
+            try
+            {
+                using var selection = new ProductionHostHistoryService(
+                    store,
+                    producer,
+                    pcDeviceId,
+                    store.IsSessionDeleted).Select(
+                        sessionId,
+                        new HostHistoryRequestPayload
+                        {
+                            Kind = HostHistoryRequestKindV1.LatestSnapshot
+                        },
+                        recipient);
+                var selectedSequence = selection.Object?.SnapshotSequence ?? 0;
+                var throughSequence = requestedThroughSequence ?? (frames.LastOrDefault()?.Sequence ?? 0);
+                var selectedFrames = frames
+                    .Where(value => value.Sequence > selectedSequence && value.Sequence <= throughSequence)
+                    .OrderBy(value => value.Sequence)
+                    .ToList();
+                var expectedSequence = selectedSequence == ulong.MaxValue ? 0 : selectedSequence + 1;
+                var contiguous = selectedSequence < throughSequence &&
+                    selectedFrames.Count > 0 &&
+                    selectedFrames[0].Sequence == expectedSequence &&
+                    selectedFrames[^1].Sequence == throughSequence &&
+                    selectedFrames.Select(value => value.Sequence)
+                        .SequenceEqual(Enumerable.Range(0, selectedFrames.Count)
+                            .Select(offset => checked(expectedSequence + (ulong)offset)));
+                var eventKinds = selectedFrames.Select(value =>
+                {
+                    var historyEvent = ProductionAgentRuntime.BuildHistoryEvent(value);
+                    return historyEvent == null
+                        ? value.Sequence.ToString(CultureInfo.InvariantCulture) + ":LOCAL_ONLY"
+                        : value.Sequence.ToString(CultureInfo.InvariantCulture) + ":" + historyEvent.MessageType;
+                });
+                using var rangeSelection = selectedSequence < throughSequence
+                    ? new ProductionHostHistoryService(
+                        store,
+                        producer,
+                        pcDeviceId,
+                        store.IsSessionDeleted).Select(
+                            sessionId,
+                            new HostHistoryRequestPayload
+                            {
+                                Kind = HostHistoryRequestKindV1.EventRange,
+                                AfterSeq = selectedSequence,
+                                ThroughSeq = throughSequence,
+                                MaxEvents = 4096
+                            },
+                            recipient)
+                    : null;
+                Console.WriteLine(
+                    $"frames={frames.Count} last_frame={frames.LastOrDefault()?.Sequence ?? 0} " +
+                    $"checkpoint={checkpoint?.LastSequence ?? 0} eligible={checkpoint?.SnapshotEligible ?? false} " +
+                    $"authority={checkpoint?.AuthorityVersion ?? 0} outbox={outbox?.SnapshotSequence ?? 0} " +
+                    $"artifacts={outbox?.Artifacts?.Count ?? 0} status={selection.Status} " +
+                    $"error={selection.ErrorCode ?? string.Empty} selected={selectedSequence} " +
+                    $"bytes={selection.Object?.SealedObject?.Length ?? 0} " +
+                    $"range_through={throughSequence} range_frames={selectedFrames.Count} " +
+                    $"range_contiguous={contiguous} range_status={rangeSelection?.Status} " +
+                    $"range_start={rangeSelection?.Object?.StartSequence ?? 0} " +
+                    $"range_end={rangeSelection?.Object?.EndSequence ?? 0} " +
+                    $"range_has_more={rangeSelection?.Object?.HasMoreEvents ?? false} " +
+                    $"event_kinds={string.Join(",", eventKinds)}");
+                return selection.Status == HostHistoryResponseStatusV1.Ok &&
+                    (!requestedThroughSequence.HasValue ||
+                        contiguous && rangeSelection?.Status == HostHistoryResponseStatusV1.Ok &&
+                        rangeSelection.Object?.StartSequence == expectedSequence &&
+                        rangeSelection.Object?.EndSequence == throughSequence &&
+                        !rangeSelection.Object.HasMoreEvents)
+                    ? 0
+                    : 1;
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(recipient.PairwiseKey);
+            }
+        }
+
         private static void ValidateUploaderConstructorCompatibility()
         {
             var sendType = typeof(Func<HttpMethod, string, byte[], bool, string, CancellationToken, Task<HttpResponseMessage>>);
             Require(
                 typeof(ProductionHistoryUploader).GetConstructor(new[] { typeof(HttpClient), sendType, typeof(Guid) }) != null,
                 "Production history uploader no longer exposes its original three-parameter constructor.");
+        }
+
+        private static async Task ValidateHostHistoryRequestStateAsync()
+        {
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000111");
+            var deviceId = Guid.Parse("bbbbbbbb-0000-4000-8000-000000000111");
+            var objectId = Guid.Parse("cccccccc-0000-4000-8000-000000000111");
+            var request = new ProductionHostHistoryResponseRequest(sessionId, deviceId);
+            var acknowledged = request.PrepareChunkAcknowledgement(objectId, 7);
+            Require(!request.Acknowledge(Guid.NewGuid(), 7) &&
+                !request.Acknowledge(objectId, 6) &&
+                !acknowledged.IsCompleted,
+                "A mismatched Host History ACK advanced the response stream.");
+            Require(request.Acknowledge(objectId, 7),
+                "The matching Host History ACK was not accepted.");
+            await acknowledged;
+            Require(!request.Acknowledge(objectId, 7),
+                "A duplicate Host History ACK advanced the response stream twice.");
+
+            var cancelledAcknowledgement = request.PrepareChunkAcknowledgement(objectId, 8);
+            request.Cancel();
+            var cancelled = false;
+            try { await cancelledAcknowledgement; }
+            catch (OperationCanceledException) { cancelled = true; }
+            Require(cancelled && !request.Completion.IsCompleted,
+                "Cancelling a Host History stream did not cancel its pending ACK or disposed it concurrently.");
+            request.Dispose();
+            await request.Completion;
+            request.Dispose();
+
+            using var gate = new SemaphoreSlim(1, 1);
+            using var lease = await ProductionHostHistoryGateLease.AcquireAsync(gate, CancellationToken.None);
+            using var cancellation = new CancellationTokenSource();
+            cancellation.Cancel();
+            var waitCancelled = false;
+            try
+            {
+                using var unused = await ProductionHostHistoryGateLease.AcquireAsync(
+                    gate,
+                    cancellation.Token);
+            }
+            catch (OperationCanceledException) { waitCancelled = true; }
+            Require(waitCancelled && gate.CurrentCount == 0,
+                "A cancelled Host History gate waiter released a slot it never acquired.");
+            lease.Dispose();
+            Require(gate.CurrentCount == 1,
+                "A Host History gate lease did not release exactly one acquired slot.");
+        }
+
+        private static void ValidateEmptyHostHistoryResponseContract()
+        {
+            var requestId = ByteString.CopyFrom(
+                Guid.Parse("dddddddd-0000-4000-8000-000000000111").ToByteArray());
+            foreach (var status in new[]
+            {
+                HostHistoryResponseStatusV1.NotReady,
+                HostHistoryResponseStatusV1.NotFound,
+                HostHistoryResponseStatusV1.Gap,
+                HostHistoryResponseStatusV1.Rejected
+            })
+            {
+                using var selection = new ProductionHostHistorySelection
+                {
+                    Status = status,
+                    ErrorCode = "EXPECTED_EMPTY_RESPONSE"
+                };
+                var response = ProductionHostHistoryResponseBuilder.Build(
+                    requestId,
+                    selection,
+                    chunkIndex: 0,
+                    chunkCount: 0,
+                    objectDigest: Array.Empty<byte>(),
+                    objectOffset: 0,
+                    objectCount: 0);
+                Require(response.Status == status && response.ChunkIndex == 0 &&
+                    response.ChunkCount == 0 && response.ObjectBytes == 0 &&
+                    response.ObjectId.IsEmpty && response.ObjectSha256.IsEmpty &&
+                    response.ObjectChunk.IsEmpty,
+                    "An empty Host History response declared a synthetic object chunk.");
+            }
+        }
+
+        private static void ValidateHostHistoryEventRangeRetry(string root, Guid pcDeviceId)
+        {
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000201");
+            var recipientDeviceId = Guid.Parse("bbbbbbbb-0000-4000-8000-000000000201");
+            var historyRoot = Path.Combine(root, "host-history-event-range");
+            var store = new ProductionTerminalHistoryStore(historyRoot, pcDeviceId);
+            using var producer = new ProductionTerminalHistoryProducer(store, pcDeviceId);
+            var frames = new[]
+            {
+                new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    1,
+                    Encoding.UTF8.GetBytes("first\r\n")),
+                new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    2,
+                    Encoding.UTF8.GetBytes("second\r\n")),
+                new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    3,
+                    Encoding.UTF8.GetBytes("third\r\n"))
+            };
+            foreach (var frame in frames) producer.AppendCommittedFrame(frame);
+
+            var pairwiseKey = Enumerable.Range(1, 32).Select(value => (byte)value).ToArray();
+            var recipient = new ProductionHistoryRecipient
+            {
+                DeviceId = recipientDeviceId,
+                KeyEpoch = 7,
+                PairwiseKey = pairwiseKey
+            };
+            var service = new ProductionHostHistoryService(
+                store,
+                producer,
+                pcDeviceId,
+                _ => false);
+            var request = new HostHistoryRequestPayload
+            {
+                Kind = HostHistoryRequestKindV1.EventRange,
+                AfterSeq = 0,
+                ThroughSeq = 3,
+                MaxEvents = 3
+            };
+
+            ProductionHostHistorySelection first = null;
+            ProductionHostHistorySelection retry = null;
+            try
+            {
+                first = service.Select(sessionId, request, recipient);
+                Require(first.Status == HostHistoryResponseStatusV1.Ok && first.Object != null &&
+                    first.Object.Kind == HostHistoryObjectKindV1.EventChunk &&
+                    first.Object.StartSequence == 1 && first.Object.EndSequence == 3,
+                    "Host History did not select the expected contiguous event range.");
+                var firstObjectId = first.Object.ObjectId;
+                var firstCiphertext = (byte[])first.Object.SealedObject.Clone();
+                try
+                {
+                    var previousCulture = CultureInfo.CurrentCulture;
+                    try
+                    {
+                        CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("ar-SA");
+                        retry = service.Select(sessionId, request, recipient);
+                    }
+                    finally { CultureInfo.CurrentCulture = previousCulture; }
+                    Require(retry.Status == HostHistoryResponseStatusV1.Ok && retry.Object != null &&
+                        retry.Object.ObjectId == firstObjectId &&
+                        CryptographicOperations.FixedTimeEquals(firstCiphertext, retry.Object.SealedObject),
+                        "Retrying the same Host History event range changed its object ID or ciphertext.");
+
+                    var opened = HistoryCrypto.Open(
+                        pairwiseKey,
+                        retry.Object.SealedObject,
+                        sessionId,
+                        pcDeviceId,
+                        recipientDeviceId,
+                        recipient.KeyEpoch,
+                        retry.Object.KeyId,
+                        retry.Object.StartSequence,
+                        retry.Object.EndSequence);
+                    Require(opened.Events.Count == 3 && opened.Events[0].Seq == 1 &&
+                        opened.Events[2].Seq == 3,
+                        "The stable Host History event range could not be authenticated and opened.");
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(firstCiphertext);
+                }
+            }
+            finally
+            {
+                retry?.Dispose();
+                first?.Dispose();
+                CryptographicOperations.ZeroMemory(pairwiseKey);
+            }
+        }
+
+        private static void ValidateHostHistorySnapshotSuffixEvents(string root, Guid pcDeviceId)
+        {
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000206");
+            var recipientDeviceId = Guid.Parse("bbbbbbbb-0000-4000-8000-000000000206");
+            var historyRoot = Path.Combine(root, "host-history-snapshot-suffix-events");
+            var store = new ProductionTerminalHistoryStore(historyRoot, pcDeviceId);
+            using var producer = new ProductionTerminalHistoryProducer(store, pcDeviceId);
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                sessionId,
+                1,
+                Encoding.UTF8.GetBytes("snapshot anchor\r\n")));
+            var anchored = producer.ProcessSession(sessionId);
+            Require(anchored.SnapshotEligible && anchored.LastSequence == 1,
+                "The Host History suffix fixture did not produce its Snapshot anchor.");
+
+            // These frames deliberately arrive after Snapshot production. This
+            // matches a final title/lifecycle update followed by local removal:
+            // Android must restore Snapshot 1 and replay only events 2..3.
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Title,
+                sessionId,
+                2,
+                LocalPayloadCodec.Title("final title")));
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Lifecycle,
+                sessionId,
+                3,
+                LocalPayloadCodec.Lifecycle(LocalLifecycleState.Ended, 17)));
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.SessionRemoved,
+                sessionId,
+                4,
+                LocalPayloadCodec.SessionRemoved()));
+
+            var pairwiseKey = Enumerable.Repeat((byte)0x26, 32).ToArray();
+            var recipient = new ProductionHistoryRecipient
+            {
+                DeviceId = recipientDeviceId,
+                KeyEpoch = 1,
+                PairwiseKey = pairwiseKey
+            };
+            var service = new ProductionHostHistoryService(store, producer, pcDeviceId, _ => false);
+            ProductionHostHistorySelection snapshot = null;
+            ProductionHostHistorySelection suffix = null;
+            ProductionHostHistorySelection localOnly = null;
+            try
+            {
+                snapshot = service.Select(
+                    sessionId,
+                    new HostHistoryRequestPayload { Kind = HostHistoryRequestKindV1.LatestSnapshot },
+                    recipient);
+                Require(snapshot.Status == HostHistoryResponseStatusV1.Ok && snapshot.Object != null &&
+                    snapshot.Object.SnapshotSequence == 1,
+                    "A post-Snapshot lifecycle suffix replaced or hid the immutable Snapshot anchor.");
+
+                suffix = service.Select(
+                    sessionId,
+                    new HostHistoryRequestPayload
+                    {
+                        Kind = HostHistoryRequestKindV1.EventRange,
+                        AfterSeq = 1,
+                        ThroughSeq = 3,
+                        MaxEvents = 2
+                    },
+                    recipient);
+                Require(suffix.Status == HostHistoryResponseStatusV1.Ok && suffix.Object != null &&
+                    suffix.Object.StartSequence == 2 && suffix.Object.EndSequence == 3 &&
+                    !suffix.Object.HasMoreEvents,
+                    "Host History did not return the bounded post-Snapshot title/lifecycle suffix.");
+                var opened = HistoryCrypto.Open(
+                    pairwiseKey,
+                    suffix.Object.SealedObject,
+                    sessionId,
+                    pcDeviceId,
+                    recipientDeviceId,
+                    recipient.KeyEpoch,
+                    suffix.Object.KeyId,
+                    suffix.Object.StartSequence,
+                    suffix.Object.EndSequence);
+                Require(opened.Events.Count == 2 &&
+                    opened.Events[0].Seq == 2 && opened.Events[0].MessageType == MessageType.SessionUpsert &&
+                    SessionUpsertPayload.Parser.ParseFrom(opened.Events[0].Payload).HasTitle &&
+                    opened.Events[1].Seq == 3 && opened.Events[1].MessageType == MessageType.SessionEnded &&
+                    SessionUpsertPayload.Parser.ParseFrom(opened.Events[1].Payload).ExitCode == 17,
+                    "The post-Snapshot title/lifecycle suffix is incompatible with Android history decoding.");
+
+                localOnly = service.Select(
+                    sessionId,
+                    new HostHistoryRequestPayload
+                    {
+                        Kind = HostHistoryRequestKindV1.EventRange,
+                        AfterSeq = 3,
+                        ThroughSeq = 4,
+                        MaxEvents = 1
+                    },
+                    recipient);
+                Require(localOnly.Status == HostHistoryResponseStatusV1.NotFound &&
+                    localOnly.ErrorCode == "EVENT_RANGE_EMPTY",
+                    "The local SessionRemoved marker leaked into the remote history protocol.");
+            }
+            finally
+            {
+                localOnly?.Dispose();
+                suffix?.Dispose();
+                snapshot?.Dispose();
+                CryptographicOperations.ZeroMemory(pairwiseKey);
+            }
+        }
+
+        private static void ValidateExplicitCloseHistoryDeletion(string root, Guid pcDeviceId)
+        {
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000202");
+            var historyRoot = Path.Combine(root, "host-history-explicit-close");
+            var store = new ProductionTerminalHistoryStore(historyRoot, pcDeviceId);
+            using var producer = new ProductionTerminalHistoryProducer(store, pcDeviceId);
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                sessionId,
+                1,
+                Encoding.UTF8.GetBytes("persist until explicit close")));
+            producer.ProcessSession(sessionId);
+            var sessionPath = Path.Combine(historyRoot, sessionId.ToString("N"));
+            Require(Directory.Exists(sessionPath) && store.ListSessions().Contains(sessionId),
+                "The explicit-close fixture did not create durable local session history.");
+
+            var service = new ProductionHostHistoryService(
+                store,
+                producer,
+                pcDeviceId,
+                store.IsSessionDeleted);
+            var recipient = new ProductionHistoryRecipient
+            {
+                DeviceId = Guid.Parse("bbbbbbbb-0000-4000-8000-000000000202"),
+                KeyEpoch = 1,
+                PairwiseKey = Enumerable.Repeat((byte)0x42, 32).ToArray()
+            };
+            ProductionHostHistorySelection beforeClose = null;
+            ProductionHostHistorySelection afterClose = null;
+            try
+            {
+                beforeClose = service.Select(
+                    sessionId,
+                    new HostHistoryRequestPayload
+                    {
+                        Kind = HostHistoryRequestKindV1.EventRange,
+                        ThroughSeq = 1,
+                        MaxEvents = 1
+                    },
+                    recipient);
+                Require(beforeClose.Status == HostHistoryResponseStatusV1.Ok,
+                    "An active session could not serve Host History before explicit close.");
+
+                // This is the Windows store boundary used by DestroySessionHistory:
+                // mark the session inaccessible before removing its durable directory.
+                producer.ReleaseSession(sessionId);
+                store.DeleteSession(sessionId);
+                afterClose = service.Select(
+                    sessionId,
+                    new HostHistoryRequestPayload
+                    {
+                        Kind = HostHistoryRequestKindV1.EventRange,
+                        ThroughSeq = 1,
+                        MaxEvents = 1
+                    },
+                    recipient);
+                Require(afterClose.Status == HostHistoryResponseStatusV1.NotFound &&
+                    afterClose.ErrorCode == "SESSION_HISTORY_DESTROYED" &&
+                    store.IsSessionDeleted(sessionId) &&
+                    !Directory.Exists(sessionPath) && !store.ListSessions().Contains(sessionId),
+                    "Explicit close did not tombstone and delete Windows session history.");
+
+                var recoveredStore = new ProductionTerminalHistoryStore(historyRoot, pcDeviceId);
+                Require(recoveredStore.IsSessionDeleted(sessionId) &&
+                    !recoveredStore.ContainsSession(sessionId),
+                    "An Agent restart discarded the durable history deletion tombstone.");
+                var lateWriteRejected = false;
+                try
+                {
+                    recoveredStore.AppendCommittedFrame(new LocalFrame(
+                        LocalFrameType.Output,
+                        sessionId,
+                        2,
+                        Encoding.UTF8.GetBytes("late writer")));
+                }
+                catch (InvalidOperationException) { lateWriteRejected = true; }
+                Require(lateWriteRejected && !Directory.Exists(sessionPath),
+                    "A late history writer recreated a tombstoned session directory.");
+            }
+            finally
+            {
+                afterClose?.Dispose();
+                beforeClose?.Dispose();
+                CryptographicOperations.ZeroMemory(recipient.PairwiseKey);
+            }
+        }
+
+        private static void ValidateDeletionMarkerFailure(string root, Guid pcDeviceId)
+        {
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000112");
+            var historyRoot = Path.Combine(root, "host-history-delete-marker-failure");
+            var store = new ProductionTerminalHistoryStore(
+                historyRoot,
+                pcDeviceId,
+                (_, _) => throw new IOException("simulated durable marker failure"));
+            store.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                sessionId,
+                1,
+                Encoding.UTF8.GetBytes("must remain available after rejected deletion")));
+            var rejected = false;
+            try { store.MarkSessionDeleted(sessionId); }
+            catch (IOException) { rejected = true; }
+            Require(rejected && !store.IsSessionDeleted(sessionId) && store.ContainsSession(sessionId),
+                "A failed deletion-marker write was mistaken for durable history deletion.");
+        }
+
+        private static void ValidateHistorySurvivesShellExitDisconnectAndRestart(string root, Guid pcDeviceId)
+        {
+            ValidateHistorySurvivesShellExit(root, pcDeviceId);
+            ValidateHistorySurvivesNetworkDisconnect(root, pcDeviceId);
+            ValidateHistorySurvivesAgentRestart(root, pcDeviceId);
+        }
+
+        private static void ValidateHistorySurvivesShellExit(string root, Guid pcDeviceId)
+        {
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000203");
+            var historyRoot = Path.Combine(root, "history-shell-exit");
+            var store = new ProductionTerminalHistoryStore(historyRoot, pcDeviceId);
+            using (var producer = new ProductionTerminalHistoryProducer(store, pcDeviceId))
+            {
+                producer.AppendCommittedFrame(new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    1,
+                    Encoding.UTF8.GetBytes("shell output")));
+                producer.AppendCommittedFrame(new LocalFrame(
+                    LocalFrameType.Lifecycle,
+                    sessionId,
+                    2,
+                    LocalPayloadCodec.Lifecycle(LocalLifecycleState.Ended, 0)));
+                producer.ProcessSession(sessionId);
+            }
+
+            var recoveredStore = new ProductionTerminalHistoryStore(historyRoot, pcDeviceId);
+            Require(recoveredStore.ListSessions().Contains(sessionId) &&
+                recoveredStore.ReadFrames(sessionId).Count == 2 &&
+                recoveredStore.LoadCheckpoint(sessionId) != null,
+                "Shell natural exit incorrectly deleted the Windows history projection.");
+        }
+
+        private static void ValidateHistorySurvivesNetworkDisconnect(string root, Guid pcDeviceId)
+        {
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000204");
+            var historyRoot = Path.Combine(root, "history-network-disconnect");
+            using (var producer = new ProductionTerminalHistoryProducer(
+                new ProductionTerminalHistoryStore(historyRoot, pcDeviceId),
+                pcDeviceId))
+            {
+                producer.AppendCommittedFrame(new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    1,
+                    Encoding.UTF8.GetBytes("before disconnect")));
+                producer.ProcessSession(sessionId);
+            }
+
+            // A physical Relay/P2P loss disposes the producer connection, not the
+            // local history store. A later connection appends and projects normally.
+            using (var reconnected = new ProductionTerminalHistoryProducer(
+                new ProductionTerminalHistoryStore(historyRoot, pcDeviceId),
+                pcDeviceId))
+            {
+                reconnected.AppendCommittedFrame(new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    2,
+                    Encoding.UTF8.GetBytes("after reconnect")));
+                reconnected.ProcessSession(sessionId);
+            }
+
+            var recoveredStore = new ProductionTerminalHistoryStore(historyRoot, pcDeviceId);
+            var recovered = recoveredStore.ReadFrames(sessionId);
+            Require(recovered.Count == 2 && recovered[0].Sequence == 1 && recovered[1].Sequence == 2 &&
+                recoveredStore.LoadCheckpoint(sessionId) != null,
+                "A network disconnect/reconnect lost locally durable Windows history.");
+        }
+
+        private static void ValidateHistorySurvivesAgentRestart(string root, Guid pcDeviceId)
+        {
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000205");
+            var historyRoot = Path.Combine(root, "history-agent-restart");
+            using (var producer = new ProductionTerminalHistoryProducer(
+                new ProductionTerminalHistoryStore(historyRoot, pcDeviceId),
+                pcDeviceId))
+            {
+                producer.AppendCommittedFrame(new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    1,
+                    Encoding.UTF8.GetBytes("before Agent restart")));
+                producer.ProcessSession(sessionId);
+            }
+
+            // Recreating both store and producer models a clean Agent process
+            // restart while the shell session itself remains registered.
+            using (var restarted = new ProductionTerminalHistoryProducer(
+                new ProductionTerminalHistoryStore(historyRoot, pcDeviceId),
+                pcDeviceId))
+            {
+                var existing = restarted.ReadFrames(sessionId);
+                Require(existing.Count == 1 && existing[0].Sequence == 1,
+                    "Agent restart could not recover the durable Windows history WAL.");
+                restarted.AppendCommittedFrame(new LocalFrame(
+                    LocalFrameType.Output,
+                    sessionId,
+                    2,
+                    Encoding.UTF8.GetBytes("after Agent restart")));
+                restarted.ProcessSession(sessionId);
+            }
+
+            var recoveredStore = new ProductionTerminalHistoryStore(historyRoot, pcDeviceId);
+            Require(recoveredStore.ReadFrames(sessionId).Count == 2 &&
+                recoveredStore.LoadCheckpoint(sessionId) != null &&
+                recoveredStore.LoadOutbox(sessionId) != null,
+                "Agent restart did not preserve or resume the Windows history projection.");
+        }
+
+        private static void ValidateLegacyHistoryDirectoryMigration()
+        {
+            var runtimeAssembly = Assembly.Load("TermLink.Agent");
+            var runtimeType = runtimeAssembly.GetType(
+                "TermLink.Agent.ProductionAgentRuntime",
+                throwOnError: true);
+            var configType = runtimeAssembly.GetType(
+                "TermLink.Agent.ProductionAgentConfig",
+                throwOnError: true);
+            var defaultPath = (string)configType.GetProperty(
+                "DefaultPath",
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic).GetValue(null);
+            var accountRoot = Path.GetDirectoryName(defaultPath);
+            Require(!string.IsNullOrWhiteSpace(accountRoot),
+                "Production Agent default path has no parent for migration validation.");
+            var migrate = runtimeType.GetMethod(
+                "MigrateLegacyTerminalHistory",
+                BindingFlags.Static | BindingFlags.NonPublic);
+            Require(migrate != null, "Legacy terminal history migration hook is unavailable.");
+
+            var pcDeviceId = Guid.NewGuid();
+            var legacy = Path.Combine(accountRoot, "production-history", pcDeviceId.ToString("N"));
+            var destination = Path.Combine(
+                accountRoot,
+                "Data",
+                "History",
+                "migration-validation-" + Guid.NewGuid().ToString("N"));
+            Require(!Directory.Exists(legacy) && !Directory.Exists(destination),
+                "Migration validation paths unexpectedly already exist.");
+            try
+            {
+                Directory.CreateDirectory(legacy);
+                var marker = Path.Combine(legacy, "marker.wal.dpapi");
+                File.WriteAllBytes(marker, Encoding.UTF8.GetBytes("legacy-history-marker"));
+                migrate.Invoke(null, new object[] { pcDeviceId, destination });
+                var migratedMarker = Path.Combine(destination, "marker.wal.dpapi");
+                Require(!Directory.Exists(legacy) && File.Exists(migratedMarker) &&
+                    File.ReadAllText(migratedMarker, Encoding.UTF8) == "legacy-history-marker" &&
+                    !Directory.EnumerateFileSystemEntries(destination, "*.tmp").Any(),
+                    "Legacy terminal history was not moved atomically into the new directory.");
+
+                // An existing destination is never merged or overwritten. This
+                // protects a concurrently-started Agent from a legacy move.
+                var guardedPcId = Guid.NewGuid();
+                var guardedLegacy = Path.Combine(
+                    accountRoot,
+                    "production-history",
+                    guardedPcId.ToString("N"));
+                var guardedDestination = Path.Combine(
+                    accountRoot,
+                    "Data",
+                    "History",
+                    "migration-validation-existing-" + Guid.NewGuid().ToString("N"));
+                try
+                {
+                    Directory.CreateDirectory(guardedLegacy);
+                    Directory.CreateDirectory(guardedDestination);
+                    File.WriteAllText(Path.Combine(guardedLegacy, "legacy.txt"), "legacy", Encoding.UTF8);
+                    File.WriteAllText(Path.Combine(guardedDestination, "current.txt"), "current", Encoding.UTF8);
+                    migrate.Invoke(null, new object[] { guardedPcId, guardedDestination });
+                    Require(File.Exists(Path.Combine(guardedLegacy, "legacy.txt")) &&
+                        File.ReadAllText(Path.Combine(guardedDestination, "current.txt"), Encoding.UTF8) == "current" &&
+                        !File.Exists(Path.Combine(guardedDestination, "legacy.txt")),
+                        "Legacy migration overwrote an already-owned destination directory.");
+                }
+                finally
+                {
+                    if (Directory.Exists(guardedLegacy)) Directory.Delete(guardedLegacy, true);
+                    if (Directory.Exists(guardedDestination)) Directory.Delete(guardedDestination, true);
+                }
+            }
+            finally
+            {
+                if (Directory.Exists(legacy)) Directory.Delete(legacy, true);
+                if (Directory.Exists(destination)) Directory.Delete(destination, true);
+            }
         }
 
         private static void ValidateRuntimeCapabilityAndPublicationGate(string root, Guid pcDeviceId)

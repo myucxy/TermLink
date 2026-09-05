@@ -105,18 +105,6 @@ type Config struct {
 	RedisURLFile                   string
 	TokenSigningKeyFile            string
 
-	// S3Endpoint is the server-side endpoint used for bucket and object
-	// verification/deletion. S3PublicEndpoint is used only in presigned URLs
-	// returned to clients.
-	S3Endpoint       string
-	S3PublicEndpoint string
-	S3Bucket         string
-	S3Region         string
-	S3AccessKey      Secret
-	S3SecretKey      Secret
-	S3AccessKeyFile  string
-	S3SecretKeyFile  string
-
 	// Pool and timeout values are non-secret, validated runtime controls. The
 	// defaults preserve the previous PostgreSQL settings and make go-redis's
 	// formerly implicit timeout behavior stable across CPU counts.
@@ -139,7 +127,6 @@ type Config struct {
 	AccountDeletionIdentityKeyVersion int16
 
 	LogLevel          string
-	HistoryEnabled    bool
 	ListenAddr        string
 	MetricsListenAddr string
 }
@@ -148,7 +135,7 @@ type Config struct {
 // secret paths as well as secret values, because paths can contain identifying
 // deployment information and are not needed in normal startup diagnostics.
 func (c Config) String() string {
-	return fmt.Sprintf("Config{PublicURL:%q OIDCIssuer:%q OIDCClientID:%q OIDCAllowedParties:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q WindowsOIDCClientID:%q WindowsRegistrationOIDCParties:%q WindowsOIDCRedirectURI:%q WebOIDCClientID:%q WebOIDCStepUpClientID:%q WebOIDCRedirectURI:%q HumanVerificationProvider:%q HumanVerificationSiteKey:%q HumanVerificationSecret:%s OIDCClientSecret:%s KeycloakAdminClientSecret:%s KeycloakAdminClientID:%q KeycloakAdminBaseURL:%q RegistrationRecoveryEnabled:%t AccountDeletionEnabled:%t AccountDeletionIdentityKeyVersion:%d DatabaseURL:%s RedisURL:%s TokenSigningKey:%s S3Endpoint:%q S3PublicEndpoint:%q S3Bucket:%q S3Region:%q S3AccessKey:%s S3SecretKey:%s PostgresMaxConns:%d PostgresMinConns:%d PostgresMaxConnLifetime:%s PostgresMaxConnIdleTime:%s PostgresHealthCheckPeriod:%s PostgresConnectTimeout:%s RedisPoolSize:%d RedisMinIdleConns:%d RedisDialTimeout:%s RedisReadTimeout:%s RedisWriteTimeout:%s RedisPoolTimeout:%s LogLevel:%q HistoryEnabled:%t ListenAddr:%q MetricsListenAddr:%q}",
+	return fmt.Sprintf("Config{PublicURL:%q OIDCIssuer:%q OIDCClientID:%q OIDCAllowedParties:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q WindowsOIDCClientID:%q WindowsRegistrationOIDCParties:%q WindowsOIDCRedirectURI:%q WebOIDCClientID:%q WebOIDCStepUpClientID:%q WebOIDCRedirectURI:%q HumanVerificationProvider:%q HumanVerificationSiteKey:%q HumanVerificationSecret:%s OIDCClientSecret:%s KeycloakAdminClientSecret:%s KeycloakAdminClientID:%q KeycloakAdminBaseURL:%q RegistrationRecoveryEnabled:%t AccountDeletionEnabled:%t AccountDeletionIdentityKeyVersion:%d DatabaseURL:%s RedisURL:%s TokenSigningKey:%s PostgresMaxConns:%d PostgresMinConns:%d PostgresMaxConnLifetime:%s PostgresMaxConnIdleTime:%s PostgresHealthCheckPeriod:%s PostgresConnectTimeout:%s RedisPoolSize:%d RedisMinIdleConns:%d RedisDialTimeout:%s RedisReadTimeout:%s RedisWriteTimeout:%s RedisPoolTimeout:%s LogLevel:%q ListenAddr:%q MetricsListenAddr:%q}",
 		c.PublicURL,
 		c.OIDCIssuer,
 		c.OIDCClientID,
@@ -174,12 +161,6 @@ func (c Config) String() string {
 		c.DatabaseURL,
 		c.RedisURL,
 		c.TokenSigningKey,
-		c.S3Endpoint,
-		c.S3PublicEndpoint,
-		c.S3Bucket,
-		c.S3Region,
-		c.S3AccessKey,
-		c.S3SecretKey,
 		c.PostgresMaxConns,
 		c.PostgresMinConns,
 		c.PostgresMaxConnLifetime,
@@ -193,7 +174,6 @@ func (c Config) String() string {
 		c.RedisWriteTimeout,
 		c.RedisPoolTimeout,
 		c.LogLevel,
-		c.HistoryEnabled,
 		c.ListenAddr,
 		c.MetricsListenAddr,
 	)
@@ -326,13 +306,6 @@ type Input struct {
 	RedisURL                   string
 	TokenSigningKey            string
 
-	S3Endpoint       string
-	S3PublicEndpoint string
-	S3Bucket         string
-	S3Region         string
-	S3AccessKey      string
-	S3SecretKey      string
-
 	PostgresMaxConns                  int32
 	PostgresMinConns                  int32
 	PostgresMaxConnLifetime           time.Duration
@@ -352,7 +325,6 @@ type Input struct {
 	AccountDeletionIdentityKeyVersion int16
 
 	LogLevel          string
-	HistoryEnabled    bool
 	ListenAddr        string
 	MetricsListenAddr string
 }
@@ -387,12 +359,6 @@ func New(input Input) (Config, error) {
 		DatabaseURL:                       Secret(strings.TrimSpace(input.DatabaseURL)),
 		RedisURL:                          Secret(strings.TrimSpace(input.RedisURL)),
 		TokenSigningKey:                   Secret(strings.TrimSpace(input.TokenSigningKey)),
-		S3Endpoint:                        strings.TrimSpace(input.S3Endpoint),
-		S3PublicEndpoint:                  strings.TrimSpace(input.S3PublicEndpoint),
-		S3Bucket:                          strings.TrimSpace(input.S3Bucket),
-		S3Region:                          strings.TrimSpace(input.S3Region),
-		S3AccessKey:                       Secret(strings.TrimSpace(input.S3AccessKey)),
-		S3SecretKey:                       Secret(strings.TrimSpace(input.S3SecretKey)),
 		PostgresMaxConns:                  input.PostgresMaxConns,
 		PostgresMinConns:                  input.PostgresMinConns,
 		PostgresMaxConnLifetime:           input.PostgresMaxConnLifetime,
@@ -406,7 +372,6 @@ func New(input Input) (Config, error) {
 		RedisWriteTimeout:                 input.RedisWriteTimeout,
 		RedisPoolTimeout:                  input.RedisPoolTimeout,
 		LogLevel:                          input.LogLevel,
-		HistoryEnabled:                    input.HistoryEnabled,
 		ListenAddr:                        input.ListenAddr,
 		MetricsListenAddr:                 input.MetricsListenAddr,
 	})
@@ -551,10 +516,6 @@ func LoadSource(source Source) (Config, error) {
 	keycloakAdminClientID := lookupOptional("TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID", defaultKeycloakAdminClientID)
 	keycloakAdminBaseURL := lookupOptional("TERMLINK_KEYCLOAK_ADMIN_BASE_URL", "")
 	logLevel := lookupOptional("TERMLINK_LOG_LEVEL", defaultLogLevel)
-	historyEnabled, err := parseBool("TERMLINK_HISTORY_ENABLED", lookupOptional("TERMLINK_HISTORY_ENABLED", "false"))
-	if err != nil {
-		return Config{}, err
-	}
 	listenAddr := lookupOptional("TERMLINK_LISTEN_ADDR", defaultListenAddr)
 	metricsListenAddr := lookupOptional("TERMLINK_METRICS_LISTEN_ADDR", "")
 	postgresMaxConns, err := parseIntRange("TERMLINK_POSTGRES_MAX_CONNS", lookupOptional("TERMLINK_POSTGRES_MAX_CONNS", strconv.Itoa(int(defaultPostgresMaxConns))), 1, 1000)
@@ -644,25 +605,6 @@ func LoadSource(source Source) (Config, error) {
 		}
 	}
 
-	s3Endpoint := lookupOptional("TERMLINK_S3_ENDPOINT", "")
-	s3PublicEndpoint := lookupOptional("TERMLINK_S3_PUBLIC_ENDPOINT", s3Endpoint)
-	s3Bucket := lookupOptional("TERMLINK_S3_BUCKET", "termlink-history")
-	s3Region := lookupOptional("TERMLINK_S3_REGION", "us-east-1")
-	var s3AccessKey, s3SecretKey Secret
-	if historyEnabled {
-		if s3Endpoint == "" {
-			return Config{}, fmt.Errorf("%w: TERMLINK_S3_ENDPOINT", ErrMissing)
-		}
-		s3AccessKey, err = readSecret(source, "TERMLINK_S3_ACCESS_KEY_FILE")
-		if err != nil {
-			return Config{}, err
-		}
-		s3SecretKey, err = readSecret(source, "TERMLINK_S3_SECRET_KEY_FILE")
-		if err != nil {
-			return Config{}, err
-		}
-	}
-
 	return validate(Config{
 		PublicURL:                         publicURL,
 		OIDCIssuer:                        oidcIssuer,
@@ -697,14 +639,6 @@ func LoadSource(source Source) (Config, error) {
 		DatabaseURLFile:                   envPath(source, "TERMLINK_DATABASE_URL_FILE"),
 		RedisURLFile:                      envPath(source, "TERMLINK_REDIS_URL_FILE"),
 		TokenSigningKeyFile:               envPath(source, "TERMLINK_TOKEN_SIGNING_KEY_FILE"),
-		S3Endpoint:                        s3Endpoint,
-		S3PublicEndpoint:                  s3PublicEndpoint,
-		S3Bucket:                          s3Bucket,
-		S3Region:                          s3Region,
-		S3AccessKey:                       s3AccessKey,
-		S3SecretKey:                       s3SecretKey,
-		S3AccessKeyFile:                   envPath(source, "TERMLINK_S3_ACCESS_KEY_FILE"),
-		S3SecretKeyFile:                   envPath(source, "TERMLINK_S3_SECRET_KEY_FILE"),
 		PostgresMaxConns:                  int32(postgresMaxConns),
 		PostgresMinConns:                  int32(postgresMinConns),
 		PostgresMaxConnLifetime:           postgresMaxConnLifetime,
@@ -718,7 +652,6 @@ func LoadSource(source Source) (Config, error) {
 		RedisWriteTimeout:                 redisWriteTimeout,
 		RedisPoolTimeout:                  redisPoolTimeout,
 		LogLevel:                          logLevel,
-		HistoryEnabled:                    historyEnabled,
 		ListenAddr:                        listenAddr,
 		MetricsListenAddr:                 metricsListenAddr,
 	})
@@ -786,15 +719,6 @@ func parseDurationRange(name, value string, minimum, maximum time.Duration) (tim
 }
 
 func validate(c Config) (Config, error) {
-	if strings.TrimSpace(c.S3Bucket) == "" {
-		c.S3Bucket = "termlink-history"
-	}
-	if strings.TrimSpace(c.S3Region) == "" {
-		c.S3Region = "us-east-1"
-	}
-	if strings.TrimSpace(c.S3PublicEndpoint) == "" {
-		c.S3PublicEndpoint = strings.TrimSpace(c.S3Endpoint)
-	}
 	if err := validateHTTPSURL("TERMLINK_PUBLIC_URL", c.PublicURL); err != nil {
 		return Config{}, err
 	}
@@ -915,9 +839,6 @@ func validate(c Config) (Config, error) {
 		c.AccountDeletionIdentityKeyVersion = 1
 	}
 	if c.AccountDeletionEnabled {
-		if !c.HistoryEnabled {
-			return Config{}, fmt.Errorf("%w: TERMLINK_ACCOUNT_DELETION_ENABLED requires TERMLINK_HISTORY_ENABLED", ErrInvalid)
-		}
 		if c.AccountDeletionIdentityKeyVersion < 1 {
 			return Config{}, fmt.Errorf("%w: TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION", ErrInvalid)
 		}
@@ -957,30 +878,6 @@ func validate(c Config) (Config, error) {
 	}
 	if len(c.TokenSigningKey.Value()) < 32 {
 		return Config{}, fmt.Errorf("%w: TERMLINK_TOKEN_SIGNING_KEY_FILE", ErrSecret)
-	}
-	if c.S3Endpoint != "" {
-		if err := validateS3Endpoint("TERMLINK_S3_ENDPOINT", c.S3Endpoint); err != nil {
-			return Config{}, err
-		}
-	}
-	if c.S3PublicEndpoint != "" {
-		if err := validateS3Endpoint("TERMLINK_S3_PUBLIC_ENDPOINT", c.S3PublicEndpoint); err != nil {
-			return Config{}, err
-		}
-	}
-	if c.HistoryEnabled {
-		if c.S3Endpoint == "" {
-			return Config{}, fmt.Errorf("%w: TERMLINK_S3_ENDPOINT", ErrMissing)
-		}
-		if c.S3AccessKey.Empty() {
-			return Config{}, fmt.Errorf("%w: TERMLINK_S3_ACCESS_KEY_FILE", ErrSecret)
-		}
-		if c.S3SecretKey.Empty() {
-			return Config{}, fmt.Errorf("%w: TERMLINK_S3_SECRET_KEY_FILE", ErrSecret)
-		}
-		if !validBucketName(c.S3Bucket) {
-			return Config{}, fmt.Errorf("%w: TERMLINK_S3_BUCKET", ErrInvalid)
-		}
 	}
 	postgresPoolUnspecified := c.PostgresMaxConns == 0 && c.PostgresMinConns == 0 &&
 		c.PostgresMaxConnLifetime == 0 && c.PostgresMaxConnIdleTime == 0 &&
@@ -1119,18 +1016,6 @@ func validateListenAddr(name, value string) error {
 	return nil
 }
 
-func validBucketName(value string) bool {
-	if len(value) < 3 || len(value) > 63 || value[0] == '.' || value[len(value)-1] == '.' || value[0] == '-' || value[len(value)-1] == '-' {
-		return false
-	}
-	for _, character := range value {
-		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '.' && character != '-' {
-			return false
-		}
-	}
-	return !strings.Contains(value, "..")
-}
-
 func validateURL(name, value string) error {
 	parsed, err := url.Parse(strings.TrimSpace(value))
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil {
@@ -1150,18 +1035,6 @@ func validateHTTPSURL(name, value string) error {
 	}
 	parsed, _ := url.Parse(strings.TrimSpace(value))
 	if !strings.EqualFold(parsed.Scheme, "https") {
-		return fmt.Errorf("%w: %s", ErrInvalid, name)
-	}
-	return nil
-}
-
-func validateS3Endpoint(name, value string) error {
-	if err := validateURL(name, value); err != nil {
-		return err
-	}
-	parsed, _ := url.Parse(strings.TrimSpace(value))
-	if (parsed.Path != "" && parsed.Path != "/") || parsed.RawPath != "" ||
-		parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("%w: %s", ErrInvalid, name)
 	}
 	return nil

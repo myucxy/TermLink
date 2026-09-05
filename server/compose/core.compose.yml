@@ -23,8 +23,8 @@ services:
       - public
       - frontend
     volumes:
-      # Core serves only the application. The history overlay replaces this
-      # target with the object-aware Caddyfile and adds the isolated network.
+      # Core serves only the application; external OIDC deployments may
+      # replace this target with the provider-managed overlay.
       - ./external-services.Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
@@ -90,7 +90,6 @@ services:
       TERMLINK_REDIS_WRITE_TIMEOUT: ${TERMLINK_REDIS_WRITE_TIMEOUT:-3s}
       TERMLINK_REDIS_POOL_TIMEOUT: ${TERMLINK_REDIS_POOL_TIMEOUT:-4s}
       TERMLINK_LOG_LEVEL: ${TERMLINK_LOG_LEVEL:-info}
-      TERMLINK_HISTORY_ENABLED: "false"
       TERMLINK_LISTEN_ADDR: :8080
     secrets: &server-secrets
       - source: oidc_client_secret
@@ -275,6 +274,6 @@ networks:
     internal: true
   backend:
     internal: true
-  # Only the application needs outbound access for external OIDC and S3
-  # providers.  It is deliberately separate from both frontend and backend.
+  # Only the application needs outbound access for external OIDC providers.
+  # It is deliberately separate from both frontend and backend.
   egress:

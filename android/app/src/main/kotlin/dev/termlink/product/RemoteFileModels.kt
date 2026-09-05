@@ -53,10 +53,10 @@ internal data class RemoteFileOperationResponse(
     val status: String,
     val result: JsonObject?,
     val error: String?,
-    val download: JsonObject?,
+    val transfer: JsonObject?,
 )
 
-/** Parses the shared create/get/delete envelope; DOWNLOAD metadata remains top-level. */
+/** Parses the shared create/get/delete envelope; realtime transfer metadata remains top-level. */
 internal fun remoteFileOperationResponseFromJson(root: JsonObject): RemoteFileOperationResponse {
     fun JsonObject.requiredString(name: String): String = getValue(name).jsonPrimitive.content
     val operation = root.getValue("file_operation").jsonObject
@@ -69,8 +69,30 @@ internal fun remoteFileOperationResponseFromJson(root: JsonObject): RemoteFileOp
         status = status,
         result = operation["result"]?.takeUnless { it is JsonNull }?.jsonObject,
         error = operation["error"]?.jsonPrimitive?.contentOrNull?.take(1024),
-        download = root["download"]?.takeUnless { it is JsonNull }?.jsonObject,
+        transfer = root["transfer"]?.takeUnless { it is JsonNull }?.jsonObject,
     )
+}
+
+internal fun realtimeFileTransferDescriptorFromJson(
+    transfer: JsonObject,
+    expectedTransferId: UUID,
+    expectedDirectoryZip: Boolean,
+): RealtimeFileTransferDescriptor {
+    require(transfer.getValue("protocol").jsonPrimitive.content == "REALTIME_V2") {
+        "The server returned an unsupported file-transfer protocol"
+    }
+    val transferId = UUID.fromString(transfer.getValue("transfer_id").jsonPrimitive.content)
+    val filename = transfer.getValue("filename").jsonPrimitive.content
+    val sizeBytes = transfer.getValue("size_bytes").jsonPrimitive.long
+    val sha256 = Base64.getUrlDecoder().decode(transfer.getValue("sha256").jsonPrimitive.content)
+    val directoryZip = transfer.getValue("directory_zip").jsonPrimitive.boolean
+    require(transferId == expectedTransferId && filename.isNotBlank() &&
+        filename.encodeToByteArray().size <= 255 &&
+        filename.none { it == '/' || it == '\\' || it == '\u0000' || it == '\r' || it == '\n' } &&
+        sizeBytes in 0..MAX_REMOTE_FILE_TRANSFER_BYTES && sha256.size == 32 &&
+        directoryZip == expectedDirectoryZip
+    ) { "The server returned invalid file-transfer metadata" }
+    return RealtimeFileTransferDescriptor(transferId, filename, sizeBytes, sha256, directoryZip)
 }
 
 private val REMOTE_FILE_OPERATION_STATUSES = setOf(
@@ -281,6 +303,7 @@ internal fun remoteDownloadSelection(
 
 enum class RemoteDownloadStatus {
     PREPARING,
+    RESUMING,
     DOWNLOADING,
     VERIFYING,
     COMPLETED,
@@ -288,7 +311,7 @@ enum class RemoteDownloadStatus {
     CANCELLED;
 
     val isActive: Boolean
-        get() = this == PREPARING || this == DOWNLOADING || this == VERIFYING
+        get() = this == PREPARING || this == RESUMING || this == DOWNLOADING || this == VERIFYING
 
     val isTerminal: Boolean
         get() = !isActive
@@ -317,9 +340,9 @@ internal fun restoreRemoteDownloadRecords(
 ): List<RemoteDownloadRecord> = records.map { record ->
     if (record.status.isActive) {
         record.copy(
-            status = RemoteDownloadStatus.FAILED,
+            status = RemoteDownloadStatus.RESUMING,
             updatedAt = now,
-            error = "The download was interrupted when the Android app restarted",
+            error = null,
         )
     } else {
         record

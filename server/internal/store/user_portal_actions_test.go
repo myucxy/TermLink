@@ -25,7 +25,6 @@ func TestUserPortalActionDTOsAreMinimal(t *testing.T) {
 	t.Parallel()
 	assertUserPortalActionFields(t, UserPortalActionResult{}, "Changed")
 	assertUserPortalActionFields(t, UserPortalPCControlPolicy{}, "PCID", "Name", "RemoteRoutingEnabled", "Mode", "LocalPriority", "PolicyVersion")
-	assertUserPortalActionFields(t, UserPortalDataExport{}, "ID", "Status", "RequestedAt", "ExpiresAt")
 	assertUserPortalActionFields(t, UserPortalAccountDeletionPreflight{},
 		"AccountID", "Status", "ActiveDevices", "LiveSessions", "Ready", "RequestSupported")
 }
@@ -46,7 +45,6 @@ func TestUserPortalActionSQLIsAccountScoped(t *testing.T) {
 		"policy list":      {userPortalPCPoliciesSQL, "owner_user_id=$1"},
 		"policy lookup":    {userPortalPCLookupSQL, "owner_user_id=$2"},
 		"policy update":    {userPortalPCPolicyUpdateSQL, "owner_user_id=$2"},
-		"history lookup":   {userPortalHistorySessionLookupSQL, "owner_user_id=$2"},
 		"delete preflight": {userPortalAccountDeletionPreflightSQL, "account.id=$1"},
 	} {
 		contract := contract
@@ -86,7 +84,6 @@ func TestUserPortalActionsAuditAndOutboxAreTransactionalContracts(t *testing.T) 
 	assertUserPortalActionContains(t, userPortalDeviceRevokedOutboxSQL, "device.revoked", "user_id", "device_id")
 	assertUserPortalActionContains(t, userPortalPCPolicyAuditSQL, "user_portal.pc.remote_routing.update", "user_id", "target_id")
 	assertUserPortalActionContains(t, userPortalPCPolicyOutboxSQL, "grant.updated", "pc_id", "remote_routing_enabled")
-	assertUserPortalActionContains(t, userPortalHistoryDeleteAuditSQL, "user_portal.history.delete", "user_id", "target_id")
 }
 
 func TestUserPortalActionSQLDoesNotReadSensitiveData(t *testing.T) {
@@ -94,8 +91,7 @@ func TestUserPortalActionSQLDoesNotReadSensitiveData(t *testing.T) {
 	queries := []string{
 		userPortalActionAccountSQL, userPortalActionIdempotencyReadSQL,
 		userPortalRevokeDeviceLookupSQL, userPortalPCPoliciesSQL,
-		userPortalPCLookupSQL, userPortalHistorySessionLookupSQL,
-		userPortalHistoryExistsSQL, userPortalAccountDeletionPreflightSQL,
+		userPortalPCLookupSQL, userPortalAccountDeletionPreflightSQL,
 	}
 	for _, query := range queries {
 		query = strings.ToLower(query)
@@ -117,7 +113,7 @@ func TestUnsupportedUserPortalActionsRequireMigrations(t *testing.T) {
 	if !errors.Is(wrapped, ErrUserPortalActionUnsupported) {
 		t.Fatal("unsupported sentinel is not usable with errors.Is")
 	}
-	for _, required := range []string{"data_export_requests", "account_deletion_requests", "per-PC"} {
+	for _, required := range []string{"account_deletion_requests", "per-PC"} {
 		if !strings.Contains(UserPortalActionMigrationGuidance, required) {
 			t.Fatalf("migration guidance lacks %q", required)
 		}

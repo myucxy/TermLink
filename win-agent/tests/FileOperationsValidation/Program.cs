@@ -216,6 +216,61 @@ static async Task ValidateArchiveAndHashAsync(string testRoot)
     }
     Require(!File.Exists(zipPath), "temporary ZIP was not removed after disposal");
 
+    var resumableTransferId = Guid.NewGuid();
+    string resumableZipPath;
+    byte[] resumableHash;
+    await using (var first = await preparer.PrepareAsync(source, resumableTransferId, CancellationToken.None))
+    {
+        resumableZipPath = ((FileStream)first.OpenRead()).Name;
+        resumableHash = first.Sha256.ToArray();
+    }
+    Require(File.Exists(resumableZipPath) &&
+        string.Equals(
+            Path.GetDirectoryName(resumableZipPath),
+            preparer.TransferDirectory(resumableTransferId),
+            StringComparison.OrdinalIgnoreCase),
+        "resumable directory ZIP escaped its transfer cache directory");
+    await using (var resumed = await preparer.PrepareAsync(source, resumableTransferId, CancellationToken.None))
+    {
+        var resumedPath = ((FileStream)resumed.OpenRead()).Name;
+        Require(string.Equals(resumedPath, resumableZipPath, StringComparison.OrdinalIgnoreCase) &&
+            resumed.Sha256.SequenceEqual(resumableHash),
+            "Agent restart did not reuse the stable resumable directory ZIP");
+    }
+    Require(File.Exists(resumableZipPath), "resumable ZIP was deleted before transfer finalization");
+    preparer.Cleanup(resumableTransferId);
+    Require(!Directory.Exists(preparer.TransferDirectory(resumableTransferId)),
+        "successful or cancelled transfer cache cleanup left its task directory behind");
+    var unsafeTransferId = Guid.NewGuid();
+    var unsafeDirectory = preparer.TransferDirectory(unsafeTransferId);
+    Directory.CreateDirectory(unsafeDirectory);
+    var unexpectedCacheEntry = Path.Combine(unsafeDirectory, "unowned.data");
+    File.WriteAllText(unexpectedCacheEntry, "keep", Encoding.UTF8);
+    try
+    {
+        preparer.Cleanup(unsafeTransferId);
+        throw new InvalidOperationException("unsafe transfer-cache cleanup was accepted");
+    }
+    catch (InvalidOperationException error) when (
+        error.Message.Contains("unexpected or unsafe", StringComparison.Ordinal))
+    {
+    }
+    Require(File.Exists(unexpectedCacheEntry),
+        "transfer-cache cleanup deleted an unexpected entry");
+    File.Delete(unexpectedCacheEntry);
+    preparer.Cleanup(unsafeTransferId);
+    var expiredTransferId = Guid.NewGuid();
+    var expiredDirectory = preparer.TransferDirectory(expiredTransferId);
+    Directory.CreateDirectory(expiredDirectory);
+    var expiredPayload = Path.Combine(expiredDirectory, "payload.zip");
+    File.WriteAllBytes(expiredPayload, new byte[] { 1, 2, 3 });
+    var oldWrite = DateTime.UtcNow.Subtract(FileTransferPreparer.OrphanRetention).AddMinutes(-1);
+    File.SetLastWriteTimeUtc(expiredPayload, oldWrite);
+    Directory.SetLastWriteTimeUtc(expiredDirectory, oldWrite);
+    preparer.CleanupExpired(DateTime.UtcNow - FileTransferPreparer.OrphanRetention);
+    Require(!Directory.Exists(expiredDirectory),
+        "expired transfer cache was not reclaimed by bounded startup cleanup");
+
     var oversizedSource = Path.Combine(testRoot, "oversized-archive-source");
     var oversizedArtifacts = Path.Combine(testRoot, "oversized-archive-artifacts");
     Directory.CreateDirectory(oversizedSource);
@@ -259,7 +314,8 @@ static async Task ValidateStreamingWorkerAndCancellationAsync(string testRoot)
         Id = Guid.NewGuid(),
         Operation = "DOWNLOAD",
         Path = file,
-        LeaseToken = "lease"
+        LeaseToken = "lease",
+        RequesterDeviceId = Guid.NewGuid()
     });
     var stub = Path.Combine(testRoot, "stub.exe");
     File.WriteAllBytes(stub, new byte[] { 0x4d, 0x5a });
@@ -297,6 +353,7 @@ static async Task ValidateLeaseCancellationAndRemoteAccessAsync(string testRoot)
         Operation = "DOWNLOAD",
         Path = payload,
         LeaseToken = "cancelled-lease",
+        RequesterDeviceId = Guid.NewGuid(),
         LeaseExpiresAt = DateTimeOffset.UtcNow.AddHours(1)
     }) { LoseLeaseOnRenew = true };
     using (var worker = new ProductionFileOperationWorker(
@@ -322,6 +379,7 @@ static async Task ValidateLeaseCancellationAndRemoteAccessAsync(string testRoot)
         Operation = "DOWNLOAD",
         Path = payload,
         LeaseToken = "remote-policy-lease",
+        RequesterDeviceId = Guid.NewGuid(),
         LeaseExpiresAt = DateTimeOffset.UtcNow.AddHours(1)
     });
     using (var worker = new ProductionFileOperationWorker(
@@ -548,6 +606,7 @@ static async Task ValidateDeterministicServerRejectionsAsync(string testRoot)
     var uploadApi = new ControlledOperationApi(new ClaimedFileOperation
     {
         Id = Guid.NewGuid(), Operation = "DOWNLOAD", Path = payload,
+        RequesterDeviceId = Guid.NewGuid(),
         LeaseToken = "upload-rejection", LeaseExpiresAt = DateTimeOffset.UtcNow.AddHours(1)
     }) { RejectUploadAllocation = true };
     using (var worker = new ProductionFileOperationWorker(
@@ -718,15 +777,16 @@ static void ValidateTerminalLaunch(string testRoot)
 static async Task ValidateApiContractAsync()
 {
     var operationId = Guid.NewGuid();
+    var requesterDeviceId = Guid.NewGuid();
     var requests = new List<(string Path, string Body, string IdempotencyKey)>();
     var responses = new Queue<HttpResponseMessage>(new[]
     {
         JsonResponse("{\"file_operation\":{\"id\":\"" + operationId.ToString("D") +
             "\",\"operation\":\"DOWNLOAD\",\"path\":\"C:\\\\empty.bin\",\"offset\":null," +
-            "\"shell_type\":null},\"lease_token\":\"lease\"}"),
-        JsonResponse("{\"upload\":{\"url\":\"https://upload.invalid/object\",\"method\":\"PUT\"," +
-            "\"headers\":{\"x-object-token\":[\"value\",\"second\"]}," +
-            "\"expires_at\":\"2030-01-01T00:00:00Z\"}}"),
+            "\"shell_type\":null,\"requester_device_id\":\"" + requesterDeviceId.ToString("D") +
+            "\"},\"lease_token\":\"lease\"}"),
+        JsonResponse("{\"transfer\":{\"protocol\":\"REALTIME_V2\",\"transfer_id\":\"" +
+            operationId.ToString("D") + "\",\"requester_device_id\":\"" + requesterDeviceId.ToString("D") + "\"}}"),
         JsonResponse("{\"file_operation\":{\"lease_expires_at\":\"2030-01-01T01:00:00Z\"}}"),
         JsonResponse("{}"),
         JsonResponse("{}"),
@@ -748,18 +808,21 @@ static async Task ValidateApiContractAsync()
     }
 
     using var uploadHttp = new HttpClient(new ContractHandler());
-    var api = new ProductionFileOperationApi(Guid.NewGuid(), uploadHttp, Send);
+    var transferSender = new RecordingFileTransferSender();
+    var api = new ProductionFileOperationApi(Guid.NewGuid(), uploadHttp, Send, transferSender);
     var claimed = await api.ClaimAsync(CancellationToken.None);
     Require(claimed.Id == operationId && claimed.Operation == "DOWNLOAD" && claimed.LeaseToken == "lease",
         "claim did not combine file_operation with the top-level lease_token");
     await using var emptyArtifact = new FileTransferArtifact(
         "empty.bin", false, 0, SHA256.HashData(Array.Empty<byte>()), new MemoryStream(), null);
     var upload = await api.CreateUploadAsync(claimed, emptyArtifact, CancellationToken.None);
-    Require(upload.Method == HttpMethod.Put &&
-        upload.Headers["x-object-token"].SequenceEqual(new[] { "value", "second" }),
-        "upload did not parse the nested multi-value header contract");
+    Require(upload.TransferId == operationId && upload.RequesterDeviceId == requesterDeviceId &&
+        upload.Protocol == "REALTIME_V2",
+        "upload did not parse the realtime transfer contract");
     using (var uploadContent = new MemoryStream())
         await api.UploadAsync(upload, uploadContent, 0, CancellationToken.None);
+    Require(transferSender.Calls == 1 && transferSender.Bytes.Length == 0,
+        "realtime transfer sender was not invoked exactly once");
     Require(await api.RenewAsync(claimed, CancellationToken.None) ==
         DateTimeOffset.Parse("2030-01-01T01:00:00Z"),
         "renew did not parse the revised lease expiry");
@@ -783,7 +846,8 @@ static async Task ValidateApiContractAsync()
         Id = Guid.NewGuid(),
         Operation = "DOWNLOAD",
         Path = @"C:\missing.bin",
-        LeaseToken = "failure-lease"
+        LeaseToken = "failure-lease",
+        RequesterDeviceId = Guid.NewGuid()
     };
     await api.FailAsync(failedOperation, "PATH_NOT_FOUND", "The requested path does not exist.", CancellationToken.None);
     await api.CompleteAsync(claimed, null, CancellationToken.None);
@@ -1180,9 +1244,13 @@ sealed class ControlledOperationApi : IFileOperationApi
             throw new FileOperationRemoteException("HTTP 400", false);
         return Task.FromResult(new FileOperationUploadTarget
         {
-            Url = new Uri("https://upload.invalid/object"),
-            Method = HttpMethod.Put,
-            Headers = new Dictionary<string, IReadOnlyList<string>>()
+            TransferId = operation.Id,
+            RequesterDeviceId = operation.RequesterDeviceId,
+            Protocol = "REALTIME_V2",
+            Filename = artifact.Filename,
+            DirectoryZip = artifact.DirectoryZip,
+            SizeBytes = artifact.SizeBytes,
+            Sha256 = artifact.Sha256.ToArray()
         });
     }
 
@@ -1359,9 +1427,13 @@ sealed class RecordingApi : IFileOperationApi
         FileTransferArtifact artifact,
         CancellationToken token) => Task.FromResult(new FileOperationUploadTarget
     {
-        Url = new Uri("https://upload.invalid/object"),
-        Method = HttpMethod.Put,
-        Headers = new Dictionary<string, IReadOnlyList<string>>()
+        TransferId = operation.Id,
+        RequesterDeviceId = operation.RequesterDeviceId,
+        Protocol = "REALTIME_V2",
+        Filename = artifact.Filename,
+        DirectoryZip = artifact.DirectoryZip,
+        SizeBytes = artifact.SizeBytes,
+        Sha256 = artifact.Sha256.ToArray()
     });
 
     public Task<DateTimeOffset?> RenewAsync(ClaimedFileOperation operation, CancellationToken token) =>
@@ -1397,6 +1469,23 @@ sealed class RecordingApi : IFileOperationApi
         string errorCode,
         string errorMessage,
         CancellationToken token) => throw new InvalidOperationException(errorCode + ": " + errorMessage);
+}
+
+sealed class RecordingFileTransferSender : IFileTransferSender
+{
+    internal int Calls { get; private set; }
+    internal byte[] Bytes { get; private set; } = Array.Empty<byte>();
+
+    public async Task SendAsync(
+        FileOperationUploadTarget target,
+        Stream content,
+        CancellationToken token)
+    {
+        Calls++;
+        using var output = new MemoryStream();
+        await content.CopyToAsync(output, token);
+        Bytes = output.ToArray();
+    }
 }
 
 sealed class ContractHandler : HttpMessageHandler

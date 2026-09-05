@@ -2,6 +2,7 @@ package dev.termlink.product
 
 import dev.termlink.model.DeviceTrustState
 import dev.termlink.model.SessionState
+import dev.termlink.model.SessionSummary
 import dev.termlink.network.production.AccessTokenProvider
 import dev.termlink.network.production.TermLinkApiException
 import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
@@ -11,6 +12,7 @@ import dev.termlink.session.RemoteSessionEvent
 import dev.termlink.session.RemoteSessionState
 import java.io.IOException
 import java.net.URI
+import java.time.Instant
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
@@ -97,6 +99,21 @@ class ProductContractsTest {
         assertFalse(snapshotSuffixRestoreIsBounded(9_000uL, 10_001uL, 10_000uL))
         assertTrue(fullPrefixReplayCanPreserveDurableAcknowledgement(0uL))
         assertFalse(fullPrefixReplayCanPreserveDurableAcknowledgement(1uL))
+    }
+
+    @Test
+    fun durableNonOutputEventExtendsTheHostHistoryRestoreTarget() {
+        assertEquals(46uL, restorableSessionEventTail(45uL, 46uL))
+        assertEquals(46uL, restorableSessionEventTail(46uL, 45uL))
+    }
+
+    @Test
+    fun authoritativeTailLookupIncludesEndedSessions() {
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        assertEquals(
+            "/v1/pcs/$pcId/sessions?include_ended=true",
+            authoritativeSessionCatalogPath(pcId),
+        )
     }
 
     @Test
@@ -944,6 +961,36 @@ class ProductContractsTest {
                     expiresAtEpochMillis = Long.MAX_VALUE,
                 ),
             ).isEmpty(),
+        )
+    }
+
+    @Test
+    fun readOnlyCleanupDoesNotPruneAnInFlightLiveBootstrap() {
+        val bootstrappingSession = UUID.randomUUID()
+        val installedReadOnlySession = UUID.randomUUID()
+        val installedLiveSession = UUID.randomUUID()
+
+        assertEquals(
+            setOf(bootstrappingSession, installedReadOnlySession, installedLiveSession),
+            retainedRuntimeMetadataSessionIds(
+                authoritativeSessions = listOf(
+                    SessionSummary(
+                        id = bootstrappingSession,
+                        pcId = UUID.randomUUID(),
+                        shellType = "powershell-7",
+                        encryptedTitle = null,
+                        state = SessionState.RUNNING,
+                        columns = 120,
+                        rows = 30,
+                        lastOutputSequence = 76uL,
+                        online = true,
+                        createdAt = Instant.EPOCH,
+                        endedAt = null,
+                    ),
+                ),
+                readOnlySessionIds = setOf(installedReadOnlySession),
+                liveSessionIds = setOf(installedLiveSession),
+            ),
         )
     }
 

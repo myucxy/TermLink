@@ -55,6 +55,34 @@ class SessionCryptoTest {
     }
 
     @Test
+    fun matchesCrossPlatformFileTransferKeyVector() {
+        val pairwise = hex("b1632a5a77cafec55f885fc4c3588f303ed3ca9856d5c464636e0b5feaefa773")
+        val transferId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val keyId = "file-transfer-v2:fedcba9876543210ffffeeeeeeeeeeee:7".encodeToByteArray()
+
+        assertArrayEquals(
+            hex("a027c91929064e4c12fad593690da8a112b3e2d97f002be8cccc615e75276daf"),
+            SessionCrypto.deriveFileTransferKey(
+                pairwise,
+                transferId,
+                CryptoDirection.PC_TO_ANDROID,
+                7,
+                keyId,
+            ),
+        )
+        assertArrayEquals(
+            hex("f0c24247c4825d9366b8ef3f173d20f702fcf70e4974ebefbb35ee3ed5d9ed6e"),
+            SessionCrypto.deriveFileTransferKey(
+                pairwise,
+                transferId,
+                CryptoDirection.ANDROID_TO_PC,
+                7,
+                keyId,
+            ),
+        )
+    }
+
+    @Test
     fun opensCrossPlatformBoundedHistoryVector() {
         val pcPublic = hex("8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f")
         val androidPrivate = hex("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f")

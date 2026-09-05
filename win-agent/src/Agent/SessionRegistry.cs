@@ -99,6 +99,7 @@ namespace TermLink.Agent
         private readonly string bufferRoot;
         private readonly long maximumBufferBytes;
         private readonly Action<ManagedShellType, LocalFrame> committedFrame;
+        private readonly Action<Guid> explicitlyClosed;
         private int recoveredSessionCount;
         private bool remoteAccessEnabled = true;
         private bool preserveRegistrationsOnShutdown;
@@ -109,7 +110,8 @@ namespace TermLink.Agent
             int disconnectedTimeoutMilliseconds,
             long maximumBufferBytes,
             int maximumSessions,
-            Action<ManagedShellType, LocalFrame> committedFrame = null)
+            Action<ManagedShellType, LocalFrame> committedFrame = null,
+            Action<Guid> explicitlyClosed = null)
         {
             if (string.IsNullOrWhiteSpace(bufferRoot)) throw new ArgumentException("buffer root is required", "bufferRoot");
             if (disconnectedTimeoutMilliseconds < 250 || disconnectedTimeoutMilliseconds > 300000)
@@ -127,6 +129,7 @@ namespace TermLink.Agent
             this.bufferRoot = resolvedBufferRoot;
             this.maximumBufferBytes = maximumBufferBytes;
             this.committedFrame = committedFrame;
+            this.explicitlyClosed = explicitlyClosed;
             Directory.CreateDirectory(resolvedBufferRoot);
             sessionFactory = new ManagedSessionFactory(
                 resolvedBufferRoot,
@@ -634,6 +637,7 @@ namespace TermLink.Agent
             }
             BeginStop(managed, true);
             var completed = managed.WaitForStop();
+            if (explicitlyClosed != null) explicitlyClosed(sessionId);
             if (completed)
             {
                 lock (sync) retiring.Remove(managed);
@@ -648,6 +652,11 @@ namespace TermLink.Agent
         }
 
         public bool TerminateSession(Guid sessionId)
+        {
+            return TerminateSession(sessionId, false);
+        }
+
+        internal bool TerminateSession(Guid sessionId, bool explicitUserClose)
         {
             if (sessionId == Guid.Empty) return false;
             IRegistryManagedSession managed;
@@ -701,6 +710,8 @@ namespace TermLink.Agent
                     process.Kill();
 #endif
                     terminated = process.WaitForExit(5000);
+                    if (terminated && explicitUserClose && explicitlyClosed != null)
+                        explicitlyClosed(sessionId);
                     return terminated;
                 }
             }
@@ -1381,7 +1392,8 @@ namespace TermLink.Agent
                     options.DisconnectedTimeoutMilliseconds,
                     options.MaximumBufferBytes,
                     options.MaximumSessions,
-                    ForwardCommittedFrame);
+                    ForwardCommittedFrame,
+                    sessionId => CurrentProductionRuntime()?.DestroySessionHistory(sessionId));
                 if (runtime != null)
                 {
                     runtime.Attach(registry);

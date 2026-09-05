@@ -23,9 +23,6 @@ type userPortalActionStore interface {
 	ListUserPortalPCControlPolicies(context.Context, uuid.UUID, int) ([]store.UserPortalPCControlPolicy, error)
 	SetUserPortalPCRemoteRouting(context.Context, uuid.UUID, uuid.UUID, bool, string, string) (store.UserPortalPCControlPolicy, error)
 	SetUserPortalPCControlPolicy(context.Context, uuid.UUID, uuid.UUID, store.UserPortalPCControlPolicyInput, string, string) (store.UserPortalPCControlPolicy, error)
-	RequestUserPortalHistoryDeletion(context.Context, uuid.UUID, uuid.UUID, string, string) (store.UserPortalActionResult, error)
-	RequestUserPortalDataExport(context.Context, uuid.UUID, string, string) (store.UserPortalDataExport, error)
-	GetUserPortalDataExport(context.Context, uuid.UUID, uuid.UUID) (store.UserPortalDataExport, error)
 	GetUserPortalAccountDeletionPreflight(context.Context, uuid.UUID) (store.UserPortalAccountDeletionPreflight, error)
 	RequestUserPortalAccountDeletionState(context.Context, uuid.UUID, string, string) (store.UserPortalAccountDeletion, error)
 	GetUserPortalAccountDeletion(context.Context, uuid.UUID, uuid.UUID) (store.UserPortalAccountDeletion, error)
@@ -64,18 +61,6 @@ func (a *API) setUserPortalPCRemoteRouting(w http.ResponseWriter, r *http.Reques
 
 func (a *API) setUserPortalPCControlPolicy(w http.ResponseWriter, r *http.Request) {
 	a.userPortalActions().setPCControlPolicy(w, r)
-}
-
-func (a *API) requestUserPortalHistoryDeletion(w http.ResponseWriter, r *http.Request) {
-	a.userPortalActions().requestHistoryDeletion(w, r)
-}
-
-func (a *API) requestUserPortalDataExport(w http.ResponseWriter, r *http.Request) {
-	a.userPortalActions().requestDataExport(w, r)
-}
-
-func (a *API) getUserPortalDataExport(w http.ResponseWriter, r *http.Request) {
-	a.userPortalActions().getDataExport(w, r)
 }
 
 func (a *API) getUserPortalAccountDeletionPreflight(w http.ResponseWriter, r *http.Request) {
@@ -226,65 +211,6 @@ func (h userPortalActionHandlers) setPCControlPolicy(w http.ResponseWriter, r *h
 	}
 	h.api.auditOperationSuccess(r, accountID, "user_portal.pc.control_policy.update.context", "pc", pcID)
 	writeJSON(w, http.StatusOK, map[string]any{"policy": userPortalPCControlPolicyView(policy)})
-}
-
-func (h userPortalActionHandlers) requestHistoryDeletion(w http.ResponseWriter, r *http.Request) {
-	accountID, key, ok := h.sensitiveActor(w, r)
-	if !ok {
-		return
-	}
-	sessionID, ok := userPortalPathUUID(w, r, "sessionId", "INVALID_SESSION_ID")
-	if !ok || !decodeEmptyUserPortalRequest(w, r) {
-		return
-	}
-	result, err := h.repository.RequestUserPortalHistoryDeletion(r.Context(), accountID, sessionID, key, traceID(r.Context()))
-	if err != nil {
-		writeUserPortalError(w, r, err)
-		return
-	}
-	h.api.auditOperationSuccess(r, accountID, "user_portal.history.delete.context", "session", sessionID)
-	writeJSON(w, http.StatusOK, map[string]any{"changed": result.Changed})
-}
-
-func (h userPortalActionHandlers) requestDataExport(w http.ResponseWriter, r *http.Request) {
-	accountID, key, ok := h.sensitiveActor(w, r)
-	if !ok {
-		return
-	}
-	// Never create a durable REQUESTED row unless this process can also serve
-	// the resulting encrypted artifact. Otherwise a partial deployment would
-	// leave the account with an export request that can never be downloaded.
-	if h.api.DataExportDownloader == nil {
-		writeError(w, r, http.StatusServiceUnavailable, "DATA_EXPORT_UNAVAILABLE", errors.New("data export service is unavailable"))
-		return
-	}
-	if !decodeEmptyUserPortalRequest(w, r) {
-		return
-	}
-	export, err := h.repository.RequestUserPortalDataExport(r.Context(), accountID, key, traceID(r.Context()))
-	if err != nil {
-		writeUserPortalError(w, r, err)
-		return
-	}
-	h.api.auditOperationSuccess(r, accountID, "user_portal.data_export.request.context", "data_export", export.ID)
-	writeJSON(w, http.StatusAccepted, map[string]any{"export": userPortalDataExportView(export)})
-}
-
-func (h userPortalActionHandlers) getDataExport(w http.ResponseWriter, r *http.Request) {
-	accountID, ok := h.actor(w, r)
-	if !ok {
-		return
-	}
-	exportID, ok := userPortalPathUUID(w, r, "exportId", "INVALID_EXPORT_ID")
-	if !ok {
-		return
-	}
-	export, err := h.repository.GetUserPortalDataExport(r.Context(), accountID, exportID)
-	if err != nil {
-		writeUserPortalError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"export": userPortalDataExportView(export)})
 }
 
 func (h userPortalActionHandlers) getAccountDeletionPreflight(w http.ResponseWriter, r *http.Request) {
@@ -444,16 +370,6 @@ func userPortalPCControlPolicyView(policy store.UserPortalPCControlPolicy) map[s
 		"mode":                   policy.Mode, "local_priority": policy.LocalPriority,
 		"policy_version": policy.PolicyVersion,
 	}
-}
-
-func userPortalDataExportView(export store.UserPortalDataExport) map[string]any {
-	view := map[string]any{
-		"id": export.ID, "status": export.Status, "requested_at": export.RequestedAt,
-	}
-	if export.ExpiresAt != nil {
-		view["expires_at"] = export.ExpiresAt
-	}
-	return view
 }
 
 func userPortalAccountDeletionPreflightView(preflight store.UserPortalAccountDeletionPreflight) map[string]any {

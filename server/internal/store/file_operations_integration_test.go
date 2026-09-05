@@ -143,10 +143,10 @@ func TestFileOperationClaimAuthorizationRetryUploadCancellationAndExpiry(t *test
 		t.Fatalf("expired operation renew error=%v, want ErrConflict", err)
 	}
 	emptyDigest := sha256.Sum256(nil)
-	if _, err := repository.RecordFileOperationUpload(ctx, accountID, agentID, pcID, shortLived.ID, shortHash, FileOperationUploadInput{
+	if _, err := repository.RecordFileOperationTransfer(ctx, accountID, agentID, pcID, shortLived.ID, shortHash, FileOperationUploadInput{
 		Filename: "short-lived.txt", SizeBytes: 0, SHA256: emptyDigest[:], DirectoryZIP: false,
 	}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("expired operation upload error=%v, want ErrConflict", err)
+		t.Fatalf("expired realtime transfer error=%v, want ErrConflict", err)
 	}
 	if _, err := repository.CompleteFileOperation(ctx, accountID, agentID, pcID, shortLived.ID, shortHash, FileOperationCompleteInput{
 		Status: FileOperationFailed, ErrorMessage: stringPointer("expired"),
@@ -154,39 +154,79 @@ func TestFileOperationClaimAuthorizationRetryUploadCancellationAndExpiry(t *test
 		t.Fatalf("expired operation complete error=%v, want ErrConflict", err)
 	}
 
-	download, err := repository.CreateFileOperation(ctx, accountID, requesterID, pcID, FileOperationCreateInput{
-		Operation: FileOperationDownload, Path: `C:\folder`, ExpiresAt: time.Now().UTC().Add(time.Hour),
+	realtimeDownload, err := repository.CreateFileOperation(ctx, accountID, requesterID, pcID, FileOperationCreateInput{
+		Operation: FileOperationDownload, Path: `C:\realtime.bin`, ExpiresAt: time.Now().UTC().Add(time.Hour),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	downloadClaim, downloadToken, err := repository.ClaimFileOperation(ctx, accountID, agentID, pcID, time.Minute)
-	if err != nil || downloadClaim == nil || downloadClaim.ID != download.ID {
-		t.Fatalf("download claim=%+v err=%v", downloadClaim, err)
+	realtimeClaim, realtimeToken, err := repository.ClaimFileOperation(ctx, accountID, agentID, pcID, time.Minute)
+	if err != nil || realtimeClaim == nil || realtimeClaim.ID != realtimeDownload.ID {
+		t.Fatalf("realtime download claim=%+v err=%v", realtimeClaim, err)
 	}
-	downloadHash := fileOperationLeaseHash(t, downloadToken)
-	digest := sha256.Sum256(nil)
-	upload := FileOperationUploadInput{Filename: "empty.txt", SizeBytes: 0, SHA256: digest[:], DirectoryZIP: false}
-	recorded, err := repository.RecordFileOperationUpload(ctx, accountID, agentID, pcID, download.ID, downloadHash, upload)
-	if err != nil || recorded.ObjectKey != "accounts/"+accountID.String()+"/file-transfers/"+pcID.String()+"/"+download.ID.String()+".bin" {
-		t.Fatalf("recorded upload=%+v err=%v", recorded, err)
+	realtimeHash := fileOperationLeaseHash(t, realtimeToken)
+	realtimeDigest := sha256.Sum256([]byte("realtime payload"))
+	realtimeMetadata := FileOperationUploadInput{
+		Filename: "realtime.bin", SizeBytes: int64(len("realtime payload")),
+		SHA256: realtimeDigest[:], DirectoryZIP: false,
 	}
-	if replay, err := repository.RecordFileOperationUpload(ctx, accountID, agentID, pcID, download.ID, downloadHash, upload); err != nil || replay.ObjectKey != recorded.ObjectKey {
-		t.Fatalf("upload metadata retry=%+v err=%v", replay, err)
+	realtimeRecorded, err := repository.RecordFileOperationTransfer(
+		ctx, accountID, agentID, pcID, realtimeDownload.ID, realtimeHash, realtimeMetadata)
+	if err != nil || realtimeRecorded.TransferProtocol == nil ||
+		*realtimeRecorded.TransferProtocol != FileTransferRealtimeV2 {
+		t.Fatalf("realtime transfer metadata=%+v err=%v", realtimeRecorded, err)
 	}
-	changed := upload
-	changed.SizeBytes++
-	if _, err := repository.RecordFileOperationUpload(ctx, accountID, agentID, pcID, download.ID, downloadHash, changed); !errors.Is(err, ErrConflict) {
-		t.Fatalf("changed upload retry error=%v, want ErrConflict", err)
+	if replay, replayErr := repository.RecordFileOperationTransfer(
+		ctx, accountID, agentID, pcID, realtimeDownload.ID, realtimeHash, realtimeMetadata,
+	); replayErr != nil || replay.TransferProtocol == nil || *replay.TransferProtocol != FileTransferRealtimeV2 {
+		t.Fatalf("realtime transfer metadata replay=%+v err=%v", replay, replayErr)
 	}
-	if _, err := repository.AgentFileOperation(ctx, accountID, otherAgentID, pcID, download.ID, downloadHash); !errors.Is(err, ErrNotFound) {
+	changedMetadata := realtimeMetadata
+	changedMetadata.SizeBytes++
+	if _, changedErr := repository.RecordFileOperationTransfer(
+		ctx, accountID, agentID, pcID, realtimeDownload.ID, realtimeHash, changedMetadata,
+	); !errors.Is(changedErr, ErrConflict) {
+		t.Fatalf("changed realtime metadata error=%v, want ErrConflict", changedErr)
+	}
+	if _, err := repository.AgentFileOperation(ctx, accountID, otherAgentID, pcID, realtimeDownload.ID, realtimeHash); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("wrong PC read error=%v, want ErrNotFound", err)
 	}
-	cancelledDownload, err := repository.CancelFileOperation(ctx, accountID, requesterID, pcID, download.ID)
-	if err != nil || cancelledDownload.Status != FileOperationCancelled {
-		t.Fatalf("cancel uploaded download=%+v err=%v", cancelledDownload, err)
+	route, err := repository.FileTransferRoute(ctx, accountID, realtimeDownload.ID)
+	if err != nil || route.TransferID != realtimeDownload.ID || route.RequesterDevice != requesterID ||
+		route.PCDevice != agentID || route.TransferProtocol == nil || *route.TransferProtocol != FileTransferRealtimeV2 {
+		t.Fatalf("realtime transfer route=%+v err=%v", route, err)
 	}
-	assertFileTransferCleanupScheduled(t, ctx, repository, download.ID, recorded.ObjectKey)
+	if _, err := repository.Pool.Exec(ctx, `UPDATE devices SET trust_state='REVOKED' WHERE id=$1`, requesterID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.FileTransferRoute(ctx, accountID, realtimeDownload.ID); !errors.Is(err, ErrDenied) {
+		t.Fatalf("revoked Android transfer route error=%v, want ErrDenied", err)
+	}
+	if _, err := repository.Pool.Exec(ctx, `UPDATE devices SET trust_state='TRUSTED' WHERE id=$1`, requesterID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Pool.Exec(ctx, `UPDATE devices SET trust_state='REVOKED' WHERE id=$1`, agentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.FileTransferRoute(ctx, accountID, realtimeDownload.ID); !errors.Is(err, ErrDenied) {
+		t.Fatalf("revoked PC Agent transfer route error=%v, want ErrDenied", err)
+	}
+	if _, err := repository.Pool.Exec(ctx, `UPDATE devices SET trust_state='TRUSTED' WHERE id=$1`, agentID); err != nil {
+		t.Fatal(err)
+	}
+	realtimeCompleted, err := repository.CompleteFileOperation(
+		ctx, accountID, agentID, pcID, realtimeDownload.ID, realtimeHash,
+		FileOperationCompleteInput{Status: FileOperationSucceeded},
+	)
+	if err != nil || realtimeCompleted.Status != FileOperationSucceeded {
+		t.Fatalf("realtime transfer completion=%+v err=%v", realtimeCompleted, err)
+	}
+	if replay, replayErr := repository.CompleteFileOperation(
+		ctx, accountID, agentID, pcID, realtimeDownload.ID, realtimeHash,
+		FileOperationCompleteInput{Status: FileOperationSucceeded},
+	); replayErr != nil || replay.Status != FileOperationSucceeded {
+		t.Fatalf("realtime transfer completion replay=%+v err=%v", replay, replayErr)
+	}
 
 	failedDownload, err := repository.CreateFileOperation(ctx, accountID, requesterID, pcID, FileOperationCreateInput{
 		Operation: FileOperationDownload, Path: `C:\failed.txt`, ExpiresAt: time.Now().UTC().Add(time.Hour),
@@ -199,10 +239,9 @@ func TestFileOperationClaimAuthorizationRetryUploadCancellationAndExpiry(t *test
 		t.Fatalf("failed-download claim=%+v err=%v", failedClaim, err)
 	}
 	failedHash := fileOperationLeaseHash(t, failedToken)
-	failedUpload, err := repository.RecordFileOperationUpload(ctx, accountID, agentID, pcID, failedDownload.ID, failedHash, FileOperationUploadInput{
+	if _, err := repository.RecordFileOperationTransfer(ctx, accountID, agentID, pcID, failedDownload.ID, failedHash, FileOperationUploadInput{
 		Filename: "failed.txt", SizeBytes: 0, SHA256: emptyDigest[:], DirectoryZIP: false,
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
 	failedMessage := "source changed"
@@ -212,8 +251,6 @@ func TestFileOperationClaimAuthorizationRetryUploadCancellationAndExpiry(t *test
 	if err != nil || failedTerminal.Status != FileOperationFailed {
 		t.Fatalf("failed terminal=%+v err=%v", failedTerminal, err)
 	}
-	assertFileTransferCleanupScheduled(t, ctx, repository, failedDownload.ID, failedUpload.ObjectKey)
-
 	stale, err := repository.CreateFileOperation(ctx, accountID, requesterID, pcID, FileOperationCreateInput{
 		Operation: FileOperationDownload, Path: `C:\stale.txt`, ExpiresAt: time.Now().UTC().Add(time.Hour),
 	})
@@ -226,10 +263,9 @@ func TestFileOperationClaimAuthorizationRetryUploadCancellationAndExpiry(t *test
 	}
 	staleHash := fileOperationLeaseHash(t, staleToken)
 	staleDigest := sha256.Sum256(nil)
-	staleUpload, err := repository.RecordFileOperationUpload(ctx, accountID, agentID, pcID, stale.ID, staleHash, FileOperationUploadInput{
+	if _, err := repository.RecordFileOperationTransfer(ctx, accountID, agentID, pcID, stale.ID, staleHash, FileOperationUploadInput{
 		Filename: "stale.txt", SizeBytes: 0, SHA256: staleDigest[:], DirectoryZIP: false,
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := repository.Pool.Exec(ctx, `
@@ -243,8 +279,6 @@ func TestFileOperationClaimAuthorizationRetryUploadCancellationAndExpiry(t *test
 	if err != nil || expiredStale.Status != FileOperationExpired {
 		t.Fatalf("expired stale upload=%+v err=%v", expiredStale, err)
 	}
-	assertFileTransferCleanupScheduled(t, ctx, repository, stale.ID, staleUpload.ObjectKey)
-
 	cancellable, err := repository.CreateFileOperation(ctx, accountID, requesterID, pcID, FileOperationCreateInput{
 		Operation: FileOperationOpenTerminal, Path: `C:\folder`, ShellType: stringPointer("windows-powershell"), ExpiresAt: time.Now().UTC().Add(time.Hour),
 	})
@@ -387,17 +421,3 @@ func fileOperationLeaseHash(t *testing.T, token string) [32]byte {
 }
 
 func stringPointer(value string) *string { return &value }
-
-func assertFileTransferCleanupScheduled(t *testing.T, ctx context.Context, repository *Postgres, operationID uuid.UUID, objectKey string) {
-	t.Helper()
-	var payloadKey string
-	var delayed bool
-	err := repository.Pool.QueryRow(ctx, `
-		SELECT payload->>'object_key',available_at>now()+interval '55 minutes'
-		FROM outbox
-		WHERE event_type='history.object.delete' AND aggregate_id=$1 AND payload->>'object_key'=$2`,
-		operationID, objectKey).Scan(&payloadKey, &delayed)
-	if err != nil || payloadKey != objectKey || !delayed {
-		t.Fatalf("cleanup event operation=%s key=%q delayed=%t err=%v", operationID, payloadKey, delayed, err)
-	}
-}

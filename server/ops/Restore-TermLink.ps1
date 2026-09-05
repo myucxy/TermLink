@@ -1,9 +1,6 @@
 [CmdletBinding()]
 param(
-    [string[]]$ComposeFile = @(
-        (Join-Path $PSScriptRoot '..\compose\core.compose.yml'),
-        (Join-Path $PSScriptRoot '..\compose\history.compose.yml')
-    ),
+    [string[]]$ComposeFile = @((Join-Path $PSScriptRoot '..\compose\core.compose.yml')),
     [ValidatePattern('^[a-z0-9][a-z0-9_-]{2,62}$')]
     [string]$ProjectName = 'termlink',
     [Parameter(Mandatory)]
@@ -14,11 +11,8 @@ param(
     [string]$Database = 'termlink',
     [ValidatePattern('^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$')]
     [string]$DatabaseUser = 'termlink',
-    [string]$Bucket = 'termlink-history',
     [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$')]
     [string]$PostgresService = 'postgres',
-    [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$')]
-    [string]$MinioService = 'minio',
     [Parameter(Mandatory)]
     [switch]$ConfirmDestructiveRestore
 )
@@ -33,7 +27,6 @@ if (-not $ConfirmDestructiveRestore) {
 if ($Database -in @('postgres', 'template0', 'template1')) {
     throw 'Restore refuses to replace a PostgreSQL maintenance database.'
 }
-Assert-TermLinkBucketName -Bucket $Bucket
 $backupRoot = Assert-TermLinkExternalPath -Path $BackupPath -MustExist
 Assert-TermLinkAuthenticationKeySeparation -KeyPath $ManifestAuthenticationKeyFile -BackupPath $backupRoot
 $manifestPath = Join-Path $backupRoot 'manifest.json'
@@ -68,11 +61,11 @@ try {
 catch {
     throw "Backup manifest is not valid JSON: $($_.Exception.Message)"
 }
-if ($manifest.schema -cne 'termlink.backup-manifest' -or [int]$manifest.schema_version -ne 1) {
+if ($manifest.schema -cne 'termlink.backup-manifest' -or [int]$manifest.schema_version -ne 2) {
     throw 'Unsupported backup manifest schema.'
 }
-if ($manifest.project_name -cne $ProjectName -or $manifest.database -cne $Database -or $manifest.bucket -cne $Bucket) {
-    throw 'Backup manifest target does not match the requested project, database, and bucket.'
+if ($manifest.project_name -cne $ProjectName -or $manifest.database -cne $Database) {
+    throw 'Backup manifest target does not match the requested project and database.'
 }
 if ($manifest.database_format -cne 'postgresql-custom') {
     throw 'Backup database format is not supported.'
@@ -86,7 +79,7 @@ foreach ($entry in $entries) {
     $relative = [string]$entry.path
     if ([string]::IsNullOrWhiteSpace($relative) -or $relative.Contains('\') -or
         [IO.Path]::IsPathRooted($relative) -or $relative -match '[\x00-\x1f]' -or
-        ($relative -cne 'database.dump' -and -not $relative.StartsWith('history/', [StringComparison]::Ordinal))) {
+        $relative -cne 'database.dump') {
         throw "Unsafe backup manifest path: $relative"
     }
     $segments = @($relative.Split('/'))
@@ -114,37 +107,22 @@ foreach ($entry in $entries) {
 if (-not $validatedPaths.ContainsKey('database.dump')) {
     throw 'Backup manifest does not contain database.dump.'
 }
-$historyRoot = Join-Path $backupRoot 'history'
-if (-not (Test-Path -LiteralPath $historyRoot -PathType Container)) {
-    throw 'Backup history directory is missing.'
-}
-Assert-TermLinkPathHasNoReparsePoint -Path $historyRoot -Root $backupRoot | Out-Null
 $actualPayloads = @(Get-ChildItem -LiteralPath $backupRoot -Recurse -File |
     Where-Object { $_.FullName -notin @($manifestPath, $manifestAuthenticationPath) })
 if ($actualPayloads.Count -ne $entries.Count) {
     throw 'Backup contains payload files that are not covered by the manifest.'
 }
-$historyCount = @($entries | Where-Object { ([string]$_.path).StartsWith('history/', [StringComparison]::Ordinal) }).Count
-if ([int]$manifest.history_object_count -ne $historyCount) {
-    throw 'Backup history object count does not match the manifest.'
-}
-
 $composeFiles = @(Resolve-TermLinkComposeFiles -ComposeFile $ComposeFile)
 $compose = New-TermLinkComposeArguments -ComposeFile $composeFiles -ProjectName $ProjectName
 $operationId = [guid]::NewGuid().ToString('N')
 $remoteRoot = "/tmp/termlink-restore-$operationId"
-$minioConfigDir = "$remoteRoot/mc"
 $postgresContainer = $null
-$minioContainer = $null
 $stoppedServices = @()
 $restoreSucceeded = $false
 
 try {
     $stoppedServices = @(Stop-TermLinkServices -ComposeArguments $compose -Candidates @('lucky-upstream', 'server'))
     $postgresContainer = Get-TermLinkContainerId -ComposeArguments $compose -Service $PostgresService
-    $minioContainer = Get-TermLinkContainerId -ComposeArguments $compose -Service $MinioService
-	Initialize-TermLinkMinioAlias -ContainerId $minioContainer -ConfigDir $minioConfigDir
-
     Invoke-TermLinkDocker -Arguments @('exec', $postgresContainer, 'mkdir', '-p', $remoteRoot) | Out-Null
     Invoke-TermLinkDocker -Arguments @('cp', $validatedPaths['database.dump'], "${postgresContainer}:$remoteRoot/database.dump") | Out-Null
     $databaseEntry = @($entries | Where-Object { [string]$_.path -ceq 'database.dump' })
@@ -153,20 +131,6 @@ try {
             [string]$databaseEntry[0].sha256) {
         throw 'Staged PostgreSQL dump SHA-256 does not match the authenticated manifest.'
     }
-    Invoke-TermLinkDocker -Arguments @('exec', $minioContainer, 'mkdir', '-p', "$remoteRoot/history") | Out-Null
-    foreach ($entry in @($entries | Where-Object { ([string]$_.path).StartsWith('history/', [StringComparison]::Ordinal) })) {
-        $relative = [string]$entry.path
-        $historyRelative = $relative.Substring('history/'.Length)
-        $remotePath = "$remoteRoot/history/$historyRelative"
-        $separator = $remotePath.LastIndexOf('/')
-        $remoteParent = $remotePath.Substring(0, $separator)
-        Invoke-TermLinkDocker -Arguments @('exec', $minioContainer, 'mkdir', '-p', $remoteParent) | Out-Null
-        Invoke-TermLinkDocker -Arguments @('cp', $validatedPaths[$relative], "${minioContainer}:$remotePath") | Out-Null
-        if ((Get-TermLinkContainerFileSha256 -ContainerId $minioContainer -Path $remotePath) -cne [string]$entry.sha256) {
-            throw "Staged MinIO payload SHA-256 does not match the authenticated manifest: $relative"
-        }
-    }
-
     Invoke-TermLinkDocker -Arguments @(
         'exec', $postgresContainer, 'dropdb', '--username', $DatabaseUser,
         '--maintenance-db', 'postgres', '--if-exists', '--force', $Database
@@ -181,11 +145,6 @@ try {
         "$remoteRoot/database.dump"
     ) | Out-Null
 
-    Invoke-TermLinkMinioClient -ContainerId $minioContainer -ConfigDir $minioConfigDir `
-        -Arguments @('mb', '--ignore-existing', "termlinkbackup/$Bucket") | Out-Null
-    Invoke-TermLinkMinioClient -ContainerId $minioContainer -ConfigDir $minioConfigDir `
-        -Arguments @('mirror', '--overwrite', '--remove', "$remoteRoot/history", "termlinkbackup/$Bucket") | Out-Null
-
     $restoreSucceeded = $true
     Write-Host "TermLink restore completed from: $backupRoot"
 }
@@ -194,10 +153,6 @@ finally {
     if ($null -ne $postgresContainer) {
         try { Remove-TermLinkContainerPath -ContainerId $postgresContainer -Path $remoteRoot }
         catch { $remoteCleanupFailed = $true; Write-Warning 'PostgreSQL restore staging cleanup failed.' }
-    }
-    if ($null -ne $minioContainer) {
-        try { Remove-TermLinkContainerPath -ContainerId $minioContainer -Path $remoteRoot }
-        catch { $remoteCleanupFailed = $true; Write-Warning 'MinIO restore staging cleanup failed.' }
     }
     if ($restoreSucceeded -and $stoppedServices.Count -gt 0) {
         Start-TermLinkServices -ComposeArguments $compose -Services $stoppedServices

@@ -30,9 +30,6 @@ func TestLoadFromEnvReadsSecretsAndRedactsDiagnostics(t *testing.T) {
 	if got := c.DatabaseURL.Value(); got == "" {
 		t.Fatal("DatabaseURL was empty")
 	}
-	if c.HistoryEnabled {
-		t.Fatal("HistoryEnabled = true, want false")
-	}
 	if c.LogLevel != "info" {
 		t.Fatalf("LogLevel = %q, want info", c.LogLevel)
 	}
@@ -191,14 +188,6 @@ func TestLoadAccountDeletionRequiresDedicatedIdentityKeyAndDependencies(t *testi
 	env["TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE"] = files["deletion"]
 	env["TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION"] = "7"
 
-	if _, err := LoadFromEnv(env); err == nil || !errors.Is(err, ErrInvalid) ||
-		!strings.Contains(err.Error(), "TERMLINK_HISTORY_ENABLED") {
-		t.Fatalf("account deletion without history error = %v, want field-scoped ErrInvalid", err)
-	}
-	env["TERMLINK_HISTORY_ENABLED"] = "true"
-	env["TERMLINK_S3_ENDPOINT"] = "http://minio:9000"
-	env["TERMLINK_S3_ACCESS_KEY_FILE"] = files["access"]
-	env["TERMLINK_S3_SECRET_KEY_FILE"] = files["secret"]
 	c, err := LoadFromEnv(env)
 	if err != nil {
 		t.Fatalf("LoadFromEnv(account deletion) error = %v", err)
@@ -395,103 +384,6 @@ func TestLoadRejectsEmptySecretFile(t *testing.T) {
 	_, err := LoadFromEnv(env)
 	if err == nil || !errors.Is(err, ErrSecret) {
 		t.Fatalf("LoadFromEnv() error = %v, want ErrSecret", err)
-	}
-}
-
-func TestLoadHistoryRequiresS3SecretsOnlyWhenEnabled(t *testing.T) {
-	files := writeSecrets(t, map[string]string{
-		"oidc":  "oidc-secret",
-		"db":    "db-secret",
-		"redis": "redis-secret",
-		"sign":  "01234567890123456789012345678901",
-	})
-	env := baseEnv(files)
-	env["TERMLINK_HISTORY_ENABLED"] = "true"
-	env["TERMLINK_S3_ENDPOINT"] = "http://minio:9000"
-	if _, err := LoadFromEnv(env); err == nil || !errors.Is(err, ErrMissing) {
-		t.Fatalf("LoadFromEnv() error = %v, want missing S3 secret path", err)
-	}
-
-	env["TERMLINK_S3_ACCESS_KEY_FILE"] = files["access"]
-	env["TERMLINK_S3_SECRET_KEY_FILE"] = files["secret"]
-	c, err := LoadFromEnv(env)
-	if err != nil {
-		t.Fatalf("LoadFromEnv(history) error = %v", err)
-	}
-	if !c.HistoryEnabled || c.S3AccessKey.Value() != "access-key" || c.S3SecretKey.Value() != "secret-key" {
-		t.Fatalf("history config not loaded: %#v", c)
-	}
-	if c.S3PublicEndpoint != c.S3Endpoint {
-		t.Fatalf("S3PublicEndpoint = %q, want internal endpoint %q when omitted", c.S3PublicEndpoint, c.S3Endpoint)
-	}
-
-	env["TERMLINK_S3_PUBLIC_ENDPOINT"] = "http://127.0.0.1:59000"
-	c, err = LoadFromEnv(env)
-	if err != nil {
-		t.Fatalf("LoadFromEnv(history public endpoint) error = %v", err)
-	}
-	if c.S3PublicEndpoint != env["TERMLINK_S3_PUBLIC_ENDPOINT"] {
-		t.Fatalf("S3PublicEndpoint = %q, want configured public endpoint", c.S3PublicEndpoint)
-	}
-}
-
-func TestS3EndpointValidationCoversInternalAndPublicEndpoints(t *testing.T) {
-	base := Input{
-		PublicURL:        "https://termlink.example.test",
-		OIDCIssuer:       "https://issuer.example.test",
-		OIDCClientID:     "termlink-server",
-		OIDCClientSecret: "oidc",
-		DatabaseURL:      "postgres",
-		RedisURL:         "redis",
-		TokenSigningKey:  "01234567890123456789012345678901",
-		S3Endpoint:       "http://minio:9000",
-		S3AccessKey:      "access-key",
-		S3SecretKey:      "secret-key",
-		HistoryEnabled:   true,
-	}
-	tests := []struct {
-		name      string
-		mutate    func(*Input)
-		fieldName string
-	}{
-		{
-			name: "internal",
-			mutate: func(input *Input) {
-				input.S3Endpoint = "ftp://minio:9000"
-			},
-			fieldName: "TERMLINK_S3_ENDPOINT",
-		},
-		{
-			name: "public",
-			mutate: func(input *Input) {
-				input.S3PublicEndpoint = "ftp://127.0.0.1:59000"
-			},
-			fieldName: "TERMLINK_S3_PUBLIC_ENDPOINT",
-		},
-		{
-			name: "internal path",
-			mutate: func(input *Input) {
-				input.S3Endpoint = "http://minio:9000/admin"
-			},
-			fieldName: "TERMLINK_S3_ENDPOINT",
-		},
-		{
-			name: "public query",
-			mutate: func(input *Input) {
-				input.S3PublicEndpoint = "https://history.example.test?credential=leak"
-			},
-			fieldName: "TERMLINK_S3_PUBLIC_ENDPOINT",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			input := base
-			test.mutate(&input)
-			_, err := New(input)
-			if err == nil || !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), test.fieldName) {
-				t.Fatalf("New() error = %v, want invalid %s", err, test.fieldName)
-			}
-		})
 	}
 }
 

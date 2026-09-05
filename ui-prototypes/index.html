@@ -646,7 +646,7 @@
                 <button type="button" data-action="account-security"><span><strong>登录与安全</strong><small>密码、MFA、活跃登录</small></span><svg><use href="#i-chevron" /></svg></button>
               </div>
               <button class="secondary-wide-action" type="button" data-action="android-signout">退出当前设备</button>
-              <button class="danger-wide-action" type="button" data-action="delete-account">删除账号与云端数据</button>
+              <button class="danger-wide-action" type="button" data-action="delete-account">删除账号</button>
               <nav class="mobile-bottom-nav" aria-label="主导航">
                 <button type="button"><svg><use href="#i-device" /></svg><span>设备</span></button>
                 <button type="button"><svg><use href="#i-activity" /></svg><span>活动</span></button>
@@ -1382,10 +1382,6 @@
                     ><em>healthy</em><small>8.1</small>
                   </div>
                   <div class="health-row">
-                    <span><i class="presence online"></i><b>minio</b></span
-                    ><em>healthy</em><small>2026.07</small>
-                  </div>
-                  <div class="health-row">
                     <span><i class="presence online"></i><b>caddy</b></span
                     ><em>healthy</em><small>2.10</small>
                   </div>
@@ -1627,12 +1623,6 @@
                         ><small>valkey/valkey:8.1-alpine</small></span
                       ><em>86 MB</em><strong>0.05 CPU</strong>
                     </div>
-                    <div>
-                      <span
-                        ><i class="presence online"></i><b>minio</b
-                        ><small>history profile</small></span
-                      ><em>244 MB</em><strong>0.09 CPU</strong>
-                    </div>
                   </div>
                 </section>
                 <section class="ops-section backup-panel">
@@ -1651,16 +1641,6 @@
                       ><small>今天 03:00 · 842 MB</small>
                     </div>
                     <em>成功</em>
-                  </div>
-                  <div class="backup-item">
-                    <span
-                      ><svg><use href="#i-box" /></svg
-                    ></span>
-                    <div>
-                      <strong>加密历史对象</strong
-                      ><small>生命周期策略已启用</small>
-                    </div>
-                    <em>正常</em>
                   </div>
                   <button
                     class="secondary-wide-action"
@@ -1774,9 +1754,9 @@
                 <div class="audit-event">
                   <i class="audit-marker success"></i><time>22:08:11</time>
                   <div>
-                    <strong>HISTORY_DELETE_COMPLETED</strong>
-                    <p>Session se_16…4d 的 18 个加密对象已删除</p>
-                    <small>bytes=42.8MB · objects=18 · proof=del_21c8</small>
+                    <strong>SESSION_CLOSE_COMPLETED</strong>
+                    <p>Session se_16…4d 已关闭，主机确认本地历史已销毁</p>
+                    <small>host_ack=confirmed · session=se_16…4d</small>
                   </div>
                   <em class="status-pill live">成功</em>
                 </div>

@@ -1,5 +1,6 @@
-// Package sessioncleanup periodically tombstones expired server-side session
-// metadata. It deliberately has no dependency on realtime or Windows control.
+// Package sessioncleanup retains the legacy cleanup-runner contract during the
+// host-owned history rollout. The production Store implementation is a no-op:
+// connectivity loss or elapsed time must not delete session metadata.
 package sessioncleanup
 
 import (

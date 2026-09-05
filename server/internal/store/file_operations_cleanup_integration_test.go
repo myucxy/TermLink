@@ -17,7 +17,7 @@ import (
 	"github.com/termlink/termlink/server/internal/migrate"
 )
 
-func TestCleanupFileOperationsBoundsAccountsAndWaitsForObjectDeletion(t *testing.T) {
+func TestCleanupFileOperationsBoundsAccountsAndDeletesTerminalRows(t *testing.T) {
 	databaseURL := os.Getenv("TERMLINK_INTEGRATION_DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("TERMLINK_INTEGRATION_DATABASE_URL is required for the file-operation cleanup integration test")
@@ -139,9 +139,8 @@ func TestCleanupFileOperationsBoundsAccountsAndWaitsForObjectDeletion(t *testing
 	freshPending := create(FileOperationList, `C:\fresh`)
 	oldList := create(FileOperationList, `C:\old-list`)
 	recentFailure := create(FileOperationList, `C:\recent`)
-	gatedDownload := create(FileOperationDownload, `C:\gated.bin`)
-	deliveredDownload := create(FileOperationDownload, `C:\delivered.bin`)
-	noObjectDownload := create(FileOperationDownload, `C:\missing.bin`)
+	failedDownloadA := create(FileOperationDownload, `C:\failed-a.bin`)
+	failedDownloadB := create(FileOperationDownload, `C:\failed-b.bin`)
 
 	if _, err := repository.Pool.Exec(ctx, `
 		UPDATE pc_file_operations
@@ -151,14 +150,13 @@ func TestCleanupFileOperationsBoundsAccountsAndWaitsForObjectDeletion(t *testing
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256([]byte("opaque transfer"))
-	expiredObjectKey := "accounts/" + cleanupAccountID.String() + "/file-transfers/" + cleanupPCID.String() + "/" + expiredDownload.ID.String() + ".bin"
 	if _, err := repository.Pool.Exec(ctx, `
 		UPDATE pc_file_operations
 		SET status='PROCESSING',attempt_count=1,lease_token_hash=$2,lease_expires_at=$3::timestamptz-interval '2 hours',
-		    object_key=$4,filename='expired.bin',size_bytes=15,sha256=$5,directory_zip=false,
+		    filename='expired.bin',size_bytes=15,sha256=$4,directory_zip=false,transfer_protocol='REALTIME_V2',
 		    created_at=$3::timestamptz-interval '3 hours',expires_at=$3::timestamptz-interval '2 hours',
 		    updated_at=$3::timestamptz-interval '3 hours'
-		WHERE id=$1`, expiredDownload.ID, bytes.Repeat([]byte{7}, 32), now, expiredObjectKey, digest[:]); err != nil {
+		WHERE id=$1`, expiredDownload.ID, bytes.Repeat([]byte{7}, 32), now, digest[:]); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := repository.Pool.Exec(ctx, `
@@ -179,42 +177,21 @@ func TestCleanupFileOperationsBoundsAccountsAndWaitsForObjectDeletion(t *testing
 		t.Fatal(err)
 	}
 
-	setOldDownload := func(item FileOperationRecord, filename string, withObject, processed bool) string {
+	setOldDownload := func(item FileOperationRecord, filename string) {
 		t.Helper()
-		objectKey := ""
-		if withObject {
-			objectKey = "accounts/" + cleanupAccountID.String() + "/file-transfers/" + cleanupPCID.String() + "/" + item.ID.String() + ".bin"
-			if _, updateErr := repository.Pool.Exec(ctx, `
-				UPDATE pc_file_operations
-				SET status='FAILED',attempt_count=1,lease_token_hash=$2,lease_expires_at=$3::timestamptz-interval '47 hours',
-				    error_message='terminal failure',object_key=$4,filename=$5,size_bytes=15,sha256=$6,directory_zip=false,
-				    completed_at=$3::timestamptz-interval '47 hours',created_at=$3::timestamptz-interval '48 hours',
-				    expires_at=$3::timestamptz-interval '46 hours',updated_at=$3::timestamptz-interval '47 hours'
-				WHERE id=$1`, item.ID, bytes.Repeat([]byte{10}, 32), now, objectKey, filename, digest[:]); updateErr != nil {
-				t.Fatal(updateErr)
-			}
-			if _, insertErr := repository.Pool.Exec(ctx, `
-				INSERT INTO outbox(event_type,aggregate_id,payload,available_at,processed_at)
-				VALUES('history.object.delete',$1,jsonb_build_object('object_key',$2::text),$3::timestamptz-interval '46 hours',
-				       CASE WHEN $4 THEN $3::timestamptz-interval '46 hours' END)`, item.ID, objectKey, now, processed); insertErr != nil {
-				t.Fatal(insertErr)
-			}
-			return objectKey
-		}
 		if _, updateErr := repository.Pool.Exec(ctx, `
 			UPDATE pc_file_operations
 			SET status='FAILED',attempt_count=1,lease_token_hash=$2,lease_expires_at=$3::timestamptz-interval '47 hours',
-			    error_message='terminal failure',completed_at=$3::timestamptz-interval '47 hours',
+			    error_message='terminal failure',filename=$4,size_bytes=15,sha256=$5,directory_zip=false,
+			    transfer_protocol='REALTIME_V2',completed_at=$3::timestamptz-interval '47 hours',
 			    created_at=$3::timestamptz-interval '48 hours',expires_at=$3::timestamptz-interval '46 hours',
 			    updated_at=$3::timestamptz-interval '47 hours'
-			WHERE id=$1`, item.ID, bytes.Repeat([]byte{11}, 32), now); updateErr != nil {
+			WHERE id=$1`, item.ID, bytes.Repeat([]byte{11}, 32), now, filename, digest[:]); updateErr != nil {
 			t.Fatal(updateErr)
 		}
-		return objectKey
 	}
-	_ = setOldDownload(gatedDownload, "gated.bin", true, false)
-	_ = setOldDownload(deliveredDownload, "delivered.bin", true, true)
-	_ = setOldDownload(noObjectDownload, "missing.bin", false, false)
+	setOldDownload(failedDownloadA, "failed-a.bin")
+	setOldDownload(failedDownloadB, "failed-b.bin")
 
 	results := make(chan FileOperationCleanupResult, 2)
 	errorsChannel := make(chan error, 2)
@@ -252,13 +229,6 @@ func TestCleanupFileOperationsBoundsAccountsAndWaitsForObjectDeletion(t *testing
 	if err := repository.Pool.QueryRow(ctx, `SELECT status FROM pc_file_operations WHERE id=$1`, expiredDownload.ID).Scan(&expiredStatus); err != nil || expiredStatus != FileOperationExpired {
 		t.Fatalf("expired download status=%q err=%v", expiredStatus, err)
 	}
-	var cleanupEventCount int
-	if err := repository.Pool.QueryRow(ctx, `
-		SELECT count(*) FROM outbox
-		WHERE event_type='history.object.delete' AND aggregate_id=$1
-		  AND payload->>'object_key'=$2 AND processed_at IS NULL`, expiredDownload.ID, expiredObjectKey).Scan(&cleanupEventCount); err != nil || cleanupEventCount != 1 {
-		t.Fatalf("expired download cleanup event count=%d err=%v", cleanupEventCount, err)
-	}
 	var retainedIDs []uuid.UUID
 	rows, err := repository.Pool.Query(ctx, `SELECT id FROM pc_file_operations WHERE account_id=$1`, cleanupAccountID)
 	if err != nil {
@@ -273,12 +243,12 @@ func TestCleanupFileOperationsBoundsAccountsAndWaitsForObjectDeletion(t *testing
 		retainedIDs = append(retainedIDs, id)
 	}
 	rows.Close()
-	for _, expected := range []uuid.UUID{expiredPending.ID, expiredDownload.ID, freshPending.ID, recentFailure.ID, gatedDownload.ID} {
+	for _, expected := range []uuid.UUID{expiredPending.ID, expiredDownload.ID, freshPending.ID, recentFailure.ID} {
 		if !containsUUID(retainedIDs, expected) {
 			t.Fatalf("required retained operation %s missing from %v", expected, retainedIDs)
 		}
 	}
-	for _, removed := range []uuid.UUID{oldList.ID, deliveredDownload.ID, noObjectDownload.ID} {
+	for _, removed := range []uuid.UUID{oldList.ID, failedDownloadA.ID, failedDownloadB.ID} {
 		if containsUUID(retainedIDs, removed) {
 			t.Fatalf("eligible terminal operation %s was retained", removed)
 		}

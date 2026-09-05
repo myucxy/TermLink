@@ -1,5 +1,7 @@
 package dev.termlink.product
 
+import dev.termlink.session.RendererBootstrapState
+import java.util.UUID
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -11,6 +13,45 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TerminalSnapshotBootstrapTest {
+    @Test
+    fun olderHostSnapshotMustReplayToDurableAckBeforeExactCheckpointIsAdvertised() {
+        val snapshotSequence = 45uL
+        val durableAcknowledgement = 46uL
+        val snapshotGeneration = 2L
+
+        assertFalse(
+            snapshotSuffixRestoreReady(
+                restoredThroughSequence = snapshotSequence,
+                durableAcknowledgement = durableAcknowledgement,
+                authoritativeTail = durableAcknowledgement,
+            ),
+        )
+        assertTrue(
+            snapshotSuffixReplayTargetIsBounded(
+                snapshotSequence = snapshotSequence,
+                replayTarget = durableAcknowledgement,
+            ),
+        )
+
+        val restored = RendererBootstrapState.ExactCheckpoint(
+            sequence = durableAcknowledgement.toLong(),
+            rendererGeneration = snapshotGeneration,
+            snapshotId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff"),
+            ciphertextSha256 = ByteArray(32),
+            snapshotSequence = snapshotSequence.toLong(),
+        )
+
+        assertEquals(durableAcknowledgement.toLong(), restored.sequence)
+        assertEquals(snapshotSequence.toLong(), restored.snapshotSequence)
+        assertTrue(
+            snapshotSuffixRestoreReady(
+                restoredThroughSequence = restored.sequence.toULong(),
+                durableAcknowledgement = durableAcknowledgement,
+                authoritativeTail = durableAcknowledgement,
+            ),
+        )
+    }
+
     @Test
     fun snapshotRuntimeRequiresBothLocalOptInAndPcCapability() {
         val capability = dev.termlink.model.PcCapabilityIds.TERMINAL_SNAPSHOT_V2

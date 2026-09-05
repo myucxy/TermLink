@@ -27,7 +27,7 @@ const claimOutboxEventsSQL = `
 			WHERE processed_at IS NULL AND available_at<=now()
 			  AND event_type IN (
 				'device.revoked','grant.revoked','grant.updated','lease.revoked',
-				'account.status.changed','history.object.delete'
+				'account.status.changed'
 			  )
 			ORDER BY id
 			FOR UPDATE SKIP LOCKED

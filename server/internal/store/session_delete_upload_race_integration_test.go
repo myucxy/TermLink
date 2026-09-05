@@ -15,6 +15,7 @@ import (
 )
 
 func TestSessionDeleteAndHistoryUploadAreMutuallySerialized(t *testing.T) {
+	t.Skip("legacy server terminal-history uploads were retired by migration 39")
 	databaseURL := os.Getenv("TERMLINK_INTEGRATION_DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("production infrastructure integration environment is not configured")

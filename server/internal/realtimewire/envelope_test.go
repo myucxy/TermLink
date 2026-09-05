@@ -62,3 +62,38 @@ func TestEnvelopeRejectsTLT1(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestHostHistoryAndTerminationEnvelopeRoundTrips(t *testing.T) {
+	tests := []struct {
+		name      string
+		message   MessageType
+		direction Direction
+	}{
+		{name: "android request", message: HostHistoryRequest, direction: AndroidToPC},
+		{name: "android control", message: HostHistoryControl, direction: AndroidToPC},
+		{name: "pc response", message: HostHistoryResponse, direction: PCToAndroid},
+		{name: "termination response", message: SessionTerminateResponse, direction: PCToAndroid},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			want := testEnvelope()
+			want.MessageType = test.message
+			want.Direction = test.direction
+			want.RecipientDeviceID = bytes.Repeat([]byte{0x55}, 16)
+			encoded, err := want.Marshal()
+			if err != nil {
+				t.Fatalf("marshal request-correlated envelope: %v", err)
+			}
+			got, err := Unmarshal(encoded)
+			if err != nil {
+				t.Fatalf("unmarshal request-correlated envelope: %v", err)
+			}
+			if got.MessageType != want.MessageType || got.Direction != want.Direction ||
+				!bytes.Equal(got.RecipientDeviceID, want.RecipientDeviceID) ||
+				!bytes.Equal(got.Ciphertext, want.Ciphertext) {
+				t.Fatalf("request-correlated envelope changed across wire: got=%#v want=%#v", got, want)
+			}
+		})
+	}
+}

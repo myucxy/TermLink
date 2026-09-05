@@ -155,7 +155,7 @@ TermLink 不是远程桌面，也不抓取 Windows Terminal 的图像。它传�
 - 使用 TLS WebSocket 转发加密后的实时事件；
 - 支持心跳、断线检测、ACK、按序重发、背压和限流；
 - 服务端只保存完成路由所需的元数据，无法解密终端正文；
-- 历史内容若启用云端保存，以端到端加密的数据块写入对象存储；
+- 终端历史不在服务端保存，由在线 Windows 主机从本地 WAL/checkpoint 按需提供；
 - 支持令牌刷新、设备撤销、密钥轮换和所有会话强制下线；
 - 记录安全审计元数据：登录、设备注册/撤销、控制租约、会话开始/结束和删除操作；兼容 pairing/grant API 被调用时仍记录对应审计；
 - 审计日志默认不记录命令正文、终端正文、访问令牌或明文密钥。
@@ -174,18 +174,16 @@ TermLink 不是远程桌面，也不抓取 Windows Terminal 的图像。它传�
 
 每个事件至少包含 `session_id`、单调递增的 `seq`、时间戳、事件类型和加密载荷。终端正文按大小或时间切块，快照用于快速打开长会话，事件用于准确重放快照后的变化。
 
-#### Tail-first 历史对象行为
+#### Tail-first 主机历史行为
 
-启用新能力后，Windows 以 durable `LocalFrame`/producer WAL 为唯一历史物化前缀：从同一
-1..S 前缀物化 Snapshot 与 Transcript，并在 durable ordered outbox 中按接收 Android 设备
-分别密封；上传提交顺序固定为 Transcript Page 在先、Snapshot S 最后。服务端只有
-在 transcript-first 提交屏障完成后，才可把 Snapshot S 返回给该接收设备。Transcript-first 是
-生产顺序，不等于 Android 首开下载顺序；首开仍只下载一个 Snapshot。
+Windows 以 durable `LocalFrame`/producer WAL 为唯一历史物化前缀：从同一 1..S 前缀
+物化 Snapshot、Event Range 与 Transcript，并按请求 Android 设备分别密封。Android 通过
+`host_history_v1` 会话请求取得对象；Relay 只透明转发，不持久化或选择对象。首开先取一个
+Snapshot，再有界回放后缀；上滑时才按需请求 Transcript Page。
 
-旧能力 `bounded_event_replay_v1` 继续作为默认生产恢复与失败回退。新的
-`terminal_snapshot_v1` capability 必须经双方能力协商和运行开关共同开启；
-`TerminalTranscriptPageV1` 是受同一门禁约束的 REST 对象类型，不是独立 wire capability。
-缺对象、认证失败、设备不匹配、Key Epoch 不匹配、安装失败或 S+1 缺失时 fail closed，不得把
+`terminal_snapshot_v1` 与 `host_history_v1` 必须经双方能力协商和运行开关共同开启；
+`TerminalTranscriptPageV1` 受同一门禁约束，不是独立 live event。主机离线、缺对象、
+认证失败、设备不匹配、Key Epoch 不匹配、安装失败或 S+1 缺失时 fail closed，不得把
 中段 VT 字节喂给空 parser，也不得把固定 S 的 Transcript 行拼进 live parser。
 
 默认建议：
@@ -261,7 +259,7 @@ TermLink Session Host ── ConPTY ── PowerShell / CMD / WSL
 TermLink PC Agent
         │ E2EE payload over TLS WebSocket
         ▼
-Cloud API + Realtime Relay ── PostgreSQL / Redis / Object Storage
+Cloud API + Realtime Relay ── PostgreSQL / Redis
         │ E2EE payload over TLS WebSocket
         ▼
 Android App + Terminal Renderer
@@ -273,7 +271,7 @@ Android App + Terminal Renderer
 | --- | --- |
 | Session Host | 创建 ConPTY、桥接本地终端、采集 I/O、处理 resize 和 Shell 生命周期 |
 | PC Agent | 登录和设备密钥、会话目录、加密、缓冲、重连、权限策略和本地通知 |
-| API 服务 | 账号归属、设备、撤销状态、会话元数据、历史索引和审计接口；兼容旧授权 API |
+| API 服务 | 账号归属、设备、撤销状态、会话与文件任务元数据和审计接口；兼容旧授权 API |
 | Realtime Relay | PC/Android 在线连接、路由、ACK、背压和输入租约协调 |
 | Android App | 设备与会话浏览、解密、ANSI 渲染、历史回放和远程输入 |
 
@@ -287,7 +285,7 @@ Android App + Terminal Renderer
 | API/Relay | Go | WebSocket 并发、低资源占用和单文件部署较合适 |
 | 数据库 | PostgreSQL | 账号、设备、权限、会话索引和审计元数据 |
 | 在线状态/租约 | Redis | TTL、心跳状态、分布式输入租约和临时路由 |
-| 历史内容 | S3 兼容对象存储 | 适合存放不可变的加密事件块和快照 |
+| 历史内容 | Windows App 私有目录 | 会话运行期间保存 WAL/checkpoint；显式关闭会话后销毁 |
 | 协议 | WebSocket + Protobuf 二进制帧 | 双向、低延迟、字段演进和流量控制较直接 |
 
 首个验证版本可将 API 与 Relay 合并为一个 Go 服务，并暂不引入消息队列。只有在多实例路由或事件量确实需要时再引入 NATS/Kafka，避免过早复杂化。
@@ -393,11 +391,11 @@ PC 本地用户始终可以查看远端连接状态、撤销输入租约或停�
 3. Android 能正确显示常见 ANSI 输出、中文、颜色、光标移动和一个典型 TUI 程序。
 4. Android 获得输入租约后，可以发送文本、Enter、方向键和 Ctrl+C；只读设备的输入被可靠拒绝。
 5. Wi-Fi/蜂窝网络切换并断开 30 秒后，会话可自动重连，已确认输出不重复，缺失输出可补齐或明确提示缺口。
-6. Relay 数据库、对象存储、应用日志和运维监控中均不能查到终端明文。
+6. Relay、数据库、应用日志和运维监控中均不能查到终端明文，服务端不得保存历史或文件正文。
 7. 撤销 Android 设备后，该设备的现有连接及时断开，旧令牌无法重新连接，新的会话密钥不再发给该设备。
 8. PC 断网或 Relay 停机时，本地 Terminal 仍可正常输入和运行命令。
 9. PC 用户可以一键切换只读/禁用远程访问，并能明确看到当前远程查看和控制状态。
-10. 删除历史会话后，列表不可见且对应加密内容进入可验证的删除流程。
+10. Windows 或 Android 显式关闭会话后，目录记录消失且 Windows 本地历史目录被删除。
 
 ### 9.1 Tail-first 七项原始需求验收表
 

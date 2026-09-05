@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -76,6 +77,7 @@ func TestNegotiatedCapabilitiesAreBoundedAndOrdered(t *testing.T) {
 		"flow_control_v1",
 		"e2ee_x25519_chacha20poly1305",
 		"terminal_presentation_metadata_v1",
+		"host_history_v1",
 	}
 	got := negotiatedCapabilities(offered)
 	want := []string{
@@ -86,6 +88,7 @@ func TestNegotiatedCapabilitiesAreBoundedAndOrdered(t *testing.T) {
 		"terminal_presentation_metadata_v1",
 		"terminal_typed_input_v1",
 		"liveness_probe_v1",
+		"host_history_v1",
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("negotiated capabilities = %v, want %v", got, want)
@@ -226,6 +229,8 @@ func TestRealtimeMessageDirectionACLIsExhaustive(t *testing.T) {
 		realtimewire.ThemeChanged, realtimewire.SessionStarted,
 		realtimewire.SessionInterrupted, realtimewire.SessionEnded,
 		realtimewire.SessionTerminateRequest,
+		realtimewire.HostHistoryRequest, realtimewire.HostHistoryResponse,
+		realtimewire.HostHistoryControl, realtimewire.SessionTerminateResponse,
 	}
 	android := map[realtimewire.MessageType]bool{
 		realtimewire.Heartbeat: true, realtimewire.Goodbye: true,
@@ -234,6 +239,8 @@ func TestRealtimeMessageDirectionACLIsExhaustive(t *testing.T) {
 		realtimewire.InputEvent: true, realtimewire.ResizeRequest: true,
 		realtimewire.ResumeRequest: true, realtimewire.LeaseRequest: true,
 		realtimewire.SessionTerminateRequest: true,
+		realtimewire.HostHistoryRequest:      true,
+		realtimewire.HostHistoryControl:      true,
 	}
 	pc := map[realtimewire.MessageType]bool{
 		realtimewire.Heartbeat: true, realtimewire.Goodbye: true,
@@ -245,6 +252,8 @@ func TestRealtimeMessageDirectionACLIsExhaustive(t *testing.T) {
 		realtimewire.LeaseDenied: true, realtimewire.LeaseRevoked: true,
 		realtimewire.ThemeChanged: true, realtimewire.SessionStarted: true,
 		realtimewire.SessionInterrupted: true, realtimewire.SessionEnded: true,
+		realtimewire.HostHistoryResponse:      true,
+		realtimewire.SessionTerminateResponse: true,
 	}
 	for _, messageType := range all {
 		if got := allowedMessage("android", messageType); got != android[messageType] {
@@ -273,6 +282,8 @@ func TestEnvelopeACKMetadataContract(t *testing.T) {
 		realtimewire.OutputChunk, realtimewire.InputEvent, realtimewire.ResizeRequest,
 		realtimewire.LeaseRequest, realtimewire.SessionEnded,
 		realtimewire.SessionTerminateRequest,
+		realtimewire.HostHistoryRequest, realtimewire.HostHistoryResponse,
+		realtimewire.HostHistoryControl, realtimewire.SessionTerminateResponse,
 	} {
 		if validEnvelopeACK(realtimewire.Envelope{MessageType: messageType, ACK: 42}) {
 			t.Fatalf("message %d accepted a forbidden ACK", messageType)
@@ -281,6 +292,227 @@ func TestEnvelopeACKMetadataContract(t *testing.T) {
 			t.Fatalf("message %d rejected ack=0", messageType)
 		}
 	}
+}
+
+func TestHostHistoryCapabilityIsOptionalAndNegotiatedWhenOffered(t *testing.T) {
+	withoutHistory := clientHello{
+		Role:             "android",
+		ProtocolVersions: []uint32{realtimewire.ProtocolVersion},
+		Capabilities:     append([]string(nil), requiredCapabilities...),
+	}
+	if !validHello(withoutHistory) {
+		t.Fatal("host history capability became mandatory")
+	}
+	for _, capability := range negotiatedCapabilities(withoutHistory.Capabilities) {
+		if capability == "host_history_v1" {
+			t.Fatal("unoffered host history capability was negotiated")
+		}
+	}
+
+	withHistory := withoutHistory
+	withHistory.Capabilities = append(withHistory.Capabilities, "host_history_v1")
+	if !validHello(withHistory) {
+		t.Fatal("host history capability prevented a valid hello")
+	}
+	negotiated := negotiatedCapabilities(withHistory.Capabilities)
+	if !containsRelayCapability(negotiated, "host_history_v1") {
+		t.Fatalf("host history capability was not negotiated: %v", negotiated)
+	}
+}
+
+func TestHostHistoryFramesRouteFromAndroidToPC(t *testing.T) {
+	for _, messageType := range []realtimewire.MessageType{
+		realtimewire.HostHistoryRequest,
+		realtimewire.HostHistoryControl,
+	} {
+		t.Run(strconv.FormatUint(uint64(messageType), 10), func(t *testing.T) {
+			hub := NewHubWithObserver(nil, nil, nil, nil)
+			userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+			android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+			android.capabilities = map[string]bool{"host_history_v1": true}
+			hub.subscribe(android, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
+
+			frame := []byte("opaque-host-history-frame")
+			envelope := realtimewire.Envelope{
+				MessageType:       messageType,
+				RecipientDeviceID: pcID[:],
+				Sequence:          1,
+			}
+			if err := android.route(envelope, sessionID, frame); err != nil {
+				t.Fatalf("Host History frame %d route: %v", messageType, err)
+			}
+			select {
+			case received := <-pc.send:
+				if string(received) != string(frame) {
+					t.Fatalf("PC received host history frame %d = %q, want %q", messageType, received, frame)
+				}
+			default:
+				t.Fatalf("PC did not receive host history frame %d", messageType)
+			}
+		})
+	}
+}
+
+func TestOutOfBandPCResponsesBypassTerminalReplaySequence(t *testing.T) {
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	userID, pcID, androidID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+	pc.capabilities = map[string]bool{"host_history_v1": true}
+	hub.subscribe(android, sessionID, store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: pcID})
+
+	outputOne := []byte("terminal-output-1")
+	outputEnvelope := realtimewire.Envelope{
+		RecipientDeviceID: androidID[:],
+		MessageType:       realtimewire.OutputChunk,
+		Sequence:          1,
+	}
+	if err := pc.routePCFrame(outputEnvelope, sessionID, androidID, outputOne); err != nil {
+		t.Fatalf("initial terminal output route: %v", err)
+	}
+	if received := <-android.send; string(received) != string(outputOne) {
+		t.Fatalf("initial terminal output = %q, want %q", received, outputOne)
+	}
+
+	for _, response := range []struct {
+		messageType realtimewire.MessageType
+		frame       []byte
+	}{
+		{messageType: realtimewire.HostHistoryResponse, frame: []byte("opaque-host-history-response")},
+		{messageType: realtimewire.SessionTerminateResponse, frame: []byte("opaque-session-terminate-response")},
+	} {
+		envelope := realtimewire.Envelope{
+			RecipientDeviceID: androidID[:],
+			MessageType:       response.messageType,
+			// Request-correlated response sequences are intentionally unrelated
+			// to the ordered terminal output sequence.
+			Sequence: 900,
+		}
+		if err := pc.routePCFrame(envelope, sessionID, androidID, response.frame); err != nil {
+			t.Fatalf("out-of-band response %d route: %v", response.messageType, err)
+		}
+		if got := pcRouteHighWater(pc, sessionID, androidID); got != 1 {
+			t.Fatalf("out-of-band response %d changed terminal high-water to %d, want 1", response.messageType, got)
+		}
+		if received := <-android.send; string(received) != string(response.frame) {
+			t.Fatalf("Android response %d = %q, want %q", response.messageType, received, response.frame)
+		}
+	}
+
+	outputTwo := []byte("terminal-output-2")
+	outputEnvelope.Sequence = 2
+	if err := pc.routePCFrame(outputEnvelope, sessionID, androidID, outputTwo); err != nil {
+		t.Fatalf("terminal output after host history response: %v", err)
+	}
+	if got := pcRouteHighWater(pc, sessionID, androidID); got != 2 {
+		t.Fatalf("terminal high-water after host history response = %d, want 2", got)
+	}
+	if received := <-android.send; string(received) != string(outputTwo) {
+		t.Fatalf("terminal output after host history response = %q, want %q", received, outputTwo)
+	}
+}
+
+func TestUnnegotiatedHostHistoryFramesAreRejectedWithoutClosingPeer(t *testing.T) {
+	tests := []struct {
+		name      string
+		role      string
+		message   realtimewire.MessageType
+		direction realtimewire.Direction
+	}{
+		{name: "android request", role: "android", message: realtimewire.HostHistoryRequest, direction: realtimewire.AndroidToPC},
+		{name: "android control", role: "android", message: realtimewire.HostHistoryControl, direction: realtimewire.AndroidToPC},
+		{name: "pc response", role: "pc", message: realtimewire.HostHistoryResponse, direction: realtimewire.PCToAndroid},
+		{name: "pc termination response", role: "pc", message: realtimewire.SessionTerminateResponse, direction: realtimewire.PCToAndroid},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			hub := NewHubWithObserver(nil, nil, nil, nil)
+			userID, senderID, recipientID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+			senderSocket, senderClient := newRelayWebSocketPair(t)
+			sender := testPeer(hub, senderID)
+			sender.socket = senderSocket
+			sender.role = test.role
+			sender.principal.UserID = userID
+			sender.capabilities = capabilitySet(requiredCapabilities)
+			recipient := testPeer(hub, recipientID)
+			recipient.role = "android"
+			if test.role == "android" {
+				recipient.role = "pc"
+			}
+			recipient.principal.UserID = userID
+			hub.peers[senderID] = sender
+			hub.peers[recipientID] = recipient
+			route := store.SessionRouteAuthorization{Permission: "VIEW", PCDeviceID: recipientID}
+			if test.role == "pc" {
+				route.PCDeviceID = senderID
+				hub.subscribe(recipient, sessionID, route)
+			} else {
+				hub.subscribe(sender, sessionID, route)
+			}
+			go sender.readLoop()
+			defer func() {
+				_ = senderClient.Close()
+				select {
+				case <-sender.done:
+				case <-time.After(time.Second):
+					t.Error("sender read loop did not stop after test socket close")
+				}
+			}()
+
+			historyFrame := relayTestEnvelope(t, test.message, test.direction, senderID, recipientID, sessionID, 1)
+			if err := senderClient.WriteMessage(websocket.BinaryMessage, historyFrame); err != nil {
+				t.Fatalf("write unnegotiated host history frame: %v", err)
+			}
+			heartbeatFrame := relayTestEnvelope(t, realtimewire.Heartbeat, test.direction, senderID, recipientID, sessionID, 1)
+			if err := senderClient.WriteMessage(websocket.BinaryMessage, heartbeatFrame); err != nil {
+				t.Fatalf("write post-rejection heartbeat: %v", err)
+			}
+			select {
+			case received := <-recipient.send:
+				if string(received) != string(heartbeatFrame) {
+					t.Fatalf("recipient received unnegotiated host history frame %q, want heartbeat %q", received, heartbeatFrame)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("post-rejection heartbeat was not routed")
+			}
+			select {
+			case <-sender.done:
+				t.Fatal("unnegotiated host history frame closed the authenticated peer")
+			default:
+			}
+		})
+	}
+}
+
+func containsRelayCapability(capabilities []string, wanted string) bool {
+	for _, capability := range capabilities {
+		if capability == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func relayTestEnvelope(t *testing.T, messageType realtimewire.MessageType, direction realtimewire.Direction, senderID, recipientID, sessionID uuid.UUID, sequence uint64) []byte {
+	t.Helper()
+	envelope := realtimewire.Envelope{
+		ProtocolVersion:   realtimewire.ProtocolVersion,
+		MessageType:       messageType,
+		SessionID:         sessionID[:],
+		SenderDeviceID:    senderID[:],
+		Direction:         direction,
+		Sequence:          sequence,
+		SentAtMS:          time.Now().UnixMilli(),
+		KeyID:             []byte("host-history-key"),
+		Nonce:             []byte("0123456789ab"),
+		Ciphertext:        []byte("0123456789abcdef"),
+		RecipientDeviceID: recipientID[:],
+	}
+	frame, err := envelope.Marshal()
+	if err != nil {
+		t.Fatalf("marshal relay test envelope: %v", err)
+	}
+	return frame
 }
 
 func TestAndroidControlMessagePermissionPolicy(t *testing.T) {

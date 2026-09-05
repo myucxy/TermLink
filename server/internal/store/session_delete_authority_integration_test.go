@@ -42,9 +42,6 @@ func TestSessionDeletionRejectsActiveAndCleansOfflineSessionAtomically(t *testin
 	crossManagerID := uuid.New()
 	subject := sha256.Sum256([]byte("session-delete-authority:" + userID.String()))
 	crossSubject := sha256.Sum256([]byte("session-delete-authority-cross:" + crossUserID.String()))
-	digest := sha256.Sum256([]byte("session-delete-history"))
-	objectPrefix := "session-delete-authority/" + sessionID.String()
-
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
@@ -79,23 +76,6 @@ func TestSessionDeletionRejectsActiveAndCleansOfflineSessionAtomically(t *testin
 		t.Fatal(err)
 	}
 	if _, err := repository.Pool.Exec(ctx, `
-		INSERT INTO event_chunks(id,session_id,start_seq,end_seq,object_key,key_id,ciphertext_sha256,size_bytes)
-		VALUES($1,$2,1,3,$3,'delete-key-0001',$4,128)`, uuid.New(), sessionID, objectPrefix+"/chunk.bin", digest[:]); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := repository.Pool.Exec(ctx, `
-		INSERT INTO snapshots(id,session_id,snapshot_seq,rows,columns,object_key,key_id,ciphertext_sha256,size_bytes,format_name,format_version)
-		VALUES($1,$2,3,40,120,$3,'delete-key-0001',$4,128,'BOUNDED_EVENT_REPLAY',1)`,
-		uuid.New(), sessionID, objectPrefix+"/snapshot.bin", digest[:]); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := repository.Pool.Exec(ctx, `
-		INSERT INTO history_uploads(id,user_id,actor_device_id,session_id,kind,object_key,key_id,ciphertext_sha256,size_bytes,start_seq,end_seq,expires_at)
-		VALUES($1,$2,$3,$4,'CHUNK',$5,'delete-key-0002',$6,128,4,6,now()+interval '1 hour')`,
-		uuid.New(), userID, managerID, sessionID, objectPrefix+"/pending.bin", digest[:]); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := repository.Pool.Exec(ctx, `
 		INSERT INTO control_leases(session_id,holder_device_id,lease_id,expires_at,version)
 		VALUES($1,$2,$3,now()+interval '1 minute',1)`, sessionID, managerID, uuid.New()); err != nil {
 		t.Fatal(err)
@@ -104,7 +84,7 @@ func TestSessionDeletionRejectsActiveAndCleansOfflineSessionAtomically(t *testin
 	if _, err := repository.SessionHistoryObjectKeys(ctx, userID, managerID, sessionID); !errors.Is(err, ErrSessionActive) {
 		t.Fatalf("active deletion preflight err=%v, want ErrSessionActive", err)
 	}
-	assertSessionDeletionRows(t, ctx, repository, sessionID, "RUNNING", 0, 0, 1, 1)
+	assertSessionDeletionRows(t, ctx, repository, sessionID, "RUNNING", 1)
 
 	if _, err := repository.Pool.Exec(ctx, `UPDATE pcs SET last_seen_at=now()-interval '46 seconds' WHERE id=$1`, pcID); err != nil {
 		t.Fatal(err)
@@ -113,8 +93,8 @@ func TestSessionDeletionRejectsActiveAndCleansOfflineSessionAtomically(t *testin
 	if err != nil {
 		t.Fatalf("offline deletion preflight: %v", err)
 	}
-	if len(keys) != 3 {
-		t.Fatalf("offline deletion keys=%v, want 3 history objects", keys)
+	if len(keys) != 0 {
+		t.Fatalf("offline deletion keys=%v, want no server-owned history objects", keys)
 	}
 
 	// A PC heartbeat after the object-key preflight must be caught again while
@@ -125,7 +105,7 @@ func TestSessionDeletionRejectsActiveAndCleansOfflineSessionAtomically(t *testin
 	if err := repository.MarkSessionDeleted(ctx, userID, managerID, sessionID, "session-delete-race"); !errors.Is(err, ErrSessionActive) {
 		t.Fatalf("transaction active recheck err=%v, want ErrSessionActive", err)
 	}
-	assertSessionDeletionRows(t, ctx, repository, sessionID, "RUNNING", 0, 0, 1, 1)
+	assertSessionDeletionRows(t, ctx, repository, sessionID, "RUNNING", 1)
 
 	if _, err := repository.Pool.Exec(ctx, `UPDATE pcs SET last_seen_at=now()-interval '46 seconds' WHERE id=$1`, pcID); err != nil {
 		t.Fatal(err)
@@ -133,8 +113,7 @@ func TestSessionDeletionRejectsActiveAndCleansOfflineSessionAtomically(t *testin
 	if err := repository.MarkSessionDeleted(ctx, userID, managerID, sessionID, "session-delete-offline"); err != nil {
 		t.Fatalf("delete offline session: %v", err)
 	}
-	assertSessionDeletionRows(t, ctx, repository, sessionID, "DELETED", 1, 1, 0, 0)
-	assertHistoryDeleteOutbox(t, ctx, repository, sessionID, objectPrefix+"/chunk.bin", objectPrefix+"/snapshot.bin", objectPrefix+"/pending.bin")
+	assertSessionDeletionRows(t, ctx, repository, sessionID, "DELETED", 0)
 
 	keys, err = repository.SessionHistoryObjectKeys(ctx, userID, managerID, sessionID)
 	if err != nil || len(keys) != 0 {
@@ -160,6 +139,23 @@ func TestSessionDeletionRejectsActiveAndCleansOfflineSessionAtomically(t *testin
 	}
 }
 
+func assertSessionDeletionRows(t *testing.T, ctx context.Context, repository *Postgres, sessionID uuid.UUID, wantState string, wantLeases int) {
+	t.Helper()
+	var state string
+	var leases int
+	if err := repository.Pool.QueryRow(ctx, `SELECT state FROM sessions WHERE id=$1`, sessionID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Pool.QueryRow(ctx, `SELECT count(*) FROM control_leases WHERE session_id=$1`, sessionID).Scan(&leases); err != nil {
+		t.Fatal(err)
+	}
+	if state != wantState || leases != wantLeases {
+		t.Fatalf("session deletion rows state/leases=%s/%d, want %s/%d", state, leases, wantState, wantLeases)
+	}
+}
+
+// Kept for the skipped pre-migration transcript-history integration fixture.
+// Migration 39 still uses the same public outbox event to erase legacy objects.
 func assertHistoryDeleteOutbox(t *testing.T, ctx context.Context, repository *Postgres, sessionID uuid.UUID, expected ...string) {
 	t.Helper()
 	rows, err := repository.Pool.Query(ctx, `
@@ -189,30 +185,5 @@ func assertHistoryDeleteOutbox(t *testing.T, ctx context.Context, repository *Po
 		if got[key] != 1 {
 			t.Fatalf("history delete outbox key %q count=%d, want 1", key, got[key])
 		}
-	}
-}
-
-func assertSessionDeletionRows(t *testing.T, ctx context.Context, repository *Postgres, sessionID uuid.UUID, wantState string, wantChunks, wantSnapshots, wantUploads, wantLeases int) {
-	t.Helper()
-	var state string
-	var chunks, snapshots, uploads, leases int
-	if err := repository.Pool.QueryRow(ctx, `SELECT state FROM sessions WHERE id=$1`, sessionID).Scan(&state); err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.Pool.QueryRow(ctx, `SELECT count(*) FROM event_chunks WHERE session_id=$1 AND deleted_at IS NOT NULL`, sessionID).Scan(&chunks); err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.Pool.QueryRow(ctx, `SELECT count(*) FROM snapshots WHERE session_id=$1 AND deleted_at IS NOT NULL`, sessionID).Scan(&snapshots); err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.Pool.QueryRow(ctx, `SELECT count(*) FROM history_uploads WHERE session_id=$1`, sessionID).Scan(&uploads); err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.Pool.QueryRow(ctx, `SELECT count(*) FROM control_leases WHERE session_id=$1`, sessionID).Scan(&leases); err != nil {
-		t.Fatal(err)
-	}
-	if state != wantState || chunks != wantChunks || snapshots != wantSnapshots || uploads != wantUploads || leases != wantLeases {
-		t.Fatalf("session deletion rows state/chunks/snapshots/uploads/leases=%s/%d/%d/%d/%d, want %s/%d/%d/%d/%d",
-			state, chunks, snapshots, uploads, leases, wantState, wantChunks, wantSnapshots, wantUploads, wantLeases)
 	}
 }

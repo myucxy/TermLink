@@ -47,14 +47,14 @@ class RemoteDownloadManagementTest {
     }
 
     @Test
-    fun activeMetadataBecomesRetryableFailureAfterProcessRestart() {
+    fun activeMetadataResumesAfterProcessRestart() {
         val active = record(RemoteDownloadStatus.DOWNLOADING)
 
         val restored = restoreRemoteDownloadRecords(listOf(active), Instant.parse("2026-08-24T13:00:00Z")).single()
 
-        assertEquals(RemoteDownloadStatus.FAILED, restored.status)
-        assertTrue(restored.error.orEmpty().contains("restarted"))
-        assertTrue(restored.status.isTerminal)
+        assertEquals(RemoteDownloadStatus.RESUMING, restored.status)
+        assertNull(restored.error)
+        assertTrue(restored.status.isActive)
     }
 
     @Test

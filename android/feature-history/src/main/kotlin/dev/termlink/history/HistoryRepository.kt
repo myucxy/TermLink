@@ -691,8 +691,10 @@ class HistoryRepository(
 
     /**
      * Atomically fences the old renderer and binds ACK [snapshotSequence] to
-     * one exact cached encrypted snapshot. The caller may install its already
-     * validated off-screen renderer only after this transaction succeeds.
+     * one exact cached encrypted snapshot. Legacy callers must provide a
+     * snapshot at or after the durable ACK; Host History uses the explicit
+     * [bindHostRendererCheckpoint] operation below when it has rendered a
+     * suffix from an older snapshot.
      */
     suspend fun bindRendererCheckpoint(
         sessionId: UUID,
@@ -701,6 +703,55 @@ class HistoryRepository(
         snapshotId: UUID,
         snapshotSequence: ULong,
         ciphertextSha256: ByteArray,
+    ): RendererCheckpointState = bindRendererCheckpointInternal(
+        sessionId = sessionId,
+        direction = direction,
+        expectedRendererGeneration = expectedRendererGeneration,
+        snapshotId = snapshotId,
+        snapshotSequence = snapshotSequence,
+        ciphertextSha256 = ciphertextSha256,
+        renderedThroughSequence = snapshotSequence,
+    )
+
+    /**
+     * Binds a Host Snapshot anchor [snapshotSequence] after its renderer has
+     * applied the contiguous suffix through [renderedThroughSequence]. The
+     * operation is intentionally separate from the legacy bind API: it allows
+     * an older immutable anchor, but can never regress the existing durable
+     * ACK and fences the old renderer in the same Room transaction.
+     */
+    suspend fun bindHostRendererCheckpoint(
+        sessionId: UUID,
+        direction: String,
+        expectedRendererGeneration: Long,
+        snapshotId: UUID,
+        snapshotSequence: ULong,
+        renderedThroughSequence: ULong,
+        ciphertextSha256: ByteArray,
+    ): RendererCheckpointState {
+        require(renderedThroughSequence > 0u) { "rendered cursor must be positive" }
+        require(snapshotSequence <= renderedThroughSequence) {
+            "renderer cursor must reach the snapshot anchor"
+        }
+        return bindRendererCheckpointInternal(
+            sessionId = sessionId,
+            direction = direction,
+            expectedRendererGeneration = expectedRendererGeneration,
+            snapshotId = snapshotId,
+            snapshotSequence = snapshotSequence,
+            ciphertextSha256 = ciphertextSha256,
+            renderedThroughSequence = renderedThroughSequence,
+        )
+    }
+
+    private suspend fun bindRendererCheckpointInternal(
+        sessionId: UUID,
+        direction: String,
+        expectedRendererGeneration: Long,
+        snapshotId: UUID,
+        snapshotSequence: ULong,
+        ciphertextSha256: ByteArray,
+        renderedThroughSequence: ULong,
     ): RendererCheckpointState {
         require(expectedRendererGeneration > 0) { "renderer generation must be positive" }
         require(expectedRendererGeneration < Long.MAX_VALUE) { "renderer generation is exhausted" }
@@ -710,6 +761,7 @@ class HistoryRepository(
         val safeDirection = direction.requireNonBlank("ACK direction")
         val safeSnapshotId = snapshotId.requireUuidString()
         val sequence = snapshotSequence.toRoomSequence("snapshot sequence")
+        val rendererCursor = renderedThroughSequence.toRoomSequence("rendered cursor")
         val expectedDigest = ciphertextSha256.copyOf()
         return database.withTransaction {
             val snapshot = requireNotNull(snapshots.get(safeSnapshotId)) {
@@ -745,22 +797,23 @@ class HistoryRepository(
             val cursor = requireNotNull(acks.get(safeSessionId, safeDirection)) {
                 "ACK cursor must be initialized before binding a renderer checkpoint"
             }
-            require(cursor.rendererGeneration == expectedRendererGeneration) { "ACK renderer generation is stale" }
-            require(cursor.highestContiguousSequence <= sequence) {
+            require(cursor.rendererGeneration == expectedRendererGeneration) {
+                "ACK renderer generation is stale"
+            }
+            require(rendererCursor >= cursor.highestContiguousSequence) {
                 "renderer checkpoint cannot regress the durable ACK cursor"
             }
             val updatedAt = clockMillis()
-            val bindingGeneration = expectedRendererGeneration
             check(
                 acks.installRendererCheckpoint(
                     safeSessionId,
                     safeDirection,
-                    bindingGeneration,
-                    sequence,
+                    expectedRendererGeneration,
+                    rendererCursor,
                     updatedAt,
                 ) == 1,
             ) { "ACK renderer generation changed during checkpoint binding" }
-            val nextGeneration = bindingGeneration + 1
+            val nextGeneration = expectedRendererGeneration + 1
             rendererCheckpoints.upsert(
                 RendererCheckpointEntity(
                     sessionId = safeSessionId,
@@ -772,7 +825,7 @@ class HistoryRepository(
                     updatedAtEpochMillis = updatedAt,
                 ),
             )
-            checkpointState(snapshot, sequence, nextGeneration, sequence)
+            checkpointState(snapshot, sequence, nextGeneration, rendererCursor)
         }
     }
 

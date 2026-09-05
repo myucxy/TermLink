@@ -687,6 +687,7 @@ private fun remoteDownloadStatusLabel(record: RemoteDownloadRecord): String = wh
     RemoteDownloadStatus.PREPARING -> stringResource(
         if (record.directoryZip) R.string.remote_download_compressing else R.string.remote_download_preparing,
     )
+    RemoteDownloadStatus.RESUMING -> stringResource(R.string.remote_download_resuming)
     RemoteDownloadStatus.DOWNLOADING -> stringResource(R.string.remote_download_downloading)
     RemoteDownloadStatus.VERIFYING -> stringResource(R.string.remote_download_verifying)
     RemoteDownloadStatus.COMPLETED -> stringResource(R.string.remote_download_completed)

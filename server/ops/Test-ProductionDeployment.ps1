@@ -231,7 +231,6 @@ $envPath = [IO.Path]::GetFullPath($EnvFile)
 Assert-Production (Test-Path -LiteralPath $envPath -PathType Leaf) "Environment file not found: $envPath"
 $composeFiles = @(Resolve-TermLinkComposeFiles -ComposeFile $ComposeFile)
 $coreComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\core.compose.yml'))
-$historyComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\history.compose.yml'))
 $observabilityComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\observability.compose.yml'))
 $externalServicesComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\external-services.compose.yml'))
 $registrationRecoveryComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\registration-recovery.compose.yml'))
@@ -240,7 +239,6 @@ $accountDeletionComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '.
 $directTransportComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\direct-transport.compose.yml'))
 $reviewedComposePaths = @(
     $coreComposePath,
-    $historyComposePath,
     $observabilityComposePath,
     $externalServicesComposePath,
     $registrationRecoveryComposePath,
@@ -254,7 +252,6 @@ foreach ($composeFile in $composeFiles) {
 }
 Assert-Production (@($composeFiles | Sort-Object -Unique).Count -eq $composeFiles.Count) `
     'Production Compose files must not be supplied more than once.'
-$historyOverlayRequested = $composeFiles -contains $historyComposePath
 $observabilityOverlayRequested = $composeFiles -contains $observabilityComposePath
 $externalServicesOverlayRequested = $composeFiles -contains $externalServicesComposePath
 $registrationRecoveryOverlayRequested = $composeFiles -contains $registrationRecoveryComposePath
@@ -263,11 +260,6 @@ $accountDeletionOverlayRequested = $composeFiles -contains $accountDeletionCompo
 $directTransportOverlayRequested = $composeFiles -contains $directTransportComposePath
 Assert-Production ($composeFiles -contains $coreComposePath) `
     'Production validation requires the reviewed core.compose.yml foundation.'
-Assert-Production (-not ($historyOverlayRequested -and $externalServicesOverlayRequested)) `
-    'history.compose.yml and external-services.compose.yml are mutually exclusive history providers.'
-Assert-Production (-not $accountDeletionOverlayRequested -or
-    $historyOverlayRequested -or $externalServicesOverlayRequested) `
-    'account-deletion.compose.yml requires one reviewed History/S3 provider.'
 $arguments = @('compose', '--env-file', $envPath, '--project-name', 'termlink-policy')
 foreach ($file in $composeFiles) { $arguments += @('-f', $file) }
 if ($IncludeEdge) { $arguments += @('--profile', 'edge') }
@@ -283,7 +275,6 @@ catch {
 $services = @($config.services.PSObject.Properties)
 $requiredServices = @('migrate', 'postgres', 'server', 'valkey')
 if ($IncludeEdge) { $requiredServices += 'edge' }
-if ($historyOverlayRequested) { $requiredServices += 'minio' }
 if ($observabilityOverlayRequested) {
     $requiredServices += @('alertmanager', 'blackbox', 'grafana', 'prometheus')
 }
@@ -297,7 +288,6 @@ $approvedImages = @{
     postgres = 'postgres:17.5-alpine3.22@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa'
     valkey = 'valkey/valkey:8.1.1-alpine@sha256:6a57d58c0a37cf7acc3045ac0fd6dd91be339774106ab4d9ca088013a096a99f'
     'direct-valkey' = 'valkey/valkey:8.1.1-alpine@sha256:6a57d58c0a37cf7acc3045ac0fd6dd91be339774106ab4d9ca088013a096a99f'
-    minio = 'minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e'
     prometheus = 'prom/prometheus:v2.55.1@sha256:2659f4c2ebb718e7695cb9b25ffa7d6be64db013daba13e05c875451cf51b0d3'
     blackbox = 'prom/blackbox-exporter:v0.25.0@sha256:b04a9fef4fa086a02fc7fcd8dcdbc4b7b35cc30cdee860fdc6a19dd8b208d63e'
     alertmanager = 'prom/alertmanager:v0.27.0@sha256:e13b6ed5cb929eeaee733479dce55e10eb3bc2e9c4586c705a4e8da41e5eacf5'
@@ -305,15 +295,11 @@ $approvedImages = @{
 }
 $expectedNetworks = @{
     edge = @('frontend', 'public'); migrate = @('backend'); server = @('backend', 'egress', 'frontend')
-    postgres = @('backend'); valkey = @('backend'); 'direct-valkey' = @('direct-state'); minio = @('object', 'object-control')
+    postgres = @('backend'); valkey = @('backend'); 'direct-valkey' = @('direct-state')
     # Metrics and readiness probes use frontend to reach the application's
     # internal listeners.  Alertmanager also needs egress for configured
     # receivers; no observability service needs backend access.
     prometheus = @('frontend'); blackbox = @('frontend'); alertmanager = @('egress', 'frontend'); grafana = @('frontend')
-}
-if ($historyOverlayRequested) {
-    $expectedNetworks.edge = @('frontend', 'object', 'public')
-    $expectedNetworks.server = @('backend', 'egress', 'frontend', 'object-control')
 }
 if ($directTransportOverlayRequested) {
     $expectedNetworks.server = @($expectedNetworks.server + 'direct-state' | Sort-Object -Unique)
@@ -327,39 +313,33 @@ $connectionEnvironment = @(
     'TERMLINK_REDIS_READ_TIMEOUT', 'TERMLINK_REDIS_WRITE_TIMEOUT'
 )
 $allowedEnvironment = @{
-    edge = @('TERMLINK_ACME_CA', 'TERMLINK_ACME_EMAIL', 'TERMLINK_HISTORY_PUBLIC_HOST', 'TERMLINK_PUBLIC_HOST')
-    # Keep the migration allow-list to the core server configuration.  It
-    # deliberately excludes history credentials, which are only merged into
-    # the long-running server by history.compose.yml.
+    edge = @('TERMLINK_ACME_CA', 'TERMLINK_ACME_EMAIL', 'TERMLINK_PUBLIC_HOST')
     migrate = @('TERMLINK_ACCOUNT_DELETION_ENABLED', 'TERMLINK_ANDROID_OIDC_CLIENT_ID', 'TERMLINK_ANDROID_OIDC_REDIRECT_URI',
-        'TERMLINK_DATABASE_URL_FILE', 'TERMLINK_HISTORY_ENABLED', 'TERMLINK_LISTEN_ADDR',
+        'TERMLINK_DATABASE_URL_FILE', 'TERMLINK_LISTEN_ADDR',
         'TERMLINK_LOG_LEVEL', 'TERMLINK_OIDC_ALLOWED_PARTIES', 'TERMLINK_OIDC_CLIENT_ID', 'TERMLINK_OIDC_CLIENT_SECRET_FILE',
         'TERMLINK_OIDC_ISSUER', 'TERMLINK_PUBLIC_URL', 'TERMLINK_REDIS_URL_FILE',
         'TERMLINK_REGISTRATION_RECOVERY_ENABLED', 'TERMLINK_TOKEN_SIGNING_KEY_FILE',
         'TERMLINK_WINDOWS_OIDC_CLIENT_ID', 'TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES', 'TERMLINK_WINDOWS_OIDC_REDIRECT_URI',
         'TERMLINK_WEB_OIDC_CLIENT_ID', 'TERMLINK_WEB_OIDC_REDIRECT_URI', 'TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID')
     # The server receives the same public OIDC settings as migrate, plus its
-    # metrics and optional history settings.  Secret values must remain
+    # metrics and optional feature settings. Secret values must remain
     # file-backed; the validation below enforces /run/secrets paths.
     server = @('TERMLINK_ACCOUNT_DELETION_ENABLED', 'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE',
         'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION', 'TERMLINK_ANDROID_OIDC_CLIENT_ID', 'TERMLINK_ANDROID_OIDC_REDIRECT_URI',
         'TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS', 'TERMLINK_APPSHIP_BASE_URL',
         'TERMLINK_DATABASE_URL_FILE', 'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_DIRECT_STUN_SERVERS',
-        'TERMLINK_DIRECT_TRANSPORT_ENABLED', 'TERMLINK_HISTORY_ENABLED', 'TERMLINK_LISTEN_ADDR',
+        'TERMLINK_DIRECT_TRANSPORT_ENABLED', 'TERMLINK_LISTEN_ADDR',
         'TERMLINK_HUMAN_VERIFICATION_PROVIDER', 'TERMLINK_HUMAN_VERIFICATION_SECRET_FILE', 'TERMLINK_HUMAN_VERIFICATION_SITE_KEY',
         'TERMLINK_KEYCLOAK_ADMIN_BASE_URL', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE',
         'TERMLINK_LOG_LEVEL', 'TERMLINK_METRICS_LISTEN_ADDR', 'TERMLINK_OIDC_ALLOWED_PARTIES', 'TERMLINK_OIDC_CLIENT_ID',
         'TERMLINK_OIDC_CLIENT_SECRET_FILE', 'TERMLINK_OIDC_ISSUER', 'TERMLINK_PUBLIC_URL',
         'TERMLINK_REDIS_URL_FILE', 'TERMLINK_REGISTRATION_RECOVERY_ENABLED',
-        'TERMLINK_S3_ACCESS_KEY_FILE', 'TERMLINK_S3_BUCKET',
-        'TERMLINK_S3_ENDPOINT', 'TERMLINK_S3_PUBLIC_ENDPOINT', 'TERMLINK_S3_REGION',
-        'TERMLINK_S3_SECRET_KEY_FILE', 'TERMLINK_TOKEN_SIGNING_KEY_FILE',
+        'TERMLINK_TOKEN_SIGNING_KEY_FILE',
         'TERMLINK_WINDOWS_OIDC_CLIENT_ID', 'TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES', 'TERMLINK_WINDOWS_OIDC_REDIRECT_URI',
         'TERMLINK_WEB_OIDC_CLIENT_ID', 'TERMLINK_WEB_OIDC_REDIRECT_URI', 'TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID')
     postgres = @('POSTGRES_DB', 'POSTGRES_PASSWORD_FILE', 'POSTGRES_USER')
     valkey = @('TERMLINK_VALKEY_MAXMEMORY')
     'direct-valkey' = @('TERMLINK_DIRECT_VALKEY_MAXMEMORY')
-    minio = @('MINIO_ROOT_PASSWORD_FILE', 'MINIO_ROOT_USER_FILE')
     prometheus = @(); blackbox = @(); alertmanager = @()
     grafana = @('GF_AUTH_ANONYMOUS_ENABLED', 'GF_PATHS_DATA', 'GF_PATHS_LOGS', 'GF_PATHS_PLUGINS',
         'GF_PATHS_PROVISIONING', 'GF_SECURITY_ADMIN_PASSWORD__FILE', 'GF_SECURITY_ADMIN_USER', 'GF_USERS_ALLOW_SIGN_UP')
@@ -376,23 +356,21 @@ $allowedSecretEnvironment = @{
     migrate = @('TERMLINK_DATABASE_URL_FILE', 'TERMLINK_OIDC_CLIENT_SECRET_FILE',
         'TERMLINK_REDIS_URL_FILE', 'TERMLINK_TOKEN_SIGNING_KEY_FILE')
     server = @('TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE', 'TERMLINK_DATABASE_URL_FILE', 'TERMLINK_HUMAN_VERIFICATION_SECRET_FILE', 'TERMLINK_OIDC_CLIENT_SECRET_FILE',
-        'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE', 'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_REDIS_URL_FILE', 'TERMLINK_S3_ACCESS_KEY_FILE',
-        'TERMLINK_S3_SECRET_KEY_FILE', 'TERMLINK_TOKEN_SIGNING_KEY_FILE')
+        'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE', 'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_REDIS_URL_FILE',
+        'TERMLINK_TOKEN_SIGNING_KEY_FILE')
     postgres = @('POSTGRES_PASSWORD_FILE')
     valkey = @()
     'direct-valkey' = @()
-    minio = @('MINIO_ROOT_PASSWORD_FILE', 'MINIO_ROOT_USER_FILE')
     prometheus = @(); blackbox = @(); alertmanager = @()
     grafana = @('GF_SECURITY_ADMIN_PASSWORD__FILE')
 }
-$credentialNamePattern = '(?i)(password|secret|token|identity_key_file|database_url|redis_url|s3_access_key|s3_secret_key)'
+$credentialNamePattern = '(?i)(password|secret|token|identity_key_file|database_url|redis_url)'
 $nonCredentialSecretEnvironment = @()
 foreach ($serviceName in $allowedEnvironment.Keys) {
     $declaredSecrets = @($allowedSecretEnvironment[$serviceName] | Sort-Object)
     $secretLikeNames = @($allowedEnvironment[$serviceName] |
         Where-Object {
-            ($_ -match $credentialNamePattern -and $nonCredentialSecretEnvironment -cnotcontains $_) -or
-                $_ -ceq 'MINIO_ROOT_USER_FILE'
+            $_ -match $credentialNamePattern -and $nonCredentialSecretEnvironment -cnotcontains $_
         } |
         Sort-Object)
     Assert-Production (@(Compare-Object $declaredSecrets $secretLikeNames).Count -eq 0) `
@@ -400,7 +378,7 @@ foreach ($serviceName in $allowedEnvironment.Keys) {
 }
 $expectedCommands = @{
     edge = 'caddy|run|--config|/etc/caddy/Caddyfile|--adapter|caddyfile'; migrate = 'migrate'; server = ''
-    postgres = ''; valkey = '/bin/sh|-ec'; 'direct-valkey' = '/bin/sh|-ec'; minio = 'server|/data|--console-address|:9001'
+    postgres = ''; valkey = '/bin/sh|-ec'; 'direct-valkey' = '/bin/sh|-ec'
     prometheus = '--config.file=/etc/prometheus/prometheus.yml|--storage.tsdb.path=/prometheus'
     blackbox = '--config.file=/etc/blackbox/blackbox.yml'
     alertmanager = '--config.file=/etc/alertmanager/alertmanager.yml|--storage.path=/alertmanager'; grafana = ''
@@ -409,7 +387,7 @@ $expectedHealthchecks = @{
     edge = 'CMD-SHELL|wget -q -O - http://127.0.0.1:8081/readyz >/dev/null'
     migrate = ''; server = 'CMD|/termlink-server|healthcheck'
     postgres = 'CMD-SHELL|pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}'
-    valkey = 'CMD-SHELL|REDISCLI_AUTH="$$(cat /run/secrets/valkey_password)" valkey-cli --user default ping | grep -qx PONG'; minio = 'CMD|mc|ready|local'
+    valkey = 'CMD-SHELL|REDISCLI_AUTH="$$(cat /run/secrets/valkey_password)" valkey-cli --user default ping | grep -qx PONG'
     'direct-valkey' = 'CMD-SHELL|REDISCLI_AUTH="$$(cat /run/secrets/direct_valkey_password)" valkey-cli --user termlink-direct ping | grep -qx PONG'
     prometheus = 'CMD|wget|-q|-O|/dev/null|http://127.0.0.1:9090/-/ready'
     blackbox = 'CMD|/bin/blackbox_exporter|--version'
@@ -455,16 +433,8 @@ $expectedSecretMounts = @{
     postgres = @('postgres_password:postgres_password:::0400')
     valkey = @('valkey_password:valkey_password:999:1000:0400')
     'direct-valkey' = @('direct_valkey_password:direct_valkey_password:999:1000:0400')
-    minio = @('s3_access_key:/run/secrets/s3_access_key:::', 's3_secret_key:/run/secrets/s3_secret_key:::')
     prometheus = @(); blackbox = @(); alertmanager = @()
     grafana = @('grafana_admin_password:grafana_admin_password:472:472:0400')
-}
-$historySecretMounts = @(
-    's3_access_key:s3_access_key:65532:65532:0400',
-    's3_secret_key:s3_secret_key:65532:65532:0400'
-)
-if ($historyOverlayRequested -or $externalServicesOverlayRequested) {
-    $expectedSecretMounts.server = @($expectedSecretMounts.server + $historySecretMounts | Sort-Object)
 }
 if ($registrationRecoveryOverlayRequested) {
     $expectedSecretMounts.server = @($expectedSecretMounts.server +
@@ -486,11 +456,7 @@ if ($directTransportOverlayRequested) {
     $expectedSecretMounts.server = @($expectedSecretMounts.server +
         'direct_redis_url:direct_redis_url:65532:65532:0400' | Sort-Object)
 }
-$edgeCaddyfilePath = if ($historyOverlayRequested) {
-    [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Caddyfile'))
-} else {
-    [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\external-services.Caddyfile'))
-}
+$edgeCaddyfilePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\external-services.Caddyfile'))
 $expectedBindSources = @{
     edge = @{ '/etc/caddy/Caddyfile' = $edgeCaddyfilePath }
     prometheus = @{
@@ -506,10 +472,10 @@ $expectedBindSources = @{
 }
 $allowedNamedVolumeTargets = @{
     edge = @('/config', '/data'); migrate = @(); server = @(); postgres = @('/var/lib/postgresql/data')
-    valkey = @('/data'); 'direct-valkey' = @('/data'); minio = @('/data'); prometheus = @('/prometheus'); blackbox = @()
+    valkey = @('/data'); 'direct-valkey' = @('/data'); prometheus = @('/prometheus'); blackbox = @()
     alertmanager = @('/alertmanager'); grafana = @('/var/lib/grafana')
 }
-$readOnlyServices = @('alertmanager', 'blackbox', 'direct-valkey', 'edge', 'grafana', 'migrate', 'minio', 'prometheus', 'server', 'valkey')
+$readOnlyServices = @('alertmanager', 'blackbox', 'direct-valkey', 'edge', 'grafana', 'migrate', 'prometheus', 'server', 'valkey')
 $expectedUsers = @{
     migrate = '65532:65532'
     server = '65532:65532'
@@ -522,14 +488,13 @@ $expectedTmpfs = @{
     server = @('/tmp:rw,noexec,nosuid,size=16m')
     valkey = @('/run/valkey:rw,noexec,nosuid,size=1m,uid=999,gid=1000,mode=0700')
     'direct-valkey' = @('/run/valkey:rw,noexec,nosuid,size=1m,uid=999,gid=1000,mode=0700')
-    minio = @('/root/.minio:rw,noexec,nosuid,size=16m', '/tmp:rw,noexec,nosuid,size=32m')
     prometheus = @('/tmp:rw,noexec,nosuid,size=16m')
     blackbox = @('/tmp:rw,noexec,nosuid,size=8m')
     alertmanager = @('/tmp:rw,noexec,nosuid,size=16m')
     grafana = @('/tmp:rw,noexec,nosuid,size=32m')
 }
 $resourcePolicyServices = @(
-    'alertmanager', 'blackbox', 'edge', 'grafana', 'migrate', 'minio',
+    'alertmanager', 'blackbox', 'edge', 'grafana', 'migrate',
     'postgres', 'prometheus', 'server', 'valkey', 'direct-valkey'
 )
 foreach ($serviceProperty in $services) {
@@ -730,7 +695,7 @@ foreach ($serviceProperty in $services) {
         foreach ($entry in $environment.PSObject.Properties) {
             Assert-Production ($allowedEnvironment[$name] -contains $entry.Name) `
                 "Service '$name' has unapproved environment variable '$($entry.Name)'."
-            if ($entry.Name -match '(?i)(password|secret|token|identity_key_file|database_url|redis_url|s3_access_key|s3_secret_key)' -and
+            if ($entry.Name -match '(?i)(password|secret|token|identity_key_file|database_url|redis_url)' -and
                 $nonCredentialSecretEnvironment -cnotcontains $entry.Name -and
                 $entry.Name -notmatch '(?i)(_FILE|__FILE)$') {
                 throw "Service '$name' places secret-like configuration in environment variable '$($entry.Name)'."
@@ -884,10 +849,13 @@ if ($accountDeletionEnabled) {
             "Core deployment unexpectedly includes account-deletion setting '$name'."
     }
 }
-$historyExpected = $historyOverlayRequested -or $externalServicesOverlayRequested
-$historyEnabled = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_HISTORY_ENABLED') -ceq 'true'
-Assert-Production ($historyEnabled -eq $historyExpected) `
-    'TERMLINK_HISTORY_ENABLED must exactly match the selected reviewed history overlay.'
+foreach ($name in @(
+    'TERMLINK_HISTORY_ENABLED', 'TERMLINK_S3_ACCESS_KEY_FILE', 'TERMLINK_S3_BUCKET',
+    'TERMLINK_S3_ENDPOINT', 'TERMLINK_S3_PUBLIC_ENDPOINT', 'TERMLINK_S3_REGION', 'TERMLINK_S3_SECRET_KEY_FILE'
+)) {
+    Assert-Production ($null -eq (Get-PropertyValue $serverEnvironment $name)) `
+        "Object-storage setting '$name' must not be present after server-side storage retirement."
+}
 $metricsAddress = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_METRICS_LISTEN_ADDR')
 if ($observabilityOverlayRequested) {
     Assert-Production ($metricsAddress -ceq ':9090') `
@@ -896,34 +864,6 @@ if ($observabilityOverlayRequested) {
     Assert-Production ($metricsAddress -eq '') `
         'Core deployments must not enable a metrics listener without the observability overlay.'
 }
-$s3PublicUri = $null
-if ($historyEnabled) {
-    $s3PublicUri = Assert-ProductionHttpsUri -Value ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_S3_PUBLIC_ENDPOINT')) `
-        -Name 'TERMLINK_S3_PUBLIC_ENDPOINT'
-    Assert-Production ($s3PublicUri.AbsolutePath -eq '/' -and $s3PublicUri.Query -eq '' -and
-        $s3PublicUri.Fragment -eq '' -and $s3PublicUri.UserInfo -eq '') `
-        'TERMLINK_S3_PUBLIC_ENDPOINT must be an HTTPS origin without path, query, fragment, or user info.'
-    Assert-Production ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_S3_BUCKET') -ceq 'termlink-history') `
-        'The production history bucket must remain termlink-history.'
-    $s3Endpoint = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_S3_ENDPOINT')
-    if ($historyOverlayRequested) {
-        Assert-Production ($s3Endpoint -ceq 'http://minio:9000') `
-            'The local history overlay must use only the isolated MinIO service endpoint.'
-    } else {
-        $s3EndpointUri = Assert-ProductionHttpsUri -Value $s3Endpoint -Name 'TERMLINK_S3_ENDPOINT'
-        Assert-Production ($s3EndpointUri.UserInfo -eq '' -and $s3EndpointUri.Fragment -eq '') `
-            'External TERMLINK_S3_ENDPOINT must not contain user info or a fragment.'
-    }
-} else {
-    foreach ($name in @(
-        'TERMLINK_S3_ACCESS_KEY_FILE', 'TERMLINK_S3_BUCKET', 'TERMLINK_S3_ENDPOINT',
-        'TERMLINK_S3_PUBLIC_ENDPOINT', 'TERMLINK_S3_REGION', 'TERMLINK_S3_SECRET_KEY_FILE'
-    )) {
-        Assert-Production ($null -eq (Get-PropertyValue $serverEnvironment $name)) `
-            "Core deployment unexpectedly includes history setting '$name'."
-    }
-}
-
 $frontendNetwork = Get-PropertyValue $config.networks 'frontend'
 Assert-Production ($null -ne $frontendNetwork -and [bool](Get-PropertyValue $frontendNetwork 'internal')) `
     'The edge/application frontend network must remain internal.'
@@ -932,23 +872,14 @@ Assert-Production ($null -ne $backendNetwork -and [bool](Get-PropertyValue $back
     'The PostgreSQL/Valkey backend network must remain internal.'
 $expectedNetworkNames = @('backend', 'egress', 'frontend')
 if ($IncludeEdge) { $expectedNetworkNames += 'public' }
-if ($historyOverlayRequested) { $expectedNetworkNames += @('object', 'object-control') }
 if ($directTransportOverlayRequested) { $expectedNetworkNames += 'direct-state' }
 $actualNetworkNames = @($config.networks.PSObject.Properties.Name | Sort-Object)
 Assert-Production (@(Compare-Object ($expectedNetworkNames | Sort-Object) $actualNetworkNames).Count -eq 0) `
     "Production Compose networks differ from the selected reviewed topology: $($actualNetworkNames -join ', ')"
-$objectNetwork = Get-PropertyValue $config.networks 'object'
-$objectControlNetwork = Get-PropertyValue $config.networks 'object-control'
 $directStateNetwork = Get-PropertyValue $config.networks 'direct-state'
-if ($historyOverlayRequested) {
-    Assert-Production ($null -ne $objectNetwork -and [bool](Get-PropertyValue $objectNetwork 'internal')) `
-        'The edge/MinIO object network must remain internal.'
-    Assert-Production ($null -ne $objectControlNetwork -and [bool](Get-PropertyValue $objectControlNetwork 'internal')) `
-        'The server/MinIO object-control network must remain internal.'
-} else {
-    Assert-Production ($null -eq $objectNetwork -and $null -eq $objectControlNetwork) `
-        'Core and external-S3 deployments must not retain local object-store networks.'
-}
+Assert-Production ($null -eq (Get-PropertyValue $config.networks 'object') -and
+    $null -eq (Get-PropertyValue $config.networks 'object-control')) `
+    'Production deployments must not retain retired object-store networks.'
 if ($directTransportOverlayRequested) {
     Assert-Production ($null -ne $directStateNetwork -and [bool](Get-PropertyValue $directStateNetwork 'internal')) `
         'The server/Direct-Valkey state network must remain internal.'
@@ -970,16 +901,8 @@ if ($IncludeEdge) {
         'Production edge must use the configured production ACME CA.'
     Assert-Production ([string](Get-PropertyValue $edgeEnvironment 'TERMLINK_PUBLIC_HOST') -ceq $publicUri.DnsSafeHost) `
         'TERMLINK_PUBLIC_HOST must exactly match the public URL host.'
-    $historyPublicHost = [string](Get-PropertyValue $edgeEnvironment 'TERMLINK_HISTORY_PUBLIC_HOST')
-    if ($historyOverlayRequested) {
-        Assert-ProductionHttpsUri -Value "https://$historyPublicHost" -Name 'TERMLINK_HISTORY_PUBLIC_HOST' | Out-Null
-        Assert-Production ($s3PublicUri.DnsSafeHost -ieq $historyPublicHost -and
-            ($s3PublicUri.IsDefaultPort -or $s3PublicUri.Port -eq 443)) `
-            'TERMLINK_S3_PUBLIC_ENDPOINT must exactly use TERMLINK_HISTORY_PUBLIC_HOST on HTTPS port 443.'
-    } else {
-        Assert-Production ($historyPublicHost -eq '') `
-            'Core and external-S3 edge configurations must not expose a local history host.'
-    }
+    Assert-Production ($null -eq (Get-PropertyValue $edgeEnvironment 'TERMLINK_HISTORY_PUBLIC_HOST')) `
+        'The edge must not expose the retired history object host.'
 }
 
 $caddyfilePath = $edgeCaddyfilePath
@@ -991,63 +914,21 @@ Assert-Production ($caddyfileText -match '(?m)^\s*Strict-Transport-Security "max
     'The application edge must retain the reviewed HSTS policy.'
 Assert-Production ($caddyfileText -match '(?ms)fields\s*\{.*?request delete.*?url delete.*?uri delete.*?query delete.*?\}') `
     'Caddy runtime logs must remove request URLs and query credentials.'
-if (-not $historyOverlayRequested) {
-    Assert-Production ($caddyfileText -notmatch '(?m)^\s*reverse_proxy minio:9000\s*$') `
-        'Core and external-S3 Caddy configurations must not route to local MinIO.'
-}
-
-if ($historyOverlayRequested) {
-$historyObjectMatcher = 'path_regexp history_object_path ^/termlink-history/accounts/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/sessions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/(chunk|snapshot|transcript)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]bin$'
-$fileTransferMatcher = 'path_regexp file_transfer_path ^/termlink-history/accounts/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/file-transfers/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]bin$'
-Assert-Production ($caddyfileText -match '(?m)^\s*method GET PUT\s*$') `
-    'The history edge must allow only GET and PUT object methods.'
-Assert-Production ($caddyfileText -match '(?m)^\s*max_size 67108864\s*$') `
-    'The history edge body limit must exactly match the 64 MiB object contract.'
-Assert-Production ($caddyfileText.Contains($historyObjectMatcher, [StringComparison]::Ordinal)) `
-    'The history edge must restrict requests to TermLink account object keys.'
-Assert-Production ($caddyfileText.Contains($fileTransferMatcher, [StringComparison]::Ordinal)) `
-    'The history edge must restrict file transfers to the reviewed account/PC/operation object shape.'
-Assert-Production ($caddyfileText -match '(?m)^\s*expression `\{http\.request\.header\.Content-Length\} != '''' && int\(\{http\.request\.header\.Content-Length\}\) > 67108864`$') `
-    'The history edge must reject session-history PUT bodies above 64 MiB.'
-Assert-Production ($caddyfileText -match '(?m)^\s*expression `\{http\.request\.header\.Content-Length\} != '''' && int\(\{http\.request\.header\.Content-Length\}\) > 5368709120`$') `
-    'The history edge must reject file-transfer PUT bodies above exactly 5 GiB.'
-Assert-Production ($caddyfileText -match '(?ms)handle @history_object\s*\{.*?max_size 67108864.*?reverse_proxy minio:9000\s*\}') `
-    'The session-history route must retain its independent 64 MiB streaming limit.'
-Assert-Production ($caddyfileText -match '(?ms)handle @file_transfer\s*\{.*?max_size 5368709120.*?reverse_proxy minio:9000\s*\}') `
-    'The file-transfer route must use the independent exact 5 GiB streaming limit.'
-Assert-Production ($caddyfileText -match '(?m)^\s*reverse_proxy minio:9000\s*$') `
-    'The reviewed history object proxy target is missing.'
-Assert-Production ($caddyfileText -match '(?m)^\s*respond 404\s*$') `
-    'The history edge must fail closed for every unmatched method and path.'
-Assert-Production ($caddyfileText -notmatch '(?m)^\s*log\s*(?:\{|$)') `
-    'Caddy access logging must remain disabled so presigned query credentials are not emitted.'
-
-# Acceptance uses one Lucky router with a public HTTP upstream and a private
-# internal-CA listener. Keep its routes aligned with the production edge
-# without weakening the independent 64 MiB session-history handlers.
-$acceptanceFileTransferMatcher = $fileTransferMatcher.Replace('file_transfer_path', 'file_transfer_object_path')
+Assert-Production ($caddyfileText -notmatch '(?i)minio|termlink-history|X-Amz-') `
+    'The application edge must not retain object-storage routes or signing parameters.'
 $acceptanceProxy = Join-Path $PSScriptRoot '..\acceptance\LuckyUpstream.Caddyfile'
-foreach ($acceptanceProxy in @($acceptanceProxy)) {
-    $acceptanceProxyText = [IO.File]::ReadAllText([IO.Path]::GetFullPath($acceptanceProxy))
-    Assert-Production ($acceptanceProxyText.Contains($acceptanceFileTransferMatcher, [StringComparison]::Ordinal)) `
-        "Acceptance proxy '$acceptanceProxy' must use the reviewed account/PC/operation file-transfer shape."
-    Assert-Production ($acceptanceProxyText -match '(?ms)handle @historyObject\s*\{.*?max_size 67108864.*?reverse_proxy minio:9000') `
-        "Acceptance proxy '$acceptanceProxy' must retain the independent 64 MiB history limit."
-    Assert-Production ($acceptanceProxyText -match '(?ms)handle @fileTransferObject\s*\{.*?max_size 5368709120.*?reverse_proxy minio:9000') `
-        "Acceptance proxy '$acceptanceProxy' must use the independent exact 5 GiB file-transfer limit."
-    Assert-Production ($acceptanceProxyText -match '(?ms)@serverMutation not method GET HEAD OPTIONS.*?forward_auth @serverMutation server:8080\s*\{\s*uri /readyz\s*lb_try_duration 30s\s*lb_try_interval 250ms') `
-        "Acceptance proxy '$acceptanceProxy' must gate mutations through a body-safe readiness request."
-    Assert-Production ($acceptanceProxyText -match '(?ms)@serverRead method GET HEAD OPTIONS.*?reverse_proxy @serverRead server:8080\s*\{\s*lb_try_duration 30s\s*lb_try_interval 250ms') `
-        "Acceptance proxy '$acceptanceProxy' must safely retry read-only requests during Server bootstrap."
-    Assert-Production ($acceptanceProxyText -match '(?ms)request body untouched.*?reverse_proxy server:8080\s*\{(?!.*?lb_try_duration).*?header_up X-Forwarded-Proto') `
-        "Acceptance proxy '$acceptanceProxy' must not replay mutating requests after readiness succeeds."
-}
-}
+$acceptanceProxyText = [IO.File]::ReadAllText([IO.Path]::GetFullPath($acceptanceProxy))
+Assert-Production ($acceptanceProxyText -notmatch '(?i)minio|termlink-history|X-Amz-') `
+    "Acceptance proxy '$acceptanceProxy' must not retain object-storage routes."
+Assert-Production ($acceptanceProxyText -match '(?ms)@serverMutation not method GET HEAD OPTIONS.*?forward_auth @serverMutation server:8080\s*\{\s*uri /readyz\s*lb_try_duration 30s\s*lb_try_interval 250ms') `
+    "Acceptance proxy '$acceptanceProxy' must gate mutations through a body-safe readiness request."
+Assert-Production ($acceptanceProxyText -match '(?ms)@serverRead method GET HEAD OPTIONS.*?reverse_proxy @serverRead server:8080\s*\{\s*lb_try_duration 30s\s*lb_try_interval 250ms') `
+    "Acceptance proxy '$acceptanceProxy' must safely retry read-only requests during Server bootstrap."
+Assert-Production ($acceptanceProxyText -match '(?ms)request body untouched.*?reverse_proxy server:8080\s*\{(?!.*?lb_try_duration).*?header_up X-Forwarded-Proto') `
+    "Acceptance proxy '$acceptanceProxy' must not replay mutating requests after readiness succeeds."
 
 # This is the key boundary of the production topology: the public edge may
-# reach PostgreSQL and Valkey only through the application. MinIO shares the
-# isolated object network with the edge for presigned URLs and a separate
-# object-control network with the server; it must never join backend.
+# reach PostgreSQL and Valkey only through the application.
 $edgeNetworks = if ($IncludeEdge) { @(Get-NetworkNames $edgeService) } else { @() }
 if ($IncludeEdge) {
     $edgeDataServices = @('postgres', 'valkey')
@@ -1060,29 +941,13 @@ if ($IncludeEdge) {
     }
     Assert-Production ($edgeNetworks -notcontains 'backend') 'Edge must never join the backend network.'
 }
-$minioService = Get-PropertyValue $config.services 'minio'
-if ($historyOverlayRequested) {
-    if ($IncludeEdge) {
-        $minioSharedNetworks = @((Get-NetworkNames $minioService) | Where-Object { $edgeNetworks -contains $_ })
-        Assert-Production ($minioSharedNetworks.Count -eq 1 -and $minioSharedNetworks[0] -ceq 'object') `
-            "Edge and MinIO must share only the isolated object network: $($minioSharedNetworks -join ', ')"
-    }
-    $serverNetworks = @(Get-NetworkNames $server)
-    $serverMinioSharedNetworks = @((Get-NetworkNames $minioService) | Where-Object { $serverNetworks -contains $_ })
-    Assert-Production ($serverMinioSharedNetworks.Count -eq 1 -and $serverMinioSharedNetworks[0] -ceq 'object-control') `
-        "Server and MinIO must share only the isolated object-control network: $($serverMinioSharedNetworks -join ', ')"
-    Assert-Production ((Get-NetworkNames $minioService) -notcontains 'backend') `
-        'MinIO must never join the PostgreSQL/Valkey backend network.'
-} else {
-    Assert-Production ($null -eq $minioService) `
-        'MinIO must appear only when history.compose.yml is selected.'
-}
+Assert-Production ($null -eq (Get-PropertyValue $config.services 'minio')) `
+    'MinIO must not be present after server-side object storage retirement.'
 
 $expectedSecretNames = @(
     'database_url', 'oidc_client_secret', 'postgres_password', 'redis_url',
     'token_signing_key', 'valkey_password'
 )
-if ($historyExpected) { $expectedSecretNames += @('s3_access_key', 's3_secret_key') }
 if ($observabilityOverlayRequested) { $expectedSecretNames += 'grafana_admin_password' }
 if ($registrationRecoveryOverlayRequested -or $accountDeletionOverlayRequested) {
     $expectedSecretNames += 'keycloak_admin_client_secret'

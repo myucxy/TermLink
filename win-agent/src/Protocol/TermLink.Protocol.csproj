@@ -7,6 +7,7 @@
   <ItemGroup>
     <Protobuf Include="..\..\..\protocol\protobuf\termlink_realtime.proto" GrpcServices="None" Link="Protos\termlink_realtime.proto" />
     <Protobuf Include="..\..\..\protocol\protobuf\termlink_transport.proto" GrpcServices="None" Link="Protos\termlink_transport.proto" />
+    <Protobuf Include="..\..\..\protocol\protobuf\termlink_file_transfer.proto" GrpcServices="None" Link="Protos\termlink_file_transfer.proto" />
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.5.1" />
     <PackageReference Include="Google.Protobuf" Version="3.31.1" />
     <PackageReference Include="Grpc.Tools" Version="2.72.0" PrivateAssets="All" />

@@ -1,9 +1,9 @@
 # Production Protocol Acceptance Stack
 
 This disposable stack runs the production TermLink `serve` command behind TLS
-with Keycloak in production start mode, PostgreSQL, Valkey, and MinIO. It never
-registers the LAN Replay or `TLT1` routes. The embedded identity database,
-object store, and local CA remain disposable acceptance fixtures; they are not
+with Keycloak in production start mode, PostgreSQL, and Valkey. It never
+registers the LAN Replay or `TLT1` routes. The embedded identity database and
+local CA remain disposable acceptance fixtures; they are not
 production data stores or trust anchors.
 
 The acceptance Keycloak image is augmented at image-build time and then starts
@@ -71,7 +71,7 @@ Docker Desktop does not reliably apply Compose `uid`, `gid`, and `mode` to
 file-backed secrets. Before any long-running service starts, an isolated
 one-shot container copies each credential into a service-private named volume,
 sets the exact runtime owner, and applies mode `0400`. The start script then
-checks the metadata seen inside Keycloak, PostgreSQL, Valkey, and MinIO and
+checks the metadata seen inside Keycloak, PostgreSQL, and Valkey and
 fails the deployment if any credential is group- or world-readable. Secret
 contents are never included in that check or its output. When Direct shadow is
 enabled, the same gate additionally requires its password to be exactly
@@ -84,9 +84,9 @@ plus `direct-valkey-secrets-init` when Direct is enabled. The shared
 volumes, images, or data.
 
 The default public-production steady state contains `lucky-upstream`,
-`keycloak`, `postgres`, `valkey`, `minio`, and `server`. PostgreSQL and Valkey
-provide application state and realtime coordination; Keycloak and MinIO supply
-OIDC and object history/file storage. `lucky-upstream` owns both the public HTTP
+`keycloak`, `postgres`, `valkey`, and `server`. PostgreSQL and Valkey provide
+application state and realtime coordination; Keycloak supplies OIDC.
+`lucky-upstream` owns both the public HTTP
 upstream and a Docker-internal TLS listener used for issuer-exact OIDC
 discovery, eliminating the former second Caddy `edge` service. `-LanAddress`
 uses `acceptance.local-edge.compose.yml` only to expose that same TLS listener
@@ -141,12 +141,11 @@ From the repository root, run / 在仓库根目录运行：
 
 `-LanAddress` must be an IPv4 address assigned to the host. For a selected
 `<LAN-IP>`, the product, API, and OIDC origin is
-`https://termlink.<LAN-IP>.sslip.io:9443`; signed history objects use that same
-origin. The example therefore uses
+`https://termlink.<LAN-IP>.sslip.io:9443`. The example therefore uses
 `https://termlink.192.168.9.28.sslip.io:9443`.
 
 `-LanAddress` 必须是本机网卡实际拥有的 IPv4 地址。对于指定的 `<LAN-IP>`，产品、API
-、OIDC 和历史对象 Origin 均为 `https://termlink.<LAN-IP>.sslip.io:9443`；上面的示例因此使用
+和 OIDC Origin 均为 `https://termlink.<LAN-IP>.sslip.io:9443`；上面的示例因此使用
 `https://termlink.192.168.9.28.sslip.io:9443`。
 
 The script exposes Lucky's TLS listener to the LAN and exports its disposable CA to
@@ -222,7 +221,7 @@ then verify output and input. Windows 与 Android 登录同一 OIDC 账号；在
 打开 TermLink 受管 Session，再从 Android 发现 PC/Session，建立生产 Realtime/E2EE
 链路，取得短时控制租约后验证输出和输入。该主流程不需要配对、自授信或逐 PC Grant。
 
-The automatic stack probe proves the server-side REST/Realtime/lease/history
+The automatic stack probe proves the server-side REST/Realtime/lease
 contract, but it does not replace this real Android + Windows managed-session
 test. Only sessions created and managed by TermLink are forwarded; TermLink
 cannot attach to or take over arbitrary existing cmd, PowerShell, or Windows
@@ -354,35 +353,21 @@ acceptance uses `acceptance-user`, so probe devices and interactive devices
 remain in separate account scopes. Both users are disposable and exist only in
 this acceptance realm.
 
-History is enabled in this stack. The probe creates an encrypted-object
-metadata record through the production API, uploads the opaque bytes through a
-TLS Caddy presigned PUT, commits and lists the record, downloads it through the
-TLS presigned GET, then deletes the session and verifies the old URL returns
-404. It also checks that unsigned, tampered, unsupported-method, wrong-bucket,
-and over-limit object requests never reach MinIO as successful operations.
-
-The private history host (`history.127.0.0.1.sslip.io`) and the public Lucky
-upstream use an isolated object data network shared with MinIO. Neither proxy
-has access to the separate `object-control` management network or the stateful
-PostgreSQL/Valkey backend network. Server-to-MinIO management traffic uses
-`object-control`. Both Caddy paths forward only
-`GET`/`PUT /termlink-history/accounts/...` requests carrying the required
-AWS SigV4 query fields; MinIO performs the final signature and credential
-validation. Session history object shapes (`chunk`, `snapshot`, and
-`transcript`) retain the 64 MiB request-body ceiling. PC file-transfer objects
-use the separate strict
-`accounts/<account-id>/file-transfers/<pc-id>/<operation-id>.bin` matcher and a
-5 GiB (`5368709120` byte) ceiling; that larger limit cannot match or widen a
-history route. MinIO's management and console endpoints are not exposed.
+Terminal history is host-owned in the current protocol. The online Windows
+Agent answers bounded E2EE History/Snapshot requests, while the server routes
+opaque envelopes and never stores terminal bodies. File transfers use
+`REALTIME_V2`: the server stores task and routing metadata in PostgreSQL, while
+bytes move between Windows and Android over realtime transport. The acceptance
+stack therefore contains no object store, object network, presigned URL, or
+history-object proxy route.
 
 In public mode, the acceptance stack binds an HTTP-only Lucky upstream on host
 port `8080` by default. Configure Lucky to forward the public
 `https://termlink.kget.cc:8910` origin to
 `http://<DOCKER-HOST-LAN-IP>:8080` (for this host,
 `http://192.168.9.28:8080`); TLS continues to terminate at Lucky. Identity
-paths are routed to Keycloak, signed history-object paths are routed to MinIO,
-and all other paths are routed to the TermLink Server. History presigned URLs
-therefore use the same product origin in both public and private-LAN modes.
+paths are routed to Keycloak and all other paths are routed to the TermLink
+Server.
 Override the HTTP upstream bind only when needed with `-LuckyBindAddress` and
 `-LuckyPort`; `-LanAddress` does not change that separate binding implicitly.
 

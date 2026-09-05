@@ -81,6 +81,27 @@ object SessionCrypto {
         )
     }
 
+    fun deriveFileTransferKey(
+        pairwiseKey: ByteArray,
+        transferId: UUID,
+        direction: CryptoDirection,
+        keyEpoch: Long,
+        keyId: ByteArray,
+    ): ByteArray {
+        require(pairwiseKey.size == 32) { "Pairwise key must be 32 bytes" }
+        require(transferId != UUID(0, 0)) { "Transfer ID is required" }
+        require(keyEpoch > 0) { "Key epoch must be positive" }
+        require(keyId.size in 8..128) { "Key ID length is invalid" }
+        return hkdf(
+            pairwiseKey,
+            salt,
+            bytes(
+                "TERMLINK-FILE-TRANSFER-KEY-V2".encodeToByteArray(), byteArrayOf(0),
+                uuidBytes(transferId), byteArrayOf(direction.wireValue), longBytes(keyEpoch), keyId,
+            ),
+        )
+    }
+
     fun nonce(prefix: ByteArray, sequence: ULong): ByteArray {
         require(prefix.size == 4 && sequence > 0u)
         return bytes(prefix, ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN).putLong(sequence.toLong()).array())

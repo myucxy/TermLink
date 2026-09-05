@@ -151,6 +151,18 @@ Require(Convert.ToHexString(vectorPc.PublicKey).Equals("8f40c5adb68f25624ae5b214
 Require(Convert.ToHexString(vectorAndroid.PublicKey).Equals("358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254", StringComparison.OrdinalIgnoreCase), "Android public vector changed.");
 Require(Convert.ToHexString(vectorPair).Equals("b1632a5a77cafec55f885fc4c3588f303ed3ca9856d5c464636e0b5feaefa773", StringComparison.OrdinalIgnoreCase), "Pairwise vector changed.");
 Require(Convert.ToHexString(vectorKey).Equals("e95cacb46c64bb90b7a7311b3ae253add4e29dddfb2ded34d576cb866da7695c", StringComparison.OrdinalIgnoreCase), "Session key vector changed.");
+byte[] fileTransferKeyId = Encoding.ASCII.GetBytes(
+    "file-transfer-v2:fedcba9876543210ffffeeeeeeeeeeee:7");
+byte[] pcToAndroidFileTransferKey = SessionCrypto.DeriveFileTransferKey(
+    vectorPair, vectorSessionId, CryptoDirection.PcToAndroid, 7, fileTransferKeyId);
+byte[] androidToPcFileTransferKey = SessionCrypto.DeriveFileTransferKey(
+    vectorPair, vectorSessionId, CryptoDirection.AndroidToPc, 7, fileTransferKeyId);
+Require(Convert.ToHexString(pcToAndroidFileTransferKey).Equals(
+    "a027c91929064e4c12fad593690da8a112b3e2d97f002be8cccc615e75276daf",
+    StringComparison.OrdinalIgnoreCase), "PC-to-Android file-transfer key vector changed.");
+Require(Convert.ToHexString(androidToPcFileTransferKey).Equals(
+    "f0c24247c4825d9366b8ef3f173d20f702fcf70e4974ebefbb35ee3ed5d9ed6e",
+    StringComparison.OrdinalIgnoreCase), "Android-to-PC file-transfer key vector changed.");
 Require(Convert.ToHexString(vectorAad).Equals("080110141a10fedcba9876543210ffffeeeeeeeeeeee221000112233445566778899aabbccddeeff2801302a380740fba0f1c2b1344a0e65706f63682d3030303030303037520caabbccdd000000000000002a", StringComparison.OrdinalIgnoreCase), "AAD vector changed.");
 Require(Convert.ToHexString(SessionCrypto.Encrypt(vectorKey, vectorNonce, vectorAad, vectorPlaintext)).Equals("6a97c75f0d8c984923467129d973a325134d69c9bd792587797651196a7498a68e3c44", StringComparison.OrdinalIgnoreCase), "Ciphertext vector changed.");
 

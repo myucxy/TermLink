@@ -4,6 +4,7 @@ import dev.termlink.model.DeviceSummary
 import dev.termlink.model.DeviceTrustState
 import dev.termlink.model.DeviceType
 import dev.termlink.model.PcSummary
+import dev.termlink.model.PcCapabilityIds
 import dev.termlink.model.SessionState
 import dev.termlink.model.SessionSummary
 import dev.termlink.session.RemoteSessionState
@@ -211,6 +212,19 @@ class SessionCatalogReconciliationTest {
             retainedLiveSessionIds(listOf(offlineRunning, exited), setOf(pcId)),
         )
         assertTrue(retainedLiveSessionIds(listOf(offlineRunning), emptySet()).isEmpty())
+
+        val hostHistoryPc = pc(online = false).copy(capabilities = setOf(PcCapabilityIds.HOST_HISTORY_V1))
+        assertEquals(
+            setOf(sessionB),
+            retainedReadOnlySessionIds(listOf(offlineRunning, exited), listOf(hostHistoryPc), setOf(pcId)),
+        )
+        assertTrue(
+            retainedReadOnlySessionIds(
+                listOf(exited),
+                listOf(hostHistoryPc.copy(capabilities = emptySet())),
+                setOf(pcId),
+            ).isEmpty(),
+        )
     }
 
     @Test

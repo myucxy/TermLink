@@ -53,15 +53,12 @@ function Set-AcceptanceEndpointEnvironment {
         $env:TERMLINK_ACCEPTANCE_PUBLIC_HOST = 'termlink.kget.cc'
         $env:TERMLINK_ACCEPTANCE_PUBLIC_PORT = '8910'
         $env:TERMLINK_ACCEPTANCE_PUBLIC_SCHEME = 'https'
-        $env:TERMLINK_ACCEPTANCE_HISTORY_ORIGIN = $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN
-        $env:TERMLINK_ACCEPTANCE_HISTORY_HOST = 'history.127.0.0.1.sslip.io'
         $env:TERMLINK_ACCEPTANCE_EDGE_BIND_IP = '127.0.0.1'
         $env:TERMLINK_ACCEPTANCE_LUCKY_BIND_IP = $normalizedBindAddress
         $env:TERMLINK_ACCEPTANCE_LUCKY_PORT = $PublicUpstreamPort.ToString([Globalization.CultureInfo]::InvariantCulture)
         return [pscustomobject]@{
             Root = $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN
             PublicOrigin = $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN
-            HistoryOrigin = $env:TERMLINK_ACCEPTANCE_HISTORY_ORIGIN
         }
     }
 
@@ -83,8 +80,6 @@ function Set-AcceptanceEndpointEnvironment {
     $env:TERMLINK_ACCEPTANCE_PUBLIC_HOST = $publicHost
     $env:TERMLINK_ACCEPTANCE_PUBLIC_PORT = '9443'
     $env:TERMLINK_ACCEPTANCE_PUBLIC_SCHEME = 'https'
-        $env:TERMLINK_ACCEPTANCE_HISTORY_ORIGIN = $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN
-        $env:TERMLINK_ACCEPTANCE_HISTORY_HOST = $publicHost
     $env:TERMLINK_ACCEPTANCE_EDGE_BIND_IP = '0.0.0.0'
     $parsedBindAddress = $null
     if (-not [Net.IPAddress]::TryParse($PublicUpstreamBindAddress.Trim(), [ref]$parsedBindAddress) -or
@@ -108,7 +103,6 @@ function Set-AcceptanceEndpointEnvironment {
     return [pscustomobject]@{
         Root = $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN
         PublicOrigin = $env:TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN
-        HistoryOrigin = $env:TERMLINK_ACCEPTANCE_HISTORY_ORIGIN
     }
 }
 
@@ -142,7 +136,7 @@ function Wait-ProductionAcceptanceStack {
 
     $composeFileArguments = @($ComposeFile | ForEach-Object { '-f'; $_ })
 
-    $healthyServices = @('lucky-upstream', 'postgres', 'valkey', 'minio', 'server', 'keycloak') +
+    $healthyServices = @('lucky-upstream', 'postgres', 'valkey', 'server', 'keycloak') +
         $AdditionalHealthyServices
     $runningServices = @()
     $completedServices = @(
@@ -328,7 +322,6 @@ if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container)) 
         $paths.InitialAdminReady, $paths.InitialAdminLock, $paths.UserPassword, $paths.PostgresPassword,
         $paths.ValkeyPassword, $paths.OidcClientSecret, $paths.DatabaseUrl, $paths.RedisUrl,
         $paths.DirectValkeyPassword, $paths.DirectRedisUrl,
-        $paths.S3AccessKey, $paths.S3SecretKey,
         $paths.TokenSigningKey, $paths.RootCa, $paths.ProbeIdentity,
         $productionPolicyEnvironment
     )) {
@@ -411,8 +404,6 @@ if ($EnableDirectTransportShadow) {
 }
 Write-SecretFile $paths.OidcClientSecret (New-RandomText 32)
 Write-SecretFile $paths.TokenSigningKey (New-RandomText 48)
-Write-SecretFile $paths.S3AccessKey (New-RandomText 24)
-Write-SecretFile $paths.S3SecretKey (New-RandomText 48)
 Protect-TermLinkAcceptanceSecretTree -SecretRoot $paths.SecretRoot
 
 Set-TermLinkAcceptanceComposeEnvironment -Paths $paths
@@ -466,8 +457,6 @@ function Assert-RuntimeSecretMetadata {
 Assert-RuntimeSecretMetadata -Service keycloak -Path /run/secrets/keycloak_admin_password -Expected '400:1000:0'
 Assert-RuntimeSecretMetadata -Service postgres -Path /run/secrets/postgres_password -Expected '400:70:70'
 Assert-RuntimeSecretMetadata -Service valkey -Path /run/secrets/valkey_password -Expected '400:999:1000'
-Assert-RuntimeSecretMetadata -Service minio -Path /run/secrets/s3_access_key -Expected '400:0:0'
-Assert-RuntimeSecretMetadata -Service minio -Path /run/secrets/s3_secret_key -Expected '400:0:0'
 if ($EnableDirectTransportShadow) {
     Assert-RuntimeSecretMetadata `
         -Service direct-valkey `
@@ -490,7 +479,6 @@ elseif (Test-Path -LiteralPath $paths.RootCa -PathType Leaf) {
 
 $env:TERMLINK_ACCEPTANCE_ROOT_URL = $endpoints.Root
 $env:TERMLINK_ACCEPTANCE_OIDC_ISSUER = "$($endpoints.PublicOrigin)/realms/termlink"
-$env:TERMLINK_ACCEPTANCE_HISTORY_ORIGIN = $endpoints.HistoryOrigin
 if ($localEdgeEnabled) {
     $env:TERMLINK_ACCEPTANCE_CA_FILE = $paths.RootCa
 }

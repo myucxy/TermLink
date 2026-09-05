@@ -38,33 +38,6 @@ type UserPortalAccountDeletion struct {
 	CanceledAt            *time.Time `json:"canceled_at,omitempty"`
 }
 
-const userPortalDataExportInsertSQL = `
-	INSERT INTO data_export_requests(id,account_id,scope)
-	VALUES($1,$2,ARRAY['ACCOUNT_PROFILE','DEVICE_METADATA','SESSION_METADATA']::text[])
-	ON CONFLICT (account_id) WHERE status IN ('REQUESTED','PROCESSING','READY') DO NOTHING
-	RETURNING id,status,requested_at,expires_at`
-
-const userPortalDataExportActiveSQL = `
-	SELECT id,status,requested_at,expires_at
-	FROM data_export_requests
-	WHERE account_id=$1 AND status IN ('REQUESTED','PROCESSING','READY')
-	ORDER BY created_at DESC,id DESC
-	LIMIT 1`
-
-const userPortalDataExportByAccountSQL = `
-	SELECT id,status,requested_at,expires_at
-	FROM data_export_requests
-	WHERE id=$1 AND account_id=$2`
-
-const userPortalDataExportAuditSQL = `
-	INSERT INTO audit_events(user_id,action,target_type,target_id,result,trace_id)
-	VALUES($1,'user_portal.data_export.request','data_export',$2,'SUCCEEDED',$3)`
-
-const userPortalDataExportOutboxSQL = `
-	INSERT INTO outbox(event_type,aggregate_id,payload)
-	VALUES('privacy.data_export.requested',$1,
-	       jsonb_build_object('account_id',$2::uuid,'request_id',$1::uuid))`
-
 const userPortalAccountDeletionInsertSQL = `
 	INSERT INTO account_deletion_requests(id,account_id,confirmation_expires_at)
 	VALUES($1,$2,now()+($3::bigint*interval '1 millisecond'))
@@ -164,12 +137,6 @@ const userPortalFullPCPolicyOutboxSQL = `
 	    'pc_id',$2::uuid,'remote_routing_enabled',$3::boolean,
 	    'control_mode',$4::text,'local_priority',$5::boolean,'policy_version',$6::bigint))`
 
-func scanUserPortalDataExport(row pgx.Row) (UserPortalDataExport, error) {
-	var result UserPortalDataExport
-	err := row.Scan(&result.ID, &result.Status, &result.RequestedAt, &result.ExpiresAt)
-	return result, err
-}
-
 func scanUserPortalAccountDeletion(row pgx.Row) (UserPortalAccountDeletion, error) {
 	var result UserPortalAccountDeletion
 	err := row.Scan(
@@ -177,64 +144,6 @@ func scanUserPortalAccountDeletion(row pgx.Row) (UserPortalAccountDeletion, erro
 		&result.ConfirmationExpiresAt, &result.ScheduledFor, &result.RetentionDeadline,
 		&result.CompletedAt, &result.CanceledAt,
 	)
-	return result, err
-}
-
-func (s *Postgres) requestUserPortalDataExport(ctx context.Context, accountID uuid.UUID, idempotencyKey, traceID string) (UserPortalDataExport, error) {
-	if err := validateUserPortalActionInput(accountID, idempotencyKey, traceID); err != nil {
-		return UserPortalDataExport{}, err
-	}
-	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
-	if err != nil {
-		return UserPortalDataExport{}, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := requireUserPortalActionAccount(ctx, tx, accountID); err != nil {
-		return UserPortalDataExport{}, err
-	}
-	hash := userPortalPrivacyActionHash("data-export-request-v1", accountID.String())
-	var result UserPortalDataExport
-	replayed, err := claimUserPortalAction(ctx, tx, accountID, idempotencyKey, hash, &result)
-	if err != nil {
-		return UserPortalDataExport{}, err
-	}
-	if replayed {
-		return result, tx.Commit(ctx)
-	}
-	requestID := uuid.New()
-	result, err = scanUserPortalDataExport(tx.QueryRow(ctx, userPortalDataExportInsertSQL, requestID, accountID))
-	created := err == nil
-	if errors.Is(err, pgx.ErrNoRows) {
-		result, err = scanUserPortalDataExport(tx.QueryRow(ctx, userPortalDataExportActiveSQL, accountID))
-	}
-	if err != nil {
-		return UserPortalDataExport{}, err
-	}
-	if created {
-		if _, err := tx.Exec(ctx, userPortalDataExportAuditSQL, accountID, result.ID, traceID); err != nil {
-			return UserPortalDataExport{}, err
-		}
-		if _, err := tx.Exec(ctx, userPortalDataExportOutboxSQL, result.ID, accountID); err != nil {
-			return UserPortalDataExport{}, err
-		}
-	}
-	if err := completeUserPortalAction(ctx, tx, accountID, idempotencyKey, hash, result); err != nil {
-		return UserPortalDataExport{}, err
-	}
-	return result, tx.Commit(ctx)
-}
-
-func (s *Postgres) getUserPortalDataExport(ctx context.Context, accountID, exportID uuid.UUID) (UserPortalDataExport, error) {
-	if accountID == uuid.Nil || exportID == uuid.Nil {
-		return UserPortalDataExport{}, ErrDenied
-	}
-	if err := s.requireUserPortalAccount(ctx, accountID); err != nil {
-		return UserPortalDataExport{}, err
-	}
-	result, err := scanUserPortalDataExport(s.Pool.QueryRow(ctx, userPortalDataExportByAccountSQL, exportID, accountID))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return UserPortalDataExport{}, ErrDenied
-	}
 	return result, err
 }
 

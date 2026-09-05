@@ -58,6 +58,7 @@ var optionalCapabilities = []string{
 	"terminal_presentation_metadata_v1",
 	"terminal_typed_input_v1",
 	"liveness_probe_v1",
+	"host_history_v1",
 }
 
 type Hub struct {
@@ -504,6 +505,14 @@ func (p *peer) readLoop() {
 			p.rejectApplicationFrame("message_or_ack_rejected", len(frame))
 			continue
 		}
+		if (envelope.MessageType == realtimewire.HostHistoryRequest ||
+			envelope.MessageType == realtimewire.HostHistoryResponse ||
+			envelope.MessageType == realtimewire.HostHistoryControl ||
+			envelope.MessageType == realtimewire.SessionTerminateResponse) &&
+			!p.capabilities["host_history_v1"] {
+			p.rejectApplicationFrame("host_history_capability_required", len(frame))
+			continue
+		}
 		sessionID, err := uuid.FromBytes(envelope.SessionID)
 		if err != nil {
 			p.rejectApplicationFrame("session_rejected", len(frame))
@@ -578,7 +587,8 @@ func allowedMessage(role string, messageType realtimewire.MessageType) bool {
 			realtimewire.OutputACK, realtimewire.FlowControl,
 			realtimewire.InputEvent, realtimewire.ResizeRequest,
 			realtimewire.ResumeRequest, realtimewire.LeaseRequest,
-			realtimewire.SessionTerminateRequest:
+			realtimewire.SessionTerminateRequest,
+			realtimewire.HostHistoryRequest, realtimewire.HostHistoryControl:
 			return true
 		default:
 			return false
@@ -594,7 +604,8 @@ func allowedMessage(role string, messageType realtimewire.MessageType) bool {
 			realtimewire.SnapshotChunk, realtimewire.LeaseGranted,
 			realtimewire.LeaseDenied, realtimewire.LeaseRevoked,
 			realtimewire.ThemeChanged, realtimewire.SessionStarted,
-			realtimewire.SessionInterrupted, realtimewire.SessionEnded:
+			realtimewire.SessionInterrupted, realtimewire.SessionEnded,
+			realtimewire.HostHistoryResponse, realtimewire.SessionTerminateResponse:
 			return true
 		default:
 			return false
@@ -665,6 +676,13 @@ func (p *peer) acceptPCSequence(sessionID, recipientID uuid.UUID, sequence uint6
 // still advances its high-water mark. Android's next durable cumulative ACK
 // opens the replay epoch that asks the Agent for the missed ordered frames.
 func (p *peer) routePCFrame(envelope realtimewire.Envelope, sessionID, recipientID uuid.UUID, frame []byte) error {
+	if envelope.MessageType == realtimewire.HostHistoryResponse ||
+		envelope.MessageType == realtimewire.SessionTerminateResponse {
+		// Host-history chunks and termination results are correlated by an E2EE
+		// request UUID. They do not consume the ordered terminal event sequence
+		// or replay window.
+		return p.route(envelope, sessionID, frame)
+	}
 	p.pcReplayMu.Lock()
 	state := p.pcReplayRoute(pcRouteKey{sessionID: sessionID, recipientID: recipientID})
 	commit, ok := state.validate(envelope.Sequence, envelope.MessageType, sha256.Sum256(frame))

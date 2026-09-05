@@ -41,7 +41,7 @@ func TestAcceptanceStartWaitsOnOneStableContainerSet(t *testing.T) {
 	}
 	for _, contract := range []string{
 		"ps --all --format json",
-		"'lucky-upstream', 'postgres', 'valkey', 'minio', 'server', 'keycloak'",
+		"'lucky-upstream', 'postgres', 'valkey', 'server', 'keycloak'",
 		"'runtime-secrets-init', 'keycloak-init'",
 		"'server-secrets-init', 'migrate'",
 		"[string]$item.Health -eq 'healthy'",

@@ -24,7 +24,7 @@ class RemoteFileModelsTest {
                     "status":"SUCCEEDED",
                     "result":{"session_id":"$sessionId"}
                   },
-                  "download":{"request":{"headers":{"X-Test":["one"]}}}
+                  "transfer":{"protocol":"REALTIME_V2","transfer_id":"$operationId"}
                 }""",
             ).jsonObject,
         )
@@ -32,7 +32,57 @@ class RemoteFileModelsTest {
         assertEquals(operationId, response.id)
         assertEquals("SUCCEEDED", response.status)
         assertEquals(sessionId.toString(), response.result?.get("session_id")?.jsonPrimitive?.content)
-        assertTrue(response.download?.containsKey("request") == true)
+        assertEquals("REALTIME_V2", response.transfer?.get("protocol")?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun realtimeTransferMetadataRestoresTheSameResumeDescriptor() {
+        val operationId = UUID.randomUUID()
+        val digest = MessageDigest.getInstance("SHA-256").digest("payload".encodeToByteArray())
+        val encoded = Base64.getUrlEncoder().withoutPadding().encodeToString(digest)
+        val descriptor = realtimeFileTransferDescriptorFromJson(
+            Json.parseToJsonElement(
+                """{
+                  "protocol":"REALTIME_V2",
+                  "transfer_id":"$operationId",
+                  "filename":"folder.zip",
+                  "size_bytes":7,
+                  "sha256":"$encoded",
+                  "directory_zip":true
+                }""",
+            ).jsonObject,
+            expectedTransferId = operationId,
+            expectedDirectoryZip = true,
+        )
+
+        assertEquals(operationId, descriptor.transferId)
+        assertEquals("folder.zip", descriptor.filename)
+        assertEquals(7L, descriptor.sizeBytes)
+        assertTrue(descriptor.sha256.contentEquals(digest))
+        assertTrue(descriptor.directoryZip)
+    }
+
+    @Test
+    fun realtimeTransferMetadataRejectsCrossTaskOrWrongDestinationKind() {
+        val operationId = UUID.randomUUID()
+        val encoded = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32))
+        val transfer = Json.parseToJsonElement(
+            """{
+              "protocol":"REALTIME_V2",
+              "transfer_id":"$operationId",
+              "filename":"payload.bin",
+              "size_bytes":0,
+              "sha256":"$encoded",
+              "directory_zip":false
+            }""",
+        ).jsonObject
+
+        assertTrue(runCatching {
+            realtimeFileTransferDescriptorFromJson(transfer, UUID.randomUUID(), false)
+        }.isFailure)
+        assertTrue(runCatching {
+            realtimeFileTransferDescriptorFromJson(transfer, operationId, true)
+        }.isFailure)
     }
 
     @Test

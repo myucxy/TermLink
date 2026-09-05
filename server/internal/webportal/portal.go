@@ -73,7 +73,6 @@ type Config struct {
 	ReleaseSource             PublicReleaseSource
 	BuildInfo                 buildinfo.Info
 	RegistrationCodeKey       []byte
-	DataExportDownloader      PrivacyExportDownloader
 	AccountDeletionBinder     accountdeletion.RequestBinder
 	ServiceEmail              *serviceemail.Service
 	AdminRoutes               *adminroute.Service
@@ -585,9 +584,6 @@ func (p *Portal) Handler() http.Handler {
 	mux.HandleFunc("GET /account", p.account)
 	mux.HandleFunc("POST /account/devices/{id}/revoke", p.strongAccountAction("user.device.revoke", p.userPortalRevokeDevice))
 	mux.HandleFunc("POST /account/pcs/{id}/control-policy", p.strongAccountAction("user.pc.control_policy.update", p.userPortalUpdatePCControlPolicy))
-	mux.HandleFunc("POST /account/sessions/{id}/history/delete", p.strongAccountAction("user.session_history.delete", p.userPortalDeleteSessionHistory))
-	mux.HandleFunc("POST /account/privacy/exports", p.strongAccountAction("user.data_export.request", p.userPortalRequestDataExport))
-	mux.HandleFunc("POST /account/privacy/exports/{id}/download", p.sensitiveAction("user.data_export.download", p.userPortalDownloadDataExport))
 	mux.HandleFunc("POST /account/privacy/deletions", p.strongAccountAction("user.account_deletion.request", p.userPortalRequestAccountDeletion))
 	mux.HandleFunc("POST /account/privacy/deletions/{id}/confirm", p.strongAccountAction("user.account_deletion.confirm", p.userPortalConfirmAccountDeletion))
 	mux.HandleFunc("POST /account/privacy/deletions/{id}/cancel", p.strongAccountAction("user.account_deletion.cancel", p.userPortalCancelAccountDeletion))

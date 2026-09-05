@@ -13,22 +13,16 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/termlink/termlink/server/internal/api"
 	"github.com/termlink/termlink/server/internal/auth"
-	"github.com/termlink/termlink/server/internal/history"
 	"github.com/termlink/termlink/server/internal/kv"
 	"github.com/termlink/termlink/server/internal/migrate"
 	"github.com/termlink/termlink/server/internal/realtime"
@@ -77,18 +71,9 @@ type testDevice struct {
 func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	databaseURL := os.Getenv("TERMLINK_INTEGRATION_DATABASE_URL")
 	redisURL := os.Getenv("TERMLINK_INTEGRATION_REDIS_URL")
-	s3Endpoint := os.Getenv("TERMLINK_INTEGRATION_S3_ENDPOINT")
-	if databaseURL == "" || redisURL == "" || s3Endpoint == "" {
+	if databaseURL == "" || redisURL == "" {
 		t.Skip("production infrastructure integration environment is not configured")
 	}
-	s3PublicEndpoint := os.Getenv("TERMLINK_INTEGRATION_S3_PUBLIC_ENDPOINT")
-	if s3PublicEndpoint == "" {
-		s3PublicEndpoint = s3Endpoint
-	}
-	s3Region := envOrDefault("TERMLINK_INTEGRATION_S3_REGION", "us-east-1")
-	s3Bucket := envOrDefault("TERMLINK_INTEGRATION_S3_BUCKET", "termlink-history")
-	s3AccessKey := envOrDefault("TERMLINK_INTEGRATION_S3_ACCESS_KEY", "integration-access")
-	s3SecretKey := envOrDefault("TERMLINK_INTEGRATION_S3_SECRET_KEY", "integration-only-password")
 	ctx := context.Background()
 	if err := migrate.Up(ctx, databaseURL); err != nil {
 		t.Fatal(err)
@@ -104,10 +89,6 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer valkey.Close()
-	historyStore, err := history.Open(ctx, s3Endpoint, s3PublicEndpoint, s3Region, s3Bucket, s3AccessKey, s3SecretKey)
-	if err != nil {
-		t.Fatal(err)
-	}
 	identity := auth.Identity{
 		Issuer:          "https://integration.issuer.test",
 		Subject:         "subject-" + uuid.NewString(),
@@ -125,7 +106,7 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	authentication := auth.Middleware{Tokens: verifier, Devices: repository, Nonces: valkey, SubjectKey: subjectKey}
 	service := &api.API{
 		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication,
-		SubjectKey: subjectKey, TokenKey: subjectKey, History: historyStore,
+		SubjectKey: subjectKey, TokenKey: subjectKey,
 		ClientConfig: api.ClientConfiguration{
 			OIDCClientID: "termlink-android", WindowsClientID: "termlink-windows",
 			WindowsRegistrationParties: []string{"termlink-windows"},
@@ -243,7 +224,7 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 		"pc_id": pcID, "shell_type": "pwsh", "title_cipher": "", "state": "EXITED",
 		"columns": 100, "rows": 30, "last_output_seq": 0, "ended_at": time.Now().UTC(),
 	}, "exit-history-session", http.StatusOK)
-	testHistoryUpload(t, server.URL, pc, android, historySessionID, s3Endpoint, s3Region, s3AccessKey, s3SecretKey)
+	testRetiredHistoryEndpoints(t, server.URL, pc, historySessionID)
 	leaseOne := signedJSON(t, server.URL, android, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/lease", map[string]any{}, "lease-repeat", http.StatusCreated)
 	leaseTwo := signedJSON(t, server.URL, android, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/lease", map[string]any{}, "lease-repeat", http.StatusCreated)
 	if leaseOne["lease_id"] != leaseTwo["lease_id"] {
@@ -466,212 +447,22 @@ func assertProductionMigrations(t *testing.T, repository *store.Postgres) {
 	}
 }
 
-type integrationPresignedRequest struct {
-	URL     string              `json:"url"`
-	Method  string              `json:"method"`
-	Headers map[string][]string `json:"headers"`
-}
-
-func testHistoryUpload(t *testing.T, root string, pc, recipient testDevice, sessionID uuid.UUID, s3Endpoint, s3Region, s3AccessKey, s3SecretKey string) {
+func testRetiredHistoryEndpoints(t *testing.T, root string, pc testDevice, sessionID uuid.UUID) {
 	t.Helper()
-	ciphertext := []byte("production-history-ciphertext-v1")
-	digest := sha256.Sum256(ciphertext)
-	historyKeyID := fmt.Sprintf("history-v1:%s:%08d", strings.ReplaceAll(recipient.id.String(), "-", ""), 1)
-	createBody := map[string]any{
-		"kind": "CHUNK", "key_id": historyKeyID, "ciphertext_sha256": base64.RawURLEncoding.EncodeToString(digest[:]),
-		"size_bytes": len(ciphertext), "start_seq": 1, "end_seq": 3,
-	}
-	created := signedJSON(t, root, pc, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/history/uploads", createBody, "history-upload-valid", http.StatusCreated)
-	uploadID, ok := created["upload_id"].(string)
-	if !ok || uploadID == "" {
-		t.Fatalf("history upload id=%v", created["upload_id"])
-	}
-	put := decodePresigned(t, created["upload"])
-	putPresigned(t, put, ciphertext)
-	signedJSON(t, root, pc, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/history/uploads/"+uploadID+"/commit", nil, "history-commit-valid", http.StatusCreated)
-
-	listed := signedJSON(t, root, pc, http.MethodGet, "/v1/sessions/"+sessionID.String()+"/history", nil, "", http.StatusOK)
-	items, ok := listed["items"].([]any)
-	if !ok || len(items) != 1 {
-		t.Fatalf("history items=%v", listed["items"])
-	}
-	item, ok := items[0].(map[string]any)
-	if !ok {
-		t.Fatalf("history item=%T", items[0])
-	}
-	download := decodePresigned(t, item["download"])
-	downloaded := getPresigned(t, download)
-	if !bytes.Equal(downloaded, ciphertext) {
-		t.Fatalf("downloaded history ciphertext=%q, want %q", downloaded, ciphertext)
-	}
-
-	// Upload the expected bytes first so MinIO accepts the presigned checksum,
-	// then overwrite the same object through S3 with equal-sized corrupt data.
-	expected := []byte("expected-blob-01")
-	corrupt := []byte("corruptd-blob-01")
-	if len(expected) != len(corrupt) {
-		t.Fatal("mismatch fixture sizes differ")
-	}
-	expectedDigest := sha256.Sum256(expected)
-	badCreate := signedJSON(t, root, pc, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/history/uploads", map[string]any{
-		"kind": "CHUNK", "key_id": historyKeyID, "ciphertext_sha256": base64.RawURLEncoding.EncodeToString(expectedDigest[:]),
-		"size_bytes": len(expected), "start_seq": 4, "end_seq": 5,
-	}, "history-upload-mismatch", http.StatusCreated)
-	badUploadID := badCreate["upload_id"].(string)
-	badPut := decodePresigned(t, badCreate["upload"])
-	putPresigned(t, badPut, expected)
-	overwriteS3Object(t, s3Endpoint, s3Region, s3AccessKey, s3SecretKey, badPut.URL, corrupt)
-	signedJSON(t, root, pc, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/history/uploads/"+badUploadID+"/commit", nil, "history-commit-mismatch", http.StatusUnprocessableEntity)
-
-	signedJSON(t, root, pc, http.MethodDelete, "/v1/sessions/"+sessionID.String(), nil, "delete-history-session", http.StatusNoContent)
-	deleteDeadline := time.Now().Add(10 * time.Second)
-	for {
-		request, err := http.NewRequest(http.MethodGet, download.URL, nil)
-		if err != nil {
-			t.Fatal("deleted history presigned URL was invalid")
-		}
-		applyPresignedHeaders(request, download.Headers)
-		response, err := http.DefaultClient.Do(request)
-		if err != nil {
-			t.Fatalf("deleted history request transport failure (%T)", err)
-		}
-		if response.StatusCode == http.StatusNotFound {
-			response.Body.Close()
-			break
-		}
-		code := integrationS3Code(response.Body)
-		response.Body.Close()
-		if time.Now().After(deleteDeadline) {
-			t.Fatalf("deleted history status=%d s3_code=%s", response.StatusCode, code)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func decodePresigned(t *testing.T, value any) integrationPresignedRequest {
-	t.Helper()
-	data, err := json.Marshal(value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var request integrationPresignedRequest
-	if err := json.Unmarshal(data, &request); err != nil {
-		t.Fatal(err)
-	}
-	if request.URL == "" || request.Method == "" {
-		t.Fatal("invalid presigned request shape")
-	}
-	return request
-}
-
-func putPresigned(t *testing.T, presigned integrationPresignedRequest, body []byte) {
-	t.Helper()
-	request, err := http.NewRequest(presigned.Method, presigned.URL, bytes.NewReader(body))
-	if err != nil {
-		t.Fatal("upload presigned request was invalid")
-	}
-	request.ContentLength = int64(len(body))
-	applyPresignedHeaders(request, presigned.Headers)
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatalf("presigned upload transport failure (%T)", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		t.Fatalf("presigned upload status=%d s3_code=%s", response.StatusCode, integrationS3Code(response.Body))
-	}
-}
-
-func getPresigned(t *testing.T, presigned integrationPresignedRequest) []byte {
-	t.Helper()
-	request, err := http.NewRequest(presigned.Method, presigned.URL, nil)
-	if err != nil {
-		t.Fatal("download presigned request was invalid")
-	}
-	applyPresignedHeaders(request, presigned.Headers)
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatalf("presigned download transport failure (%T)", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		t.Fatalf("presigned download status=%d s3_code=%s", response.StatusCode, integrationS3Code(response.Body))
-	}
-	data, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return data
-}
-
-func applyPresignedHeaders(request *http.Request, headers map[string][]string) {
-	for name, values := range headers {
-		if strings.EqualFold(name, "Host") {
-			continue
-		}
-		for _, value := range values {
-			request.Header.Add(name, value)
+	for _, request := range []struct {
+		method, path, key string
+		body              any
+	}{
+		{method: http.MethodGet, path: "/v1/sessions/" + sessionID.String() + "/history"},
+		{method: http.MethodPost, path: "/v1/sessions/" + sessionID.String() + "/history/uploads", key: "retired-history-upload", body: map[string]any{}},
+		{method: http.MethodPost, path: "/v1/sessions/" + sessionID.String() + "/history/uploads/" + uuid.NewString() + "/commit", key: "retired-history-commit"},
+	} {
+		response := signedJSON(t, root, pc, request.method, request.path, request.body, request.key, http.StatusUpgradeRequired)
+		errorBody, ok := response["error"].(map[string]any)
+		if !ok || errorBody["code"] != "CLIENT_UPGRADE_REQUIRED" {
+			t.Fatalf("retired history response=%v", response)
 		}
 	}
-}
-
-// integrationS3Code keeps failure output useful without ever printing a
-// presigned URL, SigV4 query credential, request ID, host ID, or response body.
-func integrationS3Code(body io.Reader) string {
-	value, err := io.ReadAll(io.LimitReader(body, 1<<16))
-	if err != nil {
-		return "unavailable"
-	}
-	start := bytes.Index(value, []byte("<Code>"))
-	if start < 0 {
-		return "unavailable"
-	}
-	start += len("<Code>")
-	end := bytes.Index(value[start:], []byte("</Code>"))
-	if end < 0 || end > 128 {
-		return "unavailable"
-	}
-	code := strings.TrimSpace(string(value[start : start+end]))
-	if code == "" || strings.ContainsAny(code, "\r\n<>?&= ") {
-		return "unavailable"
-	}
-	return code
-}
-
-func overwriteS3Object(t *testing.T, endpoint, region, accessKey, secretKey, rawURL string, body []byte) {
-	t.Helper()
-	bucket, key := objectLocation(t, rawURL)
-	config, err := awsconfig.LoadDefaultConfig(context.Background(), awsconfig.WithRegion(region), awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := s3.NewFromConfig(config, func(options *s3.Options) {
-		options.BaseEndpoint = aws.String(strings.TrimRight(endpoint, "/"))
-		options.UsePathStyle = true
-	})
-	_, err = client.PutObject(context.Background(), &s3.PutObjectInput{
-		Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(body), ContentLength: aws.Int64(int64(len(body))),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func objectLocation(t *testing.T, rawURL string) (string, string) {
-	t.Helper()
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		t.Fatal("presigned object URL was invalid")
-	}
-	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-	if len(parts) < 2 {
-		t.Fatal("presigned object path was invalid")
-	}
-	key, err := url.PathUnescape(strings.Join(parts[1:], "/"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return parts[0], key
 }
 
 func assertWebSocketClosed(t *testing.T, socket *websocket.Conn, wantCode int) {

@@ -25,6 +25,7 @@ const (
 	FileOperationFailed     = "FAILED"
 	FileOperationCancelled  = "CANCELLED"
 	FileOperationExpired    = "EXPIRED"
+	FileTransferRealtimeV2  = "REALTIME_V2"
 
 	MaxFileOperationPathBytes   = 4096
 	MaxFileOperationResultBytes = 1 << 20
@@ -32,16 +33,8 @@ const (
 	// LIST results even if a client produces work faster than cleanup runs.
 	MaxRetainedFileOperationsPerAccount = 256
 	MaxFileOperationCleanupBatch        = 500
-	// MaxFileTransferBytes matches Amazon S3's exact single-PUT ceiling.
+	// MaxFileTransferBytes is the protocol-wide transfer ceiling.
 	MaxFileTransferBytes int64 = 5 << 30
-
-	// FileOperationDownloadGracePeriod is the window after completion during
-	// which Android may request a fresh ten-minute download URL. Object deletion
-	// is delayed by those final ten minutes so an issued URL is never revoked
-	// early. The same deletion delay safely outlives the one-hour upload URL for
-	// cancelled and failed operations.
-	FileOperationDownloadGracePeriod = 55 * time.Minute
-	FileOperationObjectDeletionDelay = FileOperationDownloadGracePeriod + 10*time.Minute
 )
 
 type FileOperationCreateInput struct {
@@ -70,8 +63,6 @@ type FileOperationCleanupResult struct {
 	Deleted int
 }
 
-// FileOperationRecord intentionally excludes the object-store key from JSON.
-// It is an internal capability identifier and must never cross the API boundary.
 type FileOperationRecord struct {
 	ID                uuid.UUID       `json:"id"`
 	AccountID         uuid.UUID       `json:"-"`
@@ -87,11 +78,11 @@ type FileOperationRecord struct {
 	LeaseExpiresAt    *time.Time      `json:"lease_expires_at,omitempty"`
 	Result            json.RawMessage `json:"result,omitempty"`
 	ErrorMessage      *string         `json:"error,omitempty"`
-	ObjectKey         string          `json:"-"`
 	Filename          *string         `json:"filename,omitempty"`
 	SizeBytes         *int64          `json:"size_bytes,omitempty"`
 	SHA256            []byte          `json:"sha256,omitempty"`
 	DirectoryZIP      *bool           `json:"directory_zip,omitempty"`
+	TransferProtocol  *string         `json:"transfer_protocol,omitempty"`
 	ExpiresAt         time.Time       `json:"expires_at"`
 	CompletedAt       *time.Time      `json:"completed_at,omitempty"`
 	CancelledAt       *time.Time      `json:"cancelled_at,omitempty"`
@@ -101,14 +92,14 @@ type FileOperationRecord struct {
 
 const fileOperationColumns = `
 	id,account_id,pc_id,requester_device_id,operation,path,list_offset,shell_type,status,
-	attempt_count,lease_token_hash,lease_expires_at,result,error_message,object_key,filename,
-	size_bytes,sha256,directory_zip,expires_at,completed_at,cancelled_at,created_at,updated_at`
+	attempt_count,lease_token_hash,lease_expires_at,result,error_message,filename,
+	size_bytes,sha256,directory_zip,transfer_protocol,expires_at,completed_at,cancelled_at,created_at,updated_at`
 
 const fileOperationReturningColumns = `
 	operation.id,operation.account_id,operation.pc_id,operation.requester_device_id,operation.operation,
 	operation.path,operation.list_offset,operation.shell_type,operation.status,operation.attempt_count,
 	operation.lease_token_hash,operation.lease_expires_at,operation.result,operation.error_message,
-	operation.object_key,operation.filename,operation.size_bytes,operation.sha256,operation.directory_zip,
+	operation.filename,operation.size_bytes,operation.sha256,operation.directory_zip,operation.transfer_protocol,
 	operation.expires_at,operation.completed_at,operation.cancelled_at,operation.created_at,operation.updated_at`
 
 type rowScanner interface {
@@ -117,17 +108,13 @@ type rowScanner interface {
 
 func scanFileOperation(row rowScanner) (FileOperationRecord, error) {
 	var item FileOperationRecord
-	var objectKey *string
 	err := row.Scan(&item.ID, &item.AccountID, &item.PCID, &item.RequesterDeviceID, &item.Operation,
 		&item.Path, &item.Offset, &item.ShellType, &item.Status, &item.AttemptCount,
-		&item.LeaseTokenHash, &item.LeaseExpiresAt, &item.Result, &item.ErrorMessage, &objectKey,
-		&item.Filename, &item.SizeBytes, &item.SHA256, &item.DirectoryZIP, &item.ExpiresAt,
+		&item.LeaseTokenHash, &item.LeaseExpiresAt, &item.Result, &item.ErrorMessage,
+		&item.Filename, &item.SizeBytes, &item.SHA256, &item.DirectoryZIP, &item.TransferProtocol, &item.ExpiresAt,
 		&item.CompletedAt, &item.CancelledAt, &item.CreatedAt, &item.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return FileOperationRecord{}, ErrNotFound
-	}
-	if objectKey != nil {
-		item.ObjectKey = *objectKey
 	}
 	return item, err
 }
@@ -184,8 +171,7 @@ func (s *Postgres) CreateFileOperation(ctx context.Context, userID, requesterID,
 
 // CleanupFileOperations performs one globally bounded, concurrent-safe pass.
 // It first turns abandoned live work into EXPIRED terminal work. It only
-// deletes terminal rows older than terminalBefore, and download metadata is
-// retained until its exact object-deletion outbox event was delivered.
+// deletes terminal rows older than terminalBefore.
 func (s *Postgres) CleanupFileOperations(
 	ctx context.Context,
 	now, terminalBefore time.Time,
@@ -208,15 +194,6 @@ func (s *Postgres) CleanupFileOperations(
 		) OR (
 			operation.status IN ('SUCCEEDED','FAILED','CANCELLED','EXPIRED')
 			AND COALESCE(operation.completed_at,operation.cancelled_at,operation.updated_at)<=$2
-			AND (
-				operation.operation<>'DOWNLOAD' OR operation.object_key IS NULL OR EXISTS (
-					SELECT 1 FROM outbox event
-					WHERE event.event_type='history.object.delete'
-					  AND event.aggregate_id=operation.id
-					  AND event.payload->>'object_key'=operation.object_key
-					  AND event.processed_at IS NOT NULL
-				)
-			)
 		)
 		ORDER BY COALESCE(operation.completed_at,operation.cancelled_at,operation.expires_at,operation.updated_at),operation.id
 		FOR UPDATE OF operation SKIP LOCKED
@@ -254,16 +231,6 @@ func (s *Postgres) CleanupFileOperations(
 			return FileOperationCleanupResult{}, err
 		}
 		result.Expired = int(command.RowsAffected())
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO outbox(event_type,aggregate_id,payload,available_at)
-			SELECT 'history.object.delete',operation.id,
-			       jsonb_build_object('object_key',operation.object_key),
-			       $2::timestamptz+($3 * interval '1 millisecond')
-			FROM pc_file_operations operation
-			WHERE operation.id=ANY($1::uuid[]) AND operation.object_key IS NOT NULL
-			ON CONFLICT DO NOTHING`, expireIDs, now.UTC(), FileOperationObjectDeletionDelay.Milliseconds()); err != nil {
-			return FileOperationCleanupResult{}, err
-		}
 	}
 	if len(deleteIDs) > 0 {
 		command, err := tx.Exec(ctx, `
@@ -308,8 +275,7 @@ func (s *Postgres) ClaimFileOperation(ctx context.Context, userID, agentDeviceID
 	}
 
 	if _, err := tx.Exec(ctx, `
-		WITH expired AS (
-			UPDATE pc_file_operations operation SET status='EXPIRED',updated_at=now()
+		UPDATE pc_file_operations operation SET status='EXPIRED',updated_at=now()
 		WHERE operation.pc_id=$1 AND operation.account_id=$2
 		  AND operation.status IN ('PENDING','PROCESSING') AND operation.expires_at<=now()
 		  AND EXISTS (
@@ -317,14 +283,7 @@ func (s *Postgres) ClaimFileOperation(ctx context.Context, userID, agentDeviceID
 			WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3
 			  AND 'file_operations_v1'=ANY(p.capabilities)
 			  AND agent.user_id=$2 AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
-		  )
-			RETURNING operation.id,operation.object_key
-		)
-		INSERT INTO outbox(event_type,aggregate_id,payload,available_at)
-		SELECT 'history.object.delete',id,jsonb_build_object('object_key',object_key),
-		       now()+($4 * interval '1 millisecond')
-		FROM expired WHERE object_key IS NOT NULL
-		ON CONFLICT DO NOTHING`, pcID, userID, agentDeviceID, FileOperationObjectDeletionDelay.Milliseconds()); err != nil {
+		  )`, pcID, userID, agentDeviceID); err != nil {
 		return nil, "", err
 	}
 
@@ -369,19 +328,11 @@ func (s *Postgres) ClaimFileOperation(ctx context.Context, userID, agentDeviceID
 
 func (s *Postgres) GetFileOperation(ctx context.Context, userID, requesterID, pcID, operationID uuid.UUID) (FileOperationRecord, error) {
 	_, err := s.Pool.Exec(ctx, `
-		WITH expired AS (
-			UPDATE pc_file_operations operation SET status='EXPIRED',updated_at=now()
+		UPDATE pc_file_operations operation SET status='EXPIRED',updated_at=now()
 		WHERE id=$1 AND account_id=$2 AND requester_device_id=$3 AND pc_id=$4
 		  AND status IN ('PENDING','PROCESSING') AND expires_at<=now()
-		  AND EXISTS (SELECT 1 FROM devices WHERE id=$3 AND user_id=$2 AND device_type='ANDROID' AND trust_state='TRUSTED')
-			RETURNING operation.id,operation.object_key
-		)
-		INSERT INTO outbox(event_type,aggregate_id,payload,available_at)
-		SELECT 'history.object.delete',id,jsonb_build_object('object_key',object_key),
-		       now()+($5 * interval '1 millisecond')
-		FROM expired WHERE object_key IS NOT NULL
-		ON CONFLICT DO NOTHING`,
-		operationID, userID, requesterID, pcID, FileOperationObjectDeletionDelay.Milliseconds())
+		  AND EXISTS (SELECT 1 FROM devices WHERE id=$3 AND user_id=$2 AND device_type='ANDROID' AND trust_state='TRUSTED')`,
+		operationID, userID, requesterID, pcID)
 	if err != nil {
 		return FileOperationRecord{}, err
 	}
@@ -429,25 +380,16 @@ func (s *Postgres) CancelFileOperation(ctx context.Context, userID, requesterID,
 	if err != nil {
 		return FileOperationRecord{}, err
 	}
-	if item.ObjectKey != "" {
-		// A presigned PUT remains usable after cancellation. Delay deletion
-		// beyond its one-hour validity so a late upload cannot recreate an
-		// orphan after the deletion event has already been delivered.
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO outbox(event_type,aggregate_id,payload,available_at)
-			VALUES('history.object.delete',$1,jsonb_build_object('object_key',$2::text),
-			       now()+($3 * interval '1 millisecond'))
-			ON CONFLICT DO NOTHING`, item.ID, item.ObjectKey, FileOperationObjectDeletionDelay.Milliseconds()); err != nil {
-			return FileOperationRecord{}, err
-		}
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return FileOperationRecord{}, err
 	}
 	return item, nil
 }
 
-func (s *Postgres) RecordFileOperationUpload(ctx context.Context, userID, agentDeviceID, pcID, operationID uuid.UUID, leaseHash [32]byte, input FileOperationUploadInput) (FileOperationRecord, error) {
+// RecordFileOperationTransfer publishes only authenticated metadata for the
+// storage-free realtime transfer. File bytes never enter PostgreSQL or object
+// storage. Replaying the same metadata is idempotent across worker reconnects.
+func (s *Postgres) RecordFileOperationTransfer(ctx context.Context, userID, agentDeviceID, pcID, operationID uuid.UUID, leaseHash [32]byte, input FileOperationUploadInput) (FileOperationRecord, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return FileOperationRecord{}, err
@@ -457,14 +399,17 @@ func (s *Postgres) RecordFileOperationUpload(ctx context.Context, userID, agentD
 	if err != nil {
 		return FileOperationRecord{}, err
 	}
+	now := time.Now().UTC()
 	if item.Status != FileOperationProcessing || item.Operation != FileOperationDownload ||
 		!equalFileOperationHash(item.LeaseTokenHash, leaseHash[:]) || item.LeaseExpiresAt == nil ||
-		!item.LeaseExpiresAt.After(time.Now().UTC()) || !item.ExpiresAt.After(time.Now().UTC()) {
+		!item.LeaseExpiresAt.After(now) || !item.ExpiresAt.After(now) {
 		return FileOperationRecord{}, ErrConflict
 	}
-	if item.ObjectKey != "" {
-		if item.Filename == nil || *item.Filename != input.Filename || item.SizeBytes == nil || *item.SizeBytes != input.SizeBytes ||
-			!equalFileOperationHash(item.SHA256, input.SHA256) || item.DirectoryZIP == nil || *item.DirectoryZIP != input.DirectoryZIP {
+	if item.TransferProtocol != nil {
+		if *item.TransferProtocol != FileTransferRealtimeV2 || item.Filename == nil ||
+			*item.Filename != input.Filename || item.SizeBytes == nil || *item.SizeBytes != input.SizeBytes ||
+			!equalFileOperationHash(item.SHA256, input.SHA256) || item.DirectoryZIP == nil ||
+			*item.DirectoryZIP != input.DirectoryZIP {
 			return FileOperationRecord{}, ErrConflict
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -472,11 +417,12 @@ func (s *Postgres) RecordFileOperationUpload(ctx context.Context, userID, agentD
 		}
 		return item, nil
 	}
-	objectKey := fmt.Sprintf("accounts/%s/file-transfers/%s/%s.bin", userID, pcID, operationID)
 	item, err = scanFileOperation(tx.QueryRow(ctx, `
-		UPDATE pc_file_operations SET object_key=$2,filename=$3,size_bytes=$4,sha256=$5,directory_zip=$6,updated_at=now()
+		UPDATE pc_file_operations
+		SET filename=$2,size_bytes=$3,sha256=$4,directory_zip=$5,
+		    transfer_protocol='REALTIME_V2',updated_at=now()
 		WHERE id=$1 RETURNING `+fileOperationColumns,
-		operationID, objectKey, input.Filename, input.SizeBytes, input.SHA256, input.DirectoryZIP))
+		operationID, input.Filename, input.SizeBytes, input.SHA256, input.DirectoryZIP))
 	if err != nil {
 		return FileOperationRecord{}, err
 	}
@@ -544,9 +490,6 @@ func (s *Postgres) CompleteFileOperation(ctx context.Context, userID, agentDevic
 		if !jsonEqual(item.Result, input.Result) || !equalOptionalString(item.ErrorMessage, input.ErrorMessage) {
 			return FileOperationRecord{}, ErrConflict
 		}
-		if err := scheduleFileOperationObjectDeletion(ctx, tx, item); err != nil {
-			return FileOperationRecord{}, err
-		}
 		if err := tx.Commit(ctx); err != nil {
 			return FileOperationRecord{}, err
 		}
@@ -556,8 +499,10 @@ func (s *Postgres) CompleteFileOperation(ctx context.Context, userID, agentDevic
 		!item.LeaseExpiresAt.After(time.Now().UTC()) || !item.ExpiresAt.After(time.Now().UTC()) {
 		return FileOperationRecord{}, ErrConflict
 	}
-	if input.Status == FileOperationSucceeded && item.Operation == FileOperationDownload && item.ObjectKey == "" {
-		return FileOperationRecord{}, ErrConflict
+	if input.Status == FileOperationSucceeded && item.Operation == FileOperationDownload {
+		if item.TransferProtocol == nil || *item.TransferProtocol != FileTransferRealtimeV2 {
+			return FileOperationRecord{}, ErrConflict
+		}
 	}
 	item, err = scanFileOperation(tx.QueryRow(ctx, `
 		UPDATE pc_file_operations
@@ -567,27 +512,10 @@ func (s *Postgres) CompleteFileOperation(ctx context.Context, userID, agentDevic
 	if err != nil {
 		return FileOperationRecord{}, err
 	}
-	if err := scheduleFileOperationObjectDeletion(ctx, tx, item); err != nil {
-		return FileOperationRecord{}, err
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return FileOperationRecord{}, err
 	}
 	return item, nil
-}
-
-func scheduleFileOperationObjectDeletion(ctx context.Context, tx pgx.Tx, item FileOperationRecord) error {
-	if item.Operation != FileOperationDownload || item.ObjectKey == "" ||
-		(item.Status != FileOperationSucceeded && item.Status != FileOperationFailed &&
-			item.Status != FileOperationCancelled && item.Status != FileOperationExpired) {
-		return nil
-	}
-	_, err := tx.Exec(ctx, `
-		INSERT INTO outbox(event_type,aggregate_id,payload,available_at)
-		VALUES('history.object.delete',$1,jsonb_build_object('object_key',$2::text),
-		       now()+($3 * interval '1 millisecond'))
-		ON CONFLICT DO NOTHING`, item.ID, item.ObjectKey, FileOperationObjectDeletionDelay.Milliseconds())
-	return err
 }
 
 func (s *Postgres) getAgentFileOperationForUpdate(ctx context.Context, tx pgx.Tx, userID, agentDeviceID, pcID, operationID uuid.UUID) (FileOperationRecord, error) {

@@ -1098,11 +1098,19 @@ fun ProductApp(
     LaunchedEffect(
         snapshot.connectionState,
         snapshot.sessions.map { Triple(it.id, it.state, it.online) },
+        snapshot.pcs.map { Triple(it.id, it.online, it.capabilities) },
         openedSessionIds,
     ) {
         if (snapshot.connectionState != ProductConnectionState.CONNECTED) return@LaunchedEffect
+        val pcsById = snapshot.pcs.associateBy(PcSummary::id)
         val available = snapshot.sessions.asSequence()
-            .filter(::isSessionTabOpenable)
+            .filter { session ->
+                isSessionTabOpenable(
+                    session = session,
+                    pc = pcsById[session.pcId],
+                    hasReadOnlyRenderer = repository.terminalEngine(session.id) != null,
+                )
+            }
             .mapTo(hashSetOf()) { it.id.toString() }
         val retained = openedSessionIds.filter(available::contains)
         if (retained != openedSessionIds) {
@@ -1165,7 +1173,9 @@ fun ProductApp(
     }
 
     fun selectSessionTab(sessionId: java.util.UUID, addIfMissing: Boolean): Boolean {
-        if (!isSessionTabOpenable(snapshot.sessions.firstOrNull { it.id == sessionId })) return false
+        val session = snapshot.sessions.firstOrNull { it.id == sessionId }
+        val pc = session?.let { selected -> snapshot.pcs.firstOrNull { it.id == selected.pcId } }
+        if (!isSessionTabOpenable(session, pc, repository.terminalEngine(sessionId) != null)) return false
         val value = sessionId.toString()
         val next = if (addIfMissing && value !in openedSessionIds) openedSessionIds + value else openedSessionIds
         if (value !in next) return false
@@ -1460,7 +1470,16 @@ fun ProductApp(
                     // Opening a session is the command-line entry point. The
                     // server lease is requested here, so the terminal has no
                     // separate "申请控制" button.
-                    onOpenSession = { runSessionOperation { repository.requestControl(it) } },
+                    onOpenSession = { sessionId ->
+                        runSessionOperation {
+                            val selected = repository.snapshot.value.sessions.firstOrNull { it.id == sessionId }
+                            if (selected?.state == SessionState.EXITED) {
+                                repository.openSession(sessionId)
+                            } else {
+                                repository.requestControl(sessionId)
+                            }
+                        }
+                    },
                     onLoadTranscript = { sessionId ->
                         scope.launch { runSessionOperation { repository.loadTranscriptBefore(sessionId) } }
                     },
@@ -3653,7 +3672,7 @@ private fun PcRow(
                                 .fillMaxWidth()
                                 .clip(ProductShape)
                                 .clickable(
-                                    enabled = onOpenSession != null && isSessionTabOpenable(session),
+                                    enabled = onOpenSession != null && isSessionTabOpenable(session, pc),
                                 ) {
                                     onOpenSession?.invoke(session.id)
                                 }
@@ -3714,8 +3733,16 @@ private fun PcRow(
 
 internal fun isDeviceSessionActive(sessionOnline: Boolean): Boolean = sessionOnline
 
-internal fun isSessionTabOpenable(session: SessionSummary?): Boolean =
-    session != null && session.online && session.state != SessionState.EXITED
+internal fun isSessionTabOpenable(
+    session: SessionSummary?,
+    pc: PcSummary? = null,
+    hasReadOnlyRenderer: Boolean = false,
+): Boolean = when {
+    session == null -> false
+    session.state != SessionState.EXITED -> session.online
+    hasReadOnlyRenderer -> true
+    else -> pc?.online == true && PcCapabilityIds.HOST_HISTORY_V1 in pc.capabilities
+}
 
 internal enum class DeviceSessionDestructiveAction {
     CLOSE_ONLINE,
@@ -3758,6 +3785,16 @@ private fun SessionsPage(
     }
     val opened = openedSessionIds.toHashSet()
     val openedSessions = snapshot.sessions.filter { it.id.toString() in opened }
+    val pcsById = snapshot.pcs.associateBy(PcSummary::id)
+    val readOnlyOpenableSessionIds = openedSessions.asSequence()
+        .filter { session ->
+            isSessionTabOpenable(
+                session = session,
+                pc = pcsById[session.pcId],
+                hasReadOnlyRenderer = terminalEngine(session.id) != null,
+            )
+        }
+        .mapTo(hashSetOf(), SessionSummary::id)
     val requestedSelected = openedSessions.firstOrNull { it.id == requestedSelectedId }
     val requestedSelectedEngine = requestedSelected?.let { terminalEngine(it.id) }
     val activeSessions = liveSessionPageSessions(
@@ -3765,6 +3802,7 @@ private fun SessionsPage(
         selectedId = requestedSelectedId,
         sessionStates = snapshot.sessionStates,
         selectedHasEngine = requestedSelectedEngine != null,
+        readOnlyOpenableSessionIds = readOnlyOpenableSessionIds,
     )
     val density = LocalDensity.current
     val imeBottomPixels = WindowInsets.ime.getBottom(density)
@@ -3800,14 +3838,21 @@ private fun SessionsPage(
             } else {
                 terminalEngine(selected.id)
             }
-            val controlRequestKey = sessionControlRequestEffectKey(
-                foreground = foreground,
-                foregroundGeneration = foregroundGeneration,
-                online = selected.online,
-                remoteState = snapshot.sessionStates[selected.id],
-            )
+            val controlRequestKey = if (selected.state == SessionState.EXITED) null else {
+                sessionControlRequestEffectKey(
+                    foreground = foreground,
+                    foregroundGeneration = foregroundGeneration,
+                    online = selected.online,
+                    remoteState = snapshot.sessionStates[selected.id],
+                )
+            }
             LaunchedEffect(selected.id, controlRequestKey) {
                 if (controlRequestKey != null) {
+                    onOpenSession(selected.id)
+                }
+            }
+            LaunchedEffect(selected.id, selected.state, selectedEngine) {
+                if (selected.state == SessionState.EXITED && selectedEngine == null) {
                     onOpenSession(selected.id)
                 }
             }
@@ -4032,11 +4077,12 @@ internal fun liveSessionPageSessions(
     selectedId: java.util.UUID?,
     sessionStates: Map<java.util.UUID, RemoteSessionState>,
     selectedHasEngine: Boolean,
+    readOnlyOpenableSessionIds: Set<java.util.UUID> = emptySet(),
 ): List<SessionSummary> = sessions.filter { session ->
     val remoteState = sessionStates[session.id]
     val explicitlyExited = session.state == SessionState.EXITED || remoteState is RemoteSessionState.Exited
     if (explicitlyExited) {
-        false
+        session.id in readOnlyOpenableSessionIds
     } else {
         session.online || session.id == selectedId && (selectedHasEngine || remoteState != null)
     }

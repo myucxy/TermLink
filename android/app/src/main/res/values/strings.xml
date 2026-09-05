@@ -391,7 +391,7 @@
     <string name="confirm_sign_out_title">Sign out of this device?</string>
     <string name="confirm_sign_out_copy">This clears the local session and closes active remote connections. Windows shells keep running.</string>
     <string name="confirm_delete_session_title">Permanently delete this session?</string>
-    <string name="confirm_delete_session_copy">The offline session and its encrypted history stored on the server will be permanently deleted. This cannot be undone.</string>
+    <string name="confirm_delete_session_copy">TermLink deletes this session’s local history from the online Windows PC only after the host confirms the request, then removes the server record and Android cache. This cannot be undone.</string>
     <string name="confirm_close_session_title">Close this online session?</string>
     <string name="confirm_close_session_copy">This sends an encrypted close request to the Windows PC. Its command line, child process tree, TermLink Terminal tab, and saved session record will all be closed or removed.</string>
     <string name="confirm_change_server">Change server</string>
@@ -467,6 +467,7 @@
     <string name="remote_pc_unavailable">Windows PC unavailable</string>
     <string name="remote_pc_unavailable_copy">Return to Devices and select an online Windows PC.</string>
     <string name="remote_download_preparing">Preparing on Windows</string>
+    <string name="remote_download_resuming">Resuming from saved progress</string>
     <string name="remote_download_compressing">Compressing ZIP on Windows</string>
     <string name="remote_download_downloading">Downloading</string>
     <string name="remote_download_verifying">Verifying size and SHA-256</string>

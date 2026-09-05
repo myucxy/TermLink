@@ -89,6 +89,7 @@ internal fun productionRealtimeCapabilities(additional: Set<String>): List<Strin
         "bounded_event_replay_v1",
         "terminal_presentation_metadata_v1",
         "terminal_typed_input_v1",
+        "host_history_v1",
     ) + additional).distinct().sorted()
 }
 

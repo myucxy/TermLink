@@ -268,7 +268,8 @@ Registry API 读取 index、manifest、config blob 和 attestation descriptor。
 ```
 
 不要传 `-Reset`，不要执行 `docker compose down --volumes`。脚本会拉取固定镜像、运行 migration、重建
-server，并复用 PostgreSQL、Valkey、MinIO、Keycloak 和 secret volumes。
+server，并复用 PostgreSQL、Valkey、Keycloak 和 secret volumes。历史 MinIO named volume 不参与当前
+运行时，也不要在无损升级过程中顺带删除。
 
 当发布要求明确限定为本机构建、禁止 Git 流水线和 Registry push 时，先使用固定版本、revision、created
 与 `SOURCE_DATE_EPOCH` 构建 `linux/amd64` 镜像，再通过独立参数执行同一套迁移、健康检查和生产探针：
@@ -284,8 +285,8 @@ server，并复用 PostgreSQL、Valkey、MinIO、Keycloak 和 secret volumes。
 
 升级后必须独立确认：
 
-- `server`、`lucky-upstream`、`keycloak`、`edge`、`valkey`、`minio`、`postgres` 共 7 个服务均为
-  `running/healthy`；
+- `server`、`lucky-upstream`、`keycloak`、`valkey`、`postgres` 均为 `running`，其中声明了
+  healthcheck 的服务必须为 `healthy`；
 - server 的 `Config.Image` 是 `<tag>@<digest>`，OCI revision 是计划发布提交；
 - `SELECT MAX(version) FROM schema_migrations` 等于当前最高 migration；
 - 升级前后的 named volume 名称和数量一致；
@@ -295,7 +296,7 @@ server，并复用 PostgreSQL、Valkey、MinIO、Keycloak 和 secret volumes。
 ## 9. 最终交付记录
 
 每次发布结论至少包含：源码 commit、Android/Windows 文件哈希与 signer、AppShip 双端 release/artifact ID、
-Docker index digest 与架构、供应链证明是否完整或降级、Compose 7 服务健康、schema 版本、公网 readyz、
+Docker index digest 与架构、供应链证明是否完整或降级、Compose 服务健康、schema 版本、公网 readyz、
 模拟器 version/build 与数据保留证据、Windows marker/status，以及 AppShip 新旧 build 的更新决策。
 
 任何未完成项都按事实写明，不用“构建成功”替代“已上传”，不用“标签存在”替代“digest/架构/attestation

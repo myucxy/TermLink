@@ -47,14 +47,14 @@ Agent 返回 durable ACK 后按序 apply，并串行处理核心 Host Effect 与
 | 1 | 生产账号/OIDC、同账号设备直连与撤销 | **已实现并验证** | Windows/Android 设备按同一 OIDC subject 归属账号并自动注册、直接发现 PC/Session；账号隔离、逐设备密钥和撤销测试已覆盖。旧 pairing/grant/trust 表与 API 仅作兼容层保留，不是首版产品前置流程；真实外部 OIDC enrollment/provider 部署不在本次验收范围。 |
 | 2 | 生产 Protobuf 实时协议、X25519 + ChaCha20-Poly1305、Relay | **已实现并验证** | `protocol/protobuf/termlink_realtime.proto`、Go `realtimewire`/Relay、Android `core-network`、Windows `src/Protocol`；向量、协议和本地 Relay 集成通过，Relay 保持密文不透明，公网 TLS 部署未验收。 |
 | 3 | 自研跨平台终端核心到 Android 的实时输入输出、ACK/Gap/重连、租约与本地输入优先 | **production authority 已切换并验证** | Windows `SessionHost` 在 durable ACK 后按序 apply terminal-core，统一 Host Effect/输入顺序并对 Gap fail closed；Android APK 打包各 ABI JNI 核心并由 native View 负责渲染、输入和任意长度连续历史重建。公网 TL-H115、Gap/重连、IME、首尾 marker 与 native Snapshot/Transcript 门禁已验证；诊断 shadow 只保留为非权威差分路径。 |
-| 4 | 每 Android 设备单独加密的有界历史、S3/MinIO 预签名上传/下载/校验/删除 | **已实现并验证** | Android `core-crypto`/`feature-history`、Windows History Uploader、Go history store；SHA-256、密文元数据、预签名和删除集成测试通过。 |
+| 4 | Windows 主机本地持有的逐设备加密历史、Snapshot/ACK 冷恢复与关闭销毁 | **已实现并验证** | Windows 本地 WAL/checkpoint、Android `core-crypto`/`feature-history` 与 `host_history_v1` 实时请求；服务端只保留会话目录元数据，不保存终端历史正文或对象。 |
 | 5 | 服务端 Catalog、计费验证边界、权益与功能状态 | **核心已实现并验证（Provider 待配置）** | Go `billing`/Catalog/entitlement API、账号级不限 PC/Session、可注入 verified-purchase 契约与 Android `feature-billing` 已测试；真实 Google/Web verifier 未配置时生产入口返回 `BILLING_UNAVAILABLE`。 |
-| 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/MinIO/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、`core/history/integration.compose.yml` 与生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |
-| 7 | 生产 TLS/受信发布证书真实安装更新、备份恢复演练、镜像签名、监控告警、生产 CA/发布加固 | **已实现并本地验证（外部发布待验收）** | Caddy/ACME、隔离指标与告警、PostgreSQL+MinIO 备份恢复、摘要固定、SBOM/provenance/Cosign 工作流及生产 Compose 策略已验证；开发信任下 EXE 安装/升级/卸载通过，MSIX 仅作兼容验证。生产 CA、真实发布证书和 AppShip release tag 仍需外部执行。 |
+| 6 | Android 产品页面、Windows Tray、Compose PostgreSQL/Valkey/OIDC 接线及自动化验收 | **已实现并验证** | Android product UI、Windows Account/Devices Tray、实时文件传输与当前生产运行时；Go/Android/.NET/Compose 自动化验收通过。 |
+| 7 | 生产 TLS/受信发布证书真实安装更新、备份恢复演练、镜像签名、监控告警、生产 CA/发布加固 | **已实现并本地验证（外部发布待验收）** | Caddy/ACME、隔离指标与告警、PostgreSQL 备份恢复、摘要固定、SBOM/provenance/Cosign 工作流及生产 Compose 策略已验证；开发信任下 EXE 安装/升级/卸载通过，MSIX 仅作兼容验证。生产 CA、真实发布证书和 AppShip release tag 仍需外部执行。 |
 
 统一边界：`LAN Replay V1`、`TLT1`（Phase 1 Test Session V1）和 Android Compose
-Harness 都是测试夹具，不是生产协议；Android 历史客户端只接受 HTTPS。Integration
-Compose 中 MinIO 的 HTTP 端口仅供本机 loopback 集成测试，不能当作生产历史传输。1-7
+Harness 都是测试夹具，不是生产协议；生产历史由在线 Windows Agent 通过认证实时链路提供，
+文件正文也不落服务端对象存储。1-7
 的本地自动化结果不代表 arm64 真机、厂商 IME、外接键鼠、平板/折叠屏或外部生产发布已经验证。
 
 移动客户端已内置固定版本和校验值的 CaskaydiaCove Nerd Font Mono，并在“设置 → 终端显示”
@@ -193,12 +193,10 @@ D:\Dev\Env\Go\bin\go.exe vet ./...
 # 生产 Compose 配置（需要本机 .env 和 secrets）
 docker compose --env-file .env -f compose\core.compose.yml config
 
-# 真实 PostgreSQL/Valkey/MinIO 集成（一次性基础设施）
-docker compose -f compose\integration.compose.yml up -d --wait postgres valkey minio
+# 真实 PostgreSQL/Valkey 集成（一次性基础设施）
+docker compose -f compose\integration.compose.yml up -d --wait postgres valkey
 $env:TERMLINK_INTEGRATION_DATABASE_URL='postgres://termlink:integration-only-password@127.0.0.1:55432/termlink?sslmode=disable'
 $env:TERMLINK_INTEGRATION_REDIS_URL='redis://127.0.0.1:56379/0'
-$env:TERMLINK_INTEGRATION_S3_ENDPOINT='http://127.0.0.1:59000'
-$env:TERMLINK_INTEGRATION_S3_PUBLIC_ENDPOINT='http://127.0.0.1:59000'
 go test ./internal/api -run TestProductionAccountRelayAndRevocation -count=1
 docker compose -f compose\integration.compose.yml down -v
 

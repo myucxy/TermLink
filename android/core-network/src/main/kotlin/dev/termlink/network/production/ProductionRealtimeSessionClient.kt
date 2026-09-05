@@ -8,6 +8,13 @@ import dev.termlink.crypto.SessionCrypto
 import dev.termlink.protocol.realtime.v1.Envelope
 import dev.termlink.protocol.realtime.v1.FlowControlPayload
 import dev.termlink.protocol.realtime.v1.GapPayload
+import dev.termlink.protocol.realtime.v1.HostHistoryControlActionV1
+import dev.termlink.protocol.realtime.v1.HostHistoryControlPayload
+import dev.termlink.protocol.realtime.v1.HostHistoryObjectKindV1
+import dev.termlink.protocol.realtime.v1.HostHistoryRequestKindV1
+import dev.termlink.protocol.realtime.v1.HostHistoryRequestPayload
+import dev.termlink.protocol.realtime.v1.HostHistoryResponsePayload
+import dev.termlink.protocol.realtime.v1.HostHistoryResponseStatusV1
 import dev.termlink.protocol.realtime.v1.InputEventPayload
 import dev.termlink.protocol.realtime.v1.InputResultPayload
 import dev.termlink.protocol.realtime.v1.LeasePayload
@@ -16,6 +23,7 @@ import dev.termlink.protocol.realtime.v1.OutputAckPayload
 import dev.termlink.protocol.realtime.v1.OutputChunkPayload
 import dev.termlink.protocol.realtime.v1.ResizePayload
 import dev.termlink.protocol.realtime.v1.SessionTerminateRequestPayload
+import dev.termlink.protocol.realtime.v1.SessionTerminateResponsePayload
 import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
 import dev.termlink.protocol.realtime.v1.SubscribePayload
 import dev.termlink.protocol.realtime.v1.TerminalInputKindV1
@@ -43,6 +51,7 @@ import dev.termlink.terminal.api.TerminalKey
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.VtTerminalInputEncoder
 import java.io.Closeable
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.time.Instant
 import java.util.UUID
@@ -68,6 +77,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -122,6 +132,39 @@ private class InMemoryInputSequenceProvider : InputSequenceProvider {
 }
 
 private const val TERMINATION_REASON_USER_REQUESTED = "USER_REQUESTED"
+private const val HOST_HISTORY_RESPONSE_CHUNK_BYTES = 512 * 1024
+private const val MAX_HOST_HISTORY_OBJECT_BYTES = 64 * 1024 * 1024
+private const val HOST_HISTORY_REQUEST_TIMEOUT_MILLIS = 30_000L
+
+data class ProductionHostHistoryObject(
+    val kind: HostHistoryObjectKindV1,
+    val objectId: UUID,
+    val snapshotSequence: ULong,
+    val columns: Int,
+    val rows: Int,
+    val initialTranscriptBeforeLineId: ULong,
+    val requestBeforeLineId: ULong,
+    val firstLineId: ULong,
+    val lastLineId: ULong,
+    val hasMoreBefore: Boolean,
+    val nextBeforeLineId: ULong,
+    val startSequence: ULong,
+    val endSequence: ULong,
+    val hasMoreEvents: Boolean,
+    val keyId: String,
+    val formatName: String,
+    val formatVersion: Int,
+    val ciphertextSha256: ByteArray,
+    val sealedObject: ByteArray,
+) {
+    fun destroy() {
+        ciphertextSha256.fill(0)
+        sealedObject.fill(0)
+    }
+}
+
+class ProductionHostHistoryGapException(message: String) : IllegalStateException(message)
+class ProductionHostHistoryNotReadyException(message: String) : IllegalStateException(message)
 
 data class ProductionRealtimeSessionDiagnostics(
     val transportState: String,
@@ -178,6 +221,9 @@ class ProductionRealtimeSessionClient(
     private val previousEpochGraceMillis: Long = 30_000,
     private val subscriberRefreshIntervalMillis: Long = 15_000,
     private val terminationReadinessTimeoutMillis: Long = 15_000,
+    private val hostHistoryRequestTimeoutMillis: Long = HOST_HISTORY_REQUEST_TIMEOUT_MILLIS,
+    private val holdLiveReplayForHostHistory: Boolean = false,
+    private val hostHistoryOnlyMode: Boolean = false,
     leaseRenewalIntervalMillis: Long = 10_000,
     disposeEngineOnClose: Boolean = true,
     orderedEventObserver: RemoteSessionOrderedEventObserver? = null,
@@ -212,6 +258,8 @@ class ProductionRealtimeSessionClient(
     private val materialLock = Any()
     private val observedLocalInputEpoch = AtomicLong(initialObservedLocalInputEpoch)
     private val pendingInputs = ConcurrentHashMap<UUID, CompletableDeferred<Unit>>()
+    private val pendingTerminations = ConcurrentHashMap<UUID, CompletableDeferred<Boolean>>()
+    private val pendingHostHistory = ConcurrentHashMap<UUID, HostHistoryAccumulator>()
     private val reconnectMutex = Mutex()
     private var reconnectJob: Job? = null
     private var reconnectStabilityJob: Job? = null
@@ -256,7 +304,7 @@ class ProductionRealtimeSessionClient(
     /** Zero means not subscribed; a positive value is the exact socket generation. */
     private val subscriberReady = MutableStateFlow(0)
     private val bootstrapFlowHold = AtomicBoolean(true)
-    private val semanticFlowHold = AtomicBoolean(false)
+    private val semanticFlowHold = AtomicBoolean(holdLiveReplayForHostHistory)
     private val flowControlEpoch = AtomicLong(0)
     private val subscribeSendCount = AtomicLong(0)
     private val lastSubscribeCursor = AtomicLong(0)
@@ -272,6 +320,174 @@ class ProductionRealtimeSessionClient(
     private var lastFlowControlGeneration = Int.MIN_VALUE
     private var lastFlowControlPaused: Boolean? = null
 
+    private sealed interface HostHistoryRequestResult {
+        data class Ready(val value: ProductionHostHistoryObject) : HostHistoryRequestResult
+        data object Missing : HostHistoryRequestResult
+    }
+
+    private data class HostHistoryChunkAcceptance(
+        val objectId: ByteString,
+        val chunkIndex: Int,
+        val completed: ProductionHostHistoryObject?,
+    )
+
+    private class HostHistoryAccumulator {
+        val results = Channel<HostHistoryRequestResult>(
+            capacity = 1,
+            onUndeliveredElement = { result ->
+                if (result is HostHistoryRequestResult.Ready) result.value.destroy()
+            },
+        )
+        private var header: ByteArray? = null
+        private var metadata: HostHistoryResponsePayload? = null
+        private var assembled: ByteArray? = null
+        private var received: BooleanArray? = null
+        private var receivedCount = 0
+
+        @Synchronized
+        fun accept(response: HostHistoryResponsePayload): HostHistoryChunkAcceptance {
+            require(response.status == HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_OK) {
+                "Host history response is not successful"
+            }
+            require(response.objectId.size() == 16 && response.objectSha256.size() == 32) {
+                "Host history object identity is invalid"
+            }
+            require(response.kind != HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_UNSPECIFIED) {
+                "Host history object kind is missing"
+            }
+            require(response.objectBytes in 1..MAX_HOST_HISTORY_OBJECT_BYTES.toLong()) {
+                "Host history object size is invalid"
+            }
+            require(response.chunkCount in 1..128 && response.chunkIndex < response.chunkCount) {
+                "Host history chunk index is invalid"
+            }
+            val expectedChunkCount = (
+                (response.objectBytes + HOST_HISTORY_RESPONSE_CHUNK_BYTES - 1) /
+                    HOST_HISTORY_RESPONSE_CHUNK_BYTES
+                ).toInt()
+            require(response.chunkCount == expectedChunkCount) {
+                "Host history chunk count does not match object length"
+            }
+            val offset = response.chunkIndex * HOST_HISTORY_RESPONSE_CHUNK_BYTES
+            val expectedChunkBytes = minOf(
+                HOST_HISTORY_RESPONSE_CHUNK_BYTES.toLong(),
+                response.objectBytes - offset.toLong(),
+            ).toInt()
+            require(response.objectChunk.size() == expectedChunkBytes) {
+                "Host history chunk size is invalid"
+            }
+            val normalizedMetadata = response.toBuilder()
+                .setChunkIndex(0)
+                .clearObjectChunk()
+                .build()
+            val normalizedHeader = normalizedMetadata.toByteArray()
+            val existingHeader = header
+            if (existingHeader == null) {
+                header = normalizedHeader
+                metadata = normalizedMetadata
+                assembled = ByteArray(response.objectBytes.toInt())
+                received = BooleanArray(response.chunkCount)
+            } else {
+                try {
+                    require(MessageDigest.isEqual(existingHeader, normalizedHeader)) {
+                        "Host history chunk metadata changed"
+                    }
+                } finally {
+                    normalizedHeader.fill(0)
+                }
+            }
+            val target = requireNotNull(assembled)
+            val admitted = requireNotNull(received)
+            val index = response.chunkIndex
+            if (admitted[index]) {
+                var difference = 0
+                for (chunkOffset in 0 until expectedChunkBytes) {
+                    difference = difference or (
+                        target[offset + chunkOffset].toInt() xor
+                            response.objectChunk.byteAt(chunkOffset).toInt()
+                        )
+                }
+                require(difference == 0) { "Host history chunk was replayed with different bytes" }
+            } else {
+                response.objectChunk.asReadOnlyByteBuffer().get(target, offset, expectedChunkBytes)
+                admitted[index] = true
+                receivedCount++
+            }
+            if (receivedCount != admitted.size) {
+                return HostHistoryChunkAcceptance(response.objectId, index, null)
+            }
+            val digest = MessageDigest.getInstance("SHA-256").digest(target)
+            val expectedDigest = response.objectSha256.toByteArray()
+            try {
+                require(MessageDigest.isEqual(digest, expectedDigest)) {
+                    "Host history object digest mismatch"
+                }
+            } catch (error: Throwable) {
+                target.fill(0)
+                throw error
+            } finally {
+                digest.fill(0)
+                expectedDigest.fill(0)
+            }
+            val value = requireNotNull(metadata)
+            val objectId = ProductionRealtimeClient.uuidFromBytes(value.objectId.toByteArray())
+                ?: error("Host history object ID is invalid")
+            val completed = ProductionHostHistoryObject(
+                kind = value.kind,
+                objectId = objectId,
+                snapshotSequence = value.snapshotSeq.toULong(),
+                columns = value.columns,
+                rows = value.rows,
+                initialTranscriptBeforeLineId = value.initialTranscriptBeforeLineId.toULong(),
+                requestBeforeLineId = value.requestBeforeLineId.toULong(),
+                firstLineId = value.firstLineId.toULong(),
+                lastLineId = value.lastLineId.toULong(),
+                hasMoreBefore = value.hasMoreBefore,
+                nextBeforeLineId = value.nextBeforeLineId.toULong(),
+                startSequence = value.startSeq.toULong(),
+                endSequence = value.endSeq.toULong(),
+                hasMoreEvents = value.hasMoreEvents,
+                keyId = value.keyId,
+                formatName = value.formatName,
+                formatVersion = value.formatVersion,
+                ciphertextSha256 = value.objectSha256.toByteArray(),
+                sealedObject = target,
+            )
+            assembled = null
+            clearAssembly()
+            return HostHistoryChunkAcceptance(response.objectId, index, completed)
+        }
+
+        @Synchronized
+        fun deliver(result: HostHistoryRequestResult) {
+            if (results.trySend(result).isFailure && result is HostHistoryRequestResult.Ready) {
+                result.value.destroy()
+            }
+        }
+
+        @Synchronized
+        fun fail(error: Throwable) {
+            clearAssembly()
+            results.close(error)
+        }
+
+        @Synchronized
+        fun destroy() {
+            clearAssembly()
+            results.cancel()
+        }
+
+        private fun clearAssembly() {
+            header?.fill(0)
+            header = null
+            assembled?.fill(0)
+            assembled = null
+            received = null
+            receivedCount = 0
+            metadata = null
+        }
+    }
+
     init {
         require(reconnectDelaysMillis.isNotEmpty() && reconnectDelaysMillis.all { it in 0..30_000 }) {
             "reconnect delays must be non-empty and capped at 30 seconds"
@@ -285,6 +501,11 @@ class ProductionRealtimeSessionClient(
         require(previousEpochGraceMillis in 1..60_000) { "previous epoch grace must be 1..60000 milliseconds" }
         require(subscriberRefreshIntervalMillis > 0) { "subscriber refresh interval must be positive" }
         require(terminationReadinessTimeoutMillis > 0) { "termination readiness timeout must be positive" }
+        require(hostHistoryRequestTimeoutMillis > 0) { "host history request timeout must be positive" }
+        require(!hostHistoryOnlyMode || holdLiveReplayForHostHistory) {
+            "host history-only mode requires a permanent zero replay window"
+        }
+        if (hostHistoryOnlyMode) engine.setReadOnly(true)
         val session = RemoteTerminalSession(
             engine = engine,
             outbound = this,
@@ -383,7 +604,10 @@ class ProductionRealtimeSessionClient(
     fun start() {
         check(!closed.get()) { "production session client is closed" }
         check(started.compareAndSet(false, true)) { "production session client is already started" }
-        session.start()
+        // History-only endpoints never collect renderer input and never make
+        // the temporary RemoteTerminalSession live. They exist solely to
+        // carry encrypted Host History and termination request/response frames.
+        if (!hostHistoryOnlyMode) session.start()
         transportStateJob = controlScope.launch {
             transport.connectionEvents.collect(::handleTransportState)
         }
@@ -391,6 +615,7 @@ class ProductionRealtimeSessionClient(
     }
 
     suspend fun requestControl() = controlRequestMutex.withLock {
+        check(!hostHistoryOnlyMode) { "host history-only client cannot request control" }
         check(!closed.get()) { "production session client is closed" }
         val requestGeneration = controlArbitrationMutex.withLock { controlGeneration }
         val lease = withContext(Dispatchers.IO) {
@@ -426,7 +651,7 @@ class ProductionRealtimeSessionClient(
      * independent from both the control lease and permanent REST deletion of
      * an offline session record.
      */
-    suspend fun requestTermination(): UUID {
+    suspend fun requestTermination(awaitAcknowledgement: Boolean = false): UUID {
         check(started.get()) { "production session client is not started" }
         check(!closed.get()) { "production session client is closed" }
         try {
@@ -440,13 +665,150 @@ class ProductionRealtimeSessionClient(
         }
 
         val requestId = UUID.randomUUID()
+        val pending = if (awaitAcknowledgement) CompletableDeferred<Boolean>() else null
+        if (pending != null) {
+            check(pendingTerminations.putIfAbsent(requestId, pending) == null) {
+                "Session termination request ID collision"
+            }
+        }
         val payload = SessionTerminateRequestPayload.newBuilder()
             .setRequestId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(requestId)))
             .setReasonCode(TERMINATION_REASON_USER_REQUESTED)
             .build()
             .toByteArray()
-        sendEncrypted(MessageType.SESSION_TERMINATE_REQUEST, payload)
-        return requestId
+        try {
+            sendEncrypted(MessageType.SESSION_TERMINATE_REQUEST, payload)
+            if (pending == null) return requestId
+            val accepted = try {
+                withTimeout(terminationReadinessTimeoutMillis) { pending.await() }
+            } catch (_: TimeoutCancellationException) {
+                throw ProductionTransportException("session termination acknowledgement timed out")
+            }
+            check(accepted) { "The Windows Agent rejected session termination" }
+            return requestId
+        } finally {
+            if (pending != null) pendingTerminations.remove(requestId, pending)
+        }
+    }
+
+    suspend fun requestLatestHostSnapshot(): ProductionHostHistoryObject? = requestHostHistory(
+        kind = HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_LATEST_SNAPSHOT,
+    )
+
+    suspend fun requestHostTranscriptPage(
+        snapshotSequence: ULong,
+        beforeLineId: ULong,
+    ): ProductionHostHistoryObject? {
+        require(snapshotSequence in 1uL..Long.MAX_VALUE.toULong()) { "Snapshot sequence is invalid" }
+        require(beforeLineId in 1uL..Long.MAX_VALUE.toULong()) { "Transcript cursor is invalid" }
+        return requestHostHistory(
+            kind = HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_TRANSCRIPT_PAGE,
+            snapshotSequence = snapshotSequence,
+            beforeLineId = beforeLineId,
+        )
+    }
+
+    suspend fun requestHostEventRange(
+        afterSequence: ULong,
+        throughSequence: ULong,
+        maxEvents: Int = 512,
+    ): ProductionHostHistoryObject? {
+        require(afterSequence < Long.MAX_VALUE.toULong()) { "History start is invalid" }
+        require(throughSequence > afterSequence && throughSequence <= Long.MAX_VALUE.toULong()) {
+            "History range is invalid"
+        }
+        require(maxEvents in 1..4096) { "History event limit is invalid" }
+        return requestHostHistory(
+            kind = HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_EVENT_RANGE,
+            afterSequence = afterSequence,
+            throughSequence = throughSequence,
+            maxEvents = maxEvents,
+        )
+    }
+
+    private suspend fun requestHostHistory(
+        kind: HostHistoryRequestKindV1,
+        snapshotSequence: ULong = 0u,
+        beforeLineId: ULong = 0u,
+        afterSequence: ULong = 0u,
+        throughSequence: ULong = 0u,
+        maxEvents: Int = 0,
+    ): ProductionHostHistoryObject? {
+        check(started.get()) { "production session client is not started" }
+        check(!closed.get()) { "production session client is closed" }
+        try {
+            withTimeout(terminationReadinessTimeoutMillis) {
+                combine(mutableTransportState, subscriberReady) { transportState, readyGeneration ->
+                    transportState is ProductionTransportState.Connected && readyGeneration > 0
+                }.first { it }
+            }
+        } catch (_: TimeoutCancellationException) {
+            throw ProductionTransportException("host history transport was not ready")
+        }
+
+        val requestId = UUID.randomUUID()
+        val pending = HostHistoryAccumulator()
+        check(pendingHostHistory.putIfAbsent(requestId, pending) == null) {
+            "Host history request ID collision"
+        }
+        val payload = HostHistoryRequestPayload.newBuilder()
+            .setRequestId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(requestId)))
+            .setKind(kind)
+            .setSnapshotSeq(snapshotSequence.toLong())
+            .setBeforeLineId(beforeLineId.toLong())
+            .setAfterSeq(afterSequence.toLong())
+            .setThroughSeq(throughSequence.toLong())
+            .setMaxEvents(maxEvents)
+            .build()
+            .toByteArray()
+        var requestSent = false
+        var requestCompleted = false
+        try {
+            sendEncrypted(MessageType.HOST_HISTORY_REQUEST, payload)
+            requestSent = true
+            return try {
+                val result = withTimeout(hostHistoryRequestTimeoutMillis) {
+                    pending.results.receive()
+                }
+                requestCompleted = true
+                when (result) {
+                    is HostHistoryRequestResult.Ready -> result.value
+                    HostHistoryRequestResult.Missing -> null
+                }
+            } catch (_: TimeoutCancellationException) {
+                throw ProductionTransportException("host history request timed out")
+            }
+        } finally {
+            if (pendingHostHistory.remove(requestId, pending)) {
+                pending.destroy()
+                if (requestSent && !requestCompleted && !closed.get()) {
+                    withContext(NonCancellable) {
+                        runCatching {
+                            sendHostHistoryControl(
+                                requestId = requestId,
+                                action = HostHistoryControlActionV1.HOST_HISTORY_CONTROL_ACTION_V1_CANCEL,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun sendHostHistoryControl(
+        requestId: UUID,
+        action: HostHistoryControlActionV1,
+        objectId: ByteString = ByteString.EMPTY,
+        chunkIndex: Int = 0,
+    ) {
+        val payload = HostHistoryControlPayload.newBuilder()
+            .setRequestId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(requestId)))
+            .setAction(action)
+            .setObjectId(objectId)
+            .setChunkIndex(chunkIndex)
+            .build()
+            .toByteArray()
+        sendEncrypted(MessageType.HOST_HISTORY_CONTROL, payload)
     }
 
     suspend fun releaseControl() {
@@ -935,6 +1297,19 @@ class ProductionRealtimeSessionClient(
             it.completeExceptionally(RemoteInputDeliveryUnknownException("production session closed"))
         }
         pendingInputs.clear()
+        pendingTerminations.values.forEach {
+            it.completeExceptionally(
+                ProductionTransportException("production session closed during termination request"),
+            )
+        }
+        pendingTerminations.clear()
+        pendingHostHistory.entries.forEach { (requestId, pending) ->
+            if (pendingHostHistory.remove(requestId, pending)) {
+                pending.fail(
+                    ProductionTransportException("production session closed during host history request"),
+                )
+            }
+        }
         if (!transportAlreadyClosed) transport.close()
         api.close()
         incomingJob.cancel()
@@ -1264,7 +1639,19 @@ class ProductionRealtimeSessionClient(
         }
         try {
             context.stage = IncomingFailureStage.SEMANTIC
+            if (hostHistoryOnlyMode &&
+                envelope.messageType != MessageType.HOST_HISTORY_RESPONSE &&
+                envelope.messageType != MessageType.SESSION_TERMINATE_RESPONSE
+            ) {
+                // SUBSCRIBE may race an authoritative lifecycle or old replay
+                // already queued by Windows. A history-only zero-window route
+                // must never project those frames into its throwaway renderer.
+                if (envelope.seq > 0L) lastHandledSequence.accumulateAndGet(envelope.seq, ::maxOf)
+                return
+            }
             when (envelope.messageType) {
+                MessageType.HOST_HISTORY_RESPONSE -> handleHostHistoryResponse(context, plaintext)
+                MessageType.SESSION_TERMINATE_RESPONSE -> handleSessionTerminateResponse(context, plaintext)
                 MessageType.OUTPUT_CHUNK -> {
                     val payload = parseIncomingPayload(context) { OutputChunkPayload.parseFrom(plaintext) }
                     require(payload.output.size() > 0) { "output chunk is empty" }
@@ -1441,7 +1828,12 @@ class ProductionRealtimeSessionClient(
                 else -> error("unsupported production message type ${envelope.messageType}")
             }
             if (envelope.seq > 0L) lastHandledSequence.accumulateAndGet(envelope.seq, ::maxOf)
-            if (session.state.value is RemoteSessionState.Exited) {
+            // A zero-window Host History endpoint remains usable after the
+            // authoritative lifecycle has ended. It cannot receive terminal
+            // replay or input, but it still needs the subscriber route long
+            // enough to fetch the final Snapshot/transcript and explicit-close
+            // acknowledgement. Ordinary live clients keep the old teardown.
+            if (session.state.value is RemoteSessionState.Exited && !hostHistoryOnlyMode) {
                 subscriberReady.value = 0
                 subscriberRefreshJob?.cancel()
                 subscriberRefreshJob = null
@@ -1449,6 +1841,120 @@ class ProductionRealtimeSessionClient(
             }
         } finally {
             plaintext.fill(0)
+        }
+    }
+
+    private suspend fun handleHostHistoryResponse(
+        context: IncomingProcessingContext,
+        plaintext: ByteArray,
+    ) {
+        val response = parseIncomingPayload(context) { HostHistoryResponsePayload.parseFrom(plaintext) }
+        val requestId = ProductionRealtimeClient.uuidFromBytes(response.requestId.toByteArray())
+        if (requestId == null) {
+            Log.w(REALTIME_LOG_TAG, "host_history_response_rejected reason=invalid_request_id")
+            return
+        }
+        val pending = pendingHostHistory[requestId] ?: return
+        try {
+            when (response.status) {
+                HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_OK -> {
+                    val accepted = pending.accept(response)
+                    try {
+                        sendHostHistoryControl(
+                            requestId = requestId,
+                            action = HostHistoryControlActionV1.HOST_HISTORY_CONTROL_ACTION_V1_CHUNK_ACK,
+                            objectId = accepted.objectId,
+                            chunkIndex = accepted.chunkIndex,
+                        )
+                    } catch (error: Throwable) {
+                        accepted.completed?.destroy()
+                        throw error
+                    }
+                    val completed = accepted.completed ?: return
+                    // Keep ownership registered until the requester has taken
+                    // the value. If cancellation wins after this delivery,
+                    // requestHostHistory removes and cancels the Channel, whose
+                    // undelivered callback zeroes the sealed object.
+                    pending.deliver(HostHistoryRequestResult.Ready(completed))
+                }
+                HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_NOT_READY -> {
+                    validateEmptyHostHistoryResponse(response)
+                    failHostHistoryRequest(
+                        requestId,
+                        pending,
+                        ProductionHostHistoryNotReadyException(
+                            response.errorCode.ifBlank { "Host history is not ready" },
+                        ),
+                    )
+                }
+                HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_NOT_FOUND -> {
+                    validateEmptyHostHistoryResponse(response)
+                    if (pendingHostHistory.remove(requestId, pending)) {
+                        pending.deliver(HostHistoryRequestResult.Missing)
+                    }
+                }
+                HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_GAP -> {
+                    validateEmptyHostHistoryResponse(response)
+                    failHostHistoryRequest(
+                        requestId,
+                        pending,
+                        ProductionHostHistoryGapException(
+                            response.errorCode.ifBlank { "Host history contains a permanent gap" },
+                        ),
+                    )
+                }
+                HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_REJECTED -> {
+                    validateEmptyHostHistoryResponse(response)
+                    failHostHistoryRequest(
+                        requestId,
+                        pending,
+                        IllegalStateException(
+                            response.errorCode.ifBlank { "Host history request was rejected" },
+                        ),
+                    )
+                }
+                else -> error("Host history response status is invalid")
+            }
+        } catch (error: Exception) {
+            failHostHistoryRequest(requestId, pending, error)
+        }
+    }
+
+    private fun handleSessionTerminateResponse(
+        context: IncomingProcessingContext,
+        plaintext: ByteArray,
+    ) {
+        val response = parseIncomingPayload(context) { SessionTerminateResponsePayload.parseFrom(plaintext) }
+        val requestId = ProductionRealtimeClient.uuidFromBytes(response.requestId.toByteArray()) ?: return
+        require(response.errorCode.length <= 128) { "Session termination error code is too long" }
+        pendingTerminations.remove(requestId)?.let { pending ->
+            if (response.accepted) pending.complete(true)
+            else pending.completeExceptionally(
+                IllegalStateException(response.errorCode.ifBlank { "Session termination was rejected" }),
+            )
+        }
+    }
+
+    private fun validateEmptyHostHistoryResponse(response: HostHistoryResponsePayload) {
+        require(response.errorCode.length <= 128) { "Host history error code is too long" }
+        require(
+            response.kind == HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_UNSPECIFIED &&
+                response.objectId.isEmpty &&
+                response.objectSha256.isEmpty &&
+                response.objectBytes == 0L &&
+                response.chunkIndex == 0 &&
+                response.chunkCount == 0 &&
+                response.objectChunk.isEmpty,
+        ) { "Host history error response contains object data" }
+    }
+
+    private fun failHostHistoryRequest(
+        requestId: UUID,
+        pending: HostHistoryAccumulator,
+        error: Throwable,
+    ) {
+        if (pendingHostHistory.remove(requestId, pending)) {
+            pending.fail(error)
         }
     }
 
@@ -1676,6 +2182,7 @@ class ProductionRealtimeSessionClient(
             transport.currentConnectedGeneration() == connectedGeneration
 
     private fun scheduleConnectedSessionProjection(transition: Long, connectedGeneration: Int) {
+        if (hostHistoryOnlyMode) return
         sessionScope.launch sessionTransition@{
             if (!isCurrentTransportTransition(transition, connectedGeneration)) return@sessionTransition
             try {
@@ -1702,6 +2209,7 @@ class ProductionRealtimeSessionClient(
     }
 
     private fun notifySessionDisconnected(reason: String?) {
+        if (hostHistoryOnlyMode) return
         sessionScope.launch {
             try {
                 session.onDisconnected(reason)
@@ -1780,7 +2288,7 @@ class ProductionRealtimeSessionClient(
 
             // Projection work stays ordered with renderer events. It may be
             // delayed by JNI, but it cannot hold up the control-lane wire retry.
-            sessionReconcileProjectionJob = sessionScope.launch {
+            sessionReconcileProjectionJob = if (hostHistoryOnlyMode) null else sessionScope.launch {
                 try {
                     try {
                         session.onDisconnected(reason)

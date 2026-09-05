@@ -153,7 +153,7 @@ func (p *Portal) requireSensitiveAdminAction(w http.ResponseWriter, r *http.Requ
 
 // requireSensitiveReportingAction applies the same strong-authentication and
 // replay protections as a mutating administrator action, while retaining the
-// Store's read-only AUDITOR role for bounded data exports.
+// Store's read-only AUDITOR role for bounded diagnostic access.
 func (p *Portal) requireSensitiveReportingAction(w http.ResponseWriter, r *http.Request) (webSession, store.PortalAccount, bool) {
 	return p.requireSensitiveConsoleAction(w, r, false, true)
 }

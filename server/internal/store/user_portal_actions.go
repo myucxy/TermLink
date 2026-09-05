@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -16,14 +15,9 @@ import (
 
 var ErrUserPortalActionUnsupported = errors.New("user portal action unsupported by current schema")
 
-// UserPortalActionMigrationGuidance documents the minimum persistence still
-// required before the unsupported lifecycle methods can become real state
-// machines. Export jobs need an account-scoped request table with immutable
-// scope, status, expiry, and an opaque artifact reference. Account deletion
-// needs an account-scoped request table with confirmation/step-up state,
-// cancellation, retention deadlines, and processor fencing. Advanced control
-// modes need versioned per-PC policy columns/table and an invalidation event.
-const UserPortalActionMigrationGuidance = "add account-scoped data_export_requests and account_deletion_requests state machines; add versioned per-PC takeover/collaboration policy persistence before enabling those actions"
+// UserPortalActionMigrationGuidance documents the durable state machines used
+// by account deletion and advanced per-PC control policies.
+const UserPortalActionMigrationGuidance = "retain the account_deletion_requests state machine and versioned per-PC takeover/collaboration policy persistence"
 
 const (
 	userPortalActionDefaultLimit = 50
@@ -41,15 +35,6 @@ type UserPortalPCControlPolicy struct {
 	Mode                 ControlMode `json:"mode"`
 	LocalPriority        bool        `json:"local_priority"`
 	PolicyVersion        int64       `json:"policy_version"`
-}
-
-// UserPortalDataExport is the minimum future contract. No artifact key, URL,
-// terminal content, ciphertext, or provider credential belongs in this DTO.
-type UserPortalDataExport struct {
-	ID          uuid.UUID  `json:"id"`
-	Status      string     `json:"status"`
-	RequestedAt time.Time  `json:"requested_at"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
 }
 
 type UserPortalAccountDeletionPreflight struct {
@@ -151,25 +136,6 @@ const userPortalPCPolicyAuditSQL = `
 const userPortalPCPolicyOutboxSQL = `
 	INSERT INTO outbox(event_type,aggregate_id,payload)
 	VALUES('grant.updated',$1,jsonb_build_object('pc_id',$2::uuid,'remote_routing_enabled',$3::boolean))`
-
-const userPortalHistorySessionLookupSQL = `
-	SELECT session.state
-	FROM sessions session
-	JOIN pcs pc ON pc.id=session.pc_id
-	WHERE session.id=$1 AND pc.owner_user_id=$2
-	FOR UPDATE OF session,pc`
-
-const userPortalHistoryExistsSQL = `
-	SELECT EXISTS(
-		SELECT 1 FROM event_chunks WHERE session_id=$1 AND deleted_at IS NULL
-		UNION ALL SELECT 1 FROM snapshots WHERE session_id=$1 AND deleted_at IS NULL
-		UNION ALL SELECT 1 FROM transcript_pages WHERE session_id=$1 AND deleted_at IS NULL
-		UNION ALL SELECT 1 FROM history_uploads WHERE session_id=$1
-	)`
-
-const userPortalHistoryDeleteAuditSQL = `
-	INSERT INTO audit_events(user_id,action,target_type,target_id,result,trace_id)
-	VALUES($1,'user_portal.history.delete','session',$2,'SUCCEEDED',$3)`
 
 const userPortalAccountDeletionPreflightSQL = `
 	SELECT account.id,account.status,
@@ -413,55 +379,6 @@ func (s *Postgres) SetUserPortalPCRemoteRouting(ctx context.Context, accountID, 
 	return result, tx.Commit(ctx)
 }
 
-func (s *Postgres) RequestUserPortalHistoryDeletion(ctx context.Context, accountID, sessionID uuid.UUID, idempotencyKey, traceID string) (UserPortalActionResult, error) {
-	if sessionID == uuid.Nil || validateUserPortalActionInput(accountID, idempotencyKey, traceID) != nil {
-		return UserPortalActionResult{}, ErrDenied
-	}
-	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
-	if err != nil {
-		return UserPortalActionResult{}, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := requireUserPortalActionAccount(ctx, tx, accountID); err != nil {
-		return UserPortalActionResult{}, err
-	}
-	hash := userPortalActionHash("user-portal-history-delete-v1", []uuid.UUID{accountID, sessionID})
-	var result UserPortalActionResult
-	replayed, err := claimUserPortalAction(ctx, tx, accountID, idempotencyKey, hash, &result)
-	if err != nil {
-		return UserPortalActionResult{}, err
-	}
-	if replayed {
-		return result, tx.Commit(ctx)
-	}
-	var state string
-	err = tx.QueryRow(ctx, userPortalHistorySessionLookupSQL, sessionID, accountID).Scan(&state)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return UserPortalActionResult{}, ErrDenied
-	}
-	if err != nil {
-		return UserPortalActionResult{}, err
-	}
-	if state != "EXITED" && state != "DELETED" {
-		return UserPortalActionResult{}, ErrSessionActive
-	}
-	if err := tx.QueryRow(ctx, userPortalHistoryExistsSQL, sessionID).Scan(&result.Changed); err != nil {
-		return UserPortalActionResult{}, err
-	}
-	if result.Changed {
-		if err := tombstoneSessionHistory(ctx, tx, sessionID); err != nil {
-			return UserPortalActionResult{}, err
-		}
-		if _, err := tx.Exec(ctx, userPortalHistoryDeleteAuditSQL, accountID, sessionID, traceID); err != nil {
-			return UserPortalActionResult{}, err
-		}
-	}
-	if err := completeUserPortalAction(ctx, tx, accountID, idempotencyKey, hash, result); err != nil {
-		return UserPortalActionResult{}, err
-	}
-	return result, tx.Commit(ctx)
-}
-
 func (s *Postgres) GetUserPortalAccountDeletionPreflight(ctx context.Context, accountID uuid.UUID) (UserPortalAccountDeletionPreflight, error) {
 	if err := s.requireUserPortalAccount(ctx, accountID); err != nil {
 		return UserPortalAccountDeletionPreflight{}, err
@@ -479,14 +396,6 @@ func (s *Postgres) GetUserPortalAccountDeletionPreflight(ctx context.Context, ac
 	result.Ready = result.LiveSessions == 0
 	result.RequestSupported = true
 	return result, nil
-}
-
-func (s *Postgres) RequestUserPortalDataExport(ctx context.Context, accountID uuid.UUID, idempotencyKey, traceID string) (UserPortalDataExport, error) {
-	return s.requestUserPortalDataExport(ctx, accountID, idempotencyKey, traceID)
-}
-
-func (s *Postgres) GetUserPortalDataExport(ctx context.Context, accountID, exportID uuid.UUID) (UserPortalDataExport, error) {
-	return s.getUserPortalDataExport(ctx, accountID, exportID)
 }
 
 func (s *Postgres) RequestUserPortalAccountDeletion(ctx context.Context, accountID uuid.UUID, idempotencyKey, traceID string) error {

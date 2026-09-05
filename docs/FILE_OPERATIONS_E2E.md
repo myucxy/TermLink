@@ -1,4 +1,10 @@
-# File operations end-to-end validation
+# Legacy file operations end-to-end validation (retired)
+
+This document describes the retired `OBJECT_V1` acceptance path. Current
+Windows/Android transfers use the storage-free `REALTIME_V2` protocol documented
+in `REMOTE_FILE_OPERATIONS_E2E.md` and `REALTIME_FILE_TRANSFER_V2.md`. Do not use
+the environment variables or presigned-object procedure below for current
+validation.
 
 `scripts/Invoke-FileOperationsE2E.ps1` validates the authenticated production
 protocol against a running TermLink server and Windows Agent. It is deliberately

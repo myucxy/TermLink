@@ -28,18 +28,16 @@ import (
 	"github.com/termlink/termlink/server/internal/buildinfo"
 	"github.com/termlink/termlink/server/internal/config"
 	"github.com/termlink/termlink/server/internal/fileoperationcleanup"
-	"github.com/termlink/termlink/server/internal/history"
+	"github.com/termlink/termlink/server/internal/filetransfer"
 	"github.com/termlink/termlink/server/internal/humanverification"
 	"github.com/termlink/termlink/server/internal/kv"
 	"github.com/termlink/termlink/server/internal/migrate"
 	"github.com/termlink/termlink/server/internal/observability"
 	"github.com/termlink/termlink/server/internal/outbox"
-	"github.com/termlink/termlink/server/internal/privacyexport"
 	"github.com/termlink/termlink/server/internal/realtime"
 	"github.com/termlink/termlink/server/internal/registrationrecovery"
 	serverruntime "github.com/termlink/termlink/server/internal/runtime"
 	"github.com/termlink/termlink/server/internal/serviceemail"
-	"github.com/termlink/termlink/server/internal/sessioncleanup"
 	"github.com/termlink/termlink/server/internal/store"
 	"github.com/termlink/termlink/server/internal/transport"
 	"github.com/termlink/termlink/server/internal/webportal"
@@ -82,13 +80,6 @@ func logProcessFailure(logger *slog.Logger, command string, _ error) {
 		errorClass = "admin_route_offline_reset_failed"
 	}
 	logger.Error("server stopped", "error_class", errorClass)
-}
-
-func optionalHistoryStore(store *history.Store) api.HistoryObjectStore {
-	if store == nil {
-		return nil
-	}
-	return store
 }
 
 func runProduction() error {
@@ -136,7 +127,6 @@ func runProduction() error {
 	// codes remain valid after the registration subsystem refactor.
 	registrationCodeKey := deriveServerKey(keyMaster, "commerce-code-digest")
 	registrationProofKey := deriveServerKey(keyMaster, "keycloak-registration-attempt-proof")
-	privacyExportKey := deriveServerKey(keyMaster, "privacy-export-artifact-encryption")
 	serviceEmailKey := deriveServerKey(keyMaster, "service-email-encryption-and-challenges")
 	adminRouteKey := deriveServerKey(keyMaster, "web-admin-route-encryption")
 	humanVerificationKey := deriveServerKey(keyMaster, "human-verification-settings-encryption")
@@ -194,22 +184,8 @@ func runProduction() error {
 	if err != nil {
 		return fmt.Errorf("initialize Agent update catalog: %w", err)
 	}
-	var historyStore *history.Store
-	var privacyExportService *privacyexport.Service
-	var privacyExportRunner *privacyexport.Runner
 	var accountDeletionBinder accountdeletion.RequestBinder
 	var accountDeletionRunner *accountdeletion.Runner
-	if cfg.HistoryEnabled {
-		historyStore, err = history.Open(ctx, cfg.S3Endpoint, cfg.S3PublicEndpoint, cfg.S3Region, cfg.S3Bucket, cfg.S3AccessKey.Value(), cfg.S3SecretKey.Value())
-		if err != nil {
-			return fmt.Errorf("open encrypted history object store: %w", err)
-		}
-		privacyExportService, err = privacyexport.New(repository, historyStore, uuid.New(), privacyExportKey)
-		if err != nil {
-			return fmt.Errorf("initialize privacy export service: %w", err)
-		}
-		privacyExportRunner = privacyexport.NewRunner(privacyExportService, privacyexport.RunnerOptions{Logger: slog.Default()})
-	}
 	if cfg.AccountDeletionEnabled {
 		identityKeys, keyErr := cfg.AccountDeletionIdentityKeys()
 		if keyErr != nil {
@@ -230,25 +206,18 @@ func runProduction() error {
 		if disablerErr != nil {
 			return fmt.Errorf("initialize account deletion identity disabler: %w", disablerErr)
 		}
-		deletionService, serviceErr := accountdeletion.New(repository, identityDisabler, historyStore, uuid.New())
+		deletionService, serviceErr := accountdeletion.New(repository, identityDisabler, uuid.New())
 		if serviceErr != nil {
 			return fmt.Errorf("initialize account deletion service: %w", serviceErr)
 		}
 		accountDeletionBinder = binder
 		accountDeletionRunner = accountdeletion.NewRunner(deletionService, accountdeletion.RunnerOptions{Logger: slog.Default()})
 	}
-	var privacyExportDownloader api.PrivacyExportDownloader
-	var webPrivacyExportDownloader webportal.PrivacyExportDownloader
-	if privacyExportService != nil {
-		privacyExportDownloader = privacyExportService
-		webPrivacyExportDownloader = privacyExportService
-	}
 	productionAPI := &api.API{
 		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication,
 		ServiceEmail:      serviceEmail,
 		HumanVerification: humanVerificationManager,
-		SubjectKey:        subjectKey, TokenKey: tokenKey, RegistrationCodeKey: registrationCodeKey, History: optionalHistoryStore(historyStore),
-		DataExportDownloader:  privacyExportDownloader,
+		SubjectKey:        subjectKey, TokenKey: tokenKey, RegistrationCodeKey: registrationCodeKey,
 		AccountDeletionBinder: accountDeletionBinder, AgentUpdateCatalog: updateCatalog,
 		ClientConfig: api.ClientConfiguration{
 			OIDCIssuer: cfg.OIDCIssuer, OIDCClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI,
@@ -275,6 +244,12 @@ func runProduction() error {
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = hub.Close(shutdown)
+	}()
+	fileTransferHub := filetransfer.NewHub(repository, slog.Default())
+	defer func() {
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = fileTransferHub.Close(shutdown)
 	}()
 	directTransportEnabled, err := optionalFeatureFlag("TERMLINK_DIRECT_TRANSPORT_ENABLED")
 	if err != nil {
@@ -365,7 +340,6 @@ func runProduction() error {
 		AppShipAllowedPrivateIPs:  os.Getenv("TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS"),
 		BuildInfo:                 buildinfo.Current(),
 		RegistrationCodeKey:       registrationCodeKey,
-		DataExportDownloader:      webPrivacyExportDownloader,
 		AccountDeletionBinder:     accountDeletionBinder,
 		ServiceEmail:              serviceEmail,
 		AdminRoutes:               adminRoutes,
@@ -382,6 +356,7 @@ func runProduction() error {
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/realtime", authentication.Authenticate(hub.Handler()))
+	mux.Handle("/v1/file-transfers", authentication.Authenticate(fileTransferHub.Handler()))
 	if directHub != nil && directTickets != nil {
 		registerDirectTransportRoutes(mux,
 			directAuthentication.Authenticate(directTickets.ConfigHandler()),
@@ -402,19 +377,15 @@ func runProduction() error {
 	case <-time.After(5 * time.Second):
 		return errors.New("realtime authority subscription did not become ready")
 	}
-	go (outbox.Dispatcher{Store: repository, Valkey: valkey, History: historyStore, Logger: slog.Default()}).Run(ctx)
+	go (outbox.Dispatcher{Store: repository, Valkey: valkey, Logger: slog.Default()}).Run(ctx)
 	if registrationRecoveryRunner != nil {
 		go registrationRecoveryRunner.Run(ctx)
-	}
-	if privacyExportRunner != nil {
-		go privacyExportRunner.Run(ctx)
 	}
 	if accountDeletionRunner != nil {
 		go accountDeletionRunner.Run(ctx)
 	}
 	go fileoperationcleanup.New(repository, fileoperationcleanup.Options{Logger: slog.Default()}).Run(ctx)
-	go sessioncleanup.New(repository, sessioncleanup.Options{Logger: slog.Default()}).Run(ctx)
-	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "history_enabled", cfg.HistoryEnabled, "metrics_enabled", cfg.MetricsListenAddr != "", "direct_transport_enabled", directHub != nil)
+	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "metrics_enabled", cfg.MetricsListenAddr != "", "direct_transport_enabled", directHub != nil)
 	applicationHandler := http.Handler(mux)
 	if metrics != nil {
 		applicationHandler = metrics.HTTPMiddleware(applicationHandler)

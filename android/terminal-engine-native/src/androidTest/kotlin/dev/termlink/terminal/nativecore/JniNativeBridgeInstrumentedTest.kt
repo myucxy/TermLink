@@ -338,6 +338,41 @@ class JniNativeBridgeInstrumentedTest {
     }
 
     @Test
+    fun importedCheckpointRemainsVisibleAfterLifecycleAdvance() = kotlinx.coroutines.runBlocking {
+        val checkpoint = NativeTerminalHandle.create(
+            bridge = JniNativeBridge,
+            size = TerminalSize(16, 3),
+            initialNextSourceSequence = 1,
+            outputProfile = TerminalOutputProfile.UTF8,
+            historyCapacityRows = 32,
+        ).use { source ->
+            source.feed(1, "checkpoint-visible".encodeToByteArray())
+            for (sequence in 2L..45L) {
+                source.advance(sequence, 0)
+            }
+            assertEquals(46L, source.nextSourceSequence)
+            source.exportCheckpoint().copyPayload()
+        }
+
+        val engine = NativeTerminalEngine(TerminalSize(8, 2))
+        try {
+            val installed = engine.installCheckpoint(checkpoint)
+            assertEquals(45L, installed.sequence)
+            assertEquals("c", firstCellText(engine.frames.value))
+
+            // SessionEnded is an ordered lifecycle event. Android intentionally projects it as
+            // an advance because it must consume the source sequence without changing the screen.
+            engine.advance(46)
+
+            assertEquals(47L, engine.frames.value.nextSourceSequence)
+            assertEquals("c", firstCellText(engine.frames.value))
+        } finally {
+            checkpoint.fill(0)
+            engine.dispose()
+        }
+    }
+
+    @Test
     fun concurrentDestroyPublishesExactlyOneSuccess() {
         val allocation = LongArray(3)
         assertEquals(

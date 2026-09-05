@@ -221,46 +221,6 @@ function Get-TermLinkContainerFileSha256 {
     return $Matches[1].ToLowerInvariant()
 }
 
-function Assert-TermLinkBucketName {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Bucket)
-    if ($Bucket -notmatch '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$' -or $Bucket.Contains('..')) {
-        throw "Invalid S3 bucket name: $Bucket"
-    }
-}
-
-function Initialize-TermLinkMinioAlias {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$ContainerId,
-        [Parameter(Mandatory)][ValidatePattern('^/tmp/termlink-(backup|restore)-[0-9a-f]{32}/mc$')][string]$ConfigDir
-    )
-    $script = @'
-set -eu
-user="${MINIO_ROOT_USER:-}"
-password="${MINIO_ROOT_PASSWORD:-}"
-if [ -z "$user" ] && [ -n "${MINIO_ROOT_USER_FILE:-}" ]; then user="$(cat "$MINIO_ROOT_USER_FILE")"; fi
-if [ -z "$password" ] && [ -n "${MINIO_ROOT_PASSWORD_FILE:-}" ]; then password="$(cat "$MINIO_ROOT_PASSWORD_FILE")"; fi
-test -n "$user"
-test -n "$password"
-mc --config-dir "$1" alias set termlinkbackup http://127.0.0.1:9000 "$user" "$password" >/dev/null
-unset user password
-'@
-    Invoke-TermLinkDocker -Arguments @('exec', $ContainerId, 'sh', '-c', $script, 'termlink-minio-alias', $ConfigDir) | Out-Null
-}
-
-function Invoke-TermLinkMinioClient {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$ContainerId,
-        [Parameter(Mandatory)][ValidatePattern('^/tmp/termlink-(backup|restore)-[0-9a-f]{32}/mc$')][string]$ConfigDir,
-        [Parameter(Mandatory)][string[]]$Arguments,
-        [switch]$AllowFailure
-    )
-    return Invoke-TermLinkDocker -Arguments (@('exec', $ContainerId, 'mc', '--config-dir', $ConfigDir) + $Arguments) `
-        -AllowFailure:$AllowFailure
-}
-
 function Remove-TermLinkContainerPath {
     [CmdletBinding()]
     param(
@@ -284,8 +244,5 @@ Export-ModuleMember -Function @(
     'Assert-TermLinkAuthenticationKeySeparation',
     'Get-TermLinkHmacSha256',
     'Get-TermLinkContainerFileSha256',
-    'Assert-TermLinkBucketName',
-    'Initialize-TermLinkMinioAlias',
-    'Invoke-TermLinkMinioClient',
     'Remove-TermLinkContainerPath'
 )

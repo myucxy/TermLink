@@ -57,7 +57,6 @@ func TestUserPortalPrivacyStateMachinesIntegration(t *testing.T) {
 	repository := &Postgres{Pool: pool}
 	accountA, accountB, pcA := seedUserPortalPrivacyAccounts(t, ctx, pool)
 	legacyRecords := seedUserPortalAccountDeletionLegacyCommercialRecords(t, ctx, pool, accountA)
-	testUserPortalDataExportStateMachine(t, ctx, repository, pool, accountA, accountB)
 	testUserPortalPCPolicyStateMachine(t, ctx, repository, accountA, accountB, pcA)
 	testUserPortalAccountDeletionStateMachine(t, ctx, repository, pool, accountA, accountB, legacyRecords)
 }
@@ -173,86 +172,6 @@ func seedUserPortalAccountDeletionLegacyCommercialRecords(t *testing.T, ctx cont
 	return fixture
 }
 
-func testUserPortalDataExportStateMachine(t *testing.T, ctx context.Context, repository *Postgres, pool *pgxpool.Pool, accountA, accountB uuid.UUID) {
-	t.Helper()
-	legacyOnly, err := repository.UserPortalDataExportSnapshot(ctx, accountA, []string{"BILLING_RECORDS"})
-	if err != nil {
-		t.Fatalf("legacy billing-only export snapshot: %v", err)
-	}
-	if legacyOnly.SchemaVersion != 1 || legacyOnly.Account != nil || legacyOnly.Devices != nil || legacyOnly.PCs != nil || legacyOnly.Sessions != nil || legacyOnly.Security != nil {
-		t.Fatalf("legacy billing-only export leaked active sections: %+v", legacyOnly)
-	}
-	requested, err := repository.RequestUserPortalDataExport(ctx, accountA, "export-request-1", "trace-export-request")
-	if err != nil {
-		t.Fatal(err)
-	}
-	replayed, err := repository.RequestUserPortalDataExport(ctx, accountA, "export-request-1", "trace-export-request-retry")
-	if err != nil || replayed.ID != requested.ID {
-		t.Fatalf("idempotent export request=(%s,%v), want %s", replayed.ID, err, requested.ID)
-	}
-	if _, err := repository.GetUserPortalDataExport(ctx, accountB, requested.ID); !errors.Is(err, ErrDenied) {
-		t.Fatalf("cross-account export lookup error=%v, want ErrDenied", err)
-	}
-
-	processorA, processorB := uuid.New(), uuid.New()
-	first, err := repository.ClaimUserPortalDataExports(ctx, processorA, time.Minute, 1)
-	if err != nil || len(first) != 1 || first[0].ID != requested.ID || first[0].ProcessingFence != 1 {
-		t.Fatalf("first export claim=%+v error=%v", first, err)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE data_export_requests SET processor_lease_until=now()-interval '1 second' WHERE id=$1`, requested.ID); err != nil {
-		t.Fatal(err)
-	}
-	second, err := repository.ClaimUserPortalDataExports(ctx, processorB, time.Minute, 1)
-	if err != nil || len(second) != 1 || second[0].ProcessingFence != first[0].ProcessingFence+1 {
-		t.Fatalf("reclaimed export=%+v error=%v", second, err)
-	}
-	completion := UserPortalDataExportCompletion{
-		ArtifactObjectKey: fmt.Sprintf("accounts/%s/privacy-exports/%s/%d.bin", accountA, requested.ID, second[0].ProcessingFence),
-		ArtifactSHA256:    privacyRepeatedByte(0x41),
-		ArtifactSizeBytes: 512,
-		ExpiresAt:         time.Now().UTC().Add(24 * time.Hour).Truncate(time.Microsecond),
-	}
-	if err := repository.CompleteUserPortalDataExport(ctx, processorA, requested.ID, first[0].ProcessingFence, completion, "trace-stale-export"); !errors.Is(err, ErrConflict) {
-		t.Fatalf("stale export processor error=%v, want ErrConflict", err)
-	}
-	if err := repository.CompleteUserPortalDataExport(ctx, processorB, requested.ID, second[0].ProcessingFence, completion, "trace-export-ready"); err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.CompleteUserPortalDataExport(ctx, processorB, requested.ID, second[0].ProcessingFence, completion, "trace-export-ready-retry"); err != nil {
-		t.Fatalf("idempotent export completion: %v", err)
-	}
-	var auditCount, outboxCount int
-	if err := pool.QueryRow(ctx, `
-		SELECT
-			(SELECT count(*) FROM audit_events WHERE user_id=$1 AND target_id=$2
-			 AND action IN ('user_portal.data_export.request','user_portal.data_export.ready')),
-			(SELECT count(*) FROM outbox WHERE aggregate_id=$2
-			 AND event_type IN ('privacy.data_export.requested','privacy.data_export.ready'))`,
-		accountA, requested.ID).Scan(&auditCount, &outboxCount); err != nil || auditCount != 2 || outboxCount != 2 {
-		t.Fatalf("export audit/outbox=%d/%d error=%v, want 2/2", auditCount, outboxCount, err)
-	}
-
-	failedRequest, err := repository.RequestUserPortalDataExport(ctx, accountB, "export-request-b1", "trace-export-request-b")
-	if err != nil {
-		t.Fatal(err)
-	}
-	processorC := uuid.New()
-	failedJobs, err := repository.ClaimUserPortalDataExports(ctx, processorC, time.Minute, 1)
-	if err != nil || len(failedJobs) != 1 || failedJobs[0].ID != failedRequest.ID {
-		t.Fatalf("failed export claim=%+v error=%v", failedJobs, err)
-	}
-	if err := repository.FailUserPortalDataExport(ctx, processorC, failedRequest.ID, failedJobs[0].ProcessingFence, "OBJECT_UNAVAILABLE", "trace-export-failed"); err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.FailUserPortalDataExport(ctx, processorC, failedRequest.ID, failedJobs[0].ProcessingFence, "OBJECT_UNAVAILABLE", "trace-export-failed-retry"); err != nil {
-		t.Fatalf("idempotent export failure: %v", err)
-	}
-	failedState, err := repository.GetUserPortalDataExport(ctx, accountB, failedRequest.ID)
-	if err != nil || failedState.Status != "FAILED" {
-		t.Fatalf("failed export state=%+v error=%v", failedState, err)
-	}
-}
-
 func testUserPortalPCPolicyStateMachine(t *testing.T, ctx context.Context, repository *Postgres, accountA, accountB, pcA uuid.UUID) {
 	t.Helper()
 	input := UserPortalPCControlPolicyInput{
@@ -362,7 +281,7 @@ func testUserPortalAccountDeletionStateMachine(t *testing.T, ctx context.Context
 	if err := repository.CompleteUserPortalAccountDeletion(ctx, processorA, finalRequest.ID, first[0].ProcessingFence, "trace-stale-delete"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("stale deletion processor error=%v, want ErrConflict", err)
 	}
-	if _, err := repository.PrepareUserPortalAccountDeletion(ctx, processorB, finalRequest.ID, second[0].ProcessingFence); err != nil {
+	if err := repository.PrepareUserPortalAccountDeletion(ctx, processorB, finalRequest.ID, second[0].ProcessingFence); err != nil {
 		t.Fatal(err)
 	}
 	if err := repository.FailUserPortalAccountDeletion(ctx, processorB, finalRequest.ID, second[0].ProcessingFence, "RETENTION_BACKEND_UNAVAILABLE", "trace-delete-fail"); err != nil {
@@ -382,14 +301,13 @@ func testUserPortalAccountDeletionStateMachine(t *testing.T, ctx context.Context
 	if err := repository.CompleteUserPortalAccountDeletion(ctx, processorB, finalRequest.ID, second[0].ProcessingFence, "trace-stale-delete-after-fail"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("superseded failed processor error=%v, want ErrConflict", err)
 	}
-	deletedObjects, err := repository.PrepareUserPortalAccountDeletion(ctx, processorC, finalRequest.ID, third[0].ProcessingFence)
-	if err != nil || len(deletedObjects) == 0 {
-		t.Fatalf("final deletion preparation objects=%d error=%v", len(deletedObjects), err)
+	if err := repository.PrepareUserPortalAccountDeletion(ctx, processorC, finalRequest.ID, third[0].ProcessingFence); err != nil {
+		t.Fatalf("final deletion preparation error=%v", err)
 	}
-	if err := repository.FinalizeUserPortalAccountDeletion(ctx, processorC, finalRequest.ID, third[0].ProcessingFence, deletedObjects, "trace-delete-complete"); err != nil {
+	if err := repository.FinalizeUserPortalAccountDeletion(ctx, processorC, finalRequest.ID, third[0].ProcessingFence, "trace-delete-complete"); err != nil {
 		t.Fatal(err)
 	}
-	if err := repository.FinalizeUserPortalAccountDeletion(ctx, processorC, finalRequest.ID, third[0].ProcessingFence, deletedObjects, "trace-delete-complete-retry"); err != nil {
+	if err := repository.FinalizeUserPortalAccountDeletion(ctx, processorC, finalRequest.ID, third[0].ProcessingFence, "trace-delete-complete-retry"); err != nil {
 		t.Fatalf("idempotent deletion completion: %v", err)
 	}
 	var accountStatus, requestStatus string
@@ -421,7 +339,6 @@ func assertUserPortalAccountDeletionRetention(t *testing.T, ctx context.Context,
 			EXISTS(SELECT 1 FROM users WHERE id=$1 AND oidc_subject_hash=$6 AND status='DELETED'),
 			NOT EXISTS(SELECT 1 FROM pcs WHERE owner_user_id=$1)
 			AND NOT EXISTS(SELECT 1 FROM devices WHERE user_id=$1)
-			AND NOT EXISTS(SELECT 1 FROM data_export_requests WHERE account_id=$1)
 			AND NOT EXISTS(SELECT 1 FROM subscriptions WHERE account_id=$1)
 			AND NOT EXISTS(SELECT 1 FROM entitlements WHERE account_id=$1)`,
 		accountID, legacy.orderID, legacy.transactionID, legacy.refundID, legacy.orderNumber, tombstone[:],

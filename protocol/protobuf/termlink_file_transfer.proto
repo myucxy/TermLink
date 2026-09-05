@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package termlink.filetransfer.v2;
+
+option csharp_namespace = "TermLink.Protocol.FileTransfer.V2";
+option java_multiple_files = true;
+option java_package = "dev.termlink.protocol.filetransfer.v2";
+
+// FileTransferEnvelopeV2 is routed by the server as opaque E2EE data. The
+// relay validates only the bounded routing header and never reads payload.
+message FileTransferEnvelopeV2 {
+  uint32 protocol_version = 1;
+  bytes transfer_id = 2;
+  bytes sender_device_id = 3;
+  bytes recipient_device_id = 4;
+  FileTransferMessageTypeV2 message_type = 5;
+  uint64 sequence = 6;
+  uint64 key_epoch = 7;
+  bytes key_id = 8;
+  bytes nonce = 9;
+  bytes ciphertext = 10;
+}
+
+enum FileTransferMessageTypeV2 {
+  FILE_TRANSFER_MESSAGE_TYPE_V2_UNSPECIFIED = 0;
+  FILE_TRANSFER_MESSAGE_TYPE_V2_OFFER = 1;
+  FILE_TRANSFER_MESSAGE_TYPE_V2_RESUME = 2;
+  FILE_TRANSFER_MESSAGE_TYPE_V2_CHUNK = 3;
+  FILE_TRANSFER_MESSAGE_TYPE_V2_ACK = 4;
+  FILE_TRANSFER_MESSAGE_TYPE_V2_COMPLETE = 5;
+  FILE_TRANSFER_MESSAGE_TYPE_V2_COMPLETE_ACK = 6;
+  FILE_TRANSFER_MESSAGE_TYPE_V2_CANCEL = 7;
+  FILE_TRANSFER_MESSAGE_TYPE_V2_ERROR = 8;
+}
+
+// Exactly one field must be present after decrypting an envelope.
+message FileTransferPayloadV2 {
+  oneof body {
+    FileTransferOfferV2 offer = 1;
+    FileTransferResumeV2 resume = 2;
+    FileTransferChunkV2 chunk = 3;
+    FileTransferAckV2 ack = 4;
+    FileTransferCompleteV2 complete = 5;
+    FileTransferCompleteAckV2 complete_ack = 6;
+    FileTransferCancelV2 cancel = 7;
+    FileTransferErrorV2 error = 8;
+  }
+}
+
+message FileTransferOfferV2 {
+  string filename = 1;
+  uint64 size_bytes = 2;
+  bytes sha256 = 3;
+  bool directory_zip = 4;
+  uint32 chunk_bytes = 5;
+}
+
+// committed_offset is the exact contiguous prefix durably stored in the
+// receiver's private cache. The sender starts again at this byte.
+message FileTransferResumeV2 {
+  uint64 committed_offset = 1;
+}
+
+message FileTransferChunkV2 {
+  uint64 offset = 1;
+  bytes data = 2;
+}
+
+message FileTransferAckV2 {
+  uint64 committed_offset = 1;
+}
+
+message FileTransferCompleteV2 {
+  uint64 size_bytes = 1;
+  bytes sha256 = 2;
+}
+
+message FileTransferCompleteAckV2 {
+  uint64 committed_offset = 1;
+  bytes sha256 = 2;
+}
+
+message FileTransferCancelV2 {
+  string reason_code = 1;
+}
+
+message FileTransferErrorV2 {
+  string error_code = 1;
+  bool retryable = 2;
+}

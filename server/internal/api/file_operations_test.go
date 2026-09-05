@@ -19,7 +19,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/termlink/termlink/server/internal/auth"
-	"github.com/termlink/termlink/server/internal/history"
 	"github.com/termlink/termlink/server/internal/migrate"
 	"github.com/termlink/termlink/server/internal/store"
 )
@@ -88,21 +87,18 @@ func TestFileTransferFilenameRejectsPathsAndRequiresBoundedLeaf(t *testing.T) {
 }
 
 func TestZeroByteFileTransferMetadataIsAccepted(t *testing.T) {
-	if history.MaxFileTransferObjectBytes != 5<<30 || store.MaxFileTransferBytes != 5<<30 {
-		t.Fatalf("single-PUT bounds history/store=%d/%d", history.MaxFileTransferObjectBytes, store.MaxFileTransferBytes)
-	}
-	if store.FileOperationObjectDeletionDelay-store.FileOperationDownloadGracePeriod < fileDownloadURLLifetime {
-		t.Fatal("file-transfer deletion delay does not preserve the final signed download URL")
+	if store.MaxFileTransferBytes != 5<<30 {
+		t.Fatalf("file-transfer bound=%d", store.MaxFileTransferBytes)
 	}
 	digest := sha256.Sum256(nil)
 	if len(base64.RawURLEncoding.EncodeToString(digest[:])) == 0 {
 		t.Fatal("empty-file digest was not encoded")
 	}
-	// The upload handler uses this exact lower-bound predicate. Keep the
+	// The transfer metadata handler uses this exact lower-bound predicate. Keep the
 	// validation contract explicit while malformed negative sizes remain
 	// rejected by both HTTP and PostgreSQL.
-	for size, valid := range map[int64]bool{0: true, -1: false, history.MaxFileTransferObjectBytes: true, history.MaxFileTransferObjectBytes + 1: false} {
-		got := size >= 0 && size <= history.MaxFileTransferObjectBytes
+	for size, valid := range map[int64]bool{0: true, -1: false, store.MaxFileTransferBytes: true, store.MaxFileTransferBytes + 1: false} {
+		got := size >= 0 && size <= store.MaxFileTransferBytes
 		if got != valid {
 			t.Fatalf("size %d accepted=%t, want %t", size, got, valid)
 		}
@@ -163,12 +159,10 @@ func TestZeroByteUploadHandlerAcceptsEmptyFileAndRejectsNegativeSize(t *testing.
 	digest := sha256.Sum256(nil)
 	repository := &fakeFileOperationStore{record: store.FileOperationRecord{
 		ID: operationID, PCID: pcID, Operation: store.FileOperationDownload, Status: store.FileOperationProcessing,
-		ObjectKey: "accounts/" + accountID.String() + "/file-transfers/" + pcID.String() + "/" + operationID.String() + ".bin",
-		Filename:  &filename, SizeBytes: &size, SHA256: digest[:], DirectoryZIP: &directoryZIP,
+		Filename: &filename, SizeBytes: &size, SHA256: digest[:], DirectoryZIP: &directoryZIP,
 		ExpiresAt: now.Add(time.Hour), CreatedAt: now, UpdatedAt: now,
 	}}
-	objects := &fakeFileOperationObjects{}
-	service := &API{fileOperations: repository, History: objects, Clock: func() time.Time { return now }}
+	service := &API{fileOperations: repository, Clock: func() time.Time { return now }}
 
 	invoke := func(sizeBytes int64) *httptest.ResponseRecorder {
 		body, _ := json.Marshal(map[string]any{
@@ -183,8 +177,9 @@ func TestZeroByteUploadHandlerAcceptsEmptyFileAndRejectsNegativeSize(t *testing.
 		authentication.Authenticate(http.HandlerFunc(service.uploadFileOperation)).ServeHTTP(response, request)
 		return response
 	}
-	if response := invoke(0); response.Code != http.StatusOK || repository.uploadInput.SizeBytes != 0 || objects.putSize != 0 {
-		t.Fatalf("zero-byte upload status=%d body=%s metadata=%+v putSize=%d", response.Code, response.Body.String(), repository.uploadInput, objects.putSize)
+	if response := invoke(0); response.Code != http.StatusOK || repository.uploadInput.SizeBytes != 0 ||
+		!strings.Contains(response.Body.String(), `"protocol":"REALTIME_V2"`) {
+		t.Fatalf("zero-byte transfer status=%d body=%s metadata=%+v", response.Code, response.Body.String(), repository.uploadInput)
 	}
 	if response := invoke(-1); response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "INVALID_FILE_TRANSFER_METADATA") {
 		t.Fatalf("negative upload status=%d body=%s", response.Code, response.Body.String())
@@ -199,17 +194,15 @@ func TestFileOperationHandlersEnforceRolesAndNeverExposeObjectKey(t *testing.T) 
 	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
 	androidAuth, androidKey := fileOperationTestAuth(t, accountID, androidID, "ANDROID", now)
 	windowsAuth, windowsKey := fileOperationTestAuth(t, accountID, windowsID, "WINDOWS_PC", now)
-	objectKey := "accounts/" + accountID.String() + "/file-transfers/" + pcID.String() + "/" + operationID.String() + ".bin"
 	filename, size, directoryZIP := "folder.zip", int64(9), true
 	digest := sha256.Sum256([]byte("zip bytes"))
 	repository := &fakeFileOperationStore{record: store.FileOperationRecord{
 		ID: operationID, PCID: pcID, RequesterDeviceID: androidID, Operation: store.FileOperationDownload,
-		Path: `C:\folder`, Status: store.FileOperationSucceeded, ObjectKey: objectKey,
+		Path: `C:\folder`, Status: store.FileOperationSucceeded,
 		Filename: &filename, SizeBytes: &size, SHA256: digest[:], DirectoryZIP: &directoryZIP,
 		ExpiresAt: now.Add(time.Hour), CompletedAt: timePointer(now), CreatedAt: now, UpdatedAt: now,
 	}}
-	objects := &fakeFileOperationObjects{}
-	service := &API{fileOperations: repository, History: objects, Clock: func() time.Time { return now }}
+	service := &API{fileOperations: repository, Clock: func() time.Time { return now }}
 
 	createBody := []byte(`{"operation":"DOWNLOAD","path":"C:\\folder"}`)
 	create := signedFileOperationRequest(t, androidKey, androidID, now, http.MethodPost, "/v1/pcs/"+pcID.String()+"/file-operations", createBody)
@@ -235,7 +228,7 @@ func TestFileOperationHandlersEnforceRolesAndNeverExposeObjectKey(t *testing.T) 
 	claim.SetPathValue("pcId", pcID.String())
 	claimResponse := httptest.NewRecorder()
 	windowsAuth.Authenticate(http.HandlerFunc(service.claimFileOperation)).ServeHTTP(claimResponse, claim)
-	if claimResponse.Code != http.StatusOK || !strings.Contains(claimResponse.Body.String(), `"lease_token"`) || strings.Contains(claimResponse.Body.String(), objectKey) {
+	if claimResponse.Code != http.StatusOK || !strings.Contains(claimResponse.Body.String(), `"lease_token"`) || strings.Contains(claimResponse.Body.String(), "object_key") {
 		t.Fatalf("claim status=%d body=%s", claimResponse.Code, claimResponse.Body.String())
 	}
 	emptyDigest := sha256.Sum256(nil)
@@ -248,9 +241,9 @@ func TestFileOperationHandlersEnforceRolesAndNeverExposeObjectKey(t *testing.T) 
 	upload.SetPathValue("operationId", operationID.String())
 	uploadResponse := httptest.NewRecorder()
 	windowsAuth.Authenticate(http.HandlerFunc(service.uploadFileOperation)).ServeHTTP(uploadResponse, upload)
-	if uploadResponse.Code != http.StatusOK || repository.uploadInput.SizeBytes != 0 || objects.putSize != 0 ||
+	if uploadResponse.Code != http.StatusOK || repository.uploadInput.SizeBytes != 0 ||
 		!bytes.Equal(repository.uploadInput.SHA256, emptyDigest[:]) {
-		t.Fatalf("zero-byte upload status=%d body=%s metadata=%+v putSize=%d", uploadResponse.Code, uploadResponse.Body.String(), repository.uploadInput, objects.putSize)
+		t.Fatalf("zero-byte transfer status=%d body=%s metadata=%+v", uploadResponse.Code, uploadResponse.Body.String(), repository.uploadInput)
 	}
 
 	repository.record.Status = store.FileOperationSucceeded
@@ -259,20 +252,15 @@ func TestFileOperationHandlersEnforceRolesAndNeverExposeObjectKey(t *testing.T) 
 	get.SetPathValue("operationId", operationID.String())
 	getResponse := httptest.NewRecorder()
 	androidAuth.Authenticate(http.HandlerFunc(service.getFileOperation)).ServeHTTP(getResponse, get)
-	if getResponse.Code != http.StatusOK || !strings.Contains(getResponse.Body.String(), `"download"`) ||
-		!strings.Contains(getResponse.Body.String(), `"sha256":"`+base64.RawURLEncoding.EncodeToString(digest[:])+`"`) ||
-		strings.Contains(getResponse.Body.String(), objectKey) {
-		t.Fatalf("download poll status=%d body=%s", getResponse.Code, getResponse.Body.String())
-	}
-	service.Clock = func() time.Time { return now.Add(store.FileOperationDownloadGracePeriod) }
-	afterGraceResponse := httptest.NewRecorder()
-	androidAuth.Authenticate(http.HandlerFunc(service.getFileOperation)).ServeHTTP(afterGraceResponse, get)
-	if afterGraceResponse.Code != http.StatusOK || strings.Contains(afterGraceResponse.Body.String(), `"download"`) || objects.getCalls != 1 {
-		t.Fatalf("after-grace poll status=%d body=%s getCalls=%d", afterGraceResponse.Code, afterGraceResponse.Body.String(), objects.getCalls)
+	if getResponse.Code != http.StatusOK || !strings.Contains(getResponse.Body.String(), `"transfer"`) ||
+		!strings.Contains(getResponse.Body.String(), `"protocol":"REALTIME_V2"`) ||
+		!strings.Contains(getResponse.Body.String(), `"sha256":"`+base64.RawURLEncoding.EncodeToString(emptyDigest[:])+`"`) ||
+		strings.Contains(getResponse.Body.String(), "object_key") {
+		t.Fatalf("transfer poll status=%d body=%s", getResponse.Code, getResponse.Body.String())
 	}
 }
 
-func TestDownloadCompletionVerifiesIntegrityBeforeSuccess(t *testing.T) {
+func TestDownloadCompletionRequiresRealtimeTransferMetadata(t *testing.T) {
 	accountID, pcID, operationID, windowsID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
 	authentication, privateKey := fileOperationTestAuth(t, accountID, windowsID, "WINDOWS_PC", now)
@@ -282,32 +270,33 @@ func TestDownloadCompletionVerifiesIntegrityBeforeSuccess(t *testing.T) {
 	leaseHash := sha256.Sum256(token)
 	size := int64(9)
 	digest := sha256.Sum256([]byte("zip bytes"))
+	objectProtocol := "OBJECT_V1"
 	repository := &fakeFileOperationStore{record: store.FileOperationRecord{
 		ID: operationID, PCID: pcID, Operation: store.FileOperationDownload, Status: store.FileOperationProcessing,
-		ObjectKey: "accounts/" + accountID.String() + "/file-transfers/" + pcID.String() + "/" + operationID.String() + ".bin",
-		SizeBytes: &size, SHA256: digest[:], LeaseTokenHash: leaseHash[:], LeaseExpiresAt: timePointer(now.Add(time.Hour)),
+		SizeBytes: &size, SHA256: digest[:], TransferProtocol: &objectProtocol,
+		LeaseTokenHash: leaseHash[:], LeaseExpiresAt: timePointer(now.Add(time.Hour)),
 		ExpiresAt: now.Add(time.Hour), CreatedAt: now, UpdatedAt: now,
 	}}
-	objects := &fakeFileOperationObjects{verifyError: errors.New("hash mismatch")}
-	service := &API{fileOperations: repository, History: objects, Clock: func() time.Time { return now }}
+	service := &API{fileOperations: repository, Clock: func() time.Time { return now }}
 	body, _ := json.Marshal(map[string]any{"lease_token": encodedToken, "status": store.FileOperationSucceeded})
 	request := signedFileOperationRequest(t, privateKey, windowsID, now, http.MethodPost, "/v1/pcs/"+pcID.String()+"/file-operations/"+operationID.String()+"/complete", body)
 	request.SetPathValue("pcId", pcID.String())
 	request.SetPathValue("operationId", operationID.String())
 	response := httptest.NewRecorder()
 	authentication.Authenticate(http.HandlerFunc(service.completeFileOperation)).ServeHTTP(response, request)
-	if response.Code != http.StatusUnprocessableEntity || repository.completeCalls != 0 || objects.verifyCalls != 1 {
-		t.Fatalf("integrity failure status=%d body=%s completeCalls=%d verifyCalls=%d", response.Code, response.Body.String(), repository.completeCalls, objects.verifyCalls)
+	if response.Code != http.StatusBadRequest || repository.completeCalls != 0 {
+		t.Fatalf("object completion status=%d body=%s completeCalls=%d", response.Code, response.Body.String(), repository.completeCalls)
 	}
 
-	objects.verifyError = nil
+	realtimeProtocol := store.FileTransferRealtimeV2
+	repository.record.TransferProtocol = &realtimeProtocol
 	retry := signedFileOperationRequest(t, privateKey, windowsID, now, http.MethodPost, "/v1/pcs/"+pcID.String()+"/file-operations/"+operationID.String()+"/complete", body)
 	retry.SetPathValue("pcId", pcID.String())
 	retry.SetPathValue("operationId", operationID.String())
 	retryResponse := httptest.NewRecorder()
 	authentication.Authenticate(http.HandlerFunc(service.completeFileOperation)).ServeHTTP(retryResponse, retry)
-	if retryResponse.Code != http.StatusOK || repository.completeCalls != 1 || objects.verifyCalls != 2 {
-		t.Fatalf("integrity retry status=%d body=%s completeCalls=%d verifyCalls=%d", retryResponse.Code, retryResponse.Body.String(), repository.completeCalls, objects.verifyCalls)
+	if retryResponse.Code != http.StatusOK || repository.completeCalls != 1 {
+		t.Fatalf("realtime completion status=%d body=%s completeCalls=%d", retryResponse.Code, retryResponse.Body.String(), repository.completeCalls)
 	}
 }
 
@@ -379,8 +368,7 @@ func TestFileOperationFullStackIdempotencyAcrossLeaseRotation(t *testing.T) {
 
 	now := time.Now().UTC()
 	authentication, privateKey := fileOperationTestAuth(t, accountID, windowsID, "WINDOWS_PC", now)
-	objects := &fakeFileOperationObjects{}
-	service := (&API{Store: repository, Auth: authentication, History: objects, Clock: func() time.Time { return now }}).Handler()
+	service := (&API{Store: repository, Auth: authentication, Clock: func() time.Time { return now }}).Handler()
 	digest := sha256.Sum256(nil)
 
 	createDownload := func(path string) store.FileOperationRecord {
@@ -464,9 +452,10 @@ func TestFileOperationFullStackIdempotencyAcrossLeaseRotation(t *testing.T) {
 	firstUpload := invoke(http.MethodPost, firstUploadPath, firstUploadBody, "upload-first-0001")
 	firstUploadReplay := invoke(http.MethodPost, firstUploadPath, firstUploadBody, "upload-first-0001")
 	if firstUpload.Code != http.StatusOK || firstUploadReplay.Code != http.StatusOK ||
-		firstUploadReplay.Header().Get("Idempotency-Replayed") != "true" || objects.putCalls != 1 {
-		t.Fatalf("upload/replay statuses=%d/%d replay=%q putCalls=%d bodies=%s / %s",
-			firstUpload.Code, firstUploadReplay.Code, firstUploadReplay.Header().Get("Idempotency-Replayed"), objects.putCalls,
+		firstUploadReplay.Header().Get("Idempotency-Replayed") != "true" ||
+		!strings.Contains(firstUpload.Body.String(), `"protocol":"REALTIME_V2"`) {
+		t.Fatalf("transfer/replay statuses=%d/%d replay=%q bodies=%s / %s",
+			firstUpload.Code, firstUploadReplay.Code, firstUploadReplay.Header().Get("Idempotency-Replayed"),
 			firstUpload.Body.String(), firstUploadReplay.Body.String())
 	}
 	firstCompleteBody, _ := json.Marshal(map[string]any{"lease_token": firstToken, "status": store.FileOperationSucceeded})
@@ -474,15 +463,15 @@ func TestFileOperationFullStackIdempotencyAcrossLeaseRotation(t *testing.T) {
 	firstComplete := invoke(http.MethodPost, firstCompletePath, firstCompleteBody, "complete-first-0001")
 	firstCompleteReplay := invoke(http.MethodPost, firstCompletePath, firstCompleteBody, "complete-first-0001")
 	if firstComplete.Code != http.StatusOK || firstCompleteReplay.Code != http.StatusOK ||
-		firstCompleteReplay.Header().Get("Idempotency-Replayed") != "true" || objects.verifyCalls != 1 {
-		t.Fatalf("complete/replay statuses=%d/%d replay=%q verifyCalls=%d bodies=%s / %s",
-			firstComplete.Code, firstCompleteReplay.Code, firstCompleteReplay.Header().Get("Idempotency-Replayed"), objects.verifyCalls,
+		firstCompleteReplay.Header().Get("Idempotency-Replayed") != "true" {
+		t.Fatalf("complete/replay statuses=%d/%d replay=%q bodies=%s / %s",
+			firstComplete.Code, firstCompleteReplay.Code, firstCompleteReplay.Header().Get("Idempotency-Replayed"),
 			firstComplete.Body.String(), firstCompleteReplay.Body.String())
 	}
 	var cleanupCount int
 	if err := repository.Pool.QueryRow(ctx, `
 		SELECT count(*) FROM outbox
-		WHERE event_type='history.object.delete' AND aggregate_id=$1`, first.ID).Scan(&cleanupCount); err != nil || cleanupCount != 1 {
+		WHERE event_type='history.object.delete' AND aggregate_id=$1`, first.ID).Scan(&cleanupCount); err != nil || cleanupCount != 0 {
 		t.Fatalf("successful download cleanup count=%d error=%v", cleanupCount, err)
 	}
 
@@ -648,6 +637,16 @@ func (fake *fakeFileOperationStore) RecordFileOperationUpload(_ context.Context,
 	fake.uploadInput = input
 	return fake.record, nil
 }
+func (fake *fakeFileOperationStore) RecordFileOperationTransfer(_ context.Context, _, _, _, _ uuid.UUID, _ [32]byte, input store.FileOperationUploadInput) (store.FileOperationRecord, error) {
+	fake.uploadInput = input
+	protocol := store.FileTransferRealtimeV2
+	fake.record.Filename = &input.Filename
+	fake.record.SizeBytes = &input.SizeBytes
+	fake.record.SHA256 = append([]byte(nil), input.SHA256...)
+	fake.record.DirectoryZIP = &input.DirectoryZIP
+	fake.record.TransferProtocol = &protocol
+	return fake.record, nil
+}
 func (fake *fakeFileOperationStore) AgentFileOperation(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, [32]byte) (store.FileOperationRecord, error) {
 	return fake.record, nil
 }
@@ -660,28 +659,5 @@ func (fake *fakeFileOperationStore) CompleteFileOperation(_ context.Context, _, 
 	result.Status = input.Status
 	return result, nil
 }
-
-type fakeFileOperationObjects struct {
-	verifyError error
-	verifyCalls int
-	putSize     int64
-	putCalls    int
-	getCalls    int
-}
-
-func (fake *fakeFileOperationObjects) PresignPut(_ context.Context, _ string, size int64, _ []byte, _ time.Duration) (history.PresignedRequest, error) {
-	fake.putSize = size
-	fake.putCalls++
-	return history.PresignedRequest{URL: "https://objects.test/upload", Method: http.MethodPut}, nil
-}
-func (fake *fakeFileOperationObjects) PresignGet(context.Context, string, time.Duration) (history.PresignedRequest, error) {
-	fake.getCalls++
-	return history.PresignedRequest{URL: "https://objects.test/download", Method: http.MethodGet}, nil
-}
-func (fake *fakeFileOperationObjects) VerifyCiphertext(context.Context, string, int64, []byte) error {
-	fake.verifyCalls++
-	return fake.verifyError
-}
-func (fake *fakeFileOperationObjects) Delete(context.Context, string) error { return nil }
 
 func timePointer(value time.Time) *time.Time { return &value }

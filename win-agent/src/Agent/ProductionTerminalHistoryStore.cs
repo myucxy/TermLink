@@ -170,8 +170,11 @@ namespace TermLink.Agent
         private const string ChunkOutboxFileName = "chunk-outbox.dpapi";
         private const string TranscriptArchiveDirectoryName = "transcript-archive";
         private const string TranscriptArchiveExtension = ".transcript.dpapi";
+        private const string DeleteMarkerPrefix = ".delete-";
+        private const string DeleteMarkerSuffix = ".marker";
         private readonly string root;
         private readonly Guid pcDeviceId;
+        private readonly Action<string, byte[]> durableWrite;
         private readonly ConcurrentDictionary<Guid, object> sessionLocks = new ConcurrentDictionary<Guid, object>();
         private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
         {
@@ -179,11 +182,22 @@ namespace TermLink.Agent
         };
 
         public ProductionTerminalHistoryStore(string root, Guid pcDeviceId)
+            : this(root, pcDeviceId, AtomicWrite)
+        {
+        }
+
+        internal ProductionTerminalHistoryStore(
+            string root,
+            Guid pcDeviceId,
+            Action<string, byte[]> durableWrite)
         {
             if (string.IsNullOrWhiteSpace(root)) throw new ArgumentException("History store root is required.", nameof(root));
             if (pcDeviceId == Guid.Empty) throw new ArgumentException("PC device ID is required.", nameof(pcDeviceId));
+            this.durableWrite = durableWrite ?? throw new ArgumentNullException(nameof(durableWrite));
             this.root = Path.GetFullPath(root);
             this.pcDeviceId = pcDeviceId;
+            Directory.CreateDirectory(this.root);
+            CompleteInterruptedDeletes();
         }
 
         public string RootPath => root;
@@ -226,6 +240,54 @@ namespace TermLink.Agent
         public IList<LocalFrame> ReadFramesAfter(Guid sessionId, ulong afterSequence)
         {
             return ReadFramesAfter(sessionId, afterSequence, shouldYield: null);
+        }
+
+        public IList<LocalFrame> ReadContiguousFrames(
+            Guid sessionId,
+            ulong afterSequence,
+            ulong throughSequence,
+            int maximumFrames,
+            int maximumDecodedBytes,
+            out bool gapDetected)
+        {
+            ValidateSessionId(sessionId);
+            if (throughSequence <= afterSequence) throw new ArgumentOutOfRangeException(nameof(throughSequence));
+            if (maximumFrames < 1) throw new ArgumentOutOfRangeException(nameof(maximumFrames));
+            if (maximumDecodedBytes < 1) throw new ArgumentOutOfRangeException(nameof(maximumDecodedBytes));
+            lock (SessionLock(sessionId))
+            {
+                gapDetected = false;
+                var directory = ResolveWalDirectory(sessionId);
+                var frames = new List<LocalFrame>(maximumFrames);
+                if (!Directory.Exists(directory)) return frames;
+                var sequence = checked(afterSequence + 1);
+                var decodedBytes = 0;
+                while (sequence <= throughSequence && frames.Count < maximumFrames)
+                {
+                    var path = Path.Combine(directory, sequence.ToString("D20") + WalExtension);
+                    if (!File.Exists(path))
+                    {
+                        gapDetected = HasWalSequenceAfter(directory, sequence, throughSequence);
+                        break;
+                    }
+                    var encoded = ReadProtected(path, sessionId, "wal");
+                    try
+                    {
+                        if (encoded.Length > maximumDecodedBytes)
+                            throw new InvalidDataException("A terminal WAL frame exceeds the history page bound.");
+                        if (frames.Count > 0 && decodedBytes > maximumDecodedBytes - encoded.Length) break;
+                        var frame = LocalFrameCodec.Decode(encoded);
+                        if (frame.SessionId != sessionId || frame.Sequence != sequence)
+                            throw new InvalidDataException("A terminal WAL frame identity is invalid.");
+                        frames.Add(frame);
+                        decodedBytes = checked(decodedBytes + encoded.Length);
+                    }
+                    finally { CryptographicOperations.ZeroMemory(encoded); }
+                    if (sequence == ulong.MaxValue) break;
+                    sequence++;
+                }
+                return frames;
+            }
         }
 
         private IList<LocalFrame> ReadFramesAfter(
@@ -276,6 +338,7 @@ namespace TermLink.Agent
             foreach (var directory in new DirectoryInfo(root).GetDirectories())
             {
                 if (Guid.TryParseExact(directory.Name, "N", out var sessionId) &&
+                    !IsSessionDeleted(sessionId) &&
                     Directory.Exists(Path.Combine(directory.FullName, "wal")))
                 {
                     result.Add(sessionId);
@@ -283,6 +346,25 @@ namespace TermLink.Agent
             }
             result.Sort();
             return result;
+        }
+
+        public bool ContainsSession(Guid sessionId)
+        {
+            ValidateSessionId(sessionId);
+            lock (SessionLock(sessionId))
+            {
+                return !File.Exists(DeleteMarkerPath(sessionId)) &&
+                    Directory.Exists(ResolveSessionDirectory(sessionId));
+            }
+        }
+
+        public bool IsSessionDeleted(Guid sessionId)
+        {
+            ValidateSessionId(sessionId);
+            lock (SessionLock(sessionId))
+            {
+                return File.Exists(DeleteMarkerPath(sessionId));
+            }
         }
 
         public void AppendTranscriptArchivePage(
@@ -559,6 +641,80 @@ namespace TermLink.Agent
             }
         }
 
+        public ProductionTerminalHistoryPreparedUpload PrepareArtifact(
+            Guid sessionId,
+            Guid recipientDeviceId,
+            long keyEpoch,
+            Func<ProductionTerminalHistoryArtifact, bool> selector,
+            Func<ProductionTerminalHistoryArtifact, byte[]> seal)
+        {
+            ValidateSessionId(sessionId);
+            if (recipientDeviceId == Guid.Empty || recipientDeviceId == pcDeviceId)
+                throw new ArgumentException("A distinct recipient device is required.", nameof(recipientDeviceId));
+            if (keyEpoch < 1) throw new ArgumentOutOfRangeException(nameof(keyEpoch));
+            if (selector == null) throw new ArgumentNullException(nameof(selector));
+            if (seal == null) throw new ArgumentNullException(nameof(seal));
+            lock (SessionLock(sessionId))
+            {
+                var path = Path.Combine(SessionDirectory(sessionId), OutboxFileName);
+                if (!File.Exists(path)) return null;
+                var outbox = ReadPersistedOutbox(path, sessionId);
+                var artifact = outbox.Artifacts
+                    .OrderBy(value => value.UploadOrder)
+                    .FirstOrDefault(value => selector(value.Clone()));
+                if (artifact == null) return null;
+                var deliveryKey = DeliveryKey(recipientDeviceId, keyEpoch);
+                if (!outbox.Deliveries.TryGetValue(deliveryKey, out var delivery))
+                {
+                    delivery = new ProductionTerminalHistoryDelivery
+                    {
+                        RecipientDeviceId = recipientDeviceId,
+                        KeyEpoch = keyEpoch
+                    };
+                    outbox.Deliveries.Add(deliveryKey, delivery);
+                }
+                if (!delivery.SealedObjects.TryGetValue(artifact.ArtifactId, out var sealedObject))
+                {
+                    sealedObject = seal(artifact.Clone());
+                    if (sealedObject == null || sealedObject.Length == 0)
+                        throw new InvalidDataException("Terminal artifact sealing returned no ciphertext.");
+                    delivery.SealedObjects[artifact.ArtifactId] = (byte[])sealedObject.Clone();
+                    WriteJson(path, sessionId, "outbox", outbox);
+                }
+                return new ProductionTerminalHistoryPreparedUpload
+                {
+                    SessionId = sessionId,
+                    RecipientDeviceId = recipientDeviceId,
+                    KeyEpoch = keyEpoch,
+                    Artifact = artifact.Clone(),
+                    SealedObject = (byte[])sealedObject.Clone()
+                };
+            }
+        }
+
+        public void MarkSessionDeleted(Guid sessionId)
+        {
+            ValidateSessionId(sessionId);
+            lock (SessionLock(sessionId))
+            {
+                var marker = DeleteMarkerPath(sessionId);
+                if (!File.Exists(marker)) durableWrite(marker, sessionId.ToByteArray());
+                if (!File.Exists(marker))
+                    throw new IOException("Terminal history deletion marker was not persisted.");
+            }
+        }
+
+        public void DeleteSession(Guid sessionId)
+        {
+            ValidateSessionId(sessionId);
+            lock (SessionLock(sessionId))
+            {
+                MarkSessionDeleted(sessionId);
+                var directory = ResolveSessionDirectory(sessionId);
+                if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+            }
+        }
+
         public void MarkUploaded(ProductionTerminalHistoryPreparedUpload upload)
         {
             if (upload == null || upload.Artifact == null) throw new ArgumentNullException(nameof(upload));
@@ -689,17 +845,70 @@ namespace TermLink.Agent
 
         private object SessionLock(Guid sessionId) => sessionLocks.GetOrAdd(sessionId, _ => new object());
 
-        private string SessionDirectory(Guid sessionId)
+        private string ResolveSessionDirectory(Guid sessionId)
         {
             ValidateSessionId(sessionId);
             var path = Path.GetFullPath(Path.Combine(root, sessionId.ToString("N")));
             if (!string.Equals(Path.GetDirectoryName(path), root, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Terminal history session path escaped its store root.");
+            return path;
+        }
+
+        private string SessionDirectory(Guid sessionId)
+        {
+            if (File.Exists(DeleteMarkerPath(sessionId)))
+                throw new InvalidOperationException("Terminal history session was permanently deleted.");
+            var path = ResolveSessionDirectory(sessionId);
             Directory.CreateDirectory(path);
             return path;
         }
 
         private string WalDirectory(Guid sessionId) => Path.Combine(SessionDirectory(sessionId), "wal");
+
+        private string ResolveWalDirectory(Guid sessionId) => Path.Combine(ResolveSessionDirectory(sessionId), "wal");
+
+        private bool HasWalSequenceAfter(string directory, ulong missingSequence, ulong throughSequence)
+        {
+            foreach (var path in Directory.EnumerateFiles(directory, "*" + WalExtension))
+            {
+                var name = Path.GetFileName(path);
+                var sequenceText = name.Substring(0, name.Length - WalExtension.Length);
+                if (!ulong.TryParse(sequenceText, out var sequence) || sequence == 0)
+                    throw new InvalidDataException("A terminal WAL filename is invalid.");
+                if (sequence > missingSequence && sequence <= throughSequence) return true;
+            }
+            return false;
+        }
+
+        private string DeleteMarkerPath(Guid sessionId) =>
+            Path.Combine(root, DeleteMarkerPrefix + sessionId.ToString("N") + DeleteMarkerSuffix);
+
+        private void CompleteInterruptedDeletes()
+        {
+            foreach (var marker in Directory.EnumerateFiles(
+                root,
+                DeleteMarkerPrefix + "*" + DeleteMarkerSuffix,
+                SearchOption.TopDirectoryOnly))
+            {
+                var name = Path.GetFileName(marker);
+                var value = name.Substring(
+                    DeleteMarkerPrefix.Length,
+                    name.Length - DeleteMarkerPrefix.Length - DeleteMarkerSuffix.Length);
+                if (!Guid.TryParseExact(value, "N", out var sessionId)) continue;
+                var directory = ResolveSessionDirectory(sessionId);
+                try
+                {
+                    if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+                }
+                catch (Exception error) when (error is IOException ||
+                    error is UnauthorizedAccessException ||
+                    error is System.Security.SecurityException)
+                {
+                    // The permanent marker remains authoritative. A locked
+                    // directory can be retried on a later clean Agent start.
+                }
+            }
+        }
 
         private string TranscriptArchiveDirectory(Guid sessionId) =>
             Path.Combine(SessionDirectory(sessionId), TranscriptArchiveDirectoryName);

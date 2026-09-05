@@ -1,16 +1,19 @@
 # Android ↔ Server ↔ Windows 文件操作 E2E
 
+> 文件内容通道使用独立的 E2EE Realtime File Transfer V2，断点续传与缓存真值
+> 见 `docs/REALTIME_FILE_TRANSFER_V2.md`。
+
 本文记录当前已经落入源码的远程文件操作契约、端到端数据路径、Android 下载中心生命周期、Docker 部署取舍与验收边界。中文是产品主说明，首次出现的主要界面词同时给出英文，便于核对中英文资源。
 
-实现基线：2026-08-25。协议真值以 `server/internal/api/file_operations.go`、`server/internal/store/file_operations.go`、数据库 Migration 17/18/19、`win-agent/src/Agent/ProductionFileOperationWorker.cs`、`win-agent/src/Agent/WindowsFileOperations.cs`、`android/app/src/main/kotlin/dev/termlink/product/ProductionProductRepository.kt` 和 `RemoteFileModels.kt` 为准。
+实现基线：2026-09-05。协议真值以 `server/internal/api/file_operations.go`、`server/internal/store/file_operations.go`、数据库 Migration 40/41、`win-agent/src/Agent/ProductionFileOperationWorker.cs`、`win-agent/src/Agent/ProductionFileTransferSender.cs`、`android/app/src/main/kotlin/dev/termlink/product/ProductionFileTransferClient.kt` 和 `RemoteFileModels.kt` 为准。
 
 ## 已实现的产品行为
 
 - Android 设备页只展示在线 Windows PC；每台 PC 的右上状态区域提供“浏览文件 / Browse files”，设备页右上角提供跨 PC 聚合的“下载中心 / Download center”。
 - 文件浏览从空路径开始列出 Windows 逻辑驱动器。进入目录后支持返回上一级、刷新和“加载更多 / Load more”。目录优先，再按名称排序。
 - 文件和目录都可下载。文件按原始字节传输；目录先在 Windows 端生成包含所选根目录的 ZIP，保留空目录，不跟随 junction、symlink 等 reparse point。
-- Android 先通过 Storage Access Framework（SAF）选择保存位置，再创建服务端 `DOWNLOAD` 任务。文件内容不经过 TermLink API 进程中转：Windows Agent 使用预签名 `PUT` 直传 S3/MinIO，Android 使用预签名 `GET` 直下对象。
-- Android 下载时流式写入 SAF 文档，同时检查声明长度和 SHA-256；支持零字节文件。任何截断、超长或摘要不符都转为失败，并删除或清空不完整目标。
+- Android 先通过 Storage Access Framework（SAF）选择保存位置，再创建服务端 `DOWNLOAD` 任务。Windows 与 Android 通过独立文件 WebSocket 传送 E2EE 分块，服务端只鉴权和转发。
+- Android 先把分块写入私有 `.part` 缓存并持久化连续偏移，支持断线和进程重启续传；长度和 SHA-256 验证通过后才提交 SAF 文档。零字节文件合法，截断、超长或摘要不符都会失败关闭。
 - 文件/目录行右侧统一使用操作菜单；目录菜单提供 ZIP 下载、收藏/取消收藏，以及该 PC Agent 实际上报可用的命令行。收藏按服务端与账号隔离，并记录 PC 与绝对路径，可从收藏目录跨 PC 直达。
 - 目录页面只在 PC 的 `supported_shells` 中包含相应值时，才允许启动 CMD（`cmd.exe`）或 Windows PowerShell（`powershell.exe -NoLogo -NoProfile`）。新窗口由 TermLink SessionHost 托管，随后按返回的准确 `session_id` 出现在 Android 会话页。
 - 下载中心显示准备/压缩、下载、校验、完成、失败和取消状态以及字节进度；支持取消、失败或取消后的重试、终态记录删除。删除记录只删 Android 元数据，不删除已经保存的 SAF 文档。
@@ -29,14 +32,14 @@ flowchart LR
     W -->|LIST 本地枚举| FS[Windows 文件系统]
     W -->|OPEN_TERMINAL| H[SessionHost]
     H --> T[Windows Terminal 或可见控制台]
-    W -->|预签名 PUT 文件或 ZIP| O[(S3 或 MinIO)]
-    O -->|预签名 GET| A
-    A -->|流式写入| D[Android SAF 文档]
+    W <-->|E2EE 文件分块与 ACK| F[独立 File Transfer Relay]
+    F <-->|续传与 COMPLETE_ACK| A
+    A -->|校验后提交| D[Android SAF 文档]
     H -->|会话注册与实时终端流| R[TermLink Realtime]
     R --> A
 ```
 
-控制面是 Android/Windows 与 Server API 之间的小型 JSON 请求；下载数据面是 Windows → 对象存储 → Android。Realtime 只承载打开后的终端会话，不承载文件字节。
+控制面是 Android/Windows 与 Server API 之间的小型 JSON 请求；下载数据面使用独立于终端连接的 E2EE 文件 WebSocket。终端和文件拥有不同的队列、心跳与背压边界。
 
 ## 服务端任务协议
 
@@ -182,67 +185,41 @@ sequenceDiagram
     autonumber
     participant A as Android
     participant SAF as Android SAF
-    participant S as Server API
-    participant P as PostgreSQL
+    participant S as Server API/Relay
     participant W as Windows Agent
-    participant O as S3 or MinIO
+    participant F as Windows FS
 
     A->>SAF: ACTION_CREATE_DOCUMENT suggested filename
     SAF-->>A: content URI and persistable grant
     A->>S: POST file-operations DOWNLOAD path
-    S->>P: INSERT PENDING
     S-->>A: operation ID
-    W->>S: POST claim
-    S-->>W: operation plus lease_token
-    alt Selected path is a directory
-        W->>W: Create temporary ZIP and preserve empty directories
-    else Selected path is a file
-        W->>W: Open source as a stream
+    W->>S: Claim operation and publish REALTIME_V2 metadata
+    W->>F: Open seekable file or create stable task ZIP
+    A->>S: Connect /v1/file-transfers with committed offset
+    W->>S: Connect /v1/file-transfers and send E2EE offer/chunks
+    S-->>A: Relay opaque encrypted frames
+    A->>A: Append .part, fsync, then ACK committed offset
+    alt connection interrupted
+        A->>S: Reconnect with last durable offset
+        S-->>W: Resume request
     end
-    W->>W: Enforce 5 GiB and calculate SHA-256
-    W->>S: POST upload metadata
-    S->>P: Bind opaque object key and metadata
-    S-->>W: Presigned PUT valid for 1 hour
-    W->>O: PUT stream with checksum metadata
-    W->>S: POST complete SUCCEEDED
-    S->>O: HEAD size and checksum
-    S->>P: Persist SUCCEEDED and schedule deletion
-    A->>S: GET completed operation
-    S-->>A: Download descriptor and presigned GET
-    A->>O: GET stream
-    O-->>A: File or ZIP bytes
-    A->>SAF: Stream write while hashing
     A->>A: Verify exact size and SHA-256
+    A->>SAF: Commit verified cache file
+    A-->>W: COMPLETE_ACK
+    W->>S: Complete operation SUCCEEDED
 ```
 
-下载 descriptor 位于 `GET` 响应顶层，而不是 `file_operation.result`：
+文件内容只存在于 Windows 源文件/任务缓存和 Android 私有任务缓存中。服务端验证账号、设备、任务、方向、有效期和帧大小，然后转发 E2EE 帧；不保存块内容、续传偏移或文件密钥。
 
-```json
-{
-  "download": {
-    "filename": "work.zip",
-    "size_bytes": 12345,
-    "sha256": "Base64URL without padding",
-    "directory_zip": true,
-    "request": {
-      "url": "presigned HTTPS URL",
-      "method": "GET",
-      "headers": {"header-name": ["value"]},
-      "expires_at": "RFC 3339 timestamp"
-    }
-  }
-}
-```
+### 大小、校验和缓存生命周期
 
-### 大小、校验和对象生命周期
-
-- 文件和压缩后 ZIP 的共同硬上限是 5 GiB，即 `5,368,709,120` 字节。当前使用 S3 单次 `PUT`，未实现 multipart，因此不能宣称支持更大对象。
-- 零字节普通文件合法；目录 ZIP 不会是零字节。
-- Windows 在上传前计算 SHA-256；预签名 `PUT` 把摘要绑定为对象校验和。服务端完成任务时使用 `HEAD` 校验对象长度和 S3 checksum 元数据，不同步回读整个大对象。Android 下载后再独立计算 SHA-256。
-- Windows 临时 ZIP 位于系统临时目录下的 TermLink 专用子目录，上传结束、失败或取消后释放流并删除。
-- 上传 URL 有效 1 小时。任务成功后，Android 可在 `completed_at + 55 分钟` 之前请求新的 10 分钟下载 URL。
-- 下载对象在终态后延迟 65 分钟通过持久化 outbox 删除。这个时间覆盖最后一个 10 分钟 GET，也覆盖取消或失败后仍可能到达的 1 小时 PUT。
-- 终态记录仍保留在 PostgreSQL；对象被删除或 55 分钟下载宽限结束后，`GET file_operation` 仍返回任务，但不再附带 `download`。
+- 文件和压缩后 ZIP 的共同硬上限是 5 GiB，即 `5,368,709,120` 字节。
+- Windows 普通文件直接以只读可 seek 流发送；目录 ZIP 固定在 `%LOCALAPPDATA%\TermLink\Cache\FileTransfers\<transfer-id>\`，从而可在断线或 Agent 重启后续传。
+- Android 先写 `<cacheDir>/file-transfers/<transfer-id>/payload.part`，每次持久化后才 ACK 当前连续偏移；重连时这个偏移是唯一续传权威。
+- 重复块必须逐字节一致；前向缺口触发 `RESUME`，不会创建稀疏文件。
+- Android 在写入 SAF 前核对长度和 SHA-256；Windows 仅在收到 `COMPLETE_ACK` 后报告任务成功。
+- 成功、明确取消、过期、授权丢失或用户移除记录后清理任务缓存。瞬态断线和进程重启保留缓存。
+- 文件传输使用独立的 `termlink.file-transfer.v2` WebSocket，不与终端 `/v1/realtime` 共用队列和心跳。
 
 ## 取消、失败、恢复和重试
 
@@ -340,70 +317,43 @@ sequenceDiagram
 
 ```mermaid
 flowchart TB
-    subgraph M[最小生产拓扑：外部 OIDC 和 S3]
-        ME[可选 Caddy edge profile] --> MS[TermLink Server]
-        MS --> MP[(PostgreSQL)]
-        MS --> MV[(Valkey)]
-        MS --> MO[外部 OIDC]
-        MS --> MX[外部 S3]
-    end
-
-    subgraph A[自包含 acceptance 拓扑]
-        PUB[公网 Lucky 映射] --> AL[Lucky upstream]
-        LAN[本地或 LAN 内部 CA] --> AE[Caddy TLS edge]
-        AL --> AS[TermLink Server]
-        AL --> AK[Keycloak]
-        AL --> AM[MinIO object route]
-        AE --> AS
-        AE --> AK
-        AE --> AM
-        AS --> AP[(PostgreSQL)]
-        AS --> AV[(Valkey)]
-        AS --> AK
-        AS --> AM
-    end
+    C[Android / Windows clients] --> E[可选 Caddy / 外部反向代理]
+    E --> S[TermLink Server]
+    S --> P[(PostgreSQL)]
+    S --> V[(Valkey)]
+    S --> O[OIDC]
+    W[Windows Agent] <-->|E2EE terminal/history/file frames| S
+    A[Android] <-->|E2EE terminal/history/file frames| S
 ```
 
-| 方案 | 常驻组件 | 适用场景与取舍 |
-| --- | --- | --- |
-| `core.compose.yml` + `external-services.compose.yml` | Server、PostgreSQL、Valkey；`--profile edge` 可选 Caddy | 推荐的精简生产方式。OIDC 与 S3 由外部服务提供，不启动 Keycloak/MinIO；已有反向代理时也可不启 Caddy。登录、任务持久化、协调和对象存储能力没有被关闭。 |
-| `core.compose.yml` + `history.compose.yml` | 上述组件 + MinIO；可选 Caddy | 自托管对象存储。文件下载依赖 history/S3 开关，但文件传输仍使用独立 5 GiB object path 和限制。OIDC 仍是外部服务。 |
-| `acceptance.compose.yml` | Server、PostgreSQL、Valkey、MinIO、Keycloak、edge、lucky-upstream | 可重复的本地/公网映射联调栈，资源更重。Compose 声明 11 个服务，其中 `runtime-secrets-init`、`keycloak-init`、`server-secrets-init` 和 `migrate` 是 4 个一次性任务，成功后退出；稳态为表中 7 个服务。两个 Caddy 在此栈中职责不同：TLS/内部验收入口与 Lucky 的明文上游边界。 |
+生产运行时不再包含 MinIO/S3。PostgreSQL 仅保存账号、设备、会话目录、文件任务和路由元数据；Valkey 支撑实时协调；终端历史由在线 Windows Agent 提供，文件内容由 Windows 与 Android 通过 Relay/Direct 路径传送。隐私数据导出功能及其对象制品已移除。
 
-PostgreSQL 保存任务和 outbox，Valkey 支撑当前认证/实时协调，OIDC 提供账号登录，S3/MinIO 保存待下载对象，因此不能在保留当前 E2E 能力的同时直接删除这些逻辑依赖。精简的正确方向是外置 OIDC/S3、让一次性容器退出、复用同一个 Server 镜像以及按需启用 edge，而不是把功能依赖删掉。
-
-自托管入口必须允许严格匹配的对象路径：
-
-```text
-/termlink-history/accounts/{account UUID}/file-transfers/{pc UUID}/{operation UUID}.bin
-```
-
-只需代理带完整 S3 SigV4 查询参数的 `GET` 和 `PUT`，并为文件传输单独配置 `5,368,709,120` 字节请求体上限；不要误用终端历史对象的 64 MiB 上限。外部 S3 模式不应把对象流量再代理回 TermLink Caddy。
+`external-services.compose.yml` 现在只表示外部 OIDC 部署；`acceptance.compose.yml` 仍提供 Keycloak、PostgreSQL、Valkey、Server 和入口代理，但不启动对象存储。
 
 ## 部署与 E2E 验收清单
 
-1. 把数据库迁移到 Migration 19：Migration 17 创建 `pc_file_operations` 和 claim 索引，Migration 18 把 `size_bytes` 收紧到 5 GiB 并固化 OPEN_TERMINAL 约束，Migration 19 增加白名单约束的 `pcs.supported_shells`。
-2. 确认 `TERMLINK_HISTORY_ENABLED=true`，S3 internal/public endpoint、bucket、region 和凭据可用；公网客户端拿到的预签名 URL 必须从 Android 和 Windows 都可达。
-3. 若使用仓库 Caddy，确认 file-transfer matcher、`GET PUT`、5 GiB 限制和对象存储 upstream 生效。若使用外部 ingress，等价复制这些约束。
-4. 访问 `/readyz` 应为 `200`；访问 `/v1/client-config`，OIDC issuer 和客户端看到的 public origin 必须是实际公网域名，而不是 Docker hostname 或 LAN 临时地址。
-5. Android 与 Windows Agent 登录同一账号；所选 PC 必须在线且 remote routing/remote access 已启用。
-6. 浏览根驱动器和含超过 500 项的目录，确认分页无遗漏、无重复；覆盖中文、空格和 Unicode 文件名。
-7. 下载普通文件、零字节文件和目录 ZIP，逐一核对文件名、长度、SHA-256、ZIP 根目录、空目录和内容。
-8. 在 ZIP 准备阶段及实际下载阶段各取消一次，确认 Android 变为 `CANCELLED`、不完整 SAF 文档被清理，服务端任务最终为 `CANCELLED` 或按竞态已经终态。
-9. 对失败和取消记录执行重试；删除完成记录后确认 Android 文件仍存在。
-10. 先确认 PC 列表只回显 Agent 实际探测到的 `supported_shells`；再分别打开已上报的 CMD 和 Windows PowerShell，确认返回 `session_id` 唯一、`cwd` 正确、Android 会话目录出现同一 ID，并能进入实时终端。对缺失 Shell 或旧 Agent，确认 Android 不显示对应命令。
-11. 检查终态 download 对象已创建延迟删除 outbox；用自动化时钟测试验证 55 分钟 descriptor 宽限、10 分钟 GET 和 65 分钟删除关系，不建议人工等待。
+1. 将数据库迁移到当前最新版本，确认旧隐私导出表、`pc_file_operations.object_key` 和 `OBJECT_V1` 任务已清理。
+2. 确认 Compose 不包含 MinIO、S3 凭据、对象网络或 `/termlink-history` 反向代理。
+3. 访问 `/readyz` 应为 `200`；`/v1/client-config` 的 OIDC issuer 和 public origin 必须使用实际域名。
+4. Android 与 Windows Agent 登录同一账号，验证设备目录和会话目录加载。
+5. 浏览根驱动器及超过 500 项的目录，覆盖中文、空格和 Unicode 文件名。
+6. 下载零字节文件、多块文件和目录 ZIP，核对名称、长度、SHA-256、ZIP 空目录和内容。
+7. 在传输中断网后恢复，确认 Android 从已持久化偏移续传且终端连接不断开。
+8. 杀掉 Android 进程后重新进入任务，确认 `.part` 缓存可续传；完成后的 SAF 文档不会重复提交。
+9. 在 Windows Agent 重启后续传目录 ZIP，确认稳定任务缓存被复用。
+10. 分别取消 Android 和 Windows 侧任务，确认两端任务缓存最终清理，服务端只保留受限生命周期的任务元数据。
+11. 打开终端并同时进行文件传输，验证输入、输出、心跳、本地主机历史和控制租约不受影响。
 
-仓库中的协议级真实链路脚本见 [File operations end-to-end validation](FILE_OPERATIONS_E2E.md)。它验证生产 REST、对象传输和 Windows Agent 路径，但不代替 Android UI/SAF 验收。
+协议和缓存边界详见 [Realtime File Transfer V2](REALTIME_FILE_TRANSFER_V2.md)。
 
 ## 验证状态与设备边界
 
 ### 已验证的自动化覆盖
 
-- Server：Go 全量测试与 `go vet` 已通过；文件操作 API、角色边界、零字节、5 GiB 边界、SHA-256 元数据、严格 Shell 结果、幂等完成、租约轮换、取消/到期、延迟对象删除，以及真实 PostgreSQL Migration 17/18 与任务集成均有测试覆盖。
-- Windows：Release `FileOperationsValidation` 和完整 `Build-Windows.ps1` 已通过；覆盖目录排序/分页/UTF-8 字节预算、ZIP 空目录、reparse point、临时文件清理、流式上传、取消、续租丢失、remote access 关闭、HTTP 超时继续领取、未分类异常独立恢复、中英双语诊断、Shell allowlist、cwd/session 参数和 SessionHost 注册超时。
-- Android：`:app:testDebugUnitTest`、`assembleDebug` 和 `lintDebug` 已通过；覆盖文件协议解析、5 GiB 边界、零字节/截断/SHA 错误、浏览竞态和分页去重、SAF 清理、下载元数据恢复、进程重启转失败、重试前状态以及“删记录不删文件”。
-- Docker/入口：生产配置检查覆盖独立 file-transfer matcher 和 5 GiB request-body 限制；Compose 配置可以分别生成自托管对象存储与外部 OIDC/S3 拓扑。
+- Server：Go 全量测试覆盖文件操作 API、角色边界、实时传输路由、5 GiB 元数据边界、幂等完成、租约轮换、取消/到期和 Migration 40/41。
+- Windows：Release 验证覆盖目录排序/分页、ZIP 空目录、reparse point、统一缓存、E2EE 多块发送、续传、取消、续租丢失和独立 Worker 恢复。
+- Android：单元与仪器测试覆盖文件协议、零字节/多块/重复/缺口/SHA 错误、私有缓存恢复、SAF 单次提交和“删记录不删文件”。
+- Docker/入口：生产配置策略覆盖 64 组功能组合，并禁止 MinIO、S3 凭据、对象网络和对象代理入口。
 
 这些结果证明分层实现和服务端真实数据库契约，不自动等同于一次物理 Android 设备到真实 Windows 文件系统的完整用户操作已经通过。
 
@@ -413,6 +363,6 @@ PostgreSQL 保存任务和 outbox，Valkey 支撑当前认证/实时协调，OID
 - 真实移动网络切换、超大文件长时间下载、接近 5 GiB 上限的端到端耗时与厂商省电策略；5 GiB 是协议上限，不是已经用真机搬运 5 GiB 的性能结论。
 - 真机触控与中英文布局、屏幕旋转、Activity 重建后的系统文件选择器体验，以及下载中心的人工可用性。
 - 不同 Windows 版本、企业 ACL、锁定文件、网络盘和实际 reparse point 目录的人工行为；自动化只覆盖可控夹具。
-- 公网 ingress、证书链、外部 S3 的单次 PUT 兼容性和对象生命周期任务需要在最终部署环境再做一次验收。
+- 公网 ingress、证书链以及 Relay/Direct 切换下的大文件续传需要在最终部署环境再做一次验收。
 
 正式验收记录应分别注明 `protocol_e2e`、`android_ui_emulator` 和 `android_physical_device`，未执行的层级不得由其他层级的成功结果代替。

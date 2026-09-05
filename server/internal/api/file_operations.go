@@ -13,15 +13,12 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
-	"github.com/termlink/termlink/server/internal/history"
 	"github.com/termlink/termlink/server/internal/store"
 )
 
 const (
 	fileOperationLifetime      = 24 * time.Hour
 	fileOperationLeaseDuration = time.Hour
-	fileTransferURLLifetime    = time.Hour
-	fileDownloadURLLifetime    = 10 * time.Minute
 )
 
 type fileOperationStore interface {
@@ -29,7 +26,7 @@ type fileOperationStore interface {
 	ClaimFileOperation(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, time.Duration) (*store.FileOperationRecord, string, error)
 	GetFileOperation(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID) (store.FileOperationRecord, error)
 	CancelFileOperation(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID) (store.FileOperationRecord, error)
-	RecordFileOperationUpload(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, [32]byte, store.FileOperationUploadInput) (store.FileOperationRecord, error)
+	RecordFileOperationTransfer(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, [32]byte, store.FileOperationUploadInput) (store.FileOperationRecord, error)
 	AgentFileOperation(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, [32]byte) (store.FileOperationRecord, error)
 	RenewFileOperation(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, [32]byte, time.Duration) (store.FileOperationRecord, error)
 	CompleteFileOperation(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, [32]byte, store.FileOperationCompleteInput) (store.FileOperationRecord, error)
@@ -136,23 +133,14 @@ func (a *API) getFileOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response := map[string]any{"file_operation": fileOperationView(item)}
-	if item.Status == store.FileOperationSucceeded && item.Operation == store.FileOperationDownload {
-		if a.History == nil || item.ObjectKey == "" || item.Filename == nil || item.SizeBytes == nil || len(item.SHA256) != sha256.Size ||
-			item.DirectoryZIP == nil || item.CompletedAt == nil {
-			writeError(w, r, http.StatusServiceUnavailable, "FILE_TRANSFER_UNAVAILABLE", errors.New("download object unavailable"))
-			return
-		}
-		if a.now().Before(item.CompletedAt.Add(store.FileOperationDownloadGracePeriod)) {
-			download, err := a.History.PresignGet(r.Context(), item.ObjectKey, fileDownloadURLLifetime)
-			if err != nil {
-				writeError(w, r, http.StatusServiceUnavailable, "FILE_TRANSFER_UNAVAILABLE", err)
-				return
-			}
-			response["download"] = map[string]any{
-				"filename": *item.Filename, "size_bytes": *item.SizeBytes,
-				"sha256":        base64.RawURLEncoding.EncodeToString(item.SHA256),
-				"directory_zip": *item.DirectoryZIP, "request": download,
-			}
+	if item.Operation == store.FileOperationDownload && item.TransferProtocol != nil &&
+		*item.TransferProtocol == store.FileTransferRealtimeV2 && item.Filename != nil && item.SizeBytes != nil &&
+		len(item.SHA256) == sha256.Size && item.DirectoryZIP != nil &&
+		(item.Status == store.FileOperationProcessing || item.Status == store.FileOperationSucceeded) {
+		response["transfer"] = map[string]any{
+			"protocol": store.FileTransferRealtimeV2, "transfer_id": item.ID,
+			"filename": *item.Filename, "size_bytes": *item.SizeBytes,
+			"sha256": base64.RawURLEncoding.EncodeToString(item.SHA256), "directory_zip": *item.DirectoryZIP,
 		}
 	}
 	writeJSON(w, http.StatusOK, response)
@@ -182,10 +170,6 @@ func (a *API) cancelFileOperation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) uploadFileOperation(w http.ResponseWriter, r *http.Request) {
-	if a.History == nil {
-		writeError(w, r, http.StatusServiceUnavailable, "FILE_TRANSFER_UNAVAILABLE", errors.New("object store unavailable"))
-		return
-	}
 	p := principal(r)
 	if !store.IsPCAgentDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "WINDOWS_AGENT_REQUIRED", store.ErrDenied)
@@ -212,7 +196,7 @@ func (a *API) uploadFileOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	digest, err := base64.RawURLEncoding.DecodeString(input.SHA256)
-	if err != nil || len(digest) != sha256.Size || input.SizeBytes < 0 || input.SizeBytes > history.MaxFileTransferObjectBytes ||
+	if err != nil || len(digest) != sha256.Size || input.SizeBytes < 0 || input.SizeBytes > store.MaxFileTransferBytes ||
 		!validFileTransferFilename(input.Filename) || (input.DirectoryZIP && !strings.HasSuffix(strings.ToLower(input.Filename), ".zip")) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_FILE_TRANSFER_METADATA", errors.New("invalid file transfer metadata"))
 		return
@@ -222,19 +206,17 @@ func (a *API) uploadFileOperation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusServiceUnavailable, "FILE_OPERATIONS_UNAVAILABLE", errors.New("file-operation store unavailable"))
 		return
 	}
-	item, err := repository.RecordFileOperationUpload(r.Context(), p.UserID, p.Device.ID, pcID, operationID, leaseHash, store.FileOperationUploadInput{
+	item, err := repository.RecordFileOperationTransfer(r.Context(), p.UserID, p.Device.ID, pcID, operationID, leaseHash, store.FileOperationUploadInput{
 		Filename: input.Filename, SizeBytes: input.SizeBytes, SHA256: digest, DirectoryZIP: input.DirectoryZIP,
 	})
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
-	upload, err := a.History.PresignPut(r.Context(), item.ObjectKey, input.SizeBytes, digest, fileTransferURLLifetime)
-	if err != nil {
-		writeError(w, r, http.StatusServiceUnavailable, "FILE_TRANSFER_UNAVAILABLE", err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"upload": upload})
+	writeJSON(w, http.StatusOK, map[string]any{"transfer": map[string]any{
+		"protocol": store.FileTransferRealtimeV2, "transfer_id": item.ID,
+		"requester_device_id": item.RequesterDeviceID,
+	}})
 }
 
 func (a *API) renewFileOperation(w http.ResponseWriter, r *http.Request) {
@@ -328,12 +310,10 @@ func (a *API) completeFileOperation(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case store.FileOperationDownload:
-			if len(input.Result) != 0 || a.History == nil || current.ObjectKey == "" || current.SizeBytes == nil || len(current.SHA256) != sha256.Size {
-				writeError(w, r, http.StatusBadRequest, "INVALID_FILE_OPERATION_RESULT", errors.New("download upload required"))
-				return
-			}
-			if err := a.History.VerifyCiphertext(r.Context(), current.ObjectKey, *current.SizeBytes, current.SHA256); err != nil {
-				writeError(w, r, http.StatusUnprocessableEntity, "FILE_TRANSFER_INTEGRITY_FAILED", err)
+			if len(input.Result) != 0 || current.TransferProtocol == nil ||
+				*current.TransferProtocol != store.FileTransferRealtimeV2 ||
+				current.SizeBytes == nil || len(current.SHA256) != sha256.Size {
+				writeError(w, r, http.StatusBadRequest, "INVALID_FILE_OPERATION_RESULT", errors.New("realtime transfer completion required"))
 				return
 			}
 		case store.FileOperationOpenTerminal:
@@ -458,7 +438,8 @@ func validFileTransferFilename(value string) bool {
 func fileOperationView(item store.FileOperationRecord) map[string]any {
 	result := map[string]any{
 		"id": item.ID, "pc_id": item.PCID, "operation": item.Operation, "path": item.Path,
-		"status": item.Status, "attempt_count": item.AttemptCount, "expires_at": item.ExpiresAt,
+		"requester_device_id": item.RequesterDeviceID,
+		"status":              item.Status, "attempt_count": item.AttemptCount, "expires_at": item.ExpiresAt,
 		"created_at": item.CreatedAt, "updated_at": item.UpdatedAt,
 	}
 	if item.Offset != nil {

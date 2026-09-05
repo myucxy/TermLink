@@ -50,8 +50,8 @@ flowchart LR
     AGENT -->|持久化后加密 Envelope| RELAY[服务端 API + Realtime Relay]
     RELAY -->|仅路由密文| APP[Android 客户端]
     APP --> ENGINE[TerminalEngine：解析 VT/ANSI]
-    AGENT -.->|可选、按设备加密| HISTORY[有界历史对象]
-    HISTORY -.-> RELAY
+    AGENT -.->|本地 WAL/checkpoint| HISTORY[主机有界历史]
+    HISTORY -.->|按 Android 设备密封并经 Relay 响应| APP
 ```
 
 必须满足：
@@ -78,11 +78,11 @@ terminal-main 没有可直接复用的远程服务、认证、序号、ACK、断
 
 ### 2.4 实时查看、远程输入与历史记录是三个概念
 
-实时输出是受管会话的基本能力，不能因为历史记录关闭而停止转发。远程输入是授权后的控制命令，不等同于“采集键盘硬件事件”。输入内容默认不进入本地/云历史；本地输入只发布控制权已被夺回的 `local_input_epoch`，不把键盘内容作为独立历史事件上传。历史记录是独立的可选保留策略，必须继续使用现有的加密、有界、按接收设备隔离的链路。
+实时输出是受管会话的基本能力，不能因为历史记录关闭而停止转发。远程输入是授权后的控制命令，不等同于“采集键盘硬件事件”。输入内容默认不进入主机历史；本地输入只发布控制权已被夺回的 `local_input_epoch`，不把键盘内容作为独立历史事件上传。历史记录保存在 Windows App 私有目录，并通过加密、有界、按接收设备隔离的实时响应提供。
 
 ### 2.5 Tail-first durable 生产合同
 
-Tail-first 历史对象只能从已经提交到 Windows 本地持久化边界的有序 `LocalFrame` 生成。
+Tail-first 主机历史对象只能从已经提交到 Windows 本地持久化边界的有序 `LocalFrame` 生成。
 producer WAL 是崩溃恢复和幂等重试的事实来源；terminal-main channel ordinal 仍然只是诊断顺序，
 不能替代 durable wire sequence。Transcript Page 必须先于同一 S 的 Snapshot 提交，Snapshot
 必须最后提交并充当该批历史对象可选择性的发布屏障。
@@ -153,7 +153,7 @@ ACK 只有在 Android 终端引擎完成事件应用、必要的会话状态提�
 
 - 默认不记录或上传输入正文、完整环境变量、Token、密码、私钥、Pipe 名和本地缓冲路径。
 - 命令行、CWD、子进程 PID、主机名和最终窗口标题可能包含凭据或个人信息。窗口标题仅可通过本合同的逐 recipient E2EE `title_cipher` 和有序 E2EE realtime 事件同步；Relay、数据库、日志和指标不得保存标题明文，其余敏感字段除非另有明确合同否则只保留本机诊断摘要。
-- Relay、PostgreSQL、Valkey、对象存储、指标和日志不得出现终端正文或解密后的敏感描述。
+- Relay、PostgreSQL、Valkey、指标和日志不得出现终端正文或解密后的敏感描述；服务端不得保存历史或文件正文。
 - 不能依赖“检测密码提示符”进行脱敏；SSH、数据库客户端和 TUI 可以用任意方式请求秘密。
 - 若未来支持历史、搜索、导出或删除，查看/导出/删除动作本身要写入不含正文的审计事件，并使用租户隔离和最小权限。
 
@@ -253,31 +253,29 @@ flowchart TD
 
 ### 4.4 Android tail-first 选择、安装与分页
 
-只有双方协商并启用 `terminal_snapshot_v1` 后，Android 才能进入新路径；
-`TerminalTranscriptPageV1` 受同一门禁约束，不是独立 wire capability。否则继续使用
-`bounded_event_replay_v1`。Snapshot/Transcript selector 必须先按
-账号和 `recipient_device_id` 过滤，再签发下载 URL。
+只有双方协商并启用 `host_history_v1` 与 terminal snapshot runtime 后，Android 才能进入
+主机恢复路径；`TerminalTranscriptPageV1` 受同一门禁约束，不是独立 live event。
+Windows 必须按账号、会话和 `recipient_device_id` 密封响应，Relay 只做短时路由。
 
 ```mermaid
 sequenceDiagram
     participant U as Android UI
-    participant H as History REST
-    participant O as Object Storage
+    participant H as Windows Host History
     participant V as Crypto Validator
     participant P as Detached Renderer
     participant D as Durable Cache and Checkpoint
     participant L as Live Renderer
     participant R as Realtime Relay
 
-    U->>H: Select eligible Snapshot for this recipient
-    H-->>U: Snapshot metadata at S and signed URL
-    U->>O: Download recipient-bound ciphertext
-    O-->>U: Sealed Snapshot S
+    U->>R: Request latest recipient-bound Snapshot
+    R->>H: Route bounded host-history request
+    H-->>R: Sealed Snapshot S
+    R-->>U: Sealed Snapshot S
     U->>V: Verify identity digest AAD Key Epoch and AEAD
     V-->>U: Validated Snapshot S
     U->>P: Prepare detached candidate
     P-->>U: Prepared renderer at S
-    U->>D: Durably cache sealed object
+    U->>D: Durably cache sealed snapshot
     U->>D: Atomically bind checkpoint identity and ACK S
     D-->>U: Bound generation at S
     U->>L: Install prepared candidate
@@ -380,7 +378,7 @@ termForward 文档中可迁移的是失败隔离、字节保真、显式丢失�
 | --- | --- | --- |
 | 来源隔离 | 只从 TermLink 注册的 terminal-main 异步通道获取信息；普通已有标签页不出现在会话列表，TermLink 不读取 ConPTY。 | 新增通道单测和 terminal-main 集成测试；旧 SessionHost 仅作为迁移前对照。 |
 | 通道保真 | UTF-16 code unit、中文、emoji、组合字符、ANSI、OSC、回车进度条、TUI、超长输出及被拆开的输出块可由 Android 引擎连续重放。 | 新增 terminal-main AsyncTerminalChannel 测试；Golden Stream 保留为跨引擎对照。 |
-| 端到端安全 | Relay、DB、Valkey、对象存储、日志和指标均无终端明文；错误日志不泄露 Token/密钥。 | E2EE/Relay 契约测试；公网三端扫描仍待验收。 |
+| 端到端安全 | Relay、DB、Valkey、日志和指标均无终端明文，服务端不保存历史或文件正文；错误日志不泄露 Token/密钥。 | E2EE/Relay 契约测试；公网三端扫描仍待验收。 |
 | 顺序与恢复 | 重连从最高连续 ACK 继续，不重复输出、不重复执行输入；缺口范围精确且用户可见。 | Host-Agent、Android、Relay 单测/契约；补真实公网重启/断网证据。 |
 | 背压与离线 | Android 暂停或慢消费者不阻塞 terminal-main；Relay 不可用时本地终端与本地输入继续。 | 新增异步通道取消/满载测试；补持续 2 MB/s、慢磁盘/慢网络实测。 |
 | 状态语义 | started/interrupted/ended、退出码、尺寸和授权状态不被默认值覆盖；未知值不伪造。 | 当前 lifecycle/resize 路径存在投影缺口，列为 P1 修复。 |

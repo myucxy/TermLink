@@ -29,7 +29,6 @@ import (
 	"github.com/termlink/termlink/server/internal/accountdeletion"
 	"github.com/termlink/termlink/server/internal/agentupdate"
 	"github.com/termlink/termlink/server/internal/auth"
-	"github.com/termlink/termlink/server/internal/history"
 	"github.com/termlink/termlink/server/internal/humanverification"
 	"github.com/termlink/termlink/server/internal/kv"
 	"github.com/termlink/termlink/server/internal/serviceemail"
@@ -46,6 +45,8 @@ const maxSessionTitleCipherBytes = 1 << 20
 const maxHistoryPageTokenBytes = 2048
 
 const maxTranscriptPublicationPageCount = 100_000
+
+const maxLegacyHistoryObjectBytes int64 = 32 << 20
 
 const (
 	boundedEventReplayFormat                   = store.HistoryFormatBoundedEventReplay
@@ -66,7 +67,6 @@ type API struct {
 	TokenKey              []byte
 	RegistrationCodeKey   []byte
 	History               HistoryObjectStore
-	DataExportDownloader  PrivacyExportDownloader
 	AccountDeletionBinder accountdeletion.RequestBinder
 	Registration          interface {
 		Register(context.Context, auth.DirectRegistrationInput) error
@@ -117,10 +117,19 @@ type ClientConfiguration struct {
 }
 
 type HistoryObjectStore interface {
-	PresignPut(context.Context, string, int64, []byte, time.Duration) (history.PresignedRequest, error)
-	PresignGet(context.Context, string, time.Duration) (history.PresignedRequest, error)
+	PresignPut(context.Context, string, int64, []byte, time.Duration) (PresignedRequest, error)
+	PresignGet(context.Context, string, time.Duration) (PresignedRequest, error)
 	VerifyCiphertext(context.Context, string, int64, []byte) error
 	Delete(context.Context, string) error
+}
+
+// PresignedRequest remains only in the unreachable legacy-history handlers.
+// The registered routes return HTTP 426 and no production implementation is
+// wired now that server-side object storage has been retired.
+type PresignedRequest struct {
+	URL     string              `json:"url"`
+	Method  string              `json:"method"`
+	Headers map[string][]string `json:"headers"`
 }
 
 func (a *API) Handler() http.Handler {
@@ -171,9 +180,9 @@ func (a *API) Handler() http.Handler {
 	trusted.HandleFunc("DELETE /v1/sessions/{id}/lease", a.forceReleaseLease)
 	trusted.HandleFunc("POST /v1/sessions/{id}/lease/{leaseId}/renew", a.renewLease)
 	trusted.HandleFunc("DELETE /v1/sessions/{id}/lease/{leaseId}", a.releaseLease)
-	trusted.HandleFunc("GET /v1/sessions/{id}/history", a.listHistory)
-	trusted.HandleFunc("POST /v1/sessions/{id}/history/uploads", a.createHistoryUpload)
-	trusted.HandleFunc("POST /v1/sessions/{id}/history/uploads/{uploadId}/commit", a.commitHistoryUpload)
+	trusted.HandleFunc("GET /v1/sessions/{id}/history", retiredTerminalHistory)
+	trusted.HandleFunc("POST /v1/sessions/{id}/history/uploads", retiredTerminalHistory)
+	trusted.HandleFunc("POST /v1/sessions/{id}/history/uploads/{uploadId}/commit", retiredTerminalHistory)
 	trusted.HandleFunc("GET /v1/audit-events", a.listAudit)
 	trusted.HandleFunc("GET /v1/account/entitlements", a.getEntitlement)
 	trusted.HandleFunc("GET /v1/admin/registration-policy", a.adminGetRegistrationPolicy)
@@ -213,16 +222,27 @@ func (a *API) Handler() http.Handler {
 	root.Handle("GET /v1/account/pcs/control-policies", a.Auth.Authenticate(http.HandlerFunc(a.listUserPortalPCControlPolicies)))
 	root.Handle("PUT /v1/account/pcs/{pcId}/remote-routing", a.Auth.Authenticate(http.HandlerFunc(a.setUserPortalPCRemoteRouting)))
 	root.Handle("PUT /v1/account/pcs/{pcId}/control-policy", a.Auth.Authenticate(http.HandlerFunc(a.setUserPortalPCControlPolicy)))
-	root.Handle("DELETE /v1/account/sessions/{sessionId}/history", a.Auth.Authenticate(http.HandlerFunc(a.requestUserPortalHistoryDeletion)))
-	root.Handle("POST /v1/account/data-exports", a.Auth.Authenticate(http.HandlerFunc(a.requestUserPortalDataExport)))
-	root.Handle("GET /v1/account/data-exports/{exportId}", a.Auth.Authenticate(http.HandlerFunc(a.getUserPortalDataExport)))
-	root.Handle("GET /v1/account/data-exports/{exportId}/download", a.Auth.Authenticate(http.HandlerFunc(a.downloadUserPortalDataExport)))
 	root.Handle("GET /v1/account/deletion-preflight", a.Auth.Authenticate(http.HandlerFunc(a.getUserPortalAccountDeletionPreflight)))
 	root.Handle("POST /v1/account/deletion-requests", a.Auth.Authenticate(http.HandlerFunc(a.requestUserPortalAccountDeletion)))
 	root.Handle("GET /v1/account/deletion-requests/{requestId}", a.Auth.Authenticate(http.HandlerFunc(a.getUserPortalAccountDeletion)))
 	root.Handle("POST /v1/account/deletion-requests/{requestId}/cancel", a.Auth.Authenticate(http.HandlerFunc(a.cancelUserPortalAccountDeletion)))
 	root.Handle("/v1/", a.Auth.Authenticate(a.idempotency(trusted)))
 	return traceMiddleware(root)
+}
+
+// retiredTerminalHistory keeps legacy clients on an explicit upgrade path.
+// Terminal history is owned and served by the online Windows host over the
+// negotiated host_history_v1 realtime capability; this server accepts neither
+// new terminal-history objects nor reads of the retired database tables.
+func retiredTerminalHistory(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Upgrade", "host_history_v1")
+	writeError(
+		w,
+		r,
+		http.StatusUpgradeRequired,
+		"CLIENT_UPGRADE_REQUIRED",
+		errors.New("terminal history is served by the Windows host"),
+	)
 }
 
 type registerAccountRequest struct {
@@ -1653,7 +1673,7 @@ func (a *API) createHistoryUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	digest, err := base64.RawURLEncoding.DecodeString(input.CiphertextSHA256)
-	if err != nil || len(digest) != sha256.Size || len(input.KeyID) < 8 || len(input.KeyID) > 128 || input.SizeBytes < 1 || input.SizeBytes > history.MaxObjectBytes {
+	if err != nil || len(digest) != sha256.Size || len(input.KeyID) < 8 || len(input.KeyID) > 128 || input.SizeBytes < 1 || input.SizeBytes > maxLegacyHistoryObjectBytes {
 		writeError(w, r, http.StatusBadRequest, "INVALID_HISTORY_METADATA", errors.New("invalid ciphertext metadata"))
 		return
 	}
