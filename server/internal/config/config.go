@@ -40,6 +40,9 @@ const (
 	defaultRedisReadTimeout  = 3 * time.Second
 	defaultRedisWriteTimeout = 3 * time.Second
 	defaultRedisPoolTimeout  = 4 * time.Second
+
+	RuntimeModeDistributed = "distributed"
+	RuntimeModeSingleNode  = "single-node"
 )
 
 var (
@@ -72,8 +75,10 @@ func (Secret) GoString() string { return "[REDACTED]" }
 // Config is the validated production server configuration. Values ending in
 // Secret, URL, or Key are loaded from secret files and are redacted by String.
 type Config struct {
+	RuntimeMode                    string
 	PublicURL                      string
 	OIDCIssuer                     string
+	OIDCBackchannelIssuer          string
 	OIDCClientID                   string
 	OIDCAllowedParties             []string
 	AndroidOIDCClientID            string
@@ -135,9 +140,11 @@ type Config struct {
 // secret paths as well as secret values, because paths can contain identifying
 // deployment information and are not needed in normal startup diagnostics.
 func (c Config) String() string {
-	return fmt.Sprintf("Config{PublicURL:%q OIDCIssuer:%q OIDCClientID:%q OIDCAllowedParties:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q WindowsOIDCClientID:%q WindowsRegistrationOIDCParties:%q WindowsOIDCRedirectURI:%q WebOIDCClientID:%q WebOIDCStepUpClientID:%q WebOIDCRedirectURI:%q HumanVerificationProvider:%q HumanVerificationSiteKey:%q HumanVerificationSecret:%s OIDCClientSecret:%s KeycloakAdminClientSecret:%s KeycloakAdminClientID:%q KeycloakAdminBaseURL:%q RegistrationRecoveryEnabled:%t AccountDeletionEnabled:%t AccountDeletionIdentityKeyVersion:%d DatabaseURL:%s RedisURL:%s TokenSigningKey:%s PostgresMaxConns:%d PostgresMinConns:%d PostgresMaxConnLifetime:%s PostgresMaxConnIdleTime:%s PostgresHealthCheckPeriod:%s PostgresConnectTimeout:%s RedisPoolSize:%d RedisMinIdleConns:%d RedisDialTimeout:%s RedisReadTimeout:%s RedisWriteTimeout:%s RedisPoolTimeout:%s LogLevel:%q ListenAddr:%q MetricsListenAddr:%q}",
+	return fmt.Sprintf("Config{RuntimeMode:%q PublicURL:%q OIDCIssuer:%q OIDCBackchannelIssuer:%q OIDCClientID:%q OIDCAllowedParties:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q WindowsOIDCClientID:%q WindowsRegistrationOIDCParties:%q WindowsOIDCRedirectURI:%q WebOIDCClientID:%q WebOIDCStepUpClientID:%q WebOIDCRedirectURI:%q HumanVerificationProvider:%q HumanVerificationSiteKey:%q HumanVerificationSecret:%s OIDCClientSecret:%s KeycloakAdminClientSecret:%s KeycloakAdminClientID:%q KeycloakAdminBaseURL:%q RegistrationRecoveryEnabled:%t AccountDeletionEnabled:%t AccountDeletionIdentityKeyVersion:%d DatabaseURL:%s RedisURL:%s TokenSigningKey:%s PostgresMaxConns:%d PostgresMinConns:%d PostgresMaxConnLifetime:%s PostgresMaxConnIdleTime:%s PostgresHealthCheckPeriod:%s PostgresConnectTimeout:%s RedisPoolSize:%d RedisMinIdleConns:%d RedisDialTimeout:%s RedisReadTimeout:%s RedisWriteTimeout:%s RedisPoolTimeout:%s LogLevel:%q ListenAddr:%q MetricsListenAddr:%q}",
+		c.RuntimeMode,
 		c.PublicURL,
 		c.OIDCIssuer,
+		c.OIDCBackchannelIssuer,
 		c.OIDCClientID,
 		c.OIDCAllowedParties,
 		c.AndroidOIDCClientID,
@@ -283,8 +290,10 @@ func clearAccountDeletionIdentityKeys(keys map[int16][]byte) {
 // obtain secrets from a managed secret provider instead of files. Production
 // startup should use Load, which enforces file permissions.
 type Input struct {
+	RuntimeMode                    string
 	PublicURL                      string
 	OIDCIssuer                     string
+	OIDCBackchannelIssuer          string
 	OIDCClientID                   string
 	OIDCAllowedParties             []string
 	AndroidOIDCClientID            string
@@ -333,8 +342,10 @@ type Input struct {
 // it does not read environment variables or secret files.
 func New(input Input) (Config, error) {
 	return validate(Config{
+		RuntimeMode:                       strings.ToLower(strings.TrimSpace(input.RuntimeMode)),
 		PublicURL:                         strings.TrimSpace(input.PublicURL),
 		OIDCIssuer:                        strings.TrimSpace(input.OIDCIssuer),
+		OIDCBackchannelIssuer:             strings.TrimSpace(input.OIDCBackchannelIssuer),
 		OIDCClientID:                      strings.TrimSpace(input.OIDCClientID),
 		OIDCAllowedParties:                append([]string(nil), input.OIDCAllowedParties...),
 		AndroidOIDCClientID:               strings.TrimSpace(input.AndroidOIDCClientID),
@@ -464,6 +475,7 @@ func LoadSource(source Source) (Config, error) {
 		return strings.TrimSpace(value)
 	}
 
+	runtimeMode := strings.ToLower(lookupOptional("TERMLINK_RUNTIME_MODE", RuntimeModeDistributed))
 	publicURL, err := lookupRequired("TERMLINK_PUBLIC_URL")
 	if err != nil {
 		return Config{}, err
@@ -472,6 +484,7 @@ func LoadSource(source Source) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	oidcBackchannelIssuer := lookupOptional("TERMLINK_OIDC_BACKCHANNEL_ISSUER", oidcIssuer)
 	oidcClientID, err := lookupRequired("TERMLINK_OIDC_CLIENT_ID")
 	if err != nil {
 		return Config{}, err
@@ -575,9 +588,12 @@ func LoadSource(source Source) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	redisURL, err := readSecret(source, "TERMLINK_REDIS_URL_FILE")
-	if err != nil {
-		return Config{}, err
+	var redisURL Secret
+	if runtimeMode != RuntimeModeSingleNode {
+		redisURL, err = readSecret(source, "TERMLINK_REDIS_URL_FILE")
+		if err != nil {
+			return Config{}, err
+		}
 	}
 	tokenSigningKey, err := readSecret(source, "TERMLINK_TOKEN_SIGNING_KEY_FILE")
 	if err != nil {
@@ -606,8 +622,10 @@ func LoadSource(source Source) (Config, error) {
 	}
 
 	return validate(Config{
+		RuntimeMode:                       runtimeMode,
 		PublicURL:                         publicURL,
 		OIDCIssuer:                        oidcIssuer,
+		OIDCBackchannelIssuer:             oidcBackchannelIssuer,
 		OIDCClientID:                      oidcClientID,
 		OIDCAllowedParties:                oidcAllowedParties,
 		AndroidOIDCClientID:               androidOIDCClientID,
@@ -719,10 +737,23 @@ func parseDurationRange(name, value string, minimum, maximum time.Duration) (tim
 }
 
 func validate(c Config) (Config, error) {
+	c.RuntimeMode = strings.ToLower(strings.TrimSpace(c.RuntimeMode))
+	if c.RuntimeMode == "" {
+		c.RuntimeMode = RuntimeModeDistributed
+	}
+	if c.RuntimeMode != RuntimeModeDistributed && c.RuntimeMode != RuntimeModeSingleNode {
+		return Config{}, fmt.Errorf("%w: TERMLINK_RUNTIME_MODE", ErrInvalid)
+	}
 	if err := validateHTTPSURL("TERMLINK_PUBLIC_URL", c.PublicURL); err != nil {
 		return Config{}, err
 	}
 	if err := validateHTTPSURL("TERMLINK_OIDC_ISSUER", c.OIDCIssuer); err != nil {
+		return Config{}, err
+	}
+	if strings.TrimSpace(c.OIDCBackchannelIssuer) == "" {
+		c.OIDCBackchannelIssuer = c.OIDCIssuer
+	}
+	if err := validateOIDCBackchannelIssuer(c.OIDCIssuer, c.OIDCBackchannelIssuer); err != nil {
 		return Config{}, err
 	}
 	c.HumanVerificationProvider = strings.ToLower(strings.TrimSpace(c.HumanVerificationProvider))
@@ -870,7 +901,7 @@ func validate(c Config) (Config, error) {
 	if c.DatabaseURL.Empty() {
 		return Config{}, fmt.Errorf("%w: TERMLINK_DATABASE_URL_FILE", ErrSecret)
 	}
-	if c.RedisURL.Empty() {
+	if c.RuntimeMode == RuntimeModeDistributed && c.RedisURL.Empty() {
 		return Config{}, fmt.Errorf("%w: TERMLINK_REDIS_URL_FILE", ErrSecret)
 	}
 	if c.TokenSigningKey.Empty() {
@@ -1035,6 +1066,37 @@ func validateHTTPSURL(name, value string) error {
 	}
 	parsed, _ := url.Parse(strings.TrimSpace(value))
 	if !strings.EqualFold(parsed.Scheme, "https") {
+		return fmt.Errorf("%w: %s", ErrInvalid, name)
+	}
+	return nil
+}
+
+func validateOIDCBackchannelIssuer(publicIssuer, value string) error {
+	const name = "TERMLINK_OIDC_BACKCHANNEL_ISSUER"
+	public, publicErr := url.Parse(strings.TrimRight(strings.TrimSpace(publicIssuer), "/"))
+	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(value), "/"))
+	if publicErr != nil || parsed == nil || err != nil || parsed.Opaque != "" || parsed.Host == "" ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" ||
+		(parsed.Scheme != "https" && parsed.Scheme != "http") ||
+		strings.Contains(parsed.Path, "\\") || strings.Contains(parsed.Path, "//") {
+		return fmt.Errorf("%w: %s", ErrInvalid, name)
+	}
+	if strings.Trim(parsed.Path, "/") != "" {
+		for _, segment := range strings.Split(strings.Trim(parsed.Path, "/"), "/") {
+			if segment == "" || segment == "." || segment == ".." {
+				return fmt.Errorf("%w: %s", ErrInvalid, name)
+			}
+		}
+	}
+	if parsed.Scheme == "http" {
+		if parsed.Port() == "" || !isLoopbackOrSingleLabelHost(parsed.Hostname()) {
+			return fmt.Errorf("%w: %s", ErrInvalid, name)
+		}
+	}
+	// A same-origin HTTPS issuer remains the ordinary distributed-provider
+	// path. A distinct HTTPS backchannel may be a private service mesh name.
+	if strings.EqualFold(parsed.Scheme, public.Scheme) && strings.EqualFold(parsed.Host, public.Host) &&
+		strings.TrimRight(parsed.Path, "/") != strings.TrimRight(public.Path, "/") {
 		return fmt.Errorf("%w: %s", ErrInvalid, name)
 	}
 	return nil

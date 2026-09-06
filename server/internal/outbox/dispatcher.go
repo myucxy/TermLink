@@ -16,7 +16,7 @@ import (
 
 type Dispatcher struct {
 	Store  *store.Postgres
-	Valkey *kv.Valkey
+	Valkey kv.Coordinator
 	Logger *slog.Logger
 }
 
@@ -111,5 +111,5 @@ func (d Dispatcher) publishAggregate(ctx context.Context, channel string, id *uu
 	if d.Valkey == nil {
 		return errors.New("authority invalidation store is unavailable")
 	}
-	return d.Valkey.Client.Publish(ctx, channel, id.String()).Err()
+	return d.Valkey.Publish(ctx, channel, *id)
 }

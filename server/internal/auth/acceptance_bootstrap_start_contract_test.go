@@ -179,3 +179,40 @@ func TestAcceptanceDirectShadowUsesIsolatedPrewarmedState(t *testing.T) {
 		}
 	}
 }
+
+func TestAcceptanceSingleNodeKeepsDurableServicesAndEmbedsCoordination(t *testing.T) {
+	startData, err := os.ReadFile("../../ops/Start-ProductionAcceptance.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlayData, err := os.ReadFile("../../compose/acceptance.single-node.compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := string(startData)
+	overlay := strings.ReplaceAll(string(overlayData), "\r\n", "\n")
+	for _, contract := range []string{
+		"[switch]$SingleNode",
+		"compose\\acceptance.single-node.compose.yml",
+		"TERMLINK_SINGLE_NODE_DIRECT_TRANSPORT_ENABLED = 'true'",
+		"$EnableDirectTransportShadow -or $SingleNode",
+		"if (-not $SingleNode) { $oneShotServices += 'migrate' }",
+	} {
+		if !strings.Contains(start, contract) {
+			t.Fatalf("single-node acceptance startup omitted %q", contract)
+		}
+	}
+	for _, contract := range []string{
+		"lucky-upstream:\n    profiles: [\"distributed-runtime\"]",
+		"valkey:\n    profiles: [\"distributed-runtime\"]",
+		"migrate:\n    profiles: [\"distributed-runtime\"]",
+		"TERMLINK_RUNTIME_MODE: single-node",
+		"TERMLINK_OIDC_BACKCHANNEL_ISSUER: http://keycloak:8080/realms/termlink",
+		"TERMLINK_REDIS_URL_FILE: !reset null",
+		"TERMLINK_DIRECT_REDIS_URL_FILE: !reset null",
+	} {
+		if !strings.Contains(overlay, contract) {
+			t.Fatalf("single-node acceptance overlay omitted %q", contract)
+		}
+	}
+}

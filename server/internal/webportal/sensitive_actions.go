@@ -127,7 +127,7 @@ func (p *Portal) requireStrongAccountAction(w http.ResponseWriter, r *http.Reque
 	}
 	slot, slotOK := r.Context().Value(sensitiveActionContextKey{}).(*sensitiveActionSlot)
 	if !slotOK || slot == nil || slot.action == "" {
-		p.rejectSensitiveAction(w, r, account, http.StatusServiceUnavailable, "audit_unavailable", "账号操作暂不可用", "安全审计配置不完整，请稍后重试。")
+		p.rejectSensitiveAction(w, r, account, http.StatusServiceUnavailable, "audit_unavailable", "账号操作暂不可用", "操作记录配置不完整，请稍后重试。")
 		return webSession{}, store.PortalAccount{}, false
 	}
 	reason := ensureSensitiveActionReason(r.Form, slot.action)
@@ -190,7 +190,7 @@ func (p *Portal) requireSensitiveConsoleAction(w http.ResponseWriter, r *http.Re
 	}
 	slot, slotOK := r.Context().Value(sensitiveActionContextKey{}).(*sensitiveActionSlot)
 	if !slotOK || slot == nil || slot.action == "" {
-		p.rejectSensitiveAction(w, r, account, http.StatusServiceUnavailable, "idempotency_unavailable", "管理请求暂不可用", "安全审计或幂等保护暂不可用，请稍后重试。")
+		p.rejectSensitiveAction(w, r, account, http.StatusServiceUnavailable, "idempotency_unavailable", "管理请求暂不可用", "操作记录或幂等保护暂不可用，请稍后重试。")
 		return webSession{}, store.PortalAccount{}, false
 	}
 	reason := ensureSensitiveActionReason(r.Form, slot.action)
@@ -205,13 +205,13 @@ func (p *Portal) requireSensitiveConsoleAction(w http.ResponseWriter, r *http.Re
 	}
 	repository, repositoryOK := p.config.Repository.(sensitiveActionRepository)
 	if !repositoryOK {
-		p.rejectSensitiveAction(w, r, account, http.StatusServiceUnavailable, "idempotency_unavailable", "管理请求暂不可用", "安全审计或幂等保护暂不可用，请稍后重试。")
+		p.rejectSensitiveAction(w, r, account, http.StatusServiceUnavailable, "idempotency_unavailable", "管理请求暂不可用", "操作记录或幂等保护暂不可用，请稍后重试。")
 		return webSession{}, store.PortalAccount{}, false
 	}
 	requestHash := sensitiveRequestHash(slot.action, r.Form)
 	claim, err := repository.ClaimIdempotency(r.Context(), account.ID, key, requestHash)
 	if err != nil {
-		p.rejectSensitiveAction(w, r, account, http.StatusServiceUnavailable, "idempotency_unavailable", "管理请求暂不可用", "安全审计或幂等保护暂不可用，请稍后重试。")
+		p.rejectSensitiveAction(w, r, account, http.StatusServiceUnavailable, "idempotency_unavailable", "管理请求暂不可用", "操作记录或幂等保护暂不可用，请稍后重试。")
 		return webSession{}, store.PortalAccount{}, false
 	}
 	if !claim.Claimed {

@@ -29,6 +29,7 @@ var (
 
 type KeycloakAdminConfig struct {
 	Issuer               string
+	BackchannelIssuer    string
 	AdminBaseURL         string
 	ClientID             string
 	ClientSecret         string
@@ -104,9 +105,16 @@ func NewKeycloakAdminClient(config KeycloakAdminConfig) (*KeycloakAdminClient, e
 	// behavior at this security boundary.
 	isolatedClient := *client
 	isolatedClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
-	token := *issuer
+	tokenIssuer := issuer
+	if strings.TrimSpace(config.BackchannelIssuer) != "" {
+		tokenIssuer, err = parseKeycloakBackchannelIssuer(config.BackchannelIssuer, realm)
+		if err != nil {
+			return nil, err
+		}
+	}
+	token := *tokenIssuer
 	token.Path = strings.TrimRight(token.Path, "/") + "/protocol/openid-connect/token"
-	adminBase, err := keycloakAdminBaseURL(config.AdminBaseURL, issuer)
+	adminBase, err := keycloakAdminBaseURL(config.AdminBaseURL, tokenIssuer)
 	if err != nil {
 		return nil, err
 	}
@@ -121,6 +129,23 @@ func NewKeycloakAdminClient(config KeycloakAdminConfig) (*KeycloakAdminClient, e
 		clientSecret: config.ClientSecret, proofKey: append([]byte(nil), config.RegistrationProofKey...),
 		requestTimeout: timeout, http: &isolatedClient, clock: time.Now,
 	}, nil
+}
+
+func parseKeycloakBackchannelIssuer(raw, realm string) (*url.URL, error) {
+	issuer, err := url.Parse(strings.TrimRight(strings.TrimSpace(raw), "/"))
+	if err != nil || issuer == nil || issuer.Opaque != "" || issuer.Host == "" || issuer.User != nil ||
+		issuer.RawQuery != "" || issuer.Fragment != "" || issuer.RawPath != "" ||
+		(issuer.Scheme != "https" && issuer.Scheme != "http") {
+		return nil, errors.New("Keycloak backchannel issuer is invalid")
+	}
+	parts := strings.Split(strings.Trim(issuer.Path, "/"), "/")
+	if len(parts) < 2 || parts[len(parts)-2] != "realms" || parts[len(parts)-1] != realm {
+		return nil, errors.New("Keycloak backchannel issuer must identify the public realm")
+	}
+	if issuer.Scheme == "http" && (issuer.Port() == "" || !isLoopbackOrSingleLabelHost(issuer.Hostname())) {
+		return nil, errors.New("Keycloak backchannel HTTP issuer must target a loopback or single-label private service")
+	}
+	return issuer, nil
 }
 
 func keycloakAdminBaseURL(raw string, issuer *url.URL) (*url.URL, error) {

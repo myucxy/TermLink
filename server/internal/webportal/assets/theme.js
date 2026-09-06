@@ -120,8 +120,8 @@
           ? (roleSelect?.selectedOptions?.[0]?.textContent?.trim() || "新角色")
           : (roleSelect?.value || "the selected role");
         message = isChineseUI
-          ? `确认将 ${account} 的角色改为 ${role}？该变更会立即生效并写入安全审计。`
-          : `Change ${account} to ${role}? This takes effect immediately and is recorded in the security audit.`;
+          ? `确认将 ${account} 的角色改为 ${role}？该变更会立即生效并写入操作记录。`
+          : `Change ${account} to ${role}? This takes effect immediately and is recorded.`;
       } else if (action === "lock") {
         message = isChineseUI
           ? `确认停用 ${account}？其门户访问和新会话将被拒绝。`

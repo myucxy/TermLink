@@ -60,7 +60,7 @@ const pairingCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 type API struct {
 	Store                 *store.Postgres
-	Valkey                *kv.Valkey
+	Valkey                kv.Coordinator
 	Tokens                auth.TokenVerifier
 	Auth                  auth.Middleware
 	SubjectKey            []byte
@@ -860,7 +860,7 @@ func (a *API) revokeDevice(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	_ = a.Valkey.Client.Publish(r.Context(), "device-revoked", target.String()).Err()
+	_ = a.Valkey.Publish(r.Context(), "device-revoked", target)
 	writeJSON(w, 200, map[string]any{"status": "REVOKED"})
 }
 
@@ -1028,7 +1028,7 @@ func (a *API) upsertPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if result.ReplacedDeviceID != nil && a.Valkey != nil {
-		_ = a.Valkey.Client.Publish(r.Context(), "device-revoked", result.ReplacedDeviceID.String()).Err()
+		_ = a.Valkey.Publish(r.Context(), "device-revoked", *result.ReplacedDeviceID)
 	}
 	writeJSON(w, 200, map[string]any{"id": result.ID, "key_epoch": result.KeyEpoch})
 }
@@ -1212,7 +1212,7 @@ func (a *API) putGrant(w http.ResponseWriter, r *http.Request) {
 				slog.String("target_device_id", deviceID.String()), slog.String("pc_id", pcID.String()))
 		}
 	}
-	_ = a.Valkey.Client.Publish(r.Context(), "device-authorization-changed", deviceID.String()).Err()
+	_ = a.Valkey.Publish(r.Context(), "device-authorization-changed", deviceID)
 	writeJSON(w, 200, map[string]any{"permission": input.Permission})
 }
 
@@ -1243,7 +1243,7 @@ func (a *API) deleteGrant(w http.ResponseWriter, r *http.Request) {
 				slog.String("target_device_id", deviceID.String()), slog.String("session_id", sessionID.String()))
 		}
 	}
-	_ = a.Valkey.Client.Publish(r.Context(), "device-authorization-changed", deviceID.String()).Err()
+	_ = a.Valkey.Publish(r.Context(), "device-authorization-changed", deviceID)
 	w.WriteHeader(http.StatusNoContent)
 }
 

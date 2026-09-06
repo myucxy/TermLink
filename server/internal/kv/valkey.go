@@ -13,7 +13,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-type Valkey struct{ Client *redis.Client }
+type Valkey struct {
+	Client        *redis.Client
+	LeaseVersions LeaseVersionSource
+}
 
 type OpenOptions struct {
 	PoolSize     int
@@ -69,6 +72,61 @@ func (v *Valkey) Ping(ctx context.Context) error { return v.Client.Ping(ctx).Err
 func (v *Valkey) Consume(ctx context.Context, scope, nonce string, ttl time.Duration) (bool, error) {
 	return v.Client.SetNX(ctx, "proof:"+scope+":"+nonce, "1", ttl).Result()
 }
+
+var fixedWindowRateScript = redis.NewScript(`
+local current=redis.call('GET',KEYS[1])
+if current and tonumber(current)>=tonumber(ARGV[1]) then return 0 end
+current=redis.call('INCR',KEYS[1])
+if current==1 then redis.call('PEXPIRE',KEYS[1],ARGV[2]) end
+return 1`)
+
+func (v *Valkey) Allow(ctx context.Context, key string, limit int64, window time.Duration) (bool, error) {
+	if key == "" || limit < 1 || window <= 0 {
+		return false, errors.New("invalid rate limit request")
+	}
+	allowed, err := fixedWindowRateScript.Run(ctx, v.Client, []string{key}, limit, window.Milliseconds()).Int64()
+	return allowed == 1, err
+}
+
+func (v *Valkey) Publish(ctx context.Context, channel string, id uuid.UUID) error {
+	if channel == "" || id == uuid.Nil {
+		return errors.New("authority notification is invalid")
+	}
+	return v.Client.Publish(ctx, channel, id.String()).Err()
+}
+
+func (v *Valkey) Subscribe(ctx context.Context, channels ...string) (AuthoritySubscription, error) {
+	if len(channels) == 0 {
+		return nil, errors.New("authority notification channels are required")
+	}
+	for _, channel := range channels {
+		if channel == "" {
+			return nil, errors.New("authority notification channel is empty")
+		}
+	}
+	subscription := v.Client.Subscribe(ctx, channels...)
+	if _, err := subscription.Receive(ctx); err != nil {
+		_ = subscription.Close()
+		return nil, err
+	}
+	return &valkeyAuthoritySubscription{subscription: subscription}, nil
+}
+
+type valkeyAuthoritySubscription struct{ subscription *redis.PubSub }
+
+func (s *valkeyAuthoritySubscription) Receive(ctx context.Context) (AuthorityMessage, error) {
+	message, err := s.subscription.ReceiveMessage(ctx)
+	if err != nil {
+		return AuthorityMessage{}, err
+	}
+	id, err := uuid.Parse(message.Payload)
+	if err != nil || id == uuid.Nil {
+		return AuthorityMessage{}, errors.New("invalid authority notification payload")
+	}
+	return AuthorityMessage{Channel: message.Channel, ID: id}, nil
+}
+
+func (s *valkeyAuthoritySubscription) Close() error { return s.subscription.Close() }
 
 type Lease struct {
 	SessionID      uuid.UUID `json:"session_id"`
@@ -184,7 +242,20 @@ if current then
   redis.call('PEXPIREAT',KEYS[3],expires)
   return current
 end
-local version=redis.call('INCR',KEYS[2])
+local version
+if ARGV[4] and ARGV[4]~='' then
+  local numeric_version=tonumber(ARGV[4])
+  if not numeric_version or numeric_version<1 or numeric_version>9007199254740991 or math.floor(numeric_version)~=numeric_version then
+    return redis.error_reply('invalid durable lease version')
+  end
+  -- Lua numbers are doubles and tostring() switches large safe integers to
+  -- scientific notation. Preserve PostgreSQL's canonical decimal text on the
+  -- wire so every client parses the exact fencing token.
+  version=ARGV[4]
+  redis.call('SET',KEYS[2],version)
+else
+  version=redis.call('INCR',KEYS[2])
+end
 local value=ARGV[1]..'|'..ARGV[2]..'|'..version
 redis.call('PSETEX',KEYS[1],ARGV[3],value)
 redis.call('DEL',KEYS[3])
@@ -200,8 +271,19 @@ return value`)
 func (v *Valkey) Acquire(ctx context.Context, sessionID, holderID uuid.UUID, duration time.Duration) (Lease, error) {
 	key := "lease:" + sessionID.String()
 	leaseID := uuid.New()
+	version := ""
+	if v.LeaseVersions != nil {
+		allocated, err := v.LeaseVersions.NextControlLeaseVersion(ctx)
+		if err != nil {
+			return Lease{}, fmt.Errorf("allocate durable lease version: %w", err)
+		}
+		if allocated < 1 {
+			return Lease{}, errors.New("durable lease version is invalid")
+		}
+		version = strconv.FormatInt(allocated, 10)
+	}
 	now := time.Now().UTC()
-	value, err := acquireScript.Run(ctx, v.Client, []string{key, key + ":version", key + ":participants"}, holderID.String(), leaseID.String(), duration.Milliseconds()).Text()
+	value, err := acquireScript.Run(ctx, v.Client, []string{key, key + ":version", key + ":participants"}, holderID.String(), leaseID.String(), duration.Milliseconds(), version).Text()
 	if errors.Is(err, redis.Nil) {
 		return Lease{}, ErrLeaseHeld
 	}

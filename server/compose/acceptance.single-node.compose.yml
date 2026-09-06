@@ -1,0 +1,58 @@
+# Explicit single-node acceptance overlay. It preserves Keycloak and PostgreSQL
+# data while moving coordination, Direct signalling, migrations, and public
+# Keycloak routing into TermLink Server. The distributed services remain in the
+# base file behind an inactive profile for immediate rollback.
+services:
+  postgres:
+    restart: unless-stopped
+
+  lucky-upstream:
+    profiles: ["distributed-runtime"]
+
+  valkey:
+    profiles: ["distributed-runtime"]
+
+  migrate:
+    profiles: ["distributed-runtime"]
+
+  server-secrets-init:
+    command:
+      - >-
+        for name in oidc_client_secret database_url token_signing_key; do
+          rm -f "/target/$$name";
+          cp "/run/secrets/$$name" "/target/$$name";
+          chmod 0400 "/target/$$name";
+          chown 65532:65532 "/target/$$name";
+        done;
+        rm -f /target/redis_url /target/direct_redis_url /target/acceptance-root-ca.crt;
+        test -s /target/keycloak_admin_client_secret;
+        chown 0:0 /target/keycloak_admin_client_secret;
+        chmod 0400 /target/keycloak_admin_client_secret;
+        chown 65532:65532 /target/keycloak_admin_client_secret
+    secrets: !override
+      - oidc_client_secret
+      - database_url
+      - token_signing_key
+    depends_on: !override
+      keycloak-init:
+        condition: service_completed_successfully
+
+  server:
+    restart: unless-stopped
+    environment:
+      TERMLINK_RUNTIME_MODE: single-node
+      TERMLINK_OIDC_BACKCHANNEL_ISSUER: http://keycloak:8080/realms/termlink
+      TERMLINK_DIRECT_TRANSPORT_ENABLED: ${TERMLINK_SINGLE_NODE_DIRECT_TRANSPORT_ENABLED:-true}
+      TERMLINK_DIRECT_STUN_SERVERS: ${TERMLINK_SINGLE_NODE_DIRECT_STUN_SERVERS:-stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302}
+      TERMLINK_REDIS_URL_FILE: !reset null
+      TERMLINK_DIRECT_REDIS_URL_FILE: !reset null
+      SSL_CERT_FILE: !reset null
+    ports:
+      - "${TERMLINK_SINGLE_NODE_BIND_IP:-0.0.0.0}:${TERMLINK_SINGLE_NODE_PORT:-8080}:8080"
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      keycloak-init:
+        condition: service_completed_successfully
+      server-secrets-init:
+        condition: service_completed_successfully

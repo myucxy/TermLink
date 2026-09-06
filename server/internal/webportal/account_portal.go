@@ -49,7 +49,6 @@ type userPortalPageData struct {
 	PendingEmail              string
 	EmailChallengeID          uuid.UUID
 	EmailChallengeExpiresAt   time.Time
-	Announcements             []store.WebAnnouncement
 }
 
 func (p *Portal) accountDashboard(w http.ResponseWriter, r *http.Request) {
@@ -105,14 +104,6 @@ func (p *Portal) loadUserPortalPage(ctx context.Context, repository userPortalRe
 		CanOpenConsole: account.Role.CanOpenConsole() && consoleURL != "", ConsoleURL: consoleURL,
 		IdentityAccountURL: "/account/identity", CSRF: session.CSRF, Section: section,
 		SectionTitle: userPortalSectionTitle(section), IdempotencyKey: idempotencyKey, Notice: notice,
-	}
-	if announcementRepository, available := p.config.Repository.(interface {
-		ListActiveWebAnnouncements(context.Context, int) ([]store.WebAnnouncement, error)
-	}); available {
-		data.Announcements, err = announcementRepository.ListActiveWebAnnouncements(ctx, 5)
-		if err != nil {
-			return userPortalPageData{}, err
-		}
 	}
 	data.ProfileChangeAvailable = p.config.IdentityProfiles != nil
 	if p.config.ServiceEmail != nil {

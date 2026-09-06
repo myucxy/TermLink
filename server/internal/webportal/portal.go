@@ -47,7 +47,6 @@ const (
 	recentLoginTTL          = 10 * time.Minute
 	sensitiveActionTTL      = 20 * time.Minute
 	maximumCookieSize       = 3800
-	recentAuditLimit        = 7
 	themeQueryParameter     = "termlink_theme"
 )
 
@@ -58,6 +57,7 @@ var portalAssets embed.FS
 type Config struct {
 	PublicURL                 string
 	Issuer                    string
+	BackchannelIssuer         string
 	ClientID                  string
 	WindowsClientID           string
 	StepUpClientID            string
@@ -255,19 +255,17 @@ type adminPageData struct {
 	Role                   store.Role
 	RoleLabel              string
 	CSRF                   string
+	AdminBasePath          string
 	Section                string
 	SectionTitle           string
 	CanManageAccounts      bool
 	Dashboard              store.PortalAdminDashboard
-	RecentAuditEvents      []store.PortalAuditEvent
 	IdentityAccountURL     string
 	PublicURL              string
 	Issuer                 string
 	Notice                 string
 	ActionNonce            string
 	SystemVersions         SystemVersions
-	Announcements          []store.WebAnnouncement
-	CanManageAnnouncements bool
 	ServiceEmail           serviceemail.AdminView
 	HumanVerification      humanverification.AdminView
 	AdminRoute             adminroute.View
@@ -297,15 +295,9 @@ func New(ctx context.Context, config Config) (*Portal, error) {
 	if err != nil {
 		return nil, err
 	}
-	provider, err := oidc.NewProvider(ctx, config.Issuer)
+	discovery, err := auth.DiscoverOIDC(ctx, config.Issuer, config.BackchannelIssuer)
 	if err != nil {
 		return nil, fmt.Errorf("discover web OIDC issuer: %w", err)
-	}
-	var discovery struct {
-		EndSessionEndpoint string `json:"end_session_endpoint"`
-	}
-	if err := provider.Claims(&discovery); err != nil {
-		return nil, fmt.Errorf("decode web OIDC discovery: %w", err)
 	}
 	accountURL := strings.TrimRight(config.Issuer, "/") + "/account/"
 	accountQuery := url.Values{}
@@ -315,16 +307,16 @@ func New(ctx context.Context, config Config) (*Portal, error) {
 	flow := &productionOIDCFlow{
 		oauthConfig: oauth2.Config{
 			ClientID:    config.ClientID,
-			Endpoint:    provider.Endpoint(),
+			Endpoint:    discovery.Endpoint(),
 			RedirectURL: config.RedirectURI,
 			Scopes:      []string{oidc.ScopeOpenID, "profile", "email"},
 		},
-		verifier: provider.Verifier(&oidc.Config{ClientID: config.ClientID}),
+		verifier: discovery.Verifier(config.ClientID),
 		stepUpOAuthConfig: oauth2.Config{
-			ClientID: config.StepUpClientID, Endpoint: provider.Endpoint(), RedirectURL: config.RedirectURI,
+			ClientID: config.StepUpClientID, Endpoint: discovery.Endpoint(), RedirectURL: config.RedirectURI,
 			Scopes: []string{oidc.ScopeOpenID, "profile", "email"},
 		},
-		stepUpVerifier:     provider.Verifier(&oidc.Config{ClientID: config.StepUpClientID}),
+		stepUpVerifier:     discovery.Verifier(config.StepUpClientID),
 		issuer:             strings.TrimRight(config.Issuer, "/"),
 		clientID:           config.ClientID,
 		publicURL:          strings.TrimRight(config.PublicURL, "/"),
@@ -359,9 +351,6 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 		"userPortalDeletionCanConfirm": userPortalDeletionCanConfirm,
 		"userPortalDeletionCanCancel":  userPortalDeletionCanCancel,
 		"actionKey":                    sensitiveActionKey,
-		"formatAnnouncementTimeInput":  formatAnnouncementTimeInput,
-		"announcementSeverityLabel":    announcementSeverityLabel,
-		"announcementStatusLabel":      announcementStatusLabel,
 	}).ParseFS(portalAssets, "assets/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("parse web portal templates: %w", err)
@@ -601,9 +590,6 @@ func (p *Portal) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/registration/invitations/codes/{id}/status", p.sensitiveAction("registration.invitation_code.status", p.adminSetInvitationCodeStatus))
 	mux.HandleFunc("POST /admin/accounts/{id}/role", p.sensitiveAction("admin.account.role.update", p.adminUpdateRole))
 	mux.HandleFunc("POST /admin/accounts/{id}/status", p.sensitiveAction("admin.account.status.update", p.adminUpdateStatus))
-	mux.HandleFunc("POST /admin/announcements", p.sensitiveAction("announcement.create", p.adminCreateAnnouncement))
-	mux.HandleFunc("POST /admin/announcements/{id}", p.sensitiveAction("announcement.update", p.adminUpdateAnnouncement))
-	mux.HandleFunc("POST /admin/announcements/{id}/transition", p.sensitiveAction("announcement.transition", p.adminTransitionAnnouncement))
 	mux.HandleFunc("POST /admin/settings/service-email", p.sensitiveAction("admin.service_email.update", p.adminUpdateServiceEmail))
 	mux.HandleFunc("POST /admin/settings/human-verification", p.sensitiveAction("admin.human_verification.update", p.adminUpdateHumanVerification))
 	mux.HandleFunc("POST /admin/settings/admin-route", p.sensitiveAction("admin.route.update", p.adminUpdateRoute))
@@ -940,13 +926,17 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	adminBasePath, err := p.adminBasePath(r.Context())
+	if err != nil {
+		p.internalError(w, err)
+		return
+	}
 	section := normalizeAdminSection(r.URL.Query().Get("section"))
 	if section == "settings" && account.Role != store.RoleSuperAdmin {
 		p.renderError(w, http.StatusForbidden, "需要超级管理员", "系统安全设置仅允许 SUPER_ADMIN 查看和修改。")
 		return
 	}
 	var dashboard store.PortalAdminDashboard
-	var err error
 	if repository, ok := p.config.Repository.(sectionPortalRepository); ok {
 		dashboard, err = repository.PortalAdminSection(r.Context(), account.ID, section)
 	} else {
@@ -959,19 +949,6 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 	var systemVersions SystemVersions
 	if section == "versions" {
 		systemVersions = p.systemVersions.Load(r.Context())
-	}
-	var announcements []store.WebAnnouncement
-	if section == "announcements" {
-		repository, available := p.config.Repository.(announcementRepository)
-		if !available {
-			p.renderError(w, http.StatusServiceUnavailable, "公告管理暂不可用", "当前服务端尚未完成公告存储配置。")
-			return
-		}
-		announcements, err = repository.ListAdminWebAnnouncements(r.Context(), account.ID, 100)
-		if err != nil {
-			p.internalError(w, err)
-			return
-		}
 	}
 	var serviceEmailSettings serviceemail.AdminView
 	if section == "settings" && p.config.ServiceEmail != nil {
@@ -997,37 +974,31 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	recentAuditEvents := dashboard.AuditEvents
-	if len(recentAuditEvents) > recentAuditLimit {
-		recentAuditEvents = recentAuditEvents[:recentAuditLimit]
-	}
 	actionNonce, err := randomText(24)
 	if err != nil {
 		p.internalError(w, err)
 		return
 	}
 	p.render(w, http.StatusOK, "admin.html", adminPageData{
-		Username:               session.Username,
-		Role:                   account.Role,
-		RoleLabel:              roleLabel(account.Role),
-		CSRF:                   session.CSRF,
-		Section:                section,
-		SectionTitle:           adminSectionTitle(section),
-		CanManageAccounts:      account.Role.CanManageAccounts(),
-		Dashboard:              dashboard,
-		RecentAuditEvents:      recentAuditEvents,
-		IdentityAccountURL:     "/account/identity",
-		PublicURL:              strings.TrimRight(p.config.PublicURL, "/"),
-		Issuer:                 strings.TrimRight(p.config.Issuer, "/"),
-		Notice:                 adminNotice(r.URL.Query().Get("notice")),
-		ActionNonce:            actionNonce,
-		SystemVersions:         systemVersions,
-		Announcements:          announcements,
-		CanManageAnnouncements: account.Role.IsAdministrator(),
-		ServiceEmail:           serviceEmailSettings,
-		HumanVerification:      humanVerificationSettings,
-		AdminRoute:             adminRoute,
-		CanConfigureSystem:     account.Role == store.RoleSuperAdmin,
+		Username:           session.Username,
+		Role:               account.Role,
+		RoleLabel:          roleLabel(account.Role),
+		CSRF:               session.CSRF,
+		AdminBasePath:      adminBasePath,
+		Section:            section,
+		SectionTitle:       adminSectionTitle(section),
+		CanManageAccounts:  account.Role.CanManageAccounts(),
+		Dashboard:          dashboard,
+		IdentityAccountURL: "/account/identity",
+		PublicURL:          strings.TrimRight(p.config.PublicURL, "/"),
+		Issuer:             strings.TrimRight(p.config.Issuer, "/"),
+		Notice:             adminNotice(r.URL.Query().Get("notice")),
+		ActionNonce:        actionNonce,
+		SystemVersions:     systemVersions,
+		ServiceEmail:       serviceEmailSettings,
+		HumanVerification:  humanVerificationSettings,
+		AdminRoute:         adminRoute,
+		CanConfigureSystem: account.Role == store.RoleSuperAdmin,
 	})
 }
 
@@ -1788,7 +1759,7 @@ func (p *Portal) handleAdminMutationError(w http.ResponseWriter, err error) {
 
 func normalizeAdminSection(value string) string {
 	switch value {
-	case "overview", "connections", "deployment", "versions", "announcements", "audit", "identity", "accounts", "settings":
+	case "overview", "connections", "deployment", "versions", "identity", "accounts", "settings":
 		return value
 	default:
 		return "overview"
@@ -1798,9 +1769,7 @@ func normalizeAdminSection(value string) string {
 func adminSectionTitle(section string) string {
 	return map[string]string{
 		"overview": "运行概览", "connections": "连接与路由", "deployment": "Docker 部署",
-		"versions":      "系统版本",
-		"announcements": "公告管理",
-		"audit":         "安全审计", "identity": "身份与安全",
+		"versions": "系统版本", "identity": "身份与安全",
 		"accounts": "账号与角色",
 		"settings": "系统设置",
 	}[normalizeAdminSection(section)]
@@ -1809,23 +1778,15 @@ func adminSectionTitle(section string) string {
 func adminNotice(value string) string {
 	switch value {
 	case "role-updated":
-		return bilingualPortalNotice("账号角色已更新，并已写入安全审计。", "The account role was updated and recorded in the security audit.")
+		return bilingualPortalNotice("账号角色已更新，并已写入操作记录。", "The account role was updated and recorded.")
 	case "status-updated":
-		return bilingualPortalNotice("账号状态已更新，并已写入安全审计。", "The account status was updated and recorded in the security audit.")
+		return bilingualPortalNotice("账号状态已更新，并已写入操作记录。", "The account status was updated and recorded.")
 	case "service-email-updated":
 		return bilingualPortalNotice("测试邮件已发送，服务邮箱配置和功能开关已发布。", "The test email was sent, and the service email settings are now active.")
 	case "human-verification-updated":
 		return bilingualPortalNotice("注册人机验证设置已更新并立即生效。", "Registration human-verification settings were updated and are active immediately.")
 	case "admin-route-updated":
 		return bilingualPortalNotice("管理中心安全入口已经更新，旧入口已立即失效。请将新地址保存在受信任的密码管理器中。", "The secure admin route was updated and the old route is no longer valid. Store the new address in a trusted password manager.")
-	case "announcement-created":
-		return bilingualPortalNotice("公告草稿已创建；确认内容与生效时间后再发布。", "The announcement draft was created. Review its content and schedule before publishing.")
-	case "announcement-updated":
-		return bilingualPortalNotice("公告内容已更新并写入安全审计。", "The announcement was updated and recorded in the security audit.")
-	case "announcement-published":
-		return bilingualPortalNotice("公告已发布，将按设定的生效时间向用户展示。", "The announcement was published and will appear at its scheduled time.")
-	case "announcement-archived":
-		return bilingualPortalNotice("公告已下线，用户中心不再展示。", "The announcement was archived and is no longer shown in the account portal.")
 	default:
 		return ""
 	}

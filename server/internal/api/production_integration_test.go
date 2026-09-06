@@ -267,14 +267,14 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	writeEnvelope(t, androidSocket, unsubscribe)
 	readEnvelope(t, pcSocket)
 	drainRouteEvents(routeEvents)
-	writeEnvelope(t, pcSocket, testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 2))
-	waitRouteEvent(t, routeEvents, "pc_to_android", realtimewire.OutputChunk)
-	resubscribe := testEnvelope(android, pc, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 3)
+	lateOutput := testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 2)
+	writeEnvelope(t, pcSocket, lateOutput)
+	waitRouteEvent(t, routeEvents, "pc_to_android", realtimewire.OutputChunk, "accepted")
+	resubscribe := testEnvelopeWithACK(android, pc, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 3, 1)
 	writeEnvelope(t, androidSocket, resubscribe)
 	readEnvelope(t, pcSocket)
-	resumedOutput := testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 3)
-	writeEnvelope(t, pcSocket, resumedOutput)
-	if got := readEnvelope(t, androidSocket); !bytes.Equal(got, resumedOutput) {
+	writeEnvelope(t, pcSocket, lateOutput)
+	if got := readEnvelope(t, androidSocket); !bytes.Equal(got, lateOutput) {
 		t.Fatal("PC connection did not survive stale post-unsubscribe output")
 	}
 
@@ -290,13 +290,14 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	if _, err := repository.Pool.Exec(ctx, `UPDATE device_grants SET expires_at=now()+interval '500 milliseconds' WHERE device_id=$1 AND pc_id=$2`, android.id, pcID); err != nil {
 		t.Fatal(err)
 	}
-	expiringSubscribe := testEnvelope(android, pc, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 5)
+	expiringSubscribe := testEnvelopeWithACK(android, pc, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 5, 2)
 	writeEnvelope(t, androidSocket, expiringSubscribe)
 	readEnvelope(t, pcSocket)
 	time.Sleep(750 * time.Millisecond)
 	drainRouteEvents(routeEvents)
-	writeEnvelope(t, pcSocket, testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 4))
-	waitRouteEvent(t, routeEvents, "pc_to_android", realtimewire.OutputChunk)
+	expiredOutput := testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 3)
+	writeEnvelope(t, pcSocket, expiredOutput)
+	waitRouteEvent(t, routeEvents, "pc_to_android", realtimewire.OutputChunk, "denied")
 	signedJSON(t, server.URL, pc, http.MethodPost, "/v1/pcs/"+pcID.String()+"/grants", map[string]any{
 		"device_id": android.id, "permission": "CONTROL",
 	}, "restore-expired-grant", http.StatusOK)
@@ -304,12 +305,11 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	waitAuthorityEvent(t, authorityEvents, "device-authorization-changed")
 	restoredAndroidSocket := dialRealtime(t, server.URL, android, "android")
 	defer restoredAndroidSocket.Close()
-	restoredSubscribe := testEnvelope(android, pc, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 4)
+	restoredSubscribe := testEnvelopeWithACK(android, pc, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 4, 2)
 	writeEnvelope(t, restoredAndroidSocket, restoredSubscribe)
 	readEnvelope(t, pcSocket)
-	restoredOutput := testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 5)
-	writeEnvelope(t, pcSocket, restoredOutput)
-	if got := readEnvelope(t, restoredAndroidSocket); !bytes.Equal(got, restoredOutput) {
+	writeEnvelope(t, pcSocket, expiredOutput)
+	if got := readEnvelope(t, restoredAndroidSocket); !bytes.Equal(got, expiredOutput) {
 		t.Fatal("PC connection did not survive expired subscription cleanup")
 	}
 
@@ -321,16 +321,16 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	}
 	waitConnectionClosed(t, connectionEvents, "android")
 	drainRouteEvents(routeEvents)
-	writeEnvelope(t, pcSocket, testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 6))
-	waitRouteEvent(t, routeEvents, "pc_to_android", realtimewire.OutputChunk)
+	disconnectedOutput := testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 4)
+	writeEnvelope(t, pcSocket, disconnectedOutput)
+	waitRouteEvent(t, routeEvents, "pc_to_android", realtimewire.OutputChunk, "accepted")
 	reconnectedAndroidSocket := dialRealtime(t, server.URL, android, "android")
 	defer reconnectedAndroidSocket.Close()
-	reconnectSubscribe := testEnvelope(android, pc, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 5)
+	reconnectSubscribe := testEnvelopeWithACK(android, pc, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 5, 3)
 	writeEnvelope(t, reconnectedAndroidSocket, reconnectSubscribe)
 	readEnvelope(t, pcSocket)
-	reconnectedOutput := testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 7)
-	writeEnvelope(t, pcSocket, reconnectedOutput)
-	if got := readEnvelope(t, reconnectedAndroidSocket); !bytes.Equal(got, reconnectedOutput) {
+	writeEnvelope(t, pcSocket, disconnectedOutput)
+	if got := readEnvelope(t, reconnectedAndroidSocket); !bytes.Equal(got, disconnectedOutput) {
 		t.Fatal("PC connection did not survive physical Android disconnect")
 	}
 
@@ -507,19 +507,23 @@ func waitAuthorityEvent(t *testing.T, events <-chan string, expected string) {
 	}
 }
 
-func waitRouteEvent(t *testing.T, events <-chan string, direction string, messageType realtimewire.MessageType) {
+func waitRouteEvent(t *testing.T, events <-chan string, direction string, messageType realtimewire.MessageType, result string) {
 	t.Helper()
-	want := direction + ":" + strconv.FormatUint(uint64(messageType), 10) + ":"
+	want := direction + ":" + strconv.FormatUint(uint64(messageType), 10) + ":" + result
+	seen := make([]string, 0, 8)
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	for {
 		select {
 		case event := <-events:
-			if strings.HasPrefix(event, want) {
+			if event == want {
 				return
 			}
+			if len(seen) < cap(seen) {
+				seen = append(seen, event)
+			}
 		case <-timer.C:
-			t.Fatalf("production route event %q was not observed", want)
+			t.Fatalf("production route event %q was not observed; saw %v", want, seen)
 		}
 	}
 }
@@ -668,7 +672,11 @@ func dialRealtime(t *testing.T, root string, device testDevice, role string) *we
 }
 
 func testEnvelope(sender, recipient testDevice, sessionID uuid.UUID, messageType realtimewire.MessageType, direction realtimewire.Direction, sequence uint64) []byte {
-	envelope := realtimewire.Envelope{ProtocolVersion: 1, MessageType: messageType, SessionID: sessionID[:], SenderDeviceID: sender.id[:], RecipientDeviceID: recipient.id[:], Direction: direction, Sequence: sequence, SentAtMS: time.Now().UnixMilli(), KeyID: []byte("epoch-01"), Nonce: bytes.Repeat([]byte{byte(sequence)}, 12), Ciphertext: bytes.Repeat([]byte{0x44}, 32)}
+	return testEnvelopeWithACK(sender, recipient, sessionID, messageType, direction, sequence, 0)
+}
+
+func testEnvelopeWithACK(sender, recipient testDevice, sessionID uuid.UUID, messageType realtimewire.MessageType, direction realtimewire.Direction, sequence, ack uint64) []byte {
+	envelope := realtimewire.Envelope{ProtocolVersion: 1, MessageType: messageType, SessionID: sessionID[:], SenderDeviceID: sender.id[:], RecipientDeviceID: recipient.id[:], Direction: direction, Sequence: sequence, ACK: ack, SentAtMS: time.Now().UnixMilli(), KeyID: []byte("epoch-01"), Nonce: bytes.Repeat([]byte{byte(sequence)}, 12), Ciphertext: bytes.Repeat([]byte{0x44}, 32)}
 	encoded, err := envelope.Marshal()
 	if err != nil {
 		panic(err)

@@ -1,0 +1,941 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+readonly SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+readonly SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+readonly MARKER_VALUE='termlink-single-node-production-v1'
+readonly DEFAULT_DATA_DIR='/opt/termlink'
+readonly DEFAULT_BACKUP_DIR='/var/backups/termlink'
+readonly SECRET_NAMES=(
+  postgres-password
+  keycloak-db-password
+  keycloak-bootstrap-admin-password
+  initial-admin-password
+  keycloak-admin-client-secret
+  oidc-client-secret
+  database-url
+  token-signing-key
+  account-deletion-identity-key
+)
+
+DATA_DIR=''
+RUNTIME_DIR=''
+SECRETS_DIR=''
+CONFIG_FILE=''
+TLS_MODE=''
+PUBLIC_HOST=''
+PUBLIC_URL=''
+ADMIN_EMAIL=''
+IMAGE=''
+HTTP_PORT=''
+HTTPS_PORT=''
+BACKUP_RECIPIENT=''
+RESTORE_ACTIVE=0
+TEMP_PATHS=()
+COMPOSE=()
+COMPOSE_ALL=()
+
+log() {
+  printf '[TermLink] %s\n' "$*"
+}
+
+warn() {
+  printf '[TermLink] WARNING: %s\n' "$*" >&2
+}
+
+die() {
+  printf '[TermLink] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+cleanup() {
+  local path
+  set +e
+  for path in "${TEMP_PATHS[@]:-}"; do
+    [[ -n "$path" && -d "$path" ]] && rm -rf -- "$path"
+  done
+  return 0
+}
+
+on_error() {
+  local status=$?
+  if [[ "$RESTORE_ACTIVE" == 1 && ${#COMPOSE_ALL[@]} -gt 0 ]]; then
+    set +e
+    warn 'restore failed; application and identity services will remain stopped'
+    "${COMPOSE_ALL[@]}" stop edge server keycloak >/dev/null 2>&1
+  fi
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap on_error ERR
+
+show_help() {
+  cat <<'EOF'
+TermLink single-node production deployment
+
+Usage:
+  termlink-deploy install --domain HOST --email EMAIL --image IMAGE [options]
+  termlink-deploy upgrade [--image IMAGE] [--data-dir DIR] [--skip-backup]
+  termlink-deploy doctor [--data-dir DIR]
+  termlink-deploy backup [--data-dir DIR] [--recipient AGE_RECIPIENT] [--output FILE]
+  termlink-deploy restore --input FILE --identity FILE --confirm-restore [--data-dir DIR]
+  termlink-deploy credentials [--data-dir DIR]
+  termlink-deploy config [options]
+  termlink-deploy uninstall --keep-data [--data-dir DIR]
+
+Install/config options:
+  --domain HOST              Public DNS name.
+  --email EMAIL              ACME contact and initial administrator e-mail.
+  --image IMAGE              docker.io/myucxy/termlink:TAG@sha256:DIGEST.
+  --data-dir DIR             Managed deployment directory (default: /opt/termlink).
+  --tls managed|external     Use built-in Caddy or an external TLS proxy.
+  --http-port PORT           Loopback origin port (default: 8080).
+  --https-port PORT          Public HTTPS port for managed TLS (default: 443).
+  --backup-recipient VALUE   Native age recipient used by backup and upgrade.
+  --restore FILE             Restore this v3 archive during a fresh install.
+  --identity FILE            age identity for --restore.
+
+The external TLS mode exposes only the loopback HTTP origin. Configure your
+host reverse proxy to forward the public HTTPS host to 127.0.0.1:HTTP_PORT.
+EOF
+}
+
+need_root() {
+  [[ "${EUID:-$(id -u)}" == 0 ]] || die 'run this command as root (for example with sudo)'
+}
+
+need_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
+}
+
+validate_port() {
+  local value="$1"
+  local name="$2"
+  [[ "$value" =~ ^[0-9]+$ && "$value" -ge 1 && "$value" -le 65535 ]] || \
+    die "$name must be an integer from 1 through 65535"
+}
+
+validate_domain() {
+  local value="${1,,}"
+  local label
+  [[ ${#value} -le 253 && "$value" == *.* ]] || die 'domain must be a fully qualified DNS name'
+  [[ ! "$value" =~ (^|\.)(localhost|invalid|test|example)$ ]] || die 'reserved test domains are not allowed'
+  [[ ! "$value" =~ (^|\.)example\.(com|net|org)$ ]] || die 'reserved example domains are not allowed'
+  IFS='.' read -r -a labels <<<"$value"
+  for label in "${labels[@]}"; do
+    [[ "$label" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || die "invalid DNS label in domain: $label"
+  done
+}
+
+validate_email() {
+  [[ "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ && ${#1} -le 320 ]] || \
+    die 'email is not syntactically valid'
+}
+
+validate_image() {
+  [[ "$1" =~ ^docker\.io/myucxy/termlink:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}@sha256:[0-9a-f]{64}$ ]] || \
+    die 'image must be docker.io/myucxy/termlink:TAG@sha256:<64 lowercase hex characters>'
+}
+
+validate_recipient() {
+  [[ "$1" =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{50,100}$ ]] || \
+    die 'backup recipient must be a native age X25519 recipient'
+}
+
+canonical_data_dir() {
+  local requested="$1"
+  local canonical
+  local lexical
+  [[ "$requested" == /* ]] || die 'data directory must be an absolute path'
+  [[ ! "$requested" =~ [[:space:]#=] ]] || die 'data directory cannot contain whitespace, #, or ='
+  canonical="$(realpath -m -- "$requested")"
+  lexical="$(realpath -ms -- "$requested")"
+  [[ "$canonical" == "$lexical" ]] || die 'data directory path cannot contain symbolic links'
+  [[ "$canonical" != / ]] || die 'data directory cannot be the filesystem root'
+  [[ "$canonical" != /root && "$canonical" != /home ]] || die 'data directory cannot be a home directory root'
+  while IFS=: read -r _ _ _ _ _ home _; do
+    [[ -z "$home" || "$canonical" != "$(realpath -m -- "$home")" ]] || \
+      die 'data directory cannot be a user home directory'
+  done < <(getent passwd 2>/dev/null || true)
+  printf '%s' "$canonical"
+}
+
+set_paths() {
+  DATA_DIR="$(canonical_data_dir "${1:-${TERMLINK_DATA_DIR:-$DEFAULT_DATA_DIR}}")"
+  RUNTIME_DIR="$DATA_DIR/runtime"
+  SECRETS_DIR="$DATA_DIR/secrets"
+  CONFIG_FILE="$DATA_DIR/config.env"
+}
+
+assert_managed_dir() {
+  [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" ]] || die "managed data directory does not exist: $DATA_DIR"
+  [[ -f "$DATA_DIR/.termlink-managed" && ! -L "$DATA_DIR/.termlink-managed" ]] || \
+    die "managed directory marker is missing: $DATA_DIR"
+  [[ "$(<"$DATA_DIR/.termlink-managed")" == "$MARKER_VALUE" ]] || \
+    die "managed directory marker is invalid: $DATA_DIR"
+}
+
+config_get() {
+  local name="$1"
+  local line
+  line="$(grep -E "^${name}=" "$CONFIG_FILE" | tail -n 1 || true)"
+  [[ -n "$line" ]] || die "configuration value is missing: $name"
+  printf '%s' "${line#*=}"
+}
+
+load_config() {
+  assert_managed_dir
+  [[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] || die "configuration file is missing: $CONFIG_FILE"
+  [[ -d "$RUNTIME_DIR" && ! -L "$RUNTIME_DIR" ]] || die 'runtime directory is missing or unsafe'
+  [[ -d "$SECRETS_DIR" && ! -L "$SECRETS_DIR" ]] || die 'secret directory is missing or unsafe'
+  [[ "$(stat -c '%a' "$DATA_DIR")" == 700 ]] || die 'managed data directory must have mode 0700'
+  [[ "$(stat -c '%a' "$RUNTIME_DIR")" == 700 ]] || die 'runtime directory must have mode 0700'
+  [[ "$(stat -c '%a' "$SECRETS_DIR")" == 700 ]] || die 'secret directory must have mode 0700'
+  [[ "$(stat -c '%a' "$CONFIG_FILE")" == 600 ]] || die 'configuration file must have mode 0600'
+  [[ "$(config_get TERMLINK_CONFIG_VERSION)" == 1 ]] || die 'unsupported deployment configuration version'
+  PUBLIC_HOST="$(config_get TERMLINK_PUBLIC_HOST)"
+  PUBLIC_URL="$(config_get TERMLINK_PUBLIC_URL)"
+  ADMIN_EMAIL="$(config_get TERMLINK_ADMIN_EMAIL)"
+  IMAGE="$(config_get TERMLINK_IMAGE)"
+  TLS_MODE="$(config_get TERMLINK_TLS_MODE)"
+  HTTP_PORT="$(config_get TERMLINK_HTTP_PORT)"
+  HTTPS_PORT="$(config_get TERMLINK_HTTPS_PORT)"
+  BACKUP_RECIPIENT="$(grep -E '^TERMLINK_BACKUP_RECIPIENT=' "$CONFIG_FILE" | tail -n 1 | cut -d= -f2- || true)"
+  [[ "$(config_get TERMLINK_RUNTIME_DIR)" == "$RUNTIME_DIR" ]] || die 'runtime directory does not match the managed path'
+  [[ "$(config_get TERMLINK_SECRETS_DIR)" == "$SECRETS_DIR" ]] || die 'secret directory does not match the managed path'
+  validate_domain "$PUBLIC_HOST"
+  validate_email "$ADMIN_EMAIL"
+  validate_image "$IMAGE"
+  validate_port "$HTTP_PORT" TERMLINK_HTTP_PORT
+  validate_port "$HTTPS_PORT" TERMLINK_HTTPS_PORT
+  [[ "$TLS_MODE" == managed || "$TLS_MODE" == external ]] || die 'invalid TLS mode in configuration'
+  [[ -z "$BACKUP_RECIPIENT" ]] || validate_recipient "$BACKUP_RECIPIENT"
+  local expected_public_url="https://$PUBLIC_HOST"
+  [[ "$HTTPS_PORT" == 443 ]] || expected_public_url="$expected_public_url:$HTTPS_PORT"
+  [[ "$PUBLIC_URL" == "$expected_public_url" ]] || die 'public URL does not match the configured host and HTTPS port'
+}
+
+write_config() {
+  local tmp="$DATA_DIR/.config.env.tmp.$$"
+  local public_url="https://$PUBLIC_HOST"
+  if [[ "$HTTPS_PORT" != 443 ]]; then
+    public_url="$public_url:$HTTPS_PORT"
+  fi
+  PUBLIC_URL="$public_url"
+  cat > "$tmp" <<EOF
+TERMLINK_CONFIG_VERSION=1
+COMPOSE_PROJECT_NAME=termlink
+TERMLINK_IMAGE=$IMAGE
+TERMLINK_RUNTIME_DIR=$RUNTIME_DIR
+TERMLINK_SECRETS_DIR=$SECRETS_DIR
+TERMLINK_PUBLIC_HOST=$PUBLIC_HOST
+TERMLINK_PUBLIC_URL=$PUBLIC_URL
+TERMLINK_ADMIN_EMAIL=$ADMIN_EMAIL
+TERMLINK_TLS_MODE=$TLS_MODE
+TERMLINK_HTTP_BIND_IP=127.0.0.1
+TERMLINK_HTTP_PORT=$HTTP_PORT
+TERMLINK_HTTPS_BIND_IP=0.0.0.0
+TERMLINK_HTTPS_PORT=$HTTPS_PORT
+TERMLINK_BACKUP_RECIPIENT=$BACKUP_RECIPIENT
+EOF
+  chmod 0600 "$tmp"
+  mv -f -- "$tmp" "$CONFIG_FILE"
+}
+
+source_package_dir() {
+  if [[ -f "$SCRIPT_DIR/compose.yml" && -f "$SCRIPT_DIR/keycloak-realm.json" ]]; then
+    printf '%s' "$SCRIPT_DIR"
+  elif [[ -f "$SCRIPT_DIR/runtime/compose.yml" && -f "$SCRIPT_DIR/runtime/keycloak-realm.json" ]]; then
+    printf '%s' "$SCRIPT_DIR/runtime"
+  else
+    die 'deployment runtime assets were not found beside the deployment tool'
+  fi
+}
+
+install_runtime_assets() {
+  local package_dir
+  local server_dir
+  local theme_source=''
+  local identity_source=''
+  package_dir="$(source_package_dir)"
+  install -d -m 0700 "$RUNTIME_DIR"
+  if [[ "$(realpath -m -- "$package_dir")" == "$(realpath -m -- "$RUNTIME_DIR")" ]]; then
+    for name in compose.yml Caddyfile Keycloak.Dockerfile keycloak-realm.json \
+      keycloak-user-profile.json postgres-init.sh keycloak-reconcile.sh identity.css \
+      termlink-app-icon.svg termlink-favicon.svg; do
+      [[ -f "$RUNTIME_DIR/$name" && ! -L "$RUNTIME_DIR/$name" ]] || \
+        die "installed runtime asset is missing or unsafe: $name"
+    done
+    [[ -d "$RUNTIME_DIR/keycloak-theme" && ! -L "$RUNTIME_DIR/keycloak-theme" ]] || \
+      die 'installed Keycloak theme is missing or unsafe'
+    return
+  fi
+  if [[ "$(realpath -m -- "$SCRIPT_PATH")" != "$(realpath -m -- "$DATA_DIR/termlink-deploy")" ]]; then
+    install -m 0700 "$SCRIPT_PATH" "$DATA_DIR/termlink-deploy"
+  fi
+  for name in compose.yml Caddyfile Keycloak.Dockerfile keycloak-realm.json keycloak-user-profile.json; do
+    [[ -f "$package_dir/$name" ]] || die "deployment asset is missing: $name"
+    install -m 0600 "$package_dir/$name" "$RUNTIME_DIR/$name"
+  done
+  for name in postgres-init.sh keycloak-reconcile.sh; do
+    [[ -f "$package_dir/$name" ]] || die "deployment script is missing: $name"
+    install -m 0700 "$package_dir/$name" "$RUNTIME_DIR/$name"
+  done
+
+  server_dir="$(realpath -m -- "$package_dir/../..")"
+  if [[ -d "$server_dir/acceptance/keycloak-theme/termlink" ]]; then
+    theme_source="$server_dir/acceptance/keycloak-theme/termlink"
+    identity_source="$server_dir/internal/webportal/assets"
+  elif [[ -d "$package_dir/keycloak-theme" ]]; then
+    theme_source="$package_dir/keycloak-theme"
+    identity_source="$package_dir"
+  elif [[ -d "$RUNTIME_DIR/keycloak-theme" && -f "$RUNTIME_DIR/identity.css" ]]; then
+    return
+  else
+    die 'Keycloak theme sources are missing from the deployment package'
+  fi
+
+  if [[ "$(realpath -m -- "$theme_source")" != "$(realpath -m -- "$RUNTIME_DIR/keycloak-theme")" ]]; then
+    [[ ! -L "$RUNTIME_DIR/keycloak-theme" ]] || die 'runtime theme path cannot be a symbolic link'
+    rm -rf -- "$RUNTIME_DIR/keycloak-theme"
+    cp -a -- "$theme_source" "$RUNTIME_DIR/keycloak-theme"
+  fi
+  for name in identity.css termlink-app-icon.svg termlink-favicon.svg; do
+    [[ -f "$identity_source/$name" ]] || die "identity asset is missing: $name"
+    install -m 0600 "$identity_source/$name" "$RUNTIME_DIR/$name"
+  done
+  find "$RUNTIME_DIR/keycloak-theme" -type d -exec chmod 0700 {} +
+  find "$RUNTIME_DIR/keycloak-theme" -type f -exec chmod 0600 {} +
+}
+
+random_urlsafe() {
+  local bytes="${1:-32}"
+  openssl rand -base64 "$bytes" | tr '+/' '-_' | tr -d '=\r\n'
+}
+
+write_secret_if_missing() {
+  local name="$1"
+  local value="$2"
+  local path="$SECRETS_DIR/$name"
+  if [[ -e "$path" ]]; then
+    [[ -f "$path" && ! -L "$path" ]] || die "secret path is unsafe: $path"
+    return
+  fi
+  printf '%s' "$value" > "$path"
+  chmod 0600 "$path"
+}
+
+initialize_secrets() {
+  local postgres_password
+  install -d -m 0700 "$SECRETS_DIR"
+  write_secret_if_missing postgres-password "$(random_urlsafe 32)"
+  write_secret_if_missing keycloak-db-password "$(random_urlsafe 32)"
+  write_secret_if_missing keycloak-bootstrap-admin-password "$(random_urlsafe 32)"
+  write_secret_if_missing initial-admin-password "$(random_urlsafe 24)"
+  write_secret_if_missing keycloak-admin-client-secret "$(random_urlsafe 32)"
+  write_secret_if_missing oidc-client-secret "$(random_urlsafe 32)"
+  write_secret_if_missing token-signing-key "$(random_urlsafe 48)"
+  write_secret_if_missing account-deletion-identity-key "$(random_urlsafe 32)"
+  postgres_password="$(<"$SECRETS_DIR/postgres-password")"
+  write_secret_if_missing database-url \
+    "postgres://termlink:${postgres_password}@postgres:5432/termlink?sslmode=disable"
+  unset postgres_password
+  verify_secrets
+}
+
+verify_secrets() {
+  local name
+  local value
+  local mode
+  for name in "${SECRET_NAMES[@]}"; do
+    [[ -f "$SECRETS_DIR/$name" && ! -L "$SECRETS_DIR/$name" ]] || die "secret is missing or unsafe: $name"
+    mode="$(stat -c '%a' "$SECRETS_DIR/$name")"
+    [[ "$mode" == 600 || "$mode" == 400 ]] || die "secret $name must have mode 0600 or 0400"
+    value="$(<"$SECRETS_DIR/$name")"
+    [[ -n "$value" ]] || die "secret is empty: $name"
+  done
+  for name in postgres-password keycloak-db-password keycloak-bootstrap-admin-password \
+    initial-admin-password keycloak-admin-client-secret oidc-client-secret token-signing-key; do
+    value="$(<"$SECRETS_DIR/$name")"
+    [[ "$value" =~ ^[A-Za-z0-9_-]{32,128}$ ]] || die "secret has invalid encoding: $name"
+  done
+  value="$(<"$SECRETS_DIR/account-deletion-identity-key")"
+  [[ "$value" =~ ^[A-Za-z0-9_-]{43}$ ]] || die 'account deletion key is not an encoded AES-256 key'
+  value="$(<"$SECRETS_DIR/postgres-password")"
+  [[ "$(<"$SECRETS_DIR/database-url")" == \
+    "postgres://termlink:${value}@postgres:5432/termlink?sslmode=disable" ]] || \
+    die 'database URL does not match the PostgreSQL password'
+  unset value
+}
+
+build_compose_commands() {
+  local name
+  for name in COMPOSE_ENV_FILES COMPOSE_FILE COMPOSE_PROFILES COMPOSE_PROJECT_NAME \
+    TERMLINK_ADMIN_EMAIL TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS TERMLINK_APPSHIP_BASE_URL \
+    TERMLINK_CONTAINER_LOG_MAX_FILES TERMLINK_CONTAINER_LOG_MAX_SIZE TERMLINK_DIRECT_STUN_SERVERS \
+    TERMLINK_EDGE_CPU_LIMIT TERMLINK_EDGE_MEMORY_LIMIT TERMLINK_EDGE_MEMORY_RESERVATION \
+    TERMLINK_EDGE_PIDS_LIMIT TERMLINK_HTTP_BIND_IP TERMLINK_HTTP_PORT TERMLINK_HTTPS_BIND_IP \
+    TERMLINK_HTTPS_PORT TERMLINK_IMAGE TERMLINK_KEYCLOAK_CPU_LIMIT TERMLINK_KEYCLOAK_HEAP \
+    TERMLINK_KEYCLOAK_IMAGE TERMLINK_KEYCLOAK_MEMORY_LIMIT TERMLINK_KEYCLOAK_MEMORY_RESERVATION \
+    TERMLINK_KEYCLOAK_PIDS_LIMIT TERMLINK_LOG_LEVEL TERMLINK_POSTGRES_CPU_LIMIT \
+    TERMLINK_POSTGRES_MEMORY_LIMIT TERMLINK_POSTGRES_MEMORY_RESERVATION TERMLINK_POSTGRES_PIDS_LIMIT \
+    TERMLINK_POSTGRES_SHM_SIZE TERMLINK_PUBLIC_HOST TERMLINK_PUBLIC_URL TERMLINK_RUNTIME_DIR \
+    TERMLINK_SECRETS_DIR TERMLINK_SERVER_CPU_LIMIT TERMLINK_SERVER_MEMORY_LIMIT \
+    TERMLINK_SERVER_MEMORY_RESERVATION TERMLINK_SERVER_PIDS_LIMIT; do
+    unset "$name"
+  done
+  COMPOSE=(docker compose --project-directory "$RUNTIME_DIR" --project-name termlink \
+    --env-file "$CONFIG_FILE" -f "$RUNTIME_DIR/compose.yml")
+  COMPOSE_ALL=("${COMPOSE[@]}" --profile managed-tls)
+  if [[ "$TLS_MODE" == managed ]]; then
+    COMPOSE=("${COMPOSE[@]}" --profile managed-tls)
+  fi
+}
+
+verify_rendered_compose() {
+  local rendered
+  local value
+  local name
+  [[ -f "$RUNTIME_DIR/compose.yml" ]] || die 'runtime Compose file is missing'
+  rendered="$("${COMPOSE[@]}" config)"
+  [[ -n "$rendered" ]] || die 'Docker Compose rendered an empty configuration'
+  for name in "${SECRET_NAMES[@]}"; do
+    value="$(<"$SECRETS_DIR/$name")"
+    [[ "$rendered" != *"$value"* ]] || die "rendered Compose exposes secret $name"
+  done
+  unset rendered value
+}
+
+require_runtime() {
+  need_command docker
+  need_command curl
+  docker compose version >/dev/null
+  load_config
+  verify_secrets
+  build_compose_commands
+  verify_rendered_compose
+}
+
+stop_managed_edge_for_external_tls() {
+  if [[ "$TLS_MODE" == external ]]; then
+    "${COMPOSE_ALL[@]}" stop edge >/dev/null 2>&1 || true
+    "${COMPOSE_ALL[@]}" rm -f edge >/dev/null 2>&1 || true
+  fi
+}
+
+start_stack() {
+  log "pulling immutable Server image $IMAGE"
+  docker pull "$IMAGE"
+  stop_managed_edge_for_external_tls
+  "${COMPOSE_ALL[@]}" rm -f secrets-init keycloak-init >/dev/null 2>&1 || true
+  log 'starting PostgreSQL, Keycloak, and TermLink Server'
+  "${COMPOSE[@]}" up -d --build --wait --wait-timeout 420 --scale server=1
+  "${COMPOSE_ALL[@]}" rm -f secrets-init keycloak-init >/dev/null
+}
+
+assert_running_service() {
+  local service="$1"
+  local running
+  running="$("${COMPOSE_ALL[@]}" ps --services --filter status=running | grep -Fx "$service" | wc -l)"
+  [[ "$running" == 1 ]] || die "service is not running exactly once: $service"
+}
+
+doctor_runtime() {
+  local response
+  local migration
+  verify_rendered_compose
+  assert_running_service postgres
+  assert_running_service keycloak
+  assert_running_service server
+  if [[ "$TLS_MODE" == managed ]]; then
+    assert_running_service edge
+  fi
+  [[ "$("${COMPOSE_ALL[@]}" ps --services --filter status=running | grep -Fx server | wc -l)" == 1 ]] || \
+    die 'single-node deployment must run exactly one Server replica'
+
+  curl --fail --silent --show-error --max-time 10 \
+    "http://127.0.0.1:$HTTP_PORT/healthz" >/dev/null
+  curl --fail --silent --show-error --max-time 10 \
+    "http://127.0.0.1:$HTTP_PORT/readyz" >/dev/null
+  response="$(curl --fail --silent --show-error --max-time 10 \
+    -H "Host: $PUBLIC_HOST" \
+    "http://127.0.0.1:$HTTP_PORT/realms/termlink/.well-known/openid-configuration")"
+  [[ "$response" == *"$PUBLIC_URL/realms/termlink"* ]] || \
+    die 'OIDC discovery does not advertise the configured public URL'
+
+  migration="$("${COMPOSE_ALL[@]}" exec -T postgres psql -U termlink -d termlink \
+    -Atqc 'SELECT MAX(version) FROM schema_migrations')"
+  [[ "$migration" =~ ^[0-9]+$ ]] || die 'database migration state is unavailable'
+  log "deployment is healthy (database migration $migration)"
+  if [[ "$TLS_MODE" == managed ]]; then
+    curl --fail --silent --show-error --max-time 20 \
+      --resolve "$PUBLIC_HOST:$HTTPS_PORT:127.0.0.1" "$PUBLIC_URL/readyz" >/dev/null || \
+      die 'managed HTTPS is not ready; verify DNS, ports 80/443, and ACME reachability'
+    log "public HTTPS is ready at $PUBLIC_URL"
+  else
+    log "loopback origin is ready on 127.0.0.1:$HTTP_PORT; external TLS remains operator-managed"
+  fi
+}
+
+backup_runtime() {
+  local recipient="$1"
+  local output="$2"
+  local timestamp
+  local tmp
+  local payload
+  local output_dir
+  local encrypted_tmp
+  need_command age
+  need_command sha256sum
+  validate_recipient "$recipient"
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  [[ -n "$output" ]] || output="$DEFAULT_BACKUP_DIR/termlink-$timestamp.tar.age"
+  [[ "$output" == /* ]] || die 'backup output must be an absolute path'
+  output="$(realpath -m -- "$output")"
+  output_dir="$(dirname "$output")"
+  case "$output_dir/" in
+    "$DATA_DIR"/*) die 'backup output must be outside the managed data directory' ;;
+  esac
+  [[ ! -e "$output" && ! -e "$output.tmp" ]] || die "backup output already exists: $output"
+  install -d -m 0700 "$output_dir"
+
+  tmp="$(mktemp -d)"
+  TEMP_PATHS+=("$tmp")
+  payload="$tmp/payload"
+  encrypted_tmp="$tmp/backup.tar.age"
+  install -d -m 0700 "$payload/database" "$payload/secrets"
+  log 'dumping TermLink and Keycloak databases'
+  "${COMPOSE_ALL[@]}" exec -T postgres pg_dump -U termlink -Fc termlink \
+    > "$payload/database/termlink.dump"
+  "${COMPOSE_ALL[@]}" exec -T postgres pg_dump -U termlink -Fc keycloak \
+    > "$payload/database/keycloak.dump"
+  chmod 0600 "$payload/database/"*.dump
+  local name
+  for name in "${SECRET_NAMES[@]}"; do
+    install -m 0600 "$SECRETS_DIR/$name" "$payload/secrets/$name"
+  done
+  cat > "$payload/metadata.env" <<EOF
+TERMLINK_BACKUP_VERSION=3
+TERMLINK_BACKUP_CREATED_AT=$timestamp
+TERMLINK_BACKUP_IMAGE=$IMAGE
+TERMLINK_BACKUP_PUBLIC_URL=$PUBLIC_URL
+EOF
+  chmod 0600 "$payload/metadata.env"
+  (
+    cd "$payload"
+    find database secrets -type f -print0 | sort -z | xargs -0 sha256sum
+    sha256sum metadata.env
+  ) > "$payload/manifest.sha256"
+  chmod 0600 "$payload/manifest.sha256"
+  (
+    cd "$payload"
+    tar -cf - database secrets metadata.env manifest.sha256
+  ) | age --encrypt --recipient "$recipient" --output "$encrypted_tmp"
+  chmod 0600 "$encrypted_tmp"
+  mv -- "$encrypted_tmp" "$output"
+  log "encrypted backup created: $output"
+}
+
+allowed_archive_member() {
+  case "$1" in
+    database|database/|database/termlink.dump|database/keycloak.dump|secrets|secrets/|metadata.env|manifest.sha256) return 0 ;;
+  esac
+  local name
+  for name in "${SECRET_NAMES[@]}"; do
+    [[ "$1" == "secrets/$name" ]] && return 0
+  done
+  return 1
+}
+
+allowed_manifest_path() {
+  case "$1" in
+    database/termlink.dump|database/keycloak.dump|metadata.env) return 0 ;;
+  esac
+  local name
+  for name in "${SECRET_NAMES[@]}"; do
+    [[ "$1" == "secrets/$name" ]] && return 0
+  done
+  return 1
+}
+
+validate_restore_payload() {
+  local archive="$1"
+  local extract_dir="$2"
+  local member
+  local listing
+  local line
+  local relative
+  local -A seen=()
+  mapfile -t members < <(tar -tf "$archive")
+  [[ ${#members[@]} -gt 0 ]] || die 'backup archive is empty'
+  for member in "${members[@]}"; do
+    [[ "$member" != /* && "$member" != *'..'* && "$member" != *'\\'* ]] || \
+      die "backup archive contains an unsafe path: $member"
+    allowed_archive_member "$member" || die "backup archive contains an unexpected member: $member"
+  done
+  listing="$(tar -tvf "$archive")"
+  if printf '%s\n' "$listing" | awk 'substr($0,1,1) != "-" && substr($0,1,1) != "d" { print; exit }' | grep -q .; then
+    die 'backup archive contains a link or unsupported entry type'
+  fi
+  tar -xf "$archive" -C "$extract_dir" --no-same-owner --no-same-permissions
+  [[ "$(grep -E '^TERMLINK_BACKUP_VERSION=' "$extract_dir/metadata.env" | cut -d= -f2-)" == 3 ]] || \
+    die 'backup archive version is unsupported'
+
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[0-9a-f]{64}\ \ (.+)$ ]] || die 'backup manifest has invalid syntax'
+    relative="${BASH_REMATCH[1]}"
+    allowed_manifest_path "$relative" || die "backup manifest contains an unexpected path: $relative"
+    [[ -z "${seen[$relative]:-}" ]] || die "backup manifest contains a duplicate path: $relative"
+    seen["$relative"]=1
+  done < "$extract_dir/manifest.sha256"
+  for relative in database/termlink.dump database/keycloak.dump metadata.env; do
+    [[ "${seen[$relative]:-}" == 1 ]] || die "backup manifest is missing $relative"
+  done
+  local name
+  for name in "${SECRET_NAMES[@]}"; do
+    relative="secrets/$name"
+    [[ "${seen[$relative]:-}" == 1 ]] || die "backup manifest is missing $relative"
+  done
+  (cd "$extract_dir" && sha256sum --check --strict manifest.sha256 >/dev/null)
+}
+
+restore_runtime() {
+  local input="$1"
+  local identity="$2"
+  local confirmed="$3"
+  local tmp
+  local archive
+  local extract_dir
+  local name
+  local postgres_password
+  local keycloak_password
+  [[ "$confirmed" == true ]] || die 'restore requires --confirm-restore'
+  need_command age
+  need_command sha256sum
+  [[ -f "$input" && ! -L "$input" ]] || die "backup archive is missing or unsafe: $input"
+  [[ -f "$identity" && ! -L "$identity" ]] || die "age identity is missing or unsafe: $identity"
+  tmp="$(mktemp -d)"
+  TEMP_PATHS+=("$tmp")
+  archive="$tmp/backup.tar"
+  extract_dir="$tmp/extracted"
+  install -d -m 0700 "$extract_dir"
+  age --decrypt --identity "$identity" --output "$archive" "$input"
+  validate_restore_payload "$archive" "$extract_dir"
+
+  RESTORE_ACTIVE=1
+  log 'stopping application and identity services for restore'
+  "${COMPOSE_ALL[@]}" stop edge server keycloak >/dev/null 2>&1 || true
+  "${COMPOSE_ALL[@]}" rm -f secrets-init keycloak-init >/dev/null 2>&1 || true
+  "${COMPOSE_ALL[@]}" up -d --wait --wait-timeout 180 postgres
+
+  log 'restoring TermLink database'
+  "${COMPOSE_ALL[@]}" exec -T postgres dropdb -U termlink --if-exists --force termlink
+  "${COMPOSE_ALL[@]}" exec -T postgres createdb -U termlink -O termlink termlink
+  "${COMPOSE_ALL[@]}" exec -T postgres pg_restore -U termlink -d termlink \
+    --exit-on-error --no-acl < "$extract_dir/database/termlink.dump"
+
+  log 'restoring Keycloak database'
+  "${COMPOSE_ALL[@]}" exec -T postgres dropdb -U termlink --if-exists --force keycloak
+  "${COMPOSE_ALL[@]}" exec -T postgres createdb -U termlink -O keycloak keycloak
+  "${COMPOSE_ALL[@]}" exec -T postgres pg_restore -U termlink -d keycloak \
+    --exit-on-error --no-acl < "$extract_dir/database/keycloak.dump"
+
+  for name in "${SECRET_NAMES[@]}"; do
+    install -m 0600 "$extract_dir/secrets/$name" "$SECRETS_DIR/$name"
+  done
+  verify_secrets
+  postgres_password="$(<"$SECRETS_DIR/postgres-password")"
+  keycloak_password="$(<"$SECRETS_DIR/keycloak-db-password")"
+  printf "ALTER ROLE termlink LOGIN PASSWORD '%s';\nALTER ROLE keycloak LOGIN PASSWORD '%s';\n" \
+    "$postgres_password" "$keycloak_password" | \
+    "${COMPOSE_ALL[@]}" exec -T postgres psql -U termlink -d postgres --set=ON_ERROR_STOP=1 >/dev/null
+  unset postgres_password keycloak_password
+  printf 'restored\n' > "$DATA_DIR/.initial-credentials-claimed"
+  chmod 0600 "$DATA_DIR/.initial-credentials-claimed"
+
+  start_stack
+  doctor_runtime
+  RESTORE_ACTIVE=0
+  log 'restore completed; the current server domain configuration was preserved'
+}
+
+create_managed_layout() {
+  [[ ! -e "$DATA_DIR" ]] || die "install target already exists; use upgrade: $DATA_DIR"
+  install -d -m 0700 "$DATA_DIR" "$RUNTIME_DIR" "$SECRETS_DIR"
+  printf '%s' "$MARKER_VALUE" > "$DATA_DIR/.termlink-managed"
+  chmod 0600 "$DATA_DIR/.termlink-managed"
+  install -m 0700 "$SCRIPT_PATH" "$DATA_DIR/termlink-deploy"
+}
+
+command_install() {
+  local domain=''
+  local email=''
+  local image=''
+  local data_dir="${TERMLINK_DATA_DIR:-$DEFAULT_DATA_DIR}"
+  local tls=managed
+  local http_port=8080
+  local https_port=443
+  local recipient=''
+  local restore_input=''
+  local restore_identity=''
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --domain) domain="${2:-}"; shift 2 ;;
+      --email) email="${2:-}"; shift 2 ;;
+      --image) image="${2:-}"; shift 2 ;;
+      --data-dir) data_dir="${2:-}"; shift 2 ;;
+      --tls) tls="${2:-}"; shift 2 ;;
+      --http-port) http_port="${2:-}"; shift 2 ;;
+      --https-port) https_port="${2:-}"; shift 2 ;;
+      --backup-recipient) recipient="${2:-}"; shift 2 ;;
+      --restore) restore_input="${2:-}"; shift 2 ;;
+      --identity) restore_identity="${2:-}"; shift 2 ;;
+      -h|--help) show_help; return ;;
+      *) die "unknown install option: $1" ;;
+    esac
+  done
+  need_root
+  for command in realpath openssl install find getent docker curl; do need_command "$command"; done
+  [[ -n "$domain" && -n "$email" && -n "$image" ]] || \
+    die 'install requires --domain, --email, and --image'
+  validate_domain "$domain"
+  validate_email "$email"
+  validate_image "$image"
+  validate_port "$http_port" --http-port
+  validate_port "$https_port" --https-port
+  [[ "$tls" == managed || "$tls" == external ]] || die '--tls must be managed or external'
+  [[ -z "$recipient" ]] || validate_recipient "$recipient"
+  [[ -z "$restore_input" && -z "$restore_identity" ]] || \
+    [[ -n "$restore_input" && -n "$restore_identity" ]] || \
+    die '--restore and --identity must be supplied together'
+
+  set_paths "$data_dir"
+  create_managed_layout
+  PUBLIC_HOST="${domain,,}"
+  ADMIN_EMAIL="$email"
+  IMAGE="$image"
+  TLS_MODE="$tls"
+  HTTP_PORT="$http_port"
+  HTTPS_PORT="$https_port"
+  BACKUP_RECIPIENT="$recipient"
+  install_runtime_assets
+  initialize_secrets
+  write_config
+  build_compose_commands
+  verify_rendered_compose
+  if [[ -n "$restore_input" ]]; then
+    restore_runtime "$restore_input" "$restore_identity" true
+  else
+    start_stack
+    doctor_runtime
+    log "installation completed at $DATA_DIR"
+    log "run $DATA_DIR/termlink-deploy credentials once to view the initial administrator password"
+  fi
+}
+
+command_upgrade() {
+  local data_dir="${TERMLINK_DATA_DIR:-$DEFAULT_DATA_DIR}"
+  local new_image=''
+  local skip_backup=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --data-dir) data_dir="${2:-}"; shift 2 ;;
+      --image) new_image="${2:-}"; shift 2 ;;
+      --skip-backup) skip_backup=true; shift ;;
+      -h|--help) show_help; return ;;
+      *) die "unknown upgrade option: $1" ;;
+    esac
+  done
+  need_root
+  set_paths "$data_dir"
+  require_runtime
+  if [[ -n "$new_image" ]]; then
+    validate_image "$new_image"
+    IMAGE="$new_image"
+  fi
+  install_runtime_assets
+  write_config
+  build_compose_commands
+  verify_rendered_compose
+  if [[ "$skip_backup" == false ]]; then
+    if [[ -n "$BACKUP_RECIPIENT" ]]; then
+      backup_runtime "$BACKUP_RECIPIENT" ''
+    else
+      warn 'no backup recipient is configured; upgrade is proceeding without an automatic backup'
+    fi
+  fi
+  start_stack
+  doctor_runtime
+  log 'upgrade completed'
+}
+
+command_doctor() {
+  local data_dir="${TERMLINK_DATA_DIR:-$DEFAULT_DATA_DIR}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --data-dir) data_dir="${2:-}"; shift 2 ;;
+      -h|--help) show_help; return ;;
+      *) die "unknown doctor option: $1" ;;
+    esac
+  done
+  need_root
+  set_paths "$data_dir"
+  require_runtime
+  doctor_runtime
+}
+
+command_backup() {
+  local data_dir="${TERMLINK_DATA_DIR:-$DEFAULT_DATA_DIR}"
+  local recipient=''
+  local output=''
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --data-dir) data_dir="${2:-}"; shift 2 ;;
+      --recipient) recipient="${2:-}"; shift 2 ;;
+      --output) output="${2:-}"; shift 2 ;;
+      -h|--help) show_help; return ;;
+      *) die "unknown backup option: $1" ;;
+    esac
+  done
+  need_root
+  set_paths "$data_dir"
+  require_runtime
+  [[ -n "$recipient" ]] || recipient="$BACKUP_RECIPIENT"
+  [[ -n "$recipient" ]] || die 'backup requires --recipient or a configured --backup-recipient'
+  backup_runtime "$recipient" "$output"
+}
+
+command_restore() {
+  local data_dir="${TERMLINK_DATA_DIR:-$DEFAULT_DATA_DIR}"
+  local input=''
+  local identity=''
+  local confirmed=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --data-dir) data_dir="${2:-}"; shift 2 ;;
+      --input) input="${2:-}"; shift 2 ;;
+      --identity) identity="${2:-}"; shift 2 ;;
+      --confirm-restore) confirmed=true; shift ;;
+      -h|--help) show_help; return ;;
+      *) die "unknown restore option: $1" ;;
+    esac
+  done
+  need_root
+  [[ -n "$input" && -n "$identity" ]] || die 'restore requires --input and --identity'
+  set_paths "$data_dir"
+  require_runtime
+  restore_runtime "$input" "$identity" "$confirmed"
+}
+
+command_credentials() {
+  local data_dir="${TERMLINK_DATA_DIR:-$DEFAULT_DATA_DIR}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --data-dir) data_dir="${2:-}"; shift 2 ;;
+      -h|--help) show_help; return ;;
+      *) die "unknown credentials option: $1" ;;
+    esac
+  done
+  need_root
+  set_paths "$data_dir"
+  load_config
+  verify_secrets
+  [[ ! -e "$DATA_DIR/.initial-credentials-claimed" ]] || \
+    die 'initial administrator credentials have already been displayed'
+  (set -o noclobber; printf 'claimed\n' > "$DATA_DIR/.initial-credentials-claimed") 2>/dev/null || \
+    die 'initial administrator credentials have already been displayed'
+  chmod 0600 "$DATA_DIR/.initial-credentials-claimed"
+  printf 'URL: %s\nUsername: admin\nTemporary password: %s\n' \
+    "$PUBLIC_URL" "$(<"$SECRETS_DIR/initial-admin-password")"
+  printf 'Change this password at the first login; it will not be displayed again.\n'
+}
+
+command_config() {
+  local data_dir="${TERMLINK_DATA_DIR:-$DEFAULT_DATA_DIR}"
+  local new_domain=''
+  local new_email=''
+  local new_image=''
+  local new_tls=''
+  local new_http=''
+  local new_https=''
+  local new_recipient='__unchanged__'
+  local show_only=true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --data-dir) data_dir="${2:-}"; shift 2 ;;
+      --domain) new_domain="${2:-}"; show_only=false; shift 2 ;;
+      --email) new_email="${2:-}"; show_only=false; shift 2 ;;
+      --image) new_image="${2:-}"; show_only=false; shift 2 ;;
+      --tls) new_tls="${2:-}"; show_only=false; shift 2 ;;
+      --http-port) new_http="${2:-}"; show_only=false; shift 2 ;;
+      --https-port) new_https="${2:-}"; show_only=false; shift 2 ;;
+      --backup-recipient) new_recipient="${2:-}"; show_only=false; shift 2 ;;
+      --clear-backup-recipient) new_recipient=''; show_only=false; shift ;;
+      -h|--help) show_help; return ;;
+      *) die "unknown config option: $1" ;;
+    esac
+  done
+  need_root
+  set_paths "$data_dir"
+  require_runtime
+  if [[ "$show_only" == true ]]; then
+    sed -E '/^(TERMLINK_RUNTIME_DIR|TERMLINK_SECRETS_DIR)=/d' "$CONFIG_FILE"
+    return
+  fi
+  [[ -z "$new_domain" ]] || { validate_domain "$new_domain"; PUBLIC_HOST="${new_domain,,}"; }
+  [[ -z "$new_email" ]] || { validate_email "$new_email"; ADMIN_EMAIL="$new_email"; }
+  [[ -z "$new_image" ]] || { validate_image "$new_image"; IMAGE="$new_image"; }
+  [[ -z "$new_tls" ]] || { [[ "$new_tls" == managed || "$new_tls" == external ]] || die '--tls must be managed or external'; TLS_MODE="$new_tls"; }
+  [[ -z "$new_http" ]] || { validate_port "$new_http" --http-port; HTTP_PORT="$new_http"; }
+  [[ -z "$new_https" ]] || { validate_port "$new_https" --https-port; HTTPS_PORT="$new_https"; }
+  if [[ "$new_recipient" != __unchanged__ ]]; then
+    [[ -z "$new_recipient" ]] || validate_recipient "$new_recipient"
+    BACKUP_RECIPIENT="$new_recipient"
+  fi
+  write_config
+  build_compose_commands
+  verify_rendered_compose
+  start_stack
+  doctor_runtime
+  log 'configuration updated and applied'
+}
+
+command_uninstall() {
+  local data_dir="${TERMLINK_DATA_DIR:-$DEFAULT_DATA_DIR}"
+  local keep_data=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --data-dir) data_dir="${2:-}"; shift 2 ;;
+      --keep-data) keep_data=true; shift ;;
+      -h|--help) show_help; return ;;
+      *) die "unknown uninstall option: $1" ;;
+    esac
+  done
+  need_root
+  [[ "$keep_data" == true ]] || die 'only non-destructive uninstall --keep-data is supported'
+  set_paths "$data_dir"
+  require_runtime
+  "${COMPOSE_ALL[@]}" down --remove-orphans
+  log "containers and networks removed; Docker volumes and $DATA_DIR were preserved"
+}
+
+main() {
+  local command="${1:-help}"
+  [[ $# -eq 0 ]] || shift
+  case "$command" in
+    install) command_install "$@" ;;
+    upgrade) command_upgrade "$@" ;;
+    doctor) command_doctor "$@" ;;
+    backup) command_backup "$@" ;;
+    restore) command_restore "$@" ;;
+    credentials) command_credentials "$@" ;;
+    config) command_config "$@" ;;
+    uninstall) command_uninstall "$@" ;;
+    help|-h|--help) show_help ;;
+    *) die "unknown command: $command" ;;
+  esac
+}
+
+main "$@"

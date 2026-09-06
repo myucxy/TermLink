@@ -47,6 +47,12 @@ const (
 	// immediately; this short fence covers session deletion and missed events
 	// without putting a database query on every input, resize, or ACK frame.
 	subscriptionAuthorityTTL = 5 * time.Second
+	// A transient PostgreSQL or coordination-store outage must not turn an
+	// otherwise healthy WebSocket into a silent data break. Keep only the last
+	// positively verified route for this bounded grace period. Authoritative
+	// denials and expiry still invalidate immediately, and no failed refresh
+	// extends the deadline.
+	subscriptionAuthorityFailureGrace = 45 * time.Second
 )
 
 var requiredCapabilities = []string{"cumulative_ack", "e2ee_x25519_chacha20poly1305", "flow_control_v1", "lease_v1"}
@@ -125,7 +131,7 @@ type batchLiveSessionStore interface {
 	ReserveLiveSessions(context.Context, uuid.UUID, []uuid.UUID, uuid.UUID) error
 }
 
-func NewHub(repository *store.Postgres, leases *kv.Valkey, logger *slog.Logger) *Hub {
+func NewHub(repository *store.Postgres, leases liveSessionStore, logger *slog.Logger) *Hub {
 	return NewHubWithObserver(repository, leases, logger, nil)
 }
 
@@ -147,7 +153,7 @@ func (noopObserver) SubscriptionsChanged(int)                                  {
 func (noopObserver) EnvelopeRouted(string, string, string, int, time.Duration) {}
 func (noopObserver) SlowConsumerDisconnected()                                 {}
 
-func NewHubWithObserver(repository *store.Postgres, leases *kv.Valkey, logger *slog.Logger, observer Observer) *Hub {
+func NewHubWithObserver(repository *store.Postgres, leases liveSessionStore, logger *slog.Logger, observer Observer) *Hub {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -160,11 +166,7 @@ func NewHubWithObserver(repository *store.Postgres, leases *kv.Valkey, logger *s
 		authorityStore = repository
 		policyStore = repository
 	}
-	var sessionStore liveSessionStore
-	if leases != nil {
-		sessionStore = leases
-	}
-	return &Hub{store: authorityStore, policyStore: policyStore, leases: sessionStore, logger: logger, observer: observer, peers: map[uuid.UUID]*peer{}, subscriptions: map[uuid.UUID]map[uuid.UUID]*peer{}}
+	return &Hub{store: authorityStore, policyStore: policyStore, leases: leases, logger: logger, observer: observer, peers: map[uuid.UUID]*peer{}, subscriptions: map[uuid.UUID]map[uuid.UUID]*peer{}}
 }
 
 func (h *Hub) Handler() http.Handler { return http.HandlerFunc(h.serveHTTP) }
@@ -224,11 +226,13 @@ type retainedSubscriberControl struct {
 type cachedSessionRoute struct {
 	authorization store.SessionRouteAuthorization
 	validUntil    time.Time
+	failureUntil  time.Time
 }
 
 type cachedControlPolicy struct {
-	policy     store.SessionControlPolicy
-	validUntil time.Time
+	policy       store.SessionControlPolicy
+	validUntil   time.Time
+	failureUntil time.Time
 }
 
 type pcRouteKey struct {
@@ -959,18 +963,30 @@ func (p *peer) controlPolicy(ctx context.Context, sessionID uuid.UUID, route sto
 	}
 	policy, err := p.hub.policyStore.SessionControlPolicy(ctx, p.principal.UserID, p.principal.Device.ID, sessionID)
 	if err != nil || !policy.Valid() || policy.PCDeviceID != route.PCDeviceID {
+		if err != nil && !errors.Is(err, store.ErrDenied) && !errors.Is(err, store.ErrNotFound) &&
+			ok && cached.policy.Valid() && cached.policy.PCDeviceID == route.PCDeviceID &&
+			now.Before(cached.failureUntil) &&
+			(cached.policy.GrantExpiresAt == nil || now.Before(*cached.policy.GrantExpiresAt)) {
+			return cached.policy, nil
+		}
 		return store.SessionControlPolicy{}, store.ErrDenied
 	}
 	validUntil := now.Add(subscriptionAuthorityTTL)
 	if policy.GrantExpiresAt != nil && policy.GrantExpiresAt.Before(validUntil) {
 		validUntil = *policy.GrantExpiresAt
 	}
+	failureUntil := now.Add(subscriptionAuthorityFailureGrace)
+	if policy.GrantExpiresAt != nil && policy.GrantExpiresAt.Before(failureUntil) {
+		failureUntil = *policy.GrantExpiresAt
+	}
 	p.hub.mu.Lock()
 	if p.hub.subscriptions[sessionID][p.principal.Device.ID] != p {
 		p.hub.mu.Unlock()
 		return store.SessionControlPolicy{}, store.ErrDenied
 	}
-	p.controlPolicies[sessionID] = cachedControlPolicy{policy: policy, validUntil: validUntil}
+	p.controlPolicies[sessionID] = cachedControlPolicy{
+		policy: policy, validUntil: validUntil, failureUntil: failureUntil,
+	}
 	p.hub.mu.Unlock()
 	return policy, nil
 }
@@ -992,6 +1008,10 @@ func (p *peer) authorizedSubscriptionRoute(ctx context.Context, sessionID uuid.U
 	route, err := p.hub.store.SessionRoute(ctx, p.principal.UserID, p.principal.Device.ID, sessionID)
 	if err != nil {
 		if errors.Is(err, store.ErrDenied) || errors.Is(err, store.ErrNotFound) {
+			p.invalidateSubscription(ctx, sessionID)
+		} else if p.retainSubscriptionDuringTransientFailure(sessionID, now) {
+			return cached.authorization, nil
+		} else {
 			p.invalidateSubscription(ctx, sessionID)
 		}
 		return store.SessionRouteAuthorization{}, err
@@ -1136,7 +1156,13 @@ func cacheSessionRoute(route store.SessionRouteAuthorization, now time.Time) cac
 	if route.GrantExpiresAt != nil && route.GrantExpiresAt.Before(validUntil) {
 		validUntil = *route.GrantExpiresAt
 	}
-	return cachedSessionRoute{authorization: route, validUntil: validUntil}
+	failureUntil := now.Add(subscriptionAuthorityFailureGrace)
+	if route.GrantExpiresAt != nil && route.GrantExpiresAt.Before(failureUntil) {
+		failureUntil = *route.GrantExpiresAt
+	}
+	return cachedSessionRoute{
+		authorization: route, validUntil: validUntil, failureUntil: failureUntil,
+	}
 }
 
 func allowedRoutePermission(messageType realtimewire.MessageType, permission string) bool {
@@ -1809,12 +1835,21 @@ func (p *peer) refreshSubscriptions() {
 	// single-session authority contract.
 	for _, id := range sessions {
 		route, err := p.hub.store.SessionRoute(ctx, p.principal.UserID, p.principal.Device.ID, id)
-		if err != nil || !routeAuthorizationLive(route, time.Now()) {
+		if err != nil {
+			if errors.Is(err, store.ErrDenied) || errors.Is(err, store.ErrNotFound) ||
+				!p.retainSubscriptionDuringTransientFailure(id, time.Now()) {
+				p.invalidateSubscription(ctx, id)
+			}
+			continue
+		}
+		if !routeAuthorizationLive(route, time.Now()) {
 			p.invalidateSubscription(ctx, id)
 			continue
 		}
 		if err := p.hub.reserveLiveSession(ctx, p, id); err != nil {
-			p.invalidateSubscription(ctx, id)
+			if !p.retainSubscriptionDuringTransientFailure(id, time.Now()) {
+				p.invalidateSubscription(ctx, id)
+			}
 			continue
 		}
 		p.hub.updateSubscriptionRoute(p, id, route)
@@ -1827,8 +1862,11 @@ func (p *peer) refreshSubscriptionsBatched(ctx context.Context, batchStore batch
 		batch := sessions[start:end]
 		routes, err := batchStore.SessionRoutes(ctx, p.principal.UserID, p.principal.Device.ID, batch)
 		if err != nil {
+			now := time.Now()
 			for _, sessionID := range batch {
-				p.invalidateSubscription(ctx, sessionID)
+				if !p.retainSubscriptionDuringTransientFailure(sessionID, now) {
+					p.invalidateSubscription(ctx, sessionID)
+				}
 			}
 			continue
 		}
@@ -1844,8 +1882,11 @@ func (p *peer) refreshSubscriptionsBatched(ctx context.Context, batchStore batch
 		}
 		if batchLeases, ok := p.hub.leases.(batchLiveSessionStore); ok {
 			if err := p.hub.reserveLiveSessions(ctx, p, live, batchLeases); err != nil {
+				now := time.Now()
 				for _, sessionID := range live {
-					p.invalidateSubscription(ctx, sessionID)
+					if !p.retainSubscriptionDuringTransientFailure(sessionID, now) {
+						p.invalidateSubscription(ctx, sessionID)
+					}
 				}
 				continue
 			}
@@ -1856,12 +1897,20 @@ func (p *peer) refreshSubscriptionsBatched(ctx context.Context, batchStore batch
 		}
 		for _, sessionID := range live {
 			if err := p.hub.reserveLiveSession(ctx, p, sessionID); err != nil {
-				p.invalidateSubscription(ctx, sessionID)
+				if !p.retainSubscriptionDuringTransientFailure(sessionID, time.Now()) {
+					p.invalidateSubscription(ctx, sessionID)
+				}
 				continue
 			}
 			p.hub.updateSubscriptionRoute(p, sessionID, routes[sessionID])
 		}
 	}
+}
+
+func (p *peer) retainSubscriptionDuringTransientFailure(sessionID uuid.UUID, now time.Time) bool {
+	cached, subscribed := p.hub.subscriptionRoute(p, sessionID)
+	return subscribed && routeAuthorizationLive(cached.authorization, now) &&
+		now.Before(cached.failureUntil)
 }
 
 func (p *peer) refreshPresence() {

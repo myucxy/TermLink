@@ -7,6 +7,7 @@ param(
     [ValidatePattern('^https://[^/?#]+(?::[0-9]{1,5})?$')]
     [string]$AppShipBaseUrl = 'https://appship.kget.cc:8910',
     [string]$AppShipAllowedPrivateIPs = '192.168.9.250',
+    [switch]$SingleNode,
     [switch]$EnableDirectTransportShadow,
     [ValidateNotNullOrEmpty()]
     [string]$DirectStunServers = 'stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302',
@@ -138,10 +139,14 @@ function Wait-ProductionAcceptanceStack {
 
     $healthyServices = @('lucky-upstream', 'postgres', 'valkey', 'server', 'keycloak') +
         $AdditionalHealthyServices
+    if ($SingleNode) {
+        $healthyServices = @($healthyServices | Where-Object { $_ -notin @('lucky-upstream', 'valkey') })
+    }
     $runningServices = @()
     $completedServices = @(
         'runtime-secrets-init', 'keycloak-init', 'server-secrets-init', 'migrate'
     ) + $AdditionalCompletedServices
+    if ($SingleNode) { $completedServices = @($completedServices | Where-Object { $_ -ne 'migrate' }) }
     $expectedServices = @($healthyServices + $runningServices + $completedServices)
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $lastState = @{}
@@ -206,6 +211,33 @@ function Wait-ProductionAcceptanceStack {
     throw "The production acceptance stack did not become ready within $TimeoutSeconds seconds: $summary."
 }
 
+function Wait-PublicAcceptanceEndpoint {
+    param(
+        [Parameter(Mandatory)][ValidatePattern('^https://')][string]$Uri,
+        [ValidateRange(10, 120)][int]$TimeoutSeconds = 60
+    )
+
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        try {
+            $response = Invoke-WebRequest `
+                -Uri $Uri `
+                -Method Get `
+                -MaximumRedirection 0 `
+                -TimeoutSec 10 `
+                -UseBasicParsing
+            if ([int]$response.StatusCode -eq 200) { return }
+        }
+        catch {
+            # External ingress may briefly retain the stopped upstream while
+            # the single-node server takes ownership of the same host port.
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    throw "The public acceptance endpoint did not become ready within $TimeoutSeconds seconds."
+}
+
 if (-not [string]::IsNullOrWhiteSpace($ServerImage) -and
     -not [string]::IsNullOrWhiteSpace($LocalServerImage)) {
     throw '只能指定 ServerImage 或 LocalServerImage 其中一个。 / Specify only one of ServerImage or LocalServerImage.'
@@ -219,11 +251,28 @@ $endpoints = Set-AcceptanceEndpointEnvironment `
     -PublicUpstreamPort $LuckyPort
 $paths = Get-TermLinkAcceptancePaths
 $composeFiles = @($paths.ComposeFile)
+$singleNodeComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.single-node.compose.yml'
 $directTransportComposeFile = Join-Path $paths.ServerRoot 'compose\direct-transport.compose.yml'
 $acceptanceDirectTransportComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.direct-transport.compose.yml'
 $additionalHealthyServices = @()
 $additionalCompletedServices = @()
 $localEdgeEnabled = -not [string]::IsNullOrWhiteSpace($LanAddress)
+if ($SingleNode -and $localEdgeEnabled) {
+    throw '单机模式由外部入口终止 TLS，不能同时启用内置 LAN Caddy。 / Single-node mode requires external TLS ingress and cannot use the LAN Caddy listener.'
+}
+if ($SingleNode) {
+    if (-not (Test-Path -LiteralPath $singleNodeComposeFile -PathType Leaf)) {
+        throw "Single-node acceptance Compose overlay not found: $singleNodeComposeFile"
+    }
+    $env:TERMLINK_SINGLE_NODE_BIND_IP = $LuckyBindAddress
+    $env:TERMLINK_SINGLE_NODE_PORT = $LuckyPort.ToString([Globalization.CultureInfo]::InvariantCulture)
+    # Direct signalling is process-local in this topology and has no external
+    # dependency. It remains shadow-only; Relay is still the authoritative
+    # terminal transport and is never gated by Direct health.
+    $env:TERMLINK_SINGLE_NODE_DIRECT_TRANSPORT_ENABLED = 'true'
+    $env:TERMLINK_SINGLE_NODE_DIRECT_STUN_SERVERS = $DirectStunServers
+    $composeFiles += $singleNodeComposeFile
+}
 if ($localEdgeEnabled) {
     $localEdgeComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.local-edge.compose.yml'
     if (-not (Test-Path -LiteralPath $localEdgeComposeFile -PathType Leaf)) {
@@ -231,7 +280,7 @@ if ($localEdgeEnabled) {
     }
     $composeFiles += $localEdgeComposeFile
 }
-if ($EnableDirectTransportShadow) {
+if ($EnableDirectTransportShadow -and -not $SingleNode) {
     if (-not (Test-Path -LiteralPath $directTransportComposeFile -PathType Leaf)) {
         throw "Direct transport Compose overlay not found: $directTransportComposeFile"
     }
@@ -383,7 +432,7 @@ try {
 finally {
     $valkeyPassword = $null
 }
-if ($EnableDirectTransportShadow) {
+if ($EnableDirectTransportShadow -and -not $SingleNode) {
     $directValkeyPassword = if (Test-Path -LiteralPath $paths.DirectValkeyPassword -PathType Leaf) {
         [IO.File]::ReadAllText($paths.DirectValkeyPassword).Trim()
     } else {
@@ -422,7 +471,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not close the public acceptance upstream
 # rerun so rotations reach their service-private volumes.
 & docker compose @composeFileArguments rm --stop --force runtime-secrets-init server-secrets-init keycloak-init
 if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the Keycloak policy initializer.' }
-if ($EnableDirectTransportShadow) {
+if ($EnableDirectTransportShadow -and -not $SingleNode) {
     & docker compose @composeFileArguments rm --stop --force direct-valkey-secrets-init
     if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the Direct Valkey secret initializer.' }
     # The Direct lane is deliberately not a server startup dependency. Prewarm
@@ -456,15 +505,17 @@ function Assert-RuntimeSecretMetadata {
 
 Assert-RuntimeSecretMetadata -Service keycloak -Path /run/secrets/keycloak_admin_password -Expected '400:1000:0'
 Assert-RuntimeSecretMetadata -Service postgres -Path /run/secrets/postgres_password -Expected '400:70:70'
-Assert-RuntimeSecretMetadata -Service valkey -Path /run/secrets/valkey_password -Expected '400:999:1000'
-if ($EnableDirectTransportShadow) {
+if (-not $SingleNode) {
+    Assert-RuntimeSecretMetadata -Service valkey -Path /run/secrets/valkey_password -Expected '400:999:1000'
+}
+if ($EnableDirectTransportShadow -and -not $SingleNode) {
     Assert-RuntimeSecretMetadata `
         -Service direct-valkey `
         -Path /run/secrets/direct_valkey_password `
         -Expected '400:999:1000'
 }
 
-if ($localEdgeEnabled) {
+if ($localEdgeEnabled -and -not $SingleNode) {
     if (Test-Path -LiteralPath $paths.RootCa -PathType Leaf) {
         Remove-Item -LiteralPath $paths.RootCa -Force
     }
@@ -487,7 +538,10 @@ else {
 }
 $env:TERMLINK_ACCEPTANCE_USER_NAME = 'acceptance-probe'
 $env:TERMLINK_ACCEPTANCE_PROBE_IDENTITY_FILE = $paths.ProbeIdentity
-$env:TERMLINK_ACCEPTANCE_REQUIRE_DIRECT_TRANSPORT = if ($EnableDirectTransportShadow) { '1' } else { '0' }
+$env:TERMLINK_ACCEPTANCE_REQUIRE_DIRECT_TRANSPORT = if ($EnableDirectTransportShadow -or $SingleNode) { '1' } else { '0' }
+if ($SingleNode) {
+    Wait-PublicAcceptanceEndpoint -Uri "$($endpoints.Root)/healthz" -TimeoutSeconds 60
+}
 $go = if (Test-Path -LiteralPath 'D:\Dev\Env\Go\bin\go.exe' -PathType Leaf) {
     'D:\Dev\Env\Go\bin\go.exe'
 } else {
@@ -511,14 +565,24 @@ Protect-TermLinkAcceptanceSecretTree -SecretRoot $paths.SecretRoot
 # Keep completed jobs available for diagnostics until every probe succeeds,
 # then remove only their stopped containers. Named data, secret volumes, and
 # images remain untouched.
-$oneShotServices = @(
-    'runtime-secrets-init', 'keycloak-init', 'server-secrets-init', 'migrate'
-)
-if ($EnableDirectTransportShadow) {
+$oneShotServices = @('runtime-secrets-init', 'keycloak-init', 'server-secrets-init')
+if (-not $SingleNode) { $oneShotServices += 'migrate' }
+if ($EnableDirectTransportShadow -and -not $SingleNode) {
     $oneShotServices += 'direct-valkey-secrets-init'
 }
 & docker compose @composeFileArguments rm --force @oneShotServices
 if ($LASTEXITCODE -ne 0) { throw 'Could not remove completed production acceptance jobs.' }
+if ($SingleNode) {
+    # These services remain declared behind an inactive profile so Compose
+    # does not classify their old containers as orphans. Remove the containers
+    # only after the single-node probe succeeds; their named volumes and images
+    # remain available for rollback.
+    $retiredDistributedServices = @('lucky-upstream', 'valkey', 'migrate')
+    & docker compose @composeFileArguments rm --stop --force @retiredDistributedServices
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not remove retired distributed-runtime containers.'
+    }
+}
 
 Write-Output 'TermLink production acceptance stack is running.'
 Write-Output "API: $($endpoints.Root)"

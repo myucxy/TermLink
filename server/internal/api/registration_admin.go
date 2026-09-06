@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
 	"github.com/termlink/termlink/server/internal/store"
 )
 
@@ -25,15 +24,7 @@ const (
 
 const registrationCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-var (
-	registrationRateLimitScript = redis.NewScript(`
-local current=redis.call('GET',KEYS[1])
-if current and tonumber(current)>=tonumber(ARGV[1]) then return 0 end
-current=redis.call('INCR',KEYS[1])
-if current==1 then redis.call('PEXPIRE',KEYS[1],ARGV[2]) end
-return 1`)
-	errInvalidInvitationCodeGeneration = errors.New("invalid invitation code generation request")
-)
+var errInvalidInvitationCodeGeneration = errors.New("invalid invitation code generation request")
 
 func registrationRateSpec(domain string) (int64, time.Duration, bool) {
 	switch domain {
@@ -60,15 +51,14 @@ func registrationRateLimitScope(r *http.Request, domain string) (string, error) 
 
 func (a *API) consumeRegistrationRateLimit(r *http.Request, domain string) (bool, error) {
 	limit, window, valid := registrationRateSpec(domain)
-	if !valid || a.Valkey == nil || a.Valkey.Client == nil {
+	if !valid || a.Valkey == nil {
 		return false, errors.New("registration rate limiter is unavailable")
 	}
 	key, err := registrationRateLimitScope(r, domain)
 	if err != nil {
 		return false, err
 	}
-	allowed, err := registrationRateLimitScript.Run(r.Context(), a.Valkey.Client, []string{key}, limit, window.Milliseconds()).Int64()
-	return allowed == 1, err
+	return a.Valkey.Allow(r.Context(), key, limit, window)
 }
 
 func (a *API) recordRegistrationRateLimitFailure(r *http.Request, domain string, unavailable bool) {

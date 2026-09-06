@@ -30,6 +30,7 @@ import (
 	"github.com/termlink/termlink/server/internal/fileoperationcleanup"
 	"github.com/termlink/termlink/server/internal/filetransfer"
 	"github.com/termlink/termlink/server/internal/humanverification"
+	"github.com/termlink/termlink/server/internal/identityproxy"
 	"github.com/termlink/termlink/server/internal/kv"
 	"github.com/termlink/termlink/server/internal/migrate"
 	"github.com/termlink/termlink/server/internal/observability"
@@ -99,6 +100,14 @@ func runProduction() error {
 		return err
 	}
 	defer repository.Close()
+	if cfg.RuntimeMode == config.RuntimeModeSingleNode {
+		migrationCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		err = migrate.UpPool(migrationCtx, repository.Pool)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("apply single-node database migrations: %w", err)
+		}
+	}
 	// First-version product policy: signing in is sufficient to use the
 	// account's own devices. Legacy trust/grant tables remain for compatibility
 	// and future policy work, but are not a user-facing enrollment step.
@@ -106,16 +115,26 @@ func runProduction() error {
 	if err := repository.VerifySchema(ctx); err != nil {
 		return err
 	}
-	valkey, err := kv.OpenWithOptions(ctx, cfg.RedisURL.Value(), kv.OpenOptions{
-		PoolSize: cfg.RedisPoolSize, MinIdleConns: cfg.RedisMinIdleConns,
-		DialTimeout: cfg.RedisDialTimeout, ReadTimeout: cfg.RedisReadTimeout,
-		WriteTimeout: cfg.RedisWriteTimeout, PoolTimeout: cfg.RedisPoolTimeout,
-	})
+	var coordinator kv.Coordinator
+	if cfg.RuntimeMode == config.RuntimeModeSingleNode {
+		coordinator, err = kv.NewMemoryCoordinator(repository)
+	} else {
+		var valkey *kv.Valkey
+		valkey, err = kv.OpenWithOptions(ctx, cfg.RedisURL.Value(), kv.OpenOptions{
+			PoolSize: cfg.RedisPoolSize, MinIdleConns: cfg.RedisMinIdleConns,
+			DialTimeout: cfg.RedisDialTimeout, ReadTimeout: cfg.RedisReadTimeout,
+			WriteTimeout: cfg.RedisWriteTimeout, PoolTimeout: cfg.RedisPoolTimeout,
+		})
+		if err == nil {
+			valkey.LeaseVersions = repository
+			coordinator = valkey
+		}
+	}
 	if err != nil {
 		return err
 	}
-	defer valkey.Close()
-	verifier, err := auth.NewOIDCVerifier(ctx, cfg.OIDCIssuer, cfg.OIDCClientID, cfg.OIDCAllowedParties)
+	defer coordinator.Close()
+	verifier, err := auth.NewOIDCVerifierWithBackchannel(ctx, cfg.OIDCIssuer, cfg.OIDCBackchannelIssuer, cfg.OIDCClientID, cfg.OIDCAllowedParties)
 	if err != nil {
 		return err
 	}
@@ -131,12 +150,13 @@ func runProduction() error {
 	adminRouteKey := deriveServerKey(keyMaster, "web-admin-route-encryption")
 	humanVerificationKey := deriveServerKey(keyMaster, "human-verification-settings-encryption")
 	directTransportKey := deriveServerKey(keyMaster, "direct-transport-ticket-ed25519")
-	authentication := auth.Middleware{Tokens: verifier, Devices: repository, Nonces: valkey, SubjectKey: subjectKey}
+	authentication := auth.Middleware{Tokens: verifier, Devices: repository, Nonces: coordinator, SubjectKey: subjectKey}
 	var keycloakAdmin *auth.KeycloakAdminClient
 	if cfg.RegistrationRecoveryEnabled || cfg.AccountDeletionEnabled || !cfg.KeycloakAdminClientSecret.Empty() {
 		var adminErr error
 		keycloakAdmin, adminErr = auth.NewKeycloakAdminClient(auth.KeycloakAdminConfig{
-			Issuer: cfg.OIDCIssuer, AdminBaseURL: cfg.KeycloakAdminBaseURL, ClientID: cfg.KeycloakAdminClientID,
+			Issuer: cfg.OIDCIssuer, BackchannelIssuer: cfg.OIDCBackchannelIssuer,
+			AdminBaseURL: cfg.KeycloakAdminBaseURL, ClientID: cfg.KeycloakAdminClientID,
 			ClientSecret: cfg.KeycloakAdminClientSecret.Value(), RegistrationProofKey: registrationProofKey,
 		})
 		if adminErr != nil {
@@ -214,7 +234,7 @@ func runProduction() error {
 		accountDeletionRunner = accountdeletion.NewRunner(deletionService, accountdeletion.RunnerOptions{Logger: slog.Default()})
 	}
 	productionAPI := &api.API{
-		Store: repository, Valkey: valkey, Tokens: verifier, Auth: authentication,
+		Store: repository, Valkey: coordinator, Tokens: verifier, Auth: authentication,
 		ServiceEmail:      serviceEmail,
 		HumanVerification: humanVerificationManager,
 		SubjectKey:        subjectKey, TokenKey: tokenKey, RegistrationCodeKey: registrationCodeKey,
@@ -239,7 +259,7 @@ func runProduction() error {
 		metrics = observability.New(repository.Pool)
 		observer = metrics
 	}
-	hub := realtime.NewHubWithObserver(repository, valkey, slog.Default(), observer)
+	hub := realtime.NewHubWithObserver(repository, coordinator, slog.Default(), observer)
 	defer func() {
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -265,39 +285,47 @@ func runProduction() error {
 	var directValkey *kv.Valkey
 	var directAuthentication auth.Middleware
 	if directTransportEnabled {
-		directRedisURL, directSecretErr := readOptionalSecretFile("TERMLINK_DIRECT_REDIS_URL_FILE")
-		if directSecretErr == nil {
-			directRepository, err = store.OpenWithOptions(ctx, cfg.DatabaseURL.Value(), store.OpenOptions{
-				MaxConns: 4, MinConns: 0, ConnectTimeout: 3 * time.Second,
-				MaxConnLifetime: 15 * time.Minute, MaxConnIdleTime: time.Minute,
-			})
+		if cfg.RuntimeMode == config.RuntimeModeSingleNode {
+			directTickets, err = transport.NewRouteTicketService(repository, directTransportKey, directSTUNServers...)
 			if err == nil {
-				directRepository.AutoTrustDevices = true
-				directValkey, err = kv.OpenWithOptions(ctx, directRedisURL, kv.OpenOptions{
-					PoolSize: 8, MinIdleConns: 1, DialTimeout: 2 * time.Second,
-					ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second, PoolTimeout: 2 * time.Second,
-				})
-			}
-			if err == nil {
-				var directState *kv.DirectTransportState
-				directState, err = kv.NewDirectTransportState(directValkey.Client, "")
-				if err == nil {
-					directTickets, err = transport.NewSharedRouteTicketService(directRepository, directState, directTransportKey, directSTUNServers...)
-				}
-				if err == nil {
-					directHub, err = transport.NewSharedHub(directTickets, directState)
-				}
-				if err == nil {
-					directAuthentication = auth.Middleware{
-						Tokens: verifier, Devices: directRepository, Nonces: directValkey, SubjectKey: subjectKey,
-					}
-					startCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-					err = directHub.Start(startCtx, ctx)
-					cancel()
-				}
+				directHub = transport.NewHub(directTickets)
+				directAuthentication = auth.Middleware{Tokens: verifier, Devices: repository, Nonces: coordinator, SubjectKey: subjectKey}
 			}
 		} else {
-			err = directSecretErr
+			directRedisURL, directSecretErr := readOptionalSecretFile("TERMLINK_DIRECT_REDIS_URL_FILE")
+			if directSecretErr != nil {
+				err = directSecretErr
+			} else {
+				directRepository, err = store.OpenWithOptions(ctx, cfg.DatabaseURL.Value(), store.OpenOptions{
+					MaxConns: 4, MinConns: 0, ConnectTimeout: 3 * time.Second,
+					MaxConnLifetime: 15 * time.Minute, MaxConnIdleTime: time.Minute,
+				})
+				if err == nil {
+					directRepository.AutoTrustDevices = true
+					directValkey, err = kv.OpenWithOptions(ctx, directRedisURL, kv.OpenOptions{
+						PoolSize: 8, MinIdleConns: 1, DialTimeout: 2 * time.Second,
+						ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second, PoolTimeout: 2 * time.Second,
+					})
+				}
+				if err == nil {
+					var directState *kv.DirectTransportState
+					directState, err = kv.NewDirectTransportState(directValkey.Client, "")
+					if err == nil {
+						directTickets, err = transport.NewSharedRouteTicketService(directRepository, directState, directTransportKey, directSTUNServers...)
+					}
+					if err == nil {
+						directHub, err = transport.NewSharedHub(directTickets, directState)
+					}
+					if err == nil {
+						directAuthentication = auth.Middleware{
+							Tokens: verifier, Devices: directRepository, Nonces: directValkey, SubjectKey: subjectKey,
+						}
+						startCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+						err = directHub.Start(startCtx, ctx)
+						cancel()
+					}
+				}
+			}
 		}
 		if err != nil {
 			slog.Warn("direct transport degraded to Relay-only", "error_class", "direct_transport_unavailable")
@@ -316,8 +344,12 @@ func runProduction() error {
 		}
 	}
 	if directHub != nil {
-		defer directRepository.Close()
-		defer directValkey.Close()
+		if directRepository != nil {
+			defer directRepository.Close()
+		}
+		if directValkey != nil {
+			defer directValkey.Close()
+		}
 		defer func() {
 			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -327,6 +359,7 @@ func runProduction() error {
 	portal, err := webportal.New(ctx, webportal.Config{
 		PublicURL:                 cfg.PublicURL,
 		Issuer:                    cfg.OIDCIssuer,
+		BackchannelIssuer:         cfg.OIDCBackchannelIssuer,
 		ClientID:                  cfg.WebOIDCClientID,
 		WindowsClientID:           cfg.WindowsOIDCClientID,
 		StepUpClientID:            cfg.WebOIDCStepUpClientID,
@@ -347,7 +380,7 @@ func runProduction() error {
 		IdentityMFAStatus:         keycloakAdmin,
 		Repository:                repository,
 		AccountStatusChanged: func(ctx context.Context, accountID uuid.UUID, status string) error {
-			return valkey.Client.Publish(ctx, "account-status-changed", accountID.String()).Err()
+			return coordinator.Publish(ctx, "account-status-changed", accountID)
 		},
 	})
 	if err != nil {
@@ -366,10 +399,19 @@ func runProduction() error {
 	}
 	mux.Handle("/v1/", productionAPI.Handler())
 	mux.Handle("/v1", productionAPI.Handler())
-	mux.HandleFunc("GET /readyz", readinessHandler(repository, valkey))
+	mux.HandleFunc("GET /readyz", readinessHandler(repository, coordinator))
+	if cfg.RuntimeMode == config.RuntimeModeSingleNode && cfg.OIDCBackchannelIssuer != cfg.OIDCIssuer {
+		keycloakProxy, proxyErr := identityproxy.New(cfg.OIDCIssuer, cfg.OIDCBackchannelIssuer)
+		if proxyErr != nil {
+			return fmt.Errorf("initialize embedded Keycloak proxy: %w", proxyErr)
+		}
+		mux.Handle("/realms/", keycloakProxy.Handler())
+		mux.Handle("/resources/", keycloakProxy.Handler())
+		mux.Handle("/robots.txt", keycloakProxy.Handler())
+	}
 	mux.Handle("/", portal.Handler())
 	authorityReady := make(chan struct{})
-	go consumeAuthorityChanges(ctx, valkey, hub, authorityReady)
+	go consumeAuthorityChanges(ctx, coordinator, hub, authorityReady)
 	select {
 	case <-authorityReady:
 	case <-ctx.Done():
@@ -377,7 +419,7 @@ func runProduction() error {
 	case <-time.After(5 * time.Second):
 		return errors.New("realtime authority subscription did not become ready")
 	}
-	go (outbox.Dispatcher{Store: repository, Valkey: valkey, Logger: slog.Default()}).Run(ctx)
+	go (outbox.Dispatcher{Store: repository, Valkey: coordinator, Logger: slog.Default()}).Run(ctx)
 	if registrationRecoveryRunner != nil {
 		go registrationRecoveryRunner.Run(ctx)
 	}
@@ -585,14 +627,14 @@ func runMigrate() error {
 	return migrate.Up(ctx, cfg.DatabaseURL.Value())
 }
 
-func readinessHandler(repository *store.Postgres, valkey *kv.Valkey) http.HandlerFunc {
+func readinessHandler(repository *store.Postgres, coordinator kv.Coordinator) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 		// Schema compatibility is verified once, synchronously, before the
 		// listener starts. Re-querying schema_migrations on every Docker/Caddy
 		// health probe adds avoidable steady-state database traffic.
-		if repository.Ping(ctx) != nil || valkey.Ping(ctx) != nil {
+		if repository.Ping(ctx) != nil || coordinator.Ping(ctx) != nil {
 			http.Error(w, `{"status":"unavailable"}`, http.StatusServiceUnavailable)
 			return
 		}
@@ -630,37 +672,24 @@ func applyAuthorityChange(target authorityChangeTarget, channel string, id uuid.
 	}
 }
 
-func consumeAuthorityChanges(ctx context.Context, valkey *kv.Valkey, hub authorityChangeTarget, ready chan<- struct{}) {
+func consumeAuthorityChanges(ctx context.Context, coordinator kv.Coordinator, hub authorityChangeTarget, ready chan<- struct{}) {
 	var readyOnce sync.Once
 	channels := authorityChangeChannels()
 	for ctx.Err() == nil {
-		subscription := valkey.Client.Subscribe(ctx, channels...)
-		if _, err := subscription.Receive(ctx); err != nil {
-			_ = subscription.Close()
+		subscription, err := coordinator.Subscribe(ctx, channels...)
+		if err != nil {
 			if !waitForRetry(ctx, time.Second) {
 				return
 			}
 			continue
 		}
 		readyOnce.Do(func() { close(ready) })
-		messages := subscription.Channel()
-		connected := true
-		for connected {
-			select {
-			case <-ctx.Done():
-				_ = subscription.Close()
-				return
-			case message, ok := <-messages:
-				if !ok {
-					connected = false
-					continue
-				}
-				id, err := uuid.Parse(message.Payload)
-				if err != nil {
-					continue
-				}
-				applyAuthorityChange(hub, message.Channel, id)
+		for ctx.Err() == nil {
+			message, receiveErr := subscription.Receive(ctx)
+			if receiveErr != nil {
+				break
 			}
+			applyAuthorityChange(hub, message.Channel, message.ID)
 		}
 		_ = subscription.Close()
 		if !waitForRetry(ctx, time.Second) {

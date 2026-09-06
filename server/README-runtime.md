@@ -6,6 +6,24 @@ successful one-shot job. The optional `edge` profile adds the only published
 port (HTTPS 443). Core contains no MinIO, history proxy route, metrics stack,
 acceptance probe, or test service.
 
+The Server binary also has an explicit `single-node` mode for deployments that
+run exactly one Server process. It embeds bounded coordination and Direct/NAT
+signalling, runs schema migrations before serving traffic, and can proxy the
+public Keycloak browser routes to a private backchannel. This removes Valkey,
+Direct Valkey, the standalone migration job, and the internal route-splitting
+Caddy from that topology; Keycloak and PostgreSQL remain independent durable
+services. TLS still terminates at the operator's public ingress. Never scale a
+`single-node` Server past one process: use the default `distributed` mode and
+Valkey when multiple Server replicas are required.
+
+For a new single-server installation that also operates private Keycloak and
+its separate database, use
+[`deploy/single-node-production`](deploy/single-node-production/README.md).
+Its `termlink-deploy` entry point owns install, upgrade, health checks,
+encrypted backup, and validated restore without using acceptance Compose.
+The overlay examples below remain the lower-level matrix for externally
+managed identity or multi-replica deployments.
+
 OIDC is a required external dependency, not a service hidden inside core. Set
 `TERMLINK_OIDC_ISSUER` to a separately operated Keycloak realm or another
 compatible issuer. The server verifies the issuer during startup and will not
@@ -28,6 +46,23 @@ with their documented `TERMLINK_*_LIMIT` variables.
 Run these commands from `server`. Always render the exact combination before
 starting it:
 
+The production executable selects its topology explicitly:
+
+```text
+TERMLINK_RUNTIME_MODE=distributed
+
+# Exactly one Server process; the public issuer remains browser/token authority.
+TERMLINK_RUNTIME_MODE=single-node
+TERMLINK_OIDC_BACKCHANNEL_ISSUER=http://keycloak:8080/realms/termlink
+```
+
+There is no automatic fallback from a failed Valkey connection to local
+memory. This prevents an accidentally partitioned multi-replica deployment.
+In `single-node`, established Relay sockets do not depend on Keycloak after
+their authenticated handshake, Direct signalling faults are isolated from
+Relay, and lease fencing versions come from PostgreSQL so a restart cannot make
+an old controller newer than its replacement.
+
 ```powershell
 # Core: external OIDC, host-owned terminal history, realtime file transfer.
 docker compose --env-file .env `
@@ -36,6 +71,19 @@ docker compose --env-file .env `
 docker compose --env-file .env `
   -f compose\core.compose.yml `
   --profile edge up --detach --wait
+
+# Exactly one Server process with embedded coordination, Direct signalling,
+# startup migrations, and Keycloak public-route forwarding. The private
+# backchannel must identify the same realm as TERMLINK_OIDC_ISSUER.
+$env:TERMLINK_OIDC_BACKCHANNEL_ISSUER = 'http://keycloak:8080/realms/termlink'
+docker compose --env-file .env `
+  -f compose\core.compose.yml `
+  -f compose\single-node.compose.yml `
+  --profile edge config
+docker compose --env-file .env `
+  -f compose\core.compose.yml `
+  -f compose\single-node.compose.yml `
+  --profile edge up --detach --wait --scale server=1
 
 # Optional shared Direct signaling state for one or more server replicas.
 # Relay remains the always-on path; this overlay does not make Direct routing

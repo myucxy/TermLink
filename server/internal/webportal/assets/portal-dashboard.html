@@ -51,15 +51,6 @@
 
       {{if .Notice}}<div class="portal-notice" role="status">{{.Notice}}</div>{{end}}
 
-      {{if .Announcements}}
-      <section class="portal-announcements" aria-label="系统公告">
-        {{range .Announcements}}<article class="portal-announcement announcement-{{.Severity}}">
-          <div class="portal-announcement-heading"><span>{{announcementSeverityLabel .Severity}}</span><strong>{{.Title}}</strong>{{with .EndsAt}}<time>有效至 {{formatTime .}}</time>{{end}}</div>
-          <p>{{.Body}}</p>
-        </article>{{end}}
-      </section>
-      {{end}}
-
       {{if eq .Section "overview"}}
       <section class="overview-stat-grid" aria-label="账号统计">
         <article class="portal-card"><small>在线 PC</small><strong>{{.Overview.OnlinePCs}}</strong><span>共 {{.Overview.PCs}} 台</span></article>

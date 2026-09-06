@@ -1,0 +1,35 @@
+# Disposable TLS ingress used only to prove the three-service single-node
+# topology end to end. It forwards every route to Server, so Keycloak discovery,
+# login, registration, and logout must traverse Server's embedded proxy.
+services:
+  single-node-test-edge:
+    image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    environment:
+      TERMLINK_SINGLE_NODE_TEST_HOST: ${TERMLINK_SINGLE_NODE_TEST_HOST:-termlink.127.0.0.1.sslip.io}
+      TERMLINK_SINGLE_NODE_TEST_PORT: ${TERMLINK_SINGLE_NODE_TEST_PORT:-19443}
+    ports:
+      - "127.0.0.1:${TERMLINK_SINGLE_NODE_TEST_PORT:-19443}:${TERMLINK_SINGLE_NODE_TEST_PORT:-19443}"
+    networks: ["public", "frontend"]
+    volumes:
+      - ../acceptance/SingleNodeEdge.Caddyfile:/etc/caddy/Caddyfile:ro
+      - acceptance-single-node-edge-data:/data
+      - acceptance-single-node-edge-config:/config
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8081/readyz"]
+      interval: 2s
+      timeout: 2s
+      retries: 45
+    depends_on:
+      server:
+        condition: service_healthy
+
+volumes:
+  acceptance-single-node-edge-data:
+  acceptance-single-node-edge-config:

@@ -989,7 +989,7 @@ func TestPortalSeparatesUserAndAdministratorDestinations(t *testing.T) {
 	}
 }
 
-func TestPortalOverviewKeepsFullAuditLogOutOfTheDashboard(t *testing.T) {
+func TestPortalOmitsAnnouncementAndAuditManagement(t *testing.T) {
 	flow := &testOIDCFlow{identity: accountIdentity{
 		Subject: "admin-subject", Username: "admin", Roles: []string{"SUPER_ADMIN"}, MFA: true,
 	}}
@@ -1002,13 +1002,20 @@ func TestPortalOverviewKeepsFullAuditLogOutOfTheDashboard(t *testing.T) {
 	}
 	cookie, _ := completeLoginAt(t, portal, flow, "/admin")
 
-	overview := performRequest(portal.Handler(), http.MethodGet, "/admin", nil, cookie)
-	if overview.Code != http.StatusOK || strings.Count(overview.Body.String(), "overview-event-") != 7 {
-		t.Fatalf("overview audit preview status/count = %d/%d", overview.Code, strings.Count(overview.Body.String(), "overview-event-"))
+	for _, target := range []string{"/admin", "/admin?section=audit", "/admin?section=announcements"} {
+		response := performRequest(portal.Handler(), http.MethodGet, target, nil, cookie)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "运行概览") {
+			t.Fatalf("removed section %q status/body = %d/%q", target, response.Code, response.Body.String())
+		}
+		for _, removed := range []string{"overview-event-", "最近安全事件", "安全审计", "公告管理"} {
+			if strings.Contains(response.Body.String(), removed) {
+				t.Fatalf("removed section %q still rendered %q", target, removed)
+			}
+		}
 	}
-	fullAudit := performRequest(portal.Handler(), http.MethodGet, "/admin?section=audit", nil, cookie)
-	if fullAudit.Code != http.StatusOK || strings.Count(fullAudit.Body.String(), "overview-event-") != 10 {
-		t.Fatalf("full audit status/count = %d/%d", fullAudit.Code, strings.Count(fullAudit.Body.String(), "overview-event-"))
+	announcementMutation := performPortalForm(portal.Handler(), "/admin/announcements", url.Values{}, cookie)
+	if announcementMutation.Code != http.StatusNotFound {
+		t.Fatalf("removed announcement mutation status=%d, want 404", announcementMutation.Code)
 	}
 }
 
@@ -1739,7 +1746,7 @@ func TestSensitiveAdminActionRequiresStrongVerificationReasonAndIdempotency(t *t
 }
 
 func TestEverySensitiveAdminFormCarriesRequiredFields(t *testing.T) {
-	formPattern := regexp.MustCompile(`(?s)<form[^>]+action="/admin[^>]*>.*?</form>`)
+	formPattern := regexp.MustCompile(`(?s)<form[^>]+action="\{\{\$?\.AdminBasePath\}\}/[^>]*>.*?</form>`)
 	for _, name := range []string{"admin.html", "registration-admin.html"} {
 		contents, err := portalAssets.ReadFile("assets/" + name)
 		if err != nil {

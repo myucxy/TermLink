@@ -57,6 +57,7 @@ type registrationAdminPageData struct {
 	Role                   store.Role
 	RoleLabel              string
 	CSRF                   string
+	AdminBasePath          string
 	Section                string
 	SectionTitle           string
 	CanOperate             bool
@@ -84,6 +85,11 @@ func (p *Portal) adminRegistrationDashboard(w http.ResponseWriter, r *http.Reque
 		p.renderError(w, http.StatusServiceUnavailable, "注册管理暂不可用", "服务端尚未完成注册管理存储配置。")
 		return
 	}
+	adminBasePath, err := p.adminBasePath(r.Context())
+	if err != nil {
+		p.internalError(w, err)
+		return
+	}
 	actionNonce, err := randomText(24)
 	if err != nil {
 		p.internalError(w, err)
@@ -91,7 +97,8 @@ func (p *Portal) adminRegistrationDashboard(w http.ResponseWriter, r *http.Reque
 	}
 	data := registrationAdminPageData{
 		Username: session.Username, Role: account.Role, RoleLabel: roleLabel(account.Role), CSRF: session.CSRF,
-		Section: "registration", SectionTitle: "注册与邀请码",
+		AdminBasePath: adminBasePath,
+		Section:       "registration", SectionTitle: "注册与邀请码",
 		CanOperate:         account.Role == store.RoleAdmin || account.Role == store.RoleSuperAdmin,
 		CanConfigureSystem: account.Role == store.RoleSuperAdmin, RegistrationNavigation: true,
 		Notice: registrationAdminNotice(r.URL.Query().Get("notice")), ActionNonce: actionNonce,
@@ -241,7 +248,7 @@ func (p *Portal) adminGenerateInvitationCodes(w http.ResponseWriter, r *http.Req
 		p.handleRegistrationMutationError(w, err)
 		return
 	}
-	p.renderGeneratedInvitationCodes(w, session, account, batchID, batchName, raw)
+	p.renderGeneratedInvitationCodes(w, r, session, account, batchID, batchName, raw)
 }
 
 func (p *Portal) adminSetInvitationBatchStatus(w http.ResponseWriter, r *http.Request) {
@@ -354,7 +361,12 @@ func normalizeInvitationCode(value string) string {
 	return output.String()
 }
 
-func (p *Portal) renderGeneratedInvitationCodes(w http.ResponseWriter, session webSession, account store.PortalAccount, selectedID uuid.UUID, batchName string, raw []string) {
+func (p *Portal) renderGeneratedInvitationCodes(w http.ResponseWriter, r *http.Request, session webSession, account store.PortalAccount, selectedID uuid.UUID, batchName string, raw []string) {
+	adminBasePath, err := p.adminBasePath(r.Context())
+	if err != nil {
+		p.internalError(w, err)
+		return
+	}
 	actionNonce, err := randomText(24)
 	if err != nil {
 		p.internalError(w, err)
@@ -362,7 +374,8 @@ func (p *Portal) renderGeneratedInvitationCodes(w http.ResponseWriter, session w
 	}
 	p.render(w, http.StatusCreated, "registration-admin.html", registrationAdminPageData{
 		Username: session.Username, Role: account.Role, RoleLabel: roleLabel(account.Role), CSRF: session.CSRF,
-		Section: "registration", SectionTitle: "注册与邀请码",
+		AdminBasePath: adminBasePath,
+		Section:       "registration", SectionTitle: "注册与邀请码",
 		CanOperate:         account.Role == store.RoleAdmin || account.Role == store.RoleSuperAdmin,
 		CanConfigureSystem: account.Role == store.RoleSuperAdmin, RegistrationNavigation: true,
 		SelectedID: selectedID, GeneratedCodes: raw, GeneratedBatchName: batchName,
@@ -371,11 +384,16 @@ func (p *Portal) renderGeneratedInvitationCodes(w http.ResponseWriter, session w
 }
 
 func (p *Portal) redirectRegistrationAdmin(w http.ResponseWriter, r *http.Request, notice string, id uuid.UUID) {
+	adminBasePath, err := p.adminBasePath(r.Context())
+	if err != nil {
+		p.internalError(w, err)
+		return
+	}
 	query := url.Values{"notice": {notice}}
 	if id != uuid.Nil {
 		query.Set("id", id.String())
 	}
-	http.Redirect(w, r, "/admin/registration?"+query.Encode(), http.StatusSeeOther)
+	http.Redirect(w, r, adminBasePath+"/registration?"+query.Encode(), http.StatusSeeOther)
 }
 
 func (p *Portal) handleRegistrationMutationError(w http.ResponseWriter, err error) {
@@ -422,8 +440,8 @@ func registrationSecurityFields(names ...string) map[string]bool {
 
 func registrationAdminNotice(value string) string {
 	return map[string]string{
-		"policy-updated":           bilingualPortalNotice("注册策略已更新并写入审计。", "The registration policy was updated and audited."),
+		"policy-updated":           bilingualPortalNotice("注册策略已更新并写入操作记录。", "The registration policy was updated and recorded."),
 		"invitation-batch-created": bilingualPortalNotice("邀请码批次已创建。", "The invitation-code batch was created."),
-		"status-updated":           bilingualPortalNotice("邀请码状态已更新并写入审计。", "The invitation status was updated and audited."),
+		"status-updated":           bilingualPortalNotice("邀请码状态已更新并写入操作记录。", "The invitation status was updated and recorded."),
 	}[value]
 }

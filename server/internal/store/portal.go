@@ -241,21 +241,7 @@ func (s *Postgres) PortalAdminSection(ctx context.Context, actorID uuid.UUID, se
 				&result.TrustedDevices, &result.PCs, &result.Sessions, &result.RunningSessions); err != nil {
 			return PortalAdminDashboard{}, err
 		}
-		rows, err := s.Pool.Query(ctx, `
-			SELECT id,action,target_type,coalesce(target_id::text,''),result,trace_id,created_at
-			FROM audit_events ORDER BY id DESC LIMIT 7`)
-		if err != nil {
-			return PortalAdminDashboard{}, err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var item PortalAuditEvent
-			if err := rows.Scan(&item.ID, &item.Action, &item.TargetType, &item.TargetID, &item.Result, &item.TraceID, &item.CreatedAt); err != nil {
-				return PortalAdminDashboard{}, err
-			}
-			result.AuditEvents = append(result.AuditEvents, item)
-		}
-		return result, rows.Err()
+		return result, nil
 	case "connections":
 		rows, err := s.Pool.Query(ctx, `
 			SELECT d.id,d.name,d.device_type,d.trust_state,d.last_seen_at,
@@ -296,22 +282,6 @@ func (s *Postgres) PortalAdminSection(ctx context.Context, actorID uuid.UUID, se
 			}
 			item.Reference = "acct_" + item.ID.String()[:8]
 			result.Accounts = append(result.Accounts, item)
-		}
-		return result, rows.Err()
-	case "audit":
-		rows, err := s.Pool.Query(ctx, `
-			SELECT id,action,target_type,coalesce(target_id::text,''),result,trace_id,created_at
-			FROM audit_events ORDER BY id DESC LIMIT 100`)
-		if err != nil {
-			return PortalAdminDashboard{}, err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var item PortalAuditEvent
-			if err := rows.Scan(&item.ID, &item.Action, &item.TargetType, &item.TargetID, &item.Result, &item.TraceID, &item.CreatedAt); err != nil {
-				return PortalAdminDashboard{}, err
-			}
-			result.AuditEvents = append(result.AuditEvents, item)
 		}
 		return result, rows.Err()
 	case "deployment":

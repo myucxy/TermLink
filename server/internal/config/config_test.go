@@ -414,6 +414,35 @@ func TestNewExplicitInputAppliesDefaultsAndValidates(t *testing.T) {
 	}
 }
 
+func TestSingleNodeConfigDoesNotRequireValkeyAndAcceptsPrivateOIDCBackchannel(t *testing.T) {
+	c, err := New(Input{
+		RuntimeMode:           RuntimeModeSingleNode,
+		PublicURL:             "https://termlink.example.test",
+		OIDCIssuer:            "https://termlink.example.test/realms/termlink",
+		OIDCBackchannelIssuer: "http://keycloak:8080/realms/termlink",
+		OIDCClientID:          "client",
+		OIDCClientSecret:      "oidc",
+		DatabaseURL:           "postgres",
+		TokenSigningKey:       "01234567890123456789012345678901",
+	})
+	if err != nil {
+		t.Fatalf("New(single-node) error=%v", err)
+	}
+	if c.RuntimeMode != RuntimeModeSingleNode || !c.RedisURL.Empty() {
+		t.Fatalf("single-node config=%#v", c)
+	}
+	input := Input{
+		RuntimeMode: RuntimeModeSingleNode, PublicURL: "https://termlink.example.test",
+		OIDCIssuer: "https://termlink.example.test/realms/termlink", OIDCClientID: "client",
+		OIDCClientSecret: "oidc", DatabaseURL: "postgres",
+		TokenSigningKey: "01234567890123456789012345678901",
+	}
+	input.OIDCBackchannelIssuer = "http://public.example/realms/termlink"
+	if _, err := New(input); err == nil {
+		t.Fatal("unbounded cleartext OIDC backchannel was accepted")
+	}
+}
+
 func TestWebOIDCStepUpClientMustBeDistinct(t *testing.T) {
 	_, err := New(Input{
 		PublicURL:             "https://termlink.example.test",

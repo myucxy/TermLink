@@ -2008,6 +2008,24 @@ func (s *Postgres) SaveLease(ctx context.Context, userID, actorID, leaseID, sess
 	return tx.Commit(ctx)
 }
 
+// NextControlLeaseVersion allocates the durable fencing token used by both
+// embedded and external coordination backends. The sequence starts in a
+// reserved JavaScript-safe epoch so switching away from legacy Valkey counters
+// cannot make a replacement lease look older after a server restart.
+func (s *Postgres) NextControlLeaseVersion(ctx context.Context) (int64, error) {
+	if s == nil || s.Pool == nil {
+		return 0, errors.New("PostgreSQL lease version source is unavailable")
+	}
+	var version int64
+	if err := s.Pool.QueryRow(ctx, `SELECT nextval('control_lease_fence_version_seq')`).Scan(&version); err != nil {
+		return 0, err
+	}
+	if version < 1 || version > 1<<53-1 {
+		return 0, errors.New("PostgreSQL lease version is outside the protocol-safe range")
+	}
+	return version, nil
+}
+
 func (s *Postgres) DeleteLease(ctx context.Context, userID, actorID, sessionID, leaseID uuid.UUID, auditAction, traceID string) error {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {

@@ -1,0 +1,14 @@
+{
+	admin off
+	auto_https disable_redirects
+	skip_install_trust
+}
+
+http://:8081 {
+	respond /readyz 200
+}
+
+https://{$TERMLINK_SINGLE_NODE_TEST_HOST}:{$TERMLINK_SINGLE_NODE_TEST_PORT} {
+	tls internal
+	reverse_proxy server:8080
+}

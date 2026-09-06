@@ -1,25 +1,21 @@
 {{define "admin-navigation"}}
 <nav class="admin-nav" aria-label="管理中心">
   <div class="admin-nav-group" role="group" aria-label="总览">
-    <a href="/admin?section=overview"{{if and (not .RegistrationNavigation) (eq .Section "overview")}} aria-current="page"{{end}}><span class="admin-nav-text">总览与待办</span></a>
+    <a href="{{.AdminBasePath}}?section=overview"{{if and (not .RegistrationNavigation) (eq .Section "overview")}} aria-current="page"{{end}}><span class="admin-nav-text">总览与待办</span></a>
   </div>
   <div class="admin-nav-group" role="group" aria-label="用户与准入">
-    <a href="/admin?section=accounts"{{if and (not .RegistrationNavigation) (eq .Section "accounts")}} aria-current="page"{{end}}><span class="admin-nav-text">账号与角色</span></a>
-    <a href="/admin/registration"{{if and .RegistrationNavigation (eq .Section "registration")}} aria-current="page"{{end}}><span class="admin-nav-text">注册与邀请码</span></a>
+    <a href="{{.AdminBasePath}}?section=accounts"{{if and (not .RegistrationNavigation) (eq .Section "accounts")}} aria-current="page"{{end}}><span class="admin-nav-text">账号与角色</span></a>
+    <a href="{{.AdminBasePath}}/registration"{{if and .RegistrationNavigation (eq .Section "registration")}} aria-current="page"{{end}}><span class="admin-nav-text">注册与邀请码</span></a>
   </div>
   <div class="admin-nav-group" role="group" aria-label="设备与连接">
-    <a href="/admin?section=connections"{{if and (not .RegistrationNavigation) (eq .Section "connections")}} aria-current="page"{{end}}><span class="admin-nav-text">连接路由</span></a>
+    <a href="{{.AdminBasePath}}?section=connections"{{if and (not .RegistrationNavigation) (eq .Section "connections")}} aria-current="page"{{end}}><span class="admin-nav-text">连接路由</span></a>
   </div>
   <div class="admin-nav-group" role="group" aria-label="客户端">
-    <a href="/admin?section=versions"{{if and (not .RegistrationNavigation) (eq .Section "versions")}} aria-current="page"{{end}}><span class="admin-nav-text">客户端版本</span></a>
-  </div>
-  <div class="admin-nav-group" role="group" aria-label="运营与安全">
-    <a href="/admin?section=announcements"{{if and (not .RegistrationNavigation) (eq .Section "announcements")}} aria-current="page"{{end}}><span class="admin-nav-text">公告管理</span></a>
-    <a href="/admin?section=audit"{{if and (not .RegistrationNavigation) (eq .Section "audit")}} aria-current="page"{{end}}><span class="admin-nav-text">安全审计</span></a>
+    <a href="{{.AdminBasePath}}?section=versions"{{if and (not .RegistrationNavigation) (eq .Section "versions")}} aria-current="page"{{end}}><span class="admin-nav-text">客户端版本</span></a>
   </div>
   <div class="admin-nav-group" role="group" aria-label="系统">
-    <a href="/admin?section=deployment"{{if and (not .RegistrationNavigation) (eq .Section "deployment")}} aria-current="page"{{end}}><span class="admin-nav-text">系统运行</span></a>
-    {{if .CanConfigureSystem}}<a href="/admin?section=settings"{{if and (not .RegistrationNavigation) (eq .Section "settings")}} aria-current="page"{{end}}><span class="admin-nav-text">系统设置</span></a>{{end}}
+    <a href="{{.AdminBasePath}}?section=deployment"{{if and (not .RegistrationNavigation) (eq .Section "deployment")}} aria-current="page"{{end}}><span class="admin-nav-text">系统运行</span></a>
+    {{if .CanConfigureSystem}}<a href="{{.AdminBasePath}}?section=settings"{{if and (not .RegistrationNavigation) (eq .Section "settings")}} aria-current="page"{{end}}><span class="admin-nav-text">系统设置</span></a>{{end}}
   </div>
 </nav>
 {{end}}

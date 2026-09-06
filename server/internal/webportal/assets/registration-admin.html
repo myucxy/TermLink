@@ -16,7 +16,7 @@
 </head>
 <body class="admin-body portal-admin-body">
   <header class="admin-topbar">
-    <a class="admin-brand" href="/admin">
+    <a class="admin-brand" href="{{.AdminBasePath}}">
       <img src="/assets/termlink-app-icon.svg" alt="">
       <span><strong>TermLink</strong><small>Server Console</small></span>
     </a>
@@ -48,13 +48,13 @@
         <dl class="portal-detail-grid"><div><dt>批次</dt><dd>{{if .GeneratedBatchName}}{{.GeneratedBatchName}}{{else}}{{shortID .SelectedID}}{{end}}</dd></div><div><dt>生成时间</dt><dd>{{formatTime .GeneratedAt}}</dd></div></dl>
         <div class="generated-code-actions"><button class="button button-primary" type="button" data-copy-all-codes>复制全部</button><button class="button button-quiet" type="button" data-download-codes="txt">下载 TXT</button><button class="button button-quiet" type="button" data-download-codes="csv">下载 CSV</button><span data-generated-code-status aria-live="polite"></span></div>
         <div class="generated-code-list">{{range .GeneratedCodes}}<div class="generated-code-row"><code data-generated-code>{{.}}</code><button type="button" data-copy-code>复制</button></div>{{end}}</div>
-        <a class="button button-primary" href="/admin/registration?id={{.SelectedID}}" data-generated-code-ack>我已保存，返回批次</a>
+        <a class="button button-primary" href="{{.AdminBasePath}}/registration?id={{.SelectedID}}" data-generated-code-ack>我已保存，返回批次</a>
       </section>
       {{else}}
       <section class="portal-card">
         <div class="portal-card-heading"><div><p class="eyebrow">ADMISSION POLICY</p><h2>全局注册策略</h2></div><span class="portal-state state-{{.Policy.Mode}}">{{.Policy.Mode}}</span></div>
         <dl class="portal-detail-grid"><div><dt>当前模式</dt><dd>{{.Policy.Mode}}</dd></div><div><dt>配置版本</dt><dd>v{{.Policy.Version}}</dd></div><div><dt>更新时间</dt><dd>{{formatTime .Policy.UpdatedAt}}</dd></div></dl>
-        {{if .CanConfigureSystem}}<form class="portal-form compact-form" action="/admin/registration/policy" method="post">
+        {{if .CanConfigureSystem}}<form class="portal-form compact-form" action="{{.AdminBasePath}}/registration/policy" method="post">
           <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey .ActionNonce "registration-policy"}}"><input type="hidden" name="version" value="{{.Policy.Version}}">
           <label><span>注册模式</span><select name="mode"><option value="OPEN"{{if eq .Policy.Mode "OPEN"}} selected{{end}}>OPEN · 开放注册</option><option value="INVITE_REQUIRED"{{if eq .Policy.Mode "INVITE_REQUIRED"}} selected{{end}}>INVITE_REQUIRED · 必须邀请码</option><option value="CLOSED"{{if eq .Policy.Mode "CLOSED"}} selected{{end}}>CLOSED · 暂停注册</option></select></label>
           <label><span>操作原因</span><input name="reason" minlength="3" maxlength="500" required></label><button class="button button-primary" type="submit">更新策略</button>
@@ -63,7 +63,7 @@
 
       {{if .CanOperate}}<section class="portal-card">
         <div class="portal-card-heading"><div><p class="eyebrow">INVITATION BATCH</p><h2>创建邀请码批次</h2></div></div>
-        <form class="portal-form form-grid" action="/admin/registration/invitations/batches" method="post">
+        <form class="portal-form form-grid" action="{{.AdminBasePath}}/registration/invitations/batches" method="post">
           <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey .ActionNonce "invitation-batch-create"}}">
           <label><span>批次名称</span><input name="name" maxlength="128" required></label><label><span>默认使用次数</span><input name="max_uses" type="number" min="1" max="1000000" value="1" required></label>
           <label><span>限制邮箱域（可选）</span><input name="email_domain" maxlength="255" placeholder="example.com"></label><label><span>有效期（可选）</span><input name="valid_until" type="date"></label>
@@ -75,15 +75,15 @@
       <section class="portal-card">
         <div class="portal-card-heading"><div><p class="eyebrow">INVITATION INVENTORY</p><h2>邀请码批次与库存</h2></div><span class="count-pill">{{len .InvitationBatches}} 个批次</span></div>
         <div class="portal-table-wrap"><table class="portal-table"><thead><tr><th>批次</th><th>状态</th><th>默认次数</th><th>邮箱范围</th><th>有效期</th><th>操作</th></tr></thead><tbody>
-          {{range .InvitationBatches}}<tr><td><strong>{{.Name}}</strong><small>{{shortID .ID}}</small></td><td><span class="portal-state state-{{.Status}}">{{.Status}}</span></td><td>{{.DefaultMaxUses}}</td><td>{{if .EmailDomain}}{{.EmailDomain}}{{else}}不限{{end}}</td><td>{{if .ValidUntil}}{{formatTime .ValidUntil}}{{else}}长期{{end}}</td><td><div class="table-actions"><a href="/admin/registration?id={{.ID}}">查看代码</a>
-            {{if and $.CanOperate (eq .Status "ACTIVE")}}<form class="code-generate-form" action="/admin/registration/invitations/batches/{{.ID}}/codes" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-codes:%s" .ID)}}"><input type="hidden" name="reason" value="生成邀请码"><label><span>数量</span><input name="count" type="number" min="1" max="200" value="10" required></label><input type="hidden" name="max_uses" value="{{.DefaultMaxUses}}"><button type="submit">生成</button></form>
-            <form action="/admin/registration/invitations/batches/{{.ID}}/status" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-batch-status:%s" .ID)}}"><input type="hidden" name="reason" value="停用邀请码批次"><input type="hidden" name="status" value="DISABLED"><button class="danger-outline" type="submit">停用</button></form>{{else if and $.CanOperate (eq .Status "DISABLED")}}
-            <form action="/admin/registration/invitations/batches/{{.ID}}/status" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-batch-enable:%s" .ID)}}"><input type="hidden" name="reason" value="启用邀请码批次"><input type="hidden" name="status" value="ACTIVE"><button type="submit">启用</button></form>{{end}}</div></td></tr>
+          {{range .InvitationBatches}}<tr><td><strong>{{.Name}}</strong><small>{{shortID .ID}}</small></td><td><span class="portal-state state-{{.Status}}">{{.Status}}</span></td><td>{{.DefaultMaxUses}}</td><td>{{if .EmailDomain}}{{.EmailDomain}}{{else}}不限{{end}}</td><td>{{if .ValidUntil}}{{formatTime .ValidUntil}}{{else}}长期{{end}}</td><td><div class="table-actions"><a href="{{$.AdminBasePath}}/registration?id={{.ID}}">查看代码</a>
+            {{if and $.CanOperate (eq .Status "ACTIVE")}}<form class="code-generate-form" action="{{$.AdminBasePath}}/registration/invitations/batches/{{.ID}}/codes" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-codes:%s" .ID)}}"><input type="hidden" name="reason" value="生成邀请码"><label><span>数量</span><input name="count" type="number" min="1" max="200" value="10" required></label><input type="hidden" name="max_uses" value="{{.DefaultMaxUses}}"><button type="submit">生成</button></form>
+            <form action="{{$.AdminBasePath}}/registration/invitations/batches/{{.ID}}/status" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-batch-status:%s" .ID)}}"><input type="hidden" name="reason" value="停用邀请码批次"><input type="hidden" name="status" value="DISABLED"><button class="danger-outline" type="submit">停用</button></form>{{else if and $.CanOperate (eq .Status "DISABLED")}}
+            <form action="{{$.AdminBasePath}}/registration/invitations/batches/{{.ID}}/status" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-batch-enable:%s" .ID)}}"><input type="hidden" name="reason" value="启用邀请码批次"><input type="hidden" name="status" value="ACTIVE"><button type="submit">启用</button></form>{{end}}</div></td></tr>
           {{else}}<tr><td colspan="6" class="empty-cell">暂无邀请码批次。</td></tr>{{end}}
         </tbody></table></div>
 
         {{if .SelectedID}}<h3 class="subtable-title">所选批次代码（只显示前缀）</h3><div class="portal-table-wrap"><table class="portal-table"><thead><tr><th>前缀</th><th>状态</th><th>已用 / 总数</th><th>有效期</th><th>创建时间</th><th>操作</th></tr></thead><tbody>
-          {{range .InvitationCodes}}<tr><td><code>{{.Prefix}}…</code></td><td>{{.Status}}</td><td>{{.UsedCount}} / {{.MaxUses}}</td><td>{{if .ValidUntil}}{{formatTime .ValidUntil}}{{else}}跟随批次{{end}}</td><td>{{formatTime .CreatedAt}}</td><td>{{if and $.CanOperate (eq .Status "ACTIVE")}}<form action="/admin/registration/invitations/codes/{{.ID}}/status" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-code-status:%s" .ID)}}"><input type="hidden" name="reason" value="停用邀请码"><input type="hidden" name="status" value="DISABLED"><button class="danger-outline" type="submit">停用</button></form>{{else if and $.CanOperate (eq .Status "DISABLED")}}<form action="/admin/registration/invitations/codes/{{.ID}}/status" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-code-enable:%s" .ID)}}"><input type="hidden" name="reason" value="启用邀请码"><input type="hidden" name="status" value="ACTIVE"><button type="submit">启用</button></form>{{else}}—{{end}}</td></tr>
+          {{range .InvitationCodes}}<tr><td><code>{{.Prefix}}…</code></td><td>{{.Status}}</td><td>{{.UsedCount}} / {{.MaxUses}}</td><td>{{if .ValidUntil}}{{formatTime .ValidUntil}}{{else}}跟随批次{{end}}</td><td>{{formatTime .CreatedAt}}</td><td>{{if and $.CanOperate (eq .Status "ACTIVE")}}<form action="{{$.AdminBasePath}}/registration/invitations/codes/{{.ID}}/status" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-code-status:%s" .ID)}}"><input type="hidden" name="reason" value="停用邀请码"><input type="hidden" name="status" value="DISABLED"><button class="danger-outline" type="submit">停用</button></form>{{else if and $.CanOperate (eq .Status "DISABLED")}}<form action="{{$.AdminBasePath}}/registration/invitations/codes/{{.ID}}/status" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "invitation-code-enable:%s" .ID)}}"><input type="hidden" name="reason" value="启用邀请码"><input type="hidden" name="status" value="ACTIVE"><button type="submit">启用</button></form>{{else}}—{{end}}</td></tr>
           {{else}}<tr><td colspan="6" class="empty-cell">所选批次暂无代码。</td></tr>{{end}}
         </tbody></table></div>{{end}}
       </section>
@@ -96,7 +96,7 @@
         </tbody></table></div>
       </section>
       {{end}}
-      <footer class="admin-footer"><span>邀请码只用于注册准入；完整代码仅在生成回执中显示一次。</span><a href="/admin">返回运行管理台</a></footer>
+      <footer class="admin-footer"><span>邀请码只用于注册准入；完整代码仅在生成回执中显示一次。</span><a href="{{.AdminBasePath}}">返回运行管理台</a></footer>
     </main>
   </div>
 </body>

@@ -63,6 +63,43 @@ func newKeycloakAdminTestClient(t *testing.T, handler http.Handler, timeout time
 	return client, server
 }
 
+func TestKeycloakAdminDefaultsTokenAndAdminRequestsToPrivateBackchannel(t *testing.T) {
+	var tokenHits, adminHits atomic.Int32
+	backchannel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/auth/realms/termlink/protocol/openid-connect/token":
+			tokenHits.Add(1)
+			tokenResponse(w, "backchannel-token")
+		case "/auth/admin/realms/termlink/users":
+			adminHits.Add(1)
+			w.WriteHeader(http.StatusCreated)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer backchannel.Close()
+	client, err := NewKeycloakAdminClient(KeycloakAdminConfig{
+		Issuer:            "https://public.example/auth/realms/termlink",
+		BackchannelIssuer: backchannel.URL + "/auth/realms/termlink",
+		ClientID:          "registration-recovery", ClientSecret: "provider-client-secret",
+		RegistrationProofKey: keycloakTestProofKey, HTTPClient: backchannel.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := DirectRegistrationInput{
+		Username: "backchannel-user", Nickname: "Backchannel user",
+		Email: "backchannel-user@example.test", Password: "correct horse battery staple",
+		Confirm: "correct horse battery staple",
+	}
+	if err := client.Register(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	if tokenHits.Load() != 1 || adminHits.Load() != 1 {
+		t.Fatalf("backchannel token/admin hits=%d/%d, want 1/1", tokenHits.Load(), adminHits.Load())
+	}
+}
+
 func tokenResponse(w http.ResponseWriter, token string) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{

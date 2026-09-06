@@ -58,23 +58,15 @@
           <article><small>运行会话</small><strong>{{.Dashboard.RunningSessions}}</strong><span>共 {{.Dashboard.Sessions}} 个未删除会话</span></article>
           <article><small>Windows PC</small><strong>{{.Dashboard.PCs}}</strong><span>只统计路由元数据</span></article>
         </div>
-        <div class="admin-grid">
+        <div>
           <article class="admin-panel privacy-panel">
             <div class="panel-heading"><div><p class="eyebrow">E2EE BOUNDARY</p><h2>正文不可见</h2></div><span class="icon-badge" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.7 2.8 8 7 10 4.2-2 7-5.3 7-10V6zM9 12l2 2 4-4"/></svg></span></div>
-            <p>管理台只读取账号、设备、路由、序号和审计元数据。终端标题、命令、输出和历史明文不会进入服务端页面或数据库。</p>
+            <p>管理台只读取账号、设备、路由和序号等运行元数据。终端标题、命令、输出和历史明文不会进入服务端页面或数据库。</p>
             <dl class="fact-grid">
               <div><dt>Schema</dt><dd>v{{.Dashboard.SchemaVersion}}</dd></div>
               <div><dt>协议</dt><dd>Protobuf v1</dd></div>
               <div><dt>Relay</dt><dd>Opaque E2EE</dd></div>
             </dl>
-          </article>
-          <article class="admin-panel">
-            <div class="panel-heading"><div><p class="eyebrow">RECENT EVENTS</p><h2>最近安全事件</h2></div><a href="/admin?section=audit">全部审计 →</a></div>
-            <div class="compact-event-list">
-              {{range .RecentAuditEvents}}
-              <div><span class="event-result event-{{.Result}}" aria-hidden="true"></span><span><strong>{{.Action}}</strong><small>{{.TargetType}} · {{.Result}}</small></span><time>{{formatTime .CreatedAt}}</time></div>
-              {{else}}<p class="empty-copy">还没有安全事件。</p>{{end}}
-            </div>
           </article>
         </div>
       </section>
@@ -147,65 +139,6 @@
       </section>
       {{end}}
 
-      {{if eq .Section "announcements"}}
-      <section class="announcement-admin-shell" aria-labelledby="announcements-heading">
-        <div class="admin-panel">
-          <div class="panel-heading"><div><p class="eyebrow">USER COMMUNICATION</p><h2 id="announcements-heading">公告管理</h2><p>公告正文只按纯文本展示；已发布公告会根据 UTC 生效区间自动显示或隐藏。</p></div>{{if .CanManageAnnouncements}}<span class="state-pill state-TRUSTED">可管理</span>{{else}}<span class="state-pill">只读</span>{{end}}</div>
-          {{if .CanManageAnnouncements}}
-          <form class="admin-settings-form announcement-form" action="/admin/announcements" method="post">
-            <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey .ActionNonce "announcement-create"}}">
-            <label class="form-span"><span>标题</span><input name="title" maxlength="120" required placeholder="简洁说明本次公告"></label>
-            <label><span>级别</span><select name="severity"><option value="INFO">通知</option><option value="WARNING">提醒</option><option value="CRITICAL">重要</option></select></label>
-            <label><span>开始显示（UTC，可选）</span><input name="starts_at" type="datetime-local"></label>
-            <label><span>结束显示（UTC，可选）</span><input name="ends_at" type="datetime-local"></label>
-            <label class="form-span"><span>正文</span><textarea name="body" maxlength="8000" rows="5" required placeholder="正文会保留换行，但不会解析 HTML"></textarea></label>
-            <input type="hidden" name="reason" value="系统自动记录">
-            <button class="button button-primary" type="submit">创建草稿</button>
-          </form>
-          {{else}}<p class="muted-note">AUDITOR 可以查看公告，但不能创建、编辑、发布或下线。</p>{{end}}
-        </div>
-
-        <div class="announcement-admin-list">
-          {{range .Announcements}}
-          <article class="admin-panel announcement-admin-card announcement-{{.Severity}}">
-            <div class="panel-heading"><div><p class="eyebrow">{{announcementSeverityLabel .Severity}} · v{{.Version}}</p><h2>{{.Title}}</h2><p class="announcement-body">{{.Body}}</p></div><span class="state-pill state-{{.Status}}">{{announcementStatusLabel .Status}}</span></div>
-            <dl class="detail-list announcement-meta"><div><dt>生效</dt><dd>{{with .StartsAt}}{{formatTime .}}{{else}}发布后立即{{end}}</dd></div><div><dt>截止</dt><dd>{{with .EndsAt}}{{formatTime .}}{{else}}长期有效{{end}}</dd></div><div><dt>发布时间</dt><dd>{{with .PublishedAt}}{{formatTime .}}{{else}}尚未发布{{end}}</dd></div><div><dt>最近更新</dt><dd>{{formatTime .UpdatedAt}}</dd></div></dl>
-            {{if and $.CanManageAnnouncements (ne .Status "ARCHIVED")}}
-            <details class="announcement-editor"><summary>编辑公告</summary>
-              <form class="admin-settings-form announcement-form" action="/admin/announcements/{{.ID}}" method="post">
-                <input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="expected_version" value="{{.Version}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "announcement-update:%s:%d" .ID .Version)}}">
-                <label class="form-span"><span>标题</span><input name="title" value="{{.Title}}" maxlength="120" required></label>
-                <label><span>级别</span><select name="severity"><option value="INFO"{{if eq .Severity "INFO"}} selected{{end}}>通知</option><option value="WARNING"{{if eq .Severity "WARNING"}} selected{{end}}>提醒</option><option value="CRITICAL"{{if eq .Severity "CRITICAL"}} selected{{end}}>重要</option></select></label>
-                <label><span>开始显示（UTC）</span><input name="starts_at" type="datetime-local" value="{{formatAnnouncementTimeInput .StartsAt}}"></label>
-                <label><span>结束显示（UTC）</span><input name="ends_at" type="datetime-local" value="{{formatAnnouncementTimeInput .EndsAt}}"></label>
-                <label class="form-span"><span>正文</span><textarea name="body" maxlength="8000" rows="5" required>{{.Body}}</textarea></label>
-                <input type="hidden" name="reason" value="系统自动记录">
-                <button class="button button-quiet" type="submit">保存修改</button>
-              </form>
-            </details>
-            {{end}}
-            {{if $.CanManageAnnouncements}}
-            <div class="announcement-actions">
-              {{if ne .Status "PUBLISHED"}}<form action="/admin/announcements/{{.ID}}/transition" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="expected_version" value="{{.Version}}"><input type="hidden" name="target_status" value="PUBLISHED"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "announcement-publish:%s:%d" .ID .Version)}}"><input type="hidden" name="reason" value="系统自动记录"><button class="button button-primary" type="submit">发布公告</button></form>{{end}}
-              {{if ne .Status "ARCHIVED"}}<form action="/admin/announcements/{{.ID}}/transition" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="expected_version" value="{{.Version}}"><input type="hidden" name="target_status" value="ARCHIVED"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "announcement-archive:%s:%d" .ID .Version)}}"><input type="hidden" name="reason" value="系统自动记录"><button class="danger-outline" type="submit">下线公告</button></form>{{end}}
-            </div>
-            {{end}}
-          </article>
-          {{else}}<div class="admin-panel"><p class="empty-copy">还没有公告。创建草稿后，经复核再发布。</p></div>{{end}}
-        </div>
-      </section>
-      {{end}}
-
-      {{if eq .Section "audit"}}
-      <section class="admin-panel" aria-labelledby="audit-heading">
-        <div class="panel-heading"><div><p class="eyebrow">IMMUTABLE METADATA</p><h2 id="audit-heading">安全审计</h2><p>不包含命令、终端正文、Token 或 Secret。</p></div><span class="count-pill">最近 {{len .Dashboard.AuditEvents}} 条</span></div>
-        <div class="admin-table-wrap"><table class="admin-table">
-          <thead><tr><th>时间</th><th>动作</th><th>目标</th><th>结果</th><th>Trace ID</th></tr></thead>
-          <tbody>{{range .Dashboard.AuditEvents}}<tr><td>{{formatTime .CreatedAt}}</td><td><strong>{{.Action}}</strong></td><td>{{.TargetType}} <code class="masked-id" title="目标引用已脱敏">{{if .TargetID}}{{printf "%.8s…" .TargetID}}{{else}}—{{end}}</code></td><td><span class="state-pill event-{{.Result}}">{{.Result}}</span></td><td><code>{{.TraceID}}</code></td></tr>{{else}}<tr><td colspan="5" class="empty-cell">还没有审计事件。</td></tr>{{end}}</tbody>
-        </table></div>
-      </section>
-      {{end}}
-
       {{if eq .Section "identity"}}
       <section class="admin-grid">
         <article class="admin-panel"><div class="panel-heading"><div><p class="eyebrow">OIDC AUTHORITY</p><h2>身份服务</h2></div></div>
@@ -228,7 +161,7 @@
             <td data-label="账号"><strong>{{.Reference}}</strong><small>{{shortID .ID}}</small></td><td data-label="角色"><span class="role-pill role-{{.Role}}">{{roleLabel .Role}}</span><small>{{.Role}}</small></td><td data-label="状态"><span class="state-pill state-{{.Status}}">{{statusLabel .Status}}</span></td><td data-label="设备">{{.Devices}}</td><td data-label="创建时间">{{formatTime .CreatedAt}}</td>
             <td data-label="操作">{{if $.CanManageAccounts}}<div class="row-actions">
               {{if ne .Status "DELETED"}}
-                <form action="/admin/accounts/{{.ID}}/role" method="post" data-confirm-action="role" data-account="{{.Reference}}">
+                <form action="{{$.AdminBasePath}}/accounts/{{.ID}}/role" method="post" data-confirm-action="role" data-account="{{.Reference}}">
                   <input type="hidden" name="csrf" value="{{$.CSRF}}">
                   <input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "account-role:%s" .ID)}}">
                   <label><span class="sr-only">修改 {{.Reference}} 角色</span><select name="role" aria-label="修改 {{.Reference}} 角色"><option value="USER"{{if eq .Role "USER"}} selected{{end}}>USER</option><option value="AUDITOR"{{if eq .Role "AUDITOR"}} selected{{end}}>AUDITOR</option><option value="ADMIN"{{if eq .Role "ADMIN"}} selected{{end}}>ADMIN</option><option value="SUPER_ADMIN"{{if eq .Role "SUPER_ADMIN"}} selected{{end}}>SUPER_ADMIN</option></select></label>
@@ -237,13 +170,13 @@
                 </form>
               {{end}}
               {{if eq .Status "ACTIVE"}}
-                <form action="/admin/accounts/{{.ID}}/status" method="post" data-confirm-action="lock" data-account="{{.Reference}}">
+                <form action="{{$.AdminBasePath}}/accounts/{{.ID}}/status" method="post" data-confirm-action="lock" data-account="{{.Reference}}">
                   <input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "account-lock:%s" .ID)}}"><input type="hidden" name="status" value="LOCKED">
                   <input type="hidden" name="reason" value="系统自动记录">
                   <button class="danger-outline" type="submit" aria-label="停用 {{.Reference}}">停用</button>
                 </form>
               {{else if eq .Status "LOCKED"}}
-                <form action="/admin/accounts/{{.ID}}/status" method="post" data-confirm-action="unlock" data-account="{{.Reference}}">
+                <form action="{{$.AdminBasePath}}/accounts/{{.ID}}/status" method="post" data-confirm-action="unlock" data-account="{{.Reference}}">
                   <input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "account-unlock:%s" .ID)}}"><input type="hidden" name="status" value="ACTIVE">
                   <input type="hidden" name="reason" value="系统自动记录">
                   <button type="submit" aria-label="启用 {{.Reference}}">启用</button>
@@ -260,8 +193,8 @@
 
       {{if eq .Section "settings"}}
       <section class="admin-panel" aria-labelledby="admin-route-heading">
-        <div class="panel-heading"><div><p class="eyebrow">SECURITY ENTRY</p><h2 id="admin-route-heading">管理中心安全入口</h2><p>启用后旧的 <code>/admin</code> 入口返回 404；这只收敛页面暴露面，不能替代角色、MFA、最近认证和审计。</p></div>{{if .AdminRoute.Custom}}<span class="state-pill state-VERIFIED">已自定义</span>{{else}}<span class="state-pill state-DRAFT">默认入口</span>{{end}}</div>
-        <form class="admin-settings-form" action="/admin/settings/admin-route" method="post">
+        <div class="panel-heading"><div><p class="eyebrow">SECURITY ENTRY</p><h2 id="admin-route-heading">管理中心安全入口</h2><p>启用后旧的 <code>/admin</code> 入口返回 404；这只收敛页面暴露面，不能替代角色、MFA 和最近认证。</p></div>{{if .AdminRoute.Custom}}<span class="state-pill state-VERIFIED">已自定义</span>{{else}}<span class="state-pill state-DRAFT">默认入口</span>{{end}}</div>
+        <form class="admin-settings-form" action="{{.AdminBasePath}}/settings/admin-route" method="post">
           <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="expected_version" value="{{.AdminRoute.Version}}"><input type="hidden" name="idempotency_key" value="{{actionKey .ActionNonce "admin-route-update"}}">
           <label><span>新入口段</span><input name="route_segment" minlength="16" maxlength="64" pattern="[A-Za-z0-9_-]{16,64}" autocomplete="off" required placeholder="例如 4hPzK8mQvX2sN7aB"></label>
           <label><span>再次输入</span><input name="route_confirmation" minlength="16" maxlength="64" pattern="[A-Za-z0-9_-]{16,64}" autocomplete="off" required></label>
@@ -273,7 +206,7 @@
       {{if gt .HumanVerification.Version 0}}
       <section class="admin-panel" aria-labelledby="human-verification-heading">
         <div class="panel-heading"><div><p class="eyebrow">ANTI-AUTOMATION</p><h2 id="human-verification-heading">注册人机验证</h2><p>管理 Cloudflare Turnstile 的 Site Key 与 Secret。Secret 只写不读，页面永不回显原文。</p></div>{{if .HumanVerification.Enabled}}<span class="state-pill state-VERIFIED">已启用</span>{{else}}<span class="state-pill state-DRAFT">未启用</span>{{end}}</div>
-        <form class="admin-settings-form" action="/admin/settings/human-verification" method="post">
+        <form class="admin-settings-form" action="{{.AdminBasePath}}/settings/human-verification" method="post">
           <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="expected_version" value="{{.HumanVerification.Version}}"><input type="hidden" name="idempotency_key" value="{{actionKey .ActionNonce "human-verification-update"}}">
           <label><span>Turnstile Site Key</span><input name="site_key" value="{{.HumanVerification.SiteKey}}" maxlength="256" autocomplete="off" placeholder="0x4AAAA..."></label>
           <label><span>Turnstile Secret</span><input name="secret" type="password" autocomplete="new-password" maxlength="512" placeholder="{{if .HumanVerification.SecretConfigured}}留空沿用已保存 Secret{{else}}输入 Turnstile Secret{{end}}"></label>
@@ -287,7 +220,7 @@
       {{end}}
       <section class="admin-panel" aria-labelledby="service-email-heading">
         <div class="panel-heading"><div><p class="eyebrow">VERIFIED DELIVERY</p><h2 id="service-email-heading">服务邮箱</h2><p>保存时必须成功发送测试邮件；密码只写不读，页面不会回显 Secret。</p></div><span class="state-pill state-{{.ServiceEmail.Status}}">{{.ServiceEmail.Status}}</span></div>
-        <form class="admin-settings-form" action="/admin/settings/service-email" method="post">
+        <form class="admin-settings-form" action="{{.AdminBasePath}}/settings/service-email" method="post">
           <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="expected_version" value="{{.ServiceEmail.Version}}"><input type="hidden" name="idempotency_key" value="{{actionKey .ActionNonce "service-email-update"}}">
           <label><span>SMTP 主机</span><input name="smtp_host" value="{{.ServiceEmail.SMTPHost}}" maxlength="253" required placeholder="smtp.example.com"></label>
           <label><span>端口</span><input name="smtp_port" type="number" min="1" max="65535" value="{{.ServiceEmail.SMTPPort}}" required></label>

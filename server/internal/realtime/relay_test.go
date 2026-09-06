@@ -2377,6 +2377,46 @@ func TestAndroidExpiredRouteRevalidatesAndFailsClosed(t *testing.T) {
 	}
 }
 
+func TestAndroidRouteTransientFailureUsesBoundedVerifiedRouteGrace(t *testing.T) {
+	authority := newCountingRouteAuthority()
+	leasing := &fakeLiveSessionStore{}
+	hub := NewHubWithObserver(nil, nil, nil, nil)
+	hub.store, hub.leases = authority, leasing
+	userID, androidID, pcID, sessionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	route := store.SessionRouteAuthorization{Permission: "CONTROL", PCDeviceID: pcID}
+	authority.set(userID, androidID, sessionID, route, nil)
+	android, pc := activeRoutePeers(hub, userID, androidID, pcID)
+	if err := android.route(androidRouteEnvelope(realtimewire.Subscribe, pcID), sessionID, []byte("subscribe")); err != nil {
+		t.Fatalf("subscribe route: %v", err)
+	}
+	<-pc.send
+	authority.set(userID, androidID, sessionID, store.SessionRouteAuthorization{}, errors.New("database unavailable"))
+
+	hub.mu.Lock()
+	cached := android.subscriptionRoutes[sessionID]
+	cached.validUntil = time.Now().Add(-time.Second)
+	android.subscriptionRoutes[sessionID] = cached
+	hub.mu.Unlock()
+	if err := android.route(androidRouteEnvelope(realtimewire.OutputACK, pcID), sessionID, []byte("within-grace")); err != nil {
+		t.Fatalf("transient route within grace: %v", err)
+	}
+	if got := string(<-pc.send); got != "within-grace" {
+		t.Fatalf("transient route frame = %q", got)
+	}
+
+	hub.mu.Lock()
+	cached = android.subscriptionRoutes[sessionID]
+	cached.failureUntil = time.Now().Add(-time.Second)
+	android.subscriptionRoutes[sessionID] = cached
+	hub.mu.Unlock()
+	if err := android.route(androidRouteEnvelope(realtimewire.OutputACK, pcID), sessionID, []byte("after-grace")); err == nil {
+		t.Fatal("transient route remained authorized after failure grace")
+	}
+	if _, subscribed := hub.subscriptionRoute(android, sessionID); subscribed {
+		t.Fatal("expired transient route remained subscribed")
+	}
+}
+
 func TestAndroidRouteCacheRejectsWrongSessionPCAndPCConnection(t *testing.T) {
 	authority := newCountingRouteAuthority()
 	leasing := &fakeLiveSessionStore{}
@@ -2444,7 +2484,7 @@ func TestRefreshSubscriptionsUsesOneBatchAuthorityQuery(t *testing.T) {
 	}
 }
 
-func TestRefreshSubscriptionsBatchReservationErrorFailsClosed(t *testing.T) {
+func TestRefreshSubscriptionsBatchReservationErrorUsesBoundedVerifiedRouteGrace(t *testing.T) {
 	authority := newBatchedRouteAuthority()
 	leasing := &fakeLiveSessionStore{reserveErr: errors.New("Valkey unavailable")}
 	hub := NewHubWithObserver(nil, nil, nil, nil)
@@ -2458,11 +2498,19 @@ func TestRefreshSubscriptionsBatchReservationErrorFailsClosed(t *testing.T) {
 	}
 
 	android.refreshSubscriptions()
-	if got := subscriptionCountForPeer(hub, android); got != 0 {
-		t.Fatalf("subscriptions after reservation batch error = %d, want 0", got)
+	if got := subscriptionCountForPeer(hub, android); got != 4 {
+		t.Fatalf("subscriptions during transient reservation error = %d, want 4", got)
 	}
-	if leasing.reserveBatchCalls() != 1 || leasing.releaseCalls() != 4 {
-		t.Fatalf("reservation batches/releases = %d/%d, want 1/4", leasing.reserveBatchCalls(), leasing.releaseCalls())
+	if leasing.reserveBatchCalls() != 1 || leasing.releaseCalls() != 0 {
+		t.Fatalf("reservation batches/releases = %d/%d, want 1/0", leasing.reserveBatchCalls(), leasing.releaseCalls())
+	}
+	expireSubscriptionFailureGrace(hub, android)
+	android.refreshSubscriptions()
+	if got := subscriptionCountForPeer(hub, android); got != 0 {
+		t.Fatalf("subscriptions after reservation failure grace = %d, want 0", got)
+	}
+	if leasing.reserveBatchCalls() != 2 || leasing.releaseCalls() != 4 {
+		t.Fatalf("reservation batches/releases after grace = %d/%d, want 2/4", leasing.reserveBatchCalls(), leasing.releaseCalls())
 	}
 }
 
@@ -2548,7 +2596,7 @@ func TestRefreshSubscriptionsBatchMissingAndExpiredResultsUnsubscribe(t *testing
 	}
 }
 
-func TestRefreshSubscriptionsBatchErrorFailsClosed(t *testing.T) {
+func TestRefreshSubscriptionsBatchErrorUsesBoundedVerifiedRouteGrace(t *testing.T) {
 	authority := newBatchedRouteAuthority()
 	authority.err = errors.New("authority database unavailable")
 	leasing := &fakeLiveSessionStore{}
@@ -2560,16 +2608,34 @@ func TestRefreshSubscriptionsBatchErrorFailsClosed(t *testing.T) {
 	}
 
 	android.refreshSubscriptions()
-	if got := subscriptionCountForPeer(hub, android); got != 0 {
-		t.Fatalf("subscriptions after batch error = %d, want 0", got)
+	if got := subscriptionCountForPeer(hub, android); got != 4 {
+		t.Fatalf("subscriptions during transient authority error = %d, want 4", got)
 	}
-	if leasing.releaseCalls() != 4 {
-		t.Fatalf("live-session releases after batch error = %d, want 4", leasing.releaseCalls())
+	if leasing.releaseCalls() != 0 {
+		t.Fatalf("live-session releases during transient authority error = %d, want 0", leasing.releaseCalls())
 	}
 	batchCalls, singleCalls, _ := authority.counts()
 	if batchCalls != 1 || singleCalls != 0 {
 		t.Fatalf("authority calls batch/single = %d/%d, want 1/0", batchCalls, singleCalls)
 	}
+	expireSubscriptionFailureGrace(hub, android)
+	android.refreshSubscriptions()
+	if got := subscriptionCountForPeer(hub, android); got != 0 {
+		t.Fatalf("subscriptions after authority failure grace = %d, want 0", got)
+	}
+	if leasing.releaseCalls() != 4 {
+		t.Fatalf("live-session releases after authority failure grace = %d, want 4", leasing.releaseCalls())
+	}
+}
+
+func expireSubscriptionFailureGrace(hub *Hub, android *peer) {
+	hub.mu.Lock()
+	for sessionID, cached := range android.subscriptionRoutes {
+		cached.validUntil = time.Now().Add(-time.Second)
+		cached.failureUntil = time.Now().Add(-time.Second)
+		android.subscriptionRoutes[sessionID] = cached
+	}
+	hub.mu.Unlock()
 }
 
 func TestRefreshSubscriptionsBoundsAuthorityBatchSize(t *testing.T) {
@@ -2764,6 +2830,34 @@ func TestControlPolicyFailureRevocationCrossAccountAndLocalPriorityFailClosed(t 
 			t.Fatalf("input after local-priority release = %v, want ErrDenied", err)
 		}
 	})
+}
+
+func TestControlPolicyTransientFailureUsesBoundedVerifiedPolicyGrace(t *testing.T) {
+	hub, policies, _, pc, first, _, sessionID := controlPolicyFixture(t, store.ControlModeSingle)
+	if err := first.route(androidRouteEnvelope(realtimewire.InputEvent, pc.principal.Device.ID), sessionID, []byte("prime")); err != nil {
+		t.Fatalf("prime policy cache: %v", err)
+	}
+	<-pc.send
+	policies.set(store.SessionControlPolicy{}, errors.New("database unavailable"))
+	hub.mu.Lock()
+	cached := first.controlPolicies[sessionID]
+	cached.validUntil = time.Now().Add(-time.Second)
+	first.controlPolicies[sessionID] = cached
+	hub.mu.Unlock()
+	if err := first.route(androidRouteEnvelope(realtimewire.InputEvent, pc.principal.Device.ID), sessionID, []byte("within-grace")); err != nil {
+		t.Fatalf("transient policy within grace: %v", err)
+	}
+	if got := string(<-pc.send); got != "within-grace" {
+		t.Fatalf("transient policy frame = %q", got)
+	}
+	hub.mu.Lock()
+	cached = first.controlPolicies[sessionID]
+	cached.failureUntil = time.Now().Add(-time.Second)
+	first.controlPolicies[sessionID] = cached
+	hub.mu.Unlock()
+	if err := first.route(androidRouteEnvelope(realtimewire.InputEvent, pc.principal.Device.ID), sessionID, []byte("after-grace")); !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("transient policy after grace = %v, want ErrDenied", err)
+	}
 }
 
 func controlPolicyFixture(t *testing.T, mode store.ControlMode) (*Hub, *fakeControlPolicyStore, *fakeLiveSessionStore, *peer, *peer, *peer, uuid.UUID) {

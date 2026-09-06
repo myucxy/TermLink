@@ -119,3 +119,49 @@ func TestRegistrationAdminGeneratesOneTimeInvitationReceipt(t *testing.T) {
 		t.Fatalf("one-time invitation receipt is incomplete: %s", response.Body.String())
 	}
 }
+
+func TestRegistrationAdminUsesCurrentCustomAdminRoute(t *testing.T) {
+	portal := newTestPortal(t, &testOIDCFlow{})
+	base := newTestPortalRepository()
+	base.account.Role = store.RoleSuperAdmin
+	batchID := uuid.MustParse("88888888-8888-4888-8888-888888888888")
+	repository := &testRegistrationAdminRepository{
+		testPortalRepository: base,
+		policy:               store.RegistrationPolicy{Mode: store.RegistrationInviteRequired, Version: 2},
+		batches:              []store.InvitationBatch{{ID: batchID, Name: "custom-route", Status: "ACTIVE", DefaultMaxUses: 1}},
+	}
+	portal.config.Repository = repository
+	portal.config.RegistrationCodeKey = []byte("0123456789abcdef0123456789abcdef")
+	const segment = "4hPzK8mQvX2sN7aB"
+	enableTestAdminRoute(t, portal, base, segment)
+	cookie := portalSessionCookie(t, portal, store.RoleSuperAdmin, "registration-route-csrf", time.Minute)
+	basePath := "/control/" + segment
+
+	overview := performRequest(portal.Handler(), http.MethodGet, basePath, nil, cookie)
+	if overview.Code != http.StatusOK || !strings.Contains(overview.Body.String(), `href="`+basePath+`/registration"`) {
+		t.Fatalf("custom management navigation status/body = %d/%q", overview.Code, overview.Body.String())
+	}
+	registration := performRequest(portal.Handler(), http.MethodGet, basePath+"/registration", nil, cookie)
+	if registration.Code != http.StatusOK {
+		t.Fatalf("custom registration page status/body = %d/%q", registration.Code, registration.Body.String())
+	}
+	for _, expected := range []string{
+		`href="` + basePath + `?section=overview"`,
+		`action="` + basePath + `/registration/policy"`,
+		`action="` + basePath + `/registration/invitations/batches"`,
+	} {
+		if !strings.Contains(registration.Body.String(), expected) {
+			t.Fatalf("custom registration page omitted %q", expected)
+		}
+	}
+	if strings.Contains(registration.Body.String(), `href="/admin`) || strings.Contains(registration.Body.String(), `action="/admin`) {
+		t.Fatal("custom registration page leaked the disabled default management route")
+	}
+	receipt := performPortalForm(portal.Handler(), basePath+"/registration/invitations/batches/"+batchID.String()+"/codes", url.Values{
+		"csrf": {"registration-route-csrf"}, "idempotency_key": {"custom-route-generate-0001"},
+		"reason": {"验证自定义入口"}, "count": {"1"}, "max_uses": {"1"},
+	}, cookie)
+	if receipt.Code != http.StatusCreated || !strings.Contains(receipt.Body.String(), `href="`+basePath+`/registration?id=`+batchID.String()+`"`) {
+		t.Fatalf("custom registration receipt status/body = %d/%q", receipt.Code, receipt.Body.String())
+	}
+}

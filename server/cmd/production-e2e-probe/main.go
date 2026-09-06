@@ -286,6 +286,11 @@ func run() error {
 		return fmt.Errorf("connect Android realtime: %w", err)
 	}
 	defer androidSocket.Close()
+	if os.Getenv("TERMLINK_ACCEPTANCE_REQUIRE_DIRECT_TRANSPORT") == "1" {
+		if err := p.verifyDirectFailureIsolation(android); err != nil {
+			return err
+		}
+	}
 
 	subscribe, err := opaqueEnvelope(android.id, pc.id, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 1)
 	if err != nil {
@@ -297,49 +302,59 @@ func run() error {
 	if _, err := p.signedJSON(android, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/lease", map[string]any{}, uuid.NewString(), http.StatusCreated); err != nil {
 		return fmt.Errorf("acquire lease: %w", err)
 	}
-	input, err := opaqueEnvelope(android.id, pc.id, sessionID, realtimewire.InputEvent, realtimewire.AndroidToPC, 2)
+	androidSequence := uint64(2)
+	pcSequence := uint64(1)
+	input, err := opaqueEnvelope(android.id, pc.id, sessionID, realtimewire.InputEvent, realtimewire.AndroidToPC, androidSequence)
 	if err != nil {
 		return err
 	}
 	if err := routeAndMatch(androidSocket, pcSocket, input); err != nil {
 		return fmt.Errorf("route leased input: %w", err)
 	}
-	output, err := opaqueEnvelope(pc.id, android.id, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 1)
+	androidSequence++
+	output, err := opaqueEnvelope(pc.id, android.id, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, pcSequence)
 	if err != nil {
 		return err
 	}
 	if err := routeAndMatch(pcSocket, androidSocket, output); err != nil {
 		return fmt.Errorf("route subscribed output: %w", err)
 	}
-	hostHistoryRequest, err := opaqueEnvelope(android.id, pc.id, sessionID, realtimewire.HostHistoryRequest, realtimewire.AndroidToPC, 3)
+	pcSequence++
+	if err := p.verifyRealtimeStability(pcSocket, androidSocket, pc, android, sessionID, &pcSequence, &androidSequence); err != nil {
+		return err
+	}
+	hostHistoryRequest, err := opaqueEnvelope(android.id, pc.id, sessionID, realtimewire.HostHistoryRequest, realtimewire.AndroidToPC, androidSequence)
 	if err != nil {
 		return err
 	}
 	if err := routeAndMatch(androidSocket, pcSocket, hostHistoryRequest); err != nil {
 		return fmt.Errorf("route Host History request: %w", err)
 	}
-	hostHistoryResponse, err := opaqueEnvelope(pc.id, android.id, sessionID, realtimewire.HostHistoryResponse, realtimewire.PCToAndroid, 2)
+	androidSequence++
+	hostHistoryResponse, err := opaqueEnvelope(pc.id, android.id, sessionID, realtimewire.HostHistoryResponse, realtimewire.PCToAndroid, pcSequence)
 	if err != nil {
 		return err
 	}
 	if err := routeAndMatch(pcSocket, androidSocket, hostHistoryResponse); err != nil {
 		return fmt.Errorf("route Host History response: %w", err)
 	}
-	hostHistoryControl, err := opaqueEnvelope(android.id, pc.id, sessionID, realtimewire.HostHistoryControl, realtimewire.AndroidToPC, 4)
+	pcSequence++
+	hostHistoryControl, err := opaqueEnvelope(android.id, pc.id, sessionID, realtimewire.HostHistoryControl, realtimewire.AndroidToPC, androidSequence)
 	if err != nil {
 		return err
 	}
 	if err := routeAndMatch(androidSocket, pcSocket, hostHistoryControl); err != nil {
 		return fmt.Errorf("route Host History control: %w", err)
 	}
-	terminateRequest, err := opaqueEnvelope(android.id, pc.id, sessionID, realtimewire.SessionTerminateRequest, realtimewire.AndroidToPC, 5)
+	androidSequence++
+	terminateRequest, err := opaqueEnvelope(android.id, pc.id, sessionID, realtimewire.SessionTerminateRequest, realtimewire.AndroidToPC, androidSequence)
 	if err != nil {
 		return err
 	}
 	if err := routeAndMatch(androidSocket, pcSocket, terminateRequest); err != nil {
 		return fmt.Errorf("route Session terminate request: %w", err)
 	}
-	terminateResponse, err := opaqueEnvelope(pc.id, android.id, sessionID, realtimewire.SessionTerminateResponse, realtimewire.PCToAndroid, 3)
+	terminateResponse, err := opaqueEnvelope(pc.id, android.id, sessionID, realtimewire.SessionTerminateResponse, realtimewire.PCToAndroid, pcSequence)
 	if err != nil {
 		return err
 	}
@@ -354,7 +369,7 @@ func run() error {
 	}
 	if _, err := p.signedJSON(pc, http.MethodPut, "/v1/sessions/"+sessionID.String(), map[string]any{
 		"pc_id": pcID, "shell_type": "powershell", "title_cipher": "", "state": "EXITED",
-		"columns": 80, "rows": 24, "last_output_seq": 3, "ended_at": time.Now().UTC(),
+		"columns": 80, "rows": 24, "last_output_seq": pcSequence, "ended_at": time.Now().UTC(),
 	}, uuid.NewString(), http.StatusOK); err != nil {
 		return fmt.Errorf("exit history session: %w", err)
 	}
@@ -368,6 +383,103 @@ func run() error {
 	if _, err := p.signedJSON(pc, http.MethodDelete, "/v1/sessions/"+sessionID.String(), nil, uuid.NewString(), http.StatusNoContent); err != nil {
 		return fmt.Errorf("delete retired-history session catalog entry: %w", err)
 	}
+	return nil
+}
+
+func (p *probe) verifyDirectFailureIsolation(device *identity) error {
+	connection, err := p.connectDirectSignals(device, "android")
+	if err != nil {
+		return fmt.Errorf("open Direct failure-isolation connection: %w", err)
+	}
+	defer connection.Close()
+	_ = connection.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := connection.WriteMessage(websocket.BinaryMessage, []byte{0}); err != nil {
+		return errors.New("Direct failure-isolation frame write failed")
+	}
+	_ = connection.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, err = connection.ReadMessage()
+	var closeError *websocket.CloseError
+	if !errors.As(err, &closeError) || closeError.Code != websocket.ClosePolicyViolation {
+		return errors.New("Direct protocol failure was not isolated to its signalling connection")
+	}
+	return nil
+}
+
+func (p *probe) verifyRealtimeStability(
+	pcSocket, androidSocket *websocket.Conn,
+	pc, android *identity,
+	sessionID uuid.UUID,
+	pcSequence *uint64,
+	androidSequence *uint64,
+) error {
+	raw := strings.TrimSpace(os.Getenv("TERMLINK_ACCEPTANCE_REALTIME_SOAK_SECONDS"))
+	if raw == "" || raw == "0" {
+		return nil
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil || seconds < 1 || seconds > 20 {
+		return errors.New("Realtime stability soak must be between 1 and 20 seconds")
+	}
+	fmt.Println("Production realtime stability soak started.")
+	deadline := time.NewTimer(time.Duration(seconds) * time.Second)
+	ticker := time.NewTicker(time.Second)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for {
+		select {
+		case <-deadline.C:
+			return nil
+		case <-ticker.C:
+			if err := verifyRealtimeLiveness(pcSocket); err != nil {
+				return fmt.Errorf("PC realtime liveness during stability soak: %w", err)
+			}
+			if err := verifyRealtimeLiveness(androidSocket); err != nil {
+				return fmt.Errorf("Android realtime liveness during stability soak: %w", err)
+			}
+			input, err := opaqueEnvelope(android.id, pc.id, sessionID, realtimewire.InputEvent, realtimewire.AndroidToPC, *androidSequence)
+			if err != nil {
+				return err
+			}
+			if err := routeAndMatch(androidSocket, pcSocket, input); err != nil {
+				return fmt.Errorf("route input during realtime stability soak: %w", err)
+			}
+			*androidSequence++
+			output, err := opaqueEnvelope(pc.id, android.id, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, *pcSequence)
+			if err != nil {
+				return err
+			}
+			if err := routeAndMatch(pcSocket, androidSocket, output); err != nil {
+				return fmt.Errorf("route output during realtime stability soak: %w", err)
+			}
+			*pcSequence++
+		}
+	}
+}
+
+func verifyRealtimeLiveness(connection *websocket.Conn) error {
+	probeID := uuid.NewString()
+	request, err := json.Marshal(map[string]string{"type": "ping", "probe_id": probeID})
+	if err != nil {
+		return err
+	}
+	defer clear(request)
+	_ = connection.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := connection.WriteMessage(websocket.TextMessage, request); err != nil {
+		return errors.New("liveness request write failed")
+	}
+	_ = connection.SetReadDeadline(time.Now().Add(5 * time.Second))
+	messageType, response, err := connection.ReadMessage()
+	if err != nil {
+		return errors.New("liveness response read failed")
+	}
+	defer clear(response)
+	var pong map[string]string
+	if messageType != websocket.TextMessage || json.Unmarshal(response, &pong) != nil ||
+		len(pong) != 2 || pong["type"] != "pong" || pong["probe_id"] != probeID {
+		return errors.New("liveness response is invalid")
+	}
+	_ = connection.SetReadDeadline(time.Time{})
+	_ = connection.SetWriteDeadline(time.Time{})
 	return nil
 }
 
@@ -1315,7 +1427,7 @@ func (p *probe) connectRealtime(device *identity, role string) (*websocket.Conn,
 	_ = connection.SetWriteDeadline(time.Now().Add(15 * time.Second))
 	hello, _ := json.Marshal(map[string]any{
 		"role": role, "protocol_versions": []int{1},
-		"capabilities": []string{"cumulative_ack", "e2ee_x25519_chacha20poly1305", "flow_control_v1", "lease_v1", "bounded_event_replay_v1", "host_history_v1"},
+		"capabilities": []string{"cumulative_ack", "e2ee_x25519_chacha20poly1305", "flow_control_v1", "lease_v1", "bounded_event_replay_v1", "host_history_v1", "liveness_probe_v1"},
 	})
 	if err := connection.WriteMessage(websocket.TextMessage, hello); err != nil {
 		connection.Close()

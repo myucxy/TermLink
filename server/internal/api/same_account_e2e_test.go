@@ -6,7 +6,6 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -72,7 +71,7 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 		},
 		"same-account-android": {
 			Issuer: issuer, Subject: sameSubject, AuthorizedParty: "termlink-android",
-			TokenID: "same-account-android-" + uuid.NewString(),
+			TokenID: "same-account-android-" + uuid.NewString(), MFA: true, AuthenticatedAt: time.Now(),
 		},
 		"same-account-android-two": {
 			Issuer: issuer, Subject: sameSubject, AuthorizedParty: "termlink-android",
@@ -139,6 +138,11 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	sameAccountSignedJSON(t, testServer.URL, windows, "same-account-windows", http.MethodPut, "/v1/pcs/"+pcID.String(), map[string]any{
 		"name": "Same-account PC", "agent_version": "e2e", "key_epoch": 1,
 	}, "same-account-upsert-pc", http.StatusOK)
+	sameAccountSignedJSONWithHeaders(t, testServer.URL, android, "same-account-android", http.MethodPut, "/v1/account/pcs/"+pcID.String()+"/control-policy", map[string]any{
+		"remote_routing_enabled": true, "mode": "COLLABORATIVE", "local_priority": true, "expected_version": 1,
+	}, "same-account-collaborative-policy", map[string]string{
+		"X-TermLink-Operation-Reason": "verify same-account collaborative control",
+	}, http.StatusOK)
 	sameAccountSignedJSON(t, testServer.URL, windows, "same-account-windows", http.MethodPut, "/v1/sessions/"+sessionID.String(), map[string]any{
 		"pc_id": pcID, "shell_type": "pwsh", "title_cipher": "", "state": "RUNNING",
 		"columns": 120, "rows": 40, "last_output_seq": 0,
@@ -151,6 +155,10 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	subscription := sameAccountSignedJSON(t, testServer.URL, android, "same-account-android", http.MethodPost, "/v1/sessions/"+sessionID.String()+"/subscribe", map[string]any{}, "same-account-rest-subscribe", http.StatusCreated)
 	if subscription["permission"] != "MANAGE" || strings.TrimSpace(fmt.Sprint(subscription["token"])) == "" {
 		t.Fatalf("same-account subscription did not receive direct MANAGE authority: %v", subscription)
+	}
+	secondSubscription := sameAccountSignedJSON(t, testServer.URL, androidTwo, "same-account-android-two", http.MethodPost, "/v1/sessions/"+sessionID.String()+"/subscribe", map[string]any{}, "same-account-rest-subscribe-two", http.StatusCreated)
+	if secondSubscription["permission"] != "MANAGE" || strings.TrimSpace(fmt.Sprint(secondSubscription["token"])) == "" {
+		t.Fatalf("second same-account subscription did not receive direct MANAGE authority: %v", secondSubscription)
 	}
 
 	lease := sameAccountSignedJSON(t, testServer.URL, android, "same-account-android", http.MethodPost, "/v1/sessions/"+sessionID.String()+"/lease", map[string]any{}, "same-account-lease", http.StatusCreated)
@@ -178,6 +186,11 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	if got := readEnvelope(t, pcSocket); !bytes.Equal(got, subscribeFrame) {
 		t.Fatal("Relay changed the same-account SUBSCRIBE frame")
 	}
+	secondSubscribeFrame := testEnvelope(androidTwo, windows, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 1)
+	writeEnvelope(t, androidTwoSocket, secondSubscribeFrame)
+	if got := readEnvelope(t, pcSocket); !bytes.Equal(got, secondSubscribeFrame) {
+		t.Fatal("Relay changed the second same-account SUBSCRIBE frame")
+	}
 	outputFrame := testEnvelope(windows, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 1)
 	writeEnvelope(t, pcSocket, outputFrame)
 	if got := readEnvelope(t, androidSocket); !bytes.Equal(got, outputFrame) {
@@ -188,7 +201,7 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	if got := readEnvelope(t, pcSocket); !bytes.Equal(got, inputFrame) {
 		t.Fatal("Relay changed or misdirected the leased Android input frame")
 	}
-	secondInputFrame := testEnvelope(androidTwo, windows, sessionID, realtimewire.InputEvent, realtimewire.AndroidToPC, 1)
+	secondInputFrame := testEnvelope(androidTwo, windows, sessionID, realtimewire.InputEvent, realtimewire.AndroidToPC, 2)
 	writeEnvelope(t, androidTwoSocket, secondInputFrame)
 	if got := readEnvelope(t, pcSocket); !bytes.Equal(got, secondInputFrame) {
 		t.Fatal("Relay rejected or changed the second Android's shared-lease input frame")
@@ -196,7 +209,7 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 
 	sameAccountSignedJSON(t, testServer.URL, android, "same-account-android", http.MethodDelete, "/v1/sessions/"+sessionID.String()+"/lease/"+leaseID.String(), nil, "same-account-release-first-participant", http.StatusNoContent)
 	_ = androidSocket.Close()
-	remainingInputFrame := testEnvelope(androidTwo, windows, sessionID, realtimewire.InputEvent, realtimewire.AndroidToPC, 2)
+	remainingInputFrame := testEnvelope(androidTwo, windows, sessionID, realtimewire.InputEvent, realtimewire.AndroidToPC, 3)
 	writeEnvelope(t, androidTwoSocket, remainingInputFrame)
 	if got := readEnvelope(t, pcSocket); !bytes.Equal(got, remainingInputFrame) {
 		t.Fatal("first Android release/disconnect revoked the remaining Android's shared control")
@@ -206,7 +219,7 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 		t.Fatalf("first Android did not rejoin the existing shared lease: original=%v rejoined=%v", lease, rejoinedLease)
 	}
 	sameAccountSignedJSON(t, testServer.URL, windows, "same-account-windows", http.MethodPost, "/v1/devices/"+android.id.String()+"/revoke", map[string]any{}, "same-account-revoke-first-android", http.StatusOK)
-	postRevokeInputFrame := testEnvelope(androidTwo, windows, sessionID, realtimewire.InputEvent, realtimewire.AndroidToPC, 3)
+	postRevokeInputFrame := testEnvelope(androidTwo, windows, sessionID, realtimewire.InputEvent, realtimewire.AndroidToPC, 4)
 	writeEnvelope(t, androidTwoSocket, postRevokeInputFrame)
 	if got := readEnvelope(t, pcSocket); !bytes.Equal(got, postRevokeInputFrame) {
 		t.Fatal("first Android authority revocation revoked the remaining Android's shared control")
@@ -222,7 +235,8 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	crossSocket := sameAccountDialRealtime(t, testServer.URL, crossAndroid, "cross-account-android", "android")
 	crossSubscribe := testEnvelope(crossAndroid, windows, sessionID, realtimewire.Subscribe, realtimewire.AndroidToPC, 1)
 	writeEnvelope(t, crossSocket, crossSubscribe)
-	assertSameAccountSocketClosed(t, crossSocket, websocket.ClosePolicyViolation)
+	assertSameAccountRouteDeniedAndSocketAlive(t, pcSocket, crossSocket)
+	_ = crossSocket.Close()
 
 	sameAccountSignedJSON(t, testServer.URL, androidTwo, "same-account-android-two", http.MethodDelete, "/v1/sessions/"+sessionID.String()+"/lease/"+leaseID.String(), nil, "same-account-release-last-participant", http.StatusNoContent)
 	sameAccountSignedJSON(t, testServer.URL, windows, "same-account-windows", http.MethodGet, "/v1/sessions/"+sessionID.String()+"/lease", nil, "", http.StatusNotFound)
@@ -283,6 +297,11 @@ func sameAccountRegister(t *testing.T, root string, device testDevice, deviceTyp
 
 func sameAccountSignedJSON(t *testing.T, root string, device testDevice, bearer, method, path string, body any, idempotency string, wantStatus int) map[string]any {
 	t.Helper()
+	return sameAccountSignedJSONWithHeaders(t, root, device, bearer, method, path, body, idempotency, nil, wantStatus)
+}
+
+func sameAccountSignedJSONWithHeaders(t *testing.T, root string, device testDevice, bearer, method, path string, body any, idempotency string, headers map[string]string, wantStatus int) map[string]any {
+	t.Helper()
 	var data []byte
 	var err error
 	if body != nil {
@@ -293,6 +312,9 @@ func sameAccountSignedJSON(t *testing.T, root string, device testDevice, bearer,
 	}
 	request := newSignedRequest(t, root, device, method, path, data, idempotency)
 	request.Header.Set("Authorization", "Bearer "+bearer)
+	for name, value := range headers {
+		request.Header.Set(name, value)
+	}
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -325,7 +347,7 @@ func sameAccountDialRealtime(t *testing.T, root string, device testDevice, beare
 		}
 		t.Fatal(err)
 	}
-	hello := fmt.Sprintf(`{"role":%q,"protocol_versions":[1],"capabilities":["cumulative_ack","e2ee_x25519_chacha20poly1305","flow_control_v1","lease_v1"]}`, role)
+	hello := fmt.Sprintf(`{"role":%q,"protocol_versions":[1],"capabilities":["cumulative_ack","e2ee_x25519_chacha20poly1305","flow_control_v1","lease_v1","liveness_probe_v1"]}`, role)
 	if err := socket.WriteMessage(websocket.TextMessage, []byte(hello)); err != nil {
 		t.Fatal(err)
 	}
@@ -385,19 +407,26 @@ func assertSingleItemID(t *testing.T, response map[string]any, want uuid.UUID) {
 	}
 }
 
-func assertSameAccountSocketClosed(t *testing.T, socket *websocket.Conn, wantCode int) {
+func assertSameAccountRouteDeniedAndSocketAlive(t *testing.T, pcSocket, androidSocket *websocket.Conn) {
 	t.Helper()
-	defer socket.Close()
-	_ = socket.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, _, err := socket.ReadMessage()
-	if err == nil {
-		t.Fatal("cross-account Realtime socket remained open")
+	probeID := uuid.NewString()
+	ping := []byte(fmt.Sprintf(`{"type":"ping","probe_id":%q}`, probeID))
+	_ = androidSocket.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := androidSocket.WriteMessage(websocket.TextMessage, ping); err != nil {
+		t.Fatalf("cross-account Realtime liveness write: %v", err)
 	}
-	var closeError *websocket.CloseError
-	if !errors.As(err, &closeError) {
-		t.Fatalf("cross-account Realtime error=%v", err)
+	_ = androidSocket.SetReadDeadline(time.Now().Add(5 * time.Second))
+	messageType, raw, err := androidSocket.ReadMessage()
+	if err != nil {
+		t.Fatalf("cross-account Realtime connection closed after denied frame: %v", err)
 	}
-	if closeError.Code != wantCode {
-		t.Fatalf("cross-account Realtime close code=%d, want %d", closeError.Code, wantCode)
+	var pong map[string]string
+	if messageType != websocket.TextMessage || json.Unmarshal(raw, &pong) != nil ||
+		pong["type"] != "pong" || pong["probe_id"] != probeID {
+		t.Fatalf("cross-account Realtime liveness response=%q", raw)
+	}
+	_ = pcSocket.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+	if _, _, err := pcSocket.ReadMessage(); err == nil {
+		t.Fatal("cross-account SUBSCRIBE was forwarded to the PC")
 	}
 }

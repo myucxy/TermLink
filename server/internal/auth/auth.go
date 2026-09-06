@@ -55,9 +55,13 @@ type OIDCVerifier struct {
 }
 
 func NewOIDCVerifier(ctx context.Context, issuer, clientID string, allowedParties []string) (*OIDCVerifier, error) {
-	provider, err := oidc.NewProvider(ctx, issuer)
+	return NewOIDCVerifierWithBackchannel(ctx, issuer, issuer, clientID, allowedParties)
+}
+
+func NewOIDCVerifierWithBackchannel(ctx context.Context, issuer, backchannelIssuer, clientID string, allowedParties []string) (*OIDCVerifier, error) {
+	discovery, err := DiscoverOIDC(ctx, issuer, backchannelIssuer)
 	if err != nil {
-		return nil, fmt.Errorf("discover OIDC issuer: %w", err)
+		return nil, err
 	}
 	parties := make(map[string]struct{}, len(allowedParties))
 	for _, party := range allowedParties {
@@ -71,8 +75,8 @@ func NewOIDCVerifier(ctx context.Context, issuer, clientID string, allowedPartie
 		return nil, errors.New("OIDC allowed parties are required")
 	}
 	return &OIDCVerifier{
-		issuer:         issuer,
-		verifier:       provider.Verifier(&oidc.Config{ClientID: clientID}),
+		issuer:         discovery.Issuer,
+		verifier:       discovery.Verifier(clientID),
 		allowedParties: parties,
 	}, nil
 }

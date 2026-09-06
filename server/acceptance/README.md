@@ -1,10 +1,12 @@
 # Production Protocol Acceptance Stack
 
-This disposable stack runs the production TermLink `serve` command behind TLS
-with Keycloak in production start mode, PostgreSQL, and Valkey. It never
-registers the LAN Replay or `TLT1` routes. The embedded identity database and
-local CA remain disposable acceptance fixtures; they are not
-production data stores or trust anchors.
+This disposable stack runs the production TermLink `serve` command behind TLS.
+The default distributed topology uses Keycloak, PostgreSQL, and Valkey. The
+explicit single-node topology keeps Keycloak and PostgreSQL while embedding
+coordination, Direct signalling, migrations, and public Keycloak route
+forwarding into Server. Neither topology registers the LAN Replay or `TLT1`
+routes. The embedded identity database and local CA remain disposable
+acceptance fixtures; they are not production data stores or trust anchors.
 
 The acceptance Keycloak image is augmented at image-build time and then starts
 with `--optimized` on a read-only root filesystem. Runtime startup therefore
@@ -18,6 +20,21 @@ Start and validate the complete stack from the repository root:
 ```powershell
 .\server\ops\Start-ProductionAcceptance.ps1
 ```
+
+To validate the consolidated one-Server topology behind the configured
+external TLS ingress:
+
+```powershell
+.\server\ops\Start-ProductionAcceptance.ps1 -SingleNode
+```
+
+Its steady state is exactly `server`, `keycloak`, and `postgres`.
+`runtime-secrets-init`, `keycloak-init`, and `server-secrets-init` are bounded
+one-shot jobs and are removed after the probe. `valkey`, `direct-valkey`,
+`migrate`, and `lucky-upstream` are not started. Direct/NAT signalling is
+enabled locally and exercised by the acceptance probe, but Relay remains the
+authoritative terminal path. Re-running without `-SingleNode` is the immediate
+distributed rollback; no data-volume conversion is required.
 
 The script generates random credentials under the ignored
 `server/secrets/acceptance` directory, starts the containers, and runs a
