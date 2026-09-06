@@ -132,6 +132,10 @@ func run() error {
 	if username == "" {
 		username = "acceptance-probe"
 	}
+	pcClientID, err := acceptancePCClientID(os.Getenv("TERMLINK_ACCEPTANCE_PC_OIDC_CLIENT_ID"))
+	if err != nil {
+		return err
+	}
 	if root == "" || issuer == "" || passwordPath == "" || identityPath == "" {
 		return errors.New("acceptance root, issuer, password file, and probe identity file are required")
 	}
@@ -174,7 +178,7 @@ func run() error {
 		return errors.New("acceptance user password file is unavailable")
 	}
 	defer clear(password)
-	pcToken, err := p.acquireToken(username, string(bytes.TrimSpace(password)), "termlink-acceptance-cli")
+	pcToken, err := p.acquireToken(username, string(bytes.TrimSpace(password)), pcClientID)
 	if err != nil {
 		return err
 	}
@@ -384,6 +388,17 @@ func run() error {
 		return fmt.Errorf("delete retired-history session catalog entry: %w", err)
 	}
 	return nil
+}
+
+func acceptancePCClientID(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "termlink-acceptance-cli", nil
+	}
+	if value != "termlink-acceptance-cli" && value != "termlink-windows" {
+		return "", errors.New("acceptance PC OIDC client is invalid")
+	}
+	return value, nil
 }
 
 func (p *probe) verifyDirectFailureIsolation(device *identity) error {
@@ -1015,7 +1030,7 @@ func (p *probe) verifyAnonymousRegistration() error {
 	if identityResponse.StatusCode != http.StatusOK {
 		return fmt.Errorf("anonymous OIDC login page returned HTTP %d", identityResponse.StatusCode)
 	}
-	if !bytes.Contains(identityPage, []byte("identity-form-shell")) {
+	if !usesTermLinkIdentityTheme(identityPage) {
 		return errors.New("anonymous OIDC login page did not use the TermLink theme")
 	}
 	if _, ok := registrationURLFromHTML(identityPage, authorizationURL); ok {
@@ -1062,6 +1077,11 @@ func (p *probe) verifyAnonymousRegistration() error {
 		return errors.New("anonymous hosted registration failures are not localized in Chinese and English")
 	}
 	return nil
+}
+
+func usesTermLinkIdentityTheme(page []byte) bool {
+	return bytes.Contains(page, []byte("identity-form-shell")) ||
+		bytes.Contains(page, []byte("identity-card"))
 }
 
 func readBoundedHTML(response *http.Response) ([]byte, error) {

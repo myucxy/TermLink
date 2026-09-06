@@ -8,6 +8,7 @@ param(
     [string]$AppShipBaseUrl = 'https://appship.kget.cc:8910',
     [string]$AppShipAllowedPrivateIPs = '192.168.9.250',
     [switch]$SingleNode,
+    [switch]$EmbeddedIdentity,
     [switch]$EnableDirectTransportShadow,
     [ValidateNotNullOrEmpty()]
     [string]$DirectStunServers = 'stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302',
@@ -137,16 +138,25 @@ function Wait-ProductionAcceptanceStack {
 
     $composeFileArguments = @($ComposeFile | ForEach-Object { '-f'; $_ })
 
-    $healthyServices = @('lucky-upstream', 'postgres', 'valkey', 'server', 'keycloak') +
-        $AdditionalHealthyServices
-    if ($SingleNode) {
+    $healthyServices = @(if ($EmbeddedIdentity) {
+        'postgres'; 'server'; $AdditionalHealthyServices
+    }
+    else {
+        'lucky-upstream'; 'postgres'; 'valkey'; 'server'; 'keycloak'; $AdditionalHealthyServices
+    })
+    if ($SingleNode -and -not $EmbeddedIdentity) {
         $healthyServices = @($healthyServices | Where-Object { $_ -notin @('lucky-upstream', 'valkey') })
     }
     $runningServices = @()
-    $completedServices = @(
-        'runtime-secrets-init', 'keycloak-init', 'server-secrets-init', 'migrate'
-    ) + $AdditionalCompletedServices
-    if ($SingleNode) { $completedServices = @($completedServices | Where-Object { $_ -ne 'migrate' }) }
+    $completedServices = @(if ($EmbeddedIdentity) {
+        'runtime-secrets-init'; $AdditionalCompletedServices
+    }
+    else {
+        'runtime-secrets-init'; 'keycloak-init'; 'server-secrets-init'; 'migrate'; $AdditionalCompletedServices
+    })
+    if ($SingleNode -and -not $EmbeddedIdentity) {
+        $completedServices = @($completedServices | Where-Object { $_ -ne 'migrate' })
+    }
     $expectedServices = @($healthyServices + $runningServices + $completedServices)
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $lastState = @{}
@@ -242,16 +252,17 @@ if (-not [string]::IsNullOrWhiteSpace($ServerImage) -and
     -not [string]::IsNullOrWhiteSpace($LocalServerImage)) {
     throw '只能指定 ServerImage 或 LocalServerImage 其中一个。 / Specify only one of ServerImage or LocalServerImage.'
 }
-if ($Reset -and -not [string]::IsNullOrWhiteSpace($LocalServerImage)) {
-    throw '本地生产镜像无损升级不允许使用 Reset。 / Reset is not allowed when upgrading with a local production image.'
+if ($EmbeddedIdentity -and -not $SingleNode) {
+    throw '内置身份验收必须使用单机模式。 / Embedded identity acceptance requires single-node mode.'
 }
 $endpoints = Set-AcceptanceEndpointEnvironment `
     -Address $LanAddress `
     -PublicUpstreamBindAddress $LuckyBindAddress `
     -PublicUpstreamPort $LuckyPort
 $paths = Get-TermLinkAcceptancePaths
-$composeFiles = @($paths.ComposeFile)
+$composeFiles = @()
 $singleNodeComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.single-node.compose.yml'
+$embeddedIdentityComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.embedded-identity.compose.yml'
 $directTransportComposeFile = Join-Path $paths.ServerRoot 'compose\direct-transport.compose.yml'
 $acceptanceDirectTransportComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.direct-transport.compose.yml'
 $additionalHealthyServices = @()
@@ -260,7 +271,16 @@ $localEdgeEnabled = -not [string]::IsNullOrWhiteSpace($LanAddress)
 if ($SingleNode -and $localEdgeEnabled) {
     throw '单机模式由外部入口终止 TLS，不能同时启用内置 LAN Caddy。 / Single-node mode requires external TLS ingress and cannot use the LAN Caddy listener.'
 }
-if ($SingleNode) {
+if ($EmbeddedIdentity) {
+    if (-not (Test-Path -LiteralPath $embeddedIdentityComposeFile -PathType Leaf)) {
+        throw "Embedded identity acceptance Compose file not found: $embeddedIdentityComposeFile"
+    }
+    $composeFiles += $embeddedIdentityComposeFile
+}
+else {
+    $composeFiles += $paths.ComposeFile
+}
+if ($SingleNode -and -not $EmbeddedIdentity) {
     if (-not (Test-Path -LiteralPath $singleNodeComposeFile -PathType Leaf)) {
         throw "Single-node acceptance Compose overlay not found: $singleNodeComposeFile"
     }
@@ -300,7 +320,12 @@ else {
     $LocalServerImage
 }
 if (-not [string]::IsNullOrWhiteSpace($selectedServerImage)) {
-    $releaseImageComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.release-image.compose.yml'
+    $releaseImageComposeFile = if ($EmbeddedIdentity) {
+        Join-Path $paths.ServerRoot 'compose\acceptance.embedded-identity.release-image.compose.yml'
+    }
+    else {
+        Join-Path $paths.ServerRoot 'compose\acceptance.release-image.compose.yml'
+    }
     if (-not (Test-Path -LiteralPath $releaseImageComposeFile -PathType Leaf)) {
         throw "Published-image Compose overlay not found: $releaseImageComposeFile"
     }
@@ -346,31 +371,42 @@ if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container)) 
     if (-not (Test-Path -LiteralPath $paths.InitialAdminPassword -PathType Leaf)) {
         $env:TERMLINK_ACCEPTANCE_ADMIN_INITIAL_PASSWORD_FILE = $paths.AdminPassword
     }
-    # Cleanup must describe every volume that a previous opt-in topology may
-    # have created. Keep this separate from $composeFiles so omitting the
-    # Direct switch still starts a Relay-only successor after the reset.
-    foreach ($directComposeFile in @($directTransportComposeFile, $acceptanceDirectTransportComposeFile)) {
-        if (-not (Test-Path -LiteralPath $directComposeFile -PathType Leaf)) {
-            throw "Direct transport Compose cleanup overlay not found: $directComposeFile"
-        }
+    if ($EmbeddedIdentity) {
+        & docker compose -f $embeddedIdentityComposeFile down --volumes --remove-orphans
     }
-    Set-TermLinkAcceptanceDirectComposeEnvironment -Paths $paths -STUNServers $DirectStunServers
-    $resetComposeFiles = @($composeFiles)
-    if ($directTransportComposeFile -notin $resetComposeFiles) {
-        $resetComposeFiles += $directTransportComposeFile
+    else {
+        & docker compose @composeFileArguments down --volumes --remove-orphans
     }
-    if ($acceptanceDirectTransportComposeFile -notin $resetComposeFiles) {
-        $resetComposeFiles += $acceptanceDirectTransportComposeFile
-    }
-    $resetComposeFileArguments = @($resetComposeFiles | ForEach-Object { '-f'; $_ })
-    & docker compose @resetComposeFileArguments down --volumes --remove-orphans
     if ($LASTEXITCODE -ne 0) { throw 'Could not reset the production acceptance stack.' }
+    $composeProject = 'termlink-production-acceptance'
+    $projectPrefix = "$composeProject`_"
+    $remainingContainers = @(& docker ps -aq --filter "label=com.docker.compose.project=$composeProject")
+    if ($LASTEXITCODE -ne 0 -or $remainingContainers.Count -ne 0) {
+        throw 'Refusing to remove project storage while Compose containers remain.'
+    }
+    $retiredVolumes = @(& docker volume ls --filter "label=com.docker.compose.project=$composeProject" --format '{{.Name}}')
+    foreach ($volume in $retiredVolumes) {
+        if ([string]::IsNullOrWhiteSpace($volume) -or -not $volume.StartsWith($projectPrefix, [StringComparison]::Ordinal)) {
+            throw "Refusing to remove an unexpected Docker volume: $volume"
+        }
+        & docker volume rm $volume | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not remove retired project volume '$volume'." }
+    }
+    $retiredNetworks = @(& docker network ls --filter "label=com.docker.compose.project=$composeProject" --format '{{.Name}}')
+    foreach ($network in $retiredNetworks) {
+        if ([string]::IsNullOrWhiteSpace($network) -or -not $network.StartsWith($projectPrefix, [StringComparison]::Ordinal)) {
+            throw "Refusing to remove an unexpected Docker network: $network"
+        }
+        & docker network rm $network | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not remove retired project network '$network'." }
+    }
     $productionPolicyEnvironment = Join-Path $paths.SecretRoot 'production-policy.env'
     foreach ($file in @(
         $paths.AdminPassword, $paths.InitialAdminPassword, $paths.InitialAdminClaimed,
         $paths.InitialAdminReady, $paths.InitialAdminLock, $paths.UserPassword, $paths.PostgresPassword,
         $paths.ValkeyPassword, $paths.OidcClientSecret, $paths.DatabaseUrl, $paths.RedisUrl,
         $paths.DirectValkeyPassword, $paths.DirectRedisUrl,
+        $paths.LegacyS3AccessKey, $paths.LegacyS3SecretKey,
         $paths.TokenSigningKey, $paths.RootCa, $paths.ProbeIdentity,
         $productionPolicyEnvironment
     )) {
@@ -399,9 +435,11 @@ else {
 }
 Protect-TermLinkAcceptanceSecretTree -SecretRoot $paths.SecretRoot
 
-Write-SecretFile $paths.AdminPassword (New-RandomText 32)
 Write-SecretFile $paths.InitialAdminPassword (New-RandomText 18)
-Write-SecretFile $paths.UserPassword (New-RandomText 32)
+if (-not $EmbeddedIdentity) {
+    Write-SecretFile $paths.AdminPassword (New-RandomText 32)
+    Write-SecretFile $paths.UserPassword (New-RandomText 32)
+}
 $postgresPassword = if (Test-Path -LiteralPath $paths.PostgresPassword -PathType Leaf) {
     [IO.File]::ReadAllText($paths.PostgresPassword)
 } else {
@@ -415,22 +453,24 @@ try {
 finally {
     $postgresPassword = $null
 }
-$valkeyPassword = if (Test-Path -LiteralPath $paths.ValkeyPassword -PathType Leaf) {
-    [IO.File]::ReadAllText($paths.ValkeyPassword).Trim()
-} else {
-    $generated = New-RandomText 32
-    Write-SecretFile $paths.ValkeyPassword $generated
-    $generated
-}
-if ($valkeyPassword -notmatch '^[A-Za-z0-9_-]{16,128}$') {
-    $valkeyPassword = $null
-    throw 'The managed acceptance Valkey password file is empty or has an invalid format.'
-}
-try {
-    Write-SecretFile $paths.RedisUrl "redis://default:$valkeyPassword@valkey:6379/0" -Force
-}
-finally {
-    $valkeyPassword = $null
+if (-not $EmbeddedIdentity) {
+    $valkeyPassword = if (Test-Path -LiteralPath $paths.ValkeyPassword -PathType Leaf) {
+        [IO.File]::ReadAllText($paths.ValkeyPassword).Trim()
+    } else {
+        $generated = New-RandomText 32
+        Write-SecretFile $paths.ValkeyPassword $generated
+        $generated
+    }
+    if ($valkeyPassword -notmatch '^[A-Za-z0-9_-]{16,128}$') {
+        $valkeyPassword = $null
+        throw 'The managed acceptance Valkey password file is empty or has an invalid format.'
+    }
+    try {
+        Write-SecretFile $paths.RedisUrl "redis://default:$valkeyPassword@valkey:6379/0" -Force
+    }
+    finally {
+        $valkeyPassword = $null
+    }
 }
 if ($EnableDirectTransportShadow -and -not $SingleNode) {
     $directValkeyPassword = if (Test-Path -LiteralPath $paths.DirectValkeyPassword -PathType Leaf) {
@@ -451,26 +491,30 @@ if ($EnableDirectTransportShadow -and -not $SingleNode) {
         $directValkeyPassword = $null
     }
 }
-Write-SecretFile $paths.OidcClientSecret (New-RandomText 32)
+if (-not $EmbeddedIdentity) {
+    Write-SecretFile $paths.OidcClientSecret (New-RandomText 32)
+}
 Write-SecretFile $paths.TokenSigningKey (New-RandomText 48)
 Protect-TermLinkAcceptanceSecretTree -SecretRoot $paths.SecretRoot
 
 Set-TermLinkAcceptanceComposeEnvironment -Paths $paths
-$env:TERMLINK_ACCEPTANCE_KEYCLOAK_IMAGE = & (Join-Path $PSScriptRoot 'Import-KeycloakAcceptanceImage.ps1')
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($env:TERMLINK_ACCEPTANCE_KEYCLOAK_IMAGE)) {
-    throw 'Could not prepare the pinned Keycloak acceptance image.'
+$initializerServices = @(if ($EmbeddedIdentity) { 'runtime-secrets-init' } else { 'runtime-secrets-init'; 'server-secrets-init' })
+if (-not $EmbeddedIdentity) {
+    $env:TERMLINK_ACCEPTANCE_KEYCLOAK_IMAGE = & (Join-Path $PSScriptRoot 'Import-KeycloakAcceptanceImage.ps1')
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($env:TERMLINK_ACCEPTANCE_KEYCLOAK_IMAGE)) {
+        throw 'Could not prepare the pinned Keycloak acceptance image.'
+    }
+    # Keep the public Lucky upstream closed while the idempotent initializer
+    # reconciles the realm. This prevents a fresh or partially configured realm
+    # from exposing registration before the managed admin identity is verified.
+    & docker compose @composeFileArguments stop lucky-upstream
+    if ($LASTEXITCODE -ne 0) { throw 'Could not close the public acceptance upstream before identity initialization.' }
+    $initializerServices += 'keycloak-init'
 }
-# Keep the public Lucky upstream closed while the idempotent initializer
-# reconciles the realm. This prevents a fresh or partially configured realm
-# from exposing registration before the managed admin identity is verified.
-& docker compose @composeFileArguments stop lucky-upstream
-if ($LASTEXITCODE -ne 0) { throw 'Could not close the public acceptance upstream before identity initialization.' }
-# Realm imports only affect an empty Keycloak data volume, so retaining an
-# exited init container would otherwise leave registration and client policy
-# changes unapplied on an existing deployment. Secret staging jobs must also
-# rerun so rotations reach their service-private volumes.
-& docker compose @composeFileArguments rm --stop --force runtime-secrets-init server-secrets-init keycloak-init
-if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the Keycloak policy initializer.' }
+# Secret staging jobs must rerun so rotations reach their service-private
+# volumes. The external provider additionally reruns its realm reconciler.
+& docker compose @composeFileArguments rm --stop --force @initializerServices
+if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the production initializer services.' }
 if ($EnableDirectTransportShadow -and -not $SingleNode) {
     & docker compose @composeFileArguments rm --stop --force direct-valkey-secrets-init
     if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the Direct Valkey secret initializer.' }
@@ -503,7 +547,9 @@ function Assert-RuntimeSecretMetadata {
     }
 }
 
-Assert-RuntimeSecretMetadata -Service keycloak -Path /run/secrets/keycloak_admin_password -Expected '400:1000:0'
+if (-not $EmbeddedIdentity) {
+    Assert-RuntimeSecretMetadata -Service keycloak -Path /run/secrets/keycloak_admin_password -Expected '400:1000:0'
+}
 Assert-RuntimeSecretMetadata -Service postgres -Path /run/secrets/postgres_password -Expected '400:70:70'
 if (-not $SingleNode) {
     Assert-RuntimeSecretMetadata -Service valkey -Path /run/secrets/valkey_password -Expected '400:999:1000'
@@ -536,7 +582,9 @@ if ($localEdgeEnabled) {
 else {
     Remove-Item Env:TERMLINK_ACCEPTANCE_CA_FILE -ErrorAction SilentlyContinue
 }
-$env:TERMLINK_ACCEPTANCE_USER_NAME = 'acceptance-probe'
+$env:TERMLINK_ACCEPTANCE_USER_NAME = if ($EmbeddedIdentity) { 'admin' } else { 'acceptance-probe' }
+$env:TERMLINK_ACCEPTANCE_USER_PASSWORD_FILE = if ($EmbeddedIdentity) { $paths.InitialAdminPassword } else { $paths.UserPassword }
+$env:TERMLINK_ACCEPTANCE_PC_OIDC_CLIENT_ID = if ($EmbeddedIdentity) { 'termlink-windows' } else { 'termlink-acceptance-cli' }
 $env:TERMLINK_ACCEPTANCE_PROBE_IDENTITY_FILE = $paths.ProbeIdentity
 $env:TERMLINK_ACCEPTANCE_REQUIRE_DIRECT_TRANSPORT = if ($EnableDirectTransportShadow -or $SingleNode) { '1' } else { '0' }
 if ($SingleNode) {
@@ -565,20 +613,22 @@ Protect-TermLinkAcceptanceSecretTree -SecretRoot $paths.SecretRoot
 # Keep completed jobs available for diagnostics until every probe succeeds,
 # then remove only their stopped containers. Named data, secret volumes, and
 # images remain untouched.
-$oneShotServices = @('runtime-secrets-init', 'keycloak-init', 'server-secrets-init')
+$oneShotServices = @(if ($EmbeddedIdentity) { 'runtime-secrets-init' } else { 'runtime-secrets-init'; 'server-secrets-init' })
+if (-not $EmbeddedIdentity) { $oneShotServices += 'keycloak-init' }
 if (-not $SingleNode) { $oneShotServices += 'migrate' }
 if ($EnableDirectTransportShadow -and -not $SingleNode) {
     $oneShotServices += 'direct-valkey-secrets-init'
 }
 & docker compose @composeFileArguments rm --force @oneShotServices
 if ($LASTEXITCODE -ne 0) { throw 'Could not remove completed production acceptance jobs.' }
-if ($SingleNode) {
+if ($SingleNode -and -not $EmbeddedIdentity) {
     # These services remain declared behind an inactive profile so Compose
     # does not classify their old containers as orphans. Remove the containers
     # only after the single-node probe succeeds; their named volumes and images
     # remain available for rollback.
     $retiredDistributedServices = @('lucky-upstream', 'valkey', 'migrate')
-    & docker compose @composeFileArguments rm --stop --force @retiredDistributedServices
+    $cleanupComposeFileArguments = @($composeFileArguments)
+    & docker compose @cleanupComposeFileArguments rm --stop --force @retiredDistributedServices
     if ($LASTEXITCODE -ne 0) {
         throw 'Could not remove retired distributed-runtime containers.'
     }
@@ -591,5 +641,5 @@ if ($localEdgeEnabled) {
     Write-Output "CA certificate: $($paths.RootCa)"
 }
 if (-not (Test-Path -LiteralPath $paths.InitialAdminClaimed -PathType Leaf)) {
-    Write-Output 'Initial admin is ready. Retrieve its temporary password once with server\ops\Get-InitialAdminPassword.ps1.'
+    Write-Output 'Initial admin is ready. Retrieve its password once with server\ops\Get-InitialAdminPassword.ps1.'
 }

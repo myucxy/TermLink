@@ -1,0 +1,4 @@
+services:
+  server:
+    image: ${TERMLINK_ACCEPTANCE_SERVER_IMAGE:?immutable Docker Hub server image is required}
+    build: !reset null

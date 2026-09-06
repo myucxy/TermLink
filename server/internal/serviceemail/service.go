@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/mail"
 	"net/smtp"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -166,6 +167,30 @@ func (s *Service) Runtime(ctx context.Context) Runtime {
 		PasswordResetAvailable:           available && settings.PasswordResetEnabled,
 		Status:                           settings.Status,
 	}
+}
+
+// SendPasswordResetLink delivers an opaque, single-use reset link generated
+// by the identity provider. The Service never receives or stores a password,
+// token hash, or identity credential. Callers must return the same public
+// response whether or not an account exists for the supplied address.
+func (s *Service) SendPasswordResetLink(ctx context.Context, rawEmail, resetLink string) error {
+	settings, config, err := s.deliveryConfig(ctx)
+	if err != nil || !settings.PasswordResetEnabled {
+		return ErrVerificationDisabled
+	}
+	email, err := normalizeEmail(rawEmail)
+	if err != nil {
+		return ErrVerificationInvalid
+	}
+	link, err := url.Parse(strings.TrimSpace(resetLink))
+	if err != nil || link.Scheme != "https" || link.Host == "" || link.User != nil || link.Fragment != "" || len(resetLink) > 4096 {
+		return ErrInvalidConfiguration
+	}
+	body := fmt.Sprintf("请使用下面的链接重置 TermLink 密码。链接 15 分钟内有效，只能使用一次。\r\n\r\n%s\r\n\r\n如果不是你发起的请求，请忽略此邮件。\r\n\r\nUse the link below to reset your TermLink password. It expires in 15 minutes and can be used only once.\r\n\r\n%s", resetLink, resetLink)
+	if err = s.sender.Send(ctx, config, email, "TermLink 密码重置 / Password reset", body); err != nil {
+		return ErrDeliveryFailed
+	}
+	return nil
 }
 
 func (s *Service) RegistrationVerificationPolicy(ctx context.Context) (bool, error) {

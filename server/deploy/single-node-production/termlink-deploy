@@ -9,11 +9,7 @@ readonly DEFAULT_DATA_DIR='/opt/termlink'
 readonly DEFAULT_BACKUP_DIR='/var/backups/termlink'
 readonly SECRET_NAMES=(
   postgres-password
-  keycloak-db-password
-  keycloak-bootstrap-admin-password
   initial-admin-password
-  keycloak-admin-client-secret
-  oidc-client-secret
   database-url
   token-signing-key
   account-deletion-identity-key
@@ -62,8 +58,8 @@ on_error() {
   local status=$?
   if [[ "$RESTORE_ACTIVE" == 1 && ${#COMPOSE_ALL[@]} -gt 0 ]]; then
     set +e
-    warn 'restore failed; application and identity services will remain stopped'
-    "${COMPOSE_ALL[@]}" stop edge server keycloak >/dev/null 2>&1
+    warn 'restore failed; the application service will remain stopped'
+    "${COMPOSE_ALL[@]}" stop edge server >/dev/null 2>&1
   fi
   exit "$status"
 }
@@ -94,7 +90,7 @@ Install/config options:
   --http-port PORT           Loopback origin port (default: 8080).
   --https-port PORT          Public HTTPS port for managed TLS (default: 443).
   --backup-recipient VALUE   Native age recipient used by backup and upgrade.
-  --restore FILE             Restore this v3 archive during a fresh install.
+  --restore FILE             Restore this v4 archive during a fresh install.
   --identity FILE            age identity for --restore.
 
 The external TLS mode exposes only the loopback HTTP origin. Configure your
@@ -245,9 +241,9 @@ EOF
 }
 
 source_package_dir() {
-  if [[ -f "$SCRIPT_DIR/compose.yml" && -f "$SCRIPT_DIR/keycloak-realm.json" ]]; then
+  if [[ -f "$SCRIPT_DIR/compose.yml" && -f "$SCRIPT_DIR/Caddyfile" ]]; then
     printf '%s' "$SCRIPT_DIR"
-  elif [[ -f "$SCRIPT_DIR/runtime/compose.yml" && -f "$SCRIPT_DIR/runtime/keycloak-realm.json" ]]; then
+  elif [[ -f "$SCRIPT_DIR/runtime/compose.yml" && -f "$SCRIPT_DIR/runtime/Caddyfile" ]]; then
     printf '%s' "$SCRIPT_DIR/runtime"
   else
     die 'deployment runtime assets were not found beside the deployment tool'
@@ -256,58 +252,22 @@ source_package_dir() {
 
 install_runtime_assets() {
   local package_dir
-  local server_dir
-  local theme_source=''
-  local identity_source=''
   package_dir="$(source_package_dir)"
   install -d -m 0700 "$RUNTIME_DIR"
   if [[ "$(realpath -m -- "$package_dir")" == "$(realpath -m -- "$RUNTIME_DIR")" ]]; then
-    for name in compose.yml Caddyfile Keycloak.Dockerfile keycloak-realm.json \
-      keycloak-user-profile.json postgres-init.sh keycloak-reconcile.sh identity.css \
-      termlink-app-icon.svg termlink-favicon.svg; do
+    for name in compose.yml Caddyfile; do
       [[ -f "$RUNTIME_DIR/$name" && ! -L "$RUNTIME_DIR/$name" ]] || \
         die "installed runtime asset is missing or unsafe: $name"
     done
-    [[ -d "$RUNTIME_DIR/keycloak-theme" && ! -L "$RUNTIME_DIR/keycloak-theme" ]] || \
-      die 'installed Keycloak theme is missing or unsafe'
     return
   fi
   if [[ "$(realpath -m -- "$SCRIPT_PATH")" != "$(realpath -m -- "$DATA_DIR/termlink-deploy")" ]]; then
     install -m 0700 "$SCRIPT_PATH" "$DATA_DIR/termlink-deploy"
   fi
-  for name in compose.yml Caddyfile Keycloak.Dockerfile keycloak-realm.json keycloak-user-profile.json; do
+  for name in compose.yml Caddyfile; do
     [[ -f "$package_dir/$name" ]] || die "deployment asset is missing: $name"
     install -m 0600 "$package_dir/$name" "$RUNTIME_DIR/$name"
   done
-  for name in postgres-init.sh keycloak-reconcile.sh; do
-    [[ -f "$package_dir/$name" ]] || die "deployment script is missing: $name"
-    install -m 0700 "$package_dir/$name" "$RUNTIME_DIR/$name"
-  done
-
-  server_dir="$(realpath -m -- "$package_dir/../..")"
-  if [[ -d "$server_dir/acceptance/keycloak-theme/termlink" ]]; then
-    theme_source="$server_dir/acceptance/keycloak-theme/termlink"
-    identity_source="$server_dir/internal/webportal/assets"
-  elif [[ -d "$package_dir/keycloak-theme" ]]; then
-    theme_source="$package_dir/keycloak-theme"
-    identity_source="$package_dir"
-  elif [[ -d "$RUNTIME_DIR/keycloak-theme" && -f "$RUNTIME_DIR/identity.css" ]]; then
-    return
-  else
-    die 'Keycloak theme sources are missing from the deployment package'
-  fi
-
-  if [[ "$(realpath -m -- "$theme_source")" != "$(realpath -m -- "$RUNTIME_DIR/keycloak-theme")" ]]; then
-    [[ ! -L "$RUNTIME_DIR/keycloak-theme" ]] || die 'runtime theme path cannot be a symbolic link'
-    rm -rf -- "$RUNTIME_DIR/keycloak-theme"
-    cp -a -- "$theme_source" "$RUNTIME_DIR/keycloak-theme"
-  fi
-  for name in identity.css termlink-app-icon.svg termlink-favicon.svg; do
-    [[ -f "$identity_source/$name" ]] || die "identity asset is missing: $name"
-    install -m 0600 "$identity_source/$name" "$RUNTIME_DIR/$name"
-  done
-  find "$RUNTIME_DIR/keycloak-theme" -type d -exec chmod 0700 {} +
-  find "$RUNTIME_DIR/keycloak-theme" -type f -exec chmod 0600 {} +
 }
 
 random_urlsafe() {
@@ -331,18 +291,25 @@ initialize_secrets() {
   local postgres_password
   install -d -m 0700 "$SECRETS_DIR"
   write_secret_if_missing postgres-password "$(random_urlsafe 32)"
-  write_secret_if_missing keycloak-db-password "$(random_urlsafe 32)"
-  write_secret_if_missing keycloak-bootstrap-admin-password "$(random_urlsafe 32)"
   write_secret_if_missing initial-admin-password "$(random_urlsafe 24)"
-  write_secret_if_missing keycloak-admin-client-secret "$(random_urlsafe 32)"
-  write_secret_if_missing oidc-client-secret "$(random_urlsafe 32)"
   write_secret_if_missing token-signing-key "$(random_urlsafe 48)"
   write_secret_if_missing account-deletion-identity-key "$(random_urlsafe 32)"
   postgres_password="$(<"$SECRETS_DIR/postgres-password")"
   write_secret_if_missing database-url \
     "postgres://termlink:${postgres_password}@postgres:5432/termlink?sslmode=disable"
   unset postgres_password
+  apply_secret_permissions
   verify_secrets
+}
+
+apply_secret_permissions() {
+  chmod 0600 "$SECRETS_DIR/"*
+  chown 70:70 "$SECRETS_DIR/postgres-password"
+  chown 65532:65532 \
+    "$SECRETS_DIR/initial-admin-password" \
+    "$SECRETS_DIR/database-url" \
+    "$SECRETS_DIR/token-signing-key" \
+    "$SECRETS_DIR/account-deletion-identity-key"
 }
 
 verify_secrets() {
@@ -356,8 +323,7 @@ verify_secrets() {
     value="$(<"$SECRETS_DIR/$name")"
     [[ -n "$value" ]] || die "secret is empty: $name"
   done
-  for name in postgres-password keycloak-db-password keycloak-bootstrap-admin-password \
-    initial-admin-password keycloak-admin-client-secret oidc-client-secret token-signing-key; do
+  for name in postgres-password initial-admin-password token-signing-key; do
     value="$(<"$SECRETS_DIR/$name")"
     [[ "$value" =~ ^[A-Za-z0-9_-]{32,128}$ ]] || die "secret has invalid encoding: $name"
   done
@@ -377,9 +343,7 @@ build_compose_commands() {
     TERMLINK_CONTAINER_LOG_MAX_FILES TERMLINK_CONTAINER_LOG_MAX_SIZE TERMLINK_DIRECT_STUN_SERVERS \
     TERMLINK_EDGE_CPU_LIMIT TERMLINK_EDGE_MEMORY_LIMIT TERMLINK_EDGE_MEMORY_RESERVATION \
     TERMLINK_EDGE_PIDS_LIMIT TERMLINK_HTTP_BIND_IP TERMLINK_HTTP_PORT TERMLINK_HTTPS_BIND_IP \
-    TERMLINK_HTTPS_PORT TERMLINK_IMAGE TERMLINK_KEYCLOAK_CPU_LIMIT TERMLINK_KEYCLOAK_HEAP \
-    TERMLINK_KEYCLOAK_IMAGE TERMLINK_KEYCLOAK_MEMORY_LIMIT TERMLINK_KEYCLOAK_MEMORY_RESERVATION \
-    TERMLINK_KEYCLOAK_PIDS_LIMIT TERMLINK_LOG_LEVEL TERMLINK_POSTGRES_CPU_LIMIT \
+    TERMLINK_HTTPS_PORT TERMLINK_IMAGE TERMLINK_LOG_LEVEL TERMLINK_POSTGRES_CPU_LIMIT \
     TERMLINK_POSTGRES_MEMORY_LIMIT TERMLINK_POSTGRES_MEMORY_RESERVATION TERMLINK_POSTGRES_PIDS_LIMIT \
     TERMLINK_POSTGRES_SHM_SIZE TERMLINK_PUBLIC_HOST TERMLINK_PUBLIC_URL TERMLINK_RUNTIME_DIR \
     TERMLINK_SECRETS_DIR TERMLINK_SERVER_CPU_LIMIT TERMLINK_SERVER_MEMORY_LIMIT \
@@ -429,10 +393,8 @@ start_stack() {
   log "pulling immutable Server image $IMAGE"
   docker pull "$IMAGE"
   stop_managed_edge_for_external_tls
-  "${COMPOSE_ALL[@]}" rm -f secrets-init keycloak-init >/dev/null 2>&1 || true
-  log 'starting PostgreSQL, Keycloak, and TermLink Server'
-  "${COMPOSE[@]}" up -d --build --wait --wait-timeout 420 --scale server=1
-  "${COMPOSE_ALL[@]}" rm -f secrets-init keycloak-init >/dev/null
+  log 'starting PostgreSQL and TermLink Server with embedded identity'
+  "${COMPOSE[@]}" up -d --wait --wait-timeout 300 --scale server=1 --remove-orphans
 }
 
 assert_running_service() {
@@ -447,7 +409,6 @@ doctor_runtime() {
   local migration
   verify_rendered_compose
   assert_running_service postgres
-  assert_running_service keycloak
   assert_running_service server
   if [[ "$TLS_MODE" == managed ]]; then
     assert_running_service edge
@@ -506,18 +467,16 @@ backup_runtime() {
   payload="$tmp/payload"
   encrypted_tmp="$tmp/backup.tar.age"
   install -d -m 0700 "$payload/database" "$payload/secrets"
-  log 'dumping TermLink and Keycloak databases'
+  log 'dumping the TermLink database, including embedded identity data'
   "${COMPOSE_ALL[@]}" exec -T postgres pg_dump -U termlink -Fc termlink \
     > "$payload/database/termlink.dump"
-  "${COMPOSE_ALL[@]}" exec -T postgres pg_dump -U termlink -Fc keycloak \
-    > "$payload/database/keycloak.dump"
   chmod 0600 "$payload/database/"*.dump
   local name
   for name in "${SECRET_NAMES[@]}"; do
     install -m 0600 "$SECRETS_DIR/$name" "$payload/secrets/$name"
   done
   cat > "$payload/metadata.env" <<EOF
-TERMLINK_BACKUP_VERSION=3
+TERMLINK_BACKUP_VERSION=4
 TERMLINK_BACKUP_CREATED_AT=$timestamp
 TERMLINK_BACKUP_IMAGE=$IMAGE
 TERMLINK_BACKUP_PUBLIC_URL=$PUBLIC_URL
@@ -540,7 +499,7 @@ EOF
 
 allowed_archive_member() {
   case "$1" in
-    database|database/|database/termlink.dump|database/keycloak.dump|secrets|secrets/|metadata.env|manifest.sha256) return 0 ;;
+    database|database/|database/termlink.dump|secrets|secrets/|metadata.env|manifest.sha256) return 0 ;;
   esac
   local name
   for name in "${SECRET_NAMES[@]}"; do
@@ -551,7 +510,7 @@ allowed_archive_member() {
 
 allowed_manifest_path() {
   case "$1" in
-    database/termlink.dump|database/keycloak.dump|metadata.env) return 0 ;;
+    database/termlink.dump|metadata.env) return 0 ;;
   esac
   local name
   for name in "${SECRET_NAMES[@]}"; do
@@ -580,7 +539,7 @@ validate_restore_payload() {
     die 'backup archive contains a link or unsupported entry type'
   fi
   tar -xf "$archive" -C "$extract_dir" --no-same-owner --no-same-permissions
-  [[ "$(grep -E '^TERMLINK_BACKUP_VERSION=' "$extract_dir/metadata.env" | cut -d= -f2-)" == 3 ]] || \
+  [[ "$(grep -E '^TERMLINK_BACKUP_VERSION=' "$extract_dir/metadata.env" | cut -d= -f2-)" == 4 ]] || \
     die 'backup archive version is unsupported'
 
   while IFS= read -r line; do
@@ -590,7 +549,7 @@ validate_restore_payload() {
     [[ -z "${seen[$relative]:-}" ]] || die "backup manifest contains a duplicate path: $relative"
     seen["$relative"]=1
   done < "$extract_dir/manifest.sha256"
-  for relative in database/termlink.dump database/keycloak.dump metadata.env; do
+  for relative in database/termlink.dump metadata.env; do
     [[ "${seen[$relative]:-}" == 1 ]] || die "backup manifest is missing $relative"
   done
   local name
@@ -610,7 +569,6 @@ restore_runtime() {
   local extract_dir
   local name
   local postgres_password
-  local keycloak_password
   [[ "$confirmed" == true ]] || die 'restore requires --confirm-restore'
   need_command age
   need_command sha256sum
@@ -625,9 +583,8 @@ restore_runtime() {
   validate_restore_payload "$archive" "$extract_dir"
 
   RESTORE_ACTIVE=1
-  log 'stopping application and identity services for restore'
-  "${COMPOSE_ALL[@]}" stop edge server keycloak >/dev/null 2>&1 || true
-  "${COMPOSE_ALL[@]}" rm -f secrets-init keycloak-init >/dev/null 2>&1 || true
+  log 'stopping the application service for restore'
+  "${COMPOSE_ALL[@]}" stop edge server >/dev/null 2>&1 || true
   "${COMPOSE_ALL[@]}" up -d --wait --wait-timeout 180 postgres
 
   log 'restoring TermLink database'
@@ -636,22 +593,15 @@ restore_runtime() {
   "${COMPOSE_ALL[@]}" exec -T postgres pg_restore -U termlink -d termlink \
     --exit-on-error --no-acl < "$extract_dir/database/termlink.dump"
 
-  log 'restoring Keycloak database'
-  "${COMPOSE_ALL[@]}" exec -T postgres dropdb -U termlink --if-exists --force keycloak
-  "${COMPOSE_ALL[@]}" exec -T postgres createdb -U termlink -O keycloak keycloak
-  "${COMPOSE_ALL[@]}" exec -T postgres pg_restore -U termlink -d keycloak \
-    --exit-on-error --no-acl < "$extract_dir/database/keycloak.dump"
-
   for name in "${SECRET_NAMES[@]}"; do
     install -m 0600 "$extract_dir/secrets/$name" "$SECRETS_DIR/$name"
   done
+  apply_secret_permissions
   verify_secrets
   postgres_password="$(<"$SECRETS_DIR/postgres-password")"
-  keycloak_password="$(<"$SECRETS_DIR/keycloak-db-password")"
-  printf "ALTER ROLE termlink LOGIN PASSWORD '%s';\nALTER ROLE keycloak LOGIN PASSWORD '%s';\n" \
-    "$postgres_password" "$keycloak_password" | \
+  printf "ALTER ROLE termlink LOGIN PASSWORD '%s';\n" "$postgres_password" | \
     "${COMPOSE_ALL[@]}" exec -T postgres psql -U termlink -d postgres --set=ON_ERROR_STOP=1 >/dev/null
-  unset postgres_password keycloak_password
+  unset postgres_password
   printf 'restored\n' > "$DATA_DIR/.initial-credentials-claimed"
   chmod 0600 "$DATA_DIR/.initial-credentials-claimed"
 
@@ -756,6 +706,7 @@ command_upgrade() {
     IMAGE="$new_image"
   fi
   install_runtime_assets
+  apply_secret_permissions
   write_config
   build_compose_commands
   verify_rendered_compose
@@ -847,9 +798,9 @@ command_credentials() {
   (set -o noclobber; printf 'claimed\n' > "$DATA_DIR/.initial-credentials-claimed") 2>/dev/null || \
     die 'initial administrator credentials have already been displayed'
   chmod 0600 "$DATA_DIR/.initial-credentials-claimed"
-  printf 'URL: %s\nUsername: admin\nTemporary password: %s\n' \
+  printf 'URL: %s\nUsername: admin\nInitial password: %s\n' \
     "$PUBLIC_URL" "$(<"$SECRETS_DIR/initial-admin-password")"
-  printf 'Change this password at the first login; it will not be displayed again.\n'
+  printf 'Change this password after signing in; it will not be displayed again.\n'
 }
 
 command_config() {

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto"
 	"errors"
 	"fmt"
 	"net/url"
@@ -10,6 +11,42 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
 )
+
+// NewLocalOIDCDiscovery constructs discovery metadata for an OIDC provider
+// hosted by the same process. It avoids a startup-time HTTP call back into the
+// listener while retaining the same verifier path used for external issuers.
+func NewLocalOIDCDiscovery(issuer, authorizationEndpoint, tokenEndpoint, jwksEndpoint, endSessionEndpoint string, publicKeys []crypto.PublicKey) (OIDCDiscovery, error) {
+	if len(publicKeys) == 0 {
+		return OIDCDiscovery{}, errors.New("local OIDC discovery is incomplete")
+	}
+	return NewLocalOIDCDiscoveryWithKeySet(issuer, authorizationEndpoint, tokenEndpoint, jwksEndpoint, endSessionEndpoint,
+		&oidc.StaticKeySet{PublicKeys: append([]crypto.PublicKey(nil), publicKeys...)})
+}
+
+// NewLocalOIDCDiscoveryWithKeySet supports an in-process issuer whose signing
+// keys rotate while the server remains running.
+func NewLocalOIDCDiscoveryWithKeySet(issuer, authorizationEndpoint, tokenEndpoint, jwksEndpoint, endSessionEndpoint string, keySet oidc.KeySet) (OIDCDiscovery, error) {
+	issuer = strings.TrimRight(strings.TrimSpace(issuer), "/")
+	if issuer == "" || keySet == nil {
+		return OIDCDiscovery{}, errors.New("local OIDC discovery is incomplete")
+	}
+	issuerURL, err := url.Parse(issuer)
+	if err != nil || issuerURL.Scheme != "https" || issuerURL.Host == "" || issuerURL.User != nil {
+		return OIDCDiscovery{}, errors.New("local OIDC issuer is invalid")
+	}
+	for _, endpoint := range []string{authorizationEndpoint, tokenEndpoint, jwksEndpoint, endSessionEndpoint} {
+		parsed, parseErr := url.Parse(endpoint)
+		if parseErr != nil || parsed.Scheme != issuerURL.Scheme || !strings.EqualFold(parsed.Host, issuerURL.Host) || parsed.User != nil || parsed.Fragment != "" ||
+			(parsed.Path != issuerURL.Path && !strings.HasPrefix(parsed.Path, strings.TrimRight(issuerURL.Path, "/")+"/")) {
+			return OIDCDiscovery{}, errors.New("local OIDC endpoint is outside the issuer")
+		}
+	}
+	return OIDCDiscovery{
+		Issuer: issuer, AuthorizationEndpoint: authorizationEndpoint, TokenEndpoint: tokenEndpoint,
+		JWKSURL: jwksEndpoint, EndSessionEndpoint: endSessionEndpoint,
+		SigningAlgorithms: []string{oidc.RS256}, keySet: keySet,
+	}, nil
+}
 
 // OIDCDiscovery separates the issuer visible in tokens and browsers from the
 // private address used by Server for discovery, JWKS, and token exchange.

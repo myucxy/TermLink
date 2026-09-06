@@ -30,6 +30,7 @@ import (
 	"github.com/termlink/termlink/server/internal/fileoperationcleanup"
 	"github.com/termlink/termlink/server/internal/filetransfer"
 	"github.com/termlink/termlink/server/internal/humanverification"
+	"github.com/termlink/termlink/server/internal/identity"
 	"github.com/termlink/termlink/server/internal/identityproxy"
 	"github.com/termlink/termlink/server/internal/kv"
 	"github.com/termlink/termlink/server/internal/migrate"
@@ -59,8 +60,12 @@ func main() {
 		os.Exit(runHealthcheck())
 	case "admin-route-reset":
 		err = runAdminRouteReset()
+	case "identity-import-keycloak":
+		err = runKeycloakIdentityImport()
+	case "identity-reset-initial-admin":
+		err = runEmbeddedInitialAdminReset()
 	default:
-		err = fmt.Errorf("unknown command %q (use serve, migrate, healthcheck, or admin-route-reset)", command)
+		err = fmt.Errorf("unknown command %q (use serve, migrate, healthcheck, admin-route-reset, identity-import-keycloak, or identity-reset-initial-admin)", command)
 	}
 	if err != nil {
 		logProcessFailure(slog.Default(), command, err)
@@ -79,6 +84,10 @@ func logProcessFailure(logger *slog.Logger, command string, _ error) {
 		errorClass = "healthcheck_failed"
 	case "admin-route-reset":
 		errorClass = "admin_route_offline_reset_failed"
+	case "identity-import-keycloak":
+		errorClass = "keycloak_identity_import_failed"
+	case "identity-reset-initial-admin":
+		errorClass = "embedded_initial_admin_reset_failed"
 	}
 	logger.Error("server stopped", "error_class", errorClass)
 }
@@ -134,10 +143,6 @@ func runProduction() error {
 		return err
 	}
 	defer coordinator.Close()
-	verifier, err := auth.NewOIDCVerifierWithBackchannel(ctx, cfg.OIDCIssuer, cfg.OIDCBackchannelIssuer, cfg.OIDCClientID, cfg.OIDCAllowedParties)
-	if err != nil {
-		return err
-	}
 	keyMaster := cfg.TokenSigningKey.Value()
 	subjectKey := deriveServerKey(keyMaster, "oidc-subject-hash")
 	tokenKey := deriveServerKey(keyMaster, "capability-token-signing")
@@ -150,9 +155,36 @@ func runProduction() error {
 	adminRouteKey := deriveServerKey(keyMaster, "web-admin-route-encryption")
 	humanVerificationKey := deriveServerKey(keyMaster, "human-verification-settings-encryption")
 	directTransportKey := deriveServerKey(keyMaster, "direct-transport-ticket-ed25519")
+	var verifier auth.TokenVerifier
+	var embeddedIdentity *identity.Provider
+	if cfg.IdentityProvider == config.IdentityProviderEmbedded {
+		embeddedHMACKey := deriveServerKey(keyMaster, "embedded-oidc-hmac")
+		embeddedEncryptionKey := deriveServerKey(keyMaster, "embedded-identity-credential-encryption")
+		embeddedIdentity, err = identity.New(ctx, identity.Config{
+			Issuer: cfg.OIDCIssuer, Pool: repository.Pool,
+			HMACSecret:           embeddedHMACKey,
+			KeyEncryptionKey:     embeddedEncryptionKey,
+			InitialAdminPassword: cfg.InitialAdminPassword.Value(),
+			AndroidClientID:      cfg.AndroidOIDCClientID, AndroidRedirectURI: cfg.AndroidOIDCRedirectURI,
+			WindowsClientID: cfg.WindowsOIDCClientID, WindowsRedirectURI: cfg.WindowsOIDCRedirectURI,
+			WebClientID: cfg.WebOIDCClientID, WebRedirectURI: cfg.WebOIDCRedirectURI,
+			StepUpClientID: cfg.WebOIDCStepUpClientID, AllowedParties: cfg.OIDCAllowedParties,
+		})
+		clear(embeddedHMACKey)
+		clear(embeddedEncryptionKey)
+		if err != nil {
+			return fmt.Errorf("initialize embedded identity provider: %w", err)
+		}
+		verifier = embeddedIdentity.TokenVerifier()
+	} else {
+		verifier, err = auth.NewOIDCVerifierWithBackchannel(ctx, cfg.OIDCIssuer, cfg.OIDCBackchannelIssuer, cfg.OIDCClientID, cfg.OIDCAllowedParties)
+		if err != nil {
+			return err
+		}
+	}
 	authentication := auth.Middleware{Tokens: verifier, Devices: repository, Nonces: coordinator, SubjectKey: subjectKey}
 	var keycloakAdmin *auth.KeycloakAdminClient
-	if cfg.RegistrationRecoveryEnabled || cfg.AccountDeletionEnabled || !cfg.KeycloakAdminClientSecret.Empty() {
+	if cfg.IdentityProvider == config.IdentityProviderExternal && (cfg.RegistrationRecoveryEnabled || cfg.AccountDeletionEnabled || !cfg.KeycloakAdminClientSecret.Empty()) {
 		var adminErr error
 		keycloakAdmin, adminErr = auth.NewKeycloakAdminClient(auth.KeycloakAdminConfig{
 			Issuer: cfg.OIDCIssuer, BackchannelIssuer: cfg.OIDCBackchannelIssuer,
@@ -166,10 +198,15 @@ func runProduction() error {
 	var realmEmail serviceemail.RealmEmailConfigurator
 	if keycloakAdmin != nil {
 		realmEmail = keycloakRealmEmailAdapter{client: keycloakAdmin}
+	} else if embeddedIdentity != nil {
+		realmEmail = embeddedRealmEmailAdapter{}
 	}
 	serviceEmail, err := serviceemail.New(repository, serviceEmailKey, nil, realmEmail)
 	if err != nil {
 		return fmt.Errorf("initialize service email: %w", err)
+	}
+	if embeddedIdentity != nil {
+		embeddedIdentity.SetPasswordResetMailer(serviceEmail)
 	}
 	publicOrigin, parseErr := url.Parse(cfg.PublicURL)
 	if parseErr != nil || publicOrigin.Hostname() == "" {
@@ -182,13 +219,20 @@ func runProduction() error {
 	if err != nil {
 		return fmt.Errorf("initialize human verification settings: %w", err)
 	}
+	if embeddedIdentity != nil {
+		embeddedIdentity.SetHumanVerification(humanVerificationManager)
+	}
 	adminRoutes, err := adminroute.New(repository, adminRouteKey)
 	if err != nil {
 		return fmt.Errorf("initialize Web admin route service: %w", err)
 	}
 	var registrationRecoveryRunner *registrationrecovery.Runner
 	if cfg.RegistrationRecoveryEnabled {
-		registrationRecoveryRunner, err = registrationrecovery.New(repository, keycloakAdmin, registrationrecovery.Options{
+		var identityAdmin registrationrecovery.IdentityAdmin = keycloakAdmin
+		if embeddedIdentity != nil {
+			identityAdmin = embeddedIdentity.Accounts()
+		}
+		registrationRecoveryRunner, err = registrationrecovery.New(repository, identityAdmin, registrationrecovery.Options{
 			Issuer: cfg.OIDCIssuer, SubjectKey: subjectKey, Logger: slog.Default(),
 		})
 		if err != nil {
@@ -222,7 +266,11 @@ func runProduction() error {
 		if binderErr != nil {
 			return fmt.Errorf("initialize account deletion request binder: %w", binderErr)
 		}
-		identityDisabler, disablerErr := accountdeletion.NewKeycloakIdentityDisabler(codec, keycloakAdmin)
+		var identityAdmin accountdeletion.IdentityAdminClient = keycloakAdmin
+		if embeddedIdentity != nil {
+			identityAdmin = embeddedIdentity.Accounts()
+		}
+		identityDisabler, disablerErr := accountdeletion.NewKeycloakIdentityDisabler(codec, identityAdmin)
 		if disablerErr != nil {
 			return fmt.Errorf("initialize account deletion identity disabler: %w", disablerErr)
 		}
@@ -252,6 +300,10 @@ func runProduction() error {
 		// falling back to Keycloak's native self-registration form.
 		productionAPI.Registration = keycloakAdmin
 		productionAPI.VerifiedRegistration = keycloakAdmin
+	}
+	if embeddedIdentity != nil {
+		productionAPI.Registration = embeddedIdentity.Accounts()
+		productionAPI.VerifiedRegistration = embeddedIdentity.Accounts()
 	}
 	var metrics *observability.Metrics
 	var observer realtime.Observer
@@ -356,6 +408,26 @@ func runProduction() error {
 			_ = directHub.Close(shutdown)
 		}()
 	}
+	var localDiscovery *auth.OIDCDiscovery
+	var localOIDCHTTPClient *http.Client
+	var identityProfiles interface {
+		UpdateNickname(context.Context, string, string) error
+		UpdateVerifiedEmail(context.Context, string, string) error
+	}
+	var identityMFAStatus interface {
+		HasConfiguredOTP(context.Context, string) (bool, error)
+	}
+	if keycloakAdmin != nil {
+		identityProfiles = keycloakAdmin
+		identityMFAStatus = keycloakAdmin
+	}
+	if embeddedIdentity != nil {
+		discovery := embeddedIdentity.Discovery()
+		localDiscovery = &discovery
+		localOIDCHTTPClient = embeddedIdentity.HTTPClient()
+		identityProfiles = embeddedIdentity.Accounts()
+		identityMFAStatus = embeddedIdentity.Accounts()
+	}
 	portal, err := webportal.New(ctx, webportal.Config{
 		PublicURL:                 cfg.PublicURL,
 		Issuer:                    cfg.OIDCIssuer,
@@ -376,8 +448,10 @@ func runProduction() error {
 		AccountDeletionBinder:     accountDeletionBinder,
 		ServiceEmail:              serviceEmail,
 		AdminRoutes:               adminRoutes,
-		IdentityProfiles:          keycloakAdmin,
-		IdentityMFAStatus:         keycloakAdmin,
+		IdentityProfiles:          identityProfiles,
+		IdentityMFAStatus:         identityMFAStatus,
+		OIDCDiscovery:             localDiscovery,
+		OIDCHTTPClient:            localOIDCHTTPClient,
 		Repository:                repository,
 		AccountStatusChanged: func(ctx context.Context, accountID uuid.UUID, status string) error {
 			return coordinator.Publish(ctx, "account-status-changed", accountID)
@@ -400,7 +474,9 @@ func runProduction() error {
 	mux.Handle("/v1/", productionAPI.Handler())
 	mux.Handle("/v1", productionAPI.Handler())
 	mux.HandleFunc("GET /readyz", readinessHandler(repository, coordinator))
-	if cfg.RuntimeMode == config.RuntimeModeSingleNode && cfg.OIDCBackchannelIssuer != cfg.OIDCIssuer {
+	if embeddedIdentity != nil {
+		mux.Handle("/realms/", embeddedIdentity.Handler())
+	} else if cfg.RuntimeMode == config.RuntimeModeSingleNode && cfg.OIDCBackchannelIssuer != cfg.OIDCIssuer {
 		keycloakProxy, proxyErr := identityproxy.New(cfg.OIDCIssuer, cfg.OIDCBackchannelIssuer)
 		if proxyErr != nil {
 			return fmt.Errorf("initialize embedded Keycloak proxy: %w", proxyErr)
@@ -459,6 +535,14 @@ func runAdminRouteReset() error {
 
 type keycloakRealmEmailAdapter struct {
 	client *auth.KeycloakAdminClient
+}
+
+// The embedded provider reads password-reset availability directly from the
+// TermLink service-email settings, so there is no external realm to update.
+type embeddedRealmEmailAdapter struct{}
+
+func (embeddedRealmEmailAdapter) ConfigureRealmEmail(context.Context, serviceemail.SMTPConfig, bool) error {
+	return nil
 }
 
 func (a keycloakRealmEmailAdapter) ConfigureRealmEmail(ctx context.Context, config serviceemail.SMTPConfig, passwordResetEnabled bool) error {
@@ -625,6 +709,74 @@ func runMigrate() error {
 		return fmt.Errorf("load production config: %w", err)
 	}
 	return migrate.Up(ctx, cfg.DatabaseURL.Value())
+}
+
+func runEmbeddedInitialAdminReset() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load production config: %w", err)
+	}
+	if cfg.IdentityProvider != config.IdentityProviderEmbedded {
+		return errors.New("initial administrator reset requires embedded identity")
+	}
+	repository, err := store.OpenWithOptions(ctx, cfg.DatabaseURL.Value(), store.OpenOptions{MinConns: 0, MaxConns: 1})
+	if err != nil {
+		return err
+	}
+	defer repository.Close()
+	if err = repository.VerifySchema(ctx); err != nil {
+		return err
+	}
+	accounts, err := identity.NewAccountStore(repository.Pool)
+	if err != nil {
+		return err
+	}
+	return accounts.ResetInitialAdministratorPassword(ctx, cfg.InitialAdminPassword.Value())
+}
+
+func runKeycloakIdentityImport() error {
+	if len(os.Args) < 3 || len(os.Args) > 4 {
+		return errors.New("usage: termlink-server identity-import-keycloak <realm-export.json> [--dry-run]")
+	}
+	dryRun := false
+	if len(os.Args) == 4 {
+		if os.Args[3] != "--dry-run" {
+			return errors.New("identity import accepts only the optional --dry-run flag")
+		}
+		dryRun = true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load production config: %w", err)
+	}
+	repository, err := store.OpenWithOptions(ctx, cfg.DatabaseURL.Value(), store.OpenOptions{MinConns: 0, MaxConns: 2})
+	if err != nil {
+		return err
+	}
+	defer repository.Close()
+	if err = repository.VerifySchema(ctx); err != nil {
+		return err
+	}
+	source, err := os.Open(os.Args[2])
+	if err != nil {
+		return errors.New("open Keycloak realm export failed")
+	}
+	defer source.Close()
+	result, err := identity.ImportKeycloakRealm(ctx, repository.Pool, source, dryRun)
+	if err != nil {
+		return err
+	}
+	zhMode, enMode := "已完成", "completed"
+	if result.DryRun {
+		zhMode, enMode = "演练通过（未写入）", "dry run passed (no changes committed)"
+	}
+	fmt.Printf("Keycloak 用户迁移%s：用户 %d，跳过服务账号 %d。\nKeycloak identity migration %s: users %d, service accounts skipped %d.\n",
+		zhMode, result.Imported, result.SkippedServiceAccounts, enMode, result.Imported, result.SkippedServiceAccounts)
+	return nil
 }
 
 func readinessHandler(repository *store.Postgres, coordinator kv.Coordinator) http.HandlerFunc {

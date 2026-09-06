@@ -24,22 +24,13 @@ services:
           chown "$$owner" "$$destination"
         }
         copy_secret postgres-password /target/postgres/postgres_password 70:70
-        copy_secret keycloak-db-password /target/postgres/keycloak_db_password 70:70
-        copy_secret keycloak-db-password /target/keycloak/keycloak_db_password 1000:0
-        copy_secret keycloak-bootstrap-admin-password /target/keycloak/keycloak_bootstrap_admin_password 1000:0
-        copy_secret keycloak-bootstrap-admin-password /target/keycloak-init/keycloak_bootstrap_admin_password 1000:0
-        copy_secret initial-admin-password /target/keycloak-init/initial_admin_password 1000:0
-        copy_secret keycloak-admin-client-secret /target/keycloak-init/keycloak_admin_client_secret 1000:0
-        copy_secret oidc-client-secret /target/server/oidc_client_secret 65532:65532
+        copy_secret initial-admin-password /target/server/initial_admin_password 65532:65532
         copy_secret database-url /target/server/database_url 65532:65532
         copy_secret token-signing-key /target/server/token_signing_key 65532:65532
-        copy_secret keycloak-admin-client-secret /target/server/keycloak_admin_client_secret 65532:65532
         copy_secret account-deletion-identity-key /target/server/account_deletion_identity_key 65532:65532
     volumes:
       - ${TERMLINK_SECRETS_DIR:?TERMLINK_SECRETS_DIR is required}:/source:ro
       - postgres-secrets:/target/postgres
-      - keycloak-secrets:/target/keycloak
-      - keycloak-init-secrets:/target/keycloak-init
       - server-secrets:/target/server
     network_mode: none
     read_only: true
@@ -58,7 +49,6 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - postgres-secrets:/run/secrets:ro
-      - ${TERMLINK_RUNTIME_DIR:?TERMLINK_RUNTIME_DIR is required}/postgres-init.sh:/docker-entrypoint-initdb.d/10-termlink-keycloak.sh:ro
     networks: ["database"]
     shm_size: ${TERMLINK_POSTGRES_SHM_SIZE:-128m}
     healthcheck:
@@ -77,98 +67,14 @@ services:
       secrets-init:
         condition: service_completed_successfully
 
-  keycloak:
-    image: ${TERMLINK_KEYCLOAK_IMAGE:-termlink-keycloak:26.3.2-theme-v18}
-    build:
-      context: ${TERMLINK_RUNTIME_DIR:?TERMLINK_RUNTIME_DIR is required}
-      dockerfile: Keycloak.Dockerfile
-      args:
-        KEYCLOAK_BASE_IMAGE: quay.io/keycloak/keycloak:26.3.2@sha256:98fab020a3a490aba0978f237e2a06cd0ea42bf149c6cf10f11c0aaf27728ff2
-    entrypoint: ["/bin/bash", "-ec"]
-    command:
-      - |
-        export KC_DB_PASSWORD="$$(cat /run/secrets/keycloak_db_password)"
-        export KC_BOOTSTRAP_ADMIN_PASSWORD="$$(cat /run/secrets/keycloak_bootstrap_admin_password)"
-        rm -rf /opt/keycloak/data/tmp/kc-gzip-cache
-        exec /opt/keycloak/bin/kc.sh start --optimized --import-realm
-    environment:
-      KC_BOOTSTRAP_ADMIN_USERNAME: termlink-bootstrap
-      KC_DB: postgres
-      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
-      KC_DB_USERNAME: keycloak
-      KC_HEALTH_ENABLED: "true"
-      KC_HTTP_ENABLED: "true"
-      KC_HOSTNAME: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}
-      KC_PROXY_HEADERS: xforwarded
-      KC_CACHE: local
-      JAVA_OPTS_KC_HEAP: ${TERMLINK_KEYCLOAK_HEAP:--XX:InitialRAMPercentage=10 -XX:MaxRAMPercentage=60}
-    volumes:
-      - keycloak-secrets:/run/secrets:ro
-      - ${TERMLINK_RUNTIME_DIR:?TERMLINK_RUNTIME_DIR is required}/keycloak-realm.json:/opt/keycloak/data/import/termlink-realm.json:ro
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=64m
-      - /opt/keycloak/data/tmp:rw,noexec,nosuid,size=64m,uid=1000,gid=0
-    read_only: true
-    cap_drop: ["ALL"]
-    security_opt: ["no-new-privileges:true"]
-    networks: ["database", "identity", "egress"]
-    healthcheck:
-      test:
-        - CMD
-        - /bin/bash
-        - -ec
-        - >-
-          exec 3<>/dev/tcp/127.0.0.1/9000;
-          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3;
-          response="$$(cat <&3)";
-          [[ "$$response" == *'"status": "UP"'* ]]
-      interval: 5s
-      timeout: 5s
-      retries: 40
-      start_period: 20s
-    mem_limit: ${TERMLINK_KEYCLOAK_MEMORY_LIMIT:-1g}
-    mem_reservation: ${TERMLINK_KEYCLOAK_MEMORY_RESERVATION:-384m}
-    cpus: ${TERMLINK_KEYCLOAK_CPU_LIMIT:-2.00}
-    pids_limit: ${TERMLINK_KEYCLOAK_PIDS_LIMIT:-384}
-    restart: unless-stopped
-    logging: *default-logging
-    depends_on:
-      postgres:
-        condition: service_healthy
-      secrets-init:
-        condition: service_completed_successfully
-
-  keycloak-init:
-    image: ${TERMLINK_KEYCLOAK_IMAGE:-termlink-keycloak:26.3.2-theme-v18}
-    entrypoint: ["/bin/bash", "/opt/termlink/keycloak-reconcile.sh"]
-    environment:
-      TERMLINK_PUBLIC_URL: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}
-      TERMLINK_INITIAL_ADMIN_EMAIL: ${TERMLINK_ADMIN_EMAIL:?TERMLINK_ADMIN_EMAIL is required}
-    volumes:
-      - keycloak-init-secrets:/run/secrets:ro
-      - ${TERMLINK_RUNTIME_DIR:?TERMLINK_RUNTIME_DIR is required}/keycloak-reconcile.sh:/opt/termlink/keycloak-reconcile.sh:ro
-      - ${TERMLINK_RUNTIME_DIR:?TERMLINK_RUNTIME_DIR is required}/keycloak-user-profile.json:/opt/termlink/keycloak-user-profile.json:ro
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=32m
-    read_only: true
-    cap_drop: ["ALL"]
-    security_opt: ["no-new-privileges:true"]
-    networks: ["identity"]
-    restart: "no"
-    logging: *default-logging
-    depends_on:
-      keycloak:
-        condition: service_healthy
-      secrets-init:
-        condition: service_completed_successfully
-
   server:
     image: ${TERMLINK_IMAGE:?TERMLINK_IMAGE immutable tag and digest is required}
     environment:
       TERMLINK_RUNTIME_MODE: single-node
+      TERMLINK_IDENTITY_PROVIDER: embedded
       TERMLINK_PUBLIC_URL: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}
       TERMLINK_OIDC_ISSUER: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}/realms/termlink
-      TERMLINK_OIDC_BACKCHANNEL_ISSUER: http://keycloak:8080/realms/termlink
+      TERMLINK_OIDC_BACKCHANNEL_ISSUER: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}/realms/termlink
       TERMLINK_OIDC_CLIENT_ID: termlink-server
       TERMLINK_OIDC_ALLOWED_PARTIES: termlink-android,termlink-windows
       TERMLINK_ANDROID_OIDC_CLIENT_ID: termlink-android
@@ -179,13 +85,10 @@ services:
       TERMLINK_WEB_OIDC_CLIENT_ID: termlink-web
       TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID: termlink-web-step-up
       TERMLINK_WEB_OIDC_REDIRECT_URI: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}/auth/callback
-      TERMLINK_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
+      TERMLINK_INITIAL_ADMIN_PASSWORD_FILE: /run/secrets/initial_admin_password
       TERMLINK_DATABASE_URL_FILE: /run/secrets/database_url
       TERMLINK_TOKEN_SIGNING_KEY_FILE: /run/secrets/token_signing_key
       TERMLINK_REGISTRATION_RECOVERY_ENABLED: "true"
-      TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID: termlink-registration-recovery
-      TERMLINK_KEYCLOAK_ADMIN_BASE_URL: http://keycloak:8080
-      TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE: /run/secrets/keycloak_admin_client_secret
       TERMLINK_ACCOUNT_DELETION_ENABLED: "true"
       TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE: /run/secrets/account_deletion_identity_key
       TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION: "1"
@@ -205,7 +108,7 @@ services:
     user: "65532:65532"
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
-    networks: ["frontend", "database", "identity", "egress"]
+    networks: ["frontend", "database", "egress"]
     healthcheck:
       test: ["CMD", "/termlink-server", "healthcheck"]
       interval: 5s
@@ -222,8 +125,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      keycloak-init:
-        condition: service_completed_successfully
       secrets-init:
         condition: service_completed_successfully
 
@@ -266,8 +167,6 @@ services:
 volumes:
   postgres-data:
   postgres-secrets:
-  keycloak-secrets:
-  keycloak-init-secrets:
   server-secrets:
   caddy-data:
   caddy-config:
@@ -277,7 +176,5 @@ networks:
   frontend:
     internal: true
   database:
-    internal: true
-  identity:
     internal: true
   egress:

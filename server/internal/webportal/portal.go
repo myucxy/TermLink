@@ -70,6 +70,8 @@ type Config struct {
 	AppShipBaseURL            string
 	AppShipAllowedPrivateIPs  string
 	AppShipHTTPClient         *http.Client
+	OIDCDiscovery             *auth.OIDCDiscovery
+	OIDCHTTPClient            *http.Client
 	ReleaseSource             PublicReleaseSource
 	BuildInfo                 buildinfo.Info
 	RegistrationCodeKey       []byte
@@ -218,6 +220,7 @@ type productionOIDCFlow struct {
 	publicURL          string
 	accountURL         string
 	endSessionEndpoint string
+	httpClient         *http.Client
 }
 
 type homePageData struct {
@@ -295,9 +298,18 @@ func New(ctx context.Context, config Config) (*Portal, error) {
 	if err != nil {
 		return nil, err
 	}
-	discovery, err := auth.DiscoverOIDC(ctx, config.Issuer, config.BackchannelIssuer)
-	if err != nil {
-		return nil, fmt.Errorf("discover web OIDC issuer: %w", err)
+	var discovery auth.OIDCDiscovery
+	if config.OIDCDiscovery != nil {
+		discovery = *config.OIDCDiscovery
+		if strings.TrimRight(discovery.Issuer, "/") != strings.TrimRight(config.Issuer, "/") ||
+			discovery.AuthorizationEndpoint == "" || discovery.TokenEndpoint == "" || discovery.JWKSURL == "" {
+			return nil, errors.New("injected web OIDC discovery is invalid")
+		}
+	} else {
+		discovery, err = auth.DiscoverOIDC(ctx, config.Issuer, config.BackchannelIssuer)
+		if err != nil {
+			return nil, fmt.Errorf("discover web OIDC issuer: %w", err)
+		}
 	}
 	accountURL := strings.TrimRight(config.Issuer, "/") + "/account/"
 	accountQuery := url.Values{}
@@ -322,6 +334,7 @@ func New(ctx context.Context, config Config) (*Portal, error) {
 		publicURL:          strings.TrimRight(config.PublicURL, "/"),
 		accountURL:         accountURL,
 		endSessionEndpoint: discovery.EndSessionEndpoint,
+		httpClient:         config.OIDCHTTPClient,
 	}
 	if config.ReleaseSource == nil {
 		releaseSource, sourceErr := NewAppShipPublicReleaseSourceWithAllowedPrivateIPs(
@@ -1430,11 +1443,17 @@ func oidcAuthorizationURL(config oauth2.Config, state, nonce, challenge, theme s
 }
 
 func (f *productionOIDCFlow) ExchangeAndVerify(ctx context.Context, code, verifier, expectedNonce string) (accountIdentity, error) {
+	if f.httpClient != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, f.httpClient)
+	}
 	return exchangePortalIdentity(ctx, f.oauthConfig, f.verifier, f.clientID, code, verifier, expectedNonce)
 }
 
 func (f *productionOIDCFlow) ExchangeStepUpAndVerify(ctx context.Context, code, verifier, expectedNonce, method string) (accountIdentity, error) {
 	if method == sensitiveMethodMFA {
+		if f.httpClient != nil {
+			ctx = context.WithValue(ctx, oauth2.HTTPClient, f.httpClient)
+		}
 		return exchangePortalIdentity(ctx, f.stepUpOAuthConfig, f.stepUpVerifier, f.stepUpOAuthConfig.ClientID, code, verifier, expectedNonce)
 	}
 	return f.ExchangeAndVerify(ctx, code, verifier, expectedNonce)
@@ -1590,8 +1609,9 @@ func normalizeRegistrationContinueURL(config Config, value string) string {
 		!strings.EqualFold(target.Host, issuer.Host) {
 		return ""
 	}
-	expectedPath := strings.TrimRight(issuer.Path, "/") + "/login-actions/authenticate"
-	if target.Path != expectedPath {
+	legacyPath := strings.TrimRight(issuer.Path, "/") + "/login-actions/authenticate"
+	embeddedPath := strings.TrimRight(issuer.Path, "/") + "/protocol/openid-connect/auth"
+	if target.Path != legacyPath && target.Path != embeddedPath {
 		return ""
 	}
 	query, err := url.ParseQuery(target.RawQuery)
@@ -1784,7 +1804,7 @@ func adminNotice(value string) string {
 	case "service-email-updated":
 		return bilingualPortalNotice("测试邮件已发送，服务邮箱配置和功能开关已发布。", "The test email was sent, and the service email settings are now active.")
 	case "human-verification-updated":
-		return bilingualPortalNotice("注册人机验证设置已更新并立即生效。", "Registration human-verification settings were updated and are active immediately.")
+		return bilingualPortalNotice("登录与注册人机验证设置已更新并立即生效。", "Login and registration human-verification settings were updated and are active immediately.")
 	case "admin-route-updated":
 		return bilingualPortalNotice("管理中心安全入口已经更新，旧入口已立即失效。请将新地址保存在受信任的密码管理器中。", "The secure admin route was updated and the old route is no longer valid. Store the new address in a trusted password manager.")
 	default:

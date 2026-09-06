@@ -26,6 +26,44 @@ func TestLoadRootsRejectsMissingConfiguredCAFile(t *testing.T) {
 	}
 }
 
+func TestAcceptancePCClientID(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    string
+		wantErr bool
+	}{
+		{name: "default", want: "termlink-acceptance-cli"},
+		{name: "external", value: "termlink-acceptance-cli", want: "termlink-acceptance-cli"},
+		{name: "embedded", value: " termlink-windows ", want: "termlink-windows"},
+		{name: "unknown", value: "dynamic-client", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := acceptancePCClientID(test.value)
+			if (err != nil) != test.wantErr || got != test.want {
+				t.Fatalf("acceptancePCClientID(%q) = %q, %v; want %q, error=%t", test.value, got, err, test.want, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestUsesTermLinkIdentityTheme(t *testing.T) {
+	for name, page := range map[string][]byte{
+		"external": []byte(`<main class="identity-form-shell"></main>`),
+		"embedded": []byte(`<main class="identity-card"></main>`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !usesTermLinkIdentityTheme(page) {
+				t.Fatal("TermLink identity theme was rejected")
+			}
+		})
+	}
+	if usesTermLinkIdentityTheme([]byte(`<main class="untrusted-login"></main>`)) {
+		t.Fatal("unknown identity theme was accepted")
+	}
+}
+
 func TestValidateDiscoveredListItemAllowsAdditionalResources(t *testing.T) {
 	tests := []struct {
 		name       string

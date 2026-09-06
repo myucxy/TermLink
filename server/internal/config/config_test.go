@@ -114,6 +114,44 @@ func TestLoadTurnstileUsesDedicatedSecretAndFailsClosed(t *testing.T) {
 	}
 }
 
+func TestEmbeddedIdentityDerivesIssuerAndDoesNotRequireKeycloakSecrets(t *testing.T) {
+	files := writeSecrets(t, map[string]string{
+		"db": "postgres://termlink:password@postgres/termlink", "sign": "01234567890123456789012345678901",
+		"admin":    "Embedded_Admin_Test_8mP4qV7nR2xK",
+		"deletion": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+	})
+	env := map[string]string{
+		"TERMLINK_RUNTIME_MODE":                          RuntimeModeSingleNode,
+		"TERMLINK_IDENTITY_PROVIDER":                     IdentityProviderEmbedded,
+		"TERMLINK_PUBLIC_URL":                            "https://termlink.example.test",
+		"TERMLINK_DATABASE_URL_FILE":                     files["db"],
+		"TERMLINK_TOKEN_SIGNING_KEY_FILE":                files["sign"],
+		"TERMLINK_INITIAL_ADMIN_PASSWORD_FILE":           files["admin"],
+		"TERMLINK_REGISTRATION_RECOVERY_ENABLED":         "true",
+		"TERMLINK_ACCOUNT_DELETION_ENABLED":              "true",
+		"TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE":    files["deletion"],
+		"TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION": "1",
+	}
+	configured, err := LoadFromEnv(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configured.IdentityProvider != IdentityProviderEmbedded ||
+		configured.OIDCIssuer != "https://termlink.example.test/realms/termlink" ||
+		configured.OIDCBackchannelIssuer != configured.OIDCIssuer || configured.OIDCClientID != "termlink-server" ||
+		!configured.OIDCClientSecret.Empty() || !configured.KeycloakAdminClientSecret.Empty() ||
+		configured.InitialAdminPassword.Value() != "Embedded_Admin_Test_8mP4qV7nR2xK" ||
+		configured.InitialAdminPasswordFile != files["admin"] ||
+		!configured.RegistrationRecoveryEnabled || !configured.AccountDeletionEnabled ||
+		configured.AccountDeletionIdentityKey.Value() != "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" {
+		t.Fatalf("embedded identity configuration = %#v", configured)
+	}
+	env["TERMLINK_OIDC_ISSUER"] = "https://identity.example.test/realms/termlink"
+	if _, err = LoadFromEnv(env); err == nil || !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "TERMLINK_OIDC_ISSUER") {
+		t.Fatalf("mismatched embedded issuer error = %v", err)
+	}
+}
+
 func TestLoadRegistrationRecoveryUsesDedicatedSecret(t *testing.T) {
 	files := writeSecrets(t, map[string]string{
 		"oidc": "oidc-secret", "admin": "keycloak-admin-secret", "db": "db-secret", "redis": "redis-secret",

@@ -93,6 +93,8 @@ function Get-TermLinkAcceptancePaths {
         RedisUrl = Join-Path $secretRoot 'redis-url'
         DirectValkeyPassword = Join-Path $secretRoot 'direct-valkey-password'
         DirectRedisUrl = Join-Path $secretRoot 'direct-redis-url'
+        LegacyS3AccessKey = Join-Path $secretRoot 's3-access-key'
+        LegacyS3SecretKey = Join-Path $secretRoot 's3-secret-key'
         TokenSigningKey = Join-Path $secretRoot 'token-signing-key'
         RootCa = Join-Path $secretRoot 'acceptance-root-ca.crt'
         ProbeIdentity = Join-Path $secretRoot 'production-probe-pc.json'

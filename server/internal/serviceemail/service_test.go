@@ -180,6 +180,31 @@ func TestRegistrationAndAccountCodesAreHashedBoundAndConsumable(t *testing.T) {
 	}
 }
 
+func TestPasswordResetLinkUsesVerifiedServiceEmail(t *testing.T) {
+	repository := &testRepository{settings: verifiedSettings()}
+	repository.settings.PasswordResetEnabled = true
+	sender := &testSender{}
+	service, err := New(repository, []byte("service-email-test-key-0123456789abcdef"), sender, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository.settings.SMTPPasswordCiphertext, err = service.sealSecret("smtp-secret-value")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resetLink := "https://identity.example.test/realms/termlink/account/password/reset?token=opaque"
+	if err = service.SendPasswordResetLink(context.Background(), "User@Example.Test", resetLink); err != nil {
+		t.Fatal(err)
+	}
+	if sender.recipient != "User@example.test" || !strings.Contains(sender.subject, "Password reset") ||
+		strings.Count(sender.body, resetLink) != 2 || !strings.Contains(sender.body, "15 分钟") || !strings.Contains(sender.body, "15 minutes") {
+		t.Fatalf("password reset email recipient/subject/body = %q/%q/%q", sender.recipient, sender.subject, sender.body)
+	}
+	if err = service.SendPasswordResetLink(context.Background(), "User@Example.Test", "http://identity.example.test/reset"); !errors.Is(err, ErrInvalidConfiguration) {
+		t.Fatalf("insecure password reset link error = %v", err)
+	}
+}
+
 func TestSMTPSenderRejectsHeaderInjectionBeforeNetwork(t *testing.T) {
 	config := SMTPConfig{Host: "smtp.example.test", Port: 587, Security: "STARTTLS", FromAddress: "no-reply@example.test", Password: "secret"}
 	if err := (smtpSender{}).Send(context.Background(), config, "user@example.test", "safe\r\nBcc: victim@example.test", "body"); !errors.Is(err, ErrDeliveryFailed) {

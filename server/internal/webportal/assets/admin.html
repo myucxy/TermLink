@@ -205,7 +205,7 @@
       </section>
       {{if gt .HumanVerification.Version 0}}
       <section class="admin-panel" aria-labelledby="human-verification-heading">
-        <div class="panel-heading"><div><p class="eyebrow">ANTI-AUTOMATION</p><h2 id="human-verification-heading">注册人机验证</h2><p>管理 Cloudflare Turnstile 的 Site Key 与 Secret。Secret 只写不读，页面永不回显原文。</p></div>{{if .HumanVerification.Enabled}}<span class="state-pill state-VERIFIED">已启用</span>{{else}}<span class="state-pill state-DRAFT">未启用</span>{{end}}</div>
+        <div class="panel-heading"><div><p class="eyebrow">ANTI-AUTOMATION</p><h2 id="human-verification-heading">登录与注册人机验证</h2><p>管理 Cloudflare Turnstile 的 Site Key 与 Secret；启用后保护网页登录和账号注册。Secret 只写不读，页面永不回显原文。</p></div>{{if .HumanVerification.Enabled}}<span class="state-pill state-VERIFIED">已启用</span>{{else}}<span class="state-pill state-DRAFT">未启用</span>{{end}}</div>
         <form class="admin-settings-form" action="{{.AdminBasePath}}/settings/human-verification" method="post">
           <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="expected_version" value="{{.HumanVerification.Version}}"><input type="hidden" name="idempotency_key" value="{{actionKey .ActionNonce "human-verification-update"}}">
           <label><span>Turnstile Site Key</span><input name="site_key" value="{{.HumanVerification.SiteKey}}" maxlength="256" autocomplete="off" placeholder="0x4AAAA..."></label>

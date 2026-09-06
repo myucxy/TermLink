@@ -157,20 +157,21 @@ $renderedText = $renderedResult.Output -join [Environment]::NewLine
 try { $config = $renderedText | ConvertFrom-Json -Depth 100 }
 catch { throw "Rendered single-node Compose is invalid JSON: $($_.Exception.Message)" }
 
-$expectedServices = @('keycloak', 'keycloak-init', 'postgres', 'secrets-init', 'server')
+$expectedServices = @('postgres', 'secrets-init', 'server')
 if ($IncludeEdge) { $expectedServices += 'edge' }
 $actualServices = @($config.services.PSObject.Properties.Name)
 Assert-ExactSet -Expected $expectedServices -Actual $actualServices `
     -Message 'Single-node production services differ from the reviewed topology.'
-foreach ($retired in @('alertmanager', 'grafana', 'migrate', 'minio', 'prometheus', 'valkey', 'direct-valkey')) {
+foreach ($retired in @(
+    'alertmanager', 'direct-valkey', 'grafana', 'keycloak', 'keycloak-init', 'migrate',
+    'minio', 'prometheus', 'valkey'
+)) {
     Assert-SingleNode ($null -eq (Get-Value $config.services $retired)) "Retired service is present: $retired"
 }
 
 $approvedImages = @{
     'secrets-init' = 'caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c'
     postgres = 'postgres:17.5-alpine3.22@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa'
-    keycloak = 'termlink-keycloak:26.3.2-theme-v18'
-    'keycloak-init' = 'termlink-keycloak:26.3.2-theme-v18'
     server = $deploymentEnvironment.TERMLINK_IMAGE
     edge = 'caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c'
 }
@@ -194,27 +195,17 @@ foreach ($serviceName in $actualServices) {
     }
 }
 
-$keycloakBuild = Get-Value (Get-Value $config.services 'keycloak') 'build'
-Assert-SingleNode ($null -ne $keycloakBuild) 'Keycloak must build the TermLink theme image locally.'
-Assert-SingleNode ([string](Get-Value (Get-Value $keycloakBuild 'args') 'KEYCLOAK_BASE_IMAGE') -ceq
-    'quay.io/keycloak/keycloak:26.3.2@sha256:98fab020a3a490aba0978f237e2a06cd0ea42bf149c6cf10f11c0aaf27728ff2') `
-    'Keycloak base image is not pinned to the reviewed digest.'
-Assert-SingleNode ($null -eq (Get-Value (Get-Value $config.services 'keycloak-init') 'build')) `
-    'Only the Keycloak runtime service may own the shared image build.'
-
 $expectedNetworks = @{
     'secrets-init' = @()
     postgres = @('database')
-    keycloak = @('database', 'egress', 'identity')
-    'keycloak-init' = @('identity')
-    server = @('database', 'egress', 'frontend', 'identity')
+    server = @('database', 'egress', 'frontend')
     edge = @('frontend', 'public')
 }
 foreach ($serviceName in $actualServices) {
     Assert-ExactSet -Expected $expectedNetworks[$serviceName] -Actual @(Get-NetworkNames (Get-Value $config.services $serviceName)) `
         -Message "Service '$serviceName' network membership differs from the reviewed topology."
 }
-foreach ($networkName in @('database', 'frontend', 'identity')) {
+foreach ($networkName in @('database', 'frontend')) {
     Assert-SingleNode ([bool](Get-Value (Get-Value $config.networks $networkName) 'internal')) `
         "Network '$networkName' must remain internal."
 }
@@ -225,11 +216,20 @@ $server = Get-Value $config.services 'server'
 $serverEnvironment = Get-Value $server 'environment'
 Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_RUNTIME_MODE') -ceq 'single-node') `
     'Server must use single-node runtime mode.'
+Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_IDENTITY_PROVIDER') -ceq 'embedded') `
+    'Server must own the embedded identity provider.'
 Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_OIDC_BACKCHANNEL_ISSUER') -ceq
-    'http://keycloak:8080/realms/termlink') 'Server must use the internal Keycloak backchannel issuer.'
+    "$($deploymentEnvironment.TERMLINK_PUBLIC_URL)/realms/termlink") `
+    'Embedded OIDC backchannel issuer must preserve the public issuer.'
+Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_INITIAL_ADMIN_PASSWORD_FILE') -ceq
+    '/run/secrets/initial_admin_password') 'Server must bootstrap the initial administrator from a file-backed secret.'
 Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_DIRECT_TRANSPORT_ENABLED') -ceq 'true') `
     'Single-node Direct/NAT signalling must be enabled.'
-foreach ($name in @('TERMLINK_REDIS_URL_FILE', 'TERMLINK_DIRECT_REDIS_URL_FILE')) {
+foreach ($name in @(
+    'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_KEYCLOAK_ADMIN_BASE_URL',
+    'TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE',
+    'TERMLINK_OIDC_CLIENT_SECRET_FILE', 'TERMLINK_REDIS_URL_FILE'
+)) {
     Assert-SingleNode ($null -eq (Get-Value $serverEnvironment $name)) `
         "Single-node Server cannot receive $name."
 }
@@ -240,12 +240,50 @@ $serverPorts = @((Get-Value $server 'ports') | Where-Object { $null -ne $_ })
 Assert-SingleNode ($serverPorts.Count -eq 1 -and
     [string](Get-Value $serverPorts[0] 'host_ip') -ceq '127.0.0.1' -and
     [int](Get-Value $serverPorts[0] 'target') -eq 8080) 'Server may expose only its loopback HTTP origin.'
-foreach ($serviceName in @('postgres', 'keycloak', 'keycloak-init', 'secrets-init')) {
+foreach ($serviceName in @('postgres', 'secrets-init')) {
     $servicePorts = @((Get-Value (Get-Value $config.services $serviceName) 'ports') |
         Where-Object { $null -ne $_ })
     Assert-SingleNode ($servicePorts.Count -eq 0) `
         "Service '$serviceName' cannot expose host ports."
 }
+
+$secretsInit = Get-Value $config.services 'secrets-init'
+Assert-SingleNode ([string](Get-Value $secretsInit 'network_mode') -ceq 'none') `
+    'Secret initialization must not have network access.'
+Assert-SingleNode ([string](Get-Value $secretsInit 'user') -ceq '0:0' -and
+    [string](Get-Value $secretsInit 'restart') -ceq 'no') `
+    'Secret initialization must run once with the reviewed filesystem owner.'
+Assert-ExactSet -Expected @('CHOWN') -Actual @((Get-Value $secretsInit 'cap_add')) `
+    -Message 'Secret initialization capabilities differ from the reviewed set.'
+$secretInitVolumes = @((Get-Value $secretsInit 'volumes'))
+Assert-SingleNode ($secretInitVolumes.Count -eq 3) `
+    'Secret initialization must have exactly one source and two target mounts.'
+$secretSourceMount = @($secretInitVolumes | Where-Object { [string](Get-Value $_ 'target') -ceq '/source' })
+Assert-SingleNode ($secretSourceMount.Count -eq 1 -and
+    [string](Get-Value $secretSourceMount[0] 'type') -ceq 'bind' -and
+    [bool](Get-Value $secretSourceMount[0] 'read_only') -and
+    [IO.Path]::GetFullPath([string](Get-Value $secretSourceMount[0] 'source')) -ceq $secretsPath) `
+    'Secret initialization source must be the private host directory mounted read-only.'
+foreach ($target in @('/target/postgres', '/target/server')) {
+    $mount = @($secretInitVolumes | Where-Object { [string](Get-Value $_ 'target') -ceq $target })
+    Assert-SingleNode ($mount.Count -eq 1 -and [string](Get-Value $mount[0] 'type') -ceq 'volume') `
+        "Secret initialization target '$target' must be a named volume."
+}
+$secretCopyCommand = [string](@((Get-Value $secretsInit 'command'))[0])
+$expectedCopies = @(
+    'postgres-password /target/postgres/postgres_password 70:70',
+    'initial-admin-password /target/server/initial_admin_password 65532:65532',
+    'database-url /target/server/database_url 65532:65532',
+    'token-signing-key /target/server/token_signing_key 65532:65532',
+    'account-deletion-identity-key /target/server/account_deletion_identity_key 65532:65532'
+)
+$actualCopies = @([regex]::Matches($secretCopyCommand, '(?m)^copy_secret (.+)$') |
+    ForEach-Object { $_.Groups[1].Value })
+Assert-ExactSet -Expected $expectedCopies -Actual $actualCopies `
+    -Message 'Secret initialization copy set differs from the reviewed least-privilege mapping.'
+Assert-SingleNode ($secretCopyCommand -match '(?m)^\s*chmod 0400 "\$\$destination"\s*$' -and
+    $secretCopyCommand -match '(?m)^\s*chown "\$\$owner" "\$\$destination"\s*$') `
+    'Secret initialization must enforce owner-only permissions and reviewed ownership.'
 
 if ($IncludeEdge) {
     $edge = Get-Value $config.services 'edge'
@@ -260,9 +298,8 @@ if ($IncludeEdge) {
 }
 
 $secretNames = @(
-    'postgres-password', 'keycloak-db-password', 'keycloak-bootstrap-admin-password',
-    'initial-admin-password', 'keycloak-admin-client-secret', 'oidc-client-secret',
-    'database-url', 'token-signing-key', 'account-deletion-identity-key'
+    'postgres-password', 'initial-admin-password', 'database-url', 'token-signing-key',
+    'account-deletion-identity-key'
 )
 $secretValues = @{}
 foreach ($name in $secretNames) {
@@ -275,8 +312,7 @@ foreach ($name in $secretNames) {
     $secretValues[$name] = $value
 }
 foreach ($name in @(
-    'postgres-password', 'keycloak-db-password', 'keycloak-bootstrap-admin-password',
-    'initial-admin-password', 'keycloak-admin-client-secret', 'oidc-client-secret', 'token-signing-key'
+    'postgres-password', 'initial-admin-password', 'token-signing-key'
 )) {
     Assert-SingleNode ($secretValues[$name] -cmatch '^[A-Za-z0-9_-]{32,128}$') `
         "Secret '$name' is not URL-safe random material."
@@ -287,27 +323,18 @@ Assert-SingleNode ($secretValues['database-url'] -ceq
     "postgres://termlink:$($secretValues['postgres-password'])@postgres:5432/termlink?sslmode=disable") `
     'Database URL does not match the file-backed PostgreSQL password.'
 
-$realmPath = Join-Path $runtimePath 'keycloak-realm.json'
-$profilePath = Join-Path $runtimePath 'keycloak-user-profile.json'
-$reconcilePath = Join-Path $runtimePath 'keycloak-reconcile.sh'
 $caddyPath = Join-Path $runtimePath 'Caddyfile'
-foreach ($path in @($realmPath, $profilePath, $reconcilePath, $caddyPath)) {
+foreach ($path in @($caddyPath)) {
     Assert-SingleNode (Test-Path -LiteralPath $path -PathType Leaf) "Runtime asset is missing: $path"
 }
-$realm = Get-Content -LiteralPath $realmPath -Raw | ConvertFrom-Json -Depth 100
-$clientIDs = @($realm.clients | ForEach-Object { [string]$_.clientId })
-Assert-ExactSet -Expected @(
-    'termlink-android', 'termlink-registration-recovery', 'termlink-server',
-    'termlink-web', 'termlink-web-step-up', 'termlink-windows'
-) -Actual $clientIDs -Message 'Production realm client set is unexpected.'
-$ordinaryUsers = @($realm.users | Where-Object { [string]$_.serviceAccountClientId -eq '' })
-Assert-SingleNode ($ordinaryUsers.Count -eq 0) 'Production realm import cannot contain ordinary users.'
-$realmText = [IO.File]::ReadAllText($realmPath)
-$reconcileText = [IO.File]::ReadAllText($reconcilePath)
-Assert-SingleNode ($realmText -notmatch '(?i)acceptance-user|acceptance-probe|termlink-acceptance-cli') `
-    'Production realm import contains an acceptance identity or client.'
-Assert-SingleNode ($reconcileText -notmatch '(?m)^\s*for username in acceptance') `
-    'Production reconcile script cannot create acceptance users.'
+$retiredRuntimeAssets = @(
+    'Keycloak.Dockerfile', 'keycloak-realm.json', 'keycloak-reconcile.sh',
+    'keycloak-user-profile.json', 'postgres-init.sh'
+)
+foreach ($name in $retiredRuntimeAssets) {
+    Assert-SingleNode (-not (Test-Path -LiteralPath (Join-Path $runtimePath $name))) `
+        "Retired identity runtime asset is present: $name"
+}
 $caddyText = [IO.File]::ReadAllText($caddyPath)
 Assert-SingleNode ($caddyText -match '(?m)^\s*@internal path /metrics /metrics/\* /debug /debug/\*\s*$' -and
     $caddyText -match '(?m)^\s*respond @internal 404\s*$') 'Managed edge must deny metrics and debug routes.'

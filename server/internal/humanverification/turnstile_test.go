@@ -43,6 +43,34 @@ func TestTurnstileVerifiesBoundedRegistrationChallenge(t *testing.T) {
 	}
 }
 
+func TestTurnstileBindsLoginChallengeToLoginAction(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true, "hostname": "termlink.example.test", "action": LoginAction,
+		})
+	}))
+	defer server.Close()
+	verifier, err := NewTurnstile(TurnstileConfig{
+		SiteKey: "test-site-key", Secret: "test-secret", ExpectedHostname: "termlink.example.test",
+		VerifyURL: server.URL, HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = verifier.VerifyAction(context.Background(), "login-token", "203.0.113.19", LoginAction); err != nil {
+		t.Fatalf("VerifyAction(login) error = %v", err)
+	}
+	if err = verifier.Verify(context.Background(), "login-token", "203.0.113.19"); !errors.Is(err, ErrRejected) {
+		t.Fatalf("login token crossed into registration: %v", err)
+	}
+	if err = verifier.VerifyAction(context.Background(), "login-token", "", "unsupported"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("unsupported action error = %v", err)
+	}
+}
+
 func TestTurnstileFailsClosedWithoutLeakingProviderDetail(t *testing.T) {
 	tests := []struct {
 		name   string

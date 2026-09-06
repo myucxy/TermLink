@@ -37,62 +37,31 @@ try {
         throw 'The managed production acceptance deployment is unavailable.'
     }
 
-    # Block retrieval before changing either the host-side input or Keycloak.
-    # Any interruption therefore requires an explicit retry of this reset.
     [IO.File]::WriteAllText($paths.InitialAdminClaimed, 'reset-in-progress', [Text.UTF8Encoding]::new($false))
     if (Test-Path -LiteralPath $paths.InitialAdminReady -PathType Leaf) {
         Remove-Item -LiteralPath $paths.InitialAdminReady -Force
     }
     [IO.File]::WriteAllText($paths.InitialAdminPassword, (New-RandomText 18), [Text.UTF8Encoding]::new($false))
+    Protect-TermLinkAcceptanceSecretTree -SecretRoot $paths.SecretRoot
     Set-TermLinkAcceptanceComposeEnvironment -Paths $paths
-    $env:TERMLINK_ACCEPTANCE_KEYCLOAK_IMAGE = & (Join-Path $PSScriptRoot 'Import-KeycloakAcceptanceImage.ps1')
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($env:TERMLINK_ACCEPTANCE_KEYCLOAK_IMAGE)) {
-        throw 'Could not prepare the pinned Keycloak image.'
-    }
+    $embeddedCompose = Join-Path $paths.ServerRoot 'compose\acceptance.embedded-identity.compose.yml'
 
-    # Docker Desktop stages file-backed Compose secrets into service-private
-    # volumes. Refresh that staging volume after rotating the host-side input;
-    # otherwise keycloak-init would keep reading the password copied during the
-    # previous deployment and the newly retrieved credential could never log in.
-    & docker compose -f $paths.ComposeFile run --rm --no-deps runtime-secrets-init
+    # Atomically restage the new file, then execute the reset inside the exact
+    # running Server container so published and local-image deployments behave
+    # identically. No password is placed in process arguments or logs.
+    & docker compose -f $embeddedCompose run --rm --no-deps runtime-secrets-init
     if ($LASTEXITCODE -ne 0) {
-        throw 'Could not stage the new initial admin password.'
+        throw 'Could not stage the new initial administrator password.'
     }
-
-$resetCommand = @'
-admin_password="$(cat /run/secrets/keycloak_admin_password)"
-temporary_password="$(cat /run/secrets/admin_initial_password)"
-/opt/keycloak/bin/kcadm.sh config credentials \
-  --config /tmp/kcadm.config \
-  --server http://keycloak:8080 \
-  --realm master \
-  --user acceptance-admin \
-  --password "$admin_password" >/dev/null 2>&1
-admin_user_id=$(/opt/keycloak/bin/kcadm.sh get users \
-  --config /tmp/kcadm.config \
-  -r termlink -q exact=true -q username=admin \
-  --fields id --format csv --noquotes | tail -n 1)
-test -n "$admin_user_id"
-/opt/keycloak/bin/kcadm.sh set-password \
-  --config /tmp/kcadm.config \
-  -r termlink --userid "$admin_user_id" \
-  --new-password "$temporary_password" --temporary >/dev/null
-'@
-
-    # Windows PowerShell 5.1 rewrites native arguments containing the command
-    # substitution syntax used above. Pass an inert Base64 payload to Bash so
-    # the reviewed command has identical bytes under both powershell.exe and
-    # pwsh.exe, without placing either password value on the command line.
-    $encodedResetCommand = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($resetCommand))
-    $executeEncodedReset = "printf %s $encodedResetCommand | base64 -d | /bin/bash"
-    & docker compose -f $paths.ComposeFile run --rm --no-deps --entrypoint /bin/bash keycloak-init -ec $executeEncodedReset
+    & docker compose -f $embeddedCompose exec -T server /termlink-server identity-reset-initial-admin
     if ($LASTEXITCODE -ne 0) {
-        throw 'Could not issue a new initial admin temporary password.'
+        throw 'Could not reset the embedded initial administrator password.'
     }
 
-    [IO.File]::WriteAllText($paths.InitialAdminReady, 'TermLink admin temporary password reset completed', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($paths.InitialAdminReady, 'TermLink initial administrator password reset completed', [Text.UTF8Encoding]::new($false))
     Remove-Item -LiteralPath $paths.InitialAdminClaimed -Force
-    Write-Output 'A new temporary password is ready. Retrieve it once with Get-InitialAdminPassword.ps1.'
+    Protect-TermLinkAcceptanceSecretTree -SecretRoot $paths.SecretRoot
+    Write-Output 'A new initial administrator password is ready. Retrieve it once with Get-InitialAdminPassword.ps1.'
 }
 finally {
     if ($null -ne $lockStream) {

@@ -127,6 +127,10 @@ func (m *Manager) Required(ctx context.Context) (bool, error) {
 }
 
 func (m *Manager) Verify(ctx context.Context, token, remoteIP string) error {
+	return m.VerifyAction(ctx, token, remoteIP, RegistrationAction)
+}
+
+func (m *Manager) VerifyAction(ctx context.Context, token, remoteIP, action string) error {
 	effective, _, err := m.effective(ctx)
 	if err != nil {
 		return ErrUnavailable
@@ -138,7 +142,7 @@ func (m *Manager) Verify(ctx context.Context, token, remoteIP string) error {
 	if err != nil {
 		return ErrUnavailable
 	}
-	return verifier.Verify(ctx, token, remoteIP)
+	return verifier.VerifyAction(ctx, token, remoteIP, action)
 }
 
 func (m *Manager) Update(ctx context.Context, actorID uuid.UUID, input UpdateInput) (AdminView, error) {

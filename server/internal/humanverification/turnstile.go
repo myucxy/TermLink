@@ -19,6 +19,7 @@ import (
 const (
 	ProviderTurnstile     = "turnstile"
 	RegistrationAction    = "registration"
+	LoginAction           = "login"
 	TurnstileScriptOrigin = "https://challenges.cloudflare.com"
 	turnstileVerifyURL    = TurnstileScriptOrigin + "/turnstile/v0/siteverify"
 	maximumResponseBytes  = 64 << 10
@@ -95,7 +96,17 @@ func (t *Turnstile) SiteKey() string {
 }
 
 func (t *Turnstile) Verify(ctx context.Context, token, remoteIP string) error {
+	return t.VerifyAction(ctx, token, remoteIP, RegistrationAction)
+}
+
+// VerifyAction validates a token for one of TermLink's explicitly supported
+// public identity actions. Tokens cannot be replayed across registration and
+// login because the action returned by Turnstile must match exactly.
+func (t *Turnstile) VerifyAction(ctx context.Context, token, remoteIP, expectedAction string) error {
 	if t == nil {
+		return ErrUnavailable
+	}
+	if expectedAction != RegistrationAction && expectedAction != LoginAction {
 		return ErrUnavailable
 	}
 	token = strings.TrimSpace(token)
@@ -146,7 +157,7 @@ func (t *Turnstile) Verify(ctx context.Context, token, remoteIP string) error {
 		return ErrUnavailable
 	}
 	if !result.Success || !strings.EqualFold(strings.TrimSpace(result.Hostname), t.expectedHostname) ||
-		strings.TrimSpace(result.Action) != RegistrationAction {
+		strings.TrimSpace(result.Action) != expectedAction {
 		return ErrRejected
 	}
 	return nil

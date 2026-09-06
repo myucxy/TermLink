@@ -41,8 +41,10 @@ const (
 	defaultRedisWriteTimeout = 3 * time.Second
 	defaultRedisPoolTimeout  = 4 * time.Second
 
-	RuntimeModeDistributed = "distributed"
-	RuntimeModeSingleNode  = "single-node"
+	RuntimeModeDistributed   = "distributed"
+	RuntimeModeSingleNode    = "single-node"
+	IdentityProviderExternal = "external"
+	IdentityProviderEmbedded = "embedded"
 )
 
 var (
@@ -76,6 +78,7 @@ func (Secret) GoString() string { return "[REDACTED]" }
 // Secret, URL, or Key are loaded from secret files and are redacted by String.
 type Config struct {
 	RuntimeMode                    string
+	IdentityProvider               string
 	PublicURL                      string
 	OIDCIssuer                     string
 	OIDCBackchannelIssuer          string
@@ -93,6 +96,7 @@ type Config struct {
 	HumanVerificationSiteKey       string
 
 	OIDCClientSecret           Secret
+	InitialAdminPassword       Secret
 	KeycloakAdminClientSecret  Secret
 	HumanVerificationSecret    Secret
 	AccountDeletionIdentityKey Secret
@@ -103,6 +107,7 @@ type Config struct {
 	// Secret file paths are retained for diagnostics and dependency wiring, but
 	// are omitted from String because deployment paths can be sensitive too.
 	OIDCClientSecretFile           string
+	InitialAdminPasswordFile       string
 	KeycloakAdminClientSecretFile  string
 	HumanVerificationSecretFile    string
 	AccountDeletionIdentityKeyFile string
@@ -140,8 +145,9 @@ type Config struct {
 // secret paths as well as secret values, because paths can contain identifying
 // deployment information and are not needed in normal startup diagnostics.
 func (c Config) String() string {
-	return fmt.Sprintf("Config{RuntimeMode:%q PublicURL:%q OIDCIssuer:%q OIDCBackchannelIssuer:%q OIDCClientID:%q OIDCAllowedParties:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q WindowsOIDCClientID:%q WindowsRegistrationOIDCParties:%q WindowsOIDCRedirectURI:%q WebOIDCClientID:%q WebOIDCStepUpClientID:%q WebOIDCRedirectURI:%q HumanVerificationProvider:%q HumanVerificationSiteKey:%q HumanVerificationSecret:%s OIDCClientSecret:%s KeycloakAdminClientSecret:%s KeycloakAdminClientID:%q KeycloakAdminBaseURL:%q RegistrationRecoveryEnabled:%t AccountDeletionEnabled:%t AccountDeletionIdentityKeyVersion:%d DatabaseURL:%s RedisURL:%s TokenSigningKey:%s PostgresMaxConns:%d PostgresMinConns:%d PostgresMaxConnLifetime:%s PostgresMaxConnIdleTime:%s PostgresHealthCheckPeriod:%s PostgresConnectTimeout:%s RedisPoolSize:%d RedisMinIdleConns:%d RedisDialTimeout:%s RedisReadTimeout:%s RedisWriteTimeout:%s RedisPoolTimeout:%s LogLevel:%q ListenAddr:%q MetricsListenAddr:%q}",
+	return fmt.Sprintf("Config{RuntimeMode:%q IdentityProvider:%q PublicURL:%q OIDCIssuer:%q OIDCBackchannelIssuer:%q OIDCClientID:%q OIDCAllowedParties:%q AndroidOIDCClientID:%q AndroidOIDCRedirectURI:%q WindowsOIDCClientID:%q WindowsRegistrationOIDCParties:%q WindowsOIDCRedirectURI:%q WebOIDCClientID:%q WebOIDCStepUpClientID:%q WebOIDCRedirectURI:%q HumanVerificationProvider:%q HumanVerificationSiteKey:%q HumanVerificationSecret:%s OIDCClientSecret:%s InitialAdminPassword:%s KeycloakAdminClientSecret:%s KeycloakAdminClientID:%q KeycloakAdminBaseURL:%q RegistrationRecoveryEnabled:%t AccountDeletionEnabled:%t AccountDeletionIdentityKeyVersion:%d DatabaseURL:%s RedisURL:%s TokenSigningKey:%s PostgresMaxConns:%d PostgresMinConns:%d PostgresMaxConnLifetime:%s PostgresMaxConnIdleTime:%s PostgresHealthCheckPeriod:%s PostgresConnectTimeout:%s RedisPoolSize:%d RedisMinIdleConns:%d RedisDialTimeout:%s RedisReadTimeout:%s RedisWriteTimeout:%s RedisPoolTimeout:%s LogLevel:%q ListenAddr:%q MetricsListenAddr:%q}",
 		c.RuntimeMode,
+		c.IdentityProvider,
 		c.PublicURL,
 		c.OIDCIssuer,
 		c.OIDCBackchannelIssuer,
@@ -159,6 +165,7 @@ func (c Config) String() string {
 		c.HumanVerificationSiteKey,
 		c.HumanVerificationSecret,
 		c.OIDCClientSecret,
+		c.InitialAdminPassword,
 		c.KeycloakAdminClientSecret,
 		c.KeycloakAdminClientID,
 		c.KeycloakAdminBaseURL,
@@ -291,6 +298,7 @@ func clearAccountDeletionIdentityKeys(keys map[int16][]byte) {
 // startup should use Load, which enforces file permissions.
 type Input struct {
 	RuntimeMode                    string
+	IdentityProvider               string
 	PublicURL                      string
 	OIDCIssuer                     string
 	OIDCBackchannelIssuer          string
@@ -308,6 +316,7 @@ type Input struct {
 	HumanVerificationSiteKey       string
 
 	OIDCClientSecret           string
+	InitialAdminPassword       string
 	KeycloakAdminClientSecret  string
 	HumanVerificationSecret    string
 	AccountDeletionIdentityKey string
@@ -343,6 +352,7 @@ type Input struct {
 func New(input Input) (Config, error) {
 	return validate(Config{
 		RuntimeMode:                       strings.ToLower(strings.TrimSpace(input.RuntimeMode)),
+		IdentityProvider:                  strings.ToLower(strings.TrimSpace(input.IdentityProvider)),
 		PublicURL:                         strings.TrimSpace(input.PublicURL),
 		OIDCIssuer:                        strings.TrimSpace(input.OIDCIssuer),
 		OIDCBackchannelIssuer:             strings.TrimSpace(input.OIDCBackchannelIssuer),
@@ -360,6 +370,7 @@ func New(input Input) (Config, error) {
 		HumanVerificationSiteKey:          strings.TrimSpace(input.HumanVerificationSiteKey),
 		HumanVerificationSecret:           Secret(strings.TrimSpace(input.HumanVerificationSecret)),
 		OIDCClientSecret:                  Secret(strings.TrimSpace(input.OIDCClientSecret)),
+		InitialAdminPassword:              Secret(strings.TrimSpace(input.InitialAdminPassword)),
 		KeycloakAdminClientSecret:         Secret(strings.TrimSpace(input.KeycloakAdminClientSecret)),
 		KeycloakAdminClientID:             strings.TrimSpace(input.KeycloakAdminClientID),
 		KeycloakAdminBaseURL:              strings.TrimSpace(input.KeycloakAdminBaseURL),
@@ -476,18 +487,27 @@ func LoadSource(source Source) (Config, error) {
 	}
 
 	runtimeMode := strings.ToLower(lookupOptional("TERMLINK_RUNTIME_MODE", RuntimeModeDistributed))
+	identityProvider := strings.ToLower(lookupOptional("TERMLINK_IDENTITY_PROVIDER", IdentityProviderExternal))
 	publicURL, err := lookupRequired("TERMLINK_PUBLIC_URL")
 	if err != nil {
 		return Config{}, err
 	}
-	oidcIssuer, err := lookupRequired("TERMLINK_OIDC_ISSUER")
-	if err != nil {
-		return Config{}, err
+	oidcIssuer := lookupOptional("TERMLINK_OIDC_ISSUER", "")
+	if oidcIssuer == "" {
+		if identityProvider == IdentityProviderEmbedded {
+			oidcIssuer = strings.TrimRight(publicURL, "/") + "/realms/termlink"
+		} else {
+			return Config{}, fmt.Errorf("%w: TERMLINK_OIDC_ISSUER", ErrMissing)
+		}
 	}
 	oidcBackchannelIssuer := lookupOptional("TERMLINK_OIDC_BACKCHANNEL_ISSUER", oidcIssuer)
-	oidcClientID, err := lookupRequired("TERMLINK_OIDC_CLIENT_ID")
-	if err != nil {
-		return Config{}, err
+	oidcClientID := lookupOptional("TERMLINK_OIDC_CLIENT_ID", "")
+	if oidcClientID == "" {
+		if identityProvider == IdentityProviderEmbedded {
+			oidcClientID = "termlink-server"
+		} else {
+			return Config{}, fmt.Errorf("%w: TERMLINK_OIDC_CLIENT_ID", ErrMissing)
+		}
 	}
 	androidOIDCClientID := lookupOptional("TERMLINK_ANDROID_OIDC_CLIENT_ID", "termlink-android")
 	androidOIDCRedirectURI := lookupOptional("TERMLINK_ANDROID_OIDC_REDIRECT_URI", "dev.termlink:/oauth2redirect")
@@ -580,9 +600,12 @@ func LoadSource(source Source) (Config, error) {
 		return Config{}, err
 	}
 
-	oidcSecret, err := readSecret(source, "TERMLINK_OIDC_CLIENT_SECRET_FILE")
-	if err != nil {
-		return Config{}, err
+	var oidcSecret Secret
+	if identityProvider != IdentityProviderEmbedded {
+		oidcSecret, err = readSecret(source, "TERMLINK_OIDC_CLIENT_SECRET_FILE")
+		if err != nil {
+			return Config{}, err
+		}
 	}
 	databaseURL, err := readSecret(source, "TERMLINK_DATABASE_URL_FILE")
 	if err != nil {
@@ -599,8 +622,15 @@ func LoadSource(source Source) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	var initialAdminPassword Secret
+	if identityProvider == IdentityProviderEmbedded {
+		initialAdminPassword, err = readSecret(source, "TERMLINK_INITIAL_ADMIN_PASSWORD_FILE")
+		if err != nil {
+			return Config{}, err
+		}
+	}
 	var keycloakAdminClientSecret Secret
-	if registrationRecoveryEnabled || accountDeletionEnabled {
+	if identityProvider != IdentityProviderEmbedded && (registrationRecoveryEnabled || accountDeletionEnabled) {
 		keycloakAdminClientSecret, err = readSecret(source, "TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE")
 		if err != nil {
 			return Config{}, err
@@ -623,6 +653,7 @@ func LoadSource(source Source) (Config, error) {
 
 	return validate(Config{
 		RuntimeMode:                       runtimeMode,
+		IdentityProvider:                  identityProvider,
 		PublicURL:                         publicURL,
 		OIDCIssuer:                        oidcIssuer,
 		OIDCBackchannelIssuer:             oidcBackchannelIssuer,
@@ -640,6 +671,7 @@ func LoadSource(source Source) (Config, error) {
 		HumanVerificationSiteKey:          humanVerificationSiteKey,
 		HumanVerificationSecret:           humanVerificationSecret,
 		OIDCClientSecret:                  oidcSecret,
+		InitialAdminPassword:              initialAdminPassword,
 		KeycloakAdminClientSecret:         keycloakAdminClientSecret,
 		KeycloakAdminClientID:             keycloakAdminClientID,
 		KeycloakAdminBaseURL:              keycloakAdminBaseURL,
@@ -651,6 +683,7 @@ func LoadSource(source Source) (Config, error) {
 		RedisURL:                          redisURL,
 		TokenSigningKey:                   tokenSigningKey,
 		OIDCClientSecretFile:              envPath(source, "TERMLINK_OIDC_CLIENT_SECRET_FILE"),
+		InitialAdminPasswordFile:          envPath(source, "TERMLINK_INITIAL_ADMIN_PASSWORD_FILE"),
 		KeycloakAdminClientSecretFile:     envPath(source, "TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE"),
 		HumanVerificationSecretFile:       envPath(source, "TERMLINK_HUMAN_VERIFICATION_SECRET_FILE"),
 		AccountDeletionIdentityKeyFile:    envPath(source, "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE"),
@@ -744,11 +777,21 @@ func validate(c Config) (Config, error) {
 	if c.RuntimeMode != RuntimeModeDistributed && c.RuntimeMode != RuntimeModeSingleNode {
 		return Config{}, fmt.Errorf("%w: TERMLINK_RUNTIME_MODE", ErrInvalid)
 	}
+	c.IdentityProvider = strings.ToLower(strings.TrimSpace(c.IdentityProvider))
+	if c.IdentityProvider == "" {
+		c.IdentityProvider = IdentityProviderExternal
+	}
+	if c.IdentityProvider != IdentityProviderExternal && c.IdentityProvider != IdentityProviderEmbedded {
+		return Config{}, fmt.Errorf("%w: TERMLINK_IDENTITY_PROVIDER", ErrInvalid)
+	}
 	if err := validateHTTPSURL("TERMLINK_PUBLIC_URL", c.PublicURL); err != nil {
 		return Config{}, err
 	}
 	if err := validateHTTPSURL("TERMLINK_OIDC_ISSUER", c.OIDCIssuer); err != nil {
 		return Config{}, err
+	}
+	if c.IdentityProvider == IdentityProviderEmbedded && strings.TrimRight(c.OIDCIssuer, "/") != strings.TrimRight(c.PublicURL, "/")+"/realms/termlink" {
+		return Config{}, fmt.Errorf("%w: embedded TERMLINK_OIDC_ISSUER must use TERMLINK_PUBLIC_URL/realms/termlink", ErrInvalid)
 	}
 	if strings.TrimSpace(c.OIDCBackchannelIssuer) == "" {
 		c.OIDCBackchannelIssuer = c.OIDCIssuer
@@ -846,13 +889,17 @@ func validate(c Config) (Config, error) {
 		windowsRedirect.User != nil {
 		return Config{}, fmt.Errorf("%w: TERMLINK_WINDOWS_OIDC_REDIRECT_URI", ErrInvalid)
 	}
-	if c.OIDCClientSecret.Empty() {
+	if c.IdentityProvider == IdentityProviderExternal && c.OIDCClientSecret.Empty() {
 		return Config{}, fmt.Errorf("%w: TERMLINK_OIDC_CLIENT_SECRET_FILE", ErrSecret)
+	}
+	if c.IdentityProvider == IdentityProviderEmbedded &&
+		(len(c.InitialAdminPassword.Value()) < 16 || len(c.InitialAdminPassword.Value()) > 1024) {
+		return Config{}, fmt.Errorf("%w: TERMLINK_INITIAL_ADMIN_PASSWORD_FILE", ErrSecret)
 	}
 	if strings.TrimSpace(c.KeycloakAdminClientID) == "" {
 		c.KeycloakAdminClientID = defaultKeycloakAdminClientID
 	}
-	adminIdentityRequired := c.RegistrationRecoveryEnabled || c.AccountDeletionEnabled
+	adminIdentityRequired := c.IdentityProvider == IdentityProviderExternal && (c.RegistrationRecoveryEnabled || c.AccountDeletionEnabled)
 	if adminIdentityRequired {
 		if len(c.KeycloakAdminClientID) > 128 || strings.ContainsAny(c.KeycloakAdminClientID, " \t\r\n") {
 			return Config{}, fmt.Errorf("%w: TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID", ErrInvalid)

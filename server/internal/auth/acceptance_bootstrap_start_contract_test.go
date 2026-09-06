@@ -13,15 +13,20 @@ func TestAcceptanceStartClosesPublicIngressBeforeReinitializingIdentity(t *testi
 	}
 	script := string(data)
 	stopIngress := strings.Index(script, "docker compose @composeFileArguments stop lucky-upstream")
+	selectExternalInitializer := strings.Index(script, "$initializerServices += 'keycloak-init'")
 	removeInitializer := strings.Index(script, "docker compose @composeFileArguments rm --stop --force")
 	startStack := strings.Index(script, "docker compose @composeFileArguments up --build --detach")
-	if stopIngress < 0 || removeInitializer < 0 || startStack < 0 ||
-		!(stopIngress < removeInitializer && removeInitializer < startStack) {
+	if stopIngress < 0 || selectExternalInitializer < 0 || removeInitializer < 0 || startStack < 0 ||
+		!(stopIngress < selectExternalInitializer && selectExternalInitializer < removeInitializer && removeInitializer < startStack) {
 		t.Fatal("acceptance startup must close public ingress before rerunning identity initialization")
 	}
 	removeLineEnd := strings.IndexByte(script[removeInitializer:], '\n')
-	if removeLineEnd < 0 || !strings.Contains(script[removeInitializer:removeInitializer+removeLineEnd], "keycloak-init") {
-		t.Fatal("acceptance startup must remove the completed identity initializer before bringing the stack up")
+	if removeLineEnd < 0 || !strings.Contains(script[removeInitializer:removeInitializer+removeLineEnd], "@initializerServices") {
+		t.Fatal("acceptance startup must remove the selected identity initializer before bringing the stack up")
+	}
+	externalIdentityGuard := strings.LastIndex(script[:selectExternalInitializer], "if (-not $EmbeddedIdentity)")
+	if externalIdentityGuard < 0 || externalIdentityGuard > stopIngress {
+		t.Fatal("acceptance startup must only rerun the external identity initializer outside embedded identity mode")
 	}
 }
 
@@ -41,9 +46,8 @@ func TestAcceptanceStartWaitsOnOneStableContainerSet(t *testing.T) {
 	}
 	for _, contract := range []string{
 		"ps --all --format json",
-		"'lucky-upstream', 'postgres', 'valkey', 'server', 'keycloak'",
-		"'runtime-secrets-init', 'keycloak-init'",
-		"'server-secrets-init', 'migrate'",
+		"'lucky-upstream'; 'postgres'; 'valkey'; 'server'; 'keycloak'",
+		"'runtime-secrets-init'; 'keycloak-init'; 'server-secrets-init'; 'migrate'",
 		"[string]$item.Health -eq 'healthy'",
 		"[string]$item.State -eq 'exited' -and [int]$item.ExitCode -eq 0",
 	} {
@@ -102,8 +106,10 @@ func TestAcceptanceDirectShadowUsesIsolatedPrewarmedState(t *testing.T) {
 		"-Path /run/secrets/direct_valkey_password",
 		"-Expected '400:999:1000'",
 		"$oneShotServices += 'direct-valkey-secrets-init'",
-		"$resetComposeFiles = @($composeFiles)",
-		"docker compose @resetComposeFileArguments down --volumes --remove-orphans",
+		"docker compose -f $embeddedIdentityComposeFile down --volumes --remove-orphans",
+		"label=com.docker.compose.project=$composeProject",
+		"$volume.StartsWith($projectPrefix, [StringComparison]::Ordinal)",
+		"$network.StartsWith($projectPrefix, [StringComparison]::Ordinal)",
 		"TERMLINK_ACCEPTANCE_REQUIRE_DIRECT_TRANSPORT",
 		"redis://termlink-direct:$directValkeyPassword@direct-valkey:6379/0",
 	} {
@@ -213,6 +219,49 @@ func TestAcceptanceSingleNodeKeepsDurableServicesAndEmbedsCoordination(t *testin
 	} {
 		if !strings.Contains(overlay, contract) {
 			t.Fatalf("single-node acceptance overlay omitted %q", contract)
+		}
+	}
+}
+
+func TestAcceptanceEmbeddedIdentityTopologyHasNoKeycloakRuntime(t *testing.T) {
+	startData, err := os.ReadFile("../../ops/Start-ProductionAcceptance.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	composeData, err := os.ReadFile("../../compose/acceptance.embedded-identity.compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := string(startData)
+	compose := strings.ReplaceAll(string(composeData), "\r\n", "\n")
+	if strings.Contains(strings.ToLower(compose), "keycloak") {
+		t.Fatal("embedded identity Compose must not declare or reference Keycloak")
+	}
+	for _, contract := range []string{
+		"runtime-secrets-init:\n", "postgres:\n", "server:\n",
+		"TERMLINK_IDENTITY_PROVIDER: embedded",
+		"TERMLINK_INITIAL_ADMIN_PASSWORD_FILE: /run/secrets/admin_initial_password",
+		"TERMLINK_RUNTIME_MODE: single-node",
+	} {
+		if !strings.Contains(compose, contract) {
+			t.Fatalf("embedded identity Compose omitted %q", contract)
+		}
+	}
+	for _, forbidden := range []string{"acceptance-keycloak-data", "keycloak_admin_password", "oidc_client_secret", "valkey:"} {
+		if strings.Contains(strings.ToLower(compose), forbidden) {
+			t.Fatalf("embedded identity Compose retained %q", forbidden)
+		}
+	}
+	if strings.Contains(start, "Reset is not allowed during an embedded identity migration") {
+		t.Fatal("clean embedded identity reset must be supported")
+	}
+	for _, contract := range []string{
+		"$env:TERMLINK_ACCEPTANCE_USER_NAME = if ($EmbeddedIdentity) { 'admin' }",
+		"$paths.InitialAdminPassword } else { $paths.UserPassword }",
+		"if (-not $EmbeddedIdentity) {\n    Assert-RuntimeSecretMetadata -Service keycloak",
+	} {
+		if !strings.Contains(strings.ReplaceAll(start, "\r\n", "\n"), contract) {
+			t.Fatalf("embedded identity startup omitted %q", contract)
 		}
 	}
 }

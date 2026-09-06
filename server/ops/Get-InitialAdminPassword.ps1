@@ -38,7 +38,7 @@ try {
         throw 'The initial admin is not ready. Complete Start-ProductionAcceptance.ps1 first.'
     }
     if (Test-Path -LiteralPath $paths.InitialAdminClaimed -PathType Leaf) {
-        throw 'The initial admin password was already claimed. Use Reset-InitialAdminPassword.ps1 to issue a new temporary password.'
+        throw 'The initial admin password was already claimed. Use Reset-InitialAdminPassword.ps1 to issue a new password.'
     }
     if (-not (Test-Path -LiteralPath $paths.InitialAdminPassword -PathType Leaf)) {
         throw 'The managed initial admin secret is unavailable.'
@@ -49,13 +49,18 @@ try {
     }
 
     # Claim first. If the process stops after this point, retrieval fails closed
-    # and the operator must explicitly reset instead of receiving a credential
-    # that was never installed in the identity provider.
+    # and the operator must explicitly reset the credential.
     [IO.File]::WriteAllText($paths.InitialAdminClaimed, [DateTimeOffset]::UtcNow.ToString('O'), [Text.UTF8Encoding]::new($false))
-    # Rotate the host-side bootstrap input before disclosing the original so a
-    # normal restart cannot reveal it again. The replacement is not installed
-    # as an identity credential.
+    # Rotate both the host input and the service-private bootstrap file before
+    # disclosing the original. The embedded account retains only its Argon2id
+    # digest; the replacement value is never installed as a credential.
     [IO.File]::WriteAllText($paths.InitialAdminPassword, (New-RandomText 32), [Text.UTF8Encoding]::new($false))
+    Set-TermLinkAcceptanceComposeEnvironment -Paths $paths
+    $embeddedCompose = Join-Path $paths.ServerRoot 'compose\acceptance.embedded-identity.compose.yml'
+    & docker compose -f $embeddedCompose run --rm --no-deps runtime-secrets-init
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not scrub the staged initial administrator secret.'
+    }
     Write-Output $temporaryPassword
 }
 finally {

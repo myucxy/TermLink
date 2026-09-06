@@ -44,6 +44,7 @@ LABEL org.opencontainers.image.title="TermLink Server" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 COPY --from=build /out/termlink-server /termlink-server
+COPY server/THIRD_PARTY_NOTICES.md /THIRD_PARTY_NOTICES.md
 
 USER 65532:65532
 EXPOSE 8080 9090

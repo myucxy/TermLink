@@ -72,11 +72,16 @@ func TestManagerUpdateAppliesImmediatelyAndNeverExposesSecret(t *testing.T) {
 		if err := r.ParseForm(); err != nil {
 			t.Fatal(err)
 		}
-		if r.PostForm.Get("secret") != "managed-secret" || r.PostForm.Get("response") != "managed-token" {
+		token := r.PostForm.Get("response")
+		if r.PostForm.Get("secret") != "managed-secret" || token != "managed-token" && token != "login-token" {
 			t.Fatalf("Siteverify form = %v", r.PostForm)
 		}
+		action := RegistrationAction
+		if token == "login-token" {
+			action = LoginAction
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"success": true, "hostname": "termlink.example.test", "action": RegistrationAction,
+			"success": true, "hostname": "termlink.example.test", "action": action,
 		})
 	}))
 	defer provider.Close()
@@ -97,6 +102,9 @@ func TestManagerUpdateAppliesImmediatelyAndNeverExposesSecret(t *testing.T) {
 	if err = manager.Verify(context.Background(), "managed-token", "203.0.113.9"); err != nil || providerCalls != 1 {
 		t.Fatalf("Verify() err=%v providerCalls=%d", err, providerCalls)
 	}
+	if err = manager.VerifyAction(context.Background(), "login-token", "203.0.113.9", LoginAction); err != nil || providerCalls != 2 {
+		t.Fatalf("VerifyAction(login) err=%v providerCalls=%d", err, providerCalls)
+	}
 	if viewText, _ := json.Marshal(view); strings.Contains(string(viewText), "managed-secret") || bytes.Contains(repository.saved.SecretCiphertext, []byte("managed-secret")) {
 		t.Fatal("admin view or repository boundary exposed plaintext Secret")
 	}
@@ -106,7 +114,7 @@ func TestManagerUpdateAppliesImmediatelyAndNeverExposesSecret(t *testing.T) {
 	if err != nil || view.Enabled || view.SecretConfigured || len(repository.saved.SecretCiphertext) != 0 {
 		t.Fatalf("clear update = %+v saved=%+v err=%v", view, repository.saved, err)
 	}
-	if err = manager.Verify(context.Background(), "", ""); err != nil || providerCalls != 1 {
+	if err = manager.Verify(context.Background(), "", ""); err != nil || providerCalls != 2 {
 		t.Fatalf("disabled Verify() err=%v providerCalls=%d", err, providerCalls)
 	}
 }

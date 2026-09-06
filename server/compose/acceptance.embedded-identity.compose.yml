@@ -1,0 +1,136 @@
+name: termlink-production-acceptance
+
+# Clean single-node production topology. OAuth 2.0/OIDC, coordination, Direct
+# signalling, migrations, registration, recovery, and Web identity pages are
+# hosted by TermLink Server. No external identity runtime is declared here.
+services:
+  runtime-secrets-init:
+    image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        copy_secret() {
+          source="$$1"
+          destination="$$2"
+          owner="$$3"
+          temporary="$${destination}.new"
+          rm -f "$$temporary"
+          cp "/run/secrets/$$source" "$$temporary"
+          chmod 0400 "$$temporary"
+          chown "$$owner" "$$temporary"
+          mv -f "$$temporary" "$$destination"
+        }
+        copy_secret postgres_password /target/postgres/postgres_password 70:70
+        copy_secret database_url /target/server/database_url 65532:65532
+        copy_secret token_signing_key /target/server/token_signing_key 65532:65532
+        copy_secret admin_initial_password /target/server/admin_initial_password 65532:65532
+    secrets:
+      - postgres_password
+      - database_url
+      - token_signing_key
+      - admin_initial_password
+    volumes:
+      - acceptance-postgres-secrets:/target/postgres
+      - acceptance-server-secrets:/target/server
+    network_mode: "none"
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  postgres:
+    image: postgres:17.5-alpine3.22@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
+    environment:
+      POSTGRES_DB: termlink
+      POSTGRES_USER: termlink
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    networks: ["backend"]
+    volumes:
+      - acceptance-postgres-data:/var/lib/postgresql/data
+      - acceptance-postgres-secrets:/run/secrets:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U termlink -d termlink"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    depends_on:
+      runtime-secrets-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  server:
+    image: termlink-production-acceptance-server:local
+    build:
+      context: ../..
+      dockerfile: server/Dockerfile
+    environment:
+      TERMLINK_RUNTIME_MODE: single-node
+      TERMLINK_IDENTITY_PROVIDER: embedded
+      TERMLINK_PUBLIC_URL: ${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}
+      TERMLINK_OIDC_ISSUER: ${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}/realms/termlink
+      TERMLINK_OIDC_BACKCHANNEL_ISSUER: ${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}/realms/termlink
+      TERMLINK_OIDC_CLIENT_ID: termlink-server
+      TERMLINK_OIDC_ALLOWED_PARTIES: termlink-android,termlink-windows
+      TERMLINK_ANDROID_OIDC_CLIENT_ID: termlink-android
+      TERMLINK_ANDROID_OIDC_REDIRECT_URI: dev.termlink:/oauth2redirect
+      TERMLINK_WINDOWS_OIDC_CLIENT_ID: termlink-windows
+      TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES: termlink-windows
+      TERMLINK_WINDOWS_OIDC_REDIRECT_URI: http://127.0.0.1/oauth2/callback
+      TERMLINK_WEB_OIDC_CLIENT_ID: termlink-web
+      TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID: termlink-web-step-up
+      TERMLINK_WEB_OIDC_REDIRECT_URI: ${TERMLINK_ACCEPTANCE_PUBLIC_ORIGIN:-https://termlink.kget.cc:8910}/auth/callback
+      TERMLINK_DATABASE_URL_FILE: /run/secrets/database_url
+      TERMLINK_TOKEN_SIGNING_KEY_FILE: /run/secrets/token_signing_key
+      TERMLINK_INITIAL_ADMIN_PASSWORD_FILE: /run/secrets/admin_initial_password
+      TERMLINK_REGISTRATION_RECOVERY_ENABLED: "true"
+      TERMLINK_DIRECT_TRANSPORT_ENABLED: ${TERMLINK_SINGLE_NODE_DIRECT_TRANSPORT_ENABLED:-true}
+      TERMLINK_DIRECT_STUN_SERVERS: ${TERMLINK_SINGLE_NODE_DIRECT_STUN_SERVERS:-stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302}
+      TERMLINK_APPSHIP_BASE_URL: ${TERMLINK_APPSHIP_BASE_URL:-https://appship.kget.cc:8910}
+      TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS: ${TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS:-}
+      TERMLINK_LISTEN_ADDR: :8080
+      TERMLINK_LOG_LEVEL: info
+    networks:
+      - backend
+      - egress
+    volumes:
+      - acceptance-server-secrets:/run/secrets:ro
+    ports:
+      - "${TERMLINK_SINGLE_NODE_BIND_IP:-0.0.0.0}:${TERMLINK_SINGLE_NODE_PORT:-8080}:8080"
+    read_only: true
+    user: "65532:65532"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "/termlink-server", "healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 45
+    depends_on:
+      postgres:
+        condition: service_healthy
+      runtime-secrets-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+secrets:
+  admin_initial_password:
+    file: ${TERMLINK_ACCEPTANCE_ADMIN_INITIAL_PASSWORD_FILE:?required}
+  postgres_password:
+    file: ${TERMLINK_ACCEPTANCE_POSTGRES_PASSWORD_FILE:?required}
+  database_url:
+    file: ${TERMLINK_ACCEPTANCE_DATABASE_URL_FILE:?required}
+  token_signing_key:
+    file: ${TERMLINK_ACCEPTANCE_TOKEN_SIGNING_KEY_FILE:?required}
+
+volumes:
+  acceptance-postgres-data:
+  acceptance-postgres-secrets:
+  acceptance-server-secrets:
+
+networks:
+  backend:
+    internal: true
+  egress:

@@ -37,7 +37,7 @@ $serverPath = [IO.Path]::GetFullPath((Join-Path $packagePath '..\..'))
 $policyPath = Join-Path $serverPath 'ops\Test-ProductionDeployment.ps1'
 
 Assert-Test (Test-Path -LiteralPath $BashPath -PathType Leaf) "Bash not found: $BashPath"
-foreach ($scriptName in @('termlink-deploy', 'keycloak-reconcile.sh', 'postgres-init.sh')) {
+foreach ($scriptName in @('termlink-deploy')) {
     & $BashPath -n (Join-Path $packagePath $scriptName)
     Assert-Test ($LASTEXITCODE -eq 0) "Bash syntax validation failed: $scriptName"
 }
@@ -46,15 +46,6 @@ $helpText = $help -join "`n"
 Assert-Test ($LASTEXITCODE -eq 0 -and $helpText.Contains('termlink-deploy install') -and
     $helpText.Contains('termlink-deploy upgrade') -and $helpText.Contains('termlink-deploy doctor')) `
     'Deployment help did not render the command contract.'
-
-$realm = Get-Content -LiteralPath (Join-Path $packagePath 'keycloak-realm.json') -Raw |
-    ConvertFrom-Json -Depth 100
-Get-Content -LiteralPath (Join-Path $packagePath 'keycloak-user-profile.json') -Raw |
-    ConvertFrom-Json -Depth 100 | Out-Null
-$ordinaryUsers = @($realm.users | Where-Object { [string]$_.serviceAccountClientId -eq '' })
-Assert-Test ($ordinaryUsers.Count -eq 0) 'Production realm contains an ordinary or acceptance user.'
-$clientIDs = @($realm.clients | ForEach-Object { [string]$_.clientId })
-Assert-Test ($clientIDs -notcontains 'termlink-acceptance-cli') 'Production realm contains the acceptance client.'
 
 $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $fixturePath = Join-Path $tempRoot ("termlink-single-node-policy-" + [Guid]::NewGuid().ToString('N'))
@@ -68,21 +59,14 @@ try {
     New-Item -ItemType Directory -Path $fixturePath -Force | Out-Null
     Set-PrivateFixtureAcl -Path $fixturePath
     New-Item -ItemType Directory -Path $runtimePath, $secretPath -Force | Out-Null
-    foreach ($name in @(
-        'compose.yml', 'Caddyfile', 'Keycloak.Dockerfile', 'keycloak-realm.json',
-        'keycloak-user-profile.json', 'keycloak-reconcile.sh', 'postgres-init.sh'
-    )) {
+    foreach ($name in @('compose.yml', 'Caddyfile')) {
         Copy-Item -LiteralPath (Join-Path $packagePath $name) -Destination (Join-Path $runtimePath $name)
     }
 
     $postgresPassword = 'Postgres_Test_7Pz4mN8vQ2xK6cR9sT5yH3jF'
     $secrets = [ordered]@{
         'postgres-password' = $postgresPassword
-        'keycloak-db-password' = 'Keycloak_DB_Test_4kQ8nD7pM3sV6xR2cH9j'
-        'keycloak-bootstrap-admin-password' = 'Bootstrap_Test_5mR8kN2vP7xQ4cD9sH6j'
         'initial-admin-password' = 'Initial_Admin_Test_8pQ4mN7vR2xK6cD9'
-        'keycloak-admin-client-secret' = 'Recovery_Test_6vN3pQ8mR2xK7cD9sH4j'
-        'oidc-client-secret' = 'OIDC_Test_4mN8pQ2vR7xK6cD9sH3jF5yT'
         'database-url' = "postgres://termlink:${postgresPassword}@postgres:5432/termlink?sslmode=disable"
         'token-signing-key' = 'Token_Signing_Test_7pQ3mN8vR2xK6cD9sH4jF5yT1wB'
         'account-deletion-identity-key' = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
