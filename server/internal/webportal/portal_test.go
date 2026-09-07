@@ -499,7 +499,7 @@ func TestPortalHomeAndSecurityHeaders(t *testing.T) {
 		"Strict-Transport-Security": "max-age=31536000",
 		"X-Content-Type-Options":    "nosniff",
 		"X-Frame-Options":           "DENY",
-		"Referrer-Policy":           "no-referrer",
+		"Referrer-Policy":           "strict-origin",
 	} {
 		if got := recorder.Header().Get(name); !strings.Contains(got, want) {
 			t.Fatalf("%s = %q, want it to contain %q", name, got, want)
@@ -898,6 +898,7 @@ func TestPortalAccountResponsiveAndSVGControlContract(t *testing.T) {
 	for _, contract := range []string{
 		`data-identity-dialog="password"`, `data-identity-dialog="mfa"`, `data-identity-dialog="sessions"`,
 		`<dialog class="identity-security-dialog"`, `data-identity-dialog-frame`, `data-identity-dialog-fallback`,
+		`referrerpolicy="strict-origin"`,
 	} {
 		if !strings.Contains(portalDashboardHTML, contract) {
 			t.Errorf("in-page identity security dialog omitted %q", contract)
@@ -1648,6 +1649,7 @@ func TestSensitiveStepUpFrontendInterceptsOnlyAuditedForms(t *testing.T) {
 		`fetch("/auth/step-up/status"`, `cache: "no-store"`, `/auth/step-up?`,
 		`termlink:sensitive-step-up`, `HTMLFormElement.prototype.submit.call(form)`,
 		`document.querySelectorAll('[name="reason"]')`, `hidden.name = "reason"`,
+		`referrerpolicy="strict-origin"`,
 	} {
 		if !strings.Contains(contents, required) {
 			t.Fatalf("step-up frontend contract omitted %q", required)

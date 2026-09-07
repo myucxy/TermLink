@@ -132,6 +132,67 @@ func newIdentityTestBrowser(handler http.Handler) *identityTestBrowser {
 	return &identityTestBrowser{handler: handler, cookies: make(map[string]*http.Cookie)}
 }
 
+func TestEmbeddedIdentitySecurityHeadersPreserveSameOriginFormMetadata(t *testing.T) {
+	provider := &Provider{}
+	tests := []struct {
+		path         string
+		frameOptions string
+		ancestors    string
+	}{
+		{path: "/realms/termlink/protocol/openid-connect/auth", frameOptions: "SAMEORIGIN", ancestors: "frame-ancestors 'self'"},
+		{path: "/realms/termlink/account", frameOptions: "SAMEORIGIN", ancestors: "frame-ancestors 'self'"},
+		{path: "/realms/termlink/account/password/change", frameOptions: "SAMEORIGIN", ancestors: "frame-ancestors 'self'"},
+		{path: "/realms/termlink/.well-known/openid-configuration", frameOptions: "DENY", ancestors: "frame-ancestors 'none'"},
+		{path: "/realms/termlink/protocol/openid-connect/auth/extra", frameOptions: "DENY", ancestors: "frame-ancestors 'none'"},
+		{path: "/realms/termlink/accounting", frameOptions: "DENY", ancestors: "frame-ancestors 'none'"},
+	}
+	for _, test := range tests {
+		t.Run(test.path, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, identityTestOrigin+test.path, nil)
+			provider.securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})).ServeHTTP(response, request)
+
+			if got := response.Header().Get("Referrer-Policy"); got != "strict-origin" {
+				t.Fatalf("Referrer-Policy = %q, want strict-origin", got)
+			}
+			if got := response.Header().Get("X-Frame-Options"); got != test.frameOptions {
+				t.Fatalf("X-Frame-Options = %q, want %q", got, test.frameOptions)
+			}
+			if policy := response.Header().Get("Content-Security-Policy"); !strings.Contains(policy, test.ancestors) {
+				t.Fatalf("Content-Security-Policy = %q, want %q", policy, test.ancestors)
+			}
+		})
+	}
+}
+
+func TestEmbeddedIdentityFormOriginAllowsOnlySameOriginPrivacyFallback(t *testing.T) {
+	provider := &Provider{publicOrigin: identityTestOrigin}
+	request := httptest.NewRequest(http.MethodPost, identityTestOrigin+"/realms/termlink/protocol/openid-connect/auth", nil)
+	request.Header.Set("Origin", "null")
+	request.Header.Set("Sec-Fetch-Site", "same-origin")
+	if !provider.trustedIdentityFormOrigin(request) {
+		t.Fatal("same-origin browser privacy fallback was rejected")
+	}
+
+	request.Header.Set("Sec-Fetch-Site", "cross-site")
+	if provider.trustedIdentityFormOrigin(request) {
+		t.Fatal("cross-site browser request was accepted")
+	}
+	request.Header.Set("Origin", "https://attacker.example")
+	request.Header.Set("Sec-Fetch-Site", "same-origin")
+	if provider.trustedIdentityFormOrigin(request) {
+		t.Fatal("same-site fallback accepted an explicit attacker Origin")
+	}
+	request.Header.Set("Origin", "null")
+	request.Header.Set("Sec-Fetch-Site", "same-origin")
+	request.Host = "attacker.example"
+	if provider.trustedIdentityFormOrigin(request) {
+		t.Fatal("privacy fallback accepted an unexpected request host")
+	}
+}
+
 func (b *identityTestBrowser) request(method, target string, form url.Values, withOrigin bool) *httptest.ResponseRecorder {
 	var body *strings.Reader
 	if form == nil {
@@ -346,7 +407,9 @@ func TestEmbeddedIdentityBrowserSecurityFlows(t *testing.T) {
 	assertIdentityStatus(t, login, http.StatusOK)
 	if strings.Contains(login.Body.String(), `name="otp"`) ||
 		!strings.Contains(login.Body.String(), `data-sitekey="test-login-site-key"`) ||
-		!strings.Contains(login.Header().Get("Content-Security-Policy"), humanverification.TurnstileScriptOrigin) {
+		!strings.Contains(login.Header().Get("Content-Security-Policy"), humanverification.TurnstileScriptOrigin) ||
+		!strings.Contains(login.Header().Get("Content-Security-Policy"), "frame-ancestors 'self'") ||
+		login.Header().Get("X-Frame-Options") != "SAMEORIGIN" {
 		t.Fatalf("initial MFA login did not render only password plus human verification: %s", login.Body.String())
 	}
 	loginCSRF = identityHiddenValue(t, login.Body.String(), "termlink_csrf")

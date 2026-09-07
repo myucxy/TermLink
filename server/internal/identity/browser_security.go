@@ -387,7 +387,21 @@ func (p *Provider) trustedIdentityFormOrigin(r *http.Request) bool {
 		candidate = strings.TrimSpace(r.Referer())
 	}
 	parsed, err := url.Parse(candidate)
-	return err == nil && parsed.User == nil && sameIdentityOrigin(parsed, p.publicOrigin)
+	if err == nil && parsed.User == nil && sameIdentityOrigin(parsed, p.publicOrigin) {
+		return true
+	}
+	// A browser using a privacy-preserving referrer policy can serialize a
+	// same-origin form navigation as Origin: null with no Referer. Sec-Fetch-Site
+	// is a forbidden browser header, so accept that case only for the configured
+	// public host. The encrypted CSRF cookie and token are still validated by the
+	// caller before any account operation is performed.
+	return strings.EqualFold(candidate, "null") && p.identityRequestUsesPublicHost(r) &&
+		strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "same-origin")
+}
+
+func (p *Provider) identityRequestUsesPublicHost(r *http.Request) bool {
+	expected, err := url.Parse(p.publicOrigin)
+	return err == nil && expected.Host != "" && strings.EqualFold(strings.TrimSpace(r.Host), expected.Host)
 }
 
 func (p *Provider) clearIdentityFormCSRF(w http.ResponseWriter) {

@@ -447,7 +447,7 @@ func (p *Provider) renderLoginWithState(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	if humanRuntime.Enabled {
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self' "+humanverification.TurnstileScriptOrigin+"; style-src 'self'; img-src 'self' data:; connect-src 'self' "+humanverification.TurnstileScriptOrigin+"; frame-src 'self' "+humanverification.TurnstileScriptOrigin+"; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self' "+humanverification.TurnstileScriptOrigin+"; style-src 'self'; img-src 'self' data:; connect-src 'self' "+humanverification.TurnstileScriptOrigin+"; frame-src 'self' "+humanverification.TurnstileScriptOrigin+"; form-action 'self'; frame-ancestors 'self'; base-uri 'none'")
 	}
 	w.WriteHeader(http.StatusOK)
 	_ = loginTemplate.Execute(w, loginPageData{

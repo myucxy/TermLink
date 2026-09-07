@@ -253,7 +253,7 @@
         </header>
         <div class="sensitive-step-up-frame-wrap">
           <div class="sensitive-step-up-pending"><strong>${stepUpCopy.opening}</strong><span>${stepUpCopy.wait}</span></div>
-          <iframe class="sensitive-step-up-frame" title="${stepUpCopy.frameTitle}" referrerpolicy="no-referrer"></iframe>
+          <iframe class="sensitive-step-up-frame" title="${stepUpCopy.frameTitle}" referrerpolicy="strict-origin"></iframe>
         </div>
         <footer class="sensitive-step-up-footer">
           <p>${stepUpCopy.detail}</p>
