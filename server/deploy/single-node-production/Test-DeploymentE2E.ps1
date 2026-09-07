@@ -67,9 +67,12 @@ $succeeded = $false
 try {
     Invoke-Docker -Arguments @('image', 'inspect', $ServerImage) | Out-Null
     New-Item -ItemType Directory -Path $runtimePath, $secretPath -Force | Out-Null
-    foreach ($name in @('compose.yml', 'Caddyfile')) {
-        Copy-Item -LiteralPath (Join-Path $packagePath $name) -Destination (Join-Path $runtimePath $name)
+    $bashPath = 'D:\Dev\Env\Git\bin\bash.exe'
+    if (-not (Test-Path -LiteralPath $bashPath -PathType Leaf)) {
+        throw "Bash not found: $bashPath"
     }
+    & $bashPath (Join-Path $packagePath 'termlink-deploy') render-assets --output $runtimePath
+    if ($LASTEXITCODE -ne 0) { throw 'The single-file installer could not render its runtime assets.' }
 
     $postgresPassword = New-UrlSafeSecret
     $secrets = [ordered]@{
@@ -87,19 +90,16 @@ try {
     $runtimeComposePath = $runtimePath.Replace('\', '/')
     $secretComposePath = $secretPath.Replace('\', '/')
     [IO.File]::WriteAllLines($envPath, @(
-        'TERMLINK_CONFIG_VERSION=1'
+        'TERMLINK_CONFIG_VERSION=2'
         "COMPOSE_PROJECT_NAME=$project"
         "TERMLINK_IMAGE=$ServerImage"
         "TERMLINK_RUNTIME_DIR=$runtimeComposePath"
         "TERMLINK_SECRETS_DIR=$secretComposePath"
         "TERMLINK_PUBLIC_HOST=$publicHost"
         "TERMLINK_PUBLIC_URL=$publicURL"
-        'TERMLINK_ADMIN_EMAIL=admin@termlink.local'
-        'TERMLINK_TLS_MODE=external'
+        'TERMLINK_PUBLIC_PORT=443'
         'TERMLINK_HTTP_BIND_IP=127.0.0.1'
         "TERMLINK_HTTP_PORT=$httpPort"
-        'TERMLINK_HTTPS_BIND_IP=127.0.0.1'
-        'TERMLINK_HTTPS_PORT=443'
         'TERMLINK_BACKUP_RECIPIENT='
     ), [Text.UTF8Encoding]::new($false))
 
@@ -115,7 +115,7 @@ try {
             throw "E2E service is not running exactly once: $service"
         }
     }
-    if ($running -contains 'keycloak' -or $running -contains 'valkey' -or
+    if ($running -contains 'edge' -or $running -contains 'keycloak' -or $running -contains 'valkey' -or
         $running -contains 'minio' -or $running -contains 'migrate') {
         throw 'E2E topology contains a retired service.'
     }

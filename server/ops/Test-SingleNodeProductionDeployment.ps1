@@ -1,8 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$EnvFile,
-    [Parameter(Mandatory)][string]$ComposeFile,
-    [bool]$IncludeEdge = $true
+    [Parameter(Mandatory)][string]$ComposeFile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,28 +101,24 @@ function Assert-ExactSet {
 
 $envPath = [IO.Path]::GetFullPath($EnvFile)
 $composePath = [IO.Path]::GetFullPath($ComposeFile)
-$reviewedPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\deploy\single-node-production\compose.yml'))
-Assert-SingleNode ($composePath -ceq $reviewedPath) 'Single-node validation accepts only the reviewed deployment Compose file.'
+Assert-SingleNode (Test-Path -LiteralPath $composePath -PathType Leaf) `
+    "Rendered single-node Compose file does not exist: $composePath"
 Assert-PrivatePath -Path $envPath -Directory $false -DisplayName 'Deployment environment file'
 $deploymentEnvironment = Get-EnvironmentMap -Path $envPath
 
 $expectedEnvironmentNames = @(
-    'COMPOSE_PROJECT_NAME', 'TERMLINK_ADMIN_EMAIL', 'TERMLINK_BACKUP_RECIPIENT',
+    'COMPOSE_PROJECT_NAME', 'TERMLINK_BACKUP_RECIPIENT',
     'TERMLINK_CONFIG_VERSION', 'TERMLINK_HTTP_BIND_IP', 'TERMLINK_HTTP_PORT',
-    'TERMLINK_HTTPS_BIND_IP', 'TERMLINK_HTTPS_PORT', 'TERMLINK_IMAGE',
+    'TERMLINK_IMAGE', 'TERMLINK_PUBLIC_PORT',
     'TERMLINK_PUBLIC_HOST', 'TERMLINK_PUBLIC_URL', 'TERMLINK_RUNTIME_DIR',
-    'TERMLINK_SECRETS_DIR', 'TERMLINK_TLS_MODE'
+    'TERMLINK_SECRETS_DIR'
 )
 Assert-ExactSet -Expected $expectedEnvironmentNames -Actual @($deploymentEnvironment.Keys) `
     -Message 'Deployment environment keys differ from the reviewed non-secret set.'
-Assert-SingleNode ($deploymentEnvironment.TERMLINK_CONFIG_VERSION -ceq '1') 'Unsupported deployment environment version.'
+Assert-SingleNode ($deploymentEnvironment.TERMLINK_CONFIG_VERSION -ceq '2') 'Unsupported deployment environment version.'
 Assert-SingleNode ($deploymentEnvironment.COMPOSE_PROJECT_NAME -ceq 'termlink') 'Production project name must be termlink.'
 Assert-SingleNode ($deploymentEnvironment.TERMLINK_HTTP_BIND_IP -ceq '127.0.0.1') `
     'Server HTTP must bind only to loopback.'
-Assert-SingleNode ($deploymentEnvironment.TERMLINK_HTTPS_BIND_IP -ceq '0.0.0.0') `
-    'Managed HTTPS must use the reviewed public bind address.'
-Assert-SingleNode ($deploymentEnvironment.TERMLINK_TLS_MODE -in @('managed', 'external')) `
-    'TLS mode must be managed or external.'
 
 $publicUri = $null
 Assert-SingleNode ([Uri]::TryCreate($deploymentEnvironment.TERMLINK_PUBLIC_URL, [UriKind]::Absolute, [ref]$publicUri) -and
@@ -131,10 +126,13 @@ Assert-SingleNode ([Uri]::TryCreate($deploymentEnvironment.TERMLINK_PUBLIC_URL, 
     $publicUri.Fragment -eq '' -and $publicUri.AbsolutePath -ceq '/') 'Public URL must be an origin-only HTTPS URL.'
 Assert-SingleNode ($publicUri.DnsSafeHost -ceq $deploymentEnvironment.TERMLINK_PUBLIC_HOST) `
     'Public URL host must match TERMLINK_PUBLIC_HOST.'
+Assert-SingleNode ($deploymentEnvironment.TERMLINK_PUBLIC_PORT -cmatch '^[0-9]+$' -and
+    [int]$deploymentEnvironment.TERMLINK_PUBLIC_PORT -ge 1 -and
+    [int]$deploymentEnvironment.TERMLINK_PUBLIC_PORT -le 65535 -and
+    $publicUri.Port -eq [int]$deploymentEnvironment.TERMLINK_PUBLIC_PORT) `
+    'Public URL port must match TERMLINK_PUBLIC_PORT.'
 Assert-SingleNode ($publicUri.Host -notmatch '(?i)(^localhost$|\.(localhost|invalid|test|example)$|(^|\.)example\.(com|net|org)$)') `
     'Public URL cannot use a reserved test domain.'
-Assert-SingleNode ($deploymentEnvironment.TERMLINK_ADMIN_EMAIL -match '^[^\s@]+@[^\s@]+\.[^\s@]+$') `
-    'Administrator e-mail is invalid.'
 Assert-SingleNode ($deploymentEnvironment.TERMLINK_IMAGE -cmatch
     '^docker\.io/myucxy/termlink:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}@sha256:[0-9a-f]{64}$') `
     'Server image must be an immutable docker.io/myucxy/termlink tag and digest.'
@@ -149,31 +147,33 @@ $secretsPath = [IO.Path]::GetFullPath($deploymentEnvironment.TERMLINK_SECRETS_DI
 Assert-PrivatePath -Path $runtimePath -Directory $true -DisplayName 'Runtime directory'
 Assert-PrivatePath -Path $secretsPath -Directory $true -DisplayName 'Secret directory'
 
-$arguments = @('compose', '--env-file', $envPath, '--project-name', 'termlink-single-node-policy', '-f', $composePath)
-if ($IncludeEdge) { $arguments += @('--profile', 'managed-tls') }
-$arguments += @('config', '--format', 'json')
+$arguments = @('compose', '--env-file', $envPath, '--project-name', 'termlink-single-node-policy',
+    '-f', $composePath, 'config', '--format', 'json')
 $renderedResult = Invoke-TermLinkDocker -Arguments $arguments
 $renderedText = $renderedResult.Output -join [Environment]::NewLine
 try { $config = $renderedText | ConvertFrom-Json -Depth 100 }
 catch { throw "Rendered single-node Compose is invalid JSON: $($_.Exception.Message)" }
 
 $expectedServices = @('postgres', 'secrets-init', 'server')
-if ($IncludeEdge) { $expectedServices += 'edge' }
 $actualServices = @($config.services.PSObject.Properties.Name)
 Assert-ExactSet -Expected $expectedServices -Actual $actualServices `
     -Message 'Single-node production services differ from the reviewed topology.'
+Assert-ExactSet -Expected @('database', 'egress') -Actual @($config.networks.PSObject.Properties.Name) `
+    -Message 'Single-node production networks differ from the reviewed topology.'
+Assert-ExactSet -Expected @('postgres-data', 'postgres-secrets', 'server-secrets') `
+    -Actual @($config.volumes.PSObject.Properties.Name) `
+    -Message 'Single-node production volumes differ from the reviewed topology.'
 foreach ($retired in @(
-    'alertmanager', 'direct-valkey', 'grafana', 'keycloak', 'keycloak-init', 'migrate',
+    'alertmanager', 'direct-valkey', 'edge', 'grafana', 'keycloak', 'keycloak-init', 'migrate',
     'minio', 'prometheus', 'valkey'
 )) {
     Assert-SingleNode ($null -eq (Get-Value $config.services $retired)) "Retired service is present: $retired"
 }
 
 $approvedImages = @{
-    'secrets-init' = 'caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c'
+    'secrets-init' = 'alpine:3.22.1@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1'
     postgres = 'postgres:17.5-alpine3.22@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa'
     server = $deploymentEnvironment.TERMLINK_IMAGE
-    edge = 'caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c'
 }
 foreach ($serviceName in $actualServices) {
     $service = Get-Value $config.services $serviceName
@@ -198,14 +198,13 @@ foreach ($serviceName in $actualServices) {
 $expectedNetworks = @{
     'secrets-init' = @()
     postgres = @('database')
-    server = @('database', 'egress', 'frontend')
-    edge = @('frontend', 'public')
+    server = @('database', 'egress')
 }
 foreach ($serviceName in $actualServices) {
     Assert-ExactSet -Expected $expectedNetworks[$serviceName] -Actual @(Get-NetworkNames (Get-Value $config.services $serviceName)) `
         -Message "Service '$serviceName' network membership differs from the reviewed topology."
 }
-foreach ($networkName in @('database', 'frontend')) {
+foreach ($networkName in @('database')) {
     Assert-SingleNode ([bool](Get-Value (Get-Value $config.networks $networkName) 'internal')) `
         "Network '$networkName' must remain internal."
 }
@@ -285,18 +284,6 @@ Assert-SingleNode ($secretCopyCommand -match '(?m)^\s*chmod 0400 "\$\$destinatio
     $secretCopyCommand -match '(?m)^\s*chown "\$\$owner" "\$\$destination"\s*$') `
     'Secret initialization must enforce owner-only permissions and reviewed ownership.'
 
-if ($IncludeEdge) {
-    $edge = Get-Value $config.services 'edge'
-    $edgePorts = @((Get-Value $edge 'ports') | Where-Object { $null -ne $_ })
-    Assert-SingleNode ($edgePorts.Count -eq 1 -and [int](Get-Value $edgePorts[0] 'target') -eq 8443) `
-        'Managed edge must expose only its HTTPS listener.'
-    $edgeEnvironment = Get-Value $edge 'environment'
-    Assert-SingleNode ([string](Get-Value $edgeEnvironment 'TERMLINK_ACME_CA') -ceq
-        'https://acme-v02.api.letsencrypt.org/directory') 'Managed TLS must use production Let''s Encrypt.'
-    Assert-SingleNode ([string](Get-Value $edgeEnvironment 'TERMLINK_PUBLIC_HOST') -ceq
-        $deploymentEnvironment.TERMLINK_PUBLIC_HOST) 'Managed edge host does not match the public URL.'
-}
-
 $secretNames = @(
     'postgres-password', 'initial-admin-password', 'database-url', 'token-signing-key',
     'account-deletion-identity-key'
@@ -324,9 +311,8 @@ Assert-SingleNode ($secretValues['database-url'] -ceq
     'Database URL does not match the file-backed PostgreSQL password.'
 
 $caddyPath = Join-Path $runtimePath 'Caddyfile'
-foreach ($path in @($caddyPath)) {
-    Assert-SingleNode (Test-Path -LiteralPath $path -PathType Leaf) "Runtime asset is missing: $path"
-}
+Assert-SingleNode (-not (Test-Path -LiteralPath $caddyPath)) `
+    'Single-node runtime must not contain a bundled Caddy configuration.'
 $retiredRuntimeAssets = @(
     'Keycloak.Dockerfile', 'keycloak-realm.json', 'keycloak-reconcile.sh',
     'keycloak-user-profile.json', 'postgres-init.sh'
@@ -335,10 +321,4 @@ foreach ($name in $retiredRuntimeAssets) {
     Assert-SingleNode (-not (Test-Path -LiteralPath (Join-Path $runtimePath $name))) `
         "Retired identity runtime asset is present: $name"
 }
-$caddyText = [IO.File]::ReadAllText($caddyPath)
-Assert-SingleNode ($caddyText -match '(?m)^\s*@internal path /metrics /metrics/\* /debug /debug/\*\s*$' -and
-    $caddyText -match '(?m)^\s*respond @internal 404\s*$') 'Managed edge must deny metrics and debug routes.'
-Assert-SingleNode ($caddyText -notmatch '(?i)minio|termlink-history|X-Amz-') `
-    'Managed edge contains retired object-storage routes.'
-
 Write-Host 'TermLink single-node production deployment policy validation passed.'

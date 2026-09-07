@@ -3,7 +3,7 @@
 This package installs the supported single-server topology:
 
 ```text
-Caddy or an external TLS proxy
+       External HTTPS proxy
               |
         TermLink Server
               |
@@ -26,23 +26,29 @@ paths as before.
 - A Linux server with a public DNS name.
 - Docker Engine with the Docker Compose v2 plugin.
 - `bash`, `curl`, `openssl`, GNU coreutils, and GNU tar.
-- An immutable signed TermLink image reference in `tag@sha256:digest` form.
-- For managed TLS, DNS must point to the server and inbound TCP 443 must reach it.
+- The released single-file `termlink-deploy` installer. Its Server image is
+  already pinned by tag and digest.
+- An existing HTTPS reverse proxy such as Nginx, Traefik, Lucky, or a cloud
+  tunnel. It must support WebSocket upgrades.
 - `age` is required only for backup and restore.
 
 Do not use `server/acceptance` Compose files for production.
 
 ## Install
 
-Run from a release source checkout:
+Download the installer for the desired TermLink release, verify the published
+SHA-256 checksum, and run it. No repository checkout, Compose file, or image
+digest argument is required:
 
 ```bash
-cd server/deploy/single-node-production
-sudo bash ./termlink-deploy install \
-  --domain termlink.example.com \
-  --email admin@example.com \
-  --image docker.io/myucxy/termlink:0.2.41@sha256:<64-hex-digest>
+curl --fail --location --output termlink-deploy https://RELEASE-URL/termlink-deploy
+echo '<published-sha256>  termlink-deploy' | sha256sum --check
+sudo bash ./termlink-deploy install
 ```
+
+The installer asks only for the public domain. For automation, pass it with
+`--domain`. A source-tree installer has no release image embedded and
+additionally requires `--image`.
 
 The default data directory is `/opt/termlink`. The installer creates private
 runtime and secret directories, starts PostgreSQL and one Server replica, then
@@ -50,7 +56,8 @@ checks migrations, health, and OIDC discovery. Server creates the initial
 administrator transactionally only when the embedded identity database is
 empty.
 
-View the initial password exactly once:
+Interactive installation prints the initial password exactly once. If output is
+redirected or installation is non-interactive, retrieve it exactly once with:
 
 ```bash
 sudo /opt/termlink/termlink-deploy credentials
@@ -58,17 +65,15 @@ sudo /opt/termlink/termlink-deploy credentials
 
 The username is `admin`. Change the generated password after the first login.
 
-## External TLS
+## HTTPS proxy
 
-To keep an existing host reverse proxy, use:
+TermLink intentionally does not install or operate a TLS proxy. Configure the
+host's existing reverse proxy first, then install with its public domain:
 
 ```bash
 sudo bash ./termlink-deploy install \
   --domain termlink.example.com \
-  --email admin@example.com \
-  --tls external \
-  --http-port 8080 \
-  --image docker.io/myucxy/termlink:0.2.41@sha256:<64-hex-digest>
+  --http-port 8080
 ```
 
 The application origin then listens only on `127.0.0.1:8080`. The external
@@ -76,31 +81,42 @@ proxy must terminate HTTPS for the configured domain, preserve the `Host`
 header, set `X-Forwarded-Proto: https`, and support WebSocket upgrades. Do not
 publish the origin port to another machine.
 
+If the public proxy listens on a non-standard HTTPS port, add
+`--public-port PORT`. This changes generated OIDC URLs but does not expose that
+port from Docker.
+
 ## Operations
 
 ```bash
 # Health, topology, OIDC discovery, and migration state
 sudo /opt/termlink/termlink-deploy doctor
 
-# Upgrade code and runtime assets; an encrypted backup runs first when configured
-sudo bash ./termlink-deploy upgrade \
-  --image docker.io/myucxy/termlink:0.2.42@sha256:<64-hex-digest>
+# Download the newer release's one-file installer, then upgrade. Its pinned
+# image and embedded runtime assets are selected automatically.
+sudo bash ./termlink-deploy upgrade
 
 # Show current non-secret configuration
 sudo /opt/termlink/termlink-deploy config
 
 # Change the public domain and reapply the stack
 sudo /opt/termlink/termlink-deploy config \
-  --domain new.termlink.example.com \
-  --email admin@example.com
+  --domain new.termlink.example.com
 
 # Stop and remove containers and networks, preserving Docker volumes and files
 sudo /opt/termlink/termlink-deploy uninstall --keep-data
 ```
 
-Run `upgrade` from the newly downloaded deployment directory when deployment
-assets changed. Running the installed copy is sufficient for an image-only
-upgrade.
+Run `upgrade` with the newly downloaded installer. The installed copy remains
+useful for `doctor`, `config`, `backup`, `restore`, and `uninstall`, but it does
+not silently follow a floating image tag.
+
+Release maintainers generate the downloadable one-file installer with:
+
+```powershell
+.\Build-Installer.ps1 `
+  -ServerImage 'docker.io/myucxy/termlink:VERSION@sha256:DIGEST' `
+  -OutputPath '.\out\termlink-deploy'
+```
 
 An older installation that still runs Keycloak must not be upgraded in place
 without first exporting and importing its identities. For a reset deployment,
@@ -150,10 +166,10 @@ A fresh server can restore during install with `--restore` and `--identity`.
   .termlink-managed
   config.env                 # non-secret deployment settings
   secrets/                   # mode 0700, file-backed secrets mode 0600
-  runtime/                   # reviewed Compose and optional Caddy assets
-  termlink-deploy
+  runtime/                   # Compose asset rendered by the installer
+  termlink-deploy            # installed copy of the single-file tool
 ```
 
-PostgreSQL and optional Caddy state remain in named Docker volumes. The tool
-never deletes those volumes. Always create and verify an encrypted backup before
-manually removing Docker data.
+PostgreSQL state remains in a named Docker volume. The tool never deletes that
+volume. Always create and verify an encrypted backup before manually removing
+Docker data.

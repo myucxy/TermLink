@@ -3,10 +3,13 @@ set -Eeuo pipefail
 umask 077
 
 readonly SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
-readonly SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 readonly MARKER_VALUE='termlink-single-node-production-v1'
 readonly DEFAULT_DATA_DIR='/opt/termlink'
 readonly DEFAULT_BACKUP_DIR='/var/backups/termlink'
+# Release packaging replaces this exact marker with the signed immutable Server
+# image. The source checkout deliberately has no floating default: developers
+# must pass --image, while users of a released single-file installer do not.
+readonly BUNDLED_IMAGE='__TERMLINK_BUNDLED_IMAGE__'
 readonly SECRET_NAMES=(
   postgres-password
   initial-admin-password
@@ -19,18 +22,15 @@ DATA_DIR=''
 RUNTIME_DIR=''
 SECRETS_DIR=''
 CONFIG_FILE=''
-TLS_MODE=''
 PUBLIC_HOST=''
 PUBLIC_URL=''
-ADMIN_EMAIL=''
 IMAGE=''
 HTTP_PORT=''
-HTTPS_PORT=''
+PUBLIC_PORT=''
 BACKUP_RECIPIENT=''
 RESTORE_ACTIVE=0
 TEMP_PATHS=()
 COMPOSE=()
-COMPOSE_ALL=()
 
 log() {
   printf '[TermLink] %s\n' "$*"
@@ -56,10 +56,10 @@ cleanup() {
 
 on_error() {
   local status=$?
-  if [[ "$RESTORE_ACTIVE" == 1 && ${#COMPOSE_ALL[@]} -gt 0 ]]; then
+  if [[ "$RESTORE_ACTIVE" == 1 && ${#COMPOSE[@]} -gt 0 ]]; then
     set +e
     warn 'restore failed; the application service will remain stopped'
-    "${COMPOSE_ALL[@]}" stop edge server >/dev/null 2>&1
+    "${COMPOSE[@]}" stop server >/dev/null 2>&1
   fi
   exit "$status"
 }
@@ -72,7 +72,7 @@ show_help() {
 TermLink single-node production deployment
 
 Usage:
-  termlink-deploy install --domain HOST --email EMAIL --image IMAGE [options]
+  termlink-deploy install [--domain HOST] [--image IMAGE] [options]
   termlink-deploy upgrade [--image IMAGE] [--data-dir DIR] [--skip-backup]
   termlink-deploy doctor [--data-dir DIR]
   termlink-deploy backup [--data-dir DIR] [--recipient AGE_RECIPIENT] [--output FILE]
@@ -80,21 +80,24 @@ Usage:
   termlink-deploy credentials [--data-dir DIR]
   termlink-deploy config [options]
   termlink-deploy uninstall --keep-data [--data-dir DIR]
+  termlink-deploy render-assets --output DIR
 
 Install/config options:
   --domain HOST              Public DNS name.
-  --email EMAIL              ACME contact and initial administrator e-mail.
   --image IMAGE              docker.io/myucxy/termlink:TAG@sha256:DIGEST.
   --data-dir DIR             Managed deployment directory (default: /opt/termlink).
-  --tls managed|external     Use built-in Caddy or an external TLS proxy.
   --http-port PORT           Loopback origin port (default: 8080).
-  --https-port PORT          Public HTTPS port for managed TLS (default: 443).
+  --public-port PORT         External HTTPS port (default: 443).
   --backup-recipient VALUE   Native age recipient used by backup and upgrade.
   --restore FILE             Restore this v4 archive during a fresh install.
   --identity FILE            age identity for --restore.
 
-The external TLS mode exposes only the loopback HTTP origin. Configure your
-host reverse proxy to forward the public HTTPS host to 127.0.0.1:HTTP_PORT.
+Missing install values are requested interactively. A released installer embeds
+its immutable Server image, so normal installation only asks for the domain.
+Source checkouts still require --image explicitly.
+
+TermLink exposes only a loopback HTTP origin. Configure an external HTTPS proxy
+to preserve Host and X-Forwarded-Proto and forward WebSocket upgrades to it.
 EOF
 }
 
@@ -125,14 +128,29 @@ validate_domain() {
   done
 }
 
-validate_email() {
-  [[ "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ && ${#1} -le 320 ]] || \
-    die 'email is not syntactically valid'
+validate_image() {
+  is_valid_image "$1" || \
+    die 'image must be docker.io/myucxy/termlink:TAG@sha256:<64 lowercase hex characters>'
 }
 
-validate_image() {
-  [[ "$1" =~ ^docker\.io/myucxy/termlink:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}@sha256:[0-9a-f]{64}$ ]] || \
-    die 'image must be docker.io/myucxy/termlink:TAG@sha256:<64 lowercase hex characters>'
+is_valid_image() {
+  [[ "$1" =~ ^docker\.io/myucxy/termlink:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}@sha256:[0-9a-f]{64}$ ]]
+}
+
+bundled_image() {
+  is_valid_image "$BUNDLED_IMAGE" || return 1
+  printf '%s' "$BUNDLED_IMAGE"
+}
+
+prompt_required() {
+  local variable_name="$1"
+  local label="$2"
+  local current="${!variable_name}"
+  [[ -z "$current" ]] || return
+  [[ -t 0 ]] || die "$label is required in non-interactive mode"
+  read -r -p "$label: " current
+  [[ -n "$current" ]] || die "$label cannot be empty"
+  printf -v "$variable_name" '%s' "$current"
 }
 
 validate_recipient() {
@@ -190,84 +208,207 @@ load_config() {
   [[ "$(stat -c '%a' "$RUNTIME_DIR")" == 700 ]] || die 'runtime directory must have mode 0700'
   [[ "$(stat -c '%a' "$SECRETS_DIR")" == 700 ]] || die 'secret directory must have mode 0700'
   [[ "$(stat -c '%a' "$CONFIG_FILE")" == 600 ]] || die 'configuration file must have mode 0600'
-  [[ "$(config_get TERMLINK_CONFIG_VERSION)" == 1 ]] || die 'unsupported deployment configuration version'
+  [[ "$(config_get TERMLINK_CONFIG_VERSION)" == 2 ]] || die 'unsupported deployment configuration version'
   PUBLIC_HOST="$(config_get TERMLINK_PUBLIC_HOST)"
   PUBLIC_URL="$(config_get TERMLINK_PUBLIC_URL)"
-  ADMIN_EMAIL="$(config_get TERMLINK_ADMIN_EMAIL)"
   IMAGE="$(config_get TERMLINK_IMAGE)"
-  TLS_MODE="$(config_get TERMLINK_TLS_MODE)"
   HTTP_PORT="$(config_get TERMLINK_HTTP_PORT)"
-  HTTPS_PORT="$(config_get TERMLINK_HTTPS_PORT)"
+  PUBLIC_PORT="$(config_get TERMLINK_PUBLIC_PORT)"
   BACKUP_RECIPIENT="$(grep -E '^TERMLINK_BACKUP_RECIPIENT=' "$CONFIG_FILE" | tail -n 1 | cut -d= -f2- || true)"
   [[ "$(config_get TERMLINK_RUNTIME_DIR)" == "$RUNTIME_DIR" ]] || die 'runtime directory does not match the managed path'
   [[ "$(config_get TERMLINK_SECRETS_DIR)" == "$SECRETS_DIR" ]] || die 'secret directory does not match the managed path'
   validate_domain "$PUBLIC_HOST"
-  validate_email "$ADMIN_EMAIL"
   validate_image "$IMAGE"
   validate_port "$HTTP_PORT" TERMLINK_HTTP_PORT
-  validate_port "$HTTPS_PORT" TERMLINK_HTTPS_PORT
-  [[ "$TLS_MODE" == managed || "$TLS_MODE" == external ]] || die 'invalid TLS mode in configuration'
+  validate_port "$PUBLIC_PORT" TERMLINK_PUBLIC_PORT
   [[ -z "$BACKUP_RECIPIENT" ]] || validate_recipient "$BACKUP_RECIPIENT"
   local expected_public_url="https://$PUBLIC_HOST"
-  [[ "$HTTPS_PORT" == 443 ]] || expected_public_url="$expected_public_url:$HTTPS_PORT"
+  [[ "$PUBLIC_PORT" == 443 ]] || expected_public_url="$expected_public_url:$PUBLIC_PORT"
   [[ "$PUBLIC_URL" == "$expected_public_url" ]] || die 'public URL does not match the configured host and HTTPS port'
 }
 
 write_config() {
   local tmp="$DATA_DIR/.config.env.tmp.$$"
   local public_url="https://$PUBLIC_HOST"
-  if [[ "$HTTPS_PORT" != 443 ]]; then
-    public_url="$public_url:$HTTPS_PORT"
+  if [[ "$PUBLIC_PORT" != 443 ]]; then
+    public_url="$public_url:$PUBLIC_PORT"
   fi
   PUBLIC_URL="$public_url"
   cat > "$tmp" <<EOF
-TERMLINK_CONFIG_VERSION=1
+TERMLINK_CONFIG_VERSION=2
 COMPOSE_PROJECT_NAME=termlink
 TERMLINK_IMAGE=$IMAGE
 TERMLINK_RUNTIME_DIR=$RUNTIME_DIR
 TERMLINK_SECRETS_DIR=$SECRETS_DIR
 TERMLINK_PUBLIC_HOST=$PUBLIC_HOST
 TERMLINK_PUBLIC_URL=$PUBLIC_URL
-TERMLINK_ADMIN_EMAIL=$ADMIN_EMAIL
-TERMLINK_TLS_MODE=$TLS_MODE
 TERMLINK_HTTP_BIND_IP=127.0.0.1
 TERMLINK_HTTP_PORT=$HTTP_PORT
-TERMLINK_HTTPS_BIND_IP=0.0.0.0
-TERMLINK_HTTPS_PORT=$HTTPS_PORT
+TERMLINK_PUBLIC_PORT=$PUBLIC_PORT
 TERMLINK_BACKUP_RECIPIENT=$BACKUP_RECIPIENT
 EOF
   chmod 0600 "$tmp"
   mv -f -- "$tmp" "$CONFIG_FILE"
 }
 
-source_package_dir() {
-  if [[ -f "$SCRIPT_DIR/compose.yml" && -f "$SCRIPT_DIR/Caddyfile" ]]; then
-    printf '%s' "$SCRIPT_DIR"
-  elif [[ -f "$SCRIPT_DIR/runtime/compose.yml" && -f "$SCRIPT_DIR/runtime/Caddyfile" ]]; then
-    printf '%s' "$SCRIPT_DIR/runtime"
+write_embedded_runtime_assets() {
+  local target_dir="$1"
+  local compose_tmp="$target_dir/.compose.yml.tmp.$$"
+  if [[ -e "$target_dir" ]]; then
+    [[ -d "$target_dir" && ! -L "$target_dir" ]] || die "runtime asset target is unsafe: $target_dir"
   else
-    die 'deployment runtime assets were not found beside the deployment tool'
+    install -d -m 0700 "$target_dir"
   fi
+  cat > "$compose_tmp" <<'TERMLINK_COMPOSE_EOF'
+name: ${COMPOSE_PROJECT_NAME:-termlink}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: ${TERMLINK_CONTAINER_LOG_MAX_SIZE:-10m}
+    max-file: ${TERMLINK_CONTAINER_LOG_MAX_FILES:-5}
+
+services:
+  secrets-init:
+    image: alpine:3.22.1@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        copy_secret() {
+          source="$$1"
+          destination="$$2"
+          owner="$$3"
+          test -s "/source/$$source"
+          rm -f "$$destination"
+          cp "/source/$$source" "$$destination"
+          chmod 0400 "$$destination"
+          chown "$$owner" "$$destination"
+        }
+        copy_secret postgres-password /target/postgres/postgres_password 70:70
+        copy_secret initial-admin-password /target/server/initial_admin_password 65532:65532
+        copy_secret database-url /target/server/database_url 65532:65532
+        copy_secret token-signing-key /target/server/token_signing_key 65532:65532
+        copy_secret account-deletion-identity-key /target/server/account_deletion_identity_key 65532:65532
+    volumes:
+      - ${TERMLINK_SECRETS_DIR:?TERMLINK_SECRETS_DIR is required}:/source:ro
+      - postgres-secrets:/target/postgres
+      - server-secrets:/target/server
+    network_mode: none
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+    logging: *default-logging
+
+  postgres:
+    image: postgres:17.5-alpine3.22@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
+    environment:
+      POSTGRES_DB: termlink
+      POSTGRES_USER: termlink
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - postgres-secrets:/run/secrets:ro
+    networks: ["database"]
+    shm_size: ${TERMLINK_POSTGRES_SHM_SIZE:-128m}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U termlink -d termlink"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    mem_limit: ${TERMLINK_POSTGRES_MEMORY_LIMIT:-1g}
+    mem_reservation: ${TERMLINK_POSTGRES_MEMORY_RESERVATION:-256m}
+    cpus: ${TERMLINK_POSTGRES_CPU_LIMIT:-1.50}
+    pids_limit: ${TERMLINK_POSTGRES_PIDS_LIMIT:-256}
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
+
+  server:
+    image: ${TERMLINK_IMAGE:?TERMLINK_IMAGE immutable tag and digest is required}
+    environment:
+      TERMLINK_RUNTIME_MODE: single-node
+      TERMLINK_IDENTITY_PROVIDER: embedded
+      TERMLINK_PUBLIC_URL: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}
+      TERMLINK_OIDC_ISSUER: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}/realms/termlink
+      TERMLINK_OIDC_BACKCHANNEL_ISSUER: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}/realms/termlink
+      TERMLINK_OIDC_CLIENT_ID: termlink-server
+      TERMLINK_OIDC_ALLOWED_PARTIES: termlink-android,termlink-windows
+      TERMLINK_ANDROID_OIDC_CLIENT_ID: termlink-android
+      TERMLINK_ANDROID_OIDC_REDIRECT_URI: dev.termlink:/oauth2redirect
+      TERMLINK_WINDOWS_OIDC_CLIENT_ID: termlink-windows
+      TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES: termlink-windows
+      TERMLINK_WINDOWS_OIDC_REDIRECT_URI: http://127.0.0.1/oauth2/callback
+      TERMLINK_WEB_OIDC_CLIENT_ID: termlink-web
+      TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID: termlink-web-step-up
+      TERMLINK_WEB_OIDC_REDIRECT_URI: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}/auth/callback
+      TERMLINK_INITIAL_ADMIN_PASSWORD_FILE: /run/secrets/initial_admin_password
+      TERMLINK_DATABASE_URL_FILE: /run/secrets/database_url
+      TERMLINK_TOKEN_SIGNING_KEY_FILE: /run/secrets/token_signing_key
+      TERMLINK_REGISTRATION_RECOVERY_ENABLED: "true"
+      TERMLINK_ACCOUNT_DELETION_ENABLED: "true"
+      TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE: /run/secrets/account_deletion_identity_key
+      TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION: "1"
+      TERMLINK_DIRECT_TRANSPORT_ENABLED: "true"
+      TERMLINK_DIRECT_STUN_SERVERS: ${TERMLINK_DIRECT_STUN_SERVERS:-stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302}
+      TERMLINK_APPSHIP_BASE_URL: ${TERMLINK_APPSHIP_BASE_URL:-https://appship.kget.cc:8910}
+      TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS: ${TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS:-}
+      TERMLINK_LISTEN_ADDR: :8080
+      TERMLINK_LOG_LEVEL: ${TERMLINK_LOG_LEVEL:-info}
+    volumes:
+      - server-secrets:/run/secrets:ro
+    ports:
+      - "${TERMLINK_HTTP_BIND_IP:-127.0.0.1}:${TERMLINK_HTTP_PORT:-8080}:8080"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    read_only: true
+    user: "65532:65532"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    networks: ["database", "egress"]
+    healthcheck:
+      test: ["CMD", "/termlink-server", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    mem_limit: ${TERMLINK_SERVER_MEMORY_LIMIT:-768m}
+    mem_reservation: ${TERMLINK_SERVER_MEMORY_RESERVATION:-192m}
+    cpus: ${TERMLINK_SERVER_CPU_LIMIT:-1.50}
+    pids_limit: ${TERMLINK_SERVER_PIDS_LIMIT:-256}
+    stop_grace_period: 30s
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+      secrets-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+  postgres-secrets:
+  server-secrets:
+
+networks:
+  database:
+    internal: true
+  egress:
+TERMLINK_COMPOSE_EOF
+  chmod 0600 "$compose_tmp"
+  mv -f -- "$compose_tmp" "$target_dir/compose.yml"
 }
 
 install_runtime_assets() {
-  local package_dir
-  package_dir="$(source_package_dir)"
-  install -d -m 0700 "$RUNTIME_DIR"
-  if [[ "$(realpath -m -- "$package_dir")" == "$(realpath -m -- "$RUNTIME_DIR")" ]]; then
-    for name in compose.yml Caddyfile; do
-      [[ -f "$RUNTIME_DIR/$name" && ! -L "$RUNTIME_DIR/$name" ]] || \
-        die "installed runtime asset is missing or unsafe: $name"
-    done
-    return
-  fi
   if [[ "$(realpath -m -- "$SCRIPT_PATH")" != "$(realpath -m -- "$DATA_DIR/termlink-deploy")" ]]; then
     install -m 0700 "$SCRIPT_PATH" "$DATA_DIR/termlink-deploy"
   fi
-  for name in compose.yml Caddyfile; do
-    [[ -f "$package_dir/$name" ]] || die "deployment asset is missing: $name"
-    install -m 0600 "$package_dir/$name" "$RUNTIME_DIR/$name"
-  done
+  write_embedded_runtime_assets "$RUNTIME_DIR"
 }
 
 random_urlsafe() {
@@ -339,11 +480,10 @@ verify_secrets() {
 build_compose_commands() {
   local name
   for name in COMPOSE_ENV_FILES COMPOSE_FILE COMPOSE_PROFILES COMPOSE_PROJECT_NAME \
-    TERMLINK_ADMIN_EMAIL TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS TERMLINK_APPSHIP_BASE_URL \
+    TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS TERMLINK_APPSHIP_BASE_URL \
     TERMLINK_CONTAINER_LOG_MAX_FILES TERMLINK_CONTAINER_LOG_MAX_SIZE TERMLINK_DIRECT_STUN_SERVERS \
-    TERMLINK_EDGE_CPU_LIMIT TERMLINK_EDGE_MEMORY_LIMIT TERMLINK_EDGE_MEMORY_RESERVATION \
-    TERMLINK_EDGE_PIDS_LIMIT TERMLINK_HTTP_BIND_IP TERMLINK_HTTP_PORT TERMLINK_HTTPS_BIND_IP \
-    TERMLINK_HTTPS_PORT TERMLINK_IMAGE TERMLINK_LOG_LEVEL TERMLINK_POSTGRES_CPU_LIMIT \
+    TERMLINK_HTTP_BIND_IP TERMLINK_HTTP_PORT TERMLINK_IMAGE TERMLINK_LOG_LEVEL \
+    TERMLINK_POSTGRES_CPU_LIMIT \
     TERMLINK_POSTGRES_MEMORY_LIMIT TERMLINK_POSTGRES_MEMORY_RESERVATION TERMLINK_POSTGRES_PIDS_LIMIT \
     TERMLINK_POSTGRES_SHM_SIZE TERMLINK_PUBLIC_HOST TERMLINK_PUBLIC_URL TERMLINK_RUNTIME_DIR \
     TERMLINK_SECRETS_DIR TERMLINK_SERVER_CPU_LIMIT TERMLINK_SERVER_MEMORY_LIMIT \
@@ -352,10 +492,6 @@ build_compose_commands() {
   done
   COMPOSE=(docker compose --project-directory "$RUNTIME_DIR" --project-name termlink \
     --env-file "$CONFIG_FILE" -f "$RUNTIME_DIR/compose.yml")
-  COMPOSE_ALL=("${COMPOSE[@]}" --profile managed-tls)
-  if [[ "$TLS_MODE" == managed ]]; then
-    COMPOSE=("${COMPOSE[@]}" --profile managed-tls)
-  fi
 }
 
 verify_rendered_compose() {
@@ -382,17 +518,9 @@ require_runtime() {
   verify_rendered_compose
 }
 
-stop_managed_edge_for_external_tls() {
-  if [[ "$TLS_MODE" == external ]]; then
-    "${COMPOSE_ALL[@]}" stop edge >/dev/null 2>&1 || true
-    "${COMPOSE_ALL[@]}" rm -f edge >/dev/null 2>&1 || true
-  fi
-}
-
 start_stack() {
   log "pulling immutable Server image $IMAGE"
   docker pull "$IMAGE"
-  stop_managed_edge_for_external_tls
   log 'starting PostgreSQL and TermLink Server with embedded identity'
   "${COMPOSE[@]}" up -d --wait --wait-timeout 300 --scale server=1 --remove-orphans
 }
@@ -400,7 +528,7 @@ start_stack() {
 assert_running_service() {
   local service="$1"
   local running
-  running="$("${COMPOSE_ALL[@]}" ps --services --filter status=running | grep -Fx "$service" | wc -l)"
+  running="$("${COMPOSE[@]}" ps --services --filter status=running | grep -Fx "$service" | wc -l)"
   [[ "$running" == 1 ]] || die "service is not running exactly once: $service"
 }
 
@@ -410,10 +538,7 @@ doctor_runtime() {
   verify_rendered_compose
   assert_running_service postgres
   assert_running_service server
-  if [[ "$TLS_MODE" == managed ]]; then
-    assert_running_service edge
-  fi
-  [[ "$("${COMPOSE_ALL[@]}" ps --services --filter status=running | grep -Fx server | wc -l)" == 1 ]] || \
+  [[ "$("${COMPOSE[@]}" ps --services --filter status=running | grep -Fx server | wc -l)" == 1 ]] || \
     die 'single-node deployment must run exactly one Server replica'
 
   curl --fail --silent --show-error --max-time 10 \
@@ -426,18 +551,11 @@ doctor_runtime() {
   [[ "$response" == *"$PUBLIC_URL/realms/termlink"* ]] || \
     die 'OIDC discovery does not advertise the configured public URL'
 
-  migration="$("${COMPOSE_ALL[@]}" exec -T postgres psql -U termlink -d termlink \
+  migration="$("${COMPOSE[@]}" exec -T postgres psql -U termlink -d termlink \
     -Atqc 'SELECT MAX(version) FROM schema_migrations')"
   [[ "$migration" =~ ^[0-9]+$ ]] || die 'database migration state is unavailable'
   log "deployment is healthy (database migration $migration)"
-  if [[ "$TLS_MODE" == managed ]]; then
-    curl --fail --silent --show-error --max-time 20 \
-      --resolve "$PUBLIC_HOST:$HTTPS_PORT:127.0.0.1" "$PUBLIC_URL/readyz" >/dev/null || \
-      die 'managed HTTPS is not ready; verify DNS, ports 80/443, and ACME reachability'
-    log "public HTTPS is ready at $PUBLIC_URL"
-  else
-    log "loopback origin is ready on 127.0.0.1:$HTTP_PORT; external TLS remains operator-managed"
-  fi
+  log "loopback origin is ready on 127.0.0.1:$HTTP_PORT; external HTTPS must publish $PUBLIC_URL"
 }
 
 backup_runtime() {
@@ -468,7 +586,7 @@ backup_runtime() {
   encrypted_tmp="$tmp/backup.tar.age"
   install -d -m 0700 "$payload/database" "$payload/secrets"
   log 'dumping the TermLink database, including embedded identity data'
-  "${COMPOSE_ALL[@]}" exec -T postgres pg_dump -U termlink -Fc termlink \
+  "${COMPOSE[@]}" exec -T postgres pg_dump -U termlink -Fc termlink \
     > "$payload/database/termlink.dump"
   chmod 0600 "$payload/database/"*.dump
   local name
@@ -584,13 +702,13 @@ restore_runtime() {
 
   RESTORE_ACTIVE=1
   log 'stopping the application service for restore'
-  "${COMPOSE_ALL[@]}" stop edge server >/dev/null 2>&1 || true
-  "${COMPOSE_ALL[@]}" up -d --wait --wait-timeout 180 postgres
+  "${COMPOSE[@]}" stop server >/dev/null 2>&1 || true
+  "${COMPOSE[@]}" up -d --wait --wait-timeout 180 postgres
 
   log 'restoring TermLink database'
-  "${COMPOSE_ALL[@]}" exec -T postgres dropdb -U termlink --if-exists --force termlink
-  "${COMPOSE_ALL[@]}" exec -T postgres createdb -U termlink -O termlink termlink
-  "${COMPOSE_ALL[@]}" exec -T postgres pg_restore -U termlink -d termlink \
+  "${COMPOSE[@]}" exec -T postgres dropdb -U termlink --if-exists --force termlink
+  "${COMPOSE[@]}" exec -T postgres createdb -U termlink -O termlink termlink
+  "${COMPOSE[@]}" exec -T postgres pg_restore -U termlink -d termlink \
     --exit-on-error --no-acl < "$extract_dir/database/termlink.dump"
 
   for name in "${SECRET_NAMES[@]}"; do
@@ -600,7 +718,7 @@ restore_runtime() {
   verify_secrets
   postgres_password="$(<"$SECRETS_DIR/postgres-password")"
   printf "ALTER ROLE termlink LOGIN PASSWORD '%s';\n" "$postgres_password" | \
-    "${COMPOSE_ALL[@]}" exec -T postgres psql -U termlink -d postgres --set=ON_ERROR_STOP=1 >/dev/null
+    "${COMPOSE[@]}" exec -T postgres psql -U termlink -d postgres --set=ON_ERROR_STOP=1 >/dev/null
   unset postgres_password
   printf 'restored\n' > "$DATA_DIR/.initial-credentials-claimed"
   chmod 0600 "$DATA_DIR/.initial-credentials-claimed"
@@ -619,26 +737,33 @@ create_managed_layout() {
   install -m 0700 "$SCRIPT_PATH" "$DATA_DIR/termlink-deploy"
 }
 
+claim_initial_credentials() {
+  [[ ! -e "$DATA_DIR/.initial-credentials-claimed" ]] || \
+    die 'initial administrator credentials have already been displayed'
+  (set -o noclobber; printf 'claimed\n' > "$DATA_DIR/.initial-credentials-claimed") 2>/dev/null || \
+    die 'initial administrator credentials have already been displayed'
+  chmod 0600 "$DATA_DIR/.initial-credentials-claimed"
+  printf '\nURL: %s\nUsername: admin\nInitial password: %s\n' \
+    "$PUBLIC_URL" "$(<"$SECRETS_DIR/initial-admin-password")"
+  printf 'Change this password after signing in; it will not be displayed again.\n\n'
+}
+
 command_install() {
   local domain=''
-  local email=''
   local image=''
   local data_dir="${TERMLINK_DATA_DIR:-$DEFAULT_DATA_DIR}"
-  local tls=managed
   local http_port=8080
-  local https_port=443
+  local public_port=443
   local recipient=''
   local restore_input=''
   local restore_identity=''
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --domain) domain="${2:-}"; shift 2 ;;
-      --email) email="${2:-}"; shift 2 ;;
       --image) image="${2:-}"; shift 2 ;;
       --data-dir) data_dir="${2:-}"; shift 2 ;;
-      --tls) tls="${2:-}"; shift 2 ;;
       --http-port) http_port="${2:-}"; shift 2 ;;
-      --https-port) https_port="${2:-}"; shift 2 ;;
+      --public-port) public_port="${2:-}"; shift 2 ;;
       --backup-recipient) recipient="${2:-}"; shift 2 ;;
       --restore) restore_input="${2:-}"; shift 2 ;;
       --identity) restore_identity="${2:-}"; shift 2 ;;
@@ -648,14 +773,15 @@ command_install() {
   done
   need_root
   for command in realpath openssl install find getent docker curl; do need_command "$command"; done
-  [[ -n "$domain" && -n "$email" && -n "$image" ]] || \
-    die 'install requires --domain, --email, and --image'
+  if [[ -z "$image" ]] && bundled_image >/dev/null; then
+    image="$(bundled_image)"
+  fi
+  prompt_required domain 'Public domain'
+  prompt_required image 'Immutable Server image (tag@sha256:digest)'
   validate_domain "$domain"
-  validate_email "$email"
   validate_image "$image"
   validate_port "$http_port" --http-port
-  validate_port "$https_port" --https-port
-  [[ "$tls" == managed || "$tls" == external ]] || die '--tls must be managed or external'
+  validate_port "$public_port" --public-port
   [[ -z "$recipient" ]] || validate_recipient "$recipient"
   [[ -z "$restore_input" && -z "$restore_identity" ]] || \
     [[ -n "$restore_input" && -n "$restore_identity" ]] || \
@@ -664,11 +790,9 @@ command_install() {
   set_paths "$data_dir"
   create_managed_layout
   PUBLIC_HOST="${domain,,}"
-  ADMIN_EMAIL="$email"
   IMAGE="$image"
-  TLS_MODE="$tls"
   HTTP_PORT="$http_port"
-  HTTPS_PORT="$https_port"
+  PUBLIC_PORT="$public_port"
   BACKUP_RECIPIENT="$recipient"
   install_runtime_assets
   initialize_secrets
@@ -681,7 +805,11 @@ command_install() {
     start_stack
     doctor_runtime
     log "installation completed at $DATA_DIR"
-    log "run $DATA_DIR/termlink-deploy credentials once to view the initial administrator password"
+    if [[ -t 1 ]]; then
+      claim_initial_credentials
+    else
+      log "run $DATA_DIR/termlink-deploy credentials once to view the initial administrator password"
+    fi
   fi
 }
 
@@ -704,6 +832,9 @@ command_upgrade() {
   if [[ -n "$new_image" ]]; then
     validate_image "$new_image"
     IMAGE="$new_image"
+  elif bundled_image >/dev/null && [[ "$(bundled_image)" != "$IMAGE" ]]; then
+    IMAGE="$(bundled_image)"
+    log "selected the immutable Server image bundled with this installer: $IMAGE"
   fi
   install_runtime_assets
   apply_secret_permissions
@@ -793,35 +924,42 @@ command_credentials() {
   set_paths "$data_dir"
   load_config
   verify_secrets
-  [[ ! -e "$DATA_DIR/.initial-credentials-claimed" ]] || \
-    die 'initial administrator credentials have already been displayed'
-  (set -o noclobber; printf 'claimed\n' > "$DATA_DIR/.initial-credentials-claimed") 2>/dev/null || \
-    die 'initial administrator credentials have already been displayed'
-  chmod 0600 "$DATA_DIR/.initial-credentials-claimed"
-  printf 'URL: %s\nUsername: admin\nInitial password: %s\n' \
-    "$PUBLIC_URL" "$(<"$SECRETS_DIR/initial-admin-password")"
-  printf 'Change this password after signing in; it will not be displayed again.\n'
+  claim_initial_credentials
+}
+
+command_render_assets() {
+  local output=''
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output) output="${2:-}"; shift 2 ;;
+      -h|--help) show_help; return ;;
+      *) die "unknown render-assets option: $1" ;;
+    esac
+  done
+  [[ -n "$output" ]] || die 'render-assets requires --output DIR'
+  for command in realpath install; do need_command "$command"; done
+  output="$(realpath -m -- "$output")"
+  [[ "$output" != / ]] || die 'render-assets output cannot be the filesystem root'
+  [[ ! -L "$output" ]] || die 'render-assets output cannot be a symbolic link'
+  write_embedded_runtime_assets "$output"
+  log "runtime assets rendered to $output"
 }
 
 command_config() {
   local data_dir="${TERMLINK_DATA_DIR:-$DEFAULT_DATA_DIR}"
   local new_domain=''
-  local new_email=''
   local new_image=''
-  local new_tls=''
   local new_http=''
-  local new_https=''
+  local new_public_port=''
   local new_recipient='__unchanged__'
   local show_only=true
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --data-dir) data_dir="${2:-}"; shift 2 ;;
       --domain) new_domain="${2:-}"; show_only=false; shift 2 ;;
-      --email) new_email="${2:-}"; show_only=false; shift 2 ;;
       --image) new_image="${2:-}"; show_only=false; shift 2 ;;
-      --tls) new_tls="${2:-}"; show_only=false; shift 2 ;;
       --http-port) new_http="${2:-}"; show_only=false; shift 2 ;;
-      --https-port) new_https="${2:-}"; show_only=false; shift 2 ;;
+      --public-port) new_public_port="${2:-}"; show_only=false; shift 2 ;;
       --backup-recipient) new_recipient="${2:-}"; show_only=false; shift 2 ;;
       --clear-backup-recipient) new_recipient=''; show_only=false; shift ;;
       -h|--help) show_help; return ;;
@@ -836,11 +974,9 @@ command_config() {
     return
   fi
   [[ -z "$new_domain" ]] || { validate_domain "$new_domain"; PUBLIC_HOST="${new_domain,,}"; }
-  [[ -z "$new_email" ]] || { validate_email "$new_email"; ADMIN_EMAIL="$new_email"; }
   [[ -z "$new_image" ]] || { validate_image "$new_image"; IMAGE="$new_image"; }
-  [[ -z "$new_tls" ]] || { [[ "$new_tls" == managed || "$new_tls" == external ]] || die '--tls must be managed or external'; TLS_MODE="$new_tls"; }
   [[ -z "$new_http" ]] || { validate_port "$new_http" --http-port; HTTP_PORT="$new_http"; }
-  [[ -z "$new_https" ]] || { validate_port "$new_https" --https-port; HTTPS_PORT="$new_https"; }
+  [[ -z "$new_public_port" ]] || { validate_port "$new_public_port" --public-port; PUBLIC_PORT="$new_public_port"; }
   if [[ "$new_recipient" != __unchanged__ ]]; then
     [[ -z "$new_recipient" ]] || validate_recipient "$new_recipient"
     BACKUP_RECIPIENT="$new_recipient"
@@ -868,7 +1004,7 @@ command_uninstall() {
   [[ "$keep_data" == true ]] || die 'only non-destructive uninstall --keep-data is supported'
   set_paths "$data_dir"
   require_runtime
-  "${COMPOSE_ALL[@]}" down --remove-orphans
+  "${COMPOSE[@]}" down --remove-orphans
   log "containers and networks removed; Docker volumes and $DATA_DIR were preserved"
 }
 
@@ -884,6 +1020,7 @@ main() {
     credentials) command_credentials "$@" ;;
     config) command_config "$@" ;;
     uninstall) command_uninstall "$@" ;;
+    render-assets) command_render_assets "$@" ;;
     help|-h|--help) show_help ;;
     *) die "unknown command: $command" ;;
   esac

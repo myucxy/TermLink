@@ -230,15 +230,6 @@ function Assert-AccountDeletionIdentityKeyMaterial {
 $envPath = [IO.Path]::GetFullPath($EnvFile)
 Assert-Production (Test-Path -LiteralPath $envPath -PathType Leaf) "Environment file not found: $envPath"
 $composeFiles = @(Resolve-TermLinkComposeFiles -ComposeFile $ComposeFile)
-$singleNodeProductionPath = [IO.Path]::GetFullPath(
-    (Join-Path $PSScriptRoot '..\deploy\single-node-production\compose.yml'))
-if ($composeFiles -contains $singleNodeProductionPath) {
-    Assert-Production ($composeFiles.Count -eq 1) `
-        'The bundled single-node deployment cannot be combined with legacy production overlays.'
-    & (Join-Path $PSScriptRoot 'Test-SingleNodeProductionDeployment.ps1') `
-        -EnvFile $envPath -ComposeFile $singleNodeProductionPath -IncludeEdge:$IncludeEdge
-    return
-}
 $coreComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\core.compose.yml'))
 $observabilityComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\observability.compose.yml'))
 $externalServicesComposePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\compose\external-services.compose.yml'))

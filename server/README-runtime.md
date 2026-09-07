@@ -7,20 +7,19 @@ port (HTTPS 443). Core contains no MinIO, history proxy route, metrics stack,
 acceptance probe, or test service.
 
 The Server binary also has an explicit `single-node` mode for deployments that
-run exactly one Server process. It embeds bounded coordination and Direct/NAT
-signalling, runs schema migrations before serving traffic, and can proxy the
-public Keycloak browser routes to a private backchannel. This removes Valkey,
-Direct Valkey, the standalone migration job, and the internal route-splitting
-Caddy from that topology; Keycloak and PostgreSQL remain independent durable
-services. TLS still terminates at the operator's public ingress. Never scale a
-`single-node` Server past one process: use the default `distributed` mode and
-Valkey when multiple Server replicas are required.
+run exactly one Server process. It embeds identity/OIDC, schema migrations,
+bounded coordination, and Direct/NAT signalling. PostgreSQL is its only required
+long-running companion; Valkey, Direct Valkey, Keycloak, MinIO, Caddy, and a
+standalone migration job are not used. TLS terminates at an operator-managed
+public ingress. Never scale a `single-node` Server past one
+process: use the default `distributed` mode and Valkey when multiple Server
+replicas are required.
 
-For a new single-server installation that also operates private Keycloak and
-its separate database, use
+For a new single-server installation, use the self-contained installer in
 [`deploy/single-node-production`](deploy/single-node-production/README.md).
-Its `termlink-deploy` entry point owns install, upgrade, health checks,
-encrypted backup, and validated restore without using acceptance Compose.
+Its `termlink-deploy` entry point embeds its runtime assets and owns install,
+upgrade, health checks, encrypted backup, and validated restore without using
+acceptance Compose.
 The overlay examples below remain the lower-level matrix for externally
 managed identity or multi-replica deployments.
 

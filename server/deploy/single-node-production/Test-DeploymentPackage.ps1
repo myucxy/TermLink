@@ -34,9 +34,13 @@ function Set-PrivateFixtureAcl {
 
 $packagePath = $PSScriptRoot
 $serverPath = [IO.Path]::GetFullPath((Join-Path $packagePath '..\..'))
-$policyPath = Join-Path $serverPath 'ops\Test-ProductionDeployment.ps1'
+$policyPath = Join-Path $serverPath 'ops\Test-SingleNodeProductionDeployment.ps1'
 
 Assert-Test (Test-Path -LiteralPath $BashPath -PathType Leaf) "Bash not found: $BashPath"
+foreach ($retiredAsset in @('compose.yml', 'Caddyfile')) {
+    Assert-Test (-not (Test-Path -LiteralPath (Join-Path $packagePath $retiredAsset))) `
+        "The deployment package still requires the retired sidecar asset: $retiredAsset"
+}
 foreach ($scriptName in @('termlink-deploy')) {
     & $BashPath -n (Join-Path $packagePath $scriptName)
     Assert-Test ($LASTEXITCODE -eq 0) "Bash syntax validation failed: $scriptName"
@@ -59,9 +63,14 @@ try {
     New-Item -ItemType Directory -Path $fixturePath -Force | Out-Null
     Set-PrivateFixtureAcl -Path $fixturePath
     New-Item -ItemType Directory -Path $runtimePath, $secretPath -Force | Out-Null
-    foreach ($name in @('compose.yml', 'Caddyfile')) {
-        Copy-Item -LiteralPath (Join-Path $packagePath $name) -Destination (Join-Path $runtimePath $name)
+    & $BashPath (Join-Path $packagePath 'termlink-deploy') render-assets --output $runtimePath
+    Assert-Test ($LASTEXITCODE -eq 0) 'The single-file installer could not render its runtime assets.'
+    foreach ($name in @('compose.yml')) {
+        Assert-Test (Test-Path -LiteralPath (Join-Path $runtimePath $name) -PathType Leaf) `
+            "The single-file installer did not render $name."
     }
+    Assert-Test (-not (Test-Path -LiteralPath (Join-Path $runtimePath 'Caddyfile'))) `
+        'The single-file installer still rendered a Caddy configuration.'
 
     $postgresPassword = 'Postgres_Test_7Pz4mN8vQ2xK6cR9sT5yH3jF'
     $secrets = [ordered]@{
@@ -81,25 +90,33 @@ try {
     $image = 'docker.io/myucxy/termlink:v0.2.38@sha256:' + ('a' * 64)
     $envPath = Join-Path $fixturePath 'config.env'
     $environment = @(
-        'TERMLINK_CONFIG_VERSION=1'
+        'TERMLINK_CONFIG_VERSION=2'
         'COMPOSE_PROJECT_NAME=termlink'
         "TERMLINK_IMAGE=$image"
         "TERMLINK_RUNTIME_DIR=$runtimeComposePath"
         "TERMLINK_SECRETS_DIR=$secretComposePath"
         'TERMLINK_PUBLIC_HOST=deploy.termlink.example.cn'
-        'TERMLINK_PUBLIC_URL=https://deploy.termlink.example.cn'
-        'TERMLINK_ADMIN_EMAIL=admin@termlink.example.cn'
-        'TERMLINK_TLS_MODE=managed'
+        'TERMLINK_PUBLIC_URL=https://deploy.termlink.example.cn:18443'
+        'TERMLINK_PUBLIC_PORT=18443'
         'TERMLINK_HTTP_BIND_IP=127.0.0.1'
         'TERMLINK_HTTP_PORT=18080'
-        'TERMLINK_HTTPS_BIND_IP=0.0.0.0'
-        'TERMLINK_HTTPS_PORT=18443'
         'TERMLINK_BACKUP_RECIPIENT='
     )
     [IO.File]::WriteAllLines($envPath, $environment, [Text.UTF8Encoding]::new($false))
 
-    & $policyPath -EnvFile $envPath -ComposeFile (Join-Path $packagePath 'compose.yml') -IncludeEdge $true
+    & $policyPath -EnvFile $envPath -ComposeFile (Join-Path $runtimePath 'compose.yml')
     Assert-Test ($LASTEXITCODE -eq 0) 'Single-node production policy validation failed.'
+
+    $releaseInstaller = Join-Path $fixturePath 'termlink-deploy-release'
+    & (Join-Path $packagePath 'Build-Installer.ps1') -ServerImage $image -OutputPath $releaseInstaller
+    Assert-Test ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $releaseInstaller -PathType Leaf)) `
+        'The release installer builder did not create a single-file artifact.'
+    $releaseText = [IO.File]::ReadAllText($releaseInstaller)
+    Assert-Test (-not $releaseText.Contains('__TERMLINK_BUNDLED_IMAGE__', [StringComparison]::Ordinal) -and
+        $releaseText.Contains("readonly BUNDLED_IMAGE='$image'", [StringComparison]::Ordinal)) `
+        'The release installer did not pin the requested immutable Server image.'
+    & $BashPath -n $releaseInstaller
+    Assert-Test ($LASTEXITCODE -eq 0) 'The generated release installer has invalid Bash syntax.'
 }
 finally {
     if (Test-Path -LiteralPath $fixturePath) {
