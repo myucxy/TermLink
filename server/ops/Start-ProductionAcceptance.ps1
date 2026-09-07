@@ -582,26 +582,39 @@ if ($localEdgeEnabled) {
 else {
     Remove-Item Env:TERMLINK_ACCEPTANCE_CA_FILE -ErrorAction SilentlyContinue
 }
-$env:TERMLINK_ACCEPTANCE_USER_NAME = if ($EmbeddedIdentity) { 'admin' } else { 'acceptance-probe' }
-$env:TERMLINK_ACCEPTANCE_USER_PASSWORD_FILE = if ($EmbeddedIdentity) { $paths.InitialAdminPassword } else { $paths.UserPassword }
-$env:TERMLINK_ACCEPTANCE_PC_OIDC_CLIENT_ID = if ($EmbeddedIdentity) { 'termlink-windows' } else { 'termlink-acceptance-cli' }
-$env:TERMLINK_ACCEPTANCE_PROBE_IDENTITY_FILE = $paths.ProbeIdentity
-$env:TERMLINK_ACCEPTANCE_REQUIRE_DIRECT_TRANSPORT = if ($EnableDirectTransportShadow -or $SingleNode) { '1' } else { '0' }
 if ($SingleNode) {
     Wait-PublicAcceptanceEndpoint -Uri "$($endpoints.Root)/healthz" -TimeoutSeconds 60
 }
-$go = if (Test-Path -LiteralPath 'D:\Dev\Env\Go\bin\go.exe' -PathType Leaf) {
-    'D:\Dev\Env\Go\bin\go.exe'
-} else {
-    'go'
+$claimedEmbeddedAdmin = $EmbeddedIdentity -and
+    (Test-Path -LiteralPath $paths.InitialAdminClaimed -PathType Leaf)
+if ($claimedEmbeddedAdmin) {
+    # The one-time bootstrap password is deliberately destroyed when claimed.
+    # Never reset a real administrator merely to rerun an acceptance probe.
+    Wait-PublicAcceptanceEndpoint -Uri "$($endpoints.Root)/readyz" -TimeoutSeconds 60
+    Wait-PublicAcceptanceEndpoint `
+        -Uri "$($env:TERMLINK_ACCEPTANCE_OIDC_ISSUER)/.well-known/openid-configuration" `
+        -TimeoutSeconds 60
+    Write-Output '已领取管理员密码；升级已验证健康状态与 OIDC，跳过需要密码的认证探针。 / Admin password was already claimed; health and OIDC were verified, so the credentialed probe was skipped.'
 }
-Push-Location $paths.ServerRoot
-try {
-    & $go run ./cmd/production-e2e-probe
-    if ($LASTEXITCODE -ne 0) { throw 'The production OIDC/TLS/API/Realtime probe failed.' }
-}
-finally {
-    Pop-Location
+else {
+    $env:TERMLINK_ACCEPTANCE_USER_NAME = if ($EmbeddedIdentity) { 'admin' } else { 'acceptance-probe' }
+    $env:TERMLINK_ACCEPTANCE_USER_PASSWORD_FILE = if ($EmbeddedIdentity) { $paths.InitialAdminPassword } else { $paths.UserPassword }
+    $env:TERMLINK_ACCEPTANCE_PC_OIDC_CLIENT_ID = if ($EmbeddedIdentity) { 'termlink-windows' } else { 'termlink-acceptance-cli' }
+    $env:TERMLINK_ACCEPTANCE_PROBE_IDENTITY_FILE = $paths.ProbeIdentity
+    $env:TERMLINK_ACCEPTANCE_REQUIRE_DIRECT_TRANSPORT = if ($EnableDirectTransportShadow -or $SingleNode) { '1' } else { '0' }
+    $go = if (Test-Path -LiteralPath 'D:\Dev\Env\Go\bin\go.exe' -PathType Leaf) {
+        'D:\Dev\Env\Go\bin\go.exe'
+    } else {
+        'go'
+    }
+    Push-Location $paths.ServerRoot
+    try {
+        & $go run ./cmd/production-e2e-probe
+        if ($LASTEXITCODE -ne 0) { throw 'The production OIDC/TLS/API/Realtime probe failed.' }
+    }
+    finally {
+        Pop-Location
+    }
 }
 
 if (-not (Test-Path -LiteralPath $paths.InitialAdminReady -PathType Leaf) -and

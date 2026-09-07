@@ -265,3 +265,36 @@ func TestAcceptanceEmbeddedIdentityTopologyHasNoKeycloakRuntime(t *testing.T) {
 		}
 	}
 }
+
+func TestAcceptanceEmbeddedIdentityUpgradeDoesNotReuseClaimedBootstrapPassword(t *testing.T) {
+	data, err := os.ReadFile("../../ops/Start-ProductionAcceptance.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(string(data), "\r\n", "\n")
+	claimedGuard := strings.Index(script, "$claimedEmbeddedAdmin = $EmbeddedIdentity -and")
+	claimedBranch := strings.Index(script, "if ($claimedEmbeddedAdmin) {")
+	authenticatedBranch := strings.Index(script, "else {\n    $env:TERMLINK_ACCEPTANCE_USER_NAME")
+	probe := strings.Index(script, "& $go run ./cmd/production-e2e-probe")
+	if claimedGuard < 0 || claimedBranch < 0 || authenticatedBranch < 0 || probe < 0 ||
+		!(claimedGuard < claimedBranch && claimedBranch < authenticatedBranch && authenticatedBranch < probe) {
+		t.Fatal("claimed embedded administrators must bypass only the credentialed acceptance probe")
+	}
+	if !strings.Contains(script[claimedGuard:claimedBranch], "$paths.InitialAdminClaimed") {
+		t.Fatal("embedded upgrade guard must require the claimed-password marker")
+	}
+	claimedBlock := script[claimedBranch:authenticatedBranch]
+	for _, contract := range []string{
+		"/readyz",
+		"/.well-known/openid-configuration",
+		"Never reset a real administrator",
+	} {
+		if !strings.Contains(claimedBlock, contract) {
+			t.Fatalf("claimed embedded upgrade checks omitted %q", contract)
+		}
+	}
+	if strings.Contains(claimedBlock, "TERMLINK_ACCEPTANCE_USER_PASSWORD_FILE") ||
+		strings.Contains(claimedBlock, "identity-reset-initial-admin") {
+		t.Fatal("claimed embedded upgrades must not reuse or reset the one-time administrator password")
+	}
+}
