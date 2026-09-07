@@ -1,6 +1,7 @@
 package dev.termlink.product
 
 import android.net.Uri
+import android.util.Log
 import com.google.protobuf.ByteString
 import dev.termlink.crypto.CryptoDirection
 import dev.termlink.crypto.DeviceIdentity
@@ -121,8 +122,12 @@ internal class ProductionFileTransferClient(
                     if (expected != null && completionState.documentCommitted && completionConfirmed()) {
                         return expected
                     }
+                    logStage("websocket_open", "started")
                     connection = openSocket()
+                    logStage("websocket_open", "created")
+                    logStage("welcome", "waiting")
                     awaitWelcome(connection)
+                    logStage("welcome", "received")
                     val result = receiveOnSocket(
                         connection = connection,
                         pairwiseKey = pairwiseKey,
@@ -142,10 +147,13 @@ internal class ProductionFileTransferClient(
                     expected = result.descriptor
                     return result.descriptor
                 } catch (error: CancellationException) {
+                    logStage("receive", "cancelled", error)
                     throw error
                 } catch (error: RemoteFileTransferException) {
+                    logStage("receive", if (error.retryable) "retry" else "failed", error)
                     if (!error.retryable) throw error
                 } catch (error: Throwable) {
+                    logStage("receive", "retry", error)
                     if (error is IllegalArgumentException || error is SecurityException) {
                         throw RemoteFileTransferException(
                             "File transfer validation failed / 文件传输校验失败。",
@@ -164,6 +172,14 @@ internal class ProductionFileTransferClient(
             pairwiseKey.fill(0)
             keyId.fill(0)
         }
+    }
+
+    private fun logStage(stage: String, result: String, error: Throwable? = null) {
+        val failure = error?.let { it::class.java.simpleName.take(80) } ?: "none"
+        Log.i(
+            FILE_TRANSFER_LOG_TAG,
+            "operation_id=$transferId stage=$stage result=$result failure=$failure",
+        )
     }
 
     private suspend fun receiveOnSocket(
@@ -598,6 +614,7 @@ internal class ProductionFileTransferClient(
     }
 
     private companion object {
+        const val FILE_TRANSFER_LOG_TAG = "TermLinkFileTransfer"
         const val FILE_TRANSFER_MAX_WIRE_BYTES = 320 * 1024
         const val FILE_TRANSFER_HANDSHAKE_TIMEOUT_MILLIS = 15_000L
         const val FILE_TRANSFER_RESPONSE_TIMEOUT_MILLIS = 20_000L

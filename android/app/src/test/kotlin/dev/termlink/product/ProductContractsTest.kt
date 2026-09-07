@@ -17,6 +17,9 @@ import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
@@ -1155,6 +1158,44 @@ class ProductContractsTest {
                 runBlocking { TokenRefreshCoordinator { _ -> " " }.freshAccessToken() }
             }
         }
+    }
+
+    @Test
+    fun cancelledTokenRefreshWaiterDoesNotBlockTheSharedRefreshLane() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var calls = 0
+        val coordinator = TokenRefreshCoordinator { _ ->
+            calls += 1
+            if (calls == 1) {
+                entered.complete(Unit)
+                release.await()
+            }
+            "fresh-$calls"
+        }
+
+        val owner = async { coordinator.freshAccessToken() }
+        entered.await()
+        val waiter = async { coordinator.freshAccessToken() }
+        waiter.cancelAndJoin()
+        release.complete(Unit)
+
+        assertEquals("fresh-1", owner.await())
+        assertEquals("fresh-2", coordinator.freshAccessToken())
+        assertEquals(2, calls)
+    }
+
+    @Test
+    fun remoteDownloadPreflightTimeoutIsRetryableAndBilingual() = runBlocking {
+        val never = CompletableDeferred<Unit>()
+        val failure = runCatching {
+            boundedRemoteDownloadPreflight(timeoutMillis = 25L) { never.await() }
+        }.exceptionOrNull()
+
+        assertTrue(failure is RemoteFileTransferException)
+        assertTrue((failure as RemoteFileTransferException).retryable)
+        assertTrue(failure.message.orEmpty().contains("timed out"))
+        assertTrue(failure.message.orEmpty().contains("超时"))
     }
 
     @Test

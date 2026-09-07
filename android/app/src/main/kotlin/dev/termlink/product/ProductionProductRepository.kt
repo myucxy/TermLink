@@ -680,6 +680,7 @@ private const val REMOTE_FILE_STATUS_CANCELLED = "CANCELLED"
 private const val REMOTE_FILE_STATUS_EXPIRED = "EXPIRED"
 private const val REMOTE_FILE_OPERATION_POLL_INTERVAL_MILLIS = 750L
 private const val REMOTE_DOWNLOAD_PERSIST_INTERVAL_MILLIS = 1_000L
+private const val REMOTE_DOWNLOAD_PREFLIGHT_TIMEOUT_MILLIS = 30_000L
 private const val REMOTE_SHELL_CATALOG_TIMEOUT_MILLIS = 30_000L
 private const val REMOTE_FILE_PATH_MAX_BYTES = 4_096
 private const val REMOTE_FILE_LIST_PAGE_MAX_ENTRIES = 500
@@ -707,6 +708,9 @@ internal class ProductionProductRepository(
     private val historyRepository = HistoryRepository(database)
     private val authService = AuthorizationService(context)
     private val http = OkHttpClient()
+    private val remoteFilePreflightHttp = http.newBuilder()
+        .callTimeout(20, TimeUnit.SECONDS)
+        .build()
     // Direct is an optional shadow path. Give its blocking REST calls and
     // signalling WebSocket an independent dispatcher/connection pool so a
     // black-holed STUN/signalling attempt cannot consume Relay's HTTP budget.
@@ -2963,9 +2967,11 @@ internal class ProductionProductRepository(
     private fun launchRemoteDownload(recordId: UUID) {
         val job = scope.launch(start = CoroutineStart.LAZY) { performRemoteDownload(recordId) }
         if (remoteDownloadJobs.putIfAbsent(recordId, job) != null) {
+            logRemoteDownloadStage(recordId, null, "job_registration", "duplicate")
             job.cancel()
             return
         }
+        logRemoteDownloadStage(recordId, null, "job_registration", "accepted")
         job.invokeOnCompletion { remoteDownloadJobs.remove(recordId, job) }
         job.start()
     }
@@ -2983,9 +2989,17 @@ internal class ProductionProductRepository(
         val destination = Uri.parse(initial.targetUri)
         var operationId = initial.operationId
         var initialTransferDescriptor: RealtimeFileTransferDescriptor? = null
+        logRemoteDownloadStage(recordId, operationId, "job", "started")
         try {
             if (operationId != null) {
-                val existing = getRemoteFileOperation(initial.pcId, operationId!!)
+                val existing = runRemoteDownloadPreflight(recordId, { operationId }, "resume_lookup") {
+                    getRemoteFileOperation(
+                        pcId = initial.pcId,
+                        operationId = operationId!!,
+                        httpClient = remoteFilePreflightHttp,
+                        diagnostic = remoteDownloadApiDiagnostic(recordId, { operationId }, "resume_lookup"),
+                    )
+                }
                 when (existing.status) {
                     REMOTE_FILE_STATUS_PENDING, REMOTE_FILE_STATUS_PROCESSING -> {
                         initialTransferDescriptor = existing.transfer?.let { transfer ->
@@ -3015,25 +3029,30 @@ internal class ProductionProductRepository(
                 }
             }
             if (operationId == null) {
-                val operation = createRemoteFileOperation(
-                    pcId = initial.pcId,
-                    operation = REMOTE_FILE_OPERATION_DOWNLOAD,
-                    path = initial.remotePath,
-                    onCreated = { created ->
-                        operationId = created.id
-                        // Persist inside the POST response boundary so a
-                        // process stop cannot strand an unknown server task.
-                        updateRemoteDownload(recordId) { record ->
-                            if (!record.status.isActive) record else record.copy(
-                                operationId = created.id,
-                                updatedAt = Instant.now(),
-                            )
+                val operation = runRemoteDownloadPreflight(recordId, { operationId }, "operation_create") {
+                    createRemoteFileOperation(
+                        pcId = initial.pcId,
+                        operation = REMOTE_FILE_OPERATION_DOWNLOAD,
+                        path = initial.remotePath,
+                        httpClient = remoteFilePreflightHttp,
+                        diagnostic = remoteDownloadApiDiagnostic(recordId, { operationId }, "operation_create"),
+                        onCreated = { created ->
+                            operationId = created.id
+                            // Persist inside the POST response boundary so a
+                            // process stop cannot strand an unknown server task.
+                            updateRemoteDownload(recordId) { record ->
+                                if (!record.status.isActive) record else record.copy(
+                                    operationId = created.id,
+                                    updatedAt = Instant.now(),
+                                )
+                            }
                         }
-                    },
-                )
+                    )
+                }
                 operationId = operation.id
             }
             val transferId = requireNotNull(operationId)
+            logRemoteDownloadStage(recordId, transferId, "peer_key_lookup", "started")
             val snapshot = mutableSnapshot.value
             val pc = snapshot.pcs.firstOrNull { it.id == initial.pcId }
                 ?: error("The Windows PC is unavailable")
@@ -3041,6 +3060,7 @@ internal class ProductionProductRepository(
                 it.id == pc.deviceId && it.type.isPcAgent() && it.trustState == DeviceTrustState.TRUSTED
             } ?: error("The Windows PC identity is unavailable")
             val stored = identity()
+            logRemoteDownloadStage(recordId, transferId, "peer_key_lookup", "completed")
             val transferClient = ProductionFileTransferClient(
                 rootUrl = PRODUCT_PUBLIC_SERVER_URL,
                 accessToken = realtimeAccessToken::requireCurrent,
@@ -3055,6 +3075,7 @@ internal class ProductionProductRepository(
                 allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
             )
             var lastPersistedAt = 0L
+            logRemoteDownloadStage(recordId, transferId, "websocket_receive", "started")
             val descriptor = transferClient.receive(
                 destination = destination,
                 expectedDirectoryZip = initial.directoryZip,
@@ -3131,7 +3152,9 @@ internal class ProductionProductRepository(
             }
             runCatching { fileTransferCache.cleanup(transferId) }
             releaseRemoteDocumentPermission(destination)
+            logRemoteDownloadStage(recordId, transferId, "download", "completed")
         } catch (error: CancellationException) {
+            logRemoteDownloadStage(recordId, operationId, "download", "cancelled", error)
             if (!closed) {
                 cancelRemoteFileOperationBestEffort(recordId, initial.pcId)
                 operationId?.let { runCatching { fileTransferCache.cleanup(it) } }
@@ -3147,6 +3170,7 @@ internal class ProductionProductRepository(
             }
             throw error
         } catch (error: Throwable) {
+            logRemoteDownloadStage(recordId, operationId, "download", "failed", error)
             val terminalTransferFailure = error is RemoteFileTransferException && !error.retryable
             if (terminalTransferFailure) {
                 operationId?.let { failedOperationId ->
@@ -3251,11 +3275,13 @@ internal class ProductionProductRepository(
         offset: Long? = null,
         terminalCommand: TerminalCommandCapability? = null,
         onCreated: (RemoteFileOperationResponse) -> Unit = {},
+        httpClient: OkHttpClient = http,
+        diagnostic: ((String) -> Unit)? = null,
     ): RemoteFileOperationResponse {
         // One stable key belongs to this create attempt. If transport retry is
         // added below this boundary, it must reuse this value with the same body.
         val idempotencyKey = UUID.randomUUID().toString()
-        return withApi { api ->
+        return withApi(httpClient = httpClient, diagnostic = diagnostic) { api ->
         remoteFileOperationResponseFromJson(
             api.post(
                 remoteFileOperationPath(pcId),
@@ -3305,7 +3331,9 @@ internal class ProductionProductRepository(
     private suspend fun getRemoteFileOperation(
         pcId: UUID,
         operationId: UUID,
-    ): RemoteFileOperationResponse = withApi { api ->
+        httpClient: OkHttpClient = http,
+        diagnostic: ((String) -> Unit)? = null,
+    ): RemoteFileOperationResponse = withApi(httpClient = httpClient, diagnostic = diagnostic) { api ->
         remoteFileOperationResponseFromJson(
             api.get(remoteFileOperationPath(pcId, operationId)).jsonObject,
         ).also { response ->
@@ -3352,6 +3380,7 @@ internal class ProductionProductRepository(
         "/v1/pcs/$pcId/file-operations" + (operationId?.let { "/$it" } ?: "")
 
     private fun remoteFileErrorMessage(error: Throwable): String = when (error) {
+        is RemoteFileTransferException -> error.message ?: context.getString(R.string.remote_file_error_generic)
         is TermLinkApiException -> context.getString(R.string.remote_file_error_server, error.status)
         is java.io.IOException -> context.getString(R.string.remote_file_error_connection)
         else -> context.getString(R.string.remote_file_error_generic)
@@ -3622,17 +3651,21 @@ internal class ProductionProductRepository(
 
     private suspend fun <T> withApi(
         httpClient: OkHttpClient = http,
+        diagnostic: ((String) -> Unit)? = null,
         block: suspend (ProductionApiClient) -> T,
-    ): T = withAuthenticatedApi(httpClient = httpClient) { api, _ -> block(api) }
+    ): T = withAuthenticatedApi(httpClient = httpClient, diagnostic = diagnostic) { api, _ -> block(api) }
 
     private suspend fun <T> withAuthenticatedApi(
         httpClient: OkHttpClient = http,
         expectedGeneration: Long? = null,
+        diagnostic: ((String) -> Unit)? = null,
         block: suspend (ProductionApiClient, Long) -> T,
     ): T = withContext(Dispatchers.IO) {
         val root = PRODUCT_PUBLIC_SERVER_URL
         val initial = captureAuthenticationState(expectedGeneration = expectedGeneration)
+        diagnostic?.invoke("access_token_started")
         val token = freshAccessToken(expectedGeneration = initial.authenticationGeneration)
+        diagnostic?.invoke("access_token_completed")
         val refreshed = captureAuthenticationState(expectedGeneration = initial.authenticationGeneration)
         check(refreshed.accountScope == initial.accountScope) { "Authentication account scope changed" }
         val identity = identity(initial.accountScope)
@@ -3644,12 +3677,59 @@ internal class ProductionProductRepository(
             httpClient,
             allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
         ).use { api ->
+            diagnostic?.invoke("device_registration_started")
             ensureRegistered(api, identity)
+            diagnostic?.invoke("device_registration_completed")
             requireCurrentAuthentication(initial.authenticationGeneration)
+            diagnostic?.invoke("api_request_started")
             block(api, initial.authenticationGeneration).also {
                 requireCurrentAuthentication(initial.authenticationGeneration)
+                diagnostic?.invoke("api_request_completed")
             }
         }
+    }
+
+    private suspend fun <T> runRemoteDownloadPreflight(
+        recordId: UUID,
+        operationId: () -> UUID?,
+        stage: String,
+        block: suspend () -> T,
+    ): T {
+        logRemoteDownloadStage(recordId, operationId(), stage, "started")
+        return try {
+            boundedRemoteDownloadPreflight(REMOTE_DOWNLOAD_PREFLIGHT_TIMEOUT_MILLIS, block).also {
+                logRemoteDownloadStage(recordId, operationId(), stage, "completed")
+            }
+        } catch (error: CancellationException) {
+            logRemoteDownloadStage(recordId, operationId(), stage, "cancelled", error)
+            throw error
+        } catch (error: Throwable) {
+            logRemoteDownloadStage(recordId, operationId(), stage, "failed", error)
+            throw error
+        }
+    }
+
+    private fun remoteDownloadApiDiagnostic(
+        recordId: UUID,
+        operationId: () -> UUID?,
+        stage: String,
+    ): (String) -> Unit = { phase ->
+        logRemoteDownloadStage(recordId, operationId(), "${stage}_$phase", "observed")
+    }
+
+    private fun logRemoteDownloadStage(
+        recordId: UUID,
+        operationId: UUID?,
+        stage: String,
+        result: String,
+        error: Throwable? = null,
+    ) {
+        val failure = error?.let { it::class.java.simpleName.take(80) } ?: "none"
+        Log.i(
+            REMOTE_DOWNLOAD_LOG_TAG,
+            "record_id=$recordId operation_id=${operationId ?: "none"} " +
+                "stage=$stage result=$result failure=$failure",
+        )
     }
 
     private fun decryptSessionDirectoryTitles(
@@ -8169,6 +8249,7 @@ internal class ProductionProductRepository(
     private companion object {
         private const val HISTORY_REPLAY_LOG_TAG = "TermLinkHistoryReplay"
         private const val HOST_HISTORY_RESTORE_LOG_TAG = "TermLinkHostRestore"
+        private const val REMOTE_DOWNLOAD_LOG_TAG = "TermLinkFileTransfer"
         private val HOST_HISTORY_RESTORE_ATTEMPTS = AtomicInteger()
         private const val MAX_HISTORY_FAILURE_CLASS_CHARS = 128
         const val UPDATE_PREFERENCES = "update_service"

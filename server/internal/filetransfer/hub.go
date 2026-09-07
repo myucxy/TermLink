@@ -112,14 +112,17 @@ func (h *Hub) Close(ctx context.Context) error {
 func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	principal, ok := auth.PrincipalFromContext(r.Context())
 	if !ok {
+		h.logger.Warn("file-transfer websocket rejected", "stage", "principal", "reason", "unauthorized")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	if h.store == nil {
+		h.logger.Error("file-transfer websocket rejected", "stage", "route_store", "reason", "unavailable")
 		http.Error(w, "file-transfer relay unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	if !slices.Contains(websocket.Subprotocols(r), subprotocol) {
+		h.logger.Warn("file-transfer websocket rejected", "stage", "subprotocol", "device_id", principal.Device.ID)
 		http.Error(w, "file-transfer subprotocol required", http.StatusUpgradeRequired)
 		return
 	}
@@ -136,6 +139,7 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	socket, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		h.logger.Warn("file-transfer websocket upgrade failed", "device_id", principal.Device.ID, "error", err)
 		return
 	}
 	socket.SetReadLimit(MaxFrameBytes)
@@ -145,21 +149,25 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	messageType, body, err := socket.ReadMessage()
 	if err != nil || messageType != websocket.TextMessage || len(body) > maxHelloBytes {
+		h.logger.Warn("file-transfer websocket rejected", "stage", "hello_read", "device_id", principal.Device.ID, "error", err)
 		closeSocket(socket, websocket.CloseProtocolError, "valid ClientHello required")
 		return
 	}
 	var hello clientHello
 	if err := json.Unmarshal(body, &hello); err != nil || !validHello(hello) {
+		h.logger.Warn("file-transfer websocket rejected", "stage", "hello_validation", "device_id", principal.Device.ID, "role", hello.Role)
 		closeSocket(socket, websocket.ClosePolicyViolation, "unsupported file-transfer hello")
 		return
 	}
 	transferID, err := uuid.Parse(hello.TransferID)
 	if err != nil || transferID == uuid.Nil || transferID.String() != hello.TransferID {
+		h.logger.Warn("file-transfer websocket rejected", "stage", "transfer_id", "device_id", principal.Device.ID, "role", hello.Role)
 		closeSocket(socket, websocket.ClosePolicyViolation, "invalid transfer identifier")
 		return
 	}
 	if hello.Role == "pc" && !store.IsPCAgentDeviceType(principal.Device.Type) ||
 		hello.Role == "android" && principal.Device.Type != "ANDROID" {
+		h.logger.Warn("file-transfer websocket rejected", "stage", "role", "transfer_id", transferID, "device_id", principal.Device.ID, "role", hello.Role, "device_type", principal.Device.Type)
 		closeSocket(socket, websocket.ClosePolicyViolation, "role does not match device")
 		return
 	}
@@ -167,6 +175,7 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	route, routeErr := h.store.FileTransferRoute(authorityCtx, principal.UserID, transferID)
 	cancel()
 	if routeErr != nil || !routeAllows(route, principal.Device.ID, hello.Role, time.Now()) {
+		h.logger.Warn("file-transfer websocket rejected", "stage", "route", "transfer_id", transferID, "device_id", principal.Device.ID, "role", hello.Role, "route_found", routeErr == nil)
 		closeSocket(socket, websocket.ClosePolicyViolation, "file-transfer route denied")
 		return
 	}
@@ -179,10 +188,12 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer h.remove(connection)
+	h.logger.Info("file-transfer peer connected", "transfer_id", transferID, "device_id", principal.Device.ID, "role", hello.Role)
 	if err := socket.WriteJSON(serverWelcome{
 		Type: "welcome", ProtocolVersion: uint32(ProtocolVersion),
 		HeartbeatSeconds: int(pingInterval.Seconds()), Capabilities: []string{"e2ee", "resume_offset_v2"},
 	}); err != nil {
+		h.logger.Warn("file-transfer welcome failed", "transfer_id", transferID, "device_id", principal.Device.ID, "role", hello.Role, "error", err)
 		return
 	}
 	_ = socket.SetReadDeadline(time.Now().Add(pongTimeout))
@@ -238,25 +249,35 @@ func (h *Hub) remove(value *peer) {
 	}
 	h.mu.Unlock()
 	value.close(websocket.CloseNormalClosure, "file-transfer connection closed")
+	h.logger.Info("file-transfer peer disconnected", "transfer_id", value.route.TransferID, "device_id", value.principal.Device.ID, "role", value.role)
 }
 
 func (p *peer) readLoop() {
 	for {
 		messageType, frame, err := p.socket.ReadMessage()
 		if err != nil {
+			p.hub.logger.Info("file-transfer peer read ended", "transfer_id", p.route.TransferID, "device_id", p.principal.Device.ID, "role", p.role, "error", err)
 			return
 		}
 		if messageType != websocket.BinaryMessage {
+			p.hub.logger.Warn("file-transfer frame rejected", "reason", "non_binary", "transfer_id", p.route.TransferID, "device_id", p.principal.Device.ID, "role", p.role)
 			p.close(websocket.CloseUnsupportedData, "binary file-transfer frame required")
 			return
 		}
 		envelope, err := ParseEnvelope(frame)
-		if err != nil || !p.validEnvelope(envelope) {
+		if err != nil {
+			p.hub.logger.Warn("file-transfer frame rejected", "reason", "parse", "transfer_id", p.route.TransferID, "device_id", p.principal.Device.ID, "role", p.role, "error", err)
+			p.close(websocket.ClosePolicyViolation, "invalid file-transfer frame")
+			return
+		}
+		if !p.validEnvelope(envelope) {
+			p.hub.logger.Warn("file-transfer frame rejected", "reason", "route_policy", "transfer_id", p.route.TransferID, "device_id", p.principal.Device.ID, "role", p.role, "message_type", envelope.MessageType, "sequence", envelope.Sequence)
 			p.close(websocket.ClosePolicyViolation, "invalid file-transfer frame")
 			return
 		}
 		p.lastSeq = envelope.Sequence
 		if !p.hub.route(p, frame) {
+			p.hub.logger.Info("file-transfer peer unavailable", "transfer_id", p.route.TransferID, "device_id", p.principal.Device.ID, "role", p.role, "message_type", envelope.MessageType, "sequence", envelope.Sequence)
 			// An offline peer is normal. OFFER/RESUME and ACK timeouts drive
 			// retransmission without retaining file data in the service.
 			continue

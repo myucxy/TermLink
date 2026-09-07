@@ -6,6 +6,7 @@ import java.util.Base64
 import java.util.UUID
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -157,4 +158,17 @@ internal class TokenRefreshCoordinator(private val refresh: suspend (force: Bool
      * account happens to be current when the wait ends.
      */
     suspend fun <T> serially(action: suspend () -> T): T = mutex.withLock { action() }
+}
+
+internal suspend fun <T> boundedRemoteDownloadPreflight(
+    timeoutMillis: Long,
+    action: suspend () -> T,
+): T {
+    require(timeoutMillis > 0L) { "Remote download preflight timeout must be positive" }
+    val completed = withTimeoutOrNull(timeoutMillis) { Result.success(action()) }
+        ?: throw RemoteFileTransferException(
+            "File transfer preparation timed out; retry the download / 文件传输准备超时，请重试下载。",
+            retryable = true,
+        )
+    return completed.getOrThrow()
 }
