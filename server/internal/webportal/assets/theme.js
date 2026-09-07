@@ -3,6 +3,7 @@
 
   const STORAGE_KEY = "termlink-theme";
   const TRANSFER_PARAMETER = "termlink_theme";
+  const THEME_SYNC_MESSAGE = "termlink:theme-sync";
   const LIGHT = "light";
   const DARK = "dark";
   const SYSTEM = "system";
@@ -56,6 +57,32 @@
     };
   }
 
+  function currentPreference() {
+    return isPreference(root.dataset.themePreference) ? root.dataset.themePreference : SYSTEM;
+  }
+
+  function themedURL(base, preference) {
+    if (!base) return "";
+    try {
+      const target = new URL(base, window.location.href);
+      target.searchParams.set(TRANSFER_PARAMETER, preference);
+      return target.origin === window.location.origin
+        ? `${target.pathname}${target.search}${target.hash}`
+        : target.href;
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function sendThemeToFrame(frame, preference) {
+    if (!(frame instanceof HTMLIFrameElement) || !frame.contentWindow) return;
+    frame.contentWindow.postMessage({type: THEME_SYNC_MESSAGE, preference}, window.location.origin);
+  }
+
+  function broadcastTheme(preference) {
+    document.querySelectorAll("iframe[data-theme-sync]").forEach((frame) => sendThemeToFrame(frame, preference));
+  }
+
   function render(preference) {
     const theme = resolvedTheme(preference);
     root.dataset.theme = theme;
@@ -74,16 +101,10 @@
       const base = link.dataset.themeTransferBase || link.getAttribute("href");
       if (!base) return;
       link.dataset.themeTransferBase = base;
-      try {
-        const target = new URL(base, window.location.href);
-        target.searchParams.set(TRANSFER_PARAMETER, preference);
-        link.href = target.origin === window.location.origin
-          ? `${target.pathname}${target.search}${target.hash}`
-          : target.href;
-      } catch (_) {
-        // Keep the server-rendered safe target when URL parsing fails.
-      }
+      const target = themedURL(base, preference);
+      if (target) link.href = target;
     });
+    broadcastTheme(preference);
   }
 
   function persist(theme) {
@@ -95,10 +116,13 @@
   }
 
   function toggleTheme() {
-    const current = isPreference(root.dataset.themePreference) ? root.dataset.themePreference : SYSTEM;
+    const current = currentPreference();
     const next = nextPreference(current);
     persist(next);
     render(next);
+    if (window.parent !== window) {
+      window.parent.postMessage({type: THEME_SYNC_MESSAGE, preference: next}, window.location.origin);
+    }
   }
 
   function applyStoredOrSystemTheme() {
@@ -172,7 +196,8 @@
     document.querySelectorAll("[data-identity-dialog]").forEach((button) => {
       button.addEventListener("click", () => {
         const action = Object.hasOwn(actionCopy, button.dataset.identityDialog) ? button.dataset.identityDialog : "password";
-        const actionURL = `${baseURL.replace(/\/$/, "")}/${action}`;
+        const actionBaseURL = `${baseURL.replace(/\/$/, "")}/${action}`;
+        const actionURL = themedURL(actionBaseURL, currentPreference()) || actionBaseURL;
         if (description) description.textContent = actionCopy[action];
         if (loadedURL !== actionURL && frame instanceof HTMLIFrameElement) {
           if (pending) pending.hidden = false;
@@ -184,7 +209,10 @@
       });
     });
     if (frame instanceof HTMLIFrameElement) {
-      frame.addEventListener("load", () => { if (pending) pending.hidden = true; });
+      frame.addEventListener("load", () => {
+        if (pending) pending.hidden = true;
+        sendThemeToFrame(frame, currentPreference());
+      });
     }
     identityDialog.querySelectorAll("[data-identity-dialog-close]").forEach((button) => {
       button.addEventListener("click", () => identityDialog.close());
@@ -253,7 +281,7 @@
         </header>
         <div class="sensitive-step-up-frame-wrap">
           <div class="sensitive-step-up-pending"><strong>${stepUpCopy.opening}</strong><span>${stepUpCopy.wait}</span></div>
-          <iframe class="sensitive-step-up-frame" title="${stepUpCopy.frameTitle}" referrerpolicy="strict-origin"></iframe>
+          <iframe class="sensitive-step-up-frame" title="${stepUpCopy.frameTitle}" data-theme-sync referrerpolicy="strict-origin"></iframe>
         </div>
         <footer class="sensitive-step-up-footer">
           <p>${stepUpCopy.detail}</p>
@@ -284,6 +312,7 @@
     });
     frame?.addEventListener("load", () => {
       if (pending) pending.hidden = true;
+      sendThemeToFrame(frame, currentPreference());
     });
 
     const openStepUp = (form) => {
@@ -291,9 +320,9 @@
       pendingForm = form;
       if (pending) pending.hidden = false;
       if (status) status.textContent = "";
-      const preference = isPreference(root.dataset.themePreference) ? root.dataset.themePreference : SYSTEM;
+      const preference = currentPreference();
       if (frame instanceof HTMLIFrameElement) {
-        frame.src = `/auth/step-up?${TRANSFER_PARAMETER}=${encodeURIComponent(preference)}`;
+        frame.src = themedURL("/auth/step-up", preference) || `/auth/step-up?${TRANSFER_PARAMETER}=${encodeURIComponent(preference)}`;
       }
       dialog.showModal();
     };
@@ -348,6 +377,16 @@
   else systemPreference.addListener?.(handleSystemChange);
   window.addEventListener("storage", (event) => {
     if (event.key === STORAGE_KEY || event.key === null) applyStoredOrSystemTheme();
+  });
+  window.addEventListener("message", (event) => {
+    if (event.origin !== window.location.origin || event.data?.type !== THEME_SYNC_MESSAGE ||
+        !isPreference(event.data.preference)) return;
+    const fromParent = window.parent !== window && event.source === window.parent;
+    const fromChild = [...document.querySelectorAll("iframe[data-theme-sync]")]
+      .some((frame) => frame.contentWindow === event.source);
+    if (!fromParent && !fromChild) return;
+    persist(event.data.preference);
+    render(event.data.preference);
   });
 
   applyStoredOrSystemTheme();

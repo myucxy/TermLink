@@ -120,6 +120,33 @@ func TestRegistrationAdminGeneratesOneTimeInvitationReceipt(t *testing.T) {
 	}
 }
 
+func TestRegistrationAdminEmptyInventoryUsesVisibleConsoleLayout(t *testing.T) {
+	portal := newTestPortal(t, &testOIDCFlow{})
+	base := newTestPortalRepository()
+	base.account.Role = store.RoleSuperAdmin
+	portal.config.Repository = &testRegistrationAdminRepository{
+		testPortalRepository: base,
+		policy:               store.RegistrationPolicy{Mode: store.RegistrationOpen, Version: 1, UpdatedAt: portal.now()},
+	}
+	cookie := portalSessionCookie(t, portal, store.RoleSuperAdmin, "registration-page-csrf", time.Minute)
+	response := performRequest(portal.Handler(), http.MethodGet, "/admin/registration", nil, cookie)
+	if response.Code != http.StatusOK {
+		t.Fatalf("empty registration page status=%d body=%q", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	for _, contract := range []string{
+		`class="admin-shell"`, `class="admin-sidebar"`, `class="admin-main portal-admin-main"`,
+		`class="admin-account-menu"`, `注册与邀请码`, `暂无邀请码批次。`, `暂无邀请码使用记录。`,
+	} {
+		if !strings.Contains(body, contract) {
+			t.Fatalf("empty registration page omitted %q", contract)
+		}
+	}
+	if strings.Contains(body, `class="admin-layout"`) {
+		t.Fatal("registration page retained the obsolete non-grid admin layout")
+	}
+}
+
 func TestRegistrationAdminUsesCurrentCustomAdminRoute(t *testing.T) {
 	portal := newTestPortal(t, &testOIDCFlow{})
 	base := newTestPortalRepository()

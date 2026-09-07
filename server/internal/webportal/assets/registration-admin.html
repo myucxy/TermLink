@@ -7,40 +7,43 @@
   <meta name="robots" content="noindex,nofollow">
   <title>注册与邀请码 · TermLink</title>
   <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
-  <script src="/assets/theme-init.js?v=01b-v11"></script>
-  <link rel="stylesheet" href="/assets/site.css?v=01b-v12">
+  <script src="/assets/theme-init.js?v=theme-sync-v1"></script>
+  <link rel="stylesheet" href="/assets/site.css?v=step-up-v2">
   <link rel="stylesheet" href="/assets/admin.css?v=01b-v17">
   <link rel="stylesheet" href="/assets/portal-dashboard.css?v=registration-v2">
-  <script src="/assets/theme.js?v=01b-v11" defer></script>
+  <script src="/assets/theme.js?v=theme-sync-v1" defer></script>
   <script src="/assets/registration-admin.js?v=registration-v2" defer></script>
 </head>
 <body class="admin-body portal-admin-body">
-  <header class="admin-topbar">
-    <a class="admin-brand" href="{{.AdminBasePath}}">
-      <img src="/assets/termlink-app-icon.svg" alt="">
-      <span><strong>TermLink</strong><small>Server Console</small></span>
-    </a>
-    <div class="admin-topbar-actions">
-      <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题">
-        <span class="theme-toggle-label">主题</span>
-      </button>
-      <span class="admin-user"><strong>{{.Username}}</strong><small>{{.RoleLabel}}</small></span>
-      <a class="button button-quiet" href="/account">个人中心</a>
-      <form action="/logout" method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="button button-danger" type="submit">退出</button></form>
-    </div>
-  </header>
-
-  <div class="admin-layout">
+  <div class="admin-shell">
     <aside class="admin-sidebar">
-      <div class="admin-sidebar-heading"><small>管理中心</small><strong>{{.SectionTitle}}</strong></div>
+      <a class="brand admin-brand" href="/" aria-label="TermLink 首页">
+        <img class="brand-mark" src="/assets/termlink-app-icon.svg" alt="">
+        <span><strong>TermLink</strong><small>Server Console</small></span>
+      </a>
+      <div class="environment-card">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span><small>环境</small><strong>production</strong></span>
+      </div>
       {{template "admin-navigation" .}}
+      <a class="admin-user" href="/account" aria-label="返回个人中心">
+        <span class="admin-avatar" aria-hidden="true">{{printf "%.1s" .Username}}</span>
+        <span><strong>{{.Username}}</strong><small>{{.RoleLabel}} · {{.Role}}</small></span>
+      </a>
     </aside>
 
     <main class="admin-main portal-admin-main">
-      <section class="admin-page-heading">
-        <div><p class="eyebrow">REGISTRATION ACCESS</p><h1>注册与邀请码</h1><p>配置账号注册准入，生成邀请码，并查看邀请码绑定的注册账号。</p></div>
-      </section>
-      {{if .Notice}}<div class="portal-notice" role="status">{{.Notice}}</div>{{end}}
+      <header class="admin-topbar">
+        <div><p class="eyebrow">REGISTRATION ACCESS</p><h1>{{.SectionTitle}}</h1></div>
+        <div class="admin-top-actions">
+          <button class="button button-quiet theme-toggle admin-theme-toggle" type="button" data-theme-toggle aria-label="切换深浅主题" title="切换深浅主题">
+            <span class="theme-toggle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path class="theme-icon-moon" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/><g class="theme-icon-sun"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></g></svg></span><span class="theme-toggle-label">主题</span>
+          </button>
+          {{template "admin-account-menu" .}}
+        </div>
+      </header>
+      <p class="portal-muted">配置账号注册准入，生成邀请码，并查看邀请码绑定的注册账号。</p>
+      {{if .Notice}}<div class="admin-notice" role="status">{{.Notice}}</div>{{end}}
 
       {{if .GeneratedCodes}}
       <section class="portal-card generated-code-receipt" aria-labelledby="generated-code-title">

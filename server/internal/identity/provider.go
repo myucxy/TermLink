@@ -364,11 +364,13 @@ func (p *Provider) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		frameAncestors := "'none'"
 		frameOptions := "DENY"
+		scriptPolicy := ""
 		if identityAllowsSameOriginFraming(r.URL.Path) {
 			frameAncestors = "'self'"
 			frameOptions = "SAMEORIGIN"
+			scriptPolicy = "script-src 'self'; "
 		}
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'self'; img-src 'self' data:; form-action 'self'; frame-ancestors "+frameAncestors+"; base-uri 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; "+scriptPolicy+"style-src 'self'; img-src 'self' data:; form-action 'self'; frame-ancestors "+frameAncestors+"; base-uri 'none'")
 		// Chromium serializes the Origin header as "null" for same-origin form
 		// navigations when no-referrer is active. Preserve only the origin so the
 		// browser can provide usable form metadata without copying the OIDC query

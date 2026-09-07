@@ -898,7 +898,7 @@ func TestPortalAccountResponsiveAndSVGControlContract(t *testing.T) {
 	for _, contract := range []string{
 		`data-identity-dialog="password"`, `data-identity-dialog="mfa"`, `data-identity-dialog="sessions"`,
 		`<dialog class="identity-security-dialog"`, `data-identity-dialog-frame`, `data-identity-dialog-fallback`,
-		`referrerpolicy="strict-origin"`,
+		`data-theme-sync`, `referrerpolicy="strict-origin"`,
 	} {
 		if !strings.Contains(portalDashboardHTML, contract) {
 			t.Errorf("in-page identity security dialog omitted %q", contract)
@@ -906,7 +906,8 @@ func TestPortalAccountResponsiveAndSVGControlContract(t *testing.T) {
 	}
 	if !strings.Contains(portalCSS, `.identity-security-dialog::backdrop`) ||
 		!strings.Contains(portalCSS, `.identity-security-dialog iframe`) ||
-		!strings.Contains(readAsset("theme.js"), "const actionURL = `${baseURL.replace(/\\/$/, \"\")}/${action}`;") {
+		!strings.Contains(readAsset("theme.js"), "const actionBaseURL = `${baseURL.replace(/\\/$/, \"\")}/${action}`;") ||
+		!strings.Contains(readAsset("theme.js"), "themedURL(actionBaseURL, currentPreference())") {
 		t.Error("identity security actions must open their allowlisted Keycloak section in the same-page dialog")
 	}
 	if !strings.Contains(adminCSS, `overflow-x: clip;`) ||
@@ -1649,7 +1650,8 @@ func TestSensitiveStepUpFrontendInterceptsOnlyAuditedForms(t *testing.T) {
 		`fetch("/auth/step-up/status"`, `cache: "no-store"`, `/auth/step-up?`,
 		`termlink:sensitive-step-up`, `HTMLFormElement.prototype.submit.call(form)`,
 		`document.querySelectorAll('[name="reason"]')`, `hidden.name = "reason"`,
-		`referrerpolicy="strict-origin"`,
+		`data-theme-sync`, `referrerpolicy="strict-origin"`, `termlink:theme-sync`,
+		`event.origin !== window.location.origin`, `sendThemeToFrame(frame, currentPreference())`,
 	} {
 		if !strings.Contains(contents, required) {
 			t.Fatalf("step-up frontend contract omitted %q", required)

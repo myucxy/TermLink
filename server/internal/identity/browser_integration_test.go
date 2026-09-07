@@ -83,7 +83,7 @@ func TestEmbeddedLoginTemplatePreservesTermLinkIdentityShell(t *testing.T) {
 	for _, expected := range []string{
 		`class="identity-titlebar"`, `class="identity-layout"`, `class="identity-context"`,
 		`class="identity-auth-pane"`, `/assets/identity.css?v=identity-v2`,
-		`/assets/theme-init.js?v=identity-v1`, `/assets/theme.js?v=identity-v1`,
+		`/assets/theme-init.js?v=theme-sync-v1`, `/assets/theme.js?v=theme-sync-v1`,
 		`TermLink Server · Healthy`, `Authorization Code + PKCE`, `href="/account"`,
 		`href="/register?continue=test"`, `name="termlink_csrf" value="test-csrf"`,
 		`name="username"`, `name="password"`,
@@ -162,8 +162,51 @@ func TestEmbeddedIdentitySecurityHeadersPreserveSameOriginFormMetadata(t *testin
 			}
 			if policy := response.Header().Get("Content-Security-Policy"); !strings.Contains(policy, test.ancestors) {
 				t.Fatalf("Content-Security-Policy = %q, want %q", policy, test.ancestors)
+			} else if scriptsAllowed := strings.Contains(policy, "script-src 'self'"); scriptsAllowed != (test.frameOptions == "SAMEORIGIN") {
+				t.Fatalf("Content-Security-Policy script permission = %t for %q", scriptsAllowed, test.path)
 			}
 		})
+	}
+}
+
+func TestEmbeddedIdentityAuxiliaryPagesLoadSharedThemeRuntime(t *testing.T) {
+	templates := []struct {
+		name   string
+		render func(*bytes.Buffer) error
+	}{
+		{name: "account", render: func(output *bytes.Buffer) error { return accountTemplate.Execute(output, accountPageData{}) }},
+		{name: "password-reset", render: func(output *bytes.Buffer) error {
+			return passwordResetTemplate.Execute(output, passwordResetPageData{})
+		}},
+		{name: "mfa-enrollment", render: func(output *bytes.Buffer) error {
+			return mfaEnrollmentTemplate.Execute(output, mfaEnrollmentPageData{})
+		}},
+		{name: "recovery-codes", render: func(output *bytes.Buffer) error {
+			return recoveryCodesTemplate.Execute(output, recoveryCodesPageData{})
+		}},
+		{name: "outcome", render: func(output *bytes.Buffer) error { return identityOutcomeTemplate.Execute(output, outcomePageData{}) }},
+	}
+	for _, test := range templates {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			if err := test.render(&output); err != nil {
+				t.Fatal(err)
+			}
+			for _, contract := range []string{
+				`<meta name="color-scheme" content="light dark">`,
+				`/assets/theme-init.js?v=theme-sync-v1`,
+				`/assets/theme.js?v=theme-sync-v1`,
+			} {
+				if !strings.Contains(output.String(), contract) {
+					t.Fatalf("identity %s page omitted theme contract %q", test.name, contract)
+				}
+			}
+		})
+	}
+	for _, contract := range []string{`html[data-theme="dark"]`, `--bg:#f7f8fc`, `--bg:#0b0f14`} {
+		if !strings.Contains(identityCSS, contract) {
+			t.Fatalf("identity auxiliary stylesheet omitted %q", contract)
+		}
 	}
 }
 

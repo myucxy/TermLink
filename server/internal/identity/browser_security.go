@@ -70,7 +70,7 @@ type outcomePageData struct {
 
 var passwordResetTemplate = template.Must(template.New("embedded-password-reset").Parse(`<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TermLink 密码重置 / Password reset</title><link rel="stylesheet" href="/realms/termlink/resources/identity.css"></head>
+<meta name="color-scheme" content="light dark"><title>TermLink 密码重置 / Password reset</title><script src="/assets/theme-init.js?v=theme-sync-v1"></script><link rel="stylesheet" href="/realms/termlink/resources/identity.css?v=theme-sync-v1"><script src="/assets/theme.js?v=theme-sync-v1" defer></script></head>
 <body><main class="identity-card"><div class="brand">TL</div><h1>重置密码</h1><p class="subtitle">Password reset</p>
 {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}{{if .Message}}<div class="success" role="status">{{.Message}}</div>{{end}}
 {{if .Completed}}<a class="button" href="{{.LoginURL}}">重新登录 / Sign in again</a>
@@ -80,17 +80,17 @@ var passwordResetTemplate = template.Must(template.New("embedded-password-reset"
 
 var mfaEnrollmentTemplate = template.Must(template.New("embedded-mfa-enrollment").Parse(`<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TermLink 绑定动态验证码 / Set up authenticator</title><link rel="stylesheet" href="/realms/termlink/resources/identity.css"></head>
+<meta name="color-scheme" content="light dark"><title>TermLink 绑定动态验证码 / Set up authenticator</title><script src="/assets/theme-init.js?v=theme-sync-v1"></script><link rel="stylesheet" href="/realms/termlink/resources/identity.css?v=theme-sync-v1"><script src="/assets/theme.js?v=theme-sync-v1" defer></script></head>
 <body><main class="identity-card"><div class="brand">TL</div><h1>绑定动态验证码</h1><p class="subtitle">Set up authenticator</p><p class="hint">在认证器应用中输入密钥或导入下面的配置 URI，然后输入当前六位验证码。<br>Enter the secret or import the provisioning URI in your authenticator app, then enter the current six-digit code.</p><label>密钥 / Secret<code>{{.Secret}}</code></label><label>配置 URI / Provisioning URI<code>{{.ProvisioningURI}}</code></label><form method="post" action="/realms/termlink/account/mfa/confirm"><input type="hidden" name="termlink_form_csrf" value="{{.CSRF}}"><label>六位验证码 / Six-digit code<input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required autofocus></label><button type="submit">确认并启用 / Confirm and enable</button></form></main></body></html>`))
 
 var recoveryCodesTemplate = template.Must(template.New("embedded-recovery-codes").Parse(`<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TermLink 恢复码 / Recovery codes</title><link rel="stylesheet" href="/realms/termlink/resources/identity.css"></head>
+<meta name="color-scheme" content="light dark"><title>TermLink 恢复码 / Recovery codes</title><script src="/assets/theme-init.js?v=theme-sync-v1"></script><link rel="stylesheet" href="/realms/termlink/resources/identity.css?v=theme-sync-v1"><script src="/assets/theme.js?v=theme-sync-v1" defer></script></head>
 <body><main class="identity-card"><div class="brand">TL</div><h1>保存恢复码</h1><p class="subtitle">Save your recovery codes</p><div class="error" role="alert">这些恢复码只显示一次。请离线安全保存；每个恢复码只能使用一次。<br>These recovery codes are shown only once. Store them securely offline; each code can be used once.</div><ul class="recovery-list">{{range .Codes}}<li><code>{{.}}</code></li>{{end}}</ul><a class="button" href="{{.AccountURL}}">我已保存 / I have saved them</a></main></body></html>`))
 
 var identityOutcomeTemplate = template.Must(template.New("embedded-outcome").Parse(`<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{.Title}}</title><link rel="stylesheet" href="/realms/termlink/resources/identity.css"></head>
+<meta name="color-scheme" content="light dark"><title>{{.Title}}</title><script src="/assets/theme-init.js?v=theme-sync-v1"></script><link rel="stylesheet" href="/realms/termlink/resources/identity.css?v=theme-sync-v1"><script src="/assets/theme.js?v=theme-sync-v1" defer></script></head>
 <body><main class="identity-card"><div class="brand">TL</div><h1>{{.Title}}</h1><div class="success" role="status">{{.Message}}</div><a class="button" href="{{.LinkURL}}">{{.Link}}</a></main></body></html>`))
 
 func (p *Provider) runPasswordResetMailer(ctx context.Context) {

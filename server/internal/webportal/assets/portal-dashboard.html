@@ -10,7 +10,7 @@
   <script src="/assets/theme-init.js?v=01b-v11"></script>
   <link rel="stylesheet" href="/assets/site.css?v=step-up-v2">
   <link rel="stylesheet" href="/assets/portal-dashboard.css?v=registration-v2">
-  <script src="/assets/theme.js?v=step-up-v2" defer></script>
+  <script src="/assets/theme.js?v=theme-sync-v1" defer></script>
 </head>
 <body class="portal-body">
   <header class="site-header">
@@ -138,7 +138,7 @@
     <div class="identity-security-dialog-header"><div><p class="eyebrow">SECURE IDENTITY</p><h2 id="identity-security-dialog-title">登录与安全</h2><p data-identity-dialog-description>身份服务将在安全窗口中处理本次操作。</p></div><button class="identity-dialog-close" type="button" data-identity-dialog-close aria-label="关闭安全对话框">×</button></div>
     <div class="identity-security-dialog-body">
       <div class="identity-dialog-pending" data-identity-dialog-pending><span class="status-dot" aria-hidden="true"></span><span>正在打开身份服务…</span></div>
-      <iframe title="TermLink 登录与安全" data-identity-dialog-frame referrerpolicy="strict-origin"></iframe>
+      <iframe title="TermLink 登录与安全" data-identity-dialog-frame data-theme-sync referrerpolicy="strict-origin"></iframe>
     </div>
     <div class="identity-security-dialog-footer"><span>密码、OTP Secret 和会话令牌不会经过 TermLink Server。</span><a class="button button-quiet" href="{{.IdentityAccountURL}}" data-theme-transfer data-identity-dialog-fallback target="_blank" rel="noopener">在新页面打开</a></div>
   </dialog>
