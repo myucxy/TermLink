@@ -99,6 +99,8 @@ namespace TermLink.Agent
         private const string BrowserCallbackTemplate = "http://127.0.0.1/oauth2/callback";
         public const string PublicServerUrl = "https://termlink.kget.cc:8910";
         private static readonly TimeSpan AuthorizationCallbackTimeout = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan AuthorizationCallbackConnectionTimeout = TimeSpan.FromSeconds(5);
+        private const int MaximumAuthorizationCallbackConnections = 64;
         private static readonly object BrowserAuthorizationSync = new object();
         private static BrowserAuthorizationAttempt activeBrowserAuthorization;
 
@@ -588,10 +590,9 @@ namespace TermLink.Agent
             {
                 try
                 {
-                    using var connection = await listener.AcceptTcpClientAsync(timeout.Token).ConfigureAwait(false);
-                    code = await ReadAuthorizationResponseAsync(
-                        connection,
-                        redirect.AbsolutePath,
+                    code = await ReceiveAuthorizationCodeAsync(
+                        listener,
+                        redirect,
                         state,
                         timeout.Token).ConfigureAwait(false);
                 }
@@ -767,7 +768,12 @@ namespace TermLink.Agent
             listener.Server.ExclusiveAddressUse = true;
             try
             {
-                listener.Start(1);
+                // Browsers, endpoint protection, and local network inspection
+                // can establish a speculative loopback connection before the
+                // actual OAuth redirect arrives. Keep enough backlog for the
+                // authenticated callback instead of letting one probe consume
+                // the only pending connection.
+                listener.Start(8);
                 var endpoint = listener.LocalEndpoint as IPEndPoint;
                 if (endpoint == null || !IPAddress.Loopback.Equals(endpoint.Address) || endpoint.Port < 1)
                     throw new InvalidOperationException("Windows did not assign a valid loopback callback endpoint.");
@@ -815,48 +821,147 @@ namespace TermLink.Agent
 
         private static async Task<string> ReadAuthorizationResponseAsync(
             TcpClient connection,
-            string expectedPath,
+            Uri expectedRedirect,
             string expectedState,
             CancellationToken token)
         {
+            if (connection == null) throw new ArgumentNullException(nameof(connection));
+            if (expectedRedirect == null) throw new ArgumentNullException(nameof(expectedRedirect));
             using var stream = connection.GetStream();
             using var reader = new StreamReader(stream, Encoding.ASCII, false, 4096, true);
             var requestLine = await reader.ReadLineAsync(token).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(requestLine) || requestLine.Length > 8192)
                 throw new InvalidDataException("OIDC callback request is invalid.");
+            string host = null;
             for (var count = 0; count < 100; count++)
             {
                 var header = await reader.ReadLineAsync(token).ConfigureAwait(false);
                 if (header == null || header.Length == 0) break;
                 if (header.Length > 8192 || count == 99) throw new InvalidDataException("OIDC callback headers are invalid.");
+                var separator = header.IndexOf(':');
+                if (separator > 0 && string.Equals(header.Substring(0, separator).Trim(), "Host", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (host != null) throw new InvalidDataException("OIDC callback contains duplicate Host headers.");
+                    host = header.Substring(separator + 1).Trim();
+                }
             }
             var parts = requestLine.Split(' ');
-            if (parts.Length != 3 || parts[0] != "GET") throw new InvalidDataException("OIDC callback method is invalid.");
-            var target = new Uri("http://127.0.0.1" + parts[1]);
+            if (parts.Length != 3 || parts[0] != "GET" ||
+                (parts[2] != "HTTP/1.1" && parts[2] != "HTTP/1.0"))
+                throw new InvalidDataException("OIDC callback method is invalid.");
+            if (parts[2] == "HTTP/1.1" && !string.Equals(host, expectedRedirect.Authority, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("OIDC callback Host is invalid.");
+
+            Uri target;
+            if (parts[1].StartsWith("/", StringComparison.Ordinal))
+            {
+                target = new Uri(expectedRedirect.GetLeftPart(UriPartial.Authority) + parts[1]);
+            }
+            else if (!Uri.TryCreate(parts[1], UriKind.Absolute, out target))
+            {
+                throw new InvalidDataException("OIDC callback target is invalid.");
+            }
             var query = ParseQuery(target.Query);
             string code = null;
-            var success = target.AbsolutePath == expectedPath &&
-                query.TryGetValue("state", out var actualState) &&
-                FixedTimeTextEquals(actualState, expectedState) &&
+            var targetMatches = target.Scheme == Uri.UriSchemeHttp && target.Host == "127.0.0.1" &&
+                target.Port == expectedRedirect.Port && target.AbsolutePath == expectedRedirect.AbsolutePath &&
+                string.IsNullOrEmpty(target.UserInfo) && string.IsNullOrEmpty(target.Fragment);
+            var stateMatches = query.TryGetValue("state", out var actualState) &&
+                FixedTimeTextEquals(actualState, expectedState);
+            var success = targetMatches && stateMatches &&
                 query.TryGetValue("code", out code) &&
                 !string.IsNullOrWhiteSpace(code) && !query.ContainsKey("error");
+            if (success)
+            {
+                await TryWriteAuthorizationResponseAsync(stream, true, token).ConfigureAwait(false);
+                return code;
+            }
+
+            await TryWriteAuthorizationResponseAsync(stream, false, token).ConfigureAwait(false);
+            if (targetMatches && stateMatches && query.ContainsKey("error"))
+                throw new ProductionEnrollmentException(
+                    "ACCOUNT_AUTHORIZATION_REJECTED",
+                    "The OIDC authorization response was rejected.");
+            return null;
+        }
+
+        internal static async Task<string> ReceiveAuthorizationCodeAsync(
+            TcpListener listener,
+            Uri expectedRedirect,
+            string expectedState,
+            CancellationToken token)
+        {
+            if (listener == null) throw new ArgumentNullException(nameof(listener));
+            if (expectedRedirect == null) throw new ArgumentNullException(nameof(expectedRedirect));
+            if (string.IsNullOrWhiteSpace(expectedState)) throw new ArgumentException("OIDC callback state is required.", nameof(expectedState));
+
+            for (var attempt = 0; attempt < MaximumAuthorizationCallbackConnections; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                using var connection = await listener.AcceptTcpClientAsync(token).ConfigureAwait(false);
+                using var connectionTimeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+                connectionTimeout.CancelAfter(AuthorizationCallbackConnectionTimeout);
+                try
+                {
+                    var code = await ReadAuthorizationResponseAsync(
+                        connection,
+                        expectedRedirect,
+                        expectedState,
+                        connectionTimeout.Token).ConfigureAwait(false);
+                    if (!string.IsNullOrWhiteSpace(code)) return code;
+                }
+                catch (ProductionEnrollmentException)
+                {
+                    throw;
+                }
+                catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                {
+                    // A speculative connection sent no complete HTTP request.
+                    // Close it and keep waiting for the real browser redirect.
+                }
+                catch (Exception error) when (
+                    error is IOException or SocketException or InvalidDataException or UriFormatException)
+                {
+                    // Invalid loopback traffic is untrusted local noise. It must
+                    // never terminate the authorization attempt before the
+                    // state-bound OAuth callback arrives.
+                }
+            }
+
+            throw new ProductionEnrollmentException(
+                "ACCOUNT_AUTHORIZATION_REJECTED",
+                "Too many invalid local browser callback connections were received.");
+        }
+
+        private static async Task TryWriteAuthorizationResponseAsync(
+            Stream stream,
+            bool success,
+            CancellationToken token)
+        {
             var html = Encoding.UTF8.GetBytes(success
-                ? "<!doctype html><title>TermLink linked</title><p>TermLink authorization returned. You can close this window.</p>"
-                : "<!doctype html><title>TermLink error</title><p>TermLink authorization could not be completed.</p>");
+                ? "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><title>TermLink 授权完成 / Authorization complete</title><body><h1>授权已返回 TermLink</h1><p>可以关闭此页面并返回 Windows 客户端。 / You can close this page and return to the Windows client.</p></body></html>"
+                : "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><title>TermLink 授权未完成 / Authorization incomplete</title><body><h1>此回调无效</h1><p>TermLink 将继续等待有效的网页登录回调。 / TermLink is still waiting for a valid web authorization callback.</p></body></html>");
             var headers = Encoding.ASCII.GetBytes(
                 "HTTP/1.1 " + (success ? "200 OK" : "400 Bad Request") + "\r\n" +
                 "Content-Type: text/html; charset=utf-8\r\n" +
                 "Cache-Control: no-store\r\n" +
                 "Content-Security-Policy: default-src 'none'\r\n" +
+                "Referrer-Policy: no-referrer\r\n" +
+                "X-Content-Type-Options: nosniff\r\n" +
                 "Connection: close\r\n" +
                 "Content-Length: " + html.Length + "\r\n\r\n");
-            await stream.WriteAsync(headers, token).ConfigureAwait(false);
-            await stream.WriteAsync(html, token).ConfigureAwait(false);
-            if (!success)
-                throw new ProductionEnrollmentException(
-                    "ACCOUNT_AUTHORIZATION_REJECTED",
-                    "The OIDC authorization response was rejected.");
-            return code;
+            try
+            {
+                await stream.WriteAsync(headers, token).ConfigureAwait(false);
+                await stream.WriteAsync(html, token).ConfigureAwait(false);
+            }
+            catch (Exception error) when (
+                error is IOException or SocketException or ObjectDisposedException or OperationCanceledException)
+            {
+                // The authorization code is already authenticated by its
+                // loopback endpoint and state. A browser closing the socket
+                // before it reads the friendly HTML must not discard that code.
+            }
         }
 
         private static Dictionary<string, string> ParseQuery(string query)

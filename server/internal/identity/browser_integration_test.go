@@ -133,18 +133,19 @@ func newIdentityTestBrowser(handler http.Handler) *identityTestBrowser {
 }
 
 func TestEmbeddedIdentitySecurityHeadersPreserveSameOriginFormMetadata(t *testing.T) {
-	provider := &Provider{}
+	provider := &Provider{authorizeFormAction: "'self' dev.termlink: http://127.0.0.1:*"}
 	tests := []struct {
 		path         string
 		frameOptions string
 		ancestors    string
+		formAction   string
 	}{
-		{path: "/realms/termlink/protocol/openid-connect/auth", frameOptions: "SAMEORIGIN", ancestors: "frame-ancestors 'self'"},
-		{path: "/realms/termlink/account", frameOptions: "SAMEORIGIN", ancestors: "frame-ancestors 'self'"},
-		{path: "/realms/termlink/account/password/change", frameOptions: "SAMEORIGIN", ancestors: "frame-ancestors 'self'"},
-		{path: "/realms/termlink/.well-known/openid-configuration", frameOptions: "DENY", ancestors: "frame-ancestors 'none'"},
-		{path: "/realms/termlink/protocol/openid-connect/auth/extra", frameOptions: "DENY", ancestors: "frame-ancestors 'none'"},
-		{path: "/realms/termlink/accounting", frameOptions: "DENY", ancestors: "frame-ancestors 'none'"},
+		{path: "/realms/termlink/protocol/openid-connect/auth", frameOptions: "SAMEORIGIN", ancestors: "frame-ancestors 'self'", formAction: "form-action 'self' dev.termlink: http://127.0.0.1:*"},
+		{path: "/realms/termlink/account", frameOptions: "SAMEORIGIN", ancestors: "frame-ancestors 'self'", formAction: "form-action 'self'"},
+		{path: "/realms/termlink/account/password/change", frameOptions: "SAMEORIGIN", ancestors: "frame-ancestors 'self'", formAction: "form-action 'self'"},
+		{path: "/realms/termlink/.well-known/openid-configuration", frameOptions: "DENY", ancestors: "frame-ancestors 'none'", formAction: "form-action 'self'"},
+		{path: "/realms/termlink/protocol/openid-connect/auth/extra", frameOptions: "DENY", ancestors: "frame-ancestors 'none'", formAction: "form-action 'self'"},
+		{path: "/realms/termlink/accounting", frameOptions: "DENY", ancestors: "frame-ancestors 'none'", formAction: "form-action 'self'"},
 	}
 	for _, test := range tests {
 		t.Run(test.path, func(t *testing.T) {
@@ -162,6 +163,8 @@ func TestEmbeddedIdentitySecurityHeadersPreserveSameOriginFormMetadata(t *testin
 			}
 			if policy := response.Header().Get("Content-Security-Policy"); !strings.Contains(policy, test.ancestors) {
 				t.Fatalf("Content-Security-Policy = %q, want %q", policy, test.ancestors)
+			} else if !strings.Contains(policy, test.formAction) {
+				t.Fatalf("Content-Security-Policy = %q, want %q", policy, test.formAction)
 			} else if scriptsAllowed := strings.Contains(policy, "script-src 'self'"); scriptsAllowed != (test.frameOptions == "SAMEORIGIN") {
 				t.Fatalf("Content-Security-Policy script permission = %t for %q", scriptsAllowed, test.path)
 			}

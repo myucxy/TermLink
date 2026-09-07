@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pquerna/otp/totp"
 	"github.com/termlink/termlink/server/internal/auth"
+	"github.com/termlink/termlink/server/internal/humanverification"
 	"github.com/termlink/termlink/server/migrations"
 )
 
@@ -126,6 +127,7 @@ func TestEmbeddedProviderPasswordRefreshAndAuthorizationCodeCompatibility(t *tes
 	if err = provider.Accounts().RegisterVerifiedEmail(ctx, input); err != nil {
 		t.Fatal(err)
 	}
+	provider.SetHumanVerification(&browserHumanVerification{enabled: true, siteKey: "windows-login-site-key"})
 
 	password := requestToken(t, provider.Handler(), url.Values{
 		"grant_type": {"password"}, "client_id": {"termlink-android"},
@@ -151,17 +153,64 @@ func TestEmbeddedProviderPasswordRefreshAndAuthorizationCodeCompatibility(t *tes
 		"grant_type": {"refresh_token"}, "client_id": {"termlink-android"}, "refresh_token": {rotated.RefreshToken},
 	})
 
+	windowsVerifier := base64.RawURLEncoding.EncodeToString(bytesOf(0x70, 32))
+	windowsChallengeDigest := sha256.Sum256([]byte(windowsVerifier))
+	windowsState := strings.Repeat("w", 32)
+	windowsRedirectURI := "http://127.0.0.1:54321/oauth2/callback"
 	windowsQuery := url.Values{
 		"client_id": {"termlink-windows"}, "response_type": {"code"},
-		"redirect_uri": {"http://127.0.0.1:54321/oauth2/callback"}, "scope": {"openid"},
-		"state": {strings.Repeat("w", 32)}, "nonce": {strings.Repeat("x", 32)},
-		"code_challenge": {strings.Repeat("a", 43)}, "code_challenge_method": {"S256"},
+		"redirect_uri": {windowsRedirectURI}, "scope": {"openid profile email offline_access"},
+		"state": {windowsState}, "code_challenge": {base64.RawURLEncoding.EncodeToString(windowsChallengeDigest[:])},
+		"code_challenge_method": {"S256"},
 	}
+	windowsAuthPath := "/realms/termlink/protocol/openid-connect/auth?" + windowsQuery.Encode()
 	windowsStart := httptest.NewRecorder()
 	provider.Handler().ServeHTTP(windowsStart, httptest.NewRequest(http.MethodGet,
-		"https://identity.example.test/realms/termlink/protocol/openid-connect/auth?"+windowsQuery.Encode(), nil))
+		"https://identity.example.test"+windowsAuthPath, nil))
 	if windowsStart.Code != http.StatusOK {
 		t.Fatalf("Windows RFC 8252 random-port authorization status/body = %d/%s", windowsStart.Code, windowsStart.Body.String())
+	}
+	windowsPolicy := windowsStart.Header().Get("Content-Security-Policy")
+	if !strings.Contains(windowsPolicy, humanverification.TurnstileScriptOrigin) ||
+		!strings.Contains(windowsPolicy, "form-action 'self' dev.termlink: http://127.0.0.1:*") {
+		t.Fatalf("Windows RFC 8252 authorization CSP = %q", windowsPolicy)
+	}
+	windowsCSRF := regexp.MustCompile(`name="termlink_csrf" value="([^"]+)"`).FindStringSubmatch(windowsStart.Body.String())
+	if len(windowsCSRF) != 2 {
+		t.Fatal("Windows RFC 8252 authorization login omitted CSRF token")
+	}
+	windowsForm := url.Values{
+		"termlink_csrf": {windowsCSRF[1]}, "username": {input.Username}, "password": {input.Password},
+		"cf-turnstile-response": {"valid-login-token"},
+	}
+	windowsFinishRequest := httptest.NewRequest(
+		http.MethodPost,
+		"https://identity.example.test"+windowsAuthPath,
+		strings.NewReader(windowsForm.Encode()))
+	windowsFinishRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	windowsFinishRequest.Header.Set("Origin", "https://identity.example.test")
+	for _, cookie := range windowsStart.Result().Cookies() {
+		windowsFinishRequest.AddCookie(cookie)
+	}
+	windowsFinish := httptest.NewRecorder()
+	provider.Handler().ServeHTTP(windowsFinish, windowsFinishRequest)
+	if windowsFinish.Code != http.StatusSeeOther {
+		t.Fatalf("Windows RFC 8252 authorization completion status/body = %d/%s", windowsFinish.Code, windowsFinish.Body.String())
+	}
+	windowsCallback, err := url.Parse(windowsFinish.Header().Get("Location"))
+	if err != nil || windowsCallback.Scheme != "http" || windowsCallback.Host != "127.0.0.1:54321" ||
+		windowsCallback.Path != "/oauth2/callback" || windowsCallback.Query().Get("code") == "" ||
+		windowsCallback.Query().Get("state") != windowsState {
+		t.Fatalf("Windows RFC 8252 callback = %q, %v", windowsFinish.Header().Get("Location"), err)
+	}
+	windowsToken := requestToken(t, provider.Handler(), url.Values{
+		"grant_type": {"authorization_code"}, "client_id": {"termlink-windows"},
+		"redirect_uri": {windowsRedirectURI}, "code": {windowsCallback.Query().Get("code")},
+		"code_verifier": {windowsVerifier},
+	})
+	windowsIdentity, err := provider.TokenVerifier().Verify(ctx, windowsToken.AccessToken)
+	if err != nil || windowsIdentity.AuthorizedParty != "termlink-windows" || windowsToken.RefreshToken == "" {
+		t.Fatalf("Windows RFC 8252 token identity = %#v, refresh=%t, %v", windowsIdentity, windowsToken.RefreshToken != "", err)
 	}
 
 	verifier := base64.RawURLEncoding.EncodeToString(bytesOf(0x71, 32))
@@ -187,7 +236,10 @@ func TestEmbeddedProviderPasswordRefreshAndAuthorizationCodeCompatibility(t *tes
 	if len(cookies) == 0 {
 		t.Fatal("authorization login omitted CSRF cookie")
 	}
-	form := url.Values{"termlink_csrf": {csrfMatch[1]}, "username": {input.Username}, "password": {input.Password}}
+	form := url.Values{
+		"termlink_csrf": {csrfMatch[1]}, "username": {input.Username}, "password": {input.Password},
+		"cf-turnstile-response": {"valid-login-token"},
+	}
 	finishRequest := httptest.NewRequest(http.MethodPost, "https://identity.example.test"+authPath, strings.NewReader(form.Encode()))
 	finishRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	finishRequest.Header.Set("Origin", "https://identity.example.test")

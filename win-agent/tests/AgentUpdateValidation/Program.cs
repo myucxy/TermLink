@@ -24,6 +24,8 @@ namespace TermLink.AgentUpdate.Validation
             {
                 ValidateBrowserAuthorizationLaunch();
                 ValidateBrowserCallbackUsesDynamicPort();
+                await ValidateBrowserCallbackIgnoresLocalProbeAsync();
+                await ValidateBrowserCallbackSurvivesEarlyBrowserCloseAsync();
                 ValidateRetainedMachineIdentity();
                 var pcId = Guid.NewGuid();
                 var updateId = Guid.NewGuid();
@@ -405,6 +407,88 @@ namespace TermLink.AgentUpdate.Validation
                 () => ProductionEnrollment.StartCallbackListener(
                     new Uri("http://localhost/oauth2/callback"), out _),
                 "browser callback accepted a non-literal loopback host");
+        }
+
+        private static async Task ValidateBrowserCallbackIgnoresLocalProbeAsync()
+        {
+            const string expectedState = "state-that-must-match-the-browser-callback";
+            const string expectedCode = "opaque-authorization-code";
+            using var listener = ProductionEnrollment.StartCallbackListener(
+                new Uri("http://127.0.0.1/oauth2/callback"), out var redirect);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var receive = ProductionEnrollment.ReceiveAuthorizationCodeAsync(
+                listener,
+                redirect,
+                expectedState,
+                timeout.Token);
+
+            var probeResponse = await SendBrowserCallbackAsync(
+                redirect,
+                "/unrelated-local-probe",
+                timeout.Token);
+            Assert(probeResponse.Contains("400 Bad Request", StringComparison.Ordinal),
+                "an unrelated local probe did not receive a bounded rejection");
+            Assert(!receive.IsCompleted,
+                "an unrelated local probe consumed the OAuth callback listener");
+
+            var callbackTarget = redirect.AbsolutePath +
+                "?code=" + Uri.EscapeDataString(expectedCode) +
+                "&state=" + Uri.EscapeDataString(expectedState);
+            var callbackResponse = await SendBrowserCallbackAsync(
+                redirect,
+                callbackTarget,
+                timeout.Token);
+            Assert(callbackResponse.Contains("200 OK", StringComparison.Ordinal) &&
+                    callbackResponse.Contains("Authorization complete", StringComparison.Ordinal),
+                "the valid browser callback did not receive the bilingual completion page");
+            Assert(await receive == expectedCode,
+                "the valid browser callback did not return its authorization code after a probe");
+        }
+
+        private static async Task ValidateBrowserCallbackSurvivesEarlyBrowserCloseAsync()
+        {
+            const string expectedState = "state-bound-to-an-early-closing-browser";
+            const string expectedCode = "code-from-an-early-closing-browser";
+            using var listener = ProductionEnrollment.StartCallbackListener(
+                new Uri("http://127.0.0.1/oauth2/callback"), out var redirect);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var receive = ProductionEnrollment.ReceiveAuthorizationCodeAsync(
+                listener,
+                redirect,
+                expectedState,
+                timeout.Token);
+
+            using (var connection = new TcpClient(AddressFamily.InterNetwork))
+            {
+                await connection.ConnectAsync(IPAddress.Loopback, redirect.Port, timeout.Token);
+                using var stream = connection.GetStream();
+                var request = Encoding.ASCII.GetBytes(
+                    "GET " + redirect.AbsolutePath +
+                    "?code=" + Uri.EscapeDataString(expectedCode) +
+                    "&state=" + Uri.EscapeDataString(expectedState) +
+                    " HTTP/1.1\r\nHost: " + redirect.Authority + "\r\nConnection: close\r\n\r\n");
+                await stream.WriteAsync(request, timeout.Token);
+            }
+
+            Assert(await receive == expectedCode,
+                "a browser closing before the completion page was read discarded the valid authorization code");
+        }
+
+        private static async Task<string> SendBrowserCallbackAsync(
+            Uri redirect,
+            string target,
+            CancellationToken token)
+        {
+            using var connection = new TcpClient(AddressFamily.InterNetwork);
+            await connection.ConnectAsync(IPAddress.Loopback, redirect.Port, token);
+            using var stream = connection.GetStream();
+            var request = Encoding.ASCII.GetBytes(
+                "GET " + target + " HTTP/1.1\r\n" +
+                "Host: " + redirect.Authority + "\r\n" +
+                "Connection: close\r\n\r\n");
+            await stream.WriteAsync(request, token);
+            using var reader = new StreamReader(stream, Encoding.UTF8, false, 4096, false);
+            return await reader.ReadToEndAsync(token);
         }
 
         private static void ValidateSupervisorRecoveryDecisions()

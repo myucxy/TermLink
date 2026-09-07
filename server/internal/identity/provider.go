@@ -71,6 +71,7 @@ type Provider struct {
 	passwordResetMailer PasswordResetMailer
 	passwordResetJobs   chan passwordResetJob
 	humanVerification   HumanVerification
+	authorizeFormAction string
 }
 
 // New constructs an embedded OIDC provider without making any network call.
@@ -90,6 +91,10 @@ func New(ctx context.Context, config Config) (*Provider, error) {
 		config.Clock = time.Now
 	}
 	clients, err := embeddedClients(config)
+	if err != nil {
+		return nil, err
+	}
+	authorizeFormAction, err := embeddedAuthorizeFormAction(config)
 	if err != nil {
 		return nil, err
 	}
@@ -181,8 +186,9 @@ func New(ctx context.Context, config Config) (*Provider, error) {
 		issuer: issuer, accounts: accounts, storage: storage, oauth: oauthProvider,
 		signingKeys: signingKeys, verifier: verifier, discovery: discovery, clock: config.Clock,
 		browserCookies: browserCookies, stepUpClientID: config.StepUpClientID,
-		publicOrigin:      publicOrigin,
-		passwordResetJobs: make(chan passwordResetJob, 32),
+		publicOrigin:        publicOrigin,
+		authorizeFormAction: authorizeFormAction,
+		passwordResetJobs:   make(chan passwordResetJob, 32),
 	}
 	if err = cleanupExpiredIdentityState(ctx, config.Pool, config.Clock().UTC(), true); err != nil {
 		slog.Warn("embedded identity startup cleanup failed", "error_class", "identity_cleanup_failed")
@@ -270,6 +276,25 @@ func embeddedClients(config Config) (map[string]fosite.Client, error) {
 		}
 	}
 	return clients, nil
+}
+
+func embeddedAuthorizeFormAction(config Config) (string, error) {
+	androidRedirect, androidErr := url.Parse(strings.TrimSpace(config.AndroidRedirectURI))
+	if androidErr != nil || androidRedirect.Scheme != "dev.termlink" || androidRedirect.Host != "" ||
+		androidRedirect.Path != "/oauth2redirect" || androidRedirect.RawQuery != "" ||
+		androidRedirect.Fragment != "" || androidRedirect.User != nil {
+		return "", errors.New("embedded Android OIDC redirect URI is invalid")
+	}
+	windowsRedirect, windowsErr := url.Parse(strings.TrimSpace(config.WindowsRedirectURI))
+	if windowsErr != nil || windowsRedirect.Scheme != "http" || windowsRedirect.Host != "127.0.0.1" ||
+		windowsRedirect.Path != "/oauth2/callback" || windowsRedirect.RawQuery != "" ||
+		windowsRedirect.Fragment != "" || windowsRedirect.User != nil {
+		return "", errors.New("embedded Windows OIDC redirect URI is invalid")
+	}
+	// RFC 8252 requires native applications to choose an ephemeral loopback
+	// port. CSP otherwise treats the configured default port as exact and
+	// Chromium blocks the login form's 303 callback navigation.
+	return "'self' dev.termlink: http://127.0.0.1:*", nil
 }
 
 func (p *Provider) routes() http.Handler {
@@ -370,7 +395,7 @@ func (p *Provider) securityHeaders(next http.Handler) http.Handler {
 			frameOptions = "SAMEORIGIN"
 			scriptPolicy = "script-src 'self'; "
 		}
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; "+scriptPolicy+"style-src 'self'; img-src 'self' data:; form-action 'self'; frame-ancestors "+frameAncestors+"; base-uri 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; "+scriptPolicy+"style-src 'self'; img-src 'self' data:; form-action "+p.formActionForPath(r.URL.Path)+"; frame-ancestors "+frameAncestors+"; base-uri 'none'")
 		// Chromium serializes the Origin header as "null" for same-origin form
 		// navigations when no-referrer is active. Preserve only the origin so the
 		// browser can provide usable form metadata without copying the OIDC query
@@ -381,6 +406,13 @@ func (p *Provider) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (p *Provider) formActionForPath(path string) string {
+	if path == "/realms/termlink/protocol/openid-connect/auth" && p.authorizeFormAction != "" {
+		return p.authorizeFormAction
+	}
+	return "'self'"
 }
 
 func identityAllowsSameOriginFraming(path string) bool {
