@@ -8,22 +8,29 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Cancel
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.Terminal
@@ -51,8 +58,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.termlink.harness.R
@@ -66,12 +76,14 @@ import java.util.UUID
 @Composable
 internal fun RemoteFileBrowserPage(
     state: RemoteFileBrowserState,
+    searchSupported: Boolean,
     supportedCommands: List<TerminalCommandCapability>,
     favorites: List<RemoteDirectoryFavorite>,
     favoriteSupportedCommands: (RemoteDirectoryFavorite) -> List<TerminalCommandCapability>,
     onOpenDirectory: (String) -> Unit,
     onOpenFavorite: (RemoteDirectoryFavorite) -> Unit,
-    onLoadMore: (String, Long) -> Unit,
+    onSearch: (String) -> Unit,
+    onLoadMore: (String, String, Long) -> Unit,
     onDownload: (RemoteFileEntry) -> Unit,
     onDownloadFavorite: (RemoteDirectoryFavorite) -> Unit,
     onOpenShell: (String, TerminalCommandCapability) -> Unit,
@@ -81,43 +93,72 @@ internal fun RemoteFileBrowserPage(
     modifier: Modifier = Modifier,
 ) {
     var selectedTabIndex by rememberSaveable(state.pcId) { mutableIntStateOf(0) }
+    var searchQuery by rememberSaveable(state.pcId, state.currentPath) { mutableStateOf(state.query) }
     val parentTarget = remoteFileParentTarget(state.currentPath, state.parentPath)
     val currentDirectory = remoteCurrentDirectoryEntry(state.currentPath)
     val currentDirectoryFavorite = currentDirectory != null && state.pcId?.let { pcId ->
         isRemoteDirectoryFavorite(favorites, pcId, currentDirectory.path)
     } == true
     Column(modifier = modifier.fillMaxSize()) {
-        PrimaryTabRow(selectedTabIndex = selectedTabIndex) {
+        PrimaryTabRow(
+            selectedTabIndex = selectedTabIndex,
+            modifier = Modifier.height(44.dp),
+        ) {
             Tab(
                 selected = selectedTabIndex == 0,
                 onClick = { selectedTabIndex = 0 },
-                text = { Text(stringResource(R.string.remote_directory_contents)) },
+                modifier = Modifier.fillMaxHeight(),
+                text = {
+                    Text(
+                        stringResource(R.string.remote_directory_contents),
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                },
             )
             Tab(
                 selected = selectedTabIndex == 1,
                 onClick = { selectedTabIndex = 1 },
-                text = { Text(stringResource(R.string.remote_favorites_title)) },
+                modifier = Modifier.fillMaxHeight(),
+                text = {
+                    Text(
+                        stringResource(R.string.remote_favorites_title),
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                },
             )
         }
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                start = 16.dp,
+                top = 8.dp,
+                end = 16.dp,
+                bottom = 14.dp,
+            ),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             if (selectedTabIndex == 0) {
                 item(key = "header") {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text(state.pcName, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                        Text(
-                            state.currentPath.ifBlank { stringResource(R.string.remote_files_root) },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 3,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                state.pcName,
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                state.currentPath.ifBlank { stringResource(R.string.remote_files_root) },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.MiddleEllipsis,
+                            )
+                        }
                         Row(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             OutlinedIconButton(
@@ -131,6 +172,23 @@ internal fun RemoteFileBrowserPage(
                                     contentDescription = stringResource(R.string.remote_files_parent),
                                     modifier = Modifier.size(20.dp),
                                 )
+                            }
+                            if (searchSupported) {
+                                RemoteDirectorySearchField(
+                                    query = searchQuery,
+                                    loading = state.loading,
+                                    onQueryChange = { value ->
+                                        if (isValidRemoteFileSearchQuery(value)) searchQuery = value
+                                    },
+                                    onSearch = onSearch,
+                                    onClear = {
+                                        searchQuery = ""
+                                        if (state.query.isNotEmpty() || state.error != null) onSearch("")
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                )
+                            } else {
+                                Spacer(Modifier.weight(1f))
                             }
                             CurrentDirectoryActions(
                                 directory = currentDirectory,
@@ -157,7 +215,10 @@ internal fun RemoteFileBrowserPage(
                             }
                         } else if (!state.loading && state.entries.isEmpty() && state.error == null) {
                             Text(
-                                stringResource(R.string.remote_files_empty),
+                                stringResource(
+                                    if (state.query.isEmpty()) R.string.remote_files_empty
+                                    else R.string.remote_files_no_matches,
+                                ),
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -181,7 +242,7 @@ internal fun RemoteFileBrowserPage(
                 state.nextOffset?.let { offset ->
                     item(key = "more-$offset") {
                         Button(
-                            onClick = { onLoadMore(state.currentPath, offset) },
+                            onClick = { onLoadMore(state.currentPath, state.query, offset) },
                             enabled = !state.loading,
                             modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                         ) {
@@ -217,6 +278,80 @@ internal fun RemoteFileBrowserPage(
                         onDownload = { onDownloadFavorite(favorite) },
                         onOpenShell = { shell -> onOpenFavoriteShell(favorite, shell) },
                         onRemove = { onRemoveFavorite(favorite) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteDirectorySearchField(
+    query: String,
+    loading: Boolean,
+    onQueryChange: (String) -> Unit,
+    onSearch: (String) -> Unit,
+    onClear: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val focusManager = LocalFocusManager.current
+    val submit = {
+        if (!loading) {
+            onSearch(query)
+            focusManager.clearFocus()
+        }
+    }
+    Surface(
+        modifier = modifier.height(40.dp),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxSize().padding(horizontal = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconButton(
+                onClick = submit,
+                enabled = !loading,
+                modifier = Modifier.size(32.dp),
+            ) {
+                Icon(
+                    Icons.Filled.Search,
+                    contentDescription = stringResource(R.string.remote_files_search_action),
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+            BasicTextField(
+                value = query,
+                onValueChange = onQueryChange,
+                modifier = Modifier.weight(1f).fillMaxHeight(),
+                singleLine = true,
+                textStyle = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface),
+                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { submit() }),
+                decorationBox = { innerTextField ->
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+                        if (query.isEmpty()) {
+                            Text(
+                                stringResource(R.string.remote_files_search_hint),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        innerTextField()
+                    }
+                },
+            )
+            if (query.isNotEmpty()) {
+                IconButton(onClick = onClear, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        Icons.Filled.Close,
+                        contentDescription = stringResource(R.string.remote_files_search_clear),
+                        modifier = Modifier.size(18.dp),
                     )
                 }
             }

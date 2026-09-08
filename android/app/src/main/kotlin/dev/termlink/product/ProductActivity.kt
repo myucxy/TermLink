@@ -93,6 +93,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.Warning
@@ -174,6 +175,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -1054,8 +1056,8 @@ fun ProductApp(
     val snackbarHostState = remember { SnackbarHostState() }
     val unavailableOperationMessage = stringResource(R.string.unknown_server_operation)
     val activeSessionDeleteMessage = stringResource(R.string.failure_session_active)
-    val sessionCloseRequestSentMessage = stringResource(R.string.session_close_request_sent)
-    val sessionCloseRequestFailedMessage = stringResource(R.string.failure_session_close_request)
+    val sessionTerminateRequestSentMessage = stringResource(R.string.session_terminate_request_sent)
+    val sessionTerminateRequestFailedMessage = stringResource(R.string.failure_session_terminate_request)
 
     fun monitorAgentUpdate(pc: PcSummary, initial: AgentUpdateProgress) {
         agentUpdateJob?.cancel()
@@ -1278,7 +1280,7 @@ fun ProductApp(
         if (currentState.loading) return
         val currentPath = currentState.currentPath
         runOperation {
-            repository.browseRemoteDirectory(pcId, pcName, currentPath, null)
+            repository.browseRemoteDirectory(pcId, pcName, currentPath, null, currentState.query)
         }
     }
 
@@ -1507,26 +1509,6 @@ fun ProductApp(
                             repository.browseRemoteDirectory(pc.id, pc.name, "", null)
                         }
                     },
-                    onAgentUpdateRequested = { pc ->
-                        agentUpdateDialog = AgentUpdateDialogState.Loading(pc)
-                        scope.launch {
-                            try {
-                                val active = repository.activeAgentUpdate(pc.id)
-                                if (active != null) {
-                                    monitorAgentUpdate(pc, active)
-                                } else {
-                                    agentUpdateDialog = AgentUpdateDialogState.Offer(
-                                        pc,
-                                        repository.agentUpdateEligibility(pc.id),
-                                    )
-                                }
-                            } catch (error: CancellationException) {
-                                throw error
-                            } catch (error: Throwable) {
-                                agentUpdateDialog = AgentUpdateDialogState.Failure(pc, error)
-                            }
-                        }
-                    },
                     onOpenDownloads = {
                         selectedRemotePcId = null
                         selectedRemotePcName = ""
@@ -1572,8 +1554,8 @@ fun ProductApp(
                             remoteDirectoryFavorites = next
                         }
                     },
-                    onBrowseRemoteDirectory = { pcId, pcName, path, offset ->
-                        runOperation { repository.browseRemoteDirectory(pcId, pcName, path, offset) }
+                    onBrowseRemoteDirectory = { pcId, pcName, path, offset, query ->
+                        runOperation { repository.browseRemoteDirectory(pcId, pcName, path, offset, query) }
                     },
                     onDownloadRemoteEntry = { pcId, pcName, entry ->
                         onCreateRemoteDocument(remoteDownloadSelection(pcId, pcName, entry))
@@ -1734,10 +1716,10 @@ fun ProductApp(
     }
     if (stoppableSessionId != null) {
         ConfirmActionDialog(
-            title = stringResource(R.string.confirm_close_session_title),
-            message = stringResource(R.string.confirm_close_session_copy),
-            confirmLabel = stringResource(R.string.confirm_close_session),
-            icon = Icons.Filled.Close,
+            title = stringResource(R.string.confirm_terminate_session_title),
+            message = stringResource(R.string.confirm_terminate_session_copy),
+            confirmLabel = stringResource(R.string.confirm_terminate_session),
+            icon = Icons.Filled.Stop,
             onDismiss = { pendingStopSessionId = null },
             onConfirm = {
                 val sessionId = stoppableSessionId
@@ -1746,11 +1728,11 @@ fun ProductApp(
                     try {
                         repository.stopSession(sessionId)
                         removeSessionTabState(sessionId)
-                        snackbarHostState.showSnackbar(sessionCloseRequestSentMessage)
+                        snackbarHostState.showSnackbar(sessionTerminateRequestSentMessage)
                     } catch (error: CancellationException) {
                         throw error
                     } catch (_: Throwable) {
-                        snackbarHostState.showSnackbar(sessionCloseRequestFailedMessage)
+                        snackbarHostState.showSnackbar(sessionTerminateRequestFailedMessage)
                     }
                 }
             },
@@ -2871,6 +2853,7 @@ private fun ProductTopBar(
 ) {
     CenterAlignedTopAppBar(
         title = { Text(destination.localizedLabel(), style = MaterialTheme.typography.titleLarge) },
+        expandedHeight = if (destination == ProductDestination.FILES) 56.dp else Dp.Unspecified,
         navigationIcon = {
             if (onBack != null) {
                 IconButton(onClick = onBack) {
@@ -3011,12 +2994,11 @@ private fun ProductContent(
     expandedPcIds: Set<String>,
     onTogglePcExpanded: (java.util.UUID) -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
-    onAgentUpdateRequested: (PcSummary) -> Unit,
     onOpenDownloads: () -> Unit,
     onOpenRemoteFavorite: (RemoteDirectoryFavorite) -> Unit,
     onToggleRemoteFavorite: (java.util.UUID, String, RemoteFileEntry) -> Unit,
     onRemoveRemoteFavorite: (RemoteDirectoryFavorite) -> Unit,
-    onBrowseRemoteDirectory: (java.util.UUID, String, String, Long?) -> Unit,
+    onBrowseRemoteDirectory: (java.util.UUID, String, String, Long?, String) -> Unit,
     onDownloadRemoteEntry: (java.util.UUID, String, RemoteFileEntry) -> Unit,
     onOpenRemoteShell: (java.util.UUID, String, TerminalCommandCapability) -> Unit,
     onCancelRemoteDownload: (java.util.UUID) -> Unit,
@@ -3070,7 +3052,6 @@ private fun ProductContent(
                     },
                     onOpenDownloads = onOpenDownloads,
                     onBrowsePc = onBrowsePc,
-                    onAgentUpdateRequested = onAgentUpdateRequested,
                     onStopSessionRequested = onStopSessionRequested,
                     onDeleteSessionRequested = onDeleteSessionRequested,
                 )
@@ -3089,6 +3070,9 @@ private fun ProductContent(
         }
         RemoteFileBrowserPage(
             state = state,
+            searchSupported = remotePc?.capabilities?.contains(
+                dev.termlink.model.PcCapabilityIds.FILE_OPERATIONS_SEARCH_V1,
+            ) == true,
             supportedCommands = remotePc?.let(::supportedRemoteTerminalCommands).orEmpty(),
             favorites = remoteDirectoryFavorites,
             favoriteSupportedCommands = { favorite ->
@@ -3097,11 +3081,14 @@ private fun ProductContent(
                     .orEmpty()
             },
             onOpenDirectory = { path ->
-                onBrowseRemoteDirectory(remotePcId, remotePcName, path, null)
+                onBrowseRemoteDirectory(remotePcId, remotePcName, path, null, "")
             },
             onOpenFavorite = onOpenRemoteFavorite,
-            onLoadMore = { path, offset ->
-                onBrowseRemoteDirectory(remotePcId, remotePcName, path, offset)
+            onSearch = { query ->
+                onBrowseRemoteDirectory(remotePcId, remotePcName, state.currentPath, null, query)
+            },
+            onLoadMore = { path, query, offset ->
+                onBrowseRemoteDirectory(remotePcId, remotePcName, path, offset, query)
             },
             onDownload = { entry -> onDownloadRemoteEntry(remotePcId, remotePcName, entry) },
             onDownloadFavorite = { favorite ->
@@ -3156,6 +3143,8 @@ private fun ProductContent(
                 Unit
             },
             onCloseSessionTab = onCloseSessionTab,
+            onStopSessionRequested = onStopSessionRequested,
+            onDeleteSessionRequested = onDeleteSessionRequested,
             onOpenSession = onOpenSession,
             onLoadTranscript = onLoadTranscript,
             onClearTranscript = onClearTranscript,
@@ -3271,7 +3260,6 @@ private fun DevicesPage(
     onOpenSession: (java.util.UUID) -> Unit,
     onOpenDownloads: () -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
-    onAgentUpdateRequested: (PcSummary) -> Unit,
     onStopSessionRequested: (java.util.UUID) -> Unit,
     onDeleteSessionRequested: (java.util.UUID) -> Unit,
 ) {
@@ -3303,13 +3291,6 @@ private fun DevicesPage(
                     onOpenSession = onOpenSession,
                     onBrowseFiles = if (PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) {
                         { onBrowsePc(pc) }
-                    } else {
-                        null
-                    },
-                    onAgentUpdate = if (
-                        pc.platform == "windows" && PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in pc.capabilities
-                    ) {
-                        { onAgentUpdateRequested(pc) }
                     } else {
                         null
                     },
@@ -3520,7 +3501,6 @@ private fun PcRow(
     onToggleExpanded: (() -> Unit)? = null,
     onOpenSession: ((java.util.UUID) -> Unit)? = null,
     onBrowseFiles: (() -> Unit)? = null,
-    onAgentUpdate: (() -> Unit)? = null,
     onStopSessionRequested: ((java.util.UUID) -> Unit)? = null,
     onDeleteSessionRequested: ((java.util.UUID) -> Unit)? = null,
 ) {
@@ -3544,7 +3524,7 @@ private fun PcRow(
                 modifier = Modifier
                     .fillMaxWidth()
                     .combinedClickable(
-                        enabled = onToggleExpanded != null || onAgentUpdate != null || onBrowseFiles != null,
+                        enabled = onToggleExpanded != null || onBrowseFiles != null,
                         onClick = {
                             if (sessions.isNotEmpty()) onToggleExpanded?.invoke()
                         },
@@ -3645,16 +3625,6 @@ private fun PcRow(
                             },
                         )
                     }
-                    onAgentUpdate?.let { update ->
-                        DropdownMenuItem(
-                            text = { Text(stringResource(R.string.agent_update_action)) },
-                            leadingIcon = { Icon(Icons.Filled.Refresh, contentDescription = null) },
-                            onClick = {
-                                deviceMenuExpanded = false
-                                update()
-                            },
-                        )
-                    }
                 }
             }
             if (expanded && sessions.isNotEmpty()) {
@@ -3697,20 +3667,20 @@ private fun PcRow(
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
-                            when (deviceSessionDestructiveAction(session.online)) {
-                                DeviceSessionDestructiveAction.CLOSE_ONLINE -> if (onStopSessionRequested != null) {
+                            when (sessionDestructiveAction(session.online)) {
+                                SessionDestructiveAction.TERMINATE_ONLINE -> if (onStopSessionRequested != null) {
                                     IconButton(
                                         onClick = { onStopSessionRequested(session.id) },
                                         modifier = Modifier.size(36.dp),
                                     ) {
                                         Icon(
-                                            Icons.Filled.Close,
-                                            contentDescription = stringResource(R.string.action_close_session),
+                                            Icons.Filled.Stop,
+                                            contentDescription = stringResource(R.string.action_terminate_session),
                                             tint = MaterialTheme.colorScheme.error,
                                         )
                                     }
                                 }
-                                DeviceSessionDestructiveAction.DELETE_OFFLINE_RECORD -> if (onDeleteSessionRequested != null) {
+                                SessionDestructiveAction.DELETE_OFFLINE_RECORD -> if (onDeleteSessionRequested != null) {
                                     IconButton(
                                         onClick = { onDeleteSessionRequested(session.id) },
                                         modifier = Modifier.size(36.dp),
@@ -3744,16 +3714,16 @@ internal fun isSessionTabOpenable(
     else -> pc?.online == true && PcCapabilityIds.HOST_HISTORY_V1 in pc.capabilities
 }
 
-internal enum class DeviceSessionDestructiveAction {
-    CLOSE_ONLINE,
+internal enum class SessionDestructiveAction {
+    TERMINATE_ONLINE,
     DELETE_OFFLINE_RECORD,
 }
 
-internal fun deviceSessionDestructiveAction(sessionOnline: Boolean): DeviceSessionDestructiveAction =
+internal fun sessionDestructiveAction(sessionOnline: Boolean): SessionDestructiveAction =
     if (isDeviceSessionActive(sessionOnline)) {
-    DeviceSessionDestructiveAction.CLOSE_ONLINE
+    SessionDestructiveAction.TERMINATE_ONLINE
 } else {
-    DeviceSessionDestructiveAction.DELETE_OFFLINE_RECORD
+    SessionDestructiveAction.DELETE_OFFLINE_RECORD
 }
 
 @Composable
@@ -3767,6 +3737,8 @@ private fun SessionsPage(
     openedSessionIds: List<String>,
     onSessionSelected: (java.util.UUID) -> Unit,
     onCloseSessionTab: (java.util.UUID) -> Unit,
+    onStopSessionRequested: (java.util.UUID) -> Unit,
+    onDeleteSessionRequested: (java.util.UUID) -> Unit,
     onOpenSession: suspend (java.util.UUID) -> Unit,
     onLoadTranscript: (java.util.UUID) -> Unit,
     onClearTranscript: (java.util.UUID) -> Unit,
@@ -3860,6 +3832,12 @@ private fun SessionsPage(
             fun pcLabel(session: SessionSummary): String =
                 snapshot.pcs.firstOrNull { it.id == session.pcId }?.name
                     ?: unknownPcLabel
+            fun requestSessionDestructiveAction(session: SessionSummary) {
+                when (sessionDestructiveAction(session.online)) {
+                    SessionDestructiveAction.TERMINATE_ONLINE -> onStopSessionRequested(session.id)
+                    SessionDestructiveAction.DELETE_OFFLINE_RECORD -> onDeleteSessionRequested(session.id)
+                }
+            }
             if (wide) {
                 Row(
                     modifier = Modifier
@@ -3875,6 +3853,7 @@ private fun SessionsPage(
                         selectedId = selected.id,
                         onSessionSelected = onSessionSelected,
                         onCloseSessionTab = onCloseSessionTab,
+                        onDestructiveActionRequested = ::requestSessionDestructiveAction,
                         pcLabel = ::pcLabel,
                         modifier = Modifier
                             .widthIn(min = 260.dp, max = 360.dp)
@@ -3919,6 +3898,7 @@ private fun SessionsPage(
                     selectedId = selected.id,
                     onSessionSelected = onSessionSelected,
                     onCloseSessionTab = onCloseSessionTab,
+                    onDestructiveActionRequested = ::requestSessionDestructiveAction,
                     pcLabel = ::pcLabel,
                     selectedEngine = selectedEngine,
                     sessionStates = snapshot.sessionStates,
@@ -3952,6 +3932,7 @@ private fun MobileSessionContent(
     selectedId: java.util.UUID,
     onSessionSelected: (java.util.UUID) -> Unit,
     onCloseSessionTab: (java.util.UUID) -> Unit,
+    onDestructiveActionRequested: (SessionSummary) -> Unit,
     pcLabel: (SessionSummary) -> String,
     selectedEngine: TerminalViewportEngine?,
     sessionStates: Map<java.util.UUID, RemoteSessionState>,
@@ -3990,32 +3971,13 @@ private fun MobileSessionContent(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 items(sessions, key = { it.id }) { candidate ->
-                    FilterChip(
+                    MobileSessionTab(
+                        session = candidate,
                         selected = candidate.id == session.id,
+                        label = pcLabel(candidate) + " · " + displaySessionTitle(candidate, sessionTitles[candidate.id]),
                         onClick = { onSessionSelected(candidate.id) },
-                        modifier = Modifier.widthIn(min = 140.dp, max = 260.dp),
-                        label = {
-                            Text(
-                                pcLabel(candidate) + " · " + displaySessionTitle(candidate, sessionTitles[candidate.id]),
-                                maxLines = 1,
-                                overflow = TextOverflow.MiddleEllipsis,
-                            )
-                        },
-                        trailingIcon = {
-                            IconButton(
-                                onClick = { onCloseSessionTab(candidate.id) },
-                                modifier = Modifier
-                                    .size(32.dp)
-                                    .testTag(mobileSessionCloseTestTag(candidate.id)),
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Close,
-                                    contentDescription = stringResource(R.string.action_close_session_tab),
-                                    modifier = Modifier.size(17.dp),
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        },
+                        onClose = { onCloseSessionTab(candidate.id) },
+                        onDestructiveAction = { onDestructiveActionRequested(candidate) },
                     )
                 }
             }
@@ -4047,12 +4009,140 @@ private fun MobileSessionContent(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun MobileSessionTab(
+    session: SessionSummary,
+    selected: Boolean,
+    label: String,
+    onClick: () -> Unit,
+    onClose: () -> Unit,
+    onDestructiveAction: () -> Unit,
+) {
+    var actionMenuExpanded by remember(session.id) { mutableStateOf(false) }
+    val destructiveAction = sessionDestructiveAction(session.online)
+    val destructiveActionLabel = destructiveAction.localizedActionLabel()
+    Box(
+        modifier = Modifier
+            .widthIn(min = 140.dp, max = 260.dp)
+            .testTag(mobileSessionTabTestTag(session.id)),
+    ) {
+        Surface(
+            modifier = Modifier.height(32.dp),
+            shape = RoundedCornerShape(8.dp),
+            color = if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
+            contentColor = if (selected) {
+                MaterialTheme.colorScheme.onSecondaryContainer
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .height(32.dp)
+                        .widthIn(min = 108.dp, max = 228.dp)
+                        .combinedClickable(
+                            onClick = onClick,
+                            onLongClick = { actionMenuExpanded = true },
+                            onLongClickLabel = destructiveActionLabel,
+                        )
+                        .padding(start = 10.dp, end = 4.dp),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.labelLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.MiddleEllipsis,
+                    )
+                }
+                IconButton(
+                    onClick = onClose,
+                    modifier = Modifier
+                        .size(32.dp)
+                        .testTag(mobileSessionCloseTestTag(session.id)),
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Close,
+                        contentDescription = stringResource(R.string.action_close_session_tab),
+                        modifier = Modifier.size(17.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+        SessionDestructiveActionMenu(
+            expanded = actionMenuExpanded,
+            action = destructiveAction,
+            onDismissRequest = { actionMenuExpanded = false },
+            onAction = {
+                actionMenuExpanded = false
+                onDestructiveAction()
+            },
+            modifier = Modifier.testTag(mobileSessionActionTestTag(session.id)),
+        )
+    }
+}
+
+@Composable
+private fun SessionDestructiveAction.localizedActionLabel(): String = when (this) {
+    SessionDestructiveAction.TERMINATE_ONLINE -> stringResource(R.string.action_terminate_session)
+    SessionDestructiveAction.DELETE_OFFLINE_RECORD -> stringResource(R.string.action_delete_session)
+}
+
+private fun SessionDestructiveAction.icon(): ImageVector = when (this) {
+    SessionDestructiveAction.TERMINATE_ONLINE -> Icons.Filled.Stop
+    SessionDestructiveAction.DELETE_OFFLINE_RECORD -> Icons.Filled.DeleteForever
+}
+
+@Composable
+private fun SessionDestructiveActionMenu(
+    expanded: Boolean,
+    action: SessionDestructiveAction,
+    onDismissRequest: () -> Unit,
+    onAction: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    DropdownMenu(
+        expanded = expanded,
+        onDismissRequest = onDismissRequest,
+        modifier = modifier,
+    ) {
+        DropdownMenuItem(
+            text = {
+                Text(
+                    action.localizedActionLabel(),
+                    color = MaterialTheme.colorScheme.error,
+                )
+            },
+            leadingIcon = {
+                Icon(
+                    imageVector = action.icon(),
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error,
+                )
+            },
+            onClick = onAction,
+        )
+    }
+}
+
 internal const val MOBILE_SESSION_SWIPE_ENABLED = false
 internal const val MOBILE_SESSION_SELECTOR_TEST_TAG = "mobile-session-selector"
 internal const val ANDROID_VIEW_DRIVEN_TERMINAL_RESIZE_ENABLED = false
 
+internal fun mobileSessionTabTestTag(sessionId: java.util.UUID): String =
+    "mobile-session-tab:$sessionId"
+
 internal fun mobileSessionCloseTestTag(sessionId: java.util.UUID): String =
     "mobile-session-close:$sessionId"
+
+internal fun mobileSessionActionTestTag(sessionId: java.util.UUID): String =
+    "mobile-session-action:$sessionId"
 
 /**
  * A wide session layout is useful only while it leaves enough vertical space
@@ -4108,6 +4198,7 @@ private fun SessionList(
     selectedId: java.util.UUID,
     onSessionSelected: (java.util.UUID) -> Unit,
     onCloseSessionTab: (java.util.UUID) -> Unit,
+    onDestructiveActionRequested: (SessionSummary) -> Unit,
     pcLabel: (SessionSummary) -> String,
     modifier: Modifier,
 ) {
@@ -4130,12 +4221,14 @@ private fun SessionList(
                     pcLabel = pcLabel(session),
                     onClick = { onSessionSelected(session.id) },
                     onClose = { onCloseSessionTab(session.id) },
+                    onDestructiveAction = { onDestructiveActionRequested(session) },
                 )
             }
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SessionListRow(
     session: SessionSummary,
@@ -4144,45 +4237,76 @@ private fun SessionListRow(
     pcLabel: String,
     onClick: () -> Unit,
     onClose: () -> Unit,
+    onDestructiveAction: () -> Unit,
 ) {
+    var actionMenuExpanded by remember(session.id) { mutableStateOf(false) }
+    val destructiveAction = sessionDestructiveAction(session.online)
+    val destructiveActionLabel = destructiveAction.localizedActionLabel()
     val stateColor = when (session.state) {
         SessionState.RUNNING -> MaterialTheme.colorScheme.secondary
         SessionState.INTERRUPTED -> MaterialTheme.colorScheme.tertiary
         SessionState.EXITED -> MaterialTheme.colorScheme.onSurfaceVariant
     }
-    Row(
+    Box(
         modifier = Modifier
             .fillMaxWidth()
-            .background(if (selected) MaterialTheme.colorScheme.surfaceVariant else Color.Transparent)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 14.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.Top,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
+            .background(if (selected) MaterialTheme.colorScheme.surfaceVariant else Color.Transparent),
     ) {
-        Icon(Icons.Filled.Terminal, contentDescription = stringResource(R.string.terminal_session_accessibility), tint = stateColor)
-        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(displayTitle, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(
-                stringResource(
-                    R.string.session_summary,
-                    pcLabel,
-                    session.state.localizedLabel(),
-                    session.columns,
-                    session.rows,
-                ),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        IconButton(
-            onClick = onClose,
-            modifier = Modifier.size(36.dp),
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(end = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(
-                Icons.Filled.Close,
-                contentDescription = stringResource(R.string.action_close_session_tab),
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.size(18.dp),
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .combinedClickable(
+                        onClick = onClick,
+                        onLongClick = { actionMenuExpanded = true },
+                        onLongClickLabel = destructiveActionLabel,
+                    )
+                    .padding(start = 14.dp, top = 12.dp, bottom = 12.dp),
+                verticalAlignment = Alignment.Top,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Icon(Icons.Filled.Terminal, contentDescription = stringResource(R.string.terminal_session_accessibility), tint = stateColor)
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(displayTitle, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        stringResource(
+                            R.string.session_summary,
+                            pcLabel,
+                            session.state.localizedLabel(),
+                            session.columns,
+                            session.rows,
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            IconButton(
+                onClick = onClose,
+                modifier = Modifier.size(36.dp),
+            ) {
+                Icon(
+                    Icons.Filled.Close,
+                    contentDescription = stringResource(R.string.action_close_session_tab),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
+        Box(modifier = Modifier.align(Alignment.TopEnd)) {
+            SessionDestructiveActionMenu(
+                expanded = actionMenuExpanded,
+                action = destructiveAction,
+                onDismissRequest = { actionMenuExpanded = false },
+                onAction = {
+                    actionMenuExpanded = false
+                    onDestructiveAction()
+                },
             )
         }
     }

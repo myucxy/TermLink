@@ -122,14 +122,14 @@ class ProductUiLogicTest {
     }
 
     @Test
-    fun onlineCloseAndOfflineRecordDeletionAreDistinctActions() {
+    fun onlineTerminationAndOfflineRecordDeletionAreDistinctActions() {
         assertEquals(
-            DeviceSessionDestructiveAction.CLOSE_ONLINE,
-            deviceSessionDestructiveAction(sessionOnline = true),
+            SessionDestructiveAction.TERMINATE_ONLINE,
+            sessionDestructiveAction(sessionOnline = true),
         )
         assertEquals(
-            DeviceSessionDestructiveAction.DELETE_OFFLINE_RECORD,
-            deviceSessionDestructiveAction(sessionOnline = false),
+            SessionDestructiveAction.DELETE_OFFLINE_RECORD,
+            sessionDestructiveAction(sessionOnline = false),
         )
     }
 
@@ -240,7 +240,9 @@ class ProductUiLogicTest {
 
         assertEquals(1, mobileSessionSelectionIndex(listOf(first, selected, third), selected.id))
         assertEquals(0, mobileSessionSelectionIndex(listOf(selected, third, first), selected.id))
+        assertEquals("mobile-session-tab:${selected.id}", mobileSessionTabTestTag(selected.id))
         assertEquals("mobile-session-close:${selected.id}", mobileSessionCloseTestTag(selected.id))
+        assertEquals("mobile-session-action:${selected.id}", mobileSessionActionTestTag(selected.id))
     }
 
     @Test

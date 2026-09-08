@@ -259,6 +259,7 @@ internal static class Program
                     .Select(value => value.GetString()).ToHashSet(StringComparer.Ordinal);
                 Require(capabilities.Contains("realtime_terminal_v1") &&
                     capabilities.Contains("file_operations_v1") &&
+                    capabilities.Contains("file_operation_name_filter_v1") &&
                     capabilities.Contains("terminal_commands_v1") &&
                     capabilities.Contains("remote_agent_update_v1"),
                     "PC upsert did not advertise the generic bounded capability set.");

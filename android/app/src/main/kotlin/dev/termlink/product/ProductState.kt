@@ -988,6 +988,7 @@ interface ProductRepository : Closeable {
         pcName: String,
         path: String,
         offset: Long? = null,
+        query: String = "",
     ): Unit = error("Remote file browsing is unavailable")
     /** Starts the server DOWNLOAD operation only after SAF returned [targetUri]. */
     fun startRemoteDownload(selection: RemoteFileDownloadSelection, targetUri: Uri) {
@@ -1045,7 +1046,13 @@ class UnavailableProductRepository : ProductRepository {
     override suspend fun revokeDevice(deviceId: UUID) = unavailable()
     override suspend fun requestControl(sessionId: UUID) = unavailable()
     override suspend fun releaseControl(sessionId: UUID) = unavailable()
-    override suspend fun browseRemoteDirectory(pcId: UUID, pcName: String, path: String, offset: Long?) = unavailable()
+    override suspend fun browseRemoteDirectory(
+        pcId: UUID,
+        pcName: String,
+        path: String,
+        offset: Long?,
+        query: String,
+    ) = unavailable()
     override fun startRemoteDownload(selection: RemoteFileDownloadSelection, targetUri: Uri) = unavailable()
     override suspend fun cancelRemoteDownload(recordId: UUID) = unavailable()
     override fun retryRemoteDownload(recordId: UUID, targetUri: Uri) = unavailable()

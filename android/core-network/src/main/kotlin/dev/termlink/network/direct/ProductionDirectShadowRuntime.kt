@@ -1,5 +1,6 @@
 package dev.termlink.network.direct
 
+import android.annotation.SuppressLint
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -504,6 +505,9 @@ private class AndroidProductionDirectShadowPlatform(
         ThreadPoolExecutor.AbortPolicy(),
     )
 
+    // The application manifest declares ACCESS_NETWORK_STATE. This library is linted
+    // independently, so lint cannot see the consuming app's merged manifest.
+    @SuppressLint("MissingPermission")
     override fun capture(network: Network): CapturedDirectNetwork? {
         if (connectivityManager.activeNetwork != network) return null
         val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return null
@@ -2689,6 +2693,7 @@ class ProductionDirectShadowRuntime internal constructor(
         publishDiagnosticLocked(diagnosticFor(value, attempt))
     }
 
+    @SuppressLint("LogTagMismatch")
     private fun publishDiagnosticLocked(value: ProductionDirectShadowDiagnostic) {
         val changed = mutableDiagnostic.value != value
         mutableDiagnostic.value = value

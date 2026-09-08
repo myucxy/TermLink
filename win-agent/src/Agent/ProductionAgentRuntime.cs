@@ -1277,6 +1277,7 @@ namespace TermLink.Agent
             {
                 "realtime_terminal_v1",
                 "file_operations_v1",
+                "file_operation_name_filter_v1",
                 "terminal_commands_v1",
                 "remote_agent_update_v1",
                 "host_history_v1"

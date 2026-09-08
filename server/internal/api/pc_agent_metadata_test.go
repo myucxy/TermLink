@@ -112,3 +112,17 @@ func TestNormalizePCAgentMetadataRejectsDuplicateCapabilities(t *testing.T) {
 		t.Fatal("duplicate PC capabilities were accepted")
 	}
 }
+
+func TestProjectPCServerCapabilitiesRequiresAgentAndServerSupport(t *testing.T) {
+	items := []store.PCRecord{
+		{Capabilities: []string{store.PCCapabilityFileOperationsV1, store.PCCapabilityFileNameFilterV1}},
+		{Capabilities: []string{store.PCCapabilityFileOperationsV1}},
+	}
+	projectPCServerCapabilities(items)
+	if !store.HasPCCapability(items[0].Capabilities, store.PCCapabilityFileSearchV1) {
+		t.Fatal("server did not expose search for a capable Agent")
+	}
+	if store.HasPCCapability(items[1].Capabilities, store.PCCapabilityFileSearchV1) {
+		t.Fatal("server exposed search for an incapable Agent")
+	}
+}

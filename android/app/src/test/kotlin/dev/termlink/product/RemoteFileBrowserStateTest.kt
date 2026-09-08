@@ -4,6 +4,7 @@ import java.util.UUID
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RemoteFileBrowserStateTest {
@@ -79,6 +80,31 @@ class RemoteFileBrowserStateTest {
     }
 
     @Test
+    fun paginationOnlyAppendsForTheSameSearchQuery() {
+        val pcId = UUID.randomUUID()
+        val firstId = UUID.randomUUID()
+        var state = reduceRemoteFileBrowser(
+            RemoteFileBrowserState(),
+            RemoteFileBrowserEvent.LoadStarted(firstId, pcId, "PC", "C:\\", null, "report"),
+        )
+        state = reduceRemoteFileBrowser(
+            state,
+            RemoteFileBrowserEvent.LoadSucceeded(
+                firstId,
+                RemoteDirectoryPage("C:\\", null, listOf(entry("report-1", "C:\\report-1")), 1L),
+            ),
+        )
+        val differentQueryId = UUID.randomUUID()
+        state = reduceRemoteFileBrowser(
+            state,
+            RemoteFileBrowserEvent.LoadStarted(differentQueryId, pcId, "PC", "C:\\", 1L, "invoice"),
+        )
+
+        assertTrue(state.entries.isEmpty())
+        assertEquals("invoice", state.query)
+    }
+
+    @Test
     fun failedDirectoryNavigationRollsBackToLastSuccessfulPage() {
         val pcId = UUID.randomUUID()
         val firstId = UUID.randomUUID()
@@ -96,7 +122,7 @@ class RemoteFileBrowserStateTest {
         val failedId = UUID.randomUUID()
         state = reduceRemoteFileBrowser(
             state,
-            RemoteFileBrowserEvent.LoadStarted(failedId, pcId, "PC", "C:\\missing", null),
+            RemoteFileBrowserEvent.LoadStarted(failedId, pcId, "PC", "C:\\missing", null, ""),
         )
 
         state = reduceRemoteFileBrowser(
@@ -108,6 +134,48 @@ class RemoteFileBrowserStateTest {
         assertEquals(listOf("C:\\work"), state.entries.map(RemoteFileEntry::path))
         assertEquals("not found", state.error)
         assertFalse(state.loading)
+    }
+
+    @Test
+    fun failedNavigationRestoresThePreviousSearchButFailedSearchDoesNot() {
+        val pcId = UUID.randomUUID()
+        val loadedId = UUID.randomUUID()
+        var state = reduceRemoteFileBrowser(
+            RemoteFileBrowserState(),
+            RemoteFileBrowserEvent.LoadStarted(loadedId, pcId, "PC", "C:\\work", null, "term"),
+        )
+        state = reduceRemoteFileBrowser(
+            state,
+            RemoteFileBrowserEvent.LoadSucceeded(
+                loadedId,
+                RemoteDirectoryPage("C:\\work", "C:\\", listOf(entry("terminal", "C:\\work\\terminal")), null),
+            ),
+        )
+        val navigationId = UUID.randomUUID()
+        state = reduceRemoteFileBrowser(
+            state,
+            RemoteFileBrowserEvent.LoadStarted(navigationId, pcId, "PC", "C:\\missing", null, ""),
+        )
+        state = reduceRemoteFileBrowser(state, RemoteFileBrowserEvent.LoadFailed(navigationId, "missing"))
+        assertEquals("C:\\work", state.currentPath)
+        assertEquals("term", state.query)
+
+        val searchId = UUID.randomUUID()
+        state = reduceRemoteFileBrowser(
+            state,
+            RemoteFileBrowserEvent.LoadStarted(searchId, pcId, "PC", "C:\\work", null, "other"),
+        )
+        state = reduceRemoteFileBrowser(state, RemoteFileBrowserEvent.LoadFailed(searchId, "failed"))
+        assertEquals("other", state.query)
+        assertTrue(state.entries.isEmpty())
+    }
+
+    @Test
+    fun searchQueryBoundsUseUnicodeCodePointsAndUtf8Bytes() {
+        assertTrue(isValidRemoteFileSearchQuery("报告-2026"))
+        assertTrue(isValidRemoteFileSearchQuery("😀".repeat(REMOTE_FILE_SEARCH_MAX_CODE_POINTS)))
+        assertFalse(isValidRemoteFileSearchQuery("😀".repeat(REMOTE_FILE_SEARCH_MAX_CODE_POINTS + 1)))
+        assertFalse(isValidRemoteFileSearchQuery("\u0000"))
     }
 
     @Test

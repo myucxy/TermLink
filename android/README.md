@@ -65,6 +65,13 @@ socket 的 STUN/Probe/QUIC 生命周期和 Relay 热备用均由独立 network-c
 使用标题栏以下、快捷 Dock 以上的全部剩余高度；IME 显示时会收起会话选择条，并由唯一的底部
 Inset 所有者把终端和 Dock 一起移动到输入法上沿，避免遮挡最后一行。
 
+会话标签长按交互参考了固定提交中的
+`app/src/main/java/com/termux/app/terminal/TermuxSessionsListViewController.java`，并核对了
+[`termux/termux-app#5264`](https://github.com/termux/termux-app/pull/5264) 的“长按菜单、终止前确认”
+方案。Termux 的列表单击与长按动作相互独立，这一行为可直接借鉴；其 `finishIfRunning()` 终止
+Android 本地 PTY 的实现不适用于 TermLink。TermLink 长按会话标签后仍复用现有 E2EE 远程终止
+请求、Windows 子进程树清理和主机历史删除流程，而标签右侧 `X` 只关闭 Android 本地标签页。
+
 ## 构建
 
 ```powershell

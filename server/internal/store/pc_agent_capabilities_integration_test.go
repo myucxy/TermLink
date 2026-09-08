@@ -50,7 +50,7 @@ func TestPCAgentPlatformAndFileCapabilityAreServerAuthoritative(t *testing.T) {
 	if err := repository.UpsertPC(ctx, userID, agentID, PCRecord{
 		ID: pcID, Name: "Linux Agent", AgentVersion: "0.3.0.50", KeyEpoch: 1,
 		Platform: PCPlatformLinux, Architecture: PCArchitectureArm64, PlatformVersion: "Ubuntu 24.04",
-		Capabilities: []string{PCCapabilityRealtimeTerminalV1, PCCapabilityFileOperationsV1},
+		Capabilities: []string{PCCapabilityRealtimeTerminalV1, PCCapabilityFileOperationsV1, PCCapabilityFileNameFilterV1},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -66,6 +66,20 @@ func TestPCAgentPlatformAndFileCapabilityAreServerAuthoritative(t *testing.T) {
 		Operation: FileOperationList, Path: "/tmp", ExpiresAt: time.Now().Add(time.Minute),
 	}); err != nil {
 		t.Fatalf("file operation with capability was denied: %v", err)
+	}
+	search, err := repository.CreateFileOperation(ctx, userID, androidID, pcID, FileOperationCreateInput{
+		Operation: FileOperationList, Path: "/tmp", Query: "report", ExpiresAt: time.Now().Add(time.Minute),
+	})
+	if err != nil || search.Query != "report" {
+		t.Fatalf("search operation did not round trip: item=%+v error=%v", search, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE pcs SET capabilities=ARRAY['realtime_terminal_v1','file_operations_v1']::text[] WHERE id=$1`, pcID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateFileOperation(ctx, userID, androidID, pcID, FileOperationCreateInput{
+		Operation: FileOperationList, Path: "/tmp", Query: "report", ExpiresAt: time.Now().Add(time.Minute),
+	}); !errors.Is(err, ErrDenied) {
+		t.Fatalf("search without name-filter capability error=%v, want ErrDenied", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE pcs SET capabilities=ARRAY['realtime_terminal_v1']::text[] WHERE id=$1`, pcID); err != nil {
 		t.Fatal(err)

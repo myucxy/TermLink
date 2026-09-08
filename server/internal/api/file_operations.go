@@ -53,6 +53,7 @@ func (a *API) createFileOperation(w http.ResponseWriter, r *http.Request) {
 		Operation         string  `json:"operation"`
 		Path              string  `json:"path"`
 		Offset            *int64  `json:"offset"`
+		Query             string  `json:"query"`
 		ShellType         *string `json:"shell_type"`
 		TerminalCommandID *string `json:"terminal_command_id"`
 	}
@@ -60,8 +61,8 @@ func (a *API) createFileOperation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err)
 		return
 	}
-	if err := validateFileOperationRequestWithCommand(
-		input.Operation, input.Path, input.Offset, input.ShellType, input.TerminalCommandID); err != nil {
+	if err := validateFileOperationRequestWithSearch(
+		input.Operation, input.Path, input.Offset, input.Query, input.ShellType, input.TerminalCommandID); err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_FILE_OPERATION", err)
 		return
 	}
@@ -75,7 +76,7 @@ func (a *API) createFileOperation(w http.ResponseWriter, r *http.Request) {
 		requestedCommand = input.ShellType
 	}
 	item, err := repository.CreateFileOperation(r.Context(), p.UserID, p.Device.ID, pcID, store.FileOperationCreateInput{
-		Operation: input.Operation, Path: input.Path, Offset: input.Offset, ShellType: requestedCommand,
+		Operation: input.Operation, Path: input.Path, Offset: input.Offset, Query: input.Query, ShellType: requestedCommand,
 		ExpiresAt: a.now().Add(fileOperationLifetime),
 	})
 	if err != nil {
@@ -372,8 +373,21 @@ func validateFileOperationRequestWithCommand(
 	offset *int64,
 	shellType, terminalCommandID *string,
 ) error {
+	return validateFileOperationRequestWithSearch(operation, path, offset, "", shellType, terminalCommandID)
+}
+
+func validateFileOperationRequestWithSearch(
+	operation, path string,
+	offset *int64,
+	query string,
+	shellType, terminalCommandID *string,
+) error {
 	if !utf8.ValidString(path) || len(path) > store.MaxFileOperationPathBytes || strings.ContainsRune(path, '\x00') {
 		return errors.New("invalid path")
+	}
+	if !utf8.ValidString(query) || len(query) > store.MaxFileOperationQueryBytes ||
+		utf8.RuneCountInString(query) > 128 || strings.ContainsRune(query, '\x00') {
+		return errors.New("invalid query")
 	}
 	switch operation {
 	case store.FileOperationList:
@@ -381,7 +395,7 @@ func validateFileOperationRequestWithCommand(
 			return errors.New("invalid LIST parameters")
 		}
 	case store.FileOperationDownload:
-		if path == "" || offset != nil || shellType != nil || terminalCommandID != nil {
+		if path == "" || offset != nil || query != "" || shellType != nil || terminalCommandID != nil {
 			return errors.New("invalid DOWNLOAD parameters")
 		}
 	case store.FileOperationOpenTerminal:
@@ -390,7 +404,7 @@ func validateFileOperationRequestWithCommand(
 				*shellType == "powershell-7" || *shellType == "wsl")
 		standardCommand := shellType == nil && terminalCommandID != nil &&
 			terminalCommandIDPattern.MatchString(*terminalCommandID)
-		if path == "" || offset != nil || (!legacyShell && !standardCommand) {
+		if path == "" || offset != nil || query != "" || (!legacyShell && !standardCommand) {
 			return errors.New("invalid OPEN_TERMINAL parameters")
 		}
 	default:
@@ -444,6 +458,9 @@ func fileOperationView(item store.FileOperationRecord) map[string]any {
 	}
 	if item.Offset != nil {
 		result["offset"] = *item.Offset
+	}
+	if item.Query != "" {
+		result["query"] = item.Query
 	}
 	if item.ShellType != nil {
 		result["shell_type"] = *item.ShellType

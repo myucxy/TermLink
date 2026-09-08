@@ -96,6 +96,8 @@ namespace TermLink.Agent
     internal sealed class DirectoryListingService
     {
         internal const int MaximumPageSize = 500;
+        internal const int MaximumQueryBytes = 512;
+        internal const int MaximumQueryCodePoints = 128;
         // The server accepts at most 1 MiB for the LIST result itself. Keep a
         // meaningful envelope below that boundary so completion framing and
         // future small contract additions cannot turn a valid page into a 400.
@@ -120,16 +122,17 @@ namespace TermLink.Agent
             this.rootProvider = rootProvider ?? throw new ArgumentNullException(nameof(rootProvider));
         }
 
-        internal DirectoryListingResult List(string path, long offset)
+        internal DirectoryListingResult List(string path, long offset, string query = null)
         {
             if (offset < 0)
                 throw new FileOperationException("OFFSET_INVALID", "The directory offset cannot be negative.");
+            var normalizedQuery = NormalizeQuery(query);
             return string.IsNullOrWhiteSpace(path)
-                ? ListRoots(offset)
-                : ListDirectory(paths.NormalizeExistingDirectory(path), offset);
+                ? ListRoots(offset, normalizedQuery)
+                : ListDirectory(paths.NormalizeExistingDirectory(path), offset, normalizedQuery);
         }
 
-        private DirectoryListingResult ListRoots(long offset)
+        private DirectoryListingResult ListRoots(long offset, string query)
         {
             IEnumerable<FileOperationEntry> roots;
             try
@@ -148,6 +151,7 @@ namespace TermLink.Agent
                         ModifiedAt = null,
                         Attributes = Array.Empty<string>()
                     })
+                    .Where(entry => MatchesQuery(entry.Name, query))
                     .ToArray();
             }
             catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
@@ -157,13 +161,14 @@ namespace TermLink.Agent
             return Page(string.Empty, null, roots, offset);
         }
 
-        private DirectoryListingResult ListDirectory(string path, long offset)
+        private DirectoryListingResult ListDirectory(string path, long offset, string query)
         {
             FileOperationEntry[] entries;
             try
             {
                 entries = new DirectoryInfo(path)
                     .EnumerateFileSystemInfos()
+                    .Where(value => MatchesQuery(value.Name, query))
                     .Select(CreateEntry)
                     .OrderBy(entry => entry.Kind == "directory" ? 0 : 1)
                     .ThenBy(entry => entry.Name, StringComparer.InvariantCultureIgnoreCase)
@@ -184,6 +189,20 @@ namespace TermLink.Agent
             }
             return Page(path, ParentOf(path), entries, offset);
         }
+
+        private static string NormalizeQuery(string query)
+        {
+            if (string.IsNullOrEmpty(query)) return string.Empty;
+            if (query.IndexOf('\0') >= 0 || Encoding.UTF8.GetByteCount(query) > MaximumQueryBytes ||
+                query.EnumerateRunes().Count() > MaximumQueryCodePoints)
+            {
+                throw new FileOperationException("QUERY_INVALID", "The directory search query is invalid.");
+            }
+            return query;
+        }
+
+        private static bool MatchesQuery(string name, string query) =>
+            query.Length == 0 || name.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0;
 
         internal static DirectoryListingResult Page(
             string currentPath,

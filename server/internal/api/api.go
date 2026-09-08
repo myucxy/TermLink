@@ -895,7 +895,17 @@ func (a *API) listPCs(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, r, err)
 		return
 	}
+	projectPCServerCapabilities(items)
 	writeJSON(w, 200, map[string]any{"items": items})
+}
+
+func projectPCServerCapabilities(items []store.PCRecord) {
+	for index := range items {
+		if store.HasPCCapability(items[index].Capabilities, store.PCCapabilityFileNameFilterV1) &&
+			!store.HasPCCapability(items[index].Capabilities, store.PCCapabilityFileSearchV1) {
+			items[index].Capabilities = append(items[index].Capabilities, store.PCCapabilityFileSearchV1)
+		}
+	}
 }
 
 func (a *API) resolvePCMachine(w http.ResponseWriter, r *http.Request) {

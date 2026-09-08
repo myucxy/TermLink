@@ -26,6 +26,9 @@ namespace TermLink.Agent
         [JsonPropertyName("offset")]
         public long? Offset { get; set; }
 
+        [JsonPropertyName("query")]
+        public string Query { get; set; }
+
         [JsonPropertyName("shell_type")]
         public string ShellType { get; set; }
 
@@ -758,7 +761,7 @@ namespace TermLink.Agent
                     {
                         case "LIST":
                             result = JsonSerializer.SerializeToElement(
-                                listings.List(operation.Path, operation.Offset.GetValueOrDefault()),
+                                listings.List(operation.Path, operation.Offset.GetValueOrDefault(), operation.Query),
                                 ProductionJsonOptions);
                             break;
                         case "DOWNLOAD":

@@ -10,12 +10,14 @@ data class RemoteFileBrowserState(
     val parentPath: String? = null,
     val entries: List<RemoteFileEntry> = emptyList(),
     val nextOffset: Long? = null,
+    val query: String = "",
     val activeRequestId: UUID? = null,
     val requestOffset: Long? = null,
     val loading: Boolean = false,
     val openingCommandId: String? = null,
     val error: String? = null,
     val rollbackPage: RemoteDirectoryPage? = null,
+    val rollbackQuery: String? = null,
 )
 
 /** A drive root has no Windows parent, so its parent in the Android browser is the drive list. */
@@ -29,6 +31,7 @@ internal sealed interface RemoteFileBrowserEvent {
         val pcName: String,
         val path: String,
         val offset: Long?,
+        val query: String = "",
     ) : RemoteFileBrowserEvent
 
     data class LoadSucceeded(
@@ -51,8 +54,9 @@ internal fun reduceRemoteFileBrowser(
     event: RemoteFileBrowserEvent,
 ): RemoteFileBrowserState = when (event) {
     is RemoteFileBrowserEvent.LoadStarted -> {
-        val appending = event.offset != null && state.pcId == event.pcId && state.currentPath == event.path
-        val rollbackPage = if (!appending && state.pcId == event.pcId &&
+        val appending = event.offset != null && state.pcId == event.pcId &&
+            state.currentPath == event.path && state.query == event.query
+        val rollbackPage = if (!appending && state.pcId == event.pcId && state.currentPath != event.path &&
             (state.currentPath.isNotBlank() || state.entries.isNotEmpty() || state.parentPath != null)
         ) {
             RemoteDirectoryPage(state.currentPath, state.parentPath, state.entries, state.nextOffset)
@@ -66,11 +70,13 @@ internal fun reduceRemoteFileBrowser(
             parentPath = if (appending) state.parentPath else null,
             entries = if (appending) state.entries else emptyList(),
             nextOffset = if (appending) state.nextOffset else null,
+            query = event.query,
             activeRequestId = event.requestId,
             requestOffset = event.offset,
             loading = true,
             error = null,
             rollbackPage = rollbackPage,
+            rollbackQuery = rollbackPage?.let { state.query },
         )
     }
     is RemoteFileBrowserEvent.LoadSucceeded -> {
@@ -94,6 +100,7 @@ internal fun reduceRemoteFileBrowser(
                 loading = false,
                 error = null,
                 rollbackPage = null,
+                rollbackQuery = null,
             )
         }
     }
@@ -107,11 +114,13 @@ internal fun reduceRemoteFileBrowser(
                 parentPath = rollback?.parentPath ?: state.parentPath,
                 entries = rollback?.entries ?: state.entries,
                 nextOffset = rollback?.nextOffset ?: state.nextOffset,
+                query = if (rollback != null) state.rollbackQuery.orEmpty() else state.query,
                 activeRequestId = null,
                 requestOffset = null,
                 loading = false,
                 error = event.message,
                 rollbackPage = null,
+                rollbackQuery = null,
             )
         }
     }
@@ -119,3 +128,11 @@ internal fun reduceRemoteFileBrowser(
     RemoteFileBrowserEvent.ShellFinished -> state.copy(openingCommandId = null)
     is RemoteFileBrowserEvent.ShellFailed -> state.copy(openingCommandId = null, error = event.message)
 }
+
+internal const val REMOTE_FILE_SEARCH_MAX_CODE_POINTS = 128
+internal const val REMOTE_FILE_SEARCH_MAX_BYTES = 512
+
+internal fun isValidRemoteFileSearchQuery(value: String): Boolean =
+    '\u0000' !in value &&
+        value.encodeToByteArray().size <= REMOTE_FILE_SEARCH_MAX_BYTES &&
+        value.codePointCount(0, value.length) <= REMOTE_FILE_SEARCH_MAX_CODE_POINTS

@@ -2756,17 +2756,25 @@ internal class ProductionProductRepository(
         pcName: String,
         path: String,
         offset: Long?,
+        query: String,
     ) {
         require(path.encodeToByteArray().size <= REMOTE_FILE_PATH_MAX_BYTES && '\u0000' !in path) {
             "The Windows path is invalid"
         }
         require(offset == null || offset >= 0L) { "The directory offset is invalid" }
+        require(isValidRemoteFileSearchQuery(query)) { "The directory search query is invalid" }
+        if (offset != null) {
+            val current = mutableSnapshot.value.remoteFileBrowser
+            require(current.pcId == pcId && current.currentPath == path && current.query == query &&
+                current.nextOffset == offset
+            ) { "The directory continuation does not match the active search" }
+        }
         val requestId = UUID.randomUUID()
         mutableSnapshot.update { current ->
             current.copy(
                 remoteFileBrowser = reduceRemoteFileBrowser(
                     current.remoteFileBrowser,
-                    RemoteFileBrowserEvent.LoadStarted(requestId, pcId, pcName, path, offset),
+                    RemoteFileBrowserEvent.LoadStarted(requestId, pcId, pcName, path, offset, query),
                 ),
             )
         }
@@ -2776,6 +2784,7 @@ internal class ProductionProductRepository(
                 operation = REMOTE_FILE_OPERATION_LIST,
                 path = path,
                 offset = offset,
+                query = query,
             )
             val completed = awaitRemoteFileOperation(pcId, operation)
             val page = completed.result?.toRemoteDirectoryPage()
@@ -3273,6 +3282,7 @@ internal class ProductionProductRepository(
         operation: String,
         path: String,
         offset: Long? = null,
+        query: String = "",
         terminalCommand: TerminalCommandCapability? = null,
         onCreated: (RemoteFileOperationResponse) -> Unit = {},
         httpClient: OkHttpClient = http,
@@ -3289,6 +3299,7 @@ internal class ProductionProductRepository(
                     put("operation", operation)
                     put("path", path)
                     offset?.let { put("offset", it) }
+                    if (query.isNotEmpty()) put("query", query)
                     terminalCommand?.let { command ->
                         if (command.source == "legacy") put("shell_type", command.id)
                         else put("terminal_command_id", command.id)

@@ -76,7 +76,7 @@
     <string name="failure_identity_rejected">The identity service rejected this login request.</string>
     <string name="failure_server_http">The server request failed (HTTP %1$d).</string>
     <string name="failure_session_active">This session is active. Refresh the device list and try again after the PC is offline.</string>
-    <string name="failure_session_close_request">The online session could not be closed. Check the connection and try again.</string>
+    <string name="failure_session_terminate_request">The session could not be terminated. Check the connection and try again.</string>
     <string name="failure_server_request">The server request failed. Check the HTTPS endpoint and try again.</string>
     <string name="enrollment_confirm_title">Trust this phone?</string>
     <string name="enrollment_confirm_copy">This first login registered this phone as pending. Confirming trusts only this phone; it does not grant PC VIEW, CONTROL, or MANAGE permission. You can cancel and confirm later.</string>
@@ -121,9 +121,9 @@
     <string name="action_release">Release</string>
     <string name="action_paste">Paste</string>
     <string name="action_delete_session">Delete offline session</string>
-    <string name="action_close_session">Close online session</string>
+    <string name="action_terminate_session">Terminate session</string>
     <string name="action_close_session_tab">Close local tab</string>
-    <string name="session_close_request_sent">The Windows session was closed and removed.</string>
+    <string name="session_terminate_request_sent">The Windows session was terminated and its record was removed.</string>
     <string name="action_replay_output">Replay output</string>
     <string name="snapshot_replay_unavailable">Snapshot recovery metadata is available; replay controls are not supported for this object.</string>
     <string name="status_waiting_manager">Waiting for an existing trusted manager</string>
@@ -392,12 +392,12 @@
     <string name="confirm_sign_out_copy">This clears the local session and closes active remote connections. Windows shells keep running.</string>
     <string name="confirm_delete_session_title">Permanently delete this session?</string>
     <string name="confirm_delete_session_copy">TermLink deletes this session’s local history from the online Windows PC only after the host confirms the request, then removes the server record and Android cache. This cannot be undone.</string>
-    <string name="confirm_close_session_title">Close this online session?</string>
-    <string name="confirm_close_session_copy">This sends an encrypted close request to the Windows PC. Its command line, child process tree, TermLink Terminal tab, and saved session record will all be closed or removed.</string>
+    <string name="confirm_terminate_session_title">Terminate this session?</string>
+    <string name="confirm_terminate_session_copy">This sends an encrypted termination request to the Windows PC. Its command line, child process tree, TermLink terminal tab, and saved session record will all be terminated or removed.</string>
     <string name="confirm_change_server">Change server</string>
     <string name="confirm_sign_out">Sign out</string>
     <string name="confirm_delete_session">Delete permanently</string>
-    <string name="confirm_close_session">Close session</string>
+    <string name="confirm_terminate_session">Terminate session</string>
     <string name="confirm_revoke">Revoke</string>
     <string name="confirm_reject">Reject</string>
     <string name="paste_dialog_title">Send a command to the remote terminal?</string>
@@ -452,6 +452,10 @@
     <string name="remote_files_parent">Parent</string>
     <string name="remote_files_loading">Loading Windows directory…</string>
     <string name="remote_files_empty">This directory is empty.</string>
+    <string name="remote_files_search_hint">Search this directory</string>
+    <string name="remote_files_search_action">Search</string>
+    <string name="remote_files_search_clear">Clear search</string>
+    <string name="remote_files_no_matches">No matching files or folders.</string>
     <string name="remote_files_load_more">Load more</string>
     <string name="remote_favorites_title">Favorite directories</string>
     <string name="remote_favorites_empty">No favorite directories yet.</string>

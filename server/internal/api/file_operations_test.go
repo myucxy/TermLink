@@ -57,6 +57,29 @@ func TestValidateFileOperationRequestShapes(t *testing.T) {
 	}
 }
 
+func TestValidateFileOperationSearchQuery(t *testing.T) {
+	if err := validateFileOperationRequestWithSearch(
+		store.FileOperationList, `C:\`, nil, "报告", nil, nil); err != nil {
+		t.Fatalf("valid directory search rejected: %v", err)
+	}
+	for name, query := range map[string]string{
+		"nul":       "bad\x00query",
+		"too-many":  strings.Repeat("q", 129),
+		"too-large": strings.Repeat("界", 171),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateFileOperationRequestWithSearch(
+				store.FileOperationList, `C:\`, nil, query, nil, nil); err == nil {
+				t.Fatal("invalid directory search query was accepted")
+			}
+		})
+	}
+	if err := validateFileOperationRequestWithSearch(
+		store.FileOperationDownload, `C:\file.txt`, nil, "file", nil, nil); err == nil {
+		t.Fatal("DOWNLOAD accepted a directory search query")
+	}
+}
+
 func TestFileOperationLeaseRequiresCanonical32ByteBase64URLToken(t *testing.T) {
 	token := make([]byte, 32)
 	for index := range token {
@@ -211,6 +234,14 @@ func TestFileOperationHandlersEnforceRolesAndNeverExposeObjectKey(t *testing.T) 
 	androidAuth.Authenticate(http.HandlerFunc(service.createFileOperation)).ServeHTTP(createResponse, create)
 	if createResponse.Code != http.StatusCreated || repository.createInput.Operation != store.FileOperationDownload {
 		t.Fatalf("create status=%d body=%s input=%+v", createResponse.Code, createResponse.Body.String(), repository.createInput)
+	}
+	searchBody := []byte(`{"operation":"LIST","path":"C:\\folder","query":"report"}`)
+	search := signedFileOperationRequest(t, androidKey, androidID, now, http.MethodPost, "/v1/pcs/"+pcID.String()+"/file-operations", searchBody)
+	search.SetPathValue("pcId", pcID.String())
+	searchResponse := httptest.NewRecorder()
+	androidAuth.Authenticate(http.HandlerFunc(service.createFileOperation)).ServeHTTP(searchResponse, search)
+	if searchResponse.Code != http.StatusCreated || repository.createInput.Query != "report" {
+		t.Fatalf("search create status=%d body=%s input=%+v", searchResponse.Code, searchResponse.Body.String(), repository.createInput)
 	}
 
 	wrongRole := signedFileOperationRequest(t, androidKey, androidID, now, http.MethodPost, "/v1/pcs/"+pcID.String()+"/file-operations/claim", nil)

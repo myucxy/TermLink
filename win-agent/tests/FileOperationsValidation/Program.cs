@@ -107,14 +107,21 @@ static Task ValidatePathsAndListingsAsync(string testRoot)
         "directory listing was not sorted directories-first with invariant case-insensitive names");
     Require(listing.Entries.Where(entry => entry.Kind == "file").All(entry => entry.SizeBytes.HasValue),
         "file listing omitted file size");
+    var filtered = new DirectoryListingService(paths, () => Array.Empty<string>()).List(listingRoot, 0, "B-");
+    Require(filtered.Entries.Select(entry => entry.Name).SequenceEqual(new[] { "b-dir", "B-file.txt" }),
+        "directory search did not match file and directory names case-insensitively");
+    RequireFileOperationCode(
+        () => new DirectoryListingService(paths, () => Array.Empty<string>()).List(
+            listingRoot, 0, new string('q', DirectoryListingService.MaximumQueryCodePoints + 1)),
+        "QUERY_INVALID");
 
     var pageRoot = Path.Combine(testRoot, "paging");
     Directory.CreateDirectory(pageRoot);
     for (var index = 0; index < 502; index++)
         File.WriteAllBytes(Path.Combine(pageRoot, "item-" + index.ToString("D3") + ".bin"), new byte[] { 1 });
     var pageService = new DirectoryListingService(paths, () => Array.Empty<string>());
-    var firstPage = pageService.List(pageRoot, 0);
-    var secondPage = pageService.List(pageRoot, firstPage.NextOffset!.Value);
+    var firstPage = pageService.List(pageRoot, 0, "ITEM-");
+    var secondPage = pageService.List(pageRoot, firstPage.NextOffset!.Value, "item-");
     Require(firstPage.Entries.Count == 500 && firstPage.NextOffset == 500,
         "directory first page did not enforce the 500-entry limit");
     Require(secondPage.Entries.Count == 2 && secondPage.NextOffset == null,

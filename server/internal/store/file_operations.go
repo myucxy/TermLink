@@ -28,6 +28,7 @@ const (
 	FileTransferRealtimeV2  = "REALTIME_V2"
 
 	MaxFileOperationPathBytes   = 4096
+	MaxFileOperationQueryBytes  = 512
 	MaxFileOperationResultBytes = 1 << 20
 	// MaxRetainedFileOperationsPerAccount bounds transient plaintext paths and
 	// LIST results even if a client produces work faster than cleanup runs.
@@ -41,6 +42,7 @@ type FileOperationCreateInput struct {
 	Operation string
 	Path      string
 	Offset    *int64
+	Query     string
 	ShellType *string
 	ExpiresAt time.Time
 }
@@ -71,6 +73,7 @@ type FileOperationRecord struct {
 	Operation         string          `json:"operation"`
 	Path              string          `json:"path"`
 	Offset            *int64          `json:"offset,omitempty"`
+	Query             string          `json:"query,omitempty"`
 	ShellType         *string         `json:"shell_type,omitempty"`
 	Status            string          `json:"status"`
 	AttemptCount      int             `json:"attempt_count"`
@@ -91,13 +94,13 @@ type FileOperationRecord struct {
 }
 
 const fileOperationColumns = `
-	id,account_id,pc_id,requester_device_id,operation,path,list_offset,shell_type,status,
+	id,account_id,pc_id,requester_device_id,operation,path,list_offset,list_query,shell_type,status,
 	attempt_count,lease_token_hash,lease_expires_at,result,error_message,filename,
 	size_bytes,sha256,directory_zip,transfer_protocol,expires_at,completed_at,cancelled_at,created_at,updated_at`
 
 const fileOperationReturningColumns = `
 	operation.id,operation.account_id,operation.pc_id,operation.requester_device_id,operation.operation,
-	operation.path,operation.list_offset,operation.shell_type,operation.status,operation.attempt_count,
+	operation.path,operation.list_offset,operation.list_query,operation.shell_type,operation.status,operation.attempt_count,
 	operation.lease_token_hash,operation.lease_expires_at,operation.result,operation.error_message,
 	operation.filename,operation.size_bytes,operation.sha256,operation.directory_zip,operation.transfer_protocol,
 	operation.expires_at,operation.completed_at,operation.cancelled_at,operation.created_at,operation.updated_at`
@@ -109,7 +112,7 @@ type rowScanner interface {
 func scanFileOperation(row rowScanner) (FileOperationRecord, error) {
 	var item FileOperationRecord
 	err := row.Scan(&item.ID, &item.AccountID, &item.PCID, &item.RequesterDeviceID, &item.Operation,
-		&item.Path, &item.Offset, &item.ShellType, &item.Status, &item.AttemptCount,
+		&item.Path, &item.Offset, &item.Query, &item.ShellType, &item.Status, &item.AttemptCount,
 		&item.LeaseTokenHash, &item.LeaseExpiresAt, &item.Result, &item.ErrorMessage,
 		&item.Filename, &item.SizeBytes, &item.SHA256, &item.DirectoryZIP, &item.TransferProtocol, &item.ExpiresAt,
 		&item.CompletedAt, &item.CancelledAt, &item.CreatedAt, &item.UpdatedAt)
@@ -141,21 +144,22 @@ func (s *Postgres) CreateFileOperation(ctx context.Context, userID, requesterID,
 	}
 	itemID := uuid.New()
 	row := tx.QueryRow(ctx, `
-		INSERT INTO pc_file_operations(id,account_id,pc_id,requester_device_id,operation,path,list_offset,shell_type,expires_at)
-		SELECT $1,$2,p.id,$3,$4,$5,$6,$7,$8
+		INSERT INTO pc_file_operations(id,account_id,pc_id,requester_device_id,operation,path,list_offset,list_query,shell_type,expires_at)
+		SELECT $1,$2,p.id,$3,$4,$5,$6,$7,$8,$9
 		FROM pcs p
 		JOIN devices requester ON requester.id=$3 AND requester.user_id=$2
 			AND requester.device_type='ANDROID' AND requester.trust_state='TRUSTED'
 		JOIN devices agent ON agent.id=p.device_id AND agent.user_id=$2
 			AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
-		WHERE p.id=$9 AND p.owner_user_id=$2
+		WHERE p.id=$10 AND p.owner_user_id=$2
 		  AND 'file_operations_v1'=ANY(p.capabilities)
-		  AND ($4<>'OPEN_TERMINAL' OR ('terminal_commands_v1'=ANY(p.capabilities) AND ($7=ANY(p.supported_shells) OR EXISTS (
+		  AND ($7='' OR 'file_operation_name_filter_v1'=ANY(p.capabilities))
+		  AND ($4<>'OPEN_TERMINAL' OR ('terminal_commands_v1'=ANY(p.capabilities) AND ($8=ANY(p.supported_shells) OR EXISTS (
 			SELECT 1 FROM jsonb_array_elements(p.terminal_commands) command
-			WHERE command->>'id'=$7
+			WHERE command->>'id'=$8
 		  ))))
 		RETURNING `+fileOperationColumns,
-		itemID, userID, requesterID, input.Operation, input.Path, input.Offset, input.ShellType, input.ExpiresAt, pcID)
+		itemID, userID, requesterID, input.Operation, input.Path, input.Offset, input.Query, input.ShellType, input.ExpiresAt, pcID)
 	item, err := scanFileOperation(row)
 	if errors.Is(err, ErrNotFound) {
 		return FileOperationRecord{}, ErrDenied
@@ -289,7 +293,8 @@ func (s *Postgres) ClaimFileOperation(ctx context.Context, userID, agentDeviceID
 
 	row := tx.QueryRow(ctx, `
 		WITH authority AS (
-			SELECT 1 FROM pcs p JOIN devices agent ON agent.id=p.device_id
+			SELECT 'file_operation_name_filter_v1'=ANY(p.capabilities) AS search_capable
+			FROM pcs p JOIN devices agent ON agent.id=p.device_id
 			WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3
 			  AND 'file_operations_v1'=ANY(p.capabilities)
 			  AND agent.user_id=$2 AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
@@ -297,6 +302,7 @@ func (s *Postgres) ClaimFileOperation(ctx context.Context, userID, agentDeviceID
 			SELECT operation.id
 			FROM pc_file_operations operation, authority
 			WHERE operation.pc_id=$1 AND operation.account_id=$2 AND operation.expires_at>now()
+			  AND (operation.list_query='' OR authority.search_capable)
 			  AND (operation.status='PENDING'
 			       OR (operation.status='PROCESSING' AND operation.lease_expires_at<=now()))
 			ORDER BY operation.created_at,operation.id
