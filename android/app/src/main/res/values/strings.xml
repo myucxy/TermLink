@@ -84,6 +84,7 @@
     <string name="server_dialog_title">Server</string>
     <string name="server_url_label">HTTPS URL</string>
     <string name="server_url_hint">https://termlink.example.com</string>
+    <string name="server_applying">Applying server</string>
     <string name="action_save">Save</string>
     <string name="action_cancel">Cancel</string>
     <string name="action_close">Close</string>
@@ -116,6 +117,7 @@
     <string name="action_revoke_trust">Revoke trust</string>
     <string name="action_sign_in">Sign in</string>
     <string name="action_sign_out">Sign out</string>
+    <string name="action_edit_server">Edit server address</string>
     <string name="action_configure_server">Configure server</string>
     <string name="action_request_control">Request control</string>
     <string name="action_release">Release</string>
@@ -190,6 +192,10 @@
     <string name="session_detail_summary">%1$s · %2$s · %3$d × %4$d</string>
     <string name="session_pc_name">PC: %1$s</string>
     <string name="session_name">Session: %1$s</string>
+    <string name="carrier_relay">服务器中转 / Relay</string>
+    <string name="carrier_negotiating_direct">服务器中转（正在协商直连） / Relay (negotiating direct)</string>
+    <string name="carrier_lan_direct">局域网直连 / LAN direct</string>
+    <string name="carrier_nat_direct">NAT 直连 / NAT direct</string>
     <string name="history_object_summary">%1$s · %2$d bytes</string>
     <string name="entitlement_version_summary">Server entitlement v%1$d · catalog v%2$d</string>
     <string name="entitlement_effective_from">Effective from %1$s</string>

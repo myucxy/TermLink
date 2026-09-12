@@ -57,6 +57,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -74,6 +75,7 @@ import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteForever
@@ -89,11 +91,13 @@ import androidx.compose.material.icons.filled.LaptopWindows
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.Warning
@@ -156,6 +160,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionOnScreen
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
@@ -1330,6 +1335,9 @@ fun ProductApp(
                     password.fill('\u0000')
                     runOperation({ repository.signIn(username, submittedPassword) }, onComplete)
                 },
+                onConfigureServer = { url, onComplete ->
+                    runOperation({ repository.configureServer(url) }, onComplete)
+                },
                 onRegister = { onComplete ->
                     runOperation(repository::beginEmbeddedRegistration, onComplete)
                 },
@@ -1757,6 +1765,7 @@ fun ProductApp(
 private fun ProductSignInPage(
     snapshot: ProductSnapshot,
     onSignIn: (String, CharArray, () -> Unit) -> Unit,
+    onConfigureServer: (String, () -> Unit) -> Unit,
     onRegister: (() -> Unit) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -1764,10 +1773,27 @@ private fun ProductSignInPage(
     var password by remember { mutableStateOf("") }
     var submitting by remember { mutableStateOf(false) }
     var registrationLaunching by remember { mutableStateOf(false) }
+    var serverApplying by remember { mutableStateOf(false) }
+    var serverDialogVisible by remember { mutableStateOf(false) }
+    var serverDraftUrl by remember { mutableStateOf("") }
+    var focusedField by remember { mutableStateOf<String?>(null) }
+    val scrollState = rememberScrollState()
+    val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    val editServerDescription = stringResource(R.string.action_edit_server)
+    var serverUrl by remember(snapshot.serverUrl) {
+        mutableStateOf(snapshot.serverUrl ?: PRODUCT_PUBLIC_SERVER_URL)
+    }
+    LaunchedEffect(focusedField, imeVisible) {
+        if (focusedField != null && imeVisible) {
+            delay(120)
+            scrollState.animateScrollTo(scrollState.maxValue)
+        }
+    }
     Column(
         modifier = modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
+            .windowInsetsPadding(WindowInsets.ime)
+            .verticalScroll(scrollState)
             .padding(horizontal = 20.dp, vertical = 24.dp),
         verticalArrangement = Arrangement.Top,
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -1849,7 +1875,7 @@ private fun ProductSignInPage(
                 Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(stringResource(R.string.sign_in_server_label), style = MaterialTheme.typography.labelMedium)
                     Text(
-                        PRODUCT_PUBLIC_SERVER_URL,
+                        serverUrl,
                         style = MaterialTheme.typography.bodySmall,
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.SemiBold,
@@ -1862,6 +1888,18 @@ private fun ProductSignInPage(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.tertiary,
                 )
+                IconButton(
+                    onClick = {
+                        serverDraftUrl = serverUrl
+                        serverDialogVisible = true
+                    },
+                    enabled = !submitting && !serverApplying,
+                    modifier = Modifier.semantics {
+                        contentDescription = editServerDescription
+                    },
+                ) {
+                    Icon(Icons.Filled.Edit, contentDescription = null)
+                }
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.45f))
 
@@ -1881,7 +1919,9 @@ private fun ProductSignInPage(
                 label = { Text(stringResource(R.string.sign_in_username_label)) },
                 singleLine = true,
                 enabled = !submitting,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onFocusChanged { if (it.isFocused) focusedField = "username" },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
             )
             Spacer(Modifier.height(10.dp))
@@ -1892,7 +1932,9 @@ private fun ProductSignInPage(
                 singleLine = true,
                 enabled = !submitting,
                 visualTransformation = PasswordVisualTransformation(),
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onFocusChanged { if (it.isFocused) focusedField = "password" },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
             )
             Spacer(Modifier.height(12.dp))
@@ -1955,6 +1997,51 @@ private fun ProductSignInPage(
                 }
             }
         }
+    }
+    if (serverDialogVisible) {
+        AlertDialog(
+            onDismissRequest = { if (!serverApplying) serverDialogVisible = false },
+            title = { Text(stringResource(R.string.server_dialog_title)) },
+            text = {
+                OutlinedTextField(
+                    value = serverDraftUrl,
+                    onValueChange = { serverDraftUrl = it },
+                    label = { Text(stringResource(R.string.server_url_label)) },
+                    placeholder = { Text(stringResource(R.string.server_url_hint)) },
+                    singleLine = true,
+                    enabled = !serverApplying,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (serverApplying || serverDraftUrl.isBlank()) return@TextButton
+                        serverApplying = true
+                        onConfigureServer(serverDraftUrl.trim()) {
+                            serverUrl = serverDraftUrl.trim()
+                            serverApplying = false
+                            serverDialogVisible = false
+                        }
+                    },
+                    enabled = !serverApplying && serverDraftUrl.isNotBlank(),
+                ) {
+                    Text(
+                        if (serverApplying) stringResource(R.string.server_applying)
+                        else stringResource(R.string.action_save),
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { serverDialogVisible = false },
+                    enabled = !serverApplying,
+                ) {
+                    Text(stringResource(R.string.action_cancel))
+                }
+            },
+        )
     }
 }
 
@@ -3703,6 +3790,12 @@ private fun PcRow(
 
 internal fun isDeviceSessionActive(sessionOnline: Boolean): Boolean = sessionOnline
 
+/** UI-only projection used by the mobile detail surface; unknown paths stay Relay. */
+internal fun resolvePcCarrierForSession(
+    session: SessionSummary,
+    sessionCarrierStates: Map<java.util.UUID, PcCarrierState>,
+): PcCarrierState = sessionCarrierStates[session.id] ?: PcCarrierState.RELAY
+
 internal fun isSessionTabOpenable(
     session: SessionSummary?,
     pc: PcSummary? = null,
@@ -3868,6 +3961,7 @@ private fun SessionsPage(
                         session = selected,
                         displayTitle = displaySessionTitle(selected, snapshot.sessionTitles[selected.id]),
                         pcLabel = pcLabel(selected),
+                        carrier = snapshot.carrierForSession(selected),
                         sessionOnline = selected.online,
                         onTerminalAction = onTerminalAction,
                         onTerminalCustomShortcut = onTerminalCustomShortcut,
@@ -3902,6 +3996,7 @@ private fun SessionsPage(
                     pcLabel = ::pcLabel,
                     selectedEngine = selectedEngine,
                     sessionStates = snapshot.sessionStates,
+                    sessionCarrierStates = snapshot.sessionCarrierStates,
                     onTerminalAction = onTerminalAction,
                     onTerminalCustomShortcut = onTerminalCustomShortcut,
                     onPasteRequested = onPasteRequested,
@@ -3936,6 +4031,7 @@ private fun MobileSessionContent(
     pcLabel: (SessionSummary) -> String,
     selectedEngine: TerminalViewportEngine?,
     sessionStates: Map<java.util.UUID, RemoteSessionState>,
+    sessionCarrierStates: Map<java.util.UUID, PcCarrierState>,
     onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
     onTerminalCustomShortcut: (java.util.UUID, TerminalCustomShortcut) -> Unit,
     onPasteRequested: (java.util.UUID) -> Unit,
@@ -3986,6 +4082,10 @@ private fun MobileSessionContent(
             session = session,
             displayTitle = displaySessionTitle(session, sessionTitles[session.id]),
             pcLabel = pcLabel(session),
+            carrier = resolvePcCarrierForSession(
+                session = session,
+                sessionCarrierStates = sessionCarrierStates,
+            ),
             sessionOnline = session.online,
             onTerminalAction = onTerminalAction,
             onTerminalCustomShortcut = onTerminalCustomShortcut,
@@ -4318,6 +4418,7 @@ private fun SessionDetail(
     session: SessionSummary,
     displayTitle: String,
     pcLabel: String,
+    carrier: PcCarrierState,
     sessionOnline: Boolean,
     onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
     onTerminalCustomShortcut: (java.util.UUID, TerminalCustomShortcut) -> Unit,
@@ -4345,30 +4446,38 @@ private fun SessionDetail(
             verticalArrangement = Arrangement.Top,
         ) {
             val statusLabel = remoteState.localizedTerminalStatus()
-            Row(
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
             ) {
-                StatusDot(
-                    color = sessionStatusColor(session.state, sessionOnline, remoteState),
-                    contentDescription = statusLabel,
-                )
-                Text(
-                    "$pcLabel · $displayTitle",
-                    modifier = Modifier
-                        .weight(1f)
-                        .basicMarquee(),
-                    style = MaterialTheme.typography.titleSmall,
-                    maxLines = 1,
-                    softWrap = false,
-                )
-                Text(
-                    statusLabel,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    StatusDot(
+                        color = sessionStatusColor(session.state, sessionOnline, remoteState),
+                        contentDescription = statusLabel,
+                    )
+                    Text(
+                        "$pcLabel · $displayTitle",
+                        modifier = Modifier
+                            .weight(1f)
+                            .basicMarquee(),
+                        style = MaterialTheme.typography.titleSmall,
+                        maxLines = 1,
+                        softWrap = false,
+                    )
+                    Text(
+                        statusLabel,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                    )
+                    PcCarrierIcon(carrier = carrier)
+                }
             }
             Box(
                 modifier = Modifier
@@ -4402,6 +4511,32 @@ private fun SessionDetail(
             }
         }
     }
+}
+
+@Composable
+private fun PcCarrierIcon(carrier: PcCarrierState) {
+    val label = stringResource(carrier.labelResource())
+    val (icon, tint) = when (carrier) {
+        PcCarrierState.RELAY -> Icons.Filled.Cloud to MaterialTheme.colorScheme.onSurfaceVariant
+        PcCarrierState.NEGOTIATING_DIRECT -> Icons.Filled.Sync to MaterialTheme.colorScheme.tertiary
+        PcCarrierState.LAN_DIRECT -> Icons.Filled.Wifi to MaterialTheme.colorScheme.secondary
+        PcCarrierState.NAT_DIRECT -> Icons.Filled.Public to MaterialTheme.colorScheme.primary
+    }
+    Icon(
+        imageVector = icon,
+        contentDescription = label,
+        tint = tint,
+        modifier = Modifier
+            .size(18.dp)
+            .semantics { this.contentDescription = label },
+    )
+}
+
+private fun PcCarrierState.labelResource(): Int = when (this) {
+    PcCarrierState.RELAY -> R.string.carrier_relay
+    PcCarrierState.NEGOTIATING_DIRECT -> R.string.carrier_negotiating_direct
+    PcCarrierState.LAN_DIRECT -> R.string.carrier_lan_direct
+    PcCarrierState.NAT_DIRECT -> R.string.carrier_nat_direct
 }
 
 @Composable
@@ -7272,7 +7407,7 @@ private fun AccountPage(
     ) {
         Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SettingRow(Icons.Filled.CheckCircle, stringResource(R.string.account_identity), snapshot.accountLabel ?: stringResource(R.string.account_no_identity))
-            SettingRow(Icons.Filled.Wifi, stringResource(R.string.account_endpoint), PRODUCT_PUBLIC_SERVER_URL)
+            SettingRow(Icons.Filled.Wifi, stringResource(R.string.account_endpoint), snapshot.serverUrl ?: PRODUCT_PUBLIC_SERVER_URL)
             SettingRow(Icons.Filled.Info, stringResource(R.string.account_last_sync), snapshot.lastSyncedAt?.let(::formatInstant) ?: stringResource(R.string.account_not_synced))
             Text(
                 stringResource(R.string.account_access_copy),
