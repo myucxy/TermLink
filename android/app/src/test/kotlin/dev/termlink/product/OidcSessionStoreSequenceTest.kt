@@ -102,6 +102,21 @@ class OidcSessionStoreSequenceTest {
         }
     }
 
+    @Test
+    fun invalidStoredAuthStateIsClearedAndLoadsSignedOut() {
+        val preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+        preferences.edit()
+            .putString("auth_state", "!")
+            .putString("account_scope", "stale")
+            .putString("account_login", "stale-user")
+            .commit()
+
+        assertEquals(null, OidcSessionStore(context).loadAuthState())
+        assertEquals(null, preferences.getString("auth_state", null))
+        assertEquals(null, preferences.getString("account_scope", null))
+        assertEquals(null, preferences.getString("account_login", null))
+    }
+
     private companion object {
         const val PREFERENCES_NAME = "termlink-product-session"
     }

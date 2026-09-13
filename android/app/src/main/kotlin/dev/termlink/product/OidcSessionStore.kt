@@ -110,18 +110,30 @@ internal class OidcSessionStore(context: Context) {
 
     fun loadAuthState(): AuthState? {
         val encoded = preferences.getString(KEY_AUTH_STATE, null) ?: return null
-        val plaintext = AuthStateEnvelope.open(encoded, cipher)
-        val restored = try {
-            AuthState.jsonDeserialize(String(plaintext, Charsets.UTF_8))
-        } finally {
-            plaintext.fill(0)
+        return try {
+            val plaintext = AuthStateEnvelope.open(encoded, cipher)
+            val restored = try {
+                AuthState.jsonDeserialize(String(plaintext, Charsets.UTF_8))
+            } finally {
+                plaintext.fill(0)
+            }
+            // Migrate sessions written by older builds immediately.  Do not wait
+            // for token expiry: an old AuthorizationResponse may still contain an
+            // authorization code and PKCE verifier inside the encrypted envelope.
+            val sanitized = CredentialFreeAuthState.sanitize(restored)
+            saveAuthState(sanitized)
+            sanitized
+        } catch (_: Exception) {
+            // Android Keystore keys are deleted with the app.  A restored or
+            // stale preference can therefore be undecryptable after reinstall;
+            // treat it as a signed-out session instead of crashing at startup.
+            preferences.edit()
+                .remove(KEY_AUTH_STATE)
+                .remove(KEY_ACCOUNT_SCOPE)
+                .remove(KEY_ACCOUNT_LOGIN)
+                .apply()
+            null
         }
-        // Migrate sessions written by older builds immediately.  Do not wait
-        // for token expiry: an old AuthorizationResponse may still contain an
-        // authorization code and PKCE verifier inside the encrypted envelope.
-        val sanitized = CredentialFreeAuthState.sanitize(restored)
-        saveAuthState(sanitized)
-        return sanitized
     }
 
     var accountScope: String?
