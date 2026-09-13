@@ -98,6 +98,10 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private var selectionExtent: CellPoint? = null
     private var selectionActionMode: ActionMode? = null
     private var selectionDragActive = false
+    private var selectionHandleDrag: SelectionHandle? = null
+    private val selectionHandlePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val selectionHandleHitRadius = 24f * density
+    private val selectionHandleRadius = 7f * density
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
     private var touchDownX = 0f
     private var touchDownY = 0f
@@ -118,6 +122,8 @@ internal class NativeTerminalView @JvmOverloads constructor(
     }
     private var appliedFontFamilyHint: String? = null
     private var fontFamilyInitialized = false
+
+    private enum class SelectionHandle { START, END }
 
     private val gestures = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
         override fun onDown(event: MotionEvent): Boolean {
@@ -198,8 +204,9 @@ internal class NativeTerminalView @JvmOverloads constructor(
             if (mouseCaptured || !selectionLongPressEligible || scrollAxis != ScrollAxis.UNDECIDED) return
             dismissSelection()
             val cell = selectableCellAt(event.x, event.y) ?: return
-            selectionAnchor = cell
-            selectionExtent = cell
+            val word = wordSelectionAt(cell)
+            selectionAnchor = word.first
+            selectionExtent = word.second
             selectionDragActive = true
             val mode = startActionMode(selectionCallback, ActionMode.TYPE_FLOATING)
             if (mode == null) {
@@ -419,10 +426,30 @@ internal class NativeTerminalView @JvmOverloads constructor(
             )
         }
         drawCursor(canvas, frame, theme)
+        drawSelectionHandles(canvas, frame, theme)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val owner = engine ?: return false
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            selectionHandleAt(event.x, event.y)?.let { handle ->
+                selectionHandleDrag = handle
+                selectionDragActive = true
+                selectionLongPressEligible = false
+                return true
+            }
+        }
+        selectionHandleDrag?.let { handle ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_MOVE -> updateSelectionHandle(handle, event.x, event.y)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    selectionHandleDrag = null
+                    selectionDragActive = false
+                    selectionLongPressEligible = false
+                }
+            }
+            return true
+        }
         if (event.actionMasked == MotionEvent.ACTION_MOVE && !selectionDragActive) {
             val travel = hypot(event.x - touchDownX, event.y - touchDownY)
             if (travel > touchSlop) {
@@ -920,6 +947,87 @@ internal class NativeTerminalView @JvmOverloads constructor(
         return CellPoint(column, row).takeIf { text.isNotBlank() }
     }
 
+    private fun wordSelectionAt(cell: CellPoint): Pair<CellPoint, CellPoint> {
+        val frame = currentFrame()
+        fun hasText(column: Int): Boolean {
+            val value = frame.rows[cell.row].cells[column]
+            if (value.wideContinuation) return false
+            return frame.graphemes.getOrNull(value.graphemeId - 1)?.text?.isNotBlank() == true
+        }
+
+        var start = cell.column
+        var end = cell.column
+        while (start > 0 && hasText(start - 1)) start--
+        while (end < frame.size.columns - 1 && hasText(end + 1)) end++
+        return CellPoint(start, cell.row) to CellPoint(end, cell.row)
+    }
+
+    private fun selectionHandlePosition(handle: SelectionHandle): Pair<Float, Float>? {
+        val point = when (handle) {
+            SelectionHandle.START -> selectionAnchor
+            SelectionHandle.END -> selectionExtent
+        } ?: return null
+        val x = contentPadding + (if (handle == SelectionHandle.START) point.column else point.column + 1) * cellWidth - viewportX
+        val y = contentPadding + (point.row + 1) * cellHeight - viewportY
+        return x to y
+    }
+
+    private fun selectionHandleAt(x: Float, y: Float): SelectionHandle? {
+        if (!hasSelectionState()) return null
+        val radiusSquared = selectionHandleHitRadius * selectionHandleHitRadius
+        return SelectionHandle.entries
+            .mapNotNull { handle ->
+                val position = selectionHandlePosition(handle) ?: return@mapNotNull null
+                val dx = x - position.first
+                val dy = y - position.second
+                (dx * dx + dy * dy).takeIf { it <= radiusSquared }?.let { handle to it }
+            }
+            .minByOrNull { it.second }
+            ?.first
+    }
+
+    private fun updateSelectionHandle(handle: SelectionHandle, x: Float, y: Float) {
+        val edge = selectionHandleHitRadius * 1.5f
+        val edgeDelta = when {
+            y < edge -> -(edge - y) * 0.45f
+            y > height - edge -> (y - (height - edge)) * 0.45f
+            else -> 0f
+        }
+        if (edgeDelta != 0f) viewportY = (viewportY + edgeDelta).coerceIn(0f, maxViewportY())
+        val point = cellAt(x, y)
+        when (handle) {
+            SelectionHandle.START -> selectionAnchor = point
+            SelectionHandle.END -> selectionExtent = point
+        }
+        postInvalidateOnAnimation()
+    }
+
+    private fun drawSelectionHandles(
+        canvas: Canvas,
+        frame: TerminalRenderFrameV3,
+        theme: TerminalThemeV1,
+    ) {
+        if (!hasSelectionState()) return
+        selectionHandlePaint.color = theme.selectionBackground.value
+        selectionHandlePaint.style = Paint.Style.FILL
+        SelectionHandle.entries.forEach { handle ->
+            val position = selectionHandlePosition(handle) ?: return@forEach
+            val x = position.first
+            val y = position.second
+            if (x < -selectionHandleHitRadius || x > width + selectionHandleHitRadius ||
+                y < -selectionHandleHitRadius || y > height + selectionHandleHitRadius
+            ) return@forEach
+            canvas.drawRect(
+                x - selectionHandleRadius * 0.18f,
+                y - selectionHandleRadius,
+                x + selectionHandleRadius * 0.18f,
+                y + selectionHandleRadius,
+                selectionHandlePaint,
+            )
+            canvas.drawCircle(x, y + selectionHandleRadius, selectionHandleRadius, selectionHandlePaint)
+        }
+    }
+
     private fun mousePosition(x: Float, y: Float) = cellAt(x, y).let { cell ->
         terminalMousePosition(
             column = cell.column,
@@ -993,6 +1101,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
         selectionAnchor = null
         selectionExtent = null
         selectionDragActive = false
+        selectionHandleDrag = null
         invalidate()
     }
 

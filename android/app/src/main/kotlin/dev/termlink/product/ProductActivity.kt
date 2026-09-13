@@ -151,6 +151,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -275,6 +277,20 @@ private val ProductDanger = Color(0xFFFF8C91)
 private val ProductMuted = Color(0xFFAAB5C5)
 private val TerminalDockButtonSize = 30.dp
 private val TerminalDockHorizontalContentPadding = 8.dp
+
+/**
+ * The dock is a measured part of the terminal viewport. Keeping its height
+ * deterministic prevents the Android terminal view from drawing one frame
+ * into the tab/header while IME or one/two-row layout changes are settling.
+ */
+internal fun terminalDockHeight(
+    layout: TerminalShortcutDockLayout,
+    expanded: Boolean,
+): Dp = when {
+    !expanded -> 34.dp
+    layout == TerminalShortcutDockLayout.ONE_ROW -> 34.dp
+    else -> 67.dp
+}
 
 internal enum class HomeGreetingPeriod { MORNING, AFTERNOON, EVENING }
 
@@ -3870,7 +3886,6 @@ private fun SessionsPage(
         readOnlyOpenableSessionIds = readOnlyOpenableSessionIds,
     )
     val density = LocalDensity.current
-    val imeBottomPixels = WindowInsets.ime.getBottom(density)
     val contentBottom = contentBottomPixels
     val contentBottomPadding = with(density) { contentBottom.toDp() }
     Column(
@@ -4012,7 +4027,6 @@ private fun SessionsPage(
                     },
                     terminalPreferences = terminalPreferences,
                     shortcutPreferences = shortcutPreferences,
-                    compactForIme = imeBottomPixels > 0,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -4045,7 +4059,6 @@ private fun MobileSessionContent(
     onRetryOpen: (java.util.UUID) -> Unit,
     terminalPreferences: TerminalDisplayPreferences,
     shortcutPreferences: TerminalShortcutPreferences,
-    compactForIme: Boolean,
     modifier: Modifier,
 ) {
     val session = sessions.firstOrNull { it.id == selectedId } ?: sessions.first()
@@ -4055,27 +4068,26 @@ private fun MobileSessionContent(
         selectorState.animateScrollToItem(selectedIndex)
     }
     Column(modifier = modifier.fillMaxSize()) {
-        if (!compactForIme) {
-            LazyRow(
-                state = selectorState,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(36.dp)
-                    .testTag(MOBILE_SESSION_SELECTOR_TEST_TAG),
-                contentPadding = PaddingValues(horizontal = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                items(sessions, key = { it.id }) { candidate ->
-                    MobileSessionTab(
-                        session = candidate,
-                        selected = candidate.id == session.id,
-                        label = pcLabel(candidate) + " · " + displaySessionTitle(candidate, sessionTitles[candidate.id]),
-                        onClick = { onSessionSelected(candidate.id) },
-                        onClose = { onCloseSessionTab(candidate.id) },
-                        onDestructiveAction = { onDestructiveActionRequested(candidate) },
-                    )
-                }
+        LazyRow(
+            state = selectorState,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(36.dp)
+                .clipToBounds()
+                .testTag(MOBILE_SESSION_SELECTOR_TEST_TAG),
+            contentPadding = PaddingValues(horizontal = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            items(sessions, key = { it.id }) { candidate ->
+                MobileSessionTab(
+                    session = candidate,
+                    selected = candidate.id == session.id,
+                    label = pcLabel(candidate) + " · " + displaySessionTitle(candidate, sessionTitles[candidate.id]),
+                    onClick = { onSessionSelected(candidate.id) },
+                    onClose = { onCloseSessionTab(candidate.id) },
+                    onDestructiveAction = { onDestructiveActionRequested(candidate) },
+                )
             }
         }
         SessionDetail(
@@ -4303,7 +4315,7 @@ private fun SessionList(
     modifier: Modifier,
 ) {
     Surface(
-        modifier = modifier,
+        modifier = modifier.clipToBounds(),
         color = MaterialTheme.colorScheme.surface,
     ) {
         Column {
@@ -5280,12 +5292,14 @@ private fun TerminalSurface(
     var dockExpanded by rememberSaveable(session.id) { mutableStateOf(true) }
     Column(
         modifier = modifier
+            .clipToBounds()
             .background(Color(terminalPreferences.backgroundArgb)),
     ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(1f),
+                .weight(1f)
+                .clipToBounds(),
         ) {
             key(
                 activeEngine,
@@ -5305,6 +5319,7 @@ private fun TerminalSurface(
                     },
                     modifier = Modifier
                         .fillMaxSize()
+                        .clipToBounds()
                         .testTag(terminalTestTag(session.id)),
                 )
             }
@@ -5397,7 +5412,10 @@ private fun TerminalSurface(
             expanded = dockExpanded,
             onExpandedChanged = { dockExpanded = it },
             modifier = Modifier
+                .height(terminalDockHeight(shortcutPreferences.normalized.dockLayout, dockExpanded))
                 .padding(horizontal = 6.dp)
+                .clipToBounds()
+                .zIndex(1f)
                 .onGloballyPositioned { coordinates ->
                     // AndroidView bounds are sampled with getLocationOnScreen;
                     // keep the Compose dock in that same coordinate space so

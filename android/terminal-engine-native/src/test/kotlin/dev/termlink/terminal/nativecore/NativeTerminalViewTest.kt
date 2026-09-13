@@ -253,8 +253,8 @@ class NativeTerminalViewTest {
             view.seedSelectionForTest()
             assertTrue(view.hasSelectionForTest())
 
-            val down = MotionEvent.obtain(0, 0, MotionEvent.ACTION_DOWN, 16f, 16f, 0)
-            val up = MotionEvent.obtain(0, 20, MotionEvent.ACTION_UP, 16f, 16f, 0)
+            val down = MotionEvent.obtain(0, 0, MotionEvent.ACTION_DOWN, 200f, 300f, 0)
+            val up = MotionEvent.obtain(0, 20, MotionEvent.ACTION_UP, 200f, 300f, 0)
             try {
                 assertTrue(view.dispatchTouchEvent(down))
                 assertTrue(view.dispatchTouchEvent(up))
@@ -265,6 +265,43 @@ class NativeTerminalViewTest {
 
             assertFalse("a tap should close the native selection", view.hasSelectionForTest())
             assertEquals("the tap used to dismiss selection must be consumed", 0, clickCount)
+        } finally {
+            engine.dispose()
+            controller.destroy()
+        }
+    }
+
+    @Test
+    fun selectionHandleCanBeDraggedWithoutActivatingTerminalClick() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val engine = NativeTerminalEngine(
+            initialSize = TerminalSize(80, 24),
+            bridge = FakeNativeBridge(),
+        )
+        try {
+            engine.setReadOnly(false)
+            val view = engine.createView(controller.get()) as NativeTerminalView
+            var clickCount = 0
+            view.setOnClickListener { clickCount++ }
+            controller.get().setContentView(view)
+            view.layout(0, 0, 400, 600)
+            view.seedSelectionForTest()
+
+            val down = MotionEvent.obtain(0, 0, MotionEvent.ACTION_DOWN, 16f, 16f, 0)
+            val move = MotionEvent.obtain(0, 100, MotionEvent.ACTION_MOVE, 200f, 300f, 0)
+            val up = MotionEvent.obtain(0, 120, MotionEvent.ACTION_UP, 200f, 300f, 0)
+            try {
+                assertTrue(view.dispatchTouchEvent(down))
+                assertTrue(view.dispatchTouchEvent(move))
+                assertTrue(view.dispatchTouchEvent(up))
+            } finally {
+                down.recycle()
+                move.recycle()
+                up.recycle()
+            }
+
+            assertTrue("dragging a selection handle keeps selection active", view.hasSelectionForTest())
+            assertEquals("selection handle drag must not click the terminal", 0, clickCount)
         } finally {
             engine.dispose()
             controller.destroy()
